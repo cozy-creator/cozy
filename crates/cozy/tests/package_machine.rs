@@ -301,6 +301,65 @@ fn package_verbs_sent_to_a_booting_rental_wait_for_it() {
     );
 }
 
+/// Run 11762: a local package's empty `__init__.py` files (seedvr2 ships ten) never reached a
+/// rental, and its install failed `local_source_incomplete`. Zero-byte files travel like any other:
+/// a package whose subpackage has an empty `__init__.py` installs on a rental (the CI Hub's docker
+/// provider) and imports it when it runs.
+#[test]
+fn a_local_package_with_empty_files_installs_on_a_rental_and_imports_them() {
+    let Some(home) = Home::with_hub() else { return };
+    home.sign_in("empty@cozy.test");
+    let dir = package::project(&home, "tiny");
+    with_empty_subpackage(&dir.join("tiny"));
+    let src = dir.parent().unwrap();
+    let rented = json(&home, src, &["machine", "rent", "cpu", "--detach"]);
+    let rental = rented["machine"]["rental_id"].as_str().unwrap().to_owned();
+
+    let install = cozy(
+        &home,
+        src,
+        &["--json", "package", "install", "./tiny", "--on", &rental],
+    );
+    let last: Option<Value> =
+        (install.stdout.lines().rev()).find_map(|l| serde_json::from_str(l).ok());
+    assert_eq!(
+        (install.code, last.as_ref().and_then(|l| l["type"].as_str())),
+        (0, Some("run.completed")),
+        "{install:?}"
+    );
+    let ran = cozy(
+        &home,
+        src,
+        &["--json", "run", "./tiny/deep", "--on", &rental],
+    );
+    let last: Option<Value> = (ran.stdout.lines().rev()).find_map(|l| serde_json::from_str(l).ok());
+    let last = last.unwrap_or_else(|| panic!("{ran:?}"));
+    assert_eq!(last["run"]["result"]["text"], "deep", "{ran:?}");
+
+    let ended = json(&home, src, &["machine", "end", &rental]);
+    assert_eq!(ended["machine"]["state"], "ended", "{ended}");
+}
+
+/// Gives the package at `code` a subpackage two levels deep whose `__init__.py` files are empty,
+/// imported when the package loads, and a function `deep` that answers from it.
+fn with_empty_subpackage(code: &Path) {
+    let inner = code.join("upstream/inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(code.join("upstream/__init__.py"), "").unwrap();
+    std::fs::write(inner.join("__init__.py"), "").unwrap();
+    std::fs::write(inner.join("value.py"), "VALUE = \"deep\"\n").unwrap();
+    let init = code.join("__init__.py");
+    let mut text = std::fs::read_to_string(&init).unwrap();
+    text.push_str(
+        "\n\nfrom .upstream.inner.value import VALUE  # noqa: E402\n\n\n\
+         @app.entrypoint(accelerator=False)\n\
+         def deep(payload: EchoInput) -> EchoOutput:\n    \
+         \"\"\"Answers from a subpackage whose __init__.py files are empty.\"\"\"\n    \
+         return EchoOutput(VALUE)\n",
+    );
+    std::fs::write(init, text).unwrap();
+}
+
 /// A laptop names its local Hub where it listens, while machines read that Hub at its public
 /// origin and record their installations there (8819 recorded `https://cozy-e2e-6.ngrok.app:443`
 /// for the Hub this computer calls `http://127.0.0.1:8819`). The install is still the configured

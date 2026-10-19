@@ -294,9 +294,14 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     let (working, ended_ms) = service.engine.jobs(0)?;
     lifecycle.observe(crate::machine::lifecycle::Jobs { working, ended_ms }, lifecycle.epoch());
     let paths = crate::machine::update::Paths::new(&engine, &layout.root);
+    // An update's activation holds queued runs; one that ends without its restart lets them start.
+    let (activating, executions) = (lifecycle.clone(), service.engine.clone());
+    service.hold_while(move || activating.activating());
+    lifecycle.on_activation(move || executions.notify_activity());
     let updates = {
         let (service, admitted) = (service.clone(), lifecycle.clone());
-        let idle = move || service.idle().unwrap_or(false) && admitted.admitted() == 0;
+        // Only started runs drain: queued ones are journaled and run after the restart.
+        let idle = move || service.settled().unwrap_or(false) && admitted.admitted() == 0;
         crate::machine::update::Updates::open(
             paths.clone(),
             Box::new(idle),

@@ -224,3 +224,83 @@ async fn a_restart_keeps_the_queue_and_prepares_an_interrupted_run_again() {
     assert_ne!(c.2.status, "succeeded", "c was running: a restart ends it");
     assert_eq!((q.2.status.as_str(), p.2.status.as_str()), ("succeeded", "succeeded"), "{q:?} {p:?}");
 }
+
+/// Update `id` (`spec`) followed across the service's restart to its outcome.
+async fn update(client: &Client, id: &str, spec: v1::RunSpec) -> Vec<v1::RunEvent> {
+    client.submit(&v1::RunRequest { id: id.into(), spec }).await.unwrap();
+    let mut log = Vec::<v1::RunEvent>::new();
+    loop {
+        let after = log.iter().map(|e| e.sequence).max().unwrap_or(0);
+        if let Ok(events) = client.events(id, after).await {
+            let mut events = Box::pin(events);
+            while let Some(Ok(event)) = events.next().await {
+                let outcome = matches!(event.event, v1::Event::Outcome(_));
+                log.push(event);
+                if outcome {
+                    return log;
+                }
+            }
+        }
+        // The service is restarting onto the update: its port is kept.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// A machine with the cpu_bulk tree installed, and an update installing the published pair its
+/// runs execute on: it holds no pair of its own yet, so the update installs it and restarts.
+async fn updatable(home: &Path) -> (Machine, Client, String, v1::RunSpec) {
+    let (machine, client) = boot(home);
+    let manifest = tree(&client, "").await;
+    client.submit(&v1::RunRequest { id: "w".into(), spec: spec(&manifest, "", "") }).await.unwrap();
+    assert_eq!(follow(&client, "w").await.2.status, "succeeded");
+    client.submit(&v1::RunRequest { id: "n".into(), spec: spec(&manifest, "nap", r#"{"seconds":0.0}"#) }).await.unwrap();
+    let ran = follow(&client, "n").await.2;
+    let measured: serde_json::Value = serde_json::from_str(ran.measurements.as_ref().unwrap().get()).unwrap();
+    let pair = serde_json::json!({"runtime": measured["software"]["runtime"], "tensorfs": measured["software"]["tensorfs"]});
+    let install = v1::RunSpec { kind: v1::RunKind::Update, payload: v1::Json::parse(pair.to_string()).ok(), ..Default::default() };
+    (machine, client, manifest, install)
+}
+
+/// c runs and q waits in line: an update that asks to activate waits for c alone.
+async fn running_and_queued(client: &Client, manifest: &str, (c, q): (&str, &str)) {
+    client.submit(&v1::RunRequest { id: c.into(), spec: spec(manifest, "nap", r#"{"seconds":30.0}"#) }).await.unwrap();
+    until(client, c, |state| state.state == "running").await;
+    client.submit(&v1::RunRequest { id: q.into(), spec: spec(manifest, "nap", r#"{"seconds":0.0}"#) }).await.unwrap();
+    until(client, q, place).await;
+}
+
+#[tokio::test]
+async fn an_update_waits_only_for_started_runs_and_queued_ones_run_after_it() {
+    let home = tempfile::tempdir().unwrap();
+    let (_machine, client, manifest, install) = updatable(home.path()).await;
+    running_and_queued(&client, &manifest, ("c", "q")).await;
+    let log = update(&client, "up", install).await;
+    let installing = log.iter().find_map(|e| match &e.event {
+        v1::Event::Progress(p) if p.stage == "installing" => Some(e.at_ms),
+        _ => None,
+    });
+    let (c, q) = (follow(&client, "c").await, follow(&client, "q").await);
+    println!("update {log:?}\nc {c:?}\nq {q:?}");
+    let v1::Event::Outcome(done) = &log.last().unwrap().event else { unreachable!() };
+    assert_eq!(done.status, "succeeded", "{done:?}");
+    assert_eq!((c.2.status.as_str(), q.2.status.as_str()), ("succeeded", "succeeded"));
+    assert!(q.1.unwrap() > installing.expect("the update installs"), "q started before the update installed");
+}
+
+/// An activation that ends without its restart (here canceled while it drains) lets the runs it
+/// held go at once: q's place stops naming the update while c still runs.
+#[tokio::test]
+async fn a_canceled_update_lets_the_queued_runs_it_held_go_at_once() {
+    let home = tempfile::tempdir().unwrap();
+    let (_machine, client, manifest, install) = updatable(home.path()).await;
+    running_and_queued(&client, &manifest, ("c", "q")).await;
+    client.submit(&v1::RunRequest { id: "up".into(), spec: install }).await.unwrap();
+    until(&client, "q", |state| state.waiting == "position 1 in the queue, after the machine's update").await;
+    client.cancel("up").await.unwrap();
+    assert_eq!(follow(&client, "up").await.2.status, "canceled");
+    until(&client, "q", |state| state.waiting == "position 1 in the queue").await;
+    let c = Box::pin(client.events("c", 0).await.unwrap()).next().await.unwrap().unwrap().event;
+    assert!(matches!(&c, v1::Event::State(state) if state.state == "running"), "c ended first: {c:?}");
+    client.cancel("c").await.unwrap();
+    assert_eq!(follow(&client, "q").await.2.status, "succeeded");
+}

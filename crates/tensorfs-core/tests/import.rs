@@ -903,8 +903,10 @@ fn a_tiny_hf_sdxl_imports_end_to_end() {
         &access,
     )
     .unwrap();
-    let members =
-        import::remote::select(listing, None, &|m| import::remote::read_small(m, &access)).unwrap();
+    let members = import::remote::select(listing, None, import::remote::Files::All, &|m| {
+        import::remote::read_small(m, &access)
+    })
+    .unwrap();
     let landed: Vec<(String, PathBuf)> = members
         .iter()
         .map(|m| {
@@ -1483,4 +1485,168 @@ fn references_match_real_lanes() {
         }
     }
     assert!(held > 5000, "{held}");
+}
+
+/// Every file under `root`, by its path relative to `root`.
+fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.insert(rel, fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// network: Hugging Face. An import loses nothing an export can carry: four real repositories
+/// at pinned revisions (a Diffusers pipeline, a Transformers model with its tokenizer, a sharded
+/// model, a sharded fp16 variant imported as `fp16`) export with every non-weight file of the
+/// repository byte for byte, an index only of shards that exist, and their weights' data and
+/// `__metadata__`; and import is idempotent: the export, imported, has the same tensors, files
+/// and metadata, and exported and imported again, the same checkpoint.
+#[test]
+fn an_import_survives_export() {
+    let access = Access::default();
+    let cases = [
+        ("hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2", None),
+        ("hf-internal-testing/tiny-random-LlamaForCausalLM@9fb191250dd56d0ba7ec9785a025ed29c03d5998", None),
+        ("hf-internal-testing/tiny-random-bert-sharded-safetensors@3157eb8d4addc30b6e95a8000f2e3f0f6114bf5a", None),
+        (
+            "hf-internal-testing/tiny-stable-diffusion-pipe-variants-right-format@5017a45b0389efbe1710fe4cf6df15ec8237e49b",
+            Some("fp16"),
+        ),
+    ];
+    for (repo, variant) in cases {
+        let dir = scratch(&repo[..repo.find('@').unwrap()].replace('/', "-"));
+        let store = tensorfs_core::store2::Store::open(dir.join("store")).unwrap();
+        let tmp = dir.join("store").join("tmp");
+        let imported = |source: &str, variant: Option<&str>| {
+            let sources = [source.to_owned()];
+            let req = Request {
+                sources: &sources,
+                converter: None,
+                variant,
+                access: &access,
+                tmp: &tmp,
+                progress: &|_, _, _| {},
+                stop: None,
+            };
+            store
+                .checkpoint(&store.import(&req, None).unwrap())
+                .unwrap()
+        };
+        let out = dir.join("out");
+        let export = |ck: &tensorfs_core::store2::Checkpoint| {
+            let _ = fs::remove_dir_all(&out);
+            tensorfs_core::export::safetensors(ck, &out, None).unwrap();
+            tree(&out)
+        };
+        let source = format!("hf://{repo}");
+        let first = imported(&source, variant);
+        let exported = export(&first);
+
+        // Every non-weight file of the repository, byte for byte; nothing else but weights.
+        let listing =
+            import::remote::list(&import::remote::parse(&source).unwrap(), &access).unwrap();
+        let other = |p: &str| {
+            [".bin", ".onnx", ".msgpack", ".h5"]
+                .iter()
+                .any(|e| p.ends_with(e))
+                || p.contains(".bin.index")
+        };
+        let mut files = BTreeMap::new();
+        for m in listing
+            .members
+            .iter()
+            .filter(|m| !m.path.contains(".safetensors") && !other(&m.path))
+        {
+            let local =
+                import::remote::land(m, &dir.join("upstream").join(&m.path), &access).unwrap();
+            files.insert(m.path.clone(), fs::read(local).unwrap());
+        }
+        let kept: BTreeMap<String, Vec<u8>> = exported
+            .iter()
+            .filter(|(p, _)| !p.contains(".safetensors"))
+            .map(|(p, b)| (p.clone(), b.clone()))
+            .collect();
+        assert_eq!(
+            kept.keys().collect::<Vec<_>>(),
+            files.keys().collect::<Vec<_>>(),
+            "{repo}"
+        );
+        assert!(kept == files, "{repo}: a file differs from upstream's");
+        // An index names only the shards written.
+        for (path, bytes) in exported
+            .iter()
+            .filter(|(p, _)| p.contains(".safetensors.index"))
+        {
+            let index: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            let folder = path
+                .rsplit_once('/')
+                .map_or(String::new(), |(f, _)| format!("{f}/"));
+            for shard in index["weight_map"].as_object().unwrap().values() {
+                assert!(
+                    exported.contains_key(&format!("{folder}{}", shard.as_str().unwrap())),
+                    "{repo}: {path}"
+                );
+            }
+        }
+
+        // The export imports as the same tensors, files and metadata; again, as the same checkpoint.
+        let second = imported(out.to_str().unwrap(), None);
+        let tensors = |ck: &tensorfs_core::store2::Checkpoint| -> Tensors {
+            ck.tensors()
+                .map(|(c, t)| {
+                    (
+                        (c.to_owned(), t.key.clone()),
+                        (
+                            t.dtype.clone(),
+                            t.shape.clone(),
+                            ck.read(c, &t.key).unwrap(),
+                        ),
+                    )
+                })
+                .collect()
+        };
+        assert!(tensors(&first) == tensors(&second), "{repo}: the tensors");
+        assert_eq!(
+            first.manifest().files.len(),
+            second.manifest().files.len(),
+            "{repo}"
+        );
+        for (path, object) in &first.manifest().files {
+            if path != "model.cozytensors" {
+                assert_eq!(
+                    Some(object),
+                    second.manifest().files.get(path),
+                    "{repo}: {path}"
+                );
+            }
+        }
+        let meta = import::FILE_METADATA;
+        assert_eq!(
+            first.header().metadata.get(meta),
+            second.header().metadata.get(meta),
+            "{repo}"
+        );
+        export(&second);
+        let third = imported(out.to_str().unwrap(), None);
+        assert_eq!(
+            third.id(),
+            second.id(),
+            "{repo}: import of an export is a fixed point"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

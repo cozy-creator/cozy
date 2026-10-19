@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """The standalone e2e (design §11): no Cozy, no account, run by `e2e.sh` in a fresh venv.
 
-1. CLI: `tfs import hf://hf-internal-testing/tiny-sdxl-pipe`; `tfs export --safetensors`, from
-   which Diffusers renders exactly the upstream repo's image (CPU, fixed seed); `tfs export
+1. CLI: `tfs import hf://hf-internal-testing/tiny-sdxl-pipe`; `tfs export --safetensors`, which is
+   every file of the repository and imports again as a fixed point (so do a Transformers model with
+   its tokenizer, a sharded model and a sharded fp16 variant), and from which
+   Diffusers renders exactly the upstream repo's image (CPU, fixed seed); `tfs export
    --origin`, served by `python -m http.server`, then `tfs pull` into a second store,
    byte-identical; a corrupted object is removed by `tfs verify` and fetched again.
 2. The same through `tensorfs`, plus DLPack reads equal to upstream's own tensors, regions,
@@ -25,11 +27,19 @@ from collections.abc import Iterator
 import numpy as np
 import torch
 from diffusers import StableDiffusionXLPipeline
-from huggingface_hub import hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
 import tensorfs as tfs
 
 REPO = "hf-internal-testing/tiny-sdxl-pipe"
+#: Sources whose export keeps every file and imports as a fixed point, and their variant.
+SOURCES = [
+    (REPO, None),
+    ("hf-internal-testing/tiny-random-LlamaForCausalLM", None),
+    ("hf-internal-testing/tiny-random-bert-sharded-safetensors", None),
+    ("hf-internal-testing/tiny-stable-diffusion-pipe-variants-right-format", "fp16"),
+]
+OTHER_WEIGHTS = (".bin", ".onnx", ".msgpack", ".h5")
 NAME = "local/tiny-sdxl"
 TFS = str(pathlib.Path(sys.executable).with_name("tfs"))
 DTYPES = {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16, "I64": torch.int64}
@@ -55,6 +65,28 @@ def same_image(folder: pathlib.Path, reference: np.ndarray) -> None:
     diff = float(np.abs(image - reference).max())
     print(f"render {folder.name}: {image.shape}, max |diff| vs upstream {diff}")
     assert diff == 0.0, f"{folder}: the image differs from upstream's by {diff}"
+
+
+def same_folder(store: pathlib.Path, name: str, folder: pathlib.Path, repo: str) -> None:
+    """The export holds every non-weight file of the repository byte for byte, and an index only
+    of shards it wrote; imported, exported and imported again, it is the same checkpoint."""
+    def kept(path: str) -> bool:
+        return ".safetensors" not in path and not (path.endswith(OTHER_WEIGHTS) or ".bin.index" in path)
+
+    allow = [p for p in HfApi().list_repo_files(repo) if kept(p)]
+    upstream = pathlib.Path(snapshot_download(repo, allow_patterns=allow))
+    files = {str(p.relative_to(folder)): p for p in folder.rglob("*") if p.is_file()}
+    assert sorted(p for p in files if kept(p)) == sorted(allow), f"{repo}: {sorted(files)}"
+    differ = [p for p in allow if files[p].read_bytes() != (upstream / p).read_bytes()]
+    assert not differ, f"{repo}: {differ} differ from upstream's"
+    for path in (p for p in files if ".safetensors.index" in p):
+        shards = set(json.loads(files[path].read_text())["weight_map"].values())
+        assert all((files[path].parent / s).is_file() for s in shards), f"{repo}: {path}"
+    again = [cli(store, "import", str(folder), "--name", f"{name}-again")["manifest"]]
+    cli(store, "export", f"{name}-again", str(folder), "--safetensors")
+    again.append(cli(store, "import", str(folder), "--name", f"{name}-twice")["manifest"])
+    assert again[0] == again[1], f"{repo}: import of an export is a fixed point"
+    print(f"export of {repo}: its {len(allow)} other files byte for byte; re-import a fixed point")
 
 
 def same_files(folder: pathlib.Path) -> None:
@@ -119,6 +151,11 @@ def main() -> None:
     assert set(names) == {"text_encoder", "text_encoder_2", "unet", "vae"}, names
     cli(a, "export", NAME, str(work / "out"), "--safetensors")
     same_files(work / "out")
+    for i, (repo, variant) in enumerate(SOURCES):
+        flags = ["--variant", variant] if variant else []
+        cli(work / "sources", "import", f"hf://{repo}", "--name", f"local/source-{i}", *flags)
+        cli(work / "sources", "export", f"local/source-{i}", str(work / f"source-{i}"), "--safetensors")
+        same_folder(work / "sources", f"local/source-{i}", work / f"source-{i}", repo)
     same_image(work / "out", reference)
     cli(a, "export", NAME, str(work / "origin"), "--origin")
     with serve(work / "origin") as url:
