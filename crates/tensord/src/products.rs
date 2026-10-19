@@ -225,7 +225,7 @@ pub fn checkpoint(engine: &Engine, id: &str, frame: &Frame) -> Answer {
         if frame.repo_id.is_empty() {
             return Err(storage("a checkpoint reference needs its repository"));
         }
-        storage::check_digest("checkpoint revision", &frame.revision, true)?;
+        storage::check_digest("checkpoint revision", &frame.revision, true).map_err(storage)?;
         let reference = protocol::machine::CheckpointRef {
             repo_id: frame.repo_id.clone(), revision: frame.revision.clone(), variant: frame.variant.clone(),
         };
@@ -446,6 +446,10 @@ mod tests {
         assert!(checkpoint(&engine, &record.id, &frame).ok);
         frame.output = "undeclared".into();
         assert_eq!(checkpoint(&engine, &record.id, &frame).code, "output_undeclared");
+        frame.output = "weights".into();
+        let revision = std::mem::replace(&mut frame.revision, "mutable-release".into());
+        assert_eq!(checkpoint(&engine, &record.id, &frame).code, "checkpoint_refused");
+        frame.revision = revision;
         drop(engine);
         let reopened = Engine::open(&root).unwrap();
         let rows = reopened.products(&record.id).unwrap();
