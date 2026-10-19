@@ -1,0 +1,347 @@
+{
+  "schema": "tensorfs.gpu-proof-command-contract/1",
+  "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+  "branch": "xs053/api-now",
+  "r1_snapshot": {
+    "branch": "xs055/r1-engine",
+    "source": "f8245484c34e45ece257715569468ced526c94fd",
+    "clean": true
+  },
+  "native_core_source": "0800dbcfee93b887891624a303124de2c017a034",
+  "native_artifact": "Parent/C1 must pin final coherent fork-fixed AOT wheel SHA256, extension SHA256 and source in their existing payload; no artifact qualification is implied here.",
+  "execution": {
+    "transport": "existing public cozy C1 wrapper; fresh subprocesses through existing owned_child.run_owned",
+    "gpus": 1,
+    "ordinal": 0,
+    "serial": true,
+    "python_optimize": 0,
+    "triton_interpret": [
+      "",
+      "0"
+    ],
+    "term_grace_seconds": 3,
+    "kill_reap_seconds": 10,
+    "require": {
+      "rc": 0,
+      "reaped": true,
+      "timed_out": false,
+      "lingering_descendants": false
+    }
+  },
+  "profiles": {
+    "torch": {
+      "dependencies": [
+        "same final TensorFS native wheel",
+        "torch==2.14.0 (existing C1 payload pin)",
+        "numpy (existing C1 payload dependency, record actual resolved version)"
+      ],
+      "launch": "Fresh interpreter. Do not preimport Torch in a bootstrap before cuda_read_engine.py."
+    },
+    "clean": {
+      "dependencies": [
+        "same final TensorFS native wheel",
+        "Python>=3.12 standard library"
+      ],
+      "forbidden_installed": [
+        "torch",
+        "triton"
+      ],
+      "launch": "Fresh interpreter. Never run fork script in an already-CUDA-initialized process."
+    }
+  },
+  "files": [
+    {
+      "path": "crates/tensorfs/scripts/cuda_read_engine.py",
+      "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs/scripts/cuda_read_engine.py",
+      "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+      "sha256": "df567493c94fc3bd046e11c241e45bc28fafb537c32668fd75d051eff54e3008",
+      "bytes": 4767
+    },
+    {
+      "path": "crates/tensorfs/scripts/cuda_varena_source.py",
+      "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs/scripts/cuda_varena_source.py",
+      "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+      "sha256": "aac5e79afd55d1c757185a0b83b0418abcf78f3db0535ea534ff79b2195e9e18",
+      "bytes": 15377
+    },
+    {
+      "path": "crates/tensorfs/scripts/cuda_fork_cleanup.py",
+      "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs/scripts/cuda_fork_cleanup.py",
+      "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+      "sha256": "ef8554edbdc7fe772586f097c99b824d6582611a22cc71809760a3f9a5100512",
+      "bytes": 5633
+    },
+    {
+      "path": "crates/tensorfs/scripts/read_engine.py",
+      "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs/scripts/read_engine.py",
+      "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+      "sha256": "eb619411d3dde30a86024cc58a6c447f38bea4963f4055baf433d6bc9789dbb7",
+      "bytes": 8488
+    },
+    {
+      "path": "crates/tensorfs/scripts/cuda_kernel_conform.py",
+      "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs/scripts/cuda_kernel_conform.py",
+      "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+      "sha256": "7660d1cd97c95ca460e8f4bc884c01ee1f68b8adf8db8d755adda8fe8e053475",
+      "bytes": 5100
+    },
+    {
+      "path": "crates/tensorfs/scripts/kernel_conform.py",
+      "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs/scripts/kernel_conform.py",
+      "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+      "sha256": "4ff32351d1b5a6059bf7922db3e8e2d53123f1bcfc49da75bf51348e20bd50f8",
+      "bytes": 895
+    },
+    {
+      "path": "crates/tensorfs-core/tests/io.rs",
+      "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs-core/tests/io.rs",
+      "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+      "sha256": "91305ad4187c7c80d0ccfee59db6a30255870a71b2f9acde310d3c7f2ffcfbf0",
+      "bytes": 20069
+    },
+    {
+      "path": "crates/tensorfs-core/tests/format_conformance.rs",
+      "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs-core/tests/format_conformance.rs",
+      "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+      "sha256": "1b4ba25873d3e41a2f4e6064e972816d28d5950bf7761c097d9b963c80bba46e",
+      "bytes": 21095
+    }
+  ],
+  "commands": [
+    {
+      "id": "read-engine",
+      "file": {
+        "path": "crates/tensorfs/scripts/cuda_read_engine.py",
+        "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs/scripts/cuda_read_engine.py",
+        "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+        "sha256": "df567493c94fc3bd046e11c241e45bc28fafb537c32668fd75d051eff54e3008",
+        "bytes": 4767
+      },
+      "profile": "torch",
+      "argv": [
+        "{torch_python}",
+        "-u",
+        "{scripts}/cuda_read_engine.py"
+      ],
+      "timeout_s": 120,
+      "helper_files": [
+        {
+          "path": "crates/tensorfs/scripts/read_engine.py",
+          "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs/scripts/read_engine.py",
+          "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+          "sha256": "eb619411d3dde30a86024cc58a6c447f38bea4963f4055baf433d6bc9789dbb7",
+          "bytes": 8488
+        }
+      ],
+      "receipt": {
+        "format": "text",
+        "exact_line": "CUDA arrays: chunk-spanning reads, prebuilt decode, raw parts, DLPack sharing/copy and retained consumers passed",
+        "required_occurrences": 1,
+        "skips": 0,
+        "checked": {
+          "full_gpu_arrays": 4,
+          "raw_encoded_parts": 2,
+          "gpu_read_into": 2,
+          "explicit_stream_copy_refusals": 4,
+          "retained_value_consumers": 4,
+          "capsule_release_bytes": 67109121,
+          "capsule_drop_seconds_lt": 0.1,
+          "heartbeat_ticks_ge": 3,
+          "allocation_recovery_poll_seconds": 5
+        }
+      }
+    },
+    {
+      "id": "provider-cleanup",
+      "file": {
+        "path": "crates/tensorfs/scripts/cuda_varena_source.py",
+        "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs/scripts/cuda_varena_source.py",
+        "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+        "sha256": "aac5e79afd55d1c757185a0b83b0418abcf78f3db0535ea534ff79b2195e9e18",
+        "bytes": 15377
+      },
+      "profile": "torch",
+      "argv": [
+        "{torch_python}",
+        "-u",
+        "{scripts}/cuda_varena_source.py",
+        "--timeout",
+        "45"
+      ],
+      "timeout_s": 210,
+      "receipt": {
+        "format": "json-lines",
+        "identity_records": 4,
+        "passed_case_records": 4,
+        "cases": [
+          "last-weightset",
+          "callback-close",
+          "last-pin",
+          "last-consumer"
+        ],
+        "final_exact_fields": {
+          "result": "passed",
+          "cases": [
+            "last-weightset",
+            "callback-close",
+            "last-pin",
+            "last-consumer"
+          ],
+          "timeout_per_child": 45
+        },
+        "skips": 0,
+        "per_case_require": {
+          "result": "passed",
+          "cleanup.sets": 0,
+          "cleanup.mapped": 0,
+          "cleanup.idle": 0,
+          "cleanup.slots": 0,
+          "callback.chunks_gt": 0,
+          "h2d.any.bytes": 65536,
+          "h2d.any.ns_gt": 0
+        },
+        "identity_require": [
+          "device=0",
+          "nonempty actual UUID, not unavailable",
+          "extension_sha256 equals frozen wheel extension hash",
+          "same GPU UUID across four children"
+        ],
+        "details": "Each case also asserts lazy/no-I/O registration, actual loopback HTTP chunk GET, native-thread provider callback, source weakref collection, driver-page recovery within64KiB tolerance and local cache replay. Last-pin/consumer require pending CUDA, drop<0.25s, heartbeat>=3."
+      }
+    },
+    {
+      "id": "fork-cleanup",
+      "file": {
+        "path": "crates/tensorfs/scripts/cuda_fork_cleanup.py",
+        "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs/scripts/cuda_fork_cleanup.py",
+        "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+        "sha256": "ef8554edbdc7fe772586f097c99b824d6582611a22cc71809760a3f9a5100512",
+        "bytes": 5633
+      },
+      "profile": "clean",
+      "argv": [
+        "{clean_python}",
+        "-u",
+        "{scripts}/cuda_fork_cleanup.py"
+      ],
+      "timeout_s": 90,
+      "receipt": {
+        "format": "text",
+        "line_regex": "^CUDA fork cleanup: CPU-only parent import, child allocation/capsule release recovered ([0-9]+) bytes$",
+        "required_occurrences": 1,
+        "recovered_bytes_ge": 33554449,
+        "skips": 0,
+        "internal_parent_deadline_s": 60,
+        "child_release_poll_s": 10,
+        "details": "Actual CPU-only parent TensorFS import, os.fork, child-only CUDA init, held capsule keeps allocation and final capsule drop returns native bytes. Parent kills/reaps only its own child on timeout."
+      }
+    },
+    {
+      "id": "kernel",
+      "file": {
+        "path": "crates/tensorfs/scripts/cuda_kernel_conform.py",
+        "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs/scripts/cuda_kernel_conform.py",
+        "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+        "sha256": "7660d1cd97c95ca460e8f4bc884c01ee1f68b8adf8db8d755adda8fe8e053475",
+        "bytes": 5100
+      },
+      "profile": "clean",
+      "argv": [
+        "{clean_python}",
+        "-u",
+        "{scripts}/cuda_kernel_conform.py",
+        "--device",
+        "0"
+      ],
+      "timeout_s": 300,
+      "receipt": {
+        "format": "final-json",
+        "schema": "tensorfs.cuda-kernel-conformance/1",
+        "counts": {
+          "full": 209,
+          "windows": 209,
+          "total": 418,
+          "cases": 209,
+          "schemes": 39
+        },
+        "routing": {
+          "prepared": "Kernel",
+          "host_only_exclusions": []
+        },
+        "runtime": {
+          "torch_installed": false,
+          "triton_installed": false,
+          "torch_imported": false,
+          "triton_imported": false
+        },
+        "skips": 0,
+        "contract": "/home/fidika/cozy_v2/outputs/xs055-r5-kernel-contract-f8245484.md"
+      }
+    }
+  ],
+  "optional_prebuilt_native_tests": [
+    {
+      "id": "direct-host-pin-and-zero",
+      "file": {
+        "path": "crates/tensorfs-core/tests/io.rs",
+        "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs-core/tests/io.rs",
+        "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+        "sha256": "91305ad4187c7c80d0ccfee59db6a30255870a71b2f9acde310d3c7f2ffcfbf0",
+        "bytes": 20069
+      },
+      "requires": "A separately frozen, hosted-precompiled Linux io test executable plus its runtime libraries; not in the installed wheel and not built by this task. Do not compile on the paid GPU.",
+      "argv": [
+        "{io_test_binary}",
+        "--ignored",
+        "--exact",
+        "cuda_staging_pins_device_copies_and_chunk_spans_keep_exact_bytes",
+        "--nocapture"
+      ],
+      "timeout_s": 120,
+      "receipt": {
+        "format": "libtest-text",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "selected_test": "cuda_staging_pins_device_copies_and_chunk_spans_keep_exact_bytes"
+      },
+      "coverage": "Chunk-spanning File->GPU->Host, Host staging and reuse, caller-owned pinned region remains registered, D2D, device memset only9bytegap, explicit HostPin.release twice and actual unregistration."
+    },
+    {
+      "id": "native-full-element-windows",
+      "file": {
+        "path": "crates/tensorfs-core/tests/format_conformance.rs",
+        "absolute_path": "/home/fidika/cozy/.worktrees/cozy-creator/xs053-api-now-integration/crates/tensorfs-core/tests/format_conformance.rs",
+        "source": "3be2dbc2a1f6cfd867199d77a6ca94a4240be44b",
+        "sha256": "1b4ba25873d3e41a2f4e6064e972816d28d5950bf7761c097d9b963c80bba46e",
+        "bytes": 21095
+      },
+      "requires": "Separately frozen hosted-precompiled AOT format_conformance test executable and vectors corpus; Python kernel child is already the preferred installed-wheel proof. No GPU-side build.",
+      "argv": [
+        "{format_conformance_test_binary}",
+        "--ignored",
+        "--exact",
+        "cuda_decodes_every_encoded_green_vector_and_logical_windows",
+        "--nocapture"
+      ],
+      "timeout_s": 300,
+      "receipt": {
+        "format": "libtest-text",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "selected_test": "cuda_decodes_every_encoded_green_vector_and_logical_windows"
+      },
+      "coverage": "Actual checked prebuilt decode for every encoded green vector, full and inner logical element windows, exact bytes; existing native assertion checked>50 is weaker than the Python child fixed209/418 contract."
+    }
+  ],
+  "ancillary": {
+    "kernel_contract": "/home/fidika/cozy_v2/outputs/xs055-r5-kernel-contract-f8245484.md",
+    "routing_source_manifest": "/home/fidika/cozy_v2/outputs/xs055-kernel-routing-source-manifest-f824-14fac.json",
+    "routing_cpu_log": "/home/fidika/cozy_v2/outputs/xs055-kernel-routing-39334400067.log",
+    "installed_cpu_log": "/home/fidika/cozy_v2/outputs/xs055-read-engine-cpu-88-39333361390.log",
+    "identity_audit": "/home/fidika/cozy_v2/outputs/xs055-public-gpu-identity-source-audit.md"
+  },
+  "qualification": "Prepared only; no build, GPU execution, rental, private API or SSH. Text/source assertions must not be represented as structured emitted counters. Resource tests prove bounded final releases, not an unbounded leak soak.",
+  "wrapper_adaptation": "Existing consumer child.py preimports Torch in non-kernel mode and runpy does not add the scripts directory. Use existing run_owned with fresh direct-script argv above, or adjust only the one-off bootstrap for late framework import and sibling read_engine.py path. Existing worker.report expects proof marker; these JSON formats use schema or result and need case-specific validation, not ignored receipts."
+}
