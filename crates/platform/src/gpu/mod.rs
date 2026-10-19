@@ -6,7 +6,11 @@ pub use cuda::memory_classes;
 
 use crate::{Error, Result};
 use nvml_wrapper::{
-    Nvml, enums::device::UsedGpuMemory, error::NvmlError, struct_wrappers::device::MemoryInfo,
+    Nvml,
+    enum_wrappers::device::Sampling,
+    enums::device::{SampleValue, UsedGpuMemory},
+    error::NvmlError,
+    struct_wrappers::device::MemoryInfo,
 };
 use std::collections::BTreeMap;
 
@@ -165,6 +169,25 @@ impl Device {
             display: device.is_display_active().unwrap_or(false),
             processes,
         })
+    }
+
+    /// Whether kernels ran or device memory moved (copies count) in NVML's samples after
+    /// `seen` (its timestamp, µs), which it advances.
+    pub fn worked_since(&self, seen: &mut u64) -> Result<bool> {
+        let device = self.nvml.device_by_index(self.index).map_err(failed("open device"))?;
+        let (from, mut worked) = (*seen, false);
+        for sampling in [Sampling::GpuUtilization, Sampling::MemoryUtilization] {
+            for sample in device.samples(sampling, from).map_err(failed("utilization samples"))? {
+                *seen = (*seen).max(sample.timestamp);
+                worked |= match sample.value {
+                    SampleValue::U32(value) => value > 0,
+                    SampleValue::U64(value) => value > 0,
+                    SampleValue::I64(value) => value > 0,
+                    SampleValue::F64(value) => value > 0.0,
+                };
+            }
+        }
+        Ok(worked)
     }
 
     pub fn display_active(&self) -> Result<bool> {
