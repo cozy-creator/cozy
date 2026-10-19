@@ -463,6 +463,8 @@ class Memory:
         self.landing: dict[Model, set[int]] = {}
         #: host tiers sealed here for the executor to deposit
         self.deposits: list[tuple[Model, int]] = []
+        #: granted host tiers adopted before their modules exist (`adopt`), by grant key
+        self.adopted: dict[str, WeightSet] = {}
         #: its requests waiting for room (§2), counted under `freeing`
         self.waiting = 0
         self.freeing = threading.Lock()
@@ -535,6 +537,44 @@ class Memory:
         self._publish()
         return model
 
+    def adopt(self, grant: WeightGrant) -> None:
+        """Before its module is built: the host tier granted for it (`grant.host_fd`), registered
+        from the regions it carries, its copies to the GPU started into free room. `load` binds
+        the module to it when the module's regions are the same; else it is a miss, and the
+        module loads as if nothing were granted."""
+        if grant.host_fd is None or not isinstance(self.core, Gpu):
+            return
+        with self.lock:
+            files = list(grant.files) or None
+            ws = self.core.adopt(self._name(grant.key), grant.ck, grant.host_fd, files)
+            self.adopted[grant.key] = ws
+            room = self._free()
+            for region, span in enumerate(ws.spans):
+                if span > room:
+                    break
+                try:
+                    ws.prefetch(region)
+                except DeviceFull:
+                    break
+                room -= span
+        self._publish()
+
+    def unclaimed(self) -> None:
+        """Let go of what `adopt` took that no `load` bound."""
+        with self.lock:
+            adopted, self.adopted = self.adopted, {}
+        for ws in adopted.values():
+            ws.close()
+        self._publish()
+
+    def _name(self, key: str) -> str:
+        taken = {*self.models, *(ws.name for ws in self.adopted.values())}
+        name, n = key, 1
+        while name in taken:
+            n += 1
+            name = f"{key}#{n}"
+        return name
+
     def sealed(self) -> list[tuple[Model, int]]:
         """Host tiers sealed since the last call, each fd the caller's to deposit and close."""
         with self.lock:
@@ -547,31 +587,36 @@ class Memory:
         if grant is None:
             raise Unbound(f"{type(module).__name__}: no weights attached (`Declared.weights`)")
         paths, regions = blocks_of(module), regions_of(module)
-        name, n = grant.key, 1
-        while name in self.models:
-            n += 1
-            name = f"{grant.key}#{n}"
         files, host_fd = list(grant.files) or None, grant.host_fd
-        if host_fd is None and self.cuda and self.granted:
-            host_fd = seal(grant.ck, regions, name, files=files)
-        ws = self.core.register(name, grant.ck, regions, host_fd, files)
-        model = Model(self, name, grant.key, module, ws, declared)
-        if host_fd is not None and grant.host_fd is None:
-            self.deposits.append((model, host_fd))
+        ws = self.adopted.pop(grant.key, None)
+        if ws is None and host_fd is not None and isinstance(self.core, Gpu):
+            ws = self.core.adopt(self._name(grant.key), grant.ck, host_fd, files)
+        if ws is not None and ws.regions != regions:
+            ws.close()  # granted for other regions: a miss, and its layout is sealed anew
+            ws, host_fd = None, None
+        sealed = None
+        if ws is None:
+            name = self._name(grant.key)
+            if host_fd is None and self.cuda and self.granted:
+                host_fd = sealed = seal(grant.ck, regions, name, files=files)
+            ws = self.core.register(name, grant.ck, regions, host_fd, files)
+        model = Model(self, ws.name, grant.key, module, ws, declared)
+        if sealed is not None:
+            self.deposits.append((model, sealed))
         _layout(model, f"{grant.component}/", paths, regions)
         model.sites = _sites(module)
         _install(model)
         model.order = [b.index for b in model.blocks]
         model.position = {b: i for i, b in enumerate(model.order)}
         model.home = set(model.order)
-        self.models[name], self.by_module[module] = model, model
+        self.models[model.name], self.by_module[module] = model, model
         if model.host:
             _bind_host(model)
             return model
         model.ws.home(_home_regions(model))
         for b in model.blocks:
             b.site = cuts.Site(
-                (name, b.index), self.device, model.track, b.module, module, declared.state
+                (model.name, b.index), self.device, model.track, b.module, module, declared.state
             )
             _hook(b)
         cuts.install(module)
@@ -1067,14 +1112,15 @@ class Memory:
         resident = {s.name: int(s.resident) for s in self.core.stats().sets}  # type: ignore[union-attr]
         models = list(self.models.values())
         bytes_of = lambda ms: sum(resident.get(m.name, 0) for m in ms)  # noqa: E731
+        adopted = sum(resident.get(ws.name, 0) for ws in self.adopted.values())
         cold = [m for m in models if not m.flight and not m.held]
         reserved, allocated = torch.cuda.memory_reserved(gpu), torch.cuda.memory_allocated(gpu)
         row.publish(
             context=self.context,
-            resident=bytes_of(models),
+            resident=bytes_of(models) + adopted,
             cold=bytes_of(cold),
             kept=bytes_of(m for m in cold if m.level is Level.GPU),
-            pinned=bytes_of(m for m in models if m.flight or m.held),
+            pinned=bytes_of(m for m in models if m.flight or m.held) + adopted,
             torch_reserved=reserved,
             torch_allocated=allocated,
             cache=sum(c.nbytes for c in list(self.caches)),

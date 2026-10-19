@@ -88,7 +88,7 @@ fn decode_names(mut b: &[u8], regions: usize) -> Option<Vec<Vec<String>>> {
         *b = rest;
         Some(u32::from_le_bytes(*n) as usize)
     };
-    let mut out = Vec::with_capacity(regions);
+    let mut out = Vec::with_capacity(regions.min(b.len() / 4));
     for _ in 0..regions {
         let count = u32_of(&mut b)?;
         let mut region = Vec::with_capacity(count.min(b.len() / 4));
