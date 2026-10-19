@@ -81,8 +81,8 @@ def _unpack(words, slots, e, params, valid):
         i, j, rows, cols = e * 0, e, rows * 0 + 1, rows * cols
     return _code(words, slots, i, j, rows, cols, tl.load(params + 16),
                  tl.load(params + 15).to(tl.int32), valid,
-                 tl.load(params + 8), tl.load(params + 9), tl.load(params + 10),
-                 tl.load(params + 11), tl.load(params + 12), tl.load(params + 13), tl.load(params + 14))
+                 tl.load(params + 8).to(tl.int32), tl.load(params + 9).to(tl.int32), tl.load(params + 10).to(tl.int32),
+                 tl.load(params + 11).to(tl.int32), tl.load(params + 12).to(tl.int32), tl.load(params + 13).to(tl.int32), tl.load(params + 14).to(tl.int32))
 
 
 @triton.jit
