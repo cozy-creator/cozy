@@ -2,7 +2,7 @@
 //! (births, exact handles, groups, meters) is `platform::process`. Nothing here kills
 //! because time passed. Callers kill on a measured wedge (`Pace`), an owner restart, or a launch
 //! that never reached authored code.
-use platform::process::{Birth, Exact, State, burn, gone, group_members, meter, read_bytes};
+use platform::process::{Birth, Exact, State, gone, group_members, meter, read_bytes};
 use std::{
     fs::File,
     io,
@@ -22,13 +22,13 @@ pub fn group_outlives(leader: &Birth, before: u64) -> bool {
 /// The leader's meter plus its group members': a follower's imports, fills and collectives
 /// are the executor's work. `None` only when the leader itself is unreadable.
 pub fn group_burn(leader: &Birth) -> Option<u64> {
-    let own = burn(leader.pid)?;
-    Some(
-        group_members(leader)
-            .iter()
-            .filter_map(|member| burn(member.pid))
-            .fold(own, u64::saturating_add),
-    )
+    group_meter(leader).map(|(cpu, moved)| cpu.saturating_add(moved))
+}
+
+/// `meter` (CPU ns, bytes moved) summed over the leader and its group members.
+fn group_meter(leader: &Birth) -> Option<(u64, u64)> {
+    let sum = |(cpu, moved): (u64, u64), (c, m): (u64, u64)| (cpu.saturating_add(c), moved.saturating_add(m));
+    Some(group_members(leader).iter().filter_map(|member| meter(member.pid)).fold(meter(leader.pid)?, sum))
 }
 
 /// Sampling resolution and noise floor of the wedge rule (Runtime `liveness.py`). A sample
@@ -126,7 +126,24 @@ pub enum Meter {
     Burn,
     /// Frames of the running invocation; a canceled one must stop within its pace's patience.
     Frames,
+    /// A GPU invocation's work, judged while it runs: frames, bytes moved, GPU kernels and
+    /// copies, or CPU above 1.5 cores. One spinning core is not progress (runs 11818, 11822).
+    Work,
 }
+
+/// GPU work seen so far (a count of busy readings); None while it cannot be read, which judges
+/// nothing.
+pub type Activity = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// A measured wedge's verdict, as the error of the command it ended.
+#[derive(Debug)]
+pub struct Wedged(pub String);
+impl std::fmt::Display for Wedged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for Wedged {}
 
 #[derive(Default)]
 struct WatchState {
@@ -147,6 +164,7 @@ pub type Waits = Arc<dyn Fn() -> bool + Send + Sync>;
 pub struct Watch {
     meter: Meter,
     waits: Option<Waits>,
+    activity: Option<Activity>,
     state: Mutex<WatchState>,
     changed: Condvar,
 }
@@ -155,9 +173,11 @@ impl Watch {
         let floor = liveness.floor();
         // Frame gaps teach only the frame meter; CPU-plus-bytes starts its own pace.
         let mut pace = match self.meter {
-            Meter::Frames => Pace::seeded(worst_gap),
+            Meter::Frames | Meter::Work => Pace::seeded(worst_gap),
             Meter::Burn => Pace::default(),
         };
+        // A GPU call's samples whose group CPU ran above one core, and its last CPU reading.
+        let (mut cores, mut last_cpu) = (0, None);
         let mut state = self.state.lock().unwrap();
         while !state.done {
             let now = Instant::now();
@@ -180,17 +200,33 @@ impl Watch {
             let reading = match self.meter {
                 Meter::Burn => group_burn(exact.birth()),
                 Meter::Frames => Some(state.frames),
+                Meter::Work => self.activity.as_ref().and_then(|activity| activity()).map(|gpu| {
+                    let (cpu, moved) = group_meter(exact.birth()).unwrap_or_default();
+                    // CPU on more than one core is work (1.5 cores leaves room for sampling skew):
+                    // real CPU phases (torch intra-op, ffmpeg, BLAS) run many threads, a spin one,
+                    // and a missed kill beats killing a real run.
+                    if let Some((before, at)) = last_cpu.replace((cpu, now)) {
+                        cores += u64::from(u128::from(cpu.saturating_sub(before)) * 2 > (now - at).as_nanos() * 3);
+                    }
+                    gpu + state.frames + moved + cores
+                }),
             };
             pace.observe(reading, now);
-            if state.serving || self.waits.as_ref().is_some_and(|waits| waits()) {
+            let unread = self.meter == Meter::Work && reading.is_none();
+            if unread || state.serving || self.waits.as_ref().is_some_and(|waits| waits()) {
                 pace.excuse(now);
             }
             state.worst_gap = pace.worst_pause;
-            // Frames are judged only after a cancel (above); CPU and bytes always.
-            if let (Meter::Burn, Some(since)) = (self.meter, pace.still_since()) {
+            // Frames alone are judged only after a cancel (above); CPU and bytes, and a GPU
+            // call's work, always.
+            if let (Meter::Burn | Meter::Work, Some(since)) = (self.meter, pace.still_since()) {
                 let still = now - since;
                 if still > pace.patience(floor) {
-                    let verdict = format!("wedged during {what}: {}", pace.verdict(still, floor));
+                    let measures = match self.meter {
+                        Meter::Work => " (frames, bytes moved, GPU kernels and copies, CPU beyond one core)",
+                        _ => "",
+                    };
+                    let verdict = format!("wedged during {what}: {}{measures}", pace.verdict(still, floor));
                     match exact.kill() {
                         Ok(()) => state.killed = Some(verdict),
                         Err(error) => tracing::warn!("{verdict}; kill failed: {error}"),
@@ -227,11 +263,13 @@ impl Watching {
         liveness: Liveness,
         worst_gap: Duration,
         waits: Option<Waits>,
+        activity: Option<Activity>,
         what: &'static str,
     ) -> io::Result<Self> {
         let watch = Arc::new(Watch {
             meter,
             waits,
+            activity,
             state: Mutex::new(WatchState::default()),
             changed: Condvar::new(),
         });
@@ -489,6 +527,57 @@ mod tests {
         assert!(group_members(&birth).is_empty());
     }
 
+    /// A GPU call is judged while it runs on its work: one spinning on one core with no frames,
+    /// no bytes and idle GPUs is killed (runs 11818, 11822); one that moves bytes, whose GPUs
+    /// work, whose GPUs cannot be read or that runs on more than one core is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_gpu_call_spinning_without_work_is_killed_and_working_ones_are_not() {
+        let cases: [(&str, &str, Option<Activity>, bool); 5] = [
+            ("spins", "while :; do :; done", Some(Arc::new(|| Some(0))), true),
+            ("moves bytes", "while :; do echo work; done > /dev/null", Some(Arc::new(|| Some(0))), false),
+            ("GPU works", "while :; do :; done", {
+                let busy = std::sync::atomic::AtomicU64::new(0);
+                Some(Arc::new(move || Some(busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed))))
+            }, false),
+            ("GPU unread", "while :; do :; done", Some(Arc::new(|| None)), false),
+            ("spins on two cores", "while :; do :; done & while :; do :; done", Some(Arc::new(|| Some(0))), false),
+        ];
+        // A shell can fork a CPU spinner. Always end its group, including on an assertion
+        // failure: Child::kill only ends the shell and leaves that spinner running.
+        struct ChildGroup { child: Child, exact: Exact }
+        impl Drop for ChildGroup {
+            fn drop(&mut self) {
+                let _ = self.exact.kill();
+                let _ = self.child.wait();
+                for member in group_members(self.exact.birth()) {
+                    if let Ok(Some(exact)) = Exact::open(&member) {
+                        let _ = exact.wait();
+                    }
+                }
+            }
+        }
+        for (case, script, activity, killed) in cases {
+            let child = Command::new("/bin/sh").args(["-c", script]).process_group(0).stdin(Stdio::null()).spawn().unwrap();
+            let birth = Birth::of(child.id()).unwrap();
+            let group = ChildGroup { child, exact: Exact::open(&birth).unwrap().unwrap() };
+            let liveness = Liveness { sample: Duration::from_millis(20) };
+            let watching = Watching::start(group.exact.try_clone().unwrap(), Meter::Work, liveness, Duration::ZERO, None, activity, "invoke").unwrap();
+            // Long past the floor (0.12 s): only measured stillness ends it.
+            std::thread::sleep(liveness.floor() * 25);
+            assert_eq!(birth.ended().unwrap(), killed, "{case}");
+            let verdict = watching.finish().0;
+            assert_eq!(verdict.is_some(), killed, "{case}: {verdict:?}");
+            if killed {
+                let verdict = verdict.unwrap();
+                assert!(verdict.contains("wedged during invoke: no measurable progress"), "{case}");
+                assert!(verdict.contains("(frames, bytes moved, GPU kernels and copies, CPU beyond one core)"), "{verdict}");
+            }
+            drop(group);
+            assert!(group_members(&birth).iter().all(|member| member.ended().unwrap()), "{case}: the test left a process running");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_subject_waiting_on_watched_work_is_still_only_once_that_work_ends() {
@@ -514,6 +603,7 @@ mod tests {
             Some(Arc::new(move || {
                 waits.load(std::sync::atomic::Ordering::Acquire)
             })),
+            None,
             "run_job",
         )
         .unwrap();
@@ -545,7 +635,7 @@ mod tests {
             let liveness = Liveness { sample: Duration::from_millis(20) };
             let waits: Option<Waits> = (excuse == "waits").then(|| Arc::new(|| true) as Waits);
             let meter = if excuse == "waits" { Meter::Burn } else { Meter::Frames };
-            let watching = Watching::start(exact, meter, liveness, Duration::ZERO, waits, "invoke").unwrap();
+            let watching = Watching::start(exact, meter, liveness, Duration::ZERO, waits, None, "invoke").unwrap();
             let watch = watching.watch();
             watch.serving(excuse == "serving");
             let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
