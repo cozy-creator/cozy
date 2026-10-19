@@ -1,7 +1,7 @@
 //! Native owners retain ordinary tree roots while their kernel-held fence is locked.
 //! Final release closes descriptors only; collection reaps unlocked records and directories.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
@@ -32,6 +32,7 @@ impl Retention {
         // Internal ownership metadata must not recursively invoke cache admission/maintenance.
         let mut store = store.clone();
         store.cache_mode = false;
+        let _acquisition = acquire(&store)?;
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let parent = store.root().join("tmp/holds");
         fs::create_dir_all(&parent).map_err(fail("create", &parent))?;
@@ -71,7 +72,12 @@ impl Retention {
         Ok(hold)
     }
 
+    pub(crate) fn acquire(&self) -> Result<AcquisitionGuard> {
+        acquire(&self.store)
+    }
+
     pub(crate) fn extend(&self, objects: impl IntoIterator<Item = ObjectRef>) -> Result<()> {
+        let _acquisition = acquire(&self.store)?;
         let mut held = self.objects.lock().unwrap();
         let mut next = held.clone();
         for object in objects {
@@ -125,10 +131,36 @@ pub(crate) fn protected(store: &Store, id: &str) -> Result<bool> {
 /// Called by maintenance, never by Drop. A live or fork-inherited fence is never removed.
 pub(crate) fn reap(store: &Store) -> Result<usize> {
     let mut removed = 0;
-    for (id, _) in store.pins()? {
-        if !id.starts_with(PREFIX) {
-            continue;
+    let mut ids: BTreeSet<String> = store
+        .pins()?
+        .into_iter()
+        .map(|(id, _)| id)
+        .filter(|id| id.starts_with(PREFIX))
+        .collect();
+    let parent = store.root().join("tmp/holds");
+    match fs::read_dir(&parent) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(fail("list", &parent))?;
+                if entry
+                    .file_type()
+                    .map_err(fail("stat", entry.path()))?
+                    .is_dir()
+                {
+                    if let Some(id) = entry
+                        .file_name()
+                        .to_str()
+                        .filter(|id| id.starts_with(PREFIX))
+                    {
+                        ids.insert(id.to_owned());
+                    }
+                }
+            }
         }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(fail("list", &parent)(e)),
+    }
+    for id in ids {
         let path = fence(store, &id);
         let guard = match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(file) => match file.try_lock() {
@@ -157,6 +189,39 @@ pub(crate) fn reap(store: &Store) -> Result<usize> {
 #[derive(Debug)]
 pub(crate) struct DirectoryGuard(#[allow(dead_code)] File);
 
+#[derive(Debug)]
+pub(crate) struct AcquisitionGuard(#[allow(dead_code)] File);
+
+fn collection_file(store: &Store) -> Result<File> {
+    let path = store.root().join("tmp/holds/gc.lock");
+    fs::create_dir_all(path.parent().expect("a collection fence has a parent"))
+        .map_err(fail("create", &path))?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(fail("open", &path))
+}
+
+/// Only the short metadata-to-retention publication, never a checkpoint's lifetime.
+pub(crate) fn acquire(store: &Store) -> Result<AcquisitionGuard> {
+    let file = collection_file(store)?;
+    file.lock_shared().map_err(fail("lock", store.root()))?;
+    Ok(AcquisitionGuard(file))
+}
+
+/// Collection skips a concurrent acquisition; it never waits on a caller/provider.
+pub(crate) fn try_collect(store: &Store) -> Result<Option<AcquisitionGuard>> {
+    let file = collection_file(store)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(AcquisitionGuard(file))),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => Err(fail("lock", store.root())(e)),
+    }
+}
+
 fn sidecar(path: &Path) -> Result<PathBuf> {
     let parent = path
         .parent()
@@ -183,7 +248,8 @@ fn directory_file(path: &Path) -> Result<File> {
         .map_err(fail("open", sidecar))
 }
 
-pub(crate) fn directory(path: &Path) -> Result<DirectoryGuard> {
+pub(crate) fn directory(store: &Store, path: &Path) -> Result<DirectoryGuard> {
+    let _acquisition = acquire(store)?;
     let file = directory_file(path)?;
     file.lock_shared().map_err(fail("lock", path))?;
     Ok(DirectoryGuard(file))
@@ -195,5 +261,16 @@ pub(crate) fn try_directory(path: &Path) -> Result<Option<DirectoryGuard>> {
         Ok(()) => Ok(Some(DirectoryGuard(file))),
         Err(TryLockError::WouldBlock) => Ok(None),
         Err(TryLockError::Error(e)) => Err(fail("lock", path)(e)),
+    }
+}
+
+/// Maintenance only, after removing the entry while holding both the exclusive collection
+/// gate and this entry's exclusive directory guard. New openers take the shared gate first.
+pub(crate) fn remove_directory_fence(path: &Path, _guard: &DirectoryGuard) -> Result<()> {
+    let sidecar = sidecar(path)?;
+    match fs::remove_file(&sidecar) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(fail("remove", sidecar)(e)),
     }
 }

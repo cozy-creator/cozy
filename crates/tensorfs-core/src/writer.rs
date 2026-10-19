@@ -42,6 +42,7 @@ use crate::format::{
     Part, Pipeline, Tensor, Value, CHUNKS_DIR, CONFIG_FILE,
 };
 use crate::import;
+use crate::store2::retention::{self, Retention};
 use crate::sha256::{hex, Sha256};
 use crate::store2::{fail, fault, is_name, sync_dir, Admission, Checkpoint, Error, Pin, Result, Store};
 
@@ -199,6 +200,7 @@ pub struct Writer {
     key: Option<String>,
     /// Held until commit or abandon.
     fence: Option<File>,
+    retention: Option<Arc<Retention>>,
     base: Option<Checkpoint>,
     pipeline: Option<Pipeline>,
     /// Components declared, in order.
@@ -365,13 +367,17 @@ impl Writer {
 
     fn open(dest: Dest, dir: PathBuf, key: Option<&str>, base: Option<&Checkpoint>) -> Result<Writer> {
         let fence = fence(&dir)?;
+        let _acquisition = dest.store().map(retention::acquire).transpose()?;
         let spool = open(&dir.join(SPOOL), key.is_none(), false)?;
         let journal = key.map(|_| open(&dir.join(JOURNAL), false, true)).transpose()?;
+        let objects = base.map_or_else(Vec::new, |b| std::iter::once(b.id().clone()).chain(b.header().objects().cloned()).collect());
+        let retention = dest.store().map(|store| Retention::new(store, objects)).transpose()?;
         let mut writer = Writer {
             dest,
             dir,
             key: key.map(str::to_owned),
             fence: Some(fence),
+            retention,
             base: base.cloned(),
             pipeline: None,
             specs: Vec::new(),
@@ -394,6 +400,7 @@ impl Writer {
         if writer.journal.is_some() {
             writer.resume()?;
         }
+        writer.retain_referenced()?;
         Ok(writer)
     }
 
@@ -479,7 +486,7 @@ impl Writer {
             return Err(bad(format!("{path:?} names a variant, not a repo file")));
         }
         let object = match &self.dest {
-            Dest::Store(store) => store.put_bytes(bytes)?,
+            Dest::Store(_) => self.dest.put_bytes(&self.dir, bytes, self.retention.as_ref())?,
             Dest::Folder { root, .. } => {
                 let at = root.join(path);
                 let parent = at.parent().expect("a file has a directory");
@@ -488,13 +495,15 @@ impl Writer {
                 ObjectRef::of(bytes)
             }
             Dest::Endpoint { store, stream, .. } => {
+                let _acquisition = retention::acquire(store)?;
                 let object = store.put_bytes(bytes)?;
+                if let Some(hold) = &self.retention { hold.extend([object.clone()])?; }
                 stream.put_stored(store, &object).map_err(sent)?;
                 object
             }
         };
         self.repo.insert(path.to_owned(), object);
-        Ok(())
+        self.retain_referenced()
     }
 
     /// The repo files given to [`Writer::repo_file`].
@@ -542,7 +551,7 @@ impl Writer {
         }
         for (chunk, mut members) in packs {
             members.sort_by_key(|i| plan.places[*i].offset);
-            let mut admit = self.dest.admit(&self.dir)?;
+            let mut admit = self.dest.admit(&self.dir, self.retention.as_ref())?;
             let mut end = 0;
             for i in members {
                 let (place, stored) = (plan.places[i], list[i].2);
@@ -645,7 +654,7 @@ impl Writer {
                     }
                 }
                 for object in c.assets.values() {
-                    self.dest.copy_in(&self.dir, base, object)?;
+                    self.dest.copy_in(&self.dir, base, object, self.retention.as_ref())?;
                 }
                 specs.push(Spec {
                     name: c.name.clone(),
@@ -747,7 +756,7 @@ impl Writer {
                 break Ok(());
             }
             let n = left.min(GRID);
-            let written = (self.dest.admit(&self.dir))
+            let written = (self.dest.admit(&self.dir, self.retention.as_ref()))
                 .and_then(|mut admit| pour(data, &mut admit, n, &mut buffer, what).and_then(|()| admit.finish()));
             match written {
                 Ok(object) => objects.push(object),
@@ -768,6 +777,11 @@ impl Writer {
         };
         self.buffer = buffer;
         laid.map(|()| objects)
+    }
+
+    fn retain_referenced(&self) -> Result<()> {
+        if let Some(hold) = &self.retention { hold.extend(self.referenced())?; }
+        Ok(())
     }
 
     fn referenced(&self) -> Vec<ObjectRef> {
@@ -835,7 +849,7 @@ impl Writer {
             let place = match (at.length >= STANDALONE, on_grid) {
                 (true, true) => {
                     for (object, ..) in &ranges {
-                        self.dest.copy_in(&self.dir, from, object)?;
+                        self.dest.copy_in(&self.dir, from, object, self.retention.as_ref())?;
                     }
                     At::Grid(ranges.iter().map(|r| r.0.clone()).collect())
                 }
@@ -920,12 +934,14 @@ impl Writer {
     }
 
     fn record(&mut self, line: Line, bytes: u64) -> Result<()> {
+        let _acquisition = self.dest.store().map(retention::acquire).transpose()?;
         if self.journal.is_some() {
             serde_json::to_writer(&mut self.pending, &line).expect("a journal line serializes");
             self.pending.push(b'\n');
             self.unflushed += bytes;
         }
         self.apply(line);
+        self.retain_referenced()?;
         if self.unflushed >= STANDALONE {
             self.flush()?;
         }
@@ -1043,18 +1059,26 @@ impl Writer {
             let _ = fs::remove_dir(&writing);
         }
         self.fence = None;
+        self.retention = None;
+        self.base = None;
     }
 }
 
 impl Drop for Writer {
-    /// An unfinished keyed writer keeps what it journaled; a keyless one leaves nothing.
+    /// A keyed writer flushes its resume state; an anonymous workdir is reaped by maintenance.
     fn drop(&mut self) {
         if self.fence.is_none() {
             return;
         }
         match self.key {
             Some(_) => drop(self.flush()),
-            None => self.close(),
+            None => {
+                // Do not perform filesystem cleanup from a final owner (possibly under a GIL).
+                // sweep_anonymous/sweep_writers already reclaim unlocked workdirs.
+                self.fence = None;
+                self.retention = None;
+                self.base = None;
+            },
         }
     }
 }
@@ -1129,7 +1153,7 @@ impl ComponentWriter<'_> {
     pub fn asset(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
         self.w.live()?;
         asset_name(&self.name, name)?;
-        let object = self.w.dest.put_bytes(&self.w.dir, bytes)?;
+        let object = self.w.dest.put_bytes(&self.w.dir, bytes, self.w.retention.as_ref())?;
         self.add_asset(name, object, false, bytes.len() as u64)
     }
 
@@ -1248,9 +1272,9 @@ impl Dest {
         }
     }
 
-    fn admit(&self, work: &Path) -> Result<Admit> {
+    fn admit(&self, work: &Path, hold: Option<&Arc<Retention>>) -> Result<Admit> {
         match self {
-            Dest::Store(store) => Ok(Admit::Store(store.admit(None)?)),
+            Dest::Store(store) => Ok(Admit::Store(store.admit(None)?, hold.cloned())),
             Dest::Folder { root, .. } => {
                 static NEXT: AtomicU64 = AtomicU64::new(0);
                 let n = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -1266,23 +1290,25 @@ impl Dest {
                     length: 0,
                 }))
             }
-            Dest::Endpoint { store, stream, .. } => Ok(Admit::Endpoint(store.clone(), Arc::clone(stream), store.admit(None)?)),
+            Dest::Endpoint { store, stream, .. } => Ok(Admit::Endpoint(store.clone(), Arc::clone(stream), store.admit(None)?, hold.cloned())),
         }
     }
 
-    fn put_bytes(&self, work: &Path, bytes: &[u8]) -> Result<ObjectRef> {
-        let mut admit = self.admit(work)?;
+    fn put_bytes(&self, work: &Path, bytes: &[u8], hold: Option<&Arc<Retention>>) -> Result<ObjectRef> {
+        let mut admit = self.admit(work, hold)?;
         admit.write_all(bytes).map_err(fail("write", work))?;
         admit.finish()
     }
 
     /// Copies `object` from `from` unless it is here already.
-    fn copy_in(&self, work: &Path, from: &Checkpoint, object: &ObjectRef) -> Result<()> {
+    fn copy_in(&self, work: &Path, from: &Checkpoint, object: &ObjectRef, hold: Option<&Arc<Retention>>) -> Result<()> {
+        let _acquisition = self.store().map(retention::acquire).transpose()?;
         if self.has(object)? {
+            if let Some(hold) = hold { hold.extend([object.clone()])?; }
             return Ok(());
         }
         let mut src = from.object(object)?;
-        let mut admit = self.admit(work)?;
+        let mut admit = self.admit(work, hold)?;
         io::copy(&mut src, &mut admit).map_err(fail("copy", work))?;
         let got = admit.finish()?;
         if got != *object {
@@ -1297,9 +1323,9 @@ impl Dest {
 
 /// Bytes on their way to becoming an object of the destination.
 enum Admit {
-    Store(Admission),
+    Store(Admission, Option<Arc<Retention>>),
     Folder(FolderObject),
-    Endpoint(Store, Arc<Stream>, Admission),
+    Endpoint(Store, Arc<Stream>, Admission, Option<Arc<Retention>>),
 }
 
 /// A send that failed, as the writer's error.
@@ -1319,7 +1345,12 @@ struct FolderObject {
 impl Admit {
     fn finish(self) -> Result<ObjectRef> {
         match self {
-            Admit::Store(admission) => admission.finish(),
+            Admit::Store(admission, hold) => {
+                let _acquisition = hold.as_ref().map(|hold| hold.acquire()).transpose()?;
+                let object = admission.finish()?;
+                if let Some(hold) = hold { hold.extend([object.clone()])?; }
+                Ok(object)
+            },
             Admit::Folder(mut o) => {
                 let file = o.file.take().expect("a folder object has its file until it finishes");
                 file.sync_data().map_err(fail("sync", &o.temp))?;
@@ -1332,8 +1363,11 @@ impl Admit {
                 fs::rename(&o.temp, &at).map_err(fail("rename into", &at))?;
                 Ok(got)
             }
-            Admit::Endpoint(store, stream, admission) => {
+            Admit::Endpoint(store, stream, admission, hold) => {
+                let acquisition = hold.as_ref().map(|hold| hold.acquire()).transpose()?;
                 let object = admission.finish()?;
+                if let Some(hold) = hold { hold.extend([object.clone()])?; }
+                drop(acquisition);
                 stream.put_stored(&store, &object).map_err(sent)?;
                 Ok(object)
             }
@@ -1344,14 +1378,14 @@ impl Admit {
 impl Write for Admit {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match self {
-            Admit::Store(admission) => admission.write(bytes),
+            Admit::Store(admission, _) => admission.write(bytes),
             Admit::Folder(o) => {
                 let n = o.file.as_mut().expect("unfinished").write(bytes)?;
                 o.hash.update(&bytes[..n]);
                 o.length += n as u64;
                 Ok(n)
             }
-            Admit::Endpoint(_, _, admission) => admission.write(bytes),
+            Admit::Endpoint(_, _, admission, _) => admission.write(bytes),
         }
     }
 

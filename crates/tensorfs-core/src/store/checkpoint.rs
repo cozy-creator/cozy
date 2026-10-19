@@ -50,10 +50,27 @@ fn write_view(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::rename(&temp, path).map_err(fail("rename", path))
 }
 
+fn cached_directory(store: &Store, dir: &Path) -> Result<Option<DirectoryGuard>> {
+    let root = fs::canonicalize(store.root()).map_err(fail("resolve", store.root()))?;
+    let real = fs::canonicalize(dir).map_err(fail("resolve", dir))?;
+    for area in ["snapshots", "views"] {
+        if let Ok(relative) = real.strip_prefix(root.join(area)) {
+            if let Some(first) = relative.components().next() {
+                return retention::directory(store, &root.join(area).join(first.as_os_str())).map(Some);
+            }
+        }
+    }
+    Ok(None)
+}
+
 impl Store {
     /// The cozytensors whose header is `header`.
     pub fn checkpoint(&self, header: &ObjectRef) -> Result<Checkpoint> {
-        Checkpoint::opened(Objects::Store(self.clone()), header.clone(), Header::from_cbor(&self.read(header)?)?, None)
+        let acquisition = retention::acquire(self)?;
+        let ck = Checkpoint::opened(Objects::Store(self.clone()), header.clone(), Header::from_cbor(&self.read(header)?)?, None)?;
+        drop(acquisition);
+        self.cache_touch(header)?;
+        Ok(ck)
     }
 
     /// The tree document `tree`.
@@ -63,8 +80,16 @@ impl Store {
 
     /// `variant` of `tree` (its only one when `None`).
     pub fn variant(&self, tree: &ObjectRef, variant: Option<&str>) -> Result<Checkpoint> {
-        let tree = self.tree(tree)?;
-        self.checkpoint(tree.variant(variant)?.1)
+        let acquisition = retention::acquire(self)?;
+        let parsed = self.tree(tree)?;
+        let header = parsed.variant(variant)?.1;
+        let ck = Checkpoint::opened(Objects::Store(self.clone()), header.clone(), Header::from_cbor(&self.read(header)?)?, None)?;
+        if let Some(hold) = &ck._retention {
+            hold.extend(std::iter::once(tree.clone()).chain(parsed.files.values().cloned()))?;
+        }
+        drop(acquisition);
+        self.cache_touch(header)?;
+        Ok(ck)
     }
 }
 
@@ -79,19 +104,11 @@ impl Checkpoint {
             let hold = Retention::new(store, std::iter::once(id.clone()).chain(header.objects().cloned()))?;
             // These immutable descriptors survive fork without touching an inherited mutex.
             // The sidecars are outside the returned plain folders.
-            directories.push(retention::directory(&store.root().join("views").join(&id.sha256))?);
+            directories.push(retention::directory(store, &store.root().join("views").join(&id.sha256))?);
             if matches!(&objects, Objects::Store(_)) {
-                directories.push(retention::directory(&store.root().join("snapshots").join(&id.sha256))?);
+                directories.push(retention::directory(store, &store.root().join("snapshots").join(&id.sha256))?);
             } else if let Objects::Folder { dir, .. } = &objects {
-                let root = fs::canonicalize(store.root()).map_err(fail("resolve", store.root()))?;
-                let real = fs::canonicalize(dir).map_err(fail("resolve", dir))?;
-                for area in ["snapshots", "views"] {
-                    if let Ok(relative) = real.strip_prefix(root.join(area)) {
-                        if let Some(first) = relative.components().next() {
-                            directories.push(retention::directory(&root.join(area).join(first.as_os_str()))?);
-                        }
-                    }
-                }
+                if let Some(guard) = cached_directory(store, dir)? { directories.push(guard); }
             }
             Some(hold)
         } else { None };
@@ -102,6 +119,11 @@ impl Checkpoint {
     /// chunks and assets from `dir/chunks/`, else from `cache`. Lengths are checked; digests are
     /// checked where bytes enter a store ([`Store::admit_folder`]).
     pub fn folder(dir: &Path, variant: Option<&str>, cache: Option<&Store>) -> Result<Checkpoint> {
+        let _acquisition = cache.map(retention::acquire).transpose()?;
+        // Hold the actual source directory before its header is read. A collector cannot
+        // prune a cached snapshot between metadata parsing and owner publication.
+        let source_dir = if dir.is_file() { dir.parent().unwrap_or_else(|| Path::new(".")) } else { dir };
+        let _source_directory = cache.map(|store| cached_directory(store, source_dir)).transpose()?.flatten();
         if dir.is_file() {
             let parent = dir.parent().unwrap_or_else(|| Path::new("."));
             let bytes = fs::read(dir).map_err(fail("read", dir))?;
@@ -185,6 +207,7 @@ impl Checkpoint {
                 let mut tree = Tree::default();
                 tree.set_variant(variant, self.id.clone());
                 store.snapshot(&store.put_tree(&tree)?, &dir, None)?;
+                store.cache_snapshot(&dir)?;
                 Ok(dir)
             }
         }
@@ -204,6 +227,9 @@ impl Checkpoint {
         write_view(&config, &bytes)?;
         for name in c.assets.keys() {
             write_view(&dir.join(name), &self.asset(&c.name, name)?)?;
+        }
+        if let Some(store) = self.store() {
+            store.cache_snapshot(&root.join("views").join(&self.id.sha256))?;
         }
         Ok(dir)
     }
