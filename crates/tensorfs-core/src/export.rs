@@ -221,7 +221,7 @@ pub fn safetensors(
                 _ => format!("{weights}-{:05}-of-{n:05}.safetensors", i + 1),
             };
             for e in shard {
-                weight_map.insert(e.name.clone(), ConfigValue::Str(file.clone()));
+                weight_map.insert(e.name.clone(), ConfigValue::from(file.as_str()));
                 total += e.length;
             }
             write_file(
@@ -235,12 +235,8 @@ pub fn safetensors(
         }
         if n > 1 {
             let file = format!("{folder}{weights}.safetensors.index.json");
-            let total = Config::from([("total_size".to_owned(), ConfigValue::Int(total.into()))]);
-            let doc = Config::from([
-                ("metadata".to_owned(), ConfigValue::Map(total)),
-                ("weight_map".to_owned(), ConfigValue::Map(weight_map)),
-            ]);
-            write(&dir.join(&file), &config_json(&doc))?;
+            let doc = json!({"metadata": {"total_size": total}, "weight_map": weight_map});
+            write(&dir.join(&file), &config_json(doc.as_object().expect("a map")))?;
             written.push(file);
         }
     }
@@ -281,7 +277,9 @@ pub fn config_json(config: &Config) -> Vec<u8> {
 }
 
 fn map(out: &mut String, m: &Config, depth: usize) {
-    nested(out, '{', '}', depth, m.iter(), |out, (k, v)| {
+    let mut sorted: Vec<_> = m.iter().collect();
+    sorted.sort_by_key(|(k, _)| *k);
+    nested(out, '{', '}', depth, sorted.into_iter(), |out, (k, v)| {
         out.push_str(&serde_json::to_string(k).expect("a string serializes"));
         out.push_str(": ");
         value(out, v, depth + 1);
@@ -312,27 +310,20 @@ fn nested<T>(
 
 fn value(out: &mut String, v: &ConfigValue, depth: usize) {
     match v {
-        ConfigValue::Null => out.push_str("null"),
-        ConfigValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        ConfigValue::Int(i) => out.push_str(&i.to_string()),
-        ConfigValue::Float(f) => out.push_str(&python_float(*f)),
-        ConfigValue::Str(s) => out.push_str(&serde_json::to_string(s).expect("a string serializes")),
-        ConfigValue::List(l) => nested(out, '[', ']', depth, l.iter(), |out, v| value(out, v, depth + 1)),
-        ConfigValue::Map(m) => map(out, m, depth),
+        ConfigValue::Number(n) if n.is_f64() => {
+            out.push_str(&python_float(n.as_f64().expect("a float")))
+        }
+        ConfigValue::Array(l) => {
+            nested(out, '[', ']', depth, l.iter(), |out, v| value(out, v, depth + 1))
+        }
+        ConfigValue::Object(m) => map(out, m, depth),
+        scalar => out.push_str(&scalar.to_string()),
     }
 }
 
-/// Python's `repr` of a float: the shortest round-trip digits (ryu's, the closest of them),
+/// Python's `repr` of a finite float: the shortest round-trip digits (ryu's, the closest of them),
 /// positional for decimal exponents -4 through 15, else `d.ddde±XX`.
 fn python_float(f: f64) -> String {
-    if !f.is_finite() {
-        return match f {
-            f if f.is_nan() => "NaN",
-            f if f > 0.0 => "Infinity",
-            _ => "-Infinity",
-        }
-        .to_owned();
-    }
     let ryu = serde_json::to_string(&f).expect("a finite float");
     let (sign, ryu) = ryu.strip_prefix('-').map_or(("", ryu.as_str()), |r| ("-", r));
     let (mantissa, exp) = ryu.split_once('e').unwrap_or((ryu, "0"));

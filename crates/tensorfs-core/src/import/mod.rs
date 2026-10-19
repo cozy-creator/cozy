@@ -445,10 +445,8 @@ pub fn layout(mut files: BTreeMap<String, Vec<u8>>, tensored: &[String]) -> Resu
     let pipeline = match files.remove(PIPELINE_FILE) {
         Some(bytes) => {
             let config = parse_config(PIPELINE_FILE, &bytes)?;
-            let class = match config.get("_class_name") {
-                Some(ConfigValue::Str(c)) => format!("diffusers.{c}"),
-                _ => String::new(),
-            };
+            let class = (config.get("_class_name").and_then(ConfigValue::as_str))
+                .map_or_else(String::new, |c| format!("diffusers.{c}"));
             Some(Pipeline { class, config })
         }
         None => None,
@@ -456,13 +454,10 @@ pub fn layout(mut files: BTreeMap<String, Vec<u8>>, tensored: &[String]) -> Resu
     let listed: BTreeMap<String, String> = (pipeline.iter())
         .flat_map(|p| &p.config)
         .filter(|(name, _)| !name.starts_with('_'))
-        .filter_map(|(name, row)| match row {
-            ConfigValue::List(row) => match row.as_slice() {
-                [ConfigValue::Str(library), ConfigValue::Str(class), ..] => {
-                    Some((name.clone(), format!("{library}.{class}")))
-                }
-                _ => None,
-            },
+        .filter_map(|(name, row)| match row.as_array()?.as_slice() {
+            [library, class, ..] => {
+                Some((name.clone(), format!("{}.{}", library.as_str()?, class.as_str()?)))
+            }
             _ => None,
         })
         .collect();
@@ -547,16 +542,13 @@ fn parse_config(path: &str, bytes: &[u8]) -> Result<Config> {
 
 /// `<library>.<Class>` from a component's config file, `""` when it names none.
 fn class_of(file: &str, config: &Config) -> String {
-    let first = match config.get("architectures") {
-        Some(ConfigValue::List(a)) => a.first(),
-        _ => None,
-    };
-    match (first, config.get("_class_name"), config.get("tokenizer_class")) {
-        (Some(ConfigValue::Str(c)), _, _) => format!("transformers.{c}"),
-        (_, Some(ConfigValue::Str(c)), _) => format!("diffusers.{c}"),
-        (_, _, Some(ConfigValue::Str(c))) if file == "tokenizer_config.json" => {
-            format!("transformers.{c}")
-        }
+    let text = |key: &str| config.get(key).and_then(ConfigValue::as_str);
+    let first = (config.get("architectures").and_then(ConfigValue::as_array))
+        .and_then(|a| a.first()?.as_str());
+    match (first, text("_class_name"), text("tokenizer_class")) {
+        (Some(c), _, _) => format!("transformers.{c}"),
+        (_, Some(c), _) => format!("diffusers.{c}"),
+        (_, _, Some(c)) if file == "tokenizer_config.json" => format!("transformers.{c}"),
         _ => String::new(),
     }
 }

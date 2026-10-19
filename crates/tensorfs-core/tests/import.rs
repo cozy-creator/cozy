@@ -1555,16 +1555,19 @@ fn folder_tensors(files: &BTreeMap<String, Vec<u8>>) -> BTreeMap<(String, String
 #[test]
 fn a_convert_survives_export() {
     let access = Access::default();
+    // (repo, weights variant, files a current safetensors wrote: reproduced byte for byte; an
+    // older writer padded its header otherwise).
     let cases = [
-        ("hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2", None),
-        ("hf-internal-testing/tiny-random-LlamaForCausalLM@9fb191250dd56d0ba7ec9785a025ed29c03d5998", None),
-        ("hf-internal-testing/tiny-random-bert-sharded-safetensors@3157eb8d4addc30b6e95a8000f2e3f0f6114bf5a", None),
+        ("hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2", None, true),
+        ("hf-internal-testing/tiny-random-LlamaForCausalLM@9fb191250dd56d0ba7ec9785a025ed29c03d5998", None, true),
+        ("hf-internal-testing/tiny-random-bert-sharded-safetensors@3157eb8d4addc30b6e95a8000f2e3f0f6114bf5a", None, false),
         (
             "hf-internal-testing/tiny-stable-diffusion-pipe-variants-right-format@5017a45b0389efbe1710fe4cf6df15ec8237e49b",
             Some("fp16"),
+            false,
         ),
     ];
-    for (repo, variant) in cases {
+    for (repo, variant, current) in cases {
         let dir = scratch(&repo[..repo.find('@').unwrap()].replace('/', "-"));
         let tmp = dir.join("tmp");
         let convert = |source: &str, variant: Option<&str>, into: &Path| {
@@ -1639,7 +1642,7 @@ fn a_convert_survives_export() {
                 false => assert!(ours[path] == *bytes, "{repo}: {path} differs from upstream's"),
             }
         }
-        // Weights: every upstream tensor, and a file safetensors wrote whole is byte for byte.
+        // Weights: every upstream tensor, and a file a current safetensors wrote, byte for byte.
         assert!(folder_tensors(&upstream) == folder_tensors(&exported), "{repo}: the tensors");
         let weights = |files: &BTreeMap<String, Vec<u8>>, folder: &str| -> Vec<Vec<u8>> {
             (files.iter())
@@ -1651,7 +1654,7 @@ fn a_convert_survives_export() {
             (None, "model") => "",
             (_, name) => name,
         }) {
-            if let ([theirs], [ours]) = (&weights(&upstream, folder)[..], &weights(&exported, folder)[..]) {
+            if let ([theirs], [ours], true) = (&weights(&upstream, folder)[..], &weights(&exported, folder)[..], current) {
                 assert!(theirs == ours, "{repo}: {folder} weights are not byte for byte");
             }
         }
@@ -1664,12 +1667,14 @@ fn a_convert_survives_export() {
             }
         }
 
-        // The export converts to the same model; its export, again, to the same cozytensors.
+        // The export converts to the same model (its tensors in any order: a class without an
+        // order reference keeps its source's data order); its export, again, to the same
+        // cozytensors.
         let out = dir.join("out");
         let second = convert(out.to_str().unwrap(), None, &dir.join("second"));
         let model = |ck: &Checkpoint| {
-            let tensors: Vec<_> = (ck.tensors())
-                .map(|(c, t)| (c.to_owned(), t.key.clone(), t.dtype.clone(), t.shape.clone(), ck.read(c, &t.key).unwrap()))
+            let tensors: BTreeMap<_, _> = (ck.tensors())
+                .map(|(c, t)| ((c.to_owned(), t.key.clone()), (t.dtype.clone(), t.shape.clone(), ck.read(c, &t.key).unwrap())))
                 .collect();
             let h = ck.header();
             let assets: Vec<_> = h.assets().map(|(c, n, r)| (c.to_owned(), n.to_owned(), r.clone())).collect();
@@ -1678,7 +1683,9 @@ fn a_convert_survives_export() {
                 .collect();
             (tensors, assets, specs, h.pipeline().cloned(), h.metadata.get(import::FILE_METADATA).cloned())
         };
-        assert!(model(&first) == model(&second), "{repo}: the model");
+        let (a, b) = (model(&first), model(&second));
+        assert!(a.0 == b.0, "{repo}: the tensors");
+        assert_eq!((&a.1, &a.2, &a.3, &a.4), (&b.1, &b.2, &b.3, &b.4), "{repo}: the model");
         export(&second, &dir.join("second"), &out);
         let third = convert(out.to_str().unwrap(), None, &dir.join("third"));
         assert_eq!(third.id(), second.id(), "{repo}: convert of an export is a fixed point");
