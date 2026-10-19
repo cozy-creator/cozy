@@ -11,7 +11,7 @@ use tensorfs_core::err::Code;
 use tensorfs_core::fetch::{
     upload_tree, Client, Config, Endpoint, Fetcher, Fresh, ObjectStore, Origin, Payload, SourcePolicy, Stream, Want,
 };
-use tensorfs_core::format::{ConfigValue, Dtype, ObjectRef, Tree};
+use tensorfs_core::format::{Config, Dtype, ObjectRef, Tree};
 use tensorfs_core::store2::Store;
 use tensorfs_core::writer::{Data, Source};
 
@@ -55,7 +55,7 @@ fn client() -> Client {
 fn checkpoint(store: &Store, seed: u64) -> (ObjectRef, ObjectRef, BTreeMap<(String, String), Vec<u8>>) {
     let mut tensors = BTreeMap::new();
     let mut w = store.writer(None, None).unwrap();
-    let config = BTreeMap::from([("layers".to_owned(), ConfigValue::Int(2))]);
+    let config: Config = serde_json::from_str(r#"{"layers":2}"#).unwrap();
     for (component, key, n) in [("unet", "big.weight", 40 * MIB), ("unet", "norm.weight", 3000), ("vae", "conv.weight", 2 * MIB)] {
         let bytes = noise(seed + n as u64, n);
         let mut c = w.component(component, "diffusers.Thing", config.clone(), None).unwrap();
@@ -217,7 +217,7 @@ fn a_streaming_writer_tees_to_the_store_before_publishing() {
     let stream = Arc::new(Stream::new(Arc::clone(&endpoint), runtime.handle().clone()));
     let mut w = local.streaming_writer(Arc::clone(&stream), "acme/streamed", "int8", None).unwrap();
     let big = noise(9, 70 * MIB);
-    let mut c = w.component("unet", "diffusers.Thing", BTreeMap::new(), None).unwrap();
+    let mut c = w.component("unet", "diffusers.Thing", Default::default(), None).unwrap();
     c.put("big", &Dtype::U8, &[big.len() as u64], Data::Plain(Source::Read(&mut &big[..]))).unwrap();
     c.put("small", &Dtype::U8, &[5], Data::Plain(Source::Read(&mut &b"small"[..]))).unwrap();
     stream.flush().unwrap();
@@ -253,7 +253,7 @@ fn an_upload_failure_keeps_the_local_checkpoint_and_stays_failed() {
     let local = Store::open(scratch.0.join("local")).unwrap();
     let stream = Arc::new(Stream::new(Arc::clone(&endpoint), runtime.handle().clone()));
     let mut w = local.streaming_writer(Arc::clone(&stream), "acme/failed", "int8", None).unwrap();
-    w.component("unet", "diffusers.Thing", BTreeMap::new(), None).unwrap()
+    w.component("unet", "diffusers.Thing", Default::default(), None).unwrap()
         .put("w", &Dtype::U8, &[5], Data::Plain(Source::Read(&mut &b"saved"[..]))).unwrap();
     assert!(w.commit().is_err(), "the real read-only server refuses PUT");
     let header = w.committed().expect("the local commit precedes upload").clone();

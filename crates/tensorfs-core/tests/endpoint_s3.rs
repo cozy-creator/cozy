@@ -10,7 +10,7 @@ use tensorfs_core::err::Code;
 use tensorfs_core::fetch::{
     upload_tree, with_tree, Client, Config, Endpoint, Fetcher, Fresh, ObjectStore, Origin, Payload, SourcePolicy, Want,
 };
-use tensorfs_core::format::{ConfigValue, Dtype, ObjectRef, Tree};
+use tensorfs_core::format::{Config, Dtype, ObjectRef, Tree};
 use tensorfs_core::store2::Store;
 use tensorfs_core::writer::{Data, Source};
 
@@ -36,7 +36,7 @@ async fn a_bucket_serves_the_protocol_under_sigv4() {
     let source = Store::open(scratch.join("source")).unwrap();
     let mut w = source.writer(None, None).unwrap();
     let big: Vec<u8> = (0..20u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
-    let config = BTreeMap::from([("layers".to_owned(), ConfigValue::Int(1))]);
+    let config: Config = serde_json::from_str(r#"{"layers":1}"#).unwrap();
     let mut unet = w.component("unet", "diffusers.Thing", config, None).unwrap();
     unet.put("w", &Dtype::U8, &[big.len() as u64], Data::Plain(Source::Read(&mut &big[..]))).unwrap();
     unet.put("b", &Dtype::U8, &[3], Data::Plain(Source::Read(&mut &b"abc"[..]))).unwrap();
