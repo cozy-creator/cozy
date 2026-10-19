@@ -881,6 +881,7 @@ fn encoding(t: &v1::Tensor, scheme: &str) -> Encoding {
         "fp8.rowwise" => Encoding::fp8_rowwise(0, &scale("scale")),
         "fp8.tensorwise" => Encoding::fp8_tensorwise(&scale("weight_scale")),
         "int8.convrot" => Encoding::int8_convrot(256, &scale("scale")),
+        "mxfp8" => Encoding::mxfp8(ScaleLayout::RowMajor),
         // v1's nvfp4 is ModelOpt's layout: its border never took ComfyUI's.
         "nvfp4" => Encoding::nvfp4(GlobalScale::Multiply, NibbleOrder::LowFirst, ScaleLayout::RowMajor),
         other => unreachable!("v1 maps to no {other}"),
@@ -914,6 +915,10 @@ fn v2_parts(t: &v1::Tensor, mapping: &Mapping) -> Result<Vec<(String, Dtype, Vec
                     }
                     ("nvfp4", "weight", _) => {
                         fail(Kind::Invalid, format!("{what}: nvfp4 weight {:?}", p.shape))
+                    }
+                    // The early mxfp8 stored its E8M0 scales as U8: the same bytes.
+                    ("mxfp8", "scale", _) if p.dtype == Dtype::U8 => {
+                        Ok((role.to_string(), Dtype::F8_E8M0, p.shape.clone()))
                     }
                     _ => Ok((role.to_string(), p.dtype.clone(), p.shape.clone())),
                 }
@@ -965,6 +970,10 @@ fn conforms(
         "int8.convrot" if cols % 256 == 0 => {
             want("weight", &[I8], &|s| s == logical)?;
             want("scale", &[F32, BF16, F16], &|s| numel(s) == rows)
+        }
+        "mxfp8" => {
+            want("weight", &fp8, &|s| s == logical)?;
+            want("scale", &[F8_E8M0], &|s| s == [rows, cols.div_ceil(32)])
         }
         "nvfp4" if cols % 16 == 0 => {
             want("weight", &[F4], &|s| s == [rows, cols])?;
