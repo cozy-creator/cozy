@@ -1,25 +1,50 @@
-# Speed gate: cozytensors/1 against safetensors (xs-045 F1, U8)
+# Speed gate: cozytensors/1 against safetensors (xs-045 F1, xs-055 R4)
 
 Requirement: cozytensors must be at least as fast as safetensors. Measured disk → pinned host → GPU on a
 rented card, with real lane bytes, from first open to the last byte resident on the GPU.
 
+On the coordinator's shared GPU proof pool, with the exact candidate wheel and CUDA Torch installed, pin
+the already-local D10 header refs in `sources.json`:
+
+```json
+{"cache_dir":"/var/lib/tensorfs","models":{
+  "sdxl-int8":{"checkpoint":"sha256:<D10-header-hex>"},
+  "qwen-int8":{"checkpoint":"sha256:<D10-header-hex>"}
+}}
 ```
-cozy model download fidika/sdxl@1.0.0/int8 --on <machine>
-cozy model download fidika/qwen-image-2.1@0.1.0/int8 --on <machine>
-python speedgate.py <work dir> <result.json>   # on the machine: torch, fastsafetensors 0.5.0, a tensorfs dev wheel
+
+```sh
+python crates/tensorfs/gates/speed/speedgate.py WORK RESULT.json --sources=sources.json \
+  --readers=T64+rust,fastsafetensors,st-cuda,st-cpu-cuda --cells=full,window
 ```
 
-`speedgate.py` writes each lane from the machine's v1 store into a TensorFS v2 store with the v2 writer (the real
-chunk layout) and into one safetensors file per component, then times four readers in interleaved
-repetitions:
+Use a new owned `WORK` and result filename. The script never downloads weights or erases existing fixtures.
+`--build-only` prepares identical U8 stored-part fixtures through public `read_into`/`Writer`, outside the
+clock; it is explicitly unmeasured. Five rotated repetitions cover all eight lane/cold/warm/full/window
+cells. Missing cells, controls or full-warm memory headroom cannot pass. `--cells=window` is a diagnostic
+subset and exits nonzero as an incomplete R4 gate. The shared rental's R4 spend cap is $3; qualification
+also requires ending it and verifying it gone.
 
-- `T64+rust`: `tensorfs.varena`, the plane's Rust chunk reader: checkpoint, `register_checkpoint`, want, wait.
-- `T64+fst`: the same chunk files through fastsafetensors' own C++ engine.
-- `T64`: F1's Python reader over the same chunk files (16 threads, 16 MiB requests).
-- `fastsafetensors`: fastsafetensors 0.5.0 over the safetensors files: the gate's reference.
+- `T64+rust`: public `components[name].tensors.read_all(keys, device="cuda:0", decode=False)`; select window
+  keys before allocation. No Plane or compatibility path.
+- Controls remain `fastsafetensors==0.5.0`, plus `safetensors==0.8.0` `safe_open` onto CUDA or CPU then CUDA.
+  Every cell must beat or tie its fastest measured control, from first open through completed transfer.
+- Cold requests `POSIX_FADV_DONTNEED` on payload files, retaining metadata caches; warm follows an untimed
+  read. Windows stay SDXL `unet/up_blocks.1.` and Qwen `transformer/transformer_blocks.30.`.
+- Shared-engine initialization is outside the clock. Actual `varena.copies()` records bank bytes, ns,
+  measured pinned-H2D ceiling, PCIe link, busy/pin time and staged/cached bytes. The full-warm rate/ceiling
+  ratio is reported, with no invented numeric threshold; absent measurements do not qualify the gate.
+- Results record source header/part/geometry hashes, extension/script hashes, package versions, GPU UUID,
+  driver and volume. Bank the exact wheel/cohort and rental receipts beside them. Decoding, model
+  construction, inference, preparation and downloads are excluded.
 
-Cells: cold (`POSIX_FADV_DONTNEED` first) and warm (the second of two reads); full (the whole checkpoint) and
-window (SDXL `unet.up_blocks.1`, Qwen `transformer.transformer_blocks.30`).
+Historical sources were `fidika/sdxl@1.0.0/int8` (4.08 GB, manifest
+`3eb5674846e82e5b8d3e20d73f083a6d4aaa57ea699425287d5669906cfe6064`) and
+`fidika/qwen-image-2.1@0.1.0/int8` (19.2 GB, manifest
+`e7c79ee942b892d76e778fb873fbdce55deaadb1fe669fca6e7851980f747493`). These v1 manifest
+IDs are provenance, not D10 header refs. The pool must supply the corresponding local public checkpoints;
+missing refs/assets block readiness. Tables and measurements below are historical F1/U8 evidence,
+including the older diagnostic readers; they do not qualify the new engine.
 
 ## U8: the Rust reader
 
