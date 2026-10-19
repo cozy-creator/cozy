@@ -1,4 +1,19 @@
 {
+  "unread_declarations": [
+    {"file": "quantize_config.json", "producer": "GPTQ (AutoGPTQ, GPTQModel)"},
+    {"file": "quant_config.json", "producer": "AWQ (AutoAWQ)"},
+    {"metadata_prefix": "gptq_", "producer": "GPTQ (GPTQModel)"}
+  ],
+  "companions": [
+    {"producer": "bitsandbytes", "keys": ["*.absmax", "*.quant_map", "*.nested_absmax", "*.nested_quant_map", "*.quant_state.*"]},
+    {"producer": "GPTQ/AWQ", "keys": ["*.qweight", "*.qzeros", "*.g_idx"]},
+    {"producer": "fp8 block scales (DeepSeek)", "keys": ["*.weight_scale_inv"]},
+    {"producer": "mxfp4 (gpt-oss)", "keys": ["*_blocks", "*_scales"]},
+    {"producer": "compressed-tensors packed", "keys": ["*.weight_packed", "*.weight_shape"]},
+    {"producer": "AWQ smoothing", "keys": ["*.pre_quant_scale"]},
+    {"producer": "ComfyUI asym_w4a8_int8", "keys": ["*.weight_s_rel"]}
+  ],
+  "marker_execution": ["full_precision_matrix_mult", "num_experts"],
   "carriers": [
     {
       "producer": "modelopt",
@@ -49,7 +64,8 @@
         {"suffix": "weight_scale_2", "role": "scale_2", "dtypes": ["F32"], "shape": "one"},
         {"suffix": "input_scale", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true}
       ],
-      "encoding": {"scheme": "nvfp4", "params": {"block_size": 16, "global_scale": "multiply", "nibble_order": "high_first", "scale_layout": "cublas_128x4"}}
+      "encoding": {"scheme": "nvfp4", "params": {"block_size": 16, "global_scale": "multiply", "nibble_order": "high_first", "scale_layout": "cublas_128x4"}},
+      "marker_values": {"block_size": 16, "group_size": 16}
     },
     {
       "producer": "comfy",
@@ -58,7 +74,8 @@
         {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3"], "shape": "logical"},
         {"suffix": "weight_scale", "role": "scale", "dtypes": ["F8_E8M0", "U8"], "as": "F8_E8M0", "shape": {"tiles": 32}}
       ],
-      "encoding": {"scheme": "mxfp8", "params": {"block_size": 32, "scale_layout": "cublas_128x4"}}
+      "encoding": {"scheme": "mxfp8", "params": {"block_size": 32, "scale_layout": "cublas_128x4"}},
+      "marker_values": {"block_size": 32, "group_size": 32}
     },
     {
       "producer": "comfy",

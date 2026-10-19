@@ -58,8 +58,23 @@ fn read_safetensors(path: &Path) -> Tensors {
     out.into_iter().map(|(_, t)| t).collect()
 }
 
-fn write_safetensors(path: &Path, tensors: &Tensors) {
+/// Safetensors `__metadata__`.
+type Metadata = serde_json::Map<String, serde_json::Value>;
+
+fn read_metadata(path: &Path) -> Metadata {
+    let raw = fs::read(path).unwrap();
+    let n = u64::from_le_bytes(raw[..8].try_into().unwrap()) as usize;
+    let head: Metadata = serde_json::from_slice(&raw[8..8 + n]).unwrap();
+    head.get("__metadata__")
+        .and_then(|m| m.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn write_safetensors(path: &Path, tensors: &Tensors, metadata: &Metadata) {
     let mut head = serde_json::Map::new();
+    if !metadata.is_empty() {
+        head.insert("__metadata__".into(), metadata.clone().into());
+    }
     let mut data = Vec::new();
     for (key, dtype, shape, bytes) in tensors {
         let at = [data.len(), data.len() + bytes.len()];
@@ -87,6 +102,7 @@ fn import(store: &Store, source: &Path) -> tensorfs_core::err::Result<Checkpoint
         access: &access,
         tmp: &tmp,
         progress: &|_, _, _| {},
+        stop: None,
     };
     let manifest = store.import(&req, None)?;
     Ok(store.checkpoint(&manifest).unwrap())
@@ -238,7 +254,7 @@ fn check(case: &str, wants: &[Want]) -> BTreeMap<String, usize> {
             plain.push((key, dtype, shape, bytes));
         }
     }
-    write_safetensors(&twin.join("model.safetensors"), &plain);
+    write_safetensors(&twin.join("model.safetensors"), &plain, &Metadata::new());
     let twin = import(&store, &twin).unwrap();
     let order = |ck: &Checkpoint| -> Vec<(String, String)> {
         ck.tensors()
@@ -516,19 +532,42 @@ fn comfy_int8_tensorwise_rowwise_and_convrot() {
     println!("comfy int8 elements one BF16 step from kitchen's: {steps:?}");
 }
 
-/// `case`'s source copied to a scratch folder, `edit`ed (key, dtype, shape, bytes) and imported.
-fn refused(case: &str, edit: &dyn Fn(&mut Tensors, &Path)) -> tensorfs_core::err::Refusal {
-    let dir = Scratch::new(&format!("refused-{case}"));
+/// `case`'s source copied to a scratch folder, `edit`ed (its tensors, metadata and folder) and
+/// imported; the scratch folder holds the store.
+fn edited(case: &str, edit: &dyn Fn(&mut Tensors, &mut Metadata, &Path)) -> (Scratch, Checkpoint) {
+    let (dir, result) = try_edited(case, edit);
+    (dir, result.unwrap())
+}
+
+fn try_edited(
+    case: &str,
+    edit: &dyn Fn(&mut Tensors, &mut Metadata, &Path),
+) -> (Scratch, tensorfs_core::err::Result<Checkpoint>) {
+    let dir = Scratch::new(&format!("edited-{case}"));
     let src = dir.0.join("src");
     fs::create_dir_all(&src).unwrap();
-    for entry in fs::read_dir(fixtures().join(case)).unwrap().flatten() {
-        fs::copy(entry.path(), src.join(entry.file_name())).unwrap();
+    if fixtures().join(case).is_dir() {
+        for entry in fs::read_dir(fixtures().join(case)).unwrap().flatten() {
+            fs::copy(entry.path(), src.join(entry.file_name())).unwrap();
+        }
     }
-    let mut tensors = read_safetensors(&src.join("model.safetensors"));
-    edit(&mut tensors, &src);
-    write_safetensors(&src.join("model.safetensors"), &tensors);
+    let file = src.join("model.safetensors");
+    let (mut tensors, mut metadata) = match file.exists() {
+        true => (read_safetensors(&file), read_metadata(&file)),
+        false => (Tensors::new(), Metadata::new()),
+    };
+    edit(&mut tensors, &mut metadata, &src);
+    write_safetensors(&file, &tensors, &metadata);
     let store = Store::open(dir.0.join("store")).unwrap();
-    import(&store, &src).map(drop).unwrap_err()
+    let result = import(&store, &src);
+    (dir, result)
+}
+
+fn refused(
+    case: &str,
+    edit: &dyn Fn(&mut Tensors, &mut Metadata, &Path),
+) -> tensorfs_core::err::Refusal {
+    try_edited(case, edit).1.map(drop).unwrap_err()
 }
 
 fn marker(module: &str, conf: serde_json::Value) -> Entry {
@@ -544,14 +583,14 @@ fn marker(module: &str, conf: serde_json::Value) -> Entry {
 #[test]
 fn unknown_undeclared_and_ambiguous_carriers_are_refused() {
     // Comfy's carrier without its markers: nothing declares what the scales mean.
-    let e = refused("comfy-fp8", &|t, _| {
+    let e = refused("comfy-fp8", &|t, _, _| {
         t.retain(|(k, ..)| !k.ends_with(".comfy_quant"))
     });
     assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
     assert!(e.detail.contains("attn.to_k.weight_scale"), "{}", e.detail);
 
     // Two producers declare one file.
-    let e = refused("comfy-fp8", &|_, dir| {
+    let e = refused("comfy-fp8", &|_, _, dir| {
         let doc = serde_json::json!({"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "FP8"}});
         fs::write(dir.join("hf_quant_config.json"), doc.to_string()).unwrap();
     });
@@ -563,7 +602,7 @@ fn unknown_undeclared_and_ambiguous_carriers_are_refused() {
     );
 
     // A format this import does not read is named, never stored as plain bytes.
-    let e = refused("comfy-int8", &|t, _| {
+    let e = refused("comfy-int8", &|t, _, _| {
         t.retain(|(k, ..)| k != "ff.up.comfy_quant");
         t.push(marker(
             "ff.up",
@@ -574,7 +613,7 @@ fn unknown_undeclared_and_ambiguous_carriers_are_refused() {
     assert!(e.detail.contains("convrot_w4a4"), "{}", e.detail);
 
     // ModelOpt's AWQ smoothing has no part in cozytensors/1's nvfp4 yet.
-    let e = refused("modelopt-nvfp4", &|t, _| {
+    let e = refused("modelopt-nvfp4", &|t, _, _| {
         t.push((
             "proj.pre_quant_scale".into(),
             "BF16".into(),
@@ -586,7 +625,7 @@ fn unknown_undeclared_and_ambiguous_carriers_are_refused() {
     assert!(e.detail.contains("pre_quant_scale"), "{}", e.detail);
 
     // A per-expert global scale is not one nvfp4 scale_2.
-    let e = refused("comfy-nvfp4", &|t, _| {
+    let e = refused("comfy-nvfp4", &|t, _, _| {
         let g = t
             .iter_mut()
             .find(|(k, ..)| k == "blocks.0.experts.weight_scale_2")
@@ -668,4 +707,257 @@ fn tfs_inspect_shows_comfy_nvfp4_at_a_glance() {
         human.contains(&format!("    2 × {NVFP4_COMFY}\n")),
         "{human}"
     );
+}
+
+fn tensor(key: &str, dtype: &str, shape: &[u64], bytes: Vec<u8>) -> Entry {
+    (key.into(), dtype.into(), shape.to_vec(), bytes)
+}
+
+fn zeros(dtype: &str, shape: &[u64]) -> Entry {
+    let n = Dtype::parse(dtype).byte_len(shape).unwrap();
+    (
+        String::new(),
+        dtype.into(),
+        shape.to_vec(),
+        vec![0; n as usize],
+    )
+}
+
+fn named(key: &str, (_, d, s, b): Entry) -> Entry {
+    (key.into(), d, s, b)
+}
+
+/// lllyasviel/flux1-dev-bnb-nf4@32d13814 (`flux1-dev-bnb-nf4-v2.safetensors`) is one file with no
+/// config: each NF4 weight is `U8 [n, 1]` beside `.absmax`, `.quant_map` and
+/// `.quant_state.bitsandbytes__nf4` (JSON bytes). Its keys and dtypes, at a small size, are refused,
+/// not stored as plain tensors.
+#[test]
+fn a_bnb_nf4_single_file_is_refused() {
+    let module = "model.diffusion_model.double_blocks.0.img_attn.proj";
+    let state =
+        br#"{"quant_type": "nf4", "blocksize": 64, "dtype": "bfloat16", "shape": [64, 64]}"#;
+    let bnb = |t: &mut Tensors| {
+        t.extend([
+            named(&format!("{module}.bias"), zeros("BF16", &[64])),
+            named(&format!("{module}.weight"), zeros("U8", &[2048, 1])),
+            named(&format!("{module}.weight.absmax"), zeros("F32", &[64])),
+            named(&format!("{module}.weight.quant_map"), zeros("F32", &[16])),
+            tensor(
+                &format!("{module}.weight.quant_state.bitsandbytes__nf4"),
+                "U8",
+                &[state.len() as u64],
+                state.to_vec(),
+            ),
+        ])
+    };
+    let e = refused("bnb-nf4", &|t, _, _| bnb(t));
+    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
+    assert!(
+        e.detail.contains("bitsandbytes") && e.detail.contains(".weight.absmax"),
+        "{}",
+        e.detail
+    );
+
+    // Beside a declared ComfyUI carrier too.
+    let e = refused("comfy-fp8", &|t, _, _| bnb(t));
+    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
+    assert!(e.detail.contains("bitsandbytes"), "{}", e.detail);
+}
+
+/// GPTQ and AWQ declare themselves in `quantize_config.json`, `quant_config.json` or `gptq_*`
+/// header metadata, not in `config.json`; each is refused with its producer named.
+#[test]
+fn gptq_and_awq_repos_are_refused_by_their_declaration() {
+    let module = "model.layers.0.self_attn.q_proj";
+    let gptq = |t: &mut Tensors| {
+        t.extend([
+            named(&format!("{module}.qweight"), zeros("I32", &[8, 64])),
+            named(&format!("{module}.qzeros"), zeros("I32", &[1, 8])),
+            named(&format!("{module}.scales"), zeros("F16", &[1, 64])),
+            named(&format!("{module}.g_idx"), zeros("I32", &[64])),
+            named(&format!("{module}.bias"), zeros("F16", &[64])),
+        ])
+    };
+    let config =
+        serde_json::json!({"architectures": ["LlamaForCausalLM"], "torch_dtype": "float16"});
+    let e = refused("gptq", &|t, _, dir| {
+        gptq(t);
+        fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let q = serde_json::json!({"bits": 4, "group_size": 128, "desc_act": false, "sym": true,
+            "quant_method": "gptq", "checkpoint_format": "gptq"});
+        fs::write(dir.join("quantize_config.json"), q.to_string()).unwrap();
+    });
+    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
+    assert!(
+        e.detail.contains("quantize_config.json") && e.detail.contains("GPTQ"),
+        "{}",
+        e.detail
+    );
+
+    let e = refused("awq", &|t, _, dir| {
+        gptq(t);
+        let q = serde_json::json!({"zero_point": true, "q_group_size": 128, "w_bit": 4, "version": "GEMM"});
+        fs::write(dir.join("quant_config.json"), q.to_string()).unwrap();
+    });
+    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
+    assert!(
+        e.detail.contains("quant_config.json") && e.detail.contains("AWQ"),
+        "{}",
+        e.detail
+    );
+
+    let e = refused("gptq-metadata", &|t, m, _| {
+        gptq(t);
+        m.insert("gptq_bits".into(), "4".into());
+    });
+    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
+    assert!(
+        e.detail.contains("gptq_bits") && e.detail.contains("GPTQ"),
+        "{}",
+        e.detail
+    );
+
+    // With no declaration at all, the parts name the producer.
+    let e = refused("gptq-bare", &|t, _, _| gptq(t));
+    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
+    assert!(
+        e.detail.contains("GPTQ/AWQ") && e.detail.contains(".qweight"),
+        "{}",
+        e.detail
+    );
+}
+
+/// Every key of a ComfyUI marker is read, decoded at the value it states, or one that only changes
+/// how the module runs; any other is refused by name.
+#[test]
+fn comfy_marker_params_are_read_or_refused() {
+    let layers = |conf: serde_json::Value| {
+        let doc = serde_json::json!({"format_version": "1.0", "layers": {"proj": conf}});
+        move |_: &mut Tensors, m: &mut Metadata, _: &Path| {
+            m.insert("_quantization_metadata".into(), doc.to_string().into());
+        }
+    };
+    let (_dir, ck) = edited(
+        "comfy-mxfp8",
+        &layers(serde_json::json!({"format": "mxfp8", "block_size": 32})),
+    );
+    let Body::Encoded { encoding, .. } = &ck.tensor("model", "proj.weight").unwrap().body else {
+        panic!()
+    };
+    assert_eq!(encoding.to_string(), MXFP8_TILES);
+    let e = refused(
+        "comfy-mxfp8",
+        &layers(serde_json::json!({"format": "mxfp8", "block_size": 64})),
+    );
+    assert_eq!(e.code, Code::MISSING_COMPANION_ROLE, "{}", e.detail);
+    assert!(e.detail.contains("marker block_size: 64"), "{}", e.detail);
+
+    let reconf = |module: &'static str, conf: serde_json::Value| {
+        move |t: &mut Tensors, _: &mut Metadata, _: &Path| {
+            let key = format!("{module}.comfy_quant");
+            t.retain(|(k, ..)| *k != key);
+            t.push(marker(module, conf.clone()));
+        }
+    };
+    let fp8 = serde_json::json!({"format": "float8_e4m3fn", "full_precision_matrix_mult": true});
+    edited("comfy-fp8", &reconf("attn.to_q", fp8));
+    let e = refused(
+        "comfy-fp8",
+        &reconf(
+            "attn.to_q",
+            serde_json::json!({"format": "float8_e4m3fn", "weight_dtype": "bf16"}),
+        ),
+    );
+    assert!(
+        e.detail
+            .contains("marker weight_dtype: \"bf16\" is not read"),
+        "{}",
+        e.detail
+    );
+
+    // ComfyUI reads convrot keys under `params` too.
+    let conf = serde_json::json!({"format": "int8_tensorwise", "params": {"convrot": true, "convrot_groupsize": 64}});
+    let (_dir, ck) = edited("comfy-int8", &reconf("ff.down", conf));
+    let Body::Encoded { encoding, .. } = &ck.tensor("model", "ff.down.weight").unwrap().body else {
+        panic!()
+    };
+    assert_eq!(
+        encoding.to_string(),
+        r#"int8.convrot {rotation: "hadamard", rotation_size: 64}"#
+    );
+}
+
+/// xs-049's real bytes (`real-provenance.json`: 128 rows × 512 columns of each file, whole tiles,
+/// with BF16 references). ComfyUI's file decodes within NVFP4's error in its own layout and far
+/// outside it in any other; two files are refused until tier-1 work reads them.
+#[test]
+fn real_bytes_from_comfyui_and_modelopt() {
+    let dir = Scratch::new("real");
+    let store = Store::open(dir.0.join("store")).unwrap();
+    let ck = import(&store, &fixtures().join("real-comfy-nvfp4")).unwrap();
+    let key = "transformer_blocks.0.attn.to_q.weight";
+    let t = ck.tensor("model", key).unwrap();
+    let Body::Encoded { encoding, parts } = &t.body else {
+        panic!()
+    };
+    assert_eq!(encoding.to_string(), NVFP4_COMFY);
+    let source = read_safetensors(&fixtures().join("real-comfy-nvfp4.expect.safetensors"));
+    let source = bf16s(&source[0].3);
+    let error = |decoded: &[u16]| {
+        let (mut err, mut norm) = (0.0, 0.0);
+        for (d, s) in decoded.iter().zip(&source) {
+            err += (value(*d) - value(*s)).powi(2);
+            norm += value(*s).powi(2);
+        }
+        (err / norm).sqrt()
+    };
+    let right = error(&bf16s(&ck.read("model", key).unwrap()));
+    assert!(right < 0.12, "{right}");
+    let bytes: Vec<Vec<u8>> = parts
+        .iter()
+        .map(|p| {
+            let mut b = vec![0; p.length as usize];
+            ck.bytes_into(&p.at(), &mut b).unwrap();
+            b
+        })
+        .collect();
+    let views: BTreeMap<&str, PartBytes> = parts
+        .iter()
+        .zip(&bytes)
+        .map(|(p, b)| {
+            (
+                p.role.as_str(),
+                PartBytes {
+                    dtype: &p.dtype,
+                    shape: &p.shape,
+                    bytes: b,
+                },
+            )
+        })
+        .collect();
+    // 128 rows and 32 blocks: the tiles have the row-major shape, so every reading decodes.
+    for (nibbles, layout) in [
+        ("low_first", "row_major"),
+        ("high_first", "row_major"),
+        ("low_first", "cublas_128x4"),
+    ] {
+        let mut other = encoding.clone();
+        other.params.insert("nibble_order".into(), nibbles.into());
+        other.params.insert("scale_layout".into(), layout.into());
+        let wrong = error(&bf16s(&decode(&t.dtype, &t.shape, &other, &views).unwrap()));
+        assert!(wrong > 0.30, "{nibbles}/{layout}: {wrong}");
+    }
+
+    // ModelOpt AWQ converted to ComfyUI's bytes: `pre_quant_scale` has no nvfp4 part yet.
+    let e = import(&store, &fixtures().join("real-comfy-nvfp4-awq"))
+        .map(drop)
+        .unwrap_err();
+    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
+    assert!(e.detail.contains("pre_quant_scale"), "{}", e.detail);
+    // ModelOpt's post-processed export carries both declarations: refused until the rule that
+    // reads it (xs-049) lands.
+    let e = import(&store, &fixtures().join("real-modelopt-nvfp4-comfy-marked"))
+        .map(drop)
+        .unwrap_err();
+    assert_eq!(e.code, Code::AMBIGUOUS_CLASSIFICATION, "{}", e.detail);
 }
