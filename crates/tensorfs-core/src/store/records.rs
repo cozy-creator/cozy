@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use platform::lock;
 use serde::{Deserialize, Serialize};
 
-use super::{fail, invalid, now_secs, platform, Error, Result, Store};
+use super::{Error, Result, Store, fail, invalid, now_secs, platform};
 use crate::format::{ObjectRef, Repo};
 
 /// `pins/<id>.json`: what keeps objects alive, and when it was last used (unix seconds).
@@ -59,7 +59,7 @@ fn json(path: &Path, value: &impl Serialize) -> Result<Vec<u8>> {
 }
 
 impl Store {
-    fn lock(&self, dir: &str) -> Result<lock::DirLock> {
+    pub(super) fn lock(&self, dir: &str) -> Result<lock::DirLock> {
         let path = self.root.join(dir);
         lock::dir(&path).map_err(platform("lock", path))
     }
@@ -118,6 +118,19 @@ impl Store {
     pub fn unpin(&self, id: &str) -> Result<bool> {
         let path = self.pin_path(id)?;
         let _lock = self.lock("pins")?;
+        if super::retention::protected(self, id)? {
+            return Ok(false);
+        }
+        self.remove_record(&path)
+    }
+
+    /// Only the retention reaper calls this after proving the hold fence is unowned.
+    pub(super) fn remove_hold_pin(&self, id: &str) -> Result<bool> {
+        if !id.starts_with("hold-") {
+            return Err(invalid(self.root.join("pins"), "not a retention hold"));
+        }
+        let path = self.pin_path(id)?;
+        let _lock = self.lock("pins")?;
         self.remove_record(&path)
     }
 
@@ -126,6 +139,9 @@ impl Store {
         // `id` names a file `pins()` listed, so it needs no grammar check.
         let path = self.root.join("pins").join(format!("{id}.json"));
         let _lock = self.lock("pins")?;
+        if super::retention::protected(self, id)? {
+            return Ok(false);
+        }
         match parse::<Pin>(&path)? {
             Some(pin) if pin.last_use == last_use => self.remove_record(&path),
             _ => Ok(false),
@@ -189,6 +205,7 @@ impl Store {
     ) -> Result<Option<Repo>> {
         let path = self.ref_path(name)?;
         let _lock = self.lock("refs")?;
+        self.clear_cached_ref(name)?;
         let old = Self::parse_ref(&path)?;
         let lanes = |repo: &Option<Repo>| -> Vec<ObjectRef> {
             repo.iter().flat_map(Repo::roots).cloned().collect()
