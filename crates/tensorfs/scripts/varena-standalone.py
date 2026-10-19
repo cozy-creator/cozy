@@ -17,7 +17,7 @@ from pathlib import Path
 import tensorfs
 import torch
 from diffusers import UNet2DConditionModel
-from tensorfs.varena.torch import Memory
+from tensorfs.varena.torch import Exhausted, Memory, blocks_of
 
 CONFIG = dict(  # blocks of 16 MiB and more: a smaller one shares a pack, so its region is common
     sample_size=8,
@@ -49,7 +49,12 @@ def run(device: torch.device, ck: tensorfs.Checkpoint, want: torch.Tensor, limit
     with torch.no_grad(), mem.request(f"limit {limit}") as r:
         got = unet(x.to(device), 3, encoder_hidden_states=text.to(device)).sample.cpu()
     name = f"loaded from the store, limit {limit}"
-    check(f"{name}: has blocks", model.blocks, f"common {model.common.nbytes}")
+    owners = {p for p in blocks_of(unet) if any(k.startswith(p + ".") for k in ck.tensors["unet"])}
+    check(  # its small blocks share packs with their neighbours: each still owns its regions
+        f"{name}: every block owns its regions",
+        len(model.blocks) == len(owners),
+        f"{len(model.blocks)} of {len(owners)} blocks, common {model.common.nbytes}",
+    )
     # a capped torch picks other cuDNN algorithms: F32 rounding, not a wrong weight
     check(f"{name}: equals the plain model", torch.allclose(got, want, atol=1e-5), (got - want).abs().max())
     check(f"{name}: leaves nothing behind", all(n == 0 for _, n in r.stats.leftover), r.stats.leftover)
@@ -81,6 +86,19 @@ def main() -> int:
     if device.type == "cuda":  # what torch holds, its working room, common and half the blocks
         torch.cuda.empty_cache()
         run(device, ck, want, torch.cuda.memory_reserved(device) + (16 << 20) + common + blocks // 2)
+        torch.cuda.empty_cache()  # common never fits: the bind is short, it does not spin
+        with torch.device("meta"):
+            unet = UNet2DConditionModel(**CONFIG).eval()
+        mem = Memory.open(device, limit=torch.cuda.memory_reserved(device) + common // 2)
+        model = mem.load(unet, ck=ck)
+        x, text = (torch.randn(*s, device=device) for s in ((1, 4, 8, 8), (1, 5, 768)))
+        try:
+            with torch.no_grad(), mem.request("never fits"):
+                unet(x, 3, encoder_hidden_states=text)
+            check("a model that never fits raises Exhausted", False, "it ran")
+        except Exhausted as exc:
+            check("a model that never fits raises Exhausted", exc.need > 0, exc)
+        model.close()
     print(f"{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1
 

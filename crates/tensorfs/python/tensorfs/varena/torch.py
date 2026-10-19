@@ -39,8 +39,6 @@ from torch.utils.hooks import RemovableHandle
 
 from . import DeviceFull, Gpu, Host, Ledger, Pinned, Row, WeightSet, cuts, seal
 
-#: Regions are cut only at block boundaries: one per block, plus each run of common tensors.
-_WHOLE = 1 << 62
 #: Blocks copied ahead of the one entered, in the recorded order.
 _AHEAD = 2
 #: A streamed model's scratch slots, in its largest blocks (the core keeps 2-3).
@@ -698,14 +696,19 @@ class Memory:
             raise
 
     def _pin(self, model: Model, region: int, stream: int) -> Pinned:
-        """The region's pages, room made in §5.2's order until they map."""
+        """The region's pages, room made in §5.2's order while each try maps further: a try
+        whose deficit did not shrink made no progress, however much the rungs say they freed
+        (a failed map's own chunks go idle and are trimmed again), and is short."""
+        short = None
         while True:
             try:
                 return model.ws.bind(region, stream)
             except DeviceFull as full:
                 why = f"bind {model.name}"
-                if not self._make_room(self._free() + full.deficit, why, model):
+                stuck = short is not None and full.deficit >= short
+                if stuck or not self._make_room(self._free() + full.deficit, why, model):
                     raise _Short(full.deficit, why) from None
+                short = full.deficit
 
     def _passed(self, block: Block, call: tuple) -> None:
         """A block run again starts the model's next pass, at its first block's argument shapes.
@@ -1164,11 +1167,15 @@ class Memory:
                 if (ran := self.models.get(name)) is not None:
                     ran.repeats = passes
             if not self.active:  # reserves are what it measured; watermarks rise, nothing copies
+                room = self._room()
                 for model in self.models.values():
                     if model.peak:
                         model.reserve, model.peak = model.peak, 0
                     if self.cuda and not model.host and len(model.home) < len(model.blocks):
-                        model.home = set(model.order)
+                        fits = model.order if room is None else _spread(
+                            model.order, _sizes(model), room + _set(model)[0] - model.common.nbytes
+                        )  # under a limit, what it leaves this process's weights
+                        model.home |= set(fits)
                         model.ws.home(_home_regions(model))
             self._advance()
         self._running()
@@ -1309,17 +1316,25 @@ def blocks_of(module: nn.Module) -> list[str]:
 
 
 def regions_of(module: nn.Module) -> list[list[str]]:
-    """Its weight set's regions, cut at its blocks: what `load` maps and a sealed layout holds."""
+    """Its weight set's regions, what `load` maps and a sealed layout holds: its tensors in
+    header order, cut wherever the block that owns them changes, so one region is one block's
+    run or a run of common. A chunk two blocks share is read once per region (the layout
+    reads parts), never a reason to join the blocks: packs chained a DiT's 48 blocks into one
+    18 GiB region."""
     grant = _declared(module).weights
     if grant is None:
         raise Unbound(f"{type(module).__name__}: no weights attached (`Declared.weights`)")
-    prefix, keys = f"{grant.component}/", None if grant.keys is None else set(grant.keys)
-    cuts_at = [prefix + b for b in blocks_of(module)]
-    regions = [
-        [n for n in region if n.startswith(prefix) and (keys is None or n[len(prefix) :] in keys)]
-        for region in tensorfs.regions(grant.ck, _WHOLE, cuts_at)
-    ]
-    return [r for r in regions if r]
+    keys = None if grant.keys is None else set(grant.keys)
+    prefix, paths = f"{grant.component}/", blocks_of(module)
+    runs: list[tuple[str | None, list[str]]] = []
+    for key in grant.ck.tensors.get(grant.component, {}):
+        if keys is not None and key not in keys:
+            continue
+        home = _block_of(key, paths)
+        if not runs or runs[-1][0] != home:
+            runs.append((home, []))
+        runs[-1][1].append(prefix + key)
+    return [names for _, names in runs]
 
 
 def _layout(
