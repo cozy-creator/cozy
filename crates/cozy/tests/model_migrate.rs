@@ -286,18 +286,6 @@ fn download(home: &Home, model: &str, on: &str) -> String {
     ended["run"]["result"]["models"][0]["manifest"].as_str().unwrap().to_owned()
 }
 
-/// Every object `manifest` reaches in the store at `root`, with its bytes.
-fn closure(root: &Path, manifest: &str) -> Vec<(String, Vec<u8>)> {
-    let store = Store::open(root).unwrap();
-    let sha256 = manifest.trim_start_matches("sha256:").to_string();
-    let length = std::fs::metadata(store.path(&ObjectRef { sha256: sha256.clone(), length: 0 }).unwrap()).unwrap().len();
-    let mut objects: Vec<_> = (store.closure(&ObjectRef { sha256, length }).unwrap().into_iter())
-        .map(|object| (object.sha256.clone(), store.read(&object).unwrap()))
-        .collect();
-    objects.sort();
-    objects
-}
-
 /// Every old tensor, read from the new checkpoint in the store at `root`: byte for byte the same.
 fn same_tensors(old: &Old, root: &Path, manifest: &str) {
     let store = Store::open(root).unwrap();
@@ -380,7 +368,17 @@ fn an_old_model_migrates_by_its_own_rows_and_pulls_bit_identical() {
         assert_eq!(download(&home, &format!("{model}@{release}/bf16"), "m2"), released);
     }
     same_tensors(&old, &puller.store(), &released);
-    assert!(closure(&puller.store(), &released) == closure(&migrator.store(), &released), "the pull differs from what migrated");
+    // The migrating machine keeps one lane: the second migration dropped the first's checkpoint.
+    let held = |id: &str| {
+        let store = Store::open(migrator.store()).unwrap();
+        std::fs::metadata(store.path(&ObjectRef { sha256: id.trim_start_matches("sha256:").into(), length: 0 }).unwrap()).is_ok()
+    };
+    // The CLI migrates a model's old checkpoints in manifest order.
+    let (first, second) = match old.manifests[0].0 < old.manifests[1].0 {
+        true => (&released, &unreleased),
+        false => (&unreleased, &released),
+    };
+    assert!(!held(first) && held(second), "the first migration's checkpoint is still held");
 
     // Again: nothing is old any more.
     let again = cozy(&home, &["--json", "model", "migrate", &model, "--on", "m1", "--audit", &audit_arg]);
