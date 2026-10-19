@@ -82,6 +82,16 @@ with tempfile.TemporaryDirectory() as temp:
         provider = Provider()
         alive = weakref.ref(provider)
         checkpoint = tensorfs.open("acme/lifetime", revision="one", endpoint=endpoint,
+                                   token=provider, cache_dir=root / "close-reader")
+        assert "model" in checkpoint.components
+        del provider
+        checkpoint.close()
+        gc.collect()
+        assert alive() is None, "a closed parent retained its cached components/provider"
+
+        provider = Provider()
+        alive = weakref.ref(provider)
+        checkpoint = tensorfs.open("acme/lifetime", revision="one", endpoint=endpoint,
                                    token=provider, cache_dir=root / "race-reader")
         provider.block = True
         entered, resume = provider.entered, provider.resume
