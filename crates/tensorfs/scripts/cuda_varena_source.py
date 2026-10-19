@@ -5,7 +5,7 @@ Run serially on an authorized CUDA device 0 with PyTorch installed:
     python cuda_varena_source.py --timeout 45
 
 The outer process bounds each child, including a child completely deadlocked on the GIL.
-Fixtures are generated locally through public Writer; no model or network download is used.
+Public Writer generates the fixture; HTTP reads use only that loopback data, with no model download.
 """
 
 import argparse
@@ -388,6 +388,8 @@ def main():
     )
     parser.add_argument("--child-case", choices=CASES, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if not __debug__:
+        parser.error("this proof requires Python assertions; do not use -O")
     if not 20 <= args.timeout <= 120:
         parser.error("--timeout must be between 20 and 120 seconds")
     if args.child_case:
@@ -423,6 +425,10 @@ def main():
         sys.stdout.write(result.stdout)
         sys.stderr.write(result.stderr)
         assert result.returncode == 0, f"{case}: child exited {result.returncode}"
+        report = json.loads(result.stdout.rstrip().rsplit("\n", 1)[-1])
+        assert report.get("case") == case and report.get("result") == "passed", (
+            f"{case}: child exited without its completed proof receipt"
+        )
     emit(result="passed", cases=list(CASES), timeout_per_child=args.timeout)
 
 
