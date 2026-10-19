@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 
-use cozy_platform::durable::FileAt;
+use platform::durable::FileAt;
 use serde::Deserialize;
 use serde_json::Value as Json;
 
