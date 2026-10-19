@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::fs::File;
+use std::path::PathBuf;
 
 use tensorfs_core::format::Header;
 use tensorfs_core::ids::ObjectRef;
@@ -12,6 +13,21 @@ use tensorfs_core::read::{ObjectRange, Order, PlanItem, ReadPlan, Source};
 use tensorfs_core::store2::Checkpoint;
 
 use crate::{Error, Result};
+
+/// A checkpoint as varena reads it: its header, and its chunk files' paths when a store holds
+/// it. A header parsed alone (an executor's, granted by TensorD) has none: the grant's files
+/// or a sealed host layout are its only source.
+#[derive(Clone, Copy)]
+pub struct Ck<'a> {
+    pub header: &'a Header,
+    pub paths: Option<&'a [PathBuf]>,
+}
+
+impl<'a> From<&'a Checkpoint> for Ck<'a> {
+    fn from(ck: &'a Checkpoint) -> Self {
+        Ck { header: ck.header(), paths: Some(ck.chunk_paths()) }
+    }
+}
 
 /// Every part of `components` (header order), named `component/key#role` (`value` for a plain
 /// tensor's data): a part longer than the rest of its chunk is one item per chunk it spans.
@@ -39,17 +55,20 @@ pub fn read_plan(header: &Header, components: &[&str]) -> ReadPlan {
 }
 
 /// The chunk files `plan` reads, opened.
-pub fn chunk_files(ck: &Checkpoint, plan: &ReadPlan) -> Result<Vec<(ObjectRef, File)>> {
+pub fn chunk_files(ck: Ck<'_>, plan: &ReadPlan) -> Result<Vec<(ObjectRef, File)>> {
+    let Some(paths) = ck.paths else {
+        return Err(Error::Invalid("a header parsed alone reads only a grant's chunk files".into()));
+    };
     let mut used: HashSet<&str> = plan.items.iter().filter_map(|it| match &it.source {
         Source::Object(o) => Some(o.obj.sha256.as_str()),
         Source::Inline(_) => None,
     }).collect();
     let mut out = Vec::new();
-    for (i, chunk) in ck.header().chunks.iter().enumerate() {
+    for (i, chunk) in ck.header.chunks.iter().enumerate() {
         if !used.remove(chunk.sha256.as_str()) {
             continue;
         }
-        let path = &ck.chunk_paths()[i];
+        let path = &paths[i];
         let file = File::open(path).map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
         out.push((ObjectRef { sha256: chunk.sha256.clone(), length: chunk.length }, file));
     }

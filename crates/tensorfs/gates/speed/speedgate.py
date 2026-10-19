@@ -1,6 +1,6 @@
 """TensorFS speed gate: cozytensors/1 against safetensors, disk -> pinned -> GPU (xs-045 F1, U8).
 
-    python speedgate.py <work dir> <result.json> [--build-only] [--plane=readers=16,staging_buffers=32]
+    python speedgate.py <work dir> <result.json> [--build-only] [--plane=chunk=2097152]
         [--readers=T64+rust,st-cuda] [--cells=window]
 
 The machine's v1 store supplies the real SDXL int8 and Qwen-Image int8 lane bytes. Each lane is
@@ -10,8 +10,8 @@ cold (pages dropped) and warm, the whole checkpoint and one paging window, from 
 the last byte resident on the GPU.
 
 Readers:
-- `T64+rust`: `tensorfs.varena` (the plane's Rust chunk reader): checkpoint, regions cut at blocks,
-  `register_checkpoint`, want, wait.
+- `T64+rust`: `tensorfs.varena`: checkpoint, regions cut at blocks, `Gpu.register`, bind every
+  region, synchronize.
 - `T64+fst`: the same chunk files read by fastsafetensors' own C++ engine.
 - `T64`: the F1 Python reader over the same chunk files.
 - `fastsafetensors`: fastsafetensors 0.5.0 over the safetensors files.
@@ -263,17 +263,17 @@ class Model:
     def files(self, layout):
         return self.st if layout in SAFETENSORS else [p for p, _ in self.chunks]
 
-    def rust(self, plane, window):
-        """Checkpoint, regions cut at blocks (what the Runtime passes), register and want on the
-        device: v2 weights read through the plane's register path."""
-        plane.set_vram_budget(0, torch.cuda.mem_get_info()[0] - (1 << 30))
+    def rust(self, gpu, window):
+        """Checkpoint, regions cut at blocks (what the Runtime passes), register and bind on the
+        device: v2 weights read through varena's register path."""
         t0 = time.perf_counter()
         ck = self.checkpoint()
-        ws = plane.register_checkpoint(self.name, ck, tensorfs.regions(ck, 64 << 20, self.blocks))
+        ws = gpu.register(self.name, ck, tensorfs.regions(ck, 64 << 20, self.blocks))
         self.register_s = time.perf_counter() - t0  # open, regions and register: the part before any read
-        picked = sorted({p["region"] for p in ws.parts if self.in_window(*p["what"].split("#")[0].split("/", 1))}) if window else None
-        plane.want(ws, 0, picked).wait()
-        return picked, ws
+        picked = sorted({p.region for p in ws.parts if self.in_window(p.component, p.key)}) if window else range(len(ws.spans))
+        pins = [ws.bind(r) for r in picked]
+        torch.cuda.synchronize()
+        return sum(p.nbytes for p in ws.parts if p.region in picked), ws, pins
 
     def spans(self, window):
         ck = self.checkpoint()
@@ -305,20 +305,18 @@ class Model:
         return sum(t.numel() for t in out)
 
     def once(self, readers, layout, window, cold):
-        ws = None
         t0 = time.perf_counter()
         if layout in SAFETENSORS:
             moved = self.safetensors(layout, window)
         elif layout == "T64+rust":
-            picked, ws = self.rust(readers["plane"], window)
+            moved, ws, pins = self.rust(readers["plane"], window)
         else:
             moved = readers[layout].run(self.spans(window), direct=cold)
         s = time.perf_counter() - t0
-        if ws is not None:
-            regions = ws.regions
-            moved = sum(regions[i]["nbytes"] for i in (picked if picked is not None else range(len(regions))))
+        if layout == "T64+rust":
+            del pins
             ws.close()
-            readers["plane"].set_vram_budget(0, 0)  # the plane's idle handles go back to the driver
+            readers["plane"].trim()  # the idle chunks go back to the driver
         torch.cuda.empty_cache()
         return s, moved
 
@@ -400,7 +398,7 @@ def main(work, out_path, build_only=False, plane=None, layouts=LAYOUTS, scopes=(
     log(json.dumps(env))
     hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]  # the engine holds every file open
     resource.setrlimit(resource.RLIMIT_NOFILE, (hard if 0 <= hard < 1 << 20 else 1 << 20, hard))
-    readers = {"T64": Reader(), "T64+fst": Engine(), "plane": varena.Plane(devices=[0], **(plane or {}))}
+    readers = {"T64": Reader(), "T64+fst": Engine(), "plane": varena.Gpu(0, **(plane or {}))}
     env["plane"] = plane or {}
     out = {"env": env, "models": {}}
     for name in LANES:
