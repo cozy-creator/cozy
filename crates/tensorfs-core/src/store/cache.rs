@@ -124,6 +124,48 @@ fn read<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<Option<T>> {
     }
 }
 
+/// Resolve the real existing prefix, then normalize only the not-yet-created suffix.
+/// A dangling link or permission error is not evidence that a directory is cache-owned.
+fn resolve_future(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path).map_err(fail("resolve cache path", path))?;
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        match fs::canonicalize(ancestor) {
+            Ok(mut real) => {
+                for part in suffix.into_iter().rev() {
+                    if part == ".." {
+                        real.pop();
+                    } else if part != "." {
+                        real.push(part);
+                    }
+                }
+                return Ok(real);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::symlink_metadata(ancestor) {
+                    Ok(_) => return Err(fail("resolve cache path", ancestor)(error)),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(fail("resolve cache path", ancestor)(error)),
+                }
+                let Some(parent) = ancestor.parent() else {
+                    return Err(fail("resolve cache path", ancestor)(error));
+                };
+                suffix.push(
+                    ancestor
+                        .components()
+                        .next_back()
+                        .expect("a non-root path has a component")
+                        .as_os_str()
+                        .to_owned(),
+                );
+                ancestor = parent;
+            }
+            Err(error) => return Err(fail("resolve cache path", ancestor)(error)),
+        }
+    }
+}
+
 fn fingerprint(repo: &Repo) -> Result<String> {
     Ok(ObjectRef::of(&repo.to_json()?).sha256)
 }
@@ -241,12 +283,14 @@ impl Store {
         Ok(true)
     }
 
-    pub(super) fn cache_entry(&self, path: &Path) -> Option<(PathBuf, PathBuf)> {
+    pub(super) fn cache_entry(&self, path: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
         if !self.cache_mode {
-            return None;
+            return Ok(None);
         }
+        let root = fs::canonicalize(&self.root).map_err(fail("resolve cache root", &self.root))?;
+        let path = resolve_future(path)?;
         for kind in ["snapshots", "views"] {
-            let parent = self.root.join(kind);
+            let parent = root.join(kind);
             let Ok(rest) = path.strip_prefix(&parent) else {
                 continue;
             };
@@ -257,14 +301,13 @@ impl Store {
                 continue;
             };
             if is_digest(name) {
-                let record = self
-                    .cache_state()
-                    .join("snapshots")
+                let record = root
+                    .join("tmp/cache/snapshots")
                     .join(format!("{kind}-{name}.json"));
-                return Some((parent.join(name), record));
+                return Ok(Some((parent.join(name), record)));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Only internally generated paths receive a recency record; local_dir is never classified.
@@ -275,7 +318,7 @@ impl Store {
         } else {
             None
         };
-        if let Some((entry, record)) = self.cache_entry(path) {
+        if let Some((entry, record)) = self.cache_entry(path)? {
             let _classification = self.cache_lock()?;
             let old = read::<FolderUse>(&record)?;
             if !old.as_ref().is_some_and(|record| record.owned)
@@ -301,7 +344,7 @@ impl Store {
         } else {
             None
         };
-        if let Some((_, record)) = self.cache_entry(path) {
+        if let Some((_, record)) = self.cache_entry(path)? {
             let _classification = self.cache_lock()?;
             self.cache_write(
                 &record,
@@ -315,7 +358,7 @@ impl Store {
     }
 
     pub(super) fn cache_folder_guard(&self, path: &Path) -> Result<Option<DirectoryGuard>> {
-        let Some((entry, record)) = self.cache_entry(path) else {
+        let Some((entry, record)) = self.cache_entry(path)? else {
             return Ok(None);
         };
         if !read::<FolderUse>(&record)?.is_some_and(|record| !record.owned) {
@@ -351,7 +394,7 @@ impl Store {
             for entry in entries {
                 let entry = entry.map_err(fail("list cache folder", &dir))?;
                 let path = entry.path();
-                let Some((_, record)) = self.cache_entry(&path) else {
+                let Some((real, record)) = self.cache_entry(&path)? else {
                     continue;
                 };
                 // Unclassified raw/operator folders are not silently adopted by the cache.
@@ -367,6 +410,7 @@ impl Store {
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(fail("stat cache folder", &path)(e)),
                 };
+                let path = real;
                 let Some(guard) = retention::try_directory(&path)? else {
                     continue;
                 };
@@ -393,7 +437,7 @@ impl Store {
             .map_err(fail("stat cache fence target", path))?
         {
             if let Some(guard) = retention::try_directory(path)? {
-                if let Some((_, record)) = self.cache_entry(path) {
+                if let Some((_, record)) = self.cache_entry(path)? {
                     if read::<FolderUse>(&record)?.is_some_and(|record| !record.owned) {
                         self.remove_record(&record)?;
                     }
@@ -720,6 +764,108 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_directory_ownership_follows_real_paths_without_changing_cwd() {
+        fn relative(path: &Path) -> PathBuf {
+            let cwd = std::env::current_dir().unwrap();
+            let from: Vec<_> = cwd.components().collect();
+            let to: Vec<_> = path.components().collect();
+            let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+            let mut result = PathBuf::new();
+            for _ in common..from.len() {
+                result.push("..");
+            }
+            for part in &to[common..] {
+                result.push(part.as_os_str());
+            }
+            result
+        }
+        fn populate(store: &Store, path: &Path) {
+            drop(store.cache_directory(path).unwrap());
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("user-copy"), b"durable user copy").unwrap();
+        }
+
+        let scratch = Scratch::new();
+        let store = &scratch.0;
+        let relative_store = Store::open(relative(&store.root)).unwrap().with_cache();
+        let first = store
+            .root
+            .join("snapshots")
+            .join(ObjectRef::of(b"absolute user dir").sha256);
+        populate(store, &first);
+        relative_store.cache_preserve_snapshot(&first).unwrap();
+        let second = store
+            .root
+            .join("views")
+            .join(ObjectRef::of(b"relative user dir").sha256);
+        populate(store, &second);
+        store.cache_preserve_snapshot(&relative(&second)).unwrap();
+
+        let alias = store.root.join("cache-alias");
+        std::os::unix::fs::symlink(&store.root, &alias).unwrap();
+        let alias_store = Store::open(&alias).unwrap().with_cache();
+        let third_sha = ObjectRef::of(b"absent final path through symlink").sha256;
+        let third = store.root.join("views").join(&third_sha);
+        // The complete path does not exist: resolve its actual ancestor through the alias.
+        alias_store
+            .cache_preserve_snapshot(&alias.join("views").join(third_sha))
+            .unwrap();
+        populate(store, &third);
+        let fourth_sha = ObjectRef::of(b"normalized future suffix").sha256;
+        let fourth = store.root.join("snapshots").join(&fourth_sha);
+        relative_store
+            .cache_preserve_snapshot(
+                &relative(&store.root)
+                    .join("snapshots/not-created/../")
+                    .join(fourth_sha),
+            )
+            .unwrap();
+        populate(store, &fourth);
+        for path in [&first, &second, &third, &fourth] {
+            let (actual, record) = store.cache_entry(path).unwrap().unwrap();
+            assert_eq!(actual, fs::canonicalize(path).unwrap());
+            assert!(read::<FolderUse>(&record).unwrap().unwrap().owned);
+        }
+        let disposable = store
+            .root
+            .join("views")
+            .join(ObjectRef::of(b"genuine cache folder").sha256);
+        populate(store, &disposable);
+        assert!(store
+            .cache_maintain_with(0, now_secs() + TTL.as_secs() + 1, &|| Ok(ample()))
+            .unwrap());
+        assert!(
+            !disposable.exists(),
+            "genuine inactive cache still must expire"
+        );
+        for path in [&first, &second, &third, &fourth] {
+            assert_eq!(
+                fs::read(path.join("user-copy")).unwrap(),
+                b"durable user copy"
+            );
+        }
+        let outside = store
+            .root
+            .join("snapshots")
+            .join(ObjectRef::of(b"escape").sha256)
+            .join("../../manual");
+        assert!(store.cache_entry(&outside).unwrap().is_none());
+        let broken = store.root.join("broken-alias");
+        std::os::unix::fs::symlink(store.root.join("missing-target"), &broken).unwrap();
+        assert!(
+            store
+                .cache_entry(
+                    &broken
+                        .join("views")
+                        .join(ObjectRef::of(b"invalid alias").sha256)
+                )
+                .is_err(),
+            "a broken existing symlink is not a future owned directory"
+        );
+    }
+
     #[test]
     fn policy_uses_approved_reserve_ttl_and_inode_limits() {
         assert_eq!(TTL.as_secs(), 7 * 86400);
@@ -914,7 +1060,7 @@ mod tests {
         let deficit = 16 << 10;
         let allocated = |path: &Path| platform::durable::allocated(&fs::metadata(path).unwrap());
         let metadata = allocated(&path)
-            + allocated(&store.cache_entry(&path).unwrap().1)
+            + allocated(&store.cache_entry(&path).unwrap().unwrap().1)
             + allocated(
                 &store
                     .root
@@ -962,7 +1108,7 @@ mod tests {
             .cache_maintain_with(0, now_secs() + 2 * SWEEP.as_secs(), &|| Ok(ample()))
             .unwrap();
         assert!(!sidecar.exists());
-        assert!(!store.cache_entry(&orphan).unwrap().1.exists());
+        assert!(!store.cache_entry(&orphan).unwrap().unwrap().1.exists());
     }
 
     #[test]
