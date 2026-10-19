@@ -1,7 +1,7 @@
 //! The header's bytes (spec §9, `conformance/schema/header.cddl`): RFC 8949 core deterministic
 //! CBOR, read strictly. Allowed: unsigned and negative integers, byte and text strings, arrays,
-//! maps with text keys, `true`, `false`, and inside configs only floats (in their shortest exact
-//! form) and `null`; every head in its shortest form, definite lengths only, map keys in
+//! maps with text keys, `true`, `false`, and inside configs only finite floats (in their
+//! shortest exact form) and `null`; every head in its shortest form, definite lengths only, map keys in
 //! bytewise order of their encodings. A header has one encoding, so decoding and re-encoding
 //! reproduces its bytes. A reader skips, still strictly, any elements after the fields it knows
 //! at the end of the root and of every record: later versions append fields.
@@ -101,18 +101,22 @@ impl Writer {
         match v {
             ConfigValue::Null => self.0.push(NULL),
             ConfigValue::Bool(b) => self.0.push(if *b { TRUE } else { FALSE }),
-            ConfigValue::Int(i) => self.int(*i)?,
-            ConfigValue::Float(f) => self.float(*f),
-            ConfigValue::Str(s) => self.text(s),
-            ConfigValue::List(items) => {
+            ConfigValue::Number(n) => match (n.as_u64(), n.as_i64(), n.as_f64()) {
+                (Some(u), _, _) => self.uint(u),
+                (_, Some(i), _) => self.int(i.into())?,
+                (_, _, Some(f)) => self.float(f),
+                _ => return invalid(format!("config number {n}")),
+            },
+            ConfigValue::String(s) => self.text(s),
+            ConfigValue::Array(items) => {
                 self.array(items.len());
                 items.iter().try_for_each(|item| self.config(item))?;
             }
-            ConfigValue::Map(map) => self.map(map, Writer::config)?,
+            ConfigValue::Object(map) => self.map(map, Writer::config)?,
         }
         Ok(())
     }
-    /// The shortest of half, single and double that holds `f` exactly; NaN is `f9 7e00`.
+    /// The shortest of half, single and double that holds a finite `f` exactly.
     fn float(&mut self, f: f64) {
         if let Some(h) = half(f) {
             self.0.push(0xf9);
@@ -126,12 +130,12 @@ impl Writer {
         }
     }
     /// Text keys in bytewise order of their encodings: shorter first, then by bytes.
-    fn map<V>(
+    fn map<'m, V: 'm>(
         &mut self,
-        map: &BTreeMap<String, V>,
+        map: impl IntoIterator<Item = (&'m String, &'m V)>,
         mut item: impl FnMut(&mut Self, &V) -> Result<()>,
     ) -> Result<()> {
-        let mut entries: Vec<(&String, &V)> = map.iter().collect();
+        let mut entries: Vec<(&String, &V)> = map.into_iter().collect();
         entries.sort_by(|a, b| (a.0.len(), a.0.as_bytes()).cmp(&(b.0.len(), b.0.as_bytes())));
         self.head(MAP, entries.len() as u64);
         for (k, v) in entries {
@@ -142,29 +146,24 @@ impl Writer {
     }
 }
 
-/// `f` as an IEEE half, when that is exact.
+/// A finite `f` as an IEEE half, when that is exact.
 fn half(f: f64) -> Option<u16> {
-    if f.is_nan() {
-        return Some(0x7e00);
-    }
     let sign = if f.is_sign_negative() { 0x8000 } else { 0 };
     let a = f.abs();
     let e = (a.to_bits() >> 52) as i32 - 1023;
     let (bits, m) = match e {
-        1024 => return Some(sign | 0x7c00),
-        16..=1023 => return None,
+        16.. => return None,
         -14..=15 => (((e + 15) as u16) << 10, a * 2f64.powi(10 - e) - 1024.0),
         _ => (0, a * 2f64.powi(24)),
     };
     (m.fract() == 0.0 && m < 1024.0).then(|| sign | bits | m as u16)
 }
 
-/// An IEEE half's value.
+/// An IEEE half's value; NaN for an infinity or NaN.
 fn from_half(h: u16) -> f64 {
     let (e, m) = (i32::from(h >> 10 & 31), f64::from(h & 1023));
     let a = match e {
         0 => m * 2f64.powi(-24),
-        31 if m == 0.0 => f64::INFINITY,
         31 => f64::NAN,
         _ => (1024.0 + m) * 2f64.powi(e - 25),
     };
@@ -420,7 +419,7 @@ impl<'a> Reader<'a> {
         })
     }
 
-    /// A config value: a value, or a float in its shortest exact form, or null.
+    /// A config value: a value, or a finite float in its shortest exact form, or null.
     fn config(&mut self, depth: usize) -> Result<ConfigValue> {
         if depth > DEPTH {
             return invalid("values nested too deep");
@@ -440,32 +439,35 @@ impl<'a> Reader<'a> {
                     0xfa => f32::from_bits(bits as u32) as f64,
                     _ => f64::from_bits(bits),
                 };
+                let Some(n) = serde_json::Number::from_f64(f) else {
+                    return invalid(format!("a float that is not finite at byte {at}"));
+                };
                 let mut shortest = Writer(Vec::with_capacity(9));
                 shortest.float(f);
                 if shortest.0 != self.b[at..self.at] {
                     return invalid(format!("a float not in its shortest form at byte {at}"));
                 }
-                return Ok(ConfigValue::Float(f));
+                return Ok(ConfigValue::Number(n));
             }
             _ => {}
         }
         let (major, n) = self.head()?;
         Ok(match major {
-            UINT => ConfigValue::Int(n.into()),
-            NINT if n <= i64::MAX as u64 => ConfigValue::Int(-1 - i128::from(n)),
+            UINT => ConfigValue::from(n),
+            NINT if n <= i64::MAX as u64 => ConfigValue::from(-1 - n as i64),
             NINT => return invalid(format!("an integer below -2^63 at byte {at}")),
             TEXT => {
                 self.at = at;
-                ConfigValue::Str(self.text("a string")?.to_owned())
+                ConfigValue::from(self.text("a string")?)
             }
-            ARRAY => ConfigValue::List(
+            ARRAY => ConfigValue::Array(
                 (0..n)
                     .map(|_| self.config(depth + 1))
                     .collect::<Result<_>>()?,
             ),
             MAP => {
                 self.at = at;
-                ConfigValue::Map(self.map(depth, Reader::config)?)
+                ConfigValue::Object(self.map(depth, Reader::config)?.into_iter().collect())
             }
             SIMPLE => ConfigValue::Bool(n == 1),
             _ => return invalid(format!("a byte string value at byte {at}")),
@@ -554,7 +556,7 @@ fn parse(bytes: &[u8]) -> Result<Header> {
         1 => return invalid("the pipeline: 1 field, not 0 or at least 2"),
         n => {
             let class = r.text("the pipeline's class")?.to_owned();
-            let config = r.map(1, Reader::config)?;
+            let config = r.map(1, Reader::config)?.into_iter().collect();
             r.skip(n - 2, 2)?;
             Some(Pipeline { class, config })
         }
@@ -566,7 +568,7 @@ fn parse(bytes: &[u8]) -> Result<Header> {
         let mut fields = r.record(5, "a component")?;
         let name = r.text("a component name")?.to_owned();
         let class = r.text("a component class")?.to_owned();
-        let config = r.map(2, Reader::config)?;
+        let config = r.map(2, Reader::config)?.into_iter().collect();
         let n = r.list("tensors")?;
         let mut tensors = Vec::with_capacity(room(n));
         for _ in 0..n {

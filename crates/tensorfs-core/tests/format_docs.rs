@@ -112,7 +112,7 @@ fn writer_is_deterministic_and_reader_round_trips() {
     let read = Header::from_cbor(&bytes).unwrap();
     assert_eq!(read.pipeline().unwrap().class, "diffusers.StableDiffusionXLPipeline");
     let unet = read.component("unet").unwrap();
-    assert_eq!(unet.config["norm_eps"], ConfigValue::Float(1e-5));
+    assert_eq!(unet.config["norm_eps"], json!(1e-5));
     assert_eq!(unet.config["addition_embed_type"], ConfigValue::Null);
     assert_eq!(unet.config_name(), "config.json");
     let assets: Vec<_> = read.assets().map(|(c, p, _)| (c, p)).collect();
@@ -378,9 +378,6 @@ fn config_floats_take_their_shortest_exact_form() {
         (65504.0, b"\xf9\x7b\xff"),
         (2f64.powi(-24), b"\xf9\x00\x01"),
         (2f64.powi(-14), b"\xf9\x04\x00"),
-        (f64::INFINITY, b"\xf9\x7c\x00"),
-        (f64::NEG_INFINITY, b"\xf9\xfc\x00"),
-        (f64::NAN, b"\xf9\x7e\x00"),
         (65520.0, b"\xfa\x47\x7f\xf0\x00"),
         (100000.0, b"\xfa\x47\xc3\x50\x00"),
         (2f64.powi(-25), b"\xfa\x33\x00\x00\x00"),
@@ -390,15 +387,27 @@ fn config_floats_take_their_shortest_exact_form() {
     ];
     for (f, want) in floats {
         let mut c = components(vec![]);
-        c[0].config = [("v".into(), ConfigValue::Float(*f))].into();
+        c[0].config = config(json!({"v": f}));
         let h = Header::new(vec![], None, c, Default::default()).unwrap();
         let bytes = h.to_cbor().unwrap();
         let entry = [b"\xa1\x61v".as_slice(), want].concat();
         assert!(bytes.windows(entry.len()).any(|w| w == entry), "{f}");
         let back = Header::from_cbor(&bytes).unwrap();
-        let ConfigValue::Float(got) = back.components()[0].config["v"] else { panic!("{f}") };
-        assert!(got.to_bits() == f.to_bits() || (f.is_nan() && got.is_nan()), "{f}");
+        let got = back.components()[0].config["v"].as_f64().unwrap();
+        assert_eq!(got.to_bits(), f.to_bits(), "{f}");
         assert_eq!(back, h);
+        // A wider form of the same value is refused.
+        if want.len() < 9 {
+            let wide = [b"\xa1\x61v\xfb".as_slice(), &f.to_bits().to_be_bytes()].concat();
+            let err = Header::from_cbor(&patch(&bytes, &entry, &wide)).unwrap_err();
+            assert_eq!(err.code(), "invalid", "{f}");
+        }
+    }
+    // So are infinities and NaN: a config is parsed JSON.
+    let good = header().to_cbor().unwrap();
+    for bad in [b"\xf9\x7c\x00", b"\xf9\xfc\x00", b"\xf9\x7e\x00"] {
+        let err = Header::from_cbor(&patch(&good, b"\xf9\x3c\x00", bad)).unwrap_err();
+        assert_eq!(err.code(), "invalid", "{bad:?}: {err}");
     }
     let nested = config(json!({"a": [1, 1.5, null, {"b": -2.5e-8}], "c": -3, "d": "x", "e": true}));
     let mut c = components(vec![]);
@@ -408,8 +417,9 @@ fn config_floats_take_their_shortest_exact_form() {
     assert_eq!(Header::from_cbor(&h.to_cbor().unwrap()).unwrap(), h);
     let json = serde_json::to_value(&h.components()[0].config).unwrap();
     assert_eq!(json, json!({"a": [1, 1.5, null, {"b": -2.5e-8}], "c": -3, "d": "x", "e": true}));
-    assert_ne!(ConfigValue::Float(1.0), ConfigValue::Int(1));
-    assert_ne!(ConfigValue::Float(0.0), ConfigValue::Float(-0.0));
+    let one = config(json!({"v": 1.0}));
+    let bytes = Header::new(vec![], Some(Pipeline { class: String::new(), config: one }), vec![], Default::default());
+    assert!(bytes.unwrap().to_cbor().unwrap().windows(3).any(|w| w == b"\xf9\x3c\x00"), "1.0 stays a float");
 }
 
 #[test]

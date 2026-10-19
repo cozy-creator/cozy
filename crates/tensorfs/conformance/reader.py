@@ -16,6 +16,7 @@ import base64
 import hashlib
 import itertools
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -316,8 +317,9 @@ def header(root) -> dict:
 
 
 def no_bytes(v):
-    """Metadata, params and configs hold values: no byte strings (only later fields may)."""
-    need(type(v) is not bytes, "a byte string value")
+    """Metadata, params and configs hold values: no byte strings (only later fields may), and
+    floats (configs only) are finite."""
+    need(type(v) is not bytes and (type(v) is not float or math.isfinite(v)), f"a value {v!r}")
     for x in v.values() if type(v) is dict else v if type(v) is list else ():
         no_bytes(x)
 

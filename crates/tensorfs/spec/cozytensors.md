@@ -82,8 +82,8 @@ location  = [chunk_index, offset, length]
 - **Class:** `<library>.<Class>` (`diffusers.StableDiffusionXLPipeline`, `diffusers.UNet2DConditionModel`,
   `transformers.CLIPTextModel`), or `""` when unknown.
 - **Config:** the parsed JSON of the component's config file, as a structured map, never a file. Its values, and
-  only those, MAY also be floats and `null` (`config-value` is a value, a float or `null`, lists and maps of them;
-  §9). A component without a config file has an empty config.
+  only those, MAY also be finite floats and `null` (`config-value` is a value, a float or `null`, lists and maps of
+  them; §9). A component without a config file has an empty config.
 - **`config_file`:** the config's file name in the component's folder, a path, present only when it is not
   `config.json` (`scheduler_config.json`, `tokenizer_config.json`). Later fields of a component follow it, so a
   component with later fields writes it, as `config.json` for the default.
@@ -498,8 +498,8 @@ have equal bytes and equal object refs. A reader MUST refuse:
 - anything but unsigned and negative integers, byte and text strings, arrays, maps with text keys, `true` and
   `false`, and inside a config (§4) floats and `null`: tags, `undefined` and other simple values are refused, and so
   are floats and `null` anywhere else;
-- a float not in the shortest of half, single and double precision that holds its value exactly, and a NaN other
-  than `f9 7e00`;
+- a float that is not finite, or not in the shortest of half, single and double precision that holds its value
+  exactly;
 - a head that is not in its shortest form, an indefinite length, map keys out of the bytewise order of their
   encodings or repeated, invalid UTF-8, and bytes after the root;
 - a byte string anywhere but an object's SHA-256 (and later fields);

@@ -1,7 +1,7 @@
 ; cozytensors header (spec §4, §9): RFC 8949 core deterministic CBOR.
 ; Definite lengths, shortest heads, map keys in bytewise order of their encodings.
-; No tags, undefined or simple values besides true and false; floats (the shortest of
-; half, single and double that holds the value; NaN as f9 7e00) and null only in configs.
+; No tags, undefined or simple values besides true and false; floats (finite, the shortest
+; of half, single and double that holds the value) and null only in configs.
 ; A reader skips trailing elements (`* any`) of the root and of every record: later
 ; versions only append fields.
 
@@ -31,6 +31,7 @@ component  = [name: tstr, class: tstr, config: config, tensors: [* tensor],
 
 config     = {* tstr => config-value}
 config-value = bool / int / tstr / float / null / [* config-value] / {* tstr => config-value}
+; A config is parsed JSON: its floats are finite.
 
 tensor     = plain / encoded
 plain      = [key: tstr, dtype, shape, 0, location, * any]
