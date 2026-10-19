@@ -101,7 +101,7 @@ class Info:
     def parts(self) -> dict[str, Part]: ...
 
 class Array:
-    """A tensor's bytes on the CPU; `torch.from_dlpack` and `numpy.from_dlpack` view them."""
+    """Owned CPU or CUDA bytes; DLPack consumers share them, and tobytes copies to the host."""
 
     @property
     def dtype(self) -> str: ...
@@ -150,8 +150,8 @@ class Tensors(Mapping[str, Info]):
     def read_all(
         self, keys: Sequence[str] | None = None, *, device: str = "cpu", decode: bool = True
     ) -> dict[str, Array | Encoded]: ...
-    def read_into(self, key: str, out: Buffer, *, role: str | None = None, offset: int = 0) -> None:
-        """Fill `out.nbytes` from byte `offset`; a role selects stored part bytes."""
+    def read_into(self, key: str, out: object, *, role: str | None = None, offset: int = 0) -> None:
+        """Fill a writable contiguous Buffer or DLPack array; a role selects stored part bytes."""
 
 class Pipeline:
     """What `model_index.json` held."""

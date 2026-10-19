@@ -14,7 +14,8 @@ use tensorfs_core::io::{DeviceBuffer, Dst, ReadOpts, Target};
 use tensorfs_core::store2::{Checkpoint, Error};
 
 use crate::store::{
-    invalid, metadata, raise, Aligned, ArrayBuffer, CheckpointAccess, FetchTensor, OrRaise, PyArray,
+    invalid, metadata, raise, Aligned, ArrayBuffer, CheckpointAccess, DeviceArray, FetchTensor,
+    OrRaise, PyArray,
 };
 
 /// A component's tensors: a mapping of key to `Info`, with the reads.
@@ -40,7 +41,7 @@ struct Want {
     dtype: Dtype,
     shape: Vec<u64>,
     buf: Aligned,
-    device: Option<DeviceBuffer>,
+    device: Option<Arc<DeviceArray>>,
 }
 
 impl PyTensors {
@@ -69,14 +70,116 @@ impl PyTensors {
         }
     }
 
-    /// `keys` as Arrays (or `Encoded`), every stored range in one engine call.
-    fn load<'py>(
+    fn into_destination(
         &self,
-        py: Python<'py>,
+        py: Python<'_>,
+        key: String,
+        role: Option<&str>,
+        offset: u64,
+        dst: Dst,
+    ) -> PyResult<()> {
+        let len = dst.len();
+        let ck = self.checkpoint(py)?;
+        let t = ck.tensor(&self.component, &key).or_raise(py)?;
+        if let (None, Body::Encoded { encoding, .. }) = (role, &t.body) {
+            let length = t
+                .dtype
+                .byte_len(&t.shape)
+                .ok_or_else(|| invalid(py, "unknown logical byte length"))?;
+            let end = offset
+                .checked_add(len as u64)
+                .filter(|end| *end <= length)
+                .ok_or_else(|| {
+                    invalid(py, format!("{key}: {len} bytes from {offset} of {length}"))
+                })?;
+            if len == 0 {
+                return Ok(());
+            }
+            if let Dst::Device { device, .. } = dst {
+                let parts = self
+                    .stored(py, std::slice::from_ref(&key), true, None)?
+                    .remove(0);
+                let width = t
+                    .dtype
+                    .byte_len(&[1])
+                    .ok_or_else(|| invalid(py, "unknown logical dtype width"))?;
+                let begin = offset / width;
+                let count = end.div_ceil(width) - begin;
+                return py
+                    .detach(|| -> Result<(), Failure> {
+                        let buffer = tensorfs_core::io::decode::read(
+                            &t.dtype,
+                            &t.shape,
+                            encoding,
+                            &views(&parts),
+                            device,
+                            begin,
+                            count,
+                        )?;
+                        let copy = tensorfs_core::io::Copy {
+                            src: tensorfs_core::io::Src::Device {
+                                device,
+                                ptr: buffer.ptr() + offset % width,
+                                stream: 0,
+                            },
+                            dst,
+                        };
+                        unsafe { tensorfs_core::io::read(&[copy], &ReadOpts::default()) }
+                            .map_err(|e| Failure::from(e.source))?;
+                        Ok(())
+                    })
+                    .or_raise(py);
+            }
+            let array = self
+                .load(py, std::slice::from_ref(&key), true, None)?
+                .remove(0)
+                .cast_into::<PyArray>()?;
+            let bytes = array.get().buf.host().expect("read on CPU");
+            let range = &bytes[offset as usize..end as usize];
+            let copy = tensorfs_core::io::Copy {
+                src: tensorfs_core::io::Src::Host(range.as_ptr()),
+                dst,
+            };
+            return py
+                .detach(|| {
+                    unsafe { tensorfs_core::io::read(&[copy], &ReadOpts::default()) }
+                        .map_err(|e| Failure::from(e.source))
+                })
+                .or_raise(py)
+                .map(|_| ());
+        }
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| invalid(py, "read range overflow"))?;
+        let read = FetchTensor {
+            key: &key,
+            role: Some(role.unwrap_or("")),
+            range: Some(offset..end),
+        };
+        self.ck
+            .as_ref()
+            .unwrap()
+            .fetch_tensors(py, &self.component, &[read])?;
+        let target = Target {
+            component: &self.component,
+            key: &key,
+            role: role.unwrap_or(""),
+            offset,
+            dst,
+        };
+        // SAFETY: the exporter keeps `out` alive and writable while `buf` is held.
+        py.detach(|| unsafe { ck.read_into(&[target], &ReadOpts::default()) })
+            .or_raise(py)?;
+        Ok(())
+    }
+
+    fn stored(
+        &self,
+        py: Python<'_>,
         keys: &[String],
         decode_: bool,
         device: Option<i32>,
-    ) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    ) -> PyResult<Vec<Vec<Want>>> {
         let ck = self.checkpoint(py)?;
         let reads: Vec<FetchTensor> = keys
             .iter()
@@ -105,7 +208,10 @@ impl PyTensors {
                     .map_err(|_| invalid(py, "stored tensor exceeds address space"))?;
                 let direct = device.filter(|_| !decode_ || matches!(t.body, Body::Data(_)));
                 let gpu = direct
-                    .map(|device| py.detach(|| DeviceBuffer::new(device, length)).or_raise(py))
+                    .map(|device| {
+                        py.detach(|| DeviceBuffer::new(device, length).map(DeviceArray::new))
+                            .or_raise(py)
+                    })
                     .transpose()?;
                 let buf = Aligned::new(if gpu.is_some() { 0 } else { length });
                 wants.push(Want {
@@ -147,9 +253,22 @@ impl PyTensors {
         for w in wants {
             by_key[w.key].push(w);
         }
+        Ok(by_key)
+    }
+
+    /// `keys` as Arrays (or `Encoded`), every stored range in one engine call.
+    fn load<'py>(
+        &self,
+        py: Python<'py>,
+        keys: &[String],
+        decode_: bool,
+        device: Option<i32>,
+    ) -> PyResult<Vec<Bound<'py, PyAny>>> {
+        let ck = self.checkpoint(py)?;
+        let by_key = self.stored(py, keys, decode_, device)?;
         let array = |w: Want| PyArray {
             buf: match w.device {
-                Some(device) => ArrayBuffer::Device(Arc::new(device)),
+                Some(device) => ArrayBuffer::Device(device),
                 None => ArrayBuffer::Host(Arc::new(w.buf)),
             },
             dtype: w.dtype,
@@ -178,13 +297,14 @@ impl PyTensors {
                             tensorfs_core::io::decode::read(
                                 &t.dtype, &t.shape, encoding, &views, device, 0, count,
                             )
+                            .map(DeviceArray::new)
                         })
                         .or_raise(py)?;
                     out.push(
                         Bound::new(
                             py,
                             PyArray {
-                                buf: ArrayBuffer::Device(Arc::new(buffer)),
+                                buf: ArrayBuffer::Device(buffer),
                                 dtype: t.dtype.clone(),
                                 shape: t.shape.clone(),
                             },
@@ -336,6 +456,13 @@ impl PyTensors {
         role: Option<String>,
         offset: u64,
     ) -> PyResult<()> {
+        if out.hasattr("__dlpack__")? {
+            let held = crate::store::Dlpack::of(py, out, None, None)?;
+            let result =
+                self.into_destination(py, key, role.as_deref(), offset, held.destination());
+            py.detach(move || drop(held));
+            return result;
+        }
         let view = py
             .import("builtins")?
             .getattr("memoryview")?
@@ -343,73 +470,16 @@ impl PyTensors {
         if view.getattr("readonly")?.extract::<bool>()?
             || !view.getattr("c_contiguous")?.extract::<bool>()?
         {
-            return Err(invalid(py, "out must be a writable C-contiguous buffer"));
+            return Err(invalid(
+                py,
+                "out must be a writable C-contiguous buffer or DLPack array",
+            ));
         }
         let buf: PyBuffer<u8> = PyBuffer::get(&view.call_method1("cast", ("B",))?)?;
-        let len = buf.len_bytes();
-        let ck = self.checkpoint(py)?;
-        let t = ck.tensor(&self.component, &key).or_raise(py)?;
-        if role.is_none() && matches!(t.body, Body::Encoded { .. }) {
-            let length = t
-                .dtype
-                .byte_len(&t.shape)
-                .ok_or_else(|| invalid(py, "unknown logical byte length"))?;
-            if offset
-                .checked_add(len as u64)
-                .is_none_or(|end| end > length)
-            {
-                return Err(invalid(
-                    py,
-                    format!("{key}: {len} bytes from {offset} of {length}"),
-                ));
-            }
-            let array = self
-                .load(py, std::slice::from_ref(&key), true, None)?
-                .remove(0)
-                .cast_into::<PyArray>()?;
-            let bytes = array.get().buf.host().expect("read on CPU");
-            let Some(range) = usize::try_from(offset)
-                .ok()
-                .and_then(|at| bytes.get(at..))
-                .and_then(|b| b.get(..len))
-            else {
-                return Err(invalid(
-                    py,
-                    format!("{key}: {len} bytes from {offset} of {}", bytes.len()),
-                ));
-            };
-            // SAFETY: the buffer is held writable for `len` bytes while `buf` lives.
-            if len != 0 {
-                unsafe { std::slice::from_raw_parts_mut(buf.buf_ptr() as *mut u8, len) }
-                    .copy_from_slice(range);
-            }
-            return Ok(());
-        }
-        let end = offset
-            .checked_add(len as u64)
-            .ok_or_else(|| invalid(py, "read range overflow"))?;
-        let read = FetchTensor {
-            key: &key,
-            role: Some(role.as_deref().unwrap_or("")),
-            range: Some(offset..end),
+        let dst = Dst::Host {
+            ptr: buf.buf_ptr() as *mut u8,
+            len: buf.len_bytes(),
         };
-        self.ck
-            .as_ref()
-            .unwrap()
-            .fetch_tensors(py, &self.component, &[read])?;
-        let target = Target {
-            component: &self.component,
-            key: &key,
-            role: role.as_deref().unwrap_or(""),
-            offset,
-            dst: Dst::Host {
-                ptr: buf.buf_ptr() as *mut u8,
-                len,
-            },
-        };
-        // SAFETY: the exporter keeps `out` alive and writable while `buf` is held.
-        py.detach(|| unsafe { ck.read_into(&[target], &ReadOpts::default()) })
-            .or_raise(py)?;
-        Ok(())
+        self.into_destination(py, key, role.as_deref(), offset, dst)
     }
 }

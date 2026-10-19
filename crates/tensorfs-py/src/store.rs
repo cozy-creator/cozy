@@ -1167,10 +1167,36 @@ impl Aligned {
 }
 
 /// An owned host or device allocation, also retained by every exported DLPack capsule.
+pub(crate) struct DeviceArray(Option<tensorfs_core::io::DeviceBuffer>);
+
+impl DeviceArray {
+    pub(crate) fn new(buffer: tensorfs_core::io::DeviceBuffer) -> Arc<Self> {
+        Arc::new(Self(Some(buffer)))
+    }
+}
+
+impl std::ops::Deref for DeviceArray {
+    type Target = tensorfs_core::io::DeviceBuffer;
+    fn deref(&self) -> &Self::Target { self.0.as_ref().expect("live device allocation") }
+}
+
+impl Drop for DeviceArray {
+    fn drop(&mut self) {
+        let mut buffer = self.0.take();
+        // A DLPack consumer may invoke its deleter from a foreign thread. Do not attach
+        // that thread just to free native storage. When Python calls the last deleter,
+        // release its GIL: cuMemFree may synchronize another consumer's pending work.
+        if unsafe { ffi::Py_IsInitialized() != 0 && ffi::PyGILState_Check() != 0 } {
+            Python::try_attach(|py| py.detach(|| drop(buffer.take())));
+        }
+        drop(buffer);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum ArrayBuffer {
     Host(Arc<Aligned>),
-    Device(Arc<tensorfs_core::io::DeviceBuffer>),
+    Device(Arc<DeviceArray>),
 }
 
 impl ArrayBuffer {
@@ -1199,7 +1225,7 @@ impl ArrayBuffer {
                 let request = Copy { src: Src::Device { device: b.device(), ptr: b.ptr(), stream: 0 }, dst: Dst::Device { device: b.device(), ptr: copy.ptr(), len: copy.len(), stream: 0 } };
                 // SAFETY: both allocations remain held until the copy completes.
                 unsafe { io::read(&[request], &ReadOpts::default()) }.map_err(|e| Failure::from(e.source))?;
-                Self::Device(Arc::new(copy))
+                Self::Device(DeviceArray::new(copy))
             }
         })
     }
@@ -1368,6 +1394,8 @@ impl PyArray {
                 },
             ));
         };
+        let shape = self.shape.iter().map(|&dimension| i64::try_from(dimension).map_err(|_| invalid(py, "DLPack dimension exceeds i64"))).collect::<PyResult<Vec<_>>>()?;
+        if self.shape.len() > i32::MAX as usize { return Err(invalid(py, "DLPack rank exceeds i32")); }
         let buf = if copy == Some(true) {
             py.detach(|| self.buf.duplicate()).or_raise(py)?
         } else {
@@ -1375,7 +1403,7 @@ impl PyArray {
         };
         let data = buf.ptr();
         let held = Box::into_raw(Box::new(Held {
-            shape: self.shape.iter().map(|&d| d as i64).collect(),
+            shape,
             _buf: buf,
         }));
         // SAFETY: `held` is live until the deleter runs; the consumer may write its own copy.
@@ -1420,6 +1448,90 @@ impl PyArray {
 
     fn __repr__(&self) -> String {
         format!("Array({}, {:?})", self.dtype, self.shape)
+    }
+}
+
+/// The shared contiguous DLPack view used by both the Writer and destination reads.
+/// Callers move/drop this owner in a detached closure: the stream drains before the capsule
+/// releases its producer allocation, including when an operation refuses the view.
+pub(crate) struct Dlpack {
+    pub(crate) stream: Option<tensorfs_core::io::cuda::Stream>,
+    pub(crate) capsule: Py<PyAny>,
+    pub(crate) device: (i32, i32),
+    pub(crate) dtype: Dtype,
+    pub(crate) shape: Vec<u64>,
+    pub(crate) len: usize,
+    pub(crate) address: usize,
+}
+
+impl Dlpack {
+    pub(crate) fn of(py: Python<'_>, data: &Bound<'_, PyAny>, dtype: Option<String>, shape: Option<Vec<u64>>) -> PyResult<Self> {
+        let device: (i32, i32) = data.call_method0("__dlpack_device__")?.extract()?;
+        let stream = match device {
+            (KDL_CPU, _) => None,
+            (KDL_CUDA, device) if device >= 0 => Some(py.detach(|| tensorfs_core::io::cuda::Stream::new(device)).or_raise(py)?),
+            _ => return Err(raise(py, Failure { kind: Kind::Unsupported, detail: "expected a CPU or CUDA DLPack array".into() })),
+        };
+        let exported = (|| {
+            if let Some(stream) = &stream {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("stream", stream.raw())?;
+                data.call_method("__dlpack__", (), Some(&kwargs))
+            } else { data.call_method0("__dlpack__") }
+        })();
+        let capsule = match exported {
+            Ok(capsule) => capsule.unbind(),
+            Err(error) => { py.detach(move || drop(stream)); return Err(error); }
+        };
+        let parsed = (|| {
+            let capsule = capsule.bind(py);
+            if unsafe { ffi::PyCapsule_IsValid(capsule.as_ptr(), DLTENSOR.as_ptr()) } != 1 {
+                return Err(invalid(py, "__dlpack__ did not return a dltensor capsule"));
+            }
+            let managed = unsafe { ffi::PyCapsule_GetPointer(capsule.as_ptr(), DLTENSOR.as_ptr()) as *const DLManagedTensor };
+            let tensor = unsafe { &(*managed).dl_tensor };
+            if tensor.device.device_type != device.0 || (device.0 == KDL_CUDA && tensor.device.device_id != device.1)
+                || !(0..=32).contains(&tensor.ndim) || tensor.dtype.lanes != 1 {
+                return Err(invalid(py, "DLPack device or scalar-lane tensor metadata disagrees"));
+            }
+            if tensor.ndim != 0 && tensor.shape.is_null() {
+                return Err(invalid(py, "DLPack tensor has no shape"));
+            }
+            let dims = if tensor.ndim == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(tensor.shape, tensor.ndim as usize) } };
+            let inferred_shape: Vec<u64> = dims.iter().map(|d| u64::try_from(*d).map_err(|_| invalid(py, "DLPack shape is negative"))).collect::<PyResult<_>>()?;
+            let mut stride = 1i64;
+            for i in (0..dims.len()).rev() {
+                if !tensor.strides.is_null() && dims[i] > 1 && unsafe { *tensor.strides.add(i) } != stride {
+                    return Err(invalid(py, "expected a contiguous DLPack array"));
+                }
+                stride = stride.checked_mul(dims[i]).ok_or_else(|| invalid(py, "DLPack shape overflows"))?;
+            }
+            let inferred_dtype = Dtype::known().find(|d| dl_type(d) == Some((tensor.dtype.code, tensor.dtype.bits)))
+                .ok_or_else(|| invalid(py, "DLPack dtype is unsupported"))?;
+            let dtype = dtype.map(|d| Dtype::parse(&d)).unwrap_or_else(|| inferred_dtype.clone());
+            let shape = shape.unwrap_or_else(|| inferred_shape.clone());
+            if dtype != inferred_dtype || shape != inferred_shape {
+                return Err(invalid(py, "explicit dtype or shape disagrees with the DLPack array"));
+            }
+            let len = dtype.byte_len(&shape).and_then(|n| usize::try_from(n).ok()).ok_or_else(|| invalid(py, "DLPack byte size overflows"))?;
+            let offset = usize::try_from(tensor.byte_offset).map_err(|_| invalid(py, "DLPack byte offset overflows"))?;
+            let address = (tensor.data as usize).checked_add(offset).ok_or_else(|| invalid(py, "DLPack address overflows"))?;
+            if len != 0 && address == 0 { return Err(invalid(py, "DLPack tensor has no data")); }
+            if address.checked_add(len).is_none() { return Err(invalid(py, "DLPack address range overflows")); }
+            Ok((dtype, shape, len, address))
+        })();
+        let (dtype, shape, len, address) = match parsed {
+            Ok(parsed) => parsed,
+            Err(error) => { py.detach(move || { drop(stream); drop(capsule); }); return Err(error); }
+        };
+        Ok(Self { stream, capsule, device, dtype, shape, len, address })
+    }
+
+    pub(crate) fn destination(&self) -> tensorfs_core::io::Dst {
+        match &self.stream {
+            Some(stream) => tensorfs_core::io::Dst::Device { device: self.device.1, ptr: self.address as u64, len: self.len, stream: stream.raw() },
+            None => tensorfs_core::io::Dst::Host { ptr: self.address as *mut u8, len: self.len },
+        }
     }
 }
 
@@ -1610,74 +1722,14 @@ impl PyComponentWriter {
             let shape = shape.ok_or_else(|| invalid(py, "a buffer needs shape"))?;
             return self.put(py, key, dtype, shape, data);
         }
-        let device: (i32, i32) = data.call_method0("__dlpack_device__")?.extract()?;
-        let stream = match device {
-            (KDL_CPU, _) => None,
-            (KDL_CUDA, device) if device >= 0 => Some(py.detach(|| tensorfs_core::io::cuda::Stream::new(device)).or_raise(py)?),
-            _ => return Err(raise(py, Failure { kind: Kind::Unsupported, detail: "Writer accepts CPU or CUDA DLPack arrays".into() })),
-        };
-        let exported = (|| {
-            if let Some(stream) = &stream {
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("stream", stream.raw())?;
-                data.call_method("__dlpack__", (), Some(&kwargs))
-            } else { data.call_method0("__dlpack__") }
-        })();
-        let capsule = match exported {
-            Ok(capsule) => capsule.unbind(),
-            Err(error) => { py.detach(move || drop(stream)); return Err(error); }
-        };
-        let parsed = (|| {
-            let capsule = capsule.bind(py);
-            if unsafe { ffi::PyCapsule_IsValid(capsule.as_ptr(), DLTENSOR.as_ptr()) } != 1 {
-                return Err(invalid(py, "__dlpack__ did not return a dltensor capsule"));
-            }
-            let managed = unsafe { ffi::PyCapsule_GetPointer(capsule.as_ptr(), DLTENSOR.as_ptr()) as *const DLManagedTensor };
-            let tensor = unsafe { &(*managed).dl_tensor };
-            if tensor.device.device_type != device.0 || (device.0 == KDL_CUDA && tensor.device.device_id != device.1)
-                || !(0..=32).contains(&tensor.ndim) || tensor.dtype.lanes != 1 {
-                return Err(invalid(py, "DLPack device or scalar-lane tensor metadata disagrees"));
-            }
-            if tensor.ndim != 0 && tensor.shape.is_null() {
-                return Err(invalid(py, "DLPack tensor has no shape"));
-            }
-            let dims = if tensor.ndim == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(tensor.shape, tensor.ndim as usize) } };
-            let inferred_shape: Vec<u64> = dims.iter().map(|d| u64::try_from(*d).map_err(|_| invalid(py, "DLPack shape is negative"))).collect::<PyResult<_>>()?;
-            let mut stride = 1i64;
-            for i in (0..dims.len()).rev() {
-                if !tensor.strides.is_null() && dims[i] > 1 && unsafe { *tensor.strides.add(i) } != stride {
-                    return Err(invalid(py, "Writer expects a contiguous DLPack array"));
-                }
-                stride = stride.checked_mul(dims[i]).ok_or_else(|| invalid(py, "DLPack shape overflows"))?;
-            }
-            let inferred_dtype = Dtype::known().find(|d| dl_type(d) == Some((tensor.dtype.code, tensor.dtype.bits)))
-                .ok_or_else(|| invalid(py, "DLPack dtype is unsupported"))?;
-            let dtype = dtype.map(|d| Dtype::parse(&d)).unwrap_or_else(|| inferred_dtype.clone());
-            let shape = shape.unwrap_or_else(|| inferred_shape.clone());
-            if dtype != inferred_dtype || shape != inferred_shape {
-                return Err(invalid(py, "explicit dtype or shape disagrees with the DLPack array"));
-            }
-            let len = dtype.byte_len(&shape).and_then(|n| usize::try_from(n).ok()).ok_or_else(|| invalid(py, "DLPack byte size overflows"))?;
-            let offset = usize::try_from(tensor.byte_offset).map_err(|_| invalid(py, "DLPack byte offset overflows"))?;
-            let address = (tensor.data as usize).checked_add(offset).ok_or_else(|| invalid(py, "DLPack address overflows"))?;
-            if len != 0 && address == 0 { return Err(invalid(py, "DLPack tensor has no data")); }
-            if address.checked_add(len).is_none() { return Err(invalid(py, "DLPack address range overflows")); }
-            Ok((dtype, shape, len, address))
-        })();
-        let (dtype, shape, len, address) = match parsed {
-            Ok(parsed) => parsed,
-            Err(error) => { py.detach(move || { drop(stream); drop(capsule); }); return Err(error); }
-        };
-        if let Some(stream) = stream {
-            let handoff = (stream, capsule);
-            return self.w.get().with(py, move |w| {
-                let (stream, capsule) = handoff;
+        let view = Dlpack::of(py, data, dtype, shape)?;
+        self.w.get().with(py, move |w| {
+            let Dlpack { stream, capsule, device, dtype, shape, len, address } = view;
+            if let Some(stream) = stream {
                 let mut source = crate::dlpack_source::DeviceSource::new(capsule, stream, device.1, address as u64, len)?;
-                Ok(w.get(&self.name).put(&key, &dtype, &shape, Data::Plain(Source::Read(&mut source)))?)
-            });
-        }
-        let _capsule = capsule;
-        self.w.get().with(py, |w| {
+                return Ok(w.get(&self.name).put(&key, &dtype, &shape, Data::Plain(Source::Read(&mut source)))?);
+            }
+            let _capsule = capsule;
             let mut bytes = if len == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(address as *const u8, len) } };
             Ok(w.get(&self.name).put(&key, &dtype, &shape, Data::Plain(Source::Read(&mut bytes)))?)
         })
