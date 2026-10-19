@@ -115,8 +115,7 @@ pub struct RunContext {
     pub(crate) gpus: u32,
     pub(crate) bits: u32,
     pub(crate) models: Vec<domain::ModelChoice>,
-    pub(crate) weights_destination: String,
-    /// What its weights come under before its call's executor asks (`Fetch::ahead`).
+    /// What its weights come under before its call's executor reads them (`Fetch::ahead`).
     pub(crate) ahead: Option<Arc<crate::access::Fetch>>,
 }
 
@@ -373,32 +372,34 @@ impl Runs {
             };
             #[cfg(not(feature = "migrate"))]
             let migrated: Option<(ObjectRef, Value)> = None;
-            let (manifest, mut row) = if let Some(made) = migrated {
-                made
+            // Each model's header, and the tree that names it when one does.
+            let (header, tree, mut row) = if let Some((header, row)) = migrated {
+                (header, None, row)
             } else if !choice.source.is_empty() {
                 let made = publisher.make_source(&choice.source, &choice.profiles, &spec.providers, stop, observe)?;
                 let row = json!({"parameter": choice.parameter, "source": choice.source,
                     "resolved": made.resolved, "profiles": made.profiles,
-                    "repository": made.repository, "manifest": made.manifest.id()});
-                (made.manifest, row)
+                    "repository": made.repository, "checkpoint": made.header.id()});
+                let tree = crate::storage::local_tree(publisher.store(), &made.repository)?;
+                (made.header, tree, row)
             } else if let (Some(name), None) = (choice.repository.strip_prefix("local/"), &choice.manifest) {
                 // A local alias: the model this machine's store holds under that name.
-                let manifest = crate::storage::local(publisher.store(), name)
+                let header = crate::storage::local(publisher.store(), name)
                     .map_err(|e| refused("checkpoint_absent", e.to_string()))?
                     .ok_or_else(|| refused("checkpoint_absent", format!("this machine holds no local/{name}")))?;
                 let row = json!({"parameter": choice.parameter,
-                    "repository": choice.repository, "manifest": manifest.id()});
-                (manifest, row)
+                    "repository": choice.repository, "checkpoint": header.id()});
+                (header, crate::storage::local_tree(publisher.store(), &choice.repository)?, row)
             } else if choice.repository.is_empty() {
-                // A checkpoint this machine already holds (a run's output).
-                let manifest = choice.manifest.as_ref().ok_or_else(|| {
+                // A checkpoint this machine already holds (a run's output), by its header.
+                let header = choice.manifest.as_ref().ok_or_else(|| {
                     refused("invalid_request", format!("model choice {:?} names no model", choice.parameter))
                 })?;
-                let sha256 = tensorfs_core::sha256::hex(&manifest.digest);
+                let sha256 = tensorfs_core::sha256::hex(&header.digest);
                 let held = crate::storage::held(publisher.store(), &sha256)
                     .map_err(|_| refused("checkpoint_absent", format!("this machine holds no checkpoint sha256:{sha256}")))?;
-                let row = json!({"parameter": choice.parameter, "manifest": format!("sha256:{sha256}")});
-                (held, row)
+                let row = json!({"parameter": choice.parameter, "checkpoint": format!("sha256:{sha256}")});
+                (held, None, row)
             } else {
                 // A Hub checkpoint by name, or the owner's by hash; no lane is the one this
                 // machine's GPUs would run at the run's bits (`precision`).
@@ -411,18 +412,24 @@ impl Runs {
                 let (named, (hub, volume)) = publisher.download(&self.service, hub_access()?, named, &lanes, &spec.catalog_revision, stop, &|done, total| {
                     observe(&stage, done, total)
                 })?;
-                let held = crate::storage::held(publisher.store(), &named.manifest)?;
+                let header = named.header().map_err(|(code, message)| refused(code, message))?.clone();
+                let tree = named.tree.as_ref().map(ObjectRef::id);
                 let row = json!({"parameter": choice.parameter, "repository": named.repository,
-                    "release": named.release, "lane": named.lane, "manifest": named.manifest,
+                    "release": named.release, "lane": named.lane, "tree": tree, "checkpoint": header.id(),
                     "bytes": {"hub": hub, "volume": volume}});
-                (held, row)
+                (header, None, row)
             };
             if let Some(name) = destination.strip_prefix("local/") {
                 // A local alias (`cozy model download … local/name`): the model, held by name.
-                crate::storage::set_local(publisher.store(), name, &manifest)
+                crate::storage::set_local(publisher.store(), name, &header, &Default::default())
                     .map_err(|e| refused("local_alias_refused", e.to_string()))?;
-                row["published"] = json!({"destination": destination, "checkpoint": manifest.id(), "converged": false});
+                row["published"] = json!({"destination": destination, "checkpoint": header.id(), "converged": false});
             } else if !destination.is_empty() {
+                // A tree goes up: the model's own, else one naming its header alone.
+                let tree = match tree {
+                    Some(tree) => tree,
+                    None => crate::storage::tree_of(publisher.store(), &header)?,
+                };
                 let publishing = hub::Catalog::for_op(
                     hub_access()?,
                     hub::Op::Publish { model: destination },
@@ -437,7 +444,7 @@ impl Runs {
                 let published = publishing.publish(&crate::origin::Publication {
                     store: publisher.store(),
                     destination,
-                    manifest: &manifest,
+                    tree: &tree,
                     operation: &operation,
                     progress: &|done, total| observe(&stage, done, total),
                     streams: 8,
@@ -568,7 +575,7 @@ impl Runs {
         if let (false, Some(gpu)) = (spec.warm, self.service.gpu()) {
             ahead = plan.as_ref().zip(self.publisher.as_ref()).map(|(plan, publisher)| {
                 let order = self.service.engine.get(id).map_or(u64::MAX, |record| record.root_seq());
-                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), plan.manifests(), order);
+                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), order);
                 if let Err(error) = fetch.ahead(&plan.upfront()) {
                     tracing::warn!("run {id}: its weights' early fetch: {error}");
                 }
@@ -622,7 +629,7 @@ impl Runs {
             // A function's warm run ends holding what its constructions read (`downloaded`).
             let mut moved = (0, 0);
             if let (Some(plan), Some(publisher)) = (&plan, &self.publisher) {
-                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), plan.manifests(), u64::MAX);
+                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), u64::MAX);
                 let report = |done, total| observe("downloading its weights", done, total);
                 moved = fetch.download(&plan.upfront(), &stoppable.stop, &report).map_err(|e| match stoppable.stop.is_cancelled() {
                     true => refused(crate::published::CANCELED, "the run was canceled while it downloaded"),
@@ -685,7 +692,6 @@ impl Runs {
                 gpus: spec.gpus,
                 bits: spec.bits,
                 models: spec.models.clone(),
-                weights_destination: spec.weights_destination.clone(),
                 ahead,
             };
             self.contexts.lock().unwrap().insert(id.into(), context);
@@ -800,8 +806,8 @@ impl Runs {
                 .map_err(io::Error::other)?);
                 let held = self.service.catalog.resolve(&installation.generation)?;
                 // A member's weights come under the warm run's access, after every run's.
-                let fetch = self.publisher.as_ref().zip(plan.as_ref()).map(|(publisher, plan)| {
-                    crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), plan.manifests(), u64::MAX)
+                let fetch = self.publisher.as_ref().filter(|_| plan.is_some()).map(|publisher| {
+                    crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), u64::MAX)
                 });
                 members.push(Member::new(held, plan, item.level, fetch));
             }
@@ -1133,7 +1139,7 @@ impl Runs {
                             // Its weights come after its root's own, under the child's access.
                             let hub = spec.hub.clone().or_else(|| runs.own_hub.clone());
                             if let Some(publisher) = &runs.publisher {
-                                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub, plan.manifests(), root);
+                                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub, root);
                                 gpu.prefetch(&runs.service.engine, held, plan, (root, family.clone()), owner.clone(), fetch)
                             }
                         }
@@ -1150,16 +1156,6 @@ impl Runs {
             tracing::warn!("prefetch of a child: {error}");
         }
         Ok(())
-    }
-
-    /// Where a run's weights outputs go: the requester's repository, under its capability.
-    pub fn destination(&self, id: &str) -> io::Result<Option<crate::weights::Destination>> {
-        let repository = self.contexts.lock().unwrap().get(id).map(|c| c.weights_destination.clone()).unwrap_or_default();
-        match (repository.is_empty(), self.hub(id)) {
-            (true, _) => Ok(None),
-            (false, Some(hub)) => Ok(Some(crate::weights::Destination { repository, hub })),
-            (false, None) => Err(io::Error::other("a weights destination needs the run's Hub access, and the run has none")),
-        }
     }
 
     /// The fetches a run's preparation started, for its call to end once its executor asks.

@@ -16,10 +16,6 @@ use std::{
 use crate::storage::{self, Store};
 use tensorfs_core::store2::Checkpoint;
 
-/// The `model_source` name of a checkpoint's manifest (`tensorfs.manifest/2`, its file list):
-/// `.` is never a manifest path.
-pub const LISTING: &str = ".";
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SelectedManifest {
     pub manifest: String,
@@ -28,7 +24,6 @@ pub struct SelectedManifest {
 
 struct Selection {
     checkpoint: Checkpoint,
-    manifest_bytes: Vec<u8>,
     header_bytes: Vec<u8>,
     components: Vec<String>,
     encoded_bytes: u64,
@@ -36,10 +31,6 @@ struct Selection {
 
 pub struct ModelSources {
     selected: BTreeMap<String, Selection>,
-}
-
-fn failure(error: impl std::fmt::Display) -> io::Error {
-    io::Error::other(error.to_string())
 }
 
 fn outside() -> io::Error {
@@ -72,9 +63,7 @@ impl ModelSources {
         for selection in selections {
             let manifest = digest(&selection.manifest)?.to_owned();
             let checkpoint = storage::checkpoint(&store, &manifest)?;
-            let header = checkpoint.manifest().header().ok_or_else(|| failure("selected snapshot has no model header"))?;
-            let header_bytes = store.read(header).map_err(storage::io_error)?;
-            let manifest_bytes = store.read(checkpoint.id()).map_err(storage::io_error)?;
+            let header_bytes = store.read(checkpoint.id()).map_err(storage::io_error)?;
             // No components named: all of them (a `Weights[M]` source, planned by Runtime).
             let components: Vec<String> = match selection.components.is_empty() {
                 true => checkpoint.header().components().iter().map(|c| c.name.clone()).collect(),
@@ -89,7 +78,7 @@ impl ModelSources {
                     .flat_map(|t| t.locations().into_iter().map(|(_, at)| at.length))
                     .sum::<u64>();
             }
-            let selection = Selection { checkpoint, manifest_bytes, header_bytes, components, encoded_bytes };
+            let selection = Selection { checkpoint, header_bytes, components, encoded_bytes };
             if selected.insert(manifest, selection).is_some() {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "duplicate manifest selection"));
             }
@@ -108,20 +97,20 @@ impl ModelSources {
         self.selected.get(digest(manifest)?).map(|s| s.checkpoint.clone()).ok_or_else(outside)
     }
 
-    /// One selected model's header (`name` empty), stored bytes as written; its manifest
-    /// ([`LISTING`]), the checkpoint's file list; or one of its manifest's files (configs,
-    /// tokenizers).
+    /// One selected model's header (`name` empty), stored bytes as written, or one of its
+    /// components' assets, `<component>/<name>` (tokenizers).
     pub fn source(&self, manifest: &str, name: &str) -> io::Result<Vec<u8>> {
         let selection = self.selected.get(digest(manifest)?).ok_or_else(outside)?;
-        match name {
-            "" => return Ok(selection.header_bytes.clone()),
-            LISTING => return Ok(selection.manifest_bytes.clone()),
-            _ => {}
+        if name.is_empty() {
+            return Ok(selection.header_bytes.clone());
         }
-        if !selection.checkpoint.manifest().files.contains_key(name) || name.ends_with(".cozytensors") {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "asset is outside the selected manifest"));
-        }
-        selection.checkpoint.file(name).map_err(storage::io_error)
+        let held = name.split_once('/').filter(|(component, asset)| {
+            selection.checkpoint.header().component(component).is_some_and(|c| c.assets.contains_key(*asset))
+        });
+        let Some((component, asset)) = held else {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "asset is outside the selected checkpoint"));
+        };
+        selection.checkpoint.asset(component, asset).map_err(storage::io_error)
     }
 
     /// Answer a `model_source` request: the bytes in a file nobody can write, with their digest.

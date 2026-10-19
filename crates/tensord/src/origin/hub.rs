@@ -1,10 +1,7 @@
-//! A model at a Hub: TensorFS's `TensorhubOrigin` under the run's Cozy credentials. Released
-//! lanes are read anonymously; the owner's checkpoint by hash under the capability the owner's
-//! CLI signed, traded for a DPoP-bound token and presented to the Hub host only. Every Hub call
-//! runs on the fetch runtime.
-//!
-//! U11 keeps the closure and presign wire as it is; it changes only what the Hub computes
-//! behind it (a checkpoint's closure: manifest, files, the header's chunks).
+//! A model at a Hub: TensorFS's `TensorhubOrigin` under the run's Cozy credentials. A release
+//! names a tree, and a lane is a variant in it; released lanes are read anonymously, the owner's
+//! tree by hash under the capability the owner's CLI signed, traded for a DPoP-bound token and
+//! presented to the Hub host only. Every Hub call runs on the fetch runtime.
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -50,8 +47,8 @@ fn origin(machine: &Machine, source: &hub::Source, catalog: &Arc<Catalog>) -> Re
     Ok((origin, (trust, local)))
 }
 
-/// `repository`'s checkpoint `manifest` at `source`'s Hub: a release's lane, or (no release)
-/// the owner's checkpoint by hash, read under the run's capability when it names that read.
+/// `repository`'s `tree` at `source`'s Hub: a release's, read in `lane`, or (no release) the
+/// owner's tree by hash, read under the run's capability when it names that read.
 /// Nothing is asked of the Hub until a request needs it. Answers the catalog its calls present
 /// under (a failed fetch's reason, `Catalog::reason`).
 pub fn remote(
@@ -60,14 +57,14 @@ pub fn remote(
     repository: &str,
     release: &str,
     lane: &str,
-    manifest: &ObjectRef,
+    tree: &ObjectRef,
 ) -> std::result::Result<(Remote, Arc<Catalog>), (&'static str, String)> {
     let catalog = Arc::new(match release.is_empty() {
-        true => Catalog::scoped(source, Op::Read { model: repository, manifest: &manifest.id() })?,
+        true => Catalog::scoped(source, Op::Read { model: repository, manifest: &tree.id() })?,
         false => Catalog::new(source).map_err(|e| ("catalog_read_failed", e.0))?,
     });
     let (origin, (trust, local)) = self::origin(machine, source, &catalog).map_err(|e| ("catalog_read_failed", e.detail))?;
-    let origin = Arc::new(origin.at(repository, (!release.is_empty()).then_some(release), lane, manifest));
+    let origin = Arc::new(origin.at(repository, (!release.is_empty()).then_some(release), lane, tree));
     Ok((Remote { origin, trust, local }, catalog))
 }
 
@@ -91,8 +88,8 @@ pub fn resolve_named(machine: &Machine, source: &hub::Source, repository: &str, 
     })
 }
 
-/// The owner's checkpoint `sha256` of `repository`, named by hash alone, as the Hub states it
-/// (its length), read under the run's capability when it names that read.
+/// The owner's tree `sha256` of `repository`, named by hash alone, as the Hub states it (its
+/// length), read under the run's capability when it names that read.
 pub fn resolve_hash(machine: &Machine, source: &hub::Source, repository: &str, lane: &str, sha256: &str) -> std::result::Result<ObjectRef, (&'static str, String)> {
     let id = format!("sha256:{sha256}");
     let catalog = Arc::new(Catalog::scoped(source, Op::Read { model: repository, manifest: &id })?);
@@ -100,9 +97,9 @@ pub fn resolve_hash(machine: &Machine, source: &hub::Source, repository: &str, l
     let (repository, lane, asked) = (repository.to_string(), lane.to_string(), id.clone());
     let named = machine.block(&Stop::default(), async move { hub.named(&repository, Some(&asked), Some(&lane)).await });
     let named = named.map_err(|e| catalog.reason("model_resolution_failed", e))?;
-    match named.manifest.sha256 == sha256 {
-        true => Ok(named.manifest),
-        false => Err(("model_resolution_failed", format!("{id} answered {}", named.manifest.id()))),
+    match named.tree.sha256 == sha256 {
+        true => Ok(named.tree),
+        false => Err(("model_resolution_failed", format!("{id} answered {}", named.tree.id()))),
     }
 }
 
