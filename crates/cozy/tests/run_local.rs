@@ -389,6 +389,9 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
         .unwrap();
         rival_endpoint.repo(&refused_destination).await.unwrap()
     });
+    // The denial case reads an already held local alias: its unrelated publish permission
+    // cannot be refused by a private-source token trade before the Writer commits.
+    tensord::storage::set_local(&local, "seed", &seed, &Default::default()).unwrap();
     let refused = cozy(
         &home,
         &work,
@@ -396,7 +399,7 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
             "--json",
             "run",
             "./cpu_weights/convert",
-            &source_ref,
+            "local/seed",
             &refused_destination,
             "size=128",
             "count=true",
