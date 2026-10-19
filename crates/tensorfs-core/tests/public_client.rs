@@ -3,7 +3,7 @@
 #![cfg(feature = "store")]
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -252,6 +252,15 @@ impl Drop for Http {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn owned_fds(root: &Path) -> usize {
+    fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .flatten()
+        .filter(|entry| fs::read_link(entry.path()).is_ok_and(|target| target.starts_with(root)))
+        .count()
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn actual_public_client_selects_fetches_and_retains_children() {
     let scratch = Scratch::new();
@@ -413,32 +422,172 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
     let mut bytes = [0; 8];
     file.read_exact(&mut bytes).unwrap();
     assert_eq!(&bytes, b"abcdefgh");
-    drop(component);
-    drop(view);
+    #[cfg(target_os = "linux")]
+    assert!(
+        owned_fds(&cache) > 1,
+        "children lost their source retention"
+    );
     drop(file);
     #[cfg(target_os = "linux")]
+    assert!(
+        owned_fds(&cache) > 0,
+        "last children must still own retention"
+    );
+    drop(component);
+    drop(view);
+    #[cfg(target_os = "linux")]
     {
-        let owned_fds = || {
-            fs::read_dir("/proc/self/fd")
-                .unwrap()
-                .flatten()
-                .filter(|entry| {
-                    fs::read_link(entry.path()).is_ok_and(|target| target.starts_with(&cache))
-                })
-                .count()
-        };
         for _ in 0..100 {
-            if owned_fds() == 0 {
+            if owned_fds(&cache) == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(
-            owned_fds(),
+            owned_fds(&cache),
             0,
             "final child/view drop retained cache ownership descriptors"
         );
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects() {
+    let scratch = Scratch::new();
+    let data = fixture(&scratch.0);
+    let mirror = scratch.0.join("mirror");
+    let producer = Client::new(config(
+        &scratch.0.join("producer"),
+        &format!("file://{}", mirror.display()),
+    ))
+    .unwrap();
+    let tree = producer
+        .upload_folder(&"account/model@1".parse().unwrap(), &data.folder, None)
+        .await
+        .unwrap();
+    drop(producer);
+    let http = Http::new(mirror.clone());
+    let thin = scratch.0.join("thin");
+    fs::create_dir_all(thin.join("chunks")).unwrap();
+    fs::copy(
+        data.folder.join("model.cozytensors"),
+        thin.join("model.cozytensors"),
+    )
+    .unwrap();
+    fs::copy(
+        data.folder.join("chunks").join(&data.chunks[0].sha256),
+        thin.join("chunks").join(&data.chunks[0].sha256),
+    )
+    .unwrap();
+    let cache = scratch.0.join("thin-cache");
+    let mut options = config(&cache, &http.url);
+    options.mirror = Some(mirror.clone());
+    options.token = Some(Arc::new(Denied));
+    let client = Client::new(options).unwrap();
+    let checkpoint = client
+        .open(thin.to_str().unwrap(), &Open::default())
+        .await
+        .unwrap();
+    let progress = Mutex::new(Vec::new());
+    let report = |held, total| {
+        progress.lock().unwrap().push((held, total));
+        Ok(())
+    };
+    let landed = checkpoint
+        .fetch(&Fetch {
+            selection: Selection::Tensors {
+                component: "model".into(),
+                keys: vec!["w".into()],
+            },
+            progress: Some(&report),
+            ..Fetch::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        landed.local, 8,
+        "the folder's existing chunk must not be fetched"
+    );
+    assert_eq!(landed.origin + landed.volume, 8);
+    assert_eq!(
+        checkpoint.component("model").unwrap().read("w").unwrap(),
+        b"abcdefghijklmnop"
+    );
+    assert_eq!(progress.lock().unwrap().last(), Some(&(16, 16)));
+    assert_eq!(checkpoint.missing(&Selection::All).unwrap().len(), 2);
+    assert!(
+        !cache.join(data.chunks[0].key()).exists(),
+        "existing folder payload was copied to cache"
+    );
+    assert!(!cache.join(data.chunks[2].key()).exists());
+    assert!(!cache.join(data.asset.key()).exists());
+
+    let offline_cache = scratch.0.join("offline-cache");
+    let mut options = config(&offline_cache, &http.url);
+    options.mirror = Some(mirror.clone());
+    options.token = Some(Arc::new(Denied));
+    let offline = Client::new(options).unwrap();
+    // Cold immutable metadata must also be discoverable on the mounted mirror.
+    let immutable = offline
+        .open(
+            &tree.id(),
+            &Open {
+                local_files_only: true,
+                ..Open::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(immutable.id(), &data.header);
+    assert_eq!(immutable.missing(&Selection::All).unwrap().len(), 4);
+    let named = offline
+        .open(
+            "account/model",
+            &Open {
+                local_files_only: true,
+                ..Open::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(named.named().unwrap().revision.as_deref(), Some("1"));
+    named
+        .fetch(&Fetch {
+            selection: Selection::Assets {
+                component: "tokenizer".into(),
+                names: None,
+            },
+            ..Fetch::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        named
+            .component("tokenizer")
+            .unwrap()
+            .asset("tokenizer.json")
+            .unwrap(),
+        b"{\"vocab\": [\"one\", \"two\"]}"
+    );
+    assert!(!offline_cache.join(data.chunks[0].key()).exists());
+    assert!(!offline_cache.join(data.chunks[2].key()).exists());
+
+    // The mounted mirror is untrusted and must use normal hash admission.
+    fs::write(mirror.join(data.chunks[2].key()), b"XXXXXXXX").unwrap();
+    let error = checkpoint
+        .fetch(&Fetch {
+            selection: Selection::Components(vec!["other".into()]),
+            ..Fetch::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, Kind::Integrity);
+    assert!(!cache.join(data.chunks[2].key()).exists());
+    assert_eq!(
+        http.count(),
+        0,
+        "local-files-only work reached the HTTP origin"
+    );
 }
 
 struct Denied;
@@ -452,6 +601,99 @@ impl TokenProvider for Denied {
             kind: Kind::Denied,
             detail: "exact consumer refusal".into(),
         })
+    }
+}
+
+struct CallbackFailure {
+    headers: bool,
+    active: AtomicBool,
+}
+
+impl CallbackFailure {
+    fn error(&self) -> Failure {
+        Failure {
+            kind: Kind::Conflict,
+            detail: "CREDENTIAL_REQUIRED: literal consumer text".into(),
+        }
+    }
+}
+
+#[async_trait]
+impl TokenProvider for CallbackFailure {
+    async fn headers(
+        &self,
+        _request: &Request<'_>,
+    ) -> tensorfs_core::Result<Vec<(String, String)>> {
+        if self.headers && self.active.load(Ordering::Relaxed) {
+            Err(self.error())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn retry(
+        &self,
+        _sent: &Request<'_>,
+        _status: u16,
+        _headers: &tensorfs_core::HeaderMap,
+    ) -> tensorfs_core::Result<bool> {
+        if !self.headers && self.active.load(Ordering::Relaxed) {
+            Err(self.error())
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_provider_headers_and_retry_failures_survive_metadata_and_payload_paths() {
+    let scratch = Scratch::new();
+    let data = fixture(&scratch.0);
+    let origin = scratch.0.join("origin");
+    let producer = Client::new(config(
+        &scratch.0.join("producer"),
+        &format!("file://{}", origin.display()),
+    ))
+    .unwrap();
+    producer
+        .upload_folder(&"account/model@1".parse().unwrap(), &data.folder, None)
+        .await
+        .unwrap();
+    let http = Http::new(origin);
+    for headers in [true, false] {
+        let provider = Arc::new(CallbackFailure {
+            headers,
+            active: AtomicBool::new(false),
+        });
+        let mut options = config(&scratch.0.join(format!("cache-{headers}")), &http.url);
+        options.token = Some(provider.clone());
+        let endpoint = Endpoint::with_config(&http.url, &options).unwrap();
+        let client = Client::new(options).unwrap();
+        let checkpoint = client
+            .open("account/model@1", &Open::default())
+            .await
+            .unwrap();
+        provider.active.store(true, Ordering::Relaxed);
+        let expected = provider.error();
+        let error = endpoint.repo("account/model").await.unwrap_err();
+        assert_eq!(
+            (error.kind, error.detail.as_str()),
+            (expected.kind, expected.detail.as_str())
+        );
+        let error = checkpoint
+            .fetch(&Fetch {
+                selection: Selection::Tensors {
+                    component: "model".into(),
+                    keys: vec!["w".into()],
+                },
+                ..Fetch::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (error.kind, error.detail.as_str()),
+            (expected.kind, expected.detail.as_str())
+        );
     }
 }
 

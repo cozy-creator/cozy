@@ -194,7 +194,15 @@ impl Client {
                 options.variant.as_deref(),
                 Some(&self.store),
             )?;
-            return Checkpoint::local(raw, None, None, self.store.clone());
+            let source = remote::Remote {
+                store: self.store.clone(),
+                endpoint: Endpoint::with_config("local", &self.config)?,
+                mirror: self.config.mirror.clone(),
+                // A plain folder may fill missing objects from the configured
+                // mounted mirror, but never falls through to a remote endpoint.
+                offline: true,
+            };
+            return Checkpoint::local(raw, source);
         }
         let mut reference: Ref = name_or_path.parse()?;
         if let Some(revision) = &options.revision {
@@ -269,7 +277,8 @@ impl Client {
                 &self.store,
                 reference.revision.as_deref(),
             )
-            .await?;
+            .await
+            .map_err(provider::from_native)?;
         }
         if let Some(report) = progress {
             report(total, total)?;
