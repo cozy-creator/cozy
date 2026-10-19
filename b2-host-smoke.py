@@ -24,7 +24,7 @@ store = tensorfs.Store(str(root))
 w = store.writer()
 for k, t in ref.state_dict().items():
     t = t.detach().contiguous()
-    w.put("net", k, "F32", list(t.shape), t.numpy().tobytes())
+    w.put("net", k, "F32", list(t.shape), bytes(t.view(torch.uint8).flatten().tolist()))
 ck = store.checkpoint(w.commit())
 with torch.device("meta"):
     net = Net(64, 4)
