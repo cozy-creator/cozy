@@ -279,7 +279,8 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     let engine = layout.engine();
     identity.store = Some(layout.store.clone());
     let generations = engine.join("generations");
-    if rental {
+    // A rental's own store only: never the datacenter volume or an operator-named root.
+    if rental && layout.own_store() {
         crate::storage::drop_pre_cut(&layout.store)?;
     }
     let (_owned, store) = own(&engine, &layout.store)?;
