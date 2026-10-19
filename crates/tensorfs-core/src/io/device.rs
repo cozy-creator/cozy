@@ -273,7 +273,7 @@ impl Engine {
                     ready.push(event);
                 }
             }
-            let mut direct = matches!((c.src, c.dst), (Src::Device { .. }, Dst::Device { .. }));
+            let mut direct = matches!((c.src, c.dst), (Src::Device { .. } | Src::Zero, Dst::Device { .. }));
             if let (Src::Host(ptr), Dst::Device { .. }) = (c.src, c.dst) {
                 let reused = self.reused(ptr as usize, c.dst.len());
                 if unsafe { cuda::registered(ptr) }.map_err(|e| failed(copy, e))? {
@@ -373,6 +373,7 @@ impl Engine {
                 unreachable!()
             };
             let result = match job.c.src {
+                Src::Zero => unsafe { (d.memset_d8_async)(dst, 0, job.len, stream) },
                 Src::Host(ptr) => unsafe {
                     (d.memcpy_htod_async)(dst, ptr.cast(), job.len, stream)
                 },
@@ -420,6 +421,7 @@ impl Engine {
                     std::ptr::copy_nonoverlapping(ptr.add(job.at), slot.ptr, job.len)
                 },
                 Src::Device { .. } => {}
+                Src::Zero => unreachable!("zero uses native device memset"),
             }
             let _queue = self.queues[lane].lock().unwrap();
             let rc = match (job.c.src, job.c.dst) {
@@ -480,6 +482,7 @@ pub(super) unsafe fn fill(copies: &[(usize, Copy)], opts: &ReadOpts) -> Result<R
             _ => unreachable!(),
         };
         let kind = match (copy.src, copy.dst) {
+            (Src::Zero, _) => "zero",
             (Src::Device { .. }, Dst::Host { .. }) => "d2h",
             (Src::Device { device: source, .. }, Dst::Device { device: target, .. }) if source != target => "peer",
             (Src::Device { .. }, Dst::Device { .. }) => "d2d",
