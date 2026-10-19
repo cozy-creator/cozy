@@ -5216,7 +5216,8 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         assert!(pool.accounting.lock().unwrap().get(&(model.construction.clone(), 0))
             .is_some_and(|owner| owner.reservation == next_start && owner.birth.is_none()));
         pool.clear_unborn(&model.construction, 0, 1, next_start);
-        assert!(pool.devices[0].memory.with(|gpu| gpu.tenant(&model.construction).is_none()));
+        assert_eq!(pool.devices[0].memory.with(|gpu| gpu.tenant(&model.construction).unwrap().pid), old.birth.pid,
+            "the delayed first birth remains live after the newer spawn failed");
         let _exact = [&old.birth, &live.birth].map(|birth| platform::process::Exact::open(birth).unwrap().unwrap());
         for birth in [&old.birth, &live.birth] {
             pool.starting(&model.construction, 0, 1);
