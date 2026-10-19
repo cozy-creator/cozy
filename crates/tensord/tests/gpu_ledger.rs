@@ -428,3 +428,49 @@ fn each_rank_of_a_group_holds_its_own_gpus_row() {
     assert!(!ledgers[1].running(), "the follower's GPU has its row back");
     assert!(ledgers[0].running() && ledgers[0].resident(rank0.pid), "rank 0's GPU is untouched");
 }
+
+/// Kept GPU pages (B8): while their executor lives they are its own; once it is gone they are
+/// TensorD's, counted in its row as kept, handed whole to the next executor of the layout, and
+/// closed when another row asks for room. Memfds in containers stand in for the VMM fds.
+#[test]
+fn kept_pages_outlive_their_executor_and_go_on_an_ask() {
+    use std::{fs::File, io::Read, os::fd::{AsFd, OwnedFd}, os::unix::net::UnixStream};
+    use tensord::device_executor::Page;
+    let ledger = GpuLedger::start("GPU-kept", false, 0, Some(8 * GIB), None, Liveness::default(), MemoryLog::default()).unwrap().unwrap();
+    let page = |region: u32, text: &str| -> (Page, File) {
+        let mut fd = File::from(cozy_platform::shm::memfd_named("page").unwrap());
+        fd.write_all(text.as_bytes()).unwrap();
+        let (tx, rx) = UnixStream::pair().unwrap();
+        cozy_platform::handles::send_fd(&tx, &fd).unwrap();
+        (Page { region, nbytes: GIB }, File::from(OwnedFd::from(rx)))
+    };
+    let kept = |l: &GpuLedger| {
+        l.now();
+        let rows = l.status().unwrap().rows;
+        rows.iter().find(|r| r.pid == std::process::id()).unwrap().facts.kept
+    };
+    let mut executor = Command::new("sleep").arg("1000").spawn().unwrap();
+    ledger.keep("layout-a", "fp-a", executor.id(), vec![page(0, "zero"), page(1, "one")]);
+    ledger.keep("layout-b", "fp-b", executor.id(), vec![page(0, "b")]);
+    assert!(ledger.take_kept("layout-a").is_none() && kept(&ledger) == 0, "a live executor's pages are its own");
+    executor.kill().unwrap();
+    executor.wait().unwrap();
+    assert_eq!(kept(&ledger), 3 * GIB, "a gone executor's pages are TensorD's");
+    let (fingerprint, pages) = ledger.take_kept("layout-a").expect("handed to the next executor");
+    let read = |mut f: &File| {
+        let mut text = String::new();
+        std::io::Seek::rewind(&mut f).unwrap();
+        f.read_to_string(&mut text).unwrap();
+        text
+    };
+    assert_eq!((fingerprint.as_str(), pages.iter().map(|(p, f)| (p.region, read(f))).collect::<Vec<_>>()), ("fp-a", vec![(0, "zero".into()), (1, "one".into())]));
+    assert_eq!(kept(&ledger), GIB);
+    let [table, events] = ledger.grant().unwrap();
+    let asker = Ledger::adopt(table.as_fd(), Some(events.as_fd())).unwrap();
+    let victims = asker.ask(None, GIB).unwrap();
+    assert_eq!(victims.iter().map(|v| (v.pid, v.bytes)).collect::<Vec<_>>(), [(std::process::id(), GIB)]);
+    for victim in &victims {
+        asker.wait(victim).unwrap();
+    }
+    assert!(kept(&ledger) == 0 && ledger.take_kept("layout-b").is_none(), "an ask closed them");
+}

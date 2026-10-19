@@ -20,6 +20,7 @@ weight binds once.
 from __future__ import annotations
 
 import gc
+import hashlib
 import math
 import threading
 import time
@@ -71,7 +72,8 @@ class Level(Enum):
 @dataclass(frozen=True, slots=True)
 class WeightGrant:
     """TensorD's grant for one component: its header, the binding's manifest, the sealed host
-    layout or the chunk files `(sha256, length, fd)`, and the stored tensors the module builds."""
+    layout or the chunk files `(sha256, length, fd)`, and the stored tensors the module builds.
+    With a held layout, GPU pages a gone executor kept of it, `(region, fd)`, and what they hold."""
 
     ck: tensorfs.Checkpoint
     component: str
@@ -79,6 +81,8 @@ class WeightGrant:
     host_fd: int | None = None
     keys: Collection[str] | None = None
     files: Sequence[tuple[str, int, int]] = ()
+    pages: Sequence[tuple[int, int]] = ()
+    fingerprint: str = ""
 
     @property
     def key(self) -> str:
@@ -400,6 +404,15 @@ class Model:
     def close(self) -> None:
         self.memory._close(self)
 
+    def kept(self) -> tuple[str, list[tuple[int, int, int]]]:
+        """Its landed home pages not handed out yet, kept past this process for TensorD, and what
+        they hold: `(region, span, fd)`, each fd the caller's. None when a fill (a LoRA bake)
+        writes them."""
+        if self.fill is not None or self.host or not self.memory.granted:
+            return "", []
+        pages = self.ws.kept()
+        return (_fingerprint(self.key, self.ws) if pages else ""), pages
+
 
 class Hold:
     def __init__(self, model: Model, cache: Cache) -> None:
@@ -585,6 +598,7 @@ class Memory:
         with self.lock:
             files = list(grant.files) or None
             ws = self.core.adopt(self._name(grant.key), grant.ck, grant.host_fd, files)
+            self._share(ws, grant)
             self.adopted[grant.key] = ws
             room = self._free() if self.cuda else 0
             for region, span in enumerate(ws.spans):
@@ -604,6 +618,13 @@ class Memory:
         for ws in adopted.values():
             ws.close()
         self._publish()
+
+    def _share(self, ws: WeightSet, grant: WeightGrant) -> None:
+        """Under TensorD, a set's home pages can be kept past this process; pages a gone
+        executor kept for it map now, no copy, when they hold what this set holds."""
+        if self.cuda and self.granted and ws.shareable() and grant.pages:
+            if grant.fingerprint == _fingerprint(grant.key, ws):
+                ws.adopt_pages(list(grant.pages))
 
     def _name(self, key: str) -> str:
         taken = {*self.models, *(ws.name for ws in self.adopted.values())}
@@ -629,6 +650,7 @@ class Memory:
         ws = self.adopted.pop(grant.key, None)
         if ws is None and host_fd is not None:
             ws = self.core.adopt(self._name(grant.key), grant.ck, host_fd, files)
+            self._share(ws, grant)
         if ws is not None and ws.regions != regions:
             ws.close()  # granted for other regions: a miss, and its layout is sealed anew
             ws, host_fd = None, None
@@ -638,6 +660,7 @@ class Memory:
             if host_fd is None and self.cuda and self.granted:
                 host_fd = sealed = seal(grant.ck, regions, name, files=files)
             ws = self.core.register(name, grant.ck, regions, host_fd, files)
+            self._share(ws, grant)
         model = Model(self, ws.name, grant.key, module, ws, declared)
         if sealed is not None:
             self.deposits.append((model, sealed))
@@ -1512,6 +1535,16 @@ def _runs(model: Model, plan: _Plan, step: int) -> bool:
 def _declared(module: nn.Module) -> Declared:
     found = vars(module).get("_varena")
     return found if isinstance(found, Declared) else Declared()
+
+
+def _fingerprint(key: str, ws: WeightSet) -> str:
+    """What `ws`'s kept pages hold: its checkpoint and component, and each part's place and
+    encoding."""
+    parts = sorted(
+        (p.region, p.offset, p.nbytes, p.component, p.key, p.role, p.dtype, tuple(p.shape))
+        for p in ws.parts
+    )
+    return hashlib.sha256(repr((key, ws.spans, parts)).encode()).hexdigest()
 
 
 def blocks_of(module: nn.Module) -> list[str]:

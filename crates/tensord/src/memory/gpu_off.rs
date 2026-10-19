@@ -1,6 +1,7 @@
 //! Where the OS has no memfd ledger (macOS, Windows): no GPU ledger exists.
 use super::{MemoryLog, Sample};
 use crate::process::Liveness;
+use crate::device_executor::Page;
 use std::{fs::File, io};
 
 pub type Ender = Box<dyn Fn(u32) + Send + Sync>;
@@ -48,6 +49,15 @@ impl GpuLedger {
         match *self {}
     }
     pub fn undispatch(&self, _: &str) {
+        match *self {}
+    }
+    pub fn keep(&self, _: &str, _: &str, _: u32, _: Vec<(Page, File)>) {
+        match *self {}
+    }
+    pub fn take_kept(&self, _: &str) -> Option<(String, Vec<(Page, File)>)> {
+        match *self {}
+    }
+    pub fn forget_kept(&self) {
         match *self {}
     }
 }

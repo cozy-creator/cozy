@@ -215,6 +215,17 @@ class WeightSet:
     def busy(self, busy: bool) -> None:
         """Whether a forward of its model is in flight (from its first forward's start to its
         last one's end): another process's ask never takes a busy set's pages."""
+    def shareable(self) -> bool:
+        """Home regions map as one shareable allocation each from now on, so their pages can be
+        kept past this process (`kept`); False where the device cannot share them."""
+    def kept(self) -> list[tuple[int, int, int]]:
+        """Landed home regions not handed out yet: `(region, span, fd)`, each fd a container of
+        the region's pages for TensorD to hold, the caller's to close. Unmapping a region here
+        frees it at once; only this process's death leaves its pages to TensorD."""
+    def adopt_pages(self, pages: Sequence[tuple[int, int]]) -> int:
+        """Home regions `(region, fd)` mapped from pages a dead process kept: imported, no copy.
+        Each fd is duplicated; the caller closes its own. A page that will not map fills as
+        usual. Returns the bytes adopted."""
     def evict(self, regions: Sequence[int] | None = None) -> int:
         """Unmap these regions at home (all when None): only those unpinned whose fill and
         release events completed. Returns the bytes unmapped. The chunks go idle; past a small

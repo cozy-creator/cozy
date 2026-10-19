@@ -332,6 +332,28 @@ impl PyWeightSet {
         Ok(())
     }
 
+    /// Home regions map as one shareable allocation each from now on; false where they cannot.
+    fn shareable(&self, py: Python<'_>) -> PyResult<bool> {
+        Ok(self.gpu(py)?.is_some_and(|w| w.shareable()))
+    }
+
+    /// Landed home regions not handed out yet, kept past this process: `(region, span, fd)`,
+    /// each fd the caller's to deposit with TensorD and close.
+    fn kept(&self, py: Python<'_>) -> PyResult<Vec<(u32, u64, i32)>> {
+        let Some(w) = self.gpu(py)? else { return Ok(vec![]) };
+        Ok(py.detach(|| w.kept()).or_raise(py)?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect())
+    }
+
+    /// Home regions mapped from kept pages `(region, fd)`; each fd duplicated, the caller's
+    /// kept. Returns the bytes adopted.
+    fn adopt_pages(&self, py: Python<'_>, pages: Vec<(u32, i32)>) -> PyResult<u64> {
+        let Some(w) = self.gpu(py)? else { return Ok(0) };
+        // SAFETY: descriptors the caller holds for the duration of this call.
+        let dup = |(r, fd): (u32, i32)| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().map(|fd| (r, fd));
+        let pages = pages.into_iter().map(dup).collect::<std::io::Result<Vec<_>>>().map_err(|e| Error::Io(format!("dup kept pages: {e}"))).or_raise(py)?;
+        py.detach(|| w.adopt_pages(pages)).or_raise(py)
+    }
+
     #[pyo3(signature = (regions = None))]
     fn evict(&self, py: Python<'_>, regions: Option<Vec<u32>>) -> PyResult<u64> {
         self.gpu(py)?.map_or(Ok(0), |w| py.detach(|| w.evict(regions.as_deref())).or_raise(py))

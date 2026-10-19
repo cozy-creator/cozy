@@ -2637,6 +2637,8 @@ impl Pool {
             weights: None,
             fetch: fetch.as_ref(),
             raw: &plan.sources,
+            // Kept GPU pages are one GPU's: a one-GPU executor's.
+            kept: gpus.first().and_then(|d| d.memory.as_ref()).filter(|_| ranks == 1).map(|m| (m, session.executor.birth.pid)),
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
@@ -2885,6 +2887,8 @@ impl Pool {
         // Rank 0 answered, so a follower that ended during the call is the group's first fault.
         let lost = self.lost_followers(start, degree, &session.followers);
         if !reply.ok || !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
+            // It may have faulted on its GPU: what it or any process kept there is not trusted.
+            gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(GpuLedger::forget_kept);
             // The author's failure keeps its traceback and origin in triage; the executor's
             // end would record only "executor_ended".
             if let Some(outcome) = reply.outcome.as_ref().filter(|o| !o.traceback.is_empty()) {
@@ -3505,6 +3509,8 @@ struct Callbacks<'a> {
     fetch: Option<&'a Arc<crate::access::Fetch>>,
     /// Its `Weights[M]` sources, whose headers and assets `model_source` answers too.
     raw: &'a [crate::gpu_service::PlanSource],
+    /// Its GPU's ledger, which holds the GPU pages it keeps, and its pid.
+    kept: Option<(&'a GpuLedger, u32)>,
 }
 impl Callbacks<'_> {
     /// The weight set's chunk files, once its objects landed, and their digest in `answer`.
@@ -3525,9 +3531,29 @@ impl Services for Callbacks<'_> {
             Some(layout) => (true, Ok((vec![layout], String::new()))),
             None => (false, self.chunks(&frame.manifest)),
         };
+        let nfiles = files.as_ref().map_or(0, |(f, _)| f.len());
+        let (mut answer, mut fds) = granted(frame.seq, held, files);
+        // GPU pages a gone executor kept of this layout follow its host layout.
+        if let Some((fingerprint, pages)) = self.kept.filter(|_| held).and_then(|(m, _)| m.take_kept(&frame.layout)) {
+            for (page, fd) in pages {
+                answer.pages.push(page);
+                fds.push(fd);
+            }
+            (answer.fingerprint, answer.descriptors) = (fingerprint, fds.len() as u64);
+        }
         self.pool.notes.note(serde_json::json!({"event": "read_grant", "manifest": frame.manifest,
-            "layout": frame.layout, "held": held, "files": files.as_ref().map_or(0, |(f, _)| f.len())}));
-        Ok(granted(frame.seq, held, files))
+            "layout": frame.layout, "held": held, "files": nfiles, "pages": answer.pages.len()}));
+        Ok((answer, fds))
+    }
+    /// GPU pages the executor kept: held past its end, for the next executor of the layout.
+    fn keep_pages(&mut self, frame: &Frame, pages: Vec<File>) -> Answer {
+        let Some((ledger, pid)) = self.kept.filter(|_| pages.len() == frame.pages.len()) else {
+            return Answer::refused(frame.seq, "keep_pages_refused", "kept pages are a one-GPU executor's, one fd per page");
+        };
+        let bytes: u64 = frame.pages.iter().map(|p| p.nbytes).sum();
+        ledger.keep(&frame.layout, &frame.fingerprint, pid, frame.pages.iter().copied().zip(pages).collect());
+        self.pool.notes.note(serde_json::json!({"event": "keep_pages", "layout": frame.layout, "pages": frame.pages.len(), "bytes": bytes}));
+        Answer::ok(frame.seq)
     }
     fn progress(&mut self, frame: &Frame) {
         crate::calls::observe(self.engine, self.id, &mut self.completed, frame, self.caller);
