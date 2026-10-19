@@ -417,12 +417,14 @@ def main() -> int:
         compare(runtime, declared, "", faults)
     faults.extend(check_error_families(_ext))
     # A compiled submodule (`_ext.varena`) is typed by the stub of the facade module that
-    # re-exports it (`varena.pyi`), and is held to it the same way.
+    # re-exports it (a module.pyi or package/__init__.pyi), held to the same full checks.
     for name in sorted(n for n in runtime if isinstance(getattr(_ext, n), types.ModuleType)):
-        sub_path = stub_path.with_name(f"{name}.pyi")
-        if not sub_path.exists():
-            faults.append(f"{name}: the extension exports this submodule and {sub_path.name} is absent")
+        candidates = [stub_path.with_name(f"{name}.pyi"), stub_path.parent / name / "__init__.pyi"]
+        available = [path for path in candidates if path.is_file()]
+        if len(available) != 1:
+            faults.append(f"{name}: expected one module or package stub, found {len(available)}: {available}")
             continue
+        sub_path = available[0]
         sub_declared, sub_hatches = read_stub(sub_path)
         sub_faults = [f"{hatch}: an escape hatch in the stub" for hatch in sub_hatches]
         if not sub_hatches:
