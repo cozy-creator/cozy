@@ -490,6 +490,9 @@ impl Service {
             let root = invocation.parent.is_empty();
             if !(full || held && root || invocation.degree > 0 && gpu_fenced) && self.offer(&pool, &record, &mut claims, calls.clone())? {
                 room -= usize::from(invocation.degree == 0);
+                if root {
+                    self.queue.lock().unwrap().started(&record);
+                }
             } else if root {
                 place += 1;
                 let after = if held { ", after the machine's update" } else { "" };
