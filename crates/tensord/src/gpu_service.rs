@@ -2459,6 +2459,7 @@ impl Pool {
         )?;
         // A group's NCCL seal (NVLS off, peer memory only over NVLink).
         seal.group = degree > 1;
+        seal.tensorfs_home = Some(self.store.root().to_path_buf());
         seal.threads = self.config.threads;
         Ok(ExecutorConfig {
             python: held.record.python.clone(),
