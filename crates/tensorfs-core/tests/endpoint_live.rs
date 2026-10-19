@@ -4,7 +4,6 @@
 //! P-256 key offline with their device key, and the provider trades it at AuthKit's token
 //! endpoint once (JWT-bearer, DPoP-proved) and proves every Hub request with it.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,7 +78,7 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     let store = Store::open(scratch.join("source")).unwrap();
     let mut writer = store.writer(None, None).unwrap();
     let weights: Vec<u8> = (0..300_000u32).map(|i| i.wrapping_mul(2_654_435_761) as u8).collect();
-    writer.component("model", "conformance.Fixture", BTreeMap::new(), None).unwrap()
+    writer.component("model", "conformance.Fixture", Default::default(), None).unwrap()
         .put("w", &Dtype::U8, &[weights.len() as u64], Data::Plain(Source::Read(&mut &weights[..]))).unwrap();
     let header = writer.commit().unwrap();
     let mut tree = Tree::default();
