@@ -873,6 +873,7 @@ impl Pool {
             return false;
         };
         let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
+        self.notes.note(serde_json::json!({"event": "end_idle", "plan": plan, "gpus": start..start + degree as usize}));
         if let Err(error) = session.executor.shutdown() {
             tracing::warn!("memory: ending idle executor {key}: {error}");
         }
@@ -1289,6 +1290,8 @@ impl Pool {
                     break;
                 }
                 if ledger.running() || !self.end_idle_on(gpu, plan, spare) {
+                    self.notes.note(serde_json::json!({"event": "short", "plan": plan, "gpu": device.entry,
+                        "shape": shape, "running": ledger.running()}));
                     fit = false;
                     break;
                 }
@@ -3502,6 +3505,8 @@ impl Services for Callbacks<'_> {
             }
             None => self.chunks(&frame.manifest, &mut answer),
         };
+        self.pool.notes.note(serde_json::json!({"event": "read_grant", "manifest": frame.manifest,
+            "layout": frame.layout, "held": answer.held, "files": files.as_ref().map_or(0, Vec::len)}));
         Ok(match files {
             Ok(files) => {
                 (answer.ok, answer.descriptors) = (true, files.len() as u64);
@@ -3530,7 +3535,10 @@ impl Services for Callbacks<'_> {
         if frame.kind == Kind::Deposit {
             // A layout varena sealed in the executor, kept for the next executor of its weights.
             let layout = descriptor.ok_or_else(|| io::Error::other("a deposit omitted its layout"))?;
-            return Ok(match self.deposits.deposit(&frame.manifest, &frame.layout, layout) {
+            let kept = self.deposits.deposit(&frame.manifest, &frame.layout, layout);
+            self.pool.notes.note(serde_json::json!({"event": "deposit", "manifest": frame.manifest,
+                "layout": frame.layout, "kept": kept.as_ref().map_or_else(ToString::to_string, |()| "yes".into())}));
+            return Ok(match kept {
                 Ok(()) => (Answer::ok(frame.seq), None),
                 Err(error) => (Answer::refused(frame.seq, "deposit_refused", error.to_string()), None),
             });
