@@ -4,9 +4,8 @@ Temporary review copy of the planned TensorFS 0.13 declarations. Implementation 
 separate; this is not a claim that every declaration is available on current master.
 For normal development, use the [Python usage guide](API.md).
 
-`Info` currently names the whole-tensor metadata. `Part` describes one stored array, such
-as quantized weights or scales. Their names are under review; the declarations below
-retain the current names rather than introducing undocumented aliases.
+`TensorMetadata` describes the logical tensor. Physical storage descriptors are internal;
+encoded reads expose named `Array` values without chunk locations or byte offsets.
 
 The provider/DLPack protocols describe accepted inputs and are not additional package exports.
 
@@ -104,29 +103,6 @@ class ConflictError(Error):
 class UnsupportedError(Error):
     """A source or target this build cannot represent (`unsupported`)."""
 
-class Part:
-    """Metadata for one stored array: plain data (role `""`), encoded weights, scales, etc."""
-
-    @property
-    def dtype(self) -> str:
-        ...
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        ...
-
-    @property
-    def chunk(self) -> int:
-        ...
-
-    @property
-    def offset(self) -> int:
-        ...
-
-    @property
-    def length(self) -> int:
-        ...
-
 class Encoding:
     """A scheme and its complete params; str() is `scheme {key: value, ...}`."""
 
@@ -144,8 +120,8 @@ class Encoding:
     def __repr__(self) -> str:
         ...
 
-class Info:
-    """A tensor's logical dtype and shape, its encoding (None when plain), its parts."""
+class TensorMetadata:
+    """A tensor's logical dtype and shape, and its encoding (None when plain)."""
 
     @property
     def dtype(self) -> str:
@@ -157,10 +133,6 @@ class Info:
 
     @property
     def encoding(self) -> Encoding | None:
-        ...
-
-    @property
-    def parts(self) -> dict[str, Part]:
         ...
 
     def __repr__(self) -> str:
@@ -208,7 +180,7 @@ class Encoded:
     def parts(self) -> dict[str, Array]:
         ...
 
-class Tensors(Mapping[str, Info]):
+class Tensors(Mapping[str, TensorMetadata]):
     """Tensor metadata in construction order, with engine-backed host and CUDA reads."""
 
     def __len__(self) -> int:
@@ -217,7 +189,7 @@ class Tensors(Mapping[str, Info]):
     def __iter__(self) -> Iterator[str]:
         ...
 
-    def __getitem__(self, key: str) -> Info:
+    def __getitem__(self, key: str) -> TensorMetadata:
         ...
 
     def __contains__(self, key: object) -> bool:
@@ -226,22 +198,22 @@ class Tensors(Mapping[str, Info]):
     def keys(self) -> KeysView[str]:
         ...
 
-    def values(self) -> ValuesView[Info]:
+    def values(self) -> ValuesView[TensorMetadata]:
         ...
 
-    def items(self) -> ItemsView[str, Info]:
-        ...
-
-    @overload
-    def get(self, key: str, default: None=None) -> Info | None:
+    def items(self) -> ItemsView[str, TensorMetadata]:
         ...
 
     @overload
-    def get(self, key: str, default: Info) -> Info:
+    def get(self, key: str, default: None=None) -> TensorMetadata | None:
         ...
 
     @overload
-    def get(self, key: str, default: _T) -> Info | _T:
+    def get(self, key: str, default: TensorMetadata) -> TensorMetadata:
+        ...
+
+    @overload
+    def get(self, key: str, default: _T) -> TensorMetadata | _T:
         ...
 
     def read(self, key: str, *, decode: bool=True) -> Array | Encoded:
@@ -288,7 +260,7 @@ class Component:
 
     @property
     def tensors(self) -> Tensors:
-        """`key -> Info`, in construction order."""
+        """`key -> TensorMetadata`, in construction order."""
 
     @property
     def assets(self) -> dict[str, tuple[str, int]]:
@@ -377,7 +349,7 @@ class Checkpoint:
 
     @property
     def chunks(self) -> list[tuple[str, int]]:
-        """The header's chunk objects in order: `(sha256, length)` (`Part.chunk` indexes them)."""
+        """The header's chunk objects in order: `(sha256, length)`."""
 
     @property
     def chunk_paths(self) -> list[str]:

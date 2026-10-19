@@ -82,10 +82,9 @@ print(info.dtype, info.shape, info.encoding)
 `keys()`, `values()`, `items()` and `get(key, default)` work normally. A missing indexed
 key raises `KeyError`; `get` returns its default.
 
-The returned `Info` describes the whole tensor: its logical `dtype`, `shape`, optional
-`encoding`, and stored `parts`. It contains metadata, not the tensor values. For ordinary
-use, inspect its shape/dtype and then call `read` or `read_all`. The storage details below
-are useful when consuming an encoding directly.
+The returned `TensorMetadata` describes the whole tensor: its logical `dtype`, `shape`
+and optional `encoding`. It contains metadata, not tensor values. Inspect its shape/dtype,
+then call `read` or `read_all`. Physical chunk locations and byte offsets are internal.
 
 ### Read a tensor, or a component's weights
 
@@ -125,10 +124,8 @@ with shape `(4096, 4096)` can be stored as an int8 array named `weight` with tha
 and a separate scale array named `scale` with shape `(4096,)`. Each row is reconstructed
 as `weight[row, column] * scale[row]`.
 
-`Part` is the current name for the metadata of **one of those stored arrays**: its
-`dtype`, `shape`, `chunk`, byte `offset` and byte `length`. It does not mean a slice of
-the logical tensor or a storage chunk. `Info` describes the whole logical tensor;
-its `parts` mapping describes the arrays used to represent it.
+These are ordinary arrays with their own dtype and shape. Consumers receive their values;
+TensorFS handles the underlying chunk locations and byte offsets.
 
 For an encoded tensor, `decode=False` returns `Encoded`: the loaded `scheme`, `params`,
 and a role-to-`Array` mapping named `parts`. For a plain tensor it still returns `Array`.
@@ -349,8 +346,8 @@ A conflict can cause the callback to run again, so it must tolerate retries.
 | `hub_download` | Local file path |
 | `upload_folder` | Published tree id |
 
-The returned data types are `Checkpoint`, `Pipeline`, `Component`, `Tensors`, `Info`,
-`Part`, `Encoding`, `Array` and `Encoded`. Writing uses `Writer` and `ComponentWriter`;
+The returned data types are `Checkpoint`, `Pipeline`, `Component`, `Tensors`,
+`TensorMetadata`, `Encoding`, `Array` and `Encoded`. Writing uses `Writer` and `ComponentWriter`;
 advanced authorization/reference operations use `DPoP` and `Endpoint`. They are covered
 above. The companion `tensorfs.varena` placement API is separate and is unnecessary for
 ordinary TensorFS or Diffusers/ComfyUI use.

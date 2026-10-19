@@ -190,17 +190,11 @@ impl Writer {
     pub fn committed(&self) -> Option<Checkpoint>; // local commit survives remote failure
     pub fn abandon(self) -> Result<()>;
 }
-pub struct PartData<'a> {
-    pub role: String,
-    pub dtype: Dtype,
-    pub shape: Vec<u64>,
-    pub data: &'a mut dyn Read,
-}
 pub struct ComponentWriter<'a> { /* borrows the writer */ }
 impl ComponentWriter<'_> {
     pub fn put(&mut self, key: &str, dtype: Dtype, shape: &[u64], data: &mut dyn Read) -> Result<()>;
     pub fn put_encoded(&mut self, key: &str, dtype: Dtype, shape: &[u64],
-        encoding: Encoding, parts: Vec<PartData<'_>>) -> Result<()>;
+        encoding: Encoding, parts: Vec<raw::PartData<'_>>) -> Result<()>;
     pub fn copy(&mut self, key: &str, source: &Component, as_key: Option<&str>) -> Result<()>;
     pub fn asset(&mut self, name: &str, data: &[u8]) -> Result<()>;
     pub fn order(&mut self, keys: &[String]) -> Result<()>;
@@ -209,4 +203,20 @@ impl ComponentWriter<'_> {
 pub enum Format { Safetensors }
 pub fn export(checkpoint: &Checkpoint, dir: &Path, format: Format,
     dequantize: Option<Dtype>) -> Result<Vec<String>>;
+```
+
+## Low-level streaming input
+
+This is for raw encoded-stream producers. Ordinary readers and model consumers do not
+need storage descriptors or this module.
+
+```rust
+pub mod raw {
+    pub struct PartData<'a> {
+        pub role: String,
+        pub dtype: Dtype,
+        pub shape: Vec<u64>,
+        pub data: &'a mut dyn Read,
+    }
+}
 ```

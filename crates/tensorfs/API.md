@@ -104,13 +104,13 @@ dequantize)` and returns `Result<Vec<String>>`; ensure required bytes are availa
 A `Writer` also has `pipeline(class, config)`, `component(name, class, config, config_file)`,
 `set_metadata(key, Value)`, `has(component, key)`, `committed()` and `abandon(self)`. Its
 `ComponentWriter` supports `put(key, Dtype, shape, &mut Read)`,
-`put_encoded(key, Dtype, shape, Encoding, Vec<PartData>)`, `copy(key, &Component, as_key)`,
+`copy(key, &Component, as_key)`,
 `asset(name, bytes)`, `order(keys)` and `has(key)`. These operations return `Result`, except
 `committed`, which returns `Option<Checkpoint>`.
 
-Each `PartData` has a `role: String`, `dtype: Dtype`, `shape: Vec<u64>` and borrowed
-`data: &mut dyn Read`. Plain and encoded input streams are consumed by the write;
-`base`/`copy` reuse existing checkpoint content.
+Plain input streams are consumed by the write; `base`/`copy` reuse existing checkpoint
+content. Raw encoded-stream producers can use the low-level writer interface described
+below; normal model consumers do not need it.
 
 ## Rust: options and returned objects
 
@@ -124,7 +124,6 @@ Each `PartData` has a `role: String`, `dtype: Dtype`, `shape: Vec<u64>` and borr
 | `Fetched` | Byte counts `local`, `volume`, `origin`. |
 | `Convert` | Optional `converter`, `variant`, borrowed conversion-progress callback. |
 | `WriterOptions` | Optional `dest`, `variant`, `base`, `resume`, `repo_id`, `endpoint`, `token`, `ca_der`; implements `Default`. |
-| `PartData` | Role, dtype, shape and a borrowed input stream. |
 | `Format` | `Safetensors` export. |
 
 `Progress` is a borrowed `Fn(u64, u64) -> Result<()> + Sync` (held bytes, total bytes).
@@ -180,6 +179,15 @@ logical dtype/shape and plain location or encoding/parts. `Encoding` holds schem
 parameters. Format metadata structures are described in the [format spec](spec/cozytensors.md).
 The lower-level I/O/codec interfaces used by in-tree integrations are separate from this
 application-facing session API.
+
+### Low-level encoded-stream producers
+
+For converters or custom encoders that stream already encoded bytes,
+`ComponentWriter::put_encoded(key, dtype, shape, encoding, parts)` accepts
+`Vec<raw::PartData>`. Each entry identifies a named array with `role`, `dtype`, `shape`
+and a borrowed `data: &mut dyn Read` stream. This low-level input does not require the
+caller to choose disk chunks or byte offsets; TensorFS assigns those. Physical format
+structures stay in the format/inspection interface, outside ordinary model-loading code.
 
 ## Errors and value types
 
