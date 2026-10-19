@@ -191,11 +191,12 @@ async fn queued_runs_start_a_model_at_a_time_show_their_place_and_cancel() {
         assert!(reasons.iter().any(|r| r.starts_with("position ") && r.ends_with(" in the queue")), "{id}: {reasons:?}");
         runs.push((started.unwrap(), entrypoint));
     }
-    // From c's model, one switch to the other and one back, never one per run as in arrival order.
+    // Each model's queued runs run together: one switch between them, never one per run as in
+    // arrival order.
     runs.sort();
-    let order: Vec<_> = std::iter::once("nap").chain(runs.iter().map(|(_, model)| *model)).collect();
+    let order: Vec<_> = runs.iter().map(|(_, model)| *model).collect();
     let switches = order.windows(2).filter(|pair| pair[0] != pair[1]).count();
-    assert_eq!(switches, 2, "{order:?}");
+    assert_eq!(switches, 1, "{order:?}");
 }
 
 #[tokio::test]
