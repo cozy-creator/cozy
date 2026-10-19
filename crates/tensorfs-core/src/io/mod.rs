@@ -6,6 +6,8 @@
 mod host;
 mod plan;
 mod probe;
+#[cfg(feature = "store")]
+pub mod view;
 
 pub use plan::Target;
 pub use probe::{ceiling, disk, Ceiling};

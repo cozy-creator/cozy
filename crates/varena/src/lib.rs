@@ -9,8 +9,6 @@
 //! crate is empty until its tier exists (xs-043 unit WM).
 #![cfg(unix)]
 
-#[cfg(feature = "store")]
-pub mod checkpoint;
 pub mod ceiling;
 pub mod cuda;
 pub mod faults;
@@ -43,7 +41,7 @@ pub enum Error {
     #[error("io: {0}")]
     Io(String),
     #[error("source: {0}")]
-    Source(#[from] tensorfs_core::err::Refusal),
+    Source(#[from] tensorfs_core::failure::Failure),
     /// What closed: a weight set, a source.
     #[error("closed: {0}")]
     Closed(String),
@@ -80,3 +78,7 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<tensorfs_core::err::Refusal> for Error {
+    fn from(error: tensorfs_core::err::Refusal) -> Error { Error::Source(error.into()) }
+}

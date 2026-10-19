@@ -17,10 +17,10 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 #[cfg(feature = "store")]
-use tensorfs_core::{format::Header, ids::ObjectRef};
+use tensorfs_core::ids::ObjectRef;
 
 #[cfg(feature = "store")]
-use crate::checkpoint::Ck;
+use tensorfs_core::io::view::View;
 use crate::ceiling::{self, Copy};
 use crate::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUevent, CUstream, CtxGuard, Handle};
 use crate::host::HostMem;
@@ -203,35 +203,28 @@ pub struct Weights {
 #[cfg(feature = "store")]
 impl Weights {
     /// Copies come from `host_fd`'s sealed layout if given, else `files`, else the stored checkpoint's chunk files.
-    fn open(name: &str, ck: Ck<'_>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Weights> {
-        if host_fd.is_none() && files.is_none() && ck.stored.is_none() {
+    fn open(name: &str, ck: View, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Weights> {
+        if host_fd.is_none() && files.is_none() && !ck.has_source() {
             return Err(Error::Invalid("a header parsed alone reads only a grant: chunk files or a sealed layout".into()));
         }
-        let (layout, source) = open_checkpoint(ck, regions, false, files)?;
+        let (layout, source) = open_checkpoint(&ck, regions, false, files)?;
         let host = host_fd.map(|fd| HostMem::adopt_sealed(fd, &layout)).transpose()?;
         if host.as_ref().is_some_and(|h| h.window().is_some()) {
             return Err(Error::Invalid("a streamed host layout: register takes a whole sealed layout".into()));
         }
-        Ok(Weights { name: name.into(), parts: parts(ck.header, &layout), layout, source, host })
+        Ok(Weights { name: name.into(), parts: parts(&ck, &layout), layout, source, host })
     }
 }
 
 /// Each part of `layout` with its dtype and shape from `header`.
 #[cfg(feature = "store")]
-fn parts(header: &Header, layout: &Layout) -> Vec<Part> {
-    let part = |p: &crate::layout::Part| {
-        let (tensor, role) = p.what.rsplit_once('#')?;
-        let (component, key) = tensor.split_once('/')?;
-        let t = header.tensor(component, key)?;
-        let role = if role == "value" { "" } else { role };
-        let (dtype, shape) = match t.part(role) {
-            Some(part) => (part.dtype.name().to_string(), part.shape.clone()),
-            None => (t.dtype.name().to_string(), t.shape.clone()),
-        };
-        let offset = p.offset - layout.regions[p.region as usize].offset;
-        Some(Part { component: component.into(), key: key.into(), role: role.into(), dtype, shape, region: p.region, offset, nbytes: p.nbytes })
-    };
-    layout.parts.iter().filter_map(part).collect()
+fn parts(view: &View, layout: &Layout) -> Vec<Part> {
+    layout.parts.iter().filter_map(|part| {
+        let info = view.part(&part.what)?;
+        Some(Part { component: info.component, key: info.key, role: info.role, dtype: info.dtype,
+            shape: info.shape, region: part.region,
+            offset: part.offset - layout.regions[part.region as usize].offset, nbytes: part.nbytes })
+    }).collect()
 }
 
 /// One region's copy: pending, then enqueued (`Ok`: its landing event) or failed with nothing in flight.
@@ -558,7 +551,7 @@ impl Gpu {
 
     /// `regions` (`tensorfs_core::client::regions`) of a v2 checkpoint as one weight set.
     #[cfg(feature = "store")]
-    pub fn register<'c>(self: &Arc<Self>, name: &str, ck: impl Into<Ck<'c>>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<WeightSet>> {
+    pub fn register(self: &Arc<Self>, name: &str, ck: impl Into<View>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<WeightSet>> {
         let weights = Arc::new(Weights::open(name, ck.into(), regions, host_fd, files)?);
         let g = &self.inner;
         let _c = CtxGuard::enter(g.ctx)?;
@@ -574,7 +567,7 @@ impl Gpu {
     /// module needed, so its copy to the GPU (`WeightSet::prefetch`) runs while the module is
     /// still being built. A module whose regions differ (`WeightSet::regions`) cannot use it.
     #[cfg(feature = "store")]
-    pub fn adopt<'c>(self: &Arc<Self>, name: &str, ck: impl Into<Ck<'c>>, host_fd: RawFd, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<WeightSet>> {
+    pub fn adopt(self: &Arc<Self>, name: &str, ck: impl Into<View>, host_fd: RawFd, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<WeightSet>> {
         self.register(name, ck, &crate::host::sealed_regions(host_fd)?, Some(host_fd), files)
     }
 
@@ -1393,14 +1386,14 @@ pub struct HostSet {
 
 impl Host {
     #[cfg(feature = "store")]
-    pub fn register<'c>(&self, name: &str, ck: impl Into<Ck<'c>>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<HostSet>> {
+    pub fn register(&self, name: &str, ck: impl Into<View>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<HostSet>> {
         let weights = Weights::open(name, ck.into(), regions, host_fd, files)?;
         Ok(Arc::new(HostSet { regs: Mutex::new(vec![(None, false); weights.layout.regions.len()]), weights }))
     }
 
     /// `Gpu::adopt` on the host: a sealed layout registered from the regions it carries.
     #[cfg(feature = "store")]
-    pub fn adopt<'c>(&self, name: &str, ck: impl Into<Ck<'c>>, host_fd: RawFd, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<HostSet>> {
+    pub fn adopt(&self, name: &str, ck: impl Into<View>, host_fd: RawFd, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<HostSet>> {
         self.register(name, ck, &crate::host::sealed_regions(host_fd)?, Some(host_fd), files)
     }
 }
@@ -1476,20 +1469,21 @@ pub struct HostPinned {
 /// The one layout of `regions` of `ck` and its chunk files: what `register` maps and a sealed
 /// host layout holds, the same by construction.
 #[cfg(feature = "store")]
-fn open_checkpoint(ck: Ck<'_>, regions: &[Vec<String>], direct_io: bool, files: Option<Vec<(ObjectRef, File)>>) -> Result<(Layout, Source)> {
-    let (plan, chunks) = crate::checkpoint::read_plan(ck.header, regions)?;
-    let files = match (files, ck.stored) {
-        (Some(f), _) => f,
-        (None, Some(stored)) => crate::checkpoint::chunk_files(stored, &chunks)?,
-        (None, None) => Vec::new(), // a parsed header's sealed layout: its holes have no source
+fn open_checkpoint(view: &View, regions: &[Vec<String>], direct_io: bool, files: Option<Vec<(ObjectRef, File)>>) -> Result<(Layout, Source)> {
+    let (plan, chunks) = view.plan(regions)?;
+    let files = match files {
+        Some(files) => files,
+        None if view.has_source() => view.files(&chunks)?,
+        None => Vec::new(),
     };
     Ok((Layout::build(&plan, regions)?, Source::files(files, direct_io, 0)))
 }
 
 /// `regions` of `ck` in a sealed host layout filled here: the memfd `register(host_fd=)` adopts.
 #[cfg(feature = "store")]
-pub fn seal<'c>(ck: impl Into<Ck<'c>>, regions: &[Vec<String>], name: &str, threads: usize, files: Option<Vec<(ObjectRef, File)>>) -> Result<OwnedFd> {
-    let (layout, source) = open_checkpoint(ck.into(), regions, true, files)?;
+pub fn seal(ck: impl Into<View>, regions: &[Vec<String>], name: &str, threads: usize, files: Option<Vec<(ObjectRef, File)>>) -> Result<OwnedFd> {
+    let view = ck.into();
+    let (layout, source) = open_checkpoint(&view, regions, true, files)?;
     crate::host::fill_sealed(name, &layout, &source, threads, &IoTally::default(), None)
 }
 

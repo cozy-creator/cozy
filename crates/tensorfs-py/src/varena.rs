@@ -1,735 +1,415 @@
-//! `tensorfs.varena`: the weight plane's Python surface, exactly `crates/varena/API.md`.
-//!
-//! Marshal only. Every call that can wait, do I/O or touch the driver runs detached from the
-//! GIL. Stats, events and trims cross as plain dicts and lists; device bytes cross as uint8
-//! DLPack views that keep the VA (never the pages) alive.
+//! `tensorfs.varena`: varena's Python surface, typed in `tensorfs/varena/__init__.pyi`. Marshal
+//! only: every call that can wait, read or touch the driver runs detached from the GIL. A bound
+//! region crosses as a uint8 DLPack tensor whose deleter releases the pin.
 
 use std::ffi::{c_void, CStr};
-use std::os::fd::{BorrowedFd, IntoRawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+#[cfg(feature = "store")]
+use std::fs::File;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyBufferError, PyException};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyTuple;
 use pyo3::{create_exception, ffi};
 #[cfg(feature = "store")]
-use varena::io::Source;
-use varena::layout::Layout;
-use varena::plane::{Event, LeaseView, Stats};
-use varena::{
-    Cursor, Error, Lease, Plane, PlaneConfig, RingView, Ticket, Tier, Trim, View, WsId,
-};
+use tensorfs_core::ids::ObjectRef;
+use varena::ledger::{Admit, Facts, Ledger, Row, RowFacts, State, Victim};
+use varena::ceiling::Copy;
+use varena::memory::{Counters, GpuStats, Part, SetStats};
+use varena::{Error, Gpu, Host, HostPinned, HostSet, Pinned, WeightSet};
 
-use crate::errors::to_py;
-use crate::readplan::PyPlan;
+#[cfg(feature = "store")]
+use crate::store::PyCheckpoint;
 
-create_exception!(tensorfs.varena, PlaneError, PyException, "A weight-plane error; `.code` names its class.");
-create_exception!(tensorfs.varena, BudgetExceeded, PlaneError);
-create_exception!(tensorfs.varena, Shortfall, PlaneError);
-create_exception!(tensorfs.varena, BelowFloor, PlaneError);
-create_exception!(tensorfs.varena, LeaseViolation, PlaneError);
-create_exception!(tensorfs.varena, Poisoned, PlaneError);
-create_exception!(tensorfs.varena, CudaError, PlaneError);
-create_exception!(tensorfs.varena, CudaUnavailable, PlaneError);
-create_exception!(tensorfs.varena, Invalid, PlaneError);
-create_exception!(tensorfs.varena, IoError, PlaneError);
-create_exception!(tensorfs.varena, Closed, PlaneError);
-create_exception!(tensorfs.varena, Unsupported, PlaneError);
-
-/// The one conversion. Source failures cross as the common `tensorfs.Error` families.
-fn err(py: Python<'_>, e: Error) -> PyErr {
-    let msg = e.to_string();
-    let x = match &e {
-        Error::Source(r) => return to_py(py, r),
-        Error::BudgetExceeded { .. } => BudgetExceeded::new_err(msg),
-        Error::Shortfall { .. } => Shortfall::new_err(msg),
-        Error::BelowFloor { .. } => BelowFloor::new_err(msg),
-        Error::LeaseViolation { .. } => LeaseViolation::new_err(msg),
-        Error::Poisoned(_) => Poisoned::new_err(msg),
-        Error::Cuda { .. } => CudaError::new_err(msg),
-        Error::CudaUnavailable(_) => CudaUnavailable::new_err(msg),
-        Error::Invalid(_) => Invalid::new_err(msg),
-        Error::Io(_) => IoError::new_err(msg),
-        Error::Closed(_) => Closed::new_err(msg),
-        Error::Unsupported(_) => Unsupported::new_err(msg),
-    };
-    let v = x.value(py);
-    let _ = v.setattr("code", e.code());
-    if let Error::Shortfall { pool, need, available, blockers } = &e {
-        let _ = v.setattr("pool", *pool);
-        let _ = v.setattr("need", *need);
-        let _ = v.setattr("available", *available);
-        let _ = v.setattr("blockers", blockers.clone());
-    }
-    if let Error::BudgetExceeded { pool, requested, available } = &e {
-        let _ = v.setattr("pool", *pool);
-        let _ = v.setattr("requested", *requested);
-        let _ = v.setattr("available", *available);
-    }
-    if let Error::BelowFloor { pool, need, budget } = &e {
-        let _ = v.setattr("pool", *pool);
-        let _ = v.setattr("need", *need);
-        let _ = v.setattr("budget", *budget);
-    }
-    x
+/// What varena reads of a `tensorfs.Checkpoint`: its header, and the stored checkpoint when a
+/// store holds it (a parsed header reads only a grant's files or a sealed layout).
+#[cfg(feature = "store")]
+fn ck_of(py: Python<'_>, ck: &PyCheckpoint) -> PyResult<tensorfs_core::io::view::View> {
+    ck.native_view(py)
 }
 
+create_exception!(tensorfs.varena, VarenaError, PyException, "A varena error; `.code` names its class.");
+create_exception!(tensorfs.varena, DeviceFull, VarenaError);
+create_exception!(tensorfs.varena, CudaError, VarenaError);
+create_exception!(tensorfs.varena, CudaUnavailable, VarenaError);
+create_exception!(tensorfs.varena, Invalid, VarenaError);
+create_exception!(tensorfs.varena, IoError, VarenaError);
+create_exception!(tensorfs.varena, Closed, VarenaError);
+create_exception!(tensorfs.varena, Unsupported, VarenaError);
+create_exception!(tensorfs.varena, LedgerError, PyException, "A ledger error; `.code` names its class.");
+
 trait OrRaise<T> {
+    /// The core's errors: a class per kind, and source refusals as the usual `tensorfs.errors`.
     fn or_raise(self, py: Python<'_>) -> PyResult<T>;
+    /// The ledger's: `LedgerError`.
+    fn or_ledger(self, py: Python<'_>) -> PyResult<T>;
 }
 
 impl<T> OrRaise<T> for varena::Result<T> {
     fn or_raise(self, py: Python<'_>) -> PyResult<T> {
-        self.map_err(|e| err(py, e))
+        self.map_err(|e| {
+            let x = match &e {
+                Error::Source(failure) => return crate::errors::raise(py, failure.clone()),
+                Error::DeviceFull { .. } => DeviceFull::new_err(e.to_string()),
+                Error::Cuda { .. } => CudaError::new_err(e.to_string()),
+                Error::CudaUnavailable(_) => CudaUnavailable::new_err(e.to_string()),
+                Error::Invalid(_) => Invalid::new_err(e.to_string()),
+                Error::Io(_) => IoError::new_err(e.to_string()),
+                Error::Closed(_) => Closed::new_err(e.to_string()),
+                Error::Unsupported(_) => Unsupported::new_err(e.to_string()),
+            };
+            let v = x.value(py);
+            let _ = v.setattr("code", e.code());
+            if let Error::DeviceFull { need, deficit } = e {
+                let _ = (v.setattr("need", need), v.setattr("deficit", deficit));
+            }
+            x
+        })
+    }
+
+    fn or_ledger(self, py: Python<'_>) -> PyResult<T> {
+        self.map_err(|e| {
+            let x = LedgerError::new_err(e.to_string());
+            let _ = x.value(py).setattr("code", e.code());
+            x
+        })
     }
 }
 
-macro_rules! dict {
-    ($py:expr; $($k:literal => $v:expr),* $(,)?) => {{
-        let d = PyDict::new($py);
-        $(d.set_item($k, $v)?;)*
-        d
-    }};
-}
+// ---------------------------------------------------------------- records
 
-/// `"pinned"` or a CUDA ordinal.
-#[derive(FromPyObject)]
-enum TierArg {
-    Device(i32),
-    Name(String),
-}
-
-fn tier(py: Python<'_>, t: TierArg) -> PyResult<Tier> {
-    match t {
-        TierArg::Device(o) => Ok(Tier::Device(o)),
-        TierArg::Name(s) if s == "pinned" => Ok(Tier::Pinned),
-        TierArg::Name(s) => Err(err(py, Error::Invalid(format!("tier {s:?}: \"pinned\" or a CUDA ordinal")))),
-    }
-}
-
-fn trim<'p>(py: Python<'p>, t: Trim) -> PyResult<Bound<'p, PyDict>> {
-    Ok(dict!(py;
-        "freed" => t.freed,
-        "evicted" => t.evicted,
-        "over_budget_unreleasable" => t.over_budget_unreleasable,
-        "blockers" => t.blockers,
-    ))
-}
-
-fn stats<'p>(py: Python<'p>, s: Stats) -> PyResult<Bound<'p, PyDict>> {
-    let (h, c) = (&s.host, &s.host.counters);
-    let host = dict!(py;
-        "budget" => h.budget, "used" => h.used, "ready_bytes" => h.ready_bytes,
-        "registered_bytes" => h.registered_bytes, "memfd_bytes" => h.memfd_bytes,
-        "sealed_bytes" => h.sealed_bytes,
-        "cached_bytes" => h.cached_bytes, "direct_bytes" => h.direct_bytes,
-        "buffered_bytes" => h.buffered_bytes, "inline_bytes" => h.inline_bytes,
-        "direct_refused" => h.direct_refused, "map_refused" => h.map_refused,
-        "disk_read_bytes" => h.disk_read_bytes, "fills" => c.fills, "fill_bytes" => c.fill_bytes,
-        "fill_ns" => c.fill_ns, "evictions" => c.evictions, "evicted_bytes" => c.evicted_bytes,
-        "register_failed" => c.register_failed, "trims" => c.trims,
-    );
-    let devices = PyList::empty(py);
-    for d in &s.devices {
-        let c = &d.counters;
-        devices.append(dict!(py;
-            "ordinal" => d.ordinal, "uuid" => &d.uuid, "granularity" => d.granularity,
-            "exportable" => d.exportable, "budget" => d.budget, "committed" => d.committed,
-            "mapped" => d.mapped, "idle" => d.idle, "leased_bytes" => d.leased_bytes,
-            "held_bytes" => d.held_bytes, "over_budget_unreleasable" => d.over_budget_unreleasable,
-            "reserved_va" => d.reserved_va, "shared_bytes" => d.shared_bytes, "copies" => c.copies,
-            "host_copy_bytes" => c.host_copy_bytes, "host_copy_ns" => c.host_copy_ns,
-            "bounce_copy_bytes" => c.bounce_copy_bytes, "bounce_copy_ns" => c.bounce_copy_ns,
-            "disk_copy_bytes" => c.disk_copy_bytes, "disk_copy_ns" => c.disk_copy_ns,
-            "mapped_copy_bytes" => c.mapped_copy_bytes, "mapped_copy_ns" => c.mapped_copy_ns,
-            "misses" => c.misses, "evictions" => c.evictions, "evicted_bytes" => c.evicted_bytes,
-            "trims" => c.trims,
-        ))?;
-    }
-    let sets = PyList::empty(py);
-    for w in &s.sets {
-        let devs = PyList::empty(py);
-        for (ordinal, ready) in &w.devices {
-            let shared = w.shared.iter().find(|(o, _)| o == ordinal).map_or(0, |(_, n)| *n);
-            devs.append(dict!(py; "ordinal" => ordinal, "ready_bytes" => ready, "shared_bytes" => shared))?;
+/// A frozen class with a property per field, from varena's record of the same fields; the
+/// field after `;` is a list whose items convert.
+macro_rules! record {
+    ($py:ident = $name:literal from $rs:ty { $($f:ident: $t:ty),* $(; $v:ident: $vt:ty)? }) => {
+        #[pyclass(name = $name, module = "tensorfs.varena", frozen, get_all, skip_from_py_object)]
+        #[derive(Clone)]
+        pub struct $py {
+            $($f: $t,)*
+            $($v: Vec<$vt>)?
         }
-        sets.append(dict!(py;
-            "id" => w.id, "name" => &w.name, "nbytes" => w.nbytes, "regions" => w.regions,
-            "host_ready_bytes" => w.host_ready_bytes, "host_memfd_bytes" => w.host_memfd_bytes,
-            "evictions" => w.evictions, "evicted_bytes" => w.evicted_bytes, "devices" => devs,
-        ))?;
-    }
-    let stages = PyList::empty(py);
-    for (ws, device, tag, t) in &s.tags {
-        stages.append(dict!(py;
-            "ws" => ws, "device" => device, "tag" => tag, "acquires" => t.acquires,
-            "skipped" => t.skipped, "misses" => t.misses, "late" => t.late,
-            "late_bytes" => t.late_bytes, "stall_ns" => t.stall_ns,
-            "streamed_bytes" => t.streamed_bytes,
-        ))?;
-    }
-    let regions = PyList::empty(py);
-    for (ws, device, tag, region, r) in &s.regions {
-        regions.append(dict!(py;
-            "ws" => ws, "device" => device, "tag" => tag, "region" => region, "uses" => r.uses,
-            "compute_ns" => r.compute_ns, "stall_ns" => r.stall_ns, "late" => r.late,
-        ))?;
-    }
-    Ok(dict!(py;
-        "host" => host, "devices" => devices, "sets" => sets, "stages" => stages,
-        "regions" => regions, "events_dropped" => s.events_dropped, "poisoned" => s.poisoned,
-    ))
-}
 
-fn event<'p>(py: Python<'p>, e: Event) -> PyResult<Bound<'p, PyDict>> {
-    Ok(dict!(py;
-        "kind" => e.kind, "ws" => e.ws, "region" => e.region, "device" => e.device,
-        "bytes" => e.bytes, "ns" => e.ns, "detail" => e.detail,
-    ))
-}
-
-// ---------------------------------------------------------------- the plane
-
-#[pyclass(name = "Plane", module = "tensorfs.varena", frozen)]
-pub struct PyPlane {
-    plane: Arc<Plane>,
-}
-
-impl PyPlane {
-    fn id(&self, py: Python<'_>, ws: &PyWeightSet) -> PyResult<WsId> {
-        if Arc::ptr_eq(&self.plane, &ws.plane) {
-            return Ok(ws.id);
+        impl From<$rs> for $py {
+            fn from(x: $rs) -> Self {
+                $py { $($f: x.$f.into(),)* $($v: x.$v.into_iter().map(Into::into).collect())? }
+            }
         }
-        Err(err(py, Error::Invalid(format!("weight set {:?} belongs to another plane", ws.name))))
-    }
+    };
 }
+
+record!(PyCounters = "Counters" from Counters {
+    binds: u64, faults: u64, paged_in: u64, streamed_bytes: u64, evicted: u64, copy_ns: u64, stall_ns: u64, map_ns: u64
+});
+record!(PySetStats = "SetStats" from SetStats {
+    name: String, nbytes: u64, regions: u32, home: u64, resident: u64, pinned: u64, pins: u32, slot_bytes: u64,
+    step: PyCounters, last: PyCounters, total: PyCounters
+});
+record!(PyGpuStats = "GpuStats" from GpuStats {
+    device: i32, chunk: u64, steps: u64, mapped: u64, idle: u64, slots: u32, slot_bytes: u64, slot_span: u64,
+    driver_free: u64, driver_total: u64; sets: PySetStats
+});
+
+record!(PyCopy = "Copy" from Copy {
+    kind: String, gpu: i32, bytes: u64, ns: u64, ceiling: f64, link: String, busy_ns: u64, pin_ns: u64, staged: u64, cached: u64
+});
+
+/// Every run of weight copies since the last call (`h2d`: a GPU's copy stream from its first job
+/// to its last landing; `disk`: a host layout filled from chunk files), with its ceiling in GB/s.
+#[pyfunction]
+fn copies() -> Vec<PyCopy> {
+    varena::ceiling::take().into_iter().map(Into::into).collect()
+}
+
+#[pyclass(name = "Part", module = "tensorfs.varena", frozen, get_all)]
+pub struct PyPart {
+    component: String,
+    key: String,
+    role: String,
+    dtype: String,
+    shape: Py<PyTuple>,
+    region: u32,
+    offset: u64,
+    nbytes: u64,
+}
+
+// ---------------------------------------------------------------- cores
+
+/// A grant's chunk files, `(sha256, length, fd)` each: every fd duplicated, the caller's kept.
+#[cfg(feature = "store")]
+fn granted(py: Python<'_>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<Option<Vec<(ObjectRef, File)>>> {
+    let dup = |(sha256, length, fd): (String, u64, i32)| -> varena::Result<(ObjectRef, File)> {
+        // SAFETY: a descriptor the caller holds for the duration of this call.
+        let own = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().map_err(|e| Error::Io(format!("dup chunk fd {fd}: {e}")));
+        Ok((ObjectRef { sha256, length }, File::from(own?)))
+    };
+    files.map(|f| f.into_iter().map(dup).collect::<varena::Result<_>>()).transpose().or_raise(py)
+}
+
+#[pyclass(name = "Gpu", module = "tensorfs.varena", frozen)]
+pub struct PyGpu(Arc<Gpu>);
 
 #[pymethods]
-impl PyPlane {
+impl PyGpu {
     #[new]
-    #[pyo3(signature = (devices, readers = 16, copy_streams = 1, slab_bytes = 64 << 20, staging_buffers = 32, staging_bytes = 1 << 20, direct_io = true))]
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        py: Python<'_>,
-        devices: Vec<i32>,
-        readers: usize,
-        copy_streams: usize,
-        slab_bytes: u64,
-        staging_buffers: usize,
-        staging_bytes: u64,
-        direct_io: bool,
-    ) -> PyResult<Self> {
-        let cfg = PlaneConfig { devices, readers, copy_streams, slab_bytes, staging_buffers, staging_bytes, direct_io };
-        let plane = py.detach(|| Plane::open(cfg)).or_raise(py)?;
-        Ok(PyPlane { plane: Arc::new(plane) })
+    #[pyo3(signature = (device, chunk = 64 << 20))]
+    fn new(py: Python<'_>, device: i32, chunk: u64) -> PyResult<Self> {
+        Ok(PyGpu(py.detach(|| Gpu::open(device, chunk)).or_raise(py)?))
     }
 
     #[getter]
-    fn devices(&self) -> Vec<(i32, String)> {
-        self.plane.devices()
+    fn device(&self) -> i32 {
+        self.0.device()
+    }
+
+    #[getter]
+    fn chunk(&self) -> u64 {
+        self.0.chunk()
     }
 
     #[cfg(feature = "store")]
-    #[pyo3(signature = (name, source, plan, regions, host_fd = None))]
-    fn register(
-        &self,
-        py: Python<'_>,
-        name: String,
-        source: PyRef<'_, PySource>,
-        plan: PyRef<'_, PyPlan>,
-        regions: Vec<Vec<String>>,
-        host_fd: Option<i32>,
-    ) -> PyResult<PyWeightSet> {
-        let (src, p, plane) = (source.source.clone(), &plan.plan, &self.plane);
-        let (id, layout) = py
-            .detach(|| {
-                let id = plane.register(&name, src, p, &regions, host_fd)?;
-                Ok((id, plane.layout(id)?))
-            })
-            .or_raise(py)?;
-        Ok(PyWeightSet { plane: self.plane.clone(), id, name, layout })
+    #[pyo3(signature = (name, ck, regions, host_fd = None, files = None))]
+    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
+        let (ck, files) = (ck_of(py, &ck)?, granted(py, files)?);
+        Ok(PyWeightSet::new(SetRef::Gpu(py.detach(|| self.0.register(&name, ck, &regions, host_fd, files)).or_raise(py)?)))
     }
 
-    /// Register `regions` (`tensorfs.regions(ck)` when None) of a stored checkpoint as one
-    /// weight set: the parts they name, in header order, are the read plan and their chunk
-    /// files the source.
+    /// The sealed host layout `host_fd` registered from the regions it carries, before any module.
     #[cfg(feature = "store")]
-    #[pyo3(signature = (name, ck, regions = None, host_fd = None))]
-    fn register_checkpoint(
-        &self,
-        py: Python<'_>,
-        name: String,
-        ck: PyRef<'_, crate::store::PyCheckpoint>,
-        regions: Option<Vec<Vec<String>>>,
-        host_fd: Option<i32>,
-    ) -> PyResult<PyWeightSet> {
-        let (ck, plane) = (ck.stored(py)?, &self.plane);
-        let regions = regions.unwrap_or_else(|| tensorfs_core::client::regions(ck.header(), 64 << 20, &[], &[]));
-        let (id, layout) = py
-            .detach(|| {
-                let id = plane.register_checkpoint(&name, &ck, &regions, host_fd)?;
-                Ok((id, plane.layout(id)?))
-            })
-            .or_raise(py)?;
-        Ok(PyWeightSet { plane: self.plane.clone(), id, name, layout })
+    #[pyo3(signature = (name, ck, host_fd, files = None))]
+    fn adopt(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, host_fd: i32, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
+        let (ck, files) = (ck_of(py, &ck)?, granted(py, files)?);
+        Ok(PyWeightSet::new(SetRef::Gpu(py.detach(|| self.0.adopt(&name, ck, host_fd, files)).or_raise(py)?)))
     }
 
-    /// Register one weight set over a sealed layout (filled by its machine, or still filling: each
-    /// region is used once Ready); `fd` stays the caller's. `files`: `(sha256, length, fd)` per
-    /// object, the verified object files its owner supplied for regions not staged in that
-    /// shared CPU layout (each fd is duplicated; the caller keeps and closes its own).
-    /// Runtime performs GPU copies/mappings through its local plane using those sources.
-    #[pyo3(signature = (name, plan, regions, fd, files = None))]
-    fn register_sealed(
-        &self,
-        py: Python<'_>,
-        name: String,
-        plan: PyRef<'_, PyPlan>,
-        regions: Vec<Vec<String>>,
-        fd: i32,
-        files: Option<Vec<(String, u64, i32)>>,
-    ) -> PyResult<PyWeightSet> {
-        let mut handed = Vec::new();
-        for (sha256, length, file) in files.unwrap_or_default() {
-            // SAFETY: a descriptor the caller holds for the duration of this call.
-            let owned = unsafe { std::os::fd::BorrowedFd::borrow_raw(file) }
-                .try_clone_to_owned()
-                .map_err(|e| err(py, Error::Io(format!("object file {sha256}: {e}"))))?;
-            let sha256 = sha256.strip_prefix("sha256:").unwrap_or(&sha256).to_string();
-            handed.push((tensorfs_core::ids::ObjectRef { sha256, length }, std::fs::File::from(owned)));
-        }
-        let (p, plane) = (&plan.plan, &self.plane);
-        let (id, layout) = py
-            .detach(|| {
-                let id = plane.register_staged(&name, p, &regions, fd, handed)?;
-                Ok((id, plane.layout(id)?))
-            })
-            .or_raise(py)?;
-        Ok(PyWeightSet { plane: self.plane.clone(), id, name, layout })
+    fn trim(&self, py: Python<'_>) -> PyResult<u64> {
+        py.detach(|| self.0.trim()).or_raise(py)
     }
 
-    fn set_vram_budget<'p>(&self, py: Python<'p>, device: i32, nbytes: u64) -> PyResult<Bound<'p, PyDict>> {
-        let t = py.detach(|| self.plane.set_vram_budget(device, nbytes)).or_raise(py)?;
-        trim(py, t)
+    /// Frees up to `nbytes` as an ask of this process's row would; what each set gave.
+    fn give(&self, py: Python<'_>, nbytes: u64) -> PyResult<Vec<(String, u64)>> {
+        py.detach(|| self.0.give(nbytes)).or_raise(py)
     }
 
-    fn set_pinned_budget<'p>(&self, py: Python<'p>, nbytes: u64) -> PyResult<Bound<'p, PyDict>> {
-        let t = py.detach(|| self.plane.set_pinned_budget(nbytes)).or_raise(py)?;
-        trim(py, t)
+    /// Answers other processes' asks of `row` from now on with `give`, on a Rust thread.
+    fn serve(&self, py: Python<'_>, row: PyRef<'_, PyRow>) -> PyResult<()> {
+        let gpu = self.0.clone();
+        row.0.serve(move |want| gpu.give(want).map_or(0, |gave| gave.iter().map(|g| g.1).sum())).map(drop).or_raise(py)
     }
 
-    #[pyo3(signature = (ws, tier, regions = None, priority = 0, pin = false))]
-    fn want(
-        &self,
-        py: Python<'_>,
-        ws: PyRef<'_, PyWeightSet>,
-        tier: TierArg,
-        regions: Option<Vec<u32>>,
-        priority: i64,
-        pin: bool,
-    ) -> PyResult<PyTicket> {
-        let (id, t) = (self.id(py, &ws)?, self::tier(py, tier)?);
-        let plane = &self.plane;
-        let ticket = py.detach(|| plane.want(id, t, regions.as_deref(), priority, pin)).or_raise(py)?;
-        Ok(PyTicket { ticket })
+    fn step(&self, py: Python<'_>) {
+        py.detach(|| self.0.step())
     }
 
-    /// This device can export and attach shared regions.
-    fn device_sharing(&self, py: Python<'_>, device: i32) -> PyResult<bool> {
-        self.plane.device_sharing(device).or_raise(py)
+    fn stats(&self, py: Python<'_>) -> PyResult<PyGpuStats> {
+        Ok(py.detach(|| self.0.stats()).or_raise(py)?.into())
+    }
+}
+
+#[pyclass(name = "Host", module = "tensorfs.varena", frozen)]
+pub struct PyHost;
+
+#[pymethods]
+impl PyHost {
+    #[new]
+    fn new() -> Self {
+        PyHost
     }
 
-    /// Share the Ready, unleased regions (all when None) on `device`: they become read-only
-    /// and leave the budget. Returns `[{"region": int, "chunks": [(bytes, fd), ...]}]`; the
-    /// caller owns every fd (close-on-exec).
-    #[pyo3(signature = (ws, device, regions = None))]
-    fn export_device<'p>(
-        &self,
-        py: Python<'p>,
-        ws: PyRef<'_, PyWeightSet>,
-        device: i32,
-        regions: Option<Vec<u32>>,
-    ) -> PyResult<Bound<'p, PyList>> {
-        let id = self.id(py, &ws)?;
-        let plane = &self.plane;
-        let exported = py.detach(|| plane.export_device(id, device, regions.as_deref())).or_raise(py)?;
-        let out = PyList::empty(py);
-        for e in exported {
-            let chunks: Vec<(u64, i32)> = e.chunks.into_iter().map(|(n, fd)| (n, fd.into_raw_fd())).collect();
-            out.append(dict!(py; "region" => e.region, "chunks" => chunks))?;
-        }
-        Ok(out)
+    #[cfg(feature = "store")]
+    #[pyo3(signature = (name, ck, regions, host_fd = None, files = None))]
+    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
+        let (ck, files) = (ck_of(py, &ck)?, granted(py, files)?);
+        Ok(PyWeightSet::new(SetRef::Host(py.detach(|| Host.register(&name, ck, &regions, host_fd, files)).or_raise(py)?)))
     }
 
-    /// Map another process's shared `region` read-only, without a copy: `chunks` are
-    /// `(bytes, fd)` in VA order, from `export_device`; `digest` is the holder's layout and must
-    /// equal `ws.digest`. The fds stay the caller's to close.
-    fn attach_device(
-        &self,
-        py: Python<'_>,
-        ws: PyRef<'_, PyWeightSet>,
-        device: i32,
-        region: u32,
-        chunks: Vec<(u64, i32)>,
-        digest: String,
-    ) -> PyResult<()> {
-        let id = self.id(py, &ws)?;
-        if chunks.iter().any(|(_, fd)| *fd < 0) {
-            return Err(err(py, Error::Invalid("a negative fd".into())));
-        }
-        // SAFETY: the caller keeps these fds open for the call.
-        let borrowed: Vec<(u64, BorrowedFd<'_>)> =
-            chunks.iter().map(|(n, fd)| (*n, unsafe { BorrowedFd::borrow_raw(*fd) })).collect();
-        let plane = &self.plane;
-        py.detach(|| plane.attach_device(id, device, region, &borrowed, &digest)).or_raise(py)
-    }
-
-    /// Bytes freed; refuses on live leases or holds.
-    #[pyo3(name = "drop", signature = (ws, tier, regions = None))]
-    fn drop_regions(
-        &self,
-        py: Python<'_>,
-        ws: PyRef<'_, PyWeightSet>,
-        tier: TierArg,
-        regions: Option<Vec<u32>>,
-    ) -> PyResult<u64> {
-        let (id, t) = (self.id(py, &ws)?, self::tier(py, tier)?);
-        let plane = &self.plane;
-        py.detach(|| plane.drop_regions(id, t, regions.as_deref())).or_raise(py)
-    }
-
-    /// Set priority (and pin, when given) without moving a byte.
-    #[pyo3(signature = (ws, tier, regions = None, priority = 0, pin = None))]
-    fn prioritise(
-        &self,
-        py: Python<'_>,
-        ws: PyRef<'_, PyWeightSet>,
-        tier: TierArg,
-        regions: Option<Vec<u32>>,
-        priority: i64,
-        pin: Option<bool>,
-    ) -> PyResult<()> {
-        let (id, t) = (self.id(py, &ws)?, self::tier(py, tier)?);
-        let plane = &self.plane;
-        py.detach(|| plane.prioritise(id, t, regions.as_deref(), priority, pin)).or_raise(py)
-    }
-
-    #[pyo3(signature = (ws, devices, regions = None, priority = 0, pin = false))]
-    fn replicate(
-        &self,
-        py: Python<'_>,
-        ws: PyRef<'_, PyWeightSet>,
-        devices: Vec<i32>,
-        regions: Option<Vec<u32>>,
-        priority: i64,
-        pin: bool,
-    ) -> PyResult<Vec<PyTicket>> {
-        let (id, plane) = (self.id(py, &ws)?, &self.plane);
-        let tickets = py
-            .detach(|| plane.replicate(id, &devices, regions.as_deref(), priority, pin))
-            .or_raise(py)?;
-        Ok(tickets.into_iter().map(|ticket| PyTicket { ticket }).collect())
-    }
-
-    /// A region not resident is demand-filled at `priority` (when given, it becomes the
-    /// region's priority first).
-    #[pyo3(signature = (ws, device, region, stream, priority = None))]
-    fn acquire(
-        &self,
-        py: Python<'_>,
-        ws: PyRef<'_, PyWeightSet>,
-        device: i32,
-        region: u32,
-        stream: u64,
-        priority: Option<i64>,
-    ) -> PyResult<PyPlaneLease> {
-        let (id, plane) = (self.id(py, &ws)?, &self.plane);
-        let lease = py.detach(|| plane.acquire(id, device, region, stream, priority)).or_raise(py)?;
-        Ok(PyPlaneLease::new(lease, stream))
-    }
-
-    #[pyo3(signature = (ws, device, order, window, repeat = 1, priority = 0, tag = "denoise", ring_bytes = None))]
-    #[allow(clippy::too_many_arguments)]
-    fn stream(
-        &self,
-        py: Python<'_>,
-        ws: PyRef<'_, PyWeightSet>,
-        device: i32,
-        order: Vec<u32>,
-        window: u32,
-        repeat: u32,
-        priority: i64,
-        tag: &str,
-        ring_bytes: Option<u64>,
-    ) -> PyResult<PyCursor> {
-        let (id, plane) = (self.id(py, &ws)?, &self.plane);
-        let cur = py
-            .detach(|| plane.stream(id, device, &order, window, repeat, priority, tag, ring_bytes))
-            .or_raise(py)?;
-        let (home, window, ring_ptr, ring_nbytes) = (cur.home.clone(), cur.window, cur.ring_ptr, cur.ring_nbytes);
-        Ok(PyCursor { home, window, ring_ptr, ring_nbytes, cur })
-    }
-
-    fn stats<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyDict>> {
-        let s = py.detach(|| self.plane.stats());
-        stats(py, s)
-    }
-
-    /// Drains the event ring.
-    fn events<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyList>> {
-        let out = PyList::empty(py);
-        for e in py.detach(|| self.plane.events()) {
-            out.append(event(py, e)?)?;
-        }
-        Ok(out)
-    }
-
-    /// Closes every weight set; refuses while leases, cursors or views live.
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.plane.close()).or_raise(py)
+    #[cfg(feature = "store")]
+    #[pyo3(signature = (name, ck, host_fd, files = None))]
+    fn adopt(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, host_fd: i32, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
+        let (ck, files) = (ck_of(py, &ck)?, granted(py, files)?);
+        Ok(PyWeightSet::new(SetRef::Host(py.detach(|| Host.adopt(&name, ck, host_fd, files)).or_raise(py)?)))
     }
 }
 
 // ---------------------------------------------------------------- weight sets
 
+#[derive(Clone)]
+enum SetRef {
+    Gpu(Arc<WeightSet>),
+    Host(Arc<HostSet>),
+}
+
 #[pyclass(name = "WeightSet", module = "tensorfs.varena", frozen)]
 pub struct PyWeightSet {
-    plane: Arc<Plane>,
-    id: WsId,
     #[pyo3(get)]
     name: String,
-    layout: Arc<Layout>,
+    #[pyo3(get)]
+    nbytes: u64,
+    #[pyo3(get)]
+    spans: Vec<u64>,
+    #[pyo3(get)]
+    regions: Vec<Vec<String>>,
+    #[pyo3(get)]
+    device: Option<i32>,
+    parts: Vec<Part>,
+    set: Mutex<Option<SetRef>>,
+}
+
+impl PyWeightSet {
+    fn new(set: SetRef) -> Self {
+        let (w, device) = match &set {
+            SetRef::Gpu(ws) => (&*ws.weights, Some(ws.device())),
+            SetRef::Host(hs) => (&hs.weights, None),
+        };
+        let spans = w.layout.regions.iter().map(|r| r.span).collect();
+        let regions = w.layout.names.clone();
+        PyWeightSet { name: w.name.clone(), nbytes: w.layout.nbytes, spans, regions, device, parts: w.parts.clone(), set: Mutex::new(Some(set)) }
+    }
+
+    fn set(&self, py: Python<'_>) -> PyResult<SetRef> {
+        let set = self.set.lock().unwrap().clone();
+        set.ok_or_else(|| Error::Closed(format!("weight set {:?}", self.name))).or_raise(py)
+    }
+
+    /// The GPU set; None on the host, where the watermark, prefetch and eviction do nothing.
+    fn gpu(&self, py: Python<'_>) -> PyResult<Option<Arc<WeightSet>>> {
+        Ok(match self.set(py)? {
+            SetRef::Gpu(w) => Some(w),
+            SetRef::Host(_) => None,
+        })
+    }
 }
 
 #[pymethods]
 impl PyWeightSet {
-    /// The layout span (a multiple of 2 MiB).
     #[getter]
-    fn nbytes(&self) -> u64 {
-        self.layout.nbytes
+    fn parts(&self, py: Python<'_>) -> PyResult<Vec<PyPart>> {
+        let part = |p: &Part| {
+            let shape = PyTuple::new(py, &p.shape)?.unbind();
+            let (component, key, role, dtype) = (p.component.clone(), p.key.clone(), p.role.clone(), p.dtype.clone());
+            Ok(PyPart { component, key, role, dtype, shape, region: p.region, offset: p.offset, nbytes: p.nbytes })
+        };
+        self.parts.iter().map(part).collect()
     }
 
-    /// Identity of the byte layout: equal digests place the same bytes at the same offsets.
-    #[getter]
-    fn digest(&self) -> String {
-        self.layout.digest.clone()
+    fn home(&self, py: Python<'_>, regions: Vec<u32>) -> PyResult<()> {
+        self.gpu(py)?.map_or(Ok(()), |w| py.detach(|| w.home(&regions)).or_raise(py))
     }
 
-    #[getter]
-    fn regions<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyList>> {
-        let out = PyList::empty(py);
-        for (i, r) in self.layout.regions.iter().enumerate() {
-            out.append(dict!(py; "index" => i, "offset" => r.offset, "nbytes" => r.nbytes, "span" => r.span))?;
+    #[pyo3(signature = (region, stream = 0))]
+    fn bind(&self, py: Python<'_>, region: u32, stream: u64) -> PyResult<PyPinned> {
+        Ok(match self.set(py)? {
+            SetRef::Gpu(w) => PyPinned::gpu(py.detach(|| w.bind(region, stream)).or_raise(py)?),
+            SetRef::Host(h) => PyPinned::host(py.detach(|| h.bind(region)).or_raise(py)?),
+        })
+    }
+
+    fn prefetch(&self, py: Python<'_>, region: u32) -> PyResult<()> {
+        self.gpu(py)?.map_or(Ok(()), |w| py.detach(|| w.prefetch(region)).or_raise(py))
+    }
+
+    /// GPU: mapped at home with bytes there or on their way. Host: always.
+    fn resident(&self, py: Python<'_>, region: u32) -> PyResult<bool> {
+        match self.gpu(py)? {
+            Some(w) => w.resident(region).or_raise(py),
+            None if (region as usize) < self.spans.len() => Ok(true),
+            None => Err(Error::Invalid(format!("region {region} of {}", self.spans.len()))).or_raise(py),
         }
-        Ok(out)
     }
 
-    #[getter]
-    fn parts<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyList>> {
-        let out = PyList::empty(py);
-        for p in &self.layout.parts {
-            out.append(dict!(py; "what" => &p.what, "region" => p.region, "offset" => p.offset, "nbytes" => p.nbytes))?;
+    fn warm(&self, py: Python<'_>, warm: bool) -> PyResult<()> {
+        if let Some(w) = self.gpu(py)? {
+            w.warm(warm)
         }
-        Ok(out)
+        Ok(())
     }
 
-    /// The plane-owned memfd; pass it to another process to share the pinned tier.
-    #[getter]
-    fn host_fd(&self, py: Python<'_>) -> PyResult<i32> {
-        py.detach(|| self.plane.host_fd(self.id)).or_raise(py)
+    fn busy(&self, py: Python<'_>, busy: bool) -> PyResult<()> {
+        if let Some(w) = self.gpu(py)? {
+            w.busy(busy)
+        }
+        Ok(())
     }
 
-    /// The stable device VA as a uint8 DLPack view of `nbytes`.
-    fn view(&self, py: Python<'_>, device: i32) -> PyResult<PyDeviceView> {
-        let v = py.detach(|| self.plane.view(self.id, device)).or_raise(py)?;
-        Ok(PyDeviceView { held: Arc::new(Viewed::Ws(v)) })
+    /// Home regions map as one shareable allocation each from now on; false where they cannot.
+    fn shareable(&self, py: Python<'_>) -> PyResult<bool> {
+        Ok(self.gpu(py)?.is_some_and(|w| w.shareable()))
     }
 
-    /// Driver truth: every chunk the books call mapped is the driver's mapping there. Returns
-    /// chunks checked; a mismatch poisons the plane.
-    fn verify(&self, py: Python<'_>, device: i32) -> PyResult<u64> {
-        py.detach(|| self.plane.verify(self.id, device)).or_raise(py)
+    /// Landed home regions not handed out yet, kept past this process: `(region, span, fd)`,
+    /// each fd the caller's to deposit with TensorD and close.
+    fn kept(&self, py: Python<'_>) -> PyResult<Vec<(u32, u64, i32)>> {
+        let Some(w) = self.gpu(py)? else { return Ok(vec![]) };
+        Ok(py.detach(|| w.kept()).or_raise(py)?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect())
     }
 
-    /// Refuses while leases, holds, cursors or views remain. The source's lease ends when its
-    /// last weight set closes and the Source handle is gone.
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.plane.close_ws(self.id)).or_raise(py)
+    /// Home regions mapped from kept pages `(region, fd)`; each fd duplicated, the caller's
+    /// kept. Returns the bytes adopted.
+    fn adopt_pages(&self, py: Python<'_>, pages: Vec<(u32, i32)>) -> PyResult<u64> {
+        let Some(w) = self.gpu(py)? else { return Ok(0) };
+        // SAFETY: descriptors the caller holds for the duration of this call.
+        let dup = |(r, fd): (u32, i32)| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().map(|fd| (r, fd));
+        let pages = pages.into_iter().map(dup).collect::<std::io::Result<Vec<_>>>().map_err(|e| Error::Io(format!("dup kept pages: {e}"))).or_raise(py)?;
+        py.detach(|| w.adopt_pages(pages)).or_raise(py)
+    }
+
+    #[pyo3(signature = (regions = None))]
+    fn evict(&self, py: Python<'_>, regions: Option<Vec<u32>>) -> PyResult<u64> {
+        self.gpu(py)?.map_or(Ok(0), |w| py.detach(|| w.evict(regions.as_deref())).or_raise(py))
+    }
+
+    /// Lets the set go: its VA and pages are released now, or when its last pin dies.
+    fn close(&self, py: Python<'_>) {
+        let set = self.set.lock().unwrap().take();
+        py.detach(|| drop(set));
     }
 
     fn __repr__(&self) -> String {
-        format!("<tensorfs.varena.WeightSet {:?} {} B in {} regions>", self.name, self.layout.nbytes, self.layout.regions.len())
+        format!("<tensorfs.varena.WeightSet {:?} {} B in {} regions>", self.name, self.nbytes, self.spans.len())
     }
 }
 
-/// A manifest's byte source: one TensorFS lease shared by its weight sets.
-#[cfg(feature = "store")]
-#[pyclass(name = "Source", module = "tensorfs.varena", frozen)]
-pub struct PySource {
-    source: Arc<Source>,
+// ---------------------------------------------------------------- pins and DLPack
+
+/// The pin a Python handle and every tensor made from it share.
+struct Pin {
+    gpu: Option<Pinned>,
+    _host: Option<HostPinned>,
 }
 
-#[pyclass(name = "Ticket", module = "tensorfs.varena", frozen)]
-pub struct PyTicket {
-    ticket: Ticket,
-}
-
-#[pymethods]
-impl PyTicket {
-    fn done(&self, py: Python<'_>) -> PyResult<bool> {
-        py.detach(|| self.ticket.done()).or_raise(py)
-    }
-
-    fn wait(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.ticket.wait()).or_raise(py)
-    }
-}
-
-// ---------------------------------------------------------------- leases and cursors
-
-/// Use of one region's bytes on one stream. Release exactly once; a lease collected
-/// unreleased poisons the plane.
-#[pyclass(name = "Lease", module = "tensorfs.varena", frozen)]
-pub struct PyPlaneLease {
+/// A bound region: a uint8 DLPack tensor of `nbytes` at `ptr`. It and every tensor made from it
+/// hold the pin.
+#[pyclass(name = "Pinned", module = "tensorfs.varena", frozen)]
+pub struct PyPinned {
+    #[pyo3(get)]
+    region: u32,
     #[pyo3(get)]
     ptr: u64,
     #[pyo3(get)]
     nbytes: u64,
     #[pyo3(get)]
-    region: u32,
-    /// Where a streamed lease's bytes sit in the cursor's ring; None for a resident one.
+    home: bool,
     #[pyo3(get)]
-    ring_offset: Option<u64>,
-    /// The acquire stream: `release()` records there unless told otherwise.
-    stream: u64,
-    released: AtomicBool,
-    lease: Lease,
-}
-
-impl PyPlaneLease {
-    fn new(lease: Lease, stream: u64) -> Self {
-        let (ptr, nbytes, region, ring_offset) = (lease.ptr, lease.nbytes, lease.region, lease.ring_offset);
-        PyPlaneLease { ptr, nbytes, region, ring_offset, stream, released: AtomicBool::new(false), lease }
-    }
-}
-
-#[pymethods]
-impl PyPlaneLease {
-    /// One uint8 DLPack view of the region's bytes, at `ptr`.
-    fn view(&self, py: Python<'_>) -> PyResult<PyDeviceView> {
-        let v = py.detach(|| self.lease.view()).or_raise(py)?;
-        Ok(PyDeviceView { held: Arc::new(Viewed::Lease(v)) })
-    }
-
-    /// Diagnostic: parts whose device bytes differ from the source (waits for the copy and
-    /// reads the store; debugging runs only).
-    fn verify_bytes(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        py.detach(|| self.lease.verify_bytes()).or_raise(py)
-    }
-
-    #[pyo3(signature = (stream = None))]
-    fn release(&self, py: Python<'_>, stream: Option<u64>) -> PyResult<()> {
-        self.released.store(true, Ordering::SeqCst);
-        let s = stream.unwrap_or(self.stream);
-        py.detach(|| self.lease.release(s)).or_raise(py)
-    }
-
-    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    #[pyo3(signature = (*_args))]
-    fn __exit__(&self, py: Python<'_>, _args: &Bound<'_, PyAny>) -> PyResult<bool> {
-        if !self.released.load(Ordering::SeqCst) {
-            self.release(py, None)?;
-        }
-        Ok(false)
-    }
-}
-
-#[pyclass(name = "Cursor", module = "tensorfs.varena", frozen)]
-pub struct PyCursor {
-    /// Per order index: served in place (resident at `stream()`).
+    fresh: bool,
     #[pyo3(get)]
-    home: Vec<bool>,
-    #[pyo3(get)]
-    window: u32,
-    #[pyo3(get)]
-    ring_ptr: u64,
-    #[pyo3(get)]
-    ring_nbytes: u64,
-    cur: Cursor,
+    writable: bool,
+    dl: (i32, i32),
+    pin: Arc<Pin>,
 }
 
-#[pymethods]
-impl PyCursor {
-    /// Schedule positions consumed so far.
-    #[getter]
-    fn position(&self, py: Python<'_>) -> u64 {
-        py.detach(|| self.cur.position())
+impl PyPinned {
+    fn gpu(p: Pinned) -> Self {
+        let (home, dl) = (p.home(), (KDL_CUDA, p.device()));
+        PyPinned { region: p.region, ptr: p.ptr, nbytes: p.nbytes, home, fresh: p.fresh, writable: p.writable, dl, pin: Arc::new(Pin { gpu: Some(p), _host: None }) }
     }
 
-    /// Completed cycles over `order`.
-    #[getter]
-    fn passes(&self, py: Python<'_>) -> u64 {
-        py.detach(|| self.cur.passes())
-    }
-
-
-    /// Lease `region`: the next scheduled one, a later one (skipping ahead), or a demand fill.
-    fn acquire(&self, py: Python<'_>, region: u32, stream: u64) -> PyResult<PyPlaneLease> {
-        let lease = py.detach(|| self.cur.acquire(region, stream)).or_raise(py)?;
-        Ok(PyPlaneLease::new(lease, stream))
-    }
-
-    /// A uint8 DLPack view of the whole ring; it keeps the cursor from closing.
-    fn ring_view(&self, py: Python<'_>) -> PyResult<PyDeviceView> {
-        let v = py.detach(|| self.cur.ring_view()).or_raise(py)?;
-        Ok(PyDeviceView { held: Arc::new(Viewed::Ring(v)) })
-    }
-
-    /// Refuses while a lease or ring view is live; waits for copies in flight.
-    fn close(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.cur.close()).or_raise(py)
-    }
-
-    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    #[pyo3(signature = (*_args))]
-    fn __exit__(&self, py: Python<'_>, _args: &Bound<'_, PyAny>) -> PyResult<bool> {
-        self.close(py)?;
-        Ok(false)
+    fn host(p: HostPinned) -> Self {
+        let (region, ptr, nbytes, fresh, writable) = (p.region, p.ptr, p.nbytes, p.fresh, p.writable);
+        PyPinned { region, ptr, nbytes, home: true, fresh, writable, dl: (KDL_CPU, 0), pin: Arc::new(Pin { gpu: None, _host: Some(p) }) }
     }
 }
 
-// ---------------------------------------------------------------- DLPack views
-
-enum Viewed {
-    Ws(View),
-    Ring(RingView),
-    Lease(LeaseView),
-}
-
-impl Viewed {
-    /// (ptr, nbytes, device ordinal)
-    fn span(&self) -> (u64, u64, i32) {
-        match self {
-            Viewed::Ws(v) => (v.ptr, v.nbytes, v.device()),
-            Viewed::Ring(s) => (s.ptr, s.nbytes, s.device),
-            Viewed::Lease(l) => (l.ptr, l.nbytes, l.device),
-        }
-    }
-}
-
-/// Device bytes as a 1-D uint8 DLPack tensor. Consumers' tensors keep the view alive.
-#[pyclass(name = "DeviceView", module = "tensorfs.varena", frozen)]
-pub struct PyDeviceView {
-    held: Arc<Viewed>,
-}
-
+const KDL_CPU: i32 = 1;
 const KDL_CUDA: i32 = 2;
 const KDL_UINT: u8 = 1;
 const DLTENSOR: &CStr = c"dltensor";
@@ -765,19 +445,18 @@ struct DLManagedTensor {
     deleter: Option<unsafe extern "C" fn(*mut DLManagedTensor)>,
 }
 
-/// What a consumer's tensor owns: the shape and stride cells, and the view.
+/// What a consumer's tensor owns: the shape and stride cells, and the pin.
 struct Held {
     dims: [i64; 2],
-    _view: Arc<Viewed>,
+    _pin: Arc<Pin>,
 }
 
 unsafe extern "C" fn deleter(t: *mut DLManagedTensor) {
-    if t.is_null() {
-        return;
+    if !t.is_null() {
+        // SAFETY: both boxes were leaked by `__dlpack__` and are freed exactly once, here.
+        let m = unsafe { Box::from_raw(t) };
+        drop(unsafe { Box::from_raw(m.manager_ctx as *mut Held) });
     }
-    // SAFETY: both boxes were leaked by `__dlpack__` and are freed exactly once, here.
-    let m = unsafe { Box::from_raw(t) };
-    drop(unsafe { Box::from_raw(m.manager_ctx as *mut Held) });
 }
 
 /// Runs only for an unconsumed capsule: a consumer renames it `used_dltensor` and owns the
@@ -792,52 +471,26 @@ unsafe extern "C" fn capsule_destructor(capsule: *mut ffi::PyObject) {
 }
 
 #[pymethods]
-impl PyDeviceView {
-    /// True if a region of the weight set was unmapped since the view was made (ring views:
-    /// False, the ring stays mapped for the cursor's life).
-    #[getter]
-    fn stale(&self, py: Python<'_>) -> bool {
-        py.detach(|| match &*self.held {
-            Viewed::Ws(v) => v.stale(),
-            Viewed::Lease(l) => l.stale(),
-            Viewed::Ring(_) => false,
-        })
-    }
-
-    // Mapping is host-synchronous: no producer work is queued for the consumer's stream.
+impl PyPinned {
+    /// `stream`: the consumer's, which also waits for the bytes (the bind stream already does).
     #[pyo3(signature = (*, stream = None, max_version = None, dl_device = None, copy = None))]
-    fn __dlpack__<'p>(
-        &self,
-        py: Python<'p>,
-        stream: Option<Bound<'p, PyAny>>,
-        max_version: Option<Bound<'p, PyAny>>,
-        dl_device: Option<(i32, i32)>,
-        copy: Option<bool>,
-    ) -> PyResult<Bound<'p, PyAny>> {
-        let _ = (stream, max_version);
-        let (ptr, nbytes, device) = self.held.span();
+    fn __dlpack__<'p>(&self, py: Python<'p>, stream: Option<i64>, max_version: Option<Bound<'p, PyAny>>, dl_device: Option<(i32, i32)>, copy: Option<bool>) -> PyResult<Bound<'p, PyAny>> {
+        let _ = max_version;
         if copy == Some(true) {
-            return Err(PyBufferError::new_err("a plane view is never copied"));
+            return Err(PyBufferError::new_err("a bound region is never copied"));
         }
-        if dl_device.is_some_and(|d| d != (KDL_CUDA, device)) {
-            return Err(PyBufferError::new_err(format!("a plane view lives on (2, {device})")));
+        if dl_device.is_some_and(|d| d != self.dl) {
+            return Err(PyBufferError::new_err(format!("a bound region lives on {:?}", self.dl)));
         }
-        let held = Box::into_raw(Box::new(Held { dims: [nbytes as i64, 1], _view: self.held.clone() }));
+        if let (Some(p), Some(s)) = (&self.pin.gpu, stream.filter(|&s| s > 0)) {
+            py.detach(|| p.wait_on(s as u64)).or_raise(py)?;
+        }
+        let held = Box::into_raw(Box::new(Held { dims: [self.nbytes as i64, 1], _pin: self.pin.clone() }));
         // SAFETY: `held` is live until the deleter runs.
         let dims = unsafe { (*held).dims.as_mut_ptr() };
-        let t = Box::into_raw(Box::new(DLManagedTensor {
-            dl_tensor: DLTensor {
-                data: ptr as *mut c_void,
-                device: DLDevice { device_type: KDL_CUDA, device_id: device },
-                ndim: 1,
-                dtype: DLDataType { code: KDL_UINT, bits: 8, lanes: 1 },
-                shape: dims,
-                strides: unsafe { dims.add(1) },
-                byte_offset: 0,
-            },
-            manager_ctx: held as *mut c_void,
-            deleter: Some(deleter),
-        }));
+        let (device, dtype) = (DLDevice { device_type: self.dl.0, device_id: self.dl.1 }, DLDataType { code: KDL_UINT, bits: 8, lanes: 1 });
+        let dl_tensor = DLTensor { data: self.ptr as *mut c_void, device, ndim: 1, dtype, shape: dims, strides: unsafe { dims.add(1) }, byte_offset: 0 };
+        let t = Box::into_raw(Box::new(DLManagedTensor { dl_tensor, manager_ctx: held as *mut c_void, deleter: Some(deleter) }));
         // SAFETY: the capsule takes the leaked tensor; on failure it is freed here.
         unsafe {
             let cap = ffi::PyCapsule_New(t as *mut c_void, DLTENSOR.as_ptr(), Some(capsule_destructor));
@@ -850,62 +503,275 @@ impl PyDeviceView {
     }
 
     fn __dlpack_device__(&self) -> (i32, i32) {
-        (KDL_CUDA, self.held.span().2)
+        self.dl
     }
 }
 
-// ---------------------------------------------------------------- the module
+// ---------------------------------------------------------------- the host tier
 
-macro_rules! add_errors {
-    ($m:expr; $($e:ident),*) => { $($m.add(stringify!($e), $m.py().get_type::<$e>())?;)* };
-}
-
-/// A whole-tier claim on a pinned-tier memfd for an owner without a plane (such as TensorD): a
-/// new descriptor the caller owns; closing it ends the claim.
+/// A whole-tier claim on a host-tier memfd for an owner that maps none of it (TensorD): a new
+/// descriptor the caller owns; closing it ends the claim.
 #[pyfunction]
 fn hold_tier(py: Python<'_>, fd: i32) -> PyResult<i32> {
-    varena::host::hold(fd).map(std::os::fd::IntoRawFd::into_raw_fd).or_raise(py)
+    varena::host::hold(fd).map(IntoRawFd::into_raw_fd).or_raise(py)
 }
 
-/// End a `hold_tier` claim: punches every Ready region no plane claims, closes `hold`, and
+/// Ends a `hold_tier` claim: punches every Ready region nobody claims, closes `hold`, and
 /// returns the bytes punched.
 #[pyfunction]
 fn release_tier(py: Python<'_>, hold: i32) -> PyResult<u64> {
     // SAFETY: the caller hands over the descriptor `hold_tier` returned.
-    let hold = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(hold) };
-    varena::host::release_hold(hold).or_raise(py)
+    varena::host::release_hold(unsafe { OwnedFd::from_raw_fd(hold) }).or_raise(py)
 }
 
-/// A memfd of `nbytes` whose pages are allocated now.
+/// `regions` of a v2 checkpoint in a sealed host layout, filled in this process from its chunk
+/// files (`files`, else the checkpoint's paths): what `register(host_fd=)` adopts. Returns the
+/// memfd (the caller's).
+#[cfg(feature = "store")]
 #[pyfunction]
-#[pyo3(signature = (name, nbytes, threads = 8))]
-fn reserve(py: Python<'_>, name: String, nbytes: u64, threads: usize) -> PyResult<i32> {
-    py.detach(|| varena::host::reserve(&name, nbytes, threads))
-        .map(std::os::fd::IntoRawFd::into_raw_fd)
-        .or_raise(py)
+#[pyo3(signature = (ck, regions, name, threads = 8, files = None))]
+fn seal(py: Python<'_>, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, name: String, threads: usize, files: Option<Vec<(String, u64, i32)>>) -> PyResult<i32> {
+    let (ck, files) = (ck_of(py, &ck)?, granted(py, files)?);
+    py.detach(|| varena::memory::seal(ck, &regions, &name, threads, files)).map(IntoRawFd::into_raw_fd).or_raise(py)
 }
 
-/// `tensorfs._ext.varena`, importable as such (the facade module `tensorfs.varena` re-exports it).
+// ---------------------------------------------------------------- the ledger
+
+#[pyclass(name = "Ledger", module = "tensorfs.varena", frozen)]
+pub struct PyLedger(Ledger);
+
+#[pymethods]
+impl PyLedger {
+    #[staticmethod]
+    fn create(py: Python<'_>, gpu_uuid: &str, capacity: u64) -> PyResult<Self> {
+        Ok(Self(Ledger::create(gpu_uuid, capacity).or_ledger(py)?.0))
+    }
+
+    /// The table behind `fd`, and the eventfd beside it (`freed` signals it).
+    #[staticmethod]
+    #[pyo3(signature = (fd, events_fd = None))]
+    fn adopt(py: Python<'_>, fd: i32, events_fd: Option<i32>) -> PyResult<Self> {
+        // SAFETY: the caller holds `fd` and `events_fd` open for the call.
+        let (fd, events) = unsafe { (BorrowedFd::borrow_raw(fd), events_fd.map(|e| BorrowedFd::borrow_raw(e))) };
+        Ok(Self(Ledger::adopt(fd, events).or_ledger(py)?))
+    }
+
+    #[getter]
+    fn fd(&self) -> i32 {
+        self.0.fd().as_raw_fd()
+    }
+
+    #[getter]
+    fn events_fd(&self) -> Option<i32> {
+        self.0.events().map(|e| e.as_raw_fd())
+    }
+
+    #[getter]
+    fn gpu_uuid(&self) -> String {
+        self.0.gpu_uuid()
+    }
+
+    #[getter]
+    fn capacity(&self) -> u64 {
+        self.0.capacity()
+    }
+
+    /// A row for this process.
+    fn claim(&self, py: Python<'_>) -> PyResult<PyRow> {
+        Ok(PyRow(Arc::new(py.detach(|| self.0.claim(std::process::id())).or_ledger(py)?)))
+    }
+
+    #[pyo3(signature = (need, asker = None))]
+    fn ask(&self, py: Python<'_>, need: u64, asker: Option<u32>) -> PyResult<Vec<PyVictim>> {
+        Ok(victims(py.detach(|| self.0.ask(asker, need)).or_ledger(py)?))
+    }
+
+    fn answered(&self, py: Python<'_>, victim: &PyVictim) -> PyResult<bool> {
+        self.0.answered(&victim.v).or_ledger(py)
+    }
+
+    fn wait(&self, py: Python<'_>, victim: &PyVictim) -> PyResult<()> {
+        py.detach(|| self.0.wait(&victim.v)).or_ledger(py)
+    }
+
+    fn admit(&self, py: Python<'_>, need: u64) -> PyResult<PyAdmit> {
+        Ok(match py.detach(|| self.0.admit(need)).or_ledger(py)? {
+            Admit::Now => PyAdmit { now: true, victims: vec![], short: 0 },
+            Admit::After { victims: v, short } => PyAdmit { now: false, victims: victims(v), short },
+        })
+    }
+
+    fn reap(&self, py: Python<'_>, pid: u32) -> PyResult<u64> {
+        py.detach(|| self.0.reap(pid)).or_ledger(py)
+    }
+
+    fn returned(&self, py: Python<'_>, pid: u32) -> PyResult<()> {
+        self.0.returned(pid).or_ledger(py)
+    }
+
+    fn stalled(&self, py: Python<'_>) -> PyResult<Vec<u32>> {
+        py.detach(|| self.0.stalled()).or_ledger(py)
+    }
+
+    fn snapshot(&self, py: Python<'_>) -> PyResult<Vec<PyRowFacts>> {
+        Ok(py.detach(|| self.0.snapshot()).or_ledger(py)?.into_iter().map(Into::into).collect())
+    }
+
+    /// Bytes freed here: the free generation moves and the eventfd is signalled.
+    fn freed(&self) {
+        self.0.freed()
+    }
+
+    fn freed_gen(&self) -> u64 {
+        self.0.freed_gen()
+    }
+
+    fn wait_freed(&self, py: Python<'_>, seen: u64) -> u64 {
+        py.detach(|| self.0.wait_freed(seen))
+    }
+
+    fn peak(&self, key: &str) -> Option<u64> {
+        self.0.peak(key)
+    }
+
+    fn set_peak(&self, py: Python<'_>, key: &str, nbytes: u64) -> PyResult<()> {
+        self.0.set_peak(key, nbytes).or_ledger(py)
+    }
+
+    fn dispatched(&self, request_id: &str) -> Option<String> {
+        self.0.dispatched(request_id)
+    }
+
+    fn dispatch(&self, py: Python<'_>, request_id: &str, key: &str) -> PyResult<()> {
+        self.0.dispatch(request_id, key).or_ledger(py)
+    }
+
+    fn undispatch(&self, request_id: &str) {
+        self.0.undispatch(request_id)
+    }
+
+    #[pyo3(signature = (package, shape = None, spawn = false))]
+    fn fits(&self, py: Python<'_>, package: &str, shape: Option<&str>, spawn: bool) -> PyResult<bool> {
+        py.detach(|| self.0.fits(package, shape, spawn)).or_ledger(py)
+    }
+}
+
+#[pyclass(name = "Victim", module = "tensorfs.varena", frozen, skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyVictim {
+    #[pyo3(get)]
+    slot: u32,
+    #[pyo3(get)]
+    pid: u32,
+    #[pyo3(get)]
+    bytes: u64,
+    v: Victim,
+}
+
+fn victims(vs: Vec<Victim>) -> Vec<PyVictim> {
+    vs.into_iter().map(|v| PyVictim { slot: v.slot, pid: v.pid, bytes: v.bytes, v }).collect()
+}
+
+#[pyclass(name = "Admit", module = "tensorfs.varena", frozen, get_all)]
+pub struct PyAdmit {
+    now: bool,
+    victims: Vec<PyVictim>,
+    short: u64,
+}
+
+/// `Row.publish`'s keywords and `RowFacts`' properties: the ledger's `Facts`, field for field.
+macro_rules! facts {
+    ($($f:ident),*) => {
+        #[pyclass(name = "Row", module = "tensorfs.varena", frozen)]
+        pub struct PyRow(Arc<Row>);
+
+        #[pymethods]
+        impl PyRow {
+            #[getter]
+            fn id(&self) -> u32 {
+                self.0.id()
+            }
+
+            #[getter]
+            fn pid(&self) -> u32 {
+                self.0.pid()
+            }
+
+            #[pyo3(signature = (*, $($f = 0),*))]
+            #[allow(clippy::too_many_arguments)]
+            fn publish(&self, $($f: u64),*) {
+                self.0.publish(&Facts { $($f),* })
+            }
+
+            fn want(&self) -> u64 {
+                self.0.want()
+            }
+
+            fn wait_want(&self, py: Python<'_>) -> u64 {
+                py.detach(|| self.0.wait_want())
+            }
+
+            fn ack(&self, freed: u64) {
+                self.0.ack(freed)
+            }
+
+            /// Its requests running now: (request id, remaining measured peak; -1 never measured).
+            fn running(&self, py: Python<'_>, requests: Vec<(String, i64)>) -> PyResult<()> {
+                self.0.running(&requests).or_ledger(py)
+            }
+        }
+
+        #[pyclass(name = "RowFacts", module = "tensorfs.varena", frozen, get_all)]
+        pub struct PyRowFacts {
+            slot: u32,
+            gen: u64,
+            pid: u32,
+            state: &'static str,
+            $($f: u64,)*
+            want: u64,
+            acked: u64,
+            progress: u64,
+            running: Vec<(String, i64)>,
+            held: u64,
+            unevictable: u64,
+            reclaimable: u64,
+        }
+
+        impl From<RowFacts> for PyRowFacts {
+            fn from(r: RowFacts) -> Self {
+                let state = match r.state {
+                    State::Live => "live",
+                    State::Dead => "dead",
+                    State::Reaping => "reaping",
+                };
+                let (held, unevictable, reclaimable) = (r.held(), r.unevictable(), r.reclaimable());
+                let (slot, gen, pid, want, acked, progress) = (r.slot, r.gen, r.pid, r.want, r.acked, r.progress);
+                PyRowFacts { slot, gen, pid, state, $($f: r.facts.$f,)* want, acked, progress, running: r.running, held, unevictable, reclaimable }
+            }
+        }
+    };
+}
+
+facts!(context, resident, cold, kept, pinned, torch_reserved, torch_allocated, cache, idle, active_peak, last_use, waiting);
+
+// ---------------------------------------------------------------- the module
+
+/// `tensorfs._ext.varena`, importable as such (the package `tensorfs.varena` re-exports it).
 pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
     let m = PyModule::new(py, "varena")?;
-    m.add_class::<PyPlane>()?;
+    macro_rules! add {
+        ($($c:ty),*; $($f:ident),*; $($e:ident),*) => {
+            $(m.add_class::<$c>()?;)*
+            $(m.add_function(wrap_pyfunction!($f, &m)?)?;)*
+            $(m.add(stringify!($e), py.get_type::<$e>())?;)*
+        };
+    }
+    add!(PyGpu, PyHost, PyWeightSet, PyPinned, PyPart, PyCounters, PySetStats, PyGpuStats, PyCopy, PyLedger, PyRow, PyVictim, PyAdmit, PyRowFacts;
+        copies, hold_tier, release_tier;
+        VarenaError, DeviceFull, CudaError, CudaUnavailable, Invalid, IoError, Closed, Unsupported, LedgerError);
     #[cfg(feature = "store")]
-    m.add_class::<PySource>()?;
-    m.add_class::<PyWeightSet>()?;
-    m.add_class::<PyTicket>()?;
-    m.add_class::<PyPlaneLease>()?;
-    m.add_class::<PyCursor>()?;
-    m.add_class::<PyDeviceView>()?;
-    m.add_function(wrap_pyfunction!(hold_tier, &m)?)?;
-    m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
-    m.add_function(wrap_pyfunction!(reserve, &m)?)?;
-    // `register_sealed` adopts a layout its machine is still filling (waits per region).
-    m.add("SEALED_WHILE_FILLING", true)?;
-    // `register_sealed(files=)`: regions the machine did not stage copy from object files.
-    m.add("SEALED_HOLES", true)?;
-    add_errors!(m; PlaneError, BudgetExceeded, Shortfall, BelowFloor, LeaseViolation, Poisoned, CudaError,
-        CudaUnavailable, Invalid, IoError, Closed, Unsupported);
+    add!(; seal;);
     parent.add_submodule(&m)?;
     py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.varena", &m)
 }

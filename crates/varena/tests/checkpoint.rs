@@ -12,7 +12,7 @@ use tensorfs_core::format::Dtype;
 use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::store2::{Checkpoint, Store};
 use tensorfs_core::writer::{Data, Source};
-use varena::checkpoint::Ck;
+use tensorfs_core::io::view::View;
 use varena::{cuda, memory, Error, Gpu, Host, HostSet};
 
 const MIB: usize = 1 << 20;
@@ -126,7 +126,7 @@ fn a_v2_checkpoint_binds_from_the_chunk_files_a_grant_hands_over_and_no_others()
 fn a_header_parsed_alone_binds_and_seals_from_its_grant_only() {
     let fx = Fixture::new("parsed");
     let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
-    let parsed = Ck { header: fx.ck.header(), stored: None };
+    let parsed = View::parsed(fx.ck.header().clone());
     check(&Host.register("parsed", parsed, &rs, None, Some(granted(&fx.ck))).unwrap());
     assert!(matches!(Host.register("bare", parsed, &rs, None, None), Err(Error::Invalid(_))), "no store, no grant: nothing to read");
     let fd = memory::seal(parsed, &rs, "parsed", 2, Some(granted(&fx.ck))).unwrap();

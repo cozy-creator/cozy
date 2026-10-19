@@ -861,6 +861,18 @@ impl PyCheckpoint {
         if closed { Err(invalid(py, "the checkpoint is closed")) } else { Ok(()) }
     }
 
+    pub(crate) fn native_view(&self, py: Python<'_>) -> PyResult<tensorfs_core::io::view::View> {
+        let (closed, access) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (state.closed, state.access.clone())
+        };
+        if closed { return Err(invalid(py, "the checkpoint is closed")); }
+        Ok(match access {
+            Some(access) => tensorfs_core::io::view::View::from(&access.checkpoint),
+            None => tensorfs_core::io::view::View::parsed(self.header.clone()),
+        })
+    }
+
     pub(crate) fn stored(&self, py: Python<'_>) -> PyResult<Checkpoint> {
         Ok(self.access(py)?.checkpoint.clone())
     }
