@@ -37,6 +37,15 @@ assert published.id != ck.id and published.tree is not None
 repo = tensorfs.Endpoint(request["endpoint"], token=provider, ca_der=ca).repo(request["model"])[0]
 assert any(tree["sha256"] == published.tree.removeprefix("sha256:") for tree in repo["checkpoints"])
 
+try:
+    tensorfs.Endpoint(request["endpoint"], token=provider, ca_der=ca).update_repo(request["model"], lambda old: {
+        **old, "releases": [*old["releases"], {"version": "forbidden", "tree": {
+            "sha256": published.tree_ref[0], "length": published.tree_ref[1]}}]})
+except tensorfs.DeniedError as error:
+    assert error.code == "denied", "capability_exceeded policy was classified as a revision conflict"
+else:
+    raise AssertionError("a run capability published a release")
+
 denied = tensorfs.Writer(repo_id=request["other"], variant="int8", **options)
 denied.component("model", cls="", config={}).put("w", b"denied", dtype="U8", shape=[6])
 try:

@@ -8,12 +8,12 @@
 Arrays cross to NumPy, PyTorch, JAX or CuPy through DLPack. TensorFS never imports a framework.
 """
 
-from . import errors
 from ._ext import (
     Array,
     Checkpoint,
     Closure,
     Component,
+    ConflictError,
     DecodeError,
     DeniedError,
     DiskFullError,
@@ -44,6 +44,7 @@ __all__ = [
     "Checkpoint",
     "Closure",
     "Component",
+    "ConflictError",
     "ComponentWriter",
     "DecodeError",
     "DeniedError",
@@ -66,7 +67,6 @@ __all__ = [
     "UnsupportedError",
     "Writer",
     "__version__",
-    "errors",
     "parse_header",
     "plan",
     "regions",

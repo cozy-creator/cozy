@@ -55,7 +55,7 @@ with TemporaryDirectory() as temp:
     assert metadata.missing(["model"]), "rendering a component path fetched its tensors"
     only = tensorfs.snapshot_download("acme/example", revision="1", variant="f32", components=["model"], endpoint=origin, cache_dir=remote_cache)
     assert not (Path(only) / "model.f16.cozytensors").exists()
-    selected = tensorfs.open(only)
+    selected = tensorfs.open(only, cache_dir=remote_cache)
     assert selected.missing(["model"]) == []
     assert selected.missing(["optimizer"]), "a model-only snapshot fetched the optimizer"
     assert np.array_equal(np.from_dlpack(selected.components["model"].tensors.read("weight")), values)

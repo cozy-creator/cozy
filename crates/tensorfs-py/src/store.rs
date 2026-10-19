@@ -7,10 +7,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
-use pyo3::{create_exception, ffi};
+use pyo3::ffi;
 use tensorfs_core::client::{self, ImportOptions, Named, PullFrom};
 use tensorfs_core::export;
 use tensorfs_core::fetch::{self, Client as FetchClient, Endpoint, Fetcher, ObjectStore, Origin, Want};
@@ -19,48 +18,7 @@ use tensorfs_core::format::{Body, Config, ConfigValue, Dtype, Encoding, Header, 
 use tensorfs_core::store2::{Checkpoint, Store};
 use tensorfs_core::writer::{Data, PartData, Source, Writer};
 
-create_exception!(
-    tensorfs,
-    Error,
-    PyException,
-    "A TensorFS error: `.code` names its family, `.detail` its cause."
-);
-create_exception!(tensorfs, InvalidError, Error);
-create_exception!(tensorfs, FormatError, Error);
-create_exception!(tensorfs, NotFoundError, Error);
-create_exception!(tensorfs, IntegrityError, Error);
-create_exception!(tensorfs, UnknownSchemeError, Error);
-create_exception!(tensorfs, DecodeError, Error);
-create_exception!(tensorfs, StorageError, Error);
-create_exception!(tensorfs, DiskFullError, Error);
-create_exception!(tensorfs, NetworkError, Error);
-create_exception!(tensorfs, DeniedError, Error);
-create_exception!(tensorfs, UnsupportedError, Error);
-
-fn family(py: Python<'_>, kind: Kind) -> Bound<'_, pyo3::types::PyType> {
-    match kind {
-        Kind::Invalid => py.get_type::<InvalidError>(),
-        Kind::Format => py.get_type::<FormatError>(),
-        Kind::NotFound => py.get_type::<NotFoundError>(),
-        Kind::Integrity => py.get_type::<IntegrityError>(),
-        Kind::UnknownScheme => py.get_type::<UnknownSchemeError>(),
-        Kind::Decode => py.get_type::<DecodeError>(),
-        Kind::Io => py.get_type::<StorageError>(),
-        Kind::Full => py.get_type::<DiskFullError>(),
-        Kind::Network => py.get_type::<NetworkError>(),
-        Kind::Denied => py.get_type::<DeniedError>(),
-        Kind::Unsupported => py.get_type::<UnsupportedError>(),
-    }
-}
-
-/// The one conversion: a failure becomes its family's exception, with `.code` and `.detail`.
-pub(crate) fn raise(py: Python<'_>, f: Failure) -> PyErr {
-    let err = PyErr::from_type(family(py, f.kind), f.to_string());
-    let value = err.value(py);
-    let _ = value.setattr("code", f.kind.code());
-    let _ = value.setattr("detail", f.detail);
-    err
-}
+pub(crate) use crate::errors::raise;
 
 fn invalid(py: Python<'_>, detail: impl Into<String>) -> PyErr {
     raise(
@@ -1582,7 +1540,6 @@ impl PyComponentWriter {
 // ---------------------------------------------------------------- the module
 
 pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    let py = m.py();
     m.add_class::<PyStore>()?;
     m.add_class::<PyCheckpoint>()?;
     m.add_class::<PyPipeline>()?;
@@ -1594,11 +1551,5 @@ pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyArray>()?;
     m.add_class::<PyWriter>()?;
     m.add_function(wrap_pyfunction!(regions, m)?)?;
-    m.add("Error", py.get_type::<Error>())?;
-    for kind in Kind::ALL {
-        let ty = family(py, kind);
-        ty.setattr("code", kind.code())?;
-        m.add(ty.name()?, ty)?;
-    }
     Ok(())
 }
