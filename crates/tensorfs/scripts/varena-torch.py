@@ -14,27 +14,31 @@ tensors, bit for bit:
 - a cache's hold keeps every page for a CUDA graph; `fill` runs once per page-in and again
   when its `prepare()` changes; `bind` makes the module's tensors; `Exhausted` leaves the
   memory usable;
-- TensorD's targets: a non-target's cold pages go before a target's; the row carries the facts.
+- an idle (RAM-level) model's cold pages go before a warm one's; a request short of room waits
+  for another's bytes; `load` seals the host tier for deposit; the row carries the facts.
 
     flock <locks>/gpu.lock python scripts/varena-torch.py [workdir] [--blocks N] [--dim D]
 Runs with any python that has torch (CUDA) and `PYTHONPATH=<worktree>/python`.
 """
 
 import argparse
+import os
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import torch
 from torch import nn
 
 import tensorfs
-from tensorfs.varena import Ledger, Target
+from tensorfs.varena import Ledger
 from tensorfs.varena.torch import (
     Declared,
     Exhausted,
     LedgerGrant,
+    Level,
     Memory,
     Placeholder,
     WeightGrant,
@@ -113,10 +117,14 @@ def main() -> int:
     table = Ledger.create(
         str(torch.cuda.get_device_properties(0).uuid), torch.cuda.mem_get_info(0)[1]
     )
-    table.set_targets([Target(f"{MANIFEST}/net", "gpu", 5)])
-    mem = Memory.open(dev, LedgerGrant(0, table.fd))
+    mem = Memory.open(dev, LedgerGrant(0, table.fd, table.events))
     net = meta(a.dim, a.blocks)
-    model = mem.register(net, WeightGrant(ck, "net", MANIFEST))
+    net._varena = Declared(WeightGrant(ck, "net", MANIFEST))
+    model = mem.load(net)
+    sealed = mem.sealed()
+    check("load seals the host tier for deposit", [m for m, _ in sealed] == [model], str(sealed))
+    for _, fd in sealed:
+        os.close(fd)
     ref = reference(tensors, a.dim, a.blocks, dev)
     x = torch.randn(a.batch, a.dim, generator=torch.Generator().manual_seed(1)).bfloat16().to(dev)
     with torch.no_grad():
@@ -145,7 +153,7 @@ def main() -> int:
         str(steps[-1]),
     )
     check("two passes in a request make it repeat", model.repeats == 2, str(model.repeats))
-    check("its target's priority is read", stats(model.name).priority == 5, str(stats(model.name)))
+    check("a load is warm", stats(model.name).level == "gpu", str(stats(model.name)))
     check("a request leaves nothing behind", r.stats.leftover == ((0, 0),), str(r.stats.leftover))
 
     # placeholders outside the forward; an op on one binds its block for that op
@@ -240,7 +248,7 @@ def main() -> int:
     check("no forward is in flight after them", stats(model.name).flight == 0)
 
     # a cache's hold keeps every page at its address for a CUDA graph
-    pool = mem.register_cache("graphs:net", 0, lambda n: 0)
+    pool = mem.cache("graphs:net", lambda n: 0)
     hold = pool.hold(model)
     graph, static = torch.cuda.CUDAGraph(), x.clone()
     with torch.no_grad():
@@ -278,8 +286,10 @@ def main() -> int:
 
     fill = Bias()
     net2 = meta(a.dim, a.blocks)
-    net2._varena = Declared(fill=fill, bind=bind)
-    model2 = mem.register(net2, WeightGrant(ck, "net", "sha256:" + "1" * 64))
+    net2._varena = Declared(WeightGrant(ck, "net", "sha256:" + "1" * 64), fill=fill, bind=bind)
+    model2 = mem.load(net2)
+    for _, fd in mem.sealed():
+        os.close(fd)
 
     def biased(add: float) -> torch.Tensor:
         changed = dict(tensors, **{"blocks.1.lin.bias": tensors["blocks.1.lin.bias"] + add})
@@ -303,9 +313,9 @@ def main() -> int:
     check("a resident page is not filled again", fill.fills == fills, str(fill.fills))
     check("a new prepare() refills the pages", torch.equal(f5, want2))
 
-    # rung 2 takes a non-target's cold pages before a target's
+    # rung 2 takes an idle model's cold pages before a warm one's
     torch.cuda.synchronize()
-    table.set_targets([Target(f"{MANIFEST}/net", "gpu", 5)])
+    mem.load(net2, Level.RAM)
     with torch.no_grad(), mem.request("cold"):
         net(x), net2(x)
     before = stats(model.name).resident, stats(model2.name).resident
@@ -315,10 +325,37 @@ def main() -> int:
         after = stats(model.name).resident, stats(model2.name).resident
         del junk
     check(
-        "the non-target's cold pages go first",
+        "the idle model's cold pages go first",
         after[1] < before[1] and after[0] == before[0],
         f"{before} -> {after}",
     )
+
+    # a request short of room waits for another's bytes, without a timer
+    holding, done = threading.Event(), threading.Event()
+    waited: list[int] = []
+
+    def holder() -> None:
+        with mem.request("holds"):
+            junk = torch.empty(torch.cuda.mem_get_info(0)[0] - block, dtype=torch.uint8, device=dev)
+            holding.set()
+            time.sleep(2)  # the waiter runs out of room meanwhile
+            del junk
+
+    def waiter() -> None:
+        holding.wait()
+        with mem.request("waits") as r:
+            junk = torch.empty(4 * block, dtype=torch.uint8, device=dev)
+            del junk
+        waited.append(r.stats.retries)
+        done.set()
+
+    model.evict(), model2.evict()  # nothing cold is left to free: only the holder's bytes
+    pair = [threading.Thread(target=holder), threading.Thread(target=waiter)]
+    for t in pair:
+        t.start()
+    for t in pair:
+        t.join()
+    check("a request short of room waits for another's, then runs", waited and waited[0] >= 1)
 
     # Exhausted leaves the memory usable
     try:
