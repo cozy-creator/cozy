@@ -34,6 +34,25 @@ pub struct Objects {
     engine: Arc<Engine>,
     /// Uploads under way, by part file.
     uploads: Mutex<HashMap<PathBuf, Weak<Upload>>>,
+    #[cfg(test)]
+    pause: Pause,
+}
+
+/// Test seams: each runs once at its point, and `waiting` counts callers queued for custody.
+#[cfg(test)]
+#[derive(Default)]
+struct Pause {
+    stored_checked: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    settling: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    waiting: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+fn pause_at(seam: &Mutex<Option<Box<dyn FnOnce() + Send>>>) {
+    let run = seam.lock().unwrap().take();
+    if let Some(run) = run {
+        run();
+    }
 }
 
 /// Why a write was refused, as the API's typed reason.
@@ -149,12 +168,19 @@ impl Objects {
             store,
             engine,
             uploads: Mutex::default(),
+            #[cfg(test)]
+            pause: Pause::default(),
         })
     }
 
     /// Excludes root release while a Write or an acceptance takes references.
     pub(crate) fn guard(&self) -> MutexGuard<'_, ()> {
-        self.engine.object_custody.lock().unwrap()
+        #[cfg(test)]
+        self.pause.waiting.fetch_add(1, Ordering::AcqRel);
+        let custody = self.engine.object_custody.lock().unwrap();
+        #[cfg(test)]
+        self.pause.waiting.fetch_sub(1, Ordering::AcqRel);
+        custody
     }
     /// Pins `objects` in the store, last used now; called with `guard` held.
     pub(crate) fn retain(&self, objects: &[ObjectRef]) -> io::Result<()> {
@@ -297,9 +323,9 @@ impl Objects {
         dir.join(format!("{hex}.part"))
     }
 
-    /// The stored object this signer wrote, its roots renewed so a run naming it soon finds it.
+    /// The stored object this signer wrote, its roots renewed so a run naming it soon finds it;
+    /// called with `guard` held.
     fn renew(&self, actor: &str, digest: &str) -> io::Result<Option<u64>> {
-        let _custody = self.guard();
         let Some((_, length)) = self.path(actor, digest)? else {
             return Ok(None);
         };
@@ -317,11 +343,15 @@ impl Objects {
     /// always means stored; bytes that differ from the digest are dropped, and held no more.
     pub fn held(&self, actor: &str, digest: &str) -> Result<Ranges, Refused> {
         let hex = valid(digest)?;
-        if let Some(length) = self.renew(actor, digest)? {
-            return Ok(whole(length));
-        }
         let part = self.part(actor, &hex);
-        let upload = self.uploads.lock().unwrap().get(&part).and_then(Weak::upgrade);
+        // Under custody a settle of this part has not begun or has stored the object (`upload`).
+        let upload = {
+            let _custody = self.guard();
+            if let Some(length) = self.renew(actor, digest)? {
+                return Ok(whole(length));
+            }
+            self.uploads.lock().unwrap().get(&part).and_then(Weak::upgrade)
+        };
         if let Some(upload) = upload {
             return match upload.held() {
                 held if held != whole(upload.object.length) => Ok(held),
@@ -338,9 +368,15 @@ impl Objects {
     /// resumed from the ranges an earlier one synced. None once the object is stored.
     pub fn upload(&self, actor: &str, digest: &str, length: u64) -> Result<Option<Arc<Upload>>, Refused> {
         let hex = valid(digest)?;
+        // Custody from the stored check through the part's open: a settle takes the part under
+        // custody and keeps it until the object is stored and bound, so the part is never
+        // reopened (and truncated) while a settle reads it.
+        let _custody = self.guard();
         if self.renew(actor, digest)? == Some(length) {
             return Ok(None);
         }
+        #[cfg(test)]
+        pause_at(&self.pause.stored_checked);
         let part = self.part(actor, &hex);
         let mut uploads = self.uploads.lock().unwrap();
         uploads.retain(|_, upload| upload.strong_count() > 0);
@@ -400,6 +436,8 @@ impl Objects {
         let _custody = self.guard();
         upload.ended.store(true, Ordering::Release);
         self.uploads.lock().unwrap().remove(&upload.part);
+        #[cfg(test)]
+        pause_at(&self.pause.settling);
         let stored = File::open(&upload.part).map_err(Refused::from).and_then(|part| {
             self.store.put(part, Some(&upload.object)).map_err(|e| {
                 let code = match e {
@@ -457,6 +495,58 @@ mod tests {
             crate::service::Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
         let store = storage::open(&root.join("tensorfs")).unwrap();
         Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap()
+    }
+
+    /// An upload of an object whose whole part is being settled never truncates that part: it
+    /// joins the upload or finds the object stored. The seams order the two calls exactly as
+    /// run_local raced them (an upload's stored check, then the settle taking the part, then
+    /// the rest of the upload), and the custody between them decides what happens.
+    #[test]
+    fn an_upload_never_truncates_a_part_being_settled() {
+        use std::sync::mpsc::channel;
+        let root = std::env::temp_dir().join(format!("cm-objects-{}", uuid::Uuid::new_v4()));
+        let objects = objects(&root);
+        let bytes: Vec<u8> = (0..444u32).map(|i| (i % 251) as u8 + 1).collect();
+        let digest = format!("sha256:{}", sha256::hex_digest(&bytes));
+        let length = bytes.len() as u64;
+        let first = objects.upload("alice", &digest, length).unwrap().unwrap();
+        first.write_at(0, &bytes).unwrap();
+
+        let (checked, at_checked) = channel();
+        let (resume_upload, upload_resumes) = channel::<()>();
+        *objects.pause.stored_checked.lock().unwrap() = Some(Box::new(move || {
+            checked.send(()).unwrap();
+            upload_resumes.recv().unwrap();
+        }));
+        let (settling, at_settling) = channel();
+        let (resume_settle, settle_resumes) = channel::<()>();
+        *objects.pause.settling.lock().unwrap() = Some(Box::new(move || {
+            settling.send(()).unwrap();
+            settle_resumes.recv().unwrap();
+        }));
+        std::thread::scope(|scope| {
+            // A second write of the same input passes its stored check: not stored yet.
+            let second = scope.spawn(|| objects.upload("alice", &digest, length).map(|u| u.map(|u| u.object.clone())));
+            at_checked.recv().unwrap();
+            // The settle takes the whole part, or waits for custody the upload holds.
+            let settled = scope.spawn(|| objects.settle(&first));
+            let mut paused = false;
+            while !paused && objects.pause.waiting.load(Ordering::Acquire) == 0 {
+                paused = at_settling.try_recv().is_ok();
+                std::thread::yield_now();
+            }
+            resume_upload.send(()).unwrap();
+            assert!(second.join().unwrap().is_ok());
+            if !paused {
+                at_settling.recv().unwrap();
+            }
+            resume_settle.send(()).unwrap();
+            let settled = settled.join().unwrap().map_err(|r| (r.code, r.message));
+            assert_eq!(settled, Ok(whole(length)), "the settle read the part another upload truncated");
+        });
+        let (path, held) = objects.path("alice", &digest).unwrap().unwrap();
+        assert_eq!((fs::read(path).unwrap(), held), (bytes, length));
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Ranges land in any order, side by side, survive the machine's restart, verify once whole,
