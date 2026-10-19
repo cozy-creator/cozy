@@ -183,7 +183,7 @@ mod imp {
         }
 
         #[pyo3(signature = (*, context = 0, resident = 0, cold = 0, kept = 0, pinned = 0, torch_reserved = 0,
-            torch_allocated = 0, cache = 0, idle = 0, active_peak = 0, last_use = 0))]
+            torch_allocated = 0, cache = 0, idle = 0, active_peak = 0, last_use = 0, waiting = 0))]
         #[allow(clippy::too_many_arguments)]
         fn publish(
             &self,
@@ -198,6 +198,7 @@ mod imp {
             idle: u64,
             active_peak: u64,
             last_use: u64,
+            waiting: u64,
         ) {
             self.0.publish(&Facts {
                 context,
@@ -211,6 +212,7 @@ mod imp {
                 idle,
                 active_peak,
                 last_use,
+                waiting,
             });
         }
 
@@ -288,6 +290,7 @@ mod imp {
         idle: u64,
         active_peak: u64,
         last_use: u64,
+        waiting: u64,
         want: u64,
         acked: u64,
         progress: u64,
@@ -320,6 +323,7 @@ mod imp {
                 idle: f.idle,
                 active_peak: f.active_peak,
                 last_use: f.last_use,
+                waiting: f.waiting,
                 want: r.want,
                 acked: r.acked,
                 progress: r.progress,

@@ -28,7 +28,7 @@ pub const ROWS: u32 = 64;
 const HEADER: usize = 256;
 const ROW: usize = 1536;
 const UUID: usize = 64;
-const FACTS: usize = 11;
+const FACTS: usize = 12;
 
 const FREE: u64 = 0;
 const LIVE: u64 = 1;
@@ -193,6 +193,9 @@ facts! {
     /// The measured torch-allocated peak of the active requests; 0 when idle.
     active_peak,
     last_use,
+    /// Its requests waiting for room now: a request waits only while another row runs more
+    /// than it waits.
+    waiting,
 }
 
 fn sum(xs: &[u64]) -> u64 {

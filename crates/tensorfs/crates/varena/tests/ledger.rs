@@ -82,7 +82,7 @@ impl Proc {
 fn publish(f: &Facts) -> String {
     let w = [
         f.context, f.resident, f.cold, f.kept, f.pinned, f.torch_reserved, f.torch_allocated, f.cache, f.idle,
-        f.active_peak, f.last_use,
+        f.active_peak, f.last_use, f.waiting,
     ];
     format!("publish {}", w.map(|n| n.to_string()).join(" "))
 }
@@ -109,6 +109,7 @@ fn counted(k: u64) -> Facts {
         idle: k,
         active_peak: k,
         last_use: k,
+        waiting: k,
     }
 }
 
@@ -137,10 +138,10 @@ fn child() {
                 out
             }
             "publish" => {
-                let [context, resident, cold, kept, pinned, torch_reserved, torch_allocated, cache, idle, active_peak, last_use] =
+                let [context, resident, cold, kept, pinned, torch_reserved, torch_allocated, cache, idle, active_peak, last_use, waiting] =
                     w[..].try_into().unwrap();
                 facts = Facts {
-                    context, resident, cold, kept, pinned, torch_reserved, torch_allocated, cache, idle, active_peak, last_use,
+                    context, resident, cold, kept, pinned, torch_reserved, torch_allocated, cache, idle, active_peak, last_use, waiting,
                 };
                 row.as_ref().unwrap().publish(&facts);
                 vec![]
@@ -287,6 +288,7 @@ fn two_processes_publish_and_a_third_reads_exact_snapshots() {
         idle: 64 * MIB,
         active_peak: 0,
         last_use: 100,
+        waiting: 0,
     };
     let fb = Facts {
         context: 450 * MIB,
@@ -300,6 +302,7 @@ fn two_processes_publish_and_a_third_reads_exact_snapshots() {
         idle: 0,
         active_peak: 3 * GIB,
         last_use: 200,
+        waiting: 1,
     };
     let (mut a, mut b) = (Proc::spawn(&ledger), Proc::spawn(&ledger));
     let (ca, cb) = (a.call("claim"), b.call("claim"));
