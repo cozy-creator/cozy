@@ -2,6 +2,9 @@ set +e
 declare -A r
 run() { local name=$1; shift; echo "=== $name: $*"; "$@"; r[$name]=$?; echo "=== $name exit ${r[$name]}"; }
 run smoke "$TENSORFS_TEST_PYTHON" -c "import tensorfs, tensorfs.varena as v; print(tensorfs.__version__, tensorfs.Checkpoint.parse, tensorfs.regions, v.seal, v.Ledger.freed_gen, v.Ledger.dispatched, v.Row.running)"
+run torch_cpu "$TENSORFS_TEST_PYTHON" -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+run glue_limit "$TENSORFS_TEST_PYTHON" crates/tensorfs/scripts/varena-limit.py
+run glue_host "$TENSORFS_TEST_PYTHON" b2-host-smoke.py
 run varena_ck cargo test -p varena --test checkpoint
 run varena_ledger cargo test -p varena --test ledger
 run tensord_ledger cargo test -p tensord --test gpu_ledger
