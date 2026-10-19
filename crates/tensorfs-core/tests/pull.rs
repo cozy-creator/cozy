@@ -10,7 +10,7 @@ use std::time::Duration;
 use pull_support::*;
 use tensorfs_core::err::Code;
 use tensorfs_core::fetch::{
-    Config, Fetcher, HttpOrigin, ObjectStore, Origin, Progress, VolumeOrigin, Want,
+    Config, Fetcher, Endpoint, ObjectStore, Origin, Progress, VolumeOrigin, Want,
 };
 use tensorfs_core::store2::Store;
 
@@ -33,7 +33,7 @@ fn fetcher(store: &Arc<Store>, volume: Option<VolumeOrigin>) -> Fetcher {
 }
 
 fn http(base: &str) -> Arc<dyn Origin> {
-    Arc::new(HttpOrigin::new(&client(), base).unwrap())
+    Arc::new(Endpoint::new(&client(), base, None).unwrap().anonymous())
 }
 
 fn all() -> Want<'static> {
@@ -287,7 +287,7 @@ async fn https_trusts_a_private_ca_only_when_named() {
         None,
         config(),
     );
-    let origin: Arc<dyn Origin> = Arc::new(HttpOrigin::new(&trusting, &server.base).unwrap());
+    let origin: Arc<dyn Origin> = Arc::new(Endpoint::new(&trusting, &server.base, None).unwrap().anonymous());
     let pulled = fetcher
         .pull(&origin, "acme/tls", None, Some("int8"), &all())
         .await
@@ -296,7 +296,7 @@ async fn https_trusts_a_private_ca_only_when_named() {
     assert_eq!(blobs(&root), blobs(&origin_dir));
 
     let webpki = tensorfs_core::fetch::Client::new(policy);
-    let untrusting: Arc<dyn Origin> = Arc::new(HttpOrigin::new(&webpki, &server.base).unwrap());
+    let untrusting: Arc<dyn Origin> = Arc::new(Endpoint::new(&webpki, &server.base, None).unwrap().anonymous());
     let refused = fetcher
         .pull(&untrusting, "acme/tls", None, Some("int8"), &all())
         .await
@@ -324,9 +324,8 @@ async fn a_private_origin_writes_nothing_to_the_volume() {
         }),
     );
     let origin: Arc<dyn Origin> = Arc::new(
-        HttpOrigin::new(&client(), &server.base)
-            .unwrap()
-            .bearer("s3cret"),
+        Endpoint::new(&client(), &server.base, Some(tensorfs_core::fetch::bearer("s3cret")))
+            .unwrap(),
     );
     let (volume_dir, root) = (temporary("private-volume"), temporary("private-store"));
     let fetcher = fetcher(

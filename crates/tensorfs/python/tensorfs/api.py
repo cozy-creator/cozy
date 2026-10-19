@@ -71,6 +71,17 @@ def export(src, dir, *, format="safetensors", dequantize=None) -> list[str]:
     return _store().export(src, dir, dequantize=dequantize)
 
 
+class Endpoint:
+    def __init__(self, url, token=None, *, ca_der=None, cache_dir=None):
+        self._native = _ext.Endpoint(str(_cache(cache_dir)) if url == "local" else url, token, ca_der=ca_der)
+
+    def repo(self, repo_id):
+        return self._native.repo(repo_id)
+
+    def update_repo(self, repo_id, change):
+        return self._native.update_repo(repo_id, change)
+
+
 class ComponentWriter:
     def __init__(self, native):
         self._native = native

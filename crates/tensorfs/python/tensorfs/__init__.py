@@ -10,19 +10,17 @@ Arrays cross to NumPy, PyTorch, JAX or CuPy through DLPack. TensorFS never impor
 
 from collections.abc import Mapping
 
-from . import errors
 from ._ext import (
     Array,
     Checkpoint,
     Closure,
     Component,
-    ComponentWriter,
+    ConflictError,
     DecodeError,
     DeniedError,
     DiskFullError,
     DPoP,
     Encoded,
-    Endpoint,
     Encoding,
     Error,
     FormatError,
@@ -38,13 +36,12 @@ from ._ext import (
     Tensors,
     UnknownSchemeError,
     UnsupportedError,
-    Writer,
     __version__,
     parse_header,
     plan,
     regions,
 )
-from .api import ComponentWriter, Writer, configure, convert, export, hub_download, open, resolve_source, snapshot_download, upload_folder
+from .api import ComponentWriter, Endpoint, Writer, configure, convert, export, hub_download, open, resolve_source, snapshot_download, upload_folder
 
 Mapping.register(Tensors)
 
@@ -53,6 +50,7 @@ __all__ = [
     "Checkpoint",
     "Closure",
     "Component",
+    "ConflictError",
     "ComponentWriter",
     "DecodeError",
     "DeniedError",
@@ -77,7 +75,6 @@ __all__ = [
     "UnsupportedError",
     "Writer",
     "__version__",
-    "errors",
     "parse_header",
     "plan",
     "regions",
