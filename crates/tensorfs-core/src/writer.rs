@@ -495,9 +495,10 @@ impl Writer {
                 ObjectRef::of(bytes)
             }
             Dest::Endpoint { store, stream, .. } => {
-                let _acquisition = retention::acquire(store)?;
+                let acquisition = retention::acquire(store)?;
                 let object = store.put_bytes(bytes)?;
                 if let Some(hold) = &self.retention { hold.extend([object.clone()])?; }
+                drop(acquisition);
                 stream.put_stored(store, &object).map_err(sent)?;
                 object
             }
@@ -1302,11 +1303,12 @@ impl Dest {
 
     /// Copies `object` from `from` unless it is here already.
     fn copy_in(&self, work: &Path, from: &Checkpoint, object: &ObjectRef, hold: Option<&Arc<Retention>>) -> Result<()> {
-        let _acquisition = self.store().map(retention::acquire).transpose()?;
+        let acquisition = self.store().map(retention::acquire).transpose()?;
         if self.has(object)? {
             if let Some(hold) = hold { hold.extend([object.clone()])?; }
             return Ok(());
         }
+        drop(acquisition);
         let mut src = from.object(object)?;
         let mut admit = self.admit(work, hold)?;
         io::copy(&mut src, &mut admit).map_err(fail("copy", work))?;
