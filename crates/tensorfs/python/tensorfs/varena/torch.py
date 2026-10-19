@@ -455,10 +455,15 @@ class Memory:
         self.memo = cuts.Memo()
         cuts.serve(self.memo, self)
         self.row: tuple[Ledger, Row] | None = None
+        #: a ledger capacity below the card (`gpu_memory_limit`, §5.6), and the card's total
+        self.limit: int | None = None
+        self.total = 0
         if ledger is not None and isinstance(self.core, Gpu):
             table = Ledger.adopt(ledger.fd, ledger.events)
             self.row = (table, table.claim())
             self.core.serve(self.row[1])  # other processes' asks, answered in Rust
+            self.total = int(torch.cuda.mem_get_info(self.gpu)[1])
+            self.limit = table.capacity if table.capacity < self.total else None
 
     @classmethod
     def open(
@@ -649,6 +654,9 @@ class Memory:
             if fresh and model.fill is not None:
                 model.fill(block, fresh)
             _write(block, views)
+            if self.limit is not None and self._free() < 0:  # mapped past the limit
+                self._make_room(0, f"limit {model.name}", model)
+            self._cap()
         except BaseException:
             _unbind(block)
             raise
@@ -662,7 +670,7 @@ class Memory:
                 return model.ws.bind(region, stream)
             except DeviceFull as full:
                 why = f"bind {model.name}"
-                if not self._make_room(_free(self.gpu) + full.deficit, why, model):
+                if not self._make_room(self._free() + full.deficit, why, model):
                     raise _Short(full.deficit, why) from None
 
     def _passed(self, block: Block, call: tuple) -> None:
@@ -758,29 +766,29 @@ class Memory:
         (rung 2), until `target` bytes are free."""
         freed = self._idle()
         for victim in self._victims():
-            if _free(self.gpu) >= target:
+            if self._free() >= target:
                 return True
-            short = target - _free(self.gpu)
+            short = target - self._free()
             if isinstance(victim, Model):
                 freed += self._evict(victim, why, 2, short)
             else:
                 freed += self._shrink(victim, short)
                 torch.cuda.empty_cache()
-        if _free(self.gpu) >= target:
+        if self._free() >= target:
             return True
         if self.row is not None:  # other rows, each evicting in its own process
-            table, row, before = *self.row, _free(self.gpu)
+            table, row, before = *self.row, self._free()
             for asked in table.ask(target - before, row.id):
                 table.wait(asked)
-            freed += max(_free(self.gpu) - before, 0)
-        return freed > 0 or _free(self.gpu) >= target
+            freed += max(self._free() - before, 0)
+        return freed > 0 or self._free() >= target
 
     def _lower_until(self, target: int, why: str, asking: Model | None) -> bool:
         """Rung 4: the hot watermarks fall from the top of their spread sets, the asker's last."""
         freed = 0
         hot = [m for m in self.models.values() if m.flight and not m.held]
         for model in sorted(hot, key=lambda m: (m is asking, self._value(m))):
-            while model.home and _free(self.gpu) < target:
+            while model.home and self._free() < target:
                 ranked = _spread(model.order, _sizes(model), model.nbytes)
                 last = next(b for b in reversed(ranked) if b in model.home)
                 freed += self._set_home(model, model.home - {last}, why, 4)
@@ -792,7 +800,9 @@ class Memory:
         if device.type != "cuda" or device.index != self.gpu:
             return False
         with self.lock:
-            return self._free_upto(need, "out of memory")
+            freed = self._free_upto(need, "out of memory")
+            self._cap()
+            return freed
 
     def lower(self, device: torch.device, need: int) -> bool:
         """At least one block lower; with nothing left to lower, a wait for another request's
@@ -800,15 +810,37 @@ class Memory:
         if device.type != "cuda" or device.index != self.gpu:
             return False
         with self.lock:
-            if self._lower_until(max(need, _free(self.gpu) + 1), "out of memory", None):
+            lowered = self._lower_until(max(need, self._free() + 1), "out of memory", None)
+            self._cap()
+            if lowered:
                 return True
         return self._wait_room()
+
+    def _free(self) -> int:
+        """The driver's free bytes, never beyond what a `gpu_memory_limit` leaves (§5.6)."""
+        free, room = int(torch.cuda.mem_get_info(self.gpu)[0]), self._room()
+        return free if room is None else min(free, room - torch.cuda.memory_reserved(self.gpu))
+
+    def _room(self) -> int | None:
+        """Under a limit, what this process's torch may reserve; None without one."""
+        if self.limit is None or self.row is None:
+            return None
+        table, row = self.row
+        others = sum(f.held for f in table.snapshot() if f.slot != row.id)
+        core = self.core.stats()  # type: ignore[union-attr]
+        return limited(self.limit, self.context, others, core.mapped + core.idle)
+
+    def _cap(self) -> None:
+        """Torch's allocator held to what the limit leaves it, at block boundaries."""
+        room = self._room()
+        if room is not None:
+            torch.cuda.set_per_process_memory_fraction(min(room / self.total, 1.0), self.gpu)
 
     def available(self, device: torch.device | None = None) -> int:
         if not self.cuda or device is not None and device.index != self.gpu:
             return 0
         return (
-            _free(self.gpu)
+            self._free()
             + torch.cuda.memory_reserved(self.gpu)
             - torch.cuda.memory_allocated(self.gpu)
         )
@@ -890,6 +922,7 @@ class Memory:
         Rust thread answers from weight pages also gets torch's slack and the caches here."""
         if self.row is None:
             return
+        self._cap()
         row, gpu = self.row[1], self.gpu
         if row.want() > 0:
             freed = self._idle() + sum(
@@ -1085,7 +1118,7 @@ class Memory:
         slots = max(
             (_SLOTS * max(_sizes(m), default=0) for m in models if m.repeats < 2), default=0
         )
-        room = _free(self.gpu) - max((max(m.reserve, 0) for m in models), default=0) - slots
+        room = self._free() - max((max(m.reserve, 0) for m in models), default=0) - slots
         ranked = sorted(models, key=self._value, reverse=True)
         for i, model in enumerate(ranked):
             if model.level is not Level.GPU:
@@ -1333,8 +1366,10 @@ def _peak(shape: cuts.Shape) -> Peak:
     return Peak(shape.model, shape.shape, shape.peak, cut)
 
 
-def _free(gpu: int) -> int:
-    return int(torch.cuda.mem_get_info(gpu)[0])
+def limited(capacity: int, context: int, others: int, varena: int) -> int:
+    """Under a limit, what this process's torch may reserve: the capacity less its CUDA context,
+    the bytes other rows hold and its own varena pages (§5.6)."""
+    return max(capacity - context - others - varena, 0)
 
 
 def _set(model: Model) -> tuple[int, int, int, int]:
