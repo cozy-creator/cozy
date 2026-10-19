@@ -49,20 +49,22 @@ it holds, making room in other executors through the GPU's ledger (design memory
   `seam.MAX_FRAME`) refuses only a corrupt or hostile prefix. Bulk data goes through the spool.
 - Any outgoing object key named `token`, `credential`, `authorization`, `secret` or `jwt` is
   refused. Credentials cannot cross the seam.
-- Commands (`cmd`): `hello`, `start`, `load`, `activate`, `prepare_request`, `invoke`, `map`,
+- Commands (`cmd`): `hello`, `start`, `load`, `activate`, `prepare_request`, `invoke`, `map`
+  (warming: load the construction's models at `level` `gpu` or `ram`),
   `unload`, `probe`, `fork`, `shutdown`. The usual sequence is
   Hello -> Start -> Load -> Activate -> PrepareRequest -> Invoke.
-- `start` names `ledgers: N` and `memory_mode` (`shared` or `dedicated`); N fds follow the frame,
-  one per GPU of `devices` in order, each its GPU's ledger memfd. Rank 0 claims its row in the
-  first and hands follower r the r-th.
+- `start` names `ledgers: N` and `memory_mode` (`shared` or `dedicated`); 2N fds follow the
+  frame, each GPU of `devices` in order its ledger memfd then its eventfd. Rank 0 claims its row
+  in the first and hands follower r its pair.
 - While waiting for a reply, `event=progress` frames go to `Services::progress`. `event=request`
   frames (optionally with an `SCM_RIGHTS` fd) go to `Services::request`. The reply must name the
   command, otherwise it is an error. Unknown events and fields are ignored.
 - `Baseline` services answer every request `capability_unavailable`.
 - A successful `model_source_read` answer must pass a read-only regular-file fd of the declared length.
-- `read_grant` requests carry the executor's plan memfd when it has one (`descriptor`); the answer
-  names its `descriptors` and the fds follow it: the sealed host layout (`held`), or the weight
-  set's chunk files sorted by digest (`objects_sha256`). They go to `Services::read_grant`.
+- `read_grant {manifest, layout}`: the answer names its `descriptors` and the fds follow it: a
+  deposited sealed host layout (`held`), or the weight set's chunk files sorted by digest
+  (`objects_sha256`). They go to `Services::read_grant`. `deposit {manifest, layout}` carries one
+  memfd (`descriptor`): a sealed layout the executor filled.
 
 ## Capabilities
 

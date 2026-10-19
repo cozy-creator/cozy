@@ -1,38 +1,29 @@
-//! One GPU's ledger, held by TensorD: the table executors claim their rows in, and TensorD's own
-//! row, whose context is the display floor plus every byte NVML shows that no row explains (other
-//! programs, executors still dying). A watch thread reads NVML once a second and on demand: it
-//! reaps dead rows, returns their bytes once NVML shows them back, and every wedge floor ends the
-//! rows asked for bytes whose progress did not move. NVML is read for capacity and these checks only.
+//! One GPU's ledger, held by TensorD (design memory-varena §2, §5.6): the table executors claim
+//! their rows in, with the eventfd beside it, and TensorD's own row, whose context is the display
+//! floor plus every byte NVML shows that no row explains (other programs, executors still dying).
+//! A watch thread reads NVML once a second and on demand and wakes on the eventfd: it reaps dead
+//! rows, returns them once NVML shows their bytes back, ends the rows the ledger names stalled
+//! once a wedge floor, and tells the pool when bytes freed. TensorD decides nothing from bytes:
+//! it asks `fits`.
 use super::{MemoryLog, Sample};
 use crate::process::Liveness;
 use cozy_platform::{gpu::Device, process::Birth};
 use std::{
     fs::File,
     io,
-    os::fd::{AsFd, OwnedFd},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Condvar, Mutex, OnceLock,
-    },
-    time::{Duration, Instant},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+    sync::{Arc, Condvar, Mutex, OnceLock},
+    time::Instant,
 };
-use varena::ledger::{Admit, Facts, Ledger, Row, RowFacts, State};
+use varena::ledger::{Facts, Ledger, Row, RowFacts, State, Status};
 
-/// A CUDA context before any process on this GPU published one (design §7: ≈0.5 GiB).
-const UNMEASURED_CONTEXT: u64 = 512 << 20;
 /// What a desktop keeps free on its GPU in shared mode, or a sixteenth of a larger card.
 const DISPLAY_FLOOR: u64 = 512 << 20;
 
 /// Ends a process the ledger names stalled (its pid).
 pub type Ender = Box<dyn Fn(u32) + Send + Sync>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Admitted {
-    Now,
-    /// Bytes no ask or ended idle executor freed: in use, pinned or in activations. The start
-    /// goes ahead and its executor makes what room it can.
-    Short(u64),
-}
+/// Told when bytes freed on the GPU.
+pub type Freed = Box<dyn Fn() + Send + Sync>;
 
 struct Inner {
     entry: String,
@@ -40,10 +31,9 @@ struct Inner {
     fd: OwnedFd,
     own: Row,
     floor: u64,
-    /// The largest context a row here published.
-    context: AtomicU64,
     log: MemoryLog,
     end: OnceLock<Ender>,
+    freed: OnceLock<Freed>,
     looked: Mutex<Instant>,
     liveness: Liveness,
 }
@@ -61,6 +51,8 @@ struct Ticks {
 pub struct GpuLedger {
     inner: Arc<Inner>,
     ticks: Arc<(Mutex<Ticks>, Condvar)>,
+    /// An eventfd that wakes the watch thread for an asked tick or a stop.
+    wake: Arc<OwnedFd>,
 }
 
 fn err(error: varena::Error) -> io::Error {
@@ -70,6 +62,30 @@ fn err(error: varena::Error) -> io::Error {
 /// Its pid exited (a zombie included) or never was.
 fn gone(pid: u32) -> bool {
     Birth::of(pid).map_or(true, |birth| birth.ended().unwrap_or(false))
+}
+
+fn eventfd() -> io::Result<OwnedFd> {
+    // SAFETY: eventfd(2) with no shared state; a negative return is an error.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor we just created and own.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Adds one to an eventfd.
+fn signal(fd: &OwnedFd) {
+    let one = 1u64.to_ne_bytes();
+    // SAFETY: an 8-byte write to an eventfd we hold.
+    unsafe { libc::write(fd.as_raw_fd(), one.as_ptr().cast(), 8) };
+}
+
+/// Reads an eventfd to zero; whether it was signalled.
+fn drain(fd: i32) -> bool {
+    let mut count = [0u8; 8];
+    // SAFETY: an 8-byte read from a nonblocking eventfd we hold.
+    unsafe { libc::read(fd, count.as_mut_ptr().cast(), 8) == 8 }
 }
 
 impl GpuLedger {
@@ -105,18 +121,19 @@ impl GpuLedger {
             fd,
             own,
             floor,
-            context: AtomicU64::new(0),
             log,
             end: OnceLock::new(),
+            freed: OnceLock::new(),
             looked: Mutex::new(Instant::now()),
             liveness,
         });
         let ticks: Arc<(Mutex<Ticks>, Condvar)> = Arc::default();
-        let (watched, shared_ticks) = (inner.clone(), ticks.clone());
+        let wake = Arc::new(eventfd()?);
+        let (watched, shared_ticks, woken) = (inner.clone(), ticks.clone(), wake.clone());
         std::thread::Builder::new().name("gpu-ledger".into()).spawn(move || {
-            watch(device, &watched, &shared_ticks)
+            watch(device, &watched, &shared_ticks, &woken)
         })?;
-        let ledger = Self { inner, ticks };
+        let ledger = Self { inner, ticks, wake };
         ledger.now();
         Ok(Some(ledger))
     }
@@ -126,21 +143,16 @@ impl GpuLedger {
         let _ = self.inner.end.set(end);
     }
 
-    /// A descriptor of the memfd executors claim their rows in, to send one.
-    pub fn grant(&self) -> io::Result<File> {
-        Ok(File::from(self.inner.fd.as_fd().try_clone_to_owned()?))
+    /// What is told when bytes free here (the dispatch queue's wake); set once.
+    pub fn on_freed(&self, freed: Freed) {
+        let _ = self.inner.freed.set(freed);
     }
 
-    pub fn capacity(&self) -> u64 {
-        self.inner.ledger.capacity()
-    }
-
-    /// A new process's context here: the largest one measured, else the unmeasured estimate.
-    pub fn context(&self) -> u64 {
-        match self.inner.context.load(Ordering::Relaxed) {
-            0 => UNMEASURED_CONTEXT,
-            measured => measured,
-        }
+    /// An executor's grant: descriptors of the memfd it claims its row in and of the eventfd it
+    /// signals when it frees bytes.
+    pub fn grant(&self) -> io::Result<[File; 2]> {
+        let events = self.inner.ledger.events().ok_or_else(|| io::Error::other("the ledger has no eventfd"))?;
+        Ok([File::from(self.inner.fd.as_fd().try_clone_to_owned()?), File::from(events.try_clone_to_owned()?)])
     }
 
     /// The latest NVML reading, taken on the watch thread.
@@ -154,7 +166,7 @@ impl GpuLedger {
         let mut ticks = lock.lock().unwrap();
         ticks.asked += 1;
         let ticket = ticks.asked;
-        changed.notify_all();
+        signal(&self.wake);
         drop(changed.wait_while(ticks, |t| t.answered < ticket && !t.stopped).unwrap());
     }
 
@@ -166,76 +178,50 @@ impl GpuLedger {
         drop(changed.wait_while(ticks, |t| t.done < ticket && !t.stopped).unwrap());
     }
 
-    fn rows(&self) -> io::Result<Vec<RowFacts>> {
-        self.inner.ledger.snapshot().map_err(err)
+    /// Whether a request of `package` can start here now (`Ledger::fits`): at `shape`, or its
+    /// widest measured one before its shape is known; `spawn`: it starts a process too.
+    pub fn fits(&self, package: &str, shape: Option<&str>, spawn: bool) -> bool {
+        self.inner.ledger.fits(package, shape, spawn).unwrap_or(false)
     }
 
-    /// Capacity less every byte the rows hold.
-    pub fn free(&self) -> io::Result<u64> {
-        let held = self.rows()?.iter().fold(0u64, |sum, row| sum.saturating_add(row.held()));
-        Ok(self.capacity().saturating_sub(held))
+    /// Whether any request runs here now, by any process's row.
+    pub fn running(&self) -> bool {
+        self.inner.ledger.snapshot().is_ok_and(|rows| rows.iter().any(|r| !r.running.is_empty()))
     }
 
-    /// What `pid`'s live row holds, and of that its weights resident.
-    pub fn row(&self, pid: u32) -> Option<(u64, u64)> {
-        let rows = self.rows().ok()?;
-        let row = rows.iter().find(|r| r.pid == pid && r.state == State::Live)?;
-        Some((row.held(), row.facts.resident))
-    }
-
-    /// Whether `need` fits now (`exact`), or once others' cold and idle bytes are asked for.
-    pub fn fits(&self, need: u64, exact: bool) -> bool {
-        match self.inner.ledger.admit(need) {
-            Ok(Admit::Now) => true,
-            Ok(Admit::After { short, .. }) => !exact && short == 0,
-            Err(_) => false,
-        }
-    }
-
-    /// Room for `need` bytes: what is free; else other rows' idle and cold bytes, asked for and
-    /// waited on (the watch thread ends a victim that stops answering); else dead rows' bytes,
-    /// waited for while each reading returns some; else, while `end_idle` ends one, idle
-    /// executors. Never "now" below need.
-    pub fn admit(&self, need: u64, end_idle: &mut dyn FnMut() -> bool) -> io::Result<Admitted> {
-        let inner = &*self.inner;
-        let (mut asking, mut going_before) = (true, None);
+    /// Waits while rows of exited processes give their bytes back: a reading at a time, as long
+    /// as each returns some.
+    pub fn settle(&self) {
+        let mut before = usize::MAX;
         loop {
             self.now();
-            let (victims, short) = match inner.ledger.admit(need).map_err(err)? {
-                Admit::Now => {
-                    inner.log.note(serde_json::json!({"event": "admit", "gpu": inner.entry, "need": need}));
-                    return Ok(Admitted::Now);
-                }
-                Admit::After { victims, short } => (victims, short),
-            };
-            if asking && !victims.is_empty() {
-                let before = self.free()?;
-                let bytes = victims.iter().map(|v| v.bytes).sum();
-                for victim in inner.ledger.ask(None, bytes).map_err(err)? {
-                    inner.ledger.wait(&victim).map_err(err)?;
-                }
-                self.now();
-                let after = self.free()?;
-                inner.log.note(serde_json::json!({"event": "ask", "gpu": inner.entry, "need": need,
-                    "asked": bytes, "victims": victims.iter().map(|v| v.pid).collect::<Vec<_>>(),
-                    "freed": after.saturating_sub(before)}));
-                asking = after > before;
-                continue;
+            let going = self.inner.ledger.snapshot().map_or(0, |rows| rows.iter().filter(|r| r.state != State::Live).count());
+            if going == 0 || going >= before {
+                return;
             }
-            let going: u64 = self.rows()?.iter().filter(|r| r.state != State::Live).map(RowFacts::held).sum();
-            if going > 0 && going_before.is_none_or(|before| going < before) {
-                going_before = Some(going);
-                self.next();
-                continue;
-            }
-            if end_idle() {
-                (asking, going_before) = (true, None);
-                continue;
-            }
-            let short = short.max(need.saturating_sub(self.free()?));
-            inner.log.note(serde_json::json!({"event": "admit_short", "gpu": inner.entry, "need": need, "short": short}));
-            return Ok(Admitted::Short(short));
+            before = going;
+            self.next();
         }
+    }
+
+    /// Whether `pid`'s live row has weights resident here.
+    pub fn resident(&self, pid: u32) -> bool {
+        let rows = self.inner.ledger.snapshot().unwrap_or_default();
+        rows.iter().any(|r| r.pid == pid && r.state == State::Live && r.facts.resident > 0)
+    }
+
+    /// Names the key `request` records its peak under, before it runs.
+    pub fn dispatch(&self, request: &str, key: &str) -> io::Result<()> {
+        self.inner.ledger.dispatch(request, key).map_err(err)
+    }
+
+    pub fn undispatch(&self, request: &str) {
+        self.inner.ledger.undispatch(request);
+    }
+
+    /// The table at a glance (`machine show`, telemetry).
+    pub fn status(&self) -> io::Result<Status> {
+        self.inner.ledger.status().map_err(err)
     }
 }
 
@@ -244,6 +230,7 @@ impl Drop for GpuLedger {
         let (lock, changed) = &*self.ticks;
         lock.lock().unwrap().stopped = true;
         changed.notify_all();
+        signal(&self.wake);
     }
 }
 
@@ -251,9 +238,12 @@ fn read(device: &Device) -> Option<Sample> {
     device.read().ok().map(|r| Sample { total: r.total, free: r.free, display: r.display, processes: r.processes })
 }
 
-/// One tick a second, or sooner when asked; until the ledger's owner drops it.
-fn watch(device: Option<Device>, inner: &Inner, ticks: &(Mutex<Ticks>, Condvar)) {
+/// One tick a second, or sooner when asked or when the ledger's eventfd says bytes freed; until
+/// the ledger's owner drops it. A freed signal reaches the pool after the tick that follows it.
+fn watch(device: Option<Device>, inner: &Inner, ticks: &(Mutex<Ticks>, Condvar), wake: &OwnedFd) {
     let (lock, changed) = ticks;
+    let events = inner.ledger.events().map(|e| e.as_raw_fd());
+    let mut freed = false;
     loop {
         let asked = lock.lock().unwrap().asked;
         let reading = device.as_ref().and_then(read);
@@ -261,6 +251,11 @@ fn watch(device: Option<Device>, inner: &Inner, ticks: &(Mutex<Ticks>, Condvar))
             tracing::warn!("memory: GPU {} ledger: {error}", inner.entry);
         }
         inner.look();
+        if std::mem::take(&mut freed) {
+            if let Some(told) = inner.freed.get() {
+                told();
+            }
+        }
         let mut state = lock.lock().unwrap();
         state.latest = reading;
         state.answered = asked;
@@ -269,12 +264,15 @@ fn watch(device: Option<Device>, inner: &Inner, ticks: &(Mutex<Ticks>, Condvar))
         if state.stopped {
             return;
         }
-        let state = changed
-            .wait_timeout_while(state, Duration::from_secs(1), |t| t.asked == asked && !t.stopped)
-            .unwrap()
-            .0;
-        if state.stopped {
-            return;
+        drop(state);
+        let mut fds = [wake.as_raw_fd(), events.unwrap_or(-1)].map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
+        // SAFETY: poll on two descriptors this thread's owners keep open (-1 is ignored).
+        unsafe { libc::poll(fds.as_mut_ptr(), 2, 1000) };
+        if fds[0].revents & libc::POLLIN != 0 {
+            drain(fds[0].fd);
+        }
+        if fds[1].revents & libc::POLLIN != 0 {
+            freed |= drain(fds[1].fd);
         }
     }
 }
@@ -295,9 +293,6 @@ impl Inner {
         let rows = self.ledger.snapshot()?;
         let charged = |pid: u32| reading.and_then(|s| s.processes.as_ref()).is_some_and(|p| p.contains_key(&pid));
         let back: Vec<&RowFacts> = rows.iter().filter(|r| r.state == State::Reaping && !charged(r.pid)).collect();
-        if let Some(context) = rows.iter().filter(|r| r.state == State::Live && !self.mine(r)).map(|r| r.facts.context).max() {
-            self.context.fetch_max(context, Ordering::Relaxed);
-        }
         let explained = rows
             .iter()
             .filter(|r| !self.mine(r) && !back.iter().any(|b| b.slot == r.slot))

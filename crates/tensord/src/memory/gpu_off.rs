@@ -1,15 +1,10 @@
-//! Where varena has no ledger (Windows): no GPU ledger exists, so executors run without one.
+//! Where the OS has no memfd ledger (macOS, Windows): no GPU ledger exists.
 use super::{MemoryLog, Sample};
 use crate::process::Liveness;
-use std::io;
+use std::{fs::File, io};
 
 pub type Ender = Box<dyn Fn(u32) + Send + Sync>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Admitted {
-    Now,
-    Short(u64),
-}
+pub type Freed = Box<dyn Fn() + Send + Sync>;
 
 pub enum GpuLedger {}
 
@@ -20,13 +15,10 @@ impl GpuLedger {
     pub fn on_stalled(&self, _: Ender) {
         match *self {}
     }
-    pub fn grant(&self) -> io::Result<std::fs::File> {
+    pub fn on_freed(&self, _: Freed) {
         match *self {}
     }
-    pub fn capacity(&self) -> u64 {
-        match *self {}
-    }
-    pub fn context(&self) -> u64 {
+    pub fn grant(&self) -> io::Result<[File; 2]> {
         match *self {}
     }
     pub fn sample(&self) -> Option<Sample> {
@@ -35,16 +27,22 @@ impl GpuLedger {
     pub fn now(&self) {
         match *self {}
     }
-    pub fn free(&self) -> io::Result<u64> {
+    pub fn fits(&self, _: &str, _: Option<&str>, _: bool) -> bool {
         match *self {}
     }
-    pub fn row(&self, _: u32) -> Option<(u64, u64)> {
+    pub fn running(&self) -> bool {
         match *self {}
     }
-    pub fn fits(&self, _: u64, _: bool) -> bool {
+    pub fn settle(&self) {
         match *self {}
     }
-    pub fn admit(&self, _: u64, _: &mut dyn FnMut() -> bool) -> io::Result<Admitted> {
+    pub fn resident(&self, _: u32) -> bool {
+        match *self {}
+    }
+    pub fn dispatch(&self, _: &str, _: &str) -> io::Result<()> {
+        match *self {}
+    }
+    pub fn undispatch(&self, _: &str) {
         match *self {}
     }
 }

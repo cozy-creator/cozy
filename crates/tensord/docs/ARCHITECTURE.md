@@ -44,8 +44,8 @@ Calcifer ──HTTPS (Cozy-Cap)──> api::http ─> machine_api::NativeBackend
                           gpu_service::Pool ─> device_executor::DeviceExecutor
                             (retained executors per plan: deviceless, one GPU or a group,
                              via the Runtime trampoline)
-                            memory::GpuLedger: per-GPU ledger, start admission, reaps, stalls
-                            answers model-source and read-grant requests
+                            memory::GpuLedger: per-GPU ledger + eventfd, fits, reaps, stalls
+                            answers model-source, read-grant and deposit requests
                           calls::Calls: child calls and each attempt's weights grant
 ```
 
@@ -105,7 +105,8 @@ code is still not sandboxed.
 | `execution.rs` | Acceptance, attempt supervision, cancellation, progress coalescing, output custody, reconcile | `Engine` | E |
 | `journal.rs` | SQLite journal: executions, installations, preparations, receipts, process births | `Journal`, `Execution`, `State`, `ProcessBirth` | E |
 | `gpu_service.rs` | Executor pool (degree 0, 1 or n): published package/model mapping, executor retention, request callbacks; GPU groups (a degree-K plan on the first K GPUs, one memory decision per GPU), one call slot per GPU and one-GPU replicas and multi-slot plans | `Pool`, `GpuConfig`, `Plan`, `PlanSlot`, `PlanSource`, `ModelGrant` | B2 (admission, grants), E (spawn/fencing), D1 (published mapping), I (groups, slots) |
-| `memory/` | Each GPU's varena ledger and TensorD's row in it, start admission, reaps and stalls on an NVML watch thread (`gpu`); a call's memory measurements (`call`) | `GpuLedger`, `Admitted`, `CallMemory` | xs-046 B4 |
+| `memory/` | Each GPU's varena ledger and eventfd, TensorD's row in it, `fits`, reaps, stalls and freed wakes on an NVML watch thread (`gpu`); a call's memory measurements (`call`) | `GpuLedger`, `CallMemory` | xs-046 B4 |
+| `deposits.rs` | Sealed host layouts executors deposit, granted to the next executor of the same weights | `Deposits` | xs-046 B4 |
 | `device_executor.rs` | Typed control seam to the Runtime device executor, per-request output encoding | `DeviceExecutor`, `ExecutorConfig`, `DeviceCommand`, `Frame`, `Answer` | E |
 | `launch_identity.rs` | Runtime trampoline command, the executor environment seal, optional UID/GID | `LaunchIdentity`, `Seal`, `trampoline` | E |
 | `process.rs` | Exact process births, kill (scope and group), the progress meter and watch (leader plus process-group members), reaping (`reap_group`) | `Exact`, `Pace`, `Watching`, `Reaped` | E, I |

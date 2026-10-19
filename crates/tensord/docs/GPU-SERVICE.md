@@ -90,27 +90,36 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   and forms its followers inside `Start` (Runtime `RankGroup`); the machine never talks to a follower.
   Every command's watch meters rank 0 plus its process-group members, so formation ends only on
   measured lack of progress. Each GPU of the group is admitted by its own ledger (device order).
-  `Start` carries one ledger fd per GPU of the lane; rank 0 hands follower r the r-th, and each
-  rank claims its own row. Followers' pids from `Start` are their GPUs' tenants: a stalled one
+  `Start` carries each GPU's ledger memfd and eventfd in lane order; rank 0 hands follower r
+  its pair, and each rank claims its own row. Followers' pids from `Start` are their GPUs' tenants: a stalled one
   is ended by pid.
   Teardown waits for every group member's exit. Startup fences GPU dispatch until a previous
   machine's leaders and their followers are gone. A refusal or poisoned group call fails the run
   with the executor's own code (a group's first fault names its GPU). A group forks from the generation's import-only parent like a
   single GPU does: the child takes the lane and NCCL seal with its environment; followers are spawned
   by rank 0.
-- A cold session is admitted first, on each GPU of its lane: room for a new context (the largest
-  a row measured here, else 512 MiB) is free; else other rows' idle and cold bytes are asked for
-  and waited on; else dead rows' bytes are waited for while each NVML reading returns some; else
-  idle executors end, least recently used first, outside every warm set first. Never "now" below
-  need, never refused: what stays short is in use, and the executor makes what room it can. It is
-  spawned by the pool's `ChildLauncher`, which journals the birth, then sent Start (with its
-  ledgers), Load and Activate once. Each request sends PrepareRequest and Invoke.
+- TensorD handles no byte count: it asks each GPU's ledger `fits(package, shape)` (design
+  memory-varena §5.6), from the peaks varena measured per `<construction>|<shape>` (the shape:
+  PrepareRequest's features, hashed) beside every row's unevictable bytes and every running
+  request's remaining peak; never beside a dead or reaping row, and a shape never measured only
+  alone. A replica goes to a GPU where the plan's widest measured shape fits with a new process.
+  Before a cold session spawns, and again once its request's shape is known, while it does not
+  fit and nothing runs on a GPU of its lane, exited executors' bytes are waited for while they
+  come back, then idle executors end, least recently used first, outside every warm set first.
+  A request is never refused: varena in its executor makes what room it can. The request is
+  named to varena under its key (the ledger's dispatch table) until it ends, so its peak is
+  recorded. It is spawned by the pool's `ChildLauncher`, which journals the birth, then sent
+  Start (with its ledgers), Load and Activate once. Each request sends PrepareRequest and Invoke.
+- Warming: a warm member's executor is loaded, then `Map{construction, level}` has it load its
+  models at `gpu` or `ram`; varena fills them, and its priority is in use > warm > idle.
 - Each GPU's ledger: its capacity is NVML's total; TensorD holds a row of its own whose context
   is the display floor (shared mode: 512 MiB or 1/16 of the card) plus every byte NVML shows that
   no row explains (other programs, executors still exiting). A watch thread reads NVML once a
-  second: a dead row whose process is gone is reaped, and returned once NVML charges the pid no
-  more (in a container, at a reading after the exit; what it still shows stays in TensorD's row).
-  Once a wedge floor it ends the rows asked for bytes whose progress did not move. A restarted
+  second, and wakes on the ledger's eventfd: a dead row whose process is gone is reaped, and
+  returned once NVML charges the pid no more (in a container, at a reading after the exit; what it
+  still shows stays in TensorD's row). Once a wedge floor it ends the rows asked for bytes whose
+  progress did not move. When bytes free (an executor's `freed`, a returned row) the engine's
+  dispatch is woken (`notify_activity`): the queue asks `fits` again and never polls. A restarted
   TensorD makes fresh ledgers: its old executors die with it (`PDEATHSIG`), and what they hold
   until then is unexplained bytes.
 - An executor's failed terminal (its own refusal before entry, or a failed invoke) first keeps a
@@ -130,11 +139,12 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   nonterminal.
 
 Executor requests:
-- `read_grant`: a weight set's bytes. With the executor's plan, the sealed host layout
-  `HostTier` fills (`HOST-TIER.md`, one fd, `held`); without one or where there is no sealed tier
-  (an Apple or CPU executor), every chunk file of its selected components, sorted by digest, with
-  `objects_sha256` (`descriptors` fds). Models that ran more than one pass of a call mark their
-  layouts per-step: the host cache releases them after run-once ones.
+- `read_grant {manifest, layout}`: a weight set's bytes. The sealed host layout an executor
+  deposited for that manifest and layout (one fd, `held`); else every chunk file of its selected
+  components, sorted by digest, with `objects_sha256` (`descriptors` fds). TensorD never fills.
+- `deposit {manifest, layout}` + the memfd: a layout varena sealed in the executor, kept as an
+  opaque handle (`deposits.rs`) for the next executor of the same weights (D9's refill path);
+  under host pressure the least recently granted goes first.
 - `model_source` goes to `ModelSources` for selected headers/assets in sealed descriptors.
 - `publish` (`Outputs.publish`) goes to `products.rs`: the spool file is retained as a native
   one-file tree bound to the run's actor, then journaled as a `product` (list outputs APPEND,

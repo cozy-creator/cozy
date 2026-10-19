@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod config;
 pub mod derive;
 pub mod child_launcher;
+pub mod deposits;
 pub mod device_executor;
 pub mod execution;
 pub mod frame;

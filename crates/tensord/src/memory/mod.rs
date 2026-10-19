@@ -1,14 +1,14 @@
-//! TensorD on varena's ledger (design memory-varena §1, §5.6): each GPU's table, TensorD's own row
-//! of what no executor explains, start admission, reaping and stalls. Executors decide their own
-//! bytes and make room through the ledger's asks; nothing here models GPU memory.
+//! TensorD on varena's ledger (design memory-varena §1, §2, §5.6): each GPU's table and eventfd,
+//! TensorD's own row of what no executor explains, `fits`, reaping, stalls and freed-bytes wakes.
+//! Executors decide their own bytes; nothing here models GPU memory.
 pub mod call;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod gpu;
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 #[path = "gpu_off.rs"]
 mod gpu;
 
-pub use gpu::{Admitted, Ender, GpuLedger};
+pub use gpu::{Ender, Freed, GpuLedger};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,

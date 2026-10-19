@@ -12,12 +12,12 @@ use crate::{
     },
     execution::Engine,
     gpu_allocation::Claims,
-    host_tier::{HostGrant, HostTier, HostTierConfig, SealedRequest},
+    deposits::Deposits,
     journal::{
         AssetBinding, Execution, Failure, Outcome, Preparation, State,
     },
     launch_identity::Seal,
-    memory::{Admitted, GpuLedger, MemoryConfig},
+    memory::{GpuLedger, MemoryConfig},
     model_sources::{ModelSources, SelectedManifest},
 };
 use serde::{Deserialize, Serialize};
@@ -60,13 +60,9 @@ pub struct PublishedPackage {
     pub generation: String,
 }
 
-/// The machine's sealed host tier (`host_tier.rs`); always on, sized by live headroom.
+/// How the machine shares its host and GPUs.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct HostOptions {
-    #[serde(default)]
-    pub fill_threads: Option<usize>,
-    #[serde(default)]
-    pub ttl_seconds: Option<u64>,
     /// `shared` (the default): a guest that gives memory back whenever anything on the host
     /// stalls on it; `dedicated` (a rented pod's image or grant): only when this cgroup does.
     #[serde(default)]
@@ -418,8 +414,6 @@ struct Session {
     /// Its selected models' headers and assets, served on `model_source`.
     sources: Arc<ModelSources>,
     /// This executor in the host tier and the layouts it may adopt.
-    peer: u64,
-    grants: Vec<HostGrant>,
     launch: Launch,
     /// It has served a call: its next one is not its first.
     invoked: bool,
@@ -608,7 +602,8 @@ pub struct Pool {
     levels: Mutex<BTreeMap<String, (App, Level)>>,
     /// Each envelope GPU and its ledger, in envelope order.
     devices: Vec<Device>,
-    host: Arc<HostTier>,
+    /// Host layouts executors deposited, granted to the next executor of the same weights.
+    deposits: Arc<Deposits>,
     /// Shared mode's room for the host's other programs, and the stalls the watcher saw: the
     /// count at the last bring-back pass says whether one came since (`host_pressure`).
     reserve: Mutex<cozy_platform::contain::host_pressure::Reserve>,
@@ -688,20 +683,7 @@ impl Pool {
                     .ok_or_else(|| io::Error::other("GPU root has no owned state parent"))?,
             )?;
         }
-        let defaults = HostTierConfig::default();
-        let host = HostTier::new(
-            store.clone(),
-            HostTierConfig {
-                fill_threads: config.host.fill_threads.unwrap_or(defaults.fill_threads),
-                ttl: config
-                    .host
-                    .ttl_seconds
-                    .map_or(defaults.ttl, std::time::Duration::from_secs),
-            },
-            // The machine's one pinned host total: executors' pinned budgets split it too.
-            Box::new(crate::host_tier::HalfOfHeadroom),
-        )?;
-        // Fill leases and chunk grants hold one descriptor per object.
+        // Chunk grants hold one descriptor per object.
         cozy_platform::process::raise_fd_limit();
         let envelope = config.envelope();
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
@@ -743,7 +725,7 @@ impl Pool {
             members: Mutex::new(BTreeMap::new()),
             keeping: Mutex::new(()),
             levels: Mutex::new(BTreeMap::new()),
-            host,
+            deposits: Arc::default(),
             reserve: Mutex::default(),
             stalls: Default::default(),
             stalls_seen: Default::default(),
@@ -805,8 +787,7 @@ impl Pool {
         if self.config.host.mode == cozy_platform::contain::host_pressure::HostMode::Dedicated {
             return Some(available);
         }
-        let ours = cozy_platform::contain::host_memory::tree_private(std::process::id())
-            + self.host.facts().charged_bytes;
+        let ours = cozy_platform::contain::host_memory::tree_private(std::process::id());
         let total = u64::try_from(cozy_platform::contain::host_memory::total()).ok()?;
         let others = cozy_platform::contain::host_pressure::others(&host, total, ours)?;
         Some(available.saturating_sub(self.reserve.lock().unwrap().observe(others)))
@@ -818,8 +799,7 @@ impl Pool {
             return;
         }
         let host = cozy_platform::contain::host_memory::read();
-        let ours = cozy_platform::contain::host_memory::tree_private(std::process::id())
-            + self.host.facts().charged_bytes;
+        let ours = cozy_platform::contain::host_memory::tree_private(std::process::id());
         let others = u64::try_from(cozy_platform::contain::host_memory::total())
             .ok()
             .and_then(|total| cozy_platform::contain::host_pressure::others(&host, total, ours));
@@ -832,7 +812,7 @@ impl Pool {
     /// executor (outside every warm set first) on a GPU no call holds. Whether anything went
     /// back.
     pub fn give_back_one(&self) -> bool {
-        self.host.release(1) > 0
+        self.deposits.release_one()
             || self.end_idle_parent(false) > 0
             || self.end_idle_deviceless(|_| true)
             || self.end_lru_idle("", false, 0..0)
@@ -992,10 +972,17 @@ impl Pool {
     /// A loaded executor's level from its leader's ledger row: `gpu` while its weights are
     /// resident there, else `host`.
     fn loaded_level(&self, start: usize, pid: u32) -> Level {
-        let resident = self.devices.get(start).and_then(|d| d.memory.as_ref()).and_then(|m| m.row(pid));
-        match resident {
-            Some((_, resident)) if resident > 0 => Level::Gpu,
-            _ => Level::Host,
+        match self.devices.get(start).and_then(|d| d.memory.as_ref()).is_some_and(|m| m.resident(pid)) {
+            true => Level::Gpu,
+            false => Level::Host,
+        }
+    }
+    /// The engine's dispatch wakes whenever bytes free on a GPU: a queued request asks `fits`
+    /// again then, and never polls.
+    pub fn wake_on_freed(&self, engine: &Arc<Engine>) {
+        for ledger in self.devices.iter().filter_map(|d| d.memory.as_ref()) {
+            let engine = Arc::downgrade(engine);
+            ledger.on_freed(Box::new(move || engine.upgrade().iter().for_each(|e| e.notify_activity())));
         }
     }
 
@@ -1109,8 +1096,8 @@ impl Pool {
         }
         let asked = Instant::now();
         let mut result = self.prewarm(engine, held, plan.clone(), 0, true, member.fetch.clone());
-        if let (Ok("loaded" | "already loaded"), Level::Gpu) = (&result, level) {
-            result = self.map_member(plan);
+        if let (Ok("loaded" | "already loaded"), Level::Gpu | Level::Host) = (&result, level) {
+            result = self.map_member(plan, level);
         }
         self.settle_lane(&plan.construction, 0, plan.degree);
         self.note_prewarm(&plan.construction, Default::default(), asked.elapsed(), &result);
@@ -1123,11 +1110,11 @@ impl Pool {
             }
         }
     }
-    /// A loaded member's weights kept and restored onto its GPU (`gpu`) into the room there is:
-    /// "mapped", or why they stay in the host cache.
-    fn map_member(&self, plan: &Plan) -> io::Result<&'static str> {
-        let level = self.levels.lock().unwrap().get(&plan.construction).map(|(_, level)| *level);
-        if level == Some(Level::Gpu) {
+    /// Warming a loaded member: its executor loads its models at `level` (`gpu`, or `host` in
+    /// RAM) and varena fills them: "mapped", or why they stay lower.
+    fn map_member(&self, plan: &Plan, level: Level) -> io::Result<&'static str> {
+        let holds = self.levels.lock().unwrap().get(&plan.construction).map(|(_, level)| *level);
+        if holds == Some(level) {
             return Ok("mapped");
         }
         if plan.degree != 1 {
@@ -1137,7 +1124,10 @@ impl Pool {
             return Ok("its executor ended");
         };
         let reply = session.executor.command(
-            &DeviceCommand::Map { construction: plan.construction.clone() },
+            &DeviceCommand::Map {
+                construction: plan.construction.clone(),
+                level: if level == Level::Gpu { "gpu" } else { "ram" },
+            },
             &mut device_executor::Baseline,
         );
         let complete = reply.as_ref().is_ok_and(|reply| reply.ok && reply.complete.unwrap_or(true));
@@ -1277,29 +1267,29 @@ impl Pool {
             }
         }
     }
-    /// A new executor's context on every GPU of the lane, in device order (so two groups never
-    /// wait on each other): free room, else others' cold and idle bytes asked for, else idle
-    /// executors ended (never `plan`'s, never a warm member's when `spare`). `exact` (a
-    /// prefetch) takes only what is free and makes no room. Whether every GPU had its room; a
-    /// request starts either way and its executor makes what room it can.
-    fn admit(&self, plan: &str, start: usize, degree: u32, spare: bool, exact: bool) -> io::Result<bool> {
+    /// Room for a request of `plan` on every GPU of the lane, in device order (so two groups
+    /// never wait on each other), at `shape` once it is known (`spawn`: it starts a process too):
+    /// while it does not fit and no request runs there, the bytes of exited executors are waited
+    /// for while they come back, then idle executors end, least recently used first (never
+    /// `plan`'s, nor a warm member's when `spare`). Whether it fits everywhere; a request starts
+    /// either way, and varena in its executor makes what room it can.
+    fn make_room(&self, plan: &str, start: usize, degree: u32, shape: Option<&str>, spawn: bool, spare: bool) -> io::Result<bool> {
         self.reap();
         let mut fit = true;
         for (gpu, device) in (start..).zip(self.lane(start, degree)?) {
             let Some(ledger) = &device.memory else { continue };
-            let need = ledger.context();
-            if exact {
-                ledger.now();
-                fit &= ledger.fits(need, true);
-                continue;
+            loop {
+                ledger.settle();
+                if ledger.fits(plan, shape, spawn) {
+                    break;
+                }
+                if ledger.running() || !self.end_idle_on(gpu, plan, spare) {
+                    fit = false;
+                    break;
+                }
             }
-            let admitted = ledger.admit(need, &mut || self.end_idle_on(gpu, plan, spare))?;
-            fit &= admitted == Admitted::Now;
         }
         Ok(fit)
-    }
-    pub fn host_tier(&self) -> &Arc<HostTier> {
-        &self.host
     }
     /// Idle executors that exited leave the pool.
     fn reap(&self) {
@@ -1689,21 +1679,13 @@ impl Pool {
         let leaders = self.leaders.lock().unwrap();
         leaders.iter().filter(|(p, _)| p == plan).map(|(_, start)| *start).collect()
     }
-    /// Whether a replica of `plan` fits on GPU `device` now: what its executors hold on their
-    /// own GPUs (else a new context) is free there, or once others' cold and idle bytes go.
-    /// Without a ledger, when no executor is there.
+    /// Whether a replica of `plan` fits on GPU `device` now (`fits`, its widest measured shape,
+    /// a new process). Without a ledger, when no executor is there.
     fn fits(&self, plan: &str, device: usize) -> bool {
-        let Some(ledger) = &self.devices[device].memory else {
-            return !self.leaders.lock().unwrap().iter().any(|(_, start)| *start == device);
-        };
-        let held = {
-            let tenants = self.tenants.lock().unwrap();
-            let rows = tenants.iter().filter(|(_, t)| t.plan == plan).filter_map(|(pid, t)| {
-                self.devices.get(t.start)?.memory.as_ref()?.row(*pid).map(|(held, _)| held)
-            });
-            rows.max()
-        };
-        ledger.fits(held.unwrap_or_else(|| ledger.context()), false)
+        match &self.devices[device].memory {
+            Some(ledger) => ledger.fits(plan, None, true),
+            None => !self.leaders.lock().unwrap().iter().any(|(_, start)| *start == device),
+        }
     }
     /// Where `plan` runs now, with its GPUs' call slots: inside its root's `lane` when it has
     /// one, else (a standalone call) on GPUs no root holds or older root claims. A group takes
@@ -1832,7 +1814,6 @@ impl Pool {
             gpus: &'a str,
             load_ms: f64,
             facts: &'a Option<device_executor::LoadFacts>,
-            host_tier: crate::host_tier::HostTierFacts,
             machine: ProcessMemory,
             executor: ProcessMemory,
             launch: &'a Launch,
@@ -1842,7 +1823,6 @@ impl Pool {
             gpus,
             load_ms: took.as_secs_f64() * 1e3,
             facts: &loaded.facts,
-            host_tier: self.host.facts(),
             machine: process(std::process::id()).unwrap_or_default(),
             executor: process(executor).unwrap_or_default(),
             launch,
@@ -1965,9 +1945,13 @@ impl Pool {
         if self.sessions.lock().unwrap().contains_key(&session_key(&plan.construction, start)) {
             return Ok("already loaded");
         }
-        // A warm set member may end idle executors outside every set; a prefetch takes only
-        // what is free. Neither touches a member or a running call.
-        if !self.admit(&plan.construction, start, plan.degree, true, !member)? {
+        // A warm set member may end idle executors outside every set; a prefetch only starts
+        // where it fits. Neither touches a member or a running call.
+        let fits = match member {
+            true => self.make_room(&plan.construction, start, plan.degree, None, true, true)?,
+            false => self.lane(start, plan.degree)?.iter().all(|d| d.memory.as_ref().is_none_or(|m| m.fits(&plan.construction, None, true))),
+        };
+        if !fits {
             return Ok("no GPU room beside the warm set and the running call");
         }
         let mut session = self.new_session(engine, held, &plan, start, |_, _| Ok(()))?;
@@ -2443,8 +2427,8 @@ impl Pool {
                 session
             }
             None => {
-                // Its context has room on every GPU of the lane before the process exists.
-                self.admit(&plan.construction, start, degree, false, false)?;
+                // Room for its process and its widest measured request before it exists.
+                self.make_room(&plan.construction, start, degree, None, true, false)?;
                 let on_birth = |birth: &Birth, cancel: &Cancellation| {
                     engine.register_managed(id, birth.clone(), stops(cancel.clone()))
                 };
@@ -2583,21 +2567,6 @@ impl Pool {
             id,
         });
         let sources = Arc::new(ModelSources::open_shared(self.store.clone(), &selections)?);
-        // The executor reads holes from object files: it gets only what it streams staged.
-        let peer = self.host.register_peer(executor.observer_pidfd()?);
-        let grants = selections
-            .iter()
-            .map(|selected| {
-                Ok(HostGrant {
-                    manifest: selected.manifest.clone(),
-                    checkpoint: sources.authorized(&selected.manifest)?,
-                    components: selected.components.iter().cloned().collect(),
-                })
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        // Weights come from the machine's sealed host tier, filled through TensorFS (what is
-        // here, while Runtime imports and constructs the model; the rest as it lands).
-        self.host.prepare(grants.clone());
         Ok(Session {
             plan: plan.construction.clone(),
             start,
@@ -2609,8 +2578,6 @@ impl Pool {
             executor,
             used: Instant::now(),
             sources,
-            peer,
-            grants,
             launch,
             invoked: false,
         })
@@ -2645,10 +2612,8 @@ impl Pool {
             engine,
             id,
             completed: 0,
-            host: &self.host,
+            deposits: &self.deposits,
             sources: &session.sources,
-            peer: session.peer,
-            grants: &session.grants,
             pool: self,
             store: &self.store,
             spool: None,
@@ -2660,11 +2625,13 @@ impl Pool {
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
             let starting = Instant::now();
-            // Each GPU's ledger follows the Start, in lane order: every rank claims its own row.
-            let ledgers = match gpus.iter().all(|d| d.memory.is_some()) {
+            // Each GPU's ledger and its eventfd follow the Start, in lane order: every rank claims
+            // its own row.
+            let grants = match gpus.iter().all(|d| d.memory.is_some()) {
                 true => gpus.iter().filter_map(|d| d.memory.as_ref()).map(GpuLedger::grant).collect::<io::Result<Vec<_>>>()?,
                 false => vec![],
             };
+            let ledgers: Vec<File> = grants.into_iter().flatten().collect();
             // Rank 0 spawns and forms every follower inside this command; its watch meters
             // the whole group's work, so formation ends only on measured lack of progress.
             let started = command_ok(session.executor.command_with(
@@ -2676,7 +2643,7 @@ impl Pool {
                     import_only: false,
                     call_interfaces: crate::calls::call_interfaces(held, &interface_path),
                     constructions: constructions(&plan),
-                    ledgers: ledgers.len() as u32,
+                    ledgers: (ledgers.len() / 2) as u32,
                     memory_mode: match self.config.host.mode {
                         cozy_platform::contain::host_pressure::HostMode::Shared => "shared",
                         cozy_platform::contain::host_pressure::HostMode::Dedicated => "dedicated",
@@ -2838,7 +2805,11 @@ impl Pool {
             engine.finish(id, Outcome::Failed(failure))?;
             return Ok(true);
         }
-        command_ok(prepared)?;
+        let prepared = command_ok(prepared)?;
+        // Its measured peak is recorded under its shape: room for it, and the key named to varena.
+        let shape = shape(&prepared.features);
+        self.make_room(&construction, start, degree, Some(&shape), false, false)?;
+        let _dispatched = Dispatched::new(gpus, id, &format!("{construction}|{shape}"));
         let spool = if let Some(identity) = self.config.identity {
             // Keep Journal/results/admin paths private to the core. A separate peer-owned
             // spool lives only inside this executor's already authorized output directory.
@@ -3023,6 +2994,34 @@ fn binds_models(interface: &serde_json::Value) -> bool {
 
 /// An error ends its executor; the exact exit is observed before the run settles, and a
 /// kill's measurement joins the reason.
+/// A request's shape key: its normalized features (PrepareRequest's), hashed to 16 hex digits.
+fn shape(features: &BTreeMap<String, serde_json::Value>) -> String {
+    let canonical = crate::boundary_json::exact(&serde_json::json!(features));
+    tensorfs_core::sha256::hex_digest(&canonical)[..16].to_string()
+}
+
+/// A request named to varena on every GPU of its lane (`<package>|<shape>`, the key its peak is
+/// recorded under), until it ends.
+struct Dispatched<'a> {
+    gpus: &'a [Device],
+    id: String,
+}
+impl<'a> Dispatched<'a> {
+    fn new(gpus: &'a [Device], id: &str, key: &str) -> Self {
+        for ledger in gpus.iter().filter_map(|d| d.memory.as_ref()) {
+            if let Err(error) = ledger.dispatch(id, key) {
+                tracing::warn!("memory: request {id} runs unrecorded: {error}");
+            }
+        }
+        Self { gpus, id: id.into() }
+    }
+}
+impl Drop for Dispatched<'_> {
+    fn drop(&mut self) {
+        self.gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(|ledger| ledger.undispatch(&self.id));
+    }
+}
+
 fn ended_with(engine: &Engine, id: &str, error: io::Error, executor: DeviceExecutor) -> io::Error {
     let (pid, stderr_tail) = (executor.birth.pid, executor.stderr_tail());
     let error = ending(error, executor);
@@ -3458,10 +3457,8 @@ struct Callbacks<'a> {
     engine: &'a Arc<Engine>,
     id: &'a str,
     completed: u64,
-    host: &'a Arc<HostTier>,
+    deposits: &'a Deposits,
     sources: &'a Arc<ModelSources>,
-    peer: u64,
-    grants: &'a [HostGrant],
     pool: &'a Pool,
     store: &'a Store,
     /// The invoking request's spool, where its published assets' bytes are.
@@ -3482,29 +3479,22 @@ impl Callbacks<'_> {
         if let Some(fetch) = self.fetch {
             fetch.wait(&crate::access::held(self.store, manifest)?, &objects)?;
         }
-        let files = self.sources.files(objects)?;
-        answer.objects_sha256 = crate::host_tier::objects_digest(&files);
-        Ok(files.into_iter().map(|(_, file)| file).collect())
+        answer.objects_sha256 = crate::deposits::objects_digest(&objects);
+        Ok(self.sources.files(objects)?.into_iter().map(|(_, file)| file).collect())
     }
 }
 impl Services for Callbacks<'_> {
-    /// A weight set's bytes: the sealed host layout its plan names where this machine fills
-    /// one, else every chunk file of its selected components (an Apple or CPU executor).
+    /// A weight set's bytes: the sealed host layout an executor deposited for its manifest and
+    /// layout, else every chunk file of its selected components (TensorD never fills).
     fn read_grant(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
+        drop(plan);
         let mut answer = Answer::unavailable(frame.seq);
-        let request = SealedRequest { sha256: &frame.sha256, length: frame.length, stage: None };
-        let sealed = match plan {
-            Some(plan) => self.host.seal(self.peer, self.grants, request, plan, self.fetch),
-            None => Ok(None),
-        };
-        let files = match sealed {
-            Ok(Some(layout)) => {
+        let files = match self.deposits.grant(&frame.manifest, &frame.layout) {
+            Some(layout) => {
                 answer.held = true;
                 Ok(vec![layout])
             }
-            Ok(None) => self.chunks(&frame.manifest, &mut answer),
-            Err(error) if error.kind() == io::ErrorKind::Unsupported => self.chunks(&frame.manifest, &mut answer),
-            Err(error) => Err(error),
+            None => self.chunks(&frame.manifest, &mut answer),
         };
         Ok(match files {
             Ok(files) => {
@@ -3530,6 +3520,14 @@ impl Services for Callbacks<'_> {
     ) -> io::Result<(Answer, Option<File>)> {
         if frame.kind == Kind::FetchChannel {
             return Ahead(self.fetch.map(|fetch| &**fetch)).request(frame, descriptor);
+        }
+        if frame.kind == Kind::Deposit {
+            // A layout varena sealed in the executor, kept for the next executor of its weights.
+            let layout = descriptor.ok_or_else(|| io::Error::other("a deposit omitted its layout"))?;
+            return Ok(match self.deposits.deposit(&frame.manifest, &frame.layout, layout) {
+                Ok(()) => (Answer::ok(frame.seq), None),
+                Err(error) => (Answer::refused(frame.seq, "deposit_refused", error.to_string()), None),
+            });
         }
         if frame.kind == Kind::ModelSource {
             drop(descriptor);
@@ -3764,7 +3762,7 @@ mod tests {
         let pool = Pool::new(&root.join("gpu"), config, store).unwrap();
         let host = cozy_platform::contain::host_memory::total();
         assert!(host > 0);
-        assert_eq!(pool.devices[0].memory.as_ref().map(GpuLedger::capacity), Some(host as u64));
+        assert_eq!(pool.devices[0].memory.as_ref().map(|ledger| ledger.status().unwrap().capacity), Some(host as u64));
         let _ = fs::remove_dir_all(root);
     }
 

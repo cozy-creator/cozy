@@ -1,24 +1,28 @@
-//! TensorD on varena's ledger (design memory-varena §5.6), with real processes as tenants and
-//! a fake `libnvidia-ml.so.1` as the only stand-in: the GPU. Each test runs in a child of this
+//! TensorD on varena's ledger (design memory-varena §2, §5.6), with real processes as tenants
+//! and a fake `libnvidia-ml.so.1` as the only stand-in: the GPU. Each test runs in a child of this
 //! binary under that NVML, whose memory is the bytes each file in `FAKE_NVML_DIR` charges its
-//! pid; a tenant (`tenant`, another child) claims its own row, publishes its facts, charges
-//! its bytes and answers asks by evicting cold bytes. Its death leaves its charge until the
-//! test takes the file away, as a driver gives a dead process's memory back.
+//! pid. A tenant (`tenant`, another child) is an executor's ledger half: it claims its own row,
+//! publishes its facts and running requests, charges its bytes, frees, and answers asks by
+//! evicting cold bytes (or never). Its death leaves its charge until the test takes the file
+//! away, as a driver gives a dead process's memory back.
 #![cfg(target_os = "linux")]
 use std::{
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     os::{
         fd::{AsRawFd, BorrowedFd},
         unix::process::CommandExt,
     },
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, OnceLock},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::Duration,
 };
 use tensord::{
-    memory::{Admitted, GpuLedger, MemoryLog},
+    memory::{GpuLedger, MemoryLog},
     process::Liveness,
 };
 use varena::ledger::{Facts, Ledger};
@@ -134,39 +138,71 @@ fn ledger(liveness: Liveness) -> GpuLedger {
     GpuLedger::start("0", false, 0, None, liveness, MemoryLog::default()).unwrap().expect("a ledger")
 }
 
-/// A tenant process with its own row in `ledger`.
+/// The driver gives `pid`'s memory back.
+fn release(pid: u32) {
+    let _ = fs::remove_file(charges().join(pid.to_string()));
+}
+
+/// A process charging the GPU without a row (another program).
+fn foreign(bytes: u64) {
+    fs::write(charges().join("1"), bytes.to_string()).unwrap();
+}
+
+/// A tenant process with its own row, driven over stdin: `publish context resident cold torch`,
+/// `running [id remaining]…`, `freed`; each answered `tenant-ok`.
 struct Tenant {
     child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
     pid: u32,
 }
 
 impl Tenant {
     /// Its bytes are charged in `charges` (the fake NVML's directory, or any).
-    fn start(ledger: &GpuLedger, charges: &Path, facts: &str, mode: &str) -> Self {
-        let fd = ledger.grant().unwrap();
-        let raw = fd.as_raw_fd();
+    fn start(ledger: &GpuLedger, charges: &Path, mode: &str) -> Self {
+        let [memfd, events] = ledger.grant().unwrap();
+        let (fd, events_fd) = (memfd.as_raw_fd(), events.as_raw_fd());
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", "tenant", "--ignored", "--nocapture", "--test-threads=1"])
-            .env("LEDGER_FD", raw.to_string())
-            .env("TENANT_FACTS", facts)
+            .env("LEDGER_FD", fd.to_string())
+            .env("EVENTS_FD", events_fd.to_string())
             .env("TENANT_MODE", mode)
             .env("FAKE_NVML_DIR", charges)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped());
-        // SAFETY: only fcntl on a descriptor this process keeps open through the spawn.
+        // SAFETY: only fcntl on descriptors this process keeps open through the spawn.
         unsafe {
-            command.pre_exec(move || match libc::fcntl(raw, libc::F_SETFD, 0) {
-                0 => Ok(()),
+            command.pre_exec(move || match (libc::fcntl(fd, libc::F_SETFD, 0), libc::fcntl(events_fd, libc::F_SETFD, 0)) {
+                (0, 0) => Ok(()),
                 _ => Err(std::io::Error::last_os_error()),
             });
         }
         let mut child = command.spawn().unwrap();
-        drop(fd);
-        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        // libtest prints `test tenant ... ` ahead of what the test prints on the same line.
-        assert!(lines.any(|line| line.unwrap().ends_with("tenant-ready")), "the tenant never claimed its row");
+        drop((memfd, events));
+        let (input, output) = (child.stdin.take().unwrap(), BufReader::new(child.stdout.take().unwrap()));
         let pid = child.id();
-        Self { child, pid }
+        let mut tenant = Self { child, input, output, pid };
+        tenant.answer();
+        tenant
+    }
+
+    /// libtest prints `test tenant ... ` ahead of what the test prints on the same line.
+    fn answer(&mut self) {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(self.output.read_line(&mut line).unwrap() > 0, "tenant {} exited", self.pid);
+            if line.trim_end().ends_with("tenant-ok") {
+                return;
+            }
+        }
+    }
+
+    fn call(&mut self, line: &str) {
+        writeln!(self.input, "{line}").unwrap();
+        self.input.flush().unwrap();
+        self.answer();
     }
 
     /// `kill -9`: its row drops at once; its bytes stay charged until the driver lets them go.
@@ -183,73 +219,101 @@ impl Drop for Tenant {
     }
 }
 
-/// The driver gives `pid`'s memory back.
-fn release(pid: u32) {
-    let _ = fs::remove_file(charges().join(pid.to_string()));
-}
-
-/// A tenant: claims a row in the ledger it inherited, publishes `TENANT_FACTS`
-/// (`context,resident,cold,torch_allocated` bytes), charges them to its pid, then
-/// answers asks by evicting cold bytes (`answer`) or never (`stall`). It says `tenant-ready`.
+/// A tenant: claims a row in the ledger it inherited and serves the commands above; in `answer`
+/// mode a thread answers asks by evicting cold bytes, in `stall` mode nothing does.
 #[test]
 #[ignore = "a tenant process the ledger tests start"]
 fn tenant() {
     let fd: i32 = std::env::var("LEDGER_FD").unwrap().parse().unwrap();
-    // SAFETY: the descriptor this process inherited, open for its whole life.
-    let ledger = Ledger::adopt(unsafe { BorrowedFd::borrow_raw(fd) }, None).unwrap();
-    let row = ledger.claim(std::process::id()).unwrap();
-    let bytes: Vec<u64> = std::env::var("TENANT_FACTS").unwrap().split(',').map(|n| n.parse().unwrap()).collect();
-    let mut facts = Facts {
-        context: bytes[0],
-        resident: bytes[1],
-        cold: bytes[2],
-        torch_allocated: bytes[3],
-        torch_reserved: bytes[3],
-        last_use: 1,
-        ..Facts::default()
-    };
+    let events: i32 = std::env::var("EVENTS_FD").unwrap().parse().unwrap();
+    // SAFETY: the descriptors this process inherited, open for its whole life.
+    let ledger = Ledger::adopt(unsafe { BorrowedFd::borrow_raw(fd) }, Some(unsafe { BorrowedFd::borrow_raw(events) })).unwrap();
+    let ledger = Arc::new(ledger);
+    let row = Arc::new(ledger.claim(std::process::id()).unwrap());
+    let facts = Arc::new(Mutex::new(Facts { last_use: 1, ..Facts::default() }));
     let charge = |facts: &Facts| fs::write(charges().join(std::process::id().to_string()), facts.held().to_string()).unwrap();
-    row.publish(&facts);
-    charge(&facts);
-    println!("tenant-ready");
-    if std::env::var("TENANT_MODE").unwrap() == "stall" {
-        loop {
-            std::thread::park();
-        }
+    if std::env::var("TENANT_MODE").unwrap() == "answer" {
+        let (row, facts) = (row.clone(), facts.clone());
+        std::thread::spawn(move || loop {
+            let want = row.wait_want();
+            let mut f = facts.lock().unwrap();
+            let freed = want.min(f.cold);
+            (f.cold, f.resident) = (f.cold - freed, f.resident - freed);
+            row.publish(&f);
+            charge(&f);
+            row.ack(freed);
+        });
     }
-    loop {
-        let freed = row.wait_want().min(facts.cold);
-        facts.cold -= freed;
-        facts.resident -= freed;
-        row.publish(&facts);
-        charge(&facts);
-        row.ack(freed);
+    println!("tenant-ok");
+    for line in std::io::stdin().lock().lines() {
+        let line = line.unwrap();
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words[0] {
+            "publish" => {
+                let n: Vec<u64> = words[1..].iter().map(|w| w.parse().unwrap()).collect();
+                let mut f = facts.lock().unwrap();
+                (f.context, f.resident, f.cold, f.torch_allocated, f.torch_reserved) = (n[0], n[1], n[2], n[3], n[3]);
+                row.publish(&f);
+                charge(&f);
+            }
+            "running" => {
+                let pairs = words[1..].chunks(2).map(|p| (p[0].to_string(), p[1].parse().unwrap())).collect::<Vec<(String, i64)>>();
+                row.running(&pairs).unwrap();
+            }
+            "freed" => ledger.freed(),
+            other => panic!("unknown command {other}"),
+        }
+        println!("tenant-ok");
     }
 }
 
+/// `fits` through TensorD's ledger: a measured peak beside every row's unevictable bytes, every
+/// running request's remaining peak and what NVML shows that no row explains; a shape never
+/// measured only alone. A request ending frees bytes, and the pool hears it.
 #[test]
-fn a_second_executor_is_admitted_once_the_firsts_cold_weights_are_asked_for_and_freed() {
-    under_fake_nvml("inner_a_second_executor_waits_for_the_firsts_cold_weights", 24 * GIB, false);
+fn a_request_starts_only_when_its_measured_peak_fits_and_freed_bytes_wake_the_pool() {
+    under_fake_nvml("inner_a_request_starts_only_when_it_fits", 24 * GIB, false);
 }
 
 #[test]
 #[ignore = "run under the fake NVML by its outer test"]
-fn inner_a_second_executor_waits_for_the_firsts_cold_weights() {
+fn inner_a_request_starts_only_when_it_fits() {
     let ledger = ledger(Liveness::default());
-    let first = Tenant::start(&ledger, &charges(), &format!("{},{},{},0", GIB / 2, 19 * GIB + GIB / 2, 19 * GIB), "answer");
+    let woken = Arc::new(AtomicU64::new(0));
+    let heard = woken.clone();
+    ledger.on_freed(Box::new(move || {
+        heard.fetch_add(1, Ordering::SeqCst);
+    }));
+    let mut running = Tenant::start(&ledger, &charges(), "answer");
+    running.call(&format!("publish {} {} {} {}", GIB / 2, 4 * GIB, 4 * GIB, 3 * GIB / 2));
     ledger.now();
-    assert_eq!(ledger.free().unwrap(), 4 * GIB);
-    assert!(!ledger.fits(8 * GIB, true), "8 GiB is not free beside the first executor");
-    assert!(ledger.fits(8 * GIB, false), "its cold weights make the room");
-    let admitted = ledger.admit(8 * GIB, &mut || panic!("cold weights are asked for, no executor ended")).unwrap();
-    assert_eq!(admitted, Admitted::Now);
-    assert!(ledger.free().unwrap() >= 8 * GIB);
-    let (_, resident) = ledger.row(first.pid).expect("the first executor lives on");
-    assert_eq!(resident, 15 * GIB + GIB / 2, "it gave exactly what was missing");
+    assert!(ledger.fits("plan", Some("s"), false), "never measured, and nothing runs");
+    running.call(&format!("running r1 {}", 12 * GIB));
+    assert!(!ledger.fits("plan", Some("s"), false), "never measured beside a running request");
+    let [memfd, _] = ledger.grant().unwrap();
+    let executor = Ledger::adopt(std::os::fd::AsFd::as_fd(&memfd), None).unwrap();
+    executor.set_peak("plan|s", 8 * GIB).unwrap();
+    assert!(ledger.fits("plan", Some("s"), false), "2 unevictable + 12 remaining + 8 of 24");
+    foreign(3 * GIB);
+    ledger.now();
+    assert!(!ledger.fits("plan", Some("s"), false), "another program's 3 GiB count");
+    release(1);
+    ledger.now();
+    assert!(ledger.fits("plan", Some("s"), false));
+    let before = woken.load(Ordering::SeqCst);
+    running.call("running");
+    running.call("freed");
+    for _ in 0..2 {
+        ledger.now();
+    }
+    assert!(woken.load(Ordering::SeqCst) > before, "freed bytes woke the pool");
+    executor.set_peak("plan|s", 23 * GIB).unwrap();
+    assert!(!ledger.fits("plan", Some("s"), false), "2 unevictable + 23 of 24");
+    assert!(ledger.fits("plan", Some("other"), false), "a shape never measured, alone");
 }
 
 /// The 11405 shape: an executor holding 7 GiB of an 8 GiB card in torch is killed. Its bytes
-/// are counted until NVML shows them back, and nothing is admitted beside them meanwhile.
+/// are counted until NVML shows them back, and nothing fits beside them meanwhile.
 #[test]
 fn a_killed_executors_bytes_stay_counted_until_nvml_shows_them_back() {
     under_fake_nvml("inner_a_killed_executors_bytes_stay_counted", 8 * GIB, true);
@@ -265,27 +329,28 @@ fn a_killed_executors_bytes_stay_counted_where_nvml_cannot_attribute_them() {
 #[ignore = "run under the fake NVML by its outer test"]
 fn inner_a_killed_executors_bytes_stay_counted() {
     let ledger = ledger(Liveness::default());
-    let mut held = Tenant::start(&ledger, &charges(), &format!("{},0,0,{}", GIB / 2, 6 * GIB + GIB / 2), "answer");
+    let mut held = Tenant::start(&ledger, &charges(), "answer");
+    held.call(&format!("publish {} 0 0 {}", GIB / 2, 6 * GIB + GIB / 2));
+    let [memfd, _] = ledger.grant().unwrap();
+    Ledger::adopt(std::os::fd::AsFd::as_fd(&memfd), None).unwrap().set_peak("plan|s", 2 * GIB).unwrap();
     ledger.now();
-    assert_eq!(ledger.free().unwrap(), GIB);
+    assert!(!ledger.fits("plan", Some("s"), false), "7 held + 2 of 8");
     held.kill();
-    let ended = std::cell::Cell::new(0);
-    let admitted = ledger.admit(2 * GIB, &mut || {
-        ended.set(ended.get() + 1);
-        false
-    });
-    assert_eq!(admitted.unwrap(), Admitted::Short(GIB), "nothing beside a dead executor's bytes");
-    assert_eq!(ended.get(), 1, "an idle executor would have been ended for the room");
-    assert_eq!(ledger.free().unwrap(), GIB);
+    ledger.settle();
+    assert!(!ledger.fits("plan", Some("s"), false), "nothing beside a dead executor's bytes");
+    // Where NVML charges each process, its row stays reaping meanwhile: not even a request never
+    // measured starts beside it. In a container the bytes are TensorD's row's, unexplained.
+    let attributed = std::env::var_os("FAKE_NVML_PROCESSES").is_some();
+    assert_eq!(ledger.fits("plan", Some("never"), false), !attributed);
     release(held.pid);
-    assert_eq!(ledger.admit(2 * GIB, &mut || false).unwrap(), Admitted::Now);
-    assert_eq!(ledger.free().unwrap(), 8 * GIB);
+    ledger.settle();
+    assert!(ledger.fits("plan", Some("s"), false));
 }
 
-/// A victim that never answers is named stalled once its progress has not moved for a wedge
-/// floor, and ended; the start it held up then goes ahead.
+/// A victim that never answers an ask is named stalled once its progress has not moved for a
+/// wedge floor, and ended; the asker's wait then returns.
 #[test]
-fn a_stalled_victim_is_ended_and_the_start_goes_ahead() {
+fn a_stalled_victim_is_ended_and_its_asker_goes_on() {
     under_fake_nvml("inner_a_stalled_victim_is_ended", 8 * GIB, false);
 }
 
@@ -293,7 +358,8 @@ fn a_stalled_victim_is_ended_and_the_start_goes_ahead() {
 #[ignore = "run under the fake NVML by its outer test"]
 fn inner_a_stalled_victim_is_ended() {
     let ledger = ledger(Liveness { sample: Duration::from_millis(50) });
-    let stalled = Tenant::start(&ledger, &charges(), &format!("{},{},{},0", GIB / 2, 6 * GIB + GIB / 2, 6 * GIB), "stall");
+    let mut stalled = Tenant::start(&ledger, &charges(), "stall");
+    stalled.call(&format!("publish {} {} {} 0", GIB / 2, 6 * GIB + GIB / 2, 6 * GIB));
     let ended: Arc<Mutex<Vec<u32>>> = Arc::default();
     let seen = ended.clone();
     ledger.on_stalled(Box::new(move |pid| {
@@ -302,10 +368,11 @@ fn inner_a_stalled_victim_is_ended() {
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         release(pid);
     }));
-    ledger.now();
-    assert_eq!(ledger.free().unwrap(), GIB);
-    let admitted = ledger.admit(4 * GIB, &mut || false).unwrap();
-    assert_eq!(admitted, Admitted::Now);
+    let [memfd, _] = ledger.grant().unwrap();
+    let asker = Ledger::adopt(std::os::fd::AsFd::as_fd(&memfd), None).unwrap();
+    for victim in asker.ask(None, 3 * GIB).unwrap() {
+        asker.wait(&victim).unwrap();
+    }
     assert_eq!(*ended.lock().unwrap(), [stalled.pid]);
 }
 
@@ -318,18 +385,19 @@ fn each_rank_of_a_group_holds_its_own_gpus_row() {
         .map(|entry| GpuLedger::start(entry, false, 0, Some(8 * GIB), Liveness::default(), MemoryLog::default()).unwrap().unwrap())
         .collect();
     let dir = tempfile::tempdir().unwrap();
-    let ranks: Vec<Tenant> = ledgers.iter().map(|l| Tenant::start(l, dir.path(), &format!("{},{},0,{}", GIB / 2, 2 * GIB, GIB), "answer")).collect();
+    let mut ranks: Vec<Tenant> = ledgers.iter().map(|l| Tenant::start(l, dir.path(), "answer")).collect();
+    for rank in &mut ranks {
+        rank.call(&format!("publish {} {} 0 {}", GIB / 2, 2 * GIB, GIB));
+        rank.call("running req-1 0");
+    }
     for ledger in &ledgers {
         ledger.now();
-        assert_eq!(ledger.free().unwrap(), 8 * GIB - GIB / 2 - 3 * GIB);
+        assert!(ledger.running());
     }
-    assert!(ledgers[0].row(ranks[0].pid).is_some() && ledgers[0].row(ranks[1].pid).is_none());
-    assert!(ledgers[1].row(ranks[1].pid).is_some() && ledgers[1].row(ranks[0].pid).is_none());
     let [rank0, mut rank1]: [Tenant; 2] = ranks.try_into().ok().unwrap();
+    assert!(ledgers[1].resident(rank1.pid) && !ledgers[1].resident(rank0.pid));
     rank1.kill();
-    ledgers[1].now();
-    assert_eq!(ledgers[1].free().unwrap(), 8 * GIB, "the follower's GPU has its bytes back");
-    ledgers[0].now();
-    assert_eq!(ledgers[0].free().unwrap(), 8 * GIB - GIB / 2 - 3 * GIB, "rank 0's GPU is untouched");
-    drop(rank0);
+    ledgers[1].settle();
+    assert!(!ledgers[1].running(), "the follower's GPU has its row back");
+    assert!(ledgers[0].running() && ledgers[0].resident(rank0.pid), "rank 0's GPU is untouched");
 }

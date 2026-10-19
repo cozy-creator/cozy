@@ -223,10 +223,11 @@ pub enum DeviceCommand {
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         weights: BTreeMap<String, u64>,
     },
-    /// A warm set member at `gpu`: its loaded construction's weights kept and restored into
-    /// free room, nothing run.
+    /// Warming: the loaded construction's models are loaded at `level` (`gpu` or `ram`, varena
+    /// filling them), nothing run.
     Map {
         construction: String,
+        level: &'static str,
     },
     Unload {
         construction: String,
@@ -308,6 +309,8 @@ pub enum Kind {
     ModelSource,
     /// One weight set's bytes: its sealed host layout, or its chunk files.
     ReadGrant,
+    /// A sealed host layout the executor filled, for the next executor of its weights.
+    Deposit,
     Publish,
     StageMemoLookup,
     StageMemoStore,
@@ -444,6 +447,8 @@ pub struct Frame {
     pub kind: Kind,
     pub descriptor: bool,
     pub name: String,
+    /// `read_grant`/`deposit`: the sealed host layout's digest.
+    pub layout: String,
     pub manifest: String,
     pub sha256: String,
     pub length: u64,

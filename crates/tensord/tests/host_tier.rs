@@ -24,7 +24,7 @@ use tensorfs_core::{
     store2::Checkpoint,
     writer::{Data, Source},
 };
-use varena::{layout::Layout, Plane, PlaneConfig, Tier};
+use varena::{host::HostMem, layout::Layout};
 
 #[path = "common/names_hub.rs"]
 mod names_hub;
@@ -104,33 +104,17 @@ impl Fixture {
     fn adopt(&self, granted: &File) {
         assert!(self.adopt_filling(granted), "the layout's fill failed");
     }
-    /// An executor that waits per region: adopt a layout still filling, pin it (each region
-    /// once its filler marks it Ready), then check every byte. Never reads the store. False
-    /// when the fill failed.
+    /// An executor that waits per region: adopt a layout still filling, wait for each region
+    /// its filler marks Ready, then check every byte. Never reads the store. False when the
+    /// fill failed.
     fn adopt_filling(&self, granted: &File) -> bool {
-        let plane = Plane::open(PlaneConfig {
-            readers: 2,
-            ..Default::default()
-        })
-        .unwrap();
-        let plan = tensord::host_tier::plan_for_traversal(&self.checkpoint, &self.traversal(), &["unet".into()], 4 << 20).unwrap();
-        let pinned = plane
-            .register_sealed("unet", &plan, &self.regions(), granted.as_raw_fd())
-            .and_then(|ws| {
-                plane.set_pinned_budget(1 << 30)?;
-                plane.want(ws, Tier::Pinned, None, 0, false)?.wait()?;
-                Ok(ws)
-            });
-        if let Ok(ws) = pinned {
-            self.check(granted, &plane.layout(ws).unwrap());
-            assert_eq!(
-                plane.stats().host.counters.fill_bytes,
-                0,
-                "waited, never read"
-            );
+        let layout = self.layout();
+        let host = HostMem::adopt_sealed(granted.as_raw_fd(), &layout).unwrap();
+        let ready = (0..layout.regions.len() as u32).all(|r| host.wait_ready(r).is_ok());
+        if ready {
+            self.check(granted, &layout);
         }
-        let _ = plane.close();
-        pinned.is_ok()
+        ready
     }
     fn check(&self, granted: &File, layout: &Layout) {
         for part in &layout.parts {
