@@ -785,7 +785,7 @@ mod tests {
         service.engine.with_journal(|j| j.begin_metadata(&pending.id)).unwrap();
         resume(&runs).unwrap();
         let failed = service.engine.get_public("alice", "metadata-2").unwrap();
-        assert_eq!(failed.failure.unwrap().code, "metadata_preflight_interrupted");
+        assert_eq!(crate::journal::Failure::decode(&failed.failure.unwrap()).unwrap().code, "metadata_preflight_interrupted");
     }
 
     /// A digest of 64 non-hex bytes is refused, not sliced mid-character.
