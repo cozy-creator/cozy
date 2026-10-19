@@ -1143,7 +1143,7 @@ impl Pool {
             &mut device_executor::Baseline,
         );
         let complete = reply.as_ref().is_ok_and(|reply| reply.ok && reply.complete.unwrap_or(true));
-        self.keep_idle(session);
+        self.keep_idle(session)?;
         let reply = reply?;
         if !reply.ok {
             tracing::warn!("warm set: mapping {}: {} {}", plan.construction, reply.code, reply.detail);
@@ -1191,27 +1191,24 @@ impl Pool {
     }
     /// Keep an executor idle for its next call, noting what a loaded one holds for Status.
     /// Once the pool stopped it ends instead.
-    fn keep_idle(&self, session: Session) {
+    fn keep_idle(&self, session: Session) -> io::Result<()> {
         let key = session_key(&session.plan, session.start);
         if session.degree == 0 {
             let mut idle = self.deviceless.lock().unwrap();
             if !self.stopped.load(Ordering::Acquire) {
-                return idle.push(session);
+                idle.push(session);
+                return Ok(());
             }
             drop(idle);
-            if let Err(error) = session.executor.shutdown() {
-                tracing::warn!("ending executor {key} after the pool stopped: {error}");
-            }
-            return;
+            return session.executor.shutdown();
         }
         let mut sessions = self.sessions.lock().unwrap();
         if self.stopped.load(Ordering::Acquire) {
             drop(sessions);
             let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
-            if let Err(error) = session.executor.shutdown() {
-                tracing::warn!("ending executor {key} after the pool stopped: {error}");
-            }
-            return self.ended(&plan, start, degree);
+            session.executor.shutdown()?;
+            self.ended(&plan, start, degree);
+            return Ok(());
         }
         let mut session = session;
         session.used = Instant::now();
@@ -1221,6 +1218,7 @@ impl Pool {
             self.levels.lock().unwrap().insert(key.clone(), noted);
         }
         sessions.insert(key, session);
+        Ok(())
     }
     /// A lane's turn is over: an executor not kept idle is gone.
     fn settle_lane(&self, plan: &str, start: usize, degree: u32) {
@@ -1972,7 +1970,7 @@ impl Pool {
         let mut session = self.new_session(engine, held, &plan, start, |_, _| Ok(()))?;
         match self.call(engine, "", held, plan, &mut session, true, None, fetch) {
             Ok(_) => {
-                self.keep_idle(session);
+                self.keep_idle(session)?;
                 Ok("loaded")
             }
             // A prewarm is no run: there is no triage to keep.
@@ -2391,8 +2389,14 @@ impl Pool {
     ) -> io::Result<()> {
         let (key, degree) = (plan.construction.clone(), plan.degree);
         let result = self.run_on(engine, id, held, plan, start, calls);
-        // Broken/failed exchanges close the owner channel. Sources and the journal
-        // reservation survive until the exact receiver has exited.
+        // A known outcome with failed cleanup retains this run's permit and lane until
+        // exact exit. Dropping the permit first would dispatch over an unproven receiver.
+        if result.is_err() {
+            if let Some(pending) = engine.get(id)?.pending_completion {
+                await_pending_exit(engine, &pending);
+                engine.finish_pending(id)?;
+            }
+        }
         self.settle_lane(&key, start, degree);
         result
     }
@@ -2465,8 +2469,8 @@ impl Pool {
         };
         let facts = crate::journal::ExecutorFacts::observed(session.executor.birth.pid, runtime, hello.tensorfs_version.clone());
         if !engine.authorize_managed(id, Some(facts))? {
+            self.keep_idle(session)?;
             engine.finish_stopped(id)?;
-            self.keep_idle(session);
             return Ok(());
         }
         let fresh = plan.clone();
@@ -2474,19 +2478,30 @@ impl Pool {
             let mut session = session;
             let fetch = calls.map(|calls| engine.get(id).map(|record| calls.fetch(&record, &plan))).transpose()?;
             match self.call(engine, id, &held, plan, &mut session, false, calls, fetch) {
-                Ok(true) => {
-                    self.keep_idle(session);
+                Ok(reusable) => {
+                    // A caller can submit again as soon as finish publishes. Its predecessor
+                    // must already be idle, or gone if it cannot be reused.
+                    let returned = if reusable {
+                        self.keep_idle(session)
+                    } else {
+                        session.executor.terminate().map(drop)
+                    };
+                    returned?;
+                    engine.finish_pending(id)?;
                     return Ok(());
                 }
-                // Not reusable: gone (exit observed) before its context is released.
-                Ok(false) => return session.executor.terminate().map(drop),
-                Err(error) if undelivered(&error) => ending(error, session.executor),
-                Err(error) => return Err(ended_with(engine, id, error, session.executor)),
+                Err(error) => {
+                    if undelivered(&error) {
+                        ending(error, session.executor)
+                    } else {
+                        return Err(ended_with(engine, id, error, session.executor));
+                    }
+                }
             }
         }; // the rest of the ended session (sources, grants) goes here
         // Never started: once that exit is observed, this dispatch runs it on a fresh executor
         // (cold, so a second loss is FAILED). An unproven exit stays charged.
-        if !undelivered(&error) {
+        if !undelivered(&error) || engine.get(id)?.pending_completion.is_some() {
             return Err(error);
         }
         tracing::warn!("execution {id}: {error}; starting it on a fresh executor");
@@ -2599,8 +2614,8 @@ impl Pool {
         })
     }
 
-    /// Load (once) and invoke (unless `load_only`: a prewarm, no request). Ok(false): the
-    /// executor must not be reused.
+    /// Load once and invoke (unless `load_only`: a prewarm). A known outcome stays in
+    /// the journal until run_on returns its executor idle or proves its teardown ended.
     #[allow(clippy::too_many_arguments)]
     fn call(
         &self,
@@ -2807,7 +2822,7 @@ impl Pool {
         {
             // Canceled while it waited for its attention kernel's compile (Runtime 0.23.4).
             if prepared.terminal == "canceled" && engine.get(id)?.cancel_actor.is_some() {
-                engine.finish(id, Outcome::Canceled)?;
+                defer_completion(engine, id, &session.executor.birth, &session.followers, Outcome::Canceled)?;
                 return Ok(true);
             }
             // A pre-entry refusal leaves the executor Ready; the run ends with its reason.
@@ -2830,7 +2845,7 @@ impl Pool {
                     traceback: prepared.traceback.clone(),
                 },
             );
-            engine.finish(id, Outcome::Failed(failure))?;
+            defer_completion(engine, id, &session.executor.birth, &session.followers, Outcome::Failed(failure))?;
             return Ok(true);
         }
         let prepared = command_ok(prepared)?;
@@ -2920,35 +2935,26 @@ impl Pool {
                     let (value, bindings) =
                         device_executor::postprocess(&session.executor.codec(), &spool, &reply)?;
                     let adjusted = device_executor::adjustments(id, &reply);
-                    engine.managed_result(id, &spool, value, output_bindings(bindings), adjusted)
+                    engine.managed_result_record(id, &spool, value, output_bindings(bindings), adjusted)
                 })();
-                if let Err(error) = result {
-                    // The invocation is already quiescent; a codec/custody
-                    // failure cannot cause authored work to be dispatched again.
-                    engine.finish(
-                        id,
-                        Outcome::Failed(
-                            crate::journal::Failure::custody(&error.to_string()),
-                        ),
-                    )?;
-                }
+                // Custody is durable before the spool goes; terminal publication waits
+                // until run_on has returned the executor to its pool.
+                defer_completion(engine, id, &session.executor.birth, &session.followers, match result {
+                    Ok(result) => Outcome::Completed(result),
+                    Err(error) => Outcome::Failed(Failure::custody(&error.to_string())),
+                })?;
             }
             "canceled" if engine.get(id)?.cancel_actor.is_some() => {
-                engine.finish(id, Outcome::Canceled)?;
+                defer_completion(engine, id, &session.executor.birth, &session.followers, Outcome::Canceled)?;
             }
             _ => {
                 keep_triage(engine, id, &session.executor, outcome);
-                engine.finish(
-                    id,
-                    Outcome::Failed(
-                        crate::journal::Failure::executor(
-                            &outcome.terminal,
-                            &outcome.origin,
-                            &outcome.code,
-                            &outcome.message,
-                        ),
-                    ),
-                )?;
+                defer_completion(engine, id, &session.executor.birth, &session.followers, Outcome::Failed(Failure::executor(
+                    &outcome.terminal,
+                    &outcome.origin,
+                    &outcome.code,
+                    &outcome.message,
+                )))?;
             }
         }
         Ok(true)
@@ -3022,8 +3028,43 @@ fn binds_models(interface: &serde_json::Value) -> bool {
         })
 }
 
-/// An error ends its executor; the exact exit is observed before the run settles, and a
-/// kill's measurement joins the reason.
+/// No deadline authorizes release: exact kernel exits wake the existing activity loop.
+fn await_pending_exit(engine: &Arc<Engine>, pending: &crate::journal::PendingCompletion) {
+    let mut watched = std::collections::HashSet::new();
+    loop {
+        let epoch = engine.activity_epoch();
+        match pending.exited() {
+            Ok(true) => return,
+            Ok(false) => (),
+            Err(error) => tracing::warn!("pending executor exit remains unproven: {error}"),
+        }
+        let members = pending.processes.iter().flat_map(platform::process::group_members);
+        for birth in pending.processes.iter().cloned().chain(members) {
+            if watched.insert(birth.clone()) {
+                if let Err(error) = engine.watch_process(birth) {
+                    tracing::warn!("pending executor exit observer: {error}");
+                }
+            }
+        }
+        // A birth can exit before watch_process opens its handle (which then needs no
+        // watcher). Re-read after registration so that exit cannot be a lost wake.
+        if pending.exited().is_ok_and(|exited| exited) {
+            continue;
+        }
+        engine.wait_activity(epoch, None);
+    }
+}
+
+fn defer_completion(
+    engine: &Arc<Engine>, id: &str, leader: &Birth,
+    followers: &[platform::process::Exact], outcome: Outcome,
+) -> io::Result<()> {
+    let mut processes = platform::process::group_members(leader);
+    processes.extend(followers.iter().map(|exact| exact.birth().clone()));
+    processes.push(leader.clone());
+    engine.defer_completion(id, outcome, processes)
+}
+
 /// A request's shape key: its normalized features (PrepareRequest's), hashed to 16 hex digits.
 fn shape(features: &BTreeMap<String, serde_json::Value>) -> String {
     let canonical = crate::boundary_json::exact(&serde_json::json!(features));
@@ -3052,6 +3093,7 @@ impl Drop for Dispatched<'_> {
     }
 }
 
+/// An error ends its executor; exact exit is observed before settlement.
 fn ended_with(engine: &Engine, id: &str, error: io::Error, executor: DeviceExecutor) -> io::Error {
     let (pid, stderr_tail) = (executor.birth.pid, executor.stderr_tail());
     let error = ending(error, executor);
@@ -3130,6 +3172,16 @@ pub(crate) fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::R
     let record = engine.get(id)?;
     if record.state.terminal() {
         return Ok(());
+    }
+    if let Some(pending) = record.pending_completion {
+        if pending.exited()? {
+            engine.finish(id, pending.outcome)?;
+        } else {
+            for birth in pending.processes {
+                engine.watch_process(birth)?;
+            }
+        }
+        return Ok(()); // Keep the known outcome through every post-response cleanup error.
     }
     let ended = record
         .process

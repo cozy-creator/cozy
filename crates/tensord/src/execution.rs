@@ -850,6 +850,23 @@ impl Engine {
         Ok(record)
     }
 
+    /// Custody is durable before post-response cleanup; no terminal or public result yet.
+    pub(crate) fn defer_completion(
+        self: &Arc<Self>, id: &str, outcome: Outcome, processes: Vec<Birth>,
+    ) -> io::Result<()> {
+        let progress = self.progress.lock().unwrap();
+        self.journal.lock().unwrap().defer_completion(id, outcome, processes, progress.get(id))?;
+        Ok(())
+    }
+
+    /// The caller has proved that the executor is idle in its pool, or its teardown ended.
+    pub(crate) fn finish_pending(&self, id: &str) -> io::Result<()> {
+        if let Some(pending) = self.get(id)?.pending_completion {
+            self.finish(id, pending.outcome)?;
+        }
+        Ok(())
+    }
+
     /// A memoizable run's success, its files kept for its signer, to hold as it completes: a
     /// later call of the same computation is answered from it the moment this one is done.
     fn held_memo(&self, id: &str, outcome: &Outcome) -> Option<crate::journal::HeldMemo> {
@@ -988,6 +1005,7 @@ impl Engine {
         fs::create_dir_all(&root)?;
         Ok(root)
     }
+    #[cfg(test)]
     pub(crate) fn managed_result(
         &self,
         id: &str,
@@ -996,6 +1014,20 @@ impl Engine {
         bindings: Vec<crate::journal::AssetBinding>,
         adjustments: Vec<crate::journal::Adjustment>,
     ) -> io::Result<Execution> {
+        let result = self.managed_result_record(id, source, value, bindings, adjustments)?;
+        self.finish(id, Outcome::Completed(result))
+    }
+
+    /// Take the result's verified files into custody without publishing a terminal. A pooled
+    /// executor returns to its idle pool before its caller can observe completion and call again.
+    pub(crate) fn managed_result_record(
+        &self,
+        id: &str,
+        source: &Path,
+        value: Value,
+        bindings: Vec<crate::journal::AssetBinding>,
+        adjustments: Vec<crate::journal::Adjustment>,
+    ) -> io::Result<ResultRecord> {
         let mut paths: Vec<_> = bindings.iter().map(|b| b.relative_path.clone()).collect();
         // A tree's member files are held beside its manifest, by digest (`tree_binding`).
         for tree in bindings.iter().filter(|b| b.media_type == crate::gpu_service::TREE_MEDIA) {
@@ -1006,7 +1038,7 @@ impl Engine {
         paths.sort();
         paths.dedup();
         let result = self.bound_custody(id, source, value, paths, bindings)?;
-        self.finish(id, Outcome::Completed(ResultRecord { adjustments, ..result }))
+        Ok(ResultRecord { adjustments, ..result })
     }
 
     /// Reconcile a previous service incarnation without adopting or repeating authored work.
@@ -1020,6 +1052,17 @@ impl Engine {
                 || owned.contains(&record.id)
             {
                 continue;
+            }
+            if let Some(pending) = record.pending_completion {
+                match pending.exited() {
+                    Ok(true) => {
+                        journal.finish(&record.id, pending.outcome)?;
+                        changed = true;
+                    }
+                    Ok(false) => (),
+                    Err(error) => tracing::warn!("execution {}: pending exit unproven: {error}", record.id),
+                }
+                continue; // A known outcome is never requeued or replaced by owner loss.
             }
             let ended = match &record.process {
                 Some(birth) => match birth.ended() {
@@ -1374,6 +1417,126 @@ mod tests {
         assert_eq!(run("applied", "sdpa", true), Vec::<Value>::new());
         assert_eq!(run("unpinned", "", false), Vec::<Value>::new());
         drop(engine);
+        crate::scratch::remove(&root);
+    }
+
+    /// Result custody must survive the spool going away before the pool publishes completion.
+    #[test]
+    fn a_managed_result_can_be_held_before_its_terminal_is_published() {
+        let root = std::env::temp_dir().join(format!("cm-pending-result-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root).unwrap();
+        let id = engine.submit("pending-result", Invocation::default()).unwrap().id;
+        attempt(&engine, &id, |engine, id| {
+            let spool = Spool(engine.staging(id).unwrap());
+            fs::write(spool.0.join("answer"), b"kept").unwrap();
+            let binding = crate::journal::AssetBinding {
+                relative_path: "answer".into(), asset_ref: "attempt:run/file/0".into(),
+                media_type: "text/plain".into(), length: 4,
+            };
+            let result = engine.managed_result_record(id, &spool.0, serde_json::json!({"answer": 42}), vec![binding], vec![]).unwrap();
+            assert_eq!(engine.get(id).unwrap().state, State::Running);
+            drop(spool);
+            assert_eq!(fs::read(engine.root.join(&result.artifacts[0].path)).unwrap(), b"kept");
+            engine.finish(id, Outcome::Completed(result)).unwrap();
+        });
+        assert_eq!(engine.get(&id).unwrap().state, State::Completed);
+        let mut bytes = Vec::new();
+        engine.open_result(&id, 0).unwrap().read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"kept");
+        drop(engine);
+        crate::scratch::remove(&root);
+    }
+
+    /// A cleanup error cannot publish a live executor's result or lose it on restart. Both
+    /// exact process births must end; the held files and outcome survive without re-execution.
+    #[test]
+    fn a_pending_result_survives_cleanup_error_and_restart_until_exact_exit() {
+        let root = std::env::temp_dir().join(format!("cm-pending-restart-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root).unwrap();
+        let id = engine.submit("pending-restart", Invocation::default()).unwrap().id;
+        let mut leader = crate::scratch::until_stdin_closes().stdin(std::process::Stdio::piped()).spawn().unwrap();
+        let mut follower = crate::scratch::until_stdin_closes().stdin(std::process::Stdio::piped()).spawn().unwrap();
+        let births = vec![Birth::of(leader.id()).unwrap(), Birth::of(follower.id()).unwrap()];
+        assert!(engine.journal.lock().unwrap().claim(&id).unwrap());
+        engine.owned.lock().unwrap().insert(id.clone());
+        engine.register_managed(&id, births[0].clone(), Arc::new(|| Ok(()))).unwrap();
+        assert!(engine.authorize_managed(&id, None).unwrap());
+        let spool = Spool(engine.staging(&id).unwrap());
+        fs::write(spool.0.join("answer"), b"kept once").unwrap();
+        let binding = crate::journal::AssetBinding {
+            relative_path: "answer".into(), asset_ref: "attempt:run/file/0".into(),
+            media_type: "text/plain".into(), length: 9,
+        };
+        let member = b"tree kept";
+        let sha = tensorfs_core::sha256::hex_digest(member);
+        fs::write(spool.0.join(format!("sha256-{sha}")), member).unwrap();
+        let manifest = serde_json::to_vec(&serde_json::json!({"entries": [
+            {"path": "member.txt", "blob": {"sha256": sha, "length": member.len()}}
+        ]})).unwrap();
+        fs::write(spool.0.join("tree-manifest"), &manifest).unwrap();
+        let tree = crate::journal::AssetBinding {
+            relative_path: "tree-manifest".into(), asset_ref: "attempt:run/tree/0".into(),
+            media_type: crate::gpu_service::TREE_MEDIA.into(), length: manifest.len() as u64,
+        };
+        let result = engine.managed_result_record(&id, &spool.0, serde_json::json!({"answer": 42}), vec![binding, tree], vec![]).unwrap();
+        let held = result.artifacts.clone();
+        let held_path = result.artifacts[0].path.clone();
+        engine.observe_progress(&id, 7, "last observed".into()).unwrap();
+        engine.defer_completion(&id, Outcome::Completed(result), births).unwrap();
+        drop(spool);
+        crate::gpu_service::settle(&engine, &id, &io::Error::other("post-response cleanup exit unproven")).unwrap();
+        let running = engine.get(&id).unwrap();
+        assert_eq!(running.state, State::Running);
+        assert!(running.result.is_none());
+        assert!(running.pending_completion.is_some());
+        assert_eq!(engine.nonterminal(10).unwrap().len(), 1);
+        assert!(engine.open_result(&id, 0).is_err());
+        assert!(engine.journal.lock().unwrap().acknowledge_collection(&id).is_err());
+        // GC protects the whole uncollected result directory, including tree members, even
+        // before the normal terminal/public product roots have been materialized.
+        let catalog = crate::catalog::Catalog::new(&root.join("generations")).unwrap();
+        let bound = HashSet::new();
+        let disk = || Ok(crate::reclaim::Disk { capacity: 1 << 30, available: 0, inodes: 0, available_inodes: 0 });
+        let swept = crate::reclaim::sweep(&crate::reclaim::Caches {
+            engine: &engine, catalog: &catalog, bound: &bound, kernels: None, memo: None,
+            uv_cache: None, store: None, disk: &disk,
+        }).unwrap();
+        assert_eq!(swept.results, 0);
+        assert_eq!(held.len(), 3);
+        for artifact in &held {
+            let bytes = fs::read(root.join(&artifact.path)).unwrap();
+            assert_eq!(tensorfs_core::sha256::hex_digest(&bytes), artifact.sha256);
+        }
+
+        engine.owned.lock().unwrap().remove(&id);
+        let restarted = Engine::open(&root).unwrap();
+        assert_eq!(restarted.reconcile().unwrap().len(), 1);
+        assert!(!restarted.dispatch_managed(&id, |_, _| panic!("known outcome replayed")).unwrap());
+        drop(leader.stdin.take());
+        leader.wait().unwrap();
+        // The leader's exit alone cannot release the follower's reservation.
+        assert_eq!(restarted.reconcile().unwrap().len(), 1);
+        assert_eq!(restarted.get(&id).unwrap().state, State::Running);
+        drop(follower.stdin.take());
+        follower.wait().unwrap();
+        assert!(restarted.reconcile().unwrap().is_empty());
+        let finished = restarted.get(&id).unwrap();
+        assert_eq!(finished.state, State::Completed);
+        assert_eq!(finished.attempt, 1);
+        assert_eq!(finished.completed_units, 7);
+        assert_eq!(finished.progress.as_deref(), Some("last observed"));
+        assert!(finished.pending_completion.is_none());
+        assert_eq!(finished.result.as_ref().unwrap().value, serde_json::json!({"answer": 42}));
+        assert_eq!(finished.result.as_ref().unwrap().artifacts[0].path, held_path);
+        assert_eq!(finished.result.as_ref().unwrap().asset_bindings.len(), 2);
+        for artifact in &finished.result.as_ref().unwrap().artifacts {
+            let bytes = fs::read(root.join(&artifact.path)).unwrap();
+            assert_eq!(tensorfs_core::sha256::hex_digest(&bytes), artifact.sha256);
+        }
+        let mut bytes = Vec::new();
+        restarted.open_result(&id, 0).unwrap().read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"kept once");
+        drop((engine, restarted));
         crate::scratch::remove(&root);
     }
 
