@@ -70,6 +70,7 @@ impl Store {
         let ck = Checkpoint::opened(Objects::Store(self.clone()), header.clone(), Header::from_cbor(&self.read(header)?)?, None)?;
         drop(acquisition);
         self.cache_touch(header)?;
+        let _ = self.cache_maintain(0)?;
         Ok(ck)
     }
 
@@ -89,6 +90,7 @@ impl Store {
         }
         drop(acquisition);
         self.cache_touch(header)?;
+        let _ = self.cache_maintain(0)?;
         Ok(ck)
     }
 }
@@ -204,6 +206,7 @@ impl Checkpoint {
             Objects::Folder { dir, .. } => Ok(dir.clone()),
             Objects::Store(store) => {
                 let dir = store.root().join("snapshots").join(&self.id.sha256);
+                store.cache_snapshot(&dir)?;
                 let mut tree = Tree::default();
                 tree.set_variant(variant, self.id.clone());
                 store.snapshot(&store.put_tree(&tree)?, &dir, None)?;
@@ -220,7 +223,9 @@ impl Checkpoint {
             Objects::Store(store) | Objects::Folder { cache: Some(store), .. } => store.root().to_path_buf(),
             Objects::Folder { dir, .. } => dir.join("chunks"),
         };
-        let dir = root.join("views").join(&self.id.sha256).join(name);
+        let entry = root.join("views").join(&self.id.sha256);
+        if let Some(store) = self.store() { store.cache_snapshot(&entry)?; }
+        let dir = entry.join(name);
         fs::create_dir_all(&dir).map_err(fail("create", &dir))?;
         let config = dir.join(c.config_file.as_deref().unwrap_or("config.json"));
         let bytes = serde_json::to_vec(&c.config).map_err(|e| invalid(&config, e.to_string()))?;
@@ -229,7 +234,7 @@ impl Checkpoint {
             write_view(&dir.join(name), &self.asset(&c.name, name)?)?;
         }
         if let Some(store) = self.store() {
-            store.cache_snapshot(&root.join("views").join(&self.id.sha256))?;
+            store.cache_snapshot(&entry)?;
         }
         Ok(dir)
     }
