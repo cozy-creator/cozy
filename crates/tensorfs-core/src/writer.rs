@@ -604,7 +604,7 @@ impl Writer {
         let header = header.to_cbor()?;
         let id = match &self.dest {
             Dest::Store(store) => {
-                let id = store.put_bytes(&header)?;
+                let id = self.admit_header(store, &header)?;
                 if !store.cache_writer(&id, &self.repo)? {
                     let pin = self.key.clone().unwrap_or_else(|| id.sha256.clone());
                     let roots = std::iter::once(id.clone()).chain(self.repo.values().cloned()).collect();
@@ -620,7 +620,7 @@ impl Writer {
                 ObjectRef::of(&header)
             }
             Dest::Endpoint { store, stream, name, variant } => {
-                let id = store.put_bytes(&header)?;
+                let id = self.admit_header(store, &header)?;
                 if !store.cache_writer(&id, &self.repo)? {
                     let roots = std::iter::once(id.clone()).chain(self.repo.values().cloned()).collect();
                     store.pin(&id.sha256, &Pin::new(roots))?;
@@ -633,6 +633,14 @@ impl Writer {
         self.close();
         self.committed = Some(id.clone());
         Ok(id)
+    }
+
+    // The local header must join the same native hold before publication can fail. Use the
+    // retained local admission path; an Endpoint header is uploaded later by Stream::commit.
+    fn admit_header(&self, store: &Store, header: &[u8]) -> Result<ObjectRef> {
+        let mut admit = Admit::Store(store.admit(None)?, self.retention.clone());
+        admit.write_all(header).map_err(fail("write", &self.dir))?;
+        admit.finish()
     }
 
     /// Ends the writer without a header: its journal and spool go.

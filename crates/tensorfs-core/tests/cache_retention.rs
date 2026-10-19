@@ -730,6 +730,11 @@ fn failed_managed_stream_retains_local_bytes_until_the_last_native_owner() {
         .expect("local commit must precede failed upload")
         .clone();
     assert!(store.get_pin(&id.sha256).unwrap().is_none());
+    expire_managed_cache(&store); // The failed Writer is the only native owner at this point.
+    assert!(
+        store.verify(&id).unwrap(),
+        "failed Writer lost its committed header before an error checkpoint was opened"
+    );
     let ck = store.checkpoint(&id).unwrap();
     let chunks = ck.header().chunks.clone();
     expire_managed_cache(&store);
