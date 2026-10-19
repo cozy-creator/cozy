@@ -338,8 +338,15 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
             anonymous.repo(&destination).await.unwrap().is_none(),
             "private output is public"
         );
-        let endpoint: Arc<dyn Origin> =
+        let endpoint =
             Arc::new(Endpoint::new(&client, &origin, Some(bearer(home.token()))).unwrap());
+        let (repo, _) = endpoint.repo(&destination).await.unwrap().unwrap();
+        let published = repo
+            .checkpoints
+            .iter()
+            .find(|tree| tree.id() == remote["revision"].as_str().unwrap())
+            .unwrap();
+        let endpoint: Arc<dyn Origin> = endpoint;
         let fetcher = Fetcher::new(
             Arc::new(downloaded.clone()) as Arc<dyn ObjectStore>,
             client.clone(),
@@ -347,13 +354,7 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
             Config::default(),
         );
         let pulled = fetcher
-            .pull(
-                &endpoint,
-                &destination,
-                remote["revision"].as_str(),
-                None,
-                &Want::default(),
-            )
+            .pull_tree(&endpoint, published, None, &Want::default())
             .await
             .unwrap();
         fetcher.settled().await;
@@ -483,8 +484,14 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
     let retry_cache = tempfile::tempdir().unwrap();
     let retry_store = Store::open(retry_cache.path()).unwrap();
     runtime.block_on(async {
-        let endpoint: Arc<dyn Origin> =
+        let endpoint =
             Arc::new(Endpoint::new(&client, &origin, Some(bearer(home.token()))).unwrap());
+        let (repo, _) = endpoint.repo(&retry_destination).await.unwrap().unwrap();
+        assert!(
+            repo.checkpoints.contains(&retained_tree),
+            "the retry did not publish its retained tree"
+        );
+        let endpoint: Arc<dyn Origin> = endpoint;
         let fetcher = Fetcher::new(
             Arc::new(retry_store.clone()) as Arc<dyn ObjectStore>,
             client.clone(),
@@ -492,10 +499,9 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
             Config::default(),
         );
         let pulled = fetcher
-            .pull(
+            .pull_tree(
                 &endpoint,
-                &retry_destination,
-                retained["revision"].as_str(),
+                &retained_tree,
                 (!variant.is_empty()).then_some(variant),
                 &Want::default(),
             )
