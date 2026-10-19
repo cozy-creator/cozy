@@ -225,6 +225,15 @@ impl Link {
         mut progress: impl FnMut(u64, Option<f64>),
     ) -> Result<(), LinkError> {
         let name = digest.to_string();
+        // An empty object's ranges are empty whether the machine holds it or not, and it has no
+        // parts: it goes as one empty PUT, which a machine that holds it answers at once.
+        if length == 0 {
+            let unreachable = || LinkError::Unreachable("no connection to the machine".into());
+            let lane = self.lane(0, false).ok_or_else(unreachable)?;
+            lane.put(&name, (0, 0, 0), Vec::new()).await?;
+            progress(0, None);
+            return Ok(());
+        }
         if v1::held_bytes(&held) >= length {
             return Ok(());
         }

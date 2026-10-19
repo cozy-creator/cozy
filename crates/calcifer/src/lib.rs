@@ -822,10 +822,12 @@ impl Calcifer {
             .collect();
         let digests: Vec<Digest> = run.inputs.iter().map(|(digest, _)| *digest).collect();
         let held = link.held_many(&digests).await?;
+        // An empty object's ranges cannot say it is held: it is always sent (one empty PUT).
+        let whole = |held: &v1::Ranges, length: u64| length > 0 && v1::held_bytes(held) >= length;
         // The request's files the machine already holds are not sent again, and the run's log says
         // so: `run show` and a follower that attaches late read it too.
         let reused: Vec<(&str, u64)> = (run.inputs.iter().zip(&held))
-            .filter(|((_, length), held)| v1::held_bytes(held) >= *length)
+            .filter(|((_, length), held)| whole(held, *length))
             .filter_map(|((digest, length), _)| {
                 Some((*names.get(digest.to_string().as_str())?, *length))
             })
@@ -842,7 +844,7 @@ impl Calcifer {
             self.publish(&run.id, events);
         }
         for ((digest, length), held) in run.inputs.iter().zip(held) {
-            if v1::held_bytes(&held) >= *length {
+            if whole(&held, *length) {
                 continue;
             }
             let hex = hex::encode(digest.bytes());
