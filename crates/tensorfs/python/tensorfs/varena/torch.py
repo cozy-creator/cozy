@@ -553,13 +553,14 @@ class Memory:
 
     # -- loading
 
-    def load(self, module: nn.Module, level: Level = Level.GPU) -> Model:
+    def load(self, module: nn.Module, level: Level | str = Level.GPU) -> Model:
         """Load `module`, built on meta, at `level`, from what the author API attached to it
         (`module._varena`). The first load seals its host tier unless TensorD granted one
         (`sealed()` hands it over for deposit) and installs the hooks: its blocks bind per
         forward and run in the catch (`cuts.run`), its FFNs cut in tokens. At GPU level it is
         warm and fills free room now; at RAM level its resident pages are idle. On a CPU or
         Apple device every weight binds once, here."""
+        level = Level(level)
         with self.lock:
             model = self.by_module.get(module) or self._register(module)
             model.level = level
