@@ -1021,7 +1021,6 @@ print(next(out.glob('tensorfs-*.whl')))
     /// the machine's native writer channel and adopts it; the output is a product of its log
     /// (the manifest). A warm run keeps that held checkpoint under a local alias.
     #[tokio::test]
-    #[ignore = "U10: the Runtime's derive client speaks the derive channel of #1494"]
     async fn a_job_writes_a_weights_output_kept_under_a_local_alias() {
         let (machine, tools) = installing_machine().await;
         let client = client(&machine);
@@ -2468,7 +2467,6 @@ print(next(out.glob('tensorfs-*.whl')))
     /// published package's callee is: the call is a child run of that package, counted where it
     /// truly runs.
     #[tokio::test]
-    #[ignore = "U10: the Runtime's derive client speaks the derive channel of #1494"]
     async fn a_job_calls_a_package_its_environment_depends_on() {
         let (machine, tools) = installing_machine().await;
         let client = client(&machine);
