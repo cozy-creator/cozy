@@ -1,14 +1,11 @@
-"""TensorFS: cozytensors/1 checkpoints in a content-addressed store.
+"""TensorFS: self-contained model variants, read and written by component.
 
-    store = tensorfs.Store("~/.cache/tensorfs")          # created when absent
-    ck = store.import_("hf://hf-internal-testing/tiny-sdxl-pipe")
-    ck = store.pull("acme/sdxl@1.0", variant="int8")     # from tensorhub.com
-    unet = ck.components["unet"]                         # .cls, .config, .tensors, .assets
-    torch.from_dlpack(unet.tensors.read("conv_in.weight")) # encoded tensors decode
-    store.export(ck, "out/")                             # a Diffusers/Transformers folder
+    ck = tensorfs.open("acme/sdxl", revision="1.0", variant="int8")
+    unet = ck.components["unet"]
+    tensors = unet.tensors.read_all(device="cpu")
+    tokenizer_path = ck.components["tokenizer"].path
 
-Compiled in `tensorfs._ext`, typed in `_ext.pyi`; the weight plane is `tensorfs.varena`;
-`parse_header` projects a CBOR header (`tensorfs.errors` refusals). TensorFS never imports torch.
+Arrays cross to NumPy, PyTorch, JAX or CuPy through DLPack. TensorFS never imports a framework.
 """
 
 from collections.abc import Mapping
@@ -47,7 +44,7 @@ from ._ext import (
     plan,
     regions,
 )
-from .api import ComponentWriter, Writer, configure, convert, export, open, snapshot_download, upload_folder
+from .api import ComponentWriter, Writer, configure, convert, export, hub_download, open, resolve_source, snapshot_download, upload_folder
 
 Mapping.register(Tensors)
 
@@ -87,6 +84,8 @@ __all__ = [
     "configure",
     "convert",
     "export",
+    "hub_download",
+    "resolve_source",
     "open",
     "snapshot_download",
     "upload_folder",

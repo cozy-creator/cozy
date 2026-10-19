@@ -41,7 +41,7 @@ use crate::format::{
     self, variant_path, Body, Component, Config, Dtype, Encoding, Header, Metadata, ObjectRef,
     Part, Pipeline, Tensor, Value, CHUNKS_DIR, CONFIG_FILE,
 };
-use crate::import::{self, Imported, Sink};
+use crate::import;
 use crate::sha256::{hex, Sha256};
 use crate::store2::{fail, fault, is_name, sync_dir, Admission, Checkpoint, Error, Pin, Result, Store};
 
@@ -333,7 +333,7 @@ impl Store {
         key: Option<&str>,
     ) -> err::Result<(ObjectRef, BTreeMap<String, ObjectRef>)> {
         let mut writer = self.writer(None, key).map_err(Error::refusal)?;
-        import::import(req, &mut writer)?;
+        import::convert(req, &mut writer)?;
         let header = writer.committed.clone().expect("an import commits");
         Ok((header, std::mem::take(&mut writer.repo)))
     }
@@ -1163,62 +1163,6 @@ impl ComponentWriter<'_> {
     /// Written (or journaled by an interrupted writer of this key); base tensors don't count.
     pub fn has(&self, key: &str) -> bool {
         self.w.has(&self.name, key)
-    }
-}
-
-/// An import writes through the writer; tensors an interrupted import journaled are skipped.
-/// Until convert maps files to D10 (D3, which moves this into `import`), every file is a repo
-/// file.
-impl Sink for Writer {
-    fn put(
-        &mut self,
-        component: &str,
-        key: &str,
-        dtype: &Dtype,
-        shape: &[u64],
-        encoding: Option<&Encoding>,
-        parts: Vec<import::Part>,
-    ) -> err::Result<()> {
-        if self.has(component, key) {
-            return Ok(());
-        }
-        let mut parts = parts.into_iter().map(|p| PartData {
-            role: p.role.to_owned(),
-            dtype: p.dtype.clone(),
-            shape: p.shape.to_vec(),
-            data: Source::Read(p.data),
-        });
-        let data = match encoding {
-            Some(encoding) => Data::Encoded {
-                encoding: encoding.clone(),
-                parts: parts.collect(),
-            },
-            None => Data::Plain(parts.next().expect("a plain tensor's part").data),
-        };
-        (self.get(component).put(key, dtype, shape, data)).map_err(Error::refusal)
-    }
-
-    fn file(&mut self, path: &str, bytes: &[u8]) -> err::Result<()> {
-        self.repo_file(path, bytes).map_err(Error::refusal)
-    }
-
-    fn commit(&mut self, imported: &Imported) -> err::Result<()> {
-        let list =
-            |items: &[String]| Value::List(items.iter().map(|s| Value::Str(s.clone())).collect());
-        self.set_metadata("normalized", imported.normalized.into());
-        self.set_metadata("converters", list(&imported.converters));
-        self.set_metadata("sources", list(&imported.sources));
-        if !imported.file_metadata.is_empty() {
-            let strings = |m: &BTreeMap<String, String>| {
-                let pairs = m.iter().map(|(k, v)| (k.clone(), Value::Str(v.clone())));
-                Value::Map(pairs.collect())
-            };
-            let by_component = (imported.file_metadata.iter())
-                .map(|(c, m)| (c.clone(), strings(m)))
-                .collect();
-            self.set_metadata(import::FILE_METADATA, Value::Map(by_component));
-        }
-        Writer::commit(self).map(drop).map_err(Error::refusal)
     }
 }
 

@@ -32,7 +32,11 @@ struct PythonProvider(Py<PyAny>);
 impl TokenProvider for PythonProvider {
     async fn headers(&self, request: &Request<'_>) -> Result<Vec<(String, String)>> {
         Python::attach(|py| {
-            let value = self.0.bind(py).call_method1("headers", (request.method, request.url))?;
+            let provider = self.0.bind(py);
+            let headers = PyDict::new(py);
+            for (name, value) in request.headers { headers.set_item(name, value)?; }
+            let args = (request.method, request.url, headers, request.payload);
+            let value = if provider.hasattr("headers")? { provider.call_method1("headers", args)? } else { provider.call1(args)? };
             if let Ok(dict) = value.cast::<PyDict>() {
                 dict.iter().map(|(k, v)| Ok((k.extract()?, v.extract()?))).collect()
             } else { value.extract() }
@@ -47,7 +51,9 @@ impl TokenProvider for PythonProvider {
             for (name, value) in headers {
                 if let Ok(value) = value.to_str() { answer.set_item(name.as_str(), value)?; }
             }
-            provider.call_method1("retry", (sent.url, status, answer))?.extract()
+            let request = PyDict::new(py);
+            for (name, value) in sent.headers { request.set_item(name, value)?; }
+            provider.call_method1("retry", (sent.method, sent.url, request, sent.payload, status, answer))?.extract()
         }).unwrap_or(false)
     }
 }
@@ -58,7 +64,7 @@ pub(crate) fn provider(token: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Arc<
         Some(token) if token.is_none() => None,
         Some(token) => {
             if let Ok(native) = token.cast::<PyDPoP>() {
-                Some(Arc::clone(&native.get().provider))
+                Some(native.get().dpop.clone() as Arc<dyn TokenProvider>)
             } else if let Ok(bearer) = token.extract::<String>() {
                 Some(fetch::bearer(bearer))
             } else {
@@ -69,10 +75,13 @@ pub(crate) fn provider(token: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Arc<
 }
 
 #[pyclass(name = "DPoP", module = "tensorfs", frozen)]
-pub struct PyDPoP { provider: Arc<dyn TokenProvider> }
+pub struct PyDPoP { dpop: Arc<fetch::DPoP> }
 
 #[pymethods]
 impl PyDPoP {
+    fn issued_token(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        py.detach(|| Ok::<_, tensorfs_core::err::Refusal>(fetch::runtime()?.block_on(self.dpop.issued_token()))).or_raise(py)
+    }
     #[staticmethod]
     #[pyo3(signature = (key, *, token_endpoint, client_id, resource, claims, endpoint = None, ca_der = None))]
     #[allow(clippy::too_many_arguments)]
@@ -82,13 +91,15 @@ impl PyDPoP {
         let grant = JwtBearer { token_endpoint, client_id, resource, claims };
         let mut dpop = fetch::DPoP::grant(&client, key, grant).or_raise(py)?;
         if let Some(endpoint) = endpoint { dpop = dpop.at(&endpoint); }
-        Ok(Self { provider: Arc::new(dpop) })
+        Ok(Self { dpop: Arc::new(dpop) })
     }
 
     #[staticmethod]
-    #[pyo3(signature = (key, access_token, resource = None))]
-    fn token(py: Python<'_>, key: &str, access_token: &str, resource: Option<String>) -> PyResult<Self> {
-        Ok(Self { provider: Arc::new(fetch::DPoP::token(key, access_token, resource.as_deref()).or_raise(py)?) })
+    #[pyo3(signature = (key, access_token, resource = None, *, endpoint = None))]
+    fn token(py: Python<'_>, key: &str, access_token: &str, resource: Option<String>, endpoint: Option<String>) -> PyResult<Self> {
+        let mut dpop = fetch::DPoP::token(key, access_token, resource.as_deref()).or_raise(py)?;
+        if let Some(endpoint) = endpoint { dpop = dpop.at(&endpoint); }
+        Ok(Self { dpop: Arc::new(dpop) })
     }
 }
 

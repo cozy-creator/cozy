@@ -71,6 +71,7 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     };
     let provider = Arc::new(DPoP::grant(&client, &jwk, grant).unwrap().at(&reach));
     assert_eq!(provider.thumbprint(), thumbprint);
+    assert!(provider.issued_token().await.is_none(), "a snapshot does not trigger a trade");
 
     let elsewhere = Request { method: "GET", url: "https://elsewhere.example/x", headers: &[], payload: None };
     assert!(provider.headers(&elsewhere).await.unwrap().is_empty(), "only the resource's origin sees the token");
@@ -88,6 +89,10 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     let model = format!("{account}/model");
     let first = upload_tree(&endpoint, &model, &tree, &store, None).await.unwrap();
     assert_eq!(first.sent, first.objects);
+    let issued = provider.issued_token().await.expect("the first upload traded once");
+    let resumed = Arc::new(DPoP::token(&jwk, &issued, Some(&origin)).unwrap().at(&reach));
+    let resumed_endpoint = Endpoint::new(&client, &reach, Some(resumed)).unwrap();
+    assert_eq!(resumed_endpoint.object(&header.sha256).await.unwrap(), Some(header.clone()), "a token snapshot resumes under the same key without another trade");
     // This would fail if each request tried to trade the single-use capability again.
     assert_eq!(upload_tree(&endpoint, &model, &tree, &store, None).await.unwrap().sent, 0);
 
