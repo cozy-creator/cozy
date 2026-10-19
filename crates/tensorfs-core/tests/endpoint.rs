@@ -231,6 +231,7 @@ fn a_streaming_writer_tees_to_the_store_before_publishing() {
     assert!(runtime.block_on(endpoint.object("not-a-digest")).is_err());
     let (repo, _) = runtime.block_on(endpoint.repo("acme/streamed")).unwrap().unwrap();
     assert_eq!((repo.releases.len(), repo.checkpoints.len()), (0, 1), "an unreleased checkpoint");
+    assert_eq!(w.published(), Some(&repo.checkpoints[0]), "this writer's exact committed tree");
     let into = Store::open(scratch.0.join("into")).unwrap();
     runtime.block_on(async {
         let fetcher = Fetcher::new(Arc::new(into.clone()) as Arc<dyn ObjectStore>, client(), None, Config::default());
@@ -256,6 +257,7 @@ fn an_upload_failure_keeps_the_local_checkpoint_and_stays_failed() {
     w.component("unet", "diffusers.Thing", Default::default(), None).unwrap()
         .put("w", &Dtype::U8, &[5], Data::Plain(Source::Read(&mut &b"saved"[..]))).unwrap();
     assert!(w.commit().is_err(), "the real read-only server refuses PUT");
+    assert!(w.published().is_none(), "no remote commit was made");
     let header = w.committed().expect("the local commit precedes upload").clone();
     assert_eq!(local.checkpoint(&header).unwrap().read("unet", "w").unwrap(), b"saved");
     assert!(stream.flush().is_err(), "the first upload failure is sticky");

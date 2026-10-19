@@ -221,6 +221,7 @@ pub struct Writer {
     touched: Instant,
     buffer: Vec<u8>,
     committed: Option<ObjectRef>,
+    published: Option<ObjectRef>,
 }
 
 /// One component of a [`Writer`]: borrowed from it by [`Writer::component`] or [`Writer::get`].
@@ -388,6 +389,7 @@ impl Writer {
             touched: Instant::now(),
             buffer: vec![0; 1 << 20],
             committed: None,
+            published: None,
         };
         if writer.journal.is_some() {
             writer.resume()?;
@@ -460,6 +462,11 @@ impl Writer {
     /// The header, once committed.
     pub fn committed(&self) -> Option<&ObjectRef> {
         self.committed.as_ref()
+    }
+
+    /// This writer's exact tree, once its endpoint's conditional repo update succeeded.
+    pub fn published(&self) -> Option<&ObjectRef> {
+        self.published.as_ref()
     }
 
     /// A repo file (README, LICENSE): never inside the cozytensors. Into the store it is an
@@ -605,7 +612,7 @@ impl Writer {
                 let roots = std::iter::once(id.clone()).chain(self.repo.values().cloned()).collect();
                 store.pin(&id.sha256, &Pin::new(roots))?;
                 self.committed = Some(id.clone());
-                stream.commit(name, variant, header, &self.repo).map_err(sent)?;
+                self.published = Some(stream.commit(name, variant, header, &self.repo).map_err(sent)?);
                 id
             }
         };

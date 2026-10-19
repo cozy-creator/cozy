@@ -408,7 +408,7 @@ impl Endpoint {
             let mut headers = ask.headers.clone();
             let (moved, began) = (Arc::new(AtomicU64::new(0)), Instant::now());
             let authorized = match ask.auth {
-                true => self.authorize(ask.method, ask.url, &ask.headers, ask.payload).await,
+                true => self.watched(self.authorize(ask.method, ask.url, &ask.headers, ask.payload), &moved).await,
                 false => Ok(vec![]),
             };
             let outcome = match authorized {
@@ -692,7 +692,7 @@ impl Stream {
     }
 
     /// A writer's commit: its `header` as `variant` of a tree with `files`, each sent after
-    /// what it cites, then the tree added to repo `name`'s checkpoints. The header's ref.
+    /// what it cites, then the tree added to repo `name`'s checkpoints. The exact tree's ref.
     pub fn commit(&self, name: &str, variant: &str, header: Vec<u8>, files: &BTreeMap<String, ObjectRef>) -> Result<ObjectRef> {
         self.flush()?;
         let header = self.put(header)?;
@@ -703,7 +703,7 @@ impl Stream {
         self.flush()?;
         let named = self.endpoint.update_repo(name, |old| Ok(Some(with_tree(old, name, &tree, None))));
         self.runtime.block_on(named)?;
-        Ok(header)
+        Ok(tree)
     }
 }
 
