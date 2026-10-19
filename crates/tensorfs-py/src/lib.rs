@@ -8,6 +8,10 @@ mod varena;
 mod readplan;
 #[cfg(feature = "store")]
 mod store;
+#[cfg(feature = "store")]
+mod tensors;
+#[cfg(feature = "store")]
+mod credentials;
 
 use pyo3::prelude::*;
 
@@ -36,5 +40,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<readplan::PyPlan>()?;
     #[cfg(feature = "store")]
     store::install(m)?;
+    #[cfg(feature = "store")]
+    credentials::install(m)?;
     varena::install(m)
 }

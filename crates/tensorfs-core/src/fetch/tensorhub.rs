@@ -1,8 +1,9 @@
-//! Tensorhub, the default origin ([`TENSORHUB`]). The Hub names a model's checkpoint by name,
-//! release and lane and lists its closure (`POST /v1/tensorfs/closure`), then presigns its
-//! objects (`POST /v1/tensorfs/presign`); the Fetcher reads them from the presigned URLs, which
-//! see no credential. Public release lanes are read anonymously; a bearer token, or a caller's
-//! own [`Credential`], reads the private checkpoints it grants.
+//! Tensorhub, the default origin ([`TENSORHUB`]). The Hub names a model's tree by name, release
+//! and variant (its wire's `lane`; its `manifest` is the tree) and lists its closure
+//! (`POST /v1/tensorfs/closure`), then presigns its objects (`POST /v1/tensorfs/presign`); the
+//! Fetcher reads them from the presigned URLs, which see no credential. Public releases are
+//! read anonymously; a bearer token, or a caller's own [`TokenProvider`], reads the private
+//! trees it grants.
 //!
 //! Wire: closure `{"ref":"org/name[@release][@sha256:<hex>]","lane","after"?}` →
 //! `{complete, lane, manifest, model, objects[], presign_max_digests, public, release, scope}`,
@@ -19,8 +20,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::net::{Client, HeaderMap};
+use super::net::Client;
 use super::origin::{split_name, Location, Origin};
+use super::token::{bearer, Request, TokenProvider};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::format::ObjectRef;
 
@@ -33,37 +35,14 @@ const RETRYABLE: [u16; 7] = [408, 425, 429, 500, 502, 503, 504];
 /// The most bytes one Hub answer may have.
 const ANSWER_BYTES: u64 = 16 << 20;
 
-/// What a request to the Hub presents: a bearer token, or a proof made per request (DPoP).
-#[async_trait]
-pub trait Credential: Send + Sync {
-    /// Headers for `method url`, a Hub URL.
-    async fn present(&self, method: &str, url: &str) -> Vec<(String, String)>;
-
-    /// The Hub answered `status` and `headers` to a request that sent `sent`: true asks it once
-    /// more (a fresh nonce).
-    fn observe(&self, url: &str, sent: &[(String, String)], status: u16, headers: &HeaderMap) -> bool {
-        let _ = (url, sent, status, headers);
-        false
-    }
-}
-
-struct Bearer(String);
-
-#[async_trait]
-impl Credential for Bearer {
-    async fn present(&self, _: &str, _: &str) -> Vec<(String, String)> {
-        vec![("authorization".into(), format!("Bearer {}", self.0))]
-    }
-}
-
-/// What the Hub named: the model, the release and lane it chose (both empty for a checkpoint
-/// asked by hash) and their manifest.
+/// What the Hub named: the model, the release and variant it chose (both empty for a tree
+/// asked by hash) and their tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
     pub model: String,
     pub release: String,
-    pub lane: String,
-    pub manifest: ObjectRef,
+    pub variant: String,
+    pub tree: ObjectRef,
     /// Anyone may read it.
     pub public: bool,
 }
@@ -109,7 +88,7 @@ struct State {
 pub struct TensorhubOrigin {
     client: Client,
     base: String,
-    credential: Option<Arc<dyn Credential>>,
+    credential: Option<Arc<dyn TokenProvider>>,
     public: AtomicBool,
     state: tokio::sync::Mutex<State>,
 }
@@ -130,28 +109,28 @@ impl TensorhubOrigin {
 
     /// Sends `Authorization: Bearer <token>` to the Hub.
     pub fn bearer(self, token: impl Into<String>) -> TensorhubOrigin {
-        self.credential(Arc::new(Bearer(token.into())))
+        self.credential(bearer(token))
     }
 
     /// Presents `credential` on every Hub call.
-    pub fn credential(mut self, credential: Arc<dyn Credential>) -> TensorhubOrigin {
+    pub fn credential(mut self, credential: Arc<dyn TokenProvider>) -> TensorhubOrigin {
         self.credential = Some(credential);
         self
     }
 
-    /// Binds `locate` to `name`'s checkpoint `manifest` at `release` (none: the owner's
-    /// checkpoint by hash) and `lane`, without asking the Hub.
-    pub fn at(mut self, name: &str, release: Option<&str>, lane: &str, manifest: &ObjectRef) -> TensorhubOrigin {
+    /// Binds `locate` to `name`'s `tree` at `release` (none: the owner's tree by hash) and
+    /// `variant`, without asking the Hub.
+    pub fn at(mut self, name: &str, release: Option<&str>, variant: &str, tree: &ObjectRef) -> TensorhubOrigin {
         self.state.get_mut().at = Some(At {
-            reference: pinned(name, release.unwrap_or(""), manifest),
-            lane: lane.into(),
-            manifest: manifest.clone(),
+            reference: pinned(name, release.unwrap_or(""), tree),
+            lane: variant.into(),
+            manifest: tree.clone(),
         });
         self
     }
 
-    /// `name` at `release` (the newest when `None`; `sha256:<hex>` names the owner's checkpoint
-    /// by hash) and `lane` (the release's only one when `None`), and binds `locate` to it.
+    /// `name` at `release` (the newest when `None`; `sha256:<hex>` names the owner's tree by
+    /// hash) and `variant` (the tree's only one when `None`), and binds `locate` to it.
     pub async fn named(&self, name: &str, release: Option<&str>, lane: Option<&str>) -> Result<Resolved> {
         split_name(name)?;
         let reference = match release {
@@ -181,8 +160,8 @@ impl TensorhubOrigin {
         Ok(Resolved {
             model: page.model,
             release: page.release,
-            lane: page.lane,
-            manifest: page.manifest,
+            variant: page.lane,
+            tree: page.manifest,
             public: page.public,
         })
     }
@@ -258,7 +237,10 @@ impl TensorhubOrigin {
         let mut retried = false;
         loop {
             let sent = match &self.credential {
-                Some(credential) => credential.present("POST", url).await,
+                Some(credential) => {
+                    let request = Request { method: "POST", url, headers: &[], payload: None };
+                    credential.headers(&request).await.map_err(Ask::Final)?
+                }
                 None => Vec::new(),
             };
             let answer = match self.client.post(url, &sent, body.to_vec(), ANSWER_BYTES).await {
@@ -266,7 +248,8 @@ impl TensorhubOrigin {
                 Err(e) if matches!(e.code, Code::TRANSFER_FAILED | Code::FD_HEADROOM) => return Err(Ask::Weather(e.detail, None)),
                 Err(e) => return Err(Ask::Final(e)),
             };
-            let again = (self.credential.as_ref()).is_some_and(|c| c.observe(url, &sent, answer.status, &answer.headers));
+            let request = Request { method: "POST", url, headers: &sent, payload: None };
+            let again = (self.credential.as_ref()).is_some_and(|c| c.retry(&request, answer.status, &answer.headers));
             if again && !retried {
                 retried = true;
                 continue;
@@ -293,8 +276,8 @@ impl TensorhubOrigin {
 
 #[async_trait]
 impl Origin for TensorhubOrigin {
-    async fn resolve(&self, name: &str, release: Option<&str>, lane: Option<&str>) -> Result<ObjectRef> {
-        Ok(self.named(name, release, lane).await?.manifest)
+    async fn resolve(&self, name: &str, release: Option<&str>, variant: Option<&str>) -> Result<ObjectRef> {
+        Ok(self.named(name, release, variant).await?.tree)
     }
 
     async fn locate(&self, objects: &[ObjectRef]) -> Result<Vec<Location>> {

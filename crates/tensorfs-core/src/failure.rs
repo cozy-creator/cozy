@@ -138,7 +138,12 @@ impl From<store2::Error> for Failure {
     fn from(e: store2::Error) -> Failure {
         let kind = match &e {
             store2::Error::Format(f) => return f.clone().into(),
-            store2::Error::Io { .. } => Kind::Io,
+            store2::Error::Io { source, .. } => {
+                if let Some(refusal) = source.get_ref().and_then(|cause| cause.downcast_ref::<Refusal>()) {
+                    return refusal.clone().into();
+                }
+                Kind::Io
+            }
             store2::Error::Full { .. } => Kind::Full,
             store2::Error::Absent(_) => Kind::NotFound,
             store2::Error::Mismatch { .. } => Kind::Integrity,

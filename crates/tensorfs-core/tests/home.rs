@@ -41,7 +41,7 @@ fn refuse_without_a_named_root(name: &str, args: &[&str]) {
         "tfs {args:?} wrote into its working directory"
     );
     assert!(
-        !home.join(".tensorfs").exists(),
+        !home.join(".cache").join("tensorfs").exists(),
         "tfs {args:?} conjured a home Store"
     );
     let _ = fs::remove_dir_all(root);
@@ -68,7 +68,7 @@ fn store_rebuild_names_its_root_and_writes_nothing_without_one() {
         0,
         "tfs store rebuild wrote into its working directory"
     );
-    assert!(!home.join(".tensorfs").exists() && !root.join("environment").exists());
+    assert!(!home.join(".cache").join("tensorfs").exists() && !root.join("environment").exists());
     let _ = fs::remove_dir_all(root);
 }
 

@@ -51,6 +51,8 @@ pub mod ids;
 pub mod import;
 #[cfg(feature = "store")]
 pub mod ingest;
+/// The read engine: byte ranges of files into host or device destinations (xs-055).
+pub mod io;
 pub mod jcs;
 pub mod limits;
 pub mod machine;
@@ -102,8 +104,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The on-disk Store this build reads and writes: layout, catalog and object encoding. The
 /// `cozy` binary and the `tensorfs` wheel share every Store ([`contract`]); a change an older
-/// build would misread bumps it, and the wheel's minor.
-pub const STORE_FORMAT: u32 = 1;
+/// build would misread bumps it, and the wheel's minor. The store's `format` record names it
+/// (`tensorfs.store/3`, D10: trees and component headers).
+pub const STORE_FORMAT: u32 = 3;
 
 /// The cross-process protocol over one Store: owner claim, writer guards, read leases and
 /// holds. Bumped like [`STORE_FORMAT`] by a change a process speaking the old one would break.

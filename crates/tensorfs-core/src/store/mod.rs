@@ -2,6 +2,10 @@
 //!
 //! `<root>/{format, blobs/<aa>/<bb>/<sha256>, refs/<org>/<name>.json, pins/<id>.json, tmp/}`
 //!
+//! - Objects are trees, cozytensors headers, chunks, assets and repo files. A ref names a
+//!   model's releases of trees; a pin keeps trees or headers. A cozytensors is opened by its
+//!   header ([`Store::checkpoint`]) or a tree's variant ([`Store::variant`]); a plain folder
+//!   enters by [`Store::admit_folder`] and leaves by [`Store::snapshot`].
 //! - One door admits objects ([`Store::admit`], [`Store::put`]): streamed into `tmp/`, hashed,
 //!   checked, flushed per [`Durability`] and renamed into `blobs/`. An object is verified there
 //!   once and trusted after; [`Store::verify`] rehashes on demand.
@@ -13,10 +17,11 @@
 //!   a name, and an open descriptor outlives an unlink.
 
 mod checkpoint;
+mod folder;
 mod gc;
 mod records;
 
-pub use checkpoint::{Checkpoint, ChunkRead, Piece, Placed, ReadPlan};
+pub use checkpoint::{wanted, Checkpoint, ChunkRead, Piece, Placed, ReadPlan};
 pub use gc::{Collected, PinUsage, Usage};
 pub(crate) use records::is_name;
 pub use records::Pin;
@@ -35,7 +40,8 @@ use crate::fetch;
 use crate::format::{self, ObjectRef};
 use crate::sha256::{hex, Sha256};
 
-const FORMAT: &str = "tensorfs.store/2";
+/// [`crate::STORE_FORMAT`] as the store's `format` record.
+const FORMAT: &str = "tensorfs.store/3";
 const LAYOUT: [&str; 4] = ["blobs", "refs", "pins", "tmp"];
 
 /// How long an unreferenced object outlives its last write or reuse.
@@ -197,6 +203,14 @@ impl Store {
                 }
                 match serde_json::from_slice::<Record>(&bytes) {
                     Ok(found) if same_major(&found.format, FORMAT) => {}
+                    Ok(found) if same_family(&found.format, FORMAT) => {
+                        let why = format!(
+                            "is a {} store from an older TensorFS, which this one cannot read: \
+                             remove it and pull again (tensorfs.store/3 holds trees and D10 headers)",
+                            found.format
+                        );
+                        return Err(invalid(&record, why));
+                    }
                     _ => {
                         let found = String::from_utf8_lossy(&bytes);
                         return Err(invalid(&record, format!("is {found:?}, not {FORMAT}")));
