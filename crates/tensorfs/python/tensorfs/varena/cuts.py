@@ -342,8 +342,18 @@ def _bare(
     return out
 
 
+@contextmanager
+def caught() -> Iterator[None]:
+    """Ops on this thread are caught at the op until it closes (a request, a cache's loop)."""
+    enter()
+    try:
+        yield
+    finally:
+        leave()
+
+
 def enter() -> None:
-    """A `use` opened on this thread: until it closes, ops here are caught at the op."""
+    """Ops on this thread are caught at the op until the matching `leave` (refcounted)."""
     local = _local
     local.depth += 1
     if local.depth == 1 and local.layer is None:
