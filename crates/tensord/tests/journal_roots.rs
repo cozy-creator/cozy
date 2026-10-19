@@ -99,7 +99,7 @@ fn open(root: &Path, tools: &Tools) -> Machine {
         publisher: None,
         local: Some(Arc::new(local)),
         own_hub: None,
-        leaf: None,
+
         contexts: Default::default(),
     });
     let config = GpuConfig::deviceless(&root.join("home")).unwrap();

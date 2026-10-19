@@ -475,13 +475,11 @@ fn accept(runs: &Arc<crate::runs::Runs>, actor: &str, id: &str, spec: crate::run
 }
 
 /// `spec` reading `hub` under its capability, if any.
-fn reach(runs: &crate::runs::Runs, mut spec: crate::runs::Spec, hub: Option<v1::HubAccess>) -> Result<crate::runs::Spec, Error> {
+fn reach(_runs: &crate::runs::Runs, mut spec: crate::runs::Spec, hub: Option<v1::HubAccess>) -> Result<crate::runs::Spec, Error> {
     if let Some(hub) = hub {
         let invalid = |e: crate::hub::Refusal| refused("hub_access_invalid", &e.0);
-        let capability = match (hub.capability.is_empty(), &runs.leaf) {
-            (true, _) => None,
-            (false, Some(leaf)) => Some(crate::hub::Capability::new(&hub.capability, &hub.token_endpoint, leaf.clone()).map_err(invalid)?),
-            (false, None) => return Err(refused("hub_access_invalid", "this machine holds no key to trade a capability with")),
+        let capability = if hub.capability.is_empty() { None } else {
+            Some(crate::hub::Capability::new(&hub.capability, &hub.token_endpoint, &hub.key).map_err(invalid)?)
         };
         let ca = Some(hub.ca_der).filter(|der| !der.is_empty());
         spec.hub = Some(crate::hub::Source::new(&hub.origin, ca, hub.object_hosts, capability).map_err(invalid)?);
@@ -672,7 +670,7 @@ mod tests {
             inputs: vec![input("reference", "a", 0), input("reference", "b", 1)],
             models: vec![model("model", "org/first"), model("other", "org/second")],
             hub: Some(v1::HubAccess {
-                origin: "https://hub.example.test/".into(), capability: "e30.e30.c2ln".into(),
+                origin: "https://hub.example.test/".into(), capability: "e30.e30.c2ln".into(), key: "first-request-key".into(),
                 token_endpoint: "https://hub.example.test/v1/auth/oauth2/token".into(),
                 ca_der: vec![1], object_hosts: vec!["objects-1.example.test".into()],
             }),
@@ -690,7 +688,7 @@ mod tests {
         let mut resent = original.clone();
         resent.payload = v1::Json::parse(r#"{"nested":{"a":1,"b":2},"seed":9007199254740993}"#).ok();
         resent.hub = Some(v1::HubAccess {
-            origin: "https://hub.example.test".into(), capability: String::new(), token_endpoint: String::new(),
+            origin: "https://hub.example.test".into(), capability: String::new(), key: "second-request-key".into(), token_endpoint: String::new(),
             ca_der: vec![2], object_hosts: vec!["objects-2.example.test".into()],
         });
         resent.providers = None;
@@ -733,7 +731,7 @@ mod tests {
         let store = crate::storage::open(&root.join("store")).unwrap();
         let objects = Arc::new(crate::objects::Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
         let runs = Arc::new(crate::runs::Runs {
-            service: service.clone(), objects, publisher: None, local: None, own_hub: None, leaf: None, contexts: Default::default(),
+            service: service.clone(), objects, publisher: None, local: None, own_hub: None, contexts: Default::default(),
         });
         let held = authored();
         let (spec, access) = spec_of(held.clone()).unwrap();

@@ -3014,6 +3014,7 @@ impl Pool {
             let load = match plan.slots.first() {
                 // A call that constructs nothing: its weightless construction.
                 None => DeviceCommand::Load {
+                    hub: calls.and_then(|calls| calls.hub_access(id)),
                     construction: construction.clone(),
                     devices: lane.clone(),
                     sequence_parallel_degree: ranks,
@@ -3053,6 +3054,7 @@ impl Pool {
                         _ => plan.slots.iter().map(load).collect(),
                     };
                     DeviceCommand::Load {
+                        hub: calls.and_then(|calls| calls.hub_access(id)),
                         construction: construction.clone(),
                         devices: lane.clone(),
                         sequence_parallel_degree: ranks,
@@ -3248,6 +3250,7 @@ impl Pool {
         session.invoked = true;
         let reply = session.executor.command_with(
             &DeviceCommand::Invoke {
+                hub: calls.and_then(|calls| calls.hub_access(id)),
                 max_output_bytes: crate::output_capacity::for_callable(document, "entrypoints", &plan.entrypoint)?,
                 request_id: id.into(),
                 construction: construction.clone(),

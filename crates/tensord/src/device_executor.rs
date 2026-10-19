@@ -188,6 +188,8 @@ pub enum DeviceCommand {
         constructions: Vec<Construction>,
     },
     Load {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hub: Option<Value>,
         construction: String,
         devices: String,
         sequence_parallel_degree: u32,
@@ -241,6 +243,8 @@ pub enum DeviceCommand {
         input_metadata: BTreeMap<String, Value>,
     },
     Invoke {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hub: Option<Value>,
         /// Retained asset capacity derived from the actual installed result schema.
         max_output_bytes: u64,
         request_id: String,

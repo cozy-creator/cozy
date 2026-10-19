@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tensord::{
-    hub::{Capability, Catalog, Leaf, Op, Source},
+    hub::{Capability, Catalog, Op, Source},
     origin::Publication,
     stop::Stop,
 };
@@ -217,12 +217,12 @@ fn hub() -> (Source, Held) {
         })
     });
     let pem = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap().serialize_pem();
-    let leaf = Arc::new(Leaf::from_pem(&pem).unwrap());
+    let leaf = hub_client::P256Key::from_pem(&pem).unwrap();
     let part = |value: Value| URL_SAFE_NO_PAD.encode(value.to_string());
     let exp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600;
     let jws = format!("{}.{}.sig", part(json!({"alg": "EdDSA"})), part(json!({"aud": origin, "cnf": {"jkt": leaf.thumbprint()},
-        "exp": exp, "authorization_details": [{"type": "tensorhub_model_publish", "model": "acme/model"}]})));
-    let capability = Capability::new(&jws, &format!("{origin}/v1/auth/oauth2/token"), leaf).unwrap();
+        "exp": exp, "authorization_details": [{"type": "tensorhub_model_upload", "model": "acme/model"}]})));
+    let capability = Capability::new(&jws, &format!("{origin}/v1/auth/oauth2/token"), &leaf.private_jwk()).unwrap();
     (Source::new(&origin, None, vec![], Some(capability)).unwrap(), held)
 }
 

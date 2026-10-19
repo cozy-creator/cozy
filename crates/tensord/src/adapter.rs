@@ -353,7 +353,7 @@ pub(crate) mod tests {
     /// tokenizer.
     pub(crate) fn checkpoint(store: &Store, key: &str, component: &str, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> ObjectRef {
         let mut writer = store.writer(None, Some(key)).unwrap();
-        let config = Config::from([("a".to_string(), ConfigValue::Int(1))]);
+        let config = Config::from_iter([("a".to_string(), ConfigValue::from(1))]);
         let mut declared = writer.component(component, "diffusers.UNet2DConditionModel", config, None).unwrap();
         for (name, shape, bytes) in tensors {
             declared.put(name, &Dtype::F32, shape, Data::Plain(Source::Read(&mut bytes.as_slice()))).unwrap();

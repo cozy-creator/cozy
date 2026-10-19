@@ -1,18 +1,27 @@
 //! Hub access (th-241, th-245). Released content is read anonymously, by name. A run's private
 //! operations (reading one of the owner's unpublished checkpoints, publishing to the owner's
 //! repositories) are named by a capability the owner's CLI signed with its device key for this
-//! machine's TLS leaf. At the run's first private operation the machine trades it, once, for a
+//! run's own key. At the run's first private operation the machine trades it, once, for a
 //! DPoP-bound token (hub-client's `RunToken`: AuthKit's JWT-bearer grant, an assertion the leaf
 //! signs). TensorFS's mover carries the bytes; it presents the token, proved per request, to
 //! the Hub host only.
 use base64::Engine as _;
-use hub_client::{Credential, Ended, P256Key, RunToken};
+use hub_client::Credential;
+use serde_json::{Value, json};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use tensorfs_core::fetch::token::{HeaderMap, Request};
+use tensorfs_core::fetch::{Client as FetchClient, DPoP, JwtBearer, SourcePolicy, TokenProvider};
 
-pub use hub_client::{types, Op};
+pub use hub_client::types;
+
+#[derive(Clone, Copy, Debug)]
+pub enum Op<'a> {
+    Read { model: &'a str, manifest: &'a str },
+    Publish { model: &'a str },
+}
 
 /// A run's reasons when its capability does not carry it (th-241's typed refusals).
 pub mod reason {
@@ -177,67 +186,122 @@ fn pooled(pool: &Pool, ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal
     Ok(client)
 }
 
-/// The machine's TLS leaf key (P-256): it proves DPoP and signs JWT-bearer assertions. A
-/// capability names its thumbprint (`cnf.jkt`).
-pub struct Leaf(Arc<P256Key>);
-
-impl Leaf {
-    /// The identity's PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`).
-    pub fn from_pem(pem: &str) -> Result<Self, Refusal> {
-        P256Key::from_pem(pem)
-            .map(|key| Self(Arc::new(key)))
-            .map_err(|e| Refusal(format!("the machine key: {e}")))
-    }
-
-    /// RFC 7638 thumbprint: a capability's and every token's `cnf.jkt`.
-    pub fn thumbprint(&self) -> String {
-        self.0.thumbprint()
-    }
-}
-
-/// The owner's capability for one run (th-241), and the one token it trades for. Child runs
-/// share it. Nothing is asked of the Hub until a private operation needs it.
+/// Per-request access. The generic TensorFS provider holds the key and trades lazily once.
 pub struct Capability {
-    run: Arc<RunToken>,
+    access: protocol::machine::HubAccess,
+    claims: Value,
+    provider: Mutex<Option<Arc<DPoP>>>,
+    refused: AtomicBool,
+    forbidden: AtomicBool,
 }
 
 impl Capability {
-    /// `jws` as the run spec carries it, traded at `token_endpoint`. Its claims are the CLI's
-    /// statement, read here only to know which operations are private, for which Hub and until
-    /// when; AuthKit and the Hub verify it.
-    pub fn new(jws: &str, token_endpoint: &str, leaf: Arc<Leaf>) -> Result<Self, Refusal> {
+    pub fn new(jws: &str, token_endpoint: &str, key: &str) -> Result<Self, Refusal> {
         if !valid_url(token_endpoint) {
             return Err(Refusal(
                 "the run's capability comes with no token endpoint".into(),
             ));
         }
-        let run = RunToken::new(jws, token_endpoint, leaf.0.clone())
-            .map_err(|e| Refusal(e.to_string()))?;
-        if !valid_origin(run.resource()) {
-            return Err(Refusal("the run's capability names no Hub origin".into()));
+        let claims = jws
+            .split('.')
+            .nth(1)
+            .filter(|_| jws.len() <= 64 << 10 && jws.split('.').count() == 3)
+            .and_then(|c| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(c)
+                    .ok()
+            })
+            .and_then(|c| serde_json::from_slice::<Value>(&c).ok())
+            .ok_or_else(|| Refusal("the run's capability is not a compact JWS".into()))?;
+        let resource = claims["aud"].as_str().unwrap_or_default();
+        if !valid_origin(resource)
+            || claims["exp"].as_u64().is_none()
+            || !claims["authorization_details"]
+                .as_array()
+                .is_some_and(|ops| !ops.is_empty())
+        {
+            return Err(Refusal(
+                "the run's capability lacks its origin, expiry or operations".into(),
+            ));
         }
-        Ok(Self { run: Arc::new(run) })
-    }
-
-    /// Whether the capability names `op`.
-    pub fn names(&self, op: Op) -> bool {
-        self.run.names(op)
-    }
-    pub fn expired(&self) -> bool {
-        self.run.expired()
-    }
-
-    /// Why the capability no longer serves, if it does not.
-    fn ended(&self) -> Option<(&'static str, String)> {
-        self.run.ended().map(|ended| match ended {
-            Ended::Expired => (reason::EXPIRED, ended.to_string()),
-            Ended::Refused(_) => (reason::REFUSED, ended.to_string()),
+        let check = DPoP::token(key, "", Some(resource)).map_err(|e| Refusal(e.to_string()))?;
+        if claims["cnf"]["jkt"].as_str() != Some(check.thumbprint().as_str()) {
+            return Err(Refusal(
+                "the run's capability names another request key".into(),
+            ));
+        }
+        Ok(Self {
+            access: protocol::machine::HubAccess {
+                capability: jws.into(),
+                key: key.into(),
+                token_endpoint: token_endpoint.into(),
+                ..Default::default()
+            },
+            claims,
+            provider: Mutex::default(),
+            refused: AtomicBool::new(false),
+            forbidden: AtomicBool::new(false),
         })
     }
 
-    /// The token, traded over `http` on first need; none while it cannot be had.
-    fn token(&self, http: &reqwest::Client) -> Option<String> {
-        block(self.run.token(http)).ok()
+    pub fn names(&self, op: Op) -> bool {
+        self.claims["authorization_details"]
+            .as_array()
+            .is_some_and(|ops| {
+                ops.iter().any(|named| match op {
+                    Op::Read { model, manifest } => {
+                        named["type"] == "tensorhub_model_read"
+                            && named["model"] == model.to_ascii_lowercase()
+                            && named["revision"] == manifest
+                    }
+                    Op::Publish { model } => {
+                        named["type"] == "tensorhub_model_upload"
+                            && named["model"] == model.to_ascii_lowercase()
+                    }
+                })
+            })
+    }
+
+    pub fn expired(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now >= self.claims["exp"].as_u64().unwrap_or_default()
+    }
+
+    fn ended(&self) -> Option<(&'static str, String)> {
+        if self.expired() {
+            Some((reason::EXPIRED, "the run's capability expired".into()))
+        } else if self.refused.load(Ordering::Relaxed) {
+            Some((
+                reason::REFUSED,
+                "the Hub refused the run's capability".into(),
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn provider(&self, source: &Source) -> Result<Arc<DPoP>, Refusal> {
+        let mut held = self.provider.lock().unwrap();
+        if let Some(provider) = held.as_ref() {
+            return Ok(provider.clone());
+        }
+        let client = source.fetch_client()?;
+        let grant = JwtBearer {
+            token_endpoint: self.access.token_endpoint.clone(),
+            client_id: "tensord".into(),
+            resource: self.claims["aud"].as_str().unwrap_or_default().into(),
+            claims: json!({"capability": self.access.capability})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let provider = DPoP::grant(&client, &self.access.key, grant)
+            .map_err(|e| Refusal(e.to_string()))?
+            .at(&source.origin);
+        Ok(held.insert(Arc::new(provider)).clone())
     }
 }
 
@@ -257,6 +321,44 @@ pub struct Source {
 }
 
 impl Source {
+    fn fetch_client(&self) -> Result<FetchClient, Refusal> {
+        let local = origin_key(&self.origin).is_some_and(|key| loopback_host(&key));
+        let policy = SourcePolicy {
+            any_host: true,
+            allow_local: local,
+            max_redirects: 5,
+            ..Default::default()
+        };
+        match &self.ca_der {
+            Some(der) => FetchClient::with_roots(policy, pem(der).as_bytes())
+                .map_err(|e| Refusal(e.to_string())),
+            None => Ok(FetchClient::new(policy)),
+        }
+    }
+
+    /// The original per-request access, passed through to the Runtime without a trade.
+    pub fn runtime_access(&self) -> Value {
+        let mut access = self
+            .capability
+            .as_ref()
+            .map(|c| c.access.clone())
+            .unwrap_or_default();
+        access.origin = self.origin.clone();
+        access.ca_der = self.ca_der.clone().unwrap_or_default();
+        let mut wire = serde_json::to_value(access).expect("Hub access serializes");
+        wire["endpoint"] = wire.as_object_mut().unwrap().remove("origin").unwrap();
+        wire.as_object_mut().unwrap().remove("object_hosts");
+        wire
+    }
+
+    /// Public prefetch never redeems a package run's capability.
+    pub fn anonymous(&self) -> Self {
+        Self {
+            capability: None,
+            ..self.clone()
+        }
+    }
+
     pub fn new(
         origin: &str,
         ca_der: Option<Vec<u8>>,
@@ -283,42 +385,28 @@ impl std::fmt::Debug for Source {
     }
 }
 
-/// The capability's token, as TensorFS's mover presents it: to the Hub host only, with a fresh
-/// proof per request naming the Hub's public origin.
-struct Presenter {
-    capability: Arc<Capability>,
-    host: String,
-    http: reqwest::Client,
-    /// The Hub answered a token-bearing request 403: the operation is outside the token.
-    forbidden: AtomicBool,
-}
-
-impl Presenter {
-    /// The capability's headers on `method host target`: nothing off the Hub host or without
-    /// a token.
-    fn present(&self, method: &str, host: &str, target: &str) -> Vec<(String, String)> {
-        if !host.eq_ignore_ascii_case(&self.host) {
-            return Vec::new();
+#[async_trait::async_trait]
+impl TokenProvider for Capability {
+    async fn headers(&self, request: &Request<'_>) -> tensorfs_core::err::Result<Vec<(String, String)>> {
+        if let Some((code, detail)) = self.ended() {
+            return tensorfs_core::err::refuse(tensorfs_core::err::Code::CREDENTIAL_REQUIRED, format!("{code}: {detail}"));
         }
-        let Some(token) = self.capability.token(&self.http) else {
-            return Vec::new();
-        };
-        let path = target.split(['?', '#']).next().filter(|p| !p.is_empty()).unwrap_or("/");
-        let presented = self.capability.run.present(&token, method, &self.host, path);
-        presented.into_iter().map(|(name, value)| (name.to_string(), value)).collect()
+        let provider = self.provider.lock().unwrap().clone().expect("a scoped provider");
+        let answer = provider.headers(request).await;
+        if answer.as_ref().is_err_and(|e| e.code == tensorfs_core::err::Code::CREDENTIAL_REQUIRED) {
+            self.refused.store(true, Ordering::Relaxed);
+        }
+        answer
     }
 
-    /// Reads the Hub's answer to a request that presented `authorization`: true asks the
-    /// request again (a fresh DPoP nonce).
-    fn observe(&self, host: &str, authorization: Option<&str>, status: u16, nonce: Option<&str>, challenged: bool) -> bool {
-        let token = authorization.and_then(|v| v.strip_prefix("DPoP "));
-        let Some(token) = token.filter(|_| host.eq_ignore_ascii_case(&self.host)) else {
-            return false;
-        };
-        if status == 403 {
-            self.forbidden.store(true, Ordering::Relaxed);
+    fn retry(&self, sent: &Request<'_>, status: u16, headers: &HeaderMap) -> bool {
+        let provider = self.provider.lock().unwrap().clone().expect("a scoped provider");
+        let retry = provider.retry(sent, status, headers);
+        if sent.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("authorization")) {
+            if status == 403 { self.forbidden.store(true, Ordering::Relaxed); }
+            if status == 401 && !retry { self.refused.store(true, Ordering::Relaxed); }
         }
-        self.capability.run.observe(&self.host, token, status, nonce, challenged)
+        retry
     }
 }
 
@@ -326,11 +414,9 @@ impl Presenter {
 /// object hosts see nothing. Anonymous unless built for an operation the capability names.
 pub struct Catalog {
     origin: String,
-    host: String,
     hub: hub_client::Client,
     /// The Hub as the run's capability, for an operation it names.
-    run: Option<hub_client::Client>,
-    credential: Option<Presenter>,
+    credential: Option<Arc<Capability>>,
     ca_der: Option<Vec<u8>>,
 }
 
@@ -338,14 +424,13 @@ impl Catalog {
     /// Public reads: anonymous.
     pub fn new(source: &Source) -> Result<Self, Refusal> {
         let origin = source.origin.clone();
-        let host = tensorfs_core::fetch::policy::base_host(&origin).map_err(|e| Refusal(e.to_string()))?;
+        let host =
+            tensorfs_core::fetch::policy::base_host(&origin).map_err(|e| Refusal(e.to_string()))?;
         let http = http(source.ca_der.as_deref())?;
         let hub = hub_client::Client::connect(&origin, http, Credential::Anonymous);
         Ok(Self {
             origin,
-            host,
             hub,
-            run: None,
             credential: None,
             ca_der: source.ca_der.clone(),
         })
@@ -357,12 +442,12 @@ impl Catalog {
     /// before any request goes out without it.
     pub fn for_op(source: &Source, op: Op) -> Result<Self, (&'static str, String)> {
         let catalog = Self::scoped(source, op)?;
-        if let Some(presenter) = &catalog.credential {
-            if presenter.capability.token(&presenter.http).is_none() {
-                if let Some(ended) = presenter.capability.ended() {
-                    return Err(ended);
-                }
-            }
+        if let Some(ended) = catalog
+            .credential
+            .as_ref()
+            .and_then(|p| p.ended())
+        {
+            return Err(ended);
         }
         Ok(catalog)
     }
@@ -373,15 +458,8 @@ impl Catalog {
         let mut catalog = Self::new(source).map_err(|e| ("catalog_read_failed", e.0))?;
         match &source.capability {
             Some(capability) if capability.names(op) => {
-                let http = http(source.ca_der.as_deref()).map_err(|e| ("catalog_read_failed", e.0))?;
-                let credential = Credential::Run(capability.run.clone());
-                catalog.run = Some(hub_client::Client::connect(&source.origin, http.clone(), credential));
-                catalog.credential = Some(Presenter {
-                    capability: capability.clone(),
-                    host: catalog.host.clone(),
-                    http,
-                    forbidden: AtomicBool::new(false),
-                });
+                capability.provider(source).map_err(|e| ("hub_access_invalid", e.0))?;
+                catalog.credential = Some(capability.clone());
             }
             _ => {
                 if let Op::Publish { model } = op {
@@ -404,33 +482,47 @@ impl Catalog {
         self.credential.is_some()
     }
 
-    /// The CA the Hub's grant names, beyond the public roots (DER).
-    pub(crate) fn ca(&self) -> Option<&[u8]> {
-        self.ca_der.as_deref()
-    }
-
-    /// The Hub as the run's capability, when it names this operation.
-    pub(crate) fn run(&self) -> Option<&hub_client::Client> {
-        self.run.as_ref()
+    pub(crate) fn endpoint(&self) -> tensorfs_core::err::Result<tensorfs_core::fetch::Endpoint> {
+        let source = Source::new(&self.origin, self.ca_der.clone(), vec![], None).map_err(|e| {
+            tensorfs_core::err::Refusal {
+                code: tensorfs_core::err::Code::CREDENTIAL_REQUIRED,
+                detail: e.0,
+            }
+        })?;
+        let client = source
+            .fetch_client()
+            .map_err(|e| tensorfs_core::err::Refusal {
+                code: tensorfs_core::err::Code::CREDENTIAL_REQUIRED,
+                detail: e.0,
+            })?;
+        let token = self
+            .credential
+            .as_ref()
+            .map(|p| p.clone() as Arc<dyn TokenProvider>);
+        tensorfs_core::fetch::Endpoint::new(&client, &self.origin, token)
     }
 
     /// Headers presenting the capability on `method url`; none off the Hub host.
     pub fn present(&self, method: &str, url: &str) -> Vec<(String, String)> {
-        let (Some(presenter), Ok(parsed)) = (&self.credential, reqwest::Url::parse(url)) else {
+        let Some(presenter) = &self.credential else {
             return Vec::new();
         };
-        presenter.present(method, parsed.host_str().unwrap_or_default(), parsed.path())
+        block(presenter.headers(&Request { method, url, headers: &[], payload: None })).unwrap_or_default()
     }
 
     /// Reads the Hub's answer to a request that sent `sent`: true asks it again.
-    pub(crate) fn observe(&self, url: &str, sent: &[(String, String)], status: u16, headers: &reqwest::header::HeaderMap) -> bool {
+    pub(crate) fn observe(
+        &self,
+        url: &str,
+        sent: &[(String, String)],
+        status: u16,
+        headers: &reqwest::header::HeaderMap,
+    ) -> bool {
         let (Some(presenter), Ok(parsed)) = (&self.credential, reqwest::Url::parse(url)) else {
             return false;
         };
-        let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-        let authorization = sent.iter().find(|(name, _)| name.eq_ignore_ascii_case("authorization")).map(|(_, v)| v.as_str());
-        let challenged = header("www-authenticate").is_some_and(|v| v.contains("use_dpop_nonce"));
-        presenter.observe(parsed.host_str().unwrap_or_default(), authorization, status, header("dpop-nonce"), challenged)
+        let _ = parsed;
+        presenter.retry(&Request { method: "GET", url, headers: sent, payload: None }, status, headers)
     }
 
     /// A package and its releases.
@@ -449,7 +541,10 @@ impl Catalog {
     ) -> Result<types::PackageInstallPlan, hub_client::Error> {
         let empty = types::Empty(Default::default());
         block(async {
-            let plan = self.hub.get_package_download_plan(org, name, python_version, Some(release), &empty).await?;
+            let plan = self
+                .hub
+                .get_package_download_plan(org, name, python_version, Some(release), &empty)
+                .await?;
             Ok(plan.into_inner())
         })
     }
@@ -464,7 +559,7 @@ impl Catalog {
         let Some(presenter) = &self.credential else {
             return (code, detail.to_string());
         };
-        if let Some(ended) = presenter.capability.ended() {
+        if let Some(ended) = presenter.ended() {
             return ended;
         }
         if presenter.forbidden.load(Ordering::Relaxed) {
@@ -478,16 +573,16 @@ impl Catalog {
 mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
-    fn leaf() -> Arc<Leaf> {
+    fn leaf() -> Arc<hub_client::P256Key> {
         let pem = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
             .unwrap()
             .serialize_pem();
-        Arc::new(Leaf::from_pem(&pem).unwrap())
+        Arc::new(hub_client::P256Key::from_pem(&pem).unwrap())
     }
 
-    fn signed(leaf: &Leaf, ops: Value) -> String {
+    fn signed(leaf: &hub_client::P256Key, ops: Value) -> String {
         let part = |value: Value| URL_SAFE_NO_PAD.encode(value.to_string());
         let exp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -513,15 +608,15 @@ mod tests {
         let jws = signed(
             &leaf,
             json!([
-                {"type": "tensorhub_model_read", "model": "alice/private", "manifest": manifest},
-                {"type": "tensorhub_model_publish", "model": "alice/out"},
+                {"type": "tensorhub_model_read", "model": "alice/private", "revision": manifest},
+                {"type": "tensorhub_model_upload", "model": "alice/out"},
             ]),
         );
         // Nothing answers here: a trade goes unanswered and the operation keeps its capability.
         const TOKENS: &str = "http://127.0.0.1:9/v1/auth/oauth2/token";
-        let capability = Capability::new(&jws, TOKENS, leaf.clone()).unwrap();
+        let capability = Capability::new(&jws, TOKENS, &leaf.private_jwk()).unwrap();
         assert!(
-            Capability::new(&jws, "", leaf.clone()).is_err(),
+            Capability::new(&jws, "", &leaf.private_jwk()).is_err(),
             "a capability comes with its token endpoint"
         );
         let source = Source::new(
@@ -532,10 +627,7 @@ mod tests {
         )
         .unwrap();
         let public = Catalog::new(&source).unwrap();
-        assert_eq!(
-            (public.origin(), public.host.as_str()),
-            ("https://hub.example", "hub.example")
-        );
+        assert_eq!(public.origin(), "https://hub.example");
         assert!(public.credential.is_none());
         let read =
             |model, manifest| Catalog::for_op(&source, Op::Read { model, manifest }).unwrap();
@@ -557,13 +649,13 @@ mod tests {
         assert!(Source::new("http://hub.example", None, vec![], None).is_err());
         let other = signed(
             &self::leaf(),
-            json!([{"type": "tensorhub_model_publish", "model": "alice/out"}]),
+            json!([{"type": "tensorhub_model_upload", "model": "alice/out"}]),
         );
         assert!(
-            Capability::new(&other, TOKENS, leaf.clone()).is_err(),
+            Capability::new(&other, TOKENS, &leaf.private_jwk()).is_err(),
             "a capability for another machine key"
         );
-        assert!(Capability::new("not-a-jws", TOKENS, leaf).is_err());
+        assert!(Capability::new("not-a-jws", TOKENS, &leaf.private_jwk()).is_err());
     }
 
     #[test]

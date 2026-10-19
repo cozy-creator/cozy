@@ -58,7 +58,7 @@ type seen struct {
 type op struct {
 	Type     string `json:"type"`
 	Model    string `json:"model"`
-	Manifest string `json:"manifest,omitempty"`
+	Revision string `json:"revision,omitempty"`
 }
 
 type hub struct {
@@ -114,10 +114,10 @@ func permits(ops []op, method, path string) bool {
 	}
 	return slices.ContainsFunc(ops, func(o op) bool {
 		switch o.Type {
-		case "tensorhub_model_publish":
+		case "tensorhub_model_upload":
 			return o.Model == model
 		case "tensorhub_model_read":
-			return read && o.Model == model && method == http.MethodGet && strings.SplitN(checkpoint, "/", 2)[0] == o.Manifest
+			return read && o.Model == model && method == http.MethodGet && strings.SplitN(checkpoint, "/", 2)[0] == o.Revision
 		}
 		return false
 	})
@@ -139,7 +139,7 @@ func TestHarness(t *testing.T) {
 			Clients: []authkit.OAuthClientConfig{{
 				ID: client, Name: "TensorD", Resources: []string{resource},
 				GrantTypes:                []authkit.OAuthGrantType{authkit.GrantJWTBearer},
-				AuthorizationDetailsTypes: []string{"tensorhub_model_read", "tensorhub_model_publish"},
+				AuthorizationDetailsTypes: []string{"tensorhub_model_read", "tensorhub_model_upload"},
 			}},
 		}
 	}), authtest.WithDeps(func(d *authkit.Deps) { d.OAuthGrants = h.decide }))

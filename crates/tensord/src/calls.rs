@@ -152,6 +152,10 @@ struct Received {
 }
 
 impl Calls {
+    pub(crate) fn hub_access(&self, id: &str) -> Option<Value> {
+        self.runs.upgrade()?.hub(id).map(|hub| hub.runtime_access())
+    }
+
     /// The machine's call broker; `runs` prepares children (none: no children).
     pub fn configure(
         service: &Arc<Service>,

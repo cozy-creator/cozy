@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tensorfs_core::{
     err::{refuse, Code, Refusal, Result},
-    fetch::{Credential, TensorhubOrigin},
+    fetch::{TokenProvider, TensorhubOrigin},
     format::ObjectRef,
 };
 
@@ -23,15 +23,14 @@ use crate::{
 struct Presented(Arc<Catalog>);
 
 #[async_trait]
-impl Credential for Presented {
-    async fn present(&self, method: &str, url: &str) -> Vec<(String, String)> {
-        // The token is traded on the Hub runtime: off the fetch runtime's workers.
-        let (catalog, method, url) = (self.0.clone(), method.to_string(), url.to_string());
-        tokio::task::spawn_blocking(move || catalog.present(&method, &url)).await.unwrap_or_default()
+impl TokenProvider for Presented {
+    async fn headers(&self, request: &tensorfs_core::fetch::token::Request<'_>) -> Result<Vec<(String, String)>> {
+        let (catalog, method, url) = (self.0.clone(), request.method.to_string(), request.url.to_string());
+        Ok(tokio::task::spawn_blocking(move || catalog.present(&method, &url)).await.unwrap_or_default())
     }
 
-    fn observe(&self, url: &str, sent: &[(String, String)], status: u16, headers: &reqwest::header::HeaderMap) -> bool {
-        self.0.observe(url, sent, status, headers)
+    fn retry(&self, sent: &tensorfs_core::fetch::token::Request<'_>, status: u16, headers: &tensorfs_core::fetch::token::HeaderMap) -> bool {
+        self.0.observe(sent.url, sent.headers, status, headers)
     }
 }
 
