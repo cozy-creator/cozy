@@ -13,8 +13,9 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
 use pyo3::{create_exception, ffi};
 use tensorfs_core::client::{self, ImportOptions, Named, PullFrom};
 use tensorfs_core::export;
+use tensorfs_core::fetch::{self, Client as FetchClient, Endpoint, Fetcher, ObjectStore, Origin, Want};
 use tensorfs_core::failure::{Failure, Kind};
-use tensorfs_core::format::{Body, Config, ConfigValue, Dtype, Encoding, Header, Metadata, Tensor, Value};
+use tensorfs_core::format::{Body, Config, ConfigValue, Dtype, Encoding, Header, Metadata, ObjectRef, Tensor, Tree, Value};
 use tensorfs_core::store2::{Checkpoint, Store};
 use tensorfs_core::writer::{Data, PartData, Source, Writer};
 
@@ -53,7 +54,7 @@ fn family(py: Python<'_>, kind: Kind) -> Bound<'_, pyo3::types::PyType> {
 }
 
 /// The one conversion: a failure becomes its family's exception, with `.code` and `.detail`.
-fn raise(py: Python<'_>, f: Failure) -> PyErr {
+pub(crate) fn raise(py: Python<'_>, f: Failure) -> PyErr {
     let err = PyErr::from_type(family(py, f.kind), f.to_string());
     let value = err.value(py);
     let _ = value.setattr("code", f.kind.code());
@@ -71,7 +72,7 @@ fn invalid(py: Python<'_>, detail: impl Into<String>) -> PyErr {
     )
 }
 
-trait OrRaise<T> {
+pub(crate) trait OrRaise<T> {
     fn or_raise(self, py: Python<'_>) -> PyResult<T>;
 }
 
@@ -166,7 +167,7 @@ impl Bytes {
 
 // ---------------------------------------------------------------- configs
 
-fn config_to_py<'py>(py: Python<'py>, v: &ConfigValue) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn config_to_py<'py>(py: Python<'py>, v: &ConfigValue) -> PyResult<Bound<'py, PyAny>> {
     Ok(match v {
         ConfigValue::Null => py.None().into_bound(py),
         ConfigValue::Bool(b) => PyBool::new(py, *b).to_owned().into_any(),
@@ -192,7 +193,7 @@ fn config_dict<'py>(py: Python<'py>, map: &Config) -> PyResult<Bound<'py, PyDict
     Ok(dict)
 }
 
-fn config_from_py(obj: &Bound<'_, PyAny>) -> PyResult<ConfigValue> {
+pub(crate) fn config_from_py(obj: &Bound<'_, PyAny>) -> PyResult<ConfigValue> {
     let py = obj.py();
     if obj.is_none() {
         return Ok(ConfigValue::Null);
@@ -267,6 +268,25 @@ pub struct PyStore {
     store: Store,
 }
 
+struct Remote {
+    store: Store,
+    client: FetchClient,
+    endpoint: Arc<Endpoint>,
+}
+
+impl Remote {
+    fn fetch(&self, objects: &[ObjectRef], priority: u64) -> Result<(), Failure> {
+        let origin: Arc<dyn Origin> = self.endpoint.clone();
+        let store: Arc<dyn ObjectStore> = Arc::new(self.store.clone());
+        fetch::runtime()?.block_on(async {
+            let fetcher = Fetcher::new(store, self.client.clone(), None, fetch::Config::default());
+            fetcher.objects(&origin, objects, &Want { priority, ..Want::default() }).await?;
+            fetcher.settled().await;
+            Ok(())
+        })
+    }
+}
+
 #[pymethods]
 impl PyStore {
     #[new]
@@ -288,6 +308,72 @@ impl PyStore {
     fn open_path(&self, py: Python<'_>, path: PathBuf, variant: Option<String>) -> PyResult<PyCheckpoint> {
         let ck = py.detach(|| Checkpoint::folder(&path, variant.as_deref(), Some(&self.store))).or_raise(py)?;
         Ok(PyCheckpoint::new(ck.header().clone(), Some(ck), None))
+    }
+
+    #[pyo3(signature = (repo_id, revision = None, variant = None, endpoint = "https://tensorhub.com", token = None, ca_der = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn open_remote(&self, py: Python<'_>, repo_id: String, revision: Option<String>, variant: Option<String>, endpoint: &str, token: Option<&Bound<'_, PyAny>>, ca_der: Option<Vec<u8>>) -> PyResult<PyCheckpoint> {
+        let client = crate::credentials::client(endpoint, ca_der.as_deref()).or_raise(py)?;
+        let endpoint = Arc::new(Endpoint::new(&client, endpoint, crate::credentials::provider(token)?).or_raise(py)?);
+        let remote = Remote { store: self.store.clone(), client, endpoint };
+        let named = py.detach(|| -> Result<Named, Failure> {
+            if revision.is_some() || repo_id.starts_with("sha256:") {
+                let reference = format!("{repo_id}{}", revision.as_deref().map(|r| format!("@{r}")).unwrap_or_default());
+                if let Ok(named) = self.store.resolve(&reference, variant.as_deref()) { return Ok(named); }
+                if let Some(digest) = revision.as_deref().filter(|r| r.starts_with("sha256:")) {
+                    if let Ok(mut named) = self.store.resolve(digest, variant.as_deref()) {
+                        named.name = Some(repo_id.clone());
+                        return Ok(named);
+                    }
+                }
+            }
+            let runtime = fetch::runtime()?;
+            let digest = revision.as_deref().filter(|r| r.starts_with("sha256:")).or_else(|| repo_id.starts_with("sha256:").then_some(repo_id.as_str()));
+            let (root, version) = if let Some(digest) = digest {
+                let object = runtime.block_on(remote.endpoint.object(digest.trim_start_matches("sha256:")))?
+                    .ok_or_else(|| Failure { kind: Kind::NotFound, detail: format!("no object {digest}") })?;
+                (object, None)
+            } else {
+                let (repo, _) = runtime.block_on(remote.endpoint.repo(&repo_id))?
+                    .ok_or_else(|| Failure { kind: Kind::NotFound, detail: format!("no repo {repo_id}") })?;
+                let (version, tree) = fetch::release_of(&repo, revision.as_deref())?;
+                (tree, Some(version))
+            };
+            remote.fetch(std::slice::from_ref(&root), 0)?;
+            let bytes = self.store.read(&root)?;
+            let (tree, header, chosen) = match Tree::from_json(&bytes) {
+                Ok(tree) => {
+                    let (v, header) = if variant.as_deref() == Some("*") {
+                        tree.variants().next().ok_or_else(|| Failure { kind: Kind::NotFound, detail: "the tree has no variants".into() })?
+                    } else { tree.variant(variant.as_deref())? };
+                    remote.fetch(std::slice::from_ref(header), 0)?;
+                    (Some(root), header.clone(), Some(v.to_owned()))
+                }
+                Err(_) => {
+                    Header::from_cbor(&bytes)?;
+                    (None, root, variant)
+                }
+            };
+            if let (Some(tree), Some(version)) = (&tree, &version) {
+                self.store.update_ref(&repo_id, |old| Some(fetch::with_tree(old, &repo_id, tree, Some(version))))?;
+            }
+            Ok(Named { header, tree, name: Some(repo_id), release: version, variant: chosen })
+        }).or_raise(py)?;
+        let mut ck = opened(py, &self.store, named)?;
+        ck.remote = Some(remote);
+        Ok(ck)
+    }
+
+    #[pyo3(signature = (folder_path, repo_id, revision = None, endpoint = "https://tensorhub.com", token = None, ca_der = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn upload_folder(&self, py: Python<'_>, folder_path: PathBuf, repo_id: String, revision: Option<String>, endpoint: &str, token: Option<&Bound<'_, PyAny>>, ca_der: Option<Vec<u8>>) -> PyResult<String> {
+        let client = crate::credentials::client(endpoint, ca_der.as_deref()).or_raise(py)?;
+        let endpoint = Endpoint::new(&client, endpoint, crate::credentials::provider(token)?).or_raise(py)?;
+        py.detach(|| -> Result<String, Failure> {
+            let tree = self.store.admit_folder(&folder_path)?;
+            fetch::runtime()?.block_on(fetch::upload_tree(&endpoint, &repo_id, &tree, &self.store, revision.as_deref()))?;
+            Ok(tree.id())
+        }).or_raise(py)
     }
 
     #[pyo3(signature = (folder_path, repo_id, revision = None))]
@@ -318,6 +404,16 @@ impl PyStore {
                     self.store.admit_folder(&source)?
                 }
             };
+            if let Some(remote) = &ck.remote {
+                let parsed = self.store.tree(&tree)?;
+                let mut objects: Vec<ObjectRef> = parsed.repo_files().map(|(_, o)| o.clone()).collect();
+                let headers: Vec<ObjectRef> = parsed.variants().filter(|(v, _)| variants.as_ref().is_none_or(|want| want.iter().any(|w| w == v))).map(|(_, h)| h.clone()).collect();
+                remote.fetch(&headers, 0)?;
+                for header in headers {
+                    objects.extend(Header::from_cbor(&self.store.read(&header)?)?.objects().cloned());
+                }
+                remote.fetch(&objects, 0)?;
+            }
             self.store.snapshot(&tree, &dest, variants.as_deref())?;
             Ok(dest)
         }).or_raise(py)
@@ -414,6 +510,7 @@ impl PyStore {
             w: Mutex::new(Some(w)),
             dest: None,
             variant: None,
+            repo_id: None,
         })
     }
 
@@ -489,6 +586,7 @@ pub struct PyCheckpoint {
     named: Option<Named>,
     tensors: OnceLock<Py<PyDict>>,
     components: OnceLock<Py<PyDict>>,
+    remote: Option<Remote>,
 }
 
 /// What `model_index.json` held: `cls` (`diffusers.<Class>`) and `config`.
@@ -524,7 +622,9 @@ pub struct PyComponent {
 impl PyComponent {
     #[getter]
     fn path(&self, py: Python<'_>) -> PyResult<PathBuf> {
-        let ck = self.ck.as_ref().ok_or_else(|| invalid(py, "a parsed header has no asset path"))?.get().stored(py)?;
+        let checkpoint = self.ck.as_ref().ok_or_else(|| invalid(py, "a parsed header has no asset path"))?.get();
+        checkpoint.fetch_components(py, Some(&[self.name.clone()]), 0)?;
+        let ck = checkpoint.stored(py)?;
         py.detach(|| ck.component_path(&self.name)).or_raise(py)
     }
     /// Asset `name`'s bytes; a parsed header has none.
@@ -532,7 +632,9 @@ impl PyComponent {
         let Some(ck) = &self.ck else {
             return Err(raise(py, Failure { kind: Kind::Unsupported, detail: "a parsed header has no assets here".into() }));
         };
-        let ck = ck.get().stored(py)?;
+        let checkpoint = ck.get();
+        checkpoint.fetch_components(py, Some(&[self.name.clone()]), 0)?;
+        let ck = checkpoint.stored(py)?;
         let bytes = py.detach(|| ck.asset(&self.name, &name)).or_raise(py)?;
         Ok(PyBytes::new(py, &bytes))
     }
@@ -628,7 +730,15 @@ fn info(py: Python<'_>, t: &Tensor) -> PyResult<PyInfo> {
 
 impl PyCheckpoint {
     fn new(header: Header, stored: Option<Checkpoint>, named: Option<Named>) -> PyCheckpoint {
-        PyCheckpoint { header, stored, named, tensors: OnceLock::new(), components: OnceLock::new() }
+        PyCheckpoint { header, stored, named, tensors: OnceLock::new(), components: OnceLock::new(), remote: None }
+    }
+
+    pub(crate) fn fetch_components(&self, py: Python<'_>, components: Option<&[String]>, priority: u64) -> PyResult<()> {
+        if let Some(remote) = &self.remote {
+            let objects = tensorfs_core::store2::wanted(&self.header, components).or_raise(py)?;
+            py.detach(|| remote.fetch(&objects, priority)).or_raise(py)?;
+        }
+        Ok(())
     }
 
     /// The store's checkpoint behind it; a parsed header has none.
@@ -693,6 +803,7 @@ impl PyCheckpoint {
     fn revision(&self) -> Option<&str> { self.release() }
     #[getter]
     fn path(&self, py: Python<'_>) -> PyResult<PathBuf> {
+        self.fetch_components(py, None, 0)?;
         let ck = self.stored(py)?;
         py.detach(|| ck.path()).or_raise(py)
     }
@@ -755,6 +866,12 @@ impl PyCheckpoint {
         Ok(missing.into_iter().map(|o| (o.sha256, o.length)).collect())
     }
 
+    #[pyo3(signature = (components = None, *, priority = 0, progress = None))]
+    fn fetch(&self, py: Python<'_>, components: Option<Vec<String>>, priority: u64, progress: Option<Py<PyAny>>) -> PyResult<()> {
+        let _ = progress;
+        self.fetch_components(py, components.as_deref(), priority)
+    }
+
     /// `tensors[component][key] -> Info`.
     #[getter]
     fn tensors(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
@@ -777,6 +894,7 @@ impl PyCheckpoint {
     /// A tensor's logical bytes on the CPU, as a DLPack-able `Array`; an encoded tensor goes
     /// through the reference decode.
     fn read(&self, py: Python<'_>, component: String, key: String) -> PyResult<PyArray> {
+        self.fetch_components(py, Some(&[component.clone()]), 0)?;
         let ck = self.stored(py)?;
         let t = ck.tensor(&component, &key).or_raise(py)?;
         let length = match &t.body {
@@ -1044,23 +1162,36 @@ pub struct PyWriter {
     w: Mutex<Option<Writer>>,
     dest: Option<PathBuf>,
     variant: Option<String>,
+    repo_id: Option<String>,
 }
 
 impl PyWriter {
     #[new]
-    #[pyo3(signature = (dest = None, *, variant = None, base = None, resume = None, cache_dir = None))]
-    fn new(py: Python<'_>, dest: Option<PathBuf>, variant: Option<String>, base: Option<&PyCheckpoint>, resume: Option<String>, cache_dir: Option<PathBuf>) -> PyResult<Self> {
+    #[pyo3(signature = (dest = None, *, variant = None, base = None, resume = None, cache_dir = None, repo_id = None, endpoint = None, token = None, ca_der = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(py: Python<'_>, dest: Option<PathBuf>, variant: Option<String>, base: Option<&PyCheckpoint>, resume: Option<String>, cache_dir: Option<PathBuf>, repo_id: Option<String>, endpoint: Option<String>, token: Option<&Bound<'_, PyAny>>, ca_der: Option<Vec<u8>>) -> PyResult<Self> {
         let base = base.map(|b| b.stored(py)).transpose()?;
         let root = tensorfs_core::home::resolve(cache_dir.as_deref()).or_raise(py)?;
+        if dest.is_some() && repo_id.is_some() { return Err(invalid(py, "a Writer names a folder or an endpoint repo")); }
+        let endpoint = if repo_id.is_some() {
+            let url = endpoint.unwrap_or_else(fetch::token::default_endpoint);
+            let client = crate::credentials::client(&url, ca_der.as_deref()).or_raise(py)?;
+            Some(Arc::new(Endpoint::new(&client, &url, crate::credentials::provider(token)?).or_raise(py)?))
+        } else { None };
         let (store, w) = py.detach(|| -> Result<_, Failure> {
             let store = Store::open(&root)?;
-            let w = match &dest {
-                Some(dest) => Writer::folder(dest, variant.as_deref().unwrap_or(""), base, resume.is_some())?,
-                None => store.writer(base, resume.as_deref())?,
+            let w = match (&dest, &repo_id, endpoint) {
+                (Some(dest), _, _) => Writer::folder(dest, variant.as_deref().unwrap_or(""), base, resume.is_some())?,
+                (_, Some(name), Some(endpoint)) => {
+                    let runtime = fetch::runtime()?;
+                    let stream = Arc::new(fetch::Stream::new(endpoint, runtime.handle().clone()));
+                    store.streaming_writer(stream, name, variant.as_deref().unwrap_or(""), base)?
+                }
+                _ => store.writer(base, resume.as_deref())?,
             };
             Ok((store, w))
         }).or_raise(py)?;
-        Ok(Self { store, w: Mutex::new(Some(w)), dest, variant })
+        Ok(Self { store, w: Mutex::new(Some(w)), dest, variant, repo_id })
     }
     fn with<T: Send>(
         &self,
@@ -1135,13 +1266,28 @@ impl PyWriter {
     /// Lays out the chunks and seals the header; it is pinned under the writer's key, or its
     /// digest. Returns the new checkpoint.
     fn commit(&self, py: Python<'_>) -> PyResult<PyCheckpoint> {
-        let header = self.with(py, |w| Ok(w.commit()?))?;
+        let header = match self.with(py, |w| Ok(w.commit()?)) {
+            Ok(header) => header,
+            Err(err) => {
+                let header = self.w.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|w| w.committed().cloned());
+                if let Some(header) = header {
+                    let ck = opened(py, &self.store, Named { header, tree: None, name: None, release: None, variant: self.variant.clone() })?;
+                    err.value(py).setattr("checkpoint", Py::new(py, ck)?)?;
+                }
+                return Err(err);
+            }
+        };
+        let tree = if self.repo_id.is_some() {
+            let mut tree = self.w.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|w| Tree { files: w.repo_files().clone() }).unwrap_or_default();
+            tree.set_variant(self.variant.as_deref().unwrap_or(""), header.clone());
+            Some(py.detach(|| self.store.put_tree(&tree)).or_raise(py)?)
+        } else { None };
         self.w.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(dest) = &self.dest {
             let ck = py.detach(|| Checkpoint::folder(dest, Some(self.variant.as_deref().unwrap_or("")), Some(&self.store))).or_raise(py)?;
             return Ok(PyCheckpoint::new(ck.header().clone(), Some(ck), None));
         }
-        let named = Named { header, tree: None, name: None, release: None, variant: self.variant.clone() };
+        let named = Named { header, tree, name: self.repo_id.clone(), release: None, variant: self.variant.clone() };
         opened(py, &self.store, named)
     }
 

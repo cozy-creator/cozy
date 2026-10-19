@@ -29,22 +29,17 @@ def _endpoint(endpoint=None):
     return endpoint or _settings.get("endpoint") or os.environ.get("TENSORFS_ENDPOINT", "https://tensorhub.com")
 
 
-def open(name_or_path, *, revision=None, variant=None, endpoint=None, local_files_only=False, cache_dir=None, token=None):
+def open(name_or_path, *, revision=None, variant=None, endpoint=None, local_files_only=False, cache_dir=None, token=None, ca_der=None):
     store = _store(cache_dir)
     path = Path(name_or_path).expanduser()
     if path.exists():
         return store.open_path(path, variant)
     reference = str(name_or_path) + ("@" + revision if revision is not None else "")
-    try:
+    if local_files_only or str(name_or_path).startswith("local/"):
         return store.checkpoint(reference, variant)
-    except _ext.NotFoundError:
-        if local_files_only or str(name_or_path).startswith("local/"):
-            raise
     at = _endpoint(endpoint)
     credential = token if token is not None else _settings.get("token")
-    if at.startswith("file://"):
-        return store.pull(reference, variant, origin=at[7:])
-    return store.pull(reference, variant, hub=at, token=credential)
+    return store.open_remote(str(name_or_path), revision, variant, at, credential, ca_der)
 
 
 def snapshot_download(repo_id: str, *, revision=None, variant=None, components=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None) -> str:
@@ -53,11 +48,11 @@ def snapshot_download(repo_id: str, *, revision=None, variant=None, components=N
     return str(_store(cache_dir).snapshot(ck, dest, None if variant is None else [variant]))
 
 
-def upload_folder(*, repo_id: str, folder_path, revision=None, token=None, endpoint=None) -> str:
+def upload_folder(*, repo_id: str, folder_path, revision=None, token=None, endpoint=None, cache_dir=None, ca_der=None) -> str:
     at = _endpoint(endpoint)
     if repo_id.startswith("local/") or at == "local":
-        return _store().upload_local(Path(folder_path), repo_id, revision)
-    return _store().upload_folder(Path(folder_path), repo_id, revision, at, token if token is not None else _settings.get("token"))
+        return _store(cache_dir).upload_local(Path(folder_path), repo_id, revision)
+    return _store(cache_dir).upload_folder(Path(folder_path), repo_id, revision, at, token if token is not None else _settings.get("token"), ca_der)
 
 
 def convert(source: str | Sequence[str], *, converter=None, variant=None, cache_dir=None, token=None, progress=None):
@@ -94,10 +89,9 @@ class ComponentWriter:
 
 
 class Writer:
-    def __init__(self, dest=None, *, variant=None, base=None, resume=None, repo_id=None, endpoint=None, token=None):
-        self._native = _ext.Writer(dest, variant=variant, base=base, resume=resume, cache_dir=_cache())
+    def __init__(self, dest=None, *, variant=None, base=None, resume=None, repo_id=None, endpoint=None, token=None, cache_dir=None, ca_der=None):
+        self._native = _ext.Writer(dest, variant=variant, base=base, resume=resume, cache_dir=_cache(cache_dir), repo_id=repo_id, endpoint=_endpoint(endpoint), token=token if token is not None else _settings.get("token"), ca_der=ca_der)
         self._resume = resume
-        self._repo_id, self._endpoint, self._token = repo_id, endpoint, token
         self._committed = None
         self.metadata = {}
 
@@ -120,11 +114,16 @@ class Writer:
         if self._committed is None:
             for key, value in self.metadata.items():
                 self._native.set_metadata(key, value)
-            ck = self._native.commit()
-            if self._repo_id is not None:
-                upload_folder(repo_id=self._repo_id, folder_path=ck.path, endpoint=self._endpoint, token=self._token)
+            try:
+                ck = self._native.commit()
+            except _ext.Error as error:
+                self._committed = getattr(error, "checkpoint", None)
+                raise
             self._committed = ck
         return self._committed
 
     def abandon(self) -> None:
         self._native.abandon()
+
+    def has(self, component, key) -> bool:
+        return self._native.has(component, key)
