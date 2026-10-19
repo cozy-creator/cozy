@@ -141,6 +141,12 @@ impl Endpoint {
         &self.url
     }
 
+    /// Public reads only, even when the environment configures credentials for this host.
+    pub fn anonymous(mut self) -> Self {
+        self.token = None;
+        self
+    }
+
     /// The repo document `name` and its ETag; `None` when there is none.
     pub async fn repo(&self, name: &str) -> Result<Option<(Repo, String)>> {
         Ok(match self.repo_since(name, None).await? {
