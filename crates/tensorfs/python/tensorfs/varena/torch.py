@@ -1235,8 +1235,8 @@ class Memory:
             self.ended.append(request.stats)
             self.epoch += 1
             for name, passes in request.passes.items():
-                if (model := self.models.get(name)) is not None:
-                    model.repeats = passes
+                if (ran := self.models.get(name)) is not None:
+                    ran.repeats = passes
             for gpu in request.gpus:
                 if not self._in_request(gpu):
                     self._restore(gpu)
@@ -1578,7 +1578,8 @@ def _set_stats(gpu: Gpu, name: str) -> tuple[int, int, int, int]:
     """One weight set's resident bytes, and its cumulative bytes paged in, streamed and stall."""
     for s in gpu.stats().sets:
         if s.name == name:
-            return int(s.resident), int(s.paged_in), int(s.slot_bytes), int(s.stall_ns)
+            total = s.total
+            return s.resident, total.paged_in, total.streamed_bytes, total.stall_ns
     return 0, 0, 0, 0
 
 
