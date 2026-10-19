@@ -24,18 +24,24 @@ Runs with any python that has torch (CUDA) and `PYTHONPATH=<worktree>/python`.
 """
 
 import argparse
+import contextlib
+import hashlib
+import importlib.metadata
+import json
 import os
+import socket
 import sys
 import tempfile
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import torch
 from torch import nn
 
 import tensorfs
-from tensorfs.varena import Ledger, cuts
+from tensorfs.varena import Ledger, cuts, seal
 from tensorfs.varena.torch import (
     Declared,
     Exhausted,
@@ -44,6 +50,7 @@ from tensorfs.varena.torch import (
     Memory,
     Placeholder,
     WeightGrant,
+    regions_of,
 )
 
 MANIFEST = "sha256:" + "0" * 64
@@ -54,6 +61,27 @@ results: list[bool] = []
 def check(name: str, ok: object, detail: str = "") -> None:
     results.append(bool(ok))
     print(f"{'PASS' if ok else 'FAIL'} {name}" + ("" if ok else f": {detail}"), flush=True)
+
+
+def cwb_overlap(path: Path) -> dict:
+    """Actual GPU HtoD activities and the real CPU factory, on Kineto's common trace clock."""
+    events = json.loads(path.read_text())["traceEvents"]
+    factories = [e for e in events if e.get("ph") == "X" and e.get("cat") == "user_annotation" and e.get("name") == "varena.construct.factory"]
+    assert len(factories) == 1, "one actual factory interval is required"
+    factory = factories[0]
+    start, end = factory["ts"], factory["ts"] + factory["dur"]
+    assert end > start, "the factory interval must contain actual construction work"
+    copies = [
+        e for e in events
+        if e.get("ph") == "X" and e.get("cat") == "gpu_memcpy"
+        and str(e.get("name", "")).startswith("Memcpy HtoD") and e.get("dur", 0) > 0
+        and e.get("args", {}).get("bytes", 0) > 0
+    ]
+    assert copies, "no actual GPU HtoD activity: CUPTI is required, CPU launches do not count"
+    intervals = [(e["ts"], e["ts"] + e["dur"]) for e in copies]
+    overlaps = [(a, b) for a, b in intervals if min(b, end) > max(a, start)]
+    assert overlaps, "no actual GPU HtoD interval overlaps factory construction"
+    return {"clock": "Kineto trace microseconds", "factory": [start, end], "h2d": intervals, "h2d_bytes": sum(e["args"]["bytes"] for e in copies), "overlapping_h2d": overlaps}
 
 
 class Block(nn.Module):
@@ -142,7 +170,11 @@ def main() -> int:
     # a block under 16 MiB shares the writer's packs with the next, so its region is common
     ap.add_argument("--dim", type=int, default=4096)
     ap.add_argument("--batch", type=int, default=512)
+    ap.add_argument("--cwb-trace", type=Path, help="dedicated CWB preview; require GPU DMA/factory overlap and save raw CUPTI trace")
+    ap.add_argument("--creator-ref", help="exact candidate source SHA recorded with --cwb-trace")
     a = ap.parse_args()
+    if a.cwb_trace and (a.dim > 4096 or a.blocks > 12 or a.batch > 512 or not a.creator_ref or len(a.creator_ref) != 40 or not set(a.creator_ref) <= set("0123456789abcdef")):
+        ap.error("CWB preview requires dim<=4096, blocks<=12, batch<=512 and the full --creator-ref")
     root = Path(a.workdir or tempfile.mkdtemp(prefix="varena-torch-")) / "store"
     ck, tensors = build(root, a.dim, a.blocks)
     dev = torch.device("cuda", 0)
@@ -151,6 +183,21 @@ def main() -> int:
         str(torch.cuda.get_device_properties(0).uuid), torch.cuda.mem_get_info(0)[1]
     )
     mem = Memory.open(dev, LedgerGrant(0, table.fd, table.events_fd))
+    if a.cwb_trace:
+        # A fresh plane has no earlier model's pending copies that could satisfy the trace.
+        preview = meta(a.dim, a.blocks)
+        preview._varena = Declared(WeightGrant(ck, "net", MANIFEST))
+        held = seal(ck, regions_of(preview), "cwb-preview")
+        try:
+            with torch.no_grad():
+                x = torch.randn(a.batch, a.dim, dtype=torch.bfloat16, device=dev)
+                want = reference(tensors, a.dim, a.blocks, dev)(x)
+            torch.cuda.synchronize()
+            adopted(mem, ck, held, a, want, x)
+        finally:
+            os.close(held)
+        print(f"{sum(results)}/{len(results)} checks passed")
+        return 0 if all(results) else 1
     net = meta(a.dim, a.blocks)
     net._varena = Declared(WeightGrant(ck, "net", MANIFEST))
     model = mem.load(net)
@@ -450,19 +497,103 @@ def main() -> int:
     return 0 if all(results) else 1
 
 
+class Touch:
+    def __init__(self) -> None:
+        self.fills = 0
+
+    def __call__(self, block: object, parts: dict[str, dict[str, torch.Tensor]]) -> None:
+        for roles in parts.values():
+            for value in roles.values():
+                value.add_(0)
+        self.fills += 1
+
+    def prepare(self) -> int:
+        return 0
+
+
 def adopted(mem: Memory, ck: tensorfs.Checkpoint, held: int, a: argparse.Namespace, want: torch.Tensor, x: torch.Tensor) -> None:
     """The deposit adopted before any module: its copies start at once, the load binds to it."""
     grant = WeightGrant(ck, "net", "sha256:" + "2" * 64, host_fd=held)
-    mem.adopt(grant)
-    ws = mem.adopted[grant.key]
-    check("an adopted tier copies before its module exists", any(ws.resident(r) for r in range(len(ws.spans))))
-    net = meta(a.dim, a.blocks)
+    profile = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]) if a.cwb_trace else contextlib.nullcontext()
+    with profile as trace:
+        mem.adopt(grant)
+        ws = mem.adopted[grant.key]
+        check("an adopted tier copies before its module exists", any(ws.resident(r) for r in range(len(ws.spans))))
+        with torch.profiler.record_function("varena.construct.factory"):
+            net = meta(a.dim, a.blocks)
+    if a.cwb_trace:
+        a.cwb_trace.parent.mkdir(parents=True, exist_ok=True)
+        trace.export_chrome_trace(str(a.cwb_trace))
+        summary = dict(creator=a.creator_ref, script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), tensorfs=importlib.metadata.version("tensorfs"), dim=a.dim, blocks=a.blocks)
+        try:
+            summary.update(cwb_overlap(a.cwb_trace))
+        except Exception as error:
+            summary["failure"] = f"{type(error).__name__}: {error}"
+            raise
+        finally:
+            a.cwb_trace.with_suffix(".summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        check("actual GPU HtoD overlaps the real factory", True)
     net._varena = Declared(grant)
     model = mem.load(net)
     check("the load binds the adopted tier", model.ws is ws and not mem.adopted and not mem.sealed())
     with torch.no_grad(), mem.request("adopted"):
         check("the adopted model equals the reference", torch.equal(net(x), want))
+    torch.cuda.synchronize()
+    pool = mem.cache("graphs:retained", lambda n: 0)
+    hold = pool.hold(model)
+    graph = torch.cuda.CUDAGraph()
+    with torch.no_grad(), torch.cuda.graph(graph):
+        graphed = net(x)
+    graph.replay()
+    torch.cuda.synchronize()
+    check("a lifetime graph hold keeps export conservative", not model.kept()[1])
+    fingerprint, containers = model.kept(quiescent=True)
+    check("a quiescent graph-held model retains pages", bool(containers))
+    graph.replay()
+    torch.cuda.synchronize()
+    check("retention preserves the held graph and addresses", torch.equal(graphed, want))
+    del graph, graphed
+    hold.close()
+    pool.close()
+    pages = []
+    for region, _, fd in containers:
+        with socket.socket(fileno=fd) as container:
+            pages.append((region, socket.recv_fds(container, 1, 1)[1][0]))
+    assert pages, "the fill regression needs retained GPU pages"
     model.close()
+    kept = replace(grant, pages=tuple(pages), fingerprint=fingerprint)
+    try:
+        mismatched = replace(kept, fingerprint="a different layout")
+        mem.adopt(mismatched)
+        net = meta(a.dim, a.blocks)
+        net._varena = Declared(mismatched)
+        model = mem.load(net)
+        with torch.no_grad(), mem.request("fingerprint-miss"):
+            check("a fingerprint mismatch refills exact bytes", torch.equal(net(x), want))
+        moved = next(s.total.paged_in for s in mem.core.stats().sets if s.name == model.name)
+        check("a fingerprint mismatch copies from RAM", moved > 0, str(moved))
+        model.close()
+        mem.adopt(kept)
+        imported = mem.adopted[kept.key]
+        pin = imported.bind(0, torch.cuda.current_stream().cuda_stream)
+        assert not pin.writable, "the early adopted pages are read-only"
+        del pin
+        touch = Touch()
+        net = meta(a.dim, a.blocks)
+        net._varena = Declared(kept, fill=touch)
+        model = mem.load(net)
+        check("a fill drops the read-only early GPU adoption", model.ws is not imported)
+        pin = model.ws.bind(0, torch.cuda.current_stream().cuda_stream)
+        assert pin.writable, "a fill's fresh mapping is writable before any mutation"
+        del pin
+        with torch.no_grad(), mem.request("adopted-fill"):
+            check("a fill after early adoption serves correctly", torch.equal(net(x), want))
+        check("the replacement mapping ran its fill", touch.fills > 0)
+        check("filled pages are never retained", not model.kept()[1])
+        model.close()
+    finally:
+        for _, fd in pages:
+            os.close(fd)
 
     mem.adopt(grant)
     net = meta(a.dim, a.blocks)

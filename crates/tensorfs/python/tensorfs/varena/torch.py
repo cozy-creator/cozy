@@ -408,14 +408,20 @@ class Model:
     def close(self) -> None:
         self.memory._close(self)
 
-    def kept(self) -> tuple[str, list[tuple[int, int, int]]]:
+    def kept(self, *, quiescent: bool = False) -> tuple[str, list[tuple[int, int, int]]]:
         """Its landed home pages not handed out yet, kept past this process for TensorD, and what
         they hold: `(region, span, fd)`, each fd the caller's. None when a fill (a LoRA bake)
-        writes them."""
+        writes them. `quiescent` is only for an executor that stopped admission and drained
+        all work: lifetime graph pins can remain without excluding their pages."""
         if self.fill is not None or self.host or not self.memory.granted:
             return "", []
-        pages = self.ws.kept()
-        return (_fingerprint(self.key, self.ws) if pages else ""), pages
+        with self.memory.lock:
+            if quiescent and (
+                self.memory.active or any(m.flight for m in self.memory.models.values())
+            ):
+                raise Unbound("quiescent retention requires no active request or forward")
+            pages = self.ws.kept_quiescent() if quiescent else self.ws.kept()
+            return (_fingerprint(self.key, self.ws) if pages else ""), pages
 
 
 class Hold:

@@ -2563,6 +2563,7 @@ impl Pool {
         };
         executor.retain_until_exit(directory);
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
+        executor.activity = gpu_work(self.lane(start, plan.degree)?);
         executor.keep_memo(self.memo.clone());
         if plan.degree > 0 {
             let exact = Exact::open(&executor.birth)?.ok_or_else(|| io::Error::other("executor exited before its start"))?;
@@ -2639,7 +2640,7 @@ impl Pool {
             raw: &plan.sources,
             kept: gpus.iter().enumerate().map(|(rank, d)| {
                 let pid = if rank == 0 { Some(session.executor.birth.pid) } else { session.followers.get(rank - 1).map(|f| f.birth().pid) };
-                d.memory.as_ref().zip(pid)
+                d.memory.as_ref().zip(pid).map(|(memory, pid)| (memory, pid, d.entry.as_str()))
             }).collect(),
         };
         if !session.loaded {
@@ -2702,7 +2703,7 @@ impl Pool {
             }
             callbacks.kept = gpus.iter().enumerate().map(|(rank, d)| {
                 let pid = if rank == 0 { Some(session.executor.birth.pid) } else { session.followers.get(rank - 1).map(|f| f.birth().pid) };
-                d.memory.as_ref().zip(pid)
+                d.memory.as_ref().zip(pid).map(|(memory, pid)| (memory, pid, d.entry.as_str()))
             }).collect();
             let load = match plan.slots.first() {
                 // A call that constructs nothing: its weightless construction.
@@ -3105,6 +3106,24 @@ fn unsettled(reply: &Frame, lost: &str) -> Refused {
     Refused { code, detail }
 }
 
+/// Work on `gpus` (kernels or copies), as a count of readings that saw it; None without GPUs
+/// or while NVML cannot tell.
+fn gpu_work(gpus: &[Device]) -> Option<crate::process::Activity> {
+    let opened = gpus.iter().map(|gpu| platform::gpu::Device::open(&gpu.entry).ok());
+    let devices: Vec<_> = opened.collect::<Option<_>>().filter(|devices: &Vec<_>| !devices.is_empty())?;
+    let state = Mutex::new((vec![0; devices.len()], 0));
+    Some(Arc::new(move || {
+        let mut state = state.lock().unwrap();
+        let (seen, readings) = &mut *state;
+        let mut worked = false;
+        for (device, seen) in devices.iter().zip(seen.iter_mut()) {
+            worked |= device.worked_since(seen).ok()?;
+        }
+        *readings += u64::from(worked);
+        Some(*readings)
+    }))
+}
+
 /// Every error ends the run once its executor is gone: FAILED with the reason, or CANCELED
 /// when a cancel was journaled. Nothing returns to the queue to fail again.
 pub(crate) fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::Result<()> {
@@ -3140,6 +3159,8 @@ pub(crate) fn settle(engine: &Arc<Engine>, id: &str, error: &io::Error) -> io::R
         Outcome::Failed(
             Failure::executor("failed", "runtime", &refusal.code, &refusal.detail),
         )
+    } else if let Some(wedged) = error.get_ref().and_then(|inner| inner.downcast_ref::<crate::process::Wedged>()) {
+        Outcome::Failed(Failure::machine("no_progress", wedged.to_string()))
     } else if record.state == State::Starting {
         Outcome::Failed(
             Failure::abandoned(&format!("device executor did not start: {error}")),
@@ -3521,8 +3542,8 @@ struct Callbacks<'a> {
     fetch: Option<&'a Arc<crate::access::Fetch>>,
     /// Its `Weights[M]` sources, whose headers and assets `model_source` answers too.
     raw: &'a [crate::gpu_service::PlanSource],
-    /// Each rank's GPU ledger and the corresponding executor process.
-    kept: Vec<Option<(&'a GpuLedger, u32)>>,
+    /// Each rank's GPU ledger, corresponding executor process and physical lane entry.
+    kept: Vec<Option<(&'a GpuLedger, u32, &'a str)>>,
 }
 impl Callbacks<'_> {
     /// The weight set's chunk files, once its objects landed, and their digest in `answer`.
@@ -3546,7 +3567,8 @@ impl Services for Callbacks<'_> {
         let nfiles = files.as_ref().map_or(0, |(f, _)| f.len());
         let (mut answer, mut fds) = granted(frame.seq, held, files);
         // GPU pages a gone executor kept of this layout follow its host layout.
-        if let Some((fingerprint, pages)) = self.kept.get(frame.rank as usize).copied().flatten().filter(|_| held).and_then(|(m, _)| m.take_kept(&frame.layout)) {
+        let rank = self.kept.get(frame.rank as usize).copied().flatten();
+        if let Some((fingerprint, pages)) = rank.filter(|_| held).and_then(|(m, _, _)| m.take_kept(&frame.layout)) {
             for (page, fd) in pages {
                 answer.pages.push(page);
                 fds.push(fd);
@@ -3554,17 +3576,19 @@ impl Services for Callbacks<'_> {
             (answer.fingerprint, answer.descriptors) = (fingerprint, fds.len() as u64);
         }
         self.pool.notes.note(serde_json::json!({"event": "read_grant", "manifest": frame.manifest,
-            "layout": frame.layout, "held": held, "files": nfiles, "pages": answer.pages.len()}));
+            "layout": frame.layout, "held": held, "files": nfiles, "pages": answer.pages.len(),
+            "rank": frame.rank, "pid": rank.map(|(_, pid, _)| pid), "gpu": rank.map(|(_, _, gpu)| gpu)}));
         Ok((answer, fds))
     }
     /// GPU pages the executor kept: held past its end, for the next executor of the layout.
     fn keep_pages(&mut self, frame: &Frame, pages: Vec<File>) -> Answer {
-        let Some((ledger, pid)) = self.kept.get(frame.rank as usize).copied().flatten().filter(|_| pages.len() == frame.pages.len()) else {
+        let Some((ledger, pid, gpu)) = self.kept.get(frame.rank as usize).copied().flatten().filter(|_| pages.len() == frame.pages.len()) else {
             return Answer::refused(frame.seq, "keep_pages_refused", "kept pages name one existing GPU rank, one fd per page");
         };
         let bytes: u64 = frame.pages.iter().map(|p| p.nbytes).sum();
         ledger.keep(&frame.layout, &frame.fingerprint, pid, frame.pages.iter().copied().zip(pages).collect());
-        self.pool.notes.note(serde_json::json!({"event": "keep_pages", "layout": frame.layout, "pages": frame.pages.len(), "bytes": bytes}));
+        self.pool.notes.note(serde_json::json!({"event": "keep_pages", "layout": frame.layout, "pages": frame.pages.len(), "bytes": bytes,
+            "rank": frame.rank, "pid": pid, "gpu": gpu}));
         Answer::ok(frame.seq)
     }
     fn progress(&mut self, frame: &Frame) {

@@ -318,15 +318,25 @@ def keeper(store: str, sha256: str, fd: int) -> None:
     ws = varena.Gpu(0).register("kept-a", ck, regions(ck))
     assert ws.shareable(), "this card shares VMM pages by fd"
     stream = torch.cuda.current_stream().cuda_stream
-    for r in range(len(ws.spans)):
-        ws.bind(r, stream)
+    held = [torch.from_dlpack(ws.bind(r, stream)) for r in range(len(ws.spans))]
     torch.cuda.synchronize()
-    kept = ws.kept()
+    expected = [view[:4096].clone() for view in held]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = [view[:4096].clone() for view in held]
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not ws.kept(), "ordinary export still refuses lifetime-pinned mappings"
+    kept = ws.kept_quiescent()
+    assert len(kept) == len(held), "drained graph-held pages can be retained without unpinning"
     for r, _, _ in kept:
         pin = ws.bind(r, stream)
         assert not pin.writable and access(pin) == 1, "exported mappings are CUDA read-only"
         del pin
-    meta = json.dumps([(r, span) for r, span, _ in kept]).encode()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(expected, replayed, strict=True)), "READ protection preserves graph replay"
+    meta = json.dumps({"regions": [(r, span) for r, span, _ in kept], "graph_held": len(held)}).encode()
     socket.send_fds(socket.socket(fileno=fd), [meta], [f for _, _, f in kept])
     signal.pause()
 
@@ -338,7 +348,10 @@ def test_survive(gpu, ck, rs, store, stream, facts):
     theirs.close()
     try:
         meta, containers, _, _ = socket.recv_fds(ours, 1 << 16, 256)
-        meta = json.loads(meta)
+        document = json.loads(meta)
+        meta = document["regions"]
+        assert document["graph_held"] == len(rs), "the exporter kept its actual graph pins"
+        facts["h_graph_held"] = document["graph_held"]
         assert len(meta) == len(rs), f"every region kept, got {len(meta)} of {len(rs)}"
     finally:
         if child.poll() is None:

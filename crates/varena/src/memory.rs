@@ -1227,12 +1227,28 @@ impl WeightSet {
     /// `(region, span, container)`, a socket whose queue holds the allocation's fd. The pages
     /// outlive this process while TensorD holds the container; unmapping them here drains it.
     pub fn kept(&self) -> Result<Vec<(u32, u64, OwnedFd)>> {
+        self.keep(false)
+    }
+
+    /// Exports after the caller has stopped admission and drained every use of these weights.
+    /// Lifetime address pins (cached graphs) may remain; no work may read or write them now.
+    /// Their addresses and pins stay intact, and incomplete copies still cannot be exported.
+    pub fn kept_quiescent(&self) -> Result<Vec<(u32, u64, OwnedFd)>> {
+        self.keep(true)
+    }
+
+    fn keep(&self, quiescent: bool) -> Result<Vec<(u32, u64, OwnedFd)>> {
         let g = &self.gpu.inner;
         g.with(|st| {
             let mut out = vec![];
             for (r, reg) in st.set(self.id).regs.iter_mut().enumerate() {
                 let Some(m) = reg.map.as_mut().filter(|m| m.chunks.len() == 1 && m.chunks[0].shared && !m.deposited) else { continue };
-                if !m.quiet()? {
+                let ready = if quiescent {
+                    m.fill.as_ref().map_or(Ok(false), |f| f.landed())? && passed(&mut m.released)?
+                } else {
+                    m.quiet()?
+                };
+                if !ready {
                     continue;
                 }
                 let filled = m.fill.as_ref().and_then(|f| f.state.lock().unwrap().clone());

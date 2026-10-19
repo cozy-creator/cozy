@@ -732,6 +732,8 @@ pub struct DeviceExecutor {
     /// Stillness while this answers true is not this executor's: it waits on runs watched
     /// by their own executors (a job's unfinished children).
     pub waits: Option<crate::process::Waits>,
+    /// Its GPUs' work: a GPU executor's invocations are judged while they run (`Meter::Work`).
+    pub activity: Option<crate::process::Activity>,
     root: PathBuf,
     socket: PathBuf,
     _generation_hold: Option<Arc<File>>,
@@ -1529,6 +1531,7 @@ impl DeviceExecutor {
             hello: Hello::default(),
             liveness: Liveness::default(),
             waits: None,
+            activity: None,
             root: config.root,
             socket: config.socket,
             _generation_hold: config.generation_hold,
@@ -1622,8 +1625,9 @@ impl DeviceExecutor {
         fds: &[File],
         services: &mut impl Services,
     ) -> io::Result<Frame> {
-        let meter = match command {
-            DeviceCommand::Invoke { .. } => Meter::Frames,
+        let meter = match (command, &self.activity) {
+            (DeviceCommand::Invoke { .. }, Some(_)) => Meter::Work,
+            (DeviceCommand::Invoke { .. }, None) => Meter::Frames,
             _ => Meter::Burn,
         };
         let watching = Watching::start(
@@ -1632,6 +1636,7 @@ impl DeviceExecutor {
             self.liveness,
             self.worst_gap,
             self.waits.clone(),
+            self.activity.clone(),
             command.name(),
         )?;
         *self.watched.lock().unwrap() = Some(watching.watch());
@@ -1642,11 +1647,11 @@ impl DeviceExecutor {
             memo.release(run);
         }
         let (killed, worst_gap) = watching.finish();
-        if meter == Meter::Frames {
+        if meter != Meter::Burn {
             self.worst_gap = self.worst_gap.max(worst_gap);
         }
         match killed {
-            Some(verdict) => Err(io::Error::other(verdict)),
+            Some(verdict) => Err(io::Error::other(crate::process::Wedged(verdict))),
             None => result,
         }
     }
@@ -1712,9 +1717,12 @@ impl DeviceExecutor {
                     }
                 }
                 Some(Event::Request) if frame.kind == Kind::KeepPages => {
+                    watch.serving(true);
                     let pages = (0..frame.descriptors).map(|_| platform::handles::recv_fd(&self.stream).map(File::from));
                     let pages = pages.collect::<Result<Vec<_>, _>>()?;
-                    write_frame(&mut self.stream, &services.keep_pages(&frame, pages))?;
+                    let answer = services.keep_pages(&frame, pages);
+                    watch.serving(false);
+                    write_frame(&mut self.stream, &answer)?;
                 }
                 Some(Event::Request) => {
                     // The machine's own answer time is not the executor's stillness.
