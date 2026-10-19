@@ -52,6 +52,7 @@ on:
 run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.runtime_ref }} ${{ inputs.nonce }}
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
