@@ -64,7 +64,7 @@ pub(super) unsafe fn fill(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats,
         let end = offset.checked_add(len as u64).ok_or_else(|| invalid(i, "source range overflows"))?;
         let mut at = offset;
         while at < end {
-            let next = (at - at % grid).checked_add(grid).unwrap_or(u64::MAX).min(end);
+            let next = (at - at % grid).saturating_add(grid).min(end);
             let joins = file.is_some()
                 && pieces.last().is_some_and(|p| {
                     let (first, last) = (&segs[p.segs.start], &segs[p.segs.end - 1]);

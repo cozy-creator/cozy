@@ -130,6 +130,21 @@ class HostReads(unittest.TestCase):
         with self.assertRaises(tfs.UnsupportedError):
             self.tensors.read_all(device="cuda:0")
 
+    def test_real_endpoint_fetches_only_chunks_touched_by_the_read(self) -> None:
+        root = pathlib.Path(self.tmp.name)
+        endpoint = (root / "origin").as_uri()
+        tfs.upload_folder(repo_id="acme/reads", revision="one", folder_path=self.ck.path,
+                          endpoint=endpoint, cache_dir=root / "upload")
+        remote = tfs.open("acme/reads", revision="one", endpoint=endpoint, cache_dir=root / "reader")
+        before = set(remote.missing())
+        part = remote.components["model"].tensors["big"].parts[""]
+        chunk = remote.chunks[part.chunk]
+        self.assertIn(chunk, before)
+        out = bytearray(17)
+        remote.components["model"].tensors.read_into("big", out, offset=1)
+        self.assertEqual(out, self.big[1:18].tobytes())
+        self.assertEqual(set(remote.missing()), before - {chunk})
+
     def test_header_metadata_does_not_imply_local_bytes(self) -> None:
         header = next((pathlib.Path(self.tmp.name) / "store").rglob(self.ck.id.removeprefix("sha256:")))
         parsed = tfs.Checkpoint.parse(header.read_bytes())
