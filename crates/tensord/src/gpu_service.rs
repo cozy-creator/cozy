@@ -998,7 +998,7 @@ impl Pool {
         let mut accounting = self.accounting.lock().unwrap();
         let survivor = self.leaders.lock().unwrap().values()
             .find(|(birth, p, lane)| p == plan && *lane == start && !gone.contains(birth)
-                && !birth.ended().unwrap_or(true))
+                && !birth.ended().unwrap_or(false))
             .map(|(birth, _, _)| birth.clone());
         let key = session_key(plan, start);
         let mut levels = self.levels.lock().unwrap();
@@ -3029,7 +3029,7 @@ impl Pool {
             if start {
                 zygote.set(self.import_only(held));
             }
-            match zygote.fork(config.take().expect("one config per launch"), &on_birth)? {
+            match zygote.fork(config.take().expect("one config per launch"), on_birth)? {
                 Forked::Ready(executor) => {
                     forked = Some(*executor);
                     break;
@@ -3055,7 +3055,7 @@ impl Pool {
                 DeviceExecutor::spawn_owned(
                     config.expect("a refused fork returns its config"),
                     &self.launcher,
-                    &on_birth,
+                    on_birth,
                 )?,
                 "spawn",
             ),
