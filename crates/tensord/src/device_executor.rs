@@ -2472,4 +2472,13 @@ mod codec_tests {
         drop(codec);
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn metadata_access_tokens_do_not_appear_in_frame_diagnostics() {
+        let reply: Frame = serde_json::from_value(serde_json::json!({
+            "ok": true, "access_token": "private-token-for-this-request"
+        })).unwrap();
+        assert_eq!(reply.access_token.as_ref().unwrap().0, "private-token-for-this-request");
+        assert!(!format!("{reply:?}").contains("private-token-for-this-request"));
+    }
+
 }

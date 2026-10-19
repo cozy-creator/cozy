@@ -78,6 +78,11 @@ fn a_request_key_trades_once_without_the_machine_leaf() {
     assert!(get(&tiny, &path).unwrap_err().starts_with("HTTP 404"));
     assert!(get(&Catalog::for_op(&source, TINY).unwrap(), &path).unwrap_err().starts_with("HTTP 404"));
     assert_eq!(authkit.exchanges(), 1, "one trade per run");
+    let handoff = Capability::new(&signed, &authkit.token_endpoint, &run_key.private_jwk()).unwrap();
+    handoff.restore_token(&authkit.last_token());
+    let handed = Source::new(&authkit.hub, None, hosts.clone(), Some(handoff)).unwrap();
+    assert!(get(&Catalog::for_op(&handed, TINY).unwrap(), &path).unwrap_err().starts_with("HTTP 404"));
+    assert_eq!(authkit.exchanges(), 1, "a journaled token handoff must not redeem the capability again");
     let verified = authkit.verified();
     assert!(verified.iter().all(|s| s["owner"] == authkit.owner().as_str() && s["actor"] == jkt.as_str()), "{verified:?}");
     // Public reads of the same run stay anonymous.

@@ -779,7 +779,7 @@ mod tests {
         assert!(!public.contains("first-request-key"));
         #[cfg(unix)] {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(state.join("executions.sqlite3")).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(state.join("execution/executions.sqlite3")).unwrap().permissions().mode() & 0o777, 0o600);
         }
         let pending = service.engine.accept_run_objects("alice", "metadata-2", &spec.digest, Default::default(), &[], &spec.journaled).unwrap().0;
         service.engine.with_journal(|j| j.begin_metadata(&pending.id)).unwrap();
