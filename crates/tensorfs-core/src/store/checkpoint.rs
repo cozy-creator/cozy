@@ -15,6 +15,7 @@ use crate::format::{
     self, decode, variant_of, variant_path, Body, Component, Header, Location, ObjectRef,
     PartBytes, Pipeline, Tensor, Tree, CHUNKS_DIR,
 };
+use crate::sha256::{hex, Sha256};
 
 /// One cozytensors: its parsed header, and where its chunks and assets are read. Opening one
 /// reads the header and nothing more; a chunk is found when it is read, so some may be absent
@@ -24,6 +25,7 @@ pub struct Checkpoint {
     objects: Objects,
     id: ObjectRef,
     header: Arc<Header>,
+    header_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +54,7 @@ impl Store {
             objects: Objects::Store(self.clone()),
             header: Arc::new(Header::from_cbor(&self.read(header)?)?),
             id: header.clone(),
+            header_file: None,
         })
     }
 
@@ -79,6 +82,7 @@ impl Checkpoint {
                 objects: Objects::Folder { dir: parent.to_path_buf(), cache: cache.cloned() },
                 header: Arc::new(Header::from_cbor(&bytes)?),
                 id: ObjectRef::of(&bytes),
+                header_file: Some(dir.to_path_buf()),
             });
         }
         let name = match variant {
@@ -112,12 +116,46 @@ impl Checkpoint {
             },
             header: Arc::new(Header::from_cbor(&bytes)?),
             id: ObjectRef::of(&bytes),
+            header_file: Some(path),
         })
     }
 
     /// The header's object: the cozytensors' id.
     pub fn id(&self) -> &ObjectRef {
         &self.id
+    }
+
+    /// Hash the actual header file and closure without changing them. Missing or corrupt
+    /// objects are returned; other filesystem errors remain errors.
+    pub fn verify(&self) -> Result<Vec<ObjectRef>> {
+        let mut bad = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut buf = vec![0; 1 << 20];
+        for object in std::iter::once(&self.id).chain(self.header.objects()) {
+            if !seen.insert((&object.sha256, object.length)) { continue; }
+            let opened = match (&self.header_file, object == &self.id) {
+                (Some(path), true) => File::open(path).map_err(fail("open", path)),
+                _ => self.object(object),
+            };
+            let mut file = match opened {
+                Ok(file) => file,
+                Err(Error::Absent(_) | Error::Mismatch { .. }) => { bad.push(object.clone()); continue; },
+                Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => { bad.push(object.clone()); continue; },
+                Err(error) => return Err(error),
+            };
+            let mut hash = Sha256::new();
+            let mut length = 0;
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => { length += n as u64; hash.update(&buf[..n]); },
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(fail("verify", object.id())(error)),
+                }
+            }
+            if length != object.length || hex(&hash.finish()) != object.sha256 { bad.push(object.clone()); }
+        }
+        Ok(bad)
     }
 
     /// A plain folder view of this checkpoint, sharing its admitted object files.

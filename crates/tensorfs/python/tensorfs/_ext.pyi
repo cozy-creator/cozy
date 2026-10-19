@@ -184,6 +184,15 @@ class Component:
 class Checkpoint:
     """One cozytensors read from a store, or only its header (`parse`)."""
 
+    def close(self) -> None:
+        """Release this handle's access and cached components; existing child handles remain usable."""
+    def __enter__(self) -> Checkpoint: ...
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None: ...
+    def verify(self) -> list[tuple[str, int]]:
+        """Hash locally available header, chunks and assets; report missing or corrupt objects."""
+    def open_chunk(self, index: int) -> int:
+        """A new read-only OS descriptor owned and closed by the caller."""
+
     @staticmethod
     def parse(header: bytes) -> Checkpoint:
         """A `cozytensors/1` header's pipeline, components and metadata, with no store: component reads,
