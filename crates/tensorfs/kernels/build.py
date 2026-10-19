@@ -40,7 +40,7 @@ def main() -> None:
                          "scale": "*fp32", "term": "*fp32", "table": "*fp32", "factor": "*fp32",
                          "post": "*fp32", "index": "*u32", "error": "*i32", "params": "*i64"}
             variants = [("codes", k.codes, {"BLOCK": 256})]
-            variants += [(name, k.structs, {"DECODE": fn, "BLOCK": 256}, 0) for name, fn in STRUCTS.items()]
+            variants += [(name, k.structs, {"DECODE": fn, "BLOCK": 256}) for name, fn in STRUCTS.items()]
             variants += [(name, getattr(k, name), {"BLOCK": 256}) for name in STAGES]
             for kind, fn, constants in variants:
                 stage_signature = {**signature, "out": "*i32"} if kind in ("unpack", "hadamard") else signature
