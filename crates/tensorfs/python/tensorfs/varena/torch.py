@@ -369,6 +369,8 @@ class Model:
         self.closed = False
         #: its pass now: the memo entry of the shape it runs at
         self.track = cuts.Track(name)
+        #: its open use repeats, for a pass's plan
+        self.repeats = False
 
     @property
     def host(self) -> bool:
@@ -562,6 +564,7 @@ class Memory:
         with self.lock:
             if model.uses == 0:
                 self._plan(model, repeats)
+                model.repeats = repeats
                 model.repeating = repeats
             model.uses += 1
             self.clock += 1
@@ -699,7 +702,7 @@ class Memory:
             request.shapes[(model.name, key)] = shape
         if shape.peak >= 0 and shape.peak != model.reserve:
             model.reserve = shape.peak
-            self._plan(model, model.repeating)
+            self._plan(model, model.repeats)
 
     def _step(self, model: Model) -> None:
         if not model.steps:  # the first pass fixes the order prefetch follows
