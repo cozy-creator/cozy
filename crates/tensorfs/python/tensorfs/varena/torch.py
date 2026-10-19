@@ -542,13 +542,13 @@ class Memory:
         from the regions it carries, its copies to the GPU started into free room. `load` binds
         the module to it when the module's regions are the same; else it is a miss, and the
         module loads as if nothing were granted."""
-        if grant.host_fd is None or not isinstance(self.core, Gpu):
+        if grant.host_fd is None:
             return
         with self.lock:
             files = list(grant.files) or None
             ws = self.core.adopt(self._name(grant.key), grant.ck, grant.host_fd, files)
             self.adopted[grant.key] = ws
-            room = self._free()
+            room = self._free() if self.cuda else 0
             for region, span in enumerate(ws.spans):
                 if span > room:
                     break
@@ -589,7 +589,7 @@ class Memory:
         paths, regions = blocks_of(module), regions_of(module)
         files, host_fd = list(grant.files) or None, grant.host_fd
         ws = self.adopted.pop(grant.key, None)
-        if ws is None and host_fd is not None and isinstance(self.core, Gpu):
+        if ws is None and host_fd is not None:
             ws = self.core.adopt(self._name(grant.key), grant.ck, host_fd, files)
         if ws is not None and ws.regions != regions:
             ws.close()  # granted for other regions: a miss, and its layout is sealed anew

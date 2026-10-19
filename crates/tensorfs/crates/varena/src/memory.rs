@@ -1194,6 +1194,12 @@ impl Host {
         let weights = Weights::open(name, ck.into(), regions, host_fd, files)?;
         Ok(Arc::new(HostSet { regs: Mutex::new(vec![(None, false); weights.layout.regions.len()]), weights }))
     }
+
+    /// `Gpu::adopt` on the host: a sealed layout registered from the regions it carries.
+    #[cfg(feature = "store")]
+    pub fn adopt<'c>(&self, name: &str, ck: impl Into<Ck<'c>>, host_fd: RawFd, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<HostSet>> {
+        self.register(name, ck, &crate::host::sealed_regions(host_fd)?, Some(host_fd), files)
+    }
 }
 
 impl HostSet {

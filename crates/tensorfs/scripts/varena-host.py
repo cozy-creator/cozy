@@ -3,7 +3,7 @@
 
 A v2 checkpoint is registered from its chunk files, from a grant's chunk-file descriptors (closed
 by the caller before any read: the core keeps its own) and from a sealed host layout this process
-filled from a grant (`seal`). Every part
+filled from a grant (`seal`), and that layout adopted from the regions it carries. Every part
 is read back through `Pinned.ptr`. Freshness, close and the GPU core's refusals are checked.
 
     python varena-host.py [workdir]
@@ -37,9 +37,13 @@ def main(root: Path) -> None:
     fd = varena.seal(ck, rs, "host-smoke", files=sealed_from)
     for _, _, f in sealed_from:
         os.close(f)
-    for name, host_fd in (("files", None), ("granted", None), ("sealed", fd)):
+    for name, host_fd in (("files", None), ("granted", None), ("sealed", fd), ("adopted", fd)):
         grant_fds = grant() if name == "granted" else None
-        ws = varena.Host().register(name, ck, rs, host_fd, grant_fds)
+        if name == "adopted":
+            ws = varena.Host().adopt(name, ck, fd)
+            assert ws.regions == rs, "a sealed layout carries the regions it was built from"
+        else:
+            ws = varena.Host().register(name, ck, rs, host_fd, grant_fds)
         for _, _, f in grant_fds or ():
             os.close(f)
         assert ws.device is None and len(ws.spans) == len(rs) and len(ws.parts) == len(want)
@@ -63,7 +67,7 @@ def main(root: Path) -> None:
         raise AssertionError("chunks are whole 2 MiB pages")
     except varena.Invalid as e:
         assert e.code == "INVALID"
-    print("varena host core: every part exact, from the chunk files, a grant and a sealed layout")
+    print("varena host core: every part exact, from the chunk files, a grant, a sealed layout and its adoption")
 
 
 if __name__ == "__main__":

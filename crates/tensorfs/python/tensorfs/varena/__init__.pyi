@@ -288,6 +288,14 @@ class Host:
     ) -> WeightSet:
         """As `Gpu.register`. Binds are views of the sealed layout (read-only), or private
         memory read once from the chunk files."""
+    def adopt(
+        self,
+        name: str,
+        ck: Checkpoint,
+        host_fd: int,
+        files: Sequence[tuple[str, int, int]] | None = None,
+    ) -> WeightSet:
+        """As `Gpu.adopt`."""
 
 def hold_tier(fd: int) -> int:
     """A claim on every region of the host-tier memfd `fd`, for an owner that maps none of it

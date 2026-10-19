@@ -211,6 +211,13 @@ impl PyHost {
         let (ck, files) = (ck_of(&ck), granted(py, files)?);
         Ok(PyWeightSet::new(SetRef::Host(py.detach(|| Host.register(&name, ck, &regions, host_fd, files)).or_raise(py)?)))
     }
+
+    #[cfg(feature = "store")]
+    #[pyo3(signature = (name, ck, host_fd, files = None))]
+    fn adopt(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, host_fd: i32, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
+        let (ck, files) = (ck_of(&ck), granted(py, files)?);
+        Ok(PyWeightSet::new(SetRef::Host(py.detach(|| Host.adopt(&name, ck, host_fd, files)).or_raise(py)?)))
+    }
 }
 
 // ---------------------------------------------------------------- weight sets
