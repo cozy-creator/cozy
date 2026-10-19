@@ -192,3 +192,49 @@ fn across_filesystems_the_reused_objects_are_copied() {
     assert_eq!(adopted, migrate::Adopted { linked: (0, 0), copied: (1, 16 << 20) });
     assert_ne!(std::fs::metadata(&from).unwrap().dev(), std::fs::metadata(&to).unwrap().dev());
 }
+
+/// nvfp4-w4a4/1, as real pre-cut headers carry it: `weight`, `weight_scale`, `weight_scale_2`.
+const NVFP4: &str = "8482030281028383667765696768748201810a82018282000083010102836c7765696768745f7363616c658201810482018282000083010110836e7765696768745f7363616c655f328201810182018081825820ffc364c5657cd5620662a11aa454706f3a942906b1f1e83344f7eb3febfd4c5d191da3";
+
+/// A v1 part role the new encoding does not map (AWQ's `pre_quant_scale`) refuses its lane,
+/// naming the role: migrate never drops a part.
+#[test]
+fn a_part_role_the_scheme_does_not_map_refuses_the_lane() {
+    let dir = scratch(Path::new(env!("CARGO_TARGET_TMPDIR")), "unmapped-role");
+    let part = |role: &str, dtype: u64, shape: &[u64], n: usize, out: &mut Vec<u8>| {
+        head(4, 4, out);
+        text(role, out);
+        head(0, dtype, out);
+        head(4, shape.len() as u64, out);
+        shape.iter().for_each(|d| head(0, *d, out));
+        head(2, n as u64, out);
+        out.extend(noise(n as u64, n));
+    };
+    let mut header = vec![0x85];
+    text("cozytensors/1", &mut header);
+    header.extend([0x80, 0x80, 0x81]);
+    header.extend(hex_digest_bytes(NVFP4));
+    header.extend([0x81, 0x82]);
+    text("transformer", &mut header);
+    header.extend([0x81, 0x85]);
+    text("blocks.0.proj.weight", &mut header);
+    head(0, BF16, &mut header);
+    header.extend([0x82, 0x10, 0x18, 0x20, 0x00, 0x84]);
+    part("weight", 10, &[16, 16], 256, &mut header);
+    part("weight_scale", 4, &[16, 2], 32, &mut header);
+    part("weight_scale_2", 1, &[], 4, &mut header);
+    part("pre_quant_scale", 1, &[32], 128, &mut header);
+    let header_digest = hex_digest(&header);
+    std::fs::write(dir.0.join(&header_digest), &header).unwrap();
+    let manifest = format!(
+        r#"{{"entries":[{{"blob":{{"length":{},"sha256":"{header_digest}"}},"kind":"cozytensors","path":"model.cozytensors"}}]}}"#,
+        header.len()
+    );
+    let digest = hex_digest(manifest.as_bytes());
+    std::fs::write(dir.0.join(&digest), &manifest).unwrap();
+    let lane = v1::Lane { manifest: ObjectRef { sha256: digest, length: manifest.len() as u64 }, names: vec![] };
+    let report = migrate::lane(&v1::Source::new(&dir.0), None, &lane, false);
+    assert!(!report.pass, "{:?}", report.doc);
+    let error = report.doc["error"]["detail"].as_str().unwrap_or_default();
+    assert!(error.contains("pre_quant_scale"), "{:?}", report.doc);
+}
