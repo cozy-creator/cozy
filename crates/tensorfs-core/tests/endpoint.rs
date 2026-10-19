@@ -11,7 +11,7 @@ use tensorfs_core::err::Code;
 use tensorfs_core::fetch::{
     upload_tree, Client, Config, Endpoint, Fetcher, Fresh, ObjectStore, Origin, Payload, SourcePolicy, Stream, Want,
 };
-use tensorfs_core::format::{Config, Dtype, ObjectRef, Tree};
+use tensorfs_core::format::{Config as HeaderConfig, Dtype, ObjectRef, Tree};
 use tensorfs_core::store2::Store;
 use tensorfs_core::writer::{Data, Source};
 
@@ -55,7 +55,7 @@ fn client() -> Client {
 fn checkpoint(store: &Store, seed: u64) -> (ObjectRef, ObjectRef, BTreeMap<(String, String), Vec<u8>>) {
     let mut tensors = BTreeMap::new();
     let mut w = store.writer(None, None).unwrap();
-    let config: Config = serde_json::from_str(r#"{"layers":2}"#).unwrap();
+    let config: HeaderConfig = serde_json::from_str(r#"{"layers":2}"#).unwrap();
     for (component, key, n) in [("unet", "big.weight", 40 * MIB), ("unet", "norm.weight", 3000), ("vae", "conv.weight", 2 * MIB)] {
         let bytes = noise(seed + n as u64, n);
         let mut c = w.component(component, "diffusers.Thing", config.clone(), None).unwrap();
