@@ -46,6 +46,11 @@ def prove(root):
     ).eval()
     state = model.state_dict()
     assert all(t.device.type == "cpu" and t.is_contiguous() for t in state.values())
+    sample = torch.randn(1, 4, 8, 8)
+    conditioning = torch.randn(1, 4, 16)
+    # Keep an independent reference from before TensorFS sees any source tensor.
+    with torch.inference_mode():
+        expected = model(sample, 5, encoder_hidden_states=conditioning).sample.detach().clone()
     config = json.loads(json.dumps(dict(model.config)))
     pipeline_config = {"unet": ["diffusers", "UNet2DConditionModel"]}
     asset = b"Locally generated CPU Diffusers UNet; no pretrained weights.\n"
@@ -87,10 +92,7 @@ def prove(root):
     checkpoint.close()
     del checkpoint, component, arrays, loaded, committed, writer
     gc.collect()
-    sample = torch.randn(1, 4, 8, 8)
-    conditioning = torch.randn(1, 4, 16)
     with torch.inference_mode():
-        expected = model(sample, 5, encoder_hidden_states=conditioning).sample
         actual = restored(sample, 5, encoder_hidden_states=conditioning).sample
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
     return {
@@ -106,6 +108,7 @@ def prove(root):
         "max_abs_error": (actual - expected).abs().max().item(),
         "assigned_without_copy": True,
         "survives_checkpoint_close": True,
+        "reference_computed_before_write": True,
     }
 
 
