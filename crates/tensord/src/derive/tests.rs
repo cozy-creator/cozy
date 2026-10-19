@@ -97,7 +97,7 @@ fn a_derive_channel_writes_a_checkpoint_that_reads_back() {
         c.0.data(&x[500..]).unwrap();
         assert_eq!(c.answer()["result"], Value::Null);
         let put = json!({"op": "put", "component": "unet", "key": "q", "dtype": "F32", "shape": [16],
-            "encoding": {"scheme": "fp8-tensorwise"},
+            "encoding": {"scheme": "fp8.tensorwise", "params": {"scale_dtype": "F32"}},
             "parts": [{"role": "weight", "dtype": "F8_E4M3", "shape": [16], "length": 16}, {"role": "scale", "dtype": "F32", "shape": [], "length": 4}]});
         c.0.send(&put).unwrap();
         c.0.data(&weight).unwrap();
@@ -122,7 +122,7 @@ fn a_derive_channel_writes_a_checkpoint_that_reads_back() {
     assert_eq!(view.file("unet/config.json").unwrap(), b"{}");
     assert!(view.tensor("unet", "a.weight").is_err(), "only what was written or copied");
     let Body::Encoded { encoding, parts } = &view.tensor("unet", "q").unwrap().body else { panic!("q is encoded") };
-    assert_eq!(encoding.scheme, "fp8-tensorwise");
+    assert_eq!(encoding.scheme, "fp8.tensorwise");
     let mut got = vec![0; 16];
     view.bytes_into(&parts.iter().find(|p| p.role == "weight").unwrap().at(), &mut got).unwrap();
     assert_eq!(got, weight);
