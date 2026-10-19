@@ -355,7 +355,7 @@ fn operations(owner: &str, spec: &v1::RunSpec) -> Vec<Value> {
         let owned = model
             .split_once('/')
             .is_some_and(|(org, _)| org.eq_ignore_ascii_case(owner));
-        let read = json!({"type": "tensorhub_model_read", "model": model, "manifest": manifest});
+        let read = json!({"type": "tensorhub_model_read", "model": model.to_ascii_lowercase(), "manifest": manifest});
         if owned && by_digest(release, manifest) && !operations.contains(&read) {
             operations.push(read);
         }
@@ -368,7 +368,9 @@ fn operations(owner: &str, spec: &v1::RunSpec) -> Vec<Value> {
     }
     let destination = destination(spec);
     if !destination.is_empty() {
-        operations.push(json!({"type": "tensorhub_model_publish", "model": destination}));
+        operations.push(
+            json!({"type": "tensorhub_model_publish", "model": destination.to_ascii_lowercase()}),
+        );
     }
     operations
 }
@@ -433,7 +435,7 @@ mod tests {
                 choice("fidika/flux", "2026.1", "sha256:bb"),
                 choice("other/model", "", "sha256:cc"),
             ],
-            weights_destination: "model://fidika/out".into(),
+            weights_destination: "model://Fidika/Out".into(),
             ..Default::default()
         };
         spec.models[2].adapters.push(v1::Adapter {
@@ -445,12 +447,13 @@ mod tests {
         assert_eq!(
             operations("fidika", &spec),
             vec![
-                json!({"type": "tensorhub_model_read", "model": "Fidika/sdxl", "manifest": "sha256:aa"}),
                 json!({"type": "tensorhub_model_read", "model": "fidika/sdxl", "manifest": "sha256:aa"}),
                 json!({"type": "tensorhub_model_read", "model": "fidika/lora", "manifest": "sha256:dd"}),
                 json!({"type": "tensorhub_model_publish", "model": "fidika/out"}),
             ]
         );
+        assert_eq!(spec.models[0].repository, "Fidika/sdxl");
+        assert_eq!(spec.weights_destination, "model://Fidika/Out");
         let public = v1::RunSpec {
             models: vec![choice("fidika/sdxl", "2026.1", "")],
             weights_destination: "local/out".into(),
