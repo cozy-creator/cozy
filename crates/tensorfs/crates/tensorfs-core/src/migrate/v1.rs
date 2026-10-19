@@ -114,8 +114,14 @@ const NVFP4: &[(&str, &str)] = &[
     ("input_scale", "input_scale"),
 ];
 
-/// The v1 registry's 11 specs by digest (tensorfs ≤ 0.11 `registry::seeds`).
-static REGISTRY: [(&str, &str, Mapping); 11] = [
+/// The v1 registry's 11 specs by digest (tensorfs ≤ 0.11 `registry::seeds`), and the mxfp8 spec
+/// early H3 lanes wrote before it (E4M3 data, a U8 E8M0 scale per 32 columns).
+static REGISTRY: [(&str, &str, Mapping); 12] = [
+    (
+        "7e9b1ad8f2e5ddd236a4d4303042d632a96eadef4f25d44eb0fb63124cec7cfd",
+        "mxfp8 (E8M0 scale as U8)",
+        Mapping::Scheme("mxfp8", ROWWISE),
+    ),
     (
         "1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc3613f",
         "plain/1",
