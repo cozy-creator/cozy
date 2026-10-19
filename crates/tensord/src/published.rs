@@ -620,18 +620,6 @@ impl Publisher {
     /// lane's header there. Journaled per catalog revision so a warm run, across restarts too,
     /// asks the Hub nothing (th-245).
     pub(crate) fn resolve(&self, service: &Service, source: &hub::Source, named: Named, lanes: &[&str], revision: &str) -> Result<Named, Failure> {
-        if named.repository.starts_with("local/") && named.tree.is_none() {
-            let reference = match named.release.is_empty() {
-                true => named.repository.clone(),
-                false => format!("{}@{}", named.repository, named.release),
-            };
-            let local = self.store.resolve(&reference, (!named.lane.is_empty()).then_some(named.lane.as_str()))
-                .map_err(|error| ("model_resolution_failed", format!("{reference}: {error}")))?;
-            return Ok(Named {
-                release: local.release.unwrap_or_default(), lane: local.variant.unwrap_or_default(),
-                tree: local.tree, header: Some(local.header), ..named
-            });
-        }
         if named.tree.is_some() {
             return measured(&self.machine, service, source, named);
         }
@@ -1382,10 +1370,24 @@ impl Publisher {
                 // A model passed by value (a ModelArtifact a run here produced): held here.
                 return Ok((self.held_grant(installation, &path, reference)?, None, vec![]));
             }
+            if choice.repository.starts_with("local/") && choice.manifest.is_none() {
+                let reference = match choice.release.is_empty() {
+                    true => choice.repository.clone(),
+                    false => format!("{}@{}", choice.repository, choice.release),
+                };
+                let local = self.store.resolve(&reference, (!choice.lane.is_empty()).then_some(choice.lane.as_str()))
+                    .map_err(|error| ("model_resolution_failed", format!("{reference}: {error}")))?;
+                let header = local.header.id();
+                return Ok((ModelGrant {
+                    package: installation.package.clone(), slot: path, repository: choice.repository.clone(),
+                    release: local.release.unwrap_or_default(), lane: local.variant.unwrap_or_default(),
+                    components: self.components(&header)?, manifest: header,
+                }, None, vec![]));
+            }
             let named = choose(choice, &path)?;
             let tolerances = precision::Slot::of(slot);
             let bits = tolerances.bits(request.bits, short);
-            let ruled = named.lane.is_empty() && named.tree.is_none() && !named.repository.starts_with("local/");
+            let ruled = named.lane.is_empty() && named.tree.is_none();
             let lanes = if ruled { tolerances.lanes(bits, &gpus) } else { vec![] };
             let named = self.resolve(service, &request.source, named, &lanes, &request.catalog_revision)?;
             let model = format!("{}@{}", named.repository, named.release);
