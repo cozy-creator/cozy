@@ -81,6 +81,8 @@ pub struct Uploaded {
     pub objects: usize,
     pub sent: usize,
     pub bytes: u64,
+    /// The requested repo update was already present, independent of blob deduplication.
+    pub converged: bool,
 }
 
 /// An answer read whole.
@@ -554,6 +556,29 @@ pub fn with_tree(repo: Option<Repo>, name: &str, tree: &ObjectRef, version: Opti
 /// then headers, then the tree), then names it in repo `name`: as release `version`, or with
 /// none as an unreleased checkpoint.
 pub async fn upload_tree(endpoint: &Endpoint, name: &str, tree: &ObjectRef, store: &Store, version: Option<&str>) -> Result<Uploaded> {
+    upload_tree_with(endpoint, name, tree, store, version, &UploadControl {
+        cancelled: &|| false,
+        progress: &|_, _| {},
+        commit: &|| true,
+    }).await
+}
+
+/// Cooperative control of one upload. `commit` is called once after the objects land,
+/// before the atomic ref update. Once it accepts, cancellation no longer interrupts the
+/// ref's conditional-update and lost-response recovery loop. Progress counts verified bytes,
+/// including objects the endpoint already holds.
+pub struct UploadControl<'a> {
+    pub cancelled: &'a (dyn Fn() -> bool + Sync),
+    pub progress: &'a (dyn Fn(u64, u64) + Sync),
+    pub commit: &'a (dyn Fn() -> bool + Sync),
+}
+
+/// [`upload_tree`] with cancellation before the ref update, progress, and a final commit gate.
+pub async fn upload_tree_with(endpoint: &Endpoint, name: &str, tree: &ObjectRef, store: &Store, version: Option<&str>, control: &UploadControl<'_>) -> Result<Uploaded> {
+    let stopped = || Refusal { code: Code::TRANSFER_FAILED, detail: "upload stopped before its ref update; admitted objects remain available".into() };
+    if (control.cancelled)() {
+        return Err(stopped());
+    }
     let refusal = crate::store2::Error::refusal;
     let parsed = store.tree(tree).map_err(refusal)?;
     let mut leaves = Vec::new();
@@ -569,6 +594,11 @@ pub async fn upload_tree(endpoint: &Endpoint, name: &str, tree: &ObjectRef, stor
     leaves.dedup();
     let (mut sent, mut bytes) = (0, 0);
     let objects = leaves.len() + headers.len() + 1;
+    let total = leaves.iter().chain(&headers).chain(std::iter::once(tree))
+        .try_fold(0u64, |sum, object| sum.checked_add(object.length))
+        .ok_or_else(|| Refusal { code: Code::ARITH_OVERFLOW, detail: "upload closure byte count overflows".into() })?;
+    let mut verified = 0;
+    (control.progress)(0, total);
     for stage in [leaves, headers, vec![tree.clone()]] {
         let mut sending = futures::stream::iter(stage)
             .map(|object| async move {
@@ -577,14 +607,33 @@ pub async fn upload_tree(endpoint: &Endpoint, name: &str, tree: &ObjectRef, stor
                 endpoint.upload(&object, &payload).await.map(|s| (s, object.length))
             })
             .buffer_unordered(STREAMS);
-        while let Some(done) = sending.next().await {
-            if let (true, length) = done? {
+        loop {
+            if (control.cancelled)() {
+                return Err(stopped());
+            }
+            let done = tokio::select! {
+                done = sending.next() => done,
+                () = tokio::time::sleep(TICK) => continue,
+            };
+            let Some(done) = done else { break };
+            let (pushed, length) = done?;
+            if pushed {
                 (sent, bytes) = (sent + 1, bytes + length);
             }
+            verified += length;
+            (control.progress)(verified, total);
         }
     }
-    let repo = endpoint.update_repo(name, |old| Ok(Some(with_tree(old, name, tree, version)))).await?;
-    Ok(Uploaded { repo, objects, sent, bytes })
+    if (control.cancelled)() || !(control.commit)() {
+        return Err(stopped());
+    }
+    let mut converged = false;
+    let repo = endpoint.update_repo(name, |old| {
+        let new = with_tree(old.clone(), name, tree, version);
+        converged = old.as_ref() == Some(&new);
+        Ok(Some(new))
+    }).await?;
+    Ok(Uploaded { repo, objects, sent, bytes, converged })
 }
 
 /// Replaces `<root>/<key>` with `bytes` under the store's record lock while it has ETag `etag`.

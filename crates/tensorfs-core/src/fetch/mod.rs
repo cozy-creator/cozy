@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use dpop::{DPoP, JwtBearer};
-pub use endpoint::{upload_tree, with_tree, Endpoint, Fresh, Payload, Stream, Uploaded};
+pub use endpoint::{upload_tree, upload_tree_with, with_tree, Endpoint, Fresh, Payload, Stream, UploadControl, Uploaded};
 pub use net::Client;
 pub use origin::{choose, release_of, variant_of_tree, Chosen, Location, Origin};
 pub use policy::SourcePolicy;
