@@ -134,6 +134,7 @@ with tempfile.TemporaryDirectory() as temp:
             pass
         else:
             raise AssertionError("open_chunk returned a writable descriptor")
+        os.close(descriptor)
         blob = root / "source/chunks" / chunk[0]
         saved = blob.read_bytes()
         corrupted = bytes([saved[0] ^ 1]) + saved[1:]
@@ -150,6 +151,7 @@ with tempfile.TemporaryDirectory() as temp:
         assert checkpoint.header_ref in checkpoint.verify()
         header.write_bytes(saved_header)
         assert checkpoint.verify() == []
+        descriptor = checkpoint.open_chunk(part.chunk)
     for call in [lambda: checkpoint.components, lambda: checkpoint.missing(), lambda: checkpoint.fetch(),
                  lambda: checkpoint.open_chunk(0), lambda: checkpoint.verify(), lambda: checkpoint.__enter__()]:
         try:
