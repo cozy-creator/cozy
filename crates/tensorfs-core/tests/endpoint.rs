@@ -227,6 +227,8 @@ fn a_streaming_writer_tees_to_the_store_before_publishing() {
     let header = w.commit().unwrap();
 
     assert!(local.checkpoint(&header).unwrap().read("unet", "big").unwrap() == big);
+    assert_eq!(runtime.block_on(endpoint.object(&header.id())).unwrap(), Some(header.clone()));
+    assert!(runtime.block_on(endpoint.object("not-a-digest")).is_err());
     let (repo, _) = runtime.block_on(endpoint.repo("acme/streamed")).unwrap().unwrap();
     assert_eq!((repo.releases.len(), repo.checkpoints.len()), (0, 1), "an unreleased checkpoint");
     let into = Store::open(scratch.0.join("into")).unwrap();
@@ -280,6 +282,11 @@ fn a_directory_and_a_static_server_conform() {
     assert!(ok && failed == 0, "{cases:#?}");
     assert!(cases.len() >= 12);
     let server = HttpServer::start(&dir);
+    let runtime = tensorfs_core::fetch::runtime().unwrap();
+    let endpoint = Endpoint::new(&client(), &server.1, None).unwrap();
+    let fixture = runtime.block_on(endpoint.repo(tensorfs_core::fetch::conform::FIXTURE)).unwrap().unwrap().0;
+    let tree = &fixture.releases[0].tree;
+    assert_eq!(runtime.block_on(endpoint.object(&tree.sha256)).unwrap(), Some(tree.clone()));
     let (ok, failed, cases) = conform(&server.1, false);
     assert!(ok && failed == 0, "{cases:#?}");
     // python -m http.server sends no ETag and ignores Range: SHOULDs it fails.

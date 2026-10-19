@@ -71,7 +71,7 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     let capability = device.sign_run_capability(&RunCapability {
         user_id,
         hub: origin.clone(),
-        machine: thumbprint.clone(),
+        key_jkt: thumbprint.clone(),
         run: format!("r-{nonce}"),
         operations: vec![json!({"type": "tensorhub_model_publish", "model": format!("{account}/model")})],
         lifetime: Duration::from_secs(600),

@@ -264,6 +264,33 @@ impl Endpoint {
         }
     }
 
+    /// An object named by digest, including its length, or `None` when absent or unreadable.
+    pub async fn object(&self, sha256: &str) -> Result<Option<ObjectRef>> {
+        let sha256 = sha256.strip_prefix("sha256:").unwrap_or(sha256);
+        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return refuse(Code::MALFORMED_DIGEST, "an object digest must be 64 lowercase hex digits");
+        }
+        let mut object = ObjectRef { sha256: sha256.to_owned(), length: 0 };
+        object.length = match &self.at {
+            At::Dir(root, _) => match fs::metadata(root.join(object.key())) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(crate::err::classify_io(self.url(), error)),
+            },
+            At::Http(base) => {
+                let url = format!("{base}/{}", object.key());
+                let reply = self.exchange(Ask { method: "HEAD", url: &url, headers: vec![], body: None, payload: None, auth: true }).await?;
+                match reply.status {
+                    200 => reply.header("content-length").and_then(|length| length.parse().ok())
+                        .ok_or_else(|| Refusal { code: Code::LENGTH_MISMATCH, detail: format!("HEAD {url}: no valid Content-Length") })?,
+                    404 | 410 => return Ok(None),
+                    _ => return Err(refusal(&reply, "HEAD")),
+                }
+            }
+        };
+        Ok(Some(object))
+    }
+
     /// Whether the endpoint holds `object`.
     pub async fn has(&self, object: &ObjectRef) -> Result<bool> {
         match &self.at {
