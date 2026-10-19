@@ -31,8 +31,8 @@ impl TokenProvider for Presented {
             .map_err(|error| Refusal { code: Code::CREDENTIAL_REQUIRED, detail: error.to_string() })
     }
 
-    fn retry(&self, sent: &Request<'_>, status: u16, headers: &reqwest::header::HeaderMap) -> bool {
-        self.0.observe(sent.url, sent.headers, status, headers)
+    fn retry(&self, sent: &Request<'_>, status: u16, headers: &reqwest::header::HeaderMap) -> Result<bool> {
+        Ok(self.0.observe(sent.url, sent.headers, status, headers))
     }
 }
 
