@@ -81,6 +81,14 @@ class HostReads(unittest.TestCase):
         np.testing.assert_array_equal(second, self.plain)
         np.testing.assert_array_equal(copied, self.plain)
 
+    def test_dlpack_refuses_dimensions_outside_its_signed_shape_abi(self) -> None:
+        writer = tfs.Writer(cache_dir=self.cache)
+        writer.component("empty").put("large-shape", b"", dtype="U8", shape=[0, 2**63])
+        array = writer.commit().components["empty"].tensors.read("large-shape")
+        self.assertEqual(array.nbytes, 0)
+        with self.assertRaises(tfs.InvalidError):
+            array.__dlpack__()
+
     def test_writable_typed_buffers_and_chunk_spanning_offsets(self) -> None:
         destination = np.full((3, 4), -1, dtype=np.float32)
         self.assertIsNone(self.tensors.read_into("plain", destination, role=""))
