@@ -51,6 +51,8 @@ with TemporaryDirectory() as temp:
     assert metadata.id == ck.id and metadata.tree == remote_tree
     assert metadata.header_ref[1] == (root / "folder/model.f32.cozytensors").stat().st_size
     assert metadata.missing(), "opening metadata fetched the closure"
+    assert (Path(metadata.components["model"].path) / "tokenizer.json").read_bytes() == b"{}"
+    assert metadata.missing(["model"]), "rendering a component path fetched its tensors"
     only = tensorfs.snapshot_download("acme/example", revision="1", variant="f32", components=["model"], endpoint=origin, cache_dir=remote_cache)
     assert not (Path(only) / "model.f16.cozytensors").exists()
     selected = tensorfs.open(only)

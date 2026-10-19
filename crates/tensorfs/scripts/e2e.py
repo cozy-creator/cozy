@@ -201,8 +201,9 @@ def main() -> None:
     assert tree(work / "out2") == tree(work / "out"), "the Python export is the CLI's, byte for byte"
     same_image(work / "out2", reference)
     origin = (work / "origin2").as_uri()
-    tfs.upload_folder(repo_id=NAME, revision="1", folder_path=folder, endpoint=origin)
-    downloaded = tfs.snapshot_download(NAME, revision="1", endpoint=origin, cache_dir=work / "d")
+    remote_name = "conformance/tiny-sdxl"
+    tfs.upload_folder(repo_id=remote_name, revision="1", folder_path=folder, endpoint=origin)
+    downloaded = tfs.snapshot_download(remote_name, revision="1", endpoint=origin, cache_dir=work / "d")
     assert tfs.open(downloaded).id == m.id
 
     w = tfs.Writer(base=m)

@@ -15,7 +15,7 @@ use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNIN
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hub_client::{types, Credential, RunCapability};
-use serde_json::{json, Map};
+use serde_json::{json, Map, Value};
 use tensorfs_core::fetch::token::Request;
 use tensorfs_core::err::Code;
 use tensorfs_core::fetch::{bearer as bearer_provider, upload_tree, with_tree, Client, Config, DPoP, Endpoint, Fetcher, JwtBearer, ObjectStore, Origin, SourcePolicy, TokenProvider, Want};
@@ -33,6 +33,15 @@ fn key() -> (String, String) {
     let d = b64(pair.private_key().as_be_bytes().unwrap().as_ref());
     let jwk = json!({"kty": "EC", "crv": "P-256", "x": x, "y": y, "d": d}).to_string();
     (jwk, hub_client::thumbprint(&x, &y))
+}
+
+fn python_proof(python: &str, script: &Path, request: &Value) {
+    let mut child = Command::new(python).arg("-I").arg(script)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(&serde_json::to_vec(request).unwrap()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "Python endpoint proof: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    println!("{}", String::from_utf8_lossy(&output.stdout));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -172,12 +181,32 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
             "ca": ca, "cache_dir": scratch.join("python"),
         });
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensorfs/scripts/endpoint_api.py");
-        let mut child = Command::new(python).arg("-I").arg(script)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        child.stdin.take().unwrap().write_all(&serde_json::to_vec(&request).unwrap()).unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert!(output.status.success(), "Python endpoint proof: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        println!("{}", String::from_utf8_lossy(&output.stdout));
+        python_proof(&python, &script, &request);
+        if let Some(script) = var("COZY_TEST_RUNTIME_PROOF") {
+            let scope = |label: &str, upload_repo: &str| {
+                let (key, thumbprint) = key();
+                let capability = device.sign_run_capability(&RunCapability {
+                    user_id: user_id.clone(), hub: origin.clone(), key_jkt: thumbprint,
+                    run: format!("runtime-{nonce}-{label}"),
+                    operations: vec![
+                        json!({"type": "tensorhub_model_read", "model": model, "revision": base_tree.id()}),
+                        json!({"type": "tensorhub_model_upload", "model": upload_repo}),
+                    ],
+                    lifetime: Duration::from_secs(600),
+                });
+                json!({"key": key, "capability": capability, "upload_repo": upload_repo})
+            };
+            let mut denied = scope("denied", &format!("{account}/permitted"));
+            denied["attempt_repo"] = json!(format!("{account}/forbidden"));
+            let fixture = json!({
+                "origin": origin, "endpoint": reach, "token_endpoint": user.token_endpoint().await.unwrap(),
+                "model": model, "tree": base_tree.id(), "ca": ca, "cache_dir": scratch.join("runtime"),
+                "owner_token": bearer.token, "component": "model", "tensor": "w", "dtype": "U8", "shape": [300_000],
+                "runs": [scope("a", &format!("{account}/output-a")), scope("b", &format!("{account}/output-b"))],
+                "denied": denied,
+            });
+            python_proof(&python, Path::new(&script), &fixture);
+        }
     } else {
         eprintln!("Python binding proof skipped: TENSORFS_TEST_PYTHON is absent");
     }

@@ -728,7 +728,7 @@ impl PyComponent {
     #[getter]
     fn path(&self, py: Python<'_>) -> PyResult<PathBuf> {
         let checkpoint = self.ck.as_ref().ok_or_else(|| invalid(py, "a parsed header has no asset path"))?.get();
-        checkpoint.fetch_components(py, Some(&[self.name.clone()]), 0)?;
+        checkpoint.fetch_assets(py, &self.name, None)?;
         let ck = checkpoint.stored(py)?;
         py.detach(|| ck.component_path(&self.name)).or_raise(py)
     }
@@ -738,7 +738,7 @@ impl PyComponent {
             return Err(raise(py, Failure { kind: Kind::Unsupported, detail: "a parsed header has no assets here".into() }));
         };
         let checkpoint = ck.get();
-        checkpoint.fetch_components(py, Some(&[self.name.clone()]), 0)?;
+        checkpoint.fetch_assets(py, &self.name, Some(&name))?;
         let ck = checkpoint.stored(py)?;
         let bytes = py.detach(|| ck.asset(&self.name, &name)).or_raise(py)?;
         Ok(PyBytes::new(py, &bytes))
@@ -842,6 +842,18 @@ impl PyCheckpoint {
         if let Some(remote) = &self.remote {
             let objects = tensorfs_core::store2::wanted(&self.header, components).or_raise(py)?;
             py.detach(|| remote.fetch(&objects, priority)).or_raise(py)?;
+        }
+        Ok(())
+    }
+
+    fn fetch_assets(&self, py: Python<'_>, component: &str, name: Option<&str>) -> PyResult<()> {
+        let component = self.header.component(component).ok_or_else(|| invalid(py, "no such component"))?;
+        let objects: Vec<_> = match name {
+            Some(name) => vec![component.assets.get(name).ok_or_else(|| invalid(py, "no such asset"))?.clone()],
+            None => component.assets.values().cloned().collect(),
+        };
+        if let Some(remote) = &self.remote {
+            py.detach(|| remote.fetch(&objects, 0)).or_raise(py)?;
         }
         Ok(())
     }
@@ -1008,7 +1020,7 @@ impl PyCheckpoint {
     /// A tensor's logical bytes on the CPU, as a DLPack-able `Array`; an encoded tensor goes
     /// through the reference decode.
     fn read(&self, py: Python<'_>, component: String, key: String) -> PyResult<PyArray> {
-        self.fetch_components(py, Some(&[component.clone()]), 0)?;
+        self.fetch_components(py, Some(std::slice::from_ref(&component)), 0)?;
         let ck = self.stored(py)?;
         let t = ck.tensor(&component, &key).or_raise(py)?;
         let length = match &t.body {
