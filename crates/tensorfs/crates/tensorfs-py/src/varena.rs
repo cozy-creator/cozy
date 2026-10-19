@@ -348,6 +348,14 @@ impl PyWeightSet {
         Ok(())
     }
 
+    /// Whether a forward of its model is in flight: an ask never takes a busy set's pages.
+    fn busy(&self, py: Python<'_>, busy: bool) -> PyResult<()> {
+        if let SetRef::Gpu(w) = self.set(py)? {
+            w.busy(busy);
+        }
+        Ok(())
+    }
+
     #[pyo3(signature = (regions = None))]
     fn evict(&self, py: Python<'_>, regions: Option<Vec<u32>>) -> PyResult<u64> {
         match self.set(py)? {

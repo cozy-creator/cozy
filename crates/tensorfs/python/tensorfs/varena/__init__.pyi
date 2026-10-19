@@ -207,6 +207,9 @@ class WeightSet:
     def warm(self, warm: bool) -> None:
         """Whether its model is warm (loaded at GPU level, the default): another process's ask
         takes idle sets' pages before warm ones'."""
+    def busy(self, busy: bool) -> None:
+        """Whether a forward of its model is in flight (from its first forward's start to its
+        last one's end): another process's ask never takes a busy set's pages."""
     def evict(self, regions: Sequence[int] | None = None) -> int:
         """Unmap these regions at home (all when None): only those unpinned whose fill and
         release events completed. Returns the bytes unmapped. The chunks go idle; past a small
@@ -245,7 +248,7 @@ class Gpu:
         """Idle chunks and unneeded slots go back to the driver. Returns the bytes released."""
     def serve(self, row: Row) -> None:
         """Answers other processes' asks of `row` from now on, on a Rust thread with no Python:
-        idle chunks and slots, then unpinned home pages, idle sets before warm ones, least
+        idle chunks and slots, then unpinned home pages of sets not busy, idle before warm, least
         recently bound first. Each answer moves the row's progress, so a long kernel is never a
         stall. Caches and torch's slack stay the control thread's to shed."""
     def step(self) -> None:

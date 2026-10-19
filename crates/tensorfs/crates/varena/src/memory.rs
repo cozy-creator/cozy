@@ -405,9 +405,11 @@ struct Set {
     last: Counters,
     total: Counters,
     /// The clock at its last bind, and whether its model is warm (loaded at GPU level): asks
-    /// take idle sets before warm ones, least recently bound first.
+    /// take idle sets before warm ones, least recently bound first. A busy set (a forward in
+    /// flight) is never asked: its unbound blocks are needed this pass.
     used: u64,
     warm: bool,
+    busy: bool,
 }
 
 impl Set {
@@ -630,6 +632,7 @@ impl Gpu {
             total: Counters::default(),
             used: 0,
             warm: true,
+            busy: false,
         }));
         let id = st.sets.len() - 1;
         Ok(Arc::new(WeightSet { gpu: self.clone(), id, base, name: name.into(), layout, parts }))
@@ -654,14 +657,14 @@ impl Gpu {
 
     /// Bytes for another process's ask (design §5.2), answered on this process's own thread with
     /// no Python: idle chunks and unneeded slots, then unpinned home pages, idle sets before warm
-    /// ones, least recently bound first, until `want`. Pages in use are pinned and stay.
+    /// ones, least recently bound first, until `want`. Busy sets and pinned pages stay.
     pub fn give(&self, want: u64) -> Result<u64> {
         let mut freed = self.trim()?;
         let g = &self.inner;
         let _c = CtxGuard::enter(g.ctx)?;
         let mut st = g.lock();
         let mut order: Vec<(bool, u64, usize)> =
-            st.sets.iter().enumerate().filter_map(|(id, s)| s.as_ref().map(|s| (s.warm, s.used, id))).collect();
+            st.sets.iter().enumerate().filter_map(|(id, s)| s.as_ref().filter(|s| !s.busy).map(|s| (s.warm, s.used, id))).collect();
         order.sort_unstable();
         for (_, _, id) in order {
             if freed >= want {
@@ -1251,6 +1254,11 @@ impl WeightSet {
     /// Whether its model is warm (loaded at GPU level): an ask takes idle sets first.
     pub fn warm(&self, warm: bool) {
         self.gpu.inner.lock().set(self.id).warm = warm;
+    }
+
+    /// Whether a forward of its model is in flight: an ask never takes a busy set's pages.
+    pub fn busy(&self, busy: bool) {
+        self.gpu.inner.lock().set(self.id).busy = busy;
     }
 
     fn span(&self, r: u32) -> (u64, u64) {
