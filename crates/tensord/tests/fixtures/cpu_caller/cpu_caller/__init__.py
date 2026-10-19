@@ -83,7 +83,7 @@ app.entrypoint(portrait, emits_media=True, accelerator=False)
 
 
 class Requantize(msgspec.Struct):
-    encoding: str = "fp8-rowwise/1"
+    encoding: str = "fp8.rowwise"
 
 
 class Requantized(msgspec.Struct):

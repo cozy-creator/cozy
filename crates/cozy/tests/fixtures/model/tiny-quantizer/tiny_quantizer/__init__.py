@@ -11,13 +11,13 @@ app = App()
 
 @invocable(memo_version="tiny-quantizer-fp8/1")
 async def fp8(ctx: Context, *, source: Weights[Any], tel: Telemetry) -> ModelArtifact:
-    """The fp8 lane (`fp8-rowwise/1`)."""
+    """The fp8 lane (`fp8.rowwise`)."""
     plan = QuantizationPlan(
         components=source.components(),
         include=("*.c_attn.weight", "*.c_fc.weight"),
         output_precision="preserve",
     )
-    return quantize_into(ctx, tel, source=source, plan=plan, encoding="fp8-rowwise/1", output="fp8")
+    return quantize_into(ctx, tel, source=source, plan=plan, encoding="fp8.rowwise", output="fp8")
 
 
 app.entrypoint(fp8, weights=(WeightsOutput("fp8", max_new_bytes=1 << 30),), accelerator=False)
