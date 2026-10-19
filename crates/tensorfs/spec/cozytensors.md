@@ -545,7 +545,7 @@ A plain tensor's bytes are its value; reading it is a copy, whatever its dtype.
 A new scheme is a minor version (§8). It ships:
 1. a `### <scheme>` subsection here (params and their values, parts with the producer's role names, dtypes and shapes,
    the decode in the building blocks' terms), and any fixed table in Appendix A with its SHA-256;
-2. a reference decoder in `tensorfs-core` (`format/decode/<family>.rs`, one row in `SCHEMES`) and in the
+2. a reference decoder in `tensorfs` (`format/decode/<family>.rs`, one row in `SCHEMES`) and in the
    independent reader (`conformance/schemes/<family>.py`, one row in `FAMILIES`);
 3. conformance vectors mined from the real producer, `conformance/vectors/cases/<family>.json`, with refusals;
 4. encoders (`format/encode/<family>.rs`, one row in `ENCODERS`) and an importer row for its native container.
@@ -646,7 +646,7 @@ The chunk concatenation is not a safetensors file (padding); export rebuilds one
 generator took from the target model's `state_dict()`. A source already in the canonical layout (a Diffusers or
 Transformers folder) carries no order, since safetensors files sort their keys; a writer orders it by the reference
 of the class its `config.json` names (`_class_name`, or the first of `architectures`): that class's `state_dict()`
-order, generated on the meta device and checked in as data (`crates/tensorfs-core/orders/<class>.json`,
+order, generated on the meta device and checked in as data (`crates/tensorfs/orders/<class>.json`,
 `task -d crates/tensorfs orders`). It applies the reference structurally:
 
 - a key is a path of dot-separated segments; a segment made only of digits is an index;
