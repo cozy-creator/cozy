@@ -33,6 +33,8 @@ pub use nvfp4::{GlobalScale, NibbleOrder};
 
 /// Every scheme's encoders, one row each.
 pub static ENCODERS: &[&Encoder] = &[
+    &nvfp4::NVFP4,
+
     // fp8.blockwise, mxfp4
 
     // gguf.*

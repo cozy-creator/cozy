@@ -35,7 +35,8 @@ def shape(g: Grid, c):
         return "exact", [*c.lead, w]
     if g.layout == "transposed":
         return "exact", [w, c.rows]
-    return "exact", [128 * -(-c.rows // 128), 4 * -(-w // 4)]
+    *stack, n = c.lead  # cublas_128x4 tiles each matrix [N, C] of a stack on its own
+    return "exact", [*stack, 128 * -(-n // 128), 4 * -(-w // 4)]
 
 
 def at(g: Grid, rows: int, cols: int) -> np.ndarray:

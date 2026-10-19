@@ -86,6 +86,8 @@ pub enum Allowed {
     Bool,
     /// Values `check` accepts, as `what` describes them.
     Check(fn(&Value) -> bool, &'static str),
+    /// The dtype an optional part is stored in, one of these: present exactly when the part is.
+    PartDtype(&'static str, &'static [&'static str]),
 }
 
 pub struct Part {
@@ -232,7 +234,11 @@ fn checked(
         return Err(fail(format!("unknown param {key:?}")));
     }
     for p in scheme.params {
-        if !params.get(p.key).is_some_and(|v| allowed(&p.allowed, v)) {
+        let ok = match (&p.allowed, params.get(p.key)) {
+            (Allowed::PartDtype(role, _), v) if !parts.contains_key(role) => v.is_none(),
+            (a, v) => v.is_some_and(|v| allowed(a, v)),
+        };
+        if !ok {
             return Err(fail(format!(
                 "param {} is not {}",
                 p.key,
@@ -298,6 +304,7 @@ fn allowed(a: &Allowed, v: &Value) -> bool {
         Allowed::Range(lo, hi) => v.as_u64().is_some_and(|n| (*lo..=*hi).contains(&n)),
         Allowed::Bool => matches!(v, Value::Bool(_)),
         Allowed::Check(check, _) => check(v),
+        Allowed::PartDtype(_, list) => v.as_str().is_some_and(|s| list.contains(&s)),
     }
 }
 
@@ -308,6 +315,7 @@ fn describe(a: &Allowed) -> String {
         Allowed::Range(lo, hi) => format!("an integer in {lo}..={hi}"),
         Allowed::Bool => "a boolean".into(),
         Allowed::Check(_, what) => what.to_string(),
+        Allowed::PartDtype(role, list) => format!("one of {list:?} with part {role}, else absent"),
     }
 }
 

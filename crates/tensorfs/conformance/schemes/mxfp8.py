@@ -1,5 +1,7 @@
 """mxfp8 (spec §6 `mxfp8`): OCP MXFP8, an F8_E8M0 scale per 32 elements of a row."""
 
+import numpy as np
+
 from . import elem, grid, table
 from .base import Part, Scheme, logical
 
@@ -12,7 +14,9 @@ def blocks(c):
 
 def decode(c):
     dtype, _, data = c.parts["weight"]
-    return table.decode(table.codes(data), elem.TABLES[dtype], c.values("scale"), blocks(c), c.rows, c.cols)
+    n, mats = table.matrices(c, table.codes(data), c.values("scale"))
+    return np.concatenate([table.decode(q, elem.TABLES[dtype], s, blocks(c), n, c.cols).reshape(-1)
+                           for q, s in mats] or [np.zeros(0, np.float32)])
 
 
 SCHEMES = (

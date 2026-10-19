@@ -44,3 +44,10 @@ hold the same values as their mined twins in the other nibble order, scale tilin
 (per-column scales, `F8_E5M2` weights, `BF16`/`F16` tensorwise, rowwise and convrot scales, `int8.tensorwise`, `int8.rowwise`, a ragged `mxfp8` block, a divided global
 scale, rounding of 3,072 f32 patterns to BF16/F16, plain and unknown dtypes, refusals) were computed exactly from the
 spec's formulas.
+
+`mine/nvfp4.py` mines the `nvfp4` `modelopt-*`, `comfy-*` and `experts-*` cases: parts from ModelOpt 0.47.0's own
+NVFP4 and NVFP4_AWQ export (`pre_quant_scale` in BF16, F16 and F32), and a range-read slice of ComfyUI's fused-expert
+file `Comfy-Org/Lens` (`weight_scale_2 [E]`, tiles per expert). Expected bytes are the spec's decode: ModelOpt's own
+dequantize gives the same values at BF16 and F16 (its table has no −0) and differs by at most 2 steps at F32
+(it multiplies `s × g` first); comfy-kitchen's BF16 arithmetic differs by one step. The Lens slice decodes bit for bit
+to OpenAI's MXFP4 original of the same weights.
