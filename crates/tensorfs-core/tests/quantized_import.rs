@@ -297,6 +297,7 @@ fn modelopt_nvfp4_and_mxfp8() {
 
 #[test]
 fn compressed_tensors_nvfp4_and_mxfp8() {
+    // Both global scales are reciprocals: `global_scale: divide` covers `scale_2` and `input_scale`.
     check(
         "ct-nvfp4",
         &[Want {
@@ -427,20 +428,20 @@ fn comfy_mxfp8_declared_by_metadata() {
 
 #[test]
 fn comfy_fp8_tensorwise_rowwise_and_legacy() {
-    // kitchen's `dequantize_per_tensor_fp8` rounds a per-row scale to BF16 first, as the spec
-    // does only for a tensorwise one.
+    // kitchen's `dequantize_per_tensor_fp8` rounds the stored f32 scale to BF16 first
+    // (`scale.to(bf16)`); the spec uses it exactly.
     let steps = check(
         "comfy-fp8",
         &[
             Want {
                 key: "attn.to_q.weight",
-                encoding: "fp8.tensorwise {}",
+                encoding: r#"fp8.tensorwise {scale_dtype: "F32"}"#,
                 parts: &[
                     ("weight", "F8_E4M3", &[32, 64], "weight"),
                     ("scale", "F32", &[], "weight_scale"),
                     ("input_scale", "F32", &[], "input_scale"),
                 ],
-                meets: Meets::Exactly,
+                meets: Meets::OneStep,
                 error: 0.04,
             },
             Want {
@@ -456,38 +457,38 @@ fn comfy_fp8_tensorwise_rowwise_and_legacy() {
         ],
     );
     println!("comfy fp8 elements one BF16 step from kitchen's: {steps:?}");
-    check(
+    let steps = check(
         "comfy-scaled-fp8",
         &[Want {
             key: "attn.to_v.weight",
-            encoding: "fp8.tensorwise {}",
+            encoding: r#"fp8.tensorwise {scale_dtype: "F32"}"#,
             parts: &[
                 ("weight", "F8_E4M3", &[32, 64], "weight"),
                 ("scale", "F32", &[1], "scale_weight"),
                 ("input_scale", "F32", &[1], "scale_input"),
             ],
-            meets: Meets::Exactly,
+            meets: Meets::OneStep,
             error: 0.04,
         }],
     );
+    println!("comfy scaled_fp8 elements one BF16 step from kitchen's: {steps:?}");
 }
 
 #[test]
 fn comfy_int8_tensorwise_rowwise_and_convrot() {
-    // kitchen's int8 dequantize is `q.float() * scale` (no BF16 scale, unlike the spec's
-    // int8.tensorwise), and ConvRot rotates the rounded `q * scale` back where the spec rotates the
-    // exact integers.
+    // kitchen's int8 dequantize is `q.float() * scale`, the spec's; ConvRot rotates the rounded
+    // `q * scale` back where the spec rotates the exact integers.
     let steps = check(
         "comfy-int8",
         &[
             Want {
                 key: "ff.up.weight",
-                encoding: "int8.tensorwise {}",
+                encoding: r#"int8.tensorwise {scale_dtype: "F32"}"#,
                 parts: &[
                     ("weight", "I8", &[32, 64], "weight"),
                     ("scale", "F32", &[], "weight_scale"),
                 ],
-                meets: Meets::OneStep,
+                meets: Meets::Exactly,
                 error: 0.05,
             },
             Want {
@@ -608,9 +609,9 @@ fn every_carrier_names_a_complete_encoding() {
             ("nvfp4", Producer::Comfy) => Encoding::nvfp4(Multiply, HighFirst, Cublas128x4),
             ("mxfp8", Producer::Comfy) => Encoding::mxfp8(Cublas128x4),
             ("mxfp8", _) => Encoding::mxfp8(RowMajor),
-            ("fp8.tensorwise", _) => Encoding::fp8_tensorwise(),
+            ("fp8.tensorwise", _) => Encoding::fp8_tensorwise(&Dtype::F32),
             ("fp8.rowwise", _) => Encoding::fp8_rowwise(0),
-            ("int8.tensorwise", _) => Encoding::int8_tensorwise(),
+            ("int8.tensorwise", _) => Encoding::int8_tensorwise(&Dtype::F32),
             ("int8.rowwise", _) => Encoding::int8_rowwise(0),
             ("int8.convrot", _) => Encoding::int8_convrot(256),
             other => panic!("{other:?}"),
@@ -618,6 +619,9 @@ fn every_carrier_names_a_complete_encoding() {
         let mut encoding = c.encoding.clone();
         for (param, (_, default)) in &c.marker_params {
             encoding.params.insert(param.clone(), (*default).into());
+        }
+        for param in c.dtype_params.keys() {
+            encoding.params.insert(param.clone(), "F32".into());
         }
         assert_eq!(encoding, want, "{:?} {:?}", c.producer, c.formats);
     }
