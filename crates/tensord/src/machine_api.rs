@@ -1386,7 +1386,7 @@ print(json.dumps({"identity": generation.identity}))
                             call_interfaces: vec![],
                             constructions: Vec::new(),
                             ledgers: 0,
-                            memory_mode: "shared",
+                            memory_mode: crate::device_executor::MemoryMode::Shared,
                         },
                     )?;
                     command(
