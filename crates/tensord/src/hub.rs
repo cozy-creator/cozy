@@ -260,6 +260,8 @@ pub struct Source {
 
 pub(crate) struct RequestAccess {
     access: Mutex<protocol::machine::HubAccess>,
+    audience: String,
+    provider: Mutex<Option<Arc<tensorfs::fetch::DPoP>>>,
     pub(crate) resolving: Mutex<()>,
 }
 
@@ -280,6 +282,30 @@ impl RequestAccess {
 
     pub(crate) fn restore(&self, access: protocol::machine::HubAccess) {
         *self.access.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = access;
+        *self.provider.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    fn provider(&self, client: &tensorfs::fetch::Client) -> Result<Arc<tensorfs::fetch::DPoP>, Refusal> {
+        let mut held = self.provider.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(provider) = &*held { return Ok(provider.clone()); }
+        let access = self.snapshot();
+        let provider = match &access.issued_token {
+            Some(token) => tensorfs::fetch::DPoP::token(&access.key, token, Some(&self.audience)),
+            None => tensorfs::fetch::DPoP::grant(client, &access.key, tensorfs::fetch::JwtBearer {
+                token_endpoint: access.token_endpoint.clone(), client_id: "tensord".into(), resource: self.audience.clone(),
+                claims: serde_json::json!({"capability": access.capability}).as_object().unwrap().clone(),
+            }),
+        }.map_err(|_| Refusal("cannot construct the request's DPoP provider".into()))?.at(&access.origin);
+        Ok(held.insert(Arc::new(provider)).clone())
+    }
+
+    /// Observe a completed trade without causing one. Used before settling code-less runs.
+    pub(crate) fn snapshot_issued(&self) -> Result<protocol::machine::HubAccess, Refusal> {
+        let provider = self.provider.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        match provider.and_then(|provider| block(async move { provider.issued_token().await })) {
+            Some(token) => self.issued(&token),
+            None => Ok(self.snapshot()),
+        }
     }
 }
 
@@ -315,12 +341,28 @@ impl Source {
             return Err(Refusal("request Hub access has an empty issued token".into()));
         }
         let mut source = Self::new(&access.origin, (!access.ca_der.is_empty()).then(|| access.ca_der.clone()), access.object_hosts.clone(), None)?;
-        source.request = Some(Arc::new(RequestAccess { access: Mutex::new(access), resolving: Mutex::new(()) }));
+        source.request = Some(Arc::new(RequestAccess { access: Mutex::new(access), audience: resource,
+            provider: Mutex::new(None), resolving: Mutex::new(()) }));
         Ok(source)
     }
 
     pub(crate) fn request_access(&self) -> Option<protocol::machine::HubAccess> {
         self.request.as_ref().map(|request| request.snapshot())
+    }
+
+    pub(crate) fn worker_endpoint(&self) -> Result<(tensorfs::fetch::Client, Arc<tensorfs::fetch::Endpoint>), Refusal> {
+        let access = self.request.as_ref().ok_or_else(|| Refusal("request access is absent".into()))?;
+        let policy = tensorfs::fetch::SourcePolicy { any_host: true,
+            allow_local: tensorfs::fetch::policy::is_loopback_origin(&self.origin), max_redirects: 5,
+            ..Default::default() };
+        let client = match &self.ca_der {
+            Some(der) => tensorfs::fetch::Client::with_roots(policy, pem(der).as_bytes()),
+            None => Ok(tensorfs::fetch::Client::new(policy)),
+        }.map_err(|_| Refusal("cannot configure the request's TensorFS transport".into()))?;
+        let provider = access.provider(&client)?;
+        let endpoint = tensorfs::fetch::Endpoint::new(&client, &self.origin, Some(provider))
+            .map_err(|_| Refusal("cannot configure the request's TensorFS endpoint".into()))?;
+        Ok((client, Arc::new(endpoint)))
     }
 
     pub fn new(

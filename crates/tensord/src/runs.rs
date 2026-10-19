@@ -359,6 +359,24 @@ impl Runs {
     /// weights destination the one choice is put there: a `local/` alias held by name, or a
     /// Hub repository under the run's capability.
     fn warm_models(
+        &self, actor: &str, id: &str, spec: &Spec,
+        observe: &(dyn Fn(&str, u64, u64) + Sync), stoppable: &Stoppable,
+    ) -> Result<Vec<Value>, Refused> {
+        let source = spec.hub.clone().or_else(|| self.own_hub.clone());
+        let access = source.as_ref().and_then(|source| source.request.as_ref());
+        let Some(access) = access.filter(|_| spec.tensorfs.is_none()) else {
+            return self.warm_models_inner(actor, id, spec, observe, stoppable);
+        };
+        let _one = access.resolving.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.service.engine.with_journal(|j| j.begin_metadata(id))?;
+        let result = self.warm_models_inner(actor, id, spec, observe, stoppable);
+        let next = access.snapshot_issued().map_err(|e| refused("worker_credential_failed", e.0))?;
+        self.service.engine.with_journal(|j| j.complete_metadata(id, &next, result.is_ok()))?;
+        access.restore(next);
+        result
+    }
+
+    fn warm_models_inner(
         &self,
         actor: &str,
         id: &str,
@@ -439,9 +457,11 @@ impl Runs {
                 let any = crate::precision::Slot { min_bits: 8, decode: false, encoded: true, raw: false };
                 let lanes = any.lanes(any.bits(spec.bits, false), &gpus);
                 let stage = format!("downloading {}", choice.repository);
-                let (named, (hub, volume)) = publisher.download(&self.service, hub_access()?, named, &lanes, &spec.catalog_revision, stop, &|done, total| {
-                    observe(&stage, done, total)
-                })?;
+                let report = |done, total| observe(&stage, done, total);
+                let (named, (hub, volume)) = match &spec.tensorfs {
+                    Some(options) => publisher.ordinary_download(options, named, &lanes, stop, &report)?,
+                    None => publisher.download(&self.service, hub_access()?, named, &lanes, &spec.catalog_revision, stop, &report)?,
+                };
                 let header = named.header().map_err(|(code, message)| refused(code, message))?.clone();
                 let tree = named.tree.as_ref().map(ObjectRef::id);
                 let row = json!({"parameter": choice.parameter, "repository": named.repository,
@@ -461,19 +481,24 @@ impl Runs {
                     None => crate::storage::tree_of(publisher.store(), &header)?,
                 };
                 let stage = format!("uploading to {destination}");
-                if let Some(options) = &spec.tensorfs {
+                let worker = hub.as_ref().filter(|source| source.request.is_some() && spec.tensorfs.is_none());
+                if spec.tensorfs.is_some() || worker.is_some() {
                     use tensorfs::fetch::{bearer, upload_tree_with, Client, Endpoint, SourcePolicy, UploadControl};
-                    let policy = SourcePolicy { any_host: true, allow_local: true, max_redirects: 8, ..Default::default() };
-                    let client = match options.ca_der.is_empty() {
-                        true => Ok(Client::new(policy)),
-                        false => Client::with_roots(policy, hub::pem(&options.ca_der).as_bytes()),
-                    }.map_err(|error| refused("upload_failed", error.to_string()))?;
-                    let token = (!options.token.is_empty()).then(|| bearer(options.token.clone()));
-                    let mut endpoint = Endpoint::new(&client, &options.endpoint, token)
-                        .map_err(|error| refused("upload_failed", error.to_string()))?;
-                    if options.token.is_empty() {
-                        endpoint = endpoint.anonymous();
-                    }
+                    let endpoint = if let Some(source) = worker {
+                        source.worker_endpoint().map_err(|e| refused("upload_failed", e.0))?.1
+                    } else {
+                        let options = spec.tensorfs.as_ref().unwrap();
+                        let policy = SourcePolicy { any_host: true, allow_local: true, max_redirects: 8, ..Default::default() };
+                        let client = match options.ca_der.is_empty() {
+                            true => Ok(Client::new(policy)),
+                            false => Client::with_roots(policy, hub::pem(&options.ca_der).as_bytes()),
+                        }.map_err(|error| refused("upload_failed", error.to_string()))?;
+                        let token = (!options.token.is_empty()).then(|| bearer(options.token.clone()));
+                        let mut endpoint = Endpoint::new(&client, &options.endpoint, token)
+                            .map_err(|error| refused("upload_failed", error.to_string()))?;
+                        if options.token.is_empty() { endpoint = endpoint.anonymous(); }
+                        Arc::new(endpoint)
+                    };
                     let runtime = tensorfs::fetch::runtime().map_err(|error| refused("upload_failed", error.to_string()))?;
                     let uploaded = runtime.block_on(upload_tree_with(&endpoint, destination, &tree, publisher.store(), None, &UploadControl {
                         cancelled: &|| stoppable.stop.is_cancelled(),

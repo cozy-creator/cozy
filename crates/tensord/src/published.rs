@@ -704,7 +704,7 @@ impl Publisher {
                 _ => "metadata_preflight_failed",
             };
             // Failure text comes from a credential-bearing process; keep public errors bounded.
-            return Err((code, format!("metadata helper refused: {}", reply.code.chars().take(96).collect::<String>())));
+            return Err((code, "the Runtime could not resolve the requested model metadata".into()));
         }
         if job.stop.as_ref().is_some_and(Stop::is_cancelled) { return Err(canceled()); }
         if reply.resolved.len() != 1 { return Err(("metadata_preflight_failed", "metadata helper returned an unexpected model count".into())); }
@@ -766,11 +766,96 @@ impl Publisher {
         stop: Option<&Stop>,
         bytes: &(dyn Fn(u64, u64) + Sync),
     ) -> Result<(Named, (u64, u64)), Refused> {
+        if source.request.is_some() {
+            return self.worker_download(source, named, lanes, stop, bytes);
+        }
         let failed = |(code, message)| Refused { code, message };
         let named = self.resolve(service, source, named, lanes, revision).map_err(failed)?;
         // A checkpoint this store already holds whole moves nothing and asks the Hub nothing.
         let moved = self.ensure(source, &named, stop, bytes).map_err(failed)?;
         Ok((named, moved))
+    }
+
+    /// Code-less downloads use the same public TensorFS provider, fetcher and endpoint as
+    /// Runtime. The caller owns the request's exchange reservation and durable handoff.
+    fn worker_download(&self, source: &hub::Source, named: Named, lanes: &[&str], stop: Option<&Stop>,
+        report: &(dyn Fn(u64, u64) + Sync),
+    ) -> Result<(Named, (u64, u64)), Refused> {
+        let (client, endpoint) = source.worker_endpoint().map_err(|e| Refused::from(("model_download_failed", e.0)))?;
+        self.endpoint_download(client, endpoint, named, lanes, stop, report)
+    }
+
+    pub(crate) fn ordinary_download(&self, options: &protocol::machine::TensorFSOptions, named: Named,
+        lanes: &[&str], stop: Option<&Stop>, report: &(dyn Fn(u64, u64) + Sync),
+    ) -> Result<(Named, (u64, u64)), Refused> {
+        use tensorfs::fetch::{bearer, Client, Endpoint, SourcePolicy};
+        let failed = |e: tensorfs::err::Refusal| Refused::from(("model_download_failed", e.to_string()));
+        let policy = SourcePolicy { any_host: true, allow_local: true, max_redirects: 5, ..Default::default() };
+        let client = if options.ca_der.is_empty() { Client::new(policy) }
+            else { Client::with_roots(policy, hub::pem(&options.ca_der).as_bytes()).map_err(failed)? };
+        let token = (!options.token.is_empty()).then(|| bearer(options.token.clone()));
+        let mut endpoint = Endpoint::new(&client, &options.endpoint, token).map_err(failed)?;
+        if options.token.is_empty() { endpoint = endpoint.anonymous(); }
+        self.endpoint_download(client, Arc::new(endpoint), named, lanes, stop, report)
+    }
+
+    fn endpoint_download(&self, client: tensorfs::fetch::Client, endpoint: Arc<tensorfs::fetch::Endpoint>,
+        named: Named, lanes: &[&str], stop: Option<&Stop>, report: &(dyn Fn(u64, u64) + Sync),
+    ) -> Result<(Named, (u64, u64)), Refused> {
+        use tensorfs::fetch::{self, Fetcher, ObjectStore, Origin, Want};
+        let origin: Arc<dyn Origin> = endpoint.clone();
+        let objects: Arc<dyn ObjectStore> = self.store.clone();
+        let progress = fetch::Progress::default();
+        let operation = async {
+            let fetcher = Fetcher::new(objects, client, None, fetch::Config::default());
+            let root = match &named.tree {
+                Some(root) if root.length != 0 => root.clone(),
+                Some(root) => match storage::held(&self.store, &root.id()) {
+                    Ok(root) => root,
+                    Err(_) => endpoint.object(&root.sha256).await?.ok_or_else(|| tensorfs::err::Refusal {
+                        code: tensorfs::err::Code::REF_NOT_FOUND, detail: "requested checkpoint is absent".into() })?,
+                },
+                None => {
+                    let (repo, _) = endpoint.repo(&named.repository).await?.ok_or_else(|| tensorfs::err::Refusal {
+                        code: tensorfs::err::Code::REF_NOT_FOUND, detail: "requested model is absent".into() })?;
+                    fetch::release_of(&repo, (!named.release.is_empty()).then_some(named.release.as_str()))?.1
+                }
+            };
+            let want = Want { progress: Some(&progress), ..Default::default() };
+            fetcher.objects(&origin, std::slice::from_ref(&root), &want).await?;
+            let (tree, variant, header, pulled) = match self.store.tree(&root) {
+                Ok(tree) => {
+                    let variants = if named.lane.is_empty() { lanes.iter().map(|v| v.to_string()).collect() } else { vec![named.lane.clone()] };
+                    let (variant, header) = selected_variant(&tree, &variants, named.lane.is_empty()).ok_or_else(|| tensorfs::err::Refusal {
+                        code: tensorfs::err::Code::REF_NOT_FOUND, detail: "the model has no requested or sole variant".into() })?;
+                    let pulled = fetcher.pull_tree(&origin, &root, Some(&variant), &want).await?;
+                    (Some(root), variant, header, pulled)
+                }
+                Err(_) => {
+                    self.store.checkpoint(&root).map_err(|e| e.refusal())?;
+                    if !named.lane.is_empty() { return Err(tensorfs::err::Refusal {
+                        code: tensorfs::err::Code::REF_NOT_FOUND, detail: "a standalone header has no named variant".into() }); }
+                    let pulled = fetcher.pull_header(&origin, &root, &want).await?;
+                    (None, String::new(), root, pulled)
+                }
+            };
+            fetcher.settled().await;
+            Ok::<_, tensorfs::err::Refusal>((Named { release: tree.as_ref().unwrap_or(&header).id(), tree, lane: variant,
+                header: Some(header), ..named }, (pulled.landed.origin, pulled.landed.volume)))
+        };
+        hub::block(async {
+            let mut work = std::pin::pin!(operation);
+            let mut tick = tokio::time::interval(Duration::from_millis(250));
+            loop {
+                tokio::select! {
+                    result = &mut work => break result.map_err(|e| Refused::from(("model_download_failed", e.to_string()))),
+                    _ = tick.tick() => {
+                        if stop.is_some_and(Stop::is_cancelled) { break Err(Refused::from(canceled())); }
+                        report(progress.held.load(std::sync::atomic::Ordering::Relaxed), progress.total.load(std::sync::atomic::Ordering::Relaxed));
+                    }
+                }
+            }
+        })
     }
 
     /// The store's share of the machine's self-managing caches (`reclaim`), with what it

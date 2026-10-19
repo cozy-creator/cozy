@@ -2508,10 +2508,15 @@ impl Pool {
             answer
         });
         match answer {
-            Ok(reply) => {
+            Ok(mut reply) => {
                 let hello = executor.command(&DeviceCommand::Hello, &mut device_executor::Baseline);
-                executor.shutdown()?;
-                if hello?.hello.torch_loaded { return Err(io::Error::other("metadata helper imported torch")); }
+                let ended = executor.shutdown();
+                if ended.is_err() || hello.as_ref().is_err() || hello.is_ok_and(|reply| reply.hello.torch_loaded) {
+                    // Preserve any issued token even when post-reply teardown fails.
+                    reply.ok = false;
+                    reply.code = "metadata_helper_invalid".into();
+                    reply.detail.clear();
+                }
                 Ok(reply)
             }
             Err(error) => { executor.terminate()?; Err(error) }
