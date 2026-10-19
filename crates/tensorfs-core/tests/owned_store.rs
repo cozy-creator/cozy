@@ -1,11 +1,15 @@
 //! The embedded owner role uses real store files, flock and process death. Ordinary
 //! readers retain their existing recovery-lock behavior across the ownership transition.
+//!
+//! The tests run one at a time: a child spawned by one test holds every other thread's lock
+//! descriptors from fork until exec, so a lock another test just released could still be held.
 
 use platform::durable::symlink;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 
 use tensorfs_core::err::Code;
 use tensorfs_core::ids::ObjectRef;
@@ -13,27 +17,36 @@ use tensorfs_core::meta::{now_nanos_unique, Meta};
 use tensorfs_core::read;
 use tensorfs_core::store::{Fault, Store};
 
-struct Scratch(PathBuf);
+static SERIAL: Mutex<()> = Mutex::new(());
+
+struct Scratch {
+    dir: PathBuf,
+    _serial: MutexGuard<'static, ()>,
+}
 
 impl Scratch {
     fn new() -> Self {
+        let serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let path = std::env::temp_dir().join(format!(
             "tensorfs-owned-store-{}-{}",
             std::process::id(),
             now_nanos_unique()
         ));
         fs::create_dir_all(&path).unwrap();
-        Self(path)
+        Self {
+            dir: path,
+            _serial: serial,
+        }
     }
 
     fn store(&self) -> PathBuf {
-        self.0.join("store")
+        self.dir.join("store")
     }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -211,8 +224,8 @@ fn another_process_and_path_alias_cannot_claim_until_owner_death() {
     let scratch = Scratch::new();
     let root = scratch.store();
     let first = Process::start(&root, "owned");
-    symlink(&scratch.0, &scratch.0.join("alias")).unwrap();
-    let alias = scratch.0.join("alias/store");
+    symlink(&scratch.dir, &scratch.dir.join("alias")).unwrap();
+    let alias = scratch.dir.join("alias/store");
     assert_eq!(
         Store::ensure_owned(&alias).unwrap_err().code,
         Code::STORE_BUSY
@@ -300,7 +313,7 @@ fn contention_refuses_before_inspecting_or_recovering_the_catalog() {
 #[test]
 fn ownership_does_not_initialize_foreign_or_partial_roots() {
     let scratch = Scratch::new();
-    let foreign = scratch.0.join("foreign");
+    let foreign = scratch.dir.join("foreign");
     fs::create_dir(&foreign).unwrap();
     fs::write(foreign.join("unrelated"), b"keep").unwrap();
     assert_eq!(
@@ -308,7 +321,7 @@ fn ownership_does_not_initialize_foreign_or_partial_roots() {
         Code::STORE_ERA
     );
     assert!(!foreign.join("owner.lock").exists());
-    let partial = scratch.0.join("partial");
+    let partial = scratch.dir.join("partial");
     fs::create_dir_all(partial.join("blobs")).unwrap();
     assert_eq!(
         Store::ensure_owned(&partial).unwrap_err().code,
@@ -327,7 +340,7 @@ fn an_owner_lock_symlink_or_nonregular_file_is_refused() {
     let scratch = Scratch::new();
     let root = scratch.store();
     drop(Store::ensure(&root).unwrap());
-    let other = scratch.0.join("other");
+    let other = scratch.dir.join("other");
     fs::write(&other, b"leave intact").unwrap();
     symlink(&other, &root.join("owner.lock")).unwrap();
     assert_eq!(
