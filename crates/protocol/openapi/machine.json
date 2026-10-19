@@ -1284,7 +1284,20 @@
           },
           "capability": {
             "type": "string",
-            "description": "The owner's capability for this run's private operations (th-241): a compact JWS its\ndevice key signed for this machine's leaf (`cnf.jkt`) and the Hub's resource (`aud`),\nnaming each operation in `authorization_details`. The machine trades it once, at the run's\nfirst private operation, at `token_endpoint`. Empty: a public-only run.",
+            "description": "The owner's capability for this run's private operations (th-241): a compact JWS its\ndevice key signed for this run's key (`cnf.jkt`) and the Hub's resource (`aud`),\nnaming each operation in `authorization_details`. Empty: a public-only run.",
+            "default": ""
+          },
+          "issued_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A token already issued for this exact request and key. Reading it never exchanges a grant.",
+            "default": null
+          },
+          "key": {
+            "type": "string",
+            "description": "The private P-256 JWK bound to this request's capability; never the machine's key.",
             "default": ""
           },
           "object_hosts": {

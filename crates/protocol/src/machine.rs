@@ -426,7 +426,7 @@ pub struct Adapter {
 }
 
 /// A Hub a run reads. Public content is read anonymously.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct HubAccess {
     pub origin: String,
@@ -437,12 +437,23 @@ pub struct HubAccess {
     /// The Hub's object-storage hosts downloads may follow.
     pub object_hosts: Vec<String>,
     /// The owner's capability for this run's private operations (th-241): a compact JWS its
-    /// device key signed for this machine's leaf (`cnf.jkt`) and the Hub's resource (`aud`),
-    /// naming each operation in `authorization_details`. The machine trades it once, at the run's
-    /// first private operation, at `token_endpoint`. Empty: a public-only run.
+    /// device key signed for this run's key (`cnf.jkt`) and the Hub's resource (`aud`),
+    /// naming each operation in `authorization_details`. Empty: a public-only run.
     pub capability: String,
+    /// The private P-256 JWK bound to this request's capability; never the machine's key.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub key: String,
+    /// A token already issued for this exact request and key. Reading it never exchanges a grant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issued_token: Option<String>,
     /// The Hub's authorization server's, as its metadata names it.
     pub token_endpoint: String,
+}
+
+impl std::fmt::Debug for HubAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HubAccess").field("origin", &self.origin).finish_non_exhaustive()
+    }
 }
 
 /// One entry of a run's log, as `GET /v1/runs/{id}/events` sends it: SSE `event: <variant>`,

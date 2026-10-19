@@ -167,11 +167,53 @@ pub struct ModelLoad {
     pub budgets: Budgets,
 }
 
+/// Metadata selection before placement; no weight bytes or package import are requested.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MetadataModel {
+    pub slot: String,
+    pub repo_id: String,
+    pub revision: Option<String>,
+    /// Exact preferences in order. An empty string selects the unnamed variant.
+    /// An empty list requires the tree to have exactly one variant.
+    pub variants: Vec<String>,
+    /// Only policy-generated preferences may fall back to the tree's sole variant.
+    #[serde(default)]
+    pub fallback_to_only_variant: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResolvedMetadata {
+    pub slot: String,
+    pub repo_id: String,
+    /// Immutable tree id, or header id for a standalone checkpoint; never a mutable alias.
+    pub revision: String,
+    pub variant: String,
+    pub header: tensorfs::format::ObjectRef,
+    pub tree: Option<tensorfs::format::ObjectRef>,
+    pub components: Vec<String>,
+}
+
+/// Sensitive reply data, including when a metadata operation fails after exchanging a grant.
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct AccessToken(pub String);
+
+impl std::fmt::Debug for AccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AccessToken(..)")
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum DeviceCommand {
     Hello,
     Shutdown,
+    ResolveWeights {
+        request_id: String,
+        hub: Option<protocol::machine::HubAccess>,
+        models: Vec<MetadataModel>,
+    },
     Start {
         devices: String,
         application: String,
@@ -366,6 +408,7 @@ impl DeviceCommand {
         match self {
             Self::Hello => "hello",
             Self::Shutdown => "shutdown",
+            Self::ResolveWeights { .. } => "resolve_weights",
             Self::Start { .. } => "start",
             Self::Load { .. } => "load",
             Self::Activate { .. } => "activate",
@@ -729,6 +772,10 @@ pub struct Frame {
     pub numerics: String,
     pub local: String,
     pub cost_ms: f64,
+    /// `resolve_weights`: validated references only, never model or asset bytes.
+    pub resolved: Vec<ResolvedMetadata>,
+    /// Present on success or error when the helper obtained this request's token.
+    pub issued_token: Option<AccessToken>,
 }
 
 impl Frame {
@@ -2172,6 +2219,13 @@ fn write_command(stream: &mut LocalStream, command: &DeviceCommand, group: &Grou
     ) {
         options.remove("token");
     }
+    if let (DeviceCommand::ResolveWeights { hub: Some(_), .. }, Some(access)) = (
+        command, value.get_mut("hub").and_then(Value::as_object_mut),
+    ) {
+        for field in ["capability", "key", "issued_token"] {
+            access.remove(field);
+        }
+    }
     scan(&value)?;
     seam::write_body(stream, &bytes)
 }
@@ -2237,7 +2291,7 @@ fn scan(value: &Value) -> io::Result<()> {
     match value {
         Value::Object(fields) => {
             for (name, value) in fields {
-                if ["token", "credential", "authorization", "secret", "jwt"]
+                if ["token", "credential", "authorization", "secret", "jwt", "capability", "access_token", "issued_token"]
                     .contains(&name.to_lowercase().as_str())
                 {
                     return Err(io::Error::new(
@@ -2261,6 +2315,45 @@ fn scan(value: &Value) -> io::Result<()> {
 #[cfg(test)]
 mod codec_tests {
     use super::*;
+
+    #[test]
+    fn metadata_credentials_cross_only_the_typed_resolve_command() {
+        let access = protocol::machine::HubAccess {
+            origin: "https://hub.example.test".into(),
+            capability: "private-capability".into(), key: "private-request-key".into(),
+            issued_token: Some("private-issued-token".into()),
+            ..Default::default()
+        };
+        let command = DeviceCommand::ResolveWeights {
+            request_id: "request-1".into(), hub: Some(access),
+            models: vec![MetadataModel {
+                slot: "unet".into(), repo_id: "owner/model".into(), revision: Some(format!("sha256:{}", "a".repeat(64))),
+                variants: vec!["int8".into(), "bf16".into()], fallback_to_only_variant: true,
+            }],
+        };
+        let (mut machine, mut runtime) = platform::ipc::pair().unwrap();
+        write_command(&mut machine, &command, &Group::default(), false).unwrap();
+        let bytes = seam::read_body(&mut runtime).unwrap().unwrap();
+        let received: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(received["cmd"], "resolve_weights");
+        assert_eq!(received["hub"]["issued_token"], "private-issued-token");
+        assert_eq!(received["hub"]["key"], "private-request-key");
+        assert_eq!(received["models"][0]["variants"], serde_json::json!(["int8", "bf16"]));
+        for secret in ["private-capability", "private-request-key", "private-issued-token"] {
+            assert!(!format!("{command:?}").contains(secret));
+        }
+        rejected_without_a_partial_frame(|stream| write_frame(stream, &received));
+    }
+
+    #[test]
+    fn metadata_errors_keep_an_issued_token_without_logging_it() {
+        let frame = decode_frame(br#"{"reply":"resolve_weights","request_id":"request-1","ok":false,"code":"variant_required","issued_token":"private-issued-token"}"#).unwrap();
+        assert!(!frame.ok);
+        assert_eq!(frame.request_id, "request-1");
+        assert_eq!(frame.issued_token.as_ref().unwrap().0, "private-issued-token");
+        assert!(!format!("{frame:?}").contains("private-issued-token"));
+        assert!(frame.resolved.is_empty());
+    }
 
     fn ordinary_options() -> protocol::machine::TensorFSOptions {
         protocol::machine::TensorFSOptions {
