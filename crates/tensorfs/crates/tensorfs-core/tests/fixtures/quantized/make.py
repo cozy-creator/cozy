@@ -345,7 +345,7 @@ def main(root: Path):
                 {"format_version": "1.0", "layers": {"proj": {"format": "mxfp8"}}})})
 
     # ComfyUI fp8: a tensorwise scale with an input scale, and a per-row scale.
-    c = Case(root, "comfy-fp8", 7)
+    c = Case(root, "comfy-fp8", 17)
     tensors = []
     for key, rowwise in [("attn.to_q", False), ("attn.to_k", True)]:
         w = c.weight([32, 64])
@@ -359,7 +359,7 @@ def main(root: Path):
     c.write(tensors)
 
     # ComfyUI's legacy `scaled_fp8` checkpoints: `scale_weight` and `scale_input` siblings.
-    c = Case(root, "comfy-scaled-fp8", 8)
+    c = Case(root, "comfy-scaled-fp8", 18)
     w = c.weight([32, 64])
     q, scale, deq = comfy_fp8(w, False)
     c.expected("attn.to_v.weight", w, deq)
