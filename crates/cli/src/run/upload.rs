@@ -53,14 +53,10 @@ fn weights<'a>(run: &'a Run, output: Option<&str>) -> Result<&'a OutputItem, Err
     let held: Vec<&OutputItem> = run
         .output
         .iter()
-        .filter(|item| {
-            item.checkpoint.is_none()
-                && item.is_checkpoint()
-                && output.is_none_or(|name| item.name == name)
-        })
+        .filter(|item| item.is_checkpoint() && output.is_none_or(|name| item.name == name))
         .collect();
     match held.as_slice() {
-        [item] if item.sha256.is_some() => Ok(item),
+        [item] if item.checkpoint.is_some() || item.sha256.is_some() => Ok(item),
         [item] => Err(Error::new(
             Kind::Conflict,
             "run_output_unfinished",
@@ -90,15 +86,24 @@ fn weights<'a>(run: &'a Run, output: Option<&str>) -> Result<&'a OutputItem, Err
 
 /// A WARM run on the run's machine: the output's checkpoint by hash, into `destination`.
 fn submission(run: &Run, item: &OutputItem, machine: String, destination: &Repo) -> SubmitRun {
-    let digest = item.sha256.expect("a final output carries its digest");
-    let spec = v1::RunSpec {
-        kind: v1::RunKind::Warm,
-        models: vec![ModelChoice {
+    let model = match &item.checkpoint {
+        Some(reference) => ModelChoice {
             parameter: item.name.clone(),
-            manifest: digest.to_string(),
+            repository: reference.repo_id.clone(),
+            manifest: reference.revision.clone(),
+            lane: reference.variant.clone(),
+            ..Default::default()
+        },
+        None => ModelChoice {
+            parameter: item.name.clone(),
+            manifest: item.sha256.expect("a final legacy output carries its digest").to_string(),
             manifest_length: item.length,
             ..Default::default()
-        }],
+        },
+    };
+    let spec = v1::RunSpec {
+        kind: v1::RunKind::Warm,
+        models: vec![model],
         weights_destination: destination.to_string(),
         ..Default::default()
     };
@@ -197,5 +202,33 @@ mod tests {
         assert_eq!(model.manifest, Digest::of(b"int8").to_string());
         assert!(model.repository.is_empty() && model.release.is_empty());
         assert!(Repo::hub("local/x").is_err());
+    }
+
+    #[test]
+    fn a_retained_typed_checkpoint_retries_its_tree_and_variant_without_byte_metadata() {
+        let mut held = run(&[("model", "", false)]);
+        held.status = Status::Failed;
+        let reference = v1::CheckpointRef {
+            repo_id: "local/derived".into(),
+            revision: format!("sha256:{}", "a".repeat(64)),
+            variant: "f32".into(),
+        };
+        held.output[0].checkpoint = Some(reference.clone());
+        let item = weights(&held, Some("model")).unwrap();
+        let destination = Repo::hub("owner/retry").unwrap();
+        let sent = submission(&held, item, "original-machine".into(), &destination);
+        assert_eq!(sent.on, On::Machine("original-machine".into()));
+        assert_eq!(sent.spec.kind, v1::RunKind::Warm);
+        let choice = &sent.spec.models[0];
+        assert_eq!((&choice.repository, &choice.manifest, &choice.lane),
+            (&reference.repo_id, &reference.revision, &reference.variant));
+        assert!(choice.release.is_empty());
+        assert_eq!(choice.manifest_length, 0);
+        assert!(sent.spec.source.is_none());
+        let mut legacy = run(&[("old", CHECKPOINT, true)]).output.remove(0);
+        legacy.name = "old".into();
+        held.output.push(legacy);
+        assert_eq!(weights(&held, None).unwrap_err().code, "run_output_ambiguous");
+        assert!(weights(&held, Some("old")).unwrap().checkpoint.is_none());
     }
 }
