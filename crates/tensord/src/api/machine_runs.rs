@@ -769,6 +769,10 @@ mod tests {
         service.engine.with_journal(|j| j.begin_metadata(&accepted.id)).unwrap();
         let mut access = sent.hub.clone().unwrap();
         access.access_token = "bound-token-kept-only-in-access".into();
+        let diagnostic = format!("{access:?}");
+        assert!(!diagnostic.contains("bound-token-kept-only-in-access"));
+        assert!(!diagnostic.contains("first-request-key"));
+        assert!(!diagnostic.contains("e30.e30.c2ln"));
         service.engine.with_journal(|j| j.complete_metadata(&accepted.id, &access)).unwrap();
         assert!(!service.engine.with_journal(|j| j.metadata_pending(&accepted.id)).unwrap());
         let restored = service.engine.interrupted().unwrap().into_iter().find(|(id, _, _)| id == &accepted.id).unwrap().2;
