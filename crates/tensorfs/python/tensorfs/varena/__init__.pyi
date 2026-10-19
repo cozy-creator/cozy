@@ -319,16 +319,26 @@ class Copy:
     landing; `disk`, a host layout filled from chunk files. `ceiling` is the measured GB/s it
     is held against (pinned H2D on that GPU, the volume's O_DIRECT read), 0 when unmeasured."""
 
-    kind: str
-    gpu: int
-    bytes: int
-    ns: int
-    ceiling: float
-    link: str
-    busy_ns: int
-    pin_ns: int
-    staged: int
-    cached: int
+    @property
+    def kind(self) -> str: ...
+    @property
+    def gpu(self) -> int: ...
+    @property
+    def bytes(self) -> int: ...
+    @property
+    def ns(self) -> int: ...
+    @property
+    def ceiling(self) -> float: ...
+    @property
+    def link(self) -> str: ...
+    @property
+    def busy_ns(self) -> int: ...
+    @property
+    def pin_ns(self) -> int: ...
+    @property
+    def staged(self) -> int: ...
+    @property
+    def cached(self) -> int: ...
 
 def copies() -> list[Copy]:
     """Every copy run since the last call."""
