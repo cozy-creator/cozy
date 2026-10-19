@@ -191,6 +191,27 @@ fn refused(code: &'static str, message: impl Into<String>) -> Refused {
     }
 }
 
+/// A named tree already held for an upload. Empty-repository choices retain their legacy
+/// header meaning; local trees never fall back to a remote repository or its newest release.
+fn held_tree(store: &crate::storage::Store, choice: &domain::ModelChoice) -> Result<Option<crate::published::Named>, Refused> {
+    let Some(manifest) = choice.manifest.as_ref().filter(|_| !choice.repository.is_empty()) else {
+        return Ok(None);
+    };
+    let id = tensorfs_core::sha256::hex(&manifest.digest);
+    let tree = match crate::storage::held(store, &id) {
+        Ok(tree) => tree,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !choice.repository.starts_with("local/") => return Ok(None),
+        Err(error) => return Err(refused("checkpoint_absent", format!("held tree sha256:{id}: {error}"))),
+    };
+    let parsed = store.tree(&tree).map_err(|error| refused("checkpoint_invalid", error.to_string()))?;
+    let (lane, header) = tensorfs_core::fetch::variant_of_tree(&parsed, (!choice.lane.is_empty()).then_some(choice.lane.as_str()))
+        .map_err(|error| refused("checkpoint_variant_absent", error.to_string()))?;
+    Ok(Some(crate::published::Named {
+        repository: choice.repository.clone(), release: choice.release.clone(), lane,
+        tree: Some(tree), header: Some(header),
+    }))
+}
+
 impl Runs {
     /// The run this id already names, if its spec is `digest`; another spec is a conflict.
     pub(crate) fn existing(&self, actor: &str, id: &str, digest: &str) -> Result<Option<Execution>, Refused> {
@@ -403,6 +424,12 @@ impl Runs {
                     .map_err(|_| refused("checkpoint_absent", format!("this machine holds no checkpoint sha256:{sha256}")))?;
                 let row = json!({"parameter": choice.parameter, "checkpoint": format!("sha256:{sha256}")});
                 (held, None, row)
+            } else if let Some(named) = if destination.is_empty() { None } else { held_tree(publisher.store(), choice)? } {
+                let header = named.header().map_err(|(code, message)| refused(code, message))?.clone();
+                let tree = named.tree().map_err(|(code, message)| refused(code, message))?.clone();
+                let row = json!({"parameter": choice.parameter, "repository": named.repository,
+                    "lane": named.lane, "tree": tree.id(), "checkpoint": header.id()});
+                (header, Some(tree), row)
             } else {
                 // A Hub checkpoint by name, or the owner's by hash; no lane is the one this
                 // machine's GPUs would run at the run's bits (`precision`).
@@ -433,6 +460,34 @@ impl Runs {
                     Some(tree) => tree,
                     None => crate::storage::tree_of(publisher.store(), &header)?,
                 };
+                let stage = format!("uploading to {destination}");
+                if let Some(options) = &spec.tensorfs {
+                    use tensorfs_core::fetch::{bearer, upload_tree_with, Client, Endpoint, SourcePolicy, UploadControl};
+                    let policy = SourcePolicy { any_host: true, allow_local: true, max_redirects: 8, ..Default::default() };
+                    let client = match options.ca_der.is_empty() {
+                        true => Ok(Client::new(policy)),
+                        false => Client::with_roots(policy, hub::pem(&options.ca_der).as_bytes()),
+                    }.map_err(|error| refused("upload_failed", error.to_string()))?;
+                    let token = (!options.token.is_empty()).then(|| bearer(options.token.clone()));
+                    let mut endpoint = Endpoint::new(&client, &options.endpoint, token)
+                        .map_err(|error| refused("upload_failed", error.to_string()))?;
+                    if options.token.is_empty() {
+                        endpoint = endpoint.anonymous();
+                    }
+                    let runtime = tensorfs_core::fetch::runtime().map_err(|error| refused("upload_failed", error.to_string()))?;
+                    let uploaded = runtime.block_on(upload_tree_with(&endpoint, destination, &tree, publisher.store(), None, &UploadControl {
+                        cancelled: &|| stoppable.stop.is_cancelled(),
+                        progress: &|done, total| observe(&stage, done, total),
+                        commit: &|| stoppable.commit(),
+                    })).map_err(|error| match stoppable.stop.is_cancelled() {
+                        true => refused(crate::published::CANCELED, "the upload was canceled before its ref update; admitted objects remain available"),
+                        false => refused("upload_failed", error.to_string()),
+                    })?;
+                    row["published"] = json!({"destination": destination, "tree": tree.id(),
+                        "checkpoint": header.id(), "converged": uploaded.sent == 0});
+                    models.push(row);
+                    continue;
+                }
                 let publishing = hub::Catalog::for_op(
                     hub_access()?,
                     hub::Op::Publish { model: destination },
@@ -442,7 +497,6 @@ impl Runs {
                     "upload-{}",
                     &tensorfs_core::sha256::hex_digest(format!("{actor}\0{id}").as_bytes())[..40]
                 );
-                let stage = format!("uploading to {destination}");
                 // A cancel stops the push; only finalizing, which publishes, cannot be taken back.
                 let published = publishing.publish(&crate::origin::Publication {
                     store: publisher.store(),
