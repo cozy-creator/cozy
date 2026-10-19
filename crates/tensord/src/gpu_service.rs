@@ -613,12 +613,13 @@ pub struct Pool {
     /// Set (under `sessions`) once the pool stops: an executor coming back then is ended.
     stopped: std::sync::atomic::AtomicBool,
     /// Host bytes admitted for executors still starting, by `session_key`, until their load.
-    admitted: Mutex<BTreeMap<String, (u64, Option<Birth>)>>,
+    admitted: Mutex<BTreeMap<String, (u64, u64, Option<Birth>)>>,
     /// Live executor lane leaders, including running sessions removed from `sessions`.
     leaders: Mutex<BTreeMap<u32, (Birth, String, usize)>>,
     /// Serializes the current exact owner with every mutation of a plan-keyed GPU charge.
     /// None reserves the slot for a spawn whose birth has not arrived yet.
-    accounting: Mutex<BTreeMap<(String, usize), Option<Birth>>>,
+    accounting: Mutex<BTreeMap<(String, usize), ChargeOwner>>,
+    next_reservation: std::sync::atomic::AtomicU64,
     /// Per generation, the import-only executor sessions fork from. Declared after
     /// `sessions`: executors end before the parent they were forked from.
     zygotes: Mutex<BTreeMap<(String, String), Arc<Zygote>>>,
@@ -646,6 +647,11 @@ pub struct Pool {
     // Drop session/resource custody before ending the actual spawning thread.
     launcher: crate::child_launcher::ChildLauncher,
 }
+struct ChargeOwner {
+    reservation: u64,
+    birth: Option<Birth>,
+}
+
 struct Device {
     entry: String,
     memory: GpuMemory,
@@ -767,6 +773,7 @@ impl Pool {
             admitted: Mutex::default(),
             leaders: Mutex::default(),
             accounting: Mutex::default(),
+            next_reservation: std::sync::atomic::AtomicU64::new(1),
             zygotes: Mutex::new(BTreeMap::new()),
             kernel_boots: Mutex::new(BTreeMap::new()),
             members: Mutex::new(BTreeMap::new()),
@@ -980,7 +987,7 @@ impl Pool {
             .map(|(birth, _, _)| birth.clone()).collect();
         births.extend(self.accounting.lock().unwrap().iter()
             .filter(|((p, index), _)| p == plan && (start..start + degree as usize).contains(index))
-            .filter_map(|(_, owner)| owner.clone()));
+            .filter_map(|(_, owner)| owner.birth.clone()));
         self.retire(plan, start, degree, &births);
     }
 
@@ -1004,7 +1011,7 @@ impl Pool {
         }
         drop(levels);
         let mut admitted = self.admitted.lock().unwrap();
-        if admitted.get(&key).and_then(|(_, owner)| owner.as_ref()).is_some_and(|owner| gone.contains(owner)) {
+        if admitted.get(&key).and_then(|(_, _, owner)| owner.as_ref()).is_some_and(|owner| gone.contains(owner)) {
             admitted.remove(&key);
         }
         drop(admitted);
@@ -1012,10 +1019,10 @@ impl Pool {
             !(p == plan && *lane == start && gone.contains(birth)));
         for (index, device) in (start..).zip(self.lane(start, degree).unwrap_or_default()) {
             let slot = (plan.to_owned(), index);
-            if accounting.get(&slot).and_then(Option::as_ref).is_some_and(|owner| gone.contains(owner)) {
+            if accounting.get(&slot).and_then(|owner| owner.birth.as_ref()).is_some_and(|owner| gone.contains(owner)) {
                 if let Some(survivor) = &survivor {
                     // Keep the same construction's measured charge until the sibling reports.
-                    accounting.insert(slot, Some(survivor.clone()));
+                    accounting.get_mut(&slot).unwrap().birth = Some(survivor.clone());
                 } else {
                     device.memory.finished(plan);
                     device.memory.with(|gpu| gpu.ended(plan));
@@ -1025,55 +1032,69 @@ impl Pool {
         }
     }
 
-    fn starting(&self, plan: &str, start: usize, degree: u32) {
+    fn starting(&self, plan: &str, start: usize, degree: u32) -> u64 {
         let mut owners = self.accounting.lock().unwrap();
+        let reservation = self.next_reservation.fetch_add(1, Ordering::Relaxed);
         for (index, device) in (start..).zip(self.lane(start, degree).unwrap_or_default()) {
-            owners.insert((plan.to_owned(), index), None);
+            owners.insert((plan.to_owned(), index), ChargeOwner { reservation, birth: None });
             device.memory.with(|gpu| gpu.starting(plan, gpu.spawn_need(plan)));
         }
-        if let Some((_, owner)) = self.admitted.lock().unwrap().get_mut(&session_key(plan, start)) {
+        if let Some((_, generation, owner)) = self.admitted.lock().unwrap().get_mut(&session_key(plan, start)) {
+            *generation = reservation;
             *owner = None;
         }
+        reservation
     }
 
-    fn clear_unborn(&self, plan: &str, start: usize, degree: u32) {
+    fn clear_unborn(&self, plan: &str, start: usize, degree: u32, reservation: u64) {
         let mut owners = self.accounting.lock().unwrap();
         for (index, device) in (start..).zip(self.lane(start, degree).unwrap_or_default()) {
             let key = (plan.to_owned(), index);
-            if owners.get(&key).is_some_and(Option::is_none) {
+            if owners.get(&key).is_some_and(|owner| owner.reservation == reservation && owner.birth.is_none()) {
                 device.memory.with(|gpu| gpu.ended(plan));
                 owners.remove(&key);
             }
         }
         let key = session_key(plan, start);
         let mut admitted = self.admitted.lock().unwrap();
-        if admitted.get(&key).is_some_and(|(_, owner)| owner.is_none()) {
+        if admitted.get(&key).is_some_and(|(_, generation, owner)| *generation == reservation && owner.is_none()) {
             admitted.remove(&key);
         }
     }
 
     fn born(&self, plan: &str, start: usize, degree: u32, birth: &Birth) {
+        self.born_at(plan, start, degree, birth, None);
+    }
+
+    fn born_at(&self, plan: &str, start: usize, degree: u32, birth: &Birth, expected: Option<u64>) {
         let mut owners = self.accounting.lock().unwrap();
-        for (index, _) in (start..).zip(self.lane(start, degree).unwrap_or_default()) {
-            owners.insert((plan.to_owned(), index), Some(birth.clone()));
+        let reservation = expected.unwrap_or_else(|| self.next_reservation.fetch_add(1, Ordering::Relaxed));
+        for (index, device) in (start..).zip(self.lane(start, degree).unwrap_or_default()) {
+            let key = (plan.to_owned(), index);
+            if expected.is_none() || owners.get(&key).is_some_and(|owner| owner.reservation == reservation) {
+                owners.insert(key, ChargeOwner { reservation, birth: Some(birth.clone()) });
+                if index == start {
+                    device.memory.with(|gpu| gpu.spawned(plan, birth.pid));
+                }
+            }
         }
-        if let Some(device) = self.lane(start, degree).unwrap_or_default().first() {
-            device.memory.with(|gpu| gpu.spawned(plan, birth.pid));
-        }
-        if let Some((_, owner)) = self.admitted.lock().unwrap().get_mut(&session_key(plan, start)) {
-            *owner = Some(birth.clone());
+        if let Some((_, generation, owner)) = self.admitted.lock().unwrap().get_mut(&session_key(plan, start)) {
+            if expected.is_none() || *generation == reservation {
+                *generation = reservation;
+                *owner = Some(birth.clone());
+            }
         }
         self.leaders.lock().unwrap().insert(birth.pid, (birth.clone(), plan.to_owned(), start));
     }
 
     fn followed(&self, plan: &str, start: usize, birth: &Birth, followers: &[platform::process::Exact]) {
         let mut owners = self.accounting.lock().unwrap();
-        if owners.get(&(plan.to_owned(), start)).and_then(Option::as_ref) != Some(birth) {
+        if owners.get(&(plan.to_owned(), start)).and_then(|owner| owner.birth.as_ref()) != Some(birth) {
             return;
         }
         for (rank, follower) in followers.iter().enumerate() {
             let index = start + rank + 1;
-            owners.insert((plan.to_owned(), index), Some(follower.birth().clone()));
+            owners.get_mut(&(plan.to_owned(), index)).unwrap().birth = Some(follower.birth().clone());
             if let Some(device) = self.devices.get(index) {
                 device.memory.with(|gpu| gpu.spawned(plan, follower.birth().pid));
             }
@@ -1082,7 +1103,7 @@ impl Pool {
 
     fn finish_accounting(&self, plan: &str, start: usize, degree: u32, birth: &Birth) {
         let owners = self.accounting.lock().unwrap();
-        if degree > 0 && owners.get(&(plan.to_owned(), start)).and_then(Option::as_ref) != Some(birth) {
+        if degree > 0 && owners.get(&(plan.to_owned(), start)).and_then(|owner| owner.birth.as_ref()) != Some(birth) {
             return;
         }
         for device in self.lane(start, degree).unwrap_or_default() {
@@ -1103,7 +1124,7 @@ impl Pool {
     ) -> Facts {
         let each = rank_facts(facts, ranks, degree);
         let owners = self.accounting.lock().unwrap();
-        if degree > 0 && owners.get(&(plan.to_owned(), start)).and_then(Option::as_ref) != Some(birth) {
+        if degree > 0 && owners.get(&(plan.to_owned(), start)).and_then(|owner| owner.birth.as_ref()) != Some(birth) {
             return each[0];
         }
         for (device, facts) in self.lane(start, degree).unwrap_or_default().iter().zip(&each) {
@@ -1386,7 +1407,7 @@ impl Pool {
                 }) { Level::Gpu } else { Level::Host };
                 let noted = ((session.generation.clone(), session.application.clone()), level, session.executor.birth.clone());
                 let owners = self.accounting.lock().unwrap();
-                if owners.get(&(session.plan.clone(), session.start)).and_then(Option::as_ref) == Some(&session.executor.birth) {
+                if owners.get(&(session.plan.clone(), session.start)).and_then(|owner| owner.birth.as_ref()) == Some(&session.executor.birth) {
                     self.levels.lock().unwrap().insert(key.clone(), noted);
                 }
             }
@@ -1421,7 +1442,6 @@ impl Pool {
                 }
                 await_executor_exit(engine, &births);
                 self.retire_returned(plan, start, degree, &births);
-                if births.is_empty() { self.clear_unborn(plan, start, degree); }
                 record?;
             }
         }
@@ -1556,8 +1576,7 @@ impl Pool {
             self.ended(&session.plan, session.start, session.degree);
         }
         let ended: Vec<_> = self.accounting.lock().unwrap().iter()
-            .filter_map(|((plan, index), owner)| owner.as_ref()
-                .filter(|birth| birth.ended().unwrap_or(false))
+            .filter_map(|((plan, index), owner)| owner.birth.as_ref().filter(|birth| birth.ended().unwrap_or(false))
                 .map(|birth| (plan.clone(), *index, birth.clone())))
             .collect();
         for (plan, index, birth) in ended {
@@ -2239,9 +2258,9 @@ impl Pool {
         if !member {
             load_caps = self.decide(&plan.construction, start, plan.degree, true)?;
         }
-        self.starting(&plan.construction, start, plan.degree);
+        let reservation = self.starting(&plan.construction, start, plan.degree);
         let born = Mutex::new(vec![]);
-        let created = self.new_session(engine, held, &plan, start, |birth, _| {
+        let created = self.new_session(engine, held, &plan, start, reservation, |birth, _| {
             born.lock().unwrap().extend(executor_births(birth, &[]));
             Ok(())
         });
@@ -2251,7 +2270,7 @@ impl Pool {
                 let births = born.into_inner().unwrap();
                 await_executor_exit(engine, &births);
                 self.retire_returned(&plan.construction, start, plan.degree, &births);
-                if births.is_empty() { self.clear_unborn(&plan.construction, start, plan.degree); }
+                if births.is_empty() { self.clear_unborn(&plan.construction, start, plan.degree, reservation); }
                 return Err(error);
             }
         };
@@ -2900,14 +2919,17 @@ impl Pool {
                 // A context and the first working set are reserved on every GPU of the lane
                 // before the process exists.
                 let load_caps = self.decide(&plan.construction, start, degree, true)?;
-                self.starting(&plan.construction, start, degree);
+                let reservation = self.starting(&plan.construction, start, degree);
                 let born = Mutex::new(vec![]);
                 let on_birth = |birth: &Birth, cancel: &Cancellation| {
                     born.lock().unwrap().extend(executor_births(birth, &[]));
                     engine.register_managed(id, birth.clone(), stops(cancel.clone()))
                 };
-                let created = self.new_session(engine, &held, &plan, start, on_birth);
+                let created = self.new_session(engine, &held, &plan, start, reservation, on_birth);
                 let births = born.into_inner().unwrap();
+                if created.is_err() && births.is_empty() {
+                    self.clear_unborn(&plan.construction, start, degree, reservation);
+                }
                 *disposition = Disposition::Unknown(births.clone());
                 match created {
                     Err(error) if error.kind() == io::ErrorKind::Unsupported => {
@@ -2984,11 +3006,12 @@ impl Pool {
         held: &HeldGeneration,
         plan: &Plan,
         start: usize,
+        reservation: u64,
         on_birth: impl Fn(&Birth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Session> {
         let launched = Instant::now();
         let on_birth = |birth: &Birth, cancel: &Cancellation| {
-            self.born(&plan.construction, start, plan.degree, birth);
+            self.born_at(&plan.construction, start, plan.degree, birth, Some(reservation));
             on_birth(birth, cancel)
         };
         let (root, socket, directory) = self.executor_endpoint()?;
@@ -3195,7 +3218,7 @@ impl Pool {
                         ..Facts::default()
                     };
                     let owners = self.accounting.lock().unwrap();
-                    if owners.get(&(construction.clone(), start)).and_then(Option::as_ref) == Some(&session.executor.birth) {
+                    if owners.get(&(construction.clone(), start)).and_then(|owner| owner.birth.as_ref()) == Some(&session.executor.birth) {
                         device.memory.observe(&construction, context, None);
                     }
                 }
@@ -3330,7 +3353,7 @@ impl Pool {
             let _owners = self.accounting.lock().unwrap();
             let mut admitted = self.admitted.lock().unwrap();
             let key = session_key(&construction, start);
-            if admitted.get(&key).and_then(|(_, owner)| owner.as_ref()) == Some(&session.executor.birth) {
+            if admitted.get(&key).and_then(|(_, _, owner)| owner.as_ref()) == Some(&session.executor.birth) {
                 admitted.remove(&key);
             }
         }
@@ -3651,10 +3674,10 @@ impl Pool {
             };
             let key = session_key(plan, start);
             let mut admitted = self.admitted.lock().unwrap();
-            let others: u64 = admitted.iter().filter(|(k, _)| **k != key).map(|(_, (bytes, _))| bytes).sum();
+            let others: u64 = admitted.iter().filter(|(k, _)| **k != key).map(|(_, (bytes, _, _))| bytes).sum();
             let available = available.map(|available| available.saturating_sub(others));
             if available.is_none_or(|available| available >= need) {
-                admitted.insert(key, (need, None));
+                admitted.insert(key, (need, 0, None));
                 return true;
             }
             drop(admitted);
@@ -3669,7 +3692,7 @@ impl Pool {
                 "need": need, "available": available, "released": released, "ended": ended}));
             if released == 0 && !ended {
                 if !spare {
-                    self.admitted.lock().unwrap().insert(key, (need, None));
+                    self.admitted.lock().unwrap().insert(key, (need, 0, None));
                 }
                 return false;
             }
@@ -3860,7 +3883,7 @@ fn known(value: Option<i64>) -> Option<u64> {
 fn rank_context(reply: &Frame, rank: usize) -> Option<u64> {
     let own = match rank {
         0 => reply.plane.as_ref(),
-        _ => reply.rank_planes.get(rank - 1).and_then(Option::as_ref),
+        _ => reply.rank_planes.get(rank - 1).and_then(|owner| owner.birth.as_ref()),
     };
     own.and_then(|plane| known(plane.context_bytes))
 }
@@ -3891,7 +3914,7 @@ fn rank_facts(
     };
     let mut each = vec![facts];
     for rank in 1..degree.max(1) as usize {
-        each.push(match ranks.get(rank - 1).and_then(Option::as_ref) {
+        each.push(match ranks.get(rank - 1).and_then(|owner| owner.birth.as_ref()) {
             Some(own) => Facts {
                 weights: facts.weights,
                 weights_floor: facts.weights_floor,
@@ -4794,7 +4817,7 @@ impl Services for Callbacks<'_> {
                         ..Default::default()
                     };
                     let owners = self.pool.accounting.lock().unwrap();
-                    if owners.get(&(self.plan.to_owned(), self.start)).and_then(Option::as_ref) == Some(&self.birth) {
+                    if owners.get(&(self.plan.to_owned(), self.start)).and_then(|owner| owner.birth.as_ref()) == Some(&self.birth) {
                         self.pool.devices[self.start].memory.observe(self.plan, facts, None);
                     }
                 }
@@ -5162,6 +5185,14 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         let mut old = child(ledger);
         let live = child(ledger);
         let model = plan("replica", 1);
+        let first_start = pool.starting(&model.construction, 0, 1);
+        let next_start = pool.starting(&model.construction, 0, 1);
+        pool.clear_unborn(&model.construction, 0, 1, first_start);
+        pool.born_at(&model.construction, 0, 1, &old.birth, Some(first_start));
+        assert!(pool.accounting.lock().unwrap().get(&(model.construction.clone(), 0))
+            .is_some_and(|owner| owner.reservation == next_start && owner.birth.is_none()));
+        pool.clear_unborn(&model.construction, 0, 1, next_start);
+        assert!(pool.devices[0].memory.with(|gpu| gpu.tenant(&model.construction).is_none()));
         let _exact = [&old.birth, &live.birth].map(|birth| platform::process::Exact::open(birth).unwrap().unwrap());
         for birth in [&old.birth, &live.birth] {
             pool.starting(&model.construction, 0, 1);
@@ -5193,7 +5224,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
             serving.finish_returned(&engine, &id, "replica", 0, 1,
                 &Disposition::Unknown(vec![owned.clone()]))?;
             let preserved = owned.ended()? && !survivor.ended()?
-                && serving.accounting.lock().unwrap().get(&("replica".into(), 0)).and_then(Option::as_ref) == Some(&survivor)
+                && serving.accounting.lock().unwrap().get(&("replica".into(), 0)).and_then(|owner| owner.birth.as_ref()) == Some(&survivor)
                 && serving.level("replica") == Some(Level::Gpu);
             settle(&engine, &id, &io::Error::other("early request failed before its outcome"))?;
             done.send(preserved).unwrap();
@@ -5603,10 +5634,9 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         (0..2).for_each(learn);
         assert!(pool.host_room("image", 0, 1, false));
         assert!(!pool.host_room("image", 1, 1, false), "the first one is admitted, not loaded");
-        pool.clear_unborn("image", 0, 1);
-        pool.clear_unborn("image", 1, 1);
+        pool.admitted.lock().unwrap().clear();
         assert!(pool.host_room("image", 1, 1, false));
-        pool.clear_unborn("image", 1, 1);
+        pool.admitted.lock().unwrap().clear();
 
         let gib = 1u64 << 30;
         for (index, (tenant, start)) in [("film", 0), ("film", 2), ("image", 0), ("image", 2)].into_iter().enumerate() {
