@@ -1458,6 +1458,7 @@ mod tests {
         let mut follower = crate::scratch::until_stdin_closes().stdin(std::process::Stdio::piped()).spawn().unwrap();
         let births = vec![Birth::of(leader.id()).unwrap(), Birth::of(follower.id()).unwrap()];
         assert!(engine.journal.lock().unwrap().claim(&id).unwrap());
+        engine.owned.lock().unwrap().insert(id.clone());
         engine.register_managed(&id, births[0].clone(), Arc::new(|| Ok(()))).unwrap();
         assert!(engine.authorize_managed(&id, None).unwrap());
         let spool = Spool(engine.staging(&id).unwrap());
@@ -1507,6 +1508,7 @@ mod tests {
             assert_eq!(tensorfs_core::sha256::hex_digest(&bytes), artifact.sha256);
         }
 
+        engine.owned.lock().unwrap().remove(&id);
         let restarted = Engine::open(&root).unwrap();
         assert_eq!(restarted.reconcile().unwrap().len(), 1);
         assert!(!restarted.dispatch_managed(&id, |_, _| panic!("known outcome replayed")).unwrap());
