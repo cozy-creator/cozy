@@ -7,12 +7,12 @@ mod common;
 use std::{path::Path, sync::Arc};
 
 use calcifer::{Calcifer, machines::Machines};
+use hub_client::{Client, Credential, DeviceKey, P256Key, RunToken, UserSession, testing, types};
 use platform::paths::Home;
 use protocol::{
     calcifer::{Kind, On, SubmitRun},
     config, machine as v1,
 };
-use hub_client::{Client, Credential, DeviceKey, P256Key, RunToken, UserSession, testing, types};
 use sha2::{Digest as _, Sha256};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -270,9 +270,24 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
         "the run reads its Hub as a run under the configured spelling does"
     );
 
-    // As the machine: trade it with the leaf's key, then publish where it names, and only there.
-    let leaf = Arc::new(P256Key::from_pkcs8(&tensord.leaf_key()).unwrap());
-    let token = RunToken::new(&access.capability, &access.token_endpoint, leaf).unwrap();
+    // The request holds its own key; another send gets a different one without probing a leaf.
+    let run_key = Arc::new(P256Key::from_jwk(&access.key).unwrap());
+    assert_ne!(
+        run_key.thumbprint(),
+        P256Key::from_pkcs8(&tensord.leaf_key())
+            .unwrap()
+            .thumbprint()
+    );
+    let resent = machines
+        .hub_access(&publishes, "no-machine-needed")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        run_key.thumbprint(),
+        P256Key::from_jwk(&resent.key).unwrap().thumbprint()
+    );
+    let token = RunToken::new(&access.capability, &access.token_endpoint, run_key).unwrap();
     let machine = Client::connect(
         &origin,
         reqwest::Client::new(),

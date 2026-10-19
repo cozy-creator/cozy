@@ -20,18 +20,22 @@
 //! - A folder writer writes `chunks/<sha256>` first and `model.<variant>.cozytensors` last, by
 //!   rename: a folder without the header is unfinished. Objects its base's store holds are
 //!   referenced, not copied (a thin folder).
+//! - A streaming writer sends each object to an endpoint as it seals it ([`Stream`]) and, at
+//!   commit, the header and a tree of it, which becomes an unreleased checkpoint of its repo.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use platform::durable::{self, FileId};
 use serde::{Deserialize, Serialize};
 
 use crate::err;
+use crate::fetch::Stream;
 use crate::format::layout::{self, GRID, STANDALONE};
 use crate::format::{
     self, variant_path, Body, Component, Config, Dtype, Encoding, Header, Metadata, ObjectRef,
@@ -180,6 +184,13 @@ enum Dest {
         variant: String,
         cache: Option<Store>,
     },
+    /// Objects sent as they seal; at commit the header and tree, a checkpoint of repo `name`.
+    Endpoint {
+        store: Store,
+        stream: Arc<Stream>,
+        name: String,
+        variant: String,
+    },
 }
 
 pub struct Writer {
@@ -210,6 +221,7 @@ pub struct Writer {
     touched: Instant,
     buffer: Vec<u8>,
     committed: Option<ObjectRef>,
+    published: Option<ObjectRef>,
 }
 
 /// One component of a [`Writer`]: borrowed from it by [`Writer::component`] or [`Writer::get`].
@@ -235,6 +247,19 @@ impl Store {
             }
         };
         Writer::open(Dest::Store(self.clone()), writers.join(name), key, base)
+    }
+
+    /// A writer of `variant` whose objects go to `stream` as they seal and whose commit adds a
+    /// tree of it (with its repo files) to repo `name`'s checkpoints there. The local checkpoint
+    /// commits first and remains available when the upload fails.
+    pub fn streaming_writer(&self, stream: Arc<Stream>, name: &str, variant: &str, base: Option<&Checkpoint>) -> Result<Writer> {
+        let writers = self.root().join("tmp").join("writers");
+        sweep_anonymous(&writers)?;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = writers.join(format!("{ANONYMOUS}{}-s{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        format::check_file(&variant_path(variant))?;
+        let dest = Dest::Endpoint { store: self.clone(), stream, name: name.to_owned(), variant: variant.to_owned() };
+        Writer::open(dest, dir, None, base)
     }
 
     /// Removes the directories of writers no process holds and nothing touched for `older_than`
@@ -364,6 +389,7 @@ impl Writer {
             touched: Instant::now(),
             buffer: vec![0; 1 << 20],
             committed: None,
+            published: None,
         };
         if writer.journal.is_some() {
             writer.resume()?;
@@ -438,6 +464,11 @@ impl Writer {
         self.committed.as_ref()
     }
 
+    /// This writer's exact tree, once its endpoint's conditional repo update succeeded.
+    pub fn published(&self) -> Option<&ObjectRef> {
+        self.published.as_ref()
+    }
+
     /// A repo file (README, LICENSE): never inside the cozytensors. Into the store it is an
     /// object listed by [`Writer::repo_files`] and pinned with the header; into a folder, a
     /// file at its path.
@@ -455,6 +486,11 @@ impl Writer {
                 fs::create_dir_all(parent).map_err(fail("create", parent))?;
                 durable::replace(&at, bytes, 0o644).map_err(|e| fail("write", &at)(e.into()))?;
                 ObjectRef::of(bytes)
+            }
+            Dest::Endpoint { store, stream, .. } => {
+                let object = store.put_bytes(bytes)?;
+                stream.put_stored(store, &object).map_err(sent)?;
+                object
             }
         };
         self.repo.insert(path.to_owned(), object);
@@ -547,7 +583,15 @@ impl Writer {
         let mut metadata = (self.base.as_ref()).map_or_else(Metadata::new, |b| b.header().metadata.clone());
         metadata.extend(self.metadata.clone());
         let pipeline = self.pipeline.clone().or_else(|| self.base.as_ref()?.pipeline().cloned());
-        let header = Header::new(chunks, pipeline, components, metadata)?.to_cbor()?;
+        let header = Header::new(chunks, pipeline, components, metadata)?;
+        if let Dest::Endpoint { store, stream, .. } = &self.dest {
+            for object in header.objects() {
+                if store.reuse(object)? {
+                    stream.put_stored(store, object).map_err(sent)?;
+                }
+            }
+        }
+        let header = header.to_cbor()?;
         let id = match &self.dest {
             Dest::Store(store) => {
                 let id = store.put_bytes(&header)?;
@@ -562,6 +606,14 @@ impl Writer {
                 let at = root.join(variant_path(variant));
                 durable::replace(&at, &header, 0o644).map_err(|e| fail("write", &at)(e.into()))?;
                 ObjectRef::of(&header)
+            }
+            Dest::Endpoint { store, stream, name, variant } => {
+                let id = store.put_bytes(&header)?;
+                let roots = std::iter::once(id.clone()).chain(self.repo.values().cloned()).collect();
+                store.pin(&id.sha256, &Pin::new(roots))?;
+                self.committed = Some(id.clone());
+                self.published = Some(stream.commit(name, variant, header, &self.repo).map_err(sent)?);
+                id
             }
         };
         self.close();
@@ -1219,6 +1271,7 @@ impl Dest {
         match self {
             Dest::Store(store) => Some(store),
             Dest::Folder { cache, .. } => cache.as_ref(),
+            Dest::Endpoint { store, .. } => Some(store),
         }
     }
 
@@ -1226,6 +1279,7 @@ impl Dest {
         match self {
             Dest::Store(store) => store.flushes(),
             Dest::Folder { .. } => true,
+            Dest::Endpoint { store, .. } => store.flushes(),
         }
     }
 
@@ -1239,6 +1293,13 @@ impl Dest {
                     return Ok(true);
                 }
                 cache.as_ref().map_or(Ok(false), |c| c.reuse(object))
+            }
+            Dest::Endpoint { store, stream, .. } => {
+                let held = store.reuse(object)?;
+                if held {
+                    stream.put_stored(store, object).map_err(sent)?;
+                }
+                Ok(held)
             }
         }
     }
@@ -1261,6 +1322,7 @@ impl Dest {
                     length: 0,
                 }))
             }
+            Dest::Endpoint { store, stream, .. } => Ok(Admit::Endpoint(store.clone(), Arc::clone(stream), store.admit(None)?)),
         }
     }
 
@@ -1293,6 +1355,12 @@ impl Dest {
 enum Admit {
     Store(Admission),
     Folder(FolderObject),
+    Endpoint(Store, Arc<Stream>, Admission),
+}
+
+/// A send that failed, as the writer's error.
+fn sent(refusal: err::Refusal) -> Error {
+    Error::Io { op: "send", path: PathBuf::from("the endpoint"), source: io::Error::other(refusal) }
 }
 
 /// A temp in the writer's directory, renamed into `chunks/<sha256>` when finished.
@@ -1320,6 +1388,11 @@ impl Admit {
                 fs::rename(&o.temp, &at).map_err(fail("rename into", &at))?;
                 Ok(got)
             }
+            Admit::Endpoint(store, stream, admission) => {
+                let object = admission.finish()?;
+                stream.put_stored(&store, &object).map_err(sent)?;
+                Ok(object)
+            }
         }
     }
 }
@@ -1334,6 +1407,7 @@ impl Write for Admit {
                 o.length += n as u64;
                 Ok(n)
             }
+            Admit::Endpoint(_, _, admission) => admission.write(bytes),
         }
     }
 

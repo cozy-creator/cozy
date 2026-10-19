@@ -53,9 +53,13 @@ impl PyTensors {
         }
     }
 
-    fn checkpoint<'a>(&'a self, py: Python<'_>) -> PyResult<&'a Checkpoint> {
+    fn checkpoint<'a>(&'a self, py: Python<'_>, fetch: bool) -> PyResult<&'a Checkpoint> {
         match &self.ck {
-            Some(ck) => ck.get().stored(py),
+            Some(ck) => {
+                let ck = ck.get();
+                if fetch { ck.fetch_components(py, Some(std::slice::from_ref(&self.component)), 0)?; }
+                ck.stored(py)
+            },
             None => Err(raise(
                 py,
                 Failure {
@@ -73,7 +77,7 @@ impl PyTensors {
         keys: &[String],
         decode_: bool,
     ) -> PyResult<Vec<Bound<'py, PyAny>>> {
-        let ck = self.checkpoint(py)?;
+        let ck = self.checkpoint(py, !keys.is_empty())?;
         let mut wants = Vec::new();
         for (i, key) in keys.iter().enumerate() {
             let t = ck.tensor(&self.component, key).or_raise(py)?;
@@ -265,7 +269,6 @@ impl PyTensors {
         role: Option<String>,
         offset: u64,
     ) -> PyResult<()> {
-        let ck = self.checkpoint(py)?;
         let view = py
             .import("builtins")?
             .getattr("memoryview")?
@@ -277,6 +280,7 @@ impl PyTensors {
         }
         let buf: PyBuffer<u8> = PyBuffer::get(&view.call_method1("cast", ("B",))?)?;
         let len = buf.len_bytes();
+        let ck = self.checkpoint(py, len != 0)?;
         let t = ck.tensor(&self.component, &key).or_raise(py)?;
         if role.is_none() && matches!(t.body, Body::Encoded { .. }) {
             let array = self

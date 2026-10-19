@@ -122,12 +122,16 @@ impl Checkpoint {
 
     /// A plain folder view of this checkpoint, sharing its admitted object files.
     pub fn path(&self) -> Result<PathBuf> {
+        self.path_for("")
+    }
+
+    pub fn path_for(&self, variant: &str) -> Result<PathBuf> {
         match &self.objects {
             Objects::Folder { dir, .. } => Ok(dir.clone()),
             Objects::Store(store) => {
                 let dir = store.root().join("snapshots").join(&self.id.sha256);
                 let mut tree = Tree::default();
-                tree.set_variant("", self.id.clone());
+                tree.set_variant(variant, self.id.clone());
                 store.snapshot(&store.put_tree(&tree)?, &dir, None)?;
                 Ok(dir)
             }

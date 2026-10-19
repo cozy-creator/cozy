@@ -1,16 +1,21 @@
 //! Fetching into a store (design §5). An [`Origin`] names a model's tree and locates objects
-//! ([`TensorhubOrigin`] by default, [`HttpOrigin`] and [`VolumeOrigin`] for a static layout);
+//! ([`Endpoint`], the distribution protocol's client; [`TensorhubOrigin`] until TensorD moves to
+//! it; [`VolumeOrigin`] for a datacenter volume);
 //! the [`Fetcher`] walks the closure (tree → its repo files and the chosen variant's header →
 //! the wanted components' chunks and assets), reads each object through the tiers local store →
 //! volume → origin,
 //! and admits it through the store, which verifies it. One HTTP client ([`Client`]) and one
 //! downloader serve every origin.
 
+pub mod conform;
 mod download;
+mod dpop;
+mod endpoint;
 mod net;
 mod origin;
 pub mod policy;
 mod tensorhub;
+pub mod token;
 mod volume;
 
 use std::fs::File;
@@ -19,10 +24,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub use dpop::{DPoP, JwtBearer};
+pub use endpoint::{upload_tree, with_tree, Endpoint, Fresh, Payload, Stream, Uploaded};
 pub use net::Client;
-pub use origin::{choose, release_of, variant_of_tree, Chosen, HttpOrigin, Location, Origin};
+pub use origin::{choose, release_of, variant_of_tree, Chosen, Location, Origin};
 pub use policy::SourcePolicy;
-pub use tensorhub::{Credential, Resolved, TensorhubOrigin, TENSORHUB};
+pub use tensorhub::{Resolved, TensorhubOrigin, TENSORHUB};
+pub use token::{bearer, SigV4, TokenProvider};
 pub use volume::VolumeOrigin;
 
 use crate::err::{refuse, Code, Refusal, Result};

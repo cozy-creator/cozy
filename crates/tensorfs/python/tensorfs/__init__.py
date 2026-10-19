@@ -23,7 +23,9 @@ from ._ext import (
     DecodeError,
     DeniedError,
     DiskFullError,
+    DPoP,
     Encoded,
+    Endpoint,
     Encoding,
     Error,
     FormatError,
@@ -45,6 +47,7 @@ from ._ext import (
     plan,
     regions,
 )
+from .api import ComponentWriter, Writer, configure, convert, export, open, snapshot_download, upload_folder
 
 Mapping.register(Tensors)
 
@@ -57,7 +60,9 @@ __all__ = [
     "DecodeError",
     "DeniedError",
     "DiskFullError",
+    "DPoP",
     "Encoded",
+    "Endpoint",
     "Encoding",
     "Error",
     "FormatError",
@@ -79,4 +84,10 @@ __all__ = [
     "parse_header",
     "plan",
     "regions",
+    "configure",
+    "convert",
+    "export",
+    "open",
+    "snapshot_download",
+    "upload_folder",
 ]
