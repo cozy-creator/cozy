@@ -1,7 +1,7 @@
 # TensorFS
 
-For short Rust and Python examples, start with the [usage guide](../tensorfs/README.md).
-The [full API reference](../tensorfs/API.md) lists the planned public interface.
+Start with the [Python API and examples](API.md) for calls and returned objects.
+The [Rust API](../tensorfs/API.md) is documented separately.
 
 This guide describes the TensorFS 0.13.0 target API under integration. The current master
 implementation and published wheels may still expose the preceding interface.
