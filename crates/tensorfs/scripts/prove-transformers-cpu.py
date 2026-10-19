@@ -116,7 +116,8 @@ def make_checkpoint(root):
     writer = tensorfs.Writer(root / "checkpoint", cache_dir=root / "cache")
     for name, model in models_by_name.items():
         component = writer.component(
-            name, cls=f"transformers.{type(model).__name__}", config=model.config.to_dict(),
+            name, cls=f"transformers.{type(model).__name__}",
+            config=json.loads(model.config.to_json_string(use_diff=False)),
         )
         manifests[name] = {}
         for key, value in model.state_dict().items():
