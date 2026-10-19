@@ -8,6 +8,7 @@ import numpy as np
 
 import tensorfs
 
+assert not hasattr(tensorfs, "Store"), "the cache implementation leaked into the public API"
 
 with TemporaryDirectory() as temp:
     root = Path(temp)
@@ -24,6 +25,7 @@ with TemporaryDirectory() as temp:
         half.component("optimizer", cls="", config={}).put("step", np.array([8], dtype=np.int64))
     (root / "folder/README.md").write_text("a repo file\n")
     ck = writer.commit()
+    assert not hasattr(ck, "read") and not hasattr(ck, "tensors"), "checkpoint-wide tensor APIs remain public"
     assert tensorfs.open(root / "folder", variant="f32").id == ck.id
     assert tensorfs.open(root / "folder/model.f32.cozytensors").id == ck.id
     assert np.array_equal(np.from_dlpack(ck.components["model"].tensors.read("weight")), values)
