@@ -42,12 +42,12 @@ pub(crate) mod tests;
 pub use adapter::{compose, Composed, Selection, GRAPH_FILE};
 pub use source::serve_source;
 
+use cozy_platform::ipc::LocalStream;
 use std::{
     cell::RefCell,
     collections::BTreeSet,
     fmt::Display,
     io::{self, Read, Seek, SeekFrom},
-    os::unix::net::UnixStream,
 };
 
 use serde::{de::DeserializeOwned, Deserialize};
@@ -121,11 +121,11 @@ impl From<Refusal> for io::Error {
     }
 }
 
-pub(crate) fn answer(channel: &mut Channel<UnixStream>, result: Value) -> io::Result<()> {
+pub(crate) fn answer(channel: &mut Channel<LocalStream>, result: Value) -> io::Result<()> {
     channel.send(&json!({ "result": result }))
 }
 
-pub(crate) fn refuse(channel: &mut Channel<UnixStream>, refusal: &Refusal) -> io::Result<()> {
+pub(crate) fn refuse(channel: &mut Channel<LocalStream>, refusal: &Refusal) -> io::Result<()> {
     let detail: String = refusal.detail.chars().take(1024).collect();
     channel.send(&json!({ "error": refusal.code, "detail": detail }))
 }
@@ -190,7 +190,7 @@ struct ReadIn {
 /// One `read`: refused before any byte goes (the channel goes on), else `{"length"}` and the
 /// bytes. Only a failure mid-stream ends the channel.
 pub(crate) fn serve_read<'c>(
-    channel: &mut Channel<UnixStream>,
+    channel: &mut Channel<LocalStream>,
     store: &Store,
     checkpoint: impl FnOnce(&str) -> Answer<&'c Checkpoint>,
     request: &Value,
@@ -223,7 +223,7 @@ pub(crate) fn serve_read<'c>(
 }
 
 /// Ranges `(object, offset, length)` as data frames.
-fn send(channel: &mut Channel<UnixStream>, store: &Store, ranges: &[(ObjectRef, u64, u64)]) -> io::Result<()> {
+fn send(channel: &mut Channel<LocalStream>, store: &Store, ranges: &[(ObjectRef, u64, u64)]) -> io::Result<()> {
     let mut buffer = vec![0; CHUNK];
     for (object, offset, length) in ranges {
         let mut file = store.file(object).map_err(storage::io_error)?;
@@ -272,7 +272,7 @@ pub fn serve_output(
     store: &Store,
     transaction: &str,
     derivation: &Derivation,
-    stream: UnixStream,
+    stream: LocalStream,
     hooks: &Hooks,
 ) -> io::Result<Option<ObjectRef>> {
     let channel = RefCell::new(Channel(stream));
@@ -298,7 +298,7 @@ impl Context<'_> {
             .ok_or_else(|| refused("ungranted", format!("{from:?} is not a granted checkpoint")))
     }
 
-    fn read(&self, channel: &RefCell<Channel<UnixStream>>, request: &Value) -> io::Result<()> {
+    fn read(&self, channel: &RefCell<Channel<LocalStream>>, request: &Value) -> io::Result<()> {
         serve_read(&mut channel.borrow_mut(), self.store, |from| self.granted(from), request, self.hooks)
     }
 }
@@ -368,7 +368,7 @@ struct FileIn {
 /// A write's bytes as they come in data frames, `left` of them still to come; `read` requests
 /// in between are answered.
 struct Incoming<'a> {
-    channel: &'a RefCell<Channel<UnixStream>>,
+    channel: &'a RefCell<Channel<LocalStream>>,
     context: &'a Context<'a>,
     left: u64,
     buffer: Vec<u8>,
@@ -376,7 +376,7 @@ struct Incoming<'a> {
 }
 
 impl<'a> Incoming<'a> {
-    fn new(channel: &'a RefCell<Channel<UnixStream>>, context: &'a Context<'a>, left: u64) -> Incoming<'a> {
+    fn new(channel: &'a RefCell<Channel<LocalStream>>, context: &'a Context<'a>, left: u64) -> Incoming<'a> {
         Incoming { channel, context, left, buffer: vec![], at: 0 }
     }
 
@@ -418,7 +418,7 @@ fn output(
     store: &Store,
     transaction: &str,
     derivation: &Derivation,
-    channel: &RefCell<Channel<UnixStream>>,
+    channel: &RefCell<Channel<LocalStream>>,
     hooks: &Hooks,
 ) -> Answer<Option<ObjectRef>> {
     let granted = derivation.granted().map(|m| open(store, m, hooks)).collect::<Answer<_>>()?;

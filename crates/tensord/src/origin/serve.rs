@@ -10,8 +10,8 @@
 //! - `present` answers, for each, whether it is here.
 //!
 //! Waits answer out of order. Everything the channel wants ends when its peer closes it.
+use cozy_platform::ipc::LocalStream;
 use std::{
-    os::unix::net::UnixStream,
     sync::{mpsc, Arc},
 };
 
@@ -38,7 +38,7 @@ pub struct Grant {
 }
 
 /// Serves `stream` until its peer closes it.
-pub fn serve(machine: &Arc<Machine>, grant: Grant, stream: UnixStream) -> Result<()> {
+pub fn serve(machine: &Arc<Machine>, grant: Grant, stream: LocalStream) -> Result<()> {
     let io = |e: std::io::Error| Refusal { code: Code::TRANSFER_FAILED, detail: format!("fetch channel: {e}") };
     let writer = stream.try_clone().map_err(io)?;
     let (replies, outbox) = mpsc::channel::<Value>();

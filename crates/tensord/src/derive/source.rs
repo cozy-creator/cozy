@@ -1,5 +1,6 @@
 //! The source channel: one granted checkpoint's files and bytes (module doc of `derive`).
-use std::{io, os::unix::net::UnixStream};
+use cozy_platform::ipc::LocalStream;
+use std::io;
 
 use serde::Deserialize;
 use serde_json::json;
@@ -15,7 +16,7 @@ struct FileOut {
 }
 
 /// Serves `source` until the executor closes the channel or its attempt ends.
-pub fn serve_source(store: &Store, source: &ObjectRef, stream: UnixStream, hooks: &Hooks) -> io::Result<()> {
+pub fn serve_source(store: &Store, source: &ObjectRef, stream: LocalStream, hooks: &Hooks) -> io::Result<()> {
     let mut channel = Channel(stream);
     let checkpoint = match open(store, source, hooks) {
         Ok(checkpoint) => checkpoint,

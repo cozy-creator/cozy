@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn frames_round_trip_and_split_data() {
-        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (a, b) = cozy_platform::ipc::pair().unwrap();
         let (mut tx, mut rx) = (Channel(a), Channel(b));
         let big = vec![7u8; CHUNK + 5];
         std::thread::scope(|s| {

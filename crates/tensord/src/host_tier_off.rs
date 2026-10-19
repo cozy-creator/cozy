@@ -6,7 +6,8 @@ use cozy_platform::contain::host_memory::HostMemory;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fs::File, io, sync::Arc, time::Duration};
-use tensorfs_core::{header::Header, store::Store};
+use crate::storage::Store;
+use tensorfs_core::store2::Checkpoint;
 
 #[derive(Clone, Debug)]
 pub struct HostTierConfig {
@@ -39,7 +40,7 @@ impl TierLimit for HalfOfHeadroom {
 #[derive(Clone)]
 pub struct HostGrant {
     pub manifest: String,
-    pub header: Header,
+    pub checkpoint: Checkpoint,
     pub components: BTreeSet<String>,
 }
 
