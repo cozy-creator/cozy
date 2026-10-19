@@ -1038,9 +1038,15 @@ impl Pool {
         }
     }
 
+    #[cfg(test)]
     fn starting(&self, plan: &str, start: usize, degree: u32) -> u64 {
-        let mut owners = self.accounting.lock().unwrap();
         let reservation = self.next_reservation.fetch_add(1, Ordering::Relaxed);
+        self.starting_at(plan, start, degree, reservation);
+        reservation
+    }
+
+    fn starting_at(&self, plan: &str, start: usize, degree: u32, reservation: u64) {
+        let mut owners = self.accounting.lock().unwrap();
         for (index, device) in (start..).zip(self.lane(start, degree).unwrap_or_default()) {
             owners.insert((plan.to_owned(), index), ChargeOwner { reservation, birth: None });
             device.memory.with(|gpu| gpu.starting(plan, gpu.spawn_need(plan)));
@@ -1049,7 +1055,6 @@ impl Pool {
             admission.reservation = reservation;
             admission.birth = None;
         }
-        reservation
     }
 
     fn clear_unborn(&self, plan: &str, start: usize, degree: u32, reservation: u64) {
@@ -2282,13 +2287,20 @@ impl Pool {
                 None => return Ok("no GPU room beside the warm set and the running call"),
             }
         }
-        if !self.host_room(&plan.construction, start, plan.degree, true) {
+        let reservation = self.next_reservation.fetch_add(1, Ordering::Relaxed);
+        if !self.host_room(&plan.construction, start, plan.degree, true, reservation) {
             return Ok("host_memory: no host room beside the warm set and what this host's other programs used recently");
         }
         if !member {
-            load_caps = self.decide(&plan.construction, start, plan.degree, true)?;
+            load_caps = match self.decide(&plan.construction, start, plan.degree, true) {
+                Ok(caps) => caps,
+                Err(error) => {
+                    self.clear_unborn(&plan.construction, start, plan.degree, reservation);
+                    return Err(error);
+                }
+            };
         }
-        let reservation = self.starting(&plan.construction, start, plan.degree);
+        self.starting_at(&plan.construction, start, plan.degree, reservation);
         let born = Mutex::new(vec![]);
         let created = self.new_session(engine, held, &plan, start, reservation, |birth, _| {
             born.lock().unwrap().extend(executor_births(birth, &[]));
@@ -2943,13 +2955,20 @@ impl Pool {
                 (session, vec![])
             }
             None => {
+                let reservation = self.next_reservation.fetch_add(1, Ordering::Relaxed);
                 if degree > 0 {
-                    self.host_room(&plan.construction, start, degree, false);
+                    self.host_room(&plan.construction, start, degree, false, reservation);
                 }
                 // A context and the first working set are reserved on every GPU of the lane
                 // before the process exists.
-                let load_caps = self.decide(&plan.construction, start, degree, true)?;
-                let reservation = self.starting(&plan.construction, start, degree);
+                let load_caps = match self.decide(&plan.construction, start, degree, true) {
+                    Ok(caps) => caps,
+                    Err(error) => {
+                        self.clear_unborn(&plan.construction, start, degree, reservation);
+                        return Err(error);
+                    }
+                };
+                self.starting_at(&plan.construction, start, degree, reservation);
                 let born = Mutex::new(vec![]);
                 let on_birth = |birth: &Birth, cancel: &Cancellation| {
                     born.lock().unwrap().extend(executor_births(birth, &[]));
@@ -3685,7 +3704,7 @@ impl Pool {
     /// (a member's own admission, a prefetch) never takes from a member. Executors admitted
     /// and not yet loaded count as held, so concurrent spawns never share one reading. Returns
     /// whether the room is there; a request is admitted either way.
-    fn host_room(&self, plan: &str, start: usize, degree: u32, spare: bool) -> bool {
+    fn host_room(&self, plan: &str, start: usize, degree: u32, spare: bool, reservation: u64) -> bool {
         let need = self.devices[start].memory.with(|gpu| {
             gpu.learned
                 .plans
@@ -3707,7 +3726,7 @@ impl Pool {
             let others: u64 = admitted.iter().filter(|(k, _)| **k != key).map(|(_, admission)| admission.bytes).sum();
             let available = available.map(|available| available.saturating_sub(others));
             if available.is_none_or(|available| available >= need) {
-                admitted.insert(key, Admission { bytes: need, reservation: 0, birth: None });
+                admitted.insert(key, Admission { bytes: need, reservation, birth: None });
                 return true;
             }
             drop(admitted);
@@ -3722,7 +3741,7 @@ impl Pool {
                 "need": need, "available": available, "released": released, "ended": ended}));
             if released == 0 && !ended {
                 if !spare {
-                    self.admitted.lock().unwrap().insert(key, Admission { bytes: need, reservation: 0, birth: None });
+                    self.admitted.lock().unwrap().insert(key, Admission { bytes: need, reservation, birth: None });
                 }
                 return false;
             }
@@ -5668,10 +5687,10 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
             })
         };
         (0..2).for_each(learn);
-        assert!(pool.host_room("image", 0, 1, false));
-        assert!(!pool.host_room("image", 1, 1, false), "the first one is admitted, not loaded");
+        assert!(pool.host_room("image", 0, 1, false, 1));
+        assert!(!pool.host_room("image", 1, 1, false, 2), "the first one is admitted, not loaded");
         pool.admitted.lock().unwrap().clear();
-        assert!(pool.host_room("image", 1, 1, false));
+        assert!(pool.host_room("image", 1, 1, false, 2));
         pool.admitted.lock().unwrap().clear();
 
         let gib = 1u64 << 30;
