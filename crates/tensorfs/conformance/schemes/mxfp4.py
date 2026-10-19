@@ -1,5 +1,5 @@
 """mxfp4 (spec §6 `mxfp4`): OCP MXFP4, an E2M1 element per weight and an F8_E8M0 scale per 32 elements of a
-row."""
+row; `transposed` (the registry's) stores the last two axes swapped."""
 
 import numpy as np
 
@@ -16,7 +16,7 @@ def decode(c):
 
 
 SCHEMES = (
-    Scheme("mxfp4", {"block_size": (32,)},
+    Scheme("mxfp4", {"block_size": (32,), "transposed": (False, True)},
            (Part("weight", ("F4",), logical), Part("scale", ("F8_E8M0",), lambda c: grid.shape(BLOCKS, c))),
            decode),
 )

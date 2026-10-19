@@ -4,6 +4,7 @@
 //! row's last block may be short.
 
 use super::{encoding, Encoder, Input, OwnedPart};
+use crate::format::decode::swap_last_two;
 use crate::format::{Dtype, Encoding, Error, Result, Value};
 
 pub const ENCODER: Encoder = Encoder {
@@ -13,8 +14,16 @@ pub const ENCODER: Encoder = Encoder {
 };
 
 impl Encoding {
-    pub fn mxfp4() -> Encoding {
-        encoding("mxfp4", &[("block_size", 32u64.into())])
+    /// `transposed`: the parts hold the logical tensor with its last two axes swapped (gpt-oss's
+    /// `[E, out, in]` for transformers' `[E, in, out]`).
+    pub fn mxfp4(transposed: bool) -> Encoding {
+        encoding(
+            "mxfp4",
+            &[
+                ("block_size", 32u64.into()),
+                ("transposed", transposed.into()),
+            ],
+        )
     }
 }
 
@@ -29,13 +38,22 @@ fn quantize(input: &Input) -> Result<Vec<OwnedPart>> {
     {
         return Err(fail("block_size is not 32".into()));
     }
-    let x = input.values()?;
-    let shape = input.shape;
-    let (Some(&c), true) = (shape.last(), shape.len() >= 2) else {
+    let transposed = match input.encoding.params.get("transposed") {
+        Some(Value::Bool(t)) => *t,
+        _ => return Err(fail("transposed is not a boolean".into())),
+    };
+    let (x, shape) = (input.values()?, input.shape);
+    let [lead @ .., a, b] = shape else {
         return Err(fail(format!(
             "logical shape {shape:?} is not rank 2 or more"
         )));
     };
+    // The stored tensor: the logical one, or with its last two axes swapped.
+    let (x, shape) = match transposed {
+        true => (swap_last_two(&x, shape), [lead, &[*b, *a]].concat()),
+        false => (x, shape.to_vec()),
+    };
+    let c = shape[shape.len() - 1];
     if x.len() % 2 != 0 {
         return Err(fail(format!("{} elements do not fill F4 bytes", x.len())));
     }

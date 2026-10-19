@@ -245,6 +245,13 @@ part, indexed by the code; a code outside `T` refuses the decode.
 elements of a row in order (`C` a multiple of `n`; the leading extents are the logical shape's). The scheme defines
 each struct's little-endian fields and the formula of its `n` elements, using the blocks above within the struct.
 
+**Transposed storage.** A scheme with the param `transposed` (`false` or `true`) whose value is `true` stores the
+logical tensor `[lead…, A, B]` as `S = [lead…, B, A]`: its view `[R, C]`, its parts' shapes and its formula all
+apply to `S`, and `value[lead…, a, b] = S[lead…, b, a]`. Its blocks therefore run along the logical axis −2. A
+producer that keeps a weight as `[out, in]` where its framework's tensor is `[in, out]` (gpt-oss) is read under
+the framework's key and shape. `mxfp4` has the param; ModelOpt's fused gpt-oss NVFP4 export (`[E, K/2, N]`) is
+the next user, through `nvfp4`.
+
 ### `fp8.tensorwise`
 
 - Params: `scale_dtype`: `F32`, `BF16` or `F16`, as the producer stored the scale.
@@ -324,14 +331,16 @@ Under `scale_fmt: ue8m0` every scale is a power of two, stored `F32` (DeepSeek-V
 
 The OCP Microscaling MXFP4 format: an E2M1 element per weight and a power-of-two scale per 32 consecutive elements of
 a row (the last block of a row may be short).
-- Params: `block_size: 32`.
-- Parts: `weight`: `F4`, the logical shape (§5's packing). `scale`: `F8_E8M0` on row blocks of 32, `row_major`.
+- Params: `block_size: 32`; `transposed`: `false` or `true` (transposed storage, above).
+- Parts: `weight`: `F4`, the logical shape, or `S` when `transposed` (§5's packing). `scale`: `F8_E8M0` on row
+  blocks of 32, `row_major`.
 - Decode, with `T` the 16 E2M1 values (§5): `round_L(T[q] × s(i, j))`.
 
 Every producer seen writes these bytes, the even element in the low nibble and the scales row-major: gpt-oss's
-`<module>_blocks` (`U8 [lead…, C/32, 16]`, a row's blocks in order) and `<module>_scales`, compressed-tensors'
-`weight_packed` and `weight_scale`, AMD Quark's `weight` and `weight_scale` (`pack_method: reorder`), MLX's `weight`
-(`U32` words, little-endian) and `scales`, and DeepSeek-V4's FP4 experts (`weight` `I8`, `scale`).
+`<module>_blocks` (`U8 [E, N, K/32, 16]`, a row's blocks in order) and `<module>_scales`, read as transformers'
+`<module>` `[E, K, N]` with `transposed: true`; compressed-tensors' `weight_packed` and `weight_scale`, AMD Quark's
+`weight` and `weight_scale` (`pack_method: reorder`), MLX's `weight` (`U32` words, little-endian) and `scales`, and
+DeepSeek-V4's FP4 experts (`weight` `I8`, `scale`).
 
 <!-- gguf.* -->
 

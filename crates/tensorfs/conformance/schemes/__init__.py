@@ -79,6 +79,11 @@ def _decode(dtype, shape, encoding, parts) -> bytes:
             raise fail(f"param {key}={params[key]!r}")
     if dtype not in ("F32", "BF16", "F16"):
         raise fail(f"logical dtype {dtype}")
+    # transposed: true (spec §6, building blocks): the parts hold the logical tensor with its last two axes
+    # swapped; the scheme reads that stored tensor, and its values are swapped back.
+    transposed = params.get("transposed") is True and len(shape) >= 2
+    if transposed:
+        shape = [*shape[:-2], shape[-1], shape[-2]]
     numel = int(np.prod(shape, dtype=np.int64))
     if scheme.flat:
         rows, cols = 1, numel
@@ -97,7 +102,10 @@ def _decode(dtype, shape, encoding, parts) -> bytes:
         fits = ps == list(want) if kind == "exact" else int(np.prod(ps, dtype=np.int64)) == want
         if pd not in names or not fits:
             raise fail(f"part {rule.role} is {pd} {ps}")
-    return round_l(dtype, np.asarray(scheme.decode(c), np.float32))
+    out = np.asarray(scheme.decode(c), np.float32)
+    if transposed:
+        out = out.reshape(shape).swapaxes(-1, -2)
+    return round_l(dtype, out)
 
 
 def round_l(dtype: str, x: np.ndarray) -> bytes:

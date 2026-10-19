@@ -1,5 +1,5 @@
 //! `mxfp4` (spec §6 `mxfp4`): OCP MXFP4, an E2M1 element per weight and an `F8_E8M0` scale
-//! per 32 elements of a row.
+//! per 32 elements of a row; `transposed` (the registry's) stores the last two axes swapped.
 
 use super::grid::{Grid, ScaleLayout};
 use super::{elem, logical, table, Allowed, Dtypes, Param, Part, Scheme, View};
@@ -14,10 +14,16 @@ const BLOCKS: Grid = Grid::Blocks {
 pub const MXFP4: Scheme = Scheme {
     name: "mxfp4",
     view: View::Matrix,
-    params: &[Param {
-        key: "block_size",
-        allowed: Allowed::Uint(&[32]),
-    }],
+    params: &[
+        Param {
+            key: "block_size",
+            allowed: Allowed::Uint(&[32]),
+        },
+        Param {
+            key: "transposed",
+            allowed: Allowed::Bool,
+        },
+    ],
     parts: &[
         Part::req("weight", Dtypes::Of(&["F4"]), logical),
         Part::req("scale", Dtypes::Of(&["F8_E8M0"]), |c| BLOCKS.shape(c)),
