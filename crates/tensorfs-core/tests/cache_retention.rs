@@ -189,7 +189,7 @@ fn collected(store: &Store, objects: &[ObjectRef]) {
             .pins()
             .unwrap()
             .iter()
-            .all(|(id, _)| !id.starts_with("hold-")),
+            .all(|(_, pin)| pin.owner.as_deref() != Some("tensorfs.native-retention/1")),
         "dead owner record was not reaped"
     );
 }
@@ -755,4 +755,98 @@ fn failed_managed_stream_retains_local_bytes_until_the_last_native_owner() {
     expire_managed_cache(&store);
     collected(&store, &[id, ObjectRef::of(LATE)]);
     collected(&store, &chunks);
+}
+
+#[test]
+fn manual_hold_prefix_pins_survive_while_native_owner_records_are_reaped() {
+    use tensorfs_core::store2::Pin;
+
+    let scratch = Scratch::new();
+    let store = scratch.store();
+    let mut raw = store.writer(None, Some("hold-operator")).unwrap();
+    raw.get("c")
+        .put(
+            "weight",
+            &Dtype::U8,
+            &[8],
+            Data::Plain(WriterSource::Read(&mut &b"operator"[..])),
+        )
+        .unwrap();
+    let operator = raw.commit().unwrap();
+    assert!(store
+        .get_pin("hold-operator")
+        .unwrap()
+        .unwrap()
+        .owner
+        .is_none());
+    let manual = store.put_bytes(b"a manually pinned object").unwrap();
+    let manual_id = format!("hold-{}-123-4", std::process::id());
+    store
+        .pin(&manual_id, &Pin::new(vec![manual.clone()]))
+        .unwrap();
+    let released: Vec<_> = store
+        .pins()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, pin)| pin.owner.as_deref() == Some("tensorfs.native-retention/1"))
+        .map(|(id, _)| id)
+        .collect();
+    assert!(
+        !released.is_empty(),
+        "committed Writer should leave a released hold for maintenance"
+    );
+    age(&store);
+    store.gc().unwrap();
+    for id in released {
+        assert!(
+            store.get_pin(&id).unwrap().is_none(),
+            "released Writer hold was not reaped"
+        );
+    }
+
+    let f = fixture(&scratch);
+    store.put_bytes(LATE).unwrap();
+    let ck = store.variant(&f.tree, Some("main")).unwrap();
+    let held: Vec<_> = store
+        .pins()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, pin)| pin.owner.as_deref() == Some("tensorfs.native-retention/1"))
+        .map(|(id, _)| id)
+        .collect();
+    assert!(!held.is_empty());
+    age(&store);
+    store.gc().unwrap();
+    for id in &held {
+        assert!(
+            store.get_pin(id).unwrap().is_some(),
+            "live native owner was reaped"
+        );
+    }
+    assert!(store.get_pin("hold-operator").unwrap().is_some());
+    assert!(store.get_pin(&manual_id).unwrap().is_some());
+    assert!(store.verify(&operator).unwrap());
+    assert!(store.verify(&manual).unwrap());
+
+    drop(ck);
+    age(&store);
+    store.gc().unwrap();
+    for id in held {
+        assert!(
+            store.get_pin(&id).unwrap().is_none(),
+            "released native owner was not reaped"
+        );
+    }
+    collected(&store, &f.held);
+    assert!(
+        store.get_pin("hold-operator").unwrap().is_some(),
+        "ordinary Writer key was mistaken for a native hold"
+    );
+    assert!(
+        store.get_pin(&manual_id).unwrap().is_some(),
+        "a synthetic-looking ordinary pin was mistaken for a native hold"
+    );
+    let raw = store.checkpoint(&operator).unwrap();
+    assert_eq!(raw.read("c", "weight").unwrap(), b"operator");
+    assert_eq!(store.read(&manual).unwrap(), b"a manually pinned object");
 }
