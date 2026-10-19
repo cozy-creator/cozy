@@ -596,6 +596,9 @@ impl Gpu {
     #[cfg(feature = "store")]
     pub fn register<'c>(self: &Arc<Self>, name: &str, ck: impl Into<Ck<'c>>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<WeightSet>> {
         let ck = ck.into();
+        if host_fd.is_none() && files.is_none() && ck.paths.is_none() {
+            return Err(Error::Invalid("a header parsed alone reads only a grant: chunk files or a sealed layout".into()));
+        }
         let (layout, source) = open_checkpoint(ck, regions, false, files)?;
         let host = host_fd.map(|fd| HostMem::adopt_sealed(fd, &layout)).transpose()?;
         if host.as_ref().is_some_and(|h| h.window().is_some()) {
@@ -1332,6 +1335,9 @@ impl Host {
     #[cfg(feature = "store")]
     pub fn register<'c>(&self, name: &str, ck: impl Into<Ck<'c>>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<HostSet>> {
         let ck = ck.into();
+        if host_fd.is_none() && files.is_none() && ck.paths.is_none() {
+            return Err(Error::Invalid("a header parsed alone reads only a grant: chunk files or a sealed layout".into()));
+        }
         let (layout, source) = open_checkpoint(ck, regions, false, files)?;
         let host = host_fd.map(|fd| HostMem::adopt_sealed(fd, &layout)).transpose()?;
         if host.as_ref().is_some_and(|h| h.window().is_some()) {
@@ -1432,9 +1438,10 @@ pub struct HostPinned {
 pub fn open_checkpoint(ck: Ck<'_>, regions: &[Vec<String>], direct_io: bool, files: Option<Vec<(ObjectRef, File)>>) -> Result<(Layout, Source)> {
     let components: Vec<&str> = regions.iter().flatten().filter_map(|t| t.split_once('/').map(|(c, _)| c)).collect();
     let plan = crate::checkpoint::read_plan(ck.header, &components);
-    let files = match files {
-        Some(f) => f,
-        None => crate::checkpoint::chunk_files(ck, &plan)?,
+    let files = match (files, ck.paths) {
+        (Some(f), _) => f,
+        (None, Some(_)) => crate::checkpoint::chunk_files(ck, &plan)?,
+        (None, None) => Vec::new(), // a parsed header's sealed layout: its holes have no source
     };
     Ok((Layout::build(&plan, regions)?, Source::files(files, direct_io, 0)))
 }
