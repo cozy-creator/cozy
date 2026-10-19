@@ -19,12 +19,23 @@ use crate::{Context, output, tui};
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct Measurements {
+    #[serde(deserialize_with = "lenient")]
     attribution: Attribution,
+    #[serde(deserialize_with = "lenient")]
     execution: Execution,
+    #[serde(deserialize_with = "lenient")]
     observations: Vec<Observation>,
     /// The models it ran, as its machine resolved them.
+    #[serde(deserialize_with = "lenient")]
     models: Vec<Model>,
+    #[serde(deserialize_with = "lenient")]
     memory: Memory,
+}
+
+/// A field of a shape this CLI does not read (`null`, a newer one) reads as empty: it never
+/// takes the other measurements with it.
+fn lenient<'de, D: serde::Deserializer<'de>, T: Default + serde::de::DeserializeOwned>(d: D) -> Result<T, D::Error> {
+    Ok(T::deserialize(serde_json::Value::deserialize(d)?).unwrap_or_default())
 }
 
 /// Its executor's memory (TensorD `memory::call::CallMemory`); `stats` is the executor's own:
@@ -33,6 +44,7 @@ struct Measurements {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct Memory {
+    #[serde(deserialize_with = "lenient")]
     stats: Stats,
 }
 
@@ -661,6 +673,17 @@ mod tests {
             .iter()
             .map(|r| r.iter().map(String::as_str).collect())
             .collect()
+    }
+
+    #[test]
+    fn a_field_of_another_shape_reads_empty_and_keeps_the_rest() {
+        let m = Measurements::deserialize(serde_json::json!({
+            "memory": {"stats": null}, "models": 7,
+            "execution": {"construction": {"legs_ms": {"construct": 12.0}}},
+        }))
+        .unwrap();
+        assert!(m.memory.stats.rows.is_empty() && m.models.is_empty());
+        assert_eq!(m.execution.construction.unwrap().legs_ms["construct"], 12.0);
     }
 
     #[test]
