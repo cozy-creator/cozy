@@ -122,7 +122,7 @@ fn made(ctx: &Context, run: &Run) {
     }
     let text = |key: &str| model[key].as_str().filter(|s| !s.is_empty());
     let mut record = Record::new();
-    for key in ["repository", "release", "lane", "manifest", "resolved"] {
+    for key in ["repository", "release", "lane", "checkpoint", "resolved"] {
         if let Some(value) = text(key) {
             record = record.field(key, value);
         }
@@ -130,7 +130,7 @@ fn made(ctx: &Context, run: &Run) {
     let published = &model["published"];
     let (destination, checkpoint) = (published["destination"].as_str(), published["checkpoint"].as_str());
     if let (Some(destination), Some(checkpoint)) = (destination, checkpoint) {
-        record = record.field("checkpoint", format!("{destination}#{checkpoint}"));
+        record = record.field("published", format!("{destination}#{checkpoint}"));
     }
     record.print(ctx);
     if let (Some(destination), Some(checkpoint)) = (destination, checkpoint)

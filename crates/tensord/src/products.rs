@@ -3,7 +3,8 @@
 //! actor and journals one `product` on the run's log, in that order, so every product a
 //! client reads can be fetched with ReadByteTreeObject. A single output's product is replaced
 //! by each publish (SET); a list output grows (APPEND). The returned result publishes only
-//! what the log does not already show.
+//! what the log does not already show. A weights output (`asset_kind` model) names the
+//! cozytensors header the Runtime wrote into the store.
 use crate::{
     api::domain,
     device_executor::{Answer, Frame},
@@ -18,6 +19,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 use crate::storage::{self, Store};
+use protocol::calcifer::CHECKPOINT;
 use tensorfs_core::{format::ObjectRef, sha256};
 
 const MAX_PARTS: usize = 128;
@@ -171,7 +173,11 @@ pub fn decode(stored: &StoredProduct) -> io::Result<domain::RunProduct> {
 /// The SDK's `publish` request during a running attempt: answers `Published`.
 pub fn publish(store: &Store, engine: &Engine, id: &str, spool: &Path, frame: &Frame) -> Answer {
     let mut answer = Answer::unavailable(frame.seq);
-    match commit(store, engine, id, spool, frame) {
+    let committed = match frame.asset_kind.as_str() {
+        "model" => model(store, engine, id, frame),
+        _ => commit(store, engine, id, spool, frame),
+    };
+    match committed {
         Ok((content, sequence)) => {
             answer.ok = true;
             answer.code.clear();
@@ -192,6 +198,59 @@ pub fn publish(store: &Store, engine: &Engine, id: &str, spool: &Path, frame: &F
     answer
 }
 
+/// The running execution's submission and its entrypoint's declaration.
+fn declared(engine: &Engine, id: &str) -> io::Result<(crate::journal::SubmissionContext, Value)> {
+    let record = engine.get(id)?;
+    let context = record
+        .submission
+        .ok_or_else(|| io::Error::other("only a public execution has an output log"))?;
+    let installed = engine
+        .installation_for_generation(&context.actor, &record.invocation.generation)?
+        .ok_or_else(|| io::Error::other("held installation interface absent"))?;
+    let interface: Value = serde_json::from_slice(&installed.interface).map_err(storage)?;
+    let entry = interface
+        .get("entrypoints")
+        .and_then(Value::as_array)
+        .and_then(|rows| rows.iter().find(|row| row.get("name").and_then(Value::as_str) == Some(&record.invocation.entrypoint)))
+        .cloned()
+        .ok_or_else(|| io::Error::other("declared entrypoint absent"))?;
+    Ok((context, entry))
+}
+
+/// A weights output the Runtime wrote into the store, as a product of its run's log: its content
+/// is the cozytensors header it names; the same header again adds nothing.
+fn model(store: &Store, engine: &Engine, id: &str, frame: &Frame) -> io::Result<(domain::Ref, u64)> {
+    let (_, entry) = declared(engine, id)?;
+    let outputs = entry.get("weights_outputs").and_then(Value::as_array).into_iter().flatten();
+    if !outputs.clone().any(|row| row.get("output_id").and_then(Value::as_str) == Some(&frame.output)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{:?} is not a declared weights output", frame.output)));
+    }
+    if frame.media_type != CHECKPOINT {
+        return Err(storage(format!("a weights output is {CHECKPOINT}, not {:?}", frame.media_type)));
+    }
+    storage::check_digest("weights output", &frame.digest, true)?;
+    let header = ObjectRef { sha256: frame.digest.trim_start_matches("sha256:").into(), length: frame.size_bytes };
+    if !storage::present(store, &header) {
+        return Err(storage(format!("this machine's store holds no checkpoint {}", header.id())));
+    }
+    store.checkpoint(&header).map_err(storage::io_error)?;
+    let content = domain::Ref { digest: unhex(&header.sha256)?, length: header.length };
+    let product = domain::RunProduct {
+        output: frame.output.clone(),
+        op: domain::RunProductOp::Set as i32,
+        media_type: CHECKPOINT.into(),
+        label: frame.output.clone(),
+        content: Some(content.clone()),
+        ..Default::default()
+    };
+    let sequence = engine.append_product(id, |prior| {
+        let prior = prior.iter().map(decode).collect::<io::Result<Vec<_>>>()?;
+        let held = prior.iter().rev().find(|p| p.output == product.output).is_some_and(|p| p.content.as_ref() == Some(&content));
+        Ok((!held).then(|| encode(&product)))
+    })?;
+    Ok((content, sequence))
+}
+
 fn commit(
     store: &Store,
     engine: &Engine,
@@ -199,25 +258,8 @@ fn commit(
     spool: &Path,
     frame: &Frame,
 ) -> io::Result<(domain::Ref, u64)> {
-    let record = engine.get(id)?;
-    let context = record
-        .submission
-        .as_ref()
-        .ok_or_else(|| io::Error::other("only a public execution has an output log"))?;
-    let installed = engine
-        .installation_for_generation(&context.actor, &record.invocation.generation)?
-        .ok_or_else(|| io::Error::other("held installation interface absent"))?;
-    let interface: Value = serde_json::from_slice(&installed.interface).map_err(storage)?;
-    let result = interface
-        .get("entrypoints")
-        .and_then(Value::as_array)
-        .and_then(|rows| {
-            rows.iter().find(|row| {
-                row.get("name").and_then(Value::as_str) == Some(&record.invocation.entrypoint)
-            })
-        })
-        .and_then(|entry| entry.get("result"))
-        .ok_or_else(|| io::Error::other("declared result schema absent"))?;
+    let (context, entry) = declared(engine, id)?;
+    let result = entry.get("result").ok_or_else(|| io::Error::other("declared result schema absent"))?;
     let op = output_op(result, &frame.output).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -307,33 +349,6 @@ fn commit(
         Ok(Some(encode(&product)))
     })?;
     Ok((content, sequence))
-}
-
-/// An adopted weights output as a product of its run's log: its bytes are the output's
-/// manifest (`weights::MANIFEST_MEDIA`), held in the machine's store; the same manifest
-/// adopted again adds nothing.
-pub fn record_manifest(engine: &Engine, id: &str, output: &str, manifest: &tensorfs_core::format::ObjectRef) -> io::Result<u64> {
-    let content = domain::Ref {
-        digest: unhex(&manifest.sha256)?,
-        length: manifest.length,
-    };
-    let product = domain::RunProduct {
-        output: output.into(),
-        op: domain::RunProductOp::Set as i32,
-        media_type: crate::weights::MANIFEST_MEDIA.into(),
-        label: output.into(),
-        content: Some(content.clone()),
-        ..Default::default()
-    };
-    engine.append_product(id, |prior| {
-        let prior = prior.iter().map(decode).collect::<io::Result<Vec<_>>>()?;
-        let held = prior
-            .iter()
-            .rev()
-            .find(|p| p.output == product.output)
-            .is_some_and(|current| current.content.as_ref() == Some(&content));
-        Ok((!held).then(|| encode(&product)))
-    })
 }
 
 /// The canonical body of one product event.

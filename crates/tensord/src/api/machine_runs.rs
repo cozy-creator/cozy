@@ -475,13 +475,13 @@ fn accept(runs: &Arc<crate::runs::Runs>, actor: &str, id: &str, spec: crate::run
 }
 
 /// `spec` reading `hub` under its capability, if any.
-fn reach(runs: &crate::runs::Runs, mut spec: crate::runs::Spec, hub: Option<v1::HubAccess>) -> Result<crate::runs::Spec, Error> {
+fn reach(_runs: &crate::runs::Runs, mut spec: crate::runs::Spec, hub: Option<v1::HubAccess>) -> Result<crate::runs::Spec, Error> {
     if let Some(hub) = hub {
         let invalid = |e: crate::hub::Refusal| refused("hub_access_invalid", &e.0);
-        let capability = match (hub.capability.is_empty(), &runs.leaf) {
-            (true, _) => None,
-            (false, Some(leaf)) => Some(crate::hub::Capability::new(&hub.capability, &hub.token_endpoint, leaf.clone()).map_err(invalid)?),
-            (false, None) => return Err(refused("hub_access_invalid", "this machine holds no key to trade a capability with")),
+        let capability = if hub.capability.is_empty() { None } else {
+            let capability = crate::hub::Capability::new(&hub.capability, &hub.token_endpoint, &hub.key).map_err(invalid)?;
+            capability.restore_token(&hub.access_token);
+            Some(capability)
         };
         let ca = Some(hub.ca_der).filter(|der| !der.is_empty());
         spec.hub = Some(crate::hub::Source::new(&hub.origin, ca, hub.object_hosts, capability).map_err(invalid)?);
@@ -493,6 +493,11 @@ fn reach(runs: &crate::runs::Runs, mut spec: crate::runs::Spec, hub: Option<v1::
 /// spec, or ends FAILED with why it cannot.
 pub(crate) fn resume(runs: &Arc<crate::runs::Runs>) -> std::io::Result<()> {
     for (run, actor, sent) in runs.service.engine.interrupted()? {
+        if runs.service.engine.with_journal(|journal| journal.metadata_pending(&run))? {
+            let failure = crate::journal::Failure::machine("metadata_preflight_interrupted", "the Runtime metadata phase ended before its credential handoff; send a new run");
+            runs.service.engine.end_preparation(&run, crate::journal::Outcome::Failed(failure))?;
+            continue;
+        }
         let spec = serde_json::from_slice(&sent)
             .map_err(|e| refused("preparation_interrupted", format!("its kept spec is unreadable: {e}")))
             .and_then(spec_of)
@@ -672,7 +677,7 @@ mod tests {
             inputs: vec![input("reference", "a", 0), input("reference", "b", 1)],
             models: vec![model("model", "org/first"), model("other", "org/second")],
             hub: Some(v1::HubAccess {
-                origin: "https://hub.example.test/".into(), capability: "e30.e30.c2ln".into(),
+                origin: "https://hub.example.test/".into(), capability: "e30.e30.c2ln".into(), key: "first-request-key".into(), access_token: "old-token".into(),
                 token_endpoint: "https://hub.example.test/v1/auth/oauth2/token".into(),
                 ca_der: vec![1], object_hosts: vec!["objects-1.example.test".into()],
             }),
@@ -690,7 +695,7 @@ mod tests {
         let mut resent = original.clone();
         resent.payload = v1::Json::parse(r#"{"nested":{"a":1,"b":2},"seed":9007199254740993}"#).ok();
         resent.hub = Some(v1::HubAccess {
-            origin: "https://hub.example.test".into(), capability: String::new(), token_endpoint: String::new(),
+            origin: "https://hub.example.test".into(), capability: String::new(), key: "second-request-key".into(), access_token: "new-token".into(), token_endpoint: String::new(),
             ca_der: vec![2], object_hosts: vec!["objects-2.example.test".into()],
         });
         resent.providers = None;
@@ -733,7 +738,7 @@ mod tests {
         let store = crate::storage::open(&root.join("store")).unwrap();
         let objects = Arc::new(crate::objects::Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
         let runs = Arc::new(crate::runs::Runs {
-            service: service.clone(), objects, publisher: None, local: None, own_hub: None, leaf: None, contexts: Default::default(),
+            service: service.clone(), objects, publisher: None, local: None, own_hub: None, contexts: Default::default(),
         });
         let held = authored();
         let (spec, access) = spec_of(held.clone()).unwrap();
@@ -745,6 +750,42 @@ mod tests {
         let refusal = accept(&runs, "alice", "run-2", spec, access).unwrap_err();
         assert_eq!(refusal.code, "hub_access_invalid");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metadata_handoff_is_private_and_an_interrupted_helper_is_not_replayed() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let service = crate::service::Service::open(&state, &root.path().join("generations"), 1).unwrap();
+        let store = crate::storage::open(&root.path().join("store")).unwrap();
+        let objects = Arc::new(crate::objects::Objects::new(&root.path().join("writes"), store, service.engine.clone()).unwrap());
+        let runs = Arc::new(crate::runs::Runs {
+            service: service.clone(), objects, publisher: None, local: None, own_hub: None, contexts: Default::default(),
+        });
+        let mut sent = authored();
+        sent.providers = None;
+        let (spec, _) = spec_of(sent.clone()).unwrap();
+        let accepted = service.engine.accept_run_objects("alice", "metadata-1", &spec.digest, Default::default(), &[], &spec.journaled).unwrap().0;
+        service.engine.with_journal(|j| j.begin_metadata(&accepted.id)).unwrap();
+        let mut access = sent.hub.clone().unwrap();
+        access.access_token = "bound-token-kept-only-in-access".into();
+        service.engine.with_journal(|j| j.complete_metadata(&accepted.id, &access)).unwrap();
+        assert!(!service.engine.with_journal(|j| j.metadata_pending(&accepted.id)).unwrap());
+        let restored = service.engine.interrupted().unwrap().into_iter().find(|(id, _, _)| id == &accepted.id).unwrap().2;
+        let restored: v1::RunSpec = serde_json::from_slice(&restored).unwrap();
+        assert_eq!(restored.hub.unwrap(), access);
+        let public = serde_json::to_string(&service.engine.get_public("alice", "metadata-1").unwrap()).unwrap();
+        assert!(!public.contains("bound-token-kept-only-in-access"));
+        assert!(!public.contains("first-request-key"));
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(state.join("execution/executions.sqlite3")).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let pending = service.engine.accept_run_objects("alice", "metadata-2", &spec.digest, Default::default(), &[], &spec.journaled).unwrap().0;
+        service.engine.with_journal(|j| j.begin_metadata(&pending.id)).unwrap();
+        resume(&runs).unwrap();
+        let failed = service.engine.get_public("alice", "metadata-2").unwrap();
+        assert_eq!(crate::journal::Failure::decode(&failed.failure.unwrap()).unwrap().code, "metadata_preflight_interrupted");
     }
 
     /// A digest of 64 non-hex bytes is refused, not sliced mid-character.

@@ -130,7 +130,7 @@ fn a_machines_logs_read_and_follow_what_it_did() {
     ]);
     assert_eq!(out.code, 0, "{out:?}");
     until("hf://hf-internal-testing/tiny-random-bert@");
-    let logs = machine.root().join("var/lib/tensorfs/logs");
+    let logs = machine.store().join("logs");
     let write = |text: &str| {
         use std::io::Write as _;
         let at = std::time::SystemTime::now()

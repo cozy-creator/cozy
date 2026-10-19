@@ -7,7 +7,7 @@ mod common;
 use std::{path::Path, sync::Arc};
 
 use calcifer::{Calcifer, machines::Machines};
-use hub_client::{Client, Credential, DeviceKey, P256Key, RunToken, UserSession, testing, types};
+use hub_client::{Client, Credential, DeviceKey, P256Key, UserSession, testing, types};
 use platform::paths::Home;
 use protocol::{
     calcifer::{Kind, On, SubmitRun},
@@ -145,11 +145,9 @@ async fn a_hub_is_listed_signed_in_and_a_rent_it_will_not_price_records_nothing(
     calcifer.close();
 }
 
-/// A run that publishes carries its owner's capability, minted at the send for its machine's TLS
-/// leaf: the machine (here the test, holding that leaf's key) trades it at the Hub's token
-/// endpoint and publishes into the run's destination, and nowhere else.
+/// Each send carries its own key and capability without contacting the machine's TLS leaf.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
+async fn a_runs_capability_is_bound_to_its_send_key() {
     let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
     // The job's SSL_CERT_FILE trusts the Hub's origin, which machines read too.
     let (Some(url), Some(log)) = (var("TENSORHUB_ORIGIN"), var("TENSORHUB_LOG")) else {
@@ -287,30 +285,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
         run_key.thumbprint(),
         P256Key::from_jwk(&resent.key).unwrap().thumbprint()
     );
-    let token = RunToken::new(&access.capability, &access.token_endpoint, run_key).unwrap();
-    let machine = Client::connect(
-        &origin,
-        reqwest::Client::new(),
-        Credential::Run(Arc::new(token)),
-    );
-    let declared = types::PublicationDeclaration {
-        objects: vec![types::DeclaredObject {
-            object_id: format!("sha256:{:x}", Sha256::digest(b"weights")),
-            length: 7,
-        }],
-    };
-    machine
-        .open_model_publication(&account, "model", "op-calcifer", &declared)
-        .await
-        .unwrap();
-    let elsewhere = machine
-        .open_model_publication(&account, "other", "op-other", &declared)
-        .await
-        .map_err(hub_client::Error::from);
-    assert!(
-        matches!(elsewhere, Err(hub_client::Error::Hub { status: 403, .. })),
-        "{elsewhere:?}"
-    );
+    // The real AuthKit trade is proved by tensord/tests/hub_oauth.rs and TensorFS's live endpoint suite.
     // Local code's org-relative references name this account: the machine got the run so.
     let (staged, local) = common::local_spec(home.path());
     let run = SubmitRun {

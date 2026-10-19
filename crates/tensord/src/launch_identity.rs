@@ -255,7 +255,7 @@ fn venv_home(python: &Path) -> io::Result<Option<PathBuf>> {
 
 /// Runtime `child_env.ERASED_PREFIXES`: inherited names no executor sees. The seal imposes
 /// the ones it needs after this erase, so no image or operator export can redirect them.
-const ERASED_PREFIXES: [&str; 17] = [
+const ERASED_PREFIXES: [&str; 18] = [
     "COZY_",
     "CUDA_",
     "PYTORCH_",
@@ -273,6 +273,7 @@ const ERASED_PREFIXES: [&str; 17] = [
     "MKL_",
     "FLASH_ATTENTION_",
     "TMPDIR",
+    "TENSORFS_",
 ];
 
 pub fn credential_name(name: &str) -> bool {
@@ -308,6 +309,8 @@ pub fn inherited() -> BTreeMap<String, String> {
 pub struct Seal {
     /// `CUDA_VISIBLE_DEVICES`; empty means no GPU.
     pub devices: String,
+    /// The shared TensorFS store, imposed independently of the worker's home.
+    pub tensorfs_home: Option<PathBuf>,
     pub threads: u32,
     /// Degree above one: NVLS off and GPU peer memory only over NVLink (Runtime cr-068).
     pub group: bool,
@@ -401,6 +404,7 @@ impl Seal {
         owned(kernels.join(format!("torch-kernels.{generation}")))?;
         Ok(Self {
             devices: devices.into(),
+            tensorfs_home: None,
             threads: DEFAULT_THREADS,
             group: false,
             home: owned(root.join("home").join(&namespace))?,
@@ -448,6 +452,9 @@ impl Seal {
         ]);
         // NVLink SHARP needs a privilege containers lack. The peer route is the Runtime's: it
         // measures the group's links and sets NCCL's P2P level before the group forms.
+        if let Some(root) = &self.tensorfs_home {
+            imposed.insert("TENSORFS_HOME".into(), path(root.clone()));
+        }
         if self.group {
             imposed.insert("NCCL_NVLS_ENABLE".into(), "0".into());
         }

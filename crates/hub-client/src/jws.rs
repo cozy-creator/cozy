@@ -45,6 +45,7 @@ pub(crate) fn signing_input(header: &Value, claims: &Value) -> String {
 }
 
 /// A JWS's claims, unverified: what a holder reads of a token it was handed.
+#[cfg(test)]
 pub(crate) fn claims(jws: &str) -> Option<Value> {
     let mut parts = jws.split('.');
     let (_, claims, _, None) = (parts.next()?, parts.next()?, parts.next()?, parts.next()) else {

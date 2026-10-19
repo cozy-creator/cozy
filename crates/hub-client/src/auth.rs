@@ -6,15 +6,12 @@ use std::sync::Arc;
 
 use crate::Client;
 use crate::device::UserSession;
-use crate::run::RunToken;
 
 #[derive(Clone)]
 pub enum Credential {
     Anonymous,
     /// A signed-in user: a Bearer from device-key login, minted again when stale or refused.
     User(Arc<UserSession>),
-    /// A run on a machine: the owner's capability, traded once for a DPoP-bound token.
-    Run(Arc<RunToken>),
     /// A fixed Bearer: an enrollment's email-proven token, for the calls only it may make.
     Bearer(String),
     /// A rental pod's worker capability, on the worker edge.
@@ -35,7 +32,6 @@ impl std::fmt::Debug for Auth {
         let kind = match &self.credential {
             Credential::Anonymous => "anonymous",
             Credential::User(_) => "user",
-            Credential::Run(_) => "run",
             Credential::Bearer(_) => "bearer",
             Credential::Worker { .. } => "worker",
         };
@@ -55,6 +51,18 @@ impl Client {
         Self::connect(self.baseurl(), self.client().clone(), Credential::Anonymous)
     }
 
+    /// The resource's authorization server, validated before a capability is minted.
+    pub async fn token_endpoint(&self) -> Result<String, crate::Error> {
+        let resource = self.get_protected_resource_metadata().await?.into_inner();
+        let issuer = resource.authorization_servers.first().map(|s| s.trim_end_matches('/'));
+        let server = self.get_openid_configuration().await?.into_inner();
+        if issuer != Some(server.issuer.trim_end_matches('/'))
+            || !server.grant_types_supported.iter().any(|g| g == "urn:ietf:params:oauth:grant-type:jwt-bearer") {
+            return Err(crate::Error::Answer("this Hub names no authorization server that takes run capabilities".into()));
+        }
+        Ok(server.token_endpoint)
+    }
+
     pub fn credential(&self) -> &Credential {
         &self.inner().credential
     }
@@ -67,18 +75,6 @@ impl Client {
                 // Login is itself a call through this client: boxed, as the future recurses.
                 let token = Box::pin(session.bearer(&self.anonymous())).await?;
                 vec![("authorization", format!("Bearer {token}"))]
-            }
-            Credential::Run(run) => {
-                let token = run.token(self.client()).await?;
-                let method = request.method().as_str().to_string();
-                let url = request.url();
-                run.present(
-                    &token,
-                    &method,
-                    url.host_str().unwrap_or_default(),
-                    url.path(),
-                )
-                .into()
             }
             Credential::Bearer(token) => vec![("authorization", format!("Bearer {token}"))],
             Credential::Worker { id, token } => {
@@ -139,7 +135,6 @@ impl Client {
                 session.refused(&token).await;
                 true
             }
-            Credential::Run(run) => run.answered(again.url(), &token, &response),
             _ => false,
         };
         if !retry {

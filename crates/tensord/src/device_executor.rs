@@ -167,11 +167,42 @@ pub struct ModelLoad {
     pub budgets: Budgets,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MetadataModel {
+    pub slot: String,
+    pub repo_id: String,
+    pub revision: String,
+    pub variant: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResolvedMetadata {
+    pub slot: String,
+    pub repo_id: String,
+    pub revision: String,
+    pub variant: String,
+    pub header: tensorfs_core::format::ObjectRef,
+    pub tree: Option<tensorfs_core::format::ObjectRef>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct AccessToken(pub String);
+impl std::fmt::Debug for AccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("AccessToken(..)") }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum DeviceCommand {
     Hello,
     Shutdown,
+    ResolveModels {
+        request_id: String,
+        store: PathBuf,
+        hub: Option<crate::hub::RuntimeHubAccess>,
+        models: Vec<MetadataModel>,
+    },
     Start {
         devices: String,
         application: String,
@@ -188,6 +219,9 @@ pub enum DeviceCommand {
         constructions: Vec<Construction>,
     },
     Load {
+        request_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hub: Option<crate::hub::RuntimeHubAccess>,
         construction: String,
         devices: String,
         sequence_parallel_degree: u32,
@@ -241,6 +275,8 @@ pub enum DeviceCommand {
         input_metadata: BTreeMap<String, Value>,
     },
     Invoke {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hub: Option<crate::hub::RuntimeHubAccess>,
         /// Retained asset capacity derived from the actual installed result schema.
         max_output_bytes: u64,
         request_id: String,
@@ -272,12 +308,10 @@ pub enum DeviceCommand {
         /// Degree 2 for this call; None leaves the executor's setting.
         #[serde(skip_serializing_if = "Option::is_none")]
         device_weights: Option<bool>,
-        /// Each `Weights[M]` parameter's checkpoint (`sha256:<hex>`), read through `weights_writer`.
+        /// Each `Weights[M]` parameter's checkpoint (`sha256:<hex>`, its header), which the
+        /// Runtime opens from the store itself.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         sources: BTreeMap<String, String>,
-        /// The weights outputs this attempt may write: output id to its byte bound.
-        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-        weights: BTreeMap<String, u64>,
     },
     Budget {
         vram_bytes: i64,
@@ -305,6 +339,8 @@ pub enum DeviceCommand {
     },
     Unload {
         construction: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        request_id: String,
     },
     Probe {
         collect: bool,
@@ -355,6 +391,7 @@ impl DeviceCommand {
         match self {
             Self::Hello => "hello",
             Self::Shutdown => "shutdown",
+            Self::ResolveModels { .. } => "resolve_models",
             Self::Start { .. } => "start",
             Self::Load { .. } => "load",
             Self::Activate { .. } => "activate",
@@ -402,10 +439,6 @@ pub enum Kind {
     ChildEvents,
     GpuRelease,
     ModelPrefetch,
-    /// An attempt's weights: one source read, one output written, or an output adopted.
-    WeightsWriter,
-    /// A fresh channel over the call's checkpoints held in part (`access::Fetch::channel`).
-    FetchChannel,
     /// A `progress` event carrying a retained `log` observation (`Telemetry.log`).
     Log,
     #[default]
@@ -718,10 +751,8 @@ pub struct Frame {
     pub numerics: String,
     pub local: String,
     pub cost_ms: f64,
-    /// `weights_writer`: `source`, `output` or `adopt`, its output and its transaction.
-    pub operation: String,
-    pub output_slot: String,
-    pub transaction: String,
+    pub resolved: Vec<ResolvedMetadata>,
+    pub access_token: Option<AccessToken>,
 }
 
 impl Frame {
@@ -807,17 +838,6 @@ pub struct Answer {
     pub byte_grants: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<Value>,
-    /// `Opened` (a weights output) and `Adopted`: its transaction, run and manifest.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub transaction: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub request_id: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub manifest: String,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub manifest_length: u64,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub receipt_digest: String,
     /// A memo hit: the entry's verified copy in the run's spool, and what producing it cost.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub local: String,
@@ -871,11 +891,6 @@ impl Answer {
             result: String::new(),
             byte_grants: Vec::new(),
             progress: None,
-            transaction: String::new(),
-            request_id: String::new(),
-            manifest: String::new(),
-            manifest_length: 0,
-            receipt_digest: String::new(),
             local: String::new(),
             cost_ms: 0.0,
             disputed: false,
@@ -2457,4 +2472,13 @@ mod codec_tests {
         drop(codec);
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn metadata_access_tokens_do_not_appear_in_frame_diagnostics() {
+        let reply: Frame = serde_json::from_value(serde_json::json!({
+            "ok": true, "access_token": "private-token-for-this-request"
+        })).unwrap();
+        assert_eq!(reply.access_token.as_ref().unwrap().0, "private-token-for-this-request");
+        assert!(!format!("{reply:?}").contains("private-token-for-this-request"));
+    }
+
 }

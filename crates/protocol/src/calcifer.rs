@@ -203,8 +203,8 @@ pub struct OutputItem {
     pub export_error: Option<String>,
 }
 
-/// A weights output's media type: its bytes are a checkpoint's manifest.
-pub const CHECKPOINT: &str = "application/vnd.cozy.model-manifest";
+/// A weights output's media type: its content is a cozytensors header.
+pub const CHECKPOINT: &str = "application/vnd.cozy.cozytensors";
 
 impl OutputItem {
     /// A checkpoint (a weights output) stays on the machine that wrote it, which uploads it to

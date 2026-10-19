@@ -56,7 +56,7 @@ impl Fixture {
         let mut writer = store.writer(None, Some(tag)).unwrap();
         for (key, n) in &tensors {
             let data = bytes_of(key, *n);
-            writer.put("unet", key, &Dtype::U8, &[*n as u64], Data::Plain(Source::Read(&mut data.as_slice()))).unwrap();
+            writer.get("unet").put(key, &Dtype::U8, &[*n as u64], Data::Plain(Source::Read(&mut data.as_slice()))).unwrap();
         }
         let manifest = writer.commit().unwrap();
         let checkpoint = store.checkpoint(&manifest).unwrap();
@@ -899,20 +899,21 @@ fn a_staged_region_waits_on_its_ticket_and_nothing_else_downloads() {
     use tensord::{held_models::Pulled, origin::{self, priority, Machine}, stop::Stop, storage};
     let fx = Fixture::new("fetched", &[2 * MIB, 3 * MIB, MIB + 7, 5 * MIB]);
     let manifest = fx.checkpoint.id().clone();
-    let model = names_hub::Model { repository: "acme/unet".into(), release: "1.0.0".into(), lane: "bf16".into(), manifest: manifest.clone() };
+    let model = names_hub::Model { repository: "acme/unet".into(), release: "1.0.0".into(), lane: "bf16".into(), header: manifest.clone() };
+    let tree = names_hub::trees(&fx.store, std::slice::from_ref(&model)).remove(0);
     let (origin, heard) = names_hub::paced(&fx.store, model, None, Duration::from_millis(30));
     let gets = || heard.lock().unwrap().iter().filter(|h| h.starts_with("GET /o/")).count();
     let root = std::env::temp_dir().join(format!("machine-tier-partial-{}", uuid::Uuid::new_v4()));
     let store = storage::open(&root).unwrap();
     let hub = tensord::hub::Source::new(&origin, None, vec!["localhost".into()], None).unwrap();
     let machine = Machine::new(store.clone(), None).unwrap();
-    let (remote, _) = origin::remote(&machine, &hub, "acme/unet", "1.0.0", "bf16", &manifest).unwrap();
+    let (remote, _) = origin::remote(&machine, &hub, "acme/unet", "1.0.0", "bf16", &tree).unwrap();
     machine.pull(&remote, &manifest, Some(&[]), priority::NOW, None, &Stop::default()).unwrap();
-    let pulled = Pulled { repository: "acme/unet".into(), release: "1.0.0".into(), lane: "bf16".into() };
+    let pulled = Pulled { repository: "acme/unet".into(), release: "1.0.0".into(), lane: "bf16".into(), tree: Some(tree) };
     storage::hold(&store, &storage::pin::model(&manifest.sha256), vec![manifest.clone()], Some(pulled.owner())).unwrap();
     let structure = gets();
     let tier = HostTier::new(store.clone(), HostTierConfig { fill_threads: 2, ttl: Duration::from_secs(3600) }, Box::new(Fixed(1 << 30))).unwrap();
-    let fetch = tensord::access::Fetch::new(machine, Some(hub), vec![fx.manifest.clone()], 1);
+    let fetch = tensord::access::Fetch::new(machine, Some(hub), 1);
     let (_executor, a) = Executor::spawn(&tier);
     let (plan, sha256, length) = fx.plan(&["unet"]);
     let cold = SealedRequest { sha256: &sha256, length, stage: Some(&[]) };

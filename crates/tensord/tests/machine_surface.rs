@@ -992,19 +992,11 @@ mod v1_api {
         manifest_digest
     }
 
-    /// The thumbprint of the leaf the machine's API presents: what the CLI pins and names as a
-    /// capability's `cnf.jkt`.
-    fn leaf_jkt(machine: &Machine) -> String {
-        let identity: serde_json::Value =
-            serde_json::from_slice(&fs::read(machine.root.join("config/identity/identity.json")).unwrap()).unwrap();
-        hub_client::P256Key::from_pem(identity["private_key_pem"].as_str().unwrap())
-            .unwrap()
-            .thumbprint()
-    }
+    fn request_key() -> hub_client::P256Key { hub_client::P256Key::generate() }
 
-    /// `cozy model quantize`'s shape on CPU: a job writes its declared weights output through
-    /// the machine's native writer channel and adopts it; the output is a product of its log
-    /// (the manifest). A warm run keeps that held checkpoint under a local alias.
+    /// `cozy model quantize`'s shape on CPU: a job's Runtime writes its declared weights output
+    /// into the machine's store and publishes its header, a product of its log. A warm run keeps
+    /// that held checkpoint under a local alias.
     #[tokio::test]
     async fn a_job_writes_a_weights_output_kept_under_a_local_alias() {
         let (machine, tools) = installing_machine().await;
@@ -1037,11 +1029,11 @@ mod v1_api {
             .iter()
             .find(|p| p.output == "model")
             .unwrap_or_else(|| panic!("{done:?}"));
-        assert_eq!(written.media_type, "application/vnd.cozy.model-manifest");
+        assert_eq!(written.media_type, protocol::calcifer::CHECKPOINT);
         let result: serde_json::Value = json(&done.result);
         assert!(result.to_string().contains(&written.digest), "{result} names {written:?}");
         // A writer is never memoized: the same call runs again. Its derivation replays the
-        // committed transaction of the same code and declaration, so its output is the same.
+        // committed output of the same code and declaration, so its output is the same.
         assert!(!done.memoized && done.computation_digest.is_empty(), "{done:?}");
         let events = collect(run_events(&client, &all, run("weights-again", job.clone())).await.unwrap())
             .await
@@ -1051,14 +1043,6 @@ mod v1_api {
         assert!(!again.memoized && again.computation_digest.is_empty(), "{again:?}");
         let rewritten = again.outputs.iter().find(|p| p.output == "model").unwrap();
         assert_eq!((&rewritten.digest, rewritten.length), (&written.digest, written.length));
-        let journal = Journal::open(&machine.root.join("state/execution")).unwrap();
-        let transaction = |id: &str| {
-            let record = journal.get_public(&actor(), id).unwrap();
-            journal.derived_outputs(&record.id).unwrap().into_iter().map(|b| b.transaction).collect::<Vec<_>>()
-        };
-        assert_eq!(transaction("weights-again").len(), 1);
-        assert!(transaction("weights").is_empty(), "the transaction passed to the later run");
-        drop(journal);
         // A parameter that is not a weight is the request too: the same function, slot and
         // derivation with another size derives anew, never replaying the first output.
         let wider = v1::RunSpec { payload: v1::Json::parse(r#"{"size":128}"#).ok(), ..job.clone() };
@@ -1067,14 +1051,6 @@ mod v1_api {
         assert_eq!(widened.status, "succeeded", "{widened:?}");
         let other = widened.outputs.iter().find(|p| p.output == "model").unwrap();
         assert_ne!(other.digest, written.digest, "a size-128 table replayed the size-64 output");
-        let journal = Journal::open(&machine.root.join("state/execution")).unwrap();
-        let transaction = |id: &str| {
-            let record = journal.get_public(&actor(), id).unwrap();
-            journal.derived_outputs(&record.id).unwrap().into_iter().map(|b| b.transaction).collect::<Vec<_>>()
-        };
-        let (first, wide) = (transaction("weights-again"), transaction("weights-wider"));
-        assert!(wide.len() == 1 && wide != first, "{first:?} {wide:?}");
-        drop(journal);
         let held = tensorfs_core::store2::Store::open(machine.store()).unwrap();
         let reference = tensorfs_core::format::ObjectRef {
             sha256: written.digest.trim_start_matches("sha256:").into(),
@@ -1226,10 +1202,11 @@ mod v1_api {
 
     /// A one-tensor checkpoint of `n` f32 elements a model slot constructs from, and its config.
     fn constructible(store: &tensorfs_core::store2::Store, n: usize) -> tensorfs_core::format::ObjectRef {
-        use tensorfs_core::{format::Dtype, writer::{Data, Source}};
+        use tensorfs_core::{format::{ConfigValue, Dtype}, writer::{Data, Source}};
         let mut writer = store.writer(None, None).unwrap();
-        writer.put("model", "weight", &Dtype::F32, &[n as u64], Data::Plain(Source::Read(&mut vec![5u8; 4 * n].as_slice()))).unwrap();
-        writer.file("model/config.json", serde_json::json!({"n": n}).to_string().as_bytes()).unwrap();
+        let config = tensorfs_core::format::Config::from_iter([("n".to_string(), ConfigValue::from(n))]);
+        let mut model = writer.component("model", "", config, None).unwrap();
+        model.put("weight", &Dtype::F32, &[n as u64], Data::Plain(Source::Read(&mut vec![5u8; 4 * n].as_slice()))).unwrap();
         writer.commit().unwrap()
     }
 
@@ -1255,7 +1232,7 @@ mod v1_api {
                 "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home},
                 "models": [{"package": "local/tensord-gpu-calls", "slot": "modeled.models.model",
                     "repository": "local/tiny", "release": "1", "lane": "f32",
-                    "manifest": manifest.id(), "components": ["model"]}]}).to_string()).unwrap();
+                    "revision": manifest.id(), "components": ["model"]}]}).to_string()).unwrap();
         }, &args).await;
         let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
@@ -1330,7 +1307,7 @@ mod v1_api {
                 "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home},
                 "models": [{"package": "local/tensord-gpu-calls", "slot": "resident.models.model",
                     "repository": "local/weight", "release": "1", "lane": "f32",
-                    "manifest": manifest.id(), "components": ["model"]}]}).to_string()).unwrap();
+                    "revision": manifest.id(), "components": ["model"]}]}).to_string()).unwrap();
         }, &args).await;
         let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
@@ -1413,7 +1390,7 @@ mod v1_api {
         let source = std::env::temp_dir().join(format!("cm-update-{}", uuid::Uuid::new_v4()));
         let store = tensorfs_core::store2::Store::open(&source).unwrap();
         let model = names_hub::Model { repository: "acme/weight".into(), release: "1".into(), lane: "f32".into(),
-            manifest: constructible(&store, (weight_mib << 18) as usize) };
+            header: constructible(&store, (weight_mib << 18) as usize) };
         let release = |release: &str| names_hub::Package {
             name: format!("acme/{}", FIXTURE.1), release: release.into(), interface: interface.clone(),
             wheel: wheel.file_name().unwrap().to_str().unwrap().into(), bytes: fs::read(&wheel).unwrap(), callees: vec![],
@@ -1467,11 +1444,12 @@ mod v1_api {
         let (upstream, hub) = hub_oauth::test_hub();
         let authkit = hub_oauth::AuthKit::start(&upstream);
         let (machine, tools) = installing_machine().await;
-        let jkt = leaf_jkt(&machine);
+        let request_key = request_key();
+        let jkt = request_key.thumbprint();
         let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         let manifest = write_package(&client, &all, "cpu_weights", "local/tensord-cpu-weights").await;
-        let ops = serde_json::json!([{"type": "tensorhub_model_publish", "model": "acme/tiny"}]);
+        let ops = serde_json::json!([{"type": "tensorhub_model_upload", "model": "acme/tiny"}]);
         let spec = v1::RunSpec {
             kind: v1::RunKind::Call,
             source: Some(v1::Source::Local(v1::LocalSource { manifest })),
@@ -1482,6 +1460,7 @@ mod v1_api {
                 origin: authkit.hub.clone(),
                 object_hosts: vec!["localhost".into()],
                 capability: authkit.capability(&jkt, &ops, 600),
+                key: request_key.private_jwk(),
                 token_endpoint: authkit.token_endpoint.clone(),
                 ..Default::default()
             }),
@@ -1516,18 +1495,19 @@ mod v1_api {
         let machine = Machine::start_with(|state, _| {
             let store = tensorfs_core::store2::Store::open(state.join("tensorfs")).unwrap();
             let manifest = hub_oauth::checkpoint(&store, &[7; 8192]);
-            tensord::storage::set_local(&store, "tiny", &manifest).unwrap();
-            held = Some(manifest.id());
+            tensord::storage::set_local(&store, "tiny", &manifest, &Default::default()).unwrap();
+            held = Some(tensord::storage::local_tree(&store, "local/tiny").unwrap().unwrap().id());
         })
         .await;
         let manifest = held.unwrap();
-        let jkt = leaf_jkt(&machine);
+        let request_key = request_key();
+        let jkt = request_key.thumbprint();
         let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
             ..Default::default()
         });
-        let ops = serde_json::json!([{"type": "tensorhub_model_publish", "model": "acme/tiny"}]);
+        let ops = serde_json::json!([{"type": "tensorhub_model_upload", "model": "acme/tiny"}]);
         let upload = |id: &str, capability: String| RunRequest {
             id: id.into(),
             after: 0,
@@ -1543,6 +1523,7 @@ mod v1_api {
                     origin: authkit.hub.clone(),
                     object_hosts: vec!["localhost".into()],
                     capability,
+                    key: request_key.private_jwk(),
                     token_endpoint: authkit.token_endpoint.clone(),
                     ..Default::default()
                 }),
@@ -1628,7 +1609,7 @@ mod v1_api {
             repository: "acme/model".into(),
             release: "1.0.0".into(),
             lane: "bf16".into(),
-            manifest: manifest.clone(),
+            header: manifest.clone(),
         };
         let package = names_hub::Package {
             name: "acme/pkg".into(),
@@ -1672,7 +1653,7 @@ mod v1_api {
         let result: serde_json::Value = json(&done.result);
         let row = &result["models"][0];
         assert_eq!(result["release"], "1.0.0");
-        assert_eq!((&row["release"], &row["lane"], &row["manifest"]), (&"1.0.0".into(), &"bf16".into(), &manifest.id().into()));
+        assert_eq!((&row["release"], &row["lane"], &row["checkpoint"]), (&"1.0.0".into(), &"bf16".into(), &manifest.id().into()));
         let cold = take();
         for asked in [
             "GET /v1/packages/acme/pkg",
@@ -1766,7 +1747,7 @@ mod v1_api {
                 .collect();
             let weights: Vec<&[u8]> = bodies.iter().map(Vec::as_slice).collect();
             let manifest = hub_oauth::tensors(&store, &weights);
-            let model = names_hub::Model { repository: name.into(), release: "1.0.0".into(), lane: "bf16".into(), manifest };
+            let model = names_hub::Model { repository: name.into(), release: "1.0.0".into(), lane: "bf16".into(), header: manifest };
             names_hub::serve(&store, model, None).0
         };
         let origins = [model("acme/first", 1), model("acme/second", 2)];
@@ -1815,13 +1796,17 @@ mod v1_api {
             repository: "acme/private".into(),
             release: "1.0.0".into(),
             lane: "bf16".into(),
-            manifest: manifest.clone(),
+            header: manifest,
         };
+        // The owner's tree, by hash.
+        let manifest = names_hub::trees(&store, std::slice::from_ref(&model)).remove(0);
         let (upstream, heard) = names_hub::serve(&store, model, None);
         let authkit = hub_oauth::AuthKit::start(&upstream);
         let machine = Machine::start().await;
         let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let request_key = request_key();
+        let jkt = request_key.thumbprint();
         let spec = |capability: String| v1::RunSpec {
             kind: v1::RunKind::Warm,
             models: vec![v1::ModelChoice {
@@ -1835,14 +1820,14 @@ mod v1_api {
                 origin: authkit.hub.clone(),
                 object_hosts: vec!["localhost".into()],
                 capability,
+                key: request_key.private_jwk(),
                 token_endpoint: authkit.token_endpoint.clone(),
                 ..Default::default()
             }),
             owner: "alice".into(),
             ..Default::default()
         };
-        let read = |manifest: &str| serde_json::json!([{"type": "tensorhub_model_read", "model": "acme/private", "manifest": manifest}]);
-        let jkt = leaf_jkt(&machine);
+        let read = |manifest: &str| serde_json::json!([{"type": "tensorhub_model_read", "model": "acme/private", "revision": manifest}]);
 
         let other = authkit.capability(&jkt, &read(&format!("sha256:{}", "ab".repeat(32))), 600);
         let done = settle(&client, &all, "private-1", spec(other)).await;
@@ -1878,8 +1863,9 @@ mod v1_api {
         let (upstream, hub) = hub_oauth::test_hub();
         let authkit = hub_oauth::AuthKit::start(&upstream);
         let machine = Machine::start().await;
-        let ops = serde_json::json!([{"type": "tensorhub_model_publish", "model": "acme/tiny"}]);
-        let capability = authkit.capability(&leaf_jkt(&machine), &ops, 600);
+        let ops = serde_json::json!([{"type": "tensorhub_model_upload", "model": "acme/tiny"}]);
+        let request_key = request_key();
+        let capability = authkit.capability(&request_key.thumbprint(), &ops, 600);
         let client = client(&machine);
         let all = cap(Grant {
             action: MACHINE.into(),
@@ -1897,6 +1883,7 @@ mod v1_api {
                 origin: authkit.hub.clone(),
                 object_hosts: vec!["localhost".into()],
                 capability,
+                key: request_key.private_jwk(),
                 token_endpoint: authkit.token_endpoint.clone(),
                 ..Default::default()
             }),
@@ -1916,10 +1903,9 @@ mod v1_api {
         let result: serde_json::Value = json(&done.result);
         let model = &result["models"][0];
         assert_eq!(model["published"]["destination"], "acme/tiny");
-        assert_eq!(model["published"]["checkpoint"], model["manifest"]);
         let held = hub.lock().unwrap();
         assert_eq!(held.credentialed_uploads, 0);
-        assert_eq!(held.finalized, [model["manifest"].as_str().unwrap()]);
+        assert_eq!(held.finalized, [model["published"]["checkpoint"].as_str().unwrap()], "the made model's tree");
         assert!(held.declared.contains(&held.finalized[0]));
         let mut uploaded: Vec<_> = held.uploaded.keys().cloned().collect();
         let mut declared = held.declared.clone();
@@ -1976,8 +1962,8 @@ mod v1_api {
         let model = &result["models"][0];
         assert_eq!(model["published"]["destination"], "local/unet", "{result}");
         let store = tensorfs_core::store2::Store::open(machine.store()).unwrap();
-        let manifest = tensord::storage::local(&store, "unet").unwrap().unwrap();
-        assert_eq!(model["manifest"], manifest.id());
+        let header = tensord::storage::local(&store, "unet").unwrap().unwrap();
+        assert_eq!(model["checkpoint"], header.id());
     }
 
     /// A job's input tree (`--asset field=dir`, a `Tree` field): each file and the tree's manifest
@@ -2804,7 +2790,7 @@ mod v1_api {
         let store = tensorfs_core::store2::Store::open(&source).unwrap();
         let model = names_hub::Model {
             repository: "acme/model".into(), release: "1.0.0".into(), lane: "bf16".into(),
-            manifest: hub_oauth::checkpoint(&store, &[5; 8192]),
+            header: hub_oauth::checkpoint(&store, &[5; 8192]),
         };
         let package = names_hub::Package {
             name: "acme/tensord-cpu-caller".into(), release: "0.1.0".into(),

@@ -251,8 +251,8 @@ impl Endpoint {
                 None => (None, None),
             };
             // A lost answer, or another writer that wrote the same: it is there.
-            if sent.is_some() && old == sent {
-                return Ok(sent.expect("compared"));
+            if let Some(applied) = sent.as_ref().filter(|applied| old.as_ref() == Some(*applied)) {
+                return Ok(applied.clone());
             }
             let new = change(old.clone())?.unwrap_or_else(|| Repo::new(name));
             if !new.name.eq_ignore_ascii_case(name) {

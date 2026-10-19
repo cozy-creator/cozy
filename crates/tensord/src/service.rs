@@ -405,9 +405,6 @@ impl Service {
     pub fn reclaim(&self) -> crate::reclaim::Swept {
         // Released Write roots first, so the store's GC can collect their bytes.
         if let Some(calls) = self.calls() {
-            if let Err(error) = calls.sweep_canceled_outputs(&self.engine) {
-                tracing::warn!("reclaim canceled native outputs: {error}");
-            }
             if let Err(error) = calls.sweep_objects() {
                 tracing::warn!("reclaim object roots: {error}");
             }
