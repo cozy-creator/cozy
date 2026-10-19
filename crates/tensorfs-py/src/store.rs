@@ -1,4 +1,4 @@
-//! `tensorfs`: the store, checkpoints, the writer and the error families (design §1), typed in
+//! `tensorfs`: the store, checkpoints, the component writer and the error families, typed in
 //! `_ext.pyi`. Marshal only: every call that moves bytes runs detached from the GIL.
 
 use std::ffi::{c_void, CStr};
@@ -9,12 +9,12 @@ use std::time::Duration;
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
 use pyo3::{create_exception, ffi};
 use tensorfs_core::client::{self, ImportOptions, Named, PullFrom};
 use tensorfs_core::export;
 use tensorfs_core::failure::{Failure, Kind};
-use tensorfs_core::format::{Body, Dtype, Encoding, Header, Metadata, Value};
+use tensorfs_core::format::{Body, Config, ConfigValue, Dtype, Encoding, Header, Metadata, Tensor, Value};
 use tensorfs_core::store2::{Checkpoint, Store};
 use tensorfs_core::writer::{Data, PartData, Source, Writer};
 
@@ -164,72 +164,84 @@ impl Bytes {
     }
 }
 
+// ---------------------------------------------------------------- configs
+
+fn config_to_py<'py>(py: Python<'py>, v: &ConfigValue) -> PyResult<Bound<'py, PyAny>> {
+    Ok(match v {
+        ConfigValue::Null => py.None().into_bound(py),
+        ConfigValue::Bool(b) => PyBool::new(py, *b).to_owned().into_any(),
+        ConfigValue::Int(i) => to_py(py, &Value::Int(*i))?,
+        ConfigValue::Float(f) => PyFloat::new(py, *f).into_any(),
+        ConfigValue::Str(s) => PyString::new(py, s).into_any(),
+        ConfigValue::List(items) => {
+            let items = items.iter().map(|v| config_to_py(py, v)).collect::<PyResult<Vec<_>>>()?;
+            PyList::new(py, items)?.into_any()
+        }
+        ConfigValue::Map(map) => config_dict(py, map)?.into_any(),
+    })
+}
+
+fn config_dict<'py>(py: Python<'py>, map: &Config) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    for (k, v) in map {
+        dict.set_item(k, config_to_py(py, v)?)?;
+    }
+    Ok(dict)
+}
+
+fn config_from_py(obj: &Bound<'_, PyAny>) -> PyResult<ConfigValue> {
+    if obj.is_none() {
+        return Ok(ConfigValue::Null);
+    }
+    if let Ok(f) = obj.cast::<PyFloat>() {
+        return Ok(ConfigValue::Float(f.value()));
+    }
+    if let Ok(d) = obj.cast::<PyDict>() {
+        return Ok(ConfigValue::Map(config_map(d)?));
+    }
+    if !obj.is_instance_of::<PyString>() {
+        if let Ok(items) = obj.extract::<Vec<Bound<'_, PyAny>>>() {
+            return Ok(ConfigValue::List(items.iter().map(config_from_py).collect::<PyResult<_>>()?));
+        }
+    }
+    Ok(match from_py(obj)? {
+        Value::Bool(b) => ConfigValue::Bool(b),
+        Value::Int(i) => ConfigValue::Int(i),
+        Value::Str(s) => ConfigValue::Str(s),
+        _ => unreachable!("lists and dicts are taken above"),
+    })
+}
+
+fn config_map(d: &Bound<'_, PyDict>) -> PyResult<Config> {
+    let mut map = Config::new();
+    for (k, v) in d.iter() {
+        map.insert(k.extract()?, config_from_py(&v)?);
+    }
+    Ok(map)
+}
+
 // ---------------------------------------------------------------- references
 
-/// What a ref-taking call was handed: a `Manifest`, or a reference string.
-fn named(store: &Store, reference: &Bound<'_, PyAny>, lane: Option<&str>) -> PyResult<Named> {
+/// What a ref-taking call was handed: a stored `Checkpoint`, or a reference string.
+fn named(store: &Store, reference: &Bound<'_, PyAny>, variant: Option<&str>) -> PyResult<Named> {
     let py = reference.py();
-    if let Ok(m) = reference.cast::<PyManifest>() {
-        return Ok(m.get().named.clone());
+    if let Ok(ck) = reference.cast::<PyCheckpoint>() {
+        if let Some(named) = &ck.get().named {
+            return Ok(named.clone());
+        }
     }
     match reference.extract::<String>() {
-        Ok(text) => py.detach(|| store.resolve(&text, lane)).or_raise(py),
+        Ok(text) => py.detach(|| store.resolve(&text, variant)).or_raise(py),
         Err(_) => Err(invalid(
             py,
-            "a ref is a Manifest or a string (org/name[@release], sha256:<hex>)",
+            "a ref is a stored Checkpoint or a string (org/name[@release], sha256:<hex>)",
         )),
     }
 }
 
-/// A checkpoint's manifest, and the ref, release and lane naming it when one does.
-#[pyclass(name = "Manifest", module = "tensorfs", frozen)]
-pub struct PyManifest {
-    named: Named,
-}
-
-#[pymethods]
-impl PyManifest {
-    #[getter]
-    fn sha256(&self) -> &str {
-        &self.named.manifest.sha256
-    }
-    #[getter]
-    fn length(&self) -> u64 {
-        self.named.manifest.length
-    }
-    #[getter]
-    fn name(&self) -> Option<&str> {
-        self.named.name.as_deref()
-    }
-    #[getter]
-    fn release(&self) -> Option<&str> {
-        self.named.release.as_deref()
-    }
-    #[getter]
-    fn lane(&self) -> Option<&str> {
-        self.named.lane.as_deref()
-    }
-    fn __str__(&self) -> String {
-        format!("sha256:{}", self.named.manifest.sha256)
-    }
-    fn __repr__(&self) -> String {
-        match &self.named.name {
-            Some(name) => format!(
-                "Manifest({name}@{}, sha256:{})",
-                self.named.release.as_deref().unwrap_or(""),
-                self.named.manifest.sha256
-            ),
-            None => format!("Manifest(sha256:{})", self.named.manifest.sha256),
-        }
-    }
-    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
-        other
-            .cast::<PyManifest>()
-            .is_ok_and(|o| o.get().named.manifest == self.named.manifest)
-    }
-    fn __hash__(&self) -> u64 {
-        u64::from_str_radix(&self.named.manifest.sha256[..16], 16).unwrap_or(0)
-    }
+fn opened(py: Python<'_>, store: &Store, named: Named) -> PyResult<PyCheckpoint> {
+    let ck = py.detach(|| store.checkpoint(&named.header)).or_raise(py)?;
+    Ok(PyCheckpoint::new(ck.header().clone(), Some(ck), Some(named)))
 }
 
 // ---------------------------------------------------------------- the store
@@ -257,8 +269,8 @@ impl PyStore {
         self.store.root().to_path_buf()
     }
 
-    /// Imports `src` (a file, directory, `hf://`, `civitai://` or URL; or several) and refs it
-    /// as `name` (`local/<its name>` by default).
+    /// Imports `src` (a file, directory, `hf://`, `civitai://` or URL; or several) and names it
+    /// `name` (`local/<its name>` by default), release 1, variant its main dtype.
     #[pyo3(signature = (src, name = None, converter = None, variant = None))]
     fn import_(
         &self,
@@ -267,7 +279,7 @@ impl PyStore {
         name: Option<String>,
         converter: Option<String>,
         variant: Option<String>,
-    ) -> PyResult<PyManifest> {
+    ) -> PyResult<PyCheckpoint> {
         let sources: Vec<String> = match src.extract::<String>() {
             Ok(one) => vec![one],
             Err(_) => src.extract()?,
@@ -281,21 +293,21 @@ impl PyStore {
         let named = py
             .detach(|| self.store.import_named(&sources, &opts))
             .or_raise(py)?;
-        Ok(PyManifest { named })
+        opened(py, &self.store, named)
     }
 
-    /// Pulls `ref` (`org/name[@release]`) from Tensorhub (`hub`, else tensorhub.com; `token`
-    /// reads private checkpoints), or from a static `origin`'s URL or directory.
-    #[pyo3(signature = (r#ref, lane = None, origin = None, hub = None, token = None))]
+    /// Pulls `ref` (`org/name[@release]`) and its `variant` from Tensorhub (`hub`, else
+    /// tensorhub.com; `token` reads private trees), or from a static `origin`'s URL or directory.
+    #[pyo3(signature = (r#ref, variant = None, origin = None, hub = None, token = None))]
     fn pull(
         &self,
         py: Python<'_>,
         r#ref: String,
-        lane: Option<String>,
+        variant: Option<String>,
         origin: Option<String>,
         hub: Option<String>,
         token: Option<String>,
-    ) -> PyResult<PyManifest> {
+    ) -> PyResult<PyCheckpoint> {
         let from = match (&origin, &hub, &token) {
             (Some(origin), None, None) => PullFrom::Origin(origin),
             (None, hub, token) => PullFrom::Hub {
@@ -305,48 +317,46 @@ impl PyStore {
             _ => return Err(invalid(py, "a static origin takes no hub or token")),
         };
         let pulled = py
-            .detach(|| self.store.pull(from, &r#ref, lane.as_deref()))
+            .detach(|| self.store.pull(from, &r#ref, variant.as_deref()))
             .or_raise(py)?;
-        Ok(PyManifest {
-            named: pulled.named,
-        })
+        opened(py, &self.store, pulled.named)
     }
 
-    #[pyo3(signature = (r#ref, lane = None))]
-    fn checkpoint(
-        &self,
-        py: Python<'_>,
-        r#ref: &Bound<'_, PyAny>,
-        lane: Option<String>,
-    ) -> PyResult<PyCheckpoint> {
-        let named = named(&self.store, r#ref, lane.as_deref())?;
-        let ck = py
-            .detach(|| self.store.checkpoint(&named.manifest))
-            .or_raise(py)?;
-        Ok(PyCheckpoint {
-            header: ck.header().clone(),
-            stored: Some((ck, named)),
-            tensors: OnceLock::new(),
-        })
+    /// The cozytensors `ref` names: `org/name[@release]` (its `variant`, else the release's
+    /// only one), or `sha256:<hex>` of a tree or a header.
+    #[pyo3(signature = (r#ref, variant = None))]
+    fn checkpoint(&self, py: Python<'_>, r#ref: &Bound<'_, PyAny>, variant: Option<String>) -> PyResult<PyCheckpoint> {
+        let named = named(&self.store, r#ref, variant.as_deref())?;
+        opened(py, &self.store, named)
     }
 
-    /// A writer of a new checkpoint, carrying `base`'s tensors and files; with `key`, it resumes
-    /// what an interrupted writer of that key wrote.
+    /// Names `ck` (a stored checkpoint) as `variant` (by default its main dtype) of `repo`'s
+    /// release `version`, here: the release's tree gains it.
+    #[pyo3(signature = (repo, version, ck, variant = None))]
+    fn name(&self, py: Python<'_>, repo: String, version: String, ck: &PyCheckpoint, variant: Option<String>) -> PyResult<PyCheckpoint> {
+        let header = ck.stored(py)?.id().clone();
+        let named = py
+            .detach(|| self.store.set_variant(&repo, &version, variant.as_deref(), &header, &Default::default()))
+            .or_raise(py)?;
+        opened(py, &self.store, named)
+    }
+
+    /// A writer of a new cozytensors, carrying `base`'s components, tensors and assets; with
+    /// `key`, it resumes what an interrupted writer of that key wrote.
     #[pyo3(signature = (base = None, key = None))]
-    fn writer(
-        &self,
-        py: Python<'_>,
-        base: Option<&Bound<'_, PyAny>>,
-        key: Option<String>,
-    ) -> PyResult<PyWriter> {
-        let base = base
-            .map(|b| named(&self.store, b, None))
-            .transpose()?
-            .map(|n| n.manifest);
+    fn writer(&self, py: Python<'_>, base: Option<&Bound<'_, PyAny>>, key: Option<String>) -> PyResult<PyWriter> {
+        let base = match base {
+            Some(b) => {
+                let named = named(&self.store, b, None)?;
+                Some(py.detach(|| self.store.checkpoint(&named.header)).or_raise(py)?)
+            }
+            None => None,
+        };
         let w = py
             .detach(|| self.store.writer(base.as_ref(), key.as_deref()))
             .or_raise(py)?;
         Ok(PyWriter {
+            store: self.store.clone(),
             w: Mutex::new(Some(w)),
         })
     }
@@ -354,7 +364,7 @@ impl PyStore {
     /// Writes `ref` into `dir` as a Diffusers/Transformers folder (encoded tensors keep their
     /// parts unless `dequantize` names F32, BF16 or F16), or with `origin=True` as the static
     /// origin layout instead. Returns the paths written.
-    #[pyo3(signature = (r#ref, dir, safetensors = true, dequantize = None, *, origin = false, lane = None))]
+    #[pyo3(signature = (r#ref, dir, safetensors = true, dequantize = None, *, origin = false, variant = None))]
     #[allow(clippy::too_many_arguments)]
     fn export(
         &self,
@@ -364,29 +374,28 @@ impl PyStore {
         safetensors: bool,
         dequantize: Option<String>,
         origin: bool,
-        lane: Option<String>,
+        variant: Option<String>,
     ) -> PyResult<Vec<String>> {
-        let named = named(&self.store, r#ref, lane.as_deref())?;
+        let named = named(&self.store, r#ref, variant.as_deref())?;
         if origin && dequantize.is_some() {
-            return Err(invalid(
-                py,
-                "an origin keeps objects as they are: no dequantize",
-            ));
+            return Err(invalid(py, "an origin keeps objects as they are: no dequantize"));
         }
         if !origin && !safetensors {
-            return Err(invalid(
-                py,
-                "export writes safetensors, or with origin=True an origin",
-            ));
+            return Err(invalid(py, "export writes safetensors, or with origin=True an origin"));
         }
         let dtype = dequantize.map(|d| Dtype::parse(&d.to_ascii_uppercase()));
-        py.detach(|| match origin {
-            true => client::export_origin(&self.store, &named, &dir),
-            false => export::safetensors(
-                &self.store.checkpoint(&named.manifest)?,
-                &dir,
-                dtype.as_ref(),
-            ),
+        let store = &self.store;
+        py.detach(|| -> Result<Vec<String>, Failure> {
+            if origin {
+                return client::export_origin(store, &named, &dir);
+            }
+            let mut repo = std::collections::BTreeMap::new();
+            if let Some(tree) = &named.tree {
+                for (path, object) in store.tree(tree)?.repo_files() {
+                    repo.insert(path.to_owned(), store.path(object)?);
+                }
+            }
+            export::safetensors(&store.checkpoint(&named.header)?, &repo, &dir, dtype.as_ref())
         })
         .or_raise(py)
     }
@@ -413,13 +422,55 @@ impl PyStore {
 
 // ---------------------------------------------------------------- checkpoints
 
-/// A checkpoint: its tensors, files and metadata, read from a store; or only its header's
-/// tensors (`Checkpoint.parse`), with no chunks to read.
+/// One cozytensors: its pipeline, components and metadata, read from a store; or only its
+/// header (`Checkpoint.parse`), with no chunks or assets to read.
 #[pyclass(name = "Checkpoint", module = "tensorfs", frozen)]
 pub struct PyCheckpoint {
     header: Header,
-    stored: Option<(Checkpoint, Named)>,
+    stored: Option<Checkpoint>,
+    named: Option<Named>,
     tensors: OnceLock<Py<PyDict>>,
+    components: OnceLock<Py<PyDict>>,
+}
+
+/// What `model_index.json` held: `cls` (`diffusers.<Class>`) and `config`.
+#[pyclass(name = "Pipeline", module = "tensorfs", frozen, get_all)]
+pub struct PyPipeline {
+    cls: String,
+    config: Py<PyDict>,
+}
+
+/// One component: its class, config, tensors and assets.
+#[pyclass(name = "Component", module = "tensorfs", frozen, get_all)]
+pub struct PyComponent {
+    name: String,
+    /// `<library>.<Class>`, `""` when unknown.
+    cls: String,
+    config: Py<PyDict>,
+    /// The config's file name when it isn't `config.json`.
+    config_file: Option<String>,
+    /// `key -> Info`, in construction order.
+    tensors: Py<PyDict>,
+    /// `name -> (sha256, length)`: run data in the component's folder.
+    assets: Py<PyDict>,
+    #[pyo3(get, name = "_stored")]
+    ck: Option<Py<PyCheckpoint>>,
+}
+
+#[pymethods]
+impl PyComponent {
+    /// Asset `name`'s bytes; a parsed header has none.
+    fn asset<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyBytes>> {
+        let Some(ck) = &self.ck else {
+            return Err(raise(py, Failure { kind: Kind::Unsupported, detail: "a parsed header has no assets here".into() }));
+        };
+        let ck = ck.get().stored(py)?;
+        let bytes = py.detach(|| ck.asset(&self.name, &name)).or_raise(py)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+    fn __repr__(&self) -> String {
+        format!("Component({}, {})", self.name, self.cls)
+    }
 }
 
 /// One part as stored: a plain tensor's data (role `""`) or an encoded tensor's part.
@@ -474,99 +525,133 @@ impl PyInfo {
     }
 }
 
+fn info(py: Python<'_>, t: &Tensor) -> PyResult<PyInfo> {
+    let parts = PyDict::new(py);
+    let part = |dtype: &Dtype, shape: &[u64], at: (u64, u64, u64)| -> PyResult<Py<PyPart>> {
+        let p = PyPart {
+            dtype: dtype.name().into(),
+            shape: PyTuple::new(py, shape)?.unbind(),
+            chunk: at.0,
+            offset: at.1,
+            length: at.2,
+        };
+        Py::new(py, p)
+    };
+    let encoding = match &t.body {
+        Body::Data(at) => {
+            parts.set_item("", part(&t.dtype, &t.shape, (at.chunk, at.offset, at.length))?)?;
+            None
+        }
+        Body::Encoded { encoding, parts: stored } => {
+            for p in stored {
+                parts.set_item(&p.role, part(&p.dtype, &p.shape, (p.chunk, p.offset, p.length))?)?;
+            }
+            let params = metadata(py, &encoding.params)?.unbind();
+            Some(Py::new(py, PyEncoding { scheme: encoding.scheme.clone(), params })?)
+        }
+    };
+    Ok(PyInfo {
+        dtype: t.dtype.name().into(),
+        shape: PyTuple::new(py, &t.shape)?.unbind(),
+        encoding,
+        parts: parts.unbind(),
+    })
+}
+
 impl PyCheckpoint {
+    fn new(header: Header, stored: Option<Checkpoint>, named: Option<Named>) -> PyCheckpoint {
+        PyCheckpoint { header, stored, named, tensors: OnceLock::new(), components: OnceLock::new() }
+    }
+
     /// The store's checkpoint behind it; a parsed header has none.
     pub(crate) fn stored(&self, py: Python<'_>) -> PyResult<&Checkpoint> {
         match &self.stored {
-            Some((ck, _)) => Ok(ck),
+            Some(ck) => Ok(ck),
             None => Err(raise(
                 py,
                 Failure {
                     kind: Kind::Unsupported,
-                    detail: "a parsed header has no store: its chunks and files are not here".into(),
+                    detail: "a parsed header has no store: its chunks and assets are not here".into(),
                 },
             )),
         }
     }
 
-    fn build(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let out = PyDict::new(py);
-        // Dicts keep insertion order: components and tensors iterate in header order.
-        for c in self.header.components() {
-            let tensors = PyDict::new(py);
-            for t in &c.tensors {
-                let parts = PyDict::new(py);
-                let part = |p: PyPart| Py::new(py, p);
-                let encoding = match &t.body {
-                    Body::Data(at) => {
-                        let p = PyPart {
-                            dtype: t.dtype.name().into(),
-                            shape: PyTuple::new(py, &t.shape)?.unbind(),
-                            chunk: at.chunk,
-                            offset: at.offset,
-                            length: at.length,
-                        };
-                        parts.set_item("", part(p)?)?;
-                        None
-                    }
-                    Body::Encoded {
-                        encoding,
-                        parts: stored,
-                    } => {
-                        for p in stored {
-                            let role = &p.role;
-                            let p = PyPart {
-                                dtype: p.dtype.name().into(),
-                                shape: PyTuple::new(py, &p.shape)?.unbind(),
-                                chunk: p.chunk,
-                                offset: p.offset,
-                                length: p.length,
-                            };
-                            parts.set_item(role, part(p)?)?;
-                        }
-                        let params = metadata(py, &encoding.params)?.unbind();
-                        Some(Py::new(
-                            py,
-                            PyEncoding {
-                                scheme: encoding.scheme.clone(),
-                                params,
-                            },
-                        )?)
-                    }
-                };
-                let info = PyInfo {
-                    dtype: t.dtype.name().into(),
-                    shape: PyTuple::new(py, &t.shape)?.unbind(),
-                    encoding,
-                    parts: parts.unbind(),
-                };
-                tensors.set_item(&t.key, Py::new(py, info)?)?;
-            }
-            out.set_item(&c.name, tensors)?;
+    fn tensor_dict(&self, py: Python<'_>, c: &tensorfs_core::format::Component) -> PyResult<Py<PyDict>> {
+        let tensors = PyDict::new(py);
+        for t in &c.tensors {
+            tensors.set_item(&t.key, Py::new(py, info(py, t)?)?)?;
         }
-        Ok(out.unbind())
+        Ok(tensors.unbind())
     }
 }
 
 #[pymethods]
 impl PyCheckpoint {
-    /// A `cozytensors/1` header document's tensors and metadata, with no store behind them.
+    /// A `cozytensors/1` header's pipeline, components and metadata, with no store behind them.
     #[staticmethod]
     fn parse(py: Python<'_>, header: &[u8]) -> PyResult<PyCheckpoint> {
         let header = Header::from_cbor(header).or_raise(py)?;
-        Ok(PyCheckpoint {
-            header,
-            stored: None,
-            tensors: OnceLock::new(),
-        })
+        Ok(PyCheckpoint::new(header, None, None))
     }
 
-    /// The manifest naming it; None for a parsed header.
+    /// `sha256:<hex>` of the header: the cozytensors' id. None for a parsed header.
     #[getter]
-    fn manifest(&self) -> Option<PyManifest> {
-        self.stored.as_ref().map(|(_, named)| PyManifest {
-            named: named.clone(),
-        })
+    fn id(&self) -> Option<String> {
+        self.stored.as_ref().map(|ck| ck.id().id())
+    }
+
+    /// The tree, repo, release and variant naming it, when one does.
+    #[getter]
+    fn tree(&self) -> Option<String> {
+        self.named.as_ref()?.tree.as_ref().map(|t| t.id())
+    }
+    #[getter]
+    fn name(&self) -> Option<&str> {
+        self.named.as_ref()?.name.as_deref()
+    }
+    #[getter]
+    fn release(&self) -> Option<&str> {
+        self.named.as_ref()?.release.as_deref()
+    }
+    #[getter]
+    fn variant(&self) -> Option<&str> {
+        self.named.as_ref()?.variant.as_deref()
+    }
+
+    #[getter]
+    fn pipeline(&self, py: Python<'_>) -> PyResult<Option<PyPipeline>> {
+        (self.header.pipeline())
+            .map(|p| Ok(PyPipeline { cls: p.class.clone(), config: config_dict(py, &p.config)?.unbind() }))
+            .transpose()
+    }
+
+    /// `components[name] -> Component`, in construction order.
+    #[getter]
+    fn components(slf: &Bound<'_, Self>) -> PyResult<Py<PyDict>> {
+        let py = slf.py();
+        let this = slf.get();
+        if let Some(c) = this.components.get() {
+            return Ok(c.clone_ref(py));
+        }
+        let out = PyDict::new(py);
+        for c in this.header.components() {
+            let assets = PyDict::new(py);
+            for (name, o) in &c.assets {
+                assets.set_item(name, (o.sha256.clone(), o.length))?;
+            }
+            let component = PyComponent {
+                name: c.name.clone(),
+                cls: c.class.clone(),
+                config: config_dict(py, &c.config)?.unbind(),
+                config_file: c.config_file.clone(),
+                tensors: this.tensor_dict(py, c)?,
+                assets: assets.unbind(),
+                ck: this.stored.is_some().then(|| slf.clone().unbind()),
+            };
+            out.set_item(&c.name, Py::new(py, component)?)?;
+        }
+        Ok(this.components.get_or_init(|| out.unbind()).clone_ref(py))
     }
 
     /// The header's chunks, in order: `(sha256, length)` (`Part.chunk` indexes them).
@@ -584,34 +669,31 @@ impl PyCheckpoint {
         Ok((0..ck.header().chunks.len()).map(|i| ck.chunk_path(i).display().to_string()).collect())
     }
 
+    /// The chunks and assets of `components` (all when None) not here: `(sha256, length)`.
+    #[pyo3(signature = (components = None))]
+    fn missing(&self, py: Python<'_>, components: Option<Vec<String>>) -> PyResult<Vec<(String, u64)>> {
+        let ck = self.stored(py)?;
+        let missing = py.detach(|| ck.missing(components.as_deref())).or_raise(py)?;
+        Ok(missing.into_iter().map(|o| (o.sha256, o.length)).collect())
+    }
+
     /// `tensors[component][key] -> Info`.
     #[getter]
     fn tensors(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         if let Some(t) = self.tensors.get() {
             return Ok(t.clone_ref(py));
         }
-        let built = self.build(py)?;
-        Ok(self.tensors.get_or_init(|| built).clone_ref(py))
+        let out = PyDict::new(py);
+        for c in self.header.components() {
+            out.set_item(&c.name, self.tensor_dict(py, c)?)?;
+        }
+        Ok(self.tensors.get_or_init(|| out.unbind()).clone_ref(py))
     }
 
-    /// The manifest's file paths (configs, tokenizers, the header).
-    #[getter]
-    fn files(&self) -> Vec<String> {
-        (self.stored.iter())
-            .flat_map(|(ck, _)| ck.manifest().files.keys().cloned())
-            .collect()
-    }
-
-    /// The header's metadata.
+    /// The header's loading metadata (`source`, `filled`, `safetensors_metadata`).
     #[getter]
     fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         metadata(py, &self.header.metadata)
-    }
-
-    fn file<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyBytes>> {
-        let ck = self.stored(py)?;
-        let bytes = py.detach(|| ck.file(&path)).or_raise(py)?;
-        Ok(PyBytes::new(py, &bytes))
     }
 
     /// A tensor's logical bytes on the CPU, as a DLPack-able `Array`; an encoded tensor goes
@@ -633,8 +715,11 @@ impl PyCheckpoint {
         };
         let (dtype, shape) = (t.dtype.clone(), t.shape.clone());
         let mut buf = Aligned::new(length as usize);
-        py.detach(|| ck.read_into(&component, &key, buf.bytes_mut()))
-            .or_raise(py)?;
+        let bytes = py.detach(|| ck.read(&component, &key)).or_raise(py)?;
+        if bytes.len() != buf.len {
+            return Err(invalid(py, format!("{component}/{key}: {} bytes, not {}", bytes.len(), buf.len)));
+        }
+        buf.bytes_mut().copy_from_slice(&bytes);
         Ok(PyArray {
             buf: Arc::new(buf),
             dtype,
@@ -874,9 +959,10 @@ impl PyArray {
 
 // ---------------------------------------------------------------- the writer
 
-/// Tensors and files in, one committed checkpoint out (`commit`).
+/// One cozytensors out, component by component (`component`), sealed by `commit`.
 #[pyclass(name = "Writer", module = "tensorfs", frozen)]
 pub struct PyWriter {
+    store: Store,
     w: Mutex<Option<Writer>>,
 }
 
@@ -902,31 +988,98 @@ impl PyWriter {
 
 #[pymethods]
 impl PyWriter {
+    /// What `model_index.json` held: `cls` (`diffusers.<Class>`) and its `config`.
+    fn pipeline(&self, py: Python<'_>, cls: String, config: &Bound<'_, PyDict>) -> PyResult<()> {
+        let config = config_map(config)?;
+        self.with(py, |w| {
+            w.pipeline(&cls, config);
+            Ok(())
+        })
+    }
+
+    /// Declares component `name` (again: its class and config change, its tensors stay) and
+    /// hands back its writer.
+    #[pyo3(signature = (name, cls = String::new(), config = None, config_file = None))]
+    fn component(
+        slf: &Bound<'_, Self>,
+        name: String,
+        cls: String,
+        config: Option<&Bound<'_, PyDict>>,
+        config_file: Option<String>,
+    ) -> PyResult<PyComponentWriter> {
+        let py = slf.py();
+        let config = config.map(config_map).transpose()?.unwrap_or_default();
+        slf.get().with(py, |w| {
+            w.component(&name, &cls, config, config_file.as_deref())?;
+            Ok(())
+        })?;
+        Ok(PyComponentWriter { w: slf.clone().unbind(), name })
+    }
+
+    /// A repo file (README, LICENSE): pinned with the header, never inside it.
+    fn repo_file(&self, py: Python<'_>, path: String, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        let bytes = Bytes::of(data)?;
+        self.with(py, |w| Ok(w.repo_file(&path, bytes.slice())?))
+    }
+
+    /// A header metadata field; it overrides the base's.
+    fn set_metadata(&self, py: Python<'_>, key: String, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let value = from_py(value)?;
+        self.with(py, |w| {
+            w.set_metadata(&key, value);
+            Ok(())
+        })
+    }
+
+    /// Written already (or by an interrupted writer of this key); base tensors don't count.
+    fn has(&self, component: &str, key: &str) -> bool {
+        let guard = self.w.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().is_some_and(|w| w.has(component, key))
+    }
+
+    /// Lays out the chunks and seals the header; it is pinned under the writer's key, or its
+    /// digest. Returns the new checkpoint.
+    fn commit(&self, py: Python<'_>) -> PyResult<PyCheckpoint> {
+        let header = self.with(py, |w| Ok(w.commit()?))?;
+        self.w.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let named = Named { header, tree: None, name: None, release: None, variant: None };
+        opened(py, &self.store, named)
+    }
+
+    /// Ends the writer without a checkpoint.
+    fn abandon(&self) {
+        if let Some(w) = self.w.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            w.abandon();
+        }
+    }
+}
+
+/// One component of a `Writer`.
+#[pyclass(name = "ComponentWriter", module = "tensorfs", frozen)]
+pub struct PyComponentWriter {
+    w: Py<PyWriter>,
+    #[pyo3(get)]
+    name: String,
+}
+
+#[pymethods]
+impl PyComponentWriter {
     /// A plain tensor: `data` is any C-contiguous buffer of exactly its bytes.
-    fn put(
-        &self,
-        py: Python<'_>,
-        component: String,
-        key: String,
-        dtype: String,
-        shape: Vec<u64>,
-        data: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
+    fn put(&self, py: Python<'_>, key: String, dtype: String, shape: Vec<u64>, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let bytes = Bytes::of(data)?;
         let dtype = Dtype::parse(&dtype);
-        self.with(py, |w| {
+        self.w.get().with(py, |w| {
             let mut src = bytes.slice();
-            Ok(w.put(&component, &key, &dtype, &shape, Data::Plain(Source::Read(&mut src)))?)
+            Ok(w.get(&self.name).put(&key, &dtype, &shape, Data::Plain(Source::Read(&mut src)))?)
         })
     }
 
     /// An encoded tensor: `parts` maps each role to `(dtype, shape, data)`.
-    #[pyo3(signature = (component, key, dtype, shape, scheme, parts, params = None))]
+    #[pyo3(signature = (key, dtype, shape, scheme, parts, params = None))]
     #[allow(clippy::too_many_arguments)]
     fn put_encoded(
         &self,
         py: Python<'_>,
-        component: String,
         key: String,
         dtype: String,
         shape: Vec<u64>,
@@ -944,19 +1097,12 @@ impl PyWriter {
         let mut held = Vec::new();
         for (role, part) in parts.iter() {
             let (dtype, shape, data): (String, Vec<u64>, Bound<'_, PyAny>) = part.extract()?;
-            held.push((
-                role.extract::<String>()?,
-                Dtype::parse(&dtype),
-                shape,
-                Bytes::of(&data)?,
-            ));
+            held.push((role.extract::<String>()?, Dtype::parse(&dtype), shape, Bytes::of(&data)?));
         }
         let dtype = Dtype::parse(&dtype);
-        self.with(py, |w| {
+        self.w.get().with(py, |w| {
             let mut slices: Vec<&[u8]> = held.iter().map(|h| h.3.slice()).collect();
-            let parts = held
-                .iter()
-                .zip(slices.iter_mut())
+            let parts = (held.iter().zip(slices.iter_mut()))
                 .map(|((role, dtype, shape, _), data)| PartData {
                     role: role.clone(),
                     dtype: dtype.clone(),
@@ -965,61 +1111,45 @@ impl PyWriter {
                 })
                 .collect();
             let encoding = Encoding { scheme, params };
-            Ok(w.put(
-                &component,
-                &key,
-                &dtype,
-                &shape,
-                Data::Encoded { encoding, parts },
-            )?)
+            Ok(w.get(&self.name).put(&key, &dtype, &shape, Data::Encoded { encoding, parts })?)
         })
     }
 
-    /// Takes `component/key` from `source`, a checkpoint of this store; large parts keep their
-    /// objects.
+    /// Takes `from_component/from_key` (by default this component and `key`) from `source`, a
+    /// stored checkpoint, as `key`; large parts keep their objects.
+    #[pyo3(signature = (key, source, from_component = None, from_key = None))]
     fn copy(
         &self,
         py: Python<'_>,
-        component: String,
         key: String,
         source: &PyCheckpoint,
+        from_component: Option<String>,
+        from_key: Option<String>,
     ) -> PyResult<()> {
         let from = source.stored(py)?;
-        self.with(py, |w| Ok(w.copy(&component, &key, from)?))
+        let fc = from_component.unwrap_or_else(|| self.name.clone());
+        let fk = from_key.unwrap_or_else(|| key.clone());
+        self.w.get().with(py, |w| Ok(w.get(&self.name).copy_as(&key, from, &fc, &fk)?))
     }
 
-    /// A file of the checkpoint's tree: a config, a tokenizer.
-    fn file(&self, py: Python<'_>, path: String, data: &Bound<'_, PyAny>) -> PyResult<()> {
+    /// Run data in the component's folder (`tokenizer.json`), by its path there.
+    fn asset(&self, py: Python<'_>, name: String, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let bytes = Bytes::of(data)?;
-        self.with(py, |w| Ok(w.file(&path, bytes.slice())?))
+        self.w.get().with(py, |w| Ok(w.get(&self.name).asset(&name, bytes.slice())?))
     }
 
-    /// Written already (or by an interrupted writer of this key).
-    fn has(&self, component: &str, key: &str) -> bool {
-        let guard = self.w.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().is_some_and(|w| w.has(component, key))
-    }
-
-    /// Lays out the chunks and commits; the new checkpoint is pinned under the writer's key, or
-    /// its digest.
-    fn commit(&self, py: Python<'_>) -> PyResult<PyManifest> {
-        let manifest = self.with(py, |w| Ok(w.commit()?))?;
-        self.w.lock().unwrap_or_else(|e| e.into_inner()).take();
-        Ok(PyManifest {
-            named: Named {
-                manifest,
-                name: None,
-                release: None,
-                lane: None,
-            },
+    /// The tensor order when the calls are not it: these keys first, then the rest as written.
+    fn order(&self, py: Python<'_>, keys: Vec<String>) -> PyResult<()> {
+        self.w.get().with(py, |w| {
+            let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+            w.get(&self.name).set_order(&keys);
+            Ok(())
         })
     }
 
-    /// Ends the writer without a checkpoint.
-    fn abandon(&self) {
-        if let Some(w) = self.w.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            w.abandon();
-        }
+    /// Written already (or by an interrupted writer of this key).
+    fn has(&self, key: &str) -> bool {
+        self.w.get().has(&self.name, key)
     }
 }
 
@@ -1028,8 +1158,10 @@ impl PyWriter {
 pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
     m.add_class::<PyStore>()?;
-    m.add_class::<PyManifest>()?;
     m.add_class::<PyCheckpoint>()?;
+    m.add_class::<PyPipeline>()?;
+    m.add_class::<PyComponent>()?;
+    m.add_class::<PyComponentWriter>()?;
     m.add_class::<PyInfo>()?;
     m.add_class::<PyEncoding>()?;
     m.add_class::<PyPart>()?;

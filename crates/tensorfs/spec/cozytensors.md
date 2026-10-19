@@ -6,10 +6,11 @@ Conformance vectors and an independent reader: [`../conformance/`](../conformanc
 This is the authoritative specification of the stored format and its decode semantics. A reader can implement it
 without TensorFS, Cozy or Tensorhub. Library APIs, cache policy and GPU execution are outside the format contract.
 
-cozytensors/1 stores model weights as immutable, content-addressed objects. A **checkpoint** is a manifest (a file
-tree) whose `model.cozytensors` file is a **header**; the header names **chunks** (objects of tensor bytes) and
-describes every tensor in them, plain or encoded, by component. A **repo** document maps a model's releases and lanes
-to checkpoints. Everything a reader needs to read and decode a tensor is in these documents and this spec.
+cozytensors/1 stores model weights as immutable, content-addressed objects. A **cozytensors** is one variant of a
+model: a **header** that describes its pipeline and components, every tensor in them, plain or encoded, and the
+**chunks** (objects of tensor bytes) and **asset** objects it cites. A **tree** is a repo revision as files: each
+variant's header beside repo files such as README and LICENSE. A **repo** document maps a model's releases to trees.
+Everything a reader needs to read and decode a tensor is in these documents and this spec.
 
 The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119. §1–§8 define meaning; §9 defines the byte encoding
 of documents; §10 is informative writer guidance. Appendix A holds the schemes' fixed tables.
@@ -23,17 +24,18 @@ bytes as 64 lowercase hex digits, `length` their count. In a store or static ori
 blobs/<sha256[0:2]>/<sha256[2:4]>/<sha256>
 ```
 
-A reader MUST check the length and digest of every object before using its bytes.
+Every admission, where bytes enter a store, cache or endpoint, MUST check the object's length and digest. A reader
+of a plain folder (§3) or of objects already admitted MUST check lengths; it need not hash again.
 
 ## 2. Documents
 
-Manifests, headers and repos are documents. Each carries a `format` tag `<kind>/<major>` or `<kind>/<major>.<minor>`,
+Trees, headers and repos are documents. Each carries a `format` tag `<kind>/<major>` or `<kind>/<major>.<minor>`,
 where major and minor are decimal digits:
 
 | Document | `format` kind | Encoding (§9) | Usual name |
 |---|---|---|---|
-| manifest | `tensorfs.manifest` | JSON object | an object, cited by a repo |
-| header | `cozytensors` | CBOR array | the manifest file `model.cozytensors` |
+| tree | `tensorfs.tree` | JSON object | an object, cited by a repo |
+| header | `cozytensors` | CBOR array | the tree file `model.<variant>.cozytensors` |
 | repo | `tensorfs.repo` | JSON object | `refs/<org>/<name>.json` |
 
 - A reader MUST refuse a document whose kind differs or whose major is not `1`. It MUST accept any minor.
@@ -46,15 +48,20 @@ where major and minor are decimal digits:
 **Names.** A *segment* is a non-empty string that is not `.` or `..` and contains no `/`, `\` or NUL. A *path* is one
 or more segments joined by `/`.
 
-## 3. Manifest
+## 3. Tree
 
 ```
-{format: "tensorfs.manifest/1", files: {path: object-ref}, metadata?}
+{format: "tensorfs.tree/1", files: {path: object-ref}}
 ```
 
-- Every key of `files` MUST be a path. The tree is an ordinary model folder: `model.cozytensors`,
-  `<component>/config.json`, tokenizer files, a license.
-- `model.cozytensors`, when present, is the checkpoint's header. A manifest without it holds no tensors.
+- Every key of `files` MUST be a path whose first segment is not `chunks` (a plain folder's chunk directory).
+- A **variant** is a file named `model.<variant>.cozytensors`, or `model.cozytensors` for the unnamed variant `""`;
+  `<variant>` is a non-empty string without `/`. Its object is that variant's header (§4), and its id.
+- Every other file (README, LICENSE, images, code) is a **repo file**: an object shared by all variants and never
+  cited by a header. A tree without variants holds no tensors.
+
+**Plain folder.** A tree on disk is a directory with each file at its path and `chunks/<sha256>` holding the chunks
+and assets its headers cite (some MAY be absent: a thin folder). A writer writes `chunks/` first and the headers last.
 
 ## 4. Header
 
@@ -433,27 +440,30 @@ A new scheme is a minor version (§8). It ships:
 
 ```
 {format: "tensorfs.repo/1", name: "<org>/<name>",
- releases: [{version, lanes: {lane: object-ref}, yanked?, revision?}], checkpoints?: [object-ref]}
+ releases: [{version, tree: object-ref, yanked?, revision?}], checkpoints?: [object-ref]}
 ```
 
-- `name` is two segments. Versions MUST be non-empty and unique; lane names MUST be non-empty. Each lane cites a
-  manifest. Releases are listed in publication order, newest last.
+- `name` is two segments. Versions MUST be non-empty and unique. Each release names a tree (§3); its variants are
+  the tree's files. Releases are listed in publication order, newest last.
 - `yanked` (boolean, default `false`) withdraws a release from unversioned lookups. `revision` (non-negative integer,
   default 0) is the release's expected-revision counter: every change to the release increments it, and a writer
   that changes a release conditions the change on the revision it read.
-- `checkpoints` (default empty) lists manifests uploaded but not yet in any release.
+- `checkpoints` (default empty) lists trees uploaded but not yet in any release.
 - **Resolution.** An unversioned lookup takes the newest release that is not yanked; an explicit version takes that
-  release, yanked or not (a reader MAY warn). The lane is then looked up in that release.
-- **Roots.** Every lane of every release, yanked included, and every checkpoint are roots: a store keeps their
-  closures.
+  release, yanked or not (a reader MAY warn). The variant is then looked up in that release's tree; with none named,
+  a tree of one variant gives it.
+- **Roots.** Every release's tree, yanked included, and every checkpoint are roots: a store keeps their closures.
 - Repo names are case-insensitive: `Acme/SDXL` and `acme/sdxl` are one repo. Keys and paths use the name with ASCII
   `A`–`Z` lowered (`refs/acme/sdxl.json`); the document's `name` keeps the writer's spelling.
 - A **store** or **static origin** is a directory, bucket or HTTP prefix holding `refs/<org>/<name>.json` and
-  `blobs/…` (§1). A reader resolves name → release → lane → manifest → header → chunks, verifying every object.
+  `blobs/…` (§1). A reader resolves name → release → tree → variant header → chunks and assets, verifying every object
+  where it enters.
 
-**Closure.** A checkpoint's closure is its manifest, every object its `files` cite, and, for `model.cozytensors`,
-every object in the header's `chunks`. A copy of a checkpoint is complete when its whole closure is present. A
-reader that needs only some components MAY fetch only the chunks their locations touch.
+**Closure.** A cozytensors' closure is its header and every object the header cites: its `chunks` and each
+component's assets. A tree's closure is the tree, every object its `files` cite, and each variant's closure. A copy
+is complete when its whole closure is present. A reader that needs only some components MAY fetch only the chunks
+their locations touch and their assets; one that needs one variant MAY fetch only the tree, its repo files and that
+variant's closure.
 
 ## 8. Versioning
 
@@ -484,7 +494,7 @@ Decoding and re-encoding a header of this version reproduces its bytes. A header
 an array, MUST be refused as such ("pre-cut cozytensors header (old layout); re-import or migrate"): the tag is the
 same, so only the structure tells them apart.
 
-**Manifest and repo: JSON.** UTF-8 JSON (RFC 8259) whose top level is an object; §2's values map to JSON in the obvious
+**Tree and repo: JSON.** UTF-8 JSON (RFC 8259) whose top level is an object; §2's values map to JSON in the obvious
 way. A reader MUST refuse invalid UTF-8 or JSON, a top level that is not an object, a repeated key in any object, any
 number with a fraction or exponent, `NaN` or `Infinity`, any integer outside [−2^63, 2^64), `null`, and a field of the
 wrong JSON type. Whitespace between tokens is allowed. A writer MUST produce the canonical form:
@@ -493,16 +503,16 @@ wrong JSON type. Whitespace between tokens is allowed. A writer MUST produce the
 - strings with `"` and `\` escaped as `\"` and `\\`, the controls U+0008, U+0009, U+000A, U+000C and U+000D as `\b`,
   `\t`, `\n`, `\f`, `\r`, other controls below U+0020 as `\u00XX` (lowercase hex), and every other character as its
   UTF-8 bytes (Python: `json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`);
-- optional fields at their default omitted: empty `metadata` and `checkpoints`, `yanked: false`, `revision: 0`.
+- optional fields at their default omitted: empty `checkpoints`, `yanked: false`, `revision: 0`.
 
 ## 10. Chunks (informative)
 
 Readers need only locations. Writers SHOULD lay tensors out by this rule, which keeps objects few (16–64 MiB),
-shares unchanged large tensors between lanes, and aligns every part for direct I/O:
+shares unchanged large tensors between variants, and aligns every part for direct I/O:
 
 1. **Order.** Parts in header order (components, their tensors, each tensor's parts); the layout never reorders.
 2. **Standalone.** A part of 16 MiB (2^24 bytes) or more is its own chunk(s), split every 64 MiB from its first byte.
-   Its objects depend only on its bytes, so an unchanged large tensor dedupes across lanes and versions.
+   Its objects depend only on its bytes, so an unchanged large tensor dedupes across variants and versions.
 3. **Packs.** Smaller parts are packed in order, each at a 4 KiB-aligned offset (zero padding). The open pack closes
    before a part when the part belongs to another component; when the pack holds 16 MiB or more and the part's block
    differs from the previous part's; or when the part would end past 64 MiB. A part's **block** is its key up to and

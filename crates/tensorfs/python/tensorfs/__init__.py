@@ -1,12 +1,11 @@
-"""TensorFS: cozytensors/1 checkpoints in a content-addressed store (design §1).
+"""TensorFS: cozytensors/1 checkpoints in a content-addressed store.
 
-    store = tensorfs.Store("~/.cache/tensorfs")                # created when absent
-    m = store.import_("hf://hf-internal-testing/tiny-sdxl-pipe")
-    m = store.pull("acme/sdxl@1.0", lane="int8")  # from tensorhub.com
-    ck = store.checkpoint(m)
-    ck.tensors["unet"]["conv_in.weight"]                 # Info(dtype, shape, encoding, parts)
+    store = tensorfs.Store("~/.cache/tensorfs")          # created when absent
+    ck = store.import_("hf://hf-internal-testing/tiny-sdxl-pipe")
+    ck = store.pull("acme/sdxl@1.0", variant="int8")     # from tensorhub.com
+    unet = ck.components["unet"]                         # .cls, .config, .tensors, .assets
     torch.from_dlpack(ck.read("unet", "conv_in.weight")) # encoded tensors decode
-    store.export(m, "out/")                              # a Diffusers/Transformers folder
+    store.export(ck, "out/")                             # a Diffusers/Transformers folder
 
 Compiled in `tensorfs._ext`, typed in `_ext.pyi`; the weight plane is `tensorfs.varena`;
 `parse_header` projects a CBOR header (`tensorfs.errors` refusals). TensorFS never imports torch.
@@ -17,6 +16,8 @@ from ._ext import (
     Array,
     Checkpoint,
     Closure,
+    Component,
+    ComponentWriter,
     DecodeError,
     DeniedError,
     DiskFullError,
@@ -26,10 +27,10 @@ from ._ext import (
     Info,
     IntegrityError,
     InvalidError,
-    Manifest,
     NetworkError,
     NotFoundError,
     Part,
+    Pipeline,
     StorageError,
     Store,
     UnknownSchemeError,
@@ -45,6 +46,8 @@ __all__ = [
     "Array",
     "Checkpoint",
     "Closure",
+    "Component",
+    "ComponentWriter",
     "DecodeError",
     "DeniedError",
     "DiskFullError",
@@ -54,10 +57,10 @@ __all__ = [
     "Info",
     "IntegrityError",
     "InvalidError",
-    "Manifest",
     "NetworkError",
     "NotFoundError",
     "Part",
+    "Pipeline",
     "StorageError",
     "Store",
     "UnknownSchemeError",
