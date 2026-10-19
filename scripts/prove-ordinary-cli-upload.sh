@@ -31,4 +31,4 @@ cd "$hubdir"
 go build -o dist/tensorhub .
 export PROOF_DATABASE_URL="$AUTHKIT_TEST_DATABASE_URL"
 scripts/live-hub-client.sh "$cozy_sha" -p cozy --test run_local \
-  runtime_checkpoint_uploads_with_the_ordinary_owner_credential -- --exact --test-threads=1
+  runtime_checkpoint_uploads -- --test-threads=1

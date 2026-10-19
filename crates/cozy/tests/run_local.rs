@@ -226,6 +226,10 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
             .unwrap();
         let header = writer.commit().unwrap();
         let mut tree = Tree::default();
+        assert_eq!(
+            source_store.checkpoint(&header).unwrap().header().chunks,
+            vec![tensorfs_core::format::ObjectRef::of(&[0u8; 4])]
+        );
         tree.set_variant("f32", header.clone());
         (header, source_store.put_tree(&tree).unwrap())
     };
@@ -246,7 +250,10 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
         "m1",
         &[("COZY_TENSORFS_ROOT", store_path.to_str().unwrap())],
     );
-    assert!(!Store::open(&store_path).unwrap().has(&seed), "source is warm before the call");
+    assert!(
+        !Store::open(&store_path).unwrap().has(&seed),
+        "source is warm before the call"
+    );
     let work = home.path().join("work");
     copy(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensord/tests/fixtures/cpu_weights"),
@@ -409,6 +416,10 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
         failed["reason"].to_string().contains("upload_failed"),
         "{failed}"
     );
+    assert!(
+        failed["reason"].to_string().contains("403"),
+        "expected the ordinary permission refusal: {failed}"
+    );
     let retained = failed["output"]
         .as_array()
         .unwrap()
@@ -549,6 +560,109 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
     assert!(
         !serde_json::to_string(&shown).unwrap().contains(&token),
         "owner token entered public history"
+    );
+}
+
+/// Public local model conversion needs neither a Hub connection nor a sign-in.
+#[test]
+fn runtime_checkpoint_uploads_local_alias_on_disk() {
+    use tensorfs_core::{
+        format::Dtype,
+        store2::Store,
+        writer::{Data, Source},
+    };
+    let Some(home) = Home::new() else { return };
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
+        return;
+    };
+    home.write_config("hub = \"offline\"\n[hubs]\noffline = \"http://127.0.0.1:1\"\n");
+    let store_path = home.path().join("local-tensorfs");
+    let seed = {
+        let store = Store::open(&store_path).unwrap();
+        let mut writer = store.writer(None, None).unwrap();
+        writer
+            .get("model")
+            .put(
+                "seed",
+                &Dtype::F32,
+                &[1],
+                Data::Plain(Source::Read(&mut &[0u8; 4][..])),
+            )
+            .unwrap();
+        let header = writer.commit().unwrap();
+        assert_eq!(
+            store.checkpoint(&header).unwrap().header().chunks,
+            vec![tensorfs_core::format::ObjectRef::of(&[0u8; 4])]
+        );
+        tensord::storage::set_local(&store, "seed", &header, &Default::default()).unwrap();
+        header
+    };
+    let _machine = common::tensord::added_with(
+        &home,
+        "m1",
+        &[("COZY_TENSORFS_ROOT", store_path.to_str().unwrap())],
+    );
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensord/tests/fixtures/cpu_weights"),
+        &work.join("cpu_weights"),
+    );
+    let run = completed(&cozy(
+        &home,
+        &work,
+        &[
+            "--json",
+            "run",
+            "./cpu_weights/convert",
+            "local/seed",
+            "local/output",
+            "size=64",
+            "--on",
+            "m1",
+        ],
+    ));
+    let output = run["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "model")
+        .unwrap();
+    let reference = &output["checkpoint"];
+    assert_eq!(reference["repo_id"], "local/output", "{run}");
+    for field in ["path", "sha256", "export_error"] {
+        assert!(output.get(field).is_none_or(Value::is_null), "{output}");
+    }
+    let store = Store::open(&store_path).unwrap();
+    assert_eq!(
+        store
+            .checkpoint(&seed)
+            .unwrap()
+            .read("model", "seed")
+            .unwrap(),
+        [0u8; 4]
+    );
+    let tree = tensord::storage::held(&store, reference["revision"].as_str().unwrap()).unwrap();
+    let variant = reference["variant"].as_str().unwrap();
+    let (_, header) = tensorfs_core::fetch::variant_of_tree(
+        &store.tree(&tree).unwrap(),
+        (!variant.is_empty()).then_some(variant),
+    )
+    .unwrap();
+    assert_eq!(header.id(), run["result"]["checkpoint"].as_str().unwrap());
+    assert_eq!(
+        store
+            .checkpoint(&header)
+            .unwrap()
+            .read("model", "table")
+            .unwrap(),
+        (0u8..=255).collect::<Vec<_>>()
+    );
+    let named = store.resolve("local/output", None).unwrap();
+    assert_eq!(named.tree, Some(tree));
+    assert_eq!(named.header, header);
+    assert!(
+        !home.root().join("keys").exists(),
+        "a local conversion created sign-in credentials"
     );
 }
 
