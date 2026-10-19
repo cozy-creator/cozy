@@ -19,7 +19,10 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 #[cfg(feature = "store")]
-use tensorfs_core::{format::Header, ids::ObjectRef, store2::Checkpoint};
+use tensorfs_core::{format::Header, ids::ObjectRef};
+
+#[cfg(feature = "store")]
+use crate::checkpoint::Ck;
 
 use crate::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUevent, CUstream, CtxGuard, Handle};
 use crate::host::HostMem;
@@ -591,13 +594,14 @@ impl Gpu {
     /// without, the chunk files do, through the page cache: `files` (a grant's descriptors), or
     /// the checkpoint's own paths.
     #[cfg(feature = "store")]
-    pub fn register(self: &Arc<Self>, name: &str, ck: &Checkpoint, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<WeightSet>> {
+    pub fn register<'c>(self: &Arc<Self>, name: &str, ck: impl Into<Ck<'c>>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<WeightSet>> {
+        let ck = ck.into();
         let (layout, source) = open_checkpoint(ck, regions, false, files)?;
         let host = host_fd.map(|fd| HostMem::adopt_sealed(fd, &layout)).transpose()?;
         if host.as_ref().is_some_and(|h| h.window().is_some()) {
             return Err(Error::Invalid("a streamed host layout: register takes a whole sealed layout".into()));
         }
-        let parts = parts(ck.header(), &layout);
+        let parts = parts(ck.header, &layout);
         self.insert(name, layout, source, host, parts)
     }
 
@@ -1326,13 +1330,14 @@ pub struct HostSet {
 
 impl Host {
     #[cfg(feature = "store")]
-    pub fn register(&self, name: &str, ck: &Checkpoint, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<HostSet>> {
+    pub fn register<'c>(&self, name: &str, ck: impl Into<Ck<'c>>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<HostSet>> {
+        let ck = ck.into();
         let (layout, source) = open_checkpoint(ck, regions, false, files)?;
         let host = host_fd.map(|fd| HostMem::adopt_sealed(fd, &layout)).transpose()?;
         if host.as_ref().is_some_and(|h| h.window().is_some()) {
             return Err(Error::Invalid("a streamed host layout: register takes a whole sealed layout".into()));
         }
-        let parts = parts(ck.header(), &layout);
+        let parts = parts(ck.header, &layout);
         let regs = Mutex::new(vec![(None, false); layout.regions.len()]);
         Ok(Arc::new(HostSet { name: name.into(), parts, src: Src { layout: Arc::new(layout), source, host }, regs }))
     }
@@ -1424,9 +1429,9 @@ pub struct HostPinned {
 /// with this (or `seal`), so the two agree by construction; `HostMem::adopt_sealed` checks the
 /// digest.
 #[cfg(feature = "store")]
-pub fn open_checkpoint(ck: &Checkpoint, regions: &[Vec<String>], direct_io: bool, files: Option<Vec<(ObjectRef, File)>>) -> Result<(Layout, Source)> {
+pub fn open_checkpoint(ck: Ck<'_>, regions: &[Vec<String>], direct_io: bool, files: Option<Vec<(ObjectRef, File)>>) -> Result<(Layout, Source)> {
     let components: Vec<&str> = regions.iter().flatten().filter_map(|t| t.split_once('/').map(|(c, _)| c)).collect();
-    let plan = crate::checkpoint::read_plan(ck.header(), &components);
+    let plan = crate::checkpoint::read_plan(ck.header, &components);
     let files = match files {
         Some(f) => f,
         None => crate::checkpoint::chunk_files(ck, &plan)?,
@@ -1438,8 +1443,8 @@ pub fn open_checkpoint(ck: &Checkpoint, regions: &[Vec<String>], direct_io: bool
 /// (`files`, else the checkpoint's paths): the memfd `register(host_fd=)` adopts, the same
 /// layout by construction.
 #[cfg(feature = "store")]
-pub fn seal(ck: &Checkpoint, regions: &[Vec<String>], name: &str, threads: usize, files: Option<Vec<(ObjectRef, File)>>) -> Result<OwnedFd> {
-    let (layout, source) = open_checkpoint(ck, regions, true, files)?;
+pub fn seal<'c>(ck: impl Into<Ck<'c>>, regions: &[Vec<String>], name: &str, threads: usize, files: Option<Vec<(ObjectRef, File)>>) -> Result<OwnedFd> {
+    let (layout, source) = open_checkpoint(ck.into(), regions, true, files)?;
     crate::host::fill_sealed(name, &layout, &source, threads, &IoTally::default(), None)
 }
 
