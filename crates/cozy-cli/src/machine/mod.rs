@@ -77,6 +77,11 @@ enum Verb {
         /// https://…/<wheel>#sha256=<hex>, which the machine fetches itself.
         #[arg(long, value_name = "FILE|URL")]
         tensorfs_wheel: Option<std::path::PathBuf>,
+        /// Run this dev `cozy` binary as the machine (dev-build `build=cozy`): a local file, or
+        /// https://…#sha256=<hex>. The machine checks it runs there before its accepted runs drain;
+        /// on `local` it becomes this computer's cozy, which `cozy update` returns to a release.
+        #[arg(long, value_name = "FILE|URL")]
+        tensord: Option<std::path::PathBuf>,
         /// Use at most this much of each GPU's memory (`8GiB`), as a smaller card would; `off`
         /// lifts it. The machine keeps it in its config, across updates and restarts.
         #[arg(long, value_name = "SIZE|off", value_parser = gpu_memory_limit)]
@@ -131,8 +136,9 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             name,
             runtime_wheel,
             tensorfs_wheel,
+            tensord,
             gpu_memory_limit,
-        } => end::update(ctx, &name, runtime_wheel, tensorfs_wheel, gpu_memory_limit).await,
+        } => end::update(ctx, &name, runtime_wheel, tensorfs_wheel, tensord, gpu_memory_limit).await,
         Verb::Toolchain {
             verb: ToolchainVerb::Install { on },
         } => end::toolchain(ctx, &on).await,
@@ -252,8 +258,12 @@ mod tests {
             memory_limit_bytes: limit,
             ..Default::default()
         };
-        let status = cozy_proto::calcifer::MachineStatus { gpus: vec![gpu(8 << 30), gpu(0)], ..Default::default() };
-        let cells: Vec<String> = status_fields(&status).into_iter().filter(|(k, _)| k == "GPU 0").map(|(_, v)| v).collect();
-        assert_eq!(cells, ["RTX 5070 · 12 GiB · limited to 8.0 GiB", "RTX 5070 · 12 GiB"]);
+        let field = |gpus| {
+            let status = cozy_proto::calcifer::MachineStatus { gpus, ..Default::default() };
+            status_fields(&status).into_iter().find(|(k, _)| k == "gpu memory limit").map(|(_, v)| v)
+        };
+        assert_eq!(field(vec![gpu(8 << 30), cozy_proto::calcifer::Gpu { index: 1, ..gpu(8 << 30) }]).as_deref(),
+            Some("8.0 GiB of GPU 0's 12 GiB, GPU 1's 12 GiB"));
+        assert_eq!(field(vec![gpu(0)]), None);
     }
 }

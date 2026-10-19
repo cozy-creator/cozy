@@ -96,7 +96,10 @@ pub(crate) fn rows(ctx: &Context, list: &MachineList) -> Vec<Vec<String>> {
         let rental = m.rental.as_ref();
         vec![
             m.name.clone(),
-            kind(m).into(),
+            match m.status.as_ref().is_some_and(|s| s.dev) {
+                true => format!("{} dev", kind(m)),
+                false => kind(m).into(),
+            },
             gpus_cell(m),
             family_cell(m.status.as_ref()),
             state_cell(m),
@@ -176,6 +179,9 @@ pub(crate) fn record(ctx: &Context, m: &Machine) -> output::Record {
         if let Some(warning) = &r.provider_warning {
             record = record.field("provider", warning);
         }
+        if let Some(digest) = &r.base_worker_image_digest {
+            record = record.field("image", digest);
+        }
     }
     if let Some(since) = unreachable_since(m) {
         record = record.note(format!(
@@ -225,11 +231,21 @@ pub(crate) fn record(ctx: &Context, m: &Machine) -> output::Record {
 /// What a machine reports of itself, one fact per line, GPUs by number.
 pub fn status_fields(status: &MachineStatus) -> Vec<(String, String)> {
     let mut fields = vec![
-        ("version".into(), status.version.clone()),
+        (
+            "version".into(),
+            match status.dev {
+                true => format!("{} (dev)", status.version),
+                false => status.version.clone(),
+            },
+        ),
         ("platform".into(), status.platform.clone()),
         ("phase".into(), status.phase.clone()),
     ];
-    for (key, value) in [("runtime", &status.runtime), ("tensorfs", &status.tensorfs)] {
+    let commit = [("commit", &status.commit)];
+    for (key, value) in commit
+        .into_iter()
+        .chain([("runtime", &status.runtime), ("tensorfs", &status.tensorfs)])
+    {
         if !value.is_empty() {
             fields.push((key.into(), value.clone()));
         }
@@ -239,10 +255,6 @@ pub fn status_fields(status: &MachineStatus) -> Vec<(String, String)> {
     }
     for gpu in &status.gpus {
         let mut cell = format!("{} · {} GiB", gpu.name, gpu.memory_bytes >> 30);
-        if gpu.memory_limit_bytes > 0 {
-            // The card's own size stays: a limited card is not mistaken for a smaller one.
-            cell += &format!(" · limited to {}", crate::output::bytes(gpu.memory_limit_bytes));
-        }
         for part in [&gpu.family, &gpu.memory_class].into_iter().flatten() {
             cell += &format!(" · {part}");
         }
@@ -250,6 +262,13 @@ pub fn status_fields(status: &MachineStatus) -> Vec<(String, String)> {
             cell += &format!(" · driver {}", gpu.driver);
         }
         fields.push((format!("GPU {}", gpu.index), cell));
+    }
+    // Beside each card's own size, so a limited card is not mistaken for a smaller one.
+    let limited: Vec<_> = status.gpus.iter().filter(|g| g.memory_limit_bytes > 0).collect();
+    if let Some(first) = limited.first() {
+        let cards: Vec<String> = limited.iter().map(|g| format!("GPU {}'s {} GiB", g.index, g.memory_bytes >> 30)).collect();
+        let limit = crate::output::bytes(first.memory_limit_bytes);
+        fields.push(("gpu memory limit".into(), format!("{limit} of {}", cards.join(", "))));
     }
     if status.disk_total_bytes > 0 {
         fields.push((

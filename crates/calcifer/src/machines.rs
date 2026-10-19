@@ -812,6 +812,7 @@ pub(crate) async fn create(
             hub,
             gpus,
             disk_gb,
+            image,
         } => {
             let key = headers
                 .get("idempotency-key")
@@ -830,7 +831,7 @@ pub(crate) async fn create(
                 })?;
             let rented = api
                 .machines
-                .rent(key, &hub, &sku, gpus, disk_gb)
+                .rent(key, &hub, &sku, gpus, disk_gb, image)
                 .await
                 .map_err(Refusal)?;
             let status = match rented.replay {
@@ -1028,6 +1029,8 @@ fn status(frame: &v1::StatusFrame, hubs: &Hubs) -> MachineStatus {
     MachineStatus {
         worker_id: frame.worker_id.clone(),
         version: frame.version.clone(),
+        commit: frame.commit.clone(),
+        dev: frame.dev,
         platform: frame.platform.clone(),
         phase: frame.phase.clone(),
         runtime: frame.runtime.clone(),

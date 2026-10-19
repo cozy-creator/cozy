@@ -127,6 +127,11 @@ impl RunToken {
         })
     }
 
+    /// Its `exp` has passed.
+    pub fn expired(&self) -> bool {
+        now() >= self.expires
+    }
+
     /// Why the capability no longer serves, if it does not.
     pub fn ended(&self) -> Option<Ended> {
         self.state.lock().unwrap().ended.clone()

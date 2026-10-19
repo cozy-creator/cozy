@@ -232,7 +232,7 @@ pub fn version() -> io::Result<()> {
     let record = Version {
         name: "tensord",
         version: env!("CARGO_PKG_VERSION"),
-        commit: option_env!("TENSORD_COMMIT"),
+        commit: Some(cozy_proto::COMMIT),
         api: ["cozy.machine.v1"],
         capabilities,
     };
@@ -514,6 +514,9 @@ fn start_api(
         contexts: Default::default(),
     }));
     crate::calls::Calls::configure(service, machine.clone(), backend.runs.as_ref())?;
+    if let Some(runs) = &backend.runs {
+        crate::api::machine_runs::resume(runs)?;
+    }
     listener.set_nonblocking(true)?;
     #[derive(serde::Serialize)]
     struct Ready<'a> {

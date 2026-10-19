@@ -3,6 +3,7 @@
 //! its environment, as a computer's machine does, so its Status carries its store, disk, models and
 //! environments. Its TLS identity outlives a restart.
 use std::{
+    io::Write as _,
     os::unix::{fs::PermissionsExt as _, process::CommandExt as _},
     path::Path,
     process::{Child, Command, Stdio},
@@ -290,6 +291,15 @@ fn probe() {
         loaded.as_deref(),
         Some(want.as_str()),
         "a machine updated to {runtime:?} runs another Runtime: {probe:?}"
+    );
+    // Past libtest's capture: a silent pass reads as missing.
+    let version = Path::new(&runtime)
+        .file_name()
+        .and_then(|n| n.to_str()?.split('-').nth(1));
+    let _ = writeln!(
+        std::io::stderr(),
+        "named Runtime {} (commit {want}) loads: asserted",
+        version.unwrap_or("?")
     );
 }
 

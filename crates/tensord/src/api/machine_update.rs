@@ -8,7 +8,7 @@
 //! that lost the stream across the restart follows its events again after its cursor and reads the
 //! outcome.
 use super::{auth::VerifiedActor, backend::MachineBackend, v1, MachineIdentity};
-use crate::machine::update::{Choice, Request, Status as Update, Updates};
+use crate::machine::update::{Choice, Request, Status as Update, Updates, BINARY};
 use cozy_proto::error::Error;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio_stream::{wrappers::ReceiverStream, Stream};
@@ -50,6 +50,8 @@ struct Cohort {
     cozy: Option<String>,
     /// The most memory each GPU offers, in bytes; 0 lifts it (`--gpu-memory-limit`).
     gpu_memory_limit: Option<u64>,
+    /// A dev `cozy` binary (`--tensord`): the `binary` input's file, or `{url, sha256}`.
+    binary: Option<Member>,
     #[serde(flatten)]
     unknown: BTreeMap<String, serde_json::Value>,
 }
@@ -169,6 +171,34 @@ fn stage(
     for name in cohort.unknown.keys() {
         tracing::warn!("update {id}: ignoring unknown payload field {name:?}");
     }
+    // The file an input binds to `member`, staged as `file` and held to its digest.
+    let held = |member: &str, file: &str| -> Result<Option<Choice>, Error> {
+        let Some(input) = spec.inputs.iter().find(|i| i.field == member) else {
+            return Ok(None);
+        };
+        let sha256 = input
+            .digest
+            .strip_prefix("sha256:")
+            .filter(|h| h.len() == 64)
+            .ok_or_else(|| Error::validation("invalid_digest", "an input digest is sha256:<64 hex>"))?;
+        let mut object = backend.object(actor, sha256).map_err(|e| {
+            Error::conflict(
+                "input_unwritten",
+                format!("the {member} file {} is not held here; PUT it first: {}", input.digest, e.message),
+            )
+        })?;
+        let (staged, _) = updates
+            .stage(file, &mut object)
+            .map_err(|(code, message)| refusal(code, message))?;
+        if staged != sha256 {
+            return Err(Error::internal("custody_corrupt", "the staged file differs from its object"));
+        }
+        Ok(Some(Choice {
+            file: file.into(),
+            sha256: staged,
+            ..Default::default()
+        }))
+    };
     let choose = |member: &str, value: Option<Member>| -> Result<Option<Choice>, Error> {
         let value = match value {
             None => return Ok(None),
@@ -180,34 +210,19 @@ fn stage(
             }
             Some(Member::Named(value)) => value,
         };
-        let Some(input) = spec.inputs.iter().find(|i| i.field == member) else {
-            return Ok(Some(Choice {
-                version: value,
-                ..Default::default()
-            }));
-        };
-        let sha256 = input
-            .digest
-            .strip_prefix("sha256:")
-            .filter(|h| h.len() == 64)
-            .ok_or_else(|| Error::validation("invalid_digest", "an input digest is sha256:<64 hex>"))?;
-        let mut object = backend.object(actor, sha256).map_err(|e| {
-            Error::conflict(
-                "input_unwritten",
-                format!("the {member} wheel {} is not held here; PUT it first: {}", input.digest, e.message),
-            )
-        })?;
-        let (staged, _) = updates
-            .stage(&value, &mut object)
-            .map_err(|(code, message)| refusal(code, message))?;
-        if staged != sha256 {
-            return Err(Error::internal("custody_corrupt", "the staged wheel differs from its object"));
-        }
-        Ok(Some(Choice {
-            file: value,
-            sha256: staged,
+        Ok(Some(held(member, &value)?.unwrap_or(Choice {
+            version: value,
             ..Default::default()
-        }))
+        })))
+    };
+    let binary = match cohort.binary {
+        None => None,
+        Some(Member::Fetched { url, sha256 }) => Some(
+            Choice::binary_at(&url, &sha256).map_err(|why| super::http::refused("binary_refused", why))?,
+        ),
+        Some(Member::Named(_)) => Some(held("binary", BINARY)?.ok_or_else(|| {
+            Error::validation("input_missing", "a binary is the run's `binary` input, or {url, sha256}")
+        })?),
     };
     let toolchain = match cohort.toolchain.as_deref() {
         None => false,
@@ -231,6 +246,7 @@ fn stage(
         tensorfs: choose("tensorfs", cohort.tensorfs)?,
         cozy: cohort.cozy,
         gpu_memory_limit: limit,
+        binary,
         toolchain,
     };
     updates

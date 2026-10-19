@@ -22,6 +22,7 @@ toml.workspace = true
 toml_edit.workspace = true
 fs2.workspace = true
 libc.workspace = true
+self-replace.workspace = true
 rusqlite = { workspace = true, features = ["fallible_uint"] }
 uuid = { version = "1", features = ["v4"] }
 nix = { workspace = true, features = ["fs", "socket", "uio", "user", "signal", "process", "net"] }
