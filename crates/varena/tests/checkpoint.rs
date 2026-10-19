@@ -265,3 +265,27 @@ fn give_takes_a_busy_sets_unbound_slot_never_a_bound_one() {
     let _pin = ws.bind(0, 0).unwrap();
     assert_eq!(slots(), 1, "the next stream maps one again");
 }
+
+#[test]
+fn tensorfs_source_context_lives_until_the_last_bound_region_drops() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let fx = Fixture::new("source-context");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let called = calls.clone();
+    let context = Arc::new(());
+    let weak = Arc::downgrade(&context);
+    let view = View::from(&fx.ck).with_fetch(move |objects| {
+        let _keep = &context;
+        assert!(!objects.is_empty());
+        called.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    });
+    let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
+    let set = Host.register("owned", view, &rs, None, None).unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let pin = set.bind(0).unwrap();
+    drop(set);
+    assert!(weak.upgrade().is_some(), "bound region lost its source context");
+    drop(pin);
+    assert!(weak.upgrade().is_none(), "released placement retained its source context");
+}

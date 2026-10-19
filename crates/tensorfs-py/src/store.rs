@@ -868,7 +868,9 @@ impl PyCheckpoint {
         };
         if closed { return Err(invalid(py, "the checkpoint is closed")); }
         Ok(match access {
-            Some(access) => tensorfs_core::io::view::View::from(&access.checkpoint),
+            Some(access) => tensorfs_core::io::view::View::from(&access.checkpoint).with_fetch(move |objects| {
+                if let Some(remote) = &access.remote { remote.fetch(objects, 0) } else { Ok(()) }
+            }),
             None => tensorfs_core::io::view::View::parsed(self.header.clone()),
         })
     }

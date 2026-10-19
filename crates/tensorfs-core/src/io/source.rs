@@ -1,5 +1,5 @@
-//! Owned byte sources for placement. TensorFS keeps verified descriptors and checkpoint/GC
-//! custody, then runs every transfer through the same host/device read engine.
+//! Owned byte sources for placement. TensorFS keeps verified descriptors and checkpoint
+//! source context, then runs every transfer through the same host/device read engine.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -113,7 +113,7 @@ impl Source {
         }
     }
 
-    /// Retain the checkpoint's GC hold together with the opened chunk descriptors.
+    /// Retain the checkpoint source and callbacks together with the opened chunk descriptors.
     #[cfg(feature = "store")]
     pub fn checkpoint(
         view: &super::view::View,
@@ -240,13 +240,9 @@ impl Source {
         tally.direct_bytes.fetch_add(stats.direct, Relaxed);
         tally.inline_bytes.fetch_add(inline, Relaxed);
         if mode == Mode::Buffered {
-            tally
-                .buffered_bytes
-                .fetch_add(stats.cached.saturating_sub(inline), Relaxed);
+            tally.buffered_bytes.fetch_add(stats.cached, Relaxed);
         } else {
-            tally
-                .cached_bytes
-                .fetch_add(stats.cached.saturating_sub(inline), Relaxed);
+            tally.cached_bytes.fetch_add(stats.cached, Relaxed);
         }
         if matches!(dst, Dst::Host { .. }) && stats.bytes > 0 {
             super::metrics::record(super::metrics::Copy {

@@ -1,6 +1,7 @@
 //! Stored byte descriptions for placement callers. Header details and chunk opens stay here.
 
 use std::fs::File;
+use std::sync::Arc;
 
 use crate::failure::{fail, Kind, Result};
 use crate::format::Header;
@@ -8,10 +9,13 @@ use crate::ids::ObjectRef;
 use crate::read::{ObjectRange, Order, PlanItem, ReadPlan, Source};
 use crate::store2::Checkpoint;
 
+type Fetch = dyn Fn(&[crate::format::ObjectRef]) -> Result<()> + Send + Sync;
+
 #[derive(Clone)]
 pub struct View {
     header: Header,
     stored: Option<Checkpoint>,
+    fetch: Option<Arc<Fetch>>,
 }
 
 pub struct Part {
@@ -27,6 +31,7 @@ impl From<&Checkpoint> for View {
         View {
             header: checkpoint.header().clone(),
             stored: Some(checkpoint.clone()),
+            fetch: None,
         }
     }
 }
@@ -36,7 +41,17 @@ impl View {
         View {
             header,
             stored: None,
+            fetch: None,
         }
+    }
+
+    /// Keep the source context and use its one downloader for the selected chunks.
+    pub fn with_fetch(
+        mut self,
+        fetch: impl Fn(&[crate::format::ObjectRef]) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.fetch = Some(Arc::new(fetch));
+        self
     }
 
     pub fn has_source(&self) -> bool {
@@ -113,13 +128,29 @@ impl View {
         let Some(checkpoint) = &self.stored else {
             return fail(Kind::Unsupported, "a parsed header has no chunk source");
         };
-        chunks
+        let objects = chunks
             .iter()
             .map(|&index| {
-                let chunk = &self.header.chunks[index];
+                self.header
+                    .chunks
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| crate::failure::Failure {
+                        kind: Kind::Invalid,
+                        detail: format!("no chunk {index}"),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(fetch) = &self.fetch {
+            fetch(&objects)?;
+        }
+        chunks
+            .iter()
+            .zip(objects)
+            .map(|(&index, chunk)| {
                 Ok((
                     ObjectRef {
-                        sha256: chunk.sha256.clone(),
+                        sha256: chunk.sha256,
                         length: chunk.length,
                     },
                     checkpoint.chunk(index)?,
