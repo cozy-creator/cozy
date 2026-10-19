@@ -21,7 +21,7 @@ import time
 import traceback
 from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Protocol
 
@@ -412,7 +412,9 @@ class Request:
 class Memory:
     """This process's device: every loaded model, cache and request on it."""
 
-    def __init__(self, device: torch.device, ledger: LedgerGrant | None, mode: Mode) -> None:
+    def __init__(
+        self, device: torch.device, ledger: LedgerGrant | None, mode: Mode, limit: int | None
+    ) -> None:
         cuda = device.type == "cuda"
         self.mode, self.device, self.gpu = mode, device, (device.index or 0) if cuda else -1
         self.core: Gpu | Host = Gpu(self.gpu) if cuda else Host()
@@ -434,18 +436,32 @@ class Memory:
         #: a ledger capacity below the card (`gpu_memory_limit`, §5.6), and the card's total
         self.limit: int | None = None
         self.total = 0
-        if ledger is not None and isinstance(self.core, Gpu):
-            table = Ledger.adopt(ledger.fd, ledger.events)
+        #: TensorD's ledger, which takes host-tier deposits; standalone, one of its own (§2)
+        self.granted = ledger is not None
+        if isinstance(self.core, Gpu):
+            self.total = int(torch.cuda.mem_get_info(self.gpu)[1])
+            if ledger is not None:
+                table = Ledger.adopt(ledger.fd, ledger.events)
+            else:
+                uuid = str(torch.cuda.get_device_properties(self.gpu).uuid)
+                table = Ledger.create(uuid, min(self.total, limit or self.total))
             self.row = (table, table.claim())
             self.core.serve(self.row[1])  # other processes' asks, answered in Rust
-            self.total = int(torch.cuda.mem_get_info(self.gpu)[1])
             self.limit = table.capacity if table.capacity < self.total else None
 
     @classmethod
     def open(
-        cls, device: torch.device, ledger: LedgerGrant | None = None, mode: Mode = Mode.SHARED
+        cls,
+        device: torch.device | None = None,
+        ledger: LedgerGrant | None = None,
+        mode: Mode = Mode.SHARED,
+        limit: int | None = None,
     ) -> Memory:
-        return cls(device, ledger, mode)
+        """A TensorD executor's memory (`ledger`), or a standalone one (an engine using varena on
+        its own): GPU 0 by default, `limit` a cap like `gpu_memory_limit`."""
+        if device is None:
+            device = torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
+        return cls(device, ledger, mode, limit)
 
     @property
     def cuda(self) -> bool:
@@ -453,11 +469,26 @@ class Memory:
 
     # -- loading
 
-    def load(self, module: nn.Module, level: Level | str = Level.GPU) -> Model:
-        """Load `module`, built on meta, at `level` from `module._varena`. The first load seals
-        its host tier unless TensorD granted one (`sealed()`) and installs the hooks. At GPU level
-        it is warm and fills free room now; at RAM level its resident pages are idle."""
+    def load(
+        self,
+        module: nn.Module,
+        level: Level | str = Level.GPU,
+        *,
+        ck: tensorfs.Checkpoint | None = None,
+        component: str | None = None,
+    ) -> Model:
+        """Load `module`, built on meta, at `level` from `module._varena`; standalone, from a
+        store's checkpoint `ck` (`component`: its only one by default). Under TensorD the first
+        load seals its host tier unless one was granted (`sealed()`). At GPU level it is warm and
+        fills free room now; at RAM level its resident pages are idle."""
         level = Level(level)
+        declared = _declared(module)
+        if ck is not None and declared.weights is None:
+            names = [component] if component is not None else list(ck.tensors)
+            if len(names) != 1 or ck.manifest is None:
+                raise Unbound(f"name the component of {sorted(ck.tensors)} to load (`component=`)")
+            grant = WeightGrant(ck, names[0], f"sha256:{ck.manifest.sha256}")
+            vars(module)["_varena"] = replace(declared, weights=grant)
         with self.lock:
             model = self.by_module.get(module) or self._register(module)
             model.level = level
@@ -485,7 +516,7 @@ class Memory:
             n += 1
             name = f"{grant.key}#{n}"
         files, host_fd = list(grant.files) or None, grant.host_fd
-        if host_fd is None and self.cuda:
+        if host_fd is None and self.cuda and self.granted:
             host_fd = seal(grant.ck, regions, name, files=files)
         ws = self.core.register(name, grant.ck, regions, host_fd, files)
         model = Model(self, name, grant.key, module, ws, declared)
