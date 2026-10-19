@@ -5,6 +5,8 @@ run smoke "$TENSORFS_TEST_PYTHON" -c "import tensorfs, tensorfs.varena as v; pri
 run torch_cpu bash -c '"$TENSORFS_TEST_PYTHON" -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu || uv pip install -q --python "$TENSORFS_TEST_PYTHON" torch --index-url https://download.pytorch.org/whl/cpu' 
 run glue_limit "$TENSORFS_TEST_PYTHON" crates/tensorfs/scripts/varena-limit.py
 run glue_host "$TENSORFS_TEST_PYTHON" b2-host-smoke.py
+run diffusers bash -c '"$TENSORFS_TEST_PYTHON" -m pip install -q diffusers || uv pip install -q --python "$TENSORFS_TEST_PYTHON" diffusers'
+run glue_standalone "$TENSORFS_TEST_PYTHON" crates/tensorfs/scripts/varena-standalone.py
 run varena_ck cargo test -p varena --test checkpoint
 run varena_ledger cargo test -p varena --test ledger
 run tensord_ledger cargo test -p tensord --test gpu_ledger
