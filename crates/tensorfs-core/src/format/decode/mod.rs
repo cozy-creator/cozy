@@ -1,7 +1,7 @@
 //! The reference CPU decode (spec §6): a registry with one row per scheme, the checks every
-//! row shares, and the cores schemes are built from (`elem`, `grid`, `affine`, `table`,
-//! `blocks`). Each element is computed in f32 by the scheme's formula, then rounded once to the
-//! logical dtype (`round_L`). The Runtime's GPU decoders match it bit for bit.
+//! row shares, and the cores schemes are built from (`elem`, `grid`, `affine`, `blocks`). A row
+//! returns its decode as a `plan`: here each element is computed in f32 by the scheme's formula,
+//! then rounded once to the logical dtype (`round_L`); TensorFS's GPU kernels run the same plan.
 //!
 //! Adding a scheme: one family file holding its `Scheme` row and decode fn, one row in
 //! `SCHEMES` (and its `mod` line), nothing else here.
@@ -10,12 +10,13 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 
 use super::{Dtype, Encoding, Error, Result, Value};
+pub use plan::Plan;
 
 pub mod affine;
 pub mod blocks;
 pub mod elem;
 pub mod grid;
-pub mod table;
+pub mod plan;
 
 mod fp8;
 mod int8;
@@ -51,7 +52,6 @@ pub static SCHEMES: &[&Scheme] = &[
     // fp8.blockwise, mxfp4
     &fp8_blockwise::BLOCKWISE,
     &mxfp4::MXFP4,
-
     // gguf.*
     &gguf::Q4_0,
     &gguf::Q4_1,
@@ -85,7 +85,6 @@ pub static SCHEMES: &[&Scheme] = &[
     &bnb::NF4,
     &bnb::FP4,
     &bnb::INT8,
-
     // comfy.*
 ];
 
@@ -96,8 +95,9 @@ pub struct Scheme {
     /// Every param the decode reads; all are required, none has a default.
     pub params: &'static [Param],
     pub parts: &'static [Part],
-    /// The tensor's elements in f32, row-major; `decode` rounds them to the logical dtype.
-    pub decode: fn(&Ctx) -> Result<Vec<f32>>,
+    /// The decode's plan: the CPU computes its f32 elements, row-major, and `decode` rounds them
+    /// to the logical dtype; the GPU kernels run the same plan.
+    pub decode: for<'a> fn(&Ctx<'a>) -> Result<Plan<'a>>,
 }
 
 /// How a scheme views the logical tensor.
@@ -233,6 +233,25 @@ impl<'a> Ctx<'a> {
     pub fn lead(&self) -> &'a [u64] {
         &self.shape[..self.shape.len().saturating_sub(1)]
     }
+    /// The rows of one matrix: the second-last extent of a matrix view, else `R`.
+    pub fn height(&self) -> usize {
+        match self.shape {
+            [.., n, _] if self.cols > 0 && self.rows > 0 && self.shape.len() >= 2 => *n as usize,
+            _ => self.rows,
+        }
+        .max(1)
+    }
+}
+
+/// Where a plan's values go: the `[R, C]` view with `height` rows to a matrix. `swap`: the parts
+/// hold the logical tensor with its last two axes swapped (`transposed: true`), so the values are
+/// swapped back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Geometry {
+    pub rows: usize,
+    pub cols: usize,
+    pub height: usize,
+    pub swap: bool,
 }
 
 /// The logical tensor's bytes from its encoded parts.
@@ -242,7 +261,14 @@ pub fn decode(
     encoding: &Encoding,
     parts: &BTreeMap<&str, PartBytes>,
 ) -> Result<Vec<u8>> {
-    checked(dtype, shape, encoding, parts, true)
+    planned(dtype, shape, encoding, parts, true, |plan, g| {
+        let out = plan.values(g.rows, g.cols, g.height)?;
+        let out = match g.swap {
+            true => swap_last_two(&out, g.height, g.cols),
+            false => out,
+        };
+        Ok(round(dtype, &out))
+    })
 }
 
 /// Refuses what `decode` would refuse before reading a byte: the scheme, its params, the logical
@@ -253,34 +279,38 @@ pub fn check(
     encoding: &Encoding,
     parts: &BTreeMap<&str, PartBytes>,
 ) -> Result<()> {
-    checked(dtype, shape, encoding, parts, false).map(drop)
+    planned(dtype, shape, encoding, parts, false, |_, _| Ok(()))
 }
 
-fn checked(
+/// `f` with the tensor's checked plan (built when `read`, else `Values` of nothing) and its
+/// geometry; a refusal names the scheme.
+pub fn planned<R>(
     dtype: &Dtype,
     shape: &[u64],
     encoding: &Encoding,
     parts: &BTreeMap<&str, PartBytes>,
     read: bool,
-) -> Result<Vec<u8>> {
+    f: impl FnOnce(Plan, Geometry) -> Result<R>,
+) -> Result<R> {
     let name = encoding.scheme.as_str();
     let Some(scheme) = SCHEMES.iter().find(|s| s.name == name) else {
         return Err(Error::UnknownScheme(name.into()));
     };
-    run(scheme, dtype, shape, &encoding.params, parts, read).map_err(|e| match e {
+    run(scheme, dtype, shape, &encoding.params, parts, read, f).map_err(|e| match e {
         Error::Decode(detail) => Error::Decode(format!("{name}: {detail}")),
         e => e,
     })
 }
 
-fn run(
+fn run<R>(
     scheme: &'static Scheme,
     dtype: &Dtype,
     shape: &[u64],
     params: &BTreeMap<String, Value>,
     parts: &BTreeMap<&str, PartBytes>,
     read: bool,
-) -> Result<Vec<u8>> {
+    f: impl FnOnce(Plan, Geometry) -> Result<R>,
+) -> Result<R> {
     let fail = Error::Decode;
     for role in parts.keys() {
         if !scheme.parts.iter().any(|p| p.role == *role) {
@@ -364,24 +394,27 @@ fn run(
             return Err(fail(format!("part {} has shape {:?}", rule.role, p.shape)));
         }
     }
-    if !read {
-        return Ok(Vec::new());
-    }
-    let out = (scheme.decode)(&ctx)?;
-    debug_assert_eq!(out.len(), rows * cols);
-    let out = match transposed {
-        true => swap_last_two(&out, shape),
-        false => out,
+    let g = Geometry {
+        rows,
+        cols,
+        height: ctx.height(),
+        swap: transposed,
     };
-    Ok(round(dtype, &out))
+    let plan = match read {
+        true => (scheme.decode)(&ctx)?,
+        false => Plan {
+            core: plan::Core::Values(Vec::new()),
+            post: plan::Post::None,
+        },
+    };
+    f(plan, g)
 }
 
-/// Values of a `[lead…, r, c]` tensor, row-major, as `[lead…, c, r]`.
-pub fn swap_last_two(x: &[f32], shape: &[u64]) -> Vec<f32> {
-    let (r, c) = match *shape {
-        [.., r, c] if r * c > 0 => (r as usize, c as usize),
-        _ => return x.to_vec(),
-    };
+/// Values of matrices of `r × c`, row-major, as `c × r`.
+pub fn swap_last_two(x: &[f32], r: usize, c: usize) -> Vec<f32> {
+    if r * c == 0 {
+        return x.to_vec();
+    }
     let mut out = x.to_vec();
     for (m, mat) in x.chunks(r * c).enumerate() {
         for (k, v) in mat.iter().enumerate() {
@@ -415,7 +448,7 @@ fn describe(a: &Allowed) -> String {
 
 /// `round_L`: little-endian bytes of `xs` in `dtype` (F32, BF16 or F16), nearest even, NaN
 /// canonical.
-fn round(dtype: &Dtype, xs: &[f32]) -> Vec<u8> {
+pub(crate) fn round(dtype: &Dtype, xs: &[f32]) -> Vec<u8> {
     match dtype {
         Dtype::F32 => xs
             .iter()

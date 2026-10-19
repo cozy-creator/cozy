@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -20,13 +21,20 @@ const DOCUMENT_BYTES: usize = 32 << 20;
 
 /// Provider origins and credentials (`bearer <token>` or empty), each presented only to
 /// its own host. Tests point the origins at a loopback server and set `allow_local`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Access {
     pub huggingface: String,
     pub civitai: String,
     pub huggingface_token: String,
     pub civitai_token: String,
     pub allow_local: bool,
+    pub token: Option<Arc<dyn crate::fetch::TokenProvider>>,
+}
+
+impl std::fmt::Debug for Access {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Access").field("huggingface", &self.huggingface).field("civitai", &self.civitai).finish_non_exhaustive()
+    }
 }
 
 impl Default for Access {
@@ -37,6 +45,7 @@ impl Default for Access {
             huggingface_token: String::new(),
             civitai_token: String::new(),
             allow_local: false,
+            token: None,
         }
     }
 }
@@ -210,7 +219,7 @@ impl Access {
         }
         let client = Client::new(self.policy(p));
         crate::fetch::runtime()?.block_on(async {
-            let mut answer = client.get(url, &headers).await?;
+            let mut answer = client.get_authorized(url, &headers, self.token.as_deref()).await?;
             let status = answer.status();
             let ranged = range.is_some_and(|(from, _)| from > 0) || range.is_some_and(|(_, t)| t.is_some());
             match status {

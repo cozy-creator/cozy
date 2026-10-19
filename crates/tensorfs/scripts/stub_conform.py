@@ -178,11 +178,20 @@ def read_stub(path: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
                     continue
                 dec = decorators(node)
                 static = "staticmethod" in dec
-                out[node.name] = {
+                entry = {
                     "kind": "property" if "property" in dec else "callable",
                     "static": static,
                     "params": stub_params(node, drop_self=scope != "" and not static),
                 }
+                if "overload" in dec:
+                    previous = out.get(node.name)
+                    if previous is not None and "overloads" in previous:
+                        previous["overloads"].append(entry["params"])
+                    else:
+                        entry["overloads"] = [entry["params"]]
+                        out[node.name] = entry
+                else:
+                    out[node.name] = entry
             elif isinstance(node, ast.ClassDef):
                 if not public(node.name):
                     continue
@@ -244,12 +253,42 @@ def compare_params(
                 faults.append(f"{where}: parameter {r[0]!r} defaults to {rd}, the stub says {sd}")
 
 
+def compare_overloads(where: str, runtime: list[tuple[str, str, str]] | None,
+                      variants: list[list[tuple[str, str, str]]], faults: list[str]) -> None:
+    """Every typed branch describes accepted calls; one carries the full native ABI.
+
+    Mapping.get can require a default of a particular type in a narrower typed branch.
+    Its default=None branch still checks every native name, kind and default exactly.
+    """
+    if runtime is None:
+        return
+    full = False
+    for index, params in enumerate(variants, 1):
+        exact: list[str] = []
+        compare_params(where, runtime, params, exact)
+        full |= not exact
+        label = f"{where} overload {index}"
+        if len(params) > len(runtime):
+            faults.append(f"{label}: declares more parameters than the native callable")
+            continue
+        for native, declared in zip(runtime, params):
+            if native[:2] != declared[:2]:
+                faults.append(f"{label}: parameter {declared[0]!r} name/kind differs from the native callable")
+            elif declared[2] and (not native[2] or declared[2] not in {native[2], "..."}):
+                faults.append(f"{label}: default for {declared[0]!r} differs from the native callable")
+        if any(not default and kind not in {"VAR_POSITIONAL", "VAR_KEYWORD"}
+               for _, kind, default in runtime[len(params):]):
+            faults.append(f"{label}: omits a required native parameter")
+    if not full:
+        faults.append(f"{where}: no typed overload declares the complete native signature and defaults")
+
+
 def inherited(surface: dict[str, Any], name: str, seen: frozenset[str] = frozenset()) -> dict[str, Any]:
     """A class's members plus every member it inherits from bases declared in this surface.
 
-    `Refusal.detail` is set on the INSTANCE, and each subclass carries its own `code`. Both
+    `Error.detail` is set on the INSTANCE, and each subclass carries its own `code`. Both
     spellings have to compare equal to one declaration on the base, or the stub would have
-    to repeat two lines 149 times and the repetition would be the drift.
+    to repeat two lines for every family and the repetition would be the drift.
     """
     entry = surface.get(name)
     if entry is None or entry.get("kind") != "class" or name in seen:
@@ -269,7 +308,7 @@ def compare(runtime: dict[str, Any], stub: dict[str, Any], scope: str, faults: l
         )
     for name in sorted(set(stub) - set(runtime)):
         # A bare annotation may describe an INSTANCE attribute, which no class-level
-        # introspection can see; `Refusal.detail` is one. The direction that matters —
+        # introspection can see; `Error.detail` is one. The direction that matters —
         # an export the stub does not cover — stays absolute above.
         if stub[name].get("kind") == "value":
             continue
@@ -290,7 +329,10 @@ def compare(runtime: dict[str, Any], stub: dict[str, Any], scope: str, faults: l
                     + ("static in the extension, an instance method in the stub"
                        if r.get("static") else "an instance method in the extension, static in the stub")
                 )
-            compare_params(where, r.get("params"), s.get("params", []), faults)
+            if "overloads" in s:
+                compare_overloads(where, r.get("params"), s["overloads"], faults)
+            else:
+                compare_params(where, r.get("params"), s.get("params", []), faults)
         elif r["kind"] == "class":
             compare(
                 inherited(runtime, name) if not scope else r["members"],
@@ -351,28 +393,33 @@ def emit(runtime: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def check_errors_reexports(ext: Any) -> list[str]:
-    """`tensorfs.errors` names every refusal class, one at a time.
+def check_error_families(ext: Any) -> list[str]:
+    """Every native seat exposes the same twelve error families on tensorfs.Error."""
+    import tensorfs
 
-    The same defect in miniature: this module was one `__getattr__ -> type[BaseException]`,
-    so `except errors.SortOder` type-checked and raised `AttributeError` at the moment the
-    refusal it was written to catch arrived. The list is generated from Rust and mechanical;
-    what keeps it true is being compared here rather than being remembered.
-    """
-    from tensorfs import errors
-
-    base = ext.Refusal
-    live = {n for n in dir(ext) if isinstance(getattr(ext, n), type) and issubclass(getattr(ext, n), base)}
-    named = set(getattr(errors, "__all__", [])) - {"CODES"}
-    faults = [
-        f"tensorfs.errors: {name} is a refusal class the extension exports and this module "
-        f"does not re-export — `except errors.{name}` is an AttributeError that type-checks"
-        for name in sorted(live - named)
-    ]
-    faults += [
-        f"tensorfs.errors: __all__ names {name}, which the extension does not export"
-        for name in sorted(named - live)
-    ]
+    faults = []
+    for obsolete in ("Refusal", "CODES"):
+        if hasattr(ext, obsolete) or hasattr(tensorfs, obsolete):
+            faults.append(f"{obsolete}: legacy refusal surface remains exported")
+    expected = {"invalid", "format", "not_found", "integrity", "unknown_scheme", "decode",
+                "io", "full", "network", "denied", "unsupported", "conflict"}
+    live = {name: getattr(ext, name) for name in dir(ext)
+            if isinstance(getattr(ext, name), type) and issubclass(getattr(ext, name), ext.Error)
+            and getattr(ext, name) is not ext.Error}
+    if {cls.code for cls in live.values()} != expected:
+        faults.append("Error subclasses do not expose exactly the twelve public families")
+    for name, cls in live.items():
+        if getattr(tensorfs, name, None) is not cls:
+            faults.append(f"tensorfs.{name} does not re-export its native error family")
+    try:
+        ext.parse_header(b"not a header")
+    except ext.Error as error:
+        if error.code not in expected or not isinstance(error.detail, str):
+            faults.append("parse_header did not preserve its common typed failure")
+    except Exception as error:
+        faults.append(f"parse_header escaped the common Error boundary: {type(error).__name__}")
+    else:
+        faults.append("parse_header accepted invalid CBOR")
     return faults
 
 
@@ -410,14 +457,16 @@ def main() -> int:
         )
     if not hatches:
         compare(runtime, declared, "", faults)
-    faults.extend(check_errors_reexports(_ext))
+    faults.extend(check_error_families(_ext))
     # A compiled submodule (`_ext.varena`) is typed by the stub of the facade module that
-    # re-exports it (`varena.pyi`), and is held to it the same way.
+    # re-exports it (a module.pyi or package/__init__.pyi), held to the same full checks.
     for name in sorted(n for n in runtime if isinstance(getattr(_ext, n), types.ModuleType)):
-        sub_path = stub_path.with_name(f"{name}.pyi")
-        if not sub_path.exists():
-            faults.append(f"{name}: the extension exports this submodule and {sub_path.name} is absent")
+        candidates = [stub_path.with_name(f"{name}.pyi"), stub_path.parent / name / "__init__.pyi"]
+        available = [path for path in candidates if path.is_file()]
+        if len(available) != 1:
+            faults.append(f"{name}: expected one module or package stub, found {len(available)}: {available}")
             continue
+        sub_path = available[0]
         sub_declared, sub_hatches = read_stub(sub_path)
         sub_faults = [f"{hatch}: an escape hatch in the stub" for hatch in sub_hatches]
         if not sub_hatches:

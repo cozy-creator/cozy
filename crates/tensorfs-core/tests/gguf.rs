@@ -52,8 +52,8 @@ fn import(store: &Store, source: &Path) -> tensorfs_core::err::Result<Checkpoint
         progress: &|_, _, _| {},
         stop: None,
     };
-    let manifest = store.import(&req, None)?;
-    Ok(store.checkpoint(&manifest).unwrap())
+    let (header, _) = store.import(&req, None)?;
+    Ok(store.checkpoint(&header).unwrap())
 }
 
 /// A safetensors file of U8 tensors: name -> bytes.
@@ -173,13 +173,9 @@ fn llama_takes_upstream_names_and_exports_byte_identical() {
         assert_eq!(stored(&ck, key, role), bytes, "{name}");
     }
     let meta = &h.metadata;
-    assert_eq!(meta.get("normalized"), Some(&Value::Bool(true)));
-    assert_eq!(
-        meta.get("converters"),
-        Some(&Value::List(vec![Value::Str("gguf.llama".into())]))
-    );
+    assert_eq!(meta.get("source"), Some(&Value::Str(source.canonicalize().unwrap().display().to_string())));
     let record: serde_json::Value =
-        serde_json::from_slice(&ck.file("llama-moe.gguf.json").unwrap()).unwrap();
+        serde_json::from_slice(&ck.asset("model", "llama-moe.gguf.json").unwrap()).unwrap();
     let kv: BTreeMap<String, (String, serde_json::Value)> =
         serde_json::from_value::<Vec<(String, String, serde_json::Value)>>(record["kv"].clone())
             .unwrap()
@@ -239,8 +235,6 @@ fn flux_keeps_its_keys_and_exports_byte_identical() {
     ] {
         assert_eq!(glance(&ck, key), want, "{key}");
     }
-    let meta = &ck.header().metadata;
-    assert_eq!(meta.get("normalized"), Some(&Value::Bool(false)));
     let out = scratch.0.join("out");
     assert_eq!(export::gguf(&ck, &out).unwrap(), ["flux.gguf"]);
     assert_eq!(
