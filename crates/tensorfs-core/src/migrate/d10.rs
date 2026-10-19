@@ -7,12 +7,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
+use bytes::Bytes;
+use futures::StreamExt;
 use minicbor::Decoder;
 use serde::Deserialize;
 use serde_json::{json, Value as Json};
 
 use crate::failure::{fail, Failure, Kind, Result};
+use crate::fetch::{self, Client, Endpoint, Fetcher, Fresh, Origin, Payload, SourcePolicy, Want};
 use crate::format::{Component, Config, Header, ObjectRef, Release, Repo, Tree, Value, HEADER_PATH};
 use crate::import::{layout, remote};
 use crate::store2::{Pin, Store};
@@ -154,8 +158,9 @@ struct Doc {
 /// One repo in D10.
 pub struct Migrated {
     pub repo: Repo,
-    /// Every object the D10 repo cites besides chunks: headers, trees, assets, repo files.
-    pub objects: BTreeMap<ObjectRef, Vec<u8>>,
+    /// Every object the D10 repo cites besides chunks, each before what cites it: assets and
+    /// repo files, headers, trees.
+    pub objects: Objects,
     pub report: Json,
 }
 
@@ -167,6 +172,15 @@ struct Lane {
 }
 
 pub type Read<'a> = &'a dyn Fn(&ObjectRef) -> Result<Vec<u8>>;
+pub type Objects = Vec<(ObjectRef, Vec<u8>)>;
+
+fn add(objects: &mut Objects, bytes: Vec<u8>) -> ObjectRef {
+    let at = ObjectRef::of(&bytes);
+    if !objects.iter().any(|(o, _)| *o == at) {
+        objects.push((at.clone(), bytes));
+    }
+    at
+}
 
 pub struct Migrator<'t> {
     access: remote::Access,
@@ -188,14 +202,9 @@ impl<'t> Migrator<'t> {
     pub fn repo(&mut self, doc: &[u8], read: Read) -> Result<Migrated> {
         let old: OldRepo = serde_json::from_slice(doc).map_err(|e| invalid(format!("repo document: {e}")))?;
         let upstream = self.table.iter().find(|u| u.models.iter().any(|p| matches(p, &old.name)));
-        let mut objects = BTreeMap::new();
+        let mut objects = Objects::new();
         let mut lanes: HashMap<ObjectRef, Lane> = HashMap::new();
-        let put = |objects: &mut BTreeMap<ObjectRef, Vec<u8>>, tree: &Tree| -> Result<ObjectRef> {
-            let bytes = tree.to_json()?;
-            let at = ObjectRef::of(&bytes);
-            objects.insert(at.clone(), bytes);
-            Ok(at)
-        };
+        let put = |objects: &mut Objects, tree: &Tree| -> Result<ObjectRef> { Ok(add(objects, tree.to_json()?)) };
         let (mut releases, mut reports) = (Vec::new(), Vec::new());
         for r in &old.releases {
             let named = match (&r.tree, &r.lanes) {
@@ -250,7 +259,7 @@ impl<'t> Migrator<'t> {
 
     /// One old lane: its header in D10 (old tensors, filled run data, configs, assets) and its
     /// repo files; every lane file is checked to have landed in one of them.
-    fn lane(&mut self, manifest: &ObjectRef, upstream: Option<&Upstream>, read: Read, objects: &mut BTreeMap<ObjectRef, Vec<u8>>) -> Result<Lane> {
+    fn lane(&mut self, manifest: &ObjectRef, upstream: Option<&Upstream>, read: Read, objects: &mut Objects) -> Result<Lane> {
         let doc: Doc = serde_json::from_slice(&read(manifest)?).map_err(|e| invalid(format!("{}: {e}", manifest.id())))?;
         if !doc.format.starts_with("tensorfs.manifest/") {
             return fail(Kind::Invalid, format!("{} is a {}, not a manifest", manifest.id(), doc.format));
@@ -275,11 +284,7 @@ impl<'t> Migrator<'t> {
         }
         let tensored: Vec<String> = old.components().iter().map(|c| c.name.clone()).collect();
         let l = layout(bytes.clone(), &tensored)?;
-        let mut keep = |b: Vec<u8>| {
-            let at = ObjectRef::of(&b);
-            objects.insert(at.clone(), b);
-            at
-        };
+        let mut keep = |b: Vec<u8>| add(objects, b);
         let components = (l.components.into_iter())
             .map(|f| Component {
                 tensors: old.component(&f.name).map(|c| c.tensors.clone()).unwrap_or_default(),
@@ -311,8 +316,7 @@ impl<'t> Migrator<'t> {
         let new = Header::new(old.chunks.clone(), l.pipeline, components, metadata)?;
         let cbor = new.to_cbor()?;
         check(&old, &new, &cbor, &bytes, &repo_files)?;
-        let at = ObjectRef::of(&cbor);
-        objects.insert(at.clone(), cbor);
+        let at = add(objects, cbor);
         let mut report = json!({"old": manifest.id(), "header": at.id()});
         if !filled.is_empty() {
             report["filled"] = json!(filled);
@@ -414,32 +418,75 @@ fn head(out: &mut Vec<u8>, major: u8, n: u64) {
     }
 }
 
-/// The store at `root` in place: every repo of `refs/` in D10, then its objects, refs and
-/// format record. Nothing changes unless every repo migrates; pins naming old objects go.
-pub fn store(root: &Path, migrator: &mut Migrator) -> Result<Json> {
-    let read = |o: &ObjectRef| -> Result<Vec<u8>> {
-        let bytes = fs::read(root.join(o.key()))?;
-        match bytes.len() as u64 == o.length {
-            true => Ok(bytes),
-            false => fail(Kind::Integrity, format!("{} is {} bytes, not {}", o.id(), bytes.len(), o.length)),
+/// Repo `name` at `endpoint` in D10: the old objects it cites fetched into `scratch` over
+/// `client`, what the D10 document adds uploaded where missing, then the document replaced while
+/// it is as read (read and migrated again when another writer won).
+pub fn migrate(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &Store, migrator: &mut Migrator) -> Result<Json> {
+    let rt = fetch::runtime()?;
+    loop {
+        let Fresh::Doc(doc, etag) = rt.block_on(endpoint.repo_bytes(name, None))? else {
+            return fail(Kind::NotFound, format!("no repo {name} at {}", endpoint.url()));
+        };
+        rt.block_on(old_objects(endpoint, client, scratch, &doc))?;
+        let mut m = migrator.repo(&doc, &|o| Ok(scratch.read(o)?))?;
+        let bytes = m.repo.to_json()?;
+        if bytes == doc {
+            return Ok(m.report);
         }
-    };
-    let mut repos = Vec::new();
-    for org in fs::read_dir(root.join("refs"))? {
-        for file in fs::read_dir(org?.path())? {
-            let path = file?.path();
-            if path.extension().is_some_and(|e| e == "json") {
-                repos.push((migrator.repo(&fs::read(&path)?, &read)?, path));
-            }
+        let sent = rt.block_on(upload(endpoint, &m.objects))?;
+        if rt.block_on(endpoint.put_repo_bytes(name, bytes, Some(&etag)))? {
+            m.report["sent"] = json!({"objects": sent.0, "bytes": sent.1});
+            return Ok(m.report);
         }
     }
+}
+
+/// The manifests and checkpoints `doc` names, then each manifest's header and files.
+async fn old_objects(endpoint: &Arc<Endpoint>, client: &Client, scratch: &Store, doc: &[u8]) -> Result<()> {
+    let old: OldRepo = serde_json::from_slice(doc).map_err(|e| invalid(format!("repo document: {e}")))?;
+    let lanes = old.releases.iter().flat_map(|r| r.lanes.iter().flat_map(|l| l.values()));
+    let roots: Vec<ObjectRef> = lanes.chain(&old.checkpoints).cloned().collect();
+    let (origin, want): (Arc<dyn Origin>, Want) = (endpoint.clone(), Want::default());
+    let fetcher = Fetcher::new(Arc::new(scratch.clone()), client.clone(), None, fetch::Config::default());
+    fetcher.objects(&origin, &roots, &want).await?;
+    let mut files = Vec::new();
+    for root in &roots {
+        let doc: Option<Doc> = serde_json::from_slice(&scratch.read(root)?).ok();
+        files.extend(doc.filter(|d| d.format.starts_with("tensorfs.manifest/")).into_iter().flat_map(|d| d.files.into_values()));
+    }
+    fetcher.objects(&origin, &files, &want).await?;
+    Ok(())
+}
+
+/// Sends what `endpoint` lacks of `objects`: how many it sent, and their bytes.
+async fn upload(endpoint: &Endpoint, objects: &Objects) -> Result<(usize, u64)> {
+    let mut sends = futures::stream::iter(objects)
+        .map(|(object, bytes)| async move {
+            let bytes = Bytes::from(bytes.clone());
+            let sent = endpoint.upload(object, &move || Ok(Payload::Bytes(bytes.clone()))).await?;
+            Ok::<_, crate::err::Refusal>((sent, object.length))
+        })
+        .buffered(16);
+    let mut sent = (0, 0);
+    while let Some(one) = sends.next().await {
+        if let (true, length) = one? {
+            sent = (sent.0 + 1, sent.1 + length);
+        }
+    }
+    Ok(sent)
+}
+
+/// The store at `root` in place: pins naming old objects go, the format record becomes this
+/// build's, and each repo of `refs/` migrates through the store as a directory endpoint.
+pub fn store(root: &Path, migrator: &mut Migrator) -> Result<Json> {
+    let root = root.canonicalize()?;
     let mut dropped = 0;
     for file in fs::read_dir(root.join("pins")).into_iter().flatten() {
         let path = file?.path();
         let pin: Option<Pin> = fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
         let old = |o: &ObjectRef| {
             let doc = |b: &[u8]| serde_json::from_slice::<Doc>(b).is_ok_and(|d| d.format.starts_with("tensorfs.manifest/"));
-            read(o).is_ok_and(|b| b.first() == Some(&0x85) || doc(&b))
+            fs::read(root.join(o.key())).is_ok_and(|b| b.first() == Some(&0x85) || doc(&b))
         };
         if pin.is_none_or(|p| p.roots.iter().any(old)) {
             fs::remove_file(&path)?;
@@ -449,15 +496,19 @@ pub fn store(root: &Path, migrator: &mut Migrator) -> Result<Json> {
     let io = |e: platform::Error| Failure { kind: Kind::Io, detail: e.to_string() };
     let format = format!("{{\"format\":\"tensorfs.store/{}\"}}", crate::STORE_FORMAT);
     platform::durable::replace(&root.join("format"), format.as_bytes(), 0o644).map_err(io)?;
-    let store = Store::open(root)?;
-    for (m, _) in &repos {
-        for (object, bytes) in &m.objects {
-            store.put(bytes.as_slice(), Some(object))?;
+    let store = Store::open(&root)?;
+    let client = Client::new(SourcePolicy::default());
+    let endpoint = Arc::new(Endpoint::new(&client, &root.to_string_lossy(), None)?);
+    let mut repos = Vec::new();
+    for org in fs::read_dir(root.join("refs"))? {
+        let org = org?.path();
+        for file in fs::read_dir(&org)? {
+            let path = file?.path();
+            if let (Some(o), Some(name), Some("json")) = (org.file_name(), path.file_stem(), path.extension().and_then(|e| e.to_str())) {
+                let name = format!("{}/{}", o.to_string_lossy(), name.to_string_lossy());
+                repos.push(migrate(&endpoint, &client, &name, &store, migrator)?);
+            }
         }
     }
-    for (m, path) in &repos {
-        platform::durable::replace(path, &m.repo.to_json()?, 0o644).map_err(io)?;
-    }
-    let reports: Vec<&Json> = repos.iter().map(|(m, _)| &m.report).collect();
-    Ok(json!({"store": root, "repos": reports, "pins_dropped": dropped}))
+    Ok(json!({"store": root, "repos": repos, "pins_dropped": dropped}))
 }
