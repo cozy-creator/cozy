@@ -489,11 +489,6 @@ impl Engine {
         Ok(runs)
     }
 
-    /// See `Journal::unsettled`.
-    pub(crate) fn unsettled(&self) -> io::Result<bool> {
-        self.journal.lock().unwrap().unsettled()
-    }
-
     /// The preparing run ends undispatched (warm success or preparation failure).
     pub fn end_preparation(&self, id: &str, outcome: Outcome) -> io::Result<Execution> {
         let record = self.journal.lock().unwrap().end_preparation(id, outcome);

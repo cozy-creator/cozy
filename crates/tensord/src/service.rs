@@ -347,7 +347,7 @@ impl Service {
     /// Nothing a restart would lose: no run started, no preparation in flight, and nothing waiting
     /// that could not prepare again. An update waits for this; queued runs run after it.
     pub fn settled(&self) -> io::Result<bool> {
-        Ok(self.preparing.load(std::sync::atomic::Ordering::Acquire) == 0 && !self.engine.unsettled()?)
+        Ok(self.preparing.load(std::sync::atomic::Ordering::Acquire) == 0 && !self.engine.with_journal(|journal| journal.unsettled())?)
     }
     pub fn hold_while(&self, held: impl Fn() -> bool + Send + Sync + 'static) {
         let _ = self.held.set(Box::new(held));
