@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{fail, invalid, Error, Result, Store};
+use super::retention::{self, DirectoryGuard, Retention};
 use crate::format::layout::ALIGN;
 use crate::format::{
     self, decode, variant_of, variant_path, Body, Component, Header, Location, ObjectRef,
@@ -26,6 +27,8 @@ pub struct Checkpoint {
     id: ObjectRef,
     header: Arc<Header>,
     header_file: Option<PathBuf>,
+    _retention: Option<Arc<Retention>>,
+    _directories: Arc<[DirectoryGuard]>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,12 +53,7 @@ fn write_view(path: &Path, bytes: &[u8]) -> Result<()> {
 impl Store {
     /// The cozytensors whose header is `header`.
     pub fn checkpoint(&self, header: &ObjectRef) -> Result<Checkpoint> {
-        Ok(Checkpoint {
-            objects: Objects::Store(self.clone()),
-            header: Arc::new(Header::from_cbor(&self.read(header)?)?),
-            id: header.clone(),
-            header_file: None,
-        })
+        Checkpoint::opened(Objects::Store(self.clone()), header.clone(), Header::from_cbor(&self.read(header)?)?, None)
     }
 
     /// The tree document `tree`.
@@ -71,6 +69,35 @@ impl Store {
 }
 
 impl Checkpoint {
+    fn opened(objects: Objects, id: ObjectRef, header: Header, header_file: Option<PathBuf>) -> Result<Self> {
+        let store = match &objects {
+            Objects::Store(store) | Objects::Folder { cache: Some(store), .. } => Some(store),
+            Objects::Folder { cache: None, .. } => None,
+        };
+        let mut directories = Vec::new();
+        let hold = if let Some(store) = store {
+            let hold = Retention::new(store, std::iter::once(id.clone()).chain(header.objects().cloned()))?;
+            // These immutable descriptors survive fork without touching an inherited mutex.
+            // The sidecars are outside the returned plain folders.
+            directories.push(retention::directory(&store.root().join("views").join(&id.sha256))?);
+            if matches!(&objects, Objects::Store(_)) {
+                directories.push(retention::directory(&store.root().join("snapshots").join(&id.sha256))?);
+            } else if let Objects::Folder { dir, .. } = &objects {
+                let root = fs::canonicalize(store.root()).map_err(fail("resolve", store.root()))?;
+                let real = fs::canonicalize(dir).map_err(fail("resolve", dir))?;
+                for area in ["snapshots", "views"] {
+                    if let Ok(relative) = real.strip_prefix(root.join(area)) {
+                        if let Some(first) = relative.components().next() {
+                            directories.push(retention::directory(&root.join(area).join(first.as_os_str()))?);
+                        }
+                    }
+                }
+            }
+            Some(hold)
+        } else { None };
+        Ok(Self { objects, id, header: Arc::new(header), header_file, _retention: hold, _directories: directories.into() })
+    }
+
     /// `variant` of the plain folder `dir` (its only one when `None`): its header file, and its
     /// chunks and assets from `dir/chunks/`, else from `cache`. Lengths are checked; digests are
     /// checked where bytes enter a store ([`Store::admit_folder`]).
@@ -78,12 +105,7 @@ impl Checkpoint {
         if dir.is_file() {
             let parent = dir.parent().unwrap_or_else(|| Path::new("."));
             let bytes = fs::read(dir).map_err(fail("read", dir))?;
-            return Ok(Checkpoint {
-                objects: Objects::Folder { dir: parent.to_path_buf(), cache: cache.cloned() },
-                header: Arc::new(Header::from_cbor(&bytes)?),
-                id: ObjectRef::of(&bytes),
-                header_file: Some(dir.to_path_buf()),
-            });
+            return Self::opened(Objects::Folder { dir: parent.to_path_buf(), cache: cache.cloned() }, ObjectRef::of(&bytes), Header::from_cbor(&bytes)?, Some(dir.to_path_buf()));
         }
         let name = match variant {
             Some(v) => variant_path(v),
@@ -109,15 +131,7 @@ impl Checkpoint {
             io::ErrorKind::NotFound => Error::Absent(path.display().to_string()),
             _ => fail("read", &path)(e),
         })?;
-        Ok(Checkpoint {
-            objects: Objects::Folder {
-                dir: dir.to_path_buf(),
-                cache: cache.cloned(),
-            },
-            header: Arc::new(Header::from_cbor(&bytes)?),
-            id: ObjectRef::of(&bytes),
-            header_file: Some(path),
-        })
+        Self::opened(Objects::Folder { dir: dir.to_path_buf(), cache: cache.cloned() }, ObjectRef::of(&bytes), Header::from_cbor(&bytes)?, Some(path))
     }
 
     /// The header's object: the cozytensors' id.
