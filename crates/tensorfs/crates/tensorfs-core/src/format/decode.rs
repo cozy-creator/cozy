@@ -40,7 +40,9 @@ pub enum NibbleOrder {
     HighFirst,
 }
 
-/// nvfp4's per-tensor `scale_2`: multiplied (ModelOpt) or divided (compressed-tensors).
+/// How nvfp4's per-tensor scales, `scale_2` and `input_scale`, apply: multiplied (ModelOpt,
+/// ComfyUI) or divided, being reciprocals (compressed-tensors' `weight_global_scale` and
+/// `input_global_scale`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalScale {
     Multiply,
@@ -86,15 +88,16 @@ fn encoding(scheme: &str, params: &[(&str, Value)]) -> Encoding {
 
 /// Each scheme with every param its decode reads; part dtypes and shapes say the rest.
 impl Encoding {
-    pub fn fp8_tensorwise() -> Encoding {
-        encoding("fp8.tensorwise", &[])
+    /// One scale for the tensor, stored as the producer wrote it: `F32`, `BF16` or `F16`.
+    pub fn fp8_tensorwise(scale: &Dtype) -> Encoding {
+        encoding("fp8.tensorwise", &[("scale_dtype", scale.name().into())])
     }
     /// `axis` 0: a scale per row; 1: per column.
     pub fn fp8_rowwise(axis: u64) -> Encoding {
         encoding("fp8.rowwise", &[("axis", axis.into())])
     }
-    pub fn int8_tensorwise() -> Encoding {
-        encoding("int8.tensorwise", &[])
+    pub fn int8_tensorwise(scale: &Dtype) -> Encoding {
+        encoding("int8.tensorwise", &[("scale_dtype", scale.name().into())])
     }
     pub fn int8_rowwise(axis: u64) -> Encoding {
         encoding("int8.rowwise", &[("axis", axis.into())])
@@ -134,7 +137,9 @@ pub fn decode(
     use Dtype::*;
     let scheme = encoding.scheme.as_str();
     let (required, optional, defined): (&[&str], &[&str], &[&str]) = match scheme {
-        "fp8.tensorwise" | "int8.tensorwise" => (&["scale", "weight"], &["input_scale"], &[]),
+        "fp8.tensorwise" | "int8.tensorwise" => {
+            (&["scale", "weight"], &["input_scale"], &["scale_dtype"])
+        }
         "fp8.rowwise" | "int8.rowwise" => (&["scale", "weight"], &[], &["axis"]),
         "int8.convrot" => (&["scale", "weight"], &[], &["rotation", "rotation_size"]),
         "mxfp8" => (&["scale", "weight"], &[], &["block_size", "scale_layout"]),
@@ -234,7 +239,13 @@ pub fn decode(
                 Some(shape),
                 0,
             )?;
-            let s = narrow(dtype, floats(part("scale", &[F32], None, 1)?)[0]);
+            let scale = match text("scale_dtype", &["F32", "BF16", "F16"])? {
+                "F32" => F32,
+                "BF16" => BF16,
+                _ => F16,
+            };
+            // The scale as stored, exactly: never rounded to the logical dtype first.
+            let s = floats(part("scale", &[scale], None, 1)?)[0];
             if parts.contains_key("input_scale") {
                 part("input_scale", &[F32], None, 1)?;
             }
@@ -348,6 +359,12 @@ fn floats(p: PartBytes) -> Vec<f32> {
             .iter()
             .map(|c| f32::from_le_bytes(*c))
             .collect(),
+        Dtype::BF16 => (b.as_chunks::<2>().0.iter())
+            .map(|c| f32::from_bits((u16::from_le_bytes(*c) as u32) << 16))
+            .collect(),
+        Dtype::F16 => (b.as_chunks::<2>().0.iter())
+            .map(|c| f16_to_f32(u16::from_le_bytes(*c)))
+            .collect(),
         Dtype::I8 => b.iter().map(|v| *v as i8 as f32).collect(),
         Dtype::F8_E4M3 => b.iter().map(|v| e4m3(*v)).collect(),
         Dtype::F8_E8M0 => (b.iter())
@@ -419,15 +436,6 @@ fn hadamard(x: &mut [i32]) {
     }
 }
 
-/// `x` rounded to the logical dtype and read back as f32.
-fn narrow(dtype: &Dtype, x: f32) -> f32 {
-    match dtype {
-        Dtype::BF16 => f32::from_bits((bf16(x) as u32) << 16),
-        Dtype::F16 => f16_to_f32(f16(x)),
-        _ => x,
-    }
-}
-
 /// Little-endian bytes of `xs` in `dtype` (F32, BF16 or F16).
 fn round(dtype: &Dtype, xs: &[f32]) -> Vec<u8> {
     match dtype {
@@ -473,8 +481,10 @@ fn f16(x: f32) -> u16 {
 
 fn f16_to_f32(h: u16) -> f32 {
     let (e, m) = (((h >> 10) & 31) as i32, (h & 0x3ff) as u32);
-    let v = match e {
-        0 => m as f32 * pow2(-24),
+    let v = match (e, m) {
+        (0, _) => m as f32 * pow2(-24),
+        (31, 0) => f32::INFINITY,
+        (31, _) => f32::NAN,
         _ => (1024 + m) as f32 * pow2(e - 25),
     };
     signed((h >> 8) as u8, 0x80, v)

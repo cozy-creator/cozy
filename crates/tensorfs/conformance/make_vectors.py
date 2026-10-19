@@ -28,13 +28,13 @@ def digest(label: str) -> dict:
 
 ENCODINGS = [
     ["fp8.rowwise", {"axis": 0}],
-    ["fp8.tensorwise", {}],
+    ["fp8.tensorwise", {"scale_dtype": "F32"}],
     ["int8.convrot", {"rotation": "hadamard", "rotation_size": 256}],
     ["int8.rowwise", {"axis": 0}],
     ["mxfp8", {"block_size": 32, "scale_layout": "row_major"}],
     ["nvfp4", {"block_size": 16, "global_scale": "multiply", "nibble_order": "low_first",
                "scale_layout": "row_major"}],
-    ["int8.tensorwise", {}],
+    ["int8.tensorwise", {"scale_dtype": "F32"}],
 ]
 
 

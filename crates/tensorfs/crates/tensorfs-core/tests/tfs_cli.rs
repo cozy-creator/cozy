@@ -142,9 +142,9 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
     };
     let k = |s: &str| format!("down_blocks.0.{s}");
     let want = [
-        ("fp8.tensorwise", k("attn1.to_v.weight"), [1024, 1024], "{}"),
+        ("fp8.tensorwise", k("attn1.to_v.weight"), [1024, 1024], r#"{scale_dtype: "F32"}"#),
         ("fp8.rowwise", k("attn1.to_q.weight"), [1024, 1024], "{axis: 0}"),
-        ("int8.tensorwise", k("attn2.to_v.weight"), [1024, 1024], "{}"),
+        ("int8.tensorwise", k("attn2.to_v.weight"), [1024, 1024], r#"{scale_dtype: "F32"}"#),
         ("int8.rowwise", k("attn2.to_k.weight"), [1024, 1024], "{axis: 0}"),
         ("int8.convrot", k("attn1.to_k.weight"), [1024, 1024], r#"{rotation: "hadamard", rotation_size: 256}"#),
         ("mxfp8", k("attn2.to_q.weight"), [1024, 1024], r#"{block_size: 32, scale_layout: "row_major"}"#),

@@ -154,8 +154,9 @@ is `producer.type` with the producer's type name verbatim (later `gguf.q4_k`, `g
 vendor-neutral standard keeps its bare name (`mxfp8`, `nvfp4`; later `mxfp4`).
 
 **Params** are snake_case keys in the producer's vocabulary (`axis`, `block_size`, `rotation`, `rotation_size`,
-`global_scale`, `nibble_order`, `scale_layout`). Every param the decode reads is required and none has a default, so
-the encoding shows the whole recipe; nothing a part's dtype or shape already says is repeated.
+`global_scale`, `nibble_order`, `scale_layout`, `scale_dtype`). Every param the decode reads is required and none has a
+default, so the encoding shows the whole recipe. Where a param repeats a part's dtype (`scale_dtype`), a reader MUST
+refuse a mismatch.
 
 **Four rules** bring any format in without new grammar:
 1. *Keep the producer's bytes.* Parts are the producer's packed bytes (int words, nibbles, block structs, swizzled
@@ -179,18 +180,23 @@ the encoding shows the whole recipe; nothing a part's dtype or shape already say
 `K`. `i` indexes rows and `j` columns; block schemes act along `j`.
 
 **Arithmetic.** Each formula is evaluated element by element in IEEE-754 binary32 (`f32`): every `×` and `÷` is one f32
-operation rounded to nearest even, applied left to right as written; element formats (§5) convert to f32 exactly.
-The result is then rounded once to the logical dtype `L`, written `round_L`:
+operation rounded to nearest even, applied left to right as written; element formats (§5) and stored scales convert to
+f32 exactly, and no scale is rounded before use. The result is then rounded once to the logical dtype `L`, written
+`round_L`:
 - `F32`: unchanged; `BF16`, `F16`: round to nearest, ties to even, keeping subnormals; `F16` overflows to ±infinity.
 - Any NaN result is written as the canonical quiet NaN: `0x7FC00000` (`F32`), `0x7FC0` (`BF16`), `0x7E00` (`F16`).
 
+This arithmetic defines the decode, not any producer's kernel. A producer's own dequantization may round elsewhere
+(comfy-kitchen multiplies in `BF16`, for example) and differ from it by a step of `L`; that is within the determinism
+the format promises, and readers follow this spec.
+
 `input_scale` (optional where listed, `F32`, one element) is the activation scale of a quantized matmul; it never
-enters a decode.
+enters a decode. It applies as `global_scale` says for `nvfp4`, and multiplies elsewhere.
 
 | Scheme | Params | Parts | Decode |
 |---|---|---|---|
-| `fp8.tensorwise` | none | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F32`, one element. `input_scale`. | `round_L(weight × s)`, `s` = `scale` rounded to `L` and read back as f32 |
-| `int8.tensorwise` | none | `weight`: `I8`, the logical shape. `scale`: `F32`, one element. `input_scale`. | as `fp8.tensorwise` |
+| `fp8.tensorwise` | `scale_dtype`: `F32`, `BF16` or `F16`, as the producer stored it | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `scale_dtype`, one element. `input_scale`. | `round_L(weight × scale)` |
+| `int8.tensorwise` | `scale_dtype`, as above | `weight`: `I8`, the logical shape. `scale`: `scale_dtype`, one element. `input_scale`. | `round_L(weight × scale)` |
 | `fp8.rowwise` | `axis`: `0` or `1` | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F32`, `R` elements (`axis: 0`) or `C` (`axis: 1`), any shape. | `round_L(weight[i, j] × scale[axis = 0 ? i : j])` |
 | `int8.rowwise` | `axis`: `0` or `1` | `weight`: `I8`, the logical shape. `scale` as `fp8.rowwise`. | as `fp8.rowwise` |
 | `int8.convrot` | `rotation: "hadamard"`, `rotation_size: B` | `weight`: `I8`, the logical shape. `scale`: `F32`, `R` elements. | below |
@@ -231,8 +237,11 @@ NVIDIA's NVFP4: an E2M1 element per weight, an E4M3 scale per 16 consecutive ele
 `scale_2`.
 - `nibble_order`: which nibble of a byte holds the even element of each pair. `low_first` is §5's `F4` packing
   (ModelOpt, compressed-tensors); `high_first` swaps the nibbles of every byte (ComfyUI).
-- `global_scale`: `multiply` (ModelOpt's `weight_scale_2`) or `divide` (compressed-tensors' `weight_global_scale`,
-  which is `1 / weight_scale_2`).
+- `global_scale`: how both per-tensor scales, `scale_2` and `input_scale`, apply: `multiply` (ModelOpt's
+  `weight_scale_2` and `input_scale`, ComfyUI) or `divide` (compressed-tensors' `weight_global_scale` and
+  `input_global_scale`, each the reciprocal).
+- `scale_2` is one element for the whole tensor; a pre-quantization factor (`pre_quant_scale`) is not a part of this
+  scheme (a later minor may add one, rule 3).
 - ModelOpt's `weight` (`uint8 [R, C/2]`), `weight_scale` and `weight_scale_2` are `weight`, `scale` and `scale_2`
   here; ModelOpt and compressed-tensors write `low_first`, `row_major`; ComfyUI writes `high_first`, `cublas_128x4`.
 

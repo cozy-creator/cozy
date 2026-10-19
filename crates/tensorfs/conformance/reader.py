@@ -387,6 +387,10 @@ def values(dtype: str, data: bytes) -> np.ndarray:
         return np.frombuffer(data, "<f4").astype(np.float32)
     if dtype == "F4":
         return E2M1[np.stack([raw & 15, raw >> 4], -1).reshape(-1)]
+    if dtype == "BF16":
+        return (np.frombuffer(data, "<u2").astype(np.uint32) << 16).view(np.float32)
+    if dtype == "F16":
+        return np.frombuffer(data, "<f2").astype(np.float32)
     return {"F8_E4M3": E4M3, "F8_E5M2": E5M2, "F8_E8M0": E8M0}[dtype][raw]
 
 
@@ -408,15 +412,6 @@ def to_dtype(dtype: str, x: np.ndarray) -> bytes:
     return bits.astype("<u2").tobytes()
 
 
-def narrow(dtype: str, x: np.float32) -> np.float32:
-    if dtype == "F32":
-        return np.float32(x)
-    bits = np.frombuffer(to_dtype(dtype, np.array([x], np.float32)), "<u2")
-    if dtype == "BF16":
-        return (bits.astype(np.uint32) << 16).view(np.float32)[0]
-    return bits.view(np.float16).astype(np.float32)[0]
-
-
 def hadamard(x: np.ndarray, k: int) -> np.ndarray:
     """Rows of x (int64, last axis 4**k) times H4 (x) ... (x) H4, unnormalized."""
     shape = x.shape
@@ -428,9 +423,9 @@ def hadamard(x: np.ndarray, k: int) -> np.ndarray:
 
 
 SCHEMES = {  # scheme: (required parts, optional parts, params)
-    "fp8.tensorwise": ({"weight", "scale"}, {"input_scale"}, set()),
+    "fp8.tensorwise": ({"weight", "scale"}, {"input_scale"}, {"scale_dtype"}),
     "fp8.rowwise": ({"weight", "scale"}, set(), {"axis"}),
-    "int8.tensorwise": ({"weight", "scale"}, {"input_scale"}, set()),
+    "int8.tensorwise": ({"weight", "scale"}, {"input_scale"}, {"scale_dtype"}),
     "int8.rowwise": ({"weight", "scale"}, set(), {"axis"}),
     "int8.convrot": ({"weight", "scale"}, set(), {"rotation", "rotation_size"}),
     "mxfp8": ({"weight", "scale"}, set(), {"block_size", "scale_layout"}),
@@ -498,7 +493,7 @@ def _decode(dtype: str, shape: list, encoding: dict, parts: dict) -> bytes:
 
     if scheme.endswith(".tensorwise"):
         w = part("weight", FP8 if scheme == "fp8.tensorwise" else ("I8",), want=shape)
-        s = narrow(dtype, part("scale", ("F32",), count=1)[0])
+        s = part("scale", (param("scale_dtype", ("F32", "BF16", "F16")),), count=1)[0]  # exact, never rounded
         if "input_scale" in parts:
             part("input_scale", ("F32",), count=1)
         out = w.astype(np.float32) * s

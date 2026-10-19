@@ -33,8 +33,10 @@ After a deliberate change: `make_vectors.py` rewrites the header vectors, and
 
 **Provenance.** The `fp8.rowwise`, `fp8.tensorwise`, `int8.convrot`, `nvfp4` and `mxfp8` (4×64) cases are
 producer-mined (ComfyUI's fp8_scaled quantizer, cozy-runtime's int8 ConvRot, NVFP4 and MXFP8 producers);
-cozy-runtime's decoders reproduce them bit for bit. The ComfyUI-layout `nvfp4` and `mxfp8` cases and the expert stacks
+cozy-runtime's decoders reproduce them bit for bit, except `fp8.tensorwise` at `BF16`/`F16`: ComfyUI rounds the scale
+to the logical dtype first, the spec never rounds a stored scale, so those expected bytes are the spec's decode of the
+mined parts (within one step of ComfyUI's). The ComfyUI-layout `nvfp4` and `mxfp8` cases and the expert stacks
 hold the same values as their mined twins in the other nibble order, scale tiling or shape. The other cases
-(per-column scales, `F8_E5M2` weights, `int8.tensorwise`, `int8.rowwise`, a ragged `mxfp8` block, a divided global
+(per-column scales, `F8_E5M2` weights, `BF16`/`F16` tensorwise scales, `int8.tensorwise`, `int8.rowwise`, a ragged `mxfp8` block, a divided global
 scale, rounding of 3,072 f32 patterns to BF16/F16, plain and unknown dtypes, refusals) were computed exactly from the
 spec's formulas.
