@@ -174,10 +174,10 @@ def prove(root):
             assert digest(value) == manifests[name][key], f"{name}/{key} changed"
             tensor_count += 1
             nbytes += value.numel() * value.element_size()
-        with torch.device("meta"):
-            model = model_cls(config_cls.from_dict(component.config))
+        # Normal construction initializes nonpersistent rotary/position buffers
+        # from config; the strict assign below replaces every persistent tensor.
+        model = model_cls(config_cls.from_dict(component.config))
         model.set_attn_implementation("eager")
-        assert all(p.device.type == "meta" for p in model.parameters())
         model.load_state_dict(loaded, strict=True, assign=True)
         model.eval()
         for key, value in model.state_dict().items():
