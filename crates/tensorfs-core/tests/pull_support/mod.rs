@@ -163,6 +163,7 @@ pub fn model(origin: &Path, name: &str, components: &[(&str, &[usize])], seed: u
         parsed.push(Component {
             name: component.to_string(),
             tensors,
+            ..Default::default()
         });
         files.insert(
             format!("{component}/config.json"),
@@ -176,7 +177,7 @@ pub fn model(origin: &Path, name: &str, components: &[(&str, &[usize])], seed: u
         "tokenizer/vocab.json".into(),
         put(origin, &noise(seed + 7, 3000)),
     );
-    let header = Header::new(objects, parsed, Default::default()).unwrap();
+    let header = Header::new(objects, None, parsed, Default::default()).unwrap();
     let header_ref = put(origin, &header.to_cbor().unwrap());
     files.insert("model.cozytensors".into(), header_ref.clone());
     let manifest = Manifest {

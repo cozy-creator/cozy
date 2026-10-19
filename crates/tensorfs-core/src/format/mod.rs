@@ -18,13 +18,33 @@ pub use doc::{
 };
 pub use dtype::Dtype;
 pub use encode::{GlobalScale, NibbleOrder};
-pub use value::Value;
+pub use doc::{Pipeline, CONFIG_FILE};
+pub use value::{Config, ConfigValue, Value};
 
 pub const HEADER_FORMAT: &str = "cozytensors/1";
 pub const MANIFEST_FORMAT: &str = "tensorfs.manifest/1";
 pub const REPO_FORMAT: &str = "tensorfs.repo/1";
 /// The manifest path of a checkpoint's header.
 pub const HEADER_PATH: &str = "model.cozytensors";
+/// A repo's file tree: `{format, files: {path: object}}`.
+pub const TREE_FORMAT: &str = "tensorfs.tree/1";
+
+/// The variant a repo file holds: `model.<variant>.cozytensors` → `<variant>`,
+/// `model.cozytensors` → `""`; `None` for any other path.
+pub fn variant_of(path: &str) -> Option<&str> {
+    match path.strip_prefix("model")?.strip_suffix(".cozytensors")? {
+        "" => Some(""),
+        rest => rest.strip_prefix('.').filter(|v| !v.is_empty() && !v.contains('/')),
+    }
+}
+
+/// The repo path of a variant's cozytensors: the inverse of [`variant_of`].
+pub fn variant_path(variant: &str) -> String {
+    match variant {
+        "" => HEADER_PATH.into(),
+        v => format!("model.{v}.cozytensors"),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {

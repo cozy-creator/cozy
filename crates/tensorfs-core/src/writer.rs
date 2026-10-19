@@ -561,6 +561,7 @@ impl Writer {
                 Component {
                     name: name.clone(),
                     tensors,
+                    ..Default::default()
                 }
             })
             .collect();
@@ -568,7 +569,7 @@ impl Writer {
             let chunks = (chunks.into_iter())
                 .map(|c| c.expect("every chunk is laid"))
                 .collect();
-            let header = Header::new(chunks, components, metadata)?;
+            let header = Header::new(chunks, None, components, metadata)?;
             let header = self.store.put_bytes(&header.to_cbor()?)?;
             files.insert(HEADER_PATH.to_owned(), header);
         }

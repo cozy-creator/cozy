@@ -47,6 +47,7 @@ fn header_with(tensors: Vec<Tensor>) -> Header {
     let unet = Component {
         name: "unet".into(),
         tensors,
+        ..Default::default()
     };
     let prompt = Value::Map(
         [
@@ -55,7 +56,7 @@ fn header_with(tensors: Vec<Tensor>) -> Header {
         ]
         .into(),
     );
-    Header::new(chunks, vec![unet], [("prompt".into(), prompt)].into()).unwrap()
+    Header::new(chunks, None, vec![unet], [("prompt".into(), prompt)].into()).unwrap()
 }
 
 fn header() -> Header {
@@ -183,8 +184,8 @@ fn red_documents_are_refused() {
         ("empty role", tweak(|t| set_role(&mut t[1], 1, ""))),
     ] {
         let chunks = header().chunks;
-        let unet = Component { name: "unet".into(), tensors };
-        let err = Header::new(chunks, vec![unet], Default::default()).expect_err(name);
+        let unet = Component { name: "unet".into(), tensors, ..Default::default() };
+        let err = Header::new(chunks, None, vec![unet], Default::default()).expect_err(name);
         assert_eq!(err.code(), "invalid", "{name}: {err}");
     }
 
@@ -220,7 +221,7 @@ fn spans_continue_into_following_chunks() {
         ObjectRef::of(&[1; 10]),
         ObjectRef::of(&[2; 10]),
     ];
-    let h = Header::new(chunks, vec![], Default::default()).unwrap();
+    let h = Header::new(chunks, None, vec![], Default::default()).unwrap();
     let at = Location {
         chunk: 0,
         offset: 6,

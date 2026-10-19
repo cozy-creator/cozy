@@ -428,7 +428,7 @@ fn parse(bytes: &[u8]) -> Result<Header> {
             tensors.push(tensor(&mut r, &encodings, &mut cited)?);
         }
         r.skip(fields, 2)?;
-        components.push(Component { name, tensors });
+        components.push(Component { name, tensors, ..Default::default() });
     }
     if cited != encodings.len() {
         return invalid(format!(
@@ -441,7 +441,7 @@ fn parse(bytes: &[u8]) -> Result<Header> {
     if r.at != bytes.len() {
         return invalid(format!("{} bytes after the header", bytes.len() - r.at));
     }
-    Header::new(chunks, components, metadata)
+    Header::new(chunks, None, components, metadata)
 }
 
 /// One tensor. `cited` counts the encodings cited so far: each is first cited in table order.

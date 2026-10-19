@@ -160,9 +160,10 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
         .map(|(name, list)| Component {
             name: name.to_string(),
             tensors: list.iter().map(|c| tensor(c)).collect(),
+            ..Default::default()
         })
         .collect();
-    let header = Header::new(chunks, components, Default::default()).unwrap();
+    let header = Header::new(chunks, None, components, Default::default()).unwrap();
     let manifest = Manifest {
         files: BTreeMap::from([
             (HEADER_PATH.into(), put(header.to_cbor().unwrap())),
@@ -208,8 +209,9 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
     let component = Component {
         name: span.component.clone(),
         tensors: vec![tensor],
+        ..Default::default()
     };
-    let header = Header::new(chunks, vec![component], Default::default()).unwrap();
+    let header = Header::new(chunks, None, vec![component], Default::default()).unwrap();
     let manifest = Manifest {
         files: BTreeMap::from([(HEADER_PATH.into(), put(header.to_cbor().unwrap()))]),
         metadata: Default::default(),
@@ -413,10 +415,11 @@ fn from_projection(p: &Json) -> (Header, bool) {
         components.push(Component {
             name: text(&c[0]),
             tensors,
+            ..Default::default()
         });
     }
     let metadata = serde_json::from_value(root[4].clone()).unwrap();
-    (Header::new(chunks, components, metadata).unwrap(), later)
+    (Header::new(chunks, None, components, metadata).unwrap(), later)
 }
 
 #[test]

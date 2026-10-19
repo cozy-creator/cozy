@@ -78,8 +78,9 @@ fn checkpoint(store: &Store, chunks: &[Vec<u8>], files: &[(&str, Vec<u8>)]) -> O
     let unet = Component {
         name: "unet".into(),
         tensors,
+        ..Default::default()
     };
-    let header = Header::new(chunks, vec![unet], Default::default()).unwrap();
+    let header = Header::new(chunks, None, vec![unet], Default::default()).unwrap();
     let mut manifest = Manifest::default();
     let header = store.put_bytes(&header.to_cbor().unwrap()).unwrap();
     manifest.files.insert(HEADER_PATH.into(), header);

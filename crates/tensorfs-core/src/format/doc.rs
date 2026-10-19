@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 
 use super::layout::ALIGN;
 use super::{
-    cbor, check_format, decode, invalid, json, Dtype, Error, PartBytes, Result, Value, HEADER_PATH,
-    MANIFEST_FORMAT, REPO_FORMAT,
+    cbor, check_format, decode, invalid, json, Config, Dtype, Error, PartBytes, Result, Value,
+    HEADER_PATH, MANIFEST_FORMAT, REPO_FORMAT,
 };
 
 /// Free-form metadata, and a scheme's params.
@@ -125,14 +125,17 @@ impl Manifest {
     }
 }
 
-/// `cozytensors/1`: chunk objects and the tensors that live in them. Components, each
-/// component's tensors and each tensor's parts are in construction order (the order a model
-/// builds and fills them), which the header's bytes and digest carry. Lookup by name goes
-/// through an index built by [`Header::new`].
+/// `cozytensors/1`: one variant of a model, self-contained: its pipeline, its components (class,
+/// config, tensors, assets), the chunk objects the tensors live in, and loading metadata.
+/// Components, each component's tensors and each tensor's parts are in construction order (the
+/// order a model builds and fills them), which the header's bytes and digest carry. Lookup by
+/// name goes through an index built by [`Header::new`].
 #[derive(Debug, Clone, Default)]
 pub struct Header {
     pub chunks: Vec<ObjectRef>,
+    pipeline: Option<Pipeline>,
     components: Vec<Component>,
+    /// Loading metadata: `source`, `filled`, per-file safetensors `__metadata__`.
     pub metadata: Metadata,
     /// Component name → (its index, tensor key → tensor index).
     index: HashMap<String, (usize, HashMap<String, usize>)>,
@@ -140,16 +143,42 @@ pub struct Header {
 
 impl PartialEq for Header {
     fn eq(&self, other: &Header) -> bool {
-        (&self.chunks, &self.components, &self.metadata)
-            == (&other.chunks, &other.components, &other.metadata)
+        (&self.chunks, &self.pipeline, &self.components, &self.metadata)
+            == (&other.chunks, &other.pipeline, &other.components, &other.metadata)
     }
+}
+
+/// What `model_index.json` held.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Pipeline {
+    /// `<library>.<Class>` (`diffusers.StableDiffusionXLPipeline`), `""` when unknown.
+    pub class: String,
+    pub config: Config,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Component {
     pub name: String,
+    /// `<library>.<Class>` (`transformers.CLIPTextModel`), `""` when unknown.
+    pub class: String,
+    pub config: Config,
     pub tensors: Vec<Tensor>,
+    /// Run data in the component's folder (`tokenizer.json`, `vocab.json`, ...), by path
+    /// relative to it.
+    pub assets: BTreeMap<String, ObjectRef>,
+    /// The config's file name, when it isn't `config.json`.
+    pub config_file: Option<String>,
 }
+
+impl Component {
+    /// The config's file name: [`Component::config_file`] or `config.json`.
+    pub fn config_name(&self) -> &str {
+        self.config_file.as_deref().unwrap_or(CONFIG_FILE)
+    }
+}
+
+/// A component config's file name unless `config_file` says otherwise.
+pub const CONFIG_FILE: &str = "config.json";
 
 /// A tensor: its key, logical dtype and shape, and either its bytes or its encoded parts.
 #[derive(Debug, Clone, PartialEq)]
@@ -246,14 +275,17 @@ pub struct Span {
 
 impl Header {
     /// A header with `components` in the given (construction) order. Refuses repeated names,
-    /// keys or roles, and locations outside `chunks`.
+    /// keys or roles, locations outside `chunks`, asset names that are not paths, and a
+    /// `config_file` of `config.json` or that names an asset.
     pub fn new(
         chunks: Vec<ObjectRef>,
+        pipeline: Option<Pipeline>,
         components: Vec<Component>,
         metadata: Metadata,
     ) -> Result<Header> {
         let mut header = Header {
             chunks,
+            pipeline,
             components: Vec::new(),
             metadata,
             index: HashMap::new(),
@@ -271,6 +303,18 @@ impl Header {
             if !segment(name) {
                 return invalid(format!(
                     "component name {name:?} is not one plain path segment"
+                ));
+            }
+            if let Some(file) = &component.config_file {
+                if file == CONFIG_FILE || !path(file) {
+                    return invalid(format!("component {name:?}: config_file {file:?}"));
+                }
+            }
+            if let Some(asset) = (component.assets.keys())
+                .find(|a| !path(a) || *a == component.config_name())
+            {
+                return invalid(format!(
+                    "component {name:?}: asset {asset:?} is not a path or is its config file"
                 ));
             }
             let mut keys = HashMap::with_capacity(component.tensors.len());
@@ -319,9 +363,40 @@ impl Header {
         cbor::write(self)
     }
 
+    /// What `model_index.json` held; `None` for a checkpoint of one model.
+    pub fn pipeline(&self) -> Option<&Pipeline> {
+        self.pipeline.as_ref()
+    }
+
     /// The components, in construction order.
     pub fn components(&self) -> &[Component] {
         &self.components
+    }
+
+    /// Every component's assets: (component, asset path, object).
+    pub fn assets(&self) -> impl Iterator<Item = (&str, &str, &ObjectRef)> {
+        self.components.iter().flat_map(|c| {
+            (c.assets.iter()).map(move |(path, r)| (c.name.as_str(), path.as_str(), r))
+        })
+    }
+
+    /// The header's closure besides itself: its chunks, then every component's assets.
+    pub fn objects(&self) -> impl Iterator<Item = &ObjectRef> {
+        self.chunks.iter().chain(self.assets().map(|(_, _, r)| r))
+    }
+
+    /// The distinct encodings, in order of first citation by the tensors (the header's table).
+    pub fn encodings(&self) -> Vec<&Encoding> {
+        let mut out: Vec<&Encoding> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (_, t) in self.tensors() {
+            if let Body::Encoded { encoding, .. } = &t.body {
+                if seen.insert(encoding) {
+                    out.push(encoding);
+                }
+            }
+        }
+        out
     }
 
     pub fn component(&self, name: &str) -> Option<&Component> {
@@ -590,4 +665,9 @@ impl Repo {
 
 fn segment(s: &str) -> bool {
     !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0'])
+}
+
+/// One or more segments joined by `/`.
+fn path(s: &str) -> bool {
+    s.split('/').all(segment)
 }
