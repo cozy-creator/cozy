@@ -189,6 +189,7 @@ impl Service {
         }
         *current = Some(pool.clone());
         drop(current);
+        pool.wake_on_freed(&self.engine);
         if pool.width() > 0 {
             // Kernels compile at boot, before any install. An executor starts for a request or
             // an install: nothing here prepares a package nobody asked for.

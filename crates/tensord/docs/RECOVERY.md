@@ -26,8 +26,7 @@ has ended is dispatched again at once because no authored work was authorized; i
 start, it fails. A running attempt whose
 process has ended fails (canceled, when a cancel was journaled). Completed outcomes, collected
 outputs and held memos remain durable: the same run submitted again finds its finished memoized
-calls answered, which is distinct from replaying an interrupted inference. See [durable execution](DURABLE-EXECUTION.md) and
-[resident custody](RESIDENT-CUSTODY.md).
+calls answered, which is distinct from replaying an interrupted inference. See [durable execution](DURABLE-EXECUTION.md).
 
 ## Software updates
 

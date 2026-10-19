@@ -1352,8 +1352,9 @@ mod v1_api {
     }
 
     /// An idle tenant gives its GPU to a request that needs it: an older release kept warm
-    /// beside a newer one (both installed) is evicted on demand, and the newer release's
-    /// request gets a budget for all its weights, its next one paging nothing. Klein bench
+    /// beside a newer one (both installed) is asked for its cold weights through the ledger,
+    /// and the newer release's request holds all its weights resident, its next one paging
+    /// nothing. Klein bench
     /// (runs 7772, 7779): 0.1.0's idle executor kept its VRAM, and 0.2.0's executor got a
     /// 0.4 GiB budget and paged 18.6 GiB on every request. The weights take 45% of the card:
     /// one release's fit, two do not.
@@ -1425,16 +1426,17 @@ mod v1_api {
             .filter(|e| e.package == format!("acme/{}", FIXTURE.1)).map(|e| e.release).collect();
         assert_eq!(releases, ["0.1.0", "0.2.0"]);
 
-        // 0.2.0's request takes the idle tenant's room: every weight resident, nothing paged
-        // out; its next request pages nothing in.
+        // 0.2.0's request takes the idle tenant's room: every weight resident, nothing streamed
+        // through slots; its next request pages nothing in.
         for (id, first) in [("new-1", true), ("new-2", false)] {
             let done = settle(&client, &all, id, spec(v1::RunKind::Call, "0.2.0", "resident")).await;
             assert_eq!(done.status, "succeeded", "{done:?}");
             let memory = memory(&done);
-            assert!(memory["budget_bytes"].as_u64() >= memory["weights_bytes"].as_u64(), "{id}: {memory}");
-            assert_eq!(memory["paged_out_bytes"].as_u64().unwrap_or(0), 0, "{id}: {memory}");
-            if !first {
-                assert_eq!(memory["paged_in_bytes"].as_u64().unwrap_or(0), 0, "{id}: {memory}");
+            let steps = memory["steps"].as_array().cloned().unwrap_or_default();
+            assert!(!steps.is_empty(), "{id}: {memory}");
+            for step in &steps {
+                assert_eq!(step["streamed"].as_u64().unwrap_or(0), 0, "{id}: {memory}");
+                assert!(first || step["paged_in"].as_u64().unwrap_or(0) == 0, "{id}: {memory}");
             }
         }
         let _ = fs::remove_dir_all(source);
@@ -3636,6 +3638,18 @@ mod v1_api {
             format!("{:?}", failed.reason).contains("cannot be rendered"),
             "{failed:?}"
         );
+        // Its whole traceback reaches the job's own log, which `cozy run show` prints.
+        let log: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                v1::Event::Log(line) => Some(line.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let failed_call = |l: &&str| l.contains("failed: unhandled_exception") && l.contains("cannot be rendered");
+        assert!(log.iter().any(failed_call), "{log:?}");
+        assert!(log.iter().any(|l| l.contains("in render_segment")), "{log:?}");
+        assert!(log.iter().any(|l| l.contains("ValueError: segment 1 cannot be rendered")), "{log:?}");
         // No third segment ran.
         match run_events(&client, &all, watch("broken/2")).await {
             Err(_) => {}
