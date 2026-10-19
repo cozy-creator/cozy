@@ -27,6 +27,9 @@ mod nvfp4;
 // gguf
 
 // gptq, awq, ct
+mod awq;
+mod ct;
+mod gptq;
 
 // bnb
 
@@ -46,6 +49,19 @@ pub static SCHEMES: &[&Scheme] = &[
     // gguf.*
 
     // gptq.*, awq.*, ct.*
+    &gptq::INT2,
+    &gptq::INT3,
+    &gptq::INT4,
+    &gptq::INT8,
+    &awq::INT4,
+    &ct::INT1,
+    &ct::INT2,
+    &ct::INT3,
+    &ct::INT4,
+    &ct::INT5,
+    &ct::INT6,
+    &ct::INT7,
+    &ct::INT8,
 
     // bnb.*
 
@@ -169,6 +185,11 @@ impl<'a> Ctx<'a> {
     }
     pub fn uint(&self, key: &str) -> usize {
         self.params[key].as_u64().expect("checked against the row") as usize
+    }
+    /// A param of the row as stored, for params of no text or integer kind (checked before the
+    /// decode runs).
+    pub fn param(&self, key: &str) -> &'a Value {
+        &self.params[key]
     }
     pub fn flag(&self, key: &str) -> bool {
         matches!(self.params[key], Value::Bool(true))

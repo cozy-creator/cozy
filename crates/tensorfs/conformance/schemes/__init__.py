@@ -16,6 +16,9 @@ from . import nvfp4
 # gguf
 
 # gptq, awq, ct
+from . import gptq
+from . import awq
+from . import ct
 
 # bnb
 
@@ -34,6 +37,9 @@ FAMILIES = (
     # gguf
 
     # gptq, awq, ct
+    gptq,
+    awq,
+    ct,
 
     # bnb
 
