@@ -2,13 +2,14 @@
 //! own word, kept per Hub: in a dev or CI Hub it is not the origin this computer dials), and, for
 //! a run that publishes into its weights destination or reads one of its owner's checkpoints by
 //! digest, the owner's capability for exactly that, signed offline with this computer's device
-//! key and bound to the machine's TLS leaf (th-241). The machine trades it at the Hub's token
+//! key and bound to a fresh per-run P-256 key. Its holder trades it at the Hub's token
 //! endpoint at its first private operation. The machine's spec digest leaves the capability out,
 //! so a resend with a fresh one names the same run. Signed out, a public run reads at its Hub's
 //! origin.
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hub_client::{DeviceKey, P256Key, RunCapability};
 use protocol::{
     calcifer::Reason,
     config::{self, Origin},
@@ -16,12 +17,9 @@ use protocol::{
     ids::RunId,
     machine as v1,
 };
-use hub_client::{DeviceKey, RunCapability};
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
 
 use crate::{
-    link,
     machines::{Machines, internal, lock},
     rentals::{Hubs, hub_refusal, signed_out},
     store::RunRow,
@@ -65,7 +63,7 @@ pub(crate) struct Facts {
 
 impl Machines {
     /// The Hub access and provider tokens the run's send to `machine` carries.
-    pub(crate) async fn access(&self, run: &RunRow, machine: &str) -> Result<Access, Denied> {
+    pub(crate) async fn access(&self, run: &RunRow, _machine: &str) -> Result<Access, Denied> {
         let providers = self.providers.clone();
         let spec = &run.spec;
         let origin = match &run.hub {
@@ -95,7 +93,9 @@ impl Machines {
             ..Default::default()
         };
         if !operations.is_empty() {
-            hub.capability = (self.capability(run, origin, machine, &facts, operations)).await?;
+            let key = P256Key::generate();
+            hub.capability = self.capability(run, origin, &facts, operations, &key)?;
+            hub.key = key.private_jwk();
             hub.token_endpoint = facts.token_endpoint;
         }
         Ok(Access {
@@ -128,37 +128,20 @@ impl Machines {
         }
     }
 
-    /// The owner's capability for `operations`, bound to the leaf `machine` presents.
-    async fn capability(
+    /// The owner's capability for `operations`, bound to this send's key.
+    fn capability(
         &self,
         run: &RunRow,
         origin: &Origin,
-        machine: &str,
         facts: &Facts,
         operations: Vec<Value>,
+        run_key: &P256Key,
     ) -> Result<String, Denied> {
-        let row = self
-            .store()
-            .machine(machine)
-            .map_err(|e| unreachable(e.to_string()))?;
-        let endpoint = row
-            .and_then(|row| row.endpoint)
-            .ok_or_else(|| unreachable(format!("{machine} has no address")))?;
-        let leaf = link::presented_leaf(&endpoint.address)
-            .await
-            .map_err(|e| unreachable(e.to_string()))?;
-        if Sha256::digest(&leaf).as_slice() != endpoint.pin {
-            return Err(unreachable(format!(
-                "{machine} presented another TLS leaf than the one pinned"
-            )));
-        }
-        let machine = hub_client::leaf_thumbprint(&leaf)
-            .map_err(|e| refused("machine_key_unsupported", format!("{machine}: {e}")))?;
         let key = self.device_key(origin)?;
         Ok(key.sign_run_capability(&RunCapability {
             user_id: facts.user_id.clone(),
             hub: facts.public.clone(),
-            machine,
+            key_jkt: run_key.thumbprint(),
             run: run.id.to_string(),
             operations,
             lifetime: CAPABILITY_LIFE,
@@ -302,7 +285,7 @@ fn operations(owner: &str, spec: &v1::RunSpec) -> Vec<Value> {
         let owned = model
             .split_once('/')
             .is_some_and(|(org, _)| org.eq_ignore_ascii_case(owner));
-        let read = json!({"type": "tensorhub_model_read", "model": model, "manifest": manifest});
+        let read = json!({"type": "tensorhub_model_read", "model": model.to_ascii_lowercase(), "revision": manifest});
         if owned && by_digest(release, manifest) && !operations.contains(&read) {
             operations.push(read);
         }
@@ -315,7 +298,9 @@ fn operations(owner: &str, spec: &v1::RunSpec) -> Vec<Value> {
     }
     let destination = destination(spec);
     if !destination.is_empty() {
-        operations.push(json!({"type": "tensorhub_model_publish", "model": destination}));
+        operations.push(
+            json!({"type": "tensorhub_model_upload", "model": destination.to_ascii_lowercase()}),
+        );
     }
     operations
 }
@@ -392,10 +377,9 @@ mod tests {
         assert_eq!(
             operations("fidika", &spec),
             vec![
-                json!({"type": "tensorhub_model_read", "model": "Fidika/sdxl", "manifest": "sha256:aa"}),
-                json!({"type": "tensorhub_model_read", "model": "fidika/sdxl", "manifest": "sha256:aa"}),
-                json!({"type": "tensorhub_model_read", "model": "fidika/lora", "manifest": "sha256:dd"}),
-                json!({"type": "tensorhub_model_publish", "model": "fidika/out"}),
+                json!({"type": "tensorhub_model_read", "model": "fidika/sdxl", "revision": "sha256:aa"}),
+                json!({"type": "tensorhub_model_read", "model": "fidika/lora", "revision": "sha256:dd"}),
+                json!({"type": "tensorhub_model_upload", "model": "fidika/out"}),
             ]
         );
         let public = v1::RunSpec {
