@@ -3459,6 +3459,27 @@ impl Services for Ahead<'_> {
     }
 }
 
+/// A `read_grant`'s answer, the descriptors counted in `descriptors` and following it: `held`,
+/// the one layout deposited for it; else the chunk files `objects_sha256` names. Runtime's
+/// `tests/tensord_peer.py` (`answer_read_grants`) sends this very shape.
+fn granted(seq: u64, held: bool, files: io::Result<(Vec<File>, String)>) -> (Answer, Vec<File>) {
+    let mut answer = Answer::unavailable(seq);
+    match files {
+        Ok((files, objects_sha256)) => {
+            (answer.ok, answer.held, answer.descriptors) = (true, held, files.len() as u64);
+            answer.objects_sha256 = objects_sha256;
+            answer.code.clear();
+            answer.detail.clear();
+            (answer, files)
+        }
+        Err(error) => {
+            answer.code = "read_grant_refused".into();
+            answer.detail = error.to_string();
+            (answer, Vec::new())
+        }
+    }
+}
+
 struct Callbacks<'a> {
     engine: &'a Arc<Engine>,
     id: &'a str,
@@ -3480,13 +3501,12 @@ struct Callbacks<'a> {
 }
 impl Callbacks<'_> {
     /// The weight set's chunk files, once its objects landed, and their digest in `answer`.
-    fn chunks(&self, manifest: &str, answer: &mut Answer) -> io::Result<Vec<File>> {
+    fn chunks(&self, manifest: &str) -> io::Result<(Vec<File>, String)> {
         let objects = self.sources.chunks(manifest)?;
         if let Some(fetch) = self.fetch {
             fetch.wait(manifest, &objects)?;
         }
-        answer.objects_sha256 = crate::deposits::objects_digest(&objects);
-        self.sources.files(&objects)
+        Ok((self.sources.files(&objects)?, crate::deposits::objects_digest(&objects)))
     }
 }
 impl Services for Callbacks<'_> {
@@ -3494,29 +3514,13 @@ impl Services for Callbacks<'_> {
     /// layout, else every chunk file of its selected components (TensorD never fills).
     fn read_grant(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
         drop(plan);
-        let mut answer = Answer::unavailable(frame.seq);
-        let files = match self.deposits.grant(&frame.manifest, &frame.layout) {
-            Some(layout) => {
-                answer.held = true;
-                Ok(vec![layout])
-            }
-            None => self.chunks(&frame.manifest, &mut answer),
+        let (held, files) = match self.deposits.grant(&frame.manifest, &frame.layout) {
+            Some(layout) => (true, Ok((vec![layout], String::new()))),
+            None => (false, self.chunks(&frame.manifest)),
         };
         self.pool.notes.note(serde_json::json!({"event": "read_grant", "manifest": frame.manifest,
-            "layout": frame.layout, "held": answer.held, "files": files.as_ref().map_or(0, Vec::len)}));
-        Ok(match files {
-            Ok(files) => {
-                (answer.ok, answer.descriptors) = (true, files.len() as u64);
-                answer.code.clear();
-                answer.detail.clear();
-                (answer, files)
-            }
-            Err(error) => {
-                answer.code = "read_grant_refused".into();
-                answer.detail = error.to_string();
-                (answer, Vec::new())
-            }
-        })
+            "layout": frame.layout, "held": held, "files": files.as_ref().map_or(0, |(f, _)| f.len())}));
+        Ok(granted(frame.seq, held, files))
     }
     fn progress(&mut self, frame: &Frame) {
         crate::calls::observe(self.engine, self.id, &mut self.completed, frame, self.caller);
@@ -3602,6 +3606,24 @@ mod tests {
     use serde_json::json;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+
+    /// The `read_grant` answers Runtime's `tests/tensord_peer.py` mirrors, field for field: a
+    /// held layout is one descriptor and no list; chunk files come with their list's digest.
+    #[test]
+    fn a_read_grant_answer_is_the_shape_runtime_reads() {
+        let file = || File::open("/dev/null").unwrap();
+        let (held, fds) = granted(7, true, Ok((vec![file()], String::new())));
+        assert_eq!(fds.len(), 1);
+        assert_eq!(serde_json::to_value(&held).unwrap(), json!({"event": "answer", "seq": 7, "ok": true,
+            "code": "", "detail": "", "held": true, "sha256": "", "length": 0, "descriptors": 1}));
+        let (chunks, fds) = granted(8, false, Ok((vec![file(), file()], "ab".repeat(32))));
+        assert_eq!(fds.len(), 2);
+        assert_eq!(serde_json::to_value(&chunks).unwrap(), json!({"event": "answer", "seq": 8, "ok": true,
+            "code": "", "detail": "", "held": false, "sha256": "", "length": 0, "descriptors": 2,
+            "objects_sha256": "ab".repeat(32)}));
+        let (refused, fds) = granted(9, false, Err(io::Error::other("outside selection")));
+        assert!(fds.is_empty() && !refused.ok && refused.code == "read_grant_refused");
+    }
 
     /// Runs 5313/5318/5319 ended `executor_poisoned: ; the executor did not settle quiescent
     /// (poisoned: )`: the Runtime's tail re-raised a sticky CUDA fault and answered `ok: false`.
