@@ -573,7 +573,11 @@ async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects(
     assert!(!offline_cache.join(data.chunks[2].key()).exists());
 
     // The mounted mirror is untrusted and must use normal hash admission.
-    fs::write(mirror.join(data.chunks[2].key()), b"XXXXXXXX").unwrap();
+    let corrupt = mirror.join(data.chunks[2].key());
+    // A published object is read-only. Replace this fixture's directory entry,
+    // rather than mutating an immutable inode also owned by the producer store.
+    fs::remove_file(&corrupt).unwrap();
+    fs::write(corrupt, b"XXXXXXXX").unwrap();
     let error = checkpoint
         .fetch(&Fetch {
             selection: Selection::Components(vec!["other".into()]),
