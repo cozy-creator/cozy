@@ -1368,6 +1368,9 @@ impl PyArray {
             if device.0 == KDL_CPU || value == 0 || value < -1 {
                 return Err(invalid(py, "DLPack stream must be a CUDA stream, 1/2 for default streams, or -1"));
             }
+            if device.0 == KDL_CUDA && copy == Some(true) {
+                return Err(pyo3::exceptions::PyBufferError::new_err("CUDA DLPack copy=True with an explicit consumer stream is unsupported"));
+            }
             // Every TensorFS read/launch drains before returning. The allocation is ready
             // on every consumer stream, including the DLPack default-stream sentinels.
         }

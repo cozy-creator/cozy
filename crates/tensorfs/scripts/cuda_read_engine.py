@@ -39,11 +39,22 @@ try:
         tensors.read_into("quantized", odd, offset=3)
     assert torch.equal(destination, torch.tensor(HostReads.plain, device="cuda:0"))
     assert bytes(odd.cpu().tolist()) == tensors.read("quantized").tobytes()[3:12]
+    for consumer_stream in [-1, 1, 2, stream.cuda_stream]:
+        try:
+            arrays["plain"].__dlpack__(copy=True, stream=consumer_stream)
+        except BufferError:
+            pass
+        else:
+            raise AssertionError("a CUDA copy ignored the explicit consumer stream")
     # An unconsumed capsule is destroyed with Python's GIL held. Its final allocation
     # release may synchronize CUDA work, so an independent Python heartbeat must progress.
-    victim = tensors.read_all(["plain"], device="cuda:0")["plain"]
+    free_before, _ = torch.cuda.mem_get_info()
+    victim = tensors.read_all(["big"], device="cuda:0")["big"]
+    allocation_size = victim.nbytes
     capsule = victim.__dlpack__()
     del victim
+    free_allocated, _ = torch.cuda.mem_get_info()
+    assert free_before - free_allocated >= allocation_size
     heartbeat = [0]
     stopped = threading.Event()
 
@@ -62,10 +73,20 @@ try:
     started = time.monotonic()
     del capsule
     elapsed = time.monotonic() - started
+    time.sleep(0.03)
     stopped.set()
     thread.join()
-    assert end.query() and elapsed > 0.02, "cuMemFree did not exercise a synchronizing release"
-    assert heartbeat[0] - before >= 3, "the synchronizing DLPack deleter retained the GIL"
+    assert elapsed < 0.1, "the capsule deleter waited for CUDA under the GIL"
+    assert heartbeat[0] - before >= 3, "Python stopped while native cleanup waited for CUDA"
+    end.synchronize()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        recovered, _ = torch.cuda.mem_get_info()
+        if recovered >= free_allocated + allocation_size:
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("native cleanup never released the capsule allocation")
     first = torch.from_dlpack(arrays["plain"])
     second = torch.from_dlpack(arrays["plain"])
     copied = torch.from_dlpack(arrays["plain"].__dlpack__(copy=True))
