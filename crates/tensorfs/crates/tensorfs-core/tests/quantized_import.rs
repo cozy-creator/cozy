@@ -102,7 +102,6 @@ fn import(store: &Store, source: &Path) -> tensorfs_core::err::Result<Checkpoint
         access: &access,
         tmp: &tmp,
         progress: &|_, _, _| {},
-        stop: None,
     };
     let manifest = store.import(&req, None)?;
     Ok(store.checkpoint(&manifest).unwrap())
