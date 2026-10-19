@@ -553,6 +553,14 @@ impl Gpu {
         Ok(Arc::new(WeightSet { gpu: self.clone(), id: st.sets.len() - 1, base, weights }))
     }
 
+    /// A sealed host layout (TensorD's deposit) registered from the regions it carries: no
+    /// module needed, so its copy to the GPU (`WeightSet::prefetch`) runs while the module is
+    /// still being built. A module whose regions differ (`WeightSet::regions`) cannot use it.
+    #[cfg(feature = "store")]
+    pub fn adopt<'c>(self: &Arc<Self>, name: &str, ck: impl Into<Ck<'c>>, host_fd: RawFd, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<WeightSet>> {
+        self.register(name, ck, &crate::host::sealed_regions(host_fd)?, Some(host_fd), files)
+    }
+
     pub fn trim(&self) -> Result<u64> {
         let g = &self.inner;
         g.with(|st| {
@@ -1049,6 +1057,11 @@ impl WeightSet {
         self.gpu.inner.ordinal
     }
 
+    /// The regions it was registered with.
+    pub fn regions(&self) -> &[Vec<String>] {
+        &self.weights.layout.names
+    }
+
     /// The watermark: `regions` live at home, the rest stream (a mapped one serves until evicted).
     pub fn home(&self, regions: &[u32]) -> Result<()> {
         let n = self.weights.layout.regions.len() as u32;
@@ -1262,6 +1275,12 @@ impl Host {
     pub fn register<'c>(&self, name: &str, ck: impl Into<Ck<'c>>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<HostSet>> {
         let weights = Weights::open(name, ck.into(), regions, host_fd, files)?;
         Ok(Arc::new(HostSet { regs: Mutex::new(vec![(None, false); weights.layout.regions.len()]), weights }))
+    }
+
+    /// `Gpu::adopt` on the host: a sealed layout registered from the regions it carries.
+    #[cfg(feature = "store")]
+    pub fn adopt<'c>(&self, name: &str, ck: impl Into<Ck<'c>>, host_fd: RawFd, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<HostSet>> {
+        self.register(name, ck, &crate::host::sealed_regions(host_fd)?, Some(host_fd), files)
     }
 }
 

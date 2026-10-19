@@ -12,6 +12,8 @@ files and from a sealed host layout. The script checks, and prints one JSON line
   e. bind/unbind per region of ~20 params (M2), and page-in at 2 MiB vs 64 MiB chunks;
   g. a refill from the sealed layout is logged against the measured H2D ceiling and link, and a
      set in use gives a slot no bound block holds.
+  f. adopt: the sealed layout registered from the regions it carries, prefetched whole before
+     any module exists, is bit-exact.
 """
 
 import json
@@ -275,6 +277,17 @@ def test_ceiling(ck, rs, host_fd, stream, facts):
     torch.cuda.synchronize()
     assert gpu.stats().slots == 1, "the next streamed block maps a slot again"
     ws.close()
+def test_adopt(gpu, ck, rs, host_fd, stream, facts):
+    ws = gpu.adopt("adopt", ck, host_fd)
+    assert ws.regions == rs, "a sealed layout carries the regions it was built from"
+    t0 = time.perf_counter()
+    for r in range(len(ws.spans)):
+        ws.prefetch(r)
+    torch.cuda.synchronize()
+    facts["f_prefetch_ms"] = round((time.perf_counter() - t0) * 1e3, 1)
+    facts["f_adopt_bytes"] = exact(ws, ck, stream)
+    ws.close()
+    gpu.trim()
 
 
 def main(work: Path) -> int:
@@ -294,6 +307,7 @@ def main(work: Path) -> int:
         ("d", lambda: test_oom(gpu, ck, rs, stream, facts)),
         ("e", lambda: test_costs(ck, rs, fd, stream, facts)),
         ("g", lambda: test_ceiling(ck, rs, fd, stream, facts)),
+        ("f", lambda: test_adopt(gpu, ck, rs, fd, stream, facts)),
     ):
         try:
             run()

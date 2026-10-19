@@ -15,7 +15,9 @@ tensors, bit for bit:
   when its `prepare()` changes; `bind` makes the module's tensors; `Exhausted` leaves the
   memory usable;
 - an idle (RAM-level) model's cold pages go before a warm one's; a request short of room waits
-  for another's bytes; `load` seals the host tier for deposit; the row carries the facts.
+  for another's bytes; `load` seals the host tier for deposit; the row carries the facts;
+- a granted host tier adopted before its module exists copies while the module is built, and
+  the load binds to it; a module of other regions is a miss and seals anew.
 
     flock <locks>/gpu.lock python scripts/varena-torch.py [workdir] [--blocks N] [--dim D]
 Runs with any python that has torch (CUDA) and `PYTHONPATH=<worktree>/python`.
@@ -154,8 +156,7 @@ def main() -> int:
     model = mem.load(net)
     sealed = mem.sealed()
     check("load seals the host tier for deposit", [m for m, _ in sealed] == [model], str(sealed))
-    for _, fd in sealed:
-        os.close(fd)
+    held = sealed[0][1]
     ref = reference(tensors, a.dim, a.blocks, dev)
     x = torch.randn(a.batch, a.dim, generator=torch.Generator().manual_seed(1)).bfloat16().to(dev)
     with torch.no_grad():
@@ -442,9 +443,38 @@ def main() -> int:
 
     model2.close()
     model.close()
+    adopted(mem, ck, held, a, want, x)
+    os.close(held)
     finer_first(root.parent, dev)
     print(f"{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1
+
+
+def adopted(mem: Memory, ck: tensorfs.Checkpoint, held: int, a: argparse.Namespace, want: torch.Tensor, x: torch.Tensor) -> None:
+    """The deposit adopted before any module: its copies start at once, the load binds to it."""
+    grant = WeightGrant(ck, "net", "sha256:" + "2" * 64, host_fd=held)
+    mem.adopt(grant)
+    ws = mem.adopted[grant.key]
+    check("an adopted tier copies before its module exists", any(ws.resident(r) for r in range(len(ws.spans))))
+    net = meta(a.dim, a.blocks)
+    net._varena = Declared(grant)
+    model = mem.load(net)
+    check("the load binds the adopted tier", model.ws is ws and not mem.adopted and not mem.sealed())
+    with torch.no_grad(), mem.request("adopted"):
+        check("the adopted model equals the reference", torch.equal(net(x), want))
+    model.close()
+
+    mem.adopt(grant)
+    net = meta(a.dim, a.blocks)
+    net._varena = Declared(grant, blocks=["blocks.0"])  # other regions than the deposit's
+    model = mem.load(net)
+    sealed = mem.sealed()
+    check("a module of other regions is a miss, sealed anew", [m for m, _ in sealed] == [model] and not mem.adopted, str(sealed))
+    for _, fd in sealed:
+        os.close(fd)
+    with torch.no_grad(), mem.request("missed"):
+        check("the missed model equals the reference", torch.equal(net(x), want))
+    model.close()
 
 
 def finer_first(root: Path, dev: torch.device) -> None:

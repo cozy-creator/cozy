@@ -73,6 +73,9 @@ fn only_a_sealed_complete_layout_is_adopted_read_only() {
     let layout = Layout::build(&fx.plan(), &regions()).unwrap();
     // A memfd anyone may still write is refused.
     let open = HostMem::create("unet", &layout).unwrap();
+    assert_eq!(varena::host::sealed_regions(open.fd()).unwrap(), regions(), "every layout's state page names its regions");
+    let empty = varena::host::reserve("empty", 4096, 1).unwrap();
+    assert!(matches!(varena::host::sealed_regions(empty.as_raw_fd()), Err(Error::Invalid(_))), "a memfd without a state page names none");
     match HostMem::adopt_sealed(open.fd(), &layout) {
         Err(Error::Invalid(_)) => {}
         r => panic!("an unsealed memfd must be refused, got {:?}", r.err()),

@@ -124,7 +124,9 @@ fn a_v2_checkpoint_binds_on_the_host_exactly_from_a_sealed_layout() {
     let fx = Fixture::new("sealed");
     let rs = regions(fx.ck.header(), 64 << 20, &[]);
     let fd = memory::seal(&fx.ck, &rs, "ck", 2, None).unwrap();
-    let ws = Host.register("ck", &fx.ck, &rs, Some(fd.as_raw_fd()), None).unwrap();
+    let carried = varena::host::sealed_regions(fd.as_raw_fd()).unwrap();
+    assert_eq!(carried, rs, "a sealed layout carries the regions it was built from");
+    let ws = Host.register("ck", &fx.ck, &carried, Some(fd.as_raw_fd()), None).unwrap();
     check(&ws);
     assert!(!ws.bind(0).unwrap().writable, "views of the machine's layout are read-only");
     let mut moved = rs.clone();

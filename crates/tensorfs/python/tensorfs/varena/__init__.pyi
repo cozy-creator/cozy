@@ -188,6 +188,9 @@ class WeightSet:
     def spans(self) -> list[int]:
         """Bytes each region maps."""
     @property
+    def regions(self) -> list[list[str]]:
+        """The regions it was registered with (`Gpu.adopt`: those its sealed layout carries)."""
+    @property
     def device(self) -> int | None:
         """The CUDA ordinal; None on the host."""
     @property
@@ -247,6 +250,16 @@ class Gpu:
         through the page cache. `files`: the chunk files a grant hands over, `(sha256, length,
         fd)` each, the only ones read; without it, the checkpoint's own paths. The core
         duplicates every descriptor it keeps and closes nothing the caller passed."""
+    def adopt(
+        self,
+        name: str,
+        ck: Checkpoint,
+        host_fd: int,
+        files: Sequence[tuple[str, int, int]] | None = None,
+    ) -> WeightSet:
+        """`register` of the sealed host layout `host_fd` with the regions it carries, before
+        any module exists: `prefetch` starts its copies while the module is built. A module
+        whose `regions` differ cannot use it."""
     def trim(self) -> int:
         """Idle chunks and unneeded slots go back to the driver. Returns the bytes released."""
     def give(self, nbytes: int) -> list[tuple[str, int]]:
@@ -276,6 +289,14 @@ class Host:
     ) -> WeightSet:
         """As `Gpu.register`. Binds are views of the sealed layout (read-only), or private
         memory read once from the chunk files."""
+    def adopt(
+        self,
+        name: str,
+        ck: Checkpoint,
+        host_fd: int,
+        files: Sequence[tuple[str, int, int]] | None = None,
+    ) -> WeightSet:
+        """As `Gpu.adopt`."""
 
 class Copy:
     """A run of weight copies: `h2d`, a GPU's copy stream from its first job to its last
