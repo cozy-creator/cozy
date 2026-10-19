@@ -53,5 +53,6 @@ mod scratch;
 #[cfg(test)]
 mod sdk_selection_tests;
 pub mod serve;
+mod queue;
 pub mod service;
 pub mod triage;

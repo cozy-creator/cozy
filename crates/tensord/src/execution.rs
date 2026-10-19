@@ -428,9 +428,10 @@ impl Engine {
         digest: &str,
         invocation: Invocation,
     ) -> io::Result<(Execution, bool)> {
-        self.accept_run_objects(actor, id, digest, invocation, &[])
+        self.accept_run_objects(actor, id, digest, invocation, &[], &[])
     }
 
+    /// See `Journal::accept_run_objects`.
     pub fn accept_run_objects(
         &self,
         actor: &str,
@@ -438,13 +439,14 @@ impl Engine {
         digest: &str,
         invocation: Invocation,
         objects: &[tensorfs_core::ids::ObjectRef],
+        spec: &[u8],
     ) -> io::Result<(Execution, bool)> {
         let mut owned = self.owned.lock().unwrap();
         let (record, new) = self
             .journal
             .lock()
             .unwrap()
-            .accept_run_objects(actor, id, digest, invocation, objects)?;
+            .accept_run_objects(actor, id, digest, invocation, objects, spec)?;
         if new {
             owned.insert(record.id.clone());
         }
@@ -477,6 +479,15 @@ impl Engine {
         drop((progress, owned));
         self.notify_activity();
         record
+    }
+
+    /// The preparing runs a restart interrupted, with their signers and specs, now this
+    /// machine's to prepare again.
+    pub(crate) fn interrupted(&self) -> io::Result<Vec<(String, String, Vec<u8>)>> {
+        let mut owned = self.owned.lock().unwrap();
+        let runs = self.journal.lock().unwrap().interrupted()?;
+        owned.extend(runs.iter().map(|(id, _, _)| id.clone()));
+        Ok(runs)
     }
 
     /// The preparing run ends undispatched (warm success or preparation failure).
