@@ -54,3 +54,9 @@ to OpenAI's MXFP4 original of the same weights. `mine/mxfp8.py` mines the stacke
 `cublas_128x4` pads each expert's 80 rows to 128) with comfy-kitchen's own `quantize_mxfp8` per expert, as ComfyUI's
 `MoEExperts` stores them; kitchen's dequantize gives the same bytes. No published ComfyUI mxfp8 file holds an expert
 stack.
+
+`fp8_blockwise` and `mxfp4` are mined by `mine/<family>.py` from transformers' FineGrainedFP8, compressed-tensors,
+gpt-oss's triton_kernels and torchao on CPU, each producer's own dequantize giving the expected bytes, plus rows of
+real checkpoints read by HTTP range at pinned revisions (DeepSeek-V3.1 and V4, Qwen3, RedHatAI, gpt-oss, AMD Quark,
+MLX, compressed-tensors). A case with `source` holds the `F32` values its producer quantized; TensorFS's encoder
+reproduces its parts bit for bit (`tests/format_encode.rs`).

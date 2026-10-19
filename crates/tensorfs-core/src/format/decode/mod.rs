@@ -23,6 +23,8 @@ mod mxfp8;
 mod nvfp4;
 
 // fp8.blockwise, mxfp4
+mod fp8_blockwise;
+mod mxfp4;
 
 // gguf
 
@@ -42,6 +44,8 @@ pub static SCHEMES: &[&Scheme] = &[
     &mxfp8::MXFP8,
     &nvfp4::NVFP4,
     // fp8.blockwise, mxfp4
+    &fp8_blockwise::BLOCKWISE,
+    &mxfp4::MXFP4,
 
     // gguf.*
 
@@ -172,6 +176,11 @@ impl<'a> Ctx<'a> {
     pub fn uint(&self, key: &str) -> usize {
         self.params[key].as_u64().expect("checked against the row") as usize
     }
+    /// A param of the row as stored, for params of no text or integer kind (checked before the
+    /// decode runs).
+    pub fn param(&self, key: &str) -> &'a Value {
+        &self.params[key]
+    }
     pub fn flag(&self, key: &str) -> bool {
         matches!(self.params[key], Value::Bool(true))
     }
@@ -251,6 +260,14 @@ fn checked(
             "logical dtype {dtype} is not F32, BF16 or F16"
         )));
     }
+    // `transposed: true` (spec §6, building blocks): the parts hold the logical tensor with its
+    // last two axes swapped; the scheme reads that stored tensor, and its values are swapped back.
+    let transposed = matches!(params.get("transposed"), Some(Value::Bool(true)));
+    let stored: Vec<u64> = match (transposed, shape) {
+        (true, [lead @ .., a, b]) => [lead, &[*b, *a]].concat(),
+        _ => shape.to_vec(),
+    };
+    let shape = stored.as_slice();
     let numel = shape.iter().try_fold(1u64, |a, b| a.checked_mul(*b));
     let (rows, cols) = match (scheme.view, shape, numel) {
         (View::Flat, _, Some(n)) => (1, n as usize),
@@ -294,7 +311,26 @@ fn checked(
     }
     let out = (scheme.decode)(&ctx)?;
     debug_assert_eq!(out.len(), rows * cols);
+    let out = match transposed {
+        true => swap_last_two(&out, shape),
+        false => out,
+    };
     Ok(round(dtype, &out))
+}
+
+/// Values of a `[lead…, r, c]` tensor, row-major, as `[lead…, c, r]`.
+pub fn swap_last_two(x: &[f32], shape: &[u64]) -> Vec<f32> {
+    let (r, c) = match *shape {
+        [.., r, c] if r * c > 0 => (r as usize, c as usize),
+        _ => return x.to_vec(),
+    };
+    let mut out = x.to_vec();
+    for (m, mat) in x.chunks(r * c).enumerate() {
+        for (k, v) in mat.iter().enumerate() {
+            out[m * r * c + (k % c) * r + k / c] = *v;
+        }
+    }
+    out
 }
 
 fn allowed(a: &Allowed, v: &Value) -> bool {

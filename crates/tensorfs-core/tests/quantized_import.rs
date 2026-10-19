@@ -717,9 +717,15 @@ fn every_carrier_names_a_complete_encoding() {
             ("int8.tensorwise", _) => Encoding::int8_tensorwise(&Dtype::F32),
             ("int8.rowwise", _) => Encoding::int8_rowwise(0, &Dtype::F32),
             ("int8.convrot", _) => Encoding::int8_convrot(256, &Dtype::F32),
+            ("fp8.blockwise", _) => Encoding::fp8_blockwise(128, 128, &Dtype::F32),
+            ("mxfp4", Producer::GptOss) => Encoding::mxfp4(true),
+            ("mxfp4", _) => Encoding::mxfp4(false),
             other => panic!("{other:?}"),
         };
         let mut encoding = c.encoding.clone();
+        for param in c.config_params.keys() {
+            encoding.params.insert(param.clone(), tensorfs_core::format::Value::List(vec![128u64.into(), 128u64.into()]));
+        }
         for (param, (_, default)) in &c.marker_params {
             encoding.params.insert(param.clone(), (*default).into());
         }

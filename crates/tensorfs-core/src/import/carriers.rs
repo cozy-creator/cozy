@@ -23,6 +23,13 @@ pub enum Producer {
     Modelopt,
     CompressedTensors,
     Comfy,
+    /// `quant_method: fp8` (DeepSeek's and transformers' FineGrainedFP8: DeepSeek, Qwen, Kimi,
+    /// MiniMax, GLM).
+    Deepseek,
+    /// `quant_method: mxfp4`.
+    GptOss,
+    /// AMD Quark, `quant_method: quark`.
+    Quark,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +54,14 @@ pub struct Carrier {
     /// Marker keys whose value this carrier decodes, and that value.
     #[serde(default)]
     pub marker_values: BTreeMap<String, Json>,
+    /// Params the declaration states: param -> its key in the module's declaration, else the
+    /// producer's (`block_size` -> DeepSeek's `weight_block_size`).
+    #[serde(default)]
+    pub config_params: BTreeMap<String, String>,
+    /// Parts are `{module}_{suffix}` and the folded tensor is `{module}` (gpt-oss), not
+    /// `{module}.{suffix}` and `{module}.weight`.
+    #[serde(default)]
+    pub bare: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +77,9 @@ pub struct PartRule {
     pub shape: Geometry,
     #[serde(default)]
     pub optional: bool,
+    /// The data part's last two stored axes are one row (gpt-oss's `[.., C/32, 16]` blocks).
+    #[serde(default)]
+    pub merge: bool,
 }
 
 /// A part's shape against the logical `[*lead, C]`, with `R = Π lead`.
@@ -84,6 +102,9 @@ pub enum Geometry {
     /// Block scales in cuBLAS 128×4 tiles, each matrix of `[*stack, N, C]` on its own:
     /// `[*stack, 128·⌈N/128⌉, 4·⌈W/4⌉]` with `W = ⌈C/n⌉`.
     Tiles(u64),
+    /// One scale per tile of the encoding's `block_size` `[r, c]` over each matrix `[N, C]`:
+    /// `[*lead[..-1], ⌈N/r⌉, ⌈C/c⌉]`.
+    BlockTiles,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +188,9 @@ struct Declared {
     modules: BTreeMap<String, Conf>,
     /// Keys that only declare (markers), dropped from the output.
     markers: Vec<String>,
+    /// The producer's own settings that `config_params` read when a module's declaration does not
+    /// state them.
+    config: Conf,
     /// The model's dtype, when its `config.json` states it.
     dtype: Option<Dtype>,
 }
@@ -192,6 +216,7 @@ impl Declared {
             formats: BTreeSet::new(),
             modules: BTreeMap::new(),
             markers: Vec::new(),
+            config: Conf::new(),
             dtype: None,
         }
     }
@@ -213,6 +238,74 @@ impl Declared {
             }
         }
     }
+}
+
+impl Declared {
+    /// A producer setting `config_params` may read; two different values for one are refused.
+    fn setting(&mut self, key: &str, value: &Json, what: &str) -> Result<()> {
+        match self.config.get(key) {
+            Some(other) if other != value => refuse(
+                Code::AMBIGUOUS_CLASSIFICATION,
+                format!("{what}: {key} is both {other} and {value}"),
+            ),
+            _ => {
+                self.config.insert(key.to_owned(), value.clone());
+                Ok(())
+            }
+        }
+    }
+}
+
+/// AMD Quark's declaration: a global weight spec, exact-name per-module specs
+/// (`layer_quant_config`) and `exclude` (modules left unquantized, so carrying no carrier). A spec
+/// becomes a format the carrier table names: `mxfp4` (FP4 per 32, E8M0 scales, packed
+/// `reorder`, which is §5's low-first order: proven on amd/gpt-oss-20b-w-mxfp4-a-bf16's bytes) or
+/// `fp8_block` (E4M3 per tile of `block_size`). Anything else stays an unread format.
+fn quark(doc: &Json, what: &str) -> Result<Declared> {
+    let mut d = Declared::new(Producer::Quark, what.to_owned());
+    let unread = |detail: String| refuse(Code::UNREGISTERED_ENCODING, format!("{what}: {detail}"));
+    let export = &doc["export"];
+    if export["weight_format"] != "real_quantized" {
+        return unread(format!("Quark weight_format {}", export["weight_format"]));
+    }
+    let pack = export["pack_method"].as_str().unwrap_or_default();
+    let format = |w: &Json| -> String {
+        let (dtype, scheme) = (&w["dtype"], &w["qscheme"]);
+        match (dtype.as_str(), scheme.as_str()) {
+            (Some("fp4"), Some("per_group"))
+                if w["group_size"] == 32 && w["scale_format"] == "e8m0" && pack == "reorder" =>
+            {
+                "mxfp4".into()
+            }
+            (Some("fp8_e4m3"), Some("per_block")) if w["block_size"].is_array() => {
+                "fp8_block".into()
+            }
+            _ => format!("{dtype} {scheme} (pack_method {pack})"),
+        }
+    };
+    let types = doc.get("layer_type_quant_config").and_then(Json::as_object);
+    if types.is_some_and(|t| !t.is_empty()) {
+        return unread("Quark layer_type_quant_config is not read".into());
+    }
+    let global = &doc["global_quant_config"]["weight"];
+    if !global.is_null() {
+        d.formats.insert(format(global));
+        if global["block_size"].is_array() {
+            d.setting("block_size", &global["block_size"], what)?;
+        }
+    }
+    let layers = doc.get("layer_quant_config").and_then(Json::as_object);
+    for (module, spec) in layers.into_iter().flatten() {
+        if module.contains(['*', '?', '[']) || module.starts_with("re:") {
+            return unread(format!("Quark layer_quant_config pattern {module:?}"));
+        }
+        let w = &spec["weight"];
+        let mut conf = Conf::new();
+        conf.insert("format".into(), format(w).into());
+        conf.insert("block_size".into(), w["block_size"].clone());
+        d.module(module, conf, what)?;
+    }
+    Ok(d)
 }
 
 /// `quantization_config` (Transformers' `config.json` key, or a file's metadata) and ModelOpt's
@@ -246,8 +339,45 @@ fn quantization_config(doc: &Json, what: &str) -> Result<Declared> {
                 .chain([doc])
                 .filter_map(|g| g.get("format")?.as_str());
             d.formats.extend(formats.map(str::to_owned));
+            // The block strategy is its own carrier: `float-quantized/block`, its tile from
+            // `block_structure`.
+            let top = doc.get("format").and_then(Json::as_str);
+            for g in groups.into_iter().flat_map(|g| g.values()) {
+                let format = g.get("format").and_then(Json::as_str).or(top);
+                let w = &g["weights"];
+                if format == Some("float-quantized") && w["strategy"] == "block" {
+                    d.formats.insert("float-quantized/block".into());
+                    d.setting("block_structure", &w["block_structure"], what)?;
+                }
+            }
             d
         }
+        Some("fp8") => {
+            let mut d = Declared::new(Producer::Deepseek, what.to_owned());
+            if !matches!(doc.get("fmt").and_then(Json::as_str), None | Some("e4m3")) {
+                return refuse(
+                    Code::UNREGISTERED_ENCODING,
+                    format!("{what}: quant_method fp8 with fmt {}", doc["fmt"]),
+                );
+            }
+            match doc.get("weight_block_size") {
+                Some(b @ Json::Array(_)) => d.setting("weight_block_size", b, what)?,
+                _ => {
+                    return refuse(
+                        Code::UNREGISTERED_ENCODING,
+                        format!("{what}: quant_method fp8 with no weight_block_size (per-tensor)"),
+                    )
+                }
+            }
+            d.formats.insert("fp8".into());
+            d
+        }
+        Some("mxfp4") => {
+            let mut d = Declared::new(Producer::GptOss, what.to_owned());
+            d.formats.insert("mxfp4".into());
+            d
+        }
+        Some("quark") => quark(doc, what)?,
         other => {
             return refuse(
                 Code::UNREGISTERED_ENCODING,
@@ -331,7 +461,12 @@ fn declared(set: &SourceSet, group: &Group) -> Result<Option<Declared>> {
     let mut dtype = None;
     if let Some(doc) = read_json(set, &path("config.json"))? {
         if let Some(q) = doc.get("quantization_config") {
-            all.push(quantization_config(q, &path("config.json"))?);
+            let mut d = quantization_config(q, &path("config.json"))?;
+            // DeepSeek-V4's routed experts are FP4 (MXFP4) beside its FP8 tiles.
+            if d.producer == Producer::Deepseek && doc["expert_dtype"] == "fp4" {
+                d.formats.insert("fp4".into());
+            }
+            all.push(d);
         }
         let named = doc.get("torch_dtype").or_else(|| doc.get("dtype"));
         dtype = match named.and_then(Json::as_str) {
@@ -393,6 +528,9 @@ fn declared(set: &SourceSet, group: &Group) -> Result<Option<Declared>> {
                 m.found.extend(d.found);
                 m.formats.extend(d.formats);
                 m.markers.extend(d.markers);
+                for (key, value) in &d.config {
+                    m.setting(key, value, "a second declaration")?;
+                }
                 for (module, conf) in d.modules {
                     m.module(&module, conf, "a second declaration")?;
                 }
@@ -435,7 +573,12 @@ fn numel(shape: &[u64]) -> u64 {
 }
 
 /// The stored shape of `t` as `rule` reads it against the logical `shape`, or why not.
-fn geometry(rule: &PartRule, t: &Tensor, shape: &[u64]) -> std::result::Result<Vec<u64>, String> {
+fn geometry(
+    rule: &PartRule,
+    t: &Tensor,
+    shape: &[u64],
+    block: Option<[u64; 2]>,
+) -> std::result::Result<Vec<u64>, String> {
     let (lead, c) = match shape {
         [lead @ .., c] => (lead, *c),
         [] => (&[][..], 1),
@@ -484,6 +627,16 @@ fn geometry(rule: &PartRule, t: &Tensor, shape: &[u64]) -> std::result::Result<V
                 false => return Err(format!("{:?}, not cuBLAS tiles {want:?}", t.shape)),
             }
         }
+        Geometry::BlockTiles => {
+            let ([outer @ .., n], Some([r, cols])) = (lead, block) else {
+                return Err("tiles with no block_size".into());
+            };
+            let want = [outer, &[n.div_ceil(r), c.div_ceil(cols)]].concat();
+            match t.shape == want {
+                true => want,
+                false => return Err(format!("{:?}, not tiles {want:?}", t.shape)),
+            }
+        }
     };
     let dtype = rule.stored.as_ref().unwrap_or(&t.dtype);
     match dtype.byte_len(&stored) {
@@ -497,6 +650,7 @@ fn fit(
     carrier: &Carrier,
     present: &Present,
     conf: Option<&Conf>,
+    config: &Conf,
 ) -> std::result::Result<Folded, String> {
     if let Some(s) = (present.keys()).find(|s| !carrier.parts.iter().any(|r| r.suffix == **s)) {
         return Err(format!("no part for .{s}"));
@@ -510,9 +664,31 @@ fn fit(
         return Err(format!(".{} is {}", data.suffix, t.dtype));
     };
     let mut shape = t.shape.clone();
+    if data.merge && shape.len() >= 2 {
+        let last = shape.pop().unwrap_or_default();
+        if let Some(n) = shape.last_mut() {
+            *n *= last;
+        }
+    }
     if let Some(last) = shape.last_mut() {
         *last = *last * from / to;
     }
+    let mut encoding = carrier.encoding.clone();
+    for (param, key) in &carrier.config_params {
+        let stated = conf.and_then(|c| conf_get(c, key)).filter(|v| !v.is_null());
+        let v = stated
+            .or_else(|| config.get(key))
+            .ok_or(format!("no {key} declares {param}"))?;
+        let value = json_value(v).ok_or(format!("{key} is {v}"))?;
+        encoding.params.insert(param.clone(), value);
+    }
+    let block = match encoding.params.get("block_size") {
+        Some(Value::List(l)) => match l.iter().map(Value::as_u64).collect::<Vec<_>>()[..] {
+            [Some(r), Some(c)] if r > 0 && c > 0 => Some([r, c]),
+            _ => return Err(format!("block_size {l:?} is not two positive extents")),
+        },
+        _ => None,
+    };
     let mut parts = Vec::new();
     for rule in &carrier.parts {
         let Some((_, t)) = present.get(rule.suffix.as_str()) else {
@@ -527,7 +703,8 @@ fn fit(
                 rule.suffix, t.dtype, rule.dtypes
             ));
         }
-        let part_shape = geometry(rule, t, &shape).map_err(|e| format!(".{}: {e}", rule.suffix))?;
+        let part_shape =
+            geometry(rule, t, &shape, block).map_err(|e| format!(".{}: {e}", rule.suffix))?;
         parts.push(FoldedPart {
             role: rule.role.clone(),
             dtype: rule.stored.clone().unwrap_or_else(|| t.dtype.clone()),
@@ -538,7 +715,6 @@ fn fit(
     if let (Producer::Comfy, Some(conf)) = (carrier.producer, conf) {
         marker_keys(carrier, conf)?;
     }
-    let mut encoding = carrier.encoding.clone();
     for (param, (key, default)) in &carrier.marker_params {
         let value = match conf.and_then(|c| conf_get(c, key)) {
             None => *default,
@@ -612,7 +788,33 @@ fn companions(group: &Group) -> Result<()> {
     Ok(())
 }
 
-/// Folds every quantized carrier in `set` into encoded tensors under the module's `.weight`.
+/// A declaration's JSON value as a param: a count, a name, a flag or a list of them.
+fn json_value(v: &Json) -> Option<Value> {
+    match v {
+        Json::Number(n) => n.as_u64().map(Value::from),
+        Json::String(s) => Some(Value::from(s.as_str())),
+        Json::Bool(b) => Some(Value::from(*b)),
+        Json::Array(a) => a
+            .iter()
+            .map(json_value)
+            .collect::<Option<_>>()
+            .map(Value::List),
+        _ => None,
+    }
+}
+
+/// How a producer joins a module and a part's suffix: `.` (`{module}.weight_scale`), or `_` for
+/// `bare` rows (gpt-oss's `{module}_scales`).
+fn joiner(c: &Carrier) -> char {
+    if c.bare {
+        '_'
+    } else {
+        '.'
+    }
+}
+
+/// Folds every quantized carrier in `set` into encoded tensors under the module's `.weight` (or,
+/// for `bare` rows, the module's own name).
 pub fn fold(set: &mut SourceSet) -> Result<()> {
     for g in 0..set.groups.len() {
         let group = &set.groups[g];
@@ -637,20 +839,23 @@ pub fn fold(set: &mut SourceSet) -> Result<()> {
     Ok(())
 }
 
-/// Refuses carrier suffixes no declaration explains.
+/// Refuses carrier parts no declaration explains: a suffix of the table beside its row's data
+/// part, when that data part is not a plain float tensor.
 fn undeclared(group: &Group) -> Result<()> {
-    let suffixes: BTreeSet<&str> = carriers()
-        .iter()
-        .flat_map(|c| c.parts.iter().skip(1))
-        .map(|r| r.suffix.as_str())
-        .collect();
+    let quantized = |key: &str| {
+        (group.tensors.get(key))
+            .is_some_and(|t| !matches!(t.dtype, Dtype::F32 | Dtype::BF16 | Dtype::F16))
+    };
     let found: Vec<&String> = (group.tensors.keys())
         .filter(|k| {
-            k.rsplit_once('.').is_some_and(|(module, s)| {
-                suffixes.contains(s)
-                    && ["weight", "weight_packed"]
-                        .iter()
-                        .any(|d| group.tensors.contains_key(&format!("{module}.{d}")))
+            carriers().iter().any(|c| {
+                let (j, data) = (joiner(c), &c.parts[0].suffix);
+                c.parts.iter().skip(1).any(|r| {
+                    let module = k
+                        .strip_suffix(r.suffix.as_str())
+                        .and_then(|m| m.strip_suffix(j));
+                    module.is_some_and(|m| quantized(&format!("{m}{j}{data}")))
+                })
             })
         })
         .take(4)
@@ -686,10 +891,13 @@ fn fold_group(group: &Group, d: &Declared) -> Result<Folds> {
         .map(|r| r.suffix.as_str())
         .collect();
     let data: BTreeSet<&str> = rows.iter().map(|c| c.parts[0].suffix.as_str()).collect();
+    // One producer's rows share a joiner (and so `bare`).
+    let bare = rows.iter().any(|c| c.bare);
+    let j = if bare { '_' } else { '.' };
     // Modules: each carrier role key's, and each module a declaration names.
     let mut modules: BTreeSet<&str> = BTreeSet::new();
     for key in group.tensors.keys() {
-        if let Some((module, s)) = key.rsplit_once('.') {
+        if let Some((module, s)) = key.rsplit_once(j) {
             if suffixes.contains(s) && !data.contains(s) {
                 modules.insert(module);
             }
@@ -698,7 +906,7 @@ fn fold_group(group: &Group, d: &Declared) -> Result<Folds> {
     for module in d.modules.keys() {
         if data
             .iter()
-            .any(|s| group.tensors.contains_key(&format!("{module}.{s}")))
+            .any(|s| group.tensors.contains_key(&format!("{module}{j}{s}")))
         {
             modules.insert(module);
         }
@@ -706,7 +914,7 @@ fn fold_group(group: &Group, d: &Declared) -> Result<Folds> {
     let present = |module: &str| -> Present {
         (suffixes.iter())
             .filter_map(|s| {
-                let (key, t) = group.tensors.get_key_value(&format!("{module}.{s}"))?;
+                let (key, t) = group.tensors.get_key_value(&format!("{module}{j}{s}"))?;
                 Some((*s, (key.as_str(), t)))
             })
             .collect()
@@ -767,7 +975,7 @@ fn fold_group(group: &Group, d: &Declared) -> Result<Folds> {
         let mut fits = Vec::new();
         let mut why = Vec::new();
         for c in &candidates {
-            match fit(c, &present, conf) {
+            match fit(c, &present, conf, &d.config) {
                 Ok(f) => fits.push(f),
                 Err(e) => why.push(format!("{}: {e}", c.encoding.scheme)),
             }
@@ -797,11 +1005,14 @@ fn fold_group(group: &Group, d: &Declared) -> Result<Folds> {
                 )
             }
         };
-        let key = format!("{module}.weight");
+        let key = match bare {
+            true => module.to_owned(),
+            false => format!("{module}.weight"),
+        };
         let consumed: Vec<String> = present.values().map(|(k, _)| k.to_string()).collect();
         // A sibling no carrier reads (AWQ's `pre_quant_scale`, a zero point, low-rank terms)
         // changes the weight's value: never left beside it as a plain tensor.
-        let prefix = format!("{module}.");
+        let prefix = format!("{module}{j}");
         let unread: Vec<&String> = (group.tensors.range(prefix.clone()..))
             .map(|(k, _)| k)
             .take_while(|k| k.starts_with(&prefix))
@@ -839,9 +1050,15 @@ fn fold_group(group: &Group, d: &Declared) -> Result<Folds> {
     let mut out = Folds::new();
     for (key, consumed, folded) in folds {
         let data = &folded.parts[0];
+        // `transposed: true`: the parts are the logical tensor with its last two axes swapped.
+        let mut shape = data.shape.clone();
+        if folded.encoding.params.get("transposed") == Some(&Value::Bool(true)) {
+            let n = shape.len();
+            shape.swap(n - 2, n - 1);
+        }
         let tensor = Tensor {
             dtype: logical.clone(),
-            shape: data.shape.clone(),
+            shape,
             file: data.at.file,
             start: data.at.start,
             len: data.at.len,
