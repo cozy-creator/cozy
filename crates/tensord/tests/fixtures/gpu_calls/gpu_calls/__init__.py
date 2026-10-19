@@ -5,6 +5,7 @@ device so a caller sees where it ran."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 
 import msgspec
@@ -117,9 +118,13 @@ class Tiny(Model[Graph]):
     """A constructed slot that declares no group: one GPU, as birefnet's and the describer's."""
 
     graph: Graph
+    #: Each model file its load was given (configs, tokenizer, assets): SHA-256 by manifest path.
+    assets: dict[str, str]
 
     def load(self, loader: Loader) -> None:
         self.graph = loader.construct(Graph, factory=_graph)
+        files = loader.assets
+        self.assets = {n: hashlib.sha256(files.read(n)).hexdigest() for n in files.names()}
 
     @uses_components("model")
     def weight(self) -> object:
@@ -147,6 +152,21 @@ async def resident(ctx: Context, *, model: Tiny) -> Ran:
 
 
 app.entrypoint(resident)
+
+
+class Files(msgspec.Struct):
+    #: The weight's length: the `n` its `model/config.json` gave the construction.
+    n: int
+    assets: dict[str, str]
+
+
+@invocable
+async def files(ctx: Context, *, model: Tiny) -> Files:
+    """What its model's load read through the machine: the config and every asset."""
+    return Files(int(model.weight().numel()), model.assets)
+
+
+app.entrypoint(files)
 
 
 class Children(msgspec.Struct):

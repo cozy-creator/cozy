@@ -1368,6 +1368,58 @@ print(next(out.glob('tensorfs-*.whl')))
         let _ = fs::remove_dir_all(tools);
     }
 
+    /// A model loaded through the machine reads every file its manifest lists, byte for byte:
+    /// its construction config and each asset (tokenizer files, a binary). Until xs-045's fix
+    /// only the header reached it, and configs and tokenizers came back empty.
+    #[tokio::test]
+    #[ignore = "GPU: one card (a rental)"]
+    async fn a_loaded_model_reads_its_config_tokenizer_and_assets() {
+        use sha2::{Digest, Sha256};
+        use tensorfs_core::{format::Dtype, writer::{Data, Source}};
+        const N: usize = 1000;
+        let palette: Vec<u8> = (0..=255).collect();
+        let config = serde_json::json!({"n": N}).to_string();
+        let files: [(&str, &[u8]); 4] = [
+            ("model/config.json", config.as_bytes()),
+            ("tokenizer/vocab.json", br#"{"a": 0}"#),
+            ("tokenizer/merges.txt", b"#version: 0.2\na b\n"),
+            ("assets/palette.bin", &palette),
+        ];
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tools = std::env::temp_dir().join(format!("cm-tools-{}", uuid::Uuid::new_v4()));
+        assert!(Command::new("uv").current_dir(repo).args(["build", "--wheel", "--out-dir"]).arg(&tools)
+            .status().unwrap().success());
+        let home = tools.join("executor-home");
+        fs::create_dir_all(&home).unwrap();
+        let gpu = tools.join("gpu.json");
+        let mut args = installing_args(&tools);
+        args.extend(["--gpu-config".into(), gpu.clone().into_os_string()]);
+        let machine = Machine::start_args(|state, _| {
+            let store = tensorfs_core::store2::Store::open(state.join("tensorfs")).unwrap();
+            let mut writer = store.writer(None, None).unwrap();
+            writer.put("model", "weight", &Dtype::F32, &[N as u64], Data::Plain(Source::Read(&mut vec![1u8; 4 * N].as_slice()))).unwrap();
+            for (path, bytes) in files {
+                writer.file(path, bytes).unwrap();
+            }
+            let manifest = writer.commit().unwrap();
+            fs::write(&gpu, serde_json::json!({"devices": "0", "environment": {
+                "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home},
+                "models": [{"package": "local/tensord-gpu-calls", "slot": "files.models.model",
+                    "repository": "local/files", "release": "1", "lane": "f32",
+                    "manifest": manifest.id(), "components": ["model"]}]}).to_string()).unwrap();
+        }, &args).await;
+        let client = client(&machine);
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let manifest = write_package(&client, &all, "gpu_calls", "local/tensord-gpu-calls").await;
+        let got = call(&client, &all, &manifest, ("files-1", "files"), serde_json::json!({})).await;
+        let want: serde_json::Map<String, serde_json::Value> = files.iter()
+            .map(|(path, bytes)| (path.to_string(), format!("{:x}", Sha256::digest(bytes)).into()))
+            .collect();
+        assert_eq!(got["n"], N, "the construction config did not reach the factory: {got}");
+        assert_eq!(got["assets"], serde_json::Value::Object(want), "{got}");
+        let _ = fs::remove_dir_all(tools);
+    }
+
     /// An idle tenant gives its GPU to a request that needs it: an older release kept warm
     /// beside a newer one (both installed) is evicted on demand, and the newer release's
     /// request gets a budget for all its weights, its next one paging nothing. Klein bench
