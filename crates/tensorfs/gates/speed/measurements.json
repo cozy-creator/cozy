@@ -1,0 +1,174 @@
+{
+  "description": "Recorded TensorFS/safetensors byte-transfer benchmark medians; not a model decode or inference benchmark",
+  "units": "milliseconds",
+  "repetitions": 5,
+  "aggregation": "median of interleaved repetitions",
+  "payload": "Identical real INT8 lane payloads represented as U8 tensors/parts in both formats",
+  "timed": "Per-load open, checkpoint registration, allocation/mapping, read and GPU transfer through completion",
+  "excluded": "Persistent reader initialization, fixture preparation, downloads, dequantization, model construction and inference",
+  "cold": "POSIX_FADV_DONTNEED requested for payload files; metadata is not evicted",
+  "warm": "Immediate second read",
+  "baseline": "Fastest measured safetensors path per cell; st-cpu-cuda is safe_open on CPU then CUDA transfer",
+  "versions": {
+    "safetensors": "0.8.0",
+    "fastsafetensors": "0.5.0",
+    "driver": "580.159.03"
+  },
+  "provenance_note": "Wheel/source identity is established by matching associated archived bundle wheel hashes with ghbuild artifacts; it is not a field in the run receipts.",
+  "runs": [
+    {
+      "run": 11566,
+      "receipt": "outputs/xs045-u8/show-11566.json",
+      "receipt_sha256": "995da1323c98a5f6feece1835e13eb3077f756430ff8db46af3c39ecd1355fca",
+      "wheel_source": "a742434108b61623f8ed07ea358d4166e793a161",
+      "harness_source": "b654dca7c4a53ae42f5cd99e8f3c791363b9b1be",
+      "wheel_sha256": "d041648e505c1a0e18119b8c917f918a0d579ac0f85f0f8f1151ade009b827ed",
+      "bundle": "bundle-final.tar",
+      "revision": "Before final CBOR header and lazy window registration",
+      "hardware": {
+        "gpu": "NVIDIA L4",
+        "cpus": 64,
+        "mem_total": 388493529088,
+        "torch": "2.14.0+cu130"
+      },
+      "harness_path": "crates/tensorfs/gates/speed/speedgate.py",
+      "lanes": {
+        "sdxl-int8": {
+          "full cold": {
+            "engine_ms": 321,
+            "margin": 0.28,
+            "pass": true,
+            "rust_ms": 306,
+            "safetensors": "fastsafetensors",
+            "safetensors_ms": 392
+          },
+          "full warm": {
+            "engine_ms": 444,
+            "margin": 0.177,
+            "pass": true,
+            "rust_ms": 344,
+            "safetensors": "fastsafetensors",
+            "safetensors_ms": 405
+          },
+          "window cold": {
+            "engine_ms": 28,
+            "margin": 1.189,
+            "pass": true,
+            "rust_ms": 39,
+            "safetensors": "st-cpu-cuda",
+            "safetensors_ms": 86
+          },
+          "window warm": {
+            "engine_ms": 19,
+            "margin": 0.179,
+            "pass": true,
+            "rust_ms": 35,
+            "safetensors": "st-cpu-cuda",
+            "safetensors_ms": 42
+          }
+        },
+        "qwen-int8": {
+          "full cold": {
+            "engine_ms": 1724,
+            "margin": 0.199,
+            "pass": true,
+            "rust_ms": 1384,
+            "safetensors": "fastsafetensors",
+            "safetensors_ms": 1659
+          },
+          "full warm": {
+            "engine_ms": 2175,
+            "margin": 0.199,
+            "pass": true,
+            "rust_ms": 1684,
+            "safetensors": "fastsafetensors",
+            "safetensors_ms": 2019
+          },
+          "window cold": {
+            "engine_ms": 29,
+            "margin": 1.176,
+            "pass": true,
+            "rust_ms": 41,
+            "safetensors": "st-cpu-cuda",
+            "safetensors_ms": 90
+          },
+          "window warm": {
+            "engine_ms": 16,
+            "margin": -0.187,
+            "pass": false,
+            "rust_ms": 41,
+            "safetensors": "st-cpu-cuda",
+            "safetensors_ms": 33
+          }
+        }
+      }
+    },
+    {
+      "run": 11624,
+      "receipt": "outputs/xs045-u8/show-11624.json",
+      "receipt_sha256": "517b1933d7a931308864c5e129f517653e52391d73740049c67dda8f0d58d884",
+      "wheel_source": "ffd14883a448c9c89129f1dcb8b7229ad0b6eb69",
+      "harness_source": "0a6e71ee2c919db3e6e9b5844c8234ca9749cedb",
+      "wheel_sha256": "457c33b2cf9eb3b2f01619a66b6e446cac4eb676f2714a227b61b8104b08dfc3",
+      "bundle": "bundle-c.tar",
+      "revision": "Final CBOR header and lazy window registration",
+      "hardware": {
+        "gpu": "NVIDIA L4",
+        "cpus": 64,
+        "mem_total": 388493529088,
+        "torch": "2.14.0+cu130"
+      },
+      "harness_path": "crates/tensorfs/gates/speed/speedgate.py",
+      "lanes": {
+        "sdxl-int8": {
+          "window cold": {
+            "margin": 2.309,
+            "pass": true,
+            "rust_ms": 24,
+            "rust_open_ms": 2.3,
+            "rust_read_ms": 21.1,
+            "safetensors": "fastsafetensors",
+            "safetensors_ms": 79,
+            "safetensors_open_ms": 38.9,
+            "safetensors_read_ms": 38.1
+          },
+          "window warm": {
+            "margin": 0.971,
+            "pass": true,
+            "rust_ms": 23,
+            "rust_open_ms": 2.1,
+            "rust_read_ms": 20.6,
+            "safetensors": "st-cpu-cuda",
+            "safetensors_ms": 45,
+            "safetensors_open_ms": 3.1,
+            "safetensors_read_ms": 41.7
+          }
+        },
+        "qwen-int8": {
+          "window cold": {
+            "margin": 0.873,
+            "pass": true,
+            "rust_ms": 33,
+            "rust_open_ms": 2.3,
+            "rust_read_ms": 29.7,
+            "safetensors": "fastsafetensors",
+            "safetensors_ms": 61,
+            "safetensors_open_ms": 27.6,
+            "safetensors_read_ms": 32.7
+          },
+          "window warm": {
+            "margin": 0.58,
+            "pass": true,
+            "rust_ms": 23,
+            "rust_open_ms": 2.2,
+            "rust_read_ms": 21.8,
+            "safetensors": "st-cpu-cuda",
+            "safetensors_ms": 37,
+            "safetensors_open_ms": 1.8,
+            "safetensors_read_ms": 35.0
+          }
+        }
+      }
+    }
+  ]
+}

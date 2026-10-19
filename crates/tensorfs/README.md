@@ -1,20 +1,48 @@
 # TensorFS
 
-Model weights are large, and applications need to download, verify, store and read them. Different
-source layouts and quantized encodings complicate this: packed numbers need the right scales and
-decoding rules to become usable tensors. Keeping a separate copy of every checkpoint also wastes
-space when models or precision variants share unchanged weights.
+Safetensors provides a fast, memory-mappable tensor file. Its [standard header](https://github.com/safetensors/safetensors#format)
+records names, dtypes, shapes and byte offsets. Distributing and serving quantized models still
+leaves applications to supply several things:
 
-**TensorFS handles that path in one library.** It imports recognized sources into **cozytensors**,
-a format whose header describes each tensor's shape, dtype and encoding. It stores the bytes in
-immutable chunks named by their content, so checkpoints can share unchanged chunks. Pulls reuse
-objects already in the store, verify newly downloaded bytes and can fetch just the chunks needed
-by selected components. Readers use the declared encoding to reconstruct tensor values; exports
-reassemble ordinary safetensors files for other tools.
+| What safetensors leaves to the application | How TensorFS addresses it |
+|---|---|
+| Quantization meaning: how scales, packed weights and producer-specific transforms reconstruct a tensor. These are conventions beyond the standard tensor declarations. | **cozytensors** declares named encodings, complete parameters and stored parts, with specified decoding math. |
+| Reusing unchanged bytes across checkpoints: the file format defines no content-addressed chunks shared between files. | Immutable chunks identified by SHA-256 and length are shared across models and precision lanes; pulls fetch missing objects. |
+| Verifying partial downloads: tensor offsets permit selective reads, but the format includes no per-chunk content hashes. | Each downloaded chunk is verified independently before use, so a selected component can be fetched and checked without downloading the whole checkpoint. |
+
+TensorFS combines that format with a local store, fetcher and Rust/Python readers. It packs small
+parts into aligned chunks and preserves construction order for efficient reads. Safetensors remains
+an import/export format, so existing Diffusers and Transformers workflows can use the same weights.
 
 Use TensorFS through its Rust API, Python library or `tfs` command-line tool. It works with local
 files, static origins and Tensorhub, without requiring Cozy, a Tensorhub account or PyTorch.
 The [cozytensors specification](spec/cozytensors.md) defines the format and exact decoding rules.
+
+## Timing versus safetensors
+
+Measured disk → host → GPU transfer of the same real INT8 lane bytes, represented as `U8` parts
+in both formats. Times are **milliseconds, median of five interleaved repetitions**, on NVIDIA L4.
+Each load includes open, registration, allocation/mapping and transfer through GPU completion;
+persistent reader initialization and fixture preparation are excluded.
+
+| Workload (logical payload) | TensorFS cold / warm | Safetensors cold / warm | Run |
+|---|---:|---:|---|
+| SDXL, full checkpoint, 4.08 GB | **306 / 344** | 392 / 405 | 11566 |
+| Qwen-Image, full checkpoint, 19.2 GB | **1,384 / 1,684** | 1,659 / 2,019 | 11566 |
+| SDXL, selected block, 187 MB logical | **24 / 23** | 79 / 45 | 11624 |
+| Qwen-Image, selected block, 218 MB logical | **33 / 23** | 61 / 37 | 11624 |
+
+The baseline is the fastest tested safetensors path per cell: `fastsafetensors 0.5.0` for full
+loads and cold blocks; `safetensors 0.8.0`'s `safe_open` CPU→CUDA path for warm blocks. Cold requests
+payload-cache eviction with `POSIX_FADV_DONTNEED`; warm is the immediate second read. Chunk boundaries
+make the selected-block reads 211 MB and 227 MB respectively.
+
+These are separate runs and reader revisions: the full-load run predates the final CBOR header
+and lazy window registration; the block run includes them. They measure serialized-byte loading,
+excluding dequantization, model construction and inference. Hardware and cache conditions affect
+results. [Measurements and provenance](gates/speed/measurements.json) include the earlier failed
+window cell; [the recorded harness](https://github.com/cozy-creator/cozy-creator/blob/0a6e71ee2c919db3e6e9b5844c8234ca9749cedb/crates/tensorfs/gates/speed/speedgate.py)
+defines the workloads. Download projections are separate from these measured timings.
 
 ## Get started
 
