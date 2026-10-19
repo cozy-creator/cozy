@@ -277,11 +277,16 @@ def attention_cut() -> None:
         (16 * row, "query rows"),
     ):
         memo, card, room = fresh(limit)
+        pieces: list[tuple[int, int]] = []
+
+        def kernel(q, k, v, mask):  # type: ignore[no-untyped-def]
+            pieces.append((q.shape[1], q.shape[2]))
+            return sdpa(q, k, v, mask)
+
         with card, torch.no_grad():
-            cut = cuts.attend(sdpa, q, k, v, mask, rows=16)
-            retries = memo.retries
-            again = cuts.attend(sdpa, q, k, v, mask, rows=16)
-        size = next(s for key, s in memo.sizes.items() if key[0] == "attention")
+            cut = cuts.attend(kernel, q, k, v, mask, rows=16)
+            retries, pieces[:] = memo.retries, []
+            again = cuts.attend(kernel, q, k, v, mask, rows=16)
         check(f"attention by {what} equals whole", same(cut, whole), (cut - whole).abs().max())
         check(
             f"attention by {what}: warm run cuts up front",
@@ -291,8 +296,8 @@ def attention_cut() -> None:
         if what == "query rows":
             check(
                 "query rows start on the kernel's block multiple",
-                size % 16 == 0 and size < 96,
-                size,
+                {p[0] for p in pieces} == {16} and {p[1] for p in pieces} == {1},
+                pieces,
             )
     memo, card, room = fresh(16 * row)
     try:
@@ -325,16 +330,12 @@ BANDED = frozenset(
 
 def banded(limit: int, only: frozenset[str], seed: int, call):  # type: ignore[no-untyped-def]
     memo, card, room = fresh(limit, only)
-    with card:
-        cuts.enter()
-        try:
-            torch.manual_seed(seed)
-            out = call()
-            retries = memo.retries
-            torch.manual_seed(seed)
-            again = call()
-        finally:
-            cuts.leave()
+    with card, cuts.caught():
+        torch.manual_seed(seed)
+        out = call()
+        retries = memo.retries
+        torch.manual_seed(seed)
+        again = call()
     return out, again, memo, retries
 
 
@@ -482,14 +483,10 @@ def block_catch() -> None:
     )
     memo, card, room = fresh(64 * 256 * 8 + 1000, frees=1 << 40)  # the noise fits, the linear not
     memo.blocks[("noisy", 0)] = facts
-    with card, torch.no_grad():
-        cuts.enter()
-        try:
-            torch.manual_seed(7)
-            block.counter = Counter()
-            out = cuts.run(there, block.forward, (x,), {})
-        finally:
-            cuts.leave()
+    with card, torch.no_grad(), cuts.caught():
+        torch.manual_seed(7)
+        block.counter = Counter()
+        out = cuts.run(there, block.forward, (x,), {})
     check(
         "a bare block out of memory runs again under the layer, exactly",
         same(out, whole) and same(first, whole),
@@ -551,18 +548,15 @@ def block_catch() -> None:
 
 def lattice() -> None:
     memo, card, room = fresh(100, frees=100, lowers=3, step=100)
-    with card:
-        cuts.enter()
+    with card, cuts.caught():
         try:
             torch.ones(4096)
             ended = None
         except MemoryError as exc:
             ended = exc
-        finally:
-            cuts.leave()
     check(
         "past rungs 1-2 and every rung 4 step, exhausted",
-        ended is not None and room.lowered == 3 and memo.retries == 4,
+        ended is not None and room.lowered == 3 and memo.retries == 5,
         (ended, room.lowered, memo.retries),
     )
 
