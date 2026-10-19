@@ -498,6 +498,10 @@ fn accept(runs: &Arc<crate::runs::Runs>, actor: &str, id: &str, spec: crate::run
 fn reach(runs: &crate::runs::Runs, mut spec: crate::runs::Spec, hub: Option<v1::HubAccess>) -> Result<crate::runs::Spec, Error> {
     if let Some(hub) = hub {
         let invalid = |e: crate::hub::Refusal| refused("hub_access_invalid", &e.0);
+        if !hub.key.is_empty() || hub.issued_token.is_some() {
+            spec.hub = Some(crate::hub::Source::for_request(hub).map_err(invalid)?);
+            return Ok(spec);
+        }
         let capability = match (hub.capability.is_empty(), &runs.leaf) {
             (true, _) => None,
             (false, Some(leaf)) => Some(crate::hub::Capability::new(&hub.capability, &hub.token_endpoint, leaf.clone()).map_err(invalid)?),
@@ -513,6 +517,12 @@ fn reach(runs: &crate::runs::Runs, mut spec: crate::runs::Spec, hub: Option<v1::
 /// spec, or ends FAILED with why it cannot.
 pub(crate) fn resume(runs: &Arc<crate::runs::Runs>) -> std::io::Result<()> {
     for (run, actor, sent) in runs.service.engine.interrupted()? {
+        if runs.service.engine.with_journal(|journal| journal.metadata_pending(&run))? {
+            let failure = crate::journal::Failure::machine("metadata_preflight_interrupted",
+                "the metadata helper ended without a durable successful handoff; submit a new run");
+            runs.service.engine.end_preparation(&run, crate::journal::Outcome::Failed(failure))?;
+            continue;
+        }
         let spec = serde_json::from_slice(&sent)
             .map_err(|e| refused("preparation_interrupted", format!("its kept spec is unreadable: {e}")))
             .and_then(spec_of)
@@ -691,7 +701,7 @@ mod tests {
             payload: v1::Json::parse(r#" { "seed":9007199254740993, "nested":{"b":2,"a":1} } "#).ok(),
             inputs: vec![input("reference", "a", 0), input("reference", "b", 1)],
             models: vec![model("model", "org/first"), model("other", "org/second")],
-            hub: Some(v1::HubAccess {
+            hub: Some(v1::HubAccess { key: String::new(), issued_token: None,
                 origin: "https://hub.example.test/".into(), capability: "e30.e30.c2ln".into(),
                 token_endpoint: "https://hub.example.test/v1/auth/oauth2/token".into(),
                 ca_der: vec![1], object_hosts: vec!["objects-1.example.test".into()],
@@ -709,7 +719,7 @@ mod tests {
         let digest = spec_of(original.clone()).unwrap().0.digest;
         let mut resent = original.clone();
         resent.payload = v1::Json::parse(r#"{"nested":{"a":1,"b":2},"seed":9007199254740993}"#).ok();
-        resent.hub = Some(v1::HubAccess {
+        resent.hub = Some(v1::HubAccess { key: String::new(), issued_token: None,
             origin: "https://hub.example.test".into(), capability: String::new(), token_endpoint: String::new(),
             ca_der: vec![2], object_hosts: vec!["objects-2.example.test".into()],
         });

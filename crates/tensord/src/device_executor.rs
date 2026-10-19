@@ -230,6 +230,10 @@ pub enum DeviceCommand {
         constructions: Vec<Construction>,
     },
     Load {
+        #[serde(skip_serializing_if = "String::is_empty")]
+        request_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hub: Option<protocol::machine::HubAccess>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tensorfs: Option<protocol::machine::TensorFSOptions>,
         construction: String,
@@ -285,6 +289,8 @@ pub enum DeviceCommand {
         input_metadata: BTreeMap<String, Value>,
     },
     Invoke {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hub: Option<protocol::machine::HubAccess>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tensorfs: Option<Box<protocol::machine::TensorFSOptions>>,
         /// Retained asset capacity derived from the actual installed result schema.
@@ -2219,8 +2225,10 @@ fn write_command(stream: &mut LocalStream, command: &DeviceCommand, group: &Grou
     ) {
         options.remove("token");
     }
-    if let (DeviceCommand::ResolveWeights { hub: Some(_), .. }, Some(access)) = (
-        command, value.get_mut("hub").and_then(Value::as_object_mut),
+    if let (true, Some(access)) = (
+        matches!(command, DeviceCommand::ResolveWeights { hub: Some(_), .. }
+            | DeviceCommand::Load { hub: Some(_), .. } | DeviceCommand::Invoke { hub: Some(_), .. }),
+        value.get_mut("hub").and_then(Value::as_object_mut),
     ) {
         for field in ["capability", "key", "issued_token"] {
             access.remove(field);
@@ -2364,6 +2372,8 @@ mod codec_tests {
 
     fn ordinary_load() -> DeviceCommand {
         DeviceCommand::Load {
+            request_id: String::new(),
+            hub: None,
             tensorfs: Some(ordinary_options()), construction: "construction".into(), devices: String::new(),
             sequence_parallel_degree: 1, binding: Box::default(), budgets: Budgets::default(), models: vec![],
             authorized_device_limit_bytes: None, attention_pin: String::new(), sealed_tiers: false,
@@ -2373,11 +2383,36 @@ mod codec_tests {
 
     fn ordinary_invoke() -> DeviceCommand {
         DeviceCommand::Invoke {
+            hub: None,
             tensorfs: Some(Box::new(ordinary_options())), max_output_bytes: 1024, request_id: "request".into(),
             construction: "construction".into(), entrypoint: "write".into(), spool: PathBuf::from("spool"), deadline_s: None,
             attention_kernel: String::new(), bits: 0, cap_bytes: None, inputs: BTreeMap::new(), trees: BTreeMap::new(),
             floor_bytes: None, activation_bytes: BTreeMap::new(), squeezed_bytes: BTreeMap::new(), device_weights: None,
             sources: BTreeMap::new(), weights: BTreeMap::new(), destination: "owner/model".into(), actor: "actor".into(), operation: "operation".into(),
+        }
+    }
+
+    #[test]
+    fn metadata_worker_access_survives_load_and_invoke_without_debug_secrets() {
+        let access = protocol::machine::HubAccess { origin: "https://hub.example".into(),
+            capability: "private-capability".into(), key: "private-request-key".into(),
+            issued_token: Some("private-issued-token".into()), ..Default::default() };
+        let mut load = ordinary_load();
+        if let DeviceCommand::Load { hub, request_id, .. } = &mut load {
+            *hub = Some(access.clone());
+            *request_id = "request-1".into();
+        }
+        let mut invoke = ordinary_invoke();
+        if let DeviceCommand::Invoke { hub, .. } = &mut invoke { *hub = Some(access); }
+        for command in [load, invoke] {
+            let (mut machine, mut runtime) = platform::ipc::pair().unwrap();
+            write_command(&mut machine, &command, &Group::default(), false).unwrap();
+            let bytes = seam::read_body(&mut runtime).unwrap().unwrap();
+            let received: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(received["hub"]["issued_token"], "private-issued-token");
+            assert_eq!(received["hub"]["key"], "private-request-key");
+            assert!(!format!("{command:?}").contains("private-issued-token"));
+            rejected_without_a_partial_frame(|stream| write_frame(stream, &received));
         }
     }
 

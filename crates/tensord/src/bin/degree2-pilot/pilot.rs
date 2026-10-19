@@ -203,6 +203,8 @@ fn exec(
     let t = Instant::now();
     let loaded = executor.command(
         &DeviceCommand::Load {
+            request_id: String::new(),
+            hub: None,
             tensorfs: None,
             construction: "pilot".into(),
             devices,
@@ -265,6 +267,7 @@ fn exec(
         let t = Instant::now();
         let reply = executor.command(
             &DeviceCommand::Invoke {
+                hub: None,
                 tensorfs: None,
                 weights: Default::default(),
                 destination: String::new(),

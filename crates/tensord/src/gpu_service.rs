@@ -2478,6 +2478,46 @@ impl Pool {
         })
     }
 
+    /// A fresh, request-owned metadata helper, before Start, imports or device allocation.
+    pub(crate) fn resolve_weights(
+        &self, held: &HeldGeneration, id: &str, hub: Option<protocol::machine::HubAccess>,
+        models: Vec<device_executor::MetadataModel>, stop: Option<&crate::stop::Stop>,
+    ) -> io::Result<Frame> {
+        let (root, socket, directory) = self.executor_endpoint()?;
+        let config = self.executor_config(held, root, socket, 0, 0)?;
+        let mut executor = DeviceExecutor::spawn_owned(config, &self.launcher, |_, _| Ok(()))?;
+        executor.retain_until_exit(directory);
+        if executor.hello.torch_loaded {
+            executor.shutdown()?;
+            return Err(io::Error::other("metadata helper imported torch before Start"));
+        }
+        let finished = crate::stop::Stop::default();
+        let cancellation = executor.cancellation();
+        let answer = std::thread::scope(|scope| {
+            if let Some(stop) = stop {
+                let finished = &finished;
+                scope.spawn(move || {
+                    while !finished.is_cancelled() {
+                        if stop.is_cancelled() { let _ = cancellation.cancel(id); break; }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                });
+            }
+            let answer = executor.command(&DeviceCommand::ResolveWeights { request_id: id.into(), hub, models }, &mut device_executor::Baseline);
+            finished.cancel();
+            answer
+        });
+        match answer {
+            Ok(reply) => {
+                let hello = executor.command(&DeviceCommand::Hello, &mut device_executor::Baseline);
+                executor.shutdown()?;
+                if hello?.hello.torch_loaded { return Err(io::Error::other("metadata helper imported torch")); }
+                Ok(reply)
+            }
+            Err(error) => { executor.terminate()?; Err(error) }
+        }
+    }
+
     /// The installed package interface, written where the executor (its identity) reads it.
     fn interface_file(
         &self,
@@ -3016,6 +3056,8 @@ impl Pool {
             let load = match plan.slots.first() {
                 // A call that constructs nothing: its weightless construction.
                 None => DeviceCommand::Load {
+                    request_id: id.into(),
+                    hub: calls.and_then(|calls| calls.hub_access(id)),
                     tensorfs: calls.and_then(|calls| calls.tensorfs(id)),
                     construction: construction.clone(),
                     devices: lane.clone(),
@@ -3056,6 +3098,8 @@ impl Pool {
                         _ => plan.slots.iter().map(load).collect(),
                     };
                     DeviceCommand::Load {
+                        request_id: id.into(),
+                        hub: calls.and_then(|calls| calls.hub_access(id)),
                         tensorfs: calls.and_then(|calls| calls.tensorfs(id)),
                         construction: construction.clone(),
                         devices: lane.clone(),
@@ -3260,6 +3304,7 @@ impl Pool {
         session.invoked = true;
         let reply = session.executor.command_with(
             &DeviceCommand::Invoke {
+                hub: calls.and_then(|calls| calls.hub_access(id)),
                 tensorfs: calls.and_then(|calls| calls.tensorfs(id)).map(Box::new),
                 weights,
                 destination: calls.map(|calls| calls.destination(id)).unwrap_or_default(),

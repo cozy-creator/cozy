@@ -5,6 +5,7 @@
 //! download) with its `release_root_preparing` progress answers.
 use crate::{
     api::domain,
+    device_executor,
     gpu_service::{Plan, Pool, ModelGrant},
     hub::{self, Catalog},
     journal::{Installation, Preparation},
@@ -610,7 +611,15 @@ impl Publisher {
         let names: Vec<String> = checkpoints.iter().map(|n| format!("{}@{} {}", n.repository, n.release, n.lane)).collect();
         job.stage(format!("resolving {}", names.join(" and ")));
         for named in checkpoints {
-            self.pull(source, named, Some(&[]), job.stop.as_ref(), &|_, _| ())?;
+            if source.request.is_some() {
+                // The helper already admitted this header. Payload/asset fetches belong to
+                // this request's Runtime, not an anonymous parent-side prefetch.
+                let header = named.header()?;
+                self.store.checkpoint(header).map_err(|e| ("metadata_preflight_failed", e.to_string()))?;
+                storage::hold(&self.store, &storage::pin::model(&header.sha256), vec![header.clone()], None).map_err(io_failure)?;
+            } else {
+                self.pull(source, named, Some(&[]), job.stop.as_ref(), &|_, _| ())?;
+            }
         }
         Ok(())
     }
@@ -637,6 +646,110 @@ impl Publisher {
         let answer = json!([resolved.release, resolved.lane, resolved.tree, resolved.header]).to_string();
         service.engine.with_journal(|j| j.bind_named(&name, revision, &answer)).map_err(io_failure)?;
         Ok(resolved)
+    }
+
+    /// The helper is used only for a request carrying its own key. Existing ordinary,
+    /// local and anonymous resolution keeps its path; a warm pinned header needs no helper.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_for_request(&self, service: &Service, gpu: &Pool, installation: &Installation,
+        request: &Request, slot: &str, named: Named, lanes: &[&str], fallback: bool, job: &Job,
+    ) -> Result<Named, Failure> {
+        let Some(access) = &request.source.request else {
+            return self.resolve(service, &request.source, named, lanes, &request.catalog_revision);
+        };
+        let _one = access.resolving.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if request.run.is_empty() { return Err(("metadata_preflight_failed", "request-owned metadata needs a run id".into())); }
+        let mut wanted = device_executor::MetadataModel {
+            slot: slot.into(), repo_id: named.repository.to_ascii_lowercase(),
+            revision: named.tree.as_ref().map(ObjectRef::id).or_else(|| (!named.release.is_empty()).then(|| named.release.clone())),
+            variants: if named.lane.is_empty() { lanes.iter().map(|s| s.to_string()).collect() } else { vec![named.lane.clone()] },
+            fallback_to_only_variant: fallback,
+        };
+        let key = json!(["request-weight-metadata", hub::origin_key(&request.source.origin), wanted.slot, wanted.repo_id,
+            wanted.revision, wanted.variants, wanted.fallback_to_only_variant]).to_string();
+        if let Some(saved) = service.engine.with_journal(|j| j.named(&key, &request.catalog_revision)).map_err(io_failure)? {
+            if let Ok(saved) = serde_json::from_str::<device_executor::ResolvedMetadata>(&saved) {
+                if self.validate_metadata(&wanted, &saved).is_ok() { return Ok(resolved_named(saved, named)); }
+                // A mutable name already resolved for this request/catalog does not move
+                // merely because its cached header was reclaimed.
+                wanted.revision = Some(saved.revision);
+            }
+        }
+        if let Some(saved) = self.local_metadata(&wanted) {
+            self.validate_metadata(&wanted, &saved)?;
+            return Ok(resolved_named(saved, named));
+        }
+        if job.stop.as_ref().is_some_and(Stop::is_cancelled) { return Err(canceled()); }
+        service.engine.with_journal(|j| j.begin_metadata(&request.run)).map_err(io_failure)?;
+        job.stage("resolving model metadata".into());
+        let held = service.catalog.resolve(&installation.generation).map_err(io_failure)?;
+        let reply = gpu.resolve_weights(&held, &request.run, Some(access.snapshot()), vec![wanted.clone()], job.stop.as_ref())
+            .map_err(|_| ("metadata_preflight_interrupted", "the metadata helper ended before a durable handoff; submit a new run".into()))?;
+        if reply.reply != "resolve_weights" || reply.request_id != request.run {
+            return Err(("metadata_preflight_interrupted", "the metadata helper answered another request".into()));
+        }
+        let next = match &reply.issued_token {
+            Some(token) => access.issued(&token.0).map_err(|e| ("metadata_preflight_interrupted", e.0))?,
+            None => access.snapshot(),
+        };
+        // This precedes failure handling, cancellation and any use of returned metadata.
+        service.engine.with_journal(|j| j.complete_metadata(&request.run, &next, reply.ok)).map_err(io_failure)?;
+        access.restore(next);
+        if !reply.ok {
+            let code = match reply.code.as_str() {
+                "variant_required" => "variant_required",
+                "capability_required" => "capability_required",
+                "capability_expired" => "capability_expired",
+                "capability_refused" => "capability_refused",
+                _ => "metadata_preflight_failed",
+            };
+            // Failure text comes from a credential-bearing process; keep public errors bounded.
+            return Err((code, format!("metadata helper refused: {}", reply.code.chars().take(96).collect::<String>())));
+        }
+        if job.stop.as_ref().is_some_and(Stop::is_cancelled) { return Err(canceled()); }
+        if reply.resolved.len() != 1 { return Err(("metadata_preflight_failed", "metadata helper returned an unexpected model count".into())); }
+        let resolved = reply.resolved.into_iter().next().unwrap();
+        self.validate_metadata(&wanted, &resolved)?;
+        service.engine.with_journal(|j| j.bind_named(&key, &request.catalog_revision, &serde_json::to_string(&resolved).unwrap())).map_err(io_failure)?;
+        Ok(resolved_named(resolved, named))
+    }
+
+    fn local_metadata(&self, wanted: &device_executor::MetadataModel) -> Option<device_executor::ResolvedMetadata> {
+        let revision = wanted.revision.as_deref()?.strip_prefix("sha256:")?;
+        let root = storage::held(&self.store, &format!("sha256:{revision}")).ok()?;
+        let (tree, variant, header) = match self.store.tree(&root) {
+            Ok(tree) => {
+                let (variant, header) = selected_variant(&tree, &wanted.variants, wanted.fallback_to_only_variant)?;
+                (Some(root), variant, header)
+            }
+            Err(_) if wanted.variants.is_empty() || wanted.variants.iter().any(String::is_empty) => (None, String::new(), root),
+            Err(_) => return None,
+        };
+        let checkpoint = self.store.checkpoint(&header).ok()?;
+        Some(device_executor::ResolvedMetadata { slot: wanted.slot.clone(), repo_id: wanted.repo_id.clone(),
+            revision: tree.as_ref().unwrap_or(&header).id(), variant, header, tree,
+            components: checkpoint.header().components().iter().map(|c| c.name.clone()).collect() })
+    }
+
+    fn validate_metadata(&self, wanted: &device_executor::MetadataModel, resolved: &device_executor::ResolvedMetadata) -> Result<(), Failure> {
+        let invalid = || ("metadata_preflight_failed", "metadata helper returned inconsistent model identity".to_string());
+        let root = resolved.tree.as_ref().unwrap_or(&resolved.header);
+        if resolved.slot != wanted.slot || resolved.repo_id != wanted.repo_id || resolved.header.length == 0 || root.length == 0
+            || resolved.revision != root.id()
+            || wanted.revision.as_ref().is_some_and(|r| r.starts_with("sha256:") && r != &resolved.revision) {
+            return Err(invalid());
+        }
+        if let Some(tree) = &resolved.tree {
+            let tree = self.store.tree(tree).map_err(|_| invalid())?;
+            let (variant, header) = selected_variant(&tree, &wanted.variants, wanted.fallback_to_only_variant).ok_or_else(invalid)?;
+            if variant != resolved.variant || header != resolved.header { return Err(invalid()); }
+        } else if !resolved.variant.is_empty() || !(wanted.variants.is_empty() || wanted.variants.iter().any(String::is_empty)) {
+            return Err(invalid());
+        }
+        let checkpoint = self.store.checkpoint(&resolved.header).map_err(|_| invalid())?;
+        let components: Vec<String> = checkpoint.header().components().iter().map(|c| c.name.clone()).collect();
+        if resolved.components != components { return Err(invalid()); }
+        Ok(())
     }
 
     /// A Hub checkpoint resolved (`resolve`) and downloaded whole into the store (a warm run's
@@ -1387,9 +1500,9 @@ impl Publisher {
             let named = choose(choice, &path)?;
             let tolerances = precision::Slot::of(slot);
             let bits = tolerances.bits(request.bits, short);
-            let ruled = named.lane.is_empty() && named.tree.is_none();
+            let ruled = named.lane.is_empty() && (named.tree.is_none() || request.source.request.is_some());
             let lanes = if ruled { tolerances.lanes(bits, &gpus) } else { vec![] };
-            let named = self.resolve(service, &request.source, named, &lanes, &request.catalog_revision)?;
+            let named = self.resolve_for_request(service, gpu, installation, request, &path, named, &lanes, ruled, job)?;
             let model = format!("{}@{}", named.repository, named.release);
             let warnings = if ruled { tolerances.warnings(bits, &gpus, &model, &named.lane) } else { vec![] };
             let grant = ModelGrant {
@@ -1455,7 +1568,9 @@ impl Publisher {
                 .iter()
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
-                let resolve = |named| self.resolve(service, &request.source, named, &[], &request.catalog_revision);
+                let slot = format!("{}:adapter", grant.slot);
+                let resolve = |named| self.resolve_for_request(service, gpu, installation, request,
+                    &slot, named, &[], false, job);
                 apply_adapters(self, &request.source, &resolve, choice, grant, &request.providers, job)?;
             }
         }
@@ -1745,6 +1860,23 @@ fn newest_key(request: &Request) -> String {
 /// A tree named by its hash, with what a hash alone does not say: its length (the Hub's) and its
 /// lane's header, read once under the run's access (the owner's capability for a private one)
 /// and kept, since a hash never names other bytes.
+fn selected_variant(tree: &tensorfs::format::Tree, variants: &[String], fallback: bool) -> Option<(String, ObjectRef)> {
+    if variants.is_empty() {
+        return tree.variant(None).ok().map(|(name, header)| (name.to_string(), header.clone()));
+    }
+    variants.iter().find_map(|name| tree.header(name).map(|header| (name.clone(), header.clone())))
+        .or_else(|| fallback.then(|| tree.variant(None).ok().map(|(name, header)| (name.to_string(), header.clone()))).flatten())
+}
+
+fn resolved_named(resolved: device_executor::ResolvedMetadata, mut named: Named) -> Named {
+    named.repository = resolved.repo_id;
+    named.release = resolved.revision;
+    named.lane = resolved.variant;
+    named.tree = resolved.tree;
+    named.header = Some(resolved.header);
+    named
+}
+
 fn measured(machine: &Machine, service: &Service, source: &hub::Source, mut named: Named) -> Result<Named, Failure> {
     if named.header.is_some() {
         return Ok(named);
@@ -2098,6 +2230,22 @@ pub(crate) mod names_hub;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_preferences_keep_unnamed_distinct_from_only_variant() {
+        let mut tree = tensorfs::format::Tree::default();
+        let custom = ObjectRef::of(b"custom");
+        tree.set_variant("custom", custom.clone());
+        assert_eq!(selected_variant(&tree, &[], false), Some(("custom".into(), custom.clone())));
+        assert!(selected_variant(&tree, &[String::new()], false).is_none());
+        assert!(selected_variant(&tree, &["int8".into()], false).is_none());
+        assert_eq!(selected_variant(&tree, &["int8".into()], true), Some(("custom".into(), custom)));
+        let bf16 = ObjectRef::of(b"bf16");
+        tree.set_variant("bf16", bf16.clone());
+        assert!(selected_variant(&tree, &[], false).is_none());
+        assert!(selected_variant(&tree, &["int8".into()], true).is_none());
+        assert_eq!(selected_variant(&tree, &["int8".into(), "bf16".into()], false), Some(("bf16".into(), bf16)));
+    }
 
     /// A wheel with nothing but its metadata: `name` `version`, requiring `requires`.
     fn tiny_wheel(dir: &Path, name: &str, version: &str, requires: &[&str]) -> PathBuf {

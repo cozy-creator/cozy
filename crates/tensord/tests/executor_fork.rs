@@ -117,6 +117,8 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
         for command in [
             start(&generation, &interface, false),
             DeviceCommand::Load {
+                request_id: String::new(),
+                hub: None,
                 tensorfs: None,
                 construction: "lifecycle".into(),
                 devices: String::new(),
@@ -164,6 +166,7 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
         let reply = child
             .command(
                 &DeviceCommand::Invoke {
+                    hub: None,
                     tensorfs: None,
                     weights: Default::default(),
                     destination: String::new(),

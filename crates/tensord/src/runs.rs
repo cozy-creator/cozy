@@ -633,8 +633,10 @@ impl Runs {
             ahead = plan.as_ref().zip(self.publisher.as_ref()).map(|(plan, publisher)| {
                 let order = self.service.engine.get(id).map_or(u64::MAX, |record| record.root_seq());
                 let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), order);
-                if let Err(error) = fetch.ahead(&plan.upfront()) {
-                    tracing::warn!("run {id}: its weights' early fetch: {error}");
+                if !hub.as_ref().is_some_and(|source| source.request.is_some()) {
+                    if let Err(error) = fetch.ahead(&plan.upfront()) {
+                        tracing::warn!("run {id}: its weights' early fetch: {error}");
+                    }
                 }
                 fetch
             });

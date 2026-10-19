@@ -1407,6 +1407,8 @@ print(json.dumps({"identity": generation.identity}))
                     command(
                         &mut executor,
                         &DeviceCommand::Load {
+                            request_id: String::new(),
+                            hub: None,
                             tensorfs: None,
                             construction: "fixture".into(),
                             devices: String::new(),
@@ -1450,6 +1452,7 @@ print(json.dumps({"identity": generation.identity}))
                     let spool = engine.staging(&id)?;
                     let reply = executor.command(
                         &DeviceCommand::Invoke {
+                            hub: None,
                             tensorfs: None,
                             weights: Default::default(),
                             destination: String::new(),

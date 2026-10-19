@@ -86,6 +86,8 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
             constructions: Vec::new(),
         },
         DeviceCommand::Load {
+            request_id: String::new(),
+            hub: None,
             tensorfs: None,
             construction: "lifecycle".into(),
             devices: String::new(),
@@ -140,6 +142,7 @@ fn invoke(
     assert!(prepared.ok, "{prepared:?}");
     executor.command(
         &DeviceCommand::Invoke {
+            hub: None,
             tensorfs: None,
             weights: Default::default(),
             destination: String::new(),
@@ -498,6 +501,8 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
             constructions: Vec::new(),
         },
         DeviceCommand::Load {
+            request_id: String::new(),
+            hub: None,
             tensorfs: None,
             construction: "lifecycle".into(),
             devices: String::new(),
@@ -552,6 +557,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
     let reply = executor
         .command(
             &DeviceCommand::Invoke {
+                hub: None,
                 tensorfs: None,
                 weights: Default::default(),
                 destination: String::new(),

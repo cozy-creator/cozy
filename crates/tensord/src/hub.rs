@@ -254,9 +254,75 @@ pub struct Source {
     pub ca_der: Option<Vec<u8>>,
     pub object_hosts: Vec<String>,
     pub capability: Option<Arc<Capability>>,
+    /// A request-owned key and token, never the machine's leaf or an ordinary user token.
+    pub(crate) request: Option<Arc<RequestAccess>>,
+}
+
+pub(crate) struct RequestAccess {
+    access: Mutex<protocol::machine::HubAccess>,
+    pub(crate) resolving: Mutex<()>,
+}
+
+impl RequestAccess {
+    pub(crate) fn snapshot(&self) -> protocol::machine::HubAccess {
+        self.access.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    pub(crate) fn issued(&self, token: &str) -> Result<protocol::machine::HubAccess, Refusal> {
+        if token.is_empty() { return Err(Refusal("the helper returned an empty issued token".into())); }
+        let mut access = self.snapshot();
+        if access.issued_token.as_deref().is_some_and(|old| old != token) {
+            return Err(Refusal("the helper changed this request's issued token".into()));
+        }
+        access.issued_token = Some(token.into());
+        Ok(access)
+    }
+
+    pub(crate) fn restore(&self, access: protocol::machine::HubAccess) {
+        *self.access.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = access;
+    }
 }
 
 impl Source {
+    pub(crate) fn for_request(access: protocol::machine::HubAccess) -> Result<Self, Refusal> {
+        if access.key.is_empty() || (access.capability.is_empty() && access.issued_token.is_none()) {
+            return Err(Refusal("request Hub access needs a key and capability or issued token".into()));
+        }
+        let resource = if access.capability.is_empty() {
+            access.origin.clone()
+        } else {
+            if access.issued_token.is_none() && !valid_url(&access.token_endpoint) {
+                return Err(Refusal("request Hub access has no valid token endpoint".into()));
+            }
+            let claims = access.capability.split('.').nth(1)
+                .filter(|_| access.capability.len() <= 64 << 10 && access.capability.split('.').count() == 3)
+                .and_then(|v| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(v).ok())
+                .and_then(|v| serde_json::from_slice::<serde_json::Value>(&v).ok())
+                .ok_or_else(|| Refusal("the request capability is not a compact JWS".into()))?;
+            let resource = claims["aud"].as_str().filter(|v| valid_origin(v))
+                .ok_or_else(|| Refusal("the request capability has no valid audience".into()))?;
+            let key = tensorfs::fetch::DPoP::token(&access.key, "", Some(resource))
+                .map_err(|_| Refusal("the request key is invalid".into()))?;
+            if claims["cnf"]["jkt"].as_str() != Some(key.thumbprint().as_str()) || claims["exp"].as_u64().is_none()
+                || !claims["authorization_details"].as_array().is_some_and(|ops| !ops.is_empty()) {
+                return Err(Refusal("the capability does not bind this request key or expiry".into()));
+            }
+            resource.to_string()
+        };
+        tensorfs::fetch::DPoP::token(&access.key, access.issued_token.as_deref().unwrap_or(""), Some(&resource))
+            .map_err(|_| Refusal("the request key is invalid".into()))?;
+        if access.issued_token.as_deref() == Some("") {
+            return Err(Refusal("request Hub access has an empty issued token".into()));
+        }
+        let mut source = Self::new(&access.origin, (!access.ca_der.is_empty()).then(|| access.ca_der.clone()), access.object_hosts.clone(), None)?;
+        source.request = Some(Arc::new(RequestAccess { access: Mutex::new(access), resolving: Mutex::new(()) }));
+        Ok(source)
+    }
+
+    pub(crate) fn request_access(&self) -> Option<protocol::machine::HubAccess> {
+        self.request.as_ref().map(|request| request.snapshot())
+    }
+
     pub fn new(
         origin: &str,
         ca_der: Option<Vec<u8>>,
@@ -271,6 +337,7 @@ impl Source {
             ca_der,
             object_hosts,
             capability: capability.map(Arc::new),
+            request: None,
         })
     }
 }

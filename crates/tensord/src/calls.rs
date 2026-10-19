@@ -183,6 +183,10 @@ impl Calls {
         self.runs.upgrade().and_then(|runs| runs.tensorfs(id))
     }
 
+    pub(crate) fn hub_access(&self, id: &str) -> Option<protocol::machine::HubAccess> {
+        self.runs.upgrade()?.hub(id)?.request_access()
+    }
+
     pub(crate) fn destination(&self, id: &str) -> String {
         self.runs.upgrade().map(|runs| runs.destination(id)).unwrap_or_default()
     }

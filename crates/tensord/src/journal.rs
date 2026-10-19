@@ -489,6 +489,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS run_objects(execution INTEGER NOT NULL REFERENCES executions(id),sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(execution,sha256));
             CREATE INDEX IF NOT EXISTS run_objects_digest ON run_objects(sha256);
             CREATE TABLE IF NOT EXISTS run_specs(execution INTEGER PRIMARY KEY REFERENCES executions(id),spec BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS run_metadata(execution INTEGER PRIMARY KEY REFERENCES executions(id) ON DELETE CASCADE,pending INTEGER NOT NULL);
             DROP TABLE IF EXISTS job_contexts;
             CREATE TABLE IF NOT EXISTS held_memos(actor TEXT NOT NULL,computation TEXT NOT NULL,record BLOB NOT NULL,used_ms INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(actor,computation));
             CREATE TABLE IF NOT EXISTS held_memo_objects(actor TEXT NOT NULL,computation TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(actor,computation,sha256));
@@ -1483,6 +1484,36 @@ impl Journal {
             self.end_preparation(&id, Outcome::Failed(failure))?;
         }
         Ok(())
+    }
+
+    /// Reserve one helper attempt durably before it can redeem a one-time capability.
+    pub(crate) fn begin_metadata(&mut self, id: &str) -> io::Result<()> {
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
+        let has_spec: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM run_specs WHERE execution=?1)", [id], |r| r.get(0)).map_err(db_error)?;
+        if !has_spec { return Err(io::Error::other("metadata resolution requires a durable run spec")); }
+        let pending: Option<i64> = tx.query_row("SELECT pending FROM run_metadata WHERE execution=?1", [id], |r| r.get(0)).optional().map_err(db_error)?;
+        if pending.is_some_and(|pending| pending != 0) {
+            return Err(io::Error::other("a metadata helper has an unsettled or failed handoff"));
+        }
+        tx.execute("INSERT INTO run_metadata(execution,pending) VALUES(?1,1) ON CONFLICT(execution) DO UPDATE SET pending=1", [id]).map_err(db_error)?;
+        tx.commit().map_err(db_error)
+    }
+
+    pub(crate) fn metadata_pending(&self, id: &str) -> io::Result<bool> {
+        Ok(self.connection.query_row("SELECT pending != 0 FROM run_metadata WHERE execution=?1", [id], |r| r.get(0)).optional().map_err(db_error)?.unwrap_or(false))
+    }
+
+    /// Keep the token on both success and failure before examining the helper's result.
+    /// A failed reply remains non-replayable if the parent dies before recording its failure.
+    pub(crate) fn complete_metadata(&mut self, id: &str, access: &protocol::machine::HubAccess, successful: bool) -> io::Result<()> {
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
+        let spec: Vec<u8> = tx.query_row("SELECT spec FROM run_specs WHERE execution=?1", [id], |r| r.get(0)).map_err(db_error)?;
+        let mut spec: protocol::machine::RunSpec = serde_json::from_slice(&spec).map_err(db_error)?;
+        spec.hub = Some(access.clone());
+        let changed = tx.execute("UPDATE run_specs SET spec=?1 WHERE execution=?2", params![serde_json::to_vec(&spec).map_err(db_error)?, id]).map_err(db_error)?;
+        let settled = tx.execute("UPDATE run_metadata SET pending=?1 WHERE execution=?2 AND pending=1", params![if successful { 0 } else { 2 }, id]).map_err(db_error)?;
+        if changed != 1 || settled != 1 { return Err(io::Error::other("metadata handoff lost its durable run reservation")); }
+        tx.commit().map_err(db_error)
     }
 
     /// A run a restart would end: one started, or one waiting with no spec to prepare again from.
@@ -2491,6 +2522,44 @@ fn is_zero(value: &u32) -> bool {
 
 #[cfg(test)]
 mod failure_message_tests {
+    #[test]
+    fn metadata_handoff_persists_error_tokens_and_refuses_ambiguous_replay() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("journal.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let spec = protocol::machine::RunSpec::default();
+        let (run, _) = journal.accept_run_objects("actor", "request", "digest", Invocation::default(), &[], &serde_json::to_vec(&spec).unwrap()).unwrap();
+        journal.begin_metadata(&run.id).unwrap();
+        assert!(journal.begin_metadata(&run.id).is_err(), "one active trader per request");
+        let access = protocol::machine::HubAccess { origin: "https://hub.example".into(), issued_token: Some("kept-token".into()), ..Default::default() };
+        journal.complete_metadata(&run.id, &access, false).unwrap();
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(journal.metadata_pending(&run.id).unwrap(), "failed handoffs cannot be replayed after restart");
+        let (_, _, bytes) = journal.interrupted().unwrap().into_iter().find(|(id, _, _)| id == &run.id).unwrap();
+        let kept: protocol::machine::RunSpec = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(kept.hub.unwrap().issued_token.as_deref(), Some("kept-token"));
+        assert!(journal.begin_metadata(&run.id).is_err());
+        assert!(journal.complete_metadata("missing", &access, true).is_err());
+    }
+
+    #[test]
+    fn metadata_requires_a_kept_spec_and_records_success_before_reuse() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&root.path().join("journal.sqlite")).unwrap();
+        let (unkept, _) = journal.accept_run("actor", "unkept", "digest", Invocation::default()).unwrap();
+        assert!(journal.begin_metadata(&unkept.id).is_err());
+        let spec = serde_json::to_vec(&protocol::machine::RunSpec::default()).unwrap();
+        let (run, _) = journal.accept_run_objects("actor", "kept", "digest", Invocation::default(), &[], &spec).unwrap();
+        journal.begin_metadata(&run.id).unwrap();
+        journal.complete_metadata(&run.id, &protocol::machine::HubAccess::default(), true).unwrap();
+        assert!(!journal.metadata_pending(&run.id).unwrap());
+        journal.begin_metadata(&run.id).unwrap();
+        assert!(journal.metadata_pending(&run.id).unwrap());
+    }
+
     use super::*;
 
     #[test]
