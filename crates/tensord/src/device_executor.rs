@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use platform::{
     durable::Mode as _,
-    handles::Owned,
     ipc::{LocalListener, LocalStream},
 };
 use std::{
@@ -28,8 +27,6 @@ use std::os::{
     unix::process::{CommandExt, ExitStatusExt},
 };
 
-/// Chunks of one weight set's shared GPU regions crossing in one exchange.
-const MAX_SHARED_FDS: u32 = 1 << 16;
 pub const RESULT_DOCUMENT: &str = "result.canonical";
 
 #[derive(Clone, Debug)]
@@ -138,33 +135,10 @@ impl Default for Binding {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct Budgets {
-    pub declared_weight_bytes: u64,
-}
-
-/// A group's per-rank fields, sent beside `Start`, `Load` and `Invoke`: its followers obey
-/// their own GPU's cap and budget cell.
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct Group {
-    /// `Start`: rank 0 hands its owner one budget cell per follower (`BudgetCell.rank`).
-    #[serde(skip_serializing_if = "is_false")]
-    pub rank_cells: bool,
-    /// `Load`/`Invoke`: each rank's own process cap, rank 0 first (-1: uncapped).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub rank_caps: Vec<i64>,
-}
-impl Group {
-    pub fn is_empty(&self) -> bool {
-        !self.rank_cells && self.rank_caps.is_empty()
-    }
-}
-
 /// One model of a many-model construction (an entrypoint with several model slots).
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelLoad {
     pub binding: Binding,
-    pub budgets: Budgets,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -186,41 +160,23 @@ pub enum DeviceCommand {
         /// Each constructed slot's checkpoint, so Runtime schedules fetches before it imports.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         constructions: Vec<Construction>,
+        /// One ledger memfd per GPU of `devices`, in order, follows the frame: rank 0 claims its
+        /// row in the first and hands follower r the r-th (design memory-varena §5.5).
+        #[serde(skip_serializing_if = "is_zero")]
+        ledgers: u32,
+        memory_mode: MemoryMode,
     },
     Load {
         construction: String,
         devices: String,
         sequence_parallel_degree: u32,
         binding: Box<Binding>,
-        budgets: Budgets,
         /// Several model slots in one construction (H3 turbo: base + LoRA); Runtime builds
-        /// these models and loads their granted weights, ignoring `binding`/`budgets`.
+        /// these models and loads their granted weights, ignoring `binding`.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         models: Vec<ModelLoad>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        authorized_device_limit_bytes: Option<u64>,
         #[serde(skip_serializing_if = "String::is_empty")]
         attention_pin: String,
-        /// Each weight set asks for TensorD's sealed CPU-buffer layout.
-        #[serde(skip_serializing_if = "is_false")]
-        sealed_tiers: bool,
-        /// TensorD supplies the selected header/assets (`model_source`) for Runtime to parse
-        /// and construct its model. With sealed tiers, no executor Store open is needed.
-        #[serde(skip_serializing_if = "is_false")]
-        model_sources: bool,
-        /// This machine stages layouts in part and hands over object files
-        /// (`sealed_stage`, `object_files`): an executor asks for them only when told so.
-        #[serde(skip_serializing_if = "is_false")]
-        staged_tiers: bool,
-        /// The pinned budget, applied before any weight set registers.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pinned_bytes: Option<i64>,
-        /// Runtime maps GPU allocation handles retained by TensorD.
-        #[serde(skip_serializing_if = "is_false")]
-        device_weights: bool,
-        /// The process's device cap.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cap_bytes: Option<u64>,
     },
     Activate {
         construction: String,
@@ -252,26 +208,12 @@ pub enum DeviceCommand {
         attention_kernel: String,
         #[serde(skip_serializing_if = "is_zero")]
         bits: u32,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cap_bytes: Option<u64>,
         /// File inputs by field path: read-only copies in this call's spool.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         inputs: BTreeMap<String, Value>,
         /// Input trees by reference: (read-only directory, manifest digest).
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         trees: BTreeMap<String, (PathBuf, String)>,
-        /// The machine's physical free floor on this GPU.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        floor_bytes: Option<u64>,
-        /// Activation growth per stage method learned for this request's shape.
-        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-        activation_bytes: BTreeMap<String, u64>,
-        /// Rooms known to squeeze its stage methods at this shape (`Shape::squeezed`).
-        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-        squeezed_bytes: BTreeMap<String, u64>,
-        /// Degree 2 for this call; None leaves the executor's setting.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        device_weights: Option<bool>,
         /// Each `Weights[M]` parameter's checkpoint (`sha256:<hex>`), read through `weights_writer`.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         sources: BTreeMap<String, String>,
@@ -279,29 +221,11 @@ pub enum DeviceCommand {
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         weights: BTreeMap<String, u64>,
     },
-    Budget {
-        vram_bytes: i64,
-        pinned_bytes: i64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cap_bytes: Option<u64>,
-    },
-    /// Map a loaded construction's weights onto the GPU inside `cap_bytes`, nothing run: a warm
-    /// set member at `gpu`.
+    /// Warming: the loaded construction's models are loaded at `level` (`gpu` or `ram`, varena
+    /// filling them), nothing run.
     Map {
         construction: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cap_bytes: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        floor_bytes: Option<u64>,
-    },
-    /// Offer the machine every GPU region filled and not shared yet.
-    Share,
-    /// Release the machine's GPU regions of one layout, or only `regions` of it.
-    Revoke {
-        layout: String,
-        generation: u64,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        regions: Vec<u32>,
+        level: &'static str,
     },
     Unload {
         construction: String,
@@ -360,10 +284,7 @@ impl DeviceCommand {
             Self::Activate { .. } => "activate",
             Self::PrepareRequest { .. } => "prepare_request",
             Self::Invoke { .. } => "invoke",
-            Self::Budget { .. } => "budget",
             Self::Map { .. } => "map",
-            Self::Share => "share",
-            Self::Revoke { .. } => "revoke",
             Self::Unload { .. } => "unload",
             Self::Probe { .. } => "probe",
             Self::Fork { .. } => "fork",
@@ -384,12 +305,12 @@ pub enum Event {
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     ModelSource,
-    SealedTier,
-    SealedStage,
-    ObjectFiles,
-    DeviceTier,
-    BudgetCell,
-    DeviceRoom,
+    /// One weight set's bytes: its sealed host layout, or its chunk files.
+    ReadGrant,
+    /// A sealed host layout the executor filled, for the next executor of its weights.
+    Deposit,
+    /// GPU pages of weight regions the executor kept, held past its end (`descriptors` follow).
+    KeepPages,
     Publish,
     StageMemoLookup,
     StageMemoStore,
@@ -456,75 +377,6 @@ pub struct HostFrame {
     pub facts: BTreeMap<String, Value>,
 }
 
-/// SDK observations: absent fields stay unknown; signed byte counters preserve its -1 sentinel.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct PlaneFacts {
-    pub budget_bytes: Option<i64>,
-    pub committed_bytes: Option<i64>,
-    /// GPU regions mapped from custody: outside `committed_bytes`.
-    pub shared_bytes: Option<i64>,
-    pub leased_bytes: Option<i64>,
-    pub pinned_budget_bytes: Option<i64>,
-    pub pinned_bytes: Option<i64>,
-    pub context_bytes: Option<i64>,
-    pub reserved_bytes: Option<i64>,
-    /// Context + torch reserved + the plane's own maps.
-    pub process_bytes: Option<i64>,
-    pub cap_bytes: Option<i64>,
-    pub activation_peak_bytes: Option<i64>,
-    pub resident: BTreeMap<String, i64>,
-    pub streamed: BTreeMap<String, Streamed>,
-    pub h2d_bytes: Option<u64>,
-    pub h2d_gbps: Option<f64>,
-    pub disk_copy_bytes: Option<u64>,
-    /// Of `h2d_bytes`, copied from the page cache, and through staging buffers (host memory
-    /// this process could not page-lock); `register_failed` counts the page locks refused.
-    pub mapped_copy_bytes: Option<u64>,
-    pub bounce_copy_bytes: Option<u64>,
-    pub register_failed: Option<u64>,
-    pub disk_read_bytes: Option<u64>,
-    /// RAM of the machine's sealed layouts the executor maps (the machine's, not its own).
-    pub sealed_bytes: Option<u64>,
-    pub late: Option<u64>,
-    pub stall_ns: Option<u64>,
-    pub misses: Option<u64>,
-    pub evictions: Option<u64>,
-    pub oom_retries: Option<u64>,
-    pub modes: BTreeMap<String, String>,
-    /// LoRA'd weights the executor baked into device bytes since it started (a streamed
-    /// copy counts at every acquire), and the wall time of its resident bakes.
-    pub lora_baked: Option<u64>,
-    pub lora_bake_ms: Option<f64>,
-    /// LoRA'd weights whose baked bytes came from custody: no bake in this executor.
-    pub lora_attached: Option<u64>,
-    /// torch's allocator short of room since the executor started: times it dropped its whole
-    /// cache to place one allocation, out-of-memory errors it raised, and the executor's own
-    /// cache releases with their bytes. A call with room adds none of the first two.
-    pub alloc_retries: Option<u64>,
-    pub alloc_ooms: Option<u64>,
-    pub cache_releases: Option<u64>,
-    pub cache_released_bytes: Option<u64>,
-    /// Those releases by the executor function that asked: (count, bytes).
-    pub cache_released_by: BTreeMap<String, (u64, u64)>,
-    /// Per stage method, the most room torch had at an entry that made it drop its whole
-    /// cache more than once (`memory::learned::Shape::squeezed`).
-    pub squeezed: BTreeMap<String, u64>,
-    /// Components the executor gave back to make torch room since it started, and their bytes.
-    pub paged_out: Option<u64>,
-    pub paged_out_bytes: Option<u64>,
-    /// Facts this machine does not read, kept as the executor sent them: they reach
-    /// invokes.jsonl and the journal without a machine release (copy paths, plan inputs).
-    #[serde(flatten)]
-    pub other: BTreeMap<String, Value>,
-}
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct Streamed {
-    pub blocks: u64,
-    pub resident_blocks: u64,
-    pub window: u64,
-}
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Metrics {
@@ -542,17 +394,6 @@ pub struct Metrics {
     pub gpu_count: Option<u32>,
     pub shape_cell: Option<String>,
 }
-/// The device memory a stage could not have (`ResidencyRefusal`): what it needed at once and
-/// what the GPU could give at the finest grain.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct Shortfall {
-    pub resource: String,
-    pub needed_bytes: i64,
-    pub available_bytes: i64,
-    /// The stage method that asked.
-    pub request_shape: String,
-}
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LoadFacts {
@@ -566,31 +407,8 @@ pub struct LoadFacts {
     pub allocator_bytes: Option<i64>,
     pub reserved_bytes: Option<i64>,
     pub rss_bytes: Option<i64>,
-    pub plane: Option<PlaneFacts>,
-    pub layouts: BTreeMap<String, Layout>,
     /// The attention kernel each component's sites were given, and what was skipped and why.
     pub attention: Option<Value>,
-}
-
-/// One weight set as the plane holds it; `planned_*` count decoded copies (Runtime 0.18.103+).
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct Layout {
-    pub common: u64,
-    pub blocks: Vec<u64>,
-    pub planned_total: Option<u64>,
-    pub planned_floor: Option<u64>,
-}
-impl Layout {
-    pub fn planned_total(&self) -> u64 {
-        self.planned_total
-            .unwrap_or(self.common + self.blocks.iter().sum::<u64>())
-    }
-    /// Common and the largest block: the least a stage of it runs in.
-    pub fn planned_floor(&self) -> u64 {
-        self.planned_floor
-            .unwrap_or(self.common + self.blocks.iter().max().copied().unwrap_or(0))
-    }
 }
 
 /// One decode per frame; only consumed business fields are represented.
@@ -620,8 +438,6 @@ pub struct Frame {
     pub reused: bool,
     /// `start` of a group (degree > 1): the follower ranks' pids, rank 1 first.
     pub follower_pids: Vec<u32>,
-    /// `budget_cell`: the GPU of the group whose process reads it (0: rank 0's own).
-    pub rank: u32,
     pub result_ref: Option<ResultRef>,
     pub outputs: Vec<Output>,
     pub frames: Vec<HostFrame>,
@@ -630,34 +446,25 @@ pub struct Frame {
     pub seq: u64,
     pub kind: Kind,
     pub descriptor: bool,
+    /// `keep_pages`: the fds that follow, one per page.
+    pub descriptors: u64,
     pub name: String,
+    /// `read_grant`/`deposit`: the sealed host layout's digest.
     pub layout: String,
+    /// `keep_pages`: what its pages hold, checked by the executor that maps them.
+    pub fingerprint: String,
+    pub pages: Vec<Page>,
     pub manifest: String,
     pub sha256: String,
     pub length: u64,
-    pub offer: bool,
-    pub method: String,
-    pub components: Vec<String>,
-    pub growth_bytes: u64,
-    pub wall_ns: u64,
-    pub stall_ns: u64,
-    pub passes: Option<u64>,
-    pub yielded: bool,
-    pub free_bytes: u64,
-    /// `device_room`: what the asking process holds on its GPU now (context, torch's segments
-    /// and plane maps), by its own count; -1 when it cannot say. Its last report may be from
-    /// its load.
-    pub holding_bytes: Option<i64>,
     pub facts: Option<LoadFacts>,
-    pub plane: Option<PlaneFacts>,
-    /// `map`: the device bytes the construction's weights hold after it, and whether that
-    /// is every weight.
-    pub mapped_bytes: Option<u64>,
+    /// `map`: whether every weight of the construction is on its GPU after it.
     pub complete: Option<bool>,
-    /// A group's followers' own plane facts, rank 1 first (None: not stated yet).
-    pub rank_planes: Vec<Option<PlaneFacts>>,
     pub metrics: Option<Metrics>,
-    pub shortfall: Option<Shortfall>,
+    /// `invoke`: the request's memory per model per step (varena's `RequestStats`); another
+    /// frame's `memory` of another shape (an older Hello's list) reads as absent.
+    #[serde(deserialize_with = "lenient")]
+    pub memory: Option<crate::memory::call::Stats>,
     pub stage: String,
     pub position: Option<u64>,
     pub total: Option<u64>,
@@ -673,17 +480,6 @@ pub struct Frame {
     pub fields: Value,
     /// PrepareRequest: the request's normalized features (its shape).
     pub features: BTreeMap<String, Value>,
-    /// `device_tier`: fds that follow the frame, one per chunk of `regions`.
-    pub descriptors: u32,
-    /// `sealed_tier`/`sealed_stage`: the regions to stage (the ones the executor streams).
-    pub stage_regions: Option<Vec<u32>>,
-    pub device: String,
-    pub regions: Vec<crate::resident_custody::SharedRegion>,
-    /// `device_tier`: what the regions hold beside the stored bytes ("": nothing; in an ask
-    /// "*": the layout's latest baked variant).
-    pub variant: String,
-    pub shared_bytes: u64,
-    pub released_bytes: u64,
     // `publish` (Outputs.publish): one product of a declared output.
     pub output: String,
     pub label: String,
@@ -750,6 +546,14 @@ impl Frame {
     }
 }
 
+/// One kept GPU page: a home region and the bytes its allocation spans.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Page {
+    pub region: u32,
+    pub nbytes: u64,
+}
+
 /// One part of a composite product: a spool file and the media time it adds.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -766,32 +570,14 @@ pub struct Answer {
     pub code: String,
     pub detail: String,
     pub held: bool,
-    /// A `DeviceRoom` answer: the process cap raised into the room made; -1 keeps it.
-    pub cap_bytes: i64,
     /// One fd follows the answer. Sent only when true: a `Tier` answer types it as the fd.
     #[serde(skip_serializing_if = "is_false")]
     pub descriptor: bool,
     pub sha256: String,
     pub length: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub generation: u64,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub regions: Vec<crate::resident_custody::SharedRegion>,
-    #[serde(skip_serializing_if = "is_false")]
-    pub duplicate: bool,
+    /// `read_grant`: the fds that follow the answer.
     #[serde(skip_serializing_if = "is_zero")]
     pub descriptors: u64,
-    /// `device_tier`: the holding's layout digest, which the reader's plane verifies.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub layout: String,
-    /// `device_tier`: the last fd after the answer is the reader's lease socket.
-    #[serde(skip_serializing_if = "is_false")]
-    pub lease: bool,
-    /// `device_tier`: this machine keys holdings by variant, and the answered holding's.
-    #[serde(skip_serializing_if = "is_false")]
-    pub variants: bool,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub variant: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub digest: String,
     #[serde(skip_serializing_if = "is_zero")]
@@ -807,6 +593,9 @@ pub struct Answer {
     pub byte_grants: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<Value>,
+    /// A failed child call's raising traceback, whole (its triage's).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub traceback: String,
     /// `Opened` (a weights output) and `Adopted`: its transaction, run and manifest.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub transaction: String,
@@ -831,14 +620,16 @@ pub struct Answer {
     pub stored: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub reason: String,
-    /// `object_files`: the SHA-256 of the objects whose fds follow, in the order the executor
-    /// derives from its own plan (`HostTier::objects_digest`), in place of the list (SDXL's
+    /// `read_grant` without a sealed layout: the SHA-256 of the chunk objects whose fds
+    /// follow, sorted by digest (`deposits::objects_digest`), in place of the list (SDXL's
     /// UNet: about 1,700 objects).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub objects_sha256: String,
-    /// `sealed_stage`: the regions staged or staging (the rest stay holes).
+    /// A held `read_grant`: GPU pages kept for it, whose fds follow the layout's.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub fingerprint: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub staged: Vec<u32>,
+    pub pages: Vec<Page>,
 }
 fn is_zero_ms(value: &f64) -> bool {
     *value == 0.0
@@ -852,18 +643,10 @@ impl Answer {
             code: "capability_unavailable".into(),
             detail: "owner has not qualified this operation".into(),
             held: false,
-            cap_bytes: -1,
             descriptor: false,
             sha256: String::new(),
             length: 0,
-            generation: 0,
-            regions: Vec::new(),
-            duplicate: false,
             descriptors: 0,
-            layout: String::new(),
-            lease: false,
-            variants: false,
-            variant: String::new(),
             digest: String::new(),
             sequence: 0,
             state: String::new(),
@@ -871,6 +654,7 @@ impl Answer {
             result: String::new(),
             byte_grants: Vec::new(),
             progress: None,
+            traceback: String::new(),
             transaction: String::new(),
             request_id: String::new(),
             manifest: String::new(),
@@ -882,7 +666,8 @@ impl Answer {
             stored: false,
             reason: String::new(),
             objects_sha256: String::new(),
-            staged: Vec::new(),
+            fingerprint: String::new(),
+            pages: Vec::new(),
         }
     }
     pub fn ok(seq: u64) -> Self {
@@ -912,25 +697,20 @@ pub trait Services {
         drop(descriptor);
         Ok((Answer::unavailable(frame.seq), None))
     }
-    /// `device_tier`: `fds` arrived with the request; the returned ones
-    /// follow the answer, the lease socket last when `answer.lease`.
-    fn device_tier(
-        &mut self,
-        frame: &Frame,
-        fds: Vec<Owned>,
-    ) -> io::Result<(Answer, Vec<Owned>)> {
-        drop(fds);
-        Ok((Answer::unavailable(frame.seq), Vec::new()))
-    }
-    /// `object_files`: the plan's memfd arrived with the request; the
-    /// verified object files follow the answer, one fd per `objects` entry.
-    fn object_files(
+    /// `read_grant`: the plan's memfd, when one came with the request; the fds returned follow
+    /// the answer (`descriptors`).
+    fn read_grant(
         &mut self,
         frame: &Frame,
         plan: Option<File>,
     ) -> io::Result<(Answer, Vec<File>)> {
         drop(plan);
         Ok((Answer::unavailable(frame.seq), Vec::new()))
+    }
+    /// `keep_pages`: its fds, one per page.
+    fn keep_pages(&mut self, frame: &Frame, pages: Vec<File>) -> Answer {
+        drop(pages);
+        Answer::unavailable(frame.seq)
     }
 }
 
@@ -1830,14 +1610,14 @@ impl DeviceExecutor {
         command: &DeviceCommand,
         services: &mut impl Services,
     ) -> io::Result<Frame> {
-        self.command_with(command, &Group::default(), services)
+        self.command_with(command, &[], services)
     }
 
-    /// `command` with a group's per-rank fields.
+    /// `command` with `fds` following its frame (`Start`'s ledgers).
     pub fn command_with(
         &mut self,
         command: &DeviceCommand,
-        group: &Group,
+        fds: &[File],
         services: &mut impl Services,
     ) -> io::Result<Frame> {
         let meter = match command {
@@ -1853,7 +1633,7 @@ impl DeviceExecutor {
             command.name(),
         )?;
         *self.watched.lock().unwrap() = Some(watching.watch());
-        let result = self.exchange(command, group, services, &watching.watch());
+        let result = self.exchange(command, fds, services, &watching.watch());
         *self.watched.lock().unwrap() = None;
         // Whatever the run was computing when its exchange ended, its waiters compute themselves.
         if let (Some(memo), Some((run, _))) = (&self.memo, command.spool()) {
@@ -1872,24 +1652,20 @@ impl DeviceExecutor {
     fn exchange(
         &mut self,
         command: &DeviceCommand,
-        group: &Group,
+        fds: &[File],
         services: &mut impl Services,
         watch: &Watch,
     ) -> io::Result<Frame> {
         let mut value = serde_json::to_value(command)?;
-        if let (false, Some(object), Value::Object(extra)) = (
-            group.is_empty(),
-            value.as_object_mut(),
-            serde_json::to_value(group)?,
-        ) {
-            object.extend(extra);
-        }
         // The executor's memoized stages go to the machine tier.
         if matches!(command, DeviceCommand::Start { .. }) && self.memo.is_some() {
             value["memo"] =
                 serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
         }
         write_frame(&mut self.stream, &value)?;
+        for fd in fds {
+            platform::handles::send_fd(&self.stream, fd)?;
+        }
         loop {
             let frame = read_frame(&mut self.stream)?
                 .ok_or_else(|| {
@@ -1902,25 +1678,6 @@ impl DeviceExecutor {
                 }
                 Some(Event::Progress) if !frame.malformed.is_empty() => (),
                 Some(Event::Progress) => services.progress(&frame),
-                Some(Event::Request) if frame.kind == Kind::DeviceTier => {
-                    if frame.descriptors > MAX_SHARED_FDS {
-                        return Err(io::Error::other("device tier names too many descriptors"));
-                    }
-                    let mut fds = Vec::with_capacity(frame.descriptors as usize);
-                    for _ in 0..frame.descriptors {
-                        fds.push(platform::handles::recv_fd(&self.stream)?);
-                    }
-                    let (mut answer, out) = services.device_tier(&frame, fds)?;
-                    answer.event = "answer";
-                    answer.seq = frame.seq;
-                    answer.descriptor = false;
-                    // Chunk fds, then the lease socket when there is one.
-                    answer.descriptors = out.len().saturating_sub(usize::from(answer.lease)) as u64;
-                    write_frame(&mut self.stream, &answer)?;
-                    for fd in &out {
-                        platform::handles::send_fd(&self.stream, fd)?;
-                    }
-                }
                 Some(Event::Request)
                     if matches!(frame.kind, Kind::StageMemoLookup | Kind::StageMemoStore) =>
                 {
@@ -1933,14 +1690,14 @@ impl DeviceExecutor {
                     watch.serving(false);
                     write_frame(&mut self.stream, &answer)?;
                 }
-                Some(Event::Request) if frame.kind == Kind::ObjectFiles => {
+                Some(Event::Request) if frame.kind == Kind::ReadGrant => {
                     let plan = if frame.descriptor {
                         Some(File::from(platform::handles::recv_fd(&self.stream)?))
                     } else {
                         None
                     };
                     watch.serving(true);
-                    let answered = services.object_files(&frame, plan);
+                    let answered = services.read_grant(&frame, plan);
                     watch.serving(false);
                     let (mut answer, out) = answered?;
                     answer.event = "answer";
@@ -1951,6 +1708,11 @@ impl DeviceExecutor {
                     for file in &out {
                         platform::handles::send_fd(&self.stream, file)?;
                     }
+                }
+                Some(Event::Request) if frame.kind == Kind::KeepPages => {
+                    let pages = (0..frame.descriptors).map(|_| platform::handles::recv_fd(&self.stream).map(File::from));
+                    let pages = pages.collect::<Result<Vec<_>, _>>()?;
+                    write_frame(&mut self.stream, &services.keep_pages(&frame, pages))?;
                 }
                 Some(Event::Request) => {
                     // The machine's own answer time is not the executor's stillness.
@@ -2156,6 +1918,11 @@ pub fn read_result(spool: &Path, reply: &Frame) -> io::Result<Value> {
     }
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
+/// A field of the shape this machine reads, else absent: never a reason to refuse the frame.
+fn lenient<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(d: D) -> Result<Option<T>, D::Error> {
+    Ok(serde_json::from_value(Value::deserialize(d)?).ok())
+}
+
 fn is_zero<T: Default + PartialEq>(value: &T) -> bool {
     *value == T::default()
 }
@@ -2189,13 +1956,11 @@ fn decode_frame(bytes: &[u8]) -> io::Result<Frame> {
     };
     let seq = fields.get("seq").and_then(Value::as_u64);
     let descriptor = fields.get("descriptor").and_then(Value::as_bool).unwrap_or(false);
-    let descriptors = fields.get("descriptors").and_then(Value::as_u64).unwrap_or(0);
     serde_json::from_value(Value::Object(fields)).or_else(|error| match (event, seq) {
         (Some(Event::Request), Some(seq)) => Ok(Frame {
             event,
             seq,
             descriptor,
-            descriptors: u32::try_from(descriptors).unwrap_or(u32::MAX),
             malformed: error.to_string(),
             ..Frame::default()
         }),
@@ -2209,15 +1974,12 @@ fn decode_frame(bytes: &[u8]) -> io::Result<Frame> {
 }
 
 /// A request this machine cannot decode is refused alone, under its own sequence number,
-/// after the fds it announced are taken off the socket: the executor's call goes on.
+/// after the fd it announced is taken off the socket: the executor's call goes on.
 fn refuse_malformed(
     stream: &mut LocalStream,
     frame: &Frame,
 ) -> io::Result<()> {
-    if frame.descriptors > MAX_SHARED_FDS {
-        return Err(io::Error::other("a malformed request names too many descriptors"));
-    }
-    for _ in 0..u32::from(frame.descriptor) + frame.descriptors {
+    if frame.descriptor {
         drop(platform::handles::recv_fd(stream)?);
     }
     let answer = Answer::refused(frame.seq, "malformed_request", frame.malformed.clone());
@@ -2254,6 +2016,25 @@ fn scan(value: &Value) -> io::Result<()> {
     Ok(())
 }
 
+/// How the machine shares its GPUs, which Start tells every executor, an import-only one too:
+/// `shared` (a local machine: leave the display its floor, give memory back) or `dedicated`
+/// (a rented pod).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryMode {
+    Shared,
+    Dedicated,
+}
+
+impl From<platform::contain::host_pressure::HostMode> for MemoryMode {
+    fn from(mode: platform::contain::host_pressure::HostMode) -> Self {
+        match mode {
+            platform::contain::host_pressure::HostMode::Shared => Self::Shared,
+            platform::contain::host_pressure::HostMode::Dedicated => Self::Dedicated,
+        }
+    }
+}
+
 #[cfg(test)]
 mod codec_tests {
     use super::*;
@@ -2274,6 +2055,26 @@ mod codec_tests {
         assert_eq!(read_result(spool.path(), &reply).unwrap()["predictions"][2], 1);
         fs::write(spool.path().join(RESULT_DOCUMENT), b"mutated").unwrap();
         assert_eq!(read_result(spool.path(), &reply).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Every Start names one of the Runtime's two modes: an empty one turned prespawn off on
+    /// every machine (the import-only start was refused, `$.memory_mode`).
+    #[test]
+    fn a_start_names_the_machines_memory_mode() {
+        for (mode, wire) in [(MemoryMode::Shared, "shared"), (MemoryMode::Dedicated, "dedicated")] {
+            let start = DeviceCommand::Start {
+                devices: String::new(),
+                application: "app:app".into(),
+                package_interface: "interface.json".into(),
+                sequence_parallel_degree: 1,
+                import_only: true,
+                call_interfaces: vec![],
+                constructions: vec![],
+                ledgers: 0,
+                memory_mode: mode,
+            };
+            assert_eq!(serde_json::to_value(&start).unwrap()["memory_mode"], wire);
+        }
     }
 
     /// An invoke reply's adjustment rows are advisory: each malformed one is skipped and the
@@ -2309,6 +2110,15 @@ mod codec_tests {
 
     /// A null in any optional field reads as its absence: a string, a flattened hello field,
     /// a count, a flag, a kind or a list (the Runtime's `None`).
+    #[test]
+    fn a_memory_field_of_another_shape_reads_as_absent() {
+        let hello: Frame = serde_json::from_value(serde_json::json!({"reply": "hello", "ok": true, "pid": 7,
+            "memory": [1, 2]})).unwrap();
+        assert!(hello.ok && hello.memory.is_none() && hello.hello.pid == 7);
+        let invoke: Frame = serde_json::from_value(serde_json::json!({"reply": "invoke", "memory": {"paged_in": 5}})).unwrap();
+        assert_eq!(invoke.memory.unwrap().paged_in, 5);
+    }
+
     #[test]
     fn a_null_field_reads_as_absent() {
         let body = serde_json::to_vec(&serde_json::json!({
@@ -2353,8 +2163,8 @@ mod codec_tests {
     #[test]
     fn a_request_that_does_not_decode_is_refused_alone() {
         let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
-        let malformed = serde_json::json!({"event": "request", "kind": "device_room", "seq": 9,
-            "free_bytes": -23068672, "holding_bytes": 1, "descriptor": true});
+        let malformed = serde_json::json!({"event": "request", "kind": "read_grant", "seq": 9,
+            "length": -23068672, "descriptor": true});
         write_frame(&mut runtime, &malformed).unwrap();
         platform::handles::send_fd(&runtime, &File::open(std::env::current_exe().unwrap()).unwrap()).unwrap();
         let frame = read_frame(&mut machine).unwrap().unwrap();
@@ -2367,24 +2177,12 @@ mod codec_tests {
         write_frame(&mut runtime, &progress).unwrap();
         let dropped = read_frame(&mut machine).unwrap().unwrap();
         assert!(dropped.event == Some(Event::Progress) && !dropped.malformed.is_empty());
-        let fine = serde_json::json!({"event": "request", "kind": "device_room", "seq": 10,
-            "free_bytes": 5});
+        let fine = serde_json::json!({"event": "request", "kind": "read_grant", "seq": 10,
+            "length": 5});
         write_frame(&mut runtime, &fine).unwrap();
         let next = read_frame(&mut machine).unwrap().unwrap();
         assert!(next.malformed.is_empty());
-        assert_eq!((next.kind, next.seq, next.free_bytes), (Kind::DeviceRoom, 10, 5));
-    }
-
-    #[test]
-    fn plane_facts_this_machine_does_not_read_reach_its_records() {
-        let facts: PlaneFacts = serde_json::from_value(serde_json::json!({
-            "h2d_bytes": 7, "host_gbps": 5, "plan_inputs": {"budget": 42}
-        }))
-        .unwrap();
-        assert_eq!(facts.h2d_bytes, Some(7));
-        let written = serde_json::to_value(&facts).unwrap();
-        assert_eq!(written["host_gbps"], 5);
-        assert_eq!(written["plan_inputs"]["budget"], 42);
+        assert_eq!((next.kind, next.seq, next.length), (Kind::ReadGrant, 10, 5));
     }
 
     fn pid(codec: &Codec) -> Option<u32> {

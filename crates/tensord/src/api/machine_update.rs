@@ -48,6 +48,8 @@ struct Cohort {
     toolchain: Option<String>,
     /// The `cozy` release the caller installed at the machine's launch path (`cozy update`).
     cozy: Option<String>,
+    /// The most memory each GPU offers, in bytes; 0 lifts it (`--gpu-memory-limit`).
+    gpu_memory_limit: Option<u64>,
     /// A dev `cozy` binary (`--tensord`): the `binary` input's file, or `{url, sha256}`.
     binary: Option<Member>,
     #[serde(flatten)]
@@ -106,7 +108,7 @@ pub(super) async fn submit<B: MachineBackend>(
         if !identity.readiness.proved() {
             return Err(Error::unavailable("machine_booting", "the machine is starting; update it once it is ready"));
         }
-        stage(&updates, &*backend, actor, &id, request.spec)?;
+        stage(&updates, &*backend, actor, &id, request.spec, &identity.gpus)?;
         let update = updates.update(&id).ok_or_else(|| Error::internal("update_unrecorded", "the update was not recorded"))?;
         Ok((true, state(&id, &update)))
     })
@@ -160,6 +162,7 @@ fn stage(
     actor: VerifiedActor,
     id: &str,
     spec: v1::RunSpec,
+    gpus: &[crate::machine::receipt::Gpu],
 ) -> Result<(), Error> {
     let payload = spec.payload.as_ref().map_or("{}", |payload| payload.get());
     let cohort: Cohort = serde_json::from_str(payload).map_err(|e| {
@@ -228,12 +231,21 @@ fn stage(
             return Err(Error::validation("toolchain_unknown", format!("the toolchain is installed, not {other:?}")));
         }
     };
+    // Refused before anything drains: a limit stands a card in for a smaller one, never a larger.
+    let limit = cohort.gpu_memory_limit;
+    if let Some(gpu) = gpus.iter().find(|g| limit.is_some_and(|l| l > g.memory_bytes)) {
+        let gib = |n: u64| format!("{:.1} GiB", n as f64 / (1u64 << 30) as f64);
+        return Err(Error::validation("gpu_memory_limit_above_card", format!(
+            "a {} limit exceeds GPU {}'s {}; it only lowers a card", gib(limit.unwrap_or(0)), gpu.device_index, gib(gpu.memory_bytes)
+        )));
+    }
     let request = Request {
         operation: id.into(),
         pin: None,
         runtime: choose("runtime", cohort.runtime)?,
         tensorfs: choose("tensorfs", cohort.tensorfs)?,
         cozy: cohort.cozy,
+        gpu_memory_limit: limit,
         binary,
         toolchain,
     };

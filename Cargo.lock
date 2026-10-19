@@ -3970,6 +3970,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "toml",
+ "toml_edit",
  "tower",
  "tracing",
  "tracing-appender",

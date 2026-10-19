@@ -87,6 +87,18 @@ pub fn detail(bundle: &[u8]) -> Option<String> {
     Some(masked(capped(&tail, DETAIL_BYTES)))
 }
 
+/// A failed attempt's whole raising traceback (else its executor's stderr), secrets masked:
+/// what a failed child call hands its caller.
+pub fn traceback(bundle: &[u8]) -> Option<String> {
+    let bundle: serde_json::Value = serde_json::from_slice(bundle).ok()?;
+    let text = [&bundle["terminal"]["traceback"], &bundle["executor"]["stderr_tail"]]
+        .into_iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .find(|text| !text.is_empty())?;
+    Some(masked(text))
+}
+
 fn capped(text: &str, limit: usize) -> &str {
     if text.len() <= limit {
         return text;
