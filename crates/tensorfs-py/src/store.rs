@@ -297,8 +297,25 @@ impl Remote {
             }
         }
         if self.offline { return Err(Failure { kind: Kind::NotFound, detail: format!("{name} is not cached") }); }
-        let (repo, _) = fetch::runtime()?.block_on(self.endpoint.repo(name))?
-            .ok_or_else(|| Failure { kind: Kind::NotFound, detail: format!("no repo {name}") })?;
+        let resolved = fetch::runtime()?.block_on(self.endpoint.repo(name));
+        let (repo, _) = match resolved {
+            Ok(Some(repo)) => repo,
+            Ok(None) => return Err(Failure { kind: Kind::NotFound, detail: format!("no repo {name}") }),
+            Err(error) => {
+                // The last named resolution is useful without a network. A refusal,
+                // invalid response or absent repo must still be visible to the caller.
+                if matches!(error.kind, Kind::Network) {
+                    if let Some(repo) = self.store.get_ref(name)? {
+                        if let Ok((version, tree)) = fetch::release_of(&repo, revision) {
+                            if self.store.reuse(&tree)? {
+                                return Ok((tree, Some(version)));
+                            }
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        };
         let (version, tree) = fetch::release_of(&repo, revision)?;
         Ok((tree, Some(version)))
     }
@@ -312,7 +329,7 @@ impl PyStore {
             (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
             _ => root,
         };
-        let store = py.detach(|| Store::open(root)).or_raise(py)?;
+        let store = py.detach(|| Store::open(root).map(Store::with_cache)).or_raise(py)?;
         Ok(PyStore { store })
     }
 
@@ -350,6 +367,7 @@ impl PyStore {
             };
             if let (Some(tree), Some(version)) = (&tree, &version) {
                 self.store.update_ref(&repo_id, |old| Some(fetch::with_tree(old, &repo_id, tree, Some(version))))?;
+                self.store.cache_ref(&repo_id)?;
             }
             Ok(Named { header, tree, name: Some(repo_id), release: version, variant: chosen })
         }).or_raise(py)?;
@@ -438,6 +456,7 @@ impl PyStore {
             remote.fetch(&objects, 0)?;
             if let Some(version) = version {
                 self.store.update_ref(repo_id, |old| Some(fetch::with_tree(old, repo_id, &root, Some(&version))))?;
+                self.store.cache_ref(repo_id)?;
             }
             let dest = local_dir.unwrap_or_else(|| self.store.root().join("snapshots").join(&root.sha256));
             let variants: Option<Vec<_>> = variant.map(|v| vec![v]);
@@ -453,11 +472,15 @@ impl PyStore {
         let endpoint = Arc::new(Endpoint::new(&client, endpoint, crate::credentials::provider(token)?).or_raise(py)?);
         let remote = Remote { store: self.store.clone(), client, endpoint, offline: local_files_only || repo_id.starts_with("local/") };
         py.detach(|| -> Result<PathBuf, Failure> {
-            let (root, _) = remote.root(repo_id, revision.as_deref())?;
+            let (root, version) = remote.root(repo_id, revision.as_deref())?;
             remote.fetch(std::slice::from_ref(&root), 0)?;
             let tree = self.store.tree(&root)?;
             let object = tree.files.get(filename).ok_or_else(|| Failure { kind: Kind::NotFound, detail: format!("no file {filename}") })?;
             remote.fetch(std::slice::from_ref(object), 0)?;
+            if let Some(version) = version {
+                self.store.update_ref(repo_id, |old| Some(fetch::with_tree(old, repo_id, &root, Some(&version))))?;
+                self.store.cache_ref(repo_id)?;
+            }
             let dest = local_dir.unwrap_or_else(|| self.store.root().join("snapshots").join(&root.sha256)).join(filename);
             self.store.materialize(object, &dest)?;
             Ok(dest)
@@ -1594,7 +1617,7 @@ impl PyWriter {
             Some(Arc::new(Endpoint::new(&client, &url, crate::credentials::provider(token)?).or_raise(py)?))
         } else { None };
         let (store, w) = py.detach(|| -> Result<_, Failure> {
-            let store = Store::open(&root)?;
+            let store = Store::open(&root)?.with_cache();
             let w = match (&dest, &repo_id, endpoint) {
                 (Some(dest), _, _) => Writer::folder(dest, variant.as_deref().unwrap_or(""), base.as_ref(), resume.is_some())?,
                 (_, Some(name), Some(endpoint)) => {

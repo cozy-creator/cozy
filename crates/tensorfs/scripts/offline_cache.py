@@ -97,6 +97,33 @@ class OfflineCache(unittest.TestCase):
         self.stop_server()
         self.check_bytes(self.open())
 
+    def test_online_default_refreshes_then_offline_uses_last_resolution(self):
+        with tensorfs.Writer(
+            self.root / "second", cache_dir=self.root / "author"
+        ) as writer:
+            writer.component("model", cls="test.Model", config={}).put(
+                "weight", b"next", dtype="U8", shape=[4]
+            )
+        tensorfs.upload_folder(
+            repo_id="acme/offline",
+            revision="two",
+            folder_path=self.root / "second",
+            endpoint=(self.root / "origin").as_uri(),
+            cache_dir=self.root / "upload",
+        )
+        with self.open() as checkpoint:
+            self.assertNotEqual(checkpoint.id, self.header)
+            self.header = checkpoint.id
+            self.assertEqual(
+                checkpoint.components["model"].tensors.read("weight").tobytes(), b"next"
+            )
+        self.stop_server()
+        with self.open() as checkpoint:
+            self.assertEqual(checkpoint.id, self.header)
+            self.assertEqual(
+                checkpoint.components["model"].tensors.read("weight").tobytes(), b"next"
+            )
+
     def test_remote_refusals_do_not_become_stale_success(self):
         for mode, expected in (
             ("denied", tensorfs.DeniedError),
