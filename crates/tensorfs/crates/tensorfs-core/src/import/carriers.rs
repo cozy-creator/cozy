@@ -44,6 +44,9 @@ pub struct Carrier {
     /// Params naming a part's stored dtype: param -> part role (`scale_dtype` -> `scale`).
     #[serde(default)]
     pub dtype_params: BTreeMap<String, String>,
+    /// Marker keys whose value this carrier decodes, and that value.
+    #[serde(default)]
+    pub marker_values: BTreeMap<String, Json>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,20 +81,57 @@ pub enum Geometry {
     Tiles(u64),
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Table {
-    carriers: Vec<Carrier>,
+pub struct Table {
+    /// Declarations of producers no carrier reads yet: refused, naming the producer.
+    pub unread_declarations: Vec<UnreadDeclaration>,
+    /// Quantization parts no scheme reads yet: refused wherever they appear.
+    pub companions: Vec<Companions>,
+    /// ComfyUI marker keys that change how a module runs, never its values.
+    pub marker_execution: Vec<String>,
+    pub carriers: Vec<Carrier>,
 }
 
-/// The reviewed carriers, parsed once.
-pub fn carriers() -> &'static [Carrier] {
-    static PARSED: std::sync::OnceLock<Vec<Carrier>> = std::sync::OnceLock::new();
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnreadDeclaration {
+    /// A file beside the weights, or a safetensors metadata key prefix.
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default)]
+    pub metadata_prefix: Option<String>,
+    pub producer: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Companions {
+    pub producer: String,
+    /// Key patterns: `*` at either end matches any text.
+    pub keys: Vec<String>,
+}
+
+/// The reviewed table, parsed once.
+pub fn table() -> &'static Table {
+    static PARSED: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
     PARSED.get_or_init(|| {
-        let table: Table =
-            serde_json::from_str(include_str!("carriers.json")).expect("the carrier table");
-        table.carriers
+        serde_json::from_str(include_str!("carriers.json")).expect("the carrier table")
     })
+}
+
+pub fn carriers() -> &'static [Carrier] {
+    &table().carriers
+}
+
+/// `key` against a pattern with an optional `*` at either end.
+fn matches(pattern: &str, key: &str) -> bool {
+    match (pattern.strip_prefix('*'), pattern.strip_suffix('*')) {
+        (Some(rest), _) if rest.ends_with('*') => key.contains(&rest[..rest.len() - 1]),
+        (Some(rest), _) => key.ends_with(rest),
+        (None, Some(rest)) => key.starts_with(rest),
+        (None, None) => key == pattern,
+    }
 }
 
 /// One folded tensor: its encoding and each part's role, dtype, shape and source bytes.
@@ -247,6 +287,30 @@ fn declared(set: &SourceSet, group: &Group) -> Result<Option<Declared>> {
         "" => name.to_owned(),
         folder => format!("{folder}/{name}"),
     };
+    for unread in &table().unread_declarations {
+        let found = match (&unread.file, &unread.metadata_prefix) {
+            (Some(file), _) => read_json(set, &path(file))?.map(|doc| {
+                let stated: Vec<String> = ["quant_method", "checkpoint_format", "version"]
+                    .iter()
+                    .filter_map(|k| Some(format!("{k}: {}", doc.get(*k)?)))
+                    .collect();
+                format!("{} ({})", path(file), stated.join(", "))
+            }),
+            (None, Some(prefix)) => (group.metadata.keys())
+                .find(|k| k.starts_with(prefix.as_str()))
+                .map(|k| format!("{} metadata {k}", group.label())),
+            (None, None) => None,
+        };
+        if let Some(found) = found {
+            return refuse(
+                Code::UNREGISTERED_ENCODING,
+                format!(
+                    "{found}: a {} quantization, which this import does not read yet",
+                    unread.producer
+                ),
+            );
+        }
+    }
     if let Some(doc) = read_json(set, &path("hf_quant_config.json"))? {
         let what = path("hf_quant_config.json");
         match doc["producer"]["name"].as_str() {
@@ -460,6 +524,9 @@ fn fit(
             at: (*t).clone(),
         });
     }
+    if let (Producer::Comfy, Some(conf)) = (carrier.producer, conf) {
+        marker_keys(carrier, conf)?;
+    }
     let mut encoding = carrier.encoding.clone();
     for (param, (key, default)) in &carrier.marker_params {
         let value = match conf.and_then(|c| conf_get(c, key)) {
@@ -481,12 +548,66 @@ fn fit(
     Ok(Folded { encoding, parts })
 }
 
+/// Every key of a ComfyUI marker (and of its `params`) is one this carrier reads, one it
+/// decodes at the stated value, or one that never changes values; any other is refused by name.
+fn marker_keys(carrier: &Carrier, conf: &Conf) -> std::result::Result<(), String> {
+    let nested = match conf.get("params") {
+        None => None,
+        Some(Json::Object(params)) => Some(params),
+        Some(other) => return Err(format!("marker params: {other} is not a map")),
+    };
+    let entries = conf
+        .iter()
+        .filter(|(k, _)| *k != "params")
+        .chain(nested.into_iter().flatten());
+    for (key, value) in entries {
+        let read = key == "format"
+            || (key == "convrot" && value.is_boolean())
+            || carrier.marker_params.values().any(|(k, _)| k == key)
+            || table().marker_execution.contains(key);
+        let decoded = carrier.marker_values.get(key).map(|want| want == value);
+        match (read, decoded) {
+            (true, _) | (false, Some(true)) => {}
+            (false, Some(false)) => {
+                return Err(format!(
+                    "marker {key}: {value}, where {} decodes {}",
+                    carrier.encoding.scheme, carrier.marker_values[key]
+                ))
+            }
+            (false, None) => return Err(format!("marker {key}: {value} is not read")),
+        }
+    }
+    Ok(())
+}
+
+/// Refuses quantization parts no scheme reads yet, wherever they are.
+fn companions(group: &Group) -> Result<()> {
+    for c in &table().companions {
+        let found: Vec<&String> = (group.tensors.keys())
+            .filter(|k| c.keys.iter().any(|p| matches(p, k)))
+            .take(3)
+            .collect();
+        if !found.is_empty() {
+            return refuse(
+                Code::UNREGISTERED_ENCODING,
+                format!(
+                    "{}: {found:?} are {} quantization parts, which this import does not read yet",
+                    group.label(),
+                    c.producer
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Folds every quantized carrier in `set` into encoded tensors under the module's `.weight`.
 pub fn fold(set: &mut SourceSet) -> Result<()> {
     for g in 0..set.groups.len() {
         let group = &set.groups[g];
         let Some(d) = declared(set, group)? else {
             undeclared(group)?;
+            companions(group)?;
             continue;
         };
         let folded = fold_group(group, &d)?;
@@ -500,6 +621,7 @@ pub fn fold(set: &mut SourceSet) -> Result<()> {
             }
             group.tensors.insert(key, t);
         }
+        companions(group)?;
     }
     Ok(())
 }
