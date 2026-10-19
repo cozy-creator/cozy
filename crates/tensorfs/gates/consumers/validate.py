@@ -8,7 +8,9 @@ from pathlib import Path
 import re
 import tarfile
 
-from make_payload import COMFY, CONSUMERS, PRE_GPU
+from make_payload import (COMFY, CONSUMERS, PRE_GPU, KERNEL_SOURCE, KERNEL_SCRIPT,
+                          KERNEL_CORPUS, KERNEL_SCHEMA, KERNEL_FILE, kernel_cases)
+from owned_child import CONSUMER_SECONDS, KERNEL_SECONDS, SETUP_SECONDS
 
 
 def require(ok, detail):
@@ -34,6 +36,47 @@ def uuid(value):
 
 def finite(value, positive=False):
     return type(value) in (int, float) and math.isfinite(value) and (value > 0 if positive else value >= 0)
+
+
+def tree_document(root):
+    """TensorD trees::document/device_executor::tree_binding, not an invented wire format.
+
+    entries sorted by path; serde_json's sorted keys, UTF-8, compact separators, no newline.
+    Include files.json too: the PUBLIC run digest must bind every returned receipt byte.
+    """
+    entries = [{'blob': {'length': p.stat().st_size, 'sha256': sha(p)}, 'kind': 'file',
+                'path': p.relative_to(root).as_posix()}
+               for p in sorted(Path(root).rglob('*')) if p.is_file()]
+    return json.dumps({'entries': entries}, ensure_ascii=False, sort_keys=True,
+                      separators=(',', ':')).encode()
+
+
+def public_tree(root, run, identity):
+    require(isinstance(run.get('id'), str) and run['id'].startswith('run-') and
+            type(run.get('number')) is int and run['number'] > 0, 'public run identity absent')
+    # Context.request_id is TensorD's local Execution.id, not Calcifer's public run ID/number.
+    require(isinstance(identity.get('request_id'), str) and identity['request_id'].isdecimal() and
+            int(identity['request_id']) > 0, 'missing worker Context request identity')
+    trees = [o for o in run.get('output', []) if o.get('media_type') == 'application/vnd.cozy.tree-manifest']
+    require(len(trees) == 1, 'public run must contain this one receipt Tree')
+    item = trees[0]
+    require(item.get('index') == 0 and item.get('status') == 'completed' and not item.get('export_error') and
+            isinstance(item.get('name'), str) and bool(item['name']) and
+            item.get('id') == f"{run['number']}/{item['name']}", 'public Tree output/run association differs')
+    document = tree_document(root)
+    require(type(item.get('length')) is int and item['length'] == len(document) and
+            item.get('sha256') == 'sha256:' + hashlib.sha256(document).hexdigest(),
+            'downloaded receipts differ from this public run Tree digest/length')
+    return {'run_id': run['id'], 'number': run['number'], 'output_id': item['id'],
+            'sha256': item['sha256'], 'length': len(document), 'context_request_id': identity['request_id']}
+
+
+def completed_child(part, limit):
+    return (part.get('ok') is True and type(part.get('rc')) is int and part['rc'] == 0 and
+            part.get('timed_out') is False and part.get('reaped') is True and
+            part.get('lingering_descendants') is False and part.get('signals') == [] and
+            part.get('timeout_s') == limit and finite(part.get('elapsed_s'), True) and
+            type(part.get('pid')) is int and part['pid'] > 0 and part.get('pgid') == part['pid'])
 
 
 def consumer(name, value, spec, device):
@@ -85,18 +128,16 @@ def physical(run, machine, identities, launch, payload_sha):
     visit(run)
     rows = [g for e in executions for g in e.get('gpus', []) if type(g.get('gpu')) is int and g['gpu'] >= 0]
     pairs = {(r['gpu'], uuid(r.get('uuid'))) for r in rows}
-    require(len(pairs) <= 1, 'public run used a different GPU count/identity')
-    # A model-less parent may report CPU/-1. Those rows contribute no physical evidence.
-    # Physical evidence comes from each sealed child, matched to public machine inventory.
+    require(len(pairs) == 1, 'public run lacks exactly one positive GPU execution identity')
     observed = {(i['physical']['gpu'], uuid(i['gpu_uuid'])) for i in identities}
     require(len(observed) == 1, 'children executed different physical GPU allocations')
     index, gpu_uuid = next(iter(observed))
     require(type(index) is int and index >= 0, 'child has no physical GPU index')
-    if pairs:
-        require(pairs == observed and all(e.get('degree') == 1 for e in executions if e.get('gpus') and
-                any(type(g.get('gpu')) is int and g['gpu'] >= 0 for g in e['gpus'])), 'public physical GPU measurement differs')
-        require(any(type(r.get('pid')) is int and r['pid'] > 0 and finite(r.get('start_us'), True) and
-                    finite(r.get('end_us'), True) and r['end_us'] > r['start_us'] for r in rows), 'GPU measurement has no real process/interval')
+    require(pairs == observed and all(e.get('degree') == 1 for e in executions if e.get('gpus') and
+            any(type(g.get('gpu')) is int and g['gpu'] >= 0 for g in e['gpus'])), 'public physical GPU measurement differs')
+    require(all(type(r.get('pid')) is int and r['pid'] > 0 and finite(r.get('start_us'), True) and
+                finite(r.get('end_us'), True) and r['end_us'] > r['start_us'] and
+                re.fullmatch('sm_[0-9]+', r.get('arch', '')) for r in rows), 'GPU measurement has no real process/interval/architecture')
     inventory = machine.get('status', {}).get('gpus', [])
     matches = [g for g in inventory if g.get('index') == index]
     require(len(matches) == 1, 'executed physical GPU absent from public machine snapshot')
@@ -105,7 +146,7 @@ def physical(run, machine, identities, launch, payload_sha):
         require(p['gpu'] == index and uuid(p['uuid']) == gpu_uuid == uuid(identity['gpu_uuid']), 'sealed/Torch/NVML/public physical allocation differs')
         require(p['name'] == matches[0].get('name') and p['driver'] == matches[0].get('driver'), 'physical machine name/driver differs')
     return {'gpu': index, 'uuid': gpu_uuid, 'public_measured_gpu_rows': len(rows),
-            'evidence': 'sealed child Torch UUID + physical NVML + public one-GPU launch/machine snapshot'}
+            'evidence': 'positive public GPU execution UUID/index/PID/time + sealed child Torch UUID/NVML + public one-GPU launch/machine snapshot'}
 
 
 def validate(root, expected, run, machine, launch, require_kernel=False):
@@ -132,7 +173,11 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
     actual = {str(p.relative_to(root)): sha(p) for p in root.rglob('*') if p.is_file() and p != root / 'files.json'}
     require(actual == inventory, 'receipt file inventory/hash differs')
     expected_files = {'manifest.json', 'identity.json', 'verdict.json', 'source/payload.py',
-                      'source/comfy-upstream.tar', 'logs/comfy-setup.log'}
+                      'source/comfy-upstream.tar'}
+    setup_names = ['comfy-init', 'comfy-remote', 'comfy-fetch', 'comfy-checkout', 'comfy-archive']
+    setup_names += [name + '-purelib' for name in requested]
+    for name in setup_names:
+        expected_files.update({f'logs/{name}.stdout', f'logs/{name}.stderr'})
     expected_files.update('source/' + name for name in spec['sources'])
     for name in requested:
         expected_files.update({f'logs/{name}.stdout', f'logs/{name}.stderr', f'reports/{name}.json',
@@ -142,10 +187,14 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
         require(sha(root / 'source' / name) == expected_sha, 'retained source hash differs')
     identity, verdict = read(root / 'identity.json'), read(root / 'verdict.json')
     require(identity.get('ok') is True and verdict.get('ok') is True, 'worker failed')
+    operations = identity.get('operations', [])
+    require([p.get('name') for p in operations] == setup_names and
+            all(completed_child(p, SETUP_SECONDS) for p in operations), 'setup child timed out/failed/not reaped')
     require(isinstance(identity.get('context_device'), str) and bool(identity['context_device']) and
             identity.get('python_optimize') == 0, 'missing public Context/optimized Python')
     require(identity.get('runtime_source') == spec['runtime']['source'] and identity.get('runtime') == spec['runtime']['version'], 'live Runtime differs')
     require(identity.get('native_sha256') == spec['native']['sha256'], 'native input differs')
+    require(identity.get('outer_torch_present') is True, 'outer Runtime lacks Torch identity path')
     require(identity.get('triton_interpret') in ('', '0'), 'interpreter fallback')
     require(sha(root / 'source/comfy-upstream.tar') == identity.get('comfy_archive_sha256'), 'Comfy archive hash differs')
     with tarfile.open(root / 'source/comfy-upstream.tar') as archive:
@@ -158,7 +207,8 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
     devices = []
     for part in parts:
         name = part['name']
-        require(type(part.get('rc')) is int and part['rc'] == 0 and part.get('ok') is True, f'{name}: child failed')
+        require(completed_child(part, KERNEL_SECONDS if name == 'kernel' else CONSUMER_SECONDS),
+                f'{name}: child failed/timed out/not reaped')
         child = read(root / f'reports/{name}-identity.json')
         require(child.get('ok') is True and child.get('python_optimize') == 0 and child.get('triton_interpret') in ('', '0'), f'{name}: skipped/interpreter/optimized child')
         require(child.get('script_completed') is True and child.get('native_extension_sha256') == spec['native']['extension_sha256'], f'{name}: native binary differs or child incomplete')
@@ -171,21 +221,34 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
                 row = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(row, dict) and row.get('proof') == value.get('proof'):
+            if isinstance(row, dict) and ((name != 'kernel' and row.get('proof') == value.get('proof')) or
+                                         (name == 'kernel' and row.get('schema') == KERNEL_SCHEMA)):
                 rows.append(row)
         require(rows == [value], f'{name}: report differs from actual subprocess stdout')
         if name == 'kernel':
             require(child.get('torch_present') is False and child.get('triton_present') is False and
                     child.get('torch_loaded') is False and child.get('triton_loaded') is False, 'kernel child is not clean TensorFS-only')
-            contract = spec['kernel']['contract']
-            require(value.get('proof') == contract['proof'], 'wrong kernel proof marker')
-            require(value.get('native_source') == spec['native']['source'] and value.get('wheel_sha256') == spec['native']['sha256'] and
-                    value.get('script_sha256') == spec['kernel']['sha256'], 'kernel artifact/source differs')
-            require(type(value.get('device_count')) is int and value['device_count'] == 1 and
-                    uuid(value.get('gpu_uuid')) == uuid(devices[0]['gpu_uuid']), 'kernel physical CUDA device differs')
-            cases = value.get('cases', [])
-            require(len(cases) == len(contract['cases']) and {c.get('name') for c in cases} == set(contract['cases']), 'kernel requested/missing case set differs')
-            require(all(c.get('executed') is True and c.get('skipped') is False and c.get('kernel') is True and c.get('device') == 'cuda:0' and finite(c.get('max_abs_error')) for c in cases), 'kernel CPU/skip/interpreter case')
+            contract = spec['kernel']
+            require((contract.get('source'), contract.get('sha256'), contract.get('file'), contract.get('schema'),
+                     contract.get('corpus_sha256'), contract.get('argv')) ==
+                    (KERNEL_SOURCE, KERNEL_SCRIPT, KERNEL_FILE, KERNEL_SCHEMA, KERNEL_CORPUS, ['--device', '0']),
+                    'kernel frozen source/contract differs')
+            require(spec['sources'].get(KERNEL_FILE) == KERNEL_SCRIPT, 'kernel script hash differs')
+            files = {name: (root / 'source' / name).read_text() for name in spec['sources']}
+            expected_cases = kernel_cases(files)
+            schemes = sorted({c['scheme'] for c in expected_cases})
+            require(contract.get('cases') == [c['case'] for c in expected_cases] and contract.get('schemes') == schemes,
+                    'kernel requested case set differs')
+            require(value.get('schema') == KERNEL_SCHEMA and value.get('device') == {'type': 'cuda', 'ordinal': 0}, 'kernel CPU/wrong CUDA ordinal')
+            require(value.get('counts') == {'full': 209, 'windows': 209, 'total': 418, 'cases': 209, 'schemes': 39} and
+                    value.get('schemes') == schemes and value.get('corpus_sha256') == KERNEL_CORPUS and
+                    value.get('cases') == expected_cases, 'kernel missing/duplicate/skipped/non-bit-exact case')
+            require(value.get('routing') == {'prepared': 'Kernel', 'host_only_exclusions': []}, 'kernel host fallback')
+            require(value.get('runtime') == {'torch_installed': False, 'triton_installed': False,
+                                           'torch_imported': False, 'triton_imported': False}, 'kernel runtime is not clean')
+            require(child.get('cuda_visible_devices') == identity.get('cuda_visible_devices') and
+                    isinstance(child.get('cuda_visible_devices'), str) and bool(child['cuda_visible_devices']) and
+                    ',' not in child['cuda_visible_devices'], 'kernel inherited CUDA scope differs')
             continue
         require(child.get('cuda_available') is True and type(child.get('device_count')) is int and child['device_count'] == 1 and
                 child.get('cuda_initialized_before_probe') is False, f'{name}: no exact real CUDA/pre-init observation')
@@ -194,8 +257,9 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
         consumer(name, value, spec, child)
         devices.append(child)
     observed = physical(run, machine, devices, launch, payload_sha)
+    bound = public_tree(root, run, identity)
     return {'ok': True, 'requested': requested, 'unrequested': spec['unrequested'],
-            'context_device': identity['context_device'], 'physical': observed,
+            'context_device': identity['context_device'], 'physical': observed, 'public_tree': bound,
             'scope': 'tiny model/library forwards; no ComfyUI graph/visual or unrequested kernel qualification'}
 
 

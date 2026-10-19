@@ -40,14 +40,16 @@ try:
         props = torch.cuda.get_device_properties(0)
         identity['gpu_uuid'] = str(props.uuid)
         raw = subprocess.check_output(['nvidia-smi', '--query-gpu=index,uuid,driver_version,name',
-                                       '--format=csv,noheader,nounits'], text=True)
+                                       '--format=csv,noheader,nounits'], text=True, timeout=15)
         rows = [line.split(',', 3) for line in raw.splitlines() if line.strip()]
         matches = [r for r in rows if len(r) == 4 and uuid(r[1].strip()) == uuid(identity['gpu_uuid'])]
         assert len(matches) == 1, 'Torch UUID has no unique physical NVML mapping'
         row = [v.strip() for v in matches[0]]
         identity['physical'] = {'gpu': int(row[0]), 'uuid': row[1], 'driver': row[2], 'name': row[3]}
         visible = identity['cuda_visible_devices']
-        assert (int(visible) == int(row[0])) if visible.isdecimal() else uuid(visible) == uuid(row[1]), 'sealed visibility differs from physical GPU'
+        # Decimal visibility entries are CUDA ordinals and need not be NVML indices.
+        # The real Torch UUID joined to NVML and the public execution row is authoritative.
+        assert visible.isdecimal() or uuid(visible) == uuid(row[1]), 'sealed UUID visibility differs from physical GPU'
     identity['ok'] = True
     sys.argv = [script, *argv]
     try:

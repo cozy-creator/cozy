@@ -3,6 +3,7 @@
 
 import argparse
 import ast
+import base64
 from email.parser import Parser
 import hashlib
 import json
@@ -21,6 +22,37 @@ CONSUMERS = {
               "7b0c10a859d553674cd55a3259999a92bd8476982bb979e494060b70068b6dfb", 130, 2893456),
 }
 PRE_GPU = {"88a49ac8e634035301a3314088a856d214e55db8", "f0601a0d5323cd4ed3da829072ab9d6ca61d7748"}
+KERNEL_SOURCE = 'f8245484c34e45ece257715569468ced526c94fd'
+KERNEL_SCRIPT = '7660d1cd97c95ca460e8f4bc884c01ee1f68b8adf8db8d755adda8fe8e053475'
+KERNEL_CORPUS = '92a0f4f01f4490c2f7f8c391e5eb600f5e5b33d647eed48d91ff7c21e7af57d4'
+KERNEL_SCHEMA = 'tensorfs.cuda-kernel-conformance/1'
+KERNEL_FILE = 'kernel/scripts/cuda_kernel_conform.py'
+KERNEL_CASES = 'kernel/conformance/vectors/cases/'
+
+
+def git(repo, *args):
+    return subprocess.check_output(['git', '-C', str(repo), *args], timeout=15)
+
+
+def kernel_cases(files):
+    """Derive the exact receipt rows from the owner's frozen, hash-checked corpus."""
+    corpus, rows = hashlib.sha256(), []
+    for name, contents in sorted(files.items()):
+        if not name.startswith(KERNEL_CASES):
+            continue
+        filename = Path(name).name
+        corpus.update(filename.encode() + b'\0' + contents.encode())
+        for case in json.loads(contents)['cases']:
+            if case.get('encoding') is None or case.get('expect') is None:
+                continue
+            length = len(base64.b64decode(case['expect'], validate=True))
+            rows.append({'case': f"{Path(filename).stem}/{case['component']}/{case['key']}",
+                         'scheme': case['encoding']['scheme'], 'dtype': case['dtype'], 'shape': case['shape'],
+                         'full_bytes': length, 'full_passed': True,
+                         'window': {'offset': 1, 'length': min(13, max(0, length - 1)), 'passed': True}})
+    if corpus.hexdigest() != KERNEL_CORPUS or len(rows) != 209 or len({r['case'] for r in rows}) != 209 or len({r['scheme'] for r in rows}) != 39:
+        raise ValueError('frozen kernel corpus/hash/case set differs')
+    return rows
 
 
 def digest(data):
@@ -74,33 +106,32 @@ def generate(args):
         raise ValueError("review the candidate wheels' different Requires-Python constraints")
     files, consumers = {}, {}
     for name, (ref, filename, expected, count, size) in CONSUMERS.items():
-        data = subprocess.check_output(['git', '-C', str(args.creator_repo), 'show',
-                                        f'{ref}:crates/tensorfs/scripts/{filename}'])
+        data = git(args.creator_repo, 'show', f'{ref}:crates/tensorfs/scripts/{filename}')
         if digest(data) != expected:
             raise ValueError(f"frozen {name} source differs")
         files[filename] = data.decode()
         consumers[name] = {'source': ref, 'file': filename, 'sha256': expected, 'tensors': count, 'bytes': size}
     files['child.py'] = (HERE / 'child.py').read_text()
+    files['owned_child.py'] = (HERE / 'owned_child.py').read_text()
     spec = {'schema': 1, 'requested': ['diffusers', 'comfy'], 'unrequested': ['kernel'],
             'native': native, 'runtime': runtime, 'consumers': consumers, 'comfy_source': COMFY,
             'gpu_count': 1, 'device': 'cuda:0', 'cublas_workspace_config': ':4096:8'}
-    kernel_args = [args.kernel_script, args.kernel_source, args.kernel_sha256, args.kernel_manifest]
-    if any(v is not None for v in kernel_args):
-        if not all(v is not None for v in kernel_args):
-            raise ValueError("kernel script/source/hash/case manifest must be supplied together")
-        data = args.kernel_script.read_bytes()
-        if digest(data) != pin(args.kernel_sha256, 64):
-            raise ValueError("kernel script hash differs")
-        contract = json.loads(args.kernel_manifest.read_text())
-        cases = contract.get('cases')
-        if not isinstance(cases, list) or not cases or any(not isinstance(c, str) or not c for c in cases) or len(set(cases)) != len(cases):
-            raise ValueError("kernel manifest needs a nonempty, unique explicit case set")
-        if not isinstance(contract.get('proof'), str) or not contract['proof']:
-            raise ValueError("kernel manifest needs its exact JSON proof marker")
-        if not isinstance(contract.get('argv', []), list) or any(not isinstance(a, str) for a in contract.get('argv', [])):
-            raise ValueError("kernel argv must be explicit strings")
-        files['kernel.py'] = data.decode()
-        spec['kernel'] = {'source': pin(args.kernel_source, 40), 'sha256': args.kernel_sha256, 'contract': contract}
+    if args.include_kernel:
+        data = git(args.creator_repo, 'show', f'{KERNEL_SOURCE}:crates/tensorfs/scripts/cuda_kernel_conform.py')
+        if digest(data) != KERNEL_SCRIPT:
+            raise ValueError('frozen kernel script hash differs')
+        files[KERNEL_FILE] = data.decode()
+        prefix = 'crates/tensorfs/conformance/vectors/cases/'
+        paths = git(args.creator_repo, 'ls-tree', '-r', '--name-only', KERNEL_SOURCE, prefix).decode().splitlines()
+        for path in paths:
+            if not path.endswith('.json'):
+                raise ValueError('unexpected file in frozen kernel corpus')
+            files[KERNEL_CASES + Path(path).name] = git(args.creator_repo, 'show', f'{KERNEL_SOURCE}:{path}').decode()
+        rows = kernel_cases(files)
+        spec['kernel'] = {'source': KERNEL_SOURCE, 'sha256': KERNEL_SCRIPT, 'file': KERNEL_FILE,
+                          'schema': KERNEL_SCHEMA, 'corpus_sha256': KERNEL_CORPUS,
+                          'cases': [r['case'] for r in rows], 'schemes': sorted({r['scheme'] for r in rows}),
+                          'argv': ['--device', '0']}
         spec['requested'].append('kernel')
         spec['unrequested'] = []
     spec['sources'] = {name: digest(text.encode()) for name, text in files.items()}
@@ -137,8 +168,5 @@ if __name__ == '__main__':
     p.add_argument('--runtime-source', required=True)
     p.add_argument('--runtime-sha256', required=True)
     p.add_argument('--output', type=Path, required=True)
-    p.add_argument('--kernel-script', type=Path)
-    p.add_argument('--kernel-source')
-    p.add_argument('--kernel-sha256')
-    p.add_argument('--kernel-manifest', type=Path)
+    p.add_argument('--include-kernel', action='store_true', help='include the frozen f824 clean-child 209-case kernel proof')
     print(generate(p.parse_args()))

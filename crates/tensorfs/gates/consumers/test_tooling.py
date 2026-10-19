@@ -5,7 +5,10 @@ import copy
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tarfile
 import tempfile
 import tomllib
@@ -14,6 +17,7 @@ import zipfile
 
 import make_payload
 import validate
+from owned_child import CONSUMER_SECONDS, KERNEL_SECONDS, SETUP_SECONDS, run_owned
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[3]
@@ -23,6 +27,12 @@ UUID = 'GPU-12345678-1234-1234-1234-123456789abc'
 def write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2) + '\n')
+
+
+def completed(limit):
+    return {'rc': 0, 'ok': True, 'timed_out': False, 'reaped': True,
+            'lingering_descendants': False, 'signals': [], 'timeout_s': limit,
+            'elapsed_s': 0.1, 'pid': 123, 'pgid': 123}
 
 
 class Contract(unittest.TestCase):
@@ -43,17 +53,11 @@ class Contract(unittest.TestCase):
         self.args = argparse.Namespace(creator_repo=REPO, native_wheel=self.native, native_source='2' * 40,
                                       native_sha256=validate.sha(self.native), runtime_wheel=self.runtime,
                                       runtime_source='3' * 40, runtime_sha256=validate.sha(self.runtime),
-                                      output=self.root / 'payload.py', kernel_script=None, kernel_source=None,
-                                      kernel_sha256=None, kernel_manifest=None)
+                                      output=self.root / 'payload.py', include_kernel=False)
 
     def fixture(self, kernel=False):
         if kernel:
-            script = self.root / 'kernel-input.py'
-            script.write_text('# Contract fixture only, never executed as GPU proof.\n')
-            manifest = self.root / 'kernel-input.json'
-            write(manifest, {'proof': 'fixture-native-kernel', 'cases': ['decode'], 'argv': []})
-            self.args.kernel_script, self.args.kernel_manifest = script, manifest
-            self.args.kernel_source, self.args.kernel_sha256 = '4' * 40, validate.sha(script)
+            self.args.include_kernel = True
         sidecar = make_payload.generate(self.args)
         expected = validate.read(sidecar)
         spec = dict(expected)
@@ -67,18 +71,24 @@ class Contract(unittest.TestCase):
         (root / 'logs').mkdir()
         (root / 'source/payload.py').write_bytes(self.args.output.read_bytes())
         for name, source in files.items():
+            (root / 'source' / name).parent.mkdir(parents=True, exist_ok=True)
             (root / 'source' / name).write_text(source)
-        (root / 'logs/comfy-setup.log').write_text('fixture source setup\n')
+        operations = []
+        for name in ['comfy-init', 'comfy-remote', 'comfy-fetch', 'comfy-checkout', 'comfy-archive'] + [n + '-purelib' for n in spec['requested']]:
+            (root / f'logs/{name}.stdout').write_text('fixture source setup\n')
+            (root / f'logs/{name}.stderr').write_text('')
+            operations.append({'name': name, **completed(SETUP_SECONDS)})
         with tarfile.open(root / 'source/comfy-upstream.tar', 'w', format=tarfile.PAX_FORMAT,
                           pax_headers={'comment': make_payload.COMFY}) as archive:
             data = b'# fixture source\n'
             entry = tarfile.TarInfo('comfy/__init__.py')
             entry.size = len(data)
             archive.addfile(entry, io.BytesIO(data))
-        identity = {'ok': True, 'request_id': 'fixture-only', 'context_device': 'cuda:0', 'python_optimize': 0,
+        identity = {'ok': True, 'request_id': '987', 'context_device': 'cuda:0', 'python_optimize': 0,
                     'cuda_visible_devices': '0', 'triton_interpret': '', 'runtime_source': '3' * 40,
                     'runtime': '0.28.2', 'native_sha256': spec['native']['sha256'],
-                    'comfy_archive_sha256': validate.sha(root / 'source/comfy-upstream.tar')}
+                    'comfy_archive_sha256': validate.sha(root / 'source/comfy-upstream.tar'), 'operations': operations,
+                    'outer_torch_present': True}
         write(root / 'identity.json', identity)
         parts = []
         for name in spec['requested']:
@@ -89,11 +99,14 @@ class Contract(unittest.TestCase):
                      'physical': {'gpu': 0, 'uuid': UUID, 'name': 'fixture GPU', 'driver': '600.0'}}
             if name == 'kernel':
                 child.update(torch_present=False, triton_present=False, torch_loaded=False, triton_loaded=False)
-                value = {'proof': 'fixture-native-kernel', 'native_source': spec['native']['source'],
-                         'wheel_sha256': spec['native']['sha256'], 'script_sha256': spec['kernel']['sha256'],
-                         'device_count': 1, 'gpu_uuid': UUID,
-                         'cases': [{'name': 'decode', 'executed': True, 'skipped': False,
-                                    'kernel': True, 'device': 'cuda:0', 'max_abs_error': 0.0}]}
+                cases = make_payload.kernel_cases(files)
+                value = {'schema': make_payload.KERNEL_SCHEMA, 'device': {'type': 'cuda', 'ordinal': 0},
+                         'counts': {'full': 209, 'windows': 209, 'total': 418, 'cases': 209, 'schemes': 39},
+                         'schemes': sorted({c['scheme'] for c in cases}), 'cases': cases,
+                         'corpus_sha256': make_payload.KERNEL_CORPUS,
+                         'routing': {'prepared': 'Kernel', 'host_only_exclusions': []},
+                         'runtime': {'torch_installed': False, 'triton_installed': False,
+                                     'torch_imported': False, 'triton_imported': False}}
             else:
                 value = validate.read(HERE / 'fixtures' / f'{name}-cpu.json')['evidence']
                 value.update(proof=f'public-tensorfs-{name}-unet-cuda', device='cuda:0', gpu_origin_writer=True,
@@ -101,11 +114,12 @@ class Contract(unittest.TestCase):
                              native_source=spec['native']['source'], wheel_sha256=spec['native']['sha256'])
             write(root / f'reports/{name}-identity.json', child)
             self.result(root, name, value)
-            parts.append({'name': name, 'rc': 0, 'ok': True})
+            parts.append({'name': name, **completed(KERNEL_SECONDS if name == 'kernel' else CONSUMER_SECONDS)})
         write(root / 'verdict.json', {'ok': True, 'requested': spec['requested'], 'unrequested': spec['unrequested'], 'parts': parts})
         self.inventory(root)
-        run = {'status': 'completed', 'machine': 'fixture-machine', 'measurements': {'execution': {'degree': 1,
-               'gpus': [{'gpu': 0, 'uuid': UUID, 'pid': 123, 'start_us': 10, 'end_us': 20}]}}}
+        run = {'id': 'run-' + '1' * 24, 'number': 12, 'status': 'completed', 'machine': 'fixture-machine', 'measurements': {'execution': {'degree': 1,
+               'gpus': [{'gpu': 0, 'uuid': UUID, 'arch': 'sm_90', 'pid': 123, 'start_us': 10, 'end_us': 20}]}}}
+        self.bind(root, run)
         machine = {'name': 'fixture-machine', 'status': {'gpus': [{'index': 0, 'name': 'fixture GPU', 'driver': '600.0'}]}}
         launch = {'payload_sha256': expected['payload_sha256'], 'argv': ['cozy', 'run', 'payload.py', '--gpus', '1', '--on', 'fixture-machine']}
         return root, expected, run, machine, launch
@@ -118,6 +132,12 @@ class Contract(unittest.TestCase):
     def inventory(self, root):
         write(root / 'files.json', {str(p.relative_to(root)): validate.sha(p) for p in root.rglob('*')
                                   if p.is_file() and p != root / 'files.json'})
+
+    def bind(self, root, run):
+        document = validate.tree_document(root)
+        run['output'] = [{'id': f"{run['number']}/value", 'name': 'value', 'index': 0, 'rev': 1,
+                          'status': 'completed', 'media_type': 'application/vnd.cozy.tree-manifest',
+                          'length': len(document), 'sha256': 'sha256:' + hashlib.sha256(document).hexdigest()}]
 
     def test_synthetic_contract_only_positive_and_derived_metadata(self):
         root, expected, run, machine, launch = self.fixture()
@@ -190,11 +210,43 @@ class Contract(unittest.TestCase):
         identity = validate.read(root / 'identity.json')
         write(root / 'identity.json', {**identity, 'context_device': 'cpu'})
         self.inventory(root)
-        run['measurements']['execution'] = {'degree': 0, 'gpus': [{'gpu': -1, 'uuid': ''}]}
+        self.bind(root, run)
         result = validate.validate(root, expected, run, machine, launch)
         self.assertEqual(result['physical']['gpu'], 0)
-        self.assertEqual(result['physical']['public_measured_gpu_rows'], 0)
+        self.assertEqual(result['physical']['public_measured_gpu_rows'], 1)
         self.assertEqual(result['context_device'], 'cpu')
+
+    def test_missing_or_negative_public_gpu_identity_never_passes(self):
+        root, expected, run, machine, launch = self.fixture()
+        for rows in [[], [{'gpu': -1, 'uuid': ''}]]:
+            run['measurements']['execution'] = {'degree': 0, 'gpus': rows}
+            with self.assertRaisesRegex(ValueError, 'positive GPU execution'):
+                validate.validate(root, expected, run, machine, launch)
+
+    def test_swapped_public_run_or_receipt_is_refused(self):
+        root, expected, run, machine, launch = self.fixture()
+        for field, value in [('sha256', 'sha256:' + 'f' * 64), ('length', 0), ('id', '99/value')]:
+            changed = copy.deepcopy(run)
+            changed['output'][0][field] = value
+            with self.assertRaisesRegex(ValueError, 'public.*Tree|Tree.*public'):
+                validate.validate(root, expected, changed, machine, launch)
+        # Same sources and same machine, but a different actual worker invocation's bytes.
+        identity = validate.read(root / 'identity.json')
+        write(root / 'identity.json', {**identity, 'request_id': '988'})
+        self.inventory(root)
+        with self.assertRaisesRegex(ValueError, 'public run Tree digest'):
+            validate.validate(root, expected, run, machine, launch)
+
+    def test_timeout_or_failed_reap_cannot_pass_with_good_stdout(self):
+        root, expected, run, machine, launch = self.fixture()
+        original = validate.read(root / 'verdict.json')
+        for field, value in [('timed_out', True), ('reaped', False), ('lingering_descendants', True)]:
+            changed = copy.deepcopy(original)
+            changed['parts'][0][field] = value
+            write(root / 'verdict.json', changed)
+            self.inventory(root)
+            with self.assertRaisesRegex(ValueError, 'timed out/not reaped'):
+                validate.validate(root, expected, run, machine, launch)
 
     def test_missing_or_wrong_public_one_gpu_launch(self):
         root, expected, run, machine, launch = self.fixture()
@@ -224,7 +276,9 @@ class Contract(unittest.TestCase):
         root, expected, run, machine, launch = self.fixture(kernel=True)
         self.assertTrue(validate.validate(root, expected, run, machine, launch, require_kernel=True)['ok'])
         value = validate.read(root / 'reports/kernel.json')
-        for cases in [[], [{**value['cases'][0], 'skipped': True}], [{**value['cases'][0], 'kernel': False}]]:
+        for cases in [[], [value['cases'][0]] * 209,
+                      [{**value['cases'][0], 'full_passed': False}, *value['cases'][1:]],
+                      [{**value['cases'][0], 'window': {'offset': 1, 'length': 13, 'passed': False}}, *value['cases'][1:]]]:
             self.result(root, 'kernel', {**value, 'cases': cases})
             self.inventory(root)
             with self.assertRaises(ValueError):
@@ -241,6 +295,50 @@ class Contract(unittest.TestCase):
         self.args.native_source = '88a49ac8e634035301a3314088a856d214e55db8'
         with self.assertRaisesRegex(ValueError, 'pre-GPU/fork-fix'):
             make_payload.generate(self.args)
+
+
+class OwnedChild(unittest.TestCase):
+    def test_success_keeps_complete_stdout_and_stderr(self):
+        with tempfile.TemporaryDirectory() as folder:
+            out, err = Path(folder) / 'out', Path(folder) / 'err'
+            row = run_owned([sys.executable, '-c', 'import sys; print("done"); print("error-log", file=sys.stderr)'],
+                            out, err, timeout=5, term_seconds=0.05, kill_seconds=2)
+            self.assertTrue(row['ok'])
+            self.assertEqual(out.read_text(), 'done\n')
+            self.assertEqual(err.read_text(), 'error-log\n')
+            self.assertNotEqual(row['pgid'], os.getpgrp())
+
+    def test_cleanup_hang_after_valid_json_is_killed_and_reaped(self):
+        # A native destructor/cleanup hang after reporting success must still fail.
+        code = ('import signal,time,sys; signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+                'print(\'{"proof":"already-printed"}\',flush=True); '
+                'print("cleanup stuck",file=sys.stderr,flush=True); time.sleep(60)')
+        with tempfile.TemporaryDirectory() as folder:
+            out, err = Path(folder) / 'out', Path(folder) / 'err'
+            row = run_owned([sys.executable, '-c', code], out, err,
+                            timeout=0.2, term_seconds=0.05, kill_seconds=2)
+            self.assertFalse(row['ok'])
+            self.assertTrue(row['timed_out'] and row['reaped'])
+            self.assertEqual(row['signals'], ['SIGTERM', 'SIGKILL'])
+            self.assertEqual(json.loads(out.read_text())['proof'], 'already-printed')
+            self.assertIn('cleanup stuck', err.read_text())
+            self.assertLess(row['elapsed_s'], 3)
+
+    def test_timeout_targets_only_owned_group_including_grandchild(self):
+        code = ('import subprocess,sys,time; '
+                'p=subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"]); '
+                'print(p.pid,flush=True); time.sleep(60)')
+        with tempfile.TemporaryDirectory() as folder:
+            out, err = Path(folder) / 'out', Path(folder) / 'err'
+            row = run_owned([sys.executable, '-c', code], out, err,
+                            timeout=0.2, term_seconds=0.1, kill_seconds=2)
+            self.assertTrue(row['reaped'] and row['timed_out'])
+            grandchild = int(out.read_text().strip())
+            stat = Path(f'/proc/{grandchild}/stat')
+            # Only the direct child is ours to reap; an orphan zombie is already dead.
+            if stat.exists():
+                self.assertEqual(stat.read_text().split(') ', 1)[1].split()[0], 'Z')
+            self.assertNotEqual(row['pgid'], os.getpgrp())
 
 
 if __name__ == '__main__':
