@@ -26,6 +26,8 @@ pub mod machine;
 pub mod machine_api;
 pub mod memo;
 pub mod memory;
+#[cfg(feature = "migrate")]
+mod migrate;
 pub mod model_sources;
 pub mod native_inputs;
 pub mod objects;

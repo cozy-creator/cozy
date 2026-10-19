@@ -25,6 +25,8 @@ x509-cert.workspace = true
 [features]
 # Helpers for tests against a real Tensorhub (hub_client::testing).
 testing = []
+# Dev builds only (xs-045 U12): a model's own rows (`model_rows`). Never in a release.
+migrate = []
 
 [build-dependencies]
 openapiv3.workspace = true

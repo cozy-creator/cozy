@@ -348,6 +348,10 @@ impl Runs {
         if !destination.is_empty() && spec.models.len() != 1 {
             return Err(refused("invalid_request", "a weights destination takes one model"));
         }
+        #[cfg(feature = "migrate")]
+        if let (Some(store), Some(publisher)) = (crate::migrate::local_store(&spec.models), &self.publisher) {
+            return crate::migrate::local(publisher, store, observe);
+        }
         if spec.models.is_empty() {
             return Ok(vec![]);
         }
@@ -362,7 +366,16 @@ impl Runs {
         };
         let mut models = vec![];
         for choice in &spec.models {
-            let (manifest, mut row) = if !choice.source.is_empty() {
+            #[cfg(feature = "migrate")]
+            let migrated = match crate::migrate::marked(choice) {
+                true => Some(crate::migrate::checkpoint(publisher, hub_access()?, choice, stop, observe)?),
+                false => None,
+            };
+            #[cfg(not(feature = "migrate"))]
+            let migrated: Option<(ObjectRef, Value)> = None;
+            let (manifest, mut row) = if let Some(made) = migrated {
+                made
+            } else if !choice.source.is_empty() {
                 let made = publisher.make_source(&choice.source, &choice.profiles, &spec.providers, stop, observe)?;
                 let row = json!({"parameter": choice.parameter, "source": choice.source,
                     "resolved": made.resolved, "profiles": made.profiles,

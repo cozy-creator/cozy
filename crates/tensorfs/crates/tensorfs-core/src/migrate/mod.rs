@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value as Json};
 
-use crate::failure::{fail, Kind, Result};
-use crate::format::layout::{ALIGN, GRID, STANDALONE};
+use crate::failure::{fail, Failure, Kind, Result};
+use crate::format::layout::{self, GRID, STANDALONE};
 use crate::format::{
     Body, Dtype, Encoding, GlobalScale, Location, NibbleOrder, ObjectRef, Release, Repo,
     ScaleLayout, Value, HEADER_PATH,
@@ -80,12 +80,71 @@ pub fn lane(src: &v1::Source, store: Option<&Store>, lane: &v1::Lane, dry_run: b
     r
 }
 
+/// The old objects a migration of `h` reads: the parts it repacks and the segments of assets it
+/// joins. Large parts on the old grid and whole files are reused by digest, unread.
+pub fn reads(h: &v1::Header) -> Vec<ObjectRef> {
+    let mut out: Vec<ObjectRef> = (h.components.iter().flat_map(|c| &c.1).flat_map(|t| &t.parts))
+        .filter(|p| reusable(p).is_none())
+        .flat_map(|p| match &p.body {
+            v1::Body::Objects(objects) => objects.clone(),
+            v1::Body::Inline(_) => vec![],
+        })
+        .collect();
+    out.extend((h.assets.iter()).filter(|a| a.segments != [a.object.clone()]).flat_map(|a| a.segments.clone()));
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// What [`adopt`] moved into a store, in objects and bytes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Adopted {
+    pub linked: (u64, u64),
+    pub copied: (u64, u64),
+}
+
+/// Puts `objects`, which `src` holds, into `store`: a hard link where both lie on one
+/// filesystem, so they cost no new disk (the old store checked them at admission); a copy
+/// through the store's door across filesystems. Those `store` holds already are left.
+pub fn adopt(src: &v1::Source, store: &Store, objects: &[ObjectRef]) -> Result<Adopted> {
+    let mut adopted = Adopted::default();
+    for object in objects {
+        if store.reuse(object)? {
+            continue;
+        }
+        let Some(from) = src.path(object) else {
+            return fail(Kind::NotFound, format!("v1 object {} is not in {}", object.sha256, src.root().display()));
+        };
+        let to = store.path(object)?;
+        let dir = to.parent().expect("a blob has a directory");
+        let io = |e: std::io::Error| Failure { kind: Kind::Io, detail: format!("{}: {e}", to.display()) };
+        std::fs::create_dir_all(dir).map_err(io)?;
+        match std::fs::hard_link(&from, &to) {
+            Ok(()) => {
+                std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(io)?;
+                adopted.linked = (adopted.linked.0 + 1, adopted.linked.1 + object.length);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                let file = std::fs::File::open(&from).map_err(io)?;
+                store.put(file, Some(object))?;
+                adopted.copied = (adopted.copied.0 + 1, adopted.copied.1 + object.length);
+            }
+            Err(e) => return Err(io(e)),
+        }
+    }
+    Ok(adopted)
+}
+
 /// Totals over checkpoints; an object several share counts once.
 pub fn totals(reports: &[Report]) -> Json {
+    // A checkpoint no repo names (one read from a directory) goes by its manifest.
+    let label = |r: &Report| match r.doc["names"].as_array().is_some_and(|n| !n.is_empty()) {
+        true => r.doc["names"].clone(),
+        false => json!(r.manifests.0.sha256),
+    };
     let names = |keep: &dyn Fn(&Report) -> bool| -> Vec<Json> {
-        (reports.iter().filter(|r| keep(r)))
-            .map(|r| r.doc["names"].clone())
-            .collect()
+        reports.iter().filter(|r| keep(r)).map(label).collect()
     };
     let union = |set: &dyn Fn(&Report) -> &BTreeSet<ObjectRef>| -> BTreeSet<&ObjectRef> {
         reports.iter().flat_map(|r| set(r).iter()).collect()
@@ -94,6 +153,19 @@ pub fn totals(reports: &[Report]) -> Json {
     let new: Vec<&&ObjectRef> = v2.iter().filter(|o| !v1.contains(**o)).collect();
     let sum =
         |objects: &mut dyn Iterator<Item = &ObjectRef>| objects.map(|o| o.length).sum::<u64>();
+    // What each checkpoint alone makes: new objects no other one makes too.
+    let mut makers: HashMap<&ObjectRef, usize> = HashMap::new();
+    for r in reports {
+        for o in r.v2.iter().filter(|o| !v1.contains(o)) {
+            *makers.entry(o).or_default() += 1;
+        }
+    }
+    let alone: BTreeMap<&str, u64> = (reports.iter())
+        .map(|r| {
+            let only = r.v2.iter().filter(|o| makers.get(o) == Some(&1));
+            (r.manifests.0.sha256.as_str(), only.map(|o| o.length).sum())
+        })
+        .collect();
     let per_checkpoint: u64 = reports
         .iter()
         .filter_map(|r| r.doc.get("new")?["bytes"].as_u64())
@@ -116,7 +188,7 @@ pub fn totals(reports: &[Report]) -> Json {
         "order": order,
         "v1": {"objects": v1.len(), "bytes": sum(&mut v1.iter().copied())},
         "v2": {"objects": v2.len(), "bytes": sum(&mut v2.iter().copied())},
-        "new": {"objects": new.len(), "bytes": sum(&mut new.iter().map(|o| **o)), "sum_per_checkpoint": per_checkpoint},
+        "new": {"objects": new.len(), "bytes": sum(&mut new.iter().map(|o| **o)), "sum_per_checkpoint": per_checkpoint, "alone": alone},
     })
 }
 
@@ -227,6 +299,9 @@ fn migrate(
         }
     }
     r.doc.insert("encodings".into(), json!(encodings));
+    if schemes.contains_key("nvfp4") {
+        r.doc.insert("nvfp4".into(), nvfp4_origin(&h, &mappings));
+    }
     let mut names = Names::of(&h);
     let (order_doc, expected) = ordering(&h, &names);
     r.doc.insert("order".into(), order_doc);
@@ -257,17 +332,11 @@ fn migrate(
         r.doc.insert("renames".into(), doc);
     }
     let Some(store) = store else {
-        let (mut packed, mut reused) = (0u64, 0u64);
-        let mut new = lane.manifest.length + header.length;
-        new += h.configs.iter().map(|c| c.1.len() as u64).sum::<u64>();
-        for p in all().flat_map(|(_, t)| &t.parts) {
-            match reusable(p) {
-                Some(_) => reused += 1,
-                None => (packed, new) = (packed + 1, new + p.length().next_multiple_of(ALIGN)),
-            }
-        }
-        let plan = json!({"new_bytes": new, "packed_parts": packed, "reused_parts": reused});
-        r.doc.insert("plan".into(), plan);
+        let (plan, v2) = plan(&h, &names, &mappings, &expected, &files, lane, &header)?;
+        r.v2 = v2;
+        let new: BTreeSet<ObjectRef> = r.v2.difference(&r.v1).cloned().collect();
+        r.doc
+            .extend([("plan".into(), plan), ("new".into(), count(&new))]);
         return Ok(true);
     };
     let key = format!("migrate-{}", lane.manifest.sha256);
@@ -305,13 +374,7 @@ fn migrate(
                 }
                 w.file(path, &bytes)?
             }
-            File::Split { v1, component } => {
-                let doc: Json =
-                    serde_json::from_slice(v1).or_else(|e| fail(Kind::Invalid, e.to_string()))?;
-                let bytes = serde_json_canonicalizer::to_vec(&doc[component.as_str()])
-                    .or_else(|e| fail(Kind::Invalid, e.to_string()))?;
-                w.file(path, &bytes)?
-            }
+            File::Split { v1, component } => w.file(path, &split(v1, component)?)?,
         }
     }
     let manifest = w.commit()?;
@@ -637,6 +700,159 @@ fn reusable(p: &v1::Part) -> Option<&[ObjectRef]> {
     (on_grid && p.length() >= STANDALONE).then_some(objects.as_slice())
 }
 
+/// One component's config out of v1's `model` config, as the v2 file's bytes.
+fn split(v1: &[u8], component: &str) -> Result<Vec<u8>> {
+    let doc: Json = serde_json::from_slice(v1).or_else(|e| fail(Kind::Invalid, e.to_string()))?;
+    serde_json_canonicalizer::to_vec(&doc[component])
+        .or_else(|e| fail(Kind::Invalid, e.to_string()))
+}
+
+/// What the writer would make, without writing: the v2 objects by identity, so totals count an
+/// object several checkpoints share once. A pack is its parts' v1 contents at their offsets, a
+/// re-split large part its contents' slice, a file its bytes; the header and manifest are the
+/// checkpoint's own, their lengths estimated from v1's. Reused objects are v1's.
+fn plan(
+    h: &v1::Header,
+    names: &Names,
+    mappings: &[(String, &Mapping)],
+    expected: &[(usize, usize)],
+    files: &BTreeMap<String, File>,
+    lane: &v1::Lane,
+    header: &ObjectRef,
+) -> Result<(Json, BTreeSet<ObjectRef>)> {
+    let named = |label: String, length: u64| ObjectRef {
+        sha256: hex_digest(label.as_bytes()),
+        length,
+    };
+    let mut parts = Vec::new();
+    for (c, i) in expected {
+        let (component, tensors) = &h.components[*c];
+        let t = &tensors[*i];
+        let roles = v2_parts(t, mappings[t.spec].1)?;
+        let (c2, k2) = (names.component(component), names.key(component, &t.key));
+        for (p, (role, ..)) in t.parts.iter().zip(roles) {
+            parts.push((c2.clone(), k2.clone(), role, p));
+        }
+    }
+    let items: Vec<layout::Item> = (parts.iter())
+        .map(|(component, key, role, p)| layout::Item {
+            component,
+            key,
+            role,
+            length: p.length(),
+        })
+        .collect();
+    let laid = layout::plan(&items);
+    let content = |p: &v1::Part| match &p.body {
+        v1::Body::Inline(bytes) => hex_digest(bytes),
+        v1::Body::Objects(objects) => objects.iter().map(|o| o.sha256.as_str()).collect(),
+    };
+    let (mut v2, mut packs) = (BTreeSet::new(), BTreeMap::<u64, String>::new());
+    let (mut packed, mut reused, mut inline) = (0u64, 0u64, 0u64);
+    for (i, (.., p)) in parts.iter().enumerate() {
+        let at = laid.places[i];
+        if let v1::Body::Inline(bytes) = &p.body {
+            inline += bytes.len() as u64;
+        }
+        match reusable(p) {
+            Some(objects) => {
+                reused += 1;
+                v2.extend(objects.iter().cloned());
+            }
+            None if p.length() >= STANDALONE => {
+                let mut left = p.length();
+                for slice in 0.. {
+                    if left == 0 {
+                        break;
+                    }
+                    v2.insert(named(
+                        format!("grid {slice} {}", content(p)),
+                        left.min(GRID),
+                    ));
+                    left -= left.min(GRID);
+                }
+            }
+            None if p.length() > 0 => {
+                packed += 1;
+                let pack = packs.entry(at.chunk).or_default();
+                pack.push_str(&format!("{} {} {};", at.offset, at.length, content(p)));
+            }
+            None => {}
+        }
+    }
+    for (chunk, members) in packs {
+        v2.insert(named(
+            format!("pack {members}"),
+            laid.chunks[chunk as usize],
+        ));
+    }
+    for file in files.values() {
+        v2.insert(match file {
+            File::Reuse(object) | File::Assemble { object, .. } => object.clone(),
+            File::Bytes(bytes) => ObjectRef::of(bytes),
+            File::Split { v1, component } => ObjectRef::of(&split(v1, component)?),
+        });
+    }
+    let configs: u64 = h.configs.iter().map(|c| c.1.len() as u64).sum();
+    let documents = [
+        (
+            "header",
+            header.length.saturating_sub(inline + configs) + 40 * laid.chunks.len() as u64,
+        ),
+        ("manifest", 64 + 128 * (files.len() as u64 + 1)),
+    ];
+    for (what, length) in documents {
+        v2.insert(named(format!("{what} of {}", lane.manifest.sha256), length));
+    }
+    let doc = json!({"packed_parts": packed, "reused_parts": reused, "chunks": laid.chunks.len(),
+        "documents_estimated": documents.iter().map(|d| d.1).sum::<u64>()});
+    Ok((doc, v2))
+}
+
+/// An nvfp4 checkpoint's signs of its producer. ComfyUI writes ModelOpt's names and shapes with
+/// other bytes (high nibble first, cuBLAS 128×4 block scales, its markers `<module>.comfy_quant`
+/// and `_quantization_metadata`). A block scale whose rows or columns are off cuBLAS's 128×4
+/// tiles was never padded to them: row-major, as ModelOpt writes it.
+fn nvfp4_origin(h: &v1::Header, mappings: &[(String, &Mapping)]) -> Json {
+    let lowered = |s: &str| s.to_ascii_lowercase();
+    let mut signs = BTreeSet::new();
+    for (c, tensors) in &h.components {
+        for t in tensors.iter().filter(|t| lowered(&t.key).contains("comfy")) {
+            signs.insert(format!("tensor {c}/{}", t.key));
+        }
+    }
+    for (name, bytes) in &h.configs {
+        let text = lowered(&String::from_utf8_lossy(bytes));
+        for marker in [
+            "comfy",
+            "_quantization_metadata",
+            "quantization_config",
+            "modelopt",
+        ] {
+            if text.contains(marker) {
+                signs.insert(format!("config {name}: {marker}"));
+            }
+        }
+    }
+    for a in h
+        .assets
+        .iter()
+        .filter(|a| lowered(&a.path).contains("comfy"))
+    {
+        signs.insert(format!("asset {}", a.path));
+    }
+    let (mut tensors, mut untiled) = (0u64, 0u64);
+    for t in h.components.iter().flat_map(|c| &c.1) {
+        if let (Mapping::Scheme("nvfp4", _), &[rows, cols]) =
+            (mappings[t.spec].1, t.shape.as_slice())
+        {
+            tensors += 1;
+            untiled += u64::from(rows % 128 != 0 || (cols / 16) % 4 != 0);
+        }
+    }
+    json!({"tensors": tensors, "scales_off_cublas_tiles": untiled, "signs": signs})
+}
+
 fn bytes(src: &v1::Source, p: &v1::Part) -> Result<Vec<u8>> {
     match &p.body {
         v1::Body::Inline(bytes) => Ok(bytes.clone()),
@@ -658,12 +874,14 @@ fn digest(p: &v1::Part, b: &[u8]) -> String {
     }
 }
 
-/// The scheme's complete encoding.
-fn encoding(scheme: &str) -> Encoding {
+/// `t`'s complete encoding under `scheme`: every scale keeps the dtype v1 stored it in.
+fn encoding(t: &v1::Tensor, scheme: &str) -> Encoding {
+    let scale = |role: &str| t.parts.iter().find(|p| p.role == role).map_or(Dtype::F32, |p| p.dtype.clone());
     match scheme {
-        "fp8.rowwise" => Encoding::fp8_rowwise(0, &Dtype::F32),
-        "fp8.tensorwise" => Encoding::fp8_tensorwise(&Dtype::F32),
-        "int8.convrot" => Encoding::int8_convrot(256, &Dtype::F32),
+        "fp8.rowwise" => Encoding::fp8_rowwise(0, &scale("scale")),
+        "fp8.tensorwise" => Encoding::fp8_tensorwise(&scale("weight_scale")),
+        "int8.convrot" => Encoding::int8_convrot(256, &scale("scale")),
+        "mxfp8" => Encoding::mxfp8(ScaleLayout::RowMajor),
         // v1's nvfp4 is ModelOpt's layout: its border never took ComfyUI's.
         "nvfp4" => Encoding::nvfp4(GlobalScale::Multiply, NibbleOrder::LowFirst, ScaleLayout::RowMajor),
         other => unreachable!("v1 maps to no {other}"),
@@ -697,6 +915,10 @@ fn v2_parts(t: &v1::Tensor, mapping: &Mapping) -> Result<Vec<(String, Dtype, Vec
                     }
                     ("nvfp4", "weight", _) => {
                         fail(Kind::Invalid, format!("{what}: nvfp4 weight {:?}", p.shape))
+                    }
+                    // The early mxfp8 stored its E8M0 scales as U8: the same bytes.
+                    ("mxfp8", "scale", _) if p.dtype == Dtype::U8 => {
+                        Ok((role.to_string(), Dtype::F8_E8M0, p.shape.clone()))
                     }
                     _ => Ok((role.to_string(), p.dtype.clone(), p.shape.clone())),
                 }
@@ -738,16 +960,20 @@ fn conforms(
     match scheme {
         "fp8.rowwise" => {
             want("weight", &fp8, &|s| s == logical)?;
-            want("scale", &[F32], &|s| numel(s) == rows)
+            want("scale", &[F32, BF16, F16], &|s| numel(s) == rows)
         }
         "fp8.tensorwise" => {
             want("weight", &fp8, &|s| s == logical)?;
-            want("scale", &[F32], &|s| numel(s) == 1)?;
+            want("scale", &[F32, BF16, F16], &|s| numel(s) == 1)?;
             optional("input_scale")
         }
         "int8.convrot" if cols % 256 == 0 => {
             want("weight", &[I8], &|s| s == logical)?;
-            want("scale", &[F32], &|s| numel(s) == rows)
+            want("scale", &[F32, BF16, F16], &|s| numel(s) == rows)
+        }
+        "mxfp8" => {
+            want("weight", &fp8, &|s| s == logical)?;
+            want("scale", &[F8_E8M0], &|s| s == [rows, cols.div_ceil(32)])
         }
         "nvfp4" if cols % 16 == 0 => {
             want("weight", &[F4], &|s| s == [rows, cols])?;
@@ -799,7 +1025,7 @@ fn put(
     }
     let data = match mapping {
         Mapping::Scheme(scheme, _) => Data::Encoded {
-            encoding: encoding(scheme),
+            encoding: encoding(t, scheme),
             parts,
         },
         _ => Data::Plain(parts.pop().expect("a plain tensor has one part").data),
@@ -927,7 +1153,7 @@ fn verify(
             let stored: Vec<(&str, &Dtype, &[u64], Location)> = match (&t2.body, mapping) {
                 (Body::Data(at), Mapping::Plain) => vec![("", &t2.dtype, &t2.shape, *at)],
                 (Body::Encoded { encoding: e, parts }, Mapping::Scheme(s, _))
-                    if *e == encoding(s) && parts.len() == t.parts.len() =>
+                    if *e == encoding(t, s) && parts.len() == t.parts.len() =>
                 {
                     (parts.iter())
                         .map(|p| (p.role.as_str(), &p.dtype, p.shape.as_slice(), p.at()))

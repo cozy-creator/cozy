@@ -55,6 +55,9 @@ pub struct Grant {
     pub home: Home,
 }
 
+/// A machine root's own TensorFS store.
+const STORE: &str = "var/lib/tensorfs";
+
 /// The image's filesystem, rooted: "/" on a pod, a directory on an owned machine. The paths
 /// preserve the machine's identity across software updates.
 #[derive(Clone, Debug)]
@@ -76,9 +79,13 @@ impl Layout {
             root: root.into(),
             bootstrap: root.join("run/cozy/bootstrap"),
             state: root.join("var/lib/cozy/machine"),
-            store: store.unwrap_or_else(|| root.join("var/lib/tensorfs")),
+            store: store.unwrap_or_else(|| root.join(STORE)),
             cache: None,
         }
+    }
+    /// Whether the store is this root's own, not one an operator named elsewhere (and may share).
+    pub fn own_store(&self) -> bool {
+        self.store == self.root.join(STORE)
     }
     /// This service's execution journal and package generations.
     pub fn engine(&self) -> PathBuf {
