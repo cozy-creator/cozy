@@ -1,6 +1,6 @@
 """`tensorfs._ext`, checked against the built extension by `scripts/stub_conform.py`."""
 
-from collections.abc import Buffer, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
+from collections.abc import Buffer, Callable, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
 from os import PathLike
 from types import ModuleType
 from typing import Any, Protocol, TypeVar, overload
@@ -187,6 +187,15 @@ class Component:
 class Checkpoint:
     """One cozytensors read from a store, or only its header (`parse`)."""
 
+    def close(self) -> None:
+        """Release this handle's access and cached components; existing child handles remain usable."""
+    def __enter__(self) -> Checkpoint: ...
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None: ...
+    def verify(self) -> list[tuple[str, int]]:
+        """Hash locally available header, chunks and assets; report missing or corrupt objects."""
+    def open_chunk(self, index: int) -> int:
+        """A new read-only OS descriptor owned and closed by the caller."""
+
     @staticmethod
     def parse(header: bytes) -> Checkpoint:
         """A `cozytensors/1` header's pipeline, components and metadata, with no store: component reads,
@@ -227,7 +236,8 @@ class Checkpoint:
     def metadata(self) -> dict[str, Any]: ...
     def missing(self, components: Sequence[str] | None = None) -> list[tuple[str, int]]:
         """The chunks and assets of `components` (all when None) not here."""
-    def fetch(self, components: Sequence[str] | None = None, *, priority: int = 0, progress: Any = None) -> None: ...
+    def fetch(self, components: Sequence[str] | None = None, *, priority: int = 0,
+              progress: Callable[[str, int, int], object] | None = None) -> None: ...
 
 class ComponentWriter:
     @property

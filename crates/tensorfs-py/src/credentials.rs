@@ -1,6 +1,6 @@
 //! Python providers delegate transport and DPoP to the shared Rust client.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
@@ -124,14 +124,21 @@ impl PyEndpoint {
     }
 
     fn update_repo<'py>(&self, py: Python<'py>, repo_id: &str, change: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
-        let repo = py.detach(|| fetch::runtime()?.block_on(self.endpoint.update_repo(repo_id, |old| {
+        let callback_error = Mutex::new(None);
+        let result = py.detach(|| fetch::runtime()?.block_on(self.endpoint.update_repo(repo_id, |old| {
             Python::attach(|py| -> PyResult<Option<Repo>> {
                 let old = serde_json::to_value(old).expect("Repo is serializable");
                 let next = change.bind(py).call1((config_to_py(py, &old)?,))?;
                 if next.is_none() { return Ok(None); }
-                serde_json::from_value(config_from_py(&next)?).map(Some).map_err(|_| pyo3::exceptions::PyValueError::new_err("change returned an invalid repo document"))
-            }).map_err(failed)
-        }))).or_raise(py)?;
+                serde_json::from_value(config_from_py(&next)?).map(Some).map_err(|_| crate::errors::raise(py, tensorfs_core::failure::Failure {
+                    kind: tensorfs_core::failure::Kind::Invalid, detail: "change returned an invalid repo document".into() }))
+            }).map_err(|error| {
+                *callback_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                Refusal { code: Code::UNKNOWN_FORMAT, detail: "the repository change callback failed".into() }
+            })
+        })));
+        if let Some(error) = callback_error.into_inner().unwrap_or_else(|e| e.into_inner()) { return Err(error); }
+        let repo = result.or_raise(py)?;
         config_to_py(py, &serde_json::to_value(repo).expect("Repo is serializable"))
     }
 }
