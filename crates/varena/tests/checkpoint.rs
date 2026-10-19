@@ -225,12 +225,26 @@ fn a_window_gets_the_regions_the_full_call_gives_its_tensors() {
 
 #[test]
 fn a_seal_logs_its_disk_copy() {
+    // The copy log is process-global; isolate this operation from parallel tests.
+    if std::env::var_os("VARENA_COPY_LOG_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "a_seal_logs_its_disk_copy", "--nocapture"])
+            .env("VARENA_COPY_LOG_CHILD", "1").status().unwrap();
+        assert!(status.success());
+        return;
+    }
     let fx = Fixture::new("logged");
     let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
+    varena::ceiling::take();
     memory::seal(&fx.ck, &rs, "logged", 2, None).unwrap();
-    let all: u64 = TENSORS.iter().map(|t| t.2 as u64).sum();
+    let mut expected = rs.iter().map(|names| names.iter().map(|name| {
+        TENSORS.iter().find(|(c, k, _)| format!("{c}/{k}") == *name).unwrap().2 as u64
+    }).sum::<u64>()).filter(|bytes| *bytes > 0).collect::<Vec<_>>();
     let copies = varena::ceiling::take();
-    assert!(copies.iter().any(|c| c.kind == "disk" && c.bytes == all && c.ns > 0), "{copies:?}");
+    assert!(copies.iter().all(|c| c.kind == "disk" && c.ns > 0), "{copies:?}");
+    let mut observed = copies.iter().map(|c| c.bytes).collect::<Vec<_>>();
+    expected.sort_unstable(); observed.sort_unstable();
+    assert_eq!(observed, expected, "each region's exact payload bytes are measured once");
 }
 
 /// On a GPU only: `give` takes a slot of a set in use that no bound block holds, never a bound
@@ -281,10 +295,20 @@ fn tensorfs_source_context_lives_until_the_last_bound_region_drops() {
     });
     let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
     let set = Host.register("owned", view, &rs, None, None).unwrap();
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(calls.load(Ordering::Relaxed), 0, "registration fetched payload bytes");
     let pin = set.bind(0).unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
     drop(set);
     assert!(weak.upgrade().is_some(), "bound region lost its source context");
     drop(pin);
     assert!(weak.upgrade().is_none(), "released placement retained its source context");
+}
+
+#[test]
+fn a_sealed_host_layout_binds_without_fetching_its_cold_stored_source() {
+    let fx = Fixture::new("sealed-cold-source");
+    let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
+    let fd = memory::seal(&fx.ck, &rs, "ready", 2, None).unwrap();
+    let view = View::from(&fx.ck).with_fetch(|_| panic!("sealed host bytes must not fetch their cold source"));
+    check(&Host.register("sealed", view, &rs, Some(fd.as_raw_fd()), None).unwrap());
 }

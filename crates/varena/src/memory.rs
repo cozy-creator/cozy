@@ -1367,10 +1367,10 @@ pub struct HostPinned {
 /// host layout holds, the same by construction.
 #[cfg(feature = "store")]
 fn open_checkpoint(view: &View, regions: &[Vec<String>], direct_io: bool, files: Option<Vec<(ObjectRef, File)>>) -> Result<(Layout, Source)> {
-    let (plan, chunks) = view.plan(regions)?;
+    let (plan, _) = view.plan(regions)?;
     let source = match files {
         Some(files) => Source::files(files, direct_io, 0),
-        None if view.has_source() => Source::checkpoint(view, &chunks, direct_io)?,
+        None if view.has_source() => Source::checkpoint(view, direct_io),
         None => Source::files(Vec::new(), direct_io, 0),
     };
     Ok((Layout::build(&plan, regions)?, source))

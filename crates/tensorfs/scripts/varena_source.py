@@ -40,13 +40,14 @@ with tempfile.TemporaryDirectory() as temp:
         assert checkpoint.missing(), "fixture must begin with cold chunk bytes"
         before = provider.calls
         weights = varena.Host().register("cold", checkpoint, [["model/weight"]])
-        assert provider.calls > before, "placement did not use TensorFS's real HTTP provider"
-        assert not checkpoint.missing(), "selected chunk was not fetched"
+        assert provider.calls == before, "registration fetched payload bytes"
+        assert checkpoint.missing(), "registration must remain metadata-only"
         checkpoint.close()
         del provider, checkpoint
         gc.collect()
         assert alive() is not None, "placement lost its retained source context"
         pin = weights.bind(0)
+        assert alive().calls > before, "binding did not use TensorFS's real HTTP provider"
         part = weights.parts[0]
         assert ctypes.string_at(pin.ptr + part.offset, part.nbytes) == b"data"
         weights.close()

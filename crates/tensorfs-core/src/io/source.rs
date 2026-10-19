@@ -69,7 +69,7 @@ pub struct Source {
     #[cfg(feature = "store")]
     store: Option<Arc<Store>>,
     #[cfg(feature = "store")]
-    _view: Option<super::view::View>,
+    view: Option<super::view::View>,
     files: Mutex<HashMap<String, Arc<File>>>,
     direct_io: bool,
 }
@@ -87,7 +87,7 @@ impl Source {
             lease: RwLock::new(Some(lease)),
             meta: Some(meta),
             store: Some(store),
-            _view: None,
+            view: None,
             files: Mutex::default(),
             direct_io,
         }
@@ -102,7 +102,7 @@ impl Source {
             #[cfg(feature = "store")]
             store: None,
             #[cfg(feature = "store")]
-            _view: None,
+            view: None,
             files: Mutex::new(
                 files
                     .into_iter()
@@ -113,16 +113,34 @@ impl Source {
         }
     }
 
-    /// Retain the checkpoint source and callbacks together with the opened chunk descriptors.
+    /// Retain metadata and the source context. No chunk opens or downloads until a read.
     #[cfg(feature = "store")]
-    pub fn checkpoint(
-        view: &super::view::View,
-        chunks: &[usize],
-        direct_io: bool,
-    ) -> Result<Source> {
-        let mut source = Self::files(view.files(chunks)?, direct_io, 0);
-        source._view = Some(view.clone());
-        Ok(source)
+    pub fn checkpoint(view: &super::view::View, direct_io: bool) -> Source {
+        let mut source = Self::files(Vec::new(), direct_io, 0);
+        source.view = Some(view.clone());
+        source
+    }
+
+    #[cfg(feature = "store")]
+    fn load(&self, objects: &[ObjectRef]) -> Result<()> {
+        if let Some(view) = &self.view {
+            let missing = {
+                let files = self.files.lock().unwrap();
+                objects
+                    .iter()
+                    .filter(|o| !files.contains_key(&o.sha256))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            if !missing.is_empty() {
+                let opened = view.files_for(&missing)?;
+                self.files
+                    .lock()
+                    .unwrap()
+                    .extend(opened.into_iter().map(|(o, f)| (o.sha256, Arc::new(f))));
+            }
+        }
+        Ok(())
     }
 
     fn file(&self, object: &ObjectRef) -> Result<Arc<File>> {
@@ -163,11 +181,13 @@ impl Source {
     }
 
     pub fn resident(&self, obj: &ObjectRef, _tally: &IoTally) -> Result<bool> {
+        #[cfg(feature = "store")]
+        self.load(std::slice::from_ref(obj))?;
         let file = self.file(obj)?;
         Ok(platform::durable::cached(&file, 0, obj.length).unwrap_or(false))
     }
 
-    /// Transfer a placement range. Padding is zeroed by its allocator and does not carry data.
+    /// Transfer a placement range. Uncovered padding is zeroed through the same engine.
     ///
     /// # Safety
     /// `dst` is exclusively writable for its length; the selected item ranges lie inside it.
@@ -182,6 +202,55 @@ impl Source {
     ) -> Result<ReadStats> {
         #[cfg(feature = "store")]
         let lease = self.lease.read().unwrap();
+        let mut intervals = items
+            .iter()
+            .map(|item| {
+                let start = item
+                    .offset
+                    .checked_sub(origin)
+                    .ok_or_else(|| invalid("item begins before destination"))?;
+                let end = start
+                    .checked_add(item.len)
+                    .ok_or_else(|| invalid("item range overflows"))?;
+                if end > dst.len() as u64 {
+                    return Err(invalid("item exceeds destination"));
+                }
+                Ok((start, end))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        intervals.sort_unstable();
+        let mut gaps = Vec::new();
+        let mut cursor = 0;
+        for (start, end) in intervals {
+            if start == end {
+                continue;
+            }
+            if start < cursor {
+                return Err(invalid("placement items overlap"));
+            }
+            if start > cursor {
+                gaps.push((cursor, start - cursor));
+            }
+            cursor = end;
+        }
+        if cursor < dst.len() as u64 {
+            gaps.push((cursor, dst.len() as u64 - cursor));
+        }
+        #[cfg(feature = "store")]
+        {
+            let wanted = items
+                .iter()
+                .filter_map(|item| match &item.source {
+                    ItemSource::Object(range) => {
+                        Some((range.obj.sha256.clone(), range.obj.clone()))
+                    }
+                    ItemSource::Inline(_) => None,
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into_values()
+                .collect::<Vec<_>>();
+            self.load(&wanted)?;
+        }
         let mut files = HashMap::new();
         for item in items {
             if let ItemSource::Object(range) = &item.source {
@@ -230,13 +299,20 @@ impl Source {
                 dst: dst.slice(offset as usize, item.len as usize),
             });
         }
+        for (start, len) in gaps {
+            copies.push(Copy {
+                src: Src::Zero,
+                dst: dst.slice(start as usize, len as usize),
+            });
+        }
         let opts = ReadOpts {
             threads,
             direct: self.direct_io && mode == Mode::Cache,
             ..ReadOpts::default()
         };
         // SAFETY: item ranges and destination bounds checked above; caller supplies exclusivity.
-        let stats = unsafe { super::read(&copies, &opts) }?;
+        let mut stats = unsafe { super::read(&copies, &opts) }?;
+        stats.bytes = items.iter().map(|item| item.len).sum();
         tally.direct_bytes.fetch_add(stats.direct, Relaxed);
         tally.inline_bytes.fetch_add(inline, Relaxed);
         if mode == Mode::Buffered {

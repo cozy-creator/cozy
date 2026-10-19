@@ -1,5 +1,6 @@
 //! Stored byte descriptions for placement callers. Header details and chunk opens stay here.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::sync::Arc;
 
@@ -13,7 +14,8 @@ type Fetch = dyn Fn(&[crate::format::ObjectRef]) -> Result<()> + Send + Sync;
 
 #[derive(Clone)]
 pub struct View {
-    header: Header,
+    header: Arc<Header>,
+    chunks: Arc<BTreeMap<String, (u64, usize)>>,
     stored: Option<Checkpoint>,
     fetch: Option<Arc<Fetch>>,
 }
@@ -28,21 +30,28 @@ pub struct Part {
 
 impl From<&Checkpoint> for View {
     fn from(checkpoint: &Checkpoint) -> View {
-        View {
-            header: checkpoint.header().clone(),
-            stored: Some(checkpoint.clone()),
-            fetch: None,
-        }
+        View::new(checkpoint.header().clone(), Some(checkpoint.clone()))
     }
 }
 
 impl View {
-    pub fn parsed(header: Header) -> View {
-        View {
-            header,
-            stored: None,
+    fn new(header: Header, stored: Option<Checkpoint>) -> Self {
+        let chunks = header
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.sha256.clone(), (c.length, i)))
+            .collect();
+        Self {
+            header: Arc::new(header),
+            chunks: Arc::new(chunks),
+            stored,
             fetch: None,
         }
+    }
+
+    pub fn parsed(header: Header) -> View {
+        Self::new(header, None)
     }
 
     /// Keep the source context and use its one downloader for the selected chunks.
@@ -122,6 +131,23 @@ impl View {
             },
             chunks,
         ))
+    }
+
+    pub fn files_for(&self, objects: &[ObjectRef]) -> Result<Vec<(ObjectRef, File)>> {
+        let indices = objects
+            .iter()
+            .map(|object| {
+                self.chunks
+                    .get(&object.sha256)
+                    .filter(|(length, _)| *length == object.length)
+                    .map(|(_, index)| *index)
+                    .ok_or_else(|| crate::failure::Failure {
+                        kind: Kind::Invalid,
+                        detail: format!("{}: not a checkpoint chunk", object.sha256),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.files(&indices)
     }
 
     pub fn files(&self, chunks: &[usize]) -> Result<Vec<(ObjectRef, File)>> {
