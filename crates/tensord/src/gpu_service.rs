@@ -3869,6 +3869,11 @@ fn await_pending_exit(engine: &Arc<Engine>, pending: &crate::journal::PendingCom
                 }
             }
         }
+        // A birth can exit before watch_process opens its handle (which then needs no
+        // watcher). Re-read after registration so that exit cannot be a lost wake.
+        if pending.exited().is_ok_and(|exited| exited) {
+            continue;
+        }
         engine.wait_activity(epoch, None);
     }
 }

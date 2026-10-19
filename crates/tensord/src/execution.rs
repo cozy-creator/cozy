@@ -1465,7 +1465,19 @@ mod tests {
             relative_path: "answer".into(), asset_ref: "attempt:run/file/0".into(),
             media_type: "text/plain".into(), length: 9,
         };
-        let result = engine.managed_result_record(&id, &spool.0, serde_json::json!({"answer": 42}), vec![binding], vec![]).unwrap();
+        let member = b"tree kept";
+        let sha = tensorfs_core::sha256::hex_digest(member);
+        fs::write(spool.0.join(format!("sha256-{sha}")), member).unwrap();
+        let manifest = serde_json::to_vec(&serde_json::json!({"entries": [
+            {"path": "member.txt", "blob": {"sha256": sha, "length": member.len()}}
+        ]})).unwrap();
+        fs::write(spool.0.join("tree-manifest"), &manifest).unwrap();
+        let tree = crate::journal::AssetBinding {
+            relative_path: "tree-manifest".into(), asset_ref: "attempt:run/tree/0".into(),
+            media_type: crate::gpu_service::TREE_MEDIA.into(), length: manifest.len() as u64,
+        };
+        let result = engine.managed_result_record(&id, &spool.0, serde_json::json!({"answer": 42}), vec![binding, tree], vec![]).unwrap();
+        let held = result.artifacts.clone();
         let held_path = result.artifacts[0].path.clone();
         engine.defer_completion(&id, Outcome::Completed(result), births).unwrap();
         drop(spool);
@@ -1475,6 +1487,23 @@ mod tests {
         assert!(running.result.is_none());
         assert!(running.pending_completion.is_some());
         assert_eq!(engine.nonterminal(10).unwrap().len(), 1);
+        assert!(engine.open_result(&id, 0).is_err());
+        assert!(engine.journal.lock().unwrap().acknowledge_collection(&id).is_err());
+        // GC protects the whole uncollected result directory, including tree members, even
+        // before the normal terminal/public product roots have been materialized.
+        let catalog = crate::catalog::Catalog::new(&root.join("generations")).unwrap();
+        let bound = HashSet::new();
+        let disk = || Ok(crate::reclaim::Disk { capacity: 1 << 30, available: 0, inodes: 0, available_inodes: 0 });
+        let swept = crate::reclaim::sweep(&crate::reclaim::Caches {
+            engine: &engine, catalog: &catalog, bound: &bound, kernels: None, memo: None,
+            uv_cache: None, store: None, disk: &disk,
+        }).unwrap();
+        assert_eq!(swept.results, 0);
+        assert_eq!(held.len(), 3);
+        for artifact in &held {
+            let bytes = fs::read(root.join(&artifact.path)).unwrap();
+            assert_eq!(tensorfs_core::sha256::hex_digest(&bytes), artifact.sha256);
+        }
 
         let restarted = Engine::open(&root).unwrap();
         assert_eq!(restarted.reconcile().unwrap().len(), 1);
@@ -1493,6 +1522,11 @@ mod tests {
         assert!(finished.pending_completion.is_none());
         assert_eq!(finished.result.as_ref().unwrap().value, serde_json::json!({"answer": 42}));
         assert_eq!(finished.result.as_ref().unwrap().artifacts[0].path, held_path);
+        assert_eq!(finished.result.as_ref().unwrap().asset_bindings.len(), 2);
+        for artifact in &finished.result.as_ref().unwrap().artifacts {
+            let bytes = fs::read(root.join(&artifact.path)).unwrap();
+            assert_eq!(tensorfs_core::sha256::hex_digest(&bytes), artifact.sha256);
+        }
         let mut bytes = Vec::new();
         restarted.open_result(&id, 0).unwrap().read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"kept once");
