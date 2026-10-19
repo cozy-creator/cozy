@@ -1,14 +1,17 @@
-//! Import: sources become one canonical model (normalize at ingest).
+//! Convert: sources become one canonical model in the D10 layout (normalize at ingest).
 //!
 //! 1. List and pin each source, and select what the model is built from (`remote`).
 //! 2. Download remote members into `<tmp>/import/<id>/`, never the store; resumable, since
-//!    `<id>` is the pinned selection's digest, and locked (`<id>.lock`) while one import uses it.
-//!    Local members are read where they are.
+//!    `<id>` is the pinned selection's digest, and locked (`<id>.lock`) while one convert uses
+//!    it. Local members are read where they are.
 //! 3. Fold quantized carriers into encoded tensors, by their producer's declaration
 //!    (`carriers`). Recognize from safetensors headers alone: a built-in table claims a group
 //!    when its key set is the table's (`engine`). Unclaimed groups are stored as they are.
-//! 4. Convert row by row into the [`Sink`], with the configs and tokenizers (the table's
-//!    pinned reference supplies them when the source has none), then delete the tmp area.
+//! 4. Map every other file ([`layout`]): `model_index.json` becomes the pipeline, a component's
+//!    config its structured config, the other run files in its folder its assets; README,
+//!    LICENSE, images, code and docs stay repo files. A table's pinned reference supplies the
+//!    configs and tokenizers the source lacks (recorded as `filled`).
+//! 5. Convert row by row into the [`Sink`], then delete the tmp area.
 //!
 //! A GGUF file is one component of its own (`gguf`).
 
@@ -24,8 +27,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::err::{refuse, Code, Result};
-use crate::format::{Dtype, Encoding};
+use crate::err::{refuse, Code, Refusal, Result};
+use crate::format::{Config, ConfigValue, Dtype, Encoding, Metadata, Pipeline, Value, CONFIG_FILE};
 
 pub use engine::{tables, Table};
 pub use order::{constructor_order, Ordered};
@@ -40,8 +43,11 @@ pub struct Part<'a> {
     pub data: &'a mut dyn Read,
 }
 
-/// Where an import's output goes: the writer, or anything that takes tensors and files.
+/// Where a convert's output goes: the writer, or anything that takes a D10 model.
 pub trait Sink {
+    /// The variant ([`main_variant`]), the pipeline, each component's class, config and assets,
+    /// and the repo files; before any tensor.
+    fn begin(&mut self, variant: &str, layout: &Layout) -> Result<()>;
     /// One tensor: plain (no encoding, one part) or encoded (its parts in order).
     fn put(
         &mut self,
@@ -52,10 +58,50 @@ pub trait Sink {
         encoding: Option<&Encoding>,
         parts: Vec<Part>,
     ) -> Result<()>;
-    fn file(&mut self, path: &str, bytes: &[u8]) -> Result<()>;
-    fn commit(&mut self, imported: &Imported) -> Result<()>;
+    /// Commits with the header's loading metadata ([`Imported::metadata`]).
+    fn commit(&mut self, metadata: Metadata) -> Result<()>;
 }
 
+/// What a component's folder held besides weights.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Folder {
+    pub name: String,
+    /// `<library>.<Class>`, `""` when unknown.
+    pub class: String,
+    pub config: Config,
+    /// The config's file name when it isn't `config.json`.
+    pub config_file: Option<String>,
+    /// Run files by path relative to the folder, byte-exact.
+    pub assets: BTreeMap<String, Vec<u8>>,
+}
+
+/// A source's non-weight files in the D10 layout.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Layout {
+    pub pipeline: Option<Pipeline>,
+    /// Header order: components with tensors in construction order, then the rest by name.
+    pub components: Vec<Folder>,
+    /// Repo files by path, byte-exact; never inside the cozytensors.
+    pub files: BTreeMap<String, Vec<u8>>,
+}
+
+/// What `model_index.json` holds: the pipeline.
+pub const PIPELINE_FILE: &str = "model_index.json";
+/// The component of a model without a pipeline, whose folder is the root.
+pub const ROOT_COMPONENT: &str = "model";
+/// A folder's config file: the first of these it holds.
+const CONFIGS: [&str; 5] = [
+    CONFIG_FILE,
+    "scheduler_config.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "tokenizer_config.json",
+];
+
+/// Header metadata: the pinned source (a list when there are several).
+pub const SOURCE: &str = "source";
+/// Header metadata: run data a pinned reference supplied, `{from, files, note}`.
+pub const FILLED: &str = "filled";
 /// The header metadata key of each component's source safetensors `__metadata__`
 /// (`{component: {key: value}}`), which export writes back.
 pub const FILE_METADATA: &str = "safetensors_metadata";
@@ -63,7 +109,7 @@ pub const FILE_METADATA: &str = "safetensors_metadata";
 /// `__metadata__` keys that declare a quantized carrier, which the encodings now state.
 const DECLARATIONS: [&str; 2] = ["_quantization_metadata", "quantization_config"];
 
-/// What the model records about its import.
+/// What a convert reports; the header's metadata comes from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Imported {
     /// Every key is canonical: converted by a table, or the source's own Diffusers or
@@ -72,8 +118,42 @@ pub struct Imported {
     pub converters: Vec<String>,
     /// The pinned sources.
     pub sources: Vec<String>,
+    /// Each pinned reference that supplied run data the source lacks, with the paths.
+    pub filled: Vec<(String, Vec<String>)>,
     /// Each component's source safetensors `__metadata__` (LoRA training fields, `format`, …).
     pub file_metadata: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl Imported {
+    /// The header's loading metadata: `source`, `filled` and each component's `__metadata__`.
+    pub fn metadata(&self) -> Metadata {
+        let text = |s: &str| Value::Str(s.to_owned());
+        let texts = |l: &[String]| Value::List(l.iter().map(|s| text(s)).collect());
+        let one = |mut l: Vec<Value>| match l.len() {
+            1 => l.remove(0),
+            _ => Value::List(l),
+        };
+        let mut out = Metadata::new();
+        out.insert(SOURCE.into(), one(self.sources.iter().map(|s| text(s)).collect()));
+        let filled = (self.filled.iter()).map(|(from, files)| {
+            Value::Map(BTreeMap::from([
+                ("from".to_owned(), text(from)),
+                ("files".to_owned(), texts(files)),
+                ("note".to_owned(), text("run data the source lacks, from a pinned reference")),
+            ]))
+        });
+        if !self.filled.is_empty() {
+            out.insert(FILLED.into(), one(filled.collect()));
+        }
+        if !self.file_metadata.is_empty() {
+            let strings = |m: &BTreeMap<String, String>| {
+                Value::Map(m.iter().map(|(k, v)| (k.clone(), text(v))).collect())
+            };
+            let by_component = (self.file_metadata.iter()).map(|(c, m)| (c.clone(), strings(m)));
+            out.insert(FILE_METADATA.into(), Value::Map(by_component.collect()));
+        }
+        out
+    }
 }
 
 pub struct Request<'a> {
@@ -131,19 +211,49 @@ fn name(path: &str) -> &str {
     path.rsplit_once('/').map_or(path, |(_, n)| n)
 }
 
+fn join(folder: &str, path: &str) -> String {
+    match folder {
+        "" => path.to_owned(),
+        f => format!("{f}/{path}"),
+    }
+}
+
 fn is_gguf(path: &str) -> bool {
     path.to_ascii_lowercase().ends_with(".gguf")
 }
 
-/// Adds the configs, tokenizers and license at the root of the repository a GGUF names as its
-/// source to `files`, in the GGUF's folder `into`, where the source has none; the pinned reference.
+/// Lands `docs` (a pinned reference's) and adds each at `into/<path>` where `files` has none;
+/// the paths added.
+fn fill(
+    docs: &[remote::Member],
+    into: &str,
+    area: &Path,
+    req: &Request,
+    files: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<String>> {
+    let mut added = Vec::new();
+    for (path, local) in land(docs, area, req.access, req.progress)? {
+        let path = join(into, &path);
+        if !files.contains_key(&path) {
+            let bytes = std::fs::read(&local)
+                .map_err(|e| crate::err::classify_io(format!("read {path}"), e))?;
+            files.insert(path.clone(), bytes);
+            added.push(path);
+        }
+    }
+    Ok(added)
+}
+
+/// The configs, tokenizers and license at the root of the repository a GGUF names as its
+/// source, added in the GGUF's folder `into` where the source has none: the pinned reference
+/// and the paths added.
 fn gguf_documents(
     reference: &str,
     into: &str,
     req: &Request,
     area: &Path,
     files: &mut BTreeMap<String, Vec<u8>>,
-) -> Result<String> {
+) -> Result<(String, Vec<String>)> {
     let listing = remote::list(&remote::parse(reference)?, req.access)?;
     let pin = listing.pinned.clone();
     let read = |m: &remote::Member| remote::read_small(m, req.access);
@@ -151,29 +261,23 @@ fn gguf_documents(
         .into_iter()
         .filter(|m| !remote::weights(&m.path) && folder(&m.path).is_empty())
         .collect();
-    let area = area.join("gguf-reference");
-    for (path, local) in land(&docs, &area, req.access, req.progress)? {
-        let bytes = std::fs::read(&local)
-            .map_err(|e| crate::err::classify_io(format!("read {path}"), e))?;
-        let path = match into {
-            "" => path,
-            f => format!("{f}/{path}"),
-        };
-        files.entry(path).or_insert(bytes);
-    }
-    Ok(pin)
+    let added = fill(&docs, into, &area.join("gguf-reference"), req, files)?;
+    Ok((pin, added))
 }
 
 /// The model's files: every non-weight file of the source, byte-exact at its path, except a
 /// converted folder's `config.json` (the foreign layout's); each table's reference (its index,
-/// the produced components' configs and the asset folders); the tables' inline files.
+/// the produced components' configs and the asset folders) where the source has none; the
+/// tables' inline files. With each reference that filled some, and the paths.
+type Documents = (BTreeMap<String, Vec<u8>>, Vec<(String, Vec<String>)>);
+
 fn documents(
     set: &source::SourceSet,
     recognized: &engine::Recognized,
     planned: &[engine::Planned],
     req: &Request,
     area: &Path,
-) -> Result<BTreeMap<String, Vec<u8>>> {
+) -> Result<Documents> {
     let tables = tables();
     let converted: Vec<&str> = recognized
         .claims
@@ -192,16 +296,18 @@ fn documents(
         .collect();
     let mut files = BTreeMap::new();
     for p in &set.plain {
-        let foreign = converted.contains(&folder(&p.path)) && name(&p.path) == "config.json";
+        let foreign = converted.contains(&folder(&p.path)) && name(&p.path) == CONFIG_FILE;
         if !raw.contains(&p.file) && !foreign && !is_gguf(&p.path) {
             files.insert(p.path.clone(), set.read_plain(p)?);
         }
     }
     let produced: Vec<&str> = planned.iter().map(|p| p.component.as_str()).collect();
+    let mut filled = Vec::new();
     for t in &recognized.tables {
         let table = &tables[*t];
         if let Some(reference) = &table.reference {
             let listing = remote::list(&remote::parse(reference)?, req.access)?;
+            let pin = listing.pinned.clone();
             let read = |m: &remote::Member| remote::read_small(m, req.access);
             let selected = remote::select(listing, None, remote::Files::Configs, &read)?;
             let weighted: Vec<&str> = selected
@@ -218,20 +324,149 @@ fn documents(
                 })
                 .cloned()
                 .collect();
-            for (path, local) in land(&docs, &area.join("reference"), req.access, req.progress)? {
-                let bytes = std::fs::read(&local)
-                    .map_err(|e| crate::err::classify_io(format!("read {path}"), e))?;
-                files.entry(path).or_insert(bytes);
+            let added = fill(&docs, "", &area.join("reference"), req, &mut files)?;
+            if !added.is_empty() {
+                filled.push((pin, added));
             }
         }
         for (path, doc) in &table.files {
             files.insert(path.clone(), serde_json::to_vec(doc).expect("a JSON value"));
         }
     }
-    Ok(files)
+    Ok((files, filled))
 }
 
-pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
+/// Maps a source's non-weight `files` to D10 for the components `tensored` (in construction
+/// order):
+/// - `model_index.json` is the pipeline: class `diffusers.<_class_name>`, config the parsed JSON.
+///   Each entry `name: [library, Class]` is a component in folder `name`, tensors or not
+///   (schedulers, tokenizers, processors), of class `<library>.<Class>`.
+/// - Without one, a component named [`ROOT_COMPONENT`] owns the root (a Transformers folder).
+/// - In a component's folder, the first of [`CONFIGS`] is its config, and the other run files
+///   ([`run_data`]) its assets. Its class is otherwise its config's: `architectures[0]`
+///   (Transformers), `_class_name` (Diffusers), a tokenizer config's `tokenizer_class`.
+/// - Every other file is a repo file. A component with no tensors, config or assets is none.
+pub fn layout(mut files: BTreeMap<String, Vec<u8>>, tensored: &[String]) -> Result<Layout> {
+    let pipeline = match files.remove(PIPELINE_FILE) {
+        Some(bytes) => {
+            let config = parse_config(PIPELINE_FILE, &bytes)?;
+            let class = match config.get("_class_name") {
+                Some(ConfigValue::Str(c)) => format!("diffusers.{c}"),
+                _ => String::new(),
+            };
+            Some(Pipeline { class, config })
+        }
+        None => None,
+    };
+    let listed: BTreeMap<String, String> = (pipeline.iter())
+        .flat_map(|p| &p.config)
+        .filter(|(name, _)| !name.starts_with('_'))
+        .filter_map(|(name, row)| match row {
+            ConfigValue::List(row) => match row.as_slice() {
+                [ConfigValue::Str(library), ConfigValue::Str(class), ..] => {
+                    Some((name.clone(), format!("{library}.{class}")))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let mut names = tensored.to_vec();
+    names.extend(listed.keys().filter(|n| !tensored.contains(n)).cloned());
+    let root = pipeline.is_none()
+        && (names.is_empty() || names.iter().any(|n| n == ROOT_COMPONENT))
+        && !files.keys().any(|p| p.starts_with("model/"));
+    if root && names.is_empty() {
+        names.push(ROOT_COMPONENT.into());
+    }
+    let mut components = Vec::new();
+    for name in names {
+        let at = if root && name == ROOT_COMPONENT { "" } else { name.as_str() };
+        let inside = |p: &str| match at {
+            "" => Some(p.to_owned()).filter(|p| !p.contains('/')),
+            f => (p.strip_prefix(f)?.strip_prefix('/')).map(str::to_owned),
+        };
+        let mine: Vec<(String, String)> = (files.keys())
+            .filter_map(|p| Some((p.clone(), inside(p)?)))
+            .filter(|(_, rel)| run_data(rel))
+            .collect();
+        let mut assets: BTreeMap<String, Vec<u8>> = (mine.into_iter())
+            .map(|(path, rel)| (rel, files.remove(&path).expect("listed")))
+            .collect();
+        let file = CONFIGS.iter().find(|c| assets.contains_key(**c));
+        let (config, class) = match file {
+            Some(f) => {
+                let config = parse_config(&join(at, f), &assets.remove(*f).expect("found"))?;
+                let class = class_of(f, &config);
+                (config, class)
+            }
+            None => (Config::new(), String::new()),
+        };
+        if file.is_none() && assets.is_empty() && !tensored.contains(&name) {
+            continue;
+        }
+        components.push(Folder {
+            class: listed.get(&name).cloned().unwrap_or(class),
+            name,
+            config,
+            config_file: file.filter(|f| **f != CONFIG_FILE).map(|f| f.to_string()),
+            assets,
+        });
+    }
+    Ok(Layout {
+        pipeline,
+        components,
+        files,
+    })
+}
+
+/// The variant a model is written as: its main dtype or scheme by stored bytes (`bf16`,
+/// `fp8.rowwise`), `files` when it has no tensors.
+pub fn main_variant<'a>(tensors: impl Iterator<Item = (&'a Dtype, Option<&'a Encoding>, u64)>) -> String {
+    let mut bytes: BTreeMap<String, u64> = BTreeMap::new();
+    for (dtype, encoding, n) in tensors {
+        let name = encoding.map_or_else(|| dtype.name().to_ascii_lowercase(), |e| e.scheme.clone());
+        *bytes.entry(name).or_default() += n;
+    }
+    (bytes.into_iter().max_by_key(|(_, n)| *n)).map_or_else(|| "files".to_owned(), |(name, _)| name)
+}
+
+/// Run data: a file a component loads or runs with (tokenizers and their vocabularies,
+/// generation and preprocessor configs, chat templates). Docs, code and images are not.
+fn run_data(path: &str) -> bool {
+    let lower = name(path).to_ascii_lowercase();
+    let doc = ["readme", "license", "licence", "notice", "copying"];
+    !doc.iter().any(|d| lower.starts_with(d))
+        && [".json", ".txt", ".model", ".jinja", ".tiktoken"]
+            .iter()
+            .any(|e| lower.ends_with(e))
+}
+
+/// A config file as structured JSON: floats and `null` kept.
+fn parse_config(path: &str, bytes: &[u8]) -> Result<Config> {
+    serde_json::from_slice(bytes).map_err(|e| Refusal {
+        code: Code::MALFORMED_JSON,
+        detail: format!("{path}: {e}"),
+    })
+}
+
+/// `<library>.<Class>` from a component's config file, `""` when it names none.
+fn class_of(file: &str, config: &Config) -> String {
+    let first = match config.get("architectures") {
+        Some(ConfigValue::List(a)) => a.first(),
+        _ => None,
+    };
+    match (first, config.get("_class_name"), config.get("tokenizer_class")) {
+        (Some(ConfigValue::Str(c)), _, _) => format!("transformers.{c}"),
+        (_, Some(ConfigValue::Str(c)), _) => format!("diffusers.{c}"),
+        (_, _, Some(ConfigValue::Str(c))) if file == "tokenizer_config.json" => {
+            format!("transformers.{c}")
+        }
+        _ => String::new(),
+    }
+}
+
+pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     let progress = req.progress;
     progress("resolving", 0, 0);
     let mut pinned = Vec::new();
@@ -258,7 +493,7 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     let area = req.tmp.join("import").join(&id[..32]);
     std::fs::create_dir_all(req.tmp.join("import"))
         .map_err(|e| crate::err::classify_io("create the import area", e))?;
-    // One import of a selection at a time: the kernel's lock, released when this ends.
+    // One convert of a selection at a time: the kernel's lock, released when this ends.
     let _area = platform::lock::LockFile::new(area.with_extension("lock"))
         .lock(platform::lock::Kind::Exclusive)
         .map_err(|e| {
@@ -280,8 +515,8 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     // The source's own Diffusers or Transformers layout is canonical by definition.
     let canonical = set.plain.iter().any(|p| {
         let (folder, name) = p.path.rsplit_once('/').unwrap_or(("", &p.path));
-        name.ends_with("model_index.json")
-            || (name == "config.json" && set.groups.iter().any(|g| g.folder == folder))
+        name.ends_with(PIPELINE_FILE)
+            || (name == CONFIG_FILE && set.groups.iter().any(|g| g.folder == folder))
     });
     let normalized = recognized.unclaimed.is_empty() || canonical;
 
@@ -290,7 +525,7 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
         let groups = set.groups.iter().filter(|o| o.folder == f).count();
         let shared = groups + ggufs.iter().filter(|p| folder(&p.path) == f).count() > 1;
         match (f, shared) {
-            ("", false) => "model".to_string(),
+            ("", false) => ROOT_COMPONENT.to_string(),
             ("", true) => stem.to_owned(),
             (f, false) => f.to_string(),
             (f, true) => format!("{f}/{stem}"),
@@ -298,7 +533,7 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     };
     let identity = |g: &source::Group| component(&g.folder, &g.stem);
     let planned = engine::plan(&set, tables, &recognized, &identity)?;
-    let mut files = documents(&set, &recognized, &planned, req, &area)?;
+    let (mut files, mut filled) = documents(&set, &recognized, &planned, req, &area)?;
     let (mut converters, mut normalized) = (converters, normalized);
     let mut ggufs_planned = Vec::new();
     for p in &ggufs {
@@ -313,11 +548,27 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
         let record = serde_json::to_vec(&plan.meta).expect("the record serializes");
         files.insert(format!("{}.json", p.path), record);
         if let Some(reference) = &plan.reference {
-            let into = folder(&p.path);
-            pinned.push(gguf_documents(reference, into, req, &area, &mut files)?);
+            let (pin, added) = gguf_documents(reference, folder(&p.path), req, &area, &mut files)?;
+            filled.extend((!added.is_empty()).then_some((pin, added)));
         }
         ggufs_planned.push((p.file, component, plan));
     }
+    let mut tensored: Vec<String> = Vec::new();
+    let names = (planned.iter().map(|p| &p.component)).chain(ggufs_planned.iter().map(|g| &g.1));
+    for name in names {
+        if !tensored.contains(name) {
+            tensored.push(name.clone());
+        }
+    }
+    let sizes = |parts: &mut dyn Iterator<Item = (&Dtype, &[u64])>| -> u64 {
+        parts.map(|(d, s)| d.byte_len(s).unwrap_or(0)).sum()
+    };
+    let stored = (planned.iter())
+        .map(|p| (&p.dtype, p.encoding.as_ref(), sizes(&mut p.parts.iter().map(|q| (&q.dtype, &q.shape[..])))))
+        .chain(ggufs_planned.iter().flat_map(|g| &g.2.tensors).map(|o| {
+            (&o.dtype, o.encoding.as_ref(), sizes(&mut o.parts.iter().map(|q| (&q.dtype, &q.shape[..]))))
+        }));
+    sink.begin(&main_variant(stored), &layout(files, &tensored)?)?;
     let opened: Vec<File> = set
         .files
         .iter()
@@ -371,9 +622,6 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
             sink.put(component, &o.key, &o.dtype, &o.shape, encoding, parts)?;
         }
     }
-    for (path, bytes) in &files {
-        sink.file(path, bytes)?;
-    }
     let mut file_metadata: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let named = (recognized.claims.iter())
         .map(|c| (c.name.clone(), c.group))
@@ -389,9 +637,10 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
         normalized,
         converters,
         sources: pinned,
+        filled,
         file_metadata,
     };
-    sink.commit(&imported)?;
+    sink.commit(imported.metadata())?;
     drop(opened);
     match std::fs::remove_dir_all(&area) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {

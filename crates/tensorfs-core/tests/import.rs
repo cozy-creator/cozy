@@ -6,10 +6,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use tensorfs_core::err::{Code, Result};
-use tensorfs_core::format::{Dtype, Encoding};
+use tensorfs_core::format::{Dtype, Encoding, Metadata};
 use tensorfs_core::import::engine::{self, Ops, Reading, TensorReader};
 use tensorfs_core::import::source::{Group, SourceSet};
-use tensorfs_core::import::{self, Access, Imported, Part, Request, Sink};
+use tensorfs_core::import::{self, Access, Imported, Layout, Part, Request, Sink};
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tfs-import-{name}-{}", std::process::id()));
@@ -66,11 +66,16 @@ struct Collect {
     tensors: Tensors,
     /// (component, key) in the order the import put them.
     order: Vec<(String, String)>,
-    files: BTreeMap<String, Vec<u8>>,
+    layout: Layout,
+    metadata: Metadata,
     imported: Option<Imported>,
 }
 
 impl Sink for Collect {
+    fn begin(&mut self, _: &str, layout: &Layout) -> Result<()> {
+        self.layout = layout.clone();
+        Ok(())
+    }
     fn put(
         &mut self,
         component: &str,
@@ -104,12 +109,8 @@ impl Sink for Collect {
         self.order.push((component.into(), key.into()));
         Ok(())
     }
-    fn file(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
-        self.files.insert(path.into(), bytes.to_vec());
-        Ok(())
-    }
-    fn commit(&mut self, imported: &Imported) -> Result<()> {
-        self.imported = Some(imported.clone());
+    fn commit(&mut self, metadata: Metadata) -> Result<()> {
+        self.metadata = metadata;
         Ok(())
     }
 }
@@ -117,18 +118,16 @@ impl Sink for Collect {
 fn run(tmp: &Path, sources: &[String], converter: Option<&str>) -> Result<Collect> {
     let mut sink = Collect::default();
     let access = Access::default();
-    import::import(
-        &Request {
-            sources,
-            converter,
-            variant: None,
-            access: &access,
-            tmp,
-            progress: &|_, _, _| {},
-            stop: None,
-        },
-        &mut sink,
-    )?;
+    let req = Request {
+        sources,
+        converter,
+        variant: None,
+        access: &access,
+        tmp,
+        progress: &|_, _, _| {},
+        stop: None,
+    };
+    sink.imported = Some(import::convert(&req, &mut sink)?);
     // Sources never outlive the import, and never land anywhere but its tmp area.
     assert_eq!(areas(tmp), 0);
     Ok(sink)
@@ -879,23 +878,39 @@ fn a_tiny_hf_sdxl_imports_end_to_end() {
         components.into_iter().collect::<Vec<_>>(),
         ["text_encoder", "text_encoder_2", "unet", "vae"]
     );
-    for file in [
-        "model_index.json",
-        "unet/config.json",
-        "scheduler/scheduler_config.json",
-        "tokenizer/vocab.json",
-        "text_encoder_2/config.json",
-    ] {
-        assert!(
-            out.files.contains_key(file),
-            "{file}: {:?}",
-            out.files.keys().collect::<Vec<_>>()
-        );
-    }
-    assert!(!out
-        .files
-        .keys()
-        .any(|f| f.contains(".safetensors") || f.ends_with(".bin") || f.ends_with(".onnx")));
+    // D10: the pipeline, every component with its class, config and run files; README and
+    // .gitattributes are repo files.
+    let layout = &out.layout;
+    let pipeline = layout.pipeline.as_ref().unwrap();
+    assert_eq!(pipeline.class, "diffusers.StableDiffusionXLPipeline");
+    let classes: Vec<(&str, &str, Option<&str>)> = (layout.components.iter())
+        .map(|c| (c.name.as_str(), c.class.as_str(), c.config_file.as_deref()))
+        .collect();
+    assert_eq!(
+        classes,
+        [
+            ("text_encoder", "transformers.CLIPTextModel", None),
+            ("text_encoder_2", "transformers.CLIPTextModelWithProjection", None),
+            ("unet", "diffusers.UNet2DConditionModel", None),
+            ("vae", "diffusers.AutoencoderKL", None),
+            ("scheduler", "diffusers.DDIMScheduler", Some("scheduler_config.json")),
+            ("tokenizer", "transformers.CLIPTokenizer", Some("tokenizer_config.json")),
+            ("tokenizer_2", "transformers.CLIPTokenizer", Some("tokenizer_config.json")),
+        ]
+    );
+    let tokenizer = &layout.components[5];
+    assert_eq!(
+        tokenizer.assets.keys().collect::<Vec<_>>(),
+        ["merges.txt", "special_tokens_map.json", "vocab.json"]
+    );
+    assert_eq!(
+        layout.files.keys().collect::<Vec<_>>(),
+        [".gitattributes", "README.md"]
+    );
+    assert_eq!(
+        out.metadata["source"],
+        tensorfs_core::format::Value::Str(imported.sources[0].clone())
+    );
     // Bit-identical to the repository's own files, landed separately.
     let access = Access::default();
     let listing = import::remote::list(
@@ -1216,11 +1231,14 @@ fn h3_native_real_bytes_equal_the_diffusers_packaging() {
 #[derive(Default)]
 struct Count {
     tensors: BTreeMap<(String, String), (Dtype, Vec<u64>)>,
-    files: Vec<String>,
-    imported: Option<Imported>,
+    layout: Layout,
 }
 
 impl Sink for Count {
+    fn begin(&mut self, _: &str, layout: &Layout) -> Result<()> {
+        self.layout = layout.clone();
+        Ok(())
+    }
     fn put(
         &mut self,
         component: &str,
@@ -1240,12 +1258,7 @@ impl Sink for Count {
         );
         Ok(())
     }
-    fn file(&mut self, path: &str, _: &[u8]) -> Result<()> {
-        self.files.push(path.into());
-        Ok(())
-    }
-    fn commit(&mut self, imported: &Imported) -> Result<()> {
-        self.imported = Some(imported.clone());
+    fn commit(&mut self, _: Metadata) -> Result<()> {
         Ok(())
     }
 }
@@ -1264,20 +1277,16 @@ fn a_single_file_sdxl_becomes_the_upstream_layout() {
     let access = Access::default();
     let sources = [file.display().to_string()];
     let tmp = dir.join("tmp");
-    import::import(
-        &Request {
-            sources: &sources,
-            converter: None,
-            variant: None,
-            access: &access,
-            tmp: &tmp,
-            progress: &|_, _, _| {},
-            stop: None,
-        },
-        &mut sink,
-    )
-    .unwrap();
-    let imported = sink.imported.unwrap();
+    let req = Request {
+        sources: &sources,
+        converter: None,
+        variant: None,
+        access: &access,
+        tmp: &tmp,
+        progress: &|_, _, _| {},
+        stop: None,
+    };
+    let imported = import::convert(&req, &mut sink).unwrap();
     assert!(imported.normalized);
     assert_eq!(imported.converters, ["sdxl.single_file"]);
     for (component, banked) in [
@@ -1310,21 +1319,21 @@ fn a_single_file_sdxl_becomes_the_upstream_layout() {
             .collect();
         assert_eq!(got, want, "{component}");
     }
-    sink.files.sort();
-    for file in [
-        "model_index.json",
-        "scheduler/scheduler_config.json",
-        "text_encoder/config.json",
-        "tokenizer_2/vocab.json",
-        "unet/config.json",
-        "vae/config.json",
-    ] {
-        assert!(
-            sink.files.iter().any(|f| f == file),
-            "{file}: {:?}",
-            sink.files
-        );
+    // The reference fills the pipeline, the configs and the tokenizers, and says so.
+    let layout = &sink.layout;
+    assert_eq!(
+        layout.pipeline.as_ref().unwrap().class,
+        "diffusers.StableDiffusionXLPipeline"
+    );
+    let folders: BTreeMap<&str, &import::Folder> =
+        layout.components.iter().map(|c| (c.name.as_str(), c)).collect();
+    assert_eq!(folders["scheduler"].config_file.as_deref(), Some("scheduler_config.json"));
+    assert!(folders["tokenizer_2"].assets.contains_key("vocab.json"));
+    for c in ["text_encoder", "unet", "vae"] {
+        assert!(!folders[c].config.is_empty() && folders[c].config_file.is_none(), "{c}");
     }
+    let (from, files) = &imported.filled[0];
+    assert!(from.starts_with("hf://") && files.iter().any(|f| f == "unet/config.json"));
     assert_eq!(areas(&tmp), 0);
     fs::remove_dir_all(&dir).unwrap();
 }
