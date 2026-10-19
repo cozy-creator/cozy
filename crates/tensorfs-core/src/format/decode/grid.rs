@@ -11,7 +11,8 @@ pub enum ScaleLayout {
     RowMajor,
     /// `[W, R]`: element `b·R + i` (GPTQ's and AWQ's `[K/g, N]`).
     Transposed,
-    /// cuBLAS's tiles of 128 rows × 4 blocks, `[128·⌈R/128⌉, 4·⌈W/4⌉]`, zero-padded (ComfyUI).
+    /// cuBLAS's tiles of 128 rows × 4 blocks, zero-padded, each matrix `[N, C]` of a stack on its own:
+    /// `[…stack, 128·⌈N/128⌉, 4·⌈W/4⌉]` (ComfyUI). `at` takes one matrix's rows.
     Cublas128x4,
 }
 
@@ -61,7 +62,8 @@ impl Grid<'_> {
                     ScaleLayout::RowMajor => [c.lead(), &[w]].concat(),
                     ScaleLayout::Transposed => vec![w, c.rows as u64],
                     ScaleLayout::Cublas128x4 => {
-                        vec![c.rows.div_ceil(128) as u64 * 128, w.div_ceil(4) * 4]
+                        let (stack, n) = c.shape.split_at(c.shape.len() - 2);
+                        [stack, &[n[0].div_ceil(128) * 128, w.div_ceil(4) * 4]].concat()
                     }
                 })
             }

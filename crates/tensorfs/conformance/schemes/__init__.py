@@ -21,7 +21,7 @@ from . import nvfp4
 
 # comfy
 
-from .base import Ctx, Refused
+from .base import Ctx, PartDtype, Refused
 
 FAMILIES = (
     fp8,
@@ -68,10 +68,12 @@ def _decode(dtype, shape, encoding, parts) -> bytes:
     roles = {p.role for p in scheme.parts}
     if not {p.role for p in scheme.parts if p.required} <= parts.keys() <= roles:
         raise fail(f"parts {sorted(parts)}")
-    if params.keys() != scheme.params.keys():  # all required; an unknown one is refused
+    need = {k for k, r in scheme.params.items() if not isinstance(r, PartDtype) or r.role in parts}
+    if params.keys() != need:  # all required; an unknown one is refused
         raise fail(f"params {sorted(params)}")
-    for key, rule in scheme.params.items():
-        if not allowed(rule, params[key]):
+    for key in need:
+        rule = scheme.params[key]
+        if not allowed(rule.dtypes if isinstance(rule, PartDtype) else rule, params[key]):
             raise fail(f"param {key}={params[key]!r}")
     if dtype not in ("F32", "BF16", "F16"):
         raise fail(f"logical dtype {dtype}")

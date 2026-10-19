@@ -1,6 +1,7 @@
 //! The table decode (spec §6, building blocks): `table[q] × s`, a code looked up in a fixed or stored table
 //! (an element format, NF4, a codebook part), then scaled on a grid.
 
+use super::Ctx;
 use super::grid::Grid;
 use crate::format::{Error, Result};
 
@@ -27,6 +28,22 @@ pub fn decode(
         }
     }
     Ok(out)
+}
+
+/// One matrix of a stack: its codes and its share of the scales.
+pub type Matrix<'a> = (&'a [i32], &'a [f32]);
+
+/// The matrices of a stack `[…stack, N, C]` (the tensor at rank 2): `N`, and each matrix's codes
+/// with its share of row-block scales `s` stored `row_major` or `cublas_128x4` (tiled per matrix).
+pub fn matrices<'a>(c: &Ctx, q: &'a [i32], s: &'a [f32]) -> (usize, Vec<Matrix<'a>>) {
+    let n = c.shape[c.shape.len() - 2] as usize;
+    if c.rows == 0 {
+        return (n, Vec::new());
+    }
+    let m = c.rows / n;
+    let (qn, sn) = (q.len() / m, s.len() / m);
+    let each = (0..m).map(|k| (&q[k * qn..][..qn], &s[k * sn..][..sn]));
+    (n, each.collect())
 }
 
 /// A part's bytes as codes (an 8-bit element format, or `U8` indices).

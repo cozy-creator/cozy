@@ -74,10 +74,15 @@ pub enum Geometry {
     One,
     /// `R` elements: `[*lead]` or `[*lead, 1]`.
     Rows,
+    /// One element, or one per matrix of a stack `[*stack, N, C]`: `[*stack]` (ComfyUI's
+    /// `weight_scale_2 [E]` beside `[E, N, C]` experts).
+    Matrices,
+    /// `C` elements, `[C]` (AWQ's `pre_quant_scale`).
+    Columns,
     /// Row-major block scales, `[*lead, ⌈C/n⌉]`.
     Blocks(u64),
-    /// Block scales in cuBLAS 128×4 tiles, `[128·⌈R/128⌉, 4·⌈W/4⌉]` with `W = ⌈C/n⌉`; an expert
-    /// stack tiled expert by expert (`[E, N, 4·⌈W/4⌉]`, `N` a multiple of 128) is the same bytes.
+    /// Block scales in cuBLAS 128×4 tiles, each matrix of `[*stack, N, C]` on its own:
+    /// `[*stack, 128·⌈N/128⌉, 4·⌈W/4⌉]` with `W = ⌈C/n⌉`.
     Tiles(u64),
 }
 
@@ -435,7 +440,6 @@ fn geometry(rule: &PartRule, t: &Tensor, shape: &[u64]) -> std::result::Result<V
         [lead @ .., c] => (lead, *c),
         [] => (&[][..], 1),
     };
-    let rows = numel(lead);
     let blocks = |n: u64| c.div_ceil(n);
     let block_scheme = !matches!(rule.shape, Geometry::Logical | Geometry::One);
     if block_scheme && shape.len() < 2 {
@@ -461,14 +465,21 @@ fn geometry(rule: &PartRule, t: &Tensor, shape: &[u64]) -> std::result::Result<V
                 false => return Err(format!("{:?}, not {want:?}", t.shape)),
             }
         }
+        Geometry::Matrices => {
+            let stack = &lead[..lead.len() - 1];
+            match numel(&t.shape) == 1 || (!stack.is_empty() && t.shape == stack) {
+                true => t.shape.clone(),
+                false => return Err(format!("{:?}, not one element or {stack:?}", t.shape)),
+            }
+        }
+        Geometry::Columns => match t.shape == [c] {
+            true => t.shape.clone(),
+            false => return Err(format!("{:?}, not [{c}]", t.shape)),
+        },
         Geometry::Tiles(n) => {
-            let width = blocks(n).div_ceil(4) * 4;
-            let want = vec![rows.div_ceil(128) * 128, width];
-            let per_expert = match lead {
-                [e, n] if n % 128 == 0 => t.shape == [*e, *n, width],
-                _ => false,
-            };
-            match t.shape == want || per_expert {
+            let (stack, rows) = lead.split_at(lead.len() - 1);
+            let want = [stack, &[rows[0].div_ceil(128) * 128, blocks(n).div_ceil(4) * 4]].concat();
+            match t.shape == want {
                 true => want,
                 false => return Err(format!("{:?}, not cuBLAS tiles {want:?}", t.shape)),
             }
@@ -537,13 +548,13 @@ fn fit(
         };
         encoding.params.insert(param.clone(), Value::from(value));
     }
+    // A param naming an optional part's dtype is there exactly when the part is.
     for (param, role) in &carrier.dtype_params {
-        let part = parts.iter().find(|p| p.role == *role);
-        let dtype = part
-            .ok_or(format!("no {role} part for {param}"))?
-            .dtype
-            .name();
-        encoding.params.insert(param.clone(), Value::from(dtype));
+        match parts.iter().find(|p| p.role == *role) {
+            Some(part) => encoding.params.insert(param.clone(), Value::from(part.dtype.name())),
+            None if carrier.parts.iter().any(|r| r.role == *role && r.optional) => continue,
+            None => return Err(format!("no {role} part for {param}")),
+        };
     }
     Ok(Folded { encoding, parts })
 }

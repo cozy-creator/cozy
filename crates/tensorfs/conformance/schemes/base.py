@@ -25,6 +25,13 @@ class Part:
 
 
 @dataclass(frozen=True)
+class PartDtype:
+    """A param naming the dtype an optional part is stored in: present exactly when the part is."""
+    role: str
+    dtypes: tuple
+
+
+@dataclass(frozen=True)
 class Scheme:
     name: str
     params: dict  # key -> the allowed values (a tuple, a range) or a predicate
