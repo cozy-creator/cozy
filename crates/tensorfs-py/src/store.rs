@@ -1166,6 +1166,27 @@ pub struct PyWriter {
 }
 
 impl PyWriter {
+    fn with<T: Send>(
+        &self,
+        py: Python<'_>,
+        f: impl FnOnce(&mut Writer) -> Result<T, Failure> + Send,
+    ) -> PyResult<T> {
+        py.detach(|| {
+            let mut guard = self.w.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_mut() {
+                Some(w) => f(w),
+                None => Err(Failure {
+                    kind: Kind::Invalid,
+                    detail: "the writer has committed or been abandoned".into(),
+                }),
+            }
+        })
+        .or_raise(py)
+    }
+}
+
+#[pymethods]
+impl PyWriter {
     #[new]
     #[pyo3(signature = (dest = None, *, variant = None, base = None, resume = None, cache_dir = None, repo_id = None, endpoint = None, token = None, ca_der = None))]
     #[allow(clippy::too_many_arguments)]
@@ -1193,27 +1214,6 @@ impl PyWriter {
         }).or_raise(py)?;
         Ok(Self { store, w: Mutex::new(Some(w)), dest, variant, repo_id })
     }
-    fn with<T: Send>(
-        &self,
-        py: Python<'_>,
-        f: impl FnOnce(&mut Writer) -> Result<T, Failure> + Send,
-    ) -> PyResult<T> {
-        py.detach(|| {
-            let mut guard = self.w.lock().unwrap_or_else(|e| e.into_inner());
-            match guard.as_mut() {
-                Some(w) => f(w),
-                None => Err(Failure {
-                    kind: Kind::Invalid,
-                    detail: "the writer has committed or been abandoned".into(),
-                }),
-            }
-        })
-        .or_raise(py)
-    }
-}
-
-#[pymethods]
-impl PyWriter {
     /// What `model_index.json` held: `cls` (`diffusers.<Class>`) and its `config`.
     fn pipeline(&self, py: Python<'_>, cls: String, config: &Bound<'_, PyDict>) -> PyResult<()> {
         let config = config_map(config)?;
