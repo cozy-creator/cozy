@@ -29,7 +29,8 @@ git -C "$proof/hub" fetch -q --depth 1 https://github.com/cozy-creator/tensorhub
 git -C "$proof/hub" checkout -q FETCH_HEAD
 test "$(git -C "$proof/hub" rev-parse HEAD)" = "$hub_sha"
 printf 'Ordinary CLI proof Creator: %s; Hub: %s\n' "$cozy_sha" "$hub_sha"
-cd "$proof/hub"+# API fixture only: app.FS explicitly permits a binary without built browser pages.
+cd "$proof/hub"
+# API fixture only: app.FS explicitly permits a binary without built browser pages.
 go build -o dist/tensorhub .
 export PROOF_DATABASE_URL="$AUTHKIT_TEST_DATABASE_URL"
 scripts/live-hub-client.sh "$cozy_sha" -p cozy --test run_local \
