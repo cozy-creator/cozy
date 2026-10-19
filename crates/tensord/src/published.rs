@@ -620,6 +620,18 @@ impl Publisher {
     /// lane's header there. Journaled per catalog revision so a warm run, across restarts too,
     /// asks the Hub nothing (th-245).
     pub(crate) fn resolve(&self, service: &Service, source: &hub::Source, named: Named, lanes: &[&str], revision: &str) -> Result<Named, Failure> {
+        if named.repository.starts_with("local/") && named.tree.is_none() {
+            let reference = match named.release.is_empty() {
+                true => named.repository.clone(),
+                false => format!("{}@{}", named.repository, named.release),
+            };
+            let local = self.store.resolve(&reference, (!named.lane.is_empty()).then_some(named.lane.as_str()))
+                .map_err(|error| ("model_resolution_failed", format!("{reference}: {error}")))?;
+            return Ok(Named {
+                release: local.release.unwrap_or_default(), lane: local.variant.unwrap_or_default(),
+                tree: local.tree, header: Some(local.header), ..named
+            });
+        }
         if named.tree.is_some() {
             return measured(&self.machine, service, source, named);
         }
@@ -819,6 +831,11 @@ impl Publisher {
                 plan: None,
                 warnings: vec![],
             }));
+        }
+        // An alias may now name another tree, or be gone. Resolve its current local metadata
+        // before building a plan; the raw request key cannot prove a cached header is current.
+        if local_aliases(&installation, request)? {
+            return Ok(None);
         }
         let Some(gpu) = service.pool() else {
             return Ok(None);
@@ -1368,7 +1385,7 @@ impl Publisher {
             let named = choose(choice, &path)?;
             let tolerances = precision::Slot::of(slot);
             let bits = tolerances.bits(request.bits, short);
-            let ruled = named.lane.is_empty() && named.tree.is_none();
+            let ruled = named.lane.is_empty() && named.tree.is_none() && !named.repository.starts_with("local/");
             let lanes = if ruled { tolerances.lanes(bits, &gpus) } else { vec![] };
             let named = self.resolve(service, &request.source, named, &lanes, &request.catalog_revision)?;
             let model = format!("{}@{}", named.repository, named.release);
@@ -1883,6 +1900,19 @@ pub(crate) fn default_choice(slot: &Value, path: &str, package: &str, owner: &st
         false => format!("{account}/{model}"),
     };
     Some(domain::ModelChoice { parameter: path.into(), repository, release: release.into(), ..Default::default() })
+}
+
+fn local_aliases(installation: &Installation, request: &Request) -> io::Result<bool> {
+    let interface: Value = serde_json::from_slice(&installation.interface).map_err(io::Error::other)?;
+    Ok(model_slots(&interface, &request.entrypoint).unwrap_or_default().iter().any(|slot| {
+        let path = slot["path"].as_str().unwrap_or_default();
+        let parameter = path.rsplit('.').next().unwrap_or_default();
+        let asked = request.choices.iter().find(|c| c.parameter == path || c.parameter == parameter)
+            .filter(|c| !c.repository.is_empty() || c.manifest.is_some() || !c.source.is_empty());
+        let declared = default_choice(slot, path, &installation.package, &request.owner);
+        asked.or(declared.as_ref()).is_some_and(|choice| choice.source.is_empty()
+            && choice.manifest.is_none() && choice.repository.starts_with("local/"))
+    }))
 }
 
 /// A slot with neither a choice nor a declared default.
@@ -2989,6 +3019,102 @@ pub(crate) mod tests {
             let _ = self.service.pool().unwrap().stop();
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn local_alias_machine(default: Option<String>) -> Machine {
+        let mut slot = json!({"path": "render.models.source", "class": "M", "weights": true});
+        if let Some(default) = default { slot["default"] = json!(default); }
+        Machine::with("acme/pkg", &[], json!([{"name": "render", "accelerator": false, "models": [slot]}]), &[])
+    }
+
+    fn local_alias_request(machine: &Machine, choices: Vec<domain::ModelChoice>) -> Request {
+        Request { run: String::new(), source: machine.hub.clone(), package: machine.installation.package.clone(),
+            release: "1.0.0".into(), installed: Some(machine.installation.clone()), owner: "acme".into(),
+            catalog_revision: "same-catalog".into(), providers: Providers::default(), entrypoint: "render".into(),
+            choices, gpus: 0, bits: 0, imports: false }
+    }
+
+    fn local_alias_header(machine: &Machine, tag: u8) -> ObjectRef {
+        crate::adapter::tests::checkpoint(machine.publisher.store(), &format!("local-{tag}"), "model",
+            &[("weight", vec![4], crate::adapter::tests::f32s(4, f32::from(tag)))])
+    }
+
+    #[test]
+    fn local_alias_active_calls_follow_replacement_and_removal_without_hub_reads() {
+        let machine = local_alias_machine(None);
+        let (first, second) = (local_alias_header(&machine, 19), local_alias_header(&machine, 23));
+        let store = machine.publisher.store();
+        storage::set_local(store, "seed", &first, &BTreeMap::new()).unwrap();
+        let request = local_alias_request(&machine, vec![domain::ModelChoice {
+            parameter: "source".into(), repository: "local/seed".into(), ..Default::default() }]);
+        let prepare = || machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).unwrap().plan.unwrap();
+        let a = prepare();
+        assert_eq!(a.sources[0].manifest, first.id());
+        assert_eq!(a.sources[0].repository, "local/seed");
+        assert_eq!(prepare().id, a.id, "unchanged header retains exact plan identity");
+        storage::set_local(store, "seed", &second, &BTreeMap::new()).unwrap();
+        let b = prepare();
+        assert_eq!(b.sources[0].manifest, second.id(), "same request/catalog must read the replaced alias");
+        assert_ne!(b.id, a.id);
+        storage::set_local(store, "seed", &first, &BTreeMap::new()).unwrap();
+        assert_eq!(prepare().id, a.id);
+        store.update_ref("local/seed", |_| None).unwrap();
+        let error = machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).err().unwrap();
+        assert_eq!(error.0, "model_resolution_failed");
+        assert!(machine.heard.lock().unwrap().is_empty(), "local aliases never read the fixture Hub");
+    }
+
+    #[test]
+    fn local_alias_declared_defaults_refresh_their_held_grants() {
+        let machine = local_alias_machine(Some(format!("local/seed@{}", tensorfs_core::client::IMPORT_RELEASE)));
+        let (first, second) = (local_alias_header(&machine, 29), local_alias_header(&machine, 31));
+        let store = machine.publisher.store();
+        storage::set_local(store, "seed", &first, &BTreeMap::new()).unwrap();
+        let request = local_alias_request(&machine, vec![]);
+        let prepare = || machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).unwrap().plan.unwrap();
+        let a = prepare();
+        storage::set_local(store, "seed", &second, &BTreeMap::new()).unwrap();
+        let b = prepare();
+        assert_eq!(a.sources[0].manifest, first.id());
+        assert_eq!(b.sources[0].manifest, second.id());
+        assert_ne!(a.id, b.id);
+        assert!(machine.heard.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_alias_explicit_variants_and_ambiguity_are_resolved_by_tensorfs() {
+        let machine = local_alias_machine(None);
+        let (first, second) = (local_alias_header(&machine, 37), local_alias_header(&machine, 41));
+        let store = machine.publisher.store();
+        for (variant, header) in [("f32", &first), ("other", &second)] {
+            store.set_variant("local/multi", "1", Some(variant), header, &BTreeMap::new()).unwrap();
+        }
+        let mut request = local_alias_request(&machine, vec![domain::ModelChoice {
+            parameter: "source".into(), repository: "local/multi".into(), release: "1".into(), lane: "f32".into(),
+            ..Default::default() }]);
+        let a = machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).unwrap().plan.unwrap();
+        assert_eq!(a.sources[0].manifest, first.id());
+        assert_eq!(a.sources[0].lane, "f32");
+        for variant in ["absent", ""] {
+            request.choices[0].lane = variant.into();
+            assert_eq!(machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).err().unwrap().0,
+                "model_resolution_failed");
+        }
+        assert!(machine.heard.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_alias_cache_bypass_leaves_an_explicit_immutable_header_cached() {
+        let machine = local_alias_machine(Some(format!("local/seed@{}", tensorfs_core::client::IMPORT_RELEASE)));
+        let header = local_alias_header(&machine, 43);
+        let reference = domain::Ref { digest: sha256::digest(&machine.publisher.store().read(&header).unwrap()).to_vec(), length: header.length };
+        let request = local_alias_request(&machine, vec![domain::ModelChoice {
+            parameter: "source".into(), manifest: Some(reference), ..Default::default() }]);
+        let first = machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).unwrap().plan.unwrap();
+        let held = machine.publisher.held(&machine.service, "alice", &request).unwrap().unwrap().plan.unwrap();
+        assert_eq!(first.id, held.id);
+        assert_eq!(held.sources[0].manifest, header.id());
+        assert!(machine.heard.lock().unwrap().is_empty());
     }
 
     const GIB: u64 = 1 << 30;
