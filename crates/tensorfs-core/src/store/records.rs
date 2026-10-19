@@ -93,6 +93,7 @@ impl Store {
     /// Creates or replaces pin `id`.
     pub fn pin(&self, id: &str, pin: &Pin) -> Result<()> {
         let path = self.pin_path(id)?;
+        let _acquisition = super::retention::acquire(self)?;
         let _lock = self.lock("pins")?;
         let old = parse::<Pin>(&path)?.map_or_else(Vec::new, |old| old.roots);
         self.retain(pin.roots.iter().filter(|root| !old.contains(root)))?;

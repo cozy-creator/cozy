@@ -605,9 +605,11 @@ impl Writer {
         let id = match &self.dest {
             Dest::Store(store) => {
                 let id = store.put_bytes(&header)?;
-                let pin = self.key.clone().unwrap_or_else(|| id.sha256.clone());
-                let roots = std::iter::once(id.clone()).chain(self.repo.values().cloned()).collect();
-                store.pin(&pin, &Pin::new(roots))?;
+                if !store.cache_writer(&id, &self.repo)? {
+                    let pin = self.key.clone().unwrap_or_else(|| id.sha256.clone());
+                    let roots = std::iter::once(id.clone()).chain(self.repo.values().cloned()).collect();
+                    store.pin(&pin, &Pin::new(roots))?;
+                }
                 fault::point("writer.pinned");
                 id
             }
@@ -619,8 +621,10 @@ impl Writer {
             }
             Dest::Endpoint { store, stream, name, variant } => {
                 let id = store.put_bytes(&header)?;
-                let roots = std::iter::once(id.clone()).chain(self.repo.values().cloned()).collect();
-                store.pin(&id.sha256, &Pin::new(roots))?;
+                if !store.cache_writer(&id, &self.repo)? {
+                    let roots = std::iter::once(id.clone()).chain(self.repo.values().cloned()).collect();
+                    store.pin(&id.sha256, &Pin::new(roots))?;
+                }
                 self.committed = Some(id.clone());
                 self.published = Some(stream.commit(name, variant, header, &self.repo).map_err(sent)?);
                 id

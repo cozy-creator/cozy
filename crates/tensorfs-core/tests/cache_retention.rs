@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -512,4 +513,241 @@ fn native_owner_process() {
         }
         mode => panic!("unknown owner mode {mode}"),
     }
+}
+
+/// Exercise the real TTL policy with aged records/files, not a substituted collector.
+fn expire_managed_cache(store: &Store) {
+    for (id, mut pin) in store.pins().unwrap() {
+        if id.starts_with("cache-") {
+            pin.last_use = 0;
+            store.pin(&id, &pin).unwrap();
+        }
+    }
+    age(store);
+    let state = store.root().join("tmp/cache");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(state.join("sweep.json"), br#"{"last_use":0}"#).unwrap();
+    let _ = store.cache_maintain(0).unwrap();
+}
+
+#[test]
+fn managed_writer_results_expire_but_raw_pins_and_finished_local_replays_remain() {
+    use tensorfs_core::fetch::{Client, Endpoint, SourcePolicy, Stream};
+
+    let repo_bytes: [&[u8]; 2] = [
+        b"\x85raw repository file, not a header",
+        br#"{"format":"tensorfs.tree/1","files":{}}"#,
+    ];
+    for mode in ["anonymous", "keyed", "streamed"] {
+        let scratch = Scratch::new();
+        let store = scratch.store().with_cache();
+        let key = (mode == "keyed").then_some("managed-resume");
+        if key.is_some() {
+            let mut writer = store.writer(None, key).unwrap();
+            writer
+                .get("c")
+                .put(
+                    "weight",
+                    &Dtype::U8,
+                    &[5],
+                    Data::Plain(WriterSource::Read(&mut &b"saved"[..])),
+                )
+                .unwrap();
+            drop(writer); // Existing keyed Drop journals the small spool before resume.
+        }
+        let mut result = None;
+        for (i, bytes) in repo_bytes.iter().enumerate() {
+            let mut writer = if mode == "streamed" {
+                let client = Client::new(SourcePolicy {
+                    allow_local: true,
+                    any_host: true,
+                    ..Default::default()
+                });
+                let endpoint = Arc::new(
+                    Endpoint::new(&client, scratch.0.join("remote").to_str().unwrap(), None)
+                        .unwrap(),
+                );
+                let runtime = tensorfs_core::fetch::runtime().unwrap();
+                store
+                    .streaming_writer(
+                        Arc::new(Stream::new(endpoint, runtime.handle().clone())),
+                        "acme/result",
+                        "",
+                        None,
+                    )
+                    .unwrap()
+            } else {
+                store.writer(None, key).unwrap()
+            };
+            if mode == "keyed" && i == 0 {
+                assert!(
+                    writer.has("c", "weight"),
+                    "the recent journal did not resume"
+                );
+            } else {
+                assert!(
+                    !writer.has("c", "weight"),
+                    "a completed key is not a journal lookup"
+                );
+            }
+            if !writer.has("c", "weight") {
+                writer
+                    .get("c")
+                    .put(
+                        "weight",
+                        &Dtype::U8,
+                        &[5],
+                        Data::Plain(WriterSource::Read(&mut &b"saved"[..])),
+                    )
+                    .unwrap();
+            }
+            writer.repo_file("README.bin", bytes).unwrap();
+            let id = writer.commit().unwrap();
+            if let Some(previous) = &result {
+                assert_eq!(
+                    previous, &id,
+                    "repo-only changes must not change the header"
+                );
+            }
+            result = Some(id.clone());
+            assert!(
+                store.get_pin(&id.sha256).unwrap().is_none(),
+                "managed result leaked an ordinary digest pin"
+            );
+            if let Some(key) = key {
+                assert!(
+                    store.get_pin(key).unwrap().is_none(),
+                    "managed result leaked an ordinary key pin"
+                );
+            }
+            let ck = store.checkpoint(&id).unwrap();
+            assert_eq!(ck.read("c", "weight").unwrap(), b"saved");
+            assert_eq!(store.read(&ObjectRef::of(bytes)).unwrap(), *bytes);
+            drop(ck); // Reopening touched the header cache pin; repo-file roots must survive that.
+        }
+        for bytes in repo_bytes {
+            assert_eq!(store.read(&ObjectRef::of(bytes)).unwrap(), bytes);
+        }
+        let id = result.unwrap();
+        let h = Header::from_cbor(&store.read(&id).unwrap()).unwrap();
+        expire_managed_cache(&store);
+        collected(&store, &[id]);
+        collected(&store, &h.chunks);
+        for bytes in repo_bytes {
+            collected(&store, &[ObjectRef::of(bytes)]);
+        }
+        if mode == "streamed" {
+            let remote = Store::open(scratch.0.join("remote")).unwrap();
+            let repo = remote.get_ref("acme/result").unwrap().unwrap();
+            assert_eq!(repo.checkpoints.len(), 2);
+            for tree in repo.checkpoints {
+                for object in remote.closure(&tree).unwrap() {
+                    assert!(remote.verify(&object).unwrap());
+                }
+            }
+        }
+    }
+
+    let scratch = Scratch::new();
+    let raw = scratch.store();
+    let mut writer = raw.writer(None, Some("operator-key")).unwrap();
+    writer
+        .get("c")
+        .put(
+            "weight",
+            &Dtype::U8,
+            &[5],
+            Data::Plain(WriterSource::Read(&mut &b"saved"[..])),
+        )
+        .unwrap();
+    let id = writer.commit().unwrap();
+    let mut tree = Tree::default();
+    tree.set_variant("", id.clone());
+    let root = raw.put_tree(&tree).unwrap();
+    raw.update_ref("local/derived", |_| {
+        Some(Repo {
+            name: "local/derived".into(),
+            releases: vec![Release {
+                version: "replay-key".into(),
+                tree: root,
+                yanked: false,
+                revision: 0,
+            }],
+            ..Default::default()
+        })
+    })
+    .unwrap();
+    expire_managed_cache(&raw.clone().with_cache());
+    assert!(
+        raw.get_pin("operator-key").unwrap().is_some(),
+        "operator retention was changed by consumer policy"
+    );
+    assert!(raw.unpin("operator-key").unwrap());
+    expire_managed_cache(&raw.clone().with_cache());
+    let repo = raw.get_ref("local/derived").unwrap().unwrap();
+    let ck = raw.variant(&repo.releases[0].tree, None).unwrap();
+    assert_eq!(ck.read("c", "weight").unwrap(), b"saved");
+}
+
+#[test]
+fn failed_managed_stream_retains_local_bytes_until_the_last_native_owner() {
+    use tensorfs_core::fetch::{Client, Endpoint, SourcePolicy, Stream};
+
+    let scratch = Scratch::new();
+    let store = scratch.store().with_cache();
+    // A real file cannot be an endpoint directory. The asynchronous upload fails at flush.
+    let destination = scratch.0.join("not-a-directory");
+    fs::write(&destination, b"an actual filesystem failure").unwrap();
+    let client = Client::new(SourcePolicy {
+        allow_local: true,
+        any_host: true,
+        ..Default::default()
+    });
+    let endpoint = Arc::new(Endpoint::new(&client, destination.to_str().unwrap(), None).unwrap());
+    let runtime = tensorfs_core::fetch::runtime().unwrap();
+    let mut writer = store
+        .streaming_writer(
+            Arc::new(Stream::new(endpoint, runtime.handle().clone())),
+            "acme/failed",
+            "",
+            None,
+        )
+        .unwrap();
+    writer
+        .get("c")
+        .put(
+            "weight",
+            &Dtype::U8,
+            &[5],
+            Data::Plain(WriterSource::Read(&mut &b"saved"[..])),
+        )
+        .unwrap();
+    writer.repo_file("README.bin", LATE).unwrap();
+    assert!(writer.commit().is_err());
+    assert!(writer.published().is_none());
+    let id = writer
+        .committed()
+        .expect("local commit must precede failed upload")
+        .clone();
+    assert!(store.get_pin(&id.sha256).unwrap().is_none());
+    let ck = store.checkpoint(&id).unwrap();
+    let chunks = ck.header().chunks.clone();
+    expire_managed_cache(&store);
+    assert_eq!(ck.read("c", "weight").unwrap(), b"saved");
+    assert_eq!(
+        store.read(&ObjectRef::of(LATE)).unwrap(),
+        LATE,
+        "failed Writer still owns its repo bytes"
+    );
+    drop(writer);
+    expire_managed_cache(&store);
+    assert_eq!(
+        ck.read("c", "weight").unwrap(),
+        b"saved",
+        "the retained checkpoint survives the failed Writer"
+    );
+    drop(ck);
+    expire_managed_cache(&store);
+    collected(&store, &[id, ObjectRef::of(LATE)]);
+    collected(&store, &chunks);
 }

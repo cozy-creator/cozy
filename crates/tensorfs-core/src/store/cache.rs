@@ -1,5 +1,6 @@
 //! Policy for an explicitly enabled library cache. Raw object stores keep their own policy.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::retention::{self, DirectoryGuard};
 use super::{fail, invalid, is_digest, now_secs, platform, Pin, Result, Store};
-use crate::format::{ObjectRef, Repo};
+use crate::format::{ObjectRef, Repo, Tree};
 
 pub(super) const TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub(super) const SWEEP: Duration = Duration::from_secs(10 * 60);
@@ -208,6 +209,30 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+
+    /// Managed writer results use disposable cache pins; raw stores keep the writer's
+    /// explicit key/header pin. Repo files remain raw non-variant tree entries, so arbitrary
+    /// CBOR-looking bytes are never interpreted as a header by the closure walker.
+    pub(crate) fn cache_writer(
+        &self,
+        header: &ObjectRef,
+        files: &BTreeMap<String, ObjectRef>,
+    ) -> Result<bool> {
+        if !self.cache_mode {
+            return Ok(false);
+        }
+        let _acquisition = retention::acquire(self)?;
+        self.cache_touch(header)?;
+        if !files.is_empty() {
+            let mut raw = self.clone();
+            raw.cache_mode = false;
+            let root = raw.put_tree(&Tree {
+                files: files.clone(),
+            })?;
+            self.cache_touch(&root)?;
+        }
+        Ok(true)
     }
 
     pub(super) fn cache_entry(&self, path: &Path) -> Option<(PathBuf, PathBuf)> {
@@ -558,7 +583,7 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{Body, Component, Dtype, Header, Location, Release, Tensor, Tree};
+    use crate::format::{Body, Component, Dtype, Header, Location, Release, Tensor};
     use std::fs::File;
     use std::sync::atomic::{AtomicU64, Ordering};
 
