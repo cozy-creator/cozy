@@ -48,7 +48,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 
 HERE = Path(__file__).resolve().parent
 CASES = HERE.parent / "vectors" / "cases" / "nvfp4.json"
-FIXTURES = HERE.parents[1] / "crates" / "tensorfs-core" / "tests" / "fixtures" / "quantized"
+FIXTURES = HERE.parents[2] / "tensorfs-core" / "tests" / "fixtures" / "quantized"
 LENS = ("Comfy-Org/Lens", "393618fd7db3e370509f84390b9162b8fd839a25", "text_encoders/gpt_oss_20b_nvfp4.safetensors")
 GPT_OSS = ("openai/gpt-oss-20b", "6cee5e81ee83917806bbde320786a8fb61efebee", "model-00000-of-00002.safetensors")
 EXPERTS, ROWS, N = [11, 14, 0], (2816, 2880), 64

@@ -1,6 +1,6 @@
 # cozytensors/1
 
-Status: normative, version 1.0. Start with the [introduction and usage guide](../README.md).
+Status: normative, version 1.1. Start with the [introduction and usage guide](../README.md).
 Conformance vectors and an independent reader: [`../conformance/`](../conformance/).
 
 This is the authoritative specification of the stored format and its decode semantics. A reader can implement it
@@ -386,6 +386,9 @@ reader that needs only some components MAY fetch only the chunks their locations
   locates and verifies every byte, and refuses only a decode or typed view of the tensors that use it. A new param of
   an existing scheme is too: an old decoder refuses the tensors whose params it does not know (§6).
 - A change that alters the meaning of an existing field, scheme or param is a new major.
+
+Minors: 1.1 adds `nvfp4`'s `pre_quant_scale` and a `scale_2` per matrix, and tiles each matrix of a stack on its own
+in `cublas_128x4` (before any stacked file was written).
 
 ## 9. Encoding
 
