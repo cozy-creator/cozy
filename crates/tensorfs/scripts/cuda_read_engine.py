@@ -93,6 +93,7 @@ try:
     assert first.is_cuda and first.data_ptr() == second.data_ptr()
     assert first.data_ptr() != copied.data_ptr()
     expected = torch.tensor(HostReads.plain, device="cuda:0")
+    expected_quantized = torch.frombuffer(bytearray(tensors.read("quantized").tobytes()), dtype=torch.float32).reshape(2, 16)
     # Consumers on a separate stream see a completed read and retain native allocations
     # after the parent checkpoint, cached component map and Array wrappers are released.
     with torch.cuda.stream(stream):
@@ -104,7 +105,7 @@ try:
     stream.synchronize()
     assert torch.equal(first, expected) and torch.equal(second, expected)
     assert torch.equal(copied, expected)
-    assert independent.shape == (2, 16)
+    assert torch.equal(independent.cpu(), expected_quantized), "a retained consumer lost its source bytes"
     torch.cuda.synchronize()
 finally:
     HostReads.tearDownClass()
