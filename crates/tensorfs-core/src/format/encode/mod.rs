@@ -20,6 +20,8 @@ mod mxfp8;
 mod nvfp4;
 
 // fp8.blockwise, mxfp4
+mod fp8_blockwise;
+mod mxfp4;
 
 // gguf
 
@@ -36,6 +38,8 @@ pub static ENCODERS: &[&Encoder] = &[
     &nvfp4::NVFP4,
 
     // fp8.blockwise, mxfp4
+    &fp8_blockwise::ENCODER,
+    &mxfp4::ENCODER,
 
     // gguf.*
 
@@ -64,6 +68,22 @@ pub struct Input<'a> {
     /// The complete encoding to produce: every param its decode reads.
     pub encoding: &'a Encoding,
     pub arrays: &'a BTreeMap<&'a str, PartBytes<'a>>,
+}
+
+impl Input<'_> {
+    /// `arrays["values"]`: the logical values, `F32` in the logical shape, all finite.
+    pub fn values(&self) -> Result<Vec<f32>> {
+        let fail = |d: &str| Error::Encode(format!("{}: {d}", self.encoding.scheme));
+        let v = (self.arrays.get("values")).ok_or_else(|| fail("no values"))?;
+        if *v.dtype != Dtype::F32 || v.shape != self.shape {
+            return Err(fail("values are not F32 in the logical shape"));
+        }
+        let x = super::decode::elem::floats(v.dtype, v.bytes);
+        if x.iter().any(|x| !x.is_finite()) {
+            return Err(fail("a value is not finite"));
+        }
+        Ok(x)
+    }
 }
 
 /// One encoded part, in the scheme's part order.

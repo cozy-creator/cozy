@@ -1,0 +1,44 @@
+{
+ "quantization_config": {
+  "algo_config": null,
+  "exclude": [],
+  "export": {
+   "kv_cache_group": [],
+   "min_kv_scale": 0.0,
+   "pack_method": "reorder",
+   "weight_format": "real_quantized",
+   "weight_merge_groups": null
+  },
+  "global_quant_config": {
+   "bias": null,
+   "input_tensors": null,
+   "output_tensors": null,
+   "target_device": null,
+   "weight": {
+    "block_size": null,
+    "ch_axis": -1,
+    "dtype": "fp4",
+    "group_size": 32,
+    "is_dynamic": false,
+    "is_scale_quant": false,
+    "mx_element_dtype": null,
+    "observer_cls": "PerBlockMXObserver",
+    "qscheme": "per_group",
+    "round_method": "half_even",
+    "scale_calculation_mode": "even",
+    "scale_format": "e8m0",
+    "scale_type": "float",
+    "symmetric": null
+   }
+  },
+  "kv_cache_post_rope": false,
+  "kv_cache_quant_config": {},
+  "layer_quant_config": {},
+  "layer_type_quant_config": {},
+  "quant_method": "quark",
+  "quant_mode": "eager_mode",
+  "softmax_quant_spec": null,
+  "version": "0.12+56b86f78b63"
+ },
+ "torch_dtype": "bfloat16"
+}
