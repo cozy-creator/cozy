@@ -103,7 +103,10 @@ pub mod writer;
 #[cfg(feature = "store")]
 mod session;
 #[cfg(feature = "store")]
-pub use session::{Checkpoint, Client, Component, Config, Endpoint, Fetch, Open, Ref};
+pub use session::{
+    bearer, Checkpoint, Client, Component, Config, Endpoint, Fetch, Fetched, HeaderMap, Open,
+    Progress, Ref, Request, Selection, TokenProvider,
+};
 
 
 /// This TensorFS's release version.
