@@ -30,7 +30,7 @@ with tempfile.TemporaryDirectory() as temporary:
                 continue
             expected = bits(case["expect"])
             writer = tensorfs.Writer(cache_dir=temporary)
-            component = writer.component("model")
+            component = writer.component("model", cls="test.Conformance", config={})
             parts = {part["role"]: (part["dtype"], part["shape"], bits(part["bits"]))
                      for part in case["parts"]}
             component.put_encoded("value", dtype=case["dtype"], shape=case["shape"],

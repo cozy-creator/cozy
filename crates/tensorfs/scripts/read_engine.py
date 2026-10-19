@@ -83,7 +83,7 @@ class HostReads(unittest.TestCase):
 
     def test_dlpack_refuses_dimensions_outside_its_signed_shape_abi(self) -> None:
         writer = tfs.Writer(cache_dir=self.cache)
-        writer.component("empty").put("large-shape", b"", dtype="U8", shape=[0, 2**63])
+        writer.component("empty", cls="test.Empty", config={}).put("large-shape", b"", dtype="U8", shape=[0, 2**63])
         array = writer.commit().components["empty"].tensors.read("large-shape")
         self.assertEqual(array.nbytes, 0)
         with self.assertRaises(tfs.InvalidError):
