@@ -2,6 +2,10 @@
 //!
 //! `<root>/{format, blobs/<aa>/<bb>/<sha256>, refs/<org>/<name>.json, pins/<id>.json, tmp/}`
 //!
+//! - Objects are trees, cozytensors headers, chunks, assets and repo files. A ref names a
+//!   model's releases of trees; a pin keeps trees or headers. A cozytensors is opened by its
+//!   header ([`Store::checkpoint`]) or a tree's variant ([`Store::variant`]); a plain folder
+//!   enters by [`Store::admit_folder`] and leaves by [`Store::snapshot`].
 //! - One door admits objects ([`Store::admit`], [`Store::put`]): streamed into `tmp/`, hashed,
 //!   checked, flushed per [`Durability`] and renamed into `blobs/`. An object is verified there
 //!   once and trusted after; [`Store::verify`] rehashes on demand.
@@ -13,10 +17,11 @@
 //!   a name, and an open descriptor outlives an unlink.
 
 mod checkpoint;
+mod folder;
 mod gc;
 mod records;
 
-pub use checkpoint::{Checkpoint, ChunkRead, Piece, Placed, ReadPlan};
+pub use checkpoint::{wanted, Checkpoint, ChunkRead, Piece, Placed, ReadPlan};
 pub use gc::{Collected, PinUsage, Usage};
 pub(crate) use records::is_name;
 pub use records::Pin;

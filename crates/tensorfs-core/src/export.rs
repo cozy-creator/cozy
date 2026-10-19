@@ -26,13 +26,13 @@ pub use gguf::gguf;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value as Json};
 
 use crate::client::io;
 use crate::failure::{fail, Kind, Result};
-use crate::format::{decode, Body, Dtype, Location, PartBytes, Value, HEADER_PATH};
+use crate::format::{decode, variant_of, Body, Dtype, Location, PartBytes, Value};
 use crate::import::FILE_METADATA;
 use crate::store2::Checkpoint;
 
@@ -65,8 +65,14 @@ fn part_name(key: &str, role: &str) -> String {
     }
 }
 
-/// Writes `ck` into `dir` as a Diffusers/Transformers folder; the paths written, relative.
-pub fn safetensors(ck: &Checkpoint, dir: &Path, dequantize: Option<&Dtype>) -> Result<Vec<String>> {
+/// Writes `ck` into `dir` as a Diffusers/Transformers folder, with the repo files `repo` (path →
+/// local file; a tree's files other than its variants); the paths written, relative.
+pub fn safetensors(
+    ck: &Checkpoint,
+    repo: &BTreeMap<String, PathBuf>,
+    dir: &Path,
+    dequantize: Option<&Dtype>,
+) -> Result<Vec<String>> {
     if let Some(dtype) = dequantize {
         if !matches!(dtype, Dtype::F32 | Dtype::BF16 | Dtype::F16) {
             return fail(
@@ -75,31 +81,53 @@ pub fn safetensors(ck: &Checkpoint, dir: &Path, dequantize: Option<&Dtype>) -> R
             );
         }
     }
-    let files = &ck.manifest().files;
-    let index: BTreeMap<String, Json> = match files.get("model_index.json") {
-        Some(_) => serde_json::from_slice(&ck.file("model_index.json")?).unwrap_or_default(),
-        None => BTreeMap::new(),
+    let files: BTreeMap<&String, &PathBuf> =
+        repo.iter().filter(|(p, _)| variant_of(p).is_none()).collect();
+    let read = |path: &str| fs::read(files.get(&path.to_owned())?).ok();
+    let index: BTreeMap<String, Json> = match (ck.pipeline(), read("model_index.json")) {
+        (Some(p), _) => serde_json::from_value(json!(p.config)).unwrap_or_default(),
+        (None, Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        (None, None) => BTreeMap::new(),
     };
     let file_metadata = match ck.header().metadata.get(FILE_METADATA) {
         Some(Value::Map(m)) => m.clone(),
         _ => BTreeMap::new(),
     };
     let mut written = Vec::new();
-    for path in files.keys().filter(|p| *p != HEADER_PATH) {
+    for (path, local) in &files {
         let dest = dir.join(path);
         let parent = dest.parent().expect("a file has a directory");
         fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
-        fs::write(&dest, ck.file(path)?).map_err(|e| io(&dest, e))?;
-        written.push(path.clone());
+        fs::copy(local, &dest).map_err(|e| io(&dest, e))?;
+        written.push((*path).clone());
+    }
+    for c in ck.components() {
+        let at = |name: &str| format!("{}/{name}", c.name);
+        if !c.config.is_empty() {
+            let path = at(c.config_name());
+            let dest = dir.join(&path);
+            fs::create_dir_all(dest.parent().expect("a folder")).map_err(|e| io(&dest, e))?;
+            let bytes = serde_json::to_vec_pretty(&c.config).expect("a config serializes");
+            fs::write(&dest, bytes).map_err(|e| io(&dest, e))?;
+            written.push(path);
+        }
+        for (name, object) in &c.assets {
+            let path = at(name);
+            let dest = dir.join(&path);
+            fs::create_dir_all(dest.parent().expect("a folder")).map_err(|e| io(&dest, e))?;
+            io::copy(&mut ck.object(object)?, &mut File::create(&dest).map_err(|e| io(&dest, e))?)
+                .map_err(|e| io(&dest, e))?;
+            written.push(path);
+        }
     }
     for c in ck.header().components() {
         let component = &c.name;
         let in_folder = index.contains_key(component)
-            || files
-                .keys()
-                .any(|p| p.starts_with(&format!("{component}/")));
+            || !c.config.is_empty()
+            || !c.assets.is_empty()
+            || files.keys().any(|p| p.starts_with(&format!("{component}/")));
         let (folder, weights) = if in_folder {
-            (format!("{component}/"), weights_name(ck, &index, component))
+            (format!("{component}/"), weights_name(c, &index, &read))
         } else {
             (String::new(), component.clone())
         };
@@ -227,18 +255,25 @@ pub fn safetensors(ck: &Checkpoint, dir: &Path, dequantize: Option<&Dtype>) -> R
 }
 
 /// `diffusion_pytorch_model` for a Diffusers component, `model` for any other.
-fn weights_name(ck: &Checkpoint, index: &BTreeMap<String, Json>, component: &str) -> String {
+fn weights_name(
+    c: &crate::format::Component,
+    index: &BTreeMap<String, Json>,
+    read: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> String {
+    let component = &c.name;
     let diffusers = match index
         .get(component)
         .and_then(|v| v.get(0))
         .and_then(Json::as_str)
     {
         Some(library) => library == "diffusers",
-        None => ck
-            .file(&format!("{component}/config.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Map<String, Json>>(&b).ok())
-            .is_some_and(|c| c.contains_key("_diffusers_version") || c.contains_key("_class_name")),
+        None => {
+            c.class.starts_with("diffusers.")
+                || c.config.contains_key("_diffusers_version")
+                || read(&format!("{component}/config.json"))
+                    .and_then(|b| serde_json::from_slice::<Map<String, Json>>(&b).ok())
+                    .is_some_and(|c| c.contains_key("_diffusers_version") || c.contains_key("_class_name"))
+        }
     };
     if diffusers {
         "diffusion_pytorch_model"
@@ -306,7 +341,7 @@ fn write_file(
 fn copy(ck: &Checkpoint, at: &Location, out: &mut impl Write) -> Result<()> {
     for span in ck.header().spans(at) {
         let path = &ck.chunk_path(span.chunk);
-        let mut file = ck.store().file(&ck.header().chunks[span.chunk])?;
+        let mut file = ck.chunk(span.chunk)?;
         file.seek(SeekFrom::Start(span.start))
             .map_err(|e| io(path, e))?;
         let n = io::copy(&mut file.take(span.length), out).map_err(|e| io(path, e))?;
