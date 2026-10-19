@@ -33,7 +33,7 @@ use std::{
         atomic::Ordering,
         Arc, Condvar, Mutex, Weak,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use crate::storage::Store;
 

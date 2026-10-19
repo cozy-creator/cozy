@@ -105,7 +105,7 @@ fn a_request_key_trades_once_without_the_machine_leaf() {
         (200, _) => Ok(()),
         (status, _) => Err(status),
     };
-    assert!(stolen.is_err(), "a stolen token without the key is refused");
+    assert_eq!(stolen, Err(401), "a stolen token without the key is refused");
 
     // Revoking the device key ends the run's private work at its next request, typed, with
     // no second trade.
