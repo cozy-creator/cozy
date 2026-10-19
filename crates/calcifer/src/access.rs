@@ -309,31 +309,10 @@ fn ordinary_tensorfs_needed(spec: &v1::RunSpec, operations: &[Value]) -> bool {
     spec.tensorfs.is_none() && !operations.is_empty()
 }
 
-/// Transport for public model reads uses the Hub already selected for the outbound spec.
-/// A blank model choice can resolve to a Hub default; known local headers/aliases and
-/// provider-only choices need no Hub transport. This descriptor acquires no credential.
+/// The existing outbound Hub context also names public model defaults resolved later by
+/// TensorD. Copying its transport acquires no credential and makes no network call.
 pub(crate) fn anonymous_tensorfs(spec: &v1::RunSpec) -> Option<v1::TensorFSOptions> {
-    let hub_model = |repository: &str, manifest: &str, source: &str| {
-        source.is_empty()
-            && !repository.starts_with("local/")
-            && (!repository.is_empty() || manifest.is_empty())
-    };
-    let mut choices = spec.models.iter().chain(
-        spec.set
-            .iter()
-            .flat_map(|set| set.items.iter().flat_map(|item| item.models.iter())),
-    );
-    let needs_hub = choices.any(|choice| {
-        hub_model(&choice.repository, &choice.manifest, &choice.source)
-            || choice
-                .adapters
-                .iter()
-                .any(|adapter| hub_model(&adapter.model, &adapter.manifest, &adapter.source))
-    });
-    let hub = spec
-        .hub
-        .as_ref()
-        .filter(|hub| !hub.origin.is_empty() && needs_hub)?;
+    let hub = spec.hub.as_ref().filter(|hub| !hub.origin.is_empty())?;
     Some(v1::TensorFSOptions {
         endpoint: hub.origin.clone(),
         ca_der: hub.ca_der.clone(),
@@ -540,14 +519,21 @@ mod tests {
                 ..Default::default()
             })
         };
-        for model in [
-            choice("public/model", "1", ""),
-            v1::ModelChoice {
+        for models in [
+            vec![],
+            vec![choice("public/model", "1", "")],
+            vec![v1::ModelChoice {
                 parameter: "default".into(),
                 ..Default::default()
-            },
+            }],
+            vec![choice("local/base", "", "")],
+            vec![choice("", "", "sha256:local-header")],
+            vec![v1::ModelChoice {
+                source: "hf://owner/model".into(),
+                ..Default::default()
+            }],
         ] {
-            let options = map(vec![model]).unwrap();
+            let options = map(models).unwrap();
             assert_eq!(
                 (options.endpoint, options.ca_der),
                 (hub.origin.clone(), hub.ca_der.clone())
@@ -561,22 +547,15 @@ mod tests {
             ..Default::default()
         });
         assert!(map(vec![local]).is_some());
-        for model in [
-            choice("local/base", "", ""),
-            choice("", "", "sha256:local-header"),
-            v1::ModelChoice {
-                source: "hf://owner/model".into(),
-                ..Default::default()
-            },
-        ] {
-            assert!(map(vec![model]).is_none());
-        }
-        assert!(map(vec![]).is_none(), "a source-free Writer stays local");
+        assert!(
+            anonymous_tensorfs(&v1::RunSpec::default()).is_none(),
+            "a no-Hub local run has no transport"
+        );
         let warm = v1::RunSpec {
             hub: Some(hub),
             set: Some(v1::WarmSet {
                 items: vec![v1::WarmItem {
-                    models: vec![v1::ModelChoice::default()],
+                    models: vec![],
                     ..Default::default()
                 }],
             }),
@@ -679,7 +658,26 @@ mod tests {
                 },
             )
             .unwrap();
+        for models in [
+            vec![],
+            vec![choice("local/base", "", "")],
+            vec![v1::ModelChoice {
+                source: "hf://owner/model".into(),
+                ..Default::default()
+            }],
+        ] {
+            let mut local = row.spec.clone();
+            local.models = models;
+            calcifer.finish_spec(&row, &mut local, Access::default());
+            assert!(local.tensorfs.unwrap().token.is_empty());
+        }
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "transport construction made a network call"
+        );
         let mut sent = row.spec.clone();
+        // Normal omitted CLI defaults have an empty model vector; actual resolution follows.
+        sent.models.clear();
         calcifer.finish_spec(&row, &mut sent, Access::default());
         let options = sent.tensorfs.unwrap();
         assert_eq!(options.endpoint, selected);
