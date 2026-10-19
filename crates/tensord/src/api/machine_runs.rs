@@ -748,6 +748,24 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_references_reach_the_run_log_without_fabricated_byte_metadata() {
+        let checkpoint = v1::CheckpointRef {
+            repo_id: "owner/model".into(), revision: format!("sha256:{}", "b".repeat(64)), variant: "bf16".into(),
+        };
+        let mut log = Log::default();
+        let event = log.event(domain::MachineExecutionEvent {
+            kind: "product".into(), product: Some(domain::RunProduct {
+                output: "weights".into(), checkpoint: Some(checkpoint.clone()),
+                op: domain::RunProductOp::Set as i32, ..Default::default()
+            }), ..Default::default()
+        }).unwrap();
+        let v1::Event::Product(product) = event.event else { panic!("checkpoint is a product") };
+        assert_eq!(product.checkpoint, Some(checkpoint));
+        assert_eq!((product.length, product.digest.as_str(), product.media_type.as_str()), (0, "", ""));
+        assert_eq!(log.products, vec![product]);
+    }
+
+    #[test]
     fn exact_gpu_count_survives_the_wire_and_is_advertised() {
         let mut sent = authored();
         sent.gpus = 2;
