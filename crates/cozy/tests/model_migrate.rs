@@ -95,14 +95,22 @@ fn encode(c: &Cbor, out: &mut Vec<u8>) {
     }
 }
 
-/// One old tensor: its key, logical dtype and shape, spec, and parts (role, dtype, shape, bytes,
-/// whether the header holds them inline).
+/// One old tensor: its key, logical dtype and shape, spec, and parts.
 struct Tensor {
     key: &'static str,
     dtype: u64,
     shape: Vec<u64>,
     spec: u64,
-    parts: Vec<(&'static str, u64, Vec<u64>, Vec<u8>, bool)>,
+    parts: Vec<Part>,
+}
+
+/// One old part, and whether the header holds its bytes inline.
+struct Part {
+    role: &'static str,
+    dtype: u64,
+    shape: Vec<u64>,
+    bytes: Vec<u8>,
+    inline: bool,
 }
 
 /// A checkpoint from before the cut: its objects by digest, its header and two manifests naming
@@ -117,7 +125,8 @@ struct Old {
 fn old() -> Old {
     let plain = |key, shape: Vec<u64>, seed, inline| {
         let n = shape.iter().product::<u64>() as usize * 2;
-        Tensor { key, dtype: BF16, shape: shape.clone(), spec: 0, parts: vec![("value", BF16, shape, noise(seed, n), inline)] }
+        let part = Part { role: "value", dtype: BF16, shape: shape.clone(), bytes: noise(seed, n), inline };
+        Tensor { key, dtype: BF16, shape, spec: 0, parts: vec![part] }
     };
     let tensors = vec![
         // 16 MiB: one object on the old grid, which the new checkpoint reuses.
@@ -130,8 +139,8 @@ fn old() -> Old {
             shape: vec![32, 256],
             spec: 1,
             parts: vec![
-                ("data", F8_E4M3, vec![32, 256], noise(4, 32 * 256), false),
-                ("scale", F32, vec![32], noise(5, 32 * 4), true),
+                Part { role: "data", dtype: F8_E4M3, shape: vec![32, 256], bytes: noise(4, 32 * 256), inline: false },
+                Part { role: "scale", dtype: F32, shape: vec![32], bytes: noise(5, 32 * 4), inline: true },
             ],
         },
     ];
@@ -139,16 +148,17 @@ fn old() -> Old {
     let items = (tensors.iter())
         .map(|t| {
             let parts = (t.parts.iter())
-                .map(|(role, dtype, shape, bytes, inline)| {
-                    let body = match inline {
-                        true => Cbor::B(bytes.clone()),
+                .map(|p| {
+                    let body = match p.inline {
+                        true => Cbor::B(p.bytes.clone()),
                         false => {
-                            objects.push((sha(bytes), bytes.clone()));
-                            let digest = hex::decode(sha(bytes)).unwrap();
-                            Cbor::A(vec![Cbor::A(vec![Cbor::B(digest), Cbor::U(bytes.len() as u64)])])
+                            objects.push((sha(&p.bytes), p.bytes.clone()));
+                            let digest = hex::decode(sha(&p.bytes)).unwrap();
+                            Cbor::A(vec![Cbor::A(vec![Cbor::B(digest), Cbor::U(p.bytes.len() as u64)])])
                         }
                     };
-                    Cbor::A(vec![Cbor::T(role), Cbor::U(*dtype), Cbor::A(shape.iter().map(|n| Cbor::U(*n)).collect()), body])
+                    let shape = p.shape.iter().map(|n| Cbor::U(*n)).collect();
+                    Cbor::A(vec![Cbor::T(p.role), Cbor::U(p.dtype), Cbor::A(shape), body])
                 })
                 .collect();
             let shape = t.shape.iter().map(|n| Cbor::U(*n)).collect();
@@ -301,10 +311,10 @@ fn same_tensors(old: &Old, root: &Path, manifest: &str) {
             Body::Encoded { parts, .. } => parts.iter().map(|p| (p.role.clone(), p.at())).collect(),
         };
         assert_eq!(at.len(), t.parts.len(), "{}", t.key);
-        for ((_, location), (role, _, _, bytes, _)) in at.iter().zip(&t.parts) {
+        for ((_, location), part) in at.iter().zip(&t.parts) {
             let mut read = vec![0; location.length as usize];
             ck.bytes_into(location, &mut read).unwrap();
-            assert!(read == *bytes, "{} part {role} differs from the old bytes", t.key);
+            assert!(read == part.bytes, "{} part {} differs from the old bytes", t.key, part.role);
         }
     }
 }

@@ -74,6 +74,14 @@ async fn run(ctx: &Context, args: &Args, target: String, spec: RunSpec) -> Resul
     crate::run::follow(ctx, submitted.run, false).await
 }
 
+/// The verb's document: with `--json`, one line after the runs' events.
+fn print(ctx: &Context, doc: &Value) {
+    match ctx.json {
+        true => output::ndjson(doc),
+        false => output::json(doc),
+    }
+}
+
 fn write(path: &Path, doc: &Value) -> Result<(), Error> {
     let io = |e: std::io::Error| Error::new(Kind::Internal, "audit_write_failed", format!("{}: {e}", path.display()));
     std::fs::create_dir_all(path.parent().unwrap_or(Path::new("."))).map_err(io)?;
@@ -184,7 +192,7 @@ pub(crate) async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         models.push(json!({"model": repo.to_string(), "checkpoints": audits.into_values().collect::<Vec<_>>(),
             "releases": repointed}));
     }
-    output::json(&json!({"models": models, "audit": args.audit}));
+    print(ctx, &json!({"models": models, "audit": args.audit}));
     Ok(if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
@@ -203,6 +211,6 @@ async fn local(ctx: &Context, args: &Args, store: &Path) -> Result<ExitCode, Err
         let name = model["repository"].as_str().unwrap_or_default().replace('/', "__");
         write(&args.audit.join(format!("{name}.json")), model)?;
     }
-    output::json(&json!({"run": ran.number, "status": ran.status, "models": models, "audit": args.audit}));
+    print(ctx, &json!({"run": ran.number, "status": ran.status, "models": models, "audit": args.audit}));
     Ok(crate::run::exit_code(&ran))
 }
