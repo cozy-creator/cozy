@@ -32,6 +32,8 @@ pub enum Producer {
     Quark,
     Gptq,
     Awq,
+    /// bitsandbytes: `quant_method: bitsandbytes`, or its own `quant_state` documents.
+    Bitsandbytes,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,6 +205,9 @@ pub struct FoldedPart {
     pub dtype: Dtype,
     pub shape: Vec<u64>,
     pub at: Tensor,
+    /// The part's bytes when the producer keeps them in a document, not a tensor (bnb's
+    /// `nested_offset`, a JSON float).
+    pub inline: Option<Vec<u8>>,
 }
 
 /// A module's own declaration: ComfyUI's marker or `_quantization_metadata` layer, ModelOpt's
@@ -380,6 +385,7 @@ fn quantization_config(doc: &Json, what: &str) -> Result<Declared> {
             };
             Declared::of_config(producer, what, doc.clone())
         }
+        Some("bitsandbytes") => Declared::new(Producer::Bitsandbytes, what.to_owned()),
         Some("compressed-tensors") => {
             let mut d = Declared::new(Producer::CompressedTensors, what.to_owned());
             d.configs.push((what.to_owned(), doc.clone()));
@@ -453,7 +459,7 @@ fn read_json(set: &SourceSet, path: &str) -> Result<Option<Json>> {
         .map_err(|e| malformed(path, e))
 }
 
-fn bytes(set: &SourceSet, key: &str, t: &Tensor) -> Result<Vec<u8>> {
+pub(super) fn bytes(set: &SourceSet, key: &str, t: &Tensor) -> Result<Vec<u8>> {
     if t.len > 1 << 20 {
         return refuse(Code::SIZE_CAP, format!("{key}: a {} byte marker", t.len));
     }
@@ -567,6 +573,9 @@ fn declared(set: &SourceSet, group: &Group) -> Result<Option<Declared>> {
         }
     }
     all.extend(comfy);
+    if let Some(found) = super::bnb::declaration(group) {
+        all.push(Declared::new(Producer::Bitsandbytes, found));
+    }
     let producers: BTreeSet<Producer> = all.iter().map(|d| d.producer).collect();
     if producers.len() > 1 {
         let found: Vec<String> = all.iter().flat_map(|d| d.found.clone()).collect();
@@ -782,6 +791,7 @@ fn fit(
             dtype: rule.stored.clone().unwrap_or_else(|| t.dtype.clone()),
             shape: part_shape,
             at: (*t).clone(),
+            inline: None,
         });
     }
     if carrier.from_config {
@@ -1164,7 +1174,12 @@ pub fn fold(set: &mut SourceSet) -> Result<()> {
             companions(group)?;
             continue;
         };
-        let folded = fold_group(set, group, &d)?;
+        let folded = match d.producer {
+            Producer::Bitsandbytes => {
+                super::bnb::fold_group(set, group, &|c| logical_dtype(group, &d, c))?
+            }
+            _ => fold_group(set, group, &d)?,
+        };
         let group = &mut set.groups[g];
         for key in &d.markers {
             group.tensors.remove(key);
@@ -1215,7 +1230,7 @@ fn undeclared(group: &Group) -> Result<()> {
     }
 }
 
-type Folds = BTreeMap<String, (Vec<String>, Tensor)>;
+pub(super) type Folds = BTreeMap<String, (Vec<String>, Tensor)>;
 
 /// A module's carrier tensors present: suffix -> (key, tensor).
 type Present<'g> = BTreeMap<&'g str, (&'g str, &'g Tensor)>;
