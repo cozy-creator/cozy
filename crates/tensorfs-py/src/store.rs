@@ -200,12 +200,11 @@ fn config_map(d: &Bound<'_, PyDict>) -> PyResult<Config> {
 fn named(store: &Store, reference: &Bound<'_, PyAny>, variant: Option<&str>) -> PyResult<Named> {
     let py = reference.py();
     if let Ok(ck) = reference.cast::<PyCheckpoint>() {
+        let stored = ck.get().stored(py)?;
         if let Some(named) = &ck.get().named {
             return Ok(named.clone());
         }
-        if let Some(stored) = &ck.get().stored {
-            return Ok(Named { header: stored.id().clone(), tree: None, name: None, release: None, variant: None });
-        }
+        return Ok(Named { header: stored.id().clone(), tree: None, name: None, release: None, variant: None });
     }
     match reference.extract::<String>() {
         Ok(text) => py.detach(|| store.resolve(&text, variant)).or_raise(py),
