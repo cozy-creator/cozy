@@ -4,6 +4,7 @@
 //! core's proof runs on a rental (`scripts/varena-gpu.py`).
 #![cfg(target_os = "linux")]
 
+use tensorfs_core::import::Sink;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
@@ -127,9 +128,9 @@ fn a_header_parsed_alone_binds_and_seals_from_its_grant_only() {
     let fx = Fixture::new("parsed");
     let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
     let parsed = View::parsed(fx.ck.header().clone());
-    check(&Host.register("parsed", parsed, &rs, None, Some(granted(&fx.ck))).unwrap());
-    assert!(matches!(Host.register("bare", parsed, &rs, None, None), Err(Error::Invalid(_))), "no store, no grant: nothing to read");
-    let fd = memory::seal(parsed, &rs, "parsed", 2, Some(granted(&fx.ck))).unwrap();
+    check(&Host.register("parsed", parsed.clone(), &rs, None, Some(granted(&fx.ck))).unwrap());
+    assert!(matches!(Host.register("bare", parsed.clone(), &rs, None, None), Err(Error::Invalid(_))), "no store, no grant: nothing to read");
+    let fd = memory::seal(parsed.clone(), &rs, "parsed", 2, Some(granted(&fx.ck))).unwrap();
     check(&Host.register("sealed", parsed, &rs, Some(fd.as_raw_fd()), None).unwrap());
 }
 
