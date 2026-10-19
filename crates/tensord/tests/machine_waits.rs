@@ -213,6 +213,8 @@ async fn a_restart_keeps_the_queue_and_prepares_an_interrupted_run_again() {
     until(&client, "q", place).await;
     let fresh = tree(&client, "fresh").await;
     client.submit(&v1::RunRequest { id: "p".into(), spec: spec(&fresh, "nap", r#"{"seconds":0.0}"#) }).await.unwrap();
+    let first = Box::pin(client.events("p", 0).await.unwrap()).next().await.unwrap().unwrap().event;
+    assert!(matches!(&first, v1::Event::State(state) if state.state == "preparing"), "{first:?}");
     drop(machine);
     std::fs::remove_file(home.path().join(".cozy/machine/var/lib/cozy/tensord/api-ready.json")).unwrap();
 
