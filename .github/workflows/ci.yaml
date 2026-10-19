@@ -27,11 +27,9 @@ jobs:
       runtime_ref: 4a63e5b1fba951ebe287621ce9674f014a19ff0c
       # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below. Known master
       # failures are skipped by name until their fix lands, then the skip goes:
-      #   a_restart_neither_shortens_nor_extends_the_idle_clock: xs-047
       test: >-
         cargo test --workspace --locked --no-fail-fast --exclude cozy --exclude calcifer --exclude tensord &&
-        cargo test --locked --no-fail-fast -p tensord --
-        --skip a_restart_neither_shortens_nor_extends_the_idle_clock
+        cargo test --locked --no-fail-fast -p tensord
 
   owner-day:
     if: github.event_name == 'push'

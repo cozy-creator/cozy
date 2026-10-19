@@ -454,8 +454,9 @@ async fn a_job_holds_the_rental_and_its_end_starts_the_idle_clock() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// A restart mid-job never releases early: a job preparing when the service stopped ends at the
-/// restart, which starts the clock. A restart mid-idle keeps the exact deadline.
+/// A restart mid-job never releases early: a job preparing when the service stopped prepares
+/// again after it (xs-047) and holds the rental; the clock starts when it ends. A restart
+/// mid-idle keeps the exact deadline.
 #[tokio::test]
 async fn a_restart_neither_shortens_nor_extends_the_idle_clock() {
     let root = root("idle-restart");
@@ -472,13 +473,17 @@ async fn a_restart_neither_shortens_nor_extends_the_idle_clock() {
     stop(&mut machine);
     // Down longer than the whole window: the clock from before the job ran out long ago.
     std::thread::sleep(Duration::from_millis(idle_ms as u64 + 1_000));
-    let relaunched = now_ms();
     let mut machine = launch_idle(&root, port, provider_port, idle);
     ready(&mut machine, &root, port);
     let client = owner(&root, port);
-    let first = deadline(&client, false).await;
-    assert!(first >= relaunched + idle_ms, "the job ended at the restart: {first} vs {relaunched}");
+    assert_eq!(deadline(&client, false).await, 0, "the job prepares again after the restart");
     assert!(received.recv_timeout(Duration::from_millis(idle_ms as u64 / 3)).is_err(), "released early after a restart mid-job");
+    let ended = now_ms();
+    client.cancel("stalled-2").await.unwrap();
+    // Status reads the jobs the machine sampled within the last second.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let first = deadline(&client, false).await;
+    assert!(first >= ended + idle_ms, "the clock started before the job ended: {first} vs {ended}");
     drop(client);
     stop(&mut machine);
     let mut machine = launch_idle(&root, port, provider_port, idle);
