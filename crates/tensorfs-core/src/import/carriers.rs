@@ -17,6 +17,8 @@ use crate::format::{check, Dtype, Encoding, PartBytes, Value};
 
 use super::source::{Group, SourceSet, Tensor};
 
+mod bnb;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Producer {
@@ -32,6 +34,8 @@ pub enum Producer {
     Quark,
     Gptq,
     Awq,
+    /// bitsandbytes: `quant_method: bitsandbytes`, or its own `quant_state` documents.
+    Bitsandbytes,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,6 +207,9 @@ pub struct FoldedPart {
     pub dtype: Dtype,
     pub shape: Vec<u64>,
     pub at: Tensor,
+    /// The part's bytes when the producer keeps them in a document, not a tensor (bnb's
+    /// `nested_offset`, a JSON float).
+    pub inline: Option<Vec<u8>>,
 }
 
 /// A module's own declaration: ComfyUI's marker or `_quantization_metadata` layer, ModelOpt's
@@ -380,6 +387,7 @@ fn quantization_config(doc: &Json, what: &str) -> Result<Declared> {
             };
             Declared::of_config(producer, what, doc.clone())
         }
+        Some("bitsandbytes") => Declared::new(Producer::Bitsandbytes, what.to_owned()),
         Some("compressed-tensors") => {
             let mut d = Declared::new(Producer::CompressedTensors, what.to_owned());
             d.configs.push((what.to_owned(), doc.clone()));
@@ -567,6 +575,9 @@ fn declared(set: &SourceSet, group: &Group) -> Result<Option<Declared>> {
         }
     }
     all.extend(comfy);
+    if let Some(found) = bnb::declaration(group) {
+        all.push(Declared::new(Producer::Bitsandbytes, found));
+    }
     let producers: BTreeSet<Producer> = all.iter().map(|d| d.producer).collect();
     if producers.len() > 1 {
         let found: Vec<String> = all.iter().flat_map(|d| d.found.clone()).collect();
@@ -782,6 +793,7 @@ fn fit(
             dtype: rule.stored.clone().unwrap_or_else(|| t.dtype.clone()),
             shape: part_shape,
             at: (*t).clone(),
+            inline: None,
         });
     }
     if carrier.from_config {
@@ -1164,7 +1176,12 @@ pub fn fold(set: &mut SourceSet) -> Result<()> {
             companions(group)?;
             continue;
         };
-        let folded = fold_group(set, group, &d)?;
+        let folded = match d.producer {
+            Producer::Bitsandbytes => {
+                bnb::fold_group(set, group, &|c| logical_dtype(group, &d, c))?
+            }
+            _ => fold_group(set, group, &d)?,
+        };
         let group = &mut set.groups[g];
         for key in &d.markers {
             group.tensors.remove(key);

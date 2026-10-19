@@ -191,6 +191,9 @@ fn check(case: &str, wants: &[Want]) -> BTreeMap<String, usize> {
         assert_eq!(got, wanted, "{}", want.key);
         // Each part is the producer's tensor, byte for byte.
         for (p, (_, _, _, suffix)) in parts.iter().zip(want.parts) {
+            if suffix.is_empty() {
+                continue; // a part held in the producer's document (bnb's nested_offset)
+            }
             let (_, _, bytes) = &producer[&format!("{module}.{suffix}")];
             assert_eq!(&raw(&p.at()), bytes, "{} part {}", want.key, p.role);
         }
@@ -794,10 +797,6 @@ fn tfs_inspect_shows_comfy_nvfp4_at_a_glance() {
     );
 }
 
-fn tensor(key: &str, dtype: &str, shape: &[u64], bytes: Vec<u8>) -> Entry {
-    (key.into(), dtype.into(), shape.to_vec(), bytes)
-}
-
 fn zeros(dtype: &str, shape: &[u64]) -> Entry {
     let n = Dtype::parse(dtype).byte_len(shape).unwrap();
     (
@@ -812,41 +811,163 @@ fn named(key: &str, (_, d, s, b): Entry) -> Entry {
     (key.into(), d, s, b)
 }
 
-/// lllyasviel/flux1-dev-bnb-nf4@32d13814 (`flux1-dev-bnb-nf4-v2.safetensors`) is one file with no
-/// config: each NF4 weight is `U8 [n, 1]` beside `.absmax`, `.quant_map` and
-/// `.quant_state.bitsandbytes__nf4` (JSON bytes). Its keys and dtypes, at a small size, are refused,
-/// not stored as plain tensors.
+const NF4_DQ: &str = "bnb.nf4 {block_size: 64, double_quant: true}";
+type Parts = &'static [(&'static str, &'static str, &'static [u64], &'static str)];
+const NF4_DQ_PARTS: Parts = &[
+    ("weight", "U8", &[8192, 1], "weight"),
+    ("absmax", "U8", &[256], "weight.absmax"),
+    ("quant_map", "F32", &[16], "weight.quant_map"),
+    ("nested_absmax", "F32", &[1], "weight.nested_absmax"),
+    ("nested_quant_map", "F32", &[256], "weight.nested_quant_map"),
+    ("nested_offset", "F32", &[], ""),
+];
+
+/// bitsandbytes reads from its `quantization_config` or, with no config, from each weight's own
+/// quant_state document (`make_bnb.py`): real unsloth and Forge (lllyasviel) bytes decode bit for
+/// bit as bitsandbytes dequantizes them, at NF4's ~9.5% from the BF16 originals.
 #[test]
-fn a_bnb_nf4_single_file_is_refused() {
-    let module = "model.diffusion_model.double_blocks.0.img_attn.proj";
-    let state =
-        br#"{"quant_type": "nf4", "blocksize": 64, "dtype": "bfloat16", "shape": [64, 64]}"#;
-    let bnb = |t: &mut Tensors| {
-        t.extend([
-            named(&format!("{module}.bias"), zeros("BF16", &[64])),
-            named(&format!("{module}.weight"), zeros("U8", &[2048, 1])),
-            named(&format!("{module}.weight.absmax"), zeros("F32", &[64])),
-            named(&format!("{module}.weight.quant_map"), zeros("F32", &[16])),
-            tensor(
-                &format!("{module}.weight.quant_state.bitsandbytes__nf4"),
-                "U8",
-                &[state.len() as u64],
-                state.to_vec(),
-            ),
-        ])
+fn bitsandbytes_reads_by_its_declaration_or_its_quant_state() {
+    let nf4 = |key, parts| Want {
+        key,
+        encoding: NF4_DQ,
+        parts,
+        meets: Meets::Exactly,
+        error: 0.1,
     };
-    let e = refused("bnb-nf4", &|t, _, _| bnb(t));
+    check(
+        "real-bnb-unsloth",
+        &[
+            nf4("model.layers.0.self_attn.k_proj.weight", NF4_DQ_PARTS),
+            nf4("model.layers.15.mlp.down_proj.weight", NF4_DQ_PARTS),
+        ],
+    );
+    check(
+        "real-bnb-forge",
+        &[Want {
+            key: "model.diffusion_model.double_blocks.0.img_attn.proj.weight",
+            encoding: "bnb.nf4 {block_size: 64, double_quant: false}",
+            parts: &[
+                ("weight", "U8", &[12288, 1], "weight"),
+                ("absmax", "F32", &[384], "weight.absmax"),
+                ("quant_map", "F32", &[16], "weight.quant_map"),
+            ],
+            meets: Meets::Exactly,
+            error: 0.1,
+        }],
+    );
+    check(
+        "bnb-fp4-dq",
+        &[Want {
+            key: "proj.weight",
+            encoding: "bnb.fp4 {block_size: 64, double_quant: true}",
+            parts: &[
+                ("weight", "U8", &[512, 1], "weight"),
+                ("absmax", "U8", &[16], "weight.absmax"),
+                ("quant_map", "F32", &[16], "weight.quant_map"),
+                ("nested_absmax", "F32", &[1], "weight.nested_absmax"),
+                ("nested_quant_map", "F32", &[256], "weight.nested_quant_map"),
+                ("nested_offset", "F32", &[], ""),
+            ],
+            meets: Meets::Exactly,
+            error: 0.2,
+        }],
+    );
+    let int8 = [Want {
+        key: "proj.weight",
+        encoding: "bnb.int8 {}",
+        parts: &[
+            ("weight", "I8", &[16, 64], "weight"),
+            ("SCB", "F32", &[16], "SCB"),
+            ("weight_format", "U8", &[], "weight_format"),
+        ],
+        meets: Meets::Exactly,
+        error: 0.01,
+    }];
+    check("bnb-int8", &int8);
+    // With no config: `weight_format` beside `SCB` declares it, and the plain bias gives the dtype.
+    let (_dir, ck) = try_edited("bnb-int8", &|_, _, dir| {
+        fs::remove_file(dir.join("config.json")).unwrap()
+    });
+    let t = ck.unwrap();
+    let t = t.tensor("model", "proj.weight").unwrap();
+    assert!(
+        matches!(&t.body, Body::Encoded { encoding, .. } if encoding.to_string() == int8[0].encoding)
+    );
+    assert_eq!(t.dtype, Dtype::BF16);
+}
+
+/// What bitsandbytes' documents do not state the way its scheme reads them is refused, never
+/// stored as plain bytes.
+#[test]
+fn bitsandbytes_carriers_it_cannot_read_are_refused() {
+    let w = "model.diffusion_model.double_blocks.0.img_attn.proj.weight";
+    let state = format!("{w}.quant_state.bitsandbytes__nf4");
+    type Edit = fn(&mut serde_json::Value);
+    let cases: [(&str, Edit, Code, &str); 3] = [
+        (
+            "an unknown key",
+            |d| d["quant_storage"] = "bfloat16".into(),
+            Code::MALFORMED_JSON,
+            "quant_storage",
+        ),
+        (
+            "a nested block of 128",
+            |d| {
+                d["nested_blocksize"] = 128.into();
+                d["nested_dtype"] = "float32".into();
+                d["nested_offset"] = 0.5.into();
+            },
+            Code::UNREGISTERED_ENCODING,
+            "nested_blocksize",
+        ),
+        (
+            "a shape the bytes do not hold",
+            |d| d["shape"] = serde_json::json!([9, 3072]),
+            Code::CARRIER_GEOMETRY,
+            "U8 [13824, 1]",
+        ),
+    ];
+    for (what, edit, code, names) in cases {
+        let e = refused("real-bnb-forge", &|t, _, _| {
+            let e = t.iter_mut().find(|(k, ..)| *k == state).unwrap();
+            let mut doc: serde_json::Value = serde_json::from_slice(&e.3).unwrap();
+            edit(&mut doc);
+            e.3 = doc.to_string().into_bytes();
+            e.2 = vec![e.3.len() as u64];
+        });
+        assert_eq!(e.code, code, "{what}: {}", e.detail);
+        assert!(e.detail.contains(names), "{what}: {}", e.detail);
+    }
+    // A table other than bnb's NF4.
+    let e = refused("real-bnb-forge", &|t, _, _| {
+        let e = t
+            .iter_mut()
+            .find(|(k, ..)| *k == format!("{w}.quant_map"))
+            .unwrap();
+        e.3[..4].copy_from_slice(&0.5f32.to_le_bytes());
+    });
+    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
+    assert!(e.detail.contains("nf4 table"), "{}", e.detail);
+    // Its parts with no quant_state and no config declare nothing.
+    let e = refused("real-bnb-forge", &|t, _, _| t.retain(|(k, ..)| *k != state));
     assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
     assert!(
         e.detail.contains("bitsandbytes") && e.detail.contains(".weight.absmax"),
         "{}",
         e.detail
     );
-
-    // Beside a declared ComfyUI carrier too.
-    let e = refused("comfy-fp8", &|t, _, _| bnb(t));
-    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
-    assert!(e.detail.contains("bitsandbytes"), "{}", e.detail);
+    // Beside a declared ComfyUI carrier: two producers.
+    let e = refused("comfy-fp8", &|t, _, _| {
+        for (k, d, s, b) in read_safetensors(&fixtures().join("real-bnb-forge/model.safetensors")) {
+            t.push((k, d, s, b));
+        }
+    });
+    assert_eq!(e.code, Code::AMBIGUOUS_CLASSIFICATION, "{}", e.detail);
+    assert!(
+        e.detail.contains("Bitsandbytes") && e.detail.contains("Comfy"),
+        "{}",
+        e.detail
+    );
 }
 
 /// GPTQ and AWQ declare themselves in `quantize_config.json`, `quant_config.json` or `gptq_*`

@@ -466,6 +466,8 @@ pub struct Reading {
     pub runs: Runs,
     pub source: Dtype,
     pub cast: Option<Dtype>,
+    /// The bytes themselves, for a part no source tensor holds (`FoldedPart::inline`).
+    pub inline: Option<Vec<u8>>,
 }
 
 impl Reading {
@@ -483,6 +485,7 @@ impl Reading {
             },
             source: t.dtype.clone(),
             cast: None,
+            inline: None,
         }
     }
 }
@@ -657,7 +660,10 @@ fn planned(
                 role: p.role.clone(),
                 dtype: p.dtype.clone(),
                 shape: p.shape.clone(),
-                read: Reading::whole(&p.at),
+                read: Reading {
+                    inline: p.inline.clone(),
+                    ..Reading::whole(&p.at)
+                },
             })
             .collect();
         return Ok(Planned {
@@ -681,6 +687,7 @@ fn planned(
             runs,
             source: t.dtype.clone(),
             cast,
+            inline: None,
         },
         (true, _) => {
             return refuse(
@@ -942,7 +949,9 @@ const STEP: u64 = 8 << 20;
 impl<'f> TensorReader<'f> {
     /// `what` names the tensor in errors.
     pub fn new(file: &'f File, r: &'f Reading, what: String) -> Result<TensorReader<'f>> {
-        let whole = if r.runs.count() > 1 && r.runs.run * r.unit < SHORT_RUN {
+        let whole = if let Some(bytes) = &r.inline {
+            Some(bytes.clone())
+        } else if r.runs.count() > 1 && r.runs.run * r.unit < SHORT_RUN {
             let mut buf = vec![0u8; r.len as usize];
             file.read_exact_at(&mut buf, r.start)
                 .map_err(|e| io(&what, e))?;

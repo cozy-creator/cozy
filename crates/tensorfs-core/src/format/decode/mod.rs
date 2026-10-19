@@ -35,6 +35,7 @@ pub(crate) mod ct;
 pub(crate) mod gptq;
 
 // bnb
+pub(crate) mod bnb;
 
 // comfy
 
@@ -81,6 +82,9 @@ pub static SCHEMES: &[&Scheme] = &[
     &ct::INT7,
     &ct::INT8,
     // bnb.*
+    &bnb::NF4,
+    &bnb::FP4,
+    &bnb::INT8,
 
     // comfy.*
 ];

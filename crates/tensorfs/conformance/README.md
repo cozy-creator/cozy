@@ -70,3 +70,8 @@ on every F32 case.
 each producer's own dequantizer giving the expected bytes, plus 8-row bands of real Qwen GPTQ and AWQ and RedHatAI
 w4a16 checkpoints read by HTTP range. A case with `pack` holds the codes and zeros its producer packed: TensorFS's
 `pack` reproduces its parts bit for bit (`tests/format_pack.rs`).
+
+`bnb` is mined by `mine/bnb.py` from bitsandbytes 0.50.2's CPU backend: Linear4bit and Linear8bitLt state dicts, and
+bitsandbytes' own dequantize as the expected bytes, plus rows of unsloth's and lllyasviel's nf4 checkpoints read by HTTP
+range at pinned revisions. bitsandbytes' fallback for an odd last extent reads FP4 code 8 as +0 where its kernels (and
+the spec) read −0; the odd-extent FP4 cases hold no code 8.

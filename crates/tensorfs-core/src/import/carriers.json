@@ -5,7 +5,7 @@
     {"metadata_prefix": "gptq_", "producer": "gptq"}
   ],
   "companions": [
-    {"producer": "bitsandbytes", "keys": ["*.absmax", "*.quant_map", "*.nested_absmax", "*.nested_quant_map", "*.quant_state.*"]},
+    {"producer": "bitsandbytes", "keys": ["*.absmax", "*.quant_map", "*.nested_absmax", "*.nested_quant_map", "*.quant_state.*", "*.SCB", "*.weight_format"]},
     {"producer": "GPTQ/AWQ", "keys": ["*.qweight", "*.qzeros", "*.g_idx"]},
     {"producer": "fp8 block scales (DeepSeek)", "keys": ["*.weight_scale_inv"]},
     {"producer": "mxfp4 (gpt-oss)", "keys": ["*_blocks", "*_scales"]},
