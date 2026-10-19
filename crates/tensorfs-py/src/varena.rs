@@ -146,15 +146,34 @@ fn granted(py: Python<'_>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<O
     files.map(|f| f.into_iter().map(dup).collect::<varena::Result<_>>()).transpose().or_raise(py)
 }
 
+/// All Python-facing GPU owners, including temporary method refs, release on the native
+/// cleanup worker. A lazy provider may close its own set from the mover's fetch callback.
+struct Native<T: Send + 'static>(Option<T>);
+impl<T: Send + 'static> Native<T> {
+    fn new(value: T) -> Self { Self(Some(value)) }
+}
+impl<T: Send + Clone + 'static> Clone for Native<T> {
+    fn clone(&self) -> Self { Self::new(self.0.as_ref().expect("live native owner").clone()) }
+}
+impl<T: Send + 'static> std::ops::Deref for Native<T> {
+    type Target = T;
+    fn deref(&self) -> &T { self.0.as_ref().expect("live native owner") }
+}
+impl<T: Send + 'static> Drop for Native<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() { crate::cleanup::defer(value); }
+    }
+}
+
 #[pyclass(name = "Gpu", module = "tensorfs.varena", frozen)]
-pub struct PyGpu(Arc<Gpu>);
+pub struct PyGpu(Native<Arc<Gpu>>);
 
 #[pymethods]
 impl PyGpu {
     #[new]
     #[pyo3(signature = (device, chunk = 64 << 20))]
     fn new(py: Python<'_>, device: i32, chunk: u64) -> PyResult<Self> {
-        Ok(PyGpu(py.detach(|| Gpu::open(device, chunk)).or_raise(py)?))
+        Ok(PyGpu(Native::new(py.detach(|| Gpu::open(device, chunk)).or_raise(py)?)))
     }
 
     #[getter]
@@ -171,7 +190,7 @@ impl PyGpu {
     #[pyo3(signature = (name, ck, regions, host_fd = None, files = None))]
     fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
         let (ck, files) = (ck_of(py, &ck)?, granted(py, files)?);
-        Ok(PyWeightSet::new(SetRef::Gpu(py.detach(|| self.0.register(&name, ck, &regions, host_fd, files)).or_raise(py)?)))
+        Ok(PyWeightSet::new(SetRef::Gpu(Native::new(py.detach(|| self.0.register(&name, ck, &regions, host_fd, files)).or_raise(py)?))))
     }
 
     /// The sealed host layout `host_fd` registered from the regions it carries, before any module.
@@ -179,7 +198,7 @@ impl PyGpu {
     #[pyo3(signature = (name, ck, host_fd, files = None))]
     fn adopt(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, host_fd: i32, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
         let (ck, files) = (ck_of(py, &ck)?, granted(py, files)?);
-        Ok(PyWeightSet::new(SetRef::Gpu(py.detach(|| self.0.adopt(&name, ck, host_fd, files)).or_raise(py)?)))
+        Ok(PyWeightSet::new(SetRef::Gpu(Native::new(py.detach(|| self.0.adopt(&name, ck, host_fd, files)).or_raise(py)?))))
     }
 
     fn trim(&self, py: Python<'_>) -> PyResult<u64> {
@@ -235,7 +254,7 @@ impl PyHost {
 
 #[derive(Clone)]
 enum SetRef {
-    Gpu(Arc<WeightSet>),
+    Gpu(Native<Arc<WeightSet>>),
     Host(Arc<HostSet>),
 }
 
@@ -272,7 +291,7 @@ impl PyWeightSet {
     }
 
     /// The GPU set; None on the host, where the watermark, prefetch and eviction do nothing.
-    fn gpu(&self, py: Python<'_>) -> PyResult<Option<Arc<WeightSet>>> {
+    fn gpu(&self, py: Python<'_>) -> PyResult<Option<Native<Arc<WeightSet>>>> {
         Ok(match self.set(py)? {
             SetRef::Gpu(w) => Some(w),
             SetRef::Host(_) => None,
@@ -364,7 +383,7 @@ impl PyWeightSet {
         self.gpu(py)?.map_or(Ok(0), |w| py.detach(|| w.evict(regions.as_deref())).or_raise(py))
     }
 
-    /// Lets the set go: its VA and pages are released now, or when its last pin dies.
+    /// Release this handle; the final native owner drains pending uses before reclaiming pages.
     fn close(&self, py: Python<'_>) {
         let set = self.set.lock().unwrap().take();
         py.detach(|| drop(set));
@@ -381,6 +400,12 @@ impl PyWeightSet {
 struct Pin {
     gpu: Option<Pinned>,
     _host: Option<HostPinned>,
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        if let Some(pin) = self.gpu.take() { crate::cleanup::defer(pin); }
+    }
 }
 
 /// A bound region: a uint8 DLPack tensor of `nbytes` at `ptr`. It and every tensor made from it
