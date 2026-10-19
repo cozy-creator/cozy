@@ -281,6 +281,45 @@ impl PyStore {
         self.store.root().to_path_buf()
     }
 
+    #[pyo3(signature = (path, variant = None))]
+    fn open_path(&self, py: Python<'_>, path: PathBuf, variant: Option<String>) -> PyResult<PyCheckpoint> {
+        let ck = py.detach(|| Checkpoint::folder(&path, variant.as_deref(), Some(&self.store))).or_raise(py)?;
+        Ok(PyCheckpoint::new(ck.header().clone(), Some(ck), None))
+    }
+
+    #[pyo3(signature = (folder_path, repo_id, revision = None))]
+    fn upload_local(&self, py: Python<'_>, folder_path: PathBuf, repo_id: String, revision: Option<String>) -> PyResult<String> {
+        py.detach(|| -> Result<String, Failure> {
+            let tree = self.store.admit_folder(&folder_path)?;
+            self.store.update_ref(&repo_id, |old| {
+                let mut repo = old.unwrap_or_else(|| tensorfs_core::format::Repo::new(&repo_id));
+                if let Some(version) = &revision {
+                    repo.set_release(version, tree.clone());
+                } else if !repo.checkpoints.contains(&tree) {
+                    repo.checkpoints.push(tree.clone());
+                }
+                Some(repo)
+            })?;
+            Ok(tree.id())
+        }).or_raise(py)
+    }
+
+    #[pyo3(signature = (ck, dest, variants = None))]
+    fn snapshot(&self, py: Python<'_>, ck: &PyCheckpoint, dest: PathBuf, variants: Option<Vec<String>>) -> PyResult<PathBuf> {
+        let stored = ck.stored(py)?;
+        py.detach(|| -> Result<PathBuf, Failure> {
+            let tree = match ck.named.as_ref().and_then(|n| n.tree.clone()) {
+                Some(tree) => tree,
+                None => {
+                    let source = stored.path()?;
+                    self.store.admit_folder(&source)?
+                }
+            };
+            self.store.snapshot(&tree, &dest, variants.as_deref())?;
+            Ok(dest)
+        }).or_raise(py)
+    }
+
     /// Imports `src` (a file, directory, `hf://`, `civitai://` or URL; or several) and names it
     /// `name` (`local/<its name>` by default), release 1, variant its main dtype.
     #[pyo3(signature = (src, name = None, converter = None, variant = None))]
@@ -370,6 +409,8 @@ impl PyStore {
         Ok(PyWriter {
             store: self.store.clone(),
             w: Mutex::new(Some(w)),
+            dest: None,
+            variant: None,
         })
     }
 
@@ -476,6 +517,11 @@ pub struct PyComponent {
 
 #[pymethods]
 impl PyComponent {
+    #[getter]
+    fn path(&self, py: Python<'_>) -> PyResult<PathBuf> {
+        let ck = self.ck.as_ref().ok_or_else(|| invalid(py, "a parsed header has no asset path"))?.get().stored(py)?;
+        py.detach(|| ck.component_path(&self.name)).or_raise(py)
+    }
     /// Asset `name`'s bytes; a parsed header has none.
     fn asset<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyBytes>> {
         let Some(ck) = &self.ck else {
@@ -634,6 +680,16 @@ impl PyCheckpoint {
     #[getter]
     fn variant(&self) -> Option<&str> {
         self.named.as_ref()?.variant.as_deref()
+    }
+
+    #[getter]
+    fn repo_id(&self) -> Option<&str> { self.name() }
+    #[getter]
+    fn revision(&self) -> Option<&str> { self.release() }
+    #[getter]
+    fn path(&self, py: Python<'_>) -> PyResult<PathBuf> {
+        let ck = self.stored(py)?;
+        py.detach(|| ck.path()).or_raise(py)
     }
 
     #[getter]
@@ -981,9 +1037,26 @@ impl PyArray {
 pub struct PyWriter {
     store: Store,
     w: Mutex<Option<Writer>>,
+    dest: Option<PathBuf>,
+    variant: Option<String>,
 }
 
 impl PyWriter {
+    #[new]
+    #[pyo3(signature = (dest = None, *, variant = None, base = None, resume = None, cache_dir = None))]
+    fn new(py: Python<'_>, dest: Option<PathBuf>, variant: Option<String>, base: Option<&PyCheckpoint>, resume: Option<String>, cache_dir: Option<PathBuf>) -> PyResult<Self> {
+        let base = base.map(|b| b.stored(py)).transpose()?;
+        let root = tensorfs_core::home::resolve(cache_dir.as_deref()).or_raise(py)?;
+        let (store, w) = py.detach(|| -> Result<_, Failure> {
+            let store = Store::open(&root)?;
+            let w = match &dest {
+                Some(dest) => Writer::folder(dest, variant.as_deref().unwrap_or(""), base, resume.is_some())?,
+                None => store.writer(base, resume.as_deref())?,
+            };
+            Ok((store, w))
+        }).or_raise(py)?;
+        Ok(Self { store, w: Mutex::new(Some(w)), dest, variant })
+    }
     fn with<T: Send>(
         &self,
         py: Python<'_>,
@@ -1059,7 +1132,11 @@ impl PyWriter {
     fn commit(&self, py: Python<'_>) -> PyResult<PyCheckpoint> {
         let header = self.with(py, |w| Ok(w.commit()?))?;
         self.w.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let named = Named { header, tree: None, name: None, release: None, variant: None };
+        if let Some(dest) = &self.dest {
+            let ck = py.detach(|| Checkpoint::folder(dest, Some(self.variant.as_deref().unwrap_or("")), Some(&self.store))).or_raise(py)?;
+            return Ok(PyCheckpoint::new(ck.header().clone(), Some(ck), None));
+        }
+        let named = Named { header, tree: None, name: None, release: None, variant: self.variant.clone() };
         opened(py, &self.store, named)
     }
 

@@ -7,6 +7,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{fail, invalid, Error, Result, Store};
 use crate::format::layout::ALIGN;
@@ -30,6 +31,18 @@ enum Objects {
     Store(Store),
     /// A plain folder's `chunks/<sha256>`, else the cache.
     Folder { dir: PathBuf, cache: Option<Store> },
+}
+
+fn write_view(path: &Path, bytes: &[u8]) -> Result<()> {
+    if path.is_file() {
+        return Ok(());
+    }
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().expect("a view file has a parent");
+    fs::create_dir_all(parent).map_err(fail("create", parent))?;
+    let temp = parent.join(format!(".view-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    fs::write(&temp, bytes).map_err(fail("write", &temp))?;
+    fs::rename(&temp, path).map_err(fail("rename", path))
 }
 
 impl Store {
@@ -59,6 +72,15 @@ impl Checkpoint {
     /// chunks and assets from `dir/chunks/`, else from `cache`. Lengths are checked; digests are
     /// checked where bytes enter a store ([`Store::admit_folder`]).
     pub fn folder(dir: &Path, variant: Option<&str>, cache: Option<&Store>) -> Result<Checkpoint> {
+        if dir.is_file() {
+            let parent = dir.parent().unwrap_or_else(|| Path::new("."));
+            let bytes = fs::read(dir).map_err(fail("read", dir))?;
+            return Ok(Checkpoint {
+                objects: Objects::Folder { dir: parent.to_path_buf(), cache: cache.cloned() },
+                header: Arc::new(Header::from_cbor(&bytes)?),
+                id: ObjectRef::of(&bytes),
+            });
+        }
         let name = match variant {
             Some(v) => variant_path(v),
             None => {
@@ -96,6 +118,38 @@ impl Checkpoint {
     /// The header's object: the cozytensors' id.
     pub fn id(&self) -> &ObjectRef {
         &self.id
+    }
+
+    /// A plain folder view of this checkpoint, sharing its admitted object files.
+    pub fn path(&self) -> Result<PathBuf> {
+        match &self.objects {
+            Objects::Folder { dir, .. } => Ok(dir.clone()),
+            Objects::Store(store) => {
+                let dir = store.root().join("snapshots").join(&self.id.sha256);
+                let mut tree = Tree::default();
+                tree.set_variant("", self.id.clone());
+                store.snapshot(&store.put_tree(&tree)?, &dir, None)?;
+                Ok(dir)
+            }
+        }
+    }
+
+    /// The rendered config and assets for a path-only model loader.
+    pub fn component_path(&self, name: &str) -> Result<PathBuf> {
+        let c = self.component(name)?;
+        let root = match &self.objects {
+            Objects::Store(store) | Objects::Folder { cache: Some(store), .. } => store.root().to_path_buf(),
+            Objects::Folder { dir, .. } => dir.join("chunks"),
+        };
+        let dir = root.join("views").join(&self.id.sha256).join(name);
+        fs::create_dir_all(&dir).map_err(fail("create", &dir))?;
+        let config = dir.join(c.config_file.as_deref().unwrap_or("config.json"));
+        let bytes = serde_json::to_vec(&c.config).map_err(|e| invalid(&config, e.to_string()))?;
+        write_view(&config, &bytes)?;
+        for (name, _) in &c.assets {
+            write_view(&dir.join(name), &self.asset(&c.name, name)?)?;
+        }
+        Ok(dir)
     }
 
     pub fn header(&self) -> &Header {
