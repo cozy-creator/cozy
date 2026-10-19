@@ -27,19 +27,21 @@ class Result(msgspec.Struct):
 
 def main():
     assert importlib.util.find_spec('torch') is None, 'this metadata check needs no Torch environment'
-    test = Contract()
-    test.setUp()
-    try:
-        test.fixture()
-        sys.path.insert(0, str(test.root))
-        app = script_app('payload')
-        surfaces = describe(app)
-        assert len(surfaces) == 1 and surfaces[0].name == 'main' and surfaces[0].accelerator
-        fields = msgspec.structs.fields(surfaces[0].payload_type)
-        assert [f.name for f in fields] == ['native_wheel']
-        assert fields[0].type.__name__ == 'FileAsset'
-    finally:
-        test.doCleanups()
+    for native, hostpin in [(False, False), (True, False), (True, True)]:
+        test = Contract()
+        test.setUp()
+        try:
+            test.fixture(native=native, hostpin=hostpin)
+            sys.path.insert(0, str(test.root))
+            app = script_app('payload')
+            surfaces = describe(app)
+            assert len(surfaces) == 1 and surfaces[0].name == 'main' and surfaces[0].accelerator
+            fields = msgspec.structs.fields(surfaces[0].payload_type)
+            assert [f.name for f in fields] == (['native_wheel', 'hostpin_bundle'] if hostpin else ['native_wheel'])
+            assert all(f.type.__name__ == 'FileAsset' for f in fields)
+        finally:
+            sys.path.remove(str(test.root))
+            test.doCleanups()
     with tempfile.TemporaryDirectory() as folder:
         root = Path(folder)
         source = root / 'source'
@@ -74,6 +76,7 @@ def main():
         assert canonical.write_application(json.loads(tree_document(snapshot))) == original
     print(json.dumps({'ok': True, 'proof': 'installed-runtime-consumer-tooling-contract',
                       'script_accelerator': True, 'input': 'FileAsset',
+                      'payload_fileasset_counts': [1, 1, 2],
                       'snapshot_and_tree_result': True, 'canonical_tree_bytes': True,
                       'scope': 'CPU metadata/snapshot/serialization only; no GPU execution'}))
 

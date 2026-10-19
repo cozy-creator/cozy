@@ -12,6 +12,7 @@ import tarfile
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 import zipfile
 
 import make_payload
@@ -52,12 +53,33 @@ class Contract(unittest.TestCase):
         self.args = argparse.Namespace(creator_repo=REPO, native_wheel=self.native, native_source='2' * 40,
                                       native_sha256=validate.sha(self.native), runtime_wheel=self.runtime,
                                       runtime_source='3' * 40, runtime_sha256=validate.sha(self.runtime),
-                                      output=self.root / 'payload.py', include_kernel=False)
+                                      output=self.root / 'payload.py', include_kernel=False,
+                                      include_native_io=False, hostpin_archive=None)
 
-    def fixture(self, kernel=False):
+    def fixture(self, kernel=False, native=False, hostpin=False):
         if kernel:
             self.args.include_kernel = True
-        sidecar = make_payload.generate(self.args)
+        if native or hostpin:
+            self.args.include_native_io = True
+            self.args.native_source = validate.native_io.CORE
+        if hostpin:
+            self.args.hostpin_archive = self.root / 'hostpin-linux-x86_64.tar.gz'
+            self.args.hostpin_archive.write_bytes(b'unit shape fixture; not an executable artifact')
+            pin = validate.native_io
+            source = make_payload.git(REPO, 'show', pin.PIN_SOURCE + ':crates/tensorfs-core/tests/io.rs')
+            provenance = {'native_source': pin.PIN_SOURCE, 'production_core': pin.CORE,
+                          'binary': {'sha256': pin.PIN_BINARY_SHA},
+                          'source_sha256': {'crates/tensorfs-core/tests/io.rs': hashlib.sha256(source).hexdigest()}}
+            info = {'sha256': pin.PIN_SHA, 'bytes': 3448805, 'source': pin.PIN_SOURCE, 'core_source': pin.CORE,
+                    'binary_sha256': pin.PIN_BINARY_SHA, 'binary_bytes': 8714656, 'glibc_max': '2.28',
+                    'argv': pin.PIN_ARGV, 'timeout_s': 120}
+            contents = {'hostpin/io.rs': source, 'hostpin/provenance.json': json.dumps(provenance).encode()}
+            # Only the offline metadata/validator shape is synthetic. Never execute this
+            # fake artifact; the production inspector requires the real frozen archive hash.
+            with mock.patch.object(pin, 'inspect_hostpin', return_value=(info, contents)):
+                sidecar = make_payload.generate(self.args)
+        else:
+            sidecar = make_payload.generate(self.args)
         expected = validate.read(sidecar)
         spec = dict(expected)
         spec.pop('payload_sha256')
@@ -73,7 +95,7 @@ class Contract(unittest.TestCase):
             (root / 'source' / name).parent.mkdir(parents=True, exist_ok=True)
             (root / 'source' / name).write_text(source)
         operations = []
-        for name in ['comfy-init', 'comfy-remote', 'comfy-fetch', 'comfy-checkout', 'comfy-archive'] + [n + '-purelib' for n in spec['requested']]:
+        for name in validate.native_io.setup_names(spec['requested']):
             (root / f'logs/{name}.stdout').write_text('fixture source setup\n')
             (root / f'logs/{name}.stderr').write_text('')
             operations.append({'name': name, **completed(SETUP_SECONDS)})
@@ -91,6 +113,40 @@ class Contract(unittest.TestCase):
         write(root / 'identity.json', identity)
         parts = []
         for name in spec['requested']:
+            if name in validate.native_io.IDS or name == validate.native_io.HOSTPIN:
+                pin = validate.native_io
+                if name == pin.HOSTPIN:
+                    write(root / 'reports/hostpin-artifact.json', spec['hostpin'])
+                    stdout = ('running 1 test\ntest ' + pin.PIN_TEST + ' ... ' + pin.PIN_MARKER + '\nok\n'
+                              'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.50s\n')
+                    argv = ['/work/hostpin-io', *pin.PIN_ARGV]
+                else:
+                    row = next(c for c in spec['native_io']['commands'] if c['id'] == name)
+                    argv = ['/work/' + name + '/venv/bin/python', '-u', '/receipt/source/' + row['file'], *row['argv'][3:]]
+                    clean = row['profile'] == 'clean'
+                    environment = {'python': '3.12 fixture', 'executable': argv[0], 'python_optimize': 0, 'no_user_site': 1,
+                                   'cuda_visible_devices': '0', 'cublas_workspace_config': ':4096:8', 'profile': row['profile'],
+                                   'installed_native_extension_sha256': spec['native']['extension_sha256'],
+                                   'torch': None if clean else '2.14.0+cu130', 'numpy': None if clean else '2.3.5', 'triton': None}
+                    write(root / f'reports/{name}-environment.json', environment)
+                    if name == 'read-engine':
+                        stdout = pin.READ_MARKER + '\n'
+                    elif name == 'fork-cleanup':
+                        stdout = 'CUDA fork cleanup: CPU-only parent import, child allocation/capsule release recovered 33554449 bytes\n'
+                    else:
+                        records = []
+                        for case in pin.CASES:
+                            records += [{'case': case, 'tensorfs': spec['native']['version'], 'distribution': spec['native']['version'],
+                                         'extension_sha256': spec['native']['extension_sha256'], 'device': 0, 'uuid': UUID},
+                                        {'case': case, 'result': 'passed', 'cleanup': {'sets': 0, 'mapped': 0, 'idle': 0, 'slots': 0},
+                                         'callback': {'chunks': 1}, 'h2d': [{'bytes': 65536, 'ns': 1}]}]
+                        records.append({'result': 'passed', 'cases': pin.CASES, 'timeout_per_child': 45})
+                        stdout = ''.join(json.dumps(r) + '\n' for r in records)
+                value = pin.parse(name, stdout, spec['native'], UUID)
+                self.result(root, name, value)
+                (root / f'logs/{name}.stdout').write_text(stdout)
+                parts.append({'name': name, 'command': argv, **completed(pin.TIMEOUT[name])})
+                continue
             child = {'ok': True, 'mode': name, 'python_optimize': 0, 'triton_interpret': '', 'script_completed': True,
                      'cublas_workspace_config': ':4096:8', 'cuda_visible_devices': '0', 'cuda_available': True,
                      'device_count': 1, 'cuda_initialized_before_probe': False, 'gpu_uuid': UUID,
@@ -307,6 +363,93 @@ class Contract(unittest.TestCase):
         self.args.native_source = '88a49ac8e634035301a3314088a856d214e55db8'
         with self.assertRaisesRegex(ValueError, 'pre-GPU/fork-fix'):
             make_payload.generate(self.args)
+
+    def test_native_io_matrix_and_optional_hostpin_shape(self):
+        root, expected, run, machine, launch = self.fixture(native=True, hostpin=True)
+        result = validate.validate(root, expected, run, machine, launch)
+        self.assertTrue(result['ok'])
+        self.assertEqual(expected['requested'], ['diffusers', 'comfy', *validate.native_io.IDS, validate.native_io.HOSTPIN])
+        self.assertEqual(expected['unrequested'], ['kernel'])
+        self.assertIn('hostpin_bundle: FileAsset', self.args.output.read_text())
+        self.assertNotIn('full_gpu_arrays', validate.read(root / 'reports/read-engine.json'))
+        changed = copy.deepcopy(expected)
+        changed['requested'].remove('read-engine')
+        with self.assertRaisesRegex(ValueError, 'partial native I/O batch'):
+            validate.validate(root, changed, run, machine, launch)
+
+    def test_native_io_direct_interpreter_profile_and_partial_process_fail(self):
+        root, expected, run, machine, launch = self.fixture(native=True)
+        self.assertTrue(validate.validate(root, expected, run, machine, launch)['ok'])
+        original = validate.read(root / 'verdict.json')
+        for name, field, value in [('read-engine', 'command', ['python', '-c', 'import torch; print("fallback")']),
+                                   ('provider-cleanup', 'timeout_s', 120), ('fork-cleanup', 'timed_out', True),
+                                   ('provider-cleanup', 'rc', 1), ('fork-cleanup', 'reaped', False)]:
+            changed = copy.deepcopy(original)
+            next(p for p in changed['parts'] if p['name'] == name)[field] = value
+            write(root / 'verdict.json', changed)
+            self.inventory(root)
+            with self.assertRaises(ValueError):
+                validate.validate(root, expected, run, machine, launch)
+        write(root / 'verdict.json', original)
+        environment = validate.read(root / 'reports/fork-cleanup-environment.json')
+        write(root / 'reports/fork-cleanup-environment.json', {**environment, 'torch': '2.14.0'})
+        self.inventory(root)
+        with self.assertRaisesRegex(ValueError, 'clean profile'):
+            validate.validate(root, expected, run, machine, launch)
+
+    def test_native_text_markers_do_not_allow_partial_skip_or_invented_counts(self):
+        pin = validate.native_io
+        native = {'extension_sha256': 'f' * 64, 'version': '0.11.0'}
+        for text in ['', pin.READ_MARKER + '\n' + pin.READ_MARKER, 'SKIP\n' + pin.READ_MARKER,
+                     '{"full_gpu_arrays":4}\n' + pin.READ_MARKER]:
+            with self.assertRaises(ValueError):
+                pin.parse('read-engine', text, native, UUID)
+        for text in ['', 'CUDA fork cleanup: CPU-only parent import, child allocation/capsule release recovered 33554448 bytes',
+                     'SKIP\nCUDA fork cleanup: CPU-only parent import, child allocation/capsule release recovered 33554449 bytes']:
+            with self.assertRaises(ValueError):
+                pin.parse('fork-cleanup', text, native, UUID)
+
+    def test_provider_requires_every_real_identity_cleanup_and_h2d_case(self):
+        root, expected, *_ = self.fixture(native=True)
+        pin = validate.native_io
+        original = [json.loads(line) for line in (root / 'logs/provider-cleanup.stdout').read_text().splitlines()]
+        mutations = []
+        for row, key, value in [(0, 'uuid', 'unavailable'), (0, 'device', False), (0, 'extension_sha256', '0' * 64),
+                                (1, 'result', 'skipped'), (1, 'result', 'error'), (1, 'cleanup', {'sets': 1, 'mapped': 0, 'idle': 0, 'slots': 0}),
+                                (1, 'callback', {'chunks': 0}), (1, 'h2d', [{'bytes': 65536, 'ns': 0}]),
+                                (1, 'h2d', [{'bytes': 65535, 'ns': 1}]), (1, 'h2d', [{'bytes': 65536, 'ns': float('nan')}])]:
+            rows = copy.deepcopy(original);rows[row][key] = value;mutations.append(rows)
+        mutations += [original[:-1], original + [original[0]], [*original[:2], *original[:2], *original[4:]]]
+        for rows in mutations:
+            with self.assertRaises(ValueError):
+                pin.parse('provider-cleanup', ''.join(json.dumps(r) + '\n' for r in rows), expected['native'], UUID)
+
+    def test_hostpin_exact_single_ignored_selection_and_no_returned_binary(self):
+        root, expected, run, machine, launch = self.fixture(hostpin=True)
+        pin = validate.native_io
+        original = (root / f'logs/{pin.HOSTPIN}.stdout').read_text()
+        for text in [original.replace(pin.PIN_MARKER, ''), original + pin.PIN_MARKER,
+                     original.replace('1 passed; 0 failed; 0 ignored', '0 passed; 0 failed; 1 ignored'),
+                     original.replace('1 passed; 0 failed; 0 ignored', '1 passed; 1 failed; 0 ignored'),
+                     original.replace('test ' + pin.PIN_TEST, 'test host_read_speed')]:
+            with self.assertRaises(ValueError):
+                pin.parse(pin.HOSTPIN, text, expected['native'], UUID)
+        (root / 'hostpin-io').write_bytes(b'not a receipt')
+        self.inventory(root)
+        with self.assertRaisesRegex(ValueError, 'unexpected/missing'):
+            validate.validate(root, expected, run, machine, launch)
+
+    def test_hostpin_rejects_bad_hash_and_unsafe_archive_members(self):
+        pin = validate.native_io
+        with self.assertRaisesRegex(ValueError, 'archive hash/length'):
+            pin.inspect_hostpin(b'wrong artifact')
+        for name, kind in [('../hostpin-io', tarfile.REGTYPE), ('hostpin/link', tarfile.SYMTYPE)]:
+            raw = io.BytesIO()
+            with tarfile.open(fileobj=raw, mode='w:gz') as archive:
+                entry = tarfile.TarInfo(name);entry.type = kind;entry.linkname = '/elsewhere'
+                archive.addfile(entry)
+            with self.assertRaises(ValueError):
+                pin.archive_files(raw.getvalue())
 
 
 class OwnedChild(unittest.TestCase):

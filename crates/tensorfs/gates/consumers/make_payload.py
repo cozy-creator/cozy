@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import zipfile
+import native_io
 
 HERE = Path(__file__).resolve().parent
 COMFY = "35f6d4f8bdefe6eea17bfc4631bba8c7f5a66360"
@@ -94,6 +95,7 @@ def wheel(path, name, expected, source):
               'version': fields['Version'], 'requires_python': fields['Requires-Python']}
     if extension:
         result['extension_sha256'] = extension
+        result['extension_file'] = extensions[0]
     return result
 
 
@@ -113,6 +115,7 @@ def generate(args):
         consumers[name] = {'source': ref, 'file': filename, 'sha256': expected, 'tensors': count, 'bytes': size}
     files['child.py'] = (HERE / 'child.py').read_text()
     files['owned_child.py'] = (HERE / 'owned_child.py').read_text()
+    files['native_io.py'] = (HERE / 'native_io.py').read_text()
     spec = {'schema': 1, 'requested': ['diffusers', 'comfy'], 'unrequested': ['kernel'],
             'native': native, 'runtime': runtime, 'consumers': consumers, 'comfy_source': COMFY,
             'gpu_count': 1, 'device': 'cuda:0', 'cublas_workspace_config': ':4096:8'}
@@ -134,6 +137,37 @@ def generate(args):
                           'argv': ['--device', '0']}
         spec['requested'].append('kernel')
         spec['unrequested'] = []
+    if args.include_native_io:
+        raw = (HERE / 'native-io-contract.json').read_bytes()
+        contract = native_io.contract(raw)
+        files['native/contract.json'] = raw.decode()
+        commands = []
+        for command in contract['commands']:
+            if command['id'] not in native_io.IDS:
+                continue
+            copied = dict(command)
+            for source in [command['file'], *command.get('helper_files', [])]:
+                raw = git(args.creator_repo, 'show', f"{source['source']}:{source['path']}")
+                if digest(raw) != source['sha256'] or len(raw) != source['bytes']:
+                    raise ValueError('frozen native I/O script/hash differs')
+                files['native/scripts/' + Path(source['path']).name] = raw.decode()
+            copied['file'] = 'native/scripts/' + Path(command['file']['path']).name
+            commands.append(copied)
+        spec['native_io'] = {'source': native_io.SOURCE, 'contract_sha256': native_io.CONTRACT_SHA, 'commands': commands}
+        spec['requested'].extend(native_io.IDS)
+    if args.hostpin_archive is not None:
+        if not args.include_native_io or args.native_source != native_io.CORE:
+            raise ValueError('HostPin requires the native-I/O batch and exact coherent 0800 core')
+        spec['hostpin'], content = native_io.inspect_hostpin(args.hostpin_archive.read_bytes())
+        spec['hostpin']['file'] = args.hostpin_archive.name
+        left = git(args.creator_repo, 'rev-parse', native_io.PIN_SOURCE + ':crates/tensorfs-core/src').strip()
+        right = git(args.creator_repo, 'rev-parse', native_io.CORE + ':crates/tensorfs-core/src').strip()
+        if left != right:
+            raise ValueError('portable HostPin production core differs from the frozen wheel source')
+        for name in ('io.rs', 'provenance.json'):
+            files['hostpin/' + name] = content['hostpin/' + name].decode()
+        spec['requested'].append(native_io.HOSTPIN)
+    spec['unrequested'] = [name for name in native_io.ALL if name not in spec['requested']]
     spec['sources'] = {name: digest(text.encode()) for name, text in files.items()}
     dependencies = [f"cozy-runtime=={runtime['version']}", f"tensorfs=={native['version']}",
                     'torch==2.14.0', 'diffusers==0.40.0', 'numpy', 'einops', 'safetensors', 'Pillow',
@@ -148,7 +182,10 @@ def generate(args):
     header += '# dependencies = ' + json.dumps(dependencies) + '\n# [tool.uv.sources]\n'
     header += ''.join(f'# {name} = {{ path = {json.dumps(path)} }}\n' for name, path in paths.items())
     header += '# ///\n'
-    payload = header + '\nSPEC = ' + repr(spec) + '\nFILES = ' + repr(files) + '\n\n' + (HERE / 'worker.py').read_text()
+    worker = (HERE / 'worker.py').read_text()
+    if 'hostpin' in spec:
+        worker = worker.replace('native_wheel: FileAsset, out: Outputs', 'native_wheel: FileAsset, hostpin_bundle: FileAsset, out: Outputs')
+    payload = header + '\nSPEC = ' + repr(spec) + '\nFILES = ' + repr(files) + '\n\n' + worker
     ast.parse(payload)
     if len(payload.encode()) > 32 << 20:
         raise ValueError("payload exceeds the existing public script source bound")
@@ -169,4 +206,6 @@ if __name__ == '__main__':
     p.add_argument('--runtime-sha256', required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--include-kernel', action='store_true', help='include the frozen f824 clean-child 209-case kernel proof')
+    p.add_argument('--include-native-io', action='store_true', help='include the frozen read/provider/fork direct scripts')
+    p.add_argument('--hostpin-archive', type=Path, help='also require the exact portable HostPin public FileAsset')
     print(generate(p.parse_args()))

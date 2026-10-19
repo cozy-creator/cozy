@@ -51,6 +51,8 @@ def main(ctx: Context, *, native_wheel: FileAsset, out: Outputs) -> Tree:
     helper = {}
     exec(compile(FILES['owned_child.py'], 'owned_child.py', 'exec'), helper)
     run_owned = helper['run_owned']
+    native = {}
+    exec(compile(FILES['native_io.py'], 'native_io.py', 'exec'), native)
 
     def setup(name, command, env, cwd=None, timeout=60):
         result = run_owned(command, receipts / f'logs/{name}.stdout', receipts / f'logs/{name}.stderr',
@@ -78,6 +80,18 @@ def main(ctx: Context, *, native_wheel: FileAsset, out: Outputs) -> Tree:
         wheel = work / SPEC['native']['file']
         wheel.write_bytes(raw)
         identity['native_sha256'] = digest(raw)
+        hostpin = None
+        if 'hostpin' in SPEC:
+            artifact = locals()['hostpin_bundle'].read_bytes()
+            info, content = native['inspect_hostpin'](artifact)
+            info['file'] = SPEC['hostpin']['file']
+            assert info == SPEC['hostpin'], 'portable HostPin artifact differs'
+            for name in ('io.rs', 'provenance.json'):
+                assert content['hostpin/' + name].decode() == FILES['hostpin/' + name], 'HostPin retained source differs'
+            hostpin = work / 'hostpin-io'
+            hostpin.write_bytes(content['hostpin/hostpin-io'])
+            hostpin.chmod(0o755)
+            (receipts / 'reports/hostpin-artifact.json').write_text(json.dumps(info, indent=2) + '\n')
         comfy = work / 'comfy'
         commands = [['git', 'init', '--quiet', str(comfy)],
                     ['git', '-C', str(comfy), 'remote', 'add', 'origin', 'https://github.com/Comfy-Org/ComfyUI.git'],
@@ -89,35 +103,68 @@ def main(ctx: Context, *, native_wheel: FileAsset, out: Outputs) -> Tree:
         (receipts / 'source/comfy-upstream.tar').write_bytes(archive)
         identity['comfy_archive_sha256'] = digest(archive)
         for name in SPEC['requested']:
-            clean = name == 'kernel'
+            native_case = name in native['IDS'] or name == native['HOSTPIN']
+            if name == native['HOSTPIN']:
+                command = [str(hostpin), *SPEC['hostpin']['argv']]
+                directory = work
+                limit = 120
+            else:
+                command = None
+            clean = name in ('kernel', 'fork-cleanup')
             directory = work / name
             directory.mkdir()
-            venv.EnvBuilder(with_pip=False).create(directory / 'venv')
-            py = directory / 'venv/bin/python'
-            purelib = Path(setup(f'{name}-purelib', [str(py), '-c', 'import sysconfig; print(sysconfig.get_paths()["purelib"])'], env).decode().strip())
-            if not clean:
-                (purelib / 'zz-parent.pth').write_text(''.join(str(p) + '\n' for p in site.getsitepackages()))
-            with zipfile.ZipFile(wheel) as source:
-                assert all(not Path(n).is_absolute() and '..' not in Path(n).parts for n in source.namelist())
-                source.extractall(purelib)
-            if clean:
-                script = receipts / 'source' / SPEC['kernel']['file']
-                extra = SPEC['kernel']['argv']
-                marker = SPEC['kernel']['schema']
-            else:
-                script = receipts / 'source' / SPEC['consumers'][name]['file']
-                extra = ['--device', 'cuda:0', '--native-source', SPEC['native']['source'], '--wheel', str(wheel)]
-                if name == 'comfy':
-                    extra += ['--comfy-root', str(comfy)]
-                marker = f'public-tensorfs-{name}-unet-cuda'
-            command = [str(py), str(receipts / 'source/child.py'), str(receipts / f'reports/{name}-identity.json'),
-                       name, str(script), *extra]
+            if command is None:
+                venv.EnvBuilder(with_pip=False).create(directory / 'venv')
+                py = directory / 'venv/bin/python'
+                purelib = Path(setup(f'{name}-purelib', [str(py), '-c', 'import sysconfig; print(sysconfig.get_paths()["purelib"])'], env).decode().strip())
+                if not clean:
+                    (purelib / 'zz-parent.pth').write_text(''.join(str(p) + '\n' for p in site.getsitepackages()))
+                with zipfile.ZipFile(wheel) as source:
+                    assert all(not Path(n).is_absolute() and '..' not in Path(n).parts for n in source.namelist())
+                    source.extractall(purelib)
+                if native_case:
+                    row = next(c for c in SPEC['native_io']['commands'] if c['id'] == name)
+                    script = receipts / 'source' / row['file']
+                    command = [str(py), '-u', str(script), *row['argv'][3:]]
+                    limit = row['timeout_s']
+                    # Separate metadata-only process: no framework/native import before the
+                    # DIRECT fresh script, especially its isolation assertion and os.fork.
+                    code = ('import importlib.metadata as m,json,os,sys; '
+                            'versions={d.metadata["Name"].lower().replace("_","-"):d.version for d in m.distributions()}; '
+                            'print(json.dumps({"python":sys.version,"executable":sys.executable,"python_optimize":sys.flags.optimize,'
+                            '"no_user_site":sys.flags.no_user_site,"cuda_visible_devices":os.environ.get("CUDA_VISIBLE_DEVICES"),'
+                            '"cublas_workspace_config":os.environ.get("CUBLAS_WORKSPACE_CONFIG"),'
+                            '"torch":versions.get("torch"),"triton":versions.get("triton"),"numpy":versions.get("numpy")}))')
+                    observed = json.loads(setup(name + '-environment', [str(py), '-c', code], env))
+                    observed['profile'] = row['profile']
+                    observed['installed_native_extension_sha256'] = digest((purelib / SPEC['native']['extension_file']).read_bytes())
+                    assert observed['installed_native_extension_sha256'] == SPEC['native']['extension_sha256']
+                    assert (observed['torch'] is None and observed['triton'] is None) if clean else bool(observed['torch'] and observed['numpy'])
+                    (receipts / f'reports/{name}-environment.json').write_text(json.dumps(observed, indent=2) + '\n')
+                else:
+                    if clean:
+                        script = receipts / 'source' / SPEC['kernel']['file']
+                        extra = SPEC['kernel']['argv']
+                        marker = SPEC['kernel']['schema']
+                    else:
+                        script = receipts / 'source' / SPEC['consumers'][name]['file']
+                        extra = ['--device', 'cuda:0', '--native-source', SPEC['native']['source'], '--wheel', str(wheel)]
+                        if name == 'comfy':
+                            extra += ['--comfy-root', str(comfy)]
+                        marker = f'public-tensorfs-{name}-unet-cuda'
+                    command = [str(py), str(receipts / 'source/child.py'), str(receipts / f'reports/{name}-identity.json'), name, str(script), *extra]
+                    limit = helper['KERNEL_SECONDS'] if clean else helper['CONSUMER_SECONDS']
             done = run_owned(command, receipts / f'logs/{name}.stdout', receipts / f'logs/{name}.stderr',
-                             timeout=helper['KERNEL_SECONDS'] if clean else helper['CONSUMER_SECONDS'], env=env, cwd=directory)
+                             timeout=limit, env=env, cwd=directory)
             part = {'name': name, **done, 'ok': False}
             parts.append(part)
             try:
-                result = report((receipts / f'logs/{name}.stdout').read_text(), marker)
+                stdout = (receipts / f'logs/{name}.stdout').read_text()
+                if native_case:
+                    gpu = json.loads((receipts / 'reports/diffusers-identity.json').read_text())['gpu_uuid']
+                    result = native['parse'](name, stdout, SPEC['native'], gpu)
+                else:
+                    result = report(stdout, marker)
                 (receipts / f'reports/{name}.json').write_text(json.dumps(result, indent=2) + '\n')
                 part['ok'] = done['ok']
             except ValueError as error:

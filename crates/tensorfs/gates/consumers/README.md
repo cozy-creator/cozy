@@ -102,6 +102,36 @@ The kernel routing oracle at the same frozen source was separately CPU-proven in
 that is plan evidence, not device evidence. Without `--include-kernel`, `kernel` is unrequested.
 `validate.py --require-kernel` refuses an unrequested or incomplete kernel proof.
 
+Optional `--include-native-io` adds the frozen `3be2dbc2` read/Array/DLPack, ordinary-provider
+cleanup and fork-cleanup scripts. They launch **directly** as fresh `python -u <script>`
+children through the same `run_owned`, with 120/210/90-second bounds. The read script retains
+its sibling `read_engine.py`; no bootstrap imports Torch before the read script or CPU-only
+fork parent. The fork venv contains only TensorFS and the standard library. Metadata-only
+subprocesses record the actual Torch/NumPy versions, sealed visibility and installed extension
+hash without importing those modules. Read/fork receipts retain their actual text markers
+(and the fork's emitted recovered byte count); other source assertions stay recorded as source coverage.
+Provider receipts require all four identities/results and the exact final case set, real
+chunk callbacks, zero remaining mappings and positive native H2D records, with matching UUID/hash.
+
+Also supplying `--hostpin-archive "$HOSTPIN_BUNDLE"` requires the frozen archive SHA256
+`91db7556e78bbffdfccbcd91e671b205b20261589bcb37bbfd030c54c636e514`, binary SHA256
+`c6cf3db17c1fd21651a50095a04c42061580447c32964980407e95f3b00c280a`, source `c6f535fe`,
+production core identical to `0800dbcfee`, and ELF glibc floor no newer than 2.28. The generator
+and worker verify it without running a binary. The payload then has a second **required** public
+FileAsset field; add `--asset "hostpin_bundle=$HOSTPIN_BUNDLE"` to the ordinary launch command.
+Archive paths/types/duplicates/sizes are checked, and only the verified executable is written
+to temporary work. The Tree retains its test source/provenance and logs, never executable bytes.
+The 120-second child selects only the ignored exact
+`cuda_staging_pins_device_copies_and_chunk_spans_keep_exact_bytes` test, with `--nocapture
+--test-threads=1`; the exact HostPin marker plus 1 passed/0 failed/0 ignored and clean reap
+are mandatory. The bundled speed test, A11 migration and extra native vectors are unrequested.
+
+Every manifest explicitly lists requested and unrequested cases. Missing, partial, duplicate,
+skipped, wrong-profile/interpreter, timeout, failed cleanup and unrequested output cannot pass.
+The original PR1616 and its generated payload are immutable; this extension generates a NEW
+payload directory only after hosted CPU metadata/validator checks and parent review. Providers
+and GPU launch remain stopped until separately authorized.
+
 Stdlib checks (synthetic GPU-shaped fixtures are validator tests, never hardware evidence):
 
 ```bash
@@ -109,7 +139,7 @@ python3 -m unittest discover -s crates/tensorfs/gates/consumers -p 'test_*.py' -
 ```
 
 The hosted no-Torch installed-Runtime contract check additionally discovers the generated public
-script's actual FileAsset/Outputs signature and default accelerator, snapshots a real output Tree,
+script's actual one/two-FileAsset/Outputs signatures and default accelerator, snapshots a real output Tree,
 serializes its result through the installed Runtime, and checks its canonical document bytes:
 
 ```bash

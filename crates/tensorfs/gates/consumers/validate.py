@@ -11,6 +11,7 @@ import tarfile
 from make_payload import (COMFY, CONSUMERS, PRE_GPU, KERNEL_SOURCE, KERNEL_SCRIPT,
                           KERNEL_CORPUS, KERNEL_SCHEMA, KERNEL_FILE, kernel_cases)
 from owned_child import CONSUMER_SECONDS, KERNEL_SECONDS, SETUP_SECONDS
+import native_io
 
 
 def require(ok, detail):
@@ -171,8 +172,13 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
                 re.fullmatch('[0-9a-f]{64}', spec[name].get('sha256', '')) is not None, f'{name}: malformed artifact/source hash')
     require(spec['native']['source'] not in PRE_GPU, 'known pre-GPU/fork-fix source')
     requested = spec.get('requested')
-    require(requested in (['diffusers', 'comfy'], ['diffusers', 'comfy', 'kernel']), 'wrong requested consumer/case set')
-    require(spec.get('unrequested') == ([] if 'kernel' in requested else ['kernel']), 'unrequested cases are ambiguous')
+    require(isinstance(requested, list) and requested[:2] == ['diffusers', 'comfy'] and
+            requested == [name for name in native_io.ALL if name in requested], 'wrong requested consumer/case set')
+    require(all(name in requested for name in native_io.IDS) == any(name in requested for name in native_io.IDS), 'partial native I/O batch')
+    require(('native_io' in spec) == all(name in requested for name in native_io.IDS) and
+            ('hostpin' in spec) == (native_io.HOSTPIN in requested) and
+            (native_io.HOSTPIN not in requested or all(name in requested for name in native_io.IDS)), 'native I/O requested/artifact matrix differs')
+    require(spec.get('unrequested') == [name for name in native_io.ALL if name not in requested], 'unrequested cases are ambiguous')
     require(not require_kernel or 'kernel' in requested, 'kernel proof was not requested')
     require(read(root / 'manifest.json') == spec, 'returned manifest differs from coordinator freeze')
     require(sha(root / 'source/payload.py') == payload_sha, 'executed payload source differs')
@@ -185,17 +191,34 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
     require(actual == inventory, 'receipt file inventory/hash differs')
     expected_files = {'manifest.json', 'identity.json', 'verdict.json', 'source/payload.py',
                       'source/comfy-upstream.tar'}
-    setup_names = ['comfy-init', 'comfy-remote', 'comfy-fetch', 'comfy-checkout', 'comfy-archive']
-    setup_names += [name + '-purelib' for name in requested]
+    setup_names = native_io.setup_names(requested)
     for name in setup_names:
         expected_files.update({f'logs/{name}.stdout', f'logs/{name}.stderr'})
     expected_files.update('source/' + name for name in spec['sources'])
     for name in requested:
-        expected_files.update({f'logs/{name}.stdout', f'logs/{name}.stderr', f'reports/{name}.json',
-                               f'reports/{name}-identity.json'})
+        expected_files.update({f'logs/{name}.stdout', f'logs/{name}.stderr', f'reports/{name}.json'})
+        if name in native_io.IDS:
+            expected_files.add(f'reports/{name}-environment.json')
+        elif name == native_io.HOSTPIN:
+            expected_files.add('reports/hostpin-artifact.json')
+        else:
+            expected_files.add(f'reports/{name}-identity.json')
     require(set(actual) == expected_files, 'unexpected/missing receipt files or model/checkpoint bytes')
     for name, expected_sha in spec['sources'].items():
         require(sha(root / 'source' / name) == expected_sha, 'retained source hash differs')
+    if any(name in requested for name in native_io.IDS):
+        command_contract = native_io.contract((root / 'source/native/contract.json').read_bytes())
+        commands = []
+        for row in command_contract['commands']:
+            if row['id'] not in native_io.IDS:
+                continue
+            row = dict(row)
+            for f in [row['file'], *row.get('helper_files', [])]:
+                path = 'native/scripts/' + Path(f['path']).name
+                require(spec['sources'].get(path) == f['sha256'] and (root / 'source' / path).stat().st_size == f['bytes'], 'native I/O source pin differs')
+            row['file'] = 'native/scripts/' + Path(row['file']['path']).name
+            commands.append(row)
+        require(exact(spec.get('native_io'), {'source': native_io.SOURCE, 'contract_sha256': native_io.CONTRACT_SHA, 'commands': commands}), 'native I/O frozen command matrix differs')
     identity, verdict = read(root / 'identity.json'), read(root / 'verdict.json')
     require(identity.get('ok') is True and verdict.get('ok') is True, 'worker failed')
     operations = identity.get('operations', [])
@@ -218,8 +241,40 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
     devices = []
     for part in parts:
         name = part['name']
-        require(completed_child(part, KERNEL_SECONDS if name == 'kernel' else CONSUMER_SECONDS),
+        limit = native_io.TIMEOUT.get(name, KERNEL_SECONDS if name == 'kernel' else CONSUMER_SECONDS)
+        require(completed_child(part, limit),
                 f'{name}: child failed/timed out/not reaped')
+        if name in native_io.IDS or name == native_io.HOSTPIN:
+            stdout = (root / f'logs/{name}.stdout').read_text()
+            value = read(root / f'reports/{name}.json')
+            require(devices, 'native I/O lacks preceding real consumer GPU identity')
+            require(exact(value, native_io.parse(name, stdout, spec['native'], devices[0]['gpu_uuid'])), 'native I/O receipt differs from actual stdout')
+            argv = part.get('command', [])
+            if name == native_io.HOSTPIN:
+                h = spec.get('hostpin', {})
+                require(exact(read(root / 'reports/hostpin-artifact.json'), h) and h.get('sha256') == native_io.PIN_SHA and
+                        h.get('binary_sha256') == native_io.PIN_BINARY_SHA and h.get('source') == native_io.PIN_SOURCE and
+                        h.get('core_source') == native_io.CORE == spec['native']['source'] and h.get('glibc_max') == '2.28', 'HostPin artifact/source differs')
+                require(len(argv) == 6 and Path(argv[0]).name == 'hostpin-io' and argv[1:] == native_io.PIN_ARGV, 'HostPin requested binary/test/interpreter differs')
+                provenance = read(root / 'source/hostpin/provenance.json')
+                require(provenance.get('native_source') == native_io.PIN_SOURCE and provenance.get('production_core') == native_io.CORE and
+                        provenance.get('binary', {}).get('sha256') == native_io.PIN_BINARY_SHA and
+                        sha(root / 'source/hostpin/io.rs') == provenance.get('source_sha256', {}).get('crates/tensorfs-core/tests/io.rs'), 'HostPin retained source/provenance differs')
+            else:
+                row = next(c for c in spec['native_io']['commands'] if c['id'] == name)
+                observed = read(root / f'reports/{name}-environment.json')
+                require(len(argv) == len(row['argv']) and argv[1] == '-u' and str(argv[2]).endswith('/source/' + row['file']) and
+                        argv[3:] == row['argv'][3:] and argv[0] == observed.get('executable'), 'native I/O direct-script interpreter/arguments differ')
+                require(observed.get('installed_native_extension_sha256') == spec['native']['extension_sha256'] and
+                        observed.get('cuda_visible_devices') == identity.get('cuda_visible_devices') and observed.get('profile') == row['profile'] and
+                        observed.get('python_optimize') == 0 and observed.get('no_user_site') == 1 and
+                        observed.get('cublas_workspace_config') == ':4096:8', 'native I/O environment/artifact differs')
+                if row['profile'] == 'clean':
+                    require(observed.get('torch') is None and observed.get('triton') is None, 'native I/O clean profile contains a framework')
+                else:
+                    require(isinstance(observed.get('torch'), str) and re.fullmatch(r'2\.14\.0(?:\+[^\s]+)?', observed['torch']) and
+                            isinstance(observed.get('numpy'), str) and bool(observed['numpy']), 'native I/O missing pinned Torch/resolved NumPy')
+            continue
         child = read(root / f'reports/{name}-identity.json')
         require(child.get('ok') is True and child.get('python_optimize') == 0 and child.get('triton_interpret') in ('', '0'), f'{name}: skipped/interpreter/optimized child')
         require(child.get('script_completed') is True and child.get('native_extension_sha256') == spec['native']['extension_sha256'], f'{name}: native binary differs or child incomplete')
