@@ -587,8 +587,8 @@ pub struct Pool {
     deviceless: Mutex<Vec<Session>>,
     /// Set (under `sessions`) once the pool stops: an executor coming back then is ended.
     stopped: std::sync::atomic::AtomicBool,
-    /// Live executor lane leaders, including running sessions removed from `sessions`.
-    leaders: Mutex<std::collections::BTreeSet<(String, usize)>>,
+    /// Exact live executor lane leaders by PID, including sessions taken out for a call.
+    leaders: Mutex<BTreeMap<u32, (Birth, String, usize)>>,
     /// Every live GPU executor process (leaders and followers) by pid: its plan, lane and
     /// handle, so a process the ledger names stalled can be ended and a row read as a plan's.
     tenants: Mutex<BTreeMap<u32, Tenant>>,
@@ -601,9 +601,8 @@ pub struct Pool {
     members: Mutex<BTreeMap<String, Vec<Arc<Member>>>>,
     /// One pass over the warm sets at a time.
     keeping: Mutex<()>,
-    /// Each live executor's (generation, level) by plan: what Status reads while a call holds
-    /// `sessions`.
-    levels: Mutex<BTreeMap<String, (App, Level)>>,
+    /// Each cached executor's measured (App, level) and exact owner, retained during its call.
+    levels: Mutex<BTreeMap<String, (App, Level, Birth)>>,
     /// Each envelope GPU and its ledger, in envelope order.
     devices: Vec<Device>,
     /// Host layouts executors deposited, granted to the next executor of the same weights.
@@ -888,14 +887,21 @@ impl Pool {
     /// A process the ledger names stalled (asked for bytes, its progress still): it ends now.
     /// An idle one leaves the pool; a running one's call fails as its executor ends.
     fn end_stalled(&self, pid: u32) {
-        let Some(tenant) = self.tenants.lock().unwrap().get(&pid).map(|t| (t.plan.clone(), t.start, t.exact.kill())) else {
+        let Some(tenant) = self.tenants.lock().unwrap().get(&pid).map(|t| (t.plan.clone(), t.start, t.exact.birth().clone(), t.exact.kill())) else {
             return tracing::warn!("memory: stalled pid {pid} is no executor of this machine");
         };
-        let (plan, start, killed) = tenant;
+        let (plan, start, birth, killed) = tenant;
         self.notes.note(serde_json::json!({"event": "end_stalled", "pid": pid, "plan": plan,
             "killed": killed.as_ref().map_or_else(|e| e.to_string(), |_| "yes".into())}));
         let key = session_key(&plan, start);
-        let idle = self.sessions.lock().unwrap().remove(&key);
+        let idle = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let owns = |s: &Session| s.executor.birth == birth || s.followers.iter().any(|f| f.birth() == &birth);
+            match sessions.get(&key).is_some_and(owns) {
+                true => sessions.remove(&key),
+                false => None,
+            }
+        };
         if let Some(session) = idle {
             let (degree, executor) = (session.degree, session.executor);
             if let Err(error) = executor.terminate() {
@@ -973,10 +979,30 @@ impl Pool {
     /// the lane reads NVML now, so their rows are reaped and their bytes returned (which wakes
     /// the dispatch).
     fn ended(&self, plan: &str, start: usize, degree: u32) {
+        let mut births: Vec<Birth> = self.leaders.lock().unwrap().values()
+            .filter(|(_, p, s)| p == plan && *s == start).map(|(birth, _, _)| birth.clone()).collect();
+        births.extend(self.tenants.lock().unwrap().values()
+            .filter(|t| t.plan == plan && t.start == start).map(|t| t.exact.birth().clone()));
+        self.retire(plan, start, degree, &births);
+    }
+    /// Retire only proven exited incarnations. Another same-plan/lane session may already
+    /// be running or cached; neither its row nor its most recent measured level is ours.
+    fn retire(&self, plan: &str, start: usize, degree: u32, births: &[Birth]) {
+        let gone: std::collections::HashSet<&Birth> = births.iter()
+            .filter(|birth| birth.ended().unwrap_or(false)).collect();
+        if gone.is_empty() {
+            return;
+        }
         let key = session_key(plan, start);
-        self.levels.lock().unwrap().remove(&key);
-        self.leaders.lock().unwrap().remove(&(plan.to_owned(), start));
-        self.tenants.lock().unwrap().retain(|_, t| !(t.plan == plan && t.start == start));
+        let mut levels = self.levels.lock().unwrap();
+        if levels.get(&key).is_some_and(|(_, _, owner)| gone.contains(owner)) {
+            levels.remove(&key);
+        }
+        drop(levels);
+        self.leaders.lock().unwrap().retain(|_, (birth, p, s)|
+            !(p == plan && *s == start && gone.contains(birth)));
+        self.tenants.lock().unwrap().retain(|_, t|
+            !(t.plan == plan && t.start == start && gone.contains(t.exact.birth())));
         for ledger in self.lane(start, degree).unwrap_or_default().iter().filter_map(|d| d.memory.as_ref()) {
             ledger.now();
         }
@@ -1125,7 +1151,7 @@ impl Pool {
     /// Warming a loaded member: its executor loads its models at `level` (`gpu`, or `host` in
     /// RAM) and varena fills them: "mapped", or why they stay lower.
     fn map_member(&self, plan: &Plan, level: Level) -> io::Result<&'static str> {
-        let holds = self.levels.lock().unwrap().get(&plan.construction).map(|(_, level)| *level);
+        let holds = self.levels.lock().unwrap().get(&plan.construction).map(|(_, level, _)| *level);
         if holds == Some(level) {
             return Ok("mapped");
         }
@@ -1170,7 +1196,7 @@ impl Pool {
     fn level(&self, plan: &str) -> Option<Level> {
         let levels = self.levels.lock().unwrap();
         let of_plan = levels.iter().filter(|(key, _)| key.split('@').next() == Some(plan));
-        of_plan.map(|(_, (_, level))| *level).max()
+        of_plan.map(|(_, (_, level, _))| *level).max()
     }
     fn warm_set(&self, actor: &str) -> Vec<Arc<Member>> {
         let sets = self.members.lock().unwrap();
@@ -1214,17 +1240,16 @@ impl Pool {
         session.used = Instant::now();
         if session.loaded {
             let level = self.loaded_level(session.start, session.executor.birth.pid);
-            let noted = ((session.generation.clone(), session.application.clone()), level);
+            let noted = ((session.generation.clone(), session.application.clone()), level, session.executor.birth.clone());
             self.levels.lock().unwrap().insert(key.clone(), noted);
         }
         sessions.insert(key, session);
         Ok(())
     }
-    /// A lane's turn is over: an executor not kept idle is gone.
+    /// A lane's turn is over: reap only processes whose exact exits are known.
     fn settle_lane(&self, plan: &str, start: usize, degree: u32) {
-        if !self.sessions.lock().unwrap().contains_key(&session_key(plan, start)) {
-            self.ended(plan, start, degree);
-        }
+        // Map absence means a call took the session, not that its process exited.
+        self.ended(plan, start, degree);
     }
     pub fn store(&self) -> &Arc<Store> {
         &self.store
@@ -1247,7 +1272,7 @@ impl Pool {
             .filter(|(_, parent)| parent.ready())
             .map(|(app, _)| (app, Level::Imported))
             .collect();
-        for (app, level) in self.levels.lock().unwrap().values() {
+        for (app, level, _) in self.levels.lock().unwrap().values() {
             let held = highest.entry(app.clone()).or_insert(*level);
             *held = (*held).max(*level);
         }
@@ -1689,14 +1714,14 @@ impl Pool {
     /// The GPUs with an executor of `plan` now, by envelope index (a lane's first).
     fn hosting(&self, plan: &str) -> Vec<usize> {
         let leaders = self.leaders.lock().unwrap();
-        leaders.iter().filter(|(p, _)| p == plan).map(|(_, start)| *start).collect()
+        leaders.values().filter(|(_, p, _)| p == plan).map(|(_, _, start)| *start).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
     }
     /// Whether a replica of `plan` fits on GPU `device` now (`fits`, its widest measured shape,
     /// a new process). Without a ledger, when no executor is there.
     fn fits(&self, plan: &str, device: usize) -> bool {
         match &self.devices[device].memory {
             Some(ledger) => ledger.fits(plan, None, true),
-            None => !self.leaders.lock().unwrap().iter().any(|(_, start)| *start == device),
+            None => !self.leaders.lock().unwrap().values().any(|(_, _, start)| *start == device),
         }
     }
     /// Where `plan` runs now, with its GPUs' call slots: inside its root's `lane` when it has
@@ -2523,7 +2548,6 @@ impl Pool {
         on_birth: impl Fn(&Birth, &Cancellation) -> io::Result<()>,
     ) -> io::Result<Session> {
         let launched = Instant::now();
-        self.leaders.lock().unwrap().insert((plan.construction.clone(), start));
         let (root, socket, directory) = self.executor_endpoint()?;
         let config = self.executor_config(held, root, socket, start, plan.degree)?;
         // A forked child takes its lane and seal with its environment, so a group forks from
@@ -2584,6 +2608,8 @@ impl Pool {
             let exact = Exact::open(&executor.birth)?.ok_or_else(|| io::Error::other("executor exited before its start"))?;
             let tenant = Tenant { plan: plan.construction.clone(), start, exact };
             self.tenants.lock().unwrap().insert(executor.birth.pid, tenant);
+            self.leaders.lock().unwrap().insert(executor.birth.pid,
+                (executor.birth.clone(), plan.construction.clone(), start));
         }
         let selections = plan.selections();
         let id = self.serving.next.fetch_add(1, Ordering::Relaxed);
@@ -3962,6 +3988,11 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         let engine = Engine::open(&root.join("execution")).unwrap();
         (root, pool, engine)
     }
+    /// Placement-only marker: process/ledger liveness is exercised by the retirement test.
+    fn mark_serving(pool: &Pool, plan: &str, start: usize) {
+        let birth = Birth { pid: 1_000_000 + start as u32, boot_id: "placement-only".into(), start_ticks: 0 };
+        pool.leaders.lock().unwrap().insert(birth.pid, (birth, plan.into(), start));
+    }
     fn plan(id: &str, degree: u32) -> Plan {
         Plan {
             id: id.into(),
@@ -3980,7 +4011,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         let (root, pool, engine) = pool_of(4);
         let (image, film) = (plan("image", 1), plan("film", 2));
         let place = |plan: &Plan, seq: u64, claims: &mut [Option<u64>]| pool.place(&engine, plan, (seq, None), None, claims);
-        let serving = |gpu: usize| pool.leaders.lock().unwrap().insert(("image".into(), gpu));
+        let serving = |gpu: usize| mark_serving(&pool, "image", gpu);
         let mut claims = [None; 4];
         let (gpu, first) = place(&image, 1, &mut claims).unwrap();
         assert_eq!(gpu, 0);
@@ -4224,10 +4255,10 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         let mut claims = [None; 2];
         let (gpu, first) = pool.place(&engine, &image, (1, None), None, &mut claims).unwrap();
         assert_eq!(gpu, 0);
-        pool.leaders.lock().unwrap().insert(("image".into(), 0));
+        mark_serving(&pool, "image", 0);
         let (gpu, second) = pool.place(&engine, &image, (2, None), None, &mut claims).unwrap();
         assert_eq!(gpu, 1);
-        pool.leaders.lock().unwrap().insert(("image".into(), 1));
+        mark_serving(&pool, "image", 1);
         assert!(pool.place(&engine, &image, (3, None), None, &mut claims).is_none());
         assert_eq!(claims, [Some(3), Some(3)]);
         drop((first, second));
