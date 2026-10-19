@@ -483,10 +483,10 @@ A new scheme is a minor version (§8). It ships:
   where it enters.
 
 **Closure.** A cozytensors' closure is its header's closure (§4): the header and every object it cites, its `chunks`
-and each component's assets. A tree's closure is the tree, every object its `files` cite, and each variant's closure. A copy
-is complete when its whole closure is present. A reader that needs only some components MAY fetch only the chunks
-their locations touch and their assets; one that needs one variant MAY fetch only the tree, its repo files and that
-variant's closure.
+and each component's assets. A tree's closure is the tree, every object its `files` cite, and each variant's closure.
+A copy is complete when its whole closure is present. A reader that needs only some components MAY fetch only the
+chunks their locations touch and their assets; one that needs one variant MAY fetch only the tree, its repo files and
+that variant's closure.
 
 ## 8. Versioning
 
