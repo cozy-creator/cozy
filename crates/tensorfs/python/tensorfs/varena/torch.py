@@ -37,7 +37,8 @@ from torch.utils._python_dispatch import _disable_current_modes
 from torch.utils._pytree import tree_map_only
 from torch.utils.hooks import RemovableHandle
 
-from . import DeviceFull, Gpu, Host, Ledger, Pinned, Row, WeightSet, cuts, seal
+from . import Copy as CopyRun
+from . import DeviceFull, Gpu, Host, Ledger, Pinned, Row, WeightSet, copies, cuts, seal
 
 #: Blocks copied ahead of the one entered, in the recorded order.
 _AHEAD = 2
@@ -188,6 +189,36 @@ class Peak:
 
 
 @dataclass(frozen=True, slots=True)
+class Copy:
+    """A run of weight copies since the last request (`varena.copies()`): a restore, refill or
+    fill (`h2d`), or a host layout read from disk (`disk`), against the measured `ceiling` GB/s.
+    `busy_s` is the GPU's copy time, `pin_s` the host's page locking."""
+
+    kind: str
+    gpu: int
+    bytes: int
+    seconds: float
+    gbps: float
+    ceiling: float
+    pct: float
+    link: str
+    busy_s: float
+    pin_s: float
+    staged: int
+    cached: int
+
+
+def _copy(c: CopyRun) -> Copy:
+    gbps = c.bytes / c.ns if c.ns else 0.0
+    pct = round(100 * gbps / c.ceiling, 1) if c.ceiling else 0.0
+    seconds, busy, pin = c.ns / 1e9, c.busy_ns / 1e9, c.pin_ns / 1e9
+    ceiling = round(c.ceiling, 2)
+    return Copy(
+        c.kind, c.gpu, c.bytes, seconds, round(gbps, 2), ceiling, pct, c.link, busy, pin, c.staged, c.cached
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class RequestStats:
     id: str
     steps: tuple[Step, ...]
@@ -200,6 +231,7 @@ class RequestStats:
     peaks: tuple[Peak, ...] = ()
     #: its declared plan (`Memory.plan`), each step's models by component name
     plan: tuple[tuple[str, ...], ...] = ()
+    copies: tuple[Copy, ...] = ()
 
 
 # ------------------------------------------------------------------------ placeholders
@@ -1252,8 +1284,9 @@ class Memory:
         steps, evictions = tuple(request.steps), tuple(request.evictions)
         declared = self.plans.get(request.id)
         plan = () if declared is None else tuple(self._names(s) for s in declared.steps)
+        runs = tuple(_copy(c) for c in copies())
         request.stats = RequestStats(
-            request.id, steps, evictions, leftover, copied, retries, peaks, plan
+            request.id, steps, evictions, leftover, copied, retries, peaks, plan, runs
         )
         if request.key is not None and self.row is not None:
             self.row[0].set_peak(request.key, request.peak)

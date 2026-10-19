@@ -15,6 +15,7 @@ use pyo3::{create_exception, ffi};
 #[cfg(feature = "store")]
 use tensorfs_core::ids::ObjectRef;
 use varena::ledger::{Admit, Facts, Ledger, Row, RowFacts, State, Victim};
+use varena::ceiling::Copy;
 use varena::memory::{Counters, GpuStats, Part, SetStats};
 use varena::{Error, Gpu, Host, HostPinned, HostSet, Pinned, WeightSet};
 
@@ -110,6 +111,17 @@ record!(PyGpuStats = "GpuStats" from GpuStats {
     driver_free: u64, driver_total: u64; sets: PySetStats
 });
 
+record!(PyCopy = "Copy" from Copy {
+    kind: String, gpu: i32, bytes: u64, ns: u64, ceiling: f64, link: String, busy_ns: u64, pin_ns: u64, staged: u64, cached: u64
+});
+
+/// Every run of weight copies since the last call (`h2d`: a GPU's copy stream from its first job
+/// to its last landing; `disk`: a host layout filled from chunk files), with its ceiling in GB/s.
+#[pyfunction]
+fn copies() -> Vec<PyCopy> {
+    varena::ceiling::take().into_iter().map(Into::into).collect()
+}
+
 #[pyclass(name = "Part", module = "tensorfs.varena", frozen, get_all)]
 pub struct PyPart {
     component: String,
@@ -141,7 +153,7 @@ pub struct PyGpu(Arc<Gpu>);
 #[pymethods]
 impl PyGpu {
     #[new]
-    #[pyo3(signature = (device, chunk = 2 << 20))]
+    #[pyo3(signature = (device, chunk = 64 << 20))]
     fn new(py: Python<'_>, device: i32, chunk: u64) -> PyResult<Self> {
         Ok(PyGpu(py.detach(|| Gpu::open(device, chunk)).or_raise(py)?))
     }
@@ -716,8 +728,8 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
             $(m.add(stringify!($e), py.get_type::<$e>())?;)*
         };
     }
-    add!(PyGpu, PyHost, PyWeightSet, PyPinned, PyPart, PyCounters, PySetStats, PyGpuStats, PyLedger, PyRow, PyVictim, PyAdmit, PyRowFacts;
-        hold_tier, release_tier;
+    add!(PyGpu, PyHost, PyWeightSet, PyPinned, PyPart, PyCounters, PySetStats, PyGpuStats, PyCopy, PyLedger, PyRow, PyVictim, PyAdmit, PyRowFacts;
+        copies, hold_tier, release_tier;
         VarenaError, DeviceFull, CudaError, CudaUnavailable, Invalid, IoError, Closed, Unsupported, LedgerError);
     #[cfg(feature = "store")]
     add!(; seal;);

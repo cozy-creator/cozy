@@ -11,6 +11,7 @@
 
 #[cfg(feature = "store")]
 pub mod checkpoint;
+pub mod ceiling;
 pub mod cuda;
 pub mod faults;
 pub mod host;
