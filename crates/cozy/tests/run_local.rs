@@ -661,7 +661,7 @@ fn runtime_checkpoint_uploads_local_alias_on_disk() {
     assert_eq!(named.tree, Some(tree));
     assert_eq!(named.header, header);
     assert!(
-        !home.root().join("keys").exists(),
+        !home.device_key("http://127.0.0.1:1").exists(),
         "a local conversion created sign-in credentials"
     );
 }
