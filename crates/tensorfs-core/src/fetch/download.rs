@@ -38,6 +38,9 @@ use super::{Admission, ObjectStore, Tier};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::format::ObjectRef;
 
+/// Where an origin redirected an object's GET, reused for restarts until the redirect's max-age.
+type Delivery = (String, Option<Instant>);
+
 /// How many times slower than its peers a request may run, or longer than their answer it may
 /// wait, before it is dropped. Also how much longer than the fetch's longest recovered stillness
 /// it may stand still before an object ends.
@@ -693,7 +696,7 @@ impl Shared {
     /// The origin's copy, asked again from the byte reached until it lands or ends.
     async fn from_origin(self: &Arc<Self>, task: &Arc<Task>) -> Result<()> {
         let mut sink = Sink::open(self, task)?;
-        let (mut location, mut delivery, mut relocated) = (None::<Location>, None::<String>, false);
+        let (mut location, mut delivery, mut relocated) = (None::<Location>, None::<Delivery>, false);
         let (mut doublings, mut wrong) = (0, None::<String>);
         loop {
             if !task.wanted() {
@@ -747,9 +750,10 @@ impl Shared {
                     FileRead::Failed(refusal) => Attempt::Fatal(refusal),
                 },
                 Location::Url { url, headers, .. } => {
+                    delivery = delivery.filter(|(_, until)| until.is_none_or(|u| u > Instant::now()));
                     let (delivered, asked) = (
                         delivery.is_some(),
-                        delivery.clone().unwrap_or_else(|| url.clone()),
+                        delivery.clone().map_or_else(|| url.clone(), |(at, _)| at),
                     );
                     self.request(
                         task,
@@ -885,7 +889,7 @@ impl Shared {
         headers: &[(String, String)],
         doublings: u32,
         delivered: bool,
-        delivery: &mut Option<String>,
+        delivery: &mut Option<Delivery>,
     ) -> Attempt {
         let object = &task.object;
         let flying = self.fly(task, false, doublings);
@@ -917,7 +921,7 @@ impl Shared {
         flight.moved();
         flight.stretch_begins();
         if answer.url != url {
-            *delivery = Some(answer.url.clone());
+            *delivery = Some((answer.url.clone(), answer.until));
         }
         let status = answer.status();
         let what = || format!("{}: {status} from {url}", object.sha256);

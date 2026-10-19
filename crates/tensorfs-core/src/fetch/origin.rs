@@ -6,12 +6,8 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 
-use super::net::Client;
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::format::{repo_key, ObjectRef, Repo, Tree};
-
-/// The most bytes a refs document may have.
-const REPO_BYTES: u64 = 16 << 20;
+use crate::format::{ObjectRef, Repo, Tree};
 
 #[async_trait]
 pub trait Origin: Send + Sync {
@@ -125,65 +121,4 @@ pub fn choose(
         variant,
         header,
     })
-}
-
-/// A static origin over HTTP: `{base}/refs/<org>/<model>.json` (lowercase) and `{base}/blobs/<aa>/<bb>/<sha256>`.
-/// Any HTTP server, bucket or repository holding that layout serves it.
-pub struct HttpOrigin {
-    client: Client,
-    base: String,
-    bearer: Option<String>,
-}
-
-impl HttpOrigin {
-    pub fn new(client: &Client, base: &str) -> Result<HttpOrigin> {
-        let base = base.trim_end_matches('/').to_string();
-        client.policy().admit(&base)?;
-        Ok(HttpOrigin {
-            client: client.clone(),
-            base,
-            bearer: None,
-        })
-    }
-
-    /// Sends `Authorization: Bearer <token>`; the origin is then private.
-    pub fn bearer(mut self, token: impl Into<String>) -> HttpOrigin {
-        self.bearer = Some(token.into());
-        self
-    }
-
-    fn headers(&self) -> Vec<(String, String)> {
-        self.bearer
-            .iter()
-            .map(|token| ("authorization".to_string(), format!("Bearer {token}")))
-            .collect()
-    }
-}
-
-#[async_trait]
-impl Origin for HttpOrigin {
-    async fn resolve(&self, name: &str, release: Option<&str>, _: Option<&str>) -> Result<ObjectRef> {
-        split_name(name)?;
-        let url = format!("{}/{}", self.base, repo_key(name));
-        let bytes = self
-            .client
-            .document(&url, &self.headers(), REPO_BYTES)
-            .await?;
-        pick(name, &bytes, release)
-    }
-
-    async fn locate(&self, objects: &[ObjectRef]) -> Result<Vec<Location>> {
-        let headers = self.headers();
-        Ok((objects.iter())
-            .map(|object| Location::Url {
-                url: format!("{}/{}", self.base, object.key()),
-                headers: headers.clone(),
-                expires: None,
-            })
-            .collect())
-    }
-
-    fn public(&self) -> bool {
-        self.bearer.is_none()
-    }
 }
