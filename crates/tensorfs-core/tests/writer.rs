@@ -86,6 +86,23 @@ fn blobs(store: &Store) -> BTreeSet<String> {
     found
 }
 
+/// Account only for the normal Trees written by native retention, including superseded
+/// roots not yet swept. Every raw entry must name a known fixture header/payload exactly.
+fn retention_trees(store: &Store, digests: &BTreeSet<String>, known: &BTreeSet<ObjectRef>) -> BTreeMap<String, u64> {
+    digests.iter().map(|digest| {
+        let object = ObjectRef { sha256: digest.clone(), length: 0 };
+        let bytes = fs::read(store.path(&object).unwrap()).unwrap();
+        assert_eq!(&ObjectRef::of(&bytes).sha256, digest, "metadata digest");
+        let tree = Tree::from_json(&bytes).expect("only known retention metadata may accompany the payload");
+        assert_eq!(bytes, tree.to_json().unwrap(), "canonical retention Tree");
+        for (path, object) in &tree.files {
+            assert_eq!(path, &format!("held/{}", object.sha256), "retention raw-entry name");
+            assert!(known.contains(object), "retention Tree names an unexpected object: {object:?}");
+        }
+        (digest.clone(), bytes.len() as u64)
+    }).collect()
+}
+
 /// The checkpoint's layout is what the planner makes of its parts in header order.
 fn assert_layout(ck: &Checkpoint) {
     let mut parts: Vec<(&str, &str, &str, Location)> = Vec::new();
@@ -324,9 +341,18 @@ fn copy_and_a_base_share_the_large_parts_objects() {
     );
     let b_bytes: u64 = b_chunks.iter().map(|o| o.length).sum();
     println!("lane B shares {shared_bytes} of {b_bytes} bytes with A");
-    // B wrote only its own new chunks and its header (the config is in the header).
-    let fresh = blobs(&store).difference(&before).count();
-    assert_eq!(fresh, b_chunks.difference(&a_chunks).count() + 1);
+    // B wrote its own new chunks and header, plus native hold Trees. Preserve exact
+    // payload/header identities and reject every extra object not of that known metadata form.
+    let fresh: BTreeSet<String> = blobs(&store).difference(&before).cloned().collect();
+    let written: BTreeSet<String> = b_chunks.difference(&a_chunks).map(|o| o.sha256.clone())
+        .chain(std::iter::once(b.id().sha256.clone())).collect();
+    assert_eq!(written.len(), b_chunks.difference(&a_chunks).count() + 1);
+    assert!(written.is_subset(&fresh), "every expected new payload/header was admitted");
+    let extra: BTreeSet<String> = fresh.difference(&written).cloned().collect();
+    let known: BTreeSet<ObjectRef> = [a.id().clone(), b.id().clone()].into_iter()
+        .chain(a.header().objects().cloned()).chain(b.header().objects().cloned()).collect();
+    let metadata = retention_trees(&store, &extra, &known);
+    assert_eq!(fresh.len(), written.len() + metadata.len());
     for (component, key) in copied_large.iter().chain(&copied_small) {
         let want = &a_tensors
             .iter()
@@ -1054,9 +1080,21 @@ fn a_two_variant_repo_shares_chunks_and_files_and_gc_keeps_its_closure() {
     let bytes: u64 = closure.iter().map(|o| o.length).sum();
     assert_eq!(store.usage().unwrap().refs, bytes, "shared objects count once");
 
-    let collected = store.clone().with_grace(Duration::ZERO).gc().unwrap();
     let gone: BTreeSet<ObjectRef> = std::iter::once(dropped.id().clone()).chain(dropped.header().objects().cloned()).collect();
-    assert_eq!(collected.objects, gone.len() as u64);
+    drop(dropped); // A live native owner must keep its payload even after the ordinary pin goes.
+    let before = blobs(&store);
+    let known: BTreeSet<ObjectRef> = closure.union(&gone).cloned().collect();
+    let known_digests: BTreeSet<String> = known.iter().map(|o| o.sha256.clone()).collect();
+    let extra: BTreeSet<String> = before.difference(&known_digests).cloned().collect();
+    let metadata = retention_trees(&store, &extra, &known);
+    let collected = store.clone().with_grace(Duration::ZERO).gc().unwrap();
+    let removed: BTreeSet<String> = before.difference(&blobs(&store)).cloned().collect();
+    let gone_digests: BTreeSet<String> = gone.iter().map(|o| o.sha256.clone()).collect();
+    assert!(gone_digests.is_subset(&removed), "the released checkpoint's exact payload is swept");
+    let removed_metadata: BTreeSet<String> = removed.difference(&gone_digests).cloned().collect();
+    let metadata_bytes: u64 = removed_metadata.iter().map(|digest| *metadata.get(digest).expect("GC removed an unexpected object")).sum();
+    assert_eq!(collected.objects, gone.len() as u64 + removed_metadata.len() as u64);
+    assert_eq!(collected.bytes, gone.iter().map(|o| o.length).sum::<u64>() + metadata_bytes);
     for o in &gone {
         assert!(!store.path(o).unwrap().exists(), "{} is swept", o.sha256);
     }
