@@ -1,5 +1,6 @@
 //! Compact JWS: the P-256 keys a machine proves with (DPoP, RFC 9449; JWT-bearer assertions,
 //! RFC 7523) and the base64url and random helpers the Ed25519 side shares.
+use aws_lc_rs::encoding::{AsBigEndian, EcPrivateKeyBin};
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -88,6 +89,38 @@ pub struct P256Key {
 }
 
 impl P256Key {
+    /// A private P-256 JWK, for the request that holds this key.
+    pub fn private_jwk(&self) -> String {
+        let scalar: EcPrivateKeyBin<'_> =
+            self.pair.private_key().as_be_bytes().expect("P-256 scalar");
+        let mut jwk = self.jwk();
+        jwk["d"] = b64(scalar.as_ref()).into();
+        jwk.to_string()
+    }
+
+    pub fn from_jwk(key: &str) -> Result<Self, Error> {
+        let bad = || Error::Key("not a private P-256 JWK".into());
+        let jwk: Value = serde_json::from_str(key).map_err(|_| bad())?;
+        if jwk["kty"] != "EC" || jwk["crv"] != "P-256" {
+            return Err(bad());
+        }
+        let field = |name: &str| {
+            jwk[name]
+                .as_str()
+                .and_then(unb64)
+                .filter(|v| v.len() == 32)
+                .ok_or_else(bad)
+        };
+        let point = [&[4u8][..], &field("x")?, &field("y")?].concat();
+        let pair = EcdsaKeyPair::from_private_key_and_public_key(
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            &field("d")?,
+            &point,
+        )
+        .map_err(|_| bad())?;
+        Ok(Self::from_pair(pair))
+    }
+
     /// An unencrypted PKCS#8 key, DER.
     pub fn from_pkcs8(der: &[u8]) -> Result<Self, Error> {
         let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, der)
@@ -168,7 +201,10 @@ mod tests {
     /// A proof verifies under the key its header carries and binds the request and token.
     #[test]
     fn a_proof_binds_its_request_and_token() {
-        let key = P256Key::generate();
+        let generated = P256Key::generate();
+        let key = P256Key::from_jwk(&generated.private_jwk()).unwrap();
+        assert_eq!(key.thumbprint(), generated.thumbprint());
+        assert_ne!(key.thumbprint(), P256Key::generate().thumbprint());
         let proof = key.proof(
             "POST",
             "https://hub.example/v1/tensorfs/closure",

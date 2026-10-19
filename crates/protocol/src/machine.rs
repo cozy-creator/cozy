@@ -412,10 +412,12 @@ pub struct HubAccess {
     /// The Hub's object-storage hosts downloads may follow.
     pub object_hosts: Vec<String>,
     /// The owner's capability for this run's private operations (th-241): a compact JWS its
-    /// device key signed for this machine's leaf (`cnf.jkt`) and the Hub's resource (`aud`),
-    /// naming each operation in `authorization_details`. The machine trades it once, at the run's
-    /// first private operation, at `token_endpoint`. Empty: a public-only run.
+    /// device key signed for the per-run key (`cnf.jkt`) and the Hub's resource (`aud`).
+    /// The Runtime (or TensorD for code-less runs) trades it once on first use.
     pub capability: String,
+    /// The private P-256 JWK this request proves with. Empty for public-only runs.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub key: String,
     /// The Hub's authorization server's, as its metadata names it.
     pub token_endpoint: String,
 }
