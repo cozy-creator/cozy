@@ -854,7 +854,8 @@ impl Engine {
     pub(crate) fn defer_completion(
         self: &Arc<Self>, id: &str, outcome: Outcome, processes: Vec<Birth>,
     ) -> io::Result<()> {
-        self.journal.lock().unwrap().defer_completion(id, outcome, processes)?;
+        let progress = self.progress.lock().unwrap();
+        self.journal.lock().unwrap().defer_completion(id, outcome, processes, progress.get(id))?;
         Ok(())
     }
 
@@ -1479,6 +1480,7 @@ mod tests {
         let result = engine.managed_result_record(&id, &spool.0, serde_json::json!({"answer": 42}), vec![binding, tree], vec![]).unwrap();
         let held = result.artifacts.clone();
         let held_path = result.artifacts[0].path.clone();
+        engine.observe_progress(&id, 7, "last observed".into()).unwrap();
         engine.defer_completion(&id, Outcome::Completed(result), births).unwrap();
         drop(spool);
         crate::gpu_service::settle(&engine, &id, &io::Error::other("post-response cleanup exit unproven")).unwrap();
@@ -1519,6 +1521,8 @@ mod tests {
         let finished = restarted.get(&id).unwrap();
         assert_eq!(finished.state, State::Completed);
         assert_eq!(finished.attempt, 1);
+        assert_eq!(finished.completed_units, 7);
+        assert_eq!(finished.progress.as_deref(), Some("last observed"));
         assert!(finished.pending_completion.is_none());
         assert_eq!(finished.result.as_ref().unwrap().value, serde_json::json!({"answer": 42}));
         assert_eq!(finished.result.as_ref().unwrap().artifacts[0].path, held_path);

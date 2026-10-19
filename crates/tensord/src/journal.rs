@@ -2410,8 +2410,9 @@ impl Journal {
     /// Hold a known outcome in the existing record, without releasing its reservation.
     pub(crate) fn defer_completion(
         &mut self, id: &str, outcome: Outcome, processes: Vec<Birth>,
+        progress: Option<&ProgressSnapshot>,
     ) -> io::Result<Execution> {
-        self.update(id, |record| {
+        self.update_observed(id, progress, |record| {
             if record.state.terminal() || record.pending_completion.is_some() {
                 return Ok(false);
             }
