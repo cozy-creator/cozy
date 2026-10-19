@@ -494,7 +494,10 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Member>) -> Result<()> {
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let path = entry.path();
-        if entry.file_name().to_string_lossy().starts_with('.') {
+        // Hidden folders are tools' state (`.git`, `.cache`); hidden files (`.gitattributes`)
+        // are the model's.
+        let hidden = entry.file_name().to_string_lossy().starts_with('.');
+        if path.is_dir() && hidden {
             continue;
         }
         if path.is_dir() {

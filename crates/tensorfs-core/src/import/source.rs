@@ -35,16 +35,6 @@ pub struct Group {
     pub tensors: BTreeMap<String, Tensor>,
     /// The files' safetensors `__metadata__`.
     pub metadata: BTreeMap<String, String>,
-    pub layout: Layout,
-}
-
-/// A group's safetensors files as the source has them, which an export writes back.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Layout {
-    /// Each file's path and header (the JSON after its length, padding included).
-    pub files: Vec<(String, String)>,
-    /// A sharded group's index: its path and text.
-    pub index: Option<(String, String)>,
 }
 
 impl Group {
@@ -156,15 +146,10 @@ pub fn read_header(path: &Path, file: usize) -> Result<Header> {
             format!("{}: {} overlaps {}", path.display(), w[0].2, w[1].2),
         );
     }
-    let text = String::from_utf8(head).map_err(|e| Refusal {
-        code: Code::MALFORMED_JSON,
-        detail: format!("{}: {e}", path.display()),
-    })?;
-    Ok((out, metadata, text))
+    Ok((out, metadata))
 }
 
-/// A file's tensors, its `__metadata__` and its header text.
-pub type Header = (BTreeMap<String, Tensor>, BTreeMap<String, String>, String);
+pub type Header = (BTreeMap<String, Tensor>, BTreeMap<String, String>);
 
 fn split(path: &str) -> (&str, &str) {
     path.rsplit_once('/').unwrap_or(("", path))
@@ -198,19 +183,11 @@ impl SourceSet {
                 detail: format!("{path}: {e}"),
             })?;
             let (folder, stem) = split(stem);
-            let text = String::from_utf8(bytes.clone()).map_err(|e| Refusal {
-                code: Code::MALFORMED_JSON,
-                detail: format!("{path}: {e}"),
-            })?;
             let mut group = Group {
                 folder: folder.into(),
                 stem: stem.into(),
                 tensors: BTreeMap::new(),
                 metadata: BTreeMap::new(),
-                layout: Layout {
-                    files: Vec::new(),
-                    index: Some((path.clone(), text)),
-                },
             };
             let mut shards: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
             for (key, shard) in &index.weight_map {
@@ -231,8 +208,7 @@ impl SourceSet {
                 sharded.insert(shard_path.clone());
                 let file = set.files.len();
                 set.files.push(local.to_path_buf());
-                let (tensors, metadata, text) = read_header(local, file)?;
-                group.layout.files.push((shard_path.clone(), text));
+                let (tensors, metadata) = read_header(local, file)?;
                 let mut named: Vec<&str> = keys.clone();
                 named.sort();
                 if tensors.keys().map(String::as_str).ne(named.iter().copied()) {
@@ -252,16 +228,12 @@ impl SourceSet {
                 set.files.push(local.clone());
                 let (folder, name) = split(path);
                 let stem = name.strip_suffix(".safetensors").unwrap_or(name);
-                let (tensors, metadata, text) = read_header(local, file)?;
+                let (tensors, metadata) = read_header(local, file)?;
                 set.groups.push(Group {
                     folder: folder.into(),
                     stem: stem.into(),
                     tensors,
                     metadata,
-                    layout: Layout {
-                        files: vec![(path.clone(), text)],
-                        index: None,
-                    },
                 });
             } else if !path.contains(".safetensors") {
                 let len = std::fs::metadata(local).map_err(|e| io(local, e))?.len();
