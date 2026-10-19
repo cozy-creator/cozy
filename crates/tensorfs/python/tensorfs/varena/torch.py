@@ -8,9 +8,9 @@
 
 A block's params are views of its region's pages only while the block runs (the view is the
 pin); zero-byte placeholders stand in otherwise, and an op on one binds its block for that op.
-Bytes rank in use > warm (loaded at GPU level) > idle; within each, models run once go before
-repeating ones, then least recently used. Room is made in §5.2's order; the hot watermark falls
-only within a request and refills after it. On a CPU or Apple device every weight binds once.
+Bytes rank in use > warm (loaded at GPU level) > idle, least recently used first within each.
+Room is made in §5.2's order; the hot watermark falls only within a request and refills after
+it. On a CPU or Apple device every weight binds once.
 """
 
 from __future__ import annotations
@@ -858,11 +858,10 @@ class Memory:
         torch.cuda.empty_cache()
         return reserved - torch.cuda.memory_reserved(self.gpu) + int(self.core.trim())  # type: ignore[union-attr]
 
-    def _value(self, model: Model) -> tuple[int, bool, int]:
-        """Its class (in use 2, warm 1, idle 0), then whether it repeats (a denoise loop goes
-        after models run once), then recency."""
+    def _value(self, model: Model) -> tuple[int, int]:
+        """Its class (in use 2, warm 1, idle 0), then recency."""
         use = 2 if model.flight or model.held else 1 if model.level is Level.GPU else 0
-        return (use, model.repeats >= 2, model.last_use)
+        return (use, model.last_use)
 
     def _shrink(self, cache: Cache, nbytes: int) -> int:
         freed = min(int(cache.shrink(min(nbytes, cache.nbytes))), cache.nbytes)
