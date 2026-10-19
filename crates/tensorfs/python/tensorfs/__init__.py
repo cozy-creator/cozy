@@ -13,7 +13,6 @@ from collections.abc import Mapping
 from ._ext import (
     Array,
     Checkpoint,
-    Closure,
     Component,
     ConflictError,
     DecodeError,
@@ -36,9 +35,6 @@ from ._ext import (
     UnknownSchemeError,
     UnsupportedError,
     __version__,
-    parse_header,
-    plan,
-    regions,
 )
 from .api import ComponentWriter, Endpoint, Writer, configure, convert, export, hub_download, open, resolve_source, snapshot_download, upload_folder
 
@@ -47,7 +43,6 @@ Mapping.register(Tensors)
 __all__ = [
     "Array",
     "Checkpoint",
-    "Closure",
     "Component",
     "ConflictError",
     "ComponentWriter",
@@ -73,9 +68,6 @@ __all__ = [
     "UnsupportedError",
     "Writer",
     "__version__",
-    "parse_header",
-    "plan",
-    "regions",
     "configure",
     "convert",
     "export",

@@ -1142,7 +1142,7 @@ impl PyCheckpoint {
 /// `only` limits the work and the result to the tensors a load wants.
 #[pyfunction]
 #[pyo3(signature = (ck, max_bytes = 64 << 20, boundaries = None, only = None))]
-fn regions(ck: &PyCheckpoint, max_bytes: u64, boundaries: Option<Vec<String>>, only: Option<Vec<String>>) -> Vec<Vec<String>> {
+pub(crate) fn regions(ck: &PyCheckpoint, max_bytes: u64, boundaries: Option<Vec<String>>, only: Option<Vec<String>>) -> Vec<Vec<String>> {
     client::regions(&ck.header, max_bytes, &boundaries.unwrap_or_default(), &only.unwrap_or_default())
 }
 
@@ -1858,7 +1858,6 @@ pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTensors>()?;
     m.add_class::<PyEncoded>()?;
     m.add_class::<PyWriter>()?;
-    m.add_function(wrap_pyfunction!(regions, m)?)?;
     m.add_function(wrap_pyfunction!(_kernel_binary, m)?)?;
     Ok(())
 }
