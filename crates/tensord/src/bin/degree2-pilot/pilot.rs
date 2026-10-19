@@ -203,6 +203,7 @@ fn exec(
     let t = Instant::now();
     let loaded = executor.command(
         &DeviceCommand::Load {
+            tensorfs: None,
             construction: "pilot".into(),
             devices,
             sequence_parallel_degree: 1,
@@ -264,6 +265,11 @@ fn exec(
         let t = Instant::now();
         let reply = executor.command(
             &DeviceCommand::Invoke {
+                tensorfs: None,
+                weights: Default::default(),
+                destination: String::new(),
+                actor: String::new(),
+                operation: String::new(),
                 max_output_bytes: tensord::output_capacity::DEFAULT_BYTES,
                 request_id: id.clone(),
                 construction: "pilot".into(),
@@ -280,7 +286,6 @@ fn exec(
                 squeezed_bytes: Default::default(),
                 device_weights: None,
                 sources: Default::default(),
-                weights: Default::default(),
             },
             &mut pilot,
         )?;

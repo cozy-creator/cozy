@@ -52,7 +52,7 @@ tar.workspace = true
 
 [features]
 # Dev builds only (xs-045 U12): the hidden `cozy model migrate`. Never in a release.
-migrate = ["protocol/migrate", "hub-client/migrate"]
+migrate = ["protocol/migrate", "hub-client/migrate", "tensorfs/store"]
 
 [lints]
 workspace = true
