@@ -295,8 +295,10 @@ impl PyTensors {
                 ));
             };
             // SAFETY: the buffer is held writable for `len` bytes while `buf` lives.
-            unsafe { std::slice::from_raw_parts_mut(buf.buf_ptr() as *mut u8, len) }
-                .copy_from_slice(range);
+            if len != 0 {
+                unsafe { std::slice::from_raw_parts_mut(buf.buf_ptr() as *mut u8, len) }
+                    .copy_from_slice(range);
+            }
             return Ok(());
         }
         let target = Target {

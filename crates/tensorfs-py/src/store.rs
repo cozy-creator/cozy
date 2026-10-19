@@ -973,7 +973,7 @@ impl PyArray {
         dl_device: Option<(i32, i32)>,
         copy: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let _ = (stream, max_version, copy);
+        let _ = (stream, max_version);
         if dl_device.is_some_and(|d| d != (KDL_CPU, 0)) {
             return Err(raise(
                 py,
@@ -992,14 +992,22 @@ impl PyArray {
                 },
             ));
         };
+        let buf = if copy == Some(true) {
+            let mut buf = Aligned::new(self.buf.len);
+            buf.bytes_mut().copy_from_slice(self.buf.bytes());
+            Arc::new(buf)
+        } else {
+            self.buf.clone()
+        };
+        let data = buf.ptr() as *mut c_void;
         let held = Box::into_raw(Box::new(Held {
             shape: self.shape.iter().map(|&d| d as i64).collect(),
-            _buf: self.buf.clone(),
+            _buf: buf,
         }));
         // SAFETY: `held` is live until the deleter runs; the consumer may write its own copy.
         let t = Box::into_raw(Box::new(DLManagedTensor {
             dl_tensor: DLTensor {
-                data: self.buf.ptr() as *mut c_void,
+                data,
                 device: DLDevice {
                     device_type: KDL_CPU,
                     device_id: 0,

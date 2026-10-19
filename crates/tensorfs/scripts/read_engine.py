@@ -71,12 +71,15 @@ class HostReads(unittest.TestCase):
         self.assertEqual(array.__dlpack_device__(), (1, 0))
         self.assertEqual((array.dtype, array.shape, array.nbytes), ("F32", (3, 4), 48))
         first, second = np.from_dlpack(array), np.from_dlpack(array)
+        copied = np.from_dlpack(array, copy=True)
         self.assertEqual(first.ctypes.data, second.ctypes.data)
+        self.assertNotEqual(first.ctypes.data, copied.ctypes.data)
         self.assertEqual(first.ctypes.data % 4096, 0)
         del array
         gc.collect()
         np.testing.assert_array_equal(first, self.plain)
         np.testing.assert_array_equal(second, self.plain)
+        np.testing.assert_array_equal(copied, self.plain)
 
     def test_writable_typed_buffers_and_chunk_spanning_offsets(self) -> None:
         destination = np.full((3, 4), -1, dtype=np.float32)
