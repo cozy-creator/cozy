@@ -168,7 +168,7 @@ mod imp {
     }
 
     #[pyclass(name = "Row", module = "tensorfs.varena", frozen)]
-    pub struct PyRow(Arc<Row>);
+    pub struct PyRow(pub(crate) Arc<Row>);
 
     #[pymethods]
     impl PyRow {
@@ -377,6 +377,8 @@ mod imp {
     #[pyclass(name = "RowFacts", module = "tensorfs.varena", frozen)]
     pub struct PyRowFacts;
 }
+
+pub(crate) use imp::PyRow;
 
 /// Adds the ledger to `tensorfs._ext.varena`.
 pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {

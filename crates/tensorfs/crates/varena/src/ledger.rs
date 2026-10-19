@@ -502,6 +502,20 @@ impl Row {
         }
     }
 
+    /// Answers asks of this row on a thread of its own, with no Python: `answer(want)` frees
+    /// what it can and returns it, and each answer moves the row's progress, so a process busy
+    /// in one long kernel is never named stalled while this thread runs.
+    pub fn serve(self: &Arc<Self>, answer: impl Fn(u64) -> u64 + Send + 'static) -> Result<std::thread::JoinHandle<()>> {
+        let row = self.clone();
+        std::thread::Builder::new()
+            .name("varena-ask".into())
+            .spawn(move || loop {
+                let want = row.wait_want();
+                row.ack(answer(want));
+            })
+            .map_err(|e| Error::Io(format!("spawn the ask thread: {e}")))
+    }
+
     /// Its requests running now and the most each still needs beyond what the process holds:
     /// their measured remaining peak, -1 when never measured. Replaces the last list; at most
     /// `RUNNING`, ids of at most `REQUEST_ID` bytes.

@@ -404,6 +404,10 @@ struct Set {
     step: Counters,
     last: Counters,
     total: Counters,
+    /// The clock at its last bind, and whether its model is warm (loaded at GPU level): asks
+    /// take idle sets before warm ones, least recently bound first.
+    used: u64,
+    warm: bool,
 }
 
 impl Set {
@@ -616,7 +620,17 @@ impl Gpu {
         let regs = (0..layout.regions.len()).map(|_| Reg { home: true, ..Default::default() }).collect();
         let src = Arc::new(Src { layout: layout.clone(), source, host });
         let mut st = g.lock();
-        st.sets.push(Some(Set { name: name.into(), base, src, regs, step: Counters::default(), last: Counters::default(), total: Counters::default() }));
+        st.sets.push(Some(Set {
+            name: name.into(),
+            base,
+            src,
+            regs,
+            step: Counters::default(),
+            last: Counters::default(),
+            total: Counters::default(),
+            used: 0,
+            warm: true,
+        }));
         let id = st.sets.len() - 1;
         Ok(Arc::new(WeightSet { gpu: self.clone(), id, base, name: name.into(), layout, parts }))
     }
@@ -636,6 +650,27 @@ impl Gpu {
             }
         }
         g.keep_idle(&mut st, 0)
+    }
+
+    /// Bytes for another process's ask (design §5.2), answered on this process's own thread with
+    /// no Python: idle chunks and unneeded slots, then unpinned home pages, idle sets before warm
+    /// ones, least recently bound first, until `want`. Pages in use are pinned and stay.
+    pub fn give(&self, want: u64) -> Result<u64> {
+        let mut freed = self.trim()?;
+        let g = &self.inner;
+        let _c = CtxGuard::enter(g.ctx)?;
+        let mut st = g.lock();
+        let mut order: Vec<(bool, u64, usize)> =
+            st.sets.iter().enumerate().filter_map(|(id, s)| s.as_ref().map(|s| (s.warm, s.used, id))).collect();
+        order.sort_unstable();
+        for (_, _, id) in order {
+            if freed >= want {
+                break;
+            }
+            freed += g.evict(&mut st, id, None, want - freed)?;
+        }
+        g.keep_idle(&mut st, IDLE_KEEP)?;
+        Ok(freed)
     }
 
     /// Ends a step: the counters of the step under way become the last step's.
@@ -921,6 +956,29 @@ impl Inner {
     }
 
     /// Release idle chunks, largest first, until at most `keep` bytes are idle.
+    /// Unmaps set `id`'s `regions` (all when None) at home that no pin holds and whose fill and
+    /// release events completed, until `budget` bytes; returns the bytes unmapped.
+    fn evict(&self, st: &mut State, id: usize, regions: Option<&[u32]>, budget: u64) -> Result<u64> {
+        let all: Vec<u32> = (0..st.set(id).regs.len() as u32).collect();
+        let mut freed = 0;
+        for &r in regions.unwrap_or(&all) {
+            if freed >= budget {
+                break;
+            }
+            let reg = st.reg(id, r)?;
+            let Some(m) = &reg.map else { continue };
+            if reg.pins > 0 || !m.fill.landed()? || !passed(&mut reg.released)? {
+                continue;
+            }
+            let m = reg.map.take().unwrap();
+            let (base, x) = (st.set(id).base, st.set(id).src.layout.region(r)?.clone());
+            self.unmap(st, base + x.offset, x.span, m.chunks)?;
+            st.set(id).count(|c| c.evicted += x.span);
+            freed += x.span;
+        }
+        Ok(freed)
+    }
+
     fn keep_idle(&self, st: &mut State, keep: u64) -> Result<u64> {
         let d = cuda::driver()?;
         let mut freed = 0;
@@ -1113,6 +1171,8 @@ impl WeightSet {
             if st.timings.len() > 256 {
                 st.resolve();
             }
+            let clock = st.clock;
+            st.set(self.id).used = clock;
             st.set(self.id).count(|c| c.binds += 1);
             let reg = st.reg(self.id, region)?;
             if reg.pins == 0 && reg.map.as_ref().is_some_and(|m| m.fill.failed()) {
@@ -1183,22 +1243,14 @@ impl WeightSet {
         let g = &self.gpu.inner;
         let _c = CtxGuard::enter(g.ctx)?;
         let mut st = g.lock();
-        let all: Vec<u32> = (0..self.layout.regions.len() as u32).collect();
-        let mut freed = 0;
-        for &r in regions.unwrap_or(&all) {
-            let reg = st.reg(self.id, r)?;
-            let Some(m) = &reg.map else { continue };
-            if reg.pins > 0 || !m.fill.landed()? || !passed(&mut reg.released)? {
-                continue;
-            }
-            let m = reg.map.take().unwrap();
-            let (va, span) = self.span(r);
-            g.unmap(&mut st, va, span, m.chunks)?;
-            st.set(self.id).count(|c| c.evicted += span);
-            freed += span;
-        }
+        let freed = g.evict(&mut st, self.id, regions, u64::MAX)?;
         g.keep_idle(&mut st, IDLE_KEEP)?;
         Ok(freed)
+    }
+
+    /// Whether its model is warm (loaded at GPU level): an ask takes idle sets first.
+    pub fn warm(&self, warm: bool) {
+        self.gpu.inner.lock().set(self.id).warm = warm;
     }
 
     fn span(&self, r: u32) -> (u64, u64) {

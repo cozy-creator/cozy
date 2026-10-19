@@ -204,6 +204,9 @@ class WeightSet:
     def prefetch(self, region: int) -> None:
         """Start the fill ahead of its bind, at home or into a free slot. It never waits. A
         no-op on the host."""
+    def warm(self, warm: bool) -> None:
+        """Whether its model is warm (loaded at GPU level, the default): another process's ask
+        takes idle sets' pages before warm ones'."""
     def evict(self, regions: Sequence[int] | None = None) -> int:
         """Unmap these regions at home (all when None): only those unpinned whose fill and
         release events completed. Returns the bytes unmapped. The chunks go idle; past a small
@@ -240,6 +243,11 @@ class Gpu:
         duplicates every descriptor it keeps and closes nothing the caller passed."""
     def trim(self) -> int:
         """Idle chunks and unneeded slots go back to the driver. Returns the bytes released."""
+    def serve(self, row: Row) -> None:
+        """Answers other processes' asks of `row` from now on, on a Rust thread with no Python:
+        idle chunks and slots, then unpinned home pages, idle sets before warm ones, least
+        recently bound first. Each answer moves the row's progress, so a long kernel is never a
+        stall. Caches and torch's slack stay the control thread's to shed."""
     def step(self) -> None:
         """Ends a step: each set's `step` counters become its `last`."""
     def stats(self) -> GpuStats: ...

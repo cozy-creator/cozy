@@ -231,6 +231,13 @@ impl PyGpu {
         py.detach(|| self.gpu.trim()).or_raise(py)
     }
 
+    /// Answers other processes' asks of `row` from now on, on a Rust thread of this process with
+    /// no Python (`Gpu::give`): idle chunks, then unpinned pages of idle sets before warm ones.
+    fn serve(&self, py: Python<'_>, row: PyRef<'_, crate::varena_ledger::PyRow>) -> PyResult<()> {
+        let gpu = self.gpu.clone();
+        row.0.serve(move |want| gpu.give(want).unwrap_or(0)).map(drop).or_raise(py)
+    }
+
     fn step(&self, py: Python<'_>) {
         py.detach(|| self.gpu.step())
     }
@@ -331,6 +338,14 @@ impl PyWeightSet {
             SetRef::Gpu(w) => py.detach(|| w.prefetch(region)).or_raise(py),
             SetRef::Host(_) => Ok(()),
         }
+    }
+
+    /// Whether its model is warm (loaded at GPU level): an ask takes idle sets first.
+    fn warm(&self, py: Python<'_>, warm: bool) -> PyResult<()> {
+        if let SetRef::Gpu(w) = self.set(py)? {
+            w.warm(warm);
+        }
+        Ok(())
     }
 
     #[pyo3(signature = (regions = None))]

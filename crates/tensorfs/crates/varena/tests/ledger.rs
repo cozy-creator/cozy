@@ -134,7 +134,7 @@ fn child() {
             "claim" => {
                 let r = ledger.claim(std::process::id()).unwrap();
                 let out = vec![r.id() as u64, r.gen()];
-                row = Some(r);
+                row = Some(Arc::new(r));
                 out
             }
             "publish" => {
@@ -156,6 +156,16 @@ fn child() {
                 r.publish(&facts);
                 r.ack(freed);
                 vec![want, freed]
+            }
+            // A Rust thread answers its asks from its cold bytes; then its main thread is busy
+            // (one long kernel) and never reads another line.
+            "busy" => {
+                let cold = facts.cold;
+                row.as_ref().unwrap().serve(move |want| want.min(cold)).unwrap();
+                println!("@");
+                loop {
+                    std::thread::park();
+                }
             }
             // Its running requests: `id remaining` pairs, -1 for never measured.
             "running" => {
@@ -246,6 +256,27 @@ fn fits_reserves_remaining_peaks_and_never_admits_beside_the_unmeasured_or_the_d
     a.call("running");
     a.kill9();
     assert!(!ledger.fits("plan", Some("s"), false).unwrap(), "beside a dead row's bytes");
+}
+
+/// A process whose main thread is busy in one long kernel still answers asks, from a Rust
+/// thread: the answer moves its progress, so it is never named stalled.
+#[test]
+fn a_busy_process_answers_asks_from_its_own_thread_and_is_never_stalled() {
+    let (ledger, _fd) = Ledger::create("GPU-busy", 24 * GIB).unwrap();
+    let mut busy = Proc::spawn(&ledger);
+    busy.call("claim");
+    busy.call(&publish(&Facts { resident: 4 * GIB, cold: 4 * GIB, last_use: 1, ..Facts::default() }));
+    busy.call("busy");
+    assert!(ledger.stalled().unwrap().is_empty(), "the first look records");
+    for ask in 0..3 {
+        let victims = ledger.ask(None, GIB).unwrap();
+        assert_eq!(victims.len(), 1, "ask {ask}");
+        ledger.wait(&victims[0]).unwrap();
+        assert!(ledger.answered(&victims[0]).unwrap());
+        assert!(ledger.stalled().unwrap().is_empty(), "ask {ask}: answered, so never stalled");
+    }
+    assert_eq!(row(&ledger, busy.pid()).acked, 3 * GIB);
+    busy.kill9();
 }
 
 /// Freed bytes move the free generation, wake a process waiting on it, and signal the eventfd.
