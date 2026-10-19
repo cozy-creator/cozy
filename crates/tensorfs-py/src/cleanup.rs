@@ -119,9 +119,10 @@ fn submit(task: Task, queue: std::io::Result<&State>) {
             retry(state);
             send(state, task);
         }
-        Err(error) => {
+        Err(_) => {
             retain(task);
-            tracing::error!(%error, "native cleanup worker unavailable; release retained for retry");
+            // Do not enter a process-global logger from a post-fork destructor: its
+            // lock may also belong to a vanished parent thread. init() reports errors.
         }
     }
 }
