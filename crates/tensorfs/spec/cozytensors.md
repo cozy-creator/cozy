@@ -40,7 +40,8 @@ where major and minor are decimal digits:
 - A reader MUST ignore what a later minor adds: unknown fields of a JSON document, at every level, and trailing
   elements of the header's records (§4). Adding them never needs a new major.
 - Values are booleans, integers in [−2^63, 2^64), strings, lists and maps with string keys. There are no null values
-  and no floating-point numbers anywhere in a document. A map MUST NOT repeat a key.
+  and no floating-point numbers anywhere in a document, except inside a header's configs (§4). A map MUST NOT repeat
+  a key.
 - `metadata`, where allowed, is a free-form map of such values.
 
 **Names.** A *segment* is a non-empty string that is not `.` or `..` and contains no `/`, `\` or NUL. A *path* is one
@@ -58,20 +59,41 @@ or more segments joined by `/`.
 
 ## 4. Header
 
-A header is an array of records, each an array whose fields are known by position (CDDL:
+A header is one variant of a model, self-contained: its pipeline, its components (class, config, tensors and run
+data) and the chunks of tensor bytes. It holds only what running, loading or quantizing the model needs or is helped
+by; a README, license, images, docs and code are repo files, never in a header. A header is an array of records, each
+an array whose fields are known by position (CDDL:
 [`../conformance/schema/header.cddl`](../conformance/schema/header.cddl)):
 
 ```
-header    = [format, chunks: [* chunk], encodings: [* encoding], components: [* component], metadata]
-chunk     = [sha256: bytes(32), length]
+header    = [format, chunks: [* object], encodings: [* encoding], pipeline, components: [* component], metadata]
+object    = [sha256: bytes(32), length]
 encoding  = [scheme, params: {* name => value}]
-component = [name, tensors: [* tensor]]
+pipeline  = [] / [class, config]
+component = [name, class, config, tensors: [* tensor], assets: {* path => object}, ? config_file]
+config    = {* name => config-value}
 tensor    = [key, dtype, shape, 0, location]                 ; plain
           / [key, dtype, shape, encoding_index, [+ part]]    ; encoded, index ≥ 1
 part      = [role, dtype, shape, location]
 location  = [chunk_index, offset, length]
 ```
 
+- **Pipeline:** what `model_index.json` held, as its class and config; `[]` for a model with no pipeline.
+- **Class:** `<library>.<Class>` (`diffusers.StableDiffusionXLPipeline`, `diffusers.UNet2DConditionModel`,
+  `transformers.CLIPTextModel`), or `""` when unknown.
+- **Config:** the parsed JSON of the component's config file, as a structured map, never a file. Its values, and
+  only those, MAY also be floats and `null` (`config-value` is a value, a float or `null`, lists and maps of them;
+  §9). A component without a config file has an empty config.
+- **`config_file`:** the config's file name in the component's folder, a path, present only when it is not
+  `config.json` (`scheduler_config.json`, `tokenizer_config.json`). Later fields of a component follow it, so a
+  component with later fields writes it, as `config.json` for the default.
+- **Assets:** the run data in the component's folder (`tokenizer.json`, `vocab.json`, `merges.txt`, `spiece.model`,
+  `special_tokens_map.json`, `generation_config.json`, preprocessor files), each an object (§1). Keys MUST be paths,
+  relative to the component's folder, and MUST NOT be the config's file name.
+- **Closure:** a header's closure is the header, its chunks and every component's assets.
+- **Metadata** is loading metadata: each source file's safetensors `__metadata__` (a LoRA's alpha and rank),
+  `source` (the pinned upstream, `hf://<org>/<name>@<commit>`), and `filled` (`{from, files, note}`) when a migration
+  filled run data from upstream.
 - **Construction order is data.** `components`, each component's `tensors` and each encoded tensor's parts are
   arrays in construction order: the order in which the model builds and fills them (its `state_dict()` order). The
   order is part of the header's bytes, so reordering changes its digest. A writer MUST take the order from its
@@ -79,7 +101,8 @@ location  = [chunk_index, offset, length]
   iterate in this order and look names up through an index.
 - **Later fields.** A record MAY have more elements than listed; a reader MUST skip them (they are a later minor's).
   A reader MUST refuse a record with fewer.
-- `chunks` lists the chunk objects (§1) by their 32-byte SHA-256 and length.
+- `chunks` lists the chunk objects (§1). A header names every object, chunk or asset, by its 32-byte SHA-256 and
+  length.
 - `encodings` lists each distinct encoding (§6) once, in order of first citation by the tensors; every entry MUST be
   cited. A tensor's `encoding_index` `i ≥ 1` cites `encodings[i − 1]`; `0` marks a plain tensor.
 - Component names MUST be segments (they name folders on export) and unique. Tensor keys MUST be non-empty and unique
@@ -452,7 +475,7 @@ A new scheme is a minor version (§8). It ships:
   `blobs/…` (§1). A reader resolves name → release → lane → manifest → header → chunks, verifying every object.
 
 **Closure.** A checkpoint's closure is its manifest, every object its `files` cite, and, for `model.cozytensors`,
-every object in the header's `chunks`. A copy of a checkpoint is complete when its whole closure is present. A
+the header's closure (§4). A copy of a checkpoint is complete when its whole closure is present. A
 reader that needs only some components MAY fetch only the chunks their locations touch.
 
 ## 8. Versioning
@@ -473,16 +496,19 @@ in `cublas_128x4` (before any stacked file was written); the schemes `fp8.blockw
 **Header: deterministic CBOR.** A header is CBOR (RFC 8949) in core deterministic encoding (§4.2.1), so equal headers
 have equal bytes and equal object refs. A reader MUST refuse:
 - anything but unsigned and negative integers, byte and text strings, arrays, maps with text keys, `true` and
-  `false`: tags, floats, `null`, `undefined` and other simple values are refused;
+  `false`, and inside a config (§4) floats and `null`: tags, `undefined` and other simple values are refused, and so
+  are floats and `null` anywhere else;
+- a float not in the shortest of half, single and double precision that holds its value exactly, and a NaN other
+  than `f9 7e00`;
 - a head that is not in its shortest form, an indefinite length, map keys out of the bytewise order of their
   encodings or repeated, invalid UTF-8, and bytes after the root;
-- a byte string anywhere but a chunk's SHA-256 (and later fields);
+- a byte string anywhere but an object's SHA-256 (and later fields);
 - an integer outside [−2^63, 2^64).
 
 Decoding and re-encoding a header of this version reproduces its bytes. A header that fails to read and is a
-**pre-cut** layout, the provisional JSON (first byte `{`) or a well-formed root of exactly five elements whose fifth is
-an array, MUST be refused as such ("pre-cut cozytensors header (old layout); re-import or migrate"): the tag is the
-same, so only the structure tells them apart.
+**pre-cut** layout, the provisional JSON (first byte `{`) or a well-formed `cozytensors/1` root of exactly five
+elements (the layouts before the pipeline), MUST be refused as such ("pre-cut cozytensors header (old layout);
+re-import or migrate"): the tag is the same, so only the structure tells them apart.
 
 **Manifest and repo: JSON.** UTF-8 JSON (RFC 8259) whose top level is an object; §2's values map to JSON in the obvious
 way. A reader MUST refuse invalid UTF-8 or JSON, a top level that is not an object, a repeated key in any object, any
