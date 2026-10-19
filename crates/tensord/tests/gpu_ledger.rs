@@ -7,11 +7,11 @@
 //! away, as a driver gives a dead process's memory back.
 #![cfg(target_os = "linux")]
 use std::{
-    fs,
-    io::{BufRead, BufReader, Write},
+    fs::{self, File},
+    io::{BufRead, BufReader, Read, Write},
     os::{
-        fd::{AsRawFd, BorrowedFd},
-        unix::process::CommandExt,
+        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+        unix::{net::UnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
@@ -22,6 +22,7 @@ use std::{
     time::Duration,
 };
 use tensord::{
+    device_executor::Page,
     memory::{GpuLedger, MemoryLog},
     process::Liveness,
 };
@@ -434,8 +435,6 @@ fn each_rank_of_a_group_holds_its_own_gpus_row() {
 /// closed when another row asks for room. Memfds in containers stand in for the VMM fds.
 #[test]
 fn kept_pages_outlive_their_executor_and_go_on_an_ask() {
-    use std::{fs::File, io::Read, os::fd::{AsFd, OwnedFd}, os::unix::net::UnixStream};
-    use tensord::device_executor::Page;
     let ledger = GpuLedger::start("GPU-kept", false, 0, Some(8 * GIB), None, Liveness::default(), MemoryLog::default()).unwrap().unwrap();
     let page = |region: u32, text: &str| -> (Page, File) {
         let mut fd = File::from(platform::shm::memfd_named("page").unwrap());

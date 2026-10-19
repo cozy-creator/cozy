@@ -14,7 +14,7 @@ files and from a sealed host layout. The script checks, and prints one JSON line
      set in use gives a slot no bound block holds.
   f. adopt: the sealed layout registered from the regions it carries, prefetched whole before
      any module exists, is bit-exact.
-  g. kept pages: a process fills a shareable set and hands its pages over, then is killed (-9);
+  h. kept pages: a process fills a shareable set and hands its pages over, then is killed (-9);
      this process imports and maps them with no copy, bit-exact; closing them frees them.
 """
 
@@ -282,6 +282,8 @@ def test_ceiling(ck, rs, host_fd, stream, facts):
     torch.cuda.synchronize()
     assert gpu.stats().slots == 1, "the next streamed block maps a slot again"
     ws.close()
+
+
 def test_adopt(gpu, ck, rs, host_fd, stream, facts):
     ws = gpu.adopt("adopt", ck, host_fd)
     assert ws.regions == rs, "a sealed layout carries the regions it was built from"
@@ -296,7 +298,7 @@ def test_adopt(gpu, ck, rs, host_fd, stream, facts):
 
 
 def keeper(store: str, sha256: str, fd: int) -> None:
-    """g's first process: every region filled at home, its pages handed over, then it waits for
+    """h's first process: every region filled at home, its pages handed over, then it waits for
     its kill."""
     ck = tensorfs.Store(Path(store)).checkpoint(f"sha256:{sha256}")
     ws = varena.Gpu(0).register("kept-a", ck, regions(ck))
@@ -329,12 +331,12 @@ def test_survive(gpu, ck, rs, store, stream, facts):
     assert ws.shareable()
     t0 = time.perf_counter()
     adopted = ws.adopt_pages(pages)
-    facts["g_adopt_ms"] = round((time.perf_counter() - t0) * 1e3, 2)
+    facts["h_adopt_ms"] = round((time.perf_counter() - t0) * 1e3, 2)
     for _, f in pages:
         os.close(f)
     want = sum(p.nbytes for p in ws.parts)
     assert adopted >= want, f"adopted {adopted} of {want}"
-    facts["g_exact_bytes"] = exact(ws, ck, stream)
+    facts["h_exact_bytes"] = exact(ws, ck, stream)
     assert counters(gpu, "kept-b").paged_in == 0, "kept pages are mapped, never copied"
     again = ws.kept()
     for _, _, f in again:
@@ -347,7 +349,7 @@ def test_survive(gpu, ck, rs, store, stream, facts):
     gained = gpu.stats().driver_free - free
     kept_bytes = sum(span for _, span in meta)
     assert gained >= kept_bytes - 2 * MiB, f"closing freed {gained} of {kept_bytes} kept"
-    facts.update(g_kept_bytes=kept_bytes, g_adopted=adopted, g_freed=gained)
+    facts.update(h_kept_bytes=kept_bytes, h_adopted=adopted, h_freed=gained)
 
 
 def main(work: Path) -> int:
@@ -368,7 +370,7 @@ def main(work: Path) -> int:
         ("e", lambda: test_costs(ck, rs, fd, stream, facts)),
         ("g", lambda: test_ceiling(ck, rs, fd, stream, facts)),
         ("f", lambda: test_adopt(gpu, ck, rs, fd, stream, facts)),
-        ("g", lambda: test_survive(gpu, ck, rs, work / "store", stream, facts)),
+        ("h", lambda: test_survive(gpu, ck, rs, work / "store", stream, facts)),
     ):
         try:
             run()
