@@ -5,7 +5,6 @@ mod docs;
 mod errors;
 #[cfg_attr(windows, path = "varena_windows.rs")]
 mod varena;
-mod varena_ledger;
 mod readplan;
 #[cfg(feature = "store")]
 mod store;
@@ -37,6 +36,5 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<readplan::PyPlan>()?;
     #[cfg(feature = "store")]
     store::install(m)?;
-    varena::install(m)?;
-    varena_ledger::install(m)
+    varena::install(m)
 }

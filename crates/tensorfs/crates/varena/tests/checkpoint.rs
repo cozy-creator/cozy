@@ -64,10 +64,10 @@ impl Drop for Fixture {
 /// shape; the first bind of a region is fresh, the next is not.
 fn check(ws: &Arc<HostSet>) {
     let mut seen = 0;
-    for r in 0..ws.layout().regions.len() as u32 {
+    for r in 0..ws.weights.layout.regions.len() as u32 {
         let pin = ws.bind(r).unwrap();
         assert!(pin.fresh && !ws.bind(r).unwrap().fresh);
-        for part in ws.parts().iter().filter(|p| p.region == r) {
+        for part in ws.weights.parts.iter().filter(|p| p.region == r) {
             let n = TENSORS.iter().find(|t| t.0 == part.component && t.1 == part.key).unwrap().2;
             assert_eq!((part.nbytes as usize, part.dtype.as_str(), part.shape.as_slice(), part.role.as_str()), (n, "U8", &[n as u64][..], ""));
             // SAFETY: the part lies inside the region the pin keeps.
@@ -84,12 +84,12 @@ fn a_v2_checkpoint_binds_on_the_host_exactly_from_its_chunk_files() {
     let fx = Fixture::new("host");
     let rs = regions(fx.ck.header(), 64 << 20, &[]);
     let ws = Host.register("ck", &fx.ck, &rs, None, None).unwrap();
-    assert_eq!(ws.layout().regions.len(), rs.len());
+    assert_eq!(ws.weights.layout.regions.len(), rs.len());
     check(&ws);
     assert!(ws.bind(0).unwrap().writable);
     // One component alone is a weight set of its own tensors.
     let vae: Vec<Vec<String>> = rs.iter().filter(|r| r[0].starts_with("vae/")).cloned().collect();
-    assert!(Host.register("vae", &fx.ck, &vae, None, None).unwrap().parts().iter().all(|p| p.component == "vae"));
+    assert!(Host.register("vae", &fx.ck, &vae, None, None).unwrap().weights.parts.iter().all(|p| p.component == "vae"));
 }
 
 #[test]

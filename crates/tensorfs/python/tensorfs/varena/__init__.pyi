@@ -203,6 +203,9 @@ class WeightSet:
     def prefetch(self, region: int) -> None:
         """Start the fill ahead of its bind, at home or into a free slot. It never waits. A
         no-op on the host."""
+    def resident(self, region: int) -> bool:
+        """Mapped at home, its bytes there or on their way (a region only in a slot is not).
+        Always True on the host."""
     def warm(self, warm: bool) -> None:
         """Whether its model is warm (loaded at GPU level, the default): another process's ask
         takes idle sets' pages before warm ones'."""
@@ -245,11 +248,15 @@ class Gpu:
         duplicates every descriptor it keeps and closes nothing the caller passed."""
     def trim(self) -> int:
         """Idle chunks and unneeded slots go back to the driver. Returns the bytes released."""
+    def give(self, nbytes: int) -> list[tuple[str, int]]:
+        """Frees up to `nbytes` in the order `serve` answers asks, and returns what each gave:
+        idle chunks and slots under `""`, then each weight set by name. Sets that gave nothing
+        are left out."""
     def serve(self, row: Row) -> None:
-        """Answers other processes' asks of `row` from now on, on a Rust thread with no Python:
-        idle chunks and slots, then unpinned home pages of sets not busy, idle before warm, least
-        recently bound first. Each answer moves the row's progress, so a long kernel is never a
-        stall. Caches and torch's slack stay the control thread's to shed."""
+        """Answers other processes' asks of `row` from now on with `give`, on a Rust thread with
+        no Python: idle chunks and slots, then unpinned home pages of sets not busy, idle before
+        warm, least recently bound first. Each answer moves the row's progress, so a long kernel
+        is never a stall. Caches and torch's slack stay the control thread's to shed."""
     def step(self) -> None:
         """Ends a step: each set's `step` counters become its `last`."""
     def stats(self) -> GpuStats: ...
