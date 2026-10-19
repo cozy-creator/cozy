@@ -34,6 +34,8 @@ also requires ending it and verifying it gone.
 - Shared-engine initialization is outside the clock. Actual `varena.copies()` records bank bytes, ns,
   measured pinned-H2D ceiling, PCIe link, busy/pin time and staged/cached bytes. The full-warm rate/ceiling
   ratio is reported, with no invented numeric threshold; absent measurements do not qualify the gate.
+  `parity_pass` and exit zero establish F1 parity plus complete observations only; output retains
+  `r4_link_review_required` and `r4_lifecycle_review_required` for parent link/teardown receipt review.
 - Results record source header/part/geometry hashes, extension/script hashes, package versions, GPU UUID,
   driver and volume. Bank the exact wheel/cohort and rental receipts beside them. Decoding, model
   construction, inference, preparation and downloads are excluded.
