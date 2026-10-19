@@ -4,6 +4,7 @@
 #![allow(unsafe_code)]
 
 pub mod cuda;
+mod device;
 mod host;
 mod plan;
 mod probe;
@@ -137,12 +138,27 @@ impl Error {
 /// of its destination's length and not written until this returns.
 pub unsafe fn read(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats, Error> {
     let start = Instant::now();
-    if let Some(copy) = copies.iter().position(|c| matches!(c.src, Src::Device { .. }) || matches!(c.dst, Dst::Device { .. })) {
-        let source = std::io::Error::new(std::io::ErrorKind::Unsupported, "device destinations need the CUDA engine");
-        return Err(Error { copy, source });
+    for (copy, c) in copies.iter().enumerate() {
+        let n = c.dst.len() as u64;
+        let invalid = match c.src {
+            Src::File(_, offset) if offset.checked_add(n).is_none() => Some("source file range overflows"),
+            Src::Device { ptr, .. } if (ptr == 0 && n != 0) || ptr.checked_add(n).is_none() => Some("invalid CUDA source range"),
+            _ => match c.dst {
+                Dst::Device { ptr, .. } if (ptr == 0 && n != 0) || ptr.checked_add(n).is_none() => Some("invalid CUDA destination range"),
+                _ => None,
+            },
+        };
+        if let Some(detail) = invalid { return Err(Error { copy, source: std::io::Error::new(std::io::ErrorKind::InvalidInput, detail) }); }
     }
-    // SAFETY: per the contract.
-    let mut stats = unsafe { host::fill(copies, opts) }?;
+    let (host, devices): (Vec<_>, Vec<_>) = copies.iter().copied().enumerate()
+        .partition(|(_, c)| !matches!(c.src, Src::Device { .. }) && !matches!(c.dst, Dst::Device { .. }));
+    let host_copies: Vec<_> = host.iter().map(|(_, c)| *c).collect();
+    let mut stats = if host_copies.is_empty() { ReadStats::default() } else {
+        unsafe { host::fill(&host_copies, opts) }.map_err(|e| Error { copy: host[e.copy].0, source: e.source })?
+    };
+    let device = unsafe { device::fill(&devices, opts) }?;
+    stats.direct += device.direct; stats.cached += device.cached; stats.bounced += device.bounced;
+    stats.pin_ns += device.pin_ns; stats.staged += device.staged; stats.busy_ns += device.busy_ns;
     stats.bytes = copies.iter().map(|c| c.dst.len() as u64).sum();
     stats.ns = start.elapsed().as_nanos() as u64;
     Ok(stats)
