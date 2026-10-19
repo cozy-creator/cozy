@@ -3,14 +3,13 @@
 //! `memory` places a weight set's regions on a GPU (home pages, scratch slots, pins as tensor
 //! lifetimes, eviction of what nothing uses); `Host` serves them from host memory where there
 //! is no GPU. The host tier (`host`, `window`) is the machine's: sealed memfds a TensorD fills
-//! and executors adopt read-only. `tensorfs-core` supplies verified bytes and stays CUDA-free.
+//! and executors adopt read-only. `tensorfs-core` owns parsing, source custody and every host/device byte transfer.
 //!
 //! The host tier is Linux-only and answers [`Error::Unsupported`] elsewhere. On Windows the
 //! crate is empty until its tier exists (xs-043 unit WM).
 #![cfg(unix)]
 
-pub mod ceiling;
-pub mod cuda;
+pub use tensorfs_core::io::{cuda, metrics as ceiling};
 pub mod faults;
 pub mod host;
 pub mod io;
@@ -81,4 +80,29 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl From<tensorfs_core::err::Refusal> for Error {
     fn from(error: tensorfs_core::err::Refusal) -> Error { Error::Source(error.into()) }
+}
+
+impl From<tensorfs_core::io::cuda::Error> for Error {
+    fn from(error: tensorfs_core::io::cuda::Error) -> Error {
+        match error {
+            tensorfs_core::io::cuda::Error::Cuda { op, code, name } => Error::Cuda { op, code, name },
+            tensorfs_core::io::cuda::Error::CudaUnavailable(detail) => Error::CudaUnavailable(detail),
+        }
+    }
+}
+impl From<tensorfs_core::io::Error> for Error {
+    fn from(error: tensorfs_core::io::Error) -> Error {
+        match error.cuda().cloned() {
+            Some(cuda) => cuda.into(),
+            None => Error::Io(error.to_string()),
+        }
+    }
+}
+impl From<tensorfs_core::io::source::Error> for Error {
+    fn from(error: tensorfs_core::io::source::Error) -> Error {
+        match error {
+            tensorfs_core::io::source::Error::Read(error) => error.into(),
+            tensorfs_core::io::source::Error::Source(error) => error.into(),
+        }
+    }
 }

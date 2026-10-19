@@ -13,6 +13,7 @@ name and parameter for parameter.
 """
 
 from collections.abc import Sequence
+from typing import Literal
 
 from .._ext import Checkpoint
 

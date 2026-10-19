@@ -4,11 +4,14 @@
 #![allow(unsafe_code)]
 
 pub mod cuda;
+pub mod pins;
 #[cfg(unix)]
 pub mod metrics;
 mod device;
 mod host;
 mod plan;
+#[cfg(unix)]
+pub mod source;
 mod probe;
 #[cfg(feature = "store")]
 pub mod view;

@@ -6,7 +6,6 @@
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{fence, AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::host::{self, HostMem};
@@ -134,27 +133,13 @@ impl OpenWindow {
         let w = h.window().expect("a window");
         let region = &layout.regions[r as usize];
         let base = h.base() as usize + s * w.slot_span as usize;
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let failed: Mutex<Option<Error>> = Mutex::new(None);
-        std::thread::scope(|scope| {
-            for _ in 0..threads.clamp(1, region.items.len().max(1)) {
-                scope.spawn(|| loop {
-                    let k = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(it) = region.items.get(k) else { return };
-                    let dst = (base + (it.offset - region.offset) as usize) as *mut u8;
-                    // SAFETY: each item's range (and its padding) lies inside slot `s`, which is
-                    // this thread's alone until its word is published; items are disjoint.
-                    if let Err(e) = unsafe { source.read_item(it, dst, Mode::Cache, tally) } {
-                        failed.lock().unwrap().get_or_insert(e);
-                        next.store(region.items.len(), Ordering::Relaxed);
-                        return;
-                    }
-                });
-            }
-        });
-        match failed.into_inner().unwrap() {
-            None => h.slot_word(s).store(host::staged(r), Ordering::SeqCst),
-            Some(_) => {
+        // SAFETY: slot s is exclusively held until its publication word is stored below.
+        let result = unsafe { source.read_items(&region.items, region.offset,
+            tensorfs_core::io::Dst::Host { ptr: base as *mut u8, len: region.nbytes as usize },
+            threads, Mode::Cache, tally) };
+        match result {
+            Ok(_) => h.slot_word(s).store(host::staged(r), Ordering::SeqCst),
+            Err(_) => {
                 h.slot_word(s).store(0, Ordering::SeqCst);
                 h.mark_failed(r);
             }

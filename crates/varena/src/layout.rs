@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tensorfs_core::read::{ObjectRange, ReadPlan, Source};
+use tensorfs_core::read::{ReadPlan, Source};
 
 use crate::{Error, Result};
 
@@ -18,21 +18,7 @@ pub fn align_up(x: u64, a: u64) -> u64 {
     x.div_ceil(a) * a
 }
 
-/// Where one run of source bytes lands in the layout.
-#[derive(Debug, Clone)]
-pub struct Item {
-    pub offset: u64,
-    pub len: u64,
-    pub source: ItemSource,
-    /// The last item of its part: bytes up to the next `PART_ALIGN` boundary are padding.
-    pub part_end: bool,
-}
-
-#[derive(Debug, Clone)]
-pub enum ItemSource {
-    Object(ObjectRange),
-    Inline(std::sync::Arc<[u8]>),
-}
+pub use tensorfs_core::io::source::{Item, ItemSource};
 
 #[derive(Debug, Clone)]
 pub struct Part {

@@ -12,7 +12,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(feature = "store")]
 use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -21,26 +21,23 @@ use tensorfs_core::ids::ObjectRef;
 
 #[cfg(feature = "store")]
 use tensorfs_core::io::view::View;
-use crate::ceiling::{self, Copy};
 use crate::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUevent, CUstream, CtxGuard, Handle};
 use crate::host::HostMem;
-use crate::io::{IoTally, Mode, Readers, Source};
-use crate::layout::{align_up, Item, ItemSource, Layout, PART_ALIGN, REGION_ALIGN};
+use crate::io::{IoTally, Mode, Source};
+use crate::layout::{align_up, Layout, PART_ALIGN, REGION_ALIGN};
+use tensorfs_core::io::{self as byte_io, Copy, Dst, ReadOpts, Src};
 use crate::{Error, Result};
 
 /// Scratch slots kept while a region streams; more exist only while every one is pinned.
 const SLOTS: usize = 3;
 /// Idle chunks kept after an eviction for the next map; the rest go back to the driver.
 const IDLE_KEEP: u64 = 64 << 20;
-const STAGING: usize = 16;
-const STAGING_BYTES: u64 = 2 << 20;
-const READERS: usize = 8;
 
 /// A checked driver call on handles this core made, in its context.
 macro_rules! call {
     ($op:literal, $f:ident($($a:expr),* $(,)?)) => {
         // SAFETY: live handles of our context; out-params point at live locals.
-        cuda::check($op, unsafe { (cuda::driver()?.$f)($($a),*) })
+        cuda::check($op, unsafe { (cuda::driver()?.$f)($($a),*) }).map_err(Error::from)
     };
 }
 
@@ -59,7 +56,7 @@ impl Ev {
         match unsafe { (cuda::driver()?.event_query)(self.raw) } {
             cuda::SUCCESS => Ok(true),
             cuda::ERROR_NOT_READY => Ok(false),
-            rc => cuda::check("cuEventQuery", rc).map(|_| false),
+            rc => cuda::check("cuEventQuery", rc).map(|_| false).map_err(Error::from),
         }
     }
 
@@ -270,10 +267,6 @@ struct Job {
 /// The copy stream busy from its first job to its last copy landing.
 #[derive(Default)]
 struct Run {
-    t0: Option<Instant>,
-    bytes: u64,
-    staged: u64,
-    pin_ns: u64,
     copies: Vec<(EvRef, EvRef)>,
 }
 
@@ -281,29 +274,6 @@ struct Run {
 struct Jobs {
     q: VecDeque<Job>,
     stop: bool,
-}
-
-struct Buf {
-    ptr: *mut u8,
-    last: Option<EvRef>,
-}
-unsafe impl Send for Buf {}
-
-/// Pinned host buffers that page-cache bytes pass through; one is reused once its copy landed.
-struct Staging {
-    free: Mutex<Vec<Buf>>,
-    cv: Condvar,
-}
-
-impl Staging {
-    fn take(&self) -> Buf {
-        self.cv.wait_while(self.free.lock().unwrap(), |f| f.is_empty()).unwrap().pop().unwrap()
-    }
-
-    fn put(&self, buf: Buf) {
-        self.free.lock().unwrap().push(buf);
-        self.cv.notify_one();
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -466,18 +436,13 @@ impl State {
 struct Inner {
     ordinal: i32,
     ctx: CUcontext,
-    /// PCI address (sysfs) and measured pinned H2D GB/s, 0 when unmeasured.
-    pci: String,
-    ceiling: f64,
     prop: AllocationProp,
     /// Allocations exportable as POSIX fds, where the device supports them.
     shared: Option<AllocationProp>,
     chunk: u64,
     events: Arc<Events>,
     copy: CUstream,
-    readers: Readers,
     tally: IoTally,
-    staging: Staging,
     jobs: (Mutex<Jobs>, Condvar),
     st: Mutex<State>,
 }
@@ -509,30 +474,17 @@ impl Gpu {
         if g == 0 || !REGION_ALIGN.is_multiple_of(g as u64) {
             return Err(Error::Invalid(format!("device {ordinal}: granularity {g} does not divide {REGION_ALIGN}")));
         }
-        let attr = |a| cuda::attribute(dev, a);
-        let pci = format!("{:04x}:{:02x}:{:02x}.0", attr(cuda::ATTR_PCI_DOMAIN_ID)?, attr(cuda::ATTR_PCI_BUS_ID)?, attr(cuda::ATTR_PCI_DEVICE_ID)?);
-        let ceiling = ceiling::h2d(ordinal).map_or(0.0, |c| c.0);
         let mut s: CUstream = std::ptr::null_mut();
         call!("cuStreamCreate", stream_create(&mut s, cuda::STREAM_NON_BLOCKING))?;
-        let mut bufs = Vec::with_capacity(STAGING);
-        for _ in 0..STAGING {
-            let mut p: *mut c_void = std::ptr::null_mut();
-            call!("cuMemHostAlloc", mem_host_alloc(&mut p, STAGING_BYTES as usize, cuda::MEMHOSTALLOC_PORTABLE))?;
-            bufs.push(Buf { ptr: p as *mut u8, last: None });
-        }
         let inner = Arc::new(Inner {
             ordinal,
             ctx,
-            pci,
-            ceiling,
             prop,
             shared,
             chunk,
             events: Arc::new(Events { ctx, free: Mutex::default() }),
             copy: s,
-            readers: Readers::new(READERS),
             tally: IoTally::default(),
-            staging: Staging { free: Mutex::new(bufs), cv: Condvar::new() },
             jobs: Default::default(),
             st: Mutex::default(),
         });
@@ -720,7 +672,7 @@ impl Inner {
                 Some(job) => job,
                 None => return,
             };
-            let r = run.get_or_insert_with(|| Run { t0: Some(Instant::now()), ..Default::default() });
+            let r = run.get_or_insert_with(Run::default);
             let filled = self.run(&job, r).map(|(a, b)| {
                 r.copies.push((a.clone(), b.clone()));
                 let mut st = self.lock();
@@ -732,28 +684,13 @@ impl Inner {
         }
     }
 
-    /// Run `r` once its last copy landed: logged against the ceiling, unless jobs came meanwhile
-    /// (then it goes on).
+    /// Retire completed placement events once the queue becomes idle.
     fn land(&self, r: Run) -> Option<Run> {
         if let Some((_, last)) = r.copies.last() {
             let _ = last.sync();
         }
         if !self.jobs.0.lock().unwrap().q.is_empty() {
             return Some(r);
-        }
-        if r.bytes > 0 {
-            ceiling::record(Copy {
-                kind: "h2d",
-                gpu: self.ordinal,
-                bytes: r.bytes,
-                ns: r.t0.map_or(0, |t| t.elapsed().as_nanos() as u64),
-                ceiling: self.ceiling,
-                link: ceiling::link(&self.pci).map_or_else(String::new, |l| l.to_string()),
-                busy_ns: r.copies.iter().map(|(a, b)| b.since(a).unwrap_or(0)).sum(),
-                pin_ns: r.pin_ns,
-                staged: r.staged,
-                cached: 0,
-            });
         }
         None
     }
@@ -766,77 +703,27 @@ impl Inner {
         }
     }
 
-    fn run(self: &Arc<Self>, job: &Job, run: &mut Run) -> Result<(EvRef, EvRef)> {
-        let s = self.copy;
-        for w in &job.waits {
-            wait_in(s, w)?;
-        }
-        let start = self.events.record(s, true)?;
-        let (r, reg) = (job.region, job.w.layout.region(job.region)?);
-        let n = reg.nbytes;
-        match job.w.host.as_ref().filter(|h| !h.hole(r)) {
-            Some(h) if n > 0 => {
-                h.wait_ready(r)?;
-                // SAFETY: inside the live mapping the source keeps; the region is complete.
-                let p = unsafe { h.base().add(reg.offset as usize) } as *const u8;
-                let t = Instant::now();
-                let pinned = h.pin_region(r, reg.offset, align_up(n, PART_ALIGN));
-                run.pin_ns += t.elapsed().as_nanos() as u64;
-                if pinned {
-                    call!("cuMemcpyHtoDAsync", memcpy_htod_async(job.dst, p as *const c_void, n as usize, s))?;
-                } else {
-                    self.staged(job, Some(p as usize))?;
-                    run.staged += n;
-                }
+    fn run(self: &Arc<Self>, job: &Job, _run: &mut Run) -> Result<(EvRef, EvRef)> {
+        for release in &job.waits { wait_in(self.copy, release)?; }
+        let start = self.events.record(self.copy, true)?;
+        let (region, layout) = (job.region, job.w.layout.region(job.region)?);
+        let dst = Dst::Device { device: self.ordinal, ptr: job.dst, len: layout.nbytes as usize, stream: self.copy as usize };
+        match job.w.host.as_ref().filter(|host| !host.hole(region)) {
+            Some(host) if layout.nbytes > 0 => {
+                host.wait_ready(region)?;
+                host.pin_region(region, layout.offset, align_up(layout.nbytes, PART_ALIGN));
+                // SAFETY: source is complete inside the retained host layout; destination is the
+                // placement's exclusive mapped region until this fill is published.
+                let ptr = unsafe { host.base().add(layout.offset as usize) };
+                unsafe { byte_io::read(&[Copy { src: Src::Host(ptr), dst }], &ReadOpts::default()) }?;
             }
-            _ if n > 0 => {
-                self.staged(job, None)?;
-                run.staged += n;
+            _ if layout.nbytes > 0 => {
+                // SAFETY: layout items are disjoint ranges of this exclusive device mapping.
+                unsafe { job.w.source.read_items(&layout.items, layout.offset, dst, 8, Mode::Buffered, &self.tally) }?;
             }
             _ => {}
         }
-        run.bytes += n;
-        Ok((start, self.events.record(s, true)?))
-    }
-
-    /// The region through staging, a piece per reader: from host memory at `host`, else the files.
-    fn staged(self: &Arc<Self>, job: &Job, host: Option<usize>) -> Result<()> {
-        let n = job.w.layout.region(job.region)?.nbytes;
-        let (tx, rx) = mpsc::channel();
-        for at in (0..n).step_by(STAGING_BYTES as usize) {
-            let (g, w, tx, r, dst) = (self.clone(), job.w.clone(), tx.clone(), job.region, job.dst);
-            self.readers.submit(true, move || drop(tx.send(g.piece(&w, r, dst, at, STAGING_BYTES.min(n - at), host))));
-        }
-        drop(tx);
-        let done: Vec<Result<()>> = rx.iter().collect();
-        if done.len() < n.div_ceil(STAGING_BYTES) as usize {
-            return Err(Error::Io("a staged read never ran".into()));
-        }
-        done.into_iter().collect()
-    }
-
-    fn piece(&self, w: &Weights, r: u32, dst: u64, at: u64, len: u64, host: Option<usize>) -> Result<()> {
-        let mut buf = self.staging.take();
-        let res = (|| {
-            buf.last.take().map_or(Ok(()), |last| last.sync())?;
-            match host {
-                // SAFETY: `len` bytes inside the region the source keeps mapped; the buffer is ours.
-                Some(p) => unsafe { std::ptr::copy_nonoverlapping((p as *const u8).add(at as usize), buf.ptr, len as usize) },
-                None => {
-                    let reg = w.layout.region(r)?;
-                    for it in slice_items(&reg.items, reg.offset + at, reg.offset + at + len) {
-                        // SAFETY: a buffered read writes `it.len` bytes, inside this buffer.
-                        unsafe { w.source.read_item(&it, buf.ptr.add((it.offset - reg.offset - at) as usize), Mode::Buffered, &self.tally)? };
-                    }
-                }
-            }
-            let _c = CtxGuard::enter(self.ctx)?;
-            call!("cuMemcpyHtoDAsync", memcpy_htod_async(dst + at, buf.ptr as *const c_void, len as usize, self.copy))?;
-            buf.last = Some(self.events.record(self.copy, false)?);
-            Ok(())
-        })();
-        self.staging.put(buf);
-        res
+        Ok((start, self.events.record(self.copy, true)?))
     }
 
     /// A new chunk, releasing idle chunks first if the device is full; None if it still is.
@@ -850,7 +737,7 @@ impl Inner {
                     self.keep_idle(st, 0)?;
                 }
                 cuda::ERROR_OUT_OF_MEMORY => return Ok(None),
-                rc => return cuda::check("cuMemCreate", rc).map(|_| None),
+                rc => return cuda::check("cuMemCreate", rc).map(|_| None).map_err(Error::from),
             }
         }
     }
@@ -1065,7 +952,6 @@ impl Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        self.readers.stop();
         let Ok(d) = cuda::driver() else { return };
         let Ok(_c) = CtxGuard::enter(self.ctx) else { return };
         // SAFETY: our stream, drained before anything it wrote to goes.
@@ -1078,10 +964,6 @@ impl Drop for Inner {
             }
         }
         let _ = self.keep_idle(&mut st, 0);
-        for b in self.staging.free.get_mut().unwrap().drain(..) {
-            // SAFETY: our pinned buffers; the stream that read them is drained.
-            unsafe { (d.mem_free_host)(b.ptr as *mut c_void) };
-        }
         // SAFETY: our drained stream.
         unsafe { (d.stream_destroy)(self.copy) };
     }
@@ -1220,12 +1102,28 @@ impl WeightSet {
     /// `(region, span, container)`, a socket whose queue holds the allocation's fd. The pages
     /// outlive this process while TensorD holds the container; unmapping them here drains it.
     pub fn kept(&self) -> Result<Vec<(u32, u64, OwnedFd)>> {
+        self.keep(false)
+    }
+
+    /// Exports after the caller has stopped admission and drained every use of these weights.
+    /// Lifetime address pins (cached graphs) may remain; no work may read or write them now.
+    /// Their addresses and pins stay intact, and incomplete copies still cannot be exported.
+    pub fn kept_quiescent(&self) -> Result<Vec<(u32, u64, OwnedFd)>> {
+        self.keep(true)
+    }
+
+    fn keep(&self, quiescent: bool) -> Result<Vec<(u32, u64, OwnedFd)>> {
         let g = &self.gpu.inner;
         g.with(|st| {
             let mut out = vec![];
             for (r, reg) in st.set(self.id).regs.iter_mut().enumerate() {
                 let Some(m) = reg.map.as_mut().filter(|m| m.chunks.len() == 1 && m.chunks[0].shared && !m.deposited) else { continue };
-                if !m.quiet()? {
+                let ready = if quiescent {
+                    m.fill.as_ref().map_or(Ok(false), |f| f.landed())? && passed(&mut m.released)?
+                } else {
+                    m.quiet()?
+                };
+                if !ready {
                     continue;
                 }
                 let filled = m.fill.as_ref().and_then(|f| f.state.lock().unwrap().clone());
@@ -1439,10 +1337,9 @@ impl Anon {
             return Err(Error::Io(format!("map {len} bytes: {}", std::io::Error::last_os_error())));
         }
         let a = Anon { ptr: ptr as *mut u8, len };
-        for it in &reg.items {
-            // SAFETY: a buffered read writes `it.len` bytes inside the mapping.
-            unsafe { w.source.read_item(it, a.ptr.add((it.offset - reg.offset) as usize), Mode::Buffered, &IoTally::default())? };
-        }
+        // SAFETY: all items lie in this fresh exclusive mapping.
+        unsafe { w.source.read_items(&reg.items, reg.offset,
+            Dst::Host { ptr: a.ptr, len }, 8, Mode::Buffered, &IoTally::default()) }?;
         Ok(a)
     }
 }
@@ -1471,12 +1368,12 @@ pub struct HostPinned {
 #[cfg(feature = "store")]
 fn open_checkpoint(view: &View, regions: &[Vec<String>], direct_io: bool, files: Option<Vec<(ObjectRef, File)>>) -> Result<(Layout, Source)> {
     let (plan, chunks) = view.plan(regions)?;
-    let files = match files {
-        Some(files) => files,
-        None if view.has_source() => view.files(&chunks)?,
-        None => Vec::new(),
+    let source = match files {
+        Some(files) => Source::files(files, direct_io, 0),
+        None if view.has_source() => Source::checkpoint(view, &chunks, direct_io)?,
+        None => Source::files(Vec::new(), direct_io, 0),
     };
-    Ok((Layout::build(&plan, regions)?, Source::files(files, direct_io, 0)))
+    Ok((Layout::build(&plan, regions)?, source))
 }
 
 /// `regions` of `ck` in a sealed host layout filled here: the memfd `register(host_fd=)` adopts.
@@ -1504,22 +1401,4 @@ fn reserve_va(size: u64) -> Result<u64> {
 
 fn free_va(base: u64, size: u64) -> Result<()> {
     call!("cuMemAddressFree", mem_address_free(base, size as usize))
-}
-
-/// The parts of `items` inside layout range `[lo, hi)`, split at the edges.
-fn slice_items(items: &[Item], lo: u64, hi: u64) -> Vec<Item> {
-    let mut out = Vec::new();
-    for it in items {
-        let (s, e) = (it.offset.max(lo), (it.offset + it.len).min(hi));
-        if s >= e {
-            continue;
-        }
-        let skip = s - it.offset;
-        let source = match &it.source {
-            ItemSource::Object(o) => ItemSource::Object(tensorfs_core::read::ObjectRange { obj: o.obj.clone(), off: o.off + skip, len: e - s }),
-            ItemSource::Inline(b) => ItemSource::Inline(b[skip as usize..(skip + e - s) as usize].into()),
-        };
-        out.push(Item { offset: s, len: e - s, source, part_end: it.part_end && e == it.offset + it.len });
-    }
-    out
 }
