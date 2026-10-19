@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify, Semaphore};
 
 use super::net::{same_origin, Client};
-use super::origin::{Location, Origin};
+use super::origin::{HttpLocation, Location, Origin};
 use super::token::TokenProvider;
 use super::volume::{blocking, VolumeOrigin, Wrote, STEP};
 use super::{Admission, ObjectStore, Tier};
@@ -751,7 +751,7 @@ impl Shared {
                     FileRead::Failed(refusal) => Attempt::Fatal(refusal),
                 },
                 http => {
-                    let (url, headers, provider) = http.http().expect("a URL location");
+                    let HttpLocation { url, headers, provider } = http.http().expect("a URL location");
                     delivery = delivery.filter(|(_, until)| until.is_none_or(|u| u > Instant::now()));
                     let (delivered, asked) = (
                         delivery.is_some(),

@@ -50,15 +50,21 @@ pub enum Location {
     File(PathBuf),
 }
 
+pub(crate) struct HttpLocation<'a> {
+    pub url: &'a str,
+    pub headers: &'a [(String, String)],
+    pub provider: Option<&'a dyn TokenProvider>,
+}
+
 impl Location {
     pub(crate) fn expired(&self) -> bool {
         matches!(self, Location::Url { expires: Some(at), .. } if *at <= SystemTime::now())
     }
 
-    pub(crate) fn http(&self) -> Option<(&str, &[(String, String)], Option<&dyn TokenProvider>)> {
+    pub(crate) fn http(&self) -> Option<HttpLocation<'_>> {
         match self {
-            Self::Url { url, headers, .. } => Some((url, headers, None)),
-            Self::Authenticated { url, provider } => Some((url, &[], Some(provider.as_ref()))),
+            Self::Url { url, headers, .. } => Some(HttpLocation { url, headers, provider: None }),
+            Self::Authenticated { url, provider } => Some(HttpLocation { url, headers: &[], provider: Some(provider.as_ref()) }),
             Self::File(_) => None,
         }
     }
