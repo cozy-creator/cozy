@@ -1596,6 +1596,19 @@ mod tests {
         let store = crate::storage::open(&state.join("tensorfs")).unwrap();
         let objects =
             Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
+        // The local-source tests use the same named SDK pair as the other machine fixtures.
+        // An empty SDK otherwise installs the published Runtime, even in a candidate-pair job.
+        let named = ["COZY_TEST_RUNTIME_WHEEL", "COZY_TEST_TENSORFS_WHEEL"]
+            .map(|name| std::env::var_os(name).map(std::path::PathBuf::from));
+        let (sdk, runtime_build) = match named {
+            [Some(runtime), Some(tensorfs)] => {
+                let version = runtime.file_name().unwrap().to_string_lossy()
+                    .split('-').nth(1).unwrap().to_string();
+                (vec![runtime, tensorfs], version)
+            }
+            [None, None] => (vec![], String::new()),
+            _ => panic!("local-source fixture needs both named Runtime and TensorFS wheels"),
+        };
         let local = LocalSources::new(
             objects.clone(),
             InstallerConfig {
@@ -1605,10 +1618,10 @@ mod tests {
                 generations: root.join("generations"),
                 client_wheel: client,
                 staging_root: root.join("staging"),
-                sdk: vec![],
+                sdk,
                 uv: "uv".into(),
                 seed_cache: None,
-                runtime_build: String::new(),
+                runtime_build,
             },
             store.clone(),
         );
