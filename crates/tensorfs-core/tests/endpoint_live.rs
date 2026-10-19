@@ -4,7 +4,6 @@
 //! P-256 key offline with their device key, and the provider trades it at AuthKit's token
 //! endpoint once (JWT-bearer, DPoP-proved) and proves every Hub request with it.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,7 +78,7 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     let store = Store::open(scratch.join("source")).unwrap();
     let mut writer = store.writer(None, None).unwrap();
     let weights: Vec<u8> = (0..300_000u32).map(|i| i.wrapping_mul(2_654_435_761) as u8).collect();
-    writer.component("model", "conformance.Fixture", BTreeMap::new(), None).unwrap()
+    writer.component("model", "conformance.Fixture", Default::default(), None).unwrap()
         .put("w", &Dtype::U8, &[weights.len() as u64], Data::Plain(Source::Read(&mut &weights[..]))).unwrap();
     let header = writer.commit().unwrap();
     let mut tree = Tree::default();
@@ -91,6 +90,23 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     assert_eq!(first.sent, first.objects);
     // This would fail if each request tried to trade the single-use capability again.
     assert_eq!(upload_tree(&endpoint, &model, &tree, &store, None).await.unwrap().sent, 0);
+
+    let mut raced = Vec::new();
+    for i in 0..8 {
+        let mut variant = Tree::default();
+        variant.set_variant("int8", header.clone());
+        variant.files.insert("README.md".into(), store.put_bytes(format!("concurrent writer {i}\n").as_bytes()).unwrap());
+        raced.push(store.put_tree(&variant).unwrap());
+    }
+    let writers = raced.iter().cloned().map(|tree| {
+        let (endpoint, store, model) = (Arc::clone(&endpoint), store.clone(), model.clone());
+        tokio::spawn(async move { upload_tree(&endpoint, &model, &tree, &store, None).await })
+    });
+    for result in futures::future::join_all(writers).await {
+        result.unwrap().unwrap();
+    }
+    let named = endpoint.repo(&model).await.unwrap().unwrap().0;
+    assert!(raced.iter().all(|tree| named.checkpoints.contains(tree)), "all concurrent appends survived CAS rebases");
 
     let other = format!("{account}/other");
     let refused = endpoint.update_repo(&other, |old| Ok(Some(with_tree(old, &other, &tree, None)))).await.unwrap_err();

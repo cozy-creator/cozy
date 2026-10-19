@@ -14,7 +14,7 @@ use bytes::Bytes;
 use super::endpoint::{upload_tree, with_tree, Endpoint, Fresh, Payload};
 use super::{Client, Config, Fetcher, ObjectStore, Origin, Want};
 use crate::err::{Code, Refusal, Result};
-use crate::format::{repo_key, ConfigValue, Dtype, ObjectRef, Repo, Tree};
+use crate::format::{repo_key, Config as HeaderConfig, Dtype, ObjectRef, Repo, Tree};
 use crate::sha256::hex_digest;
 use crate::store2::Store;
 use crate::writer::{Data, Source};
@@ -60,7 +60,7 @@ fn fixture(scratch: &Path) -> Result<(Store, ObjectRef)> {
     let store = Store::open(scratch.join("fixture")).map_err(failed)?;
     let mut w = store.writer(None, None).map_err(failed)?;
     let bytes: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
-    let config = BTreeMap::from([("conformance".to_owned(), ConfigValue::Int(1))]);
+    let config: HeaderConfig = serde_json::from_str(r#"{"conformance":1}"#).unwrap();
     let mut c = w.component("model", "conformance.Fixture", config, None).map_err(failed)?;
     c.put("w", &Dtype::U8, &[bytes.len() as u64], Data::Plain(Source::Read(&mut &bytes[..]))).map_err(failed)?;
     let header = w.commit().map_err(failed)?;
