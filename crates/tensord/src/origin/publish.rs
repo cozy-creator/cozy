@@ -48,7 +48,11 @@ impl Catalog {
         let total = leaves.iter().chain(headers.iter()).map(|o| o.length).sum::<u64>() + p.tree.length;
         let committing = AtomicBool::new(false);
         let work = async {
-            let (mut done, mut sent) = (0, 0);
+            if endpoint.repo(p.destination).await?.is_some_and(|(repo, _)| repo.roots().any(|root| root == p.tree)) {
+                (p.progress)(total, total);
+                return Ok(Published { checkpoint: p.tree.id(), converged: true });
+            }
+            let mut done = 0;
             for stage in [leaves, headers, BTreeSet::from([p.tree.clone()])] {
                 let endpoint = &endpoint;
                 let mut uploads = stream::iter(stage).map(|object| async move {
@@ -56,8 +60,7 @@ impl Catalog {
                     endpoint.upload(&object, &payload).await.map(|sent| (sent, object.length))
                 }).buffer_unordered(p.streams.clamp(1, 32));
                 while let Some(uploaded) = uploads.next().await {
-                    let (new, length) = uploaded?;
-                    sent += usize::from(new);
+                    let (_, length) = uploaded?;
                     done += length;
                     (p.progress)(done, total);
                 }
@@ -65,7 +68,7 @@ impl Catalog {
             if !(p.commit)() { return refuse(Code::TRANSFER_FAILED, "the upload was stopped before its ref PUT"); }
             committing.store(true, Ordering::Release);
             endpoint.update_repo(p.destination, |old| Ok(Some(with_tree(old, p.destination, p.tree, None)))).await?;
-            Ok(Published { checkpoint: p.tree.id(), converged: sent == 0 })
+            Ok(Published { checkpoint: p.tree.id(), converged: false })
         };
         block(async {
             let stopped = async {
