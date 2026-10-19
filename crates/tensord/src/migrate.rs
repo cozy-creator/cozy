@@ -2,10 +2,11 @@
 //! before TensorFS's format cut, rewritten into this machine's store by `tensorfs_core::migrate`
 //! (the last reader of the old format) and checked tensor by tensor.
 //!
-//! - [`checkpoint`]: an old checkpoint at the run's Hub. Its objects land in the store as plain
-//!   blobs, where the migration reads them; the run then puts the result in its weights
-//!   destination like any upload. Today's publish wants the whole closure here, so every old
-//!   object comes down, the large ones the new checkpoint reuses included.
+//! - [`checkpoint`]: an old checkpoint at the run's Hub, on a machine that does nothing else (a
+//!   rental). Its objects land in the store as plain blobs, where the migration reads them; the
+//!   run then puts the result in its weights destination like any upload. Today's publish wants
+//!   the whole closure here, so every old object comes down, the large ones the new checkpoint
+//!   reuses included. Each migration first drops what the previous one left.
 //! - [`local`]: every `local/` model of a pre-cut store on this machine, under the same name; the
 //!   old objects it reuses move in by hard link (a copy only across filesystems), so the
 //!   conversion costs only its new bytes.
@@ -37,19 +38,26 @@ fn refused(code: &'static str, message: impl Into<String>) -> Refused {
     Refused { code, message: message.into() }
 }
 
-/// The migration of `lane` in `src` into `store`: its new manifest, held as a model cache (the
-/// machine's disk policy may let it go), and its report.
+/// The migration of `lane` in `src` into `store`: its new manifest, pinned under the writer's
+/// key `migrate-<old manifest>`, and its report.
 fn rewrite(src: &v1::Source, store: &Store, lane: v1::Lane) -> Result<(ObjectRef, Value), Refused> {
-    let key = format!("migrate-{}", lane.manifest.sha256);
     let report = migrate::lane(src, Some(store), &lane, false);
     let doc = Value::Object(report.doc);
-    let Some(made) = report.manifests.1.filter(|_| report.pass) else {
-        return Err(refused("migration_failed", format!("{}: {doc}", lane.manifest.sha256)));
-    };
-    storage::hold(store, &storage::pin::model(&made.sha256), vec![made.clone()], None)
-        .and_then(|()| store.unpin(&key).map(drop).map_err(storage::io_error))
-        .map_err(|e| refused("migration_failed", e.to_string()))?;
-    Ok((made, doc))
+    match report.manifests.1.filter(|_| report.pass) {
+        Some(made) => Ok((made, doc)),
+        None => Err(refused("migration_failed", format!("{}: {doc}", lane.manifest.sha256))),
+    }
+}
+
+/// What earlier migrations left here: published by now (the CLI runs one at a time), so their
+/// pins go and every unreferenced object goes at once, the old ones fetched for them included.
+/// No grace: the Hub path runs on a machine that does nothing else, so disk holds one lane.
+fn clear(store: &Store) -> Result<(), Refused> {
+    let failed = |e: tensorfs_core::store2::Error| refused("migration_failed", e.to_string());
+    for (id, _) in store.pins().map_err(failed)?.into_iter().filter(|(id, _)| id.starts_with("migrate-")) {
+        store.unpin(&id).map_err(failed)?;
+    }
+    store.clone().with_grace(std::time::Duration::ZERO).gc().map(drop).map_err(failed)
 }
 
 /// `choice`, an old checkpoint of `choice.repository` (a release lane, or the owner's by hash),
@@ -76,6 +84,7 @@ pub fn checkpoint(
     )
     .map_err(|(code, message)| refused(code, message))?;
     let (store, never) = (publisher.store(), Stop::default());
+    clear(store)?;
     let fetch = |objects: &[ObjectRef], stage: &str| -> Result<(), Refused> {
         let absent: Vec<ObjectRef> = objects.iter().filter(|o| !storage::present(store, o)).cloned().collect();
         let bytes = absent.iter().map(|o| o.length).sum::<u64>();
@@ -129,6 +138,8 @@ pub fn local(publisher: &Publisher, root: &str, observe: &(dyn Fn(&str, u64, u64
         let closure = store.closure(&made).map_err(|e| refused("migration_failed", e.to_string()))?;
         let adopted = migrate::adopt(&src, store, &closure).map_err(failed)?;
         storage::set_local(store, name, &made).map_err(|e| refused("local_alias_refused", e.to_string()))?;
+        let key = format!("migrate-{}", manifest.sha256);
+        store.unpin(&key).map_err(|e| refused("migration_failed", e.to_string()))?;
         rows.push(json!({"repository": format!("local/{name}"), "manifest": made.id(), "migrated": doc,
             "linked": {"objects": adopted.linked.0, "bytes": adopted.linked.1},
             "copied": {"objects": adopted.copied.0, "bytes": adopted.copied.1}}));
