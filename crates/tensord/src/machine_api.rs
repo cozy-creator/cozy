@@ -1399,6 +1399,7 @@ print(json.dumps({"identity": generation.identity}))
                     command(
                         &mut executor,
                         &DeviceCommand::Load {
+                            tensorfs: None,
                             construction: "fixture".into(),
                             devices: String::new(),
                             sequence_parallel_degree: 1,
@@ -1441,6 +1442,11 @@ print(json.dumps({"identity": generation.identity}))
                     let spool = engine.staging(&id)?;
                     let reply = executor.command(
                         &DeviceCommand::Invoke {
+                            tensorfs: None,
+                            weights: Default::default(),
+                            destination: String::new(),
+                            actor: String::new(),
+                            operation: String::new(),
                             max_output_bytes: crate::output_capacity::DEFAULT_BYTES,
                             request_id: id.clone(),
                             construction: "fixture".into(),
@@ -1457,7 +1463,6 @@ print(json.dumps({"identity": generation.identity}))
                             squeezed_bytes: Default::default(),
                             device_weights: None,
                             sources: Default::default(),
-                            weights: Default::default(),
                         },
                         &mut Publisher {
                             store: &task_store,

@@ -168,7 +168,8 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
         v1::RunKind::Update => return Err(Error::validation("invalid_kind", "an update is not a run of code")),
     };
     // Kept while it prepares, for a restart to prepare it again; provider tokens stay in memory.
-    let tokens = spec.providers.as_ref().is_some_and(|p| !p.huggingface.is_empty() || !p.civitai.is_empty());
+    let tokens = spec.providers.as_ref().is_some_and(|p| !p.huggingface.is_empty() || !p.civitai.is_empty())
+        || spec.tensorfs.as_ref().is_some_and(|options| !options.token.is_empty());
     let journaled = if tokens { vec![] } else { serde_json::to_vec(&spec).unwrap_or_default() };
     let input: Value = match &spec.payload {
         None => serde_json::json!({}),
@@ -177,6 +178,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
     };
     let hub = spec.hub.take();
     let providers = spec.providers.take();
+    let tensorfs = spec.tensorfs.take();
     // What the run is, not how it reaches its sources: a spec re-sent with other access,
     // another catalog revision or a reformatted payload names the same run.
     let identity_digest = {
@@ -187,6 +189,10 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
             origin: hub.origin.trim_end_matches('/').into(),
             ..Default::default()
         });
+        identity.tensorfs = tensorfs.as_ref().map(|options| v1::TensorFSOptions {
+            endpoint: options.endpoint.trim_end_matches('/').into(),
+            ..Default::default()
+        });
         // A JSON value's objects are sorted maps and its numbers exact: one spelling per spec.
         let mut identity = serde_json::to_value(&identity).expect("a run spec serializes");
         identity["payload"] = input.clone();
@@ -195,6 +201,9 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
     };
     if hub.as_ref().is_some_and(|hub| !crate::hub::valid_origin(&hub.origin)) {
         return Err(Error::validation("invalid_hub_origin", "the run's Hub origin is invalid"));
+    }
+    if tensorfs.as_ref().is_some_and(|options| !crate::hub::valid_origin(&options.endpoint)) {
+        return Err(Error::validation("invalid_tensorfs_endpoint", "the TensorFS endpoint is invalid"));
     }
     let source = match spec.source {
         Some(v1::Source::Release(release)) => release_source(release),
@@ -237,6 +246,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
         gpus: spec.gpus,
         bits: spec.bits,
         hub: None,
+        tensorfs,
         providers: providers
             .map(|p| crate::published::Providers {
                 huggingface: p.huggingface,
@@ -710,6 +720,28 @@ mod tests {
             change(&mut changed);
             assert_ne!(spec_of(changed).unwrap().0.digest, digest);
         }
+    }
+
+    #[test]
+    fn supplied_tensorfs_access_is_forwarded_in_memory_and_excluded_from_run_identity() {
+        let mut sent = authored();
+        sent.providers = None;
+        sent.tensorfs = Some(v1::TensorFSOptions {
+            endpoint: "https://tensorfs.example.test/".into(),
+            token: "ordinary-supplied-token".into(),
+            ca_der: vec![1, 2, 3],
+        });
+        assert!(!format!("{sent:?}").contains("ordinary-supplied-token"));
+        let first = spec_of(sent.clone()).unwrap().0;
+        assert!(first.journaled.is_empty());
+        assert_eq!(first.tensorfs.as_ref().unwrap().token, "ordinary-supplied-token");
+        let options = sent.tensorfs.as_mut().unwrap();
+        options.endpoint.pop();
+        options.token = "replacement-supplied-token".into();
+        options.ca_der = vec![4, 5, 6];
+        assert_eq!(spec_of(sent.clone()).unwrap().0.digest, first.digest);
+        sent.tensorfs.as_mut().unwrap().endpoint = "https://other.example.test".into();
+        assert_ne!(spec_of(sent).unwrap().0.digest, first.digest);
     }
 
     #[test]

@@ -237,26 +237,29 @@ fn weight(at: usize, size: usize) -> Vec<u8> {
     bytes
 }
 
-/// A store holding a checkpoint whose closure has one object per entry of `sizes` (a file of
-/// the manifest each), besides its header and chunk.
+/// A store holding a tree whose closure has one object per entry of `sizes` (a repo file each),
+/// besides its header and chunk.
 fn store(name: &str, sizes: &[usize]) -> (std::path::PathBuf, Store, ObjectRef) {
-    use tensorfs_core::{format::Dtype, writer::{Data, Source}};
+    use tensorfs_core::{format::{Dtype, Tree}, writer::{Data, Source}};
     let root = std::env::temp_dir().join(format!("td-publication-{name}-{}", uuid::Uuid::new_v4()));
     let store = Store::open(&root).unwrap();
     let mut writer = store.writer(None, None).unwrap();
-    writer.put("model", "weight", &Dtype::F32, &[1], Data::Plain(Source::Read(&mut &[0u8; 4][..]))).unwrap();
+    writer.get("model").put("weight", &Dtype::F32, &[1], Data::Plain(Source::Read(&mut &[0u8; 4][..]))).unwrap();
     for (at, size) in sizes.iter().enumerate() {
-        writer.file(&format!("files/{at}"), &weight(at, *size)).unwrap();
+        writer.repo_file(&format!("files/{at}"), &weight(at, *size)).unwrap();
     }
-    let manifest = writer.commit().unwrap();
-    (root, store, manifest)
+    let header = writer.commit().unwrap();
+    let mut tree = Tree { files: writer.repo_files().clone() };
+    tree.set_variant("", header);
+    let tree = store.put_tree(&tree).unwrap();
+    (root, store, tree)
 }
 
-fn publication<'a>(store: &'a Store, manifest: &'a ObjectRef, operation: &'a str) -> Publication<'a> {
+fn publication<'a>(store: &'a Store, tree: &'a ObjectRef, operation: &'a str) -> Publication<'a> {
     Publication {
         store,
         destination: "acme/model",
-        manifest,
+        tree,
         operation,
         progress: &|_, _| {},
         streams: 4,
@@ -267,13 +270,13 @@ fn publication<'a>(store: &'a Store, manifest: &'a ObjectRef, operation: &'a str
 
 #[test]
 fn publish_pushes_what_the_hub_lacks_and_follows_its_finalization() {
-    let (root, store, manifest) = store("basic", &[4096; 6]);
+    let (root, store, tree) = store("basic", &[4096; 6]);
     let (source, state) = hub();
     let landed = Mutex::new(Vec::new());
     let progress = |done: u64, total: u64| landed.lock().unwrap().push((done, total));
     let catalog = catalog(&source);
-    let published = catalog.publish(&Publication { destination: "Acme/Model", progress: &progress, ..publication(&store, &manifest, "op-1") }).unwrap();
-    assert_eq!(published.checkpoint, manifest.id());
+    let published = catalog.publish(&Publication { destination: "Acme/Model", progress: &progress, ..publication(&store, &tree, "op-1") }).unwrap();
+    assert_eq!(published.checkpoint, tree.id());
     assert!(!published.converged);
     let held = state.lock().unwrap();
     let pushed: Vec<_> = held.declared[1..].to_vec();
@@ -294,7 +297,7 @@ fn publish_pushes_what_the_hub_lacks_and_follows_its_finalization() {
     drop(held);
 
     state.lock().unwrap().holds = true;
-    let again = catalog.publish(&publication(&store, &manifest, "op-2")).unwrap();
+    let again = catalog.publish(&publication(&store, &tree, "op-2")).unwrap();
     assert!(again.converged);
     assert_eq!(state.lock().unwrap().finalized, 1);
     let _ = std::fs::remove_dir_all(root);
@@ -305,10 +308,10 @@ fn publish_pushes_what_the_hub_lacks_and_follows_its_finalization() {
 /// below the worker count.
 #[test]
 fn publish_asks_for_a_large_closure_in_requests_the_hub_accepts() {
-    let (root, store, manifest) = store("large", &[4096; 300]);
+    let (root, store, tree) = store("large", &[4096; 300]);
     let (source, state) = hub();
-    let published = catalog(&source).publish(&publication(&store, &manifest, "op-large")).unwrap();
-    assert_eq!(published.checkpoint, manifest.id());
+    let published = catalog(&source).publish(&publication(&store, &tree, "op-large")).unwrap();
+    assert_eq!(published.checkpoint, tree.id());
     let held = state.lock().unwrap();
     assert_eq!(held.uploaded.len(), held.declared.len() - 1);
     assert_eq!(held.verified.len(), held.declared.len() - 1);
@@ -321,14 +324,14 @@ fn publish_asks_for_a_large_closure_in_requests_the_hub_accepts() {
 #[test]
 fn publish_renews_only_expired_authority_and_keeps_long_puts_live() {
     for mode in ["stale", "expired403", "landed", "heartbeat", "denied", "always-stale", "legacy"] {
-        let (root, store, manifest) = store(mode, &[512]);
+        let (root, store, tree) = store(mode, &[512]);
         let (source, state) = hub();
         state.lock().unwrap().mode = mode;
         let progress = Mutex::new((0, 0));
         let published = catalog(&source).publish(&Publication {
             progress: &|done, total| *progress.lock().unwrap() = (done, total),
             streams: 2,
-            ..publication(&store, &manifest, mode)
+            ..publication(&store, &tree, mode)
         });
         let state = state.lock().unwrap();
         assert!(state.max_selection <= 2);
@@ -342,7 +345,7 @@ fn publish_renews_only_expired_authority_and_keeps_long_puts_live() {
             assert!(state.grants.values().all(|n| *n <= 3));
             assert!(state.puts.is_empty());
         } else {
-            assert_eq!(published.unwrap().checkpoint, manifest.id(), "{mode}");
+            assert_eq!(published.unwrap().checkpoint, tree.id(), "{mode}");
             if mode == "legacy" {
                 assert!(state.grants.values().all(|n| *n == 1));
             } else {
@@ -364,7 +367,7 @@ fn publish_renews_only_expired_authority_and_keeps_long_puts_live() {
 fn publish_refills_slots_while_a_large_put_waits_and_renews() {
     let mut sizes = vec![512; 24];
     sizes[0] = 1 << 20;
-    let (root, store, manifest) = store("rolling", &sizes);
+    let (root, store, tree) = store("rolling", &sizes);
     let blocked = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&weight(0, 1 << 20)));
     let (source, state) = hub();
     {
@@ -372,14 +375,14 @@ fn publish_refills_slots_while_a_large_put_waits_and_renews() {
         state.mode = "rolling";
         state.blocked = blocked.clone();
     }
-    let published = catalog(&source).publish(&Publication { streams: 8, ..publication(&store, &manifest, "rolling") }).unwrap();
+    let published = catalog(&source).publish(&Publication { streams: 8, ..publication(&store, &tree, "rolling") }).unwrap();
     let state = state.lock().unwrap();
     assert!(state.released_after_refill, "later objects must finish before the slow PUT is released");
     assert!(state.max_unverified_grants <= 8, "only dispatchable objects obtain grants");
     assert!(state.grants[&blocked] >= 2, "a waiting PUT retains its publication hold");
     assert_eq!(state.puts[&blocked], 1, "heartbeat does not restart a moving PUT");
     assert_eq!(state.verified.len(), state.declared.len() - 1);
-    assert_eq!(published.checkpoint, manifest.id());
+    assert_eq!(published.checkpoint, tree.id());
     drop(state);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -391,7 +394,7 @@ fn publish_refills_slots_while_a_large_put_waits_and_renews() {
 fn a_stopped_publication_finalizes_nothing_and_resumes() {
     let mut sizes = vec![512; 8];
     sizes[0] = 1 << 20;
-    let (root, store, manifest) = store("stopped", &sizes);
+    let (root, store, tree) = store("stopped", &sizes);
     let blocked = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&weight(0, 1 << 20)));
     let (source, state) = hub();
     {
@@ -402,7 +405,7 @@ fn a_stopped_publication_finalizes_nothing_and_resumes() {
     let catalog = catalog(&source);
     let stop = Stop::default();
     let (stopped, took) = std::thread::scope(|scope| {
-        let running = scope.spawn(|| catalog.publish(&Publication { stop: Some(&stop), ..publication(&store, &manifest, "stopped") }));
+        let running = scope.spawn(|| catalog.publish(&Publication { stop: Some(&stop), ..publication(&store, &tree, "stopped") }));
         let started = Instant::now();
         while !{
             let state = state.lock().unwrap();
@@ -423,8 +426,8 @@ fn a_stopped_publication_finalizes_nothing_and_resumes() {
         assert!(!state.uploaded.contains_key(&blocked));
         state.release = true;
     }
-    let resumed = catalog.publish(&publication(&store, &manifest, "stopped")).unwrap();
-    assert_eq!(resumed.checkpoint, manifest.id());
+    let resumed = catalog.publish(&publication(&store, &tree, "stopped")).unwrap();
+    assert_eq!(resumed.checkpoint, tree.id());
     let state = state.lock().unwrap();
     assert_eq!(state.finalized, 1);
     assert_eq!(state.puts[&blocked], 2);
@@ -438,13 +441,13 @@ fn a_stopped_publication_finalizes_nothing_and_resumes() {
 /// again it pushes nothing and finalizes once.
 #[test]
 fn a_publication_declined_at_its_commit_point_finalizes_nothing() {
-    let (root, store, manifest) = store("declined", &[512; 4]);
+    let (root, store, tree) = store("declined", &[512; 4]);
     let (source, state) = hub();
     let catalog = catalog(&source);
-    let declined = catalog.publish(&Publication { commit: &|| false, ..publication(&store, &manifest, "declined") });
+    let declined = catalog.publish(&Publication { commit: &|| false, ..publication(&store, &tree, "declined") });
     assert_eq!(declined.unwrap_err().code, Code::TRANSFER_FAILED);
     assert_eq!(state.lock().unwrap().finalized, 0);
-    catalog.publish(&publication(&store, &manifest, "declined")).unwrap();
+    catalog.publish(&publication(&store, &tree, "declined")).unwrap();
     let state = state.lock().unwrap();
     assert_eq!(state.finalized, 1);
     assert!(state.puts.values().all(|n| *n == 1));

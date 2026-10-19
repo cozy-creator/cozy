@@ -1,4 +1,4 @@
-//! Child calls and each attempt's weights grant. Every call an attempt makes to a callable of
+//! Child calls. Every call an attempt makes to a callable of
 //! its environment arrives on the seam (`child_call`) and becomes a run of its own,
 //! `<parent>/<call_index>`, under the parent's signer: same records, dispatched like any run,
 //! canceled with the parent. A child's result and files reach the parent through the seam
@@ -9,7 +9,6 @@ use crate::{
     catalog::HeldGeneration,
     device_executor::{Answer, CallInterface, Frame, Kind},
     execution::Engine,
-    gpu_service::Plan,
     journal::{Execution, Failure, InputFile, State},
     launch_identity::LaunchIdentity,
     runs::Runs,
@@ -17,7 +16,7 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -31,8 +30,6 @@ pub struct Calls {
     runs: Weak<Runs>,
     /// Running attempts that may call, by execution id.
     parents: Mutex<HashMap<String, Arc<Parent>>>,
-    /// Every attempt's weights sources and outputs (`weights_writer`).
-    weights: crate::weights::Weights,
     machine: Arc<crate::origin::Machine>,
     /// Each live call's fetches, by run: its cancel ends them at once.
     fetches: Mutex<HashMap<String, Vec<Weak<crate::access::Fetch>>>>,
@@ -166,13 +163,9 @@ impl Calls {
             service: Arc::downgrade(service),
             runs: runs.map_or_else(Weak::new, Arc::downgrade),
             parents: Mutex::new(HashMap::new()),
-            weights: crate::weights::Weights::new(machine.store().clone())?,
             machine,
             fetches: Mutex::default(),
         });
-        if let Err(error) = calls.sweep_canceled_outputs(&service.engine) {
-            tracing::warn!("startup canceled native outputs: {error}");
-        }
         let (watching, engine) = (Arc::downgrade(&calls), service.engine.clone());
         std::thread::Builder::new()
             .name("call-nudges".into())
@@ -186,16 +179,20 @@ impl Calls {
         self.parents.lock().unwrap().get(id).is_some_and(|parent| parent.unfinished(engine))
     }
 
-    pub(crate) fn weights(&self) -> &crate::weights::Weights {
-        &self.weights
+    pub(crate) fn tensorfs(&self, id: &str) -> Option<protocol::machine::TensorFSOptions> {
+        self.runs.upgrade().and_then(|runs| runs.tensorfs(id))
     }
 
-    /// One call's fetches of `plan`'s checkpoints, under its run's Hub access and ordered by
-    /// its root's acceptance; they end with the call, or at once with its run's cancel.
-    pub(crate) fn fetch(&self, record: &Execution, plan: &Plan) -> Arc<crate::access::Fetch> {
+    pub(crate) fn destination(&self, id: &str) -> String {
+        self.runs.upgrade().map(|runs| runs.destination(id)).unwrap_or_default()
+    }
+
+    /// One call's fetches, under its run's Hub access and ordered by its root's acceptance;
+    /// they end with the call, or at once with its run's cancel.
+    pub(crate) fn fetch(&self, record: &Execution) -> Arc<crate::access::Fetch> {
         let runs = self.runs.upgrade();
         let hub = runs.as_ref().and_then(|runs| runs.hub(&record.id));
-        let fetch = crate::access::Fetch::new(self.machine.clone(), hub, plan.manifests(), record.root_seq());
+        let fetch = crate::access::Fetch::new(self.machine.clone(), hub, record.root_seq());
         fetch.replaces(runs.and_then(|runs| runs.ahead(&record.id)));
         let mut fetches = self.fetches.lock().unwrap();
         let live = fetches.entry(record.id.clone()).or_default();
@@ -234,111 +231,12 @@ impl Calls {
         (Caller { calls: self.clone(), parent }, rows)
     }
 
-    /// The attempt's weights grant: its plan's `Weights[M]` sources, the weights outputs its
-    /// function declares, where they are published and the call's `fetch` of what a source
-    /// held in part lacks. None when it reads and writes no weights.
-    pub(crate) fn grant(
-        &self,
-        engine: &Arc<Engine>,
-        record: &Execution,
-        plan: &Plan,
-        document: &Value,
-        spool: &Path,
-        fetch: &Arc<crate::access::Fetch>,
-    ) -> io::Result<Option<crate::weights::Grant>> {
-        let entry = document["entrypoints"]
-            .as_array()
-            .and_then(|rows| rows.iter().find(|row| row["name"] == record.invocation.entrypoint.as_str()))
-            .cloned()
-            .unwrap_or_default();
-        let outputs: BTreeMap<String, u64> = entry["weights_outputs"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|row| Some((row["output_id"].as_str()?.to_string(), row["max_bytes"].as_u64()?)))
-            .collect();
-        if plan.sources.is_empty() && outputs.is_empty() {
-            return Ok(None);
-        }
-        let destination = match self.runs.upgrade() {
-            Some(runs) => runs.destination(&record.id)?,
-            None => None,
-        };
-        let fetch = Some(fetch.clone());
-        let sources = plan.sources.iter().map(|s| (s.manifest.clone(), s.length)).collect();
-        let actor = record.submission.as_ref().map(|s| s.actor.clone()).unwrap_or_default();
-        let (run, attempt) = (record.id.clone(), record.attempt);
-        let current = {
-            let (engine, run) = (engine.clone(), run.clone());
-            Arc::new(move || {
-                engine.get(&run).is_ok_and(|r| {
-                    r.attempt == attempt && r.state == State::Running && r.cancel_actor.is_none()
-                })
-            })
-        };
-        let bind_output = {
-            let engine = engine.clone();
-            Arc::new(move |transaction: &str, slot: &str| {
-                engine.with_journal(|journal| journal.bind_derived_output(&run, attempt, transaction, slot))
-            })
-        };
-        // A committed derivation is replayed for the same code, declaration and request: its
-        // parameters, file inputs and precision (its weights are the derivation's sources, keyed
-        // by the writer), never for less. Two runs differing in a parameter derive apart.
-        let replay = self.service.upgrade().and_then(|service| {
-            let held = service.catalog.resolve(&record.invocation.generation).ok()?;
-            let operation = crate::call_memo::operation(&held.record, &record.invocation.module, &entry["invocable"])?;
-            let declared = serde_json_canonicalizer::to_vec(&entry).ok()?;
-            let invocation = &record.invocation;
-            let request = serde_json::json!({"input": invocation.input, "files": invocation.inputs, "bits": invocation.bits});
-            let request = serde_json_canonicalizer::to_vec(&request).ok()?;
-            let digest = tensorfs_core::sha256::hex_digest;
-            Some(format!("{operation}\0{}\0{}", digest(&declared), digest(&request)))
-        });
-        Ok(Some(crate::weights::Grant::new(
-            &actor,
-            &record.id,
-            spool,
-            sources,
-            outputs,
-            destination,
-            crate::weights::GrantAuthority { current, bind_output, fetch, replay },
-        )))
-    }
-
     /// Write roots no unfinished run needs (`objects::Objects::sweep`).
     pub fn sweep_objects(&self) -> io::Result<usize> {
         match self.runs.upgrade() {
             Some(runs) => runs.objects.sweep(),
             None => Ok(0),
         }
-    }
-
-    /// Retry native cancellation cleanup from the existing durable execution associations.
-    pub fn sweep_canceled_outputs(&self, engine: &Engine) -> io::Result<usize> {
-        let bindings = engine.with_journal(|journal| journal.canceled_derived_outputs())?;
-        let mut released = 0;
-        let mut failure = None;
-        for binding in bindings {
-            let result = self
-                .weights
-                .cancel_output(&binding.transaction)
-                .and_then(|()| {
-                    engine.with_journal(|journal| journal.release_derived_output_binding(&binding))
-                });
-            match result {
-                Ok(()) => released += 1,
-                Err(error) => {
-                    failure.get_or_insert_with(|| {
-                        io::Error::other(format!(
-                            "run {} output {}: {error}",
-                            binding.execution, binding.slot
-                        ))
-                    });
-                }
-            }
-        }
-        failure.map_or(Ok(released), Err)
     }
 
     /// Every unfinished child of `parent` is canceled with it.
@@ -360,9 +258,6 @@ impl Calls {
         let Some(service) = self.service.upgrade() else {
             return;
         };
-        if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
-            tracing::warn!("canceled native outputs: {error}");
-        }
         if service.engine.get(id).is_ok_and(|r| r.state == State::Queued) {
             return;
         }
@@ -373,16 +268,11 @@ impl Calls {
         }
     }
 
-    /// A cancel reached a run: its unfinished native outputs are let go at once, and when no
-    /// attempt runs (it was queued) its children end too.
+    /// A cancel reached a run: its fetches end at once, and when no attempt runs (it was
+    /// queued) its children end too.
     pub fn canceled(&self, record: &Execution) {
         if record.cancel_actor.is_none() {
             return;
-        }
-        if let Some(service) = self.service.upgrade() {
-            if let Err(error) = self.sweep_canceled_outputs(&service.engine) {
-                tracing::warn!("canceled native outputs: {error}");
-            }
         }
         for fetch in self.fetches.lock().unwrap().remove(&record.id).into_iter().flatten() {
             if let Some(fetch) = fetch.upgrade() {
@@ -1023,25 +913,6 @@ fn nudge(calls: Weak<Calls>, engine: Arc<Engine>) {
                 let _ = watcher.write(&[0]);
             }
         }
-    }
-}
-
-/// Journals a weights output's publication as a `call` event on its run (`run show` lists it
-/// beside the run's child calls), before the run settles. Keyed by output and transaction, so
-/// a replay adds no second row.
-pub(crate) fn record_upload(engine: &Engine, id: &str, upload: &crate::weights::Upload) {
-    let body = json!({
-        "request": format!("{id}/upload/{}", upload.output), "parent": id, "index": 0, "attempt": 1,
-        "module": "cozy_runtime.author.publication", "export": "upload_checkpoint",
-        "label": format!("Upload checkpoint to {}", upload.destination),
-        "status": if upload.error.is_some() { "failed" } else { "succeeded" },
-        "error": upload.error.clone().unwrap_or_default(),
-        "error_code": if upload.error.is_some() { "weights_upload_failed" } else { "" },
-        "called_unix_ms": upload.called_ms, "finished_unix_ms": upload.finished_ms, "measurements": Value::Null,
-    });
-    let key = format!("weights:{}/{}", upload.output, upload.transaction);
-    if let Err(error) = engine.append_call(id, &key, &crate::boundary_json::exact(&body)) {
-        tracing::warn!("run {id}: upload call: {error}");
     }
 }
 
