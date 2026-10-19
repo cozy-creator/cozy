@@ -249,6 +249,22 @@ fn locations_spanning_chunk_ends_read_whole_and_in_pieces() {
     assert!(out.bytes() == &stream[3..] && s.bytes == stream.len() as u64 - 3);
 }
 
+#[test]
+fn overflowing_file_ranges_and_request_grids_refuse_before_writing() {
+    let scratch = Scratch::new("overflow");
+    let path = scratch.0.join("bytes");
+    fs::write(&path, b"real file bytes").unwrap();
+    let file = fs::File::open(path).unwrap();
+    for (offset, opts) in [(u64::MAX, ReadOpts::default()), (0, ReadOpts { request: usize::MAX, ..ReadOpts::default() })] {
+        let mut out = [0xa5];
+        let copy = Copy { src: Src::File(&file, offset), dst: Dst::host(&mut out) };
+        // SAFETY: a live non-overlapping destination; file offsets and options are validated.
+        let error = unsafe { io::read(&[copy], &opts) }.unwrap_err();
+        assert_eq!(error.source.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(out, [0xa5]);
+    }
+}
+
 /// A writer's folder: `n` small tensors of varied sizes, an encoded tensor, and one standalone
 /// tensor past the 64 MiB grid (two chunks).
 fn written(dir: &Path, n: usize) -> Checkpoint {

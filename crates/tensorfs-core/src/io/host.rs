@@ -44,7 +44,8 @@ struct Tally {
 /// # Safety
 /// As [`super::read`], for host destinations only.
 pub(super) unsafe fn fill(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats, Error> {
-    let grid = (opts.request as u64).max(A).next_multiple_of(A);
+    let grid = (opts.request as u64).max(A).checked_next_multiple_of(A)
+        .ok_or_else(|| invalid(0, "read request alignment overflows"))?;
     let mut index: HashMap<*const File, usize> = HashMap::new();
     let mut files: Vec<&File> = Vec::new();
     let (mut segs, mut pieces) = (Vec::<Seg>::new(), Vec::<Piece>::new());
@@ -60,9 +61,10 @@ pub(super) unsafe fn fill(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats,
             }
             Src::Host(p) => (None, p as u64),
         };
-        let (mut at, end) = (offset, offset + len as u64);
+        let end = offset.checked_add(len as u64).ok_or_else(|| invalid(i, "source range overflows"))?;
+        let mut at = offset;
         while at < end {
-            let next = ((at / grid + 1) * grid).min(end);
+            let next = (at - at % grid).checked_add(grid).unwrap_or(u64::MAX).min(end);
             let joins = file.is_some()
                 && pieces.last().is_some_and(|p| {
                     let (first, last) = (&segs[p.segs.start], &segs[p.segs.end - 1]);
@@ -136,6 +138,10 @@ pub(super) unsafe fn fill(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats,
         bounced: tally.bounced.into_inner(),
         ..ReadStats::default()
     })
+}
+
+fn invalid(copy: usize, detail: &str) -> Error {
+    Error { copy, source: io::Error::new(io::ErrorKind::InvalidInput, detail) }
 }
 
 /// `dst.len()` bytes at `at` past the page cache: the aligned middle straight into `dst` when
