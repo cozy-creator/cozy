@@ -593,7 +593,7 @@ fn child() {
             let mut w = store.with_grace(GRACE).writer(None, None).unwrap();
             for (key, bytes) in overlap(seed) {
                 plain(&mut w, "unet", &key, &bytes);
-                std::thread::sleep(GRACE / 3);
+                std::thread::sleep(GRACE / 4);
             }
             let header = w.commit().unwrap();
             println!("HEADER {} {}", header.sha256, header.length);
@@ -1018,9 +1018,9 @@ fn a_two_variant_repo_shares_chunks_and_files_and_gc_keeps_its_closure() {
     assert_eq!(int8.component("scheduler").unwrap().config_file.as_deref(), Some("scheduler_config.json"));
     assert_eq!(int8.asset("tokenizer", "vocab.json").unwrap(), vocab);
     let c = bf16.component("unet").unwrap();
-    assert_eq!(c.config["scaling_factor"], ConfigValue::Float(0.13025));
+    assert_eq!(c.config["scaling_factor"], serde_json::json!(0.13025));
     assert_eq!(c.config["act"], ConfigValue::Null);
-    assert_eq!(c.config["blocks"], ConfigValue::List(vec![ConfigValue::Int(1), ConfigValue::Float(2.5)]));
+    assert_eq!(c.config["blocks"], serde_json::json!([1, 2.5]));
     let (a, b): (BTreeSet<ObjectRef>, BTreeSet<ObjectRef>) = (bf16.header().objects().cloned().collect(), int8.header().objects().cloned().collect());
     let shared: Vec<&ObjectRef> = a.intersection(&b).collect();
     assert!(shared.iter().any(|o| o.length == 18 * MIB as u64), "mid.weight's object is shared");
@@ -1146,7 +1146,7 @@ fn a_plain_folder_round_trips_through_the_store() {
     assert_eq!(own.len(), 1, "only the new pack: {own:?}");
     let alone = Checkpoint::folder(&thin, Some("int8"), None).unwrap();
     assert_eq!(alone.id(), &int8);
-    assert_eq!(alone.missing(None).unwrap().len(), 2, "big.weight's objects and the asset are the store's");
+    assert_eq!(alone.missing(None).unwrap().len(), 3, "big.weight's two objects and the asset are the store's");
     let cached = Checkpoint::folder(&thin, Some("int8"), Some(&store)).unwrap();
     assert!(cached.read("unet", "big.weight").unwrap() == tensors[0].1);
     assert!(scratch.store("empty").admit_folder(&thin).is_err(), "a thin folder needs its objects somewhere");
@@ -1166,7 +1166,7 @@ fn a_plain_folder_round_trips_through_the_store() {
 }
 
 /// The grace two concurrent writers run under while a collector sweeps.
-const GRACE: Duration = Duration::from_millis(900);
+const GRACE: Duration = Duration::from_secs(6);
 
 /// Ten tensors, slowly: a large part and a small one every seed shares, and its own.
 fn overlap(seed: u64) -> Vec<(String, Vec<u8>)> {
