@@ -24,10 +24,15 @@ mod fp8_blockwise;
 mod mxfp4;
 
 // gguf
+mod gguf;
 
 // gptq, awq, ct
+mod awq;
+mod ct;
+mod gptq;
 
 // bnb
+mod bnb;
 
 // comfy
 
@@ -42,10 +47,39 @@ pub static ENCODERS: &[&Encoder] = &[
     &mxfp4::ENCODER,
 
     // gguf.*
+    &gguf::Q4_0,
+    &gguf::Q4_1,
+    &gguf::Q5_0,
+    &gguf::Q5_1,
+    &gguf::Q8_0,
+    &gguf::Q2_K,
+    &gguf::Q3_K,
+    &gguf::Q4_K,
+    &gguf::Q5_K,
+    &gguf::Q6_K,
+    &gguf::MXFP4,
+    &gguf::NVFP4,
+    &gguf::Q1_0,
+    &gguf::Q2_0,
 
     // gptq.*, awq.*, ct.*
-
+    &gptq::INT2,
+    &gptq::INT3,
+    &gptq::INT4,
+    &gptq::INT8,
+    &awq::INT4,
+    &ct::INT1,
+    &ct::INT2,
+    &ct::INT3,
+    &ct::INT4,
+    &ct::INT5,
+    &ct::INT6,
+    &ct::INT7,
+    &ct::INT8,
     // bnb.*
+    &bnb::NF4,
+    &bnb::FP4,
+    &bnb::INT8,
 
     // comfy.*
 ];
@@ -131,5 +165,40 @@ pub(crate) fn encoding(scheme: &str, params: &[(&str, Value)]) -> Encoding {
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect(),
+    }
+}
+
+/// An integer array (`I8`, `U8`, `I16`, `U16` or `I32`) of a calibrated producer's, by name.
+fn array(input: &Input, role: &str) -> Result<Vec<i32>> {
+    let fail = |d: &str| Error::Encode(format!("{}: {role} {d}", input.encoding.scheme));
+    let a = input.arrays.get(role).ok_or_else(|| fail("is missing"))?;
+    let b = a.bytes;
+    Ok(match a.dtype {
+        Dtype::I8 => b.iter().map(|v| *v as i8 as i32).collect(),
+        Dtype::U8 => b.iter().map(|v| *v as i32).collect(),
+        Dtype::I16 => (b.as_chunks::<2>().0.iter())
+            .map(|v| i16::from_le_bytes(*v) as i32)
+            .collect(),
+        Dtype::U16 => (b.as_chunks::<2>().0.iter())
+            .map(|v| u16::from_le_bytes(*v) as i32)
+            .collect(),
+        Dtype::I32 => (b.as_chunks::<4>().0.iter())
+            .map(|v| i32::from_le_bytes(*v))
+            .collect(),
+        other => return Err(fail(&format!("is {other}, not an integer array"))),
+    })
+}
+
+fn part(
+    role: &str,
+    dtype: Dtype,
+    shape: impl IntoIterator<Item = usize>,
+    bytes: Vec<u8>,
+) -> OwnedPart {
+    OwnedPart {
+        role: role.into(),
+        dtype,
+        shape: shape.into_iter().map(|e| e as u64).collect(),
+        bytes,
     }
 }

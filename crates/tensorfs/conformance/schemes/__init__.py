@@ -15,11 +15,15 @@ from . import nvfp4
 from . import fp8_blockwise
 from . import mxfp4
 
-# gguf
+from . import gguf
 
 # gptq, awq, ct
+from . import gptq
+from . import awq
+from . import ct
 
 # bnb
+from . import bnb
 
 # comfy
 
@@ -35,11 +39,15 @@ FAMILIES = (
     fp8_blockwise,
     mxfp4,
 
-    # gguf
+    gguf,
 
     # gptq, awq, ct
+    gptq,
+    awq,
+    ct,
 
     # bnb
+    bnb,
 
     # comfy
 )

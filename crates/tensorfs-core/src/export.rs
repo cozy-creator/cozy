@@ -19,6 +19,10 @@
 //!   `cozytensors.encodings` names each one's scheme and params. With `dequantize`, it is decoded
 //!   into that dtype instead.
 
+mod gguf;
+
+pub use gguf::gguf;
+
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};

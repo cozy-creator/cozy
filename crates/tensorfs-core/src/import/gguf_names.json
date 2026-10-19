@@ -1,0 +1,85 @@
+{
+  "llama": {
+    "class": "LlamaForCausalLM",
+    "class_experts": "MixtralForCausalLM",
+    "llama_cpp_only": ["rope_freqs"],
+    "permute": {
+      "blk.{bid}.attn_q": "attention.head_count",
+      "blk.{bid}.attn_k": "attention.head_count_kv"
+    },
+    "tensors": {
+      "token_embd": "model.embed_tokens",
+      "output_norm": "model.norm",
+      "output": "lm_head",
+      "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+      "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+      "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+      "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+      "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+      "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+      "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+      "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+      "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+      "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.block_sparse_moe.gate",
+      "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.block_sparse_moe.experts.{xid}.w1",
+      "blk.{bid}.ffn_down_exps": "model.layers.{bid}.block_sparse_moe.experts.{xid}.w2",
+      "blk.{bid}.ffn_up_exps": "model.layers.{bid}.block_sparse_moe.experts.{xid}.w3"
+    }
+  },
+  "qwen2": {
+    "class": "Qwen2ForCausalLM",
+    "tensors": {
+      "token_embd": "model.embed_tokens",
+      "output_norm": "model.norm",
+      "output": "lm_head",
+      "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+      "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+      "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+      "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+      "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+      "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+      "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+      "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+      "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj"
+    }
+  },
+  "qwen3": {
+    "class": "Qwen3ForCausalLM",
+    "tensors": {
+      "token_embd": "model.embed_tokens",
+      "output_norm": "model.norm",
+      "output": "lm_head",
+      "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+      "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+      "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+      "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+      "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+      "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+      "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+      "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+      "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+      "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+      "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj"
+    }
+  },
+  "qwen3moe": {
+    "class": "Qwen3MoeForCausalLM",
+    "tensors": {
+      "token_embd": "model.embed_tokens",
+      "output_norm": "model.norm",
+      "output": "lm_head",
+      "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+      "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+      "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+      "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+      "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+      "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+      "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+      "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+      "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+      "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.{xid}.gate_proj",
+      "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.{xid}.up_proj",
+      "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.{xid}.down_proj"
+    }
+  }
+}

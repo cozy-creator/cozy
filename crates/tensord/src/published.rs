@@ -528,18 +528,33 @@ impl Publisher {
                 catalog.reason(code, message)
             }
         };
+        let (started, subject) = (Instant::now(), format!("{}@{} {}", named.repository, named.release, named.lane));
+        let logged = |pulled: &tensorfs_core::fetch::Pulled| {
+            let (fetched, reused) = (pulled.landed.origin + pulled.landed.volume, pulled.landed.local);
+            let seconds = started.elapsed().as_secs_f64();
+            let detail = format!("manifest={} objects={} fetched={fetched} reused={reused} seconds={seconds:.1} origin={}",
+                manifest.id(), pulled.objects, source.origin);
+            storage::transport(&self.store, "pull", &subject, &detail);
+        };
+        let failed = |e: Refusal| {
+            storage::transport(&self.store, "pull-failed", &subject, &format!("origin={}: {e}", source.origin));
+            failed(e)
+        };
         let structure = self.machine.pull(&remote, &manifest, Some(&[]), priority::NOW, None, &stop).map_err(failed)?;
         let pulled = Pulled { repository: named.repository.clone(), release: named.release.clone(), lane: named.lane.clone() };
         storage::hold(&self.store, &storage::pin::model(&manifest.sha256), vec![manifest.clone()], Some(pulled.owner()))
             .map_err(io_failure)?;
         if components == Some(&[]) {
+            logged(&structure);
             return Ok((structure.landed.origin, structure.landed.volume));
         }
         let progress = Arc::new(Counted::default());
         let pulled = origin::watched(&progress, bytes, || {
             self.machine.pull(&remote, &manifest, components, priority::NOW, Some(progress.clone()), &stop)
         });
-        let landed = pulled.map_err(failed)?.landed;
+        let pulled = pulled.map_err(failed)?;
+        logged(&pulled);
+        let landed = pulled.landed;
         Ok((structure.landed.origin + landed.origin, structure.landed.volume + landed.volume))
     }
 
@@ -1493,22 +1508,45 @@ fn make_source(
         profiles: profiles.to_vec(),
     };
     if let Some(manifest) = crate::storage::local(store, &name).map_err(io_failure)? {
+        crate::storage::transport(store, "import", source, &format!("manifest={} reused", manifest.id()));
         return Ok(made(manifest));
     }
     let stop = || cancellation.as_ref().is_some_and(Stop::is_cancelled);
+    // What the import downloaded, for its transport line.
+    let downloaded = std::sync::atomic::AtomicU64::new(0);
+    let counted = |stage: &str, done: u64, total: u64| {
+        if stage == "downloading" {
+            downloaded.fetch_max(total, std::sync::atomic::Ordering::Relaxed);
+        }
+        progress(stage, done, total)
+    };
     let request = tensorfs_core::import::Request {
         sources: &[source.to_string()],
         converter,
         variant: None,
         access: &access,
         tmp: &store.root().join("tmp"),
-        progress,
+        progress: &counted,
         stop: Some(&stop),
     };
-    let manifest = store.import(&request, Some(&name)).map_err(|e| match stop() {
-        true => canceled(),
-        false => refused("model_source_failed", e),
+    let started = Instant::now();
+    let manifest = store.import(&request, Some(&name)).map_err(|e| {
+        crate::storage::transport(store, "import-failed", source, &e.to_string());
+        match stop() {
+            true => canceled(),
+            false => refused("model_source_failed", e),
+        }
     })?;
+    let closure = store.closure(&manifest).unwrap_or_default();
+    let detail = format!(
+        "manifest={} objects={} bytes={} downloaded={} seconds={:.1}",
+        manifest.id(),
+        closure.len(),
+        closure.iter().map(|o| o.length).sum::<u64>(),
+        downloaded.load(std::sync::atomic::Ordering::Relaxed),
+        started.elapsed().as_secs_f64()
+    );
+    crate::storage::transport(store, "import", source, &detail);
     crate::storage::set_local(store, &name, &manifest).map_err(io_failure)?;
     store.unpin(&name).map_err(|e| io_failure(crate::storage::io_error(e)))?;
     Ok(made(manifest))

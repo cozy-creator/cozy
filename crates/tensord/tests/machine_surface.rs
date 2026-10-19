@@ -903,7 +903,9 @@ mod v1_api {
         };
         let requirements = env.join("requirements.txt");
         uv(&["venv".as_ref(), "--python".as_ref(), "3.12".as_ref(), env.as_os_str()]);
+        // Less the lock's own pair: the named Runtime is installed once, beside the TensorFS it takes.
         uv(&["export".as_ref(), "--locked".as_ref(), "--extra".as_ref(), "test".as_ref(), "--no-emit-project".as_ref(),
+            "--no-emit-package".as_ref(), "cozy-runtime".as_ref(), "--no-emit-package".as_ref(), "tensorfs".as_ref(),
             "--no-hashes".as_ref(), "-o".as_ref(), requirements.as_os_str()]);
         let python = env.join("bin/python");
         uv(&["pip".as_ref(), "install".as_ref(), "--python".as_ref(), python.as_os_str(), "-r".as_ref(), requirements.as_os_str()]);

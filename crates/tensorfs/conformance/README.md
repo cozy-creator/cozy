@@ -14,7 +14,7 @@ For anyone implementing [cozytensors/1](../spec/cozytensors.md).
 | `vectors/{green,red}/{manifest,repo}-*.json` | Manifests and repos to accept or refuse. |
 | `reader.py` | An independent reader and header encoder (Python, numpy, cbor2); its decoders are `schemes/`, one module per family, registered in `schemes/__init__.py`. |
 | `make_vectors.py` | Writes the header vectors from the projections and defects it lists, and checks and normalizes every `cases/<family>.json`. |
-| `mine/` | Producer miners: `mine/cores.py` writes `cores.json`; a family's miner writes its cases. |
+| `mine/` | Producer miners: `mine/cores.py` writes `cores.json`; a family's miner writes its cases (`mine/gguf.py`: ggml's own C, fetched at llama.cpp ff5a233 and built here). |
 
 A conforming implementation:
 - reads the store, verifies every object, and decodes every case to its expected bytes or refuses it with its code;
@@ -60,3 +60,18 @@ gpt-oss's triton_kernels and torchao on CPU, each producer's own dequantize givi
 real checkpoints read by HTTP range at pinned revisions (DeepSeek-V3.1 and V4, Qwen3, RedHatAI, gpt-oss, AMD Quark,
 MLX, compressed-tensors). A case with `source` holds the `F32` values its producer quantized; TensorFS's encoder
 reproduces its parts bit for bit (`tests/format_encode.rs`).
+
+The `gguf` cases are ggml's own C (`quantize_row_<type>_ref`, `dequantize_row_<type>` from llama.cpp ff5a233's
+`ggml-quants.c`, gcc for baseline x86-64 with `-ffp-contract=off`); gguf-py's numpy dequantizers (same commit) agree
+on every F32 case.
+
+`gptq`, `awq` and `ct` are mined by `mine/<family>.py` on CPU from GPTQModel 7.6.0, AutoGPTQ 0.7.1 and AutoAWQ 0.2.9
+(their own files from the PyPI sdists), and compressed-tensors 0.16.0 and 0.19.0 (both sides of its packing change),
+each producer's own dequantizer giving the expected bytes, plus 8-row bands of real Qwen GPTQ and AWQ and RedHatAI
+w4a16 checkpoints read by HTTP range. A case with `pack` holds the codes and zeros its producer packed: TensorFS's
+`pack` reproduces its parts bit for bit (`tests/format_pack.rs`).
+
+`bnb` is mined by `mine/bnb.py` from bitsandbytes 0.50.2's CPU backend: Linear4bit and Linear8bitLt state dicts, and
+bitsandbytes' own dequantize as the expected bytes, plus rows of unsloth's and lllyasviel's nf4 checkpoints read by HTTP
+range at pinned revisions. bitsandbytes' fallback for an odd last extent reads FP4 code 8 as +0 where its kernels (and
+the spec) read −0; the odd-extent FP4 cases hold no code 8.

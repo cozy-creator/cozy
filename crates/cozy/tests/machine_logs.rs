@@ -1,6 +1,6 @@
 //! `cozy machine logs` through the real binary, a real Calcifer and a real TensorD
-//! (COZY_TEST_TENSORD) added by address. A model download writes the machine's TensorFS
-//! transport log; reading and following it needs no Hub. Elsewhere it skips.
+//! (COZY_TEST_TENSORD) added by address. A model download writes its line to the machine's
+//! TensorFS transport log; reading and following it needs no Hub. Elsewhere it skips.
 #![cfg(unix)]
 mod common;
 
@@ -53,11 +53,14 @@ fn a_machines_logs_read_and_follow_what_it_did() {
     ]);
     assert_eq!(out.code, 0, "{out:?}");
     let read = lines(&home.cozy(["machine", "logs", "m1", "tensorfs", "-n", "0", "--json"]));
-    assert!(
-        read.iter()
-            .any(|l| l["text"].as_str().unwrap().contains(" walk ")),
-        "{read:?}"
-    );
+    // One line says what the download did: its source, manifest, objects, bytes and time.
+    let said = |l: &Value| {
+        let text = l["text"].as_str().unwrap();
+        [" import ", TINY, "manifest=sha256:", "objects=", "bytes=", "downloaded=", "seconds="]
+            .iter()
+            .all(|part| text.contains(part))
+    };
+    assert!(read.iter().any(said), "{read:?}");
     assert!(
         read.iter()
             .all(|l| l["machine"] == "m1" && l["log"] == "tensorfs")
@@ -126,7 +129,7 @@ fn a_machines_logs_read_and_follow_what_it_did() {
         "m1",
     ]);
     assert_eq!(out.code, 0, "{out:?}");
-    until(" walk ");
+    until("hf://hf-internal-testing/tiny-random-bert@");
     let logs = machine.root().join("var/lib/tensorfs/logs");
     let write = |text: &str| {
         use std::io::Write as _;

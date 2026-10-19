@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -184,3 +185,38 @@ def test_a_wheel_tagged_for_another_platform_stands_and_a_missed_requirement_ref
     check = subprocess.run(["uv", "pip", "check", "--python", str(python)], capture_output=True, text=True)
     assert "The package `nvidia-cusparselt-cu12` was built for a different platform" in check.stdout + check.stderr
     assert conflicts(python) == {"The package `conflicted-app` requires `numpy==1.0.0`, but `2.0.0` is installed"}
+
+
+def pypi_pair(directory: Path) -> list[Path]:
+    """PyPI's newest Runtime and the TensorFS it accepts, wheels for this platform: a machine's pair."""
+    download = ["uvx", "--from", "pip", "pip", "download", "-q", "--no-deps", "--only-binary=:all:", "--python-version", "3.12",
+                "--platform", "manylinux_2_28_x86_64", "--platform", "manylinux_2_17_x86_64", "-d", str(directory)]
+    subprocess.run([*download, "cozy-runtime"], check=True)
+    runtime = next(directory.glob("cozy_runtime-*.whl"))
+    with zipfile.ZipFile(runtime) as archive:
+        metadata = archive.read(next(n for n in archive.namelist() if n.endswith(".dist-info/METADATA"))).decode()
+    accepted = next(line[15:].split(";")[0].replace(" ", "") for line in metadata.splitlines()
+                    if re.match(r"Requires-Dist: tensorfs[^A-Za-z0-9._-]", line))
+    subprocess.run([*download, accepted], check=True)
+    return [runtime, next(directory.glob("tensorfs-*.whl"))]
+
+
+def test_a_captured_lock_takes_the_machines_pair_without_fetching_its_own(capture, tmp_path):
+    """The machine's pair is installed once: a captured lock's own Runtime and TensorFS, made
+    unreachable here, are never fetched to be replaced."""
+    root, source, client, _ = capture
+    pair = pypi_pair(tmp_path / "pair")
+    project = tmp_path / "source"
+    shutil.copytree(source, project)
+    lock = (project / "uv.lock").read_text()
+    # Each file keeps its name (uv reads a locked wheel's tags) on a host nothing answers.
+    unreachable = lambda row: re.sub(r'url = "[^"]*/([^"/]+)"', r'url = "https://127.0.0.1:9/\1"', row.group(0))
+    lock = re.sub(r'\[\[package\]\]\nname = "(cozy-runtime|tensorfs)"\n.*?(?=\n\[\[package\]\]|\Z)', unreachable, lock, flags=re.S)
+    (project / "uv.lock").write_text(lock)
+    generation = install_captured(project=project, wheels=[], requirements=None,
+        distribution="tensord-cpu-classifier", release="0.1.0", python_requires=">=3.12", python_version="3.12",
+        generations=tmp_path / "generations", client_wheel=client, python="3.12", sdk=pair)
+    versions = {dependency.name: dependency.version for dependency in generation.dependencies}
+    assert versions["cozy-runtime"] == pair[0].name.split("-")[1]
+    assert versions["tensorfs"] == pair[1].name.split("-")[1]
+    assert_installed(generation)
