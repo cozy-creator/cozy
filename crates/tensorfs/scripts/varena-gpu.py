@@ -22,7 +22,8 @@ from pathlib import Path
 
 import torch
 
-from tensorfs import v2, varena
+import tensorfs
+from tensorfs import varena
 
 LAYERS, DIM, TOKENS = 12, 4096, 8192
 #: blocks of 20 one-MiB params: each block fills its own pack, so it is a region of its own
@@ -30,8 +31,8 @@ BLOCKS, PARAMS = 4, 20
 MiB = 1 << 20
 
 
-def write(root: Path) -> v2.Checkpoint:
-    store = v2.Store(root)
+def write(root: Path) -> tensorfs.Checkpoint:
+    store = tensorfs.Store(root)
     w = store.writer()
     g = torch.Generator().manual_seed(7)
     for i in range(LAYERS):
@@ -42,9 +43,9 @@ def write(root: Path) -> v2.Checkpoint:
     return store.checkpoint(w.commit())
 
 
-def regions(ck: v2.Checkpoint) -> list[list[str]]:
+def regions(ck: tensorfs.Checkpoint) -> list[list[str]]:
     cuts = [f"model/layers.{i}" for i in range(LAYERS)] + [f"blocks/{b}" for b in range(BLOCKS)]
-    return v2.regions(ck, 64 * MiB, cuts)
+    return tensorfs.regions(ck, 64 * MiB, cuts)
 
 
 def views(pin: varena.Pinned, parts: list[varena.Part]) -> dict[str, torch.Tensor]:
@@ -60,7 +61,7 @@ def by_region(ws: varena.WeightSet) -> dict[int, list[varena.Part]]:
     return out
 
 
-def exact(ws: varena.WeightSet, ck: v2.Checkpoint, stream: int) -> int:
+def exact(ws: varena.WeightSet, ck: tensorfs.Checkpoint, stream: int) -> int:
     """Every part of every region, bound, equals the checkpoint's bytes."""
     n = 0
     for r, parts in by_region(ws).items():

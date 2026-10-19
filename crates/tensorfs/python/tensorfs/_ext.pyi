@@ -1,82 +1,255 @@
-"""The compiled extension's Python surface, declared in full (tfs-077).
+"""`tensorfs._ext`, checked against the built extension by `scripts/stub_conform.py`."""
 
-THIS FILE IS THE SEAM'S ONLY COMPILER. `tensorfs` ships `py.typed`, which tells every
-consumer's type checker that what it reads here is true. Until tfs-077 it was not: this
-stub ended in `def __getattr__(name: str) -> Any` and `Store` carried one too, so every
-attribute on the extension typed as `Any`. `Store.prepare_model_source` was then called
-with six arguments against a five-parameter binding and shipped through cozy-runtime's
-strict-mode CI, refusing every model-source preparation on a rented pod (cozy-runtime#296);
-a second signature change on the same method went the same way and was caught only by a
-hand-written frozen-signature table. Both were compile errors that nothing compiled.
-
-There is NO `__getattr__` here and there must never be one. A name absent from this file is
-an attribute error, not an `Any`. `scripts/stub_conform.py` runs against the BUILT
-extension in CI and refuses on a missing name, an extra name, a changed parameter list, a
-changed default, a method declared as a property — and on the reappearance of a
-`__getattr__`, because that one line would make every other check in this file vacuous.
-
-WHAT IS MACHINE-CHECKED: names, arity, parameter names and order, positional-/keyword-only
-kinds, defaults, and callable-vs-property. WHAT IS NOT: the annotations themselves. pyo3
-erases Rust types into `PyObject` and `__text_signature__` carries no annotation to compare
-against, so `hex: str` is a human's assertion. Change a Rust parameter's TYPE without
-changing its name and this file will still say `str` and CI will still be green — which is
-why cozy-runtime keeps a contract test for argument MEANING beside its call sites.
-
-Native input and result records live in `tensorfs.records`. Python names the Rust
-contract without reimplementing validation or changing its dictionary/tuple ABI.
-"""
-
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Buffer, Mapping, Sequence
 from os import PathLike
 from types import ModuleType
-from typing import Literal, Self
-from .records import (
-    CheckoutResult,
-    CheckpointReceipt,
-    DeclarationConfigs,
-    DeclarationFiles,
-    DeclarationSources,
-    DeclarationTargets,
-    DerivedLookup,
-    DerivedReceipt,
-    DerivedWriteEstimate,
-    DispositionResult,
-    FitResult,
-    GCResult,
-    Header,
-    InspectedSource,
-    ManifestRow,
-    ObjectKey,
-    PartReceipt,
-    PutResult,
-    ReadItem,
-    Reader,
-    SourceCheckpointPage,
-    TensorKey,
-    TensorRequirementRow,
-    TreeRoot,
-    WalkObject,
-)
+from typing import Any
+
+from .records import Header as HeaderRecord
+from .records import ReadItem
 
 __version__: str
+STORE_FORMAT: int
+CLAIM_PROTOCOL: int
 
 #: `tensorfs._ext.varena`, typed in full by `varena.pyi` (the `tensorfs.varena` facade).
 varena: ModuleType
-#: `tensorfs._ext.v2`, typed in full by `v2.pyi` (the `tensorfs.v2` facade).
-v2: ModuleType
 
 StrPath = str | PathLike[str]
+#: `org/name[@release]`, `sha256:<hex>`, or a `Manifest`.
+Ref = str | Manifest
 
-#: `ReadLease.bytes` is a property, so inside that class body the name `bytes` is the
-#: property and not the builtin. mypy said so the first time this file was checked.
-_Bytes = bytes
+class Error(Exception):
+    """A TensorFS error. `.code` names its family; `.detail` the cause."""
 
-# --------------------------------------------------------------------------------- typed
-# rows. Only where a caller indexes the result: a TypedDict that drifts from the Rust
-# `set_item` calls is a wrong answer with a type on it, so these are kept to the surfaces
-# a consumer actually reads.
+    code: str
+    detail: str
 
-# ------------------------------------------------------------------------- typed refusals
+class InvalidError(Error):
+    """A document, argument or tensor breaks the format or a grammar (`invalid`)."""
+
+class FormatError(Error):
+    """Another document kind or major version (`format`)."""
+
+class NotFoundError(Error):
+    """No such ref, release, lane, tensor, file or object (`not_found`)."""
+
+class IntegrityError(Error):
+    """Bytes that do not match their digest or length (`integrity`)."""
+
+class UnknownSchemeError(Error):
+    """The tensor's scheme has no decoder here; its parts still read (`unknown_scheme`)."""
+
+class DecodeError(Error):
+    """A known scheme whose parts or params break its definition (`decode`)."""
+
+class StorageError(Error):
+    """The filesystem failed (`io`)."""
+
+class DiskFullError(Error):
+    """The disk or a quota is full (`full`)."""
+
+class NetworkError(Error):
+    """A transfer failed or stalled (`network`)."""
+
+class DeniedError(Error):
+    """Refused: egress policy, credentials, TLS trust or the server (`denied`)."""
+
+class UnsupportedError(Error):
+    """A source or target this build cannot represent (`unsupported`)."""
+
+class Manifest:
+    """A checkpoint's manifest object, and the ref, release and lane naming it when one does."""
+
+    @property
+    def sha256(self) -> str: ...
+    @property
+    def length(self) -> int: ...
+    @property
+    def name(self) -> str | None: ...
+    @property
+    def release(self) -> str | None: ...
+    @property
+    def lane(self) -> str | None: ...
+    def __eq__(self, other: object) -> bool: ...
+    def __hash__(self) -> int: ...
+
+class Part:
+    """One stored part: a plain tensor's data (role `""`) or an encoded tensor's part."""
+
+    @property
+    def dtype(self) -> str: ...
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+    @property
+    def chunk(self) -> int: ...
+    @property
+    def offset(self) -> int: ...
+    @property
+    def length(self) -> int: ...
+
+class Encoding:
+    """A scheme and its complete params; str() is `scheme {key: value, ...}`."""
+
+    @property
+    def scheme(self) -> str: ...
+    @property
+    def params(self) -> dict[str, Any]: ...
+    def __str__(self) -> str: ...
+
+class Info:
+    """A tensor's logical dtype and shape, its encoding (None when plain), its parts."""
+
+    @property
+    def dtype(self) -> str: ...
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+    @property
+    def encoding(self) -> Encoding | None: ...
+    @property
+    def parts(self) -> dict[str, Part]: ...
+
+class Array:
+    """A tensor's bytes on the CPU; `torch.from_dlpack` and `numpy.from_dlpack` view them."""
+
+    @property
+    def dtype(self) -> str: ...
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+    @property
+    def nbytes(self) -> int: ...
+    def tobytes(self) -> bytes: ...
+    def __dlpack__(
+        self,
+        *,
+        stream: object | None = None,
+        max_version: tuple[int, int] | None = None,
+        dl_device: tuple[int, int] | None = None,
+        copy: bool | None = None,
+    ) -> object: ...
+    def __dlpack_device__(self) -> tuple[int, int]: ...
+
+class Checkpoint:
+    """A checkpoint read from a store, or only a header's tensors (`parse`)."""
+
+    @staticmethod
+    def parse(header: bytes) -> Checkpoint:
+        """A `cozytensors/1` header's tensors and metadata, with no store: `read`, `file` and
+        `chunk_paths` refuse (`UnsupportedError`)."""
+    @property
+    def manifest(self) -> Manifest | None:
+        """None for a parsed header."""
+    @property
+    def chunks(self) -> list[tuple[str, int]]:
+        """The header's chunk objects in order: `(sha256, length)` (`Part.chunk` indexes them)."""
+    @property
+    def chunk_paths(self) -> list[str]:
+        """Each chunk's file in the store, in header order; a parsed header raises."""
+    @property
+    def tensors(self) -> dict[str, dict[str, Info]]:
+        """`tensors[component][key]`."""
+    @property
+    def files(self) -> list[str]: ...
+    @property
+    def metadata(self) -> dict[str, Any]: ...
+    def file(self, path: str) -> bytes: ...
+    def read(self, component: str, key: str) -> Array:
+        """Logical bytes; an encoded tensor goes through the reference decode."""
+
+class Writer:
+    def put(self, component: str, key: str, dtype: str, shape: Sequence[int], data: Buffer) -> None: ...
+    def put_encoded(
+        self,
+        component: str,
+        key: str,
+        dtype: str,
+        shape: Sequence[int],
+        scheme: str,
+        parts: Mapping[str, tuple[str, Sequence[int], Buffer]],
+        params: Mapping[str, Any] | None = None,
+    ) -> None: ...
+    def copy(self, component: str, key: str, source: Checkpoint) -> None: ...
+    def file(self, path: str, data: Buffer) -> None: ...
+    def has(self, component: str, key: str) -> bool: ...
+    def commit(self) -> Manifest: ...
+    def abandon(self) -> None: ...
+
+class Store:
+    def __init__(self, root: StrPath) -> None:
+        """The store at `root` (`~` expands), created when absent."""
+    @property
+    def root(self) -> str: ...
+    def import_(
+        self,
+        src: str | Sequence[str],
+        name: str | None = None,
+        converter: str | None = None,
+        variant: str | None = None,
+    ) -> Manifest:
+        """A file, directory, `hf://`, `civitai://` or URL, refd as `name` (`local/<its name>`)."""
+    def pull(
+        self,
+        ref: str,
+        lane: str | None = None,
+        origin: str | None = None,
+        hub: str | None = None,
+        token: str | None = None,
+    ) -> Manifest:
+        """`org/name[@release]` from Tensorhub (`hub`, else tensorhub.com; `token` reads private
+        checkpoints), or from a static `origin`'s URL or directory."""
+    def checkpoint(self, ref: Ref, lane: str | None = None) -> Checkpoint: ...
+    def writer(self, base: Ref | None = None, key: str | None = None) -> Writer: ...
+    def export(
+        self,
+        ref: Ref,
+        dir: StrPath,
+        safetensors: bool = True,
+        dequantize: str | None = None,
+        *,
+        origin: bool = False,
+        lane: str | None = None,
+    ) -> list[str]:
+        """A Diffusers/Transformers folder, or with `origin=True` the static origin layout."""
+    def gc(self, older_than: float | None = None) -> dict[str, Any]: ...
+
+def regions(
+    ck: Checkpoint, max_bytes: int = ..., boundaries: Sequence[str] | None = None
+) -> list[list[str]]:
+    """`<component>/<key>` regions: chunk-sharing tensors together, up to `max_bytes` each, never
+    across a `<component>/<key prefix>` boundary (a block) unless a shared chunk does."""
+
+# ------------------------------------------------------------------------- the CBOR header
+
+class Closure:
+    """Encoding specs a CBOR header's tensors may cite, by digest."""
+
+    def __init__(self) -> None: ...
+    def insert(self, data: bytes) -> str: ...
+    def digests(self) -> list[str]: ...
+    def __len__(self) -> int: ...
+
+def parse_header(data: bytes, closure: Closure | None = None) -> HeaderRecord:
+    """A CBOR header's plain-data projection; refusals are `tensorfs.errors` classes."""
+
+class ReadPlan:
+    """A CBOR header's read plan, what `tensorfs.varena` registers from until it
+    registers checkpoints."""
+
+    def select(self, whats: Sequence[str]) -> ReadPlan: ...
+    @property
+    def bytes(self) -> int: ...
+    @property
+    def order(self) -> str: ...
+    def items(self) -> list[ReadItem]: ...
+    def __len__(self) -> int: ...
+
+def plan(
+    header: bytes,
+    traversal: Sequence[tuple[str, str]],
+    components: Sequence[str] | None = None,
+    window: int = ...,
+) -> ReadPlan: ...
+
 # `Refusal` is the base of every code in `err::Code`; the subclasses are BUILT IN RUST from
 # that list, and the names below are the frozen Python spelling of it. `code` is a class
 # attribute on each subclass and `detail` is set on the instance.
@@ -219,207 +392,3 @@ class ZeroElement(Refusal): ...
 #: The frozen wire name to its class, for a caller dispatching on the code rather than the
 #: type. Built in Rust from the same list.
 CODES: dict[str, type[Refusal]]
-
-# --------------------------------------------------------------------------------- reads
-
-
-class ReadPlan:
-    def select(self, whats: Sequence[str]) -> ReadPlan: ...
-    @property
-    def bytes(self) -> int: ...
-    @property
-    def order(self) -> str: ...
-    def items(self) -> list[ReadItem]: ...
-    def __len__(self) -> int: ...
-
-class ReadLease:
-    """A verified hold on a closure. Live for as long as the lock the kernel drops on
-    process death, never a wall clock."""
-
-    @property
-    def hold_id(self) -> str: ...
-    @property
-    def manifest(self) -> str: ...
-    @property
-    def bytes(self) -> int: ...
-    @property
-    def objects(self) -> list[tuple[str, int]]: ...
-    @property
-    def live(self) -> bool: ...
-    def release(self) -> None: ...
-    def read_into(
-        self, object: str, object_length: int, off: int, length: int, into: object
-    ) -> None: ...
-    def read_asset(self, header: _Bytes, name: str, max_bytes: int = 67108864) -> _Bytes: ...
-    def read_part_into(
-        self, header: _Bytes, component: str, key: str, role: str, off: int, into: object
-    ) -> None: ...
-    def __enter__(self) -> Self: ...
-    def __exit__(self, *_args: object) -> bool: ...
-
-class Closure:
-    def insert(self, data: bytes) -> str: ...
-    def digests(self) -> list[str]: ...
-    def __len__(self) -> int: ...
-
-# --------------------------------------------------------------------------------- writes
-
-class Operation:
-    """One repository operation's exact CAS holds, released when it commits or is dropped."""
-
-    def hold_manifest(self, identity: str, length: int) -> None: ...
-    def commit_release(
-        self,
-        current: bytes | None,
-        version: str,
-        lane: str,
-        manifest_id: str,
-        manifest_length: int,
-    ) -> bytes: ...
-
-class DerivedWriter:
-    def part_write_bound(self, component: str, key: str, role: str) -> int: ...
-    def config_write_bound(self, name: str) -> int: ...
-    def completed_parts(self) -> list[tuple[str, str, str]]: ...
-    def completed_configs(self) -> list[str]: ...
-    def checkpoint(self, operation_id: str, slot: str, *, previous: ObjectKey | None = None) -> CheckpointReceipt: ...
-    def source_read_into(
-        self, source: str, component: str, key: str, role: str, off: int, into: object
-    ) -> None: ...
-    def add_part(self, component: str, key: str, role: str, reader: Reader) -> PartReceipt: ...
-    def add_config(self, name: str, reader: Reader) -> None: ...
-    def commit(self) -> DerivedReceipt: ...
-    def fence(self) -> bool: ...
-
-# ---------------------------------------------------------------------------------- store
-
-class Store:
-    """A content-addressed store rooted at one directory. Never created implicitly: `open`
-    refuses an absent root, `ensure` creates one, `init` demands a fresh one (tfs-053)."""
-
-    @staticmethod
-    def ensure(root: StrPath | None = None) -> Store: ...
-    @staticmethod
-    def open(root: StrPath | None = None) -> Store: ...
-    @staticmethod
-    def init(root: StrPath | None = None) -> Store: ...
-    @property
-    def root(self) -> str: ...
-    def import_tree(
-        self, owner: str, manifest_bytes: bytes, files: Sequence[tuple[str, StrPath]],
-    ) -> TreeRoot: ...
-
-    # -- content
-    def contains(self, hex: str) -> bool: ...
-    def put_file(
-        self, path: StrPath, expect: str | None = None, expect_length: int | None = None
-    ) -> PutResult: ...
-    def put_manifest(
-        self, data: bytes, expect: str | None = None, expect_length: int | None = None
-    ) -> PutResult: ...
-    def document(self, hex: str, max_bytes: int = ...) -> bytes: ...
-    def manifest(self, hex: str) -> ManifestRow: ...
-    def walk_cozytensors(self, hex: str) -> list[WalkObject]: ...
-    def checkout(self, hex: str, dest: StrPath, symlink: bool = True) -> CheckoutResult: ...
-
-    # -- leases
-    def acquire(self, manifest: str, objects: Sequence[ObjectKey]) -> ReadLease: ...
-    def acquire_manifest(self, hex: str) -> ReadLease: ...
-    def acquire_cozytensors(self, hex: str) -> ReadLease: ...
-
-    # -- repository
-    def begin_operation(self, operation_id: str, org: str, name: str) -> Operation: ...
-    def checkpoint_page(
-        self, head_id: str, head_length: int, *, operation_id: str, slot: str,
-        plan_digest: str, offset: int = 0, limit: int = 128,
-    ) -> SourceCheckpointPage: ...
-
-    # -- derived
-    def inspect_derived_source(
-        self,
-        manifest: str,
-        manifest_length: int,
-        components: Sequence[str],
-        configs: Sequence[str],
-    ) -> InspectedSource: ...
-    def derived_declaration(
-        self, sources: DeclarationSources, targets: DeclarationTargets, configs: DeclarationConfigs,
-        order: Sequence[TensorKey], max_new_bytes: int,
-        files: DeclarationFiles | None = None, *, work_fingerprint: str,
-    ) -> bytes: ...
-    def validate_derived_checkpoint(
-        self, transaction_id: str, declaration: bytes, head_id: str, head_length: int, *,
-        operation_id: str, slot: str, plan_digest: str,
-    ) -> None: ...
-    def begin_derived(
-        self,
-        transaction_id: str,
-        writer_session_id: int,
-        sources: DeclarationSources,
-        targets: DeclarationTargets,
-        configs: DeclarationConfigs,
-        order: Sequence[TensorKey],
-        max_new_bytes: int,
-        files: DeclarationFiles | None = None,
-        *,
-        work_fingerprint: str,
-        checkpoint: ObjectKey | None = None,
-    ) -> DerivedWriter: ...
-    def derived_write_estimate(
-        self,
-        transaction_id: str,
-        writer_session_id: int,
-        sources: DeclarationSources,
-        targets: DeclarationTargets,
-        configs: DeclarationConfigs,
-        order: Sequence[TensorKey],
-        max_new_bytes: int,
-        files: DeclarationFiles | None = None,
-        *,
-        work_fingerprint: str,
-        checkpoint: ObjectKey | None = None,
-    ) -> DerivedWriteEstimate: ...
-    def adopt_derived_checkpoint(
-        self, transaction_id: str, source_transaction_id: str, declaration: bytes,
-        head_id: str, head_length: int, *, operation_id: str, slot: str,
-    ) -> CheckpointReceipt: ...
-    def derived_lookup(self, transaction_id: str) -> DerivedLookup: ...
-    def derived_adopt(self, transaction_id: str, scratch_root_id: str) -> DispositionResult: ...
-    def derived_dispose(self, transaction_id: str) -> DispositionResult: ...
-
-# ------------------------------------------------------------------------ module functions
-
-def object_id(data: bytes) -> str: ...
-def parse_header(data: bytes, closure: Closure | None = None) -> Header: ...
-def seed_digests() -> list[tuple[str, str]]: ...
-def dtypes() -> dict[str, int]: ...
-def manifest_max_bytes() -> int: ...
-
-#: The raw census comparison. `tensorfs.fit` is the typed wrapper and is what callers use.
-def _fit(
-    tensors: Sequence[TensorRequirementRow],
-    header: bytes,
-    *,
-    custody: str,
-    encoded_leaves: bool,
-    device: str | None = None,
-    observations: bytes | None = None,
-) -> FitResult: ...
-def plan(
-    header: bytes,
-    traversal: Sequence[TensorKey],
-    components: Sequence[str] | None = None,
-    window: int = ...,
-) -> ReadPlan: ...
-def gc(root: StrPath) -> GCResult: ...
-
-#: The store, derived-writer and GC bindings are present (False: a plane-only build).
-STORE: bool
-#: The Store contract shared with the `cozy` binary's TensorD (tensorfs-core `contract`).
-STORE_FORMAT: int
-CLAIM_PROTOCOL: int
-
-def serve_fetch(store: Store, fd: int, *, origins: Sequence[Mapping[str, object]], run: int = 0) -> None: ...
-def serve_source(
-    store: Store, fd: int, manifest: str, length: int, *, check_current: Callable[[], object] | None = None
-) -> None: ...

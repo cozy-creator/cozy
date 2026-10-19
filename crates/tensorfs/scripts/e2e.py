@@ -5,8 +5,9 @@
    which Diffusers renders exactly the upstream repo's image (CPU, fixed seed); `tfs export
    --origin`, served by `python -m http.server`, then `tfs pull` into a second store,
    byte-identical; a corrupted object is removed by `tfs verify` and fetched again.
-2. The same through `tensorfs.v2`, plus DLPack reads equal to upstream's own tensors, regions,
+2. The same through `tensorfs`, plus DLPack reads equal to upstream's own tensors, regions,
    the writer (with an encoded tensor) and typed errors.
+3. A parsed header carries the stored checkpoint's tensors, with no store behind it.
 
     e2e.py <workdir>
 """
@@ -26,7 +27,7 @@ import torch
 from diffusers import StableDiffusionXLPipeline
 from huggingface_hub import hf_hub_download
 
-import tensorfs.v2 as tfs
+import tensorfs as tfs
 
 REPO = "hf-internal-testing/tiny-sdxl-pipe"
 NAME = "local/tiny-sdxl"
@@ -182,6 +183,20 @@ def main() -> None:
     except tfs.NotFoundError as e:
         assert e.code == "not_found" and isinstance(e, tfs.Error), e
     assert store.gc()["objects"] == 0
+
+    # 3. A parsed header.
+    parsed = tfs.Checkpoint.parse(ck.file("model.cozytensors"))
+    assert parsed.manifest is None and parsed.chunks == ck.chunks and parsed.files == []
+    for component, tensors in ck.tensors.items():
+        assert list(parsed.tensors[component]) == list(tensors), component
+        for key, info in tensors.items():
+            assert (parsed.tensors[component][key].dtype, parsed.tensors[component][key].shape) == (info.dtype, info.shape)
+    try:
+        parsed.read("unet", "conv_in.weight")
+        raise AssertionError("a parsed header has no chunks")
+    except tfs.UnsupportedError:
+        pass
+    print(f"parse: {sum(len(t) for t in parsed.tensors.values())} tensors, as stored")
     print("e2e: all green")
 
 

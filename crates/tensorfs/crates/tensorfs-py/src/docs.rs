@@ -7,72 +7,10 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tensorfs_core::canon::Value;
-use tensorfs_core::capability::CapabilityRecords;
-use tensorfs_core::dtype::Dtype;
-use tensorfs_core::fit::{Custody, TensorRequirements};
 use tensorfs_core::header::{Closure as CoreClosure, Header};
-use tensorfs_core::ids;
-use tensorfs_core::manifest::Manifest;
-use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 
 use crate::errors::IntoPy;
-
-type TensorRequirementRow = (String, String, Vec<u64>, Option<String>);
-
-/// Compare a request-time meta-device census with a CozyTensors header. Requirements never
-/// become bytes or a digest; the result is the only value crossing this boundary.
-#[pyfunction(name = "_fit")]
-#[pyo3(signature = (tensors, header, *, custody, encoded_leaves, device=None, observations=None))]
-pub fn py_fit<'p>(
-    py: Python<'p>,
-    tensors: Vec<TensorRequirementRow>,
-    header: &[u8],
-    custody: &str,
-    encoded_leaves: bool,
-    device: Option<&str>,
-    observations: Option<&[u8]>,
-) -> PyResult<Bound<'p, PyDict>> {
-    let requirements = TensorRequirements::new(
-        tensors
-            .into_iter()
-            .map(|(component, key, shape, logical_dtype)| {
-                Ok((
-                    component,
-                    key,
-                    shape,
-                    match logical_dtype {
-                        Some(value) => Some(Dtype::parse(&value)?),
-                        None => None,
-                    },
-                ))
-            })
-            .collect::<tensorfs_core::err::Result<Vec<_>>>()
-            .or_refuse(py)?,
-    )
-    .or_refuse(py)?;
-    let header = Header::from_stored(header).or_refuse(py)?;
-    let custody = Custody::parse(custody).or_refuse(py)?;
-    let observed = match observations {
-        Some(bytes) => Some(CapabilityRecords::parse_observed(bytes).or_refuse(py)?),
-        None => None,
-    };
-    let verdict = tensorfs_core::fit::fit(
-        &requirements,
-        &header,
-        custody,
-        encoded_leaves,
-        device,
-        observed.as_ref(),
-    )
-    .or_refuse(py)?;
-    let doc = tensorfs_core::machine::fit_json(&verdict, custody);
-    let value = tensorfs_core::canon::parse_canonical(&doc, tensorfs_core::limits::DOC_MAX_BYTES)
-        .or_refuse(py)?;
-    let out = marshal(py, &value)?.cast_into::<PyDict>()?;
-    out.set_item("ok", verdict.is_ok())?;
-    Ok(out)
-}
 
 /// Canonical `Value` -> plain Python data. The document's shape survives; its Rust types do
 /// not cross, so no Python-side schema knowledge is needed or possible.
@@ -210,12 +148,6 @@ impl PyClosure {
     }
 }
 
-/// `sha256:<hex>` of exactly these bytes — the universal object identity.
-#[pyfunction]
-pub fn object_id(data: &[u8]) -> String {
-    ids::object_id(data)
-}
-
 /// Decode admitted CozyTensorsHeader bytes; return them as plain Python data.
 #[pyfunction]
 #[pyo3(signature = (data, closure=None))]
@@ -229,43 +161,4 @@ pub fn parse_header<'p>(
         h.validate(&c.inner).or_refuse(py)?;
     }
     marshal_header(py, &h)
-}
-
-/// (alias, spec digest) for every seeded encoding. Aliases are display; digests are identity.
-#[pyfunction]
-pub fn seed_digests() -> Vec<(String, String)> {
-    registry::seeds()
-        .into_iter()
-        .map(|s| (s.alias.to_string(), s.spec.object_id()))
-        .collect()
-}
-
-/// The closed dtype enum and its element sizes, exported EXACTLY ONCE. A consumer that
-/// needs `torch.frombuffer` gets its item size from here, never from a table of its own.
-#[pyfunction]
-pub fn dtypes(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
-    let d = PyDict::new(py);
-    for name in [
-        "f64",
-        "f32",
-        "f16",
-        "bf16",
-        "f8_e4m3fn",
-        "f8_e5m2",
-        "i64",
-        "i32",
-        "i16",
-        "i8",
-        "u8",
-        "bool",
-    ] {
-        let dt = Dtype::parse(name).or_refuse(py)?;
-        d.set_item(dt.name(), dt.size())?;
-    }
-    Ok(d)
-}
-
-#[pyfunction]
-pub fn manifest_max_bytes() -> usize {
-    Manifest::MAX_BYTES
 }

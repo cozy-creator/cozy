@@ -70,7 +70,7 @@ Qwen-Image int8, 19.2 GB, window 218 MB:
 
 - Full cold and warm pass on both lanes against fastsafetensors (+18% to +28%).
 - The one failing cell is Qwen's warm window: the plane reads whole regions, 294 MB against the window's
-  218 MB, because `tensorfs.v2.regions` merges neighbouring chunks up to 64 MiB without block boundaries.
+  218 MB, because `tensorfs.regions` merges neighbouring chunks up to 64 MiB without block boundaries.
   Regions cut at the Runtime's blocks read about the window's bytes (the engine reads 227 MB).
 - On this pod's storage the F1 Python reader (`T64`, 16 MiB requests) is the fastest full read; on the 3090
   pod's NVMe 16 MiB requests were the slowest. Request size is a per-disk trade-off; 1 MiB holds up on both.

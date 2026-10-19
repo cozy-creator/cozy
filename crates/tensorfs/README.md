@@ -100,19 +100,14 @@ takes its root as an argument. Nor does a
 writer marker create the root it locks, so no command lays down a skeleton Store in whatever
 directory it happened to be run from.
 
-Python exposes the same resolver. Passing a root remains supported and always wins:
+Python opens a cozytensors/1 store by root, creating it when absent:
 
 ```python
 import tensorfs
 
-store = tensorfs.Store.ensure()
-other = tensorfs.Store.open("/srv/tensorfs")
+store = tensorfs.Store("~/.tensorfs")
+ck = store.checkpoint(store.import_("hf://hf-internal-testing/tiny-sdxl-pipe"))
 ```
-
-`Store.init`/`tfs store init` accept only an absent or exactly empty real directory. Use
-`Store.ensure` for normal startup: it initializes that same narrow case, but requires a nonempty
-root to be a real current Store with a valid `tensorfs.sqlite`. Neither operation follows a root
-or namespace symlink, merges foreign files into a Store, or recognizes an older layout.
 
 ## Disk budget
 
@@ -159,7 +154,7 @@ once they are present; dropping the ticket releases the interest.
   evicted first (least recently used, structure kept) and ticketed or leased ones stay;
   `gc::collect_idle` drops it once unused for its TTL.
 - **Executors** never fetch: TensorD serves each attempt `fetch::serve` over a socket, scoped
-  to its selected manifests, and Runtime calls `tensorfs.fetch.Fetch` (`schedule`, `wait`,
+  to its selected manifests, and Runtime's fetch channel client calls it (`schedule`, `wait`,
   `present`). A derived writer or source channel reading a source held in part waits on a
   ticket with the origin its custody record names.
 - **Failure**: a refused object (hub refusal, wrong bytes, no measured progress) fails the
@@ -231,25 +226,6 @@ the collection performs, so the estimate and the act cannot drift.
 
 The native wheel is `cp312-abi3`, so CPython 3.12 is the floor and every later CPython loads
 the same wheel.
-
-`tensorfs.TensorRequirement(component, key, shape, logical_dtype=None)` describes one row of
-Runtime's request-time `factory(config)` census.
-
-## Fit
-
-`tensorfs.fit(requirements, header, *, custody, encoded_leaves, device=None,
-observations=None)` compares those in-memory rows with one `cozytensors/1` header. There is
-no CLI or document form.
-
-| code | rule |
-| --- | --- |
-| `ok` | routes counted: `verbatim` (plain), `decoded_float`, `encoded_gemm` |
-| `component_missing` | (1) every required component exists; extra components are ignored |
-| `tensor_missing`, `shape_mismatch` | (2) every constructed key exists at the same logical shape |
-| `dtype_mismatch` | (3) an optional logical dtype constraint disagrees |
-| `ok`, with `ignored` | (4) a stored key inside a constructed component absent from the requirements is skipped, never loaded, on every custody: `ignored` lists it, `ignored_bytes` sums what it stores, and `warning` is the one line to show (count, bytes, first keys). `extra_tensor` is no longer answered |
-| `encoding_unsupported` | (5) the package refuses encoded leaves |
-| `encoding_unqualified` | (6) with `--device`, every encoded leaf has a qualification record for that class (plain storage has nothing to qualify) |
 
 TensorFS has no compatibility grade or search plane.
 

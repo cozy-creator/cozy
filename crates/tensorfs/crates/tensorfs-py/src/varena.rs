@@ -8,8 +8,6 @@ use std::ffi::{c_void, CStr};
 use std::fs::File;
 #[cfg(feature = "store")]
 use std::os::fd::BorrowedFd;
-#[cfg(feature = "store")]
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyBufferError, PyException};
@@ -18,18 +16,17 @@ use pyo3::types::PyTuple;
 use pyo3::{create_exception, ffi};
 #[cfg(feature = "store")]
 use tensorfs_core::ids::ObjectRef;
-#[cfg(feature = "store")]
-use varena::io::Source;
-#[cfg(feature = "store")]
-use varena::layout::Layout;
 use varena::memory::{Counters, Part, SetStats};
 use varena::{Error, Gpu, GpuStats, Host, HostPinned, HostSet, Pinned, WeightSet};
 
 use crate::errors::to_py;
+
+/// What varena reads of a `tensorfs.Checkpoint`: its header, and its chunk paths when a store
+/// holds it (a parsed header reads only a grant's files or a sealed layout).
 #[cfg(feature = "store")]
-use crate::readplan::PyPlan;
-#[cfg(feature = "store")]
-use crate::store::{PyLease, PyStore};
+fn ck_of(ck: &crate::store::PyCheckpoint) -> varena::checkpoint::Ck<'_> {
+    varena::checkpoint::Ck { header: &ck.header, paths: ck.stored.as_ref().map(|(c, _)| c.chunk_paths()) }
+}
 
 create_exception!(tensorfs.varena, VarenaError, PyException, "A varena error; `.code` names its class.");
 create_exception!(tensorfs.varena, DeviceFull, VarenaError);
@@ -221,8 +218,8 @@ impl PyGpu {
 
     #[cfg(feature = "store")]
     #[pyo3(signature = (name, ck, regions, host_fd = None, files = None))]
-    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, crate::v2::PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
-        let (gpu, ck, files) = (&self.gpu, &ck.ck, granted(py, files)?);
+    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, crate::store::PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
+        let (gpu, ck, files) = (&self.gpu, ck_of(&ck), granted(py, files)?);
         let ws = py.detach(|| gpu.register(&name, ck, &regions, host_fd, files)).or_raise(py)?;
         Ok(PyWeightSet::new(SetRef::Gpu(ws)))
     }
@@ -259,8 +256,8 @@ impl PyHost {
 
     #[cfg(feature = "store")]
     #[pyo3(signature = (name, ck, regions, host_fd = None, files = None))]
-    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, crate::v2::PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
-        let (ck, files) = (&ck.ck, granted(py, files)?);
+    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, crate::store::PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
+        let (ck, files) = (ck_of(&ck), granted(py, files)?);
         let ws = py.detach(|| Host.register(&name, ck, &regions, host_fd, files)).or_raise(py)?;
         Ok(PyWeightSet::new(SetRef::Host(ws)))
     }
@@ -546,62 +543,15 @@ fn release_tier(py: Python<'_>, hold: i32) -> PyResult<u64> {
     varena::host::release_hold(hold).or_raise(py)
 }
 
-/// Fill a shared CPU layout of a v1 read plan through the verified read path and seal it.
-/// CONSUMES `lease`. Returns the sealed memfd (the caller's) and each read mode's bytes.
-#[cfg(feature = "store")]
-#[pyfunction]
-#[pyo3(signature = (store, lease, plan, regions, name, threads = 8, reserved = None, staged = None))]
-#[allow(clippy::too_many_arguments)]
-fn fill_sealed<'p>(
-    py: Python<'p>,
-    store: PyRef<'_, PyStore>,
-    lease: PyRef<'_, PyLease>,
-    plan: PyRef<'_, PyPlan>,
-    regions: Vec<Vec<String>>,
-    name: String,
-    threads: usize,
-    reserved: Option<i32>,
-    staged: Option<Vec<u32>>,
-) -> PyResult<(i32, Bound<'p, pyo3::types::PyDict>)> {
-    // SAFETY: the caller hands over a descriptor `reserve` returned.
-    let reserved = reserved.map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
-    let lease = lease.take_for_plane(py)?;
-    let (store, meta, p) = (store.store.clone(), store.meta.clone(), &plan.plan);
-    let tally = varena::io::IoTally::default();
-    let fd = py
-        .detach(|| {
-            let layout = Layout::build(p, &regions)?;
-            let source = Source::new(store, meta, lease, true, 0);
-            let (fd, open) = varena::host::open_sealed(&name, &layout, reserved, staged.as_deref())?;
-            open.run(&layout, &source, threads, &tally)?;
-            Ok::<_, varena::Error>(fd)
-        })
-        .or_raise(py)?;
-    let read = |n: &AtomicU64| n.load(Ordering::Relaxed);
-    let facts = pyo3::types::PyDict::new(py);
-    facts.set_item("cached_bytes", read(&tally.cached_bytes))?;
-    facts.set_item("direct_bytes", read(&tally.direct_bytes))?;
-    facts.set_item("buffered_bytes", read(&tally.buffered_bytes))?;
-    facts.set_item("inline_bytes", read(&tally.inline_bytes))?;
-    Ok((std::os::fd::IntoRawFd::into_raw_fd(fd), facts))
-}
-
 /// `regions` of a v2 checkpoint in a sealed host layout, filled in this process from its chunk
 /// files (`files`, else the checkpoint's paths): what `register(host_fd=)` adopts. Returns the
 /// memfd (the caller's).
 #[cfg(feature = "store")]
 #[pyfunction]
 #[pyo3(signature = (ck, regions, name, threads = 8, files = None))]
-fn seal(py: Python<'_>, ck: PyRef<'_, crate::v2::PyCheckpoint>, regions: Vec<Vec<String>>, name: String, threads: usize, files: Option<Vec<(String, u64, i32)>>) -> PyResult<i32> {
-    let (ck, files) = (&ck.ck, granted(py, files)?);
+fn seal(py: Python<'_>, ck: PyRef<'_, crate::store::PyCheckpoint>, regions: Vec<Vec<String>>, name: String, threads: usize, files: Option<Vec<(String, u64, i32)>>) -> PyResult<i32> {
+    let (ck, files) = (ck_of(&ck), granted(py, files)?);
     py.detach(|| varena::memory::seal(ck, &regions, &name, threads, files)).map(std::os::fd::IntoRawFd::into_raw_fd).or_raise(py)
-}
-
-/// A memfd of `nbytes` whose pages are allocated now (`fill_sealed(reserved=)` then copies).
-#[pyfunction]
-#[pyo3(signature = (name, nbytes, threads = 8))]
-fn reserve(py: Python<'_>, name: String, nbytes: u64, threads: usize) -> PyResult<i32> {
-    py.detach(|| varena::host::reserve(&name, nbytes, threads)).map(std::os::fd::IntoRawFd::into_raw_fd).or_raise(py)
 }
 
 // ---------------------------------------------------------------- the module
@@ -625,10 +575,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hold_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
     #[cfg(feature = "store")]
-    m.add_function(wrap_pyfunction!(fill_sealed, &m)?)?;
-    #[cfg(feature = "store")]
     m.add_function(wrap_pyfunction!(seal, &m)?)?;
-    m.add_function(wrap_pyfunction!(reserve, &m)?)?;
     add_errors!(m; VarenaError, DeviceFull, CudaError, CudaUnavailable, Invalid, IoError, Closed, Unsupported);
     parent.add_submodule(&m)?;
     py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.varena", &m)
