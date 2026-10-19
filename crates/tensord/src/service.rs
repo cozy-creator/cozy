@@ -51,6 +51,9 @@ pub struct Service {
     /// previous incarnation's followers.
     started_ticks: u64,
     queue: Mutex<crate::queue::Queue>,
+    /// While it holds (an update activating), no new root run starts: queued runs are journaled
+    /// and start after the restart.
+    held: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 /// Held while one preparation runs; the machine is not idle meanwhile.
 pub struct Preparing(Arc<Service>);
@@ -125,6 +128,7 @@ impl Service {
             preparing: std::sync::atomic::AtomicUsize::new(0),
             started_ticks,
             queue: Default::default(),
+            held: Default::default(),
         });
         service.engine.reconcile()?;
         service.reclaim();
@@ -340,6 +344,14 @@ impl Service {
                 && self.engine.nonterminal(1)?.is_empty(),
         )
     }
+    /// Nothing a restart would lose: no run started, no preparation in flight, and nothing waiting
+    /// that could not prepare again. An update waits for this; queued runs run after it.
+    pub fn settled(&self) -> io::Result<bool> {
+        Ok(self.preparing.load(std::sync::atomic::Ordering::Acquire) == 0 && !self.engine.unsettled()?)
+    }
+    pub fn hold_while(&self, held: impl Fn() -> bool + Send + Sync + 'static) {
+        let _ = self.held.set(Box::new(held));
+    }
     pub fn preparing(self: &Arc<Self>) -> Preparing {
         self.preparing
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -471,15 +483,17 @@ impl Service {
         // A run whose plan cannot be read is its own model; its offer reports why.
         let model = |r: &Execution| self.plan(&pool, r).map_or_else(|_| r.id.clone(), |plan| plan.construction);
         let ready = self.queue.lock().unwrap().order(self.engine.ready()?, model);
-        let mut place = 0;
+        let (mut place, held) = (0, self.held.get().is_some_and(|held| held()));
         for record in ready {
             let invocation = &record.invocation;
             let full = room == 0 && (invocation.degree == 0 || claims.iter().all(Option::is_some));
-            if !(full || invocation.degree > 0 && gpu_fenced) && self.offer(&pool, &record, &mut claims, calls.clone())? {
+            let root = invocation.parent.is_empty();
+            if !(full || held && root || invocation.degree > 0 && gpu_fenced) && self.offer(&pool, &record, &mut claims, calls.clone())? {
                 room -= usize::from(invocation.degree == 0);
-            } else if invocation.parent.is_empty() {
+            } else if root {
                 place += 1;
-                let shown = self.engine.waiting(&record.id, Some(format!("position {place} in the queue")));
+                let after = if held { ", after the machine's update" } else { "" };
+                let shown = self.engine.waiting(&record.id, Some(format!("position {place} in the queue{after}")));
                 shown.unwrap_or_else(|error| tracing::warn!("run {}: its place was not shown: {error}", record.id));
             }
         }
