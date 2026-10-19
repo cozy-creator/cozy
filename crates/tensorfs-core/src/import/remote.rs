@@ -697,7 +697,14 @@ pub fn select(
         }
         None => Box::new(|_: &str| true),
     };
-    let members = listing
+    let gguf = |m: &Member| m.path.to_ascii_lowercase().ends_with(".gguf") && keep(&m.path);
+    let ggufs: Vec<Member> = listing
+        .members
+        .iter()
+        .filter(|m| gguf(m))
+        .cloned()
+        .collect();
+    let mut members: Vec<Member> = listing
         .members
         .into_iter()
         .filter(|m| match files {
@@ -706,6 +713,21 @@ pub fn select(
             Files::Configs => config(&m.path) && keep(&m.path),
         })
         .collect();
+    // A GGUF is the model only where no safetensors are, and then it must be the only one: a
+    // GGUF repository holds one file per quantization.
+    if !members.iter().any(|m| m.path.ends_with(".safetensors")) {
+        match ggufs.as_slice() {
+            [] => {}
+            [one] => members.push(one.clone()),
+            many => {
+                let names: Vec<&str> = many.iter().map(|m| m.path.as_str()).collect();
+                return refuse(
+                    Code::AMBIGUOUS_CLASSIFICATION,
+                    format!("{} GGUF files; name one: {}", many.len(), names.join(", ")),
+                );
+            }
+        }
+    }
     Ok(one_variant(members, variant))
 }
 

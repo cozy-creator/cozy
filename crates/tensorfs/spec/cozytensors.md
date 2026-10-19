@@ -155,7 +155,7 @@ the logical tensor; no decode depends on anything outside the header, its chunks
 
 **Names** are `family.variant` in lowercase, in the words of the ecosystem that made the format: generic scaled
 formats are `element.granularity` (`fp8.tensorwise`, `int8.rowwise`, `fp8.blockwise`), a producer's own format
-is `producer.type` with the producer's type name verbatim (later `gguf.q4_k`, `gptq.int4`, `bnb.nf4`), and a
+is `producer.type` with the producer's type name verbatim (`gguf.q4_k`; later `gptq.int4`, `bnb.nf4`), and a
 vendor-neutral standard keeps its bare name (`mxfp4`, `mxfp8`, `nvfp4`).
 
 **Params** are snake_case keys in the producer's vocabulary (`axis`, `block_size`, `rotation`, `rotation_size`,
@@ -365,7 +365,49 @@ Every producer seen writes these bytes, the even element in the low nibble and t
 `weight` and `weight_scale` (`pack_method: reorder`), MLX's `weight` (`U32` words, little-endian) and `scales`, and
 DeepSeek-V4's FP4 experts (`weight` `I8`, `scale`).
 
-<!-- gguf.* -->
+### `gguf.*`
+
+ggml's block types as llama.cpp writes them in a GGUF (`ggml-common.h`, and `dequantize_row_*` in `ggml-quants.c`,
+llama.cpp `ff5a233`): one scheme per type, named `gguf.<type>` with ggml's type name in lowercase. ggml's plain types
+(`f32`, `f16`, `bf16`, `i8`…`i64`, `f64`) are plain tensors.
+- Params: `block_size`: the type's `n` below.
+- Parts: `blocks`: `U8`, the type's structs of `S` bytes, as block structs `[lead…, C/n, S]` when `n` divides the last
+  extent `C`, else `[N/n, S]` for a tensor of `N` elements (ComfyUI-GGUF stores a tensor whose last extent is not
+  whole blocks reshaped). Either way struct `k` holds elements `k·n … k·n + n − 1` of the tensor in row-major order.
+  `gguf.nvfp4` adds `scale` and `input_scale` (optional, `F32`, one element each): ggml's `<name>.scale` and
+  `<name>.input_scale` tensors.
+- Decode, any shape whose element count is a multiple of `n`: element `t` of a struct is `round_L(v)`, with `v` below
+  evaluated in f32 in ggml's own order, as written. `d`, `m` and `dmin` are the struct's `F16` fields, `lo(x) = x & 15`,
+  `hi(x) = x >> 4`, `bit(x, k) = (x >> k) & 1`, and `K` is Appendix A.2.
+
+| Type | `n` | `S` | Fields (byte offset) | `v` for element `t` |
+|---|---|---|---|---|
+| `q4_0` | 32 | 18 | `d`@0, `qs[16]`@2 | `(q − 8) × d`, `q = lo(qs[t])` for `t < 16`, else `hi(qs[t − 16])` |
+| `q4_1` | 32 | 20 | `d`@0, `m`@2, `qs[16]`@4 | `q × d + m`, `q` as `q4_0` |
+| `q5_0` | 32 | 22 | `d`@0, `qh` U32@2, `qs[16]`@6 | `(q − 16) × d`, `q` = `q4_0`'s nibble `+ 16·bit(qh, t)` |
+| `q5_1` | 32 | 24 | `d`@0, `m`@2, `qh` U32@4, `qs[16]`@8 | `q × d + m`, `q` as `q5_0` |
+| `q8_0` | 32 | 34 | `d`@0, `qs` I8[32]@2 | `qs[t] × d` |
+| `q2_k` | 256 | 84 | `scales[16]`@0, `qs[64]`@16, `d`@80, `dmin`@82 | `(d × lo(c)) × q − dmin × hi(c)`, `c = scales[b]`, `q = (qs[32h + 16·(b mod 2) + l] >> 2j) & 3` |
+| `q3_k` | 256 | 110 | `hmask[32]`@0, `qs[64]`@32, `scales[12]`@96, `d`@108 | `(d × (c − 32)) × (q − 4 + 4·bit(hmask[16·(b mod 2) + l], ⌊t/32⌋))`, `q` as `q2_k`, `c = lo4 + 16·((scales[8 + b mod 4] >> 2·⌊b/4⌋) & 3)` with `lo4 = lo(scales[b])` for `b < 8`, else `hi(scales[b − 8])` |
+| `q4_k` | 256 | 144 | `d`@0, `dmin`@2, `scales[12]`@4, `qs[128]`@16 | `(d × c) × q − dmin × e`, `q = lo` (`t mod 64 < 32`) or `hi` of `qs[32·⌊t/64⌋ + t mod 32]`, `(c, e)` the 6-bit pair `a` below |
+| `q5_k` | 256 | 176 | `d`@0, `dmin`@2, `scales[12]`@4, `qh[32]`@16, `qs[128]`@48 | as `q4_k` with `q + 16·bit(qh[t mod 32], a)` |
+| `q6_k` | 256 | 210 | `ql[128]`@0, `qh[64]`@128, `scales` I8[16]@192, `d`@208 | `(d × scales[8h + ⌊l/16⌋ + 2j]) × (q − 32)`, `q = lo` (`j` even) or `hi` of `ql[64h + 32·(j mod 2) + l]`, `+ 16·((qh[32h + l] >> 2j) & 3)` |
+| `mxfp4` | 32 | 17 | `e` U8@0, `qs[16]`@1 | `K[q] × 2^(e − 128)`, `q` as `q4_0`; every `e` is a power of two (no NaN) |
+| `nvfp4` | 64 | 36 | `d[4]` UE4M3@0, `qs[32]`@4 | `K[q] × (UE4M3(d[s]) × 0.5)`, `s = ⌊t/16⌋`, `q = lo` (`t mod 16 < 8`) or `hi` of `qs[8s + t mod 8]`; then `× scale` when present |
+| `q1_0` | 128 | 18 | `d`@0, `qs[16]`@2 | `d` if `bit(qs[⌊t/8⌋], t mod 8)`, else `−d` |
+| `q2_0` | 64 | 18 | `d`@0, `qs[16]`@2 | `(q − 1) × d`, `q = (qs[⌊t/4⌋] >> 2·(t mod 4)) & 3` |
+
+In the k-types, `b = ⌊t/16⌋` (`q2_k`, `q3_k`) is the sub-block, `h = ⌊t/128⌋`, `j = ⌊(t mod 128)/32⌋`, and
+`l = t mod 16` (`q2_k`, `q3_k`) or `t mod 32` (`q6_k`). `q4_k` and `q5_k` take sub-block
+`a = ⌊t/32⌋`'s scale `c` and min `e` from `scales` (ggml's `get_scale_min_k4`): for `a < 4`, `c = scales[a] & 63`,
+`e = scales[a + 4] & 63`; else `c = lo(scales[a + 4]) + 16·(scales[a − 4] >> 6)`, `e = hi(scales[a + 4]) +
+16·(scales[a] >> 6)`.
+
+Every product of a code with a scale is exact in f32 (`q6_k`'s second product aside), so only the add or subtract of
+`q4_1`, `q5_1`, `q2_k`, `q4_k` and `q5_k`, `q6_k`'s second product and `nvfp4`'s `scale` round; a build of ggml that
+fuses multiply-adds agrees. ggml's own encoder for each type is its `quantize_row_<type>_ref`; TensorFS's is a port,
+bit-exact with it.
+
 
 <!-- gptq.*, awq.*, ct.* -->
 
@@ -423,8 +465,8 @@ reader that needs only some components MAY fetch only the chunks their locations
 - A change that alters the meaning of an existing field, scheme or param is a new major.
 
 Minors: 1.1 adds `nvfp4`'s `pre_quant_scale` and a `scale_2` per matrix, and tiles each matrix of a stack on its own
-in `cublas_128x4` (before any stacked file was written); the schemes `fp8.blockwise` and `mxfp4`; and the `tiles`
-grid and transposed storage.
+in `cublas_128x4` (before any stacked file was written); the schemes `fp8.blockwise`, `mxfp4` and `gguf.*`; and the
+`tiles` grid and transposed storage.
 
 ## 9. Encoding
 
@@ -500,7 +542,16 @@ of its little-endian bytes in that dtype, and a reader MAY check its copy agains
  [-1,  1,  1,  1]]
 ```
 
-<!-- gguf tables -->
+### A.2 `K` (`gguf.mxfp4`, `gguf.nvfp4`)
+
+ggml's `kvalues_fp4`: E2M1's values doubled, by code.
+
+`I8 [16]`, SHA-256 `adf76b672d47eb7fc0afd4db132d548d59d3190aa0ad118fdbf569d5fd478f97`:
+
+```
+[0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12]
+```
+
 
 <!-- bnb tables -->
 

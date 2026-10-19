@@ -27,6 +27,7 @@ const USAGE: &str = "usage: tfs [--store <dir>] [--json] <verb> ...
       checkpoints), or from a static origin's URL or directory
   export <ref> <dir> --safetensors [--dequantize bf16|f16|f32]
   export <ref> <dir> --origin
+  export <ref> <dir> --gguf      every GGUF the checkpoint was imported from, rebuilt
   inspect <ref>
   verify [<ref>]
   gc [--older-than <7d|12h|30m|90s>]
@@ -42,6 +43,7 @@ const SWITCHES: &[&str] = &[
     "json",
     "safetensors",
     "origin",
+    "gguf",
     "plain",
     "no-configs",
     "dry-run",
@@ -287,13 +289,15 @@ fn run(args: &Args) -> Done {
             let files = match (
                 args.on("safetensors"),
                 args.on("origin"),
+                args.on("gguf"),
                 args.get("dequantize"),
             ) {
-                (true, false, dequantize) => {
+                (true, false, false, dequantize) => {
                     let dtype = dequantize.map(|d| Dtype::parse(&d.to_ascii_uppercase()));
                     export::safetensors(&store.checkpoint(&n.manifest)?, dir, dtype.as_ref())?
                 }
-                (false, true, None) => client::export_origin(&store, &n, dir)?,
+                (false, true, false, None) => client::export_origin(&store, &n, dir)?,
+                (false, false, true, None) => export::gguf(&store.checkpoint(&n.manifest)?, dir)?,
                 _ => return Ok(None),
             };
             let human = format!(

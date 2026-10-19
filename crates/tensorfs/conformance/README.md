@@ -14,7 +14,7 @@ For anyone implementing [cozytensors/1](../spec/cozytensors.md).
 | `vectors/{green,red}/{manifest,repo}-*.json` | Manifests and repos to accept or refuse. |
 | `reader.py` | An independent reader and header encoder (Python, numpy, cbor2); its decoders are `schemes/`, one module per family, registered in `schemes/__init__.py`. |
 | `make_vectors.py` | Writes the header vectors from the projections and defects it lists, and checks and normalizes every `cases/<family>.json`. |
-| `mine/` | Producer miners: `mine/cores.py` writes `cores.json`; a family's miner writes its cases. |
+| `mine/` | Producer miners: `mine/cores.py` writes `cores.json`; a family's miner writes its cases (`mine/gguf.py`: ggml's own C, fetched at llama.cpp ff5a233 and built here). |
 
 A conforming implementation:
 - reads the store, verifies every object, and decodes every case to its expected bytes or refuses it with its code;
@@ -60,3 +60,7 @@ gpt-oss's triton_kernels and torchao on CPU, each producer's own dequantize givi
 real checkpoints read by HTTP range at pinned revisions (DeepSeek-V3.1 and V4, Qwen3, RedHatAI, gpt-oss, AMD Quark,
 MLX, compressed-tensors). A case with `source` holds the `F32` values its producer quantized; TensorFS's encoder
 reproduces its parts bit for bit (`tests/format_encode.rs`).
+
+The `gguf` cases are ggml's own C (`quantize_row_<type>_ref`, `dequantize_row_<type>` from llama.cpp ff5a233's
+`ggml-quants.c`, gcc for baseline x86-64 with `-ffp-contract=off`); gguf-py's numpy dequantizers (same commit) agree
+on every F32 case.

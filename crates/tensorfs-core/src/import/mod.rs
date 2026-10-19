@@ -9,9 +9,12 @@
 //!    when its key set is the table's (`engine`). Unclaimed groups are stored as they are.
 //! 4. Convert row by row into the [`Sink`], with the configs and tokenizers (the table's
 //!    pinned reference supplies them when the source has none), then delete the tmp area.
+//!
+//! A GGUF file is one component of its own (`gguf`).
 
 pub mod carriers;
 pub mod engine;
+pub mod gguf;
 pub mod order;
 pub mod remote;
 pub mod source;
@@ -128,6 +131,39 @@ fn name(path: &str) -> &str {
     path.rsplit_once('/').map_or(path, |(_, n)| n)
 }
 
+fn is_gguf(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".gguf")
+}
+
+/// Adds the configs, tokenizers and license at the root of the repository a GGUF names as its
+/// source to `files`, in the GGUF's folder `into`, where the source has none; the pinned reference.
+fn gguf_documents(
+    reference: &str,
+    into: &str,
+    req: &Request,
+    area: &Path,
+    files: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<String> {
+    let listing = remote::list(&remote::parse(reference)?, req.access)?;
+    let pin = listing.pinned.clone();
+    let read = |m: &remote::Member| remote::read_small(m, req.access);
+    let docs: Vec<remote::Member> = remote::select(listing, None, remote::Files::Configs, &read)?
+        .into_iter()
+        .filter(|m| !remote::weights(&m.path) && folder(&m.path).is_empty())
+        .collect();
+    let area = area.join("gguf-reference");
+    for (path, local) in land(&docs, &area, req.access, req.progress)? {
+        let bytes = std::fs::read(&local)
+            .map_err(|e| crate::err::classify_io(format!("read {path}"), e))?;
+        let path = match into {
+            "" => path,
+            f => format!("{f}/{path}"),
+        };
+        files.entry(path).or_insert(bytes);
+    }
+    Ok(pin)
+}
+
 /// The model's files: every non-weight file of the source, byte-exact at its path, except a
 /// converted folder's `config.json` (the foreign layout's); each table's reference (its index,
 /// the produced components' configs and the asset folders); the tables' inline files.
@@ -157,7 +193,7 @@ fn documents(
     let mut files = BTreeMap::new();
     for p in &set.plain {
         let foreign = converted.contains(&folder(&p.path)) && name(&p.path) == "config.json";
-        if !raw.contains(&p.file) && !foreign {
+        if !raw.contains(&p.file) && !foreign && !is_gguf(&p.path) {
             files.insert(p.path.clone(), set.read_plain(p)?);
         }
     }
@@ -249,17 +285,39 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     });
     let normalized = recognized.unclaimed.is_empty() || canonical;
 
-    let identity = |g: &source::Group| {
-        let shared = set.groups.iter().filter(|o| o.folder == g.folder).count() > 1;
-        match (g.folder.as_str(), shared) {
+    let ggufs: Vec<&source::Plain> = set.plain.iter().filter(|p| is_gguf(&p.path)).collect();
+    let component = |f: &str, stem: &str| {
+        let groups = set.groups.iter().filter(|o| o.folder == f).count();
+        let shared = groups + ggufs.iter().filter(|p| folder(&p.path) == f).count() > 1;
+        match (f, shared) {
             ("", false) => "model".to_string(),
-            ("", true) => g.stem.clone(),
+            ("", true) => stem.to_owned(),
             (f, false) => f.to_string(),
-            (f, true) => format!("{f}/{}", g.stem),
+            (f, true) => format!("{f}/{stem}"),
         }
     };
+    let identity = |g: &source::Group| component(&g.folder, &g.stem);
     let planned = engine::plan(&set, tables, &recognized, &identity)?;
-    let files = documents(&set, &recognized, &planned, req, &area)?;
+    let mut files = documents(&set, &recognized, &planned, req, &area)?;
+    let (mut converters, mut normalized) = (converters, normalized);
+    let mut ggufs_planned = Vec::new();
+    for p in &ggufs {
+        let file = name(&p.path);
+        let component = component(folder(&p.path), &file[..file.len() - ".gguf".len()]);
+        let local = &set.files[p.file];
+        let opened = File::open(local)
+            .map_err(|e| crate::err::classify_io(format!("open {}", local.display()), e))?;
+        let plan = gguf::plan(&gguf::read(&opened)?, &component)?;
+        normalized &= plan.normalized;
+        converters.extend(plan.arch.as_ref().map(|a| format!("gguf.{a}")));
+        let record = serde_json::to_vec(&plan.meta).expect("the record serializes");
+        files.insert(format!("{}.json", p.path), record);
+        if let Some(reference) = &plan.reference {
+            let into = folder(&p.path);
+            pinned.push(gguf_documents(reference, into, req, &area, &mut files)?);
+        }
+        ggufs_planned.push((p.file, component, plan));
+    }
     let opened: Vec<File> = set
         .files
         .iter()
@@ -267,7 +325,8 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
             File::open(f).map_err(|e| crate::err::classify_io(format!("open {}", f.display()), e))
         })
         .collect::<Result<_>>()?;
-    let total = planned.len() as u64;
+    let gguf_tensors: usize = ggufs_planned.iter().map(|(_, _, p)| p.tensors.len()).sum();
+    let total = (planned.len() + gguf_tensors) as u64;
     for (n, p) in planned.iter().enumerate() {
         stopped(req)?;
         progress("converting", n as u64, total);
@@ -293,6 +352,24 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
             p.encoding.as_ref(),
             parts,
         )?;
+    }
+    for (file, component, plan) in &ggufs_planned {
+        for o in &plan.tensors {
+            stopped(req)?;
+            let mut readers: Vec<gguf::Ranges> = (o.parts.iter())
+                .map(|part| gguf::Ranges::new(&opened[*file], &part.ranges))
+                .collect();
+            let parts = (o.parts.iter().zip(&mut readers))
+                .map(|(part, reader)| Part {
+                    role: part.role,
+                    dtype: &part.dtype,
+                    shape: &part.shape,
+                    data: reader,
+                })
+                .collect();
+            let encoding = o.encoding.as_ref();
+            sink.put(component, &o.key, &o.dtype, &o.shape, encoding, parts)?;
+        }
     }
     for (path, bytes) in &files {
         sink.file(path, bytes)?;
