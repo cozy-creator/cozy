@@ -37,6 +37,6 @@ cozy-runtime's decoders reproduce them bit for bit, except `fp8.tensorwise` at `
 to the logical dtype first, the spec never rounds a stored scale, so those expected bytes are the spec's decode of the
 mined parts (within one step of ComfyUI's). The ComfyUI-layout `nvfp4` and `mxfp8` cases and the expert stacks
 hold the same values as their mined twins in the other nibble order, scale tiling or shape. The other cases
-(per-column scales, `F8_E5M2` weights, `BF16`/`F16` tensorwise scales, `int8.tensorwise`, `int8.rowwise`, a ragged `mxfp8` block, a divided global
+(per-column scales, `F8_E5M2` weights, `BF16`/`F16` tensorwise, rowwise and convrot scales, `int8.tensorwise`, `int8.rowwise`, a ragged `mxfp8` block, a divided global
 scale, rounding of 3,072 f32 patterns to BF16/F16, plain and unknown dtypes, refusals) were computed exactly from the
 spec's formulas.

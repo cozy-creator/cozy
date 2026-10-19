@@ -93,19 +93,22 @@ impl Encoding {
         encoding("fp8.tensorwise", &[("scale_dtype", scale.name().into())])
     }
     /// `axis` 0: a scale per row; 1: per column.
-    pub fn fp8_rowwise(axis: u64) -> Encoding {
-        encoding("fp8.rowwise", &[("axis", axis.into())])
+    pub fn fp8_rowwise(axis: u64, scale: &Dtype) -> Encoding {
+        let p = [("axis", axis.into()), ("scale_dtype", scale.name().into())];
+        encoding("fp8.rowwise", &p)
     }
     pub fn int8_tensorwise(scale: &Dtype) -> Encoding {
         encoding("int8.tensorwise", &[("scale_dtype", scale.name().into())])
     }
-    pub fn int8_rowwise(axis: u64) -> Encoding {
-        encoding("int8.rowwise", &[("axis", axis.into())])
+    pub fn int8_rowwise(axis: u64, scale: &Dtype) -> Encoding {
+        let p = [("axis", axis.into()), ("scale_dtype", scale.name().into())];
+        encoding("int8.rowwise", &p)
     }
-    pub fn int8_convrot(rotation_size: u64) -> Encoding {
+    pub fn int8_convrot(rotation_size: u64, scale: &Dtype) -> Encoding {
         let p = [
             ("rotation", "hadamard".into()),
             ("rotation_size", rotation_size.into()),
+            ("scale_dtype", scale.name().into()),
         ];
         encoding("int8.convrot", &p)
     }
@@ -140,8 +143,12 @@ pub fn decode(
         "fp8.tensorwise" | "int8.tensorwise" => {
             (&["scale", "weight"], &["input_scale"], &["scale_dtype"])
         }
-        "fp8.rowwise" | "int8.rowwise" => (&["scale", "weight"], &[], &["axis"]),
-        "int8.convrot" => (&["scale", "weight"], &[], &["rotation", "rotation_size"]),
+        "fp8.rowwise" | "int8.rowwise" => (&["scale", "weight"], &[], &["axis", "scale_dtype"]),
+        "int8.convrot" => (
+            &["scale", "weight"],
+            &[],
+            &["rotation", "rotation_size", "scale_dtype"],
+        ),
         "mxfp8" => (&["scale", "weight"], &[], &["block_size", "scale_layout"]),
         "nvfp4" => (
             &["scale", "scale_2", "weight"],
@@ -175,6 +182,12 @@ pub fn decode(
     let uint = |key: &str, allowed: &[u64]| match encoding.params.get(key).and_then(Value::as_u64) {
         Some(v) if allowed.contains(&v) => Ok(v as usize),
         _ => Err(fail(format!("param {key} is not one of {allowed:?}"))),
+    };
+    // A free-dtype scale, as the producer stored it; read exactly, never rounded first.
+    let scale_dtype = || match text("scale_dtype", &["F32", "BF16", "F16"])? {
+        "F32" => Ok(F32),
+        "BF16" => Ok(BF16),
+        _ => Ok(F16),
     };
     if !matches!(dtype, F32 | BF16 | F16) {
         return Err(fail(format!(
@@ -239,13 +252,7 @@ pub fn decode(
                 Some(shape),
                 0,
             )?;
-            let scale = match text("scale_dtype", &["F32", "BF16", "F16"])? {
-                "F32" => F32,
-                "BF16" => BF16,
-                _ => F16,
-            };
-            // The scale as stored, exactly: never rounded to the logical dtype first.
-            let s = floats(part("scale", &[scale], None, 1)?)[0];
+            let s = floats(part("scale", &[scale_dtype()?], None, 1)?)[0];
             if parts.contains_key("input_scale") {
                 part("input_scale", &[F32], None, 1)?;
             }
@@ -259,7 +266,12 @@ pub fn decode(
                 0,
             )?;
             let axis = uint("axis", &[0, 1])?;
-            let s = floats(part("scale", &[F32], None, [rows, cols][axis] as u64)?);
+            let s = floats(part(
+                "scale",
+                &[scale_dtype()?],
+                None,
+                [rows, cols][axis] as u64,
+            )?);
             let at = |i: usize| if axis == 0 { i / cols } else { i % cols };
             let w = floats(w);
             w.iter().enumerate().map(|(i, v)| v * s[at(i)]).collect()
@@ -273,7 +285,7 @@ pub fn decode(
                 )));
             }
             let w = part("weight", &[I8], Some(shape), 0)?.bytes;
-            let s = floats(part("scale", &[F32], None, rows as u64)?);
+            let s = floats(part("scale", &[scale_dtype()?], None, rows as u64)?);
             let unit = pow2(-(block.trailing_zeros() as i32 / 2));
             let mut out = Vec::with_capacity(rows * cols);
             for (g, group) in w.chunks(block).enumerate() {

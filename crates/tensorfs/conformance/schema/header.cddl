@@ -14,7 +14,8 @@ encoding   = [scheme: tstr .size (1..), params: {* tstr => value}, * any]
 ; Each distinct [scheme, params] once, in order of first citation. The scheme and its
 ; params define the decode (spec §6): every param the decode reads is required, and a
 ; decoder refuses a param it does not know (params are not later fields), and a param that
-; repeats a part's dtype (scale_dtype) and disagrees with it.
+; repeats a part's dtype and disagrees with it. A scale whose dtype the scheme leaves free
+; (tensorwise, rowwise, convrot) names it in scale_dtype: "F32", "BF16" or "F16".
 
 component  = [name: tstr, tensors: [* tensor], * any]
 ; name is one path segment (non-empty, not "." or "..", no "/", "\" or NUL), unique.

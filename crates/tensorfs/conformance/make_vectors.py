@@ -27,10 +27,10 @@ def digest(label: str) -> dict:
 
 
 ENCODINGS = [
-    ["fp8.rowwise", {"axis": 0}],
+    ["fp8.rowwise", {"axis": 0, "scale_dtype": "F32"}],
     ["fp8.tensorwise", {"scale_dtype": "F32"}],
-    ["int8.convrot", {"rotation": "hadamard", "rotation_size": 256}],
-    ["int8.rowwise", {"axis": 0}],
+    ["int8.convrot", {"rotation": "hadamard", "rotation_size": 256, "scale_dtype": "F32"}],
+    ["int8.rowwise", {"axis": 0, "scale_dtype": "F32"}],
     ["mxfp8", {"block_size": 32, "scale_layout": "row_major"}],
     ["nvfp4", {"block_size": 16, "global_scale": "multiply", "nibble_order": "low_first",
                "scale_layout": "row_major"}],
@@ -220,7 +220,7 @@ def reds() -> dict[str, bytes]:
         "past-chunks": encode(edit((3, 1, 1, 0, 4), [2, 0, 576])),
         "location-short": encode(edit((*NORM, 4), [1, 4096])),
         "encoding-index": encode(edit((*Q, 3), 8)),
-        "encoding-unused": encode(edit((2, 7), ["fp8.rowwise", {"axis": 1}])),
+        "encoding-unused": encode(edit((2, 7), ["fp8.rowwise", {"axis": 1, "scale_dtype": "F32"}])),
         "encoding-repeated": encode(edit((2, 6), ENCODINGS[0])),
         "encoding-first-use": encode(edit((*Q, 3), 2)),
         "scheme-empty": encode(edit((2, 0, 0), "")),

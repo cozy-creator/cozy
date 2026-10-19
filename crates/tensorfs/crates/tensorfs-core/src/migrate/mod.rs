@@ -661,9 +661,9 @@ fn digest(p: &v1::Part, b: &[u8]) -> String {
 /// The scheme's complete encoding.
 fn encoding(scheme: &str) -> Encoding {
     match scheme {
-        "fp8.rowwise" => Encoding::fp8_rowwise(0),
+        "fp8.rowwise" => Encoding::fp8_rowwise(0, &Dtype::F32),
         "fp8.tensorwise" => Encoding::fp8_tensorwise(&Dtype::F32),
-        "int8.convrot" => Encoding::int8_convrot(256),
+        "int8.convrot" => Encoding::int8_convrot(256, &Dtype::F32),
         // v1's nvfp4 is ModelOpt's layout: its border never took ComfyUI's.
         "nvfp4" => Encoding::nvfp4(GlobalScale::Multiply, NibbleOrder::LowFirst, ScaleLayout::RowMajor),
         other => unreachable!("v1 maps to no {other}"),

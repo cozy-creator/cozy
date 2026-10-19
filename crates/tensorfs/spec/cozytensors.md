@@ -155,8 +155,9 @@ vendor-neutral standard keeps its bare name (`mxfp8`, `nvfp4`; later `mxfp4`).
 
 **Params** are snake_case keys in the producer's vocabulary (`axis`, `block_size`, `rotation`, `rotation_size`,
 `global_scale`, `nibble_order`, `scale_layout`, `scale_dtype`). Every param the decode reads is required and none has a
-default, so the encoding shows the whole recipe. Where a param repeats a part's dtype (`scale_dtype`), a reader MUST
-refuse a mismatch.
+default, so the encoding shows the whole recipe. A scale whose dtype the scheme leaves free carries `scale_dtype`:
+`F32`, `BF16` or `F16`, as the producer stored it (the fixed scales of `mxfp8` and `nvfp4` do not). Where a param
+repeats a part's dtype (`scale_dtype`), a reader MUST refuse a mismatch.
 
 **Four rules** bring any format in without new grammar:
 1. *Keep the producer's bytes.* Parts are the producer's packed bytes (int words, nibbles, block structs, swizzled
@@ -195,11 +196,11 @@ enters a decode. It applies as `global_scale` says for `nvfp4`, and multiplies e
 
 | Scheme | Params | Parts | Decode |
 |---|---|---|---|
-| `fp8.tensorwise` | `scale_dtype`: `F32`, `BF16` or `F16`, as the producer stored it | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `scale_dtype`, one element. `input_scale`. | `round_L(weight × scale)` |
-| `int8.tensorwise` | `scale_dtype`, as above | `weight`: `I8`, the logical shape. `scale`: `scale_dtype`, one element. `input_scale`. | `round_L(weight × scale)` |
-| `fp8.rowwise` | `axis`: `0` or `1` | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F32`, `R` elements (`axis: 0`) or `C` (`axis: 1`), any shape. | `round_L(weight[i, j] × scale[axis = 0 ? i : j])` |
-| `int8.rowwise` | `axis`: `0` or `1` | `weight`: `I8`, the logical shape. `scale` as `fp8.rowwise`. | as `fp8.rowwise` |
-| `int8.convrot` | `rotation: "hadamard"`, `rotation_size: B` | `weight`: `I8`, the logical shape. `scale`: `F32`, `R` elements. | below |
+| `fp8.tensorwise` | `scale_dtype` | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `scale_dtype`, one element. `input_scale`. | `round_L(weight × scale)` |
+| `int8.tensorwise` | `scale_dtype` | `weight`: `I8`, the logical shape. `scale`: `scale_dtype`, one element. `input_scale`. | `round_L(weight × scale)` |
+| `fp8.rowwise` | `axis`: `0` or `1`; `scale_dtype` | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `scale_dtype`, `R` elements (`axis: 0`) or `C` (`axis: 1`), any shape. | `round_L(weight[i, j] × scale[axis = 0 ? i : j])` |
+| `int8.rowwise` | `axis`; `scale_dtype` | `weight`: `I8`, the logical shape. `scale` as `fp8.rowwise`. | as `fp8.rowwise` |
+| `int8.convrot` | `rotation: "hadamard"`, `rotation_size: B`; `scale_dtype` | `weight`: `I8`, the logical shape. `scale`: `scale_dtype`, `R` elements. | below |
 | `mxfp8` | `block_size: 32`, `scale_layout` | `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F8_E8M0`, `⌈C/32⌉` per row (below). | `round_L(weight[i, j] × scale(i, ⌊j/32⌋))` |
 | `nvfp4` | `block_size: 16`, `global_scale`, `nibble_order`, `scale_layout` | `weight`: `F4`, the logical shape, `C` a multiple of 16. `scale`: `F8_E4M3`, `C/16` per row. `scale_2`: `F32`, one element. `input_scale`. | `multiply`: `round_L((weight[i, j] × scale(i, ⌊j/16⌋)) × scale_2)`; `divide`: `round_L(weight[i, j] × (scale(i, ⌊j/16⌋) ÷ scale_2))` |
 
