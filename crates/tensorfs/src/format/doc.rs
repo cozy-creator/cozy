@@ -270,6 +270,13 @@ impl Header {
                         header.check(&rooms, loc, &t.dtype, &t.shape, || format!("{name}/{key}"))?
                     }
                     Body::Encoded { encoding, parts } => {
+                        // The logical size is a format constraint, even for an unknown scheme.
+                        if t.dtype.bits().is_some() && t.dtype.byte_len(&t.shape).is_none() {
+                            return invalid(format!(
+                                "{name}/{key}: {} {:?} overflows or is not whole bytes",
+                                t.dtype, t.shape
+                            ));
+                        }
                         if encoding.scheme.is_empty() || parts.is_empty() {
                             return invalid(format!("{name}/{key}: no scheme or no parts"));
                         }
