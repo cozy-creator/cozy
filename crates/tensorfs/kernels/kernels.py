@@ -53,7 +53,7 @@ def _grid(i, j, index, params, valid):
     elif kind == 3:
         width = (cols + size - 1) // size
         if tl.load(params + 20):
-            block = tl.load(index + j, mask=valid, other=0)
+            block = tl.load(index + j, mask=valid, other=0).to(tl.uint64)
         else:
             block = j // size
         if layout == 0:
@@ -78,7 +78,7 @@ def _unpack(words, slots, e, params, valid):
     rows, cols = tl.load(params + 1), tl.load(params + 2)
     i, j = e // cols, e % cols
     if tl.load(params + 7):
-        i, j, rows, cols = e * 0, e, 1, rows * cols
+        i, j, rows, cols = e * 0, e, rows * 0 + 1, rows * cols
     return _code(words, slots, i, j, rows, cols, tl.load(params + 16),
                  tl.load(params + 15).to(tl.int32), valid,
                  tl.load(params + 8), tl.load(params + 9), tl.load(params + 10),
@@ -99,6 +99,7 @@ def _value(q, e, scale, term, table, factor, post, index, error, params, valid):
     at = _grid(i, j, index, params, valid)
     s = tl.load(scale + at, mask=valid, other=0.0)
     mode = tl.load(params + 25)
+    g = tl.full(s.shape, 1.0, tl.float32)
     if mode:
         g_at = tl.where(tl.load(params + 26) == 1, 0, i // height)
         g = tl.load(factor + g_at, mask=valid, other=1.0)
