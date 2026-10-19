@@ -532,12 +532,23 @@ pub struct Progress {
     pub stage_fraction: Option<f64>,
 }
 
-/// One revision of an output: a single output is replaced by each, a list output grows. Its bytes
-/// are `GET /v1/runs/{id}/outputs/{output}`.
+/// A checkpoint stored by Runtime. `revision` names its immutable TensorFS tree.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct CheckpointRef {
+    pub repo_id: String,
+    pub revision: String,
+    pub variant: String,
+}
+
+/// One revision of an output: a single output is replaced by each, a list output grows. Byte
+/// outputs use `GET /v1/runs/{id}/outputs/{output}`; checkpoints are immutable references.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct Product {
     pub output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CheckpointRef>,
     /// A list item's 1-based index; 0 for a single output.
     pub index: u32,
     pub rev: u64,

@@ -424,6 +424,7 @@ impl Log {
                     .map(|before| before.iter().map(|(_, length)| length).sum());
                 let converted = v1::Product {
                     output: product.output,
+                    checkpoint: product.checkpoint,
                     index,
                     rev: *rev,
                     length: content.length,
