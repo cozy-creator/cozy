@@ -276,6 +276,15 @@ impl Source {
         Ok(bytes)
     }
 
+    /// An object's file, unread: its bytes were checked when the old store admitted it.
+    pub fn file(&self, object: &ObjectRef) -> Result<fs::File> {
+        let found = self.find(&object.sha256).filter(|_| self.has(object));
+        let Some(path) = found else {
+            return fail(Kind::NotFound, format!("v1 object {} is not in {}", object.sha256, self.root.display()));
+        };
+        fs::File::open(&path).or_else(|e| fail(Kind::Io, format!("{}: {e}", path.display())))
+    }
+
     /// A manifest named by its digest alone.
     pub fn manifest_ref(&self, sha256: &str) -> Result<ObjectRef> {
         match self.find(sha256).and_then(|p| fs::metadata(p).ok()) {
@@ -388,6 +397,20 @@ fn object(doc: &Json) -> Result<ObjectRef> {
             .and_then(Json::as_u64)
             .map_or_else(|| bad("v1 ref has no length"), Ok)?,
     })
+}
+
+/// Every object a checkpoint names besides its manifest: header, files, asset segments, parts.
+pub fn objects(m: &Manifest, h: &Header) -> Vec<ObjectRef> {
+    let mut out: Vec<ObjectRef> = m.header.iter().chain(m.files.iter().map(|f| &f.1)).cloned().collect();
+    out.extend(h.assets.iter().flat_map(|a| a.segments.iter().cloned()));
+    for p in h.components.iter().flat_map(|c| &c.1).flat_map(|t| &t.parts) {
+        if let Body::Objects(objects) = &p.body {
+            out.extend(objects.iter().cloned());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// `{"entries": [{"path", "kind", "blob"}]}`: the header entry and ordinary files.

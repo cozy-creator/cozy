@@ -26,6 +26,10 @@ on:
         description: Targeted test command, run with bash at the ref in a delegated cgroup; empty runs none
         type: string
         default: ''
+      tensord_features:
+        description: "Cargo features of the tensord build: migrate is a dev build (xs-045 U12), never a release"
+        type: string
+        default: ''
       runtime_ref:
         description: cozy-runtime branch, tag or SHA whose wheel tests get as COZY_TEST_RUNTIME_WHEEL; empty for the newest published
         type: string
@@ -91,7 +95,7 @@ jobs:
         if: contains(inputs.build, 'tensord')
         run: |
           rm -rf target/manylinux/rustup
-          CARGO_BUILD_JOBS=$(nproc) task -d crates/tensord release OUT="$PWD/dist/tensord"
+          CARGO_BUILD_JOBS=$(nproc) task -d crates/tensord release OUT="$PWD/dist/tensord" FEATURES="${{ inputs.tensord_features }}"
           rm -rf target/manylinux/rustup
       - if: contains(inputs.build, 'tensord')
         uses: actions/upload-artifact@v4
