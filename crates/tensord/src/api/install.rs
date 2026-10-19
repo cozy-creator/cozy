@@ -169,7 +169,7 @@ pub fn prepare_uploaded(
     if let Some(requirements) = &materialized.requirements {
         command.arg("--requirements").arg(requirements);
     }
-    publish(config, command, stop)
+    publish(config, command, stop, None)
 }
 
 /// A live project installed editable in `environment`, which is built when it is not there
@@ -185,6 +185,10 @@ pub fn prepare_editable(
     source_digest: &str,
     stop: Option<&Stop>,
 ) -> Result<PreparedGeneration, Error> {
+    // A machine killed mid-install leaves its helper building here (its own process group
+    // outlives it): that helper ends before another builds the same environment.
+    let claim = environment.with_extension("installer");
+    end_stale(&claim).map_err(storage)?;
     let mut command = installer(config, root)?;
     command.arg("--project").arg(project).arg("--editable-environment").arg(environment);
     command.arg("--source-digest").arg(source_digest);
@@ -194,7 +198,25 @@ pub fn prepare_editable(
     for wheel in wheels {
         command.arg("--wheel").arg(wheel);
     }
-    publish(config, command, stop)
+    publish(config, command, stop, Some(&claim))
+}
+
+/// Who builds at a claim: the helper, and the machine that started it.
+type Claim = (platform::process::Birth, platform::process::Birth);
+
+/// Ends the helper an earlier machine left building at `claim`, once its exit is seen.
+fn end_stale(claim: &Path) -> std::io::Result<()> {
+    let recorded = fs::read(claim).ok().and_then(|bytes| serde_json::from_slice::<Claim>(&bytes).ok());
+    if let Some((helper, _)) = recorded.filter(|(_, machine)| platform::process::Birth::own().ok().as_ref() != Some(machine)) {
+        if let Some(exact) = platform::process::Exact::open(&helper)? {
+            exact.kill()?;
+            exact.wait()?;
+        }
+    }
+    match fs::remove_file(claim) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
 }
 
 /// The trusted helper's command for one package: this machine's interpreter, SDK pair,
@@ -261,13 +283,18 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Error>
 /// Run the helper to its exit and hold the generation it published. Its process group ends
 /// with its run's cancel (`stop`), or when it stops moving past its measured patience
 /// (`process::supervise`); a long install that moves is never killed.
-fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&Stop>) -> Result<PreparedGeneration, Error> {
+fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&Stop>, claim: Option<&Path>) -> Result<PreparedGeneration, Error> {
     let mut child = platform::process::own_group(&mut command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(storage)?;
+    if let Some(claim) = claim {
+        let births = platform::process::Birth::of(child.id()).and_then(|helper| Ok((helper, platform::process::Birth::own()?)));
+        let claimed: Claim = births.map_err(|error| storage(error.into()))?;
+        fs::write(claim, serde_json::to_vec(&claimed).map_err(std::io::Error::other).map_err(storage)?).map_err(storage)?;
+    }
     let stderr = child.stderr.take().expect("piped installer stderr");
     let tail = std::thread::spawn(move || forward_tail(stderr));
     let mut stdout = child.stdout.take().expect("piped installer stdout");
@@ -279,6 +306,9 @@ fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&Stop>) 
         Ok::<_, std::io::Error>(output)
     });
     let ended = crate::process::supervise(&mut child, stop, "the package installer", &|_| ()).map_err(storage)?;
+    if let Some(claim) = claim {
+        let _ = fs::remove_file(claim);
+    }
     let output = output.join().map_err(|_| Error::internal("internal", "installer output reader panicked"))?.map_err(storage)?;
     let exited = match ended {
         crate::process::Supervised::Exited(status) => status,
@@ -448,7 +478,7 @@ mod tests {
         let mut helper = std::process::Command::new("sh");
         helper.args(["-c", r#"echo '{"kind":"install_failed","code":"package_dependency_operation_failed","detail":"uv pip install"}'
             i=0; while [ $i -lt 40 ]; do echo "  uv line $i https://user:tok@hub.example/simple" >&2; i=$((i+1)); done; exit 1"#]);
-        let refused = super::publish(&config, helper, None).err().expect("the helper failed");
+        let refused = super::publish(&config, helper, None, None).err().expect("the helper failed");
         let message = &refused.message;
         assert!(message.starts_with("package_dependency_operation_failed: uv pip install:\nuv line 0 "), "{message}");
         assert!(message.ends_with("uv line 39 https://***@hub.example/simple") && message.lines().count() == 41, "{message}");
