@@ -344,7 +344,11 @@ impl PyStore {
 
     #[pyo3(signature = (path, variant = None))]
     fn open_path(&self, py: Python<'_>, path: PathBuf, variant: Option<String>) -> PyResult<PyCheckpoint> {
-        let ck = py.detach(|| Checkpoint::folder(&path, variant.as_deref(), Some(&self.store))).or_raise(py)?;
+        let ck = py.detach(|| -> Result<_, Failure> {
+            let ck = Checkpoint::folder(&path, variant.as_deref(), Some(&self.store))?;
+            let _ = self.store.cache_maintain(0)?;
+            Ok(ck)
+        }).or_raise(py)?;
         Ok(PyCheckpoint::new(ck.header().clone(), Some(ck), None))
     }
 
