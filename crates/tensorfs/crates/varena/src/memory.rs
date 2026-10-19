@@ -41,7 +41,6 @@ macro_rules! call {
     };
 }
 
-
 struct Ev {
     raw: CUevent,
     timing: bool,
@@ -133,7 +132,6 @@ fn passed(events: &mut Vec<EvRef>) -> Result<bool> {
     });
     err.map_or(Ok(events.is_empty()), Err)
 }
-
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Counters {
@@ -233,7 +231,6 @@ fn parts(header: &Header, layout: &Layout) -> Vec<Part> {
     layout.parts.iter().filter_map(part).collect()
 }
 
-
 /// One region's copy: pending, then enqueued (`Ok`: its landing event) or failed with nothing in flight.
 struct Fill {
     state: Mutex<Option<Result<EvRef>>>,
@@ -293,15 +290,8 @@ struct Staging {
 }
 
 impl Staging {
-    fn take(&self) -> Result<Buf> {
-        let mut buf = self.cv.wait_while(self.free.lock().unwrap(), |f| f.is_empty()).unwrap().pop().unwrap();
-        match buf.last.take().map_or(Ok(()), |last| last.sync()) {
-            Ok(()) => Ok(buf),
-            Err(e) => {
-                self.put(buf);
-                Err(e)
-            }
-        }
+    fn take(&self) -> Buf {
+        self.cv.wait_while(self.free.lock().unwrap(), |f| f.is_empty()).unwrap().pop().unwrap()
     }
 
     fn put(&self, buf: Buf) {
@@ -309,7 +299,6 @@ impl Staging {
         self.cv.notify_one();
     }
 }
-
 
 #[derive(Clone, Copy)]
 struct Chunk {
@@ -751,8 +740,9 @@ impl Inner {
     }
 
     fn piece(&self, w: &Weights, r: u32, dst: u64, at: u64, len: u64, host: Option<usize>) -> Result<()> {
-        let mut buf = self.staging.take()?;
+        let mut buf = self.staging.take();
         let res = (|| {
+            buf.last.take().map_or(Ok(()), |last| last.sync())?;
             match host {
                 // SAFETY: `len` bytes inside the region the source keeps mapped; the buffer is ours.
                 Some(p) => unsafe { std::ptr::copy_nonoverlapping((p as *const u8).add(at as usize), buf.ptr, len as usize) },
@@ -963,7 +953,6 @@ impl Drop for Inner {
         unsafe { (d.stream_destroy)(self.copy) };
     }
 }
-
 
 /// One weight set on one GPU. Dropping it waits for its copies and releases, then unmaps it.
 pub struct WeightSet {
@@ -1177,7 +1166,6 @@ impl Drop for Pinned {
     }
 }
 
-
 /// The host-only core, for CPU executors: regions as host bytes, never loading libcuda.
 pub struct Host;
 
@@ -1262,7 +1250,6 @@ pub struct HostPinned {
     /// False for a view of a sealed host layout, mapped read-only.
     pub writable: bool,
 }
-
 
 /// The one layout of `regions` of `ck` and its chunk files: what `register` maps and a sealed
 /// host layout holds, the same by construction.
