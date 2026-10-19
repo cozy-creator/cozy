@@ -280,9 +280,17 @@ def fill_sealed(
     """A v1 read plan's sealed host layout, filled through verified reads; CONSUMES `lease`.
     Returns the memfd and each read mode's bytes."""
 
-def seal(ck: Checkpoint, regions: Sequence[Sequence[str]], name: str, threads: int = 8) -> int:
-    """`regions` of a v2 checkpoint in a sealed host layout, filled from its chunk files. This is
-    the owner's half of `register(host_fd=)`. Returns the memfd (the caller's)."""
+def seal(
+    ck: Checkpoint,
+    regions: Sequence[Sequence[str]],
+    name: str,
+    threads: int = 8,
+    files: Sequence[tuple[str, int, int]] | None = None,
+) -> int:
+    """`regions` of a v2 checkpoint in a sealed host layout, filled in this process from its
+    chunk files (`files`, as in `register`, else the checkpoint's own paths). The result is what
+    `register(host_fd=)` adopts, the same layout by construction; deposit it with TensorD as an
+    opaque fd. Returns the memfd (the caller's)."""
 
 def reserve(name: str, nbytes: int, threads: int = 8) -> int:
     """A memfd of `nbytes` whose pages are allocated now. `fill_sealed(reserved=)` consumes it."""

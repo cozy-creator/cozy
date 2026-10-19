@@ -107,7 +107,7 @@ fn a_v2_checkpoint_binds_from_the_chunk_files_a_grant_hands_over_and_no_others()
 fn a_v2_checkpoint_binds_on_the_host_exactly_from_a_sealed_layout() {
     let fx = Fixture::new("sealed");
     let rs = regions(fx.ck.header(), 64 << 20, &[]);
-    let fd = memory::seal(&fx.ck, &rs, "ck", 2).unwrap();
+    let fd = memory::seal(&fx.ck, &rs, "ck", 2, None).unwrap();
     let ws = Host.register("ck", &fx.ck, &rs, Some(fd.as_raw_fd()), None).unwrap();
     check(&ws);
     assert!(!ws.bind(0).unwrap().writable, "views of the machine's layout are read-only");

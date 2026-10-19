@@ -1434,11 +1434,12 @@ pub fn open_checkpoint(ck: &Checkpoint, regions: &[Vec<String>], direct_io: bool
     Ok((Layout::build(&plan, regions)?, Source::files(files, direct_io, 0)))
 }
 
-/// The owner's half (TensorD's): `regions` of `ck` in a sealed host layout, filled from the
-/// chunk files, for `Gpu::register(host_fd=)`.
+/// `regions` of `ck` in a sealed host layout, filled in this process from the chunk files
+/// (`files`, else the checkpoint's paths): the memfd `register(host_fd=)` adopts, the same
+/// layout by construction.
 #[cfg(feature = "store")]
-pub fn seal(ck: &Checkpoint, regions: &[Vec<String>], name: &str, threads: usize) -> Result<OwnedFd> {
-    let (layout, source) = open_checkpoint(ck, regions, true, None)?;
+pub fn seal(ck: &Checkpoint, regions: &[Vec<String>], name: &str, threads: usize, files: Option<Vec<(ObjectRef, File)>>) -> Result<OwnedFd> {
+    let (layout, source) = open_checkpoint(ck, regions, true, files)?;
     crate::host::fill_sealed(name, &layout, &source, threads, &IoTally::default(), None)
 }
 
