@@ -132,7 +132,7 @@ def main() -> int:
     block = model.blocks[0].nbytes
 
     def stats(name: str) -> object:
-        return next(s for s in mem.stats(False).models if s.name == name)
+        return next(s for s in mem.stats().models if s.name == name)
 
     # cold, then warm: one request, two passes
     with torch.no_grad(), mem.request("cold-warm") as r:
