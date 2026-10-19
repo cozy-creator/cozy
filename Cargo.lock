@@ -4217,6 +4217,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "libloading 0.9.0",
  "minicbor",
  "platform",
  "rcgen",

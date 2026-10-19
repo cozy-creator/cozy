@@ -3,6 +3,7 @@
 //! this the crate's one unsafe seam outside `platform`.
 #![allow(unsafe_code)]
 
+pub mod cuda;
 mod host;
 mod plan;
 mod probe;
