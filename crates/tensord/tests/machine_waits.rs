@@ -225,21 +225,6 @@ async fn a_restart_keeps_the_queue_and_prepares_an_interrupted_run_again() {
     assert_eq!((q.2.status.as_str(), p.2.status.as_str()), ("succeeded", "succeeded"), "{q:?} {p:?}");
 }
 
-/// The machine's own `distribution` wheel (its executors' pair), found under `dir`.
-fn held_wheel(dir: &Path, distribution: &str) -> Option<(String, Vec<u8>)> {
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let (path, name) = (entry.path(), entry.file_name().to_string_lossy().into_owned());
-        if path.is_dir() && !path.is_symlink() {
-            if let Some(found) = held_wheel(&path, distribution) {
-                return Some(found);
-            }
-        } else if name.starts_with(&format!("{distribution}-")) && name.ends_with(".whl") {
-            return Some((name, std::fs::read(&path).unwrap()));
-        }
-    }
-    None
-}
-
 /// Update `id` (`spec`) followed across the service's restart to its outcome.
 async fn update(client: &Client, id: &str, spec: v1::RunSpec) -> Vec<v1::RunEvent> {
     client.submit(&v1::RunRequest { id: id.into(), spec }).await.unwrap();
@@ -268,30 +253,20 @@ async fn an_update_waits_only_for_started_runs_and_queued_ones_run_after_it() {
     let manifest = tree(&client, "").await;
     client.submit(&v1::RunRequest { id: "w".into(), spec: spec(&manifest, "", "") }).await.unwrap();
     assert_eq!(follow(&client, "w").await.2.status, "succeeded");
-    // The machine's own pair, its Runtime rebuilt (an archive comment): the update installs it
-    // and restarts the service.
-    let held = |distribution| held_wheel(home.path(), distribution).unwrap_or_else(|| panic!("no {distribution} wheel"));
-    let ((runtime, runtime_bytes), (tensorfs, tensorfs_bytes)) = (held("cozy_runtime"), held("tensorfs"));
-    let mut rebuilt = zip::ZipWriter::new_append(std::io::Cursor::new(runtime_bytes)).unwrap();
-    rebuilt.set_comment("xs-047");
-    let runtime_bytes = rebuilt.finish().unwrap().into_inner();
-    let bulk = client.bulk().unwrap();
-    let mut inputs = vec![];
-    for (field, bytes) in [("runtime", runtime_bytes), ("tensorfs", tensorfs_bytes)] {
-        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&bytes));
-        let length = bytes.len() as u64;
-        bulk.put(&digest, (0, length, length), bytes).await.unwrap();
-        inputs.push(v1::InputFile { field: field.into(), digest, ..Default::default() });
-    }
-    let payload = serde_json::json!({"runtime": runtime, "tensorfs": tensorfs}).to_string();
-    let rebuild = v1::RunSpec { kind: v1::RunKind::Update, payload: v1::Json::parse(payload).ok(), inputs, ..Default::default() };
+    // The published pair its runs execute on: this machine holds no pair of its own yet, so the
+    // update installs it and restarts the service.
+    client.submit(&v1::RunRequest { id: "n".into(), spec: spec(&manifest, "nap", r#"{"seconds":0.0}"#) }).await.unwrap();
+    let ran = follow(&client, "n").await.2;
+    let measured: serde_json::Value = serde_json::from_str(ran.measurements.as_ref().unwrap().get()).unwrap();
+    let pair = serde_json::json!({"runtime": measured["software"]["runtime"], "tensorfs": measured["software"]["tensorfs"]});
+    let install = v1::RunSpec { kind: v1::RunKind::Update, payload: v1::Json::parse(pair.to_string()).ok(), ..Default::default() };
 
     // c runs and q waits in line when the update asks to activate: it waits for c alone.
     client.submit(&v1::RunRequest { id: "c".into(), spec: spec(&manifest, "nap", r#"{"seconds":30.0}"#) }).await.unwrap();
     until(&client, "c", |state| state.state == "running").await;
     client.submit(&v1::RunRequest { id: "q".into(), spec: spec(&manifest, "nap", r#"{"seconds":0.0}"#) }).await.unwrap();
     until(&client, "q", place).await;
-    let log = update(&client, "up", rebuild).await;
+    let log = update(&client, "up", install).await;
     let installing = log.iter().find_map(|e| match &e.event {
         v1::Event::Progress(p) if p.stage == "installing" => Some(e.at_ms),
         _ => None,
