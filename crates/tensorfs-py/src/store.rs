@@ -650,7 +650,6 @@ pub struct PyCheckpoint {
     header: Header,
     stored: Option<Checkpoint>,
     named: Option<Named>,
-    tensors: OnceLock<Py<PyDict>>,
     components: OnceLock<Py<PyDict>>,
     remote: Option<Remote>,
 }
@@ -802,7 +801,7 @@ pub(crate) struct FetchTensor<'a> {
 
 impl PyCheckpoint {
     fn new(header: Header, stored: Option<Checkpoint>, named: Option<Named>) -> PyCheckpoint {
-        PyCheckpoint { header, stored, named, tensors: OnceLock::new(), components: OnceLock::new(), remote: None }
+        PyCheckpoint { header, stored, named, components: OnceLock::new(), remote: None }
     }
 
     pub(crate) fn fetch_components(&self, py: Python<'_>, components: Option<&[String]>, priority: u64) -> PyResult<()> {
@@ -997,56 +996,13 @@ impl PyCheckpoint {
         self.fetch_components(py, components.as_deref(), priority)
     }
 
-    /// `tensors[component][key] -> Info`.
-    #[getter]
-    fn tensors(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        if let Some(t) = self.tensors.get() {
-            return Ok(t.clone_ref(py));
-        }
-        let out = PyDict::new(py);
-        for c in self.header.components() {
-            out.set_item(&c.name, self.tensor_dict(py, c)?)?;
-        }
-        Ok(self.tensors.get_or_init(|| out.unbind()).clone_ref(py))
-    }
-
     /// The header's loading metadata (`source`, `filled`, `safetensors_metadata`).
     #[getter]
     fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         metadata(py, &self.header.metadata)
     }
 
-    /// A tensor's logical bytes on the CPU, as a DLPack-able `Array`; an encoded tensor goes
-    /// through the reference decode.
-    fn read(&self, py: Python<'_>, component: String, key: String) -> PyResult<PyArray> {
-        self.fetch_components(py, Some(std::slice::from_ref(&component)), 0)?;
-        let ck = self.stored(py)?;
-        let t = ck.tensor(&component, &key).or_raise(py)?;
-        let length = match &t.body {
-            Body::Data(at) => at.length,
-            Body::Encoded { .. } => t.dtype.byte_len(&t.shape).ok_or_else(|| {
-                raise(
-                    py,
-                    Failure {
-                        kind: Kind::Unsupported,
-                        detail: format!("{component}/{key}: no size for {} {:?}", t.dtype, t.shape),
-                    },
-                )
-            })?,
-        };
-        let (dtype, shape) = (t.dtype.clone(), t.shape.clone());
-        let mut buf = Aligned::new(length as usize);
-        let bytes = py.detach(|| ck.read(&component, &key)).or_raise(py)?;
-        if bytes.len() != buf.len {
-            return Err(invalid(py, format!("{component}/{key}: {} bytes, not {}", bytes.len(), buf.len)));
-        }
-        buf.bytes_mut().copy_from_slice(&bytes);
-        Ok(PyArray {
-            buf: Arc::new(buf),
-            dtype,
-            shape,
-        })
-    }
+
 }
 
 /// Groups `ck`'s tensors into `<component>/<key>` regions for a weight plane: tensors sharing a

@@ -22,27 +22,27 @@ class HostReads(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.tmp = tempfile.TemporaryDirectory()
-        cls.store = tfs.Store(pathlib.Path(cls.tmp.name) / "store")
-        writer = cls.store.writer()
-        component = writer.component("model", cls="test.Model")
+        cls.cache = pathlib.Path(cls.tmp.name) / "store"
+        writer = tfs.Writer(cache_dir=cls.cache)
+        component = writer.component("model", cls="test.Model", config={})
         cls.plain = np.arange(12, dtype=np.float32).reshape(3, 4)
-        component.put("plain", "F32", cls.plain.shape, cls.plain)
-        component.put("empty", "U8", [0], b"")
+        component.put("plain", cls.plain)
+        component.put("empty", b"", dtype="U8", shape=[0])
         cls.big = np.arange((64 << 20) + 257, dtype=np.uint8)
-        component.put("big", "U8", cls.big.shape, cls.big)
+        component.put("big", cls.big)
         component.put_encoded(
-            "quantized", "F32", [2, 16], "fp8.rowwise",
-            {"weight": ("F8_E4M3", [2, 16], bytes([0x38]) * 32),
+            "quantized", dtype="F32", shape=[2, 16], scheme="fp8.rowwise",
+            parts={"weight": ("F8_E4M3", [2, 16], bytes([0x38]) * 32),
              "scale": ("F32", [2], np.array([0.5, 2.0], dtype=np.float32))},
-            {"axis": 0, "scale_dtype": "F32"},
+            params={"axis": 0, "scale_dtype": "F32"},
         )
-        component.put_encoded("unknown", "U8", [4], "test.unknown", {"packed": ("U8", [4], b"test")})
+        component.put_encoded("unknown", dtype="U8", shape=[4], scheme="test.unknown", parts={"packed": ("U8", [4], b"test")}, params={})
         cls.ck = writer.commit()
         cls.tensors = cls.ck.components["model"].tensors
 
     @classmethod
     def tearDownClass(cls) -> None:
-        del cls.tensors, cls.ck, cls.store, cls.big
+        del cls.tensors, cls.ck, cls.cache, cls.big
         cls.tmp.cleanup()
 
     def test_mapping_and_batch_reads(self) -> None:
@@ -50,7 +50,7 @@ class HostReads(unittest.TestCase):
         self.assertIsInstance(tensors, tfs.Tensors)
         self.assertIsInstance(tensors, Mapping)
         self.assertEqual(list(tensors), ["plain", "empty", "big", "quantized", "unknown"])
-        self.assertEqual(tensors.keys(), self.ck.tensors["model"].keys())
+        self.assertEqual(list(tensors.keys()), ["plain", "empty", "big", "quantized", "unknown"])
         self.assertEqual(len(tensors.values()), 5)
         self.assertEqual(len(tensors.items()), 5)
         self.assertEqual(tensors["plain"].shape, (3, 4))
