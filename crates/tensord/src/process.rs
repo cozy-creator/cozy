@@ -2,7 +2,7 @@
 //! (births, exact handles, groups, meters) is `platform::process`. Nothing here kills
 //! because time passed. Callers kill on a measured wedge (`Pace`), an owner restart, or a launch
 //! that never reached authored code.
-use platform::process::{Birth, Exact, State, burn, gone, group_members, meter, read_bytes};
+use platform::process::{Birth, Exact, State, gone, group_members, meter, read_bytes};
 use std::{
     fs::File,
     io,
@@ -22,13 +22,13 @@ pub fn group_outlives(leader: &Birth, before: u64) -> bool {
 /// The leader's meter plus its group members': a follower's imports, fills and collectives
 /// are the executor's work. `None` only when the leader itself is unreadable.
 pub fn group_burn(leader: &Birth) -> Option<u64> {
-    let own = burn(leader.pid)?;
-    Some(
-        group_members(leader)
-            .iter()
-            .filter_map(|member| burn(member.pid))
-            .fold(own, u64::saturating_add),
-    )
+    group_meter(leader).map(|(cpu, moved)| cpu.saturating_add(moved))
+}
+
+/// `meter` (CPU ns, bytes moved) summed over the leader and its group members.
+fn group_meter(leader: &Birth) -> Option<(u64, u64)> {
+    let sum = |(cpu, moved): (u64, u64), (c, m): (u64, u64)| (cpu.saturating_add(c), moved.saturating_add(m));
+    Some(group_members(leader).iter().filter_map(|member| meter(member.pid)).fold(meter(leader.pid)?, sum))
 }
 
 /// Sampling resolution and noise floor of the wedge rule (Runtime `liveness.py`). A sample
@@ -135,12 +135,6 @@ pub enum Meter {
 /// nothing.
 pub type Activity = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
-/// The bytes the leader and its group members moved (`meter`'s second part).
-fn group_moved(leader: &Birth) -> Option<u64> {
-    let moved = |pid| meter(pid).map(|(_, moved)| moved);
-    Some(group_members(leader).iter().filter_map(|member| moved(member.pid)).fold(moved(leader.pid)?, u64::saturating_add))
-}
-
 /// A measured wedge's verdict, as the error of the command it ended.
 #[derive(Debug)]
 pub struct Wedged(pub String);
@@ -182,6 +176,8 @@ impl Watch {
             Meter::Frames | Meter::Work => Pace::seeded(worst_gap),
             Meter::Burn => Pace::default(),
         };
+        // A GPU call's samples whose group CPU ran above one core, and its last CPU reading.
+        let (mut cores, mut last_cpu) = (0, None);
         let mut state = self.state.lock().unwrap();
         while !state.done {
             let now = Instant::now();
@@ -204,8 +200,16 @@ impl Watch {
             let reading = match self.meter {
                 Meter::Burn => group_burn(exact.birth()),
                 Meter::Frames => Some(state.frames),
-                Meter::Work => self.activity.as_ref().and_then(|activity| activity())
-                    .map(|gpu| gpu + state.frames + group_moved(exact.birth()).unwrap_or(0)),
+                Meter::Work => self.activity.as_ref().and_then(|activity| activity()).map(|gpu| {
+                    let (cpu, moved) = group_meter(exact.birth()).unwrap_or_default();
+                    // CPU on more than one core is work (1.5 cores leaves room for sampling skew):
+                    // real CPU phases (torch intra-op, ffmpeg, BLAS) run many threads, a spin one,
+                    // and a missed kill beats killing a real run.
+                    if let Some((before, at)) = last_cpu.replace((cpu, now)) {
+                        cores += u64::from(u128::from(cpu.saturating_sub(before)) * 2 > (now - at).as_nanos() * 3);
+                    }
+                    gpu + state.frames + moved + cores
+                }),
             };
             pace.observe(reading, now);
             let unread = self.meter == Meter::Work && reading.is_none();
@@ -519,13 +523,13 @@ mod tests {
         assert!(group_members(&birth).is_empty());
     }
 
-    /// A GPU call is judged while it runs on its work, never its CPU: one spinning with no
-    /// frames, no bytes and idle GPUs is killed (runs 11818, 11822); one that moves bytes or
-    /// whose GPUs work is not, nor one whose GPUs cannot be read.
+    /// A GPU call is judged while it runs on its work: one spinning on one core with no frames,
+    /// no bytes and idle GPUs is killed (runs 11818, 11822); one that moves bytes, whose GPUs
+    /// work, whose GPUs cannot be read or that runs on more than one core is not.
     #[cfg(unix)]
     #[test]
     fn a_gpu_call_spinning_without_work_is_killed_and_working_ones_are_not() {
-        let cases: [(&str, &str, Option<Activity>, bool); 4] = [
+        let cases: [(&str, &str, Option<Activity>, bool); 5] = [
             ("spins", "while :; do :; done", Some(Arc::new(|| Some(0))), true),
             ("moves bytes", "while :; do echo work; done > /dev/null", Some(Arc::new(|| Some(0))), false),
             ("GPU works", "while :; do :; done", {
@@ -533,6 +537,7 @@ mod tests {
                 Some(Arc::new(move || Some(busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed))))
             }, false),
             ("GPU unread", "while :; do :; done", Some(Arc::new(|| None)), false),
+            ("spins on two cores", "while :; do :; done & while :; do :; done", Some(Arc::new(|| Some(0))), false),
         ];
         for (case, script, activity, killed) in cases {
             let mut child = Command::new("/bin/sh").args(["-c", script]).process_group(0).stdin(Stdio::null()).spawn().unwrap();
