@@ -53,6 +53,8 @@ pub struct Lifecycle {
     epoch: AtomicU64,
     /// When an output read last moved bytes (unix ms).
     transferred: AtomicI64,
+    /// Called when an activation starts or ends without its restart: the runs it holds change.
+    activation_changed: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 /// Holds the release while a call that may queue a job is in flight.
@@ -64,6 +66,7 @@ pub struct Activation(Arc<Lifecycle>);
 impl Drop for Activation {
     fn drop(&mut self) {
         self.0.state.lock().unwrap().activating = false;
+        self.0.activation_changed();
     }
 }
 impl Drop for Admission {
@@ -100,6 +103,7 @@ impl Lifecycle {
             admissions: AtomicUsize::new(0),
             epoch: AtomicU64::new(0),
             transferred: AtomicI64::new(0),
+            activation_changed: Default::default(),
         });
         lifecycle.save(&lifecycle.state.lock().unwrap().ledger)?;
         Ok(lifecycle)
@@ -166,7 +170,22 @@ impl Lifecycle {
             ));
         }
         state.activating = true;
+        drop(state);
+        self.activation_changed();
         Ok(Activation(self.clone()))
+    }
+
+    /// An update is activating: admission is closed until it exits or fails.
+    pub fn activating(&self) -> bool {
+        self.state.lock().unwrap().activating
+    }
+    pub fn on_activation(&self, changed: impl Fn() + Send + Sync + 'static) {
+        let _ = self.activation_changed.set(Box::new(changed));
+    }
+    fn activation_changed(&self) {
+        if let Some(changed) = self.activation_changed.get() {
+            changed();
+        }
     }
 
     /// The admission epoch, read before the journal is.

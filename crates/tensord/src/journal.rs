@@ -1495,6 +1495,12 @@ impl Journal {
         Ok(())
     }
 
+    /// A run a restart would end: one started, or one waiting with no spec to prepare again from.
+    pub(crate) fn unsettled(&self) -> io::Result<bool> {
+        self.connection.query_row("SELECT EXISTS(SELECT 1 FROM executions WHERE state IN ('starting','running') OR (state='queued'
+            AND json_extract(record,'$.waiting_reason') IS NOT NULL AND id NOT IN (SELECT execution FROM run_specs)))", [], |row| row.get(0)).map_err(db_error)
+    }
+
     /// The preparing runs a restart interrupted, each with its signer and kept spec.
     pub(crate) fn interrupted(&self) -> io::Result<Vec<(String, String, Vec<u8>)>> {
         let mut statement = self.connection.prepare("SELECT id, actor, spec FROM executions JOIN run_specs ON execution=id WHERE state='queued' AND json_extract(record,'$.waiting_reason')=?1 ORDER BY id").map_err(db_error)?;
