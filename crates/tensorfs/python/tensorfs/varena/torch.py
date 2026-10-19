@@ -640,6 +640,9 @@ class Memory:
                 room += sum(_set(m)[0] for m in cold if self._keep(m) < keep)
             sizes = [model.blocks[b].nbytes for b in model.order]
             fits = sum(sizes) <= room
+            if not fits and repeating and cuts.finer(model.track.shape):
+                model.reserve = -1  # cut finer first (rung 3); the next pass measures it
+                return
             want = set(model.order if fits else _spread(model.order, sizes, room - 2 * max(sizes)))
         if self.active:
             want &= model.home
