@@ -24,8 +24,8 @@ GPU handle does not create a CUDA context in TensorD.
 TensorFS `Store::ensure_owned` retains the store claim through live handles and read leases,
 coordinates GC pins and excludes outside collectors. Cooperating ordinary processes can
 still share its store for reads and writes. Its
-[owned-store contract](https://github.com/cozy-creator/tensorfs/blob/master/docs/owned-store.md)
-describes collector compatibility. TensorD retains the node-specific sealed memfd cache, host
+[TensorFS storage guide](../../tensorfs/README.md#storage-and-ownership)
+describes storage and retention. TensorD retains the node-specific sealed memfd cache, host
 tiers, GPU-region custody and peer/process leases. [Recovery](RECOVERY.md) distinguishes
 executor replacement, daemon restart and software activation guarantees.
 
