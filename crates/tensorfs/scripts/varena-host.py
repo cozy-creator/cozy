@@ -47,6 +47,7 @@ def main(root: Path) -> None:
         for _, _, f in grant_fds or ():
             os.close(f)
         assert ws.device is None and len(ws.spans) == len(rs) and len(ws.parts) == len(want)
+        assert ws.kept() == ws.kept_quiescent() == [], "host sets retain no GPU pages"
         for r in range(len(rs)):
             pin = ws.bind(r)
             assert pin.fresh and not ws.bind(r).fresh, "fresh once per page-in"
