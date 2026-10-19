@@ -1082,8 +1082,36 @@ impl PyCheckpoint {
 
     #[pyo3(signature = (components = None, *, priority = 0, progress = None))]
     fn fetch(&self, py: Python<'_>, components: Option<Vec<String>>, priority: u64, progress: Option<Py<PyAny>>) -> PyResult<()> {
-        let _ = progress;
-        self.access(py)?.fetch_components(py, components.as_deref(), priority)
+        let access = self.access(py)?;
+        let objects = tensorfs_core::store2::wanted(access.checkpoint.header(), components.as_deref()).or_raise(py)?;
+        let callback_error = Mutex::new(None);
+        let report = |held, total| -> Result<(), Failure> {
+            if let Some(callback) = &progress {
+                if let Err(error) = Python::attach(|py| callback.call1(py, ("fetch", held, total))) {
+                    *callback_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                    return Err(Failure { kind: Kind::Invalid, detail: "the download progress callback failed".into() });
+                }
+            }
+            Ok(())
+        };
+        let result = py.detach(|| -> Result<(), Failure> {
+            if let Some(remote) = &access.remote {
+                return remote.fetch_progress(&objects, priority, &report);
+            }
+            let total = objects.iter().map(|object| object.length).sum();
+            report(0, total)?;
+            let mut held = 0;
+            for object in &objects {
+                if !access.checkpoint.holds(object)? {
+                    return Err(Failure { kind: Kind::NotFound, detail: format!("{} is absent and has no download endpoint", object.id()) });
+                }
+                held += object.length;
+                report(held, total)?;
+            }
+            Ok(())
+        });
+        if let Some(error) = callback_error.into_inner().unwrap_or_else(|e| e.into_inner()) { return Err(error); }
+        result.or_raise(py)
     }
 
     /// The header's loading metadata (`source`, `filled`, `safetensors_metadata`).

@@ -1,6 +1,6 @@
 """`tensorfs._ext`, checked against the built extension by `scripts/stub_conform.py`."""
 
-from collections.abc import Buffer, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
+from collections.abc import Buffer, Callable, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
 from os import PathLike
 from types import ModuleType
 from typing import Any, Protocol, TypeVar, overload
@@ -233,7 +233,8 @@ class Checkpoint:
     def metadata(self) -> dict[str, Any]: ...
     def missing(self, components: Sequence[str] | None = None) -> list[tuple[str, int]]:
         """The chunks and assets of `components` (all when None) not here."""
-    def fetch(self, components: Sequence[str] | None = None, *, priority: int = 0, progress: Any = None) -> None: ...
+    def fetch(self, components: Sequence[str] | None = None, *, priority: int = 0,
+              progress: Callable[[str, int, int], object] | None = None) -> None: ...
 
 class ComponentWriter:
     @property
