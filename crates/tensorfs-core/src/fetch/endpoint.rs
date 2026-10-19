@@ -15,7 +15,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
@@ -29,7 +30,7 @@ use super::origin::{release_of, split_name, Location, Origin};
 use super::policy::is_loopback_origin;
 use super::token::{default_for, s3_base, Request, TokenProvider};
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::format::{repo_key, Header, ObjectRef, Repo};
+use crate::format::{repo_key, Header, ObjectRef, Repo, Tree};
 use crate::sha256::{digest, hex, hex_digest};
 use crate::store2::Store;
 
@@ -263,6 +264,33 @@ impl Endpoint {
         }
     }
 
+    /// An object named by digest, including its length, or `None` when absent or unreadable.
+    pub async fn object(&self, sha256: &str) -> Result<Option<ObjectRef>> {
+        let sha256 = sha256.strip_prefix("sha256:").unwrap_or(sha256);
+        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return refuse(Code::MALFORMED_DIGEST, "an object digest must be 64 lowercase hex digits");
+        }
+        let mut object = ObjectRef { sha256: sha256.to_owned(), length: 0 };
+        object.length = match &self.at {
+            At::Dir(root, _) => match fs::metadata(root.join(object.key())) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(crate::err::classify_io(self.url(), error)),
+            },
+            At::Http(base) => {
+                let url = format!("{base}/{}", object.key());
+                let reply = self.exchange(Ask { method: "HEAD", url: &url, headers: vec![], body: None, payload: None, auth: true }).await?;
+                match reply.status {
+                    200 => reply.header("content-length").and_then(|length| length.parse().ok())
+                        .ok_or_else(|| Refusal { code: Code::LENGTH_MISMATCH, detail: format!("HEAD {url}: no valid Content-Length") })?,
+                    404 | 410 => return Ok(None),
+                    _ => return Err(refusal(&reply, "HEAD")),
+                }
+            }
+        };
+        Ok(Some(object))
+    }
+
     /// Whether the endpoint holds `object`.
     pub async fn has(&self, object: &ObjectRef) -> Result<bool> {
         match &self.at {
@@ -327,6 +355,18 @@ impl Endpoint {
             200 => held(&confirm, object).map(|()| true),
             _ => Err(refusal(&confirm, "the confirming HEAD")),
         }
+    }
+
+    /// One authorized exchange at `key` under an HTTP endpoint (`None` for a directory): its
+    /// status, headers and body. What the conformance suite checks servers with.
+    pub(crate) async fn raw(&self, method: &str, key: &str, headers: Vec<(String, String)>, body: Option<Bytes>) -> Result<Option<(u16, HeaderMap, Vec<u8>)>> {
+        let At::Http(base) = &self.at else { return Ok(None) };
+        let url = format!("{base}/{key}");
+        let payload = body.as_ref().map(|b| hex_digest(b));
+        let make = body.map(|b| move || Ok(Payload::Bytes(b.clone())));
+        let body = make.as_ref().map(|m| m as &(dyn Fn() -> Result<Payload> + Send + Sync));
+        let reply = self.exchange(Ask { method, url: &url, headers, body, payload: payload.as_deref(), auth: true }).await?;
+        Ok(Some((reply.status, reply.headers, reply.body)))
     }
 
     /// The store over a directory endpoint, which its writes go through.
@@ -557,6 +597,108 @@ fn put_dir(root: &Path, key: &str, bytes: &[u8], etag: Option<&str>) -> Result<b
     }
     platform::durable::replace(&path, bytes, 0o644).map_err(|e| io(&path)(e.into()))?;
     Ok(true)
+}
+
+/// A writer's objects on their way to an endpoint (`Writer(repo_id=…)`): each is sent (HEAD →
+/// PUT → HEAD) as soon as it is sealed while the writer goes on, at most [`IN_FLIGHT`] at once;
+/// at commit the header, then the tree, then the repo's new checkpoint.
+/// Its calls block: a writer runs outside the runtime that sends.
+pub struct Stream {
+    endpoint: Arc<Endpoint>,
+    runtime: tokio::runtime::Handle,
+    sent: Mutex<HashSet<ObjectRef>>,
+    sending: Mutex<Vec<tokio::task::JoinHandle<Result<()>>>>,
+    failed: Mutex<Option<Refusal>>,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl std::fmt::Debug for Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Stream({})", self.endpoint.url)
+    }
+}
+
+/// Objects a [`Stream`] holds in memory while they are sent (each at most 64 MiB).
+const IN_FLIGHT: usize = 4;
+
+impl Stream {
+    pub fn new(endpoint: Arc<Endpoint>, runtime: tokio::runtime::Handle) -> Stream {
+        Stream {
+            endpoint,
+            runtime,
+            sent: Mutex::default(),
+            sending: Mutex::default(),
+            failed: Mutex::default(),
+            permits: Arc::new(tokio::sync::Semaphore::new(IN_FLIGHT)),
+        }
+    }
+
+    /// Whether `object` was given to [`Stream::put`].
+    pub fn has(&self, object: &ObjectRef) -> bool {
+        self.sent.lock().unwrap().contains(object)
+    }
+
+    /// Sends `bytes` as an object, once; its ref at once.
+    pub fn put(&self, bytes: Vec<u8>) -> Result<ObjectRef> {
+        let object = ObjectRef::of(&bytes);
+        let bytes = Bytes::from(bytes);
+        self.send(&object, move || Ok(Payload::Bytes(bytes.clone())))?;
+        Ok(object)
+    }
+
+    /// Queues an admitted object without copying its bytes into an upload buffer.
+    pub(crate) fn put_stored(&self, store: &Store, object: &ObjectRef) -> Result<()> {
+        let (store, at) = (store.clone(), object.clone());
+        self.send(object, move || store.file(&at).map(Payload::File).map_err(crate::store2::Error::refusal))
+    }
+
+    fn send(&self, object: &ObjectRef, make: impl Fn() -> Result<Payload> + Send + Sync + 'static) -> Result<()> {
+        if !self.sent.lock().unwrap().insert(object.clone()) {
+            return Ok(());
+        }
+        let permit = self.runtime.block_on(Arc::clone(&self.permits).acquire_owned()).expect("never closed");
+        let (endpoint, at) = (Arc::clone(&self.endpoint), object.clone());
+        let task = self.runtime.spawn(async move {
+            let _permit = permit;
+            endpoint.upload(&at, &make).await.map(drop)
+        });
+        self.sending.lock().unwrap().push(task);
+        Ok(())
+    }
+
+    /// Waits for every object put so far: the first failure.
+    pub fn flush(&self) -> Result<()> {
+        let tasks = std::mem::take(&mut *self.sending.lock().unwrap());
+        let mut first = self.failed.lock().unwrap().clone().map_or(Ok(()), Err);
+        for task in tasks {
+            let done = match self.runtime.block_on(task) {
+                Ok(done) => done,
+                Err(e) => Err(Refusal { code: Code::TRANSFER_FAILED, detail: e.to_string() }),
+            };
+            if first.is_ok() {
+                first = done;
+            }
+        }
+        if let Err(ref failure) = first {
+            *self.failed.lock().unwrap() = Some(failure.clone());
+        }
+        first
+    }
+
+    /// A writer's commit: its `header` as `variant` of a tree with `files`, each sent after
+    /// what it cites, then the tree added to repo `name`'s checkpoints. The header's ref.
+    pub fn commit(&self, name: &str, variant: &str, header: Vec<u8>, files: &BTreeMap<String, ObjectRef>) -> Result<ObjectRef> {
+        self.flush()?;
+        let header = self.put(header)?;
+        self.flush()?;
+        let mut tree = Tree { files: files.clone() };
+        tree.set_variant(variant, header.clone());
+        let tree = self.put(tree.to_json().map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() })?)?;
+        self.flush()?;
+        let named = self.endpoint.update_repo(name, |old| Ok(Some(with_tree(old, name, &tree, None))));
+        self.runtime.block_on(named)?;
+        Ok(header)
+    }
 }
 
 /// The ETag a directory (or a server that sends none) gives a document: `"sha256:<hex>"`.

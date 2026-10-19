@@ -7,6 +7,7 @@
 //! and admits it through the store, which verifies it. One HTTP client ([`Client`]) and one
 //! downloader serve every origin.
 
+pub mod conform;
 mod download;
 mod dpop;
 mod endpoint;
@@ -24,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use dpop::{DPoP, JwtBearer};
-pub use endpoint::{upload_tree, with_tree, Endpoint, Fresh, Payload, Uploaded};
+pub use endpoint::{upload_tree, with_tree, Endpoint, Fresh, Payload, Stream, Uploaded};
 pub use net::Client;
 pub use origin::{choose, release_of, variant_of_tree, Chosen, Location, Origin};
 pub use policy::SourcePolicy;
