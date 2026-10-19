@@ -1,6 +1,10 @@
 # cozytensors/1
 
-Status: normative, version 1.0. Conformance vectors and an independent reader: [`../conformance/`](../conformance/).
+Status: normative, version 1.0. Start with the [introduction and usage guide](../README.md).
+Conformance vectors and an independent reader: [`../conformance/`](../conformance/).
+
+This is the authoritative specification of the stored format and its decode semantics. A reader can implement it
+without TensorFS, Cozy or Tensorhub. Library APIs, cache policy and GPU execution are outside the format contract.
 
 cozytensors/1 stores model weights as immutable, content-addressed objects. A **checkpoint** is a manifest (a file
 tree) whose `model.cozytensors` file is a **header**; the header names **chunks** (objects of tensor bytes) and
