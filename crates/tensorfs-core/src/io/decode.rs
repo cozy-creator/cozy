@@ -125,7 +125,7 @@ fn execute(device: i32, launch: &Launch<'_>) -> Result<DeviceBuffer> {
         return Ok(output);
     }
     let family = (cuda::attribute(device, 75)? * 10 + cuda::attribute(device, 76)?) as u32;
-    let binary = |stage| {
+    let binary = |stage: &str| {
         launch.stage_binary(family, stage).ok_or_else(|| Failure {
             kind: Kind::Unsupported,
             detail: format!(
