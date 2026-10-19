@@ -568,22 +568,29 @@ fn an_object_reused_while_gc_sweeps_it_survives() {
         gc.wait_for("FAULT gc.trashed");
         assert_eq!(trash(&store), 1);
         // The collector holds an exclusive inode fence until it finishes its trash decision.
-        // A real reader restores the namespace first, then waits for that fence. Keep the
-        // controller free to resume GC; a synchronous read here would deadlock the fixture.
+        // A real reader waits for that fence. Keep the controller free to restore the
+        // namespace and resume GC; a synchronous read here would deadlock the fixture.
         let (sent, received) = std::sync::mpsc::channel();
+        let (started, waiting) = std::sync::mpsc::sync_channel(0);
         let reading = store.clone();
         let read_object = object.clone();
         let reader = std::thread::spawn(move || {
-            let _ = sent.send(reading.read(&read_object));
+            if started.send(()).is_ok() {
+                let _ = sent.send(reading.read(&read_object));
+            }
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while trash(&store) != 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the reader never entered the real trash restore path"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        waiting
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reader thread never started");
+        let probe = File::open(root.join("tmp/gc").join(&object.sha256)).unwrap();
+        assert!(
+            matches!(
+                probe.try_lock_shared(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ),
+            "GC did not hold the actual trash inode's exclusive fence"
+        );
+        drop(probe);
         assert!(
             matches!(
                 received.recv_timeout(Duration::from_millis(100)),
