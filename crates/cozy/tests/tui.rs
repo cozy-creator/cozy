@@ -11,8 +11,8 @@ use std::{
 };
 
 use common::{Home, package, pty::Pty, silent::SilentHub, tensord};
-use cozy_cli::tui::testing::{View, draw};
-use cozy_proto::error::Error;
+use cli::tui::testing::{View, draw};
+use protocol::error::Error;
 
 /// A hang bound for a view that stops drawing; the product waits without one.
 const PATIENCE: Duration = Duration::from_secs(600);

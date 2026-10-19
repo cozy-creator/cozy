@@ -1,7 +1,7 @@
 //! One adapter into the owned execution engine. This module owns no journal.
 use super::{auth::VerifiedActor, domain, v1};
 use std::collections::BTreeMap;
-use cozy_proto::error::Error;
+use protocol::error::Error;
 
 pub trait MachineBackend: Send + Sync + 'static {
     /// `cozy.machine.v1` Run sources and Write (`runs`).
@@ -105,7 +105,7 @@ pub trait MachineBackend: Send + Sync + 'static {
         unsupported()
     }
     /// A log this machine keeps, by its name on the wire.
-    fn log(&self, name: &str) -> Result<cozy_platform::tail::Log, Error> {
+    fn log(&self, name: &str) -> Result<platform::tail::Log, Error> {
         Err(Error::not_found("log_not_found", format!("this machine keeps no log {name}")))
     }
     /// A complete content-addressed object this signer wrote with `Write`, verified against

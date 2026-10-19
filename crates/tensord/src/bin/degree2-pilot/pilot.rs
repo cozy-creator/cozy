@@ -34,7 +34,7 @@ struct Config {
 
 struct Pilot {
     custody: Arc<Mutex<ResidentCustody>>,
-    reader: Option<(cozy_platform::process::Birth, File)>,
+    reader: Option<(platform::process::Birth, File)>,
     cells: Vec<File>,
     log: File,
 }
@@ -126,7 +126,7 @@ struct Exec {
 }
 
 fn used_mib() -> u64 {
-    cozy_platform::gpu::Device::open("0")
+    platform::gpu::Device::open("0")
         .and_then(|device| device.read())
         .map_or(0, |reading| reading.total.saturating_sub(reading.free) >> 20)
 }
@@ -334,7 +334,7 @@ fn exec(
 
 fn kill(exec: Exec) -> io::Result<()> {
     // The exact live child we spawned, killed and waited for: no elapsed-time policy.
-    if let Some(exact) = cozy_platform::process::Exact::open(&exec.executor.birth)? {
+    if let Some(exact) = platform::process::Exact::open(&exec.executor.birth)? {
         exact.kill()?;
         exact.wait()?;
     }

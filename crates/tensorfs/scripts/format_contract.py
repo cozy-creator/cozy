@@ -26,7 +26,7 @@ NAMES = ("STORE_FORMAT", "CLAIM_PROTOCOL")
 
 
 def source() -> tuple[int, ...]:
-    text = (ROOT / "crates/tensorfs-core/src/lib.rs").read_text()
+    text = (ROOT.parent / "tensorfs-core/src/lib.rs").read_text()
     found = [re.search(rf"^pub const {name}: u32 = (\d+);", text, re.MULTILINE) for name in NAMES]
     if not all(found):
         raise SystemExit(f"tensorfs-core's lib.rs no longer declares `pub const {'/'.join(NAMES)}: u32 = N;`")

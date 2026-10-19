@@ -1,7 +1,7 @@
 //! The two listener observations the Hub's readiness reader requires, made against the real
 //! listener over loopback with the machine API's own client: it presents exactly this machine's
 //! leaf, and it refuses a foreign credential.
-use cozy_proto::machine::client::{presented_leaf, Auth, Machine};
+use protocol::machine::client::{presented_leaf, Auth, Machine};
 use std::sync::Arc;
 
 fn address(port: u16) -> String {

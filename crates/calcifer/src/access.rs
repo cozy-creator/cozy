@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use cozy_proto::{
+use protocol::{
     calcifer::Reason,
     config::{self, Origin},
     error::{Error, Kind},

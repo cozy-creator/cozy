@@ -2,7 +2,7 @@
 //! GPU, or on a group of K (rank 0 forms followers). It supplies weight sources/CPU buffers
 //! and budgets; Runtime constructs models and performs CUDA transfers/mappings through its
 //! TensorFS plane. Engine owns acceptance and run custody.
-use cozy_platform::process::Birth;
+use platform::process::Birth;
 use crate::{
     catalog::HeldGeneration,
     device_executor::{
@@ -73,7 +73,7 @@ pub struct HostOptions {
     /// `shared` (the default): a guest that gives memory back whenever anything on the host
     /// stalls on it; `dedicated` (a rented pod's image or grant): only when this cgroup does.
     #[serde(default)]
-    pub mode: cozy_platform::contain::host_pressure::HostMode,
+    pub mode: platform::contain::host_pressure::HostMode,
 }
 
 /// Root-sealed configuration, never peer-controlled paths or environment logic switches.
@@ -413,7 +413,7 @@ struct Session {
     /// GPUs of its group; its followers (rank 1 first) once it started, held by pidfd so a
     /// call that fails can name the GPU whose process ended first.
     degree: u32,
-    followers: Vec<cozy_platform::process::Exact>,
+    followers: Vec<platform::process::Exact>,
     loaded: bool,
     executor: DeviceExecutor,
     /// Budget cells by rank: rank 0's own, and each follower's.
@@ -531,7 +531,7 @@ impl Zygote {
     /// Its private host bytes (PSS less shared memory), 0 when not running.
     fn private_bytes(&self) -> u64 {
         match &*self.state.lock().unwrap() {
-            ZygoteState::Ready(parent) => cozy_platform::contain::host_memory::process(parent.birth.pid)
+            ZygoteState::Ready(parent) => platform::contain::host_memory::process(parent.birth.pid)
                 .map_or(0, |memory| memory.pss.saturating_sub(memory.pss_shmem)),
             _ => 0,
         }
@@ -610,7 +610,7 @@ pub struct Pool {
     /// `sessions`: executors end before the parent they were forked from.
     zygotes: Mutex<BTreeMap<(String, String), Arc<Zygote>>>,
     /// Each generation's kernel boot of this machine run: its process while it runs.
-    kernel_boots: Mutex<BTreeMap<String, Option<cozy_platform::process::Exact>>>,
+    kernel_boots: Mutex<BTreeMap<String, Option<platform::process::Exact>>>,
     /// Each caller's warm set, in the order it sent it.
     members: Mutex<BTreeMap<String, Vec<Arc<Member>>>>,
     /// One pass over the warm sets at a time.
@@ -623,7 +623,7 @@ pub struct Pool {
     host: Arc<HostTier>,
     /// Shared mode's room for the host's other programs, and the stalls the watcher saw: the
     /// count at the last bring-back pass says whether one came since (`host_pressure`).
-    reserve: Mutex<cozy_platform::contain::host_pressure::Reserve>,
+    reserve: Mutex<platform::contain::host_pressure::Reserve>,
     stalls: std::sync::atomic::AtomicU64,
     stalls_seen: std::sync::atomic::AtomicU64,
     /// Degree 2: GPU weights kept across executors. None on a GPU that drives a display.
@@ -708,7 +708,7 @@ impl Pool {
             Box::new(crate::host_tier::HalfOfHeadroom),
         )?;
         // Fill leases and GPU custody hold one descriptor per object or chunk.
-        cozy_platform::process::raise_fd_limit();
+        platform::process::raise_fd_limit();
         let envelope = config.envelope();
         // Degree 2 is world-one, on the first device; off where it drives a display, and
         // outside Unix, where one executor's device memory cannot be handed to another.
@@ -772,7 +772,7 @@ impl Pool {
     /// kernel reports a stall, then a rung given back when the feedback rule says so.
     fn watch_host(self: &Arc<Self>) {
         let mode = self.config.host.mode;
-        let pressure = match cozy_platform::contain::host_pressure::Pressure::arm(mode) {
+        let pressure = match platform::contain::host_pressure::Pressure::arm(mode) {
             Ok(pressure) => pressure,
             Err(error) => {
                 tracing::warn!("host pressure: no PSI trigger ({error}); memory goes back only as calls plan");
@@ -783,7 +783,7 @@ impl Pool {
         let started = std::thread::Builder::new()
             .name("host-pressure".into())
             .spawn(move || {
-                let mut feedback = cozy_platform::contain::host_pressure::Feedback::new(
+                let mut feedback = platform::contain::host_pressure::Feedback::new(
                     pressure.sample().map(|sample| sample.total()).unwrap_or(0),
                     std::time::Instant::now(),
                 );
@@ -811,15 +811,15 @@ impl Pool {
     /// the host has before its tightest limit, less, in shared mode, what its other programs
     /// used recently beyond their use now (`host_pressure::Reserve`). None: unreadable.
     fn host_room_now(&self) -> Option<u64> {
-        let host = cozy_platform::contain::host_memory::read();
+        let host = platform::contain::host_memory::read();
         let available = u64::try_from(host.available).ok()?;
-        if self.config.host.mode == cozy_platform::contain::host_pressure::HostMode::Dedicated {
+        if self.config.host.mode == platform::contain::host_pressure::HostMode::Dedicated {
             return Some(available);
         }
-        let ours = cozy_platform::contain::host_memory::tree_private(std::process::id())
+        let ours = platform::contain::host_memory::tree_private(std::process::id())
             + self.host.facts().charged_bytes;
-        let total = u64::try_from(cozy_platform::contain::host_memory::total()).ok()?;
-        let others = cozy_platform::contain::host_pressure::others(&host, total, ours)?;
+        let total = u64::try_from(platform::contain::host_memory::total()).ok()?;
+        let others = platform::contain::host_pressure::others(&host, total, ours)?;
         Some(available.saturating_sub(self.reserve.lock().unwrap().observe(others)))
     }
     /// A bring-back pass: with no stall since the last one, the reserve forgets half.
@@ -828,12 +828,12 @@ impl Pool {
         if self.stalls_seen.swap(stalls, Ordering::AcqRel) != stalls {
             return;
         }
-        let host = cozy_platform::contain::host_memory::read();
-        let ours = cozy_platform::contain::host_memory::tree_private(std::process::id())
+        let host = platform::contain::host_memory::read();
+        let ours = platform::contain::host_memory::tree_private(std::process::id())
             + self.host.facts().charged_bytes;
-        let others = u64::try_from(cozy_platform::contain::host_memory::total())
+        let others = u64::try_from(platform::contain::host_memory::total())
             .ok()
-            .and_then(|total| cozy_platform::contain::host_pressure::others(&host, total, ours));
+            .and_then(|total| platform::contain::host_pressure::others(&host, total, ours));
         if let Some(others) = others {
             self.reserve.lock().unwrap().quiet(others);
         }
@@ -1890,7 +1890,7 @@ impl Pool {
         executor: u32,
         launch: &Launch,
     ) -> io::Result<()> {
-        use cozy_platform::contain::host_memory::{process, ProcessMemory};
+        use platform::contain::host_memory::{process, ProcessMemory};
         #[derive(Serialize)]
         struct Line<'a> {
             plan: &'a str,
@@ -2165,7 +2165,7 @@ impl Pool {
         generation: &str,
         python: &Path,
         runtime: Option<&Path>,
-    ) -> io::Result<(std::process::Child, cozy_platform::process::Exact, PathBuf)> {
+    ) -> io::Result<(std::process::Child, platform::process::Exact, PathBuf)> {
         let devices: Vec<_> = self.devices.iter().map(|d| d.entry.as_str()).collect();
         let seal = Seal::prepare(
             &self.root,
@@ -2176,7 +2176,7 @@ impl Pool {
         )?;
         let log = self.root.join(format!("kernel-boot.{generation}.log"));
         let output = File::create(&log)?;
-        let scope = Arc::new(cozy_platform::contain::Scope::create(&cozy_platform::contain::namespace(
+        let scope = Arc::new(platform::contain::Scope::create(&platform::contain::namespace(
             self.root.parent().unwrap_or(&self.root),
         ))?);
         let launch = || {
@@ -2196,7 +2196,7 @@ impl Pool {
             crate::launch_identity::inherit(&mut command, &[seal.kernel_hold.as_ref()]);
             let child = self.launcher.spawn(command)?;
             let birth = Birth::of(child.id())?;
-            let boot = cozy_platform::process::Exact::open(&birth)?
+            let boot = platform::process::Exact::open(&birth)?
                 .ok_or_else(|| io::Error::other("launched kernel boot has no exact birth"))?;
             io::Result::Ok((child, boot))
         };
@@ -2397,7 +2397,7 @@ impl Pool {
                     reply.code, reply.detail
                 )));
             }
-            if let Ok(memory) = cozy_platform::contain::host_memory::process(executor.birth.pid) {
+            if let Ok(memory) = platform::contain::host_memory::process(executor.birth.pid) {
                 self.first().learn_host(
                     &parent_key(held),
                     memory.pss.saturating_sub(memory.pss_shmem),
@@ -2414,7 +2414,7 @@ impl Pool {
     fn executor_endpoint(&self) -> io::Result<(PathBuf, PathBuf, File)> {
         let root = self.root.join(uuid::Uuid::new_v4().simple().to_string());
         fs::create_dir(&root)?;
-        let directory = cozy_platform::durable::open_dir(&root)?;
+        let directory = platform::durable::open_dir(&root)?;
         let socket = if self.config.identity.is_some() {
             // Another UID cannot traverse this owner's /proc/fd magic link.
             // A deliberately short owned state root is required for this operation.
@@ -2471,7 +2471,7 @@ impl Pool {
             seal,
             generation_hold: Some(held.retention()),
             identity: self.config.identity,
-            cgroup_namespace: Some(cozy_platform::contain::namespace(
+            cgroup_namespace: Some(platform::contain::namespace(
                 self.root.parent().unwrap_or(&self.root),
             )),
         })
@@ -2993,12 +2993,12 @@ impl Pool {
                 }));
             }
             // Only processes in rank 0's own group are taken as its followers.
-            let members = cozy_platform::process::group_members(&session.executor.birth);
+            let members = platform::process::group_members(&session.executor.birth);
             session.followers = started
                 .follower_pids
                 .iter()
                 .filter_map(|pid| members.iter().find(|m| m.pid == *pid))
-                .filter_map(|birth| cozy_platform::process::Exact::open(birth).ok().flatten())
+                .filter_map(|birth| platform::process::Exact::open(birth).ok().flatten())
                 .collect();
             // NVML charges each GPU's own process: rank r drives the group's GPU r.
             for (device, pid) in gpus.iter().skip(1).zip(&started.follower_pids) {
@@ -3423,7 +3423,7 @@ impl Pool {
             // programs their recent peak. A request takes what the host has.
             let available = match spare {
                 true => self.host_room_now(),
-                false => u64::try_from(cozy_platform::contain::host_memory::read().available).ok(),
+                false => u64::try_from(platform::contain::host_memory::read().available).ok(),
             };
             let key = session_key(plan, start);
             let mut admitted = self.admitted.lock().unwrap();
@@ -3484,7 +3484,7 @@ impl Pool {
         // The squeezed rooms are those of rank 0's process, whose facts these are.
         if let Some(first) = lane.first() {
             first.memory.learn_squeezed(plan, shape, &plane.squeezed);
-            if let Ok(host) = cozy_platform::contain::host_memory::process(pid) {
+            if let Ok(host) = platform::contain::host_memory::process(pid) {
                 first.memory.learn_host(plan, host.pss.saturating_sub(host.pss_shmem));
             }
         }
@@ -3560,7 +3560,7 @@ impl Pool {
 
     /// Followers whose process has ended, as people name their GPUs ("GPU 1's process 3224
     /// ended"); empty while the whole group lives.
-    fn lost_followers(&self, start: usize, degree: u32, followers: &[cozy_platform::process::Exact]) -> String {
+    fn lost_followers(&self, start: usize, degree: u32, followers: &[platform::process::Exact]) -> String {
         let lane = self.lane(start, degree).unwrap_or_default();
         followers
             .iter()
@@ -3838,7 +3838,7 @@ fn binds_models(interface: &serde_json::Value) -> bool {
 
 /// Degree 2 stays off on a GPU that drives a display until qualified there. Unknown is "yes".
 fn display_active(device: &str) -> bool {
-    cozy_platform::gpu::Device::open(device)
+    platform::gpu::Device::open(device)
         .and_then(|device| device.display_active())
         .unwrap_or(true)
 }
@@ -4039,7 +4039,7 @@ fn copy_held(
 ) -> io::Result<()> {
     let object = tensorfs_core::format::ObjectRef { sha256: digest.trim_start_matches("sha256:").into(), length };
     let mut source = store.file(&object).map_err(crate::storage::io_error)?;
-    let mut copy = cozy_platform::durable::Mode::mode(
+    let mut copy = platform::durable::Mode::mode(
         fs::OpenOptions::new().write(true).create_new(true),
         0o444,
     )
@@ -4339,8 +4339,8 @@ impl Services for Callbacks<'_> {
     fn device_tier(
         &mut self,
         frame: &Frame,
-        fds: Vec<cozy_platform::handles::Owned>,
-    ) -> io::Result<(Answer, Vec<cozy_platform::handles::Owned>)> {
+        fds: Vec<platform::handles::Owned>,
+    ) -> io::Result<(Answer, Vec<platform::handles::Owned>)> {
         let mut answer = Answer::unavailable(frame.seq);
         let Some(custody) = self.custody else {
             return Ok((answer, Vec::new()));
@@ -4791,7 +4791,7 @@ mod tests {
             "authorized_device_limit_bytes": null, "prespawn": false})).unwrap();
         let store = crate::storage::open(&root.join("store")).unwrap();
         let pool = Pool::new(&root.join("gpu"), config, store).unwrap();
-        let host = cozy_platform::contain::host_memory::total();
+        let host = platform::contain::host_memory::total();
         assert!(host > 0);
         assert_eq!(pool.device_limit(pool.lane(0, 1).unwrap()), Some(host as u64));
         let _ = fs::remove_dir_all(root);
@@ -5108,7 +5108,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
     #[test]
     fn host_room_and_pinned_budgets_span_every_gpu() {
         let (root, pool, _engine) = pool_of(4);
-        let available = u64::try_from(cozy_platform::contain::host_memory::read().available).unwrap();
+        let available = u64::try_from(platform::contain::host_memory::read().available).unwrap();
         let need = available / 10 * 6;
         let learn = |gpu: usize| {
             pool.devices[gpu].memory.with(|ledger| {

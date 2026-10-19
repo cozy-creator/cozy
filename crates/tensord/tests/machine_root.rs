@@ -9,7 +9,7 @@ mod common;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::SigningKey;
 use fs2::FileExt;
-use cozy_platform::durable::{self, FileId};
+use platform::durable::{self, FileId};
 use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},

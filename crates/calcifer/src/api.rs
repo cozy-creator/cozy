@@ -1,7 +1,7 @@
 //! Calcifer's loopback API (design §3.2): HTTP/1.1, JSON and SSE for the CLI. Every request
 //! passes the guard chain in order: a loopback peer, an allowed `Host`, no foreign `Origin`, then
 //! (on the routes Calcifer serves) the bearer and the admission gate a stopping Calcifer closes.
-//! Refusals are `cozy_proto::error::Envelope`s. No CORS header is ever sent and no cookie is read.
+//! Refusals are `protocol::error::Envelope`s. No CORS header is ever sent and no cookie is read.
 use std::{collections::VecDeque, convert::Infallible, net::SocketAddr, sync::Arc};
 
 use axum::{
@@ -19,7 +19,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use cozy_proto::{
+use protocol::{
     calcifer::{Down, Event, Run, RunList, RunsEvent, Status, SubmitRun, Submitted},
     error::{Envelope, Error, Kind},
     ids::RunId,

@@ -6,7 +6,7 @@
 //! close (release, or the kernel at process death) ends it. Bytes are counted once per GPU, until
 //! every lease ended and the fds here are closed. A holding lives while a package environment
 //! installed here has read it: the last one's removal revokes it.
-use cozy_platform::process::Birth;
+use platform::process::Birth;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -105,8 +105,8 @@ impl Reader {
     }
 
     fn ended(&self) -> bool {
-        cozy_platform::handles::hung_up(&self.lease)
-            || (cozy_platform::process::ended(&self.exit) && self.birth.ended().unwrap_or(false))
+        platform::handles::hung_up(&self.lease)
+            || (platform::process::ended(&self.exit) && self.birth.ended().unwrap_or(false))
     }
 }
 
@@ -411,7 +411,7 @@ fn validate(key: &HoldingKey, regions: &[SharedRegion], fds: &[OwnedFd]) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cozy_platform::process::Birth;
+    use platform::process::Birth;
     use std::process::{Child, Command, Stdio};
 
     fn devnull() -> OwnedFd {
@@ -420,7 +420,7 @@ mod tests {
     }
     fn pidfd(pid: u32) -> File {
         let birth = Birth::of(pid).unwrap();
-        cozy_platform::process::Exact::open(&birth).unwrap().unwrap().into_file()
+        platform::process::Exact::open(&birth).unwrap().unwrap().into_file()
     }
     /// A lease whose executor end this test process keeps.
     fn mine() -> (Reader, OwnedFd) {

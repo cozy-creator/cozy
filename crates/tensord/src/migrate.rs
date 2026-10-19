@@ -21,9 +21,9 @@ use crate::{
     api::domain, hub, objects::Refused, origin::priority, published::Publisher, stop::Stop, storage,
 };
 
-/// Whether the run's model choice is a migration (`cozy_proto::machine::MIGRATE`).
+/// Whether the run's model choice is a migration (`protocol::machine::MIGRATE`).
 pub fn marked(choice: &domain::ModelChoice) -> bool {
-    choice.profiles.iter().any(|p| p == cozy_proto::machine::MIGRATE)
+    choice.profiles.iter().any(|p| p == protocol::machine::MIGRATE)
 }
 
 /// The pre-cut store a run's one marked choice names as its source: a `--local` migration.

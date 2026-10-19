@@ -10,7 +10,7 @@
 //! - `present` answers, for each, whether it is here.
 //!
 //! Waits answer out of order. Everything the channel wants ends when its peer closes it.
-use cozy_platform::ipc::LocalStream;
+use platform::ipc::LocalStream;
 use std::{
     sync::{mpsc, Arc},
 };

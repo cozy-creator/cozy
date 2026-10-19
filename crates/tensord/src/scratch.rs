@@ -18,7 +18,7 @@ pub(crate) fn remove(root: &Path) {
 /// The interpreter a fixture generation's record names, at its venv's path on this OS; empty,
 /// for a test that never runs it.
 pub(crate) fn interpreter(env: &Path) -> PathBuf {
-    let python = cozy_platform::paths::venv_python(env);
+    let python = platform::paths::venv_python(env);
     fs::create_dir_all(python.parent().unwrap()).unwrap();
     fs::write(&python, "").unwrap();
     python

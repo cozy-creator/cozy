@@ -37,6 +37,6 @@ cozy model search sdxl
 cargo build --release -p cozy
 ```
 
-The workspace's crates live in `crates/`: `cozy` (the binary), `cozy-cli`, `calcifer`, `tensord`,
-`tensorfs`, `hub-client`, `cozy-proto`, `cozy-platform` and `migrate` (the Go home importer). The
-browser player is `web/player`.
+The workspace's crates live in `crates/`: `cozy` (the binary), `cli`, `calcifer`, `tensord`,
+`tensorfs-core`, `varena`, `tensorfs-py`, `hub-client`, `protocol` and `platform`; `crates/tensorfs` is
+TensorFS's Python package. The browser player is `web/player`.

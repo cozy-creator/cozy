@@ -1,6 +1,6 @@
 //! Acceptance, attempt supervision, cancellation, progress coalescing, output custody and
 //! reconcile. Scheduling policy remains with the machine owner (`service`).
-use cozy_platform::process::Birth;
+use platform::process::Birth;
 use crate::journal::{
     Artifact, CallMemo, Execution, Invocation, Journal, Outcome, ProgressSnapshot,
     ResultRecord, State, SubmissionContext,
@@ -135,11 +135,11 @@ type Halt = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 impl Engine {
     pub fn open(root: &Path) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
-        cozy_platform::durable::set_mode(root, 0o700)?;
+        platform::durable::set_mode(root, 0o700)?;
         for name in ["staging", "results"] {
             fs::create_dir_all(root.join(name))?;
         }
-        cozy_platform::durable::sync_dir(root)?;
+        platform::durable::sync_dir(root)?;
         let mut journal = Journal::open(root)?;
         journal.interrupt_preparations()?;
         Ok(Arc::new(Self {
@@ -859,7 +859,7 @@ impl Engine {
 
     pub(crate) fn watch_process(
         self: &Arc<Self>,
-        birth: cozy_platform::process::Birth,
+        birth: platform::process::Birth,
     ) -> io::Result<()> {
         if birth.ended()? {
             return Ok(());
@@ -867,7 +867,7 @@ impl Engine {
         // An exact handle (a pidfd on Linux, a kqueue on macOS), read on both sides of its
         // open so PID reuse cannot watch or reclaim a different process. A kernel exit event
         // only wakes reconciliation.
-        let Some(exact) = cozy_platform::process::Exact::open(&birth)? else {
+        let Some(exact) = platform::process::Exact::open(&birth)? else {
             // Reaped, or a leader whose exit is still tearing down (a large GPU context) with
             // no handle yet: observe that exit by sampling instead, then wake dispatch.
             return match birth.ended()? {
@@ -907,7 +907,7 @@ impl Engine {
     /// A previous machine's process has no owner channel and is never adopted: kill that
     /// exact birth (and its group) and wake dispatch when its exit is observed.
     pub(crate) fn end_orphan(self: &Arc<Self>, birth: Birth) -> io::Result<()> {
-        if let Some(exact) = cozy_platform::process::Exact::open(&birth)? {
+        if let Some(exact) = platform::process::Exact::open(&birth)? {
             exact.kill()?;
         }
         self.watch_process(birth)
@@ -1094,7 +1094,7 @@ impl Engine {
             let mut source = open_artifact(output_root, Path::new(&name))?;
             let temporary = destination.join(format!("{index}.pending"));
             let mut output =
-                cozy_platform::durable::Mode::mode(OpenOptions::new().write(true).create_new(true), 0o600)
+                platform::durable::Mode::mode(OpenOptions::new().write(true).create_new(true), 0o600)
                     .open(&temporary)?;
             let mut hash = tensorfs_core::sha256::Sha256::new();
             let mut length = 0;
@@ -1109,7 +1109,7 @@ impl Engine {
                 length += count as u64;
             }
             let digest = tensorfs_core::sha256::hex(&hash.finish());
-            cozy_platform::durable::set_file_mode(&output, 0o400)?;
+            platform::durable::set_file_mode(&output, 0o400)?;
             output.sync_all()?;
             let filename = format!("{index}-{digest}");
             fs::rename(&temporary, destination.join(&filename))?;
@@ -1120,8 +1120,8 @@ impl Engine {
                 length,
             });
         }
-        cozy_platform::durable::sync_dir(&destination)?;
-        cozy_platform::durable::sync_dir(&self.root.join("results"))?;
+        platform::durable::sync_dir(&destination)?;
+        platform::durable::sync_dir(&self.root.join("results"))?;
         Ok(ResultRecord {
             value,
             artifacts,
@@ -1279,7 +1279,7 @@ pub(crate) fn open_artifact(root: &Path, path: &Path) -> io::Result<File> {
             if index + 1 < parts.len() {
                 continue;
             }
-            let file = cozy_platform::durable::open_nofollow(&path, OpenOptions::new().read(true))?;
+            let file = platform::durable::open_nofollow(&path, OpenOptions::new().read(true))?;
             if !file.metadata()?.is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1414,7 +1414,7 @@ mod tests {
         engine.open_result(&held.id, 0).unwrap().read_to_string(&mut bytes).unwrap();
         assert_eq!(bytes, "17,39\n");
         let path = root.join(&held.result.unwrap().artifacts[0].path);
-        cozy_platform::durable::set_mode(&path, 0o600).unwrap();
+        platform::durable::set_mode(&path, 0o600).unwrap();
         fs::write(&path, b"corrupted").unwrap();
         assert_eq!(engine.open_result(&held.id, 0).unwrap_err().kind(), io::ErrorKind::InvalidData);
         drop(engine);

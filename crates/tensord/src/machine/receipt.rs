@@ -187,8 +187,8 @@ pub struct Gpu {
 /// initializes CUDA here: call it once, in the service, which forks nothing without exec after.
 /// No NVIDIA driver is a CPU machine.
 pub fn gpus(visible: Option<&str>) -> io::Result<Vec<Gpu>> {
-    let mut probed = cozy_platform::gpu::probe(visible).map_err(io::Error::other)?;
-    cozy_platform::gpu::memory_classes(&mut probed).map_err(io::Error::other)?;
+    let mut probed = platform::gpu::probe(visible).map_err(io::Error::other)?;
+    platform::gpu::memory_classes(&mut probed).map_err(io::Error::other)?;
     if probed.len() > 16 {
         return Err(invalid("GPU inventory is oversized"));
     }
@@ -197,8 +197,8 @@ pub fn gpus(visible: Option<&str>) -> io::Result<Vec<Gpu>> {
 
 /// One probed GPU as the receipt names it. An integrated GPU's (GB10) memory is the host's, as
 /// the probe reads it.
-fn row(g: cozy_platform::gpu::Gpu) -> io::Result<Gpu> {
-    use cozy_platform::gpu::MemoryClass;
+fn row(g: platform::gpu::Gpu) -> io::Result<Gpu> {
+    use platform::gpu::MemoryClass;
     let memory_bytes = match g.memory_bytes {
         0 => return Err(invalid(&format!("the driver reports no memory for {}", g.name))),
         // Whole MiB, as the receipts sealed before NVML read them.
@@ -241,7 +241,7 @@ impl Measured<'_> {
         let mut value = serde_json::json!({
             "pod_boot_id": self.boot_id,
             "worker_internal_port": self.worker_port,
-            "worker_protocol": "cozy.machine.v1",
+            "machine_protocol": "cozy.machine.v1",
             "worker_listener_bound": self.listener_bound,
             "worker_foreign_credential_refused": self.foreign_credential_refused,
             "tls_certificate_der_base64": STANDARD.encode(self.cert_der),
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn a_probed_gpu_reads_as_the_receipt_names_it() {
-        let a40 = cozy_platform::gpu::Gpu {
+        let a40 = platform::gpu::Gpu {
             index: 0,
             name: "NVIDIA A40".into(),
             uuid: "GPU-a".into(),
@@ -414,10 +414,10 @@ mod tests {
             memory_bytes: (46068 << 20) + 12345,
             driver: "580.65.06".into(),
             compute_capability: Some((8, 6)),
-            memory_class: Some(cozy_platform::gpu::MemoryClass::Discrete),
+            memory_class: Some(platform::gpu::MemoryClass::Discrete),
         };
         let read = row(a40.clone()).unwrap();
         assert_eq!((read.memory_bytes, read.compute_cap.as_str(), read.memory_class.as_str()), (46068 << 20, "8.6", "discrete"));
-        assert!(row(cozy_platform::gpu::Gpu { memory_bytes: 0, ..a40 }).is_err());
+        assert!(row(platform::gpu::Gpu { memory_bytes: 0, ..a40 }).is_err());
     }
 }

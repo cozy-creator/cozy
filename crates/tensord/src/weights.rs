@@ -156,7 +156,7 @@ impl Weights {
             "source is outside the invocation".to_string(),
         ))?;
         let source = reference(&frame.manifest, length)?;
-        let (client, server) = cozy_platform::ipc::pair().map_err(io::Error::from).map_err(io_refusal)?;
+        let (client, server) = platform::ipc::pair().map_err(io::Error::from).map_err(io_refusal)?;
         let (store, current, fetch) = (self.store.clone(), grant.current.clone(), grant.fetch.clone());
         std::thread::Builder::new()
             .name("weights-source".into())
@@ -171,7 +171,7 @@ impl Weights {
             .map_err(io_refusal)?;
         let mut answer = Answer::ok(frame.seq);
         (answer.descriptor, answer.length) = (true, length);
-        Ok((answer, File::from(cozy_platform::handles::Owned::from(client))))
+        Ok((answer, File::from(platform::handles::Owned::from(client))))
     }
 
     fn output(&self, grant: &Grant, frame: &Frame) -> Result<(Answer, File), Refusal> {
@@ -199,7 +199,7 @@ impl Weights {
         let transaction = format!("sha256:{}", sha256::hex_digest(identity.as_bytes()));
         (grant.bind_output)(&transaction, slot).map_err(io_refusal)?;
         grant.opened.lock().unwrap().insert(transaction.clone(), slot.clone());
-        let (client, server) = cozy_platform::ipc::pair().map_err(io::Error::from).map_err(io_refusal)?;
+        let (client, server) = platform::ipc::pair().map_err(io::Error::from).map_err(io_refusal)?;
         let (store, current, fetch) = (self.store.clone(), grant.current.clone(), grant.fetch.clone());
         let (tx, output) = (transaction.clone(), slot.clone());
         std::thread::Builder::new()
@@ -215,7 +215,7 @@ impl Weights {
             .map_err(io_refusal)?;
         let mut answer = Answer::ok(frame.seq);
         (answer.descriptor, answer.transaction) = (true, transaction);
-        Ok((answer, File::from(cozy_platform::handles::Owned::from(client))))
+        Ok((answer, File::from(platform::handles::Owned::from(client))))
     }
 
     fn adopt(&self, grant: &Grant, frame: &Frame) -> Result<(Answer, Adopted), Refusal> {

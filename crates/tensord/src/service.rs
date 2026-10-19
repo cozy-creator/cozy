@@ -1,6 +1,6 @@
 //! The machine's sole dispatch policy; the engine only journals/supervises. Every run takes
 //! one path: its plan (journaled when it binds models, else weightless) on the pool.
-use cozy_platform::process::Birth;
+use platform::process::Birth;
 use crate::{
     catalog::Catalog,
     execution::Engine,
@@ -91,9 +91,9 @@ impl Service {
                     || crate::process::group_outlives(&birth, started_ticks);
                 if alive && seen.insert((birth.pid, birth.boot_id.clone(), birth.start_ticks)) {
                     // A follower left behind by a leader that already ended is ended too.
-                    for member in cozy_platform::process::group_members(&birth) {
+                    for member in platform::process::group_members(&birth) {
                         if member.start_ticks < started_ticks {
-                            if let Ok(Some(exact)) = cozy_platform::process::Exact::open(&member) {
+                            if let Ok(Some(exact)) = platform::process::Exact::open(&member) {
                                 let _ = exact.kill();
                             }
                         }
@@ -107,7 +107,7 @@ impl Service {
         }
         // Descendants of those executors (a setsid daemon, a compile worker) live on in the
         // executors' own scopes; every such scope of this machine is ended now.
-        match cozy_platform::contain::Scope::sweep(&cozy_platform::contain::namespace(root)) {
+        match platform::contain::Scope::sweep(&platform::contain::namespace(root)) {
             Ok(0) => (),
             Ok(held) => tracing::info!("ended {held} process(es) left in earlier executor scopes"),
             Err(error) => tracing::warn!("earlier executor scopes remain: {error}"),

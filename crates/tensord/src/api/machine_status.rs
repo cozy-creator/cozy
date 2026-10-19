@@ -2,7 +2,7 @@
 //! readiness receipt; a machine-scope cap gets the whole picture, sent again whenever it changes.
 //! An open stream is not activity: only `keepalive` resets the idle deadline, once.
 use super::{auth::VerifiedActor, backend::MachineBackend, domain, http::blocking, v1, MachineIdentity};
-use cozy_proto::error::Error;
+use protocol::error::Error;
 use std::{sync::Arc, time::Duration};
 use tokio_stream::{wrappers::IntervalStream, Stream, StreamExt};
 
@@ -81,7 +81,7 @@ pub(super) fn identity_frame(identity: &MachineIdentity) -> v1::StatusFrame {
         worker_id: identity.authority.worker_id.clone(),
         boot_id: identity.authority.boot_id.clone(),
         version: env!("CARGO_PKG_VERSION").into(),
-        commit: cozy_proto::COMMIT.into(),
+        commit: protocol::COMMIT.into(),
         dev: identity.updates.as_ref().is_some_and(|u| u.dev()),
         capabilities: capabilities(identity),
         receipt: identity.readiness.envelope().unwrap_or_default(),
@@ -165,7 +165,7 @@ pub(super) async fn frame<B: MachineBackend>(
         }),
         driver_floor: match identity.gpus.is_empty() {
             true => String::new(),
-            false => cozy_platform::gpu::DRIVER_FLOOR.into(),
+            false => platform::gpu::DRIVER_FLOOR.into(),
         },
         toolchain: identity.updates.as_ref().map(|u| u.toolchain()).unwrap_or_default(),
         kernels: identity.updates.as_ref().map(|u| u.kernels()).unwrap_or_default(),
@@ -222,7 +222,7 @@ fn held_or_none<T>(listed: Result<Vec<T>, Error>) -> Result<Vec<T>, Error> {
 }
 
 fn disk(path: &std::path::Path) -> Option<v1::Disk> {
-    let space = cozy_platform::durable::space(path).ok()?;
+    let space = platform::durable::space(path).ok()?;
     Some(v1::Disk {
         total_bytes: space.total,
         free_bytes: space.free,

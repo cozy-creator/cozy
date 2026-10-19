@@ -1,6 +1,6 @@
 name: dev-build
 # Builds release artifacts for any ref and runs one targeted test command, off the dev box:
-#   gh workflow run dev-build.yaml -R cozy-creator/cozy-creator -f ref=<sha> [-f build=none] [-f test='cargo test -p cozy-proto']
+#   gh workflow run dev-build.yaml -R cozy-creator/cozy-creator -f ref=<sha> [-f build=none] [-f test='cargo test -p protocol']
 #   TensorFS: -f build=tensorfs -f test='cargo test -p tensorfs-core --test store_contract'
 # Artifacts: tensord-<sha> (the runner arch's manylinux tensord that Runtime's wheel bundles),
 # cozy-<sha> (the runner arch's dev `cozy`, <version>+dev.g<sha8>, which `cozy machine update --tensord`

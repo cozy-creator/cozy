@@ -7,7 +7,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use cozy_proto::error::Error;
+use protocol::error::Error;
 use tokio_stream::Stream;
 
 #[derive(Clone)]

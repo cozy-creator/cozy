@@ -1,5 +1,5 @@
 name: platforms
-# The Rust workspace builds, lints and passes the cozy-platform seams on every release runner, Linux x86_64
+# The Rust workspace builds, lints and passes the platform seams on every release runner, Linux x86_64
 # as the control; the job's verdict is that. TensorD and TensorFS are reported, not judged, where they are
 # not ported yet (xs-043 T, X, WM, AP).
 # Nightly on master, and per question:
@@ -66,14 +66,14 @@ jobs:
       - name: Seams
         id: seams
         continue-on-error: true
-        run: cargo test -p cozy-platform --test seams --locked -- --include-ignored 2>&1 | tee seams.txt; exit "${PIPESTATUS[0]}"
+        run: cargo test -p platform --test seams --locked -- --include-ignored 2>&1 | tee seams.txt; exit "${PIPESTATUS[0]}"
 
-      # The committed machine API spec is what cozy-proto's types generate (xs-044): drift fails the run.
+      # The committed machine API spec is what protocol's types generate (xs-044): drift fails the run.
       - name: Machine API spec
         id: spec
         if: runner.os == 'Linux'
         continue-on-error: true
-        run: cargo test -p cozy-proto --locked --lib machine::api 2>&1 | tee spec.txt; exit "${PIPESTATUS[0]}"
+        run: cargo test -p protocol --locked --lib machine::api 2>&1 | tee spec.txt; exit "${PIPESTATUS[0]}"
 
       - uses: actions/checkout@v5
         if: inputs.runtime_ref != ''
@@ -148,6 +148,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      # No tracked file names a real home directory; tests use only the fake ones allowed here.
+      - name: No local paths
+        run: |
+          git grep -n -I -P '(/hom[e]/|/User[s]/|[A-Za-z]:[\\/]+User[s][\\/]+)(?!(me|a|a b)[\\/])' && exit 1
+          [ $? = 1 ]
       - uses: astral-sh/setup-uv@v7
       - name: Constructor orders
         run: uv run --script crates/tensorfs/scripts/orders.py

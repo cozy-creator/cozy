@@ -1,19 +1,19 @@
 # One workspace for the `cozy` binary (xs-043). The Go tree stays at the root until the cutover.
 [workspace]
 resolver = "3"
-# Listed, not globbed: crates/tensorfs is TensorFS's own tree (its wheel's pyproject.toml,
-# python/, conformance/) holding its three crates, and has no manifest of its own.
+# Listed, not globbed: crates/tensorfs is TensorFS's Python package (pyproject.toml, python/,
+# conformance/), not a crate.
 members = [
     "crates/calcifer",
+    "crates/cli",
     "crates/cozy",
-    "crates/cozy-cli",
-    "crates/cozy-platform",
-    "crates/cozy-proto",
     "crates/hub-client",
+    "crates/platform",
+    "crates/protocol",
     "crates/tensord",
-    "crates/tensorfs/crates/tensorfs-core",
-    "crates/tensorfs/crates/varena",
-    "crates/tensorfs/crates/tensorfs-py",
+    "crates/tensorfs-core",
+    "crates/tensorfs-py",
+    "crates/varena",
 ]
 
 [workspace.package]
@@ -27,14 +27,14 @@ publish = false
 
 [workspace.dependencies]
 calcifer = { path = "crates/calcifer" }
-cozy-cli = { path = "crates/cozy-cli" }
-cozy-platform = { path = "crates/cozy-platform" }
-cozy-proto = { path = "crates/cozy-proto" }
+cli = { path = "crates/cli" }
 hub-client = { path = "crates/hub-client" }
+platform = { path = "crates/platform" }
 portable-pty = "0.9.0"
+protocol = { path = "crates/protocol" }
 tensord = { path = "crates/tensord" }
-tensorfs-core = { path = "crates/tensorfs/crates/tensorfs-core", default-features = false }
-varena = { path = "crates/tensorfs/crates/varena", default-features = false }
+tensorfs-core = { path = "crates/tensorfs-core", default-features = false }
+varena = { path = "crates/varena", default-features = false }
 
 anstream = "1.0.0"
 anstyle = "1.0.14"

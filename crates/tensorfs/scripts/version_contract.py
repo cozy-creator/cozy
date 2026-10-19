@@ -44,7 +44,7 @@ def _python_version_from_cargo(version: str) -> str:
 
 def source_versions() -> tuple[str, str]:
     pyproject = _toml(ROOT / "pyproject.toml")
-    cargo = _toml(ROOT / "crates/tensorfs-py/Cargo.toml")
+    cargo = _toml(ROOT.parent / "tensorfs-py/Cargo.toml")
     python_version = pyproject["project"]["version"]  # type: ignore[index]
     cargo_version = cargo["package"]["version"]  # type: ignore[index]
     requires_python = pyproject["project"]["requires-python"]  # type: ignore[index]
@@ -68,11 +68,11 @@ def source_versions() -> tuple[str, str]:
             f"{python_version!r}"
         )
 
-    for manifest in sorted((ROOT / "crates").glob("*/Cargo.toml")):
+    for manifest in (ROOT.parent / crate / "Cargo.toml" for crate in ("tensorfs-core", "tensorfs-py", "varena")):
         package = _toml(manifest).get("package")
         version = package.get("version") if isinstance(package, dict) else None
         if version != cargo_version:
-            raise ValueError(f"{manifest.relative_to(ROOT)} version {version!r} != {cargo_version!r}")
+            raise ValueError(f"{manifest.relative_to(ROOT.parent)} version {version!r} != {cargo_version!r}")
     return cargo_version, python_version
 
 

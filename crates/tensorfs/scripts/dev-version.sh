@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 v=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -1)
 dev="$v+dev.g$(git rev-parse --short=8 HEAD)"
-perl -pi -e "s/^version = \"\Q$v\E\"\$/version = \"$dev\"/" pyproject.toml crates/*/Cargo.toml
+perl -pi -e "s/^version = \"\Q$v\E\"\$/version = \"$dev\"/" pyproject.toml ../{tensorfs-core,tensorfs-py,varena}/Cargo.toml
 perl -pi -e "s/^(CURRENT_(?:CARGO|PYTHON)_VERSION) = \"\Q$v\E\"\$/\$1 = \"$dev\"/" scripts/version_contract.py
 cargo update --workspace --quiet
 echo "$dev"

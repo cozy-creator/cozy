@@ -8,7 +8,7 @@ pub mod policy;
 
 use policy::{Decision, Facts, Gpu, Holding, Round, Sample, Step};
 use serde::Deserialize;
-use cozy_platform::durable::FileAt;
+use platform::durable::FileAt;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -109,7 +109,7 @@ impl GpuMemory {
                 .map_err(|error| tracing::warn!("memory: sample log {path:?} unavailable: {error}"))
                 .ok()
         });
-        let sampler = match cozy_platform::gpu::Device::open(device) {
+        let sampler = match platform::gpu::Device::open(device) {
             Ok(opened) => {
                 ledger.lock().unwrap().device = opened.key().to_string();
                 let (watched, cells, notes) = (ledger.clone(), running.clone(), notes.clone());

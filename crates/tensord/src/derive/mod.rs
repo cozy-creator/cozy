@@ -42,7 +42,7 @@ pub(crate) mod tests;
 pub use adapter::{compose, Composed, Selection, GRAPH_FILE};
 pub use source::serve_source;
 
-use cozy_platform::ipc::LocalStream;
+use platform::ipc::LocalStream;
 use std::{
     cell::RefCell,
     collections::BTreeSet,

@@ -7,7 +7,7 @@ use crate::{
     execution::Engine,
     journal::{Artifact, Execution, HeldMemo, ResultRecord},
 };
-use cozy_platform::durable::FileAt;
+use platform::durable::FileAt;
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},

@@ -11,8 +11,8 @@ use calcifer::{
     store::{Ask, AskKind, AskState, MachineRow, State, Store},
 };
 use common::{SilentHub, Tensord, until};
-use cozy_platform::{durable, lock::LockFile, paths::Home};
-use cozy_proto::{
+use platform::{durable, lock::LockFile, paths::Home};
+use protocol::{
     calcifer::{
         Ended, Event, Holder, Kind, Machine, MachineKind, MachineList, MachineLog, MachineState,
         Status, SubmitRun,
@@ -70,7 +70,7 @@ fn gpus(spec: v1::RunSpec, gpus: u32) -> v1::RunSpec {
     v1::RunSpec { gpus, ..spec }
 }
 
-fn run_of(event: &Event) -> Option<&cozy_proto::calcifer::Run> {
+fn run_of(event: &Event) -> Option<&protocol::calcifer::Run> {
     match event {
         Event::Queued { run, .. }
         | Event::InProgress { run, .. }
@@ -109,7 +109,7 @@ async fn a_machine_is_added_only_at_its_fingerprint_with_this_controllers_key_ad
     let machines = machines(&calcifer, home.path());
     let address = machine.endpoint.address.clone();
     let fingerprint = Digest::from_bytes(machine.endpoint.pin);
-    let refused = |e: cozy_proto::error::Error| e.code;
+    let refused = |e: protocol::error::Error| e.code;
 
     let wrong = machines
         .add("box", &address, &Digest::of(b"another leaf"))
@@ -499,7 +499,7 @@ async fn the_machine_routes_answer_over_loopback() {
     let home = tempfile::tempdir().unwrap();
     admit(home.path());
     let machine = Tensord::start();
-    let loaded = cozy_proto::config::Loaded {
+    let loaded = protocol::config::Loaded {
         config: Default::default(),
         home: Home::at(home.path()),
         user_home: home.path().to_owned(),

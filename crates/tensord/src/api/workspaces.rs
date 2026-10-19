@@ -2,7 +2,7 @@
 use super::{auth::VerifiedActor, domain};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use cozy_platform::durable::Mode;
+use platform::durable::Mode;
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
@@ -12,7 +12,7 @@ use std::{
 };
 use crate::{storage::Store, trees};
 use tensorfs_core::{format::ObjectRef, sha256};
-use cozy_proto::error::Error;
+use protocol::error::Error;
 
 const MAX_FILES: usize = 129;
 const MAX_SET_BYTES: u64 = 1 << 30;
@@ -126,7 +126,7 @@ impl WorkspaceUploads {
                 "upload root must be a real owned directory",
             ));
         }
-        cozy_platform::durable::set_mode(root, 0o700).map_err(std::io::Error::from).map_err(disk)?;
+        platform::durable::set_mode(root, 0o700).map_err(std::io::Error::from).map_err(disk)?;
         sync_dir(root)?;
         Ok(Arc::new(Self {
             root: root.to_owned(),
@@ -191,7 +191,7 @@ impl WorkspaceUploads {
         };
         let payload = match &record.object {
             Some(object) => self.store.file(&object.reference()).map_err(storage)?,
-            None => cozy_platform::durable::open_nofollow(&directory.join(format!("{}.partial", record.carrier.filename)), OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600)).map_err(std::io::Error::from)
+            None => platform::durable::open_nofollow(&directory.join(format!("{}.partial", record.carrier.filename)), OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600)).map_err(std::io::Error::from)
                 .map_err(disk)?,
         };
         if !payload.metadata().map_err(disk)?.is_file() {
@@ -298,7 +298,7 @@ impl WorkspaceUploads {
                     "upload namespace must be a real directory",
                 ));
             }
-            cozy_platform::durable::set_mode(path, 0o700).map_err(std::io::Error::from).map_err(disk)?;
+            platform::durable::set_mode(path, 0o700).map_err(std::io::Error::from).map_err(disk)?;
             sync_dir(path.parent().expect("owned namespace parent"))?;
         }
         Ok(operation)
@@ -560,7 +560,7 @@ fn validate_archive(file: &File) -> Result<(), Error> {
 }
 
 fn lock(directory: &Path) -> Result<File, Error> {
-    let file = cozy_platform::durable::open_nofollow(&directory.join("operation.lock"), OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600)).map_err(std::io::Error::from)
+    let file = platform::durable::open_nofollow(&directory.join("operation.lock"), OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600)).map_err(std::io::Error::from)
         .map_err(disk)?;
     file.try_lock_exclusive()
         .map_err(|_| Error::conflict("aborted", "this owner operation already has a live uploader"))?;
@@ -570,7 +570,7 @@ fn read_record(path: &Path) -> Result<Option<Record>, Error> {
     read_json(path)
 }
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, Error> {
-    match cozy_platform::durable::open_nofollow(path, OpenOptions::new().read(true)).map_err(std::io::Error::from)
+    match platform::durable::open_nofollow(path, OpenOptions::new().read(true)).map_err(std::io::Error::from)
     {
         Ok(file) => {
             if !file.metadata().map_err(disk)?.is_file() {
@@ -602,7 +602,7 @@ fn atomic_record<T: Serialize>(path: &Path, record: &T) -> Result<(), Error> {
     let temporary = path.with_extension("pending");
     let bytes = serde_json::to_vec(record)
         .map_err(|_| Error::internal("internal", "cannot encode typed upload record"))?;
-    let mut file = cozy_platform::durable::open_nofollow(&temporary, OpenOptions::new().create(true).truncate(true).write(true).mode(0o600)).map_err(std::io::Error::from)
+    let mut file = platform::durable::open_nofollow(&temporary, OpenOptions::new().create(true).truncate(true).write(true).mode(0o600)).map_err(std::io::Error::from)
         .map_err(disk)?;
     file.write_all(&bytes).map_err(disk)?;
     file.sync_all().map_err(disk)?;
@@ -610,7 +610,7 @@ fn atomic_record<T: Serialize>(path: &Path, record: &T) -> Result<(), Error> {
     sync_dir(path.parent().expect("owned record parent"))
 }
 fn sync_dir(path: &Path) -> Result<(), Error> {
-    cozy_platform::durable::sync_dir(path).map_err(|error| disk(error.into()))
+    platform::durable::sync_dir(path).map_err(|error| disk(error.into()))
 }
 fn disk(error: std::io::Error) -> Error {
     Error::unavailable("unavailable", format!("package upload storage unavailable: {error}"))

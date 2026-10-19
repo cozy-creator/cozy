@@ -2,7 +2,7 @@
 //! a tier that holds nothing. Every executor request is refused as `Unsupported`, so the executor
 //! reads its weights from its other sources; facts report an empty tier.
 use crate::access::Fetch;
-use cozy_platform::contain::host_memory::HostMemory;
+use platform::contain::host_memory::HostMemory;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fs::File, io, sync::Arc, time::Duration};
@@ -146,7 +146,7 @@ impl HostTier {
 
     pub fn facts(&self) -> HostTierFacts {
         HostTierFacts {
-            host: cozy_platform::contain::host_memory::read(),
+            host: platform::contain::host_memory::read(),
             limit: 0,
             charged_bytes: 0,
             held_bytes: 0,

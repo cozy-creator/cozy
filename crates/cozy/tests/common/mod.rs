@@ -95,11 +95,11 @@ impl Home {
     pub fn sign_in(&self, email: &str) -> String {
         let url = std::env::var("TENSORHUB_ORIGIN").expect("a Tensorhub");
         let log = std::env::var("TENSORHUB_LOG").expect("the Tensorhub's log");
-        let hub = cozy_proto::config::Hub {
+        let hub = protocol::config::Hub {
             name: Some("ci".into()),
-            origin: cozy_proto::config::Origin::parse(&url).unwrap(),
+            origin: protocol::config::Origin::parse(&url).unwrap(),
         };
-        let home = cozy_platform::paths::Home::at(self.root());
+        let home = platform::paths::Home::at(self.root());
         let name = email.split('@').next().unwrap().to_owned();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -161,11 +161,11 @@ impl Home {
 
     /// Where `cozy` keeps this home's device key for the Hub at `url`.
     pub fn device_key(&self, url: &str) -> PathBuf {
-        let hub = cozy_proto::config::Hub {
+        let hub = protocol::config::Hub {
             name: None,
-            origin: cozy_proto::config::Origin::parse(url).unwrap(),
+            origin: protocol::config::Origin::parse(url).unwrap(),
         };
-        hub.device_key(&cozy_platform::paths::Home::at(self.root()))
+        hub.device_key(&platform::paths::Home::at(self.root()))
     }
 
     /// `cozy` with this home, no inherited credentials and no user service manager: a Calcifer

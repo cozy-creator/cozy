@@ -9,7 +9,7 @@ use crate::{
     device_executor::{Answer, Frame, Kind},
     reclaim::{self, TTL},
 };
-use cozy_platform::durable::Mode;
+use platform::durable::Mode;
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
@@ -152,10 +152,10 @@ impl Memo {
                 .map_or(0, |d| d.as_nanos());
             let local = spool.join(format!("stage-memo-{}-{stamp}.safetensors", &key[..16]));
             // Never through a link.
-            cozy_platform::durable::open_nofollow(&local, OpenOptions::new().write(true).create_new(true).mode(0o644))?
+            platform::durable::open_nofollow(&local, OpenOptions::new().write(true).create_new(true).mode(0o644))?
                 .write_all(&raw)?;
             // Its last use, for the least-recently-used order.
-            let _ = cozy_platform::durable::set_times(&entry.path, fs::FileTimes::new().set_modified(SystemTime::now()));
+            let _ = platform::durable::set_times(&entry.path, fs::FileTimes::new().set_modified(SystemTime::now()));
             return Ok(Some((local.to_string_lossy().into_owned(), entry.cost_ms)));
         }
     }
@@ -274,7 +274,7 @@ fn spooled(spool: &Path, local: &Path, length: u64) -> Option<Vec<u8>> {
     if local.parent() != Some(spool) {
         return None;
     }
-    let file = cozy_platform::durable::open_nofollow(local, OpenOptions::new().read(true)).map_err(std::io::Error::from)
+    let file = platform::durable::open_nofollow(local, OpenOptions::new().read(true)).map_err(std::io::Error::from)
         .ok()?;
     if !file.metadata().ok()?.is_file() {
         return None;

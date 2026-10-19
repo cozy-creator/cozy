@@ -1,8 +1,8 @@
-//! Each GPU's memory sampler thread over `cozy_platform::gpu::Device` (NVML, opened at run time;
+//! Each GPU's memory sampler thread over `platform::gpu::Device` (NVML, opened at run time;
 //! no CUDA). Read only on that thread, never on the API or journal loop: a driver stall stalls
 //! that thread alone.
 use super::policy::Sample;
-use cozy_platform::gpu::Device;
+use platform::gpu::Device;
 use std::{
     io,
     sync::{Arc, Condvar, Mutex},

@@ -14,7 +14,7 @@ classifiers = [
 ]
 
 [tool.maturin]
-manifest-path = "crates/tensorfs-py/Cargo.toml"
+manifest-path = "../tensorfs-py/Cargo.toml"
 module-name = "tensorfs._ext"
 python-source = "python"
 features = ["extension-module", "store"]

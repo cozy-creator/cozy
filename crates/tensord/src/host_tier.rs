@@ -10,7 +10,7 @@
 //! a sealed streaming window that TensorD refills as Runtime claims regions. These are data
 //! paths for a granted weight set, not permission for the executor to open the managed Store.
 use crate::access::Fetch;
-use cozy_platform::contain::host_memory::HostMemory;
+use platform::contain::host_memory::HostMemory;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -449,7 +449,7 @@ impl HostTier {
         };
         let mut need = stage.as_deref().map_or(layout.nbytes, spans);
         loop {
-            let host = cozy_platform::contain::host_memory::read();
+            let host = platform::contain::host_memory::read();
             let charged = state.charged();
             if charged + need <= self.limit.limit(&host, charged) {
                 break;
@@ -550,7 +550,7 @@ impl HostTier {
                 None => break,
             }
         }
-        let room = self.limit.staging(&cozy_platform::contain::host_memory::read(), state.charged());
+        let room = self.limit.staging(&platform::contain::host_memory::read(), state.charged());
         let slots = ((room / span) as usize).clamp(1, layout.regions.len().max(1));
         state.slots.insert(key.clone(), Slot::Opening(slots as u64 * span));
         drop(state);
@@ -637,7 +637,7 @@ impl HostTier {
     fn stage_regions(&self, key: &str, regions: &[u32], fetch: Option<&Arc<Fetch>>) -> Vec<u32> {
         let mut state = self.state.lock().unwrap();
         let limit = |state: &State| {
-            let host = cozy_platform::contain::host_memory::read();
+            let host = platform::contain::host_memory::read();
             let charged = state.charged();
             (charged, self.limit.limit(&host, charged))
         };
@@ -704,7 +704,7 @@ impl HostTier {
                 .map(|&r| staging.layout.regions[r as usize].span)
                 .sum();
             let charged = state.charged();
-            if charged + need > self.limit.limit(&cozy_platform::contain::host_memory::read(), charged) {
+            if charged + need > self.limit.limit(&platform::contain::host_memory::read(), charged) {
                 return false;
             }
             rest
@@ -846,7 +846,7 @@ impl HostTier {
     pub fn facts(&self) -> HostTierFacts {
         let mut state = self.state.lock().unwrap();
         self.reap(&mut state);
-        let host = cozy_platform::contain::host_memory::read();
+        let host = platform::contain::host_memory::read();
         let charged = state.charged();
         let (mut held, mut filling) = (0, 0);
         let (mut windows, mut window_bytes, mut window_read_bytes) = (0, 0, 0);
@@ -894,9 +894,9 @@ impl HostTier {
 
     /// A sealed memfd of exactly the declared bytes and digest.
     fn body(request: SealedRequest<'_>, plan: File) -> io::Result<Vec<u8>> {
-        if cozy_platform::shm::seals(std::os::fd::AsFd::as_fd(&plan))? & cozy_platform::shm::NO_WRITE_SEALS != cozy_platform::shm::NO_WRITE_SEALS
+        if platform::shm::seals(std::os::fd::AsFd::as_fd(&plan))? & platform::shm::NO_WRITE_SEALS != platform::shm::NO_WRITE_SEALS
             || plan.metadata()?.len() != request.length
-            || request.length > crate::protocol::MAX_FRAME as u64
+            || request.length > crate::seam::MAX_FRAME as u64
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -959,7 +959,7 @@ impl HostTier {
         let ended: Vec<u64> = state
             .peers
             .iter()
-            .filter(|(_, peer)| cozy_platform::process::ended(&peer.pidfd))
+            .filter(|(_, peer)| platform::process::ended(&peer.pidfd))
             .map(|(id, _)| *id)
             .collect();
         for id in &ended {
@@ -1026,7 +1026,7 @@ impl HostTier {
         state.ledger.released += 1;
         state.ledger.released_bytes += entry.charged;
         match file {
-            Ok((dev, ino)) if cozy_platform::shm::held(dev, ino).is_ok_and(|held| !held) => state.ledger.freed_bytes += entry.charged,
+            Ok((dev, ino)) if platform::shm::held(dev, ino).is_ok_and(|held| !held) => state.ledger.freed_bytes += entry.charged,
             _ => state.ledger.stranded_bytes += entry.charged,
         }
     }
@@ -1159,14 +1159,14 @@ mod tests {
     #[test]
     fn a_sealed_plan_over_64_mib_is_read_and_a_lying_length_is_refused() {
         let body = vec![b' '; (64 << 20) + 1];
-        let mut file = cozy_platform::shm::memfd_named("tensord-weights").map(std::fs::File::from).unwrap();
+        let mut file = platform::shm::memfd_named("tensord-weights").map(std::fs::File::from).unwrap();
         file.write_all(&body).unwrap();
-        cozy_platform::shm::seal_with(std::os::fd::AsFd::as_fd(&file), cozy_platform::shm::NO_WRITE_SEALS).unwrap();
+        platform::shm::seal_with(std::os::fd::AsFd::as_fd(&file), platform::shm::NO_WRITE_SEALS).unwrap();
         let sha256 = format!("{:x}", Sha256::digest(&body));
         let request = |length| SealedRequest { sha256: &sha256, length, stage: None };
         let read = HostTier::body(request(body.len() as u64), file.try_clone().unwrap()).unwrap();
         assert!(read == body);
-        let lying = HostTier::body(request(crate::protocol::MAX_FRAME as u64 + 1), file);
+        let lying = HostTier::body(request(crate::seam::MAX_FRAME as u64 + 1), file);
         assert_eq!(lying.unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 }

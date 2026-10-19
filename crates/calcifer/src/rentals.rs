@@ -10,8 +10,8 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use cozy_platform::paths::Home;
-use cozy_proto::{
+use platform::paths::Home;
+use protocol::{
     calcifer::{
         Ended, HubListing, HubProblem, Machine, MachineKind, MachineState, Quote, Reason, Rental,
         Rented, Warning,
@@ -1089,7 +1089,7 @@ fn other(origin: &str, rental: &types::Rental, unverified: bool) -> Machine {
             .cert_pem
             .as_deref()
             .and_then(pin_of)
-            .map(cozy_proto::ids::Digest::from_bytes),
+            .map(protocol::ids::Digest::from_bytes),
         reason: None,
         rental: Some(view(rental, None)),
         status: None,

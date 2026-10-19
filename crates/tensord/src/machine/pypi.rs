@@ -77,7 +77,7 @@ pub fn wheel(distribution: &str, version: &str, dir: &Path, machine: &Machine, s
 pub fn wheel_at(url: &str, sha256: &str, file: &str, dir: &Path, machine: &Machine, stop: &Stop) -> io::Result<PathBuf> {
     // A private server's root as uv trusts it: the bundle SSL_CERT_FILE names. Only this fetch
     // reads it; the Hub's clients trust their own CA alone.
-    let bundle = cozy_proto::config::environment().get("SSL_CERT_FILE").and_then(|path| fs::read(path).ok()).filter(|pem| !pem.is_empty());
+    let bundle = protocol::config::environment().get("SSL_CERT_FILE").and_then(|path| fs::read(path).ok()).filter(|pem| !pem.is_empty());
     let failed = |e: Refusal| match e.code {
         Code::OBJECT_ID_MISMATCH => io::Error::other(super::update::Coded {
             code: "wheel_digest_mismatch",

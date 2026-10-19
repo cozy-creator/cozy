@@ -1,7 +1,7 @@
 //! Degree 2 GPU custody where the OS cannot share an executor's device memory by handle
 //! (macOS, Windows): the same types, and a custody that holds nothing. The pool keeps none there
 //! (`gpu_service`), so nothing reaches these; each still answers as an empty custody would.
-use cozy_platform::{handles::Owned, process::Birth};
+use platform::{handles::Owned, process::Birth};
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io};
 

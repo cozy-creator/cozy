@@ -8,7 +8,7 @@ mod common;
 use std::path::Path;
 
 use common::{Home, Out, package, tensord};
-use cozy_proto::{
+use protocol::{
     calcifer::{Kind, On, SubmitRun},
     machine as v1,
 };
@@ -197,10 +197,10 @@ fn an_unversioned_install_takes_the_hubs_newest_release() {
 
     // The ask as it reached the machine before: no release, no catalog revision.
     package::publish(&home, "tiny", "0.1.2");
-    let lock = cozy_platform::lock::LockFile::new(
-        cozy_platform::paths::Home::at(home.root()).calcifer_lock(),
+    let lock = platform::lock::LockFile::new(
+        platform::paths::Home::at(home.root()).calcifer_lock(),
     );
-    let holder: cozy_proto::calcifer::Holder =
+    let holder: protocol::calcifer::Holder =
         serde_json::from_slice(&lock.holder().unwrap().expect("Calcifer runs")).unwrap();
     let ask = SubmitRun {
         on: On::Machine("t1".into()),

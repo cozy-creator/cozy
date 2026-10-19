@@ -7,8 +7,8 @@ mod common;
 use std::{path::Path, sync::Arc};
 
 use calcifer::{Calcifer, machines::Machines};
-use cozy_platform::paths::Home;
-use cozy_proto::{
+use platform::paths::Home;
+use protocol::{
     calcifer::{Kind, On, SubmitRun},
     config, machine as v1,
 };

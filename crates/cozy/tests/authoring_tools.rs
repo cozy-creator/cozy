@@ -37,7 +37,7 @@ fn a_lock_with_no_uv_fetches_the_pinned_one() {
     let uv = home
         .root()
         .join("tools/uv")
-        .join(cozy_platform::tools::UV_VERSION)
+        .join(platform::tools::UV_VERSION)
         .join("uv");
     assert!(
         uv.is_file(),

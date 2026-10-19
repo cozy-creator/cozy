@@ -349,7 +349,7 @@ fn read_pending(paths: &Paths) -> io::Result<Option<Pending>> {
 
 fn remove_pending(paths: &Paths) -> io::Result<()> {
     fs::remove_file(paths.update("pending.json"))?;
-    cozy_platform::durable::sync_dir(&paths.update("")).map_err(io::Error::from)
+    platform::durable::sync_dir(&paths.update("")).map_err(io::Error::from)
 }
 
 /// The activation's status as last written (its later steps), else as it was when pending.
@@ -375,7 +375,7 @@ pub struct Updates {
     /// The running update's stop: its cancel ends the download in flight.
     stop: Mutex<Stop>,
     /// The build toolchain as last probed: at start and after each install.
-    toolchain: Mutex<Option<cozy_proto::machine::Toolchain>>,
+    toolchain: Mutex<Option<protocol::machine::Toolchain>>,
 }
 
 impl Updates {
@@ -386,7 +386,7 @@ impl Updates {
         machine: Option<Arc<Machine>>,
     ) -> io::Result<Arc<Self>> {
         fs::create_dir_all(paths.update("staged"))?;
-        cozy_platform::durable::sync_dir(&paths.engine)?;
+        platform::durable::sync_dir(&paths.engine)?;
         let mut status = fs::read(paths.update("status.json"))
             .ok()
             .and_then(|raw| serde_json::from_slice::<Status>(&raw).ok());
@@ -409,7 +409,7 @@ impl Updates {
     }
 
     /// The build toolchain, probed once and again after each install.
-    pub fn toolchain(&self) -> cozy_proto::machine::Toolchain {
+    pub fn toolchain(&self) -> protocol::machine::Toolchain {
         let mut held = self.toolchain.lock().unwrap();
         if held.is_none() {
             *held = Some(self.probe_toolchain());
@@ -425,15 +425,15 @@ impl Updates {
         toolchain
     }
 
-    fn probe_toolchain(&self) -> cozy_proto::machine::Toolchain {
-        let environment = cozy_proto::config::environment();
+    fn probe_toolchain(&self) -> protocol::machine::Toolchain {
+        let environment = protocol::config::environment();
         let path: Vec<PathBuf> = environment.get("PATH").map(|p| std::env::split_paths(p).collect()).unwrap_or_default();
         let cuda_home = environment.get("CUDA_HOME").map(PathBuf::from);
         super::toolchain::probe(&super::toolchain::dir(&self.paths.engine), cuda_home.as_deref(), &path)
     }
 
     /// Each kernel's verdict on this machine, as the Runtime keeps them under its kernel store.
-    pub fn kernels(&self) -> Vec<cozy_proto::machine::KernelVerdict> {
+    pub fn kernels(&self) -> Vec<protocol::machine::KernelVerdict> {
         super::toolchain::verdicts(&self.paths.engine.join("gpu/kernels"))
     }
 
@@ -715,7 +715,7 @@ impl Updates {
                 let sdk = self.paths.engine.join("sdk");
                 fs::create_dir_all(&sdk)?;
                 // On the first update this also created engine/sdk; persist that parent entry.
-                cozy_platform::durable::sync_dir(&self.paths.engine)?;
+                platform::durable::sync_dir(&self.paths.engine)?;
                 // Caller operation IDs are receipt identities, never filesystem paths. Every
                 // attempt prepares a fresh immutable generation, a historical operation's retry too.
                 let candidate = sdk.join(format!("candidate-{}", hex(&super::identity::random::<16>()?)));
@@ -903,7 +903,7 @@ impl Updates {
                 }
             }
         }
-        cozy_platform::durable::sync_dir(candidate)?;
+        platform::durable::sync_dir(candidate)?;
         identified(candidate)
     }
 
@@ -939,7 +939,7 @@ impl Updates {
         let input: String = wheels.iter().map(|p| p.display().to_string() + "\n").collect();
         super::client::ensure_uv(&self.paths.uv)?;
         let mut command = std::process::Command::new(&self.paths.uv);
-        let mut child = cozy_platform::process::own_group(&mut command)
+        let mut child = platform::process::own_group(&mut command)
             .args(["pip", "compile", "--quiet", "--no-config", "--no-cache", "--no-header", "--no-annotate", "--python", "3.12", "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1140,7 +1140,7 @@ fn previous_link(link: &Path) -> io::Result<Option<PathBuf>> {
 pub(crate) fn relink(link: &Path, target: Option<&Path>) -> io::Result<()> {
     let Some(target) = target else {
         return match unlink(link) {
-            Ok(()) => Ok(cozy_platform::durable::sync_dir(link.parent().expect("link has a parent"))?),
+            Ok(()) => Ok(platform::durable::sync_dir(link.parent().expect("link has a parent"))?),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         };
@@ -1150,16 +1150,16 @@ pub(crate) fn relink(link: &Path, target: Option<&Path>) -> io::Result<()> {
         .ok_or_else(|| invalid("a link needs a directory"))?;
     fs::create_dir_all(dir)?;
     // The first activation creates the link's directory. Its entry must survive with the link.
-    cozy_platform::durable::sync_dir(dir.parent().ok_or_else(|| invalid("a link directory needs a parent"))?)?;
+    platform::durable::sync_dir(dir.parent().ok_or_else(|| invalid("a link directory needs a parent"))?)?;
     let temp = dir.join(format!(".link-{}", hex(&super::identity::random::<8>()?)));
-    cozy_platform::durable::symlink(target, &temp)?;
+    platform::durable::symlink(target, &temp)?;
     #[cfg(windows)]
     match unlink(link) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
         _ => {}
     }
     fs::rename(&temp, link)?;
-    Ok(cozy_platform::durable::sync_dir(dir)?)
+    Ok(platform::durable::sync_dir(dir)?)
 }
 
 /// Removes the link itself, never its target: a Windows directory link is a directory entry.

@@ -7,7 +7,7 @@ fn main() -> std::process::ExitCode {
         [noun, role, rest @ ..] if *noun == "machine" && *role == "serve" => {
             machine(std::iter::once(*role).chain(rest.iter().copied()).cloned())
         }
-        _ => cozy_cli::main(),
+        _ => cli::main(),
     }
 }
 

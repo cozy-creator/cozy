@@ -1,7 +1,7 @@
 //! Materialize verified package carriers and call the trusted Python/uv installer.
 //! The service commits actor/installation aliases in its one execution journal.
 use super::workspaces::{RootSet, UploadedPackage};
-use cozy_platform::durable::Mode;
+use platform::durable::Mode;
 use fs2::FileExt;
 use serde::Deserialize;
 use std::{
@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 use crate::stop::Stop;
-use cozy_proto::error::Error;
+use protocol::error::Error;
 use crate::triage::masked;
 
 #[derive(Clone)]
@@ -77,7 +77,7 @@ pub fn materialize_uploaded(
     fs::create_dir_all(staging).map_err(storage)?;
     let root = staging.join(uuid::Uuid::new_v4().to_string());
     fs::create_dir(&root).map_err(storage)?;
-    cozy_platform::durable::set_mode(&root, 0o700).map_err(std::io::Error::from).map_err(storage)?;
+    platform::durable::set_mode(&root, 0o700).map_err(std::io::Error::from).map_err(storage)?;
     let hold = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -120,17 +120,17 @@ pub fn materialize_uploaded(
                 }
                 fs::create_dir_all(target.parent().expect("source member parent"))
                     .map_err(storage)?;
-                let mut output = cozy_platform::durable::open_nofollow(&target, OpenOptions::new().create_new(true).write(true).mode(0o600)).map_err(std::io::Error::from)
+                let mut output = platform::durable::open_nofollow(&target, OpenOptions::new().create_new(true).write(true).mode(0o600)).map_err(std::io::Error::from)
                     .map_err(storage)?;
                 std::io::copy(&mut entry, &mut output).map_err(storage)?;
                 output.sync_all().map_err(storage)?;
-                cozy_platform::durable::set_mode(&target, entry.header().mode().map_err(storage)? & 0o777).map_err(std::io::Error::from)
+                platform::durable::set_mode(&target, entry.header().mode().map_err(storage)? & 0o777).map_err(std::io::Error::from)
                 .map_err(storage)?;
             }
             materialized.project = Some(project);
         } else {
             let path = materialized.root.join(&carrier.filename);
-            let mut output = cozy_platform::durable::open_nofollow(&path, OpenOptions::new().create_new(true).write(true).mode(0o600)).map_err(std::io::Error::from)
+            let mut output = platform::durable::open_nofollow(&path, OpenOptions::new().create_new(true).write(true).mode(0o600)).map_err(std::io::Error::from)
                 .map_err(storage)?;
             std::io::copy(&mut { file }, &mut output).map_err(storage)?;
             output.sync_all().map_err(storage)?;
@@ -221,7 +221,7 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Error>
             .map_err(|e| Error::unavailable("unavailable", format!("the installer helper: {e}")))?;
     }
     let mut command = Command::new(&config.helper_python);
-    cozy_platform::process::inherit_nothing(&mut command);
+    platform::process::inherit_nothing(&mut command);
     // The uploaded build backend runs here: it gets the machine's environment without
     // credentials or Runtime-owned names, never the whole service environment.
     command
@@ -262,7 +262,7 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Error>
 /// with its run's cancel (`stop`), or when it stops moving past its measured patience
 /// (`process::supervise`); a long install that moves is never killed.
 fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&Stop>) -> Result<PreparedGeneration, Error> {
-    let mut child = cozy_platform::process::own_group(&mut command)
+    let mut child = platform::process::own_group(&mut command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -315,7 +315,7 @@ fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&Stop>) 
     }
     let returned: GenerationRecord = serde_json::from_slice(&output)
         .map_err(|_| Error::internal("custody_corrupt", "installer returned an invalid typed generation record"))?;
-    let generations = cozy_platform::durable::canonical(&config.generations).map_err(std::io::Error::from).map_err(storage)?;
+    let generations = platform::durable::canonical(&config.generations).map_err(std::io::Error::from).map_err(storage)?;
     if returned.identity.len() != 32
         || !returned
             .identity
@@ -332,21 +332,21 @@ fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&Stop>) 
         .map_err(storage)?
         .file_type()
         .is_symlink()
-        || cozy_platform::durable::canonical(&directory).map_err(std::io::Error::from).map_err(storage)? != directory
+        || platform::durable::canonical(&directory).map_err(std::io::Error::from).map_err(storage)? != directory
     {
         return Err(Error::internal("custody_corrupt",
             "published generation path is not an owned native directory",
         ));
     }
-    let hold = cozy_platform::durable::open_nofollow(&directory.join(".hold"), OpenOptions::new().read(true)).map_err(std::io::Error::from)
+    let hold = platform::durable::open_nofollow(&directory.join(".hold"), OpenOptions::new().read(true)).map_err(std::io::Error::from)
         .map_err(storage)?;
     hold.lock_shared().map_err(storage)?;
-    let file = cozy_platform::durable::open_nofollow(&directory.join("generation.json"), OpenOptions::new().read(true)).map_err(std::io::Error::from)
+    let file = platform::durable::open_nofollow(&directory.join("generation.json"), OpenOptions::new().read(true)).map_err(std::io::Error::from)
         .map_err(storage)?;
     let record: GenerationRecord = serde_json::from_reader(file.take(8 << 20))
         .map_err(|_| Error::internal("custody_corrupt", "published generation manifest is invalid"))?;
     if record.identity != returned.identity
-        || record.python != cozy_platform::paths::venv_python(&directory.join("env"))
+        || record.python != platform::paths::venv_python(&directory.join("env"))
         || !record.python.is_file()
     {
         return Err(Error::internal("custody_corrupt",
@@ -411,7 +411,7 @@ fn helper_path(uv: &Path) -> std::ffi::OsString {
         .into_iter()
         .collect();
     dirs.extend(
-        cozy_proto::config::environment()
+        protocol::config::environment()
             .get("PATH")
             .iter()
             .flat_map(std::env::split_paths),

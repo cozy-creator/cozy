@@ -11,8 +11,8 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use calcifer::store::{Endpoint, MachineRow};
-use cozy_platform::durable;
-use cozy_proto::{
+use platform::durable;
+use protocol::{
     calcifer::{Event, Kind, MachineKind, MachineState, On, StagedInput, SubmitRun},
     ids::{Digest, RunId},
     machine as v1,
@@ -213,11 +213,11 @@ pub fn warm_spec(hub: &str, inputs: Vec<v1::InputFile>) -> v1::RunSpec {
 }
 
 /// A file the run names as an input, and what the spec says of it.
-pub fn input_file(dir: &Path, bytes: &[u8]) -> (cozy_proto::calcifer::StagedInput, v1::InputFile) {
+pub fn input_file(dir: &Path, bytes: &[u8]) -> (protocol::calcifer::StagedInput, v1::InputFile) {
     let path = dir.join(format!("input-{}", bytes.len()));
     std::fs::write(&path, bytes).unwrap();
     let digest = Digest::of(bytes);
-    let staged = cozy_proto::calcifer::StagedInput {
+    let staged = protocol::calcifer::StagedInput {
         path,
         digest,
         length: bytes.len() as u64,
@@ -254,12 +254,12 @@ pub async fn until(
 
 /// Local code a machine accepts with no Runtime: a manifest naming a package and nothing else,
 /// staged as the run's input, and a warm (install-only) spec of it.
-pub fn local_spec(dir: &Path) -> (cozy_proto::calcifer::StagedInput, v1::RunSpec) {
+pub fn local_spec(dir: &Path) -> (protocol::calcifer::StagedInput, v1::RunSpec) {
     let bytes = br#"{"package":"local/hello"}"#;
     let path = dir.join("manifest.json");
     std::fs::write(&path, bytes).unwrap();
     let digest = Digest::of(bytes);
-    let staged = cozy_proto::calcifer::StagedInput {
+    let staged = protocol::calcifer::StagedInput {
         path,
         digest,
         length: bytes.len() as u64,
@@ -287,7 +287,7 @@ pub async fn holds_as(link: &calcifer::Link, id: &RunId, spec: v1::RunSpec) -> b
 /// A TensorD running as a computer's persistent machine from a grant (`tensord run`): unlike
 /// `serve`, it installs local packages. It admits the test's key.
 pub struct Machine {
-    tree: cozy_platform::process::Tree,
+    tree: platform::process::Tree,
     pub root: tempfile::TempDir,
     pub endpoint: Endpoint,
 }
@@ -323,7 +323,7 @@ impl Machine {
             .env("COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_FILE", &receipt)
             .env("CUDA_VISIBLE_DEVICES", "")
             .stdout(Stdio::null());
-        let mut tree = cozy_platform::process::spawn(command).unwrap();
+        let mut tree = platform::process::spawn(command).unwrap();
         let leaf = machine.join("run/cozy/bootstrap/tls.crt");
         // A hang bound for a machine that never starts; the product waits without one.
         let until = Instant::now() + Duration::from_secs(120);

@@ -1,8 +1,8 @@
 //! The machine's launch grant: what a Hub (rental) or this computer's home (persistent) gives
 //! it, judged once from [`crate::config`]'s load.
-use cozy_proto::config::MachineConfig;
+use protocol::config::MachineConfig;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use cozy_platform::paths::Home;
+use platform::paths::Home;
 use ed25519_dalek::VerifyingKey;
 use std::{
     fs::{self, File},
@@ -270,7 +270,7 @@ fn private_file(path: &Path) -> io::Result<String> {
     let meta = file.metadata()?;
     if !path.is_absolute()
         || !meta.is_file()
-        || cozy_platform::durable::mode(&meta).is_some_and(|mode| mode & 0o077 != 0)
+        || platform::durable::mode(&meta).is_some_and(|mode| mode & 0o077 != 0)
         || fs::symlink_metadata(path)?.file_type().is_symlink()
     {
         return Err(invalid(

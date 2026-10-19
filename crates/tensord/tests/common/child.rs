@@ -38,7 +38,7 @@ pub fn until_stdin_closes() -> Command {
 }
 
 /// Stops a machine as its service manager does: SIGTERM, which it ends cleanly on, or its end on
-/// Windows (cozy_platform::service's stop).
+/// Windows (platform::service's stop).
 #[allow(dead_code)]
 pub fn stop(machine: &mut std::process::Child) {
     if cfg!(windows) {

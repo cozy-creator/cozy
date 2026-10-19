@@ -1,8 +1,8 @@
 //! Executor process policy: the progress meter's pace, wedge watches and reaping. The OS half
-//! (births, exact handles, groups, meters) is `cozy_platform::process`. Nothing here kills
+//! (births, exact handles, groups, meters) is `platform::process`. Nothing here kills
 //! because time passed. Callers kill on a measured wedge (`Pace`), an owner restart, or a launch
 //! that never reached authored code.
-use cozy_platform::process::{Birth, Exact, State, burn, gone, group_members, meter, read_bytes};
+use platform::process::{Birth, Exact, State, burn, gone, group_members, meter, read_bytes};
 use std::{
     fs::File,
     io,
