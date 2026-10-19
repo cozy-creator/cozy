@@ -241,6 +241,9 @@ fn named(store: &Store, reference: &Bound<'_, PyAny>, variant: Option<&str>) -> 
         if let Some(named) = &ck.get().named {
             return Ok(named.clone());
         }
+        if let Some(stored) = &ck.get().stored {
+            return Ok(Named { header: stored.id().clone(), tree: None, name: None, release: None, variant: None });
+        }
     }
     match reference.extract::<String>() {
         Ok(text) => py.detach(|| store.resolve(&text, variant)).or_raise(py),
@@ -430,6 +433,7 @@ impl PyStore {
         variant: Option<String>,
     ) -> PyResult<Vec<String>> {
         let named = named(&self.store, r#ref, variant.as_deref())?;
+        let checkpoint = r#ref.cast::<PyCheckpoint>().ok().map(|c| c.get().stored(py).cloned()).transpose()?;
         if origin && dequantize.is_some() {
             return Err(invalid(py, "an origin keeps objects as they are: no dequantize"));
         }
@@ -448,7 +452,8 @@ impl PyStore {
                     repo.insert(path.to_owned(), store.path(object)?);
                 }
             }
-            export::safetensors(&store.checkpoint(&named.header)?, &repo, &dir, dtype.as_ref())
+            let checkpoint = checkpoint.map(Ok).unwrap_or_else(|| store.checkpoint(&named.header))?;
+            export::safetensors(&checkpoint, &repo, &dir, dtype.as_ref())
         })
         .or_raise(py)
     }
@@ -1158,6 +1163,56 @@ pub struct PyComponentWriter {
 
 #[pymethods]
 impl PyComponentWriter {
+    #[pyo3(signature = (key, source, as_key = None))]
+    fn copy_component(&self, py: Python<'_>, key: String, source: &PyComponent, as_key: Option<String>) -> PyResult<()> {
+        let ck = source.ck.as_ref().ok_or_else(|| invalid(py, "a parsed component has no bytes"))?.get();
+        self.copy(py, as_key.unwrap_or_else(|| key.clone()), ck, Some(source.name.clone()), Some(key))
+    }
+    /// A CPU DLPack array, or a buffer with an explicit dtype and shape.
+    #[pyo3(signature = (key, data, *, dtype = None, shape = None))]
+    fn put_array(&self, py: Python<'_>, key: String, data: &Bound<'_, PyAny>, dtype: Option<String>, shape: Option<Vec<u64>>) -> PyResult<()> {
+        if !data.hasattr("__dlpack__")? {
+            let dtype = dtype.ok_or_else(|| invalid(py, "a buffer needs dtype"))?;
+            let shape = shape.ok_or_else(|| invalid(py, "a buffer needs shape"))?;
+            return self.put(py, key, dtype, shape, data);
+        }
+        // The unconsumed capsule owns the producer's bytes through the detached write.
+        let capsule = data.call_method0("__dlpack__")?;
+        if unsafe { ffi::PyCapsule_IsValid(capsule.as_ptr(), DLTENSOR.as_ptr()) } != 1 {
+            return Err(invalid(py, "__dlpack__ did not return a dltensor capsule"));
+        }
+        let managed = unsafe { ffi::PyCapsule_GetPointer(capsule.as_ptr(), DLTENSOR.as_ptr()) as *const DLManagedTensor };
+        let tensor = unsafe { &(*managed).dl_tensor };
+        if tensor.device.device_type != KDL_CPU || !(0..=32).contains(&tensor.ndim) || tensor.dtype.lanes != 1 {
+            return Err(invalid(py, "Writer expects a scalar-lane CPU DLPack array"));
+        }
+        if tensor.ndim != 0 && tensor.shape.is_null() {
+            return Err(invalid(py, "DLPack tensor has no shape"));
+        }
+        let dims = if tensor.ndim == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(tensor.shape, tensor.ndim as usize) } };
+        let inferred_shape: Vec<u64> = dims.iter().map(|d| u64::try_from(*d).map_err(|_| invalid(py, "DLPack shape is negative"))).collect::<PyResult<_>>()?;
+        let mut stride = 1i64;
+        for i in (0..dims.len()).rev() {
+            if !tensor.strides.is_null() && dims[i] > 1 && unsafe { *tensor.strides.add(i) } != stride {
+                return Err(invalid(py, "Writer expects a contiguous DLPack array"));
+            }
+            stride = stride.checked_mul(dims[i]).ok_or_else(|| invalid(py, "DLPack shape overflows"))?;
+        }
+        let inferred_dtype = Dtype::known().find(|d| dl_type(d) == Some((tensor.dtype.code, tensor.dtype.bits)))
+            .ok_or_else(|| invalid(py, "DLPack dtype is unsupported"))?;
+        let dtype = dtype.map(|d| Dtype::parse(&d)).unwrap_or_else(|| inferred_dtype.clone());
+        let shape = shape.unwrap_or_else(|| inferred_shape.clone());
+        if dtype != inferred_dtype || shape != inferred_shape {
+            return Err(invalid(py, "explicit dtype or shape disagrees with the DLPack array"));
+        }
+        let len = dtype.byte_len(&shape).and_then(|n| usize::try_from(n).ok()).ok_or_else(|| invalid(py, "DLPack byte size overflows"))?;
+        let address = (tensor.data as usize).checked_add(tensor.byte_offset as usize).ok_or_else(|| invalid(py, "DLPack address overflows"))?;
+        if len != 0 && address == 0 { return Err(invalid(py, "DLPack tensor has no data")); }
+        self.w.get().with(py, |w| {
+            let mut bytes = if len == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(address as *const u8, len) } };
+            Ok(w.get(&self.name).put(&key, &dtype, &shape, Data::Plain(Source::Read(&mut bytes)))?)
+        })
+    }
     /// A plain tensor: `data` is any C-contiguous buffer of exactly its bytes.
     fn put(&self, py: Python<'_>, key: String, dtype: String, shape: Vec<u64>, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let bytes = Bytes::of(data)?;

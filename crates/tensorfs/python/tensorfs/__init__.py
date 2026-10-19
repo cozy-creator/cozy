@@ -41,6 +41,7 @@ from ._ext import (
     plan,
     regions,
 )
+from .api import ComponentWriter, Writer, configure, convert, export, open, snapshot_download, upload_folder
 
 __all__ = [
     "Array",
@@ -71,4 +72,10 @@ __all__ = [
     "parse_header",
     "plan",
     "regions",
+    "configure",
+    "convert",
+    "export",
+    "open",
+    "snapshot_download",
+    "upload_folder",
 ]
