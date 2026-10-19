@@ -356,6 +356,68 @@ impl Store {
         Ok(snapshots)
     }
 
+    /// The collection gate excludes every new sidecar opener while the exclusive probe
+    /// rejects live/inherited directory owners. Unmaterialized checkpoint views leave only
+    /// this sidecar, which must not permanently consume an inode after the owner exits.
+    fn cache_reap_fences(&self) -> Result<()> {
+        for kind in ["snapshots", "views"] {
+            let parent = self.root.join(kind);
+            let entries = match fs::read_dir(&parent) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(fail("list cache fences", &parent)(error)),
+            };
+            for entry in entries {
+                let entry = entry.map_err(fail("list cache fences", &parent))?;
+                let name = entry.file_name();
+                let Some(digest) = name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix('.'))
+                    .and_then(|name| name.strip_suffix(".tensorfs-lock"))
+                    .filter(|name| is_digest(name))
+                else {
+                    continue;
+                };
+                let path = parent.join(digest);
+                if !path
+                    .try_exists()
+                    .map_err(fail("stat cache fence target", &path))?
+                {
+                    if let Some(guard) = retention::try_directory(&path)? {
+                        retention::remove_directory_fence(&path, &guard)?;
+                    }
+                }
+            }
+        }
+        let trash = self.cache_state().join("pruned");
+        match fs::read_dir(&trash) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(fail("list interrupted cache prune", &trash))?;
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str() else { continue };
+                    if ["snapshots-", "views-"]
+                        .iter()
+                        .any(|prefix| name.strip_prefix(prefix).is_some_and(is_digest))
+                    {
+                        let path = entry.path();
+                        if entry
+                            .file_type()
+                            .map_err(fail("stat interrupted cache prune", &path))?
+                            .is_dir()
+                        {
+                            fs::remove_dir_all(&path)
+                                .map_err(fail("finish interrupted cache prune", &path))?;
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(fail("list interrupted cache prune", &trash)(error)),
+        }
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn cache_maintain(&self, incoming: u64) -> Result<bool> {
         self.cache_maintain_with(incoming, now_secs(), &|| Disk::measure(&self.root))
@@ -380,13 +442,11 @@ impl Store {
         if disk.need(incoming).empty() && !due(read(&stamp)?) {
             return Ok(true);
         }
-        let state = self.cache_state();
-        fs::create_dir_all(&state).map_err(fail("create cache state", &state))?;
-        let _maintenance =
-            platform::lock::dir(&state).map_err(platform("lock cache maintenance", &state))?;
+        let _maintenance = self.cache_lock()?;
         let Some(_collection) = retention::try_collect(self)? else {
             return Ok(sample()?.need(incoming).empty());
         };
+        self.cache_reap_fences()?;
         if due(read(&stamp)?) {
             let cutoff = now.saturating_sub(TTL.as_secs());
             for (id, pin) in self.pins()? {
@@ -712,6 +772,65 @@ mod tests {
         assert!(owned.join("copy").exists());
         assert!(live_path.exists());
         drop(active);
+    }
+
+    #[test]
+    fn shared_snapshot_aliases_reclaim_only_together_and_fences_are_reaped() {
+        let scratch = Scratch::new();
+        let store = &scratch.0;
+        let object = payload(store, 8);
+        let path = store.root.join("snapshots").join(&object.sha256);
+        let owner = store.cache_directory(&path).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        fs::hard_link(store.path(&object).unwrap(), path.join("weight")).unwrap();
+        let sample = sampled(store, std::slice::from_ref(&object), 4096);
+        assert!(!store.cache_maintain_with(0, now_secs(), &sample).unwrap());
+        assert!(path.join("weight").exists());
+        assert!(store
+            .get_pin(&format!("cache-{}", object.sha256))
+            .unwrap()
+            .is_some());
+        drop(owner);
+        assert!(store.cache_maintain_with(0, now_secs(), &sample).unwrap());
+        assert!(!path.exists());
+        assert!(!store.path(&object).unwrap().exists());
+        assert!(!store
+            .root
+            .join("snapshots")
+            .join(format!(".{}.tensorfs-lock", object.sha256))
+            .exists());
+        // An unopened/unmaterialized view still has a real fence inode while owned.
+        let orphan = store.root.join("views").join(&object.sha256);
+        let live = store.cache_directory(&orphan).unwrap();
+        let sidecar = store
+            .root
+            .join("views")
+            .join(format!(".{}.tensorfs-lock", object.sha256));
+        assert!(sidecar.exists());
+        let _ = store
+            .cache_maintain_with(0, now_secs() + SWEEP.as_secs(), &|| Ok(ample()))
+            .unwrap();
+        assert!(sidecar.exists());
+        drop(live);
+        let _ = store
+            .cache_maintain_with(0, now_secs() + 2 * SWEEP.as_secs(), &|| Ok(ample()))
+            .unwrap();
+        assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn pressure_never_bypasses_publication_grace() {
+        let mut scratch = Scratch::new();
+        scratch.0.grace = Duration::from_secs(3600);
+        let store = &scratch.0;
+        let object = payload(store, 9);
+        let sample = sampled(store, std::slice::from_ref(&object), 4096);
+        assert!(!store.cache_maintain_with(0, now_secs(), &sample).unwrap());
+        assert!(store
+            .get_pin(&format!("cache-{}", object.sha256))
+            .unwrap()
+            .is_some());
+        assert!(store.path(&object).unwrap().exists());
     }
 
     #[test]
