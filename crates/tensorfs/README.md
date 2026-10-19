@@ -1,35 +1,48 @@
 # TensorFS
 
-TensorFS is a Rust and Python library for importing, storing, reading and exporting model weights.
-It includes the `tfs` command-line tool and implements **cozytensors**, a format that describes both
-ordinary tensors and quantized tensors, including the scales, packing and other data needed to decode them.
-It works without Cozy, a Tensorhub account or PyTorch.
+Safetensors provides a fast, memory-mappable tensor file. Its [standard header](https://github.com/safetensors/safetensors#format)
+records names, dtypes, shapes and byte offsets. Distributing and serving quantized models still
+leaves applications to supply several things:
 
-This README is the introduction and usage guide. The [cozytensors specification](spec/cozytensors.md)
-is the authoritative definition of the format, its encodings and its versioning rules.
+| What safetensors leaves to the application | How TensorFS addresses it |
+|---|---|
+| Quantization meaning: how scales, packed weights and producer-specific transforms reconstruct a tensor. These are conventions beyond the standard tensor declarations. | **cozytensors** declares named encodings, complete parameters and stored parts, with specified decoding math. |
+| Reusing unchanged bytes across checkpoints: the file format defines no content-addressed chunks shared between files. | Immutable chunks identified by SHA-256 and length are shared across models and precision lanes; pulls fetch missing objects. |
+| Verifying partial downloads: tensor offsets permit selective reads, but the format includes no per-chunk content hashes. | Each downloaded chunk is verified independently before use, so a selected component can be fetched and checked without downloading the whole checkpoint. |
 
-## How it fits together
+TensorFS combines that format with a local store, fetcher and Rust/Python readers. It packs small
+parts into aligned chunks and preserves construction order for efficient reads. Safetensors remains
+an import/export format, so existing Diffusers and Transformers workflows can use the same weights.
 
-A **checkpoint** is a model folder described by an immutable **manifest**. It contains configuration,
-tokenizer and other files, plus a `model.cozytensors` **header** when it has tensors. The header lists
-components such as `unet` or `text_encoder`, their tensors and the chunks holding their bytes.
-A tokenizer-only checkpoint can have no header.
+Use TensorFS through its Rust API, Python library or `tfs` command-line tool. It works with local
+files, static origins and Tensorhub, without requiring Cozy, a Tensorhub account or PyTorch.
+The [cozytensors specification](spec/cozytensors.md) defines the format and exact decoding rules.
 
-```text
-repo → release → lane → manifest
-                         ├─ model.cozytensors → tensor chunks
-                         └─ configs, tokenizer files, license, …
-```
+## Timing versus safetensors
 
-A **lane** selects one representation of a release, such as BF16, FP8 or INT8. Each has its own
-manifest. Every immutable object is named by its SHA-256 and length, so checkpoints can reuse
-identical objects without storing or transferring them again. A repo document holds the mutable
-release and lane pointers; changing a pointer leaves existing checkpoint bytes intact.
+Measured disk → host → GPU transfer of the same real INT8 lane bytes, represented as `U8` parts
+in both formats. Times are **milliseconds, median of five interleaved repetitions**, on NVIDIA L4.
+Each load includes open, registration, allocation/mapping and transfer through GPU completion;
+persistent reader initialization and fixture preparation are excluded.
 
-The header distinguishes a tensor's logical dtype and shape from its stored parts. For example,
-`int8.convrot` declares its integer weights, scales and Hadamard rotation; decoding includes the
-inverse rotation. All required decode parameters are explicit. The specification defines the math,
-and its [conformance corpus](conformance/) supplies an independent reader and test vectors.
+| Workload (logical payload) | TensorFS cold / warm | Safetensors cold / warm | Run |
+|---|---:|---:|---|
+| SDXL, full checkpoint, 4.08 GB | **306 / 344** | 392 / 405 | 11566 |
+| Qwen-Image, full checkpoint, 19.2 GB | **1,384 / 1,684** | 1,659 / 2,019 | 11566 |
+| SDXL, selected block, 187 MB logical | **24 / 23** | 79 / 45 | 11624 |
+| Qwen-Image, selected block, 218 MB logical | **33 / 23** | 61 / 37 | 11624 |
+
+The baseline is the fastest tested safetensors path per cell: `fastsafetensors 0.5.0` for full
+loads and cold blocks; `safetensors 0.8.0`'s `safe_open` CPU→CUDA path for warm blocks. Cold requests
+payload-cache eviction with `POSIX_FADV_DONTNEED`; warm is the immediate second read. Chunk boundaries
+make the selected-block reads 211 MB and 227 MB respectively.
+
+These are separate runs and reader revisions: the full-load run predates the final CBOR header
+and lazy window registration; the block run includes them. They measure serialized-byte loading,
+excluding dequantization, model construction and inference. Hardware and cache conditions affect
+results. [Measurements and provenance](gates/speed/measurements.json) include the earlier failed
+window cell; [the recorded harness](https://github.com/cozy-creator/cozy-creator/blob/0a6e71ee2c919db3e6e9b5844c8234ca9749cedb/crates/tensorfs/gates/speed/speedgate.py)
+defines the workloads. Download projections are separate from these measured timings.
 
 ## Get started
 
@@ -65,6 +78,23 @@ print(info.dtype, info.shape, value.nbytes)
 frameworks and dtypes that support it. `checkpoint.file(path)` reads a companion file. Parsing
 header bytes with `tensorfs.Checkpoint.parse(data)` permits metadata inspection without a Store;
 reading tensors also requires their chunks.
+
+## How checkpoints fit together
+
+A **checkpoint** is a model folder described by an immutable **manifest**. It contains configuration,
+tokenizer and other files, plus a `model.cozytensors` **header** when it has tensors. The header lists
+components such as `unet` or `text_encoder`, their tensors and the chunks holding their bytes.
+A tokenizer-only checkpoint can have no header.
+
+```text
+repo → release → lane → manifest
+                         ├─ model.cozytensors → tensor chunks
+                         └─ configs, tokenizer files, license, …
+```
+
+A **lane** selects one representation of a release, such as BF16, FP8 or INT8. Each has its own
+manifest. Every immutable object is named by its SHA-256 and length. A repo document holds the mutable
+release and lane pointers; changing a pointer leaves existing checkpoint bytes intact.
 
 ## Import and share
 
@@ -143,6 +173,7 @@ part order is construction order and contributes to identity. Small parts are pa
 alignment; large parts keep independent chunks, normally up to 64 MiB. The specification separates
 required reader behavior from this writer policy. Export reconstructs safetensors files from chunks.
 
+The [source-header fixtures](vectors/) pin import provenance and geometry without model payloads.
 The Rust `tensorfs-core` crate contains the format and reference decoders; its `store` feature adds
 storage and I/O. `tensorfs-py` supplies Python bindings, and `varena` supplies memory mechanisms.
 The [conformance corpus](conformance/) checks the format independently of those APIs.
