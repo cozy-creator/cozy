@@ -33,7 +33,6 @@ pub mod admission;
 pub mod err;
 #[cfg(feature = "store")]
 pub mod export;
-#[cfg(feature = "store")]
 pub mod failure;
 #[cfg(feature = "store")]
 pub mod fetch;

@@ -251,8 +251,8 @@ impl Endpoint {
                 None => (None, None),
             };
             // A lost answer, or another writer that wrote the same: it is there.
-            if sent.is_some() && old == sent {
-                return Ok(sent.expect("compared"));
+            if let Some(applied) = sent.as_ref().filter(|applied| old.as_ref() == Some(*applied)) {
+                return Ok(applied.clone());
             }
             let new = change(old.clone())?.unwrap_or_else(|| Repo::new(name));
             if !new.name.eq_ignore_ascii_case(name) {
@@ -744,6 +744,7 @@ fn refusal(reply: &Reply, what: &str) -> Refusal {
     let code = match (named.as_str(), reply.status) {
         ("digest_mismatch", _) => Code::OBJECT_ID_MISMATCH,
         ("closure_incomplete", _) => Code::CHECKPOINT_CONFLICT,
+        ("policy", _) if detail.get("reason").and_then(Value::as_str) == Some("capability_exceeded") => Code::CREDENTIAL_REQUIRED,
         ("precondition_failed" | "precondition_required" | "policy", _) | (_, 409 | 412 | 428) => Code::REPOSITORY_CONFLICT,
         ("not_found", _) | (_, 404 | 410) => Code::REF_NOT_FOUND,
         ("unauthorized" | "denied", _) | (_, 401 | 403) => Code::CREDENTIAL_REQUIRED,

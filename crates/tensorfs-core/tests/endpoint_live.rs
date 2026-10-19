@@ -5,6 +5,8 @@
 //! endpoint once (JWT-bearer, DPoP-proved) and proves every Hub request with it.
 
 use std::path::Path;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,10 +15,10 @@ use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNIN
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hub_client::{types, Credential, RunCapability};
-use serde_json::{json, Map};
+use serde_json::{json, Map, Value};
 use tensorfs_core::fetch::token::Request;
 use tensorfs_core::err::Code;
-use tensorfs_core::fetch::{upload_tree, with_tree, Client, Config, DPoP, Endpoint, Fetcher, JwtBearer, ObjectStore, Origin, SourcePolicy, TokenProvider, Want};
+use tensorfs_core::fetch::{bearer as bearer_provider, upload_tree, with_tree, Client, Config, DPoP, Endpoint, Fetcher, JwtBearer, ObjectStore, Origin, SourcePolicy, TokenProvider, Want};
 use tensorfs_core::format::{Dtype, Tree};
 use tensorfs_core::sha256::hex_digest;
 use tensorfs_core::store2::Store;
@@ -33,6 +35,15 @@ fn key() -> (String, String) {
     (jwk, hub_client::thumbprint(&x, &y))
 }
 
+fn python_proof(python: &str, script: &Path, request: &Value) {
+    let mut child = Command::new(python).arg("-I").arg(script)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(&serde_json::to_vec(request).unwrap()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "Python endpoint proof: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_capability_is_traded_once_and_proves_each_request() {
     let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
@@ -46,23 +57,42 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     let (device, bearer) = hub_client::testing::sign_up(&anonymous, &format!("tfs-dpop-{nonce}@example.test"), Path::new(&log))
         .await
         .unwrap();
-    let user = hub_client::Client::connect(&reach, http.clone(), Credential::Bearer(bearer.token));
+    let user = hub_client::Client::connect(&reach, http.clone(), Credential::Bearer(bearer.token.clone()));
     let account = format!("tfsdpop{nonce}");
     user.register_account(&account, &types::Empty(Default::default())).await.unwrap();
     let user_id = user.get_current_account().await.unwrap().into_inner().user_id;
     let token_endpoint = user.token_endpoint().await.unwrap();
 
+    let policy = SourcePolicy { any_host: true, allow_local: true, ..Default::default() };
+    let client = Client::with_roots(policy, &std::fs::read(&ca).unwrap()).unwrap();
+    let scratch = std::env::temp_dir().join(format!("tfs-endpoint-live-{nonce}"));
+    let store = Store::open(scratch.join("source")).unwrap();
+    let mut writer = store.writer(None, None).unwrap();
+    let weights: Vec<u8> = (0..300_000u32).map(|i| i.wrapping_mul(2_654_435_761) as u8).collect();
+    writer.component("model", "conformance.Fixture", Default::default(), None).unwrap()
+        .put("w", &Dtype::U8, &[weights.len() as u64], Data::Plain(Source::Read(&mut &weights[..]))).unwrap();
+    let header = writer.commit().unwrap();
+    let mut tree = Tree::default();
+    tree.set_variant("int8", header.clone());
+    let base_tree = store.put_tree(&tree).unwrap();
+    let model = format!("{account}/model");
+    let owner = Endpoint::new(&client, &reach, Some(bearer_provider(bearer.token.clone()))).unwrap();
+    upload_tree(&owner, &model, &base_tree, &store, None).await.unwrap();
+    tree.files.insert("README.md".into(), store.put_bytes(b"worker output\n").unwrap());
+    let output_tree = store.put_tree(&tree).unwrap();
+
     let (jwk, thumbprint) = key();
     let capability = device.sign_run_capability(&RunCapability {
-        user_id,
+        user_id: user_id.clone(),
         hub: origin.clone(),
         key_jkt: thumbprint.clone(),
         run: format!("r-{nonce}"),
-        operations: vec![json!({"type": "tensorhub_model_upload", "model": format!("{account}/model")})],
+        operations: vec![
+            json!({"type": "tensorhub_model_read", "model": model, "revision": base_tree.id()}),
+            json!({"type": "tensorhub_model_upload", "model": model}),
+        ],
         lifetime: Duration::from_secs(600),
     });
-    let policy = SourcePolicy { any_host: true, allow_local: true, ..Default::default() };
-    let client = Client::with_roots(policy, &std::fs::read(&ca).unwrap()).unwrap();
     let grant = JwtBearer {
         token_endpoint,
         client_id: "tensord".into(),
@@ -75,26 +105,15 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
 
     let elsewhere = Request { method: "GET", url: "https://elsewhere.example/x", headers: &[], payload: None };
     assert!(provider.headers(&elsewhere).await.unwrap().is_empty(), "only the resource's origin sees the token");
-    let scratch = std::env::temp_dir().join(format!("tfs-endpoint-live-{nonce}"));
-    let store = Store::open(scratch.join("source")).unwrap();
-    let mut writer = store.writer(None, None).unwrap();
-    let weights: Vec<u8> = (0..300_000u32).map(|i| i.wrapping_mul(2_654_435_761) as u8).collect();
-    writer.component("model", "conformance.Fixture", Default::default(), None).unwrap()
-        .put("w", &Dtype::U8, &[weights.len() as u64], Data::Plain(Source::Read(&mut &weights[..]))).unwrap();
-    let header = writer.commit().unwrap();
-    let mut tree = Tree::default();
-    tree.set_variant("int8", header.clone());
-    let tree = store.put_tree(&tree).unwrap();
     let endpoint = Arc::new(Endpoint::new(&client, &reach, Some(provider.clone())).unwrap());
-    let model = format!("{account}/model");
-    let first = upload_tree(&endpoint, &model, &tree, &store, None).await.unwrap();
-    assert_eq!(first.sent, first.objects);
+    let first = upload_tree(&endpoint, &model, &output_tree, &store, None).await.unwrap();
+    assert_eq!(first.sent, 2, "the new README and output tree; the base weights deduplicate");
     let issued = provider.issued_token().await.expect("the first upload traded once");
     let resumed = Arc::new(DPoP::token(&jwk, &issued, Some(&origin)).unwrap().at(&reach));
     let resumed_endpoint = Endpoint::new(&client, &reach, Some(resumed)).unwrap();
     assert_eq!(resumed_endpoint.object(&header.sha256).await.unwrap(), Some(header.clone()), "a token snapshot resumes under the same key without another trade");
     // This would fail if each request tried to trade the single-use capability again.
-    assert_eq!(upload_tree(&endpoint, &model, &tree, &store, None).await.unwrap().sent, 0);
+    assert_eq!(upload_tree(&endpoint, &model, &output_tree, &store, None).await.unwrap().sent, 0);
 
     let mut raced = Vec::new();
     for i in 0..8 {
@@ -114,7 +133,7 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     assert!(raced.iter().all(|tree| named.checkpoints.contains(tree)), "all concurrent appends survived CAS rebases");
 
     let other = format!("{account}/other");
-    let refused = endpoint.update_repo(&other, |old| Ok(Some(with_tree(old, &other, &tree, None)))).await.unwrap_err();
+    let refused = endpoint.update_repo(&other, |old| Ok(Some(with_tree(old, &other, &output_tree, None)))).await.unwrap_err();
     assert_eq!(refused.code, Code::CREDENTIAL_REQUIRED, "the token cannot upload to another repo");
 
     let url = format!("{reach}/{}", header.key());
@@ -138,9 +157,58 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     // Go's real ServeMux cleans /./ with a same-origin redirect first. Each hop must get a
     // new proof naming its actual path before the Hub redirects to MinIO.
     let source: Arc<dyn Origin> = Arc::new(Endpoint::new(&client, &format!("{reach}/."), Some(provider.clone())).unwrap());
-    let pulled = fetcher.pull_tree(&source, &tree, Some("int8"), &Want::default()).await.unwrap();
+    let pulled = fetcher.pull_tree(&source, &base_tree, Some("int8"), &Want::default()).await.unwrap();
     fetcher.settled().await;
     assert_eq!(pulled.header, header);
     assert_eq!(into.checkpoint(&header).unwrap().read("model", "w").unwrap(), weights);
+    if let Some(python) = var("TENSORFS_TEST_PYTHON") {
+        let (key, thumbprint) = key();
+        let capability = device.sign_run_capability(&RunCapability {
+            user_id,
+            hub: origin.clone(),
+            key_jkt: thumbprint,
+            run: format!("python-{nonce}"),
+            operations: vec![
+                json!({"type": "tensorhub_model_read", "model": model, "revision": base_tree.id()}),
+                json!({"type": "tensorhub_model_upload", "model": model}),
+            ],
+            lifetime: Duration::from_secs(600),
+        });
+        let request = json!({
+            "key": key, "capability": capability, "origin": origin, "endpoint": reach,
+            "token_endpoint": user.token_endpoint().await.unwrap(), "model": model,
+            "other": other, "tree": base_tree.id(), "owner_token": bearer.token,
+            "ca": ca, "cache_dir": scratch.join("python"),
+        });
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensorfs/scripts/endpoint_api.py");
+        python_proof(&python, &script, &request);
+        if let Some(script) = var("COZY_TEST_RUNTIME_PROOF") {
+            let scope = |label: &str, upload_repo: &str| {
+                let (key, thumbprint) = key();
+                let capability = device.sign_run_capability(&RunCapability {
+                    user_id: user_id.clone(), hub: origin.clone(), key_jkt: thumbprint,
+                    run: format!("runtime-{nonce}-{label}"),
+                    operations: vec![
+                        json!({"type": "tensorhub_model_read", "model": model, "revision": base_tree.id()}),
+                        json!({"type": "tensorhub_model_upload", "model": upload_repo}),
+                    ],
+                    lifetime: Duration::from_secs(600),
+                });
+                json!({"key": key, "capability": capability, "upload_repo": upload_repo})
+            };
+            let mut denied = scope("denied", &format!("{account}/permitted"));
+            denied["attempt_repo"] = json!(format!("{account}/forbidden"));
+            let fixture = json!({
+                "origin": origin, "endpoint": reach, "token_endpoint": user.token_endpoint().await.unwrap(),
+                "model": model, "tree": base_tree.id(), "ca": ca, "cache_dir": scratch.join("runtime"),
+                "owner_token": bearer.token, "component": "model", "tensor": "w", "dtype": "U8", "shape": [300_000],
+                "runs": [scope("a", &format!("{account}/output-a")), scope("b", &format!("{account}/output-b"))],
+                "denied": denied,
+            });
+            python_proof(&python, Path::new(&script), &fixture);
+        }
+    } else {
+        eprintln!("Python binding proof skipped: TENSORFS_TEST_PYTHON is absent");
+    }
     let _ = std::fs::remove_dir_all(scratch);
 }
