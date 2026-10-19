@@ -4,7 +4,7 @@
 A tiny `UNet2DConditionModel` is written into a TensorFS store; the same model built on meta is
 loaded through `Memory.load(model, ck=...)` (its blocks from `_no_split_modules`, its bytes from
 the store's chunk files) and run under `with mem.request(...)`, then compared with the plain
-model. Again with `limit` below the model's size: on a GPU it streams.
+model. Again with `limit` leaving room for half its weights: on a GPU it streams.
 
     python scripts/varena-standalone.py
 Runs with any python that has torch, diffusers and tensorfs; on the CPU when no GPU is visible.
@@ -23,9 +23,9 @@ CONFIG = dict(
     sample_size=8,
     in_channels=4,
     out_channels=4,
-    block_out_channels=(32, 64),
-    layers_per_block=1,
-    cross_attention_dim=32,
+    block_out_channels=(128, 256),
+    layers_per_block=2,
+    cross_attention_dim=256,
     attention_head_dim=8,
     down_block_types=("CrossAttnDownBlock2D", "DownBlock2D"),
     up_block_types=("UpBlock2D", "CrossAttnUpBlock2D"),
@@ -52,10 +52,15 @@ def main() -> int:
     size = sum(t.numel() * t.element_size() for t in plain.state_dict().values())
     plain.to(device)
     x = torch.randn(1, 4, 8, 8, device=device)
-    text = torch.randn(1, 5, 32, device=device)
+    text = torch.randn(1, 5, 256, device=device)
     with torch.no_grad():
         want = plain(x, 3, encoder_hidden_states=text).sample
-    for limit in (None, size // 2):
+    plain.cpu()
+    capped = None
+    if device.type == "cuda":  # what torch holds now, its working room, half the weights
+        torch.cuda.empty_cache()
+        capped = torch.cuda.memory_reserved(device) + (16 << 20) + size // 2
+    for limit in dict.fromkeys((None, capped)):  # the cap last: its torch fraction stays
         with torch.device("meta"):
             unet = UNet2DConditionModel(**CONFIG).eval()
         mem = Memory.open(device, limit=limit)
