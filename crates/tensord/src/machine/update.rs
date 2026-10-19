@@ -314,8 +314,13 @@ pub fn recover_activation(paths: &Paths) -> io::Result<Recovered> {
     let status = latest(paths, pending.status)?;
     match status.state.as_str() {
         "starting" => {
-            // A binary activation alone leaves the SDK link as it was.
-            if previous_link(&paths.current_sdk_link())? != pending.sdk_before {
+            // An activation that moves the pair must find it where the SDK link selects, however
+            // far its publication got (a crash may leave the link unwritten); a binary activation
+            // alone leaves the pair, and its link, as it was.
+            let (from, to) = (&status.from, &status.to);
+            let moves_pair = (&from.runtime, &from.tensorfs, &from.runtime_sha256, &from.tensorfs_sha256)
+                != (&to.runtime, &to.tensorfs, &to.runtime_sha256, &to.tensorfs_sha256);
+            if moves_pair {
                 for distribution in ["cozy_runtime", "tensorfs"] {
                     if let Err(error) = existing_wheel(&paths.current_sdk_link(), distribution) {
                         return rollback_pending(paths, &format!("activated SDK unavailable: {error}"));
