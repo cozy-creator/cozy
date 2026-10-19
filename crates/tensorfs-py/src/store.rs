@@ -1,7 +1,9 @@
 //! `tensorfs`: the store, checkpoints, the component writer and the error families, typed in
 //! `_ext.pyi`. Marshal only: every call that moves bytes runs detached from the GIL.
 
+use std::collections::BTreeMap;
 use std::ffi::{c_void, CStr};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -730,6 +732,12 @@ fn info(py: Python<'_>, t: &Tensor) -> PyResult<PyInfo> {
     })
 }
 
+pub(crate) struct FetchTensor<'a> {
+    pub key: &'a str,
+    pub role: Option<&'a str>,
+    pub range: Option<Range<u64>>,
+}
+
 impl PyCheckpoint {
     fn new(header: Header, stored: Option<Checkpoint>, named: Option<Named>) -> PyCheckpoint {
         PyCheckpoint { header, stored, named, tensors: OnceLock::new(), components: OnceLock::new(), remote: None }
@@ -739,6 +747,38 @@ impl PyCheckpoint {
         if let Some(remote) = &self.remote {
             let objects = tensorfs_core::store2::wanted(&self.header, components).or_raise(py)?;
             py.detach(|| remote.fetch(&objects, priority)).or_raise(py)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fetch_tensors(&self, py: Python<'_>, component: &str, reads: &[FetchTensor]) -> PyResult<()> {
+        let Some(remote) = &self.remote else { return Ok(()) };
+        let ck = self.stored(py)?;
+        let mut objects = BTreeMap::new();
+        for read in reads {
+            let tensor = ck.tensor(component, read.key).or_raise(py)?;
+            let mut found = read.role.is_none();
+            for (role, at) in tensor.locations() {
+                if read.role.is_some_and(|wanted| wanted != role) { continue; }
+                found = true;
+                let range = read.range.clone().unwrap_or(0..at.length);
+                if range.start > range.end || range.end > at.length {
+                    return Err(invalid(py, format!("{component}/{}: range {range:?} exceeds {}", read.key, at.length)));
+                }
+                let mut offset = 0;
+                for span in self.header.spans(&at) {
+                    if offset < range.end && offset + span.length > range.start {
+                        let object = &self.header.chunks[span.chunk];
+                        objects.insert(object.sha256.clone(), object.clone());
+                    }
+                    offset += span.length;
+                }
+            }
+            if !found { return Err(invalid(py, format!("{component}/{} has no part {:?}", read.key, read.role))); }
+        }
+        if !objects.is_empty() {
+            let objects: Vec<ObjectRef> = objects.into_values().collect();
+            py.detach(|| remote.fetch(&objects, 0)).or_raise(py)?;
         }
         Ok(())
     }

@@ -13,7 +13,7 @@ use tensorfs_core::format::{decode, Body, Dtype, Encoding, PartBytes};
 use tensorfs_core::io::{Dst, ReadOpts, Target};
 use tensorfs_core::store2::{Checkpoint, Error};
 
-use crate::store::{invalid, metadata, raise, Aligned, OrRaise, PyArray, PyCheckpoint};
+use crate::store::{invalid, metadata, raise, Aligned, FetchTensor, OrRaise, PyArray, PyCheckpoint};
 
 /// A component's tensors: a mapping of key to `Info`, with the reads.
 #[pyclass(name = "Tensors", module = "tensorfs", frozen, mapping)]
@@ -53,13 +53,9 @@ impl PyTensors {
         }
     }
 
-    fn checkpoint<'a>(&'a self, py: Python<'_>, fetch: bool) -> PyResult<&'a Checkpoint> {
+    fn checkpoint<'a>(&'a self, py: Python<'_>) -> PyResult<&'a Checkpoint> {
         match &self.ck {
-            Some(ck) => {
-                let ck = ck.get();
-                if fetch { ck.fetch_components(py, Some(std::slice::from_ref(&self.component)), 0)?; }
-                ck.stored(py)
-            },
+            Some(ck) => ck.get().stored(py),
             None => Err(raise(
                 py,
                 Failure {
@@ -77,7 +73,9 @@ impl PyTensors {
         keys: &[String],
         decode_: bool,
     ) -> PyResult<Vec<Bound<'py, PyAny>>> {
-        let ck = self.checkpoint(py, !keys.is_empty())?;
+        let ck = self.checkpoint(py)?;
+        let reads: Vec<FetchTensor> = keys.iter().map(|key| FetchTensor { key, role: None, range: None }).collect();
+        self.ck.as_ref().unwrap().get().fetch_tensors(py, &self.component, &reads)?;
         let mut wants = Vec::new();
         for (i, key) in keys.iter().enumerate() {
             let t = ck.tensor(&self.component, key).or_raise(py)?;
@@ -280,9 +278,13 @@ impl PyTensors {
         }
         let buf: PyBuffer<u8> = PyBuffer::get(&view.call_method1("cast", ("B",))?)?;
         let len = buf.len_bytes();
-        let ck = self.checkpoint(py, len != 0)?;
+        let ck = self.checkpoint(py)?;
         let t = ck.tensor(&self.component, &key).or_raise(py)?;
         if role.is_none() && matches!(t.body, Body::Encoded { .. }) {
+            let length = t.dtype.byte_len(&t.shape).ok_or_else(|| invalid(py, "unknown logical byte length"))?;
+            if offset.checked_add(len as u64).is_none_or(|end| end > length) {
+                return Err(invalid(py, format!("{key}: {len} bytes from {offset} of {length}")));
+            }
             let array = self
                 .load(py, std::slice::from_ref(&key), true)?
                 .remove(0)
@@ -305,6 +307,9 @@ impl PyTensors {
             }
             return Ok(());
         }
+        let end = offset.checked_add(len as u64).ok_or_else(|| invalid(py, "read range overflow"))?;
+        let read = FetchTensor { key: &key, role: Some(role.as_deref().unwrap_or("")), range: Some(offset..end) };
+        self.ck.as_ref().unwrap().get().fetch_tensors(py, &self.component, &[read])?;
         let target = Target {
             component: &self.component,
             key: &key,
