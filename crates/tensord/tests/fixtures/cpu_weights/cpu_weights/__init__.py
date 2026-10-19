@@ -3,6 +3,8 @@ public TensorFS in the configured store and returns its model reference."""
 from __future__ import annotations
 
 import asyncio
+import os
+from pathlib import Path
 from typing import Any
 
 import msgspec
@@ -16,6 +18,7 @@ app = App()
 class TableInput(msgspec.Struct):
     size: int = 64
     hold: str = ""
+    count: bool = False
 
 
 async def table(ctx: Context, payload: TableInput, tel: Telemetry) -> ModelArtifact:
@@ -43,8 +46,12 @@ async def convert(
     ctx: Context, payload: TableInput, tel: Telemetry, *, source: Weights[Any]
 ) -> ModelArtifact:
     """The same CPU Writer behind the CLI's existing source/destination conversion syntax."""
-    # Opening the admitted local source also proves this fixture needs no provider download.
-    ctx.tensorfs_source(source)
+    values = ctx.tensorfs_source(source).components["model"].tensors.read_all()
+    assert values["seed"].tobytes() == bytes(4)
+    if payload.count:
+        # A bounded test observation: a code-less upload must not execute this function again.
+        with (Path(os.environ["TENSORFS_HOME"]) / "test-convert-invocations").open("ab") as stream:
+            stream.write(b"invoked\n")
     return await table(ctx, payload, tel)
 
 

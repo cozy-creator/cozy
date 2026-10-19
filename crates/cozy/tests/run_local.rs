@@ -177,15 +177,17 @@ fn runtime_checkpoint_writes_replay_and_survive_calcifer_restart() {
 }
 
 /// Public CLI conversion -> ephemeral ordinary owner Bearer -> Runtime Writer -> real Hub.
-/// The output remains local, and a separate cold store fetches its private remote bytes.
+/// A private Hub source starts cold; Runtime reads it, writes and uploads a new output.
+/// A failed upload retains a typed local tree, retried without executing the model again.
 #[test]
 fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
     use std::sync::Arc;
     use tensorfs_core::{
         fetch::{
             Client, Config, Endpoint, Fetcher, ObjectStore, Origin, SourcePolicy, Want, bearer,
+            upload_tree,
         },
-        format::Dtype,
+        format::{Dtype, Tree},
         store2::Store,
         writer::{Data, Source},
     };
@@ -197,9 +199,22 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
     let account = home.sign_in("cli-writer-upload@cozy.test");
     let destination = format!("{account}/writer-output");
     let store_path = home.path().join("shared-tensorfs");
-    let seed = {
-        let store = Store::open(&store_path).unwrap();
-        let mut writer = store.writer(None, None).unwrap();
+    let origin = std::env::var("TENSORHUB_ORIGIN").unwrap();
+    let ca = std::fs::read(std::env::var("TENSORHUB_CA").unwrap()).unwrap();
+    let client = Client::with_roots(
+        SourcePolicy {
+            any_host: true,
+            allow_local: true,
+            max_redirects: 5,
+            ..Default::default()
+        },
+        &ca,
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let source_store = Store::open(home.path().join("seed-tensorfs")).unwrap();
+    let (seed, source_tree) = {
+        let mut writer = source_store.writer(None, None).unwrap();
         writer
             .get("model")
             .put(
@@ -210,14 +225,28 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
             )
             .unwrap();
         let header = writer.commit().unwrap();
-        tensord::storage::set_local(&store, "seed", &header, &Default::default()).unwrap();
-        header
+        let mut tree = Tree::default();
+        tree.set_variant("f32", header.clone());
+        (header, source_store.put_tree(&tree).unwrap())
     };
+    let source_repo = format!("{account}/writer-source");
+    runtime.block_on(async {
+        let endpoint = Endpoint::new(&client, &origin, Some(bearer(home.token()))).unwrap();
+        upload_tree(&endpoint, &source_repo, &source_tree, &source_store, None)
+            .await
+            .unwrap();
+    });
+    let source_ref = format!("{source_repo}#{}", source_tree.id());
+    assert!(
+        !store_path.exists(),
+        "the machine must start without source objects"
+    );
     let _machine = common::tensord::added_with(
         &home,
         "m1",
         &[("COZY_TENSORFS_ROOT", store_path.to_str().unwrap())],
     );
+    assert!(!Store::open(&store_path).unwrap().has(&seed), "source is warm before the call");
     let work = home.path().join("work");
     copy(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensord/tests/fixtures/cpu_weights"),
@@ -231,7 +260,7 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
                 "--json",
                 "run",
                 "./cpu_weights/convert",
-                "local/seed",
+                &source_ref,
                 &destination,
                 "size=64",
                 "--on",
@@ -294,21 +323,8 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
         expected
     );
 
-    let origin = std::env::var("TENSORHUB_ORIGIN").unwrap();
-    let ca = std::fs::read(std::env::var("TENSORHUB_CA").unwrap()).unwrap();
-    let client = Client::with_roots(
-        SourcePolicy {
-            any_host: true,
-            allow_local: true,
-            max_redirects: 5,
-            ..Default::default()
-        },
-        &ca,
-    )
-    .unwrap();
     let cold = tempfile::tempdir().unwrap();
     let downloaded = Store::open(cold.path()).unwrap();
-    let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let anonymous = Endpoint::new(&client, &origin, None).unwrap().anonymous();
         assert!(
@@ -349,11 +365,147 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
         );
     });
 
+    // Refusal comes from the real ordinary-owner boundary, after Runtime commits locally.
+    let rival = Home::with_hub().unwrap();
+    let rival_account = rival.sign_in("cli-writer-rival@cozy.test");
+    let refused_destination = format!("{rival_account}/private-output");
+    let rival_endpoint = Endpoint::new(&client, &origin, Some(bearer(rival.token()))).unwrap();
+    let rival_before = runtime.block_on(async {
+        upload_tree(
+            &rival_endpoint,
+            &refused_destination,
+            &source_tree,
+            &source_store,
+            None,
+        )
+        .await
+        .unwrap();
+        rival_endpoint.repo(&refused_destination).await.unwrap()
+    });
+    let refused = cozy(
+        &home,
+        &work,
+        &[
+            "--json",
+            "run",
+            "./cpu_weights/convert",
+            &source_ref,
+            &refused_destination,
+            "size=128",
+            "count=true",
+            "--on",
+            "m1",
+        ],
+    );
+    assert_eq!(refused.code, 1, "{refused:?}");
+    let failed = refused
+        .stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .rfind(|event| event["type"] == "run.failed")
+        .unwrap()["run"]
+        .clone();
+    assert!(
+        failed["reason"].to_string().contains("upload_failed"),
+        "{failed}"
+    );
+    let retained = failed["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "model")
+        .unwrap()["checkpoint"]
+        .clone();
+    assert_eq!(retained["repo_id"], "local/derived", "{retained}");
+    let retained_tree =
+        tensord::storage::held(&local, retained["revision"].as_str().unwrap()).unwrap();
+    let variant = retained["variant"].as_str().unwrap();
+    let (_, retained_header) = tensorfs_core::fetch::variant_of_tree(
+        &local.tree(&retained_tree).unwrap(),
+        (!variant.is_empty()).then_some(variant),
+    )
+    .unwrap();
+    let retained_bytes: Vec<u8> = (0u8..=255).cycle().take(512).collect();
+    assert_eq!(
+        local
+            .checkpoint(&retained_header)
+            .unwrap()
+            .read("model", "table")
+            .unwrap(),
+        retained_bytes
+    );
+    let counter = store_path.join("test-convert-invocations");
+    assert_eq!(std::fs::read(&counter).unwrap(), b"invoked\n");
+    assert_eq!(
+        runtime
+            .block_on(rival_endpoint.repo(&refused_destination))
+            .unwrap(),
+        rival_before,
+        "the refused upload changed another account's repository"
+    );
+
+    let retry_destination = format!("{account}/writer-retry");
+    let retry = completed(&home.cozy([
+        "--json",
+        "run",
+        "upload",
+        &format!("{}#model", failed["number"].as_u64().unwrap()),
+        &retry_destination,
+    ]));
+    assert_eq!(
+        retry["result"]["models"][0]["published"]["tree"], retained["revision"],
+        "{retry}"
+    );
+    assert_eq!(
+        retry["result"]["models"][0]["published"]["checkpoint"],
+        retained_header.id(),
+        "{retry}"
+    );
+    assert_eq!(
+        std::fs::read(&counter).unwrap(),
+        b"invoked\n",
+        "a retained upload reran model code"
+    );
+    let retry_cache = tempfile::tempdir().unwrap();
+    let retry_store = Store::open(retry_cache.path()).unwrap();
+    runtime.block_on(async {
+        let endpoint: Arc<dyn Origin> =
+            Arc::new(Endpoint::new(&client, &origin, Some(bearer(home.token()))).unwrap());
+        let fetcher = Fetcher::new(
+            Arc::new(retry_store.clone()) as Arc<dyn ObjectStore>,
+            client.clone(),
+            None,
+            Config::default(),
+        );
+        let pulled = fetcher
+            .pull(
+                &endpoint,
+                &retry_destination,
+                retained["revision"].as_str(),
+                (!variant.is_empty()).then_some(variant),
+                &Want::default(),
+            )
+            .await
+            .unwrap();
+        fetcher.settled().await;
+        assert_eq!(pulled.tree.as_ref().unwrap(), &retained_tree);
+        assert_eq!(pulled.variant, variant);
+        assert_eq!(pulled.header, retained_header);
+        assert_eq!(
+            retry_store
+                .checkpoint(&pulled.header)
+                .unwrap()
+                .read("model", "table")
+                .unwrap(),
+            retained_bytes
+        );
+    });
+
     let down = home.cozy(["down"]);
     assert_eq!(down.code, 0, "{down:?}");
     let db_path = home.root().join("calcifer/state.db");
     let db = calcifer::store::Store::open(&db_path).unwrap();
-    for run in [&first, &again] {
+    for run in [&first, &again, &failed, &retry] {
         let stored = db.run(run["id"].as_str().unwrap()).unwrap().unwrap();
         assert!(
             stored.spec.tensorfs.is_none(),
@@ -383,6 +535,16 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
         reference(&shown),
         remote,
         "remote reference survives Calcifer restart"
+    );
+    let failed_shown = home.json([
+        "--json",
+        "run",
+        "show",
+        &failed["number"].as_u64().unwrap().to_string(),
+    ]);
+    assert_eq!(
+        failed_shown["output"][0]["checkpoint"], retained,
+        "failed run lost its retained reference"
     );
     assert!(
         !serde_json::to_string(&shown).unwrap().contains(&token),
