@@ -238,11 +238,20 @@ struct Remote {
 
 impl Remote {
     fn fetch(&self, objects: &[ObjectRef], priority: u64) -> Result<(), Failure> {
+        self.fetch_progress(objects, priority, &|_, _| Ok(()))
+    }
+
+    fn fetch_progress(&self, objects: &[ObjectRef], priority: u64, report: &(dyn Fn(u64, u64) -> Result<(), Failure> + Sync)) -> Result<(), Failure> {
+        let total = objects.iter().map(|object| object.length).sum();
+        report(0, total)?;
         if self.offline {
+            let mut held = 0;
             for object in objects {
                 if !self.store.reuse(object)? {
                     return Err(Failure { kind: Kind::NotFound, detail: format!("{} is not cached", object.id()) });
                 }
+                held += object.length;
+                report(held, total)?;
             }
             return Ok(());
         }
@@ -250,7 +259,21 @@ impl Remote {
         let store: Arc<dyn ObjectStore> = Arc::new(self.store.clone());
         fetch::runtime()?.block_on(async {
             let fetcher = Fetcher::new(store, self.client.clone(), None, fetch::Config::default());
-            fetcher.objects(&origin, objects, &Want { priority, ..Want::default() }).await?;
+            let counters = fetch::Progress::default();
+            let want = Want { priority, progress: Some(&counters), ..Want::default() };
+            let mut work = std::pin::pin!(fetcher.objects(&origin, objects, &want));
+            let mut tick = tokio::time::interval(Duration::from_millis(250));
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut work => {
+                        report(counters.held.load(std::sync::atomic::Ordering::Relaxed), total)?;
+                        result?;
+                        break;
+                    }
+                    _ = tick.tick() => report(counters.held.load(std::sync::atomic::Ordering::Relaxed), total)?,
+                }
+            }
             fetcher.settled().await;
             Ok(())
         })
