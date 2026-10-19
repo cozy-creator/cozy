@@ -96,9 +96,18 @@ class Exhausted(Exception):
     each model's resident bytes and the memo's peaks then."""
 
     def __init__(
-        self, gpu: int, need: int, op: str, resident: Mapping[str, int], peaks: tuple[Peak, ...]
+        self,
+        gpu: int,
+        need: int,
+        op: str,
+        resident: Mapping[str, int],
+        peaks: tuple[Peak, ...],
+        held: str = "",
     ) -> None:
-        super().__init__(f"GPU {gpu}: {op} needs {need} B more and nothing else can be freed")
+        super().__init__(
+            f"GPU {gpu}: {op} needs {need} B more and nothing else can be freed"
+            + (f" ({held})" if held else "")
+        )
         self.gpu, self.need, self.op, self.resident, self.peaks = gpu, need, op, resident, peaks
 
 
@@ -864,7 +873,7 @@ class Memory:
     # the catch's rungs (`cuts.Rungs`)
 
     def free(self, device: torch.device, need: int) -> bool:
-        if device.type != "cuda" or device.index != self.gpu:
+        if not self._here(device):
             return False
         with self.lock:
             freed = self._free_upto(need, "out of memory")
@@ -874,7 +883,7 @@ class Memory:
     def lower(self, device: torch.device, need: int) -> bool:
         """At least one block lower; with nothing left to lower, a wait for another request's
         bytes (`_wait_room`)."""
-        if device.type != "cuda" or device.index != self.gpu:
+        if not self._here(device):
             return False
         with self.lock:
             lowered = self._lower_until(max(need, self._free() + 1), "out of memory", None)
@@ -882,6 +891,11 @@ class Memory:
             if lowered:
                 return True
         return self._wait_room()
+
+    def _here(self, device: torch.device) -> bool:
+        """`device` is this memory's GPU (`cuda` alone is the current one)."""
+        index = torch.cuda.current_device() if device.index is None else device.index
+        return device.type == "cuda" and index == self.gpu
 
     def _free(self) -> int:
         """The driver's free bytes, never beyond what a `gpu_memory_limit` leaves (§5.6)."""
@@ -904,7 +918,7 @@ class Memory:
             torch.cuda.set_per_process_memory_fraction(min(room / self.total, 1.0), self.gpu)
 
     def available(self, device: torch.device | None = None) -> int:
-        if not self.cuda or device is not None and device.index != self.gpu:
+        if not self.cuda or device is not None and not self._here(device):
             return 0
         return (
             self._free()
@@ -1301,7 +1315,15 @@ class Memory:
 
     def _exhausted(self, need: int, op: str) -> Exhausted:
         peaks = tuple(_peak(s) for s in list(self.memo.shapes.values()))
-        return Exhausted(self.gpu, need, op, self.resident(), peaks)
+        resident = self.resident()
+        held = ", ".join(  # what holds the device: each model's bytes and why they stay
+            f"{m.component} {resident.get(m.name, 0) / 2**30:.2f} GiB "
+            + ("in use" if m.flight else "held" if m.held else m.level.value)
+            for m in self.models.values()
+        )
+        reserved = torch.cuda.memory_reserved(self.gpu) if self.cuda else 0
+        held += f"; torch {reserved / 2**30:.2f} GiB"
+        return Exhausted(self.gpu, need, op, resident, peaks, held)
 
 
 # ----------------------------------------------------------------------------- binding
