@@ -1,7 +1,125 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path;
+
+use base64::Engine;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tensorfs_core::format::decode::plan::{Core, Elems, Plan, Post};
-use tensorfs_core::format::decode::{gguf, Geometry};
-use tensorfs_core::format::Dtype;
+use tensorfs_core::format::decode::{self, gguf, Geometry};
+use tensorfs_core::format::{Dtype, Encoding, PartBytes};
 use tensorfs_core::kernels::{self, Prepared, BINARIES, FAMILIES};
+
+#[test]
+fn every_encoded_green_vector_prepares_a_kernel_without_host_fallback() {
+    #[derive(Deserialize)]
+    struct Cases {
+        cases: Vec<Case>,
+    }
+    #[derive(Deserialize)]
+    struct Case {
+        component: String,
+        key: String,
+        dtype: Dtype,
+        shape: Vec<u64>,
+        encoding: Option<Encoding>,
+        #[serde(default)]
+        parts: Vec<Part>,
+        expect: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Part {
+        role: String,
+        dtype: Dtype,
+        shape: Vec<u64>,
+        bits: String,
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensorfs/conformance/vectors/cases");
+    let mut files: Vec<_> = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    files.sort();
+    let mut corpus = Sha256::new();
+    let mut checked = 0;
+    let mut schemes = BTreeSet::new();
+    for file in files {
+        let bytes = fs::read(&file).unwrap();
+        corpus.update(file.file_name().unwrap().to_str().unwrap().as_bytes());
+        corpus.update([0]);
+        corpus.update(&bytes);
+        let cases: Cases = serde_json::from_slice(&bytes).unwrap();
+        for case in cases.cases {
+            let (Some(encoding), Some(expected)) = (&case.encoding, &case.expect) else {
+                continue;
+            };
+            let label = format!("{}/{}/{}", file.display(), case.component, case.key);
+            let buffers: Vec<Vec<u8>> = case
+                .parts
+                .iter()
+                .map(|part| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(&part.bits)
+                        .unwrap()
+                })
+                .collect();
+            let parts: BTreeMap<_, _> = case
+                .parts
+                .iter()
+                .zip(&buffers)
+                .map(|(part, bytes)| {
+                    (
+                        part.role.as_str(),
+                        PartBytes {
+                            dtype: &part.dtype,
+                            shape: &part.shape,
+                            bytes,
+                        },
+                    )
+                })
+                .collect();
+            let expected = base64::engine::general_purpose::STANDARD
+                .decode(expected)
+                .unwrap();
+            let width = case.dtype.byte_len(&[1]).unwrap();
+            let total = expected.len() as u64 / width;
+            assert!(expected.len() > 1, "{label}");
+            let window_bytes = 13.min(expected.len() - 1) as u64;
+            // The installed GPU gate reads an odd byte window starting at offset 1.
+            for count in [total, (1 + window_bytes).div_ceil(width)] {
+                decode::planned(
+                    &case.dtype,
+                    &case.shape,
+                    encoding,
+                    &parts,
+                    true,
+                    |plan, geometry| {
+                        assert!(
+                            matches!(
+                                kernels::prepare(plan, geometry, &case.dtype, 0, count)?,
+                                Prepared::Kernel(_)
+                            ),
+                            "{label}: CPU decode plus upload is not kernel evidence"
+                        );
+                        Ok(())
+                    },
+                )
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            }
+            checked += 1;
+            schemes.insert(encoding.scheme.clone());
+        }
+    }
+    let digest = format!("{:x}", corpus.finalize());
+    assert_eq!(
+        digest,
+        "92a0f4f01f4490c2f7f8c391e5eb600f5e5b33d647eed48d91ff7c21e7af57d4"
+    );
+    assert_eq!(checked, 209);
+    assert_eq!(schemes.len(), 39);
+    println!("kernel routing: {checked} full + {checked} odd-byte windows, {} schemes, 0 host fallbacks; corpus {digest}", schemes.len());
+}
 
 #[test]
 fn host_only_plans_preserve_logical_range_transposition_and_rounding() {
