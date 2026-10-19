@@ -541,9 +541,7 @@ class Memory:
             table = Ledger.adopt(ledger.fd, ledger.events)
             row = table.claim()
             self.rows[ledger.gpu] = (table, row)
-            threading.Thread(
-                target=self._answer, args=(ledger.gpu, row), name="varena", daemon=True
-            ).start()
+            self.gpus[ledger.gpu].serve(row)  # other processes' asks, answered in Rust
 
     @classmethod
     def open(
@@ -564,6 +562,8 @@ class Memory:
         with self.lock:
             model = self.by_module.get(module) or self._register(module)
             model.level = level
+            if not model.host:
+                model.ws.warm(level is Level.GPU)
             if level is Level.GPU and not model.host and not self._in_request(model.gpu):
                 self._restore(model.gpu)
         if not model.host:
@@ -1022,21 +1022,16 @@ class Memory:
         if held is not None:
             held[0].freed()
 
-    def _answer(self, gpu: int, row: Row) -> None:
-        """Another process's ask of this row: idle bytes, then rung 2's order, the facts
-        published, then the ask acked. It takes no lock: pages in use are pinned, and a model
-        a forward starts meanwhile only refaults."""
-        with torch.cuda.device(gpu):
-            while True:
-                want = row.wait_want()
-                freed = self._idle(gpu)
-                for victim in self._victims(gpu):
-                    if freed >= want:
-                        break
-                    freed += self._take(victim, want - freed, "asked")
-                self._publish(gpu)
-                row.ack(freed)
-                self._freed(gpu)
+    def _heed(self, gpu: int, row: Row) -> None:
+        """An ask of this row that varena's Rust thread answers from weight pages alone: this
+        thread also gives back torch's slack and the caches, then signals freed."""
+        if row.want() <= 0:
+            return
+        freed = self._idle(gpu)
+        for cache in [c for c in list(self.caches) if c.gpu == gpu and c.nbytes]:
+            freed += self._shrink(cache, cache.nbytes)
+        if freed:
+            self._freed(gpu)
 
     def _publish(self, gpu: int) -> None:
         """This row's facts: as forwards start and land, at request ends and after an ask
@@ -1044,6 +1039,7 @@ class Memory:
         held = self.rows.get(gpu)
         if held is None:
             return
+        self._heed(gpu, held[1])
         models = [m for m in list(self.models.values()) if m.gpu == gpu]
         sets = {s.name: int(s.resident) for s in self.gpus[gpu].stats().sets}
         resident = {m.name: sets.get(m.name, 0) for m in models}
