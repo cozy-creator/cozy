@@ -87,6 +87,7 @@ fn run(lifetime: Lifetime, service_ready: Option<u64>) -> io::Result<()> {
     update::retire_agent(&paths);
     #[cfg(unix)]
     let ready = supervise::supervise(&paths, grant.provider.clone())?;
+    config.gpu_memory_limit = config::gpu_memory_limit()?;
     run_machine(config, ready)
 }
 

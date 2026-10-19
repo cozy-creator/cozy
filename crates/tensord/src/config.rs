@@ -73,6 +73,13 @@ pub fn load(lifetime: Lifetime) -> io::Result<Config> {
     from_loaded(lifetime, loaded, shared::environment())
 }
 
+/// `machine.gpu_memory_limit` as config.toml says it now. The service reads it at each start:
+/// it is forked from a parent that loaded the config before an update wrote the limit.
+pub fn gpu_memory_limit() -> io::Result<Option<u64>> {
+    let loaded = shared::load(shared::Flags::default()).map_err(|e| invalid(&named(&e.message)))?;
+    Ok(loaded.config.machine.gpu_memory_limit)
+}
+
 /// Takes the readiness key out of the environment, so nothing this machine starts inherits it.
 /// Call before any thread starts, after a provider's re-execution (which still needs it).
 pub fn forget_receipt_key() {
