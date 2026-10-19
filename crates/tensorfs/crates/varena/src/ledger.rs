@@ -423,7 +423,7 @@ impl Row {
         let mut words = self.words.lock().unwrap_or_else(PoisonError::into_inner);
         words[at..at + part.len()].copy_from_slice(part);
         let s = self.t.slot(self.slot);
-        latch_write(&s.seq, &s.latch, &*words);
+        latch_write(&s.seq, &s.latch, &words);
         s.progress.fetch_add(1, Release);
     }
 

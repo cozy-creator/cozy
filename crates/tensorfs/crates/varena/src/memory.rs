@@ -659,7 +659,7 @@ impl Inner {
     /// `f` on the books, with our context current.
     fn with<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         let _c = CtxGuard::enter(self.ctx)?;
-        f(&mut *self.lock())
+        f(&mut self.lock())
     }
 
     fn submit(&self, job: Job, urgent: bool) {
@@ -780,7 +780,9 @@ impl Inner {
             // SAFETY: out-param; device memory of our context's device.
             match unsafe { (cuda::driver()?.mem_create)(&mut h, size as usize, &self.prop, 0) } {
                 cuda::SUCCESS => return Ok(Some(h)),
-                cuda::ERROR_OUT_OF_MEMORY if st.idle_bytes() > 0 => drop(self.keep_idle(st, 0)?),
+                cuda::ERROR_OUT_OF_MEMORY if st.idle_bytes() > 0 => {
+                    self.keep_idle(st, 0)?;
+                }
                 cuda::ERROR_OUT_OF_MEMORY => return Ok(None),
                 rc => return cuda::check("cuMemCreate", rc).map(|_| None),
             }

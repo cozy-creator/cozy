@@ -77,7 +77,7 @@ impl<T> OrRaise<T> for varena::Result<T> {
 /// A frozen class with a property per field, from varena's record of the same fields; the
 /// field after `;` is a list whose items convert.
 macro_rules! record {
-    ($py:ident = $name:literal from $rs:ty { $($f:ident: $t:ty),* } $(; $v:ident: $vt:ty)?) => {
+    ($py:ident = $name:literal from $rs:ty { $($f:ident: $t:ty),* $(; $v:ident: $vt:ty)? }) => {
         #[pyclass(name = $name, module = "tensorfs.varena", frozen, get_all, skip_from_py_object)]
         #[derive(Clone)]
         pub struct $py {
