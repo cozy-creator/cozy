@@ -282,13 +282,18 @@ impl Calls {
                 engine.with_journal(|journal| journal.bind_derived_output(&run, attempt, transaction, slot))
             })
         };
-        // A committed derivation is replayed for the same code, declaration and inputs (the
-        // raw declaration the writer opens), never for its declaration alone.
+        // A committed derivation is replayed for the same code, declaration and request: its
+        // parameters, file inputs and precision (its weights are the derivation's sources, keyed
+        // by the writer), never for less. Two runs differing in a parameter derive apart.
         let replay = self.service.upgrade().and_then(|service| {
             let held = service.catalog.resolve(&record.invocation.generation).ok()?;
             let operation = crate::call_memo::operation(&held.record, &record.invocation.module, &entry["invocable"])?;
             let declared = serde_json_canonicalizer::to_vec(&entry).ok()?;
-            Some(format!("{operation}\0{}", tensorfs_core::sha256::hex_digest(&declared)))
+            let invocation = &record.invocation;
+            let request = serde_json::json!({"input": invocation.input, "files": invocation.inputs, "bits": invocation.bits});
+            let request = serde_json_canonicalizer::to_vec(&request).ok()?;
+            let digest = tensorfs_core::sha256::hex_digest;
+            Some(format!("{operation}\0{}\0{}", digest(&declared), digest(&request)))
         });
         Ok(Some(crate::weights::Grant::new(
             &actor,

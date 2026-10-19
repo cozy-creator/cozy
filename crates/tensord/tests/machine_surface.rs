@@ -1057,6 +1057,22 @@ mod v1_api {
         assert_eq!(transaction("weights-again").len(), 1);
         assert!(transaction("weights").is_empty(), "the transaction passed to the later run");
         drop(journal);
+        // A parameter that is not a weight is the request too: the same function, slot and
+        // derivation with another size derives anew, never replaying the first output.
+        let wider = v1::RunSpec { payload: v1::Json::parse(r#"{"size":128}"#).ok(), ..job.clone() };
+        let events = collect(run_events(&client, &all, run("weights-wider", wider)).await.unwrap()).await.unwrap();
+        let widened = outcome(&events);
+        assert_eq!(widened.status, "succeeded", "{widened:?}");
+        let other = widened.outputs.iter().find(|p| p.output == "model").unwrap();
+        assert_ne!(other.digest, written.digest, "a size-128 table replayed the size-64 output");
+        let journal = Journal::open(&machine.root.join("state/execution")).unwrap();
+        let transaction = |id: &str| {
+            let record = journal.get_public(&actor(), id).unwrap();
+            journal.derived_outputs(&record.id).unwrap().into_iter().map(|b| b.transaction).collect::<Vec<_>>()
+        };
+        let (first, wide) = (transaction("weights-again"), transaction("weights-wider"));
+        assert!(wide.len() == 1 && wide != first, "{first:?} {wide:?}");
+        drop(journal);
         let held = tensorfs_core::store2::Store::open(machine.store()).unwrap();
         let reference = tensorfs_core::format::ObjectRef {
             sha256: written.digest.trim_start_matches("sha256:").into(),
