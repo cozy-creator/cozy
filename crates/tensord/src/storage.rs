@@ -69,6 +69,25 @@ pub fn open(root: &Path) -> io::Result<Arc<Store>> {
     })
 }
 
+/// The machine's claim on its store: `owner.lock` at the store's real path, held exclusively
+/// (without waiting) for as long as the returned file lives; the OS releases it when the machine
+/// exits. A second machine on the same store, by any path, is refused. Readers (`tfs`, the
+/// library) never take it.
+pub fn claim(root: &Path) -> io::Result<std::fs::File> {
+    let real = std::fs::canonicalize(root)?;
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(real.join(OWNER_LOCK))?;
+    match platform::lock::try_claim(&file)? {
+        true => Ok(file),
+        false => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("STORE_BUSY: this TensorFS store already has an owner ({})", real.display()),
+        )),
+    }
+}
+
+/// The machine's claim on its store (`claim`).
+const OWNER_LOCK: &str = "owner.lock";
+
 /// A rental's store from before TensorFS 0.12's format cut (an older image's machine made it at
 /// boot): its models re-pull, so its contents go and a fresh store takes their place. A
 /// computer's machine keeps refusing one (`open`): its local models need the one-time migrate.
@@ -290,6 +309,20 @@ pub fn check_digest(what: &str, text: &str, prefixed: bool) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn one_machine_claims_a_store_by_any_path_until_it_lets_go() {
+        let root = std::env::temp_dir().join(format!("tensord-claim-{}", uuid::Uuid::new_v4()));
+        let store = root.join("real/store");
+        super::open(&store).unwrap();
+        let first = super::claim(&store).unwrap();
+        platform::durable::symlink(&root.join("real"), &root.join("alias")).unwrap();
+        let busy = super::claim(&root.join("alias/store")).expect_err("a second claim");
+        assert!(busy.to_string().contains("STORE_BUSY: this TensorFS store already has an owner"), "{busy}");
+        drop(first);
+        super::claim(&root.join("alias/store")).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn a_store_from_before_the_format_cut_is_refused_with_what_to_do() {
         let root = std::env::temp_dir().join(format!("tensord-pre-cut-store-{}", uuid::Uuid::new_v4()));
