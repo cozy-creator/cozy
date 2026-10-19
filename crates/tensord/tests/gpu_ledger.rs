@@ -370,6 +370,8 @@ fn inner_a_stalled_victim_is_ended() {
     }));
     let [memfd, _] = ledger.grant().unwrap();
     let asker = Ledger::adopt(std::os::fd::AsFd::as_fd(&memfd), None).unwrap();
+    // A call in flight: executors ask each other for bytes, and TensorD watches for stalls.
+    let _call = ledger.active();
     for victim in asker.ask(None, 3 * GIB).unwrap() {
         asker.wait(&victim).unwrap();
     }

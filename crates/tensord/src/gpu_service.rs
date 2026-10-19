@@ -962,12 +962,17 @@ impl Pool {
             .collect::<Vec<_>>()
             .join(","))
     }
-    /// `plan`'s executor on the lane from `start` is gone, its processes with it.
-    fn ended(&self, plan: &str, start: usize, _degree: u32) {
+    /// `plan`'s executor on the lane from `start` is gone, its processes with it: each GPU of
+    /// the lane reads NVML now, so their rows are reaped and their bytes returned (which wakes
+    /// the dispatch).
+    fn ended(&self, plan: &str, start: usize, degree: u32) {
         let key = session_key(plan, start);
         self.levels.lock().unwrap().remove(&key);
         self.leaders.lock().unwrap().remove(&(plan.to_owned(), start));
         self.tenants.lock().unwrap().retain(|_, t| !(t.plan == plan && t.start == start));
+        for ledger in self.lane(start, degree).unwrap_or_default().iter().filter_map(|d| d.memory.as_ref()) {
+            ledger.now();
+        }
     }
     /// A loaded executor's level from its leader's ledger row: `gpu` while its weights are
     /// resident there, else `host`.
@@ -2600,6 +2605,7 @@ impl Pool {
         let (start, degree) = (session.start, plan.degree);
         let construction = plan.construction.clone();
         let gpus = self.lane(start, degree)?;
+        let _active: Vec<_> = gpus.iter().filter_map(|d| d.memory.as_ref()).map(GpuLedger::active).collect();
         let retained = session.loaded;
         if retained {
             session.executor.begin_request();

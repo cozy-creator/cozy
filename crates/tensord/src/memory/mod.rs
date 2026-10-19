@@ -8,7 +8,7 @@ mod gpu;
 #[path = "gpu_off.rs"]
 mod gpu;
 
-pub use gpu::{Ender, Freed, GpuLedger};
+pub use gpu::{Active, Ender, Freed, GpuLedger};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,

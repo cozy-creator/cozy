@@ -8,6 +8,8 @@ pub type Freed = Box<dyn Fn() + Send + Sync>;
 
 pub enum GpuLedger {}
 
+pub struct Active<'a>(&'a GpuLedger);
+
 impl GpuLedger {
     pub fn start(_: &str, _: bool, _: u64, _: Option<u64>, _: Liveness, _: MemoryLog) -> io::Result<Option<Self>> {
         Ok(None)
@@ -25,6 +27,9 @@ impl GpuLedger {
         match *self {}
     }
     pub fn now(&self) {
+        match *self {}
+    }
+    pub fn active(&self) -> Active<'_> {
         match *self {}
     }
     pub fn fits(&self, _: &str, _: Option<&str>, _: bool) -> bool {
