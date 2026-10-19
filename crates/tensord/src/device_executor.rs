@@ -454,6 +454,8 @@ pub struct Frame {
     /// `keep_pages`: what its pages hold, checked by the executor that maps them.
     pub fingerprint: String,
     pub pages: Vec<Page>,
+    /// GPU rank within this executor group for weight page grants and deposits.
+    pub rank: u32,
     pub manifest: String,
     pub sha256: String,
     pub length: u64,

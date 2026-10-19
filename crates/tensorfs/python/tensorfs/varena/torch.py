@@ -120,6 +120,10 @@ class Unbound(Exception):
     """An op on a placeholder that binds to nothing."""
 
 
+class LayoutChanged(Unbound):
+    """A held layout needs a fresh chunk-file grant for the module's regions."""
+
+
 class _Short(Exception):
     """A bind found no room: `_enter` waits for another request's bytes, or `Exhausted`."""
 
@@ -652,7 +656,9 @@ class Memory:
             ws = self.core.adopt(self._name(grant.key), grant.ck, host_fd, files)
             self._share(ws, grant)
         if ws is not None and ws.regions != regions:
-            ws.close()  # granted for other regions: a miss, and its layout is sealed anew
+            ws.close()
+            if grant.ck.manifest is None and not files:
+                raise LayoutChanged("a held layout of other regions needs its chunk-file grant")
             ws, host_fd = None, None
         sealed = None
         if ws is None:
@@ -671,6 +677,8 @@ class Memory:
         model.position = {b: i for i, b in enumerate(model.order)}
         model.home = set(model.order)
         self.models[model.name], self.by_module[module] = model, model
+        if self.cuda:
+            self.landing[model] = {r for r in range(len(ws.spans)) if ws.resident(r)}
         if model.host:
             _bind_host(model)
             return model

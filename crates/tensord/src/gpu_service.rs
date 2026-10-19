@@ -2637,8 +2637,10 @@ impl Pool {
             weights: None,
             fetch: fetch.as_ref(),
             raw: &plan.sources,
-            // Kept GPU pages are one GPU's: a one-GPU executor's.
-            kept: gpus.first().and_then(|d| d.memory.as_ref()).filter(|_| ranks == 1).map(|m| (m, session.executor.birth.pid)),
+            kept: gpus.iter().enumerate().map(|(rank, d)| {
+                let pid = if rank == 0 { Some(session.executor.birth.pid) } else { session.followers.get(rank - 1).map(|f| f.birth().pid) };
+                d.memory.as_ref().zip(pid)
+            }).collect(),
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
@@ -2692,6 +2694,16 @@ impl Pool {
                 let tenant = Tenant { plan: construction.clone(), start, exact: follower.try_clone()? };
                 self.tenants.lock().unwrap().insert(follower.birth().pid, tenant);
             }
+            if session.followers.len() + 1 != ranks as usize {
+                return Err(io::Error::other(Refused {
+                    code: "group_unformed".into(),
+                    detail: "a follower exited before its GPU ledger could be associated".into(),
+                }));
+            }
+            callbacks.kept = gpus.iter().enumerate().map(|(rank, d)| {
+                let pid = if rank == 0 { Some(session.executor.birth.pid) } else { session.followers.get(rank - 1).map(|f| f.birth().pid) };
+                d.memory.as_ref().zip(pid)
+            }).collect();
             let load = match plan.slots.first() {
                 // A call that constructs nothing: its weightless construction.
                 None => DeviceCommand::Load {
@@ -3509,8 +3521,8 @@ struct Callbacks<'a> {
     fetch: Option<&'a Arc<crate::access::Fetch>>,
     /// Its `Weights[M]` sources, whose headers and assets `model_source` answers too.
     raw: &'a [crate::gpu_service::PlanSource],
-    /// Its GPU's ledger, which holds the GPU pages it keeps, and its pid.
-    kept: Option<(&'a GpuLedger, u32)>,
+    /// Each rank's GPU ledger and the corresponding executor process.
+    kept: Vec<Option<(&'a GpuLedger, u32)>>,
 }
 impl Callbacks<'_> {
     /// The weight set's chunk files, once its objects landed, and their digest in `answer`.
@@ -3534,7 +3546,7 @@ impl Services for Callbacks<'_> {
         let nfiles = files.as_ref().map_or(0, |(f, _)| f.len());
         let (mut answer, mut fds) = granted(frame.seq, held, files);
         // GPU pages a gone executor kept of this layout follow its host layout.
-        if let Some((fingerprint, pages)) = self.kept.filter(|_| held).and_then(|(m, _)| m.take_kept(&frame.layout)) {
+        if let Some((fingerprint, pages)) = self.kept.get(frame.rank as usize).copied().flatten().filter(|_| held).and_then(|(m, _)| m.take_kept(&frame.layout)) {
             for (page, fd) in pages {
                 answer.pages.push(page);
                 fds.push(fd);
@@ -3547,8 +3559,8 @@ impl Services for Callbacks<'_> {
     }
     /// GPU pages the executor kept: held past its end, for the next executor of the layout.
     fn keep_pages(&mut self, frame: &Frame, pages: Vec<File>) -> Answer {
-        let Some((ledger, pid)) = self.kept.filter(|_| pages.len() == frame.pages.len()) else {
-            return Answer::refused(frame.seq, "keep_pages_refused", "kept pages are a one-GPU executor's, one fd per page");
+        let Some((ledger, pid)) = self.kept.get(frame.rank as usize).copied().flatten().filter(|_| pages.len() == frame.pages.len()) else {
+            return Answer::refused(frame.seq, "keep_pages_refused", "kept pages name one existing GPU rank, one fd per page");
         };
         let bytes: u64 = frame.pages.iter().map(|p| p.nbytes).sum();
         ledger.keep(&frame.layout, &frame.fingerprint, pid, frame.pages.iter().copied().zip(pages).collect());
