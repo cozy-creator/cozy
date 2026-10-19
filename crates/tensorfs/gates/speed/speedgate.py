@@ -271,8 +271,9 @@ def summary(results):
     ratios = [row["engine"]["pinned_ceiling_ratio"] for row in warm if row["engine"]["measured"]]
     return {"cells": gate, "link_measured": link_measured,
             "full_warm_pinned_ceiling_ratio_median": statistics.median(ratios) if ratios else None,
-            "link_threshold": None, "pass": all(cell["pass"] for cell in gate.values()) and link_measured,
-            "note": "Link ratios are observations; no numeric owner threshold is invented."}
+            "link_threshold": None, "parity_pass": all(cell["pass"] for cell in gate.values()),
+            "r4_link_review_required": True,
+            "note": "F1 parity only. Link ratios need parent review; no numeric threshold is invented."}
 
 
 def environment(cache_dir, work):
@@ -308,7 +309,9 @@ def main(args):
         raise ValueError("F1 controls require fastsafetensors0.5.0 and safetensors0.8.0")
     cache_dir, work = Path(plan["cache_dir"]).expanduser(), Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
-    out = {"format": "tensorfs.speed-proof/2", "sources": plan, "models": {}, "pass": False}
+    out = {"format": "tensorfs.speed-proof/2", "sources": plan, "models": {},
+           "parity_pass": False, "link_measurements_complete": False,
+           "r4_link_review_required": True, "r4_lifecycle_review_required": True}
     # A failed or partial rerun must never leave an earlier successful result at this path.
     with open(args.result, "xb") as result:
         result.write(canonical(out))
@@ -350,10 +353,12 @@ def main(args):
                 model.drop(layout)
         out["models"][model.name] = {**model.provenance(), "results": results, "gate": summary(results)}
         Path(args.result).write_bytes(canonical(out))
-    out["pass"] = all(row["gate"]["pass"] for row in out["models"].values())
+    out["parity_pass"] = all(row["gate"]["parity_pass"] for row in out["models"].values())
+    out["link_measurements_complete"] = all(row["gate"]["link_measured"] for row in out["models"].values())
     Path(args.result).write_bytes(canonical(out))
     print(json.dumps({name: row["gate"] for name, row in out["models"].items()}, indent=2), flush=True)
-    return 0 if out["pass"] else 1
+    # Success supplies F1 parity and complete observations, never an R4 complete verdict.
+    return 0 if out["parity_pass"] and out["link_measurements_complete"] else 1
 
 
 if __name__ == "__main__":
