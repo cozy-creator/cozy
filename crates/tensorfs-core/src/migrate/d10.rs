@@ -4,7 +4,7 @@
 //! its family's pinned upstream ([`UPSTREAMS`], owner Decision 1) and is recorded in the
 //! header's `filled`. Deleted once it has run.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{btree_map::Entry, BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -275,9 +275,9 @@ impl<'t> Migrator<'t> {
         let mut filled = Vec::new();
         for (u, entry) in upstream.iter().flat_map(|u| u.files.iter().map(move |e| (u, e))) {
             for (path, b) in self.upstream(u.from, entry)? {
-                if !bytes.contains_key(&path) {
-                    filled.push(path.clone());
-                    bytes.insert(path, b);
+                if let Entry::Vacant(file) = bytes.entry(path.clone()) {
+                    filled.push(path);
+                    file.insert(b);
                 }
             }
         }
