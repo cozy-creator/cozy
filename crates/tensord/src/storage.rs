@@ -12,7 +12,7 @@
 //! - A reserve of 1/50 of the filesystem (1–10 GiB) and 32 inodes is never admitted to a
 //!   download or written into by an optional cache.
 use std::{
-    io,
+    io::{self, Write as _},
     path::Path,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -95,14 +95,13 @@ const TRANSPORT_ROTATE: u64 = 4 << 20;
 /// import did, or why it failed: `<unix seconds> <kind> <subject> <detail>`, one per completed
 /// fetch, never per object. Never fatal.
 pub fn transport(store: &Store, kind: &str, subject: &str, detail: &str) {
-    use std::io::Write as _;
     let dir = store.root().join("logs");
     let path = dir.join("transport.log");
     let _ = std::fs::create_dir_all(&dir);
     if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > TRANSPORT_ROTATE) {
         let _ = std::fs::rename(&path, dir.join("transport.log.1"));
     }
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH);
     let at = now.map_or(0.0, |since| since.as_secs_f64());
     let line = format!("{at:.3} {kind} {subject} {detail}\n");
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {

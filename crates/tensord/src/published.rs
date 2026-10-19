@@ -22,7 +22,10 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
+    },
     time::{Duration, Instant},
 };
 use crate::{
@@ -1522,10 +1525,10 @@ fn make_source(
     }
     let stop = || cancellation.as_ref().is_some_and(Stop::is_cancelled);
     // What the import downloaded, for its transport line.
-    let downloaded = std::sync::atomic::AtomicU64::new(0);
+    let downloaded = AtomicU64::new(0);
     let counted = |stage: &str, done: u64, total: u64| {
         if stage == "downloading" {
-            downloaded.fetch_max(total, std::sync::atomic::Ordering::Relaxed);
+            downloaded.fetch_max(total, Ordering::Relaxed);
         }
         progress(stage, done, total)
     };
@@ -1552,7 +1555,7 @@ fn make_source(
         manifest.id(),
         closure.len(),
         closure.iter().map(|o| o.length).sum::<u64>(),
-        downloaded.load(std::sync::atomic::Ordering::Relaxed),
+        downloaded.load(Ordering::Relaxed),
         started.elapsed().as_secs_f64()
     );
     crate::storage::transport(store, "import", source, &detail);
