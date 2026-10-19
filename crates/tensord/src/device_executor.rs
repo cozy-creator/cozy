@@ -456,7 +456,9 @@ pub struct Frame {
     /// `map`: whether every weight of the construction is on its GPU after it.
     pub complete: Option<bool>,
     pub metrics: Option<Metrics>,
-    /// `invoke`: the request's memory per model per step (varena's `RequestStats`).
+    /// `invoke`: the request's memory per model per step (varena's `RequestStats`); another
+    /// frame's `memory` of another shape (an older Hello's list) reads as absent.
+    #[serde(deserialize_with = "lenient")]
     pub memory: Option<crate::memory::call::Stats>,
     pub stage: String,
     pub position: Option<u64>,
@@ -1886,6 +1888,11 @@ pub fn read_result(spool: &Path, reply: &Frame) -> io::Result<Value> {
     }
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
+/// A field of the shape this machine reads, else absent: never a reason to refuse the frame.
+fn lenient<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(d: D) -> Result<Option<T>, D::Error> {
+    Ok(serde_json::from_value(Value::deserialize(d)?).ok())
+}
+
 fn is_zero<T: Default + PartialEq>(value: &T) -> bool {
     *value == T::default()
 }
@@ -2016,6 +2023,15 @@ mod codec_tests {
 
     /// A null in any optional field reads as its absence: a string, a flattened hello field,
     /// a count, a flag, a kind or a list (the Runtime's `None`).
+    #[test]
+    fn a_memory_field_of_another_shape_reads_as_absent() {
+        let hello: Frame = serde_json::from_value(serde_json::json!({"reply": "hello", "ok": true, "pid": 7,
+            "memory": [1, 2]})).unwrap();
+        assert!(hello.ok && hello.memory.is_none() && hello.hello.pid == 7);
+        let invoke: Frame = serde_json::from_value(serde_json::json!({"reply": "invoke", "memory": {"paged_in": 5}})).unwrap();
+        assert_eq!(invoke.memory.unwrap().paged_in, 5);
+    }
+
     #[test]
     fn a_null_field_reads_as_absent() {
         let body = serde_json::to_vec(&serde_json::json!({
