@@ -653,7 +653,8 @@ fn every_carrier_names_a_complete_encoding() {
             ("int8.rowwise", _) => Encoding::int8_rowwise(0),
             ("int8.convrot", _) => Encoding::int8_convrot(256),
             ("fp8.blockwise", _) => Encoding::fp8_blockwise(128, 128, &Dtype::F32),
-            ("mxfp4", _) => Encoding::mxfp4(),
+            ("mxfp4", Producer::GptOss) => Encoding::mxfp4(true),
+            ("mxfp4", _) => Encoding::mxfp4(false),
             other => panic!("{other:?}"),
         };
         let mut encoding = c.encoding.clone();

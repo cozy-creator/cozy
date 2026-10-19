@@ -167,7 +167,7 @@
         {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "as": "F4", "shape": "logical"},
         {"suffix": "scale", "role": "scale", "dtypes": ["F8_E8M0"], "shape": {"blocks": 32}}
       ],
-      "encoding": {"scheme": "mxfp4", "params": {"block_size": 32}}
+      "encoding": {"scheme": "mxfp4", "params": {"block_size": 32, "transposed": false}}
     },
     {
       "producer": "compressed-tensors",
@@ -187,7 +187,7 @@
         {"suffix": "weight_packed", "role": "weight", "dtypes": ["U8"], "as": "F4", "shape": "logical"},
         {"suffix": "weight_scale", "role": "scale", "dtypes": ["U8"], "as": "F8_E8M0", "shape": {"blocks": 32}}
       ],
-      "encoding": {"scheme": "mxfp4", "params": {"block_size": 32}}
+      "encoding": {"scheme": "mxfp4", "params": {"block_size": 32, "transposed": false}}
     },
     {
       "producer": "gpt-oss",
@@ -197,7 +197,7 @@
         {"suffix": "blocks", "role": "weight", "dtypes": ["U8"], "as": "F4", "shape": "logical", "merge": true},
         {"suffix": "scales", "role": "scale", "dtypes": ["U8"], "as": "F8_E8M0", "shape": {"blocks": 32}}
       ],
-      "encoding": {"scheme": "mxfp4", "params": {"block_size": 32}}
+      "encoding": {"scheme": "mxfp4", "params": {"block_size": 32, "transposed": true}}
     },
     {
       "producer": "quark",
@@ -206,7 +206,7 @@
         {"suffix": "weight", "role": "weight", "dtypes": ["U8"], "as": "F4", "shape": "logical"},
         {"suffix": "weight_scale", "role": "scale", "dtypes": ["U8"], "as": "F8_E8M0", "shape": {"blocks": 32}}
       ],
-      "encoding": {"scheme": "mxfp4", "params": {"block_size": 32}}
+      "encoding": {"scheme": "mxfp4", "params": {"block_size": 32, "transposed": false}}
     },
     {
       "producer": "quark",

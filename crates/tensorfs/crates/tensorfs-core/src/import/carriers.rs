@@ -1039,9 +1039,15 @@ fn fold_group(group: &Group, d: &Declared) -> Result<Folds> {
     let mut out = Folds::new();
     for (key, consumed, folded) in folds {
         let data = &folded.parts[0];
+        // `transposed: true`: the parts are the logical tensor with its last two axes swapped.
+        let mut shape = data.shape.clone();
+        if folded.encoding.params.get("transposed") == Some(&Value::Bool(true)) {
+            let n = shape.len();
+            shape.swap(n - 2, n - 1);
+        }
         let tensor = Tensor {
             dtype: logical.clone(),
-            shape: data.shape.clone(),
+            shape,
             file: data.at.file,
             start: data.at.start,
             len: data.at.len,

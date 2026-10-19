@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tensorfs_core::err::Code;
-use tensorfs_core::format::{Body, Dtype};
+use tensorfs_core::format::{decode, Body, Dtype, Encoding, PartBytes};
 use tensorfs_core::import::{Access, Request};
 use tensorfs_core::store2::{Checkpoint, Store};
 
@@ -81,6 +81,8 @@ fn check(case: &str, wants: &[Want]) {
             panic!("{}: plain", want.key)
         };
         assert_eq!(encoding.to_string(), want.encoding, "{}", want.key);
+        let dequant = &expect[&format!("dequant.{}", want.key)];
+        assert_eq!(t.shape, dequant.1, "{}: the logical shape", want.key);
         assert_eq!(t.dtype, Dtype::BF16, "{}", want.key);
         for (p, (role, dtype, shape, key)) in parts.iter().zip(want.parts) {
             assert_eq!(
@@ -135,7 +137,8 @@ const TILES_F16: &str = r#"fp8.blockwise {block_size: [128, 128], scale_dtype: "
 const TILES_F32: &str = r#"fp8.blockwise {block_size: [128, 128], scale_dtype: "F32"}"#;
 const TILES_BF16: &str = r#"fp8.blockwise {block_size: [128, 128], scale_dtype: "BF16"}"#;
 const TILES_E8M0: &str = r#"fp8.blockwise {block_size: [128, 128], scale_dtype: "F8_E8M0"}"#;
-const MXFP4: &str = "mxfp4 {block_size: 32}";
+const MXFP4: &str = "mxfp4 {block_size: 32, transposed: false}";
+const MXFP4_TRANSPOSED: &str = "mxfp4 {block_size: 32, transposed: true}";
 
 #[test]
 fn deepseek_dialect_fp8_tiles() {
@@ -292,29 +295,89 @@ fn compressed_tensors_block_and_mxfp4() {
 
 #[test]
 fn gpt_oss_and_quark_mxfp4() {
-    // gpt-oss: `{module}_blocks [E, N, C/32, 16]` fold into `{module}`, `[E, N, C]` (gpt-oss's [E, out, in]).
+    // gpt-oss's `{module}_blocks [E, N, K/32, 16]` are transformers' `{module}` `[E, K, N]`, stored transposed:
+    // exactly unsloth/gpt-oss-20b-BF16's tensors (the square `down_proj` included).
     check(
         "real-gpt-oss",
-        &[Want {
-            key: "model.layers.0.mlp.experts.down_proj",
-            encoding: MXFP4,
-            parts: &[
-                (
-                    "weight",
-                    "F4",
-                    &[2, 4, 2880],
-                    "model.layers.0.mlp.experts.down_proj_blocks",
-                ),
-                (
-                    "scale",
-                    "F8_E8M0",
-                    &[2, 4, 90],
-                    "model.layers.0.mlp.experts.down_proj_scales",
-                ),
-            ],
-            error: None,
-        }],
+        &[
+            Want {
+                key: "model.layers.0.mlp.experts.down_proj",
+                encoding: MXFP4_TRANSPOSED,
+                parts: &[
+                    (
+                        "weight",
+                        "F4",
+                        &[2, 64, 64],
+                        "model.layers.0.mlp.experts.down_proj_blocks",
+                    ),
+                    (
+                        "scale",
+                        "F8_E8M0",
+                        &[2, 64, 2],
+                        "model.layers.0.mlp.experts.down_proj_scales",
+                    ),
+                ],
+                error: Some(0.0),
+            },
+            Want {
+                key: "model.layers.0.mlp.experts.gate_up_proj",
+                encoding: MXFP4_TRANSPOSED,
+                parts: &[
+                    (
+                        "weight",
+                        "F4",
+                        &[2, 64, 64],
+                        "model.layers.0.mlp.experts.gate_up_proj_blocks",
+                    ),
+                    (
+                        "scale",
+                        "F8_E8M0",
+                        &[2, 64, 2],
+                        "model.layers.0.mlp.experts.gate_up_proj_scales",
+                    ),
+                ],
+                error: Some(0.0),
+            },
+        ],
     );
+    // The hazard `transposed` removes: read untransposed, the square down_proj has the same name and shape as
+    // unsloth's tensor and different values.
+    let file = tensors(&fixtures().join("real-gpt-oss/model.safetensors"));
+    let expect = tensors(&fixtures().join("real-gpt-oss.expect.safetensors"));
+    let (blocks, scales) = (
+        &file["model.layers.0.mlp.experts.down_proj_blocks"].2,
+        &file["model.layers.0.mlp.experts.down_proj_scales"].2,
+    );
+    let parts = BTreeMap::from([
+        (
+            "weight",
+            PartBytes {
+                dtype: &Dtype::F4,
+                shape: &[2, 64, 64],
+                bytes: blocks,
+            },
+        ),
+        (
+            "scale",
+            PartBytes {
+                dtype: &Dtype::F8_E8M0,
+                shape: &[2, 64, 2],
+                bytes: scales,
+            },
+        ),
+    ]);
+    let read = |transposed: bool| {
+        decode(
+            &Dtype::BF16,
+            &[2, 64, 64],
+            &Encoding::mxfp4(transposed),
+            &parts,
+        )
+        .unwrap()
+    };
+    let source = &expect["source.model.layers.0.mlp.experts.down_proj"].2;
+    assert_eq!(&read(true), source);
+    assert_ne!(&read(false), source);
     // AMD Quark (`pack_method: reorder`) re-quantized the same expert: it decodes to OpenAI's values exactly.
     check(
         "real-quark-mxfp4",

@@ -2,7 +2,8 @@
 """Writes the real-* fixtures: tiles and rows of real fp8.blockwise and mxfp4 checkpoints, read by HTTP range at
 pinned revisions, each in its producer's container and declaration. `real-<case>.expect.safetensors` holds
 `dequant.<key>` (the producer's own reader: transformers' Fp8Dequantize, compressed-tensors' decompress, gpt-oss's
-weights.py) and, where a higher-precision original exists, `source.<key>` (its BF16 weights, same rows).
+weights.py, transformers' convert_moe_packed_tensors) and, where a higher-precision original exists, `source.<key>`
+(its BF16 weights, same rows).
 
     <venv with torch, transformers, compressed-tensors, safetensors, gpt-oss (--no-deps)>/bin/python -I make_real.py
 """
@@ -23,9 +24,11 @@ from gpt_oss.torch.weights import Checkpoint
 from safetensors.torch import save_file
 from transformers import FineGrainedFP8Config
 from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+from transformers.integrations.mxfp4 import convert_moe_packed_tensors
 
 HERE = Path(__file__).resolve().parent
 HF = "https://huggingface.co/{}/resolve/{}/{}"
+UNSLOTH_LAYER0 = "model-00001-of-00009.safetensors"
 DT = {"F8_E4M3": torch.float8_e4m3fn, "F8_E8M0": torch.float8_e8m0fnu, "F32": torch.float32, "F16": torch.float16,
       "BF16": torch.bfloat16, "U8": torch.uint8, "I8": torch.int8}
 
@@ -155,27 +158,37 @@ def ct():
 
 
 def gpt_oss():
+    """gpt-oss's [E, N, K] blocks read as transformers' [E, K, N] tensors (`transposed: true`): experts 0 and 1, the
+    first 64 of N and of K, so `down_proj` is square, the case a transpose would pass silently. The source is
+    unsloth/gpt-oss-20b-BF16, transformers' own BF16 export of the same weights."""
     oa = Shard("openai/gpt-oss-20b", "6cee5e81ee83917806bbde320786a8fb61efebee", "model-00000-of-00002.safetensors")
-    m = "model.layers.0.mlp.experts.down_proj"
-    # Experts 0 and 1, rows 0..4: [2, 4, 90, 16] blocks of a [32, 2880, 90, 16] stack.
-    blocks = torch.stack([oa.span(f"{m}_blocks", e * 2880 * 1440, 4 * 1440).reshape(4, 90, 16) for e in (0, 1)])
-    scales = torch.stack([oa.span(f"{m}_scales", e * 2880 * 90, 4 * 90).reshape(4, 90) for e in (0, 1)])
-    bias = oa.rows(f"{m}_bias", 0, 2)
+    un = Shard("unsloth/gpt-oss-20b-BF16", "5a6fe4c0c1a86147cb9dc1bb99486e61d12a3c9e", UNSLOTH_LAYER0)
+    t, e = {}, {}
+    for proj, n in (("down_proj", 2880), ("gate_up_proj", 5760)):
+        m, k = f"model.layers.0.mlp.experts.{proj}", 2880
+        blocks = torch.stack([oa.span(f"{m}_blocks", x * n * k // 2, 64 * k // 2).reshape(64, k // 32, 16)[:, :2]
+                              for x in (0, 1)])
+        scales = torch.stack([oa.span(f"{m}_scales", x * n * k // 32, 64 * k // 32).reshape(64, k // 32)[:, :2]
+                              for x in (0, 1)])
+        t[f"{m}_blocks"], t[f"{m}_scales"] = blocks, scales
+        t[f"{m}_bias"] = oa.rows(f"{m}_bias", 0, 2)[:, :64]
+        e[f"dequant.{m}"] = convert_moe_packed_tensors(blocks, scales, dtype=torch.bfloat16)
+        e[f"source.{m}"] = torch.stack([un.span(m, x * k * n, 64 * n).reshape(64, n)[:, :64] for x in (0, 1)])
     config = {"quantization_config": {"modules_to_not_convert": ["model.layers.*.self_attn", "model.layers.*.mlp.router",
                                                                  "model.embed_tokens", "lm_head"],
                                       "quant_method": "mxfp4"}}
-    write("real-gpt-oss", config, {f"{m}_blocks": blocks, f"{m}_scales": scales, f"{m}_bias": bias},
-          {f"dequant.{m}": gpt_oss_reader(blocks, scales)})
-    # AMD Quark's re-quantization of the same expert: its values are OpenAI's, exactly.
+    write("real-gpt-oss", config, t, e)
+    # AMD Quark's re-quantization of expert 0 (per-expert nn.Linear weights, [out, in]): OpenAI's values, exactly.
     q = Shard("amd/gpt-oss-20b-w-mxfp4-a-bf16", "34f332d130203b37d3c7715874254cd7b5447f51", "model.safetensors")
     k = "model.layers.0.mlp.experts.0.down_proj"
     w, s = q.rows(f"{k}.weight", 0, 4), q.rows(f"{k}.weight_scale", 0, 4)
+    ob = oa.span("model.layers.0.mlp.experts.down_proj_blocks", 0, 4 * 1440).reshape(4, 90, 16)
+    os_ = oa.span("model.layers.0.mlp.experts.down_proj_scales", 0, 4 * 90).reshape(4, 90)
     config = json.loads(get("amd/gpt-oss-20b-w-mxfp4-a-bf16", "34f332d130203b37d3c7715874254cd7b5447f51",
                             "config.json"))["quantization_config"]
     config = {"quantization_config": {**config, "exclude": []}, "torch_dtype": "bfloat16"}
     write("real-quark-mxfp4", config, {f"{k}.weight": w, f"{k}.weight_scale": s},
-          {f"dequant.{k}.weight": gpt_oss_reader(w.reshape(4, 90, 16), s),
-           f"source.{k}.weight": gpt_oss_reader(blocks[0], scales[0])})
+          {f"dequant.{k}.weight": gpt_oss_reader(w.reshape(4, 90, 16), s), f"source.{k}.weight": gpt_oss_reader(ob, os_)})
 
 
 if __name__ == "__main__":
