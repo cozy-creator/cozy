@@ -1,0 +1,145 @@
+{
+  "unread_declarations": [
+    {"file": "quantize_config.json", "producer": "GPTQ (AutoGPTQ, GPTQModel)"},
+    {"file": "quant_config.json", "producer": "AWQ (AutoAWQ)"},
+    {"metadata_prefix": "gptq_", "producer": "GPTQ (GPTQModel)"}
+  ],
+  "companions": [
+    {"producer": "bitsandbytes", "keys": ["*.absmax", "*.quant_map", "*.nested_absmax", "*.nested_quant_map", "*.quant_state.*"]},
+    {"producer": "GPTQ/AWQ", "keys": ["*.qweight", "*.qzeros", "*.g_idx"]},
+    {"producer": "fp8 block scales (DeepSeek)", "keys": ["*.weight_scale_inv"]},
+    {"producer": "mxfp4 (gpt-oss)", "keys": ["*_blocks", "*_scales"]},
+    {"producer": "compressed-tensors packed", "keys": ["*.weight_packed", "*.weight_shape"]},
+    {"producer": "AWQ smoothing", "keys": ["*.pre_quant_scale"]},
+    {"producer": "ComfyUI asym_w4a8_int8", "keys": ["*.weight_s_rel"]}
+  ],
+  "marker_execution": ["full_precision_matrix_mult", "num_experts"],
+  "carriers": [
+    {
+      "producer": "modelopt",
+      "formats": ["NVFP4", "W4A16_NVFP4"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["U8"], "as": "F4", "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F8_E4M3"], "shape": {"blocks": 16}},
+        {"suffix": "weight_scale_2", "role": "scale_2", "dtypes": ["F32"], "shape": "one"},
+        {"suffix": "input_scale", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true}
+      ],
+      "encoding": {"scheme": "nvfp4", "params": {"block_size": 16, "global_scale": "multiply", "nibble_order": "low_first", "scale_layout": "row_major"}}
+    },
+    {
+      "producer": "modelopt",
+      "formats": ["MXFP8"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3"], "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["U8"], "as": "F8_E8M0", "shape": {"blocks": 32}}
+      ],
+      "encoding": {"scheme": "mxfp8", "params": {"block_size": 32, "scale_layout": "row_major"}}
+    },
+    {
+      "producer": "compressed-tensors",
+      "formats": ["nvfp4-pack-quantized"],
+      "parts": [
+        {"suffix": "weight_packed", "role": "weight", "dtypes": ["U8"], "as": "F4", "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F8_E4M3"], "shape": {"blocks": 16}},
+        {"suffix": "weight_global_scale", "role": "scale_2", "dtypes": ["F32"], "shape": "one"},
+        {"suffix": "input_global_scale", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true}
+      ],
+      "encoding": {"scheme": "nvfp4", "params": {"block_size": 16, "global_scale": "divide", "nibble_order": "low_first", "scale_layout": "row_major"}}
+    },
+    {
+      "producer": "compressed-tensors",
+      "formats": ["mxfp8-quantized"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3"], "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["U8"], "as": "F8_E8M0", "shape": {"blocks": 32}}
+      ],
+      "encoding": {"scheme": "mxfp8", "params": {"block_size": 32, "scale_layout": "row_major"}}
+    },
+    {
+      "producer": "comfy",
+      "formats": ["nvfp4"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["U8"], "as": "F4", "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F8_E4M3", "U8"], "as": "F8_E4M3", "shape": {"tiles": 16}},
+        {"suffix": "weight_scale_2", "role": "scale_2", "dtypes": ["F32"], "shape": "one"},
+        {"suffix": "input_scale", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true}
+      ],
+      "encoding": {"scheme": "nvfp4", "params": {"block_size": 16, "global_scale": "multiply", "nibble_order": "high_first", "scale_layout": "cublas_128x4"}},
+      "marker_values": {"block_size": 16, "group_size": 16}
+    },
+    {
+      "producer": "comfy",
+      "formats": ["mxfp8"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3"], "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F8_E8M0", "U8"], "as": "F8_E8M0", "shape": {"tiles": 32}}
+      ],
+      "encoding": {"scheme": "mxfp8", "params": {"block_size": 32, "scale_layout": "cublas_128x4"}},
+      "marker_values": {"block_size": 32, "group_size": 32}
+    },
+    {
+      "producer": "comfy",
+      "formats": ["float8_e4m3fn", "float8_e5m2"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3", "F8_E5M2"], "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "one"},
+        {"suffix": "input_scale", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true}
+      ],
+      "encoding": {"scheme": "fp8.tensorwise", "params": {}},
+      "dtype_params": {"scale_dtype": "scale"}
+    },
+    {
+      "producer": "comfy",
+      "formats": ["float8_e4m3fn", "float8_e5m2"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3", "F8_E5M2"], "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "rows"}
+      ],
+      "encoding": {"scheme": "fp8.rowwise", "params": {"axis": 0}},
+      "dtype_params": {"scale_dtype": "scale"}
+    },
+    {
+      "producer": "comfy",
+      "formats": ["scaled_fp8"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3", "F8_E5M2"], "shape": "logical"},
+        {"suffix": "scale_weight", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "one"},
+        {"suffix": "scale_input", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true}
+      ],
+      "encoding": {"scheme": "fp8.tensorwise", "params": {}},
+      "dtype_params": {"scale_dtype": "scale"}
+    },
+    {
+      "producer": "comfy",
+      "formats": ["int8_tensorwise"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "one"}
+      ],
+      "encoding": {"scheme": "int8.tensorwise", "params": {}},
+      "dtype_params": {"scale_dtype": "scale"}
+    },
+    {
+      "producer": "comfy",
+      "formats": ["int8_tensorwise"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "rows"}
+      ],
+      "encoding": {"scheme": "int8.rowwise", "params": {"axis": 0}},
+      "dtype_params": {"scale_dtype": "scale"}
+    },
+    {
+      "producer": "comfy",
+      "formats": ["int8_tensorwise"],
+      "convrot": true,
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "rows"}
+      ],
+      "encoding": {"scheme": "int8.convrot", "params": {"rotation": "hadamard"}},
+      "marker_params": {"rotation_size": ["convrot_groupsize", 256]},
+      "dtype_params": {"scale_dtype": "scale"}
+    }
+  ]
+}

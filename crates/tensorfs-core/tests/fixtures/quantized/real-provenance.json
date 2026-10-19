@@ -1,0 +1,93 @@
+[
+ {
+  "case": "real-comfy-nvfp4-awq",
+  "module": "model.layers.0.self_attn.o_proj",
+  "rows": [
+   2560,
+   2688
+  ],
+  "columns": [
+   0,
+   512
+  ],
+  "source": "Comfy-Org/MiniMax-H3@e5eb578a89295337b8ff433a035929ce0279e0b6/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+  "source_header_sha256": "399cac2a888a9318b42df02ccdb0f0ae372a47da9edc75b92a7f72b1857bc78e",
+  "reference": "Comfy-Org/MiniMax-H3@e5eb578a89295337b8ff433a035929ce0279e0b6/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
+  "reference_header_sha256": "5b540287b5e042e9e3fc832ee084ed6ce42fac65900e15d0be325a480a45b1c2",
+  "stored_layout": "cublas_128x4",
+  "rel_l2": {
+   "low_first/row_major": 1.5975,
+   "low_first/cublas_128x4": 1.4567,
+   "high_first/row_major": 0.6561,
+   "high_first/cublas_128x4": 0.0975
+  },
+  "sha256": {
+   "model.layers.0.self_attn.o_proj.weight": "9f13878daca049d6f03f15664dfb752e66092bb3639121fce08b8f6380e6edb1",
+   "model.layers.0.self_attn.o_proj.weight_scale": "c4378e3c9b48504651874ecadd81c7f1f174c5309533f06e76fe291414ff2ee3",
+   "model.layers.0.self_attn.o_proj.weight_scale_2": "8bbb2196746f3677b403e426acf72926181c2a2037be6722d175101114923b1d",
+   "model.layers.0.self_attn.o_proj.pre_quant_scale": "c80eb835b08dca9c75e2189d562e03d372af70a07eb9d8aa9aba732d6469040d",
+   "model.layers.0.self_attn.o_proj.comfy_quant": "24308bb3e6db93bad379f8d8a1cb49045d4c679130539a32708f52dd8354f6ef",
+   "model.layers.0.post_attention_layernorm.weight": "de9e02641dbaae72ca1fb68239d034c3ba147588c99623aadb8b4a2252ec5591"
+  }
+ },
+ {
+  "case": "real-comfy-nvfp4",
+  "module": "transformer_blocks.0.attn.to_q",
+  "rows": [
+   1536,
+   1664
+  ],
+  "columns": [
+   0,
+   512
+  ],
+  "source": "Comfy-Org/Qwen-Image_ComfyUI@1f12b17be14c89b026c51a91d67c32f84bb047bc/split_files/diffusion_models/qwen_image_nvfp4.safetensors",
+  "source_header_sha256": "f81986eaf79d994c657cd9d581e287aa744a10da6d9db7a5ace1d157cd116c9a",
+  "reference": "Comfy-Org/Qwen-Image_ComfyUI@1f12b17be14c89b026c51a91d67c32f84bb047bc/split_files/diffusion_models/qwen_image_bf16.safetensors",
+  "reference_header_sha256": "c49ad548dffd7df6ab2013de44272e7bc1f1e46b940b9fe9c239bfcec93f920a",
+  "stored_layout": "cublas_128x4",
+  "rel_l2": {
+   "low_first/row_major": 1.5891,
+   "low_first/cublas_128x4": 1.4034,
+   "high_first/row_major": 0.8984,
+   "high_first/cublas_128x4": 0.0911
+  },
+  "sha256": {
+   "transformer_blocks.0.attn.to_q.weight": "12d75cff6ebb53bee6cae369f903b10583451bda61dab1179c4f716d9e29779c",
+   "transformer_blocks.0.attn.to_q.weight_scale": "be1c8a0812f842b8b4f6976224df87a9c49150ab7a0edecc5f471196c75f3a7c",
+   "transformer_blocks.0.attn.to_q.weight_scale_2": "9abb3bfe579167494ff77a3f6c948fc84d6267ee870aec7834c7b99a360d814a",
+   "transformer_blocks.0.attn.to_q.input_scale": "999b4a8272663a5dd26131bd74a22c5792ab484ca14716f2d0ed773ce02d1b29",
+   "transformer_blocks.0.attn.to_q.bias": "00833a1bb5d7fc167d51e067cd171a4cd79b08986a9aa2667f968430833fb220"
+  }
+ },
+ {
+  "case": "real-modelopt-nvfp4-comfy-marked",
+  "module": "transformer_blocks.10.attn.to_q",
+  "rows": [
+   1536,
+   1664
+  ],
+  "columns": [
+   0,
+   512
+  ],
+  "source": "nvidia/Qwen-Image-NVFP4@4928c00477453b3570521e70a32e34b54c3a6624/transformer/diffusion_pytorch_model.safetensors",
+  "source_header_sha256": "e6d6173d94cdbc459cd5081ac51755a2b7dcb9c5582933c9feb99763d0856045",
+  "reference": "Comfy-Org/Qwen-Image_ComfyUI@1f12b17be14c89b026c51a91d67c32f84bb047bc/split_files/diffusion_models/qwen_image_bf16.safetensors",
+  "reference_header_sha256": "c49ad548dffd7df6ab2013de44272e7bc1f1e46b940b9fe9c239bfcec93f920a",
+  "stored_layout": "row_major",
+  "rel_l2": {
+   "low_first/row_major": 0.0948,
+   "low_first/cublas_128x4": 0.3803,
+   "high_first/row_major": 1.4172,
+   "high_first/cublas_128x4": 1.4508
+  },
+  "sha256": {
+   "transformer_blocks.10.attn.to_q.weight": "cff651fa5d6e683dc0edd67cd3ca40e07ff76542d2c56fe5b06730c253e497d5",
+   "transformer_blocks.10.attn.to_q.weight_scale": "62ceafcb5151eb525ee0410c40b2b5eeb1e857402ef015ca225943cb987ab5be",
+   "transformer_blocks.10.attn.to_q.weight_scale_2": "89b76c9d98e4b61bb911a783af9b1f59e4b599031726dfa5636e7613267ed7af",
+   "transformer_blocks.10.attn.to_q.input_scale": "85496be16ed859cf29be49082727fa6b154dc7ff07f36b09bd735e5f797805b6",
+   "transformer_blocks.10.attn.to_q.bias": "ee2f1d28d5be3e34978e2db9d0939a0266e0f7dc5c3a0d7849b367f889b395b9"
+  }
+ }
+]
