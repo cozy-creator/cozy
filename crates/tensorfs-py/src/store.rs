@@ -17,7 +17,7 @@ use tensorfs_core::export;
 use tensorfs_core::fetch::{self, Client as FetchClient, Endpoint, Fetcher, ObjectStore, Origin, Want};
 use tensorfs_core::failure::{Failure, Kind};
 use tensorfs_core::format::{Body, Config, ConfigValue, Dtype, Encoding, Header, Metadata, ObjectRef, Tensor, Tree, Value};
-use tensorfs_core::store2::{CacheGuard, Checkpoint, Store};
+use tensorfs_core::store2::{Checkpoint, Store};
 use tensorfs_core::writer::{Data, PartData, Source, Writer};
 
 use crate::tensors::{PyEncoded, PyTensors};
@@ -216,18 +216,11 @@ fn named(store: &Store, reference: &Bound<'_, PyAny>, variant: Option<&str>) -> 
 }
 
 fn opened(py: Python<'_>, store: &Store, named: Named) -> PyResult<PyCheckpoint> {
-    let (ck, tree) = py.detach(|| -> Result<_, Failure> {
-        let ck = store.checkpoint(&named.header)?;
-        let tree = named.tree.as_ref().map(|root| -> Result<_, Failure> {
-            Ok(store.cache_hold(&store.closure(root)?)?)
-        }).transpose()?;
-        Ok((ck, tree))
+    let ck = py.detach(|| match &named.tree {
+        Some(tree) => store.variant(tree, named.variant.as_deref()),
+        None => store.checkpoint(&named.header),
     }).or_raise(py)?;
-    let mut out = PyCheckpoint::new(ck.header().clone(), Some(ck), Some(named));
-    let state = out.state.get_mut().unwrap_or_else(|e| e.into_inner());
-    let access = Arc::get_mut(state.access.as_mut().expect("a newly opened checkpoint")).expect("not exposed to Python yet");
-    access._tree = tree;
-    Ok(out)
+    Ok(PyCheckpoint::new(ck.header().clone(), Some(ck), Some(named)))
 }
 
 // ---------------------------------------------------------------- the store
@@ -734,8 +727,6 @@ struct CheckpointState {
 pub(crate) struct CheckpointAccess {
     pub(crate) checkpoint: Checkpoint,
     remote: Option<Remote>,
-    // Repo-file and tree ownership follows Components, Tensors and native Source callbacks.
-    _tree: Option<CacheGuard>,
 }
 
 /// What `model_index.json` held: `cls` (`diffusers.<Class>`) and `config`.
@@ -886,7 +877,7 @@ pub(crate) struct FetchTensor<'a> {
 impl PyCheckpoint {
     fn new(header: Header, stored: Option<Checkpoint>, named: Option<Named>) -> PyCheckpoint {
         let id = stored.as_ref().map(|ck| ck.id().clone());
-        let access = stored.map(|checkpoint| Arc::new(CheckpointAccess { checkpoint, remote: None, _tree: None }));
+        let access = stored.map(|checkpoint| Arc::new(CheckpointAccess { checkpoint, remote: None }));
         PyCheckpoint { header, id, named, state: Mutex::new(CheckpointState { access, components: None, closed: false }) }
     }
 
