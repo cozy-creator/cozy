@@ -36,9 +36,9 @@ pub trait TokenProvider: Send + Sync {
 
     /// The answer to `sent` was `status` with `headers`: true asks once more (a DPoP nonce, a
     /// refreshed token).
-    fn retry(&self, sent: &Request<'_>, status: u16, headers: &HeaderMap) -> bool {
+    fn retry(&self, sent: &Request<'_>, status: u16, headers: &HeaderMap) -> Result<bool> {
         let _ = (sent, status, headers);
-        false
+        Ok(false)
     }
 }
 

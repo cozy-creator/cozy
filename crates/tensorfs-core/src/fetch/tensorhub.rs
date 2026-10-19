@@ -249,7 +249,10 @@ impl TensorhubOrigin {
                 Err(e) => return Err(Ask::Final(e)),
             };
             let request = Request { method: "POST", url, headers: &sent, payload: None };
-            let again = (self.credential.as_ref()).is_some_and(|c| c.retry(&request, answer.status, &answer.headers));
+            let again = match &self.credential {
+                Some(credential) => credential.retry(&request, answer.status, &answer.headers).map_err(Ask::Final)?,
+                None => false,
+            };
             if again && !retried {
                 retried = true;
                 continue;

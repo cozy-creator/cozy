@@ -194,7 +194,11 @@ impl Client {
             let uri: Uri = url.parse().expect("sent");
             let status = response.status().as_u16();
             let sent = Presented { method: "GET", url: &url, headers: &presented, payload: None };
-            if provider.is_some_and(|provider| provider.retry(&sent, status, response.headers())) && !challenged {
+            let retry = match provider {
+                Some(provider) => provider.retry(&sent, status, response.headers())?,
+                None => false,
+            };
+            if retry && !challenged {
                 challenged = true;
                 continue;
             }
