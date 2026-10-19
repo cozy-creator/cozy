@@ -1265,7 +1265,7 @@ impl Pinned {
 impl Drop for Pinned {
     fn drop(&mut self) {
         let g = &self.ws.gpu.inner;
-        match CtxGuard::enter(g.ctx).and_then(|_c| g.events.record(self.stream as CUstream, false)) {
+        match CtxGuard::enter(g.ctx).map_err(Error::from).and_then(|_c| g.events.record(self.stream as CUstream, false)) {
             Ok(e) => self.ws.release(self.at, self.region, Some(e)),
             // No event to order the release by: the pin stays, and the pages with it.
             Err(e) => tracing::warn!("varena: a release could not be recorded, region {} stays pinned: {e}", self.region),
