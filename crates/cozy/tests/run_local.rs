@@ -718,6 +718,7 @@ fn a_local_directory_reaches_a_tree_input_whole() {
     std::fs::create_dir_all(work.join("constants/sub")).unwrap();
     std::fs::write(work.join("constants/pos_emb.pt"), "positive").unwrap();
     std::fs::write(work.join("constants/sub/neg_emb.pt"), "negative").unwrap();
+    std::fs::write(work.join("constants/sub/empty.pt"), "").unwrap();
 
     let args = [
         "--json",
@@ -729,7 +730,9 @@ fn a_local_directory_reaches_a_tree_input_whole() {
     ];
     let first = cozy(&home, &work, &args);
     let run = completed(&first);
-    let files = serde_json::json!({"pos_emb.pt": "positive", "sub/neg_emb.pt": "negative"});
+    let files = serde_json::json!({
+        "pos_emb.pt": "positive", "sub/empty.pt": "", "sub/neg_emb.pt": "negative",
+    });
     assert_eq!(run["result"]["files"], files, "{run}");
 
     let again = cozy(&home, &work, &args);
@@ -745,6 +748,44 @@ fn a_local_directory_reaches_a_tree_input_whole() {
                     .is_some_and(|t| t.starts_with("reused constants"))
         });
     assert!(reused, "{again:?}");
+}
+
+/// Local code whose subpackage has empty `__init__.py` files runs on another machine: zero-byte
+/// files are sent like any other (run 11762's seedvr2 install lacked its ten).
+#[test]
+fn local_code_with_empty_files_runs_on_another_machine() {
+    let Some(home) = Home::new() else { return };
+    if std::env::var_os("COZY_TEST_TENSORD").is_none() {
+        eprintln!("skipped: no TensorD (COZY_TEST_TENSORD is unset)");
+        return;
+    }
+    let _machine = common::tensord::added(&home, "m1");
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/package/tiny"),
+        &work.join("tiny"),
+    );
+    let code = work.join("tiny/tiny");
+    let inner = code.join("upstream/inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(code.join("upstream/__init__.py"), "").unwrap();
+    std::fs::write(inner.join("__init__.py"), "").unwrap();
+    std::fs::write(inner.join("value.py"), "VALUE = \"deep\"\n").unwrap();
+    let mut text = std::fs::read_to_string(code.join("__init__.py")).unwrap();
+    text.push_str(
+        "\n\nfrom .upstream.inner.value import VALUE  # noqa: E402\n\n\n\
+         @app.entrypoint(accelerator=False)\n\
+         def deep(payload: EchoInput) -> EchoOutput:\n    \
+         return EchoOutput(VALUE)\n",
+    );
+    std::fs::write(code.join("__init__.py"), text).unwrap();
+
+    let run = completed(&cozy(
+        &home,
+        &work,
+        &["--json", "run", "./tiny/deep", "--on", "m1"],
+    ));
+    assert_eq!(run["result"]["text"], "deep", "{run}");
 }
 
 /// Counts the bytes sent to `target` through it: a TCP relay a machine is added behind.
