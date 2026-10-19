@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde_json::json;
 use tensorfs_core::format::{
     variant_of, variant_path, Body, Component, Config, ConfigValue, Dtype, Encoding, Header,
-    Location, Manifest, ObjectRef, Part, Pipeline, Release, Repo, Tensor, Value, HEADER_PATH,
+    Location, ObjectRef, Part, Pipeline, Release, Repo, Tensor, Tree, Value, HEADER_PATH,
 };
 
 fn tensors() -> Vec<Tensor> {
@@ -129,27 +129,37 @@ fn writer_is_deterministic_and_reader_round_trips() {
     wide.metadata.insert("huge".into(), Value::Int(1 << 64));
     assert_eq!(wide.to_cbor().unwrap_err().code(), "invalid");
 
-    let m = Manifest {
-        files: BTreeMap::from([(HEADER_PATH.into(), ObjectRef::of(&bytes))]),
-        metadata: Default::default(),
+    let mut t = Tree {
+        files: BTreeMap::from([("README.md".into(), ObjectRef::of(b"# tiny"))]),
     };
-    let mb = m.to_json().unwrap();
-    assert!(mb.ends_with(br#"}},"format":"tensorfs.manifest/1"}"#));
-    assert_eq!(Manifest::from_json(&mb).unwrap().header(), m.header());
+    t.set_variant("bf16", ObjectRef::of(&bytes));
+    t.set_variant("", ObjectRef::of(&wb));
+    let tb = t.to_json().unwrap();
+    assert!(tb.starts_with(br#"{"files":{"README.md":"#));
+    assert!(tb.ends_with(br#"}},"format":"tensorfs.tree/1"}"#));
+    let back = Tree::from_json(&tb).unwrap();
+    assert_eq!(back, t);
+    assert_eq!(back.variant(Some("bf16")).unwrap(), ("bf16", &ObjectRef::of(&bytes)));
+    assert_eq!(back.header(""), Some(&ObjectRef::of(&wb)));
+    assert!(back.variant(None).is_err(), "two variants: name one");
+    let files: Vec<&str> = back.repo_files().map(|(p, _)| p).collect();
+    assert_eq!(files, ["README.md"]);
+    assert_eq!(HEADER_PATH, "model.cozytensors");
 
     let r = Repo {
         name: "Acme/Tiny".into(),
         releases: vec![Release {
             version: "1.0".into(),
-            lanes: BTreeMap::from([("bf16".into(), ObjectRef::of(&mb))]),
-            ..Default::default()
+            tree: ObjectRef::of(&tb),
+            yanked: false,
+            revision: 0,
         }],
         ..Default::default()
     };
     let rb = r.to_json().unwrap();
     assert_eq!(Repo::from_json(&rb).unwrap(), r);
     assert_eq!(r.key(), "refs/acme/tiny.json");
-    assert_eq!(r.lane(None, "bf16"), Some(&ObjectRef::of(&mb)));
+    assert_eq!(r.release(None).map(|r| &r.tree), Some(&ObjectRef::of(&tb)));
 }
 
 /// Later versions append fields to the root and to records, and add dtypes and schemes: this
@@ -278,16 +288,17 @@ fn red_documents_are_refused() {
     let other = b"\x85\x6dcozytensors/2\x80\x80\x80\xa0";
     assert_eq!(Header::from_cbor(other).unwrap_err().code(), "format");
 
-    for path in ["../x", "/x", "a//b", "a/./b", ""] {
-        let doc = json!({"format": "tensorfs.manifest/1", "files": {path: {"sha256": "0".repeat(64), "length": 0}}});
-        assert!(
-            Manifest::from_json(doc.to_string().as_bytes()).is_err(),
-            "{path:?}"
-        );
+    for path in ["../x", "/x", "a//b", "a/./b", "", "chunks/x"] {
+        let doc = json!({"format": "tensorfs.tree/1", "files": {path: {"sha256": "0".repeat(64), "length": 0}}});
+        assert!(Tree::from_json(doc.to_string().as_bytes()).is_err(), "{path:?}");
     }
+    let tree = json!({"sha256": "0".repeat(64), "length": 0});
     let repo = json!({"format": "tensorfs.repo/1", "name": "acme/tiny", "releases": [
-        {"version": "1", "lanes": {}}, {"version": "1", "lanes": {}}]});
+        {"version": "1", "tree": tree}, {"version": "1", "tree": tree}]});
     assert!(Repo::from_json(repo.to_string().as_bytes()).is_err());
+    let lanes = json!({"format": "tensorfs.repo/1", "name": "acme/tiny", "releases": [
+        {"version": "1", "lanes": {}}]});
+    assert!(Repo::from_json(lanes.to_string().as_bytes()).is_err(), "a release names a tree");
 }
 
 fn tweak(f: impl FnOnce(&mut Vec<Tensor>)) -> Vec<Tensor> {

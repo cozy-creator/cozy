@@ -3,6 +3,7 @@
 //! tensor's bytes from its stored parts (concatenated, llama's Q/K rows re-permuted), padded to
 //! the alignment as llama.cpp and gguf-py write them.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -14,18 +15,21 @@ use crate::format::Body;
 use crate::import::gguf::{self, Meta};
 use crate::store2::Checkpoint;
 
-/// Writes each GGUF of `ck` into `dir`; the paths written, relative.
+/// Writes each GGUF of `ck` into `dir`, from its record (a component's `<file>.gguf.json`
+/// asset); the paths written, relative.
 pub fn gguf(ck: &Checkpoint, dir: &Path) -> Result<Vec<String>> {
-    let records: Vec<String> = (ck.manifest().files.keys())
-        .filter(|p| p.to_ascii_lowercase().ends_with(".gguf.json"))
-        .cloned()
+    let records: BTreeMap<String, &crate::format::ObjectRef> = (ck.components().iter())
+        .flat_map(|c| c.assets.iter().map(move |(n, o)| (format!("{}/{n}", c.name), o)))
+        .filter(|(p, _)| p.to_ascii_lowercase().ends_with(".gguf.json"))
         .collect();
     if records.is_empty() {
         return fail(Kind::Invalid, "the checkpoint was not imported from a GGUF");
     }
     let mut written = Vec::new();
-    for record in records {
-        let meta: Meta = match serde_json::from_slice(&ck.file(&record)?) {
+    for (record, object) in records {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut ck.object(object)?, &mut bytes).map_err(|e| io(dir, e))?;
+        let meta: Meta = match serde_json::from_slice(&bytes) {
             Ok(meta) => meta,
             Err(e) => return fail(Kind::Invalid, format!("{record}: {e}")),
         };

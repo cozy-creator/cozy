@@ -1,8 +1,9 @@
-//! Tensorhub, the default origin ([`TENSORHUB`]). The Hub names a model's checkpoint by name,
-//! release and lane and lists its closure (`POST /v1/tensorfs/closure`), then presigns its
-//! objects (`POST /v1/tensorfs/presign`); the Fetcher reads them from the presigned URLs, which
-//! see no credential. Public release lanes are read anonymously; a bearer token, or a caller's
-//! own [`Credential`], reads the private checkpoints it grants.
+//! Tensorhub, the default origin ([`TENSORHUB`]). The Hub names a model's tree by name, release
+//! and variant (its wire's `lane`; its `manifest` is the tree) and lists its closure
+//! (`POST /v1/tensorfs/closure`), then presigns its objects (`POST /v1/tensorfs/presign`); the
+//! Fetcher reads them from the presigned URLs, which see no credential. Public releases are
+//! read anonymously; a bearer token, or a caller's own [`Credential`], reads the private trees
+//! it grants.
 //!
 //! Wire: closure `{"ref":"org/name[@release][@sha256:<hex>]","lane","after"?}` →
 //! `{complete, lane, manifest, model, objects[], presign_max_digests, public, release, scope}`,
@@ -56,14 +57,14 @@ impl Credential for Bearer {
     }
 }
 
-/// What the Hub named: the model, the release and lane it chose (both empty for a checkpoint
-/// asked by hash) and their manifest.
+/// What the Hub named: the model, the release and variant it chose (both empty for a tree
+/// asked by hash) and their tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
     pub model: String,
     pub release: String,
-    pub lane: String,
-    pub manifest: ObjectRef,
+    pub variant: String,
+    pub tree: ObjectRef,
     /// Anyone may read it.
     pub public: bool,
 }
@@ -139,19 +140,19 @@ impl TensorhubOrigin {
         self
     }
 
-    /// Binds `locate` to `name`'s checkpoint `manifest` at `release` (none: the owner's
-    /// checkpoint by hash) and `lane`, without asking the Hub.
-    pub fn at(mut self, name: &str, release: Option<&str>, lane: &str, manifest: &ObjectRef) -> TensorhubOrigin {
+    /// Binds `locate` to `name`'s `tree` at `release` (none: the owner's tree by hash) and
+    /// `variant`, without asking the Hub.
+    pub fn at(mut self, name: &str, release: Option<&str>, variant: &str, tree: &ObjectRef) -> TensorhubOrigin {
         self.state.get_mut().at = Some(At {
-            reference: pinned(name, release.unwrap_or(""), manifest),
-            lane: lane.into(),
-            manifest: manifest.clone(),
+            reference: pinned(name, release.unwrap_or(""), tree),
+            lane: variant.into(),
+            manifest: tree.clone(),
         });
         self
     }
 
-    /// `name` at `release` (the newest when `None`; `sha256:<hex>` names the owner's checkpoint
-    /// by hash) and `lane` (the release's only one when `None`), and binds `locate` to it.
+    /// `name` at `release` (the newest when `None`; `sha256:<hex>` names the owner's tree by
+    /// hash) and `variant` (the tree's only one when `None`), and binds `locate` to it.
     pub async fn named(&self, name: &str, release: Option<&str>, lane: Option<&str>) -> Result<Resolved> {
         split_name(name)?;
         let reference = match release {
@@ -181,8 +182,8 @@ impl TensorhubOrigin {
         Ok(Resolved {
             model: page.model,
             release: page.release,
-            lane: page.lane,
-            manifest: page.manifest,
+            variant: page.lane,
+            tree: page.manifest,
             public: page.public,
         })
     }
@@ -293,8 +294,8 @@ impl TensorhubOrigin {
 
 #[async_trait]
 impl Origin for TensorhubOrigin {
-    async fn resolve(&self, name: &str, release: Option<&str>, lane: Option<&str>) -> Result<ObjectRef> {
-        Ok(self.named(name, release, lane).await?.manifest)
+    async fn resolve(&self, name: &str, release: Option<&str>, variant: Option<&str>) -> Result<ObjectRef> {
+        Ok(self.named(name, release, variant).await?.tree)
     }
 
     async fn locate(&self, objects: &[ObjectRef]) -> Result<Vec<Location>> {
