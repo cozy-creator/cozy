@@ -1424,13 +1424,11 @@ def _layout(
         block.regions.append(index)
         owner.append(block)
     for part in model.ws.parts:
-        key, _, role = part.key[len(prefix) :].partition("#")
-        role = role or "value"
         shape = tuple(part.shape)
         if part.dtype == "F4":
             shape = (*shape[:-1], shape[-1] // 2)
         at = _PartAt(part.region, part.offset, part.nbytes, DTYPES[part.dtype], shape)
-        owner[part.region].tensors.setdefault(key, {})[role] = at
+        owner[part.region].tensors.setdefault(part.key, {})[part.role or "value"] = at
         model.sizes[part.region] = max(model.sizes.get(part.region, 0), part.offset + part.nbytes)
     model.blocks = sorted((b for b in by_path.values() if b.regions), key=lambda b: b.regions[0])
     for index, block in enumerate(model.blocks):
