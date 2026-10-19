@@ -6,6 +6,7 @@ Run once per allocated GPU family; CUDA execution and bit-exact bytes are actual
 """
 
 import base64
+import importlib.util
 import json
 import pathlib
 import sys
@@ -19,6 +20,8 @@ def bits(encoded):
 
 
 assert "torch" not in sys.modules and "triton" not in sys.modules
+assert importlib.util.find_spec("triton") is None, "run this gate in a TensorFS-only venv without Triton"
+assert importlib.util.find_spec("torch") is None, "the core kernel gate must also work without Torch installed"
 vectors = pathlib.Path(__file__).resolve().parents[1] / "conformance/vectors/cases"
 checked = 0
 schemes = set()
