@@ -13,7 +13,9 @@ pub const INT4: Scheme = Scheme {
     params: &[GROUP_SIZE],
     parts: &[
         Part::req("qweight", I32, |c| CODES.shape(&[], c.rows, c.cols)),
-        Part::req("qzeros", I32, |c| ZEROS.shape(&[groups(c) as u64], groups(c), c.rows)),
+        Part::req("qzeros", I32, |c| {
+            ZEROS.shape(&[groups(c) as u64], groups(c), c.rows)
+        }),
         Part::req("scales", HALF, |c| blocks(c).shape(c)),
     ],
     decode,
@@ -50,9 +52,18 @@ fn blocks(c: &Ctx) -> Grid<'static> {
 /// `(q − z) × s(i, ⌊j/g⌋)`.
 fn decode(c: &Ctx) -> Result<Vec<f32>> {
     let q = CODES.unpack(c.part("qweight").bytes, c.rows, c.cols)?;
-    let z: Vec<f32> = (ZEROS.unpack(c.part("qzeros").bytes, groups(c), c.rows)?.into_iter())
-        .map(|v| v as f32)
-        .collect();
+    let z: Vec<f32> = (ZEROS
+        .unpack(c.part("qzeros").bytes, groups(c), c.rows)?
+        .into_iter())
+    .map(|v| v as f32)
+    .collect();
     let s = c.floats("scales");
-    Ok(dequant(&q, &s, Offset::Zero(&z), &blocks(c), c.rows, c.cols))
+    Ok(dequant(
+        &q,
+        &s,
+        Offset::Zero(&z),
+        &blocks(c),
+        c.rows,
+        c.cols,
+    ))
 }

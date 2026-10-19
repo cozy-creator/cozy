@@ -27,9 +27,9 @@ mod nvfp4;
 // gguf
 
 // gptq, awq, ct
-mod awq;
-mod ct;
-mod gptq;
+pub(crate) mod awq;
+pub(crate) mod ct;
+pub(crate) mod gptq;
 
 // bnb
 
@@ -62,7 +62,6 @@ pub static SCHEMES: &[&Scheme] = &[
     &ct::INT6,
     &ct::INT7,
     &ct::INT8,
-
     // bnb.*
 
     // comfy.*

@@ -81,20 +81,24 @@ fn groups(c: &Ctx) -> usize {
     c.cols.div_ceil(c.uint("group_size"))
 }
 
-/// Codes `q + 2^(b−1)` along `axis` of a `[R, C]` array stored as is.
 fn packing(c: &Ctx, axis: usize) -> Packing<'static> {
-    let b = bits(c);
+    let fill = match c.text("packing") {
+        "word" => Fill::Word,
+        _ => Fill::Dense,
+    };
+    words(bits(c), fill, axis)
+}
+
+/// Codes `q + 2^(b−1)` along `axis` of a `[R, C]` array stored as is.
+pub fn words(bits: u32, fill: Fill, axis: usize) -> Packing<'static> {
     Packing {
-        bits: b,
+        bits,
         word: 32,
         transposed: false,
         axis,
-        fill: match c.text("packing") {
-            "word" => Fill::Word,
-            _ => Fill::Dense,
-        },
+        fill,
         order: Order::LowFirst,
-        codes: Codes::Unsigned(1 << (b - 1)),
+        codes: Codes::Unsigned(1 << (bits - 1)),
     }
 }
 
@@ -115,7 +119,11 @@ fn decode(c: &Ctx) -> Result<Vec<f32>> {
             .map(|v| i64::from_le_bytes(*v))
             .collect(),
     };
-    if !stated.iter().zip(c.shape).all(|(a, b)| u64::try_from(*a) == Ok(*b)) {
+    if !stated
+        .iter()
+        .zip(c.shape)
+        .all(|(a, b)| u64::try_from(*a) == Ok(*b))
+    {
         return Err(c.fail(format!("weight_shape {stated:?} is not {:?}", c.shape)));
     }
     let (g, w) = (c.uint("group_size"), groups(c));
@@ -166,7 +174,11 @@ fn act_order(c: &Ctx, g: usize, w: usize) -> Result<Option<Vec<u32>>> {
     }
     let full = |b: usize| if b + 1 < w { g } else { c.cols - (w - 1) * g };
     if let Some(b) = (0..w).find(|b| count[*b] != full(*b)) {
-        return Err(c.fail(format!("group {b} holds {} columns, not {}", count[b], full(b))));
+        return Err(c.fail(format!(
+            "group {b} holds {} columns, not {}",
+            count[b],
+            full(b)
+        )));
     }
     Ok(Some(idx.into_iter().map(|v| v as u32).collect()))
 }

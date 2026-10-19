@@ -24,6 +24,9 @@ mod nvfp4;
 // gguf
 
 // gptq, awq, ct
+mod awq;
+mod ct;
+mod gptq;
 
 // bnb
 
@@ -38,7 +41,19 @@ pub static ENCODERS: &[&Encoder] = &[
     // gguf.*
 
     // gptq.*, awq.*, ct.*
-
+    &gptq::INT2,
+    &gptq::INT3,
+    &gptq::INT4,
+    &gptq::INT8,
+    &awq::INT4,
+    &ct::INT1,
+    &ct::INT2,
+    &ct::INT3,
+    &ct::INT4,
+    &ct::INT5,
+    &ct::INT6,
+    &ct::INT7,
+    &ct::INT8,
     // bnb.*
 
     // comfy.*
@@ -62,6 +77,22 @@ pub struct Input<'a> {
     /// The complete encoding to produce: every param its decode reads.
     pub encoding: &'a Encoding,
     pub arrays: &'a BTreeMap<&'a str, PartBytes<'a>>,
+}
+
+impl Input<'_> {
+    /// `arrays["values"]`: the logical values, `F32` in the logical shape, all finite.
+    pub fn values(&self) -> Result<Vec<f32>> {
+        let fail = |d: &str| Error::Encode(format!("{}: {d}", self.encoding.scheme));
+        let v = (self.arrays.get("values")).ok_or_else(|| fail("no values"))?;
+        if *v.dtype != Dtype::F32 || v.shape != self.shape {
+            return Err(fail("values are not F32 in the logical shape"));
+        }
+        let x = super::decode::elem::floats(v.dtype, v.bytes);
+        if x.iter().any(|x| !x.is_finite()) {
+            return Err(fail("a value is not finite"));
+        }
+        Ok(x)
+    }
 }
 
 /// One encoded part, in the scheme's part order.
@@ -109,5 +140,40 @@ pub(crate) fn encoding(scheme: &str, params: &[(&str, Value)]) -> Encoding {
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect(),
+    }
+}
+
+/// An integer array (`I8`, `U8`, `I16`, `U16` or `I32`) of a calibrated producer's, by name.
+fn array(input: &Input, role: &str) -> Result<Vec<i32>> {
+    let fail = |d: &str| Error::Encode(format!("{}: {role} {d}", input.encoding.scheme));
+    let a = input.arrays.get(role).ok_or_else(|| fail("is missing"))?;
+    let b = a.bytes;
+    Ok(match a.dtype {
+        Dtype::I8 => b.iter().map(|v| *v as i8 as i32).collect(),
+        Dtype::U8 => b.iter().map(|v| *v as i32).collect(),
+        Dtype::I16 => (b.as_chunks::<2>().0.iter())
+            .map(|v| i16::from_le_bytes(*v) as i32)
+            .collect(),
+        Dtype::U16 => (b.as_chunks::<2>().0.iter())
+            .map(|v| u16::from_le_bytes(*v) as i32)
+            .collect(),
+        Dtype::I32 => (b.as_chunks::<4>().0.iter())
+            .map(|v| i32::from_le_bytes(*v))
+            .collect(),
+        other => return Err(fail(&format!("is {other}, not an integer array"))),
+    })
+}
+
+fn part(
+    role: &str,
+    dtype: Dtype,
+    shape: impl IntoIterator<Item = usize>,
+    bytes: Vec<u8>,
+) -> OwnedPart {
+    OwnedPart {
+        role: role.into(),
+        dtype,
+        shape: shape.into_iter().map(|e| e as u64).collect(),
+        bytes,
     }
 }

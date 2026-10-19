@@ -51,8 +51,12 @@ const PARAMS: &[Param] = &[
 ];
 
 const PARTS: &[Part] = &[
-    Part::req("qweight", I32, |c| codes(c).shape(&[], c.rows, c.cols)),
-    Part::req("qzeros", I32, |c| zeros(c).shape(&[groups(c) as u64], groups(c), c.rows)),
+    Part::req("qweight", I32, |c| {
+        qweight(bits(c)).shape(&[], c.rows, c.cols)
+    }),
+    Part::req("qzeros", I32, |c| {
+        qzeros(bits(c)).shape(&[groups(c) as u64], groups(c), c.rows)
+    }),
     Part::req("scales", HALF, |c| blocks(c, None).shape(c)),
     Part::req("g_idx", I32, |c| Ok(Shape::Exact(vec![c.cols as u64]))),
 ];
@@ -85,9 +89,9 @@ fn blocks<'a>(c: &Ctx, index: Option<&'a [u32]>) -> Grid<'a> {
 }
 
 /// `qweight`: the view stored transposed (`[K, N]`), a dense stream along K.
-fn codes(c: &Ctx) -> Packing<'static> {
+pub fn qweight(bits: u32) -> Packing<'static> {
     Packing {
-        bits: bits(c),
+        bits,
         word: 32,
         transposed: true,
         axis: 0,
@@ -98,11 +102,11 @@ fn codes(c: &Ctx) -> Packing<'static> {
 }
 
 /// `qzeros`: `[W, N]` stored as is, a dense stream along N.
-fn zeros(c: &Ctx) -> Packing<'static> {
+pub fn qzeros(bits: u32) -> Packing<'static> {
     Packing {
         axis: 1,
         transposed: false,
-        ..codes(c)
+        ..qweight(bits)
     }
 }
 
@@ -118,12 +122,14 @@ pub fn ints(b: &[u8]) -> Vec<i32> {
 /// `(q − z) × s(i, g_idx[j])`, `z` the stored zero plus `zero_offset`, modulo `2^b`.
 fn decode(c: &Ctx) -> Result<Vec<f32>> {
     let (b, g, w) = (bits(c), group(c), groups(c));
-    let q = codes(c).unpack(c.part("qweight").bytes, c.rows, c.cols)?;
+    let q = qweight(b).unpack(c.part("qweight").bytes, c.rows, c.cols)?;
     let mask = (1 << b) - 1;
     let offset = c.uint("zero_offset") as i32;
-    let z: Vec<f32> = (zeros(c).unpack(c.part("qzeros").bytes, w, c.rows)?.into_iter())
-        .map(|r| ((r + offset) & mask) as f32)
-        .collect();
+    let z: Vec<f32> = (qzeros(b)
+        .unpack(c.part("qzeros").bytes, w, c.rows)?
+        .into_iter())
+    .map(|r| ((r + offset) & mask) as f32)
+    .collect();
     if c.flag("symmetric") && z.iter().any(|z| *z != (1 << (b - 1)) as f32) {
         return Err(c.fail(format!("symmetric, and a zero is not {}", 1 << (b - 1))));
     }
