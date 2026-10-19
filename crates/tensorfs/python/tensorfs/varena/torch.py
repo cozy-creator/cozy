@@ -452,10 +452,10 @@ class Memory:
         self.core: Gpu | Host = Gpu(self.gpu) if cuda else Host()
         #: this process's device bytes outside torch and the weights (its CUDA context)
         self.context = self.last_use = self.clock = self.epoch = self.evictions = 0
-        #: this process's device bytes as the driver counts them (the Runtime's NVML row), or
-        #: None: what is neither torch's nor varena's (context, NCCL, libraries) is measured
-        #: from it at each boundary instead of once
-        self.measure: Callable[[], int | None] | None = None
+        #: this process's device bytes: what is neither torch's nor varena's (context, NCCL,
+        #: libraries) is measured from it at each boundary. The driver's free count less other
+        #: rows by default; the Runtime sets its NVML row for the process
+        self.measure: Callable[[], int | None] = self._driver_bytes
         self.models: dict[str, Model] = {}
         self.by_module: dict[nn.Module, Model] = {}
         self.caches: dict[Cache, None] = {}
@@ -911,10 +911,20 @@ class Memory:
         free, room = int(torch.cuda.mem_get_info(self.gpu)[0]), self._room()
         return free if room is None else min(free, room - torch.cuda.memory_reserved(self.gpu))
 
+    def _driver_bytes(self) -> int | None:
+        """The card's bytes in use less what other processes' ledger rows hold."""
+        if not self.cuda:
+            return None
+        free, total = torch.cuda.mem_get_info(self.gpu)
+        if self.row is None:
+            return total - free
+        table, row = self.row
+        return total - free - sum(f.held for f in table.snapshot() if f.slot != row.id)
+
     def _outside(self) -> None:
         """This process's device bytes neither torch nor varena holds (its CUDA context, NCCL's
         buffers, libraries' workspaces), measured now from the driver's count of the process."""
-        total = self.measure() if self.measure is not None and self.cuda else None
+        total = self.measure() if self.cuda else None
         if total is not None:
             core = self.core.stats()  # type: ignore[union-attr]
             held = torch.cuda.memory_reserved(self.gpu) + core.mapped + core.idle
