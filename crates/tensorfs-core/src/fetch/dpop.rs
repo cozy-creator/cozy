@@ -37,6 +37,7 @@ pub struct DPoP {
     key: EcdsaKeyPair,
     jwk: Value,
     resource: Option<String>,
+    endpoint: Option<String>,
     grant: Option<(JwtBearer, Client)>,
     token: tokio::sync::Mutex<Option<String>>,
     /// The last DPoP nonce each origin sent.
@@ -55,6 +56,13 @@ impl DPoP {
         DPoP::new(key, resource.map(|r| r.trim_end_matches('/').to_owned()), None, Some(access_token.to_owned()))
     }
 
+    /// Reach the resource at another origin (for example a private proxy). Proofs still name
+    /// the resource's public origin; credentials go only to this explicit endpoint.
+    pub fn at(mut self, endpoint: &str) -> Self {
+        self.endpoint = Some(origin(endpoint));
+        self
+    }
+
     fn new(key: &str, resource: Option<String>, grant: Option<(JwtBearer, Client)>, token: Option<String>) -> Result<DPoP> {
         let bad = |why: &str| Refusal { code: Code::CREDENTIAL_REQUIRED, detail: format!("the DPoP key {why}") };
         let jwk: Value = serde_json::from_str(key).map_err(|_| bad("is not a JWK"))?;
@@ -66,7 +74,8 @@ impl DPoP {
         let key = EcdsaKeyPair::from_private_key_and_public_key(&ECDSA_P256_SHA256_FIXED_SIGNING, &field("d")?, &point)
             .map_err(|_| bad("is not a consistent P-256 key pair"))?;
         let jwk = json!({"kty": "EC", "crv": "P-256", "x": jwk["x"], "y": jwk["y"]});
-        Ok(DPoP { key, jwk, resource, grant, token: tokio::sync::Mutex::new(token), nonces: Mutex::default() })
+        let endpoint = resource.as_deref().map(origin);
+        Ok(DPoP { key, jwk, resource, endpoint, grant, token: tokio::sync::Mutex::new(token), nonces: Mutex::default() })
     }
 
     /// RFC 7638 thumbprint of the key: what a token's `cnf.jkt` names.
@@ -84,13 +93,13 @@ impl DPoP {
     }
 
     /// A proof for `method url`, presenting `token` when given.
-    fn proof(&self, method: &str, url: &str, token: Option<&str>) -> String {
+    fn proof(&self, method: &str, url: &str, token: Option<&str>, nonce_at: &str) -> String {
         let htu = url.split(['?', '#']).next().unwrap_or(url);
         let mut claims = json!({"jti": jti(), "htm": method, "htu": htu, "iat": now()});
         if let Some(token) = token {
             claims["ath"] = b64(digest(token.as_bytes())).into();
         }
-        if let Some(nonce) = self.nonces.lock().unwrap().get(&origin(url)) {
+        if let Some(nonce) = self.nonces.lock().unwrap().get(&origin(nonce_at)) {
             claims["nonce"] = nonce.clone().into();
         }
         self.sign(json!({"typ": "dpop+jwt", "jwk": self.jwk}), &claims)
@@ -131,7 +140,7 @@ impl DPoP {
             let headers = vec![
                 ("content-type".to_owned(), "application/x-www-form-urlencoded".to_owned()),
                 ("accept".to_owned(), "application/json".to_owned()),
-                ("dpop".to_owned(), self.proof("POST", url, None)),
+                ("dpop".to_owned(), self.proof("POST", url, None, url)),
             ];
             let mut answer = client.send("POST", url, &headers, Some(Body::Bytes(form.clone()))).await?;
             let (status, fresh) = (answer.status(), self.keep_nonce(url, answer.response.headers()));
@@ -167,11 +176,15 @@ impl DPoP {
 #[async_trait]
 impl TokenProvider for DPoP {
     async fn headers(&self, request: &Request<'_>) -> Result<Vec<(String, String)>> {
-        if self.resource.as_deref().is_some_and(|r| origin(r) != origin(request.url)) {
+        if self.endpoint.as_deref().is_some_and(|r| r != origin(request.url)) {
             return Ok(vec![]);
         }
         let token = self.access_token().await?;
-        let proof = self.proof(request.method, request.url, Some(&token));
+        let public = self.resource.as_deref().map(|resource| {
+            let path = request.url.parse::<Uri>().ok().and_then(|uri| uri.path_and_query().map(|p| p.as_str().to_owned())).unwrap_or_else(|| "/".into());
+            format!("{}{path}", origin(resource))
+        });
+        let proof = self.proof(request.method, public.as_deref().unwrap_or(request.url), Some(&token), request.url);
         Ok(vec![("authorization".into(), format!("DPoP {token}")), ("dpop".into(), proof)])
     }
 
