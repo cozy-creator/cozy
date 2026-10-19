@@ -369,12 +369,16 @@ class Contract(unittest.TestCase):
         result = validate.validate(root, expected, run, machine, launch)
         self.assertTrue(result['ok'])
         self.assertEqual(expected['requested'], ['diffusers', 'comfy', *validate.native_io.IDS, validate.native_io.HOSTPIN])
-        self.assertEqual(expected['unrequested'], ['kernel'])
+        self.assertEqual(expected['unrequested'], ['kernel', 'native-full-element-windows'])
         self.assertIn('hostpin_bundle: FileAsset', self.args.output.read_text())
         self.assertNotIn('full_gpu_arrays', validate.read(root / 'reports/read-engine.json'))
         changed = copy.deepcopy(expected)
         changed['requested'].remove('read-engine')
         with self.assertRaisesRegex(ValueError, 'partial native I/O batch'):
+            validate.validate(root, changed, run, machine, launch)
+        changed = copy.deepcopy(expected)
+        changed['requested'].append('native-full-element-windows')
+        with self.assertRaisesRegex(ValueError, 'extra native vectors are out of scope'):
             validate.validate(root, changed, run, machine, launch)
 
     def test_native_io_direct_interpreter_profile_and_partial_process_fail(self):

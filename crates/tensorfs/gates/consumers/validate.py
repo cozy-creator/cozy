@@ -174,6 +174,7 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
     requested = spec.get('requested')
     require(isinstance(requested, list) and requested[:2] == ['diffusers', 'comfy'] and
             requested == [name for name in native_io.ALL if name in requested], 'wrong requested consumer/case set')
+    require(native_io.EXCLUDED not in requested, 'extra native vectors are out of scope; the fixed kernel child covers them')
     require(all(name in requested for name in native_io.IDS) == any(name in requested for name in native_io.IDS), 'partial native I/O batch')
     require(('native_io' in spec) == all(name in requested for name in native_io.IDS) and
             ('hostpin' in spec) == (native_io.HOSTPIN in requested) and
