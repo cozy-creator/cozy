@@ -50,4 +50,7 @@ NVFP4 and NVFP4_AWQ export (`pre_quant_scale` in BF16, F16 and F32), and a range
 file `Comfy-Org/Lens` (`weight_scale_2 [E]`, tiles per expert). Expected bytes are the spec's decode: ModelOpt's own
 dequantize gives the same values at BF16 and F16 (its table has no −0) and differs by at most 2 steps at F32
 (it multiplies `s × g` first); comfy-kitchen's BF16 arithmetic differs by one step. The Lens slice decodes bit for bit
-to OpenAI's MXFP4 original of the same weights.
+to OpenAI's MXFP4 original of the same weights. `mine/mxfp8.py` mines the stacked `mxfp8` cases (`[3, 80, 96]`, so
+`cublas_128x4` pads each expert's 80 rows to 128) with comfy-kitchen's own `quantize_mxfp8` per expert, as ComfyUI's
+`MoEExperts` stores them; kitchen's dequantize gives the same bytes. No published ComfyUI mxfp8 file holds an expert
+stack.
