@@ -874,21 +874,15 @@ fn digest(p: &v1::Part, b: &[u8]) -> String {
     }
 }
 
-/// `t`'s complete encoding under `scheme`: a tensorwise scale keeps the dtype v1 stored it in.
+/// `t`'s complete encoding under `scheme`: every scale keeps the dtype v1 stored it in.
 fn encoding(t: &v1::Tensor, scheme: &str) -> Encoding {
+    let scale = |role: &str| t.parts.iter().find(|p| p.role == role).map_or(Dtype::F32, |p| p.dtype.clone());
     match scheme {
-        "fp8.rowwise" => Encoding::fp8_rowwise(0),
-        "fp8.tensorwise" => {
-            let scale = t.parts.iter().find(|p| p.role == "weight_scale");
-            Encoding::fp8_tensorwise(scale.map_or(&Dtype::F32, |p| &p.dtype))
-        }
-        "int8.convrot" => Encoding::int8_convrot(256),
+        "fp8.rowwise" => Encoding::fp8_rowwise(0, &scale("scale")),
+        "fp8.tensorwise" => Encoding::fp8_tensorwise(&scale("weight_scale")),
+        "int8.convrot" => Encoding::int8_convrot(256, &scale("scale")),
         // v1's nvfp4 is ModelOpt's layout: its border never took ComfyUI's.
-        "nvfp4" => Encoding::nvfp4(
-            GlobalScale::Multiply,
-            NibbleOrder::LowFirst,
-            ScaleLayout::RowMajor,
-        ),
+        "nvfp4" => Encoding::nvfp4(GlobalScale::Multiply, NibbleOrder::LowFirst, ScaleLayout::RowMajor),
         other => unreachable!("v1 maps to no {other}"),
     }
 }
@@ -961,7 +955,7 @@ fn conforms(
     match scheme {
         "fp8.rowwise" => {
             want("weight", &fp8, &|s| s == logical)?;
-            want("scale", &[F32], &|s| numel(s) == rows)
+            want("scale", &[F32, BF16, F16], &|s| numel(s) == rows)
         }
         "fp8.tensorwise" => {
             want("weight", &fp8, &|s| s == logical)?;
@@ -970,7 +964,7 @@ fn conforms(
         }
         "int8.convrot" if cols % 256 == 0 => {
             want("weight", &[I8], &|s| s == logical)?;
-            want("scale", &[F32], &|s| numel(s) == rows)
+            want("scale", &[F32, BF16, F16], &|s| numel(s) == rows)
         }
         "nvfp4" if cols % 16 == 0 => {
             want("weight", &[F4], &|s| s == [rows, cols])?;
