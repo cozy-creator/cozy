@@ -6,7 +6,7 @@
 use platform::process::Exact;
 use tensord::{
     device_executor::{
-        Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, ExecutorConfig, Forked,
+        Baseline, Binding, DeviceCommand, DeviceExecutor, ExecutorConfig, Forked,
     },
     launch_identity::Seal,
     
@@ -70,6 +70,8 @@ fn start(generation: &Generation, interface: &Path, import_only: bool) -> Device
         import_only,
         call_interfaces: vec![],
         constructions: Vec::new(),
+        ledgers: 0,
+        memory_mode: tensord::device_executor::MemoryMode::Shared,
     }
 }
 
@@ -125,16 +127,8 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
                     package_interface: interface.display().to_string(),
                     ..Binding::default()
                 }),
-                budgets: Budgets::default(),
                 models: Vec::new(),
-                authorized_device_limit_bytes: None,
                 attention_pin: String::new(),
-                device_weights: false,
-                cap_bytes: None,
-                sealed_tiers: false,
-                model_sources: false,
-                staged_tiers: false,
-                pinned_bytes: None,
             },
             DeviceCommand::Activate {
                 construction: "lifecycle".into(),
@@ -171,13 +165,8 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
                     deadline_s: None,
                     attention_kernel: String::new(),
                     bits: 0,
-                    cap_bytes: None,
                     inputs: Default::default(),
                     trees: Default::default(),
-                    floor_bytes: None,
-                    activation_bytes: Default::default(),
-                    squeezed_bytes: Default::default(),
-                    device_weights: None,
                     sources: Default::default(),
                     weights: Default::default(),
                 },

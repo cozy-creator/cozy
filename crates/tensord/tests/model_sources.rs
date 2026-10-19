@@ -53,6 +53,32 @@ fn a_selection_grants_its_headers_and_sizes_and_nothing_else() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn a_read_grant_gets_the_selected_components_chunk_files_and_no_others() {
+    let (root, manifest, _, _, _) = fixture();
+    let selected = SelectedManifest { manifest: manifest.clone(), components: vec!["allowed".into()] };
+    let sources = ModelSources::open(&root, &[selected]).unwrap();
+    let chunks = sources.chunks(&manifest).unwrap();
+    assert!(chunks.windows(2).all(|w| w[0].sha256 < w[1].sha256), "sorted by digest, each once");
+    let checkpoint = sources.authorized(&manifest).unwrap();
+    let header = checkpoint.header();
+    let wanted = |component: &str| -> Vec<ObjectRef> {
+        let tensors = &header.component(component).unwrap().tensors;
+        let at = tensors.iter().flat_map(|t| t.locations()).map(|(_, at)| at);
+        at.flat_map(|at| header.spans(&at)).map(|span| header.chunks[span.chunk].clone()).collect()
+    };
+    assert!(wanted("allowed").iter().all(|object| chunks.contains(object)));
+    let denied_only = wanted("denied").into_iter().filter(|o| !wanted("allowed").contains(o));
+    assert!(denied_only.into_iter().all(|object| !chunks.contains(&object)));
+    for (file, object) in sources.files(&chunks).unwrap().iter().zip(&chunks) {
+        assert_eq!(file.metadata().unwrap().len(), object.length);
+    }
+    let none = ModelSources::open(&root, &[]).unwrap();
+    assert_eq!(none.chunks(&manifest).err().unwrap().kind(), io::ErrorKind::PermissionDenied);
+    drop((sources, none));
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn frame(manifest: &str, name: &str) -> tensord::device_executor::Frame {
     serde_json::from_value(serde_json::json!({
         "event": "request", "seq": 7, "kind": "model_source", "manifest": manifest, "name": name,
