@@ -339,6 +339,8 @@ pub enum DeviceCommand {
     },
     Unload {
         construction: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        request_id: String,
     },
     Probe {
         collect: bool,

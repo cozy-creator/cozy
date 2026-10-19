@@ -2781,6 +2781,14 @@ impl Pool {
             let fetch = calls.map(|calls| engine.get(id).map(|record| calls.fetch(&record))).transpose()?;
             match self.call(engine, id, &held, plan, &load_caps, &mut session, false, calls, fetch) {
                 Ok(true) => {
+                    // Invoke clears access itself; this also covers a cancel/refusal after Load.
+                    let cleanup = session.executor.command(&DeviceCommand::Unload {
+                        construction: String::new(), request_id: id.into(),
+                    }, &mut device_executor::Baseline);
+                    if !cleanup.is_ok_and(|reply| reply.ok) {
+                        session.executor.terminate()?;
+                        return Ok(());
+                    }
                     self.keep_idle(session);
                     return Ok(());
                 }
