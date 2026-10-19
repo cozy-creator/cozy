@@ -98,6 +98,12 @@ pub mod vectors;
 #[cfg(feature = "store")]
 pub mod writer;
 
+/// The public session API; networking uses the caller's async runtime.
+#[cfg(feature = "store")]
+mod session;
+#[cfg(feature = "store")]
+pub use session::{Checkpoint, Client, Component, Config, Endpoint, Fetch, Open, Ref};
+
 
 /// This TensorFS's release version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
