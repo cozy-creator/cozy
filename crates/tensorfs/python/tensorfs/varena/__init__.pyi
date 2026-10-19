@@ -223,6 +223,10 @@ class WeightSet:
         """Landed home regions not handed out yet: `(region, span, fd)`, each fd a container of
         the region's pages for TensorD to hold, the caller's to close. Unmapping a region here
         frees it at once; only this process's death leaves its pages to TensorD."""
+    def kept_quiescent(self) -> list[tuple[int, int, int]]:
+        """Export landed read-only weights after admission stops and all active uses drain.
+        Cached graph address pins stay intact; the caller owns the returned container fds."""
+
     def adopt_pages(self, pages: Sequence[tuple[int, int]]) -> int:
         """Home regions `(region, fd)` mapped from pages a dead process kept: imported, no copy.
         Each fd is duplicated; the caller closes its own. A page that will not map fills as
