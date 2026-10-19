@@ -131,8 +131,8 @@ def main() -> int:
         want = ref(x)
     block = model.blocks[0].nbytes
 
-    def stats(name: str) -> object:
-        return next(s for s in mem.stats().models if s.name == name)
+    def resident(name: str) -> int:
+        return mem.resident()[name]
 
     # cold, then warm: one request, two passes
     with torch.no_grad(), mem.request("cold-warm") as r:
@@ -153,7 +153,7 @@ def main() -> int:
         str(steps[-1]),
     )
     check("two passes in a request make it repeat", model.repeats == 2, str(model.repeats))
-    check("a load is warm", stats(model.name).level == "gpu", str(stats(model.name)))
+    check("a load is warm", model.level.value == "gpu", str(model.level))
     check("a request leaves nothing behind", r.stats.leftover == ((0, 0),), str(r.stats.leftover))
 
     # placeholders outside the forward; an op on one binds its block for that op
@@ -213,14 +213,14 @@ def main() -> int:
     hook.remove()
     torch.cuda.synchronize()
     model.evict()
-    check("a kept view's page survives eviction", stats(model.name).resident >= block)
+    check("a kept view's page survives eviction", resident(model.name) >= block)
     check(
         "the kept view still reads its weights",
         torch.equal(kept[0], tensors["blocks.5.lin.weight"].to(dev)),
     )
     kept.clear()
     model.evict()
-    check("the page goes once the view does", stats(model.name).resident < block)
+    check("the page goes once the view does", resident(model.name) < block)
 
     # a failed request frees what it allocated
     try:
@@ -245,7 +245,7 @@ def main() -> int:
     for t in threads:
         t.join()
     check("two threads run one model at once, exactly", outs == [True] * 6, str(outs))
-    check("no forward is in flight after them", stats(model.name).flight == 0)
+    check("no forward is in flight after them", model.flight == 0)
 
     # a cache's hold keeps every page at its address for a CUDA graph
     pool = mem.cache("graphs:net", lambda n: 0)
@@ -318,11 +318,11 @@ def main() -> int:
     mem.load(net2, Level.RAM)
     with torch.no_grad(), mem.request("cold"):
         net(x), net2(x)
-    before = stats(model.name).resident, stats(model2.name).resident
+    before = resident(model.name), resident(model2.name)
     with mem.request("rung2"):
         fill_up = torch.cuda.mem_get_info(0)[0] + block
         junk = torch.empty(fill_up, dtype=torch.uint8, device=dev)
-        after = stats(model.name).resident, stats(model2.name).resident
+        after = resident(model.name), resident(model2.name)
         del junk
     check(
         "the idle model's cold pages go first",
