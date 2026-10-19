@@ -38,7 +38,7 @@ SOURCES = [
     ("hf-internal-testing/tiny-random-LlamaForCausalLM", [], ["*.onnx"]),
     ("hf-internal-testing/tiny-random-bert-sharded-safetensors", [], ["*.bin"]),
     ("hf-internal-testing/tiny-stable-diffusion-pipe-variants-right-format", ["--variant", "fp16"],
-     ["*.bin", "*.bin.index*.json", "safety_checker/model.safetensors", "text_encoder/model-*",
+     ["*.bin", "*.bin.index*.json", "*.msgpack", "safety_checker/model.safetensors", "text_encoder/model-*",
       "text_encoder/model.safetensors.index.json", "unet/diffusion_pytorch_model-*",
       "unet/diffusion_pytorch_model.safetensors.index.json"]),
 ]

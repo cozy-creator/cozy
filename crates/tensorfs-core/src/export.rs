@@ -355,10 +355,10 @@ fn recorded(ck: &Checkpoint) -> BTreeMap<String, Recorded> {
 /// Where each recorded file puts `entries`, when they are exactly its tensors (names, dtypes,
 /// shapes, lengths): else the component no longer is the source's (an encoded lane), and is
 /// written in the standard layout.
-fn placed<'e>(
-    rec: &Recorded,
-    entries: &'e [Entry],
-) -> Option<Vec<(String, Vec<u8>, Vec<(u64, &'e Entry)>)>> {
+/// Each file to write: its path, its header text, and its entries at their data offsets.
+type Placed<'e, 'a> = Vec<(String, Vec<u8>, Vec<(u64, &'e Entry<'a>)>)>;
+
+fn placed<'e, 'a>(rec: &Recorded, entries: &'e [Entry<'a>]) -> Option<Placed<'e, 'a>> {
     let by_name: BTreeMap<&str, &Entry> = entries.iter().map(|e| (e.name.as_str(), e)).collect();
     let mut seen = std::collections::BTreeSet::new();
     let mut files = Vec::new();
@@ -375,7 +375,7 @@ fn placed<'e>(
             {
                 return None;
             }
-            if !seen.insert(name.as_str()) {
+            if !seen.insert(name.clone()) {
                 return None;
             }
             spans.push((at.0, *e));

@@ -1517,21 +1517,26 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
 #[test]
 fn an_export_is_its_source_folder() {
     let access = Access::default();
-    let other_weights =
-        |p: &str| p.ends_with(".bin") || p.ends_with(".onnx") || p.contains(".bin.index");
-    let not_fp16 =
-        |p: &str| other_weights(p) || (p.contains(".safetensors") && !p.contains(".fp16"));
-    let cases: [(&str, Option<&str>, &dyn Fn(&str) -> bool); 4] = [
-        ("hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2", None, &other_weights),
-        ("hf-internal-testing/tiny-random-LlamaForCausalLM@9fb191250dd56d0ba7ec9785a025ed29c03d5998", None, &other_weights),
-        ("hf-internal-testing/tiny-random-bert-sharded-safetensors@3157eb8d4addc30b6e95a8000f2e3f0f6114bf5a", None, &other_weights),
+    // What an import leaves out: other serializations of the weights, and the other variant.
+    let dropped = |p: &str, variant: Option<&str>| {
+        let other = [".bin", ".onnx", ".msgpack", ".h5"]
+            .iter()
+            .any(|e| p.ends_with(e))
+            || p.contains(".bin.index");
+        let elsewise =
+            variant.is_some_and(|v| p.contains(".safetensors") && !p.contains(&format!(".{v}")));
+        other || elsewise
+    };
+    let cases = [
+        ("hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2", None),
+        ("hf-internal-testing/tiny-random-LlamaForCausalLM@9fb191250dd56d0ba7ec9785a025ed29c03d5998", None),
+        ("hf-internal-testing/tiny-random-bert-sharded-safetensors@3157eb8d4addc30b6e95a8000f2e3f0f6114bf5a", None),
         (
             "hf-internal-testing/tiny-stable-diffusion-pipe-variants-right-format@5017a45b0389efbe1710fe4cf6df15ec8237e49b",
             Some("fp16"),
-            &not_fp16,
         ),
     ];
-    for (repo, variant, dropped) in cases {
+    for (repo, variant) in cases {
         let dir = scratch(&repo[..repo.find('@').unwrap()].replace('/', "-"));
         let source = format!("hf://{repo}");
         let store = tensorfs_core::store2::Store::open(dir.join("store")).unwrap();
@@ -1553,7 +1558,11 @@ fn an_export_is_its_source_folder() {
         let listing =
             import::remote::list(&import::remote::parse(&source).unwrap(), &access).unwrap();
         let mut upstream = BTreeMap::new();
-        for m in listing.members.iter().filter(|m| !dropped(&m.path)) {
+        for m in listing
+            .members
+            .iter()
+            .filter(|m| !dropped(&m.path, variant))
+        {
             let local =
                 import::remote::land(m, &dir.join("upstream").join(&m.path), &access).unwrap();
             upstream.insert(m.path.clone(), fs::read(local).unwrap());
