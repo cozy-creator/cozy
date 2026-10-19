@@ -56,7 +56,7 @@ impl Store {
         let chunks = dir.join(CHUNKS_DIR);
         fs::create_dir_all(&chunks).map_err(fail("create", &chunks))?;
         for (path, object) in tree.repo_files() {
-            self.place(object, &dir.join(path))?;
+            self.materialize(object, &dir.join(path))?;
         }
         let chosen: Vec<(&str, &ObjectRef)> = (tree.variants())
             .filter(|(v, _)| variants.is_none_or(|want| want.iter().any(|w| w == v)))
@@ -64,18 +64,18 @@ impl Store {
         for (_, header) in &chosen {
             for object in Header::from_cbor(&self.read(header)?)?.objects() {
                 if self.reuse(object)? {
-                    self.place(object, &chunks.join(&object.sha256))?;
+                    self.materialize(object, &chunks.join(&object.sha256))?;
                 }
             }
         }
         for (variant, header) in chosen {
-            self.place(header, &dir.join(crate::format::variant_path(variant)))?;
+            self.materialize(header, &dir.join(crate::format::variant_path(variant)))?;
         }
         Ok(())
     }
 
     /// `object` at `dest`, unless a file of its length is there.
-    fn place(&self, object: &ObjectRef, dest: &Path) -> Result<()> {
+    pub fn materialize(&self, object: &ObjectRef, dest: &Path) -> Result<()> {
         if fs::metadata(dest).is_ok_and(|m| m.len() == object.length) {
             return Ok(());
         }

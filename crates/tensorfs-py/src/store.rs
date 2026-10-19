@@ -272,10 +272,19 @@ struct Remote {
     store: Store,
     client: FetchClient,
     endpoint: Arc<Endpoint>,
+    offline: bool,
 }
 
 impl Remote {
     fn fetch(&self, objects: &[ObjectRef], priority: u64) -> Result<(), Failure> {
+        if self.offline {
+            for object in objects {
+                if !self.store.reuse(object)? {
+                    return Err(Failure { kind: Kind::NotFound, detail: format!("{} is not cached", object.id()) });
+                }
+            }
+            return Ok(());
+        }
         let origin: Arc<dyn Origin> = self.endpoint.clone();
         let store: Arc<dyn ObjectStore> = Arc::new(self.store.clone());
         fetch::runtime()?.block_on(async {
@@ -284,6 +293,30 @@ impl Remote {
             fetcher.settled().await;
             Ok(())
         })
+    }
+
+    fn root(&self, name: &str, revision: Option<&str>) -> Result<(ObjectRef, Option<String>), Failure> {
+        if let Some(digest) = revision.filter(|r| r.starts_with("sha256:")).or_else(|| name.starts_with("sha256:").then_some(name)) {
+            let hex = digest.trim_start_matches("sha256:");
+            let path = self.store.path(&ObjectRef { sha256: hex.to_owned(), length: 0 })?;
+            if let Ok(meta) = std::fs::metadata(path) {
+                return Ok((ObjectRef { sha256: hex.to_owned(), length: meta.len() }, None));
+            }
+            if self.offline { return Err(Failure { kind: Kind::NotFound, detail: format!("{digest} is not cached") }); }
+            let object = fetch::runtime()?.block_on(self.endpoint.object(hex))?
+                .ok_or_else(|| Failure { kind: Kind::NotFound, detail: format!("no object {digest}") })?;
+            return Ok((object, None));
+        }
+        if revision.is_some() || self.offline {
+            if let Some(repo) = self.store.get_ref(name)? {
+                if let Ok((version, tree)) = fetch::release_of(&repo, revision) { return Ok((tree, Some(version))); }
+            }
+        }
+        if self.offline { return Err(Failure { kind: Kind::NotFound, detail: format!("{name} is not cached") }); }
+        let (repo, _) = fetch::runtime()?.block_on(self.endpoint.repo(name))?
+            .ok_or_else(|| Failure { kind: Kind::NotFound, detail: format!("no repo {name}") })?;
+        let (version, tree) = fetch::release_of(&repo, revision)?;
+        Ok((tree, Some(version)))
     }
 }
 
@@ -315,37 +348,14 @@ impl PyStore {
     fn open_remote(&self, py: Python<'_>, repo_id: String, revision: Option<String>, variant: Option<String>, endpoint: &str, token: Option<&Bound<'_, PyAny>>, ca_der: Option<Vec<u8>>) -> PyResult<PyCheckpoint> {
         let client = crate::credentials::client(endpoint, ca_der.as_deref()).or_raise(py)?;
         let endpoint = Arc::new(Endpoint::new(&client, endpoint, crate::credentials::provider(token)?).or_raise(py)?);
-        let remote = Remote { store: self.store.clone(), client, endpoint };
+        let remote = Remote { store: self.store.clone(), client, endpoint, offline: false };
         let named = py.detach(|| -> Result<Named, Failure> {
-            if revision.is_some() || repo_id.starts_with("sha256:") {
-                let reference = format!("{repo_id}{}", revision.as_deref().map(|r| format!("@{r}")).unwrap_or_default());
-                if let Ok(named) = self.store.resolve(&reference, variant.as_deref()) { return Ok(named); }
-                if let Some(digest) = revision.as_deref().filter(|r| r.starts_with("sha256:")) {
-                    if let Ok(mut named) = self.store.resolve(digest, variant.as_deref()) {
-                        named.name = Some(repo_id.clone());
-                        return Ok(named);
-                    }
-                }
-            }
-            let runtime = fetch::runtime()?;
-            let digest = revision.as_deref().filter(|r| r.starts_with("sha256:")).or_else(|| repo_id.starts_with("sha256:").then_some(repo_id.as_str()));
-            let (root, version) = if let Some(digest) = digest {
-                let object = runtime.block_on(remote.endpoint.object(digest.trim_start_matches("sha256:")))?
-                    .ok_or_else(|| Failure { kind: Kind::NotFound, detail: format!("no object {digest}") })?;
-                (object, None)
-            } else {
-                let (repo, _) = runtime.block_on(remote.endpoint.repo(&repo_id))?
-                    .ok_or_else(|| Failure { kind: Kind::NotFound, detail: format!("no repo {repo_id}") })?;
-                let (version, tree) = fetch::release_of(&repo, revision.as_deref())?;
-                (tree, Some(version))
-            };
+            let (root, version) = remote.root(&repo_id, revision.as_deref())?;
             remote.fetch(std::slice::from_ref(&root), 0)?;
             let bytes = self.store.read(&root)?;
             let (tree, header, chosen) = match Tree::from_json(&bytes) {
                 Ok(tree) => {
-                    let (v, header) = if variant.as_deref() == Some("*") {
-                        tree.variants().next().ok_or_else(|| Failure { kind: Kind::NotFound, detail: "the tree has no variants".into() })?
-                    } else { tree.variant(variant.as_deref())? };
+                    let (v, header) = tree.variant(variant.as_deref())?;
                     remote.fetch(std::slice::from_ref(header), 0)?;
                     (Some(root), header.clone(), Some(v.to_owned()))
                 }
@@ -419,6 +429,56 @@ impl PyStore {
         }).or_raise(py)
     }
 
+    #[pyo3(signature = (repo_id, *, revision = None, variant = None, components = None, local_dir = None, local_files_only = false, endpoint = "https://tensorhub.com", token = None, ca_der = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_download(&self, py: Python<'_>, repo_id: &str, revision: Option<String>, variant: Option<String>, components: Option<Vec<String>>, local_dir: Option<PathBuf>, local_files_only: bool, endpoint: &str, token: Option<&Bound<'_, PyAny>>, ca_der: Option<Vec<u8>>) -> PyResult<PathBuf> {
+        let client = crate::credentials::client(endpoint, ca_der.as_deref()).or_raise(py)?;
+        let endpoint = Arc::new(Endpoint::new(&client, endpoint, crate::credentials::provider(token)?).or_raise(py)?);
+        let remote = Remote { store: self.store.clone(), client, endpoint, offline: local_files_only || repo_id.starts_with("local/") };
+        py.detach(|| -> Result<PathBuf, Failure> {
+            let (root, version) = remote.root(repo_id, revision.as_deref())?;
+            remote.fetch(std::slice::from_ref(&root), 0)?;
+            let tree = self.store.tree(&root)?;
+            let chosen: Vec<_> = match variant.as_deref() {
+                Some(v) => vec![tree.variant(Some(v))?],
+                None => tree.variants().collect(),
+            };
+            let headers: Vec<_> = chosen.iter().map(|(_, h)| (*h).clone()).collect();
+            remote.fetch(&headers, 0)?;
+            let mut objects: Vec<_> = tree.repo_files().map(|(_, r)| r.clone()).collect();
+            for header in headers {
+                let header = Header::from_cbor(&self.store.read(&header)?)?;
+                objects.extend(tensorfs_core::store2::wanted(&header, components.as_deref())?);
+            }
+            remote.fetch(&objects, 0)?;
+            if let Some(version) = version {
+                self.store.update_ref(repo_id, |old| Some(fetch::with_tree(old, repo_id, &root, Some(&version))))?;
+            }
+            let dest = local_dir.unwrap_or_else(|| self.store.root().join("snapshots").join(&root.sha256));
+            let variants: Option<Vec<_>> = variant.map(|v| vec![v]);
+            self.store.snapshot(&root, &dest, variants.as_deref())?;
+            Ok(dest)
+        }).or_raise(py)
+    }
+
+    #[pyo3(signature = (repo_id, filename, *, revision = None, local_dir = None, local_files_only = false, endpoint = "https://tensorhub.com", token = None, ca_der = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn hub_download(&self, py: Python<'_>, repo_id: &str, filename: &str, revision: Option<String>, local_dir: Option<PathBuf>, local_files_only: bool, endpoint: &str, token: Option<&Bound<'_, PyAny>>, ca_der: Option<Vec<u8>>) -> PyResult<PathBuf> {
+        let client = crate::credentials::client(endpoint, ca_der.as_deref()).or_raise(py)?;
+        let endpoint = Arc::new(Endpoint::new(&client, endpoint, crate::credentials::provider(token)?).or_raise(py)?);
+        let remote = Remote { store: self.store.clone(), client, endpoint, offline: local_files_only || repo_id.starts_with("local/") };
+        py.detach(|| -> Result<PathBuf, Failure> {
+            let (root, _) = remote.root(repo_id, revision.as_deref())?;
+            remote.fetch(std::slice::from_ref(&root), 0)?;
+            let tree = self.store.tree(&root)?;
+            let object = tree.files.get(filename).ok_or_else(|| Failure { kind: Kind::NotFound, detail: format!("no file {filename}") })?;
+            remote.fetch(std::slice::from_ref(object), 0)?;
+            let dest = local_dir.unwrap_or_else(|| self.store.root().join("snapshots").join(&root.sha256)).join(filename);
+            self.store.materialize(object, &dest)?;
+            Ok(dest)
+        }).or_raise(py)
+    }
+
     /// Imports `src` (a file, directory, `hf://`, `civitai://` or URL; or several) and names it
     /// `name` (`local/<its name>` by default), release 1, variant its main dtype.
     #[pyo3(signature = (src, name = None, converter = None, variant = None))]
@@ -444,6 +504,51 @@ impl PyStore {
             .detach(|| self.store.import_named(&sources, &opts))
             .or_raise(py)?;
         opened(py, &self.store, named)
+    }
+
+    #[pyo3(signature = (source, *, converter = None, variant = None, token = None, progress = None))]
+    fn convert(&self, py: Python<'_>, source: &Bound<'_, PyAny>, converter: Option<String>, variant: Option<String>, token: Option<&Bound<'_, PyAny>>, progress: Option<Py<PyAny>>) -> PyResult<PyCheckpoint> {
+        let sources: Vec<String> = source.extract::<String>().map(|s| vec![s]).or_else(|_| source.extract())?;
+        let mut access = client::access();
+        access.token = crate::credentials::provider(token)?;
+        let callback_error = Mutex::new(None);
+        let notify = |stage: &str, done, total| {
+            if let Some(callback) = &progress {
+                if let Err(error) = Python::attach(|py| callback.call1(py, (stage, done, total))) {
+                    *callback_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                }
+            }
+        };
+        let stop = || callback_error.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let result = py.detach(|| -> Result<Named, Failure> {
+            if let [source] = sources.as_slice() {
+                let path = PathBuf::from(source);
+                if path.is_dir() && std::fs::read_dir(&path).is_ok_and(|entries| entries.flatten().any(|e| tensorfs_core::format::variant_of(&e.file_name().to_string_lossy()).is_some())) {
+                    let tree = self.store.admit_folder(&path)?;
+                    let parsed = self.store.tree(&tree)?;
+                    let (variant, header) = parsed.variant(variant.as_deref())?;
+                    return Ok(Named { header: header.clone(), tree: Some(tree), name: None, release: None, variant: Some(variant.to_owned()) });
+                }
+            }
+            let req = tensorfs_core::import::Request { sources: &sources, converter: converter.as_deref(), variant: variant.as_deref(), access: &access, tmp: &self.store.root().join("tmp"), progress: &notify, stop: Some(&stop) };
+            let (header, files) = self.store.import(&req, None)?;
+            let mut tree = Tree { files };
+            tree.set_variant(variant.as_deref().unwrap_or(""), header.clone());
+            let tree = self.store.put_tree(&tree)?;
+            Ok(Named { header, tree: Some(tree), name: None, release: None, variant })
+        });
+        if let Some(error) = callback_error.into_inner().unwrap_or_else(|e| e.into_inner()) { return Err(error); }
+        opened(py, &self.store, result.or_raise(py)?)
+    }
+
+    #[pyo3(signature = (source, token = None))]
+    fn resolve_source(&self, py: Python<'_>, source: String, token: Option<&Bound<'_, PyAny>>) -> PyResult<String> {
+        let mut access = client::access();
+        access.token = crate::credentials::provider(token)?;
+        py.detach(|| -> Result<String, Failure> {
+            let source = tensorfs_core::import::remote::parse(&source)?;
+            Ok(tensorfs_core::import::remote::list(&source, &access)?.pinned)
+        }).or_raise(py)
     }
 
     /// Pulls `ref` (`org/name[@release]`) and its `variant` from Tensorhub (`hub`, else
@@ -777,6 +882,15 @@ impl PyCheckpoint {
     #[getter]
     fn id(&self) -> Option<String> {
         self.stored.as_ref().map(|ck| ck.id().id())
+    }
+
+    #[getter]
+    fn header_ref(&self) -> Option<(String, u64)> {
+        self.stored.as_ref().map(|ck| (ck.id().sha256.clone(), ck.id().length))
+    }
+    #[getter]
+    fn tree_ref(&self) -> Option<(String, u64)> {
+        self.named.as_ref()?.tree.as_ref().map(|tree| (tree.sha256.clone(), tree.length))
     }
 
     /// The tree, repo, release and variant naming it, when one does.
