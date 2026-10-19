@@ -13,8 +13,8 @@ use crate::err::{refuse, Code, Result};
 use crate::format::decode::bnb::{FP4_MAP, NF4_MAP};
 use crate::format::{Dtype, Encoding, Value};
 
-use super::carriers::{bytes, Folded, FoldedPart, Folds};
-use super::source::{Group, SourceSet, Tensor};
+use super::{bytes, Folded, FoldedPart, Folds};
+use crate::import::source::{Group, SourceSet, Tensor};
 
 const STATE: &str = ".quant_state.bitsandbytes__";
 

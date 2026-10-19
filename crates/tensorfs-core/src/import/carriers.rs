@@ -17,6 +17,8 @@ use crate::format::{check, Dtype, Encoding, PartBytes, Value};
 
 use super::source::{Group, SourceSet, Tensor};
 
+mod bnb;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Producer {
@@ -459,7 +461,7 @@ fn read_json(set: &SourceSet, path: &str) -> Result<Option<Json>> {
         .map_err(|e| malformed(path, e))
 }
 
-pub(super) fn bytes(set: &SourceSet, key: &str, t: &Tensor) -> Result<Vec<u8>> {
+fn bytes(set: &SourceSet, key: &str, t: &Tensor) -> Result<Vec<u8>> {
     if t.len > 1 << 20 {
         return refuse(Code::SIZE_CAP, format!("{key}: a {} byte marker", t.len));
     }
@@ -573,7 +575,7 @@ fn declared(set: &SourceSet, group: &Group) -> Result<Option<Declared>> {
         }
     }
     all.extend(comfy);
-    if let Some(found) = super::bnb::declaration(group) {
+    if let Some(found) = bnb::declaration(group) {
         all.push(Declared::new(Producer::Bitsandbytes, found));
     }
     let producers: BTreeSet<Producer> = all.iter().map(|d| d.producer).collect();
@@ -1176,7 +1178,7 @@ pub fn fold(set: &mut SourceSet) -> Result<()> {
         };
         let folded = match d.producer {
             Producer::Bitsandbytes => {
-                super::bnb::fold_group(set, group, &|c| logical_dtype(group, &d, c))?
+                bnb::fold_group(set, group, &|c| logical_dtype(group, &d, c))?
             }
             _ => fold_group(set, group, &d)?,
         };
@@ -1230,7 +1232,7 @@ fn undeclared(group: &Group) -> Result<()> {
     }
 }
 
-pub(super) type Folds = BTreeMap<String, (Vec<String>, Tensor)>;
+type Folds = BTreeMap<String, (Vec<String>, Tensor)>;
 
 /// A module's carrier tensors present: suffix -> (key, tensor).
 type Present<'g> = BTreeMap<&'g str, (&'g str, &'g Tensor)>;
