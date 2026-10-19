@@ -2282,7 +2282,7 @@ impl Pool {
                     sequence_parallel_degree: 1,
                     import_only: true,
                     ledgers: 0,
-                    memory_mode: "",
+                    memory_mode: self.config.host.mode.into(),
                 },
                 &mut device_executor::Baseline,
             )?;
@@ -2660,10 +2660,7 @@ impl Pool {
                     call_interfaces: crate::calls::call_interfaces(held, &interface_path),
                     constructions: constructions(&plan),
                     ledgers: (ledgers.len() / 2) as u32,
-                    memory_mode: match self.config.host.mode {
-                        cozy_platform::contain::host_pressure::HostMode::Shared => "shared",
-                        cozy_platform::contain::host_pressure::HostMode::Dedicated => "dedicated",
-                    },
+                    memory_mode: self.config.host.mode.into(),
                 },
                 &ledgers,
                 &mut callbacks,
