@@ -680,17 +680,16 @@ fn model_choices(
         if artifact.is_null() {
             continue;
         }
-        let digest = artifact["manifest"]["digest"].as_str().and_then(|d| d.strip_prefix("sha256:"))
-            .filter(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()))
+        let digest = artifact["checkpoint"].as_str().and_then(|d| d.strip_prefix("sha256:"))
+            .filter(|d| d.len() == 64 && d.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
             .ok_or_else(|| refuse(&format!("passes {name} without an exact checkpoint")))?;
         let digest = (0..64).step_by(2).map(|i| u8::from_str_radix(&digest[i..i + 2], 16).unwrap()).collect();
-        let length = artifact["manifest"]["length"].as_u64().filter(|length| *length > 0)
-            .ok_or_else(|| refuse(&format!("passes {name} without a positive checkpoint length")))?;
         choices.push(crate::api::domain::ModelChoice {
             parameter: format!("{entrypoint}.models.{name}"),
             manifest: Some(crate::api::domain::Ref {
                 digest,
-                length,
+                // Local model resolution obtains the header's length from the shared store.
+                length: 0,
             }),
             ..Default::default()
         });
@@ -977,15 +976,14 @@ mod exact_tests {
         let hex = "ab".repeat(32);
         let call = json!({"payload": {"prompt": "a fox", "steps": 4}, "models": {
             "model": {"producer_request_id": "job-1/0", "output_slot": "weights",
-                "manifest": {"digest": format!("sha256:{hex}"), "length": 812},
-                "tensorfs_receipt_digest": format!("sha256:{hex}")},
+                "checkpoint": format!("sha256:{hex}"), "transaction": format!("sha256:{hex}")},
             "vae": null}});
         let (request, choices) = serving_call(&call, "generate_image").unwrap();
         assert_eq!(request, json!({"prompt": "a fox", "steps": 4}));
         assert_eq!(choices.len(), 1);
         assert_eq!(choices[0].parameter, "generate_image.models.model");
         let reference = choices[0].manifest.as_ref().unwrap();
-        assert_eq!((tensorfs_core::sha256::hex(&reference.digest), reference.length), (hex, 812));
+        assert_eq!((tensorfs_core::sha256::hex(&reference.digest), reference.length), (hex, 0));
         assert!(choices[0].repository.is_empty());
         assert!(serving_call(&json!({"prompt": "a fox"}), "generate_image").is_err());
     }
