@@ -239,7 +239,7 @@ def _code(  # type: ignore[no-untyped-def]
         elif ORDER == 1:
             slot = PER - 1 - e
         else:
-            slot = tl.load(slots + e, mask=valid, other=0)
+            slot = tl.load(slots + e, mask=valid, other=0).to(tl.uint64)
         if AXIS == 0:  # noqa: SIM108 - a constexpr branch, not a select
             at = k * nb + lane
         else:

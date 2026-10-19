@@ -22,7 +22,7 @@ pub struct Binary {
 include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
 
 pub enum Prepared<'a> {
-    Kernel(Launch<'a>),
+    Kernel(Box<Launch<'a>>),
     /// A scheme with a host-only plan: rounded bytes, ready for the engine's host source.
     Host(Vec<u8>),
 }
@@ -129,7 +129,7 @@ pub fn prepare<'a>(
             launch.words = bytes;
             launch.params[29] = kind.n as u64;
             launch.params[30] = kind.size as u64;
-            return Ok(Prepared::Kernel(launch));
+            return Ok(Prepared::Kernel(Box::new(launch)));
         }
         Core::Values(mut v) => {
             match launch.params[27] {
@@ -240,5 +240,5 @@ pub fn prepare<'a>(
         launch.global = v.floats();
         launch.params[26] = launch.global.len() as u64;
     }
-    Ok(Prepared::Kernel(launch))
+    Ok(Prepared::Kernel(Box::new(launch)))
 }
