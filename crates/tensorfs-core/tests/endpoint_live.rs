@@ -91,6 +91,23 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     // This would fail if each request tried to trade the single-use capability again.
     assert_eq!(upload_tree(&endpoint, &model, &tree, &store, None).await.unwrap().sent, 0);
 
+    let mut raced = Vec::new();
+    for i in 0..8 {
+        let mut variant = Tree::default();
+        variant.set_variant("int8", header.clone());
+        variant.files.insert("README.md".into(), store.put_bytes(format!("concurrent writer {i}\n").as_bytes()).unwrap());
+        raced.push(store.put_tree(&variant).unwrap());
+    }
+    let writers = raced.iter().cloned().map(|tree| {
+        let (endpoint, store, model) = (Arc::clone(&endpoint), store.clone(), model.clone());
+        tokio::spawn(async move { upload_tree(&endpoint, &model, &tree, &store, None).await })
+    });
+    for result in futures::future::join_all(writers).await {
+        result.unwrap().unwrap();
+    }
+    let named = endpoint.repo(&model).await.unwrap().unwrap().0;
+    assert!(raced.iter().all(|tree| named.checkpoints.contains(tree)), "all concurrent appends survived CAS rebases");
+
     let other = format!("{account}/other");
     let refused = endpoint.update_repo(&other, |old| Ok(Some(with_tree(old, &other, &tree, None)))).await.unwrap_err();
     assert_eq!(refused.code, Code::CREDENTIAL_REQUIRED, "the token cannot upload to another repo");
