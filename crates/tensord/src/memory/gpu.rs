@@ -86,7 +86,7 @@ impl GpuLedger {
         let device = Device::open(entry)
             .map_err(|error| tracing::warn!("memory: NVML unavailable for {entry:?}: {error}"))
             .ok();
-        let reading = device.as_ref().and_then(|d| read(d));
+        let reading = device.as_ref().and_then(read);
         let Some(total) = reading.as_ref().map(|r| r.total).or(capacity) else {
             return Ok(None);
         };

@@ -13,6 +13,8 @@ use std::sync::Arc;
 use varena::ledger::{Admit, Facts, Ledger, RowFacts, State, ROWS};
 
 const FD: RawFd = 9;
+/// The ledger's eventfd in a child, when its parent's ledger has one.
+const EVENTS: RawFd = 10;
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 
@@ -25,6 +27,7 @@ struct Proc {
 impl Proc {
     fn spawn(ledger: &Ledger) -> Proc {
         let fd = ledger.fd().as_raw_fd();
+        let events = ledger.events().map(|e| e.as_raw_fd());
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["child", "--exact", "--ignored", "--nocapture", "--test-threads=1", "-q"])
@@ -34,7 +37,7 @@ impl Proc {
         unsafe {
             command.pre_exec(move || {
                 let ok = if fd == FD { libc::fcntl(FD, libc::F_SETFD, 0) } else { libc::dup2(fd, FD) };
-                if ok < 0 {
+                if ok < 0 || events.is_some_and(|e| libc::dup2(e, EVENTS) < 0) {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -118,11 +121,14 @@ fn child() {
         return;
     }
     // SAFETY: as above; borrowed for the call.
-    let ledger = Ledger::adopt(unsafe { BorrowedFd::borrow_raw(FD) }).unwrap();
+    // SAFETY: as above; fd 10 is the eventfd when the parent passed one.
+    let events = (unsafe { libc::fcntl(EVENTS, libc::F_GETFD) } >= 0).then(|| unsafe { BorrowedFd::borrow_raw(EVENTS) });
+    let ledger = Ledger::adopt(unsafe { BorrowedFd::borrow_raw(FD) }, events).unwrap();
     let (mut row, mut facts, mut created) = (None, Facts::default(), None);
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
-        let w: Vec<u64> = line.split_whitespace().skip(1).map(|n| n.parse().unwrap()).collect();
+        let args: Vec<&str> = line.split_whitespace().skip(1).collect();
+        let w: Vec<u64> = args.iter().filter_map(|n| n.parse().ok()).collect();
         let reply = match line.split_whitespace().next().unwrap() {
             "claim" => {
                 let r = ledger.claim(std::process::id()).unwrap();
@@ -150,6 +156,23 @@ fn child() {
                 r.ack(freed);
                 vec![want, freed]
             }
+            // Its running requests: `id remaining` pairs, -1 for never measured.
+            "running" => {
+                let pairs = args.chunks(2).map(|p| (p[0].to_string(), p[1].parse().unwrap())).collect::<Vec<(String, i64)>>();
+                row.as_ref().unwrap().running(&pairs).unwrap();
+                vec![]
+            }
+            "setpeak" => {
+                ledger.set_peak(args[0], args[1].parse().unwrap()).unwrap();
+                vec![]
+            }
+            // The key TensorD dispatched the request under, as its hash; 0 when none.
+            "dispatched" => vec![ledger.dispatched(args[0]).map_or(0, |key| fnv(&key))],
+            "freed" => {
+                ledger.freed();
+                vec![]
+            }
+            "waitfreed" => vec![ledger.wait_freed(w[0])],
             // Creates a ledger of its own, holds a row in it, and names its memfd.
             "create" => {
                 let (l, fd) = Ledger::create("GPU-creator", w[0]).unwrap();
@@ -164,6 +187,89 @@ fn child() {
         println!("@{}", reply.iter().map(u64::to_string).collect::<Vec<_>>().join(" "));
     }
     drop(created);
+}
+
+fn fnv(key: &str) -> u64 {
+    key.bytes().fold(0xcbf29ce484222325, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+}
+
+/// TensorD names a request's key; the executor reads it, and the peak it records under it
+/// reaches every process. Two processes record keys at once; each stands.
+#[test]
+fn peaks_and_dispatches_cross_processes() {
+    let (ledger, _fd) = Ledger::create("GPU-peaks", 24 * GIB).unwrap();
+    let (mut a, mut b) = (Proc::spawn(&ledger), Proc::spawn(&ledger));
+    let key = format!("plan-{}|{}", "e".repeat(64), "0123456789abcdef");
+    ledger.dispatch("41", &key).unwrap();
+    assert_eq!(a.call("dispatched 41"), [fnv(&key)]);
+    assert_eq!(a.call("dispatched 42"), [0]);
+    assert_eq!(ledger.peak(&key), None);
+    a.send(&format!("setpeak {key} {}", 3 * GIB));
+    b.send(&format!("setpeak plan-b|s {}", 5 * GIB));
+    a.reply();
+    b.reply();
+    assert_eq!((ledger.peak(&key), ledger.peak("plan-b|s")), (Some(3 * GIB), Some(5 * GIB)));
+    a.call(&format!("setpeak {key} {}", 2 * GIB));
+    assert_eq!(ledger.peak(&key), Some(2 * GIB), "the latest measurement stands");
+    let status = ledger.status().unwrap();
+    assert_eq!(status.dispatched, [("41".to_string(), key.clone())]);
+    assert_eq!(status.peaks.len(), 2);
+    ledger.undispatch("41");
+    assert_eq!(a.call("dispatched 41"), [0]);
+    assert!(ledger.set_peak(&"k".repeat(121), 1).is_err());
+}
+
+/// `fits` (design §5.6): never beside a dead row or a running request never measured; one never
+/// measured only alone; else its peak beside every row's unevictable bytes and every running
+/// request's remaining peak, and a new process's context when it spawns one.
+#[test]
+fn fits_reserves_remaining_peaks_and_never_admits_beside_the_unmeasured_or_the_dead() {
+    let (ledger, _fd) = Ledger::create("GPU-fits", 24 * GIB).unwrap();
+    let mut a = Proc::spawn(&ledger);
+    a.call("claim");
+    a.call(&publish(&Facts { context: GIB, torch_allocated: 2 * GIB, torch_reserved: 2 * GIB, last_use: 1, ..Facts::default() }));
+    assert!(ledger.fits("plan", Some("s"), false).unwrap(), "never measured, and nothing runs");
+    a.call("running r1 -1");
+    assert!(!ledger.fits("plan", Some("s"), false).unwrap(), "beside a request never measured");
+    a.call(&format!("running r1 {}", 10 * GIB));
+    assert_eq!(row(&ledger, a.pid()).running, [("r1".to_string(), 10 * GIB as i64)]);
+    assert!(!ledger.fits("plan", Some("s"), false).unwrap(), "never measured beside a running request");
+    ledger.set_peak("plan|s", 8 * GIB).unwrap();
+    assert!(ledger.fits("plan", Some("s"), false).unwrap(), "3 + 10 + 8 of 24");
+    ledger.set_peak("plan|wide", 12 * GIB).unwrap();
+    assert!(!ledger.fits("plan", Some("wide"), false).unwrap(), "3 + 10 + 12 of 24");
+    assert!(!ledger.fits("plan", None, false).unwrap(), "a shape not yet known takes the widest");
+    ledger.set_peak("plan|wide", 21 * GIB / 2).unwrap();
+    assert!(ledger.fits("plan", Some("wide"), false).unwrap(), "3 + 10 + 10.5 of 24");
+    assert!(!ledger.fits("plan", Some("wide"), true).unwrap(), "and a new process's 1 GiB context");
+    a.call("running");
+    a.kill9();
+    assert!(!ledger.fits("plan", Some("s"), false).unwrap(), "beside a dead row's bytes");
+}
+
+/// Freed bytes move the free generation, wake a process waiting on it, and signal the eventfd.
+#[test]
+fn freeing_wakes_waiters_and_signals_the_eventfd() {
+    let (ledger, _fd) = Ledger::create("GPU-freed", 24 * GIB).unwrap();
+    let events = ledger.events().unwrap().as_raw_fd();
+    let drain = || {
+        let mut count = [0u8; 8];
+        // SAFETY: an 8-byte read from the nonblocking eventfd this ledger holds.
+        let read = unsafe { libc::read(events, count.as_mut_ptr().cast(), 8) };
+        (read == 8).then(|| u64::from_ne_bytes(count))
+    };
+    assert_eq!((ledger.freed_gen(), drain()), (0, None));
+    let (mut waiter, mut freer) = (Proc::spawn(&ledger), Proc::spawn(&ledger));
+    waiter.send("waitfreed 0");
+    freer.call("freed");
+    assert_eq!(waiter.reply(), [1]);
+    assert_eq!((ledger.freed_gen(), drain()), (1, Some(1)));
+    // A dead row's bytes coming back count too.
+    freer.call("claim");
+    freer.kill9();
+    ledger.reap(ledger.snapshot().unwrap()[0].pid).unwrap();
+    ledger.returned(ledger.snapshot().unwrap()[0].pid).unwrap();
+    assert_eq!((ledger.freed_gen(), drain()), (2, Some(1)));
 }
 
 #[test]
@@ -202,7 +308,7 @@ fn two_processes_publish_and_a_third_reads_exact_snapshots() {
     b.call(&publish(&fb));
 
     // The reader is this process, through a mapping and description of its own.
-    let reader = Ledger::adopt(ledger.fd()).unwrap();
+    let reader = Ledger::adopt(ledger.fd(), None).unwrap();
     assert_eq!((reader.gpu_uuid().as_str(), reader.capacity()), ("GPU-snapshots", 24 * GIB));
     let rows = reader.snapshot().unwrap();
     assert_eq!(rows.len(), 2);
@@ -355,7 +461,7 @@ fn a_victim_that_never_progresses_is_stalled() {
     assert_eq!(ledger.stalled().unwrap(), [b.pid()]);
     assert_eq!(ledger.stalled().unwrap(), [b.pid()]);
     // Another handle looks for itself.
-    let other = Ledger::adopt(ledger.fd()).unwrap();
+    let other = Ledger::adopt(ledger.fd(), None).unwrap();
     assert!(other.stalled().unwrap().is_empty());
     // Any progress clears it until the next look without progress.
     b.call(&publish(&Facts { resident: 2 * GIB, cold: 2 * GIB, last_use: 6, ..Facts::default() }));
@@ -557,7 +663,7 @@ fn the_table_survives_its_creator() {
     let pid = creator.pid();
     creator.kill9();
 
-    let ledger = Ledger::adopt(held.as_fd()).unwrap();
+    let ledger = Ledger::adopt(held.as_fd(), None).unwrap();
     assert_eq!((ledger.gpu_uuid().as_str(), ledger.capacity()), ("GPU-creator", 12 * GIB));
     let rows = ledger.snapshot().unwrap();
     assert_eq!(rows.iter().map(|r| (r.pid, r.state, r.facts.context)).collect::<Vec<_>>(), [(pid, State::Dead, 7 * MIB)]);
@@ -572,9 +678,9 @@ fn only_a_sealed_varena_ledger_is_adopted() {
     let plain = cozy_platform::shm::memfd_named("not-a-ledger").unwrap();
     // SAFETY: sizing our own memfd.
     assert_eq!(unsafe { libc::ftruncate(plain.as_raw_fd(), 1 << 16) }, 0);
-    assert!(Ledger::adopt(plain.as_fd()).is_err(), "unsealed");
+    assert!(Ledger::adopt(plain.as_fd(), None).is_err(), "unsealed");
     cozy_platform::shm::seal_with(plain.as_fd(), cozy_platform::shm::RESIZE_SEALS).unwrap();
-    assert!(Ledger::adopt(plain.as_fd()).is_err(), "no ledger header");
+    assert!(Ledger::adopt(plain.as_fd(), None).is_err(), "no ledger header");
     assert!(Ledger::create(&"x".repeat(65), GIB).is_err());
 
     let (ledger, fd) = Ledger::create("GPU-full", GIB).unwrap();
@@ -588,5 +694,5 @@ fn only_a_sealed_varena_ledger_is_adopted() {
         ledger.reap(pid).unwrap();
         ledger.returned(pid).unwrap();
     }
-    assert!(Ledger::adopt(fd.as_fd()).unwrap().claim(9).is_ok());
+    assert!(Ledger::adopt(fd.as_fd(), None).unwrap().claim(9).is_ok());
 }

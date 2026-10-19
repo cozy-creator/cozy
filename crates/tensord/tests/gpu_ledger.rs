@@ -196,7 +196,7 @@ fn release(pid: u32) {
 fn tenant() {
     let fd: i32 = std::env::var("LEDGER_FD").unwrap().parse().unwrap();
     // SAFETY: the descriptor this process inherited, open for its whole life.
-    let ledger = Ledger::adopt(unsafe { BorrowedFd::borrow_raw(fd) }).unwrap();
+    let ledger = Ledger::adopt(unsafe { BorrowedFd::borrow_raw(fd) }, None).unwrap();
     let row = ledger.claim(std::process::id()).unwrap();
     let bytes: Vec<u64> = std::env::var("TENANT_FACTS").unwrap().split(',').map(|n| n.parse().unwrap()).collect();
     let mut facts = Facts {
