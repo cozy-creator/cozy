@@ -100,7 +100,10 @@ pub fn checkpoint(
     let h = v1::header(&read(&header)?).map_err(|f| refused("migration_failed", f.detail))?;
     fetch(&v1::objects(&old, &h), &format!("fetching {}", choice.repository))?;
     observe(&format!("migrating {}", choice.repository), 0, 0);
-    let named = format!("{}@{} {}", choice.repository, choice.release, choice.lane);
+    let named = match choice.release.is_empty() {
+        true => format!("{}#{}", choice.repository, manifest.id()),
+        false => format!("{}@{} {}", choice.repository, choice.release, choice.lane),
+    };
     let (made, doc) = rewrite(&src, store, v1::Lane { manifest, names: vec![named] })?;
     let row = json!({"parameter": choice.parameter, "repository": choice.repository,
         "manifest": made.id(), "migrated": doc});

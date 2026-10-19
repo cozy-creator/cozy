@@ -818,12 +818,15 @@ fn digest(p: &v1::Part, b: &[u8]) -> String {
     }
 }
 
-/// The scheme's complete encoding.
-fn encoding(scheme: &str) -> Encoding {
+/// `t`'s complete encoding under `scheme`: a tensorwise scale keeps the dtype v1 stored it in.
+fn encoding(t: &v1::Tensor, scheme: &str) -> Encoding {
     match scheme {
-        "fp8.rowwise" => Encoding::fp8_rowwise(0, &Dtype::F32),
-        "fp8.tensorwise" => Encoding::fp8_tensorwise(&Dtype::F32),
-        "int8.convrot" => Encoding::int8_convrot(256, &Dtype::F32),
+        "fp8.rowwise" => Encoding::fp8_rowwise(0),
+        "fp8.tensorwise" => {
+            let scale = t.parts.iter().find(|p| p.role == "weight_scale");
+            Encoding::fp8_tensorwise(scale.map_or(&Dtype::F32, |p| &p.dtype))
+        }
+        "int8.convrot" => Encoding::int8_convrot(256),
         // v1's nvfp4 is ModelOpt's layout: its border never took ComfyUI's.
         "nvfp4" => Encoding::nvfp4(
             GlobalScale::Multiply,
@@ -906,7 +909,7 @@ fn conforms(
         }
         "fp8.tensorwise" => {
             want("weight", &fp8, &|s| s == logical)?;
-            want("scale", &[F32], &|s| numel(s) == 1)?;
+            want("scale", &[F32, BF16, F16], &|s| numel(s) == 1)?;
             optional("input_scale")
         }
         "int8.convrot" if cols % 256 == 0 => {
@@ -963,7 +966,7 @@ fn put(
     }
     let data = match mapping {
         Mapping::Scheme(scheme, _) => Data::Encoded {
-            encoding: encoding(scheme),
+            encoding: encoding(t, scheme),
             parts,
         },
         _ => Data::Plain(parts.pop().expect("a plain tensor has one part").data),
@@ -1091,7 +1094,7 @@ fn verify(
             let stored: Vec<(&str, &Dtype, &[u64], Location)> = match (&t2.body, mapping) {
                 (Body::Data(at), Mapping::Plain) => vec![("", &t2.dtype, &t2.shape, *at)],
                 (Body::Encoded { encoding: e, parts }, Mapping::Scheme(s, _))
-                    if *e == encoding(s) && parts.len() == t.parts.len() =>
+                    if *e == encoding(t, s) && parts.len() == t.parts.len() =>
                 {
                     (parts.iter())
                         .map(|p| (p.role.as_str(), &p.dtype, p.shape.as_slice(), p.at()))
