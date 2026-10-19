@@ -44,3 +44,9 @@ hold the same values as their mined twins in the other nibble order, scale tilin
 (per-column scales, `F8_E5M2` weights, `BF16`/`F16` tensorwise scales, `int8.tensorwise`, `int8.rowwise`, a ragged `mxfp8` block, a divided global
 scale, rounding of 3,072 f32 patterns to BF16/F16, plain and unknown dtypes, refusals) were computed exactly from the
 spec's formulas.
+
+`gptq`, `awq` and `ct` are mined by `mine/<family>.py` on CPU from GPTQModel 7.6.0, AutoGPTQ 0.7.1 and AutoAWQ 0.2.9
+(their own files from the PyPI sdists), and compressed-tensors 0.16.0 and 0.19.0 (both sides of its packing change),
+each producer's own dequantizer giving the expected bytes, plus 8-row bands of real Qwen GPTQ and AWQ and RedHatAI
+w4a16 checkpoints read by HTTP range. A case with `pack` holds the codes and zeros its producer packed: TensorFS's
+`pack` reproduces its parts bit for bit (`tests/format_pack.rs`).

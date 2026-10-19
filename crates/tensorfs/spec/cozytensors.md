@@ -310,7 +310,67 @@ scheme (a later minor may add one, rule 3). ModelOpt's `weight` (`uint8 [R, C/2]
 
 <!-- gguf.* -->
 
-<!-- gptq.*, awq.*, ct.* -->
+### `gptq.int2`, `gptq.int3`, `gptq.int4`, `gptq.int8`
+
+GPTQ's checkpoint layout (AutoGPTQ, GPTQModel, and the GPTQ exports of AutoRound and Optimum): `b`-bit codes (`b` is
+the variant's 2, 3, 4 or 8), a zero and a scale per group of `g` inputs. The logical weight is `[N, K]` (`R = N`,
+`C = K`) and `W = ⌈K/g⌉`.
+- Params: `group_size`: `g`, a positive integer, or `-1` for one group per row (`g = K`); `symmetric`: boolean;
+  `act_order`: boolean; `zero_offset`: `0` or `1`.
+- Parts:
+  - `qweight`: `I32 [⌈K·b/32⌉, N]`: the codes, stored transposed and packed `dense` along K (for `b` = 2, 4 and 8
+    the same bytes as `word`), unsigned.
+  - `qzeros`: `I32 [W, ⌈N·b/32⌉]`: each group's stored zero `r` as `[W, N]`, packed `dense` along N, unsigned.
+  - `scales`: `F16` or `BF16` on row blocks of `g`, `transposed` (`[W, N]`).
+  - `g_idx`: `I32 [K]`: each input's block of the zeros' and scales' grid.
+- Decode: `z = (r + zero_offset) mod 2^b` per slot; `round_L((q − z(i, j)) × s(i, j))`.
+- `act_order: false` requires `g_idx[j] = ⌊j/g⌋`, and `true` takes the groups from `g_idx` (GPTQ's `desc_act`).
+  `symmetric: true` requires every `z` to be `2^(b−1)`. A reader MUST refuse either mismatch.
+
+`zero_offset` is the zero convention. GPTQ's original checkpoints (`checkpoint_format: gptq`: AutoGPTQ, and
+GPTQModel's default export) store `z − 1`, so `zero_offset: 1`; GPTQModel's `gptq_v2` stores `z`, so `0`. A v1 zero
+of 0 is stored `2^b − 1` and decodes to 0, as AutoGPTQ's and GPTQModel's offline dequantizers read it. GPTQModel's v1
+export subtracts 1 from every slot in one 32-bit subtraction, so the slot after a zero of 0 borrows and decodes one
+low (vector `v1-zero-borrow`).
+
+### `awq.int4`
+
+AutoAWQ's GEMM layout (`version: gemm`; GPTQModel's AWQ export writes the same bytes): 4-bit codes, a zero and a scale
+per group of `g` inputs. The logical weight is `[N, K]` and `W = ⌈K/g⌉`.
+- Params: `group_size`: `g`, a positive integer, or `-1` (`g = K`).
+- Parts:
+  - `qweight`: `I32 [K, ⌈N/8⌉]`: the codes, stored transposed and packed `word` along N with the order
+    `[0, 2, 4, 6, 1, 3, 5, 7]` (slot `s` of word `t` holds column `8t + order[s]`), unsigned.
+  - `qzeros`: `I32 [W, ⌈N/8⌉]`: each group's zero as `[W, N]`, packed the same way.
+  - `scales`: `F16` or `BF16` on row blocks of `g`, `transposed` (`[W, N]`).
+- Decode: `round_L((q − z(i, j)) × s(i, j))`.
+
+AWQ's per-input activation scale is folded into the previous operation by its producers, so it is no part here.
+AutoAWQ's GEMV and GEMV_FAST layouts are other schemes.
+
+### `ct.int1` … `ct.int8`
+
+compressed-tensors' `pack-quantized` format (llm-compressor's W4A16 and W8A16, Kimi-K2-Thinking): signed `b`-bit
+codes (`b` is the variant's 1 to 8), and per group of `g` inputs a scale and, when asymmetric, a zero point. `N` is
+the logical shape's second-last extent, a matrix's rows, and `W = ⌈C/g⌉`.
+- Params: `group_size`: `g`, a positive integer; `strategy`: `group`, or `channel` with `g = C`; `symmetric`: boolean;
+  `packing`: `dense` (compressed-tensors 0.17 and later) or `word` (before: `⌊32/b⌋` codes to a word). The two are the
+  same bytes when `b` divides 32.
+- Parts:
+  - `weight_packed`: `I32`, the logical shape with C counted in words: the codes packed `packing` along C, each
+    stored as `q + 2^(b−1)`.
+  - `weight_scale`: `F32`, `BF16` or `F16` on row blocks of `g`, `row_major`.
+  - `weight_zero_point`: `I32`, present exactly when `symmetric` is false: each matrix's zero points `[N, W]`, offset
+    the same way and packed `packing` along N; its shape is the logical one before N, then N counted in words, then
+    `W`.
+  - `weight_shape`: `I32` or `I64 [rank]`: the logical shape; a reader MUST refuse another.
+  - `weight_g_idx` (optional): `I32 [C]`: each column's block of the grid, from a group act order (`actorder:
+    group`, which compressed-tensors wrote until 0.18).
+- Decode: `round_L((q − zp(i, j)) × s(i, j))`, or `round_L(q × s(i, j))` when symmetric.
+
+compressed-tensors groups the columns sorted by `weight_g_idx` in runs of `g`, which is the stated group only when
+each group holds its `g` columns (the last, `C − (W − 1)·g`); a reader MUST refuse another. A `−1` anywhere in it is
+compressed-tensors' unset index: the column order.
 
 <!-- bnb.* -->
 
