@@ -236,3 +236,13 @@ jobs:
             --setenv="GOCACHE=$(go env GOCACHE)" --setenv="GOMODCACHE=$(go env GOMODCACHE)" \
             --setenv=CARGO_TERM_COLOR=never --setenv=GITHUB_ACTIONS=true "${locations[@]}" \
             bash -euo pipefail -c "$TEST"
+      # Targeted proof commands may produce portable test executables and their source/hash
+      # receipts. Export those exact files so a later paid worker needs no compiler.
+      - name: Retain targeted proof executables
+        if: always() && hashFiles('dist/testbins/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-testbins-${{ steps.sha.outputs.sha }}
+          path: dist/testbins/**
+          if-no-files-found: error
+          retention-days: 7
