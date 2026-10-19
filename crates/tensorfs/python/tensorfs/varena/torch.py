@@ -198,6 +198,8 @@ class RequestStats:
     copied: int
     retries: int = 0
     peaks: tuple[Peak, ...] = ()
+    #: its declared plan (`Memory.plan`), each step's models by component name
+    plan: tuple[tuple[str, ...], ...] = ()
 
 
 # ------------------------------------------------------------------------ placeholders
@@ -452,6 +454,10 @@ class Memory:
         self.core: Gpu | Host = Gpu(self.gpu) if cuda else Host()
         #: this process's device bytes outside torch and the weights (its CUDA context)
         self.context = self.last_use = self.clock = self.epoch = self.evictions = 0
+        #: this process's device bytes: what is neither torch's nor varena's (context, NCCL,
+        #: libraries) is measured from it at each boundary. The driver's free count less other
+        #: rows by default; the Runtime sets its NVML row for the process
+        self.measure: Callable[[], int | None] = self._driver_bytes
         self.models: dict[str, Model] = {}
         self.by_module: dict[nn.Module, Model] = {}
         self.caches: dict[Cache, None] = {}
@@ -713,14 +719,15 @@ class Memory:
         """The region's pages, room made in §5.2's order while each try maps further: a try
         whose deficit did not shrink made no progress, however much the rungs say they freed
         (a failed map's own chunks go idle and are trimmed again), and is short."""
-        short = None
+        short, more = None, 0
         while True:
             try:
                 return model.ws.bind(region, stream)
             except DeviceFull as full:
                 why = f"bind {model.name}"
-                stuck = short is not None and full.deficit >= short
-                if stuck or not self._make_room(self._free() + full.deficit, why, model):
+                if short is not None and full.deficit >= short:
+                    more += full.deficit  # the driver's free count fell short: evict beyond it
+                if not self._make_room(self._free() + full.deficit + more, why, model):
                     raise _Short(full.deficit, why) from None
                 short = full.deficit
 
@@ -731,6 +738,7 @@ class Memory:
         if block.index in model.seen:
             self._step(model)
         if not model.seen:  # a pass counts its own copies, not a restore landing before it
+            self._outside()
             model.mark = _set(model)[1:]
             model.base = torch.cuda.memory_allocated(model.device)
             torch.cuda.reset_peak_memory_stats(model.device)
@@ -818,7 +826,8 @@ class Memory:
         furthest), then by the core's own order (`Gpu.give`: idle before warm, least recently
         bound first, never a busy set), then caches; then other processes (rung 2), until
         `target` bytes are free."""
-        freed = self._idle()
+        self._idle()  # torch's slack and idle chunks: room, but no page given up
+        freed = 0
         if self.plans:
             cold = [m for m in self.models.values() if self._victim(m)]
             for model in sorted(cold, key=self._keep):
@@ -877,8 +886,8 @@ class Memory:
     def free(self, device: torch.device, need: int) -> bool:
         if not self._here(device):
             return False
-        with self.lock:
-            freed = self._free_upto(need, "out of memory")
+        with self.lock:  # the allocation just failed: `need` more than what is free now
+            freed = self._free_upto(self._free() + need, "out of memory")
             self._cap()
             return freed
 
@@ -888,7 +897,7 @@ class Memory:
         if not self._here(device):
             return False
         with self.lock:
-            target = max(need, self._free() + 1)
+            target = self._free() + max(need, 1)
             lowered = self._lower_until(target, "out of memory", None)
             lowered = self._last(target, "out of memory") or lowered
             self._cap()
@@ -906,14 +915,33 @@ class Memory:
         free, room = int(torch.cuda.mem_get_info(self.gpu)[0]), self._room()
         return free if room is None else min(free, room - torch.cuda.memory_reserved(self.gpu))
 
-    def _room(self) -> int | None:
-        """Under a limit, what this process's torch may reserve; None without one."""
-        if self.limit is None or self.row is None:
+    def _driver_bytes(self) -> int | None:
+        """The card's bytes in use less what other processes' ledger rows hold."""
+        if not self.cuda:
             return None
+        free, total = torch.cuda.mem_get_info(self.gpu)
+        if self.row is None:
+            return total - free
         table, row = self.row
-        others = sum(f.held for f in table.snapshot() if f.slot != row.id)
-        core = self.core.stats()  # type: ignore[union-attr]
-        return limited(self.limit, self.context, others, core.mapped + core.idle)
+        return total - free - sum(f.held for f in table.snapshot() if f.slot != row.id)
+
+    def _outside(self) -> None:
+        """This process's device bytes neither torch nor varena holds (its CUDA context, NCCL's
+        buffers, libraries' workspaces), measured now from the driver's count of the process."""
+        total = self.measure() if self.cuda else None
+        if total is not None:
+            core = self.core.stats()  # type: ignore[union-attr]
+            held = torch.cuda.memory_reserved(self.gpu) + core.mapped + core.idle
+            self.context = max(total - held, 0)
+
+    def _room(self) -> int | None:
+        """Under a limit, what this process's torch may reserve: the limit less every byte the
+        driver counts in use that is not that reserve (its context, varena's pages, NCCL, any
+        other process's, a ledger row or not); None without one."""
+        if self.limit is None or not self.cuda:
+            return None
+        free, total = torch.cuda.mem_get_info(self.gpu)
+        return limited(self.limit, total - free - torch.cuda.memory_reserved(self.gpu))
 
     def _cap(self) -> None:
         """Torch's allocator held to what the limit leaves it, at block boundaries."""
@@ -1180,6 +1208,7 @@ class Memory:
         (`cuts.caught`). A capacity failure never poisons; what package state still holds shows
         as `leftover`. `plan`: its declared steps (`Memory.plan`), else one declared at dispatch."""
         start = torch.cuda.memory_allocated(self.gpu) if self.cuda else 0
+        self._outside()
         key = self.row[0].dispatched(id) if self.row is not None else None
         request = Request(id, start, self._copies(), key, self.memo.retries, memory=self)
         with self.lock:
@@ -1221,7 +1250,11 @@ class Memory:
         retries = self.memo.retries - request.retried
         peaks = tuple(_peak(s) for s in request.shapes.values())
         steps, evictions = tuple(request.steps), tuple(request.evictions)
-        request.stats = RequestStats(request.id, steps, evictions, leftover, copied, retries, peaks)
+        declared = self.plans.get(request.id)
+        plan = () if declared is None else tuple(self._names(s) for s in declared.steps)
+        request.stats = RequestStats(
+            request.id, steps, evictions, leftover, copied, retries, peaks, plan
+        )
         if request.key is not None and self.row is not None:
             self.row[0].set_peak(request.key, request.peak)
         with self.lock:
@@ -1329,6 +1362,14 @@ class Memory:
                 except DeviceFull:
                     return
 
+    def _names(self, step: frozenset[object]) -> tuple[str, ...]:
+        """A plan step's models by component name, as declared when none is loaded."""
+        names = []
+        for e in step:
+            model = e if isinstance(e, Model) else self.by_module.get(e) if isinstance(e, nn.Module) else None
+            names.append(model.component if model is not None else str(e))
+        return tuple(sorted(names))
+
     def _copies(self) -> dict[str, int]:
         """Each model's weight bytes copied since it loaded, home or through slots."""
         return {m.name: sum(_set(m)[1:3]) for m in list(self.models.values())}
@@ -1355,6 +1396,20 @@ class Memory:
         )
         reserved = torch.cuda.memory_reserved(self.gpu) if self.cuda else 0
         held += f"; torch {reserved / 2**30:.2f} GiB"
+        if self.cuda:  # every byte of the device this process sees, named
+            self._outside()
+            core = self.core.stats()  # type: ignore[union-attr]
+            others = (
+                sum(f.held for f in self.row[0].snapshot() if f.slot != self.row[1].id)
+                if self.row is not None
+                else 0
+            )
+            limit = self.limit if self.limit is not None else self.total
+            held += (
+                f"; of {limit / 2**30:.2f} GiB: outside {self.context / 2**30:.2f}, other "
+                f"processes {others / 2**30:.2f}, varena mapped {core.mapped / 2**30:.2f} "
+                f"(idle {core.idle / 2**30:.2f})"
+            )
         return Exhausted(self.gpu, need, op, resident, peaks, held)
 
 
@@ -1585,10 +1640,10 @@ def _peak(shape: cuts.Shape) -> Peak:
     return Peak(shape.model, shape.shape, shape.peak, cut)
 
 
-def limited(capacity: int, context: int, others: int, varena: int) -> int:
-    """Under a limit, what this process's torch may reserve: the capacity less its CUDA context,
-    the bytes other rows hold and its own varena pages (§5.6)."""
-    return max(capacity - context - others - varena, 0)
+def limited(capacity: int, elsewhere: int) -> int:
+    """Under a limit, what this process's torch may reserve: the capacity less every byte in
+    use on the device that is not that reserve (§5.6)."""
+    return max(capacity - elsewhere, 0)
 
 
 def _set(model: Model) -> tuple[int, int, int, int]:

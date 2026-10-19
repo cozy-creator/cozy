@@ -49,6 +49,8 @@ def run(device: torch.device, ck: tensorfs.Checkpoint, want: torch.Tensor, limit
     with torch.no_grad(), mem.request(f"limit {limit}") as r:
         got = unet(x.to(device), 3, encoder_hidden_states=text.to(device)).sample.cpu()
     name = f"loaded from the store, limit {limit}"
+    if limit is not None:  # the CUDA context is counted: measured from the driver each request
+        check(f"{name}: outside bytes are measured", mem.context > 0, mem.context)
     owners = {p for p in blocks_of(unet) if any(k.startswith(p + ".") for k in ck.tensors["unet"])}
     check(  # its small blocks share packs with their neighbours: each still owns its regions
         f"{name}: every block owns its regions",
@@ -83,13 +85,14 @@ def main() -> int:
         want = plain(x.to(device), 3, encoder_hidden_states=text.to(device)).sample.cpu()
     plain.cpu()
     common, blocks = run(device, ck, want, None)
-    if device.type == "cuda":  # what torch holds, its working room, common and half the blocks
+    if device.type == "cuda":  # what the process holds, working room, common and half the blocks
         torch.cuda.empty_cache()
-        run(device, ck, want, torch.cuda.memory_reserved(device) + (16 << 20) + common + blocks // 2)
+        used = lambda: (lambda f, t: t - f)(*torch.cuda.mem_get_info(device))  # noqa: E731
+        run(device, ck, want, used() + (16 << 20) + common + blocks // 2)
         torch.cuda.empty_cache()  # common never fits: the bind is short, it does not spin
         with torch.device("meta"):
             unet = UNet2DConditionModel(**CONFIG).eval()
-        mem = Memory.open(device, limit=torch.cuda.memory_reserved(device) + common // 2)
+        mem = Memory.open(device, limit=used() + common // 2)
         model = mem.load(unet, ck=ck)
         x, text = (torch.randn(*s, device=device) for s in ((1, 4, 8, 8), (1, 5, 768)))
         try:
