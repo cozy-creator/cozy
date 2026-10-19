@@ -12,6 +12,9 @@ __version__: str
 STORE_FORMAT: int
 CLAIM_PROTOCOL: int
 
+def _kernel_binary(family: int, core: str, dtype: str) -> tuple[bytes, str, int, int]:
+    """Internal engine binary payload, entry symbol, shared bytes and warp count."""
+
 #: `tensorfs._ext.varena`, typed in full by `varena.pyi` (the `tensorfs.varena` facade).
 varena: ModuleType
 

@@ -178,12 +178,13 @@ jobs:
           path: crates/tensorfs/dist/*.whl
           if-no-files-found: error
           retention-days: 7
-      - if: contains(inputs.build, 'tensorfs') && inputs.test != ''
+      - if: contains(inputs.build, 'tensorfs')
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/tensorfs"
           uv pip install --python "$RUNNER_TEMP/tensorfs/bin/python" crates/tensorfs/dist/*.whl
           echo "TENSORFS_TEST_PYTHON=$RUNNER_TEMP/tensorfs/bin/python" >> "$GITHUB_ENV"
           echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$PWD"/crates/tensorfs/dist/tensorfs-*.whl)" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/tensorfs/bin/python" crates/tensorfs/scripts/kernel_conform.py
       - if: inputs.tensorfs_run != ''
         uses: actions/download-artifact@v4
         with:
