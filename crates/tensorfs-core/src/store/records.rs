@@ -100,6 +100,30 @@ impl Store {
         self.commit(&path, &json(&path, pin)?, true)
     }
 
+    /// Classification and replacement share the ordinary pin lock. A manual/operator pin
+    /// occupying the internal name stays unchanged; an optional cache copy may then miss.
+    pub(super) fn pin_cache(&self, root: &ObjectRef) -> Result<()> {
+        let id = format!("cache-{}", root.sha256);
+        let path = self.pin_path(&id)?;
+        let _acquisition = super::retention::acquire(self)?;
+        let _lock = self.lock("pins")?;
+        let old = parse::<Pin>(&path)?;
+        if old
+            .as_ref()
+            .is_some_and(|pin| !super::cache::owned(&id, pin))
+        {
+            return Ok(());
+        }
+        let mut pin = Pin::new(vec![root.clone()]);
+        pin.owner = Some(super::cache::OWNER.into());
+        self.retain(
+            pin.roots
+                .iter()
+                .filter(|root| !old.as_ref().is_some_and(|old| old.roots.contains(root))),
+        )?;
+        self.commit(&path, &json(&path, &pin)?, true)
+    }
+
     pub fn get_pin(&self, id: &str) -> Result<Option<Pin>> {
         parse(&self.pin_path(id)?)
     }
@@ -133,6 +157,9 @@ impl Store {
         }
         let path = self.pin_path(id)?;
         let _lock = self.lock("pins")?;
+        if !parse::<Pin>(&path)?.is_some_and(|pin| super::retention::owned(id, &pin)) {
+            return Ok(false);
+        }
         self.remove_record(&path)
     }
 

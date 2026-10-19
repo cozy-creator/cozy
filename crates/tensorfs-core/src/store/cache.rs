@@ -18,6 +18,15 @@ pub(super) const SWEEP: Duration = Duration::from_secs(10 * 60);
 const RESERVE_MIN: u64 = 1 << 30;
 const RESERVE_MAX: u64 = 10 << 30;
 const RESERVE_INODES: u64 = 32;
+pub(super) const OWNER: &str = "tensorfs.cache/1";
+
+/// A name alone never makes an operator's ordinary pin disposable.
+pub(super) fn owned(id: &str, pin: &Pin) -> bool {
+    pin.owner.as_deref() == Some(OWNER)
+        && pin.roots.len() == 1
+        && is_digest(&pin.roots[0].sha256)
+        && id == format!("cache-{}", pin.roots[0].sha256)
+}
 
 /// The existing filesystem sample seam; pressure tests sample space and delete real files.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,10 +212,7 @@ impl Store {
     #[doc(hidden)]
     pub fn cache_touch(&self, root: &ObjectRef) -> Result<()> {
         if self.cache_mode {
-            self.pin(
-                &format!("cache-{}", root.sha256),
-                &Pin::new(vec![root.clone()]),
-            )?;
+            self.pin_cache(root)?;
         }
         Ok(())
     }
@@ -512,7 +518,7 @@ impl Store {
             self.sweep_writers(TTL)?;
             let cutoff = now.saturating_sub(TTL.as_secs());
             for (id, pin) in self.pins()? {
-                if id.starts_with("cache-") && pin.last_use <= cutoff {
+                if owned(&id, &pin) && pin.last_use <= cutoff {
                     self.unpin_unused(&id, pin.last_use)?;
                 }
             }
@@ -654,6 +660,64 @@ mod tests {
                 ..ample()
             })
         }
+    }
+
+    #[test]
+    fn cache_names_do_not_reclassify_or_evict_manual_operator_pins() {
+        let scratch = Scratch::new();
+        let store = &scratch.0;
+        let mut raw = store.clone();
+        raw.cache_mode = false;
+        let operator = raw.put_bytes(&[21; 32 << 10]).unwrap();
+        let collision = raw.put_bytes(&[22; 32 << 10]).unwrap();
+        let manual = Pin {
+            last_use: 0,
+            ..Pin::new(vec![collision.clone()])
+        };
+        let id = format!("cache-{}", collision.sha256);
+        raw.pin(
+            "cache-operator",
+            &Pin {
+                last_use: 0,
+                ..Pin::new(vec![operator.clone()])
+            },
+        )
+        .unwrap();
+        raw.pin(&id, &manual).unwrap();
+        store.cache_touch(&collision).unwrap();
+        assert_eq!(
+            store.get_pin(&id).unwrap(),
+            Some(manual.clone()),
+            "cache touch reclassified a manual pin"
+        );
+        let genuine = payload(store, 23);
+        let sample = sampled(
+            store,
+            &[operator.clone(), collision.clone(), genuine.clone()],
+            64 << 10,
+        );
+        assert!(
+            !store.cache_maintain_with(0, now_secs(), &sample).unwrap(),
+            "manual pins incorrectly covered pressure"
+        );
+        assert!(
+            store
+                .get_pin(&format!("cache-{}", genuine.sha256))
+                .unwrap()
+                .is_some(),
+            "a failed covering plan dropped genuine cache"
+        );
+        assert!(store
+            .cache_maintain_with(0, now_secs() + TTL.as_secs() + 1, &|| Ok(ample()))
+            .unwrap());
+        assert_eq!(store.read(&operator).unwrap(), [21; 32 << 10]);
+        assert_eq!(store.read(&collision).unwrap(), [22; 32 << 10]);
+        assert_eq!(store.get_pin(&id).unwrap(), Some(manual));
+        assert!(store.get_pin("cache-operator").unwrap().is_some());
+        assert!(
+            !store.path(&genuine).unwrap().exists(),
+            "a genuine classified cache pin did not expire"
+        );
     }
 
     #[test]
@@ -845,7 +909,27 @@ mod tests {
         let owner = store.cache_directory(&path).unwrap();
         fs::create_dir_all(&path).unwrap();
         fs::hard_link(store.path(&object).unwrap(), path.join("weight")).unwrap();
-        let sample = sampled(store, std::slice::from_ref(&object), 4096);
+        // The sample observes payload allocation, so a directory/record-only plan must
+        // not satisfy it. Require real fixture allocation on both sides of this deficit.
+        let deficit = 16 << 10;
+        let allocated = |path: &Path| platform::durable::allocated(&fs::metadata(path).unwrap());
+        let metadata = allocated(&path)
+            + allocated(&store.cache_entry(&path).unwrap().1)
+            + allocated(
+                &store
+                    .root
+                    .join("pins")
+                    .join(format!("cache-{}.json", object.sha256)),
+            );
+        assert!(
+            metadata < deficit,
+            "snapshot metadata alone covers the sample"
+        );
+        assert!(
+            allocated(&store.path(&object).unwrap()) > deficit,
+            "the payload cannot cover the sample"
+        );
+        let sample = sampled(store, std::slice::from_ref(&object), deficit);
         assert!(!store.cache_maintain_with(0, now_secs(), &sample).unwrap());
         assert!(path.join("weight").exists());
         assert!(store
