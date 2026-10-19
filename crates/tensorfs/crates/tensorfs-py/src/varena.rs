@@ -563,14 +563,15 @@ fn fill_sealed<'p>(
     Ok((std::os::fd::IntoRawFd::into_raw_fd(fd), facts))
 }
 
-/// `regions` of a v2 checkpoint in a sealed host layout, filled from its chunk files: what a
-/// `register(host_fd=)` adopts. Returns the memfd (the caller's).
+/// `regions` of a v2 checkpoint in a sealed host layout, filled in this process from its chunk
+/// files (`files`, else the checkpoint's paths): what `register(host_fd=)` adopts. Returns the
+/// memfd (the caller's).
 #[cfg(feature = "store")]
 #[pyfunction]
-#[pyo3(signature = (ck, regions, name, threads = 8))]
-fn seal(py: Python<'_>, ck: PyRef<'_, crate::v2::PyCheckpoint>, regions: Vec<Vec<String>>, name: String, threads: usize) -> PyResult<i32> {
-    let ck = &ck.ck;
-    py.detach(|| varena::memory::seal(ck, &regions, &name, threads)).map(std::os::fd::IntoRawFd::into_raw_fd).or_raise(py)
+#[pyo3(signature = (ck, regions, name, threads = 8, files = None))]
+fn seal(py: Python<'_>, ck: PyRef<'_, crate::v2::PyCheckpoint>, regions: Vec<Vec<String>>, name: String, threads: usize, files: Option<Vec<(String, u64, i32)>>) -> PyResult<i32> {
+    let (ck, files) = (&ck.ck, granted(py, files)?);
+    py.detach(|| varena::memory::seal(ck, &regions, &name, threads, files)).map(std::os::fd::IntoRawFd::into_raw_fd).or_raise(py)
 }
 
 /// A memfd of `nbytes` whose pages are allocated now (`fill_sealed(reserved=)` then copies).

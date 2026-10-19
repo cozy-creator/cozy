@@ -2,7 +2,8 @@
 """varena's host core through the installed wheel, CPU only, no third-party packages.
 
 A v2 checkpoint is registered from its chunk files, from a grant's chunk-file descriptors (closed
-by the caller before any read: the core keeps its own) and from a sealed host layout. Every part
+by the caller before any read: the core keeps its own) and from a sealed host layout this process
+filled from a grant (`seal`). Every part
 is read back through `Pinned.ptr`. Freshness, close and the GPU core's refusals are checked.
 
     python varena-host.py [workdir]
@@ -28,11 +29,17 @@ def main(root: Path) -> None:
             want[f"blocks.{b}.p{p}"] = data
     ck = store.checkpoint(w.commit())
     rs = v2.regions(ck, 1 << 20, [f"unet/blocks.{b}" for b in range(3)])
-    fd = varena.seal(ck, rs, "host-smoke")
+    def grant() -> list[tuple[str, int, int]]:
+        return [(Path(p).name, n, os.open(p, os.O_RDONLY)) for p, n in ck.chunks]
+
+    sealed_from = grant()
+    fd = varena.seal(ck, rs, "host-smoke", files=sealed_from)
+    for _, _, f in sealed_from:
+        os.close(f)
     for name, host_fd in (("files", None), ("granted", None), ("sealed", fd)):
-        grant = [(Path(p).name, n, os.open(p, os.O_RDONLY)) for p, n in ck.chunks] if name == "granted" else None
-        ws = varena.Host().register(name, ck, rs, host_fd, grant)
-        for _, _, f in grant or ():
+        grant_fds = grant() if name == "granted" else None
+        ws = varena.Host().register(name, ck, rs, host_fd, grant_fds)
+        for _, _, f in grant_fds or ():
             os.close(f)
         assert ws.device is None and len(ws.spans) == len(rs) and len(ws.parts) == len(want)
         for r in range(len(rs)):
