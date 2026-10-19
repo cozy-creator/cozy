@@ -1,7 +1,6 @@
 //! B7's bounded pinned staging and reuse policy, independent of varena's placement types.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::ffi::c_void;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -139,6 +138,53 @@ struct Engine {
     pool: Pool,
     serial: Mutex<()>,
     seen: Mutex<VecDeque<(usize, usize)>>,
+}
+
+/// An engine-owned CUDA allocation. DLPack holders share it; the last owner frees it in its
+/// primary context, independently of Python checkpoint and component handles.
+pub struct DeviceBuffer {
+    ptr: u64,
+    len: usize,
+    engine: Arc<Engine>,
+}
+
+impl DeviceBuffer {
+    pub fn new(device: i32, len: usize) -> cuda::Result<DeviceBuffer> {
+        let engine = Engine::get(device)?;
+        let _ctx = CtxGuard::enter(engine.ctx)?;
+        let mut ptr = 0;
+        if len != 0 {
+            cuda::check("cuMemAlloc", unsafe {
+                (cuda::driver()?.mem_alloc)(&mut ptr, len)
+            })?;
+        }
+        Ok(DeviceBuffer { ptr, len, engine })
+    }
+    pub fn ptr(&self) -> u64 {
+        self.ptr
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn device(&self) -> i32 {
+        self.engine.device
+    }
+    pub fn context(&self) -> CUcontext {
+        self.engine.ctx
+    }
+}
+
+impl Drop for DeviceBuffer {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            if let (Ok(d), Ok(_ctx)) = (cuda::driver(), CtxGuard::enter(self.engine.ctx)) {
+                unsafe { (d.mem_free)(self.ptr) };
+            }
+        }
+    }
 }
 
 // Handles are used only after entering their primary context; calls on a stream are ordered.
