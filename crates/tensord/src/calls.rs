@@ -528,7 +528,8 @@ impl Calls {
                     .map_err(|error| ("failure_record_invalid", error.to_string()))?;
                 answer.ok = false;
                 answer.code = failure.code;
-                answer.detail = crate::triage::ends(&failure.message, 1024);
+                answer.detail = failure.message;
+                answer.traceback = child_traceback(&service.engine, &record.id);
             }
             State::Canceled => {
                 answer.ok = false;
@@ -1061,6 +1062,17 @@ fn record_call(
             }
         },
     };
+    // A failed child's whole cause chain is the caller's too: in its log, as `run show` prints it.
+    if status == "failed" {
+        let traceback = child_traceback(engine, &record.id);
+        let head = format!("call {index} ({}.{}) failed: {error_code}: {error}", call.module, call.function);
+        for line in std::iter::once(head.as_str()).chain(traceback.lines()) {
+            if let Err(failed) = engine.append_log(&parent.id, "error", line) {
+                tracing::warn!("run {}: call {index}'s failure is not in its log: {failed}", parent.id);
+                break;
+            }
+        }
+    }
     let measurements = engine
         .with_journal(|journal| journal.measurements(&record.id))
         .ok()
@@ -1082,6 +1094,12 @@ fn record_call(
             false
         }
     }
+}
+
+/// A failed child's whole traceback, from its triage bundle; empty when it kept none.
+fn child_traceback(engine: &Engine, child: &str) -> String {
+    let bundle = engine.triage(child).ok().flatten();
+    bundle.and_then(|(_, bundle)| crate::triage::traceback(&bundle)).unwrap_or_default()
 }
 
 #[cfg(test)]

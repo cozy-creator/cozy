@@ -204,6 +204,12 @@ class WeightSet:
     def prefetch(self, region: int) -> None:
         """Start the fill ahead of its bind, at home or into a free slot. It never waits. A
         no-op on the host."""
+    def warm(self, warm: bool) -> None:
+        """Whether its model is warm (loaded at GPU level, the default): another process's ask
+        takes idle sets' pages before warm ones'."""
+    def busy(self, busy: bool) -> None:
+        """Whether a forward of its model is in flight (from its first forward's start to its
+        last one's end): another process's ask never takes a busy set's pages."""
     def evict(self, regions: Sequence[int] | None = None) -> int:
         """Unmap these regions at home (all when None): only those unpinned whose fill and
         release events completed. Returns the bytes unmapped. The chunks go idle; past a small
@@ -240,6 +246,11 @@ class Gpu:
         duplicates every descriptor it keeps and closes nothing the caller passed."""
     def trim(self) -> int:
         """Idle chunks and unneeded slots go back to the driver. Returns the bytes released."""
+    def serve(self, row: Row) -> None:
+        """Answers other processes' asks of `row` from now on, on a Rust thread with no Python:
+        idle chunks and slots, then unpinned home pages of sets not busy, idle before warm, least
+        recently bound first. Each answer moves the row's progress, so a long kernel is never a
+        stall. Caches and torch's slack stay the control thread's to shed."""
     def step(self) -> None:
         """Ends a step: each set's `step` counters become its `last`."""
     def stats(self) -> GpuStats: ...
@@ -355,11 +366,16 @@ class RowFacts:
     @property
     def last_use(self) -> int: ...
     @property
+    def waiting(self) -> int: ...
+    @property
     def want(self) -> int: ...
     @property
     def acked(self) -> int: ...
     @property
     def progress(self) -> int: ...
+    @property
+    def running(self) -> list[tuple[str, int]]:
+        """Its requests running now: (request id, remaining measured peak; -1 never measured)."""
     @property
     def held(self) -> int: ...
     @property
@@ -388,18 +404,25 @@ class Row:
         idle: int = 0,
         active_peak: int = 0,
         last_use: int = 0,
+        waiting: int = 0,
     ) -> None: ...
     def want(self) -> int: ...
     def wait_want(self) -> int: ...
     def ack(self, freed: int) -> None: ...
+    def running(self, requests: list[tuple[str, int]]) -> None:
+        """Its requests running now, at most 8: (request id of at most 64 bytes, the most it
+        still needs beyond what this process holds, from its measured profile; -1 when never
+        measured). Replaces the last list; written at pass ends and request ends."""
 
 class Ledger:
     @staticmethod
     def create(gpu_uuid: str, capacity: int) -> Ledger: ...
     @staticmethod
-    def adopt(fd: int) -> Ledger: ...
+    def adopt(fd: int, events_fd: int | None = None) -> Ledger: ...
     @property
     def fd(self) -> int: ...
+    @property
+    def events_fd(self) -> int | None: ...
     @property
     def gpu_uuid(self) -> str: ...
     @property
@@ -413,3 +436,16 @@ class Ledger:
     def returned(self, pid: int) -> None: ...
     def stalled(self) -> list[int]: ...
     def snapshot(self) -> list[RowFacts]: ...
+    def freed(self) -> None:
+        """Bytes freed on this GPU: the free generation moves and TensorD's eventfd is signalled."""
+    def freed_gen(self) -> int: ...
+    def wait_freed(self, seen: int) -> int:
+        """Blocks until the free generation is other than `seen`; returns it."""
+    def peak(self, key: str) -> int | None:
+        """The measured peak recorded under `key` (`<package>|<shape>`, at most 120 bytes)."""
+    def set_peak(self, key: str, nbytes: int) -> None: ...
+    def dispatched(self, request_id: str) -> str | None:
+        """The key TensorD dispatched `request_id` under; None: it runs unrecorded."""
+    def dispatch(self, request_id: str, key: str) -> None: ...
+    def undispatch(self, request_id: str) -> None: ...
+    def fits(self, package: str, shape: str | None = None, spawn: bool = False) -> bool: ...

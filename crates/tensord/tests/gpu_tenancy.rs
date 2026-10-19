@@ -1,6 +1,6 @@
-//! Rental only (`--ignored`): who submits never decides which executor or which GPU weights
-//! serve a request. Real executors and inference through the machine's own dispatch, GPU pool
-//! and custody; the front door is not in this path (`machine_surface.rs` covers its privacy).
+//! Rental only (`--ignored`): who submits never decides which executor serves a request. Real
+//! executors and inference through the machine's own dispatch and GPU pool; the front door is
+//! not in this path (`machine_surface.rs` covers its privacy).
 //!
 //! `TENSORD_GPU_TENANCY` names a JSON plan: `state`, `store`, `generations`, `gpu_config`,
 //! `entrypoint`, `input`, `output` (JSON lines) and `packages`: two published packages
@@ -9,7 +9,6 @@
 use tensord::{
     gpu_service::{GpuConfig, Pool},
     journal::{Execution, Preparation, State, SubmissionContext},
-    resident_custody::HoldingFacts,
     service::{Call, Service},
 };
 use serde::Deserialize;
@@ -116,53 +115,15 @@ impl Pod {
         let row = json!({"n": n, "actor": actor, "package": chosen.package, "plan": prepared.id,
             "id": record.id, "state": format!("{:?}", record.state), "failure": record.failure,
             "executor": record.process, "wall_s": started.elapsed().as_secs_f64(),
-            "holdings": gpu.resident(), "gpu_used_mib": used});
+            "gpu_used_mib": used});
         writeln!(self.output, "{row}").unwrap();
         (prepared.id, record)
     }
-    fn pid(record: &Execution) -> u32 {
-        record.process.as_ref().expect("the run's executor").pid
-    }
-    /// Custody's holdings once they are as `settled` says (a call offers after its run ended).
-    fn settled(&mut self, settled: impl Fn(&[HoldingFacts]) -> bool) -> Vec<HoldingFacts> {
-        // Test harness bound on a state that never comes; the product has no such limit.
-        let until = Instant::now() + Duration::from_secs(120);
-        loop {
-            let held = self.gpu.resident();
-            if settled(&held) {
-                writeln!(self.output, "{}", json!({ "holdings": held })).unwrap();
-                return held;
-            }
-            assert!(Instant::now() < until, "holdings never settled: {held:?}");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-    /// Bytes `plan`'s executor has uploaded to the GPU since it started, as of its last call.
-    fn uploaded(&self, plan: &str) -> u64 {
-        let invokes = std::fs::read_to_string(self.plan.state.join("gpu/invokes.jsonl")).unwrap();
-        let mut rows = invokes
-            .lines()
-            .rev()
-            .map(|row| serde_json::from_str::<Value>(row).unwrap());
-        let last = rows.find(|row| row["plan"] == plan).expect("a call");
-        last["plane"]["h2d_bytes"]
-            .as_u64()
-            .expect("the plane's upload count")
-    }
-}
-fn reads(holding: &HoldingFacts, pid: u32) -> bool {
-    holding.readers.iter().any(|birth| birth.pid == pid)
-}
-fn layouts(held: &[HoldingFacts]) -> Vec<&str> {
-    held.iter().map(|h| h.key.layout.as_str()).collect()
-}
-fn bytes(held: &[HoldingFacts]) -> u64 {
-    held.iter().map(|h| h.bytes).sum()
 }
 
 #[test]
 #[ignore = "rental GPU with installed generations and cached models"]
-fn submitters_share_a_packages_executor_and_packages_share_a_checkpoints_weights() {
+fn submitters_share_a_packages_executor_and_packages_keep_their_own() {
     let path = std::env::var("TENSORD_GPU_TENANCY").expect("plan path");
     let plan: Plan = serde_json::from_reader(File::open(path).unwrap()).unwrap();
     let service = Service::open(&plan.state, &plan.generations, 1).unwrap();
@@ -234,9 +195,7 @@ fn submitters_share_a_packages_executor_and_packages_share_a_checkpoints_weights
         "the quote holds stderr from before the request: {quoted}"
     );
 
-    // Another publisher's package binding the same checkpoint: an executor of its own. The
-    // machine gives a plan's first, unmeasured call the card (the first package is unmapped
-    // and its holdings revoked); its second call fills and offers.
+    // Another publisher's package binding the same checkpoint: an executor of its own.
     let (other_plan, first) = pod.run("alice", 1, None);
     let (_, second) = pod.run("bob", 1, None);
     assert_eq!(
@@ -246,40 +205,6 @@ fn submitters_share_a_packages_executor_and_packages_share_a_checkpoints_weights
     assert_ne!(other_plan, alice_plan);
     assert_ne!(first.process, alice.process);
     assert_eq!(first.process, second.process);
-    let theirs = Pod::pid(&second);
-    let offered = pod.settled(|held| !held.is_empty() && held.iter().all(|h| reads(h, theirs)));
-
-    // The first package again. Its executor's holdings were revoked, so it refills a private
-    // copy, and at the end of the call its offer is a duplicate: it lets its copy go and
-    // attaches the other package's. One weight set on the GPU for both, charged once.
-    let (_, back) = pod.run("alice", 0, None);
-    assert_eq!(back.state, State::Completed);
-    assert_eq!(back.process, alice.process);
-    let ours = Pod::pid(&back);
-    let shared = pod.settled(|held| held.iter().all(|h| reads(h, theirs) && reads(h, ours)));
-    assert_eq!(layouts(&shared), layouts(&offered));
-    assert_eq!(bytes(&shared), bytes(&offered));
-
-    // A replacement executor of the other package attaches at its load, uploading almost
-    // nothing.
-    let birth = second.process.clone().unwrap();
-    assert_eq!(
-        cozy_platform::process::Birth::of(birth.pid).unwrap(),
-        birth
-    );
-    // The exact process this test's pool started, by its recorded birth.
-    cozy_platform::process::Exact::open(&birth).unwrap().expect("it runs").kill().unwrap();
-    while !birth.ended().unwrap() {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let (_, replaced) = pod.run("bob", 1, None);
-    assert_eq!(replaced.state, State::Completed);
-    assert_ne!(replaced.process, second.process);
-    let new = Pod::pid(&replaced);
-    let after = pod.settled(|held| held.iter().all(|h| reads(h, new) && reads(h, ours)));
-    assert_eq!(layouts(&after), layouts(&offered));
-    let fresh = pod.uploaded(&other_plan);
-    assert!(fresh < bytes(&offered) / 10, "uploaded {fresh} bytes");
 
     pod.service.stop().unwrap();
     pod.gpu.stop().unwrap(); // every executor's exit observed before the test ends

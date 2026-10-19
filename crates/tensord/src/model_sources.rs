@@ -1,7 +1,7 @@
 //! Stored metadata and assets for a session's selected models. TensorD supplies each verified
 //! header, declared asset and selected component's encoded byte count through TensorFS.
-//! `ModelSource` returns sealed read-only descriptors; HostTier supplies CPU weight buffers
-//! and object descriptors. Runtime parses the metadata, constructs models and performs GPU
+//! `ModelSource` returns sealed read-only descriptors; `read_grant` the selected components'
+//! chunk files. Runtime parses the metadata, constructs models and performs GPU
 //! transfers/mappings with its own TensorFS plane. Selection remains the access boundary.
 use crate::device_executor::{Answer, Frame};
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 use crate::storage::{self, Store};
-use tensorfs_core::store2::Checkpoint;
+use tensorfs_core::{format::ObjectRef, store2::Checkpoint};
 
 /// The `model_source` name of a checkpoint's manifest (`tensorfs.manifest/2`, its file list):
 /// `.` is never a manifest path.
@@ -35,6 +35,7 @@ struct Selection {
 }
 
 pub struct ModelSources {
+    store: Arc<Store>,
     selected: BTreeMap<String, Selection>,
 }
 
@@ -94,7 +95,7 @@ impl ModelSources {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "duplicate manifest selection"));
             }
         }
-        Ok(Self { selected })
+        Ok(Self { store, selected })
     }
 
     /// Selected encoded source size, separate from prepared CPU-buffer and GPU residency.
@@ -106,6 +107,28 @@ impl ModelSources {
 
     pub fn authorized(&self, manifest: &str) -> io::Result<Checkpoint> {
         self.selected.get(digest(manifest)?).map(|s| s.checkpoint.clone()).ok_or_else(outside)
+    }
+
+    /// The chunk objects of `manifest`'s selected components, each once, sorted by digest: what
+    /// a `read_grant` without a sealed layout (an Apple or CPU executor) reads.
+    pub fn chunks(&self, manifest: &str) -> io::Result<Vec<ObjectRef>> {
+        let selection = self.selected.get(digest(manifest)?).ok_or_else(outside)?;
+        let header = selection.checkpoint.header();
+        let mut objects = BTreeMap::new();
+        for component in selection.components.iter().filter_map(|c| header.component(c)) {
+            for (_, at) in component.tensors.iter().flat_map(|t| t.locations()) {
+                for span in header.spans(&at) {
+                    let object = &header.chunks[span.chunk];
+                    objects.insert(object.sha256.clone(), object.clone());
+                }
+            }
+        }
+        Ok(objects.into_values().collect())
+    }
+
+    /// `objects`' files, read-only.
+    pub fn files(&self, objects: &[ObjectRef]) -> io::Result<Vec<File>> {
+        (objects.iter()).map(|object| self.store.file(object).map_err(storage::io_error)).collect()
     }
 
     /// One selected model's header (`name` empty), stored bytes as written; its manifest
