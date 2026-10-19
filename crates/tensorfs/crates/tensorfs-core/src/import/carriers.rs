@@ -35,6 +35,9 @@ pub struct Carrier {
     /// ComfyUI's `convrot` flag.
     #[serde(default)]
     pub convrot: bool,
+    /// ComfyUI always rotates this format: its marker's `convrot` may be absent or true, never false.
+    #[serde(default)]
+    pub rotated: bool,
     /// The data part first.
     pub parts: Vec<PartRule>,
     pub encoding: Encoding,
@@ -79,6 +82,14 @@ pub enum Geometry {
     /// Block scales in cuBLAS 128×4 tiles, `[128·⌈R/128⌉, 4·⌈W/4⌉]` with `W = ⌈C/n⌉`; an expert
     /// stack tiled expert by expert (`[E, N, 4·⌈W/4⌉]`, `N` a multiple of 128) is the same bytes.
     Tiles(u64),
+    /// The data part, `n` bits per element along the last axis: `[*lead, C·n/8]`.
+    Packed(u64),
+    /// Row-major scales per group of the encoding's `group_size`, `[*lead, C/g]`.
+    Groups,
+    /// The same, transposed: `[C/g, R]`.
+    GroupsTransposed,
+    /// `n` elements, any shape.
+    Count(u64),
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +150,8 @@ fn matches(pattern: &str, key: &str) -> bool {
 pub struct Folded {
     pub encoding: Encoding,
     pub parts: Vec<FoldedPart>,
+    /// The logical shape.
+    pub shape: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -272,7 +285,7 @@ fn bytes(set: &SourceSet, key: &str, t: &Tensor) -> Result<Vec<u8>> {
         return refuse(Code::SIZE_CAP, format!("{key}: a {} byte marker", t.len));
     }
     let path = &set.files[t.file];
-    let io = |e| crate::err::classify_io(format!("read {key} in {}", path.display()), e);
+    let io = |e| crate::store::classify_io(format!("read {key} in {}", path.display()), e);
     let mut buf = vec![0; t.len as usize];
     File::open(path)
         .and_then(|f| f.read_exact_at(&mut buf, t.start))
@@ -430,14 +443,22 @@ fn numel(shape: &[u64]) -> u64 {
 }
 
 /// The stored shape of `t` as `rule` reads it against the logical `shape`, or why not.
-fn geometry(rule: &PartRule, t: &Tensor, shape: &[u64]) -> std::result::Result<Vec<u64>, String> {
+fn geometry(
+    rule: &PartRule,
+    t: &Tensor,
+    shape: &[u64],
+    group: Option<u64>,
+) -> std::result::Result<Vec<u64>, String> {
     let (lead, c) = match shape {
         [lead @ .., c] => (lead, *c),
         [] => (&[][..], 1),
     };
     let rows = numel(lead);
     let blocks = |n: u64| c.div_ceil(n);
-    let block_scheme = !matches!(rule.shape, Geometry::Logical | Geometry::One);
+    let block_scheme = !matches!(
+        rule.shape,
+        Geometry::Logical | Geometry::One | Geometry::Count(_)
+    );
     if block_scheme && shape.len() < 2 {
         return Err(format!("a logical shape {shape:?} of rank under 2"));
     }
@@ -456,6 +477,25 @@ fn geometry(rule: &PartRule, t: &Tensor, shape: &[u64]) -> std::result::Result<V
         }
         Geometry::Blocks(n) => {
             let want = [lead, &[blocks(n)]].concat();
+            match t.shape == want {
+                true => want,
+                false => return Err(format!("{:?}, not {want:?}", t.shape)),
+            }
+        }
+        Geometry::Packed(bits) => [lead, &[c * bits / 8]].concat(),
+        Geometry::Count(n) => match numel(&t.shape) == n {
+            true => t.shape.clone(),
+            false => return Err(format!("{:?}, not {n} elements", t.shape)),
+        },
+        Geometry::Groups | Geometry::GroupsTransposed => {
+            let g = group.filter(|g| *g > 0 && c % g == 0);
+            let Some(g) = g else {
+                return Err(format!("{c} columns are not whole groups of {group:?}"));
+            };
+            let want = match rule.shape {
+                Geometry::Groups => [lead, &[c / g]].concat(),
+                _ => vec![c / g, rows],
+            };
             match t.shape == want {
                 true => want,
                 false => return Err(format!("{:?}, not {want:?}", t.shape)),
@@ -500,8 +540,23 @@ fn fit(
     };
     let mut shape = t.shape.clone();
     if let Some(last) = shape.last_mut() {
-        *last = *last * from / to;
+        *last = match data.shape {
+            Geometry::Packed(bits) if (*last * 8).is_multiple_of(bits) => *last * 8 / bits,
+            Geometry::Packed(bits) => return Err(format!(".{}: not {bits}-bit rows", data.suffix)),
+            _ => *last * from / to,
+        };
     }
+    let mut encoding = carrier.encoding.clone();
+    for (param, (key, default)) in &carrier.marker_params {
+        let value = match conf.and_then(|c| conf_get(c, key)) {
+            None => *default,
+            Some(v) => v
+                .as_u64()
+                .ok_or(format!("marker {key} is {v}, not a count"))?,
+        };
+        encoding.params.insert(param.clone(), Value::from(value));
+    }
+    let group = encoding.params.get("group_size").and_then(Value::as_u64);
     let mut parts = Vec::new();
     for rule in &carrier.parts {
         let Some((_, t)) = present.get(rule.suffix.as_str()) else {
@@ -516,7 +571,8 @@ fn fit(
                 rule.suffix, t.dtype, rule.dtypes
             ));
         }
-        let part_shape = geometry(rule, t, &shape).map_err(|e| format!(".{}: {e}", rule.suffix))?;
+        let part_shape =
+            geometry(rule, t, &shape, group).map_err(|e| format!(".{}: {e}", rule.suffix))?;
         parts.push(FoldedPart {
             role: rule.role.clone(),
             dtype: rule.stored.clone().unwrap_or_else(|| t.dtype.clone()),
@@ -527,16 +583,6 @@ fn fit(
     if let (Producer::Comfy, Some(conf)) = (carrier.producer, conf) {
         marker_keys(carrier, conf)?;
     }
-    let mut encoding = carrier.encoding.clone();
-    for (param, (key, default)) in &carrier.marker_params {
-        let value = match conf.and_then(|c| conf_get(c, key)) {
-            None => *default,
-            Some(v) => v
-                .as_u64()
-                .ok_or(format!("marker {key} is {v}, not a count"))?,
-        };
-        encoding.params.insert(param.clone(), Value::from(value));
-    }
     for (param, role) in &carrier.dtype_params {
         let part = parts.iter().find(|p| p.role == *role);
         let dtype = part
@@ -545,7 +591,11 @@ fn fit(
             .name();
         encoding.params.insert(param.clone(), Value::from(dtype));
     }
-    Ok(Folded { encoding, parts })
+    Ok(Folded {
+        encoding,
+        parts,
+        shape,
+    })
 }
 
 /// Every key of a ComfyUI marker (and of its `params`) is one this carrier reads, one it
@@ -726,13 +776,17 @@ fn fold_group(group: &Group, d: &Declared) -> Result<Folds> {
             }
             None => d.formats.clone(),
         };
-        let convrot = conf
+        let stated = conf
             .and_then(|c| conf_get(c, "convrot"))
-            .and_then(Json::as_bool)
-            .unwrap_or(false);
+            .and_then(Json::as_bool);
+        let convrot = stated.unwrap_or(false);
         let candidates: Vec<&&Carrier> = rows
             .iter()
-            .filter(|c| c.convrot == convrot && c.formats.iter().any(|f| formats.contains(f)))
+            .filter(|c| match c.rotated {
+                true => stated != Some(false),
+                false => c.convrot == convrot,
+            })
+            .filter(|c| c.formats.iter().any(|f| formats.contains(f)))
             .collect();
         let found = || {
             let found: Vec<String> = (present.values())
@@ -748,7 +802,11 @@ fn fold_group(group: &Group, d: &Declared) -> Result<Folds> {
                     "{label}: {module} is {:?} format {formats:?}{}, which this import does not \
                      read (it reads {known:?}); found {}",
                     d.producer,
-                    if convrot { " with convrot" } else { "" },
+                    match stated {
+                        Some(true) => " with convrot",
+                        Some(false) => " with convrot: false",
+                        None => "",
+                    },
                     found()
                 ),
             );
@@ -830,7 +888,7 @@ fn fold_group(group: &Group, d: &Declared) -> Result<Folds> {
         let data = &folded.parts[0];
         let tensor = Tensor {
             dtype: logical.clone(),
-            shape: data.shape.clone(),
+            shape: folded.shape.clone(),
             file: data.at.file,
             start: data.at.start,
             len: data.at.len,

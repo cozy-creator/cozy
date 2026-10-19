@@ -10,10 +10,9 @@
     {"producer": "fp8 block scales (DeepSeek)", "keys": ["*.weight_scale_inv"]},
     {"producer": "mxfp4 (gpt-oss)", "keys": ["*_blocks", "*_scales"]},
     {"producer": "compressed-tensors packed", "keys": ["*.weight_packed", "*.weight_shape"]},
-    {"producer": "AWQ smoothing", "keys": ["*.pre_quant_scale"]},
-    {"producer": "ComfyUI asym_w4a8_int8", "keys": ["*.weight_s_rel"]}
+    {"producer": "AWQ smoothing", "keys": ["*.pre_quant_scale"]}
   ],
-  "marker_execution": ["full_precision_matrix_mult", "num_experts"],
+  "marker_execution": ["full_precision_matrix_mult", "num_experts", "linear_dtype"],
   "carriers": [
     {
       "producer": "modelopt",
@@ -137,6 +136,70 @@
       ],
       "encoding": {"scheme": "int8.convrot", "params": {"rotation": "hadamard"}},
       "marker_params": {"rotation_size": ["convrot_groupsize", 256]}
+    },
+    {
+      "producer": "comfy",
+      "formats": ["asym_w4a8_int8"],
+      "rotated": true,
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": {"packed": 4}},
+        {"suffix": "weight_s_rel", "role": "weight_s_rel", "dtypes": ["F8_E4M3", "U8"], "as": "F8_E4M3", "shape": "groups"},
+        {"suffix": "weight_s_channel", "role": "weight_s_channel", "dtypes": ["F32"], "shape": "rows"},
+        {"suffix": "weight_codebook", "role": "weight_codebook", "dtypes": ["F32"], "shape": {"count": 16}, "optional": true},
+        {"suffix": "weight_correction", "role": "weight_correction", "dtypes": ["F32", "BF16", "F16"], "shape": "groups_transposed", "optional": true}
+      ],
+      "encoding": {"scheme": "comfy.asym_w4a8_int8", "params": {}},
+      "marker_params": {"group_size": ["group_size", 16], "rotation_size": ["convrot_groupsize", 256]}
+    },
+    {
+      "producer": "comfy",
+      "formats": ["asym_w4a8_int8"],
+      "rotated": true,
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": {"packed": 4}},
+        {"suffix": "weight_s_rel", "role": "weight_s_rel", "dtypes": ["F32"], "shape": "groups"},
+        {"suffix": "weight_s_channel", "role": "weight_s_channel", "dtypes": ["F32"], "shape": "rows"},
+        {"suffix": "weight_codebook", "role": "weight_codebook", "dtypes": ["F32"], "shape": {"count": 16}, "optional": true},
+        {"suffix": "weight_correction", "role": "weight_correction", "dtypes": ["F32", "BF16", "F16"], "shape": "groups_transposed", "optional": true}
+      ],
+      "encoding": {"scheme": "comfy.asym_w4a8_int8", "params": {}},
+      "marker_params": {"group_size": ["group_size", 16], "rotation_size": ["convrot_groupsize", 256]}
+    },
+    {
+      "producer": "comfy",
+      "formats": ["w6a8_int8"],
+      "rotated": true,
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": {"packed": 6}},
+        {"suffix": "weight_s_rel", "role": "weight_s_rel", "dtypes": ["F8_E4M3", "U8"], "as": "F8_E4M3", "shape": "groups"},
+        {"suffix": "weight_s_channel", "role": "weight_s_channel", "dtypes": ["F32"], "shape": "rows"}
+      ],
+      "encoding": {"scheme": "comfy.w6a8_int8", "params": {}},
+      "marker_params": {"group_size": ["group_size", 16], "rotation_size": ["convrot_groupsize", 256]}
+    },
+    {
+      "producer": "comfy",
+      "formats": ["w6a8_int8"],
+      "rotated": true,
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": {"packed": 6}},
+        {"suffix": "weight_s_rel", "role": "weight_s_rel", "dtypes": ["F32"], "shape": "groups"},
+        {"suffix": "weight_s_channel", "role": "weight_s_channel", "dtypes": ["F32"], "shape": "rows"}
+      ],
+      "encoding": {"scheme": "comfy.w6a8_int8", "params": {}},
+      "marker_params": {"group_size": ["group_size", 16], "rotation_size": ["convrot_groupsize", 256]}
+    },
+    {
+      "producer": "comfy",
+      "formats": ["convrot_w4a4"],
+      "rotated": true,
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": {"packed": 4}},
+        {"suffix": "weight_scale", "role": "weight_scale", "dtypes": ["F32"], "shape": "rows"}
+      ],
+      "encoding": {"scheme": "comfy.convrot_w4a4", "params": {}},
+      "marker_params": {"rotation_size": ["convrot_groupsize", 256]},
+      "marker_values": {"quant_group_size": 64}
     }
   ]
 }
