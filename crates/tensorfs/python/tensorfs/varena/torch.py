@@ -536,7 +536,7 @@ class Memory:
                 model.ws.home(_home_regions(model))
                 for block in model.blocks:
                     block.site = cuts.Site(
-                        (name, block.index), device, model.track, module, tuple(state)
+                        (name, block.index), device, model.track, block.module, module, tuple(state)
                     )
                     _hook(block)
                 cuts.install(module)
@@ -796,9 +796,9 @@ class Memory:
                 break
         return freed > 0
 
-    # -- the catch's room (`cuts.Room`)
+    # -- the catch's rungs (`cuts.Rungs`)
 
-    def make(self, device: torch.device, need: int) -> bool:
+    def free(self, device: torch.device, need: int) -> bool:
         if device.type != "cuda" or device.index not in self.gpus:
             return False
         with self.lock:
