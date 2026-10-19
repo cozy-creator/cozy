@@ -698,14 +698,19 @@ class Memory:
             raise
 
     def _pin(self, model: Model, region: int, stream: int) -> Pinned:
-        """The region's pages, room made in §5.2's order until they map."""
+        """The region's pages, room made in §5.2's order while each try maps further: a try
+        whose deficit did not shrink made no progress, however much the rungs say they freed
+        (a failed map's own chunks go idle and are trimmed again), and is short."""
+        short = None
         while True:
             try:
                 return model.ws.bind(region, stream)
             except DeviceFull as full:
                 why = f"bind {model.name}"
-                if not self._make_room(self._free() + full.deficit, why, model):
+                stuck = short is not None and full.deficit >= short
+                if stuck or not self._make_room(self._free() + full.deficit, why, model):
                     raise _Short(full.deficit, why) from None
+                short = full.deficit
 
     def _passed(self, block: Block, call: tuple) -> None:
         """A block run again starts the model's next pass, at its first block's argument shapes.
@@ -1164,11 +1169,15 @@ class Memory:
                 if (ran := self.models.get(name)) is not None:
                     ran.repeats = passes
             if not self.active:  # reserves are what it measured; watermarks rise, nothing copies
+                room = self._room()
                 for model in self.models.values():
                     if model.peak:
                         model.reserve, model.peak = model.peak, 0
                     if self.cuda and not model.host and len(model.home) < len(model.blocks):
-                        model.home = set(model.order)
+                        fits = model.order if room is None else _spread(
+                            model.order, _sizes(model), room + _set(model)[0] - model.common.nbytes
+                        )  # under a limit, what it leaves this process's weights
+                        model.home |= set(fits)
                         model.ws.home(_home_regions(model))
             self._advance()
         self._running()

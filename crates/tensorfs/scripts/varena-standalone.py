@@ -17,7 +17,7 @@ from pathlib import Path
 import tensorfs
 import torch
 from diffusers import UNet2DConditionModel
-from tensorfs.varena.torch import Memory
+from tensorfs.varena.torch import Exhausted, Memory
 
 CONFIG = dict(  # blocks of 16 MiB and more: a smaller one shares a pack, so its region is common
     sample_size=8,
@@ -81,6 +81,19 @@ def main() -> int:
     if device.type == "cuda":  # what torch holds, its working room, common and half the blocks
         torch.cuda.empty_cache()
         run(device, ck, want, torch.cuda.memory_reserved(device) + (16 << 20) + common + blocks // 2)
+        torch.cuda.empty_cache()  # common never fits: the bind is short, it does not spin
+        with torch.device("meta"):
+            unet = UNet2DConditionModel(**CONFIG).eval()
+        mem = Memory.open(device, limit=torch.cuda.memory_reserved(device) + common // 2)
+        model = mem.load(unet, ck=ck)
+        x, text = (torch.randn(*s, device=device) for s in ((1, 4, 8, 8), (1, 5, 768)))
+        try:
+            with torch.no_grad(), mem.request("never fits"):
+                unet(x, 3, encoder_hidden_states=text)
+            check("a model that never fits raises Exhausted", False, "it ran")
+        except Exhausted as exc:
+            check("a model that never fits raises Exhausted", exc.need > 0, exc)
+        model.close()
     print(f"{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1
 
