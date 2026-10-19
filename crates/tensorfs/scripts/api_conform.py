@@ -18,23 +18,63 @@ with TemporaryDirectory() as temp:
         component = writer.component("model", cls="transformers.TestModel", config={"width": 6})
         component.put("weight", values)
         component.asset("tokenizer.json", b"{}")
+        writer.component("optimizer", cls="", config={}).put("step", np.array([7], dtype=np.int64))
+    with tensorfs.Writer(root / "folder", variant="f16") as half:
+        half.component("model", cls="transformers.TestModel", config={"width": 6}).put("weight", values.astype(np.float16))
+        half.component("optimizer", cls="", config={}).put("step", np.array([8], dtype=np.int64))
+    (root / "folder/README.md").write_text("a repo file\n")
     ck = writer.commit()
-    assert tensorfs.open(root / "folder").id == ck.id
+    assert tensorfs.open(root / "folder", variant="f32").id == ck.id
     assert tensorfs.open(root / "folder/model.f32.cozytensors").id == ck.id
-    assert np.array_equal(np.from_dlpack(ck.read("model", "weight")), values)
+    assert np.array_equal(np.from_dlpack(ck.components["model"].tensors.read("weight")), values)
     component = ck.components["model"]
     assert json.loads((Path(component.path) / "config.json").read_text()) == {"width": 6}
     assert (Path(component.path) / "tokenizer.json").read_bytes() == b"{}"
     tree = tensorfs.upload_folder(repo_id="local/example", revision="draft", folder_path=ck.path)
-    named = tensorfs.open("local/example", revision="draft", local_files_only=True)
+    named = tensorfs.open("local/example", revision="draft", variant="f32", local_files_only=True)
     assert named.id == ck.id and named.tree == tree
     assert named.repo_id == "local/example" and named.revision == "draft"
     with tensorfs.Writer(base=named) as derived:
         derived.component("copy", cls=component.cls, config=component.config).copy("weight", component)
     again = derived.commit()
-    assert np.array_equal(np.from_dlpack(again.read("copy", "weight")), values)
+    assert np.array_equal(np.from_dlpack(again.components["copy"].tensors.read("weight")), values)
     downloaded = tensorfs.snapshot_download("local/example", revision="draft", local_dir=root / "download")
-    assert tensorfs.open(downloaded).id == ck.id
+    assert tensorfs.open(downloaded, variant="f32").id == ck.id
+    assert (Path(downloaded) / "model.f16.cozytensors").is_file()
+    assert Path(tensorfs.hub_download("local/example", "README.md", revision="draft")).read_text() == "a repo file\n"
+    default_snapshot = tensorfs.snapshot_download("local/example", revision="draft")
+    assert Path(default_snapshot).name == tree.removeprefix("sha256:")
+    origin = (root / "origin").as_uri()
+    remote_tree = tensorfs.upload_folder(repo_id="acme/example", revision="1", folder_path=root / "folder", endpoint=origin)
+    remote_cache = root / "remote-cache"
+    metadata = tensorfs.open("acme/example", revision="1", variant="f32", endpoint=origin, cache_dir=remote_cache)
+    assert metadata.id == ck.id and metadata.tree == remote_tree
+    assert metadata.header_ref[1] == (root / "folder/model.f32.cozytensors").stat().st_size
+    assert metadata.missing(), "opening metadata fetched the closure"
+    only = tensorfs.snapshot_download("acme/example", revision="1", variant="f32", components=["model"], endpoint=origin, cache_dir=remote_cache)
+    assert not (Path(only) / "model.f16.cozytensors").exists()
+    selected = tensorfs.open(only)
+    assert selected.missing(["model"]) == []
+    assert selected.missing(["optimizer"]), "a model-only snapshot fetched the optimizer"
+    assert np.array_equal(np.from_dlpack(selected.components["model"].tensors.read("weight")), values)
+    assert metadata.missing(["optimizer"]), "reading one component fetched another"
+    blocked = root / "not-a-directory"
+    blocked.write_bytes(b"blocked")
+    failed = tensorfs.Writer(repo_id="acme/blocked", endpoint=blocked.as_uri())
+    failed.component("model", cls="", config={}).put("weight", values)
+    try:
+        failed.commit()
+    except tensorfs.Error as error:
+        assert failed.local_checkpoint is not None
+        assert np.array_equal(np.from_dlpack(failed.local_checkpoint.components["model"].tensors.read("weight")), values)
+        try:
+            failed.commit()
+        except tensorfs.Error as repeated:
+            assert repeated is error
+        else:
+            raise AssertionError("failed publication became a successful commit")
+    else:
+        raise AssertionError("an unavailable endpoint accepted publication")
     try:
         with tensorfs.Writer() as bad:
             bad.component("model", cls="", config={}).put("weight", values[:, ::2])
