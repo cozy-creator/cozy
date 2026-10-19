@@ -148,6 +148,30 @@ fn a_v2_checkpoint_binds_on_the_host_exactly_from_a_sealed_layout() {
     assert!(Host.register("ck", &fx.ck, &moved, Some(fd.as_raw_fd()), None).is_err(), "another grouping is refused");
 }
 
+/// The glue's regions: header-order runs cut where the owning block changes. blocks.2.b and norm
+/// share a pack, so that chunk is read once per region, from the files and into a sealed layout.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_chunk_two_regions_share_is_read_per_region() {
+    let fx = Fixture::new("runs");
+    let chunk = |key: &str| fx.ck.header().tensor("unet", key).unwrap().locations()[0].1.chunk;
+    assert_eq!(chunk("blocks.2.b"), chunk("norm.weight"));
+    let mut rs: Vec<Vec<String>> = Vec::new();
+    let mut last = None;
+    for &(c, k, _) in TENSORS {
+        let owner = (c, blocks().into_iter().find(|b| format!("{c}/{k}").starts_with(&format!("{b}."))));
+        if last.as_ref() != Some(&owner) {
+            rs.push(Vec::new());
+            last = Some(owner);
+        }
+        rs.last_mut().unwrap().push(format!("{c}/{k}"));
+    }
+    assert!(rs.contains(&vec!["unet/blocks.2.a".into(), "unet/blocks.2.b".into()]), "{rs:?}");
+    check(&Host.register("runs", &fx.ck, &rs, None, None).unwrap());
+    let fd = memory::seal(&fx.ck, &rs, "runs", 2, None).unwrap();
+    check(&Host.register("runs", &fx.ck, &rs, Some(fd.as_raw_fd()), None).unwrap());
+}
+
 #[test]
 fn a_gpu_takes_whole_pages_and_says_why_it_cannot_open() {
     assert!(matches!(Gpu::open(0, 3 << 20), Err(Error::Invalid(_))), "chunks are whole 2 MiB pages");

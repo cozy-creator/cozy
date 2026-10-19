@@ -2,7 +2,7 @@
 //! header order (the construction order, #624), become a read plan over their chunk files, and
 //! those files are the weight set's source. Nothing else of the checkpoint is walked or opened,
 //! so a set registers in time proportional to its regions. A part's bytes keep their chunk's
-//! 4 KiB alignment in the layout, so a region's reads are runs of whole chunks.
+//! 4 KiB alignment in the layout; a chunk two regions share is read once per region.
 
 use std::fs::File;
 
