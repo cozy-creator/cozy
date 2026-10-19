@@ -1066,6 +1066,20 @@ impl Pool {
         self.leaders.lock().unwrap().insert(birth.pid, (birth.clone(), plan.to_owned(), start));
     }
 
+    fn followed(&self, plan: &str, start: usize, birth: &Birth, followers: &[platform::process::Exact]) {
+        let mut owners = self.accounting.lock().unwrap();
+        if owners.get(&(plan.to_owned(), start)).and_then(Option::as_ref) != Some(birth) {
+            return;
+        }
+        for (rank, follower) in followers.iter().enumerate() {
+            let index = start + rank + 1;
+            owners.insert((plan.to_owned(), index), Some(follower.birth().clone()));
+            if let Some(device) = self.devices.get(index) {
+                device.memory.with(|gpu| gpu.spawned(plan, follower.birth().pid));
+            }
+        }
+    }
+
     fn finish_accounting(&self, plan: &str, start: usize, degree: u32, birth: &Birth) {
         let owners = self.accounting.lock().unwrap();
         if degree > 0 && owners.get(&(plan.to_owned(), start)).and_then(Option::as_ref) != Some(birth) {
@@ -1540,6 +1554,14 @@ impl Pool {
         };
         for session in gone {
             self.ended(&session.plan, session.start, session.degree);
+        }
+        let ended: Vec<_> = self.accounting.lock().unwrap().iter()
+            .filter_map(|((plan, index), owner)| owner.as_ref()
+                .filter(|birth| birth.ended().unwrap_or(false))
+                .map(|birth| (plan.clone(), *index, birth.clone())))
+            .collect();
+        for (plan, index, birth) in ended {
+            self.retire(&plan, index, 1, &[birth]);
         }
     }
     pub fn source_facts(&self, selections: &[SelectedManifest]) -> io::Result<ModelSources> {
@@ -2863,6 +2885,7 @@ impl Pool {
             Some(session) => {
                 *disposition = Disposition::Unknown(executor_births(&session.executor.birth, &session.followers));
                 self.born(&session.plan, session.start, session.degree, &session.executor.birth);
+                self.followed(&session.plan, session.start, &session.executor.birth, &session.followers);
                 engine.register_managed(
                     id,
                     session.executor.birth.clone(),
@@ -3198,16 +3221,7 @@ impl Pool {
                 .filter_map(|birth| platform::process::Exact::open(birth).ok().flatten())
                 .collect();
             // NVML charges each GPU's own process: rank r drives the group's GPU r.
-            {
-                let mut owners = self.accounting.lock().unwrap();
-                for (rank, follower) in session.followers.iter().enumerate() {
-                    let index = start + rank + 1;
-                    owners.insert((construction.clone(), index), Some(follower.birth().clone()));
-                    if let Some(device) = self.devices.get(index) {
-                        device.memory.with(|gpu| gpu.spawned(&construction, follower.birth().pid));
-                    }
-                }
-            }
+            self.followed(&session.plan, session.start, &session.executor.birth, &session.followers);
             let (load_cap, load_group) = rank_grant(&load_caps[..load_caps.len().min(ranks as usize)]);
             // Its pinned budget, applied by the Load before any weight set registers.
             let plane = !plan.slots.is_empty();
@@ -5194,6 +5208,9 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         assert!(!owns_birth(&live.birth, &[], &stale), "a reused PID is not this owner");
         pool.retire_returned(&model.construction, 0, 1, &[stale]);
         assert_eq!(pool.leaders.lock().unwrap().len(), 2);
+        pool.observe("replica", 0, 1, &old.birth, Facts::default(), &[], Some(false));
+        assert!(pool.devices[0].memory.with(|gpu| gpu.tenant("replica").unwrap().mapped),
+            "a stale sibling observation cannot unmap the current owner");
         old.control.write_all(&[1]).unwrap();
         assert!(old.child.wait().unwrap().success());
         pool.retire_returned(&model.construction, 0, 1, std::slice::from_ref(&old.birth));
