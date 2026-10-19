@@ -50,6 +50,8 @@ pub mod ids;
 pub mod import;
 #[cfg(feature = "store")]
 pub mod ingest;
+/// The read engine: byte ranges of files into host or device destinations (xs-055).
+pub mod io;
 pub mod jcs;
 pub mod limits;
 pub mod machine;

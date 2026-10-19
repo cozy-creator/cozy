@@ -1,7 +1,9 @@
 //! `tensorfs`: the store, checkpoints, the component writer and the error families, typed in
 //! `_ext.pyi`. Marshal only: every call that moves bytes runs detached from the GIL.
 
+use std::collections::BTreeMap;
 use std::ffi::{c_void, CStr};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -18,9 +20,10 @@ use tensorfs_core::format::{Body, Config, ConfigValue, Dtype, Encoding, Header, 
 use tensorfs_core::store2::{Checkpoint, Store};
 use tensorfs_core::writer::{Data, PartData, Source, Writer};
 
+use crate::tensors::{PyEncoded, PyTensors};
 pub(crate) use crate::errors::raise;
 
-fn invalid(py: Python<'_>, detail: impl Into<String>) -> PyErr {
+pub(crate) fn invalid(py: Python<'_>, detail: impl Into<String>) -> PyErr {
     raise(
         py,
         Failure {
@@ -62,7 +65,7 @@ fn to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
     })
 }
 
-fn metadata<'py>(py: Python<'py>, map: &Metadata) -> PyResult<Bound<'py, PyDict>> {
+pub(crate) fn metadata<'py>(py: Python<'py>, map: &Metadata) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     for (k, v) in map {
         dict.set_item(k, to_py(py, v)?)?;
@@ -672,9 +675,9 @@ pub struct PyComponent {
     /// The config's file name when it isn't `config.json`.
     #[pyo3(get)]
     config_file: String,
-    /// `key -> Info`, in construction order.
+    /// `key -> Info`, in construction order; reads go through the engine.
     #[pyo3(get)]
-    tensors: Py<PyDict>,
+    tensors: Py<PyTensors>,
     /// `name -> (sha256, length)`: run data in the component's folder.
     #[pyo3(get)]
     assets: Py<PyDict>,
@@ -791,6 +794,12 @@ fn info(py: Python<'_>, t: &Tensor) -> PyResult<PyInfo> {
     })
 }
 
+pub(crate) struct FetchTensor<'a> {
+    pub key: &'a str,
+    pub role: Option<&'a str>,
+    pub range: Option<Range<u64>>,
+}
+
 impl PyCheckpoint {
     fn new(header: Header, stored: Option<Checkpoint>, named: Option<Named>) -> PyCheckpoint {
         PyCheckpoint { header, stored, named, tensors: OnceLock::new(), components: OnceLock::new(), remote: None }
@@ -800,6 +809,38 @@ impl PyCheckpoint {
         if let Some(remote) = &self.remote {
             let objects = tensorfs_core::store2::wanted(&self.header, components).or_raise(py)?;
             py.detach(|| remote.fetch(&objects, priority)).or_raise(py)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fetch_tensors(&self, py: Python<'_>, component: &str, reads: &[FetchTensor]) -> PyResult<()> {
+        let Some(remote) = &self.remote else { return Ok(()) };
+        let ck = self.stored(py)?;
+        let mut objects = BTreeMap::new();
+        for read in reads {
+            let tensor = ck.tensor(component, read.key).or_raise(py)?;
+            let mut found = read.role.is_none();
+            for (role, at) in tensor.locations() {
+                if read.role.is_some_and(|wanted| wanted != role) { continue; }
+                found = true;
+                let range = read.range.clone().unwrap_or(0..at.length);
+                if range.start > range.end || range.end > at.length {
+                    return Err(invalid(py, format!("{component}/{}: range {range:?} exceeds {}", read.key, at.length)));
+                }
+                let mut offset = 0;
+                for span in self.header.spans(&at) {
+                    if offset < range.end && offset + span.length > range.start {
+                        let object = &self.header.chunks[span.chunk];
+                        objects.insert(object.sha256.clone(), object.clone());
+                    }
+                    offset += span.length;
+                }
+            }
+            if !found { return Err(invalid(py, format!("{component}/{} has no part {:?}", read.key, read.role))); }
+        }
+        if !objects.is_empty() {
+            let objects: Vec<ObjectRef> = objects.into_values().collect();
+            py.detach(|| remote.fetch(&objects, 0)).or_raise(py)?;
         }
         Ok(())
     }
@@ -918,7 +959,7 @@ impl PyCheckpoint {
                 cls: c.class.clone(),
                 config: config_dict(py, &c.config)?.unbind(),
                 config_file: c.config_file.clone().unwrap_or_else(|| "config.json".into()),
-                tensors: this.tensor_dict(py, c)?,
+                tensors: Py::new(py, PyTensors::new(&c.name, this.tensor_dict(py, c)?, this.stored.is_some().then(|| slf.clone().unbind())))?,
                 assets: assets.unbind(),
                 ck: this.stored.is_some().then(|| slf.clone().unbind()),
             };
@@ -1020,26 +1061,35 @@ fn regions(ck: &PyCheckpoint, max_bytes: u64, boundaries: Option<Vec<String>>, o
 
 // ---------------------------------------------------------------- arrays
 
-/// Bytes aligned for every dtype (8).
-struct Aligned {
+/// Bytes on a page boundary: aligned for every dtype, and an O_DIRECT read lands in place.
+/// Zeroed lazily by the allocator (calloc), so a large one costs no pass over its pages.
+pub(crate) struct Aligned {
     words: Vec<u64>,
-    len: usize,
+    at: usize,
+    pub(crate) len: usize,
 }
 
+const PAGE: usize = 4096;
+
 impl Aligned {
-    fn new(len: usize) -> Aligned {
-        Aligned {
-            words: vec![0; len.div_ceil(8)],
-            len,
-        }
+    pub(crate) fn new(len: usize) -> Aligned {
+        let words = vec![0u64; (len + PAGE).div_ceil(8)];
+        let at = (PAGE - words.as_ptr() as usize % PAGE) % PAGE;
+        Aligned { words, at, len }
     }
-    fn bytes(&self) -> &[u8] {
-        // SAFETY: `words` holds at least `len` initialized bytes; u8 has no alignment.
-        unsafe { std::slice::from_raw_parts(self.words.as_ptr() as *const u8, self.len) }
+    fn ptr(&self) -> *const u8 {
+        (self.words.as_ptr() as *const u8).wrapping_add(self.at)
     }
-    fn bytes_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+        (self.words.as_mut_ptr() as *mut u8).wrapping_add(self.at)
+    }
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: `words` holds `at + len` initialized bytes; u8 has no alignment.
+        unsafe { std::slice::from_raw_parts(self.ptr(), self.len) }
+    }
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: as above, and `self` is borrowed mutably.
-        unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len) }
     }
 }
 
@@ -1047,9 +1097,9 @@ impl Aligned {
 /// without a copy; an unknown dtype reads (`tobytes`) but has no DLPack type.
 #[pyclass(name = "Array", module = "tensorfs", frozen)]
 pub struct PyArray {
-    buf: Arc<Aligned>,
-    dtype: Dtype,
-    shape: Vec<u64>,
+    pub(crate) buf: Arc<Aligned>,
+    pub(crate) dtype: Dtype,
+    pub(crate) shape: Vec<u64>,
 }
 
 const KDL_CPU: i32 = 1;
@@ -1169,7 +1219,7 @@ impl PyArray {
         dl_device: Option<(i32, i32)>,
         copy: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let _ = (stream, max_version, copy);
+        let _ = (stream, max_version);
         if dl_device.is_some_and(|d| d != (KDL_CPU, 0)) {
             return Err(raise(
                 py,
@@ -1188,14 +1238,22 @@ impl PyArray {
                 },
             ));
         };
+        let buf = if copy == Some(true) {
+            let mut buf = Aligned::new(self.buf.len);
+            buf.bytes_mut().copy_from_slice(self.buf.bytes());
+            Arc::new(buf)
+        } else {
+            self.buf.clone()
+        };
+        let data = buf.ptr() as *mut c_void;
         let held = Box::into_raw(Box::new(Held {
             shape: self.shape.iter().map(|&d| d as i64).collect(),
-            _buf: self.buf.clone(),
+            _buf: buf,
         }));
         // SAFETY: `held` is live until the deleter runs; the consumer may write its own copy.
         let t = Box::into_raw(Box::new(DLManagedTensor {
             dl_tensor: DLTensor {
-                data: self.buf.words.as_ptr() as *mut c_void,
+                data,
                 device: DLDevice {
                     device_type: KDL_CPU,
                     device_id: 0,
@@ -1549,6 +1607,8 @@ pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEncoding>()?;
     m.add_class::<PyPart>()?;
     m.add_class::<PyArray>()?;
+    m.add_class::<PyTensors>()?;
+    m.add_class::<PyEncoded>()?;
     m.add_class::<PyWriter>()?;
     m.add_function(wrap_pyfunction!(regions, m)?)?;
     Ok(())

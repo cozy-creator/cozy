@@ -8,6 +8,8 @@
 Arrays cross to NumPy, PyTorch, JAX or CuPy through DLPack. TensorFS never imports a framework.
 """
 
+from collections.abc import Mapping
+
 from ._ext import (
     Array,
     Checkpoint,
@@ -18,6 +20,7 @@ from ._ext import (
     DeniedError,
     DiskFullError,
     DPoP,
+    Encoded,
     Encoding,
     Error,
     FormatError,
@@ -30,6 +33,7 @@ from ._ext import (
     Pipeline,
     StorageError,
     Store,
+    Tensors,
     UnknownSchemeError,
     UnsupportedError,
     __version__,
@@ -38,6 +42,8 @@ from ._ext import (
     regions,
 )
 from .api import ComponentWriter, Endpoint, Writer, configure, convert, export, hub_download, open, resolve_source, snapshot_download, upload_folder
+
+Mapping.register(Tensors)
 
 __all__ = [
     "Array",
@@ -50,6 +56,7 @@ __all__ = [
     "DeniedError",
     "DiskFullError",
     "DPoP",
+    "Encoded",
     "Endpoint",
     "Encoding",
     "Error",
@@ -63,6 +70,7 @@ __all__ = [
     "Pipeline",
     "StorageError",
     "Store",
+    "Tensors",
     "UnknownSchemeError",
     "UnsupportedError",
     "Writer",

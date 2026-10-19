@@ -9,6 +9,8 @@ mod readplan;
 #[cfg(feature = "store")]
 mod store;
 #[cfg(feature = "store")]
+mod tensors;
+#[cfg(feature = "store")]
 mod credentials;
 
 use pyo3::prelude::*;

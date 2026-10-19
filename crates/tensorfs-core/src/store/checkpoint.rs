@@ -284,26 +284,6 @@ impl Checkpoint {
         Ok(())
     }
 
-    /// A tensor's logical bytes into `buf`: a plain tensor's data, or its parts decoded.
-    pub fn read_into(&self, component: &str, key: &str, buf: &mut [u8]) -> Result<()> {
-        match &self.tensor(component, key)?.body {
-            Body::Data(at) => self.bytes_into(at, buf),
-            Body::Encoded { .. } => {
-                let bytes = self.read(component, key)?;
-                if bytes.len() != buf.len() {
-                    return Err(format::Error::Invalid(format!(
-                        "a {} byte buffer for {component}/{key}'s {} bytes",
-                        buf.len(),
-                        bytes.len()
-                    ))
-                    .into());
-                }
-                buf.copy_from_slice(&bytes);
-                Ok(())
-            }
-        }
-    }
-
     /// A tensor's logical bytes, in its dtype: encoded parts go through the reference decode.
     pub fn read(&self, component: &str, key: &str) -> Result<Vec<u8>> {
         let tensor = self.tensor(component, key)?;
