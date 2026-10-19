@@ -1,35 +1,20 @@
 # TensorFS
 
-TensorFS is a Rust and Python library for importing, storing, reading and exporting model weights.
-It includes the `tfs` command-line tool and implements **cozytensors**, a format that describes both
-ordinary tensors and quantized tensors, including the scales, packing and other data needed to decode them.
-It works without Cozy, a Tensorhub account or PyTorch.
+Model weights are large, and applications need to download, verify, store and read them. Different
+source layouts and quantized encodings complicate this: packed numbers need the right scales and
+decoding rules to become usable tensors. Keeping a separate copy of every checkpoint also wastes
+space when models or precision variants share unchanged weights.
 
-This README is the introduction and usage guide. The [cozytensors specification](spec/cozytensors.md)
-is the authoritative definition of the format, its encodings and its versioning rules.
+**TensorFS handles that path in one library.** It imports recognized sources into **cozytensors**,
+a format whose header describes each tensor's shape, dtype and encoding. It stores the bytes in
+immutable chunks named by their content, so checkpoints can share unchanged chunks. Pulls reuse
+objects already in the store, verify newly downloaded bytes and can fetch just the chunks needed
+by selected components. Readers use the declared encoding to reconstruct tensor values; exports
+reassemble ordinary safetensors files for other tools.
 
-## How it fits together
-
-A **checkpoint** is a model folder described by an immutable **manifest**. It contains configuration,
-tokenizer and other files, plus a `model.cozytensors` **header** when it has tensors. The header lists
-components such as `unet` or `text_encoder`, their tensors and the chunks holding their bytes.
-A tokenizer-only checkpoint can have no header.
-
-```text
-repo → release → lane → manifest
-                         ├─ model.cozytensors → tensor chunks
-                         └─ configs, tokenizer files, license, …
-```
-
-A **lane** selects one representation of a release, such as BF16, FP8 or INT8. Each has its own
-manifest. Every immutable object is named by its SHA-256 and length, so checkpoints can reuse
-identical objects without storing or transferring them again. A repo document holds the mutable
-release and lane pointers; changing a pointer leaves existing checkpoint bytes intact.
-
-The header distinguishes a tensor's logical dtype and shape from its stored parts. For example,
-`int8.convrot` declares its integer weights, scales and Hadamard rotation; decoding includes the
-inverse rotation. All required decode parameters are explicit. The specification defines the math,
-and its [conformance corpus](conformance/) supplies an independent reader and test vectors.
+Use TensorFS through its Rust API, Python library or `tfs` command-line tool. It works with local
+files, static origins and Tensorhub, without requiring Cozy, a Tensorhub account or PyTorch.
+The [cozytensors specification](spec/cozytensors.md) defines the format and exact decoding rules.
 
 ## Get started
 
@@ -65,6 +50,23 @@ print(info.dtype, info.shape, value.nbytes)
 frameworks and dtypes that support it. `checkpoint.file(path)` reads a companion file. Parsing
 header bytes with `tensorfs.Checkpoint.parse(data)` permits metadata inspection without a Store;
 reading tensors also requires their chunks.
+
+## How checkpoints fit together
+
+A **checkpoint** is a model folder described by an immutable **manifest**. It contains configuration,
+tokenizer and other files, plus a `model.cozytensors` **header** when it has tensors. The header lists
+components such as `unet` or `text_encoder`, their tensors and the chunks holding their bytes.
+A tokenizer-only checkpoint can have no header.
+
+```text
+repo → release → lane → manifest
+                         ├─ model.cozytensors → tensor chunks
+                         └─ configs, tokenizer files, license, …
+```
+
+A **lane** selects one representation of a release, such as BF16, FP8 or INT8. Each has its own
+manifest. Every immutable object is named by its SHA-256 and length. A repo document holds the mutable
+release and lane pointers; changing a pointer leaves existing checkpoint bytes intact.
 
 ## Import and share
 
