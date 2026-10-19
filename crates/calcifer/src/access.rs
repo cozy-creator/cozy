@@ -6,9 +6,12 @@
 //! endpoint at its first private operation. The machine's spec digest leaves the capability out,
 //! so a resend with a fresh one names the same run. Signed out, a public run reads at its Hub's
 //! origin.
+//! Ordinary TensorFS access uses this computer's existing user Bearer at send time; it is never
+//! added to the stored submission.
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hub_client::{Credential, DeviceKey, RunCapability};
 use protocol::{
     calcifer::Reason,
     config::{self, Origin},
@@ -16,7 +19,6 @@ use protocol::{
     ids::RunId,
     machine as v1,
 };
-use hub_client::{DeviceKey, RunCapability};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -35,6 +37,7 @@ const CAPABILITY_LIFE: Duration = Duration::from_secs(24 * 3600);
 pub(crate) struct Access {
     pub hub: Option<v1::HubAccess>,
     pub providers: Option<v1::ProviderAccess>,
+    pub tensorfs: Option<v1::TensorFSOptions>,
     /// The account local code's org-relative references name: this computer's at the run's Hub.
     pub owner: Option<String>,
 }
@@ -79,6 +82,7 @@ impl Machines {
             return Ok(Access {
                 hub: None,
                 providers,
+                tensorfs: None,
                 owner: None,
             });
         };
@@ -88,6 +92,7 @@ impl Machines {
             true => operations(&facts.account, spec),
             false => vec![],
         };
+        let ordinary = ordinary_tensorfs_needed(spec, &operations);
         let mut hub = v1::HubAccess {
             origin: facts.reads.clone(),
             object_hosts: facts.object_hosts.clone(),
@@ -96,11 +101,16 @@ impl Machines {
         };
         if !operations.is_empty() {
             hub.capability = (self.capability(run, origin, machine, &facts, operations)).await?;
-            hub.token_endpoint = facts.token_endpoint;
+            hub.token_endpoint = facts.token_endpoint.clone();
         }
+        let tensorfs = match ordinary {
+            true => Some(self.hubs.ordinary_tensorfs(origin, &facts).await?),
+            false => None,
+        };
         Ok(Access {
             hub: Some(hub),
             providers,
+            tensorfs,
             owner: Some(facts.account.clone()),
         })
     }
@@ -175,6 +185,28 @@ impl Machines {
 }
 
 impl Hubs {
+    /// Uses the normal cached user session. The key stays on this computer; only its ordinary
+    /// Bearer and the Hub's existing machine-reachable endpoint/CA travel with this send.
+    async fn ordinary_tensorfs(
+        &self,
+        origin: &Origin,
+        facts: &Facts,
+    ) -> Result<v1::TensorFSOptions, Denied> {
+        let client = self.client(origin).map_err(|_| needs_sign_in(origin))?;
+        let Credential::User(session) = client.credential() else {
+            return Err(needs_sign_in(origin));
+        };
+        let token = session
+            .bearer(&client.anonymous())
+            .await
+            .map_err(|error| hub_denied(origin, error))?;
+        Ok(v1::TensorFSOptions {
+            endpoint: facts.reads.clone(),
+            token,
+            ca_der: facts.ca_der.clone(),
+        })
+    }
+
     /// This computer's account at `origin`, where machines read it, and where they trade a
     /// capability: read once, then kept for the life of this Calcifer.
     pub(crate) async fn facts(&self, origin: &Origin) -> Result<Facts, Denied> {
@@ -182,16 +214,7 @@ impl Hubs {
             return Ok(facts.clone());
         }
         let client = self.client(origin).map_err(|_| needs_sign_in(origin))?;
-        let hub = |e: hub_client::Error| match &e {
-            hub_client::Error::Hub { status, .. } if *status < 500 => {
-                let error = hub_refusal(origin, e);
-                Denied::Refused(Reason {
-                    code: error.cause.unwrap_or(error.code),
-                    message: error.message,
-                })
-            }
-            _ => unreachable(hub_refusal(origin, e).message),
-        };
+        let hub = |error| hub_denied(origin, error);
         let account = client
             .get_current_account()
             .await
@@ -277,6 +300,25 @@ impl Hubs {
             Ok(origin) => self.configured(&origin).unwrap_or(origin).into(),
             Err(_) => hub.to_owned(),
         }
+    }
+}
+
+/// The existing private-read/write decision also decides whether ordinary TensorFS needs this
+/// Hub's owner credential. Explicit caller options remain authoritative.
+fn ordinary_tensorfs_needed(spec: &v1::RunSpec, operations: &[Value]) -> bool {
+    spec.tensorfs.is_none() && !operations.is_empty()
+}
+
+fn hub_denied(origin: &Origin, error: hub_client::Error) -> Denied {
+    match &error {
+        hub_client::Error::Hub { status, .. } if *status < 500 => {
+            let error = hub_refusal(origin, error);
+            Denied::Refused(Reason {
+                code: error.cause.unwrap_or(error.code),
+                message: error.message,
+            })
+        }
+        _ => unreachable(hub_refusal(origin, error).message),
     }
 }
 
@@ -406,6 +448,206 @@ mod tests {
         assert!(
             !private(&public),
             "a release and a local destination are public"
+        );
+    }
+
+    #[test]
+    fn ordinary_tensorfs_uses_existing_private_reads_and_writes_without_overriding_options() {
+        let needs = |spec: &v1::RunSpec| ordinary_tensorfs_needed(spec, &operations("owner", spec));
+        let mut read = v1::RunSpec {
+            models: vec![choice("owner/private", "", "sha256:tree")],
+            ..Default::default()
+        };
+        assert!(needs(&read));
+        read.models = vec![choice("public/base", "1", "")];
+        read.models[0].adapters.push(v1::Adapter {
+            model: "owner/adapter".into(),
+            manifest: "sha256:adapter".into(),
+            ..Default::default()
+        });
+        assert!(needs(&read));
+        let mut write = v1::RunSpec {
+            weights_destination: "owner/output".into(),
+            ..Default::default()
+        };
+        assert!(needs(&write));
+        write.tensorfs = Some(v1::TensorFSOptions {
+            endpoint: "https://explicit.example.test".into(),
+            ..Default::default()
+        });
+        assert!(
+            !needs(&write),
+            "an explicit endpoint must not receive this Hub's credential"
+        );
+        let public = v1::RunSpec {
+            models: vec![
+                choice("public/base", "1", ""),
+                choice("other/digest", "", "sha256:public"),
+            ],
+            weights_destination: "local/derived".into(),
+            ..Default::default()
+        };
+        assert!(!needs(&public));
+        assert!(
+            !needs(&v1::RunSpec::default()),
+            "local Writer calls need no Hub sign-in"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_bearer_is_added_only_to_the_outbound_spec_after_restart() {
+        use crate::{Calcifer, store::NewRun};
+        use platform::paths::Home;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = Home::at(temp.path());
+        let origin = Origin::parse("https://configured.example.test").unwrap();
+        let hub = config::Hub {
+            name: None,
+            origin: origin.clone(),
+        };
+        platform::durable::private_dir(&home.keys()).unwrap();
+        // A synthetic test sign-in, never a real user's key. The normal session must use its
+        // live cached Bearer, so no network or alternate credential mechanism is involved.
+        let key = serde_json::to_vec(&json!({
+            "version": 1, "hub": origin.as_str(), "email": "test@example.test",
+            "device_key_id": "ordinary-test-device", "private_key": URL_SAFE_NO_PAD.encode([17u8; 32])
+        }))
+        .unwrap();
+        platform::durable::replace(&hub.device_key(&home), &key, 0o600).unwrap();
+        let keep = |token: &str| {
+            let bearer = hub_client::Bearer {
+                token: token.into(),
+                expires: u64::MAX,
+                device_key_id: "ordinary-test-device".into(),
+            };
+            platform::durable::replace(
+                &hub.bearer(&home),
+                &serde_json::to_vec(&bearer).unwrap(),
+                0o600,
+            )
+            .unwrap();
+        };
+        let facts = Facts {
+            account: "owner".into(),
+            user_id: "owner-id".into(),
+            reads: "https://machine-reachable.example.test".into(),
+            public: origin.to_string(),
+            names: vec![],
+            object_hosts: vec![],
+            ca_der: vec![1, 2, 3],
+            token_endpoint: String::new(),
+        };
+        let hubs = Hubs::new(&home, vec![hub.clone()]);
+        let calcifer_home = temp.path().join("calcifer");
+        let calcifer = Calcifer::open(&calcifer_home, &temp.path().join("outputs")).unwrap();
+        let id = RunId::mint([19; 12]);
+        let (row, _) = calcifer
+            .store()
+            .submit(
+                "ordinary",
+                "submission-digest",
+                NewRun {
+                    id: id.clone(),
+                    kind: protocol::calcifer::Kind::Call,
+                    target: "ordinary/writer".into(),
+                    hub: Some(origin.clone()),
+                    machine: None,
+                    pinned: false,
+                    spec: v1::RunSpec {
+                        weights_destination: "owner/output".into(),
+                        ..Default::default()
+                    },
+                    out_dir: temp.path().join("outputs"),
+                    warnings: vec![],
+                    inputs: vec![],
+                    wants: None,
+                },
+            )
+            .unwrap();
+        keep("ordinary-cache-first");
+        let first = match hubs.ordinary_tensorfs(&origin, &facts).await {
+            Ok(value) => value,
+            Err(_) => panic!("the normal cached user sign-in was not used"),
+        };
+        assert_eq!(first.endpoint, facts.reads);
+        assert_eq!(first.ca_der, facts.ca_der);
+        assert_eq!(first.token, "ordinary-cache-first");
+        let mut sent = row.spec.clone();
+        calcifer.finish_spec(
+            &row,
+            &mut sent,
+            Access {
+                tensorfs: Some(first),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            sent.tensorfs.as_ref().unwrap().token,
+            "ordinary-cache-first"
+        );
+        assert!(!format!("{sent:?}").contains("ordinary-cache-first"));
+        assert!(
+            calcifer
+                .store()
+                .run(id.as_str())
+                .unwrap()
+                .unwrap()
+                .spec
+                .tensorfs
+                .is_none()
+        );
+        drop(calcifer);
+
+        let calcifer = Calcifer::open(&calcifer_home, &temp.path().join("outputs")).unwrap();
+        let replay = calcifer.store().run(id.as_str()).unwrap().unwrap();
+        assert!(replay.spec.tensorfs.is_none());
+        keep("ordinary-cache-replacement");
+        let next = match hubs.ordinary_tensorfs(&origin, &facts).await {
+            Ok(value) => value,
+            Err(_) => panic!("the replacement normal cached sign-in was not used"),
+        };
+        let mut resent = replay.spec.clone();
+        calcifer.finish_spec(
+            &replay,
+            &mut resent,
+            Access {
+                tensorfs: Some(next.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(resent.tensorfs.unwrap().token, "ordinary-cache-replacement");
+        let explicit = v1::TensorFSOptions {
+            endpoint: "https://explicit.example.test".into(),
+            ca_der: vec![4, 5],
+            ..Default::default()
+        };
+        let mut custom = replay.spec.clone();
+        custom.tensorfs = Some(explicit.clone());
+        calcifer.finish_spec(
+            &replay,
+            &mut custom,
+            Access {
+                tensorfs: Some(next),
+                ..Default::default()
+            },
+        );
+        assert_eq!(custom.tensorfs, Some(explicit));
+        drop(calcifer);
+        let db = rusqlite::Connection::open(calcifer_home.join("state.db")).unwrap();
+        let persisted: Vec<u8> = db
+            .query_row("SELECT spec FROM runs WHERE id = ?1", [id.as_str()], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let persisted = String::from_utf8(persisted).unwrap();
+        assert!(!persisted.contains("ordinary-cache-"));
+        assert!(!persisted.contains("private_key"));
+        assert!(
+            serde_json::from_str::<v1::RunSpec>(&persisted)
+                .unwrap()
+                .tensorfs
+                .is_none()
         );
     }
 }

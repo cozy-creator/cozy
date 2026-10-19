@@ -127,6 +127,69 @@ fn loaded(home: &Path) -> Loaded {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_submission_refuses_an_explicit_tensorfs_token_before_persistence() {
+    let home = tempfile::tempdir().unwrap();
+    let calcifer = Calcifer::start(home.path()).await;
+    let secret = "ordinary-token-must-not-enter-calcifer-history";
+    let body = json!({
+        "on": "any", "hub": "", "kind": "call", "target": "privacy",
+        "spec": {"tensorfs": {"endpoint": "https://explicit.example.test", "token": secret}}
+    });
+    let response = calcifer
+        .request(Method::POST, "/v1/runs")
+        .header("idempotency-key", "secret")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = response.text().await.unwrap();
+    assert!(!error.contains(secret));
+    assert_eq!(
+        serde_json::from_str::<Envelope>(&error).unwrap().error.code,
+        "run_invalid"
+    );
+    let listed: RunList = calcifer
+        .request(Method::GET, "/v1/runs")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(listed.runs.is_empty());
+    let mut without_token = body;
+    without_token["spec"]["tensorfs"]["token"] = json!("");
+    let (status, accepted) = calcifer.submit("endpoint-only", without_token).await;
+    assert_eq!(status, StatusCode::CREATED);
+    calcifer.down().await;
+    assert_eq!(calcifer.stopped().await, Stopped::Down);
+    let store = Store::open(&Home::at(home.path()).calcifer_db()).unwrap();
+    let row = store.run(accepted.run.id.as_str()).unwrap().unwrap();
+    assert_eq!(
+        row.spec.tensorfs.unwrap().endpoint,
+        "https://explicit.example.test"
+    );
+    let db = Home::at(home.path()).calcifer_db();
+    for entry in std::fs::read_dir(db.parent().unwrap()).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("state.db")
+        {
+            assert!(
+                !std::fs::read(path)
+                    .unwrap()
+                    .windows(secret.len())
+                    .any(|bytes| bytes == secret.as_bytes())
+            );
+        }
+    }
+}
+
 /// The lock record, once `wanted` accepts it.
 async fn record(home: &Home, wanted: impl Fn(&Holder) -> bool) -> Holder {
     let lock = LockFile::new(home.calcifer_lock());
