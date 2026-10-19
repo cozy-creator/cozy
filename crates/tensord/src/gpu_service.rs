@@ -1327,6 +1327,13 @@ impl Pool {
             let facts = plane_facts(reply.plane.as_ref());
             self.observe(&plan.construction, 0, 1, &session.executor.birth, facts, &reply.rank_planes, Some(complete));
         }
+        if let Err(error) = reply {
+            let births = executor_births(&session.executor.birth, &session.followers);
+            let error = ended_with(engine, "", error, session.executor);
+            await_executor_exit(engine, &births);
+            self.retire_returned(&plan.construction, 0, 1, &births);
+            return Err(error);
+        }
         self.keep_idle(engine, session)?;
         let reply = reply?;
         if !reply.ok {
@@ -1555,7 +1562,7 @@ impl Pool {
         let mut failed = vec![];
         for (name, session) in self.sessions.lock().unwrap().iter_mut() {
             if let Err(error) = release_revoked(custody, &mut session.executor) {
-                failed.push((name.clone(), error));
+                failed.push((name.clone(), session.executor.birth.clone(), error));
             }
         }
         self.end_failed(failed);
@@ -1564,9 +1571,15 @@ impl Pool {
     }
     /// Idle executors whose channel failed end, and what they held (context, leases) with them:
     /// another tenant's failure is never the asking call's.
-    fn end_failed(&self, failed: Vec<(String, io::Error)>) {
-        for (key, error) in failed {
-            let Some(session) = self.sessions.lock().unwrap().remove(&key) else { continue };
+    fn end_failed(&self, failed: Vec<(String, Birth, io::Error)>) {
+        for (key, birth, error) in failed {
+            let session = {
+                let mut sessions = self.sessions.lock().unwrap();
+                if !sessions.get(&key).is_some_and(|session| owns_birth(&session.executor.birth, &[], &birth)) {
+                    continue;
+                }
+                sessions.remove(&key).unwrap()
+            };
             tracing::warn!("memory: idle executor {key} failed ({error}); ending it");
             let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
             if let Err(error) = session.executor.terminate() {
@@ -2816,7 +2829,7 @@ impl Pool {
                             tracing::warn!("trim of {} refused: {} {}", id, reply.code, reply.detail);
                             return Ok(false);
                         }
-                        Err(error) => failed.push((key.clone(), error)),
+                        Err(error) => failed.push((key.clone(), session.executor.birth.clone(), error)),
                     }
                 }
                 // A reader whose channel failed ends, and its mapping with it.
