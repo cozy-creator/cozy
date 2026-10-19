@@ -45,8 +45,8 @@ fn import(case: &str, store: &Path) -> tensorfs_core::err::Result<Checkpoint> {
         progress: &|_, _, _| {},
         stop: None,
     };
-    let manifest = store.import(&req, None)?;
-    Ok(store.checkpoint(&manifest).unwrap())
+    let (header, _) = store.import(&req, None)?;
+    Ok(store.checkpoint(&header).unwrap())
 }
 
 fn values(bf16: &[u8]) -> Vec<f64> {

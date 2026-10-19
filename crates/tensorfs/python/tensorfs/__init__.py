@@ -1,71 +1,87 @@
-"""TensorFS: cozytensors/1 checkpoints in a content-addressed store (design §1).
+"""TensorFS: self-contained model variants, read and written by component.
 
-    store = tensorfs.Store("~/.tensorfs")                # created when absent
-    m = store.import_("hf://hf-internal-testing/tiny-sdxl-pipe")
-    m = store.pull("acme/sdxl@1.0", lane="int8")  # from tensorhub.com
-    ck = store.checkpoint(m)
-    ck.tensors["unet"]["conv_in.weight"]                 # Info(dtype, shape, encoding, parts)
-    torch.from_dlpack(ck.read("unet", "conv_in.weight")) # encoded tensors decode
-    store.export(m, "out/")                              # a Diffusers/Transformers folder
+    ck = tensorfs.open("acme/sdxl", revision="1.0", variant="int8")
+    unet = ck.components["unet"]
+    tensors = unet.tensors.read_all(device="cpu")
+    tokenizer_path = ck.components["tokenizer"].path
 
-Compiled in `tensorfs._ext`, typed in `_ext.pyi`; the weight plane is `tensorfs.varena`;
-`parse_header` projects a CBOR header (`tensorfs.errors` refusals). TensorFS never imports torch.
+Arrays cross to NumPy, PyTorch, JAX or CuPy through DLPack. TensorFS never imports a framework.
 """
 
-from . import errors
+from collections.abc import Mapping
+
 from ._ext import (
     Array,
     Checkpoint,
     Closure,
+    Component,
+    ConflictError,
     DecodeError,
     DeniedError,
     DiskFullError,
+    DPoP,
+    Encoded,
     Encoding,
     Error,
     FormatError,
     Info,
     IntegrityError,
     InvalidError,
-    Manifest,
     NetworkError,
     NotFoundError,
     Part,
+    Pipeline,
     StorageError,
-    Store,
+    Tensors,
     UnknownSchemeError,
     UnsupportedError,
-    Writer,
     __version__,
     parse_header,
     plan,
     regions,
 )
+from .api import ComponentWriter, Endpoint, Writer, configure, convert, export, hub_download, open, resolve_source, snapshot_download, upload_folder
+
+Mapping.register(Tensors)
 
 __all__ = [
     "Array",
     "Checkpoint",
     "Closure",
+    "Component",
+    "ConflictError",
+    "ComponentWriter",
     "DecodeError",
     "DeniedError",
     "DiskFullError",
+    "DPoP",
+    "Encoded",
+    "Endpoint",
     "Encoding",
     "Error",
     "FormatError",
     "Info",
     "IntegrityError",
     "InvalidError",
-    "Manifest",
     "NetworkError",
     "NotFoundError",
     "Part",
+    "Pipeline",
     "StorageError",
-    "Store",
+    "Tensors",
     "UnknownSchemeError",
     "UnsupportedError",
     "Writer",
     "__version__",
-    "errors",
     "parse_header",
     "plan",
     "regions",
+    "configure",
+    "convert",
+    "export",
+    "hub_download",
+    "resolve_source",
+    "open",
+    "snapshot_download",
+    "upload_folder",
 ]

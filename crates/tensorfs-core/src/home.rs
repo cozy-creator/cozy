@@ -4,7 +4,7 @@
 //! and never consults another product's home or configuration.
 //!
 //! A root the operator NAMED — a positional argument or `TENSORFS_HOME` — is a place they asked
-//! for. `$HOME/.tensorfs` is a guess, so it is only ever OPENED: no command conjures a Store
+//! for. `$HOME/.cache/tensorfs` is a guess, so it is only ever OPENED: no command conjures a Store
 //! there, and nothing creates a Store in whatever directory a process happens to be run from
 //! (tfs-053). Creation stays with the verbs that say so, `tfs store init` and `tfs store ensure`,
 //! over a root that was named.
@@ -24,7 +24,7 @@ enum Origin {
 
 /// Resolve an optional caller-supplied Store root.
 ///
-/// Precedence is explicit argument, `TENSORFS_HOME`, then `$HOME/.tensorfs`. This answers WHERE
+/// Precedence is explicit argument, `TENSORFS_HOME`, then `$HOME/.cache/tensorfs`. This answers WHERE
 /// a Store would live; it neither requires nor creates one. `tfs home` prints exactly this.
 pub fn resolve(explicit: Option<&Path>) -> Result<PathBuf> {
     Ok(resolve_env(explicit)?.0)
@@ -33,7 +33,7 @@ pub fn resolve(explicit: Option<&Path>) -> Result<PathBuf> {
 /// The Store root of a command that needs a Store.
 ///
 /// A named root — argument or `TENSORFS_HOME` — is used as given, and `tfs store init`/`ensure`
-/// may bring it into existence. The `$HOME/.tensorfs` fallback is accepted only for a Store that
+/// may bring it into existence. The `$HOME/.cache/tensorfs` fallback is accepted only for a Store that
 /// ALREADY exists: with nothing named and nothing there, every command refuses instead of
 /// materializing a database nobody asked for.
 pub fn store_root(explicit: Option<&Path>) -> Result<PathBuf> {
@@ -72,7 +72,7 @@ fn resolve_values(
     }
     match user_home {
         Some(root) if !root.as_os_str().is_empty() => {
-            Ok((root.join(".tensorfs"), Origin::Fallback))
+            Ok((root.join(".cache").join("tensorfs"), Origin::Fallback))
         }
         _ => refuse(
             Code::IO_FAILED,
@@ -114,7 +114,7 @@ mod tests {
         );
         assert_eq!(
             resolve_values(None, None, Some(Path::new("/user"))).unwrap(),
-            (PathBuf::from("/user/.tensorfs"), Origin::Fallback),
+            (PathBuf::from("/user/.cache/tensorfs"), Origin::Fallback),
         );
     }
 
