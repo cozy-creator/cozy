@@ -81,7 +81,7 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
                 call_interfaces: vec![],
                 constructions: Vec::new(),
                 ledgers: 0,
-                memory_mode: "shared",
+                memory_mode: tensord::device_executor::MemoryMode::Shared,
             },
             &mut Baseline,
         )

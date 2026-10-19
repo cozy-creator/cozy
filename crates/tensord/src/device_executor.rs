@@ -164,9 +164,7 @@ pub enum DeviceCommand {
         /// row in the first and hands follower r the r-th (design memory-varena §5.5).
         #[serde(skip_serializing_if = "is_zero")]
         ledgers: u32,
-        /// `shared` (a local machine: leave the display its floor, give memory back) or
-        /// `dedicated` (a rented pod).
-        memory_mode: &'static str,
+        memory_mode: MemoryMode,
     },
     Load {
         construction: String,
@@ -1986,9 +1984,48 @@ fn scan(value: &Value) -> io::Result<()> {
     Ok(())
 }
 
+/// How the machine shares its GPUs, which Start tells every executor, an import-only one too:
+/// `shared` (a local machine: leave the display its floor, give memory back) or `dedicated`
+/// (a rented pod).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryMode {
+    Shared,
+    Dedicated,
+}
+
+impl From<cozy_platform::contain::host_pressure::HostMode> for MemoryMode {
+    fn from(mode: cozy_platform::contain::host_pressure::HostMode) -> Self {
+        match mode {
+            cozy_platform::contain::host_pressure::HostMode::Shared => Self::Shared,
+            cozy_platform::contain::host_pressure::HostMode::Dedicated => Self::Dedicated,
+        }
+    }
+}
+
 #[cfg(test)]
 mod codec_tests {
     use super::*;
+
+    /// Every Start names one of the Runtime's two modes: an empty one turned prespawn off on
+    /// every machine (the import-only start was refused, `$.memory_mode`).
+    #[test]
+    fn a_start_names_the_machines_memory_mode() {
+        for (mode, wire) in [(MemoryMode::Shared, "shared"), (MemoryMode::Dedicated, "dedicated")] {
+            let start = DeviceCommand::Start {
+                devices: String::new(),
+                application: "app:app".into(),
+                package_interface: "interface.json".into(),
+                sequence_parallel_degree: 1,
+                import_only: true,
+                call_interfaces: vec![],
+                constructions: vec![],
+                ledgers: 0,
+                memory_mode: mode,
+            };
+            assert_eq!(serde_json::to_value(&start).unwrap()["memory_mode"], wire);
+        }
+    }
 
     /// An invoke reply's adjustment rows are advisory: each malformed one is skipped and the
     /// reply, the run and the other rows stand, in the executor's order, each text bounded.
