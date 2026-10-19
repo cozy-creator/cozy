@@ -1364,8 +1364,11 @@ def _sites(module: nn.Module) -> dict[str, list[_Site]]:
 
 
 def _install(model: Model) -> None:
-    """Every meta weight becomes a placeholder on the execution device, owned by its block."""
+    """Every meta weight becomes a placeholder on the execution device, owned by the block
+    whose regions hold its bytes (a small block's tensors can sit in common), else by its
+    module's block."""
     by_path = {b.path: b for b in model.blocks}
+    owner = {key: b for b in (model.common, *model.blocks) for key in b.tensors}
     done: set[int] = set()
     for name, group in model.sites.items():
         meta = group[0].table[group[0].attr]
@@ -1373,7 +1376,7 @@ def _install(model: Model) -> None:
             continue
         done.add(id(meta))
         path = _block_of(name, list(by_path))
-        block = model.common if path is None else by_path[path]
+        block = owner.get(name) or (model.common if path is None else by_path[path])
         held: Tensor = Placeholder(meta.shape, meta.dtype, model.device, block, group[0])
         if group[0].parameter:
             held = nn.Parameter(held, requires_grad=False)
@@ -1398,11 +1401,18 @@ def _hook(block: Block) -> None:
     forward = block.forward = module.forward
 
     def bound(*args: object, **kwargs: object) -> object:
-        memory._enter(block, call=(args, kwargs))
+        loose = not block.model.aloft  # run outside its model's forward: common binds with it
+        if loose:
+            memory._enter(block.model.common, record=False)
         try:
-            return cuts.run(site, forward, args, kwargs)
+            memory._enter(block, call=(args, kwargs))
+            try:
+                return cuts.run(site, forward, args, kwargs)
+            finally:
+                memory._exit(block)
         finally:
-            memory._exit(block)
+            if loose:
+                memory._exit(block.model.common)
 
     module.forward = bound  # type: ignore[method-assign]
 

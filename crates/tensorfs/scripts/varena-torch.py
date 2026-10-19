@@ -172,6 +172,13 @@ def main() -> int:
         "the block is a placeholder again after the op",
         isinstance(net.blocks[3].lin.weight, Placeholder),
     )
+    with torch.no_grad():  # its norm's bytes sit in common: a small tensor shares a pack
+        alone = net.blocks[3](x)
+    check(
+        "a block run outside its model's forward binds common too",
+        torch.equal(alone, ref.blocks[3](x)),
+    )
+    del alone
 
     # out of memory inside its forward: the watermark falls, then rises after the request
     total = sum(b.nbytes for b in model.blocks)
