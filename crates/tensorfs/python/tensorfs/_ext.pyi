@@ -1,9 +1,9 @@
 """`tensorfs._ext`, checked against the built extension by `scripts/stub_conform.py`."""
 
-from collections.abc import Buffer, Mapping, Sequence
+from collections.abc import Buffer, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
 from os import PathLike
 from types import ModuleType
-from typing import Any
+from typing import Any, TypeVar
 
 from .records import Header as HeaderRecord
 from .records import ReadItem
@@ -18,6 +18,7 @@ varena: ModuleType
 StrPath = str | PathLike[str]
 #: `org/name[@release]`, `sha256:<hex>` of a tree or a header, or a stored `Checkpoint`.
 Ref = str | Checkpoint
+_T = TypeVar("_T")
 
 class Error(Exception):
     """A TensorFS error. `.code` names its family; `.detail` the cause."""
@@ -113,6 +114,34 @@ class Array:
     ) -> object: ...
     def __dlpack_device__(self) -> tuple[int, int]: ...
 
+class Encoded:
+    """A tensor's stored scheme, params and raw part arrays (`decode=False`)."""
+
+    @property
+    def scheme(self) -> str: ...
+    @property
+    def params(self) -> dict[str, Any]: ...
+    @property
+    def parts(self) -> dict[str, Array]: ...
+
+class Tensors(Mapping[str, Info]):
+    """Tensor metadata in construction order, with engine-backed host reads."""
+
+    def __len__(self) -> int: ...
+    def __iter__(self) -> Iterator[str]: ...
+    def __getitem__(self, key: str) -> Info: ...
+    def __contains__(self, key: object) -> bool: ...
+    def keys(self) -> KeysView[str]: ...
+    def values(self) -> ValuesView[Info]: ...
+    def items(self) -> ItemsView[str, Info]: ...
+    def get(self, key: str, default: _T | None = None) -> Info | _T | None: ...
+    def read(self, key: str, *, decode: bool = True) -> Array | Encoded: ...
+    def read_all(
+        self, keys: Sequence[str] | None = None, *, device: str = "cpu", decode: bool = True
+    ) -> dict[str, Array | Encoded]: ...
+    def read_into(self, key: str, out: Buffer, *, role: str | None = None, offset: int = 0) -> None:
+        """Fill `out.nbytes` from byte `offset`; a role selects stored part bytes."""
+
 class Pipeline:
     """What `model_index.json` held."""
 
@@ -136,7 +165,7 @@ class Component:
     def config_file(self) -> str | None:
         """The config's file name when it isn't `config.json`."""
     @property
-    def tensors(self) -> dict[str, Info]:
+    def tensors(self) -> Tensors:
         """`key -> Info`, in construction order."""
     @property
     def assets(self) -> dict[str, tuple[str, int]]:

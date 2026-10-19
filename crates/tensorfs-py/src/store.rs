@@ -18,6 +18,8 @@ use tensorfs_core::format::{Body, Config, ConfigValue, Dtype, Encoding, Header, 
 use tensorfs_core::store2::{Checkpoint, Store};
 use tensorfs_core::writer::{Data, PartData, Source, Writer};
 
+use crate::tensors::{PyEncoded, PyTensors};
+
 create_exception!(
     tensorfs,
     Error,
@@ -53,7 +55,7 @@ fn family(py: Python<'_>, kind: Kind) -> Bound<'_, pyo3::types::PyType> {
 }
 
 /// The one conversion: a failure becomes its family's exception, with `.code` and `.detail`.
-fn raise(py: Python<'_>, f: Failure) -> PyErr {
+pub(crate) fn raise(py: Python<'_>, f: Failure) -> PyErr {
     let err = PyErr::from_type(family(py, f.kind), f.to_string());
     let value = err.value(py);
     let _ = value.setattr("code", f.kind.code());
@@ -61,7 +63,7 @@ fn raise(py: Python<'_>, f: Failure) -> PyErr {
     err
 }
 
-fn invalid(py: Python<'_>, detail: impl Into<String>) -> PyErr {
+pub(crate) fn invalid(py: Python<'_>, detail: impl Into<String>) -> PyErr {
     raise(
         py,
         Failure {
@@ -71,7 +73,7 @@ fn invalid(py: Python<'_>, detail: impl Into<String>) -> PyErr {
     )
 }
 
-trait OrRaise<T> {
+pub(crate) trait OrRaise<T> {
     fn or_raise(self, py: Python<'_>) -> PyResult<T>;
 }
 
@@ -103,7 +105,7 @@ fn to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
     })
 }
 
-fn metadata<'py>(py: Python<'py>, map: &Metadata) -> PyResult<Bound<'py, PyDict>> {
+pub(crate) fn metadata<'py>(py: Python<'py>, map: &Metadata) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     for (k, v) in map {
         dict.set_item(k, to_py(py, v)?)?;
@@ -465,9 +467,9 @@ pub struct PyComponent {
     /// The config's file name when it isn't `config.json`.
     #[pyo3(get)]
     config_file: Option<String>,
-    /// `key -> Info`, in construction order.
+    /// `key -> Info`, in construction order; reads go through the engine.
     #[pyo3(get)]
-    tensors: Py<PyDict>,
+    tensors: Py<PyTensors>,
     /// `name -> (sha256, length)`: run data in the component's folder.
     #[pyo3(get)]
     assets: Py<PyDict>,
@@ -662,7 +664,7 @@ impl PyCheckpoint {
                 cls: c.class.clone(),
                 config: config_dict(py, &c.config)?.unbind(),
                 config_file: c.config_file.clone(),
-                tensors: this.tensor_dict(py, c)?,
+                tensors: Py::new(py, PyTensors::new(&c.name, this.tensor_dict(py, c)?, this.stored.is_some().then(|| slf.clone().unbind())))?,
                 assets: assets.unbind(),
                 ck: this.stored.is_some().then(|| slf.clone().unbind()),
             };
@@ -757,26 +759,35 @@ fn regions(ck: &PyCheckpoint, max_bytes: u64, boundaries: Option<Vec<String>>, o
 
 // ---------------------------------------------------------------- arrays
 
-/// Bytes aligned for every dtype (8).
-struct Aligned {
+/// Bytes on a page boundary: aligned for every dtype, and an O_DIRECT read lands in place.
+/// Zeroed lazily by the allocator (calloc), so a large one costs no pass over its pages.
+pub(crate) struct Aligned {
     words: Vec<u64>,
-    len: usize,
+    at: usize,
+    pub(crate) len: usize,
 }
 
+const PAGE: usize = 4096;
+
 impl Aligned {
-    fn new(len: usize) -> Aligned {
-        Aligned {
-            words: vec![0; len.div_ceil(8)],
-            len,
-        }
+    pub(crate) fn new(len: usize) -> Aligned {
+        let words = vec![0u64; (len + PAGE).div_ceil(8)];
+        let at = (PAGE - words.as_ptr() as usize % PAGE) % PAGE;
+        Aligned { words, at, len }
     }
-    fn bytes(&self) -> &[u8] {
-        // SAFETY: `words` holds at least `len` initialized bytes; u8 has no alignment.
-        unsafe { std::slice::from_raw_parts(self.words.as_ptr() as *const u8, self.len) }
+    fn ptr(&self) -> *const u8 {
+        (self.words.as_ptr() as *const u8).wrapping_add(self.at)
     }
-    fn bytes_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+        (self.words.as_mut_ptr() as *mut u8).wrapping_add(self.at)
+    }
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: `words` holds `at + len` initialized bytes; u8 has no alignment.
+        unsafe { std::slice::from_raw_parts(self.ptr(), self.len) }
+    }
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: as above, and `self` is borrowed mutably.
-        unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len) }
     }
 }
 
@@ -784,9 +795,9 @@ impl Aligned {
 /// without a copy; an unknown dtype reads (`tobytes`) but has no DLPack type.
 #[pyclass(name = "Array", module = "tensorfs", frozen)]
 pub struct PyArray {
-    buf: Arc<Aligned>,
-    dtype: Dtype,
-    shape: Vec<u64>,
+    pub(crate) buf: Arc<Aligned>,
+    pub(crate) dtype: Dtype,
+    pub(crate) shape: Vec<u64>,
 }
 
 const KDL_CPU: i32 = 1;
@@ -932,7 +943,7 @@ impl PyArray {
         // SAFETY: `held` is live until the deleter runs; the consumer may write its own copy.
         let t = Box::into_raw(Box::new(DLManagedTensor {
             dl_tensor: DLTensor {
-                data: self.buf.words.as_ptr() as *mut c_void,
+                data: self.buf.ptr() as *mut c_void,
                 device: DLDevice {
                     device_type: KDL_CPU,
                     device_id: 0,
@@ -1183,6 +1194,8 @@ pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEncoding>()?;
     m.add_class::<PyPart>()?;
     m.add_class::<PyArray>()?;
+    m.add_class::<PyTensors>()?;
+    m.add_class::<PyEncoded>()?;
     m.add_class::<PyWriter>()?;
     m.add_function(wrap_pyfunction!(regions, m)?)?;
     m.add("Error", py.get_type::<Error>())?;

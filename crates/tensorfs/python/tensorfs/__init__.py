@@ -4,12 +4,14 @@
     ck = store.import_("hf://hf-internal-testing/tiny-sdxl-pipe")
     ck = store.pull("acme/sdxl@1.0", variant="int8")     # from tensorhub.com
     unet = ck.components["unet"]                         # .cls, .config, .tensors, .assets
-    torch.from_dlpack(ck.read("unet", "conv_in.weight")) # encoded tensors decode
+    torch.from_dlpack(unet.tensors.read("conv_in.weight")) # encoded tensors decode
     store.export(ck, "out/")                             # a Diffusers/Transformers folder
 
 Compiled in `tensorfs._ext`, typed in `_ext.pyi`; the weight plane is `tensorfs.varena`;
 `parse_header` projects a CBOR header (`tensorfs.errors` refusals). TensorFS never imports torch.
 """
+
+from collections.abc import Mapping
 
 from . import errors
 from ._ext import (
@@ -21,6 +23,7 @@ from ._ext import (
     DecodeError,
     DeniedError,
     DiskFullError,
+    Encoded,
     Encoding,
     Error,
     FormatError,
@@ -33,6 +36,7 @@ from ._ext import (
     Pipeline,
     StorageError,
     Store,
+    Tensors,
     UnknownSchemeError,
     UnsupportedError,
     Writer,
@@ -41,6 +45,8 @@ from ._ext import (
     plan,
     regions,
 )
+
+Mapping.register(Tensors)
 
 __all__ = [
     "Array",
@@ -51,6 +57,7 @@ __all__ = [
     "DecodeError",
     "DeniedError",
     "DiskFullError",
+    "Encoded",
     "Encoding",
     "Error",
     "FormatError",
@@ -63,6 +70,7 @@ __all__ = [
     "Pipeline",
     "StorageError",
     "Store",
+    "Tensors",
     "UnknownSchemeError",
     "UnsupportedError",
     "Writer",

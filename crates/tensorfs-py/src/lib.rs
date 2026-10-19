@@ -8,6 +8,8 @@ mod varena;
 mod readplan;
 #[cfg(feature = "store")]
 mod store;
+#[cfg(feature = "store")]
+mod tensors;
 
 use pyo3::prelude::*;
 
