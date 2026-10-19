@@ -448,7 +448,7 @@ fn describe(a: &Allowed) -> String {
 
 /// `round_L`: little-endian bytes of `xs` in `dtype` (F32, BF16 or F16), nearest even, NaN
 /// canonical.
-fn round(dtype: &Dtype, xs: &[f32]) -> Vec<u8> {
+pub(crate) fn round(dtype: &Dtype, xs: &[f32]) -> Vec<u8> {
     match dtype {
         Dtype::F32 => xs
             .iter()

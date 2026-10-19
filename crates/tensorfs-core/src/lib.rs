@@ -52,6 +52,7 @@ pub mod import;
 #[cfg(feature = "store")]
 pub mod ingest;
 pub mod jcs;
+pub mod kernels;
 pub mod limits;
 pub mod machine;
 pub mod manifest;
