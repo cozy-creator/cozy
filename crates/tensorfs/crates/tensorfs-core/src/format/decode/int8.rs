@@ -43,16 +43,19 @@ pub const CONVROT: Scheme = Scheme {
             key: "rotation",
             allowed: Allowed::Text(&["hadamard"]),
         },
-        Param {
-            key: "rotation_size",
-            allowed: Allowed::Uint(&[4, 16, 64, 256, 1024, 4096, 16384, 65536]),
-        },
+        ROTATION_SIZE,
     ],
     parts: &[
         Part::req("weight", I8, logical),
         Part::req("scale", F32, |c| Grid::Row.shape(c)),
     ],
     decode: convrot,
+};
+
+/// `rotation_size`: `B = 4^k`, `1 ≤ k ≤ 8`.
+pub const ROTATION_SIZE: Param = Param {
+    key: "rotation_size",
+    allowed: Allowed::Uint(&[4, 16, 64, 256, 1024, 4096, 16384, 65536]),
 };
 
 /// `q × s(i, j)`.
@@ -95,7 +98,7 @@ fn convrot(c: &Ctx) -> Result<Vec<f32>> {
 }
 
 /// In place, `x · H` for H = H4 ⊗ … ⊗ H4 (unnormalized, entries ±1), x.len() a power of 4.
-fn hadamard(x: &mut [i32]) {
+pub fn hadamard(x: &mut [i32]) {
     let mut stride = 1;
     while stride < x.len() {
         for base in (0..x.len()).filter(|i| (i / stride) % 4 == 0) {

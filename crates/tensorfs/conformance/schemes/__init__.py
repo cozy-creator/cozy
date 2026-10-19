@@ -20,6 +20,7 @@ from . import nvfp4
 # bnb
 
 # comfy
+from . import comfy
 
 from .base import Ctx, Refused
 
@@ -38,6 +39,7 @@ FAMILIES = (
     # bnb
 
     # comfy
+    comfy,
 )
 SCHEMES = {s.name: s for family in FAMILIES for s in family.SCHEMES}
 

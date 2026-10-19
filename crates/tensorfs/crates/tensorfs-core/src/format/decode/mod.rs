@@ -31,6 +31,7 @@ mod nvfp4;
 // bnb
 
 // comfy
+mod comfy;
 
 /// Every scheme this reader decodes, one row each. A plain tensor needs no scheme.
 pub static SCHEMES: &[&Scheme] = &[
@@ -50,6 +51,9 @@ pub static SCHEMES: &[&Scheme] = &[
     // bnb.*
 
     // comfy.*
+    &comfy::ASYM_W4A8_INT8,
+    &comfy::W6A8_INT8,
+    &comfy::CONVROT_W4A4,
 ];
 
 /// A scheme: its params, its parts and its decode, as spec §6 lists them.

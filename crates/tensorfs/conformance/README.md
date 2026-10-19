@@ -44,3 +44,8 @@ hold the same values as their mined twins in the other nibble order, scale tilin
 (per-column scales, `F8_E5M2` weights, `BF16`/`F16` tensorwise scales, `int8.tensorwise`, `int8.rowwise`, a ragged `mxfp8` block, a divided global
 scale, rounding of 3,072 f32 patterns to BF16/F16, plain and unknown dtypes, refusals) were computed exactly from the
 spec's formulas.
+
+**comfy.** `mine/comfy.py` runs comfy-kitchen 0.2.39's eager quantizers (PyTorch 2.14.1 CPU) and range-reads rows of
+real ComfyUI files (AX1Y2JP W4A8, Comfy-Org W6A8, Merserk W4A4 of MiniMax-H3). Expected bytes are the spec's decode;
+kitchen's own dequantize is within 2.5·10^−3 relative at `BF16` (it rotates back in `L`) and f32 rounding at `F32`.
+Cases kitchen quantized carry their F32 `source` (and `kitchen` options), which `encode_comfy.rs` reproduces.
