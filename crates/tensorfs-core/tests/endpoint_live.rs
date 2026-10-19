@@ -39,6 +39,15 @@ fn python_proof(python: &str, script: &Path, request: &Value) {
     let mut child = Command::new(python).arg("-I").arg(script)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     child.stdin.take().unwrap().write_all(&serde_json::to_vec(request).unwrap()).unwrap();
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(120) {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("the owned Python endpoint proof exceeded 120 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "Python endpoint proof: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     println!("{}", String::from_utf8_lossy(&output.stdout));

@@ -1356,19 +1356,33 @@ impl PyWriter {
     }
 
     /// Written already (or by an interrupted writer of this key); base tensors don't count.
-    fn has(&self, component: &str, key: &str) -> bool {
-        let guard = self.w.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().is_some_and(|w| w.has(component, key))
+    fn has(&self, py: Python<'_>, component: &str, key: &str) -> bool {
+        py.detach(|| {
+            let guard = self.w.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().is_some_and(|w| w.has(component, key))
+        })
     }
 
     /// Lays out the chunks and seals the header; it is pinned under the writer's key, or its
     /// digest. Returns the new checkpoint.
     fn commit(&self, py: Python<'_>) -> PyResult<PyCheckpoint> {
-        let header = match self.with(py, |w| Ok(w.commit()?)) {
+        let (result, retained, published, files) = py.detach(|| {
+            let mut guard = self.w.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(writer) = guard.as_mut() else {
+                return (Err(Failure { kind: Kind::Invalid, detail: "the writer has committed or been abandoned".into() }), None, None, Default::default());
+            };
+            let result = writer.commit().map_err(Failure::from);
+            let retained = writer.committed().cloned();
+            let published = writer.published().cloned();
+            let files = writer.repo_files().clone();
+            if result.is_ok() { guard.take(); }
+            (result, retained, published, files)
+        });
+        let header = match result {
             Ok(header) => header,
-            Err(err) => {
-                let header = self.w.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|w| w.committed().cloned());
-                if let Some(header) = header {
+            Err(failure) => {
+                let err = raise(py, failure);
+                if let Some(header) = retained {
                     let ck = opened(py, &self.store, Named { header, tree: None, name: None, release: None, variant: self.variant.clone() })?;
                     err.value(py).setattr("checkpoint", Py::new(py, ck)?)?;
                 }
@@ -1376,16 +1390,12 @@ impl PyWriter {
             }
         };
         let tree = if self.repo_id.is_some() {
-            let guard = self.w.lock().unwrap_or_else(|e| e.into_inner());
-            let writer = guard.as_ref().expect("commit retained its writer");
-            let published = writer.published().cloned();
-            let mut tree = Tree { files: writer.repo_files().clone() };
+            let mut tree = Tree { files };
             tree.set_variant(self.variant.as_deref().unwrap_or(""), header.clone());
             let local = py.detach(|| self.store.put_tree(&tree)).or_raise(py)?;
             if published.as_ref() != Some(&local) { return Err(invalid(py, "the uploaded tree differs from the local tree")); }
             published
         } else { None };
-        self.w.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(dest) = &self.dest {
             let ck = py.detach(|| Checkpoint::folder(dest, Some(self.variant.as_deref().unwrap_or("")), Some(&self.store))).or_raise(py)?;
             return Ok(PyCheckpoint::new(ck.header().clone(), Some(ck), None));
@@ -1395,10 +1405,11 @@ impl PyWriter {
     }
 
     /// Ends the writer without a checkpoint.
-    fn abandon(&self) {
-        if let Some(w) = self.w.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            w.abandon();
-        }
+    fn abandon(&self, py: Python<'_>) {
+        py.detach(|| {
+            let writer = self.w.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(writer) = writer { writer.abandon(); }
+        })
     }
 }
 
@@ -1546,8 +1557,8 @@ impl PyComponentWriter {
     }
 
     /// Written already (or by an interrupted writer of this key).
-    fn has(&self, key: &str) -> bool {
-        self.w.get().has(&self.name, key)
+    fn has(&self, py: Python<'_>, key: &str) -> bool {
+        self.w.get().has(py, &self.name, key)
     }
 }
 

@@ -593,7 +593,7 @@ fn child() {
             let mut w = store.with_grace(GRACE).writer(None, None).unwrap();
             for (key, bytes) in overlap(seed) {
                 plain(&mut w, "unet", &key, &bytes);
-                std::thread::sleep(GRACE / 4);
+                std::thread::sleep(GRACE / 2);
             }
             let header = w.commit().unwrap();
             println!("HEADER {} {}", header.sha256, header.length);
@@ -1183,10 +1183,6 @@ fn two_writers_and_a_collector_lose_nothing() {
     let scratch = Scratch::new("overlap");
     let root = scratch.0.join("store");
     let store = Store::open(&root).unwrap().with_grace(GRACE);
-    let mut children: Vec<Child> = [1, 2]
-        .map(|seed| Child::spawn(&Job { root: root.clone(), arm: None, work: Work::Overlap { seed } }))
-        .into_iter()
-        .collect();
     let (stop, collected) = (std::sync::atomic::AtomicBool::new(false), AtomicU64::new(0));
     /// Stops the collector however the scope ends, a panic included.
     struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
@@ -1195,16 +1191,23 @@ fn two_writers_and_a_collector_lose_nothing() {
             self.0.store(true, Ordering::Relaxed);
         }
     }
+    let ready = std::sync::Barrier::new(2);
     let headers: Vec<ObjectRef> = std::thread::scope(|scope| {
         let _stop = Stop(&stop);
         let collector = scope.spawn(|| {
             let started = Instant::now();
+            ready.wait();
             while !stop.load(Ordering::Relaxed) {
                 collected.fetch_add(store.gc().unwrap().objects, Ordering::Relaxed);
                 std::thread::sleep(Duration::from_millis(50));
             }
             started.elapsed()
         });
+        ready.wait();
+        let mut children: Vec<Child> = [1, 2]
+            .map(|seed| Child::spawn(&Job { root: root.clone(), arm: None, work: Work::Overlap { seed } }))
+            .into_iter()
+            .collect();
         let headers = (children.iter_mut())
             .map(|c| {
                 let line = c.wait_for("HEADER");
