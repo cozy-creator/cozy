@@ -222,7 +222,11 @@ impl Watch {
             if let (Meter::Burn | Meter::Work, Some(since)) = (self.meter, pace.still_since()) {
                 let still = now - since;
                 if still > pace.patience(floor) {
-                    let verdict = format!("wedged during {what}: {}", pace.verdict(still, floor));
+                    let measures = match self.meter {
+                        Meter::Work => " (frames, bytes moved, GPU kernels and copies, CPU beyond one core)",
+                        _ => "",
+                    };
+                    let verdict = format!("wedged during {what}: {}{measures}", pace.verdict(still, floor));
                     match exact.kill() {
                         Ok(()) => state.killed = Some(verdict),
                         Err(error) => tracing::warn!("{verdict}; kill failed: {error}"),
@@ -551,7 +555,9 @@ mod tests {
             let verdict = watching.finish().0;
             assert_eq!(verdict.is_some(), killed, "{case}: {verdict:?}");
             if killed {
-                assert!(verdict.unwrap().contains("wedged during invoke: no measurable progress"), "{case}");
+                let verdict = verdict.unwrap();
+                assert!(verdict.contains("wedged during invoke: no measurable progress"), "{case}");
+                assert!(verdict.contains("(frames, bytes moved, GPU kernels and copies, CPU beyond one core)"), "{verdict}");
             } else {
                 let _ = child.kill();
             }
