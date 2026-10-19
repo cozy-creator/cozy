@@ -32,6 +32,7 @@ mod ct;
 mod gptq;
 
 // bnb
+mod bnb;
 
 // comfy
 
@@ -76,7 +77,9 @@ pub static ENCODERS: &[&Encoder] = &[
     &ct::INT7,
     &ct::INT8,
     // bnb.*
-
+    &bnb::NF4,
+    &bnb::FP4,
+    &bnb::INT8,
     // comfy.*
 ];
 

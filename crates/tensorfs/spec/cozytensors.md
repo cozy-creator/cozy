@@ -155,7 +155,7 @@ the logical tensor; no decode depends on anything outside the header, its chunks
 
 **Names** are `family.variant` in lowercase, in the words of the ecosystem that made the format: generic scaled
 formats are `element.granularity` (`fp8.tensorwise`, `int8.rowwise`, `fp8.blockwise`), a producer's own format
-is `producer.type` with the producer's type name verbatim (`gguf.q4_k`, `gptq.int4`, `awq.int4`, `ct.int4`; later
+is `producer.type` with the producer's type name verbatim (`gguf.q4_k`, `gptq.int4`, `awq.int4`, `ct.int4`,
 `bnb.nf4`), and a vendor-neutral standard keeps its bare name (`mxfp4`, `mxfp8`, `nvfp4`).
 
 **Params** are snake_case keys in the producer's vocabulary (`axis`, `block_size`, `rotation`, `rotation_size`,
@@ -470,7 +470,37 @@ compressed-tensors groups the columns sorted by `weight_g_idx` in runs of `g`, w
 each group holds its `g` columns (the last, `C − (W − 1)·g`); a reader MUST refuse another. A `−1` anywhere in it is
 compressed-tensors' unset index: the column order.
 
-<!-- bnb.* -->
+### `bnb.nf4`, `bnb.fp4`
+
+bitsandbytes' 4-bit weights (QLoRA, Transformers' `load_in_4bit`, Forge): a 4-bit code per element of the tensor
+*flattened* row-major, indexing the scheme's table, in blocks of `block_size` consecutive elements, each scaled by its
+absolute maximum. `double_quant` (bnb's `compress_statistics`) stores those as 8-bit codes of their own.
+- Params: `block_size`: 32, 64, 128, 256, 512, 1024, 2048 or 4096; `double_quant`: `true` or `false`.
+- Parts, with `n` elements and `m = ⌈n/block_size⌉` blocks:
+  - `weight`: `U8 [⌈n/2⌉, 1]`, the codes packed `word`-fill `high_first`: element `2k` is the high nibble of byte
+    `k`. An odd `n` leaves the last low nibble unused (bnb writes the code of 0).
+  - `quant_map`: `F32 [16]`, the table. A decoder MUST refuse one not equal, as numbers, to the scheme's table `T`:
+    Appendix A.3 (NF4) or A.4 (FP4).
+  - `absmax`: `F32 [m]`; with `double_quant`, `U8 [m]` codes.
+  - With `double_quant`, and only then: `nested_absmax`: `F32 [⌈m/256⌉]`; `nested_quant_map`: `F32 [256]` (bnb
+    writes its 8-bit dynamic map); `nested_offset`: `F32`, one element.
+- Decode, element `t` with code `q` in block `b = ⌊t/block_size⌋`: `round_L(T[q] × s_b)`, where `s_b = absmax[b]`,
+  or with `double_quant` `s_b = (nested_quant_map[absmax[b]] × nested_absmax[⌊b/256⌋]) + nested_offset`.
+
+`T` is the table bnb's kernels decode with; FP4's code 8 is −0 there (bit 3 is the sign) and +0 in the `quant_map`
+bnb stores. bnb's `<key>.weight.absmax`, `.quant_map`, `.nested_absmax` and `.nested_quant_map` are the parts of those
+roles. Its `<key>.weight.quant_state.bitsandbytes__<nf4|fp4>` (a `U8` JSON document) names the scheme
+(`quant_type`) and states `block_size` (`blocksize`), the logical dtype and shape (`dtype`, `shape`) and
+`nested_offset`; its `nested_blocksize` is 256 and `nested_dtype` `float32`.
+
+### `bnb.int8`
+
+LLM.int8() weights (Transformers' `load_in_8bit`), one absmax per output row.
+- Params: none.
+- Parts: `weight`: `I8 [N, K]`, the logical shape (rank 2). `SCB`: `F32` on the row grid. `weight_format`
+  (optional): `U8`, one element; a decoder MUST refuse any value but `0` (bnb's row-major layout).
+- Decode: `round_L((weight[i, j] × SCB[i]) × r)`, with `r = 0x3C010204`, the f32 nearest 1/127. bnb multiplies by
+  `r`, so this is not `int8.rowwise`.
 
 <!-- comfy.* -->
 
@@ -525,8 +555,8 @@ reader that needs only some components MAY fetch only the chunks their locations
 
 Minors: 1.1 adds `nvfp4`'s `pre_quant_scale` and a `scale_2` per matrix, and tiles each matrix of a stack on its own
 in `cublas_128x4` (before any stacked file was written); the schemes `fp8.blockwise`, `mxfp4`, `gguf.*`, `gptq.int2`,
-`gptq.int3`, `gptq.int4`, `gptq.int8`, `awq.int4` and `ct.int1` … `ct.int8`; and the `tiles` grid and transposed
-storage.
+`gptq.int3`, `gptq.int4`, `gptq.int8`, `awq.int4`, `ct.int1` … `ct.int8`, `bnb.nf4`, `bnb.fp4` and `bnb.int8`; and the
+`tiles` grid and transposed storage.
 
 ## 9. Encoding
 
@@ -612,7 +642,22 @@ ggml's `kvalues_fp4`: E2M1's values doubled, by code.
 [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12]
 ```
 
+### A.3 NF4 (`bnb.nf4`)
 
-<!-- bnb tables -->
+`F32 [16]`, SHA-256 `8501941daa1b8a90ad1bbfeb632e5101b5dddbc4bb52d6e55abcfd777e60c06a`:
+
+```
+[-1.0, -0.6961928, -0.52507305, -0.3949175, -0.28444138, -0.18477343, -0.091050036, 0.0,
+ 0.0795803, 0.1609302, 0.2461123, 0.33791524, 0.44070983, 0.562617, 0.72295684, 1.0]
+```
+
+### A.4 FP4 (`bnb.fp4`)
+
+`F32 [16]`, SHA-256 `39af60562e49a4f14fa01b864d62e6cbf0693a3ecf51e7861fc54259abb16237`:
+
+```
+[0.0, 0.0052083335, 0.6666667, 1.0, 0.33333334, 0.5, 0.16666667, 0.25,
+ -0.0, -0.0052083335, -0.6666667, -1.0, -0.33333334, -0.5, -0.16666667, -0.25]
+```
 
 <!-- comfy tables -->

@@ -23,6 +23,7 @@ from . import awq
 from . import ct
 
 # bnb
+from . import bnb
 
 # comfy
 
@@ -46,6 +47,7 @@ FAMILIES = (
     ct,
 
     # bnb
+    bnb,
 
     # comfy
 )
