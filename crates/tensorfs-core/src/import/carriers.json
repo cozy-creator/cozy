@@ -17,14 +17,16 @@
   "carriers": [
     {
       "producer": "modelopt",
-      "formats": ["NVFP4", "W4A16_NVFP4"],
+      "formats": ["NVFP4", "NVFP4_AWQ", "W4A16_NVFP4"],
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["U8"], "as": "F4", "shape": "logical"},
         {"suffix": "weight_scale", "role": "scale", "dtypes": ["F8_E4M3"], "shape": {"blocks": 16}},
         {"suffix": "weight_scale_2", "role": "scale_2", "dtypes": ["F32"], "shape": "one"},
-        {"suffix": "input_scale", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true}
+        {"suffix": "input_scale", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true},
+        {"suffix": "pre_quant_scale", "role": "pre_quant_scale", "dtypes": ["F32", "BF16", "F16"], "shape": "columns", "optional": true}
       ],
-      "encoding": {"scheme": "nvfp4", "params": {"block_size": 16, "global_scale": "multiply", "nibble_order": "low_first", "scale_layout": "row_major"}}
+      "encoding": {"scheme": "nvfp4", "params": {"block_size": 16, "global_scale": "multiply", "nibble_order": "low_first", "scale_layout": "row_major"}},
+      "dtype_params": {"pre_quant_scale_dtype": "pre_quant_scale"}
     },
     {
       "producer": "modelopt",
@@ -61,10 +63,12 @@
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["U8"], "as": "F4", "shape": "logical"},
         {"suffix": "weight_scale", "role": "scale", "dtypes": ["F8_E4M3", "U8"], "as": "F8_E4M3", "shape": {"tiles": 16}},
-        {"suffix": "weight_scale_2", "role": "scale_2", "dtypes": ["F32"], "shape": "one"},
-        {"suffix": "input_scale", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true}
+        {"suffix": "weight_scale_2", "role": "scale_2", "dtypes": ["F32"], "shape": "matrices"},
+        {"suffix": "input_scale", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true},
+        {"suffix": "pre_quant_scale", "role": "pre_quant_scale", "dtypes": ["F32", "BF16", "F16"], "shape": "columns", "optional": true}
       ],
       "encoding": {"scheme": "nvfp4", "params": {"block_size": 16, "global_scale": "multiply", "nibble_order": "high_first", "scale_layout": "cublas_128x4"}},
+      "dtype_params": {"pre_quant_scale_dtype": "pre_quant_scale"},
       "marker_values": {"block_size": 16, "group_size": 16}
     },
     {
