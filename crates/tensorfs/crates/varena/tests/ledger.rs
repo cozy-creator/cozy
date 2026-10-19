@@ -39,10 +39,13 @@ impl Proc {
             .stdout(Stdio::piped());
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
+            // Both are copied above the targets first: the eventfd may itself be number 9.
             command.pre_exec(move || {
-                let ok = if fd == FD { libc::fcntl(FD, libc::F_SETFD, 0) } else { libc::dup2(fd, FD) };
-                if ok < 0 || events.is_some_and(|e| libc::dup2(e, EVENTS) < 0) {
-                    return Err(std::io::Error::last_os_error());
+                let copies = [Some(fd), events].map(|from| from.map(|f| libc::fcntl(f, libc::F_DUPFD_CLOEXEC, 64)));
+                for (copy, to) in copies.into_iter().zip([FD, EVENTS]) {
+                    if copy.is_some_and(|c| c < 0 || libc::dup2(c, to) < 0) {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });
