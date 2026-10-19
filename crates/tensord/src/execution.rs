@@ -988,6 +988,7 @@ impl Engine {
         fs::create_dir_all(&root)?;
         Ok(root)
     }
+    #[cfg(test)]
     pub(crate) fn managed_result(
         &self,
         id: &str,
