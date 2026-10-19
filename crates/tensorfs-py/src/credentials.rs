@@ -79,6 +79,9 @@ pub struct PyDPoP { dpop: Arc<fetch::DPoP> }
 
 #[pymethods]
 impl PyDPoP {
+    fn issued_token(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        py.detach(|| Ok::<_, tensorfs_core::err::Refusal>(fetch::runtime()?.block_on(self.dpop.issued_token()))).or_raise(py)
+    }
     #[staticmethod]
     #[pyo3(signature = (key, *, token_endpoint, client_id, resource, claims, endpoint = None, ca_der = None))]
     #[allow(clippy::too_many_arguments)]
