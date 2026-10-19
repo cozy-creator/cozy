@@ -8,8 +8,9 @@
    --origin`, served by `python -m http.server`, then `tfs pull` into a second store,
    byte-identical; a corrupted object is removed by `tfs verify` and fetched again.
 2. The same through `tensorfs`, plus DLPack reads equal to upstream's own tensors, regions,
-   the writer (with an encoded tensor) and typed errors.
-3. A parsed header carries the stored checkpoint's tensors, with no store behind it.
+   the component writer (a config with floats and None, an encoded tensor) and typed errors.
+3. A parsed header carries the stored checkpoint's pipeline, components and tensors, with no
+   store behind it.
 
     e2e.py <workdir>
 """
@@ -82,9 +83,9 @@ def same_folder(store: pathlib.Path, name: str, folder: pathlib.Path, repo: str)
     for path in (p for p in files if ".safetensors.index" in p):
         shards = set(json.loads(files[path].read_text())["weight_map"].values())
         assert all((files[path].parent / s).is_file() for s in shards), f"{repo}: {path}"
-    again = [cli(store, "import", str(folder), "--name", f"{name}-again")["manifest"]]
+    again = [cli(store, "import", str(folder), "--name", f"{name}-again")["header"]]
     cli(store, "export", f"{name}-again", str(folder), "--safetensors")
-    again.append(cli(store, "import", str(folder), "--name", f"{name}-twice")["manifest"])
+    again.append(cli(store, "import", str(folder), "--name", f"{name}-twice")["header"])
     assert again[0] == again[1], f"{repo}: import of an export is a fixed point"
     print(f"export of {repo}: its {len(allow)} other files byte for byte; re-import a fixed point")
 
@@ -148,7 +149,7 @@ def main() -> None:
     assert imported["name"] == NAME and imported["release"] == "1", imported
     inspected = cli(a, "inspect", NAME)
     names = [c["name"] for c in inspected["components"]]  # header order (#624)
-    assert set(names) == {"text_encoder", "text_encoder_2", "unet", "vae"}, names
+    assert {"text_encoder", "text_encoder_2", "unet", "vae", "tokenizer", "tokenizer_2", "scheduler"} <= set(names), names
     cli(a, "export", NAME, str(work / "out"), "--safetensors")
     same_files(work / "out")
     for i, (repo, variant) in enumerate(SOURCES):
@@ -160,80 +161,98 @@ def main() -> None:
     cli(a, "export", NAME, str(work / "origin"), "--origin")
     with serve(work / "origin") as url:
         pulled = cli(b, "pull", url, NAME)
-        assert pulled["manifest"] == imported["manifest"], (pulled, imported)
+        assert pulled["header"] == imported["header"], (pulled, imported)
         assert blobs(b) == blobs(a), "the pulled store is byte-identical"
         corrupt_and_refetch(b, url)
         assert blobs(b) == blobs(a)
     print(f"CLI: import, export, origin, pull: {len(blobs(a))} objects identical")
 
     # 2. The Python API.
-    store = tfs.Store(work / "c")
-    m = store.import_(f"hf://{REPO}", name=NAME)
-    assert (m.sha256, m.length) == (imported["manifest"]["sha256"], imported["manifest"]["length"]), "imports are deterministic"
-    assert (m.name, m.release) == (NAME, "1")
-    ck = store.checkpoint(NAME)
-    assert ck.manifest == m
+    tfs.configure(cache_dir=work / "c")
+    m = tfs.convert(f"hf://{REPO}")
+    folder = tfs.snapshot_download(m.tree, local_files_only=True)
+    tfs.upload_folder(repo_id=NAME, revision="1", folder_path=folder)
+    assert m.id == f"sha256:{imported['header']['sha256']}", "imports are deterministic"
+    ck = tfs.open(NAME, revision="1", local_files_only=True)
+    assert (ck.repo_id, ck.revision) == (NAME, "1")
+    assert (ck.id, ck.tree) == (m.id, m.tree)
     compared = 0
     for component in ("unet", "vae", "text_encoder", "text_encoder_2"):
         want = getattr(upstream, component).state_dict()
-        for key, info in ck.tensors[component].items():
+        for key, info in ck.components[component].tensors.items():
             assert info.encoding is None and list(info.parts) == [""], (key, info)
-            got = torch.from_dlpack(ck.read(component, key))
+            got = torch.from_dlpack(ck.components[component].tensors.read(key))
             assert tuple(got.shape) == info.shape and got.dtype == DTYPES[info.dtype], (key, got.dtype, info)
             if key in want:
                 assert torch.equal(got, want[key]), f"{component}/{key} differs from upstream"
                 compared += 1
     assert compared > 100, compared
-    conv = ck.read("unet", "conv_in.weight")
+    conv = ck.components["unet"].tensors.read("conv_in.weight")
     want_np = upstream.unet.state_dict()["conv_in.weight"].numpy()
     assert np.array_equal(np.from_dlpack(conv), want_np), "numpy reads it too"
     assert conv.tobytes() == want_np.tobytes()
     grouped = tfs.regions(ck, 1 << 20)
     names = [n for r in grouped for n in r]
-    assert sorted(names) == sorted(f"{c}/{k}" for c, t in ck.tensors.items() for k in t), "every tensor in one region"
+    assert sorted(names) == sorted(f"{c}/{k}" for c, component in ck.components.items() for k in component.tensors), "every tensor in one region"
     print(f"Python: {compared} tensors equal upstream's through DLPack; {len(grouped)} regions")
 
-    written = store.export(m, work / "out2")
+    written = tfs.export(m, work / "out2")
     assert "unet/diffusion_pytorch_model.safetensors" in written
     assert tree(work / "out2") == tree(work / "out"), "the Python export is the CLI's, byte for byte"
     same_image(work / "out2", reference)
-    store.export(NAME, work / "origin2", safetensors=False, origin=True)
-    with serve(work / "origin2") as url:
-        second = tfs.Store(work / "d")
-        assert second.pull(NAME, origin=url) == m
-        assert blobs(work / "d") == blobs(work / "c")
+    origin = (work / "origin2").as_uri()
+    remote_name = "conformance/tiny-sdxl"
+    tfs.upload_folder(repo_id=remote_name, revision="1", folder_path=folder, endpoint=origin)
+    downloaded = tfs.snapshot_download(remote_name, revision="1", endpoint=origin, cache_dir=work / "d")
+    assert tfs.open(downloaded).id == m.id
 
-    w = store.writer(base=m)
-    w.put("extra", "x.weight", "F32", [2, 2], np.arange(4, dtype=np.float32))
+    w = tfs.Writer(base=m)
+    config = {"scale": 0.18215, "eps": 1e-05, "act": None, "blocks": [1, 2.5], "name": "x"}
+    extra = w.component("extra", cls="diffusers.Extra", config=config, config_file="extra_config.json")
+    extra.put("x.weight", np.arange(4, dtype=np.float32).reshape(2, 2))
     parts = {"weight": ("F8_E4M3", [2, 16], bytes([0x38]) * 32), "scale": ("F32", [2], np.array([0.5, 2.0], dtype=np.float32))}
-    w.put_encoded("extra", "q.weight", "F32", [2, 16], "fp8.rowwise", parts, {"axis": 0, "scale_dtype": "F32"})
-    m3 = w.commit()
-    ck3 = store.checkpoint(m3)
-    assert ck3.tensors["unet"].keys() == ck.tensors["unet"].keys(), "the base carries over"
-    q = ck3.tensors["extra"]["q.weight"]
+    extra.put_encoded("q.weight", dtype="F32", shape=[2, 16], scheme="fp8.rowwise", parts=parts, params={"axis": 0, "scale_dtype": "F32"})
+    extra.asset("vocab.txt", b"a\nb\n")
+    assert extra.has("q.weight") and w.has("extra", "x.weight")
+    ck3 = w.commit()
+    assert ck3.components["unet"].tensors.keys() == ck.components["unet"].tensors.keys(), "the base carries over"
+    e = ck3.components["extra"]
+    assert (e.cls, e.config, e.config_file) == ("diffusers.Extra", config, "extra_config.json"), (e.cls, e.config)
+    assert e.assets["vocab.txt"][1] == 4 and e.asset("vocab.txt") == b"a\nb\n"
+    q = ck3.components["extra"].tensors["q.weight"]
     assert q.encoding is not None and q.encoding.scheme == "fp8.rowwise" and set(q.parts) == {"weight", "scale"}
     assert str(q.encoding) == 'fp8.rowwise {axis: 0, scale_dtype: "F32"}', q.encoding
-    assert torch.equal(torch.from_dlpack(ck3.read("extra", "q.weight")), torch.tensor([[0.5] * 16, [2.0] * 16]))
+    assert torch.equal(torch.from_dlpack(ck3.components["extra"].tensors.read("q.weight")), torch.tensor([[0.5] * 16, [2.0] * 16]))
     try:
-        store.checkpoint("local/nothing")
+        tfs.open("local/nothing", local_files_only=True)
         raise AssertionError("no such ref")
     except tfs.NotFoundError as e:
         assert e.code == "not_found" and isinstance(e, tfs.Error), e
-    assert store.gc()["objects"] == 0
 
     # 3. A parsed header.
-    parsed = tfs.Checkpoint.parse(ck.file("model.cozytensors"))
-    assert parsed.manifest is None and parsed.chunks == ck.chunks and parsed.files == []
-    for component, tensors in ck.tensors.items():
-        assert list(parsed.tensors[component]) == list(tensors), component
-        for key, info in tensors.items():
-            assert (parsed.tensors[component][key].dtype, parsed.tensors[component][key].shape) == (info.dtype, info.shape)
+    h = ck3.id.removeprefix("sha256:")
+    parsed = tfs.Checkpoint.parse((work / "c" / "blobs" / h[:2] / h[2:4] / h).read_bytes())
+    assert parsed.id is None and parsed.chunks == ck3.chunks and parsed.metadata == ck3.metadata
+    assert (parsed.pipeline is None) == (ck3.pipeline is None)
+    for name, c in ck3.components.items():
+        p = parsed.components[name]
+        assert (p.cls, p.config, p.config_file, p.assets) == (c.cls, c.config, c.config_file, c.assets), name
     try:
-        parsed.read("unet", "conv_in.weight")
+        parsed.components["extra"].asset("vocab.txt")
+        raise AssertionError("a parsed header has no assets here")
+    except tfs.UnsupportedError:
+        pass
+    for component, stored_component in ck.components.items():
+        tensors = stored_component.tensors
+        assert list(parsed.components[component].tensors) == list(tensors), component
+        for key, info in tensors.items():
+            assert (parsed.components[component].tensors[key].dtype, parsed.components[component].tensors[key].shape) == (info.dtype, info.shape)
+    try:
+        parsed.components["unet"].tensors.read("conv_in.weight")
         raise AssertionError("a parsed header has no chunks")
     except tfs.UnsupportedError:
         pass
-    print(f"parse: {sum(len(t) for t in parsed.tensors.values())} tensors, as stored")
+    print(f"parse: {sum(len(c.tensors) for c in parsed.components.values())} tensors, as stored")
     print("e2e: all green")
 
 

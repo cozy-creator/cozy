@@ -1,34 +1,32 @@
-//! The v2 library's front door, shared by the `tfs` CLI and Python: references, import into a
-//! named ref, pull (from Tensorhub by default, or a static origin), and plane regions.
+//! The library's front door, shared by the `tfs` CLI and Python: references, import into a
+//! named repo, pull (from Tensorhub by default, or a static origin), and plane regions.
 //!
-//! A reference is `org/name[@release]` (with a lane, else the release's only one) or a
-//! manifest digest, `sha256:<hex>` or bare hex.
+//! A reference is `org/name[@release]` (with a variant, else the release tree's only one) or a
+//! digest, `sha256:<hex>` or bare hex, of a tree or a cozytensors header.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::failure::{fail, Kind, Result};
-use crate::fetch::{self, policy, Client, Config, Fetcher, HttpOrigin, ObjectStore, Origin};
-use crate::fetch::{SourcePolicy, TensorhubOrigin, VolumeOrigin, Want, TENSORHUB};
-use crate::format::{repo_key, Body, Component, Header, ObjectRef, Release, Repo, Tensor};
+use crate::fetch::{self, policy, Client, Config, Endpoint, Fetcher, ObjectStore, Origin};
+use crate::fetch::{SourcePolicy, TensorhubOrigin, Want, TENSORHUB};
+use crate::format::{repo_key, Body, Component, Header, ObjectRef, Release, Repo, Tensor, Tree};
 use crate::import::{self, Access};
 use crate::store2::Store;
 
-/// The release an import refs.
+/// The release an import names.
 pub const IMPORT_RELEASE: &str = "1";
-/// The most bytes a refs document may have.
-const REPO_BYTES: u64 = 16 << 20;
 
-/// A checkpoint and the ref, release and lane that name it, when one does.
+/// A cozytensors, and the tree, repo, release and variant that name it, when one does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Named {
-    pub manifest: ObjectRef,
+    pub header: ObjectRef,
+    pub tree: Option<ObjectRef>,
     pub name: Option<String>,
     pub release: Option<String>,
-    pub lane: Option<String>,
+    pub variant: Option<String>,
 }
 
 enum Reference<'a> {
@@ -47,41 +45,16 @@ fn parse(reference: &str) -> Reference<'_> {
     }
 }
 
-/// `repo` with `lane` of release `version` naming `manifest`. Releases keep `order`'s order
-/// where it has them, so the latest stays last.
-fn with_lane(
-    repo: Option<Repo>,
-    name: &str,
-    version: &str,
-    lane: &str,
-    manifest: &ObjectRef,
-    order: &[Release],
-) -> Repo {
-    let mut repo = repo.unwrap_or_else(|| Repo {
-        name: name.to_owned(),
-        ..Default::default()
-    });
-    let origin = order.iter().find(|r| r.version == version);
-    let release = match repo.releases.iter().position(|r| r.version == version) {
-        Some(i) => &mut repo.releases[i],
-        None => {
-            repo.releases.push(Release {
-                version: version.to_owned(),
-                ..Default::default()
-            });
-            repo.releases.last_mut().expect("just pushed")
-        }
-    };
-    release.lanes.insert(lane.to_owned(), manifest.clone());
-    if let Some(origin) = origin {
+/// `repo` with release `version` naming `tree`. Releases keep `order`'s order where it has
+/// them, so the latest stays last, and take its yanked and revision.
+fn with_release(repo: Option<Repo>, name: &str, version: &str, tree: &ObjectRef, order: &[Release]) -> Repo {
+    let mut repo = repo.unwrap_or_else(|| Repo::new(name));
+    repo.set_release(version, tree.clone());
+    if let Some(origin) = order.iter().find(|r| r.version == version) {
+        let release = (repo.releases.iter_mut()).find(|r| r.version == version).expect("just set");
         (release.yanked, release.revision) = (origin.yanked, origin.revision);
     }
-    let rank = |v: &str| {
-        order
-            .iter()
-            .position(|r| r.version == v)
-            .map_or(0, |p| p + 1)
-    };
+    let rank = |v: &str| order.iter().position(|r| r.version == v).map_or(0, |p| p + 1);
     repo.releases.sort_by_key(|r| rank(&r.version));
     repo
 }
@@ -144,8 +117,8 @@ fn default_name(source: &str) -> String {
 }
 
 /// The lowercase dtype holding most of the header's bytes (`f32`, `bf16`), or the scheme of
-/// most encoded bytes.
-fn main_lane(header: &Header) -> String {
+/// most encoded bytes: an import's variant.
+fn main_variant(header: &Header) -> String {
     let mut bytes: BTreeMap<String, u64> = BTreeMap::new();
     for (_, t) in header.tensors() {
         let (name, length) = match &t.body {
@@ -164,9 +137,24 @@ fn main_lane(header: &Header) -> String {
 }
 
 impl Store {
-    /// The checkpoint `reference` names here.
-    pub fn resolve(&self, reference: &str, lane: Option<&str>) -> Result<Named> {
+    /// The cozytensors `reference` names here: a name's release (its `variant`), a tree's
+    /// variant, or a header.
+    pub fn resolve(&self, reference: &str, variant: Option<&str>) -> Result<Named> {
         match parse(reference) {
+            Reference::Name(name, release) => {
+                let Some(repo) = self.get_ref(name)? else {
+                    return fail(Kind::NotFound, format!("no ref {name} in {}", self.root().display()));
+                };
+                let read = |t: &ObjectRef| self.tree(t).map_err(|e| e.refusal());
+                let chosen = fetch::choose(&repo, release, variant, read)?;
+                Ok(Named {
+                    header: chosen.header,
+                    tree: Some(chosen.tree),
+                    name: Some(repo.name),
+                    release: Some(chosen.version),
+                    variant: Some(chosen.variant),
+                })
+            }
             Reference::Digest(sha256) => {
                 let path = self.path(&ObjectRef {
                     sha256: sha256.to_owned(),
@@ -176,51 +164,61 @@ impl Store {
                     Ok(m) => m.len(),
                     Err(_) => return fail(Kind::NotFound, format!("no object {sha256} here")),
                 };
-                let manifest = ObjectRef {
+                let object = ObjectRef {
                     sha256: sha256.to_owned(),
                     length,
                 };
-                for repo in self.refs()? {
-                    for release in &repo.releases {
-                        for (l, m) in &release.lanes {
-                            if *m == manifest && lane.is_none_or(|want| want == l) {
-                                return Ok(Named {
-                                    manifest,
-                                    name: Some(repo.name.clone()),
-                                    release: Some(release.version.clone()),
-                                    lane: Some(l.clone()),
-                                });
-                            }
-                        }
+                let bytes = self.read(&object)?;
+                let (tree, header, variant) = match Tree::from_json(&bytes) {
+                    Ok(tree) => {
+                        let (v, header) = fetch::variant_of_tree(&tree, variant)?;
+                        (Some(object), header, Some(v))
+                    }
+                    Err(_) => {
+                        Header::from_cbor(&bytes)?;
+                        (None, object, None)
+                    }
+                };
+                let releases = self.refs()?.into_iter().flat_map(|repo| {
+                    let name = repo.name.clone();
+                    repo.releases.into_iter().map(move |r| (name.clone(), r))
+                });
+                for (name, release) in releases {
+                    let hit = match &tree {
+                        Some(t) => release.tree == *t,
+                        None => self.tree(&release.tree).is_ok_and(|t| t.variants().any(|(_, h)| *h == header)),
+                    };
+                    if hit {
+                        let variant = match &variant {
+                            Some(v) => v.clone(),
+                            None => (self.tree(&release.tree)?.variants())
+                                .find(|(_, h)| **h == header)
+                                .map(|(v, _)| v.to_owned())
+                                .expect("matched"),
+                        };
+                        return Ok(Named {
+                            header,
+                            tree: Some(release.tree),
+                            name: Some(name),
+                            release: Some(release.version),
+                            variant: Some(variant),
+                        });
                     }
                 }
                 Ok(Named {
-                    manifest,
+                    header,
+                    tree,
                     name: None,
                     release: None,
-                    lane: None,
-                })
-            }
-            Reference::Name(name, release) => {
-                let Some(repo) = self.get_ref(name)? else {
-                    return fail(
-                        Kind::NotFound,
-                        format!("no ref {name} in {}", self.root().display()),
-                    );
-                };
-                let (version, lane, manifest) = fetch::choose(&repo, release, lane)?;
-                Ok(Named {
-                    manifest,
-                    name: Some(repo.name),
-                    release: Some(version),
-                    lane: Some(lane),
+                    variant,
                 })
             }
         }
     }
 
-    /// Imports `sources` into one checkpoint and refs it as release [`IMPORT_RELEASE`], lane
-    /// its main dtype. Re-importing a name replaces that lane; an interrupted import resumes.
+    /// Imports `sources` into one cozytensors and names it as release [`IMPORT_RELEASE`],
+    /// variant its main dtype. Re-importing a name replaces that variant; an interrupted import
+    /// resumes.
     pub fn import_named(&self, sources: &[String], opts: &ImportOptions) -> Result<Named> {
         let Some(first) = sources.first() else {
             return fail(Kind::Invalid, "import needs a source");
@@ -243,40 +241,51 @@ impl Store {
             stop: None,
         };
         let key = format!("import.{}", name.replace('/', ".").to_ascii_lowercase());
-        let manifest = self.import(&req, Some(&key))?;
-        let named = self.set_lane(&name, IMPORT_RELEASE, None, &manifest)?;
+        let (header, files) = self.import(&req, Some(&key))?;
+        let named = self.set_variant(&name, IMPORT_RELEASE, None, &header, &files)?;
         self.unpin(&key)?;
         Ok(named)
     }
 
-    /// Refs `manifest` as `lane` (by default its main dtype) of `name`'s release `version`.
-    pub fn set_lane(
+    /// Names `header` as `variant` (by default its main dtype) of `name`'s release `version`:
+    /// a new tree, the release's old one with that variant set and `files` added, becomes the
+    /// release's.
+    pub fn set_variant(
         &self,
         name: &str,
         version: &str,
-        lane: Option<&str>,
-        manifest: &ObjectRef,
+        variant: Option<&str>,
+        header: &ObjectRef,
+        files: &BTreeMap<String, ObjectRef>,
     ) -> Result<Named> {
-        let lane = match lane {
-            Some(lane) => lane.to_owned(),
-            None => main_lane(self.checkpoint(manifest)?.header()),
+        let variant = match variant {
+            Some(v) => v.to_owned(),
+            None => main_variant(self.checkpoint(header)?.header()),
         };
-        let repo = self.update_ref(name, |old| {
-            Some(with_lane(old, name, version, &lane, manifest, &[]))
-        })?;
+        let old = self.get_ref(name)?;
+        let mut tree = match old.as_ref().and_then(|r| r.release(Some(version))) {
+            Some(r) => self.tree(&r.tree)?,
+            None => Tree::default(),
+        };
+        tree.files.extend(files.clone());
+        tree.set_variant(&variant, header.clone());
+        let at = self.put_tree(&tree)?;
+        let repo = self.update_ref(name, |old| Some(with_release(old, name, version, &at, &[])))?;
         Ok(Named {
-            manifest: manifest.clone(),
+            header: header.clone(),
+            tree: Some(at),
             name: repo.map(|r| r.name),
             release: Some(version.to_owned()),
-            lane: Some(lane),
+            variant: Some(variant),
         })
     }
 
     /// Pulls `reference` (`org/name[@release]`; from a Hub, `org/name@sha256:<hex>` names the
-    /// owner's checkpoint by hash) from `from`, then refs it here as the origin names it.
-    pub fn pull(&self, from: PullFrom<'_>, reference: &str, lane: Option<&str>) -> Result<Pulled> {
+    /// owner's tree by hash) from `from`, its `variant` (else the tree's only one), then names
+    /// the tree here as the origin names it.
+    pub fn pull(&self, from: PullFrom<'_>, reference: &str, variant: Option<&str>) -> Result<Pulled> {
         match from {
-            PullFrom::Origin(origin) => self.pull_static(origin, reference, lane),
+            PullFrom::Origin(origin) => self.pull_static(origin, reference, variant),
             PullFrom::Hub { base, token } => {
                 let base = base.unwrap_or(TENSORHUB);
                 let client = Client::new(SourcePolicy {
@@ -289,105 +298,72 @@ impl Store {
                 if let Some(token) = token {
                     hub = hub.bearer(token);
                 }
-                self.pull_hub(client, hub, reference, lane)
+                self.pull_hub(client, hub, reference, variant)
             }
         }
     }
 
-    /// [`Store::pull`] from the Tensorhub `hub`, read over `client`. A checkpoint asked by hash
-    /// is not a release: no ref names it here.
-    pub fn pull_hub(
-        &self,
-        client: Client,
-        hub: TensorhubOrigin,
-        reference: &str,
-        lane: Option<&str>,
-    ) -> Result<Pulled> {
+    /// [`Store::pull`] from the Tensorhub `hub`, read over `client`. A tree asked by hash is
+    /// not a release: no ref names it here.
+    pub fn pull_hub(&self, client: Client, hub: TensorhubOrigin, reference: &str, variant: Option<&str>) -> Result<Pulled> {
         let Reference::Name(name, release) = parse(reference) else {
-            return fail(
-                Kind::Invalid,
-                "a pull names org/name[@release], not a bare digest",
-            );
+            return fail(Kind::Invalid, "a pull names org/name[@release], not a bare digest");
         };
         let store: Arc<dyn ObjectStore> = Arc::new(self.clone());
         let hub = Arc::new(hub);
         let (resolved, pulled) = fetch::runtime()?.block_on(async {
-            let resolved = hub.named(name, release, lane).await?;
+            let resolved = hub.named(name, release, variant).await?;
             let origin: Arc<dyn Origin> = hub.clone();
             let fetcher = Fetcher::new(store, client, None, Config::default());
-            let pulled = fetcher
-                .pull_manifest(&origin, &resolved.manifest, &Want::default())
-                .await?;
+            let asked = variant.or(Some(resolved.variant.as_str()).filter(|v| !v.is_empty()));
+            let pulled = fetcher.pull_tree(&origin, &resolved.tree, asked, &Want::default()).await?;
             fetcher.settled().await;
             Ok::<_, crate::failure::Failure>((resolved, pulled))
         })?;
-        let named = match resolved.release.is_empty() {
-            true => Named {
-                manifest: resolved.manifest,
-                name: None,
-                release: None,
-                lane: None,
-            },
+        let (name, release) = match resolved.release.is_empty() {
+            true => (None, None),
             false => {
-                let (model, release, lane) = (&resolved.model, &resolved.release, &resolved.lane);
-                let local = self.update_ref(model, |old| {
-                    Some(with_lane(old, model, release, lane, &resolved.manifest, &[]))
-                })?;
-                Named {
-                    manifest: resolved.manifest.clone(),
-                    name: local.map(|r| r.name),
-                    release: Some(resolved.release),
-                    lane: Some(resolved.lane),
-                }
+                let (model, release) = (&resolved.model, &resolved.release);
+                let local = self.update_ref(model, |old| Some(with_release(old, model, release, &resolved.tree, &[])))?;
+                (local.map(|r| r.name), Some(resolved.release))
             }
         };
-        Ok(Pulled {
-            named,
-            objects: pulled.objects,
-            fetched: pulled.landed.origin + pulled.landed.volume,
-            held: pulled.landed.local,
-        })
+        Ok(pulled_as(pulled, name, release))
     }
 
-    fn pull_static(&self, origin: &str, reference: &str, lane: Option<&str>) -> Result<Pulled> {
+    fn pull_static(&self, origin: &str, reference: &str, variant: Option<&str>) -> Result<Pulled> {
         let Reference::Name(name, release) = parse(reference) else {
-            return fail(
-                Kind::Invalid,
-                "a pull names org/name[@release], not a digest",
-            );
+            return fail(Kind::Invalid, "a pull names org/name[@release], not a digest");
         };
         let store: Arc<dyn ObjectStore> = Arc::new(self.clone());
-        let (version, lane, manifest, repo, pulled) = fetch::runtime()?.block_on(async {
+        let (version, repo, pulled) = fetch::runtime()?.block_on(async {
             let (origin, client, repo) = open(origin, name).await?;
-            let (version, lane, manifest) = fetch::choose(&repo, release, lane)?;
+            let (version, tree) = fetch::release_of(&repo, release)?;
             let fetcher = Fetcher::new(store, client, None, Config::default());
-            let pulled = fetcher
-                .pull_manifest(&origin, &manifest, &Want::default())
-                .await?;
+            let pulled = fetcher.pull_tree(&origin, &tree, variant, &Want::default()).await?;
             fetcher.settled().await;
-            Ok::<_, crate::failure::Failure>((version, lane, manifest, repo, pulled))
+            Ok::<_, crate::failure::Failure>((version, repo, pulled))
         })?;
+        let tree = pulled.tree.clone().expect("a tree was pulled");
         let local = self.update_ref(&repo.name, |old| {
-            Some(with_lane(
-                old,
-                &repo.name,
-                &version,
-                &lane,
-                &manifest,
-                &repo.releases,
-            ))
+            Some(with_release(old, &repo.name, &version, &tree, &repo.releases))
         })?;
-        Ok(Pulled {
-            named: Named {
-                manifest,
-                name: local.map(|r| r.name),
-                release: Some(version),
-                lane: Some(lane),
-            },
-            objects: pulled.objects,
-            fetched: pulled.landed.origin + pulled.landed.volume,
-            held: pulled.landed.local,
-        })
+        Ok(pulled_as(pulled, local.map(|r| r.name), Some(version)))
+    }
+}
+
+fn pulled_as(pulled: fetch::Pulled, name: Option<String>, release: Option<String>) -> Pulled {
+    Pulled {
+        named: Named {
+            header: pulled.header,
+            tree: pulled.tree,
+            name,
+            release,
+            variant: Some(pulled.variant),
+        },
+        objects: pulled.objects,
+        fetched: pulled.landed.origin + pulled.landed.volume,
+        held: pulled.landed.local,
     }
 }
 
@@ -413,59 +389,44 @@ pub struct Pulled {
     pub held: u64,
 }
 
-/// The origin `spec` names and its refs document for `name`.
+/// The origin `spec` names (a URL or a directory) and its refs document for `name`.
 async fn open(spec: &str, name: &str) -> Result<(Arc<dyn Origin>, Client, Repo)> {
-    let key = repo_key(name);
-    let (origin, client, bytes): (Arc<dyn Origin>, Client, Vec<u8>) =
-        if spec.starts_with("https://") || spec.starts_with("http://") {
-            // The origin is the one the caller named; its objects are held to their digests
-            // wherever a redirect sends them. Plaintext is for loopback only.
-            let client = Client::new(SourcePolicy {
-                any_host: true,
-                allow_local: policy::is_loopback_origin(spec),
-                max_redirects: 5,
-                ..SourcePolicy::default()
-            });
-            let origin = HttpOrigin::new(&client, spec)?;
-            let url = format!("{}/{key}", spec.trim_end_matches('/'));
-            let bytes = client.document(&url, &[], REPO_BYTES).await?;
-            (Arc::new(origin), client, bytes)
-        } else {
-            let dir = Path::new(spec.strip_prefix("file://").unwrap_or(spec));
-            let bytes = match fs::read(dir.join(&key)) {
-                Ok(bytes) => bytes,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return fail(
-                        Kind::NotFound,
-                        format!("no ref {name} at {}", dir.display()),
-                    )
-                }
-                Err(e) => return fail(Kind::Io, format!("{}: {e}", dir.join(&key).display())),
-            };
-            let origin = VolumeOrigin::new(dir, Duration::from_secs(7 * 86400));
-            (
-                Arc::new(origin),
-                Client::new(SourcePolicy::default()),
-                bytes,
-            )
-        };
-    Ok((origin, client, Repo::from_json(&bytes)?))
+    // The origin is the one the caller named; its objects are held to their digests wherever a
+    // redirect sends them. Plaintext is for loopback only.
+    let client = Client::new(SourcePolicy {
+        any_host: true,
+        allow_local: policy::is_loopback_origin(spec),
+        max_redirects: 5,
+        ..SourcePolicy::default()
+    });
+    let url = match spec.contains("://") {
+        true => spec.to_owned(),
+        false => std::path::absolute(spec).map_err(|e| io(Path::new(spec), e))?.display().to_string(),
+    };
+    let endpoint = Endpoint::new(&client, &url, None)?;
+    let Some((repo, _)) = endpoint.repo(name).await? else {
+        return fail(Kind::NotFound, format!("no ref {name} at {spec}"));
+    };
+    Ok((Arc::new(endpoint), client, repo))
 }
 
-/// The origin layout `HttpOrigin` reads: `name`'s refs document gains `named`'s lane, and
-/// `blobs/` every object it reaches. Objects are hard-linked when they can be.
+/// The endpoint layout ([`Endpoint`]): `name`'s refs document gains `named`'s release, and
+/// `blobs/` every object of its tree's closure here (`named`'s variant whole). Objects are hard-linked when they can be.
 pub fn export_origin(store: &Store, named: &Named, dir: &Path) -> Result<Vec<String>> {
-    let (Some(name), Some(version), Some(lane)) = (&named.name, &named.release, &named.lane) else {
+    let (Some(tree), Some(name), Some(version)) = (&named.tree, &named.name, &named.release) else {
         return fail(
             Kind::NotFound,
-            format!(
-                "no ref names {}: an origin serves refs, export a named one",
-                named.manifest.sha256
-            ),
+            format!("no release names {}: an origin serves refs, export a named one", named.header.sha256),
         );
     };
+    for object in store.closure(&named.header)? {
+        if !store.path(&object)?.exists() {
+            return fail(Kind::NotFound, format!("object {} is not here", object.sha256));
+        }
+    }
     let mut written = Vec::new();
-    for object in store.closure(&named.manifest)? {
+    // Other variants of the tree are served as far as they are here.
+    for object in store.closure(tree)? {
         let key = object.key();
         let dest = dir.join(&key);
         if fs::metadata(&dest).is_ok_and(|m| m.len() == object.length) {
@@ -473,10 +434,7 @@ pub fn export_origin(store: &Store, named: &Named, dir: &Path) -> Result<Vec<Str
         }
         let src = store.path(&object)?;
         if !src.exists() {
-            return fail(
-                Kind::NotFound,
-                format!("object {} is not here", object.sha256),
-            );
+            continue;
         }
         let parent = dest.parent().expect("a blob has a shard");
         fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
@@ -494,7 +452,7 @@ pub fn export_origin(store: &Store, named: &Named, dir: &Path) -> Result<Vec<Str
         Err(_) => None,
     };
     let order = store.get_ref(name)?.map(|r| r.releases).unwrap_or_default();
-    let repo = with_lane(old, name, version, lane, &named.manifest, &order);
+    let repo = with_release(old, name, version, tree, &order);
     let parent = path.parent().expect("a ref has a directory");
     fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
     fs::write(&path, repo.to_json()?).map_err(|e| io(&path, e))?;

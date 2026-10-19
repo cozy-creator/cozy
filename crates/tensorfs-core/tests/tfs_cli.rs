@@ -123,13 +123,13 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
         (
             written["name"].as_str(),
             written["release"].as_str(),
-            written["lane"].as_str()
+            written["variant"].as_str()
         ),
         (Some("acme/syn"), Some("1"), Some("mixed"))
     );
 
     let inspected = ok(&a, &["inspect", "acme/syn"]);
-    assert_eq!(inspected["manifest"], written["manifest"]);
+    assert_eq!(inspected["header"], written["header"]);
     let unet = &inspected["components"][0];
     assert_eq!(unet["name"], "unet");
     // One tensor of each scheme: its encoding, complete, at a glance.
@@ -168,8 +168,8 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
     assert!(human.contains("    6 × plain\n"), "{human}");
 
     let store = Store::open(&a).unwrap();
-    let manifest = serde_json::from_value(written["manifest"].clone()).unwrap();
-    let ck = store.checkpoint(&manifest).unwrap();
+    let header = serde_json::from_value(written["header"].clone()).unwrap();
+    let ck = store.checkpoint(&header).unwrap();
     // A standalone part (the 32 MiB embedding) and packs, never across components.
     assert!(ck.header().chunks.iter().any(|c| c.length == 32 << 20));
     let grouped = regions(ck.header(), 4 << 20, &[], &[]);
@@ -197,10 +197,8 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
         .unwrap()
         .iter()
         .any(|f| f == "unet/diffusion_pytorch_model.safetensors"));
-    assert_eq!(
-        fs::read(out.join("unet/config.json")).unwrap(),
-        ck.file("unet/config.json").unwrap()
-    );
+    let config: Json = serde_json::from_slice(&fs::read(out.join("unet/config.json")).unwrap()).unwrap();
+    assert_eq!(config, Json::Object(ck.component("unet").unwrap().config.clone()));
     let files = [
         ("unet", "unet/diffusion_pytorch_model.safetensors"),
         ("text_encoder", "text_encoder/model.safetensors"),
@@ -301,7 +299,7 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
         &["export", "acme/syn", origin.to_str().unwrap(), "--origin"],
     );
     let pulled = ok(&b, &["pull", origin.to_str().unwrap(), "acme/syn@1"]);
-    assert_eq!(pulled["manifest"], written["manifest"]);
+    assert_eq!((&pulled["header"], &pulled["tree"]), (&written["header"], &written["tree"]));
     assert_eq!(blobs(&b), blobs(&a));
     assert_eq!(
         fs::read(b.join("refs/acme/syn.json")).unwrap(),

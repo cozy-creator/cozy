@@ -4,7 +4,7 @@
 
 use super::affine::pack as pack_words;
 use super::elem::{e2m1, e4m3};
-use super::{Encoder, Input, OwnedPart, encoding};
+use super::{encoding, Encoder, Input, OwnedPart};
 use crate::format::decode::affine::{Codes, Fill, Order, Packing};
 use crate::format::decode::elem::floats;
 use crate::format::decode::grid::Grid;
@@ -297,9 +297,8 @@ fn layout(
             };
             let mut out = vec![0u8; (v.rows / v.n.max(1)) * rows * blocks];
             for (i, row) in scales.chunks_exact(w.max(1)).enumerate() {
-                let base = i / v.n * rows * blocks;
                 for (b, s) in row.iter().enumerate() {
-                    out[base + grid.at(v.n, w, i % v.n, b)] = *s;
+                    out[grid.at(v.rows, w, v.n, i, b)] = *s;
                 }
             }
             ([v.stack, &[rows as u64, blocks as u64]].concat(), out)

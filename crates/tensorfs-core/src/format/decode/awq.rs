@@ -1,10 +1,11 @@
 //! `awq.int4` (spec §6 `awq.int4`): AutoAWQ's GEMM layout, 4-bit codes packed along N in the
 //! order `[0, 2, 4, 6, 1, 3, 5, 7]`, a zero and a scale per group of inputs.
 
-use super::affine::{dequant, Codes, Fill, Offset, Order, Packing};
-use super::gptq::{group, groups, GROUP_SIZE, HALF, I32};
+use super::affine::{Codes, Fill, Order, Packing};
+use super::gptq::{group, groups, zeros, GROUP_SIZE, HALF, I32};
 use super::grid::{Grid, ScaleLayout};
-use super::{Ctx, Part, Scheme, View};
+use super::plan::{self, Term};
+use super::{Ctx, Part, Plan, Scheme, View};
 use crate::format::Result;
 
 pub const INT4: Scheme = Scheme {
@@ -41,7 +42,7 @@ pub const ZEROS: Packing = Packing {
     ..CODES
 };
 
-fn blocks(c: &Ctx) -> Grid<'static> {
+fn blocks(c: &Ctx) -> Grid {
     Grid::Blocks {
         size: group(c),
         layout: ScaleLayout::Transposed,
@@ -50,20 +51,12 @@ fn blocks(c: &Ctx) -> Grid<'static> {
 }
 
 /// `(q − z) × s(i, ⌊j/g⌋)`.
-fn decode(c: &Ctx) -> Result<Vec<f32>> {
-    let q = CODES.unpack(c.part("qweight").bytes, c.rows, c.cols)?;
-    let z: Vec<f32> = (ZEROS
-        .unpack(c.part("qzeros").bytes, groups(c), c.rows)?
-        .into_iter())
-    .map(|v| v as f32)
-    .collect();
-    let s = c.floats("scales");
-    Ok(dequant(
-        &q,
-        &s,
-        Offset::Zero(&z),
-        &blocks(c),
-        c.rows,
-        c.cols,
-    ))
+fn decode<'a>(c: &Ctx<'a>) -> Result<Plan<'a>> {
+    let z = ZEROS.unpack(c.part("qzeros").bytes, groups(c), c.rows)?;
+    let weight = c.part("qweight").bytes;
+    Ok(plan::Codes {
+        term: Term::Zero(zeros(z)),
+        ..plan::Codes::new(weight, CODES, c.part("scales"), blocks(c))
+    }
+    .into())
 }

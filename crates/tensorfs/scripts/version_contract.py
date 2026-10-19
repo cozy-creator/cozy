@@ -153,8 +153,11 @@ def installed_version(path: pathlib.Path) -> str:
         raise ValueError(
             f"tensorfs.__version__ {tensorfs.__version__!r} != wheel version {expected!r}"
         )
-    if not hasattr(tensorfs, "Store"):
-        raise ValueError("tensorfs must install the full Store API as well as the CLI")
+    for name in ("open", "Writer", "upload_folder", "Tensors"):
+        if not callable(getattr(tensorfs, name, None)):
+            raise ValueError(f"tensorfs must install the full public component API: missing {name}")
+    if hasattr(tensorfs, "Store"):
+        raise ValueError("the internal Store is exposed by the public package")
     installed_tfs = pathlib.Path(sysconfig.get_path("scripts")) / "tfs"
     if not os.access(installed_tfs, os.X_OK):
         raise ValueError(f"install put no executable tfs at {installed_tfs}")

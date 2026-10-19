@@ -37,7 +37,7 @@ create_exception!(tensorfs.varena, IoError, PlaneError);
 create_exception!(tensorfs.varena, Closed, PlaneError);
 create_exception!(tensorfs.varena, Unsupported, PlaneError);
 
-/// The one conversion. Source refusals cross as the usual `tensorfs.errors` classes.
+/// The one conversion. Source failures cross as the common `tensorfs.Error` families.
 fn err(py: Python<'_>, e: Error) -> PyErr {
     let msg = e.to_string();
     let x = match &e {
@@ -268,7 +268,7 @@ impl PyPlane {
         let regions = regions.unwrap_or_else(|| tensorfs_core::client::regions(ck.header(), 64 << 20, &[], &[]));
         let (id, layout) = py
             .detach(|| {
-                let id = plane.register_checkpoint(&name, ck, &regions, host_fd)?;
+                let id = plane.register_checkpoint(&name, &ck, &regions, host_fd)?;
                 Ok((id, plane.layout(id)?))
             })
             .or_raise(py)?;
