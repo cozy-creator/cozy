@@ -162,9 +162,9 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     assert_eq!(pulled.header, header);
     assert_eq!(into.checkpoint(&header).unwrap().read("model", "w").unwrap(), weights);
     if let Some(python) = var("TENSORFS_TEST_PYTHON") {
-        let (key, thumbprint) = key();
+        let (python_key, thumbprint) = key();
         let capability = device.sign_run_capability(&RunCapability {
-            user_id,
+            user_id: user_id.clone(),
             hub: origin.clone(),
             key_jkt: thumbprint,
             run: format!("python-{nonce}"),
@@ -175,7 +175,7 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
             lifetime: Duration::from_secs(600),
         });
         let request = json!({
-            "key": key, "capability": capability, "origin": origin, "endpoint": reach,
+            "key": python_key, "capability": capability, "origin": origin, "endpoint": reach,
             "token_endpoint": user.token_endpoint().await.unwrap(), "model": model,
             "other": other, "tree": base_tree.id(), "owner_token": bearer.token,
             "ca": ca, "cache_dir": scratch.join("python"),
