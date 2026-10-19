@@ -58,8 +58,9 @@ fn boot(home: &Path) -> (Machine, Client) {
     (machine, client)
 }
 
-/// The cpu_bulk fixture written to the machine as a local tree of `release`: its manifest's digest.
-async fn tree(client: &Client, release: &str) -> String {
+/// The cpu_bulk fixture written to the machine as a local tree, its code marked `variant`: its
+/// manifest's digest.
+async fn tree(client: &Client, variant: &str) -> String {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpu_bulk");
     let bulk = client.bulk().unwrap();
     let write = async |bytes: Vec<u8>| -> String {
@@ -70,11 +71,14 @@ async fn tree(client: &Client, release: &str) -> String {
     };
     let mut files = vec![];
     for name in ["pyproject.toml", "package.toml", "cpu_bulk/__init__.py"] {
-        let bytes = std::fs::read(fixture.join(name)).unwrap();
+        let mut bytes = std::fs::read(fixture.join(name)).unwrap();
+        if name.ends_with(".py") {
+            bytes.extend(format!("# {variant}\n").bytes());
+        }
         let length = bytes.len();
         files.push(serde_json::json!({"name": name, "digest": write(bytes).await, "length": length}));
     }
-    let manifest = serde_json::json!({"package": "local/tensord-cpu-bulk", "release": release, "files": files});
+    let manifest = serde_json::json!({"package": "local/tensord-cpu-bulk", "release": "0.1.0", "files": files});
     write(manifest.to_string().into_bytes()).await
 }
 
@@ -124,7 +128,7 @@ fn place(state: &v1::RunState) -> bool {
 async fn a_queued_run_names_the_install_or_the_executor_slot_it_waits_for() {
     let home = tempfile::tempdir().unwrap();
     let (_machine, client) = boot(home.path());
-    let manifest = tree(&client, "0.1.0").await;
+    let manifest = tree(&client, "").await;
 
     // Runs a and b of one tree, sent together: one builds its environment, and the other waits
     // for that run's install, by name.
@@ -156,7 +160,7 @@ async fn a_queued_run_names_the_install_or_the_executor_slot_it_waits_for() {
 async fn queued_runs_start_a_model_at_a_time_show_their_place_and_cancel() {
     let home = tempfile::tempdir().unwrap();
     let (_machine, client) = boot(home.path());
-    let manifest = tree(&client, "0.1.0").await;
+    let manifest = tree(&client, "").await;
     client.submit(&v1::RunRequest { id: "w".into(), spec: spec(&manifest, "", "") }).await.unwrap();
     assert_eq!(follow(&client, "w").await.2.status, "succeeded");
 
@@ -165,22 +169,27 @@ async fn queued_runs_start_a_model_at_a_time_show_their_place_and_cancel() {
     client.submit(&v1::RunRequest { id: "c".into(), spec: spec(&manifest, "nap", r#"{"seconds":8.0}"#) }).await.unwrap();
     until(&client, "c", |state| state.state == "running").await;
     let queued = [("n1", "nap", nap), ("b1", "bulk", bulk), ("n2", "nap", nap), ("x", "nap", nap), ("b2", "bulk", bulk), ("n3", "nap", nap)];
+    let mut followed = vec![];
     for (id, entrypoint, payload) in queued {
         client.submit(&v1::RunRequest { id: id.into(), spec: spec(&manifest, entrypoint, payload) }).await.unwrap();
+        let client = client.clone();
+        followed.push((id, entrypoint, tokio::spawn(async move { follow(&client, id).await })));
     }
     // x is cancelled in line: it never starts.
     until(&client, "x", place).await;
     client.cancel("x").await.unwrap();
-    let (_, started, outcome) = follow(&client, "x").await;
-    assert_eq!((outcome.status.as_str(), started), ("canceled", None), "{outcome:?}");
 
     let mut runs = vec![];
-    for (id, entrypoint, _) in queued.iter().filter(|(id, _, _)| *id != "x") {
-        let (reasons, started, outcome) = follow(&client, id).await;
+    for (id, entrypoint, followed) in followed {
+        let (reasons, started, outcome) = followed.await.unwrap();
         println!("{id} ({entrypoint}) waited for {reasons:?}, started at {started:?}");
+        if id == "x" {
+            assert_eq!((outcome.status.as_str(), started), ("canceled", None), "{outcome:?}");
+            continue;
+        }
         assert_eq!(outcome.status, "succeeded", "{id}: {outcome:?}");
         assert!(reasons.iter().any(|r| r.starts_with("position ") && r.ends_with(" in the queue")), "{id}: {reasons:?}");
-        runs.push((started.unwrap(), *entrypoint));
+        runs.push((started.unwrap(), entrypoint));
     }
     // From c's model, one switch to the other and one back, never one per run as in arrival order.
     runs.sort();
@@ -193,7 +202,7 @@ async fn queued_runs_start_a_model_at_a_time_show_their_place_and_cancel() {
 async fn a_restart_keeps_the_queue_and_prepares_an_interrupted_run_again() {
     let home = tempfile::tempdir().unwrap();
     let (machine, client) = boot(home.path());
-    let manifest = tree(&client, "0.1.0").await;
+    let manifest = tree(&client, "").await;
     client.submit(&v1::RunRequest { id: "w".into(), spec: spec(&manifest, "", "") }).await.unwrap();
     assert_eq!(follow(&client, "w").await.2.status, "succeeded");
     // q waits in line behind c; p, of a release not installed yet, is preparing when the
@@ -202,7 +211,7 @@ async fn a_restart_keeps_the_queue_and_prepares_an_interrupted_run_again() {
     until(&client, "c", |state| state.state == "running").await;
     client.submit(&v1::RunRequest { id: "q".into(), spec: spec(&manifest, "nap", r#"{"seconds":0.0}"#) }).await.unwrap();
     until(&client, "q", place).await;
-    let fresh = tree(&client, "0.1.1").await;
+    let fresh = tree(&client, "fresh").await;
     client.submit(&v1::RunRequest { id: "p".into(), spec: spec(&fresh, "nap", r#"{"seconds":0.0}"#) }).await.unwrap();
     drop(machine);
     std::fs::remove_file(home.path().join(".cozy/machine/var/lib/cozy/tensord/api-ready.json")).unwrap();
