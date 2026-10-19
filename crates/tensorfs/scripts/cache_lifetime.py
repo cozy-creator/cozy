@@ -76,10 +76,10 @@ class CacheLifetime(unittest.TestCase):
             self.assertFalse(
                 blob(stale).exists(), "unrelated closed checkpoint was retained"
             )
+            self.assertEqual(tensors.read("weight").tobytes(), b"unread-active-payload")
             self.assertTrue(
                 blob(active).is_file(), "the unread owner's header disappeared"
             )
-            self.assertEqual(tensors.read("weight").tobytes(), b"unread-active-payload")
             del tensors
             gc.collect()
             second = collect_in_other_process()
