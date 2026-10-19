@@ -60,8 +60,10 @@ fn items<'a>(bytes: &'a [u8], d: &mut Decoder<'a>) -> Vec<&'a [u8]> {
         .collect()
 }
 
-/// The old header's encodings and each component's name and tensors, as bytes.
-fn raw(header: &[u8], root_len: usize, (encodings, components, tensors): (usize, usize, usize)) -> (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>) {
+/// A header's encodings, and each component's name and tensors, as bytes.
+type Raw = (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>);
+
+fn raw(header: &[u8], root_len: usize, (encodings, components, tensors): (usize, usize, usize)) -> Raw {
     let mut d = Decoder::new(header);
     let root = items(header, &mut d);
     assert_eq!(root.len(), root_len);

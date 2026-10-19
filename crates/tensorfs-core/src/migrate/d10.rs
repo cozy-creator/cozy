@@ -388,7 +388,7 @@ fn upgrade(old: &[u8]) -> Result<Header> {
     }
     out.push(0x80);
     let n = d.array().map_err(bad)?.ok_or_else(|| invalid("an indefinite components array".into()))?;
-    head(&mut out, 4, n);
+    array(&mut out, n);
     for _ in 0..n {
         if d.array().map_err(bad)? != Some(2) {
             return fail(Kind::Invalid, "an old component is not [name, tensors]");
@@ -406,15 +406,15 @@ fn upgrade(old: &[u8]) -> Result<Header> {
     Ok(Header::from_cbor(&out)?)
 }
 
-fn head(out: &mut Vec<u8>, major: u8, n: u64) {
-    let m = major << 5;
+/// A CBOR array head of `n` items, in its shortest form.
+fn array(out: &mut Vec<u8>, n: u64) {
+    let wide = n.to_be_bytes();
     match n {
-        0..=23 => out.push(m | n as u8),
-        24..=0xff => out.extend([m | 24, n as u8]),
-        _ => {
-            out.push(m | 27);
-            out.extend(n.to_be_bytes());
-        }
+        0..=23 => out.push(0x80 | n as u8),
+        24..=0xff => out.extend([0x98, n as u8]),
+        0x100..=0xffff => out.extend([&[0x99][..], &wide[6..]].concat()),
+        0x1_0000..=0xffff_ffff => out.extend([&[0x9a][..], &wide[4..]].concat()),
+        _ => out.extend([&[0x9b][..], &wide[..]].concat()),
     }
 }
 
