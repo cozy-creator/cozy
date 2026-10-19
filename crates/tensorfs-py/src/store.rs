@@ -371,8 +371,9 @@ impl PyStore {
                 }
             };
             if let (Some(tree), Some(version)) = (&tree, &version) {
-                self.store.update_ref(&repo_id, |old| Some(fetch::with_tree(old, &repo_id, tree, Some(version))))?;
-                self.store.cache_ref(&repo_id)?;
+                if let Some(repo) = self.store.update_ref(&repo_id, |old| Some(fetch::with_tree(old, &repo_id, tree, Some(version))))? {
+                    self.store.cache_ref(&repo)?;
+                }
             }
             Ok(Named { header, tree, name: Some(repo_id), release: version, variant: chosen })
         }).or_raise(py)?;
@@ -463,11 +464,16 @@ impl PyStore {
             let _object_hold = self.store.cache_hold(&objects)?;
             remote.fetch(&objects, 0)?;
             if let Some(version) = version {
-                self.store.update_ref(repo_id, |old| Some(fetch::with_tree(old, repo_id, &root, Some(&version))))?;
-                self.store.cache_ref(repo_id)?;
+                if let Some(repo) = self.store.update_ref(repo_id, |old| Some(fetch::with_tree(old, repo_id, &root, Some(&version))))? {
+                    self.store.cache_ref(&repo)?;
+                }
             }
             let internal = local_dir.is_none();
             let dest = local_dir.unwrap_or_else(|| self.store.root().join("snapshots").join(&root.sha256));
+            let _view_hold = if internal { Some(self.store.cache_directory(&dest)?) } else {
+                self.store.cache_preserve_snapshot(&dest)?;
+                None
+            };
             let variants: Option<Vec<_>> = variant.map(|v| vec![v]);
             self.store.snapshot(&root, &dest, variants.as_deref())?;
             if internal { self.store.cache_snapshot(&dest)?; }
@@ -491,11 +497,16 @@ impl PyStore {
             let object = tree.files.get(filename).ok_or_else(|| Failure { kind: Kind::NotFound, detail: format!("no file {filename}") })?;
             remote.fetch(std::slice::from_ref(object), 0)?;
             if let Some(version) = version {
-                self.store.update_ref(repo_id, |old| Some(fetch::with_tree(old, repo_id, &root, Some(&version))))?;
-                self.store.cache_ref(repo_id)?;
+                if let Some(repo) = self.store.update_ref(repo_id, |old| Some(fetch::with_tree(old, repo_id, &root, Some(&version))))? {
+                    self.store.cache_ref(&repo)?;
+                }
             }
             let internal = local_dir.is_none();
             let folder = local_dir.unwrap_or_else(|| self.store.root().join("snapshots").join(&root.sha256));
+            let _view_hold = if internal { Some(self.store.cache_directory(&folder)?) } else {
+                self.store.cache_preserve_snapshot(&folder)?;
+                None
+            };
             let dest = folder.join(filename);
             self.store.materialize(object, &dest)?;
             if internal { self.store.cache_snapshot(&folder)?; }
