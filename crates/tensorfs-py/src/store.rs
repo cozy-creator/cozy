@@ -1016,18 +1016,18 @@ impl PyWriter {
 
     /// Declares component `name` (again: its class and config change, its tensors stay) and
     /// hands back its writer.
-    #[pyo3(signature = (name, cls = String::new(), config = None, config_file = None))]
+    #[pyo3(signature = (name, cls = "", config = None, config_file = None))]
     fn component(
         slf: &Bound<'_, Self>,
         name: String,
-        cls: String,
+        cls: &str,
         config: Option<&Bound<'_, PyDict>>,
         config_file: Option<String>,
     ) -> PyResult<PyComponentWriter> {
         let py = slf.py();
         let config = config.map(config_map).transpose()?.unwrap_or_default();
         slf.get().with(py, |w| {
-            w.component(&name, &cls, config, config_file.as_deref())?;
+            w.component(&name, cls, config, config_file.as_deref())?;
             Ok(())
         })?;
         Ok(PyComponentWriter { w: slf.clone().unbind(), name })
