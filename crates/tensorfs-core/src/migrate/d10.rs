@@ -10,7 +10,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::StreamExt;
 use minicbor::Decoder;
 use serde::Deserialize;
 use serde_json::{json, Value as Json};
@@ -460,17 +459,11 @@ async fn old_objects(endpoint: &Arc<Endpoint>, client: &Client, scratch: &Store,
 
 /// Sends what `endpoint` lacks of `objects`: how many it sent, and their bytes.
 async fn upload(endpoint: &Endpoint, objects: &Objects) -> Result<(usize, u64)> {
-    let mut sends = futures::stream::iter(objects)
-        .map(|(object, bytes)| async move {
-            let bytes = Bytes::from(bytes.clone());
-            let sent = endpoint.upload(object, &move || Ok(Payload::Bytes(bytes.clone()))).await?;
-            Ok::<_, crate::err::Refusal>((sent, object.length))
-        })
-        .buffered(16);
     let mut sent = (0, 0);
-    while let Some(one) = sends.next().await {
-        if let (true, length) = one? {
-            sent = (sent.0 + 1, sent.1 + length);
+    for (object, bytes) in objects {
+        let bytes = Bytes::from(bytes.clone());
+        if endpoint.upload(object, &move || Ok(Payload::Bytes(bytes.clone()))).await? {
+            sent = (sent.0 + 1, sent.1 + object.length);
         }
     }
     Ok(sent)
