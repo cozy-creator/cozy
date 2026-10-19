@@ -107,7 +107,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("workdir", nargs="?")
     ap.add_argument("--blocks", type=int, default=12)
-    ap.add_argument("--dim", type=int, default=2048)
+    # a block under 16 MiB shares the writer's packs with the next, so its region is common
+    ap.add_argument("--dim", type=int, default=4096)
     ap.add_argument("--batch", type=int, default=512)
     a = ap.parse_args()
     root = Path(a.workdir or tempfile.mkdtemp(prefix="varena-torch-")) / "store"
@@ -137,11 +138,10 @@ def main() -> int:
     # cold, then warm: one request, two passes
     with torch.no_grad(), mem.request("cold-warm") as r:
         cold, warm = net(x), net(x)
+        same = torch.equal(cold, want) and torch.equal(warm, want)
+        del cold, warm  # what outlives a request is its leftover
     steps = r.stats.steps
-    check(
-        "cold and warm passes equal the reference",
-        torch.equal(cold, want) and torch.equal(warm, want),
-    )
+    check("cold and warm passes equal the reference", same)
     check(
         "the first pass copies the model home",
         steps[0].paged_in >= model.nbytes - model.common.nbytes,
@@ -223,13 +223,15 @@ def main() -> int:
     check("the page goes once the view does", resident(model.name) < block)
 
     # a failed request frees what it allocated
+    def fault() -> None:  # a package's frame: the request clears its locals
+        junk = torch.empty(256 << 20, dtype=torch.uint8, device=dev)
+        raise RuntimeError(f"a package fault holding {junk.numel()} bytes")
+
     try:
         with mem.request("fails") as r:
-            junk = torch.empty(256 << 20, dtype=torch.uint8, device=dev)
-            raise RuntimeError("a package fault")
+            fault()
     except RuntimeError:
         pass
-    del junk
     check("a failed request leaves no bytes", r.stats.leftover == ((0, 0),), str(r.stats.leftover))
 
     # two threads, one model, at once
@@ -299,10 +301,10 @@ def main() -> int:
         want1, want2 = biased(1.0), biased(2.0)
         with mem.request("filled"):
             f1, f2 = net2(x), net2(x)
+        fills = fill.fills
         with mem.request("warm"):
-            f3 = net2(x)
-            fills = fill.fills
-            f4 = net2(x)
+            f3, f4 = net2(x), net2(x)
+        warm = fill.fills
         fill.add = 2.0
         with mem.request("prepared"):
             f5 = net2(x)
@@ -310,7 +312,7 @@ def main() -> int:
         "fill runs on page-in and bind makes the tensors",
         all(torch.equal(f, want1) for f in (f1, f2, f3, f4)),
     )
-    check("a resident page is not filled again", fill.fills == fills, str(fill.fills))
+    check("a resident page is not filled again", warm == fills, f"{fills} -> {warm}")
     check("a new prepare() refills the pages", torch.equal(f5, want2))
 
     # rung 2 takes an idle model's cold pages before a warm one's
