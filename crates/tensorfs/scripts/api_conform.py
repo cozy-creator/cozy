@@ -62,6 +62,38 @@ with TemporaryDirectory() as temp:
     assert selected.missing(["optimizer"]), "a model-only snapshot fetched the optimizer"
     assert np.array_equal(np.from_dlpack(selected.components["model"].tensors.read("weight")), values)
     assert metadata.missing(["optimizer"]), "reading one component fetched another"
+    progress = []
+    metadata.fetch(["model"], progress=lambda stage, held, total: progress.append((stage, held, total)))
+    assert progress[0][0] == "fetch" and progress[-1][1] == progress[-1][2]
+    callback_failure = tensorfs.NetworkError("consumer progress failed")
+
+    def stop(stage, held, total):
+        raise callback_failure
+
+    try:
+        metadata.fetch(progress=stop)
+    except tensorfs.NetworkError as error:
+        assert error is callback_failure
+    else:
+        raise AssertionError("the progress callback failure disappeared")
+    endpoint = tensorfs.Endpoint("local", cache_dir=root / "empty-endpoint")
+    try:
+        endpoint.update_repo("proof/invalid", lambda old: {"oops": True})
+    except tensorfs.InvalidError:
+        pass
+    else:
+        raise AssertionError("an invalid repo change was not an invalid argument")
+    callback_conflict = tensorfs.ConflictError("consumer revision conflict")
+
+    def conflict(old):
+        raise callback_conflict
+
+    try:
+        endpoint.update_repo("proof/invalid", conflict)
+    except tensorfs.ConflictError as error:
+        assert error is callback_conflict
+    else:
+        raise AssertionError("the repository callback lost its error family")
     blocked = root / "not-a-directory"
     blocked.write_bytes(b"blocked")
     failed = tensorfs.Writer(repo_id="acme/blocked", endpoint=blocked.as_uri())

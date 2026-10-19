@@ -3,6 +3,8 @@
 import json
 import ssl
 import sys
+import threading
+import time
 from pathlib import Path
 
 import tensorfs
@@ -86,4 +88,53 @@ local = local.commit()
 tensorfs.upload_folder(repo_id=request["model"], folder_path=local.path, endpoint=request["endpoint"],
                        cache_dir=cache, ca_der=ca, token=owner.headers)
 assert any(method == "PUT" and isinstance(payload, str) and len(payload) == 64 for method, _, _, payload in calls)
+
+entered = threading.Event()
+release = threading.Event()
+inspecting = threading.Event()
+failures = []
+
+
+class BlockingOwner(Owner):
+    def headers(self, method, url, headers, payload):
+        if method == "PUT":
+            entered.set()
+            assert release.wait(20), "the second writer caller kept the callback from resuming"
+        return super().headers(method, url, headers, payload)
+
+
+streaming = tensorfs.Writer(repo_id=request["model"], endpoint=request["endpoint"], token=BlockingOwner(), ca_der=ca, cache_dir=cache)
+component = streaming.component("model", cls="", config={})
+component.put("threaded", b"two threads", dtype="U8", shape=[11])
+
+
+def commit():
+    try:
+        streaming.commit()
+    except BaseException as error:
+        failures.append(error)
+
+
+def inspect_and_abandon():
+    inspecting.set()
+    try:
+        streaming.has("model", "threaded")
+        component.has("threaded")
+        streaming.abandon()
+    except BaseException as error:
+        failures.append(error)
+
+
+committer = threading.Thread(target=commit)
+committer.start()
+assert entered.wait(20), "the real upload never called its Python provider"
+inspector = threading.Thread(target=inspect_and_abandon)
+inspector.start()
+assert inspecting.wait(20)
+time.sleep(0.05)
+release.set()
+committer.join(20)
+inspector.join(20)
+assert not committer.is_alive() and not inspector.is_alive(), "writer callers deadlocked with the token callback"
+assert not failures, failures
 print("Python Endpoint/AuthKit: lazy DPoP, warm cache, exact tree, denied upload and provider callbacks passed")

@@ -239,11 +239,20 @@ struct Remote {
 
 impl Remote {
     fn fetch(&self, objects: &[ObjectRef], priority: u64) -> Result<(), Failure> {
+        self.fetch_progress(objects, priority, &|_, _| Ok(()))
+    }
+
+    fn fetch_progress(&self, objects: &[ObjectRef], priority: u64, report: &(dyn Fn(u64, u64) -> Result<(), Failure> + Sync)) -> Result<(), Failure> {
+        let total = objects.iter().map(|object| object.length).sum();
+        report(0, total)?;
         if self.offline {
+            let mut held = 0;
             for object in objects {
                 if !self.store.reuse(object)? {
                     return Err(Failure { kind: Kind::NotFound, detail: format!("{} is not cached", object.id()) });
                 }
+                held += object.length;
+                report(held, total)?;
             }
             return Ok(());
         }
@@ -251,7 +260,21 @@ impl Remote {
         let store: Arc<dyn ObjectStore> = Arc::new(self.store.clone());
         fetch::runtime()?.block_on(async {
             let fetcher = Fetcher::new(store, self.client.clone(), None, fetch::Config::default());
-            fetcher.objects(&origin, objects, &Want { priority, ..Want::default() }).await?;
+            let counters = fetch::Progress::default();
+            let want = Want { priority, progress: Some(&counters), ..Want::default() };
+            let mut work = std::pin::pin!(fetcher.objects(&origin, objects, &want));
+            let mut tick = tokio::time::interval(Duration::from_millis(250));
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut work => {
+                        report(counters.held.load(std::sync::atomic::Ordering::Relaxed), total)?;
+                        result?;
+                        break;
+                    }
+                    _ = tick.tick() => report(counters.held.load(std::sync::atomic::Ordering::Relaxed), total)?,
+                }
+            }
             fetcher.settled().await;
             Ok(())
         })
@@ -1059,8 +1082,36 @@ impl PyCheckpoint {
 
     #[pyo3(signature = (components = None, *, priority = 0, progress = None))]
     fn fetch(&self, py: Python<'_>, components: Option<Vec<String>>, priority: u64, progress: Option<Py<PyAny>>) -> PyResult<()> {
-        let _ = progress;
-        self.access(py)?.fetch_components(py, components.as_deref(), priority)
+        let access = self.access(py)?;
+        let objects = tensorfs_core::store2::wanted(access.checkpoint.header(), components.as_deref()).or_raise(py)?;
+        let callback_error = Mutex::new(None);
+        let report = |held, total| -> Result<(), Failure> {
+            if let Some(callback) = &progress {
+                if let Err(error) = Python::attach(|py| callback.call1(py, ("fetch", held, total))) {
+                    *callback_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                    return Err(Failure { kind: Kind::Invalid, detail: "the download progress callback failed".into() });
+                }
+            }
+            Ok(())
+        };
+        let result = py.detach(|| -> Result<(), Failure> {
+            if let Some(remote) = &access.remote {
+                return remote.fetch_progress(&objects, priority, &report);
+            }
+            let total = objects.iter().map(|object| object.length).sum();
+            report(0, total)?;
+            let mut held = 0;
+            for object in &objects {
+                if !access.checkpoint.holds(object)? {
+                    return Err(Failure { kind: Kind::NotFound, detail: format!("{} is absent and has no download endpoint", object.id()) });
+                }
+                held += object.length;
+                report(held, total)?;
+            }
+            Ok(())
+        });
+        if let Some(error) = callback_error.into_inner().unwrap_or_else(|e| e.into_inner()) { return Err(error); }
+        result.or_raise(py)
     }
 
     /// The header's loading metadata (`source`, `filled`, `safetensors_metadata`).
@@ -1423,19 +1474,33 @@ impl PyWriter {
     }
 
     /// Written already (or by an interrupted writer of this key); base tensors don't count.
-    fn has(&self, component: &str, key: &str) -> bool {
-        let guard = self.w.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().is_some_and(|w| w.has(component, key))
+    fn has(&self, py: Python<'_>, component: &str, key: &str) -> bool {
+        py.detach(|| {
+            let guard = self.w.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().is_some_and(|w| w.has(component, key))
+        })
     }
 
     /// Lays out the chunks and seals the header; it is pinned under the writer's key, or its
     /// digest. Returns the new checkpoint.
     fn commit(&self, py: Python<'_>) -> PyResult<PyCheckpoint> {
-        let header = match self.with(py, |w| Ok(w.commit()?)) {
+        let (result, retained, published, files) = py.detach(|| {
+            let mut guard = self.w.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(writer) = guard.as_mut() else {
+                return (Err(Failure { kind: Kind::Invalid, detail: "the writer has committed or been abandoned".into() }), None, None, Default::default());
+            };
+            let result = writer.commit().map_err(Failure::from);
+            let retained = writer.committed().cloned();
+            let published = writer.published().cloned();
+            let files = writer.repo_files().clone();
+            if result.is_ok() { guard.take(); }
+            (result, retained, published, files)
+        });
+        let header = match result {
             Ok(header) => header,
-            Err(err) => {
-                let header = self.w.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|w| w.committed().cloned());
-                if let Some(header) = header {
+            Err(failure) => {
+                let err = raise(py, failure);
+                if let Some(header) = retained {
                     let ck = opened(py, &self.store, Named { header, tree: None, name: None, release: None, variant: self.variant.clone() })?;
                     err.value(py).setattr("checkpoint", Py::new(py, ck)?)?;
                 }
@@ -1443,16 +1508,12 @@ impl PyWriter {
             }
         };
         let tree = if self.repo_id.is_some() {
-            let guard = self.w.lock().unwrap_or_else(|e| e.into_inner());
-            let writer = guard.as_ref().expect("commit retained its writer");
-            let published = writer.published().cloned();
-            let mut tree = Tree { files: writer.repo_files().clone() };
+            let mut tree = Tree { files };
             tree.set_variant(self.variant.as_deref().unwrap_or(""), header.clone());
             let local = py.detach(|| self.store.put_tree(&tree)).or_raise(py)?;
             if published.as_ref() != Some(&local) { return Err(invalid(py, "the uploaded tree differs from the local tree")); }
             published
         } else { None };
-        self.w.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(dest) = &self.dest {
             let ck = py.detach(|| Checkpoint::folder(dest, Some(self.variant.as_deref().unwrap_or("")), Some(&self.store))).or_raise(py)?;
             return Ok(PyCheckpoint::new(ck.header().clone(), Some(ck), None));
@@ -1462,10 +1523,11 @@ impl PyWriter {
     }
 
     /// Ends the writer without a checkpoint.
-    fn abandon(&self) {
-        if let Some(w) = self.w.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            w.abandon();
-        }
+    fn abandon(&self, py: Python<'_>) {
+        py.detach(|| {
+            let writer = self.w.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(writer) = writer { writer.abandon(); }
+        })
     }
 }
 
@@ -1615,8 +1677,8 @@ impl PyComponentWriter {
     }
 
     /// Written already (or by an interrupted writer of this key).
-    fn has(&self, key: &str) -> bool {
-        self.w.get().has(&self.name, key)
+    fn has(&self, py: Python<'_>, key: &str) -> bool {
+        self.w.get().has(py, &self.name, key)
     }
 }
 
