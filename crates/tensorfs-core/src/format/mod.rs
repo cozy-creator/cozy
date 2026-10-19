@@ -3,19 +3,21 @@
 //! sha2 only, so it builds without the `store` feature.
 
 mod cbor;
-mod decode;
+pub mod decode;
 mod doc;
 mod dtype;
+pub mod encode;
 mod json;
 pub mod layout;
 mod value;
 
-pub use decode::{decode, GlobalScale, NibbleOrder, PartBytes, ScaleLayout, SCHEMES};
+pub use decode::{decode, grid::ScaleLayout, PartBytes, SCHEMES};
 pub use doc::{
     repo_key, Body, Component, Encoding, Header, Location, Manifest, Metadata, ObjectRef, Part,
     Release, Repo, Span, Tensor,
 };
 pub use dtype::Dtype;
+pub use encode::{GlobalScale, NibbleOrder};
 pub use value::Value;
 
 pub const HEADER_FORMAT: &str = "cozytensors/1";
@@ -44,6 +46,9 @@ pub enum Error {
     /// A known scheme whose params, parts or logical dtype break its definition.
     #[error("cannot decode: {0}")]
     Decode(String),
+    /// Values or arrays a scheme's encoder cannot write.
+    #[error("cannot encode: {0}")]
+    Encode(String),
 }
 
 impl Error {
@@ -54,6 +59,7 @@ impl Error {
             Error::PreCut => "pre_cut",
             Error::UnknownScheme(_) => "unknown_scheme",
             Error::Decode(_) => "decode",
+            Error::Encode(_) => "encode",
         }
     }
 }
