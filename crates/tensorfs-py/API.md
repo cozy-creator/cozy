@@ -61,7 +61,6 @@ A `Pipeline` has `cls` and `config`. A `Component` exposes:
 | `name` | Component name, such as `unet`. |
 | `cls` | Model class identifier. |
 | `config` | Parsed JSON configuration as a dictionary. |
-| `config_file` | Configuration filename, usually `config.json`. |
 | `tensors` | A `Tensors` mapping, described below. |
 | `assets` | Asset names mapped to `(sha256_hex, byte_length)` references. |
 | `asset(name)` | The named asset's bytes. |
@@ -69,6 +68,11 @@ A `Pipeline` has `cls` and `config`. A `Component` exposes:
 
 For example, a tokenizer that needs files can use
 `checkpoint.components["tokenizer"].path`.
+
+For import/export compatibility, a component also retains `config_file`, the filename to
+use when recreating its configuration file. For example, a scheduler can require
+`scheduler_config.json` rather than `config.json`. Loading directly from `config` does not
+require this field; conversion normally preserves it automatically.
 
 ### Inspect tensor metadata without reading weights
 
