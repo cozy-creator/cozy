@@ -506,7 +506,7 @@ impl Catalog {
         self.credential.is_some()
     }
 
-    pub(crate) fn endpoint(&self) -> tensorfs_core::err::Result<tensorfs_core::fetch::Endpoint> {
+    pub fn endpoint(&self) -> tensorfs_core::err::Result<tensorfs_core::fetch::Endpoint> {
         let source = Source::new(&self.origin, self.ca_der.clone(), vec![], None).map_err(|e| {
             tensorfs_core::err::Refusal {
                 code: tensorfs_core::err::Code::CREDENTIAL_REQUIRED,
@@ -525,14 +525,6 @@ impl Catalog {
             .map(|p| p.clone() as Arc<dyn TokenProvider>);
         let endpoint = tensorfs_core::fetch::Endpoint::new(&client, &self.origin, token)?;
         Ok(if self.credential.is_none() { endpoint.anonymous() } else { endpoint })
-    }
-
-    /// Headers presenting the capability on `method url`; none off the Hub host.
-    pub fn present(&self, method: &str, url: &str) -> Vec<(String, String)> {
-        let Some(presenter) = &self.credential else {
-            return Vec::new();
-        };
-        block(presenter.headers(&Request { method, url, headers: &[], payload: None })).unwrap_or_default()
     }
 
     /// A package and its releases.

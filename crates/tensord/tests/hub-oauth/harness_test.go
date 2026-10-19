@@ -98,6 +98,12 @@ func (h *hub) decide(_ context.Context, r iam.OAuthGrantRequest) (iam.OAuthGrant
 // its checkpoint probe) to a model, a read of one of its checkpoints, or a closure or presign
 // under a read (the test Hub checks the owner's checkpoint by hash).
 func permits(ops []op, method, path string) bool {
+	if model, ok := strings.CutPrefix(path, "/refs/"); ok && strings.HasSuffix(model, ".json") {
+		model = strings.TrimSuffix(model, ".json")
+		return method == http.MethodGet && slices.ContainsFunc(ops, func(o op) bool {
+			return o.Model == model && (o.Type == "tensorhub_model_read" || o.Type == "tensorhub_model_upload")
+		})
+	}
 	if path == "/v1/tensorfs/closure" || path == "/v1/tensorfs/presign" {
 		return slices.ContainsFunc(ops, func(o op) bool { return o.Type == "tensorhub_model_read" })
 	}
