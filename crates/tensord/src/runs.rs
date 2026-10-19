@@ -181,11 +181,6 @@ fn public_root(entry: &Value) -> Result<(), Refused> {
     }
     Ok(())
 }
-/// A refusal that ends a preparing run, as its failure.
-fn failure(refusal: Refused) -> Failure {
-    let request = refusal.code.starts_with("invalid") || refusal.code.ends_with("_absent");
-    Failure { status: 3, cause: 7, origin: if request { 6 } else { 3 }, code: refusal.code.into(), message: refusal.message }
-}
 fn refused(code: &'static str, message: impl Into<String>) -> Refused {
     Refused {
         code,
@@ -322,7 +317,11 @@ impl Runs {
             let ended = match outcome {
                 Ok(None) => Ok(()),
                 Ok(Some(result)) => this.service.engine.end_preparation(&run, Outcome::Completed(result)).map(drop),
-                Err(refusal) => this.service.engine.end_preparation(&run, Outcome::Failed(failure(refusal))).map(drop),
+                Err(Refused { code, message }) => {
+                    let origin = if code.starts_with("invalid") || code.ends_with("_absent") { 6 } else { 3 };
+                    let failure = Failure { status: 3, cause: 7, origin, code: code.into(), message };
+                    this.service.engine.end_preparation(&run, Outcome::Failed(failure)).map(drop)
+                }
             };
             if let Err(error) = ended {
                 tracing::warn!("run {run} preparation: {error}");

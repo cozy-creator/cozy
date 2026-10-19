@@ -474,15 +474,13 @@ impl Service {
         let mut place = 0;
         for record in ready {
             let invocation = &record.invocation;
-            let full = room == 0 && (gpu_fenced || claims.iter().all(Option::is_some));
-            let blocked = full || (invocation.degree == 0 && room == 0) || (invocation.degree > 0 && gpu_fenced);
-            if !blocked && self.offer(&pool, &record, &mut claims, calls.clone())? {
+            let full = room == 0 && (invocation.degree == 0 || claims.iter().all(Option::is_some));
+            if !(full || invocation.degree > 0 && gpu_fenced) && self.offer(&pool, &record, &mut claims, calls.clone())? {
                 room -= usize::from(invocation.degree == 0);
             } else if invocation.parent.is_empty() {
                 place += 1;
-                if let Err(error) = self.engine.waiting(&record.id, Some(format!("position {place} in the queue"))) {
-                    tracing::warn!("run {}: its place in the queue was not shown: {error}", record.id);
-                }
+                let shown = self.engine.waiting(&record.id, Some(format!("position {place} in the queue")));
+                shown.unwrap_or_else(|error| tracing::warn!("run {}: its place was not shown: {error}", record.id));
             }
         }
         Ok(())

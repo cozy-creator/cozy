@@ -431,7 +431,6 @@ impl Engine {
         self.accept_run_objects(actor, id, digest, invocation, &[], &[])
     }
 
-    /// See `Journal::accept_run_objects`.
     pub fn accept_run_objects(
         &self,
         actor: &str,
