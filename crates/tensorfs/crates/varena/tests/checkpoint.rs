@@ -12,6 +12,7 @@ use tensorfs_core::format::Dtype;
 use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::store2::{Checkpoint, Store};
 use tensorfs_core::writer::{Data, Source};
+use varena::checkpoint::Ck;
 use varena::{cuda, memory, Error, Gpu, Host, HostSet};
 
 const MIB: usize = 1 << 20;
@@ -100,6 +101,21 @@ fn a_v2_checkpoint_binds_from_the_chunk_files_a_grant_hands_over_and_no_others()
     check(&Host.register("granted", &fx.ck, &rs, None, Some(files)).unwrap());
     let none = Host.register("none", &fx.ck, &rs, None, Some(Vec::new())).unwrap();
     assert!((0..rs.len() as u32).any(|r| none.bind(r).is_err()), "an object no grant handed over is never read");
+}
+
+#[test]
+fn a_header_parsed_alone_binds_and_seals_from_its_grant_only() {
+    let fx = Fixture::new("parsed");
+    let rs = regions(fx.ck.header(), 64 << 20, &[]);
+    let parsed = Ck { header: fx.ck.header(), paths: None };
+    let granted = || -> Vec<(ObjectRef, std::fs::File)> {
+        let chunks = fx.ck.header().chunks.iter().zip(fx.ck.chunk_paths());
+        chunks.map(|(c, path)| (ObjectRef { sha256: c.sha256.clone(), length: c.length }, std::fs::File::open(path).unwrap())).collect()
+    };
+    check(&Host.register("parsed", parsed, &rs, None, Some(granted())).unwrap());
+    assert!(matches!(Host.register("bare", parsed, &rs, None, None), Err(Error::Invalid(_))), "no paths, no grant: nothing to read");
+    let fd = memory::seal(parsed, &rs, "parsed", 2, Some(granted())).unwrap();
+    check(&Host.register("sealed", parsed, &rs, Some(fd.as_raw_fd()), None).unwrap());
 }
 
 #[cfg(target_os = "linux")] // sealed host layouts are Linux-only
