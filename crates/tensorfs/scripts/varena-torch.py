@@ -479,7 +479,22 @@ def adopted(mem: Memory, ck: tensorfs.Checkpoint, held: int, a: argparse.Namespa
     with torch.no_grad(), mem.request("adopted"):
         check("the adopted model equals the reference", torch.equal(net(x), want))
     torch.cuda.synchronize()
-    fingerprint, containers = model.kept()
+    pool = mem.cache("graphs:retained", lambda n: 0)
+    hold = pool.hold(model)
+    graph = torch.cuda.CUDAGraph()
+    with torch.no_grad(), torch.cuda.graph(graph):
+        graphed = net(x)
+    graph.replay()
+    torch.cuda.synchronize()
+    check("a lifetime graph hold keeps export conservative", not model.kept()[1])
+    fingerprint, containers = model.kept(quiescent=True)
+    check("a quiescent graph-held model retains pages", bool(containers))
+    graph.replay()
+    torch.cuda.synchronize()
+    check("retention preserves the held graph and addresses", torch.equal(graphed, want))
+    del graph, graphed
+    hold.close()
+    pool.close()
     pages = []
     for region, _, fd in containers:
         with socket.socket(fileno=fd) as container:

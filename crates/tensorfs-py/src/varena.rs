@@ -344,6 +344,12 @@ impl PyWeightSet {
         Ok(py.detach(|| w.kept()).or_raise(py)?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect())
     }
 
+    /// As `kept`, after admission is stopped and every use is drained; cached graph pins stay.
+    fn kept_quiescent(&self, py: Python<'_>) -> PyResult<Vec<(u32, u64, i32)>> {
+        let Some(w) = self.gpu(py)? else { return Ok(vec![]) };
+        Ok(py.detach(|| w.kept_quiescent()).or_raise(py)?.into_iter().map(|(r, span, fd)| (r, span, fd.into_raw_fd())).collect())
+    }
+
     /// Home regions mapped from kept pages `(region, fd)`; each fd duplicated, the caller's
     /// kept. Returns the bytes adopted.
     fn adopt_pages(&self, py: Python<'_>, pages: Vec<(u32, i32)>) -> PyResult<u64> {
