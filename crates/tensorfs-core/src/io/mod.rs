@@ -29,6 +29,8 @@ pub enum Src<'a> {
     File(&'a File, u64),
     /// Host memory (a sealed layout's mapping): RAM to the destination, no disk.
     Host(*const u8),
+    /// Device bytes ordered on the producer's stream (0: the CUDA default stream).
+    Device { device: i32, ptr: u64, stream: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +101,9 @@ pub struct ReadStats {
     /// Of `direct`, bytes that went through an aligned bounce buffer (a destination or end
     /// O_DIRECT cannot reach).
     pub bounced: u64,
+    pub pin_ns: u64,
+    pub staged: u64,
+    pub busy_ns: u64,
 }
 
 impl ReadStats {
@@ -116,6 +121,12 @@ pub struct Error {
     pub source: std::io::Error,
 }
 
+impl Error {
+    pub fn cuda(&self) -> Option<&cuda::Error> {
+        self.source.get_ref()?.downcast_ref()
+    }
+}
+
 /// Every copy, at once: reads on `opts.threads` threads, each cut on the `opts.request` grid,
 /// O_DIRECT for what the page cache lacks (straight into the destination where it is aligned
 /// with the file, else through a bounce buffer), buffered for what it holds.
@@ -126,7 +137,7 @@ pub struct Error {
 /// of its destination's length and not written until this returns.
 pub unsafe fn read(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats, Error> {
     let start = Instant::now();
-    if let Some(copy) = copies.iter().position(|c| matches!(c.dst, Dst::Device { .. })) {
+    if let Some(copy) = copies.iter().position(|c| matches!(c.src, Src::Device { .. }) || matches!(c.dst, Dst::Device { .. })) {
         let source = std::io::Error::new(std::io::ErrorKind::Unsupported, "device destinations need the CUDA engine");
         return Err(Error { copy, source });
     }
