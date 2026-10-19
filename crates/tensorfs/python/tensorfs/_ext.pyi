@@ -3,7 +3,7 @@
 from collections.abc import Buffer, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
 from os import PathLike
 from types import ModuleType
-from typing import Any, TypeVar, overload
+from typing import Any, Protocol, TypeVar, overload
 
 from .records import Header as HeaderRecord
 from .records import ReadItem
@@ -331,6 +331,11 @@ class DPoP:
               claims: Mapping[str, Any], endpoint: str | None = None, ca_der: bytes | None = None) -> DPoP: ...
     @staticmethod
     def token(key: str, access_token: str, resource: str | None = None, *, endpoint: str | None = None) -> DPoP: ...
+
+class TokenProvider(Protocol):
+    def headers(self, method: str, url: str, headers: Mapping[str, str], payload: str | None) -> Mapping[str, str]: ...
+    def retry(self, method: str, url: str, headers: Mapping[str, str], payload: str | None,
+              status: int, response_headers: Mapping[str, str]) -> bool: ...
 
 class Endpoint:
     def __init__(self, url: str, token: Any = None, *, ca_der: bytes | None = None) -> None: ...

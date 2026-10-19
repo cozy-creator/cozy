@@ -180,10 +180,6 @@ impl Client {
 
     /// GET `url`, following redirects the policy allows, each hop checked again. Credentials
     /// go only to the origin they were given for: another origin gets only the `range`.
-    pub(crate) async fn get(&self, url: &str, headers: &[(String, String)]) -> Result<Answer> {
-        self.get_authorized(url, headers, None).await
-    }
-
     pub(crate) async fn get_authorized(&self, url: &str, headers: &[(String, String)], mut provider: Option<&dyn TokenProvider>) -> Result<Answer> {
         let mut url = url.to_string();
         let mut headers = headers.to_vec();
