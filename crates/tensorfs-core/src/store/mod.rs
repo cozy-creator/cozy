@@ -40,7 +40,8 @@ use crate::fetch;
 use crate::format::{self, ObjectRef};
 use crate::sha256::{hex, Sha256};
 
-const FORMAT: &str = "tensorfs.store/2";
+/// [`crate::STORE_FORMAT`] as the store's `format` record.
+const FORMAT: &str = "tensorfs.store/3";
 const LAYOUT: [&str; 4] = ["blobs", "refs", "pins", "tmp"];
 
 /// How long an unreferenced object outlives its last write or reuse.
@@ -202,6 +203,14 @@ impl Store {
                 }
                 match serde_json::from_slice::<Record>(&bytes) {
                     Ok(found) if same_major(&found.format, FORMAT) => {}
+                    Ok(found) if same_family(&found.format, FORMAT) => {
+                        let why = format!(
+                            "is a {} store from an older TensorFS, which this one cannot read: \
+                             remove it and pull again (tensorfs.store/3 holds trees and D10 headers)",
+                            found.format
+                        );
+                        return Err(invalid(&record, why));
+                    }
                     _ => {
                         let found = String::from_utf8_lossy(&bytes);
                         return Err(invalid(&record, format!("is {found:?}, not {FORMAT}")));

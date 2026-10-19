@@ -4,7 +4,7 @@ Scheme decoders are in schemes/, one module per family.
 
     python reader.py <vectors-dir>     run the conformance vectors (exit 1 on any failure)
 
-As a library: `Store(root).checkpoint("org/name", lane="x")` -> (manifest, header),
+As a library: `Store(root).checkpoint("org/name", variant="x")` -> (tree, header),
 `read(store, header, component, key)` -> the tensor's logical bytes, `parse_header(bytes)` and
 `encode(projection)`: a header's diagnostic projection (the CBOR tree as JSON, byte strings as
 {"hex": ...}) to its canonical bytes.
@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # schemes/, also under
 from schemes import affine, blocks, decode, grid, table  # noqa: E402
 from schemes.base import Refused  # noqa: E402
 
-HEADER, MANIFEST, REPO = "cozytensors/1", "tensorfs.manifest/1", "tensorfs.repo/1"
+HEADER, TREE, REPO = "cozytensors/1", "tensorfs.tree/1", "tensorfs.repo/1"
 BITS = {
     "BOOL": 8, "F4": 4, "F6_E2M3": 6, "F6_E3M2": 6, "U8": 8, "I8": 8, "F8_E5M2": 8, "F8_E4M3": 8,
     "F8_E8M0": 8, "F8_E4M3FNUZ": 8, "F8_E5M2FNUZ": 8, "I16": 16, "U16": 16, "F16": 16, "BF16": 16,
@@ -131,13 +131,17 @@ def byte_len(dtype, shape) -> int | None:
     return bits // 8
 
 
-def parse_manifest(data: bytes) -> dict:
-    doc = load(data, MANIFEST)
+def parse_tree(data: bytes) -> dict:
+    """A repo revision's files; `model.<variant>.cozytensors` is a variant's header."""
+    doc = load(data, TREE)
     files = field(doc, "files", dict)
-    for path in files:
-        need(all(segment(s) for s in path.split("/")), f"bad path {path!r}")
-    meta = field(doc, "metadata", dict, optional=True)
-    return {"files": {p: object_ref(r) for p, r in files.items()}, "metadata": meta}
+    for p in files:
+        need(path(p) and p.split("/")[0] != "chunks", f"bad repo file path {p!r}")
+    return {"files": {p: object_ref(r) for p, r in files.items()}}
+
+
+def variant_path(variant: str) -> str:
+    return f"model.{variant}.cozytensors" if variant else "model.cozytensors"
 
 
 def parse_repo(data: bytes) -> dict:
@@ -151,9 +155,7 @@ def parse_repo(data: bytes) -> dict:
         version = field(r, "version", str)
         need(version != "" and version not in seen, f"empty or repeated version {version!r}")
         seen.add(version)
-        lanes = field(r, "lanes", dict)
-        need("" not in lanes, "empty lane name")
-        releases.append({"version": version, "lanes": {k: object_ref(v) for k, v in lanes.items()},
+        releases.append({"version": version, "tree": object_ref(field(r, "tree", dict)),
                          "yanked": field(r, "yanked", bool, optional=True),
                          "revision": field(r, "revision", int, optional=True)})
     checkpoints = [object_ref(c) for c in field(doc, "checkpoints", list, optional=True)]
@@ -380,10 +382,10 @@ class Store:
             raise invalid(f"object {sha} does not match its ref")
         return data
 
-    def checkpoint(self, name: str, version: str | None = None, lane: str = ""):
+    def checkpoint(self, name: str, version: str | None = None, variant: str = ""):
         repo = parse_repo((self.root / repo_key(name)).read_bytes())
-        manifest = parse_manifest(self.blob(release(repo, version)["lanes"][lane]))
-        return manifest, parse_header(self.blob(manifest["files"]["model.cozytensors"]))
+        tree = parse_tree(self.blob(release(repo, version)["tree"]))
+        return tree, parse_header(self.blob(tree["files"][variant_path(variant)]))
 
 
 def gather(store: Store, header: dict, loc: dict) -> bytes:
@@ -414,7 +416,7 @@ def check(vectors: Path) -> int:
         cases = load_cases(path)
         repo = f"Conformance/{family}"
         for lane in dict.fromkeys(ln for ln, _, _ in cases):
-            _, header = store.checkpoint(repo, lane=lane)
+            _, header = store.checkpoint(repo, variant=lane)
             for comp, c in header["components"].items():
                 for key in c["tensors"]:
                     case = cases.get((lane, comp, key))
@@ -438,8 +440,8 @@ def check(vectors: Path) -> int:
             passed += ok
             if not ok:
                 failures.append(f"{family}:{lane}: header order differs from {path.name}")
-    # Core's release 2 is yanked and swaps its lanes: only an explicit version reaches it.
-    _, yanked = store.checkpoint("Conformance/core", version="2", lane="all")
+    # Core's release 2 is yanked and swaps its variants: only an explicit version reaches it.
+    _, yanked = store.checkpoint("Conformance/core", version="2", variant="all")
     ok = list(yanked["components"]) == ["spans"]
     passed += ok
     if not ok:
@@ -447,7 +449,7 @@ def check(vectors: Path) -> int:
     core_failures = check_cores(vectors / "cores.json")
     failures += core_failures
     passed += len(json.loads((vectors / "cores.json").read_text())["cases"]) - len(core_failures)
-    parsers = {"header": parse_header, "manifest": parse_manifest, "repo": parse_repo}
+    parsers = {"header": parse_header, "tree": parse_tree, "repo": parse_repo}
     for verdict in ("green", "red"):
         for path in sorted((vectors / verdict).iterdir()):
             kind = path.name.split("-")[0]

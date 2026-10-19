@@ -1,1 +1,1 @@
-{"format":"tensorfs.repo/1","name":"Conformance/fp8_blockwise","releases":[{"lanes":{"all":{"length":253,"sha256":"4997e1c4c0fa0dad4e2dfd0dac27f53e0fe394c6b33247bc78312f57f3643f49"}},"version":"1"}]}
+{"format":"tensorfs.repo/1","name":"Conformance/fp8_blockwise","releases":[{"tree":{"length":253,"sha256":"da4efcfddaf0ea9652810d147718d254fb674c7cfeb6a305b543a9e42dd86734"},"version":"1"}]}
