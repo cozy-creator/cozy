@@ -53,7 +53,11 @@ fn weights<'a>(run: &'a Run, output: Option<&str>) -> Result<&'a OutputItem, Err
     let held: Vec<&OutputItem> = run
         .output
         .iter()
-        .filter(|item| item.is_checkpoint() && output.is_none_or(|name| item.name == name))
+        .filter(|item| {
+            item.checkpoint.is_none()
+                && item.is_checkpoint()
+                && output.is_none_or(|name| item.name == name)
+        })
         .collect();
     match held.as_slice() {
         [item] if item.sha256.is_some() => Ok(item),
@@ -135,6 +139,7 @@ mod tests {
                 sha256: done.then(|| Digest::of(name.as_bytes())),
                 path: None,
                 export_error: None,
+                checkpoint: None,
             })
             .collect();
         serde_json::from_value::<Run>(serde_json::json!({
