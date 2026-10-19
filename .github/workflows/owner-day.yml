@@ -52,9 +52,11 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       - run: go build -ldflags "-X main.version=dev -X main.revision=$(git rev-parse HEAD)" -o dist/tensorhub .
-      # The Hub's TensorFS CLI and evaluator, which publish verifies with.
+      # The Hub's TensorFS CLI and evaluator, which publish verifies with, where the Hub still has them
+      # (the v2 Hub, tensorhub #1202, reads TensorFS in Go).
       - uses: astral-sh/setup-uv@v7
-      - run: uv sync --project tools/evaluator --locked --no-dev --group proof
+      - if: hashFiles('tools/evaluator/pyproject.toml') != ''
+        run: uv sync --project tools/evaluator --locked --no-dev --group proof
       # The cozy workspace's test build fills most of the runner's disk.
       - run: sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc && df -h /
       - if: inputs.plan != ''
