@@ -38,6 +38,17 @@ def finite(value, positive=False):
     return type(value) in (int, float) and math.isfinite(value) and (value > 0 if positive else value >= 0)
 
 
+def exact(value, expected):
+    """JSON counts/ordinals/flags keep their types: 209.0 and False are not 209 and 0."""
+    if type(value) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return value.keys() == expected.keys() and all(exact(value[k], v) for k, v in expected.items())
+    if isinstance(expected, list):
+        return len(value) == len(expected) and all(exact(v, e) for v, e in zip(value, expected))
+    return value == expected
+
+
 def tree_document(root):
     """TensorD trees::document/device_executor::tree_binding, not an invented wire format.
 
@@ -133,7 +144,7 @@ def physical(run, machine, identities, launch, payload_sha):
     require(len(observed) == 1, 'children executed different physical GPU allocations')
     index, gpu_uuid = next(iter(observed))
     require(type(index) is int and index >= 0, 'child has no physical GPU index')
-    require(pairs == observed and all(e.get('degree') == 1 for e in executions if e.get('gpus') and
+    require(pairs == observed and all(type(e.get('degree')) is int and e['degree'] == 1 for e in executions if e.get('gpus') and
             any(type(g.get('gpu')) is int and g['gpu'] >= 0 for g in e['gpus'])), 'public physical GPU measurement differs')
     require(all(type(r.get('pid')) is int and r['pid'] > 0 and finite(r.get('start_us'), True) and
                 finite(r.get('end_us'), True) and r['end_us'] > r['start_us'] and
@@ -239,13 +250,13 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
             schemes = sorted({c['scheme'] for c in expected_cases})
             require(contract.get('cases') == [c['case'] for c in expected_cases] and contract.get('schemes') == schemes,
                     'kernel requested case set differs')
-            require(value.get('schema') == KERNEL_SCHEMA and value.get('device') == {'type': 'cuda', 'ordinal': 0}, 'kernel CPU/wrong CUDA ordinal')
-            require(value.get('counts') == {'full': 209, 'windows': 209, 'total': 418, 'cases': 209, 'schemes': 39} and
+            require(value.get('schema') == KERNEL_SCHEMA and exact(value.get('device'), {'type': 'cuda', 'ordinal': 0}), 'kernel CPU/wrong CUDA ordinal')
+            require(exact(value.get('counts'), {'full': 209, 'windows': 209, 'total': 418, 'cases': 209, 'schemes': 39}) and
                     value.get('schemes') == schemes and value.get('corpus_sha256') == KERNEL_CORPUS and
-                    value.get('cases') == expected_cases, 'kernel missing/duplicate/skipped/non-bit-exact case')
+                    exact(value.get('cases'), expected_cases), 'kernel missing/duplicate/skipped/non-bit-exact case')
             require(value.get('routing') == {'prepared': 'Kernel', 'host_only_exclusions': []}, 'kernel host fallback')
-            require(value.get('runtime') == {'torch_installed': False, 'triton_installed': False,
-                                           'torch_imported': False, 'triton_imported': False}, 'kernel runtime is not clean')
+            require(exact(value.get('runtime'), {'torch_installed': False, 'triton_installed': False,
+                                                'torch_imported': False, 'triton_imported': False}), 'kernel runtime is not clean')
             require(child.get('cuda_visible_devices') == identity.get('cuda_visible_devices') and
                     isinstance(child.get('cuda_visible_devices'), str) and bool(child['cuda_visible_devices']) and
                     ',' not in child['cuda_visible_devices'], 'kernel inherited CUDA scope differs')

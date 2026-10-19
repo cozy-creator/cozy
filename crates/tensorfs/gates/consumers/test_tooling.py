@@ -7,7 +7,6 @@ import io
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import tarfile
 import tempfile
@@ -287,6 +286,19 @@ class Contract(unittest.TestCase):
     def test_unrequested_kernel_is_not_a_kernel_pass(self):
         with self.assertRaisesRegex(ValueError, 'not requested'):
             validate.validate(*self.fixture(), require_kernel=True)
+
+    def test_kernel_json_counts_ordinals_and_flags_keep_their_types(self):
+        root, expected, run, machine, launch = self.fixture(kernel=True)
+        original = validate.read(root / 'reports/kernel.json')
+        mutations = [dict(counts={**original['counts'], 'full': 209.0}),
+                     dict(device={'type': 'cuda', 'ordinal': False}),
+                     dict(runtime={**original['runtime'], 'torch_installed': 0}),
+                     dict(routing={'prepared': 'Host', 'host_only_exclusions': []})]
+        for change in mutations:
+            self.result(root, 'kernel', {**original, **change})
+            self.inventory(root)
+            with self.assertRaises(ValueError):
+                validate.validate(root, expected, run, machine, launch, require_kernel=True)
 
     def test_bad_freeze_hash_and_pre_fork_source_are_refused(self):
         self.args.native_sha256 = '0' * 64
