@@ -1,6 +1,6 @@
 [package]
 name = "varena"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 publish.workspace = true
 description = "The TensorFS weight plane: pinned host tier, per-GPU VMM arenas, copy streams, streaming cursors. Mechanism only."
