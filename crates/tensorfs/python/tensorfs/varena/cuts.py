@@ -772,7 +772,8 @@ def install(module: nn.Module) -> int:
         kinds = [c.__name__ for c in type(sub).__mro__ if c.__module__.startswith("diffusers.")]
         kind = next((k for k in kinds if k in _FFN), None)
         if kind is not None and "_varena_ffn" not in vars(sub):
-            width = sum(m.out_features for m in sub.modules() if isinstance(m, nn.Linear))
+            # a quantized lane's linears are encoded leaves: any module naming out_features counts
+            width = sum(int(getattr(m, "out_features", 0) or 0) for m in sub.modules())
             sub.forward = _ffn(kind, width, sub.forward)  # type: ignore[method-assign]
             vars(sub)["_varena_ffn"] = True
             count += 1
@@ -786,7 +787,7 @@ def _ffn(kind: str, width: int, forward: Callable[..., object]) -> Callable[...,
         tokens, key = x.numel() // max(x.shape[-1], 1), ("ffn", kind, x.shape[-1], width, x.dtype)
         if tokens < 2 or key in _served.memo.whole:
             return forward(x)
-        per_token = width * x.element_size()
+        per_token = max(width, x.shape[-1]) * x.element_size()
 
         def shrink(size: int) -> int:  # half, or the tokens the room holds
             return min(size // 2, _served.rungs.available(x.device) // per_token or size)
