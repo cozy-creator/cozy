@@ -3014,6 +3014,7 @@ impl Pool {
             let load = match plan.slots.first() {
                 // A call that constructs nothing: its weightless construction.
                 None => DeviceCommand::Load {
+                    request_id: id.into(),
                     hub: calls.and_then(|calls| calls.hub_access(id)),
                     construction: construction.clone(),
                     devices: lane.clone(),
@@ -3054,6 +3055,7 @@ impl Pool {
                         _ => plan.slots.iter().map(load).collect(),
                     };
                     DeviceCommand::Load {
+                    request_id: id.into(),
                         hub: calls.and_then(|calls| calls.hub_access(id)),
                         construction: construction.clone(),
                         devices: lane.clone(),

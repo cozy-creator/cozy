@@ -424,8 +424,6 @@ impl Catalog {
     /// Public reads: anonymous.
     pub fn new(source: &Source) -> Result<Self, Refusal> {
         let origin = source.origin.clone();
-        let host =
-            tensorfs_core::fetch::policy::base_host(&origin).map_err(|e| Refusal(e.to_string()))?;
         let http = http(source.ca_der.as_deref())?;
         let hub = hub_client::Client::connect(&origin, http, Credential::Anonymous);
         Ok(Self {

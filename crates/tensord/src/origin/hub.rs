@@ -45,8 +45,8 @@ pub fn resolve_named(machine: &Machine, source: &hub::Source, repository: &str, 
     let endpoint = Arc::new(endpoint);
     let name = repository.to_ascii_lowercase();
     let repo = {
-        let (endpoint, name) = (endpoint.clone(), name.clone());
-        machine.block(&Stop::default(), async move { endpoint.repo(&name).await })?
+        let (endpoint, asked) = (endpoint.clone(), name.clone());
+        machine.block(&Stop::default(), async move { endpoint.repo(&asked).await })?
             .ok_or_else(|| Refusal { code: Code::REF_NOT_FOUND, detail: format!("no repo {name}") })?.0
     };
     let (release, tree) = release_of(&repo, (!release.is_empty()).then_some(release))?;

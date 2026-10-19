@@ -203,6 +203,8 @@ fn exec(
     let t = Instant::now();
     let loaded = executor.command(
         &DeviceCommand::Load {
+            hub: None,
+            request_id: String::new(),
             construction: "pilot".into(),
             devices,
             sequence_parallel_degree: 1,
@@ -264,6 +266,7 @@ fn exec(
         let t = Instant::now();
         let reply = executor.command(
             &DeviceCommand::Invoke {
+                hub: None,
                 max_output_bytes: tensord::output_capacity::DEFAULT_BYTES,
                 request_id: id.clone(),
                 construction: "pilot".into(),

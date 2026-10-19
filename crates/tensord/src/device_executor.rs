@@ -188,6 +188,7 @@ pub enum DeviceCommand {
         constructions: Vec<Construction>,
     },
     Load {
+        request_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         hub: Option<crate::hub::RuntimeHubAccess>,
         construction: String,

@@ -1399,6 +1399,8 @@ print(json.dumps({"identity": generation.identity}))
                     command(
                         &mut executor,
                         &DeviceCommand::Load {
+                            hub: None,
+                            request_id: String::new(),
                             construction: "fixture".into(),
                             devices: String::new(),
                             sequence_parallel_degree: 1,
@@ -1441,6 +1443,7 @@ print(json.dumps({"identity": generation.identity}))
                     let spool = engine.staging(&id)?;
                     let reply = executor.command(
                         &DeviceCommand::Invoke {
+                            hub: None,
                             max_output_bytes: crate::output_capacity::DEFAULT_BYTES,
                             request_id: id.clone(),
                             construction: "fixture".into(),

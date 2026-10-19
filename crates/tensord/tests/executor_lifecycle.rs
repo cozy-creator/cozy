@@ -86,6 +86,8 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
             constructions: Vec::new(),
         },
         DeviceCommand::Load {
+            hub: None,
+            request_id: String::new(),
             construction: "lifecycle".into(),
             devices: String::new(),
             sequence_parallel_degree: 1,
@@ -139,6 +141,7 @@ fn invoke(
     assert!(prepared.ok, "{prepared:?}");
     executor.command(
         &DeviceCommand::Invoke {
+            hub: None,
             max_output_bytes: tensord::output_capacity::DEFAULT_BYTES,
             request_id: id.into(),
             construction: "lifecycle".into(),
@@ -492,6 +495,8 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
             constructions: Vec::new(),
         },
         DeviceCommand::Load {
+            hub: None,
+            request_id: String::new(),
             construction: "lifecycle".into(),
             devices: String::new(),
             sequence_parallel_degree: 1,
@@ -545,6 +550,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
     let reply = executor
         .command(
             &DeviceCommand::Invoke {
+                hub: None,
                 max_output_bytes: tensord::output_capacity::DEFAULT_BYTES,
                 request_id: "probe".into(),
                 construction: "lifecycle".into(),

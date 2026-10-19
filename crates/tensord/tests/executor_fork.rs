@@ -117,6 +117,8 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
         for command in [
             start(&generation, &interface, false),
             DeviceCommand::Load {
+                hub: None,
+                request_id: String::new(),
                 construction: "lifecycle".into(),
                 devices: String::new(),
                 sequence_parallel_degree: 1,
@@ -163,6 +165,7 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
         let reply = child
             .command(
                 &DeviceCommand::Invoke {
+                    hub: None,
                     max_output_bytes: tensord::output_capacity::DEFAULT_BYTES,
                     request_id: "forked".into(),
                     construction: "lifecycle".into(),
