@@ -1536,7 +1536,9 @@ fn safetensors_tensors(bytes: &[u8]) -> BTreeMap<String, (String, Vec<u64>, Vec<
 }
 
 /// Every tensor of a folder's safetensors files: (folder, key) → (dtype, shape, bytes).
-fn folder_tensors(files: &BTreeMap<String, Vec<u8>>) -> BTreeMap<(String, String), (String, Vec<u64>, Vec<u8>)> {
+type FolderTensor = (String, Vec<u64>, Vec<u8>);
+
+fn folder_tensors(files: &BTreeMap<String, Vec<u8>>) -> BTreeMap<(String, String), FolderTensor> {
     let mut out = BTreeMap::new();
     for (path, bytes) in files.iter().filter(|(p, _)| p.ends_with(".safetensors")) {
         let folder = path.rsplit_once('/').map_or("", |(f, _)| f).to_owned();

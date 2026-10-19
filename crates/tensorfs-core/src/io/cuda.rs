@@ -196,13 +196,13 @@ pub struct Driver {
 unsafe impl Send for Driver {}
 unsafe impl Sync for Driver {}
 
-static DRIVER: OnceLock<std::result::Result<Driver, String>> = OnceLock::new();
+static DRIVER: OnceLock<Result<Driver>> = OnceLock::new();
 
 /// The process-wide driver. `Err` when there is no usable CUDA driver.
 pub fn driver() -> Result<&'static Driver> {
-    match DRIVER.get_or_init(|| Driver::load().map_err(|e| e.to_string())) {
+    match DRIVER.get_or_init(Driver::load) {
         Ok(d) => Ok(d),
-        Err(msg) => Err(Error::CudaUnavailable(msg.clone())),
+        Err(error) => Err(error.clone()),
     }
 }
 
@@ -510,10 +510,20 @@ pub unsafe fn registered(ptr: *const u8) -> Result<bool> {
 
 impl Drop for HostPin {
     fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
+impl HostPin {
+    /// Release only this guard's registration. On failure ownership is retained, so a
+    /// mapping owner can refuse to punch/unmap it and retry. Borrowed pins are untouched.
+    pub fn release(&mut self) -> Result<()> {
         if self.owned {
-            if let (Ok(d), Ok(_ctx)) = (driver(), CtxGuard::enter(self.ctx)) {
-                unsafe { (d.mem_host_unregister)(self.ptr) };
-            }
+            let driver = driver()?;
+            let _context = CtxGuard::enter(self.ctx)?;
+            check("cuMemHostUnregister", unsafe { (driver.mem_host_unregister)(self.ptr) })?;
+            self.owned = false;
         }
+        Ok(())
     }
 }

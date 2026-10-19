@@ -74,7 +74,8 @@ async fn a_bucket_serves_the_protocol_under_sigv4() {
     }
     let (repo, _) = endpoint.repo("acme/s3").await.unwrap().unwrap();
     let mut landed = repo.checkpoints.clone();
-    (landed.sort(), trees.sort());
+    landed.sort();
+    trees.sort();
     assert_eq!(landed, trees);
     let stale = endpoint.put_repo_bytes("acme/s3", b"{}".to_vec(), Some("\"0123\"")).await.unwrap();
     assert!(!stale, "a stale If-Match is a 412");

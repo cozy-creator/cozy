@@ -52,6 +52,11 @@ pub(super) unsafe fn fill(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats,
     for (i, c) in copies.iter().enumerate() {
         let Dst::Host { ptr, len } = c.dst else { unreachable!("host copies only") };
         let (file, offset) = match c.src {
+            Src::Zero => {
+                // SAFETY: the caller lends this exclusive destination until return.
+                if len != 0 { unsafe { std::slice::from_raw_parts_mut(ptr, len) }.fill(0); }
+                continue;
+            }
             Src::File(f, offset) => {
                 let i = *index.entry(f as *const File).or_insert_with(|| {
                     files.push(f);

@@ -1,34 +1,24 @@
-//! varena: memory and transfer mechanisms used in the calling process.
-//! In Cozy, TensorD coordinates machine-wide budgets and retention and uses TensorFS to
-//! prepare shared CPU weight buffers. Runtime constructs models and drives GPU allocation,
-//! copies, mapping and unmapping through the plane/device APIs within those grants.
-//! TensorD can retain exported GPU allocation handles; retaining bytes does not construct
-//! a model or perform its GPU operations. TensorFS is a library on both sides, not a daemon.
+//! varena: the memory of the process computing with model weights.
 //!
-//! A plane applies caller-supplied budgets, regions and priorities for fills, prefetch,
-//! eviction and streaming. It does not measure free memory or reorder the caller's schedule.
-//! `tensorfs-core` supplies verified serialized bytes and metadata and stays CUDA-free.
+//! `memory` places a weight set's regions on a GPU (home pages, scratch slots, pins as tensor
+//! lifetimes, eviction of what nothing uses); `Host` serves them from host memory where there
+//! is no GPU. The host tier (`host`, `window`) is the machine's: sealed memfds a TensorD fills
+//! and executors adopt read-only. `tensorfs-core` owns parsing, source custody and every host/device byte transfer.
 //!
-//! The plane is a Unix mechanism: weight sets cross processes as descriptors. Its host tier
-//! (sealed memfds claimed by OFD locks) is Linux-only and answers [`Error::Unsupported`]
-//! elsewhere; a Mac's host tier is the page cache of the store's objects. On Windows the crate
-//! is empty until its tier exists (xs-043 unit WM).
+//! The host tier is Linux-only and answers [`Error::Unsupported`] elsewhere. On Windows the
+//! crate is empty until its tier exists (xs-043 unit WM).
 #![cfg(unix)]
 
-#[cfg(feature = "store")]
-pub mod checkpoint;
-pub mod cuda;
-pub mod cursor;
-pub mod device;
+pub use tensorfs_core::io::{cuda, metrics as ceiling};
 pub mod faults;
 pub mod host;
 pub mod io;
 pub mod layout;
-pub mod plane;
+pub mod ledger;
+pub mod memory;
 pub mod window;
 
-pub use cursor::{Cursor, RingView};
-pub use plane::{Exported, Lease, Plane, PlaneConfig, Stats, Ticket, Tier, Trim, View, WsId};
+pub use memory::{Gpu, GpuStats, Host, HostPinned, HostSet, Pinned, WeightSet};
 
 use thiserror::Error;
 
@@ -42,40 +32,16 @@ pub enum Error {
     },
     #[error("cuda driver unavailable: {0}")]
     CudaUnavailable(String),
-    #[error("budget exceeded in {pool}: requested {requested} bytes, {available} available")]
-    BudgetExceeded {
-        pool: &'static str,
-        requested: u64,
-        available: u64,
-    },
-    #[error(
-        "shortfall in {pool}: need {need} bytes, {available} free; evicting lower priorities is \
-         not enough, blocked by {blockers:?}"
-    )]
-    Shortfall {
-        pool: &'static str,
-        need: u64,
-        available: u64,
-        blockers: Vec<String>,
-    },
-    #[error("below floor in {pool}: need {need} bytes, the whole budget is {budget}")]
-    BelowFloor { pool: &'static str, need: u64, budget: u64 },
-    #[error("{op} refused: {live} live and {pending} pending lease(s) cover {what}")]
-    LeaseViolation {
-        op: &'static str,
-        live: u64,
-        pending: u64,
-        what: String,
-    },
-    #[error("poisoned: {0}")]
-    Poisoned(String),
+    /// The driver refused to map: `deficit` of the `need` bytes found no device memory.
+    #[error("device full: mapping {need} bytes, {deficit} short")]
+    DeviceFull { need: u64, deficit: u64 },
     #[error("invalid: {0}")]
     Invalid(String),
     #[error("io: {0}")]
     Io(String),
     #[error("source: {0}")]
-    Source(#[from] tensorfs_core::err::Refusal),
-    /// What closed: a weight set, a cursor, a copy stream.
+    Source(#[from] tensorfs_core::failure::Failure),
+    /// What closed: a weight set, a source.
     #[error("closed: {0}")]
     Closed(String),
     /// This OS has no such mechanism (the host tier off Linux).
@@ -100,11 +66,7 @@ impl Error {
         match self {
             Error::Cuda { .. } => "CUDA",
             Error::CudaUnavailable(_) => "CUDA_UNAVAILABLE",
-            Error::BudgetExceeded { .. } => "BUDGET_EXCEEDED",
-            Error::Shortfall { .. } => "SHORTFALL",
-            Error::BelowFloor { .. } => "BELOW_FLOOR",
-            Error::LeaseViolation { .. } => "LEASE_VIOLATION",
-            Error::Poisoned(_) => "POISONED",
+            Error::DeviceFull { .. } => "DEVICE_FULL",
             Error::Invalid(_) => "INVALID",
             Error::Io(_) => "IO",
             Error::Source(_) => "SOURCE",
@@ -115,3 +77,32 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<tensorfs_core::err::Refusal> for Error {
+    fn from(error: tensorfs_core::err::Refusal) -> Error { Error::Source(error.into()) }
+}
+
+impl From<tensorfs_core::io::cuda::Error> for Error {
+    fn from(error: tensorfs_core::io::cuda::Error) -> Error {
+        match error {
+            tensorfs_core::io::cuda::Error::Cuda { op, code, name } => Error::Cuda { op, code, name },
+            tensorfs_core::io::cuda::Error::CudaUnavailable(detail) => Error::CudaUnavailable(detail),
+        }
+    }
+}
+impl From<tensorfs_core::io::Error> for Error {
+    fn from(error: tensorfs_core::io::Error) -> Error {
+        match error.cuda().cloned() {
+            Some(cuda) => cuda.into(),
+            None => Error::Io(error.to_string()),
+        }
+    }
+}
+impl From<tensorfs_core::io::source::Error> for Error {
+    fn from(error: tensorfs_core::io::source::Error) -> Error {
+        match error {
+            tensorfs_core::io::source::Error::Read(error) => error.into(),
+            tensorfs_core::io::source::Error::Source(error) => error.into(),
+        }
+    }
+}

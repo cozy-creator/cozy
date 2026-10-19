@@ -2,6 +2,7 @@
 //! from `tensorfs-core` and `tensorfs-plane`. Torch stays outside: tensors cross as DLPack.
 
 mod docs;
+mod cleanup;
 mod errors;
 #[cfg_attr(windows, path = "varena_windows.rs")]
 mod varena;
@@ -30,6 +31,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The library's warnings reach the process's stderr.
     let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
     errors::install(m)?;
+    cleanup::init().map_err(|error| errors::raise(m.py(), error.into()))?;
     m.add("__version__", python_distribution_version())?;
     // The store format and plane claim protocol the `cozy` binary must share (format_contract.py).
     m.add("STORE_FORMAT", tensorfs_core::STORE_FORMAT)?;

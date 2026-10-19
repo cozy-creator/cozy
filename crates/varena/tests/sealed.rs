@@ -1,5 +1,5 @@
 //! Sealed host layouts on the real code path: the owner (the machine) fills one through the
-//! verified read path and seals it; host-only planes (executors, no GPU) adopt it read-only.
+//! verified read path and seals it; executors adopt it read-only.
 //! Every check reads bytes back or asks the kernel.
 #![cfg(target_os = "linux")] // The host tier (memfd, seals, OFD locks) is Linux-only.
 
@@ -9,10 +9,10 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use common::*;
 use tensorfs_core::read;
-use varena::host::{fill_sealed, reserve};
+use varena::host::{fill_sealed, reserve, HostMem};
 use varena::io::{IoTally, Source};
 use varena::layout::Layout;
-use varena::{Error, Tier};
+use varena::Error;
 
 fn sealed(fx: &Fixture, tally: &IoTally) -> OwnedFd {
     let (lease, _) = read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
@@ -46,9 +46,8 @@ fn a_sealed_layout_holds_every_byte_and_nobody_can_change_one() {
     assert!(resident(raw) >= payload);
 
     // The bytes, through an adopter's own read-only view.
-    let plane = host_only();
-    let ws = plane.register_sealed("unet", &fx.plan(), &regions(), raw).unwrap();
-    check_bytes(&plane, ws, None);
+    let layout = Layout::build(&fx.plan(), &regions()).unwrap();
+    check_host(&HostMem::adopt_sealed(raw, &layout).unwrap(), &layout, None);
 
     // Writes, resizes, punches and new writable mappings all refused, also through a new
     // read-write open of the same memfd.
@@ -66,56 +65,18 @@ fn a_sealed_layout_holds_every_byte_and_nobody_can_change_one() {
         assert_eq!(libc::fcntl(raw, libc::F_ADD_SEALS, libc::F_SEAL_GROW), -1); // sealing is sealed too
         assert_eq!(errno(), libc::EPERM);
     }
-    plane.close().unwrap();
-}
-
-#[test]
-fn an_adopter_pins_inside_its_budget_reads_nothing_and_owns_no_ram() {
-    let fx = Fixture::new("adopt-sealed");
-    let fd = sealed(&fx, &IoTally::default());
-    let full = resident(fd.as_raw_fd());
-    let plane = host_only();
-    let ws = plane.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
-    let spans: Vec<u64> = plane.layout(ws).unwrap().regions.iter().map(|r| r.span).collect();
-    // Nothing joins the books at registration: only what a budget wants.
-    assert_eq!(plane.stats().host.used, 0);
-    plane.set_pinned_budget(spans[0] + spans[1]).unwrap();
-    plane.want(ws, Tier::Pinned, Some(&[0, 1]), 0, false).unwrap().wait().unwrap();
-    let s = plane.stats();
-    assert_eq!(s.host.used, spans[0] + spans[1]);
-    assert_eq!(s.host.counters.fill_bytes, 0, "adoption reads no store");
-    assert_eq!(s.host.direct_bytes + s.host.cached_bytes + s.host.buffered_bytes, 0);
-    assert_eq!(s.host.memfd_bytes, 0, "the sealed layout's RAM is its owner's");
-    assert_eq!(s.host.sealed_bytes, full);
-    // A budget cut lets regions go from the books but never punches: the bytes stay.
-    let t = plane.set_pinned_budget(0).unwrap();
-    assert_eq!(t.freed, spans[0] + spans[1]);
-    assert_eq!(resident(fd.as_raw_fd()), full);
-    check_bytes(&plane, ws, None);
-    // Every region is Ready for good: a want past the budget is refused, never filled.
-    match plane.want(ws, Tier::Pinned, Some(&[2]), 0, false) {
-        Err(Error::BelowFloor { .. }) => {}
-        other => panic!("expected BelowFloor, got {:?}", other.err()),
-    }
-    // Closing the adopter leaves the layout whole for the next one.
-    plane.close().unwrap();
-    assert_eq!(resident(fd.as_raw_fd()), full);
-    let next = host_only();
-    let again = next.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
-    check_bytes(&next, again, None);
-    next.close().unwrap();
 }
 
 #[test]
 fn only_a_sealed_complete_layout_is_adopted_read_only() {
     let fx = Fixture::new("unsealed");
-    let plane = host_only();
-    let ws = fx.register(&plane, None);
-    plane.set_pinned_budget(1 << 30).unwrap();
-    plane.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
-    // A pinned tier an executor filled is Ready but not sealed: refused.
-    let other = host_only();
-    match other.register_sealed("unet", &fx.plan(), &regions(), plane.host_fd(ws).unwrap()) {
+    let layout = Layout::build(&fx.plan(), &regions()).unwrap();
+    // A memfd anyone may still write is refused.
+    let open = HostMem::create("unet", &layout).unwrap();
+    assert_eq!(varena::host::sealed_regions(open.fd()).unwrap(), regions(), "every layout's state page names its regions");
+    let empty = varena::host::reserve("empty", 4096, 1).unwrap();
+    assert!(matches!(varena::host::sealed_regions(empty.as_raw_fd()), Err(Error::Invalid(_))), "a memfd without a state page names none");
+    match HostMem::adopt_sealed(open.fd(), &layout) {
         Err(Error::Invalid(_)) => {}
         r => panic!("an unsealed memfd must be refused, got {:?}", r.err()),
     }
@@ -124,9 +85,7 @@ fn only_a_sealed_complete_layout_is_adopted_read_only() {
     let mut moved = regions();
     let tail = moved[2].pop().unwrap();
     moved[0].push(tail);
-    assert!(other.register_sealed("unet", &fx.plan(), &moved, fd.as_raw_fd()).is_err());
-    other.close().unwrap();
-    plane.close().unwrap();
+    assert!(HostMem::adopt_sealed(fd.as_raw_fd(), &Layout::build(&fx.plan(), &moved).unwrap()).is_err());
 }
 
 #[test]
@@ -143,10 +102,7 @@ fn a_reservation_made_before_the_plan_takes_any_layout_and_frees_what_it_does_no
         let size = std::fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap().len();
         assert!(size >= layout.nbytes && size < layout.nbytes + (1 << 20));
         assert!(resident(fd.as_raw_fd()) <= size);
-        let plane = host_only();
-        let ws = plane.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
-        check_bytes(&plane, ws, None);
-        plane.close().unwrap();
+        check_host(&HostMem::adopt_sealed(fd.as_raw_fd(), &layout).unwrap(), &layout, None);
     }
 }
 
@@ -165,36 +121,28 @@ fn an_adopter_takes_a_layout_before_its_bytes_and_uses_each_region_once_ready() 
     unsafe {
         assert_eq!(libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) & (libc::F_SEAL_SHRINK | libc::F_SEAL_GROW), libc::F_SEAL_SHRINK | libc::F_SEAL_GROW);
     }
-    let plane = host_only();
-    let ws = plane.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
-    plane.set_pinned_budget(1 << 30).unwrap();
-    let ticket = plane.want(ws, Tier::Pinned, None, 0, false).unwrap();
-    assert!(!ticket.done().unwrap(), "nothing is Ready before the fill runs");
+    let host = HostMem::adopt_sealed(fd.as_raw_fd(), &layout).unwrap();
+    assert!(!host.ready(0), "nothing is Ready before the fill runs");
     let (lease, _) = read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
     let source = Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
-    let filler = std::thread::spawn(move || fill.run(&layout, &source, 2, &IoTally::default()));
-    ticket.wait().unwrap();
+    let filling = layout.clone();
+    let filler = std::thread::spawn(move || fill.run(&filling, &source, 2, &IoTally::default()));
+    for r in 0..layout.regions.len() as u32 {
+        host.wait_ready(r).unwrap();
+    }
     filler.join().unwrap().unwrap();
-    check_bytes(&plane, ws, None);
-    assert_eq!(plane.stats().host.counters.fill_bytes, 0, "waited for, never read here");
-    plane.close().unwrap();
+    check_host(&host, &layout, None);
 }
 
 #[test]
 fn a_failed_fill_reaches_every_adopter_as_an_error() {
     let fx = Fixture::new("progressive-fail");
-    let (fd, fill, _) = open(&fx);
-    let plane = host_only();
-    let ws = plane.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
-    plane.set_pinned_budget(1 << 30).unwrap();
-    let ticket = plane.want(ws, Tier::Pinned, None, 0, false).unwrap();
+    let (fd, fill, layout) = open(&fx);
+    let host = HostMem::adopt_sealed(fd.as_raw_fd(), &layout).unwrap();
     drop(fill); // a filler that gives up poisons what it did not finish
-    assert!(ticket.wait().is_err(), "a region its machine could not fill is an error, never read");
+    assert!(host.wait_ready(0).is_err(), "a region its machine could not fill is an error, never read");
     // A later adopter refuses the failed layout outright.
-    let other = host_only();
-    assert!(other.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).is_err());
-    other.close().unwrap();
-    let _ = plane.close();
+    assert!(HostMem::adopt_sealed(fd.as_raw_fd(), &layout).is_err());
 }
 
 /// The object files a machine hands over: each object's verified store file, opened read-only.
@@ -216,13 +164,7 @@ fn a_layout_staged_in_part_holds_only_its_staged_regions_and_stages_more_on_requ
     let held = resident(fd.as_raw_fd());
     assert!(held < layout.regions[1].span, "the machine holds no copy of a hole: {held} B");
 
-    // A pinned want covers the staged regions only; the holes are the files' to serve.
-    let plane = host_only();
-    let ws = plane.register_staged("unet", &fx.plan(), &regions(), fd.as_raw_fd(), object_files(&fx)).unwrap();
-    plane.set_pinned_budget(1 << 30).unwrap();
-    plane.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
-    check_bytes(&plane, ws, Some(0));
-    assert_eq!(plane.stats().host.used, layout.regions[0].span);
+    check_host(&adopter, &layout, Some(0));
 
     // The executor's stream grew: the machine stages region 1 too, and only it.
     let taken = fill.take(&[1, 0]);
@@ -231,9 +173,7 @@ fn a_layout_staged_in_part_holds_only_its_staged_regions_and_stages_more_on_requ
     let staged = fill.stage(&taken, &layout, &source, 2, &IoTally::default()).unwrap();
     assert_eq!(staged, layout.regions[1].span);
     assert!(adopter.ready(1) && adopter.hole(2));
-    plane.want(ws, Tier::Pinned, Some(&[1]), 0, false).unwrap().wait().unwrap();
-    check_bytes(&plane, ws, Some(1));
-    plane.close().unwrap();
+    check_host(&adopter, &layout, Some(1));
     drop(fill); // holes stay holes when the filler goes; nothing staged is poisoned
     assert!(adopter.hole(2) && !adopter.failed(2) && !adopter.failed(1));
 }

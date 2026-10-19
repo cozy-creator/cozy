@@ -4,6 +4,11 @@
 #![allow(unsafe_code)]
 
 pub mod cuda;
+pub mod pins;
+#[cfg(unix)]
+pub mod source;
+#[cfg(feature = "store")]
+pub mod view;
 #[cfg(unix)]
 pub mod metrics;
 mod device;
@@ -29,6 +34,8 @@ pub struct Copy<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Src<'a> {
+    /// Fill the destination with zeroes, without a file or a host staging slab.
+    Zero,
     /// A file from an offset.
     File(&'a File, u64),
     /// Host memory (a sealed layout's mapping): RAM to the destination, no disk.
