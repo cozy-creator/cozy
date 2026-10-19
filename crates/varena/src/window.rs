@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::host::{self, HostMem};
 use crate::io::{IoTally, Mode, Source};
 use crate::layout::Layout;
-use crate::{Error, Result};
+use crate::Result;
 
 /// The machine's side of a streamed layout: its writable mapping and the staging loop.
 pub struct OpenWindow {

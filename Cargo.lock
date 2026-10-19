@@ -4766,7 +4766,6 @@ name = "varena"
 version = "0.11.0"
 dependencies = [
  "libc",
- "libloading 0.9.0",
  "platform",
  "tensorfs-core",
  "thiserror 2.0.21",
