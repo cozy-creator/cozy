@@ -1145,7 +1145,7 @@ mod v1_api {
                 owner: "alice".into(),
                 ..Default::default()
             };
-            let request = RunRequest { id: id.into(), after: 0, spec: Some(spec) };
+            let request = RunRequest { id, after: 0, spec: Some(spec) };
             let done = outcome(&collect(run_events(&client, &all, request).await.unwrap()).await.unwrap());
             assert_eq!(done.status, "succeeded", "{done:?}");
             let result: serde_json::Value = json(&done.result);
