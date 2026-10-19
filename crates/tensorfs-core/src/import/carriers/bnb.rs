@@ -244,11 +244,15 @@ fn four_bit(
     };
     let tensor = Tensor {
         dtype,
-        shape: qs.shape,
+        shape: qs.shape.clone(),
         file: weight.file,
         start: weight.start,
         len: weight.len,
-        encoded: Some(Box::new(Folded { encoding, parts })),
+        encoded: Some(Box::new(Folded {
+            encoding,
+            shape: qs.shape,
+            parts,
+        })),
     };
     Ok((consumed, tensor))
 }
@@ -292,7 +296,11 @@ fn eight_bit(set: &SourceSet, group: &Group, m: &str) -> Result<(String, Vec<Str
         params: Default::default(),
     };
     let tensor = Tensor {
-        encoded: Some(Box::new(Folded { encoding, parts })),
+        encoded: Some(Box::new(Folded {
+            encoding,
+            shape: weight.shape.clone(),
+            parts,
+        })),
         ..weight.clone()
     };
     Ok((w, consumed, tensor))
