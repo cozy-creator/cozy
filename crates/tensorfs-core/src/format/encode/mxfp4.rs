@@ -50,7 +50,10 @@ fn quantize(input: &Input) -> Result<Vec<OwnedPart>> {
     };
     // The stored tensor: the logical one, or with its last two axes swapped.
     let (x, shape) = match transposed {
-        true => (swap_last_two(&x, shape), [lead, &[*b, *a]].concat()),
+        true => (
+            swap_last_two(&x, *a as usize, *b as usize),
+            [lead, &[*b, *a]].concat(),
+        ),
         false => (x, shape.to_vec()),
     };
     let c = shape[shape.len() - 1];

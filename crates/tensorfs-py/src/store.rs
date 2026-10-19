@@ -1719,6 +1719,14 @@ impl PyComponentWriter {
 
 // ---------------------------------------------------------------- the module
 
+#[pyfunction]
+fn _kernel_binary<'py>(py: Python<'py>, family: u32, core: &str, dtype: &str) -> PyResult<(Bound<'py, PyBytes>, &'static str, u32, u32)> {
+    let binary = tensorfs_core::kernels::BINARIES.iter()
+        .find(|b| b.family == family && b.kind == core && b.dtype == dtype)
+        .ok_or_else(|| raise(py, Failure { kind: Kind::Unsupported, detail: format!("no prebuilt sm{family}/{core}/{dtype} kernel") }))?;
+    Ok((PyBytes::new(py, binary.image), binary.symbol, binary.shared, binary.warps))
+}
+
 pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStore>()?;
     m.add_class::<PyCheckpoint>()?;
@@ -1733,5 +1741,6 @@ pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEncoded>()?;
     m.add_class::<PyWriter>()?;
     m.add_function(wrap_pyfunction!(regions, m)?)?;
+    m.add_function(wrap_pyfunction!(_kernel_binary, m)?)?;
     Ok(())
 }
