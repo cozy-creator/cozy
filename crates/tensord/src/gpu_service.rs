@@ -4255,9 +4255,9 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         pool.leaders.lock().unwrap().insert(birth.pid, (birth.clone(), "unreadable".into(), 0));
         pool.tenants.lock().unwrap().insert(birth.pid, Tenant { plan: "unreadable".into(), start: 0, exact });
         pool.levels.lock().unwrap().insert("unreadable".into(), (("g".into(), "app".into()), Level::Host, birth.clone()));
-        // Corrupt only this test's real SQLite record, without a production failpoint.
+        // Valid JSON passes SQLite's index but lacks Execution fields at the journal reader.
         let db = rusqlite::Connection::open(engine.root.join("executions.sqlite3")).unwrap();
-        assert_eq!(db.execute("UPDATE executions SET record='{' WHERE id=?1", [&id]).unwrap(), 1);
+        assert_eq!(db.execute("UPDATE executions SET record='{}' WHERE id=?1", [&id]).unwrap(), 1);
         let expected = engine.get(&id).unwrap_err();
         drop(child.stdin.take());
         assert!(child.wait().unwrap().success());
