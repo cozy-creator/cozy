@@ -65,10 +65,11 @@
       "formats": ["float8_e4m3fn", "float8_e5m2"],
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3", "F8_E5M2"], "shape": "logical"},
-        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32"], "shape": "one"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "one"},
         {"suffix": "input_scale", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true}
       ],
-      "encoding": {"scheme": "fp8.tensorwise", "params": {}}
+      "encoding": {"scheme": "fp8.tensorwise", "params": {}},
+      "dtype_params": {"scale_dtype": "scale"}
     },
     {
       "producer": "comfy",
@@ -84,19 +85,21 @@
       "formats": ["scaled_fp8"],
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3", "F8_E5M2"], "shape": "logical"},
-        {"suffix": "scale_weight", "role": "scale", "dtypes": ["F32"], "shape": "one"},
+        {"suffix": "scale_weight", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "one"},
         {"suffix": "scale_input", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true}
       ],
-      "encoding": {"scheme": "fp8.tensorwise", "params": {}}
+      "encoding": {"scheme": "fp8.tensorwise", "params": {}},
+      "dtype_params": {"scale_dtype": "scale"}
     },
     {
       "producer": "comfy",
       "formats": ["int8_tensorwise"],
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": "logical"},
-        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32"], "shape": "one"}
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "one"}
       ],
-      "encoding": {"scheme": "int8.tensorwise", "params": {}}
+      "encoding": {"scheme": "int8.tensorwise", "params": {}},
+      "dtype_params": {"scale_dtype": "scale"}
     },
     {
       "producer": "comfy",

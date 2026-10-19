@@ -41,6 +41,9 @@ pub struct Carrier {
     /// Params a module's marker states: param -> (marker key, the producer's own default).
     #[serde(default)]
     pub marker_params: BTreeMap<String, (String, u64)>,
+    /// Params naming a part's stored dtype: param -> part role (`scale_dtype` -> `scale`).
+    #[serde(default)]
+    pub dtype_params: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -466,6 +469,14 @@ fn fit(
                 .ok_or(format!("marker {key} is {v}, not a count"))?,
         };
         encoding.params.insert(param.clone(), Value::from(value));
+    }
+    for (param, role) in &carrier.dtype_params {
+        let part = parts.iter().find(|p| p.role == *role);
+        let dtype = part
+            .ok_or(format!("no {role} part for {param}"))?
+            .dtype
+            .name();
+        encoding.params.insert(param.clone(), Value::from(dtype));
     }
     Ok(Folded { encoding, parts })
 }
