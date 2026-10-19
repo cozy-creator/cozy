@@ -21,7 +21,7 @@ pub enum Kind {
     /// A known scheme whose parts or params break its definition.
     Decode,
     Io,
-    /// The disk or a quota is full.
+    /// Storage, device memory or a quota is full.
     Full,
     /// A transfer failed or stalled.
     Network,
@@ -143,6 +143,19 @@ impl From<format::Error> for Failure {
 }
 
 #[cfg(feature = "store")]
+impl From<crate::io::cuda::Error> for Failure {
+    fn from(error: crate::io::cuda::Error) -> Failure {
+        use crate::io::cuda;
+        let kind = match &error {
+            cuda::Error::CudaUnavailable(_) => Kind::Unsupported,
+            cuda::Error::Cuda { code, .. } if *code == cuda::ERROR_OUT_OF_MEMORY => Kind::Full,
+            _ => Kind::Io,
+        };
+        Failure { kind, detail: error.to_string() }
+    }
+}
+
+#[cfg(feature = "store")]
 impl From<store2::Error> for Failure {
     fn from(e: store2::Error) -> Failure {
         let kind = match &e {
@@ -150,6 +163,9 @@ impl From<store2::Error> for Failure {
             store2::Error::Io { source, .. } => {
                 if let Some(refusal) = source.get_ref().and_then(|cause| cause.downcast_ref::<Refusal>()) {
                     return refusal.clone().into();
+                }
+                if let Some(cuda) = source.get_ref().and_then(|cause| cause.downcast_ref::<crate::io::cuda::Error>()) {
+                    return cuda.clone().into();
                 }
                 Kind::Io
             }
@@ -167,6 +183,10 @@ impl From<store2::Error> for Failure {
 
 impl From<std::io::Error> for Failure {
     fn from(e: std::io::Error) -> Failure {
+        #[cfg(feature = "store")]
+        if let Some(cuda) = e.get_ref().and_then(|cause| cause.downcast_ref::<crate::io::cuda::Error>()) {
+            return cuda.clone().into();
+        }
         let kind = match e.kind() {
             std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => Kind::Full,
             std::io::ErrorKind::NotFound => Kind::NotFound,

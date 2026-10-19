@@ -12,6 +12,8 @@ mod store;
 mod tensors;
 #[cfg(feature = "store")]
 mod credentials;
+#[cfg(feature = "store")]
+mod dlpack_source;
 
 use pyo3::prelude::*;
 
