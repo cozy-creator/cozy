@@ -18,6 +18,7 @@
 //! Without a store it is a plan: the census, the names and the new bytes, from the manifest and
 //! header alone ([`hub`] fetches just those from a Hub).
 
+pub mod d10;
 pub mod hub;
 pub mod v1;
 
