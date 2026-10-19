@@ -83,7 +83,8 @@ fn checkpoint(store: &Store, chunks: &[Vec<u8>], files: &[(&str, Vec<u8>)]) -> O
     let mut tree = Tree::default();
     tree.set_variant("int8", store.put_bytes(&header.to_cbor().unwrap()).unwrap());
     for (path, file) in files {
-        tree.files.insert((*path).into(), store.put_bytes(file).unwrap());
+        tree.files
+            .insert((*path).into(), store.put_bytes(file).unwrap());
     }
     store.put_tree(&tree).unwrap()
 }
@@ -448,7 +449,9 @@ fn kill_during_a_record_commit_keeps_the_old_record_or_the_new() {
     assert_eq!(store.get_pin("p").unwrap().unwrap().roots, vec![a, b]);
 
     let lane = |store: &Store| {
-        store.get_ref("ACME/Model").unwrap().unwrap().releases[0].tree.clone()
+        store.get_ref("ACME/Model").unwrap().unwrap().releases[0]
+            .tree
+            .clone()
     };
     let job = Job::Ref("acme/model".into(), second.clone());
     kill_at(&request(&root, Some("record.written"), job));
@@ -564,10 +567,21 @@ fn an_object_reused_while_gc_sweeps_it_survives() {
         let mut gc = Child::spawn(&request(&root, Some("gc.trashed"), Job::Gc));
         gc.wait_for("FAULT gc.trashed");
         assert_eq!(trash(&store), 1);
-        assert_eq!(
-            store.read(&object).unwrap(),
-            reused,
-            "it still reads mid-sweep"
+        // The collector holds an exclusive inode fence until it finishes its trash decision.
+        // A real reader restores the namespace first, then waits for that fence. Keep the
+        // controller free to resume GC; a synchronous read here would deadlock the fixture.
+        let (sent, received) = std::sync::mpsc::channel();
+        let reading = store.clone();
+        let read_object = object.clone();
+        let reader = std::thread::spawn(move || {
+            let _ = sent.send(reading.read(&read_object));
+        });
+        assert!(
+            matches!(
+                received.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the reader completed while GC held the exclusive inode fence"
         );
         if put {
             assert_eq!(store.put_bytes(&reused).unwrap(), object);
@@ -576,6 +590,15 @@ fn an_object_reused_while_gc_sweeps_it_survives() {
         }
         assert_eq!(trash(&store), 0);
         gc.resume();
+        let read = received
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reader stayed blocked after GC resumed");
+        reader.join().expect("the reader thread panicked");
+        assert_eq!(
+            read.unwrap(),
+            reused,
+            "the concurrent reader gets the exact bytes"
+        );
         gc.finish();
         assert!(store.verify(&object).unwrap());
     }
