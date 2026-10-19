@@ -1,446 +1,371 @@
-"""TensorFS speed gate: cozytensors/1 against safetensors, disk -> pinned -> GPU (xs-045 F1, U8).
+"""F1/R4 serialized-byte loading: public TensorFS against stock safetensors readers.
 
-    python speedgate.py <work dir> <result.json> [--build-only] [--plane=readers=16,staging_buffers=32]
-        [--readers=T64+rust,st-cuda] [--cells=window]
+    python speedgate.py WORK RESULT.json --sources=SOURCES.json
 
-The machine's v1 store supplies the real SDXL int8 and Qwen-Image int8 lane bytes. Each lane is
-written once into a TensorFS v2 store by its writer (the real chunk layout) and once as one
-safetensors file per component. Then every (reader, cell) is timed in interleaved repetitions:
-cold (pages dropped) and warm, the whole checkpoint and one paging window, from first open to
-the last byte resident on the GPU.
-
-Readers:
-- `T64+rust`: `tensorfs.varena` (the plane's Rust chunk reader): open the checkpoint, regions for
-  what the load wants (the window's block, or everything) cut at blocks, `register_checkpoint` of
-  those alone; then want and wait.
-- `T64+fst`: the same chunk files read by fastsafetensors' own C++ engine.
-- `T64`: the F1 Python reader over the same chunk files.
-- `fastsafetensors`: fastsafetensors 0.5.0 over the safetensors files.
-- `st-cuda`, `st-cpu-cuda`: `safetensors.safe_open` 0.8 onto the GPU, or onto the CPU then `.to("cuda")`.
-The gate compares `T64+rust` with the best of the three safetensors paths in each cell, on the
-whole time. Each cell also reports its open (up to the first byte read: header parses, regions,
-registration) and its read (the rest) for the readers that have one.
+The same real INT8 parts become U8 tensors in both formats, outside the clock. Measure
+first open through completed GPU transfer, five rotated repetitions of full/window ×
+cold/warm. Preparation, engine initialization, decoding and inference are not timed.
+The supplied checkpoint refs must already be local; this script never downloads weights.
 """
 
-import ctypes
+import argparse
 import glob
+import hashlib
+import importlib.metadata
 import json
 import os
+from pathlib import Path
 import re
 import resource
-import shutil
 import statistics
+import subprocess
 import sys
-import threading
 import time
 
-import cbor2
 import fastsafetensors.copier.nogds as fst_nogds
+import tensorfs
 import torch
 from fastsafetensors import SafeTensorsFileLoader
-from fastsafetensors import cpp as fstcpp
 from fastsafetensors.frameworks import get_framework_op
 from safetensors import safe_open
-import tensorfs
 from tensorfs import varena
 
-# fastsafetensors dlopens an unversioned libcudart.so; torch's wheels ship only the versioned one.
-_cudart = sorted(glob.glob(os.path.join(os.path.dirname(torch.__file__), "..", "nvidia", "**", "libcudart.so*"), recursive=True))
+# fastsafetensors dlopens libcudart.so; Torch wheels carry the versioned filename.
+_cudart = sorted(glob.glob(str(Path(torch.__file__).parent / ".." / "nvidia" / "**" / "libcudart.so*"), recursive=True))
 if _cudart:
     fst_nogds.resolve_runtime_lib_name = lambda framework=None: os.path.realpath(_cudart[0])
 
-MiB = 1 << 20
-ALIGN = 4 << 10
-SLOT = 16 * MiB  # one read request and its pinned staging buffer
-THREADS = 16  # fastsafetensors' defaults: 16 threads, 16 MiB buffers
-LANES = {  # v1 manifest, window component, window key prefix, repetitions
-    "sdxl-int8": ("3eb5674846e82e5b8d3e20d73f083a6d4aaa57ea699425287d5669906cfe6064", "unet", "up_blocks.1.", 5),
-    "qwen-int8": ("e7c79ee942b892d76e778fb873fbdce55deaadb1fe669fca6e7851980f747493", "transformer", "transformer_blocks.30.", 5),
+REPS = 5
+LANES = {
+    "sdxl-int8": {"component": "unet", "prefix": "up_blocks.1.",
+                  "legacy_manifest": "3eb5674846e82e5b8d3e20d73f083a6d4aaa57ea699425287d5669906cfe6064"},
+    "qwen-int8": {"component": "transformer", "prefix": "transformer_blocks.30.",
+                  "legacy_manifest": "e7c79ee942b892d76e778fb873fbdce55deaadb1fe669fca6e7851980f747493"},
 }
-LAYOUTS = ("T64+rust", "T64+fst", "T64", "fastsafetensors", "st-cuda", "st-cpu-cuda")
-SAFETENSORS = ("fastsafetensors", "st-cuda", "st-cpu-cuda")  # the paths the gate compares against
+LAYOUTS = ("T64+rust", "fastsafetensors", "st-cuda", "st-cpu-cuda")
+SAFETENSORS = LAYOUTS[1:]
+SCOPES = ("full", "window")
+CELLS = ("full cold", "full warm", "window cold", "window warm")
 
 
-def natkey(s):
-    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)]
+def digest(path):
+    with open(path, "rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def store_root():
-    for c in (os.environ.get("COZY_TENSORFS_ROOT"), "/var/lib/tensorfs", os.path.expanduser("~/.tensorfs")):
-        if c and os.path.isdir(os.path.join(c, "manifests")):
-            return c
-    raise RuntimeError("no TensorFS v1 store with manifests/ on this machine")
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
-def v1_parts(root, manifest, wcomp, wprefix):
-    """(component, key, role, length, inline bytes | None, [(object path, length)], in window), in execution order."""
-    blob = lambda d: f"{root}/blobs/{d[:2]}/{d[2:4]}/{d}"
-    m = glob.glob(f"{root}/manifests/{manifest[:2]}/{manifest[2:4]}/{manifest}*")[0]
-    e = next(x for x in json.load(open(m))["entries"] if x["kind"] == "cozytensors")["blob"]["sha256"]
-    out = []
-    for comp, tensors in cbor2.loads(open(blob(e), "rb").read())[4]:
-        for t in sorted(tensors, key=lambda t: natkey(t[0])):
-            for role, _codec, _shape, body in t[4]:
-                w = comp == wcomp and t[0].startswith(wprefix)
-                if isinstance(body, bytes):
-                    out.append((comp, t[0], role, len(body), body, [], w))
-                else:
-                    segs = [(blob(bytes(d).hex()), n) for d, n in body]
-                    out.append((comp, t[0], role, sum(n for _, n in segs), None, segs, w))
-    return out
+def natkey(key):
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", key)]
 
 
-def part_bytes(p):
-    return p[4] if p[4] is not None else b"".join(open(path, "rb").read() for path, _ in p[5])
+def copy_rows():
+    """Drain existing shared-engine observations; this does not initiate a probe."""
+    names = ("kind", "gpu", "bytes", "ns", "ceiling", "link", "busy_ns", "pin_ns", "staged", "cached")
+    return [{name: getattr(row, name) for name in names} for row in varena.copies()]
 
 
-def blocks(ck):
-    """Every `<component>/<key prefix>` up to a key's first numbered segment (`unet/up_blocks.1`,
-    `transformer/transformer_blocks.30`): the blocks regions are cut at."""
-    out = set()
-    for comp, ts in ck.tensors.items():
-        for key in ts:
-            seg = key.split("#")[0].split(".")
-            i = next((i for i, x in enumerate(seg) if i and x.isdigit()), None)
-            if i is not None:
-                out.add(f"{comp}/{'.'.join(seg[: i + 1])}")
-    return sorted(out)
-
-
-def write_v2(parts, root):
-    """The lane through TensorFS's own writer, each part a U8 tensor `key#role`: the manifest digest."""
-    w = tensorfs.Store(root).writer()
-    for p in parts:
-        w.put(p[0], f"{p[1]}#{p[2]}", "U8", [p[3]], part_bytes(p))
-    return w.commit().sha256
-
-
-def build_safetensors(parts, d):
-    """One file per component, parts in execution order as U8 tensors named `key#role`."""
-    os.makedirs(d, exist_ok=True)
-    for comp in dict.fromkeys(p[0] for p in parts):
-        cp = [p for p in parts if p[0] == comp]
-        meta, off = {}, 0
-        for p in cp:
-            meta[f"{p[1]}#{p[2]}"] = {"dtype": "U8", "shape": [p[3]], "data_offsets": [off, off + p[3]]}
-            off += p[3]
-        hb = json.dumps(meta, separators=(",", ":")).encode()
-        hb += b" " * (-len(hb) % 8)
-        with open(os.path.join(d, f"{comp}.safetensors"), "wb") as f:
-            f.write(len(hb).to_bytes(8, "little") + hb)
-            for p in cp:
-                f.write(part_bytes(p))
-
-
-class Reader:
-    """F1's Python reader: disk -> pinned slot -> GPU, each batch one slot and one copy. THREADS
-    workers, two slots, two events and a stream each: a read overlaps the previous copy."""
-
-    def __init__(self):
-        n = 2 * THREADS
-        self.host = torch.empty(n * SLOT + ALIGN, dtype=torch.uint8, pin_memory=True)
-        base = -self.host.data_ptr() % ALIGN
-        self.slots = [self.host[base + i * SLOT : base + (i + 1) * SLOT] for i in range(n)]
-        self.views = [memoryview((ctypes.c_char * SLOT).from_address(s.data_ptr())).cast("B") for s in self.slots]
-        self.streams = [torch.cuda.Stream() for _ in range(THREADS)]
-        self.events = [torch.cuda.Event() for _ in range(n)]
-
-    def run(self, spans, direct):
-        """spans: [(path, offset, length)], whole chunks. Returns bytes read."""
-        batches = [(path, off, min(SLOT, n - off)) for path, _, n in spans for off in range(0, n, SLOT)]
-        offsets, total = [], 0
-        for b in batches:
-            offsets.append(total)
-            total += -(-b[2] // 256) * 256
-        dst = torch.empty(max(total, 1), dtype=torch.uint8, device="cuda")
-        work, lock, errors = iter(zip(offsets, batches)), threading.Lock(), []
-        flags = os.O_RDONLY | (os.O_DIRECT if direct else 0)
-
-        def worker(t):
-            k = 0
-            try:
-                while True:
-                    with lock:
-                        job = next(work, None)
-                    if job is None:
-                        break
-                    dst_off, (path, off, n) = job
-                    i = 2 * t + k
-                    self.events[i].synchronize()
-                    fd = os.open(path, flags)
-                    try:
-                        os.preadv(fd, [self.views[i][: -(-n // ALIGN) * ALIGN]], off)
-                    finally:
-                        os.close(fd)
-                    with torch.cuda.stream(self.streams[t]):
-                        dst[dst_off : dst_off + n].copy_(self.slots[i][:n], non_blocking=True)
-                        self.events[i].record()
-                    k ^= 1
-            except BaseException as e:
-                errors.append(e)
-
-        ts = [threading.Thread(target=worker, args=(t,)) for t in range(THREADS)]
-        for x in ts:
-            x.start()
-        for x in ts:
-            x.join()
-        torch.cuda.synchronize()
-        if errors:
-            raise errors[0]
-        return total
-
-
-class Engine:
-    """fastsafetensors' nogds reader (C++, 16 threads, 16 MiB pinned bounce buffers) over any file ranges."""
-
-    def __init__(self):
-        fst_nogds.load_library_func(get_framework_op("pytorch"))
-        self.reader = fstcpp.nogds_file_reader(False, 16 << 10, 16, True, 0, -1)
-
-    def run(self, spans, direct):
-        offsets, total = [], 0
-        for _, _, n in spans:
-            offsets.append(total)
-            total += -(-n // 256) * 256
-        dst = torch.empty(max(total, 1), dtype=torch.uint8, device="cuda")
-        buf = fstcpp.gds_device_buffer(dst.data_ptr(), dst.numel(), True)
-        flags = os.O_RDONLY | (os.O_DIRECT if direct else 0)
-        reqs = []
-        for (path, off, n), o in zip(spans, offsets):
-            fd = os.open(path, flags)
-            reqs.append((self.reader.submit_read(fd, buf, off, n, o), fd))
-        failed = 0
-        for req, fd in reqs:
-            failed += req < 0 or self.reader.wait_read(req) == 0
-            os.close(fd)
-        torch.cuda.synchronize()
-        if failed:
-            raise RuntimeError(f"{failed} engine reads failed")
-        return sum(n for _, _, n in spans)
+def transfer_metrics(rows):
+    h2d = [row for row in rows if row["kind"] == "h2d"]
+    measured = bool(h2d) and all(row["ceiling"] > 0 and row["ns"] > 0 and row["link"] for row in h2d)
+    nbytes, ns = sum(row["bytes"] for row in h2d), sum(row["ns"] for row in h2d)
+    # Byte/ns is decimal GB/s. Aggregate each batch's measured wire-time denominator.
+    wire_ns = sum(row["bytes"] / row["ceiling"] for row in h2d) if measured else None
+    return {"records": rows, "h2d_gbps": nbytes / ns if ns else None,
+            "pinned_ceiling_ratio": wire_ns / ns if measured else None, "measured": measured}
 
 
 class Model:
-    def __init__(self, name, root, work):
-        manifest, self.wcomp, self.wprefix, self.reps = LANES[name]
-        self.name, self.dir = name, os.path.join(work, name)
-        self.parts = v1_parts(root, manifest, self.wcomp, self.wprefix)
-        self.bytes = sum(p[3] for p in self.parts)
-        self.window_bytes = sum(p[3] for p in self.parts if p[6])
-        self.store = os.path.join(self.dir, "v2")
+    def __init__(self, name, spec, cache_dir, work):
+        self.name, self.spec, self.cache_dir = name, spec, cache_dir
+        self.dir = Path(work) / name
+        self.store = self.dir / "tensorfs"
+        self.wcomp, self.wprefix = LANES[name]["component"], LANES[name]["prefix"]
+        ref = spec["checkpoint"]
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", ref) is None:
+            raise ValueError(f"{name}: checkpoint must be an immutable local header ref")
+        self.source = tensorfs.open(ref, cache_dir=cache_dir, local_files_only=True)
+        if self.source.id != ref:
+            raise ValueError(f"{name}: checkpoint is not the supplied header ref")
+        self.parts = []
+        for component, held in self.source.components.items():
+            for key in sorted(held.tensors, key=natkey):
+                for role, part in held.tensors[key].parts.items():
+                    self.parts.append((component, key, role, part.length, part.dtype, list(part.shape)))
+        self.bytes = sum(part[3] for part in self.parts)
+        self.window_bytes = sum(part[3] for part in self.parts if self.in_window(part[0], part[1]))
+        if not self.bytes or not self.window_bytes:
+            raise ValueError(f"{name}: full payload and declared F1 window must both exist")
+        names = [f"{key}#{role}" for _, key, role, *_ in self.parts]
+        if len(names) != len(set(names)):
+            raise ValueError(f"{name}: safetensors' shared key namespace has duplicate part names")
+        self.geometry = hashlib.sha256(canonical(self.parts)).hexdigest()
 
-    def build(self, log):
-        done = os.path.join(self.dir, "DONE")
-        if not os.path.exists(done):
-            shutil.rmtree(self.dir, ignore_errors=True)
-            t0 = time.perf_counter()
-            digest = write_v2(self.parts, self.store)
-            log(f"{self.name}: v2 checkpoint {digest} written in {time.perf_counter() - t0:.0f} s")
-            build_safetensors(self.parts, os.path.join(self.dir, "st"))
-            os.sync()
-            open(done, "w").write(digest)
-        self.manifest = open(done).read()
-        ck = self.checkpoint()
-        self.chunks = [(path, length) for path, (_, length) in zip(ck.chunk_paths, ck.chunks)]
-        self.blocks = blocks(ck)  # the model's structure, known before any load
-        self.st = [os.path.join(self.dir, "st", f) for f in sorted(os.listdir(os.path.join(self.dir, "st")))]
+    def in_window(self, component, key):
+        return component == self.wcomp and key.startswith(self.wprefix)
 
     def checkpoint(self):
-        return tensorfs.Store(self.store).checkpoint(f"sha256:{self.manifest}")
+        return tensorfs.open(self.header, cache_dir=self.store, local_files_only=True)
 
-    def in_window(self, comp, key):
-        return comp == self.wcomp and key.startswith(self.wprefix)
+    def build(self, log):
+        """Both formats receive the same public host-read buffer for each stored part."""
+        marker = self.dir / "DONE.json"
+        identity = {"format": "tensorfs.speed-fixture/2", "source": self.source.id,
+                    "geometry": self.geometry, "extension_sha256": digest(tensorfs._ext.__file__)}
+        if marker.exists():
+            record = json.loads(marker.read_bytes())
+            if record["identity"] != identity:
+                raise ValueError(f"{self.dir}: existing fixture belongs to another source or wheel")
+            self.header, self.part_hashes = record["header"], record["part_hashes"]
+        else:
+            # Never erase an earlier benchmark or another owner's files to rebuild a fixture.
+            self.dir.mkdir(parents=True, exist_ok=False)
+            st_dir = self.dir / "st"
+            st_dir.mkdir()
+            started = time.perf_counter()
+            writer = tensorfs.Writer(cache_dir=self.store)
+            self.part_hashes = []
+            for component in dict.fromkeys(part[0] for part in self.parts):
+                parts = [part for part in self.parts if part[0] == component]
+                meta, offset = {}, 0
+                for _, key, role, length, *_ in parts:
+                    meta[f"{key}#{role}"] = {"dtype": "U8", "shape": [length],
+                                              "data_offsets": [offset, offset + length]}
+                    offset += length
+                header = json.dumps(meta, separators=(",", ":")).encode()
+                header += b" " * (-len(header) % 8)
+                target = writer.component(component, cls="", config={})
+                with open(st_dir / f"{component}.safetensors", "xb") as stream:
+                    stream.write(len(header).to_bytes(8, "little") + header)
+                    for _, key, role, length, *_ in parts:
+                        data = bytearray(length)
+                        self.source.components[component].tensors.read_into(key, data, role=role)
+                        target.put(f"{key}#{role}", data, dtype="U8", shape=[length])
+                        stream.write(data)
+                        self.part_hashes.append((component, key, role, hashlib.sha256(data).hexdigest()))
+            committed = writer.commit()
+            self.header = committed.id
+            committed.close()
+            os.sync()
+            marker.write_bytes(canonical({"identity": identity, "header": self.header,
+                                          "part_hashes": self.part_hashes}))
+            log(f"{self.name}: matched fixtures written in {time.perf_counter() - started:.1f}s")
+        with self.checkpoint() as ck:
+            self.chunks = list(ck.chunks)
+            self.keys = {component: list(held.tensors) for component, held in ck.components.items()}
+        self.st = sorted((self.dir / "st").glob("*.safetensors"))
 
-    def window_chunks(self, ck):
-        want = set()
-        for comp, ts in ck.tensors.items():
-            for key, info in ts.items():
-                if self.in_window(comp, key):
-                    for part in info.parts.values():
-                        c, left = part.chunk, part.offset + part.length
-                        while left > 0:
-                            want.add(c)
-                            left -= self.chunks[c][1]
-                            c += 1
-        return sorted(want)
+    def selected(self, window):
+        return {component: [key for key in keys if not window or self.in_window(component, key)]
+                for component, keys in self.keys.items()}
 
-    def files(self, layout):
-        return self.st if layout in SAFETENSORS else [p for p, _ in self.chunks]
+    def drop(self, layout):
+        """F1 cold semantics: request payload eviction, leaving metadata caches alone."""
+        if layout == "T64+rust":
+            with self.checkpoint() as ck:
+                for index in range(len(ck.chunks)):
+                    fd = ck.open_chunk(index)
+                    try:
+                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                    finally:
+                        os.close(fd)
+        else:
+            for path in self.st:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(fd)
 
-    def rust(self, plane, window):
-        """Open the checkpoint, take regions for what the load wants (the window's block, or every
-        tensor) cut at blocks, and register those alone: the open. Want them on the device and
-        wait: the read."""
-        plane.set_vram_budget(0, torch.cuda.mem_get_info()[0] - (1 << 30))
-        t0 = time.perf_counter()
+    def public(self, window):
+        started = time.perf_counter()
         ck = self.checkpoint()
-        only = [f"{self.wcomp}/{self.wprefix.rstrip('.')}"] if window else None
-        ws = plane.register_checkpoint(self.name, ck, tensorfs.regions(ck, 64 << 20, self.blocks, only))
-        opened = time.perf_counter() - t0
-        plane.want(ws, 0, None).wait()
-        return opened, ws
-
-    def spans(self, window):
-        ck = self.checkpoint()
-        chunks = self.window_chunks(ck) if window else range(len(self.chunks))
-        return [(self.chunks[c][0], 0, self.chunks[c][1]) for c in chunks]
+        # Select before read_all allocates a destination or reads a tensor.
+        selected = self.selected(window)
+        opened = time.perf_counter() - started
+        arrays = {component: ck.components[component].tensors.read_all(keys, device="cuda:0", decode=False)
+                  for component, keys in selected.items() if keys}
+        torch.cuda.synchronize()
+        moved = sum(array.nbytes for tensors in arrays.values() for array in tensors.values())
+        return moved, opened, (arrays, ck)
 
     def safetensors(self, layout, window):
-        """fastsafetensors (one loader over every file), or `safe_open` per file onto the GPU
-        (`st-cuda`) or onto the CPU and then `.to("cuda")` (`st-cpu-cuda`)."""
-        keys = [f"{p[1]}#{p[2]}" for p in self.parts if p[6] or not window]
-        t0, opened = time.perf_counter(), 0.0
+        keys = [f"{key}#{role}" for component, key, role, *_ in self.parts
+                if not window or self.in_window(component, key)]
+        started, opened = time.perf_counter(), 0.0
         if layout == "fastsafetensors":
             loader = SafeTensorsFileLoader(None, "cuda:0", nogds=True)
             if window:
                 keep = set(keys)
-                loader.set_tensor_filter(lambda n: n in keep)
-            loader.add_filenames({0: self.st})
-            opened = time.perf_counter() - t0
-            fb = loader.copy_files_to_device()
-            out = [fb.get_tensor(k) for k in keys]
-            fb.close()
-            loader.close()
+                loader.set_tensor_filter(lambda name: name in keep)
+            loader.add_filenames({0: [str(path) for path in self.st]})
+            opened = time.perf_counter() - started
+            files = loader.copy_files_to_device()
+            arrays = [files.get_tensor(key) for key in keys]
+            cleanup = (files, loader)
         else:
-            out = []
+            arrays, cleanup = [], ()
             for path in self.st:
-                comp = os.path.basename(path).removesuffix(".safetensors")
-                names = [f"{p[1]}#{p[2]}" for p in self.parts if p[0] == comp and (p[6] or not window)]
-                t0 = time.perf_counter()
-                with safe_open(path, framework="pt", device="cuda:0" if layout == "st-cuda" else "cpu") as f:
-                    opened += time.perf_counter() - t0
-                    out += [f.get_tensor(k) if layout == "st-cuda" else f.get_tensor(k).to("cuda:0") for k in names]
+                component = path.stem
+                names = [f"{key}#{role}" for comp, key, role, *_ in self.parts
+                         if comp == component and (not window or self.in_window(comp, key))]
+                started = time.perf_counter()
+                with safe_open(path, framework="pt", device="cuda:0" if layout == "st-cuda" else "cpu") as source:
+                    opened += time.perf_counter() - started
+                    arrays.extend(source.get_tensor(key) if layout == "st-cuda"
+                                  else source.get_tensor(key).to("cuda:0") for key in names)
         torch.cuda.synchronize()
-        return sum(t.numel() for t in out), opened
+        return sum(array.numel() for array in arrays), opened, (arrays, cleanup)
 
-    def once(self, readers, layout, window, cold):
-        """(seconds, of them the open's or None, bytes moved)"""
-        ws, opened = None, None
-        t0 = time.perf_counter()
-        if layout in SAFETENSORS:
-            moved, opened = self.safetensors(layout, window)
-        elif layout == "T64+rust":
-            opened, ws = self.rust(readers["plane"], window)
+    def once(self, layout, window, collect=True):
+        copy_rows()
+        started = time.perf_counter()
+        moved, opened, keep = self.public(window) if layout == "T64+rust" else self.safetensors(layout, window)
+        seconds = time.perf_counter() - started
+        rows = copy_rows()
+        expected = self.window_bytes if window else self.bytes
+        if moved != expected:
+            raise ValueError(f"{self.name}/{layout}: moved {moved} bytes, expected {expected}")
+        # Release after the first-open -> transfer-complete interval for every arm.
+        if layout == "T64+rust":
+            arrays, ck = keep
+            arrays.clear()
+            ck.close()
         else:
-            moved = readers[layout].run(self.spans(window), direct=cold)
-        s = time.perf_counter() - t0
-        if ws is not None:
-            moved = sum(r["nbytes"] for r in ws.regions)
-            ws.close()
-            readers["plane"].set_vram_budget(0, 0)  # the plane's idle handles go back to the driver
+            arrays, cleanup = keep
+            arrays.clear()
+            for owner in cleanup:
+                owner.close()
         torch.cuda.empty_cache()
-        return s, opened, moved
+        return {"seconds": seconds, "bytes": moved, "open_seconds": opened,
+                "engine": transfer_metrics(rows) if collect and layout == "T64+rust" else None}
+
+    def provenance(self):
+        return {"source": self.spec, "header": self.header, "geometry_sha256": self.geometry,
+                "bytes": self.bytes, "window_bytes": self.window_bytes, "chunks": len(self.chunks),
+                "window": {"component": self.wcomp, "prefix": self.wprefix},
+                "part_sha256": self.part_hashes, "legacy_manifest": LANES[self.name]["legacy_manifest"]}
 
 
-def drop(paths):
-    for p in paths:
-        fd = os.open(p, os.O_RDONLY)
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        os.close(fd)
-
-
-def bench(model, readers, log, warm_full, layouts=LAYOUTS, scopes=("full", "window")):
-    res = {}
-    for rep in range(model.reps):
-        order = layouts[rep % len(layouts) :] + layouts[: rep % len(layouts)]
-        for layout in order:
-            files = model.files(layout)
-            for scope, window in ((x, x == "window") for x in scopes):
-                for cold in (True, False):
-                    if not cold and scope == "full" and not warm_full:
-                        continue
-                    if cold:
-                        drop(files)
-                    else:
-                        model.once(readers, layout, window, cold=False)  # populate the page cache
-                    s, opened, moved = model.once(readers, layout, window, cold=cold)
-                    cell = f"{layout} {scope} {'cold' if cold else 'warm'}"
-                    res.setdefault(cell, []).append((s, moved, opened))
-                    split = f" (open {1000 * opened:.1f}, read {1000 * (s - opened):.1f})" if opened is not None else ""
-                    log(f"{model.name} {cell}: {1000 * s:.0f} ms{split} {moved / 1e6:.0f} MB")
-            drop(files)
-        log(f"{model.name}: rep {rep + 1}/{model.reps} done")
-    return res
-
-
-def summary(model, res, layouts=LAYOUTS):
-    cells = sorted({k.split(" ", 1)[1] for k in res}, key=lambda c: ("window" in c, "warm" in c))
-    lines = [f"{model.name}: {model.bytes / 1e9:.2f} GB in {len(model.chunks)} chunks, window {model.window_bytes / 1e6:.0f} MB; "
-             "ms median (best), bytes moved, and the medians of open and read"]
-    lines.append("reader | " + " | ".join(cells))
-    med = lambda xs: statistics.median(x[0] for x in xs)
-    split = lambda xs: (statistics.median(x[2] for x in xs), statistics.median(x[0] - x[2] for x in xs)) if xs[0][2] is not None else None
-    for layout in layouts:
-        row = []
-        for cell in cells:
-            xs = sorted(res.get(f"{layout} {cell}", []), key=lambda x: x[0])
-            parts = split(xs) if xs else None
-            row.append((f"{1000 * med(xs):.0f} ({1000 * xs[0][0]:.0f}) {xs[0][1] / 1e6:.0f}MB"
-                        + (f" open {1000 * parts[0]:.1f} read {1000 * parts[1]:.1f}" if parts else "")) if xs else "-")
-        lines.append(f"{layout} | " + " | ".join(row))
+def summary(results):
     gate = {}
-    for cell in cells:
-        rust = med(res[f"T64+rust {cell}"])
-        st = {l: med(res[f"{l} {cell}"]) for l in SAFETENSORS if res.get(f"{l} {cell}")}
-        best = min(st, key=st.get)
-        (ro, rr), (so, sr) = split(res[f"T64+rust {cell}"]), split(res[f"{best} {cell}"])
-        gate[cell] = {"rust_ms": round(1000 * rust), "rust_open_ms": round(1000 * ro, 1), "rust_read_ms": round(1000 * rr, 1),
-                      "safetensors": best, "safetensors_ms": round(1000 * st[best]),
-                      "safetensors_open_ms": round(1000 * so, 1), "safetensors_read_ms": round(1000 * sr, 1),
-                      "margin": round(st[best] / rust - 1, 3), "pass": rust <= st[best]}
-        lines.append(f"gate {cell}: T64+rust {1000 * rust:.0f} ms (open {1000 * ro:.1f}, read {1000 * rr:.1f}) vs best safetensors "
-                     f"({best}) {1000 * st[best]:.0f} ms (open {1000 * so:.1f}, read {1000 * sr:.1f}) "
-                     f"({100 * (st[best] / rust - 1):+.0f}%) -> {'PASS' if rust <= st[best] else 'FAIL'}")
-    return lines, gate
-
-
-def environment(root, work):
-    mem = {l.split(":")[0]: int(l.split()[1]) * 1024 for l in open("/proc/meminfo") if l.startswith(("MemTotal", "MemAvailable"))}
-    limit = None  # the container's memory (page cache included) is what a warm read can keep
-    for p in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
-        if os.path.exists(p) and open(p).read().strip().isdigit():
-            limit = int(open(p).read())
-            break
-    return {"gpu": torch.cuda.get_device_name(0), "torch": str(torch.__version__), "cpus": len(os.sched_getaffinity(0)),
-            "mem_total": mem["MemTotal"], "mem_available": min(mem["MemAvailable"], limit or mem["MemTotal"]),
-            "store": root, "work": work}
-
-
-def main(work, out_path, build_only=False, plane=None, layouts=LAYOUTS, scopes=("full", "window")):
-    root = store_root()
-    os.makedirs(work, exist_ok=True)
-    env = environment(root, work)
-
-    def log(msg):
-        print(msg, flush=True)
-
-    log(json.dumps(env))
-    hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]  # the engine holds every file open
-    resource.setrlimit(resource.RLIMIT_NOFILE, (hard if 0 <= hard < 1 << 20 else 1 << 20, hard))
-    readers = {"T64": Reader(), "T64+fst": Engine(), "plane": varena.Plane(devices=[0], **(plane or {}))}
-    env["plane"] = plane or {}
-    out = {"env": env, "models": {}}
-    for name in LANES:
-        model = Model(name, root, work)
-        model.build(log)
-        if build_only:
-            out["models"][name] = {"bytes": model.bytes, "manifest": model.manifest, "store": model.store, "table": [], "gate": {}}
-            json.dump(out, open(out_path, "w"))
+    for cell in CELLS:
+        own = results.get(f"T64+rust {cell}", [])
+        controls = {layout: results.get(f"{layout} {cell}", []) for layout in SAFETENSORS}
+        complete = len(own) == REPS and all(len(rows) == REPS for rows in controls.values())
+        if not complete:
+            gate[cell] = {"complete": False, "pass": False, "reason": "missing reader/repetition"}
             continue
-        warm_full = env["mem_available"] > 1.3 * model.bytes + 2 * SLOT * THREADS
-        res = bench(model, readers, log, warm_full, layouts, scopes)
-        lines, gate = summary(model, res, layouts)
-        for line in lines:
-            log(line)
-        out["models"][name] = {"bytes": model.bytes, "chunks": len(model.chunks), "window_bytes": model.window_bytes,
-                               "manifest": model.manifest, "store": model.store,
-                               "results": {k: [[round(s, 4), b, o and round(o, 4)] for s, b, o in v] for k, v in res.items()}, "table": lines, "gate": gate}
-        json.dump(out, open(out_path, "w"))
-    return out
+        med = lambda rows: statistics.median(row["seconds"] for row in rows)
+        best = min(controls, key=lambda layout: med(controls[layout]))
+        seconds, baseline = med(own), med(controls[best])
+        gate[cell] = {"complete": True, "pass": seconds <= baseline,
+                      "rust_ms": round(1000 * seconds, 3), "safetensors": best,
+                      "safetensors_ms": round(1000 * baseline, 3), "margin": baseline / seconds - 1,
+                      "rust_open_ms": 1000 * statistics.median(row["open_seconds"] for row in own),
+                      "rust_read_ms": 1000 * statistics.median(row["seconds"] - row["open_seconds"] for row in own)}
+    warm = results.get("T64+rust full warm", [])
+    link_measured = len(warm) == REPS and all(row["engine"]["measured"] for row in warm)
+    ratios = [row["engine"]["pinned_ceiling_ratio"] for row in warm if row["engine"]["measured"]]
+    return {"cells": gate, "link_measured": link_measured,
+            "full_warm_pinned_ceiling_ratio_median": statistics.median(ratios) if ratios else None,
+            "link_threshold": None, "pass": all(cell["pass"] for cell in gate.values()) and link_measured,
+            "note": "Link ratios are observations; no numeric owner threshold is invented."}
+
+
+def environment(cache_dir, work):
+    mem = {line.split(":")[0]: int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines()
+           if line.startswith(("MemTotal", "MemAvailable"))}
+    limit = None
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        if Path(path).exists() and Path(path).read_text().strip().isdigit():
+            limit = int(Path(path).read_text())
+            break
+    identity = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,name,driver_version,pci.bus_id", "--format=csv,noheader"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    volume = subprocess.run(["df", "-T", str(work)], capture_output=True, text=True, check=True).stdout.strip()
+    return {"gpu": torch.cuda.get_device_name(0), "gpu_identity": identity, "volume": volume,
+            "torch": str(torch.__version__), "cuda": torch.version.cuda,
+            "versions": {name: importlib.metadata.version(name) for name in ("tensorfs", "safetensors", "fastsafetensors")},
+            "extension_sha256": digest(tensorfs._ext.__file__), "harness_sha256": digest(__file__),
+            "cpus": len(os.sched_getaffinity(0)), "mem_total": mem["MemTotal"],
+            "mem_available": min(mem["MemAvailable"], limit or mem["MemTotal"]),
+            "cache_dir": str(cache_dir), "work": str(work), "repetitions": REPS,
+            "normalization": "identical stored INT8 parts as plain U8 tensors; no dequantization",
+            "cold": "POSIX_FADV_DONTNEED requested for payload fds; metadata is not evicted",
+            "warm": "one untimed read immediately before each measured read",
+            "engine_options": "public API defaults of the recorded extension; no Plane tuning"}
+
+
+def main(args):
+    plan = json.loads(Path(args.sources).read_bytes())
+    if set(plan["models"]) != set(LANES):
+        raise ValueError("sources must pin exactly sdxl-int8 and qwen-int8")
+    if importlib.metadata.version("fastsafetensors") != "0.5.0" or importlib.metadata.version("safetensors") != "0.8.0":
+        raise ValueError("F1 controls require fastsafetensors0.5.0 and safetensors0.8.0")
+    cache_dir, work = Path(plan["cache_dir"]).expanduser(), Path(args.work)
+    work.mkdir(parents=True, exist_ok=True)
+    out = {"format": "tensorfs.speed-proof/2", "sources": plan, "models": {}, "pass": False}
+    # A failed or partial rerun must never leave an earlier successful result at this path.
+    with open(args.result, "xb") as result:
+        result.write(canonical(out))
+    models = [Model(name, plan["models"][name], cache_dir, work) for name in LANES]
+    for model in models:
+        model.build(lambda message: print(message, flush=True))
+    if args.build_only:
+        out["status"] = "fixtures_only_unmeasured"
+        out["models"] = {model.name: model.provenance() for model in models}
+        Path(args.result).write_bytes(canonical(out))
+        return 0
+    torch.cuda.init()
+    fst_nogds.load_library_func(get_framework_op("pytorch"))
+    env = environment(cache_dir, work)
+    out["env"] = env
+    hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+    resource.setrlimit(resource.RLIMIT_NOFILE, (hard if 0 <= hard < 1 << 20 else 1 << 20, hard))
+    for model in models:
+        if env["mem_available"] <= 1.3 * model.bytes + (512 << 20):
+            raise ValueError(f"{model.name}: insufficient page-cache headroom for required full-warm cell")
+    # Public reads initialize the existing shared engine/probe outside every timed cell.
+    out["initialization"] = {model.name: model.once("T64+rust", True)["engine"] for model in models}
+    for model in models:
+        results = {}
+        for rep in range(REPS):
+            order = args.readers[rep % len(args.readers):] + args.readers[:rep % len(args.readers)]
+            for layout in order:
+                for scope in args.cells:
+                    for cold in (True, False):
+                        window = scope == "window"
+                        if cold:
+                            model.drop(layout)
+                        else:
+                            model.once(layout, window, collect=False)
+                        row = model.once(layout, window)
+                        cell = f"{layout} {scope} {'cold' if cold else 'warm'}"
+                        results.setdefault(cell, []).append(row)
+                        print(f"{model.name} rep{rep + 1} {cell}: {1000 * row['seconds']:.3f}ms {row['bytes']}B", flush=True)
+                model.drop(layout)
+        out["models"][model.name] = {**model.provenance(), "results": results, "gate": summary(results)}
+        Path(args.result).write_bytes(canonical(out))
+    out["pass"] = all(row["gate"]["pass"] for row in out["models"].values())
+    Path(args.result).write_bytes(canonical(out))
+    print(json.dumps({name: row["gate"] for name, row in out["models"].items()}, indent=2), flush=True)
+    return 0 if out["pass"] else 1
 
 
 if __name__ == "__main__":
-    opts = sys.argv[3:]
-    plane = next((dict((k, int(v)) for k, v in (kv.split("=") for kv in o.removeprefix("--plane=").split(","))) for o in opts if o.startswith("--plane=")), None)
-    arg = lambda name, default: next((tuple(o.split("=", 1)[1].split(",")) for o in opts if o.startswith(f"--{name}=")), default)
-    main(sys.argv[1], sys.argv[2], build_only="--build-only" in opts, plane=plane,
-         layouts=arg("readers", LAYOUTS), scopes=arg("cells", ("full", "window")))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("work")
+    parser.add_argument("result")
+    parser.add_argument("--sources", required=True, help="JSON cache_dir + models with immutable, already-local checkpoint refs")
+    parser.add_argument("--build-only", action="store_true")
+    parser.add_argument("--readers", type=lambda value: tuple(value.split(",")), default=LAYOUTS)
+    parser.add_argument("--cells", type=lambda value: tuple(value.split(",")), default=SCOPES)
+    args = parser.parse_args()
+    if not args.readers or len(set(args.readers)) != len(args.readers) or set(args.readers) - set(LAYOUTS):
+        parser.error(f"readers must be distinct members of {LAYOUTS}")
+    if not args.cells or len(set(args.cells)) != len(args.cells) or set(args.cells) - set(SCOPES):
+        parser.error(f"cells must be distinct members of {SCOPES}")
+    sys.exit(main(args))
