@@ -6,7 +6,7 @@
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::sync::OnceLock;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     #[error("CUDA unavailable: {0}")]
     CudaUnavailable(String),
@@ -174,6 +174,7 @@ pub struct Driver {
     pub mem_host_alloc: unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> CUresult,
     pub mem_free_host: F<*mut c_void>,
     pub mem_alloc: unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult,
+    pub pointer_get_attribute: unsafe extern "C" fn(*mut c_void, c_int, CUdeviceptr) -> CUresult,
     pub mem_free: F<CUdeviceptr>,
     pub mem_get_allocation_granularity:
         unsafe extern "C" fn(*mut usize, *const AllocationProp, u32) -> CUresult,
@@ -276,6 +277,7 @@ impl Driver {
             mem_host_alloc: load!(lib, b"cuMemHostAlloc"),
             mem_free_host: load!(lib, b"cuMemFreeHost"),
             mem_alloc: load!(lib, b"cuMemAlloc_v2"),
+            pointer_get_attribute: load!(lib, b"cuPointerGetAttribute"),
             mem_free: load!(lib, b"cuMemFree_v2"),
             mem_get_allocation_granularity: load!(lib, b"cuMemGetAllocationGranularity"),
             mem_address_reserve: load!(lib, b"cuMemAddressReserve"),
@@ -438,6 +440,9 @@ impl Stream {
     pub fn device(&self) -> i32 {
         self.device
     }
+    pub(crate) fn context(&self) -> CUcontext {
+        self.ctx
+    }
 }
 
 impl Drop for Stream {
@@ -450,6 +455,65 @@ impl Drop for Stream {
                 }
             }
             unsafe { (driver.primary_ctx_release)(self.device) };
+        }
+    }
+}
+
+/// A registered host range. Its memory and context must outlive this guard; copies must be
+/// complete before it drops. An existing registration is borrowed and never unregistered.
+pub struct HostPin {
+    ptr: *mut c_void,
+    ctx: CUcontext,
+    owned: bool,
+}
+unsafe impl Send for HostPin {}
+unsafe impl Sync for HostPin {}
+
+/// # Safety
+/// `ptr..ptr+len` remains mapped until the returned guard drops; the caller retains the
+/// current context for the same lifetime and finishes every copy before dropping the guard.
+pub unsafe fn pin_region(ptr: *mut u8, len: usize, read_only: bool) -> Result<HostPin> {
+    let d = driver()?;
+    let mut ctx = std::ptr::null_mut();
+    check("cuCtxGetCurrent", unsafe { (d.ctx_get_current)(&mut ctx) })?;
+    let flags = MEMHOSTREGISTER_PORTABLE
+        | if read_only {
+            MEMHOSTREGISTER_READ_ONLY
+        } else {
+            0
+        };
+    let rc = unsafe { (d.mem_host_register)(ptr.cast(), len, flags) };
+    if rc != ERROR_HOST_MEMORY_ALREADY_REGISTERED {
+        check("cuMemHostRegister", rc)?;
+    }
+    Ok(HostPin {
+        ptr: ptr.cast(),
+        ctx,
+        owned: rc == SUCCESS,
+    })
+}
+
+/// Whether the current context can copy directly from this page-locked host address.
+/// # Safety
+/// `ptr` is live host memory; its owner holds the registration during the copy.
+pub unsafe fn registered(ptr: *const u8) -> Result<bool> {
+    let mut kind: c_int = 0;
+    let rc = unsafe {
+        (driver()?.pointer_get_attribute)((&mut kind as *mut c_int).cast(), 2, ptr as u64)
+    };
+    match rc {
+        SUCCESS => Ok(kind == 1),
+        ERROR_INVALID_VALUE | ERROR_NOT_SUPPORTED => Ok(false),
+        _ => check("cuPointerGetAttribute", rc).map(|_| false),
+    }
+}
+
+impl Drop for HostPin {
+    fn drop(&mut self) {
+        if self.owned {
+            if let (Ok(d), Ok(_ctx)) = (driver(), CtxGuard::enter(self.ctx)) {
+                unsafe { (d.mem_host_unregister)(self.ptr) };
+            }
         }
     }
 }
