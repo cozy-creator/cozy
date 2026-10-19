@@ -452,6 +452,10 @@ class Memory:
         self.core: Gpu | Host = Gpu(self.gpu) if cuda else Host()
         #: this process's device bytes outside torch and the weights (its CUDA context)
         self.context = self.last_use = self.clock = self.epoch = self.evictions = 0
+        #: this process's device bytes as the driver counts them (the Runtime's NVML row), or
+        #: None: what is neither torch's nor varena's (context, NCCL, libraries) is measured
+        #: from it at each boundary instead of once
+        self.measure: Callable[[], int | None] | None = None
         self.models: dict[str, Model] = {}
         self.by_module: dict[nn.Module, Model] = {}
         self.caches: dict[Cache, None] = {}
@@ -731,6 +735,7 @@ class Memory:
         if block.index in model.seen:
             self._step(model)
         if not model.seen:  # a pass counts its own copies, not a restore landing before it
+            self._outside()
             model.mark = _set(model)[1:]
             model.base = torch.cuda.memory_allocated(model.device)
             torch.cuda.reset_peak_memory_stats(model.device)
@@ -905,6 +910,15 @@ class Memory:
         """The driver's free bytes, never beyond what a `gpu_memory_limit` leaves (§5.6)."""
         free, room = int(torch.cuda.mem_get_info(self.gpu)[0]), self._room()
         return free if room is None else min(free, room - torch.cuda.memory_reserved(self.gpu))
+
+    def _outside(self) -> None:
+        """This process's device bytes neither torch nor varena holds (its CUDA context, NCCL's
+        buffers, libraries' workspaces), measured now from the driver's count of the process."""
+        total = self.measure() if self.measure is not None and self.cuda else None
+        if total is not None:
+            core = self.core.stats()  # type: ignore[union-attr]
+            held = torch.cuda.memory_reserved(self.gpu) + core.mapped + core.idle
+            self.context = max(total - held, 0)
 
     def _room(self) -> int | None:
         """Under a limit, what this process's torch may reserve; None without one."""
@@ -1180,6 +1194,7 @@ class Memory:
         (`cuts.caught`). A capacity failure never poisons; what package state still holds shows
         as `leftover`. `plan`: its declared steps (`Memory.plan`), else one declared at dispatch."""
         start = torch.cuda.memory_allocated(self.gpu) if self.cuda else 0
+        self._outside()
         key = self.row[0].dispatched(id) if self.row is not None else None
         request = Request(id, start, self._copies(), key, self.memo.retries, memory=self)
         with self.lock:
@@ -1355,6 +1370,20 @@ class Memory:
         )
         reserved = torch.cuda.memory_reserved(self.gpu) if self.cuda else 0
         held += f"; torch {reserved / 2**30:.2f} GiB"
+        if self.cuda:  # every byte of the device this process sees, named
+            self._outside()
+            core = self.core.stats()  # type: ignore[union-attr]
+            others = (
+                sum(f.held for f in self.row[0].snapshot() if f.slot != self.row[1].id)
+                if self.row is not None
+                else 0
+            )
+            limit = self.limit if self.limit is not None else self.total
+            held += (
+                f"; of {limit / 2**30:.2f} GiB: outside {self.context / 2**30:.2f}, other "
+                f"processes {others / 2**30:.2f}, varena mapped {core.mapped / 2**30:.2f} "
+                f"(idle {core.idle / 2**30:.2f})"
+            )
         return Exhausted(self.gpu, need, op, resident, peaks, held)
 
 
