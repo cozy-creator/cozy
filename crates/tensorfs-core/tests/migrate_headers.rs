@@ -230,25 +230,27 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
 #[test]
 fn partial_tokenizer_keeps_existing_files_and_fills_missing_files() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/store-0.12");
-    let dir = tempfile::tempdir().unwrap();
-    copy(&fixture, dir.path());
+    let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("migrate-partial-{}-{unique}", std::process::id()));
+    copy(&fixture, &dir);
     let mut manifest: Json = serde_json::from_slice(&blob(&fixture, FULL)).unwrap();
     let missing = "tokenizer/vocab.json";
     let expected: ObjectRef = serde_json::from_value(manifest["files"].as_object_mut().unwrap().remove(missing).unwrap()).unwrap();
     assert!(manifest["files"].get("tokenizer/tokenizer_config.json").is_some());
     let bytes = serde_json::to_vec(&manifest).unwrap();
     let object = ObjectRef::of(&bytes);
-    let path = dir.path().join(object.key());
+    let path = dir.join(object.key());
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, bytes).unwrap();
     let doc = serde_json::to_vec(&serde_json::json!({
         "name": "acme/tiny", "releases": [{"version": "1", "lanes": {"full": object}}]
     })).unwrap();
     let mut migrator = Migrator::new(access(), TABLE);
-    let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.path().join(o.key()))?)).unwrap();
+    let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
     let read = |o: &ObjectRef| migrated.objects.iter().find(|(at, _)| at == o).unwrap().1.clone();
     let tree = Tree::from_json(&read(&migrated.repo.releases[0].tree)).unwrap();
     let header = Header::from_cbor(&read(tree.variant(Some("full")).unwrap().1)).unwrap();
     assert_eq!(header.component("tokenizer").unwrap().assets["vocab.json"], expected);
     assert_eq!(filled(&header).unwrap().1, BTreeSet::from([missing.to_owned()]));
+    std::fs::remove_dir_all(dir).unwrap();
 }
