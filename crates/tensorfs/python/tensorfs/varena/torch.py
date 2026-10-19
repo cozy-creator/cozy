@@ -816,7 +816,7 @@ class Memory:
         `target` bytes are free."""
         freed = self._idle()
         if self.plans:
-            cold = [m for m in self.models.values() if not (m.flight or m.held or m.host)]
+            cold = [m for m in self.models.values() if self._victim(m)]
             for model in sorted(cold, key=self._keep):
                 if self._free() >= target:
                     break
@@ -847,9 +847,7 @@ class Memory:
         each cold model's wait for theirs to land (a bind waits on its fill, then lets go), then
         go, the furthest declared use first."""
         freed, stream = 0, torch.cuda.current_stream(self.device)
-        for model in sorted(
-            (m for m in self.landing if not (m.flight or m.held or m.host)), key=self._keep
-        ):
+        for model in sorted((m for m in self.landing if self._victim(m)), key=self._keep):
             if self._free() >= target:
                 break
             for region in sorted(self.landing.pop(model)):
@@ -942,6 +940,20 @@ class Memory:
         if self.plans:
             return (use, -self._distance(model), model.last_use)
         return (use, 1 if model.level is Level.GPU else 0, model.last_use)
+
+    def _victim(self, model: Model) -> bool:
+        """Its pages may go for room: nothing runs or holds it, and no declared step running now
+        uses it (a LoRA its DiT reads by its tensors is never in flight)."""
+        if model.flight or model.held or model.host:
+            return False
+        return not self.plans or self._distance(model) > 0
+
+    def _now(self) -> None:
+        """Models a running step uses are busy to the core: `give` and other processes' asks
+        pass them by."""
+        for m in self.models.values():
+            if not (m.host or m.closed):
+                m.ws.busy(bool(m.flight) or (bool(self.plans) and self._distance(m) == 0))
 
     def _distance(self, model: Model) -> float:
         """Steps until a declared plan next runs it; inf with none. A plan not yet started counts
@@ -1184,6 +1196,7 @@ class Memory:
         leftover: tuple[tuple[int, int], ...] = ()
         if self.cuda:
             torch.cuda.synchronize(self.gpu)
+            torch._C._cuda_clearCublasWorkspaces()  # cuBLAS keeps one per stream: not the request's
             torch.cuda.empty_cache()
             tail = torch.cuda.max_memory_allocated(self.gpu) - request.start
             request.peak = max(request.peak, tail)
@@ -1258,7 +1271,10 @@ class Memory:
         use, common then its blocks in recorded order, into free room beyond what models in use
         still page in and the planned reserves, then pages with a later declared use or none.
         The copies run on the core's copy stream; an ask evicts them at once."""
-        if not self.cuda or not self.plans:
+        if not self.cuda:
+            return
+        self._now()
+        if not self.plans:
             return
         models = [m for m in self.models.values() if not (m.host or m.closed)]
         near = {m: self._distance(m) for m in models}
