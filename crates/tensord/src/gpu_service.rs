@@ -4210,7 +4210,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         registered.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
         // No cache entry: the sibling already took it. Live and PID-reused identities cannot retire it.
         assert!(pool.sessions.lock().unwrap().is_empty());
-        pool.retire_returned(&model.construction, 0, 1, &[live.birth.clone()]);
+        pool.retire_returned(&model.construction, 0, 1, std::slice::from_ref(&live.birth));
         let mut stale = live.birth.clone();
         stale.start_ticks = stale.start_ticks.wrapping_add(1);
         assert!(!owns_birth(&live.birth, &[], &stale), "a reused PID is not this owner");
@@ -4218,7 +4218,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         assert_eq!(pool.tenants.lock().unwrap().len(), 2);
         old.control.write_all(&[1]).unwrap();
         assert!(old.child.wait().unwrap().success());
-        pool.retire_returned(&model.construction, 0, 1, &[old.birth.clone()]);
+        pool.retire_returned(&model.construction, 0, 1, std::slice::from_ref(&old.birth));
         assert!(!pool.tenants.lock().unwrap().contains_key(&old.birth.pid));
         assert!(pool.tenants.lock().unwrap().get(&live.birth.pid).is_some_and(|t| t.exact.birth() == &live.birth));
         assert_eq!(pool.hosting(&model.construction), [0]);
