@@ -1,5 +1,5 @@
 //! Free-form values for metadata and scheme params (no null, integers only), and config values
-//! (which add floats and null). Codec-agnostic.
+//! (parsed JSON). Codec-agnostic.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -139,99 +139,8 @@ impl<'de> Visitor<'de> for ValueVisitor {
     }
 }
 
-/// A config's value: a [`Value`], or a float or null. Floats and null appear only in configs.
-/// Floats are equal when their encodings are (`-0.0 != 0.0`, every NaN equal).
-#[derive(Debug, Clone)]
-pub enum ConfigValue {
-    Null,
-    Bool(bool),
-    Int(i128),
-    Float(f64),
-    Str(String),
-    List(Vec<ConfigValue>),
-    Map(BTreeMap<String, ConfigValue>),
-}
+/// A config's value: parsed JSON, so also floats (finite) and null, which only configs hold.
+pub type ConfigValue = serde_json::Value;
 
 /// A structured config: `config.json` as parsed JSON, never a file.
-pub type Config = BTreeMap<String, ConfigValue>;
-
-impl PartialEq for ConfigValue {
-    fn eq(&self, other: &ConfigValue) -> bool {
-        use ConfigValue::*;
-        match (self, other) {
-            (Null, Null) => true,
-            (Bool(a), Bool(b)) => a == b,
-            (Int(a), Int(b)) => a == b,
-            (Float(a), Float(b)) => a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
-            (Str(a), Str(b)) => a == b,
-            (List(a), List(b)) => a == b,
-            (Map(a), Map(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-
-impl Serialize for ConfigValue {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self {
-            ConfigValue::Null => s.serialize_unit(),
-            ConfigValue::Bool(b) => s.serialize_bool(*b),
-            ConfigValue::Int(i) => Value::Int(*i).serialize(s),
-            ConfigValue::Float(f) => s.serialize_f64(*f),
-            ConfigValue::Str(v) => s.serialize_str(v),
-            ConfigValue::List(v) => s.collect_seq(v),
-            ConfigValue::Map(v) => s.collect_map(v),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for ConfigValue {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<ConfigValue, D::Error> {
-        d.deserialize_any(ConfigVisitor)
-    }
-}
-
-struct ConfigVisitor;
-
-impl<'de> Visitor<'de> for ConfigVisitor {
-    type Value = ConfigValue;
-
-    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("a config value")
-    }
-    fn visit_unit<E>(self) -> Result<ConfigValue, E> {
-        Ok(ConfigValue::Null)
-    }
-    fn visit_none<E>(self) -> Result<ConfigValue, E> {
-        Ok(ConfigValue::Null)
-    }
-    fn visit_bool<E>(self, v: bool) -> Result<ConfigValue, E> {
-        Ok(ConfigValue::Bool(v))
-    }
-    fn visit_i64<E>(self, v: i64) -> Result<ConfigValue, E> {
-        Ok(ConfigValue::Int(v.into()))
-    }
-    fn visit_u64<E>(self, v: u64) -> Result<ConfigValue, E> {
-        Ok(ConfigValue::Int(v.into()))
-    }
-    fn visit_f64<E>(self, v: f64) -> Result<ConfigValue, E> {
-        Ok(ConfigValue::Float(v))
-    }
-    fn visit_str<E>(self, v: &str) -> Result<ConfigValue, E> {
-        Ok(ConfigValue::Str(v.into()))
-    }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<ConfigValue, A::Error> {
-        let mut out = Vec::new();
-        while let Some(v) = seq.next_element()? {
-            out.push(v);
-        }
-        Ok(ConfigValue::List(out))
-    }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ConfigValue, A::Error> {
-        let mut out = BTreeMap::new();
-        while let Some((k, v)) = map.next_entry()? {
-            out.insert(k, v);
-        }
-        Ok(ConfigValue::Map(out))
-    }
-}
+pub type Config = serde_json::Map<String, ConfigValue>;
