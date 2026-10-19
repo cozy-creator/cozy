@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tensorfs_core::err::Code;
-use tensorfs_core::format::{decode, Body, Dtype, Encoding, PartBytes};
+use tensorfs_core::format::{decode, Body, Dtype, Encoding, PartBytes, SCHEMES};
 use tensorfs_core::import::{Access, Request};
 use tensorfs_core::store2::{Checkpoint, Store};
 
@@ -60,6 +60,8 @@ fn read_safetensors(path: &Path) -> Tensors {
 
 /// Safetensors `__metadata__`.
 type Metadata = serde_json::Map<String, serde_json::Value>;
+/// An edit of a fixture's tensors, metadata and folder.
+type Edit<'a> = dyn Fn(&mut Tensors, &mut Metadata, &Path) + 'a;
 
 fn read_metadata(path: &Path) -> Metadata {
     let raw = fs::read(path).unwrap();
@@ -706,6 +708,19 @@ fn every_carrier_names_a_complete_encoding() {
     use tensorfs_core::import::carriers::{carriers, Producer};
     for c in carriers() {
         let awq = |e: Encoding| e.with_pre_quant_scale(&Dtype::F32);
+        if c.from_config {
+            // The producer's config names the width: every width it may name is a scheme here.
+            let widths: &[u32] = match c.producer {
+                Producer::Gptq => &[2, 3, 4, 8],
+                Producer::Awq => &[4],
+                _ => &[1, 2, 3, 4, 5, 6, 7, 8],
+            };
+            for bits in widths {
+                let scheme = c.encoding.scheme.replace("{bits}", &bits.to_string());
+                assert!(SCHEMES.iter().any(|s| s.name == scheme), "{scheme}");
+            }
+            continue;
+        }
         let want = match (c.encoding.scheme.as_str(), c.producer) {
             ("nvfp4", Producer::Modelopt) => awq(Encoding::nvfp4(Multiply, LowFirst, RowMajor)),
             ("nvfp4", Producer::CompressedTensors) => Encoding::nvfp4(Divide, LowFirst, RowMajor),
@@ -836,9 +851,13 @@ fn a_bnb_nf4_single_file_is_refused() {
 
 /// GPTQ and AWQ declare themselves in `quantize_config.json`, `quant_config.json` or `gptq_*`
 /// header metadata, not in `config.json`; each is refused with its producer named.
+/// GPTQ and AWQ declare themselves in `config.json`, `quantize_config.json`, AutoAWQ's
+/// `quant_config.json` or GPTQ's `gptq_*` header metadata; each is read for the scheme's params, and
+/// what no scheme here reads is refused by name.
 #[test]
-fn gptq_and_awq_repos_are_refused_by_their_declaration() {
+fn gptq_and_awq_declarations_are_read_or_refused_by_name() {
     let module = "model.layers.0.self_attn.q_proj";
+    // K = 64 inputs, N = 64 outputs, 4-bit, one group of 128.
     let gptq = |t: &mut Tensors| {
         t.extend([
             named(&format!("{module}.qweight"), zeros("I32", &[8, 64])),
@@ -848,53 +867,245 @@ fn gptq_and_awq_repos_are_refused_by_their_declaration() {
             named(&format!("{module}.bias"), zeros("F16", &[64])),
         ])
     };
+    let awq = |t: &mut Tensors| {
+        t.extend([
+            named(&format!("{module}.qweight"), zeros("I32", &[64, 8])),
+            named(&format!("{module}.qzeros"), zeros("I32", &[1, 8])),
+            named(&format!("{module}.scales"), zeros("F16", &[1, 64])),
+        ])
+    };
     let config =
         serde_json::json!({"architectures": ["LlamaForCausalLM"], "torch_dtype": "float16"});
-    let e = refused("gptq", &|t, _, dir| {
+    let write = |dir: &Path, name: &str, doc: serde_json::Value| {
+        fs::write(dir.join(name), doc.to_string()).unwrap()
+    };
+    let encoding = |ck: &Checkpoint| {
+        let t = ck.tensor("model", &format!("{module}.weight")).unwrap();
+        assert_eq!((&t.dtype, &t.shape[..]), (&Dtype::F16, &[64, 64][..]));
+        match &t.body {
+            Body::Encoded { encoding, .. } => encoding.to_string(),
+            _ => panic!("plain"),
+        }
+    };
+    let gptq_config = serde_json::json!({"bits": 4, "group_size": 128, "desc_act": false, "sym": true,
+        "quant_method": "gptq", "checkpoint_format": "gptq"});
+    let (_d, ck) = edited("gptq", &|t, _, dir| {
         gptq(t);
-        fs::write(dir.join("config.json"), config.to_string()).unwrap();
-        let q = serde_json::json!({"bits": 4, "group_size": 128, "desc_act": false, "sym": true,
-            "quant_method": "gptq", "checkpoint_format": "gptq"});
-        fs::write(dir.join("quantize_config.json"), q.to_string()).unwrap();
+        write(dir, "config.json", config.clone());
+        write(dir, "quantize_config.json", gptq_config.clone());
     });
-    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
-    assert!(
-        e.detail.contains("quantize_config.json") && e.detail.contains("GPTQ"),
-        "{}",
-        e.detail
-    );
-
-    let e = refused("awq", &|t, _, dir| {
-        gptq(t);
-        let q = serde_json::json!({"zero_point": true, "q_group_size": 128, "w_bit": 4, "version": "GEMM"});
-        fs::write(dir.join("quant_config.json"), q.to_string()).unwrap();
-    });
-    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
-    assert!(
-        e.detail.contains("quant_config.json") && e.detail.contains("AWQ"),
-        "{}",
-        e.detail
-    );
-
-    let e = refused("gptq-metadata", &|t, m, _| {
+    let v1 = "gptq.int4 {act_order: false, group_size: 128, symmetric: true, zero_offset: 1}";
+    assert_eq!(encoding(&ck), v1);
+    // AutoGPTQ's header metadata and GPTQModel's gptq_v2, in agreement with config.json.
+    let (_d, ck) = edited("gptq-v2", &|t, m, dir| {
         gptq(t);
         m.insert("gptq_bits".into(), "4".into());
+        m.insert("gptq_desc_act".into(), "False".into());
+        let mut q = config.clone();
+        q["quantization_config"] = serde_json::json!({"bits": 4, "group_size": 128, "desc_act": false,
+            "sym": false, "quant_method": "gptq", "format": "gptq_v2", "checkpoint_format": "gptq_v2"});
+        write(dir, "config.json", q);
     });
-    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
-    assert!(
-        e.detail.contains("gptq_bits") && e.detail.contains("GPTQ"),
-        "{}",
-        e.detail
-    );
+    let v2 = "gptq.int4 {act_order: false, group_size: 128, symmetric: false, zero_offset: 0}";
+    assert_eq!(encoding(&ck), v2);
+    let (_d, ck) = edited("awq", &|t, _, dir| {
+        awq(t);
+        write(dir, "config.json", config.clone());
+        let q = serde_json::json!({"zero_point": true, "q_group_size": 128, "w_bit": 4, "version": "GEMM"});
+        write(dir, "quant_config.json", q);
+    });
+    assert_eq!(encoding(&ck), "awq.int4 {group_size: 128}");
 
-    // With no declaration at all, the parts name the producer.
-    let e = refused("gptq-bare", &|t, _, _| gptq(t));
-    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
-    assert!(
-        e.detail.contains("GPTQ/AWQ") && e.detail.contains(".qweight"),
-        "{}",
-        e.detail
-    );
+    let refusals: [(&str, &Edit<'_>, &str); 6] = [
+        // AutoGPTQ's header metadata states no sym.
+        (
+            "gptq-metadata-only",
+            &|t, m, _| {
+                gptq(t);
+                for (k, v) in [
+                    ("gptq_bits", "4"),
+                    ("gptq_group_size", "128"),
+                    ("gptq_desc_act", "False"),
+                ] {
+                    m.insert(k.into(), v.into());
+                }
+            },
+            "sym is not stated",
+        ),
+        (
+            "gptq-marlin",
+            &|t, _, dir| {
+                gptq(t);
+                write(dir, "config.json", config.clone());
+                let mut q = gptq_config.clone();
+                q["checkpoint_format"] = "marlin".into();
+                write(dir, "quantize_config.json", q);
+            },
+            "GPTQ format \"marlin\" is not read",
+        ),
+        (
+            "gptq-disagree",
+            &|t, m, dir| {
+                gptq(t);
+                write(dir, "config.json", config.clone());
+                write(dir, "quantize_config.json", gptq_config.clone());
+                m.insert("gptq_bits".into(), "8".into());
+            },
+            "states bits",
+        ),
+        (
+            "gptq-dynamic",
+            &|t, _, dir| {
+                gptq(t);
+                write(dir, "config.json", config.clone());
+                let mut q = gptq_config.clone();
+                q["dynamic"] = serde_json::json!({"-:.*down_proj": {}});
+                write(dir, "quantize_config.json", q);
+            },
+            "dynamic",
+        ),
+        (
+            "awq-gemv",
+            &|t, _, dir| {
+                awq(t);
+                let q = serde_json::json!({"zero_point": true, "q_group_size": 128, "w_bit": 4, "version": "GEMV"});
+                write(dir, "quant_config.json", q);
+            },
+            "AWQ version Some(\"GEMV\") is not read",
+        ),
+        ("gptq-bare", &|t, _, _| gptq(t), "no declaration of their producer"),
+    ];
+    for (name, edit, why) in refusals {
+        let e = refused(name, edit);
+        assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{name}: {}", e.detail);
+        assert!(e.detail.contains(why), "{name}: {}", e.detail);
+    }
+}
+
+/// Bands of real GPTQ, AWQ and compressed-tensors int4, W8A8 and FP8_DYNAMIC checkpoints
+/// (`make_int.py`) import under their declared encodings and decode to their bf16 originals at
+/// their format's error (AWQ's in its folded space: the bf16 columns times its input scale,
+/// `norm_bf16 / norm_awq`).
+#[test]
+fn real_int_checkpoints_import_and_decode() {
+    let cases: [(&str, &str, &str, f64); 6] = [
+        (
+            "real-gptq-int4",
+            "F16",
+            "gptq.int4 {act_order: false, group_size: 128, symmetric: true, zero_offset: 1}",
+            0.19,
+        ),
+        ("real-awq-int4", "F16", "awq.int4 {group_size: 128}", 0.17),
+        (
+            "real-ct-int4-asym",
+            "BF16",
+            r#"ct.int4 {group_size: 64, packing: "dense", strategy: "group", symmetric: false}"#,
+            0.13,
+        ),
+        (
+            "real-ct-int4-act-order",
+            "BF16",
+            r#"ct.int4 {group_size: 64, packing: "dense", strategy: "group", symmetric: true}"#,
+            0.12,
+        ),
+        (
+            "real-ct-int8-channel",
+            "BF16",
+            r#"int8.rowwise {axis: 0, scale_dtype: "BF16"}"#,
+            0.02,
+        ),
+        (
+            "real-ct-fp8-channel",
+            "BF16",
+            r#"fp8.rowwise {axis: 0, scale_dtype: "BF16"}"#,
+            0.03,
+        ),
+    ];
+    for (case, dtype, want, bound) in cases {
+        let dir = Scratch::new(case);
+        let store = Store::open(dir.0.join("store")).unwrap();
+        let ck = import(&store, &fixtures().join(case)).unwrap();
+        let source: BTreeMap<String, Vec<u8>> =
+            read_safetensors(&fixtures().join(format!("{case}.expect.safetensors")))
+                .into_iter()
+                .map(|(k, _, _, b)| (k, b))
+                .collect();
+        let model: BTreeMap<String, Vec<u8>> =
+            read_safetensors(&fixtures().join(case).join("model.safetensors"))
+                .into_iter()
+                .map(|(k, _, _, b)| (k, b))
+                .collect();
+        let weights: Vec<&String> = source
+            .keys()
+            .filter(|k| k.ends_with("proj.weight"))
+            .collect();
+        assert_eq!(weights.len(), 3, "{case}");
+        for key in weights {
+            let key = key.strip_prefix("source.").unwrap();
+            let t = ck.tensor("model", key).unwrap();
+            let Body::Encoded { encoding, .. } = &t.body else {
+                panic!("{case} {key} is plain")
+            };
+            assert_eq!(
+                (t.dtype.name(), encoding.to_string().as_str()),
+                (dtype, want),
+                "{case} {key}"
+            );
+            let decoded: Vec<f64> = match &t.dtype {
+                Dtype::F16 => (ck.read("model", key).unwrap().as_chunks::<2>().0.iter())
+                    .map(|b| half(u16::from_le_bytes(*b)))
+                    .collect(),
+                _ => bf16s(&ck.read("model", key).unwrap())
+                    .into_iter()
+                    .map(value)
+                    .collect(),
+            };
+            // AWQ divided the norm before the module by its input scale.
+            let layer = key.split('.').take(3).collect::<Vec<_>>().join(".");
+            let norm = ["input_layernorm", "post_attention_layernorm"]
+                .iter()
+                .map(|n| format!("{layer}.{n}.weight"))
+                .find(|n| source.contains_key(&format!("source.{n}")));
+            let fold: Vec<f64> = match norm {
+                Some(n) => {
+                    let awq: Vec<f64> = (model[&n].as_chunks::<2>().0.iter())
+                        .map(|b| half(u16::from_le_bytes(*b)))
+                        .collect();
+                    let bf: Vec<f64> = bf16s(&source[&format!("source.{n}")])
+                        .into_iter()
+                        .map(value)
+                        .collect();
+                    bf.iter().zip(&awq).map(|(b, a)| b / a).collect()
+                }
+                None => vec![1.0],
+            };
+            let reference: Vec<f64> = bf16s(&source[&format!("source.{key}")])
+                .into_iter()
+                .map(value)
+                .collect();
+            let (mut err, mut sum) = (0.0, 0.0);
+            for (n, (d, r)) in decoded.iter().zip(&reference).enumerate() {
+                let r = r * fold[n % t.shape[1] as usize % fold.len()];
+                err += (d - r).powi(2);
+                sum += r * r;
+            }
+            let distance = (err / sum).sqrt();
+            assert!(distance < bound, "{case} {key}: {distance}");
+        }
+    }
+}
+
+fn half(h: u16) -> f64 {
+    let (e, m) = (((h >> 10) & 31) as i32, (h & 0x3ff) as f64);
+    let v = match e {
+        0 => m * 2f64.powi(-24),
+        _ => (1024.0 + m) * 2f64.powi(e - 25),
+    };
+    if h & 0x8000 != 0 {
+        -v
+    } else {
+        v
+    }
 }
 
 /// Every key of a ComfyUI marker is read, decoded at the value it states, or one that only changes

@@ -64,3 +64,9 @@ reproduces its parts bit for bit (`tests/format_encode.rs`).
 The `gguf` cases are ggml's own C (`quantize_row_<type>_ref`, `dequantize_row_<type>` from llama.cpp ff5a233's
 `ggml-quants.c`, gcc for baseline x86-64 with `-ffp-contract=off`); gguf-py's numpy dequantizers (same commit) agree
 on every F32 case.
+
+`gptq`, `awq` and `ct` are mined by `mine/<family>.py` on CPU from GPTQModel 7.6.0, AutoGPTQ 0.7.1 and AutoAWQ 0.2.9
+(their own files from the PyPI sdists), and compressed-tensors 0.16.0 and 0.19.0 (both sides of its packing change),
+each producer's own dequantizer giving the expected bytes, plus 8-row bands of real Qwen GPTQ and AWQ and RedHatAI
+w4a16 checkpoints read by HTTP range. A case with `pack` holds the codes and zeros its producer packed: TensorFS's
+`pack` reproduces its parts bit for bit (`tests/format_pack.rs`).
