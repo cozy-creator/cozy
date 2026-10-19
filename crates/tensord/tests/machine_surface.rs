@@ -2619,7 +2619,7 @@ mod v1_api {
         assert!(source.starts_with("sha256:") && quantized.starts_with("sha256:"), "{result}");
         assert_ne!(source, quantized, "quantize wrote a model of its own");
         // A writer's checkpoint handed to a memoized consumer: each job writes it again as a new
-        // producer, and the consumer, keyed on the checkpoint's manifest, is answered from memo.
+        // producer, and the consumer, keyed on the checkpoint and transaction, is answered from memo.
         let weighed = machine.root.join("weighed");
         let mut derived = vec![];
         for id in ["weigh-1", "weigh-2"] {
@@ -2638,6 +2638,7 @@ mod v1_api {
         }
         assert_ne!(derived[0].0["producer"], derived[1].0["producer"], "{derived:?}");
         assert_eq!(derived[0].0["length"], derived[1].0["length"], "{derived:?}");
+        assert_eq!(derived[0].0["length"], 1056, "the consumer read the actual f16 weights");
         assert_eq!(derived[1].1, [("produce".to_string(), false), ("weigh".to_string(), true)], "{derived:?}");
         assert_eq!(fs::read_to_string(&weighed).unwrap(), "1", "the consumer ran once");
         // A memoized call whose result is a file is answered from this machine's own memo while
