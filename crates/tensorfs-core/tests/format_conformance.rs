@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde_json::Value as Json;
 use tensorfs_core::format::layout::{self, Item};
 use tensorfs_core::format::{
-    repo_key, Body, Component, Dtype, Encoding, Error, Header, Location, ObjectRef, Part, Release,
-    Repo, Tensor, Tree, HEADER_FORMAT,
+    repo_key, Body, Component, Config, Dtype, Encoding, Error, Header, Location, ObjectRef, Part,
+    Pipeline, Release, Repo, Tensor, Tree, HEADER_FORMAT,
 };
 
 #[derive(Deserialize)]
@@ -338,17 +338,32 @@ fn from_projection(p: &Json) -> (Header, bool) {
     let list = |v: &Json| v.as_array().unwrap().clone();
     let uint = |v: &Json| v.as_u64().unwrap();
     let text = |v: &Json| v.as_str().unwrap().to_owned();
+    let config = |v: &Json| serde_json::from_value::<Config>(v.clone()).unwrap();
     let root = list(p);
-    let mut later = root.len() > 5 || root[0] != HEADER_FORMAT;
-    let mut chunks = Vec::new();
-    for c in list(&root[1]) {
-        let c = list(&c);
+    let mut later = root.len() > 6 || root[0] != HEADER_FORMAT;
+    let mut object = |v: &Json| {
+        let c = list(v);
         later |= c.len() > 2;
-        chunks.push(ObjectRef {
+        ObjectRef {
             sha256: text(&c[0]["hex"]),
             length: uint(&c[1]),
-        });
+        }
+    };
+    let chunks: Vec<ObjectRef> = list(&root[1]).iter().map(&mut object).collect();
+    let mut components = Vec::new();
+    for c in list(&root[4]) {
+        let c = list(&c);
+        let assets = (c[4].as_object().unwrap().iter())
+            .map(|(k, v)| (k.clone(), object(v)))
+            .collect();
+        components.push((c, assets));
     }
+    let pipeline = list(&root[3]);
+    later |= pipeline.len() > 2;
+    let pipeline = (!pipeline.is_empty()).then(|| Pipeline {
+        class: text(&pipeline[0]),
+        config: config(&pipeline[1]),
+    });
     let mut encodings = Vec::new();
     for e in list(&root[2]) {
         let e = list(&e);
@@ -368,12 +383,10 @@ fn from_projection(p: &Json) -> (Header, bool) {
         };
         (l, v.len() > 3)
     };
-    let mut components = Vec::new();
-    for c in list(&root[3]) {
-        let c = list(&c);
-        later |= c.len() > 2;
+    let components = components.into_iter().map(|(c, assets)| {
+        later |= c.len() > 6;
         let mut tensors = Vec::new();
-        for t in list(&c[1]) {
+        for t in list(&c[3]) {
             let t = list(&t);
             later |= t.len() > 5;
             let shape = |v: &Json| list(v).iter().map(uint).collect::<Vec<u64>>();
@@ -409,14 +422,18 @@ fn from_projection(p: &Json) -> (Header, bool) {
                 body,
             });
         }
-        components.push(Component {
+        Component {
             name: text(&c[0]),
+            class: text(&c[1]),
+            config: config(&c[2]),
             tensors,
-            ..Default::default()
-        });
-    }
-    let metadata = serde_json::from_value(root[4].clone()).unwrap();
-    (Header::new(chunks, None, components, metadata).unwrap(), later)
+            assets,
+            config_file: c.get(5).map(text).filter(|f| c.len() == 6 || f != "config.json"),
+        }
+    });
+    let components = components.collect();
+    let metadata = serde_json::from_value(root[5].clone()).unwrap();
+    (Header::new(chunks, pipeline, components, metadata).unwrap(), later)
 }
 
 #[test]
