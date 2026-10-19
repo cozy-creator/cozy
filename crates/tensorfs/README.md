@@ -130,8 +130,8 @@ The cache is internal. Its default root is `~/.cache/tensorfs`; `cache_dir=` and
 share immutable objects and coordinated records. Admission hashes bytes before installing them by rename; ordinary
 opens check lengths. Explicit verification rehashes on demand. TensorFS is a library and has no daemon.
 
-Runtime and TensorD use this same public API. Runtime reads and writes the shared store and publishes with its
-request's scoped provider. TensorFS owns I/O and decoding; varena owns memory placement. Installing the wheel does
+Runtime and TensorD use this same public API. Callers read and write the shared store and upload with a supplied
+credential. TensorFS owns I/O and decoding; varena owns memory placement. Installing the wheel does
 not grant access to private data or managed executions.
 
 The [public Python signatures](python/tensorfs/api.pyi) and [native types](python/tensorfs/_ext.pyi) define arguments

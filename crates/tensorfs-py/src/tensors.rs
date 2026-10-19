@@ -13,14 +13,14 @@ use tensorfs_core::format::{decode, Body, Dtype, Encoding, PartBytes};
 use tensorfs_core::io::{Dst, ReadOpts, Target};
 use tensorfs_core::store2::{Checkpoint, Error};
 
-use crate::store::{invalid, metadata, raise, Aligned, FetchTensor, OrRaise, PyArray, PyCheckpoint};
+use crate::store::{invalid, metadata, raise, Aligned, FetchTensor, OrRaise, PyArray, CheckpointAccess};
 
 /// A component's tensors: a mapping of key to `Info`, with the reads.
 #[pyclass(name = "Tensors", module = "tensorfs", frozen, mapping)]
 pub struct PyTensors {
     component: String,
     infos: Py<PyDict>,
-    ck: Option<Py<PyCheckpoint>>,
+    ck: Option<Arc<CheckpointAccess>>,
 }
 
 /// An encoded tensor as stored (`decode=False`): its scheme and params, and each part.
@@ -44,7 +44,7 @@ impl PyTensors {
     pub(crate) fn new(
         component: &str,
         infos: Py<PyDict>,
-        ck: Option<Py<PyCheckpoint>>,
+        ck: Option<Arc<CheckpointAccess>>,
     ) -> PyTensors {
         PyTensors {
             component: component.to_owned(),
@@ -53,9 +53,9 @@ impl PyTensors {
         }
     }
 
-    fn checkpoint<'a>(&'a self, py: Python<'_>) -> PyResult<&'a Checkpoint> {
+    fn checkpoint(&self, py: Python<'_>) -> PyResult<&Checkpoint> {
         match &self.ck {
-            Some(ck) => ck.get().stored(py),
+            Some(ck) => Ok(&ck.checkpoint),
             None => Err(raise(
                 py,
                 Failure {
@@ -75,7 +75,7 @@ impl PyTensors {
     ) -> PyResult<Vec<Bound<'py, PyAny>>> {
         let ck = self.checkpoint(py)?;
         let reads: Vec<FetchTensor> = keys.iter().map(|key| FetchTensor { key, role: None, range: None }).collect();
-        self.ck.as_ref().unwrap().get().fetch_tensors(py, &self.component, &reads)?;
+        self.ck.as_ref().unwrap().fetch_tensors(py, &self.component, &reads)?;
         let mut wants = Vec::new();
         for (i, key) in keys.iter().enumerate() {
             let t = ck.tensor(&self.component, key).or_raise(py)?;
@@ -309,7 +309,7 @@ impl PyTensors {
         }
         let end = offset.checked_add(len as u64).ok_or_else(|| invalid(py, "read range overflow"))?;
         let read = FetchTensor { key: &key, role: Some(role.as_deref().unwrap_or("")), range: Some(offset..end) };
-        self.ck.as_ref().unwrap().get().fetch_tensors(py, &self.component, &[read])?;
+        self.ck.as_ref().unwrap().fetch_tensors(py, &self.component, &[read])?;
         let target = Target {
             component: &self.component,
             key: &key,
