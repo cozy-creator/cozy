@@ -89,7 +89,20 @@ fn cuda_staging_pins_device_copies_and_chunk_spans_keep_exact_bytes() {
     let copy = Copy { src: Src::Host(source), dst: Dst::Device { device: 0, ptr: gpu.ptr(), len: gpu.len(), stream: 0 } };
     for _ in 0..2 { unsafe { io::read(&[copy], &opts) }.unwrap(); }
     let _context = io::cuda::CtxGuard::enter(gpu.context()).unwrap();
+    assert!(!unsafe { io::cuda::registered(source) }.unwrap(), "the completed reuse copy retained its temporary registration");
     let mut pin = unsafe { io::cuda::pin_region(source.cast_mut(), host.len, true) }.unwrap();
+    assert!(unsafe { io::cuda::registered(source) }.unwrap());
+    // A second guard borrows the first registration. Neither explicit release nor an
+    // unreleased borrowed guard's Drop may unregister the live owner's mapping.
+    let mut borrowed = unsafe { io::cuda::pin_region(source.cast_mut(), host.len, true) }.unwrap();
+    borrowed.release().unwrap();
+    borrowed.release().unwrap();
+    assert!(unsafe { io::cuda::registered(source) }.unwrap(), "a borrowed release unregistered its owner's memory");
+    drop(borrowed);
+    assert!(unsafe { io::cuda::registered(source) }.unwrap());
+    let borrowed = unsafe { io::cuda::pin_region(source.cast_mut(), host.len, true) }.unwrap();
+    drop(borrowed);
+    assert!(unsafe { io::cuda::registered(source) }.unwrap(), "a borrowed Drop unregistered its owner's memory");
     unsafe { io::read(&[copy], &opts) }.unwrap();
     assert!(unsafe { io::cuda::registered(source) }.unwrap());
     unsafe { io::read(&[Copy { src: Src::Device { device: 0, ptr: gpu.ptr(), stream: 0 }, dst: Dst::Device { device: 0, ptr: other.ptr(), len: other.len(), stream: 0 } }], &opts) }.unwrap();
@@ -102,9 +115,30 @@ fn cuda_staging_pins_device_copies_and_chunk_spans_keep_exact_bytes() {
     assert_eq!(&bytes[..17], &expected[..17]);
     assert_eq!(&bytes[17..26], &[0; 9]);
     assert_eq!(&bytes[26..], &expected[26..]);
-    pin.release().unwrap();
-    pin.release().unwrap();
+    let assert_no_current_context = || {
+        let mut current = std::ptr::null_mut();
+        io::cuda::check("cuCtxGetCurrent", unsafe { (io::cuda::driver().unwrap().ctx_get_current)(&mut current) }).unwrap();
+        assert!(current.is_null(), "a HostPin release changed the caller's CUDA context");
+    };
+    {
+        // Release enters the captured context and restores the caller's unbound state.
+        // The buffers above still retain the primary context and all copies have drained.
+        let _unbound = io::cuda::CtxGuard::enter(std::ptr::null_mut()).unwrap();
+        pin.release().unwrap();
+        pin.release().unwrap();
+        assert_no_current_context();
+    }
     assert!(!unsafe { io::cuda::registered(source) }.unwrap());
+    drop(pin);
+    let pin = unsafe { io::cuda::pin_region(source.cast_mut(), host.len, true) }.unwrap();
+    assert!(unsafe { io::cuda::registered(source) }.unwrap());
+    {
+        let _unbound = io::cuda::CtxGuard::enter(std::ptr::null_mut()).unwrap();
+        drop(pin);
+        assert_no_current_context();
+    }
+    assert!(!unsafe { io::cuda::registered(source) }.unwrap());
+    println!("HostPin: owned explicit/implicit unregister, borrowed explicit/implicit preservation, engine preservation and context restoration passed");
 }
 
 /// A destination `skew` bytes past a page boundary (0: O_DIRECT lands in place).
