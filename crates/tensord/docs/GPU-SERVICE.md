@@ -1,9 +1,10 @@
 # GPU service
 
 `gpu_service.rs` (`GpuPool`) coordinates published, cached GPU callables through retained
-Runtime executors. TensorD supplies model data and shared CPU buffers and uses
-`memory::GpuMemory` to decide device budgets and eviction. Runtime constructs models and
-performs GPU operations through its TensorFS plane in the executor's CUDA context.
+Runtime executors. TensorD supplies model data, shared CPU buffers and each GPU's varena ledger
+(`memory::GpuLedger`, design memory-varena §5.6). Varena in each executor decides that
+executor's GPU bytes and makes room through the ledger's asks. TensorD admits starts, reaps
+exited executors' rows, and ends the ones the ledger names stalled.
 Acceptance, journal, progress and output custody stay in `Engine`; scheduling stays in `service.rs`.
 
 ## Configuration
@@ -14,9 +15,9 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
 - `models: [ModelGrant { package, slot, repository, release, lane, manifest, components }]`: the only
   authority over cached model bytes.
 - `packages: [{ package, release, distribution, generation }]`: published-package mapping.
-- `pinned_budget_bytes`; `authorized_device_limit_bytes` (Load's limit only where NVML cannot read
-  the device total).
-- `memory`: `{ floor_bytes, sample_log }`: raise the free floor; log each 1 s NVML reading.
+- `authorized_device_limit_bytes`: a GPU's ledger capacity where neither NVML nor the inventory
+  says it.
+- `memory`: `{ floor_bytes }`: raise the free floor TensorD keeps on each GPU.
 - `environment`: keys containing `TOKEN`, `SECRET` or `PASSWORD` are refused.
 - `host`: optional `{fill_threads, ttl_seconds}` for the always-on `HostTier`. `identity`: optional `{uid, gid}`.
 
@@ -34,7 +35,7 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
 - Degree 0 (deviceless): `accelerator=False`, or a machine without GPUs. Such a call runs on a
   pooled deviceless executor within CPU room; idle ones are ended by host pressure, least recently
   used first, before any GPU executor. Degree 1: a call that constructs nothing, on one GPU, an
-  ordinary tenant of the memory policy.
+  ordinary tenant of its GPU's ledger.
 - Allocations (`gpu_allocation.rs`), as Slurm's: a deviceless root (a request with no parent)
   holds a contiguous lane, `--gpus` wide or as wide as the widest group its environment's models
   run on here. It is registered when the root dispatches and bound when its first GPU step is
@@ -65,23 +66,21 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   startup fence or an active GPU record this machine run does not supervise. CPU dispatch continues.
 - Placement (`GpuPool::place`), inside the root's lane (else on unallocated, unclaimed GPUs): a
   group takes a free contiguous lane of K GPUs. A one-GPU call takes, in order, a free GPU with
-  its plan's idle executor; a free GPU where its learned want fits beside the tenants there
-  without evicting any (a replica when the plan runs elsewhere too; a plan with nothing learned
-  fits only a GPU that holds nothing); or, when the plan runs nowhere or inside its root's lane,
+  its plan's idle executor; a free GPU where what its executors hold elsewhere (else a new
+  context) fits in that GPU's ledger once others' cold and idle bytes are asked for (a replica
+  when the plan runs elsewhere too); or, when the plan runs nowhere or inside its root's lane,
   any free one. A waiting standalone call claims the GPUs it waits for. A prefetch loads only
-  inside its root's bound lane, after queued requests of that root and older ones, and ends at its release. A GPU that never ran the plan first copies its learned facts from one that did.
-  Replicas share the host tier's layouts and are ordinary tenants of their GPU's memory policy. A
-  new executor's GPU is logged as `{"event": "place"}` in the memory log; `loads.jsonl` and
-  `invokes.jsonl` name each line's `gpus`.
-- Memory decisions (floor caps, placements, sheds, admissions, estimates) are lines of the store's
+  inside its root's bound lane, after queued requests of that root and older ones, and ends at
+  its release. A new executor's GPU is logged as `{"event": "place"}` in the memory log;
+  `loads.jsonl` and `invokes.jsonl` name each line's `gpus`.
+- Memory events (admissions, asks, reaps, returns, stalls, placements) are lines of the store's
   `logs/memory.log` (rotated once past 4 MiB), machine log `memory`
-  (`cozy machine logs <name> memory`; `local` names this computer's). Each call's own memory is the run's `memory` measurements
-  (`cozy run show`): torch's peaks, the process at the end, and what the plane paged since the
-  executor's previous call.
-- A memory step on a GPU runs under that GPU's call slot; host pressure ends idle executors only on
-  GPUs no call holds.
-- Host admission counts executors admitted and not yet loaded. Pinned budgets are shared over every
-  GPU's executors (a group's once), most recently used first.
+  (`cozy machine logs <name> memory`; `local` names this computer's). Each call's own memory is
+  the run's `memory` measurements (`cozy run show`): torch's peaks and the executor's `stats`
+  (bytes paged in per model per step, evictions with rung and reason, activation peaks per
+  shape, leftover), which the merge gate reads as `measurements.memory.stats`.
+- Ending idle executors for room runs under that GPU's call slot; host pressure ends idle
+  executors only on GPUs no call holds.
 - Startup: every journaled birth still alive from a previous machine run (GPU births including
   completed requests', and any nonterminal run's) is killed, since nothing can adopt it. GPU
   dispatch stays fenced until each exit is observed. Leftover executor scopes of this machine
@@ -90,27 +89,30 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   `NCCL_P2P_LEVEL=NVL`); `Start`/`Load` carry `sequence_parallel_degree: K`. Rank 0 spawns, dials back
   and forms its followers inside `Start` (Runtime `RankGroup`); the machine never talks to a follower.
   Every command's watch meters rank 0 plus its process-group members, so formation ends only on
-  measured lack of progress. Each GPU of the group is admitted by its own memory decision (device
-  order). Each rank gets its own GPU's cap (`rank_caps`) and its own budget cell
-  (rank 0 hands the machine one per follower at formation), so every GPU's floor watchdog lowers the
-  process on that GPU. Followers' pids from `Start` name their GPU's tenant for NVML.
+  measured lack of progress. Each GPU of the group is admitted by its own ledger (device order).
+  `Start` carries one ledger fd per GPU of the lane; rank 0 hands follower r the r-th, and each
+  rank claims its own row. Followers' pids from `Start` are their GPUs' tenants: a stalled one
+  is ended by pid.
   Teardown waits for every group member's exit. Startup fences GPU dispatch until a previous
   machine's leaders and their followers are gone. A refusal or poisoned group call fails the run
-  with the executor's own code (a group's first fault names its GPU). Descriptor sources and
-  Degree 2 custody stay world-one. A group forks from the generation's import-only parent like a
+  with the executor's own code (a group's first fault names its GPU). A group forks from the generation's import-only parent like a
   single GPU does: the child takes the lane and NCCL seal with its environment; followers are spawned
   by rank 0.
-- A cold session is admitted first: its context estimate (twice the largest measured here, else
-  1 GiB) and known first working set are reserved, making room by the ladder below. It is spawned by
-  the pool's `ChildLauncher`, which journals the birth, then sent Start, Load (with that cap and
-  its pinned budget) and Activate once. Each request sends PrepareRequest and
-  Invoke. Executors of other plans stay; the policy decides what they keep on the device.
-- Each Invoke carries a real grant: `cap_bytes` (whole process: context + torch + plane).
-- Making room, in order: idle executors unmap (`Budget{vram 0}`, LRU), idle executors end (only
-  while the lowest rung is unmet), a running call shrinks through its budget cell. Never refused by
-  size: with nothing left, the cap is what there is.
-- Floor: 512 MiB or 1/16 of the card on a display GPU, 256 MiB otherwise. A 1 s sample below it
-  during a call lowers the call's cap through its budget cell by the deficit.
+- A cold session is admitted first, on each GPU of its lane: room for a new context (the largest
+  a row measured here, else 512 MiB) is free; else other rows' idle and cold bytes are asked for
+  and waited on; else dead rows' bytes are waited for while each NVML reading returns some; else
+  idle executors end, least recently used first, outside every warm set first. Never "now" below
+  need, never refused: what stays short is in use, and the executor makes what room it can. It is
+  spawned by the pool's `ChildLauncher`, which journals the birth, then sent Start (with its
+  ledgers), Load and Activate once. Each request sends PrepareRequest and Invoke.
+- Each GPU's ledger: its capacity is NVML's total; TensorD holds a row of its own whose context
+  is the display floor (shared mode: 512 MiB or 1/16 of the card) plus every byte NVML shows that
+  no row explains (other programs, executors still exiting). A watch thread reads NVML once a
+  second: a dead row whose process is gone is reaped, and returned once NVML charges the pid no
+  more (in a container, at a reading after the exit; what it still shows stays in TensorD's row).
+  Once a wedge floor it ends the rows asked for bytes whose progress did not move. A restarted
+  TensorD makes fresh ledgers: its old executors die with it (`PDEATHSIG`), and what they hold
+  until then is unexplained bytes.
 - An executor's failed terminal (its own refusal before entry, or a failed invoke) first keeps a
   triage bundle (`triage.rs`: terminal, traceback, executor pid and stderr tail; canonical JSON
   under `execution/triage/`, fsynced) and binds it in the journal; the outcome body names it as
@@ -128,11 +130,12 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   nonterminal.
 
 Executor requests:
-- `device_room`: idle tenants give room (unmap, then end); the answer's `cap_bytes` raises the
-  caller's cap into it.
-- `sealed_tier` goes to `HostTier` (`HOST-TIER.md`); `Load.pinned_bytes` carries the pinned budget.
-- `model_source` goes to `ModelSources` for selected headers/assets in sealed descriptors;
-  payload buffers and granted object files are supplied by `HostTier`.
+- `read_grant`: a weight set's bytes. With the executor's plan, the sealed host layout
+  `HostTier` fills (`HOST-TIER.md`, one fd, `held`); without one or where there is no sealed tier
+  (an Apple or CPU executor), every chunk file of its selected components, sorted by digest, with
+  `objects_sha256` (`descriptors` fds). Models that ran more than one pass of a call mark their
+  layouts per-step: the host cache releases them after run-once ones.
+- `model_source` goes to `ModelSources` for selected headers/assets in sealed descriptors.
 - `publish` (`Outputs.publish`) goes to `products.rs`: the spool file is retained as a native
   one-file tree bound to the run's actor, then journaled as a `product` (list outputs APPEND,
   single outputs SET; re-publishing identical SET bytes is a no-op). Answers `Published`.
@@ -155,8 +158,8 @@ thread.
 
 ## Known gaps
 
-- Groups always take the first K envelope GPUs. Degree 2 custody, warm members and import-only
-  parents live on the first GPU; replicas elsewhere never share GPU weights. No adapters.
+- Groups always take the first K envelope GPUs. Warm members and import-only parents live on the
+  first GPU; executors never share GPU weights (the host cache is shared). No adapters.
 - One Python post helper per request.
 - Each executor gets its own scope: a cgroup-v2 where the host delegates one (laptop systemd
   scopes, rootful hosts), else a token (containers with a read-only or v1 hierarchy, RunPod).

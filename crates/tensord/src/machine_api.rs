@@ -1150,7 +1150,7 @@ mod product_log_tests {
     use crate::{
         api::MachineIdentity,
         device_executor::{
-            self, Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, ExecutorConfig, Frame,
+            self, Baseline, Binding, DeviceCommand, DeviceExecutor, ExecutorConfig, Frame,
             Services,
         },
         execution::Engine as Execution_Engine,
@@ -1385,6 +1385,8 @@ print(json.dumps({"identity": generation.identity}))
                             import_only: false,
                             call_interfaces: vec![],
                             constructions: Vec::new(),
+                            ledgers: 0,
+                            memory_mode: "shared",
                         },
                     )?;
                     command(
@@ -1398,16 +1400,8 @@ print(json.dumps({"identity": generation.identity}))
                                 package_interface: interface.display().to_string(),
                                 ..Binding::default()
                             }),
-                            budgets: Budgets::default(),
                             models: Vec::new(),
-                            authorized_device_limit_bytes: None,
                             attention_pin: String::new(),
-                            device_weights: false,
-                            cap_bytes: None,
-                            sealed_tiers: false,
-                            model_sources: false,
-                            staged_tiers: false,
-                            pinned_bytes: None,
                         },
                     )?;
                     command(
@@ -1440,13 +1434,8 @@ print(json.dumps({"identity": generation.identity}))
                             deadline_s: None,
                             attention_kernel: String::new(),
                             bits: 0,
-                            cap_bytes: None,
                             inputs: Default::default(),
                             trees: Default::default(),
-                            floor_bytes: None,
-                            activation_bytes: Default::default(),
-                            squeezed_bytes: Default::default(),
-                            device_weights: None,
                             sources: Default::default(),
                             weights: Default::default(),
                         },

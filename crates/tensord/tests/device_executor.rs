@@ -2,7 +2,7 @@
 use tensord::{device_executor, launch_identity::Seal};
 
 use device_executor::{
-    postprocess, read_result, Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor,
+    postprocess, read_result, Baseline, Binding, DeviceCommand, DeviceExecutor,
     ExecutorConfig, Frame, Services,
 };
 use serde::Deserialize;
@@ -80,6 +80,8 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
                 import_only: false,
                 call_interfaces: vec![],
                 constructions: Vec::new(),
+                ledgers: 0,
+                memory_mode: "shared",
             },
             &mut Baseline,
         )
@@ -97,16 +99,8 @@ fn prepared(version: &str, generation_path: &str) -> (DeviceExecutor, PathBuf) {
                 devices,
                 sequence_parallel_degree: 1,
                 binding: Box::new(binding),
-                budgets: Budgets::default(),
                 models: Vec::new(),
-                authorized_device_limit_bytes: None,
                 attention_pin: String::new(),
-                device_weights: false,
-                cap_bytes: None,
-                sealed_tiers: false,
-                model_sources: false,
-                staged_tiers: false,
-                pinned_bytes: None,
             },
             &mut Baseline,
         )
@@ -146,13 +140,8 @@ fn invoke(
                 deadline_s: None,
                 attention_kernel: String::new(),
                 bits: 0,
-                cap_bytes: None,
                 inputs: Default::default(),
                 trees: Default::default(),
-                floor_bytes: None,
-                activation_bytes: Default::default(),
-                squeezed_bytes: Default::default(),
-                device_weights: None,
                 sources: Default::default(),
                 weights: Default::default(),
             },
@@ -274,13 +263,8 @@ fn stock_executor_deferred_webp_reuses_sdk_encoder_and_exact_asset_binding() {
                 deadline_s: None,
                 attention_kernel: String::new(),
                 bits: 0,
-                cap_bytes: None,
                 inputs: Default::default(),
                 trees: Default::default(),
-                floor_bytes: None,
-                activation_bytes: Default::default(),
-                squeezed_bytes: Default::default(),
-                device_weights: None,
                 sources: Default::default(),
                 weights: Default::default(),
             },
