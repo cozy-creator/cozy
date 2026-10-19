@@ -35,6 +35,10 @@ on:
         description: cozy-runtime branch, tag or SHA whose wheel tests get as COZY_TEST_RUNTIME_WHEEL; empty for the newest published
         type: string
         default: ''
+      tensorfs_run:
+        description: Existing dev-build run whose TensorFS wheel the targeted tests install
+        type: string
+        default: ''
       runner:
         description: Runner label
         type: string
@@ -77,7 +81,7 @@ jobs:
           go-version-file: crates/tensord/tests/hub-oauth/go.mod
           cache-dependency-path: crates/tensord/tests/hub-oauth/go.sum
       - uses: astral-sh/setup-uv@v6
-        if: inputs.test != '' || inputs.runtime_ref != '' || contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
+        if: inputs.test != '' || inputs.runtime_ref != '' || inputs.tensorfs_run != '' || contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
       # The Rust workspace: rust-toolchain.toml's toolchain installs on first use. target/manylinux
       # is the TensorFS wheel's container build.
       - uses: Swatinem/rust-cache@v2
@@ -179,6 +183,20 @@ jobs:
           uv pip install --python "$RUNNER_TEMP/tensorfs/bin/python" crates/tensorfs/dist/*.whl
           echo "TENSORFS_TEST_PYTHON=$RUNNER_TEMP/tensorfs/bin/python" >> "$GITHUB_ENV"
           echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$PWD"/crates/tensorfs/dist/tensorfs-*.whl)" >> "$GITHUB_ENV"
+      - if: inputs.tensorfs_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.tensorfs_run }}
+          pattern: tensorfs-wheel-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/tensorfs-artifact
+      - if: inputs.tensorfs_run != ''
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/tensorfs"
+          uv pip install --python "$RUNNER_TEMP/tensorfs/bin/python" "$RUNNER_TEMP"/tensorfs-artifact/*.whl
+          echo "TENSORFS_TEST_PYTHON=$RUNNER_TEMP/tensorfs/bin/python" >> "$GITHUB_ENV"
+          echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$RUNNER_TEMP"/tensorfs-artifact/*.whl)" >> "$GITHUB_ENV"
       - if: inputs.runtime_ref != ''
         uses: actions/checkout@v5
         with:
