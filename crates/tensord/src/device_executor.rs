@@ -2166,9 +2166,10 @@ fn write_command(stream: &mut LocalStream, command: &DeviceCommand, group: &Grou
     let bytes = serde_json::to_vec(&value)?;
     // Only this typed field may carry supplied access. Validate everything else; the original
     // wire bytes above still contain the token, and arbitrary JSON never grants this exception.
-    if matches!(command, DeviceCommand::Load { tensorfs: Some(_), .. } | DeviceCommand::Invoke { tensorfs: Some(_), .. })
-        && let Some(options) = value.get_mut("tensorfs").and_then(Value::as_object_mut)
-    {
+    if let (true, Some(options)) = (
+        matches!(command, DeviceCommand::Load { tensorfs: Some(_), .. } | DeviceCommand::Invoke { tensorfs: Some(_), .. }),
+        value.get_mut("tensorfs").and_then(Value::as_object_mut),
+    ) {
         options.remove("token");
     }
     scan(&value)?;
