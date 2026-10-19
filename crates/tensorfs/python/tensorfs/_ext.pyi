@@ -16,8 +16,8 @@ CLAIM_PROTOCOL: int
 varena: ModuleType
 
 StrPath = str | PathLike[str]
-#: `org/name[@release]`, `sha256:<hex>`, or a `Manifest`.
-Ref = str | Manifest
+#: `org/name[@release]`, `sha256:<hex>` of a tree or a header, or a stored `Checkpoint`.
+Ref = str | Checkpoint
 
 class Error(Exception):
     """A TensorFS error. `.code` names its family; `.detail` the cause."""
@@ -32,7 +32,7 @@ class FormatError(Error):
     """Another document kind or major version (`format`)."""
 
 class NotFoundError(Error):
-    """No such ref, release, lane, tensor, file or object (`not_found`)."""
+    """No such ref, release, variant, component, tensor, asset or object (`not_found`)."""
 
 class IntegrityError(Error):
     """Bytes that do not match their digest or length (`integrity`)."""
@@ -57,22 +57,6 @@ class DeniedError(Error):
 
 class UnsupportedError(Error):
     """A source or target this build cannot represent (`unsupported`)."""
-
-class Manifest:
-    """A checkpoint's manifest object, and the ref, release and lane naming it when one does."""
-
-    @property
-    def sha256(self) -> str: ...
-    @property
-    def length(self) -> int: ...
-    @property
-    def name(self) -> str | None: ...
-    @property
-    def release(self) -> str | None: ...
-    @property
-    def lane(self) -> str | None: ...
-    def __eq__(self, other: object) -> bool: ...
-    def __hash__(self) -> int: ...
 
 class Part:
     """One stored part: a plain tensor's data (role `""`) or an encoded tensor's part."""
@@ -129,16 +113,60 @@ class Array:
     ) -> object: ...
     def __dlpack_device__(self) -> tuple[int, int]: ...
 
+class Pipeline:
+    """What `model_index.json` held."""
+
+    @property
+    def cls(self) -> str:
+        """`diffusers.<Class>`, `""` when unknown."""
+    @property
+    def config(self) -> dict[str, Any]: ...
+
+class Component:
+    """One component of a checkpoint: class, config, tensors and assets."""
+
+    @property
+    def name(self) -> str: ...
+    @property
+    def cls(self) -> str:
+        """`<library>.<Class>`, `""` when unknown."""
+    @property
+    def config(self) -> dict[str, Any]: ...
+    @property
+    def config_file(self) -> str | None:
+        """The config's file name when it isn't `config.json`."""
+    @property
+    def tensors(self) -> dict[str, Info]:
+        """`key -> Info`, in construction order."""
+    @property
+    def assets(self) -> dict[str, tuple[str, int]]:
+        """`name -> (sha256, length)`: run data in the component's folder."""
+    def asset(self, name: str) -> bytes:
+        """An asset's bytes; a parsed header raises `UnsupportedError`."""
+
 class Checkpoint:
-    """A checkpoint read from a store, or only a header's tensors (`parse`)."""
+    """One cozytensors read from a store, or only its header (`parse`)."""
 
     @staticmethod
     def parse(header: bytes) -> Checkpoint:
-        """A `cozytensors/1` header's tensors and metadata, with no store: `read`, `file` and
-        `chunk_paths` refuse (`UnsupportedError`)."""
+        """A `cozytensors/1` header's pipeline, components and metadata, with no store: `read`,
+        `missing`, `chunk_paths` and `Component.asset` refuse (`UnsupportedError`)."""
     @property
-    def manifest(self) -> Manifest | None:
-        """None for a parsed header."""
+    def id(self) -> str | None:
+        """`sha256:<hex>` of the header; None for a parsed header."""
+    @property
+    def tree(self) -> str | None: ...
+    @property
+    def name(self) -> str | None: ...
+    @property
+    def release(self) -> str | None: ...
+    @property
+    def variant(self) -> str | None: ...
+    @property
+    def pipeline(self) -> Pipeline | None: ...
+    @property
+    def components(self) -> dict[str, Component]:
+        """In construction order."""
     @property
     def chunks(self) -> list[tuple[str, int]]:
         """The header's chunk objects in order: `(sha256, length)` (`Part.chunk` indexes them)."""
@@ -149,18 +177,18 @@ class Checkpoint:
     def tensors(self) -> dict[str, dict[str, Info]]:
         """`tensors[component][key]`."""
     @property
-    def files(self) -> list[str]: ...
-    @property
     def metadata(self) -> dict[str, Any]: ...
-    def file(self, path: str) -> bytes: ...
+    def missing(self, components: Sequence[str] | None = None) -> list[tuple[str, int]]:
+        """The chunks and assets of `components` (all when None) not here."""
     def read(self, component: str, key: str) -> Array:
         """Logical bytes; an encoded tensor goes through the reference decode."""
 
-class Writer:
-    def put(self, component: str, key: str, dtype: str, shape: Sequence[int], data: Buffer) -> None: ...
+class ComponentWriter:
+    @property
+    def name(self) -> str: ...
+    def put(self, key: str, dtype: str, shape: Sequence[int], data: Buffer) -> None: ...
     def put_encoded(
         self,
-        component: str,
         key: str,
         dtype: str,
         shape: Sequence[int],
@@ -168,10 +196,24 @@ class Writer:
         parts: Mapping[str, tuple[str, Sequence[int], Buffer]],
         params: Mapping[str, Any] | None = None,
     ) -> None: ...
-    def copy(self, component: str, key: str, source: Checkpoint) -> None: ...
-    def file(self, path: str, data: Buffer) -> None: ...
+    def copy(
+        self, key: str, source: Checkpoint, from_component: str | None = None, from_key: str | None = None
+    ) -> None:
+        """`from_component/from_key` (default: this component, `key`) of a stored checkpoint."""
+    def asset(self, name: str, data: Buffer) -> None: ...
+    def order(self, keys: Sequence[str]) -> None: ...
+    def has(self, key: str) -> bool: ...
+
+class Writer:
+    def pipeline(self, cls: str, config: Mapping[str, Any]) -> None: ...
+    def component(
+        self, name: str, cls: str = "", config: Mapping[str, Any] | None = None, config_file: str | None = None
+    ) -> ComponentWriter:
+        """Declares a component (again: class and config change, tensors stay)."""
+    def repo_file(self, path: str, data: Buffer) -> None: ...
+    def set_metadata(self, key: str, value: Any) -> None: ...
     def has(self, component: str, key: str) -> bool: ...
-    def commit(self) -> Manifest: ...
+    def commit(self) -> Checkpoint: ...
     def abandon(self) -> None: ...
 
 class Store:
@@ -185,19 +227,21 @@ class Store:
         name: str | None = None,
         converter: str | None = None,
         variant: str | None = None,
-    ) -> Manifest:
-        """A file, directory, `hf://`, `civitai://` or URL, refd as `name` (`local/<its name>`)."""
+    ) -> Checkpoint:
+        """A file, directory, `hf://`, `civitai://` or URL, named `name` (`local/<its name>`)."""
     def pull(
         self,
         ref: str,
-        lane: str | None = None,
+        variant: str | None = None,
         origin: str | None = None,
         hub: str | None = None,
         token: str | None = None,
-    ) -> Manifest:
-        """`org/name[@release]` from Tensorhub (`hub`, else tensorhub.com; `token` reads private
-        checkpoints), or from a static `origin`'s URL or directory."""
-    def checkpoint(self, ref: Ref, lane: str | None = None) -> Checkpoint: ...
+    ) -> Checkpoint:
+        """`org/name[@release]` and its `variant` from Tensorhub (`hub`, else tensorhub.com;
+        `token` reads private trees), or from a static `origin`'s URL or directory."""
+    def checkpoint(self, ref: Ref, variant: str | None = None) -> Checkpoint: ...
+    def name(self, repo: str, version: str, ck: Checkpoint, variant: str | None = None) -> Checkpoint:
+        """`ck` as `variant` (its main dtype by default) of `repo`'s release `version` here."""
     def writer(self, base: Ref | None = None, key: str | None = None) -> Writer: ...
     def export(
         self,
@@ -207,7 +251,7 @@ class Store:
         dequantize: str | None = None,
         *,
         origin: bool = False,
-        lane: str | None = None,
+        variant: str | None = None,
     ) -> list[str]:
         """A Diffusers/Transformers folder, or with `origin=True` the static origin layout."""
     def gc(self, older_than: float | None = None) -> dict[str, Any]: ...

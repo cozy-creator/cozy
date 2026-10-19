@@ -658,7 +658,7 @@ impl Writer {
         if self.fence.is_none() {
             return Err(bad("the writer has committed"));
         }
-        self.keep()
+        self.keep().map(drop)
     }
 
     fn ready(&mut self, component: &str, key: &str) -> Result<()> {
@@ -669,19 +669,53 @@ impl Writer {
     }
 
     /// Makes every object the writer refers to young again, a quarter of the grace after the
-    /// last time, so a long write never loses its objects to GC.
-    fn keep(&mut self) -> Result<()> {
+    /// last time, so a long write never loses its objects to GC; true when it did.
+    fn keep(&mut self) -> Result<bool> {
         let Some(store) = self.dest.store() else {
-            return Ok(());
+            return Ok(false);
         };
         if self.touched.elapsed() < store.grace() / 4 {
-            return Ok(());
+            return Ok(false);
         }
         for object in self.referenced() {
             store.reuse(&object)?;
         }
         self.touched = Instant::now();
-        Ok(())
+        Ok(true)
+    }
+
+    /// `length` bytes of `data` as objects, one per 64 MiB from the first byte, keeping what the
+    /// writer refers to young between objects.
+    fn grid(&mut self, data: &mut dyn Read, length: u64, what: &str) -> Result<Vec<ObjectRef>> {
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let mut objects = Vec::new();
+        let mut left = length;
+        let laid = loop {
+            if left == 0 {
+                break Ok(());
+            }
+            let n = left.min(GRID);
+            let written = (self.dest.admit(&self.dir))
+                .and_then(|mut admit| pour(data, &mut admit, n, &mut buffer, what).and_then(|()| admit.finish()));
+            match written {
+                Ok(object) => objects.push(object),
+                Err(e) => break Err(e),
+            }
+            left -= n;
+            fault::point("writer.grid");
+            match self.keep() {
+                Ok(true) => {
+                    let store = self.dest.store().expect("a refresh has a store");
+                    if let Err(e) = objects.iter().try_for_each(|o| store.reuse(o).map(drop)) {
+                        break Err(e);
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => break Err(e),
+            }
+        };
+        self.buffer = buffer;
+        laid.map(|()| objects)
     }
 
     fn referenced(&self) -> Vec<ObjectRef> {
@@ -753,7 +787,7 @@ impl Writer {
                     }
                     At::Grid(ranges.iter().map(|r| r.0.clone()).collect())
                 }
-                (true, false) => At::Grid(grid(&self.dest, &self.dir, &mut self.buffer, &mut src, at.length, &what)?),
+                (true, false) => At::Grid(self.grid(&mut src, at.length, &what)?),
                 (false, _) => At::Spool(self.spool_in(&mut src, at.length, &what)?),
             };
             let part = Stored {
@@ -813,7 +847,7 @@ impl Writer {
             }
         };
         let at = match length >= STANDALONE {
-            true => At::Grid(grid(&self.dest, &self.dir, &mut self.buffer, data, length, what)?),
+            true => At::Grid(self.grid(data, length, what)?),
             false => At::Spool(self.spool_in(data, length, what)?),
         };
         let more = loop {
@@ -1377,28 +1411,6 @@ fn reused(what: &str, dtype: Dtype, shape: Vec<u64>, objects: Vec<ObjectRef>) ->
         length,
         at: At::Reused(objects),
     })
-}
-
-/// `length` bytes of `data` as objects, one per 64 MiB from the first byte.
-fn grid(
-    dest: &Dest,
-    work: &Path,
-    buffer: &mut [u8],
-    data: &mut dyn Read,
-    length: u64,
-    what: &str,
-) -> Result<Vec<ObjectRef>> {
-    let mut objects = Vec::new();
-    let mut left = length;
-    while left > 0 {
-        let n = left.min(GRID);
-        let mut admit = dest.admit(work)?;
-        pour(data, &mut admit, n, buffer, what)?;
-        objects.push(admit.finish()?);
-        left -= n;
-        fault::point("writer.grid");
-    }
-    Ok(objects)
 }
 
 /// Moves exactly `n` bytes.

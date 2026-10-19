@@ -70,7 +70,8 @@ async fn a_pull_from_python_http_server_is_bit_identical() {
         .pull(&origin, "acme/tiny", Some("1.0"), Some("int8"), &want)
         .await
         .unwrap();
-    assert_eq!(pulled.manifest, model.manifest);
+    assert_eq!((pulled.tree.as_ref(), &pulled.header), (Some(&model.tree), &model.header));
+    assert_eq!(pulled.variant, "int8");
     assert_eq!(pulled.landed.origin, model.bytes());
     assert_eq!(
         progress.held.load(std::sync::atomic::Ordering::Relaxed),
@@ -119,7 +120,8 @@ async fn a_pull_from_python_http_server_is_bit_identical() {
     let unet: BTreeSet<_> = model.chunks["unet"].iter().cloned().collect();
     assert!(held.is_disjoint(&unet), "a vae pull fetched unet chunks");
     assert!(model.chunks["vae"].iter().all(|c| held.contains(c)));
-    assert_eq!(held.len() + unet.len(), model.objects.len());
+    assert!(model.assets.iter().all(|a| !held.contains(a)), "nor the tokenizer's asset");
+    assert_eq!(held.len() + unet.len() + model.assets.len(), model.objects.len());
     assert_eq!(
         partial.landed.origin,
         held.iter().map(|o| o.length).sum::<u64>()
@@ -364,7 +366,7 @@ async fn a_hung_volume_is_left_alone_until_it_answers() {
     let server = Server::serve(&origin_dir, plain());
     let origin = http(&server.base);
     let volume_dir = temporary("hung-volume");
-    let fifo = volume_dir.join(model.manifest.key());
+    let fifo = volume_dir.join(model.tree.key());
     std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
     assert!(std::process::Command::new("mkfifo")
         .arg(&fifo)

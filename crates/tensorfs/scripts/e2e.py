@@ -8,8 +8,9 @@
    --origin`, served by `python -m http.server`, then `tfs pull` into a second store,
    byte-identical; a corrupted object is removed by `tfs verify` and fetched again.
 2. The same through `tensorfs`, plus DLPack reads equal to upstream's own tensors, regions,
-   the writer (with an encoded tensor) and typed errors.
-3. A parsed header carries the stored checkpoint's tensors, with no store behind it.
+   the component writer (a config with floats and None, an encoded tensor) and typed errors.
+3. A parsed header carries the stored checkpoint's pipeline, components and tensors, with no
+   store behind it.
 
     e2e.py <workdir>
 """
@@ -82,9 +83,9 @@ def same_folder(store: pathlib.Path, name: str, folder: pathlib.Path, repo: str)
     for path in (p for p in files if ".safetensors.index" in p):
         shards = set(json.loads(files[path].read_text())["weight_map"].values())
         assert all((files[path].parent / s).is_file() for s in shards), f"{repo}: {path}"
-    again = [cli(store, "import", str(folder), "--name", f"{name}-again")["manifest"]]
+    again = [cli(store, "import", str(folder), "--name", f"{name}-again")["header"]]
     cli(store, "export", f"{name}-again", str(folder), "--safetensors")
-    again.append(cli(store, "import", str(folder), "--name", f"{name}-twice")["manifest"])
+    again.append(cli(store, "import", str(folder), "--name", f"{name}-twice")["header"])
     assert again[0] == again[1], f"{repo}: import of an export is a fixed point"
     print(f"export of {repo}: its {len(allow)} other files byte for byte; re-import a fixed point")
 
@@ -160,7 +161,7 @@ def main() -> None:
     cli(a, "export", NAME, str(work / "origin"), "--origin")
     with serve(work / "origin") as url:
         pulled = cli(b, "pull", url, NAME)
-        assert pulled["manifest"] == imported["manifest"], (pulled, imported)
+        assert pulled["header"] == imported["header"], (pulled, imported)
         assert blobs(b) == blobs(a), "the pulled store is byte-identical"
         corrupt_and_refetch(b, url)
         assert blobs(b) == blobs(a)
@@ -169,10 +170,11 @@ def main() -> None:
     # 2. The Python API.
     store = tfs.Store(work / "c")
     m = store.import_(f"hf://{REPO}", name=NAME)
-    assert (m.sha256, m.length) == (imported["manifest"]["sha256"], imported["manifest"]["length"]), "imports are deterministic"
-    assert (m.name, m.release) == (NAME, "1")
+    assert m.id == f"sha256:{imported['header']['sha256']}", "imports are deterministic"
+    assert (m.name, m.release, m.variant) == (NAME, "1", imported["variant"])
     ck = store.checkpoint(NAME)
-    assert ck.manifest == m
+    assert (ck.id, ck.tree) == (m.id, m.tree)
+    assert list(ck.components) == list(ck.tensors), "components in header order"
     compared = 0
     for component in ("unet", "vae", "text_encoder", "text_encoder_2"):
         want = getattr(upstream, component).state_dict()
@@ -200,16 +202,22 @@ def main() -> None:
     store.export(NAME, work / "origin2", safetensors=False, origin=True)
     with serve(work / "origin2") as url:
         second = tfs.Store(work / "d")
-        assert second.pull(NAME, origin=url) == m
+        assert second.pull(NAME, origin=url).id == m.id
         assert blobs(work / "d") == blobs(work / "c")
 
     w = store.writer(base=m)
-    w.put("extra", "x.weight", "F32", [2, 2], np.arange(4, dtype=np.float32))
+    config = {"scale": 0.18215, "eps": 1e-05, "act": None, "blocks": [1, 2.5], "name": "x"}
+    extra = w.component("extra", cls="diffusers.Extra", config=config, config_file="extra_config.json")
+    extra.put("x.weight", "F32", [2, 2], np.arange(4, dtype=np.float32))
     parts = {"weight": ("F8_E4M3", [2, 16], bytes([0x38]) * 32), "scale": ("F32", [2], np.array([0.5, 2.0], dtype=np.float32))}
-    w.put_encoded("extra", "q.weight", "F32", [2, 16], "fp8.rowwise", parts, {"axis": 0, "scale_dtype": "F32"})
-    m3 = w.commit()
-    ck3 = store.checkpoint(m3)
+    extra.put_encoded("q.weight", "F32", [2, 16], "fp8.rowwise", parts, {"axis": 0, "scale_dtype": "F32"})
+    extra.asset("vocab.txt", b"a\nb\n")
+    assert extra.has("q.weight") and w.has("extra", "x.weight")
+    ck3 = w.commit()
     assert ck3.tensors["unet"].keys() == ck.tensors["unet"].keys(), "the base carries over"
+    e = ck3.components["extra"]
+    assert (e.cls, e.config, e.config_file) == ("diffusers.Extra", config, "extra_config.json"), (e.cls, e.config)
+    assert e.assets["vocab.txt"][1] == 4 and e.asset("vocab.txt") == b"a\nb\n"
     q = ck3.tensors["extra"]["q.weight"]
     assert q.encoding is not None and q.encoding.scheme == "fp8.rowwise" and set(q.parts) == {"weight", "scale"}
     assert str(q.encoding) == 'fp8.rowwise {axis: 0, scale_dtype: "F32"}', q.encoding
@@ -222,8 +230,18 @@ def main() -> None:
     assert store.gc()["objects"] == 0
 
     # 3. A parsed header.
-    parsed = tfs.Checkpoint.parse(ck.file("model.cozytensors"))
-    assert parsed.manifest is None and parsed.chunks == ck.chunks and parsed.files == []
+    h = ck3.id.removeprefix("sha256:")
+    parsed = tfs.Checkpoint.parse((work / "c" / "blobs" / h[:2] / h[2:4] / h).read_bytes())
+    assert parsed.id is None and parsed.chunks == ck3.chunks and parsed.metadata == ck3.metadata
+    assert (parsed.pipeline is None) == (ck3.pipeline is None)
+    for name, c in ck3.components.items():
+        p = parsed.components[name]
+        assert (p.cls, p.config, p.config_file, p.assets) == (c.cls, c.config, c.config_file, c.assets), name
+    try:
+        parsed.components["extra"].asset("vocab.txt")
+        raise AssertionError("a parsed header has no assets here")
+    except tfs.UnsupportedError:
+        pass
     for component, tensors in ck.tensors.items():
         assert list(parsed.tensors[component]) == list(tensors), component
         for key, info in tensors.items():
