@@ -178,11 +178,20 @@ def read_stub(path: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
                     continue
                 dec = decorators(node)
                 static = "staticmethod" in dec
-                out[node.name] = {
+                entry = {
                     "kind": "property" if "property" in dec else "callable",
                     "static": static,
                     "params": stub_params(node, drop_self=scope != "" and not static),
                 }
+                if "overload" in dec:
+                    previous = out.get(node.name)
+                    if previous is not None and "overloads" in previous:
+                        previous["overloads"].append(entry["params"])
+                    else:
+                        entry["overloads"] = [entry["params"]]
+                        out[node.name] = entry
+                else:
+                    out[node.name] = entry
             elif isinstance(node, ast.ClassDef):
                 if not public(node.name):
                     continue
@@ -244,6 +253,36 @@ def compare_params(
                 faults.append(f"{where}: parameter {r[0]!r} defaults to {rd}, the stub says {sd}")
 
 
+def compare_overloads(where: str, runtime: list[tuple[str, str, str]] | None,
+                      variants: list[list[tuple[str, str, str]]], faults: list[str]) -> None:
+    """Every typed branch describes accepted calls; one carries the full native ABI.
+
+    Mapping.get can require a default of a particular type in a narrower typed branch.
+    Its default=None branch still checks every native name, kind and default exactly.
+    """
+    if runtime is None:
+        return
+    full = False
+    for index, params in enumerate(variants, 1):
+        exact: list[str] = []
+        compare_params(where, runtime, params, exact)
+        full |= not exact
+        label = f"{where} overload {index}"
+        if len(params) > len(runtime):
+            faults.append(f"{label}: declares more parameters than the native callable")
+            continue
+        for native, declared in zip(runtime, params):
+            if native[:2] != declared[:2]:
+                faults.append(f"{label}: parameter {declared[0]!r} name/kind differs from the native callable")
+            elif declared[2] and (not native[2] or declared[2] not in {native[2], "..."}):
+                faults.append(f"{label}: default for {declared[0]!r} differs from the native callable")
+        if any(not default and kind not in {"VAR_POSITIONAL", "VAR_KEYWORD"}
+               for _, kind, default in runtime[len(params):]):
+            faults.append(f"{label}: omits a required native parameter")
+    if not full:
+        faults.append(f"{where}: no typed overload declares the complete native signature and defaults")
+
+
 def inherited(surface: dict[str, Any], name: str, seen: frozenset[str] = frozenset()) -> dict[str, Any]:
     """A class's members plus every member it inherits from bases declared in this surface.
 
@@ -290,7 +329,10 @@ def compare(runtime: dict[str, Any], stub: dict[str, Any], scope: str, faults: l
                     + ("static in the extension, an instance method in the stub"
                        if r.get("static") else "an instance method in the extension, static in the stub")
                 )
-            compare_params(where, r.get("params"), s.get("params", []), faults)
+            if "overloads" in s:
+                compare_overloads(where, r.get("params"), s["overloads"], faults)
+            else:
+                compare_params(where, r.get("params"), s.get("params", []), faults)
         elif r["kind"] == "class":
             compare(
                 inherited(runtime, name) if not scope else r["members"],
