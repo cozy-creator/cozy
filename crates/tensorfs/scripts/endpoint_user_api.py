@@ -60,6 +60,19 @@ readme = tensorfs.hub_download(request["model"], "README.md", revision="1", endp
 assert Path(readme).read_text() == "normal owner upload\n"
 
 
+class RetryFailure(Owner):
+    def retry(self, method, url, headers, payload, status, response_headers):
+        raise tensorfs.NetworkError("retry callback network failure")
+
+
+try:
+    tensorfs.Endpoint(request["endpoint"], token=RetryFailure(), ca_der=ca).repo(request["model"])
+except tensorfs.NetworkError as error:
+    assert error.code == "network" and "retry callback network failure" in error.detail
+else:
+    raise AssertionError("the provider retry failure disappeared")
+
+
 def unavailable(method, url, headers, payload):
     raise ValueError("the test credential provider is unavailable")
 
