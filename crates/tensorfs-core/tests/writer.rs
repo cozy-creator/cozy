@@ -86,6 +86,22 @@ fn blobs(store: &Store) -> BTreeSet<String> {
     found
 }
 
+/// GC reports allocated storage only when unlinking the last, unopened inode name.
+/// Capture these facts before collection, without keeping a descriptor to the candidate.
+fn gc_allocation(store: &Store, digest: &str) -> u64 {
+    let object = ObjectRef { sha256: digest.to_owned(), length: 0 };
+    let path = store.path(&object).unwrap();
+    let metadata = fs::metadata(&path).unwrap();
+    if platform::durable::links(&path).unwrap() != 1 { return 0; }
+    #[cfg(target_os = "linux")]
+    {
+        let id = platform::durable::FileId::at(&path).unwrap();
+        if fs::read_dir("/proc/self/fd").unwrap().flatten()
+            .any(|fd| platform::durable::FileId::at(&fd.path()).ok() == Some(id)) { return 0; }
+    }
+    platform::durable::allocated(&metadata)
+}
+
 /// Account only for the normal Trees written by native retention, including superseded
 /// roots not yet swept. Every raw entry must name a known fixture header/payload exactly.
 fn retention_trees(store: &Store, digests: &BTreeSet<String>, known: &BTreeSet<ObjectRef>) -> BTreeMap<String, u64> {
@@ -99,7 +115,7 @@ fn retention_trees(store: &Store, digests: &BTreeSet<String>, known: &BTreeSet<O
             assert_eq!(path, &format!("held/{}", object.sha256), "retention raw-entry name");
             assert!(known.contains(object), "retention Tree names an unexpected object: {object:?}");
         }
-        (digest.clone(), bytes.len() as u64)
+        (digest.clone(), gc_allocation(store, digest))
     }).collect()
 }
 
@@ -1087,14 +1103,17 @@ fn a_two_variant_repo_shares_chunks_and_files_and_gc_keeps_its_closure() {
     let known_digests: BTreeSet<String> = known.iter().map(|o| o.sha256.clone()).collect();
     let extra: BTreeSet<String> = before.difference(&known_digests).cloned().collect();
     let metadata = retention_trees(&store, &extra, &known);
+    let mut allocated = metadata.clone();
+    allocated.extend(gone.iter().map(|o| (o.sha256.clone(), gc_allocation(&store, &o.sha256))));
     let collected = store.clone().with_grace(Duration::ZERO).gc().unwrap();
     let removed: BTreeSet<String> = before.difference(&blobs(&store)).cloned().collect();
     let gone_digests: BTreeSet<String> = gone.iter().map(|o| o.sha256.clone()).collect();
     assert!(gone_digests.is_subset(&removed), "the released checkpoint's exact payload is swept");
     let removed_metadata: BTreeSet<String> = removed.difference(&gone_digests).cloned().collect();
-    let metadata_bytes: u64 = removed_metadata.iter().map(|digest| *metadata.get(digest).expect("GC removed an unexpected object")).sum();
+    assert!(removed_metadata.iter().all(|digest| metadata.contains_key(digest)), "GC removed an unexpected object");
     assert_eq!(collected.objects, gone.len() as u64 + removed_metadata.len() as u64);
-    assert_eq!(collected.bytes, gone.iter().map(|o| o.length).sum::<u64>() + metadata_bytes);
+    let physical: u64 = removed.iter().map(|digest| allocated[digest]).sum();
+    assert_eq!(collected.bytes, physical, "physical allocation captured before unlink");
     for o in &gone {
         assert!(!store.path(o).unwrap().exists(), "{} is swept", o.sha256);
     }
