@@ -8,11 +8,18 @@ Readable target documents are in [examples/](examples/); their schemas are in [s
 This is the authoritative specification of the stored format and its decode semantics. A reader can implement it
 without TensorFS, Cozy or Tensorhub. Library APIs, cache policy and GPU execution are outside the format contract.
 
-cozytensors/1 stores model weights as immutable, content-addressed objects. A **cozytensors** is one variant of a
-model: a **header** that describes its pipeline and components, every tensor in them, plain or encoded, and the
-**chunks** (objects of tensor bytes) and **asset** objects it cites. A **tree** is a repo revision as files: each
-variant's header beside repo files such as README and LICENSE. A **repo** document maps a model's releases to trees.
-Everything a reader needs to read and decode a tensor is in these documents and this spec.
+cozytensors/1 describes model weights as immutable, content-addressed objects. One **header** describes one model
+variant: its pipeline, components, plain or encoded tensors, and the chunks and assets those components use.
+A **tree** groups variant headers with shared repository files such as README and LICENSE. A **repo** document
+is the mutable index of releases and unreleased trees.
+
+```text
+repo -> release or unreleased tree -> variant header -> tensor chunks and component assets
+                                  -> shared repository files
+```
+
+Everything required to locate and decode a tensor is in its header and this specification. A header does not
+depend on a repository name, release label, filename, Python package or particular model engine.
 
 The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119. §1–§8 define meaning; §9 defines the byte encoding
 of documents; §10 is informative writer guidance. Appendix A holds the schemes' fixed tables.
@@ -26,8 +33,14 @@ bytes as 64 lowercase hex digits, `length` their count. In a store or static ori
 blobs/<sha256[0:2]>/<sha256[2:4]>/<sha256>
 ```
 
-Every admission, where bytes enter a store, cache or endpoint, MUST check the object's length and digest. A reader
-of a plain folder (§3) or of objects already admitted MUST check lengths; it need not hash again.
+An object satisfies a reference only when its length and SHA-256 match. Every admission of unverified bytes MUST
+check both. A reader MAY reuse a prior verification if it can rely on those bytes remaining unchanged; it MUST
+still check lengths when opening them. Cache policy and the mechanism that preserves verified bytes are outside
+this format contract.
+
+Identity is over stored bytes, not decoded model values. A variant's id hashes its complete encoded header,
+including configuration, metadata and construction order. A tree's id hashes its stored JSON bytes. Two
+representations that produce the same logical tensor need not have the same id.
 
 ## 2. Documents
 
@@ -40,7 +53,12 @@ where major and minor are decimal digits:
 | header | `cozytensors` | CBOR array | the tree file `model.<variant>.cozytensors` |
 | repo | `tensorfs.repo` | JSON object | `refs/<org>/<name>.json` |
 
-- A reader MUST refuse a document whose kind differs or whose major is not `1`. It MUST accept any minor.
+The schemas describe structure; they do not replace the rules below for canonical encoding, duplicate keys,
+value domains, arithmetic bounds and reference closure.
+
+- A reader MUST refuse a document whose kind differs or whose major is not `1`. Within the baseline defined here
+  it MUST accept any minor, subject to the structural rules below. The provisional pre-cut layouts are a specific
+  exception, described in §8 and §9.
 - A reader MUST ignore what a later minor adds: unknown fields of a JSON document, at every level, and trailing
   elements of the header's records (§4). Adding them never needs a new major.
 - Values are booleans, integers in [−2^63, 2^64), strings, lists and maps with string keys. There are no null values
@@ -58,13 +76,26 @@ or more segments joined by `/`.
 ```
 
 - Every key of `files` MUST be a path whose first segment is not `chunks` (a plain folder's chunk directory).
-- A **variant** is a file named `model.<variant>.cozytensors`, or `model.cozytensors` for the unnamed variant `""`;
-  `<variant>` is a non-empty string without `/`. Its object is that variant's header (§4), and its id.
+- A **variant** is a root-level entry named `model.<variant>.cozytensors`, or `model.cozytensors` for the unnamed
+  variant `""`. `<variant>` is non-empty and the resulting filename MUST be a valid segment. A nested path such
+  as `examples/model.bf16.cozytensors` is an ordinary repo file, not a variant. The variant's object is its header
+  (§4), and its id.
 - Every other file (README, LICENSE, images, code) is a **repo file**: an object shared by all variants and never
   cited by a header. A tree without variants holds no tensors.
 
 **Plain folder.** A tree on disk is a directory with each file at its path and `chunks/<sha256>` holding the chunks
-and assets its headers cite (some MAY be absent: a thin folder). A writer writes `chunks/` first and the headers last.
+and assets its headers cite. A writer writes object contents first and the headers last.
+
+A **thin folder** may omit chunks or assets. Header validation does not require their presence; absence alone
+is not a malformed-header error. An operation that needs an absent object obtains it from its
+object source or reports it missing, and applies §1 before using its bytes. A complete variant contains its entire
+header closure (§7); a complete tree
+contains all of its files and every variant's closure. A folder containing only selected variants is a projection
+of a tree, not a complete copy of that tree.
+
+Individual paths may be valid even when they cannot coexist as files: for example `a` and `a/b`. A materializer
+MUST refuse such a file/directory collision, including collisions between a component's config path and its asset
+paths; it MUST NOT silently drop or overwrite either entry. Metadata-only inspection need not materialize files.
 
 ## 4. Header
 
@@ -88,8 +119,9 @@ location  = [chunk_index, offset, length]
 ```
 
 - **Pipeline:** what `model_index.json` held, as its class and config; `[]` for a model with no pipeline.
-- **Class:** `<library>.<Class>` (`diffusers.StableDiffusionXLPipeline`, `diffusers.UNet2DConditionModel`,
-  `transformers.CLIPTextModel`), or `""` when unknown.
+- **Class:** a descriptive `<library>.<Class>` identifier (`diffusers.StableDiffusionXLPipeline`,
+  `diffusers.UNet2DConditionModel`, `transformers.CLIPTextModel`), or `""` when unknown. Reading this format does not
+  require importing or executing that class.
 - **Config:** the parsed JSON of the component's config file, as a structured map, never a file. Its values, and
   only those, MAY also be finite floats and `null` (`config-value` is a value, a float or `null`, lists and maps of
   them; §9). A component without a config file has an empty config.
@@ -109,7 +141,8 @@ location  = [chunk_index, offset, length]
   producer (a converter's rows, a base checkpoint, a source's constructor order) and MUST NOT sort names. Readers
   iterate in this order and look names up through an index.
 - **Later fields.** A record MAY have more elements than listed; a reader MUST skip them (they are a later minor's).
-  A reader MUST refuse a record with fewer.
+  A reader MUST refuse a record with fewer. Ignoring an extension does not waive the document's type and encoding
+  rules or permit it to introduce hidden closure dependencies (§7).
 - `chunks` lists the chunk objects (§1). A header names every object, chunk or asset, by its 32-byte SHA-256 and
   length.
 - `encodings` lists each distinct encoding (§6) once, in order of first citation by the tensors; every entry MUST be
@@ -143,9 +176,6 @@ read them.
 |---|---|---|---|
 | — | — | — | No deviations. |
 
-Per-head QKV layouts and the H3 gate/value order are the upstream layout (measured bit-identical, #508c, tfs-094),
-so they are not deviations.
-
 ## 5. Dtypes
 
 The known dtypes are the 22 safetensors 0.8 names:
@@ -159,11 +189,13 @@ The known dtypes are the 22 safetensors 0.8 names:
 | 32 | `I32`, `U32`, `F32` |
 | 64 | `C64`, `F64`, `I64`, `U64` |
 
-- The byte size of a known dtype and shape is `bits × Π shape / 8`. A reader MUST refuse a tensor or part whose
-  element bits are not a multiple of 8, or whose product overflows 64 bits at any step (`bits`, then each extent in
-  order).
-- Sub-byte elements pack from the low bits: `F4` element 2k is bits 0–3 of byte k and element 2k+1 bits 4–7; `F6`
-  elements fill bits continuously from bit 0 of byte 0.
+- Starting with the dtype's bit width, multiply by each shape extent in order using checked unsigned 64-bit
+  arithmetic. A reader MUST refuse a tensor or part if a multiplication overflows or the final total is not
+  divisible by eight. Its byte length is that total divided by eight. This applies to an encoded tensor's logical
+  shape as well as to the shapes of its stored parts. A later zero extent does not excuse an earlier overflow.
+- Plain sub-byte elements pack from the low bits: `F4` element 2k is bits 0–3 of byte k and element 2k+1 bits 4–7;
+  `F6` elements fill bits continuously from bit 0 of byte 0. An encoded part follows its scheme's physical packing
+  and layout rules instead. Its dtype and shape alone do not define a directly usable typed view.
 - `BOOL` is one byte, 0 or 1. `C64` is two `F32` (real, imaginary).
 - Dtypes are these names everywhere in a header. A dtype is any non-empty name; a name outside this table is a newer
   dtype: a reader still reads the document and checks bounds, takes the `length` as written, and refuses only a
@@ -192,10 +224,10 @@ is `producer.type` with the producer's type name verbatim (`gguf.q4_k`, `gptq.in
 
 **Params** are snake_case keys in the producer's vocabulary (`axis`, `block_size`, `rotation`, `rotation_size`,
 `global_scale`, `nibble_order`, `scale_layout`, `scale_dtype`). Every param the decode reads is required and none has a
-default, so the encoding shows the whole recipe. A scale whose dtype the scheme leaves free carries `scale_dtype`:
-`F32`, `BF16` or `F16` (and `F8_E8M0` for `fp8.blockwise`), as the producer stored it (the fixed scales of `mxfp4`,
-`mxfp8` and `nvfp4` do not). Where a param
-repeats a part's dtype (`scale_dtype`), a reader MUST refuse a mismatch.
+default, so the encoding shows the whole recipe. Only schemes whose parameter lists include `scale_dtype` carry
+that parameter: `F32`, `BF16` or `F16` (and `F8_E8M0` for `fp8.blockwise`), as specified by that scheme. Where a
+parameter repeats a part's dtype, a reader MUST refuse a mismatch. Otherwise the scheme's allowed part dtypes
+apply directly; readers MUST NOT require an undeclared `scale_dtype` parameter.
 
 **Four rules** bring any format in without new grammar:
 1. *Keep the producer's bytes.* Parts are the producer's packed bytes (int words, nibbles, block structs, swizzled
@@ -214,10 +246,11 @@ repeats a part's dtype (`scale_dtype`), a reader MUST refuse a mismatch.
   a param is missing, unknown or has a value not listed, a part's dtype or shape breaks the scheme's rule, or the
   logical dtype is not `F32`, `BF16` or `F16`. Params drive the decode, so an unknown one is a refusal, never ignored.
 
-**Shapes.** The tensorwise schemes take any logical shape, as one row of every element (`R = 1`). The others take
-rank 2 or more and view the tensor as `[R, C]`: `C` is the last extent and `R` the product of the others, so an expert
-stack `[E, N, K]` is `R = E·N` rows of `K`. `i` indexes rows and `j` columns; block schemes act along `j`. The
-ecosystem's `[N, K]` weight is `R = N` output rows of `K` inputs.
+**Shapes.** `fp8.tensorwise`, `int8.tensorwise`, `bnb.nf4`, `bnb.fp4` and `gguf.*` flatten any logical shape
+according to their scheme definitions. The other schemes use a matrix view of a rank-two-or-higher tensor unless
+their own section requires exactly rank two: `C` is the last extent and `R` the product of the others. An expert
+stack `[E, N, K]` therefore has `R = E·N` rows of `K` inputs. `i` indexes rows and `j` columns; block schemes act
+along `j`. Scheme-specific rank, block and padding restrictions still apply.
 
 **Arithmetic.** Each formula is evaluated element by element in IEEE-754 binary32 (`f32`): every `+`, `−`, `×` and `÷`
 is one f32 operation rounded to nearest even, applied left to right as written; element formats (§5), codes and stored
@@ -540,15 +573,13 @@ LLM.int8() weights (Transformers' `load_in_8bit`), one absmax per output row.
 
 A plain tensor's bytes are its value; reading it is a copy, whatever its dtype.
 
-### Adding a scheme
+### Defining another scheme
 
-A new scheme is a minor version (§8). It ships:
-1. a `### <scheme>` subsection here (params and their values, parts with the producer's role names, dtypes and shapes,
-   the decode in the building blocks' terms), and any fixed table in Appendix A with its SHA-256;
-2. a reference decoder in `tensorfs` (`format/decode/<family>.rs`, one row in `SCHEMES`) and in the
-   independent reader (`conformance/schemes/<family>.py`, one row in `FAMILIES`);
-3. conformance vectors mined from the real producer, `conformance/vectors/cases/<family>.json`, with refusals;
-4. encoders (`format/encode/<family>.rs`, one row in `ENCODERS`) and an importer row for its native container.
+A new scheme is a minor extension (§8). Its definition must specify the name, complete parameter set and accepted
+values, each part's role/dtype/shape, physical packing, decoding arithmetic and rounding. Any fixed table must
+include its exact values and byte digest. Conformance cases should include independently obtained values and
+invalid inputs. These requirements describe the format; they do not require a particular implementation language
+or source-tree layout.
 
 ## 7. Repo, store and origin
 
@@ -564,9 +595,12 @@ A new scheme is a minor version (§8). It ships:
   that changes a release conditions the change on the revision it read.
 - `checkpoints` (default empty) lists trees uploaded but not yet in any release.
 - **Resolution.** An unversioned lookup takes the newest release that is not yanked; an explicit version takes that
-  release, yanked or not (a reader MAY warn). The variant is then looked up in that release's tree; with none named,
-  a tree of one variant gives it.
-- **Roots.** Every release's tree, yanked included, and every checkpoint are roots: a store keeps their closures.
+  release, yanked or not (a reader MAY warn). The variant is then looked up in that release's tree. Without an
+  explicit variant, exactly one variant is selected automatically; zero gives no variant and more than one
+  requires an explicit choice. The unnamed variant has no implicit priority over other variants.
+- **Roots.** Every release's tree, yanked included, and every checkpoint are referenced roots of this repo document.
+  Keeping a complete copy of the repo requires keeping their closures. Local cache eviction policy is not part
+  of the document format.
 - Repo names are case-insensitive: `Acme/SDXL` and `acme/sdxl` are one repo. Keys and paths use the name with ASCII
   `A`–`Z` lowered (`refs/acme/sdxl.json`); the document's `name` keeps the writer's spelling.
 - A **store** or **static origin** is a directory, bucket or HTTP prefix holding `refs/<org>/<name>.json` and
@@ -580,14 +614,25 @@ A copy is complete when its whole closure is present. A reader that needs only s
 chunks their locations touch and their assets; one that needs one variant MAY fetch only the tree, its repo files and
 that variant's closure.
 
+Closure follows only these defined reference slots. Object contents and unknown extension fields are opaque;
+an object reference that merely appears inside metadata is not a dependency. Same-major extensions MUST put
+additional required dependencies in the existing chunk, asset or tree-file slots. They MUST NOT require an old
+reader, copier or collector to discover a new kind of reference edge.
+
 ## 8. Versioning
 
 - Minor versions add fields, trailing record elements, schemes and dtypes; their absence keeps the old meaning, and
-  readers of the same major read them.
+  readers of the same major read them. New fields must use the existing extension value domain (§9) and closure
+  rules (§7).
 - A new scheme or dtype is a minor change: every location carries its `length`, so an old reader reads the document,
   locates and verifies every byte, and refuses only a decode or typed view of the tensors that use it. A new param of
   an existing scheme is too: an old decoder refuses the tensors whose params it does not know (§6).
 - A change that alters the meaning of an existing field, scheme or param is a new major.
+
+These compatibility rules begin with the six-element header containing pipeline and component records defined
+here. Earlier provisional JSON and five-element CBOR layouts used the same historical `/1` tag but are not members
+of this specification. Their deliberate hard cut is an exception to the versioning rule, not a precedent for
+reinterpreting future same-major documents. Readers identify and refuse them as specified in §9.
 
 Minors: 1.1 adds `nvfp4`'s `pre_quant_scale` and a `scale_2` per matrix, and tiles each matrix of a stack on its own
 in `cublas_128x4` (before any stacked file was written); the schemes `fp8.blockwise`, `mxfp4`, `gguf.*`, `gptq.int2`,
@@ -608,7 +653,14 @@ have equal bytes and equal object refs. A reader MUST refuse:
 - a byte string anywhere but an object's SHA-256 (and later fields);
 - an integer outside [−2^63, 2^64).
 
-Decoding and re-encoding a header of this version reproduces its bytes. A header that fails to read and is a
+Unknown trailing fields use the existing value domain, with byte strings additionally permitted recursively.
+They do not make floats, `null`, tags or other new value types valid outside recognized config maps.
+
+Lossless decoding and re-encoding of the complete CBOR value reproduces its bytes. A typed reader may expose only
+recognized fields and discard extensions; reconstructing a header from that projection creates a new object.
+A copier that preserves object identity MUST retain the original bytes, including its format tag and extensions.
+
+A header that fails to read and is a
 **pre-cut** layout, the provisional JSON (first byte `{`) or a well-formed `cozytensors/1` root of exactly five
 elements (the layouts before the pipeline), MUST be refused as such ("pre-cut cozytensors header (old layout);
 re-import or migrate"): the tag is the same, so only the structure tells them apart.
@@ -642,12 +694,9 @@ shares unchanged large tensors between variants, and aligns every part for direc
 
 The chunk concatenation is not a safetensors file (padding); export rebuilds one.
 
-**Construction order of an import.** A writer that converts with a table takes the table's row order, which its
-generator took from the target model's `state_dict()`. A source already in the canonical layout (a Diffusers or
-Transformers folder) carries no order, since safetensors files sort their keys; a writer orders it by the reference
-of the class its `config.json` names (`_class_name`, or the first of `architectures`): that class's `state_dict()`
-order, generated on the meta device and checked in as data (`crates/tensorfs/orders/<class>.json`,
-`task -d crates/tensorfs orders`). It applies the reference structurally:
+**Construction order of an import.** A converter should obtain the target model's construction order from its
+producer or a reference for that model class. A container that stores keys alphabetically does not itself supply
+construction order. A reference can be applied structurally:
 
 - a key is a path of dot-separated segments; a segment made only of digits is an index;
 - children of one parent come in the order the reference gives children of the same parent pattern (indices written

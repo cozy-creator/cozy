@@ -52,8 +52,8 @@ defines the workloads. Download projections are separate from these measured tim
 
 ## Get started
 
-This branch implements the TensorFS 0.13 component API and hard-cut header/tree format. Python 3.12 or later is
-required. The wheel includes the Python module and `tfs`:
+The target TensorFS 0.13 interface uses the component API and hard-cut header/tree format. Python 3.12 or later is
+required; the current master implementation is still being integrated. The wheel includes the Python module and `tfs`:
 
 ```bash
 uv venv --python 3.12

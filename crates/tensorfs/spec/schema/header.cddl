@@ -30,7 +30,7 @@ component  = [name: tstr, class: tstr, config: config, tensors: [* tensor],
 ; Components, tensors and parts are in construction order and never sorted.
 
 config     = {* tstr => config-value}
-config-value = bool / int / tstr / float / null / [* config-value] / {* tstr => config-value}
+config-value = bool / bounded-int / tstr / float / null / [* config-value] / {* tstr => config-value}
 ; A config is parsed JSON: its floats are finite.
 
 tensor     = plain / encoded
@@ -43,9 +43,11 @@ part       = [role: tstr .size (1..), dtype, shape, location, * any]
 location   = [chunk: uint, offset: uint, length: uint, * any]
 ; chunk indexes chunks; offset is a multiple of 4096 and inside that chunk. A range longer
 ; than the rest of its chunk continues at offset 0 of the next chunks. For a known dtype,
-; length is the byte size of dtype and shape. A zero-length location is [0, 0, 0].
+; length is the byte size of dtype and shape. Writers emit [0, 0, 0] for zero length;
+; readers do not dereference a zero-length location.
 
 dtype      = tstr .size (1..)   ; a safetensors name (spec §5); another name is a newer dtype, read raw
 shape      = [* uint]
-value      = bool / int / tstr / [* value] / {* tstr => value}
+bounded-int = -9223372036854775808..18446744073709551615
+value      = bool / bounded-int / tstr / [* value] / {* tstr => value}
 any        = value / bstr / [* any] / {* tstr => any}

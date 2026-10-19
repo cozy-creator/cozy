@@ -8,7 +8,6 @@ Start with the [usage guide](README.md) for examples.
 - [Python: functions, objects, properties and errors](#python)
 - [Rust: client, checkpoints, writers and endpoints](#rust)
 - [Behavior and ownership](#behavior-and-ownership)
-- [Rust details still being finalized](#rust-details-still-being-finalized)
 
 ## Python
 
@@ -17,7 +16,11 @@ followed by every public object, its attributes/properties, methods and error ty
 Signatures include the context-manager, mapping and DLPack protocols where supported.
 `...` denotes an implementation body omitted from this reference.
 
-`TokenProvider` and `DLPack` describe accepted protocols; they do not require inheritance.
+`TokenProvider`, `RetryingTokenProvider` and `DLPack` below are protocol sketches for
+accepted objects, not additional package exports. They do not require inheritance.
+Only `headers` is required on a token provider; `retry` is optional. A CUDA DLPack
+producer must support the `stream=` argument; a CPU producer may expose no-argument
+`__dlpack__`. Ordinary inherited `object`/`Exception` methods are not repeated.
 `Buffer` means a Python buffer-protocol value. DLPack inputs support framework arrays
 without importing that framework into TensorFS.
 
@@ -27,24 +30,27 @@ from collections.abc import Buffer, Callable, ItemsView, Iterator, KeysView, Map
 from os import PathLike
 from types import TracebackType
 from typing import Any, Protocol, TypeVar, overload
-
 StrPath = str | PathLike[str]
-_T = TypeVar("_T")
+_T = TypeVar('_T')
 Token = str | DPoP | TokenProvider | Callable[[str, str, Mapping[str, str], str | None], Mapping[str, str]]
 __version__: str
-
 
 class TokenProvider(Protocol):
 
     def headers(self, method: str, url: str, headers: Mapping[str, str], payload: str | None) -> Mapping[str, str]:
         ...
 
+class RetryingTokenProvider(TokenProvider, Protocol):
+
     def retry(self, method: str, url: str, headers: Mapping[str, str], payload: str | None, status: int, response_headers: Mapping[str, str]) -> bool:
         ...
 
 class DLPack(Protocol):
 
-    def __dlpack__(self) -> object:
+    def __dlpack_device__(self) -> tuple[int, int]:
+        ...
+
+    def __dlpack__(self, stream: int | None=None) -> object:
         ...
 
 def configure(*, endpoint: str | None=None, cache_dir: StrPath | None=None, token: Token | None=None) -> None:
@@ -149,6 +155,9 @@ class Encoding:
     def __str__(self) -> str:
         ...
 
+    def __repr__(self) -> str:
+        ...
+
 class Info:
     """A tensor's logical dtype and shape, its encoding (None when plain), its parts."""
 
@@ -166,6 +175,9 @@ class Info:
 
     @property
     def parts(self) -> dict[str, Part]:
+        ...
+
+    def __repr__(self) -> str:
         ...
 
 class Array:
@@ -190,6 +202,9 @@ class Array:
         ...
 
     def __dlpack_device__(self) -> tuple[int, int]:
+        ...
+
+    def __repr__(self) -> str:
         ...
 
 class Encoded:
@@ -252,6 +267,9 @@ class Tensors(Mapping[str, Info]):
     def read_into(self, key: str, out: object, *, role: str | None=None, offset: int=0) -> None:
         """Fill a writable contiguous Buffer or DLPack array; a role selects stored part bytes."""
 
+    def __repr__(self) -> str:
+        ...
+
 class Pipeline:
     """What `model_index.json` held."""
 
@@ -295,6 +313,9 @@ class Component:
 
     @property
     def path(self) -> str:
+        ...
+
+    def __repr__(self) -> str:
         ...
 
 class Checkpoint:
@@ -465,103 +486,291 @@ and type declarations are separate from the checkpoint library surface above.
 
 ## Rust
 
-Use the Rust crate `tensorfs`. `Client` owns configuration and a session; checkpoints,
-components and arrays retain the access and byte lifetimes they need. Network operations
-are async on the caller's runtime. Rust reads explicitly follow `Checkpoint::fetch`;
-Python performs that fetch behind its synchronous read methods.
+The following is the concrete planned public interface. Its implementation is being integrated;
+these declarations are an API contract, not a claim that the current master has implemented them.
+Use the `tensorfs` Rust crate. Network operations are async on your runtime, followed by synchronous
+reads of fetched data. There is no hidden global Tokio runtime in the core client.
 
-The following is the approved planned interface, with the request-aware provider contract
-already implemented by the transport. Public `Client` integration is still in progress.
-The remaining option/writer details are listed explicitly below rather than implied to be
-implemented by a local-only wrapper.
+### Client, selection and checkpoint objects
+
+Names from the standard library (`Path`, `PathBuf`, `File`, `Read`, `Range`, `Arc`,
+`BTreeMap`, `FromStr`) retain their normal Rust meanings. `HeaderMap` is the HTTP response-header map.
+`Metadata` is `BTreeMap<String, Value>`; `format::Config` is structured JSON configuration.
 
 ```rust
-pub struct Ref { pub repo_id: String, pub revision: Option<String>, pub variant: Option<String>, pub endpoint: Option<String> }
-impl FromStr for Ref;                                        // the shorthand
-pub struct Config {                                          // locations and credentials only
-    pub endpoint: String, pub cache_dir: PathBuf, pub mirror: Option<PathBuf>,   // mirror: a datacenter volume
-    pub token: Option<Arc<dyn TokenProvider>>,               // a String converts into a bearer provider
+pub type Result<T> = std::result::Result<T, Failure>;
+pub struct Failure { pub kind: Kind, pub detail: String }
+pub enum Kind {
+    Invalid, Format, NotFound, Integrity, UnknownScheme, Decode,
+    Io, Full, Network, Denied, Unsupported, Conflict,
 }
-impl Config { pub fn from_env() -> Config }
-pub struct Request<'a> {
-    pub method: &'a str,
-    pub url: &'a str,
-    pub headers: &'a [(String, String)],
-    pub payload: Option<&'a str>, // SHA-256 of the request body, when known
+impl Kind { pub fn code(self) -> &'static str; }
+
+#[derive(Clone)]
+pub struct Config {
+    pub endpoint: String,
+    pub cache_dir: PathBuf,
+    pub mirror: Option<PathBuf>,
+    pub token: Option<Arc<dyn TokenProvider>>,
+    pub ca_der: Option<Vec<u8>>, // DER CA bytes, not base64 on the Rust API
 }
-#[async_trait] pub trait TokenProvider: Send + Sync {
-    async fn headers(&self, request: &Request<'_>) -> Result<Vec<(String, String)>>;
-    fn retry(&self, sent: &Request<'_>, status: u16, headers: &HeaderMap) -> Result<bool> { Ok(false) }
+impl Config { pub fn from_env() -> Config; }
+// Debug must redact provider/CA contents.
+
+pub struct Ref {
+    pub repo_id: String,
+    pub revision: Option<String>,
+    pub variant: Option<String>,
+    pub endpoint: Option<String>,
 }
-pub struct Client;                                           // a session (as hf-hub's Api), not a cache handle
+impl FromStr for Ref {
+    type Err = Failure;
+    fn from_str(value: &str) -> Result<Ref>;
+}
+// <org>/<name>[@revision[/variant]], and sha256:<64 lowercase hex>.
+// Client.open checks an existing folder/.cozytensors path before parsing a Ref.
+
+#[derive(Default)]
+pub struct Open {
+    pub revision: Option<String>,
+    pub variant: Option<String>,
+    pub endpoint: Option<String>,
+    pub local_files_only: bool,
+}
+pub type Progress<'a> = dyn Fn(u64, u64) -> Result<()> + Sync + 'a;
+pub type ConvertProgress<'a> = dyn Fn(&str, u64, u64) -> Result<()> + Sync + 'a;
+
+#[derive(Clone, Debug, Default)]
+pub enum Selection {
+    #[default] All,
+    Components(Vec<String>),
+    Tensors { component: String, keys: Vec<String> },
+    Part { component: String, key: String, role: Option<String>, range: Option<Range<u64>> },
+    Assets { component: String, names: Option<Vec<String>> },
+}
+#[derive(Default)]
+pub struct Fetch<'a> {
+    pub selection: Selection,
+    pub priority: u64,
+    pub progress: Option<&'a Progress<'a>>,
+    // Callback arguments: held bytes, total bytes. Error cancels this fetch.
+}
+pub struct Fetched { pub local: u64, pub volume: u64, pub origin: u64 }
+
+#[derive(Clone)]
+pub struct Client { /* private store/config */ }
 impl Client {
     pub fn new(config: Config) -> Result<Client>;
-    pub async fn open(&self, name_or_path: &str, opts: &Open) -> Result<Checkpoint>;   // Open { revision, variant, endpoint, local_files_only }
-    pub async fn snapshot_download(&self, r: &Ref, want: &Fetch<'_>) -> Result<PathBuf>;
-    pub async fn hub_download(&self, r: &Ref, filename: &str) -> Result<PathBuf>;
-    pub async fn upload_folder(&self, r: &Ref, folder: &Path, progress: Option<&Progress>) -> Result<ObjectRef>;
-    pub async fn convert(&self, sources: &[String], opts: &Convert<'_>) -> Result<Checkpoint>;
-    pub async fn resolve_source(&self, source: &str) -> Result<String>;
-    pub fn writer(&self, dest: Option<&Path>, base: Option<&Checkpoint>, resume: Option<&str>) -> Result<Writer>;
+    pub async fn open(&self, name_or_path: &str, options: &Open) -> Result<Checkpoint>;
+    pub async fn snapshot_download(
+        &self, reference: &Ref, want: &Fetch<'_>,
+        local_dir: Option<&Path>, local_files_only: bool,
+    ) -> Result<PathBuf>;
+    pub async fn hub_download(
+        &self, reference: &Ref, filename: &str,
+        local_dir: Option<&Path>, local_files_only: bool,
+    ) -> Result<PathBuf>;
+    pub async fn upload_folder(&self, reference: &Ref, folder: &Path,
+        progress: Option<&Progress<'_>>) -> Result<ObjectRef>;
 }
-pub fn export(ck: &Checkpoint, dir: &Path, format: Format, dequantize: Option<Dtype>) -> Result<Vec<String>>;
-impl Checkpoint {   // holds its bytes against eviction until dropped
-    pub fn id(&self) -> &ObjectRef;  pub fn named(&self) -> Option<&Ref>;
-    pub fn pipeline(&self) -> Option<&Pipeline>;
-    pub fn components(&self) -> &[Component];   pub fn component(&self, name: &str) -> Result<&Component>;
+// Python components= maps to Selection::Components. Asset selection does not fetch tensor chunks.
+
+#[derive(Clone)]
+pub struct Checkpoint { /* owned source, holds, metadata; no public Store */ }
+impl Checkpoint {
+    pub fn id(&self) -> &ObjectRef;
+    pub fn header(&self) -> &format::Header;
+    pub fn metadata(&self) -> &Metadata;
+    pub fn chunks(&self) -> &[ObjectRef];
+    pub fn tree(&self) -> Option<&ObjectRef>;
+    pub fn verify(&self) -> Result<Vec<ObjectRef>>;
+    pub fn view(&self) -> io::view::View;
+    pub fn named(&self) -> Option<&Ref>;
+    pub fn pipeline(&self) -> Option<&format::Pipeline>;
+    pub fn components(&self) -> &[Component];
+    pub fn component(&self, name: &str) -> Result<&Component>;
     pub fn chunk(&self, index: usize) -> Result<File>;
-    pub fn missing(&self, components: Option<&[String]>) -> Vec<ObjectRef>;
-    pub async fn fetch(&self, want: &Fetch<'_>) -> Result<Fetched>;             // Fetch { components, priority, progress }
+    pub fn missing(&self, selection: &Selection) -> Result<Vec<ObjectRef>>;
+    pub async fn fetch(&self, want: &Fetch<'_>) -> Result<Fetched>;
     pub fn folder(&self) -> Result<PathBuf>;
 }
-impl Component {    // name, class, config (format::Value), tensors, assets
-    pub fn read(&self, key: &str) -> Result<Vec<u8>>;                           // decoded
+// Synchronous chunk/read/asset/folder operations use bytes made available by fetch().
+// view() retains its source and availability state for the byte engine.
+
+#[derive(Clone)]
+pub struct Component { /* owns shared checkpoint source; immutable metadata view */ }
+impl Component {
+    pub fn name(&self) -> &str;
+    pub fn class(&self) -> &str;
+    pub fn config(&self) -> &format::Config;
+    pub fn config_file(&self) -> &str;
+    pub fn tensors(&self) -> &[format::Tensor];
+    pub fn assets(&self) -> &BTreeMap<String, ObjectRef>;
+    pub fn read(&self, key: &str) -> Result<Vec<u8>>;
     pub fn read_part_into(&self, key: &str, role: &str, offset: u64, buf: &mut [u8]) -> Result<()>;
     pub fn asset(&self, name: &str) -> Result<Vec<u8>>;
     pub fn folder(&self) -> Result<PathBuf>;
 }
-impl Writer {   // folder(dest, variant), pipeline(cls, config), component(name, cls, config) -> &mut ComponentWriter,
-                // set_metadata, commit(self) -> Checkpoint, abandon; ComponentWriter: put/Data, copy_as, asset, set_order, has
-}
-pub struct Endpoint;   // the xs-054 client, public for tools such as the CLI's release verbs
+// Tensors selects every part of each named key. Part selects the chunks overlapping
+// its stored byte range. Invalid names, roles and ranges return Failure.
+// A selected snapshot contains only the requested objects, even when others are cached.
+
+#[derive(Clone)]
+pub struct Endpoint { /* unchanged native endpoint/transport internally */ }
 impl Endpoint {
     pub fn new(url: &str, token: Option<Arc<dyn TokenProvider>>) -> Result<Endpoint>;
-    pub async fn repo(&self, repo_id: &str) -> Result<Option<(Repo, String)>>;  // (doc, ETag)
-    pub async fn update_repo(&self, repo_id: &str, f: impl FnMut(Option<Repo>) -> Result<Option<Repo>>) -> Result<Repo>;
-}   // Endpoint::new("local", …) is this machine's local/ repos; a None document removes one
+    pub fn with_config(url: &str, config: &Config) -> Result<Endpoint>;
+    pub async fn repo(&self, repo_id: &str) -> Result<Option<(Repo, String)>>;
+    pub async fn update_repo(
+        &self, repo_id: &str,
+        change: impl FnMut(Option<Repo>) -> Result<Option<Repo>>,
+    ) -> Result<Repo>;
+}
+// Endpoint("local") resolves default cache root; with_config supplies explicit
+// cache_dir/CA/provider. No callback changes a different repo or bypasses native CAS.
 ```
 
-### Supporting Rust types
+### Credentials and errors
 
-| Type | Planned contents / role |
+The public provider returns the same twelve-family `Failure` as other public operations.
+A private adapter preserves the existing transport implementation. `retry` is optional
+and defaults to `Ok(false)`; it permits a retry after a response such as a refreshed token
+or challenge. A provider receives the known body digest, not the body contents.
+
+```rust
+pub struct Request<'a> {
+    pub method: &'a str,
+    pub url: &'a str,
+    pub headers: &'a [(String, String)],
+    pub payload: Option<&'a str>, // known hex SHA256 of request body
+}
+#[async_trait]
+pub trait TokenProvider: Send + Sync {
+    async fn headers(&self, request: &Request<'_>) -> Result<Vec<(String, String)>>;
+    fn retry(&self, sent: &Request<'_>, status: u16, headers: &HeaderMap)
+        -> Result<bool> { Ok(false) }
+}
+pub fn bearer(token: impl Into<String>) -> Arc<dyn TokenProvider>;
+```
+
+### Conversion, writing and export
+
+`Writer::commit` is async for both local and remote writers. On a remote upload failure,
+`committed()` retains the strong local checkpoint. Successful commit returns the exact
+published tree through the checkpoint; it does not resolve a mutable reference again.
+
+```rust
+// Returning an error from the callback cancels conversion.
+#[derive(Default)]
+pub struct Convert<'a> {
+    pub converter: Option<&'a str>,
+    pub variant: Option<&'a str>,
+    pub progress: Option<&'a ConvertProgress<'a>>,
+}
+impl Client {
+    pub async fn convert(&self, sources: &[String], options: &Convert<'_>) -> Result<Checkpoint>;
+    pub async fn resolve_source(&self, source: &str) -> Result<String>;
+    pub fn writer(&self, options: WriterOptions<'_>) -> Result<Writer>;
+}
+#[derive(Default)]
+pub struct WriterOptions<'a> {
+    pub dest: Option<&'a Path>, pub variant: Option<&'a str>,
+    pub base: Option<&'a Checkpoint>, pub resume: Option<&'a str>,
+    pub repo_id: Option<&'a str>, pub endpoint: Option<&'a str>,
+    pub token: Option<Arc<dyn TokenProvider>>, pub ca_der: Option<&'a [u8]>,
+}
+pub struct Writer { /* owned local and optional remote write state */ }
+impl Writer {
+    pub fn pipeline(&mut self, class: &str, config: format::Config) -> Result<()>;
+    pub fn component(&mut self, name: &str, class: &str,
+        config: format::Config, config_file: Option<&str>) -> Result<ComponentWriter<'_>>;
+    pub fn set_metadata(&mut self, key: &str, value: Value) -> Result<()>;
+    pub fn has(&self, component: &str, key: &str) -> Result<bool>;
+    pub async fn commit(&mut self) -> Result<Checkpoint>;
+    pub fn committed(&self) -> Option<Checkpoint>; // local commit survives remote failure
+    pub fn abandon(self) -> Result<()>;
+}
+pub struct PartData<'a> {
+    pub role: String,
+    pub dtype: Dtype,
+    pub shape: Vec<u64>,
+    pub data: &'a mut dyn Read,
+}
+pub struct ComponentWriter<'a> { /* borrows the writer */ }
+impl ComponentWriter<'_> {
+    pub fn put(&mut self, key: &str, dtype: Dtype, shape: &[u64], data: &mut dyn Read) -> Result<()>;
+    pub fn put_encoded(&mut self, key: &str, dtype: Dtype, shape: &[u64],
+        encoding: Encoding, parts: Vec<PartData<'_>>) -> Result<()>;
+    pub fn copy(&mut self, key: &str, source: &Component, as_key: Option<&str>) -> Result<()>;
+    pub fn asset(&mut self, name: &str, data: &[u8]) -> Result<()>;
+    pub fn order(&mut self, keys: &[String]) -> Result<()>;
+    pub fn has(&self, key: &str) -> Result<bool>;
+}
+pub enum Format { Safetensors }
+pub fn export(checkpoint: &Checkpoint, dir: &Path, format: Format,
+    dequantize: Option<Dtype>) -> Result<Vec<String>>;
+```
+
+### Metadata and integration types
+
+| Type | Public meaning |
 |---|---|
-| `Open` | Optional revision, variant and endpoint; `local_files_only`. Default options use configured endpoint/cache and normal online resolution. |
-| `Fetch<'a>` | Optional component selection, priority and progress callback. |
-| `Convert<'a>` | Optional converter, variant, credentials and progress callback. |
-| `Progress` | Progress reporting for source resolution, fetching, conversion or publishing. |
-| `ObjectRef` | Immutable SHA-256 plus byte length. A header and a repository tree have distinct references. |
-| `Pipeline` | Class and configuration of the whole pipeline. |
-| `Component` | Name, class, configuration, tensors and assets; holds its checkpoint's access. |
-| `ComponentWriter` | Tensor/encoded-part writes, component reuse, assets, tensor order and presence checks. |
-| `Dtype`, `Encoding`, `Value`, `Format` | Tensor dtype, encoding description, structured configuration/metadata, and export format. |
-| `Result<T>` / error | Typed storage, format, integrity, encoding, network, authorization and conflict failures. |
+| `ObjectRef` | `{ sha256: String, length: u64 }`; `of(bytes)` hashes content, `id()` returns `sha256:…`, `key()` returns its blob key. |
+| `format::Header` | One variant's chunks, pipeline, components and loading metadata, as defined by the format spec. |
+| `format::Pipeline` | `{ class: String, config: format::Config }`. |
+| `format::Tensor` | Tensor key, logical dtype and shape, and its plain location or encoding/parts. |
+| `Encoding` | Scheme name plus complete parameters. |
+| `Dtype` | A supported dtype or a preserved unknown dtype name; byte interpretation follows the format spec. |
+| `Value` | The bounded-integer, boolean, string, list and string-map metadata domain below. |
+| `Repo` | Mutable repository document containing releases and unreleased trees; its schema is in the format spec. |
+| `io::view::View` | An owned source/availability handle passed to the existing byte engine and placement integration. |
 
-### Rust details still being finalized
-
-The method inventory above is the approved plan. These signatures must be completed by
-the public-client integration before this document can claim the Rust interface is final:
-
-- Exact `Open`, `Fetch`, `Convert` and progress/error type declarations and defaults.
-- Public writer/component-writer argument and result types, including variant/configuration,
-  plain and encoded input buffers, reuse, metadata and assets.
-- Streaming writer finalization: local commit, async remote finish, the exact published tree,
-  cancellation and retained local output after upload failure.
-- Advanced device/read-into and encoded-part Rust interfaces over the existing I/O engine.
-
-These are tracked API-design items, not additional public functions silently omitted here.
-The Rust owner is resolving them against the same engine and behaviors used by Python.
+The low-level byte engine and codec helpers used by in-tree integrations are separate from
+this application-facing session interface. They do not introduce another model cache,
+transport or copy loop.
 
 ## Behavior and ownership
+
+### Values and identities
+
+- Metadata and encoding parameters accept recursive booleans, integers in the signed-64
+  through unsigned-64 range, strings, lists and string-keyed maps. Floats, `None` and bytes
+  are refused there. Pipeline/component configuration is ordinary JSON and has a separate
+  value domain.
+- `header_ref` and `tree_ref` are `(bare_sha256_hex, byte_length)` pairs. `id` and `tree`
+  are `sha256:…` strings. `repo_id` aliases `name`; `revision` aliases `release`.
+- `Checkpoint.path` fetches/materializes the checkpoint. `Component.path` fetches that
+  component's assets and renders its configuration; it does not fetch its tensor weights.
+
+### Reads and writes
+
+- `read` returns CPU data. `read_all` accepts `cpu`, `cuda` and `cuda:N`. A plain tensor
+  still returns `Array` when `decode=False`; an encoded tensor returns `Encoded`.
+- `read_into` offsets and destination lengths are bytes. `role` selects stored part bytes;
+  otherwise encoded tensors decode. There is no conversion to the destination's dtype.
+- Missing mapping keys raise `KeyError`; `get` returns its supplied default. `Tensors`
+  supplies its mapping operations explicitly and is registered with `Mapping`.
+- `put` requires dtype and shape for a raw Buffer; DLPack inputs supply them and reject
+  contradictory explicit values. `copy(key, source, as_key=...)` reads source key `key`
+  and can rename the destination. `has` sees current/resumed writes, not untouched base tensors.
+- Python `Writer.commit` caches a successful result and re-raises its first commit failure.
+  A native failure after local commit carries `error.checkpoint`, also available as
+  `Writer.local_checkpoint`.
+
+### Endpoints and callbacks
+
+- `Endpoint.repo` returns `(document, ETag)` or `None`. `update_repo` can invoke its change
+  callback again after a conflict, so the callback must tolerate retries. Returning `None`
+  empties/removes the repository reference.
+- Progress callbacks receive `(stage, completed, total)`: fetch/download counts are bytes;
+  conversion counts are tensors. Ordinary Python callback exceptions can propagate.
+- In the currently frozen Python wrapper, `configure` changes only non-`None` arguments.
+  Its configured token is consulted by open/download/upload/Writer; convert, resolve_source
+  and explicitly constructed Endpoint use their own token/default-provider selection.
+  Uniform configuration and endpoint scoping are being reviewed during the session move;
+  do not assume a configured token applies to every external provider.
+
+### Lifetimes and publication
 
 - `open` reads metadata first. Python tensor reads fetch only required objects; explicit
   `fetch` can prefetch chosen components. Offline mode performs no network request.

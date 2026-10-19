@@ -17,6 +17,9 @@ B/blobs/<aa>/<bb>/<sha256>      an object: a tree, a cozytensors header, a chunk
 
 - `<org>/<name>` is the repo name with ASCII `A`–`Z` lowered; `<aa>` and `<bb>` are the first two pairs of the hex
   digest. A store's directory has the same layout, so a directory, bucket or static host serves it as it is.
+- URL construction percent-encodes each UTF-8 name segment separately after ASCII case folding; `/` remains
+  the separator. A name containing a space, `%`, `?` or `#` must not alter the URL structure
+  ([RFC 3986 §3.3](https://www.rfc-editor.org/rfc/rfc3986.html#section-3.3)).
 - The org `local` is reserved for a machine's own repos and is never served.
 
 ## 2. Reading
@@ -29,7 +32,10 @@ HEAD B/blobs/<aa>/<bb>/<hex>                                200 + Content-Length
 
 - A client walks repo → tree → its repo files and the chosen variant's header → that header's chunks and assets. It
   MUST check every object's length and SHA-256 before it admits it.
-- A server SHOULD send an `ETag` with a repo document and answer `304` to a matching `If-None-Match`.
+- A read-only server SHOULD send an `ETag` with a repo document and answer `304` to a matching `If-None-Match`.
+  A server that accepts repo updates MUST send a strong ETag on successful repo GET and PUT responses. Weak
+  validators cannot satisfy the strong comparison required by `If-Match`
+  ([RFC 9110 §13.1.1](https://www.rfc-editor.org/rfc/rfc9110.html#name-if-match)).
 - A server SHOULD honour one `bytes=a-b` range on a blob. A client MUST accept a `200` with the whole object instead.
 - A blob GET MAY redirect. The client repeats the request at `Location` with its `Range`, follows at most 5 hops, and
   MAY reuse the target for restarts until the redirect's `Cache-Control: max-age` ends. Plain `http` is allowed only
