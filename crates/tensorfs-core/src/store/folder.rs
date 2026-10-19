@@ -52,6 +52,7 @@ impl Store {
     /// (all when `None`), and those headers' objects this store holds, hard-linked when it can.
     /// Headers go last.
     pub fn snapshot(&self, tree: &ObjectRef, dir: &Path, variants: Option<&[String]>) -> Result<()> {
+        let _folder = self.cache_folder_guard(dir)?;
         let tree = self.tree(tree)?;
         let chunks = dir.join(CHUNKS_DIR);
         fs::create_dir_all(&chunks).map_err(fail("create", &chunks))?;
@@ -76,6 +77,7 @@ impl Store {
 
     /// `object` at `dest`, unless a file of its length is there.
     pub fn materialize(&self, object: &ObjectRef, dest: &Path) -> Result<()> {
+        let _folder = self.cache_folder_guard(dest)?;
         if fs::metadata(dest).is_ok_and(|m| m.len() == object.length) {
             return Ok(());
         }
