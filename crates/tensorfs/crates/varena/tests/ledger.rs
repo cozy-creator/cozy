@@ -8,7 +8,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use varena::ledger::{Admit, Facts, Ledger, RowFacts, State, ROWS};
 
@@ -17,6 +17,10 @@ const FD: RawFd = 9;
 const EVENTS: RawFd = 10;
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
+
+/// Held across each child's fork: until it execs, the child holds a copy of every row lock this
+/// process holds, so a row it drops meanwhile still reads live. `spawn` returns once it exec'd.
+static FORKING: RwLock<()> = RwLock::new(());
 
 struct Proc {
     child: Child,
@@ -43,7 +47,9 @@ impl Proc {
                 Ok(())
             });
         }
+        let forking = FORKING.read().unwrap_or_else(PoisonError::into_inner);
         let mut child = command.spawn().unwrap();
+        drop(forking);
         let (input, output) = (child.stdin.take().unwrap(), BufReader::new(child.stdout.take().unwrap()));
         Proc { child, input, output }
     }
@@ -718,6 +724,7 @@ fn only_a_sealed_varena_ledger_is_adopted() {
     assert!(Ledger::create(&"x".repeat(65), GIB).is_err());
 
     let (ledger, fd) = Ledger::create("GPU-full", GIB).unwrap();
+    let _no_fork = FORKING.write().unwrap_or_else(PoisonError::into_inner);
     let rows: Vec<_> = (0..ROWS).map(|i| ledger.claim(10 + i).unwrap()).collect();
     assert!(ledger.claim(9).is_err(), "every row is held");
     drop(rows);

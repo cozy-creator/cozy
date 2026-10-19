@@ -65,8 +65,11 @@ pub struct Stats {
 #[serde(default)]
 pub struct CallMemory {
     /// torch's high-water marks over the call: live tensors, and the segments reserved for them.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_allocated_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_reserved_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<Stats>,
 }
 
