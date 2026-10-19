@@ -356,6 +356,23 @@ impl Store {
         Ok(snapshots)
     }
 
+    fn cache_reap_empty(&self, path: &Path) -> Result<()> {
+        if !path
+            .try_exists()
+            .map_err(fail("stat cache fence target", path))?
+        {
+            if let Some(guard) = retention::try_directory(path)? {
+                if let Some((_, record)) = self.cache_entry(path) {
+                    if read::<FolderUse>(&record)?.is_some_and(|record| !record.owned) {
+                        self.remove_record(&record)?;
+                    }
+                }
+                retention::remove_directory_fence(path, &guard)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The collection gate excludes every new sidecar opener while the exclusive probe
     /// rejects live/inherited directory owners. Unmaterialized checkpoint views leave only
     /// this sidecar, which must not permanently consume an inode after the owner exits.
@@ -379,15 +396,34 @@ impl Store {
                     continue;
                 };
                 let path = parent.join(digest);
-                if !path
-                    .try_exists()
-                    .map_err(fail("stat cache fence target", &path))?
-                {
-                    if let Some(guard) = retention::try_directory(&path)? {
-                        retention::remove_directory_fence(&path, &guard)?;
+                self.cache_reap_empty(&path)?;
+            }
+        }
+        // A crash after sidecar removal must not strand a disposable classification inode.
+        let records = self.cache_state().join("snapshots");
+        match fs::read_dir(&records) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(fail("list cache folder records", &records))?;
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str().and_then(|name| name.strip_suffix(".json"))
+                    else {
+                        continue;
+                    };
+                    if read::<FolderUse>(&entry.path())?.is_some_and(|record| !record.owned) {
+                        for kind in ["snapshots", "views"] {
+                            if let Some(digest) = name
+                                .strip_prefix(&format!("{kind}-"))
+                                .filter(|digest| is_digest(digest))
+                            {
+                                self.cache_reap_empty(&self.root.join(kind).join(digest))?;
+                            }
+                        }
                     }
                 }
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(fail("list cache folder records", &records)(error)),
         }
         let trash = self.cache_state().join("pruned");
         match fs::read_dir(&trash) {
@@ -754,8 +790,8 @@ mod tests {
         fs::create_dir_all(&inactive).unwrap();
         fs::write(inactive.join("copy"), b"cache").unwrap();
         let owned = store.root.join("views").join(&tree.sha256);
-        drop(store.cache_directory(&owned).unwrap());
         store.cache_preserve_snapshot(&owned).unwrap();
+        drop(store.cache_directory(&owned).unwrap());
         fs::create_dir_all(&owned).unwrap();
         fs::write(owned.join("copy"), b"user").unwrap();
         let live_path = store.root.join("views").join(&header.sha256);
@@ -816,6 +852,7 @@ mod tests {
             .cache_maintain_with(0, now_secs() + 2 * SWEEP.as_secs(), &|| Ok(ample()))
             .unwrap();
         assert!(!sidecar.exists());
+        assert!(!store.cache_entry(&orphan).unwrap().1.exists());
     }
 
     #[test]
