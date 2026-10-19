@@ -69,6 +69,24 @@ pub fn open(root: &Path) -> io::Result<Arc<Store>> {
     })
 }
 
+/// A rental's store from before TensorFS 0.12's format cut (an older image's machine made it at
+/// boot): its models re-pull, so its contents go and a fresh store takes their place. A
+/// computer's machine keeps refusing one (`open`): its local models need the one-time migrate.
+pub fn drop_pre_cut(root: &Path) -> io::Result<()> {
+    if !root.join(PRE_CUT_CATALOG).exists() {
+        return Ok(());
+    }
+    tracing::warn!("{}: dropping a store from before the format cut; its models re-pull", root.display());
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
+        match path.is_dir() && !path.is_symlink() {
+            true => std::fs::remove_dir_all(&path)?,
+            false => std::fs::remove_file(&path)?,
+        }
+    }
+    Ok(())
+}
+
 /// The catalog at the root of a store from before TensorFS 0.12's format cut.
 const PRE_CUT_CATALOG: &str = "tensorfs.sqlite";
 
