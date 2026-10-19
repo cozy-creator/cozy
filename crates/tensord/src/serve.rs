@@ -234,7 +234,7 @@ pub fn version() -> io::Result<()> {
     let record = Version {
         name: "tensord",
         version: env!("CARGO_PKG_VERSION"),
-        commit: option_env!("TENSORD_COMMIT"),
+        commit: Some(cozy_proto::COMMIT),
         api: ["cozy.machine.v1"],
         capabilities,
     };

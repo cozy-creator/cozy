@@ -505,6 +505,12 @@ pub struct Rental {
 pub struct MachineStatus {
     pub worker_id: String,
     pub version: String,
+    /// The commit its `cozy` binary was built from.
+    #[serde(default)]
+    pub commit: String,
+    /// Its binary arrived by a dev update, not a release.
+    #[serde(default)]
+    pub dev: bool,
     pub platform: String,
     /// `booting`, `ready` or `releasing`.
     pub phase: String,

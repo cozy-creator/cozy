@@ -77,6 +77,11 @@ enum Verb {
         /// https://…/<wheel>#sha256=<hex>, which the machine fetches itself.
         #[arg(long, value_name = "FILE|URL")]
         tensorfs_wheel: Option<std::path::PathBuf>,
+        /// Run this dev `cozy` binary as the machine (dev-build `build=cozy`): a local file, or
+        /// https://…#sha256=<hex>. The machine checks it runs there before its accepted runs drain;
+        /// on `local` it becomes this computer's cozy, which `cozy update` returns to a release.
+        #[arg(long, value_name = "FILE|URL")]
+        tensord: Option<std::path::PathBuf>,
     },
     /// A machine's build toolchain, for cards no prebuilt kernel serves.
     Toolchain {
@@ -127,7 +132,8 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             name,
             runtime_wheel,
             tensorfs_wheel,
-        } => end::update(ctx, &name, runtime_wheel, tensorfs_wheel).await,
+            tensord,
+        } => end::update(ctx, &name, runtime_wheel, tensorfs_wheel, tensord).await,
         Verb::Toolchain {
             verb: ToolchainVerb::Install { on },
         } => end::toolchain(ctx, &on).await,

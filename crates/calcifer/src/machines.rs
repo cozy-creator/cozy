@@ -1029,6 +1029,8 @@ fn status(frame: &v1::StatusFrame, hubs: &Hubs) -> MachineStatus {
     MachineStatus {
         worker_id: frame.worker_id.clone(),
         version: frame.version.clone(),
+        commit: frame.commit.clone(),
+        dev: frame.dev,
         platform: frame.platform.clone(),
         phase: frame.phase.clone(),
         runtime: frame.runtime.clone(),
