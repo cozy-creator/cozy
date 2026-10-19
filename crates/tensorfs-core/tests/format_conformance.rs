@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde_json::Value as Json;
 use tensorfs_core::format::layout::{self, Item};
 use tensorfs_core::format::{
-    repo_key, Body, Component, Config, Dtype, Encoding, Error, Header, Location, Manifest,
-    ObjectRef, Part, Pipeline, Release, Repo, Tensor, HEADER_FORMAT, HEADER_PATH,
+    repo_key, Body, Component, Config, Dtype, Encoding, Error, Header, Location, ObjectRef, Part,
+    Pipeline, Release, Repo, Tensor, Tree, HEADER_FORMAT,
 };
 
 #[derive(Deserialize)]
@@ -93,9 +93,19 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
         files.insert(r.key(), bytes);
         r
     };
-    let mut lanes = BTreeMap::new();
+    // Each variant's header, by name; the tree of a set of them carries the LICENSE.
+    let mut variants: BTreeMap<String, ObjectRef> = BTreeMap::new();
+    let tree = |put: &mut dyn FnMut(Vec<u8>) -> ObjectRef, of: &[(&str, &ObjectRef)]| {
+        let mut t = Tree {
+            files: BTreeMap::from([("LICENSE".to_string(), put(LICENSE.to_vec()))]),
+        };
+        for (variant, header) in of {
+            t.set_variant(variant, (*header).clone());
+        }
+        put(t.to_json().unwrap())
+    };
 
-    // Lane "all": every case in file order (components by first appearance), laid out by the
+    // Variant "all": every case in file order (components by first appearance), laid out by the
     // chunk rule.
     let mut grouped: Vec<(&str, Vec<&Case>)> = Vec::new();
     for c in cases.iter().filter(|c| c.lane == "all") {
@@ -164,23 +174,16 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
         })
         .collect();
     let header = Header::new(chunks, None, components, Default::default()).unwrap();
-    let manifest = Manifest {
-        files: BTreeMap::from([
-            (HEADER_PATH.into(), put(header.to_cbor().unwrap())),
-            ("LICENSE".into(), put(LICENSE.to_vec())),
-        ]),
-        metadata: Default::default(),
-    };
-    lanes.insert("all".to_string(), put(manifest.to_json().unwrap()));
+    variants.insert("all".to_string(), put(header.to_cbor().unwrap()));
 
-    // Lane "spans" (core): one plain tensor at offset 4096 of chunk 0, continuing through
-    // chunk 2; release 2 swaps the lanes and is yanked, so unversioned lookups land on 1.
+    // Variant "spans" (core): one plain tensor at offset 4096 of chunk 0, continuing through
+    // chunk 2; release 2 swaps the variants and is yanked, so unversioned lookups land on 1.
     let Some(span) = cases.iter().find(|c| c.lane == "spans") else {
         let repo = Repo {
             name: repo_name(family),
             releases: vec![Release {
                 version: "1".into(),
-                lanes,
+                tree: tree(&mut put, &[("all", &variants["all"])]),
                 yanked: false,
                 revision: 0,
             }],
@@ -212,27 +215,21 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
         ..Default::default()
     };
     let header = Header::new(chunks, None, vec![component], Default::default()).unwrap();
-    let manifest = Manifest {
-        files: BTreeMap::from([(HEADER_PATH.into(), put(header.to_cbor().unwrap()))]),
-        metadata: Default::default(),
-    };
-    lanes.insert("spans".to_string(), put(manifest.to_json().unwrap()));
-
-    let swapped = BTreeMap::from([
-        ("all".to_string(), lanes["spans"].clone()),
-        ("spans".to_string(), lanes["all"].clone()),
-    ]);
-    let checkpoints = vec![lanes["spans"].clone()];
-    let release = |version: &str, lanes, yanked, revision| Release {
+    variants.insert("spans".to_string(), put(header.to_cbor().unwrap()));
+    let (all, spans) = (&variants["all"], &variants["spans"]);
+    let first = tree(&mut put, &[("all", all), ("spans", spans)]);
+    let swapped = tree(&mut put, &[("all", spans), ("spans", all)]);
+    let checkpoints = vec![tree(&mut put, &[("spans", spans)])];
+    let release = |version: &str, tree, yanked, revision| Release {
         version: version.into(),
-        lanes,
+        tree,
         yanked,
         revision,
     };
     let repo = Repo {
         name: repo_name(family),
         releases: vec![
-            release("1", lanes, false, 3),
+            release("1", first, false, 3),
             release("2", swapped, true, 0),
         ],
         checkpoints,
@@ -305,19 +302,19 @@ fn reader_decodes_every_case() {
         assert_eq!(repo_key(&name), format!("refs/conformance/{family}.json"));
         let repo = Repo::from_json(&fs::read(root.join(repo_key(&name))).unwrap()).unwrap();
         assert_eq!(repo.name, name);
+        let tree = |version| Tree::from_json(&blob(&root, &repo.release(version).unwrap().tree)).unwrap();
         if family == "core" {
             assert_eq!(repo.release(None).unwrap().version, "1", "release 2 is yanked");
             assert_eq!(
-                repo.lane(Some("2"), "all"),
-                repo.lane(None, "spans"),
+                tree(Some("2")).header("all"),
+                tree(None).header("spans"),
                 "an explicit version still resolves"
             );
-            assert_eq!(repo.roots().count(), 5);
+            assert_eq!(repo.roots().count(), 3);
         }
         for c in cases {
-            let manifest =
-                Manifest::from_json(&blob(&root, repo.lane(None, &c.lane).unwrap())).unwrap();
-            let header = Header::from_cbor(&blob(&root, manifest.header().unwrap())).unwrap();
+            let latest = tree(None);
+            let header = Header::from_cbor(&blob(&root, latest.variant(Some(&c.lane)).unwrap().1)).unwrap();
             let got = header.read(&c.component, &c.key, |i| {
                 Ok::<_, Error>(blob(&root, &header.chunks[i]))
             });
@@ -469,7 +466,7 @@ fn green_documents_read_and_red_documents_refuse() {
                     got.map(drop)
                 }
                 "header" => Header::from_cbor(&bytes).map(drop),
-                "manifest" => Manifest::from_json(&bytes).map(drop),
+                "tree" => Tree::from_json(&bytes).map(drop),
                 "repo" => Repo::from_json(&bytes).map(drop),
                 other => panic!("{name}: unknown kind {other}"),
             };
