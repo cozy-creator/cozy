@@ -1,4 +1,4 @@
-# tensorfs.plane — Python API (v3.5, 2026-10-02)
+# tensorfs.plane — Python API
 
 The weight plane supplies memory and transfer mechanisms in the process that calls it.
 In Cozy, TensorD coordinates machine-wide memory policy and makes model weights available
@@ -13,7 +13,6 @@ sides, with no separate daemon. The Python facade ships in the `tensorfs` wheel
 (`from tensorfs import plane`). It accepts explicit `Store`/`ReadLease` access for standalone
 or owner-side use; managed Runtime uses supplied buffers and verified object descriptors.
 Both paths use `ReadPlan` to describe the serialized weight bytes and their layout.
-Changes to this file are announced in its changelog below.
 
 ## Units
 
@@ -336,55 +335,3 @@ ws.digest                               # the layout identity both sides must sh
 - A write through a read-only mapping is an illegal address in the writer's context only.
 - Exporting is not proof of completion to anyone else: export only after the fill (the plane
   exports only Ready regions); the keeper of the fds decides who may attach.
-
-## Changelog
-
-- 2026-10-08 documentation clarification: distinguish stored bytes, prepared CPU buffers
-  and GPU tensors; describe TensorD's machine policy/retention and Runtime's model/device
-  operations. API version, public names and behavior are unchanged.
-- v3.5 2026-10-02: device memory across processes: `device_sharing`, `export_device`,
-  `attach_device`, `ws.digest`, `shared_bytes` in device and set stats, events `exported`,
-  `attached`, `detached`.
-
-- v3.4 2026-10-02: the mapped device copy of v3.3 is removed; a device fill is again pinned
-  tier, else after a filling tier, else staging. In real first loads it never acted at full
-  CPU (the tier was ready first) and was slower where it did (L4 held to 4 CPUs, warm cache:
-  SDXL load to denoise 6.44 s -> 7.54 s, Anima 5.54 s -> 8.31 s): the pinned fill copied the
-  same bytes beside it. `mapped_copy_bytes`, `mapped_copy_ns` and `map_refused` stay in
-  `stats()` and read 0. Kept from v3.3: the page-cache query that answers on overlayfs and
-  where seccomp refuses `cachestat` (a pinned fill there copies cached bytes instead of
-  re-reading them), and `stats()["host"]["disk_read_bytes"]`.
-
-- v3.3 2026-10-02: `stats()["host"]["disk_read_bytes"]` exists. The plane has counted it
-  since v3.1 and this file listed it, but the Python facade never carried it: a caller read 0
-  whatever the disk did, so a "nothing read from disk" check on it could not fail. (v3.3 also
-  added a device copy from page-cache mappings; v3.4 removed it.)
-
-- v3.2 2026-10-02 (W3: fd and thread growth per weight set): a plane collected unclosed or
-  poisoned is torn down at its last handle (threads, device memory, pinned memfds) once its
-  devices are synchronized; before, its reader threads stayed and a poisoned plane kept its
-  memfds for the life of the process.
-
-- v3.1 2026-10-02 (Xid 31; W3 run 2675): a failed copy is reported only after its stream drained;
-  an undrainable one poisons; a poisoned plane never unmaps (close raises `Poisoned`).
-  `verify_bytes()` after release raises `Invalid`. Pinned-tier claims: close and eviction punch
-  RAM no other process claims, `register(host_fd=)` claims what the memfd already holds,
-  `plane.hold_tier` / `plane.release_tier` for the Worker. The state page gains region extents
-  (`TFSPLN02`).
-
-- v3 2026-09-30 (proving-cpu.md: fine regions, spread sets): streaming uses a byte ring
-  instead of fixed slots. `stream(..., ring_bytes=None)`; `cur.ring_ptr`, `cur.ring_nbytes`,
-  `cur.ring_view()` replace `slot_ptrs`, `slot_nbytes`, `slot_view(i)`; `lease.ring_offset`
-  replaces `lease.slot`.
-- v2.1 2026-09-30 (from proving-cpu.md): `BelowFloor` (a request above the whole budget);
-  a dropped cursor with live leases closes itself when they are released.
-- v2 2026-09-30 (W3 requests R2–R19):
-  - `p.source(store, lease)` + `register(name, source, plan, regions, host_fd=None)`: one lease
-    per manifest.
-  - `regions` accept exact part names.
-  - `acquire(..., priority=None)`; `p.prioritise(...)`.
-  - `stream(repeat=0)` cycles until close; `cur.passes`.
-  - Cursor departures skip ahead or demand-fill; `ScheduleMismatch` is gone.
-  - `lease.view()`; per-region GPU compute/stall ns in `stats()["regions"]`; `skipped` in
-    stages; per-set evictions; plane-wide poison latch.
-- v1 2026-09-30: first surface.

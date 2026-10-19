@@ -143,6 +143,7 @@ part order is construction order and contributes to identity. Small parts are pa
 alignment; large parts keep independent chunks, normally up to 64 MiB. The specification separates
 required reader behavior from this writer policy. Export reconstructs safetensors files from chunks.
 
+The [source-header fixtures](vectors/) pin import provenance and geometry without model payloads.
 The Rust `tensorfs-core` crate contains the format and reference decoders; its `store` feature adds
 storage and I/O. `tensorfs-py` supplies Python bindings, and `varena` supplies memory mechanisms.
 The [conformance corpus](conformance/) checks the format independently of those APIs.
