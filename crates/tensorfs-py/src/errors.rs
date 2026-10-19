@@ -3,7 +3,6 @@
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::create_exception;
-use tensorfs_core::err::Refusal;
 use tensorfs_core::failure::{Failure, Kind};
 
 create_exception!(
@@ -49,21 +48,6 @@ pub(crate) fn raise(py: Python<'_>, f: Failure) -> PyErr {
     let _ = value.setattr("code", f.kind.code());
     let _ = value.setattr("detail", f.detail);
     err
-}
-
-
-pub fn to_py(py: Python<'_>, refusal: &Refusal) -> PyErr {
-    raise(py, refusal.clone().into())
-}
-
-pub trait IntoPy<T> {
-    fn or_refuse(self, py: Python<'_>) -> PyResult<T>;
-}
-
-impl<T> IntoPy<T> for Result<T, Refusal> {
-    fn or_refuse(self, py: Python<'_>) -> PyResult<T> {
-        self.map_err(|e| to_py(py, &e))
-    }
 }
 
 pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {

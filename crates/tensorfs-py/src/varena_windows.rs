@@ -70,6 +70,8 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hold_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(reserve, &m)?)?;
+    #[cfg(feature = "store")]
+    m.add_function(wrap_pyfunction!(crate::store::regions, &m)?)?;
     m.add("SEALED_WHILE_FILLING", false)?;
     m.add("SEALED_HOLES", false)?;
     macro_rules! add_errors {

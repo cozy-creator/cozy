@@ -1,5 +1,6 @@
 """The public component API against real local stores and folders."""
 
+import importlib.util
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,8 +8,13 @@ from tempfile import TemporaryDirectory
 import numpy as np
 
 import tensorfs
+from tensorfs import _ext, varena
 
 assert not hasattr(tensorfs, "Store"), "the cache implementation leaked into the public API"
+for obsolete in ("Closure", "ReadPlan", "parse_header", "plan", "regions"):
+    assert not hasattr(tensorfs, obsolete) and not hasattr(_ext, obsolete), obsolete
+assert importlib.util.find_spec("tensorfs.records") is None, "the legacy projection remains importable"
+assert varena.regions is _ext.varena.regions
 
 with TemporaryDirectory() as temp:
     root = Path(temp)
@@ -53,6 +59,8 @@ with TemporaryDirectory() as temp:
     assert metadata.id == ck.id and metadata.tree == remote_tree
     assert metadata.header_ref[1] == (root / "folder/model.f32.cozytensors").stat().st_size
     assert metadata.missing(), "opening metadata fetched the closure"
+    assert varena.regions(metadata, only=["model/weight"]) == [["model/weight"]]
+    assert metadata.missing(), "region planning fetched payload bytes"
     assert (Path(metadata.components["model"].path) / "tokenizer.json").read_bytes() == b"{}"
     assert metadata.missing(["model"]), "rendering a component path fetched its tensors"
     only = tensorfs.snapshot_download("acme/example", revision="1", variant="f32", components=["model"], endpoint=origin, cache_dir=remote_cache)

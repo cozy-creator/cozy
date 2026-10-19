@@ -27,6 +27,7 @@ from .._ext.varena import (
     copies,
     hold_tier,
     release_tier,
+    regions,
     seal,
 )
 from .._ext.varena import Admit, Ledger, LedgerError, Row, RowFacts, Victim
@@ -52,6 +53,7 @@ __all__ = [
     "copies",
     "hold_tier",
     "release_tier",
+    "regions",
     "seal",
 ]
 __all__ += ["Admit", "Ledger", "LedgerError", "Row", "RowFacts", "Victim"]

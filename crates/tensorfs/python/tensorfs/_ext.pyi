@@ -5,9 +5,6 @@ from os import PathLike
 from types import ModuleType
 from typing import Any, Protocol, TypeVar, overload
 
-from .records import Header as HeaderRecord
-from .records import ReadItem
-
 __version__: str
 STORE_FORMAT: int
 CLAIM_PROTOCOL: int
@@ -19,8 +16,6 @@ def _kernel_binary(family: int, core: str, dtype: str) -> tuple[bytes, str, int,
 varena: ModuleType
 
 StrPath = str | PathLike[str]
-#: `org/name[@release]`, `sha256:<hex>` of a tree or a header, or a stored `Checkpoint`.
-Ref = str | Checkpoint
 _T = TypeVar("_T")
 
 class Error(Exception):
@@ -280,6 +275,9 @@ class Writer:
     def commit(self) -> Checkpoint: ...
     def abandon(self) -> None: ...
 
+#: `org/name[@release]`, `sha256:<hex>` of a tree or a header, or a stored `Checkpoint`.
+Ref = str | Checkpoint
+
 class Store:
     def __init__(self, root: StrPath) -> None:
         """The store at `root` (`~` expands), created when absent."""
@@ -354,46 +352,3 @@ class Endpoint:
     def __init__(self, url: str, token: Any = None, *, ca_der: bytes | None = None) -> None: ...
     def repo(self, repo_id: str) -> tuple[dict[str, Any], str] | None: ...
     def update_repo(self, repo_id: str, change: Any) -> dict[str, Any]: ...
-
-def regions(
-    ck: Checkpoint,
-    max_bytes: int = ...,
-    boundaries: Sequence[str] | None = None,
-    only: Sequence[str] | None = None,
-) -> list[list[str]]:
-    """`<component>/<key>` regions: chunk-sharing tensors together, up to `max_bytes` each, never
-    across a `<component>/<key prefix>` boundary (a block) unless a shared chunk does. `only`
-    (blocks or tensors, in the same form) limits the work and the result to those tensors and
-    the ones sharing a chunk with them."""
-
-# ------------------------------------------------------------------------- the CBOR header
-
-class Closure:
-    """Encoding specs a CBOR header's tensors may cite, by digest."""
-
-    def __init__(self) -> None: ...
-    def insert(self, data: bytes) -> str: ...
-    def digests(self) -> list[str]: ...
-    def __len__(self) -> int: ...
-
-def parse_header(data: bytes, closure: Closure | None = None) -> HeaderRecord:
-    """A CBOR header's plain-data projection; failures are `tensorfs.Error` families."""
-
-class ReadPlan:
-    """A CBOR header's read plan, what `tensorfs.varena` registers from until it
-    registers checkpoints."""
-
-    def select(self, whats: Sequence[str]) -> ReadPlan: ...
-    @property
-    def bytes(self) -> int: ...
-    @property
-    def order(self) -> str: ...
-    def items(self) -> list[ReadItem]: ...
-    def __len__(self) -> int: ...
-
-def plan(
-    header: bytes,
-    traversal: Sequence[tuple[str, str]],
-    components: Sequence[str] | None = None,
-    window: int = ...,
-) -> ReadPlan: ...
