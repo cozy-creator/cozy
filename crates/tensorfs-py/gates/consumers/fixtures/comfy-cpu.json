@@ -1,0 +1,59 @@
+{
+  "run": 39330107744,
+  "status": "success",
+  "url": "https://github.com/cozy-creator/cozy-creator/actions/runs/39330107744",
+  "script_source": "868c4e9635c2e522ba80077307be3b8054791584",
+  "native_source": "f0601a0d5323cd4ed3da829072ab9d6ca61d7748",
+  "wheel_run": 39325643543,
+  "comfy_source": "35f6d4f8bdefe6eea17bfc4631bba8c7f5a66360",
+  "previous_run": 39329809825,
+  "previous_failure": "upstream comfy-kitchen omitted packaging import dependency, now explicit in hosted setup",
+  "parent_native_run_overall": "failure: separate fd fixture; exact wheel built and other independent CPU subsets passed",
+  "evidence": {
+    "assigned_without_copy": true,
+    "bytes": 2893456,
+    "comfy_aimdo": "0.5.6",
+    "comfy_kitchen": "0.2.39",
+    "comfy_repo": "https://github.com/Comfy-Org/ComfyUI",
+    "comfy_source": "35f6d4f8bdefe6eea17bfc4631bba8c7f5a66360",
+    "device": "cpu",
+    "device_info": {
+      "type": "cpu"
+    },
+    "gpu_origin_writer": false,
+    "header": "sha256:a91ed906cd1927fba3627ff2a3ea1f2c45aa39dbe1f987ad68c5e8246cae3b2d",
+    "max_abs_error": 0.0,
+    "model_class": "comfy.ldm.modules.diffusionmodules.openaimodel.UNetModel",
+    "native_source": "f0601a0d5323cd4ed3da829072ab9d6ca61d7748",
+    "operations": "comfy.ops.manual_cast",
+    "output_shape": [
+      1,
+      4,
+      8,
+      8
+    ],
+    "producer_released_before_forward": true,
+    "proof": "public-tensorfs-comfy-unet-cpu",
+    "reference_computed_before_write": true,
+    "scope": "tiny real Comfy model/library forward; no graph/GUI/visual qualification",
+    "script_sha256": "7b0c10a859d553674cd55a3259999a92bd8476982bb979e494060b70068b6dfb",
+    "survives_checkpoint_close": true,
+    "tensorfs": "0.11.0",
+    "tensors": 130,
+    "timing_scope": "one acceptance run; wall clock synchronized on the selected device",
+    "timings_ms": {
+      "dlpack_assign_verify": 177.8025870000306,
+      "open": 0.3227260000358001,
+      "producer_init": 7.656220000001213,
+      "read_all": 1.8206039999881796,
+      "reference_forward": 4.705241999999998,
+      "restored_forward": 4.721245999974144,
+      "writer": 1455.3004950000172
+    },
+    "torch": "2.14.0+cpu",
+    "torch_cuda": null,
+    "wheel_name": "tensorfs-0.11.0-cp312-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "wheel_sha256": "569f8df74781f9c46ca6dc831c0f39bd3954c73e9134ca3c7f57c9287b9054cf"
+  },
+  "qualification": "tiny real upstream Comfy model/library forward on CPU; not ComfyUI graph/server/sampler/GUI/visual or GPU qualification"
+}

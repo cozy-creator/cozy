@@ -2,10 +2,11 @@
 //! packed along K in `I32` words, a zero and a scale per group of inputs, each input's group in
 //! `g_idx`.
 
-use super::affine::{dequant, Codes, Fill, Offset, Order, Packing};
+use super::affine::{Codes, Fill, Order, Packing};
 use super::grid::{Grid, ScaleLayout};
-use super::{Allowed, Ctx, Dtypes, Param, Part, Scheme, Shape, View};
-use crate::format::{Result, Value};
+use super::plan::{self, Elems, Term};
+use super::{Allowed, Ctx, Dtypes, Param, Part, Plan, Scheme, Shape, View};
+use crate::format::{Dtype, Result, Value};
 
 pub const INT2: Scheme = scheme("gptq.int2");
 pub const INT3: Scheme = scheme("gptq.int3");
@@ -80,7 +81,7 @@ pub fn groups(c: &Ctx) -> usize {
     c.cols.div_ceil(group(c))
 }
 
-fn blocks<'a>(c: &Ctx, index: Option<&'a [u32]>) -> Grid<'a> {
+fn blocks(c: &Ctx, index: Option<Vec<u32>>) -> Grid {
     Grid::Blocks {
         size: group(c),
         layout: ScaleLayout::Transposed,
@@ -119,18 +120,25 @@ pub fn ints(b: &[u8]) -> Vec<i32> {
         .collect()
 }
 
+/// Zero codes as `U8` elements of a plan.
+pub fn zeros(z: Vec<i32>) -> Elems<'static> {
+    Elems {
+        dtype: Dtype::U8,
+        bytes: z.into_iter().map(|z| z as u8).collect::<Vec<u8>>().into(),
+    }
+}
+
 /// `(q − z) × s(i, g_idx[j])`, `z` the stored zero plus `zero_offset`, modulo `2^b`.
-fn decode(c: &Ctx) -> Result<Vec<f32>> {
+fn decode<'a>(c: &Ctx<'a>) -> Result<Plan<'a>> {
     let (b, g, w) = (bits(c), group(c), groups(c));
-    let q = qweight(b).unpack(c.part("qweight").bytes, c.rows, c.cols)?;
     let mask = (1 << b) - 1;
     let offset = c.uint("zero_offset") as i32;
-    let z: Vec<f32> = (qzeros(b)
+    let z: Vec<i32> = (qzeros(b)
         .unpack(c.part("qzeros").bytes, w, c.rows)?
         .into_iter())
-    .map(|r| ((r + offset) & mask) as f32)
+    .map(|r| (r + offset) & mask)
     .collect();
-    if c.flag("symmetric") && z.iter().any(|z| *z != (1 << (b - 1)) as f32) {
+    if c.flag("symmetric") && z.iter().any(|z| *z != 1 << (b - 1)) {
         return Err(c.fail(format!("symmetric, and a zero is not {}", 1 << (b - 1))));
     }
     let g_idx: Vec<u32> = ints(c.part("g_idx").bytes)
@@ -140,8 +148,12 @@ fn decode(c: &Ctx) -> Result<Vec<f32>> {
     if !c.flag("act_order") && (g_idx.iter().enumerate()).any(|(j, v)| *v as usize != j / g) {
         return Err(c.fail("act_order is false, and g_idx is not each column's ⌊j/g⌋"));
     }
-    let grid = blocks(c, Some(&g_idx));
+    let grid = blocks(c, Some(g_idx));
     grid.check(c)?;
-    let s = c.floats("scales");
-    Ok(dequant(&q, &s, Offset::Zero(&z), &grid, c.rows, c.cols))
+    let weight = c.part("qweight").bytes;
+    Ok(plan::Codes {
+        term: Term::Zero(zeros(z)),
+        ..plan::Codes::new(weight, qweight(b), c.part("scales"), grid)
+    }
+    .into())
 }

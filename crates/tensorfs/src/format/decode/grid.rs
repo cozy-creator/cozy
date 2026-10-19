@@ -32,8 +32,8 @@ impl ScaleLayout {
 }
 
 /// Where element `(i, j)` finds its scale `s(i, j)`.
-#[derive(Debug, Clone, Copy)]
-pub enum Grid<'a> {
+#[derive(Debug, Clone)]
+pub enum Grid {
     /// One for the tensor.
     Tensor,
     /// `s[i]`.
@@ -45,18 +45,14 @@ pub enum Grid<'a> {
     Blocks {
         size: usize,
         layout: ScaleLayout,
-        index: Option<&'a [u32]>,
+        index: Option<Vec<u32>>,
     },
-    /// Tiles of `rows × cols` over each matrix of `height` rows (the logical shape's second-last
+    /// Tiles of `rows × cols` over each matrix (`height` rows, the logical shape's second-last
     /// extent), stored `[lead…, ⌈height/rows⌉, ⌈C/cols⌉]`; edge tiles may be short.
-    Tiles {
-        rows: usize,
-        cols: usize,
-        height: usize,
-    },
+    Tiles { rows: usize, cols: usize },
 }
 
-impl Grid<'_> {
+impl Grid {
     /// The stored shape of a part on this grid for the context's view.
     pub fn shape(&self, c: &Ctx) -> Result<Shape> {
         Ok(match *self {
@@ -74,17 +70,19 @@ impl Grid<'_> {
                     }
                 })
             }
-            Grid::Tiles { rows, cols, height } => {
-                let (lead, c) = (&c.shape[..c.shape.len() - 2], c.shape[c.shape.len() - 1]);
-                let tiles = [height.div_ceil(rows) as u64, c.div_ceil(cols as u64)];
+            Grid::Tiles { rows, cols } => {
+                let (lead, n) = c.shape.split_at(c.shape.len() - 2);
+                let tiles = [n[0].div_ceil(rows as u64), n[1].div_ceil(cols as u64)];
                 Shape::Exact([lead, &tiles].concat())
             }
         })
     }
 
-    /// The index of `s(i, j)` in the stored part, for a view of `cols` columns and `rows` rows.
-    pub fn at(&self, rows: usize, cols: usize, i: usize, j: usize) -> usize {
-        match *self {
+    /// The index of `s(i, j)` in the stored part, for a view of `rows × cols` whose matrices have
+    /// `height` rows each (`cublas_128x4` and tiles restart with each matrix).
+    pub fn at(&self, rows: usize, cols: usize, height: usize, i: usize, j: usize) -> usize {
+        let (m, r) = (i / height, i % height);
+        match self {
             Grid::Tensor => 0,
             Grid::Row => i,
             Grid::Col => j,
@@ -93,24 +91,20 @@ impl Grid<'_> {
                 layout,
                 index,
             } => {
-                let w = cols.div_ceil(size);
-                let b = index.map_or(j / size, |g| g[j] as usize);
+                let w = cols.div_ceil(*size);
+                let b = index.as_ref().map_or(j / size, |g| g[j] as usize);
                 match layout {
                     ScaleLayout::RowMajor => i * w + b,
                     ScaleLayout::Transposed => b * rows + i,
                     ScaleLayout::Cublas128x4 => {
-                        let tile = (i / 128) * w.div_ceil(4) + b / 4;
-                        tile * 512 + (i % 32) * 16 + (i % 128 / 32) * 4 + b % 4
+                        let matrix = height.div_ceil(128) * 128 * w.div_ceil(4) * 4;
+                        let tile = (r / 128) * w.div_ceil(4) + b / 4;
+                        m * matrix + tile * 512 + (r % 32) * 16 + (r % 128 / 32) * 4 + b % 4
                     }
                 }
             }
-            Grid::Tiles {
-                rows: br,
-                cols: bc,
-                height,
-            } => {
-                let (matrix, r) = (i / height, i % height);
-                (matrix * height.div_ceil(br) + r / br) * cols.div_ceil(bc) + j / bc
+            Grid::Tiles { rows: br, cols: bc } => {
+                (m * height.div_ceil(*br) + r / br) * cols.div_ceil(*bc) + j / bc
             }
         }
     }
@@ -148,27 +142,25 @@ mod tests {
         let mut seen = vec![false; 256 * 12];
         for i in 0..rows {
             for b in 0..w {
-                let at = g.at(rows, w, i, b);
+                let at = g.at(rows, w, rows, i, b);
                 assert!(!seen[at], "{i} {b}");
                 seen[at] = true;
             }
         }
         // Row 33, block 5: tile 1, then (33 mod 32)·16 + ⌊33/32⌋·4 + 5 mod 4.
-        assert_eq!(g.at(rows, w, 33, 5), 512 + 16 + 4 + 1);
+        assert_eq!(g.at(rows, w, rows, 33, 5), 512 + 16 + 4 + 1);
         let t = Grid::Blocks {
             size: 4,
             layout: ScaleLayout::Transposed,
-            index: Some(&[1, 0, 1, 0, 1, 0, 1, 0]),
+            index: Some(vec![1, 0, 1, 0, 1, 0, 1, 0]),
         };
-        assert_eq!(t.at(3, 8, 2, 0), 3 + 2);
-        assert_eq!(t.at(3, 8, 2, 1), 2);
+        assert_eq!(t.at(3, 8, 3, 2, 0), 3 + 2);
+        assert_eq!(t.at(3, 8, 3, 2, 1), 2);
         // Two matrices of 3 rows × 5 in 2×2 tiles: [2, 2, 3] scales; row 4 is matrix 1's row 1.
-        let tiles = Grid::Tiles {
-            rows: 2,
-            cols: 2,
-            height: 3,
-        };
-        assert_eq!(tiles.at(6, 5, 4, 4), 2 * 3 + 2);
-        assert_eq!(tiles.at(6, 5, 2, 1), 3);
+        let tiles = Grid::Tiles { rows: 2, cols: 2 };
+        assert_eq!(tiles.at(6, 5, 3, 4, 4), 2 * 3 + 2);
+        assert_eq!(tiles.at(6, 5, 3, 2, 1), 3);
+        // A stack restarts the cuBLAS tiles: matrix 1's row 0 starts after 128 × 12 slots.
+        assert_eq!(g.at(2 * rows, w, rows, rows, 0), 256 * 12);
     }
 }

@@ -106,8 +106,8 @@ fn import(store: &Store, source: &Path) -> tensorfs::err::Result<Checkpoint> {
         progress: &|_, _, _| {},
         stop: None,
     };
-    let manifest = store.import(&req, None)?;
-    Ok(store.checkpoint(&manifest).unwrap())
+    let (header, _) = store.import(&req, None)?;
+    Ok(store.checkpoint(&header).unwrap())
 }
 
 fn bf16s(bytes: &[u8]) -> Vec<u16> {

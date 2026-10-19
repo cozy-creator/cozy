@@ -9,10 +9,11 @@ import struct
 from pathlib import Path
 
 import msgspec
+import tensorfs
 
 from cozy_runtime.author import (App, Context, FileAsset, ImageAsset, ImageFrame, ModelArtifact, Outputs, Telemetry, WeightsOutput,
                                  invocable)
-from cozy_runtime.tensord_channels import Derivation
+from cozy_runtime.weights_store import Derivation
 
 app = App()
 
@@ -162,7 +163,16 @@ async def weigh(ctx: Context, *, payload: Weigh) -> Weighed:
     """A memoized consumer of a checkpoint another run wrote: counted each time it truly runs."""
     counter = Path(payload.counter)
     counter.write_text(str(int(counter.read_text()) + 1 if counter.exists() else 1))
-    return Weighed(payload.source.manifest.length)
+    checkpoint = tensorfs.open(payload.source.checkpoint)
+    try:
+        length = sum(
+            len(value.tobytes())
+            for component in checkpoint.components.values()
+            for value in component.tensors.read_all().values()
+        )
+        return Weighed(length)
+    finally:
+        checkpoint.close()
 
 
 app.entrypoint(weigh, accelerator=False)

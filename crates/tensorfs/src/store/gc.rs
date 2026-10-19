@@ -1,4 +1,4 @@
-//! GC: mark from refs and pins through manifests and headers to chunks and files, then sweep
+//! GC: mark from refs and pins through trees and headers to blobs, chunks and assets, then sweep
 //! what is unmarked and older than the grace. When to collect, and how much, is the caller's
 //! policy (TensorD: TTL, low-disk LRU).
 //!
@@ -12,10 +12,10 @@ use std::io::{self, Read};
 use std::time::{Duration, SystemTime};
 
 use super::{fail, fault, invalid, is_digest, now_secs, same_family, Result, Store};
-use crate::format::{self, Header, Manifest, ObjectRef, MANIFEST_FORMAT};
+use crate::format::{self, variant_of, Header, ObjectRef, Tree, HEADER_FORMAT, TREE_FORMAT};
 
-/// Documents bigger than this are never read as manifests.
-const MAX_MANIFEST: u64 = 64 << 20;
+/// Documents bigger than this are never read as trees or headers.
+const MAX_DOCUMENT: u64 = 256 << 20;
 
 /// What one sweep took.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -45,6 +45,11 @@ pub struct PinUsage {
     pub owner: Option<String>,
 }
 
+enum Document {
+    Tree(Tree),
+    Header(Header),
+}
+
 struct Object {
     length: u64,
     modified: SystemTime,
@@ -72,23 +77,29 @@ impl Census {
 }
 
 impl Store {
-    /// `root`, and when it is a manifest, its files and its headers' chunks; each once.
+    /// What `root` keeps alive, each once: `root`, and for a tree its files and each variant
+    /// header's chunks and assets; for a header, its chunks and assets.
     pub fn closure(&self, root: &ObjectRef) -> Result<Vec<ObjectRef>> {
         let mut reach = BTreeSet::from([root.clone()]);
-        if let Some(manifest) = self.manifest(root)? {
-            for (path, file) in manifest.files {
-                if path.ends_with(".cozytensors") {
-                    reach.extend(self.chunks(&file)?);
+        match self.document(root)? {
+            Some(Document::Tree(tree)) => {
+                for (path, file) in tree.files {
+                    if variant_of(&path).is_some() {
+                        reach.extend(self.header_objects(&file)?);
+                    }
+                    reach.insert(file);
                 }
-                reach.insert(file);
             }
+            Some(Document::Header(header)) => reach.extend(header.objects().cloned()),
+            None => {}
         }
         Ok(reach.into_iter().collect())
     }
 
-    /// The manifest `object` is; `None` for any other object or an absent one. A manifest of
-    /// another major cannot be walked, so GC stops rather than sweep what it reaches.
-    fn manifest(&self, object: &ObjectRef) -> Result<Option<Manifest>> {
+    /// The tree or header `object` is; `None` for any other object or an absent one. One of a
+    /// kind this build cannot walk (another major, a pre-cut header) stops GC rather than sweep
+    /// what it reaches.
+    fn document(&self, object: &ObjectRef) -> Result<Option<Document>> {
         let path = self.path(object)?;
         let mut file = match File::open(&path) {
             Ok(file) => file,
@@ -97,26 +108,41 @@ impl Store {
         };
         let length = file.metadata().map_err(fail("stat", &path))?.len();
         let mut first = [0u8];
-        if length > MAX_MANIFEST || file.read_exact(&mut first).is_err() || first[0] != b'{' {
+        if length > MAX_DOCUMENT || file.read_exact(&mut first).is_err() {
+            return Ok(None);
+        }
+        // A tree is a JSON object; a header a CBOR array (five elements: pre-cut).
+        if first[0] != b'{' && !(0x85..=0x9f).contains(&first[0]) {
             return Ok(None);
         }
         let mut bytes = first.to_vec();
         file.read_to_end(&mut bytes).map_err(fail("read", &path))?;
-        match Manifest::from_json(&bytes) {
-            Ok(manifest) => Ok(Some(manifest)),
-            Err(format::Error::Format { found, .. }) if same_family(&found, MANIFEST_FORMAT) => {
-                Err(invalid(&path, format!("cannot walk a {found} manifest")))
+        let unwalkable = |found: &str| Err(invalid(&path, format!("cannot walk a {found} document")));
+        if first[0] == b'{' {
+            return match Tree::from_json(&bytes) {
+                Ok(tree) => Ok(Some(Document::Tree(tree))),
+                Err(format::Error::Format { found, .. }) if same_family(&found, TREE_FORMAT) => {
+                    unwalkable(&found)
+                }
+                Err(_) => Ok(None),
+            };
+        }
+        match Header::from_cbor(&bytes) {
+            Ok(header) => Ok(Some(Document::Header(header))),
+            Err(format::Error::PreCut) => unwalkable("pre-cut cozytensors"),
+            Err(format::Error::Format { found, .. }) if same_family(&found, HEADER_FORMAT) => {
+                unwalkable(&found)
             }
             Err(_) => Ok(None),
         }
     }
 
-    /// The chunks a header names; none when the header is absent.
-    fn chunks(&self, header: &ObjectRef) -> Result<Vec<ObjectRef>> {
+    /// A header's chunks and assets; none when the header is absent.
+    fn header_objects(&self, header: &ObjectRef) -> Result<Vec<ObjectRef>> {
         let path = self.path(header)?;
         match fs::read(&path) {
             Ok(bytes) => Header::from_cbor(&bytes)
-                .map(|header| header.chunks)
+                .map(|header| header.objects().cloned().collect())
                 .map_err(|error| invalid(&path, error)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(vec![]),
             Err(error) => Err(fail("read", &path)(error)),
@@ -135,8 +161,8 @@ impl Store {
         };
         let mut refs = HashSet::new();
         for repo in self.refs()? {
-            for manifest in repo.roots() {
-                refs.extend(reach(manifest)?);
+            for tree in repo.roots() {
+                refs.extend(reach(tree)?);
             }
         }
         let mut pins = Vec::new();

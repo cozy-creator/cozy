@@ -1,1 +1,1 @@
-{"format":"tensorfs.repo/1","name":"Conformance/gguf","releases":[{"lanes":{"all":{"length":253,"sha256":"b88d88a0446c73ca642da118d5b6ce708706077118dc693a23b18c90d1094426"}},"version":"1"}]}
+{"format":"tensorfs.repo/1","name":"Conformance/gguf","releases":[{"tree":{"length":253,"sha256":"3caf203fb2b989d14d2ce2dfe5d8ac3979ab222e6f6bd85b64664c220f856b23"},"version":"1"}]}

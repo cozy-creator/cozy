@@ -194,13 +194,17 @@ async fn status_answers_identity_to_anyone_and_the_machine_to_its_owner() {
         .iter()
         .map(|m| (m.repository.as_str(), m.total_bytes, m.unique_bytes))
         .collect();
-    // Each model's own manifest counts with the objects it reaches; the shared 1000 once.
+    // Each model's own header and chunk count with the asset they share, which counts once.
     let store = tensord::storage::open(&root.join("var/lib/tensorfs")).unwrap();
-    let manifests: Vec<u64> = (first.models.iter())
-        .map(|m| tensord::storage::held(&store, &m.checkpoints[0].manifest).unwrap().length)
+    let own: Vec<u64> = (first.models.iter())
+        .map(|m| {
+            let header = tensord::storage::held(&store, &m.checkpoints[0].manifest).unwrap();
+            let chunks: u64 = store.checkpoint(&header).unwrap().header().chunks.iter().map(|c| c.length).sum();
+            header.length + chunks
+        })
         .collect();
-    assert_eq!(models, [("acme/base", 1300 + manifests[0], 300 + manifests[0]), ("local/mine", 1050 + manifests[1], 50 + manifests[1])]);
-    assert_eq!(first.models_bytes, 1350 + manifests[0] + manifests[1]);
+    assert_eq!(models, [("acme/base", 1000 + own[0], own[0]), ("local/mine", 1000 + own[1], own[1])]);
+    assert_eq!(first.models_bytes, 1000 + own[0] + own[1]);
     assert_eq!(first.models[0].checkpoints[0].lane, "fp8");
     // Its player endpoint is the provider's mapping of the granted port.
     let webrtc = first.webrtc.clone().expect("a rental with a WebRTC port plays");
