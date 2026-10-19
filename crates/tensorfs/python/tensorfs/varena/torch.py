@@ -807,7 +807,8 @@ class Memory:
         """Rungs 1-2, then rung 4 (the catch cuts the op between them, rung 3), until `target`
         bytes are free. False when nothing could be freed."""
         freed = self._free_upto(target, why)
-        return self._lower_until(target, why, asking) or freed
+        lowered = self._lower_until(target, why, asking)
+        return self._last(target, why) or lowered or freed
 
     def _free_upto(self, target: int, why: str) -> bool:
         """Idle bytes (rung 1); cold weights by their next declared use (none first, then the
@@ -884,7 +885,9 @@ class Memory:
         if not self._here(device):
             return False
         with self.lock:
-            lowered = self._lower_until(max(need, self._free() + 1), "out of memory", None)
+            target = max(need, self._free() + 1)
+            lowered = self._lower_until(target, "out of memory", None)
+            lowered = self._last(target, "out of memory") or lowered
             self._cap()
             if lowered:
                 return True
@@ -947,6 +950,16 @@ class Memory:
         if model.flight or model.held or model.host:
             return False
         return not self.plans or self._distance(model) > 0
+
+    def _last(self, target: int, why: str) -> bool:
+        """The last resort before a wait, once no watermark can fall: models a running step uses
+        that nothing runs this instant (a LoRA its DiT reads by tensor) give their pages."""
+        freed = 0
+        if self.plans and self._free() < target:
+            for m in [m for m in self.models.values() if not (m.flight or m.held or m.host)]:
+                if self._distance(m) == 0 and self._free() < target:
+                    freed += self._evict(m, why, 4, target - self._free())
+        return freed > 0
 
     def _now(self) -> None:
         """Models a running step uses are busy to the core: `give` and other processes' asks
