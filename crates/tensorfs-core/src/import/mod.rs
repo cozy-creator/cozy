@@ -28,7 +28,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::format::{Config, ConfigValue, Dtype, Encoding, Metadata, Pipeline, Value, CONFIG_FILE};
+use crate::format::{
+    Config, ConfigValue, Dtype, Encoding, Metadata, ObjectRef, Pipeline, Value, CONFIG_FILE,
+};
+use crate::store2::Error;
+use crate::writer::{Data, PartData, Source, Writer};
 
 pub use engine::{tables, Table};
 pub use order::{constructor_order, Ordered};
@@ -60,6 +64,97 @@ pub trait Sink {
     ) -> Result<()>;
     /// Commits with the header's loading metadata ([`Imported::metadata`]).
     fn commit(&mut self, metadata: Metadata) -> Result<()>;
+}
+
+/// A convert writes through the writer; tensors an interrupted convert journaled are skipped.
+impl Sink for Writer {
+    fn begin(&mut self, _: &str, layout: &Layout) -> Result<()> {
+        if let Some(p) = &layout.pipeline {
+            self.pipeline(&p.class, p.config.clone());
+        }
+        for c in &layout.components {
+            let config_file = c.config_file.as_deref();
+            let mut w = (self.component(&c.name, &c.class, c.config.clone(), config_file))
+                .map_err(Error::refusal)?;
+            for (name, bytes) in &c.assets {
+                w.asset(name, bytes).map_err(Error::refusal)?;
+            }
+        }
+        for (path, bytes) in &layout.files {
+            self.repo_file(path, bytes).map_err(Error::refusal)?;
+        }
+        Ok(())
+    }
+
+    fn put(
+        &mut self,
+        component: &str,
+        key: &str,
+        dtype: &Dtype,
+        shape: &[u64],
+        encoding: Option<&Encoding>,
+        parts: Vec<Part>,
+    ) -> Result<()> {
+        if self.has(component, key) {
+            return Ok(());
+        }
+        let mut parts = parts.into_iter().map(|p| PartData {
+            role: p.role.to_owned(),
+            dtype: p.dtype.clone(),
+            shape: p.shape.to_vec(),
+            data: Source::Read(p.data),
+        });
+        let data = match encoding {
+            Some(encoding) => Data::Encoded {
+                encoding: encoding.clone(),
+                parts: parts.collect(),
+            },
+            None => Data::Plain(parts.next().expect("a plain tensor's part").data),
+        };
+        (self.get(component).put(key, dtype, shape, data)).map_err(Error::refusal)
+    }
+
+    fn commit(&mut self, metadata: Metadata) -> Result<()> {
+        for (key, value) in metadata {
+            self.set_metadata(&key, value);
+        }
+        Writer::commit(self).map(drop).map_err(Error::refusal)
+    }
+}
+
+/// Converts `req` into the plain folder `dir`: its repo files, `model.<variant>.cozytensors`
+/// (the variant [`main_variant`]) and `chunks/`. An interrupted convert into `dir` resumes. The
+/// header.
+pub fn convert_folder(req: &Request, dir: &Path) -> Result<ObjectRef> {
+    struct Folder<'d>(&'d Path, Option<Writer>);
+    impl Folder<'_> {
+        fn writer(&mut self) -> &mut Writer {
+            self.1.as_mut().expect("begun")
+        }
+    }
+    impl Sink for Folder<'_> {
+        fn begin(&mut self, variant: &str, layout: &Layout) -> Result<()> {
+            let writer = Writer::folder(self.0, variant, None, true).map_err(Error::refusal)?;
+            self.1.insert(writer).begin(variant, layout)
+        }
+        fn put(
+            &mut self,
+            component: &str,
+            key: &str,
+            dtype: &Dtype,
+            shape: &[u64],
+            encoding: Option<&Encoding>,
+            parts: Vec<Part>,
+        ) -> Result<()> {
+            self.writer().put(component, key, dtype, shape, encoding, parts)
+        }
+        fn commit(&mut self, metadata: Metadata) -> Result<()> {
+            Sink::commit(self.writer(), metadata)
+        }
+    }
+    let mut folder = Folder(dir, None);
+    convert(req, &mut folder)?;
+    Ok(folder.writer().committed().expect("a convert commits").clone())
 }
 
 /// What a component's folder held besides weights.
