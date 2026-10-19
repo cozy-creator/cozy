@@ -162,7 +162,7 @@ async fn a_stored_submission_refuses_an_explicit_tensorfs_token_before_persisten
     let mut without_token = body;
     without_token["spec"]["tensorfs"]["token"] = json!("");
     let (status, accepted) = calcifer.submit("endpoint-only", without_token).await;
-    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(status, StatusCode::ACCEPTED);
     calcifer.down().await;
     assert_eq!(calcifer.stopped().await, Stopped::Down);
     let store = Store::open(&Home::at(home.path()).calcifer_db()).unwrap();

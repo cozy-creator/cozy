@@ -220,7 +220,7 @@ impl Calcifer {
             .is_some_and(|options| !options.token.is_empty())
         {
             return Err(Error::Invalid(
-                "a stored submission cannot contain a TensorFS token; omit it to use this computer's sign-in at send time".into(),
+                "a stored submission cannot contain a TensorFS token; omit tensorfs options to use this computer's Hub sign-in at send time".into(),
             ));
         }
         let digest = format!(
