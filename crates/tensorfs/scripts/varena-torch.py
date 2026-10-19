@@ -436,16 +436,16 @@ def finer_first(root: Path, dev: torch.device) -> None:
     ck = store.checkpoint(w.commit())
     weights = sum(t.numel() * t.element_size() for t in plain.state_dict().values())
     coarse = tokens * dim * Wide.WIDE * 2  # the temporary of one uncut window
-    torch.cuda.empty_cache()
-    mem = Memory.open(dev, limit=torch.cuda.memory_reserved(dev) + weights + coarse * 3 // 4)
-    with torch.device("meta"):
-        net = WideNet(dim, count).bfloat16()
-    model = mem.load(net, ck=ck)
     x = torch.randn(tokens, dim, generator=torch.Generator().manual_seed(3)).bfloat16().to(dev)
-    with torch.no_grad():
+    with torch.no_grad():  # the reference first, uncapped
         want = plain.to(dev)(x)
     plain.cpu()
     torch.cuda.empty_cache()
+    free, total = torch.cuda.mem_get_info(dev)  # the cap from the device bytes in use now
+    mem = Memory.open(dev, limit=total - free + weights + coarse * 3 // 4)
+    with torch.device("meta"):
+        net = WideNet(dim, count).bfloat16()
+    model = mem.load(net, ck=ck)
     for request in range(2):
         with torch.no_grad(), mem.request(f"wide {request}") as r:
             outs = [net(x) for _ in range(4)]
