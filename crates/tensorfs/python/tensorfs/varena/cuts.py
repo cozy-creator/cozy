@@ -398,13 +398,7 @@ def _take(root: nn.Module, paths: Sequence[str]) -> list[tuple[object, str, obje
         where, _, attr = path.rpartition(".")
         owner = functools.reduce(getattr, where.split("."), root) if where else root
         value = getattr(owner, attr, _MISSING)
-        items = (
-            list(value)
-            if isinstance(value, list)
-            else dict(value)
-            if isinstance(value, dict)
-            else None
-        )
+        items = type(value)(value) if isinstance(value, list | dict) else None  # type: ignore[call-arg]
         taken.append((owner, attr, value, items))
     return taken
 
@@ -985,14 +979,8 @@ def install(module: nn.Module) -> int:
     [tokens, inner] intermediate is the widest. Returns how many it cut."""
     count = 0
     for sub in module.modules():
-        kind = next(
-            (
-                c.__name__
-                for c in type(sub).__mro__
-                if c.__name__ in _FFN and c.__module__.startswith("diffusers.")
-            ),
-            None,
-        )
+        kinds = [c.__name__ for c in type(sub).__mro__ if c.__module__.startswith("diffusers.")]
+        kind = next((k for k in kinds if k in _FFN), None)
         if kind is not None and "_varena_ffn" not in vars(sub):
             width = sum(m.out_features for m in sub.modules() if isinstance(m, nn.Linear))
             sub.forward = _ffn(kind, width, sub.forward)  # type: ignore[method-assign]
@@ -1010,16 +998,10 @@ def _ffn(kind: str, width: int, forward: Callable[..., object]) -> Callable[...,
         key = ("ffn", kind, int(x.shape[-1]), width, x.dtype)
         if tokens < 2 or key in _served.memo.whole:
             return forward(x)
+        run = functools.partial(_tokens, forward, x, tokens)
         try:
             return _cut(
-                "ffn tokens",
-                key,
-                x.device,
-                tokens,
-                1,
-                lambda size: _tokens(forward, x, tokens, size),
-                _halving(1),
-                width * x.element_size(),
+                "ffn tokens", key, x.device, tokens, 1, run, _halving(1), width * x.element_size()
             )
         except _Whole:
             _served.memo.whole.add(key)
@@ -1078,35 +1060,19 @@ def attend(
             return units[units.index(hp) + 1] * length
         return hp * max(steps, rp // 2 // steps * steps)
 
-    key = (
-        "attention",
-        count,
-        int(k.shape[2]),
-        int(q.shape[3]),
-        int(k.shape[1]),
-        q.dtype,
-        mask is None,
-        rows,
-        heads,
-    )
-    total, finest = count * length, units[-1] * steps
+    key = ("attention", *q.shape[2:], *k.shape[1:3], q.dtype, mask is None, rows, heads)
+    run = functools.partial(_attend, call, q, k, v, mask, group)
     return _cut(
-        "attention rows",
-        key,
-        q.device,
-        total,
-        finest,
-        lambda size: _attend(call, q, k, v, mask, group, *piece(size)),
-        shrink,
-    )
+        "attention rows", key, q.device, count * length, units[-1] * steps,
+        lambda size: run(*piece(size)), shrink,
+    )  # fmt: skip
 
 
+@functools.cache
 def _head_units(count: int, group: int) -> list[int]:
     """Query heads per piece that keep each piece on whole K/V groups or inside one."""
-    units = {group * m for m in range(1, count // group + 1)} | {
-        d for d in range(1, group + 1) if group % d == 0
-    }
-    return sorted(units, reverse=True)
+    wholes = {group * m for m in range(1, count // group + 1)}
+    return sorted(wholes | {d for d in range(1, group + 1) if group % d == 0}, reverse=True)
 
 
 def _attend(
