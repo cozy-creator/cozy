@@ -15,7 +15,6 @@ use tensord::{
     service::Service,
 };
 use ed25519_dalek::SigningKey;
-use fs2::FileExt;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -395,20 +394,14 @@ async fn absent_cancel_is_observable_scoped_repeatable_and_survives_restart() {
     restarted.stop().await;
 }
 
+// The held custody is the point: acceptance (on a blocking thread) waits on it.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn cancellation_wins_while_the_real_run_acceptance_waits_on_store_custody() {
     let root = Root::new();
     let server = Server::open(&root.0).await;
-    let path = root.0.join("store/tmp/writers/recovery.lock");
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let lock = fs::File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .unwrap();
-    lock.lock_exclusive().unwrap();
+    // Acceptance takes the run's objects under object custody: held here, it waits.
+    let custody = server.service.engine.object_custody();
     let client = server.client.clone();
     let submitted =
         tokio::spawn(async move { client.submit(&v1::RunRequest { id: "blocked".into(), spec: spec() }).await });
@@ -419,7 +412,7 @@ async fn cancellation_wins_while_the_real_run_acceptance_waits_on_store_custody(
         .get_public(&actor(ALICE), "blocked")
         .is_err());
     assert_eq!(server.cancel("blocked", ALICE).await.state, "canceled");
-    FileExt::unlock(&lock).unwrap();
+    drop(custody);
     let state = tokio::time::timeout(Duration::from_secs(5), submitted).await.unwrap().unwrap().unwrap();
     assert_eq!(state.state, "canceled", "the blocked acceptance escaped cancellation");
     assert_canceled(server.client.events("blocked", 0).await.unwrap()).await;
