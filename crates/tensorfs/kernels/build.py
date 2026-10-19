@@ -38,7 +38,7 @@ def main() -> None:
         for dtype, output in zip(DTYPES, range(3), strict=True):
             signature = {"out": "*i32" if output == 0 else "*i16", "words": "*u8", "slots": "*i32",
                          "scale": "*fp32", "term": "*fp32", "table": "*fp32", "factor": "*fp32",
-                         "post": "*fp32", "index": "*u32", "error": "*i32", "params": "*u64"}
+                         "post": "*fp32", "index": "*u32", "error": "*i32", "params": "*i64"}
             variants = [("codes", k.codes, {"BLOCK": 256})]
             variants += [(name, k.structs, {"DECODE": fn, "BLOCK": 256}, 0) for name, fn in STRUCTS.items()]
             variants += [(name, getattr(k, name), {"BLOCK": 256}) for name in STAGES]

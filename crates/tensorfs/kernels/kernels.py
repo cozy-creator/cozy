@@ -1,5 +1,7 @@
 """Build-only TensorFS decode cores, moved from Runtime xs049/adapters.
 
+Source: Runtime 326e72c20ab5c4be110739ab9bd23783223825fb, decode_cores/decode_schemes.
+
 Schemes and validation live in Rust's checked Plan; these kernels execute that plan.
 No framework is imported, and deployed decoding loads the emitted CUDA binaries.
 """
@@ -53,7 +55,7 @@ def _grid(i, j, index, params, valid):
     elif kind == 3:
         width = (cols + size - 1) // size
         if tl.load(params + 20):
-            block = tl.load(index + j, mask=valid, other=0).to(tl.uint64)
+            block = tl.load(index + j, mask=valid, other=0).to(tl.int64)
         else:
             block = j // size
         if layout == 0:
@@ -239,7 +241,7 @@ def _code(  # type: ignore[no-untyped-def]
         elif ORDER == 1:
             slot = PER - 1 - e
         else:
-            slot = tl.load(slots + e, mask=valid, other=0).to(tl.uint64)
+            slot = tl.load(slots + e, mask=valid, other=0).to(tl.int64)
         if AXIS == 0:  # noqa: SIM108 - a constexpr branch, not a select
             at = k * nb + lane
         else:

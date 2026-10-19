@@ -140,7 +140,9 @@ jobs:
       # manylinux container so their glibc floor is the wheel's tag.
       - name: Compile prebuilt TensorFS CUDA decode kernels
         if: contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
-        run: uv run --no-project --python 3.12 --with triton==3.8.0 python crates/tensorfs/kernels/build.py
+        run: |
+          uv run --no-project --python 3.12 --with triton==3.8.0 python crates/tensorfs/kernels/build.py
+          TENSORFS_REQUIRE_AOT=1 cargo test -p tensorfs-core --test kernel_plan -- --include-ignored --test-threads=2
       - if: contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
         uses: actions/upload-artifact@v4
         with:
@@ -157,6 +159,7 @@ jobs:
           manylinux: auto
           working-directory: crates/tensorfs
           args: --release --locked --target-dir ../../target/manylinux --out dist
+          docker-options: -e TENSORFS_REQUIRE_AOT=1
           before-script-linux: |
             cargo build --release --locked --target-dir ../../target/manylinux -p tensorfs-core --bin tfs
             install -D -m 755 ../../target/manylinux/release/tfs wheel-data/scripts/tfs

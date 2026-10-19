@@ -21,6 +21,11 @@ pub struct Binary {
 
 include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
 
+#[cfg(require_aot)]
+const _: () = assert!(
+    BINARIES.len() == FAMILIES.len() * (crate::format::decode::gguf::STRUCTS.len() + 4) * 3
+);
+
 pub enum Prepared<'a> {
     Kernel(Box<Launch<'a>>),
     /// A scheme with a host-only plan: rounded bytes, ready for the engine's host source.
@@ -74,7 +79,7 @@ pub fn prepare<'a>(
         .rows
         .checked_mul(g.cols)
         .ok_or_else(|| Error::Decode("decode size overflow".into()))? as u64;
-    if begin.checked_add(count).is_none_or(|end| end > total) {
+    if total > i64::MAX as u64 || begin.checked_add(count).is_none_or(|end| end > total) {
         return Err(Error::Decode(format!(
             "decode range {begin}+{count} exceeds {total}"
         )));
