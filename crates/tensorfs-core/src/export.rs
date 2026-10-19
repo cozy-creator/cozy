@@ -6,6 +6,10 @@
 //!   `<component>/<weights>.safetensors`, where `<weights>` is `diffusion_pytorch_model` for a
 //!   Diffusers component and `model` otherwise. Any other component is `<component>.safetensors`
 //!   at the root, which for `model` is a Transformers folder.
+//! - A component imported from safetensors files is written back as those files: their paths
+//!   (shards and variants included), their headers byte for byte and the tensors at their
+//!   offsets, and their index (header metadata `safetensors`, [`crate::import::SOURCE_FILES`]).
+//!   One whose tensors are no longer the source's (an encoded lane) takes the standard layout:
 //! - Files are sharded at [`SHARD`] bytes as `<weights>-00001-of-0000N.safetensors` beside the
 //!   standard `<weights>.safetensors.index.json`.
 //! - Each file is laid out as the safetensors library writes one: tensors by dtype (in its order,
@@ -27,7 +31,8 @@ use serde_json::{json, Map, Value as Json};
 
 use crate::client::io;
 use crate::failure::{fail, Kind, Result};
-use crate::format::{decode, Body, Dtype, Location, PartBytes, HEADER_PATH};
+use crate::format::{decode, Body, Dtype, Location, PartBytes, Value, HEADER_PATH};
+use crate::import::SOURCE_FILES;
 use crate::store2::Checkpoint;
 
 /// The largest shard, as Diffusers and Transformers write them (20 GB).
@@ -74,6 +79,7 @@ pub fn safetensors(ck: &Checkpoint, dir: &Path, dequantize: Option<&Dtype>) -> R
         Some(_) => serde_json::from_slice(&ck.file("model_index.json")?).unwrap_or_default(),
         None => BTreeMap::new(),
     };
+    let layouts = recorded(ck);
     let mut written = Vec::new();
     for path in files.keys().filter(|p| *p != HEADER_PATH) {
         let dest = dir.join(path);
@@ -153,6 +159,18 @@ pub fn safetensors(ck: &Checkpoint, dir: &Path, dequantize: Option<&Dtype>) -> R
                 ),
             );
         }
+        if let Some(files) = layouts.get(component).and_then(|rec| placed(rec, &entries)) {
+            for (path, text, spans) in files {
+                write_file(ck, component, &text, &spans, &dir.join(&path))?;
+                written.push(path);
+            }
+            if let Some((path, text)) = &layouts[component].index {
+                let dest = dir.join(path);
+                fs::write(&dest, text).map_err(|e| io(&dest, e))?;
+                written.push(path.clone());
+            }
+            continue;
+        }
         // The safetensors writer's own order (its `prepare`): dtype descending, then name.
         entries.sort_by(|a, b| b.dtype.cmp(&a.dtype).then_with(|| a.name.cmp(&b.name)));
         let mut seen = std::collections::HashSet::new();
@@ -189,13 +207,16 @@ pub fn safetensors(ck: &Checkpoint, dir: &Path, dequantize: Option<&Dtype>) -> R
                 weight_map.insert(e.name.clone(), Json::from(file.clone()));
                 total += e.length;
             }
-            write_file(
-                ck,
-                component,
-                shard,
-                &metadata,
-                &dir.join(&folder).join(&file),
-            )?;
+            let refs: Vec<&Entry> = shard.iter().collect();
+            let mut offset = 0;
+            let spans: Vec<(u64, &Entry)> = (refs.iter())
+                .map(|e| {
+                    offset += e.length;
+                    (offset - e.length, *e)
+                })
+                .collect();
+            let text = header_text(&refs, &metadata);
+            write_file(ck, component, &text, &spans, &dir.join(&folder).join(&file))?;
             written.push(format!("{folder}{file}"));
         }
         if n > 1 {
@@ -232,15 +253,9 @@ fn weights_name(ck: &Checkpoint, index: &BTreeMap<String, Json>, component: &str
     .to_owned()
 }
 
-fn write_file(
-    ck: &Checkpoint,
-    component: &str,
-    entries: &[Entry],
-    metadata: &Map<String, Json>,
-    dest: &Path,
-) -> Result<()> {
-    // As safetensors serializes its header: `__metadata__`, then each tensor in data order as
-    // `{"dtype","shape","data_offsets"}`, padded with spaces to a multiple of 8.
+/// As safetensors serializes a header: `__metadata__`, then each tensor in data order as
+/// `{"dtype","shape","data_offsets"}`, padded with spaces to a multiple of 8.
+fn header_text(entries: &[&Entry], metadata: &Map<String, Json>) -> Vec<u8> {
     let string = |s: &str| serde_json::to_string(s).expect("a string serializes");
     let mut text = format!(
         "{{\"__metadata__\":{}",
@@ -260,20 +275,35 @@ fn write_file(
     text.push('}');
     let mut text = text.into_bytes();
     text.resize(text.len().next_multiple_of(8), b' ');
+    text
+}
+
+/// A safetensors file: `text`, its header, then each entry at its offset in the data section
+/// (gaps zero-filled).
+fn write_file(
+    ck: &Checkpoint,
+    component: &str,
+    text: &[u8],
+    entries: &[(u64, &Entry)],
+    dest: &Path,
+) -> Result<()> {
     let parent = dest.parent().expect("a file has a directory");
     fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
     let temp = dest.with_extension(format!("tmp-{}", std::process::id()));
     let mut out = BufWriter::with_capacity(8 << 20, File::create(&temp).map_err(|e| io(&temp, e))?);
     let wrote = (|| -> Result<()> {
         out.write_all(&(text.len() as u64).to_le_bytes())?;
-        out.write_all(&text)?;
-        for e in entries {
+        out.write_all(text)?;
+        let mut end = 0;
+        for (offset, e) in entries {
+            io::copy(&mut io::repeat(0).take(offset - end), &mut out)?;
             match &e.bytes {
                 Bytes::Stored(at) => copy(ck, at, &mut out)?,
                 Bytes::Decoded { key, dtype } => {
                     out.write_all(&decode_as(ck, component, key, dtype)?)?
                 }
             }
+            end = offset + e.length;
         }
         out.flush()?;
         Ok(())
@@ -284,6 +314,79 @@ fn write_file(
         return Err(e);
     }
     Ok(())
+}
+
+/// The source's own weights files of a component, as import recorded them (header metadata
+/// `safetensors`): each file's path and header text, and the index's path and text.
+struct Recorded {
+    files: Vec<(String, String)>,
+    index: Option<(String, String)>,
+}
+
+fn recorded(ck: &Checkpoint) -> BTreeMap<String, Recorded> {
+    let text =
+        |m: &BTreeMap<String, Value>, k: &str| m.get(k).and_then(Value::as_str).map(str::to_owned);
+    let mut out = BTreeMap::new();
+    let Some(Value::List(layouts)) = ck.header().metadata.get(SOURCE_FILES) else {
+        return out;
+    };
+    for layout in layouts {
+        let Value::Map(m) = layout else { continue };
+        let (Some(component), Some(Value::List(files))) = (text(m, "component"), m.get("files"))
+        else {
+            continue;
+        };
+        let files = files
+            .iter()
+            .filter_map(|f| match f {
+                Value::Map(f) => Some((text(f, "path")?, text(f, "header")?)),
+                _ => None,
+            })
+            .collect();
+        let index = match m.get("index") {
+            Some(Value::Map(i)) => text(i, "path").zip(text(i, "text")),
+            _ => None,
+        };
+        out.insert(component, Recorded { files, index });
+    }
+    out
+}
+
+/// Where each recorded file puts `entries`, when they are exactly its tensors (names, dtypes,
+/// shapes, lengths): else the component no longer is the source's (an encoded lane), and is
+/// written in the standard layout.
+fn placed<'e>(
+    rec: &Recorded,
+    entries: &'e [Entry],
+) -> Option<Vec<(String, Vec<u8>, Vec<(u64, &'e Entry)>)>> {
+    let by_name: BTreeMap<&str, &Entry> = entries.iter().map(|e| (e.name.as_str(), e)).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut files = Vec::new();
+    for (path, text) in &rec.files {
+        let header: Map<String, Json> = serde_json::from_str(text).ok()?;
+        let mut spans = Vec::new();
+        for (name, t) in header.iter().filter(|(k, _)| *k != "__metadata__") {
+            let e = by_name.get(name.as_str())?;
+            let at: (u64, u64) = serde_json::from_value(t["data_offsets"].clone()).ok()?;
+            let shape: Vec<u64> = serde_json::from_value(t["shape"].clone()).ok()?;
+            if t["dtype"].as_str() != Some(e.dtype.name())
+                || shape != e.shape
+                || at.1.checked_sub(at.0) != Some(e.length)
+            {
+                return None;
+            }
+            if !seen.insert(name.as_str()) {
+                return None;
+            }
+            spans.push((at.0, *e));
+        }
+        spans.sort_by_key(|(at, _)| *at);
+        if spans.windows(2).any(|w| w[0].0 + w[0].1.length > w[1].0) {
+            return None;
+        }
+        files.push((path.clone(), text.clone().into_bytes(), spans));
+    }
+    (seen.len() == entries.len()).then_some(files)
 }
 
 /// Streams the stored bytes at `at` from their chunk files.

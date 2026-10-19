@@ -525,9 +525,10 @@ pub fn weights(path: &str) -> bool {
     path.contains(".safetensors")
 }
 
+/// Other serializations of the weights, and their indexes (`pytorch_model.bin.index.json`).
 fn other_weights(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    OTHER_WEIGHTS.iter().any(|e| lower.ends_with(e))
+    (OTHER_WEIGHTS.iter()).any(|e| lower.ends_with(e) || lower.contains(&format!("{e}.index")))
 }
 
 /// A configuration a converter's reference supplies: configs, tokenizers, templates, licenses.

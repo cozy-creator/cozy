@@ -1015,6 +1015,30 @@ impl Sink for Writer {
         self.set_metadata("normalized", imported.normalized.into());
         self.set_metadata("converters", list(&imported.converters));
         self.set_metadata("sources", list(&imported.sources));
+        let text = |pairs: [(&str, &String); 2]| {
+            let pairs = pairs
+                .iter()
+                .map(|(k, v)| ((*k).into(), Value::Str((*v).clone())));
+            Value::Map(pairs.collect())
+        };
+        let layouts: Vec<Value> = (imported.layouts.iter())
+            .map(|(component, layout)| {
+                let files = (layout.files.iter())
+                    .map(|(path, header)| text([("path", path), ("header", header)]))
+                    .collect();
+                let mut m = BTreeMap::from([
+                    ("component".to_owned(), Value::Str(component.clone())),
+                    ("files".to_owned(), Value::List(files)),
+                ]);
+                if let Some((path, index)) = &layout.index {
+                    m.insert("index".into(), text([("path", path), ("text", index)]));
+                }
+                Value::Map(m)
+            })
+            .collect();
+        if !layouts.is_empty() {
+            self.set_metadata(import::SOURCE_FILES, Value::List(layouts));
+        }
         Writer::commit(self).map(drop).map_err(Error::refusal)
     }
 }

@@ -2,7 +2,8 @@
 """The standalone e2e (design §11): no Cozy, no account, run by `e2e.sh` in a fresh venv.
 
 1. CLI: `tfs import hf://hf-internal-testing/tiny-sdxl-pipe`; `tfs export --safetensors`, which is
-   the repository file for file (a Transformers model with its tokenizer too) and from which
+   the repository file for file (so are a Transformers model with its tokenizer, a sharded model and
+   a sharded fp16 variant) and from which
    Diffusers renders exactly the upstream repo's image (CPU, fixed seed); `tfs export
    --origin`, served by `python -m http.server`, then `tfs pull` into a second store,
    byte-identical; a corrupted object is removed by `tfs verify` and fetched again.
@@ -31,8 +32,16 @@ from huggingface_hub import hf_hub_download, snapshot_download
 import tensorfs as tfs
 
 REPO = "hf-internal-testing/tiny-sdxl-pipe"
-#: A Transformers model with its tokenizer; its ONNX copy is the one file an import drops.
-LLM = "hf-internal-testing/tiny-random-LlamaForCausalLM"
+#: Sources an export reproduces file for file: the repository, its `tfs import` flags, and what
+#: the import leaves out (other serializations of the weights, the other variant).
+SOURCES = [
+    ("hf-internal-testing/tiny-random-LlamaForCausalLM", [], ["*.onnx"]),
+    ("hf-internal-testing/tiny-random-bert-sharded-safetensors", [], ["*.bin"]),
+    ("hf-internal-testing/tiny-stable-diffusion-pipe-variants-right-format", ["--variant", "fp16"],
+     ["*.bin", "*.bin.index*.json", "safety_checker/model.safetensors", "text_encoder/model-*",
+      "text_encoder/model.safetensors.index.json", "unet/diffusion_pytorch_model-*",
+      "unet/diffusion_pytorch_model.safetensors.index.json"]),
+]
 NAME = "local/tiny-sdxl"
 TFS = str(pathlib.Path(sys.executable).with_name("tfs"))
 DTYPES = {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16, "I64": torch.int64}
@@ -135,9 +144,10 @@ def main() -> None:
     cli(a, "export", NAME, str(work / "out"), "--safetensors")
     same_files(work / "out")
     same_folder(work / "out", REPO, [])
-    cli(work / "llm-store", "import", f"hf://{LLM}", "--name", "local/tiny-llama")
-    cli(work / "llm-store", "export", "local/tiny-llama", str(work / "llm"), "--safetensors")
-    same_folder(work / "llm", LLM, ["*.onnx"])
+    for i, (repo, flags, dropped) in enumerate(SOURCES):
+        cli(work / "sources", "import", f"hf://{repo}", "--name", f"local/source-{i}", *flags)
+        cli(work / "sources", "export", f"local/source-{i}", str(work / f"source-{i}"), "--safetensors")
+        same_folder(work / f"source-{i}", repo, dropped)
     same_image(work / "out", reference)
     cli(a, "export", NAME, str(work / "origin"), "--origin")
     with serve(work / "origin") as url:

@@ -53,6 +53,10 @@ pub trait Sink {
     fn commit(&mut self, imported: &Imported) -> Result<()>;
 }
 
+/// The header metadata key of the source's own safetensors files: a list of
+/// `{component, files: [{path, header}], index?: {path, text}}`, written back by export.
+pub const SOURCE_FILES: &str = "safetensors";
+
 /// What the model records about its import.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Imported {
@@ -62,6 +66,9 @@ pub struct Imported {
     pub converters: Vec<String>,
     /// The pinned sources.
     pub sources: Vec<String>,
+    /// Each component stored as it is, and its source files (converted ones take the
+    /// standard layout).
+    pub layouts: Vec<(String, source::Layout)>,
 }
 
 pub struct Request<'a> {
@@ -288,10 +295,14 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     for (path, bytes) in &files {
         sink.file(path, bytes)?;
     }
+    let layouts = (recognized.unclaimed.iter())
+        .map(|g| (identity(&set.groups[*g]), set.groups[*g].layout.clone()))
+        .collect();
     let imported = Imported {
         normalized,
         converters,
         sources: pinned,
+        layouts,
     };
     sink.commit(&imported)?;
     drop(opened);
