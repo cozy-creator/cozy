@@ -41,7 +41,7 @@ jobs:
     name: ${{ matrix.os }}
     env:
       # TensorD and TensorFS are judged where they build (Linux); elsewhere reported until ported.
-      IMPORTED: ${{ !startsWith(matrix.os, 'ubuntu') && '--exclude tensord --exclude tensorfs-core --exclude varena --exclude tensorfs-py' || '' }}
+      IMPORTED: ${{ !startsWith(matrix.os, 'ubuntu') && '--exclude tensord --exclude tensorfs --exclude varena --exclude tensorfs-py' || '' }}
     runs-on: ${{ matrix.os }}
     # Hang bound, not a work budget.
     timeout-minutes: 30
@@ -104,10 +104,10 @@ jobs:
         if: inputs.tensorfs_wheel
         run: |
           exe=; [ "$RUNNER_OS" != Windows ] || exe=.exe
-          cargo build --release --locked -p tensorfs-core --bin tfs
-          mkdir -p crates/tensorfs/wheel-data/scripts
-          cp "target/release/tfs$exe" crates/tensorfs/wheel-data/scripts/
-          (cd crates/tensorfs && uvx maturin@1.15.0 build --release --out "$RUNNER_TEMP/tensorfs")
+          cargo build --release --locked -p tensorfs --bin tfs
+          mkdir -p crates/tensorfs-py/wheel-data/scripts
+          cp "target/release/tfs$exe" crates/tensorfs-py/wheel-data/scripts/
+          (cd crates/tensorfs-py && uvx maturin@1.15.0 build --release --out "$RUNNER_TEMP/tensorfs")
           echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$RUNNER_TEMP"/tensorfs/tensorfs-*.whl)" >> "$GITHUB_ENV"
 
       - name: Test
@@ -161,6 +161,6 @@ jobs:
           [ $? = 1 ]
       - uses: astral-sh/setup-uv@v7
       - name: Constructor orders
-        run: uv run --script crates/tensorfs/scripts/orders.py
+        run: uv run --script crates/tensorfs-py/scripts/orders.py
       - name: Converter tables
-        run: uv run --script crates/tensorfs/scripts/converters.py
+        run: uv run --script crates/tensorfs-py/scripts/converters.py

@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Mutex,
 };
-use tensorfs_core::format::ObjectRef;
+use tensorfs::format::ObjectRef;
 
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct Listing {
@@ -135,7 +135,7 @@ fn list(store: &Store, seen: &Seen) -> std::io::Result<Listing> {
 /// A store with two models that share one object: `acme/base` (release 1.0.0, lane fp8),
 /// pulled, and the local model `local/mine`. Tests of the listing and of Status build on it.
 pub fn fixture(root: &Path) -> std::io::Result<()> {
-    use tensorfs_core::format::{Manifest, Metadata};
+    use tensorfs::format::{Manifest, Metadata};
     let store = storage::open(root)?;
     let put = |body: &[u8]| store.put_bytes(body).map_err(storage::io_error);
     let (shared, base, mine) = (put(&[1; 1000])?, put(&[2; 300])?, put(&[3; 50])?);

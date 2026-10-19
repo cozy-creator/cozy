@@ -18,7 +18,7 @@ use std::{
 };
 use tensord::api::v1::client::Auth;
 use tensord::storage::{self, Store};
-use tensorfs_core::{format::ObjectRef, sha256};
+use tensorfs::{format::ObjectRef, sha256};
 
 const WORKER: &str = "root-test";
 const OWNER: [u8; 32] = [44; 32];

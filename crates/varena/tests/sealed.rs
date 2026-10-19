@@ -8,7 +8,7 @@ mod common;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use common::*;
-use tensorfs_core::read;
+use tensorfs::read;
 use varena::host::{fill_sealed, reserve};
 use varena::io::{IoTally, Source};
 use varena::layout::Layout;
@@ -198,7 +198,7 @@ fn a_failed_fill_reaches_every_adopter_as_an_error() {
 }
 
 /// The object files a machine hands over: each object's verified store file, opened read-only.
-fn object_files(fx: &Fixture) -> Vec<(tensorfs_core::ids::ObjectRef, std::fs::File)> {
+fn object_files(fx: &Fixture) -> Vec<(tensorfs::ids::ObjectRef, std::fs::File)> {
     fx.objects.iter().map(|o| (o.clone(), std::fs::File::open(fx.store.blob_path(&o.sha256)).unwrap())).collect()
 }
 

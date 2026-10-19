@@ -18,7 +18,7 @@ use std::{
     net::Shutdown,
     sync::{Arc, Mutex},
 };
-use tensorfs_core::{
+use tensorfs::{
     err::{Code, Refusal},
     format::ObjectRef,
     store2::Checkpoint,
@@ -73,7 +73,7 @@ pub struct Fetch {
     manifests: Vec<String>,
     stop: Stop,
     channels: Mutex<Vec<platform::ipc::LocalStream>>,
-    kept: Mutex<Vec<tokio::task::JoinHandle<tensorfs_core::err::Result<tensorfs_core::fetch::Landed>>>>,
+    kept: Mutex<Vec<tokio::task::JoinHandle<tensorfs::err::Result<tensorfs::fetch::Landed>>>>,
     /// What fetched for this call before it could ask: ended by its first channel.
     replaced: Mutex<Option<Arc<Fetch>>>,
 }
@@ -201,7 +201,7 @@ impl Fetch {
     /// Every chunk of `selected` (manifest, components) here, reporting its bytes (a warm run
     /// of a function): the bytes that came from the Hub and from the datacenter volume.
     pub fn download(&self, selected: &[(String, Vec<String>)], stop: &Stop, progress: &(dyn Fn(u64, u64) + Sync)) -> io::Result<(u64, u64)> {
-        let counted = Arc::new(tensorfs_core::fetch::Progress::default());
+        let counted = Arc::new(tensorfs::fetch::Progress::default());
         origin::watched(&counted, progress, || {
             let mut landed = (0, 0);
             for (manifest, components) in selected {

@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 use crate::storage::{self, Store};
-use tensorfs_core::{
+use tensorfs::{
     format,
     ids,
     read::{self, Source as Item},
@@ -816,7 +816,7 @@ impl HostTier {
         request: SealedRequest<'_>,
         plan: File,
         fetch: Option<&Arc<Fetch>>,
-    ) -> io::Result<Vec<(tensorfs_core::ids::ObjectRef, File)>> {
+    ) -> io::Result<Vec<(tensorfs::ids::ObjectRef, File)>> {
         self.live_peer(peer)?;
         let plan = Self::plan(request, plan)?;
         let (read_plan, _) = Self::layout(&plan, grants)?;
@@ -1064,7 +1064,7 @@ fn fail(open: &OpenFill, layout: &Layout, regions: &[u32]) {
 
 /// The SHA-256 (hex) of `files`' objects in order, one `<sha256>:<length>\n` line each: what an
 /// `object_files` answer names, checked against the list the executor derives from its plan.
-pub fn objects_digest(files: &[(tensorfs_core::ids::ObjectRef, File)]) -> String {
+pub fn objects_digest(files: &[(tensorfs::ids::ObjectRef, File)]) -> String {
     let lines: String = files
         .iter()
         .map(|(obj, _)| format!("{}:{}\n", obj.sha256, obj.length))

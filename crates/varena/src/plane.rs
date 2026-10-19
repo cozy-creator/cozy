@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 #[cfg(feature = "store")]
-use tensorfs_core::{meta::Meta, read::ReadLease, store::Store, store2::Checkpoint};
-use tensorfs_core::ids::ObjectRef;
-use tensorfs_core::read::ReadPlan;
+use tensorfs::{meta::Meta, read::ReadLease, store::Store, store2::Checkpoint};
+use tensorfs::ids::ObjectRef;
+use tensorfs::read::ReadPlan;
 
 use crate::cuda::{self, AllocationProp, CUcontext, CUdevice, CUstream, CtxGuard};
 use crate::cursor::Cur;
@@ -1179,7 +1179,7 @@ impl Plane {
         Ok(id)
     }
 
-    /// Register `regions` of a TensorFS v2 checkpoint (`tensorfs_core::client::regions`) as one
+    /// Register `regions` of a TensorFS v2 checkpoint (`tensorfs::client::regions`) as one
     /// weight set: the parts they name, in header order, are the read plan, and their chunk
     /// files the source. Only those: a window's regions register a set as small as the window,
     /// and the checkpoint's other tensors register as their own sets when a load first wants them.

@@ -94,7 +94,7 @@ fn published_models_alternate_on_one_gpu_under_the_memory_policy() {
         let digest = |value: &Value| {
             format!(
                 "sha256:{}",
-                tensorfs_core::sha256::hex(&tensorfs_core::sha256::digest(
+                tensorfs::sha256::hex(&tensorfs::sha256::digest(
                     &serde_json_canonicalizer::to_vec(value).unwrap()
                 ))
             )

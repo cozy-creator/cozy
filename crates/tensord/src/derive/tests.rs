@@ -1,7 +1,7 @@
 use super::*;
 use platform::ipc::LocalStream;
 use std::time::Duration;
-use tensorfs_core::format::Value as Meta;
+use tensorfs::format::Value as Meta;
 
 const TX: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
@@ -212,7 +212,7 @@ fn a_source_channel_reads_and_fetches_what_it_lacks() {
         assert_eq!(inspected["manifest"]["sha256"], source.sha256.as_str());
         assert!(inspected["files"]["unet/config.json"].is_object());
         let header = held.manifest().header().unwrap().clone();
-        assert_eq!(c.read(json!({"op": "file", "path": tensorfs_core::format::HEADER_PATH})), store.read(&header).unwrap());
+        assert_eq!(c.read(json!({"op": "file", "path": tensorfs::format::HEADER_PATH})), store.read(&header).unwrap());
         assert_eq!(c.ask(json!({"op": "nope"}))["error"], "invalid_request");
         assert_eq!(c.read(json!({"op": "file", "path": "unet/config.json"})), b"{\"a\":1}");
         assert_eq!(c.read(json!({"op": "read", "component": "unet", "key": "a.weight"})), large);

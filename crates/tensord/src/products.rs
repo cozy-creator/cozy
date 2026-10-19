@@ -18,7 +18,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 use crate::storage::{self, Store};
-use tensorfs_core::{format::ObjectRef, sha256};
+use tensorfs::{format::ObjectRef, sha256};
 
 const MAX_PARTS: usize = 128;
 
@@ -312,7 +312,7 @@ fn commit(
 /// An adopted weights output as a product of its run's log: its bytes are the output's
 /// manifest (`weights::MANIFEST_MEDIA`), held in the machine's store; the same manifest
 /// adopted again adds nothing.
-pub fn record_manifest(engine: &Engine, id: &str, output: &str, manifest: &tensorfs_core::format::ObjectRef) -> io::Result<u64> {
+pub fn record_manifest(engine: &Engine, id: &str, output: &str, manifest: &tensorfs::format::ObjectRef) -> io::Result<u64> {
     let content = domain::Ref {
         digest: unhex(&manifest.sha256)?,
         length: manifest.length,

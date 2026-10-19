@@ -7,7 +7,7 @@
 //!
 //! A plane applies caller-supplied budgets, regions and priorities for fills, prefetch,
 //! eviction and streaming. It does not measure free memory or reorder the caller's schedule.
-//! `tensorfs-core` supplies verified serialized bytes and metadata and stays CUDA-free.
+//! `tensorfs` supplies verified serialized bytes and metadata and stays CUDA-free.
 //!
 //! The plane is a Unix mechanism: weight sets cross processes as descriptors. Its host tier
 //! (sealed memfds claimed by OFD locks) is Linux-only and answers [`Error::Unsupported`]
@@ -74,7 +74,7 @@ pub enum Error {
     #[error("io: {0}")]
     Io(String),
     #[error("source: {0}")]
-    Source(#[from] tensorfs_core::err::Refusal),
+    Source(#[from] tensorfs::err::Refusal),
     /// What closed: a weight set, a cursor, a copy stream.
     #[error("closed: {0}")]
     Closed(String),

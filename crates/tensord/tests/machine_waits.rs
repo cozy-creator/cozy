@@ -54,7 +54,7 @@ fn boot(home: &Path) -> (Machine, Client) {
     let pem = ready["cert_pem"].as_str().unwrap();
     let leaf = rustls_pemfile::certs(&mut pem.as_bytes()).next().unwrap().unwrap();
     let auth = Auth::Key { key: Arc::new(owner), worker: "local".into() };
-    let client = Client::new(ready["address"].as_str().unwrap(), tensorfs_core::sha256::digest(&leaf), auth).unwrap();
+    let client = Client::new(ready["address"].as_str().unwrap(), tensorfs::sha256::digest(&leaf), auth).unwrap();
     (machine, client)
 }
 
@@ -64,7 +64,7 @@ async fn tree(client: &Client, variant: &str) -> String {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpu_bulk");
     let bulk = client.bulk().unwrap();
     let write = async |bytes: Vec<u8>| -> String {
-        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&bytes));
+        let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&bytes));
         let length = bytes.len() as u64;
         bulk.put(&digest, (0, length, length), bytes).await.unwrap();
         digest

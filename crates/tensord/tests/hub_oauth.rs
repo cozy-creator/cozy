@@ -23,10 +23,10 @@ fn leaf() -> Arc<Leaf> {
 
 fn publish(
     catalog: &Catalog,
-    store: &tensorfs_core::store2::Store,
-    manifest: &tensorfs_core::format::ObjectRef,
+    store: &tensorfs::store2::Store,
+    manifest: &tensorfs::format::ObjectRef,
     operation: &str,
-) -> tensorfs_core::err::Result<()> {
+) -> tensorfs::err::Result<()> {
     catalog
         .publish(&Publication {
             store,
@@ -98,7 +98,7 @@ fn a_run_capability_trades_once_for_exactly_what_it_names() {
     let signed = authkit.capability(&jkt, &ops, 600);
     let source = Source::new(&authkit.hub, None, hosts.clone(), Some(Capability::new(&signed, &authkit.token_endpoint, leaf.clone()).unwrap())).unwrap();
     let store_root = std::env::temp_dir().join(format!("cm-oauth-store-{}", uuid::Uuid::new_v4()));
-    let store = tensorfs_core::store2::Store::open(&store_root).unwrap();
+    let store = tensorfs::store2::Store::open(&store_root).unwrap();
     let manifest = hub_oauth::checkpoint(&store, &[7; 8192]);
     assert_eq!(authkit.exchanges(), 0);
     let tiny = Catalog::for_op(&source, TINY).unwrap();

@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tensorfs_core::read::{ObjectRange, ReadPlan, Source};
+use tensorfs::read::{ObjectRange, ReadPlan, Source};
 
 use crate::{Error, Result};
 
@@ -84,7 +84,7 @@ impl Layout {
             }
         }
         // Group plan items by part, preserving plan order.
-        let mut parts: Vec<(&str, Vec<&tensorfs_core::read::PlanItem>)> = Vec::new();
+        let mut parts: Vec<(&str, Vec<&tensorfs::read::PlanItem>)> = Vec::new();
         for it in &plan.items {
             match parts.last_mut() {
                 Some((w, v)) if *w == it.what => v.push(it),
@@ -135,7 +135,7 @@ impl Layout {
                     if let Source::Object(o) = &it.source {
                         ident.push_str(&format!("{}:{}:{}@{};", o.obj.sha256, o.off, o.len, off + (it.dest_off - base)));
                     } else if let Source::Inline(bytes) = &it.source {
-                        ident.push_str(&format!("inline:{}:{}@{};", tensorfs_core::sha256::hex_digest(bytes), it.len, off + (it.dest_off - base)));
+                        ident.push_str(&format!("inline:{}:{}@{};", tensorfs::sha256::hex_digest(bytes), it.len, off + (it.dest_off - base)));
                     }
                 }
                 out_parts.push(Part {
@@ -162,7 +162,7 @@ impl Layout {
             parts: out_parts,
             regions: out_regions,
             nbytes: at,
-            digest: tensorfs_core::sha256::hex_digest(ident.as_bytes()),
+            digest: tensorfs::sha256::hex_digest(ident.as_bytes()),
         })
     }
 

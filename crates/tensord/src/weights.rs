@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use tensorfs_core::{format::ObjectRef, sha256};
+use tensorfs::{format::ObjectRef, sha256};
 
 /// The media type of a weights output's product: its bytes are the output's manifest.
 pub const MANIFEST_MEDIA: &str = "application/vnd.cozy.model-manifest";
@@ -297,7 +297,7 @@ impl Weights {
             })
             .map(drop)
             .map_err(|e| {
-                let message = if e.code == tensorfs_core::err::Code::HUB_REFUSED {
+                let message = if e.code == tensorfs::err::Code::HUB_REFUSED {
                     format!("publication was refused before its commit: {}", e.detail)
                 } else {
                     format!("publication failed before its commit: {e}")

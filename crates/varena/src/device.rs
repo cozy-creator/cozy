@@ -881,7 +881,7 @@ pub fn slice_items(items: &[Item], lo: u64, hi: u64) -> Vec<Item> {
         }
         let skip = s - it.offset;
         let source = match &it.source {
-            ItemSource::Object(o) => ItemSource::Object(tensorfs_core::read::ObjectRange {
+            ItemSource::Object(o) => ItemSource::Object(tensorfs::read::ObjectRange {
                 obj: o.obj.clone(),
                 off: o.off + skip,
                 len: e - s,

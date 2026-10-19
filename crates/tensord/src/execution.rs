@@ -443,7 +443,7 @@ impl Engine {
         id: &str,
         digest: &str,
         invocation: Invocation,
-        objects: &[tensorfs_core::format::ObjectRef],
+        objects: &[tensorfs::format::ObjectRef],
         spec: &[u8],
     ) -> io::Result<(Execution, bool)> {
         let mut owned = self.owned.lock().unwrap();
@@ -1102,7 +1102,7 @@ impl Engine {
             let mut output =
                 platform::durable::Mode::mode(OpenOptions::new().write(true).create_new(true), 0o600)
                     .open(&temporary)?;
-            let mut hash = tensorfs_core::sha256::Sha256::new();
+            let mut hash = tensorfs::sha256::Sha256::new();
             let mut length = 0;
             let mut buffer = [0; 64 * 1024];
             loop {
@@ -1114,7 +1114,7 @@ impl Engine {
                 hash.update(&buffer[..count]);
                 length += count as u64;
             }
-            let digest = tensorfs_core::sha256::hex(&hash.finish());
+            let digest = tensorfs::sha256::hex(&hash.finish());
             platform::durable::set_file_mode(&output, 0o400)?;
             output.sync_all()?;
             let filename = format!("{index}-{digest}");

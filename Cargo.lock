@@ -533,7 +533,7 @@ dependencies = [
  "supports-hyperlinks",
  "tar",
  "tempfile",
- "tensorfs-core",
+ "tensorfs",
  "tokio",
  "tokio-util",
  "toml",
@@ -667,7 +667,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tensord",
- "tensorfs-core",
+ "tensorfs",
  "tokio",
  "url",
  "vt100",
@@ -3964,7 +3964,7 @@ dependencies = [
  "str0m",
  "tar",
  "tempfile",
- "tensorfs-core",
+ "tensorfs",
  "time",
  "tokio",
  "tokio-rustls",
@@ -3982,7 +3982,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tensorfs-core"
+name = "tensorfs"
 version = "0.11.0"
 dependencies = [
  "async-trait",
@@ -4019,7 +4019,7 @@ version = "0.11.0"
 dependencies = [
  "platform",
  "pyo3",
- "tensorfs-core",
+ "tensorfs",
  "tracing",
  "tracing-subscriber",
  "varena",
@@ -4539,7 +4539,7 @@ dependencies = [
  "libc",
  "libloading 0.9.0",
  "platform",
- "tensorfs-core",
+ "tensorfs",
  "thiserror 2.0.21",
  "tracing",
 ]

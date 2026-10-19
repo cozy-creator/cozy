@@ -16,7 +16,7 @@ use std::ffi::CString;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyDict, PyType};
-use tensorfs_core::err::{Code, Refusal};
+use tensorfs::err::{Code, Refusal};
 
 static BASE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static CLASSES: PyOnceLock<HashMap<&'static str, Py<PyType>>> = PyOnceLock::new();

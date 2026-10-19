@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-use tensorfs_core::{
+use tensorfs::{
     err::{refuse, Code, Refusal, Result},
     fetch::{Client, Config, Fetcher, Landed, Origin, Progress, Pulled, SourcePolicy, VolumeOrigin, Want},
     format::ObjectRef,
@@ -68,7 +68,7 @@ pub struct Machine {
 impl Machine {
     /// Fetches into `store`, reading the datacenter volume mounted at `volume` first.
     pub fn new(store: Arc<Store>, volume: Option<&Path>) -> io::Result<Arc<Machine>> {
-        let runtime = tensorfs_core::fetch::runtime().map_err(io::Error::other)?;
+        let runtime = tensorfs::fetch::runtime().map_err(io::Error::other)?;
         let volume = volume.and_then(|path| VolumeOrigin::mounted(path, storage::TTL));
         Ok(Arc::new(Machine { store, runtime, volume, fetchers: Mutex::default() }))
     }
@@ -95,7 +95,7 @@ impl Machine {
             None => Client::new(policy),
         };
         let _entered = self.runtime.enter();
-        let store: Arc<dyn tensorfs_core::fetch::ObjectStore> = self.store.clone();
+        let store: Arc<dyn tensorfs::fetch::ObjectStore> = self.store.clone();
         let fetcher = Arc::new(Fetcher::new(store, client, self.volume.clone(), Config::default()));
         fetchers.push((key.clone(), fetcher.clone()));
         Ok(fetcher)
@@ -148,7 +148,7 @@ impl Machine {
             let checkpoint = tokio::task::spawn_blocking(move || held.checkpoint(&id).map_err(|e| e.refusal()))
                 .await
                 .map_err(|e| Refusal { code: Code::IO_FAILED, detail: e.to_string() })??;
-            admit(&store, &tensorfs_core::fetch::chunks(checkpoint.header(), components.as_deref())?)?;
+            admit(&store, &tensorfs::fetch::chunks(checkpoint.header(), components.as_deref())?)?;
             let mut pulled = fetcher.pull_manifest(&origin, &manifest, &want(components.as_deref())).await?;
             (pulled.landed.origin, pulled.landed.volume) =
                 (pulled.landed.origin + structure.landed.origin, pulled.landed.volume + structure.landed.volume);

@@ -1,5 +1,5 @@
 //! Dev builds only (feature `migrate`, xs-045 U12; deleted with the old format): checkpoints from
-//! before TensorFS's format cut, rewritten into this machine's store by `tensorfs_core::migrate`
+//! before TensorFS's format cut, rewritten into this machine's store by `tensorfs::migrate`
 //! (the last reader of the old format) and checked tensor by tensor.
 //!
 //! - [`checkpoint`]: an old checkpoint at the run's Hub, on a machine that does nothing else (a
@@ -11,7 +11,7 @@
 //!   old objects it reuses move in by hard link (a copy only across filesystems), so the
 //!   conversion costs only its new bytes.
 use serde_json::{json, Value};
-use tensorfs_core::{
+use tensorfs::{
     format::ObjectRef,
     migrate::{self, v1},
     store2::Store,
@@ -53,7 +53,7 @@ fn rewrite(src: &v1::Source, store: &Store, lane: v1::Lane) -> Result<(ObjectRef
 /// pins go and every unreferenced object goes at once, the old ones fetched for them included.
 /// No grace: the Hub path runs on a machine that does nothing else, so disk holds one lane.
 fn clear(store: &Store) -> Result<(), Refused> {
-    let failed = |e: tensorfs_core::store2::Error| refused("migration_failed", e.to_string());
+    let failed = |e: tensorfs::store2::Error| refused("migration_failed", e.to_string());
     for (id, _) in store.pins().map_err(failed)?.into_iter().filter(|(id, _)| id.starts_with("migrate-")) {
         store.unpin(&id).map_err(failed)?;
     }
@@ -70,7 +70,7 @@ pub fn checkpoint(
     observe: &(dyn Fn(&str, u64, u64) + Sync),
 ) -> Result<(ObjectRef, Value), Refused> {
     let manifest = choice.manifest.as_ref().map(|m| ObjectRef {
-        sha256: tensorfs_core::sha256::hex(&m.digest),
+        sha256: tensorfs::sha256::hex(&m.digest),
         length: m.length,
     });
     let manifest = manifest.ok_or_else(|| refused("invalid_request", "a migration names the old checkpoint's manifest"))?;
@@ -125,7 +125,7 @@ pub fn checkpoint(
 /// machine's store under its name, with the old objects it reuses linked in: one row each.
 pub fn local(publisher: &Publisher, root: &str, observe: &(dyn Fn(&str, u64, u64) + Sync)) -> Result<Vec<Value>, Refused> {
     let (src, store) = (v1::Source::new(root), publisher.store());
-    let failed = |f: tensorfs_core::failure::Failure| refused("migration_failed", f.detail);
+    let failed = |f: tensorfs::failure::Failure| refused("migration_failed", f.detail);
     let repos = src.repos().map_err(failed)?;
     let models: Vec<(&str, &ObjectRef)> = (repos.iter())
         .filter_map(|r| Some((r.name.strip_prefix("local/")?, r.checkpoints.last()?)))

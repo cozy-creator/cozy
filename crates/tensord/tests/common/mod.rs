@@ -10,7 +10,7 @@ use tensord::api::v1::{
 pub fn pin(root: &Path) -> Option<[u8; 32]> {
     let pem = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).ok()?;
     let leaf = rustls_pemfile::certs(&mut pem.as_slice()).next()?.ok()?;
-    Some(tensorfs_core::sha256::digest(&leaf))
+    Some(tensorfs::sha256::digest(&leaf))
 }
 
 /// A client of the machine root's listener on `port`, authorized by `auth`.

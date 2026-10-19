@@ -15,8 +15,8 @@ use std::process::Command;
 use common::{Home, Out};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use tensorfs_core::format::{Body, ObjectRef};
-use tensorfs_core::store2::Store;
+use tensorfs::format::{Body, ObjectRef};
+use tensorfs::store2::Store;
 
 /// tensorhub `migrations/postgres/0102_drop_tensorfs_v1.up.sql` at 250e29ef (#1203), verbatim.
 const RELEASE_TWO: &str = include_str!("fixtures/migrate/0102_drop_tensorfs_v1.up.sql");
@@ -294,7 +294,7 @@ fn same_tensors(old: &Old, root: &Path, manifest: &str) {
     let ck = store.checkpoint(&ObjectRef { sha256, length }).unwrap();
     for t in &old.tensors {
         let stored = ck.tensor(COMPONENT, t.key).unwrap();
-        let at: Vec<(String, tensorfs_core::format::Location)> = match &stored.body {
+        let at: Vec<(String, tensorfs::format::Location)> = match &stored.body {
             Body::Data(at) => vec![(String::new(), *at)],
             Body::Encoded { parts, .. } => parts.iter().map(|p| (p.role.clone(), p.at())).collect(),
         };

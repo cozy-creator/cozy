@@ -15,7 +15,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
-use tensorfs_core::{format::ObjectRef, store2::Store};
+use tensorfs::{format::ObjectRef, store2::Store};
 
 /// One released model: `repository` at `release` in `lane`, held in a source store.
 pub struct Model {
@@ -214,7 +214,7 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
         let links: String = served.packages.iter().filter(|p| p.name.starts_with(&format!("{org}/"))).flat_map(doors)
             .filter(|(name, _, _)| name == distribution)
             .map(|(_, door, bytes)| format!("<a href=\"{}{door}#sha256={}\">{}</a>\n", served.origin,
-                tensorfs_core::sha256::hex_digest(bytes), door.rsplit('/').next().unwrap()))
+                tensorfs::sha256::hex_digest(bytes), door.rsplit('/').next().unwrap()))
             .collect();
         format!("<!DOCTYPE html><html><body>\n{links}</body></html>\n")
     });
@@ -237,9 +237,9 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
         (Method::POST, _) if planned.is_some() => {
             let (package, (pyproject, lock)) = (&served.packages[planned.unwrap()], &served.locked.get().unwrap()[planned.unwrap()]);
             let exact = |bytes: &[u8]| json!({"canonical_bytes": base64::engine::general_purpose::STANDARD.encode(bytes),
-                "digest": format!("sha256:{}", tensorfs_core::sha256::hex_digest(bytes)), "length": bytes.len()});
+                "digest": format!("sha256:{}", tensorfs::sha256::hex_digest(bytes)), "length": bytes.len()});
             let (distribution, door, bytes) = doors(package).next().unwrap();
-            let wheel = json!({"digest": format!("sha256:{}", tensorfs_core::sha256::hex_digest(bytes)),
+            let wheel = json!({"digest": format!("sha256:{}", tensorfs::sha256::hex_digest(bytes)),
                 "distribution": distribution, "import_roots": [], "kind": "project_wheel", "length": bytes.len(),
                 "path": package.wheel, "tags": ["py3-none-any"], "url": format!("{}{door}", served.origin.replace("127.0.0.1", "localhost")),
                 "version": package.release});

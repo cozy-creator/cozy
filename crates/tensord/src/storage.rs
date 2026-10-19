@@ -18,8 +18,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub use tensorfs_core::store2::{Collected, Pin, Store, Usage};
-use tensorfs_core::format::ObjectRef;
+pub use tensorfs::store2::{Collected, Pin, Store, Usage};
+use tensorfs::format::ObjectRef;
 
 /// A cache pin unused this long expires.
 pub const TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -49,7 +49,7 @@ pub mod pin {
     }
     /// A retained file tree (a run's native inputs, a workspace upload), by its owner's digest.
     pub fn tree(owner: &str) -> String {
-        format!("tree-{}", tensorfs_core::sha256::hex_digest(owner.as_bytes()))
+        format!("tree-{}", tensorfs::sha256::hex_digest(owner.as_bytes()))
     }
 
     /// Caches: dropped on a TTL or a low disk. Objects and trees are released by their owners.
@@ -131,11 +131,11 @@ pub fn drop_pre_cut(root: &Path) -> io::Result<()> {
 /// The catalog at the root of a store from before TensorFS 0.12's format cut.
 const PRE_CUT_CATALOG: &str = "tensorfs.sqlite";
 
-pub fn io_error(error: tensorfs_core::store2::Error) -> io::Error {
+pub fn io_error(error: tensorfs::store2::Error) -> io::Error {
     let kind = match &error {
-        tensorfs_core::store2::Error::Full { .. } => io::ErrorKind::StorageFull,
-        tensorfs_core::store2::Error::Absent(_) => io::ErrorKind::NotFound,
-        tensorfs_core::store2::Error::Io { source, .. } => source.kind(),
+        tensorfs::store2::Error::Full { .. } => io::ErrorKind::StorageFull,
+        tensorfs::store2::Error::Absent(_) => io::ErrorKind::NotFound,
+        tensorfs::store2::Error::Io { source, .. } => source.kind(),
         _ => io::ErrorKind::InvalidData,
     };
     io::Error::new(kind, error.to_string())
@@ -277,7 +277,7 @@ pub fn relieve(store: &Store, keep: &[String], need: u64) -> io::Result<Collecte
 pub fn local(store: &Store, name: &str) -> io::Result<Option<ObjectRef>> {
     match store.resolve(&format!("local/{name}"), None) {
         Ok(named) => Ok(Some(named.manifest).filter(|manifest| store.reuse(manifest).unwrap_or(false))),
-        Err(error) if error.kind == tensorfs_core::failure::Kind::NotFound => Ok(None),
+        Err(error) if error.kind == tensorfs::failure::Kind::NotFound => Ok(None),
         Err(error) => Err(io::Error::other(error.to_string())),
     }
 }
@@ -288,7 +288,7 @@ pub fn set_local(store: &Store, name: &str, manifest: &ObjectRef) -> io::Result<
         .update_ref(&format!("local/{name}"), |_| None)
         .map_err(io_error)?;
     store
-        .set_lane(&format!("local/{name}"), tensorfs_core::client::IMPORT_RELEASE, None, manifest)
+        .set_lane(&format!("local/{name}"), tensorfs::client::IMPORT_RELEASE, None, manifest)
         .map(drop)
         .map_err(|error| io::Error::other(error.to_string()))
 }
@@ -302,7 +302,7 @@ pub fn held(store: &Store, id: &str) -> io::Result<ObjectRef> {
 }
 
 /// The checkpoint `id` names, held here (its structure; chunks may be absent).
-pub fn checkpoint(store: &Store, id: &str) -> io::Result<tensorfs_core::store2::Checkpoint> {
+pub fn checkpoint(store: &Store, id: &str) -> io::Result<tensorfs::store2::Checkpoint> {
     store.checkpoint(&held(store, id)?).map_err(io_error)
 }
 
@@ -313,8 +313,8 @@ pub fn present(store: &Store, object: &ObjectRef) -> bool {
 
 /// The chunks the tensors of `components` live in (all components when empty), each once;
 /// none when it names a component the checkpoint lacks.
-pub fn chunks(checkpoint: &tensorfs_core::store2::Checkpoint, components: &[String]) -> Vec<ObjectRef> {
-    tensorfs_core::fetch::chunks(checkpoint.header(), (!components.is_empty()).then_some(components)).unwrap_or_default()
+pub fn chunks(checkpoint: &tensorfs::store2::Checkpoint, components: &[String]) -> Vec<ObjectRef> {
+    tensorfs::fetch::chunks(checkpoint.header(), (!components.is_empty()).then_some(components)).unwrap_or_default()
 }
 
 /// `text` is 64 lowercase hex digits (a bare sha256), or `sha256:` and them when `prefixed`.

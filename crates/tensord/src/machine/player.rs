@@ -65,7 +65,7 @@ pub fn endpoint(port: u16, reach: &Reach, cert_der: &[u8]) -> v1::WebRtc {
     v1::WebRtc {
         port: port.into(),
         addresses,
-        fingerprint: tensorfs_core::sha256::hex_digest(cert_der),
+        fingerprint: tensorfs::sha256::hex_digest(cert_der),
         unavailable_reason,
     }
 }
@@ -127,7 +127,7 @@ mod tests {
         for address in &reported.addresses {
             std::net::TcpStream::connect(address).unwrap();
         }
-        assert_eq!(reported.fingerprint, tensorfs_core::sha256::hex_digest(b"leaf"));
+        assert_eq!(reported.fingerprint, tensorfs::sha256::hex_digest(b"leaf"));
         fs::remove_dir_all(root).unwrap();
     }
 

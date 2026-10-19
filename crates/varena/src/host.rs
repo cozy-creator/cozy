@@ -28,7 +28,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use tensorfs_core::ids::ObjectRef;
+use tensorfs::ids::ObjectRef;
 use platform::shm::{self, Region, RESIZE_SEALS, WRITE_SEALS};
 
 use crate::cuda;

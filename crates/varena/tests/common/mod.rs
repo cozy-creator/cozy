@@ -7,13 +7,13 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tensorfs_core::dtype::Dtype;
-use tensorfs_core::header::{Body, Header, Part, Tensor};
-use tensorfs_core::ids::ObjectRef;
-use tensorfs_core::meta::Meta;
-use tensorfs_core::read::{self, plan_for_traversal, ReadPlan};
-use tensorfs_core::registry;
-use tensorfs_core::store::{Fault, Store};
+use tensorfs::dtype::Dtype;
+use tensorfs::header::{Body, Header, Part, Tensor};
+use tensorfs::ids::ObjectRef;
+use tensorfs::meta::Meta;
+use tensorfs::read::{self, plan_for_traversal, ReadPlan};
+use tensorfs::registry;
+use tensorfs::store::{Fault, Store};
 use varena::{Plane, PlaneConfig, WsId};
 
 pub const MIB: usize = 1 << 20;
@@ -52,7 +52,7 @@ impl Fixture {
         let root = std::env::temp_dir().join(format!(
             "tfs-plane-{name}-{}-{}",
             std::process::id(),
-            tensorfs_core::meta::now_nanos_unique()
+            tensorfs::meta::now_nanos_unique()
         ));
         let store = Store::init(&root).unwrap();
         let plain = registry::seeds().into_iter().find(|s| s.alias == "plain/1").unwrap().spec;

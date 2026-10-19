@@ -1,7 +1,7 @@
 name: dev-build
 # Builds release artifacts for any ref and runs one targeted test command, off the dev box:
 #   gh workflow run dev-build.yaml -R cozy-creator/cozy-creator -f ref=<sha> [-f build=none] [-f test='cargo test -p protocol']
-#   TensorFS: -f build=tensorfs -f test='cargo test -p tensorfs-core --test store_contract'
+#   TensorFS: -f build=tensorfs -f test='cargo test -p tensorfs --test store_contract'
 # Artifacts: tensord-<sha> (the runner arch's manylinux tensord that Runtime's wheel bundles),
 # cozy-<sha> (the runner arch's dev `cozy`, <version>+dev.g<sha8>, which `cozy machine update --tensord`
 # runs on any machine: `ghbuild.sh cozy <ref> cozy`, `-r ubuntu-24.04-arm` for arm64) and
@@ -145,27 +145,27 @@ jobs:
           maturin-version: v1.15.0
           target: x86_64
           manylinux: auto
-          working-directory: crates/tensorfs
+          working-directory: crates/tensorfs-py
           args: --release --locked --target-dir ../../target/manylinux --out dist
           before-script-linux: |
-            cargo build --release --locked --target-dir ../../target/manylinux -p tensorfs-core --bin tfs
+            cargo build --release --locked --target-dir ../../target/manylinux -p tensorfs --bin tfs
             install -D -m 755 ../../target/manylinux/release/tfs wheel-data/scripts/tfs
       # The container leaves root-owned files the tests and the cache post-step write.
       - if: always() && contains(inputs.build, 'tensorfs')
-        run: sudo chown -R "$(id -u):$(id -g)" target crates/tensorfs
+        run: sudo chown -R "$(id -u):$(id -g)" target crates/tensorfs-py
       - if: contains(inputs.build, 'tensorfs')
         uses: actions/upload-artifact@v4
         with:
           name: tensorfs-wheel-${{ steps.sha.outputs.sha }}
-          path: crates/tensorfs/dist/*.whl
+          path: crates/tensorfs-py/dist/*.whl
           if-no-files-found: error
           retention-days: 7
       - if: contains(inputs.build, 'tensorfs') && inputs.test != ''
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/tensorfs"
-          uv pip install --python "$RUNNER_TEMP/tensorfs/bin/python" crates/tensorfs/dist/*.whl
+          uv pip install --python "$RUNNER_TEMP/tensorfs/bin/python" crates/tensorfs-py/dist/*.whl
           echo "TENSORFS_TEST_PYTHON=$RUNNER_TEMP/tensorfs/bin/python" >> "$GITHUB_ENV"
-          echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$PWD"/crates/tensorfs/dist/tensorfs-*.whl)" >> "$GITHUB_ENV"
+          echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$PWD"/crates/tensorfs-py/dist/tensorfs-*.whl)" >> "$GITHUB_ENV"
       - if: inputs.runtime_ref != ''
         uses: actions/checkout@v5
         with:

@@ -9,8 +9,8 @@
 use std::{collections::BTreeMap, io};
 
 use serde::Serialize;
-use tensorfs_core::format::{Body, Component, Dtype, Header, ObjectRef, Tensor};
-use tensorfs_core::store2::{Checkpoint, Store};
+use tensorfs::format::{Body, Component, Dtype, Header, ObjectRef, Tensor};
+use tensorfs::store2::{Checkpoint, Store};
 
 use crate::storage::{self, pin};
 
@@ -289,7 +289,7 @@ pub fn compose(store: &Store, base: &ObjectRef, selections: &[Selection]) -> io:
         .iter()
         .map(|s| serde_json::json!([&s.manifest.id(), s.component, s.source_component, s.strength.to_string()]))
         .collect();
-    let identity = tensorfs_core::sha256::hex_digest(
+    let identity = tensorfs::sha256::hex_digest(
         &serde_json_canonicalizer::to_vec(&serde_json::json!([FORMAT, base.id(), rows])).map_err(io::Error::other)?,
     );
     let id = pin::view(&identity[..40]);
@@ -314,7 +314,7 @@ pub fn compose(store: &Store, base: &ObjectRef, selections: &[Selection]) -> io:
         writer.copy_as(component, key, from, from_component, from_key).map_err(storage::io_error)?;
     }
     for (path, object) in &base.manifest().files {
-        if path != tensorfs_core::format::HEADER_PATH {
+        if path != tensorfs::format::HEADER_PATH {
             writer.file(path, &store.read(object).map_err(storage::io_error)?).map_err(storage::io_error)?;
         }
     }

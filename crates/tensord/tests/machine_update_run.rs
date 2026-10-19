@@ -75,7 +75,7 @@ fn hold(root: &Path, bytes: &[u8]) -> String {
     let owner = SigningKey::from_bytes(&OWNER).verifying_key();
     tensord::journal::Journal::open(&engine.join("execution"))
         .unwrap()
-        .bind_object(&tensorfs_core::sha256::hex(owner.as_bytes()), &object)
+        .bind_object(&tensorfs::sha256::hex(owner.as_bytes()), &object)
         .unwrap();
     format!("sha256:{sha256}")
 }

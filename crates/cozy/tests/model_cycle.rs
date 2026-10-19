@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use common::{Home, Out};
 use serde_json::Value;
-use tensorfs_core::{
+use tensorfs::{
     fetch::{Client, SourcePolicy, TensorhubOrigin},
     format::ObjectRef,
     store2::Store,

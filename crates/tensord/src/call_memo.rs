@@ -6,7 +6,7 @@
 //! parameters a request must give for it to be memoizable at all.
 use crate::{api::domain::ModelChoice, catalog::Generation, gpu_service::Plan, journal::InputFile};
 use serde_json::{json, Value};
-use tensorfs_core::sha256;
+use tensorfs::sha256;
 
 pub enum Memo {
     /// Not memoizable: not declared so, or nothing identifies its code.

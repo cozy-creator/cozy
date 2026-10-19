@@ -38,5 +38,6 @@ cargo build --release -p cozy
 ```
 
 The workspace's crates live in `crates/`: `cozy` (the binary), `cli`, `calcifer`, `tensord`,
-`tensorfs-core`, `varena`, `tensorfs-py`, `hub-client`, `protocol` and `platform`; `crates/tensorfs` is
-TensorFS's Python package. The browser player is `web/player`.
+`tensorfs`, `varena`, `tensorfs-py`, `hub-client`, `protocol` and `platform`.
+`crates/tensorfs` is the Rust library and `tfs` CLI; `crates/tensorfs-py` contains its PyO3 bindings,
+Python package and wheel configuration together. The browser player is `web/player`.

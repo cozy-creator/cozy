@@ -97,7 +97,7 @@ fn actor() -> String {
     actor_of(&SIGNER)
 }
 fn actor_of(key: &[u8; 32]) -> String {
-    tensorfs_core::sha256::hex(&SigningKey::from_bytes(key).verifying_key().to_bytes())
+    tensorfs::sha256::hex(&SigningKey::from_bytes(key).verifying_key().to_bytes())
 }
 
 fn launch(root: &Path, extra: &[std::ffi::OsString]) -> (Child, String) {
@@ -230,7 +230,7 @@ mod v1_api {
                 .unwrap();
         let pem = ready["cert_pem"].as_str().unwrap();
         let leaf = rustls_pemfile::certs(&mut pem.as_bytes()).next().unwrap().unwrap();
-        Client::new(&machine.address, tensorfs_core::sha256::digest(&leaf), Auth::None).unwrap()
+        Client::new(&machine.address, tensorfs::sha256::digest(&leaf), Auth::None).unwrap()
     }
     fn by(client: &Client, cap: &str) -> Client {
         client.with_auth(Auth::Token(cap.into()))
@@ -333,7 +333,7 @@ mod v1_api {
         while let Some(chunk) = body.next().await {
             data.extend_from_slice(&chunk?);
         }
-        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&data));
+        let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&data));
         Ok((Meta { rev: output.rev, length: output.length, digest }, data))
     }
 
@@ -426,7 +426,7 @@ mod v1_api {
         let machine = Machine::start().await;
         let (client, owner) = (client(&machine), cap(Grant { action: MACHINE.into(), ..Default::default() }));
         let body: Vec<u8> = (0..4u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
-        let (digest, length) = (format!("sha256:{}", tensorfs_core::sha256::hex_digest(&body)), body.len() as u64);
+        let (digest, length) = (format!("sha256:{}", tensorfs::sha256::hex_digest(&body)), body.len() as u64);
         let follower = by(&client, &owner);
         let mut held = Box::pin(follower.follow_held(&digest, length).await.unwrap());
         assert_eq!(held.next().await.unwrap().unwrap(), 0, "nothing held before the first part");
@@ -514,7 +514,7 @@ mod v1_api {
         assert_eq!(meta.length, report.length);
         let digest = format!(
             "sha256:{}",
-            tensorfs_core::sha256::hex(&tensorfs_core::sha256::digest(&bytes))
+            tensorfs::sha256::hex(&tensorfs::sha256::digest(&bytes))
         );
         assert_eq!(
             (meta.digest.as_str(), report.digest.as_str()),
@@ -925,14 +925,14 @@ mod v1_api {
         let mut files = vec![];
         for name in names {
             let bytes = fs::read(project.join(name)).unwrap();
-            let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&bytes));
+            let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&bytes));
             write(client, cap, &digest, bytes.len() as u64, 0, &bytes).await.unwrap();
             files.push(serde_json::json!({"name": name, "digest": digest, "length": bytes.len()}));
         }
         let manifest = serde_json::to_vec(&serde_json::json!({"package": package, "release": "0.1.0",
             "python_version": "3.12", "files": files}))
         .unwrap();
-        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
+        let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&manifest));
         write(client, cap, &digest, manifest.len() as u64, 0, &manifest).await.unwrap();
         digest
     }
@@ -969,7 +969,7 @@ mod v1_api {
                 .unwrap();
         }
         let source = archive.into_inner().unwrap();
-        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&source));
+        let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&source));
         let length = source.len() as u64;
         assert_eq!(
             write(client, cap, &digest, length, 0, &source)
@@ -981,7 +981,7 @@ mod v1_api {
             "package": package, "release": "0.1.0",
             "python_version": "3.12", "source": {"digest": digest, "length": length}}))
         .unwrap();
-        let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
+        let manifest_digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&manifest));
         let size = manifest.len() as u64;
         assert_eq!(
             write(client, cap, &manifest_digest, size, 0, &manifest)
@@ -1075,8 +1075,8 @@ mod v1_api {
         let (first, wide) = (transaction("weights-again"), transaction("weights-wider"));
         assert!(wide.len() == 1 && wide != first, "{first:?} {wide:?}");
         drop(journal);
-        let held = tensorfs_core::store2::Store::open(machine.store()).unwrap();
-        let reference = tensorfs_core::format::ObjectRef {
+        let held = tensorfs::store2::Store::open(machine.store()).unwrap();
+        let reference = tensorfs::format::ObjectRef {
             sha256: written.digest.trim_start_matches("sha256:").into(),
             length: written.length,
         };
@@ -1225,8 +1225,8 @@ mod v1_api {
     }
 
     /// A one-tensor checkpoint of `n` f32 elements a model slot constructs from, and its config.
-    fn constructible(store: &tensorfs_core::store2::Store, n: usize) -> tensorfs_core::format::ObjectRef {
-        use tensorfs_core::{format::Dtype, writer::{Data, Source}};
+    fn constructible(store: &tensorfs::store2::Store, n: usize) -> tensorfs::format::ObjectRef {
+        use tensorfs::{format::Dtype, writer::{Data, Source}};
         let mut writer = store.writer(None, None).unwrap();
         writer.put("model", "weight", &Dtype::F32, &[n as u64], Data::Plain(Source::Read(&mut vec![5u8; 4 * n].as_slice()))).unwrap();
         writer.file("model/config.json", serde_json::json!({"n": n}).to_string().as_bytes()).unwrap();
@@ -1249,7 +1249,7 @@ mod v1_api {
         let mut args = installing_args(&tools);
         args.extend(["--gpu-config".into(), config.clone().into_os_string()]);
         let machine = Machine::start_args(|state, _| {
-            let store = tensorfs_core::store2::Store::open(state.join("tensorfs")).unwrap();
+            let store = tensorfs::store2::Store::open(state.join("tensorfs")).unwrap();
             let manifest = constructible(&store, 2048);
             fs::write(&config, serde_json::json!({"devices": "0,1", "environment": {
                 "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home},
@@ -1324,7 +1324,7 @@ mod v1_api {
         let mut args = installing_args(&tools);
         args.extend(["--gpu-config".into(), config.clone().into_os_string()]);
         let machine = Machine::start_args(|state, _| {
-            let store = tensorfs_core::store2::Store::open(state.join("tensorfs")).unwrap();
+            let store = tensorfs::store2::Store::open(state.join("tensorfs")).unwrap();
             let manifest = constructible(&store, (WEIGHT_MIB << 18) as usize);
             fs::write(&config, serde_json::json!({"devices": "0", "environment": {
                 "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home},
@@ -1411,7 +1411,7 @@ mod v1_api {
         let requires: Vec<String> = requirements.split("dependencies = [").nth(1).unwrap().split(']').next().unwrap()
             .split('"').skip(1).step_by(2).map(str::to_string).collect();
         let source = std::env::temp_dir().join(format!("cm-update-{}", uuid::Uuid::new_v4()));
-        let store = tensorfs_core::store2::Store::open(&source).unwrap();
+        let store = tensorfs::store2::Store::open(&source).unwrap();
         let model = names_hub::Model { repository: "acme/weight".into(), release: "1".into(), lane: "f32".into(),
             manifest: constructible(&store, (weight_mib << 18) as usize) };
         let release = |release: &str| names_hub::Package {
@@ -1514,7 +1514,7 @@ mod v1_api {
         let authkit = hub_oauth::AuthKit::start(&upstream);
         let mut held = None;
         let machine = Machine::start_with(|state, _| {
-            let store = tensorfs_core::store2::Store::open(state.join("tensorfs")).unwrap();
+            let store = tensorfs::store2::Store::open(state.join("tensorfs")).unwrap();
             let manifest = hub_oauth::checkpoint(&store, &[7; 8192]);
             tensord::storage::set_local(&store, "tiny", &manifest).unwrap();
             held = Some(manifest.id());
@@ -1622,7 +1622,7 @@ mod v1_api {
     #[tokio::test]
     async fn runs_name_their_release_and_model_and_a_warm_run_asks_the_hub_nothing() {
         let source = std::env::temp_dir().join(format!("cm-names-{}", uuid::Uuid::new_v4()));
-        let store = tensorfs_core::store2::Store::open(&source).unwrap();
+        let store = tensorfs::store2::Store::open(&source).unwrap();
         let manifest = hub_oauth::checkpoint(&store, &[5; 8192]);
         let model = names_hub::Model {
             repository: "acme/model".into(),
@@ -1758,7 +1758,7 @@ mod v1_api {
             return;
         }
         let source = std::env::temp_dir().join(format!("cm-tasks-{}", uuid::Uuid::new_v4()));
-        let store = tensorfs_core::store2::Store::open(&source).unwrap();
+        let store = tensorfs::store2::Store::open(&source).unwrap();
         // 300 objects each: a pull would start a stream for every one.
         let model = |name: &str, tag: u32| {
             let bodies: Vec<Vec<u8>> = (0..300u32)
@@ -1809,7 +1809,7 @@ mod v1_api {
     #[ignore = "real AuthKit: go and AUTHKIT_TEST_DATABASE_URL"]
     async fn the_owners_checkpoint_by_hash_reads_under_the_runs_capability() {
         let source = std::env::temp_dir().join(format!("cm-private-{}", uuid::Uuid::new_v4()));
-        let store = tensorfs_core::store2::Store::open(&source).unwrap();
+        let store = tensorfs::store2::Store::open(&source).unwrap();
         let manifest = hub_oauth::checkpoint(&store, &[9; 8192]);
         let model = names_hub::Model {
             repository: "acme/private".into(),
@@ -1945,7 +1945,7 @@ mod v1_api {
             .output()
             .unwrap();
         assert!(file.status.success());
-        let sha256 = tensorfs_core::sha256::hex_digest(&file.stdout);
+        let sha256 = tensorfs::sha256::hex_digest(&file.stdout);
         let length = file.stdout.len() as u64;
         let held = write(&client, &all, &format!("sha256:{sha256}"), length, 0, &file.stdout)
             .await
@@ -1975,7 +1975,7 @@ mod v1_api {
         let result: serde_json::Value = json(&done.result);
         let model = &result["models"][0];
         assert_eq!(model["published"]["destination"], "local/unet", "{result}");
-        let store = tensorfs_core::store2::Store::open(machine.store()).unwrap();
+        let store = tensorfs::store2::Store::open(machine.store()).unwrap();
         let manifest = tensord::storage::local(&store, "unet").unwrap().unwrap();
         assert_eq!(model["manifest"], manifest.id());
     }
@@ -1995,14 +1995,14 @@ mod v1_api {
         let files: [(&str, &[u8]); 2] = [("a.txt", b"alpha"), ("nested/b.bin", b"\x00\x01beta")];
         let mut entries = vec![];
         for (path, body) in files {
-            let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(body));
+            let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(body));
             let length = body.len() as u64;
             assert_eq!(write(&client, &all, &digest, length, 0, body).await.unwrap(), length);
             entries.push(serde_json::json!({"kind": "file", "path": path,
                 "blob": {"sha256": digest.trim_start_matches("sha256:"), "length": length}}));
         }
         let tree = serde_json::to_vec(&serde_json::json!({"entries": entries})).unwrap();
-        let tree_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&tree));
+        let tree_digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&tree));
         let size = tree.len() as u64;
         assert_eq!(write(&client, &all, &tree_digest, size, 0, &tree).await.unwrap(), size);
         let spec = v1::RunSpec {
@@ -2035,7 +2035,7 @@ mod v1_api {
         assert_eq!(result["files"], serde_json::json!(["a.txt", "nested/b.bin"]), "{result}");
         let mut whole = b"alpha".to_vec();
         whole.extend_from_slice(b"\x00\x01beta");
-        assert_eq!(result["sha256"], tensorfs_core::sha256::hex_digest(&whole));
+        assert_eq!(result["sha256"], tensorfs::sha256::hex_digest(&whole));
         let _ = fs::remove_dir_all(tools);
     }
 
@@ -2138,7 +2138,7 @@ mod v1_api {
         assert_eq!(paths, ["b.txt", "empty.txt", "nested/a.txt"], "{tree}");
         let (meta, member) = read(&client, &all, target("nested/a.txt")).await.unwrap();
         assert_eq!(member, b"verified");
-        assert_eq!(meta.digest, format!("sha256:{}", tensorfs_core::sha256::hex_digest(b"verified")));
+        assert_eq!(meta.digest, format!("sha256:{}", tensorfs::sha256::hex_digest(b"verified")));
         assert_eq!(read(&client, &all, target("empty.txt")).await.unwrap().1, b"");
         assert_eq!(read(&client, &all, target("absent")).await.unwrap_err().status(), Some(404));
         let _ = fs::remove_dir_all(tools);
@@ -2488,7 +2488,7 @@ mod v1_api {
         let wheel = fs::read_dir(&built).unwrap().map(|e| e.unwrap().path())
             .find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap();
         let bytes = fs::read(&wheel).unwrap();
-        let wheel_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&bytes));
+        let wheel_digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&bytes));
         write(&client, &all, &wheel_digest, bytes.len() as u64, 0, &bytes).await.unwrap();
         let mut archive = tar::Builder::new(Vec::new());
         for name in ["pyproject.toml", "package.toml", "cpu_caller/__init__.py"] {
@@ -2497,7 +2497,7 @@ mod v1_api {
                 .unwrap();
         }
         let source = archive.into_inner().unwrap();
-        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&source));
+        let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&source));
         write(&client, &all, &digest, source.len() as u64, 0, &source).await.unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({
             "package": "local/tensord-cpu-caller", "release": "0.1.0", "python_version": "3.12",
@@ -2505,7 +2505,7 @@ mod v1_api {
             "wheels": [{"name": wheel.file_name().unwrap().to_str().unwrap(), "digest": wheel_digest, "length": bytes.len()}],
             "callees": {"tensord-cpu-memo": "local/tensord-cpu-memo"}}))
         .unwrap();
-        let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
+        let manifest_digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&manifest));
         write(&client, &all, &manifest_digest, manifest.len() as u64, 0, &manifest).await.unwrap();
         let counter = machine.root.join("measured");
         let spec = v1::RunSpec {
@@ -2605,7 +2605,7 @@ mod v1_api {
             .await
             .unwrap();
             assert!(image.starts_with(b"\x89PNG"), "reference {index} is no PNG");
-            let digest = tensorfs_core::sha256::hex_digest(&image);
+            let digest = tensorfs::sha256::hex_digest(&image);
             assert!(returned.contains(&digest), "reference {index} ({digest}) is not the one returned: {returned}");
             seen.push(digest);
         }
@@ -2679,7 +2679,7 @@ mod v1_api {
         assert_eq!(notes[1], notes[0], "the reused result is the same files");
         assert_eq!(fs::read_to_string(&noted).unwrap(), "2", "the second job ran its calls again");
         // The store loses one file (as its GC does once reclaim released it): that call runs.
-        let hex = tensorfs_core::sha256::hex_digest(b"note 5");
+        let hex = tensorfs::sha256::hex_digest(b"note 5");
         let blob = walkdir(&machine.root.join("state/tensorfs"))
             .into_iter()
             .find(|p| {
@@ -2741,7 +2741,7 @@ mod v1_api {
         let root_wheel = fs::read_dir(&built).unwrap().flatten()
             .map(|entry| entry.path()).find(|path| path.file_name().unwrap().to_str().unwrap().starts_with("tensord_cpu_caller-")).unwrap();
         let root_bytes = fs::read(&root_wheel).unwrap();
-        let root_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&root_bytes));
+        let root_digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&root_bytes));
         write(&client, &all, &root_digest, root_bytes.len() as u64, 0, &root_bytes).await.unwrap();
         let manifest = serde_json::to_vec(&serde_json::json!({
             "package":"local/tensord-cpu-caller","release":"0.1.0","python_version":"3.12",
@@ -2750,7 +2750,7 @@ mod v1_api {
                 {"name":wheel.file_name().unwrap().to_str().unwrap(),"digest":wheel_digest,"length":bytes.len()}],
             "callees":{"tensord-cpu-memo":"local/tensord-cpu-memo"}
         })).unwrap();
-        let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
+        let manifest_digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&manifest));
         write(&client, &all, &manifest_digest, manifest.len() as u64, 0, &manifest).await.unwrap();
         let wheel_counter = machine.root.join("wheel-measured");
         let events = collect(run_events(&client, &all, RunRequest {
@@ -2801,7 +2801,7 @@ mod v1_api {
             }).unwrap();
         let described: serde_json::Value = serde_json::from_slice(&described.stdout).unwrap();
         let source = std::env::temp_dir().join(format!("cm-callee-{}", uuid::Uuid::new_v4()));
-        let store = tensorfs_core::store2::Store::open(&source).unwrap();
+        let store = tensorfs::store2::Store::open(&source).unwrap();
         let model = names_hub::Model {
             repository: "acme/model".into(), release: "1.0.0".into(), lane: "bf16".into(),
             manifest: hub_oauth::checkpoint(&store, &[5; 8192]),
@@ -2869,7 +2869,7 @@ mod v1_api {
                 .unwrap();
         }
         let source = archive.into_inner().unwrap();
-        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&source));
+        let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&source));
         let length = source.len() as u64;
         // A probe holds nothing; half, then the rest from the held ranges.
         assert_eq!(
@@ -2913,7 +2913,7 @@ mod v1_api {
             "package": "local/tensord-cpu-lifecycle", "release": "0.1.0",
             "python_version": "3.12", "source": {"digest": digest, "length": length}}))
         .unwrap();
-        let manifest_digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&manifest));
+        let manifest_digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&manifest));
         let size = manifest.len() as u64;
         assert_eq!(
             write(&client, &all, &manifest_digest, size, 0, &manifest)
@@ -3051,7 +3051,7 @@ mod v1_api {
                 .write_image_data(&[7; 12])
                 .unwrap();
         }
-        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&reference));
+        let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&reference));
         let length = reference.len() as u64;
         assert_eq!(
             write(&client, &all, &digest, length, 0, &reference)
@@ -3101,12 +3101,12 @@ mod v1_api {
         assert_eq!(steps["series"].as_array().unwrap().len(), 3, "{measured}");
 
         // Each segment saw the job's reference and continued the previous segment's context.
-        let seen = tensorfs_core::sha256::hex_digest(&reference);
+        let seen = tensorfs::sha256::hex_digest(&reference);
         let mut film = String::new();
         let mut context = String::new();
         for (index, prompt) in segments.iter().enumerate() {
             let body = format!("{index}|{prompt}|{seen}|{context}\n");
-            context = tensorfs_core::sha256::hex_digest(body.as_bytes());
+            context = tensorfs::sha256::hex_digest(body.as_bytes());
             film.push_str(&body);
         }
         // Each child run is a settled call in the job's log, with what its executor measured.
@@ -3392,7 +3392,7 @@ mod v1_api {
                 .write_image_data(&[9; 12])
                 .unwrap();
         }
-        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&reference));
+        let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&reference));
         let length = reference.len() as u64;
         write(&client, &all, &digest, length, 0, &reference)
             .await
@@ -3466,11 +3466,11 @@ mod v1_api {
             let ended = outcome(&child);
             assert_eq!((ended.status.as_str(), ended.memoized), ("succeeded", memoized), "{ended:?}");
         }
-        let seen = tensorfs_core::sha256::hex_digest(&reference);
+        let seen = tensorfs::sha256::hex_digest(&reference);
         let (mut film, mut context) = (String::new(), String::new());
         for (index, prompt) in segments.iter().enumerate() {
             let body = format!("{index}|{prompt}|{seen}|{context}\n");
-            context = tensorfs_core::sha256::hex_digest(body.as_bytes());
+            context = tensorfs::sha256::hex_digest(body.as_bytes());
             film.push_str(&body);
         }
         let (_, bytes) = read(
@@ -3520,7 +3520,7 @@ mod v1_api {
                 .write_image_data(&[9; 12])
                 .unwrap();
         }
-        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&reference));
+        let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&reference));
         let length = reference.len() as u64;
         write(&client, &all, &digest, length, 0, &reference)
             .await
@@ -3585,7 +3585,7 @@ mod v1_api {
                 .write_image_data(&[9; 12])
                 .unwrap();
         }
-        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&reference));
+        let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&reference));
         let length = reference.len() as u64;
         write(&client, &all, &digest, length, 0, &reference)
             .await
@@ -3670,7 +3670,7 @@ mod v1_api {
             })
             .collect();
         assert_eq!(labels, ["Video (segments 1-1)"], "{events:?}");
-        let seen = tensorfs_core::sha256::hex_digest(&reference);
+        let seen = tensorfs::sha256::hex_digest(&reference);
         let (meta, bytes) = read(
             &client,
             &all,

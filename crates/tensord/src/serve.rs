@@ -119,7 +119,7 @@ fn machine_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
     }
     // The API's two threads and the transport's two, together.
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).thread_name("tensord").enable_all().build()?;
-    tensorfs_core::transport::use_runtime(runtime.handle().clone());
+    tensorfs::transport::use_runtime(runtime.handle().clone());
     Ok(RUNTIME.get_or_init(|| runtime))
 }
 

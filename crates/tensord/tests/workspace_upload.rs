@@ -37,7 +37,7 @@ fn make_header(operation: &str, name: &str, bytes: &[u8]) -> domain::LocalPackag
             digest: if name == "source.tar" {
                 vec![]
             } else {
-                tensorfs_core::sha256::digest(bytes).to_vec()
+                tensorfs::sha256::digest(bytes).to_vec()
             },
         }),
     }
@@ -182,7 +182,7 @@ fn source_archive_is_statically_inspected_and_imported_into_tensorfs() {
     assert!(!area
         .0
         .join("uploads")
-        .join(tensorfs_core::sha256::hex(&actor(1).public_key))
+        .join(tensorfs::sha256::hex(&actor(1).public_key))
         .join("static-source")
         .exists());
 }

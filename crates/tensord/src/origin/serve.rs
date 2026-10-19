@@ -16,7 +16,7 @@ use std::{
 };
 
 use serde_json::{json, Map, Value};
-use tensorfs_core::{
+use tensorfs::{
     err::{refuse, Code, Refusal, Result},
     format::ObjectRef,
 };

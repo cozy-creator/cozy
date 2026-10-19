@@ -191,7 +191,7 @@ fn spec_of(mut spec: v1::RunSpec) -> Result<(crate::runs::Spec, Option<v1::HubAc
         let mut identity = serde_json::to_value(&identity).expect("a run spec serializes");
         identity["payload"] = input.clone();
         let encoded = crate::boundary_json::exact(&identity);
-        format!("sha256:{}", tensorfs_core::sha256::hex_digest(&encoded))
+        format!("sha256:{}", tensorfs::sha256::hex_digest(&encoded))
     };
     if hub.as_ref().is_some_and(|hub| !crate::hub::valid_origin(&hub.origin)) {
         return Err(Error::validation("invalid_hub_origin", "the run's Hub origin is invalid"));
@@ -265,7 +265,7 @@ fn digest(text: &str) -> Result<Vec<u8>, Error> {
 }
 
 fn spell(bytes: &[u8]) -> String {
-    format!("sha256:{}", tensorfs_core::sha256::hex(bytes))
+    format!("sha256:{}", tensorfs::sha256::hex(bytes))
 }
 
 /// Canonical JSON bytes as the wire's raw JSON; none when empty or not JSON.

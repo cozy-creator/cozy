@@ -558,7 +558,7 @@ async fn a_slow_output_read_holds_the_rental_until_its_last_bytes() {
     let bulk = client.bulk().unwrap();
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpu_bulk");
     let write = async |bytes: Vec<u8>| -> String {
-        let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&bytes));
+        let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&bytes));
         let length = bytes.len() as u64;
         bulk.put(&digest, (0, length, length), bytes).await.unwrap();
         digest

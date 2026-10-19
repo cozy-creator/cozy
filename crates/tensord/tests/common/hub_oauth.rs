@@ -223,7 +223,7 @@ pub fn test_hub() -> (String, Arc<Mutex<Hub>>) {
                 let id = format!("sha256:{hex}");
                 assert_eq!(
                     id,
-                    format!("sha256:{}", tensorfs_core::sha256::hex_digest(&body))
+                    format!("sha256:{}", tensorfs::sha256::hex_digest(&body))
                 );
                 if headers.contains_key("authorization") || headers.contains_key("dpop") {
                     held.credentialed_uploads += 1;
@@ -308,14 +308,14 @@ pub fn test_hub() -> (String, Arc<Mutex<Hub>>) {
 }
 
 /// A one-tensor checkpoint in `store`: what a machine publishes.
-pub fn checkpoint(store: &tensorfs_core::store2::Store, weights: &[u8]) -> tensorfs_core::format::ObjectRef {
+pub fn checkpoint(store: &tensorfs::store2::Store, weights: &[u8]) -> tensorfs::format::ObjectRef {
     tensors(store, &[weights])
 }
 
 /// A checkpoint in `store` with one F32 tensor per entry of `weights` (16 MiB or more: its own
 /// chunks).
-pub fn tensors(store: &tensorfs_core::store2::Store, weights: &[&[u8]]) -> tensorfs_core::format::ObjectRef {
-    use tensorfs_core::{format::Dtype, writer::{Data, Source}};
+pub fn tensors(store: &tensorfs::store2::Store, weights: &[&[u8]]) -> tensorfs::format::ObjectRef {
+    use tensorfs::{format::Dtype, writer::{Data, Source}};
     let mut writer = store.writer(None, None).unwrap();
     for (at, weights) in weights.iter().enumerate() {
         assert!(!weights.is_empty() && weights.len().is_multiple_of(4));

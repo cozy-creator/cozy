@@ -1,14 +1,14 @@
 //! Document marshalling: canonical bytes in, plain Python data out.
 //!
 //! Nothing here decides anything. Every function hands bytes to the ONE reader in
-//! `tensorfs-core` and turns its result into dicts, lists, ints and strings. Python never
+//! `tensorfs` and turns its result into dicts, lists, ints and strings. Python never
 //! sees a partially-validated document: a refusal is raised before any data is built.
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
-use tensorfs_core::canon::Value;
-use tensorfs_core::header::{Closure as CoreClosure, Header};
-use tensorfs_core::spec::EncodingSpec;
+use tensorfs::canon::Value;
+use tensorfs::header::{Closure as CoreClosure, Header};
+use tensorfs::spec::EncodingSpec;
 
 use crate::errors::IntoPy;
 
@@ -91,10 +91,10 @@ fn marshal_header<'p>(py: Python<'p>, header: &Header) -> PyResult<Bound<'p, PyA
                 item.set_item("dtype", part.dtype.name())?;
                 item.set_item("shape", &part.shape)?;
                 match &part.body {
-                    tensorfs_core::header::Body::Inline(bytes) => {
+                    tensorfs::header::Body::Inline(bytes) => {
                         item.set_item("inline", PyBytes::new(py, bytes))?;
                     }
-                    tensorfs_core::header::Body::Segments(values) => {
+                    tensorfs::header::Body::Segments(values) => {
                         let segments = PyList::empty(py);
                         for segment in values {
                             let value = PyDict::new(py);

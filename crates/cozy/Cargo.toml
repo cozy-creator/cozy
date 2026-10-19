@@ -33,7 +33,7 @@ rustls.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
-tensorfs-core = { workspace = true, features = ["store"] }
+tensorfs = { workspace = true, features = ["store"] }
 tokio.workspace = true
 url.workspace = true
 vt100.workspace = true

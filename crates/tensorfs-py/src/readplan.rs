@@ -1,8 +1,8 @@
 //! Read plans: pure planning over a header (no store), for the plane and the store alike.
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use tensorfs_core::header::Header;
-use tensorfs_core::read::{self, Source as ReadSource};
+use tensorfs::header::Header;
+use tensorfs::read::{self, Source as ReadSource};
 
 use crate::errors::IntoPy;
 

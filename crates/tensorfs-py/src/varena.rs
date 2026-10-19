@@ -265,7 +265,7 @@ impl PyPlane {
         host_fd: Option<i32>,
     ) -> PyResult<PyWeightSet> {
         let (ck, plane) = (ck.stored(py)?, &self.plane);
-        let regions = regions.unwrap_or_else(|| tensorfs_core::client::regions(ck.header(), 64 << 20, &[], &[]));
+        let regions = regions.unwrap_or_else(|| tensorfs::client::regions(ck.header(), 64 << 20, &[], &[]));
         let (id, layout) = py
             .detach(|| {
                 let id = plane.register_checkpoint(&name, ck, &regions, host_fd)?;
@@ -297,7 +297,7 @@ impl PyPlane {
                 .try_clone_to_owned()
                 .map_err(|e| err(py, Error::Io(format!("object file {sha256}: {e}"))))?;
             let sha256 = sha256.strip_prefix("sha256:").unwrap_or(&sha256).to_string();
-            handed.push((tensorfs_core::ids::ObjectRef { sha256, length }, std::fs::File::from(owned)));
+            handed.push((tensorfs::ids::ObjectRef { sha256, length }, std::fs::File::from(owned)));
         }
         let (p, plane) = (&plan.plan, &self.plane);
         let (id, layout) = py

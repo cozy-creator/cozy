@@ -31,7 +31,7 @@ use crate::{
     stop::Stop,
     storage::{self, Store},
 };
-use tensorfs_core::{
+use tensorfs::{
     err::Refusal,
     fetch::Progress as Counted,
     format::ObjectRef,
@@ -529,7 +529,7 @@ impl Publisher {
             }
         };
         let (started, subject) = (Instant::now(), format!("{}@{} {}", named.repository, named.release, named.lane));
-        let logged = |pulled: &tensorfs_core::fetch::Pulled| {
+        let logged = |pulled: &tensorfs::fetch::Pulled| {
             let (fetched, reused) = (pulled.landed.origin + pulled.landed.volume, pulled.landed.local);
             let seconds = started.elapsed().as_secs_f64();
             let detail = format!("manifest={} objects={} fetched={fetched} reused={reused} seconds={seconds:.1} origin={}",
@@ -1494,7 +1494,7 @@ fn make_source(
     progress: &(dyn Fn(&str, u64, u64) + Sync),
 ) -> Result<Made, Failure> {
     let bearer = |token: &str| if token.is_empty() { String::new() } else { format!("bearer {token}") };
-    let access = tensorfs_core::import::Access {
+    let access = tensorfs::import::Access {
         huggingface_token: bearer(&providers.huggingface),
         civitai_token: bearer(&providers.civitai),
         ..Default::default()
@@ -1504,8 +1504,8 @@ fn make_source(
         [one] => [Some(one.as_str())],
         _ => return Err(("model_source_failed", "a source is converted by one table".into())),
     };
-    let listed = tensorfs_core::import::remote::parse(source)
-        .and_then(|spec| tensorfs_core::import::remote::list(&spec, &access))
+    let listed = tensorfs::import::remote::parse(source)
+        .and_then(|spec| tensorfs::import::remote::list(&spec, &access))
         .map_err(|e| refused("model_source_failed", e))?;
     let identity = serde_json_canonicalizer::to_vec(&json!(["cozy.machine-source-model/2", listed.pinned, converter]))
         .map_err(|e| io_failure(io::Error::other(e)))?;
@@ -1529,7 +1529,7 @@ fn make_source(
         }
         progress(stage, done, total)
     };
-    let request = tensorfs_core::import::Request {
+    let request = tensorfs::import::Request {
         sources: &[source.to_string()],
         converter,
         variant: None,
@@ -1562,9 +1562,9 @@ fn make_source(
 }
 
 /// A TensorFS refusal as a run's reason; a download the disk cannot fit is its own.
-fn refused(code: &'static str, refusal: tensorfs_core::err::Refusal) -> Failure {
+fn refused(code: &'static str, refusal: tensorfs::err::Refusal) -> Failure {
     match refusal.code {
-        tensorfs_core::err::Code::CAPACITY_EXHAUSTED => ("machine_disk_full", refusal.to_string()),
+        tensorfs::err::Code::CAPACITY_EXHAUSTED => ("machine_disk_full", refusal.to_string()),
         _ => (code, refusal.to_string()),
     }
 }

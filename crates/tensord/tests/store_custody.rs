@@ -7,7 +7,7 @@ use tensord::{
 };
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 use tensord::storage::{self, Store};
-use tensorfs_core::format::ObjectRef;
+use tensorfs::format::ObjectRef;
 
 struct Area {
     root: PathBuf,

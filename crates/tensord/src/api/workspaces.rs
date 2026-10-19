@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 use crate::{storage::Store, trees};
-use tensorfs_core::{format::ObjectRef, sha256};
+use tensorfs::{format::ObjectRef, sha256};
 use protocol::error::Error;
 
 const MAX_FILES: usize = 129;

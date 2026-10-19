@@ -6,10 +6,10 @@
 
 use std::os::unix::fs::FileExt;
 
-use tensorfs_core::client::regions;
-use tensorfs_core::format::Dtype;
-use tensorfs_core::store2::{Checkpoint, Store};
-use tensorfs_core::writer::{Data, Source};
+use tensorfs::client::regions;
+use tensorfs::format::Dtype;
+use tensorfs::store2::{Checkpoint, Store};
+use tensorfs::writer::{Data, Source};
 use varena::cuda::{self, CUstream, CtxGuard};
 use varena::{Plane, PlaneConfig, Tier, WsId};
 

@@ -25,7 +25,7 @@ use tensord::{
     origin::Publication,
     stop::Stop,
 };
-use tensorfs_core::{err::Code, format::ObjectRef, store2::Store};
+use tensorfs::{err::Code, format::ObjectRef, store2::Store};
 
 /// The patience a stopped publication is held to.
 const SAMPLE_SECONDS: f64 = 1.0;
@@ -240,7 +240,7 @@ fn weight(at: usize, size: usize) -> Vec<u8> {
 /// A store holding a checkpoint whose closure has one object per entry of `sizes` (a file of
 /// the manifest each), besides its header and chunk.
 fn store(name: &str, sizes: &[usize]) -> (std::path::PathBuf, Store, ObjectRef) {
-    use tensorfs_core::{format::Dtype, writer::{Data, Source}};
+    use tensorfs::{format::Dtype, writer::{Data, Source}};
     let root = std::env::temp_dir().join(format!("td-publication-{name}-{}", uuid::Uuid::new_v4()));
     let store = Store::open(&root).unwrap();
     let mut writer = store.writer(None, None).unwrap();
@@ -365,7 +365,7 @@ fn publish_refills_slots_while_a_large_put_waits_and_renews() {
     let mut sizes = vec![512; 24];
     sizes[0] = 1 << 20;
     let (root, store, manifest) = store("rolling", &sizes);
-    let blocked = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&weight(0, 1 << 20)));
+    let blocked = format!("sha256:{}", tensorfs::sha256::hex_digest(&weight(0, 1 << 20)));
     let (source, state) = hub();
     {
         let mut state = state.lock().unwrap();
@@ -392,7 +392,7 @@ fn a_stopped_publication_finalizes_nothing_and_resumes() {
     let mut sizes = vec![512; 8];
     sizes[0] = 1 << 20;
     let (root, store, manifest) = store("stopped", &sizes);
-    let blocked = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&weight(0, 1 << 20)));
+    let blocked = format!("sha256:{}", tensorfs::sha256::hex_digest(&weight(0, 1 << 20)));
     let (source, state) = hub();
     {
         let mut state = state.lock().unwrap();

@@ -270,7 +270,7 @@ async fn a_persistent_machine_reports_no_idle_deadline() {
     std::net::TcpStream::connect(&local).unwrap();
     let leaf = std::fs::read(root.join("run/cozy/bootstrap/tls.crt")).unwrap();
     let der = rustls_pemfile::certs(&mut &leaf[..]).next().unwrap().unwrap();
-    assert_eq!(webrtc.fingerprint, tensorfs_core::sha256::hex_digest(&der));
+    assert_eq!(webrtc.fingerprint, tensorfs::sha256::hex_digest(&der));
     // A play link outlives a restart: the port is kept.
     drop(machine);
     let mut machine = boot(&root, port, "persistent");

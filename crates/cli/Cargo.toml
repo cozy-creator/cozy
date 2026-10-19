@@ -37,7 +37,7 @@ sha2.workspace = true
 sigstore-verify.workspace = true
 supports-hyperlinks.workspace = true
 tempfile.workspace = true
-tensorfs-core.workspace = true
+tensorfs.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tokio-util.workspace = true
 toml.workspace = true

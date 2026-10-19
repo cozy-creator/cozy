@@ -9,7 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tensorfs_core::{
+use tensorfs::{
     err::{refuse, Code, Refusal, Result},
     fetch::{policy::is_loopback_origin, Location, Origin},
     format::ObjectRef,

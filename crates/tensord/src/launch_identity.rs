@@ -367,7 +367,7 @@ impl Seal {
             ));
         }
         // Directory names never carry a caller's spelling of the generation.
-        let generation = &tensorfs_core::sha256::hex_digest(generation.as_bytes())[..32];
+        let generation = &tensorfs::sha256::hex_digest(generation.as_bytes())[..32];
         let uid = identity.map_or_else(euid, |i| i.uid);
         let namespace = format!("u{uid}");
         let owned = |path: PathBuf| -> io::Result<PathBuf> {

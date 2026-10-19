@@ -713,7 +713,7 @@ mod copy_faults {
     fn a_region_refused_a_lock_is_bounced_and_never_asked_again() {
         use std::os::fd::AsRawFd;
         let fx = Fixture::new("gpu-sealed-refused");
-        let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+        let (lease, _) = tensorfs::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
         let source = varena::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
         let layout = varena::layout::Layout::build(&fx.plan(), &regions()).unwrap();
         let fd = varena::host::fill_sealed("unet", &layout, &source, 3, &varena::io::IoTally::default(), None).unwrap();
@@ -950,7 +950,7 @@ mod copy_faults {
 fn a_sealed_layout_reaches_the_device_pinned_inside_the_budget_and_locked_past_it() {
     use std::os::fd::AsRawFd;
     let fx = Fixture::new("gpu-sealed");
-    let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let (lease, _) = tensorfs::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
     let source = varena::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
     let layout = varena::layout::Layout::build(&fx.plan(), &regions()).unwrap();
     let tally = varena::io::IoTally::default();
@@ -1011,7 +1011,7 @@ fn a_layout_still_filling_reaches_the_device_region_by_region() {
     p.set_vram_budget(DEV, 512 << 20).unwrap();
     let device = p.want(ws, Tier::Device(DEV), None, 0, false).unwrap();
     assert!(!device.done().unwrap(), "no device copy before its region is Ready");
-    let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let (lease, _) = tensorfs::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
     let source = varena::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
     let filler = std::thread::spawn(move || fill.run(&layout, &source, 3, &varena::io::IoTally::default()));
     pinned.wait().unwrap();
@@ -1034,7 +1034,7 @@ fn a_layout_still_filling_reaches_the_device_region_by_region() {
 fn a_sealed_region_outside_the_pinned_books_is_locked_on_its_first_copy() {
     use std::os::fd::AsRawFd;
     let fx = Fixture::new("gpu-sealed-locked");
-    let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let (lease, _) = tensorfs::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
     let source = varena::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
     let layout = varena::layout::Layout::build(&fx.plan(), &regions()).unwrap();
     let fd = varena::host::fill_sealed("unet", &layout, &source, 3, &varena::io::IoTally::default(), None).unwrap();
@@ -1068,7 +1068,7 @@ fn a_sealed_region_outside_the_pinned_books_is_locked_on_its_first_copy() {
 fn served_window(fx: &Fixture, slots: usize) -> (std::os::fd::OwnedFd, std::sync::Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<varena::Result<()>>) {
     let layout = varena::layout::Layout::build(&fx.plan(), &regions()).unwrap();
     let (fd, window) = varena::window::open_window("unet", &layout, slots).unwrap();
-    let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let (lease, _) = tensorfs::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
     let source = varena::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let s = stop.clone();
@@ -1144,7 +1144,7 @@ fn holes_reach_the_device_from_the_object_files_and_staged_regions_from_the_layo
     fx.drop_cache();
     let layout = varena::layout::Layout::build(&fx.plan(), &regions()).unwrap();
     let (fd, fill) = varena::host::open_sealed("unet", &layout, None, Some(&[1])).unwrap();
-    let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let (lease, _) = tensorfs::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
     let source = varena::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
     fill.fill(&layout, &source, 3, &varena::io::IoTally::default()).unwrap();
     let files = fx.objects.iter().map(|o| (o.clone(), std::fs::File::open(fx.store.blob_path(&o.sha256)).unwrap())).collect();
@@ -1180,13 +1180,13 @@ fn a_failed_demand_fill_reports_its_cause_and_the_next_acquire_fills_again() {
     let fx = Fixture::new("gpu-refill");
     let layout = Layout::build(&fx.plan(), &regions()).unwrap();
     let (fd, fill) = varena::host::open_sealed("unet", &layout, None, Some(&[1])).unwrap();
-    let (lease, _) = tensorfs_core::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
+    let (lease, _) = tensorfs::read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
     let source = varena::io::Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
     fill.fill(&layout, &source, 3, &varena::io::IoTally::default()).unwrap();
     // The handed files are copies, so the hole region 2 reads can be made to fail and recover.
     let dir = fx.root.join("handed");
     std::fs::create_dir_all(&dir).unwrap();
-    let copy = |o: &tensorfs_core::ids::ObjectRef| {
+    let copy = |o: &tensorfs::ids::ObjectRef| {
         let path = dir.join(&o.sha256);
         std::fs::copy(fx.store.blob_path(&o.sha256), &path).unwrap();
         (o.clone(), std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap())

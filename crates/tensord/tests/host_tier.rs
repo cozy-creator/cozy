@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 use tensord::storage::Store;
-use tensorfs_core::{
+use tensorfs::{
     format::{Dtype, ObjectRef},
     store2::Checkpoint,
     writer::{Data, Source},

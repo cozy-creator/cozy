@@ -21,7 +21,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use crate::{stop::Stop, storage::Store};
-use tensorfs_core::{format::ObjectRef, sha256};
+use tensorfs::{format::ObjectRef, sha256};
 
 /// The manifest object (JSON). Members are objects the same signer wrote.
 #[derive(Deserialize)]
@@ -450,7 +450,7 @@ impl LocalSources {
             "client": self.installer.client_wheel,
             "python": self.installer.python,
         });
-        let alias = format!("local-{}", &tensorfs_core::sha256::hex_digest(key.to_string().as_bytes())[..32]);
+        let alias = format!("local-{}", &tensorfs::sha256::hex_digest(key.to_string().as_bytes())[..32]);
         let _installing = match self.installing.try_lock() {
             Ok(installing) => installing,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -564,7 +564,7 @@ mod tests {
         path::{Path, PathBuf},
         process::Command,
     };
-    use tensorfs_core::sha256;
+    use tensorfs::sha256;
 
     fn write(objects: &Objects, actor: &str, bytes: &[u8]) -> Member {
         let digest = format!("sha256:{}", sha256::hex_digest(bytes));

@@ -94,7 +94,7 @@ fn same_filename_activation_installs_new_runtime_and_retains_old_generation() {
         objects::Objects, service::Service,
     };
     use std::{path::PathBuf, process::Command, sync::Arc};
-    use tensorfs_core::sha256;
+    use tensorfs::sha256;
     assert_eq!(std::env::var("UV_OFFLINE").unwrap(), "1");
     let artifact = |name: &str| PathBuf::from(std::env::var(name).expect(name));
     let (a, b, tensorfs, report) = (

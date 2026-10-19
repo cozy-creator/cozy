@@ -6,7 +6,7 @@ and rewrites it in its one form: one case per line, keys sorted. Deterministic; 
 
     uv run --no-project --with numpy --with cbor2==6.1.4 python -I conformance/make_vectors.py
 
-`cargo test -p tensorfs-core --test format_conformance -- --ignored regenerate` then writes each
+`cargo test -p tensorfs --test format_conformance -- --ignored regenerate` then writes each
 family's repo, Conformance/<family>, into vectors/store.
 """
 

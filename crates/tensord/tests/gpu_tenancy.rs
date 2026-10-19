@@ -77,7 +77,7 @@ impl Pod {
         });
         let digest = |value: &Value| {
             let canonical = serde_json_canonicalizer::to_vec(value).unwrap();
-            format!("sha256:{}", tensorfs_core::sha256::hex_digest(&canonical))
+            format!("sha256:{}", tensorfs::sha256::hex_digest(&canonical))
         };
         let context = SubmissionContext {
             actor: actor.into(),

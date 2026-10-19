@@ -34,7 +34,7 @@ pub async fn refuses_capability_of(
     worker_id: &str,
     key: &ed25519_dalek::SigningKey,
 ) -> bool {
-    let pin = tensorfs_core::sha256::digest(leaf);
+    let pin = tensorfs::sha256::digest(leaf);
     let Ok(machine) = Machine::new(&address(port), pin, Auth::None) else {
         return false;
     };

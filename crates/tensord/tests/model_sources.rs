@@ -6,7 +6,7 @@ use platform::durable::FileAt as _;
 use std::{fs, io};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-use tensorfs_core::{
+use tensorfs::{
     format::{Dtype, ObjectRef},
     writer::{Data, Source},
 };
@@ -70,12 +70,12 @@ fn the_selection_serves_its_header_and_assets_sealed_and_nothing_else() {
         components: vec!["allowed".into()],
     };
     let sources = ModelSources::open(&root, std::slice::from_ref(&selected)).unwrap();
-    let listing = tensorfs_core::store2::Store::open(&root).unwrap().read(&tensorfs_core::format::ObjectRef {
+    let listing = tensorfs::store2::Store::open(&root).unwrap().read(&tensorfs::format::ObjectRef {
         sha256: manifest.trim_start_matches("sha256:").into(),
         length: sources.authorized(&manifest).unwrap().id().length,
     });
     let listing = listing.unwrap();
-    assert!(tensorfs_core::format::Manifest::from_json(&listing).unwrap().files.contains_key("tokenizer/vocab.json"));
+    assert!(tensorfs::format::Manifest::from_json(&listing).unwrap().files.contains_key("tokenizer/vocab.json"));
     for (name, want) in [
         ("", None),
         (tensord::model_sources::LISTING, Some(listing.as_slice())),
@@ -88,7 +88,7 @@ fn the_selection_serves_its_header_and_assets_sealed_and_nothing_else() {
         assert_eq!(answer.sha256, format!("{:x}", Sha256::digest(&got)));
         match want {
             Some(bytes) => assert_eq!(got, bytes),
-            None => assert!(tensorfs_core::format::Header::from_cbor(&got).is_ok(), "the header"),
+            None => assert!(tensorfs::format::Header::from_cbor(&got).is_ok(), "the header"),
         }
         // SAFETY: scalar fcntl queries on a descriptor we hold.
         #[cfg(unix)]

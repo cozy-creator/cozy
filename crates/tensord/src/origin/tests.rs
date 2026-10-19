@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use tensorfs_core::{
+use tensorfs::{
     fetch::HttpOrigin,
     format::{Dtype, ObjectRef, Release, Repo},
     store2::Store,

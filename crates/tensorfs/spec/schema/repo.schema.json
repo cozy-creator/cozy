@@ -1,0 +1,78 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://github.com/cozy-creator/cozy-creator/crates/tensorfs/conformance/schema/repo.schema.json",
+ "title": "tensorfs.repo/1",
+ "description": "Structure only; byte-length, bounds and duplicate-key rules are in spec/cozytensors.md. Unknown fields are allowed.",
+ "type": "object",
+ "required": [
+  "format",
+  "name",
+  "releases"
+ ],
+ "properties": {
+  "format": {
+   "type": "string",
+   "pattern": "^tensorfs\\.repo/1(\\.[0-9]+)?$"
+  },
+  "name": {
+   "type": "string",
+   "pattern": "^(?!\\.\\.?/)[^/\\\\\\u0000]+/(?!\\.\\.?$)[^/\\\\\\u0000]+$"
+  },
+  "releases": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "required": [
+     "version",
+     "tree"
+    ],
+    "properties": {
+     "version": {
+      "type": "string",
+      "minLength": 1
+     },
+     "tree": {
+      "$ref": "#/$defs/objectRef",
+      "description": "The release's tensorfs.tree/1."
+     },
+     "yanked": {
+      "type": "boolean"
+     },
+     "revision": {
+      "$ref": "#/$defs/u64"
+     }
+    }
+   }
+  },
+  "checkpoints": {
+   "type": "array",
+   "items": {
+    "$ref": "#/$defs/objectRef"
+   },
+   "description": "Trees no release names yet."
+  }
+ },
+ "$defs": {
+  "u64": {
+   "type": "integer",
+   "minimum": 0,
+   "maximum": 18446744073709551615
+  },
+  "objectRef": {
+   "type": "object",
+   "required": [
+    "sha256",
+    "length"
+   ],
+   "properties": {
+    "sha256": {
+     "type": "string",
+     "pattern": "^[0-9a-f]{64}$"
+    },
+    "length": {
+     "$ref": "#/$defs/u64"
+    }
+   }
+  }
+ }
+}

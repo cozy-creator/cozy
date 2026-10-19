@@ -1,7 +1,7 @@
 //! CPU artifact identity and shared-host admission; no GPU qualification.
 #![cfg(target_os = "linux")] // The host tier (memfd, seals, OFD locks) is Linux-only.
 use std::os::fd::AsRawFd;
-use tensorfs_core::{
+use tensorfs::{
     dtype::Dtype,
     header::{Header, Part, Tensor},
     read,
@@ -13,7 +13,7 @@ use varena::{
 };
 
 fn layout(bytes: &[u8]) -> Layout {
-    let plain = tensorfs_core::registry::seeds()
+    let plain = tensorfs::registry::seeds()
         .into_iter()
         .find(|seed| seed.alias == "plain/1")
         .unwrap()

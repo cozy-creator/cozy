@@ -1,5 +1,5 @@
 //! tensorfs-py: the `tensorfs` wheel's compiled half. It marshals; every byte-level fact comes
-//! from `tensorfs-core` and `tensorfs-plane`. Torch stays outside: tensors cross as DLPack.
+//! from `tensorfs` and `tensorfs-plane`. Torch stays outside: tensors cross as DLPack.
 
 mod docs;
 mod errors;
@@ -26,8 +26,8 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     errors::install(m)?;
     m.add("__version__", python_distribution_version())?;
     // The store format and plane claim protocol the `cozy` binary must share (format_contract.py).
-    m.add("STORE_FORMAT", tensorfs_core::STORE_FORMAT)?;
-    m.add("CLAIM_PROTOCOL", tensorfs_core::CLAIM_PROTOCOL)?;
+    m.add("STORE_FORMAT", tensorfs::STORE_FORMAT)?;
+    m.add("CLAIM_PROTOCOL", tensorfs::CLAIM_PROTOCOL)?;
     // The CBOR header codec's Python projection (owner ruling, 2026-10-18).
     m.add_function(wrap_pyfunction!(docs::parse_header, m)?)?;
     m.add_class::<docs::PyClosure>()?;

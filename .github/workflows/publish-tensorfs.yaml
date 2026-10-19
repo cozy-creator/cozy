@@ -35,13 +35,13 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: python3 crates/tensorfs/scripts/version_contract.py source
+      - run: python3 crates/tensorfs-py/scripts/version_contract.py source
       - if: inputs.publish
         run: |
-          version=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/tensorfs/pyproject.toml", "rb"))["project"]["version"])')
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/tensorfs-py/pyproject.toml", "rb"))["project"]["version"])')
           [ "$GITHUB_REF" = "refs/tags/tensorfs-v$version" ] || { echo "::error::publish runs on tensorfs-v$version, not $GITHUB_REF"; exit 1; }
       - uses: astral-sh/setup-uv@v7
-      - run: python3 crates/tensorfs/scripts/format_contract.py wheel
+      - run: python3 crates/tensorfs-py/scripts/format_contract.py wheel
 
   # Release gate (2026-10-01): weights fetched through `ensure` against a real loopback hub and object
   # store injecting resets, stalls, truncation, 5xx/429, expired URLs and wrong bytes.
@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p tensorfs-core --test fetch_faults -- --test-threads=2
+      - run: cargo test --locked -p tensorfs --test fetch_faults -- --test-threads=2
 
   # Release gate (run 2322): a real-HTTP hub pull whose first MiBs crawl still finishes at body throughput.
   download-tail:
@@ -60,7 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p tensorfs-core --lib transport::tests::tail -- --nocapture
+      - run: cargo test --locked -p tensorfs --lib transport::tests::tail -- --nocapture
 
   # Release gate (xs-045): the v2 fetch path from real loopback origins; its tail (cold MiBs,
   # stalls, failures) finishes at about the body rate, and a uniformly slow fetch restarts none.
@@ -70,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p tensorfs-core --test pull --test pull_tail -- --test-threads=1 --nocapture
+      - run: cargo test --locked -p tensorfs --test pull --test pull_tail -- --test-threads=1 --nocapture
 
   # Release gate (xs-045): the v2 store and writer under kill -9, racing GC and forking children
   # (strace counts the durability syscalls), and the `tfs` CLI over real stores.
@@ -81,7 +81,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get install -y strace
-      - run: cargo test --locked -p tensorfs-core --features faults --test store_v2 --test writer --test tfs_cli -- --test-threads=2
+      - run: cargo test --locked -p tensorfs --features faults --test store_v2 --test writer --test tfs_cli -- --test-threads=2
 
   # Release gate (xs-045): imports through the table engine, from local files, Hugging Face,
   # GitHub and Civitai.
@@ -91,7 +91,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p tensorfs-core --test import -- --test-threads=2
+      - run: cargo test --locked -p tensorfs --test import -- --test-threads=2
 
   # Release gate (xs-045, design §11): the standalone e2e on the Linux wheel in a fresh venv, with no
   # Cozy and no account: import a tiny HF SDXL, export it for Diffusers (same image as upstream),
@@ -107,7 +107,7 @@ jobs:
           name: wheel-linux-x86_64
           path: wheel
       - uses: astral-sh/setup-uv@v7
-      - run: crates/tensorfs/scripts/e2e.sh wheel/*.whl "$RUNNER_TEMP/e2e"
+      - run: crates/tensorfs-py/scripts/e2e.sh wheel/*.whl "$RUNNER_TEMP/e2e"
 
   wheel:
     name: wheel ${{ matrix.name }}
@@ -127,7 +127,7 @@ jobs:
     defaults:
       run:
         shell: bash
-        working-directory: crates/tensorfs
+        working-directory: crates/tensorfs-py
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -141,22 +141,22 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           maturin-version: v1.15.0
-          working-directory: crates/tensorfs
+          working-directory: crates/tensorfs-py
           target: ${{ matrix.target }}
           args: --release --locked --out dist
           manylinux: auto
           before-script-linux: |
-            cargo build --release --locked -p tensorfs-core --bin tfs
+            cargo build --release --locked -p tensorfs --bin tfs
             install -D -m 755 ../../target/release/tfs wheel-data/scripts/tfs
       - if: runner.os != 'Linux'
         run: |
-          cargo build --release --locked -p tensorfs-core --bin tfs
+          cargo build --release --locked -p tensorfs --bin tfs
           cp ../../target/release/tfs$([ "$RUNNER_OS" = Windows ] && echo .exe) wheel-data/scripts/
       - if: runner.os != 'Linux'
         uses: PyO3/maturin-action@v1
         with:
           maturin-version: v1.15.0
-          working-directory: crates/tensorfs
+          working-directory: crates/tensorfs-py
           target: ${{ matrix.target }}
           args: --release --locked --out dist
       - name: Smoke (the installed module and CLI)
@@ -175,7 +175,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.name }}
-          path: crates/tensorfs/dist/*.whl
+          path: crates/tensorfs-py/dist/*.whl
           if-no-files-found: error
           retention-days: 7
 
@@ -189,21 +189,21 @@ jobs:
         with:
           python-version: "3.12"
       - if: inputs.dev
-        run: crates/tensorfs/scripts/dev-version.sh
+        run: crates/tensorfs-py/scripts/dev-version.sh
       - uses: PyO3/maturin-action@v1
         with:
           maturin-version: v1.15.0
-          working-directory: crates/tensorfs
+          working-directory: crates/tensorfs-py
           command: sdist
           args: --out dist
       - run: |
-          python -m pip install crates/tensorfs/dist/*.tar.gz
+          python -m pip install crates/tensorfs-py/dist/*.tar.gz
           cd "$RUNNER_TEMP"
           python -c 'import tensorfs, tensorfs.varena; print(tensorfs.__version__)'
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-sdist
-          path: crates/tensorfs/dist/*.tar.gz
+          path: crates/tensorfs-py/dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
 

@@ -101,7 +101,7 @@ impl Server {
         identity.updates = Some(
             tensord::machine::update::Updates::open(paths, Box::new(|| true), None, None).unwrap(),
         );
-        let pin = tensorfs_core::sha256::digest(&identity.cert_der);
+        let pin = tensorfs::sha256::digest(&identity.cert_der);
         let mut backend = NativeBackend::new(service.clone(), identity.authority.clone(), store);
         backend.runs = Some(Arc::new(Runs {
             service: service.clone(),

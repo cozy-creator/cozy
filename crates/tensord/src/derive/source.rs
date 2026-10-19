@@ -4,8 +4,8 @@ use std::io;
 
 use serde::Deserialize;
 use serde_json::json;
-use tensorfs_core::format::ObjectRef;
-use tensorfs_core::store2::Store;
+use tensorfs::format::ObjectRef;
+use tensorfs::store2::Store;
 
 use super::{answer, ensure, open, parse, refuse, refused, send, serve_read, Answer, Hooks};
 use crate::frame::{Channel, Frame};

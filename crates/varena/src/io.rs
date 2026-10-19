@@ -1,7 +1,7 @@
 //! Source bytes: a TensorFS read lease (the GC hold and the verified door) plus per-object
 //! descriptors the plane opens through the store's own verification (`open_verified`). A
 //! pinned-tier fill copies what the page cache already holds and reads the rest by O_DIRECT
-//! into the destination (no second host copy), else through `tensorfs_core::read::read_into`.
+//! into the destination (no second host copy), else through `tensorfs::read::read_into`.
 //! Each mode's bytes are counted.
 
 use std::collections::{HashMap, VecDeque};
@@ -14,10 +14,10 @@ use std::sync::RwLock;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-use tensorfs_core::ids::ObjectRef;
+use tensorfs::ids::ObjectRef;
 use platform::durable;
 #[cfg(feature = "store")]
-use tensorfs_core::{meta::Meta, read::ReadLease, store::Store};
+use tensorfs::{meta::Meta, read::ReadLease, store::Store};
 
 use crate::layout::{Item, ItemSource, PART_ALIGN};
 use crate::{Error, Result};
@@ -212,7 +212,7 @@ impl Source {
             _ => {
                 #[cfg(feature = "store")]
                 if let Some(lease) = guard.as_ref() {
-                    tensorfs_core::read::read_into(lease, o, buf)?;
+                    tensorfs::read::read_into(lease, o, buf)?;
                 } else {
                     pread_exact(&fds.buffered, buf, o.off, &o.obj.sha256)?;
                 }

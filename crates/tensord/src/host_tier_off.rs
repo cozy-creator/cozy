@@ -7,7 +7,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fs::File, io, sync::Arc, time::Duration};
 use crate::storage::Store;
-use tensorfs_core::store2::Checkpoint;
+use tensorfs::store2::Checkpoint;
 
 #[derive(Clone, Debug)]
 pub struct HostTierConfig {
@@ -136,7 +136,7 @@ impl HostTier {
         _request: SealedRequest<'_>,
         _plan: File,
         _fetch: Option<&Arc<Fetch>>,
-    ) -> io::Result<Vec<(tensorfs_core::ids::ObjectRef, File)>> {
+    ) -> io::Result<Vec<(tensorfs::ids::ObjectRef, File)>> {
         Err(off())
     }
 
@@ -162,7 +162,7 @@ impl HostTier {
 }
 
 /// The SHA-256 (hex) of `files`' objects in order, one `<sha256>:<length>\n` line each.
-pub fn objects_digest(files: &[(tensorfs_core::ids::ObjectRef, File)]) -> String {
+pub fn objects_digest(files: &[(tensorfs::ids::ObjectRef, File)]) -> String {
     let lines: String = files
         .iter()
         .map(|(obj, _)| format!("{}:{}\n", obj.sha256, obj.length))

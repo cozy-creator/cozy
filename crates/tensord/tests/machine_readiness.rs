@@ -121,7 +121,7 @@ fn receipt_verifies_and_a_restart_keeps_boot_and_bytes() {
     mac.update(&payload);
     assert_eq!(
         envelope.hmac_sha256,
-        tensorfs_core::sha256::hex(&mac.finalize().into_bytes())
+        tensorfs::sha256::hex(&mac.finalize().into_bytes())
     );
     let facts: serde_json::Value = serde_json::from_slice(&payload).unwrap();
     let boot_id = std::fs::read_to_string(root.join("var/lib/cozy/machine/boot-id")).unwrap();

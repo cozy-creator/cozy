@@ -1,5 +1,9 @@
 # cozytensors/1 conformance
 
+These executable fixtures accompany the current checked-in reader. The TensorFS 0.13.0
+[target specification](../spec/cozytensors.md), [schemas](../spec/schema/) and
+[readable examples](../spec/examples/) are ahead of that implementation while it is integrated.
+
 For anyone implementing [cozytensors/1](../spec/cozytensors.md).
 
 | Path | What |
@@ -28,7 +32,7 @@ Run both implementations:
 
 ```bash
 uv run --no-project --python 3.12 --with numpy --with cbor2==6.1.4 python -I conformance/reader.py conformance/vectors
-cargo test -p tensorfs-core --no-default-features --test format_conformance --test format_docs --test format_cores
+cargo test -p tensorfs --no-default-features --test format_conformance --test format_docs --test format_cores
 ```
 
 After a deliberate change: `make_vectors.py` rewrites the header vectors and normalizes the case files, and

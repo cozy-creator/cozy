@@ -18,7 +18,7 @@ use std::{
     sync::{Condvar, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tensorfs_core::sha256;
+use tensorfs::sha256;
 
 /// The largest result the tier takes: worth storing is costly to produce and small.
 pub const ENTRY_BYTES: u64 = 512 << 10;

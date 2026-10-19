@@ -86,9 +86,9 @@ jobs:
           uv run --no-project python .runtime/scripts/stamp-build-provenance.py "$(git -C .runtime rev-parse HEAD)"
           uv build --wheel --out-dir "$RUNNER_TEMP/runtime" .runtime
           echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
-          (cd .cozy-src && cargo build --release --locked -p tensorfs-core --bin tfs)
-          install -D -m 755 .cozy-src/target/release/tfs .cozy-src/crates/tensorfs/wheel-data/scripts/tfs
-          (cd .cozy-src/crates/tensorfs && uvx maturin@1.15.0 build --release --out "$RUNNER_TEMP/tensorfs")
+          (cd .cozy-src && cargo build --release --locked -p tensorfs --bin tfs)
+          install -D -m 755 .cozy-src/target/release/tfs .cozy-src/crates/tensorfs-py/wheel-data/scripts/tfs
+          (cd .cozy-src/crates/tensorfs-py && uvx maturin@1.15.0 build --release --out "$RUNNER_TEMP/tensorfs")
           echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$RUNNER_TEMP"/tensorfs/tensorfs-*.whl)" >> "$GITHUB_ENV"
           rm -rf .cozy-src/target
       - if: inputs.plan != ''

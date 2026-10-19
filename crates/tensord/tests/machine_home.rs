@@ -58,12 +58,12 @@ fn client(ready: &serde_json::Value, key: &SigningKey) -> Client {
     let pem = ready["cert_pem"].as_str().unwrap();
     let leaf = rustls_pemfile::certs(&mut pem.as_bytes()).next().unwrap().unwrap();
     let auth = Auth::Key { key: Arc::new(key.clone()), worker: "local".into() };
-    Client::new(ready["address"].as_str().unwrap(), tensorfs_core::sha256::digest(&leaf), auth).unwrap()
+    Client::new(ready["address"].as_str().unwrap(), tensorfs::sha256::digest(&leaf), auth).unwrap()
 }
 
 /// `bytes` written to the machine as one object: its digest.
 async fn write(client: &Client, bytes: &[u8]) -> String {
-    let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(bytes));
+    let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(bytes));
     let length = bytes.len() as u64;
     let held = client.bulk().unwrap().put(&digest, (0, length, length), bytes.to_vec()).await.unwrap();
     assert_eq!(held, [(0, length)]);
@@ -158,7 +158,7 @@ async fn this_computers_machine_runs_from_its_home() {
     let in_place = async |tree: &Path| -> String {
         let files: Vec<_> = ["pyproject.toml", "package.toml", "cpu_memo/__init__.py"].iter().map(|name| {
             let bytes = std::fs::read(tree.join(name)).unwrap();
-            let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&bytes));
+            let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&bytes));
             serde_json::json!({"name": name, "digest": digest, "length": bytes.len()})
         }).collect();
         let manifest = serde_json::json!({"package": "local/tensord-cpu-memo", "release": "0.1.0",
@@ -222,7 +222,7 @@ async fn a_thousand_objects_answer_what_is_held_in_one_request() {
         asked.push(write(&client, format!("object {i}").as_bytes()).await);
     }
     let partial = b"0123456789".to_vec();
-    let digest = format!("sha256:{}", tensorfs_core::sha256::hex_digest(&partial));
+    let digest = format!("sha256:{}", tensorfs::sha256::hex_digest(&partial));
     client.bulk().unwrap().put(&digest, (6, 4, 10), partial[6..].to_vec()).await.unwrap();
     asked.push(digest);
     asked.push(format!("sha256:{}", "0".repeat(64)));

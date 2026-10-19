@@ -8,13 +8,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tensorfs_core::{
+use tensorfs::{
     err::{refuse, Code, Refusal, Result},
     fetch::{Credential, TensorhubOrigin},
     format::ObjectRef,
 };
 
-pub use tensorfs_core::fetch::Resolved;
+pub use tensorfs::fetch::Resolved;
 
 use super::{Key, Machine, Remote};
 use crate::{

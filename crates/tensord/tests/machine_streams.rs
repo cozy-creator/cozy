@@ -138,7 +138,7 @@ async fn serve(run: Run) -> (Machine, Keys) {
     let identity =
         MachineIdentity::ephemeral("m".into(), vec![SigningKey::from_bytes(&SIGNER).verifying_key()], vec![7; 32])
             .unwrap();
-    let (keys, pin) = (identity.authority.keys.clone(), tensorfs_core::sha256::digest(&identity.cert_der));
+    let (keys, pin) = (identity.authority.keys.clone(), tensorfs::sha256::digest(&identity.cert_der));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move { api::serve(listener, identity, Arc::new(run)).await.unwrap() });

@@ -13,7 +13,7 @@ str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
 hub-client.workspace = true
 reqwest.workspace = true
 async-trait.workspace = true
-tensorfs-core = { workspace = true, features = ["store"] }
+tensorfs = { workspace = true, features = ["store"] }
 varena.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }

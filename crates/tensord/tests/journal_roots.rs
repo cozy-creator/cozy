@@ -25,7 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tensord::storage::Store;
-use tensorfs_core::sha256;
+use tensorfs::sha256;
 
 const ACTOR: &str = "alice";
 

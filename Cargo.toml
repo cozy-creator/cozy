@@ -1,8 +1,7 @@
 # One workspace for the `cozy` binary (xs-043). The Go tree stays at the root until the cutover.
 [workspace]
 resolver = "3"
-# Listed, not globbed: crates/tensorfs is TensorFS's Python package (pyproject.toml, python/,
-# conformance/), not a crate.
+# The Rust implementation and its complete Python binding/package each have one directory.
 members = [
     "crates/calcifer",
     "crates/cli",
@@ -11,7 +10,7 @@ members = [
     "crates/platform",
     "crates/protocol",
     "crates/tensord",
-    "crates/tensorfs-core",
+    "crates/tensorfs",
     "crates/tensorfs-py",
     "crates/varena",
 ]
@@ -33,7 +32,7 @@ platform = { path = "crates/platform" }
 portable-pty = "0.9.0"
 protocol = { path = "crates/protocol" }
 tensord = { path = "crates/tensord" }
-tensorfs-core = { path = "crates/tensorfs-core", default-features = false }
+tensorfs = { path = "crates/tensorfs", default-features = false }
 varena = { path = "crates/varena", default-features = false }
 
 anstream = "1.0.0"

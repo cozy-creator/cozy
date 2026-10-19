@@ -11,12 +11,12 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyString, PyTuple};
 use pyo3::{create_exception, ffi};
-use tensorfs_core::client::{self, ImportOptions, Named, PullFrom};
-use tensorfs_core::export;
-use tensorfs_core::failure::{Failure, Kind};
-use tensorfs_core::format::{Body, Dtype, Encoding, Header, Metadata, Value};
-use tensorfs_core::store2::{Checkpoint, Store};
-use tensorfs_core::writer::{Data, PartData, Source, Writer};
+use tensorfs::client::{self, ImportOptions, Named, PullFrom};
+use tensorfs::export;
+use tensorfs::failure::{Failure, Kind};
+use tensorfs::format::{Body, Dtype, Encoding, Header, Metadata, Value};
+use tensorfs::store2::{Checkpoint, Store};
+use tensorfs::writer::{Data, PartData, Source, Writer};
 
 create_exception!(
     tensorfs,

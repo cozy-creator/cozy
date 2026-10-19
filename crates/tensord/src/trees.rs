@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::storage::{self, pin, Store};
-use tensorfs_core::format::ObjectRef;
+use tensorfs::format::ObjectRef;
 
 /// A pinned tree: its pin, its document and the bytes of its files.
 #[derive(Clone, Debug, PartialEq, Eq)]

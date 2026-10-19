@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 use crate::storage::{self, Store};
-use tensorfs_core::store2::Checkpoint;
+use tensorfs::store2::Checkpoint;
 
 /// The `model_source` name of a checkpoint's manifest (`tensorfs.manifest/2`, its file list):
 /// `.` is never a manifest path.

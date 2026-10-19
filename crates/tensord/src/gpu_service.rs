@@ -222,7 +222,7 @@ impl Plan {
     pub fn weightless(generation: &str, application: &str, entrypoint: &str, degree: u32) -> Self {
         let semantic = serde_json::json!({"generation": generation, "application": application,
             "entrypoint": entrypoint, "slots": [], "degree": degree});
-        let id = format!("plan-{}", tensorfs_core::sha256::hex_digest(&crate::boundary_json::exact(&semantic)));
+        let id = format!("plan-{}", tensorfs::sha256::hex_digest(&crate::boundary_json::exact(&semantic)));
         Self {
             construction: id.clone(),
             id,
@@ -1407,7 +1407,7 @@ impl Pool {
         }
         let alias = format!(
             "published-{}",
-            tensorfs_core::sha256::hex_digest(
+            tensorfs::sha256::hex_digest(
                 format!("{package}\0{release}\0{}", selected.generation).as_bytes()
             )
         );
@@ -1538,7 +1538,7 @@ impl Pool {
                                 && (choice.release.is_empty() || choice.release == grant.release)
                                 && (choice.lane.is_empty() || choice.lane == grant.lane)
                                 && choice.manifest.as_ref().is_none_or(|reference| {
-                                    tensorfs_core::sha256::hex(&reference.digest)
+                                    tensorfs::sha256::hex(&reference.digest)
                                         == grant.manifest.trim_start_matches("sha256:")
                                 })
                         }))
@@ -1650,7 +1650,7 @@ impl Pool {
         }
         let digest = |value: serde_json::Value| -> io::Result<String> {
             let canonical = serde_json_canonicalizer::to_vec(&value).map_err(io::Error::other)?;
-            Ok(tensorfs_core::sha256::hex_digest(&canonical))
+            Ok(tensorfs::sha256::hex_digest(&canonical))
         };
         let construction = format!("gpu-{}", digest(serde_json::json!({"generation": installed.generation,
             "application": application, "entrypoint": entrypoint, "slots": planned, "degree": degree}))?);
@@ -1674,9 +1674,9 @@ impl Pool {
     }
     /// A slot's checkpoint this machine's store holds, by its exact manifest.
     fn held_grant(&self, package: &str, path: &str, reference: &crate::api::domain::Ref) -> io::Result<ModelGrant> {
-        let sha = tensorfs_core::sha256::hex(&reference.digest);
+        let sha = tensorfs::sha256::hex(&reference.digest);
         let absent = |why: String| io::Error::new(io::ErrorKind::NotFound, format!("checkpoint_absent: {path} names sha256:{sha}: {why}"));
-        let object = tensorfs_core::format::ObjectRef { sha256: sha.clone(), length: reference.length };
+        let object = tensorfs::format::ObjectRef { sha256: sha.clone(), length: reference.length };
         let checkpoint = self.store.checkpoint(&object).map_err(|e| absent(e.to_string()))?;
         Ok(ModelGrant {
             package: package.into(),
@@ -3794,7 +3794,7 @@ const RUNTIME_FIRST: &str = "import runpy, sys; sys.path.insert(0, sys.argv.pop(
 /// A Runtime wheel's importable tree, unpacked once per wheel digest under `into`.
 fn unpack_runtime(wheel: &Path, into: &Path) -> io::Result<PathBuf> {
     let bytes = fs::read(wheel)?;
-    let tree = into.join(&tensorfs_core::sha256::hex_digest(&bytes)[..32]);
+    let tree = into.join(&tensorfs::sha256::hex_digest(&bytes)[..32]);
     if tree.is_dir() {
         return Ok(tree);
     }
@@ -4058,7 +4058,7 @@ fn copy_held(
     length: u64,
     local: &Path,
 ) -> io::Result<()> {
-    let object = tensorfs_core::format::ObjectRef { sha256: digest.trim_start_matches("sha256:").into(), length };
+    let object = tensorfs::format::ObjectRef { sha256: digest.trim_start_matches("sha256:").into(), length };
     let mut source = store.file(&object).map_err(crate::storage::io_error)?;
     let mut copy = platform::durable::Mode::mode(
         fs::OpenOptions::new().write(true).create_new(true),
@@ -4079,7 +4079,7 @@ fn copy_held(
 }
 
 fn held_bytes(store: &Store, digest: &str, length: u64) -> io::Result<Vec<u8>> {
-    let object = tensorfs_core::format::ObjectRef { sha256: digest.trim_start_matches("sha256:").into(), length };
+    let object = tensorfs::format::ObjectRef { sha256: digest.trim_start_matches("sha256:").into(), length };
     store.read(&object).map_err(crate::storage::io_error)
 }
 

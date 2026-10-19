@@ -10,7 +10,7 @@ use std::{
     path::Path,
 };
 use platform::durable::Mode;
-use tensorfs_core::sha256;
+use tensorfs::sha256;
 
 /// `TriageBundleRef.length` is bounded at 1 MiB by the protocol; fields are capped well below.
 const MAX_TRACEBACK: usize = 256 << 10;

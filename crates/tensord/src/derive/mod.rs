@@ -52,9 +52,9 @@ use std::{
 
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
-use tensorfs_core::format::{Body, Dtype, Encoding, Location, Manifest, ObjectRef};
-use tensorfs_core::store2::{self, Checkpoint, Store};
-use tensorfs_core::writer::{Data, PartData, Source, Writer};
+use tensorfs::format::{Body, Dtype, Encoding, Location, Manifest, ObjectRef};
+use tensorfs::store2::{self, Checkpoint, Store};
+use tensorfs::writer::{Data, PartData, Source, Writer};
 
 use crate::frame::{Channel, Frame, CHUNK};
 use crate::storage::{self, pin};

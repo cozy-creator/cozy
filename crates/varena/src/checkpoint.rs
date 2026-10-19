@@ -6,10 +6,10 @@
 
 use std::fs::File;
 
-use tensorfs_core::format::Header;
-use tensorfs_core::ids::ObjectRef;
-use tensorfs_core::read::{ObjectRange, Order, PlanItem, ReadPlan, Source};
-use tensorfs_core::store2::Checkpoint;
+use tensorfs::format::Header;
+use tensorfs::ids::ObjectRef;
+use tensorfs::read::{ObjectRange, Order, PlanItem, ReadPlan, Source};
+use tensorfs::store2::Checkpoint;
 
 use crate::{Error, Result};
 

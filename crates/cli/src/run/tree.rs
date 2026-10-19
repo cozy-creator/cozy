@@ -14,7 +14,7 @@ use protocol::{
     error::{Error, Kind},
     ids::Digest,
 };
-use tensorfs_core::{
+use tensorfs::{
     ids::{Doc, ObjectRef},
     manifest::Manifest,
 };

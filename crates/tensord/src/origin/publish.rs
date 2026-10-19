@@ -17,7 +17,7 @@ use std::{
 };
 
 use hub_client::{types, ResponseValue};
-use tensorfs_core::{
+use tensorfs::{
     err::{refuse, Code, Refusal, Result},
     format::ObjectRef,
     store2::Store,
@@ -214,7 +214,7 @@ fn pause(wait: Duration, stop: Option<&Stop>) -> Result<()> {
 /// `If-None-Match: *` makes it idempotent (412 is an earlier send that landed). Re-sent on
 /// weather; a dead peer is found by TCP keepalive, a live slow one is waited for.
 fn put(http: &reqwest::Client, store: &Store, object: &ObjectRef, grant: &Grant, stop: Option<&Stop>) -> Result<()> {
-    let runtime = tensorfs_core::fetch::runtime()?;
+    let runtime = tensorfs::fetch::runtime()?;
     let mut wait = Duration::from_secs(1);
     let mut last = String::new();
     for attempt in 1..=ATTEMPTS {

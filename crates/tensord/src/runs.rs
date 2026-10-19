@@ -18,7 +18,7 @@ use crate::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
 use crate::stop::Stop;
-use tensorfs_core::format::ObjectRef;
+use tensorfs::format::ObjectRef;
 use std::{
     collections::HashMap,
     io,
@@ -394,7 +394,7 @@ impl Runs {
                 let manifest = choice.manifest.as_ref().ok_or_else(|| {
                     refused("invalid_request", format!("model choice {:?} names no model", choice.parameter))
                 })?;
-                let sha256 = tensorfs_core::sha256::hex(&manifest.digest);
+                let sha256 = tensorfs::sha256::hex(&manifest.digest);
                 let held = crate::storage::held(publisher.store(), &sha256)
                     .map_err(|_| refused("checkpoint_absent", format!("this machine holds no checkpoint sha256:{sha256}")))?;
                 let row = json!({"parameter": choice.parameter, "manifest": format!("sha256:{sha256}")});
@@ -430,7 +430,7 @@ impl Runs {
                 .map_err(|(code, message)| refused(code, message))?;
                 let operation = format!(
                     "upload-{}",
-                    &tensorfs_core::sha256::hex_digest(format!("{actor}\0{id}").as_bytes())[..40]
+                    &tensorfs::sha256::hex_digest(format!("{actor}\0{id}").as_bytes())[..40]
                 );
                 let stage = format!("uploading to {destination}");
                 // A cancel stops the push; only finalizing, which publishes, cannot be taken back.
@@ -1217,7 +1217,7 @@ mod tests {
     use super::*;
     use crate::{api::install::InstallerConfig, execution::Engine, journal::State};
     use std::{fs, path::Path, process::Command, time::Duration};
-    use tensorfs_core::sha256;
+    use tensorfs::sha256;
 
     /// The store keeps every checkpoint an unfinished run's plan reads (its raw sources too);
     /// a plan that cannot be read stops store GC for that pass.
@@ -1631,7 +1631,7 @@ mod tests {
             assert_eq!(settled(&runs.service.engine, &accepted.id).state, State::Canceled);
             assert!(runs.service.engine.installations("alice").unwrap().is_empty(), "a canceled install binds no generation");
             runs.local.as_ref().unwrap().collect("alice", "local/hanging-build");
-            assert!(!root.join("editable").join(&tensorfs_core::sha256::hex_digest(b"alice")[..16]).join("hanging-build").exists());
+            assert!(!root.join("editable").join(&tensorfs::sha256::hex_digest(b"alice")[..16]).join("hanging-build").exists());
             let _ = fs::remove_dir_all(root);
         }
     }

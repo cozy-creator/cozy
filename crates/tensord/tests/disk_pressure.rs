@@ -18,7 +18,7 @@ use std::{
     time::SystemTime,
 };
 use tensord::storage::{self, Store};
-use tensorfs_core::format::{Manifest, Metadata, ObjectRef};
+use tensorfs::format::{Manifest, Metadata, ObjectRef};
 
 const MIB: u64 = 1 << 20;
 const CAPACITY: u64 = 100 << 30;

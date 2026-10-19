@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 use crate::{storage::{self, Store}, trees};
-use tensorfs_core::{
+use tensorfs::{
     format::ObjectRef,
     sha256,
 };

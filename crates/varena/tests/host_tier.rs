@@ -5,9 +5,9 @@
 mod common;
 
 use common::*;
-use tensorfs_core::dtype::Dtype;
-use tensorfs_core::fit::{fit, Custody, Fit, TensorRequirements};
-use tensorfs_core::read;
+use tensorfs::dtype::Dtype;
+use tensorfs::fit::{fit, Custody, Fit, TensorRequirements};
+use tensorfs::read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use varena::host::{hold, release_hold, HostMem};

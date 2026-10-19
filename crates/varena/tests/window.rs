@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 
 use common::*;
-use tensorfs_core::read;
+use tensorfs::read;
 use varena::host::HostMem;
 use varena::io::{IoTally, Source};
 use varena::layout::Layout;

@@ -292,7 +292,7 @@ impl Calls {
             let invocation = &record.invocation;
             let request = serde_json::json!({"input": invocation.input, "files": invocation.inputs, "bits": invocation.bits});
             let request = serde_json_canonicalizer::to_vec(&request).ok()?;
-            let digest = tensorfs_core::sha256::hex_digest;
+            let digest = tensorfs::sha256::hex_digest;
             Some(format!("{operation}\0{}\0{}", digest(&declared), digest(&request)))
         });
         Ok(Some(crate::weights::Grant::new(
@@ -867,7 +867,7 @@ fn child_inputs(
 /// A completed child's result as its parent receives it: each file leaf named by its bytes
 /// (`asset_ref` = `digest` = sha256) and granted at a copy in the parent's spool.
 /// The files a parent now holds from a child's result, to adopt as its own objects.
-type Held = Vec<(PathBuf, tensorfs_core::format::ObjectRef)>;
+type Held = Vec<(PathBuf, tensorfs::format::ObjectRef)>;
 
 fn receive(
     root: &Path,
@@ -907,7 +907,7 @@ fn receive(
             Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
             _ => (),
         }
-        let object = tensorfs_core::format::ObjectRef { sha256: sha.into(), length };
+        let object = tensorfs::format::ObjectRef { sha256: sha.into(), length };
         held.push((local.to_path_buf(), object));
         Ok(())
     };
@@ -1000,7 +1000,7 @@ fn receive(
 /// A child call's intent: its callable and its input, numbers exact.
 fn child_intent(module: &str, export: &str, input: &Value) -> String {
     let semantic = crate::boundary_json::exact(&json!([module, export, input]));
-    format!("sha256:{}", tensorfs_core::sha256::hex_digest(&semantic))
+    format!("sha256:{}", tensorfs::sha256::hex_digest(&semantic))
 }
 
 
@@ -1114,7 +1114,7 @@ mod exact_tests {
         assert_eq!(choices.len(), 1);
         assert_eq!(choices[0].parameter, "generate_image.models.model");
         let reference = choices[0].manifest.as_ref().unwrap();
-        assert_eq!((tensorfs_core::sha256::hex(&reference.digest), reference.length), (hex, 812));
+        assert_eq!((tensorfs::sha256::hex(&reference.digest), reference.length), (hex, 812));
         assert!(choices[0].repository.is_empty());
         assert!(serving_call(&json!({"prompt": "a fox"}), "generate_image").is_err());
     }
