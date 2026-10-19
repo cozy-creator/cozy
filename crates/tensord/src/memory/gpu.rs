@@ -72,7 +72,7 @@ impl Holding {
         }
         self.taken = true;
         let pages = std::mem::take(&mut self.pages).into_iter();
-        let take = |(r, (n, c)): (u32, (u64, OwnedFd))| Some((r, (n, cozy_platform::handles::recv_fd(&UnixStream::from(c)).ok()?)));
+        let take = |(r, (n, c)): (u32, (u64, OwnedFd))| Some((r, (n, platform::handles::recv_fd(&UnixStream::from(c)).ok()?)));
         self.pages = pages.filter_map(take).collect();
     }
 
