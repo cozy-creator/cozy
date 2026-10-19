@@ -1,6 +1,6 @@
 """TensorFS: cozytensors/1 checkpoints in a content-addressed store (design §1).
 
-    store = tensorfs.Store("~/.tensorfs")                # created when absent
+    store = tensorfs.Store("~/.cache/tensorfs")                # created when absent
     m = store.import_("hf://hf-internal-testing/tiny-sdxl-pipe")
     m = store.pull("acme/sdxl@1.0", lane="int8")  # from tensorhub.com
     ck = store.checkpoint(m)

@@ -5,13 +5,13 @@ For anyone implementing [cozytensors/1](../spec/cozytensors.md).
 | Path | What |
 |---|---|
 | `schema/header.cddl` | The header's CBOR structure (RFC 8610). |
-| `schema/{manifest,repo}.schema.json` | JSON Schema (2020-12) of the manifest and repo. Byte lengths, bounds, duplicate keys, integer-only numbers and version uniqueness are spec rules the schema cannot express. |
+| `schema/{tree,repo}.schema.json` | JSON Schema (2020-12) of the tree and repo. Byte lengths, bounds, duplicate keys, integer-only numbers and version uniqueness are spec rules the schema cannot express. |
 | `vectors/cases/<family>.json` | Decode cases of one scheme family (`core`: plain tensors, spans, an unknown scheme), in header order: a tensor's parts (base64 bits, in order) and its expected logical bytes, or the refusal code (`decode`, `unknown_scheme`). |
-| `vectors/store/` | A static origin holding those cases: one repo per family, `Conformance/<family>` at `refs/conformance/<family>.json`, lane `all` (every case, laid out by the chunk rule). `core` adds lane `spans` (a range across three chunks) and a yanked release 2 that swaps its lanes. |
+| `vectors/store/` | A static origin holding those cases: one repo per family, `Conformance/<family>` at `refs/conformance/<family>.json`, each release a tree with variant `all` (every case, laid out by the chunk rule) and a LICENSE. `core` adds variant `spans` (a range across three chunks), a yanked release 2 whose tree swaps the variants, and an unreleased tree. |
 | `vectors/cores.json` | Cases of the decode building blocks (spec §6): affine and table over the producers' packings, and gguf-py's own q4_0/q8_0 block structs. |
 | `vectors/green/header-*.cbor` | Headers a reader must accept, each with its projection `header-*.json`: the CBOR tree as JSON, byte strings as `{"hex": ...}`. |
 | `vectors/red/header-*.cbor` | Headers a reader must refuse: twins of `header-basic` in bytes other than its one encoding (non-preferred heads, indefinite lengths, unordered keys, encodings not in first-use order), forbidden items, bad tags and structure. `header-pre-cut*` (a real pre-cut header, and the provisional JSON) must be refused as pre-cut. |
-| `vectors/{green,red}/{manifest,repo}-*.json` | Manifests and repos to accept or refuse. |
+| `vectors/{green,red}/{tree,repo}-*.json` | Trees and repos to accept or refuse. |
 | `reader.py` | An independent reader and header encoder (Python, numpy, cbor2); its decoders are `schemes/`, one module per family, registered in `schemes/__init__.py`. |
 | `make_vectors.py` | Writes the header vectors from the projections and defects it lists, and checks and normalizes every `cases/<family>.json`. |
 | `mine/` | Producer miners: `mine/cores.py` writes `cores.json`; a family's miner writes its cases (`mine/gguf.py`: ggml's own C, fetched at llama.cpp ff5a233 and built here). |
