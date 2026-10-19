@@ -292,10 +292,13 @@ impl GpuLedger {
     pub fn take_kept(&self, key: &str) -> Option<(String, Vec<(Page, File)>)> {
         let held = {
             let mut kept = self.inner.kept.lock().unwrap();
-            kept.get_mut(key)?.take();
-            kept.remove_entry(key).filter(|(_, h)| h.taken).map(|(_, h)| h)
+            let held = kept.get_mut(key)?;
+            held.take();
+            match held.taken {
+                true => kept.remove(key)?,
+                false => return None,
+            }
         };
-        let Some(held) = held else { return None };
         self.inner.publish();
         let pages = held.pages.into_iter().map(|(region, (nbytes, fd))| (Page { region, nbytes }, File::from(fd)));
         Some((held.fingerprint, pages.collect()))
