@@ -805,7 +805,7 @@ impl PyCheckpoint {
     fn path(&self, py: Python<'_>) -> PyResult<PathBuf> {
         self.fetch_components(py, None, 0)?;
         let ck = self.stored(py)?;
-        py.detach(|| ck.path()).or_raise(py)
+        py.detach(|| ck.path_for(self.variant().unwrap_or(""))).or_raise(py)
     }
 
     #[getter]
@@ -1278,9 +1278,14 @@ impl PyWriter {
             }
         };
         let tree = if self.repo_id.is_some() {
-            let mut tree = self.w.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|w| Tree { files: w.repo_files().clone() }).unwrap_or_default();
+            let guard = self.w.lock().unwrap_or_else(|e| e.into_inner());
+            let writer = guard.as_ref().expect("commit retained its writer");
+            let published = writer.published().cloned();
+            let mut tree = Tree { files: writer.repo_files().clone() };
             tree.set_variant(self.variant.as_deref().unwrap_or(""), header.clone());
-            Some(py.detach(|| self.store.put_tree(&tree)).or_raise(py)?)
+            let local = py.detach(|| self.store.put_tree(&tree)).or_raise(py)?;
+            if published.as_ref() != Some(&local) { return Err(invalid(py, "the uploaded tree differs from the local tree")); }
+            published
         } else { None };
         self.w.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(dest) = &self.dest {
