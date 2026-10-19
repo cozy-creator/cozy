@@ -8,7 +8,7 @@
 //! https origin (SSL_CERT_FILE trusts its CA), TENSORHUB_LOG the hub's log, where the development
 //! mail sender writes codes.
 use hub_client::{
-    Client, Credential, DeviceKey, Error, P256Key, RunCapability, RunToken, UserSession, testing,
+    Client, Credential, DeviceKey, Error, UserSession, testing,
     types,
 };
 use serde_json::json;
@@ -187,59 +187,7 @@ async fn a_user_and_a_machine_at_a_real_hub() {
         404
     );
 
-    // A run capability: signed offline by the device key, traded by the machine's leaf for a
-    // DPoP-bound token over TLS, and good for exactly what it names.
-    let endpoint = user.token_endpoint().await.unwrap();
-    assert!(endpoint.starts_with(&hub.origin), "{endpoint}");
-    let leaf = Arc::new(P256Key::generate());
-    let capability = session.key().sign_run_capability(&RunCapability {
-        user_id: me.user_id.clone(),
-        hub: hub.origin.clone(),
-        key_jkt: leaf.thumbprint(),
-        run: format!("run-{nonce}"),
-        operations: vec![
-            json!({"type": "tensorhub_model_publish", "model": format!("{account}/model")}),
-        ],
-        lifetime: Duration::from_secs(300),
-    });
-    let run = Arc::new(RunToken::new(&capability, &endpoint, leaf).unwrap());
-    let machine = Client::connect(
-        &hub.origin,
-        reqwest::Client::new(),
-        Credential::Run(run.clone()),
-    );
-    let declared = types::PublicationDeclaration {
-        objects: vec![object(b"machine")],
-    };
-    let opened = machine
-        .open_model_publication(&account, "model", "op-machine", &declared)
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(opened.publication.operation, "op-machine");
-    let absent = format!("sha256:{:x}", Sha256::digest(b"absent"));
-    assert_eq!(
-        refused(
-            machine
-                .get_model_checkpoint(&account, "model", &absent)
-                .await
-                .map_err(Error::from)
-        )
-        .0,
-        404
-    );
-    let other = machine
-        .open_model_publication(&account, "other", "op", &declared)
-        .await
-        .map_err(Error::from);
-    assert_eq!(
-        refused(other),
-        (403, "capability.operation_forbidden".into())
-    );
-    assert!(
-        run.ended().is_none(),
-        "a refused operation does not end the capability"
-    );
+    // Run-capability exchange and upload are exercised by tensorfs-core/tests/endpoint_live.rs.
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

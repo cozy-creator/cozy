@@ -496,7 +496,8 @@ impl Catalog {
             .credential
             .as_ref()
             .map(|p| p.clone() as Arc<dyn TokenProvider>);
-        tensorfs_core::fetch::Endpoint::new(&client, &self.origin, token)
+        let endpoint = tensorfs_core::fetch::Endpoint::new(&client, &self.origin, token)?;
+        Ok(if self.credential.is_none() { endpoint.anonymous() } else { endpoint })
     }
 
     /// Headers presenting the capability on `method url`; none off the Hub host.
