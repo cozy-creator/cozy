@@ -54,13 +54,13 @@ pub fn of(
     Memo::Key(format!("sha256:{}", sha256::hex_digest(&crate::boundary_json::exact(&computation))))
 }
 
-/// The request with each model artifact it carries as its checkpoint's manifest: the run that
+/// The request with each model artifact it carries as its checkpoint's header: the run that
 /// produced a checkpoint is provenance, never part of a consumer's computation.
 fn checkpoints(value: &Value) -> Value {
-    const ARTIFACT: [&str; 4] = ["manifest", "output_slot", "producer_request_id", "tensorfs_receipt_digest"];
+    const ARTIFACT: [&str; 4] = ["checkpoint", "output_slot", "producer_request_id", "transaction"];
     match value {
         Value::Object(fields) if fields.len() == ARTIFACT.len() && ARTIFACT.iter().all(|k| fields.contains_key(*k)) => {
-            json!({"manifest": fields["manifest"]})
+            json!({"checkpoint": fields["checkpoint"]})
         }
         Value::Object(fields) => Value::Object(fields.iter().map(|(k, v)| (k.clone(), checkpoints(v))).collect()),
         Value::Array(items) => Value::Array(items.iter().map(checkpoints).collect()),
@@ -117,6 +117,28 @@ pub(crate) fn operation(generation: &Generation, application: &str, invocable: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumer_replay_keys_ignore_model_provenance_and_keep_header_identity() {
+        let generation: Generation = serde_json::from_value(json!({
+            "identity":"g", "package":"local/consumer", "version":"1", "application":"consumer:app",
+            "python":"/p", "source_digest":"source", "interface":{},
+        })).unwrap();
+        let invocable = json!({"module":"consumer", "export":"consume", "memoize":true});
+        let key = |request: &Value| match of(&generation, "", &invocable, request, &[], ("", 0), json!([])) {
+            Memo::Key(key) => key,
+            _ => panic!("consumer is memoizable"),
+        };
+        let first = json!({"model": {"checkpoint":format!("sha256:{}", "a".repeat(64)),
+            "producer_request_id":"run-1", "output_slot":"weights", "transaction":"work-1"}});
+        let mut next = first.clone();
+        next["model"]["producer_request_id"] = "run-2".into();
+        next["model"]["output_slot"] = "another".into();
+        next["model"]["transaction"] = "work-2".into();
+        assert_eq!(key(&first), key(&next));
+        next["model"]["checkpoint"] = format!("sha256:{}", "b".repeat(64)).into();
+        assert_ne!(key(&first), key(&next));
+    }
 
     /// A callee's memoized function is keyed by its package and the identity this machine read
     /// from its installed source: a new release that leaves it unchanged keeps its memos, one

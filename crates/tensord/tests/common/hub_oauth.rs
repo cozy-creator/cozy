@@ -321,7 +321,7 @@ pub fn tensors(store: &tensorfs_core::store2::Store, weights: &[&[u8]]) -> tenso
         assert!(!weights.is_empty() && weights.len().is_multiple_of(4));
         let name = if at == 0 { "weight".to_string() } else { format!("weight{at}") };
         let shape = [(weights.len() / 4) as u64];
-        writer.put("model", &name, &Dtype::F32, &shape, Data::Plain(Source::Read(&mut &weights[..]))).unwrap();
+        writer.get("model").put(&name, &Dtype::F32, &shape, Data::Plain(Source::Read(&mut &weights[..]))).unwrap();
     }
     writer.commit().unwrap()
 }

@@ -1,7 +1,8 @@
 //! A loopback Hub that answers by name (th-245): one package's card, each release's card and install
 //! plan (its pyproject and a uv.lock real uv made against PyPI and this Hub's org index), the org
-//! index and file doors, and its models' closures by name, release and lane (a hash only to a
-//! credentialed caller), presign and objects, with ranges. It records every request.
+//! index and file doors, and its models' closures by name, release and lane (a release names one
+//! tree, a lane is a variant in it; a tree's hash only to a credentialed caller), presign and
+//! objects, with ranges. It records every request.
 #![allow(dead_code)]
 use axum::{
     body::Bytes,
@@ -12,17 +13,31 @@ use axum::{
 use base64::Engine as _;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
-use tensorfs_core::{format::ObjectRef, store2::Store};
+use tensorfs_core::{
+    format::{ObjectRef, Tree},
+    store2::Store,
+};
 
-/// One released model: `repository` at `release` in `lane`, held in a source store.
+/// One released model: `repository` at `release` in `lane`, its cozytensors `header` held in a
+/// source store.
 pub struct Model {
     pub repository: String,
     pub release: String,
     pub lane: String,
-    pub manifest: ObjectRef,
+    pub header: ObjectRef,
+}
+
+/// The tree each model's release names, put in `store`: one per repository and release, each of
+/// its lanes a variant in it.
+pub fn trees(store: &Store, models: &[Model]) -> Vec<ObjectRef> {
+    let mut trees: BTreeMap<(&str, &str), Tree> = BTreeMap::new();
+    for model in models {
+        trees.entry((&model.repository, &model.release)).or_default().set_variant(&model.lane, model.header.clone());
+    }
+    models.iter().map(|m| store.put_tree(&trees[&(m.repository.as_str(), m.release.as_str())]).unwrap()).collect()
 }
 
 /// One published package release: its interface, its wheel and the wheels of the other
@@ -39,8 +54,8 @@ pub struct Package {
 }
 
 struct Served {
-    /// Each model with the objects its closure names.
-    models: Vec<(Model, Vec<ObjectRef>)>,
+    /// Each model with its release's tree and the objects its lane's closure names but the tree.
+    models: Vec<(Model, ObjectRef, Vec<ObjectRef>)>,
     bytes: HashMap<String, Vec<u8>>,
     /// Releases of one package.
     packages: Vec<Package>,
@@ -82,13 +97,13 @@ fn start(
     pace: std::time::Duration,
 ) -> (String, Heard) {
     let mut bytes = HashMap::new();
-    let models = models.into_iter().map(|model| {
-        let objects: Vec<ObjectRef> =
-            store.closure(&model.manifest).unwrap().into_iter().filter(|o| *o != model.manifest).collect();
-        for object in objects.iter().chain([&model.manifest]) {
+    let trees = trees(store, &models);
+    let models = models.into_iter().zip(trees).map(|(model, tree)| {
+        let objects = store.closure(&model.header).unwrap();
+        for object in objects.iter().chain([&tree]) {
             bytes.insert(object.sha256.clone(), store.read(object).unwrap());
         }
-        (model, objects)
+        (model, tree, objects)
     }).collect();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -263,14 +278,14 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
                     false => release = part,
                 }
             }
-            let named: Vec<_> = served.models.iter().filter(|(model, _)| {
+            let named: Vec<_> = served.models.iter().filter(|(model, tree, _)| {
                 repository == model.repository
                     && (release.is_empty() || release == model.release)
                     && (lane.is_empty() || lane == model.lane)
-                    && (digest.is_empty() || digest == format!("sha256:{}", model.manifest.sha256))
+                    && (digest.is_empty() || digest == tree.id())
             }).collect();
             // No lane names a release's only one.
-            let Some((model, objects)) = named.first().filter(|_| !lane.is_empty() || named.len() == 1) else {
+            let Some((model, tree, objects)) = named.first().filter(|_| !lane.is_empty() || named.len() == 1) else {
                 return absent();
             };
             // A hash alone is the owner's: answered only to a credentialed caller.
@@ -283,8 +298,8 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
                 false => (model.release.as_str(), model.lane.as_str()),
             };
             // A release lane is public; a hash alone is the owner's.
-            json(json!({"complete": true, "lane": lane, "manifest": {"length": model.manifest.length,
-                "sha256": model.manifest.sha256}, "model": model.repository, "objects": rows,
+            json(json!({"complete": true, "lane": lane, "manifest": {"length": tree.length,
+                "sha256": tree.sha256}, "model": model.repository, "objects": rows,
                 "presign_max_digests": 64, "public": !release.is_empty(), "release": release, "scope": "runtime"}))
         }
         (Method::POST, "/v1/tensorfs/presign") => {

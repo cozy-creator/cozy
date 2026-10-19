@@ -65,9 +65,9 @@ pub struct Layout {
     pub root: PathBuf,
     pub bootstrap: PathBuf,
     pub state: PathBuf,
-    /// The TensorFS store this machine reads and fills: the one `COZY_TENSORFS_ROOT` names (an
-    /// owned computer's box store; a worker image sets it), else the root's standard
-    /// `var/lib/tensorfs`.
+    /// The TensorFS store this machine reads and fills: the one `COZY_TENSORFS_ROOT` names (a
+    /// worker image sets it), else a rental's `var/lib/tensorfs` under its root and this
+    /// computer's shared TensorFS cache (`TENSORFS_HOME`, else `~/.cache/tensorfs`).
     pub store: PathBuf,
     /// The datacenter volume the Hub mounted (`COZY_TENSORFS_CACHE`): the machine's one Fetcher
     /// reads it before the Hub when it is a mount point.
@@ -82,10 +82,6 @@ impl Layout {
             store: store.unwrap_or_else(|| root.join(STORE)),
             cache: None,
         }
-    }
-    /// Whether the store is this root's own, not one an operator named elsewhere (and may share).
-    pub fn own_store(&self) -> bool {
-        self.store == self.root.join(STORE)
     }
     /// This service's execution journal and package generations.
     pub fn engine(&self) -> PathBuf {
@@ -164,6 +160,10 @@ impl Grant {
                 _ => return Err(invalid("bootstrap receipt key must be 32 bytes of unpadded base64url")),
             },
         };
+        let store = match (&raw.store, rental) {
+            (None, false) => Some(tensorfs_core::home::resolve(None).map_err(|e| invalid(&e.to_string()))?),
+            (named, _) => named.clone(),
+        };
         let idle_ms = match raw.rental_idle_seconds {
             None => super::lifecycle::IDLE_GRACE_MS,
             Some(seconds) if seconds > 0 => i64::from(seconds) * 1000,
@@ -171,7 +171,7 @@ impl Grant {
         };
         Ok(Self {
             lifetime,
-            layout: Layout { cache: raw.cache.clone(), ..Layout::new(&root, raw.store.clone()) },
+            layout: Layout { cache: raw.cache.clone(), ..Layout::new(&root, store) },
             listen_host,
             worker_id,
             worker_port,

@@ -1,11 +1,10 @@
-//! A checkpoint put in a Hub repository's custody (the Hub's incremental publication): its
-//! closure (manifest, files, header, chunks) is declared under one idempotent operation, only the
-//! objects the Hub lacks are PUT to their presigned final keys and verified, and the publication
-//! is finalized. Only those need be here. The Hub's finalization job is the commit's only authority, so the call follows it
-//! to its end. A checkpoint the repository already holds converges with no transfer.
-//!
-//! U11: the Hub's finalize decodes the manifest and header itself to check this closure, with
-//! no `tfs`. The calls and their shapes stay as they are.
+//! A tree put in a Hub repository's custody (the Hub's incremental publication): its closure
+//! (the tree, its repo files, each cozytensors header and its chunks and assets) is declared
+//! under one idempotent operation, only the objects the Hub lacks are PUT to their presigned
+//! final keys and verified, and the publication is finalized. Only those need be here. The Hub's
+//! finalization job is the commit's only authority, so the call follows it to its end. A tree
+//! the repository already holds converges with no transfer. The Hub's wire names the tree its
+//! `manifest`.
 //!
 //! The caller may stop it until it finalizes: PUTs in flight end within a tick and nothing is
 //! finalized. The Hub keeps every object it verified, so asking again resumes from there.
@@ -42,7 +41,7 @@ pub struct Publication<'a> {
     pub store: &'a Store,
     /// `org/name`, the model repository that takes the checkpoint.
     pub destination: &'a str,
-    pub manifest: &'a ObjectRef,
+    pub tree: &'a ObjectRef,
     /// Names this publication: the same operation resumes it, a new one starts another.
     pub operation: &'a str,
     /// Bytes the Hub holds of the closure, and its total.
@@ -59,7 +58,7 @@ pub struct Publication<'a> {
 /// What the Hub committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Published {
-    /// `sha256:<hex>` of the manifest, the checkpoint's identity in the repository.
+    /// `sha256:<hex>` of the tree, its identity in the repository.
     pub checkpoint: String,
     /// The repository already held it: nothing was pushed or finalized.
     pub converged: bool,
@@ -281,19 +280,19 @@ fn put(http: &reqwest::Client, store: &Store, object: &ObjectRef, grant: &Grant,
 }
 
 impl Catalog {
-    /// Put `p.manifest` in `p.destination`'s custody, under the run's capability.
+    /// Put the tree `p.tree` in `p.destination`'s custody, under the run's capability.
     pub fn publish(&self, p: &Publication) -> Result<Published> {
         let hub = self.run().ok_or_else(|| hub_refused("the run's capability does not let it publish"))?;
         let http = crate::hub::fetch_http(self.ca()).map_err(|e| hub_refused(e.0))?;
         let (org, name) = repository(p.destination)?;
         let (org, name) = (org.as_str(), name.as_str());
-        let checkpoint = id(p.manifest);
+        let checkpoint = id(p.tree);
         let operation = p.operation;
 
-        // The closure the checkpoint commits to: its manifest, its files and its header's chunks.
+        // The closure the tree commits to: its files and each header's chunks and assets.
         let objects: BTreeMap<String, ObjectRef> = p
             .store
-            .closure(p.manifest)
+            .closure(p.tree)
             .map_err(|e| e.refusal())?
             .into_iter()
             .map(|o| (id(&o), o))
@@ -458,7 +457,7 @@ impl Catalog {
 
         // Finalize, then follow the Hub's finalization job to its end: committed, it is no
         // longer the caller's to stop.
-        let finalize = types::PublicationFinalize { manifest_id: checkpoint.clone(), manifest_length: p.manifest.length as i64 };
+        let finalize = types::PublicationFinalize { manifest_id: checkpoint.clone(), manifest_length: p.tree.length as i64 };
         let mut view = ask("the publication's finalization", None, || {
             hub.finalize_model_publication(org, name, operation, &finalize)
         })?;

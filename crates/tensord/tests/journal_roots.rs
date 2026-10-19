@@ -170,6 +170,7 @@ fn film(manifest: &str, reference: &(String, u64), segments: &[&str], hold_at: i
         bits: 0,
         hub: None,
         providers: Default::default(),
+            tensorfs: None,
         weights_destination: String::new(),
         owner: ACTOR.into(),
         catalog_revision: String::new(),

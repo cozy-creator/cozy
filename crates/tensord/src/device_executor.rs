@@ -188,6 +188,8 @@ pub enum DeviceCommand {
         constructions: Vec<Construction>,
     },
     Load {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tensorfs: Option<protocol::machine::TensorFSOptions>,
         construction: String,
         devices: String,
         sequence_parallel_degree: u32,
@@ -241,6 +243,8 @@ pub enum DeviceCommand {
         input_metadata: BTreeMap<String, Value>,
     },
     Invoke {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tensorfs: Option<Box<protocol::machine::TensorFSOptions>>,
         /// Retained asset capacity derived from the actual installed result schema.
         max_output_bytes: u64,
         request_id: String,
@@ -272,12 +276,19 @@ pub enum DeviceCommand {
         /// Degree 2 for this call; None leaves the executor's setting.
         #[serde(skip_serializing_if = "Option::is_none")]
         device_weights: Option<bool>,
-        /// Each `Weights[M]` parameter's checkpoint (`sha256:<hex>`), read through `weights_writer`.
+        /// Each `Weights[M]` parameter's checkpoint (`sha256:<hex>`, its header), which the
+        /// Runtime opens from the store itself.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         sources: BTreeMap<String, String>,
-        /// The weights outputs this attempt may write: output id to its byte bound.
+        /// Declared outputs and bounds, enforced by Runtime's public Writer.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         weights: BTreeMap<String, u64>,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        destination: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        actor: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        operation: String,
     },
     Budget {
         vram_bytes: i64,
@@ -383,6 +394,7 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
+    CheckpointItem,
     ModelSource,
     SealedTier,
     SealedStage,
@@ -402,10 +414,6 @@ pub enum Kind {
     ChildEvents,
     GpuRelease,
     ModelPrefetch,
-    /// An attempt's weights: one source read, one output written, or an output adopted.
-    WeightsWriter,
-    /// A fresh channel over the call's checkpoints held in part (`access::Fetch::channel`).
-    FetchChannel,
     /// A `progress` event carrying a retained `log` observation (`Telemetry.log`).
     Log,
     #[default]
@@ -686,6 +694,9 @@ pub struct Frame {
     pub released_bytes: u64,
     // `publish` (Outputs.publish): one product of a declared output.
     pub output: String,
+    /// `checkpoint_item`: the immutable TensorFS reference Runtime committed or uploaded.
+    pub repo_id: String,
+    pub revision: String,
     pub label: String,
     pub asset_ref: String,
     pub asset_kind: String,
@@ -718,10 +729,6 @@ pub struct Frame {
     pub numerics: String,
     pub local: String,
     pub cost_ms: f64,
-    /// `weights_writer`: `source`, `output` or `adopt`, its output and its transaction.
-    pub operation: String,
-    pub output_slot: String,
-    pub transaction: String,
 }
 
 impl Frame {
@@ -807,17 +814,6 @@ pub struct Answer {
     pub byte_grants: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<Value>,
-    /// `Opened` (a weights output) and `Adopted`: its transaction, run and manifest.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub transaction: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub request_id: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub manifest: String,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub manifest_length: u64,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub receipt_digest: String,
     /// A memo hit: the entry's verified copy in the run's spool, and what producing it cost.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub local: String,
@@ -871,11 +867,6 @@ impl Answer {
             result: String::new(),
             byte_grants: Vec::new(),
             progress: None,
-            transaction: String::new(),
-            request_id: String::new(),
-            manifest: String::new(),
-            manifest_length: 0,
-            receipt_digest: String::new(),
             local: String::new(),
             cost_ms: 0.0,
             disputed: false,

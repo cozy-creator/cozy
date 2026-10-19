@@ -18,7 +18,7 @@ use std::{
     time::SystemTime,
 };
 use tensord::storage::{self, Store};
-use tensorfs_core::format::{Manifest, Metadata, ObjectRef};
+use tensorfs_core::format::{ObjectRef, Tree};
 
 const MIB: u64 = 1 << 20;
 const CAPACITY: u64 = 100 << 30;
@@ -91,15 +91,14 @@ impl Fixture {
         fs::write(&log, vec![4u8; MIB as usize]).unwrap();
         (result, log)
     }
-    /// A model the store cached from a Hub: one object, pinned as a pulled checkpoint.
+    /// A model the store cached from a Hub: one object under a tree, pinned as pulled.
     fn model(&self, name: &str, mib: u64) -> (ObjectRef, String) {
         let body = vec![name.as_bytes()[0]; (mib * MIB) as usize];
         let object = self.store.put_bytes(&body).unwrap();
-        let files = [("model.bin".to_string(), object.clone())].into();
-        let manifest = Manifest { files, metadata: Metadata::new() };
-        let manifest = self.store.put_bytes(&manifest.to_json().unwrap()).unwrap();
-        storage::hold(&self.store, &storage::pin::model(&manifest.sha256), vec![manifest.clone()], None).unwrap();
-        (object, manifest.id())
+        let tree = Tree { files: [("model.bin".to_string(), object.clone())].into() };
+        let tree = self.store.put_tree(&tree).unwrap();
+        storage::hold(&self.store, &storage::pin::model(&tree.sha256), vec![tree.clone()], None).unwrap();
+        (object, tree.id())
     }
     /// A disk `short` bytes from leaving its reserve, gaining whatever this fixture frees.
     fn low(&self, short: u64) -> impl Fn() -> io::Result<Disk> + '_ {
