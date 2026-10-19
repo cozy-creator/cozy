@@ -17,7 +17,7 @@ from pathlib import Path
 import tensorfs
 import torch
 from diffusers import UNet2DConditionModel
-from tensorfs.varena.torch import Exhausted, Memory
+from tensorfs.varena.torch import Exhausted, Memory, blocks_of
 
 CONFIG = dict(  # blocks of 16 MiB and more: a smaller one shares a pack, so its region is common
     sample_size=8,
@@ -49,7 +49,12 @@ def run(device: torch.device, ck: tensorfs.Checkpoint, want: torch.Tensor, limit
     with torch.no_grad(), mem.request(f"limit {limit}") as r:
         got = unet(x.to(device), 3, encoder_hidden_states=text.to(device)).sample.cpu()
     name = f"loaded from the store, limit {limit}"
-    check(f"{name}: has blocks", model.blocks, f"common {model.common.nbytes}")
+    owners = {p for p in blocks_of(unet) if any(k.startswith(p + ".") for k in ck.tensors["unet"])}
+    check(  # its small blocks share packs with their neighbours: each still owns its regions
+        f"{name}: every block owns its regions",
+        len(model.blocks) == len(owners),
+        f"{len(model.blocks)} of {len(owners)} blocks, common {model.common.nbytes}",
+    )
     # a capped torch picks other cuDNN algorithms: F32 rounding, not a wrong weight
     check(f"{name}: equals the plain model", torch.allclose(got, want, atol=1e-5), (got - want).abs().max())
     check(f"{name}: leaves nothing behind", all(n == 0 for _, n in r.stats.leftover), r.stats.leftover)

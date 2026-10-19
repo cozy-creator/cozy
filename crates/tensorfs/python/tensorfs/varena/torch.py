@@ -39,8 +39,6 @@ from torch.utils.hooks import RemovableHandle
 
 from . import DeviceFull, Gpu, Host, Ledger, Pinned, Row, WeightSet, cuts, seal
 
-#: Regions are cut only at block boundaries: one per block, plus each run of common tensors.
-_WHOLE = 1 << 62
 #: Blocks copied ahead of the one entered, in the recorded order.
 _AHEAD = 2
 #: A streamed model's scratch slots, in its largest blocks (the core keeps 2-3).
@@ -1318,17 +1316,25 @@ def blocks_of(module: nn.Module) -> list[str]:
 
 
 def regions_of(module: nn.Module) -> list[list[str]]:
-    """Its weight set's regions, cut at its blocks: what `load` maps and a sealed layout holds."""
+    """Its weight set's regions, what `load` maps and a sealed layout holds: its tensors in
+    header order, cut wherever the block that owns them changes, so one region is one block's
+    run or a run of common. A chunk two blocks share is read once per region (the layout
+    reads parts), never a reason to join the blocks: packs chained a DiT's 48 blocks into one
+    18 GiB region."""
     grant = _declared(module).weights
     if grant is None:
         raise Unbound(f"{type(module).__name__}: no weights attached (`Declared.weights`)")
-    prefix, keys = f"{grant.component}/", None if grant.keys is None else set(grant.keys)
-    cuts_at = [prefix + b for b in blocks_of(module)]
-    regions = [
-        [n for n in region if n.startswith(prefix) and (keys is None or n[len(prefix) :] in keys)]
-        for region in tensorfs.regions(grant.ck, _WHOLE, cuts_at)
-    ]
-    return [r for r in regions if r]
+    keys = None if grant.keys is None else set(grant.keys)
+    prefix, paths = f"{grant.component}/", blocks_of(module)
+    runs: list[tuple[str | None, list[str]]] = []
+    for key in grant.ck.tensors.get(grant.component, {}):
+        if keys is not None and key not in keys:
+            continue
+        home = _block_of(key, paths)
+        if not runs or runs[-1][0] != home:
+            runs.append((home, []))
+        runs[-1][1].append(prefix + key)
+    return [names for _, names in runs]
 
 
 def _layout(
