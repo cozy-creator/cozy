@@ -16,6 +16,7 @@
 //! - Processes share a store with no leases, markers or boot-time rehash: a torn write never has
 //!   a name, and an open descriptor outlives an unlink.
 
+mod cache;
 mod checkpoint;
 mod folder;
 mod gc;
@@ -185,6 +186,8 @@ pub struct Store {
     root: PathBuf,
     durability: Durability,
     grace: Duration,
+    /// Opted-in consumer cache policy; raw and operator stores remain durable.
+    cache_mode: bool,
     /// This handle admitted objects that no `syncfs` covers yet (ephemeral only).
     unsynced: Arc<AtomicBool>,
 }
@@ -238,6 +241,7 @@ impl Store {
         Ok(Store {
             durability: Durability::of(&root),
             grace: GRACE,
+            cache_mode: false,
             root,
             unsynced: Arc::default(),
         })
