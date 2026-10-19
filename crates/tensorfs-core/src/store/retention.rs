@@ -14,6 +14,32 @@ use super::{fail, invalid, Pin, Result, Store};
 use crate::format::{ObjectRef, Tree};
 
 pub(crate) const PREFIX: &str = "hold-";
+const OWNER: &str = "tensorfs.native-retention/1";
+
+fn synthetic(id: &str) -> bool {
+    let Some(parts) = id.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let mut fields = parts.split('-');
+    let (Some(pid), Some(tick), Some(counter), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    let (Ok(pid), Ok(tick), Ok(counter)) = (
+        pid.parse::<u32>(),
+        u128::from_str_radix(tick, 16),
+        u64::from_str_radix(counter, 16),
+    ) else {
+        return false;
+    };
+    pid != 0 && id == format!("{PREFIX}{pid}-{tick:x}-{counter:x}")
+}
+
+/// Ordinary manual/Writer keys may start with hold-; only our tagged synthetic records reap.
+pub(crate) fn owned(id: &str, pin: &Pin) -> bool {
+    pin.owner.as_deref() == Some(OWNER) && synthetic(id)
+}
 
 #[derive(Debug)]
 pub(crate) struct Retention {
@@ -89,7 +115,13 @@ impl Retention {
             }
             next.insert(object.sha256.clone(), object);
         }
-        if next == *held && self.store.get_pin(&self.id)?.is_some() {
+        if next == *held
+            && self
+                .store
+                .get_pin(&self.id)?
+                .as_ref()
+                .is_some_and(|pin| owned(&self.id, pin))
+        {
             return Ok(());
         }
         // Non-variant entries retain raw objects without trying to parse chunk bytes as headers.
@@ -100,7 +132,9 @@ impl Retention {
                 .collect(),
         };
         let root = self.store.put_tree(&tree)?;
-        self.store.pin(&self.id, &Pin::new(vec![root]))?;
+        let mut pin = Pin::new(vec![root]);
+        pin.owner = Some(OWNER.to_owned());
+        self.store.pin(&self.id, &pin)?;
         *held = next;
         Ok(())
     }
@@ -112,7 +146,12 @@ fn fence(store: &Store, id: &str) -> PathBuf {
 
 /// A reserved hold record is live only while its ordinary kernel fence is held.
 pub(crate) fn protected(store: &Store, id: &str) -> Result<bool> {
-    if !id.starts_with(PREFIX) {
+    if !synthetic(id)
+        || !store
+            .get_pin(id)?
+            .as_ref()
+            .is_some_and(|pin| owned(id, pin))
+    {
         return Ok(false);
     }
     let path = fence(store, id);
@@ -131,11 +170,11 @@ pub(crate) fn protected(store: &Store, id: &str) -> Result<bool> {
 /// Called by maintenance, never by Drop. A live or fork-inherited fence is never removed.
 pub(crate) fn reap(store: &Store) -> Result<usize> {
     let mut removed = 0;
-    let mut ids: BTreeSet<String> = store
-        .pins()?
-        .into_iter()
-        .map(|(id, _)| id)
-        .filter(|id| id.starts_with(PREFIX))
+    let pins: BTreeMap<_, _> = store.pins()?.into_iter().collect();
+    let mut ids: BTreeSet<String> = pins
+        .iter()
+        .filter(|(id, pin)| owned(id, pin))
+        .map(|(id, _)| id.clone())
         .collect();
     let parent = store.root().join("tmp/holds");
     match fs::read_dir(&parent) {
@@ -147,11 +186,9 @@ pub(crate) fn reap(store: &Store) -> Result<usize> {
                     .map_err(fail("stat", entry.path()))?
                     .is_dir()
                 {
-                    if let Some(id) = entry
-                        .file_name()
-                        .to_str()
-                        .filter(|id| id.starts_with(PREFIX))
-                    {
+                    if let Some(id) = entry.file_name().to_str().filter(|id| {
+                        synthetic(id) && pins.get(*id).is_none_or(|pin| owned(id, pin))
+                    }) {
                         ids.insert(id.to_owned());
                     }
                 }
