@@ -1,12 +1,8 @@
-//! Weights on one GPU, for the process computing with them (design memory-varena §5.1).
-//!
-//! A weight set reserves one VA range per GPU laid out like its host layout; a region maps at
-//! its home offset in physical chunks, or, outside the home set, streams through a few scratch
-//! slots the size of the largest such region. A `Pinned` is a region's bytes in use: while one
-//! lives its pages stay mapped, and its drop records a release event on its stream. Eviction
-//! unmaps only unpinned pages whose fill and release events completed. Copies run on this GPU's
-//! own stream, from a sealed host layout or from the chunk files through pinned staging; a
-//! consumer waits on an event, the host never syncs.
+//! Weights on one GPU, for the process computing with them (design memory-varena §5.1): a VA
+//! range per weight set, its home regions mapped in chunks, the rest streamed through scratch
+//! slots. A `Pinned` keeps its pages mapped and records a release event when it drops; eviction
+//! takes only unpinned pages whose fill and release events completed. Copies run on our own
+//! stream; consumers wait on events, the host never syncs.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
@@ -45,7 +41,6 @@ macro_rules! call {
     };
 }
 
-// ---------------------------------------------------------------- events
 
 struct Ev {
     raw: CUevent,
@@ -129,13 +124,17 @@ fn wait_in(stream: CUstream, ev: &Ev) -> Result<()> {
 /// Keeps the events not yet passed; true when none is left.
 fn passed(events: &mut Vec<EvRef>) -> Result<bool> {
     let mut err = None;
-    events.retain(|e| e.done().map(|done| !done).unwrap_or_else(|x| err.get_or_insert(x).is_ok()));
+    events.retain(|e| match e.done() {
+        Ok(done) => !done,
+        Err(x) => {
+            err.get_or_insert(x);
+            true
+        }
+    });
     err.map_or(Ok(events.is_empty()), Err)
 }
 
-// ---------------------------------------------------------------- stats
 
-/// Counted per weight set: in the step under way, in the last finished step, and in total.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Counters {
     pub binds: u64,
@@ -178,8 +177,7 @@ pub struct GpuStats {
     pub sets: Vec<SetStats>,
 }
 
-/// One stored part: where its bytes sit in its region (`offset` from its start), and what they
-/// are; `role` is `""` for a plain tensor's data.
+/// One stored part, `offset` bytes into its region; `role` is `""` for a plain tensor's data.
 #[derive(Debug, Clone)]
 pub struct Part {
     pub component: String,
@@ -192,8 +190,7 @@ pub struct Part {
     pub nbytes: u64,
 }
 
-/// A registered checkpoint's regions: its layout and parts, and what copies read from (its chunk
-/// files, and its sealed host layout if granted).
+/// A registered checkpoint's regions, and what copies read: chunk files or a sealed host layout.
 pub struct Weights {
     pub name: String,
     pub layout: Layout,
@@ -204,9 +201,7 @@ pub struct Weights {
 
 #[cfg(feature = "store")]
 impl Weights {
-    /// With `host_fd`, a sealed host layout of the same regions (TensorD's grant) serves the
-    /// copies; without, the chunk files do: `files` (a grant's descriptors), or the checkpoint's
-    /// own paths.
+    /// Copies come from `host_fd`'s sealed layout if given, else `files`, else the checkpoint's paths.
     fn open(name: &str, ck: Ck<'_>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Weights> {
         if host_fd.is_none() && files.is_none() && ck.paths.is_none() {
             return Err(Error::Invalid("a header parsed alone reads only a grant: chunk files or a sealed layout".into()));
@@ -238,10 +233,8 @@ fn parts(header: &Header, layout: &Layout) -> Vec<Part> {
     layout.parts.iter().filter_map(part).collect()
 }
 
-// ---------------------------------------------------------------- fills
 
-/// One region's copy: pending until it is enqueued on the copy stream (`Ok`, with the event that
-/// marks it landed) or failed with nothing left in flight.
+/// One region's copy: pending, then enqueued (`Ok`: its landing event) or failed with nothing in flight.
 struct Fill {
     state: Mutex<Option<Result<EvRef>>>,
     cv: Condvar,
@@ -317,7 +310,6 @@ impl Staging {
     }
 }
 
-// ---------------------------------------------------------------- books
 
 #[derive(Clone, Copy)]
 struct Chunk {
@@ -378,9 +370,8 @@ struct Set {
     step: Counters,
     last: Counters,
     total: Counters,
-    /// The clock at its last bind, and whether its model is warm (loaded at GPU level): asks
-    /// take idle sets before warm ones, least recently bound first. A busy set (a forward in
-    /// flight) is never asked: its unbound blocks are needed this pass.
+    /// Asks take idle sets before warm ones, least recently bound (`used`) first, and never a
+    /// busy one (a forward in flight).
     used: u64,
     warm: bool,
     busy: bool,
@@ -467,18 +458,13 @@ impl State {
 
 // ---------------------------------------------------------------- the GPU
 
-#[derive(Clone, Copy)]
-struct Stream(CUstream);
-unsafe impl Send for Stream {}
-unsafe impl Sync for Stream {}
-
 struct Inner {
     ordinal: i32,
     ctx: CUcontext,
     prop: AllocationProp,
     chunk: u64,
     events: Arc<Events>,
-    copy: Stream,
+    copy: CUstream,
     readers: Readers,
     tally: IoTally,
     staging: Staging,
@@ -525,7 +511,7 @@ impl Gpu {
             prop,
             chunk,
             events: Arc::new(Events { ctx, free: Mutex::default() }),
-            copy: Stream(s),
+            copy: s,
             readers: Readers::new(READERS),
             tally: IoTally::default(),
             staging: Staging { free: Mutex::new(bufs), cv: Condvar::new() },
@@ -545,8 +531,7 @@ impl Gpu {
         self.inner.chunk
     }
 
-    /// `regions` (`tensorfs_core::client::regions`) of a v2 checkpoint as one weight set; its
-    /// copies read as `Weights::open` says.
+    /// `regions` (`tensorfs_core::client::regions`) of a v2 checkpoint as one weight set.
     #[cfg(feature = "store")]
     pub fn register<'c>(self: &Arc<Self>, name: &str, ck: impl Into<Ck<'c>>, regions: &[Vec<String>], host_fd: Option<RawFd>, files: Option<Vec<(ObjectRef, File)>>) -> Result<Arc<WeightSet>> {
         let weights = Arc::new(Weights::open(name, ck.into(), regions, host_fd, files)?);
@@ -560,7 +545,6 @@ impl Gpu {
         Ok(Arc::new(WeightSet { gpu: self.clone(), id: st.sets.len() - 1, base, weights }))
     }
 
-    /// Idle chunks and unneeded slots back to the driver; returns the bytes released.
     pub fn trim(&self) -> Result<u64> {
         let g = &self.inner;
         g.with(|st| {
@@ -577,9 +561,8 @@ impl Gpu {
         })
     }
 
-    /// Bytes for an ask (design §5.2), another process's (`serve`) or this one's: idle chunks and
-    /// unneeded slots (under ""), then unpinned home pages, idle sets before warm ones, least
-    /// recently bound first, until `want`. Busy sets and pinned pages stay. Returns what each gave.
+    /// Frees up to `want` for an ask (design §5.2): idle chunks and slots (under ""), then home
+    /// pages of sets as `Set::used` orders them. Returns what each gave.
     pub fn give(&self, want: u64) -> Result<Vec<(String, u64)>> {
         let trimmed = self.trim()?;
         let g = &self.inner;
@@ -606,7 +589,6 @@ impl Gpu {
         })
     }
 
-    /// Ends a step: the counters of the step under way become the last step's.
     pub fn step(&self) {
         let mut st = self.inner.lock();
         st.resolve();
@@ -721,14 +703,14 @@ impl Inner {
 
     /// A failure is reported once nothing it queued is in flight.
     fn drained(&self, e: Error) -> Error {
-        match call!("cuStreamSynchronize", stream_synchronize(self.copy.0)) {
+        match (|| call!("cuStreamSynchronize", stream_synchronize(self.copy)))() {
             Ok(()) => e,
             Err(s) => Error::Io(format!("{e}; and the copy stream could not drain: {s}")),
         }
     }
 
     fn run(self: &Arc<Self>, job: &Job) -> Result<(EvRef, EvRef)> {
-        let s = self.copy.0;
+        let s = self.copy;
         for w in &job.waits {
             wait_in(s, w)?;
         }
@@ -752,8 +734,7 @@ impl Inner {
         Ok((start, self.events.record(s, true)?))
     }
 
-    /// The region through the staging buffers, a buffer per piece, read on the reader threads:
-    /// from host memory at `host`, else from the chunk files through the page cache.
+    /// The region through staging, a piece per reader: from host memory at `host`, else the files.
     fn staged(self: &Arc<Self>, job: &Job, host: Option<usize>) -> Result<()> {
         let n = job.w.layout.region(job.region)?.nbytes;
         let (tx, rx) = mpsc::channel();
@@ -784,72 +765,54 @@ impl Inner {
                 }
             }
             let _c = CtxGuard::enter(self.ctx)?;
-            call!("cuMemcpyHtoDAsync", memcpy_htod_async(dst + at, buf.ptr as *const c_void, len as usize, self.copy.0))?;
-            buf.last = Some(self.events.record(self.copy.0, false)?);
+            call!("cuMemcpyHtoDAsync", memcpy_htod_async(dst + at, buf.ptr as *const c_void, len as usize, self.copy))?;
+            buf.last = Some(self.events.record(self.copy, false)?);
             Ok(())
         })();
         self.staging.put(buf);
         res
     }
 
-    fn create(&self, size: u64) -> Result<Option<Handle>> {
+    /// A new chunk, releasing idle chunks first if the device is full; None if it still is.
+    fn create(&self, st: &mut State, size: u64) -> Result<Option<Handle>> {
         let mut h: Handle = 0;
-        // SAFETY: out-param; device memory of our context's device.
-        match unsafe { (cuda::driver()?.mem_create)(&mut h, size as usize, &self.prop, 0) } {
-            cuda::SUCCESS => Ok(Some(h)),
-            cuda::ERROR_OUT_OF_MEMORY => Ok(None),
-            rc => cuda::check("cuMemCreate", rc).map(|_| None),
+        loop {
+            // SAFETY: out-param; device memory of our context's device.
+            match unsafe { (cuda::driver()?.mem_create)(&mut h, size as usize, &self.prop, 0) } {
+                cuda::SUCCESS => return Ok(Some(h)),
+                cuda::ERROR_OUT_OF_MEMORY if st.idle_bytes() > 0 => drop(self.keep_idle(st, 0)?),
+                cuda::ERROR_OUT_OF_MEMORY => return Ok(None),
+                rc => return cuda::check("cuMemCreate", rc).map(|_| None),
+            }
         }
     }
 
-    /// Maps `span` bytes at `va` in chunks: idle ones first, then new ones. A driver refusal is
-    /// `DeviceFull`, with nothing left mapped.
+    /// Maps `span` bytes at `va`, idle chunks first; a refusal is `DeviceFull` with nothing mapped.
     fn map(&self, st: &mut State, va: u64, span: u64) -> Result<Mapping> {
-        let mut sizes = vec![self.chunk; (span / self.chunk) as usize];
-        if !span.is_multiple_of(self.chunk) {
-            sizes.push(span % self.chunk);
-        }
-        let mut chunks: Vec<Chunk> = Vec::with_capacity(sizes.len());
-        for (i, &size) in sizes.iter().enumerate() {
-            if let Some(handle) = st.idle.get_mut(&size).and_then(Vec::pop) {
-                chunks.push(Chunk { handle, size });
-                continue;
+        let mut m = Mapping { va, ..Default::default() };
+        let mapped = (|| {
+            while m.span < span {
+                let size = self.chunk.min(span - m.span);
+                let handle = match st.idle.get_mut(&size).and_then(Vec::pop) {
+                    Some(h) => h,
+                    None => self.create(st, size)?.ok_or(Error::DeviceFull { need: span, deficit: span - m.span })?,
+                };
+                m.chunks.push(Chunk { handle, size });
+                call!("cuMemMap", mem_map(va + m.span, size as usize, 0, handle, 0))?;
+                m.span += size;
             }
-            let mut h = self.create(size)?;
-            if h.is_none() && st.idle_bytes() > 0 {
-                self.keep_idle(st, 0)?;
-                h = self.create(size)?;
-            }
-            match h {
-                Some(handle) => chunks.push(Chunk { handle, size }),
-                None => {
-                    self.give_back(st, chunks);
-                    return Err(Error::DeviceFull { need: span, deficit: sizes[i..].iter().sum() });
-                }
-            }
-        }
-        let mut at = va;
-        let mut failure = None;
-        for c in &chunks {
-            if let Err(e) = call!("cuMemMap", mem_map(at, c.size as usize, 0, c.handle, 0)) {
-                failure = Some(e);
-                break;
-            }
-            at += c.size;
-        }
-        if failure.is_none() {
             let desc = AccessDesc { location: self.prop.location, flags: cuda::MEM_ACCESS_PROT_READWRITE };
-            failure = call!("cuMemSetAccess", mem_set_access(va, span as usize, &desc, 1)).err();
-        }
-        if let Some(e) = failure {
-            if at > va {
-                call!("cuMemUnmap", mem_unmap(va, (at - va) as usize))?;
+            call!("cuMemSetAccess", mem_set_access(va, span as usize, &desc, 1))
+        })();
+        if let Err(e) = mapped {
+            if m.span > 0 {
+                call!("cuMemUnmap", mem_unmap(va, m.span as usize))?;
             }
-            self.give_back(st, chunks);
+            self.give_back(st, m.chunks);
             return Err(e);
         }
         st.mapped += span;
-        Ok(Mapping { va, span, chunks, ..Default::default() })
+        Ok(m)
     }
 
     /// Unmaps a mapping nothing in flight touches; its chunks go idle.
@@ -866,8 +829,7 @@ impl Inner {
         }
     }
 
-    /// Unmaps set `id`'s `regions` (all when None) at home that no pin holds and whose fill and
-    /// release events completed, until `budget` bytes; returns the bytes unmapped.
+    /// Unmaps quiet home regions of set `id` (all when None) until `budget`; returns the bytes.
     fn evict(&self, st: &mut State, id: usize, regions: Option<&[u32]>, budget: u64) -> Result<u64> {
         let all: Vec<u32> = (0..st.set(id).regs.len() as u32).collect();
         let mut freed = 0;
@@ -926,9 +888,8 @@ impl Inner {
         free_va(va, span)
     }
 
-    /// A slot for streamed region `r`: the one holding it, else a settled one (empty, then
-    /// consumed, then, for a bind, a prefetch not yet bound), else a new one. A prefetch makes a
-    /// new one only below `SLOTS`, and otherwise does nothing (None).
+    /// A slot for streamed region `r`: the one holding it, else a settled one (empty, consumed,
+    /// then for a bind an unbound prefetch), else a new one; a prefetch adds none past `SLOTS`.
     fn slot_for(&self, st: &mut State, set: usize, r: u32, urgent: bool) -> Result<Option<usize>> {
         let (w, span) = (st.set(set).w.clone(), st.slot_span);
         let x = w.layout.region(r)?;
@@ -983,7 +944,7 @@ impl Drop for Inner {
         let Ok(d) = cuda::driver() else { return };
         let Ok(_c) = CtxGuard::enter(self.ctx) else { return };
         // SAFETY: our stream, drained before anything it wrote to goes.
-        unsafe { (d.stream_synchronize)(self.copy.0) };
+        unsafe { (d.stream_synchronize)(self.copy) };
         let mut st = std::mem::take(self.st.get_mut().unwrap());
         for i in 0..st.slots.len() {
             if let Some(s) = &st.slots[i] {
@@ -997,11 +958,10 @@ impl Drop for Inner {
             unsafe { (d.mem_free_host)(b.ptr as *mut c_void) };
         }
         // SAFETY: our drained stream.
-        unsafe { (d.stream_destroy)(self.copy.0) };
+        unsafe { (d.stream_destroy)(self.copy) };
     }
 }
 
-// ---------------------------------------------------------------- weight sets
 
 /// One weight set on one GPU. Dropping it waits for its copies and releases, then unmaps it.
 pub struct WeightSet {
@@ -1016,8 +976,7 @@ impl WeightSet {
         self.gpu.inner.ordinal
     }
 
-    /// The watermark: `regions` live at their home VA, the rest stream through slots. A region
-    /// left out stays mapped until evicted, and serves binds from home meanwhile.
+    /// The watermark: `regions` live at home, the rest stream (a mapped one serves until evicted).
     pub fn home(&self, regions: &[u32]) -> Result<()> {
         let n = self.weights.layout.regions.len() as u32;
         if let Some(r) = regions.iter().find(|&&r| r >= n) {
@@ -1032,8 +991,8 @@ impl WeightSet {
         Ok(())
     }
 
-    /// Region `r` for use on `stream`: at home (mapped and filled if absent) or in the slot that
-    /// holds it. `stream` waits for the bytes; the host waits only for reads that feed a copy.
+    /// Region `r` for use on `stream`, at home or in a slot; `stream` waits for the bytes, the
+    /// host only for reads that feed a copy.
     pub fn bind(self: &Arc<Self>, region: u32, stream: u64) -> Result<Pinned> {
         let g = &self.gpu.inner;
         let _c = CtxGuard::enter(g.ctx)?;
@@ -1099,9 +1058,7 @@ impl WeightSet {
         })
     }
 
-    /// Unmaps `regions` (all when None) at home, those unpinned whose fill and release events
-    /// completed; returns the bytes unmapped. Their chunks go idle, beyond a small cache back to
-    /// the driver.
+    /// Unmaps quiet home regions (all when None); returns the bytes.
     pub fn evict(&self, regions: Option<&[u32]>) -> Result<u64> {
         let g = &self.gpu.inner;
         g.with(|st| {
@@ -1116,12 +1073,10 @@ impl WeightSet {
         Ok(self.gpu.inner.lock().reg(self.id, region)?.map.as_ref().is_some_and(|m| !m.dead()))
     }
 
-    /// Whether its model is warm (loaded at GPU level): an ask takes idle sets first.
     pub fn warm(&self, warm: bool) {
         self.gpu.inner.lock().set(self.id).warm = warm;
     }
 
-    /// Whether a forward of its model is in flight: an ask never takes a busy set's pages.
     pub fn busy(&self, busy: bool) {
         self.gpu.inner.lock().set(self.id).busy = busy;
     }
@@ -1177,8 +1132,7 @@ enum At {
     Slot(usize),
 }
 
-/// A bound region's bytes on the device. While it lives its pages stay mapped; its drop
-/// records a release event on its bind stream.
+/// A bound region: its pages stay mapped while it lives; dropping it records a release event.
 pub struct Pinned {
     ws: Arc<WeightSet>,
     at: At,
@@ -1221,13 +1175,11 @@ impl Drop for Pinned {
     }
 }
 
-// ---------------------------------------------------------------- host only
 
 /// The host-only core, for CPU executors: regions as host bytes, never loading libcuda.
 pub struct Host;
 
-/// A weight set's regions in host memory: views of a sealed host layout (read-only, shared),
-/// or private memory read once from the chunk files and kept until the set goes.
+/// Regions in host memory: read-only views of a sealed layout, or private copies read once.
 pub struct HostSet {
     pub weights: Weights,
     regs: Mutex<Vec<(Option<Arc<Anon>>, bool)>>,
@@ -1309,11 +1261,9 @@ pub struct HostPinned {
     pub writable: bool,
 }
 
-// ---------------------------------------------------------------- helpers
 
-/// The one layout of `regions` of `ck`, and its chunk files (`files`, else the checkpoint's own
-/// paths): what `register` maps and what a sealed host layout for it holds, the same by
-/// construction; `HostMem::adopt_sealed` checks the digest.
+/// The one layout of `regions` of `ck` and its chunk files: what `register` maps and a sealed
+/// host layout holds, the same by construction.
 #[cfg(feature = "store")]
 fn open_checkpoint(ck: Ck<'_>, regions: &[Vec<String>], direct_io: bool, files: Option<Vec<(ObjectRef, File)>>) -> Result<(Layout, Source)> {
     let components: Vec<&str> = regions.iter().flatten().filter_map(|t| t.split_once('/').map(|(c, _)| c)).collect();
@@ -1326,8 +1276,7 @@ fn open_checkpoint(ck: Ck<'_>, regions: &[Vec<String>], direct_io: bool, files: 
     Ok((Layout::build(&plan, regions)?, Source::files(files, direct_io, 0)))
 }
 
-/// `regions` of `ck` in a sealed host layout, filled in this process from the chunk files
-/// (`files`, else the checkpoint's paths): the memfd `register(host_fd=)` adopts.
+/// `regions` of `ck` in a sealed host layout filled here: the memfd `register(host_fd=)` adopts.
 #[cfg(feature = "store")]
 pub fn seal<'c>(ck: impl Into<Ck<'c>>, regions: &[Vec<String>], name: &str, threads: usize, files: Option<Vec<(ObjectRef, File)>>) -> Result<OwnedFd> {
     let (layout, source) = open_checkpoint(ck.into(), regions, true, files)?;
