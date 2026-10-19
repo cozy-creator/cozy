@@ -66,6 +66,8 @@ def main() -> None:
     catalog.append("];\n")
     out.joinpath("catalog.rs").write_text("\n".join(catalog))
     out.joinpath("manifest.json").write_text(json.dumps({"triton": triton.__version__, "binaries": records}, indent=2) + "\n")
+    for name in ("kernels.py", "build.py"):
+        out.joinpath("source-" + name).write_bytes(pathlib.Path(__file__).with_name(name).read_bytes())
     assert len(records) == len(args.family) * len(DTYPES) * (1 + len(STRUCTS) + len(STAGES))
     print(f"{len(records)} prebuilt CUDA binaries; no driver or GPU used")
 
