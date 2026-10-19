@@ -438,10 +438,10 @@ fn kept_pages_outlive_their_executor_and_go_on_an_ask() {
     use tensord::device_executor::Page;
     let ledger = GpuLedger::start("GPU-kept", false, 0, Some(8 * GIB), None, Liveness::default(), MemoryLog::default()).unwrap().unwrap();
     let page = |region: u32, text: &str| -> (Page, File) {
-        let mut fd = File::from(cozy_platform::shm::memfd_named("page").unwrap());
+        let mut fd = File::from(platform::shm::memfd_named("page").unwrap());
         fd.write_all(text.as_bytes()).unwrap();
         let (tx, rx) = UnixStream::pair().unwrap();
-        cozy_platform::handles::send_fd(&tx, &fd).unwrap();
+        platform::handles::send_fd(&tx, &fd).unwrap();
         (Page { region, nbytes: GIB }, File::from(OwnedFd::from(rx)))
     };
     let kept = |l: &GpuLedger| {

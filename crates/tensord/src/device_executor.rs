@@ -1710,7 +1710,7 @@ impl DeviceExecutor {
                     }
                 }
                 Some(Event::Request) if frame.kind == Kind::KeepPages => {
-                    let pages = (0..frame.descriptors).map(|_| cozy_platform::handles::recv_fd(&self.stream).map(File::from));
+                    let pages = (0..frame.descriptors).map(|_| platform::handles::recv_fd(&self.stream).map(File::from));
                     let pages = pages.collect::<Result<Vec<_>, _>>()?;
                     write_frame(&mut self.stream, &services.keep_pages(&frame, pages))?;
                 }
