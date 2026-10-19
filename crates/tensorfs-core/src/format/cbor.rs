@@ -156,7 +156,7 @@ fn half(f: f64) -> Option<u16> {
         -14..=15 => (((e + 15) as u16) << 10, a * 2f64.powi(10 - e) - 1024.0),
         _ => (0, a * 2f64.powi(24)),
     };
-    (m.fract() == 0.0 && m < 1024.0).then(|| sign | bits | m as u16)
+    (m.fract() == 0.0 && m < 1024.0).then_some(sign | bits | m as u16)
 }
 
 /// An IEEE half's value; NaN for an infinity or NaN.
@@ -222,7 +222,7 @@ pub(crate) fn write(h: &Header) -> Result<Vec<u8>> {
                 }
             }
         }
-        w.map(&c.assets, |w, r| Ok(w.object(r)))?;
+        w.map(&c.assets, |w, r| { w.object(r); Ok(()) })?;
         if let Some(file) = &c.config_file {
             w.text(file);
         }

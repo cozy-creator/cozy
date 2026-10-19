@@ -647,7 +647,7 @@ impl Writer {
                 let first = |entries: &Vec<Entry>| entries.iter().map(rank).min().unwrap_or(usize::MAX);
                 let mut all: Vec<_> = (specs.into_iter().zip(grouped).zip(assets)).collect();
                 all.sort_by_key(|((_, entries), _)| first(entries));
-                let ((s, g), a) = all.into_iter().map(|((s, g), a)| ((s, g), a)).unzip();
+                let ((s, g), a) = all.into_iter().unzip();
                 (specs, grouped, assets) = (s, g, a);
             }
         }
