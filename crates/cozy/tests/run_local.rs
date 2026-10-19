@@ -131,7 +131,7 @@ fn runtime_checkpoint_writes_replay_and_survive_calcifer_restart() {
         &work.join("cpu_weights"),
     );
     let run = |size: &str| completed(&cozy(&home, &work,
-        &["--json", "run", "./cpu_weights/table", "--on", "m1", "--size", size]));
+        &["--json", "run", "./cpu_weights/table", &format!("size={size}"), "--on", "m1"]));
     let checkpoint = |run: &Value, size: usize| {
         let output = run["output"].as_array().unwrap().iter()
             .find(|output| output["name"] == "model").unwrap_or_else(|| panic!("no model output: {run}"));
