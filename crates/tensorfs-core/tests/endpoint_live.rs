@@ -5,6 +5,8 @@
 //! endpoint once (JWT-bearer, DPoP-proved) and proves every Hub request with it.
 
 use std::path::Path;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,14 +67,14 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     tree.set_variant("int8", header.clone());
     let base_tree = store.put_tree(&tree).unwrap();
     let model = format!("{account}/model");
-    let owner = Endpoint::new(&client, &reach, Some(bearer_provider(bearer.token))).unwrap();
+    let owner = Endpoint::new(&client, &reach, Some(bearer_provider(bearer.token.clone()))).unwrap();
     upload_tree(&owner, &model, &base_tree, &store, None).await.unwrap();
     tree.files.insert("README.md".into(), store.put_bytes(b"worker output\n").unwrap());
     let output_tree = store.put_tree(&tree).unwrap();
 
     let (jwk, thumbprint) = key();
     let capability = device.sign_run_capability(&RunCapability {
-        user_id,
+        user_id: user_id.clone(),
         hub: origin.clone(),
         key_jkt: thumbprint.clone(),
         run: format!("r-{nonce}"),
@@ -150,5 +152,34 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     fetcher.settled().await;
     assert_eq!(pulled.header, header);
     assert_eq!(into.checkpoint(&header).unwrap().read("model", "w").unwrap(), weights);
+    if let Some(python) = var("TENSORFS_TEST_PYTHON") {
+        let (key, thumbprint) = key();
+        let capability = device.sign_run_capability(&RunCapability {
+            user_id,
+            hub: origin.clone(),
+            key_jkt: thumbprint,
+            run: format!("python-{nonce}"),
+            operations: vec![
+                json!({"type": "tensorhub_model_read", "model": model, "revision": base_tree.id()}),
+                json!({"type": "tensorhub_model_upload", "model": model}),
+            ],
+            lifetime: Duration::from_secs(600),
+        });
+        let request = json!({
+            "key": key, "capability": capability, "origin": origin, "endpoint": reach,
+            "token_endpoint": user.token_endpoint().await.unwrap(), "model": model,
+            "other": other, "tree": base_tree.id(), "owner_token": bearer.token,
+            "ca": ca, "cache_dir": scratch.join("python"),
+        });
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensorfs/scripts/endpoint_api.py");
+        let mut child = Command::new(python).arg("-I").arg(script)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(&serde_json::to_vec(&request).unwrap()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "Python endpoint proof: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+    } else {
+        eprintln!("Python binding proof skipped: TENSORFS_TEST_PYTHON is absent");
+    }
     let _ = std::fs::remove_dir_all(scratch);
 }
