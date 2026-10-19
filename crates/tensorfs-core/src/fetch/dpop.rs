@@ -193,11 +193,11 @@ impl TokenProvider for DPoP {
         Ok(vec![("authorization".into(), format!("DPoP {token}")), ("dpop".into(), proof)])
     }
 
-    fn retry(&self, sent: &Request<'_>, status: u16, headers: &HeaderMap) -> bool {
+    fn retry(&self, sent: &Request<'_>, status: u16, headers: &HeaderMap) -> Result<bool> {
         let fresh = self.keep_nonce(sent.url, headers);
         let challenged = headers.get_all("www-authenticate").iter().any(|v| v.to_str().is_ok_and(|v| v.contains("use_dpop_nonce")));
         let proved = sent.headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("dpop"));
-        proved && fresh && (status == 400 || (status == 401 && challenged))
+        Ok(proved && fresh && (status == 400 || (status == 401 && challenged)))
     }
 }
 

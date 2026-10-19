@@ -434,7 +434,10 @@ impl Endpoint {
                 Ok(reply) => {
                     self.slowest.fetch_max(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let sent = Request { method: ask.method, url: ask.url, headers: &headers, payload: ask.payload };
-                    let again = ask.auth && (self.token.as_ref()).is_some_and(|t| t.retry(&sent, reply.status, &reply.headers));
+                    let again = match (ask.auth, &self.token) {
+                        (true, Some(token)) => token.retry(&sent, reply.status, &reply.headers)?,
+                        _ => false,
+                    };
                     if again && !asked_again {
                         asked_again = true;
                         continue;
