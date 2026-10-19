@@ -12,10 +12,11 @@ LAYOUTS = ("row_major", "transposed", "cublas_128x4")
 
 @dataclass(frozen=True)
 class Grid:
-    kind: str  # "tensor", "row", "col" or "blocks"
+    kind: str  # "tensor", "row", "col", "blocks" or "tiles"
     size: int = 0  # blocks: elements per block along a row
     layout: str = "row_major"  # blocks: one of LAYOUTS
     index: np.ndarray | None = None  # blocks: each column's block (g_idx), else j // size
+    tile: tuple = ()  # tiles: (rows, cols) of each tile, then the matrix height (second-last extent)
 
 
 TENSOR, ROW, COL = Grid("tensor"), Grid("row"), Grid("col")
@@ -25,7 +26,14 @@ def blocks(size: int, layout: str, index=None) -> Grid:
     return Grid("blocks", size, layout, index)
 
 
+def tiles(rows: int, cols: int, height: int) -> Grid:
+    return Grid("tiles", tile=(rows, cols, height))
+
+
 def shape(g: Grid, c):
+    if g.kind == "tiles":
+        rows, cols, height = g.tile
+        return "exact", [*c.shape[:-2], -(-height // rows), -(-c.shape[-1] // cols)]
     if g.kind == "tensor":
         return "count", 1
     if g.kind in ("row", "col"):
@@ -35,7 +43,8 @@ def shape(g: Grid, c):
         return "exact", [*c.lead, w]
     if g.layout == "transposed":
         return "exact", [w, c.rows]
-    return "exact", [128 * -(-c.rows // 128), 4 * -(-w // 4)]
+    *stack, n = c.lead  # cublas_128x4 tiles each matrix [N, C] of a stack on its own
+    return "exact", [*stack, 128 * -(-n // 128), 4 * -(-w // 4)]
 
 
 def at(g: Grid, rows: int, cols: int) -> np.ndarray:
@@ -47,6 +56,9 @@ def at(g: Grid, rows: int, cols: int) -> np.ndarray:
         return np.broadcast_to(i, (rows, cols))
     if g.kind == "col":
         return np.broadcast_to(j, (rows, cols))
+    if g.kind == "tiles":
+        br, bc, height = g.tile
+        return ((i // height) * -(-height // br) + i % height // br) * -(-cols // bc) + j // bc
     w = -(-cols // g.size)
     b = (j // g.size) if g.index is None else g.index.astype(np.int64)[None, :]
     if g.layout == "row_major":

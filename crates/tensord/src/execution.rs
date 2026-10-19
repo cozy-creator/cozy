@@ -133,6 +133,12 @@ fn stop_preparation(
 type Halt = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
 impl Engine {
+    /// Object custody, as a run's acceptance takes it: while one holds it, no run is accepted
+    /// (and no object root is released).
+    pub fn object_custody(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.object_custody.lock().unwrap()
+    }
+
     pub fn open(root: &Path) -> io::Result<Arc<Self>> {
         fs::create_dir_all(root)?;
         platform::durable::set_mode(root, 0o700)?;

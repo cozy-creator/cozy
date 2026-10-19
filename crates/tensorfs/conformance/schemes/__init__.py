@@ -12,6 +12,8 @@ from . import mxfp8
 from . import nvfp4
 
 # fp8.blockwise, mxfp4
+from . import fp8_blockwise
+from . import mxfp4
 
 # gguf
 
@@ -21,7 +23,7 @@ from . import nvfp4
 
 # comfy
 
-from .base import Ctx, Refused
+from .base import Ctx, PartDtype, Refused
 
 FAMILIES = (
     fp8,
@@ -30,6 +32,8 @@ FAMILIES = (
     nvfp4,
 
     # fp8.blockwise, mxfp4
+    fp8_blockwise,
+    mxfp4,
 
     # gguf
 
@@ -68,13 +72,20 @@ def _decode(dtype, shape, encoding, parts) -> bytes:
     roles = {p.role for p in scheme.parts}
     if not {p.role for p in scheme.parts if p.required} <= parts.keys() <= roles:
         raise fail(f"parts {sorted(parts)}")
-    if params.keys() != scheme.params.keys():  # all required; an unknown one is refused
+    need = {k for k, r in scheme.params.items() if not isinstance(r, PartDtype) or r.role in parts}
+    if params.keys() != need:  # all required; an unknown one is refused
         raise fail(f"params {sorted(params)}")
-    for key, rule in scheme.params.items():
-        if not allowed(rule, params[key]):
+    for key in need:
+        rule = scheme.params[key]
+        if not allowed(rule.dtypes if isinstance(rule, PartDtype) else rule, params[key]):
             raise fail(f"param {key}={params[key]!r}")
     if dtype not in ("F32", "BF16", "F16"):
         raise fail(f"logical dtype {dtype}")
+    # transposed: true (spec §6, building blocks): the parts hold the logical tensor with its last two axes
+    # swapped; the scheme reads that stored tensor, and its values are swapped back.
+    transposed = params.get("transposed") is True and len(shape) >= 2
+    if transposed:
+        shape = [*shape[:-2], shape[-1], shape[-2]]
     numel = int(np.prod(shape, dtype=np.int64))
     if scheme.flat:
         rows, cols = 1, numel
@@ -93,7 +104,10 @@ def _decode(dtype, shape, encoding, parts) -> bytes:
         fits = ps == list(want) if kind == "exact" else int(np.prod(ps, dtype=np.int64)) == want
         if pd not in names or not fits:
             raise fail(f"part {rule.role} is {pd} {ps}")
-    return round_l(dtype, np.asarray(scheme.decode(c), np.float32))
+    out = np.asarray(scheme.decode(c), np.float32)
+    if transposed:
+        out = out.reshape(shape).swapaxes(-1, -2)
+    return round_l(dtype, out)
 
 
 def round_l(dtype: str, x: np.ndarray) -> bytes:

@@ -144,6 +144,8 @@ struct Want {
 const NVFP4_MODELOPT: &str = r#"nvfp4 {block_size: 16, global_scale: "multiply", nibble_order: "low_first", scale_layout: "row_major"}"#;
 const NVFP4_CT: &str = r#"nvfp4 {block_size: 16, global_scale: "divide", nibble_order: "low_first", scale_layout: "row_major"}"#;
 const NVFP4_COMFY: &str = r#"nvfp4 {block_size: 16, global_scale: "multiply", nibble_order: "high_first", scale_layout: "cublas_128x4"}"#;
+const NVFP4_COMFY_AWQ: &str = r#"nvfp4 {block_size: 16, global_scale: "multiply", nibble_order: "high_first", pre_quant_scale_dtype: "BF16", scale_layout: "cublas_128x4"}"#;
+const NVFP4_MODELOPT_AWQ: &str = r#"nvfp4 {block_size: 16, global_scale: "multiply", nibble_order: "low_first", pre_quant_scale_dtype: "BF16", scale_layout: "row_major"}"#;
 const MXFP8_ROWS: &str = r#"mxfp8 {block_size: 32, scale_layout: "row_major"}"#;
 const MXFP8_TILES: &str = r#"mxfp8 {block_size: 32, scale_layout: "cublas_128x4"}"#;
 
@@ -312,6 +314,67 @@ fn modelopt_nvfp4_and_mxfp8() {
 }
 
 #[test]
+fn modelopt_nvfp4_awq_keeps_pre_quant_scale() {
+    // ModelOpt 0.47.0's own NVFP4_AWQ export (`conformance/mine/nvfp4.py`). Only o_proj keeps its
+    // pre_quant_scale; ModelOpt folds q/k/v's into the norm and down's into up_proj, so those decode
+    // to the smoothed weight it quantized. Its table has no −0: signed zeros are its one difference.
+    macro_rules! nvfp4 {
+        ($m:literal, $n:literal, $k:literal) => {
+            Want {
+                key: concat!("model.layers.0.", $m, ".weight"),
+                encoding: NVFP4_MODELOPT,
+                parts: &[
+                    ("weight", "F4", &[$n, $k], "weight"),
+                    ("scale", "F8_E4M3", &[$n, $k / 16], "weight_scale"),
+                    ("scale_2", "F32", &[], "weight_scale_2"),
+                    ("input_scale", "F32", &[], "input_scale"),
+                ],
+                meets: Meets::OneStep,
+                error: 0.12,
+            }
+        };
+    }
+    let mut wants = [
+        nvfp4!("self_attn.q_proj", 64, 64),
+        nvfp4!("self_attn.k_proj", 32, 64),
+        nvfp4!("self_attn.v_proj", 32, 64),
+        nvfp4!("self_attn.o_proj", 64, 64),
+        nvfp4!("mlp.gate_proj", 96, 64),
+        nvfp4!("mlp.up_proj", 96, 64),
+        nvfp4!("mlp.down_proj", 64, 96),
+    ];
+    wants[3].encoding = NVFP4_MODELOPT_AWQ;
+    wants[3].parts = &[
+        ("weight", "F4", &[64, 64], "weight"),
+        ("scale", "F8_E4M3", &[64, 4], "weight_scale"),
+        ("scale_2", "F32", &[], "weight_scale_2"),
+        ("input_scale", "F32", &[], "input_scale"),
+        ("pre_quant_scale", "BF16", &[64], "pre_quant_scale"),
+    ];
+    check("modelopt-nvfp4-awq", &wants);
+}
+
+#[test]
+fn comfy_fused_experts_keep_a_scale_2_each() {
+    // Comfy-Org/Lens's gpt-oss experts (a slice): weight_scale_2 [E] and tiles per expert decode
+    // bit for bit to OpenAI's MXFP4 original, and to comfy-kitchen's own dequantize.
+    check(
+        "comfy-nvfp4-experts",
+        &[Want {
+            key: "layers.1.mlp.experts.down_proj.weight",
+            encoding: NVFP4_COMFY,
+            parts: &[
+                ("weight", "F4", &[3, 64, 64], "weight"),
+                ("scale", "F8_E4M3", &[3, 128, 4], "weight_scale"),
+                ("scale_2", "F32", &[3], "weight_scale_2"),
+            ],
+            meets: Meets::Exactly,
+            error: 0.0,
+        }],
+    );
+}
+
+#[test]
 fn compressed_tensors_nvfp4_and_mxfp8() {
     // Both global scales are reciprocals: `global_scale: divide` covers `scale_2` and `input_scale`.
     check(
@@ -363,13 +426,13 @@ fn comfy_nvfp4_keeps_its_nibbles_and_tiles() {
                 meets: Meets::OneStep,
                 error: 0.15,
             },
-            // Experts tiled one by one are one tiling of all their rows (128 per expert).
+            // Experts are tiled one by one, as the spec's cublas_128x4 tiles a stack.
             Want {
                 key: "blocks.0.experts.weight",
                 encoding: NVFP4_COMFY,
                 parts: &[
                     ("weight", "F4", &[2, 128, 16], "weight"),
-                    ("scale", "F8_E4M3", &[256, 4], "weight_scale"),
+                    ("scale", "F8_E4M3", &[2, 128, 4], "weight_scale"),
                     ("scale_2", "F32", &[], "weight_scale_2"),
                 ],
                 meets: Meets::OneStep,
@@ -612,26 +675,26 @@ fn unknown_undeclared_and_ambiguous_carriers_are_refused() {
     assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
     assert!(e.detail.contains("convrot_w4a4"), "{}", e.detail);
 
-    // ModelOpt's AWQ smoothing has no part in cozytensors/1's nvfp4 yet.
+    // AWQ's pre_quant_scale has one element per input column.
     let e = refused("modelopt-nvfp4", &|t, _, _| {
         t.push((
             "proj.pre_quant_scale".into(),
             "BF16".into(),
-            vec![64],
-            vec![0; 128],
+            vec![32],
+            vec![0; 64],
         ));
     });
-    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
+    assert_eq!(e.code, Code::MISSING_COMPANION_ROLE, "{}", e.detail);
     assert!(e.detail.contains("pre_quant_scale"), "{}", e.detail);
 
-    // A per-expert global scale is not one nvfp4 scale_2.
+    // A global scale per expert is one per matrix, or one: not three for two experts.
     let e = refused("comfy-nvfp4", &|t, _, _| {
         let g = t
             .iter_mut()
             .find(|(k, ..)| k == "blocks.0.experts.weight_scale_2")
             .unwrap();
-        g.2 = vec![2];
-        g.3 = [g.3.clone(), g.3.clone()].concat();
+        g.2 = vec![3];
+        g.3 = [g.3.clone(), g.3.clone(), g.3.clone()].concat();
     });
     assert_eq!(e.code, Code::MISSING_COMPANION_ROLE, "{}", e.detail);
     assert!(e.detail.contains("weight_scale_2"), "{}", e.detail);
@@ -642,10 +705,11 @@ fn every_carrier_names_a_complete_encoding() {
     use tensorfs_core::format::{GlobalScale::*, NibbleOrder::*, ScaleLayout::*};
     use tensorfs_core::import::carriers::{carriers, Producer};
     for c in carriers() {
+        let awq = |e: Encoding| e.with_pre_quant_scale(&Dtype::F32);
         let want = match (c.encoding.scheme.as_str(), c.producer) {
-            ("nvfp4", Producer::Modelopt) => Encoding::nvfp4(Multiply, LowFirst, RowMajor),
+            ("nvfp4", Producer::Modelopt) => awq(Encoding::nvfp4(Multiply, LowFirst, RowMajor)),
             ("nvfp4", Producer::CompressedTensors) => Encoding::nvfp4(Divide, LowFirst, RowMajor),
-            ("nvfp4", Producer::Comfy) => Encoding::nvfp4(Multiply, HighFirst, Cublas128x4),
+            ("nvfp4", Producer::Comfy) => awq(Encoding::nvfp4(Multiply, HighFirst, Cublas128x4)),
             ("mxfp8", Producer::Comfy) => Encoding::mxfp8(Cublas128x4),
             ("mxfp8", _) => Encoding::mxfp8(RowMajor),
             ("fp8.tensorwise", _) => Encoding::fp8_tensorwise(&Dtype::F32),
@@ -653,9 +717,15 @@ fn every_carrier_names_a_complete_encoding() {
             ("int8.tensorwise", _) => Encoding::int8_tensorwise(&Dtype::F32),
             ("int8.rowwise", _) => Encoding::int8_rowwise(0, &Dtype::F32),
             ("int8.convrot", _) => Encoding::int8_convrot(256, &Dtype::F32),
+            ("fp8.blockwise", _) => Encoding::fp8_blockwise(128, 128, &Dtype::F32),
+            ("mxfp4", Producer::GptOss) => Encoding::mxfp4(true),
+            ("mxfp4", _) => Encoding::mxfp4(false),
             other => panic!("{other:?}"),
         };
         let mut encoding = c.encoding.clone();
+        for param in c.config_params.keys() {
+            encoding.params.insert(param.clone(), tensorfs_core::format::Value::List(vec![128u64.into(), 128u64.into()]));
+        }
         for (param, (_, default)) in &c.marker_params {
             encoding.params.insert(param.clone(), (*default).into());
         }
@@ -948,12 +1018,54 @@ fn real_bytes_from_comfyui_and_modelopt() {
         assert!(wrong > 0.30, "{nibbles}/{layout}: {wrong}");
     }
 
-    // ModelOpt AWQ converted to ComfyUI's bytes: `pre_quant_scale` has no nvfp4 part yet.
-    let e = import(&store, &fixtures().join("real-comfy-nvfp4-awq"))
-        .map(drop)
-        .unwrap_err();
-    assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
-    assert!(e.detail.contains("pre_quant_scale"), "{}", e.detail);
+    // ModelOpt AWQ in ComfyUI's bytes (MiniMax-H3's text encoder): `pre_quant_scale` multiplies
+    // the columns back; without it the same bytes are far off (xs-049 U8).
+    let ck = import(&store, &fixtures().join("real-comfy-nvfp4-awq")).unwrap();
+    let key = "model.layers.0.self_attn.o_proj.weight";
+    let t = ck.tensor("model", key).unwrap();
+    let Body::Encoded { encoding, parts } = &t.body else {
+        panic!()
+    };
+    assert_eq!(encoding.to_string(), NVFP4_COMFY_AWQ);
+    let roles: Vec<&str> = parts.iter().map(|p| p.role.as_str()).collect();
+    assert_eq!(roles, ["weight", "scale", "scale_2", "pre_quant_scale"]);
+    let source = read_safetensors(&fixtures().join("real-comfy-nvfp4-awq.expect.safetensors"));
+    let source = bf16s(&source[0].3);
+    let error = |decoded: &[u16]| {
+        let (mut err, mut norm) = (0.0, 0.0);
+        for (d, s) in decoded.iter().zip(&source) {
+            err += (value(*d) - value(*s)).powi(2);
+            norm += value(*s).powi(2);
+        }
+        (err / norm).sqrt()
+    };
+    let right = error(&bf16s(&ck.read("model", key).unwrap()));
+    assert!(right < 0.12, "{right}");
+    let bytes: Vec<Vec<u8>> = parts
+        .iter()
+        .map(|p| {
+            let mut b = vec![0; p.length as usize];
+            ck.bytes_into(&p.at(), &mut b).unwrap();
+            b
+        })
+        .collect();
+    let mut views: BTreeMap<&str, PartBytes> = parts
+        .iter()
+        .zip(&bytes)
+        .map(|(p, b)| {
+            let view = PartBytes {
+                dtype: &p.dtype,
+                shape: &p.shape,
+                bytes: b,
+            };
+            (p.role.as_str(), view)
+        })
+        .collect();
+    views.remove("pre_quant_scale");
+    let mut without = encoding.clone();
+    without.params.remove("pre_quant_scale_dtype");
+    let wrong = error(&bf16s(&decode(&t.dtype, &t.shape, &without, &views).unwrap()));
+    assert!(wrong > 0.30, "without pre_quant_scale: {wrong}");
     // ModelOpt's post-processed export carries both declarations: refused until the rule that
     // reads it (xs-049) lands.
     let e = import(&store, &fixtures().join("real-modelopt-nvfp4-comfy-marked"))

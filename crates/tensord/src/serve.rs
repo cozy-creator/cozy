@@ -207,14 +207,17 @@ pub fn dev(args: Dev) -> io::Result<()> {
 
 /// The state root's one owner: its lock held while the process lives, and the TensorFS store it
 /// serves (which may live outside `root`), claimed for this machine alone.
-fn own(root: &std::path::Path, store: &std::path::Path) -> io::Result<(std::fs::File, Arc<Store>)> {
+fn own(root: &std::path::Path, store: &std::path::Path) -> io::Result<((std::fs::File, std::fs::File), Arc<Store>)> {
     std::fs::create_dir_all(root)?;
     let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
         .open(root.join("owner.lock"))?;
     lock.try_lock_exclusive()
         .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "state already has a machine owner"))?;
     platform::durable::set_mode(root, 0o700)?;
-    Ok((lock, crate::storage::open(store)?))
+    let store = crate::storage::open(store)?;
+    // The store is this machine's alone, whatever path another machine names it by.
+    let claim = crate::storage::claim(store.root())?;
+    Ok(((lock, claim), store))
 }
 
 /// `tensord version --json`: what a candidate binary declares to the machine's update.

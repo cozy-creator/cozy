@@ -17,14 +17,16 @@
   "carriers": [
     {
       "producer": "modelopt",
-      "formats": ["NVFP4", "W4A16_NVFP4"],
+      "formats": ["NVFP4", "NVFP4_AWQ", "W4A16_NVFP4"],
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["U8"], "as": "F4", "shape": "logical"},
         {"suffix": "weight_scale", "role": "scale", "dtypes": ["F8_E4M3"], "shape": {"blocks": 16}},
         {"suffix": "weight_scale_2", "role": "scale_2", "dtypes": ["F32"], "shape": "one"},
-        {"suffix": "input_scale", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true}
+        {"suffix": "input_scale", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true},
+        {"suffix": "pre_quant_scale", "role": "pre_quant_scale", "dtypes": ["F32", "BF16", "F16"], "shape": "columns", "optional": true}
       ],
-      "encoding": {"scheme": "nvfp4", "params": {"block_size": 16, "global_scale": "multiply", "nibble_order": "low_first", "scale_layout": "row_major"}}
+      "encoding": {"scheme": "nvfp4", "params": {"block_size": 16, "global_scale": "multiply", "nibble_order": "low_first", "scale_layout": "row_major"}},
+      "dtype_params": {"pre_quant_scale_dtype": "pre_quant_scale"}
     },
     {
       "producer": "modelopt",
@@ -61,10 +63,12 @@
       "parts": [
         {"suffix": "weight", "role": "weight", "dtypes": ["U8"], "as": "F4", "shape": "logical"},
         {"suffix": "weight_scale", "role": "scale", "dtypes": ["F8_E4M3", "U8"], "as": "F8_E4M3", "shape": {"tiles": 16}},
-        {"suffix": "weight_scale_2", "role": "scale_2", "dtypes": ["F32"], "shape": "one"},
-        {"suffix": "input_scale", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true}
+        {"suffix": "weight_scale_2", "role": "scale_2", "dtypes": ["F32"], "shape": "matrices"},
+        {"suffix": "input_scale", "role": "input_scale", "dtypes": ["F32"], "shape": "one", "optional": true},
+        {"suffix": "pre_quant_scale", "role": "pre_quant_scale", "dtypes": ["F32", "BF16", "F16"], "shape": "columns", "optional": true}
       ],
       "encoding": {"scheme": "nvfp4", "params": {"block_size": 16, "global_scale": "multiply", "nibble_order": "high_first", "scale_layout": "cublas_128x4"}},
+      "dtype_params": {"pre_quant_scale_dtype": "pre_quant_scale"},
       "marker_values": {"block_size": 16, "group_size": 16}
     },
     {
@@ -139,6 +143,87 @@
       ],
       "encoding": {"scheme": "int8.convrot", "params": {"rotation": "hadamard"}},
       "marker_params": {"rotation_size": ["convrot_groupsize", 256]},
+      "dtype_params": {"scale_dtype": "scale"}
+    },
+    {
+      "producer": "deepseek",
+      "formats": ["fp8"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3"], "shape": "logical"},
+        {"suffix": "weight_scale_inv", "role": "scale", "dtypes": ["F32", "BF16", "F16", "F8_E8M0"], "shape": "block_tiles"}
+      ],
+      "encoding": {"scheme": "fp8.blockwise", "params": {}},
+      "config_params": {"block_size": "weight_block_size"},
+      "dtype_params": {"scale_dtype": "scale"}
+    },
+    {
+      "producer": "deepseek",
+      "formats": ["fp8"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3"], "shape": "logical"},
+        {"suffix": "scale", "role": "scale", "dtypes": ["F8_E8M0", "F32"], "shape": "block_tiles"}
+      ],
+      "encoding": {"scheme": "fp8.blockwise", "params": {}},
+      "config_params": {"block_size": "weight_block_size"},
+      "dtype_params": {"scale_dtype": "scale"}
+    },
+    {
+      "producer": "deepseek",
+      "formats": ["fp4"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "as": "F4", "shape": "logical"},
+        {"suffix": "scale", "role": "scale", "dtypes": ["F8_E8M0"], "shape": {"blocks": 32}}
+      ],
+      "encoding": {"scheme": "mxfp4", "params": {"block_size": 32, "transposed": false}}
+    },
+    {
+      "producer": "compressed-tensors",
+      "formats": ["float-quantized/block"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3"], "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["BF16", "F32", "F16"], "shape": "block_tiles"}
+      ],
+      "encoding": {"scheme": "fp8.blockwise", "params": {}},
+      "config_params": {"block_size": "block_structure"},
+      "dtype_params": {"scale_dtype": "scale"}
+    },
+    {
+      "producer": "compressed-tensors",
+      "formats": ["mxfp4-pack-quantized"],
+      "parts": [
+        {"suffix": "weight_packed", "role": "weight", "dtypes": ["U8"], "as": "F4", "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["U8"], "as": "F8_E8M0", "shape": {"blocks": 32}}
+      ],
+      "encoding": {"scheme": "mxfp4", "params": {"block_size": 32, "transposed": false}}
+    },
+    {
+      "producer": "gpt-oss",
+      "formats": ["mxfp4"],
+      "bare": true,
+      "parts": [
+        {"suffix": "blocks", "role": "weight", "dtypes": ["U8"], "as": "F4", "shape": "logical", "merge": true},
+        {"suffix": "scales", "role": "scale", "dtypes": ["U8"], "as": "F8_E8M0", "shape": {"blocks": 32}}
+      ],
+      "encoding": {"scheme": "mxfp4", "params": {"block_size": 32, "transposed": true}}
+    },
+    {
+      "producer": "quark",
+      "formats": ["mxfp4"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["U8"], "as": "F4", "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["U8"], "as": "F8_E8M0", "shape": {"blocks": 32}}
+      ],
+      "encoding": {"scheme": "mxfp4", "params": {"block_size": 32, "transposed": false}}
+    },
+    {
+      "producer": "quark",
+      "formats": ["fp8_block"],
+      "parts": [
+        {"suffix": "weight", "role": "weight", "dtypes": ["F8_E4M3"], "shape": "logical"},
+        {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32"], "shape": "block_tiles"}
+      ],
+      "encoding": {"scheme": "fp8.blockwise", "params": {}},
+      "config_params": {"block_size": "block_size"},
       "dtype_params": {"scale_dtype": "scale"}
     }
   ]

@@ -1,6 +1,6 @@
 # cozytensors/1
 
-Status: normative, version 1.0. Start with the [introduction and usage guide](../README.md).
+Status: normative, version 1.1. Start with the [introduction and usage guide](../README.md).
 Conformance vectors and an independent reader: [`../conformance/`](../conformance/).
 
 This is the authoritative specification of the stored format and its decode semantics. A reader can implement it
@@ -154,14 +154,15 @@ An encoded tensor cites an **encoding** `[scheme, params]`. With this section th
 the logical tensor; no decode depends on anything outside the header, its chunks and this spec.
 
 **Names** are `family.variant` in lowercase, in the words of the ecosystem that made the format: generic scaled
-formats are `element.granularity` (`fp8.tensorwise`, `int8.rowwise`; later `fp8.blockwise`), a producer's own format
+formats are `element.granularity` (`fp8.tensorwise`, `int8.rowwise`, `fp8.blockwise`), a producer's own format
 is `producer.type` with the producer's type name verbatim (later `gguf.q4_k`, `gptq.int4`, `bnb.nf4`), and a
-vendor-neutral standard keeps its bare name (`mxfp8`, `nvfp4`; later `mxfp4`).
+vendor-neutral standard keeps its bare name (`mxfp4`, `mxfp8`, `nvfp4`).
 
 **Params** are snake_case keys in the producer's vocabulary (`axis`, `block_size`, `rotation`, `rotation_size`,
 `global_scale`, `nibble_order`, `scale_layout`, `scale_dtype`). Every param the decode reads is required and none has a
 default, so the encoding shows the whole recipe. A scale whose dtype the scheme leaves free carries `scale_dtype`:
-`F32`, `BF16` or `F16`, as the producer stored it (the fixed scales of `mxfp8` and `nvfp4` do not). Where a param
+`F32`, `BF16` or `F16` (and `F8_E8M0` for `fp8.blockwise`), as the producer stored it (the fixed scales of `mxfp4`,
+`mxfp8` and `nvfp4` do not). Where a param
 repeats a part's dtype (`scale_dtype`), a reader MUST refuse a mismatch.
 
 **Four rules** bring any format in without new grammar:
@@ -197,8 +198,9 @@ This arithmetic defines the decode, not any producer's kernel. A producer's own 
 (comfy-kitchen multiplies in `BF16`, for example) and differ from it by a step of `L`; that is within the determinism
 the format promises, and readers follow this spec.
 
-`input_scale` (optional where listed, `F32`, one element) is the activation scale of a quantized matmul; it never
-enters a decode. It applies as `global_scale` says for `nvfp4`, and multiplies elsewhere.
+`input_scale` (optional where listed, `F32`, one element; `nvfp4` also allows one per matrix) is the activation scale
+of a quantized matmul; it never enters a decode. It applies as `global_scale` says for `nvfp4`, and multiplies
+elsewhere.
 
 Each scheme below lists its params (with their allowed values), its parts (role, dtypes, stored shape) and its decode,
 built from the building blocks that follow.
@@ -213,14 +215,17 @@ built from the building blocks that follow.
 | row | `R` elements, any shape | `s[i]` |
 | column | `C` elements, any shape | `s[j]` |
 | row blocks of `B` | `W = ⌈C/B⌉` per row, in a layout below | `s(i, b)`: `b = ⌊j/B⌋`, or `b = g_idx[j]` where the scheme has a `g_idx` |
+| tiles of `Bᵣ × B_c` | `[lead…, ⌈N/Bᵣ⌉, ⌈C/B_c⌉]`: the logical shape with its last two extents, `N` and `C`, counted in tiles | `s[m, ⌊r/Bᵣ⌋, ⌊j/B_c⌋]`, where row `i = m·N + r` is row `r` of matrix `m` |
 
-The last block of a row may be short. A `g_idx` holds `C` values, each below `W`. Row blocks are stored:
+The last block of a row, and the last tile of a matrix's rows or columns, may be short. A `g_idx` holds `C` values, each below `W`. Row blocks are stored:
 - `row_major`: the logical shape with its last extent replaced by `W` (`[R, W]` for a matrix); `s(i, b)` is element
   `i·W + b`.
 - `transposed`: `[W, R]`; `s(i, b)` is element `b·R + i` (GPTQ's and AWQ's `[K/g, N]`).
-- `cublas_128x4`: cuBLAS's block-scaling layout, as ComfyUI stores it. The part is `[128·⌈R/128⌉, 4·⌈W/4⌉]`,
-  zero-padded, in tiles of 128 rows × 4 blocks; `s(i, b)` is element
-  `512·(⌊i/128⌋·⌈W/4⌉ + ⌊b/4⌋) + 16·(i mod 32) + 4·⌊(i mod 128)/32⌋ + (b mod 4)`.
+- `cublas_128x4`: cuBLAS's block-scaling layout, as ComfyUI stores it. Each matrix `[N, C]` of the logical shape
+  `[…stack, N, C]` (the whole tensor at rank 2) is tiled on its own: the part is
+  `[…stack, 128·⌈N/128⌉, 4·⌈W/4⌉]`, zero-padded, in tiles of 128 rows × 4 blocks. Row `i` is row `r = i mod N` of
+  matrix `m = ⌊i/N⌋`, and `s(i, b)` is element
+  `m·128·⌈N/128⌉·4·⌈W/4⌉ + 512·(⌊r/128⌋·⌈W/4⌉ + ⌊b/4⌋) + 16·(r mod 32) + 4·⌊(r mod 128)/32⌋ + (b mod 4)`.
 
 **Bit packing.** A packed part holds the codes `q[i, j]` of the `[R, C]` view, stored as `[R, C]` or, where the
 scheme says *transposed*, as `[C, R]`. Along one axis of that stored array, the *pack axis*, each lane of `n` codes
@@ -248,6 +253,13 @@ part, indexed by the code; a code outside `T` refuses the decode.
 **Block structs.** A `U8 [lead…, C/n, S]` part of fixed-size structs of `S` bytes, each holding `n` consecutive
 elements of a row in order (`C` a multiple of `n`; the leading extents are the logical shape's). The scheme defines
 each struct's little-endian fields and the formula of its `n` elements, using the blocks above within the struct.
+
+**Transposed storage.** A scheme with the param `transposed` (`false` or `true`) whose value is `true` stores the
+logical tensor `[lead…, A, B]` as `S = [lead…, B, A]`: its view `[R, C]`, its parts' shapes and its formula all
+apply to `S`, and `value[lead…, a, b] = S[lead…, b, a]`. Its blocks therefore run along the logical axis −2. A
+producer that keeps a weight as `[out, in]` where its framework's tensor is `[in, out]` (gpt-oss) is read under
+the framework's key and shape. `mxfp4` has the param; ModelOpt's fused gpt-oss NVFP4 export (`[E, K/2, N]`) is
+the next user, through `nvfp4`.
 
 ### `fp8.tensorwise`
 
@@ -294,24 +306,64 @@ may be short).
 
 ### `nvfp4`
 
-NVIDIA's NVFP4: an E2M1 element per weight, an E4M3 scale per 16 consecutive elements of a row, and a per-tensor
-`scale_2`.
+NVIDIA's NVFP4: an E2M1 element per weight, an E4M3 scale per 16 consecutive elements of a row, a global scale per
+matrix, and optionally AWQ's per-column factor.
 - Params: `block_size: 16`; `global_scale`: `multiply` or `divide`; `nibble_order`: `low_first` or `high_first`;
-  `scale_layout`: `row_major` or `cublas_128x4`.
+  `scale_layout`: `row_major` or `cublas_128x4`; `pre_quant_scale_dtype`: `F32`, `BF16` or `F16`, present exactly
+  when the `pre_quant_scale` part is.
 - Parts: `weight`: `F4`, the logical shape, `C` a multiple of 16; its bytes are 4-bit codes packed `word`-fill in `U8`
   words along the last axis, `nibble_order` being the order (`low_first` is §5's `F4` packing). `scale`: `F8_E4M3` on
-  row blocks of 16, stored `scale_layout`. `scale_2`: `F32`, one element. `input_scale` (optional).
-- Decode, with `T` the 16 E2M1 values (§5): `multiply`:
-  `round_L((T[q] × s(i, j)) × scale_2)`; `divide`: `round_L(T[q] × (s(i, j) ÷ scale_2))`.
+  row blocks of 16, stored `scale_layout`. `scale_2`: `F32`, one element, or `M` elements, one per matrix of the
+  logical shape `[…stack, N, C]` (`M = R/N`; any shape). `pre_quant_scale` (optional): `pre_quant_scale_dtype` on the
+  column grid. `input_scale` (optional): one element or `M`.
+- Decode, with `T` the 16 E2M1 values (§5), `g` the element of `scale_2` for row `i` (its only one, or element
+  `⌊i/N⌋`) and `p` the factor `pre_quant_scale[j]`: `multiply`: `round_L(((T[q] × s(i, j)) × g) × p)`; `divide`:
+  `round_L((T[q] × (s(i, j) ÷ g)) × p)`. Without a `pre_quant_scale`, `× p` is left out.
 
-`global_scale` says how both per-tensor scales, `scale_2` and `input_scale`, apply: multiplied (ModelOpt's
+`global_scale` says how both global scales, `scale_2` and `input_scale`, apply: multiplied (ModelOpt's
 `weight_scale_2` and `input_scale`, ComfyUI) or divided (compressed-tensors' `weight_global_scale` and
-`input_global_scale`, each the reciprocal). A pre-quantization factor (`pre_quant_scale`) is not a part of this
-scheme (a later minor may add one, rule 3). ModelOpt's `weight` (`uint8 [R, C/2]`), `weight_scale` and
-`weight_scale_2` are `weight`, `scale` and `scale_2` here; ModelOpt and compressed-tensors write `low_first`,
-`row_major`; ComfyUI writes `high_first`, `cublas_128x4`.
+`input_global_scale`, each the reciprocal). ModelOpt's `weight` (`uint8 [R, C/2]`), `weight_scale`,
+`weight_scale_2` and `pre_quant_scale` are `weight`, `scale`, `scale_2` and `pre_quant_scale` here; ModelOpt and
+compressed-tensors write `low_first`, `row_major`; ComfyUI writes `high_first`, `cublas_128x4`.
 
-<!-- fp8.blockwise, mxfp4 -->
+`pre_quant_scale` is AWQ's per-input-channel factor (ModelOpt's `NVFP4_AWQ`, and ComfyUI files made from it). The
+producer quantizes the smoothed weight `W · diag(1/p)` and applies `p` to the activations at run time (ComfyUI:
+`input * pre_quant_scale`), so the logical weight is the dequantized one times `p` along its columns. ModelOpt stores
+`p` in the model's dtype, and folds the factors it can into the layer before (a norm, `v_proj`, `up_proj`): those
+tensors carry no part and decode to the weight the model computes with.
+
+A stack's `scale_2` is per matrix where the producer quantized each matrix on its own: ComfyUI's fused experts
+(`num_experts`) write `weight_scale_2 [E]` beside `[E, N, C]` weights, and tile each expert's scales. ModelOpt and
+compressed-tensors write experts as separate matrices, each with one `scale_2`. ModelOpt's fused Llama-4 and gpt-oss
+export (`[E, C/2, N]`, blocks along the second-to-last axis) is not this scheme.
+
+### `fp8.blockwise`
+
+FP8 elements and one scale per tile of each matrix (DeepSeek-V3 and later, Qwen3-FP8, Kimi-K2, MiniMax-M2, GLM-5-FP8;
+compressed-tensors' block strategy).
+- Params: `block_size: [Bᵣ, B_c]`, two positive integers (`[128, 128]` in practice); `scale_dtype`: `F32`, `BF16`,
+  `F16` or `F8_E8M0`, as the producer stored the scale.
+- Parts: `weight`: `F8_E4M3`, the logical shape. `scale`: `scale_dtype`, on tiles of `Bᵣ × B_c`.
+- Decode: `round_L(weight[i, j] × s(i, j))`.
+
+The scale multiplies. DeepSeek's and transformers' `weight_scale_inv` (the inverse of the factor the weight was
+multiplied by when quantized; DeepSeek-V4 names it `scale`) and compressed-tensors' `weight_scale` are this `scale`.
+Under `scale_fmt: ue8m0` every scale is a power of two, stored `F32` (DeepSeek-V3.1) or `F8_E8M0` (DeepSeek-V4).
+
+### `mxfp4`
+
+The OCP Microscaling MXFP4 format: an E2M1 element per weight and a power-of-two scale per 32 consecutive elements of
+a row (the last block of a row may be short).
+- Params: `block_size: 32`; `transposed`: `false` or `true` (transposed storage, above).
+- Parts: `weight`: `F4`, the logical shape, or `S` when `transposed` (§5's packing). `scale`: `F8_E8M0` on row
+  blocks of 32, `row_major`.
+- Decode, with `T` the 16 E2M1 values (§5): `round_L(T[q] × s(i, j))`.
+
+Every producer seen writes these bytes, the even element in the low nibble and the scales row-major: gpt-oss's
+`<module>_blocks` (`U8 [E, N, K/32, 16]`, a row's blocks in order) and `<module>_scales`, read as transformers'
+`<module>` `[E, K, N]` with `transposed: true`; compressed-tensors' `weight_packed` and `weight_scale`, AMD Quark's
+`weight` and `weight_scale` (`pack_method: reorder`), MLX's `weight` (`U32` words, little-endian) and `scales`, and
+DeepSeek-V4's FP4 experts (`weight` `I8`, `scale`).
 
 <!-- gguf.* -->
 
@@ -369,6 +421,10 @@ reader that needs only some components MAY fetch only the chunks their locations
   locates and verifies every byte, and refuses only a decode or typed view of the tensors that use it. A new param of
   an existing scheme is too: an old decoder refuses the tensors whose params it does not know (§6).
 - A change that alters the meaning of an existing field, scheme or param is a new major.
+
+Minors: 1.1 adds `nvfp4`'s `pre_quant_scale` and a `scale_2` per matrix, and tiles each matrix of a stack on its own
+in `cublas_128x4` (before any stacked file was written); the schemes `fp8.blockwise` and `mxfp4`; and the `tiles`
+grid and transposed storage.
 
 ## 9. Encoding
 

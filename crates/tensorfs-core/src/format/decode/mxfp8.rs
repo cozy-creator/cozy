@@ -2,6 +2,7 @@
 
 use super::grid::{Grid, ScaleLayout};
 use super::{elem, logical, table, Allowed, Ctx, Dtypes, Param, Part, Scheme, View};
+use crate::format::Result;
 
 pub const MXFP8: Scheme = Scheme {
     name: "mxfp8",
@@ -20,14 +21,10 @@ pub const MXFP8: Scheme = Scheme {
     decode: |c| {
         let w = c.part("weight");
         let t = elem::table(w.dtype).expect("an 8-bit element format");
-        table::decode(
-            &table::bytes(w.bytes),
-            &t,
-            &c.floats("scale"),
-            &blocks(c),
-            c.rows,
-            c.cols,
-        )
+        let (q, s) = (table::bytes(w.bytes), c.floats("scale"));
+        let (n, matrices) = table::matrices(c, &q, &s);
+        let each = matrices.into_iter().map(|(q, s)| table::decode(q, &t, s, &blocks(c), n, c.cols));
+        Ok(each.collect::<Result<Vec<_>>>()?.concat())
     },
 };
 
