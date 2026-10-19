@@ -386,4 +386,36 @@ fn an_old_model_migrates_by_its_own_rows_and_pulls_bit_identical() {
     let again = cozy(&home, &["--json", "model", "migrate", &model, "--on", "m1", "--audit", &audit_arg]);
     assert_eq!(again.code, 0, "{again:?}");
     assert_eq!(last(&again)["models"][0]["checkpoints"], serde_json::json!([]), "{again:?}");
+
+    // --local: a pre-cut store's local/ model into the machine's store on the same filesystem.
+    // The 16 MiB object it reuses moves in by hard link: one inode in both stores.
+    let precut = dir.path().join("precut");
+    let (m, body) = &old.manifests[0];
+    let place = |key: String, bytes: &[u8]| {
+        std::fs::create_dir_all(precut.join(&key).parent().unwrap()).unwrap();
+        std::fs::write(precut.join(key), bytes).unwrap();
+    };
+    for (digest, bytes) in &old.objects {
+        place(format!("blobs/{}/{}/{digest}", &digest[..2], &digest[2..4]), bytes);
+    }
+    place(format!("manifests/{}/{}/{m}.json", &m[..2], &m[2..4]), body);
+    let repo = format!(r#"{{"checkpoints":[{{"manifest":{{"length":{},"sha256":"{m}"}}}}],"releases":[],"repo":{{"name":"tiny","org":"local"}}}}"#, body.len());
+    place("repos/local/tiny.json".into(), repo.as_bytes());
+    // A fresh machine on this build, whose store holds none of it yet. SAFETY: as above.
+    unsafe { std::env::set_var("COZY_TEST_TENSORD", &wrapper) };
+    let laptop = common::tensord::added(&home, "m3");
+    unsafe { std::env::set_var("COZY_TEST_TENSORD", &tensord) };
+    let local = precut.to_string_lossy().into_owned();
+    let out = cozy(&home, &["--json", "model", "migrate", "--local", &local, "--on", "m3", "--audit", &audit_arg]);
+    assert_eq!(out.code, 0, "{out:?}");
+    let row = last(&out)["models"][0].clone();
+    assert_eq!((&row["repository"], &row["linked"]["bytes"], &row["copied"]["bytes"]), (&"local/tiny".into(), &(16u64 << 20).into(), &0.into()), "{row}");
+    let made = row["manifest"].as_str().unwrap();
+    same_tensors(&old, &laptop.store(), made);
+    let big = &old.objects.iter().find(|o| o.1.len() == 16 << 20).unwrap().0;
+    let blob = |root: &Path| std::fs::metadata(root.join("blobs").join(&big[..2]).join(&big[2..4]).join(big)).unwrap();
+    use std::os::unix::fs::MetadataExt as _;
+    assert_eq!(blob(&precut).ino(), blob(&laptop.store()).ino(), "the reused object was copied, not linked");
+    let store = Store::open(laptop.store()).unwrap();
+    assert_eq!(store.resolve("local/tiny", None).unwrap().manifest.id(), made);
 }

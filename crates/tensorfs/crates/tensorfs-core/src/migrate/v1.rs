@@ -276,13 +276,11 @@ impl Source {
         Ok(bytes)
     }
 
-    /// An object's file, unread: its bytes were checked when the old store admitted it.
-    pub fn file(&self, object: &ObjectRef) -> Result<fs::File> {
-        let found = self.find(&object.sha256).filter(|_| self.has(object));
-        let Some(path) = found else {
-            return fail(Kind::NotFound, format!("v1 object {} is not in {}", object.sha256, self.root.display()));
-        };
-        fs::File::open(&path).or_else(|e| fail(Kind::Io, format!("{}: {e}", path.display())))
+    /// Where an object of its length lies, unread: the old store checked it at admission.
+    pub fn path(&self, object: &ObjectRef) -> Option<PathBuf> {
+        let path = self.find(&object.sha256)?;
+        let length = fs::metadata(&path).ok()?.len();
+        (length == object.length).then_some(path)
     }
 
     /// A manifest named by its digest alone.
