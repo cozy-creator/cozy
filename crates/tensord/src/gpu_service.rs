@@ -3483,10 +3483,10 @@ impl Callbacks<'_> {
     fn chunks(&self, manifest: &str, answer: &mut Answer) -> io::Result<Vec<File>> {
         let objects = self.sources.chunks(manifest)?;
         if let Some(fetch) = self.fetch {
-            fetch.wait(&crate::access::held(self.store, manifest)?, &objects)?;
+            fetch.wait(manifest, &objects)?;
         }
         answer.objects_sha256 = crate::deposits::objects_digest(&objects);
-        Ok(self.sources.files(objects)?.into_iter().map(|(_, file)| file).collect())
+        self.sources.files(&objects)
     }
 }
 impl Services for Callbacks<'_> {

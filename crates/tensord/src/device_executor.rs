@@ -608,7 +608,7 @@ pub struct Answer {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub reason: String,
     /// `read_grant` without a sealed layout: the SHA-256 of the chunk objects whose fds
-    /// follow, sorted by digest (`HostTier::objects_digest`), in place of the list (SDXL's
+    /// follow, sorted by digest (`deposits::objects_digest`), in place of the list (SDXL's
     /// UNet: about 1,700 objects).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub objects_sha256: String,

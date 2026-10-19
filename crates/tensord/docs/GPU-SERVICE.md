@@ -19,7 +19,7 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   says it.
 - `memory`: `{ floor_bytes }`: raise the free floor TensorD keeps on each GPU.
 - `environment`: keys containing `TOKEN`, `SECRET` or `PASSWORD` are refused.
-- `host`: optional `{fill_threads, ttl_seconds}` for the always-on `HostTier`. `identity`: optional `{uid, gid}`.
+- `host`: optional `{mode}`, `shared` (default) or `dedicated`. `identity`: optional `{uid, gid}`.
 
 ## Preparation
 

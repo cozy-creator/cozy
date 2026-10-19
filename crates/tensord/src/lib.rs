@@ -17,12 +17,6 @@ pub mod frame;
 mod gpu_allocation;
 pub mod gpu_service;
 pub mod held_models;
-#[cfg(target_os = "linux")]
-pub mod host_tier;
-/// Off where the OS has no sealed shared memory: weights are read from the page cache.
-#[cfg(not(target_os = "linux"))]
-#[path = "host_tier_off.rs"]
-pub mod host_tier;
 pub mod hub;
 pub mod calls;
 pub mod journal;

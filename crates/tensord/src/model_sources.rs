@@ -1,7 +1,7 @@
 //! Stored metadata and assets for a session's selected models. TensorD supplies each verified
 //! header, declared asset and selected component's encoded byte count through TensorFS.
-//! `ModelSource` returns sealed read-only descriptors; HostTier supplies CPU weight buffers
-//! and object descriptors. Runtime parses the metadata, constructs models and performs GPU
+//! `ModelSource` returns sealed read-only descriptors; `read_grant` the selected components'
+//! chunk files. Runtime parses the metadata, constructs models and performs GPU
 //! transfers/mappings with its own TensorFS plane. Selection remains the access boundary.
 use crate::device_executor::{Answer, Frame};
 use serde::{Deserialize, Serialize};
@@ -127,13 +127,8 @@ impl ModelSources {
     }
 
     /// `objects`' files, read-only.
-    pub fn files(&self, objects: Vec<ObjectRef>) -> io::Result<Vec<(ObjectRef, File)>> {
-        (objects.into_iter())
-            .map(|object| {
-                let file = self.store.file(&object).map_err(storage::io_error)?;
-                Ok((object, file))
-            })
-            .collect()
+    pub fn files(&self, objects: &[ObjectRef]) -> io::Result<Vec<File>> {
+        (objects.iter()).map(|object| self.store.file(object).map_err(storage::io_error)).collect()
     }
 
     /// One selected model's header (`name` empty), stored bytes as written; its manifest

@@ -62,7 +62,7 @@ fn reopen(_: &File) -> Option<File> {
 
 /// The SHA-256 (hex) of chunk objects in order, one `<sha256>:<length>\n` line each: what a
 /// `read_grant` of chunk files names in place of the list.
-pub fn objects_digest(objects: &[tensorfs_core::ids::ObjectRef]) -> String {
+pub fn objects_digest(objects: &[tensorfs_core::format::ObjectRef]) -> String {
     let lines: String = objects.iter().map(|o| format!("{}:{}\n", o.sha256, o.length)).collect();
     tensorfs_core::sha256::hex_digest(lines.as_bytes())
 }

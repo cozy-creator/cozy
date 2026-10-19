@@ -115,8 +115,6 @@ code is still not sandboxed.
 | `child_launcher.rs` | Pool-owned spawn thread (PDEATHSIG follows the creating thread) | `ChildLauncher` | E |
 | `os.rs` | memfd, seals, peer credentials (`SO_PEERPIDFD`, `pidfd_open` fallback), pidfd exit | — | E |
 | `protocol.rs` | Length-prefixed frames of the executor seam | `read_body`, `write_body` | E |
-| `host_tier.rs` | Degree 1 host tier: machine-filled sealed layouts, adopted read-only, sized by live headroom; a region's absent objects are fetched (Now) and copied as they land | `HostTier`, `HostGrant`, `TierLimit`, `HostTierFacts` | B1 |
-| `host_memory.rs` | Live host headroom (cgroup v1/v2 path, `MemAvailable`) | `HostMemory` | B1 |
 | `model_sources.rs` | Selected model headers/assets as verified bytes and sealed read-only descriptors; component byte facts for planning | `ModelSources`, `SelectedManifest` | B1 |
 | `boundary_json.rs` | Strict JSON parse (no duplicate keys) for boundary records | — | D1 |
 
@@ -172,7 +170,7 @@ metadata transitions are coordinated with cancellation.
 - [Package bridge](PACKAGE-BRIDGE.md): generation description and install.
 - [Device executor](DEVICE-EXECUTOR.md): executor launch and control seam.
 - [GPU service](GPU-SERVICE.md): GPU pool, config, launch identity.
-- [Host tier](HOST-TIER.md), [model sources](MODEL-SOURCES.md): Degree 1.
+- [Model sources](MODEL-SOURCES.md): Degree 1.
 - [Matched gate](../scripts/gate/README.md): ComfyUI vs TensorD, ordinary CLI.
 
 ## Build and test
