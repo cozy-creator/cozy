@@ -996,6 +996,20 @@ impl Engine {
         bindings: Vec<crate::journal::AssetBinding>,
         adjustments: Vec<crate::journal::Adjustment>,
     ) -> io::Result<Execution> {
+        let result = self.managed_result_record(id, source, value, bindings, adjustments)?;
+        self.finish(id, Outcome::Completed(result))
+    }
+
+    /// Take the result's verified files into custody without publishing a terminal. A pooled
+    /// executor returns to its idle pool before its caller can observe completion and call again.
+    pub(crate) fn managed_result_record(
+        &self,
+        id: &str,
+        source: &Path,
+        value: Value,
+        bindings: Vec<crate::journal::AssetBinding>,
+        adjustments: Vec<crate::journal::Adjustment>,
+    ) -> io::Result<ResultRecord> {
         let mut paths: Vec<_> = bindings.iter().map(|b| b.relative_path.clone()).collect();
         // A tree's member files are held beside its manifest, by digest (`tree_binding`).
         for tree in bindings.iter().filter(|b| b.media_type == crate::gpu_service::TREE_MEDIA) {
@@ -1006,7 +1020,7 @@ impl Engine {
         paths.sort();
         paths.dedup();
         let result = self.bound_custody(id, source, value, paths, bindings)?;
-        self.finish(id, Outcome::Completed(ResultRecord { adjustments, ..result }))
+        Ok(ResultRecord { adjustments, ..result })
     }
 
     /// Reconcile a previous service incarnation without adopting or repeating authored work.
@@ -1373,6 +1387,33 @@ mod tests {
             [serde_json::json!({"level": "warning", "text": "attention pin sdpa was never applied"})]);
         assert_eq!(run("applied", "sdpa", true), Vec::<Value>::new());
         assert_eq!(run("unpinned", "", false), Vec::<Value>::new());
+        drop(engine);
+        crate::scratch::remove(&root);
+    }
+
+    /// Result custody must survive the spool going away before the pool publishes completion.
+    #[test]
+    fn a_managed_result_can_be_held_before_its_terminal_is_published() {
+        let root = std::env::temp_dir().join(format!("cm-pending-result-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root).unwrap();
+        let id = engine.submit("pending-result", Invocation::default()).unwrap().id;
+        attempt(&engine, &id, |engine, id| {
+            let spool = Spool(engine.staging(id).unwrap());
+            fs::write(spool.0.join("answer"), b"kept").unwrap();
+            let binding = crate::journal::AssetBinding {
+                relative_path: "answer".into(), asset_ref: "attempt:run/file/0".into(),
+                media_type: "text/plain".into(), length: 4,
+            };
+            let result = engine.managed_result_record(id, &spool.0, serde_json::json!({"answer": 42}), vec![binding], vec![]).unwrap();
+            assert_eq!(engine.get(id).unwrap().state, State::Running);
+            drop(spool);
+            assert_eq!(fs::read(engine.root.join(&result.artifacts[0].path)).unwrap(), b"kept");
+            engine.finish(id, Outcome::Completed(result)).unwrap();
+        });
+        assert_eq!(engine.get(&id).unwrap().state, State::Completed);
+        let mut bytes = Vec::new();
+        engine.open_result(&id, 0).unwrap().read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"kept");
         drop(engine);
         crate::scratch::remove(&root);
     }

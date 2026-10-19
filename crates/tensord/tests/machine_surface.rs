@@ -1135,7 +1135,8 @@ mod v1_api {
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         let manifest = write_package(&client, &all, "cpu_memo", "local/tensord-cpu-memo").await;
         let mut served = vec![];
-        for id in ["process-1", "process-2"] {
+        for ordinal in 1..=16 {
+            let id = format!("process-{ordinal}");
             let spec = v1::RunSpec {
                 kind: v1::RunKind::Call,
                 source: Some(v1::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
@@ -1150,8 +1151,10 @@ mod v1_api {
             let result: serde_json::Value = json(&done.result);
             served.push((result["pid"].as_u64().unwrap(), result["served"].as_u64().unwrap()));
         }
-        assert_eq!(served[0].0, served[1].0, "one executor served both calls: {served:?}");
-        assert_eq!((served[0].1, served[1].1), (1, 2));
+        for (ordinal, (pid, count)) in served.iter().enumerate() {
+            assert_eq!(*pid, served[0].0, "one executor served every sequential call: {served:?}");
+            assert_eq!(*count, ordinal as u64 + 1, "{served:?}");
+        }
         let _ = fs::remove_dir_all(tools);
     }
 

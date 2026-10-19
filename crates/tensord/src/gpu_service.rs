@@ -2064,7 +2064,7 @@ impl Pool {
             self.devices[start].memory.with(|gpu| gpu.spawned(&plan.construction, birth.pid));
             Ok(())
         })?;
-        match self.call(engine, "", held, plan, &load_caps, &mut session, true, None, fetch) {
+        match self.call(engine, "", held, plan, &load_caps, &mut session, true, None, fetch, &mut None) {
             Ok(_) => {
                 self.keep_idle(session);
                 Ok("loaded")
@@ -2727,23 +2727,41 @@ impl Pool {
         };
         let facts = crate::journal::ExecutorFacts::observed(session.executor.birth.pid, runtime, hello.tensorfs_version.clone());
         if !engine.authorize_managed(id, Some(facts))? {
-            engine.finish_stopped(id)?;
             self.keep_idle(session);
+            engine.finish_stopped(id)?;
             return Ok(());
         }
         let fresh = plan.clone();
         let error = {
             let mut session = session;
             let fetch = calls.map(|calls| engine.get(id).map(|record| calls.fetch(&record, &plan))).transpose()?;
-            match self.call(engine, id, &held, plan, &load_caps, &mut session, false, calls, fetch) {
-                Ok(true) => {
-                    self.keep_idle(session);
-                    return Ok(());
+            let mut completed = None;
+            match self.call(engine, id, &held, plan, &load_caps, &mut session, false, calls, fetch, &mut completed) {
+                Ok(reusable) => {
+                    // A caller can submit again as soon as finish publishes. Its predecessor
+                    // must already be idle, or gone if it cannot be reused.
+                    let returned = if reusable {
+                        self.keep_idle(session);
+                        Ok(())
+                    } else {
+                        session.executor.terminate().map(drop)
+                    };
+                    if let Some(outcome) = completed {
+                        engine.finish(id, outcome)?;
+                    }
+                    return returned;
                 }
-                // Not reusable: gone (exit observed) before its context is released.
-                Ok(false) => return session.executor.terminate().map(drop),
-                Err(error) if undelivered(&error) => ending(error, session.executor),
-                Err(error) => return Err(ended_with(engine, id, error, session.executor)),
+                Err(error) => {
+                    // A post-response teardown error does not replace an already held result.
+                    if let Some(outcome) = completed {
+                        engine.finish(id, outcome)?;
+                    }
+                    if undelivered(&error) {
+                        ending(error, session.executor)
+                    } else {
+                        return Err(ended_with(engine, id, error, session.executor));
+                    }
+                }
             }
         }; // the rest of the ended session (sources, grants) goes here
         // Never started: once that exit is observed, this dispatch runs it on a fresh executor
@@ -2878,7 +2896,8 @@ impl Pool {
     }
 
     /// Load (once), grant and invoke (unless `load_only`: a prewarm, no request). Ok(false):
-    /// the executor must not be reused.
+    /// the executor must not be reused. Its terminal is left in `completed`: run_on publishes it
+    /// only after the reusable executor is idle (or the nonreusable one is gone).
     #[allow(clippy::too_many_arguments)]
     fn call(
         &self,
@@ -2891,6 +2910,7 @@ impl Pool {
         load_only: bool,
         calls: Option<&Arc<crate::calls::Calls>>,
         fetch: Option<Arc<crate::access::Fetch>>,
+        completed: &mut Option<Outcome>,
     ) -> io::Result<bool> {
         let (start, degree) = (session.start, plan.degree);
         let construction = plan.construction.clone();
@@ -3150,7 +3170,7 @@ impl Pool {
         {
             // Canceled while it waited for its attention kernel's compile (Runtime 0.23.4).
             if prepared.terminal == "canceled" && engine.get(id)?.cancel_actor.is_some() {
-                engine.finish(id, Outcome::Canceled)?;
+                *completed = Some(Outcome::Canceled);
                 return Ok(true);
             }
             // A pre-entry refusal leaves the executor Ready; the run ends with its reason.
@@ -3173,7 +3193,7 @@ impl Pool {
                     traceback: prepared.traceback.clone(),
                 },
             );
-            engine.finish(id, Outcome::Failed(failure))?;
+            *completed = Some(Outcome::Failed(failure));
             return Ok(true);
         }
         let prepared = command_ok(prepared)?;
@@ -3329,35 +3349,26 @@ impl Pool {
                     let (value, bindings) =
                         device_executor::postprocess(&session.executor.codec(), &spool, &reply)?;
                     let adjusted = device_executor::adjustments(id, &reply);
-                    engine.managed_result(id, &spool, value, output_bindings(bindings), adjusted)
+                    engine.managed_result_record(id, &spool, value, output_bindings(bindings), adjusted)
                 })();
-                if let Err(error) = result {
-                    // The invocation is already quiescent; a codec/custody
-                    // failure cannot cause authored work to be dispatched again.
-                    engine.finish(
-                        id,
-                        Outcome::Failed(
-                            crate::journal::Failure::custody(&error.to_string()),
-                        ),
-                    )?;
-                }
+                // Custody is durable before the spool goes; terminal publication waits
+                // until run_on has returned the executor to its pool.
+                *completed = Some(match result {
+                    Ok(result) => Outcome::Completed(result),
+                    Err(error) => Outcome::Failed(Failure::custody(&error.to_string())),
+                });
             }
             "canceled" if engine.get(id)?.cancel_actor.is_some() => {
-                engine.finish(id, Outcome::Canceled)?;
+                *completed = Some(Outcome::Canceled);
             }
             _ => {
                 keep_triage(engine, id, &session.executor, outcome);
-                engine.finish(
-                    id,
-                    Outcome::Failed(
-                        crate::journal::Failure::executor(
-                            &outcome.terminal,
-                            &outcome.origin,
-                            &outcome.code,
-                            &outcome.message,
-                        ),
-                    ),
-                )?;
+                *completed = Some(Outcome::Failed(Failure::executor(
+                    &outcome.terminal,
+                    &outcome.origin,
+                    &outcome.code,
+                    &outcome.message,
+                )));
             }
         }
         // Degree 2 once this call measured that the construction fits: an executor loaded
