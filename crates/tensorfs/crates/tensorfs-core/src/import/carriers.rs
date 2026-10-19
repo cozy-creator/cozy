@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::Value as Json;
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::format::{Dtype, Encoding, Value};
+use crate::format::{check, Dtype, Encoding, PartBytes, Value};
 
 use super::source::{Group, SourceSet, Tensor};
 
@@ -23,6 +23,8 @@ pub enum Producer {
     Modelopt,
     CompressedTensors,
     Comfy,
+    Gptq,
+    Awq,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +49,29 @@ pub struct Carrier {
     /// Marker keys whose value this carrier decodes, and that value.
     #[serde(default)]
     pub marker_values: BTreeMap<String, Json>,
+    /// Where the logical shape comes from, when the data part does not state it.
+    #[serde(default)]
+    pub logical: Logical,
+    /// The code width (`{bits}` in the scheme) and every param are the producer's quantization
+    /// config's (`config_encoding`); the scheme's own rules check the parts.
+    #[serde(default)]
+    pub from_config: bool,
+}
+
+/// A carrier's logical shape.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Logical {
+    /// The data part's shape, its last extent counted in the stored dtype's elements.
+    #[default]
+    Data,
+    /// `[N, K]`: an extent of one part's tensor and an extent of another's, by suffix.
+    Extents {
+        rows: (String, usize),
+        cols: (String, usize),
+    },
+    /// The integers a part holds (compressed-tensors' `weight_shape`).
+    Stated(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,13 +104,15 @@ pub enum Geometry {
     /// Block scales in cuBLAS 128×4 tiles, `[128·⌈R/128⌉, 4·⌈W/4⌉]` with `W = ⌈C/n⌉`; an expert
     /// stack tiled expert by expert (`[E, N, 4·⌈W/4⌉]`, `N` a multiple of 128) is the same bytes.
     Tiles(u64),
+    /// As the producer stores it, checked by the scheme's own rules (`from_config`).
+    Scheme,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Table {
-    /// Declarations of producers no carrier reads yet: refused, naming the producer.
-    pub unread_declarations: Vec<UnreadDeclaration>,
+    /// Declarations beside the weights that name their producer.
+    pub declarations: Vec<Declaration>,
     /// Quantization parts no scheme reads yet: refused wherever they appear.
     pub companions: Vec<Companions>,
     /// ComfyUI marker keys that change how a module runs, never its values.
@@ -95,13 +122,14 @@ pub struct Table {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UnreadDeclaration {
-    /// A file beside the weights, or a safetensors metadata key prefix.
+pub struct Declaration {
+    /// A file beside the weights (its own `quant_method`, if it states one, names the producer),
+    /// or a safetensors metadata key prefix (the keys without it are the config).
     #[serde(default)]
     pub file: Option<String>,
     #[serde(default)]
     pub metadata_prefix: Option<String>,
-    pub producer: String,
+    pub producer: Producer,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,10 +162,12 @@ fn matches(pattern: &str, key: &str) -> bool {
     }
 }
 
-/// One folded tensor: its encoding and each part's role, dtype, shape and source bytes.
+/// One folded tensor: its encoding, logical shape and each part's role, dtype, shape and source
+/// bytes.
 #[derive(Debug, Clone)]
 pub struct Folded {
     pub encoding: Encoding,
+    pub shape: Vec<u64>,
     pub parts: Vec<FoldedPart>,
 }
 
@@ -164,6 +194,8 @@ struct Declared {
     markers: Vec<String>,
     /// The model's dtype, when its `config.json` states it.
     dtype: Option<Dtype>,
+    /// The producer's quantization configs, each with where it was found.
+    configs: Vec<(String, Json)>,
 }
 
 fn malformed(what: &str, e: impl std::fmt::Display) -> Refusal {
@@ -188,7 +220,17 @@ impl Declared {
             modules: BTreeMap::new(),
             markers: Vec::new(),
             dtype: None,
+            configs: Vec::new(),
         }
+    }
+
+    /// A producer's declaration by its own config alone (`quantize_config.json`, AutoAWQ's
+    /// `quant_config.json`, GPTQ's header metadata).
+    fn of_config(producer: Producer, what: &str, doc: Json) -> Declared {
+        let mut d = Declared::new(producer, what.to_owned());
+        d.formats.insert(format_of(producer).to_owned());
+        d.configs.push((what.to_owned(), doc));
+        d
     }
 
     /// ComfyUI's declaration, its first find naming it.
@@ -232,8 +274,17 @@ fn quantization_config(doc: &Json, what: &str) -> Result<Declared> {
             }
             d
         }
+        Some(m @ ("gptq" | "awq")) => {
+            let producer = if m == "gptq" {
+                Producer::Gptq
+            } else {
+                Producer::Awq
+            };
+            Declared::of_config(producer, what, doc.clone())
+        }
         Some("compressed-tensors") => {
             let mut d = Declared::new(Producer::CompressedTensors, what.to_owned());
+            d.configs.push((what.to_owned(), doc.clone()));
             let groups = doc.get("config_groups").and_then(Json::as_object);
             let formats = groups
                 .into_iter()
@@ -287,28 +338,36 @@ fn declared(set: &SourceSet, group: &Group) -> Result<Option<Declared>> {
         "" => name.to_owned(),
         folder => format!("{folder}/{name}"),
     };
-    for unread in &table().unread_declarations {
-        let found = match (&unread.file, &unread.metadata_prefix) {
-            (Some(file), _) => read_json(set, &path(file))?.map(|doc| {
-                let stated: Vec<String> = ["quant_method", "checkpoint_format", "version"]
-                    .iter()
-                    .filter_map(|k| Some(format!("{k}: {}", doc.get(*k)?)))
+    for decl in &table().declarations {
+        match (&decl.file, &decl.metadata_prefix) {
+            (Some(file), _) => {
+                if let Some(doc) = read_json(set, &path(file))? {
+                    let what = path(file);
+                    all.push(match doc.get("quant_method") {
+                        Some(_) => quantization_config(&doc, &what)?,
+                        None => Declared::of_config(decl.producer, &what, doc),
+                    });
+                }
+            }
+            (None, Some(prefix)) => {
+                let stated: serde_json::Map<String, Json> = (group.metadata.iter())
+                    .filter_map(|(k, v)| {
+                        Some((
+                            k.strip_prefix(prefix.as_str())?.to_owned(),
+                            metadata_value(v),
+                        ))
+                    })
                     .collect();
-                format!("{} ({})", path(file), stated.join(", "))
-            }),
-            (None, Some(prefix)) => (group.metadata.keys())
-                .find(|k| k.starts_with(prefix.as_str()))
-                .map(|k| format!("{} metadata {k}", group.label())),
-            (None, None) => None,
-        };
-        if let Some(found) = found {
-            return refuse(
-                Code::UNREGISTERED_ENCODING,
-                format!(
-                    "{found}: a {} quantization, which this import does not read yet",
-                    unread.producer
-                ),
-            );
+                if !stated.is_empty() {
+                    let what = format!("{} metadata {prefix}*", group.label());
+                    all.push(Declared::of_config(
+                        decl.producer,
+                        &what,
+                        Json::Object(stated),
+                    ));
+                }
+            }
+            (None, None) => {}
         }
     }
     if let Some(doc) = read_json(set, &path("hf_quant_config.json"))? {
@@ -388,6 +447,7 @@ fn declared(set: &SourceSet, group: &Group) -> Result<Option<Declared>> {
                 m.found.extend(d.found);
                 m.formats.extend(d.formats);
                 m.markers.extend(d.markers);
+                m.configs.extend(d.configs);
                 for (module, conf) in d.modules {
                     m.module(&module, conf, "a second declaration")?;
                 }
@@ -437,11 +497,15 @@ fn geometry(rule: &PartRule, t: &Tensor, shape: &[u64]) -> std::result::Result<V
     };
     let rows = numel(lead);
     let blocks = |n: u64| c.div_ceil(n);
-    let block_scheme = !matches!(rule.shape, Geometry::Logical | Geometry::One);
+    let block_scheme = !matches!(
+        rule.shape,
+        Geometry::Logical | Geometry::One | Geometry::Scheme
+    );
     if block_scheme && shape.len() < 2 {
         return Err(format!("a logical shape {shape:?} of rank under 2"));
     }
     let stored = match rule.shape {
+        Geometry::Scheme => t.shape.clone(),
         Geometry::Logical => shape.to_vec(),
         Geometry::One => match numel(&t.shape) {
             1 => t.shape.clone(),
@@ -481,11 +545,14 @@ fn geometry(rule: &PartRule, t: &Tensor, shape: &[u64]) -> std::result::Result<V
     }
 }
 
-/// `carrier` read from the module's present tensors (suffix -> tensor), or why not.
+/// `carrier` read from the module's present tensors (suffix -> tensor), or why not. `read` gives
+/// a small tensor's bytes (a stated shape).
 fn fit(
     carrier: &Carrier,
     present: &Present,
     conf: Option<&Conf>,
+    configured: Option<&Configured>,
+    read: &dyn Fn(&str, &Tensor) -> Result<Vec<u8>>,
 ) -> std::result::Result<Folded, String> {
     if let Some(s) = (present.keys()).find(|s| !carrier.parts.iter().any(|r| r.suffix == **s)) {
         return Err(format!("no part for .{s}"));
@@ -498,10 +565,49 @@ fn fit(
     let (Some(from), Some(to)) = (t.dtype.bits(), stored.bits()) else {
         return Err(format!(".{} is {}", data.suffix, t.dtype));
     };
-    let mut shape = t.shape.clone();
-    if let Some(last) = shape.last_mut() {
-        *last = *last * from / to;
-    }
+    let shape = match &carrier.logical {
+        Logical::Data => {
+            let mut shape = t.shape.clone();
+            if let Some(last) = shape.last_mut() {
+                *last = *last * from / to;
+            }
+            shape
+        }
+        Logical::Extents { rows, cols } => {
+            let extent = |(suffix, axis): &(String, usize)| {
+                let t = present.get(suffix.as_str()).map(|(_, t)| t);
+                t.and_then(|t| t.shape.get(*axis).copied())
+                    .ok_or(format!("no .{suffix} with an extent {axis}"))
+            };
+            vec![extent(rows)?, extent(cols)?]
+        }
+        Logical::Stated(suffix) => {
+            let Some((key, t)) = present.get(suffix.as_str()) else {
+                return Err(format!("no .{suffix}"));
+            };
+            let bytes = read(key, t).map_err(|e| e.detail)?;
+            let stated: Vec<i64> = match t.dtype {
+                Dtype::I64 => bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| i64::from_le_bytes(*b))
+                    .collect(),
+                Dtype::I32 => bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| i32::from_le_bytes(*b).into())
+                    .collect(),
+                _ => return Err(format!(".{suffix} is {}, not I32 or I64", t.dtype)),
+            };
+            (stated
+                .iter()
+                .map(|e| u64::try_from(*e))
+                .collect::<std::result::Result<_, _>>())
+            .map_err(|_| format!(".{suffix} states {stated:?}"))?
+        }
+    };
     let mut parts = Vec::new();
     for rule in &carrier.parts {
         let Some((_, t)) = present.get(rule.suffix.as_str()) else {
@@ -522,6 +628,15 @@ fn fit(
             dtype: rule.stored.clone().unwrap_or_else(|| t.dtype.clone()),
             shape: part_shape,
             at: (*t).clone(),
+        });
+    }
+    if carrier.from_config {
+        let configured = configured.ok_or("no quantization config states its params")?;
+        let encoding = config_encoding(carrier, configured, &shape, &parts)?;
+        return Ok(Folded {
+            encoding,
+            shape,
+            parts,
         });
     }
     if let (Producer::Comfy, Some(conf)) = (carrier.producer, conf) {
@@ -545,7 +660,11 @@ fn fit(
             .name();
         encoding.params.insert(param.clone(), Value::from(dtype));
     }
-    Ok(Folded { encoding, parts })
+    Ok(Folded {
+        encoding,
+        shape,
+        parts,
+    })
 }
 
 /// Every key of a ComfyUI marker (and of its `params`) is one this carrier reads, one it
@@ -580,6 +699,225 @@ fn marker_keys(carrier: &Carrier, conf: &Conf) -> std::result::Result<(), String
     Ok(())
 }
 
+/// The format name a producer's own config declares: its carriers' `formats`.
+fn format_of(producer: Producer) -> &'static str {
+    match producer {
+        Producer::Gptq => "gptq",
+        Producer::Awq => "awq",
+        _ => "",
+    }
+}
+
+/// A safetensors metadata value as the JSON its producer meant (`"4"`, `"True"`).
+fn metadata_value(v: &str) -> Json {
+    match v {
+        "True" | "true" => Json::Bool(true),
+        "False" | "false" => Json::Bool(false),
+        _ => v
+            .parse::<i64>()
+            .map_or_else(|_| Json::String(v.into()), Json::from),
+    }
+}
+
+/// The one value every config that states a setting gives it (`keys`: the producers' names for
+/// it), or why not.
+fn stated<'d>(d: &'d Declared, keys: &[&str]) -> std::result::Result<Option<&'d Json>, String> {
+    let mut found: Option<(&str, &str, &Json)> = None;
+    for (what, doc) in &d.configs {
+        for key in keys {
+            match (doc.get(*key), found) {
+                (Some(v), Some((w, k, f))) if f != v => {
+                    return Err(format!("{w} states {k} {f}, {what} states {key} {v}"))
+                }
+                (Some(v), None) => found = Some((what, key, v)),
+                _ => {}
+            }
+        }
+    }
+    Ok(found.map(|(_, _, v)| v))
+}
+
+/// compressed-tensors' weights args of its `pack-quantized` config groups: one set, or why not
+/// (a module's group would need its `targets` matched).
+fn ct_weights(d: &Declared) -> std::result::Result<serde_json::Map<String, Json>, String> {
+    const READ: [&str; 5] = ["num_bits", "type", "strategy", "group_size", "symmetric"];
+    let mut found: Vec<serde_json::Map<String, Json>> = Vec::new();
+    for (_, doc) in &d.configs {
+        let groups = doc.get("config_groups").and_then(Json::as_object);
+        for g in groups.into_iter().flat_map(|g| g.values()) {
+            let format = g.get("format").or_else(|| doc.get("format"));
+            let Some(w) = g.get("weights").and_then(Json::as_object) else {
+                continue;
+            };
+            if format.and_then(Json::as_str) == Some("pack-quantized") {
+                let read: serde_json::Map<String, Json> = READ
+                    .iter()
+                    .filter_map(|k| Some((k.to_string(), w.get(*k)?.clone())))
+                    .collect();
+                if !found.contains(&read) {
+                    found.push(read);
+                }
+            }
+        }
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err("no pack-quantized config group states its weights".into()),
+        _ => Err(format!("pack-quantized groups state different weights ({found:?}); module targets are not read")),
+    }
+}
+
+/// The code width and params a producer's quantization config states (compressed-tensors'
+/// `channel` leaves `group_size` to each module's row length), or why it cannot be read.
+pub type Configured = (i64, Vec<(&'static str, Value)>);
+
+fn config_params(producer: Producer, d: &Declared) -> std::result::Result<Configured, String> {
+    let int = |v: Option<&Json>, what: &str| {
+        v.and_then(Json::as_i64)
+            .ok_or(format!("{what} is not stated as an integer"))
+    };
+    let flag = |v: Option<&Json>, what: &str| {
+        v.and_then(Json::as_bool)
+            .ok_or(format!("{what} is not stated as a boolean"))
+    };
+    Ok(match producer {
+        Producer::Gptq => {
+            let dynamic = stated(d, &["dynamic"])?;
+            if dynamic.is_some_and(|v| !v.is_null() && v.as_object().is_none_or(|o| !o.is_empty()))
+            {
+                return Err("per-module overrides (dynamic) are not read".into());
+            }
+            let zero_offset = match stated(d, &["checkpoint_format", "format"])? {
+                None => 1u64,
+                Some(v) if v == "gptq" => 1,
+                Some(v) if v == "gptq_v2" => 0,
+                Some(v) => {
+                    return Err(format!(
+                        "GPTQ format {v} is not read (gptq and gptq_v2 are)"
+                    ))
+                }
+            };
+            if let Some(p) = stated(d, &["pack_dtype"])?.filter(|p| *p != "int32") {
+                return Err(format!("GPTQ pack_dtype {p} is not read (int32 is)"));
+            }
+            let params = vec![
+                (
+                    "group_size",
+                    int(stated(d, &["group_size"])?, "group_size")?.into(),
+                ),
+                ("symmetric", flag(stated(d, &["sym"])?, "sym")?.into()),
+                (
+                    "act_order",
+                    flag(stated(d, &["desc_act"])?, "desc_act")?.into(),
+                ),
+                ("zero_offset", zero_offset.into()),
+            ];
+            (int(stated(d, &["bits"])?, "bits")?, params)
+        }
+        Producer::Awq => {
+            let version = stated(d, &["version", "format"])?.and_then(Json::as_str);
+            if !version.is_some_and(|v| v.eq_ignore_ascii_case("gemm")) {
+                return Err(format!("AWQ version {version:?} is not read (GEMM is)"));
+            }
+            let zero_point = stated(d, &["zero_point"])?.and_then(Json::as_bool);
+            let sym = stated(d, &["sym"])?.and_then(Json::as_bool);
+            if zero_point != Some(true) && sym != Some(false) {
+                return Err("AWQ without a zero point is not read".into());
+            }
+            let g = int(stated(d, &["group_size", "q_group_size"])?, "group_size")?;
+            (
+                int(stated(d, &["bits", "w_bit"])?, "bits")?,
+                vec![("group_size", g.into())],
+            )
+        }
+        Producer::CompressedTensors => {
+            let w = ct_weights(d)?;
+            if w.get("type") != Some(&Json::from("int")) {
+                return Err(format!(
+                    "pack-quantized weights of type {:?} are not read",
+                    w.get("type")
+                ));
+            }
+            let strategy = w.get("strategy").and_then(Json::as_str).unwrap_or_default();
+            let mut params = vec![
+                ("strategy", strategy.into()),
+                ("symmetric", flag(w.get("symmetric"), "symmetric")?.into()),
+            ];
+            match strategy {
+                "group" => {
+                    params.push(("group_size", int(w.get("group_size"), "group_size")?.into()))
+                }
+                "channel" => {}
+                other => return Err(format!("pack-quantized strategy {other:?} is not read")),
+            }
+            (int(w.get("num_bits"), "num_bits")?, params)
+        }
+        _ => return Err("this producer states no config params".into()),
+    })
+}
+
+/// A `from_config` carrier's encoding for one module: the config's width and params, the
+/// module's row length as a `channel` group, and the packing compressed-tensors' words fit; the
+/// scheme checks every part.
+fn config_encoding(
+    carrier: &Carrier,
+    (bits, params): &Configured,
+    shape: &[u64],
+    parts: &[FoldedPart],
+) -> std::result::Result<Encoding, String> {
+    let (bits, mut params) = (*bits, params.clone());
+    if params
+        .iter()
+        .any(|(k, v)| *k == "strategy" && *v == Value::from("channel"))
+    {
+        params.push((
+            "group_size",
+            (shape.last().copied().unwrap_or(0) as i64).into(),
+        ));
+    }
+    let scheme = carrier.encoding.scheme.replace("{bits}", &bits.to_string());
+    let view: BTreeMap<&str, PartBytes> = (parts.iter())
+        .map(|p| {
+            (
+                p.role.as_str(),
+                PartBytes {
+                    dtype: &p.dtype,
+                    shape: &p.shape,
+                    bytes: &[],
+                },
+            )
+        })
+        .collect();
+    let fits = |params: &[(&str, Value)]| {
+        let encoding = Encoding {
+            scheme: scheme.clone(),
+            params: params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        };
+        check(&Dtype::F32, shape, &encoding, &view)
+            .map(|()| encoding)
+            .map_err(|e| e.to_string())
+    };
+    if carrier.producer != Producer::CompressedTensors {
+        return fits(&params);
+    }
+    // Before compressed-tensors 0.17 the codes filled ⌊32/b⌋ to a word; since, one dense stream.
+    // Where `b` divides 32 the bytes are the same, and `dense` names them.
+    params.push(("packing", "dense".into()));
+    let dense = fits(&params);
+    if 32 % bits == 0 {
+        return dense;
+    }
+    params.last_mut().expect("packing").1 = "word".into();
+    match (dense, fits(&params)) {
+        (Ok(e), Err(_)) | (Err(_), Ok(e)) => Ok(e),
+        (Ok(_), Ok(_)) => Err(format!("{bits}-bit words fit both packings")),
+        (Err(e), Err(_)) => Err(e),
+    }
+}
+
 /// Refuses quantization parts no scheme reads yet, wherever they are.
 fn companions(group: &Group) -> Result<()> {
     for c in &table().companions {
@@ -610,7 +948,7 @@ pub fn fold(set: &mut SourceSet) -> Result<()> {
             companions(group)?;
             continue;
         };
-        let folded = fold_group(group, &d)?;
+        let folded = fold_group(set, group, &d)?;
         let group = &mut set.groups[g];
         for key in &d.markers {
             group.tensors.remove(key);
@@ -663,7 +1001,7 @@ type Folds = BTreeMap<String, (Vec<String>, Tensor)>;
 /// A module's carrier tensors present: suffix -> (key, tensor).
 type Present<'g> = BTreeMap<&'g str, (&'g str, &'g Tensor)>;
 
-fn fold_group(group: &Group, d: &Declared) -> Result<Folds> {
+fn fold_group(set: &SourceSet, group: &Group, d: &Declared) -> Result<Folds> {
     let label = group.label();
     let rows: Vec<&Carrier> = carriers()
         .iter()
@@ -699,6 +1037,25 @@ fn fold_group(group: &Group, d: &Declared) -> Result<Folds> {
                 Some((*s, (key.as_str(), t)))
             })
             .collect()
+    };
+    // A producer that states its params in a config states them once for every module.
+    let config_rows = rows
+        .iter()
+        .filter(|c| c.from_config && c.formats.iter().any(|f| d.formats.contains(f)));
+    let configured = match config_rows.map(|c| c.producer).next() {
+        Some(producer) => match config_params(producer, d) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                return refuse(
+                    Code::UNREGISTERED_ENCODING,
+                    format!(
+                        "{label}: {} declares a quantization this import does not read: {e}",
+                        d.found.join(", ")
+                    ),
+                )
+            }
+        },
+        None => None,
     };
     let mut folds = Vec::new();
     for module in modules {
@@ -755,8 +1112,9 @@ fn fold_group(group: &Group, d: &Declared) -> Result<Folds> {
         }
         let mut fits = Vec::new();
         let mut why = Vec::new();
+        let read = |key: &str, t: &Tensor| bytes(set, key, t);
         for c in &candidates {
-            match fit(c, &present, conf) {
+            match fit(c, &present, conf, configured.as_ref(), &read) {
                 Ok(f) => fits.push(f),
                 Err(e) => why.push(format!("{}: {e}", c.encoding.scheme)),
             }
@@ -830,7 +1188,7 @@ fn fold_group(group: &Group, d: &Declared) -> Result<Folds> {
         let data = &folded.parts[0];
         let tensor = Tensor {
             dtype: logical.clone(),
-            shape: data.shape.clone(),
+            shape: folded.shape.clone(),
             file: data.at.file,
             start: data.at.start,
             len: data.at.len,

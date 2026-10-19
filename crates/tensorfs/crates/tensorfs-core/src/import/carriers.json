@@ -1,8 +1,8 @@
 {
-  "unread_declarations": [
-    {"file": "quantize_config.json", "producer": "GPTQ (AutoGPTQ, GPTQModel)"},
-    {"file": "quant_config.json", "producer": "AWQ (AutoAWQ)"},
-    {"metadata_prefix": "gptq_", "producer": "GPTQ (GPTQModel)"}
+  "declarations": [
+    {"file": "quantize_config.json", "producer": "gptq"},
+    {"file": "quant_config.json", "producer": "awq"},
+    {"metadata_prefix": "gptq_", "producer": "gptq"}
   ],
   "companions": [
     {"producer": "bitsandbytes", "keys": ["*.absmax", "*.quant_map", "*.nested_absmax", "*.nested_quant_map", "*.quant_state.*"]},
@@ -137,6 +137,45 @@
       ],
       "encoding": {"scheme": "int8.convrot", "params": {"rotation": "hadamard"}},
       "marker_params": {"rotation_size": ["convrot_groupsize", 256]}
+    },
+    {
+      "producer": "gptq",
+      "formats": ["gptq"],
+      "parts": [
+        {"suffix": "qweight", "role": "qweight", "dtypes": ["I32"], "shape": "scheme"},
+        {"suffix": "qzeros", "role": "qzeros", "dtypes": ["I32"], "shape": "scheme"},
+        {"suffix": "scales", "role": "scales", "dtypes": ["F16", "BF16"], "shape": "scheme"},
+        {"suffix": "g_idx", "role": "g_idx", "dtypes": ["I32"], "shape": "scheme"}
+      ],
+      "logical": {"extents": {"rows": ["scales", 1], "cols": ["g_idx", 0]}},
+      "encoding": {"scheme": "gptq.int{bits}", "params": {}},
+      "from_config": true
+    },
+    {
+      "producer": "awq",
+      "formats": ["awq"],
+      "parts": [
+        {"suffix": "qweight", "role": "qweight", "dtypes": ["I32"], "shape": "scheme"},
+        {"suffix": "qzeros", "role": "qzeros", "dtypes": ["I32"], "shape": "scheme"},
+        {"suffix": "scales", "role": "scales", "dtypes": ["F16", "BF16"], "shape": "scheme"}
+      ],
+      "logical": {"extents": {"rows": ["scales", 1], "cols": ["qweight", 0]}},
+      "encoding": {"scheme": "awq.int{bits}", "params": {}},
+      "from_config": true
+    },
+    {
+      "producer": "compressed-tensors",
+      "formats": ["pack-quantized"],
+      "parts": [
+        {"suffix": "weight_packed", "role": "weight_packed", "dtypes": ["I32"], "shape": "scheme"},
+        {"suffix": "weight_scale", "role": "weight_scale", "dtypes": ["F32", "BF16", "F16"], "shape": "scheme"},
+        {"suffix": "weight_zero_point", "role": "weight_zero_point", "dtypes": ["I32"], "shape": "scheme", "optional": true},
+        {"suffix": "weight_shape", "role": "weight_shape", "dtypes": ["I32", "I64"], "shape": "scheme"},
+        {"suffix": "weight_g_idx", "role": "weight_g_idx", "dtypes": ["I32"], "shape": "scheme", "optional": true}
+      ],
+      "logical": {"stated": "weight_shape"},
+      "encoding": {"scheme": "ct.int{bits}", "params": {}},
+      "from_config": true
     }
   ]
 }

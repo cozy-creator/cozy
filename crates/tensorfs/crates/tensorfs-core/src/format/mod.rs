@@ -11,7 +11,7 @@ mod json;
 pub mod layout;
 mod value;
 
-pub use decode::{decode, grid::ScaleLayout, PartBytes, SCHEMES};
+pub use decode::{check, decode, grid::ScaleLayout, PartBytes, SCHEMES};
 pub use doc::{
     repo_key, Body, Component, Encoding, Header, Location, Manifest, Metadata, ObjectRef, Part,
     Release, Repo, Span, Tensor,
