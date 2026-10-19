@@ -53,7 +53,8 @@ fn settled(row: &str) -> bool {
 #[test]
 fn the_live_run_list_redraws_a_run_as_it_moves() {
     let Some(home) = Home::new() else { return };
-    let _machine = tensord::added(&home, "live");
+    // Without the job's named Runtime, so the update to the Hub's target has work to do.
+    let _machine = tensord::added_unupdated(&home, "live");
     let (view, drawn) = drawing(home.root(), View::Runs, |frame| {
         update_row(frame).is_some_and(|row| settled(&row))
     });
