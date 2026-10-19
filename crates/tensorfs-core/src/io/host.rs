@@ -60,6 +60,7 @@ pub(super) unsafe fn fill(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats,
                 (Some(i), offset)
             }
             Src::Host(p) => (None, p as u64),
+            Src::Device { .. } => unreachable!("host sources only"),
         };
         let end = offset.checked_add(len as u64).ok_or_else(|| invalid(i, "source range overflows"))?;
         let mut at = offset;
