@@ -27,8 +27,8 @@ const EXCHANGE_MAX: u64 = 64 << 20;
 type BindOutput = Arc<dyn Fn(&str, &str) -> io::Result<()> + Send + Sync>;
 
 /// Execution-owner hooks: current attempt authority, durable output association, the
-/// sources' fetch, and the identity a committed derivation replays under (its function's code
-/// and declaration; none: this run's own).
+/// sources' fetch, and the identity a committed derivation replays under (its function's code,
+/// declaration and request; none: this run's own).
 pub struct GrantAuthority {
     pub current: Arc<dyn Fn() -> bool + Send + Sync>,
     pub bind_output: BindOutput,
@@ -191,8 +191,8 @@ impl Weights {
         if derivation.granted().any(|s| grant.sources.get(&s.id()) != Some(&s.length)) {
             return Err(("weights_source_ungranted", "source is outside invocation grant".into()));
         }
-        // The output's work is its code, its slot and what it declares (its sources and
-        // request among it): any run of the same resumes or replays the same transaction.
+        // The output's work is its code and request, its slot and what it declares (its sources
+        // among it): any run of the same resumes or replays the same transaction.
         let work = sha256::hex_digest(&raw);
         let code = grant.replay.as_deref().unwrap_or(&grant.run);
         let identity = format!("{}\0{code}\0{slot}\0{work}", grant.actor);
