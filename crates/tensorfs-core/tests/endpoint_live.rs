@@ -121,6 +121,20 @@ async fn a_capability_is_traded_once_and_proves_each_request() {
     let named = endpoint.repo(&model).await.unwrap().unwrap().0;
     assert!(raced.iter().all(|tree| named.checkpoints.contains(tree)), "all concurrent appends survived CAS rebases");
 
+    let denied = endpoint.update_repo(&model, |old| {
+        let mut repo = old.expect("the seeded repo");
+        repo.set_release("99.0.0", base_tree.clone());
+        Ok(Some(repo))
+    }).await.unwrap_err();
+    assert_eq!(denied.code, Code::CREDENTIAL_REQUIRED, "capability_exceeded is denied, despite its policy/409 status");
+    let conflict = owner.update_repo(&model, |old| {
+        let mut repo = old.expect("the seeded repo");
+        repo.set_release("1.0.0", base_tree.clone());
+        repo.releases[0].revision = 7;
+        Ok(Some(repo))
+    }).await.unwrap_err();
+    assert_eq!(conflict.code, Code::REPOSITORY_CONFLICT, "ordinary revision policy/409 remains a conflict");
+
     let other = format!("{account}/other");
     let refused = endpoint.update_repo(&other, |old| Ok(Some(with_tree(old, &other, &output_tree, None)))).await.unwrap_err();
     assert_eq!(refused.code, Code::CREDENTIAL_REQUIRED, "the token cannot upload to another repo");
