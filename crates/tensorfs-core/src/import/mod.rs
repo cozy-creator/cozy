@@ -115,9 +115,13 @@ fn folder(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(f, _)| f)
 }
 
-/// The model's documents: the source's own (not those of converted folders, whose configs
-/// are the foreign layout's), each table's reference (its index, the produced components'
-/// configs and the asset folders), and the tables' inline files.
+fn name(path: &str) -> &str {
+    path.rsplit_once('/').map_or(path, |(_, n)| n)
+}
+
+/// The model's files: every non-weight file of the source, byte-exact at its path, except a
+/// converted folder's `config.json` (the foreign layout's); each table's reference (its index,
+/// the produced components' configs and the asset folders); the tables' inline files.
 fn documents(
     set: &source::SourceSet,
     recognized: &engine::Recognized,
@@ -143,10 +147,8 @@ fn documents(
         .collect();
     let mut files = BTreeMap::new();
     for p in &set.plain {
-        if !raw.contains(&p.file)
-            && remote::document(&p.path)
-            && !converted.contains(&folder(&p.path))
-        {
+        let foreign = converted.contains(&folder(&p.path)) && name(&p.path) == "config.json";
+        if !raw.contains(&p.file) && !foreign {
             files.insert(p.path.clone(), set.read_plain(p)?);
         }
     }
@@ -155,17 +157,18 @@ fn documents(
         let table = &tables[*t];
         if let Some(reference) = &table.reference {
             let listing = remote::list(&remote::parse(reference)?, req.access)?;
-            let selected = remote::select(listing, None, &|m| remote::read_small(m, req.access))?;
+            let read = |m: &remote::Member| remote::read_small(m, req.access);
+            let selected = remote::select(listing, None, remote::Files::Configs, &read)?;
             let weighted: Vec<&str> = selected
                 .iter()
-                .filter(|m| !remote::document(&m.path))
+                .filter(|m| remote::weights(&m.path))
                 .map(|m| folder(&m.path))
                 .collect();
             let docs: Vec<remote::Member> = selected
                 .iter()
                 .filter(|m| {
                     let f = folder(&m.path);
-                    remote::document(&m.path)
+                    !remote::weights(&m.path)
                         && (f.is_empty() || produced.contains(&f) || !weighted.contains(&f))
                 })
                 .cloned()
@@ -191,7 +194,8 @@ pub fn import(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     for raw in req.sources {
         let listing = remote::list(&remote::parse(raw)?, req.access)?;
         pinned.push(listing.pinned.clone());
-        for m in remote::select(listing, req.variant, &|m| remote::read_small(m, req.access))? {
+        let read = |m: &remote::Member| remote::read_small(m, req.access);
+        for m in remote::select(listing, req.variant, remote::Files::All, &read)? {
             if members.iter().any(|o| o.path == m.path) {
                 return refuse(
                     Code::DUPLICATE_KEY,

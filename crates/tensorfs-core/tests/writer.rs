@@ -148,8 +148,10 @@ fn a_tiny_hf_sdxl_imports_and_reads_back_bit_identical() {
 
     // The repository's own files, landed apart from the import.
     let listing = import::remote::list(&import::remote::parse(pinned).unwrap(), &access).unwrap();
-    let members =
-        import::remote::select(listing, None, &|m| import::remote::read_small(m, &access)).unwrap();
+    let members = import::remote::select(listing, None, import::remote::Files::All, &|m| {
+        import::remote::read_small(m, &access)
+    })
+    .unwrap();
     let landed: Vec<(String, PathBuf)> = members
         .iter()
         .map(|m| {

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """The standalone e2e (design §11): no Cozy, no account, run by `e2e.sh` in a fresh venv.
 
-1. CLI: `tfs import hf://hf-internal-testing/tiny-sdxl-pipe`; `tfs export --safetensors`, from
-   which Diffusers renders exactly the upstream repo's image (CPU, fixed seed); `tfs export
+1. CLI: `tfs import hf://hf-internal-testing/tiny-sdxl-pipe`; `tfs export --safetensors`, which is
+   the repository file for file (a Transformers model with its tokenizer too) and from which
+   Diffusers renders exactly the upstream repo's image (CPU, fixed seed); `tfs export
    --origin`, served by `python -m http.server`, then `tfs pull` into a second store,
    byte-identical; a corrupted object is removed by `tfs verify` and fetched again.
 2. The same through `tensorfs`, plus DLPack reads equal to upstream's own tensors, regions,
@@ -25,11 +26,13 @@ from collections.abc import Iterator
 import numpy as np
 import torch
 from diffusers import StableDiffusionXLPipeline
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 
 import tensorfs as tfs
 
 REPO = "hf-internal-testing/tiny-sdxl-pipe"
+#: A Transformers model with its tokenizer; its ONNX copy is the one file an import drops.
+LLM = "hf-internal-testing/tiny-random-LlamaForCausalLM"
 NAME = "local/tiny-sdxl"
 TFS = str(pathlib.Path(sys.executable).with_name("tfs"))
 DTYPES = {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16, "I64": torch.int64}
@@ -55,6 +58,18 @@ def same_image(folder: pathlib.Path, reference: np.ndarray) -> None:
     diff = float(np.abs(image - reference).max())
     print(f"render {folder.name}: {image.shape}, max |diff| vs upstream {diff}")
     assert diff == 0.0, f"{folder}: the image differs from upstream's by {diff}"
+
+
+def same_folder(folder: pathlib.Path, repo: str, dropped: list[str]) -> None:
+    """The export is the repository, `diff -r` empty: every file, byte for byte, the weights
+    too, apart from other serializations of the weights."""
+    upstream = pathlib.Path(snapshot_download(repo, ignore_patterns=dropped))
+    tree_a = {str(p.relative_to(folder)): p.read_bytes() for p in folder.rglob("*") if p.is_file()}
+    tree_b = {str(p.relative_to(upstream)): p.read_bytes() for p in upstream.rglob("*") if p.is_file()}
+    assert sorted(tree_a) == sorted(tree_b), f"{repo}: {sorted(tree_a)} != {sorted(tree_b)}"
+    differ = [p for p in tree_b if tree_a[p] != tree_b[p]]
+    assert not differ, f"{repo}: {differ} differ from upstream's"
+    print(f"export of {repo}: its {len(tree_b)} files, byte for byte")
 
 
 def same_files(folder: pathlib.Path) -> None:
@@ -119,6 +134,10 @@ def main() -> None:
     assert set(names) == {"text_encoder", "text_encoder_2", "unet", "vae"}, names
     cli(a, "export", NAME, str(work / "out"), "--safetensors")
     same_files(work / "out")
+    same_folder(work / "out", REPO, [])
+    cli(work / "llm-store", "import", f"hf://{LLM}", "--name", "local/tiny-llama")
+    cli(work / "llm-store", "export", "local/tiny-llama", str(work / "llm"), "--safetensors")
+    same_folder(work / "llm", LLM, ["*.onnx"])
     same_image(work / "out", reference)
     cli(a, "export", NAME, str(work / "origin"), "--origin")
     with serve(work / "origin") as url:

@@ -903,8 +903,10 @@ fn a_tiny_hf_sdxl_imports_end_to_end() {
         &access,
     )
     .unwrap();
-    let members =
-        import::remote::select(listing, None, &|m| import::remote::read_small(m, &access)).unwrap();
+    let members = import::remote::select(listing, None, import::remote::Files::All, &|m| {
+        import::remote::read_small(m, &access)
+    })
+    .unwrap();
     let landed: Vec<(String, PathBuf)> = members
         .iter()
         .map(|m| {
@@ -1483,4 +1485,80 @@ fn references_match_real_lanes() {
         }
     }
     assert!(held > 5000, "{held}");
+}
+
+/// Every file under `root`, by its path relative to `root`.
+fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.insert(rel, fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// network: Hugging Face. A Diffusers pipeline and a Transformers model with its tokenizer, each
+/// imported and exported, are their repository: the same files with the same bytes (their plain
+/// weights too, laid out as safetensors writes them), missing only other serializations of the
+/// weights. The repository is landed file by file from its raw listing, not the import's
+/// selection.
+#[test]
+fn an_export_is_its_source_folder() {
+    let access = Access::default();
+    for (repo, dropped) in [
+        (
+            "hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2",
+            &[][..],
+        ),
+        (
+            "hf-internal-testing/tiny-random-LlamaForCausalLM@9fb191250dd56d0ba7ec9785a025ed29c03d5998",
+            &["onnx/model.onnx"][..],
+        ),
+    ] {
+        let dir = scratch(&repo[..repo.find('@').unwrap()].replace('/', "-"));
+        let source = format!("hf://{repo}");
+        let store = tensorfs_core::store2::Store::open(dir.join("store")).unwrap();
+        let tmp = dir.join("store").join("tmp");
+        let req = Request {
+            sources: std::slice::from_ref(&source),
+            converter: None,
+            variant: None,
+            access: &access,
+            tmp: &tmp,
+            progress: &|_, _, _| {},
+            stop: None,
+        };
+        let manifest = store.import(&req, None).unwrap();
+        let ck = store.checkpoint(&manifest).unwrap();
+        tensorfs_core::export::safetensors(&ck, &dir.join("out"), None).unwrap();
+        let exported = tree(&dir.join("out"));
+
+        let listing = import::remote::list(&import::remote::parse(&source).unwrap(), &access).unwrap();
+        let mut upstream = BTreeMap::new();
+        for m in &listing.members {
+            if !dropped.contains(&m.path.as_str()) {
+                let local = import::remote::land(m, &dir.join("upstream").join(&m.path), &access).unwrap();
+                upstream.insert(m.path.clone(), fs::read(local).unwrap());
+            }
+        }
+        let names = |t: &BTreeMap<String, Vec<u8>>| t.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(names(&exported), names(&upstream), "{repo}: the same files");
+        for (path, bytes) in &upstream {
+            assert!(exported[path] == *bytes, "{repo}: {path} differs from upstream's");
+        }
+        assert!(exported.contains_key("README.md") && exported.contains_key(".gitattributes"), "{repo}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
