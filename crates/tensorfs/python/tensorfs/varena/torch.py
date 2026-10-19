@@ -450,6 +450,8 @@ class Memory:
         self.active: dict[Request, None] = {}
         #: declared plans by request id, started or dispatched (§5.2)
         self.plans: dict[str, _Plan] = {}
+        #: regions prefetched, whose copies may still be landing (not evictable until they do)
+        self.landing: dict[Model, set[int]] = {}
         #: host tiers sealed here for the executor to deposit
         self.deposits: list[tuple[Model, int]] = []
         #: its requests waiting for room (§2), counted under `freeing`
@@ -766,6 +768,7 @@ class Memory:
             try:
                 for region in model.blocks[nxt].regions:
                     model.ws.prefetch(region)
+                    self.landing.setdefault(model, set()).add(region)
             except DeviceFull:
                 return
 
@@ -814,6 +817,8 @@ class Memory:
                 freed += n
                 if name in self.models:
                     self._evicted(self.models[name], 2, why, n)
+        if self._free() < target:
+            freed += self._landed(target, why)
         for cache in [c for c in list(self.caches) if c.nbytes]:
             if self._free() >= target:
                 return True
@@ -827,6 +832,23 @@ class Memory:
                 table.wait(asked)
             freed += max(self._free() - before, 0)
         return freed > 0 or self._free() >= target
+
+    def _landed(self, target: int, why: str) -> int:
+        """Demand outranks a prefetch: copies still landing hold pages no eviction may take, so
+        each cold model's wait for theirs to land (a bind waits on its fill, then lets go), then
+        go, the furthest declared use first."""
+        freed, stream = 0, torch.cuda.current_stream(self.device)
+        for model in sorted(
+            (m for m in self.landing if not (m.flight or m.held or m.host)), key=self._keep
+        ):
+            if self._free() >= target:
+                break
+            for region in sorted(self.landing.pop(model)):
+                if model.ws.resident(region):
+                    model.ws.bind(region, stream.cuda_stream)
+            stream.synchronize()
+            freed += self._evict(model, why, 2, target - self._free())
+        return freed
 
     def _lower_until(self, target: int, why: str, asking: Model | None) -> bool:
         """Rung 4: the hot watermarks fall from the top of their spread sets, the asker's last."""
@@ -1213,6 +1235,7 @@ class Memory:
                 try:
                     for region in block.regions:
                         model.ws.prefetch(region)
+                        self.landing.setdefault(model, set()).add(region)
                 except DeviceFull:
                     return
 
@@ -1234,7 +1257,8 @@ class Memory:
         )
         reserve = max((max(m.reserve, 0) for m in models if near[m] < math.inf), default=0)
         room = self._free() - owed - reserve
-        for model in sorted((m for m in models if near[m] < math.inf and not m.flight), key=near.get):
+        # the step running now pages in on demand; restores are for the steps after it
+        for model in sorted((m for m in models if 0 < near[m] < math.inf and not m.flight), key=near.get):
             victims = sorted(
                 (v for v in models if near[v] > near[model] and not (v.flight or v.held)),
                 key=self._keep,
@@ -1255,6 +1279,7 @@ class Memory:
                 try:
                     for region in block.regions:
                         model.ws.prefetch(region)
+                        self.landing.setdefault(model, set()).add(region)
                 except DeviceFull:
                     return
 
