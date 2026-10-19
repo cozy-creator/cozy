@@ -488,6 +488,16 @@ def adopted(mem: Memory, ck: tensorfs.Checkpoint, held: int, a: argparse.Namespa
     model.close()
     kept = replace(grant, pages=tuple(pages), fingerprint=fingerprint)
     try:
+        mismatched = replace(kept, fingerprint="a different layout")
+        mem.adopt(mismatched)
+        net = meta(a.dim, a.blocks)
+        net._varena = Declared(mismatched)
+        model = mem.load(net)
+        with torch.no_grad(), mem.request("fingerprint-miss"):
+            check("a fingerprint mismatch refills exact bytes", torch.equal(net(x), want))
+        moved = next(s.total.paged_in for s in mem.core.stats().sets if s.name == model.name)
+        check("a fingerprint mismatch copies from RAM", moved > 0, str(moved))
+        model.close()
         mem.adopt(kept)
         imported = mem.adopted[kept.key]
         pin = imported.bind(0, torch.cuda.current_stream().cuda_stream)
