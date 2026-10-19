@@ -576,6 +576,14 @@ fn an_object_reused_while_gc_sweeps_it_survives() {
         let reader = std::thread::spawn(move || {
             let _ = sent.send(reading.read(&read_object));
         });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while trash(&store) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reader never entered the real trash restore path"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(
             matches!(
                 received.recv_timeout(Duration::from_millis(100)),
