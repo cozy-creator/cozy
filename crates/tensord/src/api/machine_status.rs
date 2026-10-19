@@ -81,6 +81,8 @@ pub(super) fn identity_frame(identity: &MachineIdentity) -> v1::StatusFrame {
         worker_id: identity.authority.worker_id.clone(),
         boot_id: identity.authority.boot_id.clone(),
         version: env!("CARGO_PKG_VERSION").into(),
+        commit: cozy_proto::COMMIT.into(),
+        dev: identity.updates.as_ref().is_some_and(|u| u.dev()),
         capabilities: capabilities(identity),
         receipt: identity.readiness.envelope().unwrap_or_default(),
         ..Default::default()
@@ -141,6 +143,7 @@ pub(super) async fn frame<B: MachineBackend>(
                     cc => crate::precision::Gpus::of(&[cc]).name,
                 },
                 memory_class: g.memory_class.clone(),
+                memory_limit_bytes: identity.gpu_memory_limit.filter(|&l| l < g.memory_bytes).unwrap_or(0),
             })
             .collect(),
         hubs: identity

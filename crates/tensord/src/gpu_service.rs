@@ -82,6 +82,10 @@ pub struct GpuConfig {
     pub inventory: Vec<crate::machine::receipt::Gpu>,
     /// Load's device limit where NVML cannot read the device total.
     pub authorized_device_limit_bytes: Option<u64>,
+    /// The most memory each GPU offers (`machine.gpu_memory_limit`): its ledger's capacity and the
+    /// lane rule's memory are never more.
+    #[serde(default)]
+    pub gpu_memory_limit: Option<u64>,
     #[serde(default)]
     pub memory: MemoryConfig,
     /// Explicitly configured locations; the executor seal is imposed on top of them.
@@ -698,7 +702,8 @@ impl Pool {
                 .find(|g| g.device_index.to_string() == *entry || g.device_uuid == *entry)
                 .map(|g| g.memory_bytes)
                 .or(config.authorized_device_limit_bytes);
-            let memory = GpuLedger::start(entry, shared, config.memory.floor_bytes, capacity, Default::default(), notes.clone())
+            let limit = config.gpu_memory_limit;
+            let memory = GpuLedger::start(entry, shared, config.memory.floor_bytes, capacity, limit, Default::default(), notes.clone())
                 .unwrap_or_else(|error| {
                     tracing::warn!("memory: GPU {entry} has no ledger: {error}");
                     None
@@ -873,6 +878,7 @@ impl Pool {
             return false;
         };
         let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
+        self.notes.note(serde_json::json!({"event": "end_idle", "plan": plan, "gpus": start..start + degree as usize}));
         if let Err(error) = session.executor.shutdown() {
             tracing::warn!("memory: ending idle executor {key}: {error}");
         }
@@ -934,6 +940,7 @@ impl Pool {
     pub fn budget(&self, degree: u32) -> Option<u64> {
         let lane = &self.devices[..self.devices.len().min(degree as usize)];
         let memory = lane.iter().map(|d| self.inventory(&d.entry).map(|g| g.memory_bytes)).min()??;
+        let memory = self.config.gpu_memory_limit.map_or(memory, |limit| memory.min(limit));
         Some(memory - memory / 4)
     }
     fn inventory(&self, entry: &str) -> Option<&crate::machine::receipt::Gpu> {
@@ -1289,6 +1296,8 @@ impl Pool {
                     break;
                 }
                 if ledger.running() || !self.end_idle_on(gpu, plan, spare) {
+                    self.notes.note(serde_json::json!({"event": "short", "plan": plan, "gpu": device.entry,
+                        "shape": shape, "running": ledger.running()}));
                     fit = false;
                     break;
                 }
@@ -1889,6 +1898,7 @@ impl Pool {
                 // Queued requests of its root and older roots go first; a released lane ends
                 // the hint.
                 let (start, _permit) = loop {
+                    let epoch = engine.activity_epoch();
                     if !active() { return; }
                     match pool.allocations.bound(root) {
                         Some(None) => return,
@@ -1900,7 +1910,7 @@ impl Pool {
                         }
                         _ => {}
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    engine.wait_activity(epoch, None);
                 };
                 if !active() { return; }
                 let waited = asked.elapsed();
@@ -3502,6 +3512,8 @@ impl Services for Callbacks<'_> {
             }
             None => self.chunks(&frame.manifest, &mut answer),
         };
+        self.pool.notes.note(serde_json::json!({"event": "read_grant", "manifest": frame.manifest,
+            "layout": frame.layout, "held": answer.held, "files": files.as_ref().map_or(0, Vec::len)}));
         Ok(match files {
             Ok(files) => {
                 (answer.ok, answer.descriptors) = (true, files.len() as u64);
@@ -3530,7 +3542,10 @@ impl Services for Callbacks<'_> {
         if frame.kind == Kind::Deposit {
             // A layout varena sealed in the executor, kept for the next executor of its weights.
             let layout = descriptor.ok_or_else(|| io::Error::other("a deposit omitted its layout"))?;
-            return Ok(match self.deposits.deposit(&frame.manifest, &frame.layout, layout) {
+            let kept = self.deposits.deposit(&frame.manifest, &frame.layout, layout);
+            self.pool.notes.note(serde_json::json!({"event": "deposit", "manifest": frame.manifest,
+                "layout": frame.layout, "kept": kept.as_ref().map_or_else(ToString::to_string, |()| "yes".into())}));
+            return Ok(match kept {
                 Ok(()) => (Answer::ok(frame.seq), None),
                 Err(error) => (Answer::refused(frame.seq, "deposit_refused", error.to_string()), None),
             });

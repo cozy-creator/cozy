@@ -629,6 +629,10 @@ pub struct StatusFrame {
     pub boot_id: String,
     /// This machine's release.
     pub version: String,
+    /// The commit its `cozy` binary was built from.
+    pub commit: String,
+    /// Its binary arrived by a dev update (`cozy machine update --tensord`), not a release.
+    pub dev: bool,
     pub capabilities: Vec<String>,
     /// The sealed readiness envelope (base64); empty until sealed.
     #[serde(with = "base64_bytes")]
@@ -753,6 +757,8 @@ pub struct Gpu {
     pub family: String,
     /// discrete, coherent (GH200, GB200), unified (GB10); empty: unread.
     pub memory_class: String,
+    /// The most of `memory_bytes` this machine uses (`machine.gpu_memory_limit`); 0: all of it.
+    pub memory_limit_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]

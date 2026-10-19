@@ -232,7 +232,7 @@ pub fn version() -> io::Result<()> {
     let record = Version {
         name: "tensord",
         version: env!("CARGO_PKG_VERSION"),
-        commit: option_env!("TENSORD_COMMIT"),
+        commit: Some(cozy_proto::COMMIT),
         api: ["cozy.machine.v1"],
         capabilities,
     };
@@ -243,7 +243,7 @@ pub fn version() -> io::Result<()> {
 /// Runs the machine from its grant: identity and readiness under the machine root, the engine
 /// under `var/lib/cozy/tensord`, the API on the granted port.
 fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Ready) -> io::Result<()> {
-    let config::Config { mut grant, visible_devices, endpoint, logs, .. } = config;
+    let config::Config { mut grant, visible_devices, gpu_memory_limit, endpoint, logs, .. } = config;
     let runtime = machine_runtime()?;
     use crate::machine::{identity, receipt};
     let layout = grant.layout.clone();
@@ -321,6 +321,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
         gpus.clear();
     }
     identity.gpus = gpus.clone();
+    identity.gpu_memory_limit = gpu_memory_limit;
     {
         let devices: Vec<String> = gpus.iter().map(|g| g.device_index.to_string()).collect();
         let home = engine.join("executor-home");
@@ -329,6 +330,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
             "devices": devices.join(","),
             "inventory": gpus,
             "authorized_device_limit_bytes": null,
+            "gpu_memory_limit": gpu_memory_limit,
             "environment": {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home, "COZY_HOME": home},
             // A rented pod is the machine's alone (its grant says so); anywhere else it is a guest.
             "host": {"mode": if rental { "dedicated" } else { "shared" }},
@@ -512,6 +514,9 @@ fn start_api(
         contexts: Default::default(),
     }));
     crate::calls::Calls::configure(service, machine.clone(), backend.runs.as_ref())?;
+    if let Some(runs) = &backend.runs {
+        crate::api::machine_runs::resume(runs)?;
+    }
     listener.set_nonblocking(true)?;
     #[derive(serde::Serialize)]
     struct Ready<'a> {

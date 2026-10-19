@@ -223,6 +223,9 @@ impl Capability {
     pub fn names(&self, op: Op) -> bool {
         self.run.names(op)
     }
+    pub fn expired(&self) -> bool {
+        self.run.expired()
+    }
 
     /// Why the capability no longer serves, if it does not.
     fn ended(&self) -> Option<(&'static str, String)> {

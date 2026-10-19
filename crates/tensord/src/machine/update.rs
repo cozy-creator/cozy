@@ -28,6 +28,10 @@ pub const REPLACE_EXIT: i32 = 75;
 /// This binary's release, which an update's `from` and `to` name as `cozy`.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_WHEEL_BYTES: u64 = 256 << 20;
+/// A dev binary's: a debug build with its debug info.
+const MAX_BINARY_BYTES: u64 = 2 << 30;
+/// A dev binary's file name where it is staged.
+pub const BINARY: &str = if cfg!(windows) { "cozy.exe" } else { "cozy" };
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Pair {
@@ -128,6 +132,18 @@ impl Choice {
         }
         Ok(Choice { file: file.into(), sha256, url: url.into(), ..Default::default() })
     }
+
+    /// A `cozy` binary at an https `url`, held to `sha256`: the machine fetches it.
+    pub fn binary_at(url: &str, sha256: &str) -> Result<Choice, String> {
+        let sha256 = sha256.to_ascii_lowercase();
+        if !url.starts_with("https://") {
+            return Err(format!("{url} is not an https URL"));
+        }
+        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("the binary's sha256 is 64 hex digits, not {sha256:?}"));
+        }
+        Ok(Choice { file: BINARY.into(), sha256, url: url.into(), ..Default::default() })
+    }
 }
 
 /// An update failure with its own reason code.
@@ -154,6 +170,13 @@ pub struct Request {
     /// checked before anything drains. A swapped binary activates with or without it.
     #[serde(default)]
     pub cozy: Option<String>,
+    /// The most memory each GPU offers, in bytes (0: none), written to the machine's config after
+    /// the drain and read at the restart the update ends with.
+    #[serde(default)]
+    pub gpu_memory_limit: Option<u64>,
+    /// A dev `cozy` binary to run (`cozy machine update --tensord`), staged or fetched like a wheel.
+    #[serde(default)]
+    pub binary: Option<Choice>,
     /// Install the build toolchain (`super::toolchain`) instead of a software pair.
     #[serde(default)]
     pub toolchain: bool,
@@ -167,7 +190,21 @@ struct Pending {
     /// A binary activation's launch path, whose `.cozy-previous` a rollback renames back.
     #[serde(default)]
     binary: Option<PathBuf>,
+    /// The activated binary arrived by a dev update.
+    #[serde(default)]
+    dev: bool,
 }
+
+/// The binary an update activates: its launch path, its release, and the dev file placed there
+/// at activation (`--tensord`), none when `cozy update` already placed a release.
+struct Binary {
+    launch: PathBuf,
+    version: String,
+    dev: Option<PathBuf>,
+}
+
+/// In the engine directory while a committed dev binary runs.
+const DEV: &str = "binary-dev";
 
 /// What the stable parent does after recovering or rolling back an activation.
 #[derive(Debug, PartialEq, Eq)]
@@ -186,6 +223,8 @@ pub struct Paths {
     engine: PathBuf,
     image_wheels: PathBuf,
     uv: PathBuf,
+    /// The machine's `config.toml`, which its one load reads at start.
+    pub(crate) config: PathBuf,
 }
 impl Paths {
     pub fn new(engine: &Path, root: &Path) -> Self {
@@ -196,10 +235,12 @@ impl Paths {
         } else {
             root.join("opt/cozy/wheels")
         };
+        let home = std::env::home_dir().unwrap_or_else(|| root.into());
         Self {
             engine: engine.into(),
             image_wheels,
             uv: super::client::uv(root),
+            config: cozy_platform::paths::Home::under(&home).config(),
         }
     }
     fn update(&self, name: &str) -> PathBuf {
@@ -433,6 +474,21 @@ impl Updates {
         status.to = this_binary(identified(&self.paths.sdk())?);
         status.error.clear();
         status.enter("succeeded");
+        if let Some(launch) = &pending.binary {
+            let marker = self.paths.engine.join(DEV);
+            match pending.dev {
+                true => fs::write(&marker, VERSION)?,
+                // A release binary again: the dev record and its release copy go.
+                false => {
+                    for path in [marker, super::binary::release(launch)] {
+                        match fs::remove_file(path) {
+                            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
         self.commit_status(status)
     }
 
@@ -495,8 +551,8 @@ impl Updates {
                 "the machine is running a Runtime update; stage wheels after it finishes".into(),
             ));
         }
-        if wheel_name(file).is_none() {
-            return Err((400, "stage a cozy_runtime or tensorfs wheel".into()));
+        if wheel_name(file).is_none() && file != BINARY {
+            return Err((400, format!("stage a cozy_runtime or tensorfs wheel, or the {BINARY} binary")));
         }
         let temp = self.paths.update(&format!(
             "staged/.upload-{}",
@@ -513,9 +569,10 @@ impl Updates {
                 break;
             }
             length += n as u64;
-            if length > MAX_WHEEL_BYTES {
+            let max = if file == BINARY { MAX_BINARY_BYTES } else { MAX_WHEEL_BYTES };
+            if length > max {
                 let _ = fs::remove_file(&temp);
-                return Err((400, "the wheel exceeds 256 MiB".into()));
+                return Err((400, format!("{file} exceeds {} MiB", max >> 20)));
             }
             hash.update(&buffer[..n]);
             out.write_all(&buffer[..n]).map_err(server)?;
@@ -548,9 +605,11 @@ impl Updates {
                 .operation
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-            && (request.runtime.is_some() || request.tensorfs.is_some() || request.cozy.is_some()) != request.toolchain;
+            && (request.runtime.is_some() || request.tensorfs.is_some() || request.cozy.is_some() || request.binary.is_some()
+                || request.gpu_memory_limit.is_some())
+                != request.toolchain;
         if !valid {
-            return Err((400, "an update requires operation and a Runtime, TensorFS or cozy, or the toolchain alone".into()));
+            return Err((400, "an update requires operation and a Runtime, TensorFS or cozy binary, or the toolchain alone".into()));
         }
         let mut current = self.status.lock().unwrap();
         if let Some(status) = current.as_ref() {
@@ -652,7 +711,7 @@ impl Updates {
         let binary = self.binary(request)?;
         let pair = !(running(&request.runtime, &from.runtime, &from.runtime_sha256)
             && running(&request.tensorfs, &from.tensorfs, &from.tensorfs_sha256));
-        if !pair && binary.is_none() {
+        if !pair && binary.is_none() && request.gpu_memory_limit.is_none() {
             // Nothing to install: the machine already runs this pair and binary.
             return self.set(|s| {
                 s.to = from.clone();
@@ -679,10 +738,13 @@ impl Updates {
                 Some(candidate) => self.prepare(request, candidate)?,
                 None => from.clone(),
             };
-            to.cozy = binary.as_ref().map_or_else(|| from.cozy.clone(), |(_, version)| version.clone());
+            to.cozy = binary.as_ref().map_or_else(|| from.cozy.clone(), |b| b.version.clone());
             self.set(|s| s.to = to.clone())?;
             let activation = self.drain()?;
             self.set(|s| s.enter("installing"))?;
+            if let Some(limit) = request.gpu_memory_limit {
+                write_limit(&self.paths.config, limit)?;
+            }
             Ok((to, activation))
         })();
         if let (Err(_), Some(candidate)) = (&prepared, &candidate) {
@@ -690,13 +752,22 @@ impl Updates {
             let _ = fs::remove_dir_all(candidate);
         }
         let (to, _activation) = prepared?;
+        let dev = binary.as_ref().and_then(|b| b.dev.as_ref());
+        if let (Some(b), Some(_)) = (&binary, dev) {
+            // Kept before the record names it: a rollback renames `.cozy-previous` back.
+            super::binary::keep(&b.launch, !self.dev())?;
+        }
         let pending = Pending {
             status: self.status.lock().unwrap().clone().unwrap_or_default(),
             sdk_before: previous_link(&self.paths.current_sdk_link())?,
-            binary: binary.as_ref().map(|(launch, _)| launch.clone()),
+            binary: binary.as_ref().map(|b| b.launch.clone()),
+            dev: dev.is_some(),
         };
         let publication = (|| {
             write_json(&self.paths.update("pending.json"), &pending)?;
+            if let Some(staged) = dev {
+                super::binary::swap(staged)?;
+            }
             if let Some(candidate) = &candidate {
                 relink(&self.paths.current_sdk_link(), Some(candidate))?;
             }
@@ -730,8 +801,11 @@ impl Updates {
     /// The binary this update activates, with its release: the launch path's, when it is not this
     /// image. Refused before anything drains when it does not run, is not the release `cozy`
     /// names, or has no previous binary beside it to roll back to.
-    fn binary(&self, request: &Request) -> io::Result<Option<(PathBuf, String)>> {
+    fn binary(&self, request: &Request) -> io::Result<Option<Binary>> {
         let coded = |code, message| io::Error::other(Coded { code, message });
+        if let Some(choice) = &request.binary {
+            return self.dev_binary(request, choice).map(Some);
+        }
         let Some(launch) = super::binary::launch().filter(|l| l.swapped()) else {
             return match &request.cozy {
                 Some(named) if named != VERSION => Err(coded(
@@ -752,7 +826,35 @@ impl Updates {
                 format!("{} is missing: nothing to roll back to", previous.display()),
             ));
         }
-        Ok(Some((launch.path.clone(), version)))
+        Ok(Some(Binary { launch: launch.path.clone(), version, dev: None }))
+    }
+
+    /// A dev binary: fetched or staged and digest-checked, then refused before anything drains
+    /// unless this machine runs it (`super::binary::check`) and it is the release `cozy` names.
+    fn dev_binary(&self, request: &Request, choice: &Choice) -> io::Result<Binary> {
+        let coded = |code, message| io::Error::other(Coded { code, message });
+        let launch = super::binary::launch()
+            .ok_or_else(|| coded("binary_unsupported", "this machine was not started from a cozy binary".into()))?;
+        if launch.swapped() {
+            return Err(coded(
+                "binary_mismatch",
+                format!("{} already holds a binary to activate; update without --tensord first", launch.path.display()),
+            ));
+        }
+        self.set(|s| s.enter("preparing"))?;
+        let staged = self.resolve("cozy", choice)?;
+        #[cfg(unix)]
+        fs::set_permissions(&staged, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+        let version = super::binary::check(&staged).map_err(|why| coded("binary_incompatible", why))?;
+        if let Some(named) = request.cozy.as_ref().filter(|named| **named != version) {
+            return Err(coded("binary_mismatch", format!("the binary is cozy {version}, not {named}")));
+        }
+        Ok(Binary { launch: launch.path.clone(), version, dev: Some(staged) })
+    }
+
+    /// Whether this machine runs a dev binary: one a committed dev update activated.
+    pub fn dev(&self) -> bool {
+        self.paths.engine.join(DEV).exists()
     }
 
     /// Closes admission and waits for the work admitted before to drain, saying how many runs
@@ -1081,6 +1183,28 @@ fn unlink(link: &Path) -> io::Result<()> {
     fs::remove_file(link)
 }
 
+/// Sets `machine.gpu_memory_limit` in the machine's config (0 removes it), keeping the rest as
+/// written; a file the load would refuse is never written.
+fn write_limit(path: &Path, limit: u64) -> io::Result<()> {
+    let text = match fs::read_to_string(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        read => read?,
+    };
+    let shown = path.display().to_string();
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| invalid(&format!("{shown}: {e}")))?;
+    if !doc.get("machine").is_some_and(toml_edit::Item::is_table) {
+        doc["machine"] = toml_edit::table();
+    }
+    match limit {
+        0 => drop(doc["machine"].as_table_mut().and_then(|t| t.remove("gpu_memory_limit"))),
+        bytes => doc["machine"]["gpu_memory_limit"] = toml_edit::value(bytes as i64),
+    }
+    let text = doc.to_string();
+    cozy_proto::config::Config::parse(&text, &shown).map_err(|e| invalid(&e.message))?;
+    fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+    cozy_platform::durable::replace(path, text.as_bytes(), 0o600).map_err(io::Error::other)
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     super::identity::write_atomic(path, &serde_json::to_vec(value)?, 0o600)
 }
@@ -1201,6 +1325,7 @@ mod tests {
                 status,
                 sdk_before: Some(old.clone()),
                 binary: None,
+                dev: false,
             },
         )
         .unwrap();
@@ -1246,7 +1371,7 @@ mod tests {
         let file = candidate.file_name().unwrap().to_str().unwrap().to_owned();
         let (sha256, _) = updates.stage(&file, &mut fs::File::open(&candidate).unwrap()).unwrap();
         let runtime = Some(Choice { file, sha256, ..Default::default() });
-        let request = Request { operation: "u1".into(), pin: None, runtime, tensorfs: None, cozy: None, toolchain: false };
+        let request = Request { operation: "u1".into(), pin: None, runtime, tensorfs: None, cozy: None, binary: None, gpu_memory_limit: None, toolchain: false };
         updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
         state(&updates, "u1", "waiting_activation");
         // It says how many runs it waits on: the run, and its event, count them.
@@ -1299,6 +1424,36 @@ mod tests {
         assert_eq!(updates.update("transaction").unwrap().state, "installing");
     }
 
+    /// A GPU memory limit alone is written to the machine's config after the drain, keeping the
+    /// rest of the file, and the update restarts on the same software; 0 takes it out again.
+    #[test]
+    fn a_gpu_memory_limit_alone_is_written_and_restarts_the_machine() {
+        let root = std::env::temp_dir().join(format!("cm-limit-update-{}", uuid::Uuid::new_v4()));
+        let mut paths = Paths::new(&root.join("engine"), &root);
+        paths.config = root.join("home/.cozy/config.toml");
+        fs::create_dir_all(&paths.image_wheels).unwrap();
+        wheel(&paths.image_wheels, "cozy_runtime", "0.1.0", None);
+        wheel(&paths.image_wheels, "tensorfs", "0.1.0", None);
+        fs::create_dir_all(paths.config.parent().unwrap()).unwrap();
+        fs::write(&paths.config, "hub = \"local\"\n[machine]\nport = 9\n").unwrap();
+        for (operation, limit) in [("cap", 8u64 << 30), ("lift", 0)] {
+            let updates = Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap();
+            let request = Request {
+                operation: operation.into(), pin: None, runtime: None, tensorfs: None, cozy: None, binary: None,
+                gpu_memory_limit: Some(limit), toolchain: false,
+            };
+            updates.request(request, |code| assert_eq!(code, REPLACE_EXIT)).unwrap();
+            state(&updates, operation, "starting");
+            let text = fs::read_to_string(&paths.config).unwrap();
+            let (config, _) = cozy_proto::config::Config::parse(&text, "config.toml").unwrap();
+            assert_eq!(config.machine.gpu_memory_limit, (limit > 0).then_some(limit), "{text}");
+            assert_eq!((config.machine.port, config.hub.as_deref()), (Some(9), Some("local")));
+            // The restarted machine proves ready and commits it.
+            Updates::open(paths.clone(), Box::new(|| true), None, None).unwrap().commit().unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// A pair the machine already runs installs nothing: the update succeeds unchanged at once.
     #[test]
     fn the_running_pair_is_an_unchanged_update() {
@@ -1313,6 +1468,8 @@ mod tests {
             runtime: Some(Choice { version: "0.1.0".into(), ..Default::default() }),
             tensorfs: Some(Choice { version: "0.1.0".into(), ..Default::default() }),
             cozy: None,
+            binary: None,
+            gpu_memory_limit: None,
             toolchain: false,
         };
         updates.request(request, |_| panic!("an unchanged update restarted the service")).unwrap();
@@ -1369,6 +1526,7 @@ mod tests {
                 status,
                 sdk_before: Some(old.clone()),
                 binary: None,
+                dev: false,
             }).unwrap();
             Self { root, paths, old, new }
         }
@@ -1487,6 +1645,8 @@ mod tests {
             runtime: Some(Choice { version: "0.2.0".into(), ..Default::default() }),
             tensorfs: None,
             cozy: None,
+            binary: None,
+            gpu_memory_limit: None,
             toolchain: false,
         };
         let rejected = updates.request(next, |_| panic!("unsettled cleanup started an update")).unwrap_err();
@@ -1521,7 +1681,7 @@ mod tests {
         let (sha256, _) = updates.stage(&file, &mut fs::File::open(wheel).unwrap()).unwrap();
         Request {
             operation: id.into(), pin: None,
-            runtime: Some(Choice { file, sha256, ..Default::default() }), tensorfs: None, cozy: None, toolchain: false,
+            runtime: Some(Choice { file, sha256, ..Default::default() }), tensorfs: None, cozy: None, binary: None, gpu_memory_limit: None, toolchain: false,
         }
     }
 

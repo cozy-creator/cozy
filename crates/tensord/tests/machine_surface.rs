@@ -4,6 +4,7 @@ use tensord::journal::Journal;
 use ed25519_dalek::SigningKey;
 use std::{
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -11,6 +12,8 @@ use std::{
 
 #[path = "common/hub_oauth.rs"]
 mod hub_oauth;
+#[path = "common/named_runtime.rs"]
+mod named_runtime;
 #[path = "common/names_hub.rs"]
 mod names_hub;
 
@@ -83,6 +86,9 @@ impl Machine {
 impl Drop for Machine {
     fn drop(&mut self) {
         self.stop();
+        if !std::thread::panicking() {
+            named_runtime::loaded(&named_runtime::environments(&self.root.join("state/generations")), "a machine");
+        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -142,7 +148,8 @@ from pathlib import Path
 from tensord_client.packages import install
 fixture, out = Path(sys.argv[1]), Path(sys.argv[2])
 subprocess.run(["uv", "build", "--wheel", "--out-dir", str(out / "client"), "."], check=True, capture_output=True)
-generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12")
+generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12",
+                     sdk=[Path(wheel) for wheel in sys.argv[3:]])
 print(json.dumps({"identity": generation.identity}))
 "#;
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -154,6 +161,8 @@ print(json.dumps({"identity": generation.identity}))
         ])
         .arg(repo.join("tests/fixtures/cpu_classifier"))
         .arg(state)
+        // The named Runtime, as every machine of this suite runs it.
+        .args(named_runtime::pair())
         .output()
         .unwrap();
     assert!(
@@ -815,13 +824,17 @@ mod v1_api {
     async fn installing_machine() -> (Machine, PathBuf) {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let tools = std::env::temp_dir().join(format!("cm-tools-{}", uuid::Uuid::new_v4()));
-        assert!(Command::new("uv")
-            .current_dir(repo)
-            .args(["build", "--wheel", "--out-dir"])
-            .arg(&tools)
-            .status()
-            .unwrap()
-            .success());
+        // The client wheel, built once per test process (concurrent builds share the tree's
+        // egg-info and tear it), then one copy in each test's tools.
+        static CLIENT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let client = CLIENT.get_or_init(|| {
+            let out = std::env::temp_dir().join(format!("cm-client-{}", uuid::Uuid::new_v4()));
+            assert!(Command::new("uv").current_dir(repo).args(["build", "--wheel", "--out-dir"]).arg(&out)
+                .status().unwrap().success());
+            fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap()
+        });
+        fs::create_dir_all(&tools).unwrap();
+        fs::copy(client, tools.join(client.file_name().unwrap())).unwrap();
         NAMED_RUNTIME.get_or_init(|| named_runtime_loads(&tools)).await;
         let machine = Machine::start_args(|_, _| (), &installing_args(&tools)).await;
         (machine, tools)
@@ -832,41 +845,17 @@ mod v1_api {
     /// no test's machine holds the probe's package.
     static NAMED_RUNTIME: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
     async fn named_runtime_loads(tools: &Path) {
-        let Some(wheel) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") else { return };
-        let want = stamped(Path::new(&wheel));
-        assert!(
-            !want.is_empty() && want != "unknown",
-            "{wheel:?} names no commit (COMMIT = {want:?}): a wheel without provenance proves nothing"
-        );
+        let Some((version, want)) = named_runtime::named() else { return };
+        let wheel = std::env::var_os("COZY_TEST_RUNTIME_WHEEL");
         let machine = Machine::start_args(|_, _| (), &installing_args(tools)).await;
         let client = client(&machine);
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         let manifest = write_package(&client, &all, "cpu_bulk", "local/tensord-cpu-bulk").await;
         let built = call(&client, &all, &manifest, ("provenance", "provenance"), serde_json::json!({})).await;
         assert_eq!(built["commit"], want.as_str(), "the machine loaded another Runtime than {wheel:?}");
+        let _ = writeln!(std::io::stderr(), "named Runtime {version} (commit {want}) loads: asserted");
     }
 
-    /// The TensorFS wheel a Runtime wheel accepts, from PyPI, into `dir`.
-    const ACCEPTED_TENSORFS: &str = "import re, subprocess, sys, zipfile, pathlib
-wheel, out = sys.argv[1], pathlib.Path(sys.argv[2])
-archive = zipfile.ZipFile(wheel)
-meta = next(n for n in archive.namelist() if n.endswith('.dist-info/METADATA'))
-req = next(l[15:].split(';')[0].replace(' ', '') for l in archive.read(meta).decode().splitlines()
-           if re.match(r'Requires-Dist: tensorfs[^A-Za-z0-9._-]', l))
-subprocess.run([sys.executable, '-m', 'pip', 'download', '-q', '--no-deps', '--only-binary=:all:', '--python-version', '3.12',
-                '--platform', 'manylinux_2_28_x86_64', '--platform', 'manylinux_2_17_x86_64', '-d', str(out), req], check=True)
-print(next(out.glob('tensorfs-*.whl')))
-";
-
-    /// The commit a Runtime wheel was built from: its `cozy_runtime._build_provenance.COMMIT`.
-    fn stamped(wheel: &Path) -> String {
-        let read = "import re, sys, zipfile\n\
-            text = zipfile.ZipFile(sys.argv[1]).read('cozy_runtime/_build_provenance.py').decode()\n\
-            print(re.search(r'^COMMIT = \"([^\"]*)\"', text, re.M).group(1))\n";
-        let out = Command::new("python3").args(["-I", "-c", read]).arg(wheel).output().unwrap();
-        assert!(out.status.success(), "reading {wheel:?}: {out:?}");
-        String::from_utf8(out.stdout).unwrap().trim().to_owned()
-    }
 
     /// `serve`'s installer arguments: the test helper Python and the client wheel in `tools`.
     fn installing_args(tools: &Path) -> Vec<std::ffi::OsString> {
@@ -894,14 +883,8 @@ print(next(out.glob('tensorfs-*.whl')))
             vec!["--installer-python".into(), helper.into(), "--client-wheel".into(), wheel.into()];
         // A Runtime wheel not yet published, installed as this machine's own (a dev build), with
         // the TensorFS it accepts, as an update that names a Runtime brings.
-        if let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") {
-            let tensorfs = std::env::var_os("COZY_TEST_TENSORFS_WHEEL").unwrap_or_else(|| {
-                let out = Command::new("python3").args(["-I", "-c", ACCEPTED_TENSORFS]).arg(&runtime).arg(tools.join("tensorfs-wheel"))
-                    .output().unwrap();
-                assert!(out.status.success(), "the TensorFS {runtime:?} accepts: {out:?}");
-                String::from_utf8(out.stdout).unwrap().trim().into()
-            });
-            args.extend(["--package-sdk".into(), runtime, "--package-sdk".into(), tensorfs]);
+        for wheel in named_runtime::pair() {
+            args.extend(["--package-sdk".into(), wheel.into()]);
         }
         args
     }

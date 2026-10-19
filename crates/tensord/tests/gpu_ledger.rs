@@ -135,7 +135,7 @@ fn charges() -> PathBuf {
 
 /// The ledger TensorD keeps for the fake GPU.
 fn ledger(liveness: Liveness) -> GpuLedger {
-    GpuLedger::start("0", false, 0, None, liveness, MemoryLog::default()).unwrap().expect("a ledger")
+    GpuLedger::start("0", false, 0, None, None, liveness, MemoryLog::default()).unwrap().expect("a ledger")
 }
 
 /// The driver gives `pid`'s memory back.
@@ -312,6 +312,31 @@ fn inner_a_request_starts_only_when_it_fits() {
     assert!(ledger.fits("plan", Some("other"), false), "a shape never measured, alone");
 }
 
+/// A 24 GiB card limited to 8 GiB (`machine.gpu_memory_limit`): the ledger executors adopt
+/// says 8, and `fits` measures against 8, never the card; a limit above the card is the card.
+#[test]
+fn a_gpu_memory_limit_is_every_ledgers_capacity() {
+    under_fake_nvml("inner_a_gpu_memory_limit_is_every_ledgers_capacity", 24 * GIB, false);
+}
+
+#[test]
+#[ignore = "run under the fake NVML by its outer test"]
+fn inner_a_gpu_memory_limit_is_every_ledgers_capacity() {
+    let limited = |limit| GpuLedger::start("0", false, 0, None, Some(limit), Liveness::default(), MemoryLog::default()).unwrap().unwrap();
+    assert_eq!(limited(32 * GIB).status().unwrap().capacity, 24 * GIB, "never above the card");
+    let ledger = limited(8 * GIB);
+    let [memfd, _] = ledger.grant().unwrap();
+    let executor = Ledger::adopt(std::os::fd::AsFd::as_fd(&memfd), None).unwrap();
+    assert_eq!(executor.capacity(), 8 * GIB, "what an executor reads");
+    let mut tenant = Tenant::start(&ledger, &charges(), "answer");
+    tenant.call(&format!("publish {} {} 0 {}", GIB / 2, 2 * GIB, GIB));
+    ledger.now();
+    executor.set_peak("plan|s", 6 * GIB).unwrap();
+    assert!(!ledger.fits("plan", Some("s"), false), "3.5 unevictable + 6 of 8, though the card has 24");
+    executor.set_peak("plan|s", 4 * GIB).unwrap();
+    assert!(ledger.fits("plan", Some("s"), false), "3.5 + 4 of 8");
+}
+
 /// The 11405 shape: an executor holding 7 GiB of an 8 GiB card in torch is killed. Its bytes
 /// are counted until NVML shows them back, and nothing fits beside them meanwhile.
 #[test]
@@ -384,7 +409,7 @@ fn inner_a_stalled_victim_is_ended() {
 fn each_rank_of_a_group_holds_its_own_gpus_row() {
     let ledgers: Vec<GpuLedger> = ["GPU-rank-0", "GPU-rank-1"]
         .iter()
-        .map(|entry| GpuLedger::start(entry, false, 0, Some(8 * GIB), Liveness::default(), MemoryLog::default()).unwrap().unwrap())
+        .map(|entry| GpuLedger::start(entry, false, 0, Some(8 * GIB), None, Liveness::default(), MemoryLog::default()).unwrap().unwrap())
         .collect();
     let dir = tempfile::tempdir().unwrap();
     let mut ranks: Vec<Tenant> = ledgers.iter().map(|l| Tenant::start(l, dir.path(), "answer")).collect();

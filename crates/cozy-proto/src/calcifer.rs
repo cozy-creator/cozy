@@ -495,6 +495,9 @@ pub struct Rental {
     /// Since when the Hub cannot reach it, though its provider reports it running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreachable_since_ms: Option<i64>,
+    /// The worker image it boots, by digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_worker_image_digest: Option<String>,
 }
 
 /// A machine's `Status`, as it last sent it.
@@ -502,6 +505,12 @@ pub struct Rental {
 pub struct MachineStatus {
     pub worker_id: String,
     pub version: String,
+    /// The commit its `cozy` binary was built from.
+    #[serde(default)]
+    pub commit: String,
+    /// Its binary arrived by a dev update, not a release.
+    #[serde(default)]
+    pub dev: bool,
     pub platform: String,
     /// `booting`, `ready` or `releasing`.
     pub phase: String,
@@ -552,6 +561,13 @@ pub struct Gpu {
     pub family: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_class: Option<String>,
+    /// The most of `memory_bytes` the machine uses; 0: all of it.
+    #[serde(default, skip_serializing_if = "unlimited")]
+    pub memory_limit_bytes: u64,
+}
+
+fn unlimited(bytes: &u64) -> bool {
+    *bytes == 0
 }
 
 /// A model repository the machine holds.
@@ -712,6 +728,10 @@ pub enum NewMachine {
         gpus: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         disk_gb: Option<u32>,
+        /// A Hub admin's worker image, `sha256:<hex>`, in place of the machine kind's current
+        /// one; the Hub refuses anyone else.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<String>,
     },
     Add {
         name: String,

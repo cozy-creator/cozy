@@ -70,7 +70,7 @@ async fn a_hub_is_listed_signed_in_and_a_rent_it_will_not_price_records_nothing(
     // The Hub prices the exact ask before anything is recorded; it sells nothing here, so the
     // rent is refused and nothing is recorded or kept.
     let refused = machines
-        .rent("calcifer-key-1", &origin, "rtx4090", None, None)
+        .rent("calcifer-key-1", &origin, "rtx4090", None, None, None)
         .await
         .unwrap_err();
     assert!(
