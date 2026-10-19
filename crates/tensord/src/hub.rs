@@ -179,6 +179,7 @@ pub struct Capability {
     access: protocol::machine::HubAccess,
     claims: Value,
     provider: Mutex<Option<Arc<DPoP>>>,
+    access_token: Mutex<Option<String>>,
     refused: AtomicBool,
     forbidden: AtomicBool,
 }
@@ -227,9 +228,16 @@ impl Capability {
             },
             claims,
             provider: Mutex::default(),
+            access_token: Mutex::default(),
             refused: AtomicBool::new(false),
             forbidden: AtomicBool::new(false),
         })
+    }
+
+    pub fn restore_token(&self, token: &str) {
+        let mut provider = self.provider.lock().unwrap();
+        *self.access_token.lock().unwrap() = (!token.is_empty()).then(|| token.to_string());
+        *provider = None;
     }
 
     pub fn names(&self, op: Op) -> bool {
@@ -276,6 +284,11 @@ impl Capability {
         if let Some(provider) = held.as_ref() {
             return Ok(provider.clone());
         }
+        if let Some(token) = self.access_token.lock().unwrap().as_ref() {
+            let provider = DPoP::token(&self.access.key, token, self.claims["aud"].as_str())
+                .map_err(|e| Refusal(e.to_string()))?.at(&source.origin);
+            return Ok(held.insert(Arc::new(provider)).clone());
+        }
         let client = source.fetch_client()?;
         let grant = JwtBearer {
             token_endpoint: self.access.token_endpoint.clone(),
@@ -307,6 +320,8 @@ pub struct RuntimeHubAccess {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub key: String,
     pub token_endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ca_der: Option<String>,
 }
@@ -347,8 +362,22 @@ impl Source {
         let access = self.capability.as_ref().map(|c| c.access.clone()).unwrap_or_default();
         RuntimeHubAccess {
             endpoint: self.origin.clone(), capability: access.capability, key: access.key, token_endpoint: access.token_endpoint,
+            access_token: self.capability.as_ref().and_then(|c| c.access_token.lock().unwrap().clone()),
             ca_der: self.ca_der.as_ref().map(|der| base64::engine::general_purpose::STANDARD.encode(der)),
         }
+    }
+
+    pub fn full_access(&self) -> protocol::machine::HubAccess {
+        let mut access = self.capability.as_ref().map(|c| c.access.clone()).unwrap_or_default();
+        access.origin = self.origin.clone();
+        access.ca_der = self.ca_der.clone().unwrap_or_default();
+        access.object_hosts = self.object_hosts.clone();
+        access.access_token = self.capability.as_ref().and_then(|c| c.access_token.lock().unwrap().clone()).unwrap_or_default();
+        access
+    }
+
+    pub fn restore_token(&self, token: &str) {
+        if let Some(capability) = &self.capability { capability.restore_token(token); }
     }
 
     /// Public prefetch never redeems a package run's capability.

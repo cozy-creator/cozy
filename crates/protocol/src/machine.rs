@@ -418,6 +418,9 @@ pub struct HubAccess {
     /// The private P-256 JWK this request proves with. Empty for public-only runs.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub key: String,
+    /// A token already issued for this request's key by its metadata helper.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub access_token: String,
     /// The Hub's authorization server's, as its metadata names it.
     pub token_endpoint: String,
 }

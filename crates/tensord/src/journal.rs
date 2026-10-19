@@ -489,6 +489,7 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS run_objects(execution INTEGER NOT NULL REFERENCES executions(id),sha256 TEXT NOT NULL,length INTEGER NOT NULL,PRIMARY KEY(execution,sha256));
             CREATE INDEX IF NOT EXISTS run_objects_digest ON run_objects(sha256);
             CREATE TABLE IF NOT EXISTS run_specs(execution INTEGER PRIMARY KEY REFERENCES executions(id),spec BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS run_metadata(execution INTEGER PRIMARY KEY REFERENCES executions(id) ON DELETE CASCADE,pending INTEGER NOT NULL);
             DROP TABLE IF EXISTS job_contexts;
             CREATE TABLE IF NOT EXISTS held_memos(actor TEXT NOT NULL,computation TEXT NOT NULL,record BLOB NOT NULL,used_ms INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(actor,computation));
             CREATE TABLE IF NOT EXISTS held_memo_objects(actor TEXT NOT NULL,computation TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(actor,computation,sha256));
@@ -1489,6 +1490,27 @@ impl Journal {
     pub(crate) fn unsettled(&self) -> io::Result<bool> {
         self.connection.query_row("SELECT EXISTS(SELECT 1 FROM executions WHERE state IN ('starting','running') OR (state='queued'
             AND json_extract(record,'$.waiting_reason') IS NOT NULL AND id NOT IN (SELECT execution FROM run_specs)))", [], |row| row.get(0)).map_err(db_error)
+    }
+
+    pub(crate) fn begin_metadata(&mut self, id: &str) -> io::Result<()> {
+        self.connection.execute("INSERT INTO run_metadata(execution,pending) VALUES(?1,1) ON CONFLICT(execution) DO UPDATE SET pending=1", [id]).map_err(db_error)?;
+        Ok(())
+    }
+
+    pub(crate) fn metadata_pending(&self, id: &str) -> io::Result<bool> {
+        Ok(self.connection.query_row("SELECT pending FROM run_metadata WHERE execution=?1", [id], |r| r.get(0)).optional().map_err(db_error)?.unwrap_or(false))
+    }
+
+    pub(crate) fn complete_metadata(&mut self, id: &str, access: &protocol::machine::HubAccess) -> io::Result<()> {
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
+        let spec: Option<Vec<u8>> = tx.query_row("SELECT spec FROM run_specs WHERE execution=?1", [id], |r| r.get(0)).optional().map_err(db_error)?;
+        if let Some(spec) = spec {
+            let mut spec: protocol::machine::RunSpec = serde_json::from_slice(&spec).map_err(db_error)?;
+            spec.hub = Some(access.clone());
+            tx.execute("UPDATE run_specs SET spec=?1 WHERE execution=?2", params![serde_json::to_vec(&spec).map_err(db_error)?, id]).map_err(db_error)?;
+        }
+        tx.execute("UPDATE run_metadata SET pending=0 WHERE execution=?1", [id]).map_err(db_error)?;
+        tx.commit().map_err(db_error)
     }
 
     /// The preparing runs a restart interrupted, each with its signer and kept spec.

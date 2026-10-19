@@ -51,6 +51,18 @@ impl Client {
         Self::connect(self.baseurl(), self.client().clone(), Credential::Anonymous)
     }
 
+    /// The resource's authorization server, validated before a capability is minted.
+    pub async fn token_endpoint(&self) -> Result<String, crate::Error> {
+        let resource = self.get_protected_resource_metadata().await?.into_inner();
+        let issuer = resource.authorization_servers.first().map(|s| s.trim_end_matches('/'));
+        let server = self.get_openid_configuration().await?.into_inner();
+        if issuer != Some(server.issuer.trim_end_matches('/'))
+            || !server.grant_types_supported.iter().any(|g| g == "urn:ietf:params:oauth:grant-type:jwt-bearer") {
+            return Err(crate::Error::Answer("this Hub names no authorization server that takes run capabilities".into()));
+        }
+        Ok(server.token_endpoint)
+    }
+
     pub fn credential(&self) -> &Credential {
         &self.inner().credential
     }

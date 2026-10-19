@@ -58,6 +58,7 @@ tracing-subscriber.workspace = true
 migrate = ["protocol/migrate"]
 
 [dev-dependencies]
+hub-client = { workspace = true, features = ["testing"] }
 tower.workspace = true
 tempfile.workspace = true
 x509-parser = "0.18"

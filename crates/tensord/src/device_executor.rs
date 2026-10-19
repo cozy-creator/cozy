@@ -167,11 +167,42 @@ pub struct ModelLoad {
     pub budgets: Budgets,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MetadataModel {
+    pub slot: String,
+    pub repo_id: String,
+    pub revision: String,
+    pub variant: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResolvedMetadata {
+    pub slot: String,
+    pub repo_id: String,
+    pub revision: String,
+    pub variant: String,
+    pub header: tensorfs_core::format::ObjectRef,
+    pub tree: Option<tensorfs_core::format::ObjectRef>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct AccessToken(pub String);
+impl std::fmt::Debug for AccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("AccessToken(..)") }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum DeviceCommand {
     Hello,
     Shutdown,
+    ResolveModels {
+        request_id: String,
+        store: PathBuf,
+        hub: Option<crate::hub::RuntimeHubAccess>,
+        models: Vec<MetadataModel>,
+    },
     Start {
         devices: String,
         application: String,
@@ -358,6 +389,7 @@ impl DeviceCommand {
         match self {
             Self::Hello => "hello",
             Self::Shutdown => "shutdown",
+            Self::ResolveModels { .. } => "resolve_models",
             Self::Start { .. } => "start",
             Self::Load { .. } => "load",
             Self::Activate { .. } => "activate",
@@ -717,6 +749,8 @@ pub struct Frame {
     pub numerics: String,
     pub local: String,
     pub cost_ms: f64,
+    pub resolved: Vec<ResolvedMetadata>,
+    pub access_token: Option<AccessToken>,
 }
 
 impl Frame {

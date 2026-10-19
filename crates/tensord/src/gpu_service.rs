@@ -2477,6 +2477,49 @@ impl Pool {
         })
     }
 
+    /// One request's metadata-only Runtime, before any Start or device grant. Its credential
+    /// leaves only in the typed reply, and this exact process is reaped before returning.
+    pub(crate) fn resolve_metadata(
+        &self, held: &HeldGeneration, id: &str, source: &crate::hub::Source,
+        models: Vec<device_executor::MetadataModel>, stop: Option<&crate::stop::Stop>,
+    ) -> io::Result<Frame> {
+        let (root, socket, directory) = self.executor_endpoint()?;
+        let config = self.executor_config(held, root, socket, 0, 0)?;
+        let mut executor = DeviceExecutor::spawn_owned(config, &self.launcher, |_, _| Ok(()))?;
+        executor.retain_until_exit(directory);
+        if executor.hello.torch_loaded {
+            executor.shutdown()?;
+            return Err(io::Error::other("metadata-only Runtime imported torch before Start"));
+        }
+        let finished = crate::stop::Stop::default();
+        let cancellation = executor.cancellation();
+        let answer = std::thread::scope(|scope| {
+            if let Some(stop) = stop {
+                let finished = &finished;
+                scope.spawn(move || {
+                    while !finished.is_cancelled() {
+                        if stop.is_cancelled() { let _ = cancellation.cancel(id); break; }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                });
+            }
+            let answer = executor.command(&DeviceCommand::ResolveModels {
+                request_id: id.into(), store: self.store.root().into(), hub: Some(source.runtime_access()), models,
+            }, &mut device_executor::Baseline);
+            finished.cancel();
+            answer
+        });
+        match answer {
+            Ok(reply) => {
+                let hello = executor.command(&DeviceCommand::Hello, &mut device_executor::Baseline);
+                executor.shutdown()?;
+                if hello?.hello.torch_loaded { return Err(io::Error::other("metadata-only Runtime imported torch")); }
+                Ok(reply)
+            }
+            Err(error) => { executor.terminate()?; Err(error) }
+        }
+    }
+
     /// The installed package interface, written where the executor (its identity) reads it.
     fn interface_file(
         &self,
@@ -3055,7 +3098,7 @@ impl Pool {
                         _ => plan.slots.iter().map(load).collect(),
                     };
                     DeviceCommand::Load {
-                    request_id: id.into(),
+                        request_id: id.into(),
                         hub: calls.and_then(|calls| calls.hub_access(id)),
                         construction: construction.clone(),
                         devices: lane.clone(),

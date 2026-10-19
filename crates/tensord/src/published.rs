@@ -195,6 +195,14 @@ impl Named {
     fn landed(mut self, machine: &Machine, source: &hub::Source) -> Result<Self, Failure> {
         let tree = self.tree()?.clone();
         let (remote, catalog) = origin::remote(machine, source, &self.repository, &self.release, &self.lane, &tree)?;
+        machine.objects(&remote, std::slice::from_ref(&tree), priority::NOW, &Stop::default())
+            .map_err(|e| catalog.reason("model_resolution_failed", e))?;
+        if machine.store().tree(&tree).is_err() {
+            machine.store().checkpoint(&tree).map_err(|e| catalog.reason("model_resolution_failed", e))?;
+            self.tree = None;
+            self.header = Some(tree);
+            return Ok(self);
+        }
         let lane = (!self.lane.is_empty()).then_some(self.lane.as_str());
         let (lane, header) = machine.variant(&remote, &tree, lane, &Stop::default()).map_err(|e| {
             let (code, message) = refused("model_resolution_failed", e);
@@ -543,7 +551,8 @@ impl Publisher {
     /// from the datacenter volume. Whatever is here moves nothing.
     fn pull(&self, source: &hub::Source, named: &Named, components: Option<&[String]>, stop: Option<&Stop>,
         bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(u64, u64), Failure> {
-        let (tree, header) = (named.tree()?, named.header()?);
+        let header = named.header()?;
+        let tree = named.tree.as_ref().unwrap_or(header);
         let (remote, catalog) = origin::remote(&self.machine, source, &named.repository, &named.release, &named.lane, tree)?;
         let stop = stop.cloned().unwrap_or_default();
         let failed = |e: Refusal| match stop.is_cancelled() {
@@ -566,7 +575,7 @@ impl Publisher {
             failed(e)
         };
         let structure = self.machine.pull(&remote, header, Some(&[]), priority::NOW, None, &stop).map_err(failed)?;
-        let pulled = Pulled { repository: named.repository.clone(), release: named.release.clone(), lane: named.lane.clone(), tree: Some(tree.clone()) };
+        let pulled = Pulled { repository: named.repository.clone(), release: named.release.clone(), lane: named.lane.clone(), tree: named.tree.clone() };
         storage::hold(&self.store, &storage::pin::model(&header.sha256), vec![header.clone()], Some(pulled.owner()))
             .map_err(io_failure)?;
         if components == Some(&[]) {
@@ -847,6 +856,82 @@ impl Publisher {
         }))
     }
 
+    fn private_metadata(&self, service: &Arc<Service>, gpu: &Pool, installation: &Installation, request: &Request, job: &Job) -> Result<(), Failure> {
+        use crate::device_executor::MetadataModel;
+        let mut models = vec![];
+        for choice in &request.choices {
+            let remote = !choice.repository.is_empty() && !choice.repository.to_ascii_lowercase().starts_with("local/");
+            if remote && choice.release.is_empty() {
+                if let Some(root) = &choice.manifest {
+                    models.push(MetadataModel { slot: choice.parameter.clone(), repo_id: choice.repository.to_ascii_lowercase(),
+                        revision: format!("sha256:{}", sha256::hex(&root.digest)), variant: choice.lane.clone() });
+                }
+            }
+            for (i, adapter) in choice.adapters.iter().enumerate() {
+                if !adapter.model.is_empty() && !adapter.model.to_ascii_lowercase().starts_with("local/") && adapter.release.is_empty() && !adapter.manifest.is_empty() {
+                    models.push(MetadataModel { slot: format!("{}:adapter:{i}", choice.parameter), repo_id: adapter.model.to_ascii_lowercase(),
+                        revision: adapter.manifest.clone(), variant: adapter.lane.clone() });
+                }
+            }
+        }
+        if models.is_empty() { return Ok(()); }
+        let cached = |model: &MetadataModel| {
+            let root = storage::held(&self.store, &model.revision).ok()?;
+            let header = match self.store.tree(&root) {
+                Ok(tree) => tree.variant((!model.variant.is_empty()).then_some(model.variant.as_str())).ok()?.1.clone(),
+                Err(_) => root,
+            };
+            self.store.checkpoint(&header).ok()
+        };
+        if models.iter().all(|model| cached(model).is_some()) { return Ok(()); }
+        if request.run.is_empty() || request.source.capability.is_none() {
+            return Err(("capability_required", "private metadata needs this request's capability".into()));
+        }
+        for model in &models {
+            if !request.source.capability.as_ref().is_some_and(|c| c.names(hub::Op::Read { model: &model.repo_id, manifest: &model.revision })) {
+                return Err(("capability_required", format!("the request cannot read {}@{}", model.repo_id, model.revision)));
+            }
+        }
+        service.engine.with_journal(|journal| journal.begin_metadata(&request.run)).map_err(io_failure)?;
+        job.stage("resolving private model metadata".into());
+        let held = service.catalog.resolve(&installation.generation).map_err(io_failure)?;
+        let reply = gpu.resolve_metadata(&held, &request.run, &request.source, models.clone(), job.stop.as_ref())
+            .map_err(|e| ("metadata_preflight_failed", e.to_string()))?;
+        if job.stop.as_ref().is_some_and(Stop::is_cancelled) { return Err(canceled()); }
+        if !reply.ok {
+            let code = match reply.code.as_str() {
+                "variant_required" => "variant_required",
+                "capability_required" => "capability_required",
+                "capability_expired" => "capability_expired",
+                "capability_refused" => "capability_refused",
+                _ => "metadata_preflight_failed",
+            };
+            return Err((code, format!("{}: {}", reply.code, reply.detail)));
+        }
+        if reply.resolved.len() != models.len() { return Err(("metadata_preflight_failed", "the Runtime omitted resolved metadata".into())); }
+        for model in &models {
+            let resolved = reply.resolved.iter().find(|r| r.slot == model.slot)
+                .ok_or(("metadata_preflight_failed", "the Runtime omitted a requested slot".to_string()))?;
+            let root = resolved.tree.as_ref().unwrap_or(&resolved.header);
+            if resolved.repo_id.to_ascii_lowercase() != model.repo_id || root.id() != model.revision
+                || resolved.revision != model.revision || (!model.variant.is_empty() && resolved.variant != model.variant) {
+                return Err(("metadata_preflight_failed", "the Runtime resolved another reference".into()));
+            }
+            self.store.checkpoint(&resolved.header).map_err(|e| ("metadata_preflight_failed", e.to_string()))?;
+            if let Some(tree) = &resolved.tree {
+                let tree = self.store.tree(tree).map_err(|e| ("metadata_preflight_failed", e.to_string()))?;
+                let (_, header) = tree.variant((!resolved.variant.is_empty()).then_some(resolved.variant.as_str()))
+                    .map_err(|e| ("metadata_preflight_failed", e.to_string()))?;
+                if header != &resolved.header { return Err(("metadata_preflight_failed", "the returned header differs from the cached tree".into())); }
+            }
+        }
+        let mut access = request.source.full_access();
+        if let Some(token) = reply.access_token { access.access_token = token.0; }
+        service.engine.with_journal(|journal| journal.complete_metadata(&request.run, &access)).map_err(io_failure)?;
+        request.source.restore_token(&access.access_token);
+        Ok(())
+    }
+
     fn work(
         &self,
         service: &Arc<Service>,
@@ -882,6 +967,7 @@ impl Publisher {
             "capability_unavailable",
             "this machine runs no functions".to_string(),
         ))?;
+        self.private_metadata(service, &gpu, &installation, request, job)?;
         let (plan, warnings) = self.model(service, &gpu, actor, &installation, request, job)?;
         Ok(Prepared {
             installation,
@@ -1740,7 +1826,10 @@ fn measured(machine: &Machine, service: &Service, source: &hub::Source, mut name
         return Ok(Named { tree: Some(tree), lane, header: Some(header), ..named });
     }
     if tree.length == 0 {
-        named.tree = Some(origin::resolve_hash(machine, source, &named.repository, &named.lane, &tree.sha256)?);
+        named.tree = Some(match storage::held(machine.store(), &tree.sha256) {
+            Ok(held) => held,
+            Err(_) => origin::resolve_hash(machine, source, &named.repository, &named.lane, &tree.sha256)?,
+        });
     }
     let named = named.landed(machine, source)?;
     let answer = json!([named.tree, named.lane, named.header]).to_string();
