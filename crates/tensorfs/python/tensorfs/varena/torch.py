@@ -652,9 +652,13 @@ class Memory:
         paths, regions = blocks_of(module), regions_of(module)
         files, host_fd = list(grant.files) or None, grant.host_fd
         ws = self.adopted.pop(grant.key, None)
+        if self.cuda and declared.fill is not None and ws is not None:
+            ws.close()
+            ws = None
         if ws is None and host_fd is not None:
             ws = self.core.adopt(self._name(grant.key), grant.ck, host_fd, files)
-            self._share(ws, grant)
+            if declared.fill is None:
+                self._share(ws, grant)
         if ws is not None and ws.regions != regions:
             ws.close()
             if grant.ck.manifest is None and not files:
@@ -666,7 +670,8 @@ class Memory:
             if host_fd is None and self.cuda and self.granted:
                 host_fd = sealed = seal(grant.ck, regions, name, files=files)
             ws = self.core.register(name, grant.ck, regions, host_fd, files)
-            self._share(ws, grant)
+            if declared.fill is None:
+                self._share(ws, grant)
         model = Model(self, ws.name, grant.key, module, ws, declared)
         if sealed is not None:
             self.deposits.append((model, sealed))

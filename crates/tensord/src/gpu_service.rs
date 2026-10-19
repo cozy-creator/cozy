@@ -3830,6 +3830,7 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "a_gpu_whose_memory_nvml_does_not_support_has_the_hosts_memory_as_its_ledgers runs it under its fake NVML"]
     fn an_integrated_gpus_ledger_is_the_hosts_memory() {
@@ -3846,6 +3847,14 @@ mod tests {
 
     /// NVML for one integrated GPU: every call the memory sampler makes, and memory info
     /// NotSupported (3), as GB10's driver answers.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn an_os_without_a_memfd_ledger_never_advertises_one() {
+        let ledger = GpuLedger::start("GPU-off", false, 0, Some(8 << 30), None,
+            Default::default(), Default::default()).unwrap();
+        assert!(ledger.is_none());
+    }
+
     #[cfg(target_os = "linux")]
     const FAKE_NVML: &str = r#"
 #include <stdio.h>
