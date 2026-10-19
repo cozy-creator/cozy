@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::ffi::{c_void, CStr};
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pyo3::buffer::PyBuffer;
@@ -229,6 +229,7 @@ pub struct PyStore {
     store: Store,
 }
 
+#[derive(Clone)]
 struct Remote {
     store: Store,
     client: FetchClient,
@@ -354,7 +355,7 @@ impl PyStore {
             Ok(Named { header, tree, name: Some(repo_id), release: version, variant: chosen })
         }).or_raise(py)?;
         let mut ck = opened(py, &self.store, named)?;
-        ck.remote = Some(remote);
+        ck.set_remote(remote);
         Ok(ck)
     }
 
@@ -389,7 +390,8 @@ impl PyStore {
 
     #[pyo3(signature = (ck, dest, variants = None))]
     fn snapshot(&self, py: Python<'_>, ck: &PyCheckpoint, dest: PathBuf, variants: Option<Vec<String>>) -> PyResult<PathBuf> {
-        let stored = ck.stored(py)?;
+        let access = ck.access(py)?;
+        let stored = &access.checkpoint;
         py.detach(|| -> Result<PathBuf, Failure> {
             let tree = match ck.named.as_ref().and_then(|n| n.tree.clone()) {
                 Some(tree) => tree,
@@ -398,7 +400,7 @@ impl PyStore {
                     self.store.admit_folder(&source)?
                 }
             };
-            if let Some(remote) = &ck.remote {
+            if let Some(remote) = &access.remote {
                 let parsed = self.store.tree(&tree)?;
                 let mut objects: Vec<ObjectRef> = parsed.repo_files().map(|(_, o)| o.clone()).collect();
                 let headers: Vec<ObjectRef> = parsed.variants().filter(|(v, _)| variants.as_ref().is_none_or(|want| want.iter().any(|w| w == v))).map(|(_, h)| h.clone()).collect();
@@ -619,7 +621,7 @@ impl PyStore {
         variant: Option<String>,
     ) -> PyResult<Vec<String>> {
         let named = named(&self.store, r#ref, variant.as_deref())?;
-        let checkpoint = r#ref.cast::<PyCheckpoint>().ok().map(|c| c.get().stored(py).cloned()).transpose()?;
+        let checkpoint = r#ref.cast::<PyCheckpoint>().ok().map(|c| c.get().stored(py)).transpose()?;
         if origin && dequantize.is_some() {
             return Err(invalid(py, "an origin keeps objects as they are: no dequantize"));
         }
@@ -671,9 +673,19 @@ impl PyStore {
 #[pyclass(name = "Checkpoint", module = "tensorfs", frozen)]
 pub struct PyCheckpoint {
     header: Header,
-    stored: Option<Checkpoint>,
+    id: Option<ObjectRef>,
     named: Option<Named>,
-    components: OnceLock<Py<PyDict>>,
+    state: Mutex<CheckpointState>,
+}
+
+struct CheckpointState {
+    access: Option<Arc<CheckpointAccess>>,
+    components: Option<Py<PyDict>>,
+    closed: bool,
+}
+
+pub(crate) struct CheckpointAccess {
+    pub(crate) checkpoint: Checkpoint,
     remote: Option<Remote>,
 }
 
@@ -703,16 +715,16 @@ pub struct PyComponent {
     /// `name -> (sha256, length)`: run data in the component's folder.
     #[pyo3(get)]
     assets: Py<PyDict>,
-    ck: Option<Py<PyCheckpoint>>,
+    ck: Option<Arc<CheckpointAccess>>,
 }
 
 #[pymethods]
 impl PyComponent {
     #[getter]
     fn path(&self, py: Python<'_>) -> PyResult<PathBuf> {
-        let checkpoint = self.ck.as_ref().ok_or_else(|| invalid(py, "a parsed header has no asset path"))?.get();
+        let checkpoint = self.ck.as_ref().ok_or_else(|| invalid(py, "a parsed header has no asset path"))?;
         checkpoint.fetch_assets(py, &self.name, None)?;
-        let ck = checkpoint.stored(py)?;
+        let ck = &checkpoint.checkpoint;
         py.detach(|| ck.component_path(&self.name)).or_raise(py)
     }
     /// Asset `name`'s bytes; a parsed header has none.
@@ -720,9 +732,9 @@ impl PyComponent {
         let Some(ck) = &self.ck else {
             return Err(raise(py, Failure { kind: Kind::Unsupported, detail: "a parsed header has no assets here".into() }));
         };
-        let checkpoint = ck.get();
+        let checkpoint = ck;
         checkpoint.fetch_assets(py, &self.name, Some(&name))?;
-        let ck = checkpoint.stored(py)?;
+        let ck = &checkpoint.checkpoint;
         let bytes = py.detach(|| ck.asset(&self.name, &name)).or_raise(py)?;
         Ok(PyBytes::new(py, &bytes))
     }
@@ -824,12 +836,47 @@ pub(crate) struct FetchTensor<'a> {
 
 impl PyCheckpoint {
     fn new(header: Header, stored: Option<Checkpoint>, named: Option<Named>) -> PyCheckpoint {
-        PyCheckpoint { header, stored, named, components: OnceLock::new(), remote: None }
+        let id = stored.as_ref().map(|ck| ck.id().clone());
+        let access = stored.map(|checkpoint| Arc::new(CheckpointAccess { checkpoint, remote: None }));
+        PyCheckpoint { header, id, named, state: Mutex::new(CheckpointState { access, components: None, closed: false }) }
     }
 
+    fn set_remote(&mut self, remote: Remote) {
+        let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
+        let access = Arc::get_mut(state.access.as_mut().expect("a newly opened checkpoint")).expect("not exposed to Python yet");
+        access.remote = Some(remote);
+    }
+
+    pub(crate) fn access(&self, py: Python<'_>) -> PyResult<Arc<CheckpointAccess>> {
+        let (closed, access) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (state.closed, state.access.clone())
+        };
+        if closed { return Err(invalid(py, "the checkpoint is closed")); }
+        access.ok_or_else(|| raise(py, Failure { kind: Kind::Unsupported,
+            detail: "a parsed header has no store: its chunks and assets are not here".into() }))
+    }
+
+    fn ensure_open(&self, py: Python<'_>) -> PyResult<()> {
+        let closed = self.state.lock().unwrap_or_else(|e| e.into_inner()).closed;
+        if closed { Err(invalid(py, "the checkpoint is closed")) } else { Ok(()) }
+    }
+
+    pub(crate) fn stored(&self, py: Python<'_>) -> PyResult<Checkpoint> {
+        Ok(self.access(py)?.checkpoint.clone())
+    }
+
+    fn tensor_dict(&self, py: Python<'_>, c: &tensorfs_core::format::Component) -> PyResult<Py<PyDict>> {
+        let tensors = PyDict::new(py);
+        for t in &c.tensors { tensors.set_item(&t.key, Py::new(py, info(py, t)?)?)?; }
+        Ok(tensors.unbind())
+    }
+}
+
+impl CheckpointAccess {
     pub(crate) fn fetch_components(&self, py: Python<'_>, components: Option<&[String]>, priority: u64) -> PyResult<()> {
         if let Some(remote) = &self.remote {
-            let objects = tensorfs_core::store2::wanted(&self.header, components).or_raise(py)?;
+            let objects = tensorfs_core::store2::wanted(self.checkpoint.header(), components).or_raise(py)?;
             py.detach(|| remote.fetch(&objects, priority)).or_raise(py)?;
         }
         Ok(())
@@ -837,7 +884,7 @@ impl PyCheckpoint {
 
     pub(crate) fn fetch_tensors(&self, py: Python<'_>, component: &str, reads: &[FetchTensor]) -> PyResult<()> {
         let Some(remote) = &self.remote else { return Ok(()) };
-        let ck = self.stored(py)?;
+        let ck = &self.checkpoint;
         let mut objects = BTreeMap::new();
         for read in reads {
             let tensor = ck.tensor(component, read.key).or_raise(py)?;
@@ -850,9 +897,9 @@ impl PyCheckpoint {
                     return Err(invalid(py, format!("{component}/{}: range {range:?} exceeds {}", read.key, at.length)));
                 }
                 let mut offset = 0;
-                for span in self.header.spans(&at) {
+                for span in self.checkpoint.header().spans(&at) {
                     if offset < range.end && offset + span.length > range.start {
-                        let object = &self.header.chunks[span.chunk];
+                        let object = &self.checkpoint.header().chunks[span.chunk];
                         objects.insert(object.sha256.clone(), object.clone());
                     }
                     offset += span.length;
@@ -868,7 +915,7 @@ impl PyCheckpoint {
     }
 
     fn fetch_assets(&self, py: Python<'_>, component: &str, name: Option<&str>) -> PyResult<()> {
-        let component = self.header.component(component).ok_or_else(|| invalid(py, "no such component"))?;
+        let component = self.checkpoint.header().component(component).ok_or_else(|| invalid(py, "no such component"))?;
         let objects: Vec<_> = match name {
             Some(name) => vec![component.assets.get(name).ok_or_else(|| invalid(py, "no such asset"))?.clone()],
             None => component.assets.values().cloned().collect(),
@@ -879,31 +926,51 @@ impl PyCheckpoint {
         Ok(())
     }
 
-    /// The store's checkpoint behind it; a parsed header has none.
-    pub(crate) fn stored(&self, py: Python<'_>) -> PyResult<&Checkpoint> {
-        match &self.stored {
-            Some(ck) => Ok(ck),
-            None => Err(raise(
-                py,
-                Failure {
-                    kind: Kind::Unsupported,
-                    detail: "a parsed header has no store: its chunks and assets are not here".into(),
-                },
-            )),
-        }
-    }
-
-    fn tensor_dict(&self, py: Python<'_>, c: &tensorfs_core::format::Component) -> PyResult<Py<PyDict>> {
-        let tensors = PyDict::new(py);
-        for t in &c.tensors {
-            tensors.set_item(&t.key, Py::new(py, info(py, t)?)?)?;
-        }
-        Ok(tensors.unbind())
-    }
 }
 
 #[pymethods]
 impl PyCheckpoint {
+    fn close(&self) {
+        let released = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.closed = true;
+            (state.access.take(), state.components.take())
+        };
+        drop(released);
+    }
+
+    fn __enter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyCheckpoint>> {
+        slf.get().ensure_open(slf.py())?;
+        Ok(slf.clone().unbind())
+    }
+
+    fn __exit__(&self, exc_type: &Bound<'_, PyAny>, exc_value: &Bound<'_, PyAny>, traceback: &Bound<'_, PyAny>) {
+        let _ = (exc_type, exc_value, traceback);
+        self.close();
+    }
+
+    fn verify(&self, py: Python<'_>) -> PyResult<Vec<(String, u64)>> {
+        let checkpoint = self.stored(py)?;
+        let bad = py.detach(|| checkpoint.verify()).or_raise(py)?;
+        Ok(bad.into_iter().map(|o| (o.sha256, o.length)).collect())
+    }
+
+    fn open_chunk(&self, py: Python<'_>, index: usize) -> PyResult<i32> {
+        let access = self.access(py)?;
+        let object = access.checkpoint.header().chunks.get(index).ok_or_else(|| invalid(py, format!("no chunk {index}")))?;
+        if let Some(remote) = &access.remote { py.detach(|| remote.fetch(std::slice::from_ref(object), 0)).or_raise(py)?; }
+        let file = py.detach(|| access.checkpoint.chunk(index)).or_raise(py)?;
+        #[cfg(unix)]
+        { Ok(std::os::fd::IntoRawFd::into_raw_fd(file)) }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsRawHandle, IntoRawHandle};
+            let fd = py.import("msvcrt")?.call_method1("open_osfhandle", (file.as_raw_handle() as usize, 0x8000))?.extract()?;
+            let _ = file.into_raw_handle();
+            Ok(fd)
+        }
+    }
+
     /// A `cozytensors/1` header's pipeline, components and metadata, with no store behind them.
     #[staticmethod]
     fn parse(py: Python<'_>, header: &[u8]) -> PyResult<PyCheckpoint> {
@@ -914,12 +981,12 @@ impl PyCheckpoint {
     /// `sha256:<hex>` of the header: the cozytensors' id. None for a parsed header.
     #[getter]
     fn id(&self) -> Option<String> {
-        self.stored.as_ref().map(|ck| ck.id().id())
+        self.id.as_ref().map(ObjectRef::id)
     }
 
     #[getter]
     fn header_ref(&self) -> Option<(String, u64)> {
-        self.stored.as_ref().map(|ck| (ck.id().sha256.clone(), ck.id().length))
+        self.id.as_ref().map(|id| (id.sha256.clone(), id.length))
     }
     #[getter]
     fn tree_ref(&self) -> Option<(String, u64)> {
@@ -950,8 +1017,9 @@ impl PyCheckpoint {
     fn revision(&self) -> Option<&str> { self.release() }
     #[getter]
     fn path(&self, py: Python<'_>) -> PyResult<PathBuf> {
-        self.fetch_components(py, None, 0)?;
-        let ck = self.stored(py)?;
+        let access = self.access(py)?;
+        access.fetch_components(py, None, 0)?;
+        let ck = &access.checkpoint;
         py.detach(|| ck.path_for(self.variant().unwrap_or(""))).or_raise(py)
     }
 
@@ -964,30 +1032,29 @@ impl PyCheckpoint {
 
     /// `components[name] -> Component`, in construction order.
     #[getter]
-    fn components(slf: &Bound<'_, Self>) -> PyResult<Py<PyDict>> {
-        let py = slf.py();
-        let this = slf.get();
-        if let Some(c) = this.components.get() {
-            return Ok(c.clone_ref(py));
-        }
+    fn components(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let access = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.closed { drop(state); return Err(invalid(py, "the checkpoint is closed")); }
+            if let Some(components) = &state.components { return Ok(components.clone_ref(py)); }
+            state.access.clone()
+        };
         let out = PyDict::new(py);
-        for c in this.header.components() {
+        for c in self.header.components() {
             let assets = PyDict::new(py);
-            for (name, o) in &c.assets {
-                assets.set_item(name, (o.sha256.clone(), o.length))?;
-            }
+            for (name, o) in &c.assets { assets.set_item(name, (o.sha256.clone(), o.length))?; }
             let component = PyComponent {
-                name: c.name.clone(),
-                cls: c.class.clone(),
-                config: config_dict(py, &c.config)?.unbind(),
+                name: c.name.clone(), cls: c.class.clone(), config: config_dict(py, &c.config)?.unbind(),
                 config_file: c.config_file.clone().unwrap_or_else(|| "config.json".into()),
-                tensors: Py::new(py, PyTensors::new(&c.name, this.tensor_dict(py, c)?, this.stored.is_some().then(|| slf.clone().unbind())))?,
-                assets: assets.unbind(),
-                ck: this.stored.is_some().then(|| slf.clone().unbind()),
+                tensors: Py::new(py, PyTensors::new(&c.name, self.tensor_dict(py, c)?, access.clone()))?,
+                assets: assets.unbind(), ck: access.clone(),
             };
             out.set_item(&c.name, Py::new(py, component)?)?;
         }
-        Ok(this.components.get_or_init(|| out.unbind()).clone_ref(py))
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed { drop(state); return Err(invalid(py, "the checkpoint is closed")); }
+        let components = state.components.get_or_insert_with(|| out.unbind());
+        Ok(components.clone_ref(py))
     }
 
     /// The header's chunks, in order: `(sha256, length)` (`Part.chunk` indexes them).
@@ -1016,7 +1083,7 @@ impl PyCheckpoint {
     #[pyo3(signature = (components = None, *, priority = 0, progress = None))]
     fn fetch(&self, py: Python<'_>, components: Option<Vec<String>>, priority: u64, progress: Option<Py<PyAny>>) -> PyResult<()> {
         let _ = progress;
-        self.fetch_components(py, components.as_deref(), priority)
+        self.access(py)?.fetch_components(py, components.as_deref(), priority)
     }
 
     /// The header's loading metadata (`source`, `filled`, `safetensors_metadata`).
@@ -1323,13 +1390,13 @@ impl PyWriter {
         let (store, w) = py.detach(|| -> Result<_, Failure> {
             let store = Store::open(&root)?;
             let w = match (&dest, &repo_id, endpoint) {
-                (Some(dest), _, _) => Writer::folder(dest, variant.as_deref().unwrap_or(""), base, resume.is_some())?,
+                (Some(dest), _, _) => Writer::folder(dest, variant.as_deref().unwrap_or(""), base.as_ref(), resume.is_some())?,
                 (_, Some(name), Some(endpoint)) => {
                     let runtime = fetch::runtime()?;
                     let stream = Arc::new(fetch::Stream::new(endpoint, runtime.handle().clone()));
-                    store.streaming_writer(stream, name, variant.as_deref().unwrap_or(""), base)?
+                    store.streaming_writer(stream, name, variant.as_deref().unwrap_or(""), base.as_ref())?
                 }
-                _ => store.writer(base, resume.as_deref())?,
+                _ => store.writer(base.as_ref(), resume.as_deref())?,
             };
             Ok((store, w))
         }).or_raise(py)?;
@@ -1448,8 +1515,10 @@ pub struct PyComponentWriter {
 impl PyComponentWriter {
     #[pyo3(signature = (key, source, as_key = None))]
     fn copy_component(&self, py: Python<'_>, key: String, source: &PyComponent, as_key: Option<String>) -> PyResult<()> {
-        let ck = source.ck.as_ref().ok_or_else(|| invalid(py, "a parsed component has no bytes"))?.get();
-        self.copy(py, as_key.unwrap_or_else(|| key.clone()), ck, Some(source.name.clone()), Some(key))
+        let access = source.ck.as_ref().ok_or_else(|| invalid(py, "a parsed component has no bytes"))?;
+        access.fetch_tensors(py, &source.name, &[FetchTensor { key: &key, role: None, range: None }])?;
+        let into = as_key.unwrap_or_else(|| key.clone());
+        self.w.get().with(py, |w| Ok(w.get(&self.name).copy_as(&into, &access.checkpoint, &source.name, &key)?))
     }
     /// A CPU DLPack array, or a buffer with an explicit dtype and shape.
     #[pyo3(signature = (key, data, *, dtype = None, shape = None))]
@@ -1561,7 +1630,7 @@ impl PyComponentWriter {
         let from = source.stored(py)?;
         let fc = from_component.unwrap_or_else(|| self.name.clone());
         let fk = from_key.unwrap_or_else(|| key.clone());
-        self.w.get().with(py, |w| Ok(w.get(&self.name).copy_as(&key, from, &fc, &fk)?))
+        self.w.get().with(py, |w| Ok(w.get(&self.name).copy_as(&key, &from, &fc, &fk)?))
     }
 
     /// Run data in the component's folder (`tokenizer.json`), by its path there.
