@@ -2,7 +2,7 @@
 """`tensorfs.varena.cuts` on the CPU, through real torch and diffusers modules (xs-046 B3).
 
 The device is a `Card`: a dispatch mode below the catch's layer under which any op whose new
-results exceed `limit` bytes runs out of memory, as a GPU allocator does; its `Room` raises the
+results exceed `limit` bytes runs out of memory, as a GPU allocator does; its `Rungs` raise the
 limit when rungs 1-2 or rung 4 run. Every cut is checked against the same call run whole
 (float64, so a cut's rounding shows), and every warm run against its first:
 
@@ -91,14 +91,14 @@ class Card(TorchDispatchMode):
         return out
 
 
-class Room:
+class Rungs:
     """The card's memory: rungs 1-2 free `frees` bytes once, rung 4 `lowers` steps of `step`."""
 
     def __init__(self, card: Card, frees: int = 0, lowers: int = 0, step: int = 0) -> None:
         self.card, self.frees, self.lowers, self.step = card, frees, lowers, step
         self.made = self.lowered = 0
 
-    def make(self, device: torch.device, need: int) -> bool:
+    def free(self, device: torch.device, need: int) -> bool:
         self.made += 1
         self.card.limit += self.frees
         freed, self.frees = self.frees, 0
@@ -121,9 +121,9 @@ class Room:
 
 def fresh(
     limit: int, only: frozenset[str] = frozenset(), **room: int
-) -> tuple[cuts.Memo, Card, Room]:
+) -> tuple[cuts.Memo, Card, Rungs]:
     memo, card = cuts.Memo(), Card(limit, only)
-    served = Room(card, **room)
+    served = Rungs(card, **room)
     cuts.serve(memo, served)
     return memo, card, served
 
@@ -420,20 +420,40 @@ def vae_decode() -> None:
 # ----------------------------------------------------------------------- the catch
 
 
+class Counter:
+    """State a block changes inside an object it holds, which no attribute scan sees."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.seen: list[int] = []
+
+
 class Noisy(nn.Module):
     """A block that draws noise and counts its calls (declared state), writing nothing else."""
 
     def __init__(self) -> None:
         super().__init__()
         self.lin = nn.Linear(32, 256)
-        self.calls = 0
-        self.seen: list[int] = []
+        self.counter = Counter()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self.calls += 1
-        self.seen.append(self.calls)
+        self.counter.calls += 1
+        self.counter.seen.append(self.counter.calls)
         noise = torch.randn(x.shape[0], 256)
         return (self.lin(x) + noise).relu().sum(-1, keepdim=True) * torch.ones(1, 32)
+
+
+class Stepping(nn.Module):
+    """A block that counts its own steps in a plain attribute (HiDiffusion's)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lin = nn.Linear(32, 256)
+        self.step = 0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.step += 1
+        return self.lin(x) * self.step
 
 
 class Writer(nn.Module):
@@ -447,7 +467,9 @@ def block_catch() -> None:
     x = torch.randn(64, 32)
     torch.manual_seed(7)
     whole, _ = measured(lambda: block(x))
-    there = cuts.Site(("noisy", 0), CPU, cuts.Track("noisy"), block, ("calls", "seen"))
+    there = cuts.Site(
+        ("noisy", 0), CPU, cuts.Track("noisy"), block, block, ("counter.calls", "counter.seen")
+    )
     memo, card, room = fresh(1 << 60)
     with torch.no_grad():
         torch.manual_seed(7)
@@ -464,7 +486,7 @@ def block_catch() -> None:
         cuts.enter()
         try:
             torch.manual_seed(7)
-            block.calls, block.seen = 0, []
+            block.counter = Counter()
             out = cuts.run(there, block.forward, (x,), {})
         finally:
             cuts.leave()
@@ -475,13 +497,28 @@ def block_catch() -> None:
     )
     check(
         "its generator and declared state were put back",
-        block.calls == 1 and block.seen == [1],
-        (block.calls, block.seen),
+        block.counter.calls == 1 and block.counter.seen == [1],
+        (block.counter.calls, block.counter.seen),
     )
     check(
         "one retry, room made once",
         memo.retries == 1 and room.made == 1 and card.refused == 1,
         (memo.retries, room.made, card.refused),
+    )
+
+    stepping = Stepping().eval()
+    there = cuts.Site(("stepping", 0), CPU, cuts.Track("stepping"), stepping)
+    memo, card, room = fresh(1 << 60, frees=1 << 40)
+    with torch.no_grad():
+        cuts.run(there, stepping.forward, (x,), {})
+        bare = memo.blocks[("stepping", 0)].bare
+        card.limit = 64 * 256 * 8
+        with card:
+            cuts.run(there, stepping.forward, (x,), {})
+    check(
+        "a block that changes its own attribute is no bare block: an op runs again, never it",
+        not bare and stepping.step == 2 and card.refused == 1 and memo.retries == 1,
+        (bare, stepping.step, card.refused, memo.retries),
     )
 
     memo, card, room = fresh(1 << 60)

@@ -56,10 +56,10 @@ _ALLOC_FAILED = (
 _FFN = frozenset({"FeedForward", "GELU", "GEGLU", "SwiGLU", "ApproximateGELU", "LinearActivation"})
 
 
-class Room(Protocol):
-    """The memory's side of the catch (`torch.Memory`)."""
+class Rungs(Protocol):
+    """The memory's side of the catch (`torch.Memory`): §5.2's rungs."""
 
-    def make(self, device: torch.device, need: int) -> bool:
+    def free(self, device: torch.device, need: int) -> bool:
         """Rungs 1-2: idle bytes, then cold weights, until `need` bytes are free."""
         ...
 
@@ -74,10 +74,10 @@ class Room(Protocol):
     def exhausted(self, device: torch.device, need: int, op: str) -> Exception: ...
 
 
-class _NoRoom:
+class _NoRungs:
     """No memory serves this process: cuts still cut, nothing is freed."""
 
-    def make(self, device: torch.device, need: int) -> bool:
+    def free(self, device: torch.device, need: int) -> bool:
         return False
 
     def lower(self, device: torch.device, need: int) -> bool:
@@ -155,12 +155,13 @@ class Track:
 
 @dataclass(eq=False, slots=True)
 class Site:
-    """One block for the catch: its memo key, device, model's track and declared state (attribute
-    paths under `root` put back before a bare block runs again)."""
+    """One block for the catch: its memo key, device, model's track, its module, and declared
+    state (attribute paths under `root` put back before a bare block runs again)."""
 
     key: tuple[str, int]
     device: torch.device
     track: Track
+    block: nn.Module | None = None
     root: nn.Module | None = None
     state: tuple[str, ...] = ()
 
@@ -168,15 +169,15 @@ class Site:
 @dataclass(slots=True)
 class _Served:
     memo: Memo
-    room: Room
+    rungs: Rungs
 
 
-_served = _Served(Memo(), _NoRoom())
+_served = _Served(Memo(), _NoRungs())
 
 
-def serve(memo: Memo, room: Room) -> None:
-    """The process's memory: its memo and room serve every catch and cut from now on."""
-    _served.memo, _served.room = memo, room
+def serve(memo: Memo, rungs: Rungs) -> None:
+    """The process's memory: its memo and rungs serve every catch and cut from now on."""
+    _served.memo, _served.rungs = memo, rungs
 
 
 @dataclass(eq=False, slots=True)
@@ -296,6 +297,7 @@ def _observed(
     site: Site, forward: Callable[..., object], args: Sequence[object], kwargs: Mapping[str, object]
 ) -> object:
     journal = _Journal()
+    before = _attributes(site.block)
     with _layered() as layer:
         banded = layer.banded
         layer.journals.append(journal)
@@ -303,7 +305,8 @@ def _observed(
             out = forward(*args, **kwargs)
         finally:
             layer.journals.remove(journal)
-    bare = not journal.wrote and layer.banded == banded
+    changed = before != _attributes(site.block)  # a step counter: it must never run twice
+    bare = not journal.wrote and not changed and layer.banded == banded
     _served.memo.blocks[site.key] = Facts(bare, tuple(journal.generators.values()))
     return out
 
@@ -330,7 +333,7 @@ def _bare(
     for generator, state in states:
         generator.set_state(state)
     _put(kept)
-    _served.room.make(site.device, (need or 0) + SLACK)
+    _served.rungs.free(site.device, (need or 0) + SLACK)
     with _layered() as layer:
         banded = layer.banded
         out = forward(*args, **kwargs)
@@ -389,6 +392,23 @@ def _unlayered() -> Iterator[None]:
 
 
 _MISSING = object()
+_PLAIN = (int, float, bool, str, bytes, type(None))
+
+
+def _attributes(module: nn.Module | None) -> dict[tuple[int, str], object]:
+    """A module tree's plain attributes, tensors held by identity and public lists and dicts
+    (their items by identity): what a forward may change that no op shows."""
+    found: dict[tuple[int, str], object] = {}
+    for m in module.modules() if module is not None else ():
+        for name, value in vars(m).items():
+            if isinstance(value, _PLAIN):
+                found[(id(m), name)] = (type(value), value)
+            elif isinstance(value, Tensor):
+                found[(id(m), name)] = id(value)
+            elif not name.startswith("_") and isinstance(value, list | dict):
+                items = value.values() if isinstance(value, dict) else value
+                found[(id(m), name)] = (id(value), tuple(map(id, items)))
+    return found
 
 
 def _take(root: nn.Module, paths: Sequence[str]) -> list[tuple[object, str, object, object]]:
@@ -535,7 +555,7 @@ class Layer(TorchDispatchMode):
         need: int,
         states: Sequence[tuple[torch.Generator, Tensor]],
     ) -> object:
-        memo, room = _served.memo, _served.room
+        memo, rungs = _served.memo, _served.rungs
 
         def again() -> object:
             for generator, state in states:
@@ -543,7 +563,7 @@ class Layer(TorchDispatchMode):
             return func(*args, **kwargs)
 
         memo.retries += 1
-        room.make(device, need + SLACK)
+        rungs.free(device, need + SLACK)
         ok, out, need = _attempt(again)
         if ok:
             return out
@@ -552,19 +572,19 @@ class Layer(TorchDispatchMode):
             raise Finer(scope, need)
         if trait.rule is not None and (plan := trait.rule(func, args, kwargs)) is not None:
             return self._banded(func, plan, _op_key(func, args, kwargs), 0)
-        while room.lower(device, need + SLACK):
+        while rungs.lower(device, need + SLACK):
             memo.retries += 1
             ok, out, need = _attempt(again)
             if ok:
                 return out
-        raise room.exhausted(device, need, str(func))
+        raise rungs.exhausted(device, need, str(func))
 
     def _banded(self, func: OpOverload, plan: _Plan, key: tuple[object, ...], size: int) -> object:
         """The op in bands of `size` rows (0: as many as the room holds, at most half), into
         its whole result on the device; rows halve while a band runs out, down to `align`."""
-        memo, room, device, align = _served.memo, _served.room, plan.device, plan.align
+        memo, rungs, device, align = _served.memo, _served.rungs, plan.device, plan.align
         if not size:
-            fits = room.available(device) // max(2 * plan.per_row, 1)
+            fits = rungs.available(device) // max(2 * plan.per_row, 1)
             size = min(plan.height // 2, fits) if fits else plan.height // 2
         size = max(align, size // align * align)
         name = f"{func.overloadpacket.__name__} rows"
@@ -592,20 +612,20 @@ def _shrinking[T](
 ) -> tuple[int, T]:
     """`step(size)` until it fits: room made, then half the rows down to `align`, then the
     hot watermark lower."""
-    memo, room = _served.memo, _served.room
+    memo, rungs = _served.memo, _served.rungs
     made = False
     while True:
         ok, out, need = _attempt(functools.partial(step, size))
         if ok:
             return size, out  # type: ignore[return-value]
         memo.retries += 1
-        room.make(device, need + SLACK)
+        rungs.free(device, need + SLACK)
         if size > align:
             size = max(align, size // 2 // align * align)
         elif not made:
             made = True
-        elif not room.lower(device, need + SLACK):
-            raise room.exhausted(device, need, name)
+        elif not rungs.lower(device, need + SLACK):
+            raise rungs.exhausted(device, need, name)
 
 
 def _storage(t: Tensor) -> int:
@@ -927,7 +947,7 @@ def _cut[T](
     """`run(size)`: the call in pieces of at most `size` units of `total`. Up front at the
     memo's size; out of memory (its own, or an op's ask), room is made and it runs again once,
     then at each smaller size down to `finest`, past which the failure is its caller's."""
-    memo, room = _served.memo, _served.room
+    memo, rungs = _served.memo, _served.rungs
     size = min(memo.sizes.get(key, total), total)
     scope = _Scope()
     scopes = _local.scopes
@@ -956,12 +976,12 @@ def _cut[T](
                 return out
             memo.retries += 1
             if not made:
-                room.make(device, need + SLACK)
+                rungs.free(device, need + SLACK)
                 if fresh:
                     fresh = False
                     continue
             smaller = shrink(size)
-            if per_unit and size == total and (fits := room.available(device) // per_unit):
+            if per_unit and size == total and (fits := rungs.available(device) // per_unit):
                 smaller = max(min(smaller, fits), finest)
             size, fresh = smaller, False
     finally:
