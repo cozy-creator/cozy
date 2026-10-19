@@ -922,7 +922,7 @@ fn a_tiny_hf_sdxl_imports_end_to_end() {
         for (key, t) in &g.tensors {
             let (dtype, shape, bytes) = &out.tensors[&(g.folder.clone(), key.clone())];
             let mut want = vec![0u8; bytes.len()];
-            std::os::unix::fs::FileExt::read_exact_at(
+            cozy_platform::durable::FileAt::read_exact_at(
                 &fs::File::open(&set.files[t.file]).unwrap(),
                 &mut want,
                 t.start,
@@ -1145,7 +1145,7 @@ fn h3_native_real_bytes_equal_the_diffusers_packaging() {
         );
         let bytes =
             import::remote::read_range(&member(&shard), t.start, t.start + len, &access).unwrap();
-        std::os::unix::fs::FileExt::write_all_at(
+        cozy_platform::durable::FileAt::write_all_at(
             &fs::File::options().write(true).open(path).unwrap(),
             &bytes,
             t.start,
