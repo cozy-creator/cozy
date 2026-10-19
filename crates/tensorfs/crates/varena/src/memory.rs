@@ -5,11 +5,13 @@
 //! stream; consumers wait on events, the host never syncs.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
 #[cfg(feature = "store")]
 use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(feature = "store")]
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::RawFd;
+use std::os::unix::net::UnixStream;
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -304,6 +306,8 @@ impl Staging {
 struct Chunk {
     handle: Handle,
     size: u64,
+    /// One region's whole allocation, which another process may hold by fd: never reused.
+    shared: bool,
 }
 
 /// Chunks mapped at `va`, the fill that put bytes there, and the pins on them.
@@ -317,6 +321,11 @@ struct Mapping {
     fresh: bool,
     pins: u32,
     released: Vec<EvRef>,
+    /// Kept pages: a socket whose queue holds the allocation's fd, a dup of which TensorD holds,
+    /// so the pages outlive this process. Unmapping drains it; only our death leaves it full.
+    kept: Option<UnixStream>,
+    /// `kept` was handed out (`WeightSet::kept`).
+    deposited: bool,
 }
 
 impl Mapping {
@@ -364,6 +373,8 @@ struct Set {
     used: u64,
     warm: bool,
     busy: bool,
+    /// Home regions map as one shareable allocation each, whose pages can be kept.
+    shared: bool,
 }
 
 impl Set {
@@ -451,6 +462,8 @@ struct Inner {
     ordinal: i32,
     ctx: CUcontext,
     prop: AllocationProp,
+    /// Allocations exportable as POSIX fds, where the device supports them.
+    shared: Option<AllocationProp>,
     chunk: u64,
     events: Arc<Events>,
     copy: CUstream,
@@ -480,7 +493,9 @@ impl Gpu {
         if cuda::attribute(dev, cuda::ATTR_VMM_SUPPORTED)? != 1 {
             return Err(Error::Invalid(format!("device {ordinal} has no virtual memory management")));
         }
-        let prop = AllocationProp::device(dev);
+        let prop = AllocationProp::device(dev, cuda::MEM_HANDLE_TYPE_NONE);
+        let fds = cuda::attribute(dev, cuda::ATTR_POSIX_FD_SUPPORTED)? == 1;
+        let shared = fds.then(|| AllocationProp::device(dev, cuda::MEM_HANDLE_TYPE_POSIX_FD));
         let mut g = 0usize;
         call!("cuMemGetAllocationGranularity", mem_get_allocation_granularity(&mut g, &prop, cuda::MEM_GRANULARITY_MINIMUM))?;
         if g == 0 || !REGION_ALIGN.is_multiple_of(g as u64) {
@@ -498,6 +513,7 @@ impl Gpu {
             ordinal,
             ctx,
             prop,
+            shared,
             chunk,
             events: Arc::new(Events { ctx, free: Mutex::default() }),
             copy: s,
@@ -530,7 +546,7 @@ impl Gpu {
         let regs = weights.layout.regions.iter().map(|_| Reg { home: true, map: None }).collect();
         let (w, z) = (weights.clone(), Counters::default());
         let mut st = g.lock();
-        st.sets.push(Some(Set { w, base, regs, step: z, last: z, total: z, used: 0, warm: true, busy: false }));
+        st.sets.push(Some(Set { w, base, regs, step: z, last: z, total: z, used: 0, warm: true, busy: false, shared: false }));
         Ok(Arc::new(WeightSet { gpu: self.clone(), id: st.sets.len() - 1, base, weights }))
     }
 
@@ -772,11 +788,11 @@ impl Inner {
     }
 
     /// A new chunk, releasing idle chunks first if the device is full; None if it still is.
-    fn create(&self, st: &mut State, size: u64) -> Result<Option<Handle>> {
+    fn create(&self, st: &mut State, size: u64, prop: &AllocationProp) -> Result<Option<Handle>> {
         let mut h: Handle = 0;
         loop {
             // SAFETY: out-param; device memory of our context's device.
-            match unsafe { (cuda::driver()?.mem_create)(&mut h, size as usize, &self.prop, 0) } {
+            match unsafe { (cuda::driver()?.mem_create)(&mut h, size as usize, prop, 0) } {
                 cuda::SUCCESS => return Ok(Some(h)),
                 cuda::ERROR_OUT_OF_MEMORY if st.idle_bytes() > 0 => {
                     self.keep_idle(st, 0)?;
@@ -787,17 +803,20 @@ impl Inner {
         }
     }
 
-    /// Maps `span` bytes at `va`, idle chunks first; a refusal is `DeviceFull` with nothing mapped.
-    fn map(&self, st: &mut State, va: u64, span: u64) -> Result<Mapping> {
+    /// Maps `span` bytes at `va`, idle chunks first, or (`shared`) as one exportable allocation;
+    /// a refusal is `DeviceFull` with nothing mapped.
+    fn map(&self, st: &mut State, va: u64, span: u64, shared: bool) -> Result<Mapping> {
         let mut m = Mapping { va, ..Default::default() };
+        let prop = self.shared.filter(|_| shared);
         let mapped = (|| {
             while m.span < span {
-                let size = self.chunk.min(span - m.span);
-                let handle = match st.idle.get_mut(&size).and_then(Vec::pop) {
+                let size = if prop.is_some() { span } else { self.chunk.min(span - m.span) };
+                let idle = if prop.is_none() { st.idle.get_mut(&size).and_then(Vec::pop) } else { None };
+                let handle = match idle {
                     Some(h) => h,
-                    None => self.create(st, size)?.ok_or(Error::DeviceFull { need: span, deficit: span - m.span })?,
+                    None => self.create(st, size, prop.as_ref().unwrap_or(&self.prop))?.ok_or(Error::DeviceFull { need: span, deficit: span - m.span })?,
                 };
-                m.chunks.push(Chunk { handle, size });
+                m.chunks.push(Chunk { handle, size, shared: prop.is_some() });
                 call!("cuMemMap", mem_map(va + m.span, size as usize, 0, handle, 0))?;
                 m.span += size;
             }
@@ -808,25 +827,51 @@ impl Inner {
             if m.span > 0 {
                 call!("cuMemUnmap", mem_unmap(va, m.span as usize))?;
             }
-            self.give_back(st, m.chunks);
+            self.give_back(st, m.chunks)?;
             return Err(e);
         }
         st.mapped += span;
         Ok(m)
     }
 
-    /// Unmaps a mapping nothing in flight touches; its chunks go idle.
+    /// Imports kept pages `fd` and maps them at `va`; the handle, or nothing mapped.
+    fn import(&self, va: u64, span: u64, fd: &OwnedFd) -> Result<Handle> {
+        let mut h: Handle = 0;
+        call!("cuMemImportFromShareableHandle", mem_import(&mut h, fd.as_raw_fd() as usize as *mut c_void, cuda::MEM_HANDLE_TYPE_POSIX_FD))?;
+        let desc = AccessDesc { location: self.prop.location, flags: cuda::MEM_ACCESS_PROT_READWRITE };
+        let mapped = call!("cuMemMap", mem_map(va, span as usize, 0, h, 0));
+        let access = match &mapped {
+            Ok(()) => call!("cuMemSetAccess", mem_set_access(va, span as usize, &desc, 1)),
+            Err(e) => Err(e.clone()),
+        };
+        if let Err(e) = access {
+            if mapped.is_ok() {
+                call!("cuMemUnmap", mem_unmap(va, span as usize))?;
+            }
+            call!("cuMemRelease", mem_release(h))?;
+            return Err(e);
+        }
+        Ok(h)
+    }
+
+    /// Unmaps a mapping nothing in flight touches; its chunks go idle, its kept pages too.
     fn unmap(&self, st: &mut State, m: Mapping) -> Result<()> {
         call!("cuMemUnmap", mem_unmap(m.va, m.span as usize))?;
         st.mapped -= m.span;
-        self.give_back(st, m.chunks);
-        Ok(())
+        if let Some(kept) = &m.kept {
+            drop(cozy_platform::handles::recv_fd(kept)); // empty: TensorD already let it go
+        }
+        self.give_back(st, m.chunks)
     }
 
-    fn give_back(&self, st: &mut State, chunks: Vec<Chunk>) {
+    fn give_back(&self, st: &mut State, chunks: Vec<Chunk>) -> Result<()> {
         for c in chunks {
-            st.idle.entry(c.size).or_default().push(c.handle);
+            match c.shared {
+                true => call!("cuMemRelease", mem_release(c.handle))?,
+                false => st.idle.entry(c.size).or_default().push(c.handle),
+            }
         }
+        Ok(())
     }
 
     /// Unmaps quiet home regions of set `id` (all when None) until `budget`; returns the bytes.
@@ -872,7 +917,7 @@ impl Inner {
             }
         }
         let va = reserve_va(span)?;
-        let m = self.map(st, va, span).inspect_err(|_| drop(free_va(va, span)))?;
+        let m = self.map(st, va, span, false).inspect_err(|_| drop(free_va(va, span)))?;
         let slot = Some(Slot { m, holds: None, pending: false, used: 0 });
         match st.slots.iter().position(Option::is_none) {
             Some(i) => st.slots[i] = slot,
@@ -924,7 +969,8 @@ impl Inner {
         let (w, base) = (st.set(set).w.clone(), st.set(set).base);
         let x = w.layout.region(r)?;
         let t = Instant::now();
-        let mut m = self.map(st, base + x.offset, x.span)?;
+        let shared = st.set(set).shared;
+        let mut m = self.map(st, base + x.offset, x.span, shared)?;
         let ns = t.elapsed().as_nanos() as u64;
         let ((fill, waits), dst) = (m.refill(), m.va);
         st.reg(set, r)?.map = Some(m);
@@ -1079,6 +1125,69 @@ impl WeightSet {
 
     pub fn warm(&self, warm: bool) {
         self.gpu.inner.lock().set(self.id).warm = warm;
+    }
+
+    /// Its home regions map from now on as one shareable allocation each, so their pages can be
+    /// kept (`kept`) past this process. False where the device cannot share them.
+    pub fn shareable(&self) -> bool {
+        let g = &self.gpu.inner;
+        let ok = g.shared.is_some();
+        g.lock().set(self.id).shared = ok;
+        ok
+    }
+
+    /// Home regions whose pages landed and were not handed out yet, each kept for TensorD:
+    /// `(region, span, container)`, a socket whose queue holds the allocation's fd. The pages
+    /// outlive this process while TensorD holds the container; unmapping them here drains it.
+    pub fn kept(&self) -> Result<Vec<(u32, u64, OwnedFd)>> {
+        let g = &self.gpu.inner;
+        g.with(|st| {
+            let mut out = vec![];
+            for (r, reg) in st.set(self.id).regs.iter_mut().enumerate() {
+                let Some(m) = reg.map.as_mut().filter(|m| m.chunks.len() == 1 && m.chunks[0].shared && !m.deposited) else { continue };
+                let filled = m.fill.as_ref().and_then(|f| f.state.lock().unwrap().clone());
+                if m.kept.is_none() && filled.map_or(Ok(false), |f| f.map_or(Ok(false), |ev| ev.done()))? {
+                    let mut fd: c_int = -1;
+                    call!("cuMemExportToShareableHandle", mem_export(&mut fd as *mut c_int as *mut c_void, m.chunks[0].handle, cuda::MEM_HANDLE_TYPE_POSIX_FD, 0))?;
+                    // SAFETY: the driver just opened this descriptor for us.
+                    m.kept = Some(contain(unsafe { OwnedFd::from_raw_fd(fd) })?);
+                }
+                if let Some(kept) = &m.kept {
+                    let dup = kept.try_clone().map_err(|e| Error::Io(format!("dup a kept container: {e}")))?;
+                    out.push((r as u32, m.span, dup.into()));
+                    m.deposited = true;
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Home regions mapped from pages another process kept (`kept`'s fds, taken out of their
+    /// containers): imported and mapped, no copy. A page that will not import or map is skipped
+    /// and fills as usual. Returns the bytes adopted.
+    pub fn adopt_pages(&self, pages: Vec<(u32, OwnedFd)>) -> Result<u64> {
+        let g = &self.gpu.inner;
+        g.with(|st| {
+            let (base, w, mut adopted) = (st.set(self.id).base, st.set(self.id).w.clone(), 0);
+            for (r, fd) in pages {
+                let x = w.layout.region(r)?;
+                if !st.set(self.id).shared || st.reg(self.id, r)?.map.is_some() || !st.reg(self.id, r)?.home {
+                    continue;
+                }
+                match g.import(base + x.offset, x.span, &fd) {
+                    Ok(handle) => {
+                        let fill = Arc::new(Fill { state: Mutex::new(Some(g.events.record(g.copy, false))), cv: Condvar::new() });
+                        let chunks = vec![Chunk { handle, size: x.span, shared: true }];
+                        let m = Mapping { va: base + x.offset, span: x.span, chunks, fill: Some(fill), fresh: true, kept: Some(contain(fd)?), ..Default::default() };
+                        st.reg(self.id, r)?.map = Some(m);
+                        st.mapped += x.span;
+                        adopted += x.nbytes;
+                    }
+                    Err(e) => tracing::warn!("varena: kept region {r} of {} did not map, it fills: {e}", w.name),
+                }
+            }
+            Ok(adopted)
+        })
     }
 
     pub fn busy(&self, busy: bool) {
@@ -1289,6 +1398,15 @@ fn open_checkpoint(ck: Ck<'_>, regions: &[Vec<String>], direct_io: bool, files: 
 pub fn seal<'c>(ck: impl Into<Ck<'c>>, regions: &[Vec<String>], name: &str, threads: usize, files: Option<Vec<(ObjectRef, File)>>) -> Result<OwnedFd> {
     let (layout, source) = open_checkpoint(ck.into(), regions, true, files)?;
     crate::host::fill_sealed(name, &layout, &source, threads, &IoTally::default(), None)
+}
+
+/// `fd` in a socket's queue, the sending end closed: whoever holds the other end can take it
+/// once, and it lives while any holder does.
+fn contain(fd: OwnedFd) -> Result<UnixStream> {
+    let io = |e: std::io::Error| Error::Io(format!("contain kept pages: {e}"));
+    let (tx, rx) = UnixStream::pair().map_err(io)?;
+    cozy_platform::handles::send_fd(&tx, &fd).map_err(|e| io(e.into()))?;
+    Ok(rx)
 }
 
 fn reserve_va(size: u64) -> Result<u64> {

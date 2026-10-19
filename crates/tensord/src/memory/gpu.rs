@@ -8,14 +8,18 @@
 //! back, or a stalled row (progress not moved for a wedge floor), which it ends. TensorD decides nothing from bytes: it
 //! asks `fits`.
 use super::{MemoryLog, Sample};
-use crate::process::Liveness;
+use crate::{device_executor::Page, process::Liveness};
 use cozy_platform::{gpu::Device, process::Birth};
 use std::{
+    collections::BTreeMap,
     fs::File,
     io,
-    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+    os::{
+        fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+        unix::net::UnixStream,
+    },
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, OnceLock,
     },
     time::Instant,
@@ -34,8 +38,12 @@ struct Inner {
     entry: String,
     ledger: Ledger,
     fd: OwnedFd,
-    own: Row,
+    own: Arc<Row>,
     floor: u64,
+    /// Its row's context as last read: the floor and what no row explains.
+    context: AtomicU64,
+    /// Kept GPU pages by layout key.
+    kept: Mutex<BTreeMap<String, Holding>>,
     log: MemoryLog,
     end: OnceLock<Ender>,
     freed: OnceLock<Freed>,
@@ -43,6 +51,34 @@ struct Inner {
     liveness: Liveness,
     /// Calls TensorD has in flight on this GPU: executors ask each other for bytes then.
     active: AtomicUsize,
+}
+
+/// GPU pages an executor kept of one layout, so its crash or restart leaves them on the GPU.
+/// While `pid` lives each fd is a container (a socket whose queue holds the pages' fd) that it
+/// drains itself when it unmaps them; once it is gone the fds are taken out, and are TensorD's:
+/// counted in its row as kept, handed to the next executor of the layout, closed on an ask.
+struct Holding {
+    fingerprint: String,
+    pid: u32,
+    pages: BTreeMap<u32, (u64, OwnedFd)>,
+    taken: bool,
+    used: Instant,
+}
+
+impl Holding {
+    fn take(&mut self) {
+        if self.taken || !gone(self.pid) {
+            return;
+        }
+        self.taken = true;
+        let pages = std::mem::take(&mut self.pages).into_iter();
+        let take = |(r, (n, c)): (u32, (u64, OwnedFd))| Some((r, (n, cozy_platform::handles::recv_fd(&UnixStream::from(c)).ok()?)));
+        self.pages = pages.filter_map(take).collect();
+    }
+
+    fn bytes(&self) -> u64 {
+        self.pages.values().map(|p| p.0).filter(|_| self.taken).sum()
+    }
 }
 
 #[derive(Default)]
@@ -124,13 +160,15 @@ impl GpuLedger {
         }
         .max(floor_bytes);
         let (ledger, fd) = Ledger::create(&uuid, total).map_err(err)?;
-        let own = ledger.claim(std::process::id()).map_err(err)?;
+        let own = Arc::new(ledger.claim(std::process::id()).map_err(err)?);
         let inner = Arc::new(Inner {
             entry: entry.into(),
             ledger,
             fd,
             own,
             floor,
+            context: AtomicU64::new(floor),
+            kept: Mutex::default(),
             log,
             end: OnceLock::new(),
             freed: OnceLock::new(),
@@ -138,6 +176,8 @@ impl GpuLedger {
             liveness,
             active: AtomicUsize::new(0),
         });
+        let server = inner.clone();
+        inner.own.serve(move |want| server.evict_kept(want)).map_err(err)?;
         let ticks: Arc<(Mutex<Ticks>, Condvar)> = Arc::default();
         let wake = Arc::new(eventfd()?);
         let (watched, shared_ticks, woken) = (inner.clone(), ticks.clone(), wake.clone());
@@ -233,6 +273,40 @@ impl GpuLedger {
     pub fn status(&self) -> io::Result<Status> {
         self.inner.ledger.status().map_err(err)
     }
+
+    /// Holds GPU pages `pid` kept of layout `key` (region, bytes, container); a deposit by
+    /// another process or of other contents replaces what was held.
+    pub fn keep(&self, key: &str, fingerprint: &str, pid: u32, pages: Vec<(Page, File)>) {
+        let mut kept = self.inner.kept.lock().unwrap();
+        let fresh = || Holding { fingerprint: fingerprint.into(), pid, pages: BTreeMap::new(), taken: false, used: Instant::now() };
+        let held = kept.entry(key.into()).or_insert_with(fresh);
+        if held.pid != pid || held.fingerprint != fingerprint {
+            *held = fresh();
+        }
+        held.pages.extend(pages.into_iter().map(|(p, f)| (p.region, (p.nbytes, f.into()))));
+        held.used = Instant::now();
+    }
+
+    /// The pages kept of layout `key` by a process now gone, handed over: the fingerprint and
+    /// each page's fd. Whoever maps them keeps them next.
+    pub fn take_kept(&self, key: &str) -> Option<(String, Vec<(Page, File)>)> {
+        let held = {
+            let mut kept = self.inner.kept.lock().unwrap();
+            kept.get_mut(key)?.take();
+            kept.remove_entry(key).filter(|(_, h)| h.taken).map(|(_, h)| h)
+        };
+        let Some(held) = held else { return None };
+        self.inner.publish();
+        let pages = held.pages.into_iter().map(|(region, (nbytes, fd))| (Page { region, nbytes }, File::from(fd)));
+        Some((held.fingerprint, pages.collect()))
+    }
+
+    /// A GPU fault: no kept page is trusted any more.
+    pub fn forget_kept(&self) {
+        let dropped = std::mem::take(&mut *self.inner.kept.lock().unwrap()).len();
+        self.inner.publish();
+        self.inner.log.note(serde_json::json!({"event": "kept_forgotten", "gpu": self.inner.entry, "layouts": dropped}));
+    }
 }
 
 pub struct Active<'a>(&'a GpuLedger);
@@ -299,6 +373,48 @@ fn watch(device: Option<Device>, inner: &Inner, ticks: &(Mutex<Ticks>, Condvar),
 }
 
 impl Inner {
+    /// Kept pages whose depositor is gone: TensorD's own bytes.
+    fn kept_bytes(&self) -> u64 {
+        let mut kept = self.kept.lock().unwrap();
+        kept.values_mut().map(|h| {
+            h.take();
+            h.bytes()
+        }).sum()
+    }
+
+    /// TensorD's row: its context, and its kept pages as warm weights an ask takes last.
+    fn publish(&self) {
+        let kept = self.kept_bytes();
+        self.own.publish(&Facts { context: self.context.load(Ordering::Acquire), resident: kept, cold: kept, kept, ..Facts::default() });
+    }
+
+    /// An ask of TensorD's row: kept pages close, least recently kept layout first.
+    fn evict_kept(&self, want: u64) -> u64 {
+        self.kept_bytes();
+        let mut freed = 0;
+        {
+            let mut kept = self.kept.lock().unwrap();
+            while freed < want {
+                let Some(key) = kept.iter().filter(|(_, h)| h.taken).min_by_key(|(_, h)| h.used).map(|(k, _)| k.clone()) else { break };
+                let held = kept.get_mut(&key).unwrap();
+                while freed < want {
+                    let Some((_, (n, fd))) = held.pages.pop_last() else { break };
+                    drop(fd);
+                    freed += n;
+                }
+                if held.pages.is_empty() {
+                    kept.remove(&key);
+                }
+            }
+        }
+        if freed > 0 {
+            self.publish();
+            self.log.note(serde_json::json!({"event": "kept_evicted", "gpu": self.entry, "want": want, "freed": freed}));
+            self.ledger.freed();
+        }
+        freed
+    }
+
     fn mine(&self, row: &RowFacts) -> bool {
         row.slot == self.own.id() && row.gen == self.own.gen()
     }
@@ -325,8 +441,10 @@ impl Inner {
             .iter()
             .filter(|r| !self.mine(r) && !back.iter().any(|b| b.slot == r.slot))
             .fold(0u64, |sum, r| sum.saturating_add(r.held()));
-        let unexplained = reading.map_or(0, |s| s.total.saturating_sub(s.free).saturating_sub(explained));
-        self.own.publish(&Facts { context: self.floor + unexplained, ..Facts::default() });
+        let kept = self.kept_bytes();
+        let unexplained = reading.map_or(0, |s| s.total.saturating_sub(s.free).saturating_sub(explained).saturating_sub(kept));
+        self.context.store(self.floor + unexplained, Ordering::Release);
+        self.publish();
         for row in back {
             self.ledger.returned(row.pid)?;
             self.log.note(serde_json::json!({"event": "returned", "gpu": self.entry, "pid": row.pid, "bytes": row.held()}));

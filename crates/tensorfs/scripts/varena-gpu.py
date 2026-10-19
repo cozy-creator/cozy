@@ -12,10 +12,15 @@ files and from a sealed host layout. The script checks, and prints one JSON line
   e. bind/unbind per region of ~20 params (M2), and page-in at 2 MiB vs 64 MiB chunks;
   f. adopt: the sealed layout registered from the regions it carries, prefetched whole before
      any module exists, is bit-exact.
+  g. kept pages: a process fills a shareable set and hands its pages over, then is killed (-9);
+     this process imports and maps them with no copy, bit-exact; closing them frees them.
 """
 
 import json
 import os
+import signal
+import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -251,6 +256,61 @@ def test_adopt(gpu, ck, rs, host_fd, stream, facts):
     gpu.trim()
 
 
+def keeper(store: str, sha256: str, fd: int) -> None:
+    """g's first process: every region filled at home, its pages handed over, then it waits for
+    its kill."""
+    ck = tensorfs.Store(Path(store)).checkpoint(f"sha256:{sha256}")
+    ws = varena.Gpu(0).register("kept-a", ck, regions(ck))
+    assert ws.shareable(), "this card shares VMM pages by fd"
+    stream = torch.cuda.current_stream().cuda_stream
+    for r in range(len(ws.spans)):
+        ws.bind(r, stream)
+    torch.cuda.synchronize()
+    kept = ws.kept()
+    meta = json.dumps([(r, span) for r, span, _ in kept]).encode()
+    socket.send_fds(socket.socket(fileno=fd), [meta], [f for _, _, f in kept])
+    signal.pause()
+
+
+def test_survive(gpu, ck, rs, store, stream, facts):
+    ours, theirs = socket.socketpair()
+    argv = [sys.executable, __file__, "--keep", str(store), ck.manifest.sha256, str(theirs.fileno())]
+    child = subprocess.Popen(argv, pass_fds=[theirs.fileno()])
+    theirs.close()
+    meta, containers, _, _ = socket.recv_fds(ours, 1 << 16, 256)
+    meta = json.loads(meta)
+    assert len(meta) == len(rs), f"every region kept, got {len(meta)} of {len(rs)}"
+    child.send_signal(signal.SIGKILL)
+    child.wait()
+    pages = []
+    for (r, _), c in zip(meta, containers, strict=True):
+        with socket.socket(fileno=c) as s:
+            pages.append((r, socket.recv_fds(s, 1, 1)[1][0]))
+    ws = gpu.register("kept-b", ck, rs)
+    assert ws.shareable()
+    t0 = time.perf_counter()
+    adopted = ws.adopt_pages(pages)
+    facts["g_adopt_ms"] = round((time.perf_counter() - t0) * 1e3, 2)
+    for _, f in pages:
+        os.close(f)
+    want = sum(p.nbytes for p in ws.parts)
+    assert adopted >= want, f"adopted {adopted} of {want}"
+    facts["g_exact_bytes"] = exact(ws, ck, stream)
+    assert counters(gpu, "kept-b").paged_in == 0, "kept pages are mapped, never copied"
+    again = ws.kept()
+    for _, _, f in again:
+        os.close(f)
+    assert len(again) == len(meta), "adopted pages are kept again for the next process"
+    torch.cuda.synchronize()
+    free = gpu.stats().driver_free
+    ws.close()
+    gpu.trim()
+    gained = gpu.stats().driver_free - free
+    kept_bytes = sum(span for _, span in meta)
+    assert gained >= kept_bytes - 2 * MiB, f"closing freed {gained} of {kept_bytes} kept"
+    facts.update(g_kept_bytes=kept_bytes, g_adopted=adopted, g_freed=gained)
+
+
 def main(work: Path) -> int:
     torch.use_deterministic_algorithms(True)
     ck = write(work / "store")
@@ -268,6 +328,7 @@ def main(work: Path) -> int:
         ("d", lambda: test_oom(gpu, ck, rs, stream, facts)),
         ("e", lambda: test_costs(ck, rs, fd, stream, facts)),
         ("f", lambda: test_adopt(gpu, ck, rs, fd, stream, facts)),
+        ("g", lambda: test_survive(gpu, ck, rs, work / "store", stream, facts)),
     ):
         try:
             run()
@@ -283,5 +344,7 @@ def main(work: Path) -> int:
 
 if __name__ == "__main__":
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    if sys.argv[1:2] == ["--keep"]:
+        keeper(sys.argv[2], sys.argv[3], int(sys.argv[4]))
     with tempfile.TemporaryDirectory(prefix="varena-gpu-") as tmp:
         sys.exit(main(Path(sys.argv[1]) if len(sys.argv) > 1 else Path(tmp)))
