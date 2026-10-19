@@ -4492,6 +4492,10 @@ impl Services for Callbacks<'_> {
             };
             return Ok((answer, None));
         }
+        if frame.kind == Kind::CheckpointItem {
+            drop(descriptor);
+            return Ok((crate::products::checkpoint(self.engine, self.id, frame), None));
+        }
         let mut answer = Answer::unavailable(frame.seq);
         match frame.kind {
             Kind::BudgetCell => {

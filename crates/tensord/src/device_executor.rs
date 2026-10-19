@@ -394,6 +394,7 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
+    CheckpointItem,
     ModelSource,
     SealedTier,
     SealedStage,
@@ -693,6 +694,9 @@ pub struct Frame {
     pub released_bytes: u64,
     // `publish` (Outputs.publish): one product of a declared output.
     pub output: String,
+    /// `checkpoint_item`: the immutable TensorFS reference Runtime committed or uploaded.
+    pub repo_id: String,
+    pub revision: String,
     pub label: String,
     pub asset_ref: String,
     pub asset_kind: String,

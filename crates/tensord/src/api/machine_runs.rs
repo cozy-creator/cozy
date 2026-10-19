@@ -406,7 +406,9 @@ impl Log {
                     .entry((product.output.clone(), index))
                     .or_default();
                 *rev += 1;
-                let content = product.content.unwrap_or_default();
+                let (length, digest) = product.content.as_ref()
+                    .map(|content| (content.length, spell(&content.digest)))
+                    .unwrap_or_default();
                 let parts: Parts = product
                     .parts
                     .iter()
@@ -427,8 +429,8 @@ impl Log {
                     checkpoint: product.checkpoint,
                     index,
                     rev: *rev,
-                    length: content.length,
-                    digest: spell(&content.digest),
+                    length,
+                    digest,
                     media_type: product.media_type,
                     label: product.label,
                     duration_us: product.parts.iter().map(|p| p.duration_us).sum(),

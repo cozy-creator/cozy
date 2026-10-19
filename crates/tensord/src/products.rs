@@ -3,8 +3,8 @@
 //! actor and journals one `product` on the run's log, in that order, so every product a
 //! client reads can be fetched with ReadByteTreeObject. A single output's product is replaced
 //! by each publish (SET); a list output grows (APPEND). The returned result publishes only
-//! what the log does not already show. A weights output (`asset_kind` model) names the
-//! cozytensors header the Runtime wrote into the store.
+//! what the log does not already show. Runtime checkpoint outputs carry immutable TensorFS
+//! references only; TensorD records them without adopting or uploading their bytes.
 use crate::{
     api::domain,
     device_executor::{Answer, Frame},
@@ -19,7 +19,6 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 use crate::storage::{self, Store};
-use protocol::calcifer::CHECKPOINT;
 use tensorfs_core::{format::ObjectRef, sha256};
 
 const MAX_PARTS: usize = 128;
@@ -173,11 +172,7 @@ pub fn decode(stored: &StoredProduct) -> io::Result<domain::RunProduct> {
 /// The SDK's `publish` request during a running attempt: answers `Published`.
 pub fn publish(store: &Store, engine: &Engine, id: &str, spool: &Path, frame: &Frame) -> Answer {
     let mut answer = Answer::unavailable(frame.seq);
-    let committed = match frame.asset_kind.as_str() {
-        "model" => model(store, engine, id, frame),
-        _ => commit(store, engine, id, spool, frame),
-    };
-    match committed {
+    match commit(store, engine, id, spool, frame) {
         Ok((content, sequence)) => {
             answer.ok = true;
             answer.code.clear();
@@ -217,38 +212,40 @@ fn declared(engine: &Engine, id: &str) -> io::Result<(crate::journal::Submission
     Ok((context, entry))
 }
 
-/// A weights output the Runtime wrote into the store, as a product of its run's log: its content
-/// is the cozytensors header it names; the same header again adds nothing.
-fn model(store: &Store, engine: &Engine, id: &str, frame: &Frame) -> io::Result<(domain::Ref, u64)> {
-    let (_, entry) = declared(engine, id)?;
-    let outputs = entry.get("weights_outputs").and_then(Value::as_array).into_iter().flatten();
-    if !outputs.clone().any(|row| row.get("output_id").and_then(Value::as_str) == Some(&frame.output)) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{:?} is not a declared weights output", frame.output)));
-    }
-    if frame.media_type != CHECKPOINT {
-        return Err(storage(format!("a weights output is {CHECKPOINT}, not {:?}", frame.media_type)));
-    }
-    storage::check_digest("weights output", &frame.digest, true)?;
-    let header = ObjectRef { sha256: frame.digest.trim_start_matches("sha256:").into(), length: frame.size_bytes };
-    if !storage::present(store, &header) {
-        return Err(storage(format!("this machine's store holds no checkpoint {}", header.id())));
-    }
-    store.checkpoint(&header).map_err(storage::io_error)?;
-    let content = domain::Ref { digest: unhex(&header.sha256)?, length: header.length };
-    let product = domain::RunProduct {
-        output: frame.output.clone(),
-        op: domain::RunProductOp::Set as i32,
-        media_type: CHECKPOINT.into(),
-        label: frame.output.clone(),
-        content: Some(content.clone()),
-        ..Default::default()
+/// Record Runtime's checkpoint reference. A later upload replaces the local reference;
+/// a published remote tree need not be present in TensorD's cache.
+pub fn checkpoint(engine: &Engine, id: &str, frame: &Frame) -> Answer {
+    let record = || -> io::Result<u64> {
+        let (_, entry) = declared(engine, id)?;
+        if !entry["weights_outputs"].as_array().into_iter().flatten()
+            .any(|row| row["output_id"].as_str() == Some(frame.output.as_str())) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                format!("{:?} is not a declared weights output", frame.output)));
+        }
+        if frame.repo_id.is_empty() {
+            return Err(storage("a checkpoint reference needs its repository"));
+        }
+        storage::check_digest("checkpoint revision", &frame.revision, true)?;
+        let reference = protocol::machine::CheckpointRef {
+            repo_id: frame.repo_id.clone(), revision: frame.revision.clone(), variant: frame.variant.clone(),
+        };
+        let product = domain::RunProduct {
+            output: frame.output.clone(), checkpoint: Some(reference.clone()),
+            op: domain::RunProductOp::Set as i32, ..Default::default()
+        };
+        engine.append_product(id, |prior| {
+            let prior = prior.iter().map(decode).collect::<io::Result<Vec<_>>>()?;
+            let held = prior.iter().rev().find(|p| p.output == product.output)
+                .is_some_and(|p| p.checkpoint.as_ref() == Some(&reference));
+            Ok((!held).then(|| encode(&product)))
+        })
     };
-    let sequence = engine.append_product(id, |prior| {
-        let prior = prior.iter().map(decode).collect::<io::Result<Vec<_>>>()?;
-        let held = prior.iter().rev().find(|p| p.output == product.output).is_some_and(|p| p.content.as_ref() == Some(&content));
-        Ok((!held).then(|| encode(&product)))
-    })?;
-    Ok((content, sequence))
+    match record() {
+        Ok(sequence) => { let mut answer = Answer::ok(frame.seq); answer.sequence = sequence; answer }
+        Err(error) => Answer::refused(frame.seq,
+            if error.kind() == io::ErrorKind::InvalidInput { "output_undeclared" } else { "checkpoint_refused" },
+            error.to_string()),
+    }
 }
 
 fn commit(
@@ -342,7 +339,7 @@ fn commit(
             .iter()
             .rev()
             .find(|p| p.output == product.output && p.op == op as i32)
-            .is_some_and(|current| current.content == product.content)
+            .is_some_and(|current| current.content == product.content && current.checkpoint == product.checkpoint)
         {
             return Ok(None); // the log already shows these bytes
         }
@@ -362,6 +359,10 @@ pub fn document(product: &domain::RunProduct) -> io::Result<Value> {
             json!({"retention_id":source.retention_id,"source":{"producer_root_id":tree.producer_root_id,"receipt_digest":format!("sha256:{}",sha256::hex(&tree.receipt_digest)),"manifest":reference(manifest),"content_bytes":tree.content_bytes}}),
         )
     };
+    if let Some(checkpoint) = &product.checkpoint {
+        return Ok(json!({"format":"cozy.machine.product/1", "output":product.output, "op":product.op,
+            "checkpoint":checkpoint}));
+    }
     let mut document = json!({"format":"cozy.machine.product/1","output":product.output,"op":product.op,
         "content":reference(product.content.as_ref().ok_or_else(missing)?),"media_type":product.media_type});
     if let Some(held) = &product.source {
@@ -404,9 +405,60 @@ pub fn shown(log: &[domain::RunProduct], product: &domain::RunProduct) -> bool {
         log.iter()
             .rev()
             .find(|p| p.output == product.output && p.op == product.op)
-            .is_some_and(|current| current.content == product.content)
+            .is_some_and(|current| current.content == product.content && current.checkpoint == product.checkpoint)
     }
 }
 
 /// The product bytes held by the execution journal.
 pub fn encode(product: &domain::RunProduct) -> Vec<u8> { crate::archive::encode_run_product(product) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_references_replace_and_survive_restart_without_byte_custody() {
+        use crate::journal::{Installation, Invocation, SubmissionContext};
+        let root = std::env::temp_dir().join(format!("checkpoint-reference-{}", uuid::Uuid::new_v4()));
+        let engine = Engine::open(&root).unwrap();
+        engine.bind_installation(Installation {
+            actor: "owner".into(), alias: "package".into(), generation: "generation".into(),
+            interface: serde_json::to_vec(&json!({"entrypoints":[{"name":"convert",
+                "weights_outputs":[{"output_id":"weights","max_bytes":1024}]}]})).unwrap(),
+            ..Default::default()
+        }).unwrap();
+        let record = engine.submit_public(SubmissionContext {
+            actor: "owner".into(), request_id: "request".into(), submission_id: "submission".into(),
+            expected_workspace_id: engine.workspace_id(), ..Default::default()
+        }, Invocation { generation: "generation".into(), entrypoint: "convert".into(), ..Default::default() }).unwrap();
+        engine.with_journal(|journal| {
+            assert!(journal.claim(&record.id)?);
+            journal.register_process(&record.id, platform::process::Birth::own()?)?;
+            journal.running(&record.id, None).map(drop)
+        }).unwrap();
+        let mut frame = Frame {
+            seq: 1, output: "weights".into(), repo_id: "local/derived".into(),
+            revision: format!("sha256:{}", "a".repeat(64)), variant: "bf16".into(), ..Default::default()
+        };
+        assert!(checkpoint(&engine, &record.id, &frame).ok);
+        assert_eq!(checkpoint(&engine, &record.id, &frame).sequence, 0);
+        frame.repo_id = "owner/model".into();
+        assert!(checkpoint(&engine, &record.id, &frame).ok);
+        frame.output = "undeclared".into();
+        assert_eq!(checkpoint(&engine, &record.id, &frame).code, "output_undeclared");
+        drop(engine);
+        let reopened = Engine::open(&root).unwrap();
+        let rows = reopened.products(&record.id).unwrap();
+        assert_eq!(rows.len(), 2);
+        let local = decode(&rows[0]).unwrap();
+        let remote = decode(&rows[1]).unwrap();
+        assert_eq!(remote.checkpoint.as_ref().unwrap().repo_id, "owner/model");
+        assert!(remote.content.is_none() && remote.source.is_none() && remote.parts.is_empty());
+        let document = document(&remote).unwrap();
+        assert!(document.get("content").is_none());
+        assert_eq!(document["checkpoint"]["revision"], frame.revision);
+        assert!(!shown(&[local], &remote));
+        drop(reopened);
+        crate::scratch::remove(&root);
+    }
+}
