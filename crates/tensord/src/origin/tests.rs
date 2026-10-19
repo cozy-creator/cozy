@@ -9,7 +9,7 @@ use std::{
 };
 
 use tensorfs_core::{
-    fetch::HttpOrigin,
+    fetch::Endpoint,
     format::{Dtype, ObjectRef, Repo, Tree},
     store2::Store,
     writer::{Data, Source},
@@ -87,7 +87,7 @@ fn checkpoint(store: &Store) -> ObjectRef {
 
 fn remote(machine: &Machine, base: &str) -> Remote {
     let client = machine.client(None, true).unwrap();
-    Remote { origin: Arc::new(HttpOrigin::new(&client, base).unwrap()), trust: None, local: true }
+    Remote { origin: Arc::new(Endpoint::new(&client, base, None).unwrap().anonymous()), trust: None, local: true }
 }
 
 fn same(a: &Store, b: &Store, object: &ObjectRef) -> bool {
