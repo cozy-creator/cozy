@@ -65,6 +65,7 @@ struct Pinned {
     id: String,
     last_use: u64,
     owner: Option<String>,
+    cache: bool,
     reach: BTreeSet<String>,
 }
 
@@ -194,8 +195,10 @@ impl Store {
             for object in &objects {
                 *count.entry(object.clone()).or_default() += 1;
             }
+            let cache = super::cache::owned(&id, &pin);
             pins.push(Pinned {
                 id,
+                cache,
                 last_use: pin.last_use,
                 owner: pin.owner,
                 reach: objects,
@@ -353,7 +356,7 @@ impl Store {
             .sum();
         let mut stale: Vec<Pinned> = std::mem::take(&mut census.pins)
             .into_iter()
-            .filter(|pin| !pin.id.starts_with("hold-") && pin.last_use <= unused_since)
+            .filter(|pin| pin.last_use <= unused_since)
             .collect();
         stale.sort_by(|a, b| (a.last_use, &a.id).cmp(&(b.last_use, &b.id)));
         let mut dropped = Vec::new();
@@ -390,11 +393,7 @@ impl Store {
         let cutoff = SystemTime::now()
             .checked_sub(self.grace)
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let mut pins: Vec<_> = census
-            .pins
-            .iter()
-            .filter(|pin| pin.id.starts_with("cache-"))
-            .collect();
+        let mut pins: Vec<_> = census.pins.iter().filter(|pin| pin.cache).collect();
         pins.sort_by_key(|pin| (pin.last_use, &pin.id));
         let mut snapshots = self.cache_snapshots()?;
         snapshots.sort_by_key(|snapshot| snapshot.used);
