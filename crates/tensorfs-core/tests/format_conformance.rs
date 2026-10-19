@@ -332,6 +332,42 @@ fn reader_decodes_every_case() {
     assert!(checked >= 80, "{checked}");
 }
 
+/// Real prebuilt execution, not a mock driver or a Triton runtime. Run only on an allocated
+/// CUDA worker after building with the required AOT catalog.
+#[cfg(feature = "store")]
+#[test]
+#[ignore = "requires a CUDA GPU and the prebuilt AOT catalog"]
+fn cuda_decodes_every_encoded_green_vector_and_logical_windows() {
+    use tensorfs_core::format::PartBytes;
+    use tensorfs_core::io::{self, Copy, Dst, ReadOpts, Src};
+    let mut checked = 0;
+    for (family, cases) in families() {
+        for case in cases {
+            let (Some(encoding), Some(expected)) = (&case.encoding, &case.expect) else { continue };
+            let storage: Vec<_> = case.parts.iter().map(|p| b64(&p.bits)).collect();
+            let parts = case.parts.iter().zip(&storage).map(|(p, bytes)| (
+                p.role.as_str(), PartBytes { dtype: &p.dtype, shape: &p.shape, bytes },
+            )).collect();
+            let total: u64 = case.shape.iter().product();
+            let expected = b64(expected);
+            let mut windows = vec![(0, total)];
+            if total > 3 { windows.push((1, total - 2)); }
+            for (begin, count) in windows {
+                let gpu = io::decode::read(&case.dtype, &case.shape, encoding, &parts, 0, begin, count)
+                    .unwrap_or_else(|e| panic!("{family}/{} {begin}+{count}: {e}", case.key));
+                let mut bytes = vec![0; gpu.len()];
+                let copy = Copy { src: Src::Device { device: 0, ptr: gpu.ptr(), stream: 0 }, dst: Dst::host(&mut bytes) };
+                // SAFETY: both owned buffers remain live until the engine drains.
+                unsafe { io::read(&[copy], &ReadOpts::default()) }.unwrap();
+                let width = case.dtype.byte_len(&[1]).unwrap() as usize;
+                assert_eq!(bytes, expected[begin as usize * width..(begin + count) as usize * width], "{family}/{} {begin}+{count}", case.key);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 50, "only {checked} encoded vector windows were checked");
+}
+
 /// A green header's projection (its CBOR tree as JSON, byte strings as `{"hex": ...}`) as a
 /// header, and whether it holds what this writer does not write (a minor tag, later fields).
 fn from_projection(p: &Json) -> (Header, bool) {

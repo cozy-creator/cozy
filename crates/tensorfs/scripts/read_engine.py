@@ -127,8 +127,9 @@ class HostReads(unittest.TestCase):
             self.assertEqual(out, b"unchanged")
         with self.assertRaises(tfs.InvalidError):
             self.tensors.read_into("quantized", bytearray(1), role="")
-        with self.assertRaises(tfs.UnsupportedError):
-            self.tensors.read_all(device="cuda:0")
+        for device in ["gpu", "cuda:-1", "cuda:nope"]:
+            with self.assertRaises(tfs.InvalidError):
+                self.tensors.read_all(device=device)
 
     def test_real_endpoint_fetches_only_chunks_touched_by_the_read(self) -> None:
         root = pathlib.Path(self.tmp.name)

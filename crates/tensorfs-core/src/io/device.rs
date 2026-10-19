@@ -470,7 +470,7 @@ struct Tally {
 /// Each device has B7's reusable pinned buffers; reads finish before any borrowed source is
 /// released. A borrowed/owned registration is never retained past its caller's lifetime.
 pub(super) unsafe fn fill(copies: &[(usize, Copy)], opts: &ReadOpts) -> Result<ReadStats, Error> {
-    let mut groups: BTreeMap<i32, Vec<(usize, Copy)>> = BTreeMap::new();
+    let mut groups: BTreeMap<(i32, &str), Vec<(usize, Copy)>> = BTreeMap::new();
     for &(index, copy) in copies {
         if copy.dst.is_empty() {
             continue;
@@ -479,12 +479,30 @@ pub(super) unsafe fn fill(copies: &[(usize, Copy)], opts: &ReadOpts) -> Result<R
             (_, Dst::Device { device, .. }) | (Src::Device { device, .. }, _) => device,
             _ => unreachable!(),
         };
-        groups.entry(device).or_default().push((index, copy));
+        let kind = match (copy.src, copy.dst) {
+            (Src::Device { .. }, Dst::Host { .. }) => "d2h",
+            (Src::Device { device: source, .. }, Dst::Device { device: target, .. }) if source != target => "peer",
+            (Src::Device { .. }, Dst::Device { .. }) => "d2d",
+            _ => "h2d",
+        };
+        groups.entry((device, kind)).or_default().push((index, copy));
     }
     let mut total = ReadStats::default();
-    for (device, copies) in groups {
+    for ((device, kind), copies) in groups {
         let engine = Engine::get(device).map_err(|e| failed(copies[0].0, e))?;
+        #[cfg(unix)]
+        let ceiling = if kind == "h2d" { super::metrics::h2d(device).map_or(0.0, |c| c.0) } else { 0.0 };
+        let start = Instant::now();
         let stats = engine.run(&copies, opts)?;
+        #[cfg(unix)]
+        super::metrics::record(super::metrics::Copy {
+            kind, gpu: device, bytes: copies.iter().map(|(_, c)| c.dst.len() as u64).sum(),
+            ns: start.elapsed().as_nanos() as u64, ceiling,
+            link: super::metrics::device_link(device).map_or_else(String::new, |link| link.to_string()),
+            busy_ns: stats.busy_ns, pin_ns: stats.pin_ns, staged: stats.staged, cached: stats.cached,
+        });
+        #[cfg(not(unix))]
+        let _ = (kind, start);
         total.direct += stats.direct;
         total.cached += stats.cached;
         total.bounced += stats.bounced;

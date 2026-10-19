@@ -28,20 +28,24 @@ pub struct Ceiling {
     pub disk_gbps: f64,
     /// Measured past the page cache (O_DIRECT); else the filesystem refused it.
     pub disk_direct: bool,
+    /// Pinned host→device GB/s, when a CUDA device was requested.
+    pub h2d_gbps: Option<f64>,
+    /// Streams used by the fastest measured H2D probe.
+    pub streams: Option<u32>,
 }
 
 /// What reads from `path`'s volume (and, with `device`, copies to that GPU) can reach.
 pub fn ceiling(device: Option<i32>, path: &Path) -> io::Result<Ceiling> {
-    if device.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the H2D ceiling needs the CUDA engine",
-        ));
-    }
+    #[cfg(unix)]
+    let gpu = device.map(|device| super::metrics::h2d(device).ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, format!("CUDA device {device} has no measurable H2D ceiling")))).transpose()?;
+    #[cfg(not(unix))]
+    let gpu: Option<(f64, u32)> = if device.is_some() { return Err(io::Error::new(io::ErrorKind::Unsupported, "H2D ceiling is unavailable on this platform")); } else { None };
     let (disk_gbps, disk_direct) = disk(path)?;
     Ok(Ceiling {
         disk_gbps,
         disk_direct,
+        h2d_gbps: gpu.map(|g| g.0),
+        streams: gpu.map(|g| g.1),
     })
 }
 

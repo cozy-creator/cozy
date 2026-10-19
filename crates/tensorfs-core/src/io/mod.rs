@@ -4,6 +4,8 @@
 #![allow(unsafe_code)]
 
 pub mod cuda;
+#[cfg(unix)]
+pub mod metrics;
 mod device;
 mod host;
 mod plan;
