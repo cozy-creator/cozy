@@ -35,3 +35,7 @@ jobs:
     if: github.event_name == 'push'
     uses: ./.github/workflows/owner-day.yml
     secrets: inherit
+    with:
+      # cozy master is TensorFS v2: its gate runs against the v2 Hub, tensorhub #1202's head. This line
+      # goes when #1202 merges.
+      tensorhub_ref: b8e24df5a8e309708c1bf550fe1c4cd3fe9d5b06
