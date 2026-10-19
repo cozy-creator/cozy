@@ -116,6 +116,66 @@ fn local_code_runs_on_a_real_machine_and_runs_again_as_edited() {
     assert_eq!(echoed["result"]["text"], "from a directory", "{echoed}");
 }
 
+/// Public CLI -> Calcifer -> TensorD -> Runtime Writer -> checkpoint_item -> Calcifer.
+/// The configured shared store holds the exact bytes; Calcifer persists references only.
+#[test]
+fn runtime_checkpoint_writes_replay_and_survive_calcifer_restart() {
+    let Some(home) = Home::new() else { return };
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else { return };
+    let store_path = home.path().join("shared-tensorfs");
+    let store_name = store_path.to_str().unwrap();
+    let _machine = common::tensord::added_with(&home, "m1", &[("COZY_TENSORFS_ROOT", store_name)]);
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensord/tests/fixtures/cpu_weights"),
+        &work.join("cpu_weights"),
+    );
+    let run = |size: &str| completed(&cozy(&home, &work,
+        &["--json", "run", "./cpu_weights/table", "--on", "m1", "--size", size]));
+    let checkpoint = |run: &Value, size: usize| {
+        let output = run["output"].as_array().unwrap().iter()
+            .find(|output| output["name"] == "model").unwrap_or_else(|| panic!("no model output: {run}"));
+        assert_eq!(output["status"], "completed", "{output}");
+        for field in ["path", "sha256", "export_error"] {
+            assert!(output.get(field).is_none_or(Value::is_null), "checkpoint has byte-export metadata: {output}");
+        }
+        let reference = output["checkpoint"].clone();
+        assert_eq!(reference["repo_id"], "local/derived", "{reference}");
+        let store = tensorfs_core::store2::Store::open(&store_path).unwrap();
+        let revision = reference["revision"].as_str().unwrap();
+        let mut tree = tensorfs_core::format::ObjectRef {
+            sha256: revision.strip_prefix("sha256:").unwrap().into(), length: 0,
+        };
+        tree.length = std::fs::metadata(store.path(&tree).unwrap()).unwrap().len();
+        let variant = reference["variant"].as_str().unwrap();
+        let (_, header) = tensorfs_core::fetch::variant_of_tree(&store.tree(&tree).unwrap(),
+            (!variant.is_empty()).then_some(variant)).unwrap();
+        assert_eq!(header.id(), run["result"]["checkpoint"].as_str().unwrap(), "tree and produced header differ: {run}");
+        let expected: Vec<u8> = (0u8..=255).cycle().take(size * 4).collect();
+        assert_eq!(store.checkpoint(&header).unwrap().read("model", "table").unwrap(), expected);
+        reference
+    };
+    let first = run("64");
+    let original = checkpoint(&first, 64);
+    let again = run("64");
+    assert_eq!(checkpoint(&again, 64), original);
+    assert_eq!(first["result"]["transaction"], again["result"]["transaction"]);
+    assert_ne!(first["result"]["producer_request_id"], again["result"]["producer_request_id"],
+        "a writer executes again rather than returning the first run's result");
+    let wider = run("128");
+    assert_ne!(checkpoint(&wider, 128), original);
+    assert_ne!(first["result"]["transaction"], wider["result"]["transaction"]);
+
+    let number = first["number"].as_u64().unwrap().to_string();
+    let down = home.cozy(["down"]);
+    assert_eq!(down.code, 0, "{down:?}");
+    let shown = home.json(["--json", "run", "show", &number]);
+    assert_eq!(checkpoint(&shown, 64), original, "Calcifer persisted the typed reference");
+    let replayed = run("64");
+    assert_eq!(checkpoint(&replayed, 64), original);
+    assert_eq!(first["result"]["transaction"], replayed["result"]["transaction"]);
+}
+
 /// A wheel no index serves (an unpublished build, as cozy-kernels before its release), named by a
 /// path source: the machine installs it as a carried wheel, for a script (resolved on the machine)
 /// and for a locked project (`uv sync` leaves it to the carried file), and the code imports it.

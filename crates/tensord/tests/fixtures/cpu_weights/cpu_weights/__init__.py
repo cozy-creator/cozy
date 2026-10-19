@@ -1,5 +1,5 @@
-"""A quantizer's shape without torch: a CPU function writes one weights output through its
-owner's derive channel, adopts it and returns the model."""
+"""A quantizer's shape without torch: Runtime writes one declared output directly through
+public TensorFS in the configured store and returns its model reference."""
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +7,7 @@ import asyncio
 import msgspec
 
 from cozy_runtime.author import App, Context, ModelArtifact, Telemetry, WeightsOutput
-from cozy_runtime.tensord_channels import Derivation
+from cozy_runtime.weights_store import Derivation
 
 app = App()
 
@@ -28,9 +28,9 @@ async def table(ctx: Context, payload: TableInput, tel: Telemetry) -> ModelArtif
     output = ctx.output("model", Derivation(None, order=(("model", "table"),)))
     if not output.has("model", "table"):
         output.put("model", "table", "F32", [payload.size], bytes(range(256)) * (payload.size // 64))
-        await hold("checkpoint")  # TensorD journals each put: the write is resumable from here
+        await hold("checkpoint")  # TensorFS retains the keyed Writer's resumable state
     await hold("commit")
-    result = ctx.adopt_model(output)  # commits, then TensorD checks and keeps the manifest
+    result = ctx.adopt_model(output)  # Runtime commits, then reports a checkpoint reference
     await hold("adopt")
     return result
 
