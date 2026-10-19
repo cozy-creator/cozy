@@ -421,7 +421,8 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
         "{failed}"
     );
     assert!(
-        failed["reason"].to_string().contains("403"),
+        failed["reason"].to_string().contains("404")
+            && failed["reason"].to_string().contains("not visible"),
         "expected the ordinary permission refusal: {failed}"
     );
     let retained = failed["output"]
