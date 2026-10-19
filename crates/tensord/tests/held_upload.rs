@@ -9,7 +9,6 @@ use serde_json::json;
 use std::{
     collections::BTreeMap,
     io,
-    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
