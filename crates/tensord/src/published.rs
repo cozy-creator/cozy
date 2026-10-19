@@ -2414,7 +2414,7 @@ pub(crate) mod tests {
         let file = named.file_name().unwrap().to_string_lossy().to_string();
         let (digest, _) = updates.stage(&file, &mut File::open(&named).unwrap()).unwrap();
         let runtime = Some(Choice { file, sha256: digest.clone(), ..Default::default() });
-        let request = Request { operation: "dev".into(), pin: None, runtime, tensorfs: None, cozy: None, toolchain: false };
+        let request = Request { operation: "dev".into(), pin: None, runtime, tensorfs: None, cozy: None, binary: None, toolchain: false };
         updates.request(request, |_| ()).unwrap();
         loop {
             let status = updates.update("dev").unwrap();

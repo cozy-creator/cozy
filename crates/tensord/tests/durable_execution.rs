@@ -3,6 +3,8 @@
 //! checks drive the journal with stand-in processes. Not CLI qualification.
 #[path = "common/child.rs"]
 mod child;
+#[path = "common/named_runtime.rs"]
+mod named_runtime;
 use child::until_stdin_closes;
 use cozy_platform::process::Birth;
 use tensord::{
@@ -61,7 +63,8 @@ from pathlib import Path
 from tensord_client.packages import install
 fixture, out = Path(sys.argv[1]), Path(sys.argv[2])
 subprocess.run(["uv", "build", "--wheel", "--out-dir", str(out / "client"), "."], check=True, capture_output=True)
-generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12")
+generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12",
+                     sdk=[Path(wheel) for wheel in sys.argv[3:]])
 print(json.dumps({"identity": generation.identity}))
 "#;
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -71,9 +74,12 @@ print(json.dumps({"identity": generation.identity}))
             .args(["run", "--locked", "--extra", "test", "python", "-c", INSTALL])
             .arg(repo.join("tests/fixtures/cpu_lifecycle"))
             .arg(&out)
+            // The named Runtime, as a machine runs it.
+            .args(named_runtime::pair())
             .output()
             .unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        named_runtime::loaded(&named_runtime::environments(&out.join("generations")), "the lifecycle fixture");
         let line = String::from_utf8(output.stdout).unwrap();
         let installed: Value = serde_json::from_str(line.lines().last().unwrap()).unwrap();
         (out.join("generations"), installed["identity"].as_str().unwrap().into())

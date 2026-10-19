@@ -1969,6 +1969,7 @@ impl Pool {
                 // Queued requests of its root and older roots go first; a released lane ends
                 // the hint.
                 let (start, _permit) = loop {
+                    let epoch = engine.activity_epoch();
                     if !active() { return; }
                     match pool.allocations.bound(root) {
                         Some(None) => return,
@@ -1980,7 +1981,7 @@ impl Pool {
                         }
                         _ => {}
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    engine.wait_activity(epoch, None);
                 };
                 if !active() { return; }
                 let waited = asked.elapsed();

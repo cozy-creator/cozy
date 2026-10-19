@@ -13,6 +13,7 @@ import sys
 import tempfile
 import tomllib
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 
 import msgspec
@@ -135,7 +136,9 @@ def collect(path: Path) -> bool:
 
 
 def install(project: Path, generations: Path, client_wheel: Path, *,
-            python: str = sys.executable) -> Generation:
+            python: str = sys.executable, sdk: Sequence[Path]) -> Generation:
+    """`project` installed for a test, its Runtime/TensorFS pair `sdk` named by the caller (the
+    machine's, or none): a caller that names none says so, never forgets it."""
     project = project.resolve()
     client_wheel = client_wheel.resolve(strict=True)
     interface = describe(project)
@@ -157,9 +160,10 @@ def install(project: Path, generations: Path, client_wheel: Path, *,
             subprocess.run(["uv", "venv", "--python", python, str(root / "env")], check=True)
             interpreter = layout.interpreter(root / "env")
             # uv resolves the package's declared lower AND upper dependency bounds;
-            # no service-version floor or SDK upgrade is inserted into this solve.
+            # no service-version floor or SDK upgrade is inserted into this solve, save a
+            # named `sdk` pair, which the solve takes exactly or refuses.
             subprocess.run(["uv", "pip", "install", "--python", str(interpreter),
-                            str(wheels[0]), str(client_wheel)], check=True)
+                            str(wheels[0]), str(client_wheel), *map(str, sdk)], check=True)
             interface = describe(project, interpreter)
             return publish_generation(root, metadata, interface)
     except BaseException:

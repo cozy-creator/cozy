@@ -96,7 +96,10 @@ pub(crate) fn rows(ctx: &Context, list: &MachineList) -> Vec<Vec<String>> {
         let rental = m.rental.as_ref();
         vec![
             m.name.clone(),
-            kind(m).into(),
+            match m.status.as_ref().is_some_and(|s| s.dev) {
+                true => format!("{} dev", kind(m)),
+                false => kind(m).into(),
+            },
             gpus_cell(m),
             family_cell(m.status.as_ref()),
             state_cell(m),
@@ -176,6 +179,9 @@ pub(crate) fn record(ctx: &Context, m: &Machine) -> output::Record {
         if let Some(warning) = &r.provider_warning {
             record = record.field("provider", warning);
         }
+        if let Some(digest) = &r.base_worker_image_digest {
+            record = record.field("image", digest);
+        }
     }
     if let Some(since) = unreachable_since(m) {
         record = record.note(format!(
@@ -225,11 +231,21 @@ pub(crate) fn record(ctx: &Context, m: &Machine) -> output::Record {
 /// What a machine reports of itself, one fact per line, GPUs by number.
 pub fn status_fields(status: &MachineStatus) -> Vec<(String, String)> {
     let mut fields = vec![
-        ("version".into(), status.version.clone()),
+        (
+            "version".into(),
+            match status.dev {
+                true => format!("{} (dev)", status.version),
+                false => status.version.clone(),
+            },
+        ),
         ("platform".into(), status.platform.clone()),
         ("phase".into(), status.phase.clone()),
     ];
-    for (key, value) in [("runtime", &status.runtime), ("tensorfs", &status.tensorfs)] {
+    let commit = [("commit", &status.commit)];
+    for (key, value) in commit
+        .into_iter()
+        .chain([("runtime", &status.runtime), ("tensorfs", &status.tensorfs)])
+    {
         if !value.is_empty() {
             fields.push((key.into(), value.clone()));
         }

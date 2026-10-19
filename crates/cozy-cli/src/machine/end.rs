@@ -215,12 +215,16 @@ pub async fn update(
     name: &str,
     runtime_wheel: Option<PathBuf>,
     tensorfs_wheel: Option<PathBuf>,
+    tensord: Option<PathBuf>,
 ) -> Result<ExitCode, Error> {
     let mut payload = serde_json::Map::new();
     let (mut staged, mut inputs, mut named) = (vec![], vec![], vec![]);
+    let dev = tensord.is_some();
+    // An empty distribution: the dev `cozy` binary.
     for (member, distribution, path) in [
         ("runtime", "cozy_runtime", runtime_wheel),
         ("tensorfs", "tensorfs", tensorfs_wheel),
+        ("binary", "", tensord),
     ] {
         let Some(path) = path else { continue };
         if let Some(at) = path.to_str().filter(|p| p.contains("://")) {
@@ -235,7 +239,11 @@ pub async fn update(
             field: member.into(),
             digest: input.digest.to_string(),
             length: input.length,
-            media_type: "application/zip".into(),
+            media_type: match distribution {
+                "" => "application/octet-stream",
+                _ => "application/zip",
+            }
+            .into(),
             order: 0,
         });
         payload.insert(member.into(), file.into());
@@ -246,6 +254,13 @@ pub async fn update(
         "" => ctx.hub()?,
         origin => ctx.config.resolve(origin)?,
     };
+    if dev
+        && m.status
+            .as_ref()
+            .is_some_and(|s| s.warm.iter().any(|w| !w.level.is_empty()))
+    {
+        output::warn(&format!("{}'s warm models reload after the swap", m.name));
+    }
     if payload.is_empty() {
         let Some(status) = &m.status else {
             return Err(Error::new(
@@ -286,8 +301,26 @@ pub async fn update(
         out: None,
         warnings: vec![],
     };
+    // `local` runs from this computer's cozy: named now, before the machine renames over it.
+    let here = match dev && m.kind == MachineKind::Local {
+        true => Some(
+            std::env::current_exe()
+                .and_then(|exe| exe.canonicalize())
+                .map_err(|e| Error::new(Kind::Internal, "binary_unknown", e.to_string()))?,
+        ),
+        false => None,
+    };
     let submitted = crate::run::submit(ctx, submit, None).await?;
     let run = crate::run::follow(ctx, submitted.run, false).await?;
+    if let Some(here) = here.filter(|_| run.status == calcifer::Status::Completed) {
+        // That cozy is the dev binary now: Calcifer runs it too.
+        crate::daemon::restart(ctx, &here).await?;
+        let version = run.result.as_ref().and_then(|r| r["to"]["cozy"].as_str());
+        output::warn(&format!(
+            "this computer's cozy is now {}, a dev build; `cozy update` returns it to a release",
+            version.unwrap_or("a dev build")
+        ));
+    }
     Ok(crate::run::exit_code(&run))
 }
 
@@ -338,6 +371,7 @@ pub async fn toolchain(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
 
 /// A wheel of `distribution` the machine fetches itself, `https://…/<wheel>#sha256=<hex>`: its
 /// file name and the payload member. Nothing is sent from here.
+/// `distribution`'s wheel at `https://…#sha256=<hex>`, or (an empty distribution) a `cozy` binary.
 fn fetched(at: &str, distribution: &str) -> Result<(String, serde_json::Value), Error> {
     let refused = |why: String| Error::new(Kind::Validation, "wheel_refused", why);
     let (url, sha256) = at.split_once("#sha256=").unwrap_or((at, ""));
@@ -350,21 +384,23 @@ fn fetched(at: &str, distribution: &str) -> Result<(String, serde_json::Value), 
     let file = path
         .split_once('/')
         .map_or("", |(_, p)| p.rsplit('/').next().unwrap_or_default());
-    if !file.starts_with(&format!("{distribution}-")) || !file.ends_with(".whl") {
+    let named = file.starts_with(&format!("{distribution}-")) && file.ends_with(".whl");
+    if !distribution.is_empty() && !named {
         return Err(refused(format!(
             "{url} names no {distribution} wheel ({distribution}-<version>-….whl)"
         )));
     }
     if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(refused(format!(
-            "{at}: a wheel URL ends #sha256=<64 hex>, the digest the machine holds its bytes to"
+            "{at}: the URL ends #sha256=<64 hex>, the digest the machine holds its bytes to"
         )));
     }
     let member = serde_json::json!({"url": url, "sha256": sha256.to_ascii_lowercase()});
     Ok((file.to_owned(), member))
 }
 
-/// A local wheel of `distribution`, measured once: its file name and what the run stages.
+/// A local wheel of `distribution` (or, empty, a `cozy` binary), measured once: its file name and
+/// what the run stages.
 fn wheel(path: &Path, distribution: &str) -> Result<(String, StagedInput), Error> {
     let refused = |why: String| Error::new(Kind::Validation, "wheel_refused", why);
     let file = path
@@ -372,11 +408,15 @@ fn wheel(path: &Path, distribution: &str) -> Result<(String, StagedInput), Error
         .and_then(|n| n.to_str())
         .unwrap_or_default();
     let regular = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
-    if !regular || !file.starts_with(&format!("{distribution}-")) || !file.ends_with(".whl") {
-        return Err(refused(format!(
-            "{} is not a {distribution} wheel file ({distribution}-<version>-….whl)",
-            path.display()
-        )));
+    let named = file.starts_with(&format!("{distribution}-")) && file.ends_with(".whl");
+    if !regular || (!distribution.is_empty() && !named) {
+        return Err(refused(match distribution {
+            "" => format!("{} is not a file", path.display()),
+            _ => format!(
+                "{} is not a {distribution} wheel file ({distribution}-<version>-….whl)",
+                path.display()
+            ),
+        }));
     }
     let bytes = std::fs::read(path).map_err(|e| refused(e.to_string()))?;
     let input = StagedInput {

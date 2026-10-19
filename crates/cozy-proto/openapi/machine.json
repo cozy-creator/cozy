@@ -2017,6 +2017,16 @@
             },
             "default": []
           },
+          "commit": {
+            "type": "string",
+            "description": "The commit its `cozy` binary was built from.",
+            "default": ""
+          },
+          "dev": {
+            "type": "boolean",
+            "description": "Its binary arrived by a dev update (`cozy machine update --tensord`), not a release.",
+            "default": false
+          },
           "disk": {
             "oneOf": [
               {
