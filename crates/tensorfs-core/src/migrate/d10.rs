@@ -275,8 +275,8 @@ impl<'t> Migrator<'t> {
         }
         let mut filled = Vec::new();
         for (u, entry) in upstream.iter().flat_map(|u| u.files.iter().map(move |e| (u, e))) {
-            if !bytes.keys().any(|p| under(entry, p)) {
-                for (path, b) in self.upstream(u.from, entry)? {
+            for (path, b) in self.upstream(u.from, entry)? {
+                if !bytes.contains_key(&path) {
                     filled.push(path.clone());
                     bytes.insert(path, b);
                 }
