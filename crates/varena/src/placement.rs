@@ -103,6 +103,12 @@ pub struct TransferProof {
 }
 
 impl TransferProof {
+    fn knows(&self, page: PageId) -> bool {
+        self.pages
+            .binary_search_by_key(&page, |known| known.page)
+            .is_ok()
+    }
+
     fn invalidate(&mut self, reason: &'static str) {
         self.complete = false;
         if !self.invalid.contains(&reason) {
@@ -159,11 +165,12 @@ struct Inner {
 
 impl TransferProof {
     fn snapshot(inner: &Inner) -> Self {
-        let pages: Vec<_> = inner
+        let mut pages: Vec<_> = inner
             .models
             .values()
             .flat_map(|model| model.proof_pages.iter().cloned())
             .collect();
+        pages.sort_unstable_by_key(|page| page.page);
         let initial: Vec<_> = inner
             .table
             .pages
@@ -180,11 +187,7 @@ impl TransferProof {
             initial,
             invalid: vec![],
         };
-        if proof
-            .initial
-            .iter()
-            .any(|id| !proof.pages.iter().any(|page| page.page == *id))
-        {
+        if proof.initial.iter().any(|id| !proof.knows(*id)) {
             proof.invalidate("unknown-initial-content");
         }
         proof
@@ -1681,7 +1684,7 @@ impl Placement {
                 .copied(),
         };
         if let Some(run) = inner.requests.get_mut(&request) {
-            if kind == "bind" && !run.stats.proof.pages.iter().any(|known| known.page == page) {
+            if kind == "bind" && !run.stats.proof.knows(page) {
                 run.stats.proof.invalidate("unknown-demand-content");
             }
             run.stats.events.push(event);
