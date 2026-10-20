@@ -160,8 +160,8 @@ pub fn prepare<'a>(
                     "invalid requantized rotation geometry".into(),
                 ));
             }
-            let width = g.cols.checked_mul(bits).map(|n| n / 8);
-            if width.and_then(|n| n.checked_mul(g.rows)) != Some(codes.bytes.len()) {
+            let width = codes.packing.row_bytes(g.cols);
+            if width.checked_mul(g.rows) != Some(codes.bytes.len()) {
                 return Err(Error::Decode(
                     "requantized codes have a wrong byte length".into(),
                 ));

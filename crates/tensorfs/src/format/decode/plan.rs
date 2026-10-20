@@ -76,6 +76,15 @@ impl RequantPacking {
             Self::SplitSix => 6,
         }
     }
+
+    /// The checked schemes use whole four-column blocks. Divide before multiplying so
+    /// even a zero-sized tensor's large column metadata does not overflow needlessly.
+    pub fn row_bytes(self, cols: usize) -> usize {
+        match self {
+            Self::Nibbles => cols / 2,
+            Self::SplitSix => (cols / 4) * 3,
+        }
+    }
 }
 
 /// `clamp(round_even(level[code] * relative[i,j/group]), -127,127)` as exact i32.
@@ -96,10 +105,7 @@ impl RequantCodes<'_> {
                 "invalid requantized rotation geometry".into(),
             ));
         }
-        let width = cols
-            .checked_mul(bits)
-            .and_then(|n| n.checked_div(8))
-            .ok_or_else(|| Error::Decode("packed row size overflow".into()))?;
+        let width = self.packing.row_bytes(cols);
         if rows.checked_mul(width) != Some(self.bytes.len()) {
             return Err(Error::Decode(
                 "requantized codes have a wrong byte length".into(),

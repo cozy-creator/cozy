@@ -102,11 +102,10 @@ fn packed(c: &Ctx, bits: usize, group: bool) -> Result<Shape> {
         };
         return Err(c.fail(format!("{} columns are not whole blocks of {b}{g}", c.cols)));
     }
-    let width = c
-        .cols
-        .checked_mul(bits)
-        .map(|n| n / 8)
-        .ok_or_else(|| c.fail("packed row size overflow"))?;
+    let width = match bits {
+        4 => c.cols / 2,
+        _ => (c.cols / 4) * 3,
+    };
     Ok(Shape::Exact([c.lead(), &[width as u64]].concat()))
 }
 

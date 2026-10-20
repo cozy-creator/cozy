@@ -82,3 +82,50 @@ fn u7_golden_values_and_refusals_match_the_frozen_corpus() {
     }
     assert_eq!((values, refusals), (18, 14));
 }
+
+#[test]
+fn empty_u7_tensors_do_not_overflow_large_packed_column_metadata() {
+    let cols = 1u64 << 63;
+    for (scheme, bits) in [("comfy.asym_w4a8_int8", 4), ("comfy.w6a8_int8", 6)] {
+        let shape = [0, cols];
+        let weight = [0, if bits == 4 { cols / 2 } else { (cols / 4) * 3 }];
+        let groups = [0, cols / 16];
+        let rows = [0];
+        let encoding = Encoding {
+            scheme: scheme.into(),
+            params: BTreeMap::from([
+                ("group_size".into(), 16u64.into()),
+                ("rotation_size".into(), 256u64.into()),
+            ]),
+        };
+        let parts = BTreeMap::from([
+            (
+                "weight",
+                PartBytes {
+                    dtype: &Dtype::I8,
+                    shape: &weight,
+                    bytes: &[],
+                },
+            ),
+            (
+                "weight_s_rel",
+                PartBytes {
+                    dtype: &Dtype::F32,
+                    shape: &groups,
+                    bytes: &[],
+                },
+            ),
+            (
+                "weight_s_channel",
+                PartBytes {
+                    dtype: &Dtype::F32,
+                    shape: &rows,
+                    bytes: &[],
+                },
+            ),
+        ]);
+        assert!(decode(&Dtype::F32, &shape, &encoding, &parts)
+            .unwrap()
+            .is_empty());
+    }
+}

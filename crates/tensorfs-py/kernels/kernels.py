@@ -161,7 +161,7 @@ def requantize(out, words, slots, scale, term, table, factor, post, index, error
     valid = e < tl.load(params)
     cols, bits, group = tl.load(params + 2), tl.load(params + 8), tl.load(params + 18)
     i, j = e // cols, e % cols
-    width = cols * bits // 8
+    width = tl.where(bits == 4, cols // 2, (cols // 4) * 3)
     low = (_word(words, i * width + j // 2, valid, 8) >> (4 * (j % 2)).to(tl.uint32)) & 15
     q = low
     if bits == 6:
