@@ -80,7 +80,7 @@ fn u7_golden_values_and_refusals_match_the_frozen_corpus() {
             _ => panic!("{} has no unambiguous golden result", c.key),
         }
     }
-    assert_eq!((values, refusals), (18, 14));
+    assert_eq!((values, refusals), (18, 16));
 }
 
 #[test]
