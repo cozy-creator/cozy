@@ -33,7 +33,7 @@ struct Installed {
     machine: Option<String>,
 }
 
-pub async fn run(
+pub(super) async fn run(
     ctx: &Context,
     path: &Path,
     function: Option<String>,
