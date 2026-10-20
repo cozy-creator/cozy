@@ -52,10 +52,6 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 
-[features]
-# Dev builds only (xs-045 U12): migration runs (src/migrate.rs). Never in a release.
-migrate = ["protocol/migrate"]
-
 [dev-dependencies]
 tower.workspace = true
 tempfile.workspace = true

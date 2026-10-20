@@ -285,6 +285,9 @@ pub struct RunSpec {
     /// Where the run reads, and its capability there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hub: Option<HubAccess>,
+    /// Ordinary TensorFS connection settings supplied by the caller, forwarded to Runtime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tensorfs: Option<TensorFSOptions>,
     /// The account that org-relative references of local code name.
     pub owner: String,
     /// Provider tokens for source models, memory only like `hub`.
@@ -303,20 +306,34 @@ pub struct RunSpec {
     pub bits: u32,
 }
 
-/// Dev builds only (xs-045 U12): the profile that makes a warm run's model choice a migration
-/// of checkpoints from before TensorFS's format cut, which every Calcifer passes through. With a
-/// repository and manifest: that old checkpoint at the run's Hub, rewritten on the machine and
-/// put in the run's weights destination. With a `source`: every `local/` model of the pre-cut
-/// store at that path on the machine, into the machine's own store.
-#[cfg(feature = "migrate")]
-pub const MIGRATE: &str = "migrate";
-
 /// The caller's provider tokens, for models a run makes from a provider source.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct ProviderAccess {
     pub huggingface: String,
     pub civitai: String,
+}
+
+/// Public TensorFS transport options. TensorD forwards a supplied token without acquiring one.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct TensorFSOptions {
+    pub endpoint: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub token: String,
+    /// An endpoint's private CA, base64 DER on the wire.
+    #[serde(with = "base64_bytes", skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = String, format = Byte)]
+    pub ca_der: Vec<u8>,
+}
+
+impl std::fmt::Debug for TensorFSOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TensorFSOptions")
+            .field("endpoint", &self.endpoint)
+            .field("token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 /// A published release by name (th-245): a machine that holds no installation of it reads its
@@ -507,12 +524,23 @@ pub struct Progress {
     pub stage_fraction: Option<f64>,
 }
 
-/// One revision of an output: a single output is replaced by each, a list output grows. Its bytes
-/// are `GET /v1/runs/{id}/outputs/{output}`.
+/// A checkpoint stored by Runtime. `revision` names its immutable TensorFS tree.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct CheckpointRef {
+    pub repo_id: String,
+    pub revision: String,
+    pub variant: String,
+}
+
+/// One revision of an output: a single output is replaced by each, a list output grows. Byte
+/// outputs use `GET /v1/runs/{id}/outputs/{output}`; checkpoints are immutable references.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct Product {
     pub output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CheckpointRef>,
     /// A list item's 1-based index; 0 for a single output.
     pub index: u32,
     pub rev: u64,

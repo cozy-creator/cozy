@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use crate::{storage::Store, trees};
+use crate::{cas::Cas, trees};
 use tensorfs::{format::ObjectRef, sha256};
 use protocol::error::Error;
 
@@ -21,7 +21,7 @@ const MAX_CHUNK: usize = 1 << 20;
 
 pub struct WorkspaceUploads {
     root: PathBuf,
-    store: Arc<Store>,
+    cas: Cas,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,23 +64,23 @@ impl StoredObject {
 pub struct UploadedFile {
     pub filename: String,
     pub object: StoredObject,
-    store: Arc<Store>,
+    cas: Cas,
 }
 impl UploadedFile {
-    /// A carrier already held in the store (an object a run's signer wrote).
-    pub fn held(filename: String, object: &ObjectRef, store: Arc<Store>) -> Self {
+    /// A carrier already held (an object a run's signer wrote).
+    pub fn held(filename: String, object: &ObjectRef, cas: Cas) -> Self {
         Self {
             filename,
             object: StoredObject {
                 sha256: object.sha256.clone(),
                 length: object.length,
             },
-            store,
+            cas,
         }
     }
     /// Verify and hold the exact inode through a descriptor, never resolve a caller path.
     pub fn open(&self) -> Result<File, Error> {
-        self.store.file(&self.object.reference()).map_err(storage)
+        self.cas.file(&self.object.reference()).map_err(storage)
     }
 }
 
@@ -118,7 +118,7 @@ pub struct UploadSession {
 }
 
 impl WorkspaceUploads {
-    pub fn open(root: &Path, store: Arc<Store>) -> Result<Arc<Self>, Error> {
+    pub fn open(root: &Path, cas: Cas) -> Result<Arc<Self>, Error> {
         fs::create_dir_all(root).map_err(disk)?;
         let metadata = fs::symlink_metadata(root).map_err(disk)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -130,7 +130,7 @@ impl WorkspaceUploads {
         sync_dir(root)?;
         Ok(Arc::new(Self {
             root: root.to_owned(),
-            store,
+            cas,
         }))
     }
 
@@ -190,7 +190,7 @@ impl WorkspaceUploads {
             }
         };
         let payload = match &record.object {
-            Some(object) => self.store.file(&object.reference()).map_err(storage)?,
+            Some(object) => self.cas.file(&object.reference()).map_err(storage)?,
             None => platform::durable::open_nofollow(&directory.join(format!("{}.partial", record.carrier.filename)), OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600)).map_err(std::io::Error::from)
                 .map_err(disk)?,
         };
@@ -250,11 +250,11 @@ impl WorkspaceUploads {
             let Some(object) = record.object else {
                 return Ok(None);
             };
-            self.store.file(&object.reference()).map_err(storage)?;
+            self.cas.file(&object.reference()).map_err(storage)?;
             files.push(UploadedFile {
                 filename: carrier.filename.clone(),
                 object,
-                store: self.store.clone(),
+                cas: self.cas.clone(),
             });
         }
         let path = directory.join("root-set.json");
@@ -281,7 +281,7 @@ impl WorkspaceUploads {
         let directory = self.directory(actor, operation)?;
         let _lock = lock(&directory)?;
         for record in records(&directory)? {
-            trees::release(&self.store, &record.retention).map_err(storage)?;
+            trees::release(&self.cas, &record.retention).map_err(storage)?;
         }
         fs::remove_dir_all(&directory).map_err(disk)?;
         sync_dir(directory.parent().expect("owned operation parent"))
@@ -364,7 +364,7 @@ impl UploadSession {
         };
         let partial = self.directory.join(format!("{}.partial", self.record.carrier.filename));
         trees::import(
-            &self.uploads.store,
+            &self.uploads.cas,
             &self.record.retention,
             &[(self.record.carrier.filename.clone(), partial.as_path(), object.clone())],
         )
@@ -389,7 +389,7 @@ impl UploadSession {
                 "retained carrier length differs from accepted upload",
             ));
         }
-        self.uploads.store.file(&object.reference()).map_err(storage)?;
+        self.uploads.cas.file(&object.reference()).map_err(storage)?;
         Ok(())
     }
 }

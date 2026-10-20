@@ -15,6 +15,159 @@ use protocol::{
 use hub_client::{Client, Credential, DeviceKey, P256Key, RunToken, UserSession, testing, types};
 use sha2::{Digest as _, Sha256};
 
+/// Existing leaf-bound authorization accepts case-insensitive model inputs after Calcifer
+/// encodes their canonical operation names. No rental or Runtime invocation is started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mixed_case_model_inputs_reach_the_existing_hub_receiver_as_canonical_operations() {
+    use calcifer::store::NewRun;
+    use hub_client::Op;
+    use protocol::ids::RunId;
+    use tensorfs::{
+        fetch::{self, Client as FetchClient, Endpoint, SourcePolicy, upload_tree},
+        format::{Config as HeaderConfig, Dtype, Tree},
+        store::Store,
+        writer::{Data, Source},
+    };
+
+    let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
+    let (Some(url), Some(log), Some(ca)) = (
+        var("TENSORHUB_ORIGIN"),
+        var("TENSORHUB_LOG"),
+        var("TENSORHUB_CA"),
+    ) else {
+        return no_hub();
+    };
+    let home = tempfile::tempdir().unwrap();
+    let origin = config::Origin::parse(&url).unwrap();
+    let nonce = format!(
+        "{:x}",
+        Sha256::digest(home.path().to_string_lossy().as_bytes())
+    );
+    let account = format!("case{}", &nonce[..10]);
+    let anonymous = Client::connect(&url, reqwest::Client::new(), Credential::Anonymous);
+    let (key, bearer) = testing::sign_up(
+        &anonymous,
+        &format!("case-{}@example.test", &nonce[..10]),
+        Path::new(&log),
+    )
+    .await
+    .unwrap();
+    let hub = config::Hub {
+        name: None,
+        origin: origin.clone(),
+    };
+    key.save(&hub.device_key(&Home::at(home.path()))).unwrap();
+    Client::connect(
+        &url,
+        reqwest::Client::new(),
+        Credential::Bearer(bearer.token.clone()),
+    )
+    .register_account(&account, &types::Empty(Default::default()))
+    .await
+    .unwrap();
+
+    // Seed a real private checkpoint with the normal owner Bearer, so the existing receiver
+    // can validate the read operation against its actual model index.
+    let store = Store::open(home.path().join("source")).unwrap();
+    let mut writer = store.writer(None, None).unwrap();
+    let config: HeaderConfig = serde_json::from_str("{}").unwrap();
+    writer
+        .component("model", "conformance.Fixture", config, None)
+        .unwrap()
+        .put(
+            "weight",
+            &Dtype::U8,
+            &[7],
+            Data::Plain(Source::Read(&mut &b"weights"[..])),
+        )
+        .unwrap();
+    let header = writer.commit().unwrap();
+    let mut tree = Tree::default();
+    tree.set_variant("f32", header);
+    let tree = store.put_tree(&tree).unwrap();
+    let policy = SourcePolicy {
+        any_host: true,
+        allow_local: true,
+        max_redirects: 5,
+        ..Default::default()
+    };
+    let client = FetchClient::with_roots(policy, &std::fs::read(ca).unwrap()).unwrap();
+    let endpoint = Endpoint::new(&client, &url, Some(fetch::bearer(bearer.token))).unwrap();
+    upload_tree(&endpoint, &format!("{account}/base"), &tree, &store, None)
+        .await
+        .unwrap();
+
+    let tensord = common::Tensord::start();
+    let calcifer =
+        Calcifer::open(&home.path().join("calcifer"), &home.path().join("outputs")).unwrap();
+    let machine_key = common::key_file(home.path());
+    calcifer
+        .put_machine(&tensord.row("m", &machine_key))
+        .unwrap();
+    let machines = Machines::start(calcifer.clone(), Home::at(home.path()), &Default::default());
+    let mixed_read = format!("{}/Base", account.to_ascii_uppercase());
+    let mixed_destination = format!("model://{}/OuT", account.to_ascii_uppercase());
+    let models = [mixed_read.clone(), format!("{account}/base")]
+        .into_iter()
+        .map(|repository| v1::ModelChoice {
+            repository,
+            manifest: tree.id(),
+            ..Default::default()
+        })
+        .collect();
+    let (row, _) = calcifer
+        .store()
+        .submit(
+            "case-operations",
+            "d",
+            NewRun {
+                id: RunId::mint([53; 12]),
+                kind: Kind::Call,
+                target: "case/operations".into(),
+                hub: Some(origin),
+                machine: Some("m".into()),
+                pinned: true,
+                spec: v1::RunSpec {
+                    models,
+                    weights_destination: mixed_destination.clone(),
+                    ..Default::default()
+                },
+                out_dir: home.path().join("outputs"),
+                warnings: vec![],
+                inputs: vec![],
+                wants: None,
+            },
+        )
+        .unwrap();
+    let access = machines.hub_access(&row.id, "m").await.unwrap().unwrap();
+    // This is the ephemeral server fixture's existing TLS key, never a user's device key.
+    let identity: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(tensord.root.path().join("config/identity/identity.json")).unwrap(),
+    )
+    .unwrap();
+    let leaf = Arc::new(P256Key::from_pem(identity["private_key_pem"].as_str().unwrap()).unwrap());
+    let token = RunToken::new(&access.capability, &access.token_endpoint, leaf).unwrap();
+    assert!(token.names(Op::Read {
+        model: &format!("{account}/base"),
+        manifest: &tree.id()
+    }));
+    assert!(token.names(Op::Publish {
+        model: &format!("{account}/out")
+    }));
+    assert!(
+        !token
+            .token(&reqwest::Client::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let stored = calcifer.store().run(row.id.as_str()).unwrap().unwrap();
+    assert_eq!(stored.spec.models[0].repository, mixed_read);
+    assert_eq!(stored.spec.weights_destination, mixed_destination);
+    machines.close();
+    calcifer.close();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hub_is_listed_signed_in_and_a_rent_it_will_not_price_records_nothing() {
     let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());

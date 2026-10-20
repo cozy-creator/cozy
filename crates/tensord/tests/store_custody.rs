@@ -1,29 +1,28 @@
-//! Write objects keep their pins while an unfinished run names them; the store's
-//! GC takes them only once released.
+//! Written run objects stay while an unfinished run names them; a sweep takes them only once
+//! nothing does.
 use tensord::{
+    cas::Cas,
     execution::Engine,
     journal::{InputFile, Invocation, State},
     objects::Objects,
 };
 use std::{fs, path::PathBuf, sync::Arc, time::Duration};
-use tensord::storage::{self, Store};
 use tensorfs::format::ObjectRef;
 
 struct Area {
     root: PathBuf,
-    store: Arc<Store>,
+    cas: Cas,
     engine: Arc<Engine>,
     objects: Objects,
 }
 impl Area {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!("cm-custody-{}", uuid::Uuid::new_v4()));
-        let store = Arc::new(storage::open(&root.join("store")).unwrap().as_ref().clone().with_grace(Duration::ZERO));
         let engine = Engine::open(&root.join("state")).unwrap();
-        let objects = Objects::new(&root.join("writes"), store.clone(), engine.clone()).unwrap();
+        let objects = Objects::new(&root.join("writes"), engine.clone()).unwrap();
         Self {
             root,
-            store,
+            cas: engine.cas(),
             engine,
             objects,
         }
@@ -37,14 +36,12 @@ impl Area {
         object
     }
     fn present(&self, object: &ObjectRef) -> bool {
-        storage::present(&self.store, object)
+        self.cas.path(object).unwrap().is_file()
     }
-    /// A release of every pin nothing needs now, then the store's GC.
+    /// A sweep of every object nothing needs now.
     fn collect(&self) -> usize {
         std::thread::sleep(Duration::from_millis(5));
-        let released = self.objects.release(Duration::ZERO).unwrap();
-        self.store.gc().unwrap();
-        released
+        self.objects.release(Duration::ZERO).unwrap()
     }
 }
 impl Drop for Area {
@@ -71,8 +68,6 @@ fn invocation(object: &ObjectRef) -> Invocation {
 fn an_acknowledged_write_survives_gc_until_its_run_ends() {
     let area = Area::new();
     let object = area.write(b"accepted run input");
-    // Pinned before the journal row: the store's GC alone never takes it.
-    area.store.gc().unwrap();
     assert!(area.present(&object));
     let run = area.engine.submit("queued", invocation(&object)).unwrap();
     assert_eq!(run.state, State::Queued);
@@ -128,9 +123,8 @@ fn unsubmitted_writes_and_crash_orphans_age_out() {
     let unsubmitted = area.write(b"write never submitted");
     // Within the TTL an acknowledged Write waits for its run.
     assert_eq!(area.objects.release(tensord::reclaim::TTL).unwrap(), 0);
-    // A pin written just before a crash, with no journal row.
-    let orphan = area.store.put_bytes(b"death between pin and journal").unwrap();
-    storage::hold(&area.store, &storage::pin::object(&orphan.sha256), vec![orphan.clone()], None).unwrap();
+    // An object written just before a crash, with no journal row.
+    let orphan = area.cas.put_bytes(b"death between write and journal").unwrap();
     assert_eq!(
         area.objects.release(tensord::reclaim::IDLE).unwrap(),
         0

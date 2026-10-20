@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.metadata
+import importlib.util
 import os
 import pathlib
 import subprocess
@@ -22,8 +23,8 @@ PACKAGE = "tensorfs"
 # abi3 is forward compatible by construction: a cp312-abi3 wheel loads on 3.12 and every
 # later CPython. The floor is real; there is no ceiling to assert.
 PYTHON_SPEC = ">=3.12"
-CURRENT_CARGO_VERSION = "0.11.0"
-CURRENT_PYTHON_VERSION = "0.11.0"
+CURRENT_CARGO_VERSION = "0.13.0"
+CURRENT_PYTHON_VERSION = "0.13.0"
 
 
 def _toml(path: pathlib.Path) -> dict[str, object]:
@@ -148,13 +149,22 @@ def installed_version(path: pathlib.Path) -> str:
             f"installed METADATA version {metadata_version!r} != wheel version {expected!r}"
         )
     import tensorfs
+    from tensorfs import _ext
 
     if tensorfs.__version__ != expected:
         raise ValueError(
             f"tensorfs.__version__ {tensorfs.__version__!r} != wheel version {expected!r}"
         )
-    if not hasattr(tensorfs, "Store"):
-        raise ValueError("tensorfs must install the full Store API as well as the CLI")
+    for name in ("open", "Writer", "upload_folder", "Tensors"):
+        if not callable(getattr(tensorfs, name, None)):
+            raise ValueError(f"tensorfs must install the full public component API: missing {name}")
+    if hasattr(tensorfs, "Store"):
+        raise ValueError("the internal Store is exposed by the public package")
+    for obsolete in ("Closure", "ReadPlan", "parse_header", "plan", "regions"):
+        if hasattr(tensorfs, obsolete) or hasattr(_ext, obsolete):
+            raise ValueError(f"removed legacy utility {obsolete} is exposed by the package")
+    if importlib.util.find_spec("tensorfs.records") is not None:
+        raise ValueError("the removed legacy header projection remains importable")
     installed_tfs = pathlib.Path(sysconfig.get_path("scripts")) / "tfs"
     if not os.access(installed_tfs, os.X_OK):
         raise ValueError(f"install put no executable tfs at {installed_tfs}")

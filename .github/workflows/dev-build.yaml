@@ -6,10 +6,10 @@ name: dev-build
 # cozy-<sha> (the runner arch's dev `cozy`, <version>+dev.g<sha8>, which `cozy machine update --tensord`
 # runs on any machine: `ghbuild.sh cozy <ref> cozy`, `-r ubuntu-24.04-arm` for arm64) and
 # tensorfs-wheel-<sha> (the manylinux x86_64 wheel). The cozy binary's release archives are dist's
-# (release.yml). Tests get PostgreSQL (AUTHKIT_TEST_DATABASE_URL), the dev cozy
-# (COZY_TEST_DEV_BINARY) when it was built, the TensorFS wheel installed in a venv
-# (TENSORFS_TEST_PYTHON) and its wheel (COZY_TEST_TENSORFS_WHEEL) when it was built, and a Runtime
-# wheel (COZY_TEST_RUNTIME_WHEEL): the newest published one, or runtime_ref's, stamped with its commit.
+# (release.yml). Tests get the dev cozy (COZY_TEST_DEV_BINARY) when it was built, the TensorFS
+# wheel installed in a venv (TENSORFS_TEST_PYTHON) and its wheel (COZY_TEST_TENSORFS_WHEEL) when it
+# was built, and a Runtime wheel (COZY_TEST_RUNTIME_WHEEL): the newest published one, or
+# runtime_ref's, stamped with its commit.
 # Machines the tests start install that pair. No whole-suite default: `test` is empty unless given.
 # ci.yaml calls it on every PR and master push.
 on:
@@ -20,7 +20,7 @@ on:
         type: string
         default: master
       build:
-        description: "cozy: the dev cozy binary; tensord: the manylinux tensord; tensorfs: the TensorFS wheel; none: tests only (comma-separate several)"
+        description: "cozy: the dev cozy binary; tensord: the manylinux tensord; tensorfs: the TensorFS wheel; kernels: CUDA AOT only; none: tests only (comma-separate several)"
         type: string
         default: none
       test:
@@ -28,11 +28,19 @@ on:
         type: string
         default: ''
       features:
-        description: "Cargo features of the cozy and tensord builds: migrate is a dev build (xs-045 U12), never a release"
+        description: "Cargo features of the cozy and tensord builds (cozy's migrate: the A11 dev build, never a release)"
         type: string
         default: ''
       runtime_ref:
         description: cozy-runtime branch, tag or SHA whose wheel tests get as COZY_TEST_RUNTIME_WHEEL; empty for the newest published
+        type: string
+        default: ''
+      tensorfs_run:
+        description: Existing dev-build run whose TensorFS wheel the targeted tests install
+        type: string
+        default: ''
+      tensorhub_ref:
+        description: Optional Tensorhub source to check out at .tensorhub for targeted live tests
         type: string
         default: ''
       runner:
@@ -48,6 +56,7 @@ on:
 run-name: dev-build ${{ inputs.ref }} ${{ inputs.build }} ${{ inputs.runtime_ref }} ${{ inputs.nonce }}
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -84,7 +93,7 @@ jobs:
           go-version-file: crates/tensord/tests/hub-oauth/go.mod
           cache-dependency-path: crates/tensord/tests/hub-oauth/go.sum
       - uses: astral-sh/setup-uv@v6
-        if: inputs.test != '' || inputs.runtime_ref != ''
+        if: inputs.test != '' || inputs.runtime_ref != '' || inputs.tensorfs_run != '' || contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
       # The Rust workspace: rust-toolchain.toml's toolchain installs on first use. target/manylinux
       # is the TensorFS wheel's container build.
       - uses: Swatinem/rust-cache@v2
@@ -145,15 +154,30 @@ jobs:
           retention-days: 7
       # TensorFS's release wheel: the extension and the `tfs` it carries, both built in the
       # manylinux container so their glibc floor is the wheel's tag.
+      - name: Compile prebuilt TensorFS CUDA decode kernels
+        if: contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
+        run: |
+          uv run --no-project --python 3.12 --with triton==3.8.0 python crates/tensorfs-py/kernels/build.py
+          TENSORFS_REQUIRE_AOT=1 cargo test -p tensorfs --test kernel_plan -- --include-ignored --test-threads=2
+      - if: contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
+        uses: actions/upload-artifact@v4
+        with:
+          name: tensorfs-kernels-${{ steps.sha.outputs.sha }}
+          path: crates/tensorfs/kernels/aot/
+          if-no-files-found: error
+          retention-days: 7
       - name: Build the TensorFS wheel
         if: contains(inputs.build, 'tensorfs')
         uses: PyO3/maturin-action@v1
         with:
           maturin-version: v1.15.0
           target: x86_64
-          manylinux: auto
+          # Match cozy and the cached build scripts' glibc floor. Auto may select
+          # manylinux2014, which cannot execute the shared manylinux_2_28 cache.
+          manylinux: '2_28'
           working-directory: crates/tensorfs-py
           args: --release --locked --target-dir ../../target/manylinux --out dist
+          docker-options: -e TENSORFS_REQUIRE_AOT=1
           before-script-linux: |
             cargo build --release --locked --target-dir ../../target/manylinux -p tensorfs --bin tfs
             install -D -m 755 ../../target/manylinux/release/tfs wheel-data/scripts/tfs
@@ -167,12 +191,27 @@ jobs:
           path: crates/tensorfs-py/dist/*.whl
           if-no-files-found: error
           retention-days: 7
-      - if: contains(inputs.build, 'tensorfs') && inputs.test != ''
+      - if: contains(inputs.build, 'tensorfs')
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/tensorfs"
           uv pip install --python "$RUNNER_TEMP/tensorfs/bin/python" crates/tensorfs-py/dist/*.whl
           echo "TENSORFS_TEST_PYTHON=$RUNNER_TEMP/tensorfs/bin/python" >> "$GITHUB_ENV"
           echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$PWD"/crates/tensorfs-py/dist/tensorfs-*.whl)" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/tensorfs/bin/python" crates/tensorfs-py/scripts/kernel_conform.py
+      - if: inputs.tensorfs_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.tensorfs_run }}
+          pattern: tensorfs-wheel-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/tensorfs-artifact
+      - if: inputs.tensorfs_run != ''
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/tensorfs"
+          uv pip install --python "$RUNNER_TEMP/tensorfs/bin/python" "$RUNNER_TEMP"/tensorfs-artifact/*.whl
+          echo "TENSORFS_TEST_PYTHON=$RUNNER_TEMP/tensorfs/bin/python" >> "$GITHUB_ENV"
+          echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$RUNNER_TEMP"/tensorfs-artifact/*.whl)" >> "$GITHUB_ENV"
       - if: inputs.runtime_ref != ''
         uses: actions/checkout@v5
         with:
@@ -193,6 +232,14 @@ jobs:
             --platform manylinux_2_28_x86_64 --dest "$RUNNER_TEMP/runtime" cozy-runtime
       - if: inputs.test != '' || inputs.runtime_ref != ''
         run: echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
+      - if: inputs.tensorhub_ref != ''
+        uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/tensorhub
+          ref: ${{ inputs.tensorhub_ref }}
+          ssh-key: ${{ secrets.TENSORHUB_READ_KEY }}
+          persist-credentials: false
+          path: .tensorhub
       # The machine's executor containment needs a delegated cgroup subtree.
       - if: inputs.test != ''
         env:
@@ -209,3 +256,13 @@ jobs:
             --setenv="GOCACHE=$(go env GOCACHE)" --setenv="GOMODCACHE=$(go env GOMODCACHE)" \
             --setenv=CARGO_TERM_COLOR=never --setenv=GITHUB_ACTIONS=true "${locations[@]}" \
             bash -euo pipefail -c "$TEST"
+      # Targeted proof commands may produce portable test executables and their source/hash
+      # receipts. Export those exact files so a later paid worker needs no compiler.
+      - name: Retain targeted proof executables
+        if: always() && hashFiles('dist/testbins/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-testbins-${{ steps.sha.outputs.sha }}
+          path: dist/testbins/**
+          if-no-files-found: error
+          retention-days: 7

@@ -320,15 +320,14 @@ defines the workloads. Download projections are separate from these measured tim
 
 ## Get started
 
-The target TensorFS 0.13 interface uses the component API and hard-cut header/tree format. Python 3.12 or later is
-required; the current master implementation is still being integrated. The wheel includes the Python module and `tfs`:
+Python 3.12 or later is required. The wheel includes the Python module and `tfs`:
 
 ```bash
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install tensorfs
 
-tfs import hf://hf-internal-testing/tiny-sdxl-pipe --name local/example
+tfs convert hf://hf-internal-testing/tiny-sdxl-pipe --name local/example@1
 tfs inspect local/example
 tfs export local/example ./example --safetensors
 ```
@@ -349,7 +348,8 @@ and quantized tensors return their encoded arrays and parameters. Use `decode=Tr
 above, when the consumer needs ordinary floating-point weights. Frameworks wrap arrays
 through their DLPack entry point. DLPack is the memory-sharing protocol, not a separate
 array library to install. `component.config` is structured JSON, `component.asset(name)` reads an asset,
-and explicit `component.export_files(directory)` is only a compatibility convenience for legacy path-only loaders.
+and `component.export_files()` (a cache-managed folder, or the directory you name) is only a convenience for
+path-only loaders.
 
 ## Checkpoints and repositories
 
@@ -393,16 +393,18 @@ tensorfs.upload_folder(repo_id="local/example", revision="draft", folder_path=".
 tensorfs.upload_folder(repo_id="acme/example", folder_path="./portable", endpoint="file:///srv/origin")
 ```
 
-A normal save writes one .cozytensors header file, with its tensors and supporting-file bytes retained in
-the shared store. The file contains content hashes, not physical store paths. `Writer()` without a destination
-keeps the checkpoint in the store without writing a user-visible header file. An explicit native portable export
-writes `model.cozytensors` (or a named variant) plus complete `chunks/<sha256>` objects. `base=` reuses unchanged
-tensors and `resume=` journals local work. `Writer(repo_id=…, endpoint=…, token=…)` streams new objects
-and appends an unreleased tree. Its successful checkpoint carries the exact published tree; an upload failure keeps
-`writer.local_checkpoint` and remains an error.
+A `.cozytensors` file is a small handle into the shared local store, not a self-contained file: a save writes the
+header, and its tensors and supporting-file bytes stay in the store while that file holds this header. Delete or
+overwrite the file and the data ages out like any other cache entry. The copy for another machine is
+`materialize(checkpoint, local_dir=…)`: `model.cozytensors` (or a named variant) plus complete `chunks/<sha256>`
+objects. `Writer()` without a destination keeps the checkpoint in the store as a cache entry. `base=` reuses
+unchanged tensors and `resume=` journals local work. `Writer(repo_id=…, endpoint=…, token=…)` streams new objects
+and appends an unreleased tree, named `model.<variant>.cozytensors` by `variant=`, which needs `repo_id`. Its
+successful checkpoint carries the exact published tree; an upload failure keeps `writer.local_checkpoint` and
+remains an error.
 
 The default endpoint is `https://tensorhub.com`; `configure(endpoint=…)` or `TENSORFS_ENDPOINT` changes it.
-`token=` accepts a string, a native DPoP provider, a callable, or an object with `headers(method, url, headers,
+`token=` accepts a string, a callable, or an object with `headers(method, url, headers,
 payload)` and optional `retry(method, url, headers, payload, status, response_headers)`. The payload is its SHA-256
 hex digest when known. Credentials are presented afresh per request and removed on redirects to another origin.
 Public data needs no account. [Distribution](../tensorfs/spec/distribution.md) defines endpoint routes and publication.
@@ -411,7 +413,7 @@ Public data needs no account. [Distribution](../tensorfs/spec/distribution.md) d
 
 The shared local store is internal. Its default root is `~/.cache/tensorfs`; `cache_dir=` and `TENSORFS_HOME` override it. Processes
 share immutable objects and coordinated records. Admission hashes bytes before installing them by rename; ordinary
-opens check lengths. Saved local roots are retained separately from evictable download-cache entries; deleting a header file only removes that handle. Explicit verification rehashes on demand. TensorFS is a library and has no daemon.
+opens check lengths. A saved header file roots its data until the file is deleted or holds another header. Explicit verification rehashes on demand. TensorFS is a library and has no daemon.
 
 Runtime and TensorD use this same public API. Callers read and write the shared store and upload with a supplied
 credential. TensorFS owns I/O and decoding; varena owns memory placement. Installing the wheel does

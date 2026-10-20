@@ -2,6 +2,8 @@
 //! no model (a script) is given the GPUs it asks for, all in its one process, and a count wider
 //! than the machine is refused by name; a call that ignores its cancel is killed once its
 //! patience is spent, ends CANCELED saying so, and its GPU serves the next run.
+#[path = "common/named_runtime.rs"]
+mod named_runtime;
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 use std::{
     path::Path,
@@ -29,11 +31,21 @@ fn boot(home: &Path) -> (Machine, Client) {
     std::fs::create_dir_all(&keys).unwrap();
     let owner = SigningKey::from_bytes(&[6; 32]);
     std::fs::write(keys.join("owner.pem"), owner.to_pkcs8_pem(Default::default()).unwrap().as_bytes()).unwrap();
-    // The operator's GPU settings over the probe's: this runner has no GPU, so the envelope is
-    // named here. Nothing in the fixture touches a device.
+    // CPU scheduler/process fixture only: the declared envelope and inventory agree,
+    // so admission can create real ledger rows without touching CUDA. Unique identities
+    // prevent concurrent tests sharing a ledger; this does not qualify GPU placement.
     let state = home.join(".cozy/machine/var/lib/cozy/machine");
     std::fs::create_dir_all(&state).unwrap();
-    std::fs::write(state.join("gpu-config.json"), r#"{"devices": "0,1", "prespawn": false}"#).unwrap();
+    let identity = uuid::Uuid::new_v4().simple().to_string();
+    let inventory: Vec<_> = (0..2).map(|index| serde_json::json!({
+        "device_index": index, "device_name": "CPU scheduler fixture",
+        "device_uuid": format!("GPU-scheduler-{identity}-{index}"),
+        "driver_version": "fixture", "memory_bytes": 8u64 << 30, "pci_bus_id": "fixture"
+    })).collect();
+    std::fs::write(state.join("gpu-config.json"), serde_json::to_vec(&serde_json::json!({
+        "devices": "0,1", "inventory": inventory, "prespawn": false
+    })).unwrap()).unwrap();
+    named_runtime::image(&home.join(".cozy/machine"));
     let mut machine = Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
             .arg("--persistent")
@@ -138,30 +150,28 @@ async fn a_call_that_ignores_its_cancel_is_killed_and_its_gpu_serves_the_next_ru
         ..Default::default()
     };
     client.submit(&v1::RunRequest { id: "stuck".into(), spec }).await.unwrap();
-    let start = Instant::now();
-    let pid: i32 = loop {
-        if let Some(pid) = std::fs::read_to_string(&pidfile).ok().and_then(|text| text.trim().parse().ok()) {
-            break pid;
-        }
-        assert!(start.elapsed() < Duration::from_secs(600), "the stubborn call never started");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    client.cancel("stuck").await.unwrap();
+    // Canceled once its pid is written; a run that ends before then fails here, not a clock.
     let mut events = Box::pin(client.events("stuck", 0).await.unwrap());
-    let (mut lines, mut outcome) = (vec![], None);
-    while let Some(event) = events.next().await {
-        let event = event.unwrap().event;
+    let (mut lines, mut pid) = (vec![], None::<i32>);
+    let outcome = loop {
+        if pid.is_none() {
+            pid = std::fs::read_to_string(&pidfile).ok().and_then(|text| text.trim().parse().ok());
+            if pid.is_some() {
+                client.cancel("stuck").await.unwrap();
+            }
+        }
+        let event = tokio::select! {
+            event = events.next() => event.expect("the run's log ended without an outcome").unwrap().event,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => continue,
+        };
         eprintln!("stuck: {event:?}");
         match event {
             v1::Event::Log(line) => lines.push(line.text),
-            v1::Event::Outcome(ended) => {
-                outcome = Some(ended);
-                break;
-            }
+            v1::Event::Outcome(ended) => break ended,
             _ => {}
         }
-    }
-    let outcome = outcome.expect("an outcome");
+    };
+    let pid = pid.unwrap_or_else(|| panic!("the stubborn call ended before it ran: {outcome:?}"));
     assert_eq!(outcome.status, "canceled", "{outcome:?}");
     assert!(lines.iter().any(|l| l.contains("it did not stop for its cancel")), "{lines:?}");
     assert!(!Path::new(&format!("/proc/{pid}")).exists(), "the stubborn executor still runs");

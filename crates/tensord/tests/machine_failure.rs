@@ -2,6 +2,8 @@
 //! `reason.detail`, so `cozy run show` explains it once the machine is gone.
 #[path = "common/child.rs"]
 mod child;
+#[path = "common/named_runtime.rs"]
+mod named_runtime;
 use child::BareEnv;
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 use std::{
@@ -31,6 +33,7 @@ async fn a_raising_calls_traceback_travels_with_its_run() {
     std::fs::create_dir_all(&keys).unwrap();
     let owner = SigningKey::from_bytes(&[5; 32]);
     std::fs::write(keys.join("owner.pem"), owner.to_pkcs8_pem(Default::default()).unwrap().as_bytes()).unwrap();
+    named_runtime::image(&home.path().join(".cozy/machine"));
     let mut machine = Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
             .arg("--persistent")

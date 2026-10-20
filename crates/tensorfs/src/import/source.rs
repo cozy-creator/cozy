@@ -162,8 +162,8 @@ struct Index {
 
 impl SourceSet {
     /// The source from `(relative path, local file)` pairs: each `*.safetensors.index.json`
-    /// with its shards is one group, every other `*.safetensors` file one group, and the rest
-    /// plain files.
+    /// with its shards is one group, every other `*.safetensors` file one group (groups by
+    /// folder, then stem, however they are sharded), and the rest plain files.
     pub fn scan(members: &[(String, PathBuf)]) -> Result<SourceSet> {
         let mut set = SourceSet::default();
         let by_path: BTreeMap<&str, &PathBuf> =
@@ -245,6 +245,7 @@ impl SourceSet {
                 set.files.push(local.clone());
             }
         }
+        set.groups.sort_by(|a, b| (&a.folder, &a.stem).cmp(&(&b.folder, &b.stem)));
         Ok(set)
     }
 

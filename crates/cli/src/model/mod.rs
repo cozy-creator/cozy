@@ -9,7 +9,7 @@ use crate::Context;
 mod catalog;
 mod machine;
 #[cfg(feature = "migrate")]
-mod migrate;
+mod migrate_headers;
 mod quantize;
 pub(crate) mod refs;
 mod releases;
@@ -44,10 +44,10 @@ enum Verb {
     Yank(Yank),
     /// Delete a model whose releases are yanked, or one unreleased checkpoint.
     Delete(Delete),
-    /// Dev builds only: move checkpoints from before TensorFS's format cut onto the new format.
+    /// Dev builds only: move models from before D10 onto it, header-only.
     #[cfg(feature = "migrate")]
     #[command(hide = true)]
-    Migrate(migrate::Args),
+    MigrateHeaders(migrate_headers::Args),
 }
 
 #[derive(clap::Args, Debug)]
@@ -205,6 +205,6 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Verb::Upload(args) => machine::upload(ctx, args).await,
         Verb::Quantize(args) => quantize::quantize(ctx, args).await,
         #[cfg(feature = "migrate")]
-        Verb::Migrate(args) => migrate::exec(ctx, args).await,
+        Verb::MigrateHeaders(args) => migrate_headers::exec(ctx, args).await,
     }
 }

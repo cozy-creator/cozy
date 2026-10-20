@@ -2,11 +2,9 @@
 
 Open a model and read its tensors. TensorFS fetches missing data into its shared store
 automatically; normal loading does not create a snapshot folder. This guide covers the
-complete planned Python API, with optional filesystem and repository tools kept separate.
-
-This is the **0.13 target**, currently being integrated. The implementation on `master`
-can still expose the preceding interface. The [Rust API](../tensorfs/API.md) and
-[technical file-format specification](../tensorfs/spec/cozytensors.md) are separate documents.
+Python API, with optional filesystem and repository tools kept separate. The
+[Rust API](../tensorfs/API.md) and [file-format specification](../tensorfs/spec/cozytensors.md)
+are separate documents.
 
 - [Import and open a model](#python-import-and-open-a-model)
 - [Use the returned objects](#python-use-the-returned-objects)
@@ -48,9 +46,9 @@ This waits for all declared chunks and component assets. It does not create a fo
 unpack quantized weights or place them on a GPU. To preload only selected components,
 open lazily and call `checkpoint.download(components=["unet"])`.
 
-For a private model, pass `token=...`. Other options are `endpoint`, `cache_dir`,
-`local_files_only` and `ca_der` (private CA bytes). `local_files_only=True` forbids network
-access and fails if the required data is unavailable locally.
+For a private model, pass `token=...`. Other options are `endpoint`, `cache_dir` and
+`local_files_only`. `local_files_only=True` forbids network access and fails if the required
+data is unavailable locally. A private CA is set once, with `tensorfs.configure(ca_der=...)`.
 
 ## Python: use the returned objects
 
@@ -72,6 +70,7 @@ A `Pipeline` has `cls` and `config`. A `Component` exposes:
 | `name` | Component name, such as `unet`. |
 | `cls` | Model class identifier. |
 | `config` | Parsed JSON configuration as a dictionary. |
+| `config_file` | The file name `config` exports as: `config.json` unless the writer named another. |
 | `tensors` | A `Tensors` mapping, described below. |
 | `assets` | Supporting filenames mapped to `(sha256_hex, byte_length)` references; this does not load file contents. |
 | `asset(name)` | Read a supporting file, fetching it if needed; returns `bytes`. |
@@ -88,10 +87,10 @@ print(list(tokenizer.assets))
 tokenizer_bytes = tokenizer.asset("tokenizer.json")
 ```
 
-For import/export compatibility, the format internally retains the filename to use
-when recreating a component's configuration file. For example, a scheduler can require
+For import/export compatibility, `config_file` is the filename to use when recreating a
+component's configuration file. For example, a scheduler can require
 `scheduler_config.json` rather than `config.json`. Loading directly from `config` does not
-require a filename; conversion preserves it automatically.
+require a filename; conversion and a `Writer(base=...)` rewrite preserve it.
 
 ### Inspect tensor metadata without reading weights
 
@@ -181,8 +180,9 @@ as `weight[row, column] * scale[row]`.
 These are ordinary arrays with their own dtype and shape. Consumers receive their values;
 TensorFS handles the underlying chunk locations and byte offsets.
 
-For an encoded tensor, `decode=False` returns `Encoded`: the loaded `scheme`, `params`,
-and a role-to-`Array` mapping named `parts`. For a plain tensor it still returns `Array`.
+For an encoded tensor, `decode=False` returns `Encoded`: the logical `dtype` and `shape`,
+the loaded `scheme` and `params`, and a role-to-`Array` mapping named `parts`. For a plain
+tensor it still returns `Array`.
 A consumer of encoded weights must understand that scheme and its parameters.
 `device` chooses where the arrays live; `decode` chooses their representation. Our
 Runtime keeps supported quantized weights encoded for its matching compute kernels.
@@ -198,11 +198,18 @@ copied_bytes = bytes(destination)
 encoded = unet.tensors.read("some_quantized.weight", decode=False)
 packed = bytearray(encoded.parts["weight"].nbytes)
 unet.tensors.read_into("some_quantized.weight", packed, role="weight", offset=0)
+
+# Or its decoded logical bytes, from byte 64:
+window = bytearray(256)
+unet.tensors.read_into("some_quantized.weight", window, decode=True, offset=64)
 ```
 
-The destination determines the number of bytes copied. `offset` is a byte offset, and
-`role` selects an encoded part. Without a role, encoded weights are decoded. This call
-does not convert to the destination's dtype; provide the appropriate size and representation.
+`read_into(key, out, *, role=None, decode=False, offset=0)` follows `read`. The destination
+determines the number of bytes copied, and `offset` is a byte offset. A plain tensor gives
+its data. `role` selects one stored part of an encoded tensor, and `decode=True` gives its
+decoded logical bytes. An encoded tensor with neither raises `InvalidError` naming its
+roles, and a role with `decode=True` is refused too. This call does not convert to the
+destination's dtype; provide the appropriate size and representation.
 
 ### Download, verify and manage a checkpoint
 
@@ -215,7 +222,8 @@ checkpoint.download(components=["unet"], priority=0, progress=on_progress)
 
 `download` returns when all requested chunks and supporting files are verified and locally
 available, or raises an error. The open checkpoint retains them. Closing its last handle
-allows ordinary cache policy to apply again; saving a checkpoint uses durable retention.
+allows ordinary cache policy to apply again; a saved header file roots its data while it
+holds that header.
 Progress callbacks receive `(stage, completed, total)`; download counts are locally available
 bytes out of requested bytes, while conversion counts are tensors.
 
@@ -244,16 +252,14 @@ Additional checkpoint properties and operations:
 
 | Attribute or call | Meaning |
 |---|---|
-| `id`, `header_ref` | Header identity: `sha256:…` string and `(hex, length)` pair. May be absent for a parsed-only header. |
+| `id`, `header_ref` | Header identity: `sha256:…` string and `(hex, length)` pair. |
 | `tree`, `tree_ref` | Repository-tree identity in the same two forms, when known. |
-| `name`, `repo_id` | Repository name; `repo_id` is an alias. |
-| `release`, `revision` | Release label, when known; `revision` is an alias. |
+| `repo_id` | Repository name, when known. |
+| `revision` | Release label, when known. |
 | `variant` | Selected repository variant, when known. A standalone header does not store this label. |
 | `pipeline`, `components` | Pipeline description and ordered component mapping. |
 | `metadata` | Loading/provenance metadata. |
 | `chunks` | Chunk object references in header order, as `(sha256_hex, byte_length)` pairs. |
-| `Checkpoint.parse(header_bytes)` | Inspect a binary header without a store; it does not grant access to its objects. |
-| `open_chunk(index)` | Return a new read-only OS file descriptor; the caller must close it. |
 | `close()` | Release this checkpoint handle. Existing child handles remain valid. |
 
 Use `with tensorfs.open(...) as checkpoint:` for automatic close. `Array` implements
@@ -298,11 +304,7 @@ and `read` instead of managing these ranges.
 
 ### Advanced: decode resident encoded parts
 
-`tensorfs.raw.decode_into` is an approved **0.13 target** in the reviewed resident-decode
-source branches. Native compilation and installed CPU/GPU qualification are still pending;
-this section does not establish availability in an installed release.
-
-This operation is for integrations that already hold encoded parts in memory and own the
+`tensorfs.raw.decode_into` is for integrations that already hold encoded parts in memory and own the
 destination. It does not open a checkpoint or fetch data. Ordinary model code continues to
 use `component.tensors.read(..., decode=True)`. Its signature in `tensorfs.raw` is:
 
@@ -397,8 +399,9 @@ The context commits on normal exit. `commit()` returns a `Checkpoint` and return
 result on later successful calls. A raw Python buffer needs explicit `dtype` and `shape`;
 a DLPack input supplies them, and contradictory explicit values are refused.
 
-The destination is one header file; tensor and supporting-file bytes are admitted once
-into the configured shared store:
+A `.cozytensors` file is a small handle into the shared local store, not a self-contained
+file. The destination gets only the header; tensor and supporting-file bytes are admitted
+once into the store:
 
 ```text
 ./model.cozytensors          # binary metadata and content-hash references
@@ -407,40 +410,37 @@ $TENSORFS_HOME/blobs/...     # shared tensor and supporting-file bytes
 
 The header contains pipeline/component configuration, tensor names, dtypes, shapes,
 encodings and references. Store paths, credentials and endpoint URLs stay in configuration,
-not in the file. Moving or copying the file preserves its content identity. Opening it
-uses the configured store and, when needed and allowed, the configured source.
+not in the file. Opening it uses the configured store and, when needed and allowed, the
+configured source.
 
-The file identifies one checkpoint, not an enclosing repository tree. It contains the
-component configuration and run data references, but no release label or repository
-README/LICENSE files. Opening a copied header cannot reconstruct that missing repository
-context. Those fields remain available on a checkpoint opened through its repository.
+The store keeps the saved data while that file still holds this header. Once the file is
+deleted, moved or overwritten with another header, the data ages out like any other cache
+entry; open checkpoints keep their bytes meanwhile. To copy a checkpoint to another machine,
+write the portable form with `tensorfs.materialize(saved, local_dir=...)` (described below).
 
-A successful save retains its data as a durable store root before atomically publishing
-the header. Ordinary cache cleanup must not evict that root. Deleting or replacing the
-file removes only that handle; releasing its saved data is an explicit store-management
-operation.
+The file identifies one checkpoint, not an enclosing repository tree. It contains no release
+label or repository README/LICENSE files; those remain available on a checkpoint opened
+through its repository.
 
-`Writer(dest=None, ...)` keeps the checkpoint in the shared store without writing a header
-file. `dest` is a literal file path, not a directory.
-
-Leave `variant` unset when `dest` is supplied; that combination is invalid. TensorFS does
-not append or infer a variant label from the filename. For example,
-`Writer("model.f32.cozytensors")` writes that exact filename without assigning a repository
-variant. Tensor dtypes and encodings describe the representation independently.
+`Writer(dest=None, ...)` keeps the checkpoint in the shared store as a cache entry, without a
+header file. `dest` is a literal file path, not a directory; TensorFS does not infer a
+variant label from the filename. `variant` names `model.<variant>.cozytensors` in a
+`repo_id` upload and raises `InvalidError` without `repo_id`. To build a multi-variant folder
+locally, write each header to its own `model.<variant>.cozytensors` path in that folder.
 
 Its options and members are:
 
 | Option or member | Use |
 |---|---|
-| `variant` | Optional repository/export label when `dest=None`; invalid with a file destination. |
+| `variant` | The uploaded file's label, `model.<variant>.cozytensors`; only with `repo_id`. |
 | `base` | Start from an existing checkpoint and reuse unchanged data. |
 | `resume` | Resume keyed local write state. |
-| `repo_id`, `endpoint`, `token`, `ca_der` | Stream the new checkpoint to a repository using supplied access. |
+| `repo_id`, `endpoint`, `token` | Stream the new checkpoint to a repository using supplied access. |
 | `cache_dir` | Choose the local store/cache. |
 | `metadata` | Mutable loading/provenance metadata dictionary. |
 | `local_checkpoint` | A committed local result retained after an upload failure, if one exists. |
 | `pipeline(cls, config)` | Set the pipeline description. |
-| `component(name, cls=..., config=...)` | Create or reopen a component and return its `ComponentWriter`. |
+| `component(name, cls=..., config=..., config_file=None)` | Create or reopen a component and return its `ComponentWriter`. `config_file` names the file its config exports as (`scheduler_config.json`); the default keeps a reopened or base component's, else `config.json`. |
 | `has(component, key)` | Check a current/resumed write, excluding untouched tensors inherited from the base. |
 | `commit()` | Finish and return the checkpoint; a first commit error is cached and re-raised. |
 | `abandon()` | End without producing a new checkpoint. |
@@ -481,7 +481,8 @@ resolution call is needed. These are upstream source revisions, not Tensorhub br
 ### Choose defaults and credentials
 
 ```python
-tensorfs.configure(endpoint="https://tensorhub.com", cache_dir="/path/to/cache", token=my_token)
+tensorfs.configure(endpoint="https://tensorhub.com", cache_dir="/path/to/cache", token=my_token,
+                   ca_der=private_ca_der)
 print(tensorfs.__version__)
 ```
 
@@ -495,12 +496,12 @@ checkpoint = tensorfs.open("me/model", endpoint="https://tensorhub.com", token=m
 
 The default endpoint is `https://tensorhub.com`; environment settings include
 `TENSORFS_ENDPOINT`, `TENSORFS_HOME` and `TENSORFS_TOKEN`. Public reads need no account.
-Private CA input is DER bytes through `ca_der`.
 
-In the current frozen wrapper, `configure` updates only non-`None` arguments. Its configured
-token applies to open/download/upload/Writer. Pass provider-specific tokens explicitly to
-`convert_to_cozytensors`; an explicitly constructed `Endpoint` has its own token.
-Configuration scoping is being reviewed as the common Rust client is integrated.
+`configure` updates only non-`None` arguments. Its token applies to open, materialize,
+`download_file`, `upload_folder` and `Writer`; pass provider-specific tokens explicitly to
+`convert_to_cozytensors`. `ca_der` (DER bytes) adds a private CA as a trusted root, on top of
+the system roots, for every later call in the process; no other call takes it. An explicitly
+constructed `Endpoint` has its own `token` and `ca_der`.
 
 For refreshable access, supply a callable or object whose `headers(method, url, headers,
 payload)` returns request headers. `payload` is the known body SHA-256, not body contents.
@@ -509,22 +510,6 @@ to try again after a response. These are duck-typed protocols, not classes you m
 Progress and repository-change callback exceptions can propagate normally. An ordinary
 exception from a token provider is wrapped as `DeniedError`; a TensorFS exception retains
 its family. Credentials do not follow cross-origin redirects.
-
-The optional `DPoP` helper supports proof-bearing access where the endpoint requires it.
-Its `key` argument is a private P-256 JWK encoded as a JSON string:
-
-| Call or property | Meaning |
-|---|---|
-| `DPoP.token(key, access_token, resource=None, endpoint=None)` | Use an existing token and signing key. |
-| `DPoP.grant(key, token_endpoint=..., client_id=..., resource=..., claims=..., endpoint=None, ca_der=None)` | Create a provider for the endpoint's supported grant flow. |
-| `issued_token()` | A token obtained by the provider, when present. |
-
-Given that key and an access token from your authorization setup:
-
-```python
-provider = tensorfs.DPoP.token(private_jwk_json, access_token)
-checkpoint = tensorfs.open("me/private-model", token=provider)
-```
 
 ### Optional filesystem escape hatches
 
@@ -538,7 +523,7 @@ write that checkpoint, or a repository name to reproduce repository content:
 
 ```python
 folder = tensorfs.materialize(saved, local_dir="./portable")
-legacy_folder = tensorfs.materialize(
+st_folder = tensorfs.materialize(
     saved, local_dir="./safetensors-model", format="safetensors", dequantize="BF16"
 )
 repo_folder = tensorfs.materialize("me/model", revision="1.0", local_dir="./repo")
@@ -561,10 +546,10 @@ Supply `local_dir` for a checkpoint or for Safetensors output. A checkpoint alre
 its source and credentials, so repository-selection/configuration keywords do not apply.
 Safetensors output requires one selected checkpoint and does not accept `components`;
 choose `variant` when a named repository has multiple variants. Native repository mode
-also accepts `revision`, `variant`, `components`, `local_files_only`, `cache_dir`, `endpoint`,
-`token` and `ca_der`; without `local_dir`, it returns a managed snapshot folder.
+also accepts `revision`, `variant`, `components`, `local_files_only`, `cache_dir`, `endpoint`
+and `token`; without `local_dir`, it returns a managed snapshot folder.
 
-#### Compatibility export for legacy file-based libraries
+#### Export for file-based libraries
 
 Direct TensorFS/cozytensors loading is the normal integration path, including in our
 Runtime. Libraries should consume component configuration, supporting-file bytes and
@@ -572,14 +557,19 @@ tensor arrays directly. Export is a convenience for libraries that still require
 filenames; it is not a required preparation step.
 
 ```python
-# Only for a legacy consumer that requires a directory:
+# Only for a consumer that requires a directory:
+from transformers import CLIPTokenizer
+
+tokenizer = CLIPTokenizer.from_pretrained(checkpoint.components["tokenizer"].export_files())
 folder = checkpoint.components["tokenizer"].export_files("./tokenizer-files")
 ```
 
-`Component.export_files(directory)` explicitly writes configuration and supporting files,
-fetching any missing asset bytes. It returns the directory path and does not export tensor
-weights. Original filenames are preserved internally for compatibility. The full-checkpoint
-`tensorfs.materialize` operation also writes weight files when that is needed.
+`Component.export_files(directory=None)` writes configuration (as `config_file`) and
+supporting files, fetching any missing asset bytes, and returns the folder's path. It never
+exports tensor weights. Without a directory it writes to a folder the cache manages and
+evicts like its other entries; with one it writes there and leaves it to you. The
+full-checkpoint `tensorfs.materialize` operation also writes weight files when that is
+needed.
 
 #### Download files or publish a folder
 
@@ -594,7 +584,7 @@ tree_id = tensorfs.upload_folder(repo_id="me/model", folder_path="./portable", t
 options, without component or variant selection.
 
 `upload_folder` returns the exact published tree id. Its options are `revision`, `token`,
-`endpoint`, `cache_dir` and `ca_der`. Without a revision it appends an unreleased checkpoint;
+`endpoint` and `cache_dir`. Without a revision it appends an unreleased checkpoint;
 it does not create a public release. Repository files such as README and LICENSE are
 ordinary files in the uploaded folder.
 
@@ -632,8 +622,7 @@ All of these Python calls are synchronous.
 
 The returned data types are `Checkpoint`, `Pipeline`, `Component`, `Tensors`,
 `TensorMetadata`, `Encoding`, `Array`, `Encoded` and `VerificationReport`. Writing uses `Writer` and `ComponentWriter`;
-advanced authorization/reference operations use `DPoP` and `Endpoint`. They are covered
-above. The companion `tensorfs.varena` placement API is separate and is unnecessary for
+repository references use `Endpoint`. They are covered above. The companion `tensorfs.varena` placement API is separate and is unnecessary for
 ordinary TensorFS or Diffusers/ComfyUI use.
 
 ## Errors and value types

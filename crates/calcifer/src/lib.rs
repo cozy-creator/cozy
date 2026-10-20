@@ -216,6 +216,16 @@ impl Calcifer {
         key: &str,
         submit: SubmitRun,
     ) -> Result<Submitted, Error> {
+        if submit
+            .spec
+            .tensorfs
+            .as_ref()
+            .is_some_and(|options| !options.token.is_empty())
+        {
+            return Err(Error::Invalid(
+                "a stored submission cannot contain a TensorFS token; omit tensorfs options to use this computer's Hub sign-in at send time".into(),
+            ));
+        }
         let digest = format!(
             "sha256:{}",
             hex::encode(Sha256::digest(
@@ -916,6 +926,9 @@ impl Calcifer {
     /// The spec as the machine is sent it: the Hub access and model-source tokens minted for
     /// this send, else the run's Hub origin unless the spec names one; a warm set merged.
     fn finish_spec(&self, run: &RunRow, spec: &mut v1::RunSpec, access: access::Access) {
+        if spec.tensorfs.is_none() {
+            spec.tensorfs = access.tensorfs;
+        }
         if access.providers.is_some() {
             spec.providers = access.providers;
         }
@@ -940,6 +953,9 @@ impl Calcifer {
             && let Some(warm) = lock(&self.warm).get_mut(machine)
         {
             machines::merge_warm(warm, spec);
+        }
+        if spec.tensorfs.is_none() {
+            spec.tensorfs = access::anonymous_tensorfs(spec);
         }
     }
 

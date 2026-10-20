@@ -10,8 +10,8 @@ use crate::{
 fn artifact() -> Value {
     json!({
         "producer_request_id": "retained-output", "output_slot": "model",
-        "manifest": {"digest": format!("sha256:{}", "ab".repeat(32)), "length": 123},
-        "tensorfs_receipt_digest": format!("sha256:{}", "cd".repeat(32)),
+        "checkpoint": format!("sha256:{}", "ab".repeat(32)),
+        "transaction": format!("sha256:{}", "cd".repeat(32)),
         "future_observation": true,
     })
 }
@@ -22,7 +22,7 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
     let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
     let store = crate::storage::open(&root.join("store")).unwrap();
     let objects = Arc::new(
-        Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap(),
+        Objects::new(&root.join("writes"), service.engine.clone()).unwrap(),
     );
     let runs = Arc::new(Runs {
         service: service.clone(),
@@ -30,7 +30,7 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
         publisher: None,
         local: None,
         own_hub: None,
-        leaf: None,
+       
         contexts: Default::default(),
     });
     let broker = Calls::configure(&service, crate::origin::Machine::new(store, None).unwrap(), Some(&runs)).unwrap();
@@ -106,9 +106,9 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
     for payload in [
         "[]".to_string(), "{bad".to_string(), "{\"network\":null,\"network\":null}".to_string(),
         json!({"network": "not-an-artifact"}).to_string(),
-        json!({"network": {"manifest": {"digest": "sha256:bad", "length": 123}}}).to_string(),
-        json!({"network": {"manifest": {"digest": artifact()["manifest"]["digest"], "length": "123"}}}).to_string(),
-        json!({"network": {"manifest": {"digest": artifact()["manifest"]["digest"], "length": 0}}}).to_string(),
+        json!({"network": {"checkpoint": "sha256:bad"}}).to_string(),
+        json!({"network": {"checkpoint": 123}}).to_string(),
+        json!({"network": {"checkpoint": format!("sha256:{}", "AB".repeat(32))}}).to_string(),
     ] {
         assert_eq!(ask("render", &payload).code, "child_call_refused", "{payload}");
     }

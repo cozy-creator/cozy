@@ -8,10 +8,10 @@
 //! differ near a midpoint. Its `mean()` follows torch's reduction, which splits across threads
 //! from 32,768 blocks on.
 
-use super::{encoding, Encoder, Input, OwnedPart};
+use super::{Encoder, Input, OwnedPart};
 use crate::format::decode::bnb::{FP4_MAP, NESTED, NF4_MAP};
 use crate::format::decode::{elem, f16};
-use crate::format::{Dtype, Encoding, Error, Result, Value};
+use crate::format::{Dtype, Error, Result, Value};
 
 pub const NF4: Encoder = Encoder {
     scheme: "bnb.nf4",
@@ -30,26 +30,6 @@ pub const INT8: Encoder = Encoder {
     quantize: Some(int8),
     pack: None,
 };
-
-impl Encoding {
-    pub fn bnb_nf4(block_size: u64, double_quant: bool) -> Encoding {
-        four_bit_encoding("bnb.nf4", block_size, double_quant)
-    }
-    pub fn bnb_fp4(block_size: u64, double_quant: bool) -> Encoding {
-        four_bit_encoding("bnb.fp4", block_size, double_quant)
-    }
-    pub fn bnb_int8() -> Encoding {
-        encoding("bnb.int8", &[])
-    }
-}
-
-fn four_bit_encoding(scheme: &str, block_size: u64, double_quant: bool) -> Encoding {
-    let p = [
-        ("block_size", block_size.into()),
-        ("double_quant", double_quant.into()),
-    ];
-    encoding(scheme, &p)
-}
 
 /// torch's `clamp(min=1e-38)` floor on an absmax.
 const TINY: f32 = f32::from_bits(0x006c_e3ee);
@@ -269,7 +249,8 @@ fn int8(input: &Input) -> Result<Vec<OwnedPart>> {
     let (mut q, mut scb) = (Vec::with_capacity(x.len()), Vec::new());
     for row in x.chunks(k.max(1) as usize) {
         let am = row.iter().fold(0f32, |a, v| a.max(v.abs()));
-        let s = (1.0 / am) * 127.0; // torch's 127.0 / t is reciprocal(t) * 127
+        // PyTorch computes 127.0 / t as reciprocal(t) * 127; match its rounding.
+        let s = (1.0 / am) * 127.0;
         q.extend(row.iter().map(|v| match am {
             0.0 => 0,
             _ => (v * s).round_ties_even() as i8 as u8,
