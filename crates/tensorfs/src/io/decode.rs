@@ -348,11 +348,23 @@ fn module(context: usize, binary: &'static Binary) -> Result<Arc<Module>> {
     Ok(module)
 }
 
+/// Triton3.8 appends global/profile scratch parameters to the eleven source arguments.
+/// AOT refuses nonzero scratch requirements, but CUDA still reads BOTH parameter slots.
+fn launch_values(values: [u64; 11]) -> [u64; 13] {
+    let mut abi = [0; 13];
+    abi[..11].copy_from_slice(&values);
+    abi
+}
+
+fn argument_pointers(values: &mut [u64; 13]) -> [*mut c_void; 13] {
+    std::array::from_fn(|i| (&mut values[i] as *mut u64).cast())
+}
+
 fn launch_kernel(
     stream: &cuda::Stream,
     binary: &'static Binary,
     n: u64,
-    mut values: [u64; 11],
+    values: [u64; 11],
 ) -> Result<()> {
     let module = module(stream.context() as usize, binary)?;
     let blocks = u32::try_from(n.div_ceil(256)).map_err(|_| Failure {
@@ -362,10 +374,10 @@ fn launch_kernel(
     if blocks == 0 {
         return Ok(());
     }
-    let mut args = values
-        .iter_mut()
-        .map(|v| (v as *mut u64).cast::<c_void>())
-        .collect::<Vec<_>>();
+    let mut values = launch_values(values);
+    // These are thirteen LIVE host addresses, not null entries. The final two
+    // addresses point at zero device-pointer values for the unused scratch inputs.
+    let mut args = argument_pointers(&mut values);
     let driver = cuda::driver()?;
     cuda::check("cuLaunchKernel", unsafe {
         (driver.launch_kernel)(
@@ -663,6 +675,24 @@ fn execute_into(
 mod tests {
     use super::*;
     use crate::format::decode::plan::{Elems, Post};
+
+    #[test]
+    fn launch_frame_includes_live_zero_scratch_slots_after_source_arguments() {
+        let source = std::array::from_fn(|i| 0x1000 + i as u64 * 8);
+        let mut values = launch_values(source);
+        let pointers = argument_pointers(&mut values);
+        assert_eq!(&values[..11], &source);
+        for (i, pointer) in pointers.iter().enumerate() {
+            assert!(
+                !pointer.is_null(),
+                "CUDA reads a host address for every argument"
+            );
+            assert_eq!(*pointer as usize, values.as_ptr().wrapping_add(i) as usize);
+            // SAFETY: each pointer above addresses its live u64 slot, as CUDA's driver does.
+            let value = unsafe { *pointer.cast::<u64>() };
+            assert_eq!(value, if i < 11 { source[i] } else { 0 });
+        }
+    }
 
     #[test]
     #[cfg(target_pointer_width = "64")]

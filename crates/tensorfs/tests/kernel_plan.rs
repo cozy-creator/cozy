@@ -175,6 +175,76 @@ fn a_decode_window_is_checked_before_preparing_or_allocating_output() {
     }
 }
 
+// Inspect the emitted CUDA ELF, not the source JIT signature: Triton adds two
+// parameters absent from that signature. This check runs on EVERY actual AOT image.
+fn check_parameter_abi(image: &[u8], symbol: &str) {
+    fn word<const N: usize>(bytes: &[u8], at: usize) -> [u8; N] {
+        bytes
+            .get(at..at.checked_add(N).unwrap())
+            .expect("ELF field outside image")
+            .try_into()
+            .unwrap()
+    }
+    fn section(image: &[u8], at: usize) -> &[u8] {
+        let offset = usize::try_from(u64::from_le_bytes(word(image, at + 24))).unwrap();
+        let size = usize::try_from(u64::from_le_bytes(word(image, at + 32))).unwrap();
+        image
+            .get(offset..offset.checked_add(size).unwrap())
+            .expect("ELF section outside image")
+    }
+    assert_eq!(&image[..6], b"\x7fELF\x02\x01");
+    assert_eq!(u16::from_le_bytes(word(image, 18)), 190, "not CUDA ELF");
+    let table = usize::try_from(u64::from_le_bytes(word(image, 40))).unwrap();
+    let size = usize::from(u16::from_le_bytes(word(image, 58)));
+    let count = usize::from(u16::from_le_bytes(word(image, 60)));
+    let strings = usize::from(u16::from_le_bytes(word(image, 62)));
+    assert_eq!(size, 64);
+    assert!(strings < count);
+    let names = section(image, table + size * strings);
+    let wanted = format!(".nv.info.{symbol}");
+    let entry = (0..count)
+        .map(|i| table + i * size)
+        .find(|&at| {
+            let begin = usize::try_from(u32::from_le_bytes(word(image, at))).unwrap();
+            let name = names.get(begin..).expect("ELF name outside string table");
+            let end = name
+                .iter()
+                .position(|b| *b == 0)
+                .expect("unterminated ELF name");
+            &name[..end] == wanted.as_bytes()
+        })
+        .expect("kernel parameter attributes missing");
+    let info = section(image, entry);
+    let (mut at, mut parameters, mut bank) = (0, Vec::new(), None);
+    while at < info.len() {
+        let [form, attribute, lo, hi] = word(info, at);
+        let size = usize::from(u16::from_le_bytes([lo, hi]));
+        assert!((1..=4).contains(&form), "unknown CUDA attribute format");
+        let end = at
+            .checked_add(4 + if form == 4 { size } else { 0 })
+            .unwrap();
+        assert!(end <= info.len());
+        if form == 3 && attribute == 0x19 {
+            bank = Some(size);
+        }
+        if form == 4 && attribute == 0x17 {
+            assert_eq!(size, 12);
+            let ordinal = u16::from_le_bytes(word(info, at + 8));
+            let offset = u16::from_le_bytes(word(info, at + 10));
+            let width = u32::from_le_bytes(word(info, at + 12)) >> 18;
+            parameters.push((ordinal, offset, width));
+        }
+        at = end;
+    }
+    parameters.sort_unstable();
+    assert_eq!(
+        parameters,
+        (0u16..13).map(|i| (i, i * 8, 8u32)).collect::<Vec<_>>(),
+        "{symbol}: compiled parameter ABI differs from the thirteen-slot native frame"
+    );
+    assert_eq!(bank, Some(13 * 8));
+}
+
 #[test]
 #[ignore = "requires the build-only AOT compile, never a GPU or Triton at runtime"]
 fn prebuilt_images_cover_every_native_core_and_family() {
@@ -192,6 +262,7 @@ fn prebuilt_images_cover_every_native_core_and_family() {
                     .collect();
                 assert_eq!(images.len(), 1, "sm{family}/{kind}/{dtype}");
                 assert!(images[0].image.starts_with(b"\x7fELF"));
+                check_parameter_abi(images[0].image, images[0].symbol);
                 assert!(!images[0].symbol.is_empty());
                 assert_eq!(images[0].warps, 4);
             }

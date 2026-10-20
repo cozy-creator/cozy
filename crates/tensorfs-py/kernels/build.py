@@ -15,6 +15,7 @@ import triton
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
 
+import abi
 import kernels as k
 
 FAMILIES = (80, 86, 89, 90, 100, 120)
@@ -52,11 +53,12 @@ def main() -> None:
                 relative = pathlib.Path(f"sm{family}") / f"{kind}-{dtype}.cubin"
                 path = out / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(image)
                 meta = compiled.metadata
+                checked_abi = abi.check_compiled(meta, compiled.asm["ptx"], image)
+                path.write_bytes(image)
                 records.append({"family": family, "kind": kind, "dtype": dtype,
                                 "file": str(relative), "symbol": meta.name, "shared": meta.shared,
-                                "warps": meta.num_warps, "sha256": hashlib.sha256(image).hexdigest()})
+                                "warps": meta.num_warps, "sha256": hashlib.sha256(image).hexdigest(), **checked_abi})
                 print(f"sm{family} {kind} {dtype}: {len(image)} bytes", flush=True)
     catalog = ["pub static BINARIES: &[Binary] = &["]
     for r in records:
@@ -66,7 +68,7 @@ def main() -> None:
     catalog.append("];\n")
     out.joinpath("catalog.rs").write_text("\n".join(catalog))
     out.joinpath("manifest.json").write_text(json.dumps({"triton": triton.__version__, "binaries": records}, indent=2) + "\n")
-    for name in ("kernels.py", "build.py"):
+    for name in ("kernels.py", "build.py", "abi.py"):
         out.joinpath("source-" + name).write_bytes(pathlib.Path(__file__).with_name(name).read_bytes())
     assert len(records) == len(args.family) * len(DTYPES) * (1 + len(STRUCTS) + len(STAGES))
     print(f"{len(records)} prebuilt CUDA binaries; no driver or GPU used")
