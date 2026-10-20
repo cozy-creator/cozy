@@ -24,6 +24,9 @@ pub struct Pin {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     pub roots: Vec<ObjectRef>,
+    /// A saved header file: the pin holds only while this file holds `roots[0]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
 }
 
 impl Pin {
@@ -32,7 +35,21 @@ impl Pin {
             last_use: now_secs(),
             owner: None,
             roots,
+            file: None,
         }
+    }
+}
+
+/// False only when a file pin's file is provably gone or holds another header.
+fn holds(pin: &Pin) -> bool {
+    let (Some(path), Some(header)) = (&pin.file, pin.roots.first()) else {
+        return true;
+    };
+    let kept = |e: io::Error| !matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory);
+    match fs::metadata(path) {
+        Ok(meta) if !meta.is_file() || meta.len() != header.length => false,
+        Ok(_) => fs::read(path).map_or_else(kept, |bytes| ObjectRef::of(&bytes) == *header),
+        Err(e) => kept(e),
     }
 }
 
@@ -132,6 +149,33 @@ impl Store {
         pin.last_use = pin.last_use.max(now_secs());
         self.retain(pin.roots.iter().filter(|root| !before.contains(root)))?;
         self.commit(&path, &json(&path, &pin)?, true)
+    }
+
+    /// Roots `header` while the file at `path` (absolute) holds it: one record per path, so
+    /// saving another header there replaces it.
+    pub(crate) fn pin_file(&self, path: &Path, header: &ObjectRef) -> Result<()> {
+        let id = format!("file-{}", ObjectRef::of(path.as_os_str().as_encoded_bytes()).sha256);
+        let pin = Pin {
+            file: Some(path.to_owned()),
+            ..Pin::new(vec![header.clone()])
+        };
+        self.pin(&id, &pin)
+    }
+
+    /// Drops each file pin whose file no longer holds its header; that data then ages out
+    /// under ordinary cache policy. Callers hold the collection fence.
+    pub(super) fn unroot_files(&self) -> Result<()> {
+        for (id, pin) in self.pins()? {
+            if holds(&pin) {
+                continue;
+            }
+            let path = self.root.join("pins").join(format!("{id}.json"));
+            let _lock = self.lock("pins")?;
+            if parse::<Pin>(&path)?.is_some_and(|pin| !holds(&pin)) {
+                self.remove_record(&path)?;
+            }
+        }
+        Ok(())
     }
 
     /// Classification and replacement share the ordinary pin lock. A manual/operator pin

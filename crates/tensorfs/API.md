@@ -70,21 +70,20 @@ let saved = writer.commit().await?;
 println!("saved {}", saved.id().id());
 ```
 
-A file destination writes only the header; data is retained in the shared content-addressed
-store before the header is atomically published. Store roots and endpoint configuration are
-not embedded as paths in the file. A native portable export writes a complete folder with
-chunks; ordinary file saving does not.
+A `.cozytensors` file is a small handle into the shared local store, not a self-contained
+file: `dest` gets only the header, and the tensor and asset bytes stay in the store. The
+store keeps them while that file still holds this header. Once the file is deleted, moved or
+overwritten with another header, the data ages out like any other cache entry. Open
+checkpoints keep their bytes in the meantime. To copy a checkpoint to another machine,
+write the portable form with `saved.materialize(dir, Format::Cozytensors, None)`.
 
 `dest` is the exact filename; TensorFS does not append a variant or create a directory.
-Leave `variant` unset for a file destination. Variant labels belong to repository trees;
-setting both `dest` and `variant` is invalid. With no destination, the writer retains the
-checkpoint in the shared store and may assign a repository variant.
-A file destination also cannot be combined with `repo_id`.
+`dest` and `repo_id` exclude each other. `variant` names `model.<variant>.cozytensors` in a
+`repo_id` upload and is `Invalid` without `repo_id`. With no destination, the writer keeps
+the checkpoint in the shared store as a cache entry.
 
 A standalone header identifies one checkpoint. It does not contain its enclosing tree,
-release label, README or LICENSE. Moving or copying it preserves that checkpoint identity;
-repository context is available only when separately known. Deleting or replacing the
-file does not release its saved data automatically.
+release label, README or LICENSE; repository context is available only when separately known.
 
 The component borrows its writer while being filled. `commit(&mut self)` is async for both
 local and remote writes. After an upload failure, `writer.committed()` can return the strong
@@ -156,7 +155,7 @@ below; normal model consumers do not need it.
 | `Fetched` | Byte counts `local`, `volume`, `origin`. |
 | `VerificationReport` | Separate `missing` and `corrupt` object-reference vectors; `is_ok()` checks both are empty. |
 | `Convert` | Optional `converter`, `variant`, borrowed conversion-progress callback. |
-| `WriterOptions` | Optional `dest`, `variant`, `base`, `resume`, `repo_id`, `endpoint`, `token`; implements `Default`. |
+| `WriterOptions` | Optional `dest`, `variant` (only with `repo_id`), `base`, `resume`, `repo_id`, `endpoint`, `token`; implements `Default`. |
 | `Format` | `Safetensors` or native portable `Cozytensors` export. |
 
 `Progress` is a borrowed `Fn(u64, u64) -> Result<()> + Sync` (held bytes, total bytes).

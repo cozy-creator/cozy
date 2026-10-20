@@ -398,145 +398,90 @@ async fn public_writer_resumes_reopens_components_and_keeps_encoded_bytes_and_or
     assert_eq!(child.read_decoded("packed").unwrap_err().kind, Kind::UnknownScheme);
 }
 
+/// Ages every cache entry past its TTL and runs ordinary cache maintenance.
+fn expire_cache(cache: &Path) {
+    fn age(path: &Path, then: std::time::SystemTime) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                age(&entry.path(), then);
+            } else {
+                fs::File::open(entry.path()).unwrap().set_modified(then).unwrap();
+            }
+        }
+    }
+    let store = tensorfs::store::Store::open(cache).unwrap().with_cache();
+    for (id, mut pin) in store.pins().unwrap() {
+        if id.starts_with("cache-") {
+            pin.last_use = 0;
+            store.pin(&id, &pin).unwrap();
+        }
+    }
+    let then = std::time::SystemTime::now() - tensorfs::store::GRACE * 2;
+    age(&cache.join("blobs"), then);
+    fs::create_dir_all(cache.join("tmp/cache")).unwrap();
+    fs::write(cache.join("tmp/cache/sweep.json"), br#"{"last_use":0}"#).unwrap();
+    store.cache_maintain(0).unwrap();
+}
+
+async fn save(client: &Client, dest: &Path, weight: &[u8]) -> (ObjectRef, Vec<ObjectRef>) {
+    let mut writer = client
+        .writer(WriterOptions {
+            dest: Some(dest),
+            ..WriterOptions::default()
+        })
+        .unwrap();
+    writer
+        .component("model", "test.Model", Default::default(), None)
+        .unwrap()
+        .put("w", Dtype::U8, &[weight.len() as u64], &mut &weight[..])
+        .unwrap();
+    let saved = writer.commit().await.unwrap();
+    assert_eq!(ObjectRef::of(&fs::read(dest).unwrap()), *saved.id());
+    let mut objects: Vec<_> = saved.header().objects().cloned().collect();
+    objects.push(saved.id().clone());
+    (saved.id().clone(), objects)
+}
+
 #[tokio::test(flavor = "current_thread")]
-async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_move_and_gc() {
+async fn a_header_file_roots_its_data_only_while_it_holds_that_header() {
     let scratch = Scratch::new();
     let cache = scratch.0.join("cache");
     let client = client(&cache, &scratch.0.join("endpoint"));
-    let dest = scratch
-        .0
-        .join("published")
-        .join("arbitrary-name.cozytensors");
-    assert_eq!(
-        client
-            .writer(WriterOptions {
-                dest: Some(&dest),
-                variant: Some("bf16"),
-                ..WriterOptions::default()
-            })
-            .err()
-            .unwrap()
-            .kind,
-        Kind::Invalid
-    );
-    let mut first = client
-        .writer(WriterOptions {
-            dest: Some(&dest),
-            resume: Some("reused-key"),
-            ..WriterOptions::default()
-        })
-        .unwrap();
-    first
-        .component("model", "test.Model", Default::default(), None)
-        .unwrap()
-        .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
-        .unwrap();
-    assert!(!dest.exists(), "header was published before commit");
-    let old = first.commit().await.unwrap();
-    assert!(old.tree().is_none() && old.named().is_none() && old.variant().is_none());
-    let original_header = fs::read(&dest).unwrap();
-    assert_eq!(ObjectRef::of(&original_header), *old.id());
-    assert!(!dest.parent().unwrap().join("chunks").exists());
-    assert_eq!(fs::read_dir(dest.parent().unwrap()).unwrap().count(), 1);
-    let pin: serde_json::Value = serde_json::from_slice(
-        &fs::read(cache.join("pins").join(format!("{}.json", old.id().sha256))).unwrap(),
-    )
-    .unwrap();
-    assert!(
-        pin.get("owner").is_none(),
-        "a persistent header got a disposable cache pin"
-    );
-    // The content digest is an ordinary operator pin id, not a reserved namespace.
-    let operator = tensorfs::store::Store::open(&cache).unwrap();
-    let manual = operator
-        .put_bytes(b"operator-owned unrelated content")
-        .unwrap();
-    let mut existing = operator.get_pin(&old.id().sha256).unwrap().unwrap();
-    existing.owner = Some("ordinary operator".into());
-    existing.roots.push(manual.clone());
-    operator.pin(&old.id().sha256, &existing).unwrap();
-    let another_path = scratch.0.join("another-header.cozytensors");
-    let mut identical = client
-        .writer(WriterOptions {
-            dest: Some(&another_path),
-            ..Default::default()
-        })
-        .unwrap();
-    identical
-        .component("model", "test.Model", Default::default(), None)
-        .unwrap()
-        .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
-        .unwrap();
-    let same = identical.commit().await.unwrap();
-    assert_eq!(same.id(), old.id());
-    let preserved = operator.get_pin(&old.id().sha256).unwrap().unwrap();
-    assert_eq!(preserved.owner.as_deref(), Some("ordinary operator"));
-    assert!(preserved.roots.contains(&manual) && preserved.roots.contains(old.id()));
-    drop(identical);
-    drop(same);
-    drop(operator);
-    let mut next = client
-        .writer(WriterOptions {
-            dest: Some(&dest),
-            resume: Some("reused-key"),
-            ..WriterOptions::default()
-        })
-        .unwrap();
-    let replacement = [2, 4, 6, 8];
-    next.component("model", "test.Model", Default::default(), None)
-        .unwrap()
-        .put("w", Dtype::U8, &[4], &mut &replacement[..])
-        .unwrap();
-    let new = next.commit().await.unwrap();
-    assert_ne!(new.id(), old.id());
-    assert_eq!(
-        fs::read(&dest).unwrap().len(),
-        original_header.len(),
-        "fixture must exercise same-length replacement"
-    );
-    assert_eq!(old.component("model").unwrap().read_decoded("w").unwrap(), WEIGHT);
-    let old_id = old.id().clone();
-    let new_id = new.id().clone();
-    let moved = scratch.0.join("moved-header.cozytensors");
-    fs::rename(&dest, &moved).unwrap();
-    drop(first);
-    drop(next);
-    drop(old);
-    drop(new);
+    let file = |name: &str| scratch.0.join("published").join(name);
+    // A variant names model.<variant>.cozytensors in a repo_id upload; nothing else takes one.
+    for dest in [Some(file("x.cozytensors")), None] {
+        let options = WriterOptions { dest: dest.as_deref(), variant: Some("bf16"), ..WriterOptions::default() };
+        assert_eq!(client.writer(options).err().unwrap().kind, Kind::Invalid);
+    }
+    let (kept, kept_objects) = save(&client, &file("kept.cozytensors"), &[1, 2, 3, 4]).await;
+    let (_, deleted) = save(&client, &file("deleted.cozytensors"), &[5, 6, 7, 8]).await;
+    let (_, rewritten) = save(&client, &file("rewritten.cozytensors"), &[9, 10, 11, 12]).await;
+    let (rewrite, rewrite_objects) = save(&client, &file("rewritten.cozytensors"), &[13, 14, 15, 16]).await;
+    let (_, copied_over) = save(&client, &file("copied-over.cozytensors"), &[17, 18, 19, 20]).await;
+    assert!(!file("chunks").exists(), "a header file made adjacent payload files");
+    assert_eq!(fs::read_dir(file("")).unwrap().count(), 4);
+    fs::remove_file(file("deleted.cozytensors")).unwrap();
+    // Same length, another header: only its digest tells them apart.
+    fs::copy(file("kept.cozytensors"), file("copied-over.cozytensors")).unwrap();
     drop(client);
-    // Operator maintenance is used solely to exercise the real collector, not to create output.
-    let operator = tensorfs::store::Store::open(&cache)
-        .unwrap()
-        .with_grace(std::time::Duration::ZERO);
-    let disposable = operator
-        .put_bytes(b"unreferenced positive eviction control")
-        .unwrap();
-    operator.collect(0, std::time::Duration::ZERO).unwrap();
-    assert!(
-        !cache.join(disposable.key()).exists(),
-        "collector positive control did not run"
-    );
-    assert!(cache.join(old_id.key()).exists() && cache.join(new_id.key()).exists());
-    assert!(
-        cache.join(manual.key()).exists(),
-        "durable promotion lost an unrelated operator root"
-    );
-    drop(operator);
-    let reopened = self::client(&cache, &scratch.0.join("endpoint"))
-        .open(
-            moved.to_str().unwrap(),
-            &Open {
-                local_files_only: true,
-                ..Open::default()
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(reopened.id(), &new_id);
-    assert_eq!(
-        reopened.component("model").unwrap().read_decoded("w").unwrap(),
-        replacement
-    );
+
+    expire_cache(&cache);
+    let present = |objects: &[ObjectRef]| objects.iter().all(|o| cache.join(o.key()).exists());
+    let gone = |objects: &[ObjectRef]| objects.iter().all(|o| !cache.join(o.key()).exists());
+    assert!(present(&kept_objects) && present(&rewrite_objects), "a live header file lost its data");
+    assert!(gone(&deleted), "a deleted header file still roots its data");
+    assert!(gone(&rewritten), "a header file rewritten by a Writer still roots the old header");
+    assert!(gone(&copied_over), "a header file holding another header still roots the old one");
+
+    let reader = self::client(&cache, &scratch.0.join("endpoint"));
+    let offline = Open { local_files_only: true, ..Open::default() };
+    for (name, id, weight) in [("kept", &kept, [1, 2, 3, 4]), ("rewritten", &rewrite, [13, 14, 15, 16]), ("copied-over", &kept, [1, 2, 3, 4])] {
+        let path = file(&format!("{name}.cozytensors"));
+        let reopened = reader.open(path.to_str().unwrap(), &offline).await.unwrap();
+        assert_eq!(reopened.id(), id);
+        assert_eq!(reopened.component("model").unwrap().read_decoded("w").unwrap(), weight);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

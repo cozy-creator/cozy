@@ -76,8 +76,11 @@ impl Client {
                 "a Writer names a header file or an endpoint repository",
             );
         }
-        if options.dest.is_some() && options.variant.is_some() {
-            return fail(Kind::Invalid, "a literal header file has no variant label");
+        if options.variant.is_some() && options.repo_id.is_none() {
+            return fail(
+                Kind::Invalid,
+                "variant names model.<variant>.cozytensors in a repo_id upload; it needs repo_id",
+            );
         }
         let variant = options.variant.unwrap_or("").to_owned();
         crate::format::check_file(&crate::format::variant_path(&variant))?;
@@ -214,14 +217,12 @@ impl Context {
         Ok(checkpoint)
     }
 
+    /// The file is a handle into the store: its data stays rooted while the file holds this
+    /// header. Until the root lands, the live checkpoint holds the bytes.
     fn publish_file(&self, checkpoint: &Checkpoint) -> Result<()> {
         if let Some(dest) = &self.dest {
             self.store.cache_preserve_snapshot(dest)?;
             let header = checkpoint.id();
-            // The content-addressed normal pin is durable independently of a resume key,
-            // the path's lifetime, and any future overwrite of this header file.
-            self.store
-                .pin_roots(&header.sha256, std::slice::from_ref(header))?;
             let bytes = self.store.read(header)?;
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)
@@ -229,6 +230,7 @@ impl Context {
             }
             platform::durable::replace(dest, &bytes, 0o644)
                 .map_err(|e| super::io_failure(dest.display(), e.into()))?;
+            self.store.pin_file(dest, header)?;
         }
         Ok(())
     }

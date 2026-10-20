@@ -383,7 +383,9 @@ class Writer:
     def __init__(self, dest: StrPath | None=None, *, variant: str | None=None, base: Checkpoint | None=None, resume: str | None=None, repo_id: str | None=None, endpoint: str | None=None, token: Token | None=None, cache_dir: StrPath | None=None) -> None:
         """Write an exact header-file path, or only the shared store when dest=None.
 
-        variant labels repository content and is invalid with a file destination.
+        The file is a handle into the shared local store that roots its data while it holds
+        this header; `materialize` makes the portable copy. `variant` names
+        `model.<variant>.cozytensors` in a `repo_id` upload and is refused without `repo_id`.
         """
 
     def __enter__(self) -> Writer:

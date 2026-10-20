@@ -54,7 +54,9 @@ class Writer:
                  base: Checkpoint | None = None, resume: str | None = None,
                  repo_id: str | None = None, endpoint: str | None = None, token: Token | None = None,
                  cache_dir: StrPath | None = None) -> None:
-        """An optional literal cozytensors header file; payload remains in the configured shared store."""
+        """`dest` is a header file, a handle into the shared local store that roots its data while
+        it holds this header; `materialize` makes the portable copy. `variant` names
+        `model.<variant>.cozytensors` in a `repo_id` upload and is refused without `repo_id`."""
     def __enter__(self) -> Writer: ...
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None,
                  traceback: TracebackType | None) -> None: ...

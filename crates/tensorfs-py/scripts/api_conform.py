@@ -24,17 +24,22 @@ with TemporaryDirectory() as temp:
     root = Path(temp)
     tensorfs.configure(cache_dir=root / "cache")
     values = np.arange(24, dtype=np.float32).reshape(4, 6)
-    with tensorfs.Writer(variant="f32") as writer:
+    try:
+        tensorfs.Writer(variant="f32")
+    except tensorfs.InvalidError:
+        pass
+    else:
+        raise AssertionError("a variant without repo_id was accepted")
+    # A thin repository folder: variant headers named by file, payload in the shared store.
+    with tensorfs.Writer(root / "folder/model.f32.cozytensors") as writer:
         writer.pipeline("diffusers.TestPipeline", {"flag": None, "scale": 0.5})
         component = writer.component("model", cls="transformers.TestModel", config={"width": 6})
         component.put("weight", values)
         component.asset("tokenizer.json", b"{}")
         writer.component("optimizer", cls="", config={}).put("step", np.array([7], dtype=np.int64))
-    with tensorfs.Writer(variant="f16") as half:
+    with tensorfs.Writer(root / "folder/model.f16.cozytensors") as half:
         half.component("model", cls="transformers.TestModel", config={"width": 6}).put("weight", values.astype(np.float16))
         half.component("optimizer", cls="", config={}).put("step", np.array([8], dtype=np.int64))
-    tensorfs.materialize(writer.commit(), local_dir=root / "folder")
-    tensorfs.materialize(half.commit(), local_dir=root / "folder")
     (root / "folder/README.md").write_text("a repo file\n")
     ck = writer.commit()
     assert not hasattr(ck, "read") and not hasattr(ck, "tensors") and not hasattr(ck, "path"), "checkpoint-wide tensor APIs remain public"

@@ -192,8 +192,9 @@ impl Client {
 }
 #[derive(Default)]
 pub struct WriterOptions<'a> {
-    // Exact header-file path, or None for a checkpoint in the shared store.
-    // A file destination cannot be combined with variant or repo_id.
+    // Exact header-file path, or None for a checkpoint in the shared store. The file is a
+    // handle into the store, rooting its data while it holds this header.
+    // dest and repo_id exclude each other; variant needs repo_id.
     pub dest: Option<&'a Path>, pub variant: Option<&'a str>,
     pub base: Option<&'a Checkpoint>, pub resume: Option<&'a str>,
     pub repo_id: Option<&'a str>, pub endpoint: Option<&'a str>,

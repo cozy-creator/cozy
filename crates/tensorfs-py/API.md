@@ -213,7 +213,8 @@ checkpoint.download(components=["unet"], priority=0, progress=on_progress)
 
 `download` returns when all requested chunks and supporting files are verified and locally
 available, or raises an error. The open checkpoint retains them. Closing its last handle
-allows ordinary cache policy to apply again; saving a checkpoint uses durable retention.
+allows ordinary cache policy to apply again; a saved header file roots its data while it
+holds that header.
 Progress callbacks receive `(stage, completed, total)`; download counts are locally available
 bytes out of requested bytes, while conversion counts are tensors.
 
@@ -389,8 +390,9 @@ The context commits on normal exit. `commit()` returns a `Checkpoint` and return
 result on later successful calls. A raw Python buffer needs explicit `dtype` and `shape`;
 a DLPack input supplies them, and contradictory explicit values are refused.
 
-The destination is one header file; tensor and supporting-file bytes are admitted once
-into the configured shared store:
+A `.cozytensors` file is a small handle into the shared local store, not a self-contained
+file. The destination gets only the header; tensor and supporting-file bytes are admitted
+once into the store:
 
 ```text
 ./model.cozytensors          # binary metadata and content-hash references
@@ -399,32 +401,29 @@ $TENSORFS_HOME/blobs/...     # shared tensor and supporting-file bytes
 
 The header contains pipeline/component configuration, tensor names, dtypes, shapes,
 encodings and references. Store paths, credentials and endpoint URLs stay in configuration,
-not in the file. Moving or copying the file preserves its content identity. Opening it
-uses the configured store and, when needed and allowed, the configured source.
+not in the file. Opening it uses the configured store and, when needed and allowed, the
+configured source.
 
-The file identifies one checkpoint, not an enclosing repository tree. It contains the
-component configuration and run data references, but no release label or repository
-README/LICENSE files. Opening a copied header cannot reconstruct that missing repository
-context. Those fields remain available on a checkpoint opened through its repository.
+The store keeps the saved data while that file still holds this header. Once the file is
+deleted, moved or overwritten with another header, the data ages out like any other cache
+entry; open checkpoints keep their bytes meanwhile. To copy a checkpoint to another machine,
+write the portable form with `tensorfs.materialize(saved, local_dir=...)` (described below).
 
-A successful save retains its data as a durable store root before atomically publishing
-the header. Ordinary cache cleanup must not evict that root. Deleting or replacing the
-file removes only that handle; releasing its saved data is an explicit store-management
-operation.
+The file identifies one checkpoint, not an enclosing repository tree. It contains no release
+label or repository README/LICENSE files; those remain available on a checkpoint opened
+through its repository.
 
-`Writer(dest=None, ...)` keeps the checkpoint in the shared store without writing a header
-file. `dest` is a literal file path, not a directory.
-
-Leave `variant` unset when `dest` is supplied; that combination is invalid. TensorFS does
-not append or infer a variant label from the filename. For example,
-`Writer("model.f32.cozytensors")` writes that exact filename without assigning a repository
-variant. Tensor dtypes and encodings describe the representation independently.
+`Writer(dest=None, ...)` keeps the checkpoint in the shared store as a cache entry, without a
+header file. `dest` is a literal file path, not a directory; TensorFS does not infer a
+variant label from the filename. `variant` names `model.<variant>.cozytensors` in a
+`repo_id` upload and raises `InvalidError` without `repo_id`. To build a multi-variant folder
+locally, write each header to its own `model.<variant>.cozytensors` path in that folder.
 
 Its options and members are:
 
 | Option or member | Use |
 |---|---|
-| `variant` | Optional repository/export label when `dest=None`; invalid with a file destination. |
+| `variant` | The uploaded file's label, `model.<variant>.cozytensors`; only with `repo_id`. |
 | `base` | Start from an existing checkpoint and reuse unchanged data. |
 | `resume` | Resume keyed local write state. |
 | `repo_id`, `endpoint`, `token` | Stream the new checkpoint to a repository using supplied access. |
