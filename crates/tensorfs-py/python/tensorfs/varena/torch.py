@@ -463,7 +463,7 @@ class Cache:
                 request = self.memory._current()
                 native.cache_active(self.id, True)
                 active = True
-                for hold in self.holds:
+                for hold in tuple(self.holds):
                     native.retained_bind(request.native_id, hold.model.ws.id)
             with cuts.caught() if self.memory.cuda else nullcontext():
                 yield
