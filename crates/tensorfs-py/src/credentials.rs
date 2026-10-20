@@ -1,4 +1,4 @@
-//! Python providers marshal to the public Rust provider/Endpoint facade.
+//! Python token providers and `Endpoint`, over the public Rust ones.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -7,10 +7,7 @@ use async_trait::async_trait;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tensorfs::format::Repo;
-use tensorfs::{
-    bearer, Config, DPoP, Endpoint, Failure, HeaderMap, JwtBearer, Kind, Request, Result,
-    TokenProvider,
-};
+use tensorfs::{bearer, Config, Endpoint, Failure, HeaderMap, Kind, Request, Result, TokenProvider};
 
 use crate::store::{bridge, config_from_py, config_to_py, OrRaise};
 
@@ -124,79 +121,13 @@ pub(crate) fn provider(
         None => None,
         Some(token) if token.is_none() => None,
         Some(token) => {
-            if let Ok(native) = token.cast::<PyDPoP>() {
-                Some(native.get().dpop.clone() as Arc<dyn TokenProvider>)
-            } else if let Ok(token) = token.extract::<String>() {
+            if let Ok(token) = token.extract::<String>() {
                 Some(bearer(token))
             } else {
                 Some(Arc::new(PythonProvider(token.clone().unbind())))
             }
         }
     })
-}
-
-#[pyclass(name = "DPoP", module = "tensorfs", frozen)]
-pub struct PyDPoP {
-    dpop: Arc<DPoP>,
-}
-
-#[pymethods]
-impl PyDPoP {
-    fn issued_token(&self, py: Python<'_>) -> PyResult<Option<String>> {
-        py.detach(|| bridge(async { Ok(self.dpop.issued_token().await) }))
-            .or_raise(py)
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (key, *, token_endpoint, client_id, resource, claims, endpoint = None, ca_der = None))]
-    #[allow(clippy::too_many_arguments)]
-    fn grant(
-        py: Python<'_>,
-        key: &str,
-        token_endpoint: String,
-        client_id: String,
-        resource: String,
-        claims: &Bound<'_, PyDict>,
-        endpoint: Option<String>,
-        ca_der: Option<Vec<u8>>,
-    ) -> PyResult<Self> {
-        let claims = config_from_py(claims.as_any())?
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
-        let config = config(
-            Some(endpoint.unwrap_or_else(|| resource.clone())),
-            None,
-            None,
-            ca_der,
-        )?;
-        let grant = JwtBearer {
-            token_endpoint,
-            client_id,
-            resource,
-            claims,
-        };
-        Ok(Self {
-            dpop: Arc::new(DPoP::grant(&config, key, grant).or_raise(py)?),
-        })
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (key, access_token, resource = None, *, endpoint = None))]
-    fn token(
-        py: Python<'_>,
-        key: &str,
-        access_token: &str,
-        resource: Option<String>,
-        endpoint: Option<String>,
-    ) -> PyResult<Self> {
-        Ok(Self {
-            dpop: Arc::new(
-                DPoP::token(key, access_token, resource.as_deref(), endpoint.as_deref())
-                    .or_raise(py)?,
-            ),
-        })
-    }
 }
 
 #[pyclass(name = "Endpoint", module = "tensorfs", frozen)]
@@ -287,6 +218,5 @@ impl PyEndpoint {
 }
 
 pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyDPoP>()?;
     m.add_class::<PyEndpoint>()
 }

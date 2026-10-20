@@ -12,7 +12,7 @@ from . import _ext
 _settings: dict[str, Any] = {}
 
 
-def configure(*, endpoint=None, cache_dir=None, token=None) -> None:
+def configure(*, endpoint=None, cache_dir=None, token=None, ca_der=None) -> None:
     global _settings
     _settings = {**_settings, **{k: v for k, v in locals().items() if v is not None}}
 
@@ -25,18 +25,18 @@ def _endpoint(endpoint=None):
     return endpoint or _settings.get("endpoint") or os.environ.get("TENSORFS_ENDPOINT", "https://tensorhub.com")
 
 
-def _client(cache_dir=None, endpoint=None, token=None, ca_der=None, *, configured_token=True):
+def _client(cache_dir=None, endpoint=None, token=None, *, configured_token=True):
     credential = token if token is not None else _settings.get("token") if configured_token else None
-    return _ext._Client(_cache(cache_dir), endpoint=_endpoint(endpoint), token=credential, ca_der=ca_der)
+    return _ext._Client(_cache(cache_dir), endpoint=_endpoint(endpoint), token=credential, ca_der=_settings.get("ca_der"))
 
 
-def open(name_or_path, *, revision=None, variant=None, endpoint=None, local_files_only=False, cache_dir=None, token=None, ca_der=None, lazy=True):
-    return _client(cache_dir, endpoint, token, ca_der).open(
+def open(name_or_path, *, revision=None, variant=None, endpoint=None, local_files_only=False, cache_dir=None, token=None, lazy=True):
+    return _client(cache_dir, endpoint, token).open(
         os.fspath(name_or_path), revision=revision, variant=variant, local_files_only=local_files_only, lazy=lazy
     )
 
 
-def materialize(source: str | _ext.Checkpoint, *, local_dir=None, format="cozytensors", dequantize=None, revision=None, variant=None, components=None, cache_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
+def materialize(source: str | _ext.Checkpoint, *, local_dir=None, format="cozytensors", dequantize=None, revision=None, variant=None, components=None, cache_dir=None, local_files_only=False, token=None, endpoint=None) -> str:
     if format not in {"cozytensors", "safetensors"}:
         raise ValueError("format must be cozytensors or safetensors")
     if format == "cozytensors" and dequantize is not None:
@@ -51,13 +51,13 @@ def materialize(source: str | _ext.Checkpoint, *, local_dir=None, format="cozyte
         if local_dir is None:
             raise ValueError("a checkpoint requires an explicit local_dir")
         if local_files_only or any(value is not None for value in
-                                   (revision, variant, cache_dir, token, endpoint, ca_der)):
+                                   (revision, variant, cache_dir, token, endpoint)):
             raise ValueError("repository and client options do not apply to a checkpoint")
         return str(_ext._materialize(source, local_dir, format=format, dequantize=dequantize))
     if not isinstance(source, str):
         raise TypeError("source must be a repository reference or Checkpoint")
     if format == "cozytensors":
-        return str(_client(cache_dir, endpoint, token, ca_der).materialize(
+        return str(_client(cache_dir, endpoint, token).materialize(
             (source, revision, variant), components=components,
             local_dir=local_dir, local_files_only=local_files_only,
         ))
@@ -65,7 +65,7 @@ def materialize(source: str | _ext.Checkpoint, *, local_dir=None, format="cozyte
         raise ValueError("components selection is not supported for safetensors materialization")
     if local_dir is None:
         raise ValueError("safetensors materialization requires an explicit local_dir")
-    checkpoint = _client(cache_dir, endpoint, token, ca_der).open(
+    checkpoint = _client(cache_dir, endpoint, token).open(
         source, revision=revision, variant=variant, local_files_only=local_files_only,
     )
     try:
@@ -74,14 +74,14 @@ def materialize(source: str | _ext.Checkpoint, *, local_dir=None, format="cozyte
         checkpoint.close()
 
 
-def download_file(repo_id: str, filename: str, *, revision=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
-    return str(_client(cache_dir, endpoint, token, ca_der).download_file(
+def download_file(repo_id: str, filename: str, *, revision=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None) -> str:
+    return str(_client(cache_dir, endpoint, token).download_file(
         repo_id, filename, revision=revision, local_dir=local_dir, local_files_only=local_files_only,
     ))
 
 
-def upload_folder(*, repo_id: str, folder_path, revision=None, token=None, endpoint=None, cache_dir=None, ca_der=None) -> str:
-    return _client(cache_dir, endpoint, token, ca_der).upload_folder(Path(folder_path), repo_id, revision)
+def upload_folder(*, repo_id: str, folder_path, revision=None, token=None, endpoint=None, cache_dir=None) -> str:
+    return _client(cache_dir, endpoint, token).upload_folder(Path(folder_path), repo_id, revision)
 
 
 def convert_to_cozytensors(source: str | Sequence[str], *, converter=None, variant=None, cache_dir=None, token=None, progress=None):
@@ -125,8 +125,8 @@ class ComponentWriter:
 
 
 class Writer:
-    def __init__(self, dest=None, *, variant=None, base=None, resume=None, repo_id=None, endpoint=None, token=None, cache_dir=None, ca_der=None):
-        self._native = _ext.Writer(dest, variant=variant, base=base, resume=resume, cache_dir=_cache(cache_dir), repo_id=repo_id, endpoint=_endpoint(endpoint), token=token if token is not None else _settings.get("token"), ca_der=ca_der)
+    def __init__(self, dest=None, *, variant=None, base=None, resume=None, repo_id=None, endpoint=None, token=None, cache_dir=None):
+        self._native = _ext.Writer(dest, variant=variant, base=base, resume=resume, cache_dir=_cache(cache_dir), repo_id=repo_id, endpoint=_endpoint(endpoint), token=token if token is not None else _settings.get("token"), ca_der=_settings.get("ca_der"))
         self._resume = resume
         self._committed = None
         self.local_checkpoint = None

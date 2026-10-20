@@ -71,8 +71,8 @@ class Level(Enum):
 
 @dataclass(frozen=True, slots=True)
 class WeightGrant:
-    """TensorD's grant for one component: its header, the binding's manifest, the sealed host
-    layout or the chunk files `(sha256, length, fd)`, and the stored tensors the module builds.
+    """TensorD's grant for one component: its checkpoint, the binding's manifest, the sealed host
+    layout, and the stored tensors the module builds.
     With a held layout, GPU pages a gone executor kept of it, `(region, fd)`, and what they hold."""
 
     ck: tensorfs.Checkpoint
@@ -80,7 +80,6 @@ class WeightGrant:
     manifest: str
     host_fd: int | None = None
     keys: Collection[str] | None = None
-    files: Sequence[tuple[str, int, int]] = ()
     pages: Sequence[tuple[int, int]] = ()
     fingerprint: str = ""
 
@@ -118,10 +117,6 @@ class Exhausted(Exception):
 
 class Unbound(Exception):
     """An op on a placeholder that binds to nothing."""
-
-
-class LayoutChanged(Unbound):
-    """A held layout needs a fresh chunk-file grant for the module's regions."""
 
 
 class _Short(Exception):
@@ -610,8 +605,7 @@ class Memory:
         if grant.host_fd is None:
             return
         with self.lock:
-            files = list(grant.files) or None
-            ws = self.core.adopt(self._name(grant.key), grant.ck, grant.host_fd, files)
+            ws = self.core.adopt(self._name(grant.key), grant.ck, grant.host_fd)
             self._share(ws, grant)
             self.adopted[grant.key] = ws
             room = self._free() if self.cuda else 0
@@ -660,26 +654,24 @@ class Memory:
         if grant is None:
             raise Unbound(f"{type(module).__name__}: no weights attached (`Declared.weights`)")
         paths, regions = blocks_of(module), regions_of(module)
-        files, host_fd = list(grant.files) or None, grant.host_fd
+        host_fd = grant.host_fd
         ws = self.adopted.pop(grant.key, None)
         if self.cuda and declared.fill is not None and ws is not None:
             ws.close()
             ws = None
         if ws is None and host_fd is not None:
-            ws = self.core.adopt(self._name(grant.key), grant.ck, host_fd, files)
+            ws = self.core.adopt(self._name(grant.key), grant.ck, host_fd)
             if declared.fill is None:
                 self._share(ws, grant)
         if ws is not None and ws.regions != regions:
             ws.close()
-            if grant.ck.id is None and not files:
-                raise LayoutChanged("a held layout of other regions needs its chunk-file grant")
             ws, host_fd = None, None
         sealed = None
         if ws is None:
             name = self._name(grant.key)
             if host_fd is None and self.cuda and self.granted:
-                host_fd = sealed = seal(grant.ck, regions, name, files=files)
-            ws = self.core.register(name, grant.ck, regions, host_fd, files)
+                host_fd = sealed = seal(grant.ck, regions, name)
+            ws = self.core.register(name, grant.ck, regions, host_fd)
             if declared.fill is None:
                 self._share(ws, grant)
         model = Model(self, ws.name, grant.key, module, ws, declared)

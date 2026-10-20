@@ -1,4 +1,5 @@
-//! Stored byte descriptions for placement callers. Header details and chunk opens stay here.
+//! Stored byte descriptions for placement. Header details and chunk opens stay here; callers
+//! see them through `Checkpoint::{spans, stored_part, source}`.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -12,7 +13,7 @@ use crate::store::Checkpoint;
 type Fetch = dyn Fn(&[crate::format::ObjectRef]) -> Result<()> + Send + Sync;
 
 #[derive(Clone)]
-pub struct View {
+pub(crate) struct View {
     header: Arc<Header>,
     chunks: Arc<BTreeMap<String, (u64, usize)>>,
     stored: Checkpoint,
@@ -27,7 +28,7 @@ pub struct Span {
     pub source: ItemSource,
 }
 
-pub struct Part {
+pub struct StoredPart {
     pub component: String,
     pub key: String,
     pub role: String,
@@ -58,7 +59,7 @@ impl View {
     }
 
     /// Keep the source context and use its one downloader for the selected chunks.
-    pub fn with_fetch(
+    pub(crate) fn with_fetch(
         mut self,
         fetch: impl Fn(&[crate::format::ObjectRef]) -> Result<()> + Send + Sync + 'static,
     ) -> Self {
@@ -66,58 +67,7 @@ impl View {
         self
     }
 
-    /// The stored spans of the parts `regions` name, in header order, and the chunks they read.
-    pub fn plan(&self, regions: &[Vec<String>]) -> Result<(Vec<Span>, Vec<usize>)> {
-        let header = &self.header;
-        let mut wanted = Vec::new();
-        for name in regions.iter().flatten() {
-            wanted.push(locate(header, name).ok_or_else(|| crate::failure::Failure {
-                kind: Kind::Invalid,
-                detail: format!("{name:?} is not in the checkpoint"),
-            })?);
-        }
-        wanted.sort_unstable();
-        wanted.dedup();
-        let (mut items, mut chunks) = (Vec::new(), Vec::new());
-        for (ci, ti, only) in wanted {
-            let component = &header.components()[ci];
-            let tensor = &component.tensors[ti];
-            for (role, at) in tensor.locations() {
-                let role = if role.is_empty() { "value" } else { role };
-                if only.is_some_and(|selected| selected != role) {
-                    continue;
-                }
-                let what = format!("{}/{}#{role}", component.name, tensor.key);
-                let spans = header.spans(&at);
-                if spans.is_empty() {
-                    items.push(Span {
-                        what,
-                        len: 0,
-                        source: ItemSource::Inline(Arc::from([])),
-                    });
-                    continue;
-                }
-                for span in spans {
-                    let object = &header.chunks[span.chunk];
-                    items.push(Span {
-                        what: what.clone(),
-                        len: span.length,
-                        source: ItemSource::Object(ObjectRange {
-                            obj: object.clone(),
-                            off: span.start,
-                            len: span.length,
-                        }),
-                    });
-                    chunks.push(span.chunk);
-                }
-            }
-        }
-        chunks.sort_unstable();
-        chunks.dedup();
-        Ok((items, chunks))
-    }
-
-    pub fn files_for(&self, objects: &[ObjectRef]) -> Result<Vec<(ObjectRef, File)>> {
+    pub(crate) fn files_for(&self, objects: &[ObjectRef]) -> Result<Vec<(ObjectRef, File)>> {
         let indices = objects
             .iter()
             .map(|object| {
@@ -134,7 +84,7 @@ impl View {
         self.files(&indices)
     }
 
-    pub fn files(&self, chunks: &[usize]) -> Result<Vec<(ObjectRef, File)>> {
+    pub(crate) fn files(&self, chunks: &[usize]) -> Result<Vec<(ObjectRef, File)>> {
         let checkpoint = &self.stored;
         let objects = chunks
             .iter()
@@ -160,25 +110,6 @@ impl View {
             })
             .collect()
     }
-
-    pub fn part(&self, name: &str) -> Option<Part> {
-        let (tensor, role) = name.rsplit_once('#')?;
-        let (component, key) = tensor.split_once('/')?;
-        let tensor = self.header.tensor(component, key)?;
-        let role = if role == "value" { "" } else { role };
-        let (dtype, shape) = match tensor.part(role) {
-            Some(part) => (part.dtype.name().to_owned(), part.shape.clone()),
-            None if role.is_empty() => (tensor.dtype.name().to_owned(), tensor.shape.clone()),
-            None => return None,
-        };
-        Some(Part {
-            component: component.into(),
-            key: key.into(),
-            role: role.into(),
-            dtype,
-            shape,
-        })
-    }
 }
 
 fn locate<'a>(header: &Header, name: &'a str) -> Option<(usize, usize, Option<&'a str>)> {
@@ -194,4 +125,73 @@ fn locate<'a>(header: &Header, name: &'a str) -> Option<(usize, usize, Option<&'
         .iter()
         .any(|(r, _)| *r == role || (r.is_empty() && role == "value"))
         .then_some((ci, ti, Some(role)))
+}
+
+/// The stored spans of the parts `regions` name, in header order, and the chunks they read.
+pub(crate) fn plan(header: &Header, regions: &[Vec<String>]) -> Result<(Vec<Span>, Vec<usize>)> {
+    let mut wanted = Vec::new();
+    for name in regions.iter().flatten() {
+        wanted.push(locate(header, name).ok_or_else(|| crate::failure::Failure {
+            kind: Kind::Invalid,
+            detail: format!("{name:?} is not in the checkpoint"),
+        })?);
+    }
+    wanted.sort_unstable();
+    wanted.dedup();
+    let (mut items, mut chunks) = (Vec::new(), Vec::new());
+    for (ci, ti, only) in wanted {
+        let component = &header.components()[ci];
+        let tensor = &component.tensors[ti];
+        for (role, at) in tensor.locations() {
+            let role = if role.is_empty() { "value" } else { role };
+            if only.is_some_and(|selected| selected != role) {
+                continue;
+            }
+            let what = format!("{}/{}#{role}", component.name, tensor.key);
+            let spans = header.spans(&at);
+            if spans.is_empty() {
+                items.push(Span {
+                    what,
+                    len: 0,
+                    source: ItemSource::Inline(Arc::from([])),
+                });
+                continue;
+            }
+            for span in spans {
+                let object = &header.chunks[span.chunk];
+                items.push(Span {
+                    what: what.clone(),
+                    len: span.length,
+                    source: ItemSource::Object(ObjectRange {
+                        obj: object.clone(),
+                        off: span.start,
+                        len: span.length,
+                    }),
+                });
+                chunks.push(span.chunk);
+            }
+        }
+    }
+    chunks.sort_unstable();
+    chunks.dedup();
+    Ok((items, chunks))
+}
+
+pub(crate) fn part(header: &Header, name: &str) -> Option<StoredPart> {
+    let (tensor, role) = name.rsplit_once('#')?;
+    let (component, key) = tensor.split_once('/')?;
+    let tensor = header.tensor(component, key)?;
+    let role = if role == "value" { "" } else { role };
+    let (dtype, shape) = match tensor.part(role) {
+        Some(part) => (part.dtype.name().to_owned(), part.shape.clone()),
+        None if role.is_empty() => (tensor.dtype.name().to_owned(), tensor.shape.clone()),
+        None => return None,
+    };
+    Some(StoredPart {
+        component: component.into(),
+        key: key.into(),
+        role: role.into(),
+        dtype,
+        shape,
+    })
 }

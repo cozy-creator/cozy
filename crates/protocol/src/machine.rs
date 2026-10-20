@@ -306,14 +306,6 @@ pub struct RunSpec {
     pub bits: u32,
 }
 
-/// Dev builds only (xs-045 U12): the profile that makes a warm run's model choice a migration
-/// of checkpoints from before TensorFS's format cut, which every Calcifer passes through. With a
-/// repository and manifest: that old checkpoint at the run's Hub, rewritten on the machine and
-/// put in the run's weights destination. With a `source`: every `local/` model of the pre-cut
-/// store at that path on the machine, into the machine's own store.
-#[cfg(feature = "migrate")]
-pub const MIGRATE: &str = "migrate";
-
 /// The caller's provider tokens, for models a run makes from a provider source.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]

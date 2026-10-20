@@ -531,29 +531,19 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
         .unwrap()
         .iter()
         .all(|(_, _, authorized)| *authorized));
-    let view = checkpoint.view();
-    let mut file = checkpoint.chunk(0).unwrap();
+    let source = checkpoint.source(false);
     drop(warm);
     drop(tokenizer);
     drop(checkpoint);
     drop(client);
     assert_eq!(component.read("w").unwrap(), b"abcdefghijklmnop");
-    let mut bytes = [0; 8];
-    file.read_exact(&mut bytes).unwrap();
-    assert_eq!(&bytes, b"abcdefgh");
-    #[cfg(target_os = "linux")]
-    assert!(
-        owned_fds(&cache) > 1,
-        "children lost their source retention"
-    );
-    drop(file);
     #[cfg(target_os = "linux")]
     assert!(
         owned_fds(&cache) > 0,
         "last children must still own retention"
     );
     drop(component);
-    drop(view);
+    drop(source);
     #[cfg(target_os = "linux")]
     {
         for _ in 0..100 {

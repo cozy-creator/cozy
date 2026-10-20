@@ -155,14 +155,6 @@ impl Checkpoint {
             })
     }
 
-    /// Newly owned descriptor, valid after every checkpoint/component handle drops.
-    pub fn chunk(&self, index: usize) -> Result<File> {
-        if index >= self.chunks().len() {
-            return fail(Kind::Invalid, format!("no chunk {index}"));
-        }
-        Ok(self.data.raw.chunk(index)?)
-    }
-
     pub fn missing(&self, selection: &Selection) -> Result<Vec<ObjectRef>> {
         self.wanted(selection)?
             .into_iter()
@@ -418,23 +410,29 @@ impl Checkpoint {
         crate::verification::verify(&self.data.raw, objects)
     }
 
-    /// The same placement/byte-engine view, retaining this source without a cycle.
-    /// Its callback checks availability only; Rust callers explicitly await fetch.
-    pub fn view(&self) -> crate::io::view::View {
-        let data = Arc::clone(&self.data);
-        crate::io::view::View::from(&data.raw).with_fetch(move |objects| {
-            for object in objects {
-                if !data.raw.holds(object)? {
-                    return fail(
-                        Kind::NotFound,
-                        format!(
-                            "{} is not present; fetch it asynchronously first",
-                            object.id()
-                        ),
-                    );
-                }
-            }
-            Ok(())
+    /// The stored spans of the parts `regions` names (`component/key`, or `component/key#role`
+    /// for one part), in header order: what placement copies.
+    pub fn spans(&self, regions: &[Vec<String>]) -> Result<Vec<crate::io::Span>> {
+        Ok(crate::io::view::plan(self.header(), regions)?.0)
+    }
+
+    /// The stored dtype and shape of the part `component/key#role` (`#value`: plain data).
+    pub fn stored_part(&self, name: &str) -> Option<crate::io::StoredPart> {
+        crate::io::view::part(self.header(), name)
+    }
+
+    /// This checkpoint's chunks as a read-engine source. A read fetches the chunks it needs
+    /// and lacks on the process runtime, so call it from outside an async context.
+    #[cfg(unix)]
+    pub fn source(&self, direct_io: bool) -> crate::io::source::Source {
+        crate::io::source::Source::checkpoint(&self.view(), direct_io)
+    }
+
+    fn view(&self) -> crate::io::view::View {
+        let checkpoint = self.clone();
+        crate::io::view::View::from(&self.data.raw).with_fetch(move |objects| {
+            let want = Download::default();
+            crate::raw::runtime()?.block_on(checkpoint.fetch_objects_exact(objects, &want)).map(drop)
         })
     }
 }

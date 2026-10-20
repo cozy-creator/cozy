@@ -4,7 +4,6 @@
 
 use std::ffi::{c_void, CStr};
 #[cfg(feature = "store")]
-use std::fs::File;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
@@ -13,7 +12,6 @@ use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use pyo3::{create_exception, ffi};
 #[cfg(feature = "store")]
-use tensorfs::ids::ObjectRef;
 use varena::ledger::{Admit, Facts, Ledger, Row, RowFacts, State, Victim};
 use varena::ceiling::Copy;
 use varena::memory::{Counters, GpuStats, Part, SetStats};
@@ -22,11 +20,10 @@ use varena::{Error, Gpu, Host, HostPinned, HostSet, Pinned, WeightSet};
 #[cfg(feature = "store")]
 use crate::store::PyCheckpoint;
 
-/// What varena reads of a `tensorfs.Checkpoint`: its header, and the stored checkpoint when a
-/// store holds it (a parsed header reads only a grant's files or a sealed layout).
+/// The open checkpoint behind a `tensorfs.Checkpoint`.
 #[cfg(feature = "store")]
-fn ck_of(py: Python<'_>, ck: &PyCheckpoint) -> PyResult<tensorfs::io::view::View> {
-    ck.native_view(py)
+fn ck_of(py: Python<'_>, ck: &PyCheckpoint) -> PyResult<tensorfs::Checkpoint> {
+    ck.core(py)
 }
 
 create_exception!(tensorfs.varena, VarenaError, PyException, "A varena error; `.code` names its class.");
@@ -135,17 +132,6 @@ pub struct PyPart {
 
 // ---------------------------------------------------------------- cores
 
-/// A grant's chunk files, `(sha256, length, fd)` each: every fd duplicated, the caller's kept.
-#[cfg(feature = "store")]
-fn granted(py: Python<'_>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<Option<Vec<(ObjectRef, File)>>> {
-    let dup = |(sha256, length, fd): (String, u64, i32)| -> varena::Result<(ObjectRef, File)> {
-        // SAFETY: a descriptor the caller holds for the duration of this call.
-        let own = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().map_err(|e| Error::Io(format!("dup chunk fd {fd}: {e}")));
-        Ok((ObjectRef { sha256, length }, File::from(own?)))
-    };
-    files.map(|f| f.into_iter().map(dup).collect::<varena::Result<_>>()).transpose().or_raise(py)
-}
-
 /// All Python-facing GPU owners, including temporary method refs, release on the native
 /// cleanup worker. A lazy provider may close its own set from the mover's fetch callback.
 struct Native<T: Send + 'static>(Option<T>);
@@ -187,18 +173,18 @@ impl PyGpu {
     }
 
     #[cfg(feature = "store")]
-    #[pyo3(signature = (name, ck, regions, host_fd = None, files = None))]
-    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
-        let (ck, files) = (ck_of(py, &ck)?, granted(py, files)?);
-        Ok(PyWeightSet::new(SetRef::Gpu(Native::new(py.detach(|| self.0.register(&name, ck, &regions, host_fd, files)).or_raise(py)?))))
+    #[pyo3(signature = (name, ck, regions, host_fd = None))]
+    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>) -> PyResult<PyWeightSet> {
+        let ck = ck_of(py, &ck)?;
+        Ok(PyWeightSet::new(SetRef::Gpu(Native::new(py.detach(|| self.0.register(&name, &ck, &regions, host_fd)).or_raise(py)?))))
     }
 
     /// The sealed host layout `host_fd` registered from the regions it carries, before any module.
     #[cfg(feature = "store")]
-    #[pyo3(signature = (name, ck, host_fd, files = None))]
-    fn adopt(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, host_fd: i32, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
-        let (ck, files) = (ck_of(py, &ck)?, granted(py, files)?);
-        Ok(PyWeightSet::new(SetRef::Gpu(Native::new(py.detach(|| self.0.adopt(&name, ck, host_fd, files)).or_raise(py)?))))
+    #[pyo3(signature = (name, ck, host_fd))]
+    fn adopt(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, host_fd: i32) -> PyResult<PyWeightSet> {
+        let ck = ck_of(py, &ck)?;
+        Ok(PyWeightSet::new(SetRef::Gpu(Native::new(py.detach(|| self.0.adopt(&name, &ck, host_fd)).or_raise(py)?))))
     }
 
     fn trim(&self, py: Python<'_>) -> PyResult<u64> {
@@ -236,17 +222,17 @@ impl PyHost {
     }
 
     #[cfg(feature = "store")]
-    #[pyo3(signature = (name, ck, regions, host_fd = None, files = None))]
-    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
-        let (ck, files) = (ck_of(py, &ck)?, granted(py, files)?);
-        Ok(PyWeightSet::new(SetRef::Host(py.detach(|| Host.register(&name, ck, &regions, host_fd, files)).or_raise(py)?)))
+    #[pyo3(signature = (name, ck, regions, host_fd = None))]
+    fn register(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, host_fd: Option<i32>) -> PyResult<PyWeightSet> {
+        let ck = ck_of(py, &ck)?;
+        Ok(PyWeightSet::new(SetRef::Host(py.detach(|| Host.register(&name, &ck, &regions, host_fd)).or_raise(py)?)))
     }
 
     #[cfg(feature = "store")]
-    #[pyo3(signature = (name, ck, host_fd, files = None))]
-    fn adopt(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, host_fd: i32, files: Option<Vec<(String, u64, i32)>>) -> PyResult<PyWeightSet> {
-        let (ck, files) = (ck_of(py, &ck)?, granted(py, files)?);
-        Ok(PyWeightSet::new(SetRef::Host(py.detach(|| Host.adopt(&name, ck, host_fd, files)).or_raise(py)?)))
+    #[pyo3(signature = (name, ck, host_fd))]
+    fn adopt(&self, py: Python<'_>, name: String, ck: PyRef<'_, PyCheckpoint>, host_fd: i32) -> PyResult<PyWeightSet> {
+        let ck = ck_of(py, &ck)?;
+        Ok(PyWeightSet::new(SetRef::Host(py.detach(|| Host.adopt(&name, &ck, host_fd)).or_raise(py)?)))
     }
 }
 
@@ -569,15 +555,14 @@ fn release_tier(py: Python<'_>, hold: i32) -> PyResult<u64> {
     varena::host::release_hold(unsafe { OwnedFd::from_raw_fd(hold) }).or_raise(py)
 }
 
-/// `regions` of a v2 checkpoint in a sealed host layout, filled in this process from its chunk
-/// files (`files`, else the checkpoint's paths): what `register(host_fd=)` adopts. Returns the
-/// memfd (the caller's).
+/// `regions` of a checkpoint in a sealed host layout, filled in this process from its chunks:
+/// what `register(host_fd=)` adopts. Returns the memfd (the caller's).
 #[cfg(feature = "store")]
 #[pyfunction]
-#[pyo3(signature = (ck, regions, name, threads = 8, files = None))]
-fn seal(py: Python<'_>, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, name: String, threads: usize, files: Option<Vec<(String, u64, i32)>>) -> PyResult<i32> {
-    let (ck, files) = (ck_of(py, &ck)?, granted(py, files)?);
-    py.detach(|| varena::memory::seal(ck, &regions, &name, threads, files)).map(IntoRawFd::into_raw_fd).or_raise(py)
+#[pyo3(signature = (ck, regions, name, threads = 8))]
+fn seal(py: Python<'_>, ck: PyRef<'_, PyCheckpoint>, regions: Vec<Vec<String>>, name: String, threads: usize) -> PyResult<i32> {
+    let ck = ck_of(py, &ck)?;
+    py.detach(|| varena::memory::seal(&ck, &regions, &name, threads)).map(IntoRawFd::into_raw_fd).or_raise(py)
 }
 
 // ---------------------------------------------------------------- the ledger

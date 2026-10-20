@@ -1,24 +1,22 @@
-//! A real TensorFS store in a temp dir holding a small odd-sized model, a real read lease and
-//! plan. Shared by the host-tier tests.
+//! A real TensorFS store in a temp dir holding a small odd-sized model, written by its writer
+//! and opened as a checkpoint. Shared by the host-tier tests.
 #![allow(dead_code)]
 
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use tensorfs::dtype::Dtype;
-use tensorfs::header::{Body, Header, Part, Tensor};
-use tensorfs::ids::ObjectRef;
-use tensorfs::meta::Meta;
-use tensorfs::read::{plan_for_traversal, ReadPlan};
-use tensorfs::registry;
-use tensorfs::store::{Fault, Store};
+use tensorfs::format::{Dtype, ObjectRef};
+use tensorfs::io::Span;
+use tensorfs::store::Store;
+use tensorfs::writer::{Data, Source};
+use tensorfs::{Checkpoint, Client, Config, Open};
 use varena::host::HostMem;
 use varena::layout::Layout;
 
 pub const MIB: usize = 1 << 20;
 
-/// (key, bytes): odd sizes on purpose; one tensor spans two 64 MiB objects, one is inline.
+/// (key, bytes): odd sizes on purpose.
 pub const TENSORS: &[(&str, usize)] = &[
     ("a.weight", 3 * MIB + 100),
     ("a.bias", 200),
@@ -39,84 +37,62 @@ pub fn bytes_of(key: &str, n: usize) -> Vec<u8> {
     (0..n).map(|i| (seed.wrapping_add(i as u32).wrapping_mul(2654435761) >> 13) as u8).collect()
 }
 
+pub fn scratch(name: &str) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("tfs-plane-{name}-{}-{n}", std::process::id()))
+}
+
+/// `tensors` (component, key, bytes) as U8 tensors in this order, written into the store at
+/// `root` and opened from it.
+pub fn checkpoint(root: &Path, tensors: &[(&str, &str, Vec<u8>)]) -> (Store, Checkpoint) {
+    let store = Store::open(root).unwrap();
+    let mut w = store.writer(None, None).unwrap();
+    for (component, key, bytes) in tensors {
+        let data = Data::Plain(Source::Read(&mut &bytes[..]));
+        w.get(component).put(key, &Dtype::U8, &[bytes.len() as u64], data).unwrap();
+    }
+    let header = w.commit().unwrap();
+    let client = Client::new(Config { cache_dir: root.to_path_buf(), ..Config::from_env() }).unwrap();
+    let open = Open { local_files_only: true, ..Default::default() };
+    let reference = format!("sha256:{}", header.sha256);
+    let ck = tensorfs::raw::runtime().unwrap().block_on(client.open(&reference, &open)).unwrap();
+    (store, ck)
+}
+
 pub struct Fixture {
     pub root: PathBuf,
-    pub store: Arc<Store>,
-    pub meta: Arc<Meta>,
-    pub header: Header,
+    pub store: Store,
+    pub ck: Checkpoint,
     pub objects: Vec<ObjectRef>,
 }
 
 impl Fixture {
     pub fn new(name: &str) -> Fixture {
-        let root = std::env::temp_dir().join(format!(
-            "tfs-plane-{name}-{}-{}",
-            std::process::id(),
-            tensorfs::meta::now_nanos_unique()
-        ));
-        let store = Store::init(&root).unwrap();
-        let plain = registry::seeds().into_iter().find(|s| s.alias == "plain/1").unwrap().spec;
-        let mut objects = Vec::new();
-        let tensors = TENSORS
-            .iter()
-            .map(|&(key, n)| {
-                let b = bytes_of(key, n);
-                let part = Part::plan(Dtype::U8, vec![n as u64], &b);
-                if let Body::Segments(segs) = &part.body {
-                    let mut at = 0usize;
-                    for s in segs {
-                        let chunk = &b[at..at + s.length as usize];
-                        store.put_stream(&mut &chunk[..], Some(s), &Fault::default()).unwrap();
-                        objects.push(s.clone());
-                        at += s.length as usize;
-                    }
-                }
-                (
-                    key.to_string(),
-                    Tensor {
-                        dtype: Dtype::U8,
-                        shape: vec![n as u64],
-                        encoding: plain.object_id(),
-                        parts: vec![("value".into(), part)],
-                    },
-                )
-            })
-            .collect();
-        let header = Header {
-            configs: Vec::new(),
-            assets: Vec::new(),
-            encodings: vec![plain],
-            components: vec![("unet".into(), tensors)],
-        };
-        let header = Header::parse(&header.canonical_bytes().unwrap()).unwrap();
-        let meta = Arc::new(Meta::open(&store).unwrap());
-        Fixture {
-            root,
-            store: Arc::new(store),
-            meta,
-            header,
-            objects,
-        }
+        let root = scratch(name);
+        let tensors: Vec<_> = TENSORS.iter().map(|&(k, n)| ("unet", k, bytes_of(k, n))).collect();
+        let (store, ck) = checkpoint(&root, &tensors);
+        let objects = ck.chunks().to_vec();
+        Fixture { root, store, ck, objects }
     }
 
-    pub fn plan(&self) -> ReadPlan {
-        let traversal: Vec<(String, String)> =
-            TENSORS.iter().map(|(k, _)| ("unet".into(), k.to_string())).collect();
-        plan_for_traversal(&self.header, &traversal, &["unet".into()], 16 << 20).unwrap()
+    pub fn plan(&self) -> Vec<Span> {
+        self.ck.spans(&regions()).unwrap()
     }
 
-    /// Live TensorFS holds (lease files) in the store.
-    pub fn holds(&self) -> usize {
-        std::fs::read_dir(self.root.join("tmp/leases"))
-            .map(|d| d.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x == "lease")).count())
-            .unwrap_or(0)
+    pub fn source(&self) -> varena::io::Source {
+        self.ck.source(true)
+    }
+
+    pub fn path(&self, object: &ObjectRef) -> PathBuf {
+        self.store.path(object).unwrap()
     }
 
     /// Evict our own blob files from the page cache so a fill has to go to disk. Written back
     /// first: a dirty page stays whatever the advice.
     pub fn drop_cache(&self) {
         for o in &self.objects {
-            let f = std::fs::File::open(self.store.blob_path(&o.sha256)).unwrap();
+            let f = std::fs::File::open(self.path(o)).unwrap();
             f.sync_all().unwrap();
             // SAFETY: advice on our own descriptor.
             unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
@@ -127,7 +103,7 @@ impl Fixture {
     pub fn cached_pages(&self) -> usize {
         let mut n = 0;
         for o in &self.objects {
-            let f = std::fs::File::open(self.store.blob_path(&o.sha256)).unwrap();
+            let f = std::fs::File::open(self.path(o)).unwrap();
             let len = o.length as usize;
             // SAFETY: read-only shared mapping of our file, unmapped below.
             let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0) };

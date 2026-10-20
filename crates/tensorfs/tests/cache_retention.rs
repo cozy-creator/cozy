@@ -18,7 +18,6 @@ use tensorfs::format::{
 };
 use tensorfs::io::{
     source::{IoTally, Item, ItemSource, Mode, Source},
-    view::View,
     Dst,
 };
 use tensorfs::io::ObjectRange;
@@ -439,10 +438,20 @@ fn native_owner_process() {
     assert_eq!(ck.id(), &f.header);
     match std::env::var("TENSORFS_RETENTION_MODE").unwrap().as_str() {
         "source" => {
-            let view = View::from(&ck);
-            let source = Source::checkpoint(&view, false);
-            drop(ck);
-            drop(view);
+            let client = tensorfs::Client::new(tensorfs::Config {
+                cache_dir: scratch.join("store"),
+                ..tensorfs::Config::from_env()
+            })
+            .unwrap();
+            let open = tensorfs::Open {
+                variant: Some("main".into()),
+                local_files_only: true,
+                ..Default::default()
+            };
+            let reference = format!("sha256:{}", f.tree.sha256);
+            let opened = tensorfs::raw::runtime().unwrap().block_on(client.open(&reference, &open)).unwrap();
+            let source = opened.source(false);
+            drop((ck, opened, client));
             report("ready");
             assert_eq!(command(), "read");
             read_late(&source, &f.late);

@@ -27,7 +27,6 @@ pub struct WriterOptions<'a> {
     pub repo_id: Option<&'a str>,
     pub endpoint: Option<&'a str>,
     pub token: Option<Arc<dyn TokenProvider>>,
-    pub ca_der: Option<&'a [u8]>,
 }
 
 #[derive(Clone)]
@@ -113,9 +112,6 @@ impl Client {
             let mut config = (*self.config).clone();
             if let Some(token) = options.token {
                 config.token = Some(token);
-            }
-            if let Some(ca) = options.ca_der {
-                config.ca_der = Some(ca.to_vec());
             }
             let url = if repo_id.starts_with("local/") {
                 "local"

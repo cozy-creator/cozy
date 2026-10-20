@@ -16,11 +16,13 @@ mod probe;
 #[cfg(unix)]
 pub mod source;
 #[cfg(feature = "store")]
-pub mod view;
+pub(crate) mod view;
 
 pub use device::DeviceBuffer;
 pub use plan::Target;
 pub use probe::{ceiling, disk, Ceiling};
+#[cfg(feature = "store")]
+pub use view::{Span, StoredPart};
 
 /// `len` bytes of object `obj` from `off`.
 #[derive(Debug, Clone, PartialEq, Eq)]

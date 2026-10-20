@@ -46,8 +46,8 @@ available locally before returning. This does not unpack weights, load a GPU or 
 snapshot folder.
 
 Rust network operations use your runtime. With a lazy checkpoint, call `download` for
-the required selection before synchronous `read`, `asset`, `chunk` or `export_files`
-operations. There is no hidden core Tokio runtime.
+the required selection before synchronous `read`, `asset` or `export_files` operations.
+Only the placement `source` fetches on its own, on the process runtime.
 
 A borrowed component follows Rust's ordinary borrow rules. Clone the `Component` if it
 must outlive the parent checkpoint; owned child handles retain their source and data holds.
@@ -148,7 +148,7 @@ below; normal model consumers do not need it.
 
 | Type | Fields / use |
 |---|---|
-| `Config` | `endpoint: String`, `cache_dir: PathBuf`, `mirror: Option<PathBuf>`, `token: Option<Arc<dyn TokenProvider>>`, `ca_der: Option<Vec<u8>>`. `Config::from_env()` returns configuration; `Client::new` validates it. Debug output redacts access material. |
+| `Config` | `endpoint: String`, `cache_dir: PathBuf`, `mirror: Option<PathBuf>`, `token: Option<Arc<dyn TokenProvider>>`, `ca_der: Option<Vec<u8>>` (a private CA trusted on top of the system roots, for every operation of the client). `Config::from_env()` returns configuration; `Client::new` validates it. Debug output redacts access material. |
 | `Ref` | `repo_id`, optional `revision`, `variant`, `endpoint`; implements `FromStr`. Use explicit fields/options when names contain shorthand separators. |
 | `Open` | Optional `revision`, `variant`, `endpoint`, plus `local_files_only` and `lazy`; defaults to `lazy: true`. |
 | `Selection` | `All`, `Components(Vec<String>)`, `Tensors { component, keys }`, `Part { component, key, role: Option<String>, range: Option<Range<u64>> }`, or `Assets { component, names: Option<Vec<String>> }`. Part ranges are stored byte ranges; absent asset names selects all assets. |
@@ -156,7 +156,7 @@ below; normal model consumers do not need it.
 | `Fetched` | Byte counts `local`, `volume`, `origin`. |
 | `VerificationReport` | Separate `missing` and `corrupt` object-reference vectors; `is_ok()` checks both are empty. |
 | `Convert` | Optional `converter`, `variant`, borrowed conversion-progress callback. |
-| `WriterOptions` | Optional `dest`, `variant`, `base`, `resume`, `repo_id`, `endpoint`, `token`, `ca_der`; implements `Default`. |
+| `WriterOptions` | Optional `dest`, `variant`, `base`, `resume`, `repo_id`, `endpoint`, `token`; implements `Default`. |
 | `Format` | `Safetensors` or native portable `Cozytensors` export. |
 
 `Progress` is a borrowed `Fn(u64, u64) -> Result<()> + Sync` (held bytes, total bytes).
@@ -181,8 +181,9 @@ worker-permission mechanism.
 | `components()` | `&[Component]`. |
 | `component(name)` | `Result<&Component>`. |
 | `verify(&Selection)` | `Result<VerificationReport>`, separating absent objects from length/digest failures. |
-| `view()` | An owned `io::view::View` for byte-engine/placement integration. |
-| `chunk(index)` | `Result<File>`; the returned file owns its descriptor. |
+| `spans(regions)` | `Result<Vec<io::Span>>`: the stored byte spans of the named parts, for placement. |
+| `stored_part(name)` | `Option<io::StoredPart>`: a part's stored dtype and shape. |
+| `source(direct_io)` | An `io::source::Source` over the chunks for the read engine; absent chunks are fetched on the process runtime. |
 | `missing(&Selection)` | `Result<Vec<ObjectRef>>`. |
 | `download(&Download).await` | `Result<Fetched>`. |
 | `materialize(directory, Format, dequantize).await` | `Result<PathBuf>` for the complete checkpoint folder. |
@@ -220,13 +221,6 @@ on a conflict. `Endpoint::new("local", ...)` addresses local repository referenc
 `retry(&Request, status, &HeaderMap) -> Result<bool>` defaults to `Ok(false)`.
 `Request` contains borrowed `method`, `url`, existing `headers`, and optional body-digest
 `payload`. The public result uses the same error families as the other client operations.
-
-`DPoP` is a cloneable `TokenProvider` for callers using proof-of-possession credentials.
-`DPoP::token(key, access_token, resource, endpoint)` wraps an already issued token;
-`DPoP::grant(&config, key, JwtBearer { token_endpoint, client_id, resource, claims })`
-configures a lazy JWT-bearer exchange. The key is a private P-256 JWK. Clones share the
-same native token state. `issued_token().await` returns `Option<String>` without starting
-an exchange. These provider operations use the common `Failure` families.
 
 `ObjectRef` has `sha256: String` and `length: u64`; `of(bytes)` hashes content, `id()` returns
 `sha256:…` and `key()` gives its object-storage key. `Metadata` is `BTreeMap<String, Value>`.

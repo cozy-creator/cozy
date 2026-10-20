@@ -75,7 +75,7 @@ impl Source {
 
     /// Retain metadata and the source context. No chunk opens or downloads until a read.
     #[cfg(feature = "store")]
-    pub fn checkpoint(view: &super::view::View, direct_io: bool) -> Source {
+    pub(crate) fn checkpoint(view: &super::view::View, direct_io: bool) -> Source {
         let mut source = Self::files(Vec::new(), direct_io, 0);
         source.view = Some(view.clone());
         source

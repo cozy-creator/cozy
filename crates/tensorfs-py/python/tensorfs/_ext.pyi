@@ -7,7 +7,6 @@ from typing import Any, Protocol, TypeVar, overload
 
 __version__: str
 STORE_FORMAT: int
-CLAIM_PROTOCOL: int
 
 def _kernel_binary(family: int, core: str, dtype: str) -> tuple[bytes, str, int, int]:
     """Internal engine binary payload, entry symbol, shared bytes and warp count."""
@@ -173,12 +172,12 @@ class Component:
     def assets(self) -> dict[str, tuple[str, int]]:
         """`name -> (sha256, length)`: run data in the component's folder."""
     def asset(self, name: str) -> bytes:
-        """An asset's bytes; a parsed header raises `UnsupportedError`."""
+        """An asset's bytes, fetched when absent."""
     def export_files(self, directory: StrPath) -> str:
         """Explicit compatibility export of config and assets only; never model weights."""
 
 class Checkpoint:
-    """One cozytensors read from a store, or only its header (`parse`)."""
+    """One cozytensors read from a store."""
 
     def close(self) -> None:
         """Release this handle's access and cached components; existing child handles remain usable."""
@@ -186,26 +185,15 @@ class Checkpoint:
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None: ...
     def verify(self, components: Sequence[str] | None = None) -> VerificationReport:
         """Check the actual header and selected full chunks/assets, without fetching or repair."""
-    def open_chunk(self, index: int) -> int:
-        """A new read-only OS descriptor owned and closed by the caller."""
-
-    @staticmethod
-    def parse(header: bytes) -> Checkpoint:
-        """A `cozytensors/1` header's pipeline, components and metadata, with no store: component reads,
-        `missing` and `Component.asset` refuse (`UnsupportedError`)."""
     @property
-    def id(self) -> str | None:
-        """`sha256:<hex>` of the header; None for a parsed header."""
+    def id(self) -> str:
+        """`sha256:<hex>` of the header."""
     @property
-    def header_ref(self) -> tuple[str, int] | None: ...
+    def header_ref(self) -> tuple[str, int]: ...
     @property
     def tree_ref(self) -> tuple[str, int] | None: ...
     @property
     def tree(self) -> str | None: ...
-    @property
-    def name(self) -> str | None: ...
-    @property
-    def release(self) -> str | None: ...
     @property
     def variant(self) -> str | None: ...
     @property
@@ -284,14 +272,6 @@ class _Client:
                 progress: Callable[[str, int, int], object] | None = None) -> Checkpoint: ...
 
 
-class DPoP:
-    def issued_token(self) -> str | None: ...
-    @staticmethod
-    def grant(key: str, *, token_endpoint: str, client_id: str, resource: str,
-              claims: Mapping[str, Any], endpoint: str | None = None, ca_der: bytes | None = None) -> DPoP: ...
-    @staticmethod
-    def token(key: str, access_token: str, resource: str | None = None, *, endpoint: str | None = None) -> DPoP: ...
-
 class TokenProvider(Protocol):
     def headers(self, method: str, url: str, headers: Mapping[str, str], payload: str | None) -> Mapping[str, str]: ...
     def retry(self, method: str, url: str, headers: Mapping[str, str], payload: str | None,
@@ -303,7 +283,7 @@ class Endpoint:
     def repo(self, repo_id: str) -> tuple[dict[str, Any], str] | None: ...
     def update_repo(self, repo_id: str, change: Any) -> dict[str, Any]: ...
 
-_Token = str | DPoP | TokenProvider | Callable[[str, str, Mapping[str, str], str | None], Mapping[str, str]]
+_Token = str | TokenProvider | Callable[[str, str, Mapping[str, str], str | None], Mapping[str, str]]
 
 def _materialize(checkpoint: Checkpoint, directory: StrPath, *, format: str = "cozytensors",
                  dequantize: str | None = None) -> str: ...

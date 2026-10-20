@@ -265,23 +265,18 @@ class Gpu:
         ck: Checkpoint,
         regions: Sequence[Sequence[str]],
         host_fd: int | None = None,
-        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
         """`regions`: `tensorfs.varena.regions(ck, max_bytes, boundaries, only)`; the set is the parts
         they name and nothing else of the checkpoint. `host_fd`: a sealed host layout of exactly
-        these regions, filled by the owner (TensorD) with the same layout function (`seal()`
-        here, Rust `varena::memory::open_checkpoint` + `host::open_sealed`). Its digest is
-        checked; a layout of other regions is refused. Copies come from it, and a region its
-        owner left a hole comes from the chunk files. Without `host_fd`, every copy comes from
-        the chunk files through the page cache. `files`: the chunk files a grant hands over,
-        `(sha256, length, fd)` each, the only ones read; without it, the store's chunk files.
-        The core duplicates every descriptor it keeps and closes nothing the caller passed."""
+        these regions (`seal()`). Its digest is checked; a layout of other regions is refused.
+        Copies come from it, and a region left a hole comes from the checkpoint's chunks, read
+        by TensorFS (fetched when absent). The core duplicates every descriptor it keeps and
+        closes nothing the caller passed."""
     def adopt(
         self,
         name: str,
         ck: Checkpoint,
         host_fd: int,
-        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
         """`register` of the sealed host layout `host_fd` with the regions it carries, before
         any module exists: `prefetch` starts its copies while the module is built. A module
@@ -311,16 +306,14 @@ class Host:
         ck: Checkpoint,
         regions: Sequence[Sequence[str]],
         host_fd: int | None = None,
-        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
         """As `Gpu.register`. Binds are views of the sealed layout (read-only), or private
-        memory read once from the chunk files."""
+        memory read once from the chunks."""
     def adopt(
         self,
         name: str,
         ck: Checkpoint,
         host_fd: int,
-        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
         """As `Gpu.adopt`."""
 
@@ -366,10 +359,9 @@ def seal(
     regions: Sequence[Sequence[str]],
     name: str,
     threads: int = 8,
-    files: Sequence[tuple[str, int, int]] | None = None,
 ) -> int:
-    """`regions` of a v2 checkpoint in a sealed host layout, filled in this process from its
-    chunk files (`files`, as in `register`, else the checkpoint's own paths). The result is what
+    """`regions` of a checkpoint in a sealed host layout, filled in this process from its
+    chunks. The result is what
     `register(host_fd=)` adopts, the same layout by construction; deposit it with TensorD as an
     opaque fd. Returns the memfd (the caller's)."""
 

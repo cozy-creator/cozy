@@ -25,7 +25,7 @@ jobs:
       build: tensorfs
       # Build the Runtime that consumes this ordinary TensorFS API. Source pins distinguish
       # compatible development wheels even when their package versions are the same.
-      runtime_ref: 2cef7db0b35002da8f6da500d8cf0fe86abe2416
+      runtime_ref: b84da528601cc8609bd6392a7804b7387a699b8e
       # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below.
       test: cargo test --workspace --locked --no-fail-fast --exclude cozy --exclude calcifer
 
@@ -37,4 +37,4 @@ jobs:
       # Freeze the ordinary Hub fixture and matching Runtime source independently of
       # the release cohort until this interface is released.
       tensorhub_ref: a67f65eb0aee2e1d022dbaa8eba6ae4bd17d8662
-      runtime_ref: 2cef7db0b35002da8f6da500d8cf0fe86abe2416
+      runtime_ref: b84da528601cc8609bd6392a7804b7387a699b8e

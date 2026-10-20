@@ -48,9 +48,9 @@ This waits for all declared chunks and component assets. It does not create a fo
 unpack quantized weights or place them on a GPU. To preload only selected components,
 open lazily and call `checkpoint.download(components=["unet"])`.
 
-For a private model, pass `token=...`. Other options are `endpoint`, `cache_dir`,
-`local_files_only` and `ca_der` (private CA bytes). `local_files_only=True` forbids network
-access and fails if the required data is unavailable locally.
+For a private model, pass `token=...`. Other options are `endpoint`, `cache_dir` and
+`local_files_only`. `local_files_only=True` forbids network access and fails if the required
+data is unavailable locally. A private CA is set once, with `tensorfs.configure(ca_der=...)`.
 
 ## Python: use the returned objects
 
@@ -244,16 +244,14 @@ Additional checkpoint properties and operations:
 
 | Attribute or call | Meaning |
 |---|---|
-| `id`, `header_ref` | Header identity: `sha256:…` string and `(hex, length)` pair. May be absent for a parsed-only header. |
+| `id`, `header_ref` | Header identity: `sha256:…` string and `(hex, length)` pair. |
 | `tree`, `tree_ref` | Repository-tree identity in the same two forms, when known. |
-| `name`, `repo_id` | Repository name; `repo_id` is an alias. |
-| `release`, `revision` | Release label, when known; `revision` is an alias. |
+| `repo_id` | Repository name, when known. |
+| `revision` | Release label, when known. |
 | `variant` | Selected repository variant, when known. A standalone header does not store this label. |
 | `pipeline`, `components` | Pipeline description and ordered component mapping. |
 | `metadata` | Loading/provenance metadata. |
 | `chunks` | Chunk object references in header order, as `(sha256_hex, byte_length)` pairs. |
-| `Checkpoint.parse(header_bytes)` | Inspect a binary header without a store; it does not grant access to its objects. |
-| `open_chunk(index)` | Return a new read-only OS file descriptor; the caller must close it. |
 | `close()` | Release this checkpoint handle. Existing child handles remain valid. |
 
 Use `with tensorfs.open(...) as checkpoint:` for automatic close. `Array` implements
@@ -435,7 +433,7 @@ Its options and members are:
 | `variant` | Optional repository/export label when `dest=None`; invalid with a file destination. |
 | `base` | Start from an existing checkpoint and reuse unchanged data. |
 | `resume` | Resume keyed local write state. |
-| `repo_id`, `endpoint`, `token`, `ca_der` | Stream the new checkpoint to a repository using supplied access. |
+| `repo_id`, `endpoint`, `token` | Stream the new checkpoint to a repository using supplied access. |
 | `cache_dir` | Choose the local store/cache. |
 | `metadata` | Mutable loading/provenance metadata dictionary. |
 | `local_checkpoint` | A committed local result retained after an upload failure, if one exists. |
@@ -481,7 +479,8 @@ resolution call is needed. These are upstream source revisions, not Tensorhub br
 ### Choose defaults and credentials
 
 ```python
-tensorfs.configure(endpoint="https://tensorhub.com", cache_dir="/path/to/cache", token=my_token)
+tensorfs.configure(endpoint="https://tensorhub.com", cache_dir="/path/to/cache", token=my_token,
+                   ca_der=private_ca_der)
 print(tensorfs.__version__)
 ```
 
@@ -495,12 +494,12 @@ checkpoint = tensorfs.open("me/model", endpoint="https://tensorhub.com", token=m
 
 The default endpoint is `https://tensorhub.com`; environment settings include
 `TENSORFS_ENDPOINT`, `TENSORFS_HOME` and `TENSORFS_TOKEN`. Public reads need no account.
-Private CA input is DER bytes through `ca_der`.
 
-In the current frozen wrapper, `configure` updates only non-`None` arguments. Its configured
-token applies to open/download/upload/Writer. Pass provider-specific tokens explicitly to
-`convert_to_cozytensors`; an explicitly constructed `Endpoint` has its own token.
-Configuration scoping is being reviewed as the common Rust client is integrated.
+`configure` updates only non-`None` arguments. Its token applies to open, materialize,
+`download_file`, `upload_folder` and `Writer`; pass provider-specific tokens explicitly to
+`convert_to_cozytensors`. `ca_der` (DER bytes) adds a private CA as a trusted root, on top of
+the system roots, for every later call in the process; no other call takes it. An explicitly
+constructed `Endpoint` has its own `token` and `ca_der`.
 
 For refreshable access, supply a callable or object whose `headers(method, url, headers,
 payload)` returns request headers. `payload` is the known body SHA-256, not body contents.
@@ -509,22 +508,6 @@ to try again after a response. These are duck-typed protocols, not classes you m
 Progress and repository-change callback exceptions can propagate normally. An ordinary
 exception from a token provider is wrapped as `DeniedError`; a TensorFS exception retains
 its family. Credentials do not follow cross-origin redirects.
-
-The optional `DPoP` helper supports proof-bearing access where the endpoint requires it.
-Its `key` argument is a private P-256 JWK encoded as a JSON string:
-
-| Call or property | Meaning |
-|---|---|
-| `DPoP.token(key, access_token, resource=None, endpoint=None)` | Use an existing token and signing key. |
-| `DPoP.grant(key, token_endpoint=..., client_id=..., resource=..., claims=..., endpoint=None, ca_der=None)` | Create a provider for the endpoint's supported grant flow. |
-| `issued_token()` | A token obtained by the provider, when present. |
-
-Given that key and an access token from your authorization setup:
-
-```python
-provider = tensorfs.DPoP.token(private_jwk_json, access_token)
-checkpoint = tensorfs.open("me/private-model", token=provider)
-```
 
 ### Optional filesystem escape hatches
 
@@ -561,8 +544,8 @@ Supply `local_dir` for a checkpoint or for Safetensors output. A checkpoint alre
 its source and credentials, so repository-selection/configuration keywords do not apply.
 Safetensors output requires one selected checkpoint and does not accept `components`;
 choose `variant` when a named repository has multiple variants. Native repository mode
-also accepts `revision`, `variant`, `components`, `local_files_only`, `cache_dir`, `endpoint`,
-`token` and `ca_der`; without `local_dir`, it returns a managed snapshot folder.
+also accepts `revision`, `variant`, `components`, `local_files_only`, `cache_dir`, `endpoint`
+and `token`; without `local_dir`, it returns a managed snapshot folder.
 
 #### Compatibility export for legacy file-based libraries
 
@@ -594,7 +577,7 @@ tree_id = tensorfs.upload_folder(repo_id="me/model", folder_path="./portable", t
 options, without component or variant selection.
 
 `upload_folder` returns the exact published tree id. Its options are `revision`, `token`,
-`endpoint`, `cache_dir` and `ca_der`. Without a revision it appends an unreleased checkpoint;
+`endpoint` and `cache_dir`. Without a revision it appends an unreleased checkpoint;
 it does not create a public release. Repository files such as README and LICENSE are
 ordinary files in the uploaded folder.
 
@@ -632,8 +615,7 @@ All of these Python calls are synchronous.
 
 The returned data types are `Checkpoint`, `Pipeline`, `Component`, `Tensors`,
 `TensorMetadata`, `Encoding`, `Array`, `Encoded` and `VerificationReport`. Writing uses `Writer` and `ComponentWriter`;
-advanced authorization/reference operations use `DPoP` and `Endpoint`. They are covered
-above. The companion `tensorfs.varena` placement API is separate and is unnecessary for
+repository references use `Endpoint`. They are covered above. The companion `tensorfs.varena` placement API is separate and is unnecessary for
 ordinary TensorFS or Diffusers/ComfyUI use.
 
 ## Errors and value types

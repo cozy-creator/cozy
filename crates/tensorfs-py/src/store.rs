@@ -398,12 +398,11 @@ fn _materialize(
 
 // ---------------------------------------------------------------- checkpoints
 
-/// One cozytensors: its pipeline, components and metadata, read from a store; or only its
-/// header (`Checkpoint.parse`), with no chunks or assets to read.
+/// One cozytensors: its pipeline, components and metadata, read from a store.
 #[pyclass(name = "Checkpoint", module = "tensorfs", frozen)]
 pub struct PyCheckpoint {
     header: Header,
-    id: Option<ObjectRef>,
+    id: ObjectRef,
     tree: Option<ObjectRef>,
     named: Option<Ref>,
     variant: Option<String>,
@@ -640,24 +639,9 @@ pub(crate) struct FetchTensor<'a> {
 }
 
 impl PyCheckpoint {
-    fn parsed(header: Header) -> Self {
-        Self {
-            header,
-            id: None,
-            tree: None,
-            named: None,
-            variant: None,
-            state: Mutex::new(CheckpointState {
-                access: None,
-                components: None,
-                closed: false,
-            }),
-        }
-    }
-
     fn from_core(checkpoint: Checkpoint) -> Self {
         let header = checkpoint.header().clone();
-        let id = Some(checkpoint.id().clone());
+        let id = checkpoint.id().clone();
         let tree = checkpoint.tree().cloned();
         let named = checkpoint.named().cloned();
         let variant = checkpoint.variant().map(str::to_owned);
@@ -680,16 +664,7 @@ impl PyCheckpoint {
         if state.closed {
             return Err(invalid(py, "the checkpoint is closed"));
         }
-        state.access.clone().ok_or_else(|| {
-            raise(
-                py,
-                Failure {
-                    kind: Kind::Unsupported,
-                    detail: "a parsed header has no source: its chunks and assets are not here"
-                        .into(),
-                },
-            )
-        })
+        state.access.clone().ok_or_else(|| invalid(py, "the checkpoint is closed"))
     }
 
     fn ensure_open(&self, py: Python<'_>) -> PyResult<()> {
@@ -703,27 +678,6 @@ impl PyCheckpoint {
 
     pub(crate) fn core(&self, py: Python<'_>) -> PyResult<Checkpoint> {
         Ok((**self.access(py)?).clone())
-    }
-
-    pub(crate) fn native_view(&self, py: Python<'_>) -> PyResult<tensorfs::io::view::View> {
-        let access = {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.closed {
-                return Err(invalid(py, "the checkpoint is closed"));
-            }
-            state.access.clone()
-        };
-        Ok(match access {
-            Some(access) => access.view().with_fetch(move |objects| {
-                bridge(tensorfs::raw::fetch_objects(
-                    &access,
-                    objects,
-                    &Download::default(),
-                ))
-                .map(drop)
-            }),
-            None => tensorfs::io::view::View::parsed(self.header.clone()),
-        })
     }
 
     fn tensor_dict(
@@ -832,54 +786,15 @@ impl PyCheckpoint {
         Ok(report.into())
     }
 
-    fn open_chunk(&self, py: Python<'_>, index: usize) -> PyResult<i32> {
-        let access = self.access(py)?;
-        let object = access
-            .header()
-            .chunks
-            .get(index)
-            .ok_or_else(|| invalid(py, format!("no chunk {index}")))?;
-        py.detach(|| {
-            bridge(tensorfs::raw::fetch_objects(
-                &access,
-                std::slice::from_ref(object),
-                &Download::default(),
-            ))
-        })
-        .or_raise(py)?;
-        let file = py.detach(|| access.chunk(index)).or_raise(py)?;
-        #[cfg(unix)]
-        {
-            Ok(std::os::fd::IntoRawFd::into_raw_fd(file))
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::{AsRawHandle, IntoRawHandle};
-            let fd = py
-                .import("msvcrt")?
-                .call_method1("open_osfhandle", (file.as_raw_handle() as usize, 0x8000))?
-                .extract()?;
-            let _ = file.into_raw_handle();
-            Ok(fd)
-        }
-    }
-
-    /// A `cozytensors/1` header's pipeline, components and metadata, with no store behind them.
-    #[staticmethod]
-    fn parse(py: Python<'_>, header: &[u8]) -> PyResult<PyCheckpoint> {
-        let header = Header::from_cbor(header).or_raise(py)?;
-        Ok(PyCheckpoint::parsed(header))
-    }
-
-    /// `sha256:<hex>` of the header: the cozytensors' id. None for a parsed header.
+    /// `sha256:<hex>` of the header: the cozytensors' id.
     #[getter]
-    fn id(&self) -> Option<String> {
-        self.id.as_ref().map(ObjectRef::id)
+    fn id(&self) -> String {
+        self.id.id()
     }
 
     #[getter]
-    fn header_ref(&self) -> Option<(String, u64)> {
-        self.id.as_ref().map(|id| (id.sha256.clone(), id.length))
+    fn header_ref(&self) -> (String, u64) {
+        (self.id.sha256.clone(), self.id.length)
     }
     #[getter]
     fn tree_ref(&self) -> Option<(String, u64)> {
@@ -888,31 +803,22 @@ impl PyCheckpoint {
             .map(|tree| (tree.sha256.clone(), tree.length))
     }
 
-    /// The tree, repo, release and variant naming it, when one does.
+    /// The tree, repo, revision and variant naming it, when one does.
     #[getter]
     fn tree(&self) -> Option<String> {
         self.tree.as_ref().map(ObjectRef::id)
     }
     #[getter]
-    fn name(&self) -> Option<&str> {
+    fn repo_id(&self) -> Option<&str> {
         self.named.as_ref().map(|named| named.repo_id.as_str())
     }
     #[getter]
-    fn release(&self) -> Option<&str> {
+    fn revision(&self) -> Option<&str> {
         self.named.as_ref()?.revision.as_deref()
     }
     #[getter]
     fn variant(&self) -> Option<&str> {
         self.variant.as_deref()
-    }
-
-    #[getter]
-    fn repo_id(&self) -> Option<&str> {
-        self.name()
-    }
-    #[getter]
-    fn revision(&self) -> Option<&str> {
-        self.release()
     }
     #[getter]
     fn pipeline(&self, py: Python<'_>) -> PyResult<Option<PyPipeline>> {

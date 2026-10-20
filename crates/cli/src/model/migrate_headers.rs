@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use protocol::error::{Error, Kind};
 use serde_json::{json, Value};
-use tensorfs::client::access;
 use tensorfs::failure::Result as Done;
 use tensorfs::fetch::{policy::is_loopback_origin, token::bearer, Client, Endpoint, SourcePolicy};
 use tensorfs::migrate::d10::{self, Migrator, UPSTREAMS};
@@ -50,7 +49,7 @@ fn write(path: &Path, doc: &Value) -> Result<(), Error> {
 
 pub(crate) async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     if let Some(store) = args.local {
-        let report = blocking(move || d10::store(&store, &mut Migrator::new(access(), UPSTREAMS))).await?;
+        let report = blocking(move || d10::store(&store, &mut Migrator::new(tensorfs::import::Access::from_env(), UPSTREAMS))).await?;
         write(&args.audit.join("local.json"), &report)?;
         output::json(&report);
         return Ok(ExitCode::SUCCESS);
@@ -66,7 +65,7 @@ pub(crate) async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             let endpoint = Arc::new(Endpoint::new(&http, &origin, Some(bearer(token)))?);
             let scratch = tempfile::tempdir()?;
             let store = Store::open(scratch.path())?;
-            d10::migrate(&endpoint, &http, &name, &store, &mut Migrator::new(access(), UPSTREAMS))
+            d10::migrate(&endpoint, &http, &name, &store, &mut Migrator::new(tensorfs::import::Access::from_env(), UPSTREAMS))
         });
         let report = done.await.unwrap_or_else(|e| {
             ok = false;

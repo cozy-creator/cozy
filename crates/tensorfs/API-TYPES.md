@@ -104,12 +104,15 @@ impl Checkpoint {
     pub fn variant(&self) -> Option<&str>;
     pub fn tree(&self) -> Option<&ObjectRef>;
     pub fn verify(&self, selection: &Selection) -> Result<VerificationReport>;
-    pub fn view(&self) -> io::view::View;
+    // Placement (varena): stored spans of named regions, a part's stored dtype/shape, and a
+    // read-engine source that fetches absent chunks on the process runtime.
+    pub fn spans(&self, regions: &[Vec<String>]) -> Result<Vec<io::Span>>;
+    pub fn stored_part(&self, name: &str) -> Option<io::StoredPart>;
+    pub fn source(&self, direct_io: bool) -> io::source::Source;
     pub fn named(&self) -> Option<&Ref>;
     pub fn pipeline(&self) -> Option<&format::Pipeline>;
     pub fn components(&self) -> &[Component];
     pub fn component(&self, name: &str) -> Result<&Component>;
-    pub fn chunk(&self, index: usize) -> Result<File>;
     pub fn missing(&self, selection: &Selection) -> Result<Vec<ObjectRef>>;
     pub async fn download(&self, want: &Download<'_>) -> Result<Fetched>;
     // Cozytensors requires None; Safetensors accepts F32/BF16/F16 when Some.
@@ -170,21 +173,6 @@ pub trait TokenProvider: Send + Sync {
 }
 pub fn bearer(token: impl Into<String>) -> Arc<dyn TokenProvider>;
 
-pub struct JwtBearer {
-    pub token_endpoint: String,
-    pub client_id: String,
-    pub resource: String,
-    pub claims: serde_json::Map<String, serde_json::Value>,
-}
-#[derive(Clone)]
-pub struct DPoP { /* shared native token state */ }
-impl DPoP {
-    pub fn grant(config: &Config, key: &str, grant: JwtBearer) -> Result<Self>;
-    pub fn token(key: &str, access_token: &str, resource: Option<&str>,
-        endpoint: Option<&str>) -> Result<Self>;
-    pub async fn issued_token(&self) -> Option<String>;
-}
-// DPoP implements TokenProvider. key is a private P-256 JWK.
 ```
 
 ## Conversion, writers and export
@@ -208,7 +196,7 @@ pub struct WriterOptions<'a> {
     pub dest: Option<&'a Path>, pub variant: Option<&'a str>,
     pub base: Option<&'a Checkpoint>, pub resume: Option<&'a str>,
     pub repo_id: Option<&'a str>, pub endpoint: Option<&'a str>,
-    pub token: Option<Arc<dyn TokenProvider>>, pub ca_der: Option<&'a [u8]>,
+    pub token: Option<Arc<dyn TokenProvider>>,
 }
 pub struct Writer { /* owned local and optional remote write state */ }
 impl Writer {

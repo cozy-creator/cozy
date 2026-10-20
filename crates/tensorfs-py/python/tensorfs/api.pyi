@@ -3,31 +3,32 @@ from os import PathLike
 from types import TracebackType
 from typing import Protocol
 
-from ._ext import Checkpoint, Component, DPoP, TokenProvider
+from ._ext import Checkpoint, Component, TokenProvider
 
 StrPath = str | PathLike[str]
-Token = str | DPoP | TokenProvider | Callable[[str, str, Mapping[str, str], str | None], Mapping[str, str]]
+Token = str | TokenProvider | Callable[[str, str, Mapping[str, str], str | None], Mapping[str, str]]
 
 class DLPack(Protocol):
     def __dlpack__(self) -> object: ...
 
-def configure(*, endpoint: str | None = None, cache_dir: StrPath | None = None, token: Token | None = None) -> None: ...
+def configure(*, endpoint: str | None = None, cache_dir: StrPath | None = None, token: Token | None = None,
+              ca_der: bytes | None = None) -> None: ...
 def open(name_or_path: StrPath, *, revision: str | None = None, variant: str | None = None,
          endpoint: str | None = None, local_files_only: bool = False, cache_dir: StrPath | None = None,
-         token: Token | None = None, ca_der: bytes | None = None, lazy: bool = True) -> Checkpoint: ...
+         token: Token | None = None, lazy: bool = True) -> Checkpoint: ...
 def materialize(source: str | Checkpoint, *, local_dir: StrPath | None = None,
                 format: str = "cozytensors", dequantize: str | None = None,
                 revision: str | None = None, variant: str | None = None,
                 components: Sequence[str] | None = None, cache_dir: StrPath | None = None,
                 local_files_only: bool = False, token: Token | None = None,
-                endpoint: str | None = None, ca_der: bytes | None = None) -> str: ...
+                endpoint: str | None = None) -> str: ...
 def download_file(repo_id: str, filename: str, *, revision: str | None = None,
                  cache_dir: StrPath | None = None, local_dir: StrPath | None = None,
                  local_files_only: bool = False, token: Token | None = None,
-                 endpoint: str | None = None, ca_der: bytes | None = None) -> str: ...
+                 endpoint: str | None = None) -> str: ...
 def upload_folder(*, repo_id: str, folder_path: StrPath, revision: str | None = None,
                   token: Token | None = None, endpoint: str | None = None,
-                  cache_dir: StrPath | None = None, ca_der: bytes | None = None) -> str: ...
+                  cache_dir: StrPath | None = None) -> str: ...
 def convert_to_cozytensors(source: str | Sequence[str], *, converter: str | None = None, variant: str | None = None,
             cache_dir: StrPath | None = None, token: Token | None = None,
             progress: Callable[[str, int, int], object] | None = None) -> Checkpoint: ...
@@ -52,7 +53,7 @@ class Writer:
     def __init__(self, dest: StrPath | None = None, *, variant: str | None = None,
                  base: Checkpoint | None = None, resume: str | None = None,
                  repo_id: str | None = None, endpoint: str | None = None, token: Token | None = None,
-                 cache_dir: StrPath | None = None, ca_der: bytes | None = None) -> None:
+                 cache_dir: StrPath | None = None) -> None:
         """An optional literal cozytensors header file; payload remains in the configured shared store."""
     def __enter__(self) -> Writer: ...
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None,

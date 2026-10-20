@@ -18,7 +18,7 @@ from types import TracebackType
 from typing import Any, Protocol, TypeVar, overload
 StrPath = str | PathLike[str]
 _T = TypeVar('_T')
-Token = str | DPoP | TokenProvider | Callable[[str, str, Mapping[str, str], str | None], Mapping[str, str]]
+Token = str | TokenProvider | Callable[[str, str, Mapping[str, str], str | None], Mapping[str, str]]
 __version__: str
 
 class TokenProvider(Protocol):
@@ -39,22 +39,22 @@ class DLPack(Protocol):
     def __dlpack__(self, stream: int | None=None) -> object:
         ...
 
-def configure(*, endpoint: str | None=None, cache_dir: StrPath | None=None, token: Token | None=None) -> None:
+def configure(*, endpoint: str | None=None, cache_dir: StrPath | None=None, token: Token | None=None, ca_der: bytes | None=None) -> None:
     ...
 
 def convert_to_cozytensors(source: str | Sequence[str], *, converter: str | None=None, variant: str | None=None, cache_dir: StrPath | None=None, token: Token | None=None, progress: Callable[[str, int, int], object] | None=None) -> Checkpoint:
     ...
 
-def download_file(repo_id: str, filename: str, *, revision: str | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, ca_der: bytes | None=None) -> str:
+def download_file(repo_id: str, filename: str, *, revision: str | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None) -> str:
     ...
 
-def open(name_or_path: StrPath, *, revision: str | None=None, variant: str | None=None, endpoint: str | None=None, local_files_only: bool=False, cache_dir: StrPath | None=None, token: Token | None=None, ca_der: bytes | None=None, lazy: bool=True) -> Checkpoint:
+def open(name_or_path: StrPath, *, revision: str | None=None, variant: str | None=None, endpoint: str | None=None, local_files_only: bool=False, cache_dir: StrPath | None=None, token: Token | None=None, lazy: bool=True) -> Checkpoint:
     ...
 
-def materialize(source: str | Checkpoint, *, revision: str | None=None, variant: str | None=None, components: Sequence[str] | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, ca_der: bytes | None=None, format: str='cozytensors', dequantize: str | None=None) -> str:
+def materialize(source: str | Checkpoint, *, revision: str | None=None, variant: str | None=None, components: Sequence[str] | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, format: str='cozytensors', dequantize: str | None=None) -> str:
     ...
 
-def upload_folder(*, repo_id: str, folder_path: StrPath, revision: str | None=None, token: Token | None=None, endpoint: str | None=None, cache_dir: StrPath | None=None, ca_der: bytes | None=None) -> str:
+def upload_folder(*, repo_id: str, folder_path: StrPath, revision: str | None=None, token: Token | None=None, endpoint: str | None=None, cache_dir: StrPath | None=None) -> str:
     ...
 
 class Error(Exception):
@@ -260,7 +260,7 @@ class Component:
         """`name -> (sha256, length)`: run data in the component's folder."""
 
     def asset(self, name: str) -> bytes:
-        """An asset's bytes; a parsed header raises `UnsupportedError`."""
+        """An asset's bytes, fetched when absent."""
 
     def export_files(self, directory: str | PathLike[str]) -> str:
         """Write configuration and supporting files for a file-based consumer; no tensor weights."""
@@ -283,7 +283,7 @@ class VerificationReport:
         """True when both collections are empty."""
 
 class Checkpoint:
-    """One cozytensors read from a store, or only its header (`parse`)."""
+    """One cozytensors read from a store."""
 
     def close(self) -> None:
         """Release this handle's access and cached components; existing child handles remain usable."""
@@ -297,20 +297,12 @@ class Checkpoint:
     def verify(self, components: Sequence[str] | None=None) -> VerificationReport:
         """Audit the header and selected local data; never fetch, repair or delete objects."""
 
-    def open_chunk(self, index: int) -> int:
-        """A new read-only OS descriptor owned and closed by the caller."""
-
-    @staticmethod
-    def parse(header: bytes) -> Checkpoint:
-        """A `cozytensors/1` header's pipeline, components and metadata, with no store: component reads,
-        `missing` and `Component.asset` refuse (`UnsupportedError`)."""
+    @property
+    def id(self) -> str:
+        """`sha256:<hex>` of the header."""
 
     @property
-    def id(self) -> str | None:
-        """`sha256:<hex>` of the header; None for a parsed header."""
-
-    @property
-    def header_ref(self) -> tuple[str, int] | None:
+    def header_ref(self) -> tuple[str, int]:
         ...
 
     @property
@@ -319,14 +311,6 @@ class Checkpoint:
 
     @property
     def tree(self) -> str | None:
-        ...
-
-    @property
-    def name(self) -> str | None:
-        ...
-
-    @property
-    def release(self) -> str | None:
         ...
 
     @property
@@ -361,19 +345,6 @@ class Checkpoint:
         """The chunks and assets of `components` (all when None) not here."""
 
     def download(self, components: Sequence[str] | None=None, *, priority: int=0, progress: Callable[[str, int, int], object] | None=None) -> None:
-        ...
-
-class DPoP:
-
-    def issued_token(self) -> str | None:
-        ...
-
-    @staticmethod
-    def grant(key: str, *, token_endpoint: str, client_id: str, resource: str, claims: Mapping[str, Any], endpoint: str | None=None, ca_der: bytes | None=None) -> DPoP:
-        ...
-
-    @staticmethod
-    def token(key: str, access_token: str, resource: str | None=None, *, endpoint: str | None=None) -> DPoP:
         ...
 
 class Endpoint:
@@ -411,7 +382,7 @@ class Writer:
     metadata: dict[str, object]
     local_checkpoint: Checkpoint | None
 
-    def __init__(self, dest: StrPath | None=None, *, variant: str | None=None, base: Checkpoint | None=None, resume: str | None=None, repo_id: str | None=None, endpoint: str | None=None, token: Token | None=None, cache_dir: StrPath | None=None, ca_der: bytes | None=None) -> None:
+    def __init__(self, dest: StrPath | None=None, *, variant: str | None=None, base: Checkpoint | None=None, resume: str | None=None, repo_id: str | None=None, endpoint: str | None=None, token: Token | None=None, cache_dir: StrPath | None=None) -> None:
         """Write an exact header-file path, or only the shared store when dest=None.
 
         variant labels repository content and is invalid with a file destination.

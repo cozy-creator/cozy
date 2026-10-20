@@ -1,5 +1,5 @@
-//! TensorFS v2 checkpoints through `register`: a real v2 store written by its writer, bound on
-//! the host core from its chunk files and from a sealed host layout, every part read back. The
+//! TensorFS checkpoints through `register`: a real store written by its writer, bound on the
+//! host core from its chunks and from a sealed host layout, every part read back. The
 //! checkpoint has packs, a tensor over two chunks, two components and an empty tensor. The GPU
 //! core's proof runs on a rental (`scripts/varena-gpu.py`).
 #![cfg(target_os = "linux")]
@@ -7,12 +7,10 @@
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
-use tensorfs::client::regions;
-use tensorfs::format::Dtype;
-use tensorfs::ids::ObjectRef;
-use tensorfs::store::{Checkpoint, Store};
-use tensorfs::writer::{Data, Source};
-use tensorfs::io::view::View;
+mod common;
+
+use tensorfs::raw::regions;
+use tensorfs::Checkpoint;
 use varena::{cuda, memory, Error, Gpu, Host, HostSet};
 
 const MIB: usize = 1 << 20;
@@ -45,15 +43,9 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str) -> Fixture {
-        let root = std::env::temp_dir().join(format!("varena-ck-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let store = Store::open(&root).unwrap();
-        let mut w = store.writer(None, None).unwrap();
-        for &(component, key, n) in TENSORS {
-            let b = bytes_of(key, n);
-            w.get(component).put(key, &Dtype::U8, &[n as u64], Data::Plain(Source::Read(&mut &b[..]))).unwrap();
-        }
-        let ck = store.checkpoint(&w.commit().unwrap()).unwrap();
+        let root = common::scratch(&format!("ck-{name}"));
+        let tensors: Vec<_> = TENSORS.iter().map(|&(c, k, n)| (c, k, bytes_of(k, n))).collect();
+        let (_, ck) = common::checkpoint(&root, &tensors);
         Fixture { root, ck }
     }
 }
@@ -87,67 +79,41 @@ fn check_parts(ws: &Arc<HostSet>, want: usize) {
     assert_eq!(seen, want);
 }
 
-/// Every chunk of `ck`, opened: what a grant hands over.
-fn granted(ck: &Checkpoint) -> Vec<(ObjectRef, std::fs::File)> {
-    let chunks = ck.header().chunks.iter().enumerate();
-    chunks.map(|(i, c)| (ObjectRef { sha256: c.sha256.clone(), length: c.length }, std::fs::File::open(ck.chunk_path(i)).unwrap())).collect()
-}
-
 #[test]
-fn a_v2_checkpoint_binds_on_the_host_exactly_from_its_chunk_files() {
+fn a_checkpoint_binds_on_the_host_exactly_from_its_chunks() {
     let fx = Fixture::new("host");
     let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
-    let ws = Host.register("ck", &fx.ck, &rs, None, None).unwrap();
+    let ws = Host.register("ck", &fx.ck, &rs, None).unwrap();
     assert_eq!(ws.weights.layout.regions.len(), rs.len());
     check(&ws);
     assert!(ws.bind(0).unwrap().writable);
     // One component alone is a weight set of its own tensors.
     let vae: Vec<Vec<String>> = rs.iter().filter(|r| r[0].starts_with("vae/")).cloned().collect();
-    assert!(Host.register("vae", &fx.ck, &vae, None, None).unwrap().weights.parts.iter().all(|p| p.component == "vae"));
+    assert!(Host.register("vae", &fx.ck, &vae, None).unwrap().weights.parts.iter().all(|p| p.component == "vae"));
     // A window is a weight set of its regions' parts alone, read exactly.
     let window = regions(fx.ck.header(), 64 << 20, &blocks(), &["unet/blocks.2".into()]);
-    let ww = Host.register("window", &fx.ck, &window, None, None).unwrap();
+    let ww = Host.register("window", &fx.ck, &window, None).unwrap();
     let parts: Vec<&str> = ww.weights.parts.iter().map(|p| p.key.as_str()).collect();
     assert_eq!(parts, ["blocks.2.a", "blocks.2.b", "norm.weight"]);
     check_parts(&ww, 3);
-    assert!(Host.register("bad", &fx.ck, &[vec!["unet/blocks.9".into()]], None, None).is_err());
-}
-
-#[test]
-fn a_v2_checkpoint_binds_from_the_chunk_files_a_grant_hands_over_and_no_others() {
-    let fx = Fixture::new("granted");
-    let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
-    check(&Host.register("granted", &fx.ck, &rs, None, Some(granted(&fx.ck))).unwrap());
-    let none = Host.register("none", &fx.ck, &rs, None, Some(Vec::new())).unwrap();
-    assert!((0..rs.len() as u32).any(|r| none.bind(r).is_err()), "an object no grant handed over is never read");
-}
-
-#[test]
-fn a_header_parsed_alone_binds_and_seals_from_its_grant_only() {
-    let fx = Fixture::new("parsed");
-    let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
-    let parsed = View::parsed(fx.ck.header().clone());
-    check(&Host.register("parsed", parsed.clone(), &rs, None, Some(granted(&fx.ck))).unwrap());
-    assert!(matches!(Host.register("bare", parsed.clone(), &rs, None, None), Err(Error::Invalid(_))), "no store, no grant: nothing to read");
-    let fd = memory::seal(parsed.clone(), &rs, "parsed", 2, Some(granted(&fx.ck))).unwrap();
-    check(&Host.register("sealed", parsed, &rs, Some(fd.as_raw_fd()), None).unwrap());
+    assert!(Host.register("bad", &fx.ck, &[vec!["unet/blocks.9".into()]], None).is_err());
 }
 
 #[cfg(target_os = "linux")] // sealed host layouts are Linux-only
 #[test]
-fn a_v2_checkpoint_binds_on_the_host_exactly_from_a_sealed_layout() {
+fn a_checkpoint_binds_on_the_host_exactly_from_a_sealed_layout() {
     let fx = Fixture::new("sealed");
     let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
-    let fd = memory::seal(&fx.ck, &rs, "ck", 2, None).unwrap();
+    let fd = memory::seal(&fx.ck, &rs, "ck", 2).unwrap();
     let carried = varena::host::sealed_regions(fd.as_raw_fd()).unwrap();
     assert_eq!(carried, rs, "a sealed layout carries the regions it was built from");
-    let ws = Host.register("ck", &fx.ck, &carried, Some(fd.as_raw_fd()), None).unwrap();
+    let ws = Host.register("ck", &fx.ck, &carried, Some(fd.as_raw_fd())).unwrap();
     check(&ws);
     assert!(!ws.bind(0).unwrap().writable, "views of the machine's layout are read-only");
     let mut moved = rs.clone();
     let tail = moved[0].pop().unwrap();
     moved[1].push(tail);
-    assert!(Host.register("ck", &fx.ck, &moved, Some(fd.as_raw_fd()), None).is_err(), "another grouping is refused");
+    assert!(Host.register("ck", &fx.ck, &moved, Some(fd.as_raw_fd())).is_err(), "another grouping is refused");
 }
 
 /// The glue's regions: header-order runs cut where the owning block changes. blocks.2.b and norm
@@ -169,9 +135,9 @@ fn a_chunk_two_regions_share_is_read_per_region() {
         rs.last_mut().unwrap().push(format!("{c}/{k}"));
     }
     assert!(rs.contains(&vec!["unet/blocks.2.a".into(), "unet/blocks.2.b".into()]), "{rs:?}");
-    check(&Host.register("runs", &fx.ck, &rs, None, None).unwrap());
-    let fd = memory::seal(&fx.ck, &rs, "runs", 2, None).unwrap();
-    check(&Host.register("runs", &fx.ck, &rs, Some(fd.as_raw_fd()), None).unwrap());
+    check(&Host.register("runs", &fx.ck, &rs, None).unwrap());
+    let fd = memory::seal(&fx.ck, &rs, "runs", 2).unwrap();
+    check(&Host.register("runs", &fx.ck, &rs, Some(fd.as_raw_fd())).unwrap());
 }
 
 #[test]
@@ -236,7 +202,7 @@ fn a_seal_logs_its_disk_copy() {
     let fx = Fixture::new("logged");
     let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
     varena::ceiling::take();
-    memory::seal(&fx.ck, &rs, "logged", 2, None).unwrap();
+    memory::seal(&fx.ck, &rs, "logged", 2).unwrap();
     let mut expected = rs.iter().map(|names| names.iter().map(|name| {
         TENSORS.iter().find(|(c, k, _)| format!("{c}/{k}") == *name).unwrap().2 as u64
     }).sum::<u64>()).filter(|bytes| *bytes > 0).collect::<Vec<_>>();
@@ -257,7 +223,7 @@ fn give_takes_a_busy_sets_unbound_slot_never_a_bound_one() {
     let fx = Fixture::new("give");
     let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
     let gpu = Gpu::open(0, 2 << 20).unwrap();
-    let ws = gpu.register("give", &fx.ck, &rs, None, None).unwrap();
+    let ws = gpu.register("give", &fx.ck, &rs, None).unwrap();
     ws.home(&[]).unwrap();
     ws.busy(true);
     let slots = || gpu.stats().unwrap().slots;
@@ -279,36 +245,3 @@ fn give_takes_a_busy_sets_unbound_slot_never_a_bound_one() {
     assert_eq!(slots(), 1, "the next stream maps one again");
 }
 
-#[test]
-fn tensorfs_source_context_lives_until_the_last_bound_region_drops() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let fx = Fixture::new("source-context");
-    let calls = Arc::new(AtomicUsize::new(0));
-    let called = calls.clone();
-    let context = Arc::new(());
-    let weak = Arc::downgrade(&context);
-    let view = View::from(&fx.ck).with_fetch(move |objects| {
-        let _keep = &context;
-        assert!(!objects.is_empty());
-        called.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    });
-    let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
-    let set = Host.register("owned", view, &rs, None, None).unwrap();
-    assert_eq!(calls.load(Ordering::Relaxed), 0, "registration fetched payload bytes");
-    let pin = set.bind(0).unwrap();
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
-    drop(set);
-    assert!(weak.upgrade().is_some(), "bound region lost its source context");
-    drop(pin);
-    assert!(weak.upgrade().is_none(), "released placement retained its source context");
-}
-
-#[test]
-fn a_sealed_host_layout_binds_without_fetching_its_cold_stored_source() {
-    let fx = Fixture::new("sealed-cold-source");
-    let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
-    let fd = memory::seal(&fx.ck, &rs, "ready", 2, None).unwrap();
-    let view = View::from(&fx.ck).with_fetch(|_| panic!("sealed host bytes must not fetch their cold source"));
-    check(&Host.register("sealed", view, &rs, Some(fd.as_raw_fd()), None).unwrap());
-}

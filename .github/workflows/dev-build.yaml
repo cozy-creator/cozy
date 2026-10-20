@@ -28,7 +28,7 @@ on:
         type: string
         default: ''
       features:
-        description: "Cargo features of the cozy and tensord builds: migrate is a dev build (xs-045 U12), never a release"
+        description: "Cargo features of the cozy and tensord builds (cozy's migrate: the A11 dev build, never a release)"
         type: string
         default: ''
       runtime_ref:

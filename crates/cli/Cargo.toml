@@ -37,7 +37,7 @@ sha2.workspace = true
 sigstore-verify.workspace = true
 supports-hyperlinks.workspace = true
 tempfile.workspace = true
-tensorfs.workspace = true
+tensorfs = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["signal"] }
 tokio-util.workspace = true
 toml.workspace = true
@@ -51,8 +51,8 @@ tar.workspace = true
 
 
 [features]
-# Dev builds only (xs-045 U12): the hidden `cozy model migrate`. Never in a release.
-migrate = ["protocol/migrate", "hub-client/migrate", "tensorfs/store"]
+# Dev builds only (xs-053 A11): the hidden `cozy model migrate-headers`. Never in a release.
+migrate = ["dep:tensorfs", "tensorfs/store"]
 
 [lints]
 workspace = true

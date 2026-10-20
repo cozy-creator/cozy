@@ -1,5 +1,5 @@
 //! tensorfs-py: the `tensorfs` wheel's compiled half. It marshals; every byte-level fact comes
-//! from `tensorfs` and `tensorfs-plane`. Torch stays outside: tensors cross as DLPack.
+//! from `tensorfs` and `varena`. Torch stays outside: tensors cross as DLPack.
 
 mod cleanup;
 mod errors;
@@ -34,9 +34,8 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
     errors::install(m)?;
     m.add("__version__", python_distribution_version())?;
-    // The store format and plane claim protocol the `cozy` binary must share (format_contract.py).
+    // The store format every process on the machine shares.
     m.add("STORE_FORMAT", tensorfs::STORE_FORMAT)?;
-    m.add("CLAIM_PROTOCOL", tensorfs::CLAIM_PROTOCOL)?;
     #[cfg(feature = "store")]
     store::install(m)?;
     #[cfg(feature = "store")]
