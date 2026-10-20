@@ -1,14 +1,49 @@
 # TensorFS
 
-Start with the [Python API and examples](API.md) for calls and returned objects.
-The [Rust API](../tensorfs/API.md) is documented separately.
+TensorFS (Tensor Filesystem) is a library written in Rust, with python bindings, for downloading, storing, and loading tensors into memory efficiently. It uses an alternative storage-format we call `cozytensors`, designed to address safetensors' shortcomings.
 
-This guide describes the TensorFS 0.13.0 target API under integration. The current master
-implementation and published wheels may still expose the preceding interface.
+### Problem 1: Safetensors is not self-describing
 
-Safetensors provides a fast, memory-mappable tensor file. Its [standard header](https://github.com/safetensors/safetensors#format)
-records names, dtypes, shapes and byte offsets. Distributing and serving quantized models still
-leaves applications to supply several things:
+Safetensors describes arrays: their names, dtypes, shapes and byte offsets. It does not
+standardize how those arrays form a quantized tensor. An INT8 weight and a scale array do not
+tell a reader which axis to scale, how values were packed, or whether a rotation must be
+undone. Its optional metadata can carry conventions, but the reader must already understand
+them. See the [safetensors format](https://github.com/safetensors/safetensors#format).
+
+Each ecosystem therefore supplies its own rules. For example, ComfyUI's
+[MXFP8 format](https://github.com/Comfy-Org/comfy-quants/blob/main/docs/formats/mxfp8.md)
+uses `weight_scale` arrays in a particular block layout and a `comfy_quant` JSON marker stored
+as a byte tensor. Transformers' [bitsandbytes integration](https://huggingface.co/docs/transformers/main/en/quantization/bitsandbytes)
+publishes quantization configuration alongside the weights. These work with the corresponding
+loaders; a generic safetensors reader cannot recover their meaning from the array declarations.
+
+cozytensors makes that meaning part of the format: each logical tensor declares its encoding,
+parameters and stored arrays, with specified decoding rules. TensorFS can preserve the encoded
+representation for a compatible compute kernel or decode a supported encoding into ordinary
+tensors. Components, configuration and supporting assets are described in the same checkpoint,
+so consumers do not have to reverse-engineer filenames and producer-specific tensor names.
+
+### Problem 2: Safetensors has no built-in de-duplication
+
+A safetensors file contains its own payload. Two checkpoints containing the same text encoder
+or VAE still store those bytes in each file unless another storage layer deduplicates them.
+The format itself has no reference that lets both files share one stored copy.
+
+Hugging Face addresses this with [Xet](https://huggingface.co/docs/xet/en/download-protocol),
+a general file-storage layer: it groups content-addressed chunks into containers called
+*xorbs*, then reconstructs files from ranges within them. Xet also supports
+[local chunk caching](https://huggingface.co/docs/huggingface_hub/guides/manage-cache), so it
+does work on consumer machines. The distinction is that its normal download path reconstructs
+an ordinary file for the model loader; deduplication sits underneath that file interface.
+
+TensorFS uses the shared chunk store as the model's native storage. A `.cozytensors` header
+references immutable chunks; checkpoints sharing a chunk keep one copy on disk, and readers
+load directly from that store without reconstructing a separate full model file. A fine-tune
+can reuse its base checkpoint's unchanged chunks and add only new ones. This saves local disk
+space as well as transfer bytes on an ordinary workstation, without requiring a deduplicating
+filesystem or a hosted storage service.
+
+
 
 | What safetensors leaves to the application | How TensorFS addresses it |
 |---|---|
