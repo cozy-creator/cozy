@@ -121,9 +121,15 @@ pub fn held(store: &Store, id: &str) -> io::Result<ObjectRef> {
     Ok(ObjectRef { sha256, length })
 }
 
-/// The checkpoint `id` names, held here (its structure; chunks may be absent).
+/// The checkpoint `id` names, held here (its structure; chunks may be absent): a header, or a
+/// tree's only variant (a run's checkpoint output names its tree).
 pub fn checkpoint(store: &Store, id: &str) -> io::Result<tensorfs::store::Checkpoint> {
-    store.checkpoint(&held(store, id)?).map_err(io_error)
+    let object = held(store, id)?;
+    match store.tree(&object) {
+        Ok(_) => store.variant(&object, None),
+        Err(_) => store.checkpoint(&object),
+    }
+    .map_err(io_error)
 }
 
 /// Whether the store holds `object` (no touch: a look, not a use).

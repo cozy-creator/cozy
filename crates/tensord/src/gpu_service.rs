@@ -1889,19 +1889,18 @@ impl Pool {
     pub fn plan(&self, preparation: &Preparation) -> io::Result<Plan> {
         Plan::of(preparation)
     }
-    /// A slot's checkpoint this machine's store holds, by its exact manifest.
+    /// A slot's checkpoint this machine's store holds, by its header or its tree.
     fn held_grant(&self, package: &str, path: &str, reference: &crate::api::domain::Ref) -> io::Result<ModelGrant> {
         let sha = tensorfs::sha256::hex(&reference.digest);
         let absent = |why: String| io::Error::new(io::ErrorKind::NotFound, format!("checkpoint_absent: {path} names sha256:{sha}: {why}"));
-        let object = tensorfs::format::ObjectRef { sha256: sha.clone(), length: reference.length };
-        let checkpoint = self.store.checkpoint(&object).map_err(|e| absent(e.to_string()))?;
+        let checkpoint = crate::storage::checkpoint(&self.store, &sha).map_err(|e| absent(e.to_string()))?;
         Ok(ModelGrant {
             package: package.into(),
             slot: path.into(),
             repository: String::new(),
             release: String::new(),
             lane: String::new(),
-            manifest: format!("sha256:{sha}"),
+            manifest: checkpoint.id().id(),
             components: checkpoint.header().components().iter().map(|c| c.name.clone()).collect(),
         })
     }
