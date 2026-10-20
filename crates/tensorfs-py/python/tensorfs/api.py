@@ -36,15 +36,15 @@ def open(name_or_path, *, revision=None, variant=None, endpoint=None, local_file
     )
 
 
-def snapshot_download(repo_id: str, *, revision=None, variant=None, components=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
-    return str(_client(cache_dir, endpoint, token, ca_der).snapshot_download(
+def materialize(repo_id: str, *, revision=None, variant=None, components=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
+    return str(_client(cache_dir, endpoint, token, ca_der).materialize(
         repo_id, revision=revision, variant=variant, components=components,
         local_dir=local_dir, local_files_only=local_files_only,
     ))
 
 
-def hub_download(repo_id: str, filename: str, *, revision=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
-    return str(_client(cache_dir, endpoint, token, ca_der).hub_download(
+def download_file(repo_id: str, filename: str, *, revision=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
+    return str(_client(cache_dir, endpoint, token, ca_der).download_file(
         repo_id, filename, revision=revision, local_dir=local_dir, local_files_only=local_files_only,
     ))
 

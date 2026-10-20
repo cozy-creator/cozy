@@ -11,6 +11,10 @@ import tensorfs
 from tensorfs import _ext, raw, varena
 
 assert not hasattr(tensorfs, "Store"), "the cache implementation leaked into the public API"
+for name in ("materialize", "download_file"):
+    assert name in tensorfs.__all__ and callable(getattr(tensorfs, name)), name
+for obsolete in ("snapshot_download", "hub_download", "download"):
+    assert not hasattr(tensorfs, obsolete) and not hasattr(tensorfs.api, obsolete), obsolete
 for obsolete in ("Closure", "ReadPlan", "parse_header", "plan", "regions", "Info", "Part"):
     assert not hasattr(tensorfs, obsolete) and not hasattr(_ext, obsolete), obsolete
 assert importlib.util.find_spec("tensorfs.records") is None, "the legacy projection remains importable"
@@ -64,11 +68,11 @@ with TemporaryDirectory() as temp:
         derived.component("copy", cls=component.cls, config=component.config).copy("weight", component)
     again = derived.commit()
     assert np.array_equal(np.from_dlpack(again.components["copy"].tensors.read("weight")), values)
-    downloaded = tensorfs.snapshot_download("local/example", revision="draft", local_dir=root / "download")
+    downloaded = tensorfs.materialize("local/example", revision="draft", local_dir=root / "download")
     assert tensorfs.open(downloaded, variant="f32").id == ck.id
     assert (Path(downloaded) / "model.f16.cozytensors").is_file()
-    assert Path(tensorfs.hub_download("local/example", "README.md", revision="draft")).read_text() == "a repo file\n"
-    default_snapshot = tensorfs.snapshot_download("local/example", revision="draft")
+    assert Path(tensorfs.download_file("local/example", "README.md", revision="draft")).read_text() == "a repo file\n"
+    default_snapshot = tensorfs.materialize("local/example", revision="draft")
     assert Path(default_snapshot).name == tree.removeprefix("sha256:")
     origin = (root / "origin").as_uri()
     remote_tree = tensorfs.upload_folder(repo_id="acme/example", revision="1", folder_path=root / "folder", endpoint=origin)
@@ -82,7 +86,7 @@ with TemporaryDirectory() as temp:
     exported = Path(metadata.components["model"].export_files(root / "remote-support"))
     assert (exported / "tokenizer.json").read_bytes() == b"{}"
     assert metadata.missing(["model"]), "exporting support files fetched its tensors"
-    only = tensorfs.snapshot_download("acme/example", revision="1", variant="f32", components=["model"], endpoint=origin, cache_dir=remote_cache)
+    only = tensorfs.materialize("acme/example", revision="1", variant="f32", components=["model"], endpoint=origin, cache_dir=remote_cache)
     assert not (Path(only) / "model.f16.cozytensors").exists()
     selected = tensorfs.open(only, cache_dir=remote_cache)
     assert selected.missing(["model"]) == []

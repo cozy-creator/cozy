@@ -50,12 +50,12 @@ progress = []
 reader.fetch(progress=lambda stage, held, total: progress.append((stage, held, total)))
 assert progress and progress[-1][0] == "fetch" and progress[-1][1] == progress[-1][2]
 assert reader.components["model"].tensors.read("weight").tobytes() == data
-folder = tensorfs.snapshot_download(published.tree, local_files_only=True, cache_dir=cache)
+folder = tensorfs.materialize(published.tree, local_files_only=True, cache_dir=cache)
 (Path(folder) / "README.md").write_text("normal owner upload\n")
 tree = tensorfs.upload_folder(repo_id=request["model"], revision="1", folder_path=folder,
                               endpoint=request["endpoint"], token=owner.headers, ca_der=ca, cache_dir=cache)
 assert tree.startswith("sha256:")
-readme = tensorfs.hub_download(request["model"], "README.md", revision="1", endpoint=request["endpoint"],
+readme = tensorfs.download_file(request["model"], "README.md", revision="1", endpoint=request["endpoint"],
                                token=request["token"], ca_der=ca, cache_dir=cache / "reader")
 assert Path(readme).read_text() == "normal owner upload\n"
 

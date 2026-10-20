@@ -268,7 +268,7 @@ impl PyClient {
     }
 
     #[pyo3(signature = (repo_id, *, revision = None, variant = None, components = None, local_dir = None, local_files_only = false))]
-    fn snapshot_download(
+    fn materialize(
         &self,
         py: Python<'_>,
         repo_id: &str,
@@ -285,7 +285,7 @@ impl PyClient {
             ..Fetch::default()
         };
         py.detach(|| {
-            bridge(self.client.snapshot_download(
+            bridge(self.client.materialize(
                 &reference,
                 &want,
                 local_dir.as_deref(),
@@ -296,7 +296,7 @@ impl PyClient {
     }
 
     #[pyo3(signature = (repo_id, filename, *, revision = None, local_dir = None, local_files_only = false))]
-    fn hub_download(
+    fn download_file(
         &self,
         py: Python<'_>,
         repo_id: &str,
@@ -307,7 +307,7 @@ impl PyClient {
     ) -> PyResult<PathBuf> {
         let reference = reference(repo_id, revision, None).or_raise(py)?;
         py.detach(|| {
-            bridge(self.client.hub_download(
+            bridge(self.client.download_file(
                 &reference,
                 filename,
                 local_dir.as_deref(),

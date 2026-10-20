@@ -384,7 +384,7 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
         ..Fetch::default()
     };
     let snapshot = client
-        .snapshot_download(&reference, &selected, None, false)
+        .materialize(&reference, &selected, None, false)
         .await
         .unwrap();
     assert!(snapshot
@@ -408,14 +408,14 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
     fs::write(user_dir.join("mine"), b"owned by caller").unwrap();
     assert_eq!(
         client
-            .snapshot_download(&reference, &selected, Some(&user_dir), false)
+            .materialize(&reference, &selected, Some(&user_dir), false)
             .await
             .unwrap(),
         user_dir
     );
     assert_eq!(fs::read(user_dir.join("mine")).unwrap(), b"owned by caller");
     let readme = client
-        .hub_download(
+        .download_file(
             &reference,
             "README.md",
             Some(&scratch.0.join("readme")),

@@ -223,7 +223,7 @@ impl Client {
 
     /// Retains every fetched object while building the view. Explicit local_dir
     /// belongs to the caller, even when it happens to sit below snapshots/.
-    pub async fn snapshot_download(
+    pub async fn materialize(
         &self,
         reference: &Ref,
         want: &Fetch<'_>,
@@ -234,7 +234,7 @@ impl Client {
         source.snapshot(reference, want, local_dir).await
     }
 
-    pub async fn hub_download(
+    pub async fn download_file(
         &self,
         reference: &Ref,
         filename: &str,
