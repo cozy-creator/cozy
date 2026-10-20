@@ -2,9 +2,16 @@
 //! kept per Hub: in a dev or CI Hub it is not the origin this computer dials) and, for a run that
 //! publishes into its weights destination or reads one of its owner's checkpoints by digest,
 //! this computer's user Bearer as its TensorFS token. The Bearer is added at the send, never to
-//! the stored submission. Signed out, a public run reads at its Hub's origin.
+//! the stored submission; each one the session mints after goes to every machine sent one, at the
+//! session's own refresh point (`PUT /v1/bearer`). Signed out, a public run reads at its Hub's
+//! origin.
+use std::{
+    sync::Weak,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use hub_client::Credential;
+use hub_client::{Bearer, Credential};
 use protocol::{
     calcifer::Reason,
     config::Origin,
@@ -67,10 +74,14 @@ impl Machines {
             });
         };
         let facts = self.hubs.facts(&origin).await?;
-        let tensorfs = match needs_bearer(spec, &facts.account) {
-            true => Some(self.hubs.ordinary_tensorfs(&origin, &facts).await?),
+        let bearer = match needs_bearer(spec, &facts.account) {
+            true => Some(self.hubs.bearer(&origin).await?),
             false => None,
         };
+        if let (Some(machine), Some(bearer)) = (&run.machine, &bearer) {
+            self.holds(machine, &origin, bearer);
+        }
+        let tensorfs = bearer.map(|bearer| tensorfs(&facts, &bearer));
         Ok(Access {
             hub: Some(v1::HubAccess {
                 origin: facts.reads,
@@ -102,27 +113,117 @@ impl Machines {
     }
 }
 
+impl Machines {
+    /// `machine` was sent `bearer`, this computer's at `origin`: it is given each one minted after.
+    fn holds(&self, machine: &str, origin: &Origin, bearer: &Bearer) {
+        let mut holders = lock(&self.bearers);
+        let armed = holders.contains_key(origin);
+        holders
+            .entry(origin.clone())
+            .or_default()
+            .insert(machine.to_owned());
+        drop(holders);
+        if !armed {
+            let granting = self.calcifer.granting.get().cloned().unwrap_or_default();
+            self.spawn(refresh(granting, origin.clone(), bearer.clone()));
+        }
+    }
+
+    /// Mints this computer's bearer at `origin` and gives it to each machine sent one that is
+    /// still driven. None, and no machine is given any more, once none is left or none can be
+    /// minted.
+    async fn push(&self, origin: &Origin) -> Option<Bearer> {
+        let minted = match self.hubs.facts(origin).await {
+            Ok(facts) => self
+                .hubs
+                .bearer(origin)
+                .await
+                .ok()
+                .map(|bearer| (tensorfs(&facts, &bearer), bearer)),
+            Err(_) => None,
+        };
+        if let Some((options, _)) = &minted {
+            let holders: Vec<String> = lock(&self.bearers)
+                .get(origin)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect();
+            for name in holders {
+                match self.linked(&name) {
+                    Ok((_, link)) => {
+                        if let Err(error) = link.bearer(options).await {
+                            tracing::warn!(machine = %name, %error, "giving the machine its Hub bearer");
+                        }
+                    }
+                    Err(_) => {
+                        lock(&self.bearers)
+                            .entry(origin.clone())
+                            .or_default()
+                            .remove(&name);
+                    }
+                }
+            }
+        }
+        let mut held = lock(&self.bearers);
+        if minted.is_none() || held.get(origin).is_none_or(|machines| machines.is_empty()) {
+            held.remove(origin);
+            return None;
+        }
+        minted.map(|(_, bearer)| bearer)
+    }
+}
+
+/// From the session's own refresh point of `held`, the bearer the machines were sent, each one
+/// it mints at `origin` goes to them (`push`), until that stops.
+async fn refresh(machines: Weak<Machines>, origin: Origin, held: Bearer) {
+    let mut held = Some(held);
+    while let Some(bearer) = held.take() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if bearer.refresh_at() <= now {
+            tracing::warn!(%origin, "the Hub's bearers expire within the session's refresh margin");
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(bearer.refresh_at() - now)).await;
+        let Some(machines) = machines.upgrade() else {
+            return;
+        };
+        held = machines.push(&origin).await;
+        if held.is_none() {
+            return;
+        }
+    }
+    if let Some(machines) = machines.upgrade() {
+        lock(&machines.bearers).remove(&origin);
+    }
+}
+
+/// What a machine reads `facts`' Hub with under `bearer`.
+fn tensorfs(facts: &Facts, bearer: &Bearer) -> v1::TensorFSOptions {
+    v1::TensorFSOptions {
+        endpoint: facts.reads.clone(),
+        token: bearer.token.clone(),
+        expires_unix_ms: i64::try_from(bearer.expires)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000),
+        ca_der: facts.ca_der.clone(),
+    }
+}
+
 impl Hubs {
-    /// Uses the normal cached user session. The key stays on this computer; only its ordinary
-    /// Bearer and the Hub's existing machine-reachable endpoint/CA travel with this send.
-    async fn ordinary_tensorfs(
-        &self,
-        origin: &Origin,
-        facts: &Facts,
-    ) -> Result<v1::TensorFSOptions, Denied> {
+    /// This computer's live Bearer at `origin`, from the normal cached user session: held, kept,
+    /// or minted again past its refresh point. The key stays on this computer.
+    async fn bearer(&self, origin: &Origin) -> Result<Bearer, Denied> {
         let client = self.client(origin).map_err(|_| needs_sign_in(origin))?;
         let Credential::User(session) = client.credential() else {
             return Err(needs_sign_in(origin));
         };
-        let token = session
+        session
             .bearer(&client.anonymous())
             .await
-            .map_err(|error| hub_denied(origin, error))?;
-        Ok(v1::TensorFSOptions {
-            endpoint: facts.reads.clone(),
-            token,
-            ca_der: facts.ca_der.clone(),
-        })
+            .map_err(|error| hub_denied(origin, error))
     }
 
     /// This computer's account at `origin` and where machines read it: read once, then kept for
@@ -638,8 +739,8 @@ mod tests {
             )
             .unwrap();
         keep("ordinary-cache-first");
-        let first = match hubs.ordinary_tensorfs(&origin, &facts).await {
-            Ok(value) => value,
+        let first = match hubs.bearer(&origin).await {
+            Ok(bearer) => tensorfs(&facts, &bearer),
             Err(_) => panic!("the normal cached user sign-in was not used"),
         };
         assert_eq!(first.endpoint, facts.reads);
@@ -675,8 +776,8 @@ mod tests {
         let replay = calcifer.store().run(id.as_str()).unwrap().unwrap();
         assert!(replay.spec.tensorfs.is_none());
         keep("ordinary-cache-replacement");
-        let next = match hubs.ordinary_tensorfs(&origin, &facts).await {
-            Ok(value) => value,
+        let next = match hubs.bearer(&origin).await {
+            Ok(bearer) => tensorfs(&facts, &bearer),
             Err(_) => panic!("the replacement normal cached sign-in was not used"),
         };
         let mut resent = replay.spec.clone();

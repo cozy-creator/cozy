@@ -3112,10 +3112,13 @@ impl Pool {
             // NVML charges each GPU's own process: rank r drives the group's GPU r.
             self.followed(&session.plan, session.start, &session.executor.birth, &session.followers);
             let (load_cap, load_group) = rank_grant(&load_caps[..load_caps.len().min(ranks as usize)]);
+            // The request's signer, whose bearer the Runtime keeps apart.
+            let actor = engine.get(id).ok().and_then(|record| record.submission).map(|s| s.actor).unwrap_or_default();
             let load = match plan.slots.first() {
                 // A call that constructs nothing: its weightless construction.
                 None => DeviceCommand::Load {
-                    tensorfs: calls.and_then(|calls| calls.tensorfs(id)),
+                    tensorfs: calls.and_then(|calls| calls.tensorfs(id, session.executor.line())),
+                    actor: actor.clone(),
                     construction: construction.clone(),
                     devices: lane.clone(),
                     sequence_parallel_degree: ranks,
@@ -3152,7 +3155,8 @@ impl Pool {
                         _ => plan.slots.iter().map(load).collect(),
                     };
                     DeviceCommand::Load {
-                        tensorfs: calls.and_then(|calls| calls.tensorfs(id)),
+                        tensorfs: calls.and_then(|calls| calls.tensorfs(id, session.executor.line())),
+                        actor,
                         construction: construction.clone(),
                         devices: lane.clone(),
                         sequence_parallel_degree: ranks,
@@ -3318,7 +3322,7 @@ impl Pool {
         session.invoked = true;
         let reply = session.executor.command_with(
             &DeviceCommand::Invoke {
-                tensorfs: calls.and_then(|calls| calls.tensorfs(id)).map(Box::new),
+                tensorfs: calls.and_then(|calls| calls.tensorfs(id, session.executor.line())).map(Box::new),
                 weights,
                 destination: calls.map(|calls| calls.destination(id)).unwrap_or_default(),
                 actor: record.submission.as_ref().map(|submission| submission.actor.clone()).unwrap_or_default(),
