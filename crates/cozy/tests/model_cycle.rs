@@ -15,11 +15,27 @@ use std::path::{Path, PathBuf};
 
 use common::{Home, Out};
 use serde_json::Value;
+use std::sync::Arc;
+
 use tensorfs::{
-    fetch::{Client, SourcePolicy, TensorhubOrigin},
+    fetch::{Client, Config, Fetcher, Origin, SourcePolicy, TensorhubOrigin, Want},
     format::ObjectRef,
-    store2::Store,
+    store::Store,
 };
+
+/// `model`'s tree at `release` from the Hub through TensorFS's fetcher: the library's own pull.
+fn pull(store: &Store, client: &Client, hub: TensorhubOrigin, model: &str, release: &str) -> tensorfs::Result<ObjectRef> {
+    let hub = Arc::new(hub);
+    tensorfs::fetch::runtime()?.block_on(async {
+        let resolved = hub.named(model, Some(release), None).await?;
+        let origin: Arc<dyn Origin> = hub.clone();
+        let fetcher = Fetcher::new(Arc::new(store.clone()), client.clone(), None, Config::default());
+        let variant = Some(resolved.variant.as_str()).filter(|v| !v.is_empty());
+        fetcher.pull_tree(&origin, &resolved.tree, variant, &Want::default()).await?;
+        fetcher.settled().await;
+        Ok(resolved.tree)
+    })
+}
 
 /// `cozy args` in `dir`. Each step is named, timestamped and flushed before it starts, and its
 /// output streams into the log as it comes, so the job's own timeout shows the step it stopped in.
@@ -149,22 +165,21 @@ fn a_model_uploaded_by_one_machine_is_pulled_bit_identical_by_another() {
     let second = machine(&home, "m2");
     let checkpoint = format!("{model}#{source}");
     let run = completed(&home, &cozy(&home, None, &["--json", "model", "download", &checkpoint, "--on", "m2"]));
-    assert_eq!(run["result"]["models"][0]["manifest"], source.as_str(), "{run}");
+    assert_eq!(run["result"]["models"][0]["tree"], source.as_str(), "{run}");
     let (made, pulled) = (closure(&first.store(), &source), closure(&second.store(), &source));
-    assert!(made.len() >= 3, "a manifest, a header and its chunks: {}", made.len());
+    assert!(made.len() >= 3, "a tree, a header and its chunks: {}", made.len());
     assert!(made == pulled, "the pulled checkpoint differs from the uploaded one");
 
     let ca = std::fs::read(std::env::var("TENSORHUB_CA").expect("the Hub's CA")).unwrap();
     let url = std::env::var("TENSORHUB_ORIGIN").unwrap();
     let policy = SourcePolicy { any_host: true, allow_local: true, max_redirects: 5, ..SourcePolicy::default() };
     let client = Client::with_roots(policy, &ca).unwrap();
-    let (third, reference) = (tempfile::tempdir().unwrap(), format!("{model}@{source}"));
+    let third = tempfile::tempdir().unwrap();
     let store = Store::open(third.path()).unwrap();
-    let anonymous = store.pull_hub(client.clone(), TensorhubOrigin::new(&client, &url).unwrap(), &reference, None);
+    let anonymous = pull(&store, &client, TensorhubOrigin::new(&client, &url).unwrap(), &model, &source);
     assert!(anonymous.is_err(), "an owner's checkpoint read anonymously: {anonymous:?}");
     let hub = TensorhubOrigin::new(&client, &url).unwrap().bearer(home.token());
-    let library = store.pull_hub(client, hub, &reference, None).unwrap();
-    assert_eq!((library.named.manifest.id(), library.named.release), (source.clone(), None));
+    assert_eq!(pull(&store, &client, hub, &model, &source).unwrap().id(), source);
     assert!(closure(third.path(), &source) == made, "the library's pull differs from the uploaded checkpoint");
 }
 
@@ -186,7 +201,7 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     let _other = machine(&home, "m2");
     let checkpoint = format!("{model}#{source}");
     let run = completed(&home, &cozy(&home, None, &["--json", "model", "download", &checkpoint, "--on", "m2"]));
-    assert_eq!(run["result"]["models"][0]["manifest"], source.as_str(), "{run}");
+    assert_eq!(run["result"]["models"][0]["tree"], source.as_str(), "{run}");
 
     // A release names it; info shows the lane and its checkpoint.
     let lane = format!("f32={source}");

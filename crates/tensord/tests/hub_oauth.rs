@@ -6,10 +6,7 @@
 #[path = "common/hub_oauth.rs"]
 mod hub_oauth;
 
-use tensord::{
-    hub::{reason, Capability, Catalog, Leaf, Op, Source},
-    origin::Publication,
-};
+use tensord::hub::{reason, Capability, Catalog, Leaf, Op, Source};
 use serde_json::json;
 use std::{sync::Arc, thread::sleep, time::Duration};
 
@@ -21,27 +18,18 @@ fn leaf() -> Arc<Leaf> {
     Arc::new(Leaf::from_pem(&pem).unwrap())
 }
 
-fn publish(
-    catalog: &Catalog,
-    store: &tensorfs::store2::Store,
-    manifest: &tensorfs::format::ObjectRef,
-    operation: &str,
-) -> tensorfs::err::Result<()> {
-    catalog
-        .publish(&Publication {
-            store,
-            destination: "acme/tiny",
-            manifest,
-            operation,
-            progress: &|_, _| (),
-            streams: 2,
-            stop: None,
-            commit: &|| true,
-        })
-        .map(drop)
+/// The owner's checkpoint the capability names, read by hash.
+const TINY: &str = "sha256:7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d";
+
+fn tiny() -> Op<'static> {
+    Op::Read { model: "acme/tiny", manifest: TINY }
 }
 
-const TINY: Op = Op::Publish { model: "acme/tiny" };
+/// A private read of the owner's checkpoint: it reaches the Hub only verified, which answers
+/// that it holds no such checkpoint.
+fn read_tiny(catalog: &Catalog) -> Result<serde_json::Value, String> {
+    get(catalog, &format!("/v1/models/acme/tiny/checkpoints/{TINY}"))
+}
 
 /// One GET at `url` with `headers`, on a runtime of its own: the status and body.
 fn fetch(url: &str, headers: Vec<(String, String)>) -> (u16, Vec<u8>) {
@@ -88,27 +76,18 @@ fn a_run_capability_trades_once_for_exactly_what_it_names() {
     assert_eq!(authkit.exchanges(), 0);
     assert!(authkit.verified().is_empty());
 
-    // A run that publishes: the capability names acme/tiny's checkpoints and one read the
-    // Hub narrows away. Nothing is traded until the first private operation.
+    // A run that reads the owner's checkpoint: the capability names it and one read the Hub
+    // narrows away. Nothing is traded until the first private operation.
     let narrowed = format!("sha256:{}", "ab".repeat(32));
     let ops = json!([
-        {"type": "tensorhub_model_publish", "model": "acme/tiny"},
+        {"type": "tensorhub_model_read", "model": "acme/tiny", "manifest": TINY},
         {"type": "tensorhub_model_read", "model": "acme/narrowed", "manifest": narrowed},
     ]);
     let signed = authkit.capability(&jkt, &ops, 600);
     let source = Source::new(&authkit.hub, None, hosts.clone(), Some(Capability::new(&signed, &authkit.token_endpoint, leaf.clone()).unwrap())).unwrap();
-    let store_root = std::env::temp_dir().join(format!("cm-oauth-store-{}", uuid::Uuid::new_v4()));
-    let store = tensorfs::store2::Store::open(&store_root).unwrap();
-    let manifest = hub_oauth::checkpoint(&store, &[7; 8192]);
     assert_eq!(authkit.exchanges(), 0);
-    let tiny = Catalog::for_op(&source, TINY).unwrap();
-    publish(&tiny, &store, &manifest, "op-1").unwrap();
-    publish(&Catalog::for_op(&source, TINY).unwrap(), &store, &manifest, "op-2").unwrap();
-    {
-        let hub = hub.lock().unwrap();
-        assert_eq!(hub.finalized, [manifest.id(), manifest.id()]);
-        assert_eq!(hub.credentialed_uploads, 0, "object hosts see no credential");
-    }
+    assert!(read_tiny(&Catalog::for_op(&source, tiny()).unwrap()).unwrap_err().contains("404"));
+    assert!(read_tiny(&Catalog::for_op(&source, tiny()).unwrap()).unwrap_err().contains("404"));
     assert_eq!(authkit.exchanges(), 1, "one trade per run");
     let verified = authkit.verified();
     assert!(verified.iter().all(|s| s["owner"] == authkit.owner().as_str() && s["actor"] == jkt.as_str()), "{verified:?}");
@@ -126,23 +105,17 @@ fn a_run_capability_trades_once_for_exactly_what_it_names() {
 
     // The token is bound to the leaf: presented with another key's proof, it reads nothing.
     let (key, token) = (hub_client::P256Key::generate(), authkit.last_token());
-    let path = format!("/v1/models/acme/tiny/checkpoints/{}", manifest.id());
+    let path = format!("/v1/models/acme/tiny/checkpoints/{TINY}");
     let proof = key.proof("GET", &format!("{}{path}", authkit.resource), Some(&token), None);
-    let finalized = hub.lock().unwrap().finalized.len();
     let headers = vec![("authorization".into(), format!("DPoP {token}")), ("dpop".into(), proof)];
-    let stolen = match fetch(&format!("{}{path}", authkit.hub), headers) {
-        (200, _) => Ok(()),
-        (status, _) => Err(status),
-    };
-    assert!(stolen.is_err(), "a stolen token without the key is refused");
-    assert_eq!(hub.lock().unwrap().finalized.len(), finalized);
+    let (status, _) = fetch(&format!("{}{path}", authkit.hub), headers);
+    assert!(status == 401 || status == 403, "a stolen token without the key is refused: {status}");
 
-    // Revoking the device key ends the run's private work at its next request, typed, with
-    // no second trade.
+    // Revoking the device key ends the run's private work at its next request, with no
+    // second trade.
     authkit.revoke_device_key();
-    let tiny = Catalog::for_op(&source, TINY).unwrap();
-    assert!(publish(&tiny, &store, &manifest, "op-3").is_err());
-    assert_eq!(tiny.reason("weights_publication_failed", "").0, reason::REFUSED);
+    let refused = read_tiny(&Catalog::for_op(&source, tiny()).unwrap()).unwrap_err();
+    assert!(!refused.contains("404"), "{refused}");
     assert_eq!(authkit.exchanges(), 1);
 
     // A capability that expires ends typed too, before the Hub hears of it.
@@ -150,8 +123,6 @@ fn a_run_capability_trades_once_for_exactly_what_it_names() {
     let brief = authkit.capability(&jkt, &ops, 2);
     let source = Source::new(&authkit.hub, None, hosts, Some(Capability::new(&brief, &authkit.token_endpoint, leaf).unwrap())).unwrap();
     sleep(Duration::from_secs(3));
-    assert_eq!(Catalog::for_op(&source, TINY).err().unwrap().0, reason::EXPIRED);
+    assert_eq!(Catalog::for_op(&source, tiny()).err().unwrap().0, reason::EXPIRED);
     assert_eq!(authkit.exchanges(), 1);
-    assert_eq!(hub.lock().unwrap().finalized.len(), finalized);
-    let _ = std::fs::remove_dir_all(store_root);
 }

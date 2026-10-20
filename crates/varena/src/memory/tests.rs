@@ -63,8 +63,6 @@ fn gpu_with_host(with_host: bool) -> (Arc<Gpu>, Weak<Weights>, i32) {
     let inner = Arc::new(Inner {
         ordinal: 0,
         ctx: std::ptr::null_mut(),
-        pci: String::new(),
-        ceiling: 0.0,
         prop: AllocationProp::device(0, 0),
         shared: None,
         chunk: 64 << 20,
@@ -73,9 +71,7 @@ fn gpu_with_host(with_host: bool) -> (Arc<Gpu>, Weak<Weights>, i32) {
             free: Mutex::default(),
         }),
         copy: std::ptr::null_mut(),
-        readers: Readers::new(1),
         tally: IoTally::default(),
-        staging: Staging::new(vec![]),
         jobs: Default::default(),
         st: Mutex::new(State {
             sets: vec![Some(set)],
@@ -129,20 +125,12 @@ impl Drop for Fixture {
         self.gpu
             .inner
             .poison(error("CPU ownership fixture finished"));
-        self.gpu.inner.readers.stop();
     }
 }
 
 fn fd_is_open(fd: i32) -> bool {
     // SAFETY: F_GETFD only queries this process's descriptor table.
     (unsafe { libc::fcntl(fd, libc::F_GETFD) }) >= 0
-}
-
-fn buffer() -> Buf {
-    Buf {
-        ptr: std::ptr::null_mut(),
-        last: None,
-    }
 }
 
 #[test]
@@ -317,68 +305,6 @@ fn failed_completion_query_retains_pending_source_and_event() {
     assert_eq!(st.set(0).pending.len(), 1);
     assert!(weak.upgrade().is_some());
     assert!(fd_is_open(f.fd));
-}
-
-#[test]
-fn unproven_staging_buffer_never_reenters_pool_and_readers_finish_with_error() {
-    let f = Fixture::new();
-    let (tx, rx) = mpsc::channel();
-    let waiter = f.gpu.clone();
-    let thread = std::thread::spawn(move || tx.send(waiter.inner.staging.take().is_err()).unwrap());
-    let previous = Arc::new(Ev {
-        raw: std::ptr::null_mut(),
-        timing: false,
-        pool: f.gpu.inner.events.clone(),
-    });
-    let retained = Arc::downgrade(&previous);
-    let res = f.gpu.inner.finish_piece(
-        buffer(),
-        Some(previous),
-        Err(error("prior event synchronize failed")),
-        Some(Err(error("drain failed"))),
-    );
-    assert!(res.is_err());
-    assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap());
-    thread.join().unwrap();
-    let b = f.gpu.inner.staging.buffers.lock().unwrap();
-    assert!(b.free.is_empty());
-    assert_eq!(b.held.len(), 1);
-    assert!(b.error.is_some());
-    assert!(b.held[0].last.is_some());
-    assert!(retained.upgrade().is_some());
-}
-
-#[test]
-fn unproven_post_enqueue_buffer_without_an_event_stays_unavailable() {
-    let f = Fixture::new();
-    assert!(f
-        .gpu
-        .inner
-        .finish_piece(
-            buffer(),
-            None,
-            Err(error("post-enqueue record failed")),
-            Some(Err(error("drain failed")))
-        )
-        .is_err());
-    let b = f.gpu.inner.staging.buffers.lock().unwrap();
-    assert!(b.free.is_empty());
-    assert_eq!(b.held.len(), 1);
-    assert!(b.held[0].last.is_none());
-}
-
-#[test]
-fn staging_error_with_confirmed_drain_or_no_submission_returns_its_buffer() {
-    for drained in [Some(Ok(())), None] {
-        let f = Fixture::new();
-        assert!(f
-            .gpu
-            .inner
-            .finish_piece(buffer(), None, Err(error("copy or read failed")), drained)
-            .is_err());
-        assert!(f.gpu.inner.check().is_ok());
-        assert!(f.gpu.inner.staging.take().is_ok());
-    }
 }
 
 #[test]
@@ -1012,16 +938,6 @@ fn a_panic_holding_the_books_is_a_typed_error_and_the_next_op_works() {
     f.gpu.step();
     let st = g.lock();
     assert!(!st.sets[0].as_ref().unwrap().warm && st.steps == 1);
-}
-
-#[test]
-fn a_panicking_read_leaves_the_reader_serving() {
-    let readers = Readers::new(1);
-    let (tx, rx) = mpsc::channel();
-    readers.submit(true, || panic!("read"));
-    readers.submit(true, move || tx.send(()).unwrap());
-    rx.recv().unwrap();
-    readers.shutdown();
 }
 
 #[test]

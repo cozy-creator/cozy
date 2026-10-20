@@ -7,8 +7,8 @@
 
 header     = [format: tstr, chunks: [* object], encodings: [* encoding], pipeline: pipeline,
               components: [* component], metadata: {* tstr => value}, * any]
-; format: "cozytensors/1" or "cozytensors/1.<minor>"; a reader takes any minor. A root of
-; exactly five elements is a pre-cut layout, refused as such.
+; format: a writer writes exactly "cozytensors/1"; a reader also takes "cozytensors/1.<minor>".
+; A root of exactly five elements is a pre-cut layout, refused as such.
 
 object     = [sha256: bstr .size 32, length: uint, * any]
 

@@ -308,20 +308,20 @@ pub fn test_hub() -> (String, Arc<Mutex<Hub>>) {
 }
 
 /// A one-tensor checkpoint in `store`: what a machine publishes.
-pub fn checkpoint(store: &tensorfs::store2::Store, weights: &[u8]) -> tensorfs::format::ObjectRef {
+pub fn checkpoint(store: &tensorfs::store::Store, weights: &[u8]) -> tensorfs::format::ObjectRef {
     tensors(store, &[weights])
 }
 
 /// A checkpoint in `store` with one F32 tensor per entry of `weights` (16 MiB or more: its own
 /// chunks).
-pub fn tensors(store: &tensorfs::store2::Store, weights: &[&[u8]]) -> tensorfs::format::ObjectRef {
+pub fn tensors(store: &tensorfs::store::Store, weights: &[&[u8]]) -> tensorfs::format::ObjectRef {
     use tensorfs::{format::Dtype, writer::{Data, Source}};
     let mut writer = store.writer(None, None).unwrap();
     for (at, weights) in weights.iter().enumerate() {
         assert!(!weights.is_empty() && weights.len().is_multiple_of(4));
         let name = if at == 0 { "weight".to_string() } else { format!("weight{at}") };
         let shape = [(weights.len() / 4) as u64];
-        writer.put("model", &name, &Dtype::F32, &shape, Data::Plain(Source::Read(&mut &weights[..]))).unwrap();
+        writer.get("model").put(&name, &Dtype::F32, &shape, Data::Plain(Source::Read(&mut &weights[..]))).unwrap();
     }
     writer.commit().unwrap()
 }

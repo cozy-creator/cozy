@@ -5,7 +5,8 @@
 
 use super::affine::{Codes, Fill, Order, Packing};
 use super::grid::{Grid, ScaleLayout};
-use super::int8::{hadamard, ROTATION_SIZE};
+use super::int8::ROTATION_SIZE;
+use super::plan::{Codes as PlanCodes, Core, Elems, Plan, Post, RequantCodes, RequantPacking};
 use super::{elem, Allowed, Ctx, Dtypes, Param, Part, Scheme, Shape, View};
 use crate::format::{Result, Value};
 
@@ -13,7 +14,7 @@ const I8: Dtypes = Dtypes::Of(&["I8"]);
 const F32: Dtypes = Dtypes::Of(&["F32"]);
 const S_REL: Dtypes = Dtypes::Of(&["F8_E4M3", "F32"]);
 
-pub const ASYM_W4A8_INT8: Scheme = Scheme {
+pub static ASYM_W4A8_INT8: Scheme = Scheme {
     name: "comfy.asym_w4a8_int8",
     view: View::Matrix,
     params: &[
@@ -37,7 +38,7 @@ pub const ASYM_W4A8_INT8: Scheme = Scheme {
     decode: |c| grouped(c, 4),
 };
 
-pub const W6A8_INT8: Scheme = Scheme {
+pub static W6A8_INT8: Scheme = Scheme {
     name: "comfy.w6a8_int8",
     view: View::Matrix,
     params: &[
@@ -55,7 +56,7 @@ pub const W6A8_INT8: Scheme = Scheme {
     decode: |c| grouped(c, 6),
 };
 
-pub const CONVROT_W4A4: Scheme = Scheme {
+pub static CONVROT_W4A4: Scheme = Scheme {
     name: "comfy.convrot_w4a4",
     view: View::Matrix,
     params: &[ROTATION_SIZE],
@@ -64,10 +65,27 @@ pub const CONVROT_W4A4: Scheme = Scheme {
         Part::req("weight_scale", F32, |c| Grid::Row.shape(c)),
     ],
     decode: |c| {
-        let q = nibbles(Codes::Signed).unpack(c.part("weight").bytes, c.rows, c.cols)?;
-        rotate(c, &q, &c.floats("weight_scale"), None)
+        let codes = PlanCodes::new(
+            c.source("weight"),
+            nibbles(Codes::Signed),
+            c.elements("weight_scale"),
+            Grid::Row,
+        );
+        Ok(rotation(
+            c,
+            Core::Rotated {
+                codes,
+                block: c.uint("rotation_size"),
+            },
+        ))
     },
 };
+
+pub(super) fn supports_sources(scheme: &Scheme) -> bool {
+    [&ASYM_W4A8_INT8, &W6A8_INT8, &CONVROT_W4A4]
+        .into_iter()
+        .any(|s| std::ptr::eq(s, scheme))
+}
 
 fn w4_group(v: &Value) -> bool {
     v.as_u64()
@@ -90,13 +108,15 @@ fn packed(c: &Ctx, bits: usize, group: bool) -> Result<Shape> {
         };
         return Err(c.fail(format!("{} columns are not whole blocks of {b}{g}", c.cols)));
     }
-    Ok(Shape::Exact(
-        [c.lead(), &[(c.cols * bits / 8) as u64]].concat(),
-    ))
+    let width = match bits {
+        4 => c.cols / 2,
+        _ => (c.cols / 4) * 3,
+    };
+    Ok(Shape::Exact([c.lead(), &[width as u64]].concat()))
 }
 
 /// `weight_s_rel`: row blocks of `group_size`, row-major.
-fn groups(c: &Ctx) -> Grid<'static> {
+fn groups(c: &Ctx) -> Grid {
     Grid::Blocks {
         size: c.uint("group_size"),
         layout: ScaleLayout::RowMajor,
@@ -105,7 +125,7 @@ fn groups(c: &Ctx) -> Grid<'static> {
 }
 
 /// `weight_correction`: row blocks of `group_size`, transposed (`[C/g, R]`).
-fn correction(c: &Ctx) -> Grid<'static> {
+fn correction(c: &Ctx) -> Grid {
     Grid::Blocks {
         size: c.uint("group_size"),
         layout: ScaleLayout::Transposed,
@@ -113,7 +133,7 @@ fn correction(c: &Ctx) -> Grid<'static> {
     }
 }
 
-/// One `U8` lane of 4-bit codes, the even column low.
+/// One byte's nibbles, even column low, independently signed for W4A4.
 fn nibbles(codes: Codes) -> Packing<'static> {
     Packing {
         bits: 4,
@@ -126,100 +146,39 @@ fn nibbles(codes: Codes) -> Packing<'static> {
     }
 }
 
-/// A row's unsigned codes: `C/2` bytes of low nibbles, then (6-bit) `C/4` bytes of high pairs.
-fn codes(row: &[u8], n: usize, bits: usize) -> Result<Vec<i32>> {
-    let low = nibbles(Codes::Unsigned(0)).lane(&row[..n / 2], n)?;
-    if bits == 4 {
-        return Ok(low);
-    }
-    let pairs = Packing {
-        bits: 2,
-        ..nibbles(Codes::Unsigned(0))
-    };
-    let high = pairs.lane(&row[n / 2..], n)?;
-    Ok(low.iter().zip(high).map(|(l, h)| l + 16 * h).collect())
-}
-
-/// `q8 = clamp(round(v × s_rel), ±127)` with `v` the code's level, then rotated back.
-fn grouped(c: &Ctx, bits: usize) -> Result<Vec<f32>> {
-    let grid = groups(c);
-    let s_rel = c.floats("weight_s_rel");
-    let table = c
-        .has("weight_codebook")
-        .then(|| c.floats("weight_codebook"));
-    let mut q8 = Vec::with_capacity(c.rows * c.cols);
-    let width = c.cols * bits / 8;
-    for i in 0..c.rows {
-        let row = &c.part("weight").bytes[i * width..(i + 1) * width];
-        for (j, q) in codes(row, c.cols, bits)?.into_iter().enumerate() {
-            let v = match &table {
-                Some(t) => t[q as usize],
-                None => (q - (1 << (bits - 1))) as f32,
-            };
-            let x = (v * s_rel[grid.at(c.rows, c.cols, i, j)]).round_ties_even();
-            if x.is_nan() {
-                return Err(c.fail(format!("element ({i}, {j}) scales to NaN")));
-            }
-            q8.push(x.clamp(-127.0, 127.0) as i32);
-        }
-    }
-    let corr = c
-        .has("weight_correction")
-        .then(|| c.floats("weight_correction"));
-    rotate(c, &q8, &c.floats("weight_s_channel"), corr.as_deref())
-}
-
-/// `((y × s[i]) + z) × 2^−k` per block of `B = 4^k` columns, `y = q · H_B` exact; `z` is the
-/// correction's term, absent without one.
-fn rotate(c: &Ctx, q: &[i32], s: &[f32], corr: Option<&[f32]>) -> Result<Vec<f32>> {
+fn rotation<'a>(c: &Ctx<'a>, core: Core<'a>) -> Plan<'a> {
     let b = c.uint("rotation_size");
-    let unit = elem::pow2(-(b.trailing_zeros() as i32 / 2));
-    let per_row = c.cols / b;
-    let terms = corr.map(|_| terms(c.uint("group_size"), b, per_row));
-    let mut out = Vec::with_capacity(q.len());
-    for (n, block) in q.chunks(b).enumerate() {
-        let i = n / per_row;
-        let mut y = block.to_vec();
-        hadamard(&mut y);
-        let z = match (corr, &terms) {
-            (Some(corr), Some(terms)) => Some(term(corr, &terms[n % per_row], i, c.rows, b)),
-            _ => None,
-        };
-        for (j, y) in y.iter().enumerate() {
-            let v = *y as f32 * s[i];
-            out.push(z.as_ref().map_or(v, |z| v + z[j]) * unit);
-        }
+    Plan {
+        core,
+        post: Post::One(Elems::f32(elem::pow2(-(b.trailing_zeros() as i32 / 2)))),
     }
-    Ok(out)
 }
 
-/// For each block of a row, the groups it meets in ascending order, each with
-/// `M_b[j] = Σ_{j' in the group} H_B[j', j]`.
-fn terms(g: usize, b: usize, blocks: usize) -> Vec<Vec<(usize, Vec<i32>)>> {
-    (0..blocks)
-        .map(|blk| {
-            let (lo, hi) = (blk * b, (blk + 1) * b);
-            (lo / g..hi.div_ceil(g))
-                .map(|grp| {
-                    let mut m: Vec<i32> = (lo..hi).map(|j| (j / g == grp) as i32).collect();
-                    hadamard(&mut m);
-                    (grp, m)
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// `z[j] = Σ_b c(i, b) × M_b[j]`, left to right; `c` stored `[C/g, R]`.
-fn term(corr: &[f32], groups: &[(usize, Vec<i32>)], i: usize, rows: usize, b: usize) -> Vec<f32> {
-    let mut z: Option<Vec<f32>> = None;
-    for (grp, m) in groups {
-        let c = corr[grp * rows + i];
-        let t = m.iter().map(|m| c * *m as f32);
-        z = Some(match z {
-            None => t.collect(),
-            Some(z) => z.iter().zip(t).map(|(a, t)| a + t).collect(),
-        });
-    }
-    z.unwrap_or_else(|| vec![0.0; b])
+/// Reconstruct rounded/saturated int8 values before the integer rotation. The plan owns
+/// only scale/table metadata; GPU lowering never expands the logical weight on the host.
+fn grouped<'a>(c: &Ctx<'a>, bits: usize) -> Result<Plan<'a>> {
+    let codes = RequantCodes {
+        bytes: c.source("weight"),
+        packing: if bits == 4 {
+            RequantPacking::Nibbles
+        } else {
+            RequantPacking::SplitSix
+        },
+        group: c.uint("group_size"),
+        relative: c.elements("weight_s_rel"),
+        table: c
+            .has("weight_codebook")
+            .then(|| c.elements("weight_codebook")),
+    };
+    Ok(rotation(
+        c,
+        Core::RequantizedRotation {
+            codes,
+            block: c.uint("rotation_size"),
+            scale: c.elements("weight_s_channel"),
+            correction: c
+                .has("weight_correction")
+                .then(|| c.elements("weight_correction")),
+        },
+    ))
 }

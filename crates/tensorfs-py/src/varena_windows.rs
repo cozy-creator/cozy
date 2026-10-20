@@ -100,6 +100,8 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(seal, &m)?)?;
     m.add_function(wrap_pyfunction!(copies, &m)?)?;
+    #[cfg(feature = "store")]
+    m.add_function(wrap_pyfunction!(crate::store::regions, &m)?)?;
     macro_rules! add_errors {
         ($($e:ident),*) => { $(m.add(stringify!($e), py.get_type::<$e>())?;)* };
     }

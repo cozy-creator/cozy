@@ -8,15 +8,13 @@ mod common;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use common::*;
-use tensorfs::read;
 use varena::host::{fill_sealed, reserve, HostMem};
 use varena::io::{IoTally, Source};
 use varena::layout::Layout;
 use varena::Error;
 
 fn sealed(fx: &Fixture, tally: &IoTally) -> OwnedFd {
-    let (lease, _) = read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
-    let source = Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    let source = fx.source();
     let layout = Layout::build(&fx.plan(), &regions()).unwrap();
     fill_sealed("unet", &layout, &source, 3, tally, None).unwrap()
 }
@@ -95,8 +93,7 @@ fn a_reservation_made_before_the_plan_takes_any_layout_and_frees_what_it_does_no
     for bytes in [layout.nbytes * 2, layout.nbytes / 3] {
         let reserved = reserve("unet", bytes, 3).unwrap();
         assert!(resident(reserved.as_raw_fd()) >= bytes.next_multiple_of(4096) * 9 / 10, "pages allocated up front");
-        let (lease, _) = read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
-        let source = Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+        let source = fx.source();
         let fd = fill_sealed("unet", &layout, &source, 3, &IoTally::default(), Some(reserved)).unwrap();
         // Sized to the layout: a larger reservation's excess is freed, a smaller one grew.
         let size = std::fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap().len();
@@ -123,8 +120,7 @@ fn an_adopter_takes_a_layout_before_its_bytes_and_uses_each_region_once_ready() 
     }
     let host = HostMem::adopt_sealed(fd.as_raw_fd(), &layout).unwrap();
     assert!(!host.ready(0), "nothing is Ready before the fill runs");
-    let (lease, _) = read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
-    let source = Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    let source = fx.source();
     let filling = layout.clone();
     let filler = std::thread::spawn(move || fill.run(&filling, &source, 2, &IoTally::default()));
     for r in 0..layout.regions.len() as u32 {
@@ -146,8 +142,8 @@ fn a_failed_fill_reaches_every_adopter_as_an_error() {
 }
 
 /// The object files a machine hands over: each object's verified store file, opened read-only.
-fn object_files(fx: &Fixture) -> Vec<(tensorfs::ids::ObjectRef, std::fs::File)> {
-    fx.objects.iter().map(|o| (o.clone(), std::fs::File::open(fx.store.blob_path(&o.sha256)).unwrap())).collect()
+fn object_files(fx: &Fixture) -> Vec<(tensorfs::format::ObjectRef, std::fs::File)> {
+    fx.objects.iter().map(|o| (o.clone(), std::fs::File::open(fx.path(o)).unwrap())).collect()
 }
 
 #[test]
@@ -156,8 +152,7 @@ fn a_layout_staged_in_part_holds_only_its_staged_regions_and_stages_more_on_requ
     let layout = Layout::build(&fx.plan(), &regions()).unwrap();
     // Only region 0 is staged (the blocks that stream); 1 and 2 are holes.
     let (fd, fill) = varena::host::open_sealed("unet", &layout, None, Some(&[0])).unwrap();
-    let (lease, _) = read::acquire(&fx.store, &fx.meta, "test", fx.objects.clone()).unwrap();
-    let source = Source::new(fx.store.clone(), fx.meta.clone(), lease, true, 0);
+    let source = fx.source();
     fill.fill(&layout, &source, 2, &IoTally::default()).unwrap();
     let adopter = varena::host::HostMem::adopt_sealed(fd.as_raw_fd(), &layout).unwrap();
     assert!(adopter.ready(0) && adopter.hole(1) && adopter.hole(2));

@@ -116,6 +116,572 @@ fn local_code_runs_on_a_real_machine_and_runs_again_as_edited() {
     assert_eq!(echoed["result"]["text"], "from a directory", "{echoed}");
 }
 
+/// Public CLI -> Calcifer -> TensorD -> Runtime Writer -> checkpoint_item -> Calcifer.
+/// The configured shared store holds the exact bytes; Calcifer persists references only.
+#[test]
+fn runtime_checkpoint_writes_replay_and_survive_calcifer_restart() {
+    let Some(home) = Home::new() else { return };
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else { return };
+    let store_path = home.path().join("shared-tensorfs");
+    let store_name = store_path.to_str().unwrap();
+    let _machine = common::tensord::added_with(&home, "m1", &[("COZY_TENSORFS_ROOT", store_name)]);
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensord/tests/fixtures/cpu_weights"),
+        &work.join("cpu_weights"),
+    );
+    let run = |size: &str| completed(&cozy(&home, &work,
+        &["--json", "run", "./cpu_weights/table", &format!("size={size}"), "--on", "m1"]));
+    let checkpoint = |run: &Value, size: usize| {
+        let output = run["output"].as_array().unwrap().iter()
+            .find(|output| output["name"] == "model").unwrap_or_else(|| panic!("no model output: {run}"));
+        assert_eq!(output["status"], "completed", "{output}");
+        for field in ["path", "sha256", "export_error"] {
+            assert!(output.get(field).is_none_or(Value::is_null), "checkpoint has byte-export metadata: {output}");
+        }
+        let reference = output["checkpoint"].clone();
+        assert_eq!(reference["repo_id"], "local/derived", "{reference}");
+        let store = tensorfs::store::Store::open(&store_path).unwrap();
+        let revision = reference["revision"].as_str().unwrap();
+        let mut tree = tensorfs::format::ObjectRef {
+            sha256: revision.strip_prefix("sha256:").unwrap().into(), length: 0,
+        };
+        tree.length = std::fs::metadata(store.path(&tree).unwrap()).unwrap().len();
+        let variant = reference["variant"].as_str().unwrap();
+        let (_, header) = tensorfs::fetch::variant_of_tree(&store.tree(&tree).unwrap(),
+            (!variant.is_empty()).then_some(variant)).unwrap();
+        assert_eq!(header.id(), run["result"]["checkpoint"].as_str().unwrap(), "tree and produced header differ: {run}");
+        let expected: Vec<u8> = (0u8..=255).cycle().take(size * 4).collect();
+        assert_eq!(store.checkpoint(&header).unwrap().read("model", "table").unwrap(), expected);
+        reference
+    };
+    let first = run("64");
+    let original = checkpoint(&first, 64);
+    let again = run("64");
+    assert_eq!(checkpoint(&again, 64), original);
+    assert_eq!(first["result"]["transaction"], again["result"]["transaction"]);
+    assert_ne!(first["result"]["producer_request_id"], again["result"]["producer_request_id"],
+        "a writer executes again rather than returning the first run's result");
+    let wider = run("128");
+    assert_ne!(checkpoint(&wider, 128), original);
+    assert_ne!(first["result"]["transaction"], wider["result"]["transaction"]);
+
+    let number = first["number"].as_u64().unwrap().to_string();
+    let down = home.cozy(["down"]);
+    assert_eq!(down.code, 0, "{down:?}");
+    let shown = home.json(["--json", "run", "show", &number]);
+    assert_eq!(checkpoint(&shown, 64), original, "Calcifer persisted the typed reference");
+    let replayed = run("64");
+    assert_eq!(checkpoint(&replayed, 64), original);
+    assert_eq!(first["result"]["transaction"], replayed["result"]["transaction"]);
+}
+
+/// Public CLI conversion -> ephemeral ordinary owner Bearer -> Runtime Writer -> real Hub.
+/// A private Hub source starts cold; Runtime reads it, writes and uploads a new output.
+/// A failed upload retains a typed local tree, retried without executing the model again.
+#[test]
+fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
+    use std::sync::Arc;
+    use tensorfs::{
+        fetch::{
+            Client, Config, Endpoint, Fetcher, ObjectStore, Origin, SourcePolicy, Want, bearer,
+            upload_tree,
+        },
+        format::{Dtype, Tree},
+        store::Store,
+        writer::{Data, Source},
+    };
+
+    let Some(home) = Home::with_hub() else { return };
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
+        return;
+    };
+    let account = home.sign_in("cli-writer-upload@cozy.test");
+    let destination = format!("{account}/writer-output");
+    let store_path = home.path().join("shared-tensorfs");
+    let origin = std::env::var("TENSORHUB_ORIGIN").unwrap();
+    let ca = std::fs::read(std::env::var("TENSORHUB_CA").unwrap()).unwrap();
+    let client = Client::with_roots(
+        SourcePolicy {
+            any_host: true,
+            allow_local: true,
+            max_redirects: 5,
+            ..Default::default()
+        },
+        &ca,
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let source_store = Store::open(home.path().join("seed-tensorfs")).unwrap();
+    let (seed, source_tree) = {
+        let mut writer = source_store.writer(None, None).unwrap();
+        writer
+            .get("model")
+            .put(
+                "seed",
+                &Dtype::F32,
+                &[1],
+                Data::Plain(Source::Read(&mut &[0u8; 4][..])),
+            )
+            .unwrap();
+        let header = writer.commit().unwrap();
+        let mut tree = Tree::default();
+        assert_eq!(
+            source_store.checkpoint(&header).unwrap().header().chunks,
+            vec![tensorfs::format::ObjectRef::of(&[0u8; 4])]
+        );
+        tree.set_variant("f32", header.clone());
+        (header, source_store.put_tree(&tree).unwrap())
+    };
+    let source_repo = format!("{account}/writer-source");
+    runtime.block_on(async {
+        let endpoint = Endpoint::new(&client, &origin, Some(bearer(home.token()))).unwrap();
+        upload_tree(&endpoint, &source_repo, &source_tree, &source_store, None)
+            .await
+            .unwrap();
+    });
+    let source_ref = format!("{source_repo}#{}", source_tree.id());
+    assert!(
+        !store_path.exists(),
+        "the machine must start without source objects"
+    );
+    let _machine = common::tensord::added_with(
+        &home,
+        "m1",
+        &[("COZY_TENSORFS_ROOT", store_path.to_str().unwrap())],
+    );
+    assert!(
+        !Store::open(&store_path).unwrap().has(&seed),
+        "source is warm before the call"
+    );
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensord/tests/fixtures/cpu_weights"),
+        &work.join("cpu_weights"),
+    );
+    let run = || {
+        completed(&cozy(
+            &home,
+            &work,
+            &[
+                "--json",
+                "run",
+                "./cpu_weights/convert",
+                &source_ref,
+                &destination,
+                "size=64",
+                "--on",
+                "m1",
+            ],
+        ))
+    };
+    let reference = |run: &Value| {
+        let output = run["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|output| output["name"] == "model")
+            .unwrap();
+        assert_eq!(output["status"], "completed", "{output}");
+        for field in ["path", "sha256", "export_error"] {
+            assert!(output.get(field).is_none_or(Value::is_null), "{output}");
+        }
+        let reference = output["checkpoint"].clone();
+        assert_eq!(reference["repo_id"], destination, "{reference}");
+        assert!(
+            reference["revision"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        reference
+    };
+    let first = run();
+    let remote = reference(&first);
+    let again = run();
+    assert_eq!(
+        reference(&again),
+        remote,
+        "repeated work republishes the same tree"
+    );
+    assert_eq!(
+        first["result"]["transaction"],
+        again["result"]["transaction"]
+    );
+
+    let expected: Vec<u8> = (0u8..=255).collect();
+    let local = Store::open(&store_path).unwrap();
+    assert_eq!(
+        local
+            .checkpoint(&seed)
+            .unwrap()
+            .read("model", "seed")
+            .unwrap(),
+        [0u8; 4]
+    );
+    let header =
+        tensord::storage::held(&local, first["result"]["checkpoint"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        local
+            .checkpoint(&header)
+            .unwrap()
+            .read("model", "table")
+            .unwrap(),
+        expected
+    );
+
+    let cold = tempfile::tempdir().unwrap();
+    let downloaded = Store::open(cold.path()).unwrap();
+    runtime.block_on(async {
+        let anonymous = Endpoint::new(&client, &origin, None).unwrap().anonymous();
+        assert!(
+            anonymous.repo(&destination).await.unwrap().is_none(),
+            "private output is public"
+        );
+        let endpoint =
+            Arc::new(Endpoint::new(&client, &origin, Some(bearer(home.token()))).unwrap());
+        let (repo, _) = endpoint.repo(&destination).await.unwrap().unwrap();
+        let published = repo
+            .checkpoints
+            .iter()
+            .find(|tree| tree.id() == remote["revision"].as_str().unwrap())
+            .unwrap();
+        let endpoint: Arc<dyn Origin> = endpoint;
+        let fetcher = Fetcher::new(
+            Arc::new(downloaded.clone()) as Arc<dyn ObjectStore>,
+            client.clone(),
+            None,
+            Config::default(),
+        );
+        let pulled = fetcher
+            .pull_tree(&endpoint, published, None, &Want::default())
+            .await
+            .unwrap();
+        fetcher.settled().await;
+        assert_eq!(pulled.header, header);
+        assert_eq!(
+            pulled.tree.as_ref().unwrap().id(),
+            remote["revision"].as_str().unwrap()
+        );
+        assert_eq!(
+            downloaded
+                .checkpoint(&pulled.header)
+                .unwrap()
+                .read("model", "table")
+                .unwrap(),
+            expected
+        );
+    });
+
+    // Refusal comes from the real ordinary-owner boundary, after Runtime commits locally.
+    let rival = Home::with_hub().unwrap();
+    let rival_account = rival.sign_in("cli-writer-rival@cozy.test");
+    let refused_destination = format!("{rival_account}/private-output");
+    let rival_endpoint = Endpoint::new(&client, &origin, Some(bearer(rival.token()))).unwrap();
+    let rival_before = runtime.block_on(async {
+        upload_tree(
+            &rival_endpoint,
+            &refused_destination,
+            &source_tree,
+            &source_store,
+            None,
+        )
+        .await
+        .unwrap();
+        rival_endpoint.repo(&refused_destination).await.unwrap()
+    });
+    // The denial case reads an already held local alias: its unrelated publish permission
+    // cannot be refused by a private-source token trade before the Writer commits.
+    tensord::storage::set_local(&local, "seed", &seed, &Default::default()).unwrap();
+    let refused = cozy(
+        &home,
+        &work,
+        &[
+            "--json",
+            "run",
+            "./cpu_weights/convert",
+            "local/seed",
+            &refused_destination,
+            "size=128",
+            "count=true",
+            "--on",
+            "m1",
+        ],
+    );
+    assert_eq!(refused.code, 1, "{refused:?}");
+    let failed = refused
+        .stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .rfind(|event| event["type"] == "run.failed")
+        .unwrap()["run"]
+        .clone();
+    assert!(
+        failed["reason"].to_string().contains("upload_failed"),
+        "{failed}"
+    );
+    assert!(
+        failed["reason"].to_string().contains("404")
+            && failed["reason"].to_string().contains("not visible"),
+        "expected the ordinary permission refusal: {failed}"
+    );
+    let retained = failed["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "model")
+        .unwrap()["checkpoint"]
+        .clone();
+    assert_eq!(retained["repo_id"], "local/derived", "{retained}");
+    let retained_tree =
+        tensord::storage::held(&local, retained["revision"].as_str().unwrap()).unwrap();
+    let variant = retained["variant"].as_str().unwrap();
+    let (_, retained_header) = tensorfs::fetch::variant_of_tree(
+        &local.tree(&retained_tree).unwrap(),
+        (!variant.is_empty()).then_some(variant),
+    )
+    .unwrap();
+    let retained_bytes: Vec<u8> = (0u8..=255).cycle().take(512).collect();
+    assert_eq!(
+        local
+            .checkpoint(&retained_header)
+            .unwrap()
+            .read("model", "table")
+            .unwrap(),
+        retained_bytes
+    );
+    let counter = store_path.join("test-convert-invocations");
+    assert_eq!(std::fs::read(&counter).unwrap(), b"invoked\n");
+    assert_eq!(
+        runtime
+            .block_on(rival_endpoint.repo(&refused_destination))
+            .unwrap(),
+        rival_before,
+        "the refused upload changed another account's repository"
+    );
+
+    let retry_destination = format!("{account}/writer-retry");
+    let retry = completed(&home.cozy([
+        "--json",
+        "run",
+        "upload",
+        &format!("{}#model", failed["number"].as_u64().unwrap()),
+        &retry_destination,
+    ]));
+    assert_eq!(
+        retry["result"]["models"][0]["published"]["tree"], retained["revision"],
+        "{retry}"
+    );
+    assert_eq!(
+        retry["result"]["models"][0]["published"]["checkpoint"],
+        retained_header.id(),
+        "{retry}"
+    );
+    assert_eq!(
+        std::fs::read(&counter).unwrap(),
+        b"invoked\n",
+        "a retained upload reran model code"
+    );
+    let retry_cache = tempfile::tempdir().unwrap();
+    let retry_store = Store::open(retry_cache.path()).unwrap();
+    runtime.block_on(async {
+        let endpoint =
+            Arc::new(Endpoint::new(&client, &origin, Some(bearer(home.token()))).unwrap());
+        let (repo, _) = endpoint.repo(&retry_destination).await.unwrap().unwrap();
+        assert!(
+            repo.checkpoints.contains(&retained_tree),
+            "the retry did not publish its retained tree"
+        );
+        let endpoint: Arc<dyn Origin> = endpoint;
+        let fetcher = Fetcher::new(
+            Arc::new(retry_store.clone()) as Arc<dyn ObjectStore>,
+            client.clone(),
+            None,
+            Config::default(),
+        );
+        let pulled = fetcher
+            .pull_tree(
+                &endpoint,
+                &retained_tree,
+                (!variant.is_empty()).then_some(variant),
+                &Want::default(),
+            )
+            .await
+            .unwrap();
+        fetcher.settled().await;
+        assert_eq!(pulled.tree.as_ref().unwrap(), &retained_tree);
+        assert_eq!(pulled.variant, variant);
+        assert_eq!(pulled.header, retained_header);
+        assert_eq!(
+            retry_store
+                .checkpoint(&pulled.header)
+                .unwrap()
+                .read("model", "table")
+                .unwrap(),
+            retained_bytes
+        );
+    });
+
+    let down = home.cozy(["down"]);
+    assert_eq!(down.code, 0, "{down:?}");
+    let db_path = home.root().join("calcifer/state.db");
+    let db = calcifer::store::Store::open(&db_path).unwrap();
+    for run in [&first, &again, &failed, &retry] {
+        let stored = db.run(run["id"].as_str().unwrap()).unwrap().unwrap();
+        assert!(
+            stored.spec.tensorfs.is_none(),
+            "send-time credential entered stored spec"
+        );
+        assert!(
+            stored.spec.hub.is_none(),
+            "send-time legacy access entered stored spec"
+        );
+    }
+    drop(db);
+    let token = home.token();
+    let bytes = std::fs::read(db_path).unwrap();
+    assert!(
+        !bytes
+            .windows(token.len())
+            .any(|part| part == token.as_bytes()),
+        "owner token entered SQLite"
+    );
+    let shown = home.json([
+        "--json",
+        "run",
+        "show",
+        &first["number"].as_u64().unwrap().to_string(),
+    ]);
+    assert_eq!(
+        reference(&shown),
+        remote,
+        "remote reference survives Calcifer restart"
+    );
+    let failed_shown = home.json([
+        "--json",
+        "run",
+        "show",
+        &failed["number"].as_u64().unwrap().to_string(),
+    ]);
+    assert_eq!(
+        failed_shown["output"][0]["checkpoint"], retained,
+        "failed run lost its retained reference"
+    );
+    assert!(
+        !serde_json::to_string(&shown).unwrap().contains(&token),
+        "owner token entered public history"
+    );
+}
+
+/// Public local model conversion needs neither a Hub connection nor a sign-in.
+#[test]
+fn runtime_checkpoint_uploads_local_alias_on_disk() {
+    use tensorfs::{
+        format::Dtype,
+        store::Store,
+        writer::{Data, Source},
+    };
+    let Some(home) = Home::new() else { return };
+    let Some(_) = common::needs("COZY_TEST_TENSORD", common::TENSORD) else {
+        return;
+    };
+    home.write_config("hub = \"offline\"\n[hubs]\noffline = \"http://127.0.0.1:1\"\n");
+    let store_path = home.path().join("local-tensorfs");
+    let seed = {
+        let store = Store::open(&store_path).unwrap();
+        let mut writer = store.writer(None, None).unwrap();
+        writer
+            .get("model")
+            .put(
+                "seed",
+                &Dtype::F32,
+                &[1],
+                Data::Plain(Source::Read(&mut &[0u8; 4][..])),
+            )
+            .unwrap();
+        let header = writer.commit().unwrap();
+        assert_eq!(
+            store.checkpoint(&header).unwrap().header().chunks,
+            vec![tensorfs::format::ObjectRef::of(&[0u8; 4])]
+        );
+        tensord::storage::set_local(&store, "seed", &header, &Default::default()).unwrap();
+        header
+    };
+    let _machine = common::tensord::added_with(
+        &home,
+        "m1",
+        &[("COZY_TENSORFS_ROOT", store_path.to_str().unwrap())],
+    );
+    let work = home.path().join("work");
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensord/tests/fixtures/cpu_weights"),
+        &work.join("cpu_weights"),
+    );
+    let run = completed(&cozy(
+        &home,
+        &work,
+        &[
+            "--json",
+            "run",
+            "./cpu_weights/convert",
+            "local/seed",
+            "local/output",
+            "size=64",
+            "--on",
+            "m1",
+        ],
+    ));
+    let output = run["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "model")
+        .unwrap();
+    let reference = &output["checkpoint"];
+    assert_eq!(reference["repo_id"], "local/output", "{run}");
+    for field in ["path", "sha256", "export_error"] {
+        assert!(output.get(field).is_none_or(Value::is_null), "{output}");
+    }
+    let store = Store::open(&store_path).unwrap();
+    assert_eq!(
+        store
+            .checkpoint(&seed)
+            .unwrap()
+            .read("model", "seed")
+            .unwrap(),
+        [0u8; 4]
+    );
+    let tree = tensord::storage::held(&store, reference["revision"].as_str().unwrap()).unwrap();
+    let variant = reference["variant"].as_str().unwrap();
+    let (_, header) = tensorfs::fetch::variant_of_tree(
+        &store.tree(&tree).unwrap(),
+        (!variant.is_empty()).then_some(variant),
+    )
+    .unwrap();
+    assert_eq!(header.id(), run["result"]["checkpoint"].as_str().unwrap());
+    assert_eq!(
+        store
+            .checkpoint(&header)
+            .unwrap()
+            .read("model", "table")
+            .unwrap(),
+        (0u8..=255).collect::<Vec<_>>()
+    );
+    let repo = store.get_ref("local/output").unwrap().unwrap();
+    assert!(
+        repo.checkpoints.contains(&tree),
+        "local repository lost its checkpoint"
+    );
+    let chosen = store
+        .variant(&tree, (!variant.is_empty()).then_some(variant))
+        .unwrap();
+    assert_eq!(chosen.id(), &header);
+    assert!(
+        !home.device_key("http://127.0.0.1:1").exists(),
+        "a local conversion created sign-in credentials"
+    );
+}
+
 /// A wheel no index serves (an unpublished build, as cozy-kernels before its release), named by a
 /// path source: the machine installs it as a carried wheel, for a script (resolved on the machine)
 /// and for a locked project (`uv sync` leaves it to the carried file), and the code imports it.

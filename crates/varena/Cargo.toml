@@ -9,8 +9,6 @@ description = "The memory of the process computing with model weights: GPU pages
 platform.workspace = true
 tensorfs.workspace = true
 libc.workspace = true
-# libcuda is dlopen'd at first use: the workspace builds and tests with no CUDA toolkit.
-libloading = "0.9"
 thiserror.workspace = true
 tracing.workspace = true
 

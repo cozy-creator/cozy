@@ -162,34 +162,56 @@ pub struct Request {
 }
 
 /// A Hub checkpoint as a run names it (th-245): `repository` at `release` (empty: the newest) in
-/// `lane` (empty: the lane rule's), or the owner's checkpoint by hash (`manifest` and no
-/// release). Resolved, it carries the release, lane and manifest the Hub named.
+/// `lane` (empty: the lane rule's), or the owner's tree by hash (`tree` and no release). A lane
+/// is a variant of its release's tree. Resolved, it carries the release, lane and tree the Hub
+/// named and the lane's header there, which is the checkpoint's id on this machine.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Named {
     pub repository: String,
     pub release: String,
     pub lane: String,
-    /// `sha256:<hex>`; empty until resolved.
-    pub manifest: String,
-    /// The manifest's length, once resolved (0 for an adapter named by hash).
-    pub length: u64,
+    /// The tree; a run's hash names one before it resolves (its length 0 when unsaid).
+    pub tree: Option<ObjectRef>,
+    /// The lane's cozytensors header in `tree`, once resolved.
+    pub header: Option<ObjectRef>,
 }
 
 impl Named {
-    /// The checkpoint the Hub names it: the first of `asked` its release publishes (an empty
+    /// The tree the Hub names it in: the first of `asked` its release publishes (an empty
     /// lane: its only one). TensorFS's closure client names one lane, so it is one anonymous
     /// closure call per lane until one answers.
     fn at_hub(mut self, machine: &Machine, source: &hub::Source, asked: &[String]) -> Result<Self, Failure> {
         let resolved = origin::resolve_named(machine, source, &self.repository, &self.release, asked)
             .map_err(|e| refused("model_resolution_failed", e))?;
-        (self.release, self.lane, self.manifest, self.length) =
-            (resolved.release, resolved.lane, resolved.manifest.id(), resolved.manifest.length);
+        (self.release, self.lane, self.tree) = (resolved.release, resolved.variant, Some(resolved.tree));
         Ok(self)
     }
 
-    pub(crate) fn object(&self) -> ObjectRef {
-        ObjectRef { sha256: self.manifest.trim_start_matches("sha256:").into(), length: self.length }
+    /// Its lane's header in its tree (the tree's only variant for no lane), the tree document
+    /// landed here.
+    fn landed(mut self, machine: &Machine, source: &hub::Source) -> Result<Self, Failure> {
+        let tree = self.tree()?.clone();
+        let (remote, catalog) = origin::remote(machine, source, &self.repository, &self.release, &self.lane, &tree)?;
+        let lane = (!self.lane.is_empty()).then_some(self.lane.as_str());
+        let (lane, header) = machine.variant(&remote, &tree, lane, &Stop::default()).map_err(|e| {
+            let (code, message) = refused("model_resolution_failed", e);
+            catalog.reason(code, message)
+        })?;
+        (self.lane, self.header) = (lane, Some(header));
+        Ok(self)
     }
+
+    pub(crate) fn tree(&self) -> Result<&ObjectRef, Failure> {
+        self.tree.as_ref().ok_or_else(|| unresolved(self))
+    }
+
+    pub(crate) fn header(&self) -> Result<&ObjectRef, Failure> {
+        self.header.as_ref().ok_or_else(|| unresolved(self))
+    }
+}
+
+fn unresolved(named: &Named) -> Failure {
+    ("model_resolution_failed", format!("{}@{} {} is not resolved", named.repository, named.release, named.lane))
 }
 
 /// The caller's provider tokens; empty reads public sources anonymously.
@@ -445,29 +467,30 @@ impl Publisher {
             repository: made.repository,
             release: String::new(),
             lane: String::new(),
-            manifest: made.manifest.id(),
-            components: self.components(&made.manifest.id())?,
+            manifest: made.header.id(),
+            components: self.components(&made.header.id())?,
         })
     }
 
     /// The component names a held checkpoint's header declares.
-    fn components(&self, manifest: &str) -> Result<Vec<String>, Failure> {
-        let checkpoint = storage::checkpoint(&self.store, manifest).map_err(|e| ("checkpoint_absent", format!("{manifest}: {e}")))?;
+    fn components(&self, header: &str) -> Result<Vec<String>, Failure> {
+        let checkpoint = storage::checkpoint(&self.store, header).map_err(|e| ("checkpoint_absent", format!("{header}: {e}")))?;
         Ok(checkpoint.header().components().iter().map(|c| c.name.clone()).collect())
     }
 
-    /// A slot's model this machine's store holds, by its exact manifest.
+    /// A slot's model this machine's store holds, by its header or its tree.
     fn held_grant(&self, installation: &Installation, path: &str, reference: &domain::Ref) -> Result<ModelGrant, Failure> {
-        let manifest = format!("sha256:{}", sha256::hex(&reference.digest));
-        let absent = |_| ("checkpoint_absent", format!("{path} names checkpoint {manifest}, which this machine does not hold"));
+        let named = format!("sha256:{}", sha256::hex(&reference.digest));
+        let absent = |_| ("checkpoint_absent", format!("{path} names checkpoint {named}, which this machine does not hold"));
+        let checkpoint = storage::checkpoint(&self.store, &named).map_err(absent)?;
         Ok(ModelGrant {
             package: installation.package.clone(),
             slot: path.to_string(),
             repository: String::new(),
             release: String::new(),
             lane: String::new(),
-            components: self.components(&manifest).map_err(absent)?,
-            manifest,
+            components: checkpoint.header().components().iter().map(|c| c.name.clone()).collect(),
+            manifest: checkpoint.id().id(),
         })
     }
 
@@ -513,13 +536,13 @@ impl Publisher {
         made
     }
 
-    /// `named` from its Hub into the store, pinned as pulled: its structure (manifest, header,
-    /// files), then the `components` given (all when `None`, none when empty). Answers the bytes
-    /// that came from the Hub and from the datacenter volume. Whatever is here moves nothing.
+    /// `named` from its Hub into the store, its ref recording the pull: its tree and header, then
+    /// the `components` given (all when `None`, none when empty). Answers the bytes that came from the Hub and
+    /// from the datacenter volume. Whatever is here moves nothing.
     fn pull(&self, source: &hub::Source, named: &Named, components: Option<&[String]>, stop: Option<&Stop>,
         bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(u64, u64), Failure> {
-        let manifest = named.object();
-        let (remote, catalog) = origin::remote(&self.machine, source, &named.repository, &named.release, &named.lane, &manifest)?;
+        let (tree, header) = (named.tree()?, named.header()?);
+        let (remote, catalog) = origin::remote(&self.machine, source, &named.repository, &named.release, &named.lane, tree)?;
         let stop = stop.cloned().unwrap_or_default();
         let failed = |e: Refusal| match stop.is_cancelled() {
             true => canceled(),
@@ -532,25 +555,26 @@ impl Publisher {
         let logged = |pulled: &tensorfs::fetch::Pulled| {
             let (fetched, reused) = (pulled.landed.origin + pulled.landed.volume, pulled.landed.local);
             let seconds = started.elapsed().as_secs_f64();
-            let detail = format!("manifest={} objects={} fetched={fetched} reused={reused} seconds={seconds:.1} origin={}",
-                manifest.id(), pulled.objects, source.origin);
+            let detail = format!("header={} tree={} objects={} fetched={fetched} reused={reused} seconds={seconds:.1} origin={}",
+                header.id(), tree.id(), pulled.objects, source.origin);
             storage::transport(&self.store, "pull", &subject, &detail);
         };
         let failed = |e: Refusal| {
             storage::transport(&self.store, "pull-failed", &subject, &format!("origin={}: {e}", source.origin));
             failed(e)
         };
-        let structure = self.machine.pull(&remote, &manifest, Some(&[]), priority::NOW, None, &stop).map_err(failed)?;
-        let pulled = Pulled { repository: named.repository.clone(), release: named.release.clone(), lane: named.lane.clone() };
-        storage::hold(&self.store, &storage::pin::model(&manifest.sha256), vec![manifest.clone()], Some(pulled.owner()))
-            .map_err(io_failure)?;
+        let mut structure = self.machine.pull(&remote, header, Some(&[]), priority::NOW, None, &stop).map_err(failed)?;
+        let landed = self.machine.objects(&remote, std::slice::from_ref(tree), priority::NOW, &stop).map_err(failed)?;
+        (structure.landed.origin, structure.landed.volume) = (structure.landed.origin + landed.origin, structure.landed.volume + landed.volume);
+        let pulled = Pulled { repository: named.repository.clone(), release: named.release.clone(), lane: named.lane.clone(), tree: tree.clone() };
+        pulled.record(&self.store).map_err(io_failure)?;
         if components == Some(&[]) {
             logged(&structure);
             return Ok((structure.landed.origin, structure.landed.volume));
         }
         let progress = Arc::new(Counted::default());
         let pulled = origin::watched(&progress, bytes, || {
-            self.machine.pull(&remote, &manifest, components, priority::NOW, Some(progress.clone()), &stop)
+            self.machine.pull(&remote, header, components, priority::NOW, Some(progress.clone()), &stop)
         });
         let pulled = pulled.map_err(failed)?;
         logged(&pulled);
@@ -558,15 +582,27 @@ impl Publisher {
         Ok((structure.landed.origin + landed.origin, structure.landed.volume + landed.volume))
     }
 
-    /// `named` downloaded whole, as a request's weights are, and pinned so the GC keeps it:
-    /// what a caller asked for whole (`cozy model download`, an adapter).
+    /// `named` downloaded whole, as a request's weights are: what a caller asked for whole
+    /// (`cozy model download`, an adapter).
     fn ensure(&self, source: &hub::Source, named: &Named, stop: Option<&Stop>,
         bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(u64, u64), Failure> {
         self.pull(source, named, None, stop, bytes)
     }
 
-    /// Each Hub checkpoint's structure (manifest, header, files), landed at once: which of its
-    /// chunks come, and when, its calls direct (`access`). A held structure asks the Hub nothing.
+    /// The Hub checkpoint `header` is, as this machine pulled it (`Pulled`); none for one never
+    /// pulled (local).
+    fn pulled(&self, header: &ObjectRef) -> io::Result<Option<Named>> {
+        Ok(Pulled::of(&self.store, header)?.map(|p| Named {
+            repository: p.repository,
+            release: p.release,
+            lane: p.lane,
+            tree: Some(p.tree),
+            header: Some(header.clone()),
+        }))
+    }
+
+    /// Each Hub checkpoint's header, landed at once: which of its chunks come, and when, its
+    /// calls direct (`access`). A held header asks the Hub nothing.
     fn structure(&self, source: &hub::Source, checkpoints: &[Named], job: &Job) -> Result<(), Failure> {
         if checkpoints.is_empty() {
             return Ok(());
@@ -579,11 +615,12 @@ impl Publisher {
         Ok(())
     }
 
-    /// The checkpoint `named` is: a hash as given, a name as the Hub answers it in its lane,
-    /// else in the first of `lanes` its release publishes, else in its only lane. Journaled per
-    /// catalog revision so a warm run, across restarts too, asks the Hub nothing (th-245).
+    /// The checkpoint `named` is: a tree by hash as given, a name as the Hub answers it in its
+    /// lane, else in the first of `lanes` its release publishes, else in its only lane; then its
+    /// lane's header there. Journaled per catalog revision so a warm run, across restarts too,
+    /// asks the Hub nothing (th-245).
     pub(crate) fn resolve(&self, service: &Service, source: &hub::Source, named: Named, lanes: &[&str], revision: &str) -> Result<Named, Failure> {
-        if !named.manifest.is_empty() {
+        if named.tree.is_some() {
             return measured(&self.machine, service, source, named);
         }
         let asked: Vec<String> = match named.lane.is_empty() {
@@ -593,11 +630,11 @@ impl Publisher {
         let origin = hub::origin_key(&source.origin).unwrap_or_default();
         let name = json!([origin, named.repository, named.release, asked]).to_string();
         let held = service.engine.with_journal(|j| j.named(&name, revision)).map_err(io_failure)?;
-        if let Some((release, lane, manifest, length)) = held.and_then(|held| serde_json::from_str(&held).ok()) {
-            return Ok(Named { release, lane, manifest, length, ..named });
+        if let Some((release, lane, tree, header)) = held.and_then(|held| serde_json::from_str(&held).ok()) {
+            return Ok(Named { release, lane, tree: Some(tree), header: Some(header), ..named });
         }
-        let resolved = named.at_hub(&self.machine, source, &asked)?;
-        let answer = json!([resolved.release, resolved.lane, resolved.manifest, resolved.length]).to_string();
+        let resolved = named.at_hub(&self.machine, source, &asked)?.landed(&self.machine, source)?;
+        let answer = json!([resolved.release, resolved.lane, resolved.tree, resolved.header]).to_string();
         service.engine.with_journal(|j| j.bind_named(&name, revision, &answer)).map_err(io_failure)?;
         Ok(resolved)
     }
@@ -621,37 +658,6 @@ impl Publisher {
         // A checkpoint this store already holds whole moves nothing and asks the Hub nothing.
         let moved = self.ensure(source, &named, stop, bytes).map_err(failed)?;
         Ok((named, moved))
-    }
-
-    /// The store's share of the machine's self-managing caches (`reclaim`), with what it
-    /// must keep (`protected`).
-    pub fn caches(&self, service: &Service) -> io::Result<crate::reclaim::StoreCaches<'_>> {
-        Ok(crate::reclaim::StoreCaches {
-            store: &self.store,
-            keep: self.protected(service)?,
-        })
-    }
-
-    /// What no store GC may evict: what live executors read and the checkpoints of every
-    /// unfinished run, unknown states included (what is being fetched, its tickets hold). A
-    /// journal or plan that cannot be read is an error, never a shorter list: the caller then
-    /// runs no store GC this pass.
-    fn protected(&self, service: &Service) -> io::Result<Vec<String>> {
-        let mut keep = service.pool().map(|pool| pool.serving()).unwrap_or_default();
-        for record in service.engine.with_journal(|journal| journal.unfinished())? {
-            let Some(submission) = record.submission.filter(|s| !s.preparation_id.is_empty()) else {
-                continue;
-            };
-            let preparation = service
-                .engine
-                .preparation(&submission.actor, &submission.preparation_id)?;
-            if let Some(preparation) = preparation {
-                keep.extend(crate::gpu_service::Plan::of(&preparation)?.manifests());
-            }
-        }
-        keep.sort();
-        keep.dedup();
-        Ok(keep)
     }
 
     /// The installation a request names. An unnamed release is the one the Hub named under
@@ -782,6 +788,11 @@ impl Publisher {
                 plan: None,
                 warnings: vec![],
             }));
+        }
+        // An alias may now name another tree, or be gone. Resolve its current local metadata
+        // before building a plan; the raw request key cannot prove a cached header is current.
+        if local_aliases(&installation, request)? {
+            return Ok(None);
         }
         let Some(gpu) = service.pool() else {
             return Ok(None);
@@ -1328,10 +1339,26 @@ impl Publisher {
                 // A model passed by value (a ModelArtifact a run here produced): held here.
                 return Ok((self.held_grant(installation, &path, reference)?, None, vec![]));
             }
+            if choice.repository.starts_with("local/") && choice.manifest.is_none() {
+                let reference = match choice.release.is_empty() {
+                    true => choice.repository.clone(),
+                    false => format!("{}@{}", choice.repository, choice.release),
+                };
+                let (release, lane) = ((!choice.release.is_empty()).then_some(choice.release.as_str()), (!choice.lane.is_empty()).then_some(choice.lane.as_str()));
+                let local = storage::local(&self.store, &choice.repository, release, lane)
+                    .and_then(|local| local.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "this machine holds no such model")))
+                    .map_err(|error| ("model_resolution_failed", format!("{reference}: {error}")))?;
+                let header = local.header.id();
+                return Ok((ModelGrant {
+                    package: installation.package.clone(), slot: path, repository: choice.repository.clone(),
+                    release: local.release, lane: local.variant,
+                    components: self.components(&header)?, manifest: header,
+                }, None, vec![]));
+            }
             let named = choose(choice, &path)?;
             let tolerances = precision::Slot::of(slot);
             let bits = tolerances.bits(request.bits, short);
-            let ruled = named.lane.is_empty() && named.manifest.is_empty();
+            let ruled = named.lane.is_empty() && named.tree.is_none();
             let lanes = if ruled { tolerances.lanes(bits, &gpus) } else { vec![] };
             let named = self.resolve(service, &request.source, named, &lanes, &request.catalog_revision)?;
             let model = format!("{}@{}", named.repository, named.release);
@@ -1342,7 +1369,7 @@ impl Publisher {
                 repository: named.repository.clone(),
                 release: named.release.clone(),
                 lane: named.lane.clone(),
-                manifest: named.manifest.clone(),
+                manifest: named.header()?.id(),
                 components: vec![],
             };
             Ok((grant, (!named.repository.starts_with("local/")).then_some(named), warnings))
@@ -1425,9 +1452,12 @@ impl Publisher {
         Ok((plan, warnings))
     }
 
-    /// A landed checkpoint's bytes: its manifest, its files and every chunk its header names.
+    /// A landed checkpoint's bytes: its header and every chunk and asset it names.
     fn bytes(&self, named: &Named) -> u64 {
-        self.store.closure(&named.object()).map_or(named.length, |objects| objects.iter().map(|o| o.length).sum())
+        let Ok(header) = named.header() else {
+            return 0;
+        };
+        self.store.closure(header).map_or(header.length, |objects| objects.iter().map(|o| o.length).sum())
     }
 }
 
@@ -1435,7 +1465,7 @@ impl Publisher {
 fn distinct<'a>(named: impl Iterator<Item = &'a Named>) -> Vec<Named> {
     let mut checkpoints = Vec::<Named>::new();
     for named in named {
-        if !checkpoints.iter().any(|c| c.manifest == named.manifest) {
+        if !checkpoints.iter().any(|c| c.header == named.header) {
             checkpoints.push(named.clone());
         }
     }
@@ -1458,9 +1488,8 @@ pub(crate) fn choose(choice: &domain::ModelChoice, path: &str) -> Result<Named, 
     if choice.repository.is_empty() {
         return Err(("model_choice_absent", format!("{path}'s choice names no model repository")));
     }
-    let manifest = choice.manifest.as_ref().map(|m| format!("sha256:{}", sha256::hex(&m.digest))).unwrap_or_default();
-    let length = choice.manifest.as_ref().map_or(0, |m| m.length);
-    Ok(Named { repository: choice.repository.clone(), release: choice.release.clone(), lane: choice.lane.clone(), manifest, length })
+    let tree = choice.manifest.as_ref().map(|m| ObjectRef { sha256: sha256::hex(&m.digest), length: m.length });
+    Ok(Named { repository: choice.repository.clone(), release: choice.release.clone(), lane: choice.lane.clone(), tree, header: None })
 }
 
 /// A provider source made into a local model.
@@ -1468,7 +1497,7 @@ pub(crate) fn choose(choice: &domain::ModelChoice, path: &str) -> Result<Named, 
 pub struct Made {
     /// `local/source-<hash>`, named by the source's pinned spelling and converter.
     pub repository: String,
-    pub manifest: ObjectRef,
+    pub header: ObjectRef,
     /// The pinned source the provider resolved.
     pub resolved: String,
     pub profiles: Vec<String>,
@@ -1501,15 +1530,16 @@ fn make_source(
     let identity = serde_json_canonicalizer::to_vec(&json!(["cozy.machine-source-model/2", listed.pinned, converter]))
         .map_err(|e| io_failure(io::Error::other(e)))?;
     let name = format!("source-{}", &sha256::hex_digest(&identity)[..40]);
-    let made = |manifest| Made {
+    let made = |header| Made {
         repository: format!("local/{name}"),
-        manifest,
+        header,
         resolved: listed.pinned.clone(),
         profiles: profiles.to_vec(),
     };
-    if let Some(manifest) = crate::storage::local(store, &name).map_err(io_failure)? {
-        crate::storage::transport(store, "import", source, &format!("manifest={} reused", manifest.id()));
-        return Ok(made(manifest));
+    let held = crate::storage::local(store, &format!("local/{name}"), None, None).map_err(io_failure)?;
+    if let Some(local) = held.filter(|local| crate::storage::present(store, &local.header)) {
+        crate::storage::transport(store, "import", source, &format!("header={} reused", local.header.id()));
+        return Ok(made(local.header));
     }
     let stop = || cancellation.as_ref().is_some_and(Stop::is_cancelled);
     // What the import downloaded, for its transport line.
@@ -1530,26 +1560,25 @@ fn make_source(
         stop: Some(&stop),
     };
     let started = Instant::now();
-    let manifest = store.import(&request, Some(&name)).map_err(|e| {
+    let (header, files) = store.import(&request, Some(&name)).map_err(|e| {
         crate::storage::transport(store, "import-failed", source, &e.to_string());
         match stop() {
             true => canceled(),
             false => refused("model_source_failed", e),
         }
     })?;
-    let closure = store.closure(&manifest).unwrap_or_default();
+    let closure = store.closure(&header).unwrap_or_default();
     let detail = format!(
-        "manifest={} objects={} bytes={} downloaded={} seconds={:.1}",
-        manifest.id(),
+        "header={} objects={} bytes={} downloaded={} seconds={:.1}",
+        header.id(),
         closure.len(),
         closure.iter().map(|o| o.length).sum::<u64>(),
         downloaded.load(std::sync::atomic::Ordering::Relaxed),
         started.elapsed().as_secs_f64()
     );
     crate::storage::transport(store, "import", source, &detail);
-    crate::storage::set_local(store, &name, &manifest).map_err(io_failure)?;
-    store.unpin(&name).map_err(|e| io_failure(crate::storage::io_error(e)))?;
-    Ok(made(manifest))
+    crate::storage::set_local(store, &name, &header, &files).map_err(io_failure)?;
+    Ok(made(header))
 }
 
 /// A TensorFS refusal as a run's reason; a download the disk cannot fit is its own.
@@ -1561,7 +1590,7 @@ fn refused(code: &'static str, refusal: tensorfs::err::Refusal) -> Failure {
 }
 
 /// A slot's caller adapters applied to its resolved base: each adapter downloaded, then one
-/// adapter view composed (`derive::compose`); the grant then names the view.
+/// adapter view composed (`adapter::compose`); the grant then names the view.
 fn apply_adapters(
     publisher: &Publisher,
     source: &hub::Source,
@@ -1576,26 +1605,28 @@ fn apply_adapters(
     }
     let store = &publisher.store;
     job.stage(format!("preparing model adapters for {}", grant.slot));
-    let object = |manifest: &str| {
-        storage::held(store, manifest).map_err(|e| ("model_download_failed", format!("manifest {manifest} is not held: {e}")))
+    let object = |header: &str| {
+        storage::held(store, header).map_err(|e| ("model_download_failed", format!("checkpoint {header} is not held: {e}")))
     };
     let mut selections = vec![];
     for adapter in &choice.adapters {
-        let manifest = if adapter.source.is_empty() {
+        let header = if adapter.source.is_empty() {
             // By name, resolved at the Hub, or the owner's by hash (th-245).
             if adapter.model.is_empty() {
                 return Err(("adapter_absent", format!("an adapter of {} names no model", grant.slot)));
             }
+            let tree = (!adapter.manifest.is_empty())
+                .then(|| ObjectRef { sha256: adapter.manifest.trim_start_matches("sha256:").into(), length: 0 });
             let named = resolve(Named {
                 repository: adapter.model.clone(),
                 release: adapter.release.clone(),
                 lane: adapter.lane.clone(),
-                manifest: adapter.manifest.clone(),
-                length: 0,
+                tree,
+                header: None,
             })?;
             // An adapter is small and its view composes from all of it: it comes whole.
             publisher.ensure(source, &named, job.stop.as_ref(), &|d, t| job.bytes(d, t))?;
-            named.manifest
+            named.header()?.id()
         } else {
             // A provider-source LoRA (civitai://, hf://) is made here, normalized at ingest.
             let made = publisher.make(&adapter.source, &adapter.profiles, providers, job.stop.as_ref(), &|stage, moved, total| {
@@ -1605,7 +1636,7 @@ fn apply_adapters(
                     total,
                 })
             })?;
-            format!("sha256:{}", made.manifest.sha256)
+            made.header.id()
         };
         let strength = if adapter.scale.is_empty() {
             1.0
@@ -1617,23 +1648,23 @@ fn apply_adapters(
                 )
             })?
         };
-        selections.push(crate::derive::Selection {
-            manifest: object(&manifest)?,
+        selections.push(crate::adapter::Selection {
+            checkpoint: object(&header)?,
             component: adapter.component.clone(),
             source_component: adapter.source_component.clone(),
             strength,
         });
     }
     // The view re-packs the base's small parts: its chunks come first (its load reads them anyway).
-    if !grant.release.is_empty() {
-        let base = Named { repository: grant.repository.clone(), release: grant.release.clone(), lane: grant.lane.clone(),
-            manifest: grant.manifest.clone(), length: object(&grant.manifest)?.length };
-        publisher.ensure(source, &base, job.stop.as_ref(), &|d, t| job.bytes(d, t))?;
+    let base = object(&grant.manifest)?;
+    if let Some(pulled) = publisher.pulled(&base).map_err(io_failure)? {
+        publisher.ensure(source, &pulled, job.stop.as_ref(), &|d, t| job.bytes(d, t))?;
     }
-    let composed = crate::derive::compose(store, &object(&grant.manifest)?, &selections)
+    // The view is the store's to keep from here: the call that reads it holds it open.
+    let composed = crate::adapter::compose(store, &base, &selections)
         .map_err(|e| ("model_adapter_refused", e.to_string()))?;
-    grant.repository = composed.pin;
-    grant.manifest = format!("sha256:{}", composed.manifest.sha256);
+    grant.repository = composed.name;
+    grant.manifest = composed.checkpoint.id().id();
     Ok(())
 }
 
@@ -1674,22 +1705,25 @@ fn newest_key(request: &Request) -> String {
     json!(["newest", hub::origin_key(&request.source.origin), request.package]).to_string()
 }
 
-/// A checkpoint named by its hash, with the length a hash alone does not say: its closure's at
-/// the Hub, read once under the run's access (the owner's capability for a private one) and
-/// kept, since a hash never names other bytes.
+/// A tree named by its hash, with what a hash alone does not say: its length (the Hub's) and its
+/// lane's header, read once under the run's access (the owner's capability for a private one)
+/// and kept, since a hash never names other bytes.
 fn measured(machine: &Machine, service: &Service, source: &hub::Source, mut named: Named) -> Result<Named, Failure> {
-    if named.length > 0 {
+    if named.header.is_some() {
         return Ok(named);
     }
-    let key = json!([hub::origin_key(&source.origin).unwrap_or_default(), named.repository, named.manifest]).to_string();
+    let tree = named.tree()?.clone();
+    let key = json!([hub::origin_key(&source.origin).unwrap_or_default(), named.repository, tree.id(), named.lane]).to_string();
     let held = service.engine.with_journal(|j| j.named(&key, "")).map_err(io_failure)?;
-    if let Some(length) = held.and_then(|held| held.parse().ok()) {
-        named.length = length;
-        return Ok(named);
+    if let Some((tree, lane, header)) = held.and_then(|held| serde_json::from_str(&held).ok()) {
+        return Ok(Named { tree: Some(tree), lane, header: Some(header), ..named });
     }
-    let sha256 = named.manifest.trim_start_matches("sha256:").to_string();
-    named.length = origin::resolve_hash(machine, source, &named.repository, &named.lane, &sha256)?.length;
-    service.engine.with_journal(|j| j.bind_named(&key, "", &named.length.to_string())).map_err(io_failure)?;
+    if tree.length == 0 {
+        named.tree = Some(origin::resolve_hash(machine, source, &named.repository, &named.lane, &tree.sha256)?);
+    }
+    let named = named.landed(machine, source)?;
+    let answer = json!([named.tree, named.lane, named.header]).to_string();
+    service.engine.with_journal(|j| j.bind_named(&key, "", &answer)).map_err(io_failure)?;
     Ok(named)
 }
 
@@ -1816,21 +1850,39 @@ fn io_failure(error: io::Error) -> Failure {
     ("release_root_preparation_failed", error.to_string())
 }
 
-/// A slot's declared default as a choice (its `default`: `[org/]model@release`): what a run
-/// that names no model for the slot gets, in the lane rule's lane. An org-relative model is the
-/// package's account's: the package's org, or for unpublished code the run's `owner`.
+/// A slot's declared default as a choice (its `default`: `[org/]model@release`, or a local
+/// model `local/<name>`, its newest): what a run that names no model for the slot gets, in the
+/// lane rule's lane. An org-relative model is the package's account's: the package's org, or
+/// for unpublished code the run's `owner`.
 pub(crate) fn default_choice(slot: &Value, path: &str, package: &str, owner: &str) -> Option<domain::ModelChoice> {
     let account = match package.split_once('/') {
         Some((org, _)) if org != "local" => org,
         _ => owner,
     };
-    let (model, release) = slot.get("default")?.as_str()?.split_once('@')?;
+    let default = slot.get("default")?.as_str()?;
+    let (model, release) = match default.split_once('@') {
+        Some(named) => named,
+        None => (default.starts_with("local/").then_some(default)?, ""),
+    };
     let repository = match model.contains('/') {
         true => model.into(),
         false if account.is_empty() => return None,
         false => format!("{account}/{model}"),
     };
     Some(domain::ModelChoice { parameter: path.into(), repository, release: release.into(), ..Default::default() })
+}
+
+fn local_aliases(installation: &Installation, request: &Request) -> io::Result<bool> {
+    let interface: Value = serde_json::from_slice(&installation.interface).map_err(io::Error::other)?;
+    Ok(model_slots(&interface, &request.entrypoint).unwrap_or_default().iter().any(|slot| {
+        let path = slot["path"].as_str().unwrap_or_default();
+        let parameter = path.rsplit('.').next().unwrap_or_default();
+        let asked = request.choices.iter().find(|c| c.parameter == path || c.parameter == parameter)
+            .filter(|c| !c.repository.is_empty() || c.manifest.is_some() || !c.source.is_empty());
+        let declared = default_choice(slot, path, &installation.package, &request.owner);
+        asked.or(declared.as_ref()).is_some_and(|choice| choice.source.is_empty()
+            && choice.manifest.is_none() && choice.repository.starts_with("local/"))
+    }))
 }
 
 /// A slot with neither a choice nor a declared default.
@@ -2491,10 +2543,10 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let got = choose(&pinned).unwrap();
-        assert_eq!((got.manifest, got.release), (format!("sha256:{}", "07".repeat(32)), String::new()));
+        assert_eq!((got.tree, got.release), (Some(ObjectRef { sha256: "07".repeat(32), length: 9 }), String::new()));
         let named = domain::ModelChoice { repository: "proof/probe".into(), release: "1.0.0".into(), ..Default::default() };
         let got = choose(&named).unwrap();
-        assert_eq!((got.release.as_str(), got.lane.as_str(), got.manifest.as_str()), ("1.0.0", "", ""));
+        assert_eq!((got.release.as_str(), got.lane.as_str(), got.tree, got.header), ("1.0.0", "", None, None));
         let unnamed = domain::ModelChoice { manifest: pinned.manifest.clone(), ..Default::default() };
         assert_eq!(choose(&unnamed).err().unwrap().0, "model_choice_absent");
     }
@@ -2602,7 +2654,7 @@ pub(crate) mod tests {
             let b = scope.spawn(make);
             (a.join().unwrap(), b.join().unwrap())
         });
-        assert_eq!(a.manifest, b.manifest);
+        assert_eq!(a.header, b.header);
         assert!(publisher.making.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2616,24 +2668,26 @@ pub(crate) mod tests {
         let store = crate::storage::open(&root.join("tensorfs")).unwrap();
         let profiles = ["sdxl.lora".to_string()];
         let made = make_source(&store, "civitai://145907", &profiles, &Providers::default(), None, &|_, _, _| {}).unwrap();
-        let checkpoint = store.checkpoint(&made.manifest).unwrap();
+        let checkpoint = store.checkpoint(&made.header).unwrap();
         let unet = &checkpoint.header().components()[0];
         assert_eq!(unet.name, "unet");
         assert!(unet.tensors.iter().any(|t| t.key.ends_with("attn1.to_q.lora_A.weight")));
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A real checkpoint of `objects` tensors of 16 MiB, each its own chunk, in a source store.
+    /// A real checkpoint of `objects` tensors of 16 MiB, each its own chunk, and a tokenizer, in
+    /// a source store.
     fn checkpoint(store: &Store, objects: usize, tag: u8) -> ObjectRef {
         let tensors: Vec<(String, Vec<u64>, Vec<u8>)> = (0..objects)
-            .map(|at| (format!("w{at:03}"), vec![1 << 22], crate::derive::tests::f32s(1 << 22, f32::from(tag) * 1000.0 + at as f32)))
+            .map(|at| (format!("w{at:03}"), vec![1 << 22], crate::adapter::tests::f32s(1 << 22, f32::from(tag) * 1000.0 + at as f32)))
             .collect();
         let named: Vec<(&str, Vec<u64>, Vec<u8>)> = tensors.iter().map(|(k, s, b)| (k.as_str(), s.clone(), b.clone())).collect();
-        crate::derive::tests::checkpoint(store, &format!("fixture-{tag}"), "model", &named)
+        crate::adapter::tests::checkpoint(store, &format!("fixture-{tag}"), "model", &named)
     }
 
-    fn chunks(store: &Store, manifest: &ObjectRef) -> Vec<ObjectRef> {
-        crate::storage::chunks(&store.checkpoint(manifest).unwrap(), &[])
+    /// Its chunks and assets.
+    fn chunks(store: &Store, header: &ObjectRef) -> Vec<ObjectRef> {
+        crate::storage::chunks(&store.checkpoint(header).unwrap(), &[])
     }
 
     /// A machine's publisher and service, and a loopback Hub serving `model` from `source`
@@ -2653,15 +2707,17 @@ pub(crate) mod tests {
             Self { root, source, publisher }
         }
 
-        fn hub(&self, repository: &str, manifest: &ObjectRef, pace: u64) -> (hub::Source, Named, names_hub::Heard) {
+        fn hub(&self, repository: &str, header: &ObjectRef, pace: u64) -> (hub::Source, Named, names_hub::Heard) {
             let model = names_hub::Model {
                 repository: repository.into(),
                 release: "1.0.0".into(),
                 lane: "bf16".into(),
-                manifest: manifest.clone(),
+                header: header.clone(),
             };
+            let tree = names_hub::trees(&self.source, std::slice::from_ref(&model)).remove(0);
             let (origin, heard) = names_hub::paced(&self.source, model, None, Duration::from_millis(pace));
-            let named = Named { repository: repository.into(), release: "1.0.0".into(), lane: "bf16".into(), manifest: manifest.id(), length: manifest.length };
+            let named = Named { repository: repository.into(), release: "1.0.0".into(), lane: "bf16".into(),
+                tree: Some(tree), header: Some(header.clone()) };
             (hub::Source::new(&origin, None, vec!["localhost".into()], None).unwrap(), named, heard)
         }
     }
@@ -2670,47 +2726,21 @@ pub(crate) mod tests {
         heard.lock().unwrap().iter().filter(|h| h.starts_with(asked)).count()
     }
 
-    /// One channel request answered (frames: a kind byte, a u32 length, JSON); Null once the
-    /// channel is closed.
-    /// The channel a file carries, as the executor adopts it.
-    fn channel(file: std::fs::File) -> platform::ipc::LocalStream {
-        #[cfg(unix)]
-        let raw = std::os::fd::IntoRawFd::into_raw_fd(file) as i64;
-        #[cfg(windows)]
-        let raw = std::os::windows::io::IntoRawHandle::into_raw_handle(file) as i64;
-        // SAFETY: a connected stream this test owns and hands over.
-        unsafe { platform::ipc::adopt(raw) }
-    }
-
-    fn ask(channel: &mut platform::ipc::LocalStream, request: Value) -> Value {
-        use std::io::{Read, Write};
-        let body = serde_json::to_vec(&request).unwrap();
-        let frame = [&[0u8][..], &(body.len() as u32).to_be_bytes(), &body].concat();
-        let mut head = [0; 5];
-        if channel.write_all(&frame).is_err() || channel.read_exact(&mut head).is_err() {
-            return Value::Null;
-        }
-        let mut reply = vec![0; u32::from_be_bytes(head[1..].try_into().unwrap()) as usize];
-        channel.read_exact(&mut reply).unwrap();
-        serde_json::from_slice(&reply).unwrap()
-    }
-
-    /// A checkpoint a run chose lands as its structure alone: one closure, its manifest and
-    /// header, and an origin attested for what it lacks. Resolved again, it asks the Hub nothing.
+    /// A checkpoint a run chose lands as its header and its tree alone: one closure, the two
+    /// objects, and the store's ref naming the pull. Resolved again, it asks the Hub nothing.
     #[test]
-    fn a_chosen_checkpoint_lands_as_its_structure_alone() {
+    fn a_chosen_checkpoint_lands_as_its_header_alone() {
         let bench = Bench::new();
         let manifest = checkpoint(&bench.source, 3, 4);
         let (hub, named, heard) = bench.hub("acme/source", &manifest, 0);
         let job = Job::default();
         bench.publisher.structure(&hub, std::slice::from_ref(&named), &job).unwrap();
         let store = bench.publisher.store();
-        assert_eq!(count(&heard, "GET /o/"), 3, "the manifest, the header and the config: {heard:?}");
+        assert_eq!(count(&heard, "GET /o/"), 2, "the header and its tree: {heard:?}");
         assert_eq!(count(&heard, "POST /v1/tensorfs/closure"), 1);
         assert!(!crate::access::whole(store, &manifest.id(), &[]));
-        let pin = store.get_pin(&crate::storage::pin::model(&manifest.sha256)).unwrap().unwrap();
-        let pulled = Pulled { repository: "acme/source".into(), release: "1.0.0".into(), lane: "bf16".into() };
-        assert_eq!(pin.owner, Some(pulled.owner()));
+        let pulled = Pulled { repository: "acme/source".into(), release: "1.0.0".into(), lane: "bf16".into(), tree: named.tree.clone().unwrap() };
+        assert_eq!(Pulled::of(store, &manifest).unwrap(), Some(pulled));
         let asked = heard.lock().unwrap().len();
         bench.publisher.structure(&hub, &[named], &job).unwrap();
         assert_eq!(heard.lock().unwrap().len(), asked, "a held structure asks nothing");
@@ -2718,7 +2748,7 @@ pub(crate) mod tests {
     }
 
     /// Two calls reading one checkpoint held in part (two sessions, one model) fetch each object
-    /// once; once all of it is here, a call's waits and channel ask the Hub nothing (a warm run).
+    /// once; once all of it is here, a call asks the Hub nothing (a warm run).
     #[test]
     fn calls_sharing_a_checkpoint_fetch_each_object_once_and_a_warm_one_asks_nothing() {
         let bench = Bench::new();
@@ -2728,28 +2758,26 @@ pub(crate) mod tests {
         let store = bench.publisher.store().clone();
         let objects = chunks(&store, &manifest);
         let machine = bench.publisher.machine().clone();
-        let call = |order| crate::access::Fetch::new(machine.clone(), Some(hub.clone()), vec![manifest.id()], order);
+        let call = |order| crate::access::Fetch::new(machine.clone(), Some(hub.clone()), order);
+        let selected = [(manifest.id(), vec!["model".to_string()])];
         let (first, second) = (call(1), call(2));
-        std::thread::scope(|scope| {
-            scope.spawn(|| first.wait(&manifest.id(), &objects).unwrap());
-            scope.spawn(|| second.wait(&manifest.id(), &objects[..2]).unwrap());
-        });
-        assert!(crate::access::whole(&store, &manifest.id(), &[]));
-        assert_eq!(count(&heard, "GET /o/"), 3 + 4, "each object once: {heard:?}");
+        first.ahead(&selected).unwrap();
+        second.ahead(&selected).unwrap();
+        let started = Instant::now();
+        while !crate::access::whole(&store, &manifest.id(), &[]) {
+            assert!(started.elapsed() < Duration::from_secs(60), "never landed: {heard:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(count(&heard, "GET /o/"), 2 + objects.len(), "each object once: {heard:?}");
         let asked = heard.lock().unwrap().len();
-        let warm = call(3);
-        warm.wait(&manifest.id(), &objects).unwrap();
-        let mut channel = channel(warm.channel().unwrap());
-        let rows: Vec<Value> = objects.iter().map(|o| json!({"sha256": o.sha256, "length": o.length})).collect();
-        let waited = ask(&mut channel, json!({"id": 1, "op": "wait", "manifest": manifest.id(), "objects": rows}));
-        assert_eq!(waited, json!({"id": 1, "result": null}));
+        call(3).ahead(&selected).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
         assert_eq!(heard.lock().unwrap().len(), asked, "a warm call asks the Hub nothing");
         let _ = fs::remove_dir_all(&bench.root);
     }
 
-    /// What a call's executor schedules downloads only while the call lives: its end (or its
-    /// run's cancel) closes the channel, fails its waits and drops its tickets, and the fetcher
-    /// stops. What landed stays.
+    /// What a call wants downloads only while the call lives: its end (or its run's cancel)
+    /// drops its tickets, and the fetcher stops. What landed stays.
     #[test]
     fn an_ended_call_drops_its_tickets() {
         let bench = Bench::new();
@@ -2758,17 +2786,12 @@ pub(crate) mod tests {
         bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
         let store = bench.publisher.store().clone();
         let objects = chunks(&store, &manifest);
-        let fetch = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub.clone()), vec![manifest.id()], 7);
-        let mut channel = channel(fetch.channel().unwrap());
-        let rows: Vec<Value> = objects.iter().map(|o| json!({"sha256": o.sha256, "length": o.length})).collect();
-        let scheduled = ask(&mut channel, json!({"id": 1, "op": "schedule", "manifest": manifest.id(), "objects": rows, "rank": 0}));
-        assert_eq!(scheduled, json!({"id": 1, "result": null}));
-        while count(&heard, "GET /o/") < 3 + 2 {
+        let fetch = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub.clone()), 7);
+        fetch.ahead(&[(manifest.id(), vec!["model".to_string()])]).unwrap();
+        while count(&heard, "GET /o/") < 2 + 2 {
             std::thread::sleep(Duration::from_millis(5));
         }
         fetch.end();
-        let waited = ask(&mut channel, json!({"id": 2, "op": "wait", "manifest": manifest.id(), "objects": rows}));
-        assert_ne!(waited, json!({"id": 2, "result": null}), "a wait after the end never answers present");
         // Every request went out at once and each answer takes 100 ms: the ones on the wire stop.
         let landed = || objects.iter().filter(|o| crate::storage::present(&store, o)).count();
         std::thread::sleep(Duration::from_millis(300));
@@ -2776,7 +2799,7 @@ pub(crate) mod tests {
         std::thread::sleep(Duration::from_millis(700));
         assert_eq!(landed(), at_end, "nothing lands once its tickets dropped");
         assert!(at_end < objects.len(), "{at_end} of {} landed: it stopped short", objects.len());
-        assert!(crate::storage::present(&store, &manifest), "the structure stays");
+        assert!(crate::storage::present(&store, &manifest), "the header stays");
         let _ = fs::remove_dir_all(&bench.root);
     }
 
@@ -2791,14 +2814,14 @@ pub(crate) mod tests {
         let store = bench.publisher.store().clone();
         let selected = [(manifest.id(), vec!["model".to_string()])];
         assert!(!crate::access::whole(&store, &manifest.id(), &selected[0].1));
-        let member = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub.clone()), vec![manifest.id()], u64::MAX);
+        let member = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub.clone()), u64::MAX);
         member.keep(&selected).unwrap();
         let started = Instant::now();
         while !crate::access::whole(&store, &manifest.id(), &selected[0].1) {
             assert!(started.elapsed() < Duration::from_secs(60), "never downloaded: {heard:?}");
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(count(&heard, "GET /o/"), 3 + 3);
+        assert_eq!(count(&heard, "GET /o/"), 2 + chunks(&store, &manifest).len());
         let _ = fs::remove_dir_all(&bench.root);
     }
 
@@ -2836,7 +2859,7 @@ pub(crate) mod tests {
         let config = serde_json::from_value(json!({"devices": "GPU-test-0", "authorized_device_limit_bytes": null, "prespawn": true})).unwrap();
         let pool = Pool::new(&bench.root.join("gpu"), config, store.clone()).unwrap();
         let engine = crate::execution::Engine::open(&bench.root.join("execution")).unwrap();
-        let fetch = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub), plan.manifests(), u64::MAX);
+        let fetch = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub), u64::MAX);
         pool.set_members("alice", vec![Member::new(held, Some(plan), Level::Downloaded, Some(fetch))]);
         pool.keep(&engine, "alice");
         let [(level, held_back)] = pool.members("alice")[..] else { panic!("one member") };
@@ -2849,40 +2872,35 @@ pub(crate) mod tests {
         }
         assert_eq!(pool.members("alice"), [(Level::Downloaded, "")]);
         assert!(pool.levels().is_empty(), "nothing imports or starts");
-        assert_eq!(count(&heard, "GET /o/"), 3 + 3, "each object once");
+        assert_eq!(count(&heard, "GET /o/"), 2 + chunks(&store, &manifest).len(), "each object once");
         assert_eq!(count(&later_heard, "GET /o/"), structure, "the on-demand model: none");
         pool.stop().unwrap();
         let _ = fs::remove_dir_all(&bench.root);
     }
 
     /// A call's weights come from its preparation on (Next, smallest component first) before its
-    /// executor can ask, and keep coming while its first channel is open: nothing is dropped as
-    /// the executor takes over. Once that channel closes, the preparation's fetches end.
+    /// executor reads them, and keep coming while the call lives: nothing is dropped as it takes
+    /// over. Once the call ends, the preparation's fetches end.
     #[test]
-    fn a_calls_preparation_fetches_ahead_until_its_first_channel_closes() {
+    fn a_calls_preparation_fetches_ahead_until_the_call_ends() {
         let bench = Bench::new();
         let manifest = checkpoint(&bench.source, 4, 10);
         let (hub, named, _) = bench.hub("acme/ahead", &manifest, 100);
         bench.publisher.structure(&hub, std::slice::from_ref(&named), &Job::default()).unwrap();
         let store = bench.publisher.store().clone();
         let machine = bench.publisher.machine().clone();
-        let ahead = crate::access::Fetch::new(machine.clone(), Some(hub.clone()), vec![manifest.id()], 3);
+        let ahead = crate::access::Fetch::new(machine.clone(), Some(hub.clone()), 3);
         ahead.ahead(&[(manifest.id(), vec!["model".to_string()])]).unwrap();
-        let call = crate::access::Fetch::new(machine, Some(hub), vec![manifest.id()], 3);
+        let call = crate::access::Fetch::new(machine, Some(hub), 3);
         call.replaces(Some(ahead.clone()));
-        let channel = call.channel().unwrap();
         let started = Instant::now();
         while !crate::access::whole(&store, &manifest.id(), &[]) {
             assert!(started.elapsed() < Duration::from_secs(60), "the preparation's fetches stopped");
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(ahead.channel().is_ok(), "the preparation's fetches last while the first channel is open");
-        drop(channel);
-        let started = Instant::now();
-        while ahead.channel().is_ok() {
-            assert!(started.elapsed() < Duration::from_secs(10), "the first channel closed and they went on");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(!ahead.ended());
+        drop(call);
+        assert!(ahead.ended(), "the call ended and they went on");
         let _ = fs::remove_dir_all(&bench.root);
     }
 
@@ -2907,7 +2925,7 @@ pub(crate) mod tests {
 
         /// `new`, its package declaring `entrypoints`.
         pub(crate) fn with(package: &str, gpus: &[(&str, u64)], entrypoints: Value, lanes: &[&str]) -> Self {
-            use crate::derive::tests::{checkpoint as tensors, f32s};
+            use crate::adapter::tests::{checkpoint as tensors, f32s};
             let root = std::env::temp_dir().join(format!("cm-precision-{}", uuid::Uuid::new_v4()));
             let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
             let store = crate::storage::open(&root.join("store")).unwrap();
@@ -2930,12 +2948,12 @@ pub(crate) mod tests {
                 generation: identity, package: package.into(), release: "1.0.0".into(),
                 interface: serde_json::to_vec(&interface).unwrap(), hub: String::new() }).unwrap();
             let source = crate::storage::open(&root.join("source")).unwrap();
-            let model = |repository: &str, lane: &str, manifest| names_hub::Model { repository: repository.into(),
-                release: "1.0.0".into(), lane: lane.into(), manifest };
+            let model = |repository: &str, lane: &str, header| names_hub::Model { repository: repository.into(),
+                release: "1.0.0".into(), lane: lane.into(), header };
             let mut models: Vec<_> = lanes.iter().zip(30u8..).map(|(lane, tag)| {
                 model("acme/model", lane, tensors(&source, &format!("lane-{tag}"), "unet", &[("proj.weight", vec![4, 3], f32s(12, tag.into()))]))
             }).collect();
-            let lanes = models.iter().map(|model| (model.manifest.id(), model.lane.clone())).collect();
+            let lanes = models.iter().map(|model| (model.header.id(), model.lane.clone())).collect();
             let lora = [("proj.lora_A.weight", vec![2, 3], f32s(6, 0.25)), ("proj.lora_B.weight", vec![4, 2], f32s(8, 0.75))];
             models.push(model("acme/lora", "bf16", tensors(&source, "lora", "adapter", &lora)));
             let (origin, heard) = names_hub::models(&source, models);
@@ -2972,6 +2990,105 @@ pub(crate) mod tests {
             let _ = self.service.pool().unwrap().stop();
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn local_alias_machine(default: Option<String>) -> Machine {
+        let mut slot = json!({"path": "render.models.source", "class": "M", "weights": true});
+        if let Some(default) = default { slot["default"] = json!(default); }
+        Machine::with("acme/pkg", &[], json!([{"name": "render", "accelerator": false, "models": [slot]}]), &[])
+    }
+
+    fn local_alias_request(machine: &Machine, choices: Vec<domain::ModelChoice>) -> Request {
+        Request { run: String::new(), source: machine.hub.clone(), package: machine.installation.package.clone(),
+            release: "1.0.0".into(), installed: Some(machine.installation.clone()), owner: "acme".into(),
+            catalog_revision: "same-catalog".into(), providers: Providers::default(), entrypoint: "render".into(),
+            choices, gpus: 0, bits: 0, imports: false }
+    }
+
+    fn local_alias_header(machine: &Machine, tag: u8) -> ObjectRef {
+        crate::adapter::tests::checkpoint(machine.publisher.store(), &format!("local-{tag}"), "model",
+            &[("weight", vec![4], crate::adapter::tests::f32s(4, f32::from(tag)))])
+    }
+
+    #[test]
+    fn local_alias_active_calls_follow_replacement_and_removal_without_hub_reads() {
+        let machine = local_alias_machine(None);
+        let (first, second) = (local_alias_header(&machine, 19), local_alias_header(&machine, 23));
+        let store = machine.publisher.store();
+        storage::set_local(store, "seed", &first, &BTreeMap::new()).unwrap();
+        let request = local_alias_request(&machine, vec![domain::ModelChoice {
+            parameter: "source".into(), repository: "local/seed".into(), ..Default::default() }]);
+        let prepare = || machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).unwrap().plan.unwrap();
+        let a = prepare();
+        assert_eq!(a.sources[0].manifest, first.id());
+        assert_eq!(a.sources[0].repository, "local/seed");
+        assert_eq!(prepare().id, a.id, "unchanged header retains exact plan identity");
+        storage::set_local(store, "seed", &second, &BTreeMap::new()).unwrap();
+        let b = prepare();
+        assert_eq!(b.sources[0].manifest, second.id(), "same request/catalog must read the replaced alias");
+        assert_ne!(b.id, a.id);
+        storage::set_local(store, "seed", &first, &BTreeMap::new()).unwrap();
+        assert_eq!(prepare().id, a.id);
+        store.update_ref("local/seed", |_| None).unwrap();
+        let error = machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).err().unwrap();
+        assert_eq!(error.0, "model_resolution_failed");
+        assert!(machine.heard.lock().unwrap().is_empty(), "local aliases never read the fixture Hub");
+    }
+
+    #[test]
+    fn local_alias_declared_defaults_refresh_their_held_grants() {
+        let machine = local_alias_machine(Some("local/seed".into()));
+        let (first, second) = (local_alias_header(&machine, 29), local_alias_header(&machine, 31));
+        let store = machine.publisher.store();
+        storage::set_local(store, "seed", &first, &BTreeMap::new()).unwrap();
+        let request = local_alias_request(&machine, vec![]);
+        let prepare = || machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).unwrap().plan.unwrap();
+        let a = prepare();
+        storage::set_local(store, "seed", &second, &BTreeMap::new()).unwrap();
+        let b = prepare();
+        assert_eq!(a.sources[0].manifest, first.id());
+        assert_eq!(b.sources[0].manifest, second.id());
+        assert_ne!(a.id, b.id);
+        assert!(machine.heard.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_alias_explicit_variants_and_ambiguity_are_resolved_by_tensorfs() {
+        let machine = local_alias_machine(None);
+        let (first, second) = (local_alias_header(&machine, 37), local_alias_header(&machine, 41));
+        let store = machine.publisher.store();
+        let mut tree = tensorfs::format::Tree::default();
+        for (variant, header) in [("f32", &first), ("other", &second)] {
+            tree.set_variant(variant, header.clone());
+        }
+        let tree = store.put_tree(&tree).unwrap();
+        store.update_ref("local/multi", |old| Some(tensorfs::fetch::with_tree(old, "local/multi", &tree, Some("v1")))).unwrap();
+        let mut request = local_alias_request(&machine, vec![domain::ModelChoice {
+            parameter: "source".into(), repository: "local/multi".into(), release: "v1".into(), lane: "f32".into(),
+            ..Default::default() }]);
+        let a = machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).unwrap().plan.unwrap();
+        assert_eq!(a.sources[0].manifest, first.id());
+        assert_eq!(a.sources[0].lane, "f32");
+        for variant in ["absent", ""] {
+            request.choices[0].lane = variant.into();
+            assert_eq!(machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).err().unwrap().0,
+                "model_resolution_failed");
+        }
+        assert!(machine.heard.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_alias_cache_bypass_leaves_an_explicit_immutable_header_cached() {
+        let machine = local_alias_machine(Some("local/seed".into()));
+        let header = local_alias_header(&machine, 43);
+        let reference = domain::Ref { digest: sha256::digest(&machine.publisher.store().read(&header).unwrap()).to_vec(), length: header.length };
+        let request = local_alias_request(&machine, vec![domain::ModelChoice {
+            parameter: "source".into(), manifest: Some(reference), ..Default::default() }]);
+        let first = machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).unwrap().plan.unwrap();
+        let held = machine.publisher.held(&machine.service, "alice", &request).unwrap().unwrap().plan.unwrap();
+        assert_eq!(first.id, held.id);
+        assert_eq!(held.sources[0].manifest, header.id());
+        assert!(machine.heard.lock().unwrap().is_empty());
     }
 
     const GIB: u64 = 1 << 30;

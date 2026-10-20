@@ -134,13 +134,6 @@ pub fn http(ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal> {
     pooled(&CLIENTS, ca_der)
 }
 
-/// [`http`] for calls on TensorFS's fetch runtime: a client's connections live on the runtime
-/// that opened them, so each runtime has its own.
-pub(crate) fn fetch_http(ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal> {
-    static CLIENTS: Mutex<Vec<(Option<Vec<u8>>, reqwest::Client)>> = Mutex::new(Vec::new());
-    pooled(&CLIENTS, ca_der)
-}
-
 type Pool = Mutex<Vec<(Option<Vec<u8>>, reqwest::Client)>>;
 
 fn pooled(pool: &Pool, ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal> {
@@ -328,10 +321,7 @@ pub struct Catalog {
     origin: String,
     host: String,
     hub: hub_client::Client,
-    /// The Hub as the run's capability, for an operation it names.
-    run: Option<hub_client::Client>,
     credential: Option<Presenter>,
-    ca_der: Option<Vec<u8>>,
 }
 
 impl Catalog {
@@ -345,9 +335,7 @@ impl Catalog {
             origin,
             host,
             hub,
-            run: None,
             credential: None,
-            ca_der: source.ca_der.clone(),
         })
     }
 
@@ -374,8 +362,6 @@ impl Catalog {
         match &source.capability {
             Some(capability) if capability.names(op) => {
                 let http = http(source.ca_der.as_deref()).map_err(|e| ("catalog_read_failed", e.0))?;
-                let credential = Credential::Run(capability.run.clone());
-                catalog.run = Some(hub_client::Client::connect(&source.origin, http.clone(), credential));
                 catalog.credential = Some(Presenter {
                     capability: capability.clone(),
                     host: catalog.host.clone(),
@@ -402,16 +388,6 @@ impl Catalog {
     /// Whether its calls present the run's capability.
     pub(crate) fn presents(&self) -> bool {
         self.credential.is_some()
-    }
-
-    /// The CA the Hub's grant names, beyond the public roots (DER).
-    pub(crate) fn ca(&self) -> Option<&[u8]> {
-        self.ca_der.as_deref()
-    }
-
-    /// The Hub as the run's capability, when it names this operation.
-    pub(crate) fn run(&self) -> Option<&hub_client::Client> {
-        self.run.as_ref()
     }
 
     /// Headers presenting the capability on `method url`; none off the Hub host.

@@ -408,11 +408,8 @@ impl Service {
     }
     /// Caches manage themselves (`reclaim`): a TTL and a low disk, never a purge verb.
     pub fn reclaim(&self) -> crate::reclaim::Swept {
-        // Released Write roots first, so the store's GC can collect their bytes.
+        // Run objects no unfinished run needs go first.
         if let Some(calls) = self.calls() {
-            if let Err(error) = calls.sweep_canceled_outputs(&self.engine) {
-                tracing::warn!("reclaim canceled native outputs: {error}");
-            }
             if let Err(error) = calls.sweep_objects() {
                 tracing::warn!("reclaim object roots: {error}");
             }
@@ -435,14 +432,6 @@ impl Service {
                 kernels: kernels.as_ref(),
                 memo: pool.as_ref().map(|pool| pool.memo()),
                 uv_cache: uv_cache.as_deref(),
-                store: match publisher.as_ref().map(|publisher| publisher.caches(self)) {
-                    Some(Ok(caches)) => Some(caches),
-                    Some(Err(error)) => {
-                        tracing::warn!("reclaim: no store GC this pass, its keep list failed: {error}");
-                        None
-                    }
-                    None => None,
-                },
                 disk: &|| crate::reclaim::measure(&self.engine.root),
             })
         };

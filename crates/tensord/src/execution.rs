@@ -198,6 +198,10 @@ impl Engine {
     pub fn workspace_id(&self) -> String {
         self.journal.lock().unwrap().workspace_id().into()
     }
+    /// The run objects' store (`cas`), beside the journal.
+    pub fn cas(&self) -> crate::cas::Cas {
+        crate::cas::Cas::new(self.root.join("objects"))
+    }
     pub fn installation(
         &self,
         actor: &str,
@@ -1499,7 +1503,7 @@ mod tests {
         let disk = || Ok(crate::reclaim::Disk { capacity: 1 << 30, available: 0, inodes: 0, available_inodes: 0 });
         let swept = crate::reclaim::sweep(&crate::reclaim::Caches {
             engine: &engine, catalog: &catalog, bound: &bound, kernels: None, memo: None,
-            uv_cache: None, store: None, disk: &disk,
+            uv_cache: None, disk: &disk,
         }).unwrap();
         assert_eq!(swept.results, 0);
         assert_eq!(held.len(), 3);

@@ -1,11 +1,11 @@
-//! The models this machine's store holds, for Status: each local model (`local/<name>` refs)
-//! and each Hub checkpoint it pulled (`model-` pins), with what it weighs. A listing is read
+//! The models this machine's store holds, for Status: each local model (`local/<name>`) and
+//! each Hub checkpoint it pulled (cached Hub refs), with what it weighs. A listing is read
 //! again only when the set of models changed, not when one was merely used.
 use crate::api::v1;
 use crate::storage::{self, Store};
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
+    io,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -18,21 +18,61 @@ pub struct Listing {
     pub bytes: u64,
 }
 
-/// What a `model-` pin's owner records: the checkpoint as the Hub named it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A Hub checkpoint this machine pulled: `lane` of `tree`, `repository`'s release `release`
+/// (empty: the owner's tree by hash). The store's ref of the repository records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pulled {
     pub repository: String,
     pub release: String,
     pub lane: String,
+    pub tree: ObjectRef,
 }
 
 impl Pulled {
-    pub fn owner(&self) -> String {
-        serde_json::to_string(self).expect("plain strings")
+    /// Names the pull in the store: `repository`'s ref, a cache TensorFS may expire. The tree
+    /// must be here. One the ref already names writes nothing.
+    pub fn record(&self, store: &Store) -> io::Result<()> {
+        let release = (!self.release.is_empty()).then_some(self.release.as_str());
+        let held = store.get_ref(&self.repository).map_err(storage::io_error)?;
+        let names = |repo: &tensorfs::format::Repo| match release {
+            Some(release) => repo.release(Some(release)).is_some_and(|r| r.tree == self.tree),
+            None => repo.roots().any(|tree| *tree == self.tree),
+        };
+        if held.as_ref().is_some_and(names) {
+            return Ok(());
+        }
+        let named = store
+            .update_ref(&self.repository, |old| Some(tensorfs::fetch::with_tree(old, &self.repository, &self.tree, release)))
+            .map_err(storage::io_error)?;
+        match named {
+            Some(repo) => store.cache_ref(&repo).map_err(storage::io_error),
+            None => Ok(()),
+        }
+    }
+
+    /// The Hub checkpoint `header` is, as this machine pulled it; None for one never pulled.
+    pub fn of(store: &Store, header: &ObjectRef) -> io::Result<Option<Pulled>> {
+        for repo in store.refs().map_err(storage::io_error)? {
+            if repo.name.starts_with("local/") {
+                continue;
+            }
+            let releases = repo.releases.iter().map(|r| (r.version.as_str(), &r.tree));
+            for (release, tree) in releases.chain(repo.checkpoints.iter().map(|tree| ("", tree))) {
+                let Ok(parsed) = store.tree(tree) else {
+                    continue;
+                };
+                let lane = parsed.variants().find(|(_, h)| *h == header).map(|(lane, _)| lane.to_string());
+                if let Some(lane) = lane {
+                    let (repository, release) = (repo.name.clone(), release.to_string());
+                    return Ok(Some(Pulled { repository, release, lane, tree: tree.clone() }));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 
-/// Each model's rows: repository, release, lane, manifest.
+/// Each model's rows: repository, release, lane, header.
 type Seen = Vec<(String, String, String, ObjectRef)>;
 
 static LAST: Mutex<Option<(PathBuf, Seen, Listing)>> = Mutex::new(None);
@@ -67,30 +107,18 @@ pub fn listing(root: &Path) -> Listing {
 fn seen(store: &Store) -> std::io::Result<Seen> {
     let mut seen = Seen::new();
     for repo in store.refs().map_err(storage::io_error)? {
-        for release in &repo.releases {
-            for (lane, manifest) in &release.lanes {
-                let release = if repo.name.starts_with("local/") { "" } else { release.version.as_str() };
-                seen.push((repo.name.clone(), release.into(), lane.clone(), manifest.clone()));
+        let local = repo.name.starts_with("local/");
+        let releases = repo.releases.iter().map(|r| (r.version.as_str(), &r.tree));
+        for (release, tree) in releases.chain(repo.checkpoints.iter().map(|tree| ("", tree))) {
+            let Ok(tree) = store.tree(tree) else {
+                continue;
+            };
+            let release = if local { "" } else { release };
+            // A Hub tree names every lane its release publishes: the ones pulled are here.
+            for (variant, header) in tree.variants().filter(|(_, h)| storage::present(store, h)) {
+                seen.push((repo.name.clone(), release.into(), variant.into(), header.clone()));
             }
         }
-    }
-    // Only the pulled checkpoints' pins are read: Status asks every second, and run objects
-    // can number thousands.
-    let mut ids: Vec<String> = std::fs::read_dir(store.root().join("pins"))?
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.strip_suffix(".json").map(str::to_string))
-        .filter(|id| id.starts_with("model-"))
-        .collect();
-    ids.sort();
-    for id in ids {
-        let Some(pin) = store.get_pin(&id).map_err(storage::io_error)? else {
-            continue;
-        };
-        let Some(manifest) = pin.roots.first() else {
-            continue;
-        };
-        let pulled: Pulled = pin.owner.as_deref().and_then(|o| serde_json::from_str(o).ok()).unwrap_or_default();
-        seen.push((pulled.repository, pulled.release, pulled.lane, manifest.clone()));
     }
     seen.sort();
     Ok(seen)
@@ -100,8 +128,8 @@ fn list(store: &Store, seen: &Seen) -> std::io::Result<Listing> {
     let mut closures: BTreeMap<&str, Vec<ObjectRef>> = BTreeMap::new();
     let mut holders: HashMap<ObjectRef, usize> = HashMap::new();
     let mut models: Vec<v1::Model> = vec![];
-    for (repository, release, lane, manifest) in seen {
-        let closure = store.closure(manifest).map_err(storage::io_error)?;
+    for (repository, release, lane, header) in seen {
+        let closure = store.closure(header).map_err(storage::io_error)?;
         let held: Vec<ObjectRef> = closure.into_iter().filter(|o| storage::present(store, o)).collect();
         let entry = closures.entry(repository).or_default();
         for object in held {
@@ -115,7 +143,7 @@ fn list(store: &Store, seen: &Seen) -> std::io::Result<Listing> {
         models.last_mut().expect("pushed").checkpoints.push(v1::Checkpoint {
             release: release.clone(),
             lane: lane.clone(),
-            manifest: manifest.id(),
+            manifest: header.id(),
             yanked: false,
         });
     }
@@ -132,21 +160,25 @@ fn list(store: &Store, seen: &Seen) -> std::io::Result<Listing> {
     Ok(Listing { models, bytes: holders.keys().map(|o| o.length).sum() })
 }
 
-/// A store with two models that share one object: `acme/base` (release 1.0.0, lane fp8),
-/// pulled, and the local model `local/mine`. Tests of the listing and of Status build on it.
+/// A store with two models that share one object (an asset): `acme/base` (release 1.0.0, lane
+/// fp8), pulled, and the local model `local/mine`. Tests of the listing and of Status build on it.
 pub fn fixture(root: &Path) -> std::io::Result<()> {
-    use tensorfs::format::{Manifest, Metadata};
+    use tensorfs::writer::{Data, Source};
     let store = storage::open(root)?;
-    let put = |body: &[u8]| store.put_bytes(body).map_err(storage::io_error);
-    let (shared, base, mine) = (put(&[1; 1000])?, put(&[2; 300])?, put(&[3; 50])?);
-    let manifest = |files: [(&str, ObjectRef); 2]| -> std::io::Result<ObjectRef> {
-        let files = files.into_iter().map(|(path, object)| (path.to_string(), object)).collect();
-        put(&Manifest { files, metadata: Metadata::new() }.to_json().map_err(std::io::Error::other)?)
+    let model = |key: &str, tensor: &[u8]| -> std::io::Result<ObjectRef> {
+        let mut writer = store.writer(None, Some(key)).map_err(storage::io_error)?;
+        let mut unet = writer.component("unet", "", Default::default(), None).map_err(storage::io_error)?;
+        unet.asset("tokenizer.json", &[1; 1000]).map_err(storage::io_error)?;
+        let shape = [tensor.len() as u64];
+        unet.put("w", &tensorfs::format::Dtype::U8, &shape, Data::Plain(Source::Read(&mut &tensor[..]))).map_err(storage::io_error)?;
+        writer.commit().map_err(storage::io_error)
     };
-    let acme = manifest([("a", shared.clone()), ("b", base)])?;
-    let pulled = Pulled { repository: "acme/base".into(), release: "1.0.0".into(), lane: "fp8".into() };
-    storage::hold(&store, &storage::pin::model(&acme.sha256), vec![acme], Some(pulled.owner()))?;
-    storage::set_local(&store, "mine", &manifest([("a", shared), ("c", mine)])?)
+    let acme = model("acme", &[2; 300])?;
+    let mut tree = tensorfs::format::Tree::default();
+    tree.set_variant("fp8", acme);
+    let tree = store.put_tree(&tree).map_err(storage::io_error)?;
+    Pulled { repository: "acme/base".into(), release: "1.0.0".into(), lane: "fp8".into(), tree }.record(&store)?;
+    storage::set_local(&store, "mine", &model("mine", &[3; 50])?, &Default::default()).map(drop)
 }
 
 #[cfg(test)]
@@ -160,30 +192,34 @@ mod tests {
         assert_eq!(listing(&root), Listing::default(), "no store, no models");
         fixture(&root).unwrap();
         let held = listing(&root);
-        let manifests: Vec<u64> = held
+        // Each model's own bytes: its header and its chunk.
+        let store = Store::open(&root).unwrap();
+        let own: Vec<u64> = held
             .models
             .iter()
-            .map(|m| storage::held(&Store::open(&root).unwrap(), &m.checkpoints[0].manifest).unwrap().length)
+            .map(|m| {
+                let header = storage::held(&store, &m.checkpoints[0].manifest).unwrap();
+                let checkpoint = store.checkpoint(&header).unwrap();
+                header.length + checkpoint.header().chunks.iter().map(|c| c.length).sum::<u64>()
+            })
             .collect();
         let rows: Vec<_> = held
             .models
             .iter()
             .map(|m| (m.repository.as_str(), m.total_bytes, m.unique_bytes))
             .collect();
-        assert_eq!(
-            rows,
-            [("acme/base", 1300 + manifests[0], 300 + manifests[0]), ("local/mine", 1050 + manifests[1], 50 + manifests[1])]
-        );
-        assert_eq!(held.bytes, 1350 + manifests[0] + manifests[1], "the shared object counts once");
+        assert_eq!(rows, [("acme/base", 1000 + own[0], own[0]), ("local/mine", 1000 + own[1], own[1])]);
+        assert_eq!(held.bytes, 1000 + own[0] + own[1], "the shared asset counts once");
         let release = &held.models[0].checkpoints[0];
         assert_eq!((release.release.as_str(), release.lane.as_str()), ("1.0.0", "fp8"));
         assert!(release.manifest.starts_with("sha256:") && !release.yanked);
         assert_eq!(held.models[1].checkpoints[0].release, "", "a local model has no release");
         // A use answers from the last read; a removed model is seen.
-        let store = Store::open(&root).unwrap();
         let acme = storage::held(&store, &release.manifest).unwrap();
-        store.touch_pin(&storage::pin::model(&acme.sha256)).unwrap();
+        drop(store.checkpoint(&acme).unwrap());
         assert_eq!(listing(&root), held);
+        let pulled = Pulled::of(&store, &acme).unwrap().unwrap();
+        assert_eq!((pulled.repository.as_str(), pulled.release.as_str(), pulled.lane.as_str()), ("acme/base", "1.0.0", "fp8"));
         store.update_ref("local/mine", |_| None).unwrap();
         assert_eq!(listing(&root).models.len(), 1);
         std::fs::remove_dir_all(&root).unwrap();

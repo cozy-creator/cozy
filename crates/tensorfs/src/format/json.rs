@@ -1,6 +1,6 @@
 //! Strict reads and deterministic writes, for the manifest and the repo (JSON documents).
 //!
-//! Read: one JSON object, no duplicate keys, integers only (fitting i64 or u64); the typed
+//! Read: one JSON object, no null or duplicate keys, integers only (fitting i64 or u64); the typed
 //! layer then ignores unknown fields. Write: sorted keys (byte order), no whitespace, integers
 //! only, serde_json's string escaping (the same as Python's `json.dumps(ensure_ascii=False)`).
 
@@ -96,7 +96,7 @@ impl<'de> Visitor<'de> for Root {
     }
 }
 
-/// Walks a value refusing duplicate keys and non-integer numbers, anywhere.
+/// Walks a value refusing null, duplicate keys and non-integer numbers, anywhere.
 struct Strict;
 
 impl<'de> DeserializeSeed<'de> for Strict {
@@ -129,8 +129,8 @@ impl<'de> Visitor<'de> for Strict {
     fn visit_str<E>(self, _: &str) -> std::result::Result<(), E> {
         Ok(())
     }
-    fn visit_unit<E>(self) -> std::result::Result<(), E> {
-        Ok(())
+    fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<(), E> {
+        Err(E::custom("null is not allowed in a tree or repo"))
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<(), A::Error> {
         while seq.next_element_seed(Strict)?.is_some() {}

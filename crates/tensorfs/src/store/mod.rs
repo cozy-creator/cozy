@@ -2,6 +2,10 @@
 //!
 //! `<root>/{format, blobs/<aa>/<bb>/<sha256>, refs/<org>/<name>.json, pins/<id>.json, tmp/}`
 //!
+//! - Objects are trees, cozytensors headers, chunks, assets and repo files. A ref names a
+//!   model's releases of trees; a pin keeps trees or headers. A cozytensors is opened by its
+//!   header ([`Store::checkpoint`]) or a tree's variant ([`Store::variant`]); a plain folder
+//!   enters by [`Store::admit_folder`] and leaves by [`Store::snapshot`].
 //! - One door admits objects ([`Store::admit`], [`Store::put`]): streamed into `tmp/`, hashed,
 //!   checked, flushed per [`Durability`] and renamed into `blobs/`. An object is verified there
 //!   once and trusted after; [`Store::verify`] rehashes on demand.
@@ -12,11 +16,16 @@
 //! - Processes share a store with no leases, markers or boot-time rehash: a torn write never has
 //!   a name, and an open descriptor outlives an unlink.
 
+mod cache;
 mod checkpoint;
+mod folder;
 mod gc;
 mod records;
+pub(crate) mod retention;
 
-pub use checkpoint::{Checkpoint, ChunkRead, Piece, Placed, ReadPlan};
+#[doc(hidden)]
+pub use cache::CacheGuard;
+pub use checkpoint::{wanted, Checkpoint, ChunkRead, Piece, Placed, ReadPlan};
 pub use gc::{Collected, PinUsage, Usage};
 pub(crate) use records::is_name;
 pub use records::Pin;
@@ -35,7 +44,8 @@ use crate::fetch;
 use crate::format::{self, ObjectRef};
 use crate::sha256::{hex, Sha256};
 
-const FORMAT: &str = "tensorfs.store/2";
+/// [`crate::STORE_FORMAT`] as the store's `format` record.
+const FORMAT: &str = "tensorfs.store/3";
 const LAYOUT: [&str; 4] = ["blobs", "refs", "pins", "tmp"];
 
 /// How long an unreferenced object outlives its last write or reuse.
@@ -179,6 +189,8 @@ pub struct Store {
     root: PathBuf,
     durability: Durability,
     grace: Duration,
+    /// Opted-in consumer cache policy; raw and operator stores remain durable.
+    cache_mode: bool,
     /// This handle admitted objects that no `syncfs` covers yet (ephemeral only).
     unsynced: Arc<AtomicBool>,
 }
@@ -188,6 +200,7 @@ impl Store {
     pub fn open(root: impl Into<PathBuf>) -> Result<Store> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(fail("create", &root))?;
+        let root = fs::canonicalize(&root).map_err(fail("resolve", &root))?;
         let record = root.join("format");
         match fs::read(&record) {
             Ok(bytes) => {
@@ -197,6 +210,14 @@ impl Store {
                 }
                 match serde_json::from_slice::<Record>(&bytes) {
                     Ok(found) if same_major(&found.format, FORMAT) => {}
+                    Ok(found) if same_family(&found.format, FORMAT) => {
+                        let why = format!(
+                            "is a {} store from an older TensorFS, which this one cannot read: \
+                             remove it and pull again (tensorfs.store/3 holds trees and D10 headers)",
+                            found.format
+                        );
+                        return Err(invalid(&record, why));
+                    }
                     _ => {
                         let found = String::from_utf8_lossy(&bytes);
                         return Err(invalid(&record, format!("is {found:?}, not {FORMAT}")));
@@ -224,6 +245,7 @@ impl Store {
         Ok(Store {
             durability: Durability::of(&root),
             grace: GRACE,
+            cache_mode: false,
             root,
             unsynced: Arc::default(),
         })
@@ -278,7 +300,11 @@ impl Store {
         if let Some(expect) = expect {
             self.path(expect)?;
         }
+        if !self.cache_maintain(expect.map_or(0, |object| object.length))? {
+            return Err(Error::Full { op: "admit", path: self.root.clone() });
+        }
         let (temp, file) = self.temp("put")?;
+        file.lock_shared().map_err(fail("lock", &temp))?;
         Ok(Admission {
             store: self.clone(),
             expect: expect.cloned(),
@@ -351,6 +377,7 @@ impl Store {
             }
             Err(error) => return Err(fail("open", &path)(error)),
         };
+        file.lock_shared().map_err(fail("lock", &path))?;
         let length = file.metadata().map_err(fail("stat", &path))?.len();
         if length != object.length {
             return Err(Error::Mismatch {
@@ -502,10 +529,10 @@ impl Store {
     fn commit(&self, path: &Path, bytes: &[u8], flush: bool) -> Result<()> {
         let flush = flush && self.flushes();
         let (temp, mut file) = self.temp("record")?;
+        file.lock_shared().map_err(fail("lock", &temp))?;
         let written = file
             .write_all(bytes)
             .and_then(|()| if flush { file.sync_data() } else { Ok(()) });
-        drop(file);
         if let Err(error) = written {
             let _ = fs::remove_file(&temp);
             return Err(fail("write", &temp)(error));
@@ -610,6 +637,11 @@ impl Write for Admission {
                     "longer than the expected object",
                 ));
             }
+        }
+        match self.store.cache_maintain(bytes.len() as u64) {
+            Ok(true) => {}
+            Ok(false) => return Err(io::Error::new(io::ErrorKind::StorageFull, "cache reserve exhausted")),
+            Err(error) => return Err(io::Error::other(error)),
         }
         let file = self
             .file

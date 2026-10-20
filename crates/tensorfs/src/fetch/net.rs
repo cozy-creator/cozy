@@ -7,13 +7,18 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
-use hyper::{Request, Response, Uri};
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
+use hyper::{Method, Request, Response};
+/// The HTTP types the rest of `fetch` names; hyper stays inside this file.
+pub use hyper::{HeaderMap, Uri};
+use tokio::io::AsyncReadExt;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -22,10 +27,8 @@ use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 
 use super::policy::{CheckedUrl, SourcePolicy};
+use super::token::{Request as Presented, TokenProvider};
 use crate::err::{refuse, Code, Refusal, Result};
-
-/// The headers of an answer, for the fetch modules beside the client: hyper is named only here.
-pub(crate) use hyper::HeaderMap;
 
 /// RFC 8305's connection attempt delay: the next address is dialed while the last is silent
 /// this long. A stagger, never a verdict.
@@ -35,6 +38,28 @@ const STAGGER: Duration = Duration::from_millis(250);
 pub(crate) struct Answer {
     pub url: String,
     pub response: Response<Incoming>,
+    /// When a redirect led here: until when its `Cache-Control: max-age` lets `url` be reused.
+    pub until: Option<Instant>,
+}
+
+/// Downloads may retry an exchange failure, but never a caller's credential callback.
+pub(crate) enum GetError {
+    Provider(Refusal),
+    Exchange(Refusal),
+}
+
+impl GetError {
+    pub(crate) fn refusal(self) -> Refusal {
+        match self {
+            Self::Provider(refusal) | Self::Exchange(refusal) => refusal,
+        }
+    }
+}
+
+impl From<Refusal> for GetError {
+    fn from(refusal: Refusal) -> Self {
+        Self::Exchange(refusal)
+    }
 }
 
 impl Answer {
@@ -72,6 +97,45 @@ impl Answer {
     }
 }
 
+/// A request body: bytes, or the first `length` bytes of a file, counted into `sent` as they go.
+pub(crate) enum Body {
+    Bytes(Bytes),
+    File {
+        file: std::fs::File,
+        length: u64,
+        sent: Arc<AtomicU64>,
+    },
+}
+
+impl Body {
+    fn boxed(self) -> BoxBody<Bytes, std::io::Error> {
+        let (file, length, sent) = match self {
+            Body::Bytes(bytes) => return Full::new(bytes).map_err(|never| match never {}).boxed(),
+            Body::File { file, length, sent } => (tokio::fs::File::from_std(file), length, sent),
+        };
+        let frames = futures::stream::unfold((file, length), move |(mut file, left)| {
+            let sent = Arc::clone(&sent);
+            async move {
+                if left == 0 {
+                    return None;
+                }
+                let mut buf = vec![0; left.min(1 << 20) as usize];
+                let (frame, left) = match file.read(&mut buf).await {
+                    Ok(0) => (Err(std::io::ErrorKind::UnexpectedEof.into()), 0),
+                    Ok(n) => {
+                        buf.truncate(n);
+                        sent.fetch_add(n as u64, Ordering::Relaxed);
+                        (Ok(Frame::data(Bytes::from(buf))), left - n as u64)
+                    }
+                    Err(error) => (Err(error), 0),
+                };
+                Some((frame, (file, left)))
+            }
+        });
+        StreamBody::new(frames).boxed()
+    }
+}
+
 /// A POST's answer, read whole.
 pub(crate) struct Posted {
     pub status: u16,
@@ -82,7 +146,7 @@ pub(crate) struct Posted {
 /// The client every fetch uses. Cheap to clone: clones share one connection pool.
 #[derive(Clone)]
 pub struct Client {
-    inner: hyper_util::client::legacy::Client<Connector, Full<Bytes>>,
+    inner: hyper_util::client::legacy::Client<Connector, BoxBody<Bytes, std::io::Error>>,
     policy: SourcePolicy,
 }
 
@@ -134,31 +198,36 @@ impl Client {
     }
 
     /// GET `url`, following redirects the policy allows, each hop checked again. Credentials
-    /// go only to the origin they were given for.
-    pub(crate) async fn get(&self, url: &str, headers: &[(String, String)]) -> Result<Answer> {
+    /// go only to the origin they were given for: another origin gets only the `range`.
+    pub(crate) async fn get_authorized(&self, url: &str, headers: &[(String, String)], provider: Option<&dyn TokenProvider>) -> Result<Answer> {
+        self.get_authorized_attempt(url, headers, provider).await.map_err(|error| match error {
+            GetError::Provider(refusal) | GetError::Exchange(refusal) => refusal,
+        })
+    }
+
+    /// Retain failure origin for the downloader's retry decision; import callers return both.
+    pub(crate) async fn get_authorized_attempt(&self, url: &str, headers: &[(String, String)], mut provider: Option<&dyn TokenProvider>) -> std::result::Result<Answer, GetError> {
         let mut url = url.to_string();
         let mut headers = headers.to_vec();
-        let mut hops = 0;
+        let (mut hops, mut until) = (0, None::<Instant>);
+        let mut challenged = false;
         loop {
-            self.policy.admit(&url)?;
-            let uri: Uri = url.parse().map_err(|_| Refusal {
-                code: Code::SOURCE_NOT_ALLOWED,
-                detail: format!("{url}: not a URL"),
-            })?;
-            let mut request = Request::get(uri.clone()).header("accept-encoding", "identity");
-            for (name, value) in &headers {
-                request = request.header(name.as_str(), value.as_str());
+            let mut presented = headers.clone();
+            if let Some(provider) = provider {
+                presented.extend(provider.headers(&Presented { method: "GET", url: &url, headers: &headers, payload: None }).await.map_err(GetError::Provider)?);
             }
-            let request = request.body(Full::default()).map_err(|error| Refusal {
-                code: Code::SOURCE_NOT_ALLOWED,
-                detail: format!("{url}: {error}"),
-            })?;
-            let response = self
-                .inner
-                .request(request)
-                .await
-                .map_err(|error| refusal(&url, &error))?;
+            let response = self.send("GET", &url, &presented, None).await.map_err(GetError::Exchange)?.response;
+            let uri: Uri = url.parse().expect("sent");
             let status = response.status().as_u16();
+            let sent = Presented { method: "GET", url: &url, headers: &presented, payload: None };
+            let retry = match provider {
+                Some(provider) => provider.retry(&sent, status, response.headers()).map_err(GetError::Provider)?,
+                None => false,
+            };
+            if retry && !challenged {
+                challenged = true;
+                continue;
+            }
             if matches!(status, 301 | 302 | 303 | 307 | 308) {
                 let Some(next) = response
                     .headers()
@@ -168,7 +237,7 @@ impl Client {
                     return refuse(
                         Code::REDIRECT_REFUSED,
                         format!("{url}: {status} without a Location"),
-                    );
+                    ).map_err(GetError::Exchange);
                 };
                 let next = join(&uri, next);
                 hops += 1;
@@ -179,16 +248,19 @@ impl Client {
                             "{url}: redirected to {next}, past the policy's {} hops",
                             self.policy.max_redirects
                         ),
-                    );
+                    ).map_err(GetError::Exchange);
                 }
-                if Uri::try_from(next.as_str())
-                    .ok()
-                    .and_then(|n| n.authority().cloned())
-                    != uri.authority().cloned()
-                {
-                    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
+                if !same_origin(&url, &next) {
+                    headers.retain(|(name, _)| name.eq_ignore_ascii_case("range"));
+                    provider = None;
                 }
+                let age = max_age(response.headers()).map(|age| Instant::now() + age);
+                until = match (until, age) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
                 url = next;
+                challenged = false;
                 continue;
             }
             if let Some(encoding) = response
@@ -198,11 +270,47 @@ impl Client {
             {
                 if !encoding.trim().is_empty() && !encoding.trim().eq_ignore_ascii_case("identity")
                 {
-                    return refuse(Code::TRANSFER_FAILED, format!("{url}: the origin sent content-encoding {encoding:?} against `accept-encoding: identity`"));
+                    return refuse(Code::TRANSFER_FAILED, format!("{url}: the origin sent content-encoding {encoding:?} against `accept-encoding: identity`")).map_err(GetError::Exchange);
                 }
             }
-            return Ok(Answer { url, response });
+            return Ok(Answer { url, response, until });
         }
+    }
+
+    /// One request, redirects not followed: `body` (none: empty) with `headers`.
+    pub(crate) async fn send(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<Body>,
+    ) -> Result<Answer> {
+        self.policy.admit(url)?;
+        let bad = |detail: String| Refusal {
+            code: Code::SOURCE_NOT_ALLOWED,
+            detail,
+        };
+        let uri: Uri = url.parse().map_err(|_| bad(format!("{url}: not a URL")))?;
+        let method = Method::from_bytes(method.as_bytes()).map_err(|e| bad(format!("{method}: {e}")))?;
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("accept-encoding", "identity");
+        for (name, value) in headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let body = body.unwrap_or(Body::Bytes(Bytes::new())).boxed();
+        let request = request.body(body).map_err(|e| bad(format!("{url}: {e}")))?;
+        let response = self
+            .inner
+            .request(request)
+            .await
+            .map_err(|error| refusal(url, &error))?;
+        Ok(Answer {
+            url: url.to_string(),
+            response,
+            until: None,
+        })
     }
 
     /// POST `body` (JSON) to `url`, credentials in `headers`; redirects are not followed. The
@@ -214,33 +322,10 @@ impl Client {
         body: Vec<u8>,
         cap: u64,
     ) -> Result<Posted> {
-        self.policy.admit(url)?;
-        let uri: Uri = url.parse().map_err(|_| Refusal {
-            code: Code::SOURCE_NOT_ALLOWED,
-            detail: format!("{url}: not a URL"),
-        })?;
-        let mut request = Request::post(uri)
-            .header("content-type", "application/json")
-            .header("accept-encoding", "identity");
-        for (name, value) in headers {
-            request = request.header(name.as_str(), value.as_str());
-        }
-        let request = request
-            .body(Full::new(Bytes::from(body)))
-            .map_err(|error| Refusal {
-                code: Code::SOURCE_NOT_ALLOWED,
-                detail: format!("{url}: {error}"),
-            })?;
-        let response = self
-            .inner
-            .request(request)
-            .await
-            .map_err(|error| refusal(url, &error))?;
-        let (status, headers) = (response.status().as_u16(), response.headers().clone());
-        let mut answer = Answer {
-            url: url.to_string(),
-            response,
-        };
+        let mut headers = headers.to_vec();
+        headers.push(("content-type".into(), "application/json".into()));
+        let mut answer = (self.send("POST", url, &headers, Some(Body::Bytes(body.into())))).await?;
+        let (status, headers) = (answer.status(), answer.response.headers().clone());
         let mut body = Vec::new();
         while let Some(frame) = answer.frame().await? {
             body.extend_from_slice(&frame);
@@ -254,39 +339,22 @@ impl Client {
             body,
         })
     }
+}
 
-    /// A small document read whole: its bytes on a 2xx, `REF_NOT_FOUND` on 404/410.
-    pub(crate) async fn document(
-        &self,
-        url: &str,
-        headers: &[(String, String)],
-        cap: u64,
-    ) -> Result<Vec<u8>> {
-        let mut answer = self.get(url, headers).await?;
-        match answer.status() {
-            200..=299 => {}
-            404 | 410 => return refuse(Code::REF_NOT_FOUND, format!("{url}: {}", answer.status())),
-            401 | 403 => {
-                return refuse(
-                    Code::CREDENTIAL_REQUIRED,
-                    format!("{url}: {}", answer.status()),
-                )
-            }
-            status => return refuse(Code::HUB_REFUSED, format!("{url}: {status}")),
-        }
-        let mut bytes = Vec::new();
-        while let Some(frame) = answer.frame().await? {
-            bytes.extend_from_slice(&frame);
-            if bytes.len() as u64 > cap {
-                return refuse(Code::SIZE_CAP, format!("{url}: over {cap} B"));
-            }
-        }
-        Ok(bytes)
-    }
+pub(crate) fn same_origin(a: &str, b: &str) -> bool {
+    let origin = |url: &str| url.parse::<Uri>().ok().map(|url| (url.scheme_str().map(str::to_owned), url.authority().cloned()));
+    origin(a) == origin(b)
+}
+
+/// A response's `Cache-Control: max-age`.
+pub(crate) fn max_age(headers: &HeaderMap) -> Option<Duration> {
+    let control = headers.get("cache-control")?.to_str().ok()?;
+    let age = control.split(',').find_map(|d| d.trim().strip_prefix("max-age="))?;
+    age.trim().parse().ok().map(Duration::from_secs)
 }
 
 /// `location` against the URL that answered with it.
-fn join(base: &Uri, location: &str) -> String {
+pub(crate) fn join(base: &Uri, location: &str) -> String {
     if location.starts_with("http://") || location.starts_with("https://") {
         return location.to_string();
     }

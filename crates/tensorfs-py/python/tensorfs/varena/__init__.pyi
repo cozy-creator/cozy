@@ -7,15 +7,22 @@ long as any tensor made from it. Eviction unmaps only unpinned pages whose fill 
 events completed. Copies run on varena's own stream; the bind stream waits on an event and the
 host never syncs. `Host` is the CPU core: the same sets, as host memory, and it never loads
 libcuda.
-
-`scripts/stub_conform.py` holds this stub against the compiled `tensorfs._ext.varena`, name for
-name and parameter for parameter.
 """
 
 from collections.abc import Sequence
 from typing import Literal
 
 from .._ext import Checkpoint
+
+def regions(
+    ck: Checkpoint,
+    max_bytes: int = ...,
+    boundaries: Sequence[str] | None = None,
+    only: Sequence[str] | None = None,
+) -> list[list[str]]:
+    """`<component>/<key>` regions: chunk-sharing tensors together, up to `max_bytes` each, never
+    across a `<component>/<key prefix>` boundary (a block) unless a shared chunk does. `only`
+    (blocks or tensors, in the same form) limits the result to them and tensors sharing their chunks."""
 
 class VarenaError(Exception):
     code: str
@@ -180,7 +187,7 @@ class Pinned:
 
 class WeightSet:
     """A checkpoint's regions on one GPU (or the host). The regions are
-    `tensorfs.regions(ck, max_bytes, boundaries)`."""
+    `tensorfs.varena.regions(ck, max_bytes, boundaries)`."""
 
     @property
     def name(self) -> str: ...
@@ -255,23 +262,18 @@ class Gpu:
         ck: Checkpoint,
         regions: Sequence[Sequence[str]],
         host_fd: int | None = None,
-        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
-        """`regions`: `tensorfs.regions(ck, max_bytes, boundaries, only)`; the set is the parts
+        """`regions`: `tensorfs.varena.regions(ck, max_bytes, boundaries, only)`; the set is the parts
         they name and nothing else of the checkpoint. `host_fd`: a sealed host layout of exactly
-        these regions, filled by the owner (TensorD) with the same layout function (`seal()`
-        here, Rust `varena::memory::open_checkpoint` + `host::open_sealed`). Its digest is
-        checked; a layout of other regions is refused. Copies come from it, and a region its
-        owner left a hole comes from the chunk files. Without `host_fd`, every copy comes from
-        the chunk files through the page cache. `files`: the chunk files a grant hands over,
-        `(sha256, length, fd)` each, the only ones read; without it, the store's chunk files.
-        The core duplicates every descriptor it keeps and closes nothing the caller passed."""
+        these regions (`seal()`). Its digest is checked; a layout of other regions is refused.
+        Copies come from it, and a region left a hole comes from the checkpoint's chunks, read
+        by TensorFS (fetched when absent). The core duplicates every descriptor it keeps and
+        closes nothing the caller passed."""
     def adopt(
         self,
         name: str,
         ck: Checkpoint,
         host_fd: int,
-        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
         """`register` of the sealed host layout `host_fd` with the regions it carries, before
         any module exists: `prefetch` starts its copies while the module is built. A module
@@ -301,16 +303,14 @@ class Host:
         ck: Checkpoint,
         regions: Sequence[Sequence[str]],
         host_fd: int | None = None,
-        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
         """As `Gpu.register`. Binds are views of the sealed layout (read-only), or private
-        memory read once from the chunk files."""
+        memory read once from the chunks."""
     def adopt(
         self,
         name: str,
         ck: Checkpoint,
         host_fd: int,
-        files: Sequence[tuple[str, int, int]] | None = None,
     ) -> WeightSet:
         """As `Gpu.adopt`."""
 
@@ -356,10 +356,9 @@ def seal(
     regions: Sequence[Sequence[str]],
     name: str,
     threads: int = 8,
-    files: Sequence[tuple[str, int, int]] | None = None,
 ) -> int:
-    """`regions` of a v2 checkpoint in a sealed host layout, filled in this process from its
-    chunk files (`files`, as in `register`, else the checkpoint's own paths). The result is what
+    """`regions` of a checkpoint in a sealed host layout, filled in this process from its
+    chunks. The result is what
     `register(host_fd=)` adopts, the same layout by construction; deposit it with TensorD as an
     opaque fd. Returns the memfd (the caller's)."""
 

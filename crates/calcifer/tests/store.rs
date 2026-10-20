@@ -312,6 +312,204 @@ fn product(output: &str, index: u32, rev: u64) -> v1::Product {
     }
 }
 
+fn checkpoint(revision: &str, rev: u64) -> v1::Product {
+    v1::Product {
+        output: "weights".into(),
+        rev,
+        checkpoint: Some(v1::CheckpointRef {
+            repo_id: "local/derived".into(),
+            revision: revision.into(),
+            variant: "fp8".into(),
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn checkpoint_references_replay_across_restarts_without_byte_exports() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store
+        .put_machine(&common::machine("m", None, Path::new("/k")))
+        .unwrap();
+    let id = store
+        .submit("refs", "d", new_run(1, Some("m"), true))
+        .unwrap()
+        .0
+        .id
+        .to_string();
+    assert!(store.mark_sent(&id, "m").unwrap());
+    store.accept(&id, "m", &state(&id)).unwrap();
+    let first = store
+        .observe(
+            &id,
+            Batch {
+                cursor: 1,
+                products: vec![checkpoint("sha256:first", 1), product("image", 0, 1)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let seen = first
+        .iter()
+        .filter_map(Event::sequence_number)
+        .max()
+        .unwrap();
+    let events = store
+        .observe(
+            &id,
+            Batch {
+                cursor: 2,
+                products: vec![
+                    checkpoint("sha256:second", 2),
+                    checkpoint("sha256:first", 1),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(&events[..], [Event::OutputDelta { rev: 2, checkpoint: Some(reference), .. }]
+        if reference.revision == "sha256:second")
+    );
+    // The image still follows the ordinary export path; a reference is never requested as bytes.
+    assert_eq!(
+        store
+            .outputs_to_export(&id)
+            .unwrap()
+            .iter()
+            .map(|o| o.name.as_str())
+            .collect::<Vec<_>>(),
+        ["image"]
+    );
+    store
+        .exported(&id, "image", 0, 1, Path::new("/saved/image.png"))
+        .unwrap();
+    assert!(store.exports_owed().unwrap().is_empty());
+    assert!(store.exports_owed_on("m").unwrap().is_empty());
+    drop(store);
+
+    let store = open(dir.path());
+    assert!(store.events_after(&id, seen).unwrap().iter().any(
+        |event| matches!(event, Event::OutputDelta { rev: 2, checkpoint: Some(reference), .. }
+            if reference.revision == "sha256:second")
+    ));
+    let outcome = v1::Outcome {
+        status: "succeeded".into(),
+        outputs: vec![checkpoint("sha256:final", 3), product("image", 0, 1)],
+        ..Default::default()
+    };
+    store.settle(&id, &outcome, 3).unwrap();
+    drop(store);
+
+    let store = open(dir.path());
+    let row = store.run(&id).unwrap().unwrap();
+    let run = store.record(&row).unwrap();
+    let reference = &run.output[0];
+    assert_eq!(
+        reference.checkpoint,
+        checkpoint("sha256:final", 3).checkpoint
+    );
+    assert_eq!(
+        (reference.rev, reference.status, reference.length),
+        (3, ItemStatus::Completed, 0)
+    );
+    assert!(reference.media_type.is_empty());
+    assert!(
+        reference.sha256.is_none() && reference.path.is_none() && reference.export_error.is_none()
+    );
+    assert_eq!(
+        run.output[1].path.as_deref(),
+        Some(Path::new("/saved/image.png"))
+    );
+    assert!(run.output[1].sha256.is_some());
+    let stored = store.output(&id, "weights", 0).unwrap().unwrap();
+    assert!(stored.digest.is_empty() && stored.path.is_none() && stored.exported_rev.is_none());
+    assert_eq!(stored.checkpoint, reference.checkpoint);
+    assert!(store.outputs_to_export(&id).unwrap().is_empty());
+    assert!(store.events_after(&id, 0).unwrap().iter().any(|event|
+        matches!(event, Event::OutputDone { item, .. } if item.checkpoint == reference.checkpoint)));
+}
+
+#[test]
+fn version_five_migrates_without_rewriting_run_or_media_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store
+        .put_machine(&common::machine("m", None, Path::new("/k")))
+        .unwrap();
+    let first = store
+        .submit("old", "old-digest", new_run(1, Some("m"), true))
+        .unwrap()
+        .0;
+    let id = first.id.as_str();
+    assert!(store.mark_sent(id, "m").unwrap());
+    store.accept(id, "m", &state(id)).unwrap();
+    store
+        .observe(
+            id,
+            Batch {
+                cursor: 12,
+                logs: vec![(5, "info".into(), "old log".into())],
+                products: vec![product("image", 0, 1)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .settle(
+            id,
+            &v1::Outcome {
+                status: "succeeded".into(),
+                outputs: vec![product("image", 0, 1)],
+                result: v1::Json::parse(r#"{"caption":"saved"}"#).ok(),
+                measurements: v1::Json::parse(r#"{"execution":{}}"#).ok(),
+                ..Default::default()
+            },
+            13,
+        )
+        .unwrap();
+    store
+        .exported(id, "image", 0, 1, Path::new("/old/image.png"))
+        .unwrap();
+    store
+        .submit("pending", "pending-digest", new_run(2, None, false))
+        .unwrap();
+    let before = store.detail(&store.run(id).unwrap().unwrap()).unwrap();
+    let events = store.events_after(id, 0).unwrap();
+    drop(store);
+    // Reproduce the real v5 schema; no migration changes any existing column or stored JSON.
+    let db = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+    db.execute_batch("ALTER TABLE outputs DROP COLUMN checkpoint; PRAGMA user_version = 5;")
+        .unwrap();
+    drop(db);
+
+    let store = open(dir.path());
+    let row = store.run(id).unwrap().unwrap();
+    assert_eq!(row.cursor, 13);
+    assert_eq!(store.detail(&row).unwrap(), before);
+    assert_eq!(store.events_after(id, 0).unwrap(), events);
+    let (replayed, fresh) = store
+        .submit("old", "old-digest", new_run(3, Some("m"), true))
+        .unwrap();
+    assert!(!fresh);
+    assert_eq!(replayed.id, first.id);
+    assert_eq!(store.unsettled().unwrap(), [RunId::mint([2; 12])]);
+    assert!(store.exports_owed().unwrap().is_empty());
+    drop(store);
+    let store = open(dir.path());
+    assert_eq!(
+        store.detail(&store.run(id).unwrap().unwrap()).unwrap(),
+        before
+    );
+    let db = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        6
+    );
+}
+
 /// What a reconnecting stream replays comes from the columns, survives a reopen, and never
 /// repeats what the client already holds.
 #[test]
