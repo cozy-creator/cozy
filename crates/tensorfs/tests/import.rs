@@ -946,6 +946,36 @@ fn a_peft_adapter_becomes_module_keys_and_its_config() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The header-level rules a migration shares: PEFT's key spelling and its adapter config.
+#[test]
+fn lora_keys_and_adapter_configs_follow_one_rule() {
+    use tensorfs::import::lora::{adapter_config, peft_key};
+    for (key, want) in [
+        ("lora_unet_x.lora_down.weight", Some("lora_unet_x.lora_A.weight")),
+        ("lora_unet_x.lora_up", Some("lora_unet_x.lora_B.weight")),
+        ("base_model.model.a.b.lora_A.default.weight", Some("a.b.lora_A.weight")),
+        ("a.b.lora_B.weight", Some("a.b.lora_B.weight")),
+        ("base_model.model.a.alpha", Some("a.alpha")),
+        ("a.lora_B.bias", None),
+        ("a.weight", None),
+    ] {
+        assert_eq!(peft_key(key).as_deref(), want, "{key}");
+    }
+    let none = BTreeMap::new();
+    let mixed = [("a".to_owned(), 4), ("b".to_owned(), 8), ("c".to_owned(), 4)];
+    assert_eq!(
+        serde_json::Value::Object(adapter_config(mixed.clone(), &none, None, Some("acme/base"))),
+        serde_json::json!({"peft_type": "LORA", "r": 4, "target_modules": ["a", "b", "c"],
+                           "base_model_name_or_path": "acme/base"}),
+        "ranks differ: no lora_alpha, each module's own r is its α"
+    );
+    let source = serde_json::json!({"lora_alpha": 16, "r": 8, "base_model_name_or_path": "x"});
+    let config = adapter_config(mixed, &none, source.as_object(), None);
+    assert_eq!((&config["lora_alpha"], &config["r"], &config["base_model_name_or_path"]), (&16.into(), &8.into(), &"x".into()));
+    let uniform = adapter_config([("a".to_owned(), 2)], &none, None, None);
+    assert_eq!(uniform["lora_alpha"], 2);
+}
+
 /// Kohya's training metadata is PEFT's config of each LoRA component; its `.alpha` stays.
 #[test]
 fn a_kohya_lora_maps_its_metadata_to_the_adapter_config() {

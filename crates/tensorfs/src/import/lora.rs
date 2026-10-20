@@ -25,37 +25,107 @@ const PEFT_PREFIX: &str = "base_model.model.";
 /// diffusers' `save_lora_adapter` records the `LoraConfig` here, as JSON.
 const DIFFUSERS_CONFIG: &str = "lora_adapter_metadata";
 
+/// A LoRA key in PEFT's spelling, or `None` for a key that is no LoRA factor or alpha: kohya's
+/// `<m>.lora_down[.weight]` and `.lora_up[.weight]` are `<m>.lora_A.weight` and `.lora_B.weight`,
+/// PEFT's adapter name goes (`<m>.lora_A.default.weight`), and so does `base_model.model.`.
+pub fn peft_key(key: &str) -> Option<String> {
+    let key = key.strip_prefix(PEFT_PREFIX).unwrap_or(key);
+    if let Some(m) = key.strip_suffix(ALPHA) {
+        return Some(format!("{m}{ALPHA}"));
+    }
+    let weight = key.strip_suffix(".weight");
+    for (from, to) in [(".lora_down", A), (".lora_up", B), (".lora_A", A), (".lora_B", B)] {
+        if let Some(m) = weight.unwrap_or(key).strip_suffix(from) {
+            return Some(format!("{m}{to}"));
+        }
+        // PEFT's adapter name: `<m>.lora_A.<name>.weight`.
+        let named = weight.and_then(|w| w.rsplit_once('.'));
+        if let Some(m) = named.and_then(|(m, name)| m.strip_suffix(from).filter(|_| !name.is_empty())) {
+            return Some(format!("{m}{to}"));
+        }
+    }
+    None
+}
+
+/// PEFT's `adapter_config.json` for LoRA `modules` (module, rank): `source`'s fields where it
+/// states them (its patterns as they are: a caller that folds them into `.alpha` empties them),
+/// else `r` the commonest rank, `target_modules` the modules, `lora_alpha` kohya's
+/// `ss_network_alpha`, else `r` when every rank is `r` (omitted otherwise: each module's own
+/// rank is its `α`), and `base_model_name_or_path` `base_model`, else the source's, else kohya's
+/// `ss_sd_model_name`.
+pub fn adapter_config(
+    modules: impl IntoIterator<Item = (String, u64)>,
+    metadata: &BTreeMap<String, String>,
+    source: Option<&Config>,
+    base_model: Option<&str>,
+) -> Config {
+    let modules: BTreeMap<String, u64> = modules.into_iter().collect();
+    let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
+    for rank in modules.values() {
+        *counts.entry(*rank).or_default() += 1;
+    }
+    let r = (counts.iter().rev()).max_by_key(|(_, n)| **n).map_or(0, |(r, _)| *r);
+    let mut config = source.cloned().unwrap_or_default();
+    config.insert("peft_type".into(), "LORA".into());
+    config.entry("r").or_insert(json!(r));
+    let stated = metadata.get("ss_network_alpha").and_then(|a| a.trim().parse::<f64>().ok());
+    let alpha = match stated {
+        Some(a) if a.fract() == 0.0 => Some(json!(a as i64)),
+        Some(a) => Some(json!(a)),
+        None => (counts.len() == 1).then(|| json!(r)),
+    };
+    if let (false, Some(alpha)) = (config.contains_key("lora_alpha"), alpha) {
+        config.insert("lora_alpha".into(), alpha);
+    }
+    config.entry("target_modules").or_insert(json!(modules.keys().collect::<Vec<_>>()));
+    let base = (base_model.map(str::to_owned))
+        .or_else(|| config.get("base_model_name_or_path").and_then(Json::as_str).map(str::to_owned))
+        .or_else(|| metadata.get("ss_sd_model_name").cloned());
+    if let Some(base) = base {
+        config.insert("base_model_name_or_path".into(), json!(base));
+    }
+    config
+}
+
 /// One module's factors: its rank and where its `lora_B` is planned.
 struct Module {
     rank: u64,
     b: usize,
 }
 
-/// Normalizes, in `planned`, each component holding LoRA factors, and returns its config.
-/// `sources` is each component's source group; an adapter config file read becomes the
+/// A LoRA component's config, and whether its source stated one (PEFT's keys are then the base
+/// model's module names).
+pub struct Adapter {
+    pub config: Config,
+    pub stated: bool,
+}
+
+/// Normalizes, in `planned`, each component holding LoRA factors ([`peft_key`]), and returns its
+/// adapter. `sources` is each component's source group; an adapter config file read becomes the
 /// component's config and leaves `files`.
 pub fn normalize(
     planned: &mut Vec<Planned>,
     sources: &BTreeMap<String, &Group>,
     files: &mut BTreeMap<String, Vec<u8>>,
-) -> Result<BTreeMap<String, Config>> {
-    let (mut configs, mut read, mut alphas) = (BTreeMap::new(), BTreeSet::new(), Vec::new());
+) -> Result<BTreeMap<String, Adapter>> {
+    let (mut adapters, mut read, mut alphas) = (BTreeMap::new(), BTreeSet::new(), Vec::new());
     for (component, group) in sources {
         let mine: Vec<usize> = (0..planned.len())
             .filter(|i| planned[*i].component == *component)
             .collect();
-        if !mine.iter().any(|i| planned[*i].key.ends_with(A)) {
+        if !mine.iter().any(|i| peft_key(&planned[*i].key).is_some_and(|k| k.ends_with(A))) {
             continue;
         }
-        if mine.iter().all(|i| planned[*i].key.starts_with(PEFT_PREFIX)) {
-            for i in &mine {
-                planned[*i].key.drain(..PEFT_PREFIX.len());
-            }
-        }
-        let mut modules = BTreeMap::new();
-        let mut kept = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        let (mut modules, mut kept) = (BTreeMap::new(), BTreeSet::new());
         for i in &mine {
-            let p = &planned[*i];
+            let p = &mut planned[*i];
+            if let Some(key) = peft_key(&p.key) {
+                p.key = key;
+            }
+            if !seen.insert(p.key.clone()) {
+                return refuse(Code::DUPLICATE_KEY, format!("{component}: two LoRA keys are {}", p.key));
+            }
             if let Some(m) = p.key.strip_suffix(A) {
                 modules.entry(m.to_owned()).or_insert(Module { rank: 0, b: *i }).rank =
                     p.shape.first().copied().unwrap_or(0);
@@ -66,7 +136,7 @@ pub fn normalize(
             }
         }
         let path = super::join(&group.folder, ADAPTER_CONFIG);
-        let stated = match (files.get(&path), group.metadata.get(DIFFUSERS_CONFIG)) {
+        let source = match (files.get(&path), group.metadata.get(DIFFUSERS_CONFIG)) {
             (Some(bytes), _) => {
                 read.insert(path.clone());
                 Some(parse(&path, bytes)?)
@@ -74,11 +144,14 @@ pub fn normalize(
             (None, Some(text)) => Some(parse(DIFFUSERS_CONFIG, text.as_bytes())?),
             (None, None) => None,
         };
-        let config = match stated {
-            Some(config) => peft(component, config, &modules, &kept, &mut alphas)?,
-            None => kohya(&group.metadata, &modules),
+        let source = match source {
+            Some(source) => Some(fold(component, source, &modules, &kept, &mut alphas)?),
+            None => None,
         };
-        configs.insert(component.clone(), config);
+        let ranks = modules.iter().map(|(m, v)| (m.clone(), v.rank));
+        let config = adapter_config(ranks, &group.metadata, source.as_ref(), None);
+        let stated = source.is_some();
+        adapters.insert(component.clone(), Adapter { config, stated });
     }
     files.retain(|path, _| !read.contains(path));
     // Each new `.alpha` follows its module's `lora_B`; from the back, so indices hold.
@@ -100,7 +173,7 @@ pub fn normalize(
         };
         planned.insert(at + 1, p);
     }
-    Ok(configs)
+    Ok(adapters)
 }
 
 fn parse(what: &str, bytes: &[u8]) -> Result<Config> {
@@ -110,10 +183,10 @@ fn parse(what: &str, bytes: &[u8]) -> Result<Config> {
     })
 }
 
-/// A PEFT `LoraConfig`: `alpha_pattern` and `use_rslora` become each module's `.alpha` (PEFT's
-/// scale is `α_m / r_m`, or `α_m / √r_m` with rsLoRA); `rank_pattern` is each `lora_A`'s rows
-/// already. The config keeps everything else.
-fn peft(
+/// A PEFT `LoraConfig` with `alpha_pattern` and `use_rslora` folded into each module's `.alpha`
+/// (PEFT's scale is `α_m / r_m`, or `α_m / √r_m` with rsLoRA) and emptied, as is `rank_pattern`,
+/// each `lora_A`'s rows already.
+fn fold(
     component: &str,
     mut config: Config,
     modules: &BTreeMap<String, Module>,
@@ -172,33 +245,5 @@ fn peft(
     if rslora {
         config.insert("use_rslora".into(), Json::Bool(false));
     }
-    config.insert("peft_type".into(), "LORA".into());
     Ok(config)
-}
-
-/// Kohya's training metadata as PEFT's config: `ss_network_dim` is `r` (else the commonest
-/// rank), `ss_network_alpha` `lora_alpha` (else `r`), `ss_sd_model_name` the base model.
-fn kohya(metadata: &BTreeMap<String, String>, modules: &BTreeMap<String, Module>) -> Config {
-    let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
-    for m in modules.values() {
-        *counts.entry(m.rank).or_default() += 1;
-    }
-    let commonest = (counts.iter().rev()).max_by_key(|(_, n)| **n).map_or(0, |(r, _)| *r);
-    let stated = |key: &str| metadata.get(key).and_then(|v| v.trim().parse::<f64>().ok());
-    let r = stated("ss_network_dim").filter(|r| r.fract() == 0.0 && *r >= 1.0);
-    let r = r.map_or(commonest, |r| r as u64);
-    let alpha = match stated("ss_network_alpha") {
-        Some(a) if a.fract() == 0.0 => json!(a as i64),
-        Some(a) => json!(a),
-        None => json!(r),
-    };
-    let mut config = Config::new();
-    config.insert("peft_type".into(), "LORA".into());
-    config.insert("r".into(), json!(r));
-    config.insert("lora_alpha".into(), alpha);
-    config.insert("target_modules".into(), json!(modules.keys().collect::<Vec<_>>()));
-    if let Some(base) = metadata.get("ss_sd_model_name") {
-        config.insert("base_model_name_or_path".into(), json!(base));
-    }
-    config
 }
