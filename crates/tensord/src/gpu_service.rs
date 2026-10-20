@@ -4844,70 +4844,27 @@ mod tests {
         assert_eq!(group_degree(&[json!({"path":"e.models.vae"})], 2, 2), 1);
     }
 
-    /// An integrated GPU (GB10) answers NVML's memory info with NotSupported. Its Loads still
-    /// carry a device limit (the host's memory), without which Runtime refuses the executor
-    /// (run 10322). Under a fake `libnvidia-ml.so.1` that answers so, in a child of this test.
-    #[cfg(target_os = "linux")]
     #[test]
-    fn a_gpu_whose_memory_nvml_does_not_support_still_bounds_every_load() {
-        let dir = std::env::temp_dir().join(format!("fake-nvml-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("nvml.c"), FAKE_NVML).unwrap();
-        let built = std::process::Command::new("cc")
-            .args(["-shared", "-fPIC", "-o"]).arg(dir.join("libnvidia-ml.so.1")).arg(dir.join("nvml.c"))
-            .status().unwrap();
-        assert!(built.success());
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "gpu_service::tests::an_integrated_gpus_load_limit_is_the_hosts_memory", "--ignored"])
-            .env("LD_LIBRARY_PATH", &dir)
-            .output().unwrap();
-        let out = String::from_utf8_lossy(&child.stdout);
-        assert!(child.status.success() && out.contains("1 passed"), "{out}{}", String::from_utf8_lossy(&child.stderr));
-        let _ = fs::remove_dir_all(dir);
+    fn inventory_and_owner_limit_bound_every_load_without_loading_cuda() {
+        let (root, pool, _) = pool_of(1);
+        assert_eq!(pool.device_limit(pool.lane(0, 1).unwrap()), Some(8 << 30));
+        pool.stop().unwrap();
+        drop(pool);
+        crate::scratch::remove(&root);
     }
 
-    #[test]
-    #[ignore = "a_gpu_whose_memory_nvml_does_not_support_still_bounds_every_load runs it under its fake NVML"]
-    fn an_integrated_gpus_load_limit_is_the_hosts_memory() {
-        let root = std::env::temp_dir().join(format!("gpu-integrated-{}", uuid::Uuid::new_v4()));
-        let config: GpuConfig = serde_json::from_value(json!({"devices": "0",
-            "authorized_device_limit_bytes": null, "prespawn": false})).unwrap();
-        let store = crate::storage::open(&root.join("store")).unwrap();
-        let pool = Pool::new(&root.join("gpu"), config, store).unwrap();
-        let host = platform::contain::host_memory::total();
-        assert!(host > 0);
-        assert_eq!(pool.device_limit(pool.lane(0, 1).unwrap()), Some(host as u64));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// NVML for one integrated GPU: every call the memory sampler makes, and memory info
-    /// NotSupported (3), as GB10's driver answers.
-    #[cfg(target_os = "linux")]
-    const FAKE_NVML: &str = r#"
-#include <stdio.h>
-static int gpu;
-int nvmlInit_v2(void) { return 0; }
-int nvmlInit_v3(unsigned flags) { return 0; }
-int nvmlShutdown(void) { return 0; }
-int nvmlDeviceGetCount_v2(unsigned *n) { *n = 1; return 0; }
-int nvmlDeviceGetHandleByIndex_v2(unsigned i, void **d) { if (i) return 2; *d = &gpu; return 0; }
-int nvmlDeviceGetHandleByUUID(const char *u, void **d) { *d = &gpu; return 0; }
-int nvmlDeviceGetIndex(void *d, unsigned *i) { *i = 0; return 0; }
-int nvmlDeviceGetUUID(void *d, char *b, unsigned n) { snprintf(b, n, "GPU-integrated-test"); return 0; }
-int nvmlDeviceGetName(void *d, char *b, unsigned n) { snprintf(b, n, "NVIDIA GB10"); return 0; }
-int nvmlSystemGetDriverVersion(char *b, unsigned n) { snprintf(b, n, "595.84"); return 0; }
-int nvmlDeviceGetMemoryInfo(void *d, void *m) { return 3; }
-int nvmlDeviceGetMemoryInfo_v2(void *d, void *m) { return 3; }
-int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
-"#;
-
-    /// A fresh pool over `width` GPUs NVML does not know (this host's own stay untouched):
-    /// every GPU has room.
+    /// A CPU scheduler fixture with explicit GPU identities/capacities. This tests queue
+    /// bookkeeping only and never claims GPU execution or placement qualification.
     fn pool_of(width: usize) -> (PathBuf, Arc<Pool>, Arc<Engine>) {
         let root = std::env::temp_dir().join(format!("gpu-place-{}", uuid::Uuid::new_v4()));
-        let devices: Vec<_> = (0..width).map(|gpu| format!("GPU-test-{gpu}")).collect();
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let devices: Vec<_> = (0..width).map(|gpu| format!("GPU-test-{unique}-{gpu}")).collect();
+        let inventory: Vec<_> = devices.iter().enumerate().map(|(index, uuid)| json!({
+            "device_index":index,"device_name":"scheduler fixture","device_uuid":uuid,
+            "driver_version":"fixture","memory_bytes":8u64<<30,"pci_bus_id":"fixture"
+        })).collect();
         let config: GpuConfig = serde_json::from_value(json!({"devices": devices.join(","),
-            "authorized_device_limit_bytes": null, "prespawn": false})).unwrap();
+            "inventory":inventory,"authorized_device_limit_bytes": null, "prespawn": false})).unwrap();
         let store = crate::storage::open(&root.join("store")).unwrap();
         let pool = Pool::new(&root.join("gpu"), config, store).unwrap();
         let engine = Engine::open(&root.join("execution")).unwrap();
@@ -5528,10 +5485,10 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         crate::scratch::remove(&root);
     }
 
-    /// Host admission counts executors admitted and not loaded yet; pinned budgets are shared
-    /// over every GPU's executors, a group's once.
+    /// Host admission still counts executors admitted and not loaded yet; GPU placement
+    /// and pinned RAM ownership no longer live in this scheduler.
     #[test]
-    fn host_room_and_pinned_budgets_span_every_gpu() {
+    fn host_room_counts_every_pending_executor() {
         let (root, pool, _engine) = pool_of(4);
         let available = u64::try_from(platform::contain::host_memory::read().available).unwrap();
         let need = available / 10 * 6;
@@ -5547,27 +5504,6 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         assert!(pool.host_room("image", 1, 1, false, 2));
         pool.admitted.lock().unwrap().clear();
 
-        let gib = 1u64 << 30;
-        for (index, (tenant, start)) in [("film", 0), ("film", 2), ("image", 0), ("image", 2)].into_iter().enumerate() {
-            let birth = Birth { pid: 1_000_000 + index as u32, boot_id: "placement-only".into(), start_ticks: 0 };
-            pool.leaders.lock().unwrap().insert(birth.pid, (birth, tenant.into(), start));
-        }
-        for (gpu, tenant) in [(0, "film"), (1, "film"), (2, "film"), (3, "film"), (0, "image"), (2, "image")] {
-            pool.devices[gpu].memory.with(|ledger| {
-                ledger.starting(tenant, 0);
-                let facts = Facts { weights: Some(gib), ..Facts::default() };
-                ledger.observe(tenant, facts, None);
-            });
-        }
-        let split = pool.pinned_budgets("image", 2).unwrap();
-        let keys: Vec<_> = split.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["film", "film@2", "image", "image@2"]);
-        let total = u64::try_from(platform::contain::host_memory::read().available).unwrap() / 2;
-        assert!(split.values().sum::<u64>() <= total, "one pinned total");
-        pool.ended("film", 2, 2);
-        let split = pool.pinned_budgets("image", 0).unwrap();
-        let keys: Vec<_> = split.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["film", "image", "image@2"]);
         pool.stop().unwrap();
         crate::scratch::remove(&root);
     }
