@@ -207,6 +207,27 @@ impl Drop for Origin {
         }
     }
 }
+/// Waits until some file under `dir` holds at least `bytes`.
+async fn wait_partial(dir: &Path, bytes: u64) {
+    fn largest(dir: &Path) -> u64 {
+        let entries = fs::read_dir(dir).into_iter().flatten().flatten();
+        entries
+            .map(|e| match e.file_type() {
+                Ok(t) if t.is_dir() => largest(&e.path()),
+                _ => e.metadata().map_or(0, |m| m.len()),
+            })
+            .max()
+            .unwrap_or(0)
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while largest(dir) < bytes {
+            tokio::time::sleep(Duration::from_millis(1)).await
+        }
+    })
+    .await
+    .expect("the served prefix never landed");
+}
+
 fn receive(stream: &mut TcpStream) -> Option<Seen> {
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
@@ -357,6 +378,11 @@ async fn stalled_listing_and_member_cancel_on_caller_runtime_and_resume_exact_by
             )
         });
         origin.wait_stalled().await;
+        if matches!(stall, Stall::Member) {
+            // The served prefix must have landed in the partial file before the stop, or there
+            // is nothing to resume from.
+            wait_partial(&store.root().join("tmp"), 16).await;
+        }
         flag.store(true, Ordering::Release);
         let (result, _, committed) = tokio::time::timeout(Duration::from_secs(2), pending)
             .await
