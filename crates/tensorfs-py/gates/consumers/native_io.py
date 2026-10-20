@@ -11,9 +11,10 @@ import re
 
 IDS = ['read-engine', 'provider-cleanup', 'fork-cleanup']
 ALL = ['diffusers', 'comfy', 'kernel', *IDS]
-CASES = ['last-weightset', 'callback-close', 'last-pin', 'last-consumer', 'pending-consumer-b', 'pending-ptds-consumer']
+CASES = ['last-weightset', 'callback-close', 'last-pin', 'last-consumer', 'pending-consumer-b',
+         'pending-ptds-consumer', 'pending-legacy-consumer']
 READ_MARKER = 'CUDA arrays: chunk-spanning reads, prebuilt decode, raw parts, DLPack sharing/copy and retained consumers passed'
-TIMEOUT = {'read-engine': 120, 'provider-cleanup': 300, 'fork-cleanup': 90}
+TIMEOUT = {'read-engine': 120, 'provider-cleanup': 360, 'fork-cleanup': 90}
 PROVIDER_DATA_SHA256 = hashlib.sha256(bytes(range(256)) * 256).hexdigest()
 
 
@@ -90,8 +91,8 @@ def consumer_receipt(case, value):
         require(value.get('distinct_nondefault') is True
                 and all(type(value.get(k)) is int and value[k] > 2 for k in ('bind_stream', 'consumer_stream'))
                 and value['bind_stream'] != value['consumer_stream'], 'consumer B streams are not distinct')
-    else:
-        require(case == 'pending-ptds-consumer' and value.get('scope') == 'final-release-custody', 'PTDS scope differs')
+    elif case == 'pending-ptds-consumer':
+        require(value.get('scope') == 'final-release-custody', 'PTDS scope differs')
         require(all(type(value.get(k)) is int and value[k] == 2 for k in ('bind_stream', 'consumer_stream')),
                 'PTDS stream identity differs')
         require(all(type(value.get(k)) is int and value[k] > 0 for k in ('bind_thread', 'consumer_thread'))
@@ -99,6 +100,20 @@ def consumer_receipt(case, value):
         for name in ('distinct_threads', 'bind_thread_alive_while_pending', 'bind_thread_source_handles_released', 'ptds'):
             require(value.get(name) is True, 'PTDS evidence differs: ' + name)
         require(value.get('pending_readiness_device_proof') is False, 'PTDS final release is not a readiness proof')
+    else:
+        require(case == 'pending-legacy-consumer' and value.get('scope') == 'final-release-custody',
+                'legacy consumer scope differs')
+        require(type(value.get('bind_stream')) is int and value['bind_stream'] > 2,
+                'legacy consumer did not follow a named bind stream')
+        require('dlpack_stream' in value and value['dlpack_stream'] is None,
+                'legacy consumer must explicitly export stream=None')
+        require(type(value.get('consumer_stream')) is int and value['consumer_stream'] == 1
+                and type(value.get('torch_consumer_stream')) is int and value['torch_consumer_stream'] == 0,
+                'None must use native legacy stream 1 and Torch default stream 0')
+        require(value.get('default_legacy') is True and value.get('distinct_nondefault') is False,
+                'legacy consumer was replaced by a nondefault stream')
+        require(value.get('pending_readiness_device_proof') is False,
+                'legacy final release is not a readiness proof')
 
 
 def parse(name, stdout, native, gpu_uuid):
@@ -137,7 +152,7 @@ def parse(name, stdout, native, gpu_uuid):
                 'provider never fetched real chunks')
         require(any(type(c.get('bytes')) is int and c['bytes'] == 65536 and finite(c.get('ns'))
                     for c in passed.get('h2d', [])), 'provider missing real H2D record')
-        if case in ('pending-consumer-b', 'pending-ptds-consumer'):
+        if case in ('pending-consumer-b', 'pending-ptds-consumer', 'pending-legacy-consumer'):
             consumer_receipt(case, passed.get('consumer'))
     return {'case': name, 'format': 'json-lines', 'records': records}
 
