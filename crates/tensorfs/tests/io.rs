@@ -189,7 +189,10 @@ fn evicted_pages(ck: &Checkpoint) -> u64 {
         // SAFETY: a read-only shared mapping of our own file, unmapped below.
         let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0) };
         assert_ne!(p, libc::MAP_FAILED);
-        let mut v = vec![0u8; len.div_ceil(4096)];
+        // SAFETY: sysconf reads the kernel's page size.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page > 0);
+        let mut v = vec![0u8; len.div_ceil(page as usize)];
         // SAFETY: the vector holds one byte per page of the mapping.
         assert_eq!(unsafe { libc::mincore(p, len, v.as_mut_ptr()) }, 0);
         // SAFETY: our mapping.
@@ -197,11 +200,6 @@ fn evicted_pages(ck: &Checkpoint) -> u64 {
         evicted += v.iter().filter(|b| **b & 1 == 0).count() as u64;
     }
     evicted
-}
-
-#[cfg(not(target_os = "linux"))]
-fn evicted_pages(_: &Checkpoint) -> u64 {
-    0
 }
 
 fn direct_ok(ck: &Checkpoint) -> bool {
@@ -251,19 +249,67 @@ fn sweep(ck: &Checkpoint, what: &str) {
         for skew in [0, 1, 4095] {
             evict(ck);
             let cold = read_everything(ck, skew, &opts);
-            // The engine reads past the page cache, so a buffered read warms it.
+            // Warming is advisory: unlocked pages may be reclaimed before a later read.
+            // The strict warm-route assertion uses kernel-locked pages below.
             read_everything(ck, skew, &buffered);
-            let evicted = evicted_pages(ck);
             let warm = read_everything(ck, skew, &opts);
             println!("{what} skew {skew} {opts:?}\n  cold {cold:?}\n  warm {warm:?}");
             if opts.direct && direct_ok(ck) {
                 assert!(cold.direct > 0, "a cold read goes O_DIRECT: {cold:?}");
-                // Only a piece with a page the host evicted since the warm-up goes direct.
-                let allowed = evicted * opts.request.max(4096) as u64;
-                assert!(warm.direct <= allowed, "a warm read stays in the page cache ({evicted} pages evicted): {warm:?}");
             } else {
                 assert_eq!(cold.direct, 0);
             }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn resident_source_pages_keep_warm_reads_out_of_direct_io() {
+    let scratch = Scratch::new("locked-warm");
+    let bytes = noise(91, 64 << 10);
+    fs::create_dir_all(scratch.0.join(CHUNKS_DIR)).unwrap();
+    let chunk = ObjectRef::of(&bytes);
+    fs::write(scratch.0.join(CHUNKS_DIR).join(&chunk.sha256), &bytes).unwrap();
+    let tensors = (0..16).map(|index| Tensor {
+        key: format!("part{index}"), dtype: Dtype::U8, shape: vec![4096],
+        body: Body::Data(Location { chunk: 0, offset: index * 4096, length: 4096 }),
+    }).collect();
+    let header = Header::new(vec![chunk], None,
+        vec![Component { name: "m".into(), tensors, ..Component::default() }],
+        Default::default()).unwrap();
+    fs::write(scratch.0.join("model.cozytensors"), header.to_cbor().unwrap()).unwrap();
+    let ck = Checkpoint::folder(&scratch.0, None, None).unwrap();
+    let file = ck.chunk(0).unwrap();
+    // This private source is smaller than the ordinary unprivileged lock limit.
+    // No cgroup or process limit is changed to make the test pass.
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: a correctly sized writable rlimit.
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) }, 0);
+    assert!(bytes.len() as libc::rlim_t <= limit.rlim_cur,
+        "the resident-source fixture needs {} lockable bytes, limit {}", bytes.len(), limit.rlim_cur);
+    // SAFETY: a read-only mapping of the live private source descriptor.
+    let base = unsafe { libc::mmap(std::ptr::null_mut(), bytes.len(), libc::PROT_READ,
+        libc::MAP_SHARED, file.as_raw_fd(), 0) };
+    assert_ne!(base, libc::MAP_FAILED);
+    struct Locked { base: *mut libc::c_void, len: usize }
+    impl Drop for Locked {
+        fn drop(&mut self) {
+            // SAFETY: this guard owns this mapping, including on an assertion failure.
+            unsafe { libc::munlock(self.base, self.len); libc::munmap(self.base, self.len); }
+        }
+    }
+    let locked = Locked { base, len: bytes.len() };
+    // SAFETY: the guard retains the mapping until every read below has returned.
+    assert_eq!(unsafe { libc::mlock(locked.base, locked.len) }, 0,
+        "lock the actual source pages: {}", std::io::Error::last_os_error());
+    assert_eq!(evicted_pages(&ck), 0, "mlock must make the full source resident");
+    for opts in [ReadOpts::default(), ReadOpts { threads: 3, request: 4096, ..ReadOpts::default() }] {
+        for skew in [0, 1, 4095] {
+            let warm = read_everything(&ck, skew, &opts);
+            assert_eq!((warm.bytes, warm.direct, warm.cached, warm.bounced),
+                (bytes.len() as u64, 0, bytes.len() as u64, 0),
+                "a kernel-resident source stays in the page cache: {warm:?}");
         }
     }
 }
