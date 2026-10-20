@@ -224,12 +224,17 @@ def main():
         passed.append("never_read_writer_error_releases_once_outside_mutex")
 
         checkpoint.close()
+        owners = [source, validation, destination, failed_destination, failed_source]
+        for owner in owners:
+            owner.capsule = None
+        numpy_alias.capsule = None
+        del capsule
         gc.collect()
         time.sleep(0.02)
         assert not _live, "a managed producer allocation remains live"
         assert not _callback_errors, _callback_errors
-        assert all(owner.deletions == 1 for owner in
-                   [source, validation, destination, failed_destination, failed_source])
+        assert all(owner.deletions == 1 for owner in owners)
+        passed.append("destroying_used_capsule_aliases_does_not_release_again")
         print(json.dumps({
             "passed": len(passed), "failed": 0, "skipped": 0, "cases": passed,
             "managed_deletions": 5, "payload_sha256": hashlib.sha256(payload).hexdigest(),
