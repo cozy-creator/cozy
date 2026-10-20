@@ -977,12 +977,19 @@ pub(crate) fn hub_refusal(origin: &str, e: hub_client::Error) -> Error {
 }
 
 pub(crate) fn signed_out(origin: &str) -> Error {
+    let current = config::load(config::Flags::default()).and_then(|loaded| loaded.config.current());
+    let login = match current {
+        Ok(hub) if config::Origin::parse(origin).is_ok_and(|o| o == hub.origin) => {
+            "cozy login <email>".to_owned()
+        }
+        _ => format!("cozy login <email> --tensorhub {origin}"),
+    };
     Error::new(
         Kind::Credential,
         "signed_out",
         format!("this computer is not signed in to {origin}"),
     )
-    .next(format!("cozy login <email> --tensorhub {origin}"))
+    .next(login)
 }
 
 /// The Hub has proven the pod gone.

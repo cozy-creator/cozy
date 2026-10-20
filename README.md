@@ -18,7 +18,9 @@ Windows (PowerShell):
 irm https://tensorhub.com/install.ps1 | iex
 ```
 
-Both put `cozy` in `~/.cozy/bin`; `cozy update` moves to the newest release.
+Both put `cozy` in `~/.cozy/bin` and on your PATH for new terminals: open a new one, or run the
+`source` line (Windows: the `$env:Path` line) the installer prints. `cozy update` moves to the newest
+release.
 
 ## Use
 

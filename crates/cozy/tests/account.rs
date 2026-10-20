@@ -35,6 +35,23 @@ fn whoami_says_who_this_computer_signs_in_as() {
     assert_eq!(out["logged_in"], false, "{out}");
 }
 
+/// Signed out, the next step names `--tensorhub` only for a Hub other than the current one.
+#[test]
+fn the_login_hint_names_a_hub_only_when_it_is_not_the_current_one() {
+    let Some(home) = Home::new() else { return };
+    let here = home.cozy(["whoami"]);
+    assert!(
+        here.stdout.contains("next: cozy login <email>\n") && !here.stdout.contains("--tensorhub"),
+        "{here:?}"
+    );
+    home.json(["hub", "add", "dead", "http://127.0.0.1:1", "--json"]);
+    let there = home.cozy(["--tensorhub", "dead", "whoami"]);
+    assert!(
+        there.stdout.contains("next: cozy login <email> --tensorhub dead"),
+        "{there:?}"
+    );
+}
+
 /// `cozy login <email>`, answering its prompts as a person would: the emailed code once the
 /// Hub has sent it, then the account name if asked.
 fn login(home: &Home, email: &str, name: &str, args: &[&str]) -> common::Out {
