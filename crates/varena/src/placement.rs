@@ -1060,7 +1060,9 @@ impl Placement {
                             request,
                             Trigger::Lower {
                                 request,
-                                need: short
+                                // The prospective ring already covers this weight page.
+                                allocation: 0,
+                                reclaim: short,
                             }
                         )?,
                         Relief::Complete
@@ -1268,7 +1270,13 @@ impl Placement {
         self.drive(
             request,
             if lower {
-                Trigger::Lower { request, need }
+                Trigger::Lower {
+                    request,
+                    allocation: need,
+                    // At least one real mapped page must leave after a failed
+                    // allocation, even if the logical estimate says it fits.
+                    reclaim: 1,
+                }
             } else {
                 Trigger::Oom { request, need }
             },
