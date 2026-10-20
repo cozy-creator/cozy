@@ -361,6 +361,21 @@ impl Gpu {
         setup.map(Arc::new)
     }
 
+    pub fn device(&self) -> i32 {
+        self.device.ordinal
+    }
+
+    pub fn uuid(&self) -> Result<String> {
+        Ok(cuda::uuid(self.device.prop.location.id)?)
+    }
+
+    pub fn capacity(&self) -> Result<u64> {
+        let _context = self.device.enter()?;
+        let (mut free, mut total) = (0, 0);
+        call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
+        Ok(total as u64)
+    }
+
     pub fn reserve(&self, bytes: u64) -> Result<Arc<Reservation>> {
         let g = self.device.granularity;
         let bytes = bytes
@@ -610,6 +625,10 @@ impl Gpu {
         }
         if mapping.kept.is_none() {
             let (tx, rx) = UnixStream::pair().map_err(|error| Error::Io(error.to_string()))?;
+            // A highly fragmented page must not block while filling a socket queue
+            // which its custodian cannot receive until this method returns.
+            tx.set_nonblocking(true)
+                .map_err(|error| Error::Io(error.to_string()))?;
             for chunk in &mapping.chunks {
                 let mut raw: c_int = -1;
                 call!(
@@ -737,20 +756,20 @@ impl Gpu {
         Ok(())
     }
 
-    /// Derive mechanism facts from mappings; there is no second cached byte counter.
+    /// Derive mechanism facts from mappings; the final flag includes pending consumer
+    /// events, so the planner cannot count such a mapping as immediately reclaimable.
     pub fn facts(&self) -> Result<Vec<(PageId, u64, usize, bool)>> {
         self.poll()?;
-        Ok(self
-            .pages
-            .lock()
-            .iter()
-            .map(|(id, page)| match &*page.state.lock() {
+        let mut facts = Vec::new();
+        for (id, page) in self.pages.lock().iter() {
+            facts.push(match &mut *page.state.lock() {
                 State::Empty => (*id, 0, 0, false),
                 State::Filling => (*id, page.bytes, 0, true),
-                State::Ready(mapping) => (*id, mapping.bytes, mapping.pins, false),
+                State::Ready(mapping) => (*id, mapping.bytes, mapping.pins, !mapping.idle()?),
                 State::Failed(mapping, _) => (*id, mapping.bytes, mapping.pins, true),
-            })
-            .collect())
+            });
+        }
+        Ok(facts)
     }
 
     pub fn fingerprint(&self, id: PageId) -> Result<String> {
