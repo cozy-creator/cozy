@@ -129,13 +129,10 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
                     record = record.field("variant", &reference.variant);
                 }
                 record.print(ctx);
-                // The release it was made from takes the tree that adds its variant.
+                // The release it was made from moves to the commit that adds its variant.
                 let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
-                let next = match pinned.filter(|_| destination == repo) {
-                    Some(release) => format!("cozy model retarget {model} --release {release} --tree {tree}"),
-                    None => format!("cozy model publish {model} --release <release> --tree {tree}"),
-                };
-                output::next(ctx, &[&next]);
+                let release = pinned.filter(|_| destination == repo).unwrap_or("<version>");
+                output::next(ctx, &[&format!("cozy model publish {model} --release {release} --commit {tree}")]);
             }
             Some(WrittenCheckpoint::Header(header)) => {
                 Record::new().field("checkpoint header", header).print(ctx);

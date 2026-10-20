@@ -1,9 +1,8 @@
-//! `cozy model publish|retarget|yank|delete`: a model's releases, as its owner. Each verb is one
-//! edit of the model's repo document at the Hub's distribution endpoint (TensorFS's
-//! `Endpoint::update_repo`): read it, change it, write it under `If-Match` on what was read. A
-//! lost race reads it again and re-applies the edit, at most [`ATTEMPTS`] times; an edit the newer
-//! document no longer allows is refused. The Hub's policy rules the rest: a yank is never undone,
-//! and a retarget only adds variant files to the release's tree.
+//! `cozy model publish|yank|delete`: a model's tags, as its owner. Each verb is one edit of the
+//! model's repo document at the Hub's distribution endpoint (TensorFS's `Endpoint::update_repo`):
+//! read it, change it, write it under `If-Match` on what was read. A lost race reads it again and
+//! re-applies the edit, at most [`ATTEMPTS`] times; an edit the newer document no longer allows is
+//! refused. A public tag is a release, named by a PEP 440 version.
 use std::process::ExitCode;
 
 use base64::Engine as _;
@@ -11,11 +10,11 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use protocol::config::Hub;
 use protocol::error::{Error, Kind};
 use serde::Serialize;
-use tensorfs::format::{ObjectRef, Repo as Doc};
+use tensorfs::format::{Repo as Doc, Resolution};
 use tensorfs::{Config, Endpoint, Failure};
 
-use super::refs::{ModelRef, Repo, checkpoint, label};
-use super::{Delete, Publish, Retarget, Yank};
+use super::refs::{ModelRef, Repo, label};
+use super::{Delete, Publish, Yank};
 use crate::Context;
 use crate::context::{hub_answer, hub_error};
 use crate::output::{self, Record};
@@ -27,75 +26,50 @@ fn usage(code: &str, message: impl Into<String>) -> Error {
     Error::new(Kind::Usage, code, message)
 }
 
-fn conflict(code: &str, message: impl Into<String>) -> Error {
-    Error::new(Kind::Conflict, code, message)
-}
-
 /// One owner's change to a model's repo document.
 enum Edit {
-    /// A new release names a tree the model holds.
-    Publish { release: String, tree: String },
-    /// An existing release names another tree the model holds.
-    Retarget { release: String, tree: String },
-    Yank { release: String },
-    /// One unreleased tree goes.
-    Remove { tree: String },
-    /// The whole model goes, once every release is yanked.
-    Empty,
+    /// Tag `release` public at the commit `commit` names (a tag, or a tag's commit), or where
+    /// it is.
+    Publish { release: String, commit: Option<String> },
+    Yank { release: String, yanked: bool },
+    /// Removes one tag, or with none every tag: the model.
+    Delete { tag: Option<String> },
 }
 
 impl Edit {
     /// `doc` as this edit leaves it, or why it no longer applies.
     fn apply(&self, model: &str, doc: Option<Doc>) -> Result<Doc, Error> {
         let mut doc = doc.ok_or_else(|| {
-            Error::new(Kind::NotFound, "model_not_found", format!("{model} holds no checkpoint here"))
+            Error::new(Kind::NotFound, "model_not_found", format!("{model} has no commits here"))
                 .next(format!("cozy model upload <source> {model}"))
         })?;
-        let absent = |release: &str| Error::new(Kind::NotFound, "release_not_found", format!("{model} has no release {release}"));
+        let absent = |tag: &str| Error::new(Kind::NotFound, "tag_not_found", format!("{model} has no tag {tag}"));
         match self {
-            Edit::Publish { release, tree } | Edit::Retarget { release, tree } => {
-                match (self, doc.release(Some(release.as_str())).map(|r| r.tree.id())) {
-                    (_, Some(named)) if &named == tree => return Ok(doc),
-                    (Edit::Publish { .. }, Some(named)) => {
-                        return Err(conflict("release_exists", format!("{model}@{release} names {named}"))
-                            .next(format!("cozy model retarget {model} --release {release} --tree {tree}")));
+            Edit::Publish { release, commit } => {
+                let named = commit.as_deref().unwrap_or(release);
+                let at = match doc.resolve(Some(named)) {
+                    Some(Resolution::Tag(tag)) => tag.commit.clone(),
+                    // A header or an untagged commit: resolving it reads the endpoint's trees.
+                    Some(Resolution::Header(..)) => {
+                        return Err(Error::new(Kind::NotFound, "commit_not_found", format!("{named} is no tag's commit in {model}"))
+                            .remedy("name a tag, or a tag's commit"));
                     }
-                    (Edit::Retarget { .. }, None) => {
-                        return Err(absent(release).next(format!("cozy model publish {model} --release {release} --tree {tree}")));
+                    None if commit.is_none() => {
+                        return Err(absent(named).remedy("name the commit it releases with --commit <tag|sha256:…>"));
                     }
-                    _ => {}
-                }
-                let mut roots: Vec<ObjectRef> = doc.roots().cloned().collect();
-                roots.sort();
-                roots.dedup();
-                let Some(named) = roots.iter().find(|r| &r.id() == tree).cloned() else {
-                    return Err(Error::new(Kind::NotFound, "checkpoint_not_found", format!("{model} holds no {tree}"))
-                        .remedy("upload the checkpoint to this model first"));
+                    None => return Err(absent(named)),
                 };
-                doc.set_release(release, named);
-                // A tree a release left stays an unreleased checkpoint; a released one is none.
-                roots.retain(|root| !doc.releases.iter().any(|r| &r.tree == root));
-                doc.checkpoints = roots;
+                doc.set_tag(release, at);
+                if let Some(tag) = doc.tags.iter_mut().find(|t| &t.name == release) {
+                    tag.public = true;
+                }
             }
-            Edit::Yank { release } => match doc.releases.iter_mut().find(|r| &r.version == release) {
-                Some(r) => r.yanked = true,
+            Edit::Yank { release, yanked } => match doc.tags.iter_mut().find(|t| &t.name == release) {
+                Some(tag) => tag.yanked = *yanked,
                 None => return Err(absent(release)),
             },
-            Edit::Remove { tree } => {
-                if let Some(r) = doc.releases.iter().find(|r| &r.tree.id() == tree) {
-                    return Err(conflict("checkpoint_released", format!("{model}@{} names {tree}", r.version))
-                        .remedy("only an unreleased checkpoint is removed"));
-                }
-                doc.checkpoints.retain(|c| &c.id() != tree);
-            }
-            Edit::Empty => {
-                if let Some(r) = doc.releases.iter().find(|r| !r.yanked) {
-                    return Err(conflict("release_live", format!("{model}@{} is live", r.version))
-                        .remedy("yank every release first")
-                        .next(format!("cozy model yank {model} --release {}", r.version)));
-                }
-                doc = Doc { name: doc.name, ..Doc::default() };
-            }
+            Edit::Delete { tag: Some(tag) } => doc.tags.retain(|t| &t.name != tag),
+            Edit::Delete { tag: None } => doc.tags.clear(),
         }
         Ok(doc)
     }
@@ -113,7 +87,7 @@ async fn commit(
         .update_repo(model, |old| {
             attempts += 1;
             let new = match attempts > ATTEMPTS {
-                true => Err(conflict("model_busy", format!("{model} changed under each of {ATTEMPTS} writes"))
+                true => Err(Error::new(Kind::Conflict, "model_busy", format!("{model} changed under each of {ATTEMPTS} writes"))
                     .remedy("run it again")),
                 false => edit(old.clone()),
             };
@@ -167,24 +141,25 @@ async fn endpoint(ctx: &Context, hub: &Hub) -> Result<Endpoint, Error> {
     Endpoint::with_config(&hub.origin.to_string(), &config).map_err(failed)
 }
 
-/// A release as written.
+/// A tag as written.
 #[derive(Serialize)]
 struct Changed {
     model: String,
-    release: String,
-    tree: String,
+    tag: String,
+    commit: String,
+    public: bool,
     yanked: bool,
-    /// False when the release already was as asked.
+    /// False when the tag already was as asked.
     changed: bool,
 }
 
-/// `edit` of `model`'s `release`, and the release as written.
-async fn one_release(ctx: &Context, model: &str, release: &str, edit: Edit) -> Result<ExitCode, Error> {
+/// `edit` of `model`'s tag `release`, and the tag as written.
+async fn one_tag(ctx: &Context, model: &str, release: &str, edit: Edit) -> Result<ExitCode, Error> {
     let model = Repo::hub(model)?.to_string();
     let endpoint = endpoint(ctx, &ctx.hub()?).await?;
     let (doc, changed) = commit(&endpoint, &model, |old| edit.apply(&model, old)).await?;
-    let r = doc.release(Some(release)).expect("the edit keeps its release");
-    let view = Changed { model, release: r.version.clone(), tree: r.tree.id(), yanked: r.yanked, changed };
+    let tag = doc.tag(release).expect("the edit keeps its tag");
+    let view = Changed { model, tag: tag.name.clone(), commit: tag.commit.id(), public: tag.public, yanked: tag.yanked, changed };
     match ctx.json {
         true => output::json(&view),
         false => Record::of(&view).print(ctx),
@@ -193,36 +168,30 @@ async fn one_release(ctx: &Context, model: &str, release: &str, edit: Edit) -> R
 }
 
 pub(crate) async fn publish(ctx: &Context, args: Publish) -> Result<ExitCode, Error> {
-    let (release, tree) = (label("--release", &args.release)?, checkpoint(&args.tree)?);
-    one_release(ctx, &args.model, &release, Edit::Publish { release: release.clone(), tree }).await
-}
-
-pub(crate) async fn retarget(ctx: &Context, args: Retarget) -> Result<ExitCode, Error> {
-    let (release, tree) = (label("--release", &args.release)?, checkpoint(&args.tree)?);
-    one_release(ctx, &args.model, &release, Edit::Retarget { release: release.clone(), tree }).await
+    let release = label("--release", &args.release)?;
+    one_tag(ctx, &args.model, &release, Edit::Publish { release: release.clone(), commit: args.commit }).await
 }
 
 pub(crate) async fn yank(ctx: &Context, args: Yank) -> Result<ExitCode, Error> {
     let release = label("--release", &args.release)?;
-    one_release(ctx, &args.model, &release, Edit::Yank { release: release.clone() }).await
+    one_tag(ctx, &args.model, &release, Edit::Yank { release: release.clone(), yanked: !args.undo }).await
 }
 
 #[derive(Serialize)]
 struct Deleted {
     model: String,
-    /// One unreleased checkpoint; absent when the whole model went.
+    /// One tag; absent when the whole model went.
     #[serde(skip_serializing_if = "Option::is_none")]
-    checkpoint: Option<String>,
+    tag: Option<String>,
     /// False when it was already gone.
     removed: bool,
 }
 
 /// Never prompts: `--yes` is the confirmation, and without it nothing is sent.
 pub(crate) async fn delete(ctx: &Context, args: Delete) -> Result<ExitCode, Error> {
-    let (repo, checkpoint) = match ModelRef::parse(&args.model)? {
-        ModelRef::Checkpoint { repo, manifest } => (repo, Some(manifest)),
-        ModelRef::Hub { repo, release: None, lane: None } => (repo, None),
-        _ => return Err(usage("model_ref_invalid", format!("{:?}: delete takes org/name or org/name#sha256:…", args.model))),
+    let (repo, tag) = match ModelRef::parse(&args.model)? {
+        ModelRef::Hub { repo, release, lane: None } => (repo, release),
+        _ => return Err(usage("model_ref_invalid", format!("{:?}: delete takes org/name or org/name@tag", args.model))),
     };
     let hub = ctx.hub()?;
     if !args.yes {
@@ -230,12 +199,12 @@ pub(crate) async fn delete(ctx: &Context, args: Delete) -> Result<ExitCode, Erro
             .remedy("run it again with --yes"));
     }
     let model = repo.to_string();
-    let edit = checkpoint.clone().map_or(Edit::Empty, |tree| Edit::Remove { tree });
+    let edit = Edit::Delete { tag: tag.clone() };
     let (_, removed) = commit(&endpoint(ctx, &hub).await?, &model, |old| edit.apply(&model, old)).await?;
-    let view = Deleted { model, checkpoint, removed };
+    let view = Deleted { model, tag, removed };
     match ctx.json {
         true => output::json(&view),
-        false => Record::of(&view).note("The Hub's GC reclaims only objects no other model references.").print(ctx),
+        false => Record::of(&view).note("The Hub's GC reclaims the commits no tag names.").print(ctx),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -244,14 +213,14 @@ pub(crate) async fn delete(ctx: &Context, args: Delete) -> Result<ExitCode, Erro
 mod tests {
     use std::path::Path;
 
-    use tensorfs::format::Tree;
+    use tensorfs::format::{ObjectRef, Tag, Tree};
 
     use super::*;
 
     const MODEL: &str = "fidika/tiny";
 
-    /// A real tree of `variants`, each naming a header of its own name's bytes.
-    fn tree(variants: &[&str]) -> ObjectRef {
+    /// A real commit (tree) of `variants`, each naming a header of its own name's bytes.
+    fn commit_of(variants: &[&str]) -> ObjectRef {
         let mut tree = Tree::default();
         for variant in variants {
             tree.set_variant(variant, ObjectRef::of(variant.as_bytes()));
@@ -267,141 +236,153 @@ mod tests {
         commit(endpoint, MODEL, |old| edit.apply(MODEL, old)).await
     }
 
-    /// Another writer's edit, landing now through its own endpoint over the same directory.
-    fn elsewhere(dir: &Path, change: Edit) -> Result<(Doc, bool), Error> {
+    /// `change` by another writer, landing now through its own endpoint over the same directory.
+    fn elsewhere<T: Send + 'static>(dir: &Path, change: impl FnOnce(Endpoint) -> T + Send + 'static) -> T {
         let dir = dir.to_owned();
-        let other = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            runtime.block_on(edit(&at(&dir), change))
+        std::thread::spawn(move || change(at(&dir))).join().unwrap()
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(future)
+    }
+
+    /// An upload by another writer: private tag `tag` moves to `commit`.
+    fn uploaded(dir: &Path, tag: &str, commit: &ObjectRef) {
+        let (tag, commit) = (tag.to_owned(), commit.clone());
+        elsewhere(dir, move |endpoint| {
+            let upload = endpoint.update_repo(MODEL, |old| {
+                let mut doc = old.unwrap_or_else(|| Doc::new(MODEL));
+                doc.set_tag(&tag, commit.clone());
+                Ok(Some(doc))
+            });
+            block_on(upload).unwrap();
         });
-        other.join().unwrap()
     }
 
-    /// A directory endpoint where MODEL holds `checkpoints`, unreleased, as uploads leave it.
-    async fn uploaded(dir: &Path, checkpoints: &[&ObjectRef]) -> Endpoint {
-        let endpoint = at(dir);
-        let checkpoints: Vec<ObjectRef> = checkpoints.iter().map(|&c| c.clone()).collect();
-        let doc = Doc { name: MODEL.into(), checkpoints, ..Doc::default() };
-        endpoint.update_repo(MODEL, |_| Ok(Some(doc.clone()))).await.unwrap();
-        endpoint
+    fn publish(release: &str, commit: Option<&str>) -> Edit {
+        Edit::Publish { release: release.into(), commit: commit.map(str::to_owned) }
     }
 
-    fn publish(release: &str, tree: &ObjectRef) -> Edit {
-        Edit::Publish { release: release.into(), tree: tree.id() }
-    }
-
-    fn versions(doc: &Doc) -> Vec<(&str, String, bool)> {
-        doc.releases.iter().map(|r| (r.version.as_str(), r.tree.id(), r.yanked)).collect()
+    fn tags(doc: &Doc) -> Vec<(&str, String, bool, bool)> {
+        doc.tags.iter().map(|t| (t.name.as_str(), t.commit.id(), t.public, t.yanked)).collect()
     }
 
     #[tokio::test]
-    async fn a_tree_is_released_then_retargeted_to_one_that_adds_a_variant() {
+    async fn a_commit_is_released_and_the_release_moves_or_goes_public() {
         let dir = tempfile::tempdir().unwrap();
-        let (base, more) = (tree(&["f32"]), tree(&["f32", "fp8"]));
-        let endpoint = uploaded(dir.path(), &[&base, &more]).await;
+        let (base, more) = (commit_of(&["f32"]), commit_of(&["f32", "fp8"]));
+        uploaded(dir.path(), "main", &base);
+        let endpoint = at(dir.path());
 
-        let (doc, changed) = edit(&endpoint, publish("1.0.0", &base)).await.unwrap();
+        let (doc, changed) = edit(&endpoint, publish("1.0.0", Some("main"))).await.unwrap();
         assert!(changed);
-        assert_eq!((versions(&doc), doc.checkpoints.clone()), (vec![("1.0.0", base.id(), false)], vec![more.clone()]));
-        assert!(!edit(&endpoint, publish("1.0.0", &base)).await.unwrap().1, "the same release again is no change");
-        let over = edit(&endpoint, publish("1.0.0", &more)).await.unwrap_err();
-        assert_eq!((over.kind, over.code.as_str()), (Kind::Conflict, "release_exists"), "{over:?}");
+        assert_eq!(tags(&doc), [("main", base.id(), false, false), ("1.0.0", base.id(), true, false)]);
+        assert!(!edit(&endpoint, publish("1.0.0", Some(&base.id()))).await.unwrap().1, "the same commit again");
 
-        let retarget = |tree: &ObjectRef, release: &str| Edit::Retarget { release: release.into(), tree: tree.id() };
-        let (doc, changed) = edit(&endpoint, retarget(&more, "1.0.0")).await.unwrap();
-        assert!(changed);
-        assert_eq!(versions(&doc), [("1.0.0", more.id(), false)]);
-        assert_eq!(doc.checkpoints, std::slice::from_ref(&base), "the tree it left stays a checkpoint");
+        // An upload moves main; the release moves to it by the commit's id, keeping its place.
+        uploaded(dir.path(), "main", &more);
+        let (doc, _) = edit(&endpoint, publish("1.0.0", Some(&more.id()))).await.unwrap();
+        assert_eq!(tags(&doc), [("main", more.id(), false, false), ("1.0.0", more.id(), true, false)]);
         assert_eq!(endpoint.repo(MODEL).await.unwrap().unwrap().0, doc, "what the endpoint holds");
 
-        let missing = edit(&endpoint, retarget(&base, "2.0.0")).await.unwrap_err();
-        assert_eq!((missing.kind, missing.code.as_str()), (Kind::NotFound, "release_not_found"), "{missing:?}");
-        let unheld = edit(&endpoint, retarget(&tree(&["int8"]), "1.0.0")).await.unwrap_err();
-        assert_eq!((unheld.kind, unheld.code.as_str()), (Kind::NotFound, "checkpoint_not_found"), "{unheld:?}");
-        let nothing = commit(&at(&dir.path().join("empty")), MODEL, |old| publish("1.0.0", &base).apply(MODEL, old)).await.unwrap_err();
-        assert_eq!(nothing.code, "model_not_found", "{nothing:?}");
+        // A private tag goes public where it is.
+        uploaded(dir.path(), "2.0.0", &base);
+        let (doc, _) = edit(&endpoint, publish("2.0.0", None)).await.unwrap();
+        assert_eq!(doc.tag("2.0.0").map(|t| (t.commit.id(), t.public)), Some((base.id(), true)));
+
+        for (ask, code) in [
+            (publish("3.0.0", None), "tag_not_found"),
+            (publish("3.0.0", Some("nightly")), "tag_not_found"),
+            (publish("3.0.0", Some(&commit_of(&["int8"]).id())), "commit_not_found"),
+        ] {
+            let error = edit(&endpoint, ask).await.unwrap_err();
+            assert_eq!(error.code, code, "{error:?}");
+        }
+        let unversioned = edit(&endpoint, publish("nightly", Some("main"))).await.unwrap_err();
+        assert!(unversioned.kind == Kind::Validation && unversioned.message.contains("PEP 440"), "{unversioned:?}");
+        let nothing = commit(&at(&dir.path().join("empty")), MODEL, |old| publish("1.0.0", Some("main")).apply(MODEL, old)).await;
+        assert_eq!(nothing.unwrap_err().code, "model_not_found");
     }
 
     #[tokio::test]
-    async fn a_yank_stays_and_a_model_empties_only_once_every_release_is_yanked() {
+    async fn a_release_is_yanked_and_unyanked_and_tags_and_models_are_deleted() {
         let dir = tempfile::tempdir().unwrap();
-        let (base, spare) = (tree(&["f32"]), tree(&["bf16"]));
-        let endpoint = uploaded(dir.path(), &[&base, &spare]).await;
-        edit(&endpoint, publish("1.0.0", &base)).await.unwrap();
+        uploaded(dir.path(), "main", &commit_of(&["f32"]));
+        let endpoint = at(dir.path());
+        edit(&endpoint, publish("1.0.0", Some("main"))).await.unwrap();
 
-        let live = edit(&endpoint, Edit::Empty).await.unwrap_err();
-        assert_eq!((live.kind, live.code.as_str()), (Kind::Conflict, "release_live"), "{live:?}");
-        let yank = || Edit::Yank { release: "1.0.0".into() };
-        let (doc, changed) = edit(&endpoint, yank()).await.unwrap();
-        assert_eq!((versions(&doc), changed), (vec![("1.0.0", base.id(), true)], true));
-        assert!(!edit(&endpoint, yank()).await.unwrap().1, "a yanked release yanked again is no change");
+        let yank = |yanked| Edit::Yank { release: "1.0.0".into(), yanked };
+        let (doc, changed) = edit(&endpoint, yank(true)).await.unwrap();
+        assert_eq!((doc.tag("1.0.0").map(|t| t.yanked), changed), (Some(true), true));
+        assert!(!edit(&endpoint, yank(true)).await.unwrap().1, "yanked again is no change");
+        let (doc, changed) = edit(&endpoint, yank(false)).await.unwrap();
+        assert_eq!((doc.tag("1.0.0").map(|t| t.yanked), changed), (Some(false), true));
+        let missing = edit(&endpoint, Edit::Yank { release: "9.0.0".into(), yanked: true }).await.unwrap_err();
+        assert_eq!(missing.code, "tag_not_found", "{missing:?}");
 
-        let released = edit(&endpoint, Edit::Remove { tree: base.id() }).await.unwrap_err();
-        assert_eq!(released.code, "checkpoint_released", "{released:?}");
-        let (doc, removed) = edit(&endpoint, Edit::Remove { tree: spare.id() }).await.unwrap();
-        assert!(removed && doc.checkpoints.is_empty(), "{doc:?}");
-        assert!(!edit(&endpoint, Edit::Remove { tree: spare.id() }).await.unwrap().1, "already gone");
-
-        let (doc, removed) = edit(&endpoint, Edit::Empty).await.unwrap();
-        assert!(removed && doc.releases.is_empty() && doc.checkpoints.is_empty(), "{doc:?}");
+        let main = || Edit::Delete { tag: Some("main".into()) };
+        let (doc, removed) = edit(&endpoint, main()).await.unwrap();
+        assert!(removed && doc.tag("main").is_none() && doc.tag("1.0.0").is_some(), "{doc:?}");
+        assert!(!edit(&endpoint, main()).await.unwrap().1, "already gone");
+        let (doc, removed) = edit(&endpoint, Edit::Delete { tag: None }).await.unwrap();
+        assert!(removed && doc.tags.is_empty(), "{doc:?}");
         assert_eq!(endpoint.repo(MODEL).await.unwrap().unwrap().0, doc);
     }
 
     #[tokio::test]
     async fn a_concurrent_edit_is_read_again_and_the_edit_applied_to_it() {
         let dir = tempfile::tempdir().unwrap();
-        let (base, more) = (tree(&["f32"]), tree(&["f32", "fp8"]));
-        let endpoint = uploaded(dir.path(), &[&base, &more]).await;
+        let (base, more) = (commit_of(&["f32"]), commit_of(&["f32", "fp8"]));
+        uploaded(dir.path(), "main", &base);
+        let endpoint = at(dir.path());
 
-        // Another writer releases 2.0.0 between this edit's read and its write.
+        // An upload moves main between this edit's read and its write: 1.0.0 goes where main is.
         let mut reads = 0;
         let (doc, changed) = commit(&endpoint, MODEL, |old| {
             reads += 1;
             if reads == 1 {
-                elsewhere(dir.path(), publish("2.0.0", &more)).unwrap();
+                uploaded(dir.path(), "main", &more);
             }
-            publish("1.0.0", &base).apply(MODEL, old)
+            publish("1.0.0", Some("main")).apply(MODEL, old)
         })
         .await
         .unwrap();
-        assert_eq!(reads, 2, "one lost race, one read again");
-        assert!(changed);
-        assert_eq!(versions(&doc), [("2.0.0", more.id(), false), ("1.0.0", base.id(), false)]);
-        assert!(doc.checkpoints.is_empty(), "{doc:?}");
+        assert_eq!((reads, changed), (2, true), "one lost race, one read again");
+        assert_eq!(tags(&doc), [("main", more.id(), false, false), ("1.0.0", more.id(), true, false)]);
         assert_eq!(endpoint.repo(MODEL).await.unwrap().unwrap().0, doc);
 
-        // Another writer releases 3.0.0 first: this edit no longer applies, and says why.
+        // Another writer deletes main first: this edit no longer applies, and says why.
         let mut reads = 0;
         let refused = commit(&endpoint, MODEL, |old| {
             reads += 1;
             if reads == 1 {
-                elsewhere(dir.path(), publish("3.0.0", &more)).unwrap();
+                elsewhere(dir.path(), |other| block_on(edit(&other, Edit::Delete { tag: Some("main".into()) }))).unwrap();
             }
-            publish("3.0.0", &base).apply(MODEL, old)
+            publish("2.0.0", Some("main")).apply(MODEL, old)
         })
         .await
         .unwrap_err();
-        assert_eq!((refused.kind, refused.code.as_str()), (Kind::Conflict, "release_exists"), "{refused:?}");
-        assert!(refused.message.contains(&more.id()), "{refused:?}");
+        assert_eq!((refused.kind, refused.code.as_str(), reads), (Kind::NotFound, "tag_not_found", 2), "{refused:?}");
         let held = endpoint.repo(MODEL).await.unwrap().unwrap().0;
-        assert_eq!(held.release(Some("3.0.0")).map(|r| r.tree.id()), Some(more.id()));
+        assert_eq!(tags(&held), [("1.0.0", more.id(), true, false)]);
     }
 
     #[tokio::test]
     async fn a_document_that_changes_under_every_write_is_reported_busy() {
         let dir = tempfile::tempdir().unwrap();
-        let base = tree(&["f32"]);
-        let endpoint = uploaded(dir.path(), &[&base]).await;
+        let base = commit_of(&["f32"]);
+        uploaded(dir.path(), "main", &base);
+        let endpoint = at(dir.path());
         let mut reads = 0;
         let busy = commit(&endpoint, MODEL, |old| {
             reads += 1;
-            elsewhere(dir.path(), publish(&format!("0.{reads}"), &base)).unwrap();
-            publish("1.0.0", &base).apply(MODEL, old)
+            uploaded(dir.path(), &format!("draft{reads}"), &base);
+            publish("1.0.0", Some("main")).apply(MODEL, old)
         })
         .await
         .unwrap_err();
         assert_eq!((busy.kind, busy.code.as_str(), reads), (Kind::Conflict, "model_busy", ATTEMPTS), "{busy:?}");
         let held = endpoint.repo(MODEL).await.unwrap().unwrap().0;
-        assert_eq!((held.releases.len(), held.release(Some("1.0.0"))), (ATTEMPTS as usize, None));
+        assert_eq!((held.tags.len(), held.tag("1.0.0")), (1 + ATTEMPTS as usize, None::<&Tag>));
     }
 }

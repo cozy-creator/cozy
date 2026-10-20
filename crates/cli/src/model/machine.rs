@@ -136,7 +136,8 @@ fn made(ctx: &Context, run: &Run) {
     if let (Some(destination), Some(checkpoint)) = (destination, checkpoint)
         && !destination.starts_with("local/")
     {
-        output::next(ctx, &[&format!("cozy model publish {destination} --release <release> --tree {checkpoint}")]);
+        let model = destination.split('@').next().unwrap_or(destination);
+        output::next(ctx, &[&format!("cozy model publish {model} --release <version> --commit {checkpoint}")]);
     }
 }
 
@@ -154,7 +155,7 @@ pub(crate) async fn download(ctx: &Context, args: Download) -> Result<ExitCode, 
 }
 
 pub(crate) async fn upload(ctx: &Context, args: Upload) -> Result<ExitCode, Error> {
-    let destination = Repo::hub(&args.destination)?;
+    let destination = refs::destination(&args.destination)?;
     let made = source(&args.source, &args.profiles)?;
     if !ctx.signed_in(&ctx.hub()?) {
         // The machine publishes under this computer's sign-in; refuse before anything is made.
@@ -162,7 +163,7 @@ pub(crate) async fn upload(ctx: &Context, args: Upload) -> Result<ExitCode, Erro
             .next(ctx.login(&ctx.hub()?)));
     }
     let target = format!("{} → {destination}", args.source);
-    warm(ctx, &args.placement, args.detach, target, made, destination.to_string()).await
+    warm(ctx, &args.placement, args.detach, target, made, destination).await
 }
 
 /// One checkpoint a machine holds, and its repository's bytes there.
