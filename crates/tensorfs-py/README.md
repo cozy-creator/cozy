@@ -31,10 +31,10 @@ The format itself has no reference that lets both files share one stored copy.
 
 Hugging Face addresses this with [Xet](https://huggingface.co/docs/xet/en/download-protocol),
 a general file-storage layer: it groups content-addressed chunks into containers called
-*xorbs*, then reconstructs files from ranges within them. Xet also supports
-[local chunk caching](https://huggingface.co/docs/huggingface_hub/guides/manage-cache), so it
-does work on consumer machines. The distinction is that its normal download path reconstructs
-an ordinary file for the model loader; deduplication sits underneath that file interface.
+*xorbs*, then reconstructs files from ranges within them. Xet works on consumer machines too,
+and Hugging Face's [local file cache](https://huggingface.co/docs/huggingface_hub/en/guides/manage-cache#shared-blobs-across-repos)
+can share identical files across repositories. Its normal download path reconstructs an
+ordinary file for the model loader; deduplication sits underneath that file interface.
 
 TensorFS uses the shared chunk store as the model's native storage. A `.cozytensors` header
 references immutable chunks; checkpoints sharing a chunk keep one copy on disk, and readers
