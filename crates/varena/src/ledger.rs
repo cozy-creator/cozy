@@ -1458,7 +1458,7 @@ impl PrivateHost {
             return false;
         }
         if self.pending {
-            let mut committed = [0];
+            let mut committed = [0_u8];
             // Leave commit readiness for the dedicated service observer, even
             // if a budget query runs before that observer begins its wait.
             let read = unsafe {

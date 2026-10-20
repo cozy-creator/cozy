@@ -304,23 +304,28 @@ impl MappedBuffer {
 
 impl Drop for MappedBuffer {
     fn drop(&mut self) {
-        let released = (|| {
-            let driver = cuda::driver()?;
+        let released: cuda::Result<()> = (|| {
             if self.host != 0 {
                 self.synchronize()?;
                 let _context = CtxGuard::enter(self.ctx)?;
                 cuda::check("cuMemFreeHost", unsafe {
-                    (driver.mem_free_host)(self.host as *mut std::ffi::c_void)
+                    (cuda::driver()?.mem_free_host)(self.host as *mut std::ffi::c_void)
                 })?;
+                self.host = 0;
             }
-            cuda::check("cuDevicePrimaryCtxRelease", unsafe {
-                (driver.primary_ctx_release)(self.native_device)
-            })
+            Ok(())
         })();
         if released.is_err() {
             // A failed completion/free is not authority to release the host lease. Retain
             // the allocation, context and its actual reservation until process exit.
             std::mem::forget(self.reservation.take());
+            return;
+        }
+        // No host bytes remain owned. A later context-reference failure cannot turn a
+        // declined allocation or a proven free into a live host-byte reservation.
+        drop(self.reservation.take());
+        if let Ok(driver) = cuda::driver() {
+            unsafe { (driver.primary_ctx_release)(self.native_device) };
         }
     }
 }
