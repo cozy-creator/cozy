@@ -122,13 +122,13 @@ variant is selected. A standalone header cannot supply unknown repository files 
 metadata.
 
 All operations involving network/source resolution above are async except construction and
-`writer`. `checkpoint.materialize(directory, format, dequantize).await` returns
+`writer`. `checkpoint.materialize(directory, format, decode).await` returns
 `Result<PathBuf>`; choose `Format::Safetensors` or `Format::Cozytensors`. It first makes
 the required checkpoint data and known repository files available, then writes the folder.
 Missing or denied source objects fail the operation.
-`Format::Cozytensors` requires `None` for `dequantize`; `Format::Safetensors` accepts
-`Some(Dtype::F32)`, `Some(Dtype::BF16)` or `Some(Dtype::F16)`, or `None`.
-Other combinations return `Invalid` before source preparation.
+`Format::Cozytensors` requires `decode=false`. For `Format::Safetensors`, `decode=true`
+expands encoded tensors into their logical dtypes; `false` retains supported encodings.
+Decoding into the native cozytensors format returns `Invalid` before source preparation.
 
 A `Writer` also has `pipeline(class, config)`, `component(name, class, config, config_file)`
 (`config_file` names the file the config exports as, such as `scheduler_config.json`; `None`
@@ -187,7 +187,7 @@ worker-permission mechanism.
 | `source(direct_io)` | An `io::source::Source` over the chunks for the read engine; absent chunks are fetched on the process runtime. |
 | `missing(&Selection)` | `Result<Vec<ObjectRef>>`. |
 | `download(&Download).await` | `Result<Fetched>`. |
-| `materialize(directory, Format, dequantize).await` | `Result<PathBuf>` for the complete checkpoint folder. |
+| `materialize(directory, Format, decode).await` | `Result<PathBuf>` for the complete checkpoint folder. |
 
 `download` completes when the selected chunks and supporting files are verified and locally
 available; the open checkpoint retains them. `missing` is optional availability inspection.

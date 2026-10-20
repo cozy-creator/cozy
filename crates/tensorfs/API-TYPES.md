@@ -114,10 +114,9 @@ impl Checkpoint {
     pub fn component(&self, name: &str) -> Result<&Component>;
     pub fn missing(&self, selection: &Selection) -> Result<Vec<ObjectRef>>;
     pub async fn download(&self, want: &Download<'_>) -> Result<Fetched>;
-    // Cozytensors requires None; Safetensors accepts F32/BF16/F16 when Some.
-    // Other dequantize arguments return Invalid before source preparation.
+    // Cozytensors requires false; Safetensors true decodes into each tensor's logical dtype.
     pub async fn materialize(&self, dir: &Path, format: Format,
-        dequantize: Option<Dtype>) -> Result<PathBuf>;
+        decode: bool) -> Result<PathBuf>;
 }
 // Open.lazy=false downloads this checkpoint's data before returning.
 // Synchronous chunk/read/asset/folder operations use bytes made available by download().
