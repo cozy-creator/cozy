@@ -335,8 +335,25 @@ impl Placement {
                 }
             };
             let released = if release.is_some() {
-                this.drive(0, Trigger::ReleaseUnusedCaches(row.owner().row))
-                    .map(|_| ())
+                let through = this
+                    .inner
+                    .lock()
+                    .table
+                    .pages
+                    .iter()
+                    .filter(|page| page.row == row.owner().row && page.kind == Kind::Cache)
+                    .map(|page| page.id)
+                    .max()
+                    .unwrap_or(0);
+                this.drive(
+                    0,
+                    Trigger::ReleaseUnusedCaches {
+                        row: row.owner().row,
+                        after: 0,
+                        through,
+                    },
+                )
+                .map(|_| ())
             } else {
                 Ok(())
             };
@@ -1584,7 +1601,7 @@ impl Placement {
         self.row.publish(&snapshot, inner.progress)
     }
 
-    fn drive(&self, request: RequestId, trigger: Trigger) -> Result<Relief> {
+    fn drive(&self, request: RequestId, mut trigger: Trigger) -> Result<Relief> {
         let reason = match trigger {
             Trigger::FillLanded(_) | Trigger::PinReleased(_) => "speculation",
             Trigger::Lower { .. } => "lower",
@@ -1599,6 +1616,13 @@ impl Placement {
             let actions = plan::decide(&self.inner.lock().table, trigger);
             let mut wait = None;
             for action in actions {
+                if let (Trigger::ReleaseUnusedCaches { after, .. }, Action::Shrink { page, .. }) =
+                    (&mut trigger, &action)
+                {
+                    // One callback per cache in the initial fixed set, including
+                    // callbacks that report progress without resizing their page.
+                    *after = *page;
+                }
                 match action {
                     Action::DropHome { request, page } => {
                         self.event(request, page, "lower", "lower")?;
@@ -2338,6 +2362,10 @@ mod gpu_tests {
         let held = Arc::new(Mutex::new(Some(pin)));
         let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (retained, calls) = (held.clone(), dropped.clone());
+        let created = Arc::new(Mutex::new(None));
+        let created_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (created_id, new_calls) = (created.clone(), created_calls.clone());
+        let weak = Arc::downgrade(&placement);
         let cache = placement
             .cache(
                 0,
@@ -2345,6 +2373,15 @@ mod gpu_tests {
                     calls.fetch_add(1, Ordering::AcqRel);
                     let pin = retained.lock().take();
                     drop(pin);
+                    let new_calls = new_calls.clone();
+                    let id = weak.upgrade().expect("live placement").cache(
+                        0,
+                        Arc::new(move |_| {
+                            new_calls.fetch_add(1, Ordering::AcqRel);
+                            Ok(0)
+                        }),
+                    )?;
+                    *created_id.lock() = Some(id);
                     Ok(0) // zero graph-pool bytes still retain real weight pins
                 }),
             )
@@ -2373,6 +2410,11 @@ mod gpu_tests {
             || ledger.fits("warm-admission", "shape").unwrap(),
         );
         assert_eq!(dropped.load(Ordering::Acquire), 1);
+        assert_eq!(
+            created_calls.load(Ordering::Acquire),
+            0,
+            "a cache created by a release callback must wait for a later signal"
+        );
         assert!(held.lock().is_none());
         assert_eq!(
             placement
@@ -2396,7 +2438,7 @@ mod gpu_tests {
                     ptr: pin.ptr,
                     stream: 0,
                 },
-                dst: Dst::host(&mut bytes),
+                dst: tensorfs::io::Dst::host(&mut bytes),
             }],
             &tensorfs::io::ReadOpts::default(),
         )
@@ -2410,6 +2452,7 @@ mod gpu_tests {
             "warm admission refilled weight bytes"
         );
         placement.close_cache(cache);
+        placement.close_cache(created.lock().take().expect("callback-created cache"));
         placement.close().unwrap();
         println!(
             "PASS idle cache pins release before warm admission without weight eviction {uuid}"

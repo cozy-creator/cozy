@@ -224,7 +224,11 @@ pub enum Trigger {
         ceiling: Class,
     },
     /// Admission needs idle cache references released, not any weight bytes evicted.
-    ReleaseUnusedCaches(RowId),
+    ReleaseUnusedCaches {
+        row: RowId,
+        after: PageId,
+        through: PageId,
+    },
     Load {
         row: RowId,
         model: ModelId,
@@ -667,7 +671,11 @@ pub fn decide(table: &Table, trigger: Trigger) -> Vec<Action> {
     match trigger {
         Trigger::End(request) => vec![Action::Forget(request)],
         Trigger::Ask { row, need, ceiling } => reclaim(table, row, need, ceiling),
-        Trigger::ReleaseUnusedCaches(row) => {
+        Trigger::ReleaseUnusedCaches {
+            row,
+            after,
+            through,
+        } => {
             if table.requests.iter().any(|request| request.row == row) {
                 return vec![];
             }
@@ -676,15 +684,20 @@ pub fn decide(table: &Table, trigger: Trigger) -> Vec<Action> {
                 .iter()
                 .filter(|page| {
                     page.row == row
+                        && page.id > after
+                        && page.id <= through
                         && page.mapped()
                         && page.kind == Kind::Cache
                         && table.class(page) == Class::Unused
                 })
-                .map(|page| Action::Shrink {
-                    page: page.id,
-                    bytes: page.bytes,
+                .min_by_key(|page| page.id)
+                .map(|page| {
+                    vec![Action::Shrink {
+                        page: page.id,
+                        bytes: page.bytes,
+                    }]
                 })
-                .collect()
+                .unwrap_or_default()
         }
         Trigger::Load { row, model, level } => load(table, row, model, level),
         Trigger::Lower { request, need } => lower(table, request, need),
@@ -1362,23 +1375,58 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            decide(&table, Trigger::ReleaseUnusedCaches(1)),
+            decide(
+                &table,
+                Trigger::ReleaseUnusedCaches {
+                    row: 1,
+                    after: 0,
+                    through: 4
+                }
+            ),
             vec![Action::Shrink { page: 2, bytes: 0 }]
+        );
+        // Even a callback that leaves its zero-byte cache present is attempted
+        // once. A cache created by that callback lies beyond the initial bound.
+        let mut new_cache = page(5, 0);
+        new_cache.kind = Kind::Cache;
+        new_cache.model = None;
+        table.pages.push(new_cache);
+        assert!(
+            decide(
+                &table,
+                Trigger::ReleaseUnusedCaches {
+                    row: 1,
+                    after: 2,
+                    through: 4
+                }
+            )
+            .is_empty(),
+            "processed and newly created caches must not extend the release"
         );
         table.pages.retain(|page| page.id != 2);
         assert!(
-            decide(&table, Trigger::ReleaseUnusedCaches(1)).is_empty(),
+            decide(
+                &table,
+                Trigger::ReleaseUnusedCaches {
+                    row: 1,
+                    after: 2,
+                    through: 4
+                }
+            )
+            .is_empty(),
             "ordinary warm weights must remain mapped"
         );
-        table.pages.push({
-            let mut cache = page(2, 8);
-            cache.kind = Kind::Cache;
-            cache.model = None;
-            cache
-        });
         table.requests.push(request(7));
         assert!(
-            decide(&table, Trigger::ReleaseUnusedCaches(1)).is_empty(),
+            decide(
+                &table,
+                Trigger::ReleaseUnusedCaches {
+                    row: 1,
+                    after: 0,
+                    through: 4
+                }
+            )
+            .is_empty(),
             "a newly admitted request prevents the idle-only release"
         );
     }
