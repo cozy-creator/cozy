@@ -766,6 +766,9 @@ pub struct Answer {
     pub byte_grants: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<Value>,
+    /// A failed child call's raising traceback, whole (its triage's).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub traceback: String,
     /// A memo hit: the entry's verified copy in the run's spool, and what producing it cost.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub local: String,
@@ -801,6 +804,7 @@ impl Answer {
             result: String::new(),
             byte_grants: Vec::new(),
             progress: None,
+            traceback: String::new(),
             local: String::new(),
             cost_ms: 0.0,
             disputed: false,
