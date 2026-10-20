@@ -788,13 +788,18 @@ _RULES: dict[object, Rule] = {getattr(aten, n): r for r, ns in _SPEC.items() for
 
 
 def install(module: nn.Module) -> int:
-    """The token cut on every FFN under `module`: diffusers' FeedForward and the activation
-    projections inside one (GELU, GEGLU, SwiGLU and subclasses such as a fused SwiGLU), all
-    token-wise. A block that calls its FFN's parts itself still cuts at the projection, whose
-    [tokens, inner] intermediate is the widest. Returns how many it cut."""
+    """Independent-axis cuts under `module`: spatial bands for channel RMS normalization,
+    and token bands for Diffusers' FFNs and their activation projections (GELU, GEGLU,
+    SwiGLU and subclasses). A block that calls its FFN's parts still cuts at the projection,
+    whose [tokens, inner] intermediate is the widest. Returns how many it cut."""
     count = 0
     for sub in module.modules():
         kinds = [c.__name__ for c in type(sub).__mro__ if c.__module__.startswith("diffusers.")]
+        rms = _rms_contract(sub, kinds)
+        if rms is not None and "_varena_rms" not in vars(sub):
+            sub.forward = _rms(*rms, sub.forward)  # type: ignore[method-assign]
+            vars(sub)["_varena_rms"] = True
+            count += 1
         kind = next((k for k in kinds if k in _FFN), None)
         if kind is not None and "_varena_ffn" not in vars(sub):
             # a quantized lane's linears are encoded leaves: any module naming out_features counts
@@ -803,6 +808,74 @@ def install(module: nn.Module) -> int:
             vars(sub)["_varena_ffn"] = True
             count += 1
     return count
+
+
+def _rms_contract(module: nn.Module, kinds: Sequence[str]) -> tuple[str, bool, int, int] | None:
+    """Diffusers' channel RMS norm: channel-only affine terms, no spatial reduction."""
+    kind = next((name for name in kinds if name.endswith("RMS_norm")), None)
+    gamma, bias = getattr(module, "gamma", None), getattr(module, "bias", None)
+    first, scale = getattr(module, "channel_first", None), getattr(module, "scale", None)
+    if kind is None or type(first) is not bool or not isinstance(gamma, Tensor):
+        return None
+    shape = tuple(gamma.shape)
+    if not shape or (any(n != 1 for n in shape[1:]) if first else len(shape) != 1):
+        return None
+    channels = int(shape[0])
+    if channels < 1 or not isinstance(scale, float) or scale != channels**0.5:
+        return None
+    if isinstance(bias, Tensor):
+        if bias.shape != gamma.shape:
+            return None
+    elif bias != 0.0:
+        return None
+    return kind, first, channels, gamma.dim()
+
+
+def _rms(
+    kind: str, first: bool, channels: int, affine_dims: int, forward: Callable[..., object]
+) -> Callable[..., object]:
+    def cut(x: object, *args: object, **kwargs: object) -> object:
+        if (args or kwargs or not isinstance(x, Tensor) or x.layout is not torch.strided
+                or not x.is_contiguous() or torch.is_grad_enabled() or x.dim() < 3):
+            return forward(x, *args, **kwargs)
+        normalized = 1 if first else x.dim() - 1
+        if x.shape[normalized] != channels or (first and x.dim() != affine_dims + 1):
+            return forward(x)
+        axis = max((i for i in range(1, x.dim()) if i != normalized), key=lambda i: x.shape[i])
+        height, device = int(x.shape[axis]), x.device
+        if height < 2:
+            return forward(x)
+        key = ("rms_norm", kind, tuple(x.shape), x.dtype, axis)
+        per_row = x.numel() // height * max(x.element_size(), 4) * 4
+
+        def shrink(size: int) -> int:
+            return min(size // 2, _served.rungs.available(device) // per_row or size)
+
+        try:
+            run = functools.partial(_rms_bands, forward, x, axis)
+            return _settle(run, height, 1, shrink, device, "rms spatial rows", key)[1]
+        except _Whole:
+            return forward(x)
+
+    return cut
+
+
+def _rms_bands(forward: Callable[..., object], x: Tensor, axis: int, rows: int) -> object:
+    if rows >= x.shape[axis]:
+        return forward(x)
+    out: Tensor | None = None
+    for at in range(0, int(x.shape[axis]), rows):
+        length = min(rows, int(x.shape[axis]) - at)
+        part = forward(x.narrow(axis, at, length))
+        expected = (*x.shape[:axis], length, *x.shape[axis + 1 :])
+        if not isinstance(part, Tensor) or part.shape != expected:
+            raise _Whole()
+        out = part.new_empty(tuple(x.shape)) if out is None else out
+        if part.dtype != out.dtype or part.device != out.device:
+            raise _Whole()
+        out.narrow(axis, at, length).copy_(part)
+    assert out is not None
+    return out
 
 
 def _ffn(kind: str, width: int, forward: Callable[..., object]) -> Callable[..., object]:
