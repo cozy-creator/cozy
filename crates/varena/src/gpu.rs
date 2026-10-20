@@ -17,7 +17,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use crossbeam_queue::SegQueue;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use tensorfs::io::cuda::{self, AccessDesc, AllocationProp, CtxGuard, Handle};
 use tensorfs::io::source::{IoTally, Item, Mode, Source};
 use tensorfs::io::{self, Dst, ReadStats};
@@ -319,6 +319,8 @@ pub struct Gpu {
     device: Arc<Device>,
     pages: Mutex<BTreeMap<PageId, Arc<Page>>>,
     releases: SegQueue<Release>,
+    generation: Mutex<u64>,
+    changed: Condvar,
 }
 
 impl Gpu {
@@ -350,6 +352,8 @@ impl Gpu {
                 }),
                 pages: Mutex::new(BTreeMap::new()),
                 releases: SegQueue::new(),
+                generation: Mutex::new(0),
+                changed: Condvar::new(),
             })
         })();
         if setup.is_err() {
@@ -516,6 +520,7 @@ impl Gpu {
             Ok(mapping) => mapping,
             Err(error) => {
                 *page.state.lock() = State::Empty;
+                self.notify();
                 return Err(error);
             }
         };
@@ -556,7 +561,7 @@ impl Gpu {
         }))
         .unwrap_or(Err(Error::Internal("page fill or transform panicked")));
         let mut state = page.state.lock();
-        match result {
+        let result = match result {
             Ok(stats) => {
                 *state = State::Ready(mapping);
                 Ok(stats)
@@ -565,7 +570,10 @@ impl Gpu {
                 *state = State::Failed(mapping, error.clone());
                 Err(error)
             }
-        }
+        };
+        drop(state);
+        self.notify();
+        result
     }
 
     pub fn bind(self: &Arc<Self>, id: PageId, stream: usize) -> Result<Pin> {
@@ -600,6 +608,21 @@ impl Gpu {
             let mut state = release.page.state.lock();
             if let State::Ready(mapping) = &mut *state {
                 for stream in &release.streams {
+                    if *stream == 2 {
+                        // CUDA's per-thread default sentinel cannot be replayed on
+                        // this cleanup thread. A checked context drain covers the
+                        // original thread's work before the pin can be released.
+                        let completion = self
+                            .device
+                            .enter()
+                            .and_then(|_context| call!("cuCtxSynchronize", ctx_synchronize()));
+                        if let Err(error) = completion {
+                            drop(state);
+                            self.releases.push(release);
+                            return Err(error);
+                        }
+                        continue;
+                    }
                     match Event::record(&self.device, *stream) {
                         Ok(event) => mapping.releases.push(event),
                         Err(error) => {
@@ -615,6 +638,48 @@ impl Gpu {
             }
         }
         Ok(())
+    }
+
+    fn notify(&self) {
+        let mut generation = self.generation.lock();
+        *generation = generation.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    /// Wait for an actual in-flight fill or CUDA consumer fence. Live pins with
+    /// no submitted completion are not guessed at and do not trigger a timer.
+    pub fn wait_pending(&self) -> Result<bool> {
+        self.poll()?;
+        let mut generation = self.generation.lock();
+        let before = *generation;
+        let pages: Vec<_> = self.pages.lock().values().cloned().collect();
+        let mut filling = false;
+        for page in pages {
+            let state = page.state.lock();
+            match &*state {
+                State::Filling => filling = true,
+                State::Ready(mapping) => {
+                    for event in mapping.ready.iter().chain(&mapping.releases) {
+                        if !event.done()? {
+                            let _context = self.device.enter()?;
+                            call!(
+                                "cuEventSynchronize",
+                                event_synchronize(event.raw as cuda::CUevent)
+                            )?;
+                            return Ok(true);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if filling {
+            while *generation == before {
+                self.changed.wait(&mut generation);
+            }
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// False means the page remains protected by a fill, view, or consumer event.
@@ -855,5 +920,6 @@ impl Drop for Pin {
             page: self.page.clone(),
             streams: self.streams.get_mut().clone(),
         });
+        self.gpu.notify();
     }
 }
