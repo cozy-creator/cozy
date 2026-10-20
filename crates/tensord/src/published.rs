@@ -1805,26 +1805,10 @@ fn newest_release(catalog: &Catalog, org: &str, name: &str) -> Result<String, Fa
     let card = catalog
         .package(org, name)
         .map_err(|e| absent(e, "package_absent", || format!("{org}/{name} is not published at {}", catalog.origin())))?;
-    card.releases
-        .iter()
-        .filter(|row| row.yanked != Some(true) && row.yanked_at.as_deref().is_none_or(str::is_empty))
-        .map(|row| row.release.as_str())
-        .max_by(|a, b| release_order(a).cmp(&release_order(b)))
-        .map(str::to_string)
+    let open = card.releases.iter().filter(|row| row.yanked != Some(true) && row.yanked_at.as_deref().is_none_or(str::is_empty));
+    tensorfs::format::newest_by(open, |row| row.release.as_str())
+        .map(|row| row.release.clone())
         .ok_or(("release_absent", format!("{org}/{name} has no release that is not yanked")))
-}
-
-/// Finals after pre-releases, then by the numbers of the version and of its tag.
-fn release_order(release: &str) -> (bool, Vec<u64>, Vec<u64>) {
-    let numbers = |text: &str| -> Vec<u64> {
-        text.split(|c: char| !c.is_ascii_digit())
-            .filter(|part| !part.is_empty())
-            .map(|part| part.parse().unwrap_or(u64::MAX))
-            .collect()
-    };
-    let split = release.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(release.len());
-    let (version, tag) = release.split_at(split);
-    (tag.is_empty(), numbers(version), numbers(tag))
 }
 
 fn stage_of(progress: &Progress) -> String {
@@ -2618,12 +2602,6 @@ pub(crate) mod tests {
         assert_eq!(default_choice(&explicit, path, "local/qwen-copy", "").unwrap().repository, "proof/probe");
         assert!(default_choice(&json!({"path": path}), path, "paul/qwen-image-2", "").is_none());
         assert_eq!(choice_absent(path, "paul/qwen-image-2").0, "model_choice_absent");
-    }
-
-    #[test]
-    fn releases_order_by_version() {
-        assert!(release_order("2.0.0") > release_order("10.0.0rc1"));
-        assert!(release_order("10.0.0") > release_order("9.1.0"));
     }
 
     /// A source choice becomes the slot's grant through TensorFS `source_model`, as a local
