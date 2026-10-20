@@ -1,0 +1,59 @@
+name: consumer-probe
+# xs-060 probe: the public install path and a first user's walkthrough on every release runner.
+on:
+  push:
+    branches: [probe/xs-060-consumer]
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04 }
+          - { os: ubuntu-24.04-arm }
+          - { os: macos-15 }
+          - { os: macos-15-intel }
+          - { os: windows-2025, ps: powershell }
+          - { os: windows-11-arm, ps: pwsh }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github
+      - run: bash .github/consumer-probe.sh ${{ matrix.os }} ${{ matrix.ps }}
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: transcript-${{ matrix.os }}
+          path: transcript.md
+  distros:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - run: |
+          for img in ubuntu:22.04 debian:12 fedora:42 archlinux:latest rockylinux:9 opensuse/tumbleweed amazonlinux:2 alpine:3.20; do
+            echo "## $img" >> transcript.md
+            docker run --rm "$img" sh -c '
+              (command -v apt-get >/dev/null && apt-get update -qq >/dev/null && apt-get install -y -qq curl ca-certificates >/dev/null) ||
+              (command -v dnf >/dev/null && dnf install -y -q curl-minimal tar gzip >/dev/null 2>&1 || dnf install -y -q tar gzip >/dev/null 2>&1) ||
+              (command -v pacman >/dev/null && pacman -Sy --noconfirm -q curl >/dev/null) ||
+              (command -v zypper >/dev/null && zypper -q -n install curl tar gzip >/dev/null) ||
+              (command -v yum >/dev/null && yum install -y -q tar gzip >/dev/null) ||
+              (command -v apk >/dev/null && apk add -q curl)
+              curl -LsSf https://tensorhub.com/install.sh | sh; echo "install exit $?"
+              ~/.cozy/bin/cozy --version; ~/.cozy/bin/cozy package search sdxl; echo "search exit $?"
+              ~/.cozy/bin/cozy machine enable; echo "enable exit $?"
+            ' >> transcript.md 2>&1 < /dev/null
+          done
+          cat transcript.md
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: transcript-distros
+          path: transcript.md
