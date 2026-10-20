@@ -743,7 +743,8 @@ class Memory:
 
     def _register(self, model: Model) -> None:
         assert self.native is not None
-        version = model.fill.prepare() if model.fill is not None else None
+        current_fill = model.fill
+        version = current_fill.prepare() if current_fill is not None else None
         fingerprint = hashlib.sha256(
             repr((model.source.fingerprint, version)).encode()
         ).hexdigest()
@@ -751,20 +752,20 @@ class Memory:
 
         def fill(region: int, raw: Any, stream: int) -> None:
             current = weak()
-            if current is None or current.fill is None:
+            if current is None or current_fill is None:
                 return
             block = next(
                 b for b in (current.common, *current.blocks) if region in b.regions
             )
             with torch.cuda.stream(torch.cuda.ExternalStream(stream, device=device)):
-                current.fill(block, block.parts(region, torch.from_dlpack(raw)))
+                current_fill(block, block.parts(region, torch.from_dlpack(raw)))
 
         model.ws = self.native.register(
             model.name,
             model.source.ck,
             regions_of(model.module),
             fingerprint,
-            fill if model.fill is not None else None,
+            fill if current_fill is not None else None,
         )
         model.version = version
         with self.lock:

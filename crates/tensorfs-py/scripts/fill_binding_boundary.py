@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import queue
 import sys
 import threading
 import types
 import unittest
+import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,15 +19,21 @@ def boundary(source: Path) -> types.ModuleType:
     tree = ast.parse(source.read_text())
     classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
     methods = [node for node in classes["Memory"].body
-               if getattr(node, "name", "") in ("_enter", "_exit")]
+               if getattr(node, "name", "") in ("_enter", "_exit", "_register")]
     module = types.ModuleType("fill_binding_source")
     module.__dict__.update(
-        dataclass=dataclass, field=field, threading=threading,
+        dataclass=dataclass, field=field, threading=threading, hashlib=hashlib, weakref=weakref,
+        regions_of=lambda _: [["weight"]],
         _disable_current_modes=nullcontext,
         Unbound=type("Unbound", (RuntimeError,), {}),
-        torch=types.SimpleNamespace(cuda=types.SimpleNamespace(
-            current_stream=lambda _: "stream", is_current_stream_capturing=lambda: False,
-        )),
+        torch=types.SimpleNamespace(
+            from_dlpack=lambda raw: raw,
+            cuda=types.SimpleNamespace(
+                current_stream=lambda _: "stream", is_current_stream_capturing=lambda: False,
+                ExternalStream=lambda stream, device: stream,
+                stream=lambda _: nullcontext(),
+            ),
+        ),
         _unbind=lambda block: setattr(block, "stream", None),
     )
     sys.modules[module.__name__] = module
@@ -84,6 +92,59 @@ def run(call):
 
 
 class BindingBoundary(unittest.TestCase):
+    def test_registration_retains_the_fill_that_named_its_content(self) -> None:
+        class Fill:
+            def __init__(self, version):
+                self.version, self.prepared, self.written = version, 0, []
+
+            def prepare(self):
+                self.prepared += 1
+                return self.version
+
+            def __call__(self, block, parts):
+                self.written.append((block, parts))
+
+        class Native:
+            def __init__(self):
+                self.registrations = []
+
+            def register(self, *arguments):
+                self.registrations.append(arguments)
+                return types.SimpleNamespace(id=len(self.registrations))
+
+        class Model:
+            pass
+
+        first, second = Fill("first"), Fill("second")
+        model = Model()
+        model.fill, model.name, model.module = first, "model", object()
+        model.source = types.SimpleNamespace(fingerprint="source", ck=object())
+        model.common = types.SimpleNamespace(regions=[0], parts=lambda _, raw: {"weight": raw})
+        model.blocks = []
+        room = types.SimpleNamespace(native=Native(), device="cuda", lock=threading.RLock(), _names={})
+        B.Memory._register(room, model)
+        old = room.native.registrations[0]
+        self.assertEqual(model.version, "first")
+        self.assertEqual(old[3], hashlib.sha256(repr(("source", "first")).encode()).hexdigest())
+        model.fill = second
+        old[4](0, "old-bytes", 123)
+        self.assertEqual(first.written, [(model.common, {"weight": "old-bytes"})])
+        self.assertEqual(second.written, [], "old registration used a later fill selection")
+        B.Memory._register(room, model)
+        new = room.native.registrations[1]
+        self.assertNotEqual(old[3], new[3])
+        self.assertEqual(model.version, "second")
+        new[4](0, "new-bytes", 123)
+        old[4](0, "still-old-bytes", 123)
+        self.assertEqual(second.written, [(model.common, {"weight": "new-bytes"})])
+        self.assertEqual(first.written[-1][1], {"weight": "still-old-bytes"})
+        self.assertEqual((first.prepared, second.prepared), (1, 1))
+        owner = weakref.ref(model)
+        del model
+        self.assertIsNone(owner(), "the callback must retain its fill, not the Model")
+        old[4](0, "after-close", 123)
+        self.assertEqual(len(first.written), 2)
+
     def test_self_block_refuses_and_reuses_without_harming_bound_reentry(self) -> None:
         room = Room()
         block = B.Block(types.SimpleNamespace(memory=room), -1, "", None)
