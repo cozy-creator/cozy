@@ -25,12 +25,15 @@ jobs:
       ref: ${{ github.sha }}
       build: tensorfs
       # Build the matching ordinary TensorFS 0.13 / Runtime 0.30 candidate until publication.
-      runtime_ref: 8b8cdcbdd4afb4111cd8b3aa81612365034dca91
+      runtime_ref: af981ed954d03716472ef48c0df7b0091791ab8d
       # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below.
       test: |
         cargo test --locked --no-fail-fast -p tensord
         uv pip install --torch-backend cpu --python "$TENSORFS_TEST_PYTHON" "$COZY_TEST_RUNTIME_WHEEL" pytest torch
         "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/ffn_scope_lifetime.py
+        uv pip install --python "$TENSORFS_TEST_PYTHON" --no-deps diffusers==0.41.0
+        "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/rmsnorm_bands.py
+        "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/request_failure_boundary.py
         "$TENSORFS_TEST_PYTHON" -m pytest -q .runtime/tests/test_weight_source_loading.py .runtime/tests/test_retention_quiescence.py
 
   # The library suites do not install or launch a Runtime, so they need no release wheel.
@@ -57,4 +60,4 @@ jobs:
       # Use the compatible Hub routes and the expand-only migration during this cohort rollout.
       tensorhub_ref: e1b09ab11c2e6af5e15fb752f6bd5ebd6fb1379e
       # Use this Runtime and TensorFS pair until both releases are published.
-      runtime_ref: 8b8cdcbdd4afb4111cd8b3aa81612365034dca91
+      runtime_ref: af981ed954d03716472ef48c0df7b0091791ab8d
