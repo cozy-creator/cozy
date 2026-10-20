@@ -39,9 +39,10 @@ impl Memory {
     /// Register once in the existing reactor. Each await consumes the eventfd counter; all
     /// pending changes coalesce into one wake, and the caller then retries queue admission.
     pub fn event_source(&self) -> std::io::Result<tokio::io::unix::AsyncFd<std::fs::File>> {
-        Ok(tokio::io::unix::AsyncFd::new(std::fs::File::from(
-            self.events().try_clone_to_owned()?,
-        ))?)
+        let file = std::fs::File::from(self.events().try_clone_to_owned()?);
+        // SAFETY: AsyncFd owns this File exclusively; its descriptor stays open and stable
+        // until AsyncFd is dropped. The descriptor is an eventfd, already nonblocking.
+        unsafe { tokio::io::unix::AsyncFd::register(file) }.map_err(Into::into)
     }
     pub async fn changed(source: &tokio::io::unix::AsyncFd<std::fs::File>) -> std::io::Result<()> {
         loop {
