@@ -1459,20 +1459,31 @@ impl PrivateHost {
         }
         if self.pending {
             let mut committed = [0];
-            match self.lease.read(&mut committed) {
-                Ok(0) => return false,
-                Ok(_) if committed == [1] => self.pending = false,
-                // This is an instantaneous metadata probe. A malformed marker or
-                // interrupted probe keeps the reservation conservative until close.
-                _ => (),
+            // Leave commit readiness for the dedicated service observer, even
+            // if a budget query runs before that observer begins its wait.
+            let read = unsafe {
+                libc::recv(
+                    self.lease.as_raw_fd(),
+                    committed.as_mut_ptr().cast(),
+                    committed.len(),
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if read == 0 {
+                return false;
             }
+            if read == 1 && committed == [1] {
+                self.pending = false;
+            }
+            // A malformed marker or interrupted probe keeps the reservation
+            // conservative until close.
         }
         true
     }
 }
 
 enum HostAdmission {
-    Granted(UnixStream, u64),
+    Granted(UnixStream, u64, UnixStream),
     Reclaimed(u64),
     Refused,
 }
@@ -1587,12 +1598,15 @@ impl HostCache {
                 server
                     .set_nonblocking(true)
                     .map_err(|error| io("nonblocking private host lease", error))?;
+                let observer = server
+                    .try_clone()
+                    .map_err(|error| io("observe private host lease", error))?;
                 state.private.push(PrivateHost {
                     bytes,
                     lease: server,
                     pending: true,
                 });
-                return Ok(HostAdmission::Granted(client, pending));
+                return Ok(HostAdmission::Granted(client, pending, observer));
             }
             through.unwrap_or(state.clock).min(state.clock)
         };
@@ -1781,6 +1795,47 @@ fn ram_status(state: &HostState, layout: [u8; 32]) -> Option<RamStatus> {
             .collect(),
     })
 }
+
+/// Reuse the reserve request's dedicated service thread through the result's
+/// lifetime. The server endpoint never keeps a client alias alive. Observe one
+/// commit, then only hangup, so an unread marker cannot create a wake loop.
+fn watch_private_host(lease: UnixStream, host: &HostCache, table: &Table) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let closed = libc::POLLHUP | libc::POLLERR | libc::POLLRDHUP;
+    #[cfg(not(target_os = "linux"))]
+    let closed = libc::POLLHUP | libc::POLLERR;
+    let mut descriptor = libc::pollfd {
+        fd: lease.as_raw_fd(),
+        events: libc::POLLIN | closed,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: a live, independently owned descriptor; an event-driven wait,
+        // never under the host-state lock and with no timeout or status polling.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, -1) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(io("wait for private host lease", error));
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(Error::Io("private host lease descriptor closed".into()));
+        }
+        let ended = descriptor.revents & closed != 0;
+        if ended || descriptor.revents & libc::POLLIN != 0 {
+            host.state.lock().prune_private();
+            host.wake_warm();
+            table.changed();
+        }
+        if ended {
+            return Ok(());
+        }
+        descriptor.events = closed;
+    }
+}
+
 struct RamFill {
     ram: Arc<Ram>,
     index: usize,
@@ -2375,13 +2430,22 @@ fn serve(
                         i64::from_le_bytes(room),
                         (count == 1).then_some(u64::from_le_bytes(through)),
                     )? {
-                        HostAdmission::Granted(lease, pending) => {
+                        HostAdmission::Granted(lease, pending, observer) => {
+                            // Publish the grant before handing its client to the
+                            // worker; subsequent wakes name actual commit/free.
+                            table.changed();
                             stream
                                 .write_all(&[1])
                                 .and_then(|_| stream.write_all(&pending.to_le_bytes()))
                                 .map_err(|error| io("admit private host allocation", error))?;
                             platform::handles::send_fd(&stream, &lease)
                                 .map_err(crate::os("send private host lease"))?;
+                            drop(lease);
+                            drop(stream);
+                            // Only reserve_host's dedicated fork uses this command.
+                            // Preserve the lease after its row/request has gone,
+                            // and observe SIGKILL via the same kernel hangup.
+                            return watch_private_host(observer, &host, &table);
                         }
                         HostAdmission::Reclaimed(through) => {
                             stream
