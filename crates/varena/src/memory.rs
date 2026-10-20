@@ -149,9 +149,11 @@ enum ConsumerFence {
     Context,
 }
 
+fn consumer_stream(stream: u64) -> u64 { if stream == 0 { 1 } else { stream } }
+
 impl ConsumerFence {
     fn of(stream: u64) -> Self {
-        if stream == 2 { Self::Context } else { Self::Stream(stream) }
+        if stream == 2 { Self::Context } else { Self::Stream(consumer_stream(stream)) }
     }
 
     fn complete(self, context: CUcontext) -> Result<()> {
@@ -1564,10 +1566,10 @@ enum At {
 struct Consumers(Mutex<BTreeSet<u64>>);
 
 impl Consumers {
-    fn new(bind: u64) -> Self { Self(Mutex::new(BTreeSet::from([bind]))) }
+    fn new(bind: u64) -> Self { Self(Mutex::new(BTreeSet::from([consumer_stream(bind)]))) }
 
     fn wait_on(&self, stream: u64, wait: impl FnOnce() -> Result<()>) -> Result<()> {
-        self.0.lock().unwrap().insert(stream);
+        self.0.lock().unwrap().insert(consumer_stream(stream));
         wait()
     }
 
@@ -1632,7 +1634,7 @@ impl Pinned {
     /// CUDA PTDS (2) uses a captured-context completion fence after the final consumer drops.
     pub fn wait_on(&self, stream: u64) -> Result<()> {
         self.consumers.wait_on(stream, || {
-            if stream == self.stream || self.ready.done()? { return Ok(()); }
+            if consumer_stream(stream) == consumer_stream(self.stream) || self.ready.done()? { return Ok(()); }
             let _c = CtxGuard::enter(self.ws.gpu.inner.ctx)?;
             wait_in(stream as CUstream, &self.ready)
         })
@@ -1843,8 +1845,12 @@ mod completion_tests {
         assert_eq!(failure.code(), "INVALID");
         assert_eq!(consumers.streams(), vec![11, 22, 33]);
         assert_eq!(ConsumerFence::of(1), ConsumerFence::Stream(1));
+        assert_eq!(ConsumerFence::of(0), ConsumerFence::Stream(1));
         assert_eq!(ConsumerFence::of(2), ConsumerFence::Context);
         assert_eq!(ConsumerFence::of(1234), ConsumerFence::Stream(1234));
+        let legacy = Consumers::new(0);
+        legacy.wait_on(1, || Ok(())).unwrap();
+        assert_eq!(legacy.streams(), vec![1], "native default and DLPack legacy duplicated a consumer");
     }
 
     #[test]
