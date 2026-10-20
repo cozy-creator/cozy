@@ -14,7 +14,7 @@ use parking_lot::{Condvar, Mutex};
 use tensorfs::io::source::Source;
 use tensorfs::io::ReadStats;
 
-use crate::gpu::{FillPin, Gpu, Pin};
+use crate::gpu::{BindState, FillPin, Gpu, Pin};
 use crate::layout::Layout;
 use crate::ledger::{self, Channel, Ledger, PageKey};
 use crate::plan::{
@@ -392,7 +392,10 @@ impl Placement {
     /// pages that were still protected when the wake was first processed.
     fn settle(&self) -> Result<()> {
         loop {
-            let pending = self.gpu.wait_pending()?;
+            let pending = self.gpu.prepare_pending()?;
+            // Preparation may dequeue a last pin. Publish that release and its
+            // still-pending consumer before waiting, so observers/foregrounds
+            // never need the consumer to finish just to see the new facts.
             self.refresh()?;
             if self.stop.load(Ordering::Acquire) {
                 return Ok(());
@@ -401,7 +404,7 @@ impl Placement {
             for request in requests {
                 self.drive(request, Trigger::PinReleased(request))?;
             }
-            if !pending {
+            if !self.gpu.wait_prepared(pending)? {
                 return Ok(());
             }
         }
@@ -926,7 +929,7 @@ impl Placement {
             self.enter(request, model)?;
         }
         let mut previous = None;
-        let pin = loop {
+        loop {
             self.wait_fill(page)?;
             if let Some(row) = self
                 .inner
@@ -950,12 +953,62 @@ impl Placement {
             match outcome {
                 Relief::Complete => {
                     self.wait_fill(page)?;
-                    match self.gpu.bind(page, stream) {
-                        Ok(pin) => break pin,
-                        Err(error) if error.is_oom() => {
-                            self.gpu.recover()?;
+                    let operation = self.operations.lock();
+                    let mut inner = self.inner.lock();
+                    let model = inner
+                        .table
+                        .page(page)
+                        .and_then(|row| row.model)
+                        .ok_or_else(|| invalid("page model absent"))?;
+                    if !inner
+                        .models
+                        .get(&model)
+                        .is_some_and(|model| model.pages.contains(&page))
+                        || !inner.requests.contains_key(&request)
+                    {
+                        return Err(invalid("binding owner disappeared"));
+                    }
+                    match self.gpu.try_pin(page, stream)? {
+                        BindState::Ready { pin, pins } => {
+                            let row = inner
+                                .table
+                                .pages
+                                .iter_mut()
+                                .find(|row| row.id == page)
+                                .ok_or_else(|| invalid("bound page absent"))?;
+                            row.tier = Tier::Gpu;
+                            row.pins = u32::try_from(pins).unwrap_or(u32::MAX);
+                            Self::event_locked(&mut inner, request, page, "bind", "demand")?;
+                            inner.table.bound(request, page);
+                            inner.progress = inner.progress.saturating_add(1);
+                            self.publish(&inner)?;
+                            drop(inner);
+                            drop(operation);
+                            // The actual pin protects the mapping while its stream
+                            // dependency is enqueued outside both publication gates.
+                            // An error drops the pin through checked deferred cleanup.
+                            if let Err(error) = pin.wait_on(stream) {
+                                if let Some(run) = self.inner.lock().requests.get_mut(&request) {
+                                    run.stats.proof.invalidate("bind-stream-wait-failed");
+                                }
+                                return Err(error);
+                            }
+                            self.refresh()?;
+                            self.row.wake()?;
+                            return Ok(pin);
                         }
-                        Err(error) => return Err(error),
+                        BindState::Filling(pending) => {
+                            drop(inner);
+                            drop(operation);
+                            self.refresh()?;
+                            self.gpu.wait_prepared(pending)?;
+                            // Retry only after the captured generation progresses.
+                            continue;
+                        }
+                        BindState::Empty => {
+                            // A reclaimer won the handoff after drive completed.
+                            // The existing progress check bounds the new decision.
+                        }
                     }
                 }
                 Relief::Lower(short) => {
@@ -994,16 +1047,7 @@ impl Placement {
                 });
             }
             previous = Some(facts);
-        };
-        self.event(request, page, "bind", "demand")?;
-        {
-            let mut inner = self.inner.lock();
-            inner.table.bound(request, page);
-            inner.progress = inner.progress.saturating_add(1);
         }
-        self.refresh()?;
-        self.row.wake()?;
-        Ok(pin)
     }
 
     fn wait_fill(&self, page: PageId) -> Result<()> {
@@ -1425,7 +1469,6 @@ impl Placement {
     }
 
     fn refresh(&self) -> Result<()> {
-        let facts = self.gpu.facts()?;
         let status = self.ledger.status()?;
         let orphans = self.channel.orphans(self.row.owner())?;
         let models: Vec<_> = self
@@ -1443,7 +1486,12 @@ impl Placement {
                     .map(|status| (id, state, status))
             })
             .collect::<Result<Vec<_>>>()?;
+        self.gpu.poll()?;
         let mut inner = self.inner.lock();
+        // Capture and publish GPU facts under the same gate used by try_pin.
+        // No earlier capture survives the IPC above and overwrites a newer pin.
+        // Poll (including checked CUDA cleanup) stays outside this gate.
+        let facts = self.gpu.facts_current()?;
         for (id, state, status) in ram {
             let pages = match inner
                 .models
@@ -1576,6 +1624,11 @@ impl Placement {
                 lowered: BTreeSet::new(),
             });
         }
+        self.publish(&inner)
+    }
+
+    /// Atomic row publication only; no CUDA calls, fill or custody IPC.
+    fn publish(&self, inner: &Inner) -> Result<()> {
         let snapshot = ledger::Snapshot {
             classes: inner
                 .table
@@ -2670,6 +2723,98 @@ mod gpu_tests {
         println!(
             "PASS RAM warming stays asynchronous and closes without stale registration {uuid}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn actual_readiness_survives_concurrent_fill_and_unmap() {
+        let gpu = Gpu::open(0).expect("real CUDA device");
+        let uuid = assigned_gpu(&gpu);
+        let length = crate::layout::REGION_ALIGN;
+        let range = gpu.reserve(length).expect("real reservation");
+        gpu.register(
+            1,
+            range,
+            0,
+            length,
+            Arc::new(Source::files(vec![], false, 0)),
+            vec![Item {
+                offset: 0,
+                len: length,
+                source: ItemSource::Inline(vec![7; length as usize].into()),
+                part_end: true,
+            }],
+            0,
+            "concurrent-readiness".into(),
+        )
+        .unwrap();
+        assert!(matches!(gpu.try_pin(1, 0).unwrap(), BindState::Empty));
+        let (started, waiting) = mpsc::channel();
+        let (release, finish) = mpsc::channel();
+        let gate = ReleaseGate(Some(release));
+        let filling = gpu.clone();
+        let worker = std::thread::spawn(move || {
+            filling.fill_with(1, move |_| {
+                started.send(()).unwrap();
+                finish.recv().unwrap();
+                Ok(())
+            })
+        });
+        waiting
+            .recv_timeout(Duration::from_secs(10))
+            .expect("actual fill entered");
+        let pending = match gpu.try_pin(1, 0).unwrap() {
+            BindState::Filling(pending) => pending,
+            _ => panic!("an actual in-flight fill must remain a typed pending state"),
+        };
+        assert!(
+            !gpu.unmap(1).unwrap(),
+            "an in-flight fill must not be unmapped"
+        );
+        drop(gate);
+        worker.join().unwrap().expect("actual GPU fill completes");
+        // Completion deliberately precedes the prepared wait: no notification
+        // may be lost between observing Filling and beginning the wait.
+        assert!(gpu.wait_prepared(pending).unwrap());
+        let pin = match gpu.try_pin(1, 0).unwrap() {
+            BindState::Ready { pin, pins: 1 } => pin,
+            _ => panic!("the completed mapping must be pinned atomically"),
+        };
+        pin.wait_on(0).unwrap();
+        let reclaiming = gpu.clone();
+        assert!(
+            !std::thread::spawn(move || reclaiming.unmap(1))
+                .join()
+                .unwrap()
+                .unwrap(),
+            "a concurrent reclaimer must preserve the actual pin"
+        );
+        let mut bytes = [0_u8; 32];
+        // The live pin owns this source through the synchronous device read.
+        unsafe {
+            tensorfs::io::read(
+                &[tensorfs::io::Copy {
+                    src: tensorfs::io::Src::Device {
+                        device: 0,
+                        ptr: pin.ptr,
+                        stream: 0,
+                    },
+                    dst: tensorfs::io::Dst::host(&mut bytes),
+                }],
+                &tensorfs::io::ReadOpts::default(),
+            )
+        }
+        .expect("actual pinned GPU contents");
+        assert_eq!(bytes, [7; 32]);
+        drop(pin);
+        gpu.wait_pending().unwrap();
+        assert!(
+            gpu.unmap(1).unwrap(),
+            "the completed last pin must release the mapping"
+        );
+        assert!(matches!(gpu.try_pin(1, 0).unwrap(), BindState::Empty));
+        gpu.unregister(1).unwrap();
+        println!("PASS actual readiness survives concurrent fill and unmap {uuid}");
     }
 
     #[test]
