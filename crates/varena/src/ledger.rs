@@ -4,7 +4,7 @@
 //! private file description, so even SIGKILL drops the claim. Snapshot copies are atomics:
 //! an interrupted publisher leaves the preceding complete copy readable.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(target_os = "linux")]
@@ -13,7 +13,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering::*};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
 use parking_lot::Mutex;
@@ -198,6 +198,7 @@ fn signal(fd: BorrowedFd<'_>) {
 
 struct Table {
     file: File,
+    identity: (u64, u64),
     base: *mut Shared,
 }
 // SAFETY: only atomics are shared; references cannot outlive this mapping's Arc.
@@ -213,7 +214,8 @@ impl Drop for Table {
 }
 impl Table {
     fn map(file: File) -> Result<Self> {
-        if file.metadata().map_err(|e| io("stat ledger", e))?.len() != size_of::<Shared>() as u64 {
+        let metadata = file.metadata().map_err(|e| io("stat ledger", e))?;
+        if metadata.len() != size_of::<Shared>() as u64 {
             return Err(Error::Invalid(
                 "ledger size differs from this protocol".into(),
             ));
@@ -234,6 +236,7 @@ impl Table {
         }
         Ok(Self {
             file,
+            identity: (metadata.dev(), metadata.ino()),
             base: base.cast(),
         })
     }
@@ -371,11 +374,18 @@ pub struct Ledger {
     events: Arc<OwnedFd>,
     _watcher: Option<Watcher>,
     custody: Arc<Mutex<Custody>>,
+    host: Arc<HostCache>,
     observations: Mutex<HashMap<Owner, (u64, u64)>>,
 }
 impl Ledger {
     /// Open the machine/user's existing ledger, or initialize it under the file's OFD lock.
     pub fn create(gpu_uuid: &str, capacity: u64) -> Result<Self> {
+        Self::create_with_host(gpu_uuid, capacity, Arc::new(HostCache::default()))
+    }
+    /// TensorD supplies one host cache for all of its device ledgers. CUDA page
+    /// custody and the shared per-device placement table remain independent.
+    pub fn create_with_host(gpu_uuid: &str, capacity: u64, host: Arc<HostCache>) -> Result<Self> {
+        host.check_process()?;
         if gpu_uuid.is_empty()
             || gpu_uuid.len() > 96
             || !gpu_uuid
@@ -467,6 +477,7 @@ impl Ledger {
                 join: Some(join),
             }),
             custody: Arc::default(),
+            host,
             observations: Mutex::default(),
         })
     }
@@ -488,6 +499,7 @@ impl Ledger {
             events,
             _watcher: None,
             custody: Arc::default(),
+            host: Arc::new(HostCache::default()),
             observations: Mutex::default(),
         })
     }
@@ -506,11 +518,12 @@ impl Ledger {
         self.grant(0)
     }
     pub fn grant(&self, pid: u32) -> Result<Grant> {
+        self.host.check_process()?;
         let (server, client) = UnixStream::pair().map_err(|e| io("create grant channel", e))?;
-        let (table, custody) = (self.table.clone(), self.custody.clone());
+        let (table, custody, host) = (self.table.clone(), self.custody.clone(), self.host.clone());
         std::thread::Builder::new()
             .name("varena-custody".into())
-            .spawn(move || serve(server, pid, table, custody))
+            .spawn(move || serve(server, pid, table, custody, host))
             .map_err(|e| io("start grant service", e))?;
         Ok(Grant {
             table: self
@@ -602,6 +615,7 @@ impl Ledger {
         Err(Error::Invalid("ledger has no free row".into()))
     }
     pub fn status(&self) -> Result<Status> {
+        self.host.check_process()?;
         let kept = self
             .custody
             .lock()
@@ -616,7 +630,8 @@ impl Ledger {
             peaks: self.peaks(),
             kept,
             ram_bytes: sum(self
-                .custody
+                .host
+                .state
                 .lock()
                 .ram
                 .values()
@@ -626,6 +641,7 @@ impl Ledger {
     /// Reap only kernel-released claims. Their custody remains available until consumed or
     /// explicitly dropped; no GPU context is needed to close the queued handle containers.
     pub fn reap(&self, pid: u32) -> Result<()> {
+        self.host.check_process()?;
         for row in self.table.rows()?.into_iter().filter(|r| r.pid == pid) {
             if row.state == State::Live {
                 return Err(Error::Invalid("cannot reap a live row".into()));
@@ -634,6 +650,11 @@ impl Ledger {
             slot.state
                 .store(row.owner.generation << 2 | REAPING, Release);
             self.custody.lock().orphan(row.owner);
+            for held in self.host.state.lock().ram.values_mut() {
+                held.observers.retain(|subscriber, _| {
+                    subscriber.table != self.table.identity || subscriber.owner != row.owner
+                });
+            }
             slot.state.store(row.owner.generation << 2, Release);
         }
         self.table.changed();
@@ -807,14 +828,19 @@ impl Ledger {
         source: Arc<Source>,
         regions: Vec<RamRegion>,
     ) -> Result<bool> {
-        register_ram(&self.table, &self.custody, layout, source, regions, None)
+        self.host.check_process()?;
+        register_ram(&self.table, &self.host, layout, source, regions, None)
     }
     pub fn ram_status(&self, layout: [u8; 32]) -> Option<RamStatus> {
-        ram_status(&self.custody.lock(), layout)
+        self.host.check_process().ok()?;
+        ram_status(&self.host.state.lock(), layout)
     }
     /// Explicit pressure reclamation: never drops a layout with a live reader lease.
     pub fn release_ram(&self, layout: [u8; 32]) -> bool {
-        let mut custody = self.custody.lock();
+        if self.host.check_process().is_err() {
+            return false;
+        }
+        let mut custody = self.host.state.lock();
         let idle = custody.ram.get_mut(&layout).is_some_and(|held| {
             held.readers
                 .retain(|reader| !platform::handles::hung_up(reader));
@@ -827,10 +853,10 @@ impl Ledger {
                 .map(|held| held.observers)
                 .unwrap_or_default()
         } else {
-            BTreeSet::new()
+            BTreeMap::new()
         };
         drop(custody);
-        notify_owners(&self.table, observers);
+        notify_owners(observers);
         if idle {
             self.table.changed();
         }
@@ -839,7 +865,10 @@ impl Ledger {
     /// On real host pressure, release the oldest completed RAM layout with no live view.
     /// No GPU pages or running-request buffers are considered here.
     pub fn release_unused_ram(&self) -> bool {
-        let mut custody = self.custody.lock();
+        if self.host.check_process().is_err() {
+            return false;
+        }
+        let mut custody = self.host.state.lock();
         let victim = custody
             .ram
             .iter_mut()
@@ -858,7 +887,7 @@ impl Ledger {
                 .map(|held| held.observers)
                 .unwrap_or_default();
             drop(custody);
-            notify_owners(&self.table, observers);
+            notify_owners(observers);
             self.table.changed();
             true
         } else {
@@ -1136,15 +1165,59 @@ impl Drop for Ram {
 struct RamHeld {
     layout: Arc<Ram>,
     readers: Vec<UnixStream>,
-    observers: BTreeSet<(Owner, u64)>,
+    observers: BTreeMap<Subscriber, Weak<Table>>,
     generation: u64,
     used: u64,
+}
+impl RamHeld {
+    fn prune(&mut self) {
+        self.observers.retain(|subscriber, table| {
+            table.upgrade().is_some_and(|table| {
+                table
+                    .slot(subscriber.owner)
+                    .is_ok_and(|slot| slot.state.load(Acquire) & 3 == LIVE)
+            })
+        });
+    }
 }
 #[derive(Default)]
 struct Custody {
     pages: BTreeMap<PageKey, Kept>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Subscriber {
+    table: (u64, u64),
+    owner: Owner,
+    token: u64,
+}
+/// A machine service's explicitly owned host tier. It is shared by that service's
+/// per-GPU ledgers, never by a static registry, and drops with its last owner.
+pub struct HostCache {
+    process: u32,
+    state: Mutex<HostState>,
+}
+#[derive(Default)]
+struct HostState {
     ram: BTreeMap<[u8; 32], RamHeld>,
     clock: u64,
+}
+impl Default for HostCache {
+    fn default() -> Self {
+        Self {
+            process: std::process::id(),
+            state: Mutex::default(),
+        }
+    }
+}
+impl HostCache {
+    fn check_process(&self) -> Result<()> {
+        if self.process != std::process::id() {
+            return Err(Error::Invalid(
+                "host cache must be created after fork; adopt a grant instead".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 impl Custody {
     fn orphan(&mut self, owner: Owner) {
@@ -1170,23 +1243,26 @@ fn orphan(table: &Table, page: &Kept) -> bool {
     })
 }
 
-fn notify_owners(table: &Table, observers: BTreeSet<(Owner, u64)>) {
-    for (owner, _) in observers {
-        let _ = table.signal(owner);
+fn notify_owners(observers: BTreeMap<Subscriber, Weak<Table>>) {
+    for (subscriber, table) in observers {
+        if let Some(table) = table.upgrade() {
+            let _ = table.signal(subscriber.owner);
+        }
     }
 }
-fn notify_ram(table: &Table, custody: &Mutex<Custody>, layout: [u8; 32], generation: u64) {
-    let observers = custody
+fn notify_ram(table: &Table, host: &HostCache, layout: [u8; 32], generation: u64) {
+    let observers = host
+        .state
         .lock()
         .ram
         .get(&layout)
         .filter(|held| held.generation == generation)
         .map(|held| held.observers.clone())
         .unwrap_or_default();
-    notify_owners(table, observers);
+    notify_owners(observers);
     table.changed();
 }
-fn ram_status(custody: &Custody, layout: [u8; 32]) -> Option<RamStatus> {
+fn ram_status(custody: &HostState, layout: [u8; 32]) -> Option<RamStatus> {
     let held = custody.ram.get(&layout)?;
     Some(RamStatus {
         generation: held.generation,
@@ -1199,9 +1275,22 @@ fn ram_status(custody: &Custody, layout: [u8; 32]) -> Option<RamStatus> {
             .collect(),
     })
 }
+struct RamFill {
+    ram: Arc<Ram>,
+    table: Arc<Table>,
+    host: Arc<HostCache>,
+    layout: [u8; 32],
+    generation: u64,
+}
+impl Drop for RamFill {
+    fn drop(&mut self) {
+        self.ram.filling.store(false, Release);
+        notify_ram(&self.table, &self.host, self.layout, self.generation);
+    }
+}
 fn register_ram(
     table: &Arc<Table>,
-    custody: &Arc<Mutex<Custody>>,
+    host: &Arc<HostCache>,
     layout: [u8; 32],
     source: Arc<Source>,
     regions: Vec<RamRegion>,
@@ -1220,15 +1309,25 @@ fn register_ram(
                 "RAM fingerprint has a different layout".into(),
             ));
         }
-        held.observers.extend(observer);
+        held.prune();
+        if let Some((owner, token)) = observer {
+            held.observers.insert(
+                Subscriber {
+                    table: table.identity,
+                    owner,
+                    token,
+                },
+                Arc::downgrade(table),
+            );
+        }
         Ok(false)
     };
-    if let Some(held) = custody.lock().ram.get_mut(&layout) {
+    if let Some(held) = host.state.lock().ram.get_mut(&layout) {
         return existing(held);
     }
     let ram = Arc::new(Ram::new(regions.clone())?);
     let generation = {
-        let mut held = custody.lock();
+        let mut held = host.state.lock();
         if let Some(held) = held.ram.get_mut(&layout) {
             return existing(held);
         }
@@ -1242,19 +1341,37 @@ fn register_ram(
             RamHeld {
                 layout: ram.clone(),
                 readers: Vec::new(),
-                observers: observer.into_iter().collect(),
+                observers: observer
+                    .map(|(owner, token)| {
+                        (
+                            Subscriber {
+                                table: table.identity,
+                                owner,
+                                token,
+                            },
+                            Arc::downgrade(table),
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
                 generation,
                 used: generation,
             },
         );
         generation
     };
-    let (fill, table, custody) = (ram, table.clone(), custody.clone());
-    let failed_table = table.clone();
-    let failed_custody = custody.clone();
+    let (fill, table, host) = (ram, table.clone(), host.clone());
+    let failed_host = host.clone();
     let started = std::thread::Builder::new()
         .name("varena-ram".into())
         .spawn(move || {
+            let _finished = RamFill {
+                ram: fill.clone(),
+                table: table.clone(),
+                host: host.clone(),
+                layout,
+                generation,
+            };
             for (region, ready) in fill.regions.iter().zip(&fill.ready) {
                 // A warm cache never consumes the last observed host headroom. Refusing to warm
                 // a region is normal: demand still has its verified disk source.
@@ -1281,22 +1398,30 @@ fn register_ram(
                 match result {
                     Ok(_) => {
                         ready.store(true, Release);
-                        notify_ram(&table, &custody, layout, generation);
+                        notify_ram(&table, &host, layout, generation);
                     }
                     Err(error) => tracing::warn!(%error, "RAM region remains on disk"),
                 }
             }
-            fill.filling.store(false, Release);
-            notify_ram(&table, &custody, layout, generation);
         });
     if let Err(error) = started {
-        let observers = failed_custody
-            .lock()
-            .ram
-            .remove(&layout)
-            .map(|held| held.observers)
-            .unwrap_or_default();
-        notify_owners(&failed_table, observers);
+        let observers = {
+            let mut state = failed_host.state.lock();
+            if state
+                .ram
+                .get(&layout)
+                .is_some_and(|held| held.generation == generation)
+            {
+                state
+                    .ram
+                    .remove(&layout)
+                    .map(|held| held.observers)
+                    .unwrap_or_default()
+            } else {
+                BTreeMap::new()
+            }
+        };
+        notify_owners(observers);
         return Err(io("start RAM fill", error));
     }
     Ok(true)
@@ -1305,7 +1430,13 @@ fn register_ram(
 /// The grant channel carries only placement custody, never model headers or data bytes.
 /// Packet: op/u8, row/u32, generation/u64, fingerprint/32 bytes, page/u64, count/u32,
 /// spans/count*u64; an offer then sends one SCM_RIGHTS container. Imports consume it once.
-fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex<Custody>>) {
+fn serve(
+    mut stream: UnixStream,
+    pid: u32,
+    table: Arc<Table>,
+    custody: Arc<Mutex<Custody>>,
+    host: Arc<HostCache>,
+) {
     let result = (|| -> Result<()> {
         let mut bound = None;
         loop {
@@ -1453,25 +1584,41 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                         .map_err(|e| io("acknowledge release", e))?;
                 }
                 Some(4) => {
-                    let mut held = custody.lock();
-                    held.clock = held.clock.saturating_add(1);
-                    let used = held.clock;
-                    let ready = held.ram.get_mut(&key.fingerprint).and_then(|ram| {
-                        let index = usize::try_from(key.page).ok()?;
-                        let region = ram.layout.regions.get(index)?;
-                        let (offset, len) = (region.offset, region.len);
-                        ram.layout
-                            .ready
-                            .get(index)?
-                            .load(Acquire)
-                            .then_some((ram, offset, len))
-                    });
-                    if let Some((ram, offset, len)) = ready {
-                        ram.used = used;
+                    let ready = {
+                        let held = host.state.lock();
+                        held.ram.get(&key.fingerprint).and_then(|ram| {
+                            let index = usize::try_from(key.page).ok()?;
+                            let region = ram.layout.regions.get(index)?;
+                            ram.layout.ready.get(index)?.load(Acquire).then(|| {
+                                (
+                                    ram.layout.clone(),
+                                    ram.generation,
+                                    region.offset,
+                                    region.len,
+                                )
+                            })
+                        })
+                    };
+                    let ready = if let Some((layout, generation, offset, len)) = ready {
                         let (ours, theirs) =
                             UnixStream::pair().map_err(|e| io("create RAM reader lease", e))?;
-                        let file = shm::reopen(ram.layout.file.as_fd(), false)
+                        let file = shm::reopen(layout.file.as_fd(), false)
                             .map_err(crate::os("open read-only RAM"))?;
+                        let mut held = host.state.lock();
+                        held.clock = held.clock.saturating_add(1);
+                        let used = held.clock;
+                        held.ram
+                            .get_mut(&key.fingerprint)
+                            .filter(|ram| ram.generation == generation)
+                            .map(|ram| {
+                                ram.used = used;
+                                ram.readers.push(ours);
+                                (file, theirs, offset, len)
+                            })
+                    } else {
+                        None
+                    };
+                    if let Some((file, lease, offset, len)) = ready {
                         stream
                             .write_all(&[1])
                             .and_then(|_| stream.write_all(&offset.to_le_bytes()))
@@ -1479,9 +1626,8 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                             .map_err(|e| io("send RAM region", e))?;
                         platform::handles::send_fd(&stream, &file)
                             .map_err(crate::os("send RAM file"))?;
-                        platform::handles::send_fd(&stream, &theirs)
+                        platform::handles::send_fd(&stream, &lease)
                             .map_err(crate::os("send RAM lease"))?;
-                        ram.readers.push(ours);
                     } else {
                         stream.write_all(&[0]).map_err(|e| io("send RAM miss", e))?;
                     }
@@ -1549,7 +1695,7 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                         .collect::<Result<Vec<_>>>()?;
                     let accepted = register_ram(
                         &table,
-                        &custody,
+                        &host,
                         key.fingerprint,
                         Arc::new(Source::files(files, true, 0)),
                         regions,
@@ -1560,7 +1706,7 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                         .map_err(|e| io("ack RAM registration", e))?;
                 }
                 Some(8) => {
-                    let status = ram_status(&custody.lock(), key.fingerprint);
+                    let status = ram_status(&host.state.lock(), key.fingerprint);
                     stream
                         .write_all(&[u8::from(status.is_some())])
                         .map_err(|e| io("send RAM status", e))?;
@@ -1580,9 +1726,14 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                     }
                 }
                 Some(9) => {
-                    let mut held = custody.lock();
+                    let mut held = host.state.lock();
                     let remove = held.ram.get_mut(&key.fingerprint).is_some_and(|ram| {
-                        ram.observers.remove(&(owner, key.page));
+                        ram.observers.remove(&Subscriber {
+                            table: table.identity,
+                            owner,
+                            token: key.page,
+                        });
+                        ram.prune();
                         ram.observers.is_empty()
                     });
                     if remove {
@@ -1598,11 +1749,15 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                 Some(10) => {
                     let (server, client) =
                         UnixStream::pair().map_err(|e| io("fork grant channel", e))?;
-                    let (table, custody, pid) =
-                        (table.clone(), custody.clone(), slot.pid.load(Acquire));
+                    let (table, custody, host, pid) = (
+                        table.clone(),
+                        custody.clone(),
+                        host.clone(),
+                        slot.pid.load(Acquire),
+                    );
                     std::thread::Builder::new()
                         .name("varena-custody".into())
-                        .spawn(move || serve(server, pid, table, custody))
+                        .spawn(move || serve(server, pid, table, custody, host))
                         .map_err(|e| io("start forked grant", e))?;
                     platform::handles::send_fd(&stream, &client)
                         .map_err(crate::os("send forked grant"))?;

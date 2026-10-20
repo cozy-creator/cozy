@@ -73,6 +73,7 @@ struct Model {
     name: String,
     pages: Vec<PageId>,
     fingerprint: [u8; 32],
+    ram_key: [u8; 32],
     transform: Option<Arc<Transform>>,
     source: Arc<Source>,
     regions: Vec<ledger::RamRegion>,
@@ -322,7 +323,7 @@ impl Placement {
                 .get(&model)
                 .ok_or_else(|| invalid("unknown model"))?;
             let work = (
-                data.fingerprint,
+                data.ram_key,
                 data.source.clone(),
                 data.regions.clone(),
                 data.ram.clone(),
@@ -443,6 +444,7 @@ impl Placement {
             });
             let key = PageKey {
                 fingerprint,
+                ram_key: tensorfs::sha256::digest(layout.digest.as_bytes()),
                 page: index as u64,
             };
             let imported = self.channel.take(self.row.owner(), key)?;
@@ -1168,7 +1170,7 @@ impl Placement {
                 page.loaded = false;
                 page.uses.clear();
             }
-            (model.pages, model.fingerprint, model.ram.token)
+            (model.pages, model.ram_key, model.ram.token)
         };
         let forgotten = self
             .channel
@@ -1264,7 +1266,7 @@ impl Placement {
             .lock()
             .models
             .iter()
-            .map(|(id, model)| (*id, model.fingerprint, model.ram.clone()))
+            .map(|(id, model)| (*id, model.ram_key, model.ram.clone()))
             .collect();
         let ram = models
             .into_iter()
@@ -1753,7 +1755,7 @@ impl Placement {
                 row.attempted.insert(step);
             }
         }
-        let (model, transform, key, streamed) = {
+        let (model, transform, key, ram_key, streamed) = {
             let inner = self.inner.lock();
             let model = inner
                 .table
@@ -1776,6 +1778,7 @@ impl Placement {
                     fingerprint: data.fingerprint,
                     page: index as u64,
                 },
+                data.ram_key,
                 inner
                     .table
                     .page(page)
@@ -1783,9 +1786,7 @@ impl Placement {
             )
         };
         let apply = |pin| transform.as_ref().map_or(Ok(()), |fill| fill(page, pin));
-        let ram = self
-            .channel
-            .ram(self.row.owner(), key.fingerprint, key.page)?;
+        let ram = self.channel.ram(self.row.owner(), ram_key, key.page)?;
         let actual = if ram.is_some() { Tier::Ram } else { Tier::Disk };
         let stats = if let Some(ram) = ram {
             let mapped = Ram::map(ram)?;
@@ -1910,7 +1911,7 @@ impl Drop for Placement {
             model.ram.cancelled.store(true, Ordering::Release);
             let _ = self
                 .channel
-                .forget_ram(self.row.owner(), model.fingerprint, model.ram.token);
+                .forget_ram(self.row.owner(), model.ram_key, model.ram.token);
         }
         self.stop.store(true, Ordering::Release);
         let _ = self.row.wake();
@@ -2142,7 +2143,9 @@ mod gpu_tests {
             !state.pending.load(Ordering::Acquire)
         });
         assert!(
-            ledger.ram_status([28; 32]).is_none(),
+            ledger
+                .ram_status(tensorfs::sha256::digest(layout.digest.as_bytes()))
+                .is_none(),
             "a closed model published a stale cache"
         );
         placement.close().expect("close placement");

@@ -738,6 +738,7 @@ impl Pool {
         crate::launch_identity::remove_stale_jit(root, &incarnation);
         remove_old_executor_roots(root);
         let mut devices = vec![];
+        let host_cache = Arc::new(crate::memory::slim::HostCache::default());
         for entry in &envelope {
             // Per GPU: its own sample log and learned file (two writers would tear them).
             let mut memory = config.memory.clone();
@@ -756,8 +757,8 @@ impl Pool {
                 .filter(|gpu| gpu.memory_bytes > 0 && !gpu.device_uuid.is_empty())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,
                     format!("GPU {entry} needs an inventory UUID and a nonzero memory capacity")))?;
-            let placement = Some(crate::memory::slim::Memory::create(
-                &physical.device_uuid, physical.memory_bytes, config.authorized_device_limit_bytes)
+            let placement = Some(crate::memory::slim::Memory::create_with_host(
+                &physical.device_uuid, physical.memory_bytes, config.authorized_device_limit_bytes, host_cache.clone())
                 .map_err(io::Error::other)?);
             devices.push(Device {
                 entry: entry.clone(),

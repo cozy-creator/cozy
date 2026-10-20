@@ -23,9 +23,12 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_host(std::sync::Arc::new(varena::ledger::HostCache::default()))
+    }
+    fn with_host(host: std::sync::Arc<varena::ledger::HostCache>) -> Self {
         let name = format!("test-{}-{}", std::process::id(), NEXT.fetch_add(1, Relaxed));
         Self {
-            ledger: Ledger::create(&name, CAPACITY).unwrap(),
+            ledger: Ledger::create_with_host(&name, CAPACITY, host).unwrap(),
             name,
         }
     }
@@ -241,6 +244,10 @@ fn child() {
                         }],
                     )
                     .unwrap();
+                println!("@ok");
+            }
+            "forget_ram" => {
+                channel.forget_ram(row.owner(), [19; 32], 0).unwrap();
                 println!("@ok");
             }
             _ => panic!("unknown test command"),
@@ -563,12 +570,113 @@ fn ram_generations_and_tagged_cancellation_follow_actual_custody() {
 }
 
 #[test]
+fn two_gpu_ledgers_share_raw_ram_but_close_and_reap_keep_device_owners_separate() {
+    use std::os::unix::fs::MetadataExt;
+    let host = std::sync::Arc::new(varena::ledger::HostCache::default());
+    let first = Fixture::with_host(host.clone());
+    let second = Fixture::with_host(host);
+    let mut child = ChildRow::spawn(&first.ledger);
+    assert_eq!(child.call("warm"), "ok");
+    observe(&first.ledger, || {
+        first
+            .ledger
+            .ram_status([19; 32])
+            .is_some_and(|s| !s.filling)
+    });
+    let row = second.ledger.claim(std::process::id()).unwrap();
+    assert_eq!(
+        row.owner(),
+        child.owner,
+        "same row/generation is distinct on another device"
+    );
+    let channel = Channel::new(second.ledger.grant(std::process::id()).unwrap().channel);
+    let regions = [varena::ledger::RamRegion {
+        offset: 0,
+        len: 4,
+        items: vec![tensorfs::io::source::Item {
+            offset: 0,
+            len: 4,
+            part_end: true,
+            source: tensorfs::io::ItemSource::Inline(b"warm".to_vec().into()),
+        }],
+    }];
+    assert!(!channel
+        .cache_ram(row.owner(), [19; 32], &[], &regions)
+        .unwrap());
+    let original = first.ledger.ram_status([19; 32]).unwrap();
+    assert_eq!(
+        channel.ram_status(row.owner(), [19; 32]).unwrap(),
+        Some(original.clone())
+    );
+    assert_eq!(first.ledger.status().unwrap().ram_bytes, 4);
+    assert_eq!(
+        second.ledger.status().unwrap().ram_bytes,
+        4,
+        "one shared layout is counted by each view"
+    );
+    let first_row = first.ledger.claim(std::process::id()).unwrap();
+    let first_channel = Channel::new(first.ledger.grant(std::process::id()).unwrap().channel);
+    let a = first_channel
+        .ram(first_row.owner(), [19; 32], 0)
+        .unwrap()
+        .unwrap();
+    let b = channel.ram(row.owner(), [19; 32], 0).unwrap().unwrap();
+    assert_eq!(
+        std::fs::File::from(a.file.try_clone().unwrap())
+            .metadata()
+            .unwrap()
+            .ino(),
+        std::fs::File::from(b.file.try_clone().unwrap())
+            .metadata()
+            .unwrap()
+            .ino(),
+        "both devices receive the exact same memfd"
+    );
+    assert_eq!(child.call("forget_ram"), "ok");
+    assert_eq!(
+        channel.ram_status(row.owner(), [19; 32]).unwrap(),
+        Some(original.clone()),
+        "device A's close removed device B"
+    );
+    assert_eq!(child.call("warm"), "ok");
+    child.kill();
+    first.ledger.reap(child.process.id()).unwrap();
+    assert_eq!(
+        channel.ram_status(row.owner(), [19; 32]).unwrap(),
+        Some(original),
+        "device A's reap removed device B"
+    );
+    assert!(
+        !first.ledger.release_unused_ram(),
+        "pressure cannot reclaim a live reader on either device"
+    );
+    drop((a, b));
+    assert!(
+        first.ledger.release_unused_ram(),
+        "pressure on one device sheds the shared idle host tier"
+    );
+    assert!(channel.ram_status(row.owner(), [19; 32]).unwrap().is_none());
+    assert!(channel.ram(row.owner(), [19; 32], 0).unwrap().is_none());
+}
+
+#[test]
+fn explicitly_owned_host_cache_drops_with_its_last_ledger() {
+    let host = std::sync::Arc::new(varena::ledger::HostCache::default());
+    let lifetime = std::sync::Arc::downgrade(&host);
+    let first = Fixture::with_host(host.clone());
+    let second = Fixture::with_host(host);
+    drop(first);
+    assert!(lifetime.upgrade().is_some());
+    drop(second);
+    assert!(
+        lifetime.upgrade().is_none(),
+        "there is no global owner retaining host custody"
+    );
+}
+
+#[test]
 #[ignore = "child of the delegated-cgroup pressure test"]
 fn pressure_child() {
-    println!("@ready");
-    std::io::stdout().flush().unwrap();
-    let mut command = String::new();
-    std::io::stdin().read_line(&mut command).unwrap();
     let fixture = Fixture::new();
     let row = fixture.ledger.claim(std::process::id()).unwrap();
     let channel = Channel::new(fixture.ledger.grant(std::process::id()).unwrap().channel);
@@ -612,39 +720,31 @@ fn pressure_child() {
 
 #[test]
 fn cgroup_pressure_refuses_warming_without_claiming_readiness_or_blocking_admission() {
-    let scope = platform::contain::Scope::create("varena-ram-pressure").unwrap();
-    let Some(relative) = scope.cgroup_relative() else {
-        assert!(
-            std::env::var_os("GITHUB_ACTIONS").is_none(),
-            "hosted proof requires delegated cgroup-v2"
-        );
+    if std::env::var_os("GITHUB_ACTIONS").is_none() {
+        eprintln!("real pressure proof runs in the hosted systemd fixture");
         return;
-    };
-    let group = std::path::Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
-    let limit = group.join("memory.max");
-    if let Err(error) = std::fs::write(&limit, (32 << 20).to_string()) {
-        // systemd delegates membership to the runner but retains ownership of
-        // controller knobs. Only this fixture's freshly created child is changed.
-        assert!(
-            std::env::var_os("GITHUB_ACTIONS").is_some(),
-            "set child limit: {error}"
-        );
-        let mut setter = Command::new("sudo")
-            .args(["-n", "tee"])
-            .arg(&limit)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        setter
-            .stdin
-            .take()
-            .unwrap()
-            .write_all((32 << 20).to_string().as_bytes())
-            .unwrap();
-        assert!(setter.wait().unwrap().success(), "set fixture memory.max");
     }
-    let mut child = Command::new(std::env::current_exe().unwrap())
+    // The delegated service has no child memory controller enabled. Let systemd
+    // create one owned, finite-memory service rather than alter the test runner's
+    // hierarchy or put unrelated test processes under its limit.
+    let unit = format!(
+        "varena-ram-pressure-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Relaxed)
+    );
+    let output = Command::new("sudo")
+        .args([
+            "-n",
+            "systemd-run",
+            "--quiet",
+            "--wait",
+            "--pipe",
+            "--collect",
+        ])
+        .arg(format!("--unit={unit}"))
+        .arg(format!("--uid={}", unsafe { libc::getuid() }))
+        .args(["--property=MemoryMax=32M", "--property=MemorySwapMax=0"])
+        .arg(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "pressure_child",
@@ -652,25 +752,14 @@ fn cgroup_pressure_refuses_warming_without_claiming_readiness_or_blocking_admiss
             "--nocapture",
             "--test-threads=1",
         ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
+        .output()
         .unwrap();
-    let mut output = BufReader::new(child.stdout.take().unwrap());
-    let mut line = String::new();
-    while !line.contains("@ready") {
-        line.clear();
-        assert!(output.read_line(&mut line).unwrap() > 0);
-    }
-    scope.adopt(child.id()).unwrap();
-    child.stdin.take().unwrap().write_all(b"go\n").unwrap();
-    let mut rest = String::new();
-    output.read_to_string(&mut rest).unwrap();
     assert!(
-        child.wait().unwrap().success(),
-        "pressure child failed: {rest}"
+        output.status.success(),
+        "pressure child failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    scope.end().unwrap();
 }
 
 #[test]

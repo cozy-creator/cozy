@@ -10,6 +10,8 @@ pub struct Grant {
     pub pid: u32,
 }
 pub struct Memory;
+#[derive(Default)]
+pub struct HostCache;
 fn unsupported<T>() -> io::Result<T> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -18,6 +20,14 @@ fn unsupported<T>() -> io::Result<T> {
 }
 impl Memory {
     pub fn create(_: &str, _: u64, _: Option<u64>) -> io::Result<Self> {
+        unsupported()
+    }
+    pub fn create_with_host(
+        _: &str,
+        _: u64,
+        _: Option<u64>,
+        _: std::sync::Arc<HostCache>,
+    ) -> io::Result<Self> {
         unsupported()
     }
     pub fn grant_unbound(&self) -> io::Result<Grant> {
