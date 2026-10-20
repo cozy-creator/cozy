@@ -137,7 +137,7 @@ pub fn local(publisher: &Publisher, root: &str, observe: &(dyn Fn(&str, u64, u64
         let (made, doc) = rewrite(&src, store, lane)?;
         let closure = store.closure(&made).map_err(|e| refused("migration_failed", e.to_string()))?;
         let adopted = migrate::adopt(&src, store, &closure).map_err(failed)?;
-        storage::set_local(store, name, &made).map_err(|e| refused("local_alias_refused", e.to_string()))?;
+        storage::set_local(store, name, &made, &Default::default()).map_err(|e| refused("local_alias_refused", e.to_string()))?;
         let key = format!("migrate-{}", manifest.sha256);
         store.unpin(&key).map_err(|e| refused("migration_failed", e.to_string()))?;
         rows.push(json!({"repository": format!("local/{name}"), "manifest": made.id(), "migrated": doc,
