@@ -231,6 +231,11 @@ impl<'t> Migrator<'t> {
     /// they differ), yanked or not; each other old checkpoint a tree of its own
     /// (`model.cozytensors`).
     pub fn repo(&mut self, doc: &[u8], read: Read) -> Result<Migrated> {
+        // A document of tags is already D10.
+        if let Ok(repo) = Repo::from_json(doc) {
+            let report = json!({"model": repo.name, "releases": [], "checkpoints": []});
+            return Ok(Migrated { repo, objects: Objects::new(), report });
+        }
         let old: OldRepo = serde_json::from_slice(doc).map_err(|e| invalid(format!("repo document: {e}")))?;
         let upstream = self.table.iter().find(|u| u.models.iter().any(|p| matches(p, &old.name)));
         let mut objects = Objects::new();

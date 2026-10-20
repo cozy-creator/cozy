@@ -12,7 +12,7 @@ pub enum Kind {
     Invalid,
     /// Another document kind or major version.
     Format,
-    /// No such ref, release, lane, component, tensor, file or object.
+    /// No such ref, revision, component, tensor, file or object.
     NotFound,
     /// Bytes that do not match their digest or length.
     Integrity,
