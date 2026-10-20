@@ -249,9 +249,22 @@ impl Checkpoint {
                 );
             }
         }
+        match fs::metadata(dir) {
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(super::io_failure(
+                    dir.display(),
+                    std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+                ));
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(super::io_failure(dir.display(), error));
+            }
+            _ => {}
+        }
         self.prepare_export().await?;
         let (checkpoint, dir) = (self.clone(), dir.to_path_buf());
         let worker = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+            fs::create_dir_all(&dir).map_err(|error| super::io_failure(dir.display(), error))?;
             match format {
                 Format::Safetensors => checkpoint.export_to(&dir, dequantize.as_ref()),
                 Format::Cozytensors => checkpoint.export_cozytensors(&dir),
