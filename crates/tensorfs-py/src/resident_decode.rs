@@ -6,8 +6,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyMapping;
 use tensorfs::format::decode::PartMetadata;
 use tensorfs::format::{Dtype, Encoding, Metadata, Value};
-use tensorfs::io::decode::{Output, Part};
 use tensorfs::io::{Dst, Src};
+use tensorfs::raw::{DecodeOutput as Output, DecodePart as Part};
 use tensorfs::{Failure, Kind};
 
 use crate::store::{from_py, invalid, raise, Dlpack, OrRaise};
@@ -250,7 +250,7 @@ fn decode_into(
         })
         .collect();
     // The same Core metadata rules run before a producer is asked for a capsule.
-    tensorfs::io::decode::check(&encoding, &dtype, &shape, &metadata).or_raise(py)?;
+    tensorfs::raw::check_decode(&encoding, &dtype, &shape, &metadata).or_raise(py)?;
 
     let mut owners = Vec::new();
     for part in &descriptions {
