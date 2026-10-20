@@ -1,8 +1,10 @@
-//! The error families every v2 surface reports (the `tfs` CLI's `--json`, Python): eleven, each
+//! The error families every v2 surface reports (the `tfs` CLI's `--json`, Python): twelve, each
 //! with a stable code. The cause stays in the detail.
 
 use crate::err::{Code, Refusal};
-use crate::{format, store2};
+use crate::format;
+#[cfg(feature = "store")]
+use crate::store2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -19,7 +21,7 @@ pub enum Kind {
     /// A known scheme whose parts or params break its definition.
     Decode,
     Io,
-    /// The disk or a quota is full.
+    /// Storage, device memory or a quota is full.
     Full,
     /// A transfer failed or stalled.
     Network,
@@ -27,10 +29,12 @@ pub enum Kind {
     Denied,
     /// A source or target this build cannot represent.
     Unsupported,
+    /// A revision, conditional write or server policy conflicts with this operation.
+    Conflict,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 11] = [
+    pub const ALL: [Kind; 12] = [
         Kind::Invalid,
         Kind::Format,
         Kind::NotFound,
@@ -42,6 +46,7 @@ impl Kind {
         Kind::Network,
         Kind::Denied,
         Kind::Unsupported,
+        Kind::Conflict,
     ];
 
     pub fn code(self) -> &'static str {
@@ -57,6 +62,7 @@ impl Kind {
             Kind::Network => "network",
             Kind::Denied => "denied",
             Kind::Unsupported => "unsupported",
+            Kind::Conflict => "conflict",
         }
     }
 }
@@ -93,11 +99,13 @@ impl From<Refusal> for Failure {
             | SHORT_READ => Kind::Integrity,
             UNKNOWN_ENCODING | UNREGISTERED_ENCODING => Kind::UnknownScheme,
             ENCODING_MISMATCH => Kind::Decode,
-            IO_FAILED | NOT_REGULAR_FILE | PERMISSION_DENIED | FD_HEADROOM | STORE_BUSY => Kind::Io,
+            IO_FAILED | NOT_REGULAR_FILE | FD_HEADROOM | STORE_BUSY => Kind::Io,
             CAPACITY_EXHAUSTED | QUOTA_EXHAUSTED => Kind::Full,
             TRANSFER_FAILED | HUB_UNREACHABLE | STALLED | DEADLINE_EXCEEDED => Kind::Network,
             SOURCE_NOT_ALLOWED | REDIRECT_REFUSED | HUB_REFUSED | TLS_UNTRUSTED
-            | CREDENTIAL_REQUIRED => Kind::Denied,
+            | CREDENTIAL_REQUIRED | PERMISSION_DENIED => Kind::Denied,
+            CHECKPOINT_CONFLICT | RELEASE_CONFLICT | REPOSITORY_CONFLICT | TRANSACTION_CONFLICT
+            | DISPOSITION_CONFLICT => Kind::Conflict,
             PICKLE_REFUSED
             | ARCHIVE_REFUSED
             | GGUF_REFUSED
@@ -134,11 +142,33 @@ impl From<format::Error> for Failure {
     }
 }
 
+#[cfg(feature = "store")]
+impl From<crate::io::cuda::Error> for Failure {
+    fn from(error: crate::io::cuda::Error) -> Failure {
+        use crate::io::cuda;
+        let kind = match &error {
+            cuda::Error::CudaUnavailable(_) => Kind::Unsupported,
+            cuda::Error::Cuda { code, .. } if *code == cuda::ERROR_OUT_OF_MEMORY => Kind::Full,
+            _ => Kind::Io,
+        };
+        Failure { kind, detail: error.to_string() }
+    }
+}
+
+#[cfg(feature = "store")]
 impl From<store2::Error> for Failure {
     fn from(e: store2::Error) -> Failure {
         let kind = match &e {
             store2::Error::Format(f) => return f.clone().into(),
-            store2::Error::Io { .. } => Kind::Io,
+            store2::Error::Io { source, .. } => {
+                if let Some(refusal) = source.get_ref().and_then(|cause| cause.downcast_ref::<Refusal>()) {
+                    return refusal.clone().into();
+                }
+                if let Some(cuda) = source.get_ref().and_then(|cause| cause.downcast_ref::<crate::io::cuda::Error>()) {
+                    return cuda.clone().into();
+                }
+                Kind::Io
+            }
             store2::Error::Full { .. } => Kind::Full,
             store2::Error::Absent(_) => Kind::NotFound,
             store2::Error::Mismatch { .. } => Kind::Integrity,
@@ -153,6 +183,10 @@ impl From<store2::Error> for Failure {
 
 impl From<std::io::Error> for Failure {
     fn from(e: std::io::Error) -> Failure {
+        #[cfg(feature = "store")]
+        if let Some(cuda) = e.get_ref().and_then(|cause| cause.downcast_ref::<crate::io::cuda::Error>()) {
+            return cuda.clone().into();
+        }
         let kind = match e.kind() {
             std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => Kind::Full,
             std::io::ErrorKind::NotFound => Kind::NotFound,

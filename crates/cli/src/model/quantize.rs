@@ -1,9 +1,9 @@
 //! `cozy model quantize`: the serving package's quantizer, run as an ordinary conversion call
-//! (`cozy run <package>/<fn> <model> <org/name>`). The package owns the recipe; the machine writes
-//! the lane and uploads it as a private checkpoint.
+//! (`cozy run <package>/<fn> <model> <org/name>`). The package owns the recipe; Runtime writes
+//! the lane through Runtime's TensorFS store and returns its checkpoint reference.
 use std::process::ExitCode;
 
-use protocol::calcifer::{On, Status};
+use protocol::calcifer::{On, Run, Status};
 use protocol::config::{Hub, Origin};
 use protocol::error::{Error, Kind};
 
@@ -120,15 +120,51 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
     let (package, release, function) = quantizer(ctx, &hub, &args, lane, &components).await?;
     let inputs = vec![source.clone(), destination.to_string()];
     let run = crate::run::call(ctx, &package, Some(&release), &function, inputs, &args.placement, args.detach).await?;
-    // The lane the machine wrote (`result` is the quantizer's artifact), and how to publish it.
-    let digest = run.result.as_ref().and_then(|r| r["manifest"]["digest"].as_str());
-    if let (false, Status::Completed, Some(digest)) = (ctx.json, run.status, digest) {
-        let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
-        let release = pinned.filter(|_| destination == repo).unwrap_or("<release>");
-        Record::new().field("checkpoint", format!("{destination}#{digest}")).print(ctx);
-        output::next(ctx, &[&format!("cozy model publish {destination} --release {release} --lane {lane}={digest}")]);
+    if !ctx.json && run.status == Status::Completed {
+        match written_checkpoint(&run, lane) {
+            Some(WrittenCheckpoint::Reference(reference)) => {
+                let mut record = Record::new().field(
+                    "checkpoint",
+                    format!("{}@{}", reference.repo_id, reference.revision),
+                );
+                if !reference.variant.is_empty() {
+                    record = record.field("variant", &reference.variant);
+                }
+                record.print(ctx);
+            }
+            Some(WrittenCheckpoint::Header(header)) => {
+                Record::new().field("checkpoint header", header).print(ctx);
+            }
+            Some(WrittenCheckpoint::Legacy(digest)) => {
+                let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
+                let release = pinned.filter(|_| destination == repo).unwrap_or("<release>");
+                Record::new().field("checkpoint", format!("{destination}#{digest}")).print(ctx);
+                output::next(ctx, &[&format!("cozy model publish {destination} --release {release} --lane {lane}={digest}")]);
+            }
+            None => {}
+        }
     }
     Ok(crate::run::exit_code(&run))
+}
+
+enum WrittenCheckpoint<'a> {
+    Reference(&'a protocol::machine::CheckpointRef),
+    Header(&'a str),
+    Legacy(&'a str),
+}
+
+/// A typed output names the repository TREE. The result's new checkpoint field names only a
+/// HEADER; the nested manifest form belongs to older saved results.
+fn written_checkpoint<'a>(run: &'a Run, lane: &str) -> Option<WrittenCheckpoint<'a>> {
+    if let Some(reference) = run.output.iter().filter(|item| item.name == lane)
+        .find_map(|item| item.checkpoint.as_ref()) {
+        return Some(WrittenCheckpoint::Reference(reference));
+    }
+    let result = run.result.as_ref()?;
+    if let Some(header) = result["checkpoint"].as_str() {
+        return Some(WrittenCheckpoint::Header(header));
+    }
+    result["manifest"]["digest"].as_str().map(WrittenCheckpoint::Legacy)
 }
 
 #[cfg(test)]
@@ -152,5 +188,26 @@ mod tests {
         let parts: Vec<String> = ["text_encoder", "text_encoder_2", "unet", "vae"].map(String::from).into();
         assert_eq!(names(quantizers(&sdxl, "fp8", &parts)), ["fp8"]);
         assert!(quantizers(&sdxl, "int8", &parts[..3]).is_empty(), "a checkpoint without its vae");
+    }
+
+    #[test]
+    fn typed_output_trees_take_precedence_over_result_headers_and_old_manifests() {
+        let mut run: Run = serde_json::from_value(serde_json::json!({
+            "id": protocol::ids::RunId::mint([7; 12]), "number": 7, "kind": "call",
+            "target": "quantize", "hub": "https://tensorhub.com", "status": "completed",
+            "created_at_ms": 1,
+            "result": {"checkpoint": "sha256:header", "manifest": {"digest": "sha256:legacy"}},
+            "output": [{
+                "id": "7/fp8", "name": "fp8", "index": 0, "rev": 1, "length": 0,
+                "media_type": "", "status": "completed",
+                "checkpoint": {"repo_id": "actual/output", "revision": "sha256:tree", "variant": "fp8"}
+            }]
+        })).unwrap();
+        assert!(matches!(written_checkpoint(&run, "fp8"), Some(WrittenCheckpoint::Reference(reference))
+            if reference.repo_id == "actual/output" && reference.revision == "sha256:tree"));
+        run.output.clear();
+        assert!(matches!(written_checkpoint(&run, "fp8"), Some(WrittenCheckpoint::Header("sha256:header"))));
+        run.result = Some(serde_json::json!({"manifest": {"digest": "sha256:legacy"}}));
+        assert!(matches!(written_checkpoint(&run, "fp8"), Some(WrittenCheckpoint::Legacy("sha256:legacy"))));
     }
 }
