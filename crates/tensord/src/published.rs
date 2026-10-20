@@ -1096,10 +1096,20 @@ impl Publisher {
         }
         let wheels = dir.join("wheels");
         fs::create_dir_all(&wheels).map_err(io_failure)?;
+        // Bytes as each file lands, of all of them: a person sees an install that crawls.
+        let total: u64 = files.iter().map(|file| file.length).sum();
+        let moved = std::sync::atomic::AtomicU64::new(0);
         std::thread::scope(|scope| {
             let handles: Vec<_> = files
                 .iter()
-                .map(|file| scope.spawn(|| self.hub_wheel(file, source, &wheels, job.stop.as_ref())))
+                .map(|file| {
+                    scope.spawn(|| -> Result<PathBuf, Failure> {
+                        let path = self.hub_wheel(file, source, &wheels, job.stop.as_ref())?;
+                        let landed = moved.fetch_add(file.length, std::sync::atomic::Ordering::Relaxed);
+                        job.bytes(landed + file.length, total);
+                        Ok(path)
+                    })
+                })
                 .collect();
             handles
                 .into_iter()
