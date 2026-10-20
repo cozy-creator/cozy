@@ -1421,6 +1421,7 @@ struct RamFill {
     host: Arc<HostCache>,
     layout: [u8; 32],
     identity: u64,
+    complete: bool,
 }
 impl Drop for RamFill {
     fn drop(&mut self) {
@@ -1428,6 +1429,7 @@ impl Drop for RamFill {
         let observers = {
             let mut state = self.host.state.lock();
             let room = state.can_warm(available, 0);
+            self.ram.ready.store(self.complete, Release);
             self.ram.filling.store(false, Release);
             self.ram.pending.store(false, Release);
             state.clock = state.clock.saturating_add(1);
@@ -1581,13 +1583,14 @@ fn register_ram(
                 .map(|(_, ram)| ram.clone());
             let permit = active.as_ref().and_then(|ram| host.warm_slot(ram));
             for (index, ram) in work {
-                let _finished = RamFill {
+                let mut finished = RamFill {
                     ram: ram.clone(),
                     index,
                     table: table.clone(),
                     host: host.clone(),
                     layout,
                     identity,
+                    complete: false,
                 };
                 let available = platform::contain::host_memory::read().available;
                 if permit.is_none() || !host.begin_fill(layout, identity, index, &ram, available) {
@@ -1608,7 +1611,7 @@ fn register_ram(
                     )
                 };
                 match result {
-                    Ok(_) => ram.ready.store(true, Release),
+                    Ok(_) => finished.complete = true,
                     Err(error) => tracing::warn!(%error, "RAM region remains on disk"),
                 }
             }
