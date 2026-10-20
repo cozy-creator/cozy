@@ -32,6 +32,14 @@ def main() -> None:
     assert checkpoint.id == saved.id, (checkpoint.id, saved.id)
     assert (tuple(model.cls), model.config) == (("example", "1.0", "Model"), {"width": 2}), (model.cls, model.config)
     assert model.cls == tensorfs.ClassRef("example", "1.0", "Model") and model.cls.name == "Model"
+    assert repr(model.cls) == "ClassRef('example', '1.0', 'Model')"
+    assert {model.cls: 1}[tensorfs.ClassRef("example", "1.0", "Model")] == 1, "hashed and equal by value"
+    try:
+        tensorfs.Writer(work / "bad.cozytensors").component("m", cls=("", "1.0", "M"), config={})
+    except tensorfs.InvalidError:
+        pass
+    else:
+        raise AssertionError("a class with a version but no library was written")
     assert (value.dtype, value.shape, value.tobytes()) == ("F32", (2,), weight.tobytes()), value
     assert model.asset("vocab.txt") == b"one\ntwo\n"
 
