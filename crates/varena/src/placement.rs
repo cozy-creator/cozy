@@ -213,7 +213,8 @@ impl Placement {
                     Ok(())
                 })
             };
-            if let Err(error) = result.and_then(|()| this.settle()) {
+            let settled = this.settle();
+            if let Err(error) = result.and(settled) {
                 tracing::warn!(%error, "reclaim failed");
             }
         }
