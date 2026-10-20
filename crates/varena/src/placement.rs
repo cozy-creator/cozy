@@ -3109,6 +3109,10 @@ mod gpu_tests {
     #[ignore = "requires an owned rental; never run on the local GPU"]
     fn self_region_fill_refuses_and_the_same_request_recovers() {
         let uuid = fill_worker(|| {
+            // A returned FillPin can already belong to another release poller.
+            // Force that interleaving before exercising failed-fill reuse; it
+            // must wait for real completion, never report an escaped live view.
+            crate::gpu::returned_write_release_interleaving().unwrap();
             let fixture = FillLedger::new();
             let placement = fixture.placement();
             let uuid = assigned_gpu(&placement.gpu);
