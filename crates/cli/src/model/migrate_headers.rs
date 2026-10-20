@@ -24,7 +24,7 @@ pub(crate) struct Args {
     /// Models (org/name) at the Hub.
     #[arg(required_unless_present = "local", conflicts_with = "local")]
     models: Vec<String>,
-    /// Instead: the TensorFS 0.12 store at this path, in place.
+    /// Instead: a stopped TensorFS 0.12 store, in place. Keep a backup for rollback.
     #[arg(long, value_name = "STORE")]
     local: Option<PathBuf>,
     /// Where each model's report is written.

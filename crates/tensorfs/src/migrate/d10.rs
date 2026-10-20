@@ -473,6 +473,31 @@ async fn upload(endpoint: &Endpoint, objects: &Objects) -> Result<(usize, u64)> 
 /// this build's, and each repo of `refs/` migrates through the store as a directory endpoint.
 pub fn store(root: &Path, migrator: &mut Migrator) -> Result<Json> {
     let root = root.canonicalize()?;
+    let record = fs::read(root.join("format"))?;
+    let format: Json = serde_json::from_slice(&record).unwrap_or(Json::Null);
+    let supported = format.get("format").and_then(Json::as_str).is_some_and(|tag| {
+        crate::store::same_major(tag, "tensorfs.store/2")
+            || crate::store::same_major(tag, "tensorfs.store/3")
+    });
+    if !supported || !root.join("refs").is_dir() || !root.join("blobs").is_dir() {
+        return fail(Kind::Format, format!(
+            "{}: A11 local migration requires a TensorFS 0.12 store (tensorfs.store/2), \
+             or an already migrated store; this store was not changed. Retain a pre-0.12 \
+             store and convert it into a separate 0.12 store with the v1 migration tool first",
+            root.display()
+        ));
+    }
+    // The machine holds this same kernel claim for its whole lifetime. The conversion must
+    // not rewrite refs or the format record underneath a serving owner.
+    let owner = fs::OpenOptions::new()
+        .read(true).write(true).create(true).truncate(false)
+        .open(root.join("owner.lock"))?;
+    if !platform::lock::try_claim(&owner).map_err(|e| Failure { kind: Kind::Io, detail: e.to_string() })? {
+        return fail(Kind::Conflict, format!(
+            "{}: this store has a running owner; stop its machine before A11 local migration",
+            root.display()
+        ));
+    }
     let dropped = fs::read_dir(root.join("pins")).map_or(0, |d| d.count());
     if dropped > 0 {
         fs::remove_dir_all(root.join("pins"))?;
