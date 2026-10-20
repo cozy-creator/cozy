@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use platform::durable;
 
-use super::cuda::{self, CUstream};
+use super::cuda;
 use cuda::Result;
 
 const H2D_PROBE: usize = 128 << 20;
@@ -68,7 +68,10 @@ fn path() -> Option<PathBuf> {
 
 fn cached(key: &str) -> Option<Vec<f64>> {
     let text = std::fs::read_to_string(path()?).ok()?;
-    let line = text.lines().rev().find_map(|l| l.strip_prefix(key)?.strip_prefix('\t'))?;
+    let line = text
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix('\t'))?;
     line.split('\t').map(|v| v.parse().ok()).collect()
 }
 
@@ -91,7 +94,11 @@ pub struct Link {
 
 impl std::fmt::Display for Link {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Gen{} x{} of Gen{} x{}", self.gen, self.width, self.max_gen, self.max_width)
+        write!(
+            f,
+            "Gen{} x{} of Gen{} x{}",
+            self.gen, self.width, self.max_gen, self.max_width
+        )
     }
 }
 
@@ -101,10 +108,18 @@ pub fn link(pci: &str) -> Option<Link> {
     let read = |f: &str| std::fs::read_to_string(format!("/sys/bus/pci/devices/{pci}/{f}")).ok();
     let gen = |f: &str| -> Option<u32> {
         let gts: f64 = read(f)?.split_whitespace().next()?.parse().ok()?;
-        [2.5, 5.0, 8.0, 16.0, 32.0, 64.0].iter().position(|&g| g == gts).map(|i| i as u32 + 1)
+        [2.5, 5.0, 8.0, 16.0, 32.0, 64.0]
+            .iter()
+            .position(|&g| g == gts)
+            .map(|i| i as u32 + 1)
     };
     let width = |f: &str| read(f)?.trim().parse().ok();
-    Some(Link { gen: gen("current_link_speed")?, width: width("current_link_width")?, max_gen: gen("max_link_speed")?, max_width: width("max_link_width")? })
+    Some(Link {
+        gen: gen("current_link_speed")?,
+        width: width("current_link_width")?,
+        max_gen: gen("max_link_speed")?,
+        max_width: width("max_link_width")?,
+    })
 }
 
 /// The current PCIe link of CUDA device `device`, without creating a second context.
@@ -114,85 +129,132 @@ pub fn device_link(device: i32) -> Option<Link> {
     // SAFETY: driver out-param; an invalid ordinal returns an error.
     cuda::check("cuDeviceGet", unsafe { (d.device_get)(&mut dev, device) }).ok()?;
     let attr = |a| cuda::attribute(dev, a).ok();
-    link(&format!("{:04x}:{:02x}:{:02x}.0",
-        attr(cuda::ATTR_PCI_DOMAIN_ID)?, attr(cuda::ATTR_PCI_BUS_ID)?, attr(cuda::ATTR_PCI_DEVICE_ID)?))
+    link(&format!(
+        "{:04x}:{:02x}:{:02x}.0",
+        attr(cuda::ATTR_PCI_DOMAIN_ID)?,
+        attr(cuda::ATTR_PCI_BUS_ID)?,
+        attr(cuda::ATTR_PCI_DEVICE_ID)?
+    ))
 }
 
 /// Pinned host→device GB/s on CUDA device `device`, and the streams that reached it: measured
 /// once per GPU and driver, on its primary context.
 pub fn h2d(device: i32) -> Option<(f64, u32)> {
     let (dev, ctx) = cuda::primary_context(device).ok()?;
-    struct Retained(i32);
-    impl Drop for Retained {
-        fn drop(&mut self) {
-            if let Ok(d) = cuda::driver() {
-                // SAFETY: balances this probe's successful primary-context retain.
-                unsafe { (d.primary_ctx_release)(self.0) };
-            }
-        }
-    }
-    let _retained = Retained(dev);
+    let retained = PrimaryContext(dev);
     let _c = cuda::CtxGuard::enter(ctx).ok()?;
     let driver = std::fs::read_to_string("/sys/module/nvidia/version").unwrap_or_default();
     let key = format!("h2d {} {}", cuda::uuid(dev).ok()?, driver.trim());
     if let Some(&[gbps, streams]) = cached(&key).as_deref() {
         return Some((gbps, streams as u32));
     }
-    let (gbps, streams) = measure_h2d().inspect_err(|e| tracing::warn!("tensorfs: no H2D ceiling: {e}")).ok()?;
+    let (gbps, streams) = measure_h2d(device, ctx, retained)
+        .inspect_err(|e| tracing::warn!("tensorfs: no H2D ceiling: {e}"))
+        .ok()?;
     keep(&key, &[gbps, streams as f64]);
     Some((gbps, streams))
 }
 
-/// Buffers and streams that free themselves however the probe ends.
-struct Probe {
-    host: *mut c_void,
-    dev: u64,
-    streams: Vec<CUstream>,
-}
-
-impl Drop for Probe {
+struct PrimaryContext(i32);
+impl Drop for PrimaryContext {
     fn drop(&mut self) {
-        let Ok(d) = cuda::driver() else { return };
-        // SAFETY: ours, and every copy into them synced or never enqueued.
-        unsafe {
-            for &s in &self.streams {
-                (d.stream_synchronize)(s);
-                (d.stream_destroy)(s);
-            }
-            if self.dev != 0 {
-                (d.mem_free)(self.dev);
-            }
-            if !self.host.is_null() {
-                (d.mem_free_host)(self.host);
-            }
+        if let Ok(driver) = cuda::driver() {
+            // Balances this probe's successful primary-context retain.
+            unsafe { (driver.primary_ctx_release)(self.0) };
         }
     }
 }
 
-fn measure_h2d() -> Result<(f64, u32)> {
-    let d = cuda::driver()?;
-    let mut p = Probe { host: std::ptr::null_mut(), dev: 0, streams: Vec::new() };
-    // SAFETY: out-params; the current context's device and host memory.
-    unsafe {
-        cuda::check("cuMemHostAlloc", (d.mem_host_alloc)(&mut p.host, H2D_PROBE, 0))?;
-        cuda::check("cuMemAlloc", (d.mem_alloc)(&mut p.dev, H2D_PROBE))?;
-        for _ in 0..4 {
-            let mut s: CUstream = std::ptr::null_mut();
-            cuda::check("cuStreamCreate", (d.stream_create)(&mut s, cuda::STREAM_NON_BLOCKING))?;
-            p.streams.push(s);
+/// Actual probe owners, including the context lease. A failed completion check retains the
+/// entire owner box for process lifetime; no failed stream or allocation is ever reused.
+struct ProbeResources {
+    _context: PrimaryContext,
+    ctx: cuda::CUcontext,
+    host: *mut c_void,
+    dev: u64,
+    streams: Vec<cuda::Stream>,
+}
+
+impl ProbeResources {
+    fn drain(&self) -> Result<()> {
+        let mut first = None;
+        for stream in &self.streams {
+            if let Err(error) = stream.drain() {
+                first.get_or_insert(error);
+            }
         }
+        first.map_or(Ok(()), Err)
+    }
+}
+
+struct Probe(Option<Box<ProbeResources>>);
+impl Drop for Probe {
+    fn drop(&mut self) {
+        let Some(owners) = self.0.take() else { return };
+        let drained = owners
+            .drain()
+            .and_then(|()| cuda::CtxGuard::enter(owners.ctx));
+        let Ok(_context) = drained else {
+            // Keep the owned streams, both allocations AND the primary-context lease.
+            // Dropping raw pointer identities alone would not preserve their ownership.
+            std::mem::forget(owners);
+            return;
+        };
+        let Ok(driver) = cuda::driver() else {
+            std::mem::forget(owners);
+            return;
+        };
+        // Every private stream has a checked completion proof before either allocation frees.
+        unsafe {
+            if owners.dev != 0 {
+                (driver.mem_free)(owners.dev);
+            }
+            if !owners.host.is_null() {
+                (driver.mem_free_host)(owners.host);
+            }
+        }
+        // Stream owners and the retained primary context release after the buffers.
+        drop(owners);
+    }
+}
+
+fn measure_h2d(device: i32, ctx: cuda::CUcontext, retained: PrimaryContext) -> Result<(f64, u32)> {
+    let driver = cuda::driver()?;
+    let mut probe = Probe(Some(Box::new(ProbeResources {
+        _context: retained,
+        ctx,
+        host: std::ptr::null_mut(),
+        dev: 0,
+        streams: Vec::new(),
+    })));
+    let p = probe.0.as_mut().expect("probe owners live");
+    unsafe {
+        cuda::check(
+            "cuMemHostAlloc",
+            (driver.mem_host_alloc)(&mut p.host, H2D_PROBE, 0),
+        )?;
+        cuda::check("cuMemAlloc", (driver.mem_alloc)(&mut p.dev, H2D_PROBE))?;
+    }
+    for _ in 0..4 {
+        p.streams.push(cuda::Stream::new(device)?);
     }
     let mut best = (0.0, 1);
     for n in [1, 2, 4, 1, 2, 4, 1, 2, 4] {
         let piece = H2D_PROBE / n;
         let t = Instant::now();
-        for (i, &s) in p.streams[..n].iter().enumerate() {
-            // SAFETY: both ranges lie inside the probe's buffers.
-            cuda::check("cuMemcpyHtoDAsync", unsafe { (d.memcpy_htod_async)(p.dev + (i * piece) as u64, (p.host as *const u8).add(i * piece) as *const c_void, piece, s) })?;
+        for (i, stream) in p.streams[..n].iter().enumerate() {
+            // Both ranges lie inside the owned probe allocations.
+            cuda::check("cuMemcpyHtoDAsync", unsafe {
+                (driver.memcpy_htod_async)(
+                    p.dev + (i * piece) as u64,
+                    (p.host as *const u8).add(i * piece).cast(),
+                    piece,
+                    stream.raw() as _,
+                )
+            })?;
         }
-        for &s in &p.streams[..n] {
-            // SAFETY: our stream.
-            cuda::check("cuStreamSynchronize", unsafe { (d.stream_synchronize)(s) })?;
+        for stream in &p.streams[..n] {
+            stream.drain()?;
         }
         let gbps = H2D_PROBE as f64 / t.elapsed().as_nanos() as f64;
         if gbps > best.0 {
@@ -209,11 +271,15 @@ pub fn disk(files: &[&File]) -> Option<f64> {
     if let Some(&[gbps]) = cached(&key).as_deref() {
         return Some(gbps);
     }
-    let direct: Vec<File> = files.iter().filter_map(|f| durable::open_direct(f).ok().flatten()).collect();
+    let direct: Vec<File> = files
+        .iter()
+        .filter_map(|f| durable::open_direct(f).ok().flatten())
+        .collect();
     let mut blocks = Vec::new();
     for (i, f) in direct.iter().enumerate() {
         let len = f.metadata().ok()?.len();
-        let fit = (len / DISK_BLOCK as u64).min((DISK_PROBE / DISK_BLOCK as u64).saturating_sub(blocks.len() as u64));
+        let fit = (len / DISK_BLOCK as u64)
+            .min((DISK_PROBE / DISK_BLOCK as u64).saturating_sub(blocks.len() as u64));
         blocks.extend((0..fit).map(|b| (i, b * DISK_BLOCK as u64)));
     }
     if blocks.is_empty() {
@@ -225,14 +291,26 @@ pub fn disk(files: &[&File]) -> Option<f64> {
         for _ in 0..DISK_THREADS.min(blocks.len()) {
             s.spawn(|| {
                 // SAFETY: a fresh private anonymous mapping, page aligned as O_DIRECT needs.
-                let buf = unsafe { libc::mmap(std::ptr::null_mut(), DISK_BLOCK, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+                let buf = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        DISK_BLOCK,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
                 if buf == libc::MAP_FAILED {
                     failed.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
                 while let Some(&(i, at)) = blocks.get(next.fetch_add(1, Ordering::Relaxed)) {
                     // SAFETY: an aligned read into our own buffer.
-                    if unsafe { libc::pread(direct[i].as_raw_fd(), buf, DISK_BLOCK, at as libc::off_t) } != DISK_BLOCK as isize {
+                    if unsafe {
+                        libc::pread(direct[i].as_raw_fd(), buf, DISK_BLOCK, at as libc::off_t)
+                    } != DISK_BLOCK as isize
+                    {
                         failed.fetch_add(1, Ordering::Relaxed);
                     }
                 }

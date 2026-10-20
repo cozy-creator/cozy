@@ -191,6 +191,8 @@ impl Source {
     ///
     /// # Safety
     /// `dst` is exclusively writable for its length; the selected item ranges lie inside it.
+    /// On CUDA error, retain device destination owners until `super::drain` proves completion.
+    /// Inline host bytes use owned engine staging and are not borrowed by pending GPU work.
     pub unsafe fn read_items(
         &self,
         items: &[Item],
@@ -315,7 +317,7 @@ impl Source {
             ..ReadOpts::default()
         };
         // SAFETY: item ranges and destination bounds checked above; caller supplies exclusivity.
-        let mut stats = unsafe { super::read(&copies, &opts) }?;
+        let mut stats = unsafe { super::read_staged(&copies, &opts) }?;
         stats.bytes = items.iter().map(|item| item.len).sum();
         tally.direct_bytes.fetch_add(stats.direct, Relaxed);
         tally.inline_bytes.fetch_add(inline, Relaxed);

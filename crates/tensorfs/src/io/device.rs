@@ -83,6 +83,7 @@ struct Slot {
     ptr: *mut u8,
     done: Event,
     pending: bool,
+    recorded: bool,
 }
 
 impl Slot {
@@ -96,6 +97,7 @@ impl Slot {
             ptr: ptr.cast(),
             done,
             pending: false,
+            recorded: false,
         })
     }
 }
@@ -103,8 +105,10 @@ impl Slot {
 impl Drop for Slot {
     fn drop(&mut self) {
         if let (Ok(d), Ok(_ctx)) = (cuda::driver(), CtxGuard::enter(self.done.ctx)) {
-            if self.pending {
-                let _ = self.done.sync();
+            if self.pending && (!self.recorded || self.done.sync().is_err()) {
+                // The driver may still touch this allocation. Retain it until process exit
+                // rather than free an unproved in-flight stage during unwinding.
+                return;
             }
             unsafe { (d.mem_free_host)(self.ptr.cast()) };
         }
@@ -138,6 +142,8 @@ struct Engine {
     pool: Pool,
     serial: Mutex<()>,
     seen: Mutex<VecDeque<(usize, usize)>>,
+    held: Mutex<Vec<Retained>>,
+    staged: Mutex<Vec<Slot>>,
 }
 
 /// An engine-owned CUDA allocation. DLPack holders share it; the last owner frees it in its
@@ -187,14 +193,102 @@ impl Drop for DeviceBuffer {
     }
 }
 
+#[derive(Default)]
+struct Retained {
+    slots: Vec<Slot>,
+    pins: Vec<cuda::HostPin>,
+    events: Vec<Event>,
+    streams: Vec<cuda::Stream>,
+    _buffers: Vec<DeviceBuffer>,
+}
+
+// A failed check leaves the actual owners in place, not just their pointer identities.
+fn checked_take<T, E>(
+    owners: &mut Vec<T>,
+    check: impl FnOnce(&mut [T]) -> Result<(), E>,
+) -> Result<Vec<T>, E> {
+    check(owners)?;
+    Ok(std::mem::take(owners))
+}
+
+struct RunHold<'a> {
+    engine: &'a Engine,
+    owners: Option<Retained>,
+}
+
+impl RunHold<'_> {
+    fn take(&mut self) -> Retained {
+        let mut owners = self.owners.take().expect("run owners taken once");
+        owners
+            .slots
+            .append(&mut self.engine.staged.lock().unwrap_or_else(|e| e.into_inner()));
+        owners
+    }
+
+    fn finish(mut self, complete: bool) -> cuda::Result<()> {
+        let owners = self.take();
+        self.engine.release(vec![owners], complete)
+    }
+}
+
+impl Drop for RunHold<'_> {
+    fn drop(&mut self) {
+        if self.owners.is_some() {
+            let owners = self.take();
+            self.engine
+                .held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(owners);
+        }
+    }
+}
+
+fn registry() -> &'static Mutex<BTreeMap<i32, Arc<Engine>>> {
+    static ENGINES: OnceLock<Mutex<BTreeMap<i32, Arc<Engine>>>> = OnceLock::new();
+    ENGINES.get_or_init(Mutex::default)
+}
+
+/// Noninitializing: no driver/context is created when this device has no engine.
+pub(super) fn drain(device: i32) -> cuda::Result<()> {
+    let engine = registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&device)
+        .cloned();
+    match engine {
+        Some(engine) => {
+            let _serial = engine.serial.lock().unwrap_or_else(|e| e.into_inner());
+            engine.recover()
+        }
+        None => Ok(()),
+    }
+}
+
+pub(super) fn retain_decode(stream: Option<cuda::Stream>, buffers: Vec<DeviceBuffer>) {
+    let engine = buffers
+        .first()
+        .expect("decode retains its output")
+        .engine
+        .clone();
+    engine
+        .held
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Retained {
+            streams: stream.into_iter().collect(),
+            _buffers: buffers,
+            ..Retained::default()
+        });
+}
+
 // Handles are used only after entering their primary context; calls on a stream are ordered.
 unsafe impl Send for Engine {}
 unsafe impl Sync for Engine {}
 
 impl Engine {
     fn get(device: i32) -> cuda::Result<Arc<Engine>> {
-        static ENGINES: OnceLock<Mutex<BTreeMap<i32, Arc<Engine>>>> = OnceLock::new();
-        let mut engines = ENGINES.get_or_init(Mutex::default).lock().unwrap();
+        let mut engines = registry().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(engine) = engines.get(&device) {
             return Ok(engine.clone());
         }
@@ -217,6 +311,8 @@ impl Engine {
             },
             serial: Mutex::new(()),
             seen: Mutex::new(VecDeque::new()),
+            held: Mutex::new(Vec::new()),
+            staged: Mutex::new(Vec::new()),
         });
         engines.insert(device, engine.clone());
         Ok(engine)
@@ -244,123 +340,240 @@ impl Engine {
         Ok(())
     }
 
-    fn run(&self, copies: &[(usize, Copy)], opts: &ReadOpts) -> Result<ReadStats, Error> {
-        let _serial = self.serial.lock().unwrap();
-        let _ctx = CtxGuard::enter(self.ctx).map_err(|e| failed(copies[0].0, e))?;
-        let streams = opts.streams.clamp(1, STREAMS);
-        let first = copies[0].0;
-        let mut ready = Vec::new();
-        let mut pins = Vec::new();
-        let mut jobs = Vec::new();
-        let tally = Tally::default();
-        for &(copy, c) in copies {
-            if let Src::Device { device, stream, .. } = c.src {
-                let source = Engine::get(device).map_err(|e| failed(copy, e))?;
-                let event = Event::new(source.ctx, false).map_err(|e| failed(copy, e))?;
-                event
-                    .record(stream as CUstream)
-                    .map_err(|e| failed(copy, e))?;
-                self.wait(&event, streams).map_err(|e| failed(copy, e))?;
-                ready.push(event);
+    fn synchronize(&self, owners: &[Retained]) -> cuda::Result<()> {
+        let mut first = None;
+        for stream in self
+            .streams
+            .iter()
+            .chain(owners.iter().flat_map(|r| &r.streams))
+        {
+            if let Err(error) = stream.drain() {
+                first.get_or_insert(error);
             }
-            if let Dst::Device { stream, .. } = c.dst {
-                if stream != 0 {
-                    let event = Event::new(self.ctx, false).map_err(|e| failed(copy, e))?;
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    fn checked_release(&self, owners: &mut [Retained], complete: bool) -> cuda::Result<()> {
+        if !complete {
+            self.synchronize(owners)?;
+        }
+        let mut first = None;
+        for pin in owners.iter_mut().flat_map(|r| &mut r.pins) {
+            if let Err(error) = pin.release() {
+                first.get_or_insert(error);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    fn released(&self, owners: Vec<Retained>) {
+        for mut owner in owners {
+            for mut slot in owner.slots.drain(..) {
+                slot.pending = false;
+                slot.recorded = false;
+                self.pool.put(slot);
+            }
+            // The remaining event/stream/allocation owners drop only after checked completion.
+            drop(owner);
+        }
+    }
+
+    fn release(&self, mut owners: Vec<Retained>, complete: bool) -> cuda::Result<()> {
+        match checked_take(&mut owners, |r| self.checked_release(r, complete)) {
+            Ok(released) => {
+                self.released(released);
+                Ok(())
+            }
+            Err(error) => {
+                self.held
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(owners);
+                Err(error)
+            }
+        }
+    }
+
+    // Caller holds serial, including before allowing any slot to be reused.
+    fn recover(&self) -> cuda::Result<()> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let released = checked_take(&mut held, |r| self.checked_release(r, false))?;
+        drop(held);
+        // All previous engine work is now complete, including slots already returned to pool.
+        for slot in self
+            .pool
+            .free
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+        {
+            slot.pending = false;
+            slot.recorded = false;
+        }
+        self.released(released);
+        Ok(())
+    }
+
+    fn hold_slot(&self, slot: Slot) {
+        self.staged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(slot);
+    }
+
+    fn run(
+        &self,
+        copies: &[(usize, Copy)],
+        opts: &ReadOpts,
+        staged_host: bool,
+    ) -> Result<ReadStats, Error> {
+        let _serial = self.serial.lock().unwrap_or_else(|e| e.into_inner());
+        let first = copies[0].0;
+        if !self
+            .held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            self.recover().map_err(|e| failed(first, e))?;
+        }
+        let _ctx = CtxGuard::enter(self.ctx).map_err(|e| failed(first, e))?;
+        let streams = opts.streams.clamp(1, STREAMS);
+        let mut hold = RunHold {
+            engine: self,
+            owners: Some(Retained::default()),
+        };
+        let mut complete = false;
+        let result = (|| {
+            let owners = hold.owners.as_mut().expect("run owners live");
+            let mut jobs = Vec::new();
+            let tally = Tally::default();
+            for &(copy, c) in copies {
+                if let Src::Device { device, stream, .. } = c.src {
+                    let source = Engine::get(device).map_err(|e| failed(copy, e))?;
+                    owners
+                        .events
+                        .push(Event::new(source.ctx, false).map_err(|e| failed(copy, e))?);
+                    let event = owners.events.last().expect("source event inserted");
                     event
                         .record(stream as CUstream)
                         .map_err(|e| failed(copy, e))?;
-                    self.wait(&event, streams).map_err(|e| failed(copy, e))?;
-                    ready.push(event);
+                    self.wait(event, streams).map_err(|e| failed(copy, e))?;
+                }
+                if let Dst::Device { stream, .. } = c.dst {
+                    if stream != 0 {
+                        owners
+                            .events
+                            .push(Event::new(self.ctx, false).map_err(|e| failed(copy, e))?);
+                        let event = owners.events.last().expect("destination event inserted");
+                        event
+                            .record(stream as CUstream)
+                            .map_err(|e| failed(copy, e))?;
+                        self.wait(event, streams).map_err(|e| failed(copy, e))?;
+                    }
+                }
+                let mut direct = matches!(
+                    (c.src, c.dst),
+                    (Src::Device { .. } | Src::Zero, Dst::Device { .. })
+                );
+                if !staged_host {
+                    if let (Src::Host(ptr), Dst::Device { .. }) = (c.src, c.dst) {
+                        let reused = self.reused(ptr as usize, c.dst.len());
+                        if unsafe { cuda::registered(ptr) }.map_err(|e| failed(copy, e))? {
+                            direct = true;
+                        } else if reused {
+                            let start = Instant::now();
+                            let pin =
+                                unsafe { cuda::pin_region(ptr.cast_mut(), c.dst.len(), true) };
+                            tally
+                                .pin_ns
+                                .fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
+                            if let Ok(pin) = pin {
+                                owners.pins.push(pin);
+                                direct = true;
+                            }
+                        }
+                    }
+                }
+                let step = if direct { c.dst.len() } else { PIECE };
+                for at in (0..c.dst.len()).step_by(step.max(1)) {
+                    jobs.push(Job {
+                        copy,
+                        c,
+                        at,
+                        len: step.min(c.dst.len() - at),
+                        direct,
+                    });
                 }
             }
-            let mut direct = matches!((c.src, c.dst), (Src::Device { .. } | Src::Zero, Dst::Device { .. }));
-            if let (Src::Host(ptr), Dst::Device { .. }) = (c.src, c.dst) {
-                let reused = self.reused(ptr as usize, c.dst.len());
-                if unsafe { cuda::registered(ptr) }.map_err(|e| failed(copy, e))? {
-                    direct = true;
-                } else if reused {
-                    let start = Instant::now();
-                    let pin = unsafe { cuda::pin_region(ptr.cast_mut(), c.dst.len(), true) };
-                    tally
-                        .pin_ns
-                        .fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
-                    if let Ok(pin) = pin {
-                        pins.push(pin);
-                        direct = true;
+            let start = owners.events.len();
+            for stream in &self.streams[..streams] {
+                owners
+                    .events
+                    .push(Event::new(self.ctx, true).map_err(|e| failed(first, e))?);
+                owners
+                    .events
+                    .last()
+                    .expect("start event inserted")
+                    .record(stream.raw() as CUstream)
+                    .map_err(|e| failed(first, e))?;
+            }
+            let next = AtomicUsize::new(0);
+            let stopped = AtomicBool::new(false);
+            let error = Mutex::new(None);
+            let work = || {
+                while !stopped.load(Relaxed) {
+                    let at = next.fetch_add(1, Relaxed);
+                    let Some(job) = jobs.get(at) else { break };
+                    if let Err(failure) = self.piece(job, at % streams, opts, &tally) {
+                        error.lock().unwrap().get_or_insert(failure);
+                        stopped.store(true, Relaxed);
+                    }
+                }
+            };
+            std::thread::scope(|scope| {
+                for _ in 1..opts.threads.clamp(1, READERS).min(jobs.len().max(1)) {
+                    scope.spawn(work);
+                }
+                work();
+            });
+            let mut busy_ns = 0;
+            let mut all_complete = true;
+            for (lane, stream) in self.streams[..streams].iter().enumerate() {
+                let drained = (|| {
+                    owners.events.push(Event::new(self.ctx, true)?);
+                    let end = owners.events.last().expect("end event inserted");
+                    end.record(stream.raw() as CUstream)?;
+                    end.sync()?;
+                    end.since(&owners.events[start + lane])
+                })();
+                match drained {
+                    Ok(ns) => busy_ns += ns,
+                    Err(e) => {
+                        all_complete = false;
+                        error.lock().unwrap().get_or_insert(failed(first, e));
                     }
                 }
             }
-            let step = if direct { c.dst.len() } else { PIECE };
-            for at in (0..c.dst.len()).step_by(step.max(1)) {
-                jobs.push(Job {
-                    copy,
-                    c,
-                    at,
-                    len: step.min(c.dst.len() - at),
-                    direct,
-                });
+            complete = all_complete;
+            if let Some(error) = error.into_inner().unwrap() {
+                return Err(error);
             }
-        }
-        let start: Vec<_> = (0..streams)
-            .map(|_| Event::new(self.ctx, true))
-            .collect::<cuda::Result<_>>()
-            .map_err(|e| failed(first, e))?;
-        for (event, stream) in start.iter().zip(&self.streams) {
-            event
-                .record(stream.raw() as CUstream)
-                .map_err(|e| failed(first, e))?;
-        }
-        let next = AtomicUsize::new(0);
-        let stopped = AtomicBool::new(false);
-        let error = Mutex::new(None);
-        let work = || {
-            while !stopped.load(Relaxed) {
-                let at = next.fetch_add(1, Relaxed);
-                let Some(job) = jobs.get(at) else { break };
-                if let Err(failure) = self.piece(job, at % streams, opts, &tally) {
-                    error.lock().unwrap().get_or_insert(failure);
-                    stopped.store(true, Relaxed);
-                }
-            }
-        };
-        std::thread::scope(|scope| {
-            for _ in 1..opts.threads.clamp(1, READERS).min(jobs.len().max(1)) {
-                scope.spawn(work);
-            }
-            work();
-        });
-        let mut busy_ns = 0;
-        for (begin, stream) in start.iter().zip(&self.streams) {
-            let drained = (|| {
-                let end = Event::new(self.ctx, true)?;
-                end.record(stream.raw() as CUstream)?;
-                end.sync()?;
-                end.since(begin)
-            })();
-            match drained {
-                Ok(ns) => busy_ns += ns,
-                Err(e) => {
-                    if let Ok(d) = cuda::driver() {
-                        unsafe { (d.stream_synchronize)(stream.raw() as CUstream) };
-                    }
-                    error.lock().unwrap().get_or_insert(failed(first, e));
-                }
-            }
-        }
-        if let Some(error) = error.into_inner().unwrap() {
-            return Err(error);
-        }
-        drop(ready);
-        drop(pins);
-        Ok(ReadStats {
-            direct: tally.direct.load(Relaxed),
-            cached: tally.cached.load(Relaxed),
-            bounced: tally.bounced.load(Relaxed),
-            pin_ns: tally.pin_ns.load(Relaxed),
-            staged: tally.staged.load(Relaxed),
-            busy_ns,
-            ..ReadStats::default()
-        })
+            Ok(ReadStats {
+                direct: tally.direct.load(Relaxed),
+                cached: tally.cached.load(Relaxed),
+                bounced: tally.bounced.load(Relaxed),
+                pin_ns: tally.pin_ns.load(Relaxed),
+                staged: tally.staged.load(Relaxed),
+                busy_ns,
+                ..ReadStats::default()
+            })
+        })();
+        let released = hold.finish(complete).map_err(|e| failed(first, e));
+        let stats = result?;
+        released?;
+        Ok(stats)
     }
 
     fn piece(&self, job: &Job, lane: usize, opts: &ReadOpts, tally: &Tally) -> Result<(), Error> {
@@ -433,9 +646,11 @@ impl Engine {
                 },
                 _ => unreachable!(),
             };
+            slot.pending = true;
+            slot.recorded = false;
             cuda::check("cuMemcpyAsync", rc).map_err(|e| failed(job.copy, e))?;
             slot.done.record(stream).map_err(|e| failed(job.copy, e))?;
-            slot.pending = true;
+            slot.recorded = true;
             if let Dst::Host { ptr, .. } = job.c.dst {
                 slot.done.sync().map_err(|e| failed(job.copy, e))?;
                 slot.pending = false;
@@ -445,9 +660,10 @@ impl Engine {
             Ok(())
         })();
         if result.is_err() {
-            unsafe { (d.stream_synchronize)(stream) };
+            self.hold_slot(slot);
+        } else {
+            self.pool.put(slot);
         }
-        self.pool.put(slot);
         result
     }
 }
@@ -469,9 +685,12 @@ struct Tally {
     staged: AtomicU64,
 }
 
-/// Each device has B7's reusable pinned buffers; reads finish before any borrowed source is
-/// released. A borrowed/owned registration is never retained past its caller's lifetime.
-pub(super) unsafe fn fill(copies: &[(usize, Copy)], opts: &ReadOpts) -> Result<ReadStats, Error> {
+/// Same bounded B7 staging, with checked completion and retained native resources on error.
+pub(super) unsafe fn fill(
+    copies: &[(usize, Copy)],
+    opts: &ReadOpts,
+    staged_host: bool,
+) -> Result<ReadStats, Error> {
     let mut groups: BTreeMap<(i32, &str), Vec<(usize, Copy)>> = BTreeMap::new();
     for &(index, copy) in copies {
         if copy.dst.is_empty() {
@@ -484,25 +703,43 @@ pub(super) unsafe fn fill(copies: &[(usize, Copy)], opts: &ReadOpts) -> Result<R
         let kind = match (copy.src, copy.dst) {
             (Src::Zero, _) => "zero",
             (Src::Device { .. }, Dst::Host { .. }) => "d2h",
-            (Src::Device { device: source, .. }, Dst::Device { device: target, .. }) if source != target => "peer",
+            (Src::Device { device: source, .. }, Dst::Device { device: target, .. })
+                if source != target =>
+            {
+                "peer"
+            }
             (Src::Device { .. }, Dst::Device { .. }) => "d2d",
             _ => "h2d",
         };
-        groups.entry((device, kind)).or_default().push((index, copy));
+        groups
+            .entry((device, kind))
+            .or_default()
+            .push((index, copy));
     }
     let mut total = ReadStats::default();
     for ((device, kind), copies) in groups {
         let engine = Engine::get(device).map_err(|e| failed(copies[0].0, e))?;
         #[cfg(unix)]
-        let ceiling = if kind == "h2d" { super::metrics::h2d(device).map_or(0.0, |c| c.0) } else { 0.0 };
+        let ceiling = if kind == "h2d" {
+            super::metrics::h2d(device).map_or(0.0, |c| c.0)
+        } else {
+            0.0
+        };
         let start = Instant::now();
-        let stats = engine.run(&copies, opts)?;
+        let stats = engine.run(&copies, opts, staged_host)?;
         #[cfg(unix)]
         super::metrics::record(super::metrics::Copy {
-            kind, gpu: device, bytes: copies.iter().map(|(_, c)| c.dst.len() as u64).sum(),
-            ns: start.elapsed().as_nanos() as u64, ceiling,
-            link: super::metrics::device_link(device).map_or_else(String::new, |link| link.to_string()),
-            busy_ns: stats.busy_ns, pin_ns: stats.pin_ns, staged: stats.staged, cached: stats.cached,
+            kind,
+            gpu: device,
+            bytes: copies.iter().map(|(_, c)| c.dst.len() as u64).sum(),
+            ns: start.elapsed().as_nanos() as u64,
+            ceiling,
+            link: super::metrics::device_link(device)
+                .map_or_else(String::new, |link| link.to_string()),
+            busy_ns: stats.busy_ns,
+            pin_ns: stats.pin_ns,
+            staged: stats.staged,
+            cached: stats.cached,
         });
         #[cfg(not(unix))]
         let _ = (kind, start);
@@ -514,4 +751,42 @@ pub(super) unsafe fn fill(copies: &[(usize, Copy)], opts: &ReadOpts) -> Result<R
         total.busy_ns += stats.busy_ns;
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Owner(Arc<AtomicUsize>);
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn failed_completion_checks_retain_actual_owners_until_a_checked_success() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut owners = vec![Owner(dropped.clone()), Owner(dropped.clone())];
+        for _ in 0..2 {
+            let result = checked_take(&mut owners, |_| Err::<(), _>("injected completion error"));
+            assert!(result.is_err());
+            assert_eq!(owners.len(), 2);
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        }
+        let released = checked_take(&mut owners, |_| Ok::<(), &str>(())).unwrap();
+        assert!(owners.is_empty());
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(released);
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn draining_a_device_without_an_engine_does_not_initialize_cuda() {
+        // No CUDA discovery, context creation, allocation or driver call is needed.
+        assert!(!registry().lock().unwrap().contains_key(&i32::MIN));
+        drain(i32::MIN).unwrap();
+        assert!(!registry().lock().unwrap().contains_key(&i32::MIN));
+    }
 }

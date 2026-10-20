@@ -57,7 +57,12 @@ fn io_error(error: super::Error) -> Failure {
 
 fn upload(device: i32, bytes: &[u8]) -> Result<DeviceBuffer> {
     let buffer = DeviceBuffer::new(device, bytes.len())?;
-    write(&buffer, bytes, 0)?;
+    if let Err(error) = write(&buffer, bytes, 0) {
+        // Staging owns any outstanding host bytes; retain this actual device allocation
+        // until the same engine proves completion, instead of freeing it on an I/O error.
+        super::device::retain_decode(None, vec![buffer]);
+        return Err(error);
+    }
     Ok(buffer)
 }
 
@@ -72,7 +77,7 @@ fn write(buffer: &DeviceBuffer, bytes: &[u8], stream: usize) -> Result<()> {
         },
     };
     // SAFETY: source and exclusive destination remain live until the engine has drained.
-    unsafe { super::read(&[copy], &ReadOpts::default()) }.map_err(io_error)?;
+    unsafe { super::read_staged(&[copy], &ReadOpts::default()) }.map_err(io_error)?;
     Ok(())
 }
 
@@ -269,11 +274,26 @@ fn execute(device: i32, launch: &Launch<'_>) -> Result<DeviceBuffer> {
         }
         Ok(())
     })();
-    let drained = cuda::check("cuStreamSynchronize", unsafe {
-        (driver.stream_synchronize)(stream.raw() as _)
+    let drained = stream.drain().and_then(|()| {
+        if result.is_err() {
+            super::drain(device)
+        } else {
+            Ok(())
+        }
     });
+    if let Err(error) = drained {
+        // The private kernel stream and every allocation it can touch remain actual owners.
+        // io::drain retries this work through the same engine before a later release.
+        let mut buffers = Vec::from(inputs);
+        buffers.extend(scratch);
+        buffers.push(output);
+        super::device::retain_decode(Some(stream), buffers);
+        return match result {
+            Err(error) => Err(error),
+            Ok(()) => Err(error.into()),
+        };
+    }
     result?;
-    drained?;
     Ok(output)
 }
 
