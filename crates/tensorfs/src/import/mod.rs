@@ -266,8 +266,8 @@ pub struct Request<'a> {
     pub sources: &'a [String],
     /// A table to convert with; required for tables recognition never picks alone.
     pub converter: Option<&'a str>,
-    /// A Diffusers weights variant (`fp16`), when a folder has several.
-    pub variant: Option<&'a str>,
+    /// The source's Diffusers weights variant (`fp16`), when a folder has several.
+    pub source_variant: Option<&'a str>,
     pub access: &'a Access,
     /// The store's tmp directory.
     pub tmp: &'a Path,
@@ -586,7 +586,7 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
         let listing = remote::Scope::new(req.access, req.stop).list(&remote::parse(raw)?)?;
         pinned.push(listing.pinned.clone());
         let read = |m: &remote::Member| remote::Scope::new(req.access, req.stop).read_small(m);
-        for m in remote::select(listing, req.variant, remote::Files::All, &read)? {
+        for m in remote::select(listing, req.source_variant, remote::Files::All, &read)? {
             if members.iter().any(|o| o.path == m.path) {
                 return refuse(
                     Code::DUPLICATE_KEY,
@@ -598,7 +598,7 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     }
     let id = digest(&[
         &pinned.join("\n"),
-        req.variant.unwrap_or(""),
+        req.source_variant.unwrap_or(""),
         req.converter.unwrap_or(""),
     ]);
     let area = req.tmp.join("import").join(&id[..32]);

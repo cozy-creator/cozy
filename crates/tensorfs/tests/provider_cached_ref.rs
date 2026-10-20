@@ -201,7 +201,7 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
     let checkpoint = writer.commit().await.unwrap();
     let folder = scratch.0.join("portable");
     checkpoint
-        .materialize(&folder, Format::Cozytensors, None)
+        .materialize(&folder, Format::Cozytensors, false)
         .await
         .unwrap();
     let tree = producer

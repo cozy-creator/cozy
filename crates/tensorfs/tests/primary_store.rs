@@ -184,7 +184,7 @@ async fn empty_safetensors_materialization_returns_a_directory_and_refuses_a_fil
         .unwrap();
     let destination = scratch.0.join("empty-directory");
     let path = checkpoint
-        .materialize(&destination, Format::Safetensors, None)
+        .materialize(&destination, Format::Safetensors, false)
         .await
         .unwrap();
     assert_eq!(path, destination);
@@ -195,7 +195,7 @@ async fn empty_safetensors_materialization_returns_a_directory_and_refuses_a_fil
     fs::write(&file, b"keep me").unwrap();
     assert_eq!(
         checkpoint
-            .materialize(&file, Format::Safetensors, None)
+            .materialize(&file, Format::Safetensors, false)
             .await
             .unwrap_err()
             .kind,
@@ -224,7 +224,7 @@ fn all_local_materialize_without_tokio_returns_unsupported_without_output() {
     .unwrap();
     let directory = scratch.0.join("no-runtime");
     let result =
-        futures::executor::block_on(checkpoint.materialize(&directory, Format::Cozytensors, None));
+        futures::executor::block_on(checkpoint.materialize(&directory, Format::Cozytensors, false));
     assert_eq!(result.unwrap_err().kind, Kind::Unsupported);
     assert!(!directory.exists());
 }
@@ -359,7 +359,7 @@ async fn explicit_export_fetches_known_repo_files_and_never_omits_refused_files(
         let invalid = scratch.0.join("invalid-export");
         assert_eq!(
             checkpoint
-                .materialize(&invalid, Format::Cozytensors, Some(Dtype::F32))
+                .materialize(&invalid, Format::Cozytensors, true)
                 .await
                 .unwrap_err()
                 .kind,
@@ -368,20 +368,11 @@ async fn explicit_export_fetches_known_repo_files_and_never_omits_refused_files(
         assert_eq!(server.repo_requests(), 0);
         assert!(!invalid.exists());
         let requests_before = server.requests.lock().unwrap().len();
-        let invalid = scratch.0.join("invalid-safetensors");
-        let error = checkpoint
-            .materialize(&invalid, Format::Safetensors, Some(Dtype::I8))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind, Kind::Invalid);
-        assert_eq!(error.detail, "dequantize to I8: one of F32, BF16, F16");
-        assert_eq!(server.requests.lock().unwrap().len(), requests_before);
-        assert!(!invalid.exists());
         let file = scratch.0.join("existing-file");
         fs::write(&file, b"keep me").unwrap();
         assert_eq!(
             checkpoint
-                .materialize(&file, Format::Safetensors, None)
+                .materialize(&file, Format::Safetensors, false)
                 .await
                 .unwrap_err()
                 .kind,
@@ -392,7 +383,7 @@ async fn explicit_export_fetches_known_repo_files_and_never_omits_refused_files(
 
         let destination = scratch.0.join("export");
         let result = checkpoint
-            .materialize(&destination, Format::Cozytensors, None)
+            .materialize(&destination, Format::Cozytensors, false)
             .await;
         assert!(
             server.repo_requests() > 0,

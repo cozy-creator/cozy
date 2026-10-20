@@ -15,7 +15,8 @@ pub type ConvertProgress<'a> = dyn Fn(&str, u64, u64) -> Result<()> + Sync + 'a;
 #[derive(Default)]
 pub struct Convert<'a> {
     pub converter: Option<&'a str>,
-    pub variant: Option<&'a str>,
+    /// The source's Diffusers weights variant (`fp16`), when a folder has several.
+    pub source_variant: Option<&'a str>,
     pub progress: Option<&'a ConvertProgress<'a>>,
 }
 
@@ -129,7 +130,7 @@ impl Client {
         let access = self.import_access(sources, &control)?;
         let (sources, store) = (sources.to_owned(), self.store.clone());
         let converter = options.converter.map(str::to_owned);
-        let variant = options.variant.map(str::to_owned);
+        let source_variant = options.source_variant.map(str::to_owned);
         let worker_control = control.clone();
         blocking(control, options.progress, move |events| {
             let report = |stage: &str, held, total| {
@@ -152,7 +153,7 @@ impl Client {
             let request = import::Request {
                 sources: &sources,
                 converter: converter.as_deref(),
-                variant: variant.as_deref(),
+                source_variant: source_variant.as_deref(),
                 access: &access,
                 tmp: &tmp,
                 progress: &report,
