@@ -6,10 +6,10 @@ name: dev-build
 # cozy-<sha> (the runner arch's dev `cozy`, <version>+dev.g<sha8>, which `cozy machine update --tensord`
 # runs on any machine: `ghbuild.sh cozy <ref> cozy`, `-r ubuntu-24.04-arm` for arm64) and
 # tensorfs-wheel-<sha> (the manylinux x86_64 wheel). The cozy binary's release archives are dist's
-# (release.yml). Tests get PostgreSQL (AUTHKIT_TEST_DATABASE_URL), the dev cozy
-# (COZY_TEST_DEV_BINARY) when it was built, the TensorFS wheel installed in a venv
-# (TENSORFS_TEST_PYTHON) and its wheel (COZY_TEST_TENSORFS_WHEEL) when it was built, and a Runtime
-# wheel (COZY_TEST_RUNTIME_WHEEL): the newest published one, or runtime_ref's, stamped with its commit.
+# (release.yml). Tests get the dev cozy (COZY_TEST_DEV_BINARY) when it was built, the TensorFS
+# wheel installed in a venv (TENSORFS_TEST_PYTHON) and its wheel (COZY_TEST_TENSORFS_WHEEL) when it
+# was built, and a Runtime wheel (COZY_TEST_RUNTIME_WHEEL): the newest published one, or
+# runtime_ref's, stamped with its commit.
 # Machines the tests start install that pair. No whole-suite default: `test` is empty unless given.
 # ci.yaml calls it on every PR and master push.
 on:
@@ -64,27 +64,12 @@ jobs:
     runs-on: ${{ inputs.runner }}
     # Hang bound, not a work budget.
     timeout-minutes: 60
-    services:
-      # Started only for tests (TensorD's tests/hub_oauth.rs reads AUTHKIT_TEST_DATABASE_URL).
-      postgres:
-        image: ${{ inputs.test != '' && 'postgres:18-alpine' || '' }}
-        env:
-          POSTGRES_PASSWORD: ci-only
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
       - id: sha
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      # TensorD's OAuth tests build their Go harness (crates/tensord/tests/hub-oauth).
-      - uses: actions/setup-go@v6
-        if: inputs.test != ''
-        with:
-          go-version-file: crates/tensord/tests/hub-oauth/go.mod
-          cache-dependency-path: crates/tensord/tests/hub-oauth/go.sum
       - uses: astral-sh/setup-uv@v6
         if: inputs.test != '' || inputs.runtime_ref != '' || inputs.tensorfs_run != '' || contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
       # The Rust workspace: rust-toolchain.toml's toolchain installs on first use. target/manylinux
@@ -235,17 +220,15 @@ jobs:
       - if: inputs.test != ''
         env:
           TEST: ${{ inputs.test }}
-          AUTHKIT_TEST_DATABASE_URL: postgres://postgres:ci-only@127.0.0.1:5432/postgres?sslmode=disable
         run: |
           locations=()
-          for name in AUTHKIT_TEST_DATABASE_URL TENSORFS_TEST_PYTHON COZY_TEST_RUNTIME_WHEEL COZY_TEST_TENSORFS_WHEEL COZY_TEST_DEV_BINARY; do
+          for name in TENSORFS_TEST_PYTHON COZY_TEST_RUNTIME_WHEEL COZY_TEST_TENSORFS_WHEEL COZY_TEST_DEV_BINARY; do
             [ -z "${!name:-}" ] || locations+=("--setenv=$name=${!name}")
           done
           sudo systemd-run --wait --pipe --collect \
             --unit="cozy-dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --uid="$(id -u)" --gid="$(id -g)" --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=UV_TORCH_BACKEND=cpu \
-            --setenv="GOCACHE=$(go env GOCACHE)" --setenv="GOMODCACHE=$(go env GOMODCACHE)" \
             --setenv=CARGO_TERM_COLOR=never --setenv=GITHUB_ACTIONS=true "${locations[@]}" \
             bash -euo pipefail -c "$TEST"
       # Targeted proof commands may produce portable test executables and their source/hash
