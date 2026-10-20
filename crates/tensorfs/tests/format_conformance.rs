@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::Value as Json;
 use tensorfs::format::layout::{self, Item};
 use tensorfs::format::{
-    repo_key, Body, Component, Config, Dtype, Encoding, Error, Header, Location, ObjectRef, Part,
+    newest, repo_key, Body, Component, Config, Dtype, Encoding, Error, Header, Location, ObjectRef, Part,
     Pipeline, Repo, Resolution, Tag, Tensor, Tree, HEADER_FORMAT,
 };
 
@@ -326,6 +326,14 @@ struct Resolutions {
     repo: Json,
     trees: Vec<Json>,
     cases: Vec<ResolveCase>,
+    defaults: Vec<DefaultCase>,
+}
+
+#[derive(Deserialize)]
+struct DefaultCase {
+    why: String,
+    repo: Json,
+    default: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -348,6 +356,11 @@ fn revisions_resolve_to_commits() {
             (ObjectRef::of(&tree.to_json().unwrap()), tree)
         })
         .collect();
+    for case in doc.defaults {
+        let repo = Repo::from_json(&serde_json::to_vec(&case.repo).unwrap()).unwrap();
+        assert_eq!(newest(&repo.tags).map(|t| &t.name), case.default.as_ref(), "{}", case.why);
+        assert_eq!(repo.default_tag(), newest(&repo.tags));
+    }
     for case in doc.cases {
         let found = repo.resolve(case.revision.as_deref()).map(|r| r.find(|c| Ok::<_, ()>(trees[c].clone())).unwrap());
         let got = found.flatten().map(|(tag, variant)| (tag.commit.clone(), variant));
