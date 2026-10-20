@@ -1054,7 +1054,7 @@ pub(crate) fn regions(
     boundaries: Option<Vec<String>>,
     only: Option<Vec<String>>,
 ) -> Vec<Vec<String>> {
-    client::regions(
+    tensorfs::raw::regions(
         &ck.header,
         max_bytes,
         &boundaries.unwrap_or_default(),
