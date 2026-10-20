@@ -52,7 +52,8 @@ class Writer:
     def __init__(self, dest: StrPath | None = None, *, variant: str | None = None,
                  base: Checkpoint | None = None, resume: str | None = None,
                  repo_id: str | None = None, endpoint: str | None = None, token: Token | None = None,
-                 cache_dir: StrPath | None = None, ca_der: bytes | None = None) -> None: ...
+                 cache_dir: StrPath | None = None, ca_der: bytes | None = None) -> None:
+        """An optional literal cozytensors header file; payload remains in the configured shared store."""
     def __enter__(self) -> Writer: ...
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None,
                  traceback: TracebackType | None) -> None: ...
