@@ -782,3 +782,317 @@ async fn writer_provider_error_keeps_the_exact_family_and_detail_including_empty
         }
     }
 }
+
+fn source_safetensors() -> Vec<u8> {
+    let mut header = serde_json::to_vec(
+        &serde_json::json!({"w":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}),
+    )
+    .unwrap();
+    while !header.len().is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(header);
+    bytes.extend(WEIGHT);
+    bytes
+}
+fn conversion_source(root: &Path) -> PathBuf {
+    let folder = root.join("hf-source");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("model.safetensors"), source_safetensors()).unwrap();
+    fs::write(
+        folder.join("config.json"),
+        br#"{"width":4,"optional":null}"#,
+    )
+    .unwrap();
+    fs::write(folder.join("tokenizer.json"), ASSET).unwrap();
+    fs::write(folder.join("README.bin"), README).unwrap();
+    folder
+}
+fn actual_headers(root: &Path) -> Vec<PathBuf> {
+    let mut headers = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return headers;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            headers.extend(actual_headers(&path));
+        } else if tensorfs::format::Header::from_cbor(&fs::read(&path).unwrap()).is_ok() {
+            headers.push(path);
+        }
+    }
+    headers
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_upload_and_export()
+{
+    let scratch = Scratch::new();
+    let source = conversion_source(&scratch.0);
+    let cache = scratch.0.join("cache");
+    let endpoint = scratch.0.join("endpoint");
+    let client = client(&cache, &endpoint);
+    assert_eq!(
+        client
+            .resolve_source(source.to_str().unwrap())
+            .await
+            .unwrap(),
+        source.canonicalize().unwrap().display().to_string()
+    );
+    assert!(
+        actual_headers(&cache.join("blobs")).is_empty(),
+        "resolve_source admitted model bytes"
+    );
+    let stages = std::sync::Mutex::new(Vec::new());
+    let progress = |stage: &str, held, total| {
+        stages.lock().unwrap().push((stage.to_owned(), held, total));
+        Ok(())
+    };
+    let checkpoint = client
+        .convert(
+            &[source.to_str().unwrap().into()],
+            &tensorfs::Convert {
+                progress: Some(&progress),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(stages.lock().unwrap().last().unwrap().0, "imported");
+    assert_eq!(checkpoint.variant(), Some("u8"));
+    let child = checkpoint.component("model").unwrap().clone();
+    let portable = scratch.0.join("converted-portable");
+    export(&checkpoint, &portable, Format::Cozytensors, None).unwrap();
+    assert_eq!(fs::read(portable.join("README.bin")).unwrap(), README);
+    let tree = client
+        .upload_folder(&"local/converted".parse().unwrap(), &portable, None)
+        .await
+        .unwrap();
+    assert_eq!(checkpoint.tree(), Some(&tree));
+    let reopened = client
+        .open(
+            &format!("local/converted@{}", tree.id()),
+            &Open {
+                local_files_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    drop(checkpoint);
+    drop(client);
+    let result = scratch.0.join("converted-hf");
+    export(&reopened, &result, Format::Safetensors, None).unwrap();
+    check_export(&result);
+    drop(reopened);
+    assert_eq!(child.read("w").unwrap(), WEIGHT);
+    assert_eq!(child.asset("tokenizer.json").unwrap(), ASSET);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_convert_result_callback_can_refuse_the_final_stage_and_returns_after_worker_drain()
+{
+    let scratch = Scratch::new();
+    let source = conversion_source(&scratch.0);
+    for (index, detail) in ["", "CREDENTIAL_REQUIRED: exact final callback text"]
+        .iter()
+        .enumerate()
+    {
+        let cache = scratch.0.join(format!("cache-{index}"));
+        let client = client(&cache, &scratch.0.join("endpoint"));
+        let stages = std::sync::Mutex::new(Vec::new());
+        let progress = |stage: &str, _held, _total| {
+            stages.lock().unwrap().push(stage.to_owned());
+            if stage == "imported" {
+                Err(tensorfs::Failure {
+                    kind: Kind::Conflict,
+                    detail: (*detail).into(),
+                })
+            } else {
+                Ok(())
+            }
+        };
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.convert(
+                &[source.to_str().unwrap().into()],
+                &tensorfs::Convert {
+                    progress: Some(&progress),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind, Kind::Conflict);
+        assert_eq!(error.detail, *detail);
+        assert_eq!(stages.lock().unwrap().last().unwrap(), "imported");
+        assert!(
+            actual_headers(&cache.join("blobs")).is_empty(),
+            "callback refusal committed a header"
+        );
+        assert_eq!(
+            fs::read_dir(cache.join("refs")).unwrap().count(),
+            0,
+            "callback refusal published a repo"
+        );
+        // The returned error means the worker has drained, not merely that its await was dropped.
+        let operator = tensorfs::store2::Store::open(&cache).unwrap();
+        assert!(
+            operator.sweep_writers(std::time::Duration::ZERO).unwrap() > 0,
+            "writer fence still active after callback error returned"
+        );
+        drop(operator);
+        let checkpoint = client
+            .convert(
+                &[source.to_str().unwrap().into()],
+                &tensorfs::Convert::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            checkpoint.component("model").unwrap().read("w").unwrap(),
+            WEIGHT
+        );
+    }
+}
+
+struct ConversionProvider;
+#[async_trait::async_trait]
+impl tensorfs::TokenProvider for ConversionProvider {
+    async fn headers(
+        &self,
+        _request: &tensorfs::Request<'_>,
+    ) -> tensorfs::Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+}
+struct StalledConversion {
+    source: String,
+    waiting: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl StalledConversion {
+    fn new() -> Self {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let source = format!(
+            "http://{}/model.safetensors",
+            listener.local_addr().unwrap()
+        );
+        let waiting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (seen, go, done) = (waiting.clone(), release.clone(), stop.clone());
+        let worker = std::thread::spawn(move || {
+            while !done.load(Ordering::Acquire) {
+                let mut socket = match listener.accept() {
+                    Ok((s, _)) => s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                };
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    if socket.read(&mut byte).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    request.push(byte[0]);
+                }
+                let body = source_safetensors();
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\ncontent-length:{}\r\nconnection:close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(&body[..16]);
+                let _ = socket.flush();
+                seen.store(true, Ordering::Release);
+                while !go.load(Ordering::Acquire) && !done.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let _ = socket.write_all(&body[16..]);
+            }
+        });
+        Self {
+            source,
+            waiting,
+            release,
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+impl Drop for StalledConversion {
+    fn drop(&mut self) {
+        self.release.store(true, Ordering::Release);
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
+#[test]
+fn dropped_public_convert_wakes_stalled_io_without_restarting_the_callers_current_thread_runtime() {
+    let scratch = Scratch::new();
+    let origin = StalledConversion::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let provider = std::sync::Arc::new(ConversionProvider);
+    let weak = std::sync::Arc::downgrade(&provider);
+    let mut config = Config::from_env();
+    config.cache_dir = scratch.0.join("cache");
+    config.endpoint = origin.source.clone();
+    config.token = Some(provider);
+    config.mirror = None;
+    let client = Client::new(config).unwrap();
+    let sources = [origin.source.clone()];
+    let options = tensorfs::Convert::default();
+    let mut future = Box::pin(client.convert(&sources, &options));
+    runtime.block_on(async {
+        tokio::select! {
+            result = &mut future => panic!("conversion finished before the HTTP body stalled: {result:?}"),
+            () = async {tokio::time::timeout(std::time::Duration::from_secs(3), async {while !origin.waiting.load(Ordering::Acquire){tokio::time::sleep(std::time::Duration::from_millis(1)).await;}}).await.unwrap();} => {},
+        }
+    });
+    drop(future);
+    drop(client);
+    // No runtime is driven here. Native Notify must wake the blocking worker on its own.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while weak.upgrade().is_some() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let released_without_driver = weak.upgrade().is_none();
+    if !released_without_driver {
+        // Rescue and drain before reporting a failure, so a red oracle cannot strand its worker.
+        origin.release.store(true, Ordering::Release);
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while weak.upgrade().is_some() {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+    }
+    assert!(
+        released_without_driver,
+        "future Drop needed the caller I/O driver to restart before provider/worker release"
+    );
+    assert!(actual_headers(&scratch.0.join("cache/blobs")).is_empty());
+}
