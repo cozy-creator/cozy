@@ -1768,6 +1768,15 @@ mod gpu_tests {
         }
     }
 
+    struct Primary(cuda::CUdevice);
+    impl Drop for Primary {
+        fn drop(&mut self) {
+            if let Ok(driver) = cuda::driver() {
+                unsafe { (driver.primary_ctx_release)(self.0) };
+            }
+        }
+    }
+
     fn observe(ledger: &Ledger, description: &str, mut ready: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1802,15 +1811,21 @@ mod gpu_tests {
     #[ignore = "requires an owned rental; never run on the local GPU"]
     fn idle_worker_retires_after_pending_consumer_finishes() {
         let probe = Gpu::open(0).expect("real CUDA device");
-        let ledger = Ledger::create(
-            &probe.uuid().expect("GPU UUID"),
-            probe.capacity().expect("capacity"),
-        )
-        .expect("observer ledger");
+        let driver = cuda::driver().expect("driver");
+        let mut count = 0;
+        cuda::check("cuDeviceGetCount", unsafe {
+            (driver.device_get_count)(&mut count)
+        })
+        .expect("visible devices");
+        assert_eq!(count, 1, "this proof requires exactly one assigned GPU");
+        let uuid = probe.uuid().expect("GPU UUID");
+        let ledger =
+            Ledger::create(&uuid, probe.capacity().expect("capacity")).expect("observer ledger");
         let grant = ledger.grant_unbound().expect("unbound rank grant");
         drop(probe);
         let placement = Placement::open(0, Some((grant.table, grant.events, grant.channel)))
             .expect("real placement");
+        assert_eq!(placement.gpu_uuid().expect("placement GPU UUID"), uuid);
         let consumer = cuda::Stream::new(0).expect("consumer stream");
         let length = crate::layout::REGION_ALIGN;
         let layout = Layout {
@@ -1854,15 +1869,19 @@ mod gpu_tests {
             started,
             release: finish,
         }));
-        let (_, context) = cuda::primary_context(0).expect("context");
-        let _context = cuda::CtxGuard::enter(context).expect("enter context");
-        let result = unsafe {
-            (cuda::driver().expect("driver").launch_host_func)(
-                consumer.raw() as cuda::CUstream,
-                hold_consumer,
-                callback.cast(),
-            )
+        let (device, context) = cuda::primary_context(0).expect("context");
+        let retained = Primary(device);
+        let result = {
+            let _context = cuda::CtxGuard::enter(context).expect("enter context");
+            unsafe {
+                (driver.launch_host_func)(
+                    consumer.raw() as cuda::CUstream,
+                    hold_consumer,
+                    callback.cast(),
+                )
+            }
         };
+        drop(retained);
         if result != cuda::SUCCESS {
             drop(unsafe { Box::from_raw(callback) });
         }
@@ -1884,16 +1903,20 @@ mod gpu_tests {
         });
         drop(gate);
         observe(&ledger, "idle worker did not retire completed page", || {
+            let status = ledger.status().expect("published rows");
             placement.inner.lock().table.page(page).is_none()
-                && ledger
-                    .status()
-                    .expect("published rows")
+                && status
                     .rows
                     .iter()
-                    .filter(|row| row.pid == std::process::id())
-                    .all(|row| row.snapshot.classes.iter().all(|bytes| *bytes == 0))
+                    .find(|row| row.owner == placement.row.owner())
+                    .is_some_and(|row| row.snapshot.classes.iter().all(|bytes| *bytes == 0))
+                && status
+                    .kept
+                    .iter()
+                    .all(|(key, _)| key.fingerprint != [7; 32])
         });
         placement.end(1).expect("end request");
         placement.close().expect("close placement");
+        println!("PASS idle worker retires after pending consumer {uuid}");
     }
 }
