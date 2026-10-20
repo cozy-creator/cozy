@@ -272,11 +272,6 @@ impl<'t> Migrator<'t> {
     /// (`model.cozytensors`), named `v1-`/`v2-` and its manifest's first 12 hex (16 where two
     /// share 12), the name the Hub's view of a v1 model gives it.
     pub fn repo(&mut self, doc: &[u8], read: Read) -> Result<Migrated> {
-        // A document of tags is already D10.
-        if let Ok(repo) = Repo::from_json(doc) {
-            let report = json!({"model": repo.name, "releases": [], "checkpoints": []});
-            return Ok(Migrated { repo, objects: Objects::new(), report });
-        }
         let old: OldRepo = serde_json::from_slice(doc).map_err(|e| invalid(format!("repo document: {e}")))?;
         let name = old.name.clone();
         let upstream = self.table.iter().find(|u| u.models.iter().any(|p| matches(p, &name)));
