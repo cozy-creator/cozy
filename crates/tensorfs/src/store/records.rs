@@ -216,8 +216,13 @@ impl Store {
 
     /// `org/name` → `refs/<org>/<name>.json`. Names are case-insensitive: one identity.
     fn ref_path(&self, name: &str) -> Result<PathBuf> {
+        // Match the generic repository segments accepted by the format and public Ref.
+        // is_name remains the stricter grammar for pin IDs.
+        let segment = |part: &str| {
+            !part.is_empty() && part != "." && part != ".." && !part.contains(['/', '\\', '\0'])
+        };
         match name.split_once('/') {
-            Some((org, model)) if is_name(org, 128) && is_name(model, 128) => Ok(self
+            Some((org, model)) if segment(org) && segment(model) => Ok(self
                 .root
                 .join("refs")
                 .join(org.to_ascii_lowercase())
