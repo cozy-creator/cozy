@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,8 @@ import zipfile
 STAGES = ('import', 'host-u8', 'cuda-u8', 'cuda-awq')
 AWQ_SHA256 = '8d3db11524999d42dee58f69b664ea6c8c1ba07db784be9423b9870f992aa253'
 AWQ_KEY = 'autoawq-32x64-g32-f16'
+TERM_SECONDS = 3
+KILL_SECONDS = 10
 
 
 def sha(data):
@@ -33,6 +36,61 @@ def sha(data):
 def emit(stage, point, **facts):
     print(json.dumps({'stage': stage, 'point': point, 'monotonic_ns': time.monotonic_ns(), **facts},
                      sort_keys=True), flush=True)
+
+
+def run_owned(command, stdout, stderr, *, timeout, env=None, cwd=None,
+              term_seconds=TERM_SECONDS, kill_seconds=KILL_SECONDS):
+    """Existing bounded owned-child pattern, frozen from the public wrapper at80c3.
+
+    Never signal a caller or preexisting process. An uninterruptible child may
+    remain unreaped: record that failure instead of waiting without a deadline.
+    """
+    started = time.monotonic()
+    with Path(stdout).open('wb') as output, Path(stderr).open('wb') as errors:
+        child = subprocess.Popen(command, stdout=output, stderr=errors, env=env, cwd=cwd,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+        pgid = child.pid
+
+        def group_alive():
+            try:
+                os.killpg(pgid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+
+        def send(sig):
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                pass
+
+        timed_out = False
+        try:
+            child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        lingering = not timed_out and group_alive()
+        signals = []
+        if timed_out or lingering:
+            send(signal.SIGTERM)
+            signals.append('SIGTERM')
+            deadline = time.monotonic() + term_seconds
+            while time.monotonic() < deadline and group_alive():
+                child.poll()
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+            if group_alive():
+                send(signal.SIGKILL)
+                signals.append('SIGKILL')
+        try:
+            rc = child.wait(timeout=kill_seconds)
+            reaped = True
+        except subprocess.TimeoutExpired:
+            rc, reaped = None, False
+    return {'command': list(command), 'pid': child.pid, 'pgid': pgid, 'rc': rc,
+            'timeout_s': timeout, 'elapsed_s': time.monotonic() - started,
+            'timed_out': timed_out, 'lingering_descendants': lingering,
+            'signals': signals, 'reaped': reaped,
+            'ok': rc == 0 and reaped and not timed_out and not lingering}
 
 
 def wheel_files(path, digest):
@@ -141,7 +199,7 @@ def child(args):
                 checkpoint.close()
             value = arrays = tensors = checkpoint = component = writer = None
             gc.collect()
-            emit(stage, 'cleanup-complete')
+            emit(stage, 'python-handles-released')
     if any(n in sys.modules for n in ('torch', 'cupy', 'triton')):
         raise RuntimeError('a framework was imported')
     emit(stage, 'stage-complete')
@@ -168,14 +226,8 @@ def coordinate(args):
               'script_sha256': sha(Path(__file__).read_bytes()), 'stages': []}
     for stage in STAGES:
         argv = command(args, stage)
-        start = time.monotonic()
-        with (args.out / (stage + '.stdout')).open('wb') as stdout, (args.out / (stage + '.stderr')).open('wb') as stderr:
-            try:
-                completed = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                                           timeout=args.timeout, check=False)
-                rc, timed_out = completed.returncode, False
-            except subprocess.TimeoutExpired:
-                rc, timed_out = None, True
+        process = run_owned(argv, args.out / (stage + '.stdout'), args.out / (stage + '.stderr'),
+                            timeout=args.timeout, env=env)
         records, unparsed = [], []
         for line in (args.out / (stage + '.stdout')).read_text(errors='replace').splitlines():
             try:
@@ -188,9 +240,8 @@ def coordinate(args):
             else:
                 unparsed.append(line)
         done = bool(records and records[-1].get('point') == 'stage-complete' and not unparsed)
-        row = {'stage': stage, 'command': argv, 'rc': rc, 'timed_out': timed_out,
-               'elapsed_s': time.monotonic() - start, 'last_marker': records[-1] if records else None,
-               'unparsed_stdout': unparsed, 'ok': rc == 0 and not timed_out and done}
+        row = {'stage': stage, **process, 'last_marker': records[-1] if records else None,
+               'unparsed_stdout': unparsed, 'ok': process['ok'] and done}
         result['stages'].append(row)
         (args.out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         if not row['ok']:

@@ -1,5 +1,6 @@
 """Stdlib-only diagnostic-tool tests. Never import TensorFS or execute a probe."""
 import argparse
+import ast
 import contextlib
 import importlib.util
 import io
@@ -7,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import signal
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -63,17 +65,18 @@ class Diagnostic(unittest.TestCase):
 
     def test_coordinator_stops_after_first_failed_stage_and_preserves_logs(self):
         calls = []
-        def fake_run(argv, **kw):
+        def fake_run(argv, stdout, stderr, **kw):
             stage = argv[argv.index('--stage') + 1]
             calls.append(stage)
             self.assertEqual(kw['env']['PYTHONFAULTHANDLER'], '1')
             self.assertNotIn('PYTHONPATH', kw['env'])
             point = 'stage-complete' if stage == 'import' else 'read-start'
-            kw['stdout'].write(json.dumps({'stage': stage, 'point': point}).encode() + b'\n')
-            kw['stderr'].write(b'synthetic diagnostic stderr\n')
-            return subprocess.CompletedProcess(argv, 0 if stage == 'import' else -11)
+            stdout.write_text(json.dumps({'stage': stage, 'point': point}) + '\n')
+            stderr.write_text('synthetic diagnostic stderr\n')
+            return {'rc': 0 if stage == 'import' else -11, 'ok': stage == 'import',
+                    'reaped': True, 'timed_out': False}
         with patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': '0', 'PYTHONPATH': '/not-used'}), \
-                patch.object(probe.subprocess, 'run', side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
+                patch.object(probe, 'run_owned', side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(probe.coordinate(self.args), 1)
         self.assertEqual(calls, ['import', 'host-u8'])
         result = json.loads((self.args.out / 'result.json').read_text())
@@ -83,16 +86,46 @@ class Diagnostic(unittest.TestCase):
         self.assertEqual((self.args.out / 'host-u8.stderr').read_bytes(), b'synthetic diagnostic stderr\n')
 
     def test_timeout_or_partial_stdout_keeps_failure_receipt(self):
-        def timeout(argv, **kw):
-            kw['stdout'].write(b'{"stage":"import","point":')
-            raise subprocess.TimeoutExpired(argv, 45)
+        def timeout(argv, stdout, stderr, **kw):
+            stdout.write_bytes(b'{"stage":"import","point":')
+            stderr.write_bytes(b'')
+            return {'rc': None, 'ok': False, 'timed_out': True, 'reaped': False}
         with patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': '0'}), \
-                patch.object(probe.subprocess, 'run', side_effect=timeout), contextlib.redirect_stdout(io.StringIO()):
+                patch.object(probe, 'run_owned', side_effect=timeout), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(probe.coordinate(self.args), 1)
         row = json.loads((self.args.out / 'result.json').read_text())['stages'][0]
         self.assertTrue(row['timed_out'])
         self.assertIsNone(row['rc'])
         self.assertTrue(row['unparsed_stdout'])
+
+    def test_unreapable_child_has_only_bounded_waits_and_owned_signals(self):
+        class Stuck:
+            pid = 12345
+            def wait(self, *, timeout):
+                waits.append(timeout)
+                raise subprocess.TimeoutExpired('synthetic', timeout)
+            def poll(self):
+                return None
+        waits, signals = [], []
+        with patch.object(probe.subprocess, 'Popen', return_value=Stuck()) as spawn, \
+                patch.object(probe.os, 'killpg', side_effect=lambda pid, sig: signals.append((pid, sig))), \
+                patch.object(probe.time, 'monotonic', side_effect=range(100)):
+            row = probe.run_owned(['synthetic-child'], self.root / 'stdout', self.root / 'stderr',
+                                  timeout=0.1, term_seconds=0.01, kill_seconds=0.2)
+        self.assertEqual(waits, [0.1, 0.2])
+        self.assertEqual([s for _, s in signals if s], [signal.SIGTERM, signal.SIGKILL])
+        self.assertTrue(all(pid == 12345 for pid, _ in signals))
+        self.assertTrue(spawn.call_args.kwargs['start_new_session'])
+        self.assertFalse(row['reaped'] or row['ok'])
+        self.assertTrue(row['timed_out'])
+
+    def test_no_framework_imports_and_no_tensorfs_import_in_parent(self):
+        tree = ast.parse(SCRIPT.read_text())
+        top_imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+        self.assertFalse(any(isinstance(n, ast.Import) and any(a.name == 'tensorfs' for a in n.names)
+                             or isinstance(n, ast.ImportFrom) and n.module == 'tensorfs' for n in top_imports))
+        self.assertFalse(any(isinstance(n, ast.Import) and any(a.name in {'torch', 'cupy', 'triton'} for a in n.names)
+                             for n in ast.walk(tree)))
 
 
 if __name__ == '__main__':
