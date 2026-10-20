@@ -224,33 +224,63 @@ fn parts(view: &View, layout: &Layout) -> Vec<Part> {
     }).collect()
 }
 
-/// One region's copy: pending, then enqueued (`Ok`: its landing event) or failed with nothing in flight.
+/// An error is reclaimable only after the actual engine streams were checked.
+enum Filled {
+    Pending,
+    Ready(EvRef),
+    Failed(Error),
+    Unknown { error: Error, source: Arc<Weights> },
+}
 struct Fill {
-    state: Mutex<Option<Result<EvRef>>>,
+    state: Mutex<Filled>,
     cv: Condvar,
 }
 
 impl Fill {
-    fn set(&self, r: Result<EvRef>) {
-        *self.state.lock().unwrap() = Some(r);
+    fn set(&self, r: Filled) {
+        *self.state.lock().unwrap() = r;
         self.cv.notify_all();
     }
 
     /// Until the copies are enqueued: the host waits only for reads that feed them.
     fn wait(&self) -> Result<EvRef> {
-        self.cv.wait_while(self.state.lock().unwrap(), |s| s.is_none()).unwrap().clone().unwrap()
+        let state = self.cv.wait_while(self.state.lock().unwrap(), |s| matches!(s, Filled::Pending)).unwrap();
+        match &*state {
+            Filled::Ready(event) => Ok(event.clone()),
+            Filled::Failed(error) | Filled::Unknown { error, .. } => Err(error.clone()),
+            Filled::Pending => unreachable!(),
+        }
     }
 
     fn busy(&self) -> bool {
-        self.state.lock().unwrap().is_none()
+        matches!(*self.state.lock().unwrap(), Filled::Pending)
+    }
+
+    fn unknown(&self) -> bool {
+        matches!(*self.state.lock().unwrap(), Filled::Unknown { .. })
+    }
+
+    /// Called only after checked engine and placement-stream completion.
+    fn completed(&self) -> Option<Arc<Weights>> {
+        let mut state = self.state.lock().unwrap();
+        match std::mem::replace(&mut *state, Filled::Pending) {
+            Filled::Unknown { error, source } => {
+                *state = Filled::Failed(error);
+                Some(source)
+            }
+            old => {
+                *state = old;
+                None
+            }
+        }
     }
 
     /// Nothing of it is in flight on the device.
     fn landed(&self) -> Result<bool> {
         match &*self.state.lock().unwrap() {
-            Some(Ok(ready)) => ready.done(),
-            Some(Err(_)) => Ok(true),
-            None => Ok(false),
+            Filled::Ready(ready) => ready.done(),
+            Filled::Failed(_) => Ok(true),
+            Filled::Pending | Filled::Unknown { .. } => Ok(false),
         }
     }
 }
@@ -305,7 +335,7 @@ struct Mapping {
 
 impl Mapping {
     fn settled(&self) -> bool {
-        self.pins == 0 && self.fill.as_ref().is_none_or(|f| !f.busy())
+        self.pins == 0 && self.fill.as_ref().is_none_or(|f| !f.busy() && !f.unknown())
     }
 
     /// Nothing pins it and nothing is in flight on it.
@@ -315,12 +345,12 @@ impl Mapping {
 
     /// A fill that failed, which nothing pins: it holds no bytes.
     fn dead(&self) -> bool {
-        self.pins == 0 && self.fill.as_ref().is_some_and(|f| matches!(*f.state.lock().unwrap(), Some(Err(_))))
+        self.pins == 0 && self.fill.as_ref().is_some_and(|f| matches!(*f.state.lock().unwrap(), Filled::Failed(_)))
     }
 
     /// A new fill of it, and the releases its copies must wait for.
     fn refill(&mut self) -> (Arc<Fill>, Vec<EvRef>) {
-        let fill = Arc::new(Fill { state: Mutex::new(None), cv: Condvar::new() });
+        let fill = Arc::new(Fill { state: Mutex::new(Filled::Pending), cv: Condvar::new() });
         (self.fill, self.fresh) = (Some(fill.clone()), true);
         (fill, std::mem::take(&mut self.released))
     }
@@ -388,6 +418,8 @@ struct State {
     clock: u64,
     steps: u64,
     timings: Vec<Timing>,
+    /// Closed sets still own their VA and sources until completion is checked.
+    retired: Vec<usize>,
 }
 
 impl State {
@@ -445,6 +477,21 @@ struct Inner {
     tally: IoTally,
     jobs: (Mutex<Jobs>, Condvar),
     st: Mutex<State>,
+    retained: Mutex<Retained>,
+}
+
+#[derive(Default)]
+struct Retained {
+    /// A failed proof must retain the actual placement/resource graph after Gpu drops.
+    inner: Option<Arc<Inner>>,
+    pins: Vec<FailedPin>,
+}
+
+struct FailedPin {
+    ws: Arc<WeightSet>,
+    at: At,
+    region: u32,
+    stream: u64,
 }
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
@@ -487,6 +534,7 @@ impl Gpu {
             tally: IoTally::default(),
             jobs: Default::default(),
             st: Mutex::default(),
+            retained: Mutex::default(),
         });
         let m = inner.clone();
         let mover = std::thread::Builder::new().name(format!("varena-copy-{ordinal}")).spawn(move || m.mover());
@@ -512,7 +560,7 @@ impl Gpu {
         let (w, z) = (weights.clone(), Counters::default());
         let mut st = g.lock();
         st.sets.push(Some(Set { w, base, regs, step: z, last: z, total: z, used: 0, warm: true, busy: false, shared: false }));
-        Ok(Arc::new(WeightSet { gpu: self.clone(), id: st.sets.len() - 1, base, weights }))
+        Ok(Arc::new(WeightSet { gpu: self.clone(), id: st.sets.len() - 1, weights }))
     }
 
     /// A sealed host layout (TensorD's deposit) registered from the regions it carries: no
@@ -584,7 +632,8 @@ impl Gpu {
             let held: Vec<(usize, u32, u64)> = st.slots.iter().flatten().filter_map(|s| s.holds.map(|(set, _)| (set, s.m.pins, s.m.span))).collect();
             let set = |(id, s): (usize, &Set)| {
                 let regions = &s.w.layout.regions;
-                let sum = |f: &dyn Fn(&Reg) -> bool| s.regs.iter().zip(regions).filter(|(r, _)| f(r)).map(|(_, x)| x.span).sum();
+                let sum = |f: &dyn Fn(&Reg) -> bool| { s.regs.iter().zip(regions).filter(|(r, _)| f(r)).map(|(_, x)| x.span).sum()
+                };
                 let mine = || held.iter().filter(move |h| h.0 == id);
                 SetStats {
                     name: s.w.name.clone(),
@@ -636,7 +685,171 @@ impl Inner {
     /// `f` on the books, with our context current.
     fn with<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         let _c = CtxGuard::enter(self.ctx)?;
+        self.recover()?;
         f(&mut self.lock())
+    }
+
+    fn retain(self: &Arc<Self>) {
+        self.retained
+            .lock()
+            .unwrap()
+            .inner
+            .get_or_insert_with(|| self.clone());
+    }
+
+    fn checked_copies(&self) -> Result<()> {
+        byte_io::drain(self.ordinal)?;
+        let _c = CtxGuard::enter(self.ctx)?;
+        call!("cuStreamSynchronize", stream_synchronize(self.copy))
+    }
+
+    /// Never called by the mover: releasing a last retained WeightSet may join that thread.
+    fn recover(&self) -> Result<()> {
+        let pins = std::mem::take(&mut self.retained.lock().unwrap().pins);
+        if !pins.is_empty() {
+            let checked = self.checked_copies().and_then(|()| {
+                let _c = CtxGuard::enter(self.ctx)?;
+                for pin in &pins {
+                    call!(
+                        "cuStreamSynchronize",
+                        stream_synchronize(pin.stream as CUstream)
+                    )?;
+                }
+                Ok(())
+            });
+            if let Err(error) = checked {
+                self.retained.lock().unwrap().pins.extend(pins);
+                return Err(error);
+            }
+            for pin in pins {
+                pin.ws.release(pin.at, pin.region, None);
+            }
+        }
+        self.recover_retired()
+    }
+
+    /// Recover only mappings/source owners. No Arc<Gpu/WeightSet> drops on the mover.
+    fn recover_retired(&self) -> Result<()> {
+        let (unknown, candidates, events) = {
+            let st = self.lock();
+            let maps = || {
+                st.sets
+                    .iter()
+                    .flatten()
+                    .flat_map(|s| s.regs.iter().filter_map(|r| r.map.as_ref()))
+                    .chain(st.slots.iter().flatten().map(|s| &s.m))
+            };
+            let unknown: Vec<_> = maps()
+                .filter_map(|m| m.fill.as_ref())
+                .filter(|f| f.unknown())
+                .cloned()
+                .collect();
+            let candidates: Vec<_> = st
+                .retired
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    let home = st.sets[id]
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|s| s.regs.iter().filter_map(|r| r.map.as_ref()));
+                    let slots = st
+                        .slots
+                        .iter()
+                        .flatten()
+                        .filter(|s| s.holds.is_some_and(|(set, _)| set == id))
+                        .map(|s| &s.m);
+                    home.chain(slots)
+                        .all(|m| m.fill.as_ref().is_none_or(|f| !f.busy()))
+                })
+                .collect();
+            let mut events = Vec::new();
+            for &id in &candidates {
+                let home = st.sets[id]
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|s| s.regs.iter().filter_map(|r| r.map.as_ref()));
+                let slots = st
+                    .slots
+                    .iter()
+                    .flatten()
+                    .filter(|s| s.holds.is_some_and(|(set, _)| set == id))
+                    .map(|s| &s.m);
+                for m in home.chain(slots) {
+                    events.extend(m.released.iter().cloned());
+                    if let Some(fill) = &m.fill {
+                        if let Filled::Ready(event) = &*fill.state.lock().unwrap() {
+                            events.push(event.clone());
+                        }
+                    }
+                }
+            }
+            (unknown, candidates, events)
+        };
+        if !unknown.is_empty() || !candidates.is_empty() {
+            let _c = CtxGuard::enter(self.ctx)?;
+            self.checked_copies()?;
+            for event in events {
+                event.sync()?;
+            }
+            // Drop source owners outside both placement and fill locks.
+            drop(
+                unknown
+                    .iter()
+                    .filter_map(|f| f.completed())
+                    .collect::<Vec<_>>(),
+            );
+            for id in candidates {
+                let mut st = self.lock();
+                let Some(mut set) = st.sets[id].take() else {
+                    continue;
+                };
+                let result = (|| {
+                    for m in set.regs.iter_mut().filter_map(|r| r.map.as_mut()) {
+                        self.unmap_retired(&mut st, m)?;
+                    }
+                    self.keep_idle(&mut st, IDLE_KEEP)?;
+                    free_va(set.base, set.w.layout.nbytes.max(REGION_ALIGN))
+                })();
+                if let Err(error) = result {
+                    st.sets[id] = Some(set);
+                    return Err(error);
+                }
+                for slot in st
+                    .slots
+                    .iter_mut()
+                    .flatten()
+                    .filter(|s| s.holds.is_some_and(|(owner, _)| owner == id))
+                {
+                    slot.holds = None;
+                }
+                st.retired.retain(|&retired| retired != id);
+                drop(st);
+                drop(set);
+            }
+        }
+        let clear = {
+            let st = self.lock();
+            st.retired.is_empty()
+                && !st
+                    .sets
+                    .iter()
+                    .flatten()
+                    .flat_map(|s| &s.regs)
+                    .filter_map(|r| r.map.as_ref())
+                    .chain(st.slots.iter().flatten().map(|s| &s.m))
+                    .any(|m| m.fill.as_ref().is_some_and(|f| f.unknown()))
+        };
+        let owner = {
+            let mut retained = self.retained.lock().unwrap();
+            if clear && retained.pins.is_empty() {
+                retained.inner.take()
+            } else {
+                None
+            }
+        };
+        drop(owner);
+        Ok(())
     }
 
     fn submit(&self, job: Job, urgent: bool) {
@@ -680,7 +893,25 @@ impl Inner {
                 st.timings.push(Timing { set: job.set, step, field: |c| &mut c.copy_ns, a, b: b.clone() });
                 b
             });
-            job.fill.set(filled.map_err(|e| self.drained(e)));
+            let filled = match filled {
+                Ok(ready) => Filled::Ready(ready),
+                Err(error) => match self.checked_copies() {
+                    Ok(()) => Filled::Failed(error),
+                    Err(drain) => {
+                        self.retain();
+                        tracing::warn!("varena: retaining failed fill until completion can be checked: {drain}");
+                        Filled::Unknown {
+                            error,
+                            source: job.w.clone(),
+                        }
+                    }
+                },
+            };
+            job.fill.set(filled);
+            if let Err(error) = self.recover_retired() {
+                tracing::warn!(
+                    "varena: retained placement resources after failed completion: {error}");
+            }
         }
     }
 
@@ -693,14 +924,6 @@ impl Inner {
             return Some(r);
         }
         None
-    }
-
-    /// A failure is reported once nothing it queued is in flight.
-    fn drained(&self, e: Error) -> Error {
-        match (|| call!("cuStreamSynchronize", stream_synchronize(self.copy)))() {
-            Ok(()) => e,
-            Err(s) => Error::Io(format!("{e}; and the copy stream could not drain: {s}")),
-        }
     }
 
     fn run(self: &Arc<Self>, job: &Job, _run: &mut Run) -> Result<(EvRef, EvRef)> {
@@ -737,7 +960,8 @@ impl Inner {
                     self.keep_idle(st, 0)?;
                 }
                 cuda::ERROR_OUT_OF_MEMORY => return Ok(None),
-                rc => return cuda::check("cuMemCreate", rc).map(|_| None).map_err(Error::from),
+                rc => { return cuda::check("cuMemCreate", rc).map(|_| None).map_err(Error::from)
+                }
             }
         }
     }
@@ -764,7 +988,8 @@ impl Inner {
                             chunk = REGION_ALIGN;
                             continue;
                         }
-                        None => return Err(Error::DeviceFull { need: span, deficit: span - m.span }),
+                        None => { return Err(Error::DeviceFull { need: span, deficit: span - m.span })
+                        }
                     },
                 };
                 m.chunks.push(Chunk { handle, size, shared: prop.is_some() });
@@ -813,6 +1038,28 @@ impl Inner {
             drop(platform::handles::recv_fd(kept)); // empty: TensorD already let it go
         }
         self.give_back(st, m.chunks)
+    }
+
+    /// Keep the actual mapping owner on a failed cleanup; a retry resumes after the last
+    /// successful operation rather than unmapping/releasing the same allocation twice.
+    fn unmap_retired(&self, st: &mut State, m: &mut Mapping) -> Result<()> {
+        if m.span > 0 {
+            call!("cuMemUnmap", mem_unmap(m.va, m.span as usize))?;
+            st.mapped -= m.span;
+            m.span = 0;
+        }
+        if let Some(kept) = m.kept.take() {
+            drop(platform::handles::recv_fd(&kept));
+        }
+        while let Some(c) = m.chunks.last() {
+            if c.shared {
+                call!("cuMemRelease", mem_release(c.handle))?;
+            } else {
+                st.idle.entry(c.size).or_default().push(c.handle);
+            }
+            m.chunks.pop();
+        }
+        Ok(())
     }
 
     fn give_back(&self, st: &mut State, chunks: Vec<Chunk>) -> Result<()> {
@@ -866,7 +1113,7 @@ impl Inner {
         let span = st.slot_span;
         let (mut live, mut freed) = (st.slots.iter().flatten().count(), 0);
         for i in 0..st.slots.len() {
-            let Some(s) = st.slots[i].as_mut() else { continue };
+            let Some(s) = st.slots[i].as_mut() else { continue; };
             if (span == 0 || s.m.span < span || live > keep) && s.m.quiet()? {
                 freed += s.m.span;
                 self.drop_slot(st, i)?;
@@ -913,7 +1160,8 @@ impl Inner {
                 let settled = live.filter(|(_, s)| s.m.settled() && s.m.span >= x.span && (urgent || !s.pending));
                 match settled.min_by_key(|(_, s)| (s.holds.is_some(), s.pending, s.used)).map(|(i, _)| i) {
                     Some(i) => i,
-                    None if urgent || st.slots.iter().flatten().count() < SLOTS => self.new_slot(st, x.span.max(span))?,
+                    None if urgent || st.slots.iter().flatten().count() < SLOTS => { self.new_slot(st, x.span.max(span))?
+                    }
                     None => return Ok(None),
                 }
             }
@@ -952,20 +1200,44 @@ impl Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        let Ok(d) = cuda::driver() else { return };
-        let Ok(_c) = CtxGuard::enter(self.ctx) else { return };
-        // SAFETY: our stream, drained before anything it wrote to goes.
-        unsafe { (d.stream_synchronize)(self.copy) };
         let mut st = std::mem::take(self.st.get_mut().unwrap());
-        for i in 0..st.slots.len() {
-            if let Some(s) = &st.slots[i] {
-                s.m.released.iter().for_each(|e| drop(e.sync()));
-                let _ = self.drop_slot(&mut st, i);
+        let complete = (|| -> Result<()> {
+            let _c = CtxGuard::enter(self.ctx)?;
+            self.checked_copies()?;
+            for slot in st.slots.iter().flatten() {
+                if let Some(fill) = &slot.m.fill {
+                    match &*fill.state.lock().unwrap() {
+                        Filled::Ready(event) => event.sync()?,
+                        Filled::Pending | Filled::Unknown { .. } => {
+                            return Err(Error::Io("unproven placement completion".into()))
+                        }
+                        Filled::Failed(_) => {}
+                    }
+                }
+                for event in &slot.m.released {
+                    event.sync()?;
+                }
             }
+        for i in 0..st.slots.len() { let Some(mut slot) =st.slots[i].take() else {
+                    continue;
+                };
+                let (va, span) = (slot.m.va, slot.m.span);
+                if
+                let Err(error) = self.unmap_retired(&mut st, &mut slot.m)
+                    .and_then(|()| free_va(va, span))
+                {
+                    st.slots[ i] = Some(slot);
+                    return Err(error);
+            }
+        } self.keep_idle(&mut st, 0)?;
+            call! ("cuStreamDestroy",stream_destroy(self.copy)) })();
+        if let Err(error) = complete {
+            // No handle can request another proof now. Keep allocations, grants, sources and
+            // events until process exit instead of releasing an unknown producer's storage.
+            std::mem::forget(st);
+            std::mem::forget(self.events.clone());
+            tracing::warn!("varena: retained final GPU resources after failed completion: {error}");
         }
-        let _ = self.keep_idle(&mut st, 0);
-        // SAFETY: our drained stream.
-        unsafe { (d.stream_destroy)(self.copy) };
     }
 }
 
@@ -973,7 +1245,6 @@ impl Drop for Inner {
 pub struct WeightSet {
     gpu: Arc<Gpu>,
     id: usize,
-    base: u64,
     pub weights: Arc<Weights>,
 }
 
@@ -997,7 +1268,8 @@ impl WeightSet {
         for (r, reg) in st.set(self.id).regs.iter_mut().enumerate() {
             reg.home = regions.contains(&(r as u32));
         }
-        let streamed = st.sets.iter().flatten().flat_map(|s| s.regs.iter().zip(&s.w.layout.regions).filter(|(r, _)| !r.home));
+        let streamed = st.sets.iter().flatten().flat_map(|s| { s.regs.iter().zip(&s.w.layout.regions).filter(|(r, _)| !r.home)
+        });
         st.slot_span = streamed.map(|(_, x)| x.span).max().unwrap_or(0);
         Ok(())
     }
@@ -1007,6 +1279,7 @@ impl WeightSet {
     pub fn bind(self: &Arc<Self>, region: u32, stream: u64) -> Result<Pinned> {
         let g = &self.gpu.inner;
         let _c = CtxGuard::enter(g.ctx)?;
+        g.recover()?;
         let (at, ptr, fill, fresh, writable) = {
             let mut st = g.lock();
             st.clock += 1;
@@ -1117,7 +1390,7 @@ impl WeightSet {
         g.with(|st| {
             let mut out = vec![];
             for (r, reg) in st.set(self.id).regs.iter_mut().enumerate() {
-                let Some(m) = reg.map.as_mut().filter(|m| m.chunks.len() == 1 && m.chunks[0].shared && !m.deposited) else { continue };
+                let Some(m) = reg.map.as_mut().filter(|m| m.chunks.len() == 1 && m.chunks[0].shared && !m.deposited) else { continue; };
                 let ready = if quiescent {
                     m.fill.as_ref().map_or(Ok(false), |f| f.landed())? && passed(&mut m.released)?
                 } else {
@@ -1160,7 +1433,8 @@ impl WeightSet {
                 }
                 match g.import(base + x.offset, x.span, &fd) {
                     Ok(handle) => {
-                        let fill = Arc::new(Fill { state: Mutex::new(Some(g.events.record(g.copy, false))), cv: Condvar::new() });
+                        let ready = match g.events.record(g.copy, false) { Ok(event) => Filled::Ready(event), Err(error) => Filled::Failed(error) };
+                        let fill = Arc::new(Fill { state: Mutex::new(ready), cv: Condvar::new() });
                         let chunks = vec![Chunk { handle, size: x.span, shared: true }];
                         let m = Mapping { va: base + x.offset, span: x.span, chunks, fill: Some(fill), fresh: true, kept: Some(contain(fd)?), read_only: true, ..Default::default() };
                         st.reg(self.id, r)?.map = Some(m);
@@ -1198,28 +1472,16 @@ impl WeightSet {
 impl Drop for WeightSet {
     fn drop(&mut self) {
         let g = &self.gpu.inner;
-        let Ok(_c) = CtxGuard::enter(g.ctx) else { return };
-        let set = {
+        g.retain();
+        {
             let mut st = g.lock();
-            for s in st.slots.iter_mut().flatten().filter(|s| s.holds.is_some_and(|(set, _)| set == self.id)) {
-                s.holds = None;
-            }
-            st.sets[self.id].take()
-        };
-        let Some(set) = set else { return };
-        let maps: Vec<Mapping> = set.regs.into_iter().filter_map(|r| r.map).collect();
-        for m in &maps {
-            if let Some(Ok(ready)) = m.fill.as_ref().map(|f| f.wait()) {
-                let _ = ready.sync();
-            }
-            m.released.iter().for_each(|e| drop(e.sync()));
+            st.retired.push(self.id);
         }
-        let mut st = g.lock();
-        for m in maps {
-            let _ = g.unmap(&mut st, m);
+        // A fill may be inside its own provider callback. Never wait for that Fill here;
+        // the mover retries retirement after it publishes the result.
+        if let Err(error) = g.recover_retired() {
+            tracing::warn!("varena: retained closed weight set after failed completion: {error}");
         }
-        let _ = g.keep_idle(&mut st, IDLE_KEEP);
-        let _ = free_va(self.base, self.weights.layout.nbytes.max(REGION_ALIGN));
     }
 }
 
@@ -1267,8 +1529,15 @@ impl Drop for Pinned {
         let g = &self.ws.gpu.inner;
         match CtxGuard::enter(g.ctx).map_err(Error::from).and_then(|_c| g.events.record(self.stream as CUstream, false)) {
             Ok(e) => self.ws.release(self.at, self.region, Some(e)),
-            // No event to order the release by: the pin stays, and the pages with it.
-            Err(e) => tracing::warn!("varena: a release could not be recorded, region {} stays pinned: {e}", self.region),
+            Err(e) => {
+                g.retain();
+                g.retained.lock().unwrap().pins.push(FailedPin {
+                    ws: self.ws.clone(),
+                    at: self.at,
+                    region: self.region,
+                    stream: self.stream,
+                }); tracing::warn!("varena: retained pin owner after release could not be recorded, region {}: {e}", self.region);
+            }
         }
     }
 }
