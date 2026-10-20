@@ -148,7 +148,7 @@ def build(root: Path, dim: int, blocks: int) -> tuple[tensorfs.Checkpoint, dict[
     w = tensorfs.Writer(cache_dir=root)
     net = w.component("net", cls="test.Net", config={})
     for key, t in tensors.items():
-        net.put(key, "BF16", list(t.shape), t.view(torch.uint8).numpy().tobytes())
+        net.put(key, t.view(torch.uint8).numpy().tobytes(), dtype="BF16", shape=list(t.shape))
     return w.commit(), tensors
 
 
@@ -618,7 +618,7 @@ def relaxes(root: Path, dev: torch.device) -> None:
     wide = w.component("wide", cls="test.WideNet", config={})
     for key, t in plain.state_dict().items():
         t = t.detach().contiguous()
-        wide.put(key, "BF16", list(t.shape), t.view(torch.uint8).numpy().tobytes())
+        wide.put(key, t.view(torch.uint8).numpy().tobytes(), dtype="BF16", shape=list(t.shape))
     ck = w.commit()
     weights = sum(t.numel() * t.element_size() for t in plain.state_dict().values())
     coarse = tokens * dim * Wide.WIDE * 2  # the temporary of one uncut window

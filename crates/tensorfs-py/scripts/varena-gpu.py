@@ -46,10 +46,10 @@ def write(root: Path) -> tensorfs.Checkpoint:
     model, blocks = (w.component(name, cls="test.Model", config={}) for name in ("model", "blocks"))
     g = torch.Generator().manual_seed(7)
     for i in range(LAYERS):
-        model.put(f"layers.{i}.weight", "F16", [DIM, DIM], (torch.randn(DIM, DIM, generator=g) / DIM**0.5).half().numpy())
+        model.put(f"layers.{i}.weight", (torch.randn(DIM, DIM, generator=g) / DIM**0.5).half().numpy(), dtype="F16", shape=[DIM, DIM])
     for b in range(BLOCKS):
         for p in range(PARAMS):
-            blocks.put(f"{b}.p{p}", "BF16", [512, 1024], torch.randn(512, 1024, generator=g).bfloat16().view(torch.int16).numpy())
+            blocks.put(f"{b}.p{p}", torch.randn(512, 1024, generator=g).bfloat16().view(torch.int16).numpy().tobytes(), dtype="BF16", shape=[512, 1024])
     return w.commit()
 
 
@@ -78,7 +78,7 @@ def exact(ws: varena.WeightSet, ck: tensorfs.Checkpoint, stream: int) -> int:
         pin = ws.bind(r, stream)
         t = torch.from_dlpack(pin)
         for p in parts:
-            want = torch.frombuffer(bytearray(ck.read(p.component, p.key).tobytes()), dtype=torch.uint8)
+            want = torch.frombuffer(bytearray(ck.components[p.component].tensors.read(p.key).tobytes()), dtype=torch.uint8)
             assert torch.equal(t[p.offset : p.offset + p.nbytes].cpu(), want), f"{p.component}/{p.key} differs"
             n += p.nbytes
     return n

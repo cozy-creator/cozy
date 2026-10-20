@@ -51,7 +51,7 @@ def run(device: torch.device, ck: tensorfs.Checkpoint, want: torch.Tensor, limit
     name = f"loaded from the store, limit {limit}"
     if limit is not None:  # the CUDA context is counted: measured from the driver each request
         check(f"{name}: outside bytes are measured", mem.context > 0, mem.context)
-    owners = {p for p in blocks_of(unet) if any(k.startswith(p + ".") for k in ck.tensors["unet"])}
+    owners = {p for p in blocks_of(unet) if any(k.startswith(p + ".") for k in ck.components["unet"].tensors)}
     check(  # its small blocks share packs with their neighbours: each still owns its regions
         f"{name}: every block owns its regions",
         len(model.blocks) == len(owners),
@@ -77,7 +77,7 @@ def main() -> int:
     unet = w.component("unet", cls="diffusers.UNet2DConditionModel", config=CONFIG)
     for key, t in plain.state_dict().items():
         t = t.detach().contiguous()
-        unet.put(key, "F32", list(t.shape), t.view(torch.uint8).numpy())
+        unet.put(key, t.view(torch.uint8).numpy().tobytes(), dtype="F32", shape=list(t.shape))
     ck = w.commit()
     x, text = (torch.randn(*s, generator=torch.Generator().manual_seed(1)) for s in ((1, 4, 8, 8), (1, 5, 768)))
     plain.to(device)

@@ -24,7 +24,7 @@ def main(root: Path) -> None:
     for b in range(3):
         for p in range(4):
             data = bytes((b * 31 + p * 7 + i) % 251 for i in range(4096 * (p + 1) + 5))
-            unet.put(f"blocks.{b}.p{p}", "U8", [len(data)], data)
+            unet.put(f"blocks.{b}.p{p}", data, dtype="U8", shape=[len(data)])
             want[f"blocks.{b}.p{p}"] = data
     ck = w.commit()
     rs = varena.regions(ck, 1 << 20, [f"unet/blocks.{b}" for b in range(3)])
