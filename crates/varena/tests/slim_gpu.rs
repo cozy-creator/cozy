@@ -536,6 +536,8 @@ fn custody_holder_child() {
     let (gpu, _) = test_page();
     gpu.fill(1).expect("holder fills read-only page");
     let (spans, container) = gpu.export(1).expect("holder exports queued page handles");
+    println!("HOLDER {uuid}");
+    std::io::stdout().flush().expect("holder identity");
     control
         .write_all(&(spans.len() as u32).to_le_bytes())
         .expect("write chunk count");
@@ -545,8 +547,6 @@ fn custody_holder_child() {
             .expect("write chunk span");
     }
     platform::handles::send_fd(&control, &container).expect("send owned container");
-    println!("HOLDER {uuid}");
-    std::io::stdout().flush().expect("holder identity");
     control
         .read_exact(&mut [0])
         .expect("holder waits until parent kills it");
