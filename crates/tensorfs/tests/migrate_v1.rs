@@ -1,8 +1,10 @@
-//! xs-053 A11, v1 → D10 directly (owner, 2026-10-20: no public 0.12). Six real v1 lanes copied
-//! read-only from 8819's repo CAS (`fixtures/v1`: their manifests, headers, assets and the
-//! objects of a few small tensors; `lanes.json` holds the sha256 of each selected part's v1
-//! bytes). Each migrates through `d10::migrate` against a directory endpoint, cites no new chunk,
-//! and opens through the public API: its components, configs and stored tensor bytes are v1's.
+//! xs-053 A11, v1 → D10 directly (owner, 2026-10-20: no public 0.12). Six real v1 lanes cut to a
+//! few tensors each (`fixtures/v1`): SDXL fp8 and int8 from 8819, H3 nvfp4 from tensorhub.com,
+//! and three small ones whole. A kept tensor keeps its
+//! key, dtype, spec, roles and bytes; a cut one its first rows in every part. The fixture holds
+//! the objects of some tensors; `lanes.json` names every tensor's D10 name and scheme and, for
+//! those held, each part's sha256. Each lane migrates through `d10::migrate` against a directory
+//! endpoint, cites no new chunk but the pack, and opens through the public API.
 #![cfg(feature = "store")]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,7 +15,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{json, Value as Json};
 use tensorfs::fetch::{Client as FetchClient, Endpoint, SourcePolicy};
-use tensorfs::format::{Config, ObjectRef, Repo, Value};
+use tensorfs::format::{Body, Config, ObjectRef, Repo, Value};
 use tensorfs::import::Access;
 use tensorfs::migrate::d10::{self, Migrator, UNKNOWN, UPSTREAMS};
 use tensorfs::store::Store;
@@ -23,9 +25,18 @@ use tensorfs::{Client, Download, Open, Read, Selection};
 struct Lane {
     name: String,
     manifest: ObjectRef,
-    parts: BTreeSet<String>,
-    tensors: Vec<String>,
+    /// The v1 objects it cites, each distinct run once, and the pack when it has inline parts.
+    chunks: usize,
     configs: BTreeMap<String, Json>,
+    /// By D10 `component/key`.
+    tensors: BTreeMap<String, Want>,
+}
+
+#[derive(Deserialize)]
+struct Want {
+    scheme: Option<String>,
+    /// Each part's sha256 by D10 role (`data` for a plain tensor), when the fixture holds it.
+    read: Option<BTreeMap<String, String>>,
 }
 
 struct Scratch(PathBuf);
@@ -99,47 +110,41 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
         let open = Open { revision: Some(tree.id()), endpoint: Some(root.to_string_lossy().into()), ..Open::default() };
         let ck = rt.block_on(client.open(&lane.name, &open)).unwrap();
 
-        // One new chunk at most: the pack of the inline parts (D10 cites only 4 KiB-aligned
-        // ranges). Every other chunk is a v1 object, cited where it is.
+        // The v1 objects where they are, and one new chunk at most: the pack of the inline parts
+        // (D10 cites only 4 KiB-aligned ranges).
         let v1 = &report["lane"]["from_v1"]["v1"];
-        assert_eq!(ck.chunks().len() as u64, v1["chunks"].as_u64().unwrap());
+        assert_eq!(ck.chunks().len(), lane.chunks, "{}", lane.name);
         let new: Vec<String> = ck.chunks().iter().filter(|c| uploaded.contains(&c.sha256)).map(ObjectRef::id).collect();
         let pack: Vec<String> = v1["pack"].as_str().map(str::to_owned).into_iter().collect();
         assert_eq!(new, pack, "{}", lane.name);
         assert_eq!(v1["inline_parts"].as_u64().unwrap() > 0, !pack.is_empty(), "{}", lane.name);
 
-        // Every tensor whose chunks the endpoint holds (the fixture's objects and the pack) reads
-        // back exactly the selected v1 bytes.
-        let mut found = BTreeSet::new();
-        for component in ck.components() {
-            for tensor in component.tensors() {
-                let here = tensor.locations().iter().all(|(_, at)| {
-                    ck.header().spans(at).iter().all(|s| root.join(ck.chunks()[s.chunk].key()).exists())
-                });
-                if !here || tensor.locations().iter().all(|(_, at)| at.length == 0) {
-                    if lane.tensors.contains(&format!("{}/{}", component.name(), tensor.key)) {
-                        eprintln!("{}: {}/{} not here: {:?}", lane.name, component.name(), tensor.key, tensor.locations());
-                    }
-                    continue;
-                }
-                let want = Selection::Tensors { component: component.name().into(), keys: vec![tensor.key.clone()] };
-                rt.block_on(ck.download(&Download { selection: want, priority: 0, progress: None })).unwrap();
-                let parts: Vec<Vec<u8>> = match component.read(&tensor.key).unwrap() {
-                    Read::Plain(bytes) => vec![bytes],
-                    Read::Encoded { parts, .. } => parts.into_values().collect(),
+        // Every tensor at its D10 name (U12's renames), each v1 spec as its D10 scheme.
+        let schemes: BTreeMap<String, Option<String>> = (ck.components().iter())
+            .flat_map(|c| c.tensors().iter().map(move |t| (c.name().to_owned(), t)))
+            .map(|(c, t)| {
+                let scheme = match &t.body {
+                    Body::Encoded { encoding, .. } => Some(encoding.scheme.clone()),
+                    Body::Data(_) => None,
                 };
-                for bytes in parts {
-                    let digest = sha256(&bytes);
-                    if lane.tensors.contains(&format!("{}/{}", component.name(), tensor.key)) && !lane.parts.contains(&digest) {
-                        eprintln!("{}: {}/{} read {} ({} bytes), not a selected v1 part", lane.name, component.name(), tensor.key, digest, bytes.len());
-                    }
-                    if lane.parts.contains(&digest) {
-                        found.insert(digest);
-                    }
-                }
-            }
+                (format!("{c}/{}", t.key), scheme)
+            })
+            .collect();
+        let want: BTreeMap<String, Option<String>> = lane.tensors.iter().map(|(k, w)| (k.clone(), w.scheme.clone())).collect();
+        assert_eq!(schemes, want, "{}", lane.name);
+
+        // Each held tensor reads back its v1 parts byte for byte, under D10's roles.
+        for (name, w) in &lane.tensors {
+            let Some(want) = &w.read else { continue };
+            let (component, key) = name.split_once('/').unwrap();
+            let selection = Selection::Tensors { component: component.into(), keys: vec![key.into()] };
+            rt.block_on(ck.download(&Download { selection, priority: 0, progress: None })).unwrap();
+            let read: BTreeMap<String, String> = match ck.component(component).unwrap().read(key).unwrap() {
+                Read::Plain(bytes) => BTreeMap::from([("data".to_owned(), sha256(&bytes))]),
+                Read::Encoded { parts, .. } => parts.iter().map(|(role, bytes)| (role.clone(), sha256(bytes))).collect(),
+            };
+            assert_eq!(&read, want, "{}: {name}", lane.name);
         }
-        assert_eq!(found, lane.parts, "{}: every selected v1 part reads back byte-exact", lane.name);
 
         // Configs: each v1 config is its component's, H3's one `model` config split per component.
         let renamed = &report["lane"]["from_v1"]["renames"]["components"];
