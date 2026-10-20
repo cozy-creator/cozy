@@ -296,6 +296,79 @@ stored array's `dtype` and `shape`, a `chunk` index, and byte `offset` and `leng
 that chunk. This call only inspects metadata. Normal model code uses `TensorMetadata`
 and `read` instead of managing these ranges.
 
+### Advanced: decode resident encoded parts
+
+`tensorfs.raw.decode_into` is an approved **0.13 target** in the reviewed resident-decode
+source branches. Native compilation and installed CPU/GPU qualification are still pending;
+this section does not establish availability in an installed release.
+
+This operation is for integrations that already hold encoded parts in memory and own the
+destination. It does not open a checkpoint or fetch data. Ordinary model code continues to
+use `component.tensors.read(..., decode=True)`. Its signature in `tensorfs.raw` is:
+
+```python
+def decode_into(
+    scheme: str,
+    parts: Mapping[str, tuple[str, Sequence[int], Buffer | DLPack]],
+    out: Buffer | DLPack,
+    *,
+    dtype: str,
+    shape: Sequence[int],
+    params: Mapping[str, object] | None = None,
+) -> None: ...
+```
+
+Each input is `role: (format_dtype, format_shape, data)`, using the same role names and
+encoded representation as `ComponentWriter.put_encoded`. The tuple describes the stored
+format; `data` supplies exactly that many contiguous bytes. Its carrier dtype/shape may
+differ: packed F4 data can use a U8 carrier, and F8 bytes can use a U8 view. Marshalling
+reinterprets those bytes; it does not numerically convert the encoded weights.
+
+`dtype` and `shape` describe the logical result and its final format rounding. `out` must
+already have exactly that actual dtype, shape and byte length, with writable contiguous
+storage. It is not cast or resized. Primitive buffer outputs support F32 and F16; BF16
+outputs use a supported DLPack carrier. For example, this planned CPU call decodes stored
+rowwise INT8 bytes into an existing F32 array:
+
+```python
+import numpy as np
+from tensorfs import raw
+
+weight = np.array([[1, -2, 3, -4], [5, -6, 7, -8]], dtype=np.int8)
+scale = np.array([0.5, 2.0], dtype=np.float32)
+out = np.empty((2, 4), dtype=np.float32)
+
+raw.decode_into(
+    "int8.rowwise",
+    {
+        "weight": ("I8", weight.shape, memoryview(weight)),
+        "scale": ("F32", scale.shape, scale.tobytes()),
+    },
+    memoryview(out),
+    dtype="F32",
+    shape=[2, 4],
+    params={"axis": 0, "scale_dtype": "F32"},
+)
+```
+
+Host inputs and a host destination use the existing CPU decoder. The initial resident
+CUDA path supports `comfy.convrot_w4a4`, `comfy.asym_w4a8_int8` and `comfy.w6a8_int8`,
+with F32, BF16 or F16 output. All parts and the destination must be on the same CUDA
+device. Mixed host/device placement and other resident CUDA schemes raise
+`UnsupportedError`; there is no CPU fallback or implicit weight upload. Device metadata
+conversion and decode scratch may still require temporary allocations.
+
+The call is synchronous: success means the output is ready. Do not mutate inputs or
+access the destination concurrently with the call. Nonempty input/output spans must not overlap;
+duplicate read-only input spans are allowed. The binding holds buffer leases and DLPack
+owners through completion and orders CUDA work against their producer streams.
+
+Buffer/descriptor and overlap refusals occur before output writes. Unknown schemes raise
+`UnknownSchemeError`; invalid encoding/value cases can raise `DecodeError`. After a
+value or runtime error, output contents are unspecified. If CUDA completion cannot be
+proved, the binding retains the actual input/output owners rather than freeing storage
+still in use; the output is not a valid result.
+
 ## Python: write, convert and publish
 
 ### Save a checkpoint file

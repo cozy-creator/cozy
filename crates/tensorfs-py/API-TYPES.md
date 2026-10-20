@@ -5,8 +5,8 @@ separate; this is not a claim that every declaration is available on current mas
 For normal development, use the [Python usage guide](API.md).
 
 `TensorMetadata` describes the logical tensor. Ordinary encoded reads expose named
-`Array` values without physical locations; `tensorfs.raw` provides an advanced inspection
-surface for storage integrations.
+`Array` values without physical locations; `tensorfs.raw` provides advanced physical
+inspection and resident-part decoding for storage integrations.
 
 The provider/DLPack protocols describe accepted inputs and are not additional package exports.
 
@@ -439,12 +439,18 @@ class Writer:
         ...
 ```
 
-## `tensorfs.raw` — advanced physical inspection
+## `tensorfs.raw` — advanced physical inspection and resident decode
 
 These declarations belong to `tensorfs.raw`, not the root package.
+`decode_into` is approved resident-decode source for the 0.13 target; native compilation
+and installed CPU/GPU qualification are still pending. It is not a release availability
+claim. See [resident decoding](API.md#advanced-decode-resident-encoded-parts) for placement,
+ownership and error behavior.
 
 ```python
+from collections.abc import Buffer, Mapping, Sequence
 from tensorfs import Checkpoint
+# DLPack is the accepted input protocol described above, not a package export.
 
 class Part:
     @property
@@ -460,4 +466,23 @@ class Part:
 
 def parts(checkpoint: Checkpoint, component: str, key: str) -> dict[str, Part]:
     """Inspect stored ranges without fetching bytes; plain tensors use role ''."""
+
+def decode_into(
+    scheme: str,
+    parts: Mapping[str, tuple[str, Sequence[int], Buffer | DLPack]],
+    out: Buffer | DLPack,
+    *,
+    dtype: str,
+    shape: Sequence[int],
+    params: Mapping[str, object] | None = None,
+) -> None:
+    """Synchronously decode already-resident parts into an exact logical destination.
+
+    Part tuples describe format bytes; carrier dtype/shape may differ. The output
+    must match logical dtype/shape, byte length and writable contiguous storage.
+    Nonempty input/output overlap is refused; duplicate read-only inputs are allowed.
+    All inputs/output are on Host, or on one CUDA device with a supported resident
+    scheme. Metadata refusals precede writes; output is unspecified on value/runtime
+    failure. Native owners remain held when CUDA completion cannot be proved.
+    """
 ```
