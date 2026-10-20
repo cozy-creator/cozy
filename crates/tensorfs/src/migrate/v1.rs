@@ -298,7 +298,8 @@ pub fn lane(m: &Manifest, raw: &[u8]) -> Result<Lane> {
     let mut names = Names::of(&h);
     let files = files(m, &h, &mut names)?;
     let order = ordering(&h, &names);
-    let (mut chunks, mut runs): (Vec<ObjectRef>, HashMap<Vec<ObjectRef>, u64>) = (Vec::new(), HashMap::new());
+    let mut chunks: Vec<ObjectRef> = Vec::new();
+    let mut runs: HashMap<Vec<ObjectRef>, u64> = HashMap::new();
     let (mut pack, mut pack_at): (Vec<u8>, Option<u64>) = (Vec::new(), None);
     let mut place = |body: &V1Body| -> Location {
         match body {
@@ -326,7 +327,8 @@ pub fn lane(m: &Manifest, raw: &[u8]) -> Result<Lane> {
             }
         }
     };
-    let (mut components, mut schemes): (Vec<(String, Vec<Tensor>)>, BTreeMap<&str, u64>) = (Vec::new(), BTreeMap::new());
+    let mut components: Vec<(String, Vec<Tensor>)> = Vec::new();
+    let mut schemes: BTreeMap<&str, u64> = BTreeMap::new();
     for (c, i) in order {
         let (v1_name, tensors) = &h.components[c];
         let t = &tensors[i];
