@@ -306,6 +306,41 @@ impl PyPlane {
         Ok(self.core(py)?.device())
     }
     #[cfg(feature = "store")]
+    fn mapped_output(
+        &self,
+        py: Python<'_>,
+        shape: Vec<u64>,
+        dtype: String,
+        stream: usize,
+    ) -> PyResult<Option<crate::store::PyArray>> {
+        use tensorfs::format::Dtype;
+        let dtype = Dtype::parse(&dtype);
+        if !matches!(dtype, Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64) {
+            return Ok(None);
+        }
+        let len = dtype
+            .byte_len(&shape)
+            .and_then(|len| usize::try_from(len).ok())
+            .ok_or_else(|| raise(py, Error::Invalid("mapped output shape overflows".into())))?;
+        if len == 0 {
+            return Ok(None);
+        }
+        let bytes = tensorfs::io::MappedBuffer::allocation_size(len)
+            .map_err(|error| raise(py, error.into()))?;
+        let core = self.core(py)?;
+        let Some(reservation) = native(py, || core.reserve_host(bytes as u64))? else {
+            return Ok(None);
+        };
+        let owner: Arc<dyn Send + Sync> = reservation.clone();
+        let output = crate::tensors::mapped_output(py, core.device(), shape, dtype, stream, owner)?;
+        if output.is_some() {
+            // The builder has pinned and initialized the complete charged span.
+            // Live physical room now includes it; aliases retain its lease.
+            native(py, || reservation.commit())?;
+        }
+        Ok(output)
+    }
+    #[cfg(feature = "store")]
     #[pyo3(signature=(name,ck,regions,fingerprint,fill=None))]
     fn register(
         &self,

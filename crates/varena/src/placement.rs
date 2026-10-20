@@ -448,6 +448,17 @@ impl Placement {
         self.gpu.uuid()
     }
 
+    pub fn reserve_host(&self, bytes: u64) -> Result<Option<Arc<ledger::HostReservation>>> {
+        if self.stop.load(Ordering::Acquire) {
+            return Err(Error::Closed("placement".into()));
+        }
+        let active = !self.inner.lock().requests.is_empty();
+        if !active {
+            return Err(invalid("a mapped output requires an active request"));
+        }
+        self.channel.reserve_host(self.row.owner(), bytes)
+    }
+
     pub fn available(&self) -> Result<u64> {
         self.refresh()?;
         Ok(self.inner.lock().table.available())

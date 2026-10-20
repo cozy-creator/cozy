@@ -113,6 +113,8 @@ pub struct Status {
     pub peaks: Vec<(String, u64)>,
     pub kept: Vec<(PageKey, u64)>,
     pub ram_bytes: u64,
+    /// Live private-host reservations, including allocation still in progress.
+    pub private_host_bytes: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ask {
@@ -674,12 +676,18 @@ impl Ledger {
             .filter(|(_, page)| queued(page))
             .map(|(key, page)| (*key, sum(page.spans.iter().copied())))
             .collect();
+        let (ram_bytes, private_host_bytes) = {
+            let mut state = self.host.state.lock();
+            state.prune_private();
+            (state.retained_bytes(), state.private_bytes())
+        };
         Ok(Status {
             capacity: self.capacity(),
             rows: self.table.rows()?,
             peaks: self.peaks(),
             kept,
-            ram_bytes: self.host.state.lock().retained_bytes(),
+            ram_bytes,
+            private_host_bytes,
         })
     }
     /// Reap only kernel-released claims. Their custody remains available until consumed or
@@ -970,6 +978,16 @@ impl Ledger {
         self.host.check_process().ok()?;
         ram_status(&self.host.state.lock(), layout)
     }
+    /// Shared native allocations not yet reflected in live host memory. Executor
+    /// forecasts are counted by TensorD; committed buffers are already physical.
+    pub fn pending_host_bytes(&self) -> Result<u64> {
+        self.host.check_process()?;
+        let mut state = self.host.state.lock();
+        state.prune_private();
+        state
+            .pending_host()
+            .ok_or_else(|| Error::Invalid("pending host bytes overflow".into()))
+    }
     /// Tell the cache about a starting executor before admitting it. Unknown peaks
     /// suppress optional warming and shed every idle/queued region; measured peaks
     /// shed only until their room is available. The caller always admits demand.
@@ -1036,60 +1054,7 @@ impl Ledger {
         if self.host.check_process().is_err() {
             return false;
         }
-        let mut state = self.host.state.lock();
-        let retained_before = state.retained_bytes();
-        let victim = state
-            .ram
-            .iter_mut()
-            .flat_map(|(key, held)| {
-                held.slots
-                    .iter_mut()
-                    .enumerate()
-                    .filter_map(move |(index, slot)| {
-                        slot.idle().then_some((*key, index, slot.used))
-                    })
-            })
-            .min_by_key(|(_, _, used)| *used)
-            .map(|(key, index, _)| (key, index));
-        let Some((key, index)) = victim else {
-            return false;
-        };
-        state.clock = state.clock.saturating_add(1);
-        let generation = state.clock;
-        let Some(held) = state.ram.get_mut(&key) else {
-            return false;
-        };
-        let removed = held
-            .slots
-            .get_mut(index)
-            .and_then(|slot| slot.buffer.take());
-        let ready_bytes = removed.as_ref().map_or(0, |ram| {
-            if ram.ready.load(Acquire) {
-                ram.len as u64
-            } else {
-                0
-            }
-        });
-        if let Some(ram) = &removed {
-            ram.cancelled.store(true, Release);
-        }
-        held.generation = generation;
-        let observers = held.observers.clone();
-        if held.slots.iter().all(|slot| slot.buffer.is_none()) {
-            state.ram.remove(&key);
-        }
-        let retained_after = state.retained_bytes();
-        drop(state);
-        drop(removed); // actually unmap/free this region outside the table lock
-        // These are charged cache spans, not process RSS. Reader leases and
-        // in-flight fills were excluded by idle() before choosing this region.
-        tracing::info!(target: "varena::host", region = index, ready_bytes,
-            retained_before, retained_after, eligibility = "unleased_not_filling",
-            "released idle RAM cache region");
-        self.host.wake_warm();
-        notify_owners(observers);
-        self.table.changed();
-        true
+        self.host.release_unused_ram(&self.table, u64::MAX)
     }
     pub fn drop_kept(&self) {
         self.custody.lock().pages.clear();
@@ -1458,13 +1423,114 @@ pub struct HostCache {
     warming: Mutex<bool>,
     next_warm: Condvar,
 }
+
+/// A private allocation's capability, retained by its actual buffer/consumer owners.
+/// Closing a request, row or plane must not release it before those owners finish.
+pub struct HostReservation {
+    lease: UnixStream,
+    committed: AtomicBool,
+}
+
+impl HostReservation {
+    /// The full reserved span is now physically pinned and reflected in live host
+    /// memory. Keep its lease, but do not charge these bytes twice as pending.
+    pub fn commit(&self) -> Result<()> {
+        if !self.committed.load(Acquire) {
+            let mut lease = &self.lease;
+            lease
+                .write_all(&[1])
+                .map_err(|error| io("commit private host allocation", error))?;
+            self.committed.store(true, Release);
+        }
+        Ok(())
+    }
+}
+
+struct PrivateHost {
+    bytes: u64,
+    lease: UnixStream,
+    pending: bool,
+}
+
+impl PrivateHost {
+    fn live(&mut self) -> bool {
+        if platform::handles::hung_up(&self.lease) {
+            return false;
+        }
+        if self.pending {
+            let mut committed = [0];
+            // Leave commit readiness for the dedicated service observer, even
+            // if a budget query runs before that observer begins its wait.
+            let read = unsafe {
+                libc::recv(
+                    self.lease.as_raw_fd(),
+                    committed.as_mut_ptr().cast(),
+                    committed.len(),
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if read == 0 {
+                return false;
+            }
+            if read == 1 && committed == [1] {
+                self.pending = false;
+            }
+            // A malformed marker or interrupted probe keeps the reservation
+            // conservative until close.
+        }
+        true
+    }
+}
+
+enum HostAdmission {
+    Granted(UnixStream, u64, UnixStream),
+    Reclaimed(u64),
+    Refused,
+}
+
 #[derive(Default)]
 struct HostState {
     ram: BTreeMap<[u8; 32], RamHeld>,
     clock: u64,
     claims: BTreeMap<u64, Option<u64>>,
+    private: Vec<PrivateHost>,
 }
 impl HostState {
+    fn prune_private(&mut self) {
+        self.private.retain_mut(PrivateHost::live);
+    }
+
+    fn private_bytes(&self) -> u64 {
+        sum(self.private.iter().map(|allocation| allocation.bytes))
+    }
+
+    fn pending_private(&self) -> Option<u64> {
+        self.private
+            .iter()
+            .filter(|allocation| allocation.pending)
+            .try_fold(0_u64, |sum, allocation| sum.checked_add(allocation.bytes))
+    }
+
+    fn pending_host(&self) -> Option<u64> {
+        self.ram
+            .values()
+            .flat_map(|held| &held.slots)
+            .filter_map(|slot| slot.buffer.as_ref())
+            .filter(|ram| ram.filling.load(Acquire))
+            .try_fold(self.pending_private()?, |sum, ram| {
+                sum.checked_add(ram.len as u64)
+            })
+    }
+
+    fn can_reserve(&self, available: i64, bytes: u64) -> bool {
+        // Executor forecasts suppress optional warming, including unknown peaks.
+        // Exact demand is bounded by current room and in-flight native allocations.
+        self.pending_host()
+            .and_then(|pending| pending.checked_add(bytes))
+            .zip(u64::try_from(available).ok())
+            .is_some_and(|(need, available)| need <= available)
+    }
+
     fn retained_bytes(&self) -> u64 {
         sum(self
             .ram
@@ -1482,7 +1548,10 @@ impl HostState {
         else {
             return false;
         };
-        u64::try_from(available).is_ok_and(|available| available >= bytes.saturating_add(claimed))
+        self.pending_private()
+            .and_then(|pending| pending.checked_add(bytes)?.checked_add(claimed))
+            .zip(u64::try_from(available).ok())
+            .is_some_and(|(need, available)| need <= available)
     }
 }
 impl Default for HostCache {
@@ -1496,12 +1565,126 @@ impl Default for HostCache {
     }
 }
 impl HostCache {
+    fn reserve_private(
+        &self,
+        table: &Table,
+        bytes: u64,
+        worker_room: i64,
+        through: Option<u64>,
+    ) -> Result<HostAdmission> {
+        self.check_process()?;
+        if bytes == 0 {
+            return Err(Error::Invalid("empty private host reservation".into()));
+        }
+        if worker_room < 0 {
+            return Ok(HostAdmission::Refused);
+        }
+        let through = {
+            let mut state = self.state.lock();
+            state.prune_private();
+            // Couple this live proc/cgroup metadata reading with pending claims.
+            // No array allocation, page I/O, CUDA or descriptor exchange holds this lock.
+            let broker_room = platform::contain::host_memory::read().available;
+            if broker_room < 0 {
+                return Ok(HostAdmission::Refused);
+            }
+            let available = worker_room.min(broker_room);
+            if state.can_reserve(available, bytes) {
+                let pending = state
+                    .pending_host()
+                    .ok_or_else(|| Error::Invalid("private host reservation overflow".into()))?;
+                let (server, client) =
+                    UnixStream::pair().map_err(|error| io("private host lease", error))?;
+                server
+                    .set_nonblocking(true)
+                    .map_err(|error| io("nonblocking private host lease", error))?;
+                let observer = server
+                    .try_clone()
+                    .map_err(|error| io("observe private host lease", error))?;
+                state.private.push(PrivateHost {
+                    bytes,
+                    lease: server,
+                    pending: true,
+                });
+                return Ok(HostAdmission::Granted(client, pending, observer));
+            }
+            through.unwrap_or(state.clock).min(state.clock)
+        };
+        // Each retry removes one actually idle region from the original fixed
+        // set. New warming cannot create an unbounded admission/reclaim loop.
+        Ok(if self.release_unused_ram(table, through) {
+            HostAdmission::Reclaimed(through)
+        } else {
+            HostAdmission::Refused
+        })
+    }
+
+    fn release_unused_ram(&self, table: &Table, through: u64) -> bool {
+        let mut state = self.state.lock();
+        let retained_before = state.retained_bytes();
+        let victim = state
+            .ram
+            .iter_mut()
+            .flat_map(|(key, held)| {
+                held.slots
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(move |(index, slot)| {
+                        (slot.used <= through && slot.idle()).then_some((*key, index, slot.used))
+                    })
+            })
+            .min_by_key(|(_, _, used)| *used)
+            .map(|(key, index, _)| (key, index));
+        let Some((key, index)) = victim else {
+            return false;
+        };
+        state.clock = state.clock.saturating_add(1);
+        let generation = state.clock;
+        let Some(held) = state.ram.get_mut(&key) else {
+            return false;
+        };
+        let removed = held
+            .slots
+            .get_mut(index)
+            .and_then(|slot| slot.buffer.take());
+        let ready_bytes = removed.as_ref().map_or(0, |ram| {
+            if ram.ready.load(Acquire) {
+                ram.len as u64
+            } else {
+                0
+            }
+        });
+        if let Some(ram) = &removed {
+            ram.cancelled.store(true, Release);
+        }
+        held.generation = generation;
+        let observers = held.observers.clone();
+        if held.slots.iter().all(|slot| slot.buffer.is_none()) {
+            state.ram.remove(&key);
+        }
+        let retained_after = state.retained_bytes();
+        drop(state);
+        // Actually unmap/free this region outside the table lock.
+        drop(removed);
+        // These are charged cache spans, not process RSS. Reader leases and
+        // in-flight fills were excluded by idle() before choosing this region.
+        tracing::info!(target: "varena::host", region = index, ready_bytes,
+            retained_before, retained_after, eligibility = "unleased_not_filling",
+            "released idle RAM cache region");
+        self.wake_warm();
+        notify_owners(observers);
+        table.changed();
+        true
+    }
     fn wake_warm(&self) {
         let _active = self.warming.lock();
         self.next_warm.notify_all();
     }
     fn can_warm(&self, available: i64, bytes: u64) -> bool {
-        self.state.lock().can_warm(available, bytes)
+        let mut state = self.state.lock();
+        state.prune_private();
+        let live = platform::contain::host_memory::read().available;
+        state.can_warm(available.min(live), bytes)
     }
     fn begin_fill(
         &self,
@@ -1511,8 +1694,10 @@ impl HostCache {
         ram: &Arc<Ram>,
         available: i64,
     ) -> bool {
-        let state = self.state.lock();
-        if !state.can_warm(available, ram.len as u64) || ram.cancelled.load(Acquire) {
+        let mut state = self.state.lock();
+        state.prune_private();
+        let live = platform::contain::host_memory::read().available;
+        if !state.can_warm(available.min(live), ram.len as u64) || ram.cancelled.load(Acquire) {
             return false;
         }
         let current = state
@@ -1610,6 +1795,47 @@ fn ram_status(state: &HostState, layout: [u8; 32]) -> Option<RamStatus> {
             .collect(),
     })
 }
+
+/// Reuse the reserve request's dedicated service thread through the result's
+/// lifetime. The server endpoint never keeps a client alias alive. Observe one
+/// commit, then only hangup, so an unread marker cannot create a wake loop.
+fn watch_private_host(lease: UnixStream, host: &HostCache, table: &Table) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let closed = libc::POLLHUP | libc::POLLERR | libc::POLLRDHUP;
+    #[cfg(not(target_os = "linux"))]
+    let closed = libc::POLLHUP | libc::POLLERR;
+    let mut descriptor = libc::pollfd {
+        fd: lease.as_raw_fd(),
+        events: libc::POLLIN | closed,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: a live, independently owned descriptor; an event-driven wait,
+        // never under the host-state lock and with no timeout or status polling.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, -1) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(io("wait for private host lease", error));
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(Error::Io("private host lease descriptor closed".into()));
+        }
+        let ended = descriptor.revents & closed != 0;
+        if ended || descriptor.revents & libc::POLLIN != 0 {
+            host.state.lock().prune_private();
+            host.wake_warm();
+            table.changed();
+        }
+        if ended {
+            return Ok(());
+        }
+        descriptor.events = closed;
+    }
+}
+
 struct RamFill {
     ram: Arc<Ram>,
     index: usize,
@@ -2188,6 +2414,52 @@ fn serve(
                     platform::handles::send_fd(&stream, &client)
                         .map_err(crate::os("send forked grant"))?;
                 }
+                Some(11) => {
+                    if count > 1 {
+                        return Err(Error::Invalid("private host admission phase".into()));
+                    }
+                    let mut room = [0; 8];
+                    let mut through = [0; 8];
+                    stream
+                        .read_exact(&mut room)
+                        .and_then(|_| stream.read_exact(&mut through))
+                        .map_err(|error| io("read private host admission", error))?;
+                    match host.reserve_private(
+                        &table,
+                        key.page,
+                        i64::from_le_bytes(room),
+                        (count == 1).then_some(u64::from_le_bytes(through)),
+                    )? {
+                        HostAdmission::Granted(lease, pending, observer) => {
+                            // Publish the grant before handing its client to the
+                            // worker; subsequent wakes name actual commit/free.
+                            table.changed();
+                            stream
+                                .write_all(&[1])
+                                .and_then(|_| stream.write_all(&pending.to_le_bytes()))
+                                .map_err(|error| io("admit private host allocation", error))?;
+                            platform::handles::send_fd(&stream, &lease)
+                                .map_err(crate::os("send private host lease"))?;
+                            drop(lease);
+                            drop(stream);
+                            // Only reserve_host's dedicated fork uses this command.
+                            // Preserve the lease after its row/request has gone,
+                            // and observe SIGKILL via the same kernel hangup.
+                            return watch_private_host(observer, &host, &table);
+                        }
+                        HostAdmission::Reclaimed(through) => {
+                            stream
+                                .write_all(&[2])
+                                .and_then(|_| stream.write_all(&through.to_le_bytes()))
+                                .map_err(|error| io("refresh private host room", error))?;
+                        }
+                        HostAdmission::Refused => {
+                            stream
+                                .write_all(&[0])
+                                .map_err(|error| io("refuse private host allocation", error))?;
+                        }
+                    }
+                }
                 _ => return Err(Error::Invalid("unknown custody command".into())),
             }
             table.changed();
@@ -2202,6 +2474,82 @@ fn serve(
 /// Executor half of a grant. Operations are serialized, with no background CUDA work.
 pub struct Channel(Mutex<UnixStream>);
 impl Channel {
+    /// Exact private bytes, before allocating/pinning them. The lease is a
+    /// separate capability so a request/plane may close while its result lives.
+    pub fn reserve_host(&self, owner: Owner, bytes: u64) -> Result<Option<Arc<HostReservation>>> {
+        if bytes == 0 {
+            return Err(Error::Invalid("empty private host reservation".into()));
+        }
+        // Admission failure or an older service cannot destroy the demand channel.
+        let channel = self.fork(owner)?;
+        let mut through = None;
+        loop {
+            let room = platform::contain::host_memory::read().available;
+            if room < 0 {
+                return Ok(None);
+            }
+            let mut stream = channel.0.lock();
+            Self::header(
+                &mut stream,
+                11,
+                owner,
+                PageKey {
+                    fingerprint: [0; 32],
+                    page: bytes,
+                },
+                usize::from(through.is_some()),
+            )?;
+            stream
+                .write_all(&room.to_le_bytes())
+                .and_then(|_| stream.write_all(&through.unwrap_or(0_u64).to_le_bytes()))
+                .map_err(|error| io("request private host room", error))?;
+            let mut reply = [0];
+            if let Err(error) = stream.read_exact(&mut reply) {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    return Ok(None);
+                }
+                return Err(io("read private host admission", error));
+            }
+            match reply {
+                [0] => return Ok(None),
+                [1] => {
+                    let mut pending = [0; 8];
+                    stream
+                        .read_exact(&mut pending)
+                        .map_err(|error| io("read private host pending bytes", error))?;
+                    let lease = platform::handles::recv_fd(&stream)
+                        .map_err(crate::os("receive private host lease"))?;
+                    drop(stream);
+                    // Re-read this worker's tightest cgroup after broker reclaim
+                    // and before allocation. Commit cannot hide earlier pending
+                    // allocations: their spans accompany this grant too.
+                    let room = platform::contain::host_memory::read().available;
+                    if bytes
+                        .checked_add(u64::from_le_bytes(pending))
+                        .zip(u64::try_from(room).ok())
+                        .is_none_or(|(need, room)| need > room)
+                    {
+                        return Ok(None);
+                    }
+                    return Ok(Some(Arc::new(HostReservation {
+                        lease: UnixStream::from(lease),
+                        committed: AtomicBool::new(false),
+                    })));
+                }
+                [2] => {
+                    let mut changed = [0; 8];
+                    stream
+                        .read_exact(&mut changed)
+                        .map_err(|error| io("read reclaimed host snapshot", error))?;
+                    through = Some(u64::from_le_bytes(changed));
+                    // Each retry follows an actual region removal, not a timer
+                    // or a status poll, and uses the original fixed victim set.
+                }
+                _ => return Err(Error::Invalid("private host admission reply".into())),
+            }
+        }
+    }
+
     /// A separate stream to the same service custody, including for adopted ledgers.
     /// Background cache registration cannot occupy the GPU demand stream.
     pub fn fork(&self, owner: Owner) -> Result<Self> {
@@ -2330,6 +2678,128 @@ impl Channel {
 mod admission_tests {
     use super::*;
     use std::mem::{align_of, offset_of, size_of};
+
+    fn private(state: &mut HostState, bytes: u64) -> Arc<HostReservation> {
+        let (server, client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        state.private.push(PrivateHost {
+            bytes,
+            lease: server,
+            pending: true,
+        });
+        Arc::new(HostReservation {
+            lease: client,
+            committed: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn private_pending_commit_and_alias_lifetime_share_one_host_budget() {
+        let mut state = HostState::default();
+        state.claims.insert(1, None);
+        let allocation = private(&mut state, 80);
+        assert!(state.can_reserve(100, 20));
+        assert!(!state.can_reserve(100, 21));
+        assert!(
+            !state.can_warm(1000, 1),
+            "unknown forecasts suppress optional warming"
+        );
+        assert!(!state.can_reserve(-1, 1));
+        assert!(!state.can_reserve(i64::MAX, u64::MAX));
+        state.claims.clear();
+        assert!(!state.can_warm(100, 21));
+        allocation.commit().unwrap();
+        allocation.commit().unwrap();
+        state.prune_private();
+        assert_eq!(state.pending_private(), Some(0));
+        assert_eq!(state.private_bytes(), 80);
+        // The allocator has now spent 80 of the original 100 physical bytes.
+        // A fresh reading of20 must not subtract that committed span again.
+        assert!(state.can_reserve(20, 20));
+        let alias = allocation.clone();
+        drop(allocation);
+        state.prune_private();
+        assert_eq!(state.private_bytes(), 80);
+        drop(alias);
+        state.prune_private();
+        assert_eq!(state.private_bytes(), 0);
+    }
+
+    #[test]
+    fn private_admission_preserves_live_leases_across_row_reuse() {
+        let fixture = Fixture::new();
+        let row = fixture.ledger.claim(std::process::id()).unwrap();
+        let old = row.owner();
+        let channel = Channel::new(fixture.ledger.grant(std::process::id()).unwrap().channel);
+        let guard = channel
+            .reserve_host(old, 4096)
+            .unwrap()
+            .expect("small host grant");
+        assert_eq!(
+            unsafe { libc::fcntl(guard.lease.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            libc::FD_CLOEXEC,
+            "a lease must not leak into an unrelated exec"
+        );
+        drop(row);
+        let next = fixture.ledger.claim(std::process::id()).unwrap();
+        assert_eq!(next.owner().row, old.row);
+        assert!(next.owner().generation > old.generation);
+        assert_eq!(fixture.ledger.status().unwrap().private_host_bytes, 4096);
+        assert_eq!(fixture.ledger.pending_host_bytes().unwrap(), 4096);
+        guard.commit().unwrap();
+        assert_eq!(fixture.ledger.pending_host_bytes().unwrap(), 0);
+        assert_eq!(fixture.ledger.status().unwrap().private_host_bytes, 4096);
+        drop(guard);
+        assert_eq!(fixture.ledger.status().unwrap().private_host_bytes, 0);
+    }
+
+    #[test]
+    fn private_reclaim_uses_a_fixed_set_of_idle_regions() {
+        let fixture = Fixture::new();
+        let host = &fixture.ledger.host;
+        let put = |layout, used| {
+            let region = RamRegion {
+                offset: 0,
+                len: 4,
+                items: vec![],
+            };
+            let ram = Arc::new(Ram::new(region.clone()).unwrap());
+            ram.pending.store(false, Release);
+            ram.ready.store(true, Release);
+            let mut state = host.state.lock();
+            state.clock = used;
+            state.ram.insert(
+                layout,
+                RamHeld {
+                    regions: vec![region],
+                    slots: vec![RamSlot {
+                        buffer: Some(ram),
+                        readers: vec![],
+                        used,
+                    }],
+                    observers: BTreeMap::new(),
+                    identity: used,
+                    generation: used,
+                },
+            );
+        };
+        put([1; 32], 1);
+        let through = match host
+            .reserve_private(&fixture.ledger.table, 4096, 0, None)
+            .unwrap()
+        {
+            HostAdmission::Reclaimed(through) => through,
+            _ => panic!("insufficient room must first shed the idle region"),
+        };
+        assert!(host.state.lock().ram.is_empty());
+        put([2; 32], through + 1);
+        assert!(matches!(
+            host.reserve_private(&fixture.ledger.table, 4096, 0, Some(through))
+                .unwrap(),
+            HostAdmission::Refused
+        ));
+        assert!(host.state.lock().ram.contains_key(&[2; 32]));
+    }
 
     #[test]
     fn cache_signals_use_only_the_existing_tail_padding() {

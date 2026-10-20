@@ -192,6 +192,139 @@ pub struct DeviceBuffer {
     engine: Arc<Engine>,
 }
 
+/// Admitted page-locked host output, directly addressable by this CUDA primary context.
+/// The reservation is an actual caller-owned host-admission lease, not a byte counter.
+pub struct MappedBuffer {
+    host: usize,
+    ptr: u64,
+    len: usize,
+    allocated: usize,
+    device: i32,
+    native_device: cuda::CUdevice,
+    ctx: CUcontext,
+    reservation: Option<Arc<dyn Send + Sync>>,
+}
+
+// The allocation and its primary context are retained; raw access follows io::read's contract.
+unsafe impl Send for MappedBuffer {}
+unsafe impl Sync for MappedBuffer {}
+
+impl MappedBuffer {
+    /// Exactly the length passed to cuMemHostAlloc, including host-page padding.
+    pub fn allocation_size(len: usize) -> cuda::Result<usize> {
+        #[cfg(unix)]
+        {
+            let page = platform::shm::page_size();
+            len.checked_add(page - 1)
+                .map(|size| size / page * page)
+                .ok_or_else(|| cuda::Error::CudaUnavailable("mapped host length overflows".into()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = len;
+            Err(cuda::Error::CudaUnavailable(
+                "mapped host admission is unavailable on this platform".into(),
+            ))
+        }
+    }
+
+    /// `reservation` must admit allocation_size(len) bytes before this call. None declines
+    /// unsupported devices or the actual caller stream's capture without allocating bytes.
+    pub fn new(
+        device: i32,
+        len: usize,
+        stream: usize,
+        reservation: Arc<dyn Send + Sync>,
+    ) -> cuda::Result<Option<Self>> {
+        let allocated = Self::allocation_size(len)?;
+        let (native_device, ctx) = cuda::primary_context(device)?;
+        let mut buffer = Self {
+            host: 0,
+            ptr: 0,
+            len,
+            allocated,
+            device,
+            native_device,
+            ctx,
+            reservation: Some(reservation),
+        };
+        let _context = CtxGuard::enter(ctx)?;
+        if cuda::attribute(native_device, cuda::ATTR_CAN_MAP_HOST_MEMORY)? == 0
+            || cuda::attribute(native_device, cuda::ATTR_UNIFIED_ADDRESSING)? == 0
+        {
+            return Ok(None);
+        }
+        if buffer.is_capturing(stream)? {
+            return Ok(None);
+        }
+        let driver = cuda::driver()?;
+        if allocated != 0 {
+            let mut host = std::ptr::null_mut();
+            cuda::check("cuMemHostAlloc", unsafe {
+                (driver.mem_host_alloc)(
+                    &mut host,
+                    allocated,
+                    cuda::MEMHOSTALLOC_PORTABLE | cuda::MEMHOSTALLOC_DEVICEMAP,
+                )
+            })?;
+            buffer.host = host as usize;
+            cuda::check("cuMemHostGetDevicePointer", unsafe {
+                (driver.mem_host_get_device_pointer)(&mut buffer.ptr, host, 0)
+            })?;
+            // Every admitted page is pinned and initialized before the caller commits its
+            // reservation as physically allocated. No host byte is exposed uninitialized.
+            unsafe { std::ptr::write_bytes(host.cast::<u8>(), 0, allocated) };
+        }
+        Ok(Some(buffer))
+    }
+
+    pub fn ptr(&self) -> u64 { self.ptr }
+    pub fn host_ptr(&self) -> *mut u8 { self.host as *mut u8 }
+    pub fn len(&self) -> usize { self.len }
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn allocated(&self) -> usize { self.allocated }
+    pub fn device(&self) -> i32 { self.device }
+    pub fn context(&self) -> CUcontext { self.ctx }
+
+    pub fn is_capturing(&self, stream: usize) -> cuda::Result<bool> {
+        let _context = CtxGuard::enter(self.ctx)?;
+        let mut capture = 0;
+        cuda::check("cuStreamIsCapturing", unsafe {
+            (cuda::driver()?.stream_is_capturing)(stream as CUstream, &mut capture)
+        })?;
+        Ok(capture != 0)
+    }
+
+    /// Only success proves that every consumer stream has stopped using the host mapping.
+    pub fn synchronize(&self) -> cuda::Result<()> {
+        let _context = CtxGuard::enter(self.ctx)?;
+        cuda::check("cuCtxSynchronize", unsafe { (cuda::driver()?.ctx_synchronize)() })
+    }
+}
+
+impl Drop for MappedBuffer {
+    fn drop(&mut self) {
+        let released = (|| {
+            let driver = cuda::driver()?;
+            if self.host != 0 {
+                self.synchronize()?;
+                let _context = CtxGuard::enter(self.ctx)?;
+                cuda::check("cuMemFreeHost", unsafe {
+                    (driver.mem_free_host)(self.host as *mut std::ffi::c_void)
+                })?;
+            }
+            cuda::check("cuDevicePrimaryCtxRelease", unsafe {
+                (driver.primary_ctx_release)(self.native_device)
+            })
+        })();
+        if released.is_err() {
+            // A failed completion/free is not authority to release the host lease. Retain
+            // the allocation, context and its actual reservation until process exit.
+            std::mem::forget(self.reservation.take());
+        }
+    }
+}
+
 impl DeviceBuffer {
     pub fn new(device: i32, len: usize) -> cuda::Result<DeviceBuffer> {
         let engine = Engine::get(device)?;

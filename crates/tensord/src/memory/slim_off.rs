@@ -47,6 +47,9 @@ impl Memory {
     }
     pub fn prepare_host(&self, _: u64, _: Option<u64>) {}
     pub fn finish_host(&self, _: u64) {}
+    pub fn pending_host_bytes(&self) -> io::Result<u64> {
+        unsupported()
+    }
     pub fn capacity(&self) -> u64 {
         0
     }
