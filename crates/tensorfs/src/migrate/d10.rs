@@ -555,8 +555,8 @@ fn array(out: &mut Vec<u8>, n: u64) {
     }
 }
 
-/// What [`migrate`] did, and the repo document it replaced: the rollback is that document put
-/// back in the endpoint's storage (a D10 Hub refuses a release going back to lanes).
+/// What [`migrate`] did, and the repo document as it first read it: the rollback is that
+/// document put back in the endpoint's storage (a D10 Hub refuses a release going back to lanes).
 pub struct Done {
     pub report: Json,
     pub before: Vec<u8>,
@@ -567,21 +567,27 @@ pub struct Done {
 /// it is as read (read and migrated again when another writer won).
 pub fn migrate(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &Store, migrator: &mut Migrator) -> Result<Done> {
     let rt = fetch::runtime()?;
+    let (mut first, mut refused) = (None, 0);
     loop {
         let Fresh::Doc(doc, etag) = rt.block_on(endpoint.repo_bytes(name, None))? else {
             return fail(Kind::NotFound, format!("no repo {name} at {}", endpoint.url()));
         };
+        let before = first.get_or_insert_with(|| doc.clone()).clone();
         rt.block_on(old_objects(endpoint, client, scratch, &doc))?;
         let mut m = migrator.repo(&doc, &|o| Ok(scratch.read(o)?))?;
+        if refused > 0 {
+            m.report["refused_puts"] = json!(refused);
+        }
         let bytes = m.repo.to_json()?;
         if bytes == doc {
-            return Ok(Done { report: m.report, before: doc });
+            return Ok(Done { report: m.report, before });
         }
         let sent = rt.block_on(upload(endpoint, &m.objects))?;
         if rt.block_on(endpoint.put_repo_bytes(name, bytes, Some(&etag)))? {
             m.report["sent"] = json!({"objects": sent.0, "bytes": sent.1});
-            return Ok(Done { report: m.report, before: doc });
+            return Ok(Done { report: m.report, before });
         }
+        refused += 1;
     }
 }
 
