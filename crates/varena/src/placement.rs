@@ -2431,17 +2431,21 @@ mod gpu_tests {
             .unwrap();
         let pin = placement.bind(2, pages[0], 0).expect("warm CUDA binding");
         let mut bytes = [0_u8; 32];
-        tensorfs::io::read(
-            &[tensorfs::io::Copy {
-                src: tensorfs::io::Src::Device {
-                    device: 0,
-                    ptr: pin.ptr,
-                    stream: 0,
-                },
-                dst: tensorfs::io::Dst::host(&mut bytes),
-            }],
-            &tensorfs::io::ReadOpts::default(),
-        )
+        // The live pin owns this CUDA region through the synchronous copy;
+        // bytes is a live, disjoint host destination for the full read.
+        unsafe {
+            tensorfs::io::read(
+                &[tensorfs::io::Copy {
+                    src: tensorfs::io::Src::Device {
+                        device: 0,
+                        ptr: pin.ptr,
+                        stream: 0,
+                    },
+                    dst: tensorfs::io::Dst::host(&mut bytes),
+                }],
+                &tensorfs::io::ReadOpts::default(),
+            )
+        }
         .expect("real GPU contents");
         assert_eq!(bytes, [7; 32]);
         drop(pin);
