@@ -107,7 +107,7 @@ repository file. These folder/file operations are optional compatibility tools.
 
 `convert_to_cozytensors` accepts files, directories, `hf://`, `civitai://` and HTTPS sources. It pins upstream revisions and records
 source metadata. Recognized source layouts use converter tables; `converter=` declares a layout that cannot be
-inferred safely. `export(checkpoint, directory)` renders ordinary Hugging Face filenames, configs and assets.
+inferred safely. `materialize(checkpoint, local_dir=directory, format="safetensors")` writes ordinary Hugging Face filenames, configs and assets.
 Encoded tensors retain their parts unless `dequantize=` requests ordinary values.
 
 ```python
@@ -119,7 +119,7 @@ with tensorfs.Writer("./model.cozytensors") as writer:
     component.put("weight", array("f", [1, 2]), dtype="F32", shape=[2])
     component.asset("tokenizer.json", b"{}")
 checkpoint = writer.commit()
-tensorfs.export(checkpoint, "./portable", format="cozytensors")
+tensorfs.materialize(checkpoint, local_dir="./portable", format="cozytensors")
 
 tensorfs.upload_folder(repo_id="local/example", revision="draft", folder_path="./portable")
 tensorfs.upload_folder(repo_id="acme/example", folder_path="./portable", endpoint="file:///srv/origin")

@@ -301,7 +301,7 @@ and `read` instead of managing these ranges.
 ### Save a checkpoint file
 
 `Writer` writes the cozytensors format. To create Safetensors files, first commit the
-checkpoint and then use `tensorfs.export(..., format="safetensors")`. The export writes
+checkpoint and then use `tensorfs.materialize(..., format="safetensors")`. This writes
 weight files plus the separate configuration and supporting files required by that layout.
 
 ```python
@@ -387,11 +387,11 @@ A `ComponentWriter` supports:
 | `order(keys)` | Set tensor construction order. |
 | `has(key)` | Check a current/resumed write. |
 
-### Convert an existing model and export ordinary files
+### Import an existing model
 
 ```python
 checkpoint = tensorfs.convert_to_cozytensors("hf://owner/model")
-files = tensorfs.export(checkpoint, "./exported", dequantize="BF16")
+print(list(checkpoint.components))
 ```
 
 `convert_to_cozytensors` imports an existing model into the cozytensors format and shared
@@ -402,9 +402,6 @@ For a Hugging Face source, `hf://owner/model@revision` selects an upstream tag, 
 commit. Without `@revision`, the importer resolves Hugging Face's `main` revision. It pins
 and records the exact upstream commit automatically before importing; no separate
 resolution call is needed. These are upstream source revisions, not Tensorhub branches.
-
-`export(checkpoint, directory, format="safetensors", dequantize=None)` returns written
-paths. Formats are `"safetensors"` and `"cozytensors"` (native portable folder). Omit `dequantize` to retain supported encoded representations in the export.
 
 ## Python: configuration and advanced operations
 
@@ -461,24 +458,38 @@ checkpoint = tensorfs.open("me/private-model", token=provider)
 These operations are for tools that require paths or portable folders. They are not
 steps in the normal `open`/`read` workflow.
 
-#### Portable cozytensors export
+#### Materialize a checkpoint or repository
 
-To transfer a complete checkpoint without relying on another machine's store, explicitly
-export the native portable folder:
+`materialize` creates a regular folder and returns its path. Pass an open checkpoint to
+write that checkpoint, or a repository name to reproduce repository content:
 
 ```python
-files = tensorfs.export(saved, "./portable", format="cozytensors")
+folder = tensorfs.materialize(saved, local_dir="./portable")
+legacy_folder = tensorfs.materialize(
+    saved, local_dir="./safetensors-model", format="safetensors", dequantize="BF16"
+)
+repo_folder = tensorfs.materialize("me/model", revision="1.0", local_dir="./repo")
 ```
 
-This writes `model.cozytensors` (or its named variant) plus `chunks/`, keeping the same
-header bytes and content hashes. It fetches required missing objects or fails; it must not
-silently produce an incomplete portable export. Native export preserves encodings and
-does not accept `dequantize`.
+The default `format="cozytensors"` writes a native portable folder: `model.cozytensors`
+(or its named variant) plus `chunks/`, retaining the same header bytes and content hashes.
+`format="safetensors"` writes Safetensors weights with ordinary configuration and supporting
+files. It can retain supported encoded representations, or use `dequantize="BF16"`, for
+example, to write ordinary floating-point weights. Native cozytensors materialization
+preserves encodings and rejects `dequantize`.
 
-The export contains the selected checkpoint and any known repository files. A checkpoint
-opened from a bare header has no enclosing tree to supply a README, LICENSE or other
-variants. A selected-checkpoint export is not a complete multi-variant tree snapshot;
-use `materialize` when you need to materialize repository content.
+Materialization fetches required missing objects or fails; it does not silently create an
+incomplete output. A checkpoint produces its own data and any known repository files.
+A bare header cannot supply an unknown README, LICENSE or other variants. With a repository
+name in native mode, omitting `variant` includes all variants; `components` can select
+which components' payloads are materialized.
+
+Supply `local_dir` for a checkpoint or for Safetensors output. A checkpoint already has
+its source and credentials, so repository-selection/configuration keywords do not apply.
+Safetensors output requires one selected checkpoint and does not accept `components`;
+choose `variant` when a named repository has multiple variants. Native repository mode
+also accepts `revision`, `variant`, `components`, `local_files_only`, `cache_dir`, `endpoint`,
+`token` and `ca_der`; without `local_dir`, it returns a managed snapshot folder.
 
 #### Compatibility export for legacy file-based libraries
 
@@ -495,23 +506,19 @@ folder = checkpoint.components["tokenizer"].export_files("./tokenizer-files")
 `Component.export_files(directory)` explicitly writes configuration and supporting files,
 fetching any missing asset bytes. It returns the directory path and does not export tensor
 weights. Original filenames are preserved internally for compatibility. The full-checkpoint
-`tensorfs.export` operation below also exports weight files when that is needed.
+`tensorfs.materialize` operation also writes weight files when that is needed.
 
 #### Download files or publish a folder
 
 ```python
-folder = tensorfs.materialize("me/model", variant="bf16")
 license_path = tensorfs.download_file("me/model", "LICENSE")
 tree_id = tensorfs.upload_folder(repo_id="me/model", folder_path="./portable", token=my_token)
 ```
 
 `my_token` in the examples is a credential you obtained for your endpoint.
 
-`materialize` is an explicit filesystem escape hatch, not the normal loading path.
-It returns a folder; options are `revision`, `variant`, `components`,
-`local_dir`, `local_files_only`, `cache_dir`, `endpoint`, `token` and `ca_der`. With no
-variant it downloads all variants. `download_file` returns one file path and accepts the
-same location/authentication options, without component or variant selection.
+`download_file` returns one file path and accepts revision, location and authentication
+options, without component or variant selection.
 
 `upload_folder` returns the exact published tree id. Its options are `revision`, `token`,
 `endpoint`, `cache_dir` and `ca_der`. Without a revision it appends an unreleased checkpoint;
@@ -539,8 +546,7 @@ A conflict can cause the callback to run again, so it must tolerate retries.
 | `configure` | `None` |
 | `open` | `Checkpoint`; `lazy=True` loads metadata, `lazy=False` waits for all checkpoint data locally |
 | `convert_to_cozytensors` | `Checkpoint` |
-| `export` | List of written paths |
-| `materialize` | Local folder path |
+| `materialize` | Local folder path; native cozytensors or Safetensors output |
 | `download_file` | Local file path |
 | `upload_folder` | Published tree id |
 

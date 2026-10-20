@@ -110,6 +110,8 @@ impl Checkpoint {
     pub fn chunk(&self, index: usize) -> Result<File>;
     pub fn missing(&self, selection: &Selection) -> Result<Vec<ObjectRef>>;
     pub async fn download(&self, want: &Download<'_>) -> Result<Fetched>;
+    pub async fn materialize(&self, dir: &Path, format: Format,
+        dequantize: Option<Dtype>) -> Result<PathBuf>;
 }
 // Open.lazy=false downloads this checkpoint's data before returning.
 // Synchronous chunk/read/asset/folder operations use bytes made available by download().
@@ -226,8 +228,6 @@ impl ComponentWriter<'_> {
     pub fn has(&self, key: &str) -> Result<bool>;
 }
 pub enum Format { Safetensors, Cozytensors }
-pub async fn export(checkpoint: &Checkpoint, dir: &Path, format: Format,
-    dequantize: Option<Dtype>) -> Result<Vec<String>>;
 ```
 
 ## Low-level streaming input

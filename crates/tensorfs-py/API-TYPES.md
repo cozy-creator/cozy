@@ -45,16 +45,13 @@ def configure(*, endpoint: str | None=None, cache_dir: StrPath | None=None, toke
 def convert_to_cozytensors(source: str | Sequence[str], *, converter: str | None=None, variant: str | None=None, cache_dir: StrPath | None=None, token: Token | None=None, progress: Callable[[str, int, int], object] | None=None) -> Checkpoint:
     ...
 
-def export(src: Checkpoint, dir: StrPath, *, format: str='safetensors', dequantize: str | None=None) -> list[str]:
-    ...
-
 def download_file(repo_id: str, filename: str, *, revision: str | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, ca_der: bytes | None=None) -> str:
     ...
 
 def open(name_or_path: StrPath, *, revision: str | None=None, variant: str | None=None, endpoint: str | None=None, local_files_only: bool=False, cache_dir: StrPath | None=None, token: Token | None=None, ca_der: bytes | None=None, lazy: bool=True) -> Checkpoint:
     ...
 
-def materialize(repo_id: str, *, revision: str | None=None, variant: str | None=None, components: Sequence[str] | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, ca_der: bytes | None=None) -> str:
+def materialize(source: str | Checkpoint, *, revision: str | None=None, variant: str | None=None, components: Sequence[str] | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, ca_der: bytes | None=None, format: str='cozytensors', dequantize: str | None=None) -> str:
     ...
 
 def upload_folder(*, repo_id: str, folder_path: StrPath, revision: str | None=None, token: Token | None=None, endpoint: str | None=None, cache_dir: StrPath | None=None, ca_der: bytes | None=None) -> str:

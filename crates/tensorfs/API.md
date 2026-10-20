@@ -110,21 +110,22 @@ let model: Ref = "me/model@1.0/bf16".parse()?;
 let folder = client.materialize(&model, &Download::default(), None, false).await?;
 println!("downloaded to {}", folder.display());
 
-tensorfs::export(&saved, Path::new("./portable"), Format::Cozytensors, None).await?;
+saved.materialize(Path::new("./portable"), Format::Cozytensors, None).await?;
 let destination: Ref = "me/output".parse()?;
 let tree = client.upload_folder(&destination, Path::new("./portable"), None).await?;
 println!("published {}", tree.id());
 ```
 
-Native export includes the selected checkpoint and any known repository files. It is not
-a full multi-variant tree snapshot; use `materialize` for repository materialization.
-Exporting a standalone header cannot recover unknown repository files or release metadata.
+Checkpoint materialization includes that checkpoint and any known repository files.
+Use `Client::materialize` for an entire native repository, including all variants when no
+variant is selected. A standalone header cannot supply unknown repository files or release
+metadata.
 
 All operations involving network/source resolution above are async except construction and
-`writer`. Export uses `tensorfs::export(&checkpoint, directory, format, dequantize).await`
-and returns `Result<Vec<String>>`; choose `Format::Safetensors` or `Format::Cozytensors`.
-It first makes the required checkpoint data and known repository files available, then
-writes the export. Missing or denied source objects fail the operation.
+`writer`. `checkpoint.materialize(directory, format, dequantize).await` returns
+`Result<PathBuf>`; choose `Format::Safetensors` or `Format::Cozytensors`. It first makes
+the required checkpoint data and known repository files available, then writes the folder.
+Missing or denied source objects fail the operation.
 
 A `Writer` also has `pipeline(class, config)`, `component(name, class, config)`,
 `set_metadata(key, Value)`, `has(component, key)`, `committed()` and `abandon(self)`. Its
@@ -175,6 +176,7 @@ a separate worker-permission mechanism.
 | `chunk(index)` | `Result<File>`; the returned file owns its descriptor. |
 | `missing(&Selection)` | `Result<Vec<ObjectRef>>`. |
 | `download(&Download).await` | `Result<Fetched>`. |
+| `materialize(directory, Format, dequantize).await` | `Result<PathBuf>` for the complete checkpoint folder. |
 
 `download` completes when the selected chunks and supporting files are verified and locally
 available; the open checkpoint retains them. `missing` is optional availability inspection.
