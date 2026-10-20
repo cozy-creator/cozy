@@ -257,6 +257,9 @@ impl Repo {
         let Some(sha256) = revision.strip_prefix("sha256:") else {
             return self.tag(revision).map(Resolution::Tag);
         };
+        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return None;
+        }
         // The default's commit first, then the last created.
         let mut order: Vec<&Tag> = self.default_tag().into_iter().collect();
         order.extend(self.tags.iter().rev());
