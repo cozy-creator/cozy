@@ -43,24 +43,6 @@ pub struct Tenant {
     pub last_used: u64,
     pub mapped: bool,
 }
-#[derive(Clone, Debug)]
-pub struct Holding {
-    pub id: String,
-    pub bytes: u64,
-    pub readers: Vec<u32>,
-    pub idle_ms: u64,
-    pub revoking: bool,
-}
-pub fn holding_name(id: &str) -> &str {
-    id.rsplit_once('#').map_or(id, |(name, _)| name)
-}
-#[derive(Clone, Debug)]
-pub enum Step {
-    Unmap(String),
-    End(String),
-    Revoke(String),
-    Trim(String, u64),
-}
 #[derive(Default)]
 pub struct Gpu {
     tenants: BTreeMap<String, Tenant>,

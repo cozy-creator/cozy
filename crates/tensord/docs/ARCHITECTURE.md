@@ -131,7 +131,6 @@ code is still not sandboxed.
 
 | Path | Use | Owner |
 |---|---|---|
-| `src/bin/degree2-pilot.rs` | Degree 2 on a rental: stock executors share GPU weights through `ResidentCustody` (replacement, count-once, revoke, output equality) | C |
 | `src/bin/model-source-check.rs`, `scripts/check-model-source-descriptor.py` | Check a selected snapshot's sources | B1 |
 | `src/bin/install-capture.rs` | Run the installer path on a captured archive (used by Python tests) | D1 |
 | `scripts/gate/` | Matched ComfyUI vs TensorD gate through ordinary `cozy run` | F |

@@ -36,12 +36,6 @@ pub mod products;
 pub mod seam;
 pub mod published;
 pub mod reclaim;
-#[cfg(target_os = "linux")]
-pub mod resident_custody;
-/// Off where the OS cannot share an executor's device memory by handle.
-#[cfg(not(target_os = "linux"))]
-#[path = "resident_custody_off.rs"]
-pub mod resident_custody;
 pub mod runs;
 #[cfg(test)]
 mod scratch;

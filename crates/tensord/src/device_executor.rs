@@ -28,8 +28,8 @@ use std::os::{
     unix::process::{CommandExt, ExitStatusExt},
 };
 
-/// Chunks of one weight set's shared GPU regions crossing in one exchange.
-const MAX_SHARED_FDS: u32 = 1 << 16;
+/// Bound descriptor counts even for a malformed or unsupported request.
+const MAX_REQUEST_FDS: u32 = 1 << 16;
 pub const RESULT_DOCUMENT: &str = "result.canonical";
 
 #[derive(Clone, Debug)]
@@ -125,7 +125,6 @@ impl Default for Binding {
             store: String::new(),
             snapshot: String::new(),
             release: String::new(),
-            variant: String::new(),
             development: false,
             custody: "canonical".into(),
             objective: String::new(),
@@ -297,15 +296,6 @@ pub enum DeviceCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         floor_bytes: Option<u64>,
     },
-    /// Offer the machine every GPU region filled and not shared yet.
-    Share,
-    /// Release the machine's GPU regions of one layout, or only `regions` of it.
-    Revoke {
-        layout: String,
-        generation: u64,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        regions: Vec<u32>,
-    },
     Unload {
         construction: String,
     },
@@ -365,8 +355,6 @@ impl DeviceCommand {
             Self::Invoke { .. } => "invoke",
             Self::Budget { .. } => "budget",
             Self::Map { .. } => "map",
-            Self::Share => "share",
-            Self::Revoke { .. } => "revoke",
             Self::Unload { .. } => "unload",
             Self::Probe { .. } => "probe",
             Self::Fork { .. } => "fork",
@@ -387,7 +375,6 @@ pub enum Event {
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     CheckpointItem,
-    DeviceTier,
     BudgetCell,
     DeviceRoom,
     Publish,
@@ -646,6 +633,7 @@ pub struct Frame {
     pub holding_bytes: Option<i64>,
     pub facts: Option<LoadFacts>,
     pub plane: Option<PlaneFacts>,
+    pub memory: Option<crate::memory::call::RequestMemory>,
     /// `map`: the device bytes the construction's weights hold after it, and whether that
     /// is every weight.
     pub mapped_bytes: Option<u64>,
@@ -670,12 +658,9 @@ pub struct Frame {
     pub fields: Value,
     /// PrepareRequest: the request's normalized features (its shape).
     pub features: BTreeMap<String, Value>,
-    /// `device_tier`: fds that follow the frame, one per chunk of `regions`.
+    /// Extra descriptors are drained before an unsupported operation is refused.
     pub descriptors: u32,
     pub device: String,
-    pub regions: Vec<crate::resident_custody::SharedRegion>,
-    /// `device_tier`: what the regions hold beside the stored bytes ("": nothing; in an ask
-    /// "*": the layout's latest baked variant).
     pub variant: String,
     pub shared_bytes: u64,
     pub released_bytes: u64,
@@ -759,33 +744,11 @@ pub struct Answer {
     pub ok: bool,
     pub code: String,
     pub detail: String,
-    pub held: bool,
-    /// A `DeviceRoom` answer: the process cap raised into the room made; -1 keeps it.
-    pub cap_bytes: i64,
     /// One fd follows the answer. Sent only when true: a `Tier` answer types it as the fd.
     #[serde(skip_serializing_if = "is_false")]
     pub descriptor: bool,
     pub sha256: String,
     pub length: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub generation: u64,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub regions: Vec<crate::resident_custody::SharedRegion>,
-    #[serde(skip_serializing_if = "is_false")]
-    pub duplicate: bool,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub descriptors: u64,
-    /// `device_tier`: the holding's layout digest, which the reader's plane verifies.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub layout: String,
-    /// `device_tier`: the last fd after the answer is the reader's lease socket.
-    #[serde(skip_serializing_if = "is_false")]
-    pub lease: bool,
-    /// `device_tier`: this machine keys holdings by variant, and the answered holding's.
-    #[serde(skip_serializing_if = "is_false")]
-    pub variants: bool,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub variant: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub digest: String,
     #[serde(skip_serializing_if = "is_zero")]
@@ -826,19 +789,9 @@ impl Answer {
             ok: false,
             code: "capability_unavailable".into(),
             detail: "owner has not qualified this operation".into(),
-            held: false,
-            cap_bytes: -1,
             descriptor: false,
             sha256: String::new(),
             length: 0,
-            generation: 0,
-            regions: Vec::new(),
-            duplicate: false,
-            descriptors: 0,
-            layout: String::new(),
-            lease: false,
-            variants: false,
-            variant: String::new(),
             digest: String::new(),
             sequence: 0,
             state: String::new(),
@@ -880,16 +833,7 @@ pub trait Services {
         drop(descriptor);
         Ok((Answer::unavailable(frame.seq), None))
     }
-    /// `device_tier`: `fds` arrived with the request; the returned ones
-    /// follow the answer, the lease socket last when `answer.lease`.
-    fn device_tier(
-        &mut self,
-        frame: &Frame,
-        fds: Vec<Owned>,
-    ) -> io::Result<(Answer, Vec<Owned>)> {
-        drop(fds);
-        Ok((Answer::unavailable(frame.seq), Vec::new()))
-    }
+
 }
 
 pub struct Baseline;
@@ -1876,24 +1820,10 @@ impl DeviceExecutor {
                 }
                 Some(Event::Progress) if !frame.malformed.is_empty() => (),
                 Some(Event::Progress) => services.progress(&frame),
-                Some(Event::Request) if frame.kind == Kind::DeviceTier => {
-                    if frame.descriptors > MAX_SHARED_FDS {
-                        return Err(io::Error::other("device tier names too many descriptors"));
-                    }
-                    let mut fds = Vec::with_capacity(frame.descriptors as usize);
-                    for _ in 0..frame.descriptors {
-                        fds.push(platform::handles::recv_fd(&self.stream)?);
-                    }
-                    let (mut answer, out) = services.device_tier(&frame, fds)?;
-                    answer.event = "answer";
-                    answer.seq = frame.seq;
-                    answer.descriptor = false;
-                    // Chunk fds, then the lease socket when there is one.
-                    answer.descriptors = out.len().saturating_sub(usize::from(answer.lease)) as u64;
-                    write_frame(&mut self.stream, &answer)?;
-                    for fd in &out {
-                        platform::handles::send_fd(&self.stream, fd)?;
-                    }
+                Some(Event::Request) if frame.descriptors > 0 => {
+                    if frame.descriptors > MAX_REQUEST_FDS { return Err(io::Error::other("request names too many descriptors")); }
+                    for _ in 0..frame.descriptors { drop(platform::handles::recv_fd(&self.stream)?); }
+                    write_frame(&mut self.stream, &Answer::refused(frame.seq,"unsupported_descriptors","this operation does not accept multiple descriptors"))?;
                 }
                 Some(Event::Request)
                     if matches!(frame.kind, Kind::StageMemoLookup | Kind::StageMemoStore) =>
@@ -2190,7 +2120,7 @@ fn refuse_malformed(
     stream: &mut LocalStream,
     frame: &Frame,
 ) -> io::Result<()> {
-    if frame.descriptors > MAX_SHARED_FDS {
+    if frame.descriptors > MAX_REQUEST_FDS {
         return Err(io::Error::other("a malformed request names too many descriptors"));
     }
     for _ in 0..u32::from(frame.descriptor) + frame.descriptors {

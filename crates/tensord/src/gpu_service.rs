@@ -16,10 +16,9 @@ use crate::{
     },
     launch_identity::Seal,
     memory::{
-        policy::{Facts, Holding, Step},
+        policy::Facts,
         GpuMemory, MemoryConfig,
     },
-    resident_custody::{HoldingFacts, HoldingKey, Offered, Reader, ResidentCustody},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -431,8 +430,6 @@ struct Session {
     executor: DeviceExecutor,
     /// Budget cells by rank: rank 0's own, and each follower's.
     budget_cells: BTreeMap<u32, File>,
-    /// Its weights stay on the GPU under custody (Degree 2), decided once at its load.
-    sharing: bool,
     launch: Launch,
     /// It has served a call: its next one is not its first.
     invoked: bool,
@@ -648,8 +645,6 @@ pub struct Pool {
     reserve: Mutex<platform::contain::host_pressure::Reserve>,
     stalls: std::sync::atomic::AtomicU64,
     stalls_seen: std::sync::atomic::AtomicU64,
-    /// Degree 2: GPU weights kept across executors. None on a GPU that drives a display.
-    custody: Option<Mutex<ResidentCustody>>,
     /// Memoized Model methods' results, shared by every run on this machine.
     memo: Arc<crate::memo::Memo>,
     // Drop session/resource custody before ending the actual spawning thread.
@@ -738,12 +733,6 @@ impl Pool {
         // GPU custody holds one descriptor per chunk.
         platform::process::raise_fd_limit();
         let envelope = config.envelope();
-        // Degree 2 is world-one, on the first device; off where it drives a display, and
-        // outside Unix, where one executor's device memory cannot be handed to another.
-        let custody = envelope
-            .first()
-            .filter(|first| cfg!(unix) && !display_active(first))
-            .map(|_| Mutex::new(ResidentCustody::default()));
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
         crate::launch_identity::remove_stale_jit(root, &incarnation);
         remove_old_executor_roots(root);
@@ -798,7 +787,6 @@ impl Pool {
             reserve: Mutex::default(),
             stalls: Default::default(),
             stalls_seen: Default::default(),
-            custody,
             memo: Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?),
         });
         pool.watch_host();
@@ -909,7 +897,7 @@ impl Pool {
                 },
             };
             let victim = self.devices[device].memory.with(|gpu| gpu.lru_idle(plan, spare));
-            let ended = victim.is_some_and(|victim| self.carry_out(device, &Step::End(victim)).unwrap_or(false));
+            let ended = victim.is_some_and(|victim| self.end_idle_executor(device, &victim).unwrap_or(false));
             drop(held);
             ended
         })
@@ -1217,7 +1205,7 @@ impl Pool {
             let Some(permit) = self.allocations.upkeep(start..start + degree as usize) else {
                 continue;
             };
-            if let Err(error) = self.carry_out(start, &Step::End(plan)) {
+            if let Err(error) = self.end_idle_executor(start, &plan) {
                 tracing::warn!("ending a removed package's executor: {error}");
             }
             drop(permit);
@@ -1239,12 +1227,7 @@ impl Pool {
                 }
             }
         }
-        let unread = self.custody.as_ref().map(|c| c.lock().unwrap().end_environment(identity));
-        for (key, generation) in unread.unwrap_or_default() {
-            if let Err(error) = self.revoke(&key, generation) {
-                tracing::warn!("revoking a removed package's GPU weights: {error}");
-            }
-        }
+
     }
     /// One pass over `actor`'s warm set: each member is brought as far toward its level as
     /// free room and the room of idle tenants outside every warm set allow. It never takes
@@ -1330,10 +1313,8 @@ impl Pool {
         if !self.sessions.lock().unwrap().contains_key(&plan.construction) {
             return Ok("its executor ended");
         }
-        let step = |step: &Step| self.carry_out(0, step);
-        let Some(cap) = self.first().admit_member(&plan.construction, true, || self.holdings(), step)? else {
-            return Ok("no GPU room for its weights beside the warm set and the running call");
-        };
+        if !self.first().fits(&plan.construction) { return Ok("no GPU room beside the running requests"); }
+        let cap = self.first().capacity();
         let Some(mut session) = self.sessions.lock().unwrap().remove(&plan.construction) else {
             return Ok("its executor ended");
         };
@@ -1556,33 +1537,24 @@ impl Pool {
         self.reap();
         Ok(self.lane(start, degree)?.iter().map(|device| device.memory.capacity()).collect())
     }
-    /// GPU weights kept across executors (Degree 2), for the memory policy. Lets go of
-    /// revoked generations whose last reader ended first.
-    pub fn resident(&self) -> Vec<HoldingFacts> {
-        self.custody.as_ref().map_or_else(Vec::new, |c| {
-            let mut custody = c.lock().unwrap();
-            log_released(custody.collect(), &self.notes);
-            custody.holdings()
-        })
+
+    pub fn memory_status(&self) -> Vec<serde_json::Value> {
+        #[cfg(unix)]
+        return self.devices.iter().filter_map(|device| {
+            let state = device.memory.placement().ok()?.status().ok()?;
+            let rows: Vec<_> = state.rows.iter().map(|row| serde_json::json!({
+                "row":row.owner.row,"generation":row.owner.generation,"pid":row.pid,
+                "state":format!("{:?}",row.state).to_ascii_lowercase(),"classes":row.snapshot.classes,
+                "context":row.snapshot.context,"progress":row.progress,
+                "running":row.snapshot.requests.iter().map(|run|serde_json::json!({"id":run.id,"remaining":run.remaining})).collect::<Vec<_>>()
+            })).collect();
+            let kept:Vec<_> = state.kept.iter().map(|(key,bytes)|serde_json::json!({"fingerprint":tensorfs::sha256::hex(&key.fingerprint),"page":key.page,"bytes":bytes})).collect();
+            Some(serde_json::json!({"device":device.entry,"capacity":state.capacity,"rows":rows,"kept":kept,"ram_bytes":state.ram_bytes,"peaks":state.peaks}))
+        }).collect();
+        #[cfg(not(unix))]
+        Vec::new()
     }
-    /// Revoke one held generation: no new attachments now; every idle executor reading it
-    /// releases it at once, and the bytes stay charged until each other reader released or ended.
-    fn revoke(&self, key: &HoldingKey, generation: u64) -> io::Result<()> {
-        let custody = self
-            .custody
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "no GPU weight custody"))?;
-        custody.lock().unwrap().begin_revoke(key, generation)?;
-        let mut failed = vec![];
-        for (name, session) in self.sessions.lock().unwrap().iter_mut() {
-            if let Err(error) = release_revoked(custody, &mut session.executor) {
-                failed.push((name.clone(), session.executor.birth.clone(), error));
-            }
-        }
-        self.end_failed(failed);
-        log_released(custody.lock().unwrap().collect(), &self.notes);
-        Ok(())
-    }
+
     /// Idle executors whose channel failed end, and what they held (context, leases) with them:
     /// another tenant's failure is never the asking call's.
     fn end_failed(&self, failed: Vec<(String, Birth, io::Error)>) {
@@ -1991,7 +1963,7 @@ impl Pool {
     }
     /// Admission uses only the executor's measured declarations in the shared table.
     fn fits(&self, plan: &str, device: usize) -> bool {
-        self.devices[device].memory.fits(plan, Vec::new)
+        self.devices[device].memory.fits(plan)
     }
     #[cfg(not(unix))]
     fn watch_memory(self: &Arc<Self>, _: &Arc<Engine>) {}
@@ -2293,21 +2265,9 @@ impl Pool {
         }
         let lane = self.lane(start, plan.degree)?;
         let mut load_caps = vec![];
-        for (gpu, device) in (start..).zip(lane) {
-            let holdings = || if gpu == 0 { self.holdings() } else { vec![] };
-            // A warm set member may take the room of idle tenants outside every set; a
-            // prefetch only what is free. Neither touches a member or a running call.
-            let cap = match member {
-                true => {
-                    let step = |step: &Step| self.carry_out(gpu, step);
-                    device.memory.admit_member(&plan.construction, false, holdings, step)?
-                }
-                false => device.memory.admits(&plan.construction, holdings).then_some(None),
-            };
-            match cap {
-                Some(cap) => load_caps.push(cap),
-                None => return Ok("no GPU room beside the warm set and the running call"),
-            }
+        for device in lane {
+            if !device.memory.fits(&plan.construction) { return Ok("no GPU room beside the running requests"); }
+            load_caps.push(device.memory.capacity());
         }
         let reservation = self.next_reservation.fetch_add(1, Ordering::Relaxed);
         if !self.host_room(&plan.construction, start, plan.degree, true, reservation) {
@@ -2789,139 +2749,15 @@ impl Pool {
         result
     }
 
-    /// Custody's holdings as the memory policy reads them.
-    fn holdings(&self) -> Vec<Holding> {
-        self.resident()
-            .into_iter()
-            .map(|h| Holding {
-                id: holding_id(&h.key, h.generation),
-                bytes: h.bytes,
-                readers: h.readers.iter().map(|birth| birth.pid).collect(),
-                idle_ms: h.idle_ms,
-                revoking: h.phase == crate::resident_custody::Phase::Revoking,
-            })
-            .collect()
-    }
 
-    /// One memory step from GPU `device`'s ledger on idle executors there, or on custody. The
-    /// caller holds `device`'s call slot; an executor in a call is out of `sessions`.
-    fn carry_out(&self, device: usize, step: &Step) -> io::Result<bool> {
-        let plan = match step {
-            Step::Revoke(id) => {
-                let Some(custody) = &self.custody else {
-                    return Ok(false);
-                };
-                let found = custody
-                    .lock()
-                    .unwrap()
-                    .holdings()
-                    .into_iter()
-                    .find(|h| holding_id(&h.key, h.generation) == *id);
-                let Some(holding) = found else {
-                    return Ok(false);
-                };
-                return self.revoke(&holding.key, holding.generation).map(|_| true);
-            }
-            Step::Trim(id, bytes) => {
-                let Some(custody) = &self.custody else {
-                    return Ok(false);
-                };
-                let found = custody
-                    .lock()
-                    .unwrap()
-                    .holdings()
-                    .into_iter()
-                    .find(|h| holding_id(&h.key, h.generation) == *id);
-                let Some(holding) = found else {
-                    return Ok(false);
-                };
-                let regions = custody.lock().unwrap().trim_regions(
-                    &holding.key,
-                    holding.generation,
-                    *bytes,
-                );
-                // Every reader must be an executor this service holds; else the whole revoke.
-                let mut sessions = self.sessions.lock().unwrap();
-                let readers = sessions
-                    .values()
-                    .filter(|s| holding.readers.contains(&s.executor.birth))
-                    .count();
-                let Some(regions) = regions.filter(|_| readers == holding.readers.len()) else {
-                    drop(sessions);
-                    return self.carry_out(device, &Step::Revoke(id.clone()));
-                };
-                let mut failed = vec![];
-                for (key, session) in sessions
-                    .iter_mut()
-                    .filter(|(_, s)| holding.readers.contains(&s.executor.birth))
-                {
-                    let reply = session.executor.command(
-                        &DeviceCommand::Revoke {
-                            layout: holding.key.layout.clone(),
-                            generation: holding.generation,
-                            regions: regions.clone(),
-                        },
-                        &mut device_executor::Baseline,
-                    );
-                    match reply {
-                        Ok(reply) if reply.ok => {}
-                        // Its mapping stays a reference: the regions stay charged, nothing freed.
-                        Ok(reply) => {
-                            tracing::warn!("trim of {} refused: {} {}", id, reply.code, reply.detail);
-                            return Ok(false);
-                        }
-                        Err(error) => failed.push((key.clone(), session.executor.birth.clone(), error)),
-                    }
-                }
-                // A reader whose channel failed ends, and its mapping with it.
-                drop(sessions);
-                self.end_failed(failed);
-                let freed =
-                    custody
-                        .lock()
-                        .unwrap()
-                        .trim(&holding.key, holding.generation, &regions);
-                tracing::info!(
-                    "resident GPU weights trimmed: {} on {}, {freed} bytes in {} regions",
-                    holding.key.layout,
-                    holding.key.device,
-                    regions.len()
-                );
-                return Ok(true);
-            }
-            Step::Unmap(plan) | Step::End(plan) => plan,
-        };
+    fn end_idle_executor(&self, device: usize, plan: &str) -> io::Result<bool> {
         let mut sessions = self.sessions.lock().unwrap();
-        let on_device = |s: &Session| s.plan == *plan && (s.start..s.start + s.degree as usize).contains(&device);
-        let Some(key) = sessions.iter().find(|(_, s)| on_device(s)).map(|(key, _)| key.clone()) else {
-            return Ok(false);
-        };
-        if let Step::Unmap(_) = step {
-            let session = sessions.get_mut(&key).expect("found above");
-            let reply = session.executor.command(
-                &DeviceCommand::Budget {
-                    vram_bytes: 0,
-                    pinned_bytes: -1,
-                    cap_bytes: None,
-                },
-                &mut device_executor::Baseline,
-            );
-            if let Some(reply) = reply.ok().filter(|reply| reply.ok) {
-                let facts = plane_facts(reply.plane.as_ref());
-                self.observe(plan, session.start, session.degree, &session.executor.birth, facts, &reply.rank_planes, Some(false));
-                return Ok(true);
-            }
-        }
-        let session = sessions.remove(&key).expect("found above");
+        let key = sessions.iter().find(|(_,s)| s.plan == plan && (s.start..s.start+s.degree as usize).contains(&device)).map(|(key,_)|key.clone());
+        let Some(session)=key.and_then(|key|sessions.remove(&key)) else {return Ok(false)};
         drop(sessions);
-        let (start, degree) = (session.start, session.degree);
-        // Its context leaves the device before anything is granted in its place (the caller
-        // holds this GPU's call slot, so nothing starts there meanwhile). Another tenant's
-        // broken channel is its own failure, never this call's.
-        if let Err(error) = session.executor.shutdown() {
-            tracing::warn!("memory: ending idle executor {key}: {error}");
-        }
-        self.ended(plan, start, degree);
+        let (start,degree)=(session.start,session.degree);
+        if let Err(error)=session.executor.shutdown() { tracing::warn!(%error,plan,"ending idle executor"); }
+        self.ended(plan,start,degree);
         Ok(true)
     }
 
@@ -2949,9 +2785,6 @@ impl Pool {
                 canceled
             })
         };
-        if let Some(custody) = &self.custody {
-            log_released(custody.lock().unwrap().collect(), &self.notes);
-        }
         let (key, degree) = (session_key(&plan.construction, start), plan.degree);
         let retained = match degree {
             0 => {
@@ -3164,7 +2997,6 @@ impl Pool {
             loaded: false,
             executor,
             budget_cells: BTreeMap::new(),
-            sharing: false,
             launch,
             invoked: false,
             counted: Default::default(),
@@ -3199,10 +3031,6 @@ impl Pool {
         // A group runs one rank per GPU; a plan that constructs nothing holds its GPUs in one
         // process (the Runtime refuses a group without constructed models).
         let ranks = if plan.slots.is_empty() { 1 } else { degree.max(1) };
-        if !session.loaded {
-            session.sharing = self.degree2(&construction, start, degree)?;
-        }
-        let sharing = session.sharing;
         let lane = self.lane_devices(start, degree)?;
         let mut callbacks = Callbacks {
             engine,
@@ -3210,14 +3038,6 @@ impl Pool {
             cells: &mut session.budget_cells,
             completed: 0,
             generation: &held.record,
-            birth: session.executor.birth.clone(),
-            custody: self.custody.as_ref().filter(|_| sharing),
-            environment: &plan.generation,
-            exit: session.executor.observer_pidfd()?,
-            pool: self,
-            plan: &construction,
-            start,
-            degree,
             spool: None,
             caller: None,
         };
@@ -3324,7 +3144,7 @@ impl Pool {
                             false => engine.get(id)?.invocation.attention_kernel,
                         },
                         pinned_bytes: None,
-                        device_weights: sharing,
+                        device_weights: false,
                         cap_bytes: load_cap,
                     }
                 }
@@ -3434,17 +3254,6 @@ impl Pool {
             &spool,
             &record.invocation.inputs,
         )?;
-        // Degree 2 per call: on while the whole construction and its activations fit beside the
-        // other tenants now. A sharing executor that no longer fits lets go of what it maps
-        // first, so this call streams privately and the ladder can reclaim those holdings.
-        let share = false; // Page custody is now owned by the placement ledger.
-        if session.sharing && !share {
-            if let Some(custody) = &self.custody {
-                detach(custody, &mut session.executor, &self.notes)?;
-            }
-        }
-        session.sharing = share;
-        callbacks.custody = self.custody.as_ref().filter(|_| share);
         // A real grant for the whole call: one tenant needs no per-stage turns.
         // A group's cap holds on every GPU of it (each rank caps its own process).
         let caps = self.decide(&construction, start, degree, false)?;
@@ -3502,7 +3311,7 @@ impl Pool {
                 floor_bytes: None,
                 activation_bytes: gpu.map(|gpu| gpu.with(|gpu| gpu.seeds(&construction))).unwrap_or_default(),
                 squeezed_bytes: gpu.map(|gpu| gpu.with(|gpu| gpu.squeezed(&construction))).unwrap_or_default(),
-                device_weights: Some(share),
+                device_weights: None,
                 sources: plan.sources.iter().map(|s| (s.parameter.clone(), s.manifest.clone())).collect(),
             },
             &group,
@@ -3584,39 +3393,9 @@ impl Pool {
                 )))?;
             }
         }
-        // Degree 2 once this call measured that the construction fits: an executor loaded
-        // without it (its plan never ran here) offers everything it holds at this boundary.
-        if !session.sharing && self.degree2(&construction, start, degree)? {
-            session.sharing = true;
-            callbacks.custody = self.custody.as_ref();
-        }
-        if let Some(custody) = callbacks.custody {
-            // The call is over: the GPU regions it filled outlive this executor, and
-            // generations revoked meanwhile are let go at this idle boundary.
-            let shared = session
-                .executor
-                .command(&DeviceCommand::Share, &mut callbacks);
-            if let Ok(reply) = &shared {
-                // What it exported is custody's to count now: its report says what it still
-                // holds. Its last one counted those bytes too, which hid that much external
-                // memory and raised its next cap by it (run 4391: 22.52 GB for 21.84 GB of room).
-                let facts = plane_facts(reply.plane.as_ref());
-                self.observe(&construction, start, degree, &session.executor.birth, facts, &reply.rank_planes, None);
-            }
-            let released = shared.and_then(|_| release_revoked(custody, &mut session.executor));
-            if let Err(error) = released {
-                tracing::warn!("device weights share/revoke failed; replacing the executor: {error}");
-                return Ok(false);
-            }
-        }
         Ok(true)
     }
 
-    /// Page-level custody replaces the retired whole-model sharing path.
-    fn degree2(&self, _: &str, _: usize, _: u32) -> io::Result<bool> {
-        // The old whole-model custody channel is superseded by page-level grants.
-        Ok(false)
-    }
 
     /// Before a spawn: the host has room for the executor's private bytes as measured in
     /// earlier runs, or gives it back in order: import-only parents with no live child, then
@@ -3743,13 +3522,6 @@ fn rank_grant(caps: &[Option<u64>]) -> (Option<u64>, Group) {
     )
 }
 
-fn holding_id(key: &HoldingKey, generation: u64) -> String {
-    let variant = match key.variant.as_str() {
-        "" => String::new(),
-        variant => format!("+{variant}"),
-    };
-    format!("{}/{}{variant}#{generation}", key.device, key.layout)
-}
 
 fn known(value: Option<i64>) -> Option<u64> {
     value.and_then(|v| u64::try_from(v).ok())
@@ -3832,81 +3604,6 @@ fn load_facts(facts: Option<&device_executor::LoadFacts>) -> Facts {
     out
 }
 
-/// Ask the executor to release every revoked generation it reads (it is idle here).
-/// `executor` lets go of every holding it maps (queued work first): its weights become its
-/// own again. Holdings others still read stay; the rest are unread, for the ladder to reclaim.
-fn detach(custody: &Mutex<ResidentCustody>, executor: &mut DeviceExecutor, notes: &crate::memory::MemoryLog) -> io::Result<()> {
-    let read = custody.lock().unwrap().read_by(&executor.birth);
-    for (key, generation) in read {
-        let reply = executor.command(
-            &DeviceCommand::Revoke {
-                layout: key.layout.clone(),
-                generation,
-                regions: vec![],
-            },
-            &mut device_executor::Baseline,
-        )?;
-        if reply.ok {
-            custody
-                .lock()
-                .unwrap()
-                .released(&key, generation, &executor.birth);
-        }
-        notes.note(serde_json::json!({"event": "detach", "layout": key.layout,
-            "ok": reply.ok}));
-    }
-    Ok(())
-}
-
-fn release_revoked(
-    custody: &Mutex<ResidentCustody>,
-    executor: &mut DeviceExecutor,
-) -> io::Result<()> {
-    let pending: Vec<(HoldingKey, u64)> = {
-        let custody = custody.lock().unwrap();
-        let revoking: std::collections::BTreeSet<_> = custody
-            .holdings()
-            .into_iter()
-            .filter(|h| h.phase == crate::resident_custody::Phase::Revoking)
-            .map(|h| (h.key, h.generation))
-            .collect();
-        custody
-            .read_by(&executor.birth)
-            .into_iter()
-            .filter(|row| revoking.contains(row))
-            .collect()
-    };
-    for (key, generation) in pending {
-        let reply = executor.command(
-            &DeviceCommand::Revoke {
-                layout: key.layout.clone(),
-                generation,
-                regions: vec![],
-            },
-            &mut device_executor::Baseline,
-        )?;
-        if reply.ok {
-            custody
-                .lock()
-                .unwrap()
-                .released(&key, generation, &executor.birth);
-        } else {
-            // A reader that cannot release keeps its lease charged until it ends: no kill.
-            tracing::warn!(
-                "revoke of {} refused: {} {}",
-                key.layout, reply.code, reply.detail
-            );
-        }
-    }
-    Ok(())
-}
-
-fn log_released(released: Vec<(HoldingKey, u64)>, notes: &crate::memory::MemoryLog) {
-    for (key, bytes) in released {
-        notes.note(serde_json::json!({"event": "released", "layout": key.layout,
-            "device": key.device, "bytes": bytes}));
-    }
-}
 
 /// `machine_kernels` from the Runtime tree named by the first argument, ahead of the
 /// interpreter's own Runtime; its builders inherit that path.
@@ -4489,91 +4186,13 @@ struct Callbacks<'a> {
     completed: u64,
     /// The environment the executor runs: its App's declarations name the products it publishes.
     generation: &'a crate::catalog::Generation,
-    birth: Birth,
-    custody: Option<&'a Mutex<ResidentCustody>>,
-    /// The executor's package environment: what its holdings live for.
-    environment: &'a str,
-    /// The executor's pidfd: a reader lease ends when it does.
-    exit: File,
-    pool: &'a Pool,
-    plan: &'a str,
-    /// Its lane's first GPU.
-    start: usize,
-    degree: u32,
     /// The invoking request's spool, where its published assets' bytes are.
     spool: Option<PathBuf>,
     /// The invoking request as a caller: its child-call frames.
     caller: Option<&'a crate::calls::Caller>,
 }
 impl Services for Callbacks<'_> {
-    fn device_tier(
-        &mut self,
-        frame: &Frame,
-        fds: Vec<platform::handles::Owned>,
-    ) -> io::Result<(Answer, Vec<platform::handles::Owned>)> {
-        let mut answer = Answer::unavailable(frame.seq);
-        let Some(custody) = self.custody else {
-            return Ok((answer, Vec::new()));
-        };
-        let mut custody = custody.lock().unwrap();
-        // An ask for "*" is for the layout's latest baked variant: the executor learns which
-        // from the answer, and reads its bytes only if its own bake would be the same.
-        let variant = match frame.variant.as_str() {
-            "*" if !frame.offer => custody
-                .latest_variant(&frame.device, &frame.layout)
-                .unwrap_or_else(|| "*".into()),
-            named => named.to_string(),
-        };
-        let key = HoldingKey {
-            device: frame.device.clone(),
-            layout: frame.layout.clone(),
-            variant,
-        };
-        // This plan names this weight set: its next executor's Degree 2 fit counts it once
-        // when another tenant holds and reads it.
-        if key.variant != "*" {
-            self.pool
-                .first()
-                .learn_holding(self.plan, &holding_id(&key, 0));
-        }
-        // The reader's lease is a connection: the executor keeps one end while it maps the
-        // holding, and its close (release or death) ends the lease.
-        let (reader, lease) = Reader::lease(self.birth.clone(), self.exit.try_clone()?, self.environment)?;
-        answer.ok = true;
-        answer.code.clear();
-        answer.detail.clear();
-        answer.layout = key.layout.clone();
-        answer.variants = true;
-        if frame.offer {
-            match custody.offer(key, &frame.name, frame.regions.clone(), fds, reader) {
-                Ok(Offered::Kept { generation }) => {
-                    answer.generation = generation;
-                    answer.lease = true;
-                    return Ok((answer, vec![lease]));
-                }
-                Ok(Offered::Duplicate) => answer.duplicate = true,
-                Err(error) => {
-                    answer.ok = false;
-                    answer.code = "device_tier_refused".into();
-                    answer.detail = error.to_string();
-                }
-            }
-            return Ok((answer, Vec::new()));
-        }
-        drop(fds);
-        Ok(match custody.attach(&key, reader)? {
-            Some(mut attached) => {
-                answer.held = true;
-                answer.lease = true;
-                answer.variant = key.variant.clone();
-                answer.generation = attached.generation;
-                answer.regions = attached.regions;
-                attached.fds.push(lease);
-                (answer, attached.fds)
-            }
-            None => (answer, Vec::new()),
-        })
-    }
+
     fn progress(&mut self, frame: &Frame) {
         crate::calls::observe(self.engine, self.id, &mut self.completed, frame, self.caller);
     }
