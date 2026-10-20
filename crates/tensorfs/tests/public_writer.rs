@@ -426,6 +426,35 @@ async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_mo
         pin.get("owner").is_none(),
         "a persistent header got a disposable cache pin"
     );
+    // The content digest is an ordinary operator pin id, not a reserved namespace.
+    let operator = tensorfs::store2::Store::open(&cache).unwrap();
+    let manual = operator
+        .put_bytes(b"operator-owned unrelated content")
+        .unwrap();
+    let mut existing = operator.get_pin(&old.id().sha256).unwrap().unwrap();
+    existing.owner = Some("ordinary operator".into());
+    existing.roots.push(manual.clone());
+    operator.pin(&old.id().sha256, &existing).unwrap();
+    let another_path = scratch.0.join("another-header.cozytensors");
+    let mut identical = client
+        .writer(WriterOptions {
+            dest: Some(&another_path),
+            ..Default::default()
+        })
+        .unwrap();
+    identical
+        .component("model", "test.Model", Default::default())
+        .unwrap()
+        .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
+        .unwrap();
+    let same = identical.commit().await.unwrap();
+    assert_eq!(same.id(), old.id());
+    let preserved = operator.get_pin(&old.id().sha256).unwrap().unwrap();
+    assert_eq!(preserved.owner.as_deref(), Some("ordinary operator"));
+    assert!(preserved.roots.contains(&manual) && preserved.roots.contains(old.id()));
+    drop(identical);
+    drop(same);
+    drop(operator);
     let mut next = client
         .writer(WriterOptions {
             dest: Some(&dest),
@@ -468,6 +497,10 @@ async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_mo
         "collector positive control did not run"
     );
     assert!(cache.join(old_id.key()).exists() && cache.join(new_id.key()).exists());
+    assert!(
+        cache.join(manual.key()).exists(),
+        "durable promotion lost an unrelated operator root"
+    );
     drop(operator);
     let reopened = self::client(&cache, &scratch.0.join("endpoint"))
         .open(
@@ -1157,4 +1190,81 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
         ObjectRef::of(&fs::read(bad_repo.join("model.cozytensors")).unwrap()),
         *managed.id()
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn streaming_writer_resumes_its_keyed_journal_after_drop_then_publishes_the_complete_result()
+{
+    let scratch = Scratch::new();
+    let cache = scratch.0.join("cache");
+    let endpoint = scratch.0.join("endpoint");
+    let client = client(&cache, &endpoint);
+    let mut interrupted = client
+        .writer(WriterOptions {
+            repo_id: Some("acme/resumed"),
+            resume: Some("remote-resume"),
+            ..Default::default()
+        })
+        .unwrap();
+    interrupted
+        .component(
+            "model",
+            "test.Model",
+            serde_json::from_str(r#"{"width":4}"#).unwrap(),
+        )
+        .unwrap()
+        .put("before", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
+        .unwrap();
+    interrupted
+        .component_writer("model")
+        .unwrap()
+        .asset("tokenizer.json", ASSET)
+        .unwrap();
+    drop(interrupted);
+    assert!(cache.join("tmp/writers/remote-resume/journal").exists());
+    assert!(!endpoint
+        .join(tensorfs::format::repo_key("acme/resumed"))
+        .exists());
+    let mut resumed = client
+        .writer(WriterOptions {
+            repo_id: Some("acme/resumed"),
+            resume: Some("remote-resume"),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(resumed.has("model", "before").unwrap());
+    resumed
+        .component(
+            "model",
+            "test.Model",
+            serde_json::from_str(r#"{"width":4}"#).unwrap(),
+        )
+        .unwrap();
+    resumed
+        .component_writer("model")
+        .unwrap()
+        .put(
+            "after",
+            Dtype::U8,
+            &[4],
+            &mut std::io::Cursor::new([13, 14, 15, 16]),
+        )
+        .unwrap();
+    let checkpoint = resumed.commit().await.unwrap();
+    assert!(!cache.join("tmp/writers/remote-resume/journal").exists());
+    let reader = self::client(&scratch.0.join("reader"), &endpoint);
+    let remote = reader
+        .open(&checkpoint.tree().unwrap().id(), &Open::default())
+        .await
+        .unwrap();
+    remote.fetch(&Fetch::default()).await.unwrap();
+    drop(client);
+    drop(resumed);
+    drop(checkpoint);
+    drop(reader);
+    let model = remote.component("model").unwrap();
+    assert_eq!(model.read("before").unwrap(), WEIGHT);
+    assert_eq!(model.read("after").unwrap(), [13, 14, 15, 16]);
+    assert_eq!(model.asset("tokenizer.json").unwrap(), ASSET);
+    assert_eq!(model.config()["width"], 4);
 }
