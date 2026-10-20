@@ -295,8 +295,15 @@ impl PyPlane {
         });
         let model = native(py, || {
             let layout = varena::layout::Layout::build(&ck.spans(&regions)?, &regions)?;
-            let identity = serde_json::to_vec(&(&layout.digest, &fingerprint, core.gpu_uuid()?))
-                .map_err(|e| Error::Io(e.to_string()))?;
+            // The header identity covers dtype/encoding parameters even when their stored
+            // bytes are identical; the caller adds the transform and rank identity.
+            let identity = serde_json::to_vec(&(
+                &layout.digest,
+                &ck.id().sha256,
+                &fingerprint,
+                core.gpu_uuid()?,
+            ))
+            .map_err(|e| Error::Io(e.to_string()))?;
             let fingerprint = tensorfs::sha256::digest(&identity);
             let mut parts = Vec::new();
             for part in &layout.parts {
