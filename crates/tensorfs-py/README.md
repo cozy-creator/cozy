@@ -57,8 +57,12 @@ These are concrete cases from our format and importer work, captured by the
 | Ordinary INT8 versus ConvRot INT8 | Both can contain an INT8 matrix and row scales, but ConvRot quantized rotated weights. Multiplying by the scales alone does not reconstruct the original weight. | Distinct schemes, the Hadamard rotation and its size, and the decoding formula. |
 | NVFP4 from different producers | ComfyUI and ModelOpt can order the two 4-bit values in a byte differently and lay out block scales differently. Global scale conventions can multiply or divide. | Nibble order, scale layout and scale convention, rather than guessing from an “NVFP4” label. |
 | H3's NVFP4 AWQ text encoder | Our audit had to establish that `pre_quant_scale` multiplies each input column. Omitting it or dividing by it produces different weights. | The optional per-column factor and its exact role in decoding. |
-| ComfyUI W4A4 grouping | Our initial survey confused a kernel's tile size with the quantization grouping; the format uses per-row scales. Compute geometry does not define the stored encoding. | The scheme's actual scale granularity, independent of a particular kernel's tile size. |
+| NF4 versus FP4 | Both use 4-bit codes, but the codes index different value tables. Some files also quantize the scales themselves. | The codebook's identity, block size and whether nested scale decoding is required. |
 | GPTQ and other packed 4-bit formats | GPTQ versions differ in how zero points are stored; AWQ uses a different packed element order. The same integer dtype does not identify either rule. | The specific scheme, group size, zero-point convention and any required index/permutation arrays. |
+
+Our earlier ComfyUI W4A4 survey also confused a kernel's tile size with quantization grouping;
+the format actually used per-row scales. That was a mistake in interpreting the producer's
+format, not something a tensor's dtype or shape could correct for us.
 
 We also tested guessing NVFP4 layouts from tensor shapes or from how plausible decoded values
 looked. Neither reliably distinguished the formats. An importer must resolve the producer's
