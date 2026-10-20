@@ -4,8 +4,9 @@ Temporary review copy of the planned TensorFS 0.13 declarations. Implementation 
 separate; this is not a claim that every declaration is available on current master.
 For normal development, use the [Python usage guide](API.md).
 
-`TensorMetadata` describes the logical tensor. Physical storage descriptors are internal;
-encoded reads expose named `Array` values without chunk locations or byte offsets.
+`TensorMetadata` describes the logical tensor. Ordinary encoded reads expose named
+`Array` values without physical locations; `tensorfs.raw` provides an advanced inspection
+surface for storage integrations.
 
 The provider/DLPack protocols describe accepted inputs and are not additional package exports.
 
@@ -295,7 +296,7 @@ class Checkpoint:
     @staticmethod
     def parse(header: bytes) -> Checkpoint:
         """A `cozytensors/1` header's pipeline, components and metadata, with no store: component reads,
-        `missing`, `chunk_paths` and `Component.asset` refuse (`UnsupportedError`)."""
+        `missing` and `Component.asset` refuse (`UnsupportedError`)."""
 
     @property
     def id(self) -> str | None:
@@ -344,10 +345,6 @@ class Checkpoint:
     @property
     def chunks(self) -> list[tuple[str, int]]:
         """The header's chunk objects in order: `(sha256, length)`."""
-
-    @property
-    def chunk_paths(self) -> list[str]:
-        """Each chunk's file in the store, in header order; a parsed header raises."""
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -433,4 +430,27 @@ class Writer:
 
     def has(self, component: str, key: str) -> bool:
         ...
+```
+
+## `tensorfs.raw` — advanced physical inspection
+
+These declarations belong to `tensorfs.raw`, not the root package.
+
+```python
+from tensorfs import Checkpoint
+
+class Part:
+    @property
+    def dtype(self) -> str: ...
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+    @property
+    def chunk(self) -> int: ...
+    @property
+    def offset(self) -> int: ...
+    @property
+    def length(self) -> int: ...
+
+def parts(checkpoint: Checkpoint, component: str, key: str) -> dict[str, Part]:
+    """Inspect stored ranges without fetching bytes; plain tensors use role ''."""
 ```

@@ -195,6 +195,13 @@ on a conflict. `Endpoint::new("local", ...)` addresses local repository referenc
 `Request` contains borrowed `method`, `url`, existing `headers`, and optional body-digest
 `payload`. The public result uses the same error families as the other client operations.
 
+`DPoP` is a cloneable `TokenProvider` for callers using proof-of-possession credentials.
+`DPoP::token(key, access_token, resource, endpoint)` wraps an already issued token;
+`DPoP::grant(&config, key, JwtBearer { token_endpoint, client_id, resource, claims })`
+configures a lazy JWT-bearer exchange. The key is a private P-256 JWK. Clones share the
+same native token state. `issued_token().await` returns `Option<String>` without starting
+an exchange. These provider operations use the common `Failure` families.
+
 `ObjectRef` has `sha256: String` and `length: u64`; `of(bytes)` hashes content, `id()` returns
 `sha256:…` and `key()` gives its object-storage key. `Metadata` is `BTreeMap<String, Value>`.
 `format::Pipeline` contains `class` and JSON `config`; `format::Tensor` contains the key,

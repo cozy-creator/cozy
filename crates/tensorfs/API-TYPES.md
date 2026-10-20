@@ -153,6 +153,22 @@ pub trait TokenProvider: Send + Sync {
         -> Result<bool> { Ok(false) }
 }
 pub fn bearer(token: impl Into<String>) -> Arc<dyn TokenProvider>;
+
+pub struct JwtBearer {
+    pub token_endpoint: String,
+    pub client_id: String,
+    pub resource: String,
+    pub claims: serde_json::Map<String, serde_json::Value>,
+}
+#[derive(Clone)]
+pub struct DPoP { /* shared native token state */ }
+impl DPoP {
+    pub fn grant(config: &Config, key: &str, grant: JwtBearer) -> Result<Self>;
+    pub fn token(key: &str, access_token: &str, resource: Option<&str>,
+        endpoint: Option<&str>) -> Result<Self>;
+    pub async fn issued_token(&self) -> Option<String>;
+}
+// DPoP implements TokenProvider. key is a private P-256 JWK.
 ```
 
 ## Conversion, writers and export

@@ -96,7 +96,8 @@ key raises `KeyError`; `get` returns its default.
 
 The returned `TensorMetadata` describes the whole tensor: its logical `dtype`, `shape`
 and optional `encoding`. It contains metadata, not tensor values. Inspect its shape/dtype,
-then call `read`. Physical chunk locations and byte offsets are internal.
+then call `read`. Ordinary reads hide physical chunk locations and byte offsets;
+advanced storage integrations can inspect them through `tensorfs.raw` below.
 
 ### Read a tensor, or a component's weights
 
@@ -216,7 +217,7 @@ Additional checkpoint properties and operations:
 | `variant` | Selected repository variant, when known. A standalone header does not store this label. |
 | `pipeline`, `components` | Pipeline description and ordered component mapping. |
 | `metadata` | Loading/provenance metadata. |
-| `chunks`, `chunk_paths` | Chunk references and their local paths. |
+| `chunks` | Chunk object references in header order, as `(sha256_hex, byte_length)` pairs. |
 | `Checkpoint.parse(header_bytes)` | Inspect a binary header without a store; it does not grant access to its objects. |
 | `open_chunk(index)` | Return a new read-only OS file descriptor; the caller must close it. |
 | `close()` | Release this checkpoint handle. Existing child handles remain valid. |
@@ -225,6 +226,25 @@ Use `with tensorfs.open(...) as checkpoint:` for automatic close. `Array` implem
 `__dlpack__` and `__dlpack_device__`, including stream/device/copy negotiation. Objects
 provide normal debug representations (`repr`); an `Encoding` also has a string form.
 These representations are not serialization formats.
+
+### Advanced: inspect stored ranges
+
+Storage and memory integrations can inspect physical layout without fetching data:
+
+```python
+from tensorfs import raw
+
+layout = raw.parts(checkpoint, "unet", "conv_in.weight")
+for role, part in layout.items():
+    chunk_ref = checkpoint.chunks[part.chunk]
+    print(role, part.dtype, part.shape, chunk_ref, part.offset, part.length)
+```
+
+`raw.parts` returns `dict[str, raw.Part]`. A plain tensor has one entry with the empty
+role `""`; an encoded tensor has its named stored arrays. Each `raw.Part` reports the
+stored array's `dtype` and `shape`, a `chunk` index, and byte `offset` and `length` within
+that chunk. This call only inspects metadata. Normal model code uses `TensorMetadata`
+and `read` instead of managing these ranges.
 
 ## Python: write, convert and publish
 
