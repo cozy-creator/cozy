@@ -844,7 +844,8 @@ impl Ledger {
         }
         Ok(stalled)
     }
-    /// Measured remaining working sets are declarations, not a learned usage prediction.
+    /// Active remaining work stays conservative. An observed peak is not an idle
+    /// request's irreducible minimum: its own placement/cuts enforce actual capacity.
     pub fn fits(&self, package: &str, shape: &str) -> Result<bool> {
         self.reap_dead()?;
         let rows = self.table.rows()?;
@@ -854,6 +855,14 @@ impl Ledger {
         });
         if rows.iter().any(|r| r.state != State::Live) {
             return Ok(false);
+        }
+        for row in &rows {
+            let slot = self.table.slot(row.owner)?;
+            if slot.cache_release.load(Acquire) == row.owner.generation
+                || slot.cache_inflight.load(Acquire) == row.owner.generation
+            {
+                return Ok(false);
+            }
         }
         let running: Vec<_> = rows.iter().flat_map(|r| &r.snapshot.requests).collect();
         if running.iter().any(|r| r.remaining.is_none()) {
@@ -887,6 +896,7 @@ impl Ledger {
             .saturating_add(sum(running.iter().filter_map(|r| r.remaining)))
             .saturating_add(peak)
             <= self.capacity();
+        let mut releasing = false;
         if !fits {
             // A learned peak already includes the model's resident weights. An
             // idle graph can keep those same weights pinned, so ask its owner to
@@ -911,13 +921,17 @@ impl Ledger {
             };
             // No admission mutex is held across descriptor/claim inspection.
             for owner in release {
+                releasing = true;
                 match self.release_idle_caches(owner) {
                     Ok(()) | Err(Error::Closed(_)) => {}
                     Err(error) => return Err(error),
                 }
             }
         }
-        Ok(fits)
+        // Let an otherwise idle executor adapt after its discretionary caches
+        // acknowledged the attempt, even if they could free nothing. Never turn
+        // that historical peak into a hard minimum or erase actual context/pins.
+        Ok(fits || (running.is_empty() && !releasing))
     }
     pub fn record_peak(&self, package: &str, shape: &str, bytes: u64) -> Result<()> {
         let key = words(&format!("{package}|{shape}"))?;
@@ -2912,7 +2926,7 @@ mod admission_tests {
             ),
             (0, 0)
         );
-        assert!(!fixture.ledger.fits("package", "shape").unwrap());
+        assert!(fixture.ledger.fits("package", "shape").unwrap());
         assert_eq!(
             slot.bell.load(Acquire),
             bell,
@@ -2921,6 +2935,45 @@ mod admission_tests {
         snapshot.classes[Class::Pinned.as_usize()] = 0;
         snapshot.classes[Class::Unused.as_usize()] = 600;
         row.publish(&snapshot, 8).unwrap();
+        assert!(fixture.ledger.fits("package", "shape").unwrap());
+    }
+
+    #[test]
+    fn an_idle_adaptive_request_can_try_after_noop_cache_release_despite_its_observed_peak() {
+        let name = format!("idle-admission-{}", uuid::Uuid::new_v4());
+        let fixture = Fixture { ledger: Ledger::create(&name, 25_153_044_480).unwrap(), name };
+        let row = fixture.ledger.claim(std::process::id()).unwrap();
+        let mut snapshot = Snapshot { context: 331_350_016, ..Default::default() };
+        snapshot.classes[Class::Pinned.as_usize()] = 100_949_504;
+        fixture.ledger.record_peak("h3", "shape", 24_777_107_456).unwrap();
+        row.publish(&snapshot, 10998).unwrap();
+        assert!(!fixture.ledger.fits("h3", "shape").unwrap());
+        let release = row.cache_release().unwrap().expect("idle cache release requested");
+        assert!(!fixture.ledger.fits("h3", "shape").unwrap(), "in-flight cleanup is not quiescence");
+        drop(release); // A real no-op acknowledgement: context and pins stay exactly as published.
+        assert!(fixture.ledger.fits("h3", "shape").unwrap(), "observed peak permanently blocked an idle adaptive call");
+        assert_eq!(fixture.ledger.table.rows().unwrap()[0].snapshot, snapshot);
+        assert_eq!(fixture.ledger.capacity(), 25_153_044_480);
+        assert_eq!(fixture.ledger.measured("h3", "shape"), Some(24_777_107_456));
+        snapshot.requests = vec![Running { id: 2, remaining: Some(1) }];
+        row.publish(&snapshot, 10999).unwrap();
+        assert!(!fixture.ledger.fits("h3", "shape").unwrap(), "running work lost conservative admission");
+        snapshot.requests[0].remaining = None;
+        row.publish(&snapshot, 11000).unwrap();
+        assert!(!fixture.ledger.fits("h3", "shape").unwrap(), "unknown running work was admitted beside");
+    }
+
+    #[test]
+    fn admission_waits_for_cache_ack_even_if_the_published_bytes_already_fit() {
+        let fixture = Fixture::new();
+        let row = fixture.ledger.claim(std::process::id()).unwrap();
+        row.publish(&Snapshot::default(), 1).unwrap();
+        fixture.ledger.record_peak("package", "shape", 1).unwrap();
+        fixture.ledger.release_idle_caches(row.owner()).unwrap();
+        assert!(!fixture.ledger.fits("package", "shape").unwrap());
+        let release = row.cache_release().unwrap().unwrap();
+        assert!(!fixture.ledger.fits("package", "shape").unwrap());
+        drop(release);
         assert!(fixture.ledger.fits("package", "shape").unwrap());
     }
 

@@ -4365,4 +4365,82 @@ mod gpu_tests {
         placement.close().unwrap();
         println!("PASS controlled lower preserves fitting home, pins and bounded physical reclaim {uuid}");
     }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn idle_observed_peak_allows_adaptive_warm_use_without_dropping_live_pins() {
+        const MIB: u64 = 1 << 20;
+        let probe = Gpu::open(0).expect("real CUDA device");
+        let uuid = assigned_gpu(&probe);
+        assert!(probe.capacity().unwrap() >= 32 * MIB);
+        drop(probe);
+        let name = format!("idle-observed-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        struct Named(String);
+        impl Drop for Named {
+            fn drop(&mut self) {
+                let uid = unsafe { libc::geteuid() };
+                let _ = std::fs::remove_file(format!("/dev/shm/varena-{}-{uid}", self.0));
+            }
+        }
+        let _named = Named(name.clone());
+        let ledger = Ledger::create(&name, 32 * MIB).unwrap();
+        let grant = ledger.grant_unbound().unwrap();
+        let placement = Placement::open(0, Some((grant.table, grant.events, grant.channel))).unwrap();
+        let weight = 20 * MIB;
+        let layout = Layout {
+            parts: vec![],
+            regions: vec![crate::layout::Region {
+                offset: 0, nbytes: weight, span: weight,
+                items: vec![Item { offset: 0, len: weight, part_end: true,
+                    source: ItemSource::Inline(vec![7; weight as usize].into()) }],
+            }],
+            nbytes: weight, digest: "idle-observed-peak".into(), names: vec![],
+        };
+        let pages = placement.register(1, "idle-observed".into(), [61; 32], &layout,
+            Arc::new(Source::files(vec![], false, 0)), None).unwrap();
+        let context = tensorfs::io::DeviceBuffer::new(0, (4 * MIB) as usize).unwrap();
+        placement.allocator(4 * MIB, 0, 0).unwrap();
+        placement.begin(1, vec![vec![1]], "idle-observed".into(), "shape".into()).unwrap();
+        let retained = placement.bind(1, pages[0], 0).unwrap();
+        let scratch = tensorfs::io::DeviceBuffer::new(0, (8 * MIB) as usize).unwrap();
+        placement.allocator(4 * MIB, 8 * MIB, 8 * MIB).unwrap();
+        placement.leave(1, 8 * MIB).unwrap();
+        drop(scratch);
+        placement.allocator(4 * MIB, 0, 0).unwrap();
+        placement.end(1).unwrap();
+        assert_eq!(ledger.measured("idle-observed", "shape"), Some(28 * MIB));
+        assert_eq!(placement.allocator_budget().unwrap(), 8 * MIB);
+        assert!(!ledger.fits("idle-observed", "shape").unwrap(), "idle cache acknowledgement must come first");
+        observe(&ledger, "no-op idle acknowledgement never admitted adaptive warm use",
+            || ledger.fits("idle-observed", "shape").unwrap());
+        let idle = ledger.status().unwrap();
+        assert_eq!(idle.capacity, 32 * MIB);
+        assert_eq!(idle.rows[0].snapshot.classes[Class::Pinned.as_usize()], weight,
+            "admission silently discarded a live pin");
+        assert_eq!(placement.allocator_budget().unwrap(), 8 * MIB, "admission inflated actual available bytes");
+        placement.begin(2, vec![vec![1]], "idle-observed".into(), "shape".into()).unwrap();
+        let warm = placement.bind(2, pages[0], 0).unwrap();
+        let scratch = tensorfs::io::DeviceBuffer::new(0, (8 * MIB) as usize).unwrap();
+        placement.allocator(4 * MIB, 8 * MIB, 8 * MIB).unwrap();
+        let mut bytes = [0_u8; 32];
+        // Both live pins own the mapping throughout this checked real D2H read.
+        unsafe {
+            tensorfs::io::read(&[tensorfs::io::Copy {
+                src: tensorfs::io::Src::Device { device: 0, ptr: warm.ptr, stream: 0 },
+                dst: tensorfs::io::Dst::host(&mut bytes),
+            }], &tensorfs::io::ReadOpts::default())
+        }.expect("unchanged pinned CUDA content");
+        assert_eq!(bytes, [7; 32]);
+        drop(warm);
+        placement.leave(2, 8 * MIB).unwrap();
+        let stats = placement.end(2).unwrap();
+        assert!(stats.copies.is_empty(), "warm use unnecessarily refilled held weight bytes");
+        drop((scratch, retained));
+        placement.gpu.wait_pending().unwrap();
+        drop(context);
+        placement.allocator(0, 0, 0).unwrap();
+        placement.close().unwrap();
+        println!("PASS idle observed peak admits adaptive warm use without dropping pins {uuid}");
+    }
 }
