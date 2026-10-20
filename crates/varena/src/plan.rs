@@ -1202,6 +1202,74 @@ fn load(table: &Table, row: RowId, model: ModelId, level: Tier) -> Vec<Action> {
     plan.actions
 }
 
+fn speculate(table: &Table, id: RequestId) -> Vec<Action> {
+    let Some(request) = table.request(id) else {
+        return vec![Action::Invalid("unknown request")];
+    };
+    if request.starved {
+        return Vec::new();
+    }
+    let Some(reserve) = table.protected_room() else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<_> = table
+        .pages
+        .iter()
+        .filter_map(|page| {
+            if page.row != request.row
+                || page.mapped()
+                || page.filling
+                || page.kind != Kind::Weight
+                || page.attempted.contains(&request.step())
+                || page.lowered.contains(&id)
+                || table.class(page) == Class::Working
+            {
+                return None;
+            }
+            let usage = page
+                .uses
+                .iter()
+                .filter(|usage| usage.request == id && usage.position.step > request.position.step)
+                .map(|usage| usage.position)
+                .min()?;
+            Some((usage, page))
+        })
+        .collect();
+    candidates.sort_by_key(|(usage, page)| (*usage, page.id));
+    let mut plan = Planner::new(table);
+    let mut own_bytes = table
+        .pages
+        .iter()
+        .filter(|page| page.row == request.row && page.mapped())
+        .fold(0_u64, |sum, page| sum.saturating_add(page.bytes));
+    for (_, page) in candidates {
+        let Some(need) = reserve.checked_add(page.bytes) else {
+            break;
+        };
+        let mut trial = plan.clone();
+        trial.take(need, |victim, class| {
+            class == Class::Orphan
+                || (victim.row == request.row && matches!(class, Class::Free | Class::Unused))
+        });
+        let removed = table
+            .pages
+            .iter()
+            .filter(|item| item.row == request.row && trial.removed.contains(&item.id))
+            .fold(0_u64, |sum, item| sum.saturating_add(item.bytes));
+        if trial.free < need
+            || request.sharing_limit.is_some_and(|limit| {
+                own_bytes.saturating_sub(removed).saturating_add(page.bytes) > limit
+            })
+        {
+            break;
+        }
+        plan = trial;
+        plan.fill(page, Some(request.step()));
+        own_bytes = own_bytes.saturating_add(page.bytes);
+    }
+    plan.actions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1553,72 +1621,4 @@ mod tests {
             "joint groups refill only on actual demand"
         );
     }
-}
-
-fn speculate(table: &Table, id: RequestId) -> Vec<Action> {
-    let Some(request) = table.request(id) else {
-        return vec![Action::Invalid("unknown request")];
-    };
-    if request.starved {
-        return Vec::new();
-    }
-    let Some(reserve) = table.protected_room() else {
-        return Vec::new();
-    };
-    let mut candidates: Vec<_> = table
-        .pages
-        .iter()
-        .filter_map(|page| {
-            if page.row != request.row
-                || page.mapped()
-                || page.filling
-                || page.kind != Kind::Weight
-                || page.attempted.contains(&request.step())
-                || page.lowered.contains(&id)
-                || table.class(page) == Class::Working
-            {
-                return None;
-            }
-            let usage = page
-                .uses
-                .iter()
-                .filter(|usage| usage.request == id && usage.position.step > request.position.step)
-                .map(|usage| usage.position)
-                .min()?;
-            Some((usage, page))
-        })
-        .collect();
-    candidates.sort_by_key(|(usage, page)| (*usage, page.id));
-    let mut plan = Planner::new(table);
-    let mut own_bytes = table
-        .pages
-        .iter()
-        .filter(|page| page.row == request.row && page.mapped())
-        .fold(0_u64, |sum, page| sum.saturating_add(page.bytes));
-    for (_, page) in candidates {
-        let Some(need) = reserve.checked_add(page.bytes) else {
-            break;
-        };
-        let mut trial = plan.clone();
-        trial.take(need, |victim, class| {
-            class == Class::Orphan
-                || (victim.row == request.row && matches!(class, Class::Free | Class::Unused))
-        });
-        let removed = table
-            .pages
-            .iter()
-            .filter(|item| item.row == request.row && trial.removed.contains(&item.id))
-            .fold(0_u64, |sum, item| sum.saturating_add(item.bytes));
-        if trial.free < need
-            || request.sharing_limit.is_some_and(|limit| {
-                own_bytes.saturating_sub(removed).saturating_add(page.bytes) > limit
-            })
-        {
-            break;
-        }
-        plan = trial;
-        plan.fill(page, Some(request.step()));
-        own_bytes = own_bytes.saturating_add(page.bytes);
-    }
-    plan.actions
 }
