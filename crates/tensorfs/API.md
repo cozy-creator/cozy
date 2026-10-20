@@ -55,7 +55,7 @@ must outlive the parent checkpoint; owned child handles retain their source and 
 
 ```rust
 use std::path::Path;
-use tensorfs::{Dtype, WriterOptions};
+use tensorfs::{format::Dtype, WriterOptions};
 
 let mut writer = client.writer(WriterOptions {
     dest: Some(Path::new("./model.cozytensors")),
@@ -80,6 +80,7 @@ chunks; ordinary file saving does not.
 Leave `variant` unset for a file destination. Variant labels belong to repository trees;
 setting both `dest` and `variant` is invalid. With no destination, the writer retains the
 checkpoint in the shared store and may assign a repository variant.
+A file destination also cannot be combined with `repo_id`.
 
 A standalone header identifies one checkpoint. It does not contain its enclosing tree,
 release label, README or LICENSE. Moving or copying it preserves that checkpoint identity;
@@ -126,10 +127,14 @@ All operations involving network/source resolution above are async except constr
 `Result<PathBuf>`; choose `Format::Safetensors` or `Format::Cozytensors`. It first makes
 the required checkpoint data and known repository files available, then writes the folder.
 Missing or denied source objects fail the operation.
+`Format::Cozytensors` requires `None` for `dequantize`; `Format::Safetensors` accepts
+`Some(Dtype::F32)`, `Some(Dtype::BF16)` or `Some(Dtype::F16)`, or `None`.
+Other combinations return `Invalid` before source preparation.
 
 A `Writer` also has `pipeline(class, config)`, `component(name, class, config)`,
-`set_metadata(key, Value)`, `has(component, key)`, `committed()` and `abandon(self)`. Its
-`ComponentWriter` supports `put(key, Dtype, shape, &mut Read)`,
+`component_writer(name)`, `set_metadata(key, Value)`, `has(component, key)`, `committed()`
+and `abandon(self)`. `component_writer` reopens a declared component without changing
+its class or configuration. `ComponentWriter` supports `put(key, Dtype, shape, &mut Read)`,
 `copy(key, &Component, as_key)`,
 `asset(name, bytes)`, `order(keys)` and `has(key)`. These operations return `Result`, except
 `committed`, which returns `Option<Checkpoint>`.
@@ -154,9 +159,11 @@ below; normal model consumers do not need it.
 | `Format` | `Safetensors` or native portable `Cozytensors` export. |
 
 `Progress` is a borrowed `Fn(u64, u64) -> Result<()> + Sync` (held bytes, total bytes).
-`ConvertProgress` additionally receives a stage string. Returning an error cancels the
-operation. Configured providers supply ordinary credentials; construction does not create
-a separate worker-permission mechanism.
+`ConvertProgress` additionally receives a stage string. A callback can stop remaining work
+by returning an error. The final `upload_folder` progress callback runs after publication:
+its error is returned to the caller but does not undo the repository update. Configured
+providers supply ordinary credentials; construction does not create a separate
+worker-permission mechanism.
 
 ### Checkpoint and component handles
 
@@ -166,6 +173,7 @@ a separate worker-permission mechanism.
 | `header()` | `&format::Header`. |
 | `metadata()` | `&Metadata`. |
 | `chunks()` | `&[ObjectRef]`. |
+| `variant()` | `Option<&str>` for the selected variant. |
 | `tree()` | `Option<&ObjectRef>`. |
 | `named()` | `Option<&Ref>`. |
 | `pipeline()` | `Option<&format::Pipeline>`. |

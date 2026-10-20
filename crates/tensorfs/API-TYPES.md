@@ -90,6 +90,7 @@ impl Client {
     ) -> Result<PathBuf>;
     pub async fn upload_folder(&self, reference: &Ref, folder: &Path,
         progress: Option<&Progress<'_>>) -> Result<ObjectRef>;
+    // The final progress callback runs after publication; its error cannot undo that update.
 }
 // Python components= maps to Selection::Components. Asset selection does not fetch tensor chunks.
 
@@ -100,6 +101,7 @@ impl Checkpoint {
     pub fn header(&self) -> &format::Header;
     pub fn metadata(&self) -> &Metadata;
     pub fn chunks(&self) -> &[ObjectRef];
+    pub fn variant(&self) -> Option<&str>;
     pub fn tree(&self) -> Option<&ObjectRef>;
     pub fn verify(&self, selection: &Selection) -> Result<VerificationReport>;
     pub fn view(&self) -> io::view::View;
@@ -110,6 +112,8 @@ impl Checkpoint {
     pub fn chunk(&self, index: usize) -> Result<File>;
     pub fn missing(&self, selection: &Selection) -> Result<Vec<ObjectRef>>;
     pub async fn download(&self, want: &Download<'_>) -> Result<Fetched>;
+    // Cozytensors requires None; Safetensors accepts F32/BF16/F16 when Some.
+    // Other dequantize arguments return Invalid before source preparation.
     pub async fn materialize(&self, dir: &Path, format: Format,
         dequantize: Option<Dtype>) -> Result<PathBuf>;
 }
@@ -200,7 +204,7 @@ impl Client {
 #[derive(Default)]
 pub struct WriterOptions<'a> {
     // Exact header-file path, or None for a checkpoint in the shared store.
-    // A file destination and a repository variant label cannot be combined.
+    // A file destination cannot be combined with variant or repo_id.
     pub dest: Option<&'a Path>, pub variant: Option<&'a str>,
     pub base: Option<&'a Checkpoint>, pub resume: Option<&'a str>,
     pub repo_id: Option<&'a str>, pub endpoint: Option<&'a str>,
@@ -211,6 +215,8 @@ impl Writer {
     pub fn pipeline(&mut self, class: &str, config: format::Config) -> Result<()>;
     pub fn component(&mut self, name: &str, class: &str,
         config: format::Config) -> Result<ComponentWriter<'_>>;
+    // Reopen a declared component without changing its class or config.
+    pub fn component_writer(&mut self, name: &str) -> Result<ComponentWriter<'_>>;
     pub fn set_metadata(&mut self, key: &str, value: Value) -> Result<()>;
     pub fn has(&self, component: &str, key: &str) -> Result<bool>;
     pub async fn commit(&mut self) -> Result<Checkpoint>;
