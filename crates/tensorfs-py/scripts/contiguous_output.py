@@ -290,23 +290,27 @@ def add_cuda(memory, device, side, total):
         for at in range(32):
             piece = torch.linspace(-7 + at / 32, 7 - at / 32, 128 * 2048,
                                    device=device).reshape(1, 1, 128, 2048)
+            peer = torch.cos(piece)
             left_host.write_band(piece, 1, at)
-            right_host.write_band(piece, 1, at)
-            del piece
-        versions = left._version, right._version
+            right_host.write_band(peer, 1, at)
+            del piece, peer
         with cuts.caught():
             result = op(left, right, alpha=-0.5)
     side.synchronize()
     assert result.shape == left.shape and result.dtype == left.dtype and result.is_contiguous()
     assert result.data_ptr() not in (left.data_ptr(), right.data_ptr())
-    assert (left._version, right._version) == versions
     assert len(authority.outputs) == 1
     writes = authority.outputs[0].writes
     assert len(writes) > 1 and max(row[3] for row in writes) <= 4 << 20
     for at in range(32):
-        expected = op(left.narrow(1, at, 1), right.narrow(1, at, 1), alpha=-0.5)
+        expected_left = torch.linspace(-7 + at / 32, 7 - at / 32, 128 * 2048,
+                                       device=device).reshape(1, 1, 128, 2048)
+        expected_right = torch.cos(expected_left)
+        assert torch.equal(left.narrow(1, at, 1), expected_left), "add mutated its left input"
+        assert torch.equal(right.narrow(1, at, 1), expected_right), "add mutated its right input"
+        expected = op(expected_left, expected_right, alpha=-0.5)
         assert torch.equal(result.narrow(1, at, 1), expected)
-        del expected
+        del expected, expected_left, expected_right
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=side):
         assert cuts._add(op, (left, right), {}) is None, "capture cannot allocate a mapped result"
