@@ -1930,12 +1930,10 @@ fn serve(
                     let container = platform::handles::recv_fd(&stream)
                         .map_err(crate::os("receive kept container"))?;
                     let mut held = custody.lock();
-                    let replace = held.pages.get(&key).is_none_or(|p| {
-                        !queued(p)
-                            || p.owner == Some(owner)
-                            || p.owner
-                                .is_none_or(|o| !table.alive(o.row as usize).unwrap_or(true))
-                    });
+                    let replace = held
+                        .pages
+                        .get(&key)
+                        .is_none_or(|p| !queued(p) || p.owner == Some(owner) || orphan(&table, p));
                     if replace {
                         held.pages.insert(
                             key,
@@ -1952,10 +1950,7 @@ fn serve(
                 }
                 Some(2) => {
                     let mut held = custody.lock();
-                    let available = held.pages.get(&key).is_some_and(|p| {
-                        p.owner
-                            .is_none_or(|o| !table.alive(o.row as usize).unwrap_or(true))
-                    });
+                    let available = held.pages.get(&key).is_some_and(|p| orphan(&table, p));
                     let page = if available {
                         held.pages.remove(&key)
                     } else {
