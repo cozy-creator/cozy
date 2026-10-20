@@ -3549,6 +3549,53 @@ mod gpu_tests {
         println!("PASS idle worker retires after pending consumer {uuid}");
     }
 
+    fn controlled_lower_layout() -> Layout {
+        const MIB: u64 = 1 << 20;
+        Layout {
+            parts: vec![],
+            regions: (0..6)
+                .map(|index| crate::layout::Region {
+                    offset: index * 4 * MIB,
+                    nbytes: 4 * MIB,
+                    span: 4 * MIB,
+                    items: vec![Item {
+                        offset: index * 4 * MIB,
+                        len: 4 * MIB,
+                        part_end: true,
+                        source: ItemSource::Inline(vec![7; (4 * MIB) as usize].into()),
+                    }],
+                })
+                .collect(),
+            nbytes: 24 * MIB,
+            digest: "controlled-lower".into(),
+            names: vec![],
+        }
+    }
+
+    #[test]
+    fn controlled_lower_source_plan_reads_all_six_host_regions() {
+        use tensorfs::io::source::{IoTally, Mode};
+        let layout = controlled_lower_layout();
+        let source = Source::files(vec![], false, 0);
+        let tally = IoTally::default();
+        for region in &layout.regions {
+            let mut bytes = vec![0_u8; region.nbytes as usize];
+            unsafe {
+                source.read_items(
+                    &region.items,
+                    region.offset,
+                    tensorfs::io::Dst::host(&mut bytes),
+                    1,
+                    Mode::Buffered,
+                    &tally,
+                )
+            }
+            .expect("controlled lower region has a valid source/destination plan");
+            assert!(bytes.iter().all(|byte| *byte == 7));
+        }
+        assert_eq!(tally.inline_bytes.load(Ordering::Relaxed), layout.nbytes);
+    }
+
     #[test]
     #[ignore = "requires an owned rental; never run on the local GPU"]
     fn lower_relief_keeps_fitting_home_and_requires_real_reclaim() {
@@ -3579,25 +3626,7 @@ mod gpu_tests {
         let grant = ledger.grant_unbound().expect("rank grant");
         let placement = Placement::open(0, Some((grant.table, grant.events, grant.channel)))
             .expect("actual CUDA placement");
-        let layout = Layout {
-            parts: vec![],
-            regions: (0..6)
-                .map(|index| crate::layout::Region {
-                    offset: index * 4 * MIB,
-                    nbytes: 4 * MIB,
-                    span: 4 * MIB,
-                    items: vec![Item {
-                        offset: 0,
-                        len: 4 * MIB,
-                        part_end: true,
-                        source: ItemSource::Inline(vec![7; (4 * MIB) as usize].into()),
-                    }],
-                })
-                .collect(),
-            nbytes: 24 * MIB,
-            digest: "controlled-lower".into(),
-            names: vec![],
-        };
+        let layout = controlled_lower_layout();
         let pages = placement
             .register(
                 1,
