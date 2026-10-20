@@ -97,8 +97,12 @@ async fn blocking<T: Send + 'static>(
 }
 
 impl Client {
-    fn import_access(&self, sources: &[String], control: &Control) -> Access {
-        Access {
+    fn import_access(&self, sources: &[String], control: &Control) -> Result<Access> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| Failure {
+            kind: Kind::Unsupported,
+            detail: "conversion needs the caller's active Tokio runtime".into(),
+        })?;
+        Ok(Access {
             // A supplied loopback source is the existing explicit local-source carve-out.
             allow_local: sources
                 .iter()
@@ -106,19 +110,19 @@ impl Client {
             token: self.config.token.clone().map(|p| {
                 Arc::new(provider::NativeProvider(p)) as Arc<dyn crate::fetch::TokenProvider>
             }),
-            runtime: Some(tokio::runtime::Handle::current()),
+            runtime: Some(runtime),
             cancelled: Some(control.cancelled.clone()),
             cancel_notify: Some(control.notify.clone()),
             ca_der: self.config.ca_der.clone(),
             ..crate::client::access()
-        }
+        })
     }
 
     /// Resolve metadata only through the existing source parser and importer transport.
     pub async fn resolve_source(&self, source: &str) -> Result<String> {
         let control = Arc::new(Control::default());
         let sources = vec![source.to_owned()];
-        let access = self.import_access(&sources, &control);
+        let access = self.import_access(&sources, &control)?;
         let source = sources.into_iter().next().expect("one source");
         blocking(control, None, move |_events| {
             let spec = import::remote::parse(&source).map_err(provider::from_native)?;
@@ -137,7 +141,7 @@ impl Client {
             return fail(Kind::Invalid, "convert needs a source");
         }
         let control = Arc::new(Control::default());
-        let access = self.import_access(sources, &control);
+        let access = self.import_access(sources, &control)?;
         let (sources, store) = (sources.to_owned(), self.store.clone());
         let converter = options.converter.map(str::to_owned);
         let variant = options.variant.map(str::to_owned);

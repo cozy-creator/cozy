@@ -1268,3 +1268,25 @@ async fn streaming_writer_resumes_its_keyed_journal_after_drop_then_publishes_th
     assert_eq!(model.asset("tokenizer.json").unwrap(), ASSET);
     assert_eq!(model.config()["width"], 4);
 }
+
+#[test]
+fn public_conversion_without_a_tokio_caller_refuses_instead_of_starting_a_runtime_or_panicking() {
+    let scratch = Scratch::new();
+    let source = conversion_source(&scratch.0);
+    let cache = scratch.0.join("cache");
+    let client = client(&cache, &scratch.0.join("endpoint"));
+    let sources = [source.to_str().unwrap().to_owned()];
+    assert_eq!(
+        futures::executor::block_on(client.convert(&sources, &tensorfs::Convert::default()))
+            .unwrap_err()
+            .kind,
+        Kind::Unsupported
+    );
+    assert_eq!(
+        futures::executor::block_on(client.resolve_source(&sources[0]))
+            .unwrap_err()
+            .kind,
+        Kind::Unsupported
+    );
+    assert!(actual_headers(&cache.join("blobs")).is_empty());
+}
