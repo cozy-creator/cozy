@@ -294,14 +294,13 @@ impl Table {
                 let context = data.get(CLASSES).copied().unwrap_or(0);
                 let count = data.get(CLASSES + 1).copied().unwrap_or(0) as usize;
                 let requests = data
+                    .get(CLASSES + 2..)
+                    .unwrap_or(&[])
+                    .as_chunks::<2>()
+                    .0
                     .iter()
-                    .skip(CLASSES + 2)
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .chunks_exact(2)
                     .take(count.min(RUNNING))
-                    .filter_map(|r| r.first().zip(r.get(1)))
-                    .map(|(id, bytes)| Running {
+                    .map(|[id, bytes]| Running {
                         id: *id,
                         remaining: (*bytes != u64::MAX).then_some(*bytes),
                     })
@@ -871,18 +870,15 @@ impl Row {
         if let Some(dst) = data.get_mut(CLASSES + 1) {
             *dst = snapshot.requests.len() as u64;
         }
-        for (pair, request) in data
-            .iter_mut()
-            .skip(CLASSES + 2)
-            .collect::<Vec<_>>()
-            .chunks_mut(2)
-            .zip(&snapshot.requests)
-        {
-            if let Some(id) = pair.first_mut() {
-                **id = request.id;
-            }
-            if let Some(left) = pair.get_mut(1) {
-                **left = request.remaining.unwrap_or(u64::MAX);
+        if let Some(requests) = data.get_mut(CLASSES + 2..) {
+            for ([id, left], request) in requests
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(&snapshot.requests)
+            {
+                *id = request.id;
+                *left = request.remaining.unwrap_or(u64::MAX);
             }
         }
         let seq = slot.seq.load(Relaxed);
