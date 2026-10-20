@@ -752,9 +752,11 @@ class Memory:
         home if it fits beside its reserve and the idle bytes and cold weights worth less, else a
         spread set; one run once takes only free room. Unmeasured, a repeating model stays at
         home and one run once keeps only what is resident. Within a request it never rises.
-        Planning never cuts: cuts in force relax (`cuts.coarser`) whenever the peak the relaxed
-        pass needs (its peak measured uncut, else twice the cut one) still leaves the model two
-        streaming slots, or is no higher than the cut one. Measured, the pass's working set gets its room before it runs, not from its OOM."""
+        Planning cuts only FFN tokens, to the fewest pieces that make a repeating model wholly
+        resident (`cuts.planned`); else it streams. Other cuts in force relax (`cuts.coarser`)
+        whenever the peak the relaxed pass needs (its peak measured uncut, else twice the cut
+        one) still leaves the model two streaming slots, and any cut whose peak is no lower
+        than whole goes. Measured, a pass's working set gets its room before it runs."""
         repeating = model.repeats >= 2
         if not model.blocks or (model.reserve < 0 and repeating):
             return
@@ -769,12 +771,20 @@ class Memory:
                 cold = (m for m in self.models.values() if self._victim(m))
                 room += sum(_set(m)[0] for m in cold if self._keep(m) < keep) + self._others()
             sizes = _sizes(model)
-            need = cuts.relaxing(model.track.shape, model.reserve)  # a cut no lower goes
-            if need is not None and (need <= model.reserve or room - need >= 2 * max(sizes)):
-                cuts.coarser(model.track.shape)  # type: ignore[arg-type]
+            shape, whole = model.track.shape, sum(sizes)
+            need = cuts.relaxing(shape, model.reserve)  # a cut no lower than whole goes for good
+            # an FFN cut that is what keeps the model wholly resident stays
+            held = need is not None and cuts.ffn_only(shape) and room - need < whole
+            held = held and room - model.reserve >= whole
+            loose = not held and room - need >= 2 * max(sizes) if need is not None else False
+            if need is not None and (need <= model.reserve or loose):
+                shape.whole_only |= need <= model.reserve  # type: ignore[union-attr]
+                cuts.coarser(shape)  # type: ignore[arg-type]
                 model.reserve = need
             room -= model.reserve
-            fits = sum(sizes) <= room
+            fits = whole <= room
+            if not fits and repeating and cuts.planned(shape, whole - room):
+                model.reserve, fits = model.reserve - (whole - room), True
             want = set(model.order if fits else _spread(model.order, sizes, room - 2 * max(sizes)))
         if self.active:
             want &= model.home

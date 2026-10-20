@@ -97,11 +97,15 @@ class Shape:
     shape: str
     peak: int = -1
     whole: int = -1
+    #: a cut that measured no lower than whole: planning never cuts this shape again
+    whole_only: bool = False
     cuts: dict[str, int] = field(default_factory=dict)
     #: the cuts its passes ran: key -> (total, finest, shrink), what `coarser` relaxes
     scopes: dict[tuple[object, ...], tuple[int, int, Callable[[int], int]]] = field(
         default_factory=dict
     )
+    #: an FFN cut's bytes per token no longer live at once when it runs in pieces (`planned`)
+    units: dict[tuple[object, ...], int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +197,14 @@ def peaked(track: Track, nbytes: int) -> None:
 def _cut(shape: Shape) -> bool:
     memo = _served.memo
     return any(memo.sizes.get(k, t) < t for k, (t, _, _) in shape.scopes.items())
+
+
+def ffn_only(shape: Shape | None) -> bool:
+    """Every cut of `shape` in force is an FFN's (planning's own kind)."""
+    memo = _served.memo
+    scopes = shape.scopes.items() if shape is not None else ()
+    cut = [k for k, (t, _, _) in scopes if memo.sizes.get(k, t) < t]
+    return bool(cut) and all(k[0] == "ffn" for k in cut)
 
 
 def _note(name: str, size: int) -> None:
@@ -300,6 +312,25 @@ def _settle[T](
         memo.sizes[key] = size
         _note(name, size)
     return size, out
+
+
+def planned(shape: Shape | None, short: int) -> bool:
+    """Planning's one cut: FFN tokens, never attention. The widest FFN scope of `shape` (the
+    outermost: its bytes per token over its tokens) that can cover `short` bytes goes to the
+    fewest pieces whose saving (those bytes over the tokens no longer live at once) does;
+    False, cutting nothing, when none can or the shape measured a cut no lower than whole."""
+    if shape is None or shape.whole_only:
+        return False
+    memo = _served.memo
+    for key in sorted(shape.units, key=lambda k: -shape.units[k] * shape.scopes[k][0]):
+        unit, (total, finest, _) = shape.units[key], shape.scopes[key]
+        size, pieces = min(memo.sizes.get(key, total), total), 2
+        while (piece := -(-total // pieces)) > finest and unit * (size - piece) < short:
+            pieces *= 2
+        if piece < size and unit * (size - piece) >= short:
+            memo.sizes[key] = piece
+            return True
+    return False
 
 
 def relaxing(shape: Shape | None, peak: int) -> int | None:
@@ -901,6 +932,9 @@ def _ffn(kind: str, width: int, forward: Callable[..., object]) -> Callable[...,
         if tokens < 2 or key in _served.memo.whole:
             return forward(x)
         per_token, device = max(width, x.shape[-1]) * x.element_size(), x.device
+        site = _local.site
+        if site is not None and site.track.shape is not None:
+            site.track.shape.units[key] = per_token
 
         def shrink(size: int) -> int:  # half, or the tokens the room holds; the memo keeps it,
             return min(size // 2, _served.rungs.available(device) // per_token or size)  # not x
