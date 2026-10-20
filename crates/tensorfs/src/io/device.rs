@@ -265,6 +265,7 @@ pub(super) fn drain(device: i32) -> cuda::Result<()> {
     }
 }
 
+#[cfg(feature = "store")]
 pub(super) fn retain_decode(stream: Option<cuda::Stream>, buffers: Vec<DeviceBuffer>) {
     let engine = buffers
         .first()
