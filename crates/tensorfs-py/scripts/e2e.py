@@ -41,6 +41,7 @@ SOURCES = [
 ]
 OTHER_WEIGHTS = (".bin", ".onnx", ".msgpack", ".h5")
 NAME = "local/tiny-sdxl"
+REMOTE_NAME = "conformance/tiny-sdxl"
 TFS = str(pathlib.Path(sys.executable).with_name("tfs"))
 DTYPES = {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16, "I64": torch.int64}
 
@@ -123,7 +124,7 @@ def tree(folder: pathlib.Path) -> dict[str, bytes]:
 
 def corrupt_and_refetch(store: pathlib.Path, origin: str) -> None:
     # Pick a declared chunk, not a repository object outside checkpoint.verify's scope.
-    with tfs.open(NAME, revision="1", cache_dir=store, endpoint=origin) as checkpoint:
+    with tfs.open(REMOTE_NAME, revision="1", cache_dir=store, endpoint=origin) as checkpoint:
         digest, length = max(checkpoint.chunks, key=lambda obj: obj[1])
     victim = store / "blobs" / digest[:2] / digest[2:4] / digest
     data = bytearray(victim.read_bytes())
@@ -131,17 +132,17 @@ def corrupt_and_refetch(store: pathlib.Path, origin: str) -> None:
     data[len(data) // 2] ^= 0xFF
     victim.unlink()
     victim.write_bytes(data)
-    verified = cli(store, "--endpoint", origin, "verify", f"{NAME}@1", ok=False)
+    verified = cli(store, "--endpoint", origin, "verify", f"{REMOTE_NAME}@1", ok=False)
     assert verified["error"]["code"] == "integrity" and digest in verified["error"]["detail"], verified
-    with tfs.open(NAME, revision="1", cache_dir=store, endpoint=origin) as checkpoint:
+    with tfs.open(REMOTE_NAME, revision="1", cache_dir=store, endpoint=origin) as checkpoint:
         report = checkpoint.verify()
         assert report.corrupt == [(digest, length)] and report.missing == [], (report.corrupt, report.missing)
     assert victim.read_bytes() == data, "verify is an audit and never repairs or removes bytes"
     # Explicitly discard this test's bad copy; normal verified admission repairs the cache.
     victim.unlink()
-    cli(store, "--endpoint", origin, "download", f"{NAME}@1")
+    cli(store, "--endpoint", origin, "download", f"{REMOTE_NAME}@1")
     assert hashlib.sha256(victim.read_bytes()).hexdigest() == digest
-    cli(store, "--endpoint", origin, "verify", f"{NAME}@1")
+    cli(store, "--endpoint", origin, "verify", f"{REMOTE_NAME}@1")
     print(f"corrupted {digest[:12]} ({length} B): reported without mutation, discarded, fetched again")
 
 
@@ -168,10 +169,11 @@ def main() -> None:
         same_folder(work / "sources", f"local/source-{i}", work / f"source-{i}", repo)
     same_image(work / "out", reference)
     cli(a, "export", named, str(work / "portable"))
-    cli(a, "--endpoint", (work / "origin").as_uri(), "upload", str(work / "portable"), named)
+    remote = f"{REMOTE_NAME}@1"
+    cli(a, "--endpoint", (work / "origin").as_uri(), "upload", str(work / "portable"), remote)
     with serve(work / "origin") as url:
-        cli(b, "--endpoint", url, "download", named)
-        pulled = cli(b, "--endpoint", url, "inspect", named)
+        cli(b, "--endpoint", url, "download", remote)
+        pulled = cli(b, "--endpoint", url, "inspect", remote)
         assert pulled["header"] == imported["header"], (pulled, imported)
         expected = blobs(work / "origin")
         assert blobs(b) == expected, "every published object is downloaded byte-identically"
@@ -214,10 +216,9 @@ def main() -> None:
     assert tree(work / "out2") == tree(work / "out"), "the Python export is the CLI's, byte for byte"
     same_image(work / "out2", reference)
     origin = (work / "origin2").as_uri()
-    remote_name = "conformance/tiny-sdxl"
-    tfs.upload_folder(repo_id=remote_name, revision="1", folder_path=folder, endpoint=origin)
+    tfs.upload_folder(repo_id=REMOTE_NAME, revision="1", folder_path=folder, endpoint=origin)
     with serve(work / "origin2") as url:
-        downloaded = tfs.materialize(remote_name, revision="1", endpoint=url, cache_dir=work / "d")
+        downloaded = tfs.materialize(REMOTE_NAME, revision="1", endpoint=url, cache_dir=work / "d")
         with tfs.open(downloaded) as remote:
             assert remote.id == m.id
 
