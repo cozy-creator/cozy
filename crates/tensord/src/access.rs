@@ -1,8 +1,8 @@
 //! What a call's weights are prefetched under (one-request-kind §2.7). TensorD chooses each
-//! slot's checkpoint, lands its structure and wants its chunks ahead of the call; the machine's
-//! own readers wait for what they read. A release is read anonymously, the owner's checkpoint by
-//! hash under the run's capability. When the call ends (or its run is canceled) its waits fail
-//! and what it wanted drops.
+//! slot's checkpoint, lands its structure and wants its chunks ahead of the call; the Runtime
+//! reads them through TensorFS. A release is read anonymously, the owner's checkpoint by hash
+//! under the run's capability. Its checkpoints stay open, so the store keeps their bytes, until
+//! the call ends (or its run is canceled): then what it wanted drops.
 use crate::{
     held_models::Pulled,
     hub,
@@ -22,14 +22,13 @@ use tensorfs::{
 };
 
 /// Where `header`, a checkpoint this machine pulled from `source`'s Hub, comes from: the Hub
-/// names its tree as its pin records (`held_models::Pulled`). None for one never pulled (local).
+/// names its tree as the store's ref records (`held_models::Pulled`). None for one never
+/// pulled (local).
 pub fn remote(machine: &Machine, source: &hub::Source, header: &ObjectRef) -> io::Result<Option<Remote>> {
-    let pin = machine.store().get_pin(&storage::pin::model(&header.sha256)).map_err(storage::io_error)?;
-    let pulled = pin.and_then(|pin| serde_json::from_str::<Pulled>(pin.owner.as_deref()?).ok());
-    let Some((pulled, tree)) = pulled.and_then(|p| Some((p.clone(), p.tree?))) else {
+    let Some(pulled) = Pulled::of(machine.store(), header)? else {
         return Ok(None);
     };
-    let found = origin::remote(machine, source, &pulled.repository, &pulled.release, &pulled.lane, &tree);
+    let found = origin::remote(machine, source, &pulled.repository, &pulled.release, &pulled.lane, &pulled.tree);
     found.map(|(remote, _)| Some(remote)).map_err(|(_, why)| io::Error::other(why))
 }
 
@@ -70,6 +69,8 @@ pub struct Fetch {
     order: u64,
     stop: Stop,
     kept: Mutex<Vec<tokio::task::JoinHandle<tensorfs::err::Result<tensorfs::fetch::Landed>>>>,
+    /// Its checkpoints, open until it ends: the store keeps their bytes.
+    held: Mutex<Vec<Checkpoint>>,
     /// What fetched for this call before it started: ended with it.
     replaced: Mutex<Option<Arc<Fetch>>>,
 }
@@ -83,6 +84,7 @@ impl Fetch {
             order,
             stop: Stop::default(),
             kept: Mutex::default(),
+            held: Mutex::default(),
             replaced: Mutex::default(),
         })
     }
@@ -97,19 +99,6 @@ impl Fetch {
             return Ok(None);
         };
         remote(&self.machine, hub, header)
-    }
-
-    /// Wait until `objects` of `header` (`sha256:<hex>`) are here: a reader is blocked on them.
-    pub fn wait(&self, header: &str, objects: &[ObjectRef]) -> io::Result<()> {
-        let absent: Vec<ObjectRef> = objects.iter().filter(|o| !storage::present(self.store(), o)).cloned().collect();
-        if absent.is_empty() {
-            return Ok(());
-        }
-        let held = storage::held(self.store(), header)?;
-        let remote = self.source(&held)?.ok_or_else(|| {
-            io::Error::other(format!("model_fetch_failed: {header} lacks {} and no Hub holds it", absent[0].id()))
-        })?;
-        self.machine.objects(&remote, &absent, priority::NOW, &self.stop).map(drop).map_err(failed)
     }
 
     /// `previous` (a run's preparation's fetches) ends with the call.
@@ -132,6 +121,7 @@ impl Fetch {
                 let bytes: u64 = objects.iter().map(|o| o.length).sum();
                 wanted.push((bytes, remote.clone(), objects));
             }
+            self.held.lock().unwrap().push(checkpoint);
         }
         wanted.sort_by_key(|(bytes, ..)| *bytes);
         let mut kept = self.kept.lock().unwrap();
@@ -154,6 +144,7 @@ impl Fetch {
                 let objects = storage::chunks(&checkpoint, components);
                 kept.push(self.machine.want(&remote, objects, priority::BEHIND).map_err(failed)?);
             }
+            self.held.lock().unwrap().push(checkpoint);
         }
         Ok(())
     }
@@ -177,12 +168,18 @@ impl Fetch {
         })
     }
 
-    /// Its waits fail and everything it wanted drops.
+    /// Whether it ended (`end`).
+    pub fn ended(&self) -> bool {
+        self.stop.is_cancelled()
+    }
+
+    /// Everything it wanted drops and its checkpoints close.
     pub fn end(&self) {
         self.stop.cancel();
         for want in self.kept.lock().unwrap().drain(..) {
             want.abort();
         }
+        self.held.lock().unwrap().clear();
         if let Some(replaced) = self.replaced.lock().unwrap().take() {
             replaced.end();
         }

@@ -231,7 +231,6 @@ impl NativeBackend {
                     .open_result(&record.id, index)
                     .map_err(problem)?;
                 let native = crate::products::retain(
-                    &self.store,
                     &self.service.engine,
                     &context.actor,
                     &owner,
@@ -249,7 +248,7 @@ impl NativeBackend {
                             .ok_or_else(|| Error::internal("custody_corrupt", "a tree member is not held"))?;
                         let owner = identity(&json!({"workspace":self.workspace_id(),"actor":context.actor,
                             "request":context.request_id,"asset":binding.asset_ref,"member":sha}))?;
-                        crate::products::retain(&self.store, &self.service.engine, &context.actor, &owner,
+                        crate::products::retain(&self.service.engine, &context.actor, &owner,
                             &mut self.service.engine.open_result(&record.id, member).map_err(problem)?,
                             &ObjectRef { sha256: sha, length }).map_err(problem)?;
                     }
@@ -507,7 +506,7 @@ impl MachineBackend for NativeBackend {
             .into_iter()
             .map(|r| {
                 let object = ObjectRef { sha256: sha256::hex(&r.digest), length: r.length };
-                let file = self.store.file(&object).map_err(crate::storage::io_error).map_err(problem)?;
+                let file = self.service.engine.cas().file(&object).map_err(problem)?;
                 Ok((file, r.length))
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -541,7 +540,7 @@ impl MachineBackend for NativeBackend {
             .get(member)
             .ok_or_else(|| Error::not_found("output_not_found", "the tree has no such member"))?;
         let (sha, length) = (object.sha256.as_str(), object.length);
-        let file = self.store.file(object).map_err(storage)?;
+        let file = self.service.engine.cas().file(object).map_err(storage)?;
         Ok(crate::api::backend::OutputSnapshot {
             parts: vec![(file, length)],
             length,
@@ -602,7 +601,7 @@ impl MachineBackend for NativeBackend {
             return Err(Error::not_found("object_not_found", "this signer wrote no such object"));
         };
         let object = ObjectRef { sha256: sha256.to_string(), length };
-        self.store.file(&object).map_err(storage)
+        self.service.engine.cas().file(&object).map_err(storage)
     }
     fn list_packages(
         &self,
@@ -1213,7 +1212,7 @@ print(json.dumps({"identity": generation.identity}))
     }
 
     struct Publisher<'a> {
-        store: &'a Store,
+        generation: &'a crate::catalog::Generation,
         engine: &'a Execution_Engine,
         id: &'a str,
         spool: PathBuf,
@@ -1227,11 +1226,11 @@ print(json.dumps({"identity": generation.identity}))
             drop(descriptor);
             if frame.kind == device_executor::Kind::Publish {
                 let answer =
-                    crate::products::publish(self.store, self.engine, self.id, &self.spool, frame);
+                    crate::products::publish(self.engine, self.generation, self.id, &self.spool, frame);
                 return Ok((answer, None));
             }
             if frame.kind == device_executor::Kind::CheckpointItem {
-                return Ok((crate::products::checkpoint(self.engine, self.id, frame), None));
+                return Ok((crate::products::checkpoint(self.engine, self.generation, self.id, frame), None));
             }
             Ok((device_executor::Answer::unavailable(frame.seq), None))
         }
@@ -1350,7 +1349,7 @@ print(json.dumps({"identity": generation.identity}))
             )
             .unwrap();
         let executor_root = root.join("executor");
-        let task_store = store.clone();
+        let task_generation = held.record.clone();
         let failure = Arc::new(Mutex::new(None::<String>));
         let failed = failure.clone();
         assert!(engine
@@ -1422,9 +1421,6 @@ print(json.dumps({"identity": generation.identity}))
                             attention_pin: String::new(),
                             device_weights: false,
                             cap_bytes: None,
-                            sealed_tiers: false,
-                            model_sources: false,
-                            staged_tiers: false,
                             pinned_bytes: None,
                         },
                     )?;
@@ -1473,7 +1469,7 @@ print(json.dumps({"identity": generation.identity}))
                             sources: Default::default(),
                         },
                         &mut Publisher {
-                            store: &task_store,
+                            generation: &task_generation,
                             engine: &engine,
                             id: &id,
                             spool: spool.clone(),

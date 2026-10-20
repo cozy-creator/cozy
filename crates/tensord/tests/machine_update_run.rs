@@ -64,13 +64,11 @@ fn requiring(distribution: &str, version: &str, script: Option<&[u8]>, requires:
     (name, zip.finish().unwrap().into_inner())
 }
 
-/// Puts `bytes` into the machine's store and records them as the owner's, as an upload leaves an
-/// object; answers its digest.
+/// Puts `bytes` into the machine's run objects and records them as the owner's, as an upload
+/// leaves an object; answers its digest.
 fn hold(root: &Path, bytes: &[u8]) -> String {
     let engine = root.join("var/lib/cozy/tensord");
-    let store = tensord::storage::open(&root.join("var/lib/tensorfs")).unwrap();
-    let object = store.put_bytes(bytes).unwrap();
-    tensord::storage::hold(&store, &tensord::storage::pin::object(&object.sha256), vec![object.clone()], None).unwrap();
+    let object = tensord::cas::Cas::new(engine.join("execution/objects")).put_bytes(bytes).unwrap();
     let sha256 = object.sha256.clone();
     let owner = SigningKey::from_bytes(&OWNER).verifying_key();
     tensord::journal::Journal::open(&engine.join("execution"))

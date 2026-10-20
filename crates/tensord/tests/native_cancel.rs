@@ -86,7 +86,7 @@ impl Server {
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
         let store = tensord::storage::open(&root.join("store")).unwrap();
         let objects = Arc::new(
-            Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap(),
+            Objects::new(&root.join("writes"), service.engine.clone()).unwrap(),
         );
         let mut identity = MachineIdentity::ephemeral(
             "cancel-proof".into(),

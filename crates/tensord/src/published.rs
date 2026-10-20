@@ -535,8 +535,8 @@ impl Publisher {
         made
     }
 
-    /// `named` from its Hub into the store, pinned as pulled: its header, then the `components`
-    /// given (all when `None`, none when empty). Answers the bytes that came from the Hub and
+    /// `named` from its Hub into the store, its ref recording the pull: its tree and header, then
+    /// the `components` given (all when `None`, none when empty). Answers the bytes that came from the Hub and
     /// from the datacenter volume. Whatever is here moves nothing.
     fn pull(&self, source: &hub::Source, named: &Named, components: Option<&[String]>, stop: Option<&Stop>,
         bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(u64, u64), Failure> {
@@ -562,10 +562,11 @@ impl Publisher {
             storage::transport(&self.store, "pull-failed", &subject, &format!("origin={}: {e}", source.origin));
             failed(e)
         };
-        let structure = self.machine.pull(&remote, header, Some(&[]), priority::NOW, None, &stop).map_err(failed)?;
-        let pulled = Pulled { repository: named.repository.clone(), release: named.release.clone(), lane: named.lane.clone(), tree: Some(tree.clone()) };
-        storage::hold(&self.store, &storage::pin::model(&header.sha256), vec![header.clone()], Some(pulled.owner()))
-            .map_err(io_failure)?;
+        let mut structure = self.machine.pull(&remote, header, Some(&[]), priority::NOW, None, &stop).map_err(failed)?;
+        let landed = self.machine.objects(&remote, std::slice::from_ref(tree), priority::NOW, &stop).map_err(failed)?;
+        (structure.landed.origin, structure.landed.volume) = (structure.landed.origin + landed.origin, structure.landed.volume + landed.volume);
+        let pulled = Pulled { repository: named.repository.clone(), release: named.release.clone(), lane: named.lane.clone(), tree: tree.clone() };
+        pulled.record(&self.store).map_err(io_failure)?;
         if components == Some(&[]) {
             logged(&structure);
             return Ok((structure.landed.origin, structure.landed.volume));
@@ -580,23 +581,21 @@ impl Publisher {
         Ok((structure.landed.origin + landed.origin, structure.landed.volume + landed.volume))
     }
 
-    /// `named` downloaded whole, as a request's weights are, and pinned so the GC keeps it:
-    /// what a caller asked for whole (`cozy model download`, an adapter).
+    /// `named` downloaded whole, as a request's weights are: what a caller asked for whole
+    /// (`cozy model download`, an adapter).
     fn ensure(&self, source: &hub::Source, named: &Named, stop: Option<&Stop>,
         bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(u64, u64), Failure> {
         self.pull(source, named, None, stop, bytes)
     }
 
-    /// The Hub checkpoint `header` is, as this machine pulled it (its `model-` pin); none for
-    /// one never pulled (local).
+    /// The Hub checkpoint `header` is, as this machine pulled it (`Pulled`); none for one never
+    /// pulled (local).
     fn pulled(&self, header: &ObjectRef) -> io::Result<Option<Named>> {
-        let pin = self.store.get_pin(&storage::pin::model(&header.sha256)).map_err(storage::io_error)?;
-        let pulled = pin.and_then(|pin| serde_json::from_str::<Pulled>(pin.owner.as_deref()?).ok());
-        Ok(pulled.filter(|p| p.tree.is_some()).map(|p| Named {
+        Ok(Pulled::of(&self.store, header)?.map(|p| Named {
             repository: p.repository,
             release: p.release,
             lane: p.lane,
-            tree: p.tree,
+            tree: Some(p.tree),
             header: Some(header.clone()),
         }))
     }
@@ -658,37 +657,6 @@ impl Publisher {
         // A checkpoint this store already holds whole moves nothing and asks the Hub nothing.
         let moved = self.ensure(source, &named, stop, bytes).map_err(failed)?;
         Ok((named, moved))
-    }
-
-    /// The store's share of the machine's self-managing caches (`reclaim`), with what it
-    /// must keep (`protected`).
-    pub fn caches(&self, service: &Service) -> io::Result<crate::reclaim::StoreCaches<'_>> {
-        Ok(crate::reclaim::StoreCaches {
-            store: &self.store,
-            keep: self.protected(service)?,
-        })
-    }
-
-    /// What no store GC may evict: what live executors read and the checkpoints of every
-    /// unfinished run, unknown states included (what is being fetched, its tickets hold). A
-    /// journal or plan that cannot be read is an error, never a shorter list: the caller then
-    /// runs no store GC this pass.
-    fn protected(&self, service: &Service) -> io::Result<Vec<String>> {
-        let mut keep = service.pool().map(|pool| pool.serving()).unwrap_or_default();
-        for record in service.engine.with_journal(|journal| journal.unfinished())? {
-            let Some(submission) = record.submission.filter(|s| !s.preparation_id.is_empty()) else {
-                continue;
-            };
-            let preparation = service
-                .engine
-                .preparation(&submission.actor, &submission.preparation_id)?;
-            if let Some(preparation) = preparation {
-                keep.extend(crate::gpu_service::Plan::of(&preparation)?.manifests());
-            }
-        }
-        keep.sort();
-        keep.dedup();
-        Ok(keep)
     }
 
     /// The installation a request names. An unnamed release is the one the Hub named under
@@ -1375,12 +1343,14 @@ impl Publisher {
                     true => choice.repository.clone(),
                     false => format!("{}@{}", choice.repository, choice.release),
                 };
-                let local = self.store.resolve(&reference, (!choice.lane.is_empty()).then_some(choice.lane.as_str()))
+                let (release, lane) = ((!choice.release.is_empty()).then_some(choice.release.as_str()), (!choice.lane.is_empty()).then_some(choice.lane.as_str()));
+                let local = storage::local(&self.store, &choice.repository, release, lane)
+                    .and_then(|local| local.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "this machine holds no such model")))
                     .map_err(|error| ("model_resolution_failed", format!("{reference}: {error}")))?;
                 let header = local.header.id();
                 return Ok((ModelGrant {
                     package: installation.package.clone(), slot: path, repository: choice.repository.clone(),
-                    release: local.release.unwrap_or_default(), lane: local.variant.unwrap_or_default(),
+                    release: local.release, lane: local.variant,
                     components: self.components(&header)?, manifest: header,
                 }, None, vec![]));
             }
@@ -1574,9 +1544,10 @@ fn make_source(
         resolved: listed.pinned.clone(),
         profiles: profiles.to_vec(),
     };
-    if let Some(header) = crate::storage::local(store, &name).map_err(io_failure)? {
-        crate::storage::transport(store, "import", source, &format!("header={} reused", header.id()));
-        return Ok(made(header));
+    let held = crate::storage::local(store, &format!("local/{name}"), None, None).map_err(io_failure)?;
+    if let Some(local) = held.filter(|local| crate::storage::present(store, &local.header)) {
+        crate::storage::transport(store, "import", source, &format!("header={} reused", local.header.id()));
+        return Ok(made(local.header));
     }
     let stop = || cancellation.as_ref().is_some_and(Stop::is_cancelled);
     // What the import downloaded, for its transport line.
@@ -1615,7 +1586,6 @@ fn make_source(
     );
     crate::storage::transport(store, "import", source, &detail);
     crate::storage::set_local(store, &name, &header, &files).map_err(io_failure)?;
-    store.unpin(&name).map_err(|e| io_failure(crate::storage::io_error(e)))?;
     Ok(made(header))
 }
 
@@ -1698,10 +1668,11 @@ fn apply_adapters(
     if let Some(pulled) = publisher.pulled(&base).map_err(io_failure)? {
         publisher.ensure(source, &pulled, job.stop.as_ref(), &|d, t| job.bytes(d, t))?;
     }
+    // The view is the store's to keep from here: the call that reads it holds it open.
     let composed = crate::adapter::compose(store, &base, &selections)
         .map_err(|e| ("model_adapter_refused", e.to_string()))?;
-    grant.repository = composed.pin;
-    grant.manifest = composed.checkpoint.id();
+    grant.repository = composed.name;
+    grant.manifest = composed.checkpoint.id().id();
     Ok(())
 }
 
@@ -1887,15 +1858,20 @@ fn io_failure(error: io::Error) -> Failure {
     ("release_root_preparation_failed", error.to_string())
 }
 
-/// A slot's declared default as a choice (its `default`: `[org/]model@release`): what a run
-/// that names no model for the slot gets, in the lane rule's lane. An org-relative model is the
-/// package's account's: the package's org, or for unpublished code the run's `owner`.
+/// A slot's declared default as a choice (its `default`: `[org/]model@release`, or a local
+/// model `local/<name>`, its newest): what a run that names no model for the slot gets, in the
+/// lane rule's lane. An org-relative model is the package's account's: the package's org, or
+/// for unpublished code the run's `owner`.
 pub(crate) fn default_choice(slot: &Value, path: &str, package: &str, owner: &str) -> Option<domain::ModelChoice> {
     let account = match package.split_once('/') {
         Some((org, _)) if org != "local" => org,
         _ => owner,
     };
-    let (model, release) = slot.get("default")?.as_str()?.split_once('@')?;
+    let default = slot.get("default")?.as_str()?;
+    let (model, release) = match default.split_once('@') {
+        Some(named) => named,
+        None => (default.starts_with("local/").then_some(default)?, ""),
+    };
     let repository = match model.contains('/') {
         true => model.into(),
         false if account.is_empty() => return None,
@@ -2758,8 +2734,8 @@ pub(crate) mod tests {
         heard.lock().unwrap().iter().filter(|h| h.starts_with(asked)).count()
     }
 
-    /// A checkpoint a run chose lands as its header alone: one closure, the header, and an
-    /// origin attested for what it lacks. Resolved again, it asks the Hub nothing.
+    /// A checkpoint a run chose lands as its header and its tree alone: one closure, the two
+    /// objects, and the store's ref naming the pull. Resolved again, it asks the Hub nothing.
     #[test]
     fn a_chosen_checkpoint_lands_as_its_header_alone() {
         let bench = Bench::new();
@@ -2768,12 +2744,11 @@ pub(crate) mod tests {
         let job = Job::default();
         bench.publisher.structure(&hub, std::slice::from_ref(&named), &job).unwrap();
         let store = bench.publisher.store();
-        assert_eq!(count(&heard, "GET /o/"), 1, "the header: {heard:?}");
+        assert_eq!(count(&heard, "GET /o/"), 2, "the header and its tree: {heard:?}");
         assert_eq!(count(&heard, "POST /v1/tensorfs/closure"), 1);
         assert!(!crate::access::whole(store, &manifest.id(), &[]));
-        let pin = store.get_pin(&crate::storage::pin::model(&manifest.sha256)).unwrap().unwrap();
-        let pulled = Pulled { repository: "acme/source".into(), release: "1.0.0".into(), lane: "bf16".into(), tree: named.tree.clone() };
-        assert_eq!(pin.owner, Some(pulled.owner()));
+        let pulled = Pulled { repository: "acme/source".into(), release: "1.0.0".into(), lane: "bf16".into(), tree: named.tree.clone().unwrap() };
+        assert_eq!(Pulled::of(store, &manifest).unwrap(), Some(pulled));
         let asked = heard.lock().unwrap().len();
         bench.publisher.structure(&hub, &[named], &job).unwrap();
         assert_eq!(heard.lock().unwrap().len(), asked, "a held structure asks nothing");
@@ -2781,7 +2756,7 @@ pub(crate) mod tests {
     }
 
     /// Two calls reading one checkpoint held in part (two sessions, one model) fetch each object
-    /// once; once all of it is here, a call's waits ask the Hub nothing (a warm run).
+    /// once; once all of it is here, a call asks the Hub nothing (a warm run).
     #[test]
     fn calls_sharing_a_checkpoint_fetch_each_object_once_and_a_warm_one_asks_nothing() {
         let bench = Bench::new();
@@ -2792,21 +2767,25 @@ pub(crate) mod tests {
         let objects = chunks(&store, &manifest);
         let machine = bench.publisher.machine().clone();
         let call = |order| crate::access::Fetch::new(machine.clone(), Some(hub.clone()), order);
+        let selected = [(manifest.id(), vec!["model".to_string()])];
         let (first, second) = (call(1), call(2));
-        std::thread::scope(|scope| {
-            scope.spawn(|| first.wait(&manifest.id(), &objects).unwrap());
-            scope.spawn(|| second.wait(&manifest.id(), &objects[..2]).unwrap());
-        });
-        assert!(crate::access::whole(&store, &manifest.id(), &[]));
-        assert_eq!(count(&heard, "GET /o/"), 1 + objects.len(), "each object once: {heard:?}");
+        first.ahead(&selected).unwrap();
+        second.ahead(&selected).unwrap();
+        let started = Instant::now();
+        while !crate::access::whole(&store, &manifest.id(), &[]) {
+            assert!(started.elapsed() < Duration::from_secs(60), "never landed: {heard:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(count(&heard, "GET /o/"), 2 + objects.len(), "each object once: {heard:?}");
         let asked = heard.lock().unwrap().len();
-        call(3).wait(&manifest.id(), &objects).unwrap();
+        call(3).ahead(&selected).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
         assert_eq!(heard.lock().unwrap().len(), asked, "a warm call asks the Hub nothing");
         let _ = fs::remove_dir_all(&bench.root);
     }
 
     /// What a call wants downloads only while the call lives: its end (or its run's cancel)
-    /// fails its waits and drops its tickets, and the fetcher stops. What landed stays.
+    /// drops its tickets, and the fetcher stops. What landed stays.
     #[test]
     fn an_ended_call_drops_its_tickets() {
         let bench = Bench::new();
@@ -2817,11 +2796,10 @@ pub(crate) mod tests {
         let objects = chunks(&store, &manifest);
         let fetch = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub.clone()), 7);
         fetch.ahead(&[(manifest.id(), vec!["model".to_string()])]).unwrap();
-        while count(&heard, "GET /o/") < 1 + 2 {
+        while count(&heard, "GET /o/") < 2 + 2 {
             std::thread::sleep(Duration::from_millis(5));
         }
         fetch.end();
-        assert!(fetch.wait(&manifest.id(), &objects).is_err(), "a wait after the end never answers present");
         // Every request went out at once and each answer takes 100 ms: the ones on the wire stop.
         let landed = || objects.iter().filter(|o| crate::storage::present(&store, o)).count();
         std::thread::sleep(Duration::from_millis(300));
@@ -2851,7 +2829,7 @@ pub(crate) mod tests {
             assert!(started.elapsed() < Duration::from_secs(60), "never downloaded: {heard:?}");
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(count(&heard, "GET /o/"), 1 + chunks(&store, &manifest).len());
+        assert_eq!(count(&heard, "GET /o/"), 2 + chunks(&store, &manifest).len());
         let _ = fs::remove_dir_all(&bench.root);
     }
 
@@ -2902,7 +2880,7 @@ pub(crate) mod tests {
         }
         assert_eq!(pool.members("alice"), [(Level::Downloaded, "")]);
         assert!(pool.levels().is_empty(), "nothing imports or starts");
-        assert_eq!(count(&heard, "GET /o/"), 1 + chunks(&store, &manifest).len(), "each object once");
+        assert_eq!(count(&heard, "GET /o/"), 2 + chunks(&store, &manifest).len(), "each object once");
         assert_eq!(count(&later_heard, "GET /o/"), structure, "the on-demand model: none");
         pool.stop().unwrap();
         let _ = fs::remove_dir_all(&bench.root);
@@ -2928,10 +2906,9 @@ pub(crate) mod tests {
             assert!(started.elapsed() < Duration::from_secs(60), "the preparation's fetches stopped");
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(!ahead.ended());
         drop(call);
-        let elsewhere = ObjectRef { sha256: "ab".repeat(32), length: 1 };
-        let waited = ahead.wait(&manifest.id(), &[elsewhere]).unwrap_err();
-        assert!(waited.to_string().contains("stopped"), "the call ended and they went on: {waited}");
+        assert!(ahead.ended(), "the call ended and they went on");
         let _ = fs::remove_dir_all(&bench.root);
     }
 
@@ -3068,7 +3045,7 @@ pub(crate) mod tests {
 
     #[test]
     fn local_alias_declared_defaults_refresh_their_held_grants() {
-        let machine = local_alias_machine(Some(format!("local/seed@{}", tensorfs::client::IMPORT_RELEASE)));
+        let machine = local_alias_machine(Some("local/seed".into()));
         let (first, second) = (local_alias_header(&machine, 29), local_alias_header(&machine, 31));
         let store = machine.publisher.store();
         storage::set_local(store, "seed", &first, &BTreeMap::new()).unwrap();
@@ -3088,11 +3065,14 @@ pub(crate) mod tests {
         let machine = local_alias_machine(None);
         let (first, second) = (local_alias_header(&machine, 37), local_alias_header(&machine, 41));
         let store = machine.publisher.store();
+        let mut tree = tensorfs::format::Tree::default();
         for (variant, header) in [("f32", &first), ("other", &second)] {
-            store.set_variant("local/multi", "1", Some(variant), header, &BTreeMap::new()).unwrap();
+            tree.set_variant(variant, header.clone());
         }
+        let tree = store.put_tree(&tree).unwrap();
+        store.update_ref("local/multi", |old| Some(tensorfs::fetch::with_tree(old, "local/multi", &tree, Some("v1")))).unwrap();
         let mut request = local_alias_request(&machine, vec![domain::ModelChoice {
-            parameter: "source".into(), repository: "local/multi".into(), release: "1".into(), lane: "f32".into(),
+            parameter: "source".into(), repository: "local/multi".into(), release: "v1".into(), lane: "f32".into(),
             ..Default::default() }]);
         let a = machine.publisher.prepare_now(&machine.service, "alice", &request, None, None).unwrap().plan.unwrap();
         assert_eq!(a.sources[0].manifest, first.id());
@@ -3107,7 +3087,7 @@ pub(crate) mod tests {
 
     #[test]
     fn local_alias_cache_bypass_leaves_an_explicit_immutable_header_cached() {
-        let machine = local_alias_machine(Some(format!("local/seed@{}", tensorfs::client::IMPORT_RELEASE)));
+        let machine = local_alias_machine(Some("local/seed".into()));
         let header = local_alias_header(&machine, 43);
         let reference = domain::Ref { digest: sha256::digest(&machine.publisher.store().read(&header).unwrap()).to_vec(), length: header.length };
         let request = local_alias_request(&machine, vec![domain::ModelChoice {

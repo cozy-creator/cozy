@@ -672,11 +672,10 @@ fn runtime_checkpoint_uploads_local_alias_on_disk() {
         repo.checkpoints.contains(&tree),
         "local repository lost its checkpoint"
     );
-    let named = store
-        .resolve(&tree.id(), (!variant.is_empty()).then_some(variant))
+    let chosen = store
+        .variant(&tree, (!variant.is_empty()).then_some(variant))
         .unwrap();
-    assert_eq!(named.tree, Some(tree));
-    assert_eq!(named.header, header);
+    assert_eq!(chosen.id(), &header);
     assert!(
         !home.device_key("http://127.0.0.1:1").exists(),
         "a local conversion created sign-in credentials"

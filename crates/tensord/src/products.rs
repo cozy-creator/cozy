@@ -1,5 +1,5 @@
 //! The run output log's products: what a run has made so far, as it makes it (wire 65).
-//! `Outputs.publish` commits the asset's bytes into native custody, binds them to the run's
+//! `Outputs.publish` commits the asset's bytes into the run objects' store (`cas`), binds them to the run's
 //! actor and journals one `product` on the run's log, in that order, so every product a
 //! client reads can be fetched with ReadByteTreeObject. A single output's product is replaced
 //! by each publish (SET); a list output grows (APPEND). The returned result publishes only
@@ -7,6 +7,7 @@
 //! references only; TensorD records them without adopting or uploading their bytes.
 use crate::{
     api::domain,
+    catalog::Generation,
     device_executor::{Answer, Frame},
     execution::Engine,
     journal::StoredProduct,
@@ -18,7 +19,6 @@ use std::{
     io::{self, Read},
     path::{Component, Path, PathBuf},
 };
-use crate::storage::{self, Store};
 use tensorfs::{format::ObjectRef, sha256};
 
 const MAX_PARTS: usize = 128;
@@ -30,22 +30,22 @@ fn storage(error: impl std::fmt::Display) -> io::Error {
 /// Retain one byte string as a one-file tree named by `owner`, bound to `actor` so a reader
 /// with that actor's capability can fetch it. Idempotent per owner.
 pub fn retain(
-    store: &Store,
     engine: &Engine,
     actor: &str,
     owner: &str,
     source: &mut File,
     object: &ObjectRef,
 ) -> io::Result<domain::NativeByteRetentionRequest> {
-    // Bytes the store already holds (a product published while the run made it, a memoized
-    // or child result) are not read again.
-    if !store.reuse(object).map_err(storage::io_error)? {
-        store.put(source, Some(object)).map_err(storage::io_error)?;
+    // Bytes already held (a product published while the run made it, a memoized or child
+    // result) are not read again.
+    let cas = engine.cas();
+    if !cas.reuse(object)? {
+        cas.put(source, Some(object))?;
     }
-    let tree = crate::trees::put(store, owner, [("payload".to_string(), object.clone())].into())?;
+    let tree = crate::trees::put(&cas, owner, [("payload".to_string(), object.clone())].into())?;
     let native = domain::NativeByteRetentionRequest {
         source: Some(domain::NativeByteTreeRef {
-            producer_root_id: tree.pin,
+            producer_root_id: tree.hold,
             receipt_digest: unhex(&tree.manifest.sha256)?,
             manifest: Some(domain::Ref {
                 digest: unhex(&tree.manifest.sha256)?,
@@ -170,9 +170,9 @@ pub fn decode(stored: &StoredProduct) -> io::Result<domain::RunProduct> {
 }
 
 /// The SDK's `publish` request during a running attempt: answers `Published`.
-pub fn publish(store: &Store, engine: &Engine, id: &str, spool: &Path, frame: &Frame) -> Answer {
+pub fn publish(engine: &Engine, generation: &Generation, id: &str, spool: &Path, frame: &Frame) -> Answer {
     let mut answer = Answer::unavailable(frame.seq);
-    match commit(store, engine, id, spool, frame) {
+    match commit(engine, generation, id, spool, frame) {
         Ok((content, sequence)) => {
             answer.ok = true;
             answer.code.clear();
@@ -193,16 +193,16 @@ pub fn publish(store: &Store, engine: &Engine, id: &str, spool: &Path, frame: &F
     answer
 }
 
-/// The running execution's submission and its entrypoint's declaration.
-fn declared(engine: &Engine, id: &str) -> io::Result<(crate::journal::SubmissionContext, Value)> {
+/// The running execution's submission and its entrypoint's declaration, in the App it invokes
+/// (`generation`'s own, or a callee's it holds).
+fn declared(engine: &Engine, generation: &Generation, id: &str) -> io::Result<(crate::journal::SubmissionContext, Value)> {
     let record = engine.get(id)?;
     let context = record
         .submission
         .ok_or_else(|| io::Error::other("only a public execution has an output log"))?;
-    let installed = engine
-        .installation_for_generation(&context.actor, &record.invocation.generation)?
-        .ok_or_else(|| io::Error::other("held installation interface absent"))?;
-    let interface: Value = serde_json::from_slice(&installed.interface).map_err(storage)?;
+    let (_, _, interface) = generation
+        .app(&record.invocation.module)
+        .ok_or_else(|| io::Error::other("held application interface absent"))?;
     let entry = interface
         .get("entrypoints")
         .and_then(Value::as_array)
@@ -214,9 +214,9 @@ fn declared(engine: &Engine, id: &str) -> io::Result<(crate::journal::Submission
 
 /// Record Runtime's checkpoint reference. A later upload replaces the local reference;
 /// a published remote tree need not be present in TensorD's cache.
-pub fn checkpoint(engine: &Engine, id: &str, frame: &Frame) -> Answer {
+pub fn checkpoint(engine: &Engine, generation: &Generation, id: &str, frame: &Frame) -> Answer {
     let record = || -> io::Result<u64> {
-        let (_, entry) = declared(engine, id)?;
+        let (_, entry) = declared(engine, generation, id)?;
         if !entry["weights_outputs"].as_array().into_iter().flatten()
             .any(|row| row["output_id"].as_str() == Some(frame.output.as_str())) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput,
@@ -225,7 +225,7 @@ pub fn checkpoint(engine: &Engine, id: &str, frame: &Frame) -> Answer {
         if frame.repo_id.is_empty() {
             return Err(storage("a checkpoint reference needs its repository"));
         }
-        storage::check_digest("checkpoint revision", &frame.revision, true).map_err(storage)?;
+        crate::storage::check_digest("checkpoint revision", &frame.revision, true).map_err(storage)?;
         let reference = protocol::machine::CheckpointRef {
             repo_id: frame.repo_id.clone(), revision: frame.revision.clone(), variant: frame.variant.clone(),
         };
@@ -249,13 +249,13 @@ pub fn checkpoint(engine: &Engine, id: &str, frame: &Frame) -> Answer {
 }
 
 fn commit(
-    store: &Store,
     engine: &Engine,
+    generation: &Generation,
     id: &str,
     spool: &Path,
     frame: &Frame,
 ) -> io::Result<(domain::Ref, u64)> {
-    let (context, entry) = declared(engine, id)?;
+    let (context, entry) = declared(engine, generation, id)?;
     let result = entry.get("result").ok_or_else(|| io::Error::other("declared result schema absent"))?;
     let op = output_op(result, &frame.output).ok_or_else(|| {
         io::Error::new(
@@ -280,7 +280,6 @@ fn commit(
         );
         let owner = format!("sha256:{}", sha256::hex(&sha256::digest(named.as_bytes())));
         let source = retain(
-            store,
             engine,
             &context.actor,
             &owner,
@@ -421,10 +420,12 @@ mod tests {
         use crate::journal::{Installation, Invocation, SubmissionContext};
         let root = std::env::temp_dir().join(format!("checkpoint-reference-{}", uuid::Uuid::new_v4()));
         let engine = Engine::open(&root).unwrap();
+        let interface = json!({"entrypoints":[{"name":"convert", "weights_outputs":[{"output_id":"weights","max_bytes":1024}]}]});
+        let generation: Generation = serde_json::from_value(json!({"identity": "generation", "package": "package",
+            "version": "1", "application": "app", "python": "/usr/bin/python3", "interface": interface})).unwrap();
         engine.bind_installation(Installation {
             actor: "owner".into(), alias: "package".into(), generation: "generation".into(),
-            interface: serde_json::to_vec(&json!({"entrypoints":[{"name":"convert",
-                "weights_outputs":[{"output_id":"weights","max_bytes":1024}]}]})).unwrap(),
+            interface: serde_json::to_vec(&interface).unwrap(),
             ..Default::default()
         }).unwrap();
         let record = engine.submit_public(SubmissionContext {
@@ -440,15 +441,15 @@ mod tests {
             seq: 1, output: "weights".into(), repo_id: "local/derived".into(),
             revision: format!("sha256:{}", "a".repeat(64)), variant: "bf16".into(), ..Default::default()
         };
-        assert!(checkpoint(&engine, &record.id, &frame).ok);
-        assert_eq!(checkpoint(&engine, &record.id, &frame).sequence, 0);
+        assert!(checkpoint(&engine, &generation, &record.id, &frame).ok);
+        assert_eq!(checkpoint(&engine, &generation, &record.id, &frame).sequence, 0);
         frame.repo_id = "owner/model".into();
-        assert!(checkpoint(&engine, &record.id, &frame).ok);
+        assert!(checkpoint(&engine, &generation, &record.id, &frame).ok);
         frame.output = "undeclared".into();
-        assert_eq!(checkpoint(&engine, &record.id, &frame).code, "output_undeclared");
+        assert_eq!(checkpoint(&engine, &generation, &record.id, &frame).code, "output_undeclared");
         frame.output = "weights".into();
         let revision = std::mem::replace(&mut frame.revision, "mutable-release".into());
-        assert_eq!(checkpoint(&engine, &record.id, &frame).code, "checkpoint_refused");
+        assert_eq!(checkpoint(&engine, &generation, &record.id, &frame).code, "checkpoint_refused");
         frame.revision = revision;
         drop(engine);
         let reopened = Engine::open(&root).unwrap();

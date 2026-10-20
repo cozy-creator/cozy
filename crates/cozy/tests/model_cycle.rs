@@ -15,11 +15,27 @@ use std::path::{Path, PathBuf};
 
 use common::{Home, Out};
 use serde_json::Value;
+use std::sync::Arc;
+
 use tensorfs::{
-    fetch::{Client, SourcePolicy, TensorhubOrigin},
+    fetch::{Client, Config, Fetcher, Origin, SourcePolicy, TensorhubOrigin, Want},
     format::ObjectRef,
     store::Store,
 };
+
+/// `model`'s tree at `release` from the Hub through TensorFS's fetcher: the library's own pull.
+fn pull(store: &Store, client: &Client, hub: TensorhubOrigin, model: &str, release: &str) -> tensorfs::Result<ObjectRef> {
+    let hub = Arc::new(hub);
+    tensorfs::fetch::runtime()?.block_on(async {
+        let resolved = hub.named(model, Some(release), None).await?;
+        let origin: Arc<dyn Origin> = hub.clone();
+        let fetcher = Fetcher::new(Arc::new(store.clone()), client.clone(), None, Config::default());
+        let variant = Some(resolved.variant.as_str()).filter(|v| !v.is_empty());
+        fetcher.pull_tree(&origin, &resolved.tree, variant, &Want::default()).await?;
+        fetcher.settled().await;
+        Ok(resolved.tree)
+    })
+}
 
 /// `cozy args` in `dir`. Each step is named, timestamped and flushed before it starts, and its
 /// output streams into the log as it comes, so the job's own timeout shows the step it stopped in.
@@ -158,13 +174,12 @@ fn a_model_uploaded_by_one_machine_is_pulled_bit_identical_by_another() {
     let url = std::env::var("TENSORHUB_ORIGIN").unwrap();
     let policy = SourcePolicy { any_host: true, allow_local: true, max_redirects: 5, ..SourcePolicy::default() };
     let client = Client::with_roots(policy, &ca).unwrap();
-    let (third, reference) = (tempfile::tempdir().unwrap(), format!("{model}@{source}"));
+    let third = tempfile::tempdir().unwrap();
     let store = Store::open(third.path()).unwrap();
-    let anonymous = store.pull_hub(client.clone(), TensorhubOrigin::new(&client, &url).unwrap(), &reference, None);
+    let anonymous = pull(&store, &client, TensorhubOrigin::new(&client, &url).unwrap(), &model, &source);
     assert!(anonymous.is_err(), "an owner's checkpoint read anonymously: {anonymous:?}");
     let hub = TensorhubOrigin::new(&client, &url).unwrap().bearer(home.token());
-    let library = store.pull_hub(client, hub, &reference, None).unwrap();
-    assert_eq!((library.named.tree.as_ref().map(ObjectRef::id), library.named.release), (Some(source.clone()), None));
+    assert_eq!(pull(&store, &client, hub, &model, &source).unwrap().id(), source);
     assert!(closure(third.path(), &source) == made, "the library's pull differs from the uploaded checkpoint");
 }
 
