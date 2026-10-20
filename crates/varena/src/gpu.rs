@@ -14,6 +14,7 @@ use std::ffi::{c_int, c_void};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crossbeam_queue::SegQueue;
@@ -307,6 +308,7 @@ struct Page {
     origin: u64,
     fingerprint: String,
     state: Mutex<State>,
+    retired: AtomicBool,
 }
 
 struct Release {
@@ -321,6 +323,7 @@ pub struct Gpu {
     releases: SegQueue<Release>,
     generation: Mutex<u64>,
     changed: Condvar,
+    wakeup: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Gpu {
@@ -354,6 +357,7 @@ impl Gpu {
                 releases: SegQueue::new(),
                 generation: Mutex::new(0),
                 changed: Condvar::new(),
+                wakeup: Mutex::new(None),
             })
         })();
         if setup.is_err() {
@@ -451,6 +455,7 @@ impl Gpu {
                 origin,
                 fingerprint,
                 state: Mutex::new(State::Empty),
+                retired: AtomicBool::new(false),
             }),
         );
         Ok(())
@@ -507,6 +512,9 @@ impl Gpu {
         }
         {
             let mut state = page.state.lock();
+            if page.retired.load(Ordering::Acquire) {
+                return Err(invalid("page is retired"));
+            }
             if !matches!(*state, State::Empty) {
                 return Err(invalid("page is not empty"));
             }
@@ -580,6 +588,9 @@ impl Gpu {
         self.poll()?;
         let page = self.page(id)?;
         let mut state = page.state.lock();
+        if page.retired.load(Ordering::Acquire) {
+            return Err(invalid("page is retired"));
+        }
         let mapping = match &mut *state {
             State::Ready(mapping) => mapping,
             State::Failed(_, error) => return Err(error.clone()),
@@ -604,6 +615,7 @@ impl Gpu {
 
     /// Apply queued pin releases on a CUDA-capable thread, not in a Python finalizer.
     pub fn poll(&self) -> Result<()> {
+        let mut changed = false;
         while let Some(release) = self.releases.pop() {
             let mut state = release.page.state.lock();
             if let State::Ready(mapping) = &mut *state {
@@ -635,15 +647,56 @@ impl Gpu {
                     }
                 }
                 mapping.pins = mapping.pins.saturating_sub(1);
+                changed = true;
             }
         }
+        let candidates: Vec<_> = self
+            .pages
+            .lock()
+            .iter()
+            .filter(|(_, page)| page.retired.load(Ordering::Acquire))
+            .map(|(id, page)| (*id, page.clone()))
+            .collect();
+        for (id, page) in candidates {
+            let mut state = page.state.lock();
+            let removable = match &mut *state {
+                State::Empty => true,
+                State::Ready(mapping) if mapping.pins == 0 => {
+                    if mapping.idle()? {
+                        mapping.release(true)?;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if removable {
+                *state = State::Empty;
+                self.pages.lock().remove(&id);
+                changed = true;
+            }
+        }
+        if changed {
+            self.notify();
+        }
         Ok(())
+    }
+
+    /// The coordinator installs a nonblocking wake (normally an eventfd write).
+    /// It must capture the coordinator weakly, and never run a decision inline.
+    pub fn set_wakeup(&self, wakeup: Arc<dyn Fn() + Send + Sync>) {
+        *self.wakeup.lock() = Some(wakeup);
     }
 
     fn notify(&self) {
         let mut generation = self.generation.lock();
         *generation = generation.wrapping_add(1);
         self.changed.notify_all();
+        drop(generation);
+        if let Some(wakeup) = self.wakeup.lock().clone() {
+            let _ = catch_unwind(AssertUnwindSafe(|| wakeup()));
+        }
     }
 
     /// Wait for an actual in-flight fill or CUDA consumer fence. Live pins with
@@ -706,6 +759,20 @@ impl Gpu {
                 Ok(true)
             }
         }
+    }
+
+    /// Closing a model prevents new users immediately, but an existing view keeps
+    /// its exact source/address until its last consumer fence finishes.
+    pub fn unregister(&self, id: PageId) -> Result<bool> {
+        let page = self.pages.lock().get(&id).cloned();
+        let Some(page) = page else {
+            return Ok(true);
+        };
+        page.retired.store(true, Ordering::Release);
+        self.poll()?;
+        let done = !self.pages.lock().contains_key(&id);
+        self.notify();
+        Ok(done)
     }
 
     /// Each receiving socket contains one exported allocation. Draining it on unmap
