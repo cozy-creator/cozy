@@ -687,11 +687,7 @@ mod tests {
             payload: v1::Json::parse(r#" { "seed":9007199254740993, "nested":{"b":2,"a":1} } "#).ok(),
             inputs: vec![input("reference", "a", 0), input("reference", "b", 1)],
             models: vec![model("model", "org/first"), model("other", "org/second")],
-            hub: Some(v1::HubAccess {
-                origin: "https://hub.example.test/".into(), capability: "e30.e30.c2ln".into(),
-                token_endpoint: "https://hub.example.test/v1/auth/oauth2/token".into(),
-                ca_der: vec![1], object_hosts: vec!["objects-1.example.test".into()],
-            }),
+            hub: Some(v1::HubAccess { origin: "https://hub.example.test/".into(), ca_der: vec![1] }),
             providers: Some(v1::ProviderAccess { huggingface: "h1".into(), civitai: "c1".into() }),
             ..Default::default()
         }
@@ -705,10 +701,7 @@ mod tests {
         let digest = spec_of(original.clone()).unwrap().0.digest;
         let mut resent = original.clone();
         resent.payload = v1::Json::parse(r#"{"nested":{"a":1,"b":2},"seed":9007199254740993}"#).ok();
-        resent.hub = Some(v1::HubAccess {
-            origin: "https://hub.example.test".into(), capability: String::new(), token_endpoint: String::new(),
-            ca_der: vec![2], object_hosts: vec!["objects-2.example.test".into()],
-        });
+        resent.hub = Some(v1::HubAccess { origin: "https://hub.example.test".into(), ca_der: vec![2] });
         resent.providers = None;
         assert_eq!(spec_of(resent).unwrap().0.digest, digest);
         let changes: [fn(&mut v1::RunSpec); 8] = [
