@@ -513,19 +513,84 @@ impl Placement {
     }
 
     pub fn bind(&self, request: RequestId, page: PageId, stream: usize) -> Result<Pin> {
-        self.wait_fill(page)?;
-        match self.drive(request, Trigger::Bind { request, page })? {
-            Relief::Complete => {}
-            Relief::Cut(need) | Relief::Lower(need) | Relief::Exhausted(need) => {
+        let need = self
+            .inner
+            .lock()
+            .table
+            .page(page)
+            .ok_or_else(|| invalid("unknown page"))?
+            .bytes;
+        let mut previous = None;
+        let pin = loop {
+            self.wait_fill(page)?;
+            if let Some(row) = self
+                .inner
+                .lock()
+                .table
+                .requests
+                .iter_mut()
+                .find(|row| row.id == request)
+            {
+                // A weight-page map has no arithmetic op to cut; activation OOMs still cut first.
+                row.can_cut = false;
+            }
+            let outcome = match self.drive(request, Trigger::Bind { request, page }) {
+                Ok(outcome) => outcome,
+                Err(error) if error.is_oom() => {
+                    self.gpu.recover()?;
+                    self.drive(request, Trigger::Oom { request, need })?
+                }
+                Err(error) => return Err(error),
+            };
+            match outcome {
+                Relief::Complete => {
+                    self.wait_fill(page)?;
+                    match self.gpu.bind(page, stream) {
+                        Ok(pin) => break pin,
+                        Err(error) if error.is_oom() => {
+                            self.gpu.recover()?;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Relief::Lower(short) => {
+                    if !matches!(
+                        self.drive(
+                            request,
+                            Trigger::Lower {
+                                request,
+                                need: short
+                            }
+                        )?,
+                        Relief::Complete
+                    ) {
+                        return Err(Error::DeviceFull {
+                            need,
+                            deficit: short,
+                        });
+                    }
+                }
+                Relief::Cut(short) | Relief::Exhausted(short) => {
+                    return Err(Error::DeviceFull {
+                        need,
+                        deficit: short,
+                    });
+                }
+            }
+            self.refresh()?;
+            let facts = {
+                let inner = self.inner.lock();
+                (inner.progress, inner.table.available())
+            };
+            if previous == Some(facts) {
                 return Err(Error::DeviceFull {
                     need,
                     deficit: need,
                 });
             }
-        }
-        self.wait_fill(page)?;
+            previous = Some(facts);
+        };
         self.event(request, page, "bind", "demand")?;
-        let pin = self.gpu.bind(page, stream)?;
         {
             let mut inner = self.inner.lock();
             let current = inner
@@ -710,6 +775,8 @@ impl Placement {
     }
 
     pub fn relief(&self, request: RequestId, need: u64, lower: bool) -> Result<Relief> {
+        self.gpu.recover()?;
+        self.refresh()?;
         if let Some(facts) = self
             .inner
             .lock()
