@@ -44,9 +44,11 @@ pub(crate) enum Denied {
     Unreachable(String),
 }
 
-/// What a Hub says of this computer's account there, read once per Calcifer.
+/// What a Hub says of this computer's account there, read once per device key: a login as
+/// another account (a new key) reads it again.
 #[derive(Clone)]
 pub(crate) struct Facts {
+    key: String,
     account: String,
     /// Where machines read the Hub.
     reads: String,
@@ -226,13 +228,20 @@ impl Hubs {
             .map_err(|error| hub_denied(origin, error))
     }
 
-    /// This computer's account at `origin` and where machines read it: read once, then kept for
-    /// the life of this Calcifer.
+    /// This computer's account at `origin` and where machines read it: read once per device
+    /// key, so a login, logout or account switch is seen at the next run with no Hub read.
     pub(crate) async fn facts(&self, origin: &Origin) -> Result<Facts, Denied> {
-        if let Some(facts) = lock(&self.facts).get(origin) {
+        let client = self.client(origin).map_err(|_| needs_sign_in(origin))?;
+        let Credential::User(session) = client.credential() else {
+            return Err(needs_sign_in(origin));
+        };
+        let key = session.key().public_key();
+        if let Some(facts) = lock(&self.facts)
+            .get(origin)
+            .filter(|facts| facts.key == key)
+        {
             return Ok(facts.clone());
         }
-        let client = self.client(origin).map_err(|_| needs_sign_in(origin))?;
         let hub = |error| hub_denied(origin, error);
         let account = client
             .get_current_account()
@@ -248,6 +257,7 @@ impl Hubs {
             &environment.tensorhub_public_origin,
         ];
         let facts = Facts {
+            key,
             account: account.into_inner().name,
             names: names.iter().filter_map(|o| Origin::parse(o).ok()).collect(),
             reads: environment.tensorhub_origin,
@@ -394,8 +404,50 @@ fn unreachable(message: String) -> Denied {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use platform::paths::Home;
     use protocol::config;
     use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering::SeqCst},
+    };
+
+    /// A login as another account is the next run's owner, read once under its new key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_account_follows_the_device_key() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = reads.clone();
+        let account = move |headers: axum::http::HeaderMap| async move {
+            counted.fetch_add(1, SeqCst);
+            let bearer = headers["authorization"].to_str().unwrap();
+            axum::Json(json!({"name": bearer.trim_start_matches("Bearer "), "user_id": "u"}))
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let environment =
+            json!({"environment": {"TENSORHUB_ORIGIN": origin, "TENSORHUB_PUBLIC_ORIGIN": origin}});
+        let app = axum::Router::new()
+            .route("/v1/accounts/current", axum::routing::get(account))
+            .route(
+                "/v1/execution-environment",
+                axum::routing::get(|| async move { axum::Json(environment) }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let root = tempfile::tempdir().unwrap();
+        let home = Home::at(root.path());
+        let hub = sign_in(&home, &Origin::parse(&origin).unwrap());
+        let hubs = Hubs::new(&home, vec![hub.clone()]);
+        let owner = async || hubs.facts(&hub.origin).await.ok().unwrap().account;
+        keep_bearer(&home, &hub, "first");
+        assert_eq!(
+            (owner().await, owner().await),
+            ("first".into(), "first".into())
+        );
+        sign_in_as(&home, &hub.origin, 18);
+        keep_bearer(&home, &hub, "second");
+        assert_eq!(owner().await, "second");
+        assert_eq!(reads.load(SeqCst), 2, "one account read per key");
+    }
 
     fn choice(repository: &str, release: &str, manifest: &str) -> v1::ModelChoice {
         v1::ModelChoice {
@@ -705,6 +757,9 @@ mod tests {
         let hub = sign_in(&home, &origin);
         let keep = |token: &str| keep_bearer(&home, &hub, token);
         let facts = Facts {
+            key: hub_client::DeviceKey::load(&hub.device_key(&home))
+                .unwrap()
+                .public_key(),
             account: "owner".into(),
             reads: "https://machine-reachable.example.test".into(),
             names: vec![],
@@ -824,6 +879,11 @@ mod tests {
     }
     /// A synthetic test sign-in at `origin`, never a real user's key.
     fn sign_in(home: &platform::paths::Home, origin: &Origin) -> config::Hub {
+        sign_in_as(home, origin, 17)
+    }
+
+    /// The sign-in of the device key made from `seed`.
+    fn sign_in_as(home: &platform::paths::Home, origin: &Origin, seed: u8) -> config::Hub {
         let hub = config::Hub {
             name: None,
             origin: origin.clone(),
@@ -831,7 +891,7 @@ mod tests {
         platform::durable::private_dir(&home.keys()).unwrap();
         let key = serde_json::to_vec(&json!({
             "version": 1, "hub": origin.as_str(), "email": "test@example.test",
-            "device_key_id": "ordinary-test-device", "private_key": URL_SAFE_NO_PAD.encode([17u8; 32])
+            "device_key_id": "ordinary-test-device", "private_key": URL_SAFE_NO_PAD.encode([seed; 32])
         }))
         .unwrap();
         platform::durable::replace(&hub.device_key(home), &key, 0o600).unwrap();
@@ -868,8 +928,10 @@ mod tests {
             hubs: [("dev".to_owned(), origin.to_string())].into(),
             ..Default::default()
         };
+        let key = hub_client::DeviceKey::load(&hub.device_key(&home)).unwrap();
         let machines = Machines::start(calcifer.clone(), home, &config);
         let facts = Facts {
+            key: key.public_key(),
             account: "owner".into(),
             reads: origin.to_string(),
             names: vec![],
