@@ -9,6 +9,8 @@ on:
 
 permissions:
   contents: read
+  # Reusable dev builds may download artifacts from another run.
+  actions: read
 
 # A PR's newer push replaces its running check; every other run stands alone.
 concurrency:
