@@ -12,7 +12,7 @@
  "properties": {
   "format": {
    "type": "string",
-   "pattern": "^tensorfs\\.repo/2(\\.[0-9]+)?$"
+   "pattern": "^tensorfs\\.repo/1(\\.[0-9]+)?$"
   },
   "name": {
    "type": "string",
@@ -24,21 +24,16 @@
     "type": "object",
     "required": [
      "version",
-     "lanes"
+     "tree"
     ],
     "properties": {
      "version": {
       "type": "string",
       "minLength": 1
      },
-     "lanes": {
-      "type": "object",
-      "propertyNames": {
-       "minLength": 1
-      },
-      "additionalProperties": {
-       "$ref": "#/$defs/objectRef"
-      }
+     "tree": {
+      "$ref": "#/$defs/objectRef",
+      "description": "The release's tensorfs.tree/1."
      },
      "yanked": {
       "type": "boolean"
@@ -53,7 +48,8 @@
    "type": "array",
    "items": {
     "$ref": "#/$defs/objectRef"
-   }
+   },
+   "description": "Trees no release names yet."
   }
  },
  "$defs": {
@@ -61,10 +57,6 @@
    "type": "integer",
    "minimum": 0,
    "maximum": 18446744073709551615
-  },
-  "segment": {
-   "type": "string",
-   "pattern": "^(?!\\.\\.?$)[^/\\\\\\u0000]+$"
   },
   "objectRef": {
    "type": "object",
@@ -80,40 +72,6 @@
     "length": {
      "$ref": "#/$defs/u64"
     }
-   }
-  },
-  "value": {
-   "anyOf": [
-    {
-     "type": [
-      "null",
-      "boolean",
-      "string"
-     ]
-    },
-    {
-     "type": "integer",
-     "minimum": -9223372036854775808,
-     "maximum": 18446744073709551615
-    },
-    {
-     "type": "array",
-     "items": {
-      "$ref": "#/$defs/value"
-     }
-    },
-    {
-     "type": "object",
-     "additionalProperties": {
-      "$ref": "#/$defs/value"
-     }
-    }
-   ]
-  },
-  "metadata": {
-   "type": "object",
-   "additionalProperties": {
-    "$ref": "#/$defs/value"
    }
   }
  }

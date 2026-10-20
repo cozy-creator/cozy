@@ -72,6 +72,7 @@ mod tests {
         };
         let product = domain::RunProduct {
             output: "files".into(),
+            checkpoint: None,
             op: domain::RunProductOp::Append as i32,
             index: 2,
             content: Some(digest.clone()),
