@@ -2,7 +2,7 @@
 #![cfg(target_os = "linux")]
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -104,7 +104,7 @@ impl ChildRow {
                 self.output.read_line(&mut line).unwrap() > 0,
                 "child exited early"
             );
-            if let Some(reply) = line.strip_prefix('@') {
+            if let Some((_, reply)) = line.split_once('@') {
                 return reply.trim().to_owned();
             }
         }
