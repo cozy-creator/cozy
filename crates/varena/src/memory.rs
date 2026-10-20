@@ -878,6 +878,11 @@ impl Inner {
                 self.retain_waits(&job.waits);
             }
             job.fill.set(filled);
+            #[cfg(all(test, feature = "faults"))]
+            {
+                drop(job);
+                crate::faults::phases::reached("job-owner-dropped");
+            }
         }
     }
 
@@ -925,6 +930,8 @@ impl Inner {
         self.check()?;
         let _c = CtxGuard::enter(self.ctx)?;
         crate::faults::hit("copy-drain")?;
+        #[cfg(all(test, feature = "faults"))]
+        crate::faults::phases::reached("copy-drain-enter");
         call!("cuStreamSynchronize", stream_synchronize(self.copy))
     }
 

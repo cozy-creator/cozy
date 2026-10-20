@@ -203,3 +203,12 @@ jobs:
             --setenv="GOCACHE=$(go env GOCACHE)" --setenv="GOMODCACHE=$(go env GOMODCACHE)" \
             --setenv=CARGO_TERM_COLOR=never --setenv=GITHUB_ACTIONS=true "${locations[@]}" \
             bash -euo pipefail -c "$TEST"
+      # The reviewed targeted command alone produces this fixed private-proof directory.
+      - name: Retain private Varena GPU proof executable
+        if: inputs.build == 'none' && hashFiles('dist/varena-gpu-completion-faults/manifest.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: varena-gpu-completion-faults-${{ steps.sha.outputs.sha }}-linux-x86_64
+          path: dist/varena-gpu-completion-faults/
+          if-no-files-found: error
+          retention-days: 7
