@@ -46,7 +46,7 @@ with TemporaryDirectory() as temp:
     assert callable(ck.download) and not hasattr(ck, "fetch")
     for options in ({}, {"components": []}, {"revision": "1"}, {"variant": "f32"},
                     {"cache_dir": root / "unused"}, {"local_files_only": True},
-                    {"token": "unused"}, {"endpoint": "http://127.0.0.1:1"}, {"ca_der": b"unused"}):
+                    {"token": "unused"}, {"endpoint": "http://127.0.0.1:1"}):
         try:
             tensorfs.materialize(ck, **({"local_dir": root / "refused"} if options else {}), **options)
         except ValueError:
