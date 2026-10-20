@@ -11,6 +11,7 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 
+use base64::engine::{general_purpose::STANDARD, Engine as _};
 use super::endpoint::{upload_tree, with_tree, Endpoint, Fresh, Payload};
 use super::{Client, Config, Fetcher, ObjectStore, Origin, Want};
 use crate::err::{Code, Refusal, Result};
@@ -102,7 +103,7 @@ async fn write_side(endpoint: &Arc<Endpoint>, store: &Store, tree: &ObjectRef, n
         .files["README.md"]
         .clone();
     let bytes = Bytes::from(store.read(&readme).map_err(crate::store::Error::refusal)?);
-    let checksum = crate::b64::encode(&crate::sha256::digest(&bytes));
+    let checksum = STANDARD.encode(crate::sha256::digest(&bytes));
     let headers = vec![
         ("content-length".to_owned(), bytes.len().to_string()),
         ("x-amz-checksum-sha256".to_owned(), checksum),

@@ -70,21 +70,20 @@ let saved = writer.commit().await?;
 println!("saved {}", saved.id().id());
 ```
 
-A file destination writes only the header; data is retained in the shared content-addressed
-store before the header is atomically published. Store roots and endpoint configuration are
-not embedded as paths in the file. A native portable export writes a complete folder with
-chunks; ordinary file saving does not.
+A `.cozytensors` file is a small handle into the shared local store, not a self-contained
+file: `dest` gets only the header, and the tensor and asset bytes stay in the store. The
+store keeps them while that file still holds this header. Once the file is deleted, moved or
+overwritten with another header, the data ages out like any other cache entry. Open
+checkpoints keep their bytes in the meantime. To copy a checkpoint to another machine,
+write the portable form with `saved.materialize(dir, Format::Cozytensors, None)`.
 
 `dest` is the exact filename; TensorFS does not append a variant or create a directory.
-Leave `variant` unset for a file destination. Variant labels belong to repository trees;
-setting both `dest` and `variant` is invalid. With no destination, the writer retains the
-checkpoint in the shared store and may assign a repository variant.
-A file destination also cannot be combined with `repo_id`.
+`dest` and `repo_id` exclude each other. `variant` names `model.<variant>.cozytensors` in a
+`repo_id` upload and is `Invalid` without `repo_id`. With no destination, the writer keeps
+the checkpoint in the shared store as a cache entry.
 
 A standalone header identifies one checkpoint. It does not contain its enclosing tree,
-release label, README or LICENSE. Moving or copying it preserves that checkpoint identity;
-repository context is available only when separately known. Deleting or replacing the
-file does not release its saved data automatically.
+release label, README or LICENSE; repository context is available only when separately known.
 
 The component borrows its writer while being filled. `commit(&mut self)` is async for both
 local and remote writes. After an upload failure, `writer.committed()` can return the strong
@@ -156,7 +155,8 @@ below; normal model consumers do not need it.
 | `Fetched` | Byte counts `local`, `volume`, `origin`. |
 | `VerificationReport` | Separate `missing` and `corrupt` object-reference vectors; `is_ok()` checks both are empty. |
 | `Convert` | Optional `converter`, `variant`, borrowed conversion-progress callback. |
-| `WriterOptions` | Optional `dest`, `variant`, `base`, `resume`, `repo_id`, `endpoint`, `token`; implements `Default`. |
+| `WriterOptions` | Optional `dest`, `variant` (only with `repo_id`), `base`, `resume`, `repo_id`, `endpoint`, `token`; implements `Default`. |
+| `ReadInto` | `role: Option<&str>`, `decode: bool`, `offset: u64` for `Component::read_into`; implements `Default`. |
 | `Format` | `Safetensors` or native portable `Cozytensors` export. |
 
 `Progress` is a borrowed `Fn(u64, u64) -> Result<()> + Sync` (held bytes, total bytes).
@@ -197,17 +197,25 @@ declared chunks and component assets, not its enclosing repository files; checki
 shared chunk hashes that whole object. Other local I/O failures remain
 typed errors rather than being classified as corruption.
 
-A `Component` provides `name()`, `class()`, `config()`, `tensors()` and
-`assets()` metadata views. Its `read(key)` returns the tensor as stored, as Python's
-`decode=False`: `Read::Plain(Vec<u8>)`, or `Read::Encoded { encoding, parts }` with each
-stored part's bytes by role. `read_decoded(key)` returns logical bytes in the tensor's dtype,
-as `decode=True`;
-`read_part_into(key, role, offset, &mut [u8])` fills a stored byte range;
-`asset(name)` returns `Vec<u8>`. These direct configuration, file and tensor reads are the
-normal cozytensors integration path. `export_files(directory)` is only a convenience for
-libraries that require filenames: it explicitly writes configuration and supporting
-files and returns `PathBuf`, without exporting weights. Native consumers, including our
-Runtime, do not need that step. The I/O calls return `Result`.
+A `Component` provides `name()`, `class()`, `config()`, `config_file()`, `tensors()` and
+`assets()` metadata views. `config_file()` is the file name the config exports as
+(`config.json` unless the writer named another, such as `scheduler_config.json`). Its
+`read(key)` returns the tensor as stored, as Python's `decode=False`: `Read::Plain(Vec<u8>)`,
+or `Read::Encoded { dtype, shape, encoding, parts }` with the logical dtype and shape and
+each stored part's bytes by role. `read_decoded(key)` returns logical bytes in the tensor's
+dtype, as `decode=True`. `asset(name)` returns `Vec<u8>`.
+
+`read_into(key, &mut out, &ReadInto { role, decode, offset })` fills `out` from byte
+`offset`, as Python's `read_into`. A plain tensor gives its data. A `role` selects that stored
+part, and `decode: true` an encoded tensor's logical bytes. An encoded tensor with neither
+returns `Invalid` naming its roles; a role with `decode` is also `Invalid`.
+
+These direct configuration, file and tensor reads are the normal cozytensors integration
+path. `export_files(Some(directory))` is only a convenience for libraries that require
+filenames: it writes configuration and supporting files, never weights, and returns
+`PathBuf`. `export_files(None)` writes them to a folder the cache manages and evicts like its
+other entries. Native consumers, including our Runtime, do not need that step. The I/O calls
+return `Result`.
 Selections control exactly which component/tensor/part/asset bytes are fetched, including
 when other model data happens to be present in the cache.
 

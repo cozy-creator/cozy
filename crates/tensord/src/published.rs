@@ -478,18 +478,19 @@ impl Publisher {
         Ok(checkpoint.header().components().iter().map(|c| c.name.clone()).collect())
     }
 
-    /// A slot's model this machine's store holds, by its exact header.
+    /// A slot's model this machine's store holds, by its header or its tree.
     fn held_grant(&self, installation: &Installation, path: &str, reference: &domain::Ref) -> Result<ModelGrant, Failure> {
-        let header = format!("sha256:{}", sha256::hex(&reference.digest));
-        let absent = |_| ("checkpoint_absent", format!("{path} names checkpoint {header}, which this machine does not hold"));
+        let named = format!("sha256:{}", sha256::hex(&reference.digest));
+        let absent = |_| ("checkpoint_absent", format!("{path} names checkpoint {named}, which this machine does not hold"));
+        let checkpoint = storage::checkpoint(&self.store, &named).map_err(absent)?;
         Ok(ModelGrant {
             package: installation.package.clone(),
             slot: path.to_string(),
             repository: String::new(),
             release: String::new(),
             lane: String::new(),
-            components: self.components(&header).map_err(absent)?,
-            manifest: header,
+            components: checkpoint.header().components().iter().map(|c| c.name.clone()).collect(),
+            manifest: checkpoint.id().id(),
         })
     }
 

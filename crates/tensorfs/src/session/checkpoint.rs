@@ -428,6 +428,7 @@ impl Checkpoint {
         crate::io::source::Source::checkpoint(&self.view(), direct_io)
     }
 
+    #[cfg(unix)]
     fn view(&self) -> crate::io::view::View {
         let checkpoint = self.clone();
         crate::io::view::View::from(&self.data.raw).with_fetch(move |objects| {
@@ -437,14 +438,28 @@ impl Checkpoint {
     }
 }
 
-/// A tensor as stored: a plain tensor's data, or an encoded tensor's parts by role.
+/// A tensor as stored: a plain tensor's data, or an encoded tensor's logical dtype and shape,
+/// encoding, and parts by role.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Read {
     Plain(Vec<u8>),
     Encoded {
+        dtype: format::Dtype,
+        shape: Vec<u64>,
         encoding: format::Encoding,
         parts: BTreeMap<String, Vec<u8>>,
     },
+}
+
+/// What [`Component::read_into`] reads, as Python's `read_into` keywords.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadInto<'a> {
+    /// One stored part of an encoded tensor; `""` is a plain tensor's data.
+    pub role: Option<&'a str>,
+    /// An encoded tensor's logical bytes, through its scheme's decode.
+    pub decode: bool,
+    /// The first byte read.
+    pub offset: u64,
 }
 
 #[derive(Clone)]
@@ -483,6 +498,10 @@ impl Component {
     pub fn config(&self) -> &format::Config {
         &self.metadata().config
     }
+    /// The file name the config exports as: `config.json` unless the writer named another.
+    pub fn config_file(&self) -> &str {
+        self.metadata().config_name()
+    }
     pub fn tensors(&self) -> &[format::Tensor] {
         &self.metadata().tensors
     }
@@ -496,11 +515,13 @@ impl Component {
         let tensor = self.data.raw.tensor(&self.name, key)?;
         let part = |role: &str, length: u64| {
             let mut bytes = vec![0; length as usize];
-            self.read_part_into(key, role, 0, &mut bytes).map(|()| bytes)
+            self.read_part(key, role, 0, &mut bytes).map(|()| bytes)
         };
         Ok(match &tensor.body {
             Body::Data(at) => Read::Plain(part("", at.length)?),
             Body::Encoded { encoding, parts } => Read::Encoded {
+                dtype: tensor.dtype.clone(),
+                shape: tensor.shape.clone(),
                 encoding: encoding.clone(),
                 parts: parts
                     .iter()
@@ -516,7 +537,12 @@ impl Component {
         let tensor = self.data.raw.tensor(&self.name, key)?;
         let (encoding, parts) = match (self.read(key)?, &tensor.body) {
             (Read::Plain(bytes), _) => return Ok(bytes),
-            (Read::Encoded { encoding, parts }, Body::Encoded { parts: stored, .. }) => (encoding, (parts, stored)),
+            (
+                Read::Encoded {
+                    encoding, parts, ..
+                },
+                Body::Encoded { parts: stored, .. },
+            ) => (encoding, (parts, stored)),
             _ => unreachable!("a read follows the tensor's body"),
         };
         let (bytes, stored) = parts;
@@ -530,9 +556,45 @@ impl Component {
         Ok(format::decode(&tensor.dtype, &tensor.shape, &encoding, &views)?)
     }
 
+    /// `out.len()` bytes of `key` from `offset`, as Python's `read_into`: a plain tensor's data,
+    /// one stored part (`role`), or with `decode` an encoded tensor's logical bytes. An encoded
+    /// tensor with neither is `Invalid`, naming its roles. Download the payload first.
+    pub fn read_into(&self, key: &str, out: &mut [u8], options: &ReadInto<'_>) -> Result<()> {
+        let tensor = self.data.raw.tensor(&self.name, key)?;
+        let role = match (options.role, &tensor.body) {
+            (Some(_), _) if options.decode => {
+                return fail(
+                    Kind::Invalid,
+                    "role and decode exclude each other: a role reads one stored part",
+                );
+            }
+            (Some(role), _) => role,
+            (None, Body::Data(_)) => "",
+            (None, Body::Encoded { parts, .. }) if !options.decode => {
+                let roles: Vec<_> = parts.iter().map(|p| p.role.as_str()).collect();
+                let roles = roles.join(", ");
+                let detail = format!("{key} is encoded: pass decode or a role ({roles})");
+                return fail(Kind::Invalid, detail);
+            }
+            (None, Body::Encoded { .. }) => {
+                let bytes = self.read_decoded(key)?;
+                let start = usize::try_from(options.offset).unwrap_or(usize::MAX);
+                let end = start.saturating_add(out.len());
+                let Some(window) = bytes.get(start..end) else {
+                    let (len, total) = (out.len(), bytes.len());
+                    let detail = format!("{key}: {len} bytes from {start} of {total}");
+                    return fail(Kind::Invalid, detail);
+                };
+                out.copy_from_slice(window);
+                return Ok(());
+            }
+        };
+        self.read_part(key, role, options.offset, out)
+    }
+
     /// This safe borrow is held until the existing synchronous engine returns.
     #[allow(unsafe_code)]
-    pub fn read_part_into(&self, key: &str, role: &str, offset: u64, buf: &mut [u8]) -> Result<()> {
+    fn read_part(&self, key: &str, role: &str, offset: u64, buf: &mut [u8]) -> Result<()> {
         let target = Target {
             component: &self.name,
             key,
@@ -553,10 +615,24 @@ impl Component {
     pub fn asset(&self, name: &str) -> Result<Vec<u8>> {
         Ok(self.data.raw.asset(&self.name, name)?)
     }
-    /// Write config and support files into the caller's directory, never model weights.
-    /// Download Selection::Assets first; this synchronous operation never downloads.
-    pub fn export_files(&self, dir: &Path) -> Result<PathBuf> {
-        Ok(self.data.raw.export_component_files(&self.name, dir)?)
+    /// Write config and support files, never weights, into `dir`; with `None`, into a folder
+    /// the cache manages and evicts like its other entries. Download Selection::Assets first;
+    /// this synchronous operation never downloads.
+    pub fn export_files(&self, dir: Option<&Path>) -> Result<PathBuf> {
+        let store = &self.data.store;
+        if let Some(dir) = dir {
+            store.cache_preserve_snapshot(dir)?;
+            return Ok(self.data.raw.export_component_files(&self.name, dir)?);
+        }
+        let identity = format!("{}:files:{}", self.data.raw.id().sha256, self.name);
+        let dir = store
+            .root()
+            .join("snapshots")
+            .join(crate::sha256::hex_digest(identity.as_bytes()));
+        let _directory = store.cache_directory(&dir)?;
+        self.data.raw.export_component_files(&self.name, &dir)?;
+        let _ = store.cache_maintain(0)?;
+        Ok(dir)
     }
 }
 

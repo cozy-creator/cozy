@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
 from os import PathLike
+from pathlib import Path
 from types import ModuleType
 from typing import Any, Protocol, TypeVar, overload
 from typing_extensions import Buffer
@@ -113,8 +114,13 @@ class Array:
     def __dlpack_device__(self) -> tuple[int, int]: ...
 
 class Encoded:
-    """A tensor's stored scheme, params and raw part arrays (`decode=False`)."""
+    """An encoded tensor as stored (`decode=False`): its logical dtype and shape, scheme,
+    params and part arrays by role."""
 
+    @property
+    def dtype(self) -> str: ...
+    @property
+    def shape(self) -> tuple[int, ...]: ...
     @property
     def scheme(self) -> str: ...
     @property
@@ -144,8 +150,11 @@ class Tensors(Mapping[str, TensorMetadata]):
     def read(self, keys: list[str] | tuple[str, ...] | None = None, *, device: str = "cpu", decode: bool = False) -> dict[str, Array | Encoded]: ...
     @overload
     def read(self, keys: Sequence[str], *, device: str = "cpu", decode: bool = False) -> Array | Encoded | dict[str, Array | Encoded]: ...
-    def read_into(self, key: str, out: object, *, role: str | None = None, offset: int = 0) -> None:
-        """Fill a writable contiguous Buffer or DLPack array; a role selects stored part bytes."""
+    def read_into(self, key: str, out: object, *, role: str | None = None, decode: bool = False,
+                  offset: int = 0) -> None:
+        """Fill a writable contiguous Buffer or DLPack array from `offset`: a plain tensor's data,
+        one stored part (`role`), or with `decode=True` an encoded tensor's logical bytes. An
+        encoded tensor with neither raises `InvalidError` naming its roles."""
 
 class Pipeline:
     """What `model_index.json` held."""
@@ -167,6 +176,9 @@ class Component:
     @property
     def config(self) -> dict[str, Any]: ...
     @property
+    def config_file(self) -> str:
+        """The file name `config` exports as: `config.json` unless the writer named another."""
+    @property
     def tensors(self) -> Tensors:
         """`key -> TensorMetadata`, in construction order."""
     @property
@@ -174,8 +186,9 @@ class Component:
         """`name -> (sha256, length)`: run data in the component's folder."""
     def asset(self, name: str) -> bytes:
         """An asset's bytes, fetched when absent."""
-    def export_files(self, directory: StrPath) -> str:
-        """Explicit compatibility export of config and assets only; never model weights."""
+    def export_files(self, directory: StrPath | None = None) -> Path:
+        """Config and assets only, never weights, written to `directory`, or by default to a
+        folder the cache manages and evicts like its other entries."""
 
 class Checkpoint:
     """One cozytensors read from a store."""

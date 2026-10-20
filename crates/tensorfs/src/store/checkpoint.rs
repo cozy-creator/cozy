@@ -8,6 +8,8 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use platform::durable;
+
 use super::{fail, invalid, Error, Result, Store};
 use super::retention::{self, DirectoryGuard, Retention};
 use crate::format::layout::ALIGN;
@@ -237,8 +239,9 @@ impl Checkpoint {
         }
     }
 
-    /// Export only a component's config and support files to the caller's directory.
+    /// Export only a component's config and support files to `dir`, each replaced atomically.
     /// Missing assets refuse before any directory is created; this never downloads weights.
+    /// The caller classifies `dir` for the cache.
     pub fn export_component_files(&self, name: &str, dir: &Path) -> Result<PathBuf> {
         let component = self.component(name)?;
         for object in component.assets.values() {
@@ -246,23 +249,14 @@ impl Checkpoint {
                 return Err(Error::Absent(object.sha256.clone()));
             }
         }
-        if let Some(store) = self.store() {
-            store.cache_preserve_snapshot(dir)?;
-        }
-        fs::create_dir_all(dir).map_err(fail("create", dir))?;
-        let config = dir.join(component.config_name());
-        if let Some(parent) = config.parent() {
-            fs::create_dir_all(parent).map_err(fail("create", parent))?;
-        }
-        fs::write(&config, crate::export::config_json(&component.config))
-            .map_err(fail("write", &config))?;
-        for name in component.assets.keys() {
+        let config = crate::export::config_json(&component.config);
+        let files = std::iter::once((component.config_name(), Ok(config)))
+            .chain(component.assets.keys().map(|n| (n.as_str(), self.asset(&component.name, n))));
+        for (name, bytes) in files {
             let path = dir.join(name);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(fail("create", parent))?;
-            }
-            fs::write(&path, self.asset(&component.name, name)?)
-                .map_err(fail("write", &path))?;
+            let parent = path.parent().unwrap_or(dir);
+            fs::create_dir_all(parent).map_err(fail("create", parent))?;
+            durable::replace(&path, &bytes?, 0o644).map_err(|e| fail("write", &path)(e.into()))?;
         }
         Ok(dir.to_path_buf())
     }

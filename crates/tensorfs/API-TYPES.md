@@ -129,15 +129,24 @@ impl Component {
     pub fn name(&self) -> &str;
     pub fn class(&self) -> &str;
     pub fn config(&self) -> &format::Config;
+    pub fn config_file(&self) -> &str; // the config's export name; config.json by default
     pub fn tensors(&self) -> &[format::Tensor];
     pub fn assets(&self) -> &BTreeMap<String, ObjectRef>;
     // Stored bytes (Python's decode=False); read_decoded is decode=True.
     pub fn read(&self, key: &str) -> Result<Read>;
     pub fn read_decoded(&self, key: &str) -> Result<Vec<u8>>;
-    pub fn read_part_into(&self, key: &str, role: &str, offset: u64, buf: &mut [u8]) -> Result<()>;
+    // An encoded tensor with neither role nor decode returns Invalid, naming its roles.
+    pub fn read_into(&self, key: &str, out: &mut [u8], options: &ReadInto<'_>) -> Result<()>;
     pub fn asset(&self, name: &str) -> Result<Vec<u8>>;
-    pub fn export_files(&self, directory: &Path) -> Result<PathBuf>;
+    // None: a folder the cache manages and evicts like its other entries.
+    pub fn export_files(&self, directory: Option<&Path>) -> Result<PathBuf>;
 }
+pub enum Read {
+    Plain(Vec<u8>),
+    Encoded { dtype: Dtype, shape: Vec<u64>, encoding: Encoding, parts: BTreeMap<String, Vec<u8>> },
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadInto<'a> { pub role: Option<&'a str>, pub decode: bool, pub offset: u64 }
 // Tensors selects every part of each named key. Part selects the chunks overlapping
 // its stored byte range. Invalid names, roles and ranges return Failure.
 // A selected snapshot contains only the requested objects, even when others are cached.
@@ -192,8 +201,9 @@ impl Client {
 }
 #[derive(Default)]
 pub struct WriterOptions<'a> {
-    // Exact header-file path, or None for a checkpoint in the shared store.
-    // A file destination cannot be combined with variant or repo_id.
+    // Exact header-file path, or None for a checkpoint in the shared store. The file is a
+    // handle into the store, rooting its data while it holds this header.
+    // dest and repo_id exclude each other; variant needs repo_id.
     pub dest: Option<&'a Path>, pub variant: Option<&'a str>,
     pub base: Option<&'a Checkpoint>, pub resume: Option<&'a str>,
     pub repo_id: Option<&'a str>, pub endpoint: Option<&'a str>,

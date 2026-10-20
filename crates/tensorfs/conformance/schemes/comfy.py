@@ -5,7 +5,7 @@ import numpy as np
 
 from . import grid
 from .base import Part, Scheme
-from .int8 import hadamard
+from .int8 import kron_regular_h4
 
 ROTATION = tuple(4**k for k in range(1, 9))
 
@@ -38,7 +38,7 @@ def rotate(c, q8, s, corr=None) -> np.ndarray:
     """((y x s[i]) + z) x 2^-k per block, y = q8 . H_B exact; z = sum_b corr(i, b) x M_b, left to right."""
     b = c.p("rotation_size")
     k = b.bit_length() // 2
-    y = hadamard(q8.reshape(c.rows, c.cols // b, b), k).astype(np.float32)
+    y = kron_regular_h4(q8.reshape(c.rows, c.cols // b, b), k).astype(np.float32)
     v = y * s.reshape(c.rows, 1, 1)
     if corr is not None:
         g = c.p("group_size")
@@ -48,7 +48,7 @@ def rotate(c, q8, s, corr=None) -> np.ndarray:
             first = True
             for grp in range(blk * b // g, -(-(blk + 1) * b // g)):
                 ind = ((np.arange(blk * b, (blk + 1) * b) // g) == grp).astype(np.int64)
-                m = hadamard(ind[None, :], k)[0].astype(np.float32)
+                m = kron_regular_h4(ind[None, :], k)[0].astype(np.float32)
                 t = cg[:, grp:grp + 1] * m[None, :]
                 z[:, blk] = t if first else z[:, blk] + t
                 first = False

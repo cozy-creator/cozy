@@ -11,7 +11,7 @@ pub const FAMILIES: [u32; 6] = [80, 86, 89, 90, 100, 120];
 pub const CORE_KINDS: [&str; 7] = [
     "codes",
     "unpack",
-    "hadamard",
+    "regular_h4",
     "rotated",
     "requantize",
     "grouped_rotated",
@@ -123,8 +123,9 @@ impl Launch<'_> {
         self.stage_binary(family, self.kind)
     }
 
-    /// A rotated plan first unpacks to i32, runs `hadamard` once per stride 1, 4, … < B
-    /// (`params[31]`), alternating two i32 buffers, then runs `rotated` to scale and round.
+    /// A rotated plan first unpacks to i32, runs `regular_h4` (H₄ along one base-4 digit) once
+    /// per stride 1, 4, … < B (`params[31]`), alternating two i32 buffers, which together apply
+    /// `kron_regular_h4`; then runs `rotated` to scale and round.
     pub fn stage_binary(&self, family: u32, stage: &str) -> Option<&'static Binary> {
         BINARIES
             .iter()

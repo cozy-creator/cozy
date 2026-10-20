@@ -182,8 +182,9 @@ def requantize(out, words, slots, scale, term, table, factor, post, index, error
 
 
 @triton.jit
-def hadamard(out, words, slots, scale, term, table, factor, post, index, error, params,
-             OUT: tl.constexpr, BLOCK: tl.constexpr):
+def regular_h4(out, words, slots, scale, term, table, factor, post, index, error, params,
+               OUT: tl.constexpr, BLOCK: tl.constexpr):
+    """One factor of `kron_regular_h4`: H₄ (spec A.1) along the base-4 digit at `params[31]`."""
     e = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     valid = e < tl.load(params)
     stride = tl.load(params + 31)
@@ -209,7 +210,7 @@ def rotated(out, words, slots, scale, term, table, factor, post, index, error, p
 
 
 @triton.jit
-def _hadamard_prefix(n, j, block, root):
+def _column_prefix(n, j, block, root):
     """Exact integer sum H_B[0:n,j] in log4(B), with no logical host expansion."""
     span, weight = block, root.to(tl.int32)
     sign = tl.full(n.shape, 1, tl.int32)
@@ -228,7 +229,7 @@ def _hadamard_prefix(n, j, block, root):
 @triton.jit
 def grouped_rotated(out, words, slots, scale, term, table, factor, post, index, error, params,
                     OUT: tl.constexpr, BLOCK: tl.constexpr):
-    """Integer Hadamard result x channel scale, ordered correction, then unit/round_L."""
+    """Integer `kron_regular_h4` result x channel scale, ordered correction, then unit/round_L."""
     begin, count = tl.load(params + 4), tl.load(params + 5)
     dst = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     valid = dst < count
@@ -248,7 +249,7 @@ def grouped_rotated(out, words, slots, scale, term, table, factor, post, index, 
             lo = tl.minimum(tl.maximum(g * group - base, 0), block)
             hi = tl.minimum(tl.maximum((g + 1) * group - base, 0), block)
             root = tl.load(params + 30)
-            m = _hadamard_prefix(hi, col % block, block, root) - _hadamard_prefix(lo, col % block, block, root)
+            m = _column_prefix(hi, col % block, block, root) - _column_prefix(lo, col % block, block, root)
             correction = tl.load(term + g * tl.load(params + 1) + row, mask=active, other=0.0)
             part = correction * m.to(tl.float32)
             # Do not add a synthetic leading/trailing zero: order and signed zero matter.

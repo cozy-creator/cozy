@@ -24,24 +24,29 @@ with TemporaryDirectory() as temp:
     root = Path(temp)
     tensorfs.configure(cache_dir=root / "cache")
     values = np.arange(24, dtype=np.float32).reshape(4, 6)
-    with tensorfs.Writer(variant="f32") as writer:
+    try:
+        tensorfs.Writer(variant="f32")
+    except tensorfs.InvalidError:
+        pass
+    else:
+        raise AssertionError("a variant without repo_id was accepted")
+    # A thin repository folder: variant headers named by file, payload in the shared store.
+    with tensorfs.Writer(root / "folder/model.f32.cozytensors") as writer:
         writer.pipeline("diffusers.TestPipeline", {"flag": None, "scale": 0.5})
         component = writer.component("model", cls="transformers.TestModel", config={"width": 6})
         component.put("weight", values)
         component.asset("tokenizer.json", b"{}")
         writer.component("optimizer", cls="", config={}).put("step", np.array([7], dtype=np.int64))
-    with tensorfs.Writer(variant="f16") as half:
+    with tensorfs.Writer(root / "folder/model.f16.cozytensors") as half:
         half.component("model", cls="transformers.TestModel", config={"width": 6}).put("weight", values.astype(np.float16))
         half.component("optimizer", cls="", config={}).put("step", np.array([8], dtype=np.int64))
-    tensorfs.materialize(writer.commit(), local_dir=root / "folder")
-    tensorfs.materialize(half.commit(), local_dir=root / "folder")
     (root / "folder/README.md").write_text("a repo file\n")
     ck = writer.commit()
     assert not hasattr(ck, "read") and not hasattr(ck, "tensors") and not hasattr(ck, "path"), "checkpoint-wide tensor APIs remain public"
     assert callable(ck.download) and not hasattr(ck, "fetch")
     for options in ({}, {"components": []}, {"revision": "1"}, {"variant": "f32"},
                     {"cache_dir": root / "unused"}, {"local_files_only": True},
-                    {"token": "unused"}, {"endpoint": "http://127.0.0.1:1"}, {"ca_der": b"unused"}):
+                    {"token": "unused"}, {"endpoint": "http://127.0.0.1:1"}):
         try:
             tensorfs.materialize(ck, **({"local_dir": root / "refused"} if options else {}), **options)
         except ValueError:
@@ -76,7 +81,7 @@ with TemporaryDirectory() as temp:
     assert np.array_equal(np.from_dlpack(ck.components["model"].tensors.read("weight")), values)
     component = ck.components["model"]
     assert component.config == {"width": 6} and component.asset("tokenizer.json") == b"{}"
-    assert not hasattr(component, "path") and not hasattr(component, "config_file")
+    assert not hasattr(component, "path") and component.config_file == "config.json"
     assert isinstance(component.tensors["weight"], tensorfs.TensorMetadata)
     assert not hasattr(component.tensors["weight"], "parts") and not hasattr(component.tensors, "read_all")
     assert raw.parts(ck, "model", "weight")[""].length == values.nbytes
@@ -84,6 +89,9 @@ with TemporaryDirectory() as temp:
     assert sorted(p.name for p in support.iterdir()) == ["config.json", "tokenizer.json"]
     assert json.loads((support / "config.json").read_text()) == component.config
     assert (support / "tokenizer.json").read_bytes() == b"{}"
+    managed = Path(component.export_files())
+    assert managed.parent == root / "cache/snapshots" and Path(component.export_files()) == managed
+    assert sorted(p.name for p in managed.iterdir()) == ["config.json", "tokenizer.json"]
     handle = root / "saved.cozytensors"
     with tensorfs.Writer(handle) as saved:
         saved.component("model", cls="test.File", config={}).put("data", b"handle" * 4096, dtype="U8", shape=[6 * 4096])

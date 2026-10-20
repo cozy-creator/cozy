@@ -171,7 +171,7 @@ impl RequantCodes<'_> {
         let table = self.table.as_ref().map(Elems::floats).transpose()?;
         if table.as_ref().is_some_and(|t| bits != 4 || t.len() != 16) {
             return Err(Error::Decode(
-                "requantized codebook is not16 levels of four-bit codes".into(),
+                "requantized codebook is not 16 levels of four-bit codes".into(),
             ));
         }
         let bytes = self.bytes.host()?;
@@ -348,7 +348,7 @@ impl Plan<'_> {
             Core::Codes(c) => c.values(&c.unpack(rows, cols)?, rows, cols, height)?,
             Core::Rotated { codes, block } => {
                 let mut q = codes.unpack(rows, cols)?;
-                q.chunks_mut(block).for_each(hadamard);
+                q.chunks_mut(block).for_each(kron_regular_h4);
                 codes.values(&q, rows, cols, height)?
             }
             Core::RequantizedRotation {
@@ -366,7 +366,7 @@ impl Plan<'_> {
                 }
                 let group = codes.group;
                 let mut q = codes.unpack(rows, cols)?;
-                q.chunks_mut(block).for_each(hadamard);
+                q.chunks_mut(block).for_each(kron_regular_h4);
                 let scale = scale.floats()?;
                 let correction = correction.as_ref().map(Elems::floats).transpose()?;
                 if scale.len() != rows
@@ -412,10 +412,10 @@ impl Plan<'_> {
     }
 }
 
-/// Sum of column `j` of H_B over its first `n` rows. H4[a,j] is -1 exactly
-/// when a+j=3. A complete lower digit contributes2, so a base4 prefix costs log4(B),
-/// without allocating a B-by-B matrix or expanding group correction to host values.
-fn hadamard_prefix(n: usize, j: usize, block: usize) -> i32 {
+/// Sum of column `j` of H_B over its first `n` rows. H₄[a, j] is −1 exactly when a + j = 3. A
+/// complete lower digit contributes 2, so a base-4 prefix costs log₄(B), without allocating a
+/// B×B matrix or expanding group correction to host values.
+fn column_prefix(n: usize, j: usize, block: usize) -> i32 {
     let mut weight = 1i32 << (block.trailing_zeros() / 2);
     if n == block {
         return weight;
@@ -449,7 +449,7 @@ fn rotated_correction(
     for g in begin / group..end.div_ceil(group) {
         let lo = (g * group).max(begin) - begin;
         let hi = ((g + 1) * group).min(end) - begin;
-        let m = hadamard_prefix(hi, col % block, block) - hadamard_prefix(lo, col % block, block);
+        let m = column_prefix(hi, col % block, block) - column_prefix(lo, col % block, block);
         let term = c[g * rows + row] * m as f32;
         sum = Some(match sum {
             None => term,
@@ -459,9 +459,10 @@ fn rotated_correction(
     sum.unwrap_or(0.0)
 }
 
-/// In place, `x · H` for H = H4 ⊗ … ⊗ H4 (unnormalized, entries ±1), x.len() a power of 4: each
-/// quad `(a, b, c, d)` at a stride becomes `sum − 2·(d, c, b, a)`.
-pub fn hadamard(x: &mut [i32]) {
+/// In place, `x · H_B` for `H_B = H₄ ⊗ … ⊗ H₄` (`kron_regular_h4`: H₄ the regular Hadamard of spec
+/// Appendix A.1, unnormalized), x.len() a power of 4: each quad `(a, b, c, d)` at a stride
+/// becomes `sum − 2·(d, c, b, a)`.
+pub fn kron_regular_h4(x: &mut [i32]) {
     let mut stride = 1;
     while stride < x.len() {
         for base in (0..x.len()).filter(|i| (i / stride) % 4 == 0) {
@@ -484,10 +485,10 @@ mod tests {
         for block in [4, 16, 64] {
             for n in 0..=block {
                 let mut indicator: Vec<i32> = (0..block).map(|i| i32::from(i < n)).collect();
-                hadamard(&mut indicator);
+                kron_regular_h4(&mut indicator);
                 for (j, expected) in indicator.into_iter().enumerate() {
                     assert_eq!(
-                        hadamard_prefix(n, j, block),
+                        column_prefix(n, j, block),
                         expected,
                         "B{block} prefix{n} column{j}"
                     );

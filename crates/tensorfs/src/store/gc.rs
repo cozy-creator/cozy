@@ -296,6 +296,7 @@ impl Store {
     /// The caller owns the exclusive acquisition fence for the complete mark/sweep.
     pub(super) fn collect_locked(&self, need: u64, older_than: Duration) -> Result<Collected> {
         retention::reap(self)?;
+        self.unroot_files()?;
         let started = SystemTime::now();
         let cutoff = started
             .checked_sub(self.grace)
@@ -389,6 +390,7 @@ impl Store {
     /// is sampled again by the caller; namespace bytes are never admission credit.
     pub(super) fn cache_pressure(&self, need: Need) -> Result<()> {
         retention::reap(self)?;
+        self.unroot_files()?;
         let census = self.census()?;
         let cutoff = SystemTime::now()
             .checked_sub(self.grace)

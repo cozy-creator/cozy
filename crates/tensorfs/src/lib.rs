@@ -3,9 +3,8 @@
 // Unsafe code lives only in platform, the OS seam.
 #![deny(unsafe_code)]
 
-pub mod b64;
 #[cfg(feature = "store")]
-pub mod descriptors;
+pub(crate) mod descriptors;
 pub mod err;
 #[cfg(feature = "store")]
 pub mod export;
@@ -43,8 +42,8 @@ mod session;
 #[cfg(feature = "store")]
 pub use session::{
     bearer, Checkpoint, Client, Component, ComponentWriter, Config, Convert, ConvertProgress,
-    Download, Endpoint, Fetched, Format, HeaderMap, Open, Progress, Read, Ref, Request, Selection,
-    TokenProvider, Writer, WriterOptions,
+    Download, Endpoint, Fetched, Format, HeaderMap, Open, Progress, Read, ReadInto, Ref, Request,
+    Selection, TokenProvider, Writer, WriterOptions,
 };
 
 /// This TensorFS's release version.

@@ -12,6 +12,7 @@ The provider/DLPack protocols describe accepted inputs and are not additional pa
 from __future__ import annotations
 from collections.abc import Buffer, Callable, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
 from os import PathLike
+from pathlib import Path
 from types import TracebackType
 from typing import Any, Protocol, TypeVar, overload
 StrPath = str | PathLike[str]
@@ -159,7 +160,16 @@ class Array:
         ...
 
 class Encoded:
-    """A tensor's stored scheme, params and raw part arrays (`decode=False`)."""
+    """An encoded tensor as stored (`decode=False`): logical dtype and shape, scheme, params
+    and part arrays by role."""
+
+    @property
+    def dtype(self) -> str:
+        ...
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        ...
 
     @property
     def scheme(self) -> str:
@@ -217,8 +227,10 @@ class Tensors(Mapping[str, TensorMetadata]):
     def read(self, keys: Sequence[str] | None = None, *, device: str = "cpu", decode: bool = False) -> dict[str, Array | Encoded]:
         ...
 
-    def read_into(self, key: str, out: object, *, role: str | None=None, offset: int=0) -> None:
-        """Fill a writable contiguous Buffer or DLPack array; a role selects stored part bytes."""
+    def read_into(self, key: str, out: object, *, role: str | None=None, decode: bool=False, offset: int=0) -> None:
+        """Fill a writable contiguous Buffer or DLPack array from `offset`: a plain tensor's data,
+        one stored part (`role`), or with `decode=True` an encoded tensor's logical bytes. An
+        encoded tensor with neither raises `InvalidError` naming its roles."""
 
     def __repr__(self) -> str:
         ...
@@ -250,6 +262,10 @@ class Component:
         ...
 
     @property
+    def config_file(self) -> str:
+        """The file name `config` exports as: `config.json` unless the writer named another."""
+
+    @property
     def tensors(self) -> Tensors:
         """`key -> TensorMetadata`, in construction order."""
 
@@ -260,8 +276,9 @@ class Component:
     def asset(self, name: str) -> bytes:
         """An asset's bytes, fetched when absent."""
 
-    def export_files(self, directory: str | PathLike[str]) -> str:
-        """Write configuration and supporting files for a file-based consumer; no tensor weights."""
+    def export_files(self, directory: str | PathLike[str] | None=None) -> Path:
+        """Write configuration and supporting files, no tensor weights, to `directory`, or by
+        default to a folder the cache manages and evicts like its other entries."""
         ...
 
     def __repr__(self) -> str:
@@ -383,7 +400,9 @@ class Writer:
     def __init__(self, dest: StrPath | None=None, *, variant: str | None=None, base: Checkpoint | None=None, resume: str | None=None, repo_id: str | None=None, endpoint: str | None=None, token: Token | None=None, cache_dir: StrPath | None=None) -> None:
         """Write an exact header-file path, or only the shared store when dest=None.
 
-        variant labels repository content and is invalid with a file destination.
+        The file is a handle into the shared local store that roots its data while it holds
+        this header; `materialize` makes the portable copy. `variant` names
+        `model.<variant>.cozytensors` in a `repo_id` upload and is refused without `repo_id`.
         """
 
     def __enter__(self) -> Writer:

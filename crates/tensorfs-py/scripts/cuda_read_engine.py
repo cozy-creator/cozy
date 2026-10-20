@@ -36,7 +36,7 @@ try:
         destination = torch.full((3, 4), -1.0, device="cuda:0")
         tensors.read_into("plain", destination)
         odd = torch.empty(9, dtype=torch.uint8, device="cuda:0")
-        tensors.read_into("quantized", odd, offset=3)
+        tensors.read_into("quantized", odd, decode=True, offset=3)
     assert torch.equal(destination, torch.tensor(HostReads.plain, device="cuda:0"))
     assert bytes(odd.cpu().tolist()) == tensors.read("quantized", decode=True).tobytes()[3:12]
     for consumer_stream in [-1, 1, 2, stream.cuda_stream]:
