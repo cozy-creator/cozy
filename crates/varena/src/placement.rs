@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use tensorfs::io::source::Source;
 use tensorfs::io::ReadStats;
 
@@ -89,6 +89,7 @@ struct Inner {
     caches: BTreeMap<PageId, Arc<Shrink>>,
     orphaned: BTreeMap<PageId, PageKey>,
     retired: BTreeSet<PageId>,
+    filling: BTreeSet<PageId>,
     next_page: PageId,
     progress: u64,
     trim: Option<Arc<Shrink>>,
@@ -101,6 +102,7 @@ pub struct Placement {
     channel: Channel,
     inner: Mutex<Inner>,
     operations: Mutex<()>,
+    changed: Condvar,
     stop: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -142,11 +144,13 @@ impl Placement {
                 caches: BTreeMap::new(),
                 orphaned: BTreeMap::new(),
                 retired: BTreeSet::new(),
+                filling: BTreeSet::new(),
                 next_page: 1,
                 progress: 0,
                 trim: None,
             }),
             operations: Mutex::new(()),
+            changed: Condvar::new(),
             stop: Arc::new(AtomicBool::new(false)),
             worker: Mutex::new(None),
         });
@@ -192,7 +196,13 @@ impl Placement {
                 let _ = row.ack(ask);
                 result.map(|_| ())
             } else {
-                this.refresh()
+                this.refresh().and_then(|()| {
+                    let requests: Vec<_> = this.inner.lock().requests.keys().copied().collect();
+                    for request in requests {
+                        this.drive(request, Trigger::PinReleased(request))?;
+                    }
+                    Ok(())
+                })
             };
             if let Err(error) = result {
                 tracing::warn!(%error, "reclaim failed");
@@ -219,6 +229,7 @@ impl Placement {
             self.close_model(model)?;
         }
         self.stop.store(true, Ordering::Release);
+        self.changed.notify_all();
         self.row.wake()
     }
 
@@ -486,6 +497,7 @@ impl Placement {
     }
 
     pub fn bind(&self, request: RequestId, page: PageId, stream: usize) -> Result<Pin> {
+        self.wait_fill(page)?;
         match self.drive(request, Trigger::Bind { request, page })? {
             Relief::Complete => {}
             Relief::Cut(need) | Relief::Lower(need) | Relief::Exhausted(need) => {
@@ -495,6 +507,7 @@ impl Placement {
                 });
             }
         }
+        self.wait_fill(page)?;
         self.event(request, page, "bind", "demand")?;
         let pin = self.gpu.bind(page, stream)?;
         {
@@ -527,7 +540,19 @@ impl Placement {
             inner.progress = inner.progress.saturating_add(1);
         }
         self.refresh()?;
+        self.row.wake()?;
         Ok(pin)
+    }
+
+    fn wait_fill(&self, page: PageId) -> Result<()> {
+        let mut inner = self.inner.lock();
+        while inner.filling.contains(&page) && !self.stop.load(Ordering::Acquire) {
+            self.changed.wait(&mut inner);
+        }
+        if self.stop.load(Ordering::Acquire) {
+            return Err(Error::Closed("placement".into()));
+        }
+        Ok(())
     }
 
     pub fn leave(&self, request: RequestId, peak: u64) -> Result<()> {
@@ -550,7 +575,9 @@ impl Placement {
             (run.package.clone(), run.shape.clone())
         };
         self.ledger.record_peak(&package, &shape, peak)?;
-        self.refresh()
+        self.refresh()?;
+        self.capture_budget(request);
+        self.row.wake()
     }
 
     pub fn end(&self, request: RequestId) -> Result<Stats> {
@@ -780,10 +807,15 @@ impl Placement {
             .retain(|page| !finished.contains(&page.id));
         inner.retired.retain(|id| !finished.contains(id));
         for (id, bytes, pins, pending) in facts {
+            let reserved = inner.filling.contains(&id);
             if let Some(page) = inner.table.pages.iter_mut().find(|page| page.id == id) {
-                page.tier = if bytes == 0 { Tier::Disk } else { Tier::Gpu };
+                page.tier = if bytes == 0 && !reserved {
+                    Tier::Disk
+                } else {
+                    Tier::Gpu
+                };
                 page.pins = u32::try_from(pins).unwrap_or(u32::MAX);
-                page.filling = pending;
+                page.filling = pending || reserved;
             }
         }
         inner.table.remote = status
@@ -915,7 +947,13 @@ impl Placement {
                                 "shared RAM source registration is unavailable".into(),
                             ));
                         }
-                        self.fill(request, page, from, speculative)?;
+                        self.inner.lock().filling.insert(page);
+                        drop(operation);
+                        let result = self.fill(request, page, from, speculative);
+                        self.inner.lock().filling.remove(&page);
+                        self.changed.notify_all();
+                        result?;
+                        continue 'decide;
                     }
                     Action::Unmap(page) => {
                         if !self.gpu.unmap(page)? {
