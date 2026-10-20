@@ -247,6 +247,7 @@ mod tests {
             "copies": [{"kind": "h2d", "gpu": 0, "bytes": 8192, "seconds": 0.1,
                 "gbps": 0.00008192, "ceiling": 0.0001, "pct": 81.92, "link": "PCIe"}],
             "trace": [{"sequence": 1, "request": "request-1", "step": 0,
+                "pass_index": 0,
                 "page": 3, "gpu": 0, "rank": 1, "kind": "bind", "reason": "working",
                 "bytes": 4096, "capacity": 8192, "resident": 4096, "orphan_bytes": 0,
                 "model": "dit", "class": "working", "working_set": 4096,
