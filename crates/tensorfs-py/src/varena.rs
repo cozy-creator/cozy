@@ -835,6 +835,8 @@ mod tests {
                     copies: vec![varena::placement::Copy {
                         request: 1,
                         page: 2,
+                        model: 3,
+                        streamed: true,
                         tier: Tier::Disk,
                         speculative: false,
                         stats: tensorfs::io::ReadStats {
