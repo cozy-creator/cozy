@@ -15,7 +15,6 @@ use aws_sigv4::sign::v4;
 
 pub use super::net::HeaderMap;
 use super::policy::base_host;
-use super::tensorhub::TENSORHUB;
 use crate::err::{refuse, Code, Refusal, Result};
 
 /// A request about to be sent.
@@ -55,6 +54,9 @@ impl TokenProvider for Bearer {
 pub fn bearer(token: impl Into<String>) -> Arc<dyn TokenProvider> {
     Arc::new(Bearer(token.into()))
 }
+
+/// Tensorhub, the default endpoint.
+const TENSORHUB: &str = "https://tensorhub.com";
 
 /// The endpoint a name resolves against when none is given: `TENSORFS_ENDPOINT`, else Tensorhub.
 pub fn default_endpoint() -> String {
