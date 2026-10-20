@@ -135,7 +135,6 @@ code is still not sandboxed.
 | `src/bin/model-source-check.rs`, `scripts/check-model-source-descriptor.py` | Check a selected snapshot's sources | B1 |
 | `src/bin/install-capture.rs` | Run the installer path on a captured archive (used by Python tests) | D1 |
 | `scripts/gate/` | Matched ComfyUI vs TensorD gate through ordinary `cozy run` | F |
-| `scripts/benchmarks/permission_probe.py` | CPU executor permission probe | E |
 
 ## Contracts
 

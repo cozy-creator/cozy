@@ -264,8 +264,8 @@ Additional checkpoint properties and operations:
 
 | Attribute or call | Meaning |
 |---|---|
-| `id`, `header_ref` | Header identity: `sha256:…` string and `(hex, length)` pair. |
-| `tree`, `tree_ref` | Repository-tree identity in the same two forms, when known. |
+| `id` | Header identity, a `sha256:…` string. |
+| `tree` | Repository-tree identity, a `sha256:…` string, when known. |
 | `repo_id` | Repository name, when known. |
 | `revision` | Release label, when known. |
 | `variant` | Selected repository variant, when known. A standalone header does not store this label. |
