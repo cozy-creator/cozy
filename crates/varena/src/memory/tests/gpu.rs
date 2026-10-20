@@ -974,6 +974,9 @@ fn secondary_consumer(negative: bool) {
         let dropping = std::thread::spawn(move || drop(pin));
         phase(dropped, "actual all-stream Pinned Drop");
         phase(closing, "actual secondary-consumer WeightSet close");
+        // The close phase proves its newly recorded fences exist; A must now be
+        // drained again to prove that later A event, independently of gated B.
+        sync(&gpu, a.stream as CUstream);
         assert!(
             !dropping.is_finished(),
             "last close completed while B was gated"
