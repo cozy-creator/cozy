@@ -361,8 +361,13 @@ pub async fn export(
         );
     }
     checkpoint.prepare_export().await?;
-    match format {
-        Format::Safetensors => checkpoint.export_to(dir, dequantize.as_ref()),
-        Format::Cozytensors => checkpoint.export_cozytensors(dir),
+    let (checkpoint, dir) = (checkpoint.clone(), dir.to_path_buf());
+    let worker = tokio::task::spawn_blocking(move || match format {
+        Format::Safetensors => checkpoint.export_to(&dir, dequantize.as_ref()),
+        Format::Cozytensors => checkpoint.export_cozytensors(&dir),
+    });
+    match worker.await {
+        Ok(result) => result,
+        Err(error) => fail(Kind::Io, format!("export worker failed: {error}")),
     }
 }
