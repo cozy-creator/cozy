@@ -271,13 +271,13 @@ async fn verification_all_includes_known_repo_files_but_not_other_variant_weight
     config.mirror = None;
     let client = Client::new(config.clone()).unwrap();
     let reference = "local/verify".parse().unwrap();
-    client
+    let tree = client
         .upload_folder(&reference, &f.folder, None)
         .await
         .unwrap();
     let ck = client
         .open(
-            "local/verify",
+            &tree.id(),
             &Open {
                 variant: Some(String::new()),
                 ..Open::default()
@@ -341,14 +341,11 @@ async fn verification_uses_gc_trash_only_after_not_found_and_never_restores_it()
     config.mirror = None;
     let client = Client::new(config.clone()).unwrap();
     let reference = "local/trash-check".parse().unwrap();
-    client
+    let tree = client
         .upload_folder(&reference, &f.folder, None)
         .await
         .unwrap();
-    let ck = client
-        .open("local/trash-check", &Open::default())
-        .await
-        .unwrap();
+    let ck = client.open(&tree.id(), &Open::default()).await.unwrap();
     let blob = config.cache_dir.join(f.chunks[0].key());
     let trash = config.cache_dir.join("tmp/gc").join(&f.chunks[0].sha256);
     fs::create_dir_all(trash.parent().unwrap()).unwrap();
