@@ -676,16 +676,7 @@ impl Ledger {
             rows: self.table.rows()?,
             peaks: self.peaks(),
             kept,
-            ram_bytes: sum(self
-                .host
-                .state
-                .lock()
-                .ram
-                .values()
-                .flat_map(|held| &held.slots)
-                .filter_map(|slot| slot.buffer.as_ref())
-                .filter(|ram| ram.ready.load(Acquire) || ram.filling.load(Acquire))
-                .map(|ram| ram.len as u64)),
+            ram_bytes: self.host.state.lock().retained_bytes(),
         })
     }
     /// Reap only kernel-released claims. Their custody remains available until consumed or
@@ -1005,6 +996,7 @@ impl Ledger {
             return false;
         }
         let mut state = self.host.state.lock();
+        let retained_before = state.retained_bytes();
         let victim = state
             .ram
             .iter_mut()
@@ -1030,6 +1022,13 @@ impl Ledger {
             .slots
             .get_mut(index)
             .and_then(|slot| slot.buffer.take());
+        let ready_bytes = removed.as_ref().map_or(0, |ram| {
+            if ram.ready.load(Acquire) {
+                ram.len as u64
+            } else {
+                0
+            }
+        });
         if let Some(ram) = &removed {
             ram.cancelled.store(true, Release);
         }
@@ -1038,8 +1037,14 @@ impl Ledger {
         if held.slots.iter().all(|slot| slot.buffer.is_none()) {
             state.ram.remove(&key);
         }
+        let retained_after = state.retained_bytes();
         drop(state);
         drop(removed); // actually unmap/free this region outside the table lock
+        // These are charged cache spans, not process RSS. Reader leases and
+        // in-flight fills were excluded by idle() before choosing this region.
+        tracing::info!(target: "varena::host", region = index, ready_bytes,
+            retained_before, retained_after, eligibility = "unleased_not_filling",
+            "released idle RAM cache region");
         self.host.wake_warm();
         notify_owners(observers);
         self.table.changed();
@@ -1419,6 +1424,15 @@ struct HostState {
     claims: BTreeMap<u64, Option<u64>>,
 }
 impl HostState {
+    fn retained_bytes(&self) -> u64 {
+        sum(self
+            .ram
+            .values()
+            .flat_map(|held| &held.slots)
+            .filter_map(|slot| slot.buffer.as_ref())
+            .filter(|ram| ram.ready.load(Acquire) || ram.filling.load(Acquire))
+            .map(|ram| ram.len as u64))
+    }
     fn can_warm(&self, available: i64, bytes: u64) -> bool {
         let Some(claimed) = self
             .claims

@@ -879,10 +879,16 @@ impl Pool {
     /// child, an idle deviceless executor, then an idle executor (outside every warm set
     /// first) on a GPU no call holds. Whether anything went back.
     pub fn give_back_one(&self) -> bool {
-        self.devices.iter().any(|device| device.memory.placement().is_ok_and(|memory| memory.release_unused_ram()))
-            || self.end_idle_parent(false) > 0
-            || self.end_idle_deviceless(|_| true)
-            || self.end_lru_idle("", false, 0..0)
+        self.note_host_release("pressure", "idle_ram_region", self.devices.iter().any(|device| device.memory.placement().is_ok_and(|memory| memory.release_unused_ram())))
+            || self.note_host_release("pressure", "import_parent", self.end_idle_parent(false) > 0)
+            || self.note_host_release("pressure", "deviceless_executor", self.end_idle_deviceless(|_| true))
+            || self.note_host_release("pressure", "gpu_executor", self.end_lru_idle("", false, 0..0))
+    }
+    fn note_host_release(&self, reason: &str, rung: &str, released: bool) -> bool {
+        if released {
+            self.notes.note(serde_json::json!({"event": "host_reclaim", "reason": reason, "rung": rung}));
+        }
+        released
     }
     fn prepare_host_cache(&self, reservation: u64, need: Option<u64>) {
         if let Some(memory) = self.devices.iter().find_map(|device| device.memory.placement().ok()) {
@@ -3461,8 +3467,9 @@ impl Pool {
             // A parent with no live child (cheaper to recreate than an executor with its
             // weights), then idle executors.
             let own = start..start + degree as usize;
-            let ended = self.devices.iter().any(|device| device.memory.placement().is_ok_and(|memory| memory.release_unused_ram()))
-                || self.end_idle_parent(spare) > 0 || self.end_lru_idle(plan, spare, own);
+            let ended = self.note_host_release("admission", "idle_ram_region", self.devices.iter().any(|device| device.memory.placement().is_ok_and(|memory| memory.release_unused_ram())))
+                || self.note_host_release("admission", "import_parent", self.end_idle_parent(spare) > 0)
+                || self.note_host_release("admission", "gpu_executor", self.end_lru_idle(plan, spare, own));
             self.notes.note(serde_json::json!({"event": "host_room", "plan": plan,
                 "need": need, "available": available, "ended": ended}));
             if !ended {
