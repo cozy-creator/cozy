@@ -104,7 +104,7 @@ reader.download(progress=lambda stage, held, total: progress.append((stage, held
 assert progress and progress[-1][0] == "fetch" and progress[-1][1] == progress[-1][2]
 assert reader.components["model"].tensors.read("weight").tobytes() == data
 folder = cache / "owner-export"
-tensorfs.export(published, folder, format="cozytensors")
+tensorfs.materialize(published, local_dir=folder, format="cozytensors")
 (folder / "README.md").write_text("normal owner upload\n")
 tree = tensorfs.upload_folder(repo_id=request["model"], revision="1", folder_path=folder,
                               endpoint=request["endpoint"], token=owner.headers, ca_der=ca, cache_dir=cache)
@@ -175,7 +175,7 @@ assert any(status in (401, 403) for _, status in rival.retries[denials_before:])
 after_denial = tensorfs.Endpoint(request["endpoint"], token=owner, ca_der=ca).repo(request["model"])[0]
 assert after_denial == repo_before_denial, "a denied publication changed the owner's repo"
 retry_folder = cache / "retained-export"
-tensorfs.export(retained, retry_folder, format="cozytensors")
+tensorfs.materialize(retained, local_dir=retry_folder, format="cozytensors")
 retry_tree = tensorfs.upload_folder(repo_id=request["model"], revision="2", folder_path=retry_folder, **options)
 retried = tensorfs.open(request["model"], revision="2", variant="f32", **{**options, "cache_dir": cache / "retry-reader"})
 assert retried.tree == retry_tree and retried.id == retained_id
