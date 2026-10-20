@@ -100,6 +100,23 @@ impl Store {
         self.commit(&path, &json(&path, pin)?, true)
     }
 
+    /// Add durable content roots without replacing another owner's pin at the same id.
+    pub(crate) fn pin_roots(&self, id: &str, roots: &[ObjectRef]) -> Result<()> {
+        let path = self.pin_path(id)?;
+        let _acquisition = super::retention::acquire(self)?;
+        let _lock = self.lock("pins")?;
+        let mut pin = parse::<Pin>(&path)?.unwrap_or_else(|| Pin::new(Vec::new()));
+        let before = pin.roots.clone();
+        for root in roots {
+            if !pin.roots.contains(root) {
+                pin.roots.push(root.clone());
+            }
+        }
+        pin.last_use = pin.last_use.max(now_secs());
+        self.retain(pin.roots.iter().filter(|root| !before.contains(root)))?;
+        self.commit(&path, &json(&path, &pin)?, true)
+    }
+
     /// Classification and replacement share the ordinary pin lock. A manual/operator pin
     /// occupying the internal name stays unchanged; an optional cache copy may then miss.
     pub(super) fn pin_cache(&self, root: &ObjectRef) -> Result<()> {
