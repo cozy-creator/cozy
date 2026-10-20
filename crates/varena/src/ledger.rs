@@ -480,7 +480,7 @@ impl Ledger {
                 }
             })
             .map_err(|e| io("start ledger event bridge", e))?;
-        Ok(Self {
+        let out = Self {
             table: table.clone(),
             events,
             _watcher: Some(Watcher {
@@ -492,7 +492,10 @@ impl Ledger {
             host,
             observations: Mutex::default(),
             admission_releases: Mutex::default(),
-        })
+        };
+        // A new coordinator has no process history for a previous daemon's rows.
+        out.reap_dead()?;
+        Ok(out)
     }
     /// Adopt the descriptors in a grant. No named-file lookup or CUDA initialization occurs.
     pub fn adopt(table: BorrowedFd<'_>, events: BorrowedFd<'_>) -> Result<Self> {
@@ -687,19 +690,56 @@ impl Ledger {
             if row.state == State::Live {
                 return Err(Error::Invalid("cannot reap a live row".into()));
             }
-            let slot = self.table.slot(row.owner)?;
-            slot.state
-                .store(row.owner.generation << 2 | REAPING, Release);
-            self.custody.lock().orphan(row.owner);
-            for held in self.host.state.lock().ram.values_mut() {
-                held.observers.retain(|subscriber, _| {
-                    subscriber.table != self.table.identity || subscriber.owner != row.owner
-                });
-            }
-            slot.state.store(row.owner.generation << 2, Release);
+            self.reap_owner(row.owner)?;
         }
-        self.table.changed();
         Ok(())
+    }
+    fn reap_dead(&self) -> Result<()> {
+        self.host.check_process()?;
+        for row in self.table.rows()? {
+            if row.state != State::Live {
+                self.reap_owner(row.owner)?;
+            }
+        }
+        Ok(())
+    }
+    /// The claim lock, not PID existence or a prior snapshot, proves death. A
+    /// fresh description conflicts even with a live claim in this same process.
+    fn reap_owner(&self, owner: Owner) -> Result<bool> {
+        let claim = shm::reopen(self.fd(), true).map_err(crate::os("open reap claim"))?;
+        let start = size_of::<Header>() + owner.row as usize * size_of::<Slot>();
+        if !shm::region_lock(
+            claim.as_fd(),
+            start,
+            size_of::<Slot>(),
+            Region::Write,
+            false,
+        )
+        .map_err(crate::os("lock reap claim"))?
+        {
+            return Ok(false);
+        }
+        // No claimant can appear while this guard lives. A concurrent reaper
+        // may already have freed/reused the slot after our original snapshot.
+        let slot = match self.table.slot(owner) {
+            Ok(slot) => slot,
+            Err(Error::Closed(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if slot.state.load(Acquire) & 3 == 0 {
+            return Ok(false);
+        }
+        slot.state.store(owner.generation << 2 | REAPING, Release);
+        self.custody.lock().orphan(owner);
+        for held in self.host.state.lock().ram.values_mut() {
+            held.observers.retain(|subscriber, _| {
+                subscriber.table != self.table.identity || subscriber.owner != owner
+            });
+        }
+        slot.state.store(owner.generation << 2, Release);
+        drop(claim); // make the freed row claimable before notifying admission
+        self.table.changed();
+        Ok(true)
     }
     /// An exact-class ask; plan::decide, not the ledger, orders victims and ceilings.
     pub fn ask(&self, owner: Owner, bytes: u64, ceiling: Class) -> Result<Ask> {
@@ -798,6 +838,7 @@ impl Ledger {
     }
     /// Measured remaining working sets are declarations, not a learned usage prediction.
     pub fn fits(&self, package: &str, shape: &str) -> Result<bool> {
+        self.reap_dead()?;
         let rows = self.table.rows()?;
         self.admission_releases.lock().retain(|owner, _| {
             rows.iter()
@@ -1040,8 +1081,8 @@ impl Ledger {
         let retained_after = state.retained_bytes();
         drop(state);
         drop(removed); // actually unmap/free this region outside the table lock
-        // These are charged cache spans, not process RSS. Reader leases and
-        // in-flight fills were excluded by idle() before choosing this region.
+                       // These are charged cache spans, not process RSS. Reader leases and
+                       // in-flight fills were excluded by idle() before choosing this region.
         tracing::info!(target: "varena::host", region = index, ready_bytes,
             retained_before, retained_after, eligibility = "unleased_not_filling",
             "released idle RAM cache region");
@@ -2416,6 +2457,44 @@ mod admission_tests {
         snapshot.classes[Class::Unused.as_usize()] = 600;
         row.publish(&snapshot, 8).unwrap();
         assert!(fixture.ledger.fits("package", "shape").unwrap());
+    }
+
+    #[test]
+    fn a_reaper_with_an_old_snapshot_cannot_clear_a_reused_generation() {
+        let fixture = Fixture::new();
+        let mut old = fixture.ledger.claim(std::process::id()).unwrap();
+        let owner = old.owner();
+        // Kernel release without Row::drop's state update, as after SIGKILL.
+        drop(old._claim.take());
+        let (ready, snapshot) = std::sync::mpsc::channel();
+        let (resume, waiting) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let ledger = &fixture.ledger;
+            let reaper = scope.spawn(move || {
+                ready.send(()).unwrap();
+                waiting.recv().unwrap();
+                ledger.reap_owner(owner).unwrap()
+            });
+            snapshot.recv().unwrap();
+            fixture.ledger.reap(std::process::id()).unwrap();
+            let mut next = fixture.ledger.claim(std::process::id()).unwrap();
+            assert_eq!(owner.row, next.owner().row);
+            assert!(next.owner().generation > owner.generation);
+            resume.send(()).unwrap();
+            assert!(
+                !reaper.join().unwrap(),
+                "a fresh OFD guard must respect the new live claim"
+            );
+            let expected = next.owner().generation << 2 | LIVE;
+            let slot = fixture.ledger.table.slot(next.owner()).unwrap();
+            assert_eq!(slot.state.load(Acquire), expected);
+            // The old snapshot must also fail its generation recheck after the
+            // new owner's kernel claim disappears, when taking the guard succeeds.
+            drop(next._claim.take());
+            assert!(!fixture.ledger.reap_owner(owner).unwrap());
+            assert_eq!(slot.state.load(Acquire), expected);
+            assert!(fixture.ledger.reap_owner(next.owner()).unwrap());
+        });
     }
 
     #[test]

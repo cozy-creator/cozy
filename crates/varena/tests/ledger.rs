@@ -48,6 +48,9 @@ struct ChildRow {
 }
 impl ChildRow {
     fn spawn(ledger: &Ledger) -> Self {
+        Self::spawn_with_pid(ledger, None)
+    }
+    fn spawn_with_pid(ledger: &Ledger, reported_pid: Option<u32>) -> Self {
         // grant authenticates the row's PID after exec; the PID is not known before spawn.
         let (ours, theirs) = UnixStream::pair().unwrap();
         let inherited = theirs.as_raw_fd();
@@ -73,6 +76,10 @@ impl ChildRow {
                 }
                 Ok(())
             });
+        }
+        cmd.env_remove("VARENA_TEST_REPORTED_PID");
+        if let Some(pid) = reported_pid {
+            cmd.env("VARENA_TEST_REPORTED_PID", pid.to_string());
         }
         let mut process = cmd.spawn().unwrap();
         drop(theirs);
@@ -145,8 +152,13 @@ fn child() {
     let events = platform::handles::recv_fd(&control).unwrap();
     let channel = Channel::new(platform::handles::recv_fd(&control).unwrap());
     let ledger = Ledger::adopt(table.as_fd(), events.as_fd()).unwrap();
-    let row = ledger.claim(std::process::id()).unwrap();
-    channel.bind(row.owner()).unwrap();
+    let pid = std::env::var("VARENA_TEST_REPORTED_PID")
+        .map(|value| value.parse().unwrap())
+        .unwrap_or_else(|_| std::process::id());
+    let row = ledger.claim(pid).unwrap();
+    if pid == std::process::id() {
+        channel.bind(row.owner()).unwrap();
+    }
     println!("@{} {}", row.owner().row, row.owner().generation);
     let mut containers = Vec::new();
     for command in std::io::stdin().lock().lines().map(Result::unwrap) {
@@ -326,6 +338,79 @@ fn named_table_and_measured_peaks_survive_coordinator_restart() {
     assert!(!restarted.fits("package", "shape").unwrap());
     assert_eq!(restarted.status().unwrap().rows[0].owner, child.owner);
     assert_eq!(restarted.peaks(), vec![("package|shape".into(), 600)]);
+}
+
+#[test]
+fn restart_collects_unknown_dead_rows_without_losing_peaks_or_existing_custody() {
+    let fixture = Fixture::new();
+    fixture.ledger.record_peak("package", "shape", 800).unwrap();
+    let mut child = ChildRow::spawn(&fixture.ledger);
+    child.call("publish 300");
+    child.call("keep");
+    child.kill();
+    assert_eq!(fixture.ledger.status().unwrap().rows[0].state, State::Dead);
+    let restarted = Ledger::create(&fixture.name, CAPACITY).unwrap();
+    assert!(
+        restarted.status().unwrap().rows.is_empty(),
+        "startup must collect owners it never tracked"
+    );
+    assert!(restarted.fits("package", "shape").unwrap());
+    assert_eq!(restarted.peaks(), vec![("package|shape".into(), 800)]);
+    // A second coordinator's collection must not destroy another service's
+    // still-held page containers. Reuse recognizes the old exact owner as orphaned.
+    let mut next = ChildRow::spawn(&fixture.ledger);
+    assert_eq!(next.owner.row, child.owner.row);
+    assert!(next.owner.generation > child.owner.generation);
+    assert_eq!(next.call("take"), "1 page-data");
+}
+
+#[test]
+fn admission_collects_an_unknown_owner_that_dies_after_restart() {
+    let fixture = Fixture::new();
+    let mut child = ChildRow::spawn(&fixture.ledger);
+    child.call("running unknown");
+    let restarted = Ledger::create(&fixture.name, CAPACITY).unwrap();
+    assert!(!restarted.fits("package", "shape").unwrap());
+    child.kill();
+    assert!(restarted.fits("package", "shape").unwrap());
+    assert!(restarted.status().unwrap().rows.is_empty());
+}
+
+#[test]
+fn live_kernel_claims_survive_restart_and_pid_reuse_even_with_nonexistent_pid_metadata() {
+    let fixture = Fixture::new();
+    let pid = u32::MAX;
+    let mut old = ChildRow::spawn_with_pid(&fixture.ledger, Some(pid));
+    old.kill();
+    fixture.ledger.reap(pid).unwrap();
+    let mut live = ChildRow::spawn_with_pid(&fixture.ledger, Some(pid));
+    assert_eq!(live.owner.row, old.owner.row);
+    assert!(live.owner.generation > old.owner.generation);
+    live.call("publish 300");
+    fixture.ledger.record_peak("package", "shape", 800).unwrap();
+    let restarted = Ledger::create(&fixture.name, CAPACITY).unwrap();
+    assert_eq!(restarted.status().unwrap().rows[0].state, State::Live);
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            let ledger = &restarted;
+            scope.spawn(move || {
+                for _ in 0..32 {
+                    assert!(
+                        ledger.reap(pid).is_err(),
+                        "a PID hint cannot override a live OFD claim"
+                    );
+                    assert!(!ledger.fits("package", "shape").unwrap());
+                }
+            });
+        }
+        assert_eq!(live.call("publish 300"), "ok");
+    });
+    let rows = restarted.status().unwrap().rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].owner, live.owner);
+    assert_eq!(rows[0].snapshot.classes, [300; 7]);
+    assert_eq!(rows[0].pid, pid);
+    assert_eq!(rows[0].state, State::Live);
 }
 
 #[test]
