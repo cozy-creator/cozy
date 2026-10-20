@@ -9,7 +9,7 @@ use protocol::{
 };
 
 use super::{exit_code, follow, submit};
-use crate::{Context, model::refs::Repo};
+use crate::{Context, model::refs};
 
 pub async fn exec(
     ctx: &Context,
@@ -21,7 +21,7 @@ pub async fn exec(
         Some((number, output)) => (number, Some(output)),
         None => (reference, None),
     };
-    let destination = Repo::hub(model)?;
+    let destination = refs::destination(model)?;
     let run = ctx.calcifer().await?.run(number).await?;
     let item = weights(&run, output)?;
     let machine = run.machine.clone().ok_or_else(|| {
@@ -85,7 +85,7 @@ fn weights<'a>(run: &'a Run, output: Option<&str>) -> Result<&'a OutputItem, Err
 }
 
 /// A WARM run on the run's machine: the output's checkpoint by hash, into `destination`.
-fn submission(run: &Run, item: &OutputItem, machine: String, destination: &Repo) -> SubmitRun {
+fn submission(run: &Run, item: &OutputItem, machine: String, destination: &str) -> SubmitRun {
     let model = match &item.checkpoint {
         Some(reference) => ModelChoice {
             parameter: item.name.clone(),
@@ -107,7 +107,7 @@ fn submission(run: &Run, item: &OutputItem, machine: String, destination: &Repo)
     let spec = v1::RunSpec {
         kind: v1::RunKind::Warm,
         models: vec![model],
-        weights_destination: destination.to_string(),
+        weights_destination: destination.to_owned(),
         ..Default::default()
     };
     SubmitRun {
@@ -185,17 +185,17 @@ mod tests {
     #[test]
     fn an_upload_is_a_warm_run_on_the_runs_machine() {
         let held = run(&[("int8", CHECKPOINT, true)]);
-        let destination = Repo::hub("Paul/SDXL-int8").unwrap();
+        let destination = refs::destination("Paul/SDXL-int8").unwrap();
         let submit = submission(&held, &held.output[0], "kiyui".into(), &destination);
         assert_eq!(
             (submit.on, submit.kind),
             (On::Machine("kiyui".into()), RunKind::Warm)
         );
-        assert_eq!(submit.target, "upload 7#int8 to paul/sdxl-int8");
+        assert_eq!(submit.target, "upload 7#int8 to paul/sdxl-int8@main");
         let spec = submit.spec;
         assert_eq!(
             (spec.kind, spec.weights_destination.as_str()),
-            (v1::RunKind::Warm, "paul/sdxl-int8")
+            (v1::RunKind::Warm, "paul/sdxl-int8@main")
         );
         let model = &spec.models[0];
         assert_eq!(
@@ -204,7 +204,7 @@ mod tests {
         );
         assert_eq!(model.manifest, Digest::of(b"int8").to_string());
         assert!(model.repository.is_empty() && model.release.is_empty());
-        assert!(Repo::hub("local/x").is_err());
+        assert!(refs::destination("local/x").is_err());
     }
 
     #[test]
@@ -215,10 +215,11 @@ mod tests {
             repo_id: "local/derived".into(),
             revision: format!("sha256:{}", "a".repeat(64)),
             variant: "f32".into(),
+            tag: String::new(),
         };
         held.output[0].checkpoint = Some(reference.clone());
         let item = weights(&held, Some("model")).unwrap();
-        let destination = Repo::hub("owner/retry").unwrap();
+        let destination = refs::destination("owner/retry").unwrap();
         let sent = submission(&held, item, "original-machine".into(), &destination);
         assert_eq!(sent.on, On::Machine("original-machine".into()));
         assert_eq!(sent.spec.kind, v1::RunKind::Warm);

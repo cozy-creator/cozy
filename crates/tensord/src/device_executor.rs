@@ -528,6 +528,7 @@ pub struct Frame {
     pub repo_id: String,
     pub revision: String,
     pub variant: String,
+    pub tag: String,
 }
 
 impl Frame {

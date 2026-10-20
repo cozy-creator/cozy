@@ -123,23 +123,22 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
     if !ctx.json && run.status == Status::Completed {
         match written_checkpoint(&run, lane) {
             Some(WrittenCheckpoint::Reference(reference)) => {
-                let mut record = Record::new().field(
-                    "checkpoint",
-                    format!("{}@{}", reference.repo_id, reference.revision),
-                );
+                let (model, tree) = (&reference.repo_id, &reference.revision);
+                let mut record = Record::new().field("checkpoint", format!("{model}@{tree}"));
                 if !reference.variant.is_empty() {
                     record = record.field("variant", &reference.variant);
                 }
                 record.print(ctx);
+                // The release it was made from moves to the commit that adds its variant.
+                let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
+                let release = pinned.filter(|_| destination == repo).unwrap_or("<version>");
+                output::next(ctx, &[&format!("cozy model publish {model} --release {release} --commit {tree}")]);
             }
             Some(WrittenCheckpoint::Header(header)) => {
                 Record::new().field("checkpoint header", header).print(ctx);
             }
             Some(WrittenCheckpoint::Legacy(digest)) => {
-                let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
-                let release = pinned.filter(|_| destination == repo).unwrap_or("<release>");
                 Record::new().field("checkpoint", format!("{destination}#{digest}")).print(ctx);
-                output::next(ctx, &[&format!("cozy model publish {destination} --release {release} --lane {lane}={digest}")]);
             }
             None => {}
         }

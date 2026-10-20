@@ -320,6 +320,7 @@ fn checkpoint(revision: &str, rev: u64) -> v1::Product {
             repo_id: "local/derived".into(),
             revision: revision.into(),
             variant: "fp8".into(),
+            tag: String::new(),
         }),
         ..Default::default()
     }
