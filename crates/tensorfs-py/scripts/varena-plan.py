@@ -530,7 +530,7 @@ def kept(mem: vt.Memory, card: Card, orphans: int, weights: bool) -> None:
 
 def case(name: str, card: Card, limit: int | None, orphans: int = 0, weights: bool = False) -> None:
     mem, core, models = build(card, limit, orphans, weights)
-    dit = models["transformer_ref"].ws.name
+    dit, asks = models["transformer_ref"].ws.name, []
     for warm in (False, True):
         label, since, moved, retries = f"{name} {'warm' if warm else 'cold'}", len(core.events), core.moved(), mem.memo.retries
         start = CARD.allocated
@@ -540,6 +540,7 @@ def case(name: str, card: Card, limit: int | None, orphans: int = 0, weights: bo
             check(f"{label}: completes", False, f"{type(exc).__name__}: {exc}")
             return
         check(f"{label}: completes", True)
+        asks += [e for e in stats.evictions if e.reason.startswith("asked") and e.nbytes > 0]
         plan_checks(label, mem, core, since, core.moved() - moved, stats)
         settled(label, mem, core, start)
         if warm and limit is None:
@@ -551,6 +552,7 @@ def case(name: str, card: Card, limit: int | None, orphans: int = 0, weights: bo
             check(f"{label}: the DiT reads 0 B after its first pass", len(later) == 7 and read == 0, read)
     if orphans:
         check(f"{name}: the other row gave bytes back on demand ({card.foreign / GIB:.2f} GiB left)", card.foreign < orphans)
+        check(f"{name}: the request's stats name each ask and what it got", asks, asks)
     failure(name, mem, core, models)
 
 

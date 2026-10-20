@@ -1005,9 +1005,15 @@ class Memory:
         if spare:
             rows = [f for f in table.snapshot() if f.state == "live" and f.slot != row.id]
             need = min(need, sum(f.reclaimable for f in rows if not f.resident))
-        for asked in table.ask(need, row.id) if need > 0 else ():
+        if need <= 0:
+            return 0
+        victims = table.ask(need, row.id)
+        for asked in victims:
             table.wait(asked)
-        return max(self._free() - before, 0)
+        got = max(self._free() - before, 0)
+        rows = ", ".join(f"pid {v.pid} {v.bytes} B" for v in victims) or "no row could give"
+        self.noted(2, f"asked {need} B{' spare' if spare else ''}: {rows}", got)
+        return got
 
     def _others(self) -> int:
         """What idle tenants can give on an ask (§5.6: their cold weights, slack, caches): rows
@@ -1122,10 +1128,11 @@ class Memory:
     def exhausted(self, device: torch.device, need: int, op: str) -> Exception:
         return self._exhausted(need, op)
 
-    def hosted(self, nbytes: int, op: str) -> None:
-        """Rung 5 put `op`'s result in host memory: the request's evictions say so."""
+    def noted(self, rung: int, why: str, nbytes: int) -> None:
+        """A rung's bytes that no model of this process gave (another row's answer to an ask,
+        rung 5's host memory): the request's evictions say so."""
         for request in self._requests():
-            request.evictions.append(Eviction("", self.gpu, 5, f"hosted {op}", nbytes))
+            request.evictions.append(Eviction("", self.gpu, rung, why, nbytes))
 
     def _idle(self) -> int:
         """Rung 1: torch's slack and the core's idle chunks."""
