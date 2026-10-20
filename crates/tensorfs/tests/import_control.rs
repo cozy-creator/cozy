@@ -433,7 +433,7 @@ async fn explicit_caller_and_legacy_sync_paths_produce_the_identical_header() {
 }
 
 #[test]
-fn cancellation_after_progress_stops_before_tensor_write_and_final_commit() {
+fn cancellation_after_progress_stops_before_tensor_write() {
     let scratch = Scratch::new();
     let file = scratch.0.join("model.safetensors");
     fs::write(&file, safetensors()).unwrap();
@@ -465,6 +465,70 @@ fn cancellation_after_progress_stops_before_tensor_write_and_final_commit() {
     assert_eq!(error.code, Code::TRANSFER_FAILED);
     assert!(!writer.has("model", "weight"));
     assert!(writer.committed().is_none());
+}
+
+#[test]
+fn stop_after_real_tensor_write_prevents_final_commit() {
+    struct StopAfterPut<'a> {
+        writer: &'a mut tensorfs::writer::Writer,
+        stop: &'a AtomicBool,
+    }
+    impl import::Sink for StopAfterPut<'_> {
+        fn begin(&mut self, variant: &str, layout: &import::Layout) -> Result<()> {
+            import::Sink::begin(self.writer, variant, layout)
+        }
+        fn put(
+            &mut self,
+            component: &str,
+            key: &str,
+            dtype: &tensorfs::format::Dtype,
+            shape: &[u64],
+            encoding: Option<&tensorfs::format::Encoding>,
+            parts: Vec<import::Part<'_>>,
+        ) -> Result<()> {
+            import::Sink::put(self.writer, component, key, dtype, shape, encoding, parts)?;
+            self.stop.store(true, Ordering::Release);
+            Ok(())
+        }
+        fn commit(&mut self, metadata: tensorfs::format::Metadata) -> Result<()> {
+            import::Sink::commit(self.writer, metadata)
+        }
+    }
+    let scratch = Scratch::new();
+    let file = scratch.0.join("model.safetensors");
+    fs::write(&file, safetensors()).unwrap();
+    let sources = vec![file.to_str().unwrap().to_owned()];
+    let store = Store::open(scratch.0.join("store")).unwrap();
+    let mut writer = store.writer(None, None).unwrap();
+    let stop = AtomicBool::new(false);
+    let stopping = || stop.load(Ordering::Acquire);
+    let access = Access::default();
+    let tmp = store.root().join("tmp");
+    let error = import::convert(
+        &Request {
+            sources: &sources,
+            converter: None,
+            variant: None,
+            access: &access,
+            tmp: &tmp,
+            progress: &|_, _, _| {},
+            stop: Some(&stopping),
+        },
+        &mut StopAfterPut {
+            writer: &mut writer,
+            stop: &stop,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.code, Code::TRANSFER_FAILED);
+    assert!(
+        writer.has("model", "weight"),
+        "real tensor write did not finish"
+    );
+    assert!(
+        writer.committed().is_none(),
+        "cancellation committed the header"
+    );
 }
 
 #[test]
@@ -503,10 +567,11 @@ fn late_stop_cannot_undo_header_finalization_but_prevents_tree_and_ref_publicati
 
 #[test]
 fn owned_drop_cancels_stalled_worker_after_caller_stops_driving_io() {
-    struct CancelOnDrop(Arc<AtomicBool>);
+    struct CancelOnDrop(Arc<AtomicBool>, Arc<tokio::sync::Notify>);
     impl Drop for CancelOnDrop {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
+            self.1.notify_waiters();
         }
     }
     let scratch = Scratch::new();
@@ -517,8 +582,10 @@ fn owned_drop_cancels_stalled_worker_after_caller_stops_driving_io() {
         .build()
         .unwrap();
     let flag = Arc::new(AtomicBool::new(false));
-    let cancel = CancelOnDrop(flag.clone());
-    let worker_access = access(&origin, Some(runtime.handle().clone()), Some(flag), None);
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let cancel = CancelOnDrop(flag.clone(), notify.clone());
+    let mut worker_access = access(&origin, Some(runtime.handle().clone()), Some(flag), None);
+    worker_access.cancel_notify = Some(notify);
     let (send, recv) = std::sync::mpsc::sync_channel(1);
     runtime.block_on(async {
         tokio::task::spawn_blocking(move || {
