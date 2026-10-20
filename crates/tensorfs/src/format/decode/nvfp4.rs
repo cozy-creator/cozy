@@ -8,7 +8,7 @@ use super::plan::{Codes, Core, Elems, Post};
 use super::{elem, logical, one, Allowed, Ctx, Dtypes, Param, Part, Plan, Scheme, Shape, View};
 use crate::format::Result;
 
-const F32: Dtypes = Dtypes::Of(&["F32"]);
+const F32: Dtypes = &["F32"];
 
 pub const NVFP4: Scheme = Scheme {
     name: "nvfp4",
@@ -27,24 +27,16 @@ pub const NVFP4: Scheme = Scheme {
             allowed: Allowed::Text(&["low_first", "high_first"]),
         },
         SCALE_LAYOUT,
-        Param {
-            key: "pre_quant_scale_dtype",
-            allowed: Allowed::PartDtype("pre_quant_scale", &["F32", "BF16", "F16"]),
-        },
     ],
     parts: &[
-        Part::req("weight", Dtypes::Of(&["F4"]), logical),
-        Part::req("scale", Dtypes::Of(&["F8_E4M3"]), |c| {
+        Part::req("weight", &["F4"], logical),
+        Part::req("scale", &["F8_E4M3"], |c| {
             whole_blocks(c)?;
             blocks(c).shape(c)
         }),
         Part::req("scale_2", F32, |c| per_matrix(c, "scale_2")),
         Part::opt("input_scale", F32, |c| per_matrix(c, "input_scale")),
-        Part::opt(
-            "pre_quant_scale",
-            Dtypes::Param("pre_quant_scale_dtype"),
-            |c| Grid::Col.shape(c),
-        ),
+        Part::opt("pre_quant_scale", &["F32", "BF16", "F16"], |c| Grid::Col.shape(c)),
     ],
     decode,
 };

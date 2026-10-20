@@ -1,1 +1,1 @@
-{"format":"tensorfs.repo/1","name":"Conformance/nvfp4","releases":[{"tree":{"length":253,"sha256":"1d076f0a58d12e64550eea181816503f6643a8c4a8b5d956a7fea4bb804ffa73"},"version":"1"}]}
+{"format":"cozytensors.repo/1","name":"Conformance/nvfp4","releases":[{"tree":{"length":256,"sha256":"1978e32a4385027448b4d75f131adbb04541a2f4893f9c7171371b396c1711cf"},"version":"1"}]}

@@ -51,7 +51,7 @@ pub const NESTED: usize = 256;
 /// The f32 nearest 1/127, which `bnb.int8` multiplies by.
 pub const R127: u32 = 0x3c01_0204;
 
-const F32: Dtypes = Dtypes::Of(&["F32"]);
+const F32: Dtypes = &["F32"];
 const NIBBLES: Packing = Packing {
     bits: 4,
     word: 8,
@@ -72,10 +72,10 @@ const FOUR_BIT_PARAMS: &[Param] = &[
     },
 ];
 const FOUR_BIT_PARTS: &[Part] = &[
-    Part::req("weight", Dtypes::Of(&["U8"]), |c| {
+    Part::req("weight", &["U8"], |c| {
         exact(&[c.cols.div_ceil(2), 1])
     }),
-    Part::req("absmax", Dtypes::Of(&["F32", "U8"]), |c| {
+    Part::req("absmax", &["F32", "U8"], |c| {
         exact(&[blocks(c)])
     }),
     Part::req("quant_map", F32, |_| exact(&[16])),
@@ -107,9 +107,9 @@ pub const INT8: Scheme = Scheme {
     view: View::Matrix,
     params: &[],
     parts: &[
-        Part::req("weight", Dtypes::Of(&["I8"]), logical),
+        Part::req("weight", &["I8"], logical),
         Part::req("SCB", F32, |c| Grid::Row.shape(c)),
-        Part::opt("weight_format", Dtypes::Of(&["U8"]), one),
+        Part::opt("weight_format", &["U8"], one),
     ],
     decode: int8,
 };

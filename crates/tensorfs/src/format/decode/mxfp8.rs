@@ -2,7 +2,7 @@
 
 use super::grid::{Grid, ScaleLayout};
 use super::plan::Codes;
-use super::{logical, Allowed, Ctx, Dtypes, Param, Part, Scheme, View};
+use super::{logical, Allowed, Ctx, Param, Part, Scheme, View};
 
 pub const MXFP8: Scheme = Scheme {
     name: "mxfp8",
@@ -15,8 +15,8 @@ pub const MXFP8: Scheme = Scheme {
         SCALE_LAYOUT,
     ],
     parts: &[
-        Part::req("weight", Dtypes::Of(&["F8_E4M3", "F8_E5M2"]), logical),
-        Part::req("scale", Dtypes::Of(&["F8_E8M0"]), |c| blocks(c).shape(c)),
+        Part::req("weight", &["F8_E4M3", "F8_E5M2"], logical),
+        Part::req("scale", &["F8_E8M0"], |c| blocks(c).shape(c)),
     ],
     decode: |c| Ok(Codes::elements(c.part("weight"), c.part("scale"), blocks(c)).into()),
 };
