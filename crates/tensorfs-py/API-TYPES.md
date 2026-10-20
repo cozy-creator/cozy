@@ -255,10 +255,6 @@ class Component:
         ...
 
     @property
-    def config_file(self) -> str:
-        """The rendered config's file name (`config.json` by default)."""
-
-    @property
     def tensors(self) -> Tensors:
         """`key -> TensorMetadata`, in construction order."""
 
@@ -269,8 +265,8 @@ class Component:
     def asset(self, name: str) -> bytes:
         """An asset's bytes; a parsed header raises `UnsupportedError`."""
 
-    @property
-    def path(self) -> str:
+    def export_files(self, directory: str | PathLike[str]) -> str:
+        """Write configuration and supporting files for a file-based consumer; no tensor weights."""
         ...
 
     def __repr__(self) -> str:
@@ -425,7 +421,7 @@ class Writer:
     def pipeline(self, cls: str, config: Mapping[str, object]) -> None:
         ...
 
-    def component(self, name: str, *, cls: str, config: Mapping[str, object], config_file: str='config.json') -> ComponentWriter:
+    def component(self, name: str, *, cls: str, config: Mapping[str, object]) -> ComponentWriter:
         ...
 
     def commit(self) -> Checkpoint:

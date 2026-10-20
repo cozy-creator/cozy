@@ -112,13 +112,12 @@ impl Component {
     pub fn name(&self) -> &str;
     pub fn class(&self) -> &str;
     pub fn config(&self) -> &format::Config;
-    pub fn config_file(&self) -> &str;
     pub fn tensors(&self) -> &[format::Tensor];
     pub fn assets(&self) -> &BTreeMap<String, ObjectRef>;
     pub fn read(&self, key: &str) -> Result<Vec<u8>>;
     pub fn read_part_into(&self, key: &str, role: &str, offset: u64, buf: &mut [u8]) -> Result<()>;
     pub fn asset(&self, name: &str) -> Result<Vec<u8>>;
-    pub fn folder(&self) -> Result<PathBuf>;
+    pub fn export_files(&self, directory: &Path) -> Result<PathBuf>;
 }
 // Tensors selects every part of each named key. Part selects the chunks overlapping
 // its stored byte range. Invalid names, roles and ranges return Failure.
@@ -183,7 +182,7 @@ pub struct Writer { /* owned local and optional remote write state */ }
 impl Writer {
     pub fn pipeline(&mut self, class: &str, config: format::Config) -> Result<()>;
     pub fn component(&mut self, name: &str, class: &str,
-        config: format::Config, config_file: Option<&str>) -> Result<ComponentWriter<'_>>;
+        config: format::Config) -> Result<ComponentWriter<'_>>;
     pub fn set_metadata(&mut self, key: &str, value: Value) -> Result<()>;
     pub fn has(&self, component: &str, key: &str) -> Result<bool>;
     pub async fn commit(&mut self) -> Result<Checkpoint>;
