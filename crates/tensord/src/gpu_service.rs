@@ -876,7 +876,8 @@ impl Pool {
     /// child, an idle deviceless executor, then an idle executor (outside every warm set
     /// first) on a GPU no call holds. Whether anything went back.
     pub fn give_back_one(&self) -> bool {
-        self.end_idle_parent(false) > 0
+        self.devices.iter().any(|device| device.memory.placement().is_ok_and(|memory| memory.release_unused_ram()))
+            || self.end_idle_parent(false) > 0
             || self.end_idle_deviceless(|_| true)
             || self.end_lru_idle("", false, 0..0)
     }

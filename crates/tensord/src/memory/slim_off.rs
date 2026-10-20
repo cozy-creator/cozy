@@ -32,6 +32,9 @@ impl Memory {
     pub fn fits(&self, _: &str, _: &str) -> io::Result<bool> {
         unsupported()
     }
+    pub fn release_unused_ram(&self) -> bool {
+        false
+    }
     pub fn capacity(&self) -> u64 {
         0
     }
