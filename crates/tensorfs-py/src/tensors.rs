@@ -13,8 +13,8 @@ use tensorfs::io::{DeviceBuffer, Dst, ReadOpts, Target};
 use tensorfs::{Checkpoint, Failure, Kind};
 
 use crate::store::{
-    invalid, metadata, raise, Aligned, ArrayBuffer, CheckpointAccess, DeviceArray, FetchTensor,
-    OrRaise, PyArray,
+    defer_failed_cuda, invalid, metadata, raise, Aligned, ArrayBuffer, CheckpointAccess,
+    DeviceArray, FetchTensor, OrRaise, PyArray,
 };
 
 /// A component's tensors: a mapping of key to `TensorMetadata`, with the reads.
@@ -107,30 +107,35 @@ impl PyTensors {
                     .ok_or_else(|| invalid(py, "unknown logical dtype width"))?;
                 let begin = offset / width;
                 let count = end.div_ceil(width) - begin;
-                return py
-                    .detach(|| -> Result<(), Failure> {
-                        let buffer = tensorfs::io::decode::read(
-                            &t.dtype,
-                            &t.shape,
-                            encoding,
-                            &views(&parts),
+                let result = py.detach(|| -> Result<(), Failure> {
+                    let buffer = tensorfs::io::decode::read(
+                        &t.dtype,
+                        &t.shape,
+                        encoding,
+                        &views(&parts),
+                        device,
+                        begin,
+                        count,
+                    )?;
+                    let copy = tensorfs::io::Copy {
+                        src: tensorfs::io::Src::Device {
                             device,
-                            begin,
-                            count,
-                        )?;
-                        let copy = tensorfs::io::Copy {
-                            src: tensorfs::io::Src::Device {
-                                device,
-                                ptr: buffer.ptr() + offset % width,
-                                stream: 0,
-                            },
-                            dst,
-                        };
-                        unsafe { tensorfs::io::read(&[copy], &ReadOpts::default()) }
-                            .map_err(|e| Failure::from(e.source))?;
-                        Ok(())
-                    })
-                    .or_raise(py);
+                            ptr: buffer.ptr() + offset % width,
+                            stream: 0,
+                        },
+                        dst,
+                    };
+                    if let Err(error) = unsafe { tensorfs::io::read(&[copy], &ReadOpts::default()) }
+                    {
+                        defer_failed_cuda(device, buffer);
+                        return Err(error.source.into());
+                    }
+                    Ok(())
+                });
+                if result.is_err() {
+                    defer_failed_cuda(device, parts);
+                }
+                return result.or_raise(py);
             }
             let array = self
                 .load(py, std::slice::from_ref(&key), true, None)?
@@ -251,9 +256,18 @@ impl PyTensors {
             })
             .collect();
         // SAFETY: each destination is its own buffer, held until the read returns.
-        py.detach(|| unsafe { tensorfs::raw::read_into(ck, &targets, &ReadOpts::default()) })
-            .or_raise(py)?;
+        let result =
+            py.detach(|| unsafe { tensorfs::raw::read_into(ck, &targets, &ReadOpts::default()) });
         drop(targets);
+        if let Err(error) = result {
+            if let Some(device) = wants
+                .iter()
+                .find_map(|want| want.device.as_ref().map(|buffer| buffer.device()))
+            {
+                defer_failed_cuda(device, wants);
+            }
+            return Err(raise(py, error));
+        }
         let mut by_key: Vec<Vec<Want>> = keys.iter().map(|_| Vec::new()).collect();
         for w in wants {
             by_key[w.key].push(w);
@@ -291,23 +305,28 @@ impl PyTensors {
             };
             if decode_ {
                 if let Some(device) = device {
-                    let buffer = py
-                        .detach(|| {
-                            let views = views(&parts);
-                            let count = t
-                                .shape
-                                .iter()
-                                .try_fold(1u64, |n, d| n.checked_mul(*d))
-                                .ok_or_else(|| Failure {
-                                    kind: Kind::Invalid,
-                                    detail: "logical tensor size overflow".into(),
-                                })?;
-                            tensorfs::io::decode::read(
-                                &t.dtype, &t.shape, encoding, &views, device, 0, count,
-                            )
-                            .map(DeviceArray::new)
-                        })
-                        .or_raise(py)?;
+                    let decoded = py.detach(|| {
+                        let views = views(&parts);
+                        let count = t
+                            .shape
+                            .iter()
+                            .try_fold(1u64, |n, d| n.checked_mul(*d))
+                            .ok_or_else(|| Failure {
+                                kind: Kind::Invalid,
+                                detail: "logical tensor size overflow".into(),
+                            })?;
+                        tensorfs::io::decode::read(
+                            &t.dtype, &t.shape, encoding, &views, device, 0, count,
+                        )
+                        .map(DeviceArray::new)
+                    });
+                    let buffer = match decoded {
+                        Ok(buffer) => buffer,
+                        Err(error) => {
+                            defer_failed_cuda(device, parts);
+                            return Err(raise(py, error));
+                        }
+                    };
                     out.push(
                         Bound::new(
                             py,
@@ -476,7 +495,7 @@ impl PyTensors {
             let mut held = crate::store::Dlpack::of(py, out, None, None)?;
             let result = self.fill_target(py, key, role.as_deref(), offset, held.destination());
             if result.is_err() {
-                held.retain_after_cuda_error();
+                held.record_cuda_error();
             }
             let finished = py.detach(move || held.finish()).or_raise(py);
             return result.and(finished);

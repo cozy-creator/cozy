@@ -65,7 +65,7 @@ impl Read for DeviceSource {
         // A failed engine read is not a completion proof for its other copy streams.
         if let Err(error) = unsafe { engine::read(&[copy], &ReadOpts::default()) } {
             self.failed = true;
-            self.view.retain_after_cuda_error();
+            self.view.record_cuda_error();
             return Err(error.source);
         }
         self.offset += len;
