@@ -254,7 +254,12 @@ pub enum Trigger {
     /// Explicit permission to lower only this request's current-step watermark.
     Lower {
         request: RequestId,
-        need: u64,
+        /// Upcoming allocation room, in addition to the activation and streaming reserves.
+        allocation: u64,
+        /// Occupied bytes when this operation started, fixed across waits and re-decisions.
+        reclaim_from: u64,
+        /// Minimum newly reclaimed mapped bytes; a real OOM must not succeed as a no-op.
+        reclaim: u64,
     },
     End(RequestId),
 }
@@ -494,7 +499,7 @@ impl Table {
         Ok(counts)
     }
 
-    fn occupied(&self) -> Option<u64> {
+    pub(crate) fn occupied(&self) -> Option<u64> {
         let local = self
             .pages
             .iter()
@@ -713,7 +718,12 @@ pub fn decide(table: &Table, trigger: Trigger) -> Vec<Action> {
                 .unwrap_or_default()
         }
         Trigger::Load { row, model, level } => load(table, row, model, level),
-        Trigger::Lower { request, need } => lower(table, request, need),
+        Trigger::Lower {
+            request,
+            allocation,
+            reclaim_from,
+            reclaim,
+        } => lower(table, request, allocation, reclaim_from, reclaim),
         Trigger::Oom { request, need } => demand(table, request, need, None),
         Trigger::Bind { request, page } => {
             let Some(item) = table.page(page) else {
@@ -1011,7 +1021,13 @@ fn current(page: &Page, request: &Request) -> bool {
     })
 }
 
-fn lower(table: &Table, id: RequestId, need: u64) -> Vec<Action> {
+fn lower(
+    table: &Table,
+    id: RequestId,
+    allocation: u64,
+    reclaim_from: u64,
+    reclaim: u64,
+) -> Vec<Action> {
     let Some(request) = table.request(id) else {
         return vec![Action::Invalid("unknown request")];
     };
@@ -1058,16 +1074,20 @@ fn lower(table: &Table, id: RequestId, need: u64) -> Vec<Action> {
         .values()
         .map(|(max, count, mapped)| max.saturating_mul((*count).min(3)).saturating_sub(*mapped))
         .fold(0_u64, u64::saturating_add);
-    let budget = table
-        .capacity
-        .saturating_sub(fixed)
-        .saturating_sub(table.activation_reserve(false).unwrap_or(0))
-        .saturating_sub(ring)
-        .saturating_sub(need);
+    let Some(target) = table
+        .activation_reserve(false)
+        .and_then(|activation| activation.checked_add(ring))
+        .and_then(|reserved| reserved.checked_add(allocation))
+    else {
+        return vec![Action::Invalid("working set overflow")];
+    };
+    let budget = table.capacity.saturating_sub(fixed).saturating_sub(target);
     let mut plan = Planner::new(table);
-    let before = plan.allocated;
     for page in pages {
-        if home <= budget && before.saturating_sub(plan.allocated) >= need {
+        if home <= budget
+            && plan.shortfall(target) == 0
+            && reclaim_from.saturating_sub(plan.allocated) >= reclaim
+        {
             break;
         }
         plan.actions.push(Action::DropHome {
@@ -1079,10 +1099,16 @@ fn lower(table: &Table, id: RequestId, need: u64) -> Vec<Action> {
             plan.evict(page);
         }
     }
-    if before.saturating_sub(plan.allocated) < need {
+    let unreclaimed = reclaim.saturating_sub(reclaim_from.saturating_sub(plan.allocated));
+    let shortfall = if unreclaimed != 0 {
+        unreclaimed
+    } else {
+        plan.shortfall(target)
+    };
+    if shortfall != 0 {
         plan.actions.push(Action::Exhausted {
             request: id,
-            need: need.saturating_sub(before.saturating_sub(plan.allocated)),
+            need: shortfall,
         });
     }
     plan.actions
@@ -1367,6 +1393,175 @@ mod tests {
     }
 
     #[test]
+    fn lower_keeps_home_that_fits_the_allocation_and_streaming_ring() {
+        const MIB: u64 = 1 << 20;
+        let mut run = request(1);
+        run.working_sets = vec![Some(200 * MIB)];
+        let mut pages: Vec<_> = (1..=6)
+            .map(|id| {
+                let mut page = page(id, 100 * MIB);
+                page.uses = vec![usage(1, 0)];
+                page
+            })
+            .collect();
+        let mut context = page(7, 100 * MIB);
+        context.model = None;
+        context.kind = Kind::Context;
+        let mut scratch = page(8, 200 * MIB);
+        scratch.model = None;
+        scratch.kind = Kind::Scratch(1);
+        pages.extend([context, scratch]);
+        let mut table = Table {
+            capacity: 1400 * MIB,
+            pages,
+            rows: vec![Row {
+                id: 1,
+                alive: true,
+                reaping: false,
+            }],
+            requests: vec![run],
+            ..Default::default()
+        };
+        let actions = decide(
+            &table,
+            Trigger::Lower {
+                request: 1,
+                allocation: 600 * MIB,
+                reclaim_from: table.occupied().unwrap(),
+                reclaim: 1,
+            },
+        );
+        // 100 context + 200 live activation + 200 home + 300 ring +
+        // (536 allocation + 64 slack) = 1400 MiB. Four whole-page drops fit;
+        // freeing the allocation's full 600 MiB would discard two useful pages.
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::DropHome { .. }))
+                .count(),
+            4
+        );
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::Exhausted { .. })));
+        assert!(!actions.contains(&Action::Unmap(7)) && !actions.contains(&Action::Unmap(8)));
+
+        // Another 200 MiB of measured activation reserve consumes another
+        // 200 MiB of capacity: it must not buy back either retained page.
+        table.capacity = 1600 * MIB;
+        table.requests[0].working_sets[0] = Some(400 * MIB);
+        let actions = decide(
+            &table,
+            Trigger::Lower {
+                request: 1,
+                allocation: 600 * MIB,
+                reclaim_from: table.occupied().unwrap(),
+                reclaim: 1,
+            },
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::DropHome { .. }))
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn lower_after_a_real_oom_requires_progress_even_when_logical_room_fits() {
+        let mut weight = page(1, 40);
+        weight.uses = vec![usage(1, 0)];
+        let mut table = Table {
+            capacity: 100,
+            pages: vec![weight],
+            rows: vec![Row {
+                id: 1,
+                alive: true,
+                reaping: false,
+            }],
+            requests: vec![request(1)],
+            ..Default::default()
+        };
+        let lower = Trigger::Lower {
+            request: 1,
+            allocation: 10,
+            reclaim_from: table.occupied().unwrap(),
+            reclaim: 1,
+        };
+        assert_eq!(
+            decide(&table, lower),
+            vec![
+                Action::DropHome {
+                    request: 1,
+                    page: 1
+                },
+                Action::Unmap(1),
+            ]
+        );
+        table.pages[0].lowered.insert(1);
+        table.pages[0].tier = Tier::Disk;
+        assert_eq!(
+            decide(
+                &table,
+                Trigger::Lower {
+                    request: 1,
+                    allocation: 10,
+                    reclaim_from: table.occupied().unwrap(),
+                    reclaim: 1,
+                }
+            ),
+            vec![Action::Exhausted {
+                request: 1,
+                need: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn lower_retry_credits_the_same_operations_completed_reclaim() {
+        let mut pages = vec![page(1, 40), page(2, 40)];
+        for page in &mut pages {
+            page.uses = vec![usage(1, 0)];
+        }
+        let mut table = Table {
+            capacity: 150,
+            pages,
+            rows: vec![Row {
+                id: 1,
+                alive: true,
+                reaping: false,
+            }],
+            requests: vec![request(1)],
+            ..Default::default()
+        };
+        let lower = Trigger::Lower {
+            request: 1,
+            allocation: 10,
+            reclaim_from: table.occupied().unwrap(),
+            reclaim: 1,
+        };
+        assert_eq!(
+            decide(&table, lower),
+            vec![
+                Action::DropHome {
+                    request: 1,
+                    page: 2
+                },
+                Action::Unmap(2),
+            ]
+        );
+        // The mechanism waited for this unmap. It re-decides the SAME
+        // operation after completion, rather than reporting another OOM.
+        table.pages[1].lowered.insert(1);
+        table.pages[1].tier = Tier::Disk;
+        assert!(
+            decide(&table, lower).is_empty(),
+            "completed reclaim demanded another home page"
+        );
+    }
+
+    #[test]
     fn repeated_binds_cannot_select_a_later_declared_step() {
         let mut run = request(1);
         run.position.step = 1;
@@ -1558,7 +1753,9 @@ mod tests {
                 &table,
                 Trigger::Lower {
                     request: 1,
-                    need: 10
+                    allocation: 0,
+                    reclaim_from: table.occupied().unwrap(),
+                    reclaim: 10,
                 }
             ),
             vec![Action::Exhausted {
@@ -1637,7 +1834,9 @@ mod tests {
                 &lowered,
                 Trigger::Lower {
                     request: 1,
-                    need: 10
+                    allocation: 0,
+                    reclaim_from: lowered.occupied().unwrap(),
+                    reclaim: 10,
                 }
             ),
             vec![
