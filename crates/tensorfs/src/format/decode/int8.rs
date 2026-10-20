@@ -45,7 +45,7 @@ pub const CONVROT: Scheme = Scheme {
     params: &[
         Param {
             key: "rotation",
-            allowed: Allowed::Text(&["hadamard"]),
+            allowed: Allowed::Text(&["kron_regular_h4"]),
         },
         ROTATION_SIZE,
         SCALE_DTYPE,

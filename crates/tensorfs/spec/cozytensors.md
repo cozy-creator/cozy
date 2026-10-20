@@ -358,15 +358,18 @@ the next user, through `nvfp4`.
 
 ### `int8.convrot`
 
-- Params: `rotation: "hadamard"`; `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8` (256 in practice); `scale_dtype`.
+- Params: `rotation: "kron_regular_h4"`; `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8` (256 in practice);
+  `scale_dtype`.
 - Parts: `weight`: `I8`, the logical shape; `C` MUST be a multiple of `B`. `scale`: `scale_dtype`, on the row grid.
 - Decode: `value[i, gB + j] = round_L((y[i, g, j] × scale[i]) × 2^−k)`, with
   `y[i, g, ·] = weight[i, gB : gB + B] · H_B`.
 
-`H_B = H₄ ⊗ … ⊗ H₄` (`k` factors) with entries ±1, `H₄` as Appendix A.1. `H_B` is symmetric and `H_B · H_B = B · I`, so
-`2^−k · H_B` is the orthonormal rotation ComfyUI's ConvRot applies before quantizing each row. `y` is an exact integer
-(|y| ≤ 128·B ≤ 2^23), so its conversion to f32 is exact. One way to compute it: view each group of `B` as `k` base-4
-digits (most significant first) and apply `H₄` along every digit.
+**`kron_regular_h4`** is `H_B = H₄ ⊗ … ⊗ H₄` (`k` factors), the Kronecker power of the regular Hadamard `H₄` of
+Appendix A.1 (entries ±1, each row summing to 2). It is not the Sylvester (Walsh) matrix of size `B`, the
+Kronecker power of `[[1, 1], [1, −1]]`: the two differ in every row. `H_B` is symmetric and
+`H_B · H_B = B · I`, so `2^−k · H_B` is the orthonormal rotation ComfyUI's ConvRot applies before quantizing each
+row. `y` is an exact integer (|y| ≤ 128·B ≤ 2^23), so its conversion to f32 is exact. One way to compute it: view
+each group of `B` as `k` base-4 digits (most significant first) and apply `H₄` along every digit.
 
 ### `mxfp8`
 
@@ -717,7 +720,7 @@ construction order. A reference can be applied structurally:
 A scheme's constants (rule 2). Each table is listed in row-major order with its dtype and shape; its SHA-256 is that
 of its little-endian bytes in that dtype, and a reader MAY check its copy against it.
 
-### A.1 `H₄` (`int8.convrot`)
+### A.1 `H₄` (`kron_regular_h4`: `int8.convrot`, `comfy.*`)
 
 `I8 [4, 4]`, SHA-256 `8f2b2e629d1df5e0be97981cbf4b4d117c320dfec29a7cd72b2f497dcb680cea`:
 

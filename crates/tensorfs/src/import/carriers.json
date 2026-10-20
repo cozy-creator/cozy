@@ -140,7 +140,7 @@
         {"suffix": "weight", "role": "weight", "dtypes": ["I8"], "shape": "logical"},
         {"suffix": "weight_scale", "role": "scale", "dtypes": ["F32", "BF16", "F16"], "shape": "rows"}
       ],
-      "encoding": {"scheme": "int8.convrot", "params": {"rotation": "hadamard"}},
+      "encoding": {"scheme": "int8.convrot", "params": {"rotation": "kron_regular_h4"}},
       "marker_params": {"rotation_size": ["convrot_groupsize", 256]},
       "dtype_params": {"scale_dtype": "scale"}
     },
