@@ -164,6 +164,19 @@ impl Context {
     ) -> Result<Checkpoint> {
         // First acquire the native header owner, then build its repository context.
         let raw = self.store.checkpoint(header)?;
+        if self.dest.is_some() {
+            // A literal header contains run data only. Its returned handle has the same
+            // metadata as reopening that file, without inventing a repository context.
+            return Checkpoint::managed(
+                raw,
+                None,
+                None,
+                None,
+                Vec::new(),
+                self.store.clone(),
+                None,
+            );
+        }
         let mut parsed = Tree {
             files: files.clone(),
         };

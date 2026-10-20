@@ -413,6 +413,7 @@ async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_mo
         .unwrap();
     assert!(!dest.exists(), "header was published before commit");
     let old = first.commit().await.unwrap();
+    assert!(old.tree().is_none() && old.named().is_none() && old.variant().is_none());
     let original_header = fs::read(&dest).unwrap();
     assert_eq!(ObjectRef::of(&original_header), *old.id());
     assert!(!dest.parent().unwrap().join("chunks").exists());
