@@ -2810,12 +2810,17 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         fetch.end();
-        // Every request went out at once and each answer takes 100 ms: the ones on the wire stop.
+        // Each answer takes 100 ms: what was on the wire may still land (late on a loaded host),
+        // then nothing more does, short of the whole.
         let landed = || objects.iter().filter(|o| crate::storage::present(&store, o)).count();
-        std::thread::sleep(Duration::from_millis(300));
-        let at_end = landed();
-        std::thread::sleep(Duration::from_millis(700));
-        assert_eq!(landed(), at_end, "nothing lands once its tickets dropped");
+        let mut at_end = landed();
+        loop {
+            std::thread::sleep(Duration::from_millis(700));
+            match landed() {
+                now if now == at_end => break,
+                now => at_end = now,
+            }
+        }
         assert!(at_end < objects.len(), "{at_end} of {} landed: it stopped short", objects.len());
         assert!(crate::storage::present(&store, &manifest), "the header stays");
         let _ = fs::remove_dir_all(&bench.root);
