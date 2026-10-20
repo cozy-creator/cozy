@@ -492,7 +492,7 @@ def main() -> int:
     model.close()
     adopted(mem, ck, held, a, want, x)
     os.close(held)
-    finer_first(root.parent, dev)
+    relaxes(root.parent, dev)
     print(f"{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1
 
@@ -608,9 +608,9 @@ def adopted(mem: Memory, ck: tensorfs.Checkpoint, held: int, a: argparse.Namespa
     model.close()
 
 
-def finer_first(root: Path, dev: torch.device) -> None:
-    """A model whose peak fits beside its whole home only cut finer stays wholly at home: the
-    planner cuts finer (rung 3) before it lowers the watermark (rung 4)."""
+def relaxes(root: Path, dev: torch.device) -> None:
+    """A model whose peak fits beside its whole home only cut finer: its out-of-memory cuts
+    (rung 3 before rung 4), then planning relaxes the cut and streams instead of cutting."""
     dim, count, tokens = 4096, 16, 4096
     torch.manual_seed(0)
     plain = WideNet(dim, count).bfloat16()
@@ -641,11 +641,10 @@ def finer_first(root: Path, dev: torch.device) -> None:
     size = _served_size(("split", "wide"))
     check("a model that fits only cut finer equals the reference", same)
     check(
-        "it stays wholly at home, cut finer (rung 3 before rung 4)",
-        model.home_bytes() >= weights and size is not None and size < tokens,
-        f"home {model.home_bytes()} of {weights}, split {size}",
+        "its cut relaxed back to whole; it streams instead",
+        (size is None or size >= tokens) and model.home_bytes() < weights,
+        f"home {model.home_bytes()} of {weights}, split {size}, last {last}",
     )
-    check("its last pass moves no bytes", last.paged_in == 0 and last.streamed == 0, str(last))
     model.close()
 
 
