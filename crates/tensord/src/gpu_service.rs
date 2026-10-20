@@ -123,8 +123,12 @@ pub struct ImageKernels {
 }
 impl GpuConfig {
     pub fn load(path: &Path) -> io::Result<Self> {
-        let config: Self = serde_json::from_reader(File::open(path)?).map_err(io::Error::other)?;
-        let envelope = config.envelope();
+        serde_json::from_reader::<_, Self>(File::open(path)?).map_err(io::Error::other)?.checked()
+    }
+    /// The config, refused when its GPU scope repeats a device or its executors' environment
+    /// carries a credential.
+    pub fn checked(self) -> io::Result<Self> {
+        let envelope = self.envelope();
         let unique: std::collections::BTreeSet<_> = envelope.iter().collect();
         if unique.len() != envelope.len() {
             return Err(io::Error::new(
@@ -132,7 +136,7 @@ impl GpuConfig {
                 "GPU scope names one device or a list of distinct devices",
             ));
         }
-        if config
+        if self
             .environment
             .keys()
             .any(|key| key.contains("TOKEN") || key.contains("SECRET") || key.contains("PASSWORD"))
@@ -142,7 +146,7 @@ impl GpuConfig {
                 "device executor environment cannot carry credentials",
             ));
         }
-        Ok(config)
+        Ok(self)
     }
     /// A machine without GPUs: deviceless executors only, with a minimal environment whose
     /// home is `home`.
