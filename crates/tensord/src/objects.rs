@@ -1,9 +1,10 @@
 //! Objects a signer uploads (run inputs, local package sources), content-addressed. An upload
 //! lands byte ranges in any order, several side by side, and resumes from the ranges held. Bytes
-//! stage per signer and enter the TensorFS store only once every byte is held and the digest
-//! verifies. A run names only objects its own signer wrote, so another signer's object is neither
+//! stage per signer and enter the run objects' store (`cas`) only once every byte is held and the
+//! digest verifies. A run names only objects its own signer wrote, so another signer's object is neither
 //! readable nor reported as held.
 use crate::{
+    cas::Cas,
     execution::Engine,
     journal::{Artifact, Execution, HeldMemo, ResultRecord},
 };
@@ -19,8 +20,8 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use crate::storage::{self, pin, Disk, Store};
-use tensorfs::{format::ObjectRef, sha256, store::Error};
+use crate::reclaim::Disk;
+use tensorfs::{format::ObjectRef, sha256};
 
 /// The largest memoized result record this machine holds for reuse.
 const MEMO_RESULT_BYTES: usize = 48 << 10;
@@ -30,7 +31,7 @@ pub type Ranges = Vec<(u64, u64)>;
 
 pub struct Objects {
     root: PathBuf,
-    store: Arc<Store>,
+    cas: Cas,
     engine: Arc<Engine>,
     /// Uploads under way, by part file.
     uploads: Mutex<HashMap<PathBuf, Weak<Upload>>>,
@@ -161,16 +162,21 @@ fn write_held(part: &Path, length: u64, held: &Ranges) -> io::Result<()> {
 }
 
 impl Objects {
-    pub fn new(root: &Path, store: Arc<Store>, engine: Arc<Engine>) -> io::Result<Self> {
+    pub fn new(root: &Path, engine: Arc<Engine>) -> io::Result<Self> {
         fs::create_dir_all(root)?;
         Ok(Self {
             root: root.to_path_buf(),
-            store,
+            cas: engine.cas(),
             engine,
             uploads: Mutex::default(),
             #[cfg(test)]
             pause: Pause::default(),
         })
+    }
+
+    /// The store the objects are held in.
+    pub fn cas(&self) -> &Cas {
+        &self.cas
     }
 
     /// Excludes root release while a Write or an acceptance takes references.
@@ -182,46 +188,37 @@ impl Objects {
         self.pause.waiting.fetch_sub(1, Ordering::AcqRel);
         custody
     }
-    /// Pins `objects` in the store, last used now; called with `guard` held.
+    /// Renews `objects`, each here, so no sweep takes them soon; called with `guard` held.
     pub(crate) fn retain(&self, objects: &[ObjectRef]) -> io::Result<()> {
         for object in objects {
-            storage::hold(&self.store, &pin::object(&object.sha256), vec![object.clone()], None)?;
+            if !self.cas.reuse(object)? {
+                return Err(io::Error::new(io::ErrorKind::NotFound, format!("object {} is absent", object.id())));
+            }
         }
         Ok(())
     }
 
-    /// Releases the pins of objects no unfinished run names and nothing used for the TTL,
-    /// or for `IDLE` while the store's disk is low. Their bytes are then the store GC's.
+    /// Removes objects no unfinished run names and nothing used for the TTL, or for `IDLE`
+    /// while the disk is low.
     pub fn sweep(&self) -> io::Result<usize> {
-        self.release(match Disk::measure(self.store.root())?.short() {
+        self.release(match Disk::measure(&self.engine.root)?.short() {
             Some(_) => crate::reclaim::IDLE,
             None => crate::reclaim::TTL,
         })
     }
 
-    /// `sweep` over pins unused for `unused`. A pin written just before a crash has no journal
+    /// `sweep` over objects unused for `unused`. One written just before a crash has no journal
     /// row yet: it ages from its own last use.
     pub fn release(&self, unused: Duration) -> io::Result<usize> {
         let _custody = self.guard();
         let before = SystemTime::now().checked_sub(unused).unwrap_or(UNIX_EPOCH);
-        let since = before.duration_since(UNIX_EPOCH).unwrap_or_default();
-        let mut released = 0;
-        for (id, held) in self.store.pins().map_err(storage::io_error)? {
-            let Some(sha256) = id.strip_prefix("obj-") else {
-                continue;
-            };
-            if held.last_use > since.as_secs() {
-                continue;
-            }
-            if self.engine.with_journal(|j| j.object_releasable(sha256, since.as_millis() as i64))?
-                && self.store.unpin_unused(&id, held.last_use).map_err(storage::io_error)?
-            {
-                // A memo answered from this file cannot be answered any more.
-                self.engine.with_journal(|j| j.drop_held_memos(sha256))?;
-                released += 1;
-            }
+        let since = before.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        let released = self.cas.sweep(unused, &mut |sha256| self.engine.with_journal(|j| j.object_releasable(sha256, since)))?;
+        for sha256 in &released {
+            // A memo answered from this file cannot be answered any more.
+            self.engine.with_journal(|j| j.drop_held_memos(sha256))?;
         }
-        Ok(released)
+        Ok(released.len())
     }
 
     /// The stored object this signer wrote, or None.
@@ -232,7 +229,7 @@ impl Objects {
         let Some(length) = self.engine.with_journal(|j| j.object(actor, &hex))? else {
             return Ok(None);
         };
-        let path = self.store.path(&ObjectRef { sha256: hex, length }).map_err(storage::io_error)?;
+        let path = self.cas.path(&ObjectRef { sha256: hex, length })?;
         Ok(path.is_file().then_some((path, length)))
     }
 
@@ -309,10 +306,9 @@ impl Objects {
     /// later run of that signer may be handed it.
     pub fn adopt(&self, actor: &str, parent: &str, file: &Path, object: &ObjectRef) -> io::Result<()> {
         let _custody = self.guard();
-        if !self.store.reuse(object).map_err(storage::io_error)? {
-            self.store.put(File::open(file)?, Some(object)).map_err(storage::io_error)?;
+        if !self.cas.reuse(object)? {
+            self.cas.put(File::open(file)?, Some(object))?;
         }
-        self.retain(std::slice::from_ref(object))?;
         self.engine
             .with_journal(|j| j.adopt_object(actor, parent, object))?;
         Ok(())
@@ -400,8 +396,11 @@ impl Objects {
         };
         file.set_len(length)?;
         let missing = length - held.iter().map(|(s, e)| e - s).sum::<u64>();
-        storage::admits(&self.store, missing)
-            .map_err(|e| refused("machine_disk_full", format!("no room for the object: {e}")))?;
+        let disk = Disk::measure(&self.engine.root)?;
+        if missing > disk.free() {
+            let free = disk.free();
+            return Err(refused("machine_disk_full", format!("no room for the object: {missing} bytes do not fit, {free} are free past the reserve")));
+        }
         let landed = tokio::sync::watch::Sender::new(length - missing);
         let upload = Arc::new(Upload {
             actor: actor.to_string(),
@@ -439,10 +438,10 @@ impl Objects {
         #[cfg(test)]
         pause_at(&self.pause.settling);
         let stored = File::open(&upload.part).map_err(Refused::from).and_then(|part| {
-            self.store.put(part, Some(&upload.object)).map_err(|e| {
-                let code = match e {
-                    Error::Full { .. } => "machine_disk_full",
-                    Error::Mismatch { .. } => "object_digest_mismatch",
+            self.cas.put(part, Some(&upload.object)).map_err(|e| {
+                let code = match e.kind() {
+                    io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => "machine_disk_full",
+                    io::ErrorKind::InvalidData => "object_digest_mismatch",
                     _ => "object_storage_failed",
                 };
                 refused(code, e.to_string())
@@ -451,7 +450,6 @@ impl Objects {
         let _ = fs::remove_file(&upload.part);
         let _ = fs::remove_file(held_path(&upload.part));
         stored?;
-        self.retain(std::slice::from_ref(&upload.object))?;
         self.engine
             .with_journal(|j| j.bind_object(&upload.actor, &upload.object))?;
         Ok(held)
@@ -493,8 +491,7 @@ mod tests {
     fn objects(root: &Path) -> Objects {
         let service =
             crate::service::Service::open(&root.join("state"), &root.join("g"), 1).unwrap();
-        let store = storage::open(&root.join("tensorfs")).unwrap();
-        Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap()
+        Objects::new(&root.join("writes"), service.engine.clone()).unwrap()
     }
 
     /// An upload of an object whose whole part is being settled never truncates that part: it
@@ -571,7 +568,7 @@ mod tests {
         drop((first, second));
 
         // What was synced is held after a restart; the rest completes the object.
-        let objects = Objects::new(&root.join("writes"), objects.store.clone(), objects.engine.clone()).unwrap();
+        let objects = Objects::new(&root.join("writes"), objects.engine.clone()).unwrap();
         assert_eq!(objects.held("alice", &digest).unwrap(), [(0, 100_000), (200_000, 250_000)]);
         let upload = objects.upload("alice", &digest, length).unwrap().unwrap();
         upload.write_at(50_000, &bytes[50_000..200_000]).unwrap();

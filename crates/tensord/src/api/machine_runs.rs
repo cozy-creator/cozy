@@ -807,9 +807,8 @@ mod tests {
             .unwrap();
         drop(service);
         let service = Service::open(&state, &generations, 1).unwrap();
-        let store = crate::storage::open(&temp.path().join("store")).unwrap();
         let objects =
-            Arc::new(Objects::new(&temp.path().join("writes"), store, service.engine.clone()).unwrap());
+            Arc::new(Objects::new(&temp.path().join("writes"), service.engine.clone()).unwrap());
         let runs = Arc::new(Runs {
             service,
             objects,
@@ -872,8 +871,7 @@ mod tests {
     fn unusable_access_refuses_only_a_new_run() {
         let root = std::env::temp_dir().join(format!("cm-accept-{}", uuid::Uuid::new_v4()));
         let service = crate::service::Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
-        let store = crate::storage::open(&root.join("store")).unwrap();
-        let objects = Arc::new(crate::objects::Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
+        let objects = Arc::new(crate::objects::Objects::new(&root.join("writes"), service.engine.clone()).unwrap());
         let runs = Arc::new(crate::runs::Runs {
             service: service.clone(), objects, publisher: None, local: None, own_hub: None, leaf: None, contexts: Default::default(),
         });
