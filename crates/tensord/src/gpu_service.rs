@@ -3526,15 +3526,11 @@ fn materialize_tree(
     root: &Path,
 ) -> io::Result<()> {
     let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("tree manifest: {why}"));
-    let document = crate::trees::parse(manifest).map_err(|_| invalid("not a tree of files"))?;
+    let document = crate::trees::parse(manifest).map_err(|e| invalid(&e.to_string()))?;
     fs::create_dir(root)?;
     for (path, object) in &document {
         let (sha, length) = (&object.sha256, object.length);
         let relative = Path::new(path);
-        let local = relative.components().all(|c| matches!(c, std::path::Component::Normal(_)));
-        if !local || path.contains(['\\', '\0']) {
-            return Err(invalid("a path leaves its tree"));
-        }
         let target = root.join(relative);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
