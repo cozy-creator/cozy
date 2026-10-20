@@ -151,8 +151,8 @@ def bridge(cuts):
         def __dlpack__(self):
             return source.__dlpack__()
 
-        def _write_band(self, band, axis, offset):
-            writes.append((band, axis, offset))
+        def _write_band(self, band, axis, offset, *, stream):
+            writes.append((band, axis, offset, stream))
 
     array = Array()
 
@@ -169,7 +169,10 @@ def bridge(cuts):
         assert result is not None and factory_calls == [(tuple(source.shape), "F32", 321)]
         torch.testing.assert_close(result.tensor, source, rtol=0, atol=0)
         result.write_band(source, 1, 0)
-        assert writes == [(source, 1, 0)]
+        assert writes == [(source, 1, 0, 321)]
+        with patch.object(torch.cuda, "current_stream", return_value=SimpleNamespace(cuda_stream=654)):
+            result.write_band(source, 1, 0)
+        assert writes[-1] == (source, 1, 0, 654), "band write reused the allocation stream"
         factory_calls.clear()
         for unsupported in (like.transpose(1, 2), like.to(dtype=torch.int64)):
             assert call(memory, unsupported, source.device) is None
