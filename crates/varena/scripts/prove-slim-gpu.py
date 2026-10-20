@@ -61,7 +61,7 @@ def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
             print(stdout + stderr, flush=True)
             raise RuntimeError(f"Native GPU case {name} exceeded its test-harness bound") from None
         text = stdout + stderr
-        (logs / f"{name}.log").write_text(text)
+        (logs / f"{name.replace('::', '_')}.log").write_text(text)
         print(text, flush=True)
         summary = re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored", text)
         if process.returncode or marker not in text or not summary or summary[-1] != ("1", "0", "0"):
