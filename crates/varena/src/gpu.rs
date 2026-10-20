@@ -335,6 +335,13 @@ pub(crate) struct Pending {
     fill_generation: Option<u64>,
 }
 
+/// Actual mapping readiness, without turning a transient state into INVALID.
+pub(crate) enum BindState {
+    Ready { pin: Pin, pins: usize },
+    Empty,
+    Filling(Pending),
+}
+
 /// Holds mappings, never chooses victims. The policy invokes fill/unmap with page IDs.
 pub struct Gpu {
     device: Arc<Device>,
@@ -654,7 +661,22 @@ impl Gpu {
 
     pub fn bind(self: &Arc<Self>, id: PageId, stream: usize) -> Result<Pin> {
         self.poll()?;
+        match self.try_pin(id, stream)? {
+            BindState::Ready { pin, .. } => {
+                pin.wait_on(stream)?;
+                Ok(pin)
+            }
+            BindState::Empty | BindState::Filling(_) => {
+                Err(invalid("page has not finished filling"))
+            }
+        }
+    }
+
+    /// Pin only the actual ready mapping. No poll, stream wait or callback runs
+    /// here: placement calls it inside its short decision/publication gate.
+    pub(crate) fn try_pin(self: &Arc<Self>, id: PageId, stream: usize) -> Result<BindState> {
         let page = self.page(id)?;
+        let generation = self.generation.lock();
         let mut state = page.state.lock();
         if page.retired.load(Ordering::Acquire) {
             return Err(invalid("page is retired"));
@@ -662,22 +684,28 @@ impl Gpu {
         let mapping = match &mut *state {
             State::Ready(mapping) => mapping,
             State::Failed(_, error) => return Err(error.clone()),
-            _ => return Err(invalid("page has not finished filling")),
+            State::Empty => return Ok(BindState::Empty),
+            State::Filling => {
+                return Ok(BindState::Filling(Pending {
+                    event: None,
+                    fill_generation: Some(*generation),
+                }));
+            }
         };
-        if let Some(ready) = &mapping.ready {
-            ready.wait(stream)?;
-        }
         mapping.pins = mapping
             .pins
             .checked_add(1)
             .ok_or_else(|| invalid("pin count overflows"))?;
         let ptr = mapping.ptr();
-        Ok(Pin {
-            gpu: self.clone(),
-            page: page.clone(),
-            ptr,
-            bytes: page.bytes,
-            streams: Mutex::new(BTreeSet::from([stream])),
+        Ok(BindState::Ready {
+            pins: mapping.pins,
+            pin: Pin {
+                gpu: self.clone(),
+                page: page.clone(),
+                ptr,
+                bytes: page.bytes,
+                streams: Mutex::new(BTreeSet::from([stream])),
+            },
         })
     }
 
@@ -1072,6 +1100,12 @@ impl Gpu {
     /// events, so the planner cannot count such a mapping as immediately reclaimable.
     pub fn facts(&self) -> Result<Vec<(PageId, u64, usize, bool)>> {
         self.poll()?;
+        self.facts_current()
+    }
+
+    /// Capture without polling: placement serializes this capture and its
+    /// publication with pin acquisition, after any CUDA cleanup and IPC.
+    pub(crate) fn facts_current(&self) -> Result<Vec<(PageId, u64, usize, bool)>> {
         let mut facts = Vec::new();
         let pages: Vec<_> = self
             .pages
@@ -1145,14 +1179,11 @@ pub struct Pin {
 impl Pin {
     pub fn wait_on(&self, stream: usize) -> Result<()> {
         self.streams.lock().insert(stream);
-        let state = self.page.state.lock();
-        match &*state {
-            State::Ready(mapping) => mapping
-                .ready
-                .as_ref()
-                .map_or(Ok(()), |event| event.wait(stream)),
-            _ => Err(invalid("pinned page is not ready")),
-        }
+        let ready = match &*self.page.state.lock() {
+            State::Ready(mapping) => mapping.ready.clone(),
+            _ => return Err(invalid("pinned page is not ready")),
+        };
+        ready.as_ref().map_or(Ok(()), |event| event.wait(stream))
     }
 }
 
