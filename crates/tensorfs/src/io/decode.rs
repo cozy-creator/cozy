@@ -659,6 +659,62 @@ mod tests {
     use crate::format::decode::plan::{Elems, Post};
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn large_resident_factor_metadata_is_not_truncated_to_i32_offsets() {
+        let (rows, cols, group) = (16385u64, 262144u64, 4u64);
+        let shape = [rows, cols];
+        let weight = [rows, cols / 2];
+        let relative = [rows, cols / group];
+        let channel = [rows];
+        let correction = [cols / group, rows];
+        let typed = [
+            ("weight", Dtype::I8, weight.as_slice()),
+            ("weight_s_rel", Dtype::F32, relative.as_slice()),
+            ("weight_s_channel", Dtype::F32, channel.as_slice()),
+            ("weight_correction", Dtype::BF16, correction.as_slice()),
+        ];
+        let metadata: Vec<_> = typed
+            .iter()
+            .map(|(role, dtype, shape)| decode::PartMetadata {
+                role,
+                dtype,
+                shape,
+                len: dtype.byte_len(shape).unwrap() as usize,
+            })
+            .collect();
+        let encoding = Encoding {
+            scheme: "comfy.asym_w4a8_int8".into(),
+            params: BTreeMap::from([
+                ("group_size".into(), group.into()),
+                ("rotation_size".into(), 256u64.into()),
+            ]),
+        };
+        check(&encoding, &Dtype::BF16, &shape, &metadata).unwrap();
+        decode::planned_sources(
+            &Dtype::BF16,
+            &shape,
+            &encoding,
+            &metadata,
+            |plan, geometry| {
+                let Prepared::Kernel(launch) =
+                    kernels::prepare(plan, geometry, &Dtype::BF16, 0, rows * cols)?
+                else {
+                    panic!("resident plan fell back to Host");
+                };
+                let Factors::Slot { dtype, count, .. } = &launch.term else {
+                    panic!("correction was expanded on Host");
+                };
+                assert_eq!(*dtype, Dtype::BF16);
+                assert_eq!(*count as u64, rows * (cols / group));
+                assert!(*count > (i32::MAX as usize / 2));
+                // These are metadata-only slots: no multi-GiB input/scratch allocation or CUDA.
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn external_output_refusal_before_owned_inputs_does_not_panic_in_cleanup() {
         // An early missing-catalog/producer error used to call retain_decode(empty),
         // replacing the typed refusal with its "decode retains its output" panic.
