@@ -33,8 +33,8 @@ pub mod admission;
 pub mod err;
 #[cfg(feature = "store")]
 pub mod export;
-#[cfg(feature = "store")]
 pub mod failure;
+pub use failure::{Failure, Kind, Result};
 #[cfg(feature = "store")]
 pub mod fetch;
 #[cfg(feature = "store")]
@@ -51,7 +51,10 @@ pub mod ids;
 pub mod import;
 #[cfg(feature = "store")]
 pub mod ingest;
+/// The read engine: byte ranges of files into host or device destinations (xs-055).
+pub mod io;
 pub mod jcs;
+pub mod kernels;
 pub mod limits;
 pub mod machine;
 pub mod manifest;
@@ -95,6 +98,20 @@ pub mod unsynced;
 pub mod vectors;
 #[cfg(feature = "store")]
 pub mod writer;
+/// Advanced engine and synchronous-language integration.
+#[cfg(feature = "store")]
+pub mod raw;
+
+/// The public session API; networking uses the caller's async runtime.
+#[cfg(feature = "store")]
+mod session;
+#[cfg(feature = "store")]
+pub use session::{
+    bearer, export, Checkpoint, Client, Component, ComponentWriter, Config, Convert,
+    ConvertProgress, DPoP, Endpoint, Fetch, Fetched, Format, HeaderMap, JwtBearer, Open,
+    Progress, Ref, Request, Selection,
+    TokenProvider, Writer, WriterOptions,
+};
 
 
 /// This TensorFS's release version.
@@ -102,8 +119,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The on-disk Store this build reads and writes: layout, catalog and object encoding. The
 /// `cozy` binary and the `tensorfs` wheel share every Store ([`contract`]); a change an older
-/// build would misread bumps it, and the wheel's minor.
-pub const STORE_FORMAT: u32 = 1;
+/// build would misread bumps it, and the wheel's minor. The store's `format` record names it
+/// (`tensorfs.store/3`, D10: trees and component headers).
+pub const STORE_FORMAT: u32 = 3;
 
 /// The cross-process protocol over one Store: owner claim, writer guards, read leases and
 /// holds. Bumped like [`STORE_FORMAT`] by a change a process speaking the old one would break.

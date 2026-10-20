@@ -3,7 +3,8 @@
 //!
 //! The lock is `flock` on an `O_CLOEXEC` descriptor: held by its open file description, waited
 //! for, never inspected. A child forked meanwhile holds it only until it execs. Nothing else in
-//! the store locks; GC and puts take no lock at all.
+//! the store locks; a short shared acquisition fence also spans root publication so GC cannot
+//! delete bytes between metadata read and ownership publication.
 
 use std::fs;
 use std::io;
@@ -59,7 +60,7 @@ fn json(path: &Path, value: &impl Serialize) -> Result<Vec<u8>> {
 }
 
 impl Store {
-    fn lock(&self, dir: &str) -> Result<lock::DirLock> {
+    pub(super) fn lock(&self, dir: &str) -> Result<lock::DirLock> {
         let path = self.root.join(dir);
         lock::dir(&path).map_err(platform("lock", path))
     }
@@ -92,10 +93,52 @@ impl Store {
     /// Creates or replaces pin `id`.
     pub fn pin(&self, id: &str, pin: &Pin) -> Result<()> {
         let path = self.pin_path(id)?;
+        let _acquisition = super::retention::acquire(self)?;
         let _lock = self.lock("pins")?;
         let old = parse::<Pin>(&path)?.map_or_else(Vec::new, |old| old.roots);
         self.retain(pin.roots.iter().filter(|root| !old.contains(root)))?;
         self.commit(&path, &json(&path, pin)?, true)
+    }
+
+    /// Add durable content roots without replacing another owner's pin at the same id.
+    pub(crate) fn pin_roots(&self, id: &str, roots: &[ObjectRef]) -> Result<()> {
+        let path = self.pin_path(id)?;
+        let _acquisition = super::retention::acquire(self)?;
+        let _lock = self.lock("pins")?;
+        let mut pin = parse::<Pin>(&path)?.unwrap_or_else(|| Pin::new(Vec::new()));
+        let before = pin.roots.clone();
+        for root in roots {
+            if !pin.roots.contains(root) {
+                pin.roots.push(root.clone());
+            }
+        }
+        pin.last_use = pin.last_use.max(now_secs());
+        self.retain(pin.roots.iter().filter(|root| !before.contains(root)))?;
+        self.commit(&path, &json(&path, &pin)?, true)
+    }
+
+    /// Classification and replacement share the ordinary pin lock. A manual/operator pin
+    /// occupying the internal name stays unchanged; an optional cache copy may then miss.
+    pub(super) fn pin_cache(&self, root: &ObjectRef) -> Result<()> {
+        let id = format!("cache-{}", root.sha256);
+        let path = self.pin_path(&id)?;
+        let _acquisition = super::retention::acquire(self)?;
+        let _lock = self.lock("pins")?;
+        let old = parse::<Pin>(&path)?;
+        if old
+            .as_ref()
+            .is_some_and(|pin| !super::cache::owned(&id, pin))
+        {
+            return Ok(());
+        }
+        let mut pin = Pin::new(vec![root.clone()]);
+        pin.owner = Some(super::cache::OWNER.into());
+        self.retain(
+            pin.roots
+                .iter()
+                .filter(|root| !old.as_ref().is_some_and(|old| old.roots.contains(root))),
+        )?;
+        self.commit(&path, &json(&path, &pin)?, true)
     }
 
     pub fn get_pin(&self, id: &str) -> Result<Option<Pin>> {
@@ -118,6 +161,22 @@ impl Store {
     pub fn unpin(&self, id: &str) -> Result<bool> {
         let path = self.pin_path(id)?;
         let _lock = self.lock("pins")?;
+        if super::retention::protected(self, id)? {
+            return Ok(false);
+        }
+        self.remove_record(&path)
+    }
+
+    /// Only the retention reaper calls this after proving the hold fence is unowned.
+    pub(super) fn remove_hold_pin(&self, id: &str) -> Result<bool> {
+        if !id.starts_with("hold-") {
+            return Err(invalid(self.root.join("pins"), "not a retention hold"));
+        }
+        let path = self.pin_path(id)?;
+        let _lock = self.lock("pins")?;
+        if !parse::<Pin>(&path)?.is_some_and(|pin| super::retention::owned(id, &pin)) {
+            return Ok(false);
+        }
         self.remove_record(&path)
     }
 
@@ -126,6 +185,9 @@ impl Store {
         // `id` names a file `pins()` listed, so it needs no grammar check.
         let path = self.root.join("pins").join(format!("{id}.json"));
         let _lock = self.lock("pins")?;
+        if super::retention::protected(self, id)? {
+            return Ok(false);
+        }
         match parse::<Pin>(&path)? {
             Some(pin) if pin.last_use == last_use => self.remove_record(&path),
             _ => Ok(false),
@@ -188,7 +250,9 @@ impl Store {
         change: impl FnOnce(Option<Repo>) -> Option<Repo>,
     ) -> Result<Option<Repo>> {
         let path = self.ref_path(name)?;
+        let _acquisition = super::retention::acquire(self)?;
         let _lock = self.lock("refs")?;
+        let promoted = self.clear_cached_ref(name)?;
         let old = Self::parse_ref(&path)?;
         let lanes = |repo: &Option<Repo>| -> Vec<ObjectRef> {
             repo.iter().flat_map(Repo::roots).cloned().collect()
@@ -206,7 +270,11 @@ impl Store {
         }
         let bytes = new.to_json().map_err(|error| invalid(&path, error))?;
         let after = lanes(&Some(new.clone()));
-        self.retain(after.iter().filter(|lane| !before.contains(lane)))?;
+        self.retain(
+            after
+                .iter()
+                .filter(|lane| promoted || !before.contains(lane)),
+        )?;
         self.commit(&path, &bytes, true)?;
         Ok(Some(new))
     }
