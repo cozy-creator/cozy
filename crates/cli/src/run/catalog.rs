@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use platform::{durable, paths::Home};
 use protocol::config::Hub;
 use protocol::error::{Error, Kind};
-use hub_client::types;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
