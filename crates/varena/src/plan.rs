@@ -223,6 +223,8 @@ pub enum Trigger {
         need: u64,
         ceiling: Class,
     },
+    /// Admission needs idle cache references released, not any weight bytes evicted.
+    ReleaseUnusedCaches(RowId),
     Load {
         row: RowId,
         model: ModelId,
@@ -665,6 +667,25 @@ pub fn decide(table: &Table, trigger: Trigger) -> Vec<Action> {
     match trigger {
         Trigger::End(request) => vec![Action::Forget(request)],
         Trigger::Ask { row, need, ceiling } => reclaim(table, row, need, ceiling),
+        Trigger::ReleaseUnusedCaches(row) => {
+            if table.requests.iter().any(|request| request.row == row) {
+                return vec![];
+            }
+            table
+                .pages
+                .iter()
+                .filter(|page| {
+                    page.row == row
+                        && page.mapped()
+                        && page.kind == Kind::Cache
+                        && table.class(page) == Class::Unused
+                })
+                .map(|page| Action::Shrink {
+                    page: page.id,
+                    bytes: page.bytes,
+                })
+                .collect()
+        }
         Trigger::Load { row, model, level } => load(table, row, model, level),
         Trigger::Lower { request, need } => lower(table, request, need),
         Trigger::Oom { request, need } => demand(table, request, need, None),
@@ -1317,6 +1338,49 @@ mod tests {
             request,
             position: Position { step, order: 0 },
         }
+    }
+
+    #[test]
+    fn admission_releases_only_idle_unused_caches_even_when_the_cache_has_no_bytes() {
+        let mut pinned = page(1, 600);
+        pinned.pins = 1;
+        let mut cache = page(2, 0);
+        cache.kind = Kind::Cache;
+        cache.model = None;
+        let ordinary = page(3, 40);
+        let mut active_cache = cache.clone();
+        active_cache.id = 4;
+        active_cache.pins = 1;
+        let mut table = Table {
+            capacity: 1024,
+            pages: vec![pinned, cache, ordinary, active_cache],
+            rows: vec![Row {
+                id: 1,
+                alive: true,
+                reaping: false,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            decide(&table, Trigger::ReleaseUnusedCaches(1)),
+            vec![Action::Shrink { page: 2, bytes: 0 }]
+        );
+        table.pages.retain(|page| page.id != 2);
+        assert!(
+            decide(&table, Trigger::ReleaseUnusedCaches(1)).is_empty(),
+            "ordinary warm weights must remain mapped"
+        );
+        table.pages.push({
+            let mut cache = page(2, 8);
+            cache.kind = Kind::Cache;
+            cache.model = None;
+            cache
+        });
+        table.requests.push(request(7));
+        assert!(
+            decide(&table, Trigger::ReleaseUnusedCaches(1)).is_empty(),
+            "a newly admitted request prevents the idle-only release"
+        );
     }
 
     /// A small table oracle, not a simulated GPU or workload benchmark.
