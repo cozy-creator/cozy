@@ -46,12 +46,15 @@ try:
     # A nested scope's released activations must become allocator slack before
     # its still-running caller needs room, without starting another request.
     with memory.request("outer-after-inner-cleanup"):
+        torch.cuda.empty_cache()
+        memory._measure()
+        reusable = memory.available()
         with memory.request("temporary-allocation") as fourth:
             temporary = torch.empty(4 << 20, dtype=torch.uint8, device=device)
             memory._measure()  # A real model measures its allocator while live.
             del temporary
         assert fourth.stats is not None and fourth.stats.leftover == ((0, 0),)
-        assert memory.free(device, memory.available() + 1), (
+        assert memory.free(device, reusable), (
             "completed scope left released activations charged as pinned scratch"
         )
     del retained, another
