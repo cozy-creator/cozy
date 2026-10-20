@@ -102,6 +102,9 @@ pub async fn run(
         Some(level) => call.warm(level, &bound.models)?,
         None => call.spec(&bound)?,
     };
+    if args.warm.is_none() {
+        super::gpuless(ctx, &on, callable, &target).await;
+    }
     let bound = args.warm.is_none().then_some(&bound);
     let out = args.out.as_ref().map(|dir| terms.cwd.join(dir));
     let mut submission = call.submission(on, &hub.origin, &spec, bound, out);
