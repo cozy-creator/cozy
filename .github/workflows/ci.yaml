@@ -50,6 +50,7 @@ jobs:
     uses: ./.github/workflows/owner-day.yml
     secrets: inherit
     with:
-      # The 0.13 Hub fixture (tree refs) and the Runtime above, until this interface is released.
-      tensorhub_ref: a67f65eb0aee2e1d022dbaa8eba6ae4bd17d8662
+      # The 0.13 Hub (tags, and the class record: tensorhub#1242 xs054/class-record on master
+      # cac91b4a) and the Runtime above, until this interface is released.
+      tensorhub_ref: 7e31a1cf7ba8f97e33866fa8f45d4dd2dafe4294
       runtime_ref: fb2bb62e65285dbd283a44dd73798b4c712deac2
