@@ -85,6 +85,16 @@ pub fn region_holder(
         .then_some((fl.l_start as usize, fl.l_len as usize)))
 }
 
+/// Whether another description holds a write lock over any byte of the range.
+pub fn written(fd: BorrowedFd<'_>, start: usize, len: usize) -> Result<bool> {
+    let mut fl = flock(start, len, Region::Read);
+    // SAFETY: a lock query on a descriptor the caller holds.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_OFD_GETLK, &mut fl) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(fl.l_type != libc::F_UNLCK as libc::c_short)
+}
+
 fn flock(start: usize, len: usize, region: Region) -> libc::flock {
     libc::flock {
         l_type: match region {

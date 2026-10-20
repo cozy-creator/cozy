@@ -5,7 +5,7 @@
 
 mod common;
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
 use common::*;
 use tensorfs::read;
@@ -132,6 +132,52 @@ fn an_adopter_takes_a_layout_before_its_bytes_and_uses_each_region_once_ready() 
     }
     filler.join().unwrap().unwrap();
     check_host(&host, &layout, None);
+    assert!(!varena::host::filling(fd.as_fd()).unwrap(), "a finished fill lets its lock go");
+    assert!(varena::host::complete(fd.as_fd()).unwrap());
+}
+
+/// A filler in another process, killed mid-fill: it never marks what it left, but its fill
+/// lock goes with it, so a holder sees it is no longer filling and a waiter errors (its fill
+/// then reads the chunk files) instead of waiting forever.
+#[test]
+fn a_killed_filler_fails_its_waiters_and_is_seen_gone() {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["filler", "--exact", "--ignored", "--nocapture", "--test-threads=1", "-q"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    while !line.starts_with('@') {
+        line.clear();
+        assert!(out.read_line(&mut line).unwrap() > 0, "the filler exited");
+    }
+    let (pid, fd) = line[1..].trim().split_once(' ').unwrap();
+    let path = std::ffi::CString::new(format!("/proc/{pid}/fd/{fd}")).unwrap();
+    // SAFETY: open(2) of a path we own; the descriptor is ours.
+    let fd = unsafe { OwnedFd::from_raw_fd(libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)) };
+    let layout = Layout::build(&Fixture::new("filler-waiter").plan(), &regions()).unwrap();
+    let host = HostMem::adopt_sealed(fd.as_raw_fd(), &layout).unwrap();
+    assert!(varena::host::filling(fd.as_fd()).unwrap() && !host.ready(0), "its filler holds it");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(!varena::host::filling(fd.as_fd()).unwrap(), "a dead filler holds nothing");
+    assert!(!varena::host::complete(fd.as_fd()).unwrap(), "and its layout is granted to nobody");
+    let gone = host.wait_ready(0).unwrap_err().to_string();
+    assert!(gone.contains("filler is gone"), "{gone}");
+}
+
+/// The killed filler: opens a sealed layout, names its memfd and never fills it.
+#[test]
+#[ignore]
+fn filler() {
+    let fx = Fixture::new("filler-child");
+    let (fd, _fill, _) = open(&fx);
+    println!("@{} {}", std::process::id(), fd.as_raw_fd());
+    loop {
+        std::thread::park();
+    }
 }
 
 #[test]

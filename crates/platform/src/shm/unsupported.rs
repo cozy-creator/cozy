@@ -30,6 +30,10 @@ pub fn region_holder(_: BorrowedFd<'_>, _: usize, _: usize) -> Result<Option<(us
     Err(Error::unsupported(Seam::SharedMemory))
 }
 
+pub fn written(_: BorrowedFd<'_>, _: usize, _: usize) -> Result<bool> {
+    Err(Error::unsupported(Seam::SharedMemory))
+}
+
 pub fn punch(_: BorrowedFd<'_>, _: u64, _: u64) -> Result<()> {
     Err(Error::unsupported(Seam::SharedMemory))
 }

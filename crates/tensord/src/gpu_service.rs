@@ -2772,6 +2772,7 @@ impl Pool {
         // process (the Runtime refuses a group without constructed models).
         let ranks = if plan.slots.is_empty() { 1 } else { degree.max(1) };
         let lane = self.lane_devices(start, degree)?;
+        let _sealing = Sealing(&self.deposits, id);
         let mut callbacks = Callbacks {
             engine,
             id,
@@ -3753,29 +3754,49 @@ struct Callbacks<'a> {
 impl Callbacks<'_> {
     /// The weight set's chunk files, once its objects landed, and their digest in `answer`. The
     /// executor seals a host layout from them: host RAM for their bytes is made first.
-    fn chunks(&self, manifest: &str) -> io::Result<(Vec<File>, String)> {
+    fn chunks(&self, manifest: &str, sealing: bool) -> io::Result<(Vec<File>, String)> {
         let objects = self.sources.chunks(manifest)?;
         if let Some(fetch) = self.fetch {
             fetch.wait(manifest, &objects)?;
         }
-        self.pool.host_room_for(objects.iter().map(|o| o.length).sum());
+        if sealing {
+            self.pool.host_room_for(objects.iter().map(|o| o.length).sum());
+        }
         Ok((self.sources.files(&objects)?, crate::deposits::objects_digest(&objects)))
+    }
+}
+/// A call's end: a layout it was sealing and never deposited is nobody's to wait for.
+struct Sealing<'a>(&'a Deposits, &'a str);
+impl Drop for Sealing<'_> {
+    fn drop(&mut self) {
+        self.0.ended(self.1);
     }
 }
 impl Services for Callbacks<'_> {
     /// A weight set's bytes: the sealed host layout an executor deposited for its manifest and
-    /// layout, else every chunk file of its selected components (TensorD never fills).
+    /// layout (with the chunk files too while its filler fills it, for a filler that dies),
+    /// else every chunk file of its selected components (TensorD never fills). Its first asker
+    /// seals it; another asker meanwhile is told to ask again once that deposit lands.
     fn read_grant(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
         drop(plan);
-        let (held, files) = match self.deposits.grant(&frame.manifest, &frame.layout) {
-            Some(layout) => (true, Ok((vec![layout], String::new()))),
-            None => (false, self.chunks(&frame.manifest)),
+        let (manifest, layout) = (&frame.manifest, &frame.layout);
+        let (held, filling, files) = match self.deposits.grant(manifest, layout) {
+            Some((file, false)) => (true, false, Ok((vec![file], String::new()))),
+            Some((file, true)) => (true, true, self.chunks(manifest, false).map(|(f, sha)| (std::iter::once(file).chain(f).collect(), sha))),
+            None if layout.is_empty() => (false, false, self.chunks(manifest, true)),
+            None => match self.deposits.seal(manifest, layout, &format!("{}#{}", self.id, frame.rank)) {
+                Ok(()) => (false, false, self.chunks(manifest, true)),
+                Err(sealer) => {
+                    let detail = format!("{sealer} is sealing {layout}; ask again once it deposits");
+                    return Ok((Answer::refused(frame.seq, "layout_sealing", &detail), vec![]));
+                }
+            },
         };
         let nfiles = files.as_ref().map_or(0, |(f, _)| f.len());
         let (mut answer, mut fds) = granted(frame.seq, held, files);
         // GPU pages a gone executor kept of this layout follow its host layout.
         let rank = self.kept.get(frame.rank as usize).copied().flatten();
-        if let Some((fingerprint, pages)) = rank.filter(|_| held).and_then(|(m, _, _)| m.take_kept(&frame.layout)) {
+        if let Some((fingerprint, pages)) = rank.filter(|_| held && !filling).and_then(|(m, _, _)| m.take_kept(&frame.layout)) {
             for (page, fd) in pages {
                 answer.pages.push(page);
                 fds.push(fd);
@@ -3783,7 +3804,7 @@ impl Services for Callbacks<'_> {
             (answer.fingerprint, answer.descriptors) = (fingerprint, fds.len() as u64);
         }
         self.pool.notes.note(serde_json::json!({"event": "read_grant", "manifest": frame.manifest,
-            "layout": frame.layout, "held": held, "files": nfiles, "pages": answer.pages.len(),
+            "layout": frame.layout, "held": held, "filling": filling, "files": nfiles, "pages": answer.pages.len(),
             "rank": frame.rank, "pid": rank.map(|(_, pid, _)| pid), "gpu": rank.map(|(_, _, gpu)| gpu)}));
         Ok((answer, fds))
     }
@@ -3884,7 +3905,8 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     /// The `read_grant` answers Runtime's `tests/tensord_peer.py` mirrors, field for field: a
-    /// held layout is one descriptor and no list; chunk files come with their list's digest.
+    /// held layout is one descriptor and no list, or, while it fills, its memfd and the chunk
+    /// files; chunk files come with their list's digest.
     #[test]
     fn a_read_grant_answer_is_the_shape_runtime_reads() {
         let file = || File::open("/dev/null").unwrap();
@@ -3897,6 +3919,12 @@ mod tests {
         assert_eq!(serde_json::to_value(&chunks).unwrap(), json!({"event": "answer", "seq": 8, "ok": true,
             "code": "", "detail": "", "held": false, "sha256": "", "length": 0, "descriptors": 2,
             "objects_sha256": "ab".repeat(32)}));
+        // A layout still filling: held, its memfd first, then the chunk files with their digest.
+        let (filling, fds) = granted(10, true, Ok((vec![file(), file(), file()], "cd".repeat(32))));
+        assert_eq!(fds.len(), 3);
+        assert_eq!(serde_json::to_value(&filling).unwrap(), json!({"event": "answer", "seq": 10, "ok": true,
+            "code": "", "detail": "", "held": true, "sha256": "", "length": 0, "descriptors": 3,
+            "objects_sha256": "cd".repeat(32)}));
         let (refused, fds) = granted(9, false, Err(io::Error::other("outside selection")));
         assert!(fds.is_empty() && !refused.ok && refused.code == "read_grant_refused");
     }

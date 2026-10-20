@@ -961,9 +961,9 @@ impl Inner {
         let start = self.events.record(s, true)?;
         let (r, reg) = (job.region, job.w.layout.region(job.region)?);
         let n = reg.nbytes;
-        match job.w.host.as_ref().filter(|h| !h.hole(r)) {
+        // a region its sealer failed or died filling reads the chunk files, when there are any
+        match job.w.host.as_ref().filter(|h| !h.hole(r) && h.wait_ready(r).inspect_err(|e| tracing::warn!("varena: {}: {e}", job.w.name)).is_ok()) {
             Some(h) if n > 0 => {
-                h.wait_ready(r)?;
                 // SAFETY: inside the live mapping the source keeps; the region is complete.
                 let p = unsafe { h.base().add(reg.offset as usize) } as *const u8;
                 let t = Instant::now();
@@ -1837,10 +1837,9 @@ impl HostSet {
         let (w, mut regs) = (&self.weights, lock(&self.regs));
         let reg = w.layout.region(region)?;
         let (buf, bound) = &mut regs[region as usize];
-        let sealed = w.host.as_ref().filter(|h| !h.hole(region));
+        let sealed = w.host.as_ref().filter(|h| !h.hole(region) && h.wait_ready(region).is_ok());
         let (ptr, buf) = match sealed {
             Some(h) => {
-                h.wait_ready(region)?;
                 (h.base() as u64 + reg.offset, None)
             }
             None => {
@@ -1917,7 +1916,15 @@ fn open_checkpoint(ck: Ck<'_>, regions: &[Vec<String>], direct_io: bool, files: 
 #[cfg(feature = "store")]
 pub fn seal<'c>(ck: impl Into<Ck<'c>>, regions: &[Vec<String>], name: &str, threads: usize, files: Option<Vec<(ObjectRef, File)>>) -> Result<OwnedFd> {
     let (layout, source) = open_checkpoint(ck.into(), regions, true, files)?;
-    crate::host::fill_sealed(name, &layout, &source, threads, &IoTally::default(), None)
+    let (fd, fill) = crate::host::open_sealed(name, &layout, None, None)?;
+    let named = name.to_string();
+    let run = move || {
+        if let Err(e) = fill.run(&layout, &source, threads, &IoTally::default()) {
+            tracing::warn!("varena: sealing {named} failed; its adopters read the chunk files: {e}");
+        }
+    };
+    std::thread::Builder::new().name(format!("varena-seal-{name}")).spawn(run).map_err(|e| Error::Io(format!("spawn a seal: {e}")))?;
+    Ok(fd)
 }
 
 /// `fd` in a socket's queue, the sending end closed: whoever holds the other end can take it
