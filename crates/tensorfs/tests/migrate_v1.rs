@@ -168,7 +168,7 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
             assert!(ck.component("tokenizer").is_ok() && ck.component("tokenizer_2").is_ok());
         } else {
             assert_eq!(source, Some(Value::Str(UNKNOWN.into())), "{}", lane.name);
-            assert!(ck.metadata().get("filled").is_none());
+            assert!(!ck.metadata().contains_key("filled"));
         }
     }
 

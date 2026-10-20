@@ -386,7 +386,7 @@ fn a_lane_nobody_sourced_converts_as_unknown_and_unfilled() {
     let dir = scratch("unknown");
     let (h, _, report) = migrate_lane(&dir, "acme/unlisted", unsourced(&dir));
     assert_eq!(h.metadata.get("source"), Some(&Value::Str(d10::UNKNOWN.into())));
-    assert!(h.metadata.get("filled").is_none() && report.get("filled").is_none());
+    assert!(!h.metadata.contains_key("filled") && report.get("filled").is_none());
     assert_eq!(h.component("model").unwrap().config, parse(&blob(&dir, &lane_files(&dir, GPT2_FULL)["config.json"].sha256)));
     std::fs::remove_dir_all(dir).unwrap();
 }
