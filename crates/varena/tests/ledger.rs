@@ -174,7 +174,10 @@ fn child() {
                 println!("@ok");
             }
             "ask" => {
-                let ask = row.wait_ask().unwrap();
+                let ask = row
+                    .wait_ask(&std::sync::atomic::AtomicBool::new(false))
+                    .unwrap()
+                    .unwrap();
                 row.ack(ask).unwrap();
                 println!("@{} {}", ask.ceiling.as_usize(), ask.bytes);
             }
