@@ -66,6 +66,7 @@ pub async fn run(
         (Some(function), _) => function,
         (None, [only]) if script => (*only).to_owned(),
         (None, _) => {
+            super::unnamed(&local.package, None, &installed.interface, &args)?;
             super::functions_of(ctx, &local.package, "local", None, &installed.interface);
             return Ok(ExitCode::SUCCESS);
         }
@@ -271,7 +272,7 @@ mod tests {
             ),
             (Some("local-0123"), Some("local"))
         );
-        assert_eq!(installed.interface.public(), ["fp8", "generate", "int8"]);
+        assert_eq!(installed.interface.public(), ["generate", "fp8", "int8"]);
     }
 
     #[test]

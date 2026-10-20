@@ -230,6 +230,12 @@ async fn run(ctx: &Context, args: RunArgs) -> Result<ExitCode, Error> {
     let hub = ctx.hub()?;
     let resolved = resolve(ctx, &hub, &package, release.as_deref()).await?;
     let Some(function) = function else {
+        unnamed(
+            &package,
+            release.as_deref(),
+            &resolved.card.interface,
+            &args,
+        )?;
         functions(ctx, &package, &resolved);
         return Ok(ExitCode::SUCCESS);
     };
@@ -499,6 +505,49 @@ fn callable<'a>(
             Err(error)
         }
     }
+}
+
+/// Refuses inputs given to a package instead of one of its functions, naming the command that
+/// runs each of its first two functions with them.
+fn unnamed(
+    package: &str,
+    release: Option<&str>,
+    interface: &Interface,
+    args: &RunArgs,
+) -> Result<(), Error> {
+    if args.inputs.is_empty() && args.input_file.is_none() {
+        return Ok(());
+    }
+    let inputs: String = args
+        .inputs
+        .iter()
+        .map(|i| format!(" {}", quoted(i)))
+        .collect();
+    let release = release.map(|r| format!("@{r}")).unwrap_or_default();
+    let public = interface.public();
+    let mut error = Error::new(
+        Kind::Usage,
+        "function_unnamed",
+        format!("name the function of {package} to run"),
+    )
+    .remedy(format!("its functions: {}", public.join(", ")));
+    for name in public.iter().take(2) {
+        error = error.next(format!("cozy run {package}/{name}{release}{inputs}"));
+    }
+    Err(error)
+}
+
+/// `input` as a shell word: a value with spaces or quotes is single-quoted after its `key=`.
+fn quoted(input: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_-./:=@,+%".contains(c);
+    if input.chars().all(plain) {
+        return input.to_owned();
+    }
+    let (key, value) = match input.split_once('=') {
+        Some((key, value)) if key.chars().all(plain) => (format!("{key}="), value),
+        _ => (String::new(), input),
+    };
+    format!("{key}'{}'", value.replace('\'', r"'\''"))
 }
 
 /// `cozy run org/pkg`: the package's public functions.

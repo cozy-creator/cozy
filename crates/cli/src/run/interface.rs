@@ -203,16 +203,12 @@ impl Interface {
         Ok(out)
     }
 
-    /// The public callables' names, sorted.
+    /// The public callables' names: GPU functions first (a package's main work, before its
+    /// CPU conversions), each group sorted.
     pub fn public(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self
-            .callables
-            .iter()
-            .filter(|c| !c.internal)
-            .map(|c| c.name.as_str())
-            .collect();
-        names.sort_unstable();
-        names
+        let mut public: Vec<&Callable> = self.callables.iter().filter(|c| !c.internal).collect();
+        public.sort_unstable_by_key(|c| (c.accelerator == Some(false), c.name.as_str()));
+        public.into_iter().map(|c| c.name.as_str()).collect()
     }
 }
 
@@ -400,7 +396,7 @@ pub(crate) mod tests {
     #[test]
     fn sdxl_reads_its_types_wires_defaults_and_slots() {
         let sdxl = interface("sdxl-2.10.0");
-        assert_eq!(sdxl.public(), ["fp8", "generate", "int8"]);
+        assert_eq!(sdxl.public(), ["generate", "fp8", "int8"]);
         let generate = sdxl
             .callables
             .iter()
