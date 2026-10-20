@@ -316,10 +316,21 @@ impl Checkpoint {
 
     pub(super) fn export_cozytensors(&self, dir: &Path) -> Result<Vec<String>> {
         let repo = self.export_paths()?;
+        let repo_objects = match &self.data.tree {
+            Some(tree) => self
+                .data
+                .store
+                .tree(tree)?
+                .repo_files()
+                .map(|(p, r)| (p.to_owned(), r.clone()))
+                .collect(),
+            None => BTreeMap::new(),
+        };
         self.data.store.cache_preserve_snapshot(dir)?;
         crate::export::cozytensors(
             &self.data.raw,
             &repo,
+            &repo_objects,
             dir,
             self.variant().unwrap_or(""),
             &self.data.header_bytes,
