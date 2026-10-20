@@ -56,7 +56,8 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
     let lanes: Vec<Lane> = serde_json::from_slice(&fs::read(fixture.join("lanes.json")).unwrap()).unwrap();
     let dir = Scratch(Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("migrate-v1-{}", std::process::id())));
     let _ = fs::remove_dir_all(&dir.0);
-    // The endpoint: a store holding every fixture object, and each lane as an unreleased checkpoint.
+    // The endpoint: a store holding every fixture object, and each lane as an unreleased
+    // checkpoint, as the Hub shows a v1 model: a private tag whose commit is the v1 manifest.
     let root = dir.0.join("endpoint");
     Store::open(&root).unwrap();
     for entry in fs::read_dir(&fixture).unwrap() {
@@ -71,7 +72,8 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
     for lane in &lanes {
         let at = root.join(format!("refs/{}.json", lane.name));
         fs::create_dir_all(at.parent().unwrap()).unwrap();
-        let doc = json!({"format": "tensorfs.repo/1", "name": lane.name, "releases": [], "checkpoints": [lane.manifest]});
+        let tag = format!("v1-{}", &lane.manifest.sha256[..12]);
+        let doc = json!({"format": "cozytensors.repo/1", "name": lane.name, "tags": [{"name": tag, "commit": lane.manifest}]});
         fs::write(at, serde_json::to_vec(&doc).unwrap()).unwrap();
     }
 
@@ -99,7 +101,9 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
         assert_eq!(report["old"], lane.manifest.id().as_str());
         let repo = Repo::from_json(&fs::read(root.join(format!("refs/{}.json", lane.name))).unwrap()).unwrap();
         assert_eq!(repo.tags.len(), 1);
-        trees.insert(lane.name.clone(), (repo.tags[0].commit.clone(), report.clone()));
+        let tag = &repo.tags[0];
+        assert_eq!((tag.name.clone(), tag.public), (format!("v1-{}", &lane.manifest.sha256[..12]), false));
+        trees.insert(lane.name.clone(), (tag.commit.clone(), report.clone()));
     }
 
     let uploaded: BTreeSet<String> = blobs(&root).difference(&held).cloned().collect();
