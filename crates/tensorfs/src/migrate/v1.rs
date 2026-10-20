@@ -445,7 +445,11 @@ fn files(m: &Manifest, h: &Header, names: &mut Names) -> Result<BTreeMap<String,
                     names.rules.push("config model: one config.json per component".into());
                     continue;
                 }
-                "config.json".to_owned()
+                // A lane of one component other than `model`: the config is that component's.
+                match components.iter().collect::<Vec<_>>().as_slice() {
+                    [only] if **only != "model" => format!("{}/config.json", names.component(only)),
+                    _ => "config.json".to_owned(),
+                }
             }
             c if components.contains(c) => format!("{}/config.json", names.component(c)),
             other => format!("{other}.json"),
