@@ -513,19 +513,6 @@ fn pinned_dlpack_stream(gpu: bool, stream: Option<i64>) -> std::result::Result<O
     }
 }
 
-#[cfg(test)]
-mod pinned_stream_tests {
-    use super::pinned_dlpack_stream;
-
-    #[test]
-    fn dlpack_stream_normalization_preserves_defaults_and_refuses_unknown_consumers() {
-        assert_eq!(pinned_dlpack_stream(false, None), Ok(None));
-        for stream in [-2, -1, 0, 1, 2, 1234] { assert!(pinned_dlpack_stream(false, Some(stream)).is_err()); }
-        assert_eq!(pinned_dlpack_stream(true, None), Ok(Some(1)));
-        for stream in [1, 2, 1234, i64::MAX] { assert_eq!(pinned_dlpack_stream(true, Some(stream)), Ok(Some(stream as u64))); }
-        for stream in [-2, -1, 0] { assert!(pinned_dlpack_stream(true, Some(stream)).is_err()); }
-    }
-}
 
 #[pymethods]
 impl PyPinned {
@@ -834,4 +821,19 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::store::regions, &m)?)?;
     parent.add_submodule(&m)?;
     py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.varena", &m)
+}
+
+
+#[cfg(test)]
+mod pinned_stream_tests {
+    use super::pinned_dlpack_stream;
+
+    #[test]
+    fn dlpack_stream_normalization_preserves_defaults_and_refuses_unknown_consumers() {
+        assert_eq!(pinned_dlpack_stream(false, None), Ok(None));
+        for stream in [-2, -1, 0, 1, 2, 1234] { assert!(pinned_dlpack_stream(false, Some(stream)).is_err()); }
+        assert_eq!(pinned_dlpack_stream(true, None), Ok(Some(1)));
+        for stream in [1, 2, 1234, i64::MAX] { assert_eq!(pinned_dlpack_stream(true, Some(stream)), Ok(Some(stream as u64))); }
+        for stream in [-2, -1, 0] { assert!(pinned_dlpack_stream(true, Some(stream)).is_err()); }
+    }
 }
