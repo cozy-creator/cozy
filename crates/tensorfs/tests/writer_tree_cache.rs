@@ -57,7 +57,7 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
         .unwrap();
     {
         let mut model = writer
-            .component("model", "test.Model", Default::default())
+            .component("model", "test.Model", Default::default(), None)
             .unwrap();
         model.put("w", Dtype::U8, &[4], &mut &WEIGHT[..]).unwrap();
         model.asset("vocab.bin", ASSET).unwrap();
@@ -71,7 +71,7 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
     let payload: Vec<_> = checkpoint.header().objects().cloned().collect();
     assert_eq!(checkpoint.variant(), Some("u8"));
     assert_eq!(
-        checkpoint.component("model").unwrap().read("w").unwrap(),
+        checkpoint.component("model").unwrap().read_decoded("w").unwrap(),
         WEIGHT
     );
     assert!(cache.join(tree.key()).exists());
@@ -134,7 +134,7 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
     assert_eq!(reopened.tree(), Some(&tree));
     assert_eq!(reopened.variant(), Some("u8"));
     assert_eq!(
-        reopened.component("model").unwrap().read("w").unwrap(),
+        reopened.component("model").unwrap().read_decoded("w").unwrap(),
         WEIGHT
     );
     assert_eq!(

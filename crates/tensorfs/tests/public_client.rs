@@ -343,7 +343,7 @@ async fn eager_local_header_honors_offline_before_using_its_configured_origin() 
         .unwrap();
     assert_eq!(eager.id(), &data.header);
     assert!(eager.missing(&Selection::All).unwrap().is_empty());
-    assert_eq!(eager.component("model").unwrap().read("w").unwrap(), b"abcdefghijklmnop");
+    assert_eq!(eager.component("model").unwrap().read_decoded("w").unwrap(), b"abcdefghijklmnop");
     assert!(!scratch.0.join("chunks").exists());
 }
 
@@ -536,7 +536,7 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
     drop(tokenizer);
     drop(checkpoint);
     drop(client);
-    assert_eq!(component.read("w").unwrap(), b"abcdefghijklmnop");
+    assert_eq!(component.read_decoded("w").unwrap(), b"abcdefghijklmnop");
     #[cfg(target_os = "linux")]
     assert!(
         owned_fds(&cache) > 0,
@@ -625,7 +625,7 @@ async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects(
     );
     assert_eq!(landed.origin + landed.volume, 8);
     assert_eq!(
-        checkpoint.component("model").unwrap().read("w").unwrap(),
+        checkpoint.component("model").unwrap().read_decoded("w").unwrap(),
         b"abcdefghijklmnop"
     );
     assert_eq!(progress.lock().unwrap().last(), Some(&(16, 16)));
@@ -876,7 +876,7 @@ async fn supplied_provider_error_and_local_unreleased_semantics_are_public() {
         .unwrap();
     assert_eq!(checkpoint.id(), &data.header);
     assert_eq!(
-        checkpoint.component("other").unwrap().read("v").unwrap(),
+        checkpoint.component("other").unwrap().read_decoded("v").unwrap(),
         b"QRSTUVWX"
     );
 }
@@ -924,7 +924,7 @@ async fn public_names_match_the_generic_format_with_unicode_reserved_characters_
         assert_eq!(cached.id(), &data.header);
         checkpoint.download(&Download::default()).await.unwrap();
         assert_eq!(
-            checkpoint.component("model").unwrap().read("w").unwrap(),
+            checkpoint.component("model").unwrap().read_decoded("w").unwrap(),
             b"abcdefghijklmnop"
         );
     }

@@ -260,10 +260,14 @@ unsafe fn read_impl(
     let mut stats = if host_copies.is_empty() {
         ReadStats::default()
     } else {
-        unsafe { host::fill(&host_copies, opts) }.map_err(|e| Error {
+        let host_start = Instant::now();
+        let stats = unsafe { host::fill(&host_copies, opts) }.map_err(|e| Error {
             copy: host[e.copy].0,
             source: e.source,
-        })?
+        })?;
+        #[cfg(unix)]
+        disk_run(&host_copies, &stats, host_start.elapsed().as_nanos() as u64);
+        stats
     };
     let device = unsafe { device::fill(&devices, opts, staged_host) }?;
     stats.direct += device.direct;
@@ -275,4 +279,22 @@ unsafe fn read_impl(
     stats.bytes = copies.iter().map(|c| c.dst.len() as u64).sum();
     stats.ns = start.elapsed().as_nanos() as u64;
     Ok(stats)
+}
+
+/// Logs the file reads among `copies` as one disk run (`metrics`).
+#[cfg(unix)]
+fn disk_run(copies: &[Copy], stats: &ReadStats, ns: u64) {
+    let mut files: Vec<&File> = Vec::new();
+    let mut bytes = 0;
+    for c in copies {
+        if let Src::File(f, _) = c.src {
+            bytes += c.dst.len() as u64;
+            if !files.iter().any(|known| std::ptr::eq(*known, f)) {
+                files.push(f);
+            }
+        }
+    }
+    if bytes > 0 {
+        metrics::disk_run(&files, bytes, ns, stats.direct, stats.cached);
+    }
 }

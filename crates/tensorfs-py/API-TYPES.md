@@ -1,8 +1,6 @@
-# Python API declarations for review
+# Python API declarations
 
-Temporary review copy of the planned TensorFS 0.13 declarations. Implementation status is
-separate; this is not a claim that every declaration is available on current master.
-For normal development, use the [Python usage guide](API.md).
+The declarations of the `tensorfs` package. For usage, see the [Python guide](API.md).
 
 `TensorMetadata` describes the logical tensor. Ordinary encoded reads expose named
 `Array` values without physical locations; `tensorfs.raw` provides advanced physical
@@ -397,7 +395,7 @@ class Writer:
     def pipeline(self, cls: str, config: Mapping[str, object]) -> None:
         ...
 
-    def component(self, name: str, *, cls: str, config: Mapping[str, object]) -> ComponentWriter:
+    def component(self, name: str, *, cls: str, config: Mapping[str, object], config_file: str | None=None) -> ComponentWriter:
         ...
 
     def commit(self) -> Checkpoint:
@@ -413,9 +411,7 @@ class Writer:
 ## `tensorfs.raw` — advanced physical inspection and resident decode
 
 These declarations belong to `tensorfs.raw`, not the root package.
-`decode_into` is approved resident-decode source for the 0.13 target; native compilation
-and installed CPU/GPU qualification are still pending. It is not a release availability
-claim. See [resident decoding](API.md#advanced-decode-resident-encoded-parts) for placement,
+See [resident decoding](API.md#advanced-decode-resident-encoded-parts) for placement,
 ownership and error behavior.
 
 ```python

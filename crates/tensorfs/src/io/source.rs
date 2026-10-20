@@ -253,20 +253,6 @@ impl Source {
         } else {
             tally.cached_bytes.fetch_add(stats.cached, Relaxed);
         }
-        if matches!(dst, Dst::Host { .. }) && stats.bytes > 0 {
-            super::metrics::record(super::metrics::Copy {
-                kind: "disk",
-                gpu: -1,
-                bytes: stats.bytes,
-                ns: stats.ns,
-                cached: stats.cached,
-                ceiling: super::metrics::disk(
-                    &files.values().map(AsRef::as_ref).collect::<Vec<_>>(),
-                )
-                .unwrap_or(0.0),
-                ..Default::default()
-            });
-        }
         Ok(stats)
     }
 

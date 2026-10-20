@@ -67,17 +67,6 @@ pub const SIGNED_BYTES: Packing = Packing {
     ..BYTES
 };
 
-/// The word width of an integer container dtype.
-pub fn word_bits(dtype: &crate::format::Dtype) -> Option<u32> {
-    use crate::format::Dtype::*;
-    match dtype {
-        U8 | I8 => Some(8),
-        U16 | I16 => Some(16),
-        U32 | I32 => Some(32),
-        _ => None,
-    }
-}
-
 fn bad(detail: String) -> Error {
     Error::Decode(detail)
 }

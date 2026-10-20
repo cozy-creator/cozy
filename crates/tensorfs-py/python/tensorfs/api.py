@@ -145,8 +145,8 @@ class Writer:
     def pipeline(self, cls: str, config: Mapping) -> None:
         self._native.pipeline(cls, dict(config))
 
-    def component(self, name: str, *, cls: str, config: Mapping) -> ComponentWriter:
-        return ComponentWriter(self._native.component(name, cls, dict(config)))
+    def component(self, name: str, *, cls: str, config: Mapping, config_file=None) -> ComponentWriter:
+        return ComponentWriter(self._native.component(name, cls, dict(config), config_file))
 
     def commit(self):
         if self._failed is not None:

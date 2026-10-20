@@ -307,27 +307,6 @@ impl Store {
         Ok(removed)
     }
 
-    /// Drops what writer `key` journaled, unless a writer holds it: false while one does.
-    pub fn abandon_writer(&self, key: &str) -> Result<bool> {
-        if !is_name(key, 200) {
-            return Err(bad(format!("{key:?} is not a writer key")));
-        }
-        let dir = self.root().join("tmp").join("writers").join(key);
-        let _held = match File::open(dir.join(LOCK)) {
-            Ok(file) => match file.try_lock() {
-                Ok(()) => file,
-                Err(_) => return Ok(false),
-            },
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(true),
-            Err(e) => return Err(fail("open", dir.join(LOCK))(e)),
-        };
-        match fs::remove_dir_all(&dir) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
-            Err(e) => Err(fail("remove", &dir)(e)),
-        }
-    }
-
     /// Imports `req` into a committed cozytensors: (its header, the source's repo files). With
     /// `key`, an interrupted import resumes: the tensors its journal holds are not converted
     /// again. The header and repo files stay pinned under the key (else the header's digest).

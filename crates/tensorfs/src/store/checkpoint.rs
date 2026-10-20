@@ -4,14 +4,14 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{fail, invalid, Error, Result, Store};
 use super::retention::{self, DirectoryGuard, Retention};
 use crate::format::layout::ALIGN;
+use crate::io::{Copy, Dst, ReadOpts, Src};
 use crate::format::{
     self, decode, variant_of, variant_path, Body, Component, Header, Location, ObjectRef,
     PartBytes, Pipeline, Tensor, Tree, CHUNKS_DIR,
@@ -36,18 +36,6 @@ enum Objects {
     Store(Store),
     /// A plain folder's `chunks/<sha256>`, else the cache.
     Folder { dir: PathBuf, cache: Option<Store> },
-}
-
-fn write_view(path: &Path, bytes: &[u8]) -> Result<()> {
-    if path.is_file() {
-        return Ok(());
-    }
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let parent = path.parent().expect("a view file has a parent");
-    fs::create_dir_all(parent).map_err(fail("create", parent))?;
-    let temp = parent.join(format!(".view-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-    fs::write(&temp, bytes).map_err(fail("write", &temp))?;
-    fs::rename(&temp, path).map_err(fail("rename", path))
 }
 
 fn cached_directory(store: &Store, dir: &Path) -> Result<Option<DirectoryGuard>> {
@@ -196,16 +184,6 @@ impl Checkpoint {
         Err(Error::Absent(object.sha256.clone()))
     }
 
-    /// Inspect the header and selected components' complete chunks/assets locally.
-    /// An empty selection still checks the header. No data is fetched or changed.
-    pub fn verify_selected(&self, components: Option<&[String]>) -> crate::Result<crate::VerificationReport> {
-        let objects = match components {
-            Some(components) => wanted(&self.header, Some(components))?,
-            None => self.header.objects().cloned().collect(),
-        };
-        crate::verification::verify(self, objects)
-    }
-
     /// Hash the actual header file and closure without changing them. Missing or corrupt
     /// objects are returned; other filesystem errors remain errors.
     pub fn verify(&self) -> Result<Vec<ObjectRef>> {
@@ -257,29 +235,6 @@ impl Checkpoint {
                 Ok(dir)
             }
         }
-    }
-
-    /// The rendered config and assets for a path-only model loader.
-    pub fn component_path(&self, name: &str) -> Result<PathBuf> {
-        let c = self.component(name)?;
-        let root = match &self.objects {
-            Objects::Store(store) | Objects::Folder { cache: Some(store), .. } => store.root().to_path_buf(),
-            Objects::Folder { dir, .. } => dir.join("chunks"),
-        };
-        let entry = root.join("views").join(&self.id.sha256);
-        if let Some(store) = self.store() { store.cache_snapshot(&entry)?; }
-        let dir = entry.join(name);
-        fs::create_dir_all(&dir).map_err(fail("create", &dir))?;
-        let config = dir.join(c.config_file.as_deref().unwrap_or("config.json"));
-        let bytes = serde_json::to_vec(&c.config).map_err(|e| invalid(&config, e.to_string()))?;
-        write_view(&config, &bytes)?;
-        for name in c.assets.keys() {
-            write_view(&dir.join(name), &self.asset(&c.name, name)?)?;
-        }
-        if let Some(store) = self.store() {
-            store.cache_snapshot(&entry)?;
-        }
-        Ok(dir)
     }
 
     /// Export only a component's config and support files to the caller's directory.
@@ -428,16 +383,19 @@ impl Checkpoint {
             ))
             .into());
         }
-        let mut filled = 0;
-        for span in self.header.spans(at) {
-            let mut file = self.chunk(span.chunk)?;
-            let piece = &mut buf[filled..filled + span.length as usize];
-            file.seek(SeekFrom::Start(span.start))
-                .and_then(|_| file.read_exact(piece))
-                .map_err(|e| fail("read", self.chunk_path(span.chunk))(e))?;
-            filled += span.length as usize;
+        let spans = self.header.spans(at);
+        let files = spans.iter().map(|s| self.chunk(s.chunk)).collect::<Result<Vec<_>>>()?;
+        let (mut copies, mut filled) = (Vec::with_capacity(spans.len()), 0);
+        for (span, file) in spans.iter().zip(&files) {
+            let len = span.length as usize;
+            let dst = Dst::Host { ptr: buf[filled..filled + len].as_mut_ptr(), len };
+            copies.push(Copy { src: Src::File(file, span.start), dst });
+            filled += len;
         }
-        Ok(())
+        // SAFETY: the destinations are disjoint ranges of `buf`, borrowed until the read returns.
+        #[allow(unsafe_code)]
+        let read = unsafe { crate::io::read(&copies, &ReadOpts::default()) };
+        read.map(drop).map_err(|e| fail("read", self.chunk_path(spans[e.copy].chunk))(e.source))
     }
 
     /// A tensor's logical bytes, in its dtype: encoded parts go through the reference decode.

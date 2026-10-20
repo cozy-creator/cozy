@@ -53,7 +53,7 @@ async fn a_thin_folder_uploads_from_the_store_or_what_the_endpoint_holds() {
     // A checkpoint in store `a`, its folder made thin: the header and a README only.
     let a = client(&dir.0.join("a"), &origin);
     let mut writer = a.writer(WriterOptions::default()).unwrap();
-    writer.component("model", "", Default::default()).unwrap().put("w", Dtype::U8, &[weight.len() as u64], &mut &weight[..]).unwrap();
+    writer.component("model", "", Default::default(), None).unwrap().put("w", Dtype::U8, &[weight.len() as u64], &mut &weight[..]).unwrap();
     let saved = writer.commit().await.unwrap();
     let full = saved.materialize(&dir.0.join("full"), Format::Cozytensors, None).await.unwrap();
     let folder = dir.0.join("thin");
@@ -66,7 +66,7 @@ async fn a_thin_folder_uploads_from_the_store_or_what_the_endpoint_holds() {
     let b = client(&dir.0.join("b"), &origin);
     let pulled = b.open("acme/thin@1", &Open { lazy: false, ..Default::default() }).await.unwrap();
     assert_eq!((pulled.id(), pulled.tree()), (saved.id(), Some(&tree)));
-    assert_eq!(pulled.component("model").unwrap().read("w").unwrap(), weight);
+    assert_eq!(pulled.component("model").unwrap().read_decoded("w").unwrap(), weight);
 
     // Store `c` holds none of it; the endpoint does.
     let c = client(&dir.0.join("c"), &origin);

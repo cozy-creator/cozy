@@ -1,8 +1,7 @@
-# Rust API declarations for review
+# Rust API declarations
 
-Temporary review copy of the concrete planned TensorFS 0.13 interface. Implementation is
-in progress; declarations omit bodies and are not a standalone compilable module.
-For normal development, use the [Rust usage guide](API.md).
+The public declarations of the `tensorfs` crate, without bodies. For usage, see the
+[Rust guide](API.md).
 
 ## Client, selection and returned objects
 
@@ -132,7 +131,9 @@ impl Component {
     pub fn config(&self) -> &format::Config;
     pub fn tensors(&self) -> &[format::Tensor];
     pub fn assets(&self) -> &BTreeMap<String, ObjectRef>;
-    pub fn read(&self, key: &str) -> Result<Vec<u8>>;
+    // Stored bytes (Python's decode=False); read_decoded is decode=True.
+    pub fn read(&self, key: &str) -> Result<Read>;
+    pub fn read_decoded(&self, key: &str) -> Result<Vec<u8>>;
     pub fn read_part_into(&self, key: &str, role: &str, offset: u64, buf: &mut [u8]) -> Result<()>;
     pub fn asset(&self, name: &str) -> Result<Vec<u8>>;
     pub fn export_files(&self, directory: &Path) -> Result<PathBuf>;
@@ -201,8 +202,9 @@ pub struct WriterOptions<'a> {
 pub struct Writer { /* owned local and optional remote write state */ }
 impl Writer {
     pub fn pipeline(&mut self, class: &str, config: format::Config) -> Result<()>;
-    pub fn component(&mut self, name: &str, class: &str,
-        config: format::Config) -> Result<ComponentWriter<'_>>;
+    // config_file: the file the config exports as; None keeps a reopened or base one's.
+    pub fn component(&mut self, name: &str, class: &str, config: format::Config,
+        config_file: Option<&str>) -> Result<ComponentWriter<'_>>;
     // Reopen a declared component without changing its class or config.
     pub fn component_writer(&mut self, name: &str) -> Result<ComponentWriter<'_>>;
     pub fn set_metadata(&mut self, key: &str, value: Value) -> Result<()>;
@@ -242,9 +244,8 @@ pub mod raw {
 
 ## Advanced resident-buffer decoding
 
-Source-reviewed target at Rust wrapper `5fc6f2320b803212037de90e38fe0d0ce0e10d9f`.
-Combined native and GPU acceptance remains pending. These declarations extend the same
-`raw` module above; they do not add a second codec or byte engine.
+These declarations extend the same `raw` module above; they add no second codec or byte
+engine.
 
 ```rust
 // tensorfs::format::decode

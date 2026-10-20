@@ -62,13 +62,3 @@ pub fn exhausted(error: &std::io::Error) -> bool {
     full
 }
 
-/// Count a full table a caller learnt of without an error to hand (SQLite's "unable to open").
-pub fn exhaustion() {
-    EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-}
-
-/// How many times this process has found its descriptor table full. A caller diffs two
-/// reads around its own work.
-pub fn exhaustions() -> u64 {
-    EXHAUSTED.load(Ordering::Relaxed)
-}

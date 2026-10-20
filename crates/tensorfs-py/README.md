@@ -270,8 +270,7 @@ loads and cold blocks; `safetensors 0.8.0`'s `safe_open` CPU→CUDA path for war
 payload-cache eviction with `POSIX_FADV_DONTNEED`; warm is the immediate second read. Chunk boundaries
 make the selected-block reads 211 MB and 227 MB respectively.
 
-These receipts predate the 0.13 API. They are separate runs and reader revisions: the full-load run predates the final CBOR header
-and lazy window registration; the block run includes them. They measure serialized-byte loading,
+They measure serialized-byte loading,
 excluding dequantization, model construction and inference. Hardware and cache conditions affect
 results. [Measurements and provenance](gates/speed/measurements.json) include the earlier failed
 window cell; [the recorded harness](https://github.com/cozy-creator/cozy-creator/blob/0a6e71ee2c919db3e6e9b5844c8234ca9749cedb/crates/tensorfs/gates/speed/speedgate.py)
@@ -279,8 +278,7 @@ defines the workloads. Download projections are separate from these measured tim
 
 ## Get started
 
-The target TensorFS 0.13 interface uses the component API and hard-cut header/tree format. Python 3.12 or later is
-required; the current master implementation is still being integrated. The wheel includes the Python module and `tfs`:
+Python 3.12 or later is required. The wheel includes the Python module and `tfs`:
 
 ```bash
 uv venv --python 3.12
@@ -308,7 +306,7 @@ and quantized tensors return their encoded arrays and parameters. Use `decode=Tr
 above, when the consumer needs ordinary floating-point weights. Frameworks wrap arrays
 through their DLPack entry point. DLPack is the memory-sharing protocol, not a separate
 array library to install. `component.config` is structured JSON, `component.asset(name)` reads an asset,
-and explicit `component.export_files(directory)` is only a compatibility convenience for legacy path-only loaders.
+and explicit `component.export_files(directory)` is only a convenience for path-only loaders.
 
 ## Checkpoints and repositories
 

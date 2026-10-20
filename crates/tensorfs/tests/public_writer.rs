@@ -286,7 +286,7 @@ async fn public_writer_resumes_reopens_components_and_keeps_encoded_bytes_and_or
         })
         .unwrap();
     first
-        .component("model", "test.Model", config)
+        .component("model", "test.Model", config, None)
         .unwrap()
         .put("first", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -304,6 +304,7 @@ async fn public_writer_resumes_reopens_components_and_keeps_encoded_bytes_and_or
             "model",
             "test.Model",
             serde_json::from_str(r#"{"width":8}"#).unwrap(),
+            None,
         )
         .unwrap();
     assert_eq!(
@@ -380,13 +381,21 @@ async fn public_writer_resumes_reopens_components_and_keeps_encoded_bytes_and_or
     drop(checkpoint);
     drop(writer);
     drop(client);
-    assert_eq!(child.read("copied").unwrap(), WEIGHT);
+    assert_eq!(child.read_decoded("copied").unwrap(), WEIGHT);
     assert_eq!(child.asset("tokenizer.json").unwrap(), ASSET);
     let mut bytes = [0; 4];
     child
         .read_part_into("packed", "scale", 0, &mut bytes)
         .unwrap();
     assert_eq!(bytes, [9, 10, 11, 12]);
+    // `read` returns what is stored, as Python's decode=False: an encoded tensor's parts.
+    let tensorfs::Read::Encoded { encoding, parts } = child.read("packed").unwrap() else {
+        panic!("an encoded tensor reads as its parts");
+    };
+    assert_eq!(encoding.scheme, "acme-q");
+    assert_eq!((parts["weight"].as_slice(), parts["scale"].as_slice()), (&[5, 6, 7, 8][..], &[9, 10, 11, 12][..]));
+    assert_eq!(child.read("copied").unwrap(), tensorfs::Read::Plain(WEIGHT.to_vec()));
+    assert_eq!(child.read_decoded("packed").unwrap_err().kind, Kind::UnknownScheme);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -418,7 +427,7 @@ async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_mo
         })
         .unwrap();
     first
-        .component("model", "test.Model", Default::default())
+        .component("model", "test.Model", Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -454,7 +463,7 @@ async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_mo
         })
         .unwrap();
     identical
-        .component("model", "test.Model", Default::default())
+        .component("model", "test.Model", Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -474,7 +483,7 @@ async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_mo
         })
         .unwrap();
     let replacement = [2, 4, 6, 8];
-    next.component("model", "test.Model", Default::default())
+    next.component("model", "test.Model", Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut &replacement[..])
         .unwrap();
@@ -485,7 +494,7 @@ async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_mo
         original_header.len(),
         "fixture must exercise same-length replacement"
     );
-    assert_eq!(old.component("model").unwrap().read("w").unwrap(), WEIGHT);
+    assert_eq!(old.component("model").unwrap().read_decoded("w").unwrap(), WEIGHT);
     let old_id = old.id().clone();
     let new_id = new.id().clone();
     let moved = scratch.0.join("moved-header.cozytensors");
@@ -525,7 +534,7 @@ async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_mo
         .unwrap();
     assert_eq!(reopened.id(), &new_id);
     assert_eq!(
-        reopened.component("model").unwrap().read("w").unwrap(),
+        reopened.component("model").unwrap().read_decoded("w").unwrap(),
         replacement
     );
 }
@@ -543,7 +552,7 @@ async fn failed_file_publication_still_exposes_the_committed_local_checkpoint() 
         })
         .unwrap();
     writer
-        .component("model", "test.Model", Default::default())
+        .component("model", "test.Model", Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -554,7 +563,7 @@ async fn failed_file_publication_still_exposes_the_committed_local_checkpoint() 
     drop(writer);
     drop(client);
     assert_eq!(
-        retained.component("model").unwrap().read("w").unwrap(),
+        retained.component("model").unwrap().read_decoded("w").unwrap(),
         WEIGHT
     );
     assert!(dest.is_dir());
@@ -607,7 +616,7 @@ async fn portable_export_preflights_full_closure_and_atomically_replaces_shared_
         .await
         .unwrap();
     assert_eq!(
-        reopened.component("model").unwrap().read("w").unwrap(),
+        reopened.component("model").unwrap().read_decoded("w").unwrap(),
         WEIGHT
     );
     assert_eq!(
@@ -712,7 +721,7 @@ async fn literal_header_fetches_selected_missing_payload_online_but_not_offline_
         .unwrap();
     assert!(!output.join("README.bin").exists());
     assert_eq!(
-        online.component("model").unwrap().read("w").unwrap(),
+        online.component("model").unwrap().read_decoded("w").unwrap(),
         WEIGHT
     );
 }
@@ -730,7 +739,7 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
         })
         .unwrap();
     writer
-        .component("model", "test.Model", Default::default())
+        .component("model", "test.Model", Default::default(), None)
         .unwrap()
         .asset("tokenizer.json", ASSET)
         .unwrap();
@@ -763,7 +772,7 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
         .unwrap();
     remote.download(&Download::default()).await.unwrap();
     assert_eq!(
-        remote.component("model").unwrap().read("w").unwrap(),
+        remote.component("model").unwrap().read_decoded("w").unwrap(),
         WEIGHT
     );
     let broken = scratch.0.join("not-a-directory");
@@ -776,7 +785,7 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
         })
         .unwrap();
     failed
-        .component("model", "test.Model", Default::default())
+        .component("model", "test.Model", Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -796,7 +805,7 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
     assert!(durable.owner.is_none() && durable.roots.contains(&failed_tree));
     failed.abandon().unwrap();
     drop(bad);
-    assert_eq!(local.component("model").unwrap().read("w").unwrap(), WEIGHT);
+    assert_eq!(local.component("model").unwrap().read_decoded("w").unwrap(), WEIGHT);
     drop(local);
     // Remove only the disposable roots: a failed result must survive independently of TTL
     // and of the dropped Checkpoint/Writer native owners.
@@ -822,7 +831,7 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
         .await
         .unwrap();
     assert_eq!(
-        recovered.component("model").unwrap().read("w").unwrap(),
+        recovered.component("model").unwrap().read_decoded("w").unwrap(),
         WEIGHT
     );
 }
@@ -861,7 +870,7 @@ async fn writer_provider_error_keeps_the_exact_family_and_detail_including_empty
                 })
                 .unwrap();
             writer
-                .component("model", "test.Model", Default::default())
+                .component("model", "test.Model", Default::default(), None)
                 .unwrap()
                 .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
                 .unwrap();
@@ -873,7 +882,7 @@ async fn writer_provider_error_keeps_the_exact_family_and_detail_including_empty
             assert_eq!(error.detail, detail);
             let local = writer.committed().unwrap();
             writer.abandon().unwrap();
-            assert_eq!(local.component("model").unwrap().read("w").unwrap(), WEIGHT);
+            assert_eq!(local.component("model").unwrap().read_decoded("w").unwrap(), WEIGHT);
         }
     }
 }
@@ -976,7 +985,7 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
         .unwrap();
     check_export_readme(&result, "README.md");
     drop(reopened);
-    assert_eq!(child.read("w").unwrap(), WEIGHT);
+    assert_eq!(child.read_decoded("w").unwrap(), WEIGHT);
     assert_eq!(child.asset("tokenizer.json").unwrap(), ASSET);
 }
 
@@ -1043,7 +1052,7 @@ async fn public_convert_result_callback_can_refuse_the_final_stage_and_returns_a
             .await
             .unwrap();
         assert_eq!(
-            checkpoint.component("model").unwrap().read("w").unwrap(),
+            checkpoint.component("model").unwrap().read_decoded("w").unwrap(),
             WEIGHT
         );
     }
@@ -1280,6 +1289,7 @@ async fn streaming_writer_resumes_its_keyed_journal_after_drop_then_publishes_th
             "model",
             "test.Model",
             serde_json::from_str(r#"{"width":4}"#).unwrap(),
+            None,
         )
         .unwrap()
         .put("before", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
@@ -1307,6 +1317,7 @@ async fn streaming_writer_resumes_its_keyed_journal_after_drop_then_publishes_th
             "model",
             "test.Model",
             serde_json::from_str(r#"{"width":4}"#).unwrap(),
+            None,
         )
         .unwrap();
     resumed
@@ -1332,8 +1343,8 @@ async fn streaming_writer_resumes_its_keyed_journal_after_drop_then_publishes_th
     drop(checkpoint);
     drop(reader);
     let model = remote.component("model").unwrap();
-    assert_eq!(model.read("before").unwrap(), WEIGHT);
-    assert_eq!(model.read("after").unwrap(), [13, 14, 15, 16]);
+    assert_eq!(model.read_decoded("before").unwrap(), WEIGHT);
+    assert_eq!(model.read_decoded("after").unwrap(), [13, 14, 15, 16]);
     assert_eq!(model.asset("tokenizer.json").unwrap(), ASSET);
     assert_eq!(model.config()["width"], 4);
 }
@@ -1381,7 +1392,7 @@ async fn literal_writer_inside_classified_snapshot_preserves_the_callers_header_
         })
         .unwrap();
     writer
-        .component("model", "test.Model", Default::default())
+        .component("model", "test.Model", Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -1434,7 +1445,7 @@ async fn literal_writer_inside_classified_snapshot_preserves_the_callers_header_
         .await
         .unwrap();
     assert_eq!(
-        reopened.component("model").unwrap().read("w").unwrap(),
+        reopened.component("model").unwrap().read_decoded("w").unwrap(),
         WEIGHT
     );
 }

@@ -2,11 +2,9 @@
 
 Open a model and read its tensors. TensorFS fetches missing data into its shared store
 automatically; normal loading does not create a snapshot folder. This guide covers the
-complete planned Python API, with optional filesystem and repository tools kept separate.
-
-This is the **0.13 target**, currently being integrated. The implementation on `master`
-can still expose the preceding interface. The [Rust API](../tensorfs/API.md) and
-[technical file-format specification](../tensorfs/spec/cozytensors.md) are separate documents.
+Python API, with optional filesystem and repository tools kept separate. The
+[Rust API](../tensorfs/API.md) and [file-format specification](../tensorfs/spec/cozytensors.md)
+are separate documents.
 
 - [Import and open a model](#python-import-and-open-a-model)
 - [Use the returned objects](#python-use-the-returned-objects)
@@ -296,11 +294,7 @@ and `read` instead of managing these ranges.
 
 ### Advanced: decode resident encoded parts
 
-`tensorfs.raw.decode_into` is an approved **0.13 target** in the reviewed resident-decode
-source branches. Native compilation and installed CPU/GPU qualification are still pending;
-this section does not establish availability in an installed release.
-
-This operation is for integrations that already hold encoded parts in memory and own the
+`tensorfs.raw.decode_into` is for integrations that already hold encoded parts in memory and own the
 destination. It does not open a checkpoint or fetch data. Ordinary model code continues to
 use `component.tensors.read(..., decode=True)`. Its signature in `tensorfs.raw` is:
 
@@ -438,7 +432,7 @@ Its options and members are:
 | `metadata` | Mutable loading/provenance metadata dictionary. |
 | `local_checkpoint` | A committed local result retained after an upload failure, if one exists. |
 | `pipeline(cls, config)` | Set the pipeline description. |
-| `component(name, cls=..., config=...)` | Create or reopen a component and return its `ComponentWriter`. |
+| `component(name, cls=..., config=..., config_file=None)` | Create or reopen a component and return its `ComponentWriter`. `config_file` names the file its config exports as (`scheduler_config.json`); the default keeps a reopened or base component's, else `config.json`. |
 | `has(component, key)` | Check a current/resumed write, excluding untouched tensors inherited from the base. |
 | `commit()` | Finish and return the checkpoint; a first commit error is cached and re-raised. |
 | `abandon()` | End without producing a new checkpoint. |
@@ -521,7 +515,7 @@ write that checkpoint, or a repository name to reproduce repository content:
 
 ```python
 folder = tensorfs.materialize(saved, local_dir="./portable")
-legacy_folder = tensorfs.materialize(
+st_folder = tensorfs.materialize(
     saved, local_dir="./safetensors-model", format="safetensors", dequantize="BF16"
 )
 repo_folder = tensorfs.materialize("me/model", revision="1.0", local_dir="./repo")
@@ -547,7 +541,7 @@ choose `variant` when a named repository has multiple variants. Native repositor
 also accepts `revision`, `variant`, `components`, `local_files_only`, `cache_dir`, `endpoint`
 and `token`; without `local_dir`, it returns a managed snapshot folder.
 
-#### Compatibility export for legacy file-based libraries
+#### Export for file-based libraries
 
 Direct TensorFS/cozytensors loading is the normal integration path, including in our
 Runtime. Libraries should consume component configuration, supporting-file bytes and
@@ -555,7 +549,7 @@ tensor arrays directly. Export is a convenience for libraries that still require
 filenames; it is not a required preparation step.
 
 ```python
-# Only for a legacy consumer that requires a directory:
+# Only for a consumer that requires a directory:
 folder = checkpoint.components["tokenizer"].export_files("./tokenizer-files")
 ```
 

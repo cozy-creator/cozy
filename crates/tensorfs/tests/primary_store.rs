@@ -124,7 +124,7 @@ async fn normal_open_read_and_fetch_do_not_create_compatibility_directories() {
         checkpoint
             .component("model")
             .unwrap()
-            .read("weight")
+            .read_decoded("weight")
             .unwrap(),
         b"shared bytes"
     );
