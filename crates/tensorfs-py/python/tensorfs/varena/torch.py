@@ -757,7 +757,7 @@ class Memory:
         home and one run once keeps only what is resident. Within a request it never rises.
         Planning never cuts: cuts in force relax (`cuts.coarser`) whenever the peak the relaxed
         pass needs (its peak measured uncut, else twice the cut one) still leaves the model two
-        streaming slots. Measured, the pass's working set gets its room before it runs, not from its OOM."""
+        streaming slots, or is no higher than the cut one. Measured, the pass's working set gets its room before it runs, not from its OOM."""
         repeating = model.repeats >= 2
         if not model.blocks or (model.reserve < 0 and repeating):
             return
@@ -772,8 +772,8 @@ class Memory:
                 cold = (m for m in self.models.values() if self._victim(m))
                 room += sum(_set(m)[0] for m in cold if self._keep(m) < keep) + self._others()
             sizes = _sizes(model)
-            need = cuts.relaxing(model.track.shape, model.reserve)
-            if need is not None and room - need >= 2 * max(sizes):
+            need = cuts.relaxing(model.track.shape, model.reserve)  # a cut no lower goes
+            if need is not None and (need <= model.reserve or room - need >= 2 * max(sizes)):
                 cuts.coarser(model.track.shape)  # type: ignore[arg-type]
                 model.reserve = need
             room -= model.reserve

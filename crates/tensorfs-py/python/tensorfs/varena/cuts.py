@@ -312,12 +312,14 @@ def relaxing(shape: Shape | None, peak: int) -> int | None:
 
 def coarser(shape: Shape) -> None:
     """Relaxation (the planner's): a shape's cuts go back to whole when it ran uncut before,
-    else one step toward it (twice their size); its peak waits to be measured again."""
+    else one step toward it, half as many pieces (a floor-halved size doubles back to whole
+    exactly); its peak waits to be measured again."""
     memo = _served.memo
     for key, (total, _, _) in shape.scopes.items():
         size = min(memo.sizes.get(key, total), total)
         if size < total:
-            memo.sizes[key] = total if shape.whole >= 0 else min(total, 2 * size)
+            pieces = 1 if shape.whole >= 0 else -(-total // size) // 2
+            memo.sizes[key] = -(-total // max(pieces, 1))
     shape.peak, shape.cuts = -1, {}
 
 
