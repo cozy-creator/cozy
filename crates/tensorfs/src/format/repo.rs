@@ -237,6 +237,10 @@ impl Repo {
         self.tags.iter().find(|t| t.name == name)
     }
 
+    pub fn tag_mut(&mut self, name: &str) -> Option<&mut Tag> {
+        self.tags.iter_mut().find(|t| t.name == name)
+    }
+
     /// The default: the public, non-yanked tag with the highest version (of equal versions, the
     /// last created).
     pub fn default_tag(&self) -> Option<&Tag> {
@@ -266,7 +270,7 @@ impl Repo {
 
     /// Moves tag `name` to `commit`, keeping its place and flags; a new tag is private and last.
     pub fn set_tag(&mut self, name: &str, commit: ObjectRef) {
-        match self.tags.iter_mut().find(|t| t.name == name) {
+        match self.tag_mut(name) {
             Some(t) => t.commit = commit,
             None => self.tags.push(Tag { name: name.into(), commit, public: false, yanked: false }),
         }

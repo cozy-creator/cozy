@@ -235,7 +235,7 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
         &fs::read(cache.join("refs/acme/provider.json")).expect("first open did not cache a repo"),
     )
     .unwrap();
-    assert_eq!(repo.release(None).unwrap().tree, tree);
+    assert_eq!(repo.default_tag().unwrap().commit, tree);
     drop(warm);
 
     // Independent ordinary anonymous read proves the endpoint is still healthy. This does

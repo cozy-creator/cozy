@@ -87,8 +87,8 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
         let report = &done.report["checkpoints"][0];
         assert_eq!(report["old"], lane.manifest.id().as_str());
         let repo = Repo::from_json(&fs::read(root.join(format!("refs/{}.json", lane.name))).unwrap()).unwrap();
-        assert_eq!(repo.checkpoints.len(), 1);
-        trees.insert(lane.name.clone(), (repo.checkpoints[0].clone(), report.clone()));
+        assert_eq!(repo.tags.len(), 1);
+        trees.insert(lane.name.clone(), (repo.tags[0].commit.clone(), report.clone()));
     }
 
     let uploaded: BTreeSet<String> = blobs(&root).difference(&held).cloned().collect();
