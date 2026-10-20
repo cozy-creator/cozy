@@ -327,6 +327,36 @@ impl Placement {
             let Some(this) = weak.upgrade() else {
                 break;
             };
+            let release = match row.cache_release() {
+                Ok(release) => release,
+                Err(error) => {
+                    tracing::warn!(%error, "cache-release owner disappeared");
+                    break;
+                }
+            };
+            let released = if release.is_some() {
+                let through = this
+                    .inner
+                    .lock()
+                    .table
+                    .pages
+                    .iter()
+                    .filter(|page| page.row == row.owner().row && page.kind == Kind::Cache)
+                    .map(|page| page.id)
+                    .max()
+                    .unwrap_or(0);
+                this.drive(
+                    0,
+                    Trigger::ReleaseUnusedCaches {
+                        row: row.owner().row,
+                        after: 0,
+                        through,
+                    },
+                )
+                .map(|_| ())
+            } else {
+                Ok(())
+            };
             let result = if let Some(ask) = ask {
                 let result = this.drive(
                     0,
@@ -348,7 +378,10 @@ impl Placement {
                 })
             };
             let settled = this.settle();
-            if let Err(error) = result.and(settled) {
+            // Do not erase pending evidence while an untrusted callback or its
+            // actual CUDA consumer completion is still running.
+            drop(release);
+            if let Err(error) = released.and(result).and(settled) {
                 tracing::warn!(%error, "reclaim failed");
             }
         }
@@ -1568,7 +1601,7 @@ impl Placement {
         self.row.publish(&snapshot, inner.progress)
     }
 
-    fn drive(&self, request: RequestId, trigger: Trigger) -> Result<Relief> {
+    fn drive(&self, request: RequestId, mut trigger: Trigger) -> Result<Relief> {
         let reason = match trigger {
             Trigger::FillLanded(_) | Trigger::PinReleased(_) => "speculation",
             Trigger::Lower { .. } => "lower",
@@ -1583,6 +1616,13 @@ impl Placement {
             let actions = plan::decide(&self.inner.lock().table, trigger);
             let mut wait = None;
             for action in actions {
+                if let (Trigger::ReleaseUnusedCaches { after, .. }, Action::Shrink { page, .. }) =
+                    (&mut trigger, &action)
+                {
+                    // One callback per cache in the initial fixed set, including
+                    // callbacks that report progress without resizing their page.
+                    *after = *page;
+                }
                 match action {
                     Action::DropHome { request, page } => {
                         self.event(request, page, "lower", "lower")?;
@@ -2252,6 +2292,171 @@ mod gpu_tests {
         .expect("visible devices");
         assert_eq!(count, 1, "this proof requires exactly one assigned GPU");
         gpu.uuid().expect("GPU UUID")
+    }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn idle_cached_weight_pins_cannot_block_their_own_warm_admission() {
+        let probe = Gpu::open(0).expect("real CUDA device");
+        let uuid = assigned_gpu(&probe);
+        let capacity = 32 << 20;
+        let weight = 20 << 20; // actual mapped CUDA bytes, more than half the scoped budget
+        assert!(probe.capacity().unwrap() >= capacity);
+        drop(probe);
+        // A private test ledger avoids changing the machine service's own cap.
+        let name = format!(
+            "admission-gpu-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        struct Named(String);
+        impl Drop for Named {
+            fn drop(&mut self) {
+                let uid = unsafe { libc::geteuid() };
+                let _ = std::fs::remove_file(format!("/dev/shm/varena-{}-{uid}", self.0));
+            }
+        }
+        let _named = Named(name.clone());
+        let ledger = Ledger::create(&name, capacity).expect("scoped admission ledger");
+        let grant = ledger.grant_unbound().expect("rank grant");
+        let placement = Placement::open(0, Some((grant.table, grant.events, grant.channel)))
+            .expect("actual CUDA placement");
+        assert_eq!(placement.gpu_uuid().unwrap(), uuid);
+        let layout = Layout {
+            parts: vec![],
+            regions: vec![crate::layout::Region {
+                offset: 0,
+                nbytes: weight,
+                span: weight,
+                items: vec![Item {
+                    offset: 0,
+                    len: weight,
+                    part_end: true,
+                    source: ItemSource::Inline(vec![7; weight as usize].into()),
+                }],
+            }],
+            nbytes: weight,
+            digest: "warm-admission".into(),
+            names: vec![],
+        };
+        let pages = placement
+            .register(
+                1,
+                "warm-admission".into(),
+                [43; 32],
+                &layout,
+                Arc::new(Source::files(vec![], false, 0)),
+                None,
+            )
+            .expect("real model region");
+        placement
+            .begin(1, vec![vec![1]], "warm-admission".into(), "shape".into())
+            .unwrap();
+        placement.enter(1, 1).unwrap();
+        let pin = placement
+            .bind(1, pages[0], 0)
+            .expect("actual filled CUDA page");
+        let held = Arc::new(Mutex::new(Some(pin)));
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (retained, calls) = (held.clone(), dropped.clone());
+        let created = Arc::new(Mutex::new(None));
+        let created_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (created_id, new_calls) = (created.clone(), created_calls.clone());
+        let weak = Arc::downgrade(&placement);
+        let cache = placement
+            .cache(
+                0,
+                Arc::new(move |_| {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    let pin = retained.lock().take();
+                    drop(pin);
+                    let new_calls = new_calls.clone();
+                    let id = weak.upgrade().expect("live placement").cache(
+                        0,
+                        Arc::new(move |_| {
+                            new_calls.fetch_add(1, Ordering::AcqRel);
+                            Ok(0)
+                        }),
+                    )?;
+                    *created_id.lock() = Some(id);
+                    Ok(0) // zero graph-pool bytes still retain real weight pins
+                }),
+            )
+            .unwrap();
+        placement.leave(1, 0).unwrap();
+        placement.end(1).unwrap();
+        assert_eq!(
+            ledger
+                .peaks()
+                .iter()
+                .find(|(key, _)| key == "warm-admission|shape")
+                .map(|(_, bytes)| *bytes),
+            Some(weight)
+        );
+        assert_eq!(
+            ledger.status().unwrap().rows[0].snapshot.classes[Class::Pinned.as_usize()],
+            weight
+        );
+        assert!(
+            !ledger.fits("warm-admission", "shape").unwrap(),
+            "the first snapshot is conservatively pinned"
+        );
+        observe(
+            &ledger,
+            "idle cache release never admitted the warm request",
+            || ledger.fits("warm-admission", "shape").unwrap(),
+        );
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+        assert_eq!(
+            created_calls.load(Ordering::Acquire),
+            0,
+            "a cache created by a release callback must wait for a later signal"
+        );
+        assert!(held.lock().is_none());
+        assert_eq!(
+            placement
+                .resident()
+                .unwrap()
+                .iter()
+                .map(|(_, bytes)| *bytes)
+                .sum::<u64>(),
+            weight,
+            "admission must not unmap warm weights"
+        );
+        placement
+            .begin(2, vec![vec![1]], "warm-admission".into(), "shape".into())
+            .unwrap();
+        let pin = placement.bind(2, pages[0], 0).expect("warm CUDA binding");
+        let mut bytes = [0_u8; 32];
+        tensorfs::io::read(
+            &[tensorfs::io::Copy {
+                src: tensorfs::io::Src::Device {
+                    device: 0,
+                    ptr: pin.ptr,
+                    stream: 0,
+                },
+                dst: tensorfs::io::Dst::host(&mut bytes),
+            }],
+            &tensorfs::io::ReadOpts::default(),
+        )
+        .expect("real GPU contents");
+        assert_eq!(bytes, [7; 32]);
+        drop(pin);
+        placement.leave(2, 0).unwrap();
+        let stats = placement.end(2).unwrap();
+        assert!(
+            stats.copies.is_empty(),
+            "warm admission refilled weight bytes"
+        );
+        placement.close_cache(cache);
+        placement.close_cache(created.lock().take().expect("callback-created cache"));
+        placement.close().unwrap();
+        println!(
+            "PASS idle cache pins release before warm admission without weight eviction {uuid}"
+        );
     }
 
     struct ConsumerGate {

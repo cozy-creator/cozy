@@ -54,6 +54,10 @@ struct Slot {
     handled: [AtomicU64; CLASSES],
     wakeups: AtomicU64,
     progress: AtomicU64,
+    // Protocol extension in the old Slot tail padding. Existing field offsets
+    // and the mapped table size stay unchanged. Signals name an owner generation.
+    cache_release: AtomicU64,
+    cache_inflight: AtomicU64,
 }
 #[repr(C)]
 struct Peak {
@@ -376,6 +380,7 @@ pub struct Ledger {
     custody: Arc<Mutex<Custody>>,
     host: Arc<HostCache>,
     observations: Mutex<HashMap<Owner, (u64, u64)>>,
+    admission_releases: Mutex<HashMap<Owner, (u64, Snapshot)>>,
 }
 impl Ledger {
     /// Open the machine/user's existing ledger, or initialize it under the file's OFD lock.
@@ -486,6 +491,7 @@ impl Ledger {
             custody: Arc::default(),
             host,
             observations: Mutex::default(),
+            admission_releases: Mutex::default(),
         })
     }
     /// Adopt the descriptors in a grant. No named-file lookup or CUDA initialization occurs.
@@ -508,6 +514,7 @@ impl Ledger {
             custody: Arc::default(),
             host: Arc::new(HostCache::default()),
             observations: Mutex::default(),
+            admission_releases: Mutex::default(),
         })
     }
     pub fn fd(&self) -> BorrowedFd<'_> {
@@ -637,6 +644,8 @@ impl Ledger {
             }
             slot.progress.store(0, Relaxed);
             slot.wakeups.store(0, Relaxed);
+            slot.cache_release.store(0, Relaxed);
+            slot.cache_inflight.store(0, Relaxed);
             let owner = Owner {
                 row: row as u32,
                 generation: (before >> 2) + 1,
@@ -720,6 +729,22 @@ impl Ledger {
             sequence,
         })
     }
+    /// Request only idle cache callbacks, never a byte eviction. The pending
+    /// generation remains visible until the owner finishes its callbacks/events.
+    fn release_idle_caches(&self, owner: Owner) -> Result<()> {
+        let slot = self.table.slot(owner)?;
+        if slot.state.load(Acquire) & 3 != LIVE || !self.table.alive(owner.row as usize)? {
+            return Err(Error::Closed("cache-release owner is not live".into()));
+        }
+        if slot.cache_inflight.load(Acquire) == owner.generation {
+            return Ok(());
+        }
+        if slot.cache_release.fetch_max(owner.generation, AcqRel) < owner.generation {
+            slot.bell.fetch_add(1, Release);
+            wake(&slot.bell);
+        }
+        Ok(())
+    }
     pub fn answered(&self, owner: Owner, ask: Ask) -> Result<bool> {
         let slot = match self.table.slot(owner) {
             Ok(slot) => slot,
@@ -756,11 +781,13 @@ impl Ledger {
         let mut stalled = Vec::new();
         for row in self.table.rows()? {
             let slot = self.table.slot(row.owner)?;
-            let pending = slot
-                .asked
-                .iter()
-                .zip(&slot.handled)
-                .any(|(a, h)| a.load(Acquire) > h.load(Acquire));
+            let pending = slot.cache_release.load(Acquire) == row.owner.generation
+                || slot.cache_inflight.load(Acquire) == row.owner.generation
+                || slot
+                    .asked
+                    .iter()
+                    .zip(&slot.handled)
+                    .any(|(a, h)| a.load(Acquire) > h.load(Acquire));
             if row.state == State::Live && pending {
                 match observations.get(&row.owner).copied() {
                     Some((progress, wakeups)) if row.progress == progress => {
@@ -781,6 +808,10 @@ impl Ledger {
     /// Measured remaining working sets are declarations, not a learned usage prediction.
     pub fn fits(&self, package: &str, shape: &str) -> Result<bool> {
         let rows = self.table.rows()?;
+        self.admission_releases.lock().retain(|owner, _| {
+            rows.iter()
+                .any(|row| row.owner == *owner && row.state == State::Live)
+        });
         if rows.iter().any(|r| r.state != State::Live) {
             return Ok(false);
         }
@@ -812,10 +843,41 @@ impl Ledger {
                     .unwrap_or(0),
             )
         }));
-        Ok(fixed
+        let fits = fixed
             .saturating_add(sum(running.iter().filter_map(|r| r.remaining)))
             .saturating_add(peak)
-            <= self.capacity())
+            <= self.capacity();
+        if !fits {
+            // A learned peak already includes the model's resident weights. An
+            // idle graph can keep those same weights pinned, so ask its owner to
+            // drop discretionary cache refs before retrying this conservative sum.
+            let release: Vec<_> = {
+                let mut attempted = self.admission_releases.lock();
+                rows.iter()
+                    .filter(|row| {
+                        row.snapshot.requests.is_empty()
+                            && row.snapshot.classes[Class::Pinned.as_usize()] != 0
+                    })
+                    .filter_map(|row| {
+                        let stamp = (row.progress, row.snapshot.clone());
+                        if attempted.get(&row.owner) == Some(&stamp) {
+                            None
+                        } else {
+                            attempted.insert(row.owner, stamp);
+                            Some(row.owner)
+                        }
+                    })
+                    .collect()
+            };
+            // No admission mutex is held across descriptor/claim inspection.
+            for owner in release {
+                match self.release_idle_caches(owner) {
+                    Ok(()) | Err(Error::Closed(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(fits)
     }
     pub fn record_peak(&self, package: &str, shape: &str, bytes: u64) -> Result<()> {
         let key = words(&format!("{package}|{shape}"))?;
@@ -995,7 +1057,42 @@ pub struct Row {
     _claim: Option<OwnedFd>,
     write: Mutex<()>,
 }
+
+/// Keeps the generation's pending evidence visible through callbacks and CUDA
+/// completion. A failed callback is still one attempt, never an automatic retry.
+pub(crate) struct CacheRelease<'a>(&'a Row);
+impl Drop for CacheRelease<'_> {
+    fn drop(&mut self) {
+        let owner = self.0.owner;
+        if let Ok(slot) = self.0.table.slot(owner) {
+            let _ = slot
+                .cache_release
+                .compare_exchange(owner.generation, 0, AcqRel, Acquire);
+            let _ = slot
+                .cache_inflight
+                .compare_exchange(owner.generation, 0, AcqRel, Acquire);
+            self.0.table.changed();
+        }
+    }
+}
+
 impl Row {
+    pub(crate) fn cache_release(&self) -> Result<Option<CacheRelease<'_>>> {
+        let slot = self.table.slot(self.owner)?;
+        if slot.cache_release.load(Acquire) != self.owner.generation {
+            return Ok(None);
+        }
+        if slot
+            .cache_inflight
+            .compare_exchange(0, self.owner.generation, AcqRel, Acquire)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        slot.wakeups.fetch_add(1, Release);
+        self.table.changed();
+        Ok(Some(CacheRelease(self)))
+    }
     pub fn owner(&self) -> Owner {
         self.owner
     }
@@ -2176,6 +2273,175 @@ impl Channel {
             .read_exact(&mut ack)
             .map_err(|e| io("read release acknowledgement", e))?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod admission_tests {
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn cache_signals_use_only_the_existing_tail_padding() {
+        assert_eq!((size_of::<Header>(), align_of::<Header>()), (64, 64));
+        assert_eq!(
+            (
+                offset_of!(Header, magic),
+                offset_of!(Header, capacity),
+                offset_of!(Header, changed)
+            ),
+            (0, 8, 16)
+        );
+        assert_eq!((size_of::<Slot>(), align_of::<Slot>()), (576, 64));
+        assert_eq!(
+            [
+                offset_of!(Slot, state),
+                offset_of!(Slot, pid),
+                offset_of!(Slot, bell),
+                offset_of!(Slot, seq),
+                offset_of!(Slot, copies),
+                offset_of!(Slot, asked),
+                offset_of!(Slot, handled),
+                offset_of!(Slot, wakeups),
+                offset_of!(Slot, progress),
+            ],
+            [0, 8, 12, 16, 24, 424, 480, 536, 544]
+        );
+        assert_eq!(
+            (
+                offset_of!(Slot, cache_release),
+                offset_of!(Slot, cache_inflight)
+            ),
+            (552, 560)
+        );
+        assert_eq!((size_of::<Peak>(), align_of::<Peak>()), (208, 8));
+        assert_eq!(
+            (
+                offset_of!(Peak, state),
+                offset_of!(Peak, key),
+                offset_of!(Peak, bytes)
+            ),
+            (0, 8, 200)
+        );
+        assert_eq!((size_of::<Shared>(), align_of::<Shared>()), (90176, 64));
+        assert_eq!(
+            (
+                offset_of!(Shared, header),
+                offset_of!(Shared, rows),
+                offset_of!(Shared, peaks)
+            ),
+            (0, 64, 36928)
+        );
+    }
+
+    struct Fixture {
+        ledger: Ledger,
+        name: String,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let name = format!(
+                "admission-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Relaxed)
+            );
+            Self {
+                ledger: Ledger::create(&name, 1024).unwrap(),
+                name,
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let uid = unsafe { libc::geteuid() };
+            let _ = std::fs::remove_file(format!("/dev/shm/varena-{}-{uid}", self.name));
+        }
+    }
+
+    #[test]
+    fn unchanged_admission_does_not_repeat_or_erase_an_inflight_cache_release() {
+        let fixture = Fixture::new();
+        let row = fixture.ledger.claim(std::process::id()).unwrap();
+        fixture.ledger.record_peak("package", "shape", 700).unwrap();
+        let mut snapshot = Snapshot {
+            context: 20,
+            ..Default::default()
+        };
+        snapshot.classes[Class::Pinned.as_usize()] = 600;
+        row.publish(&snapshot, 7).unwrap();
+        assert!(!fixture.ledger.fits("package", "shape").unwrap());
+        let slot = fixture.ledger.table.slot(row.owner()).unwrap();
+        let bell = slot.bell.load(Acquire);
+        let release = row
+            .cache_release()
+            .unwrap()
+            .expect("explicit cache release");
+        assert_eq!(slot.cache_release.load(Acquire), row.owner().generation);
+        assert_eq!(slot.cache_inflight.load(Acquire), row.owner().generation);
+        for _ in 0..100 {
+            assert!(!fixture.ledger.fits("package", "shape").unwrap());
+        }
+        assert_eq!(slot.bell.load(Acquire), bell);
+        assert!(row.cache_release().unwrap().is_none());
+        drop(release);
+        assert_eq!(
+            (
+                slot.cache_release.load(Acquire),
+                slot.cache_inflight.load(Acquire)
+            ),
+            (0, 0)
+        );
+        assert!(!fixture.ledger.fits("package", "shape").unwrap());
+        assert_eq!(
+            slot.bell.load(Acquire),
+            bell,
+            "a no-progress callback must not cause a wake loop"
+        );
+        snapshot.classes[Class::Pinned.as_usize()] = 0;
+        snapshot.classes[Class::Unused.as_usize()] = 600;
+        row.publish(&snapshot, 8).unwrap();
+        assert!(fixture.ledger.fits("package", "shape").unwrap());
+    }
+
+    #[test]
+    fn a_late_cache_signal_cannot_target_a_reused_row_generation() {
+        let fixture = Fixture::new();
+        let row = fixture.ledger.claim(std::process::id()).unwrap();
+        let old = row.owner();
+        fixture.ledger.release_idle_caches(old).unwrap();
+        drop(row.cache_release().unwrap().unwrap());
+        drop(row);
+        let next = fixture.ledger.claim(std::process::id()).unwrap();
+        assert_eq!(old.row, next.owner().row);
+        assert!(next.owner().generation > old.generation);
+        let slot = fixture.ledger.table.slot(next.owner()).unwrap();
+        assert_eq!(
+            (
+                slot.cache_release.load(Acquire),
+                slot.cache_inflight.load(Acquire)
+            ),
+            (0, 0)
+        );
+        assert!(fixture.ledger.release_idle_caches(old).is_err());
+        // A producer that passed the old generation check before its owner died.
+        slot.cache_release.fetch_max(old.generation, AcqRel);
+        assert!(next.cache_release().unwrap().is_none());
+        fixture.ledger.release_idle_caches(next.owner()).unwrap();
+        let release = next
+            .cache_release()
+            .unwrap()
+            .expect("new generation signal");
+        slot.cache_release.fetch_max(old.generation, AcqRel);
+        assert_eq!(slot.cache_release.load(Acquire), next.owner().generation);
+        drop(release);
+        assert_eq!(
+            (
+                slot.cache_release.load(Acquire),
+                slot.cache_inflight.load(Acquire)
+            ),
+            (0, 0)
+        );
     }
 }
 
