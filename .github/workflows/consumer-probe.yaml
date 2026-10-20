@@ -112,6 +112,29 @@ jobs:
           ls -la "$(dirname "$cozy")"
           echo "== control: v0.10.1's own installer over the running cozy"
           curl -sSfLo old.$ext "$COZY_DOWNLOAD_URL/cozy-installer.$ext"; install old.$ext; echo "exit $?"
+  winscript:
+    if: contains(github.event.head_commit.message, '[winscript]')
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [master, fix/xs-060-windows-uv-env]
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.ref }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p cozy
+      - run: |
+          mkdir -p ~/.cozy/bin && cp target/release/cozy.exe ~/.cozy/bin/ && cozy=~/.cozy/bin/cozy.exe
+          "$cozy" machine enable
+          mkdir work && cd work
+          printf '%s\n' '# /// script' '# requires-python = ">=3.12"' '# dependencies = ["cozy-runtime"]' '# [tool.cozy]' '# accelerator = false' '# ///' 'def main() -> str:' '    return "hello from Windows"' > greet.py
+          "$cozy" run ./greet.py || true
+          "$cozy" run list || true
   distros:
     if: contains(github.event.head_commit.message, '[distros]')
     runs-on: ubuntu-24.04
