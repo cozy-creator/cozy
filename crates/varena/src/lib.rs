@@ -39,6 +39,8 @@ pub enum Error {
     DeviceFull { need: u64, deficit: u64 },
     #[error("invalid: {0}")]
     Invalid(String),
+    #[error("internal varena failure: {0}")]
+    Internal(&'static str),
     #[error("io: {0}")]
     Io(String),
     #[error("source: {0}")]
@@ -81,6 +83,7 @@ impl Error {
             Error::CudaUnavailable(_) => "CUDA_UNAVAILABLE",
             Error::DeviceFull { .. } => "DEVICE_FULL",
             Error::Invalid(_) => "INVALID",
+            Error::Internal(_) => "INTERNAL",
             Error::Io(_) => "IO",
             Error::Source(_) => "SOURCE",
             Error::Closed(_) => "CLOSED",
