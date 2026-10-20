@@ -9,15 +9,27 @@ from __future__ import annotations
 import json
 import math
 import os
+from typing import Annotated
 
-from cozy_runtime.author import Outputs, Tree
+from cozy_runtime.author import AssetBound, FileAsset, Outputs, Tree
 
 
-def main(*, limit_gib: int, out: Outputs) -> Tree:
+def main(
+    *, settings: Annotated[FileAsset, AssetBound(max_bytes=128)], out: Outputs
+) -> Tree:
+    configuration = json.loads(settings.read_bytes())
+    if (
+        not isinstance(configuration, dict)
+        or set(configuration) != {"limit_gib"}
+        or type(configuration["limit_gib"]) is not int
+        or configuration["limit_gib"] < 0
+    ):
+        raise ValueError(
+            "settings must contain only an exact nonnegative integer limit_gib"
+        )
+    limit_gib = configuration["limit_gib"]
     import torch
 
-    if limit_gib < 0:
-        raise ValueError("limit_gib is positive, or zero for no cap")
     pid = os.getpid()
     device = torch.cuda.current_device()
     cuda_device = torch.device("cuda", device)
