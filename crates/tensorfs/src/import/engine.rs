@@ -471,6 +471,25 @@ pub struct Reading {
 }
 
 impl Reading {
+    /// Bytes no source tensor holds, as they are (`file` is never read).
+    pub(super) fn inline(bytes: Vec<u8>, source: Dtype) -> Reading {
+        let len = bytes.len() as u64;
+        Reading {
+            file: 0,
+            start: 0,
+            len,
+            unit: 1,
+            runs: Runs {
+                run: len,
+                base: 0,
+                outer: vec![],
+            },
+            source,
+            cast: None,
+            inline: Some(bytes),
+        }
+    }
+
     /// A source range read as it is.
     fn whole(t: &Tensor) -> Reading {
         Reading {

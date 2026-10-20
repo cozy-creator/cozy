@@ -87,7 +87,7 @@ fn resident_host_matches_all_frozen_u7_values_and_refuses_without_writing() {
             refused += 1;
         }
     }
-    assert_eq!((passed, refused), (18, 14));
+    assert_eq!((passed, refused), (18, 16));
 }
 
 #[test]

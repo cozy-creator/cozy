@@ -18,6 +18,7 @@
 pub mod carriers;
 pub mod engine;
 pub mod gguf;
+pub mod lora;
 pub mod order;
 pub mod remote;
 pub mod source;
@@ -685,9 +686,20 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
         }
     };
     let identity = |g: &source::Group| component(&g.folder, &g.stem);
-    let planned = engine::plan(&set, tables, &recognized, &identity)?;
+    let mut planned = engine::plan(&set, tables, &recognized, &identity)?;
     let (mut files, mut filled, mut versions) = documents(&set, &recognized, &planned, req, &area)?;
     let (mut converters, mut normalized) = (converters, normalized);
+    let sources: BTreeMap<String, &source::Group> = (recognized.claims.iter())
+        .map(|c| (c.name.clone(), &set.groups[c.group]))
+        .chain((recognized.unclaimed.iter()).map(|g| (identity(&set.groups[*g]), &set.groups[*g])))
+        .collect();
+    let mut adapters = lora::normalize(&mut planned, &sources, &mut files)?;
+    // A PEFT adapter's keys are its base model's module names: canonical once unwrapped.
+    let peft = |g: &usize| adapters.get(&identity(&set.groups[*g])).is_some_and(|a| a.stated);
+    if recognized.unclaimed.iter().any(peft) {
+        converters.push("peft.lora".into());
+        normalized |= recognized.unclaimed.iter().all(peft);
+    }
     let mut ggufs_planned = Vec::new();
     for p in &ggufs {
         let file = name(&p.path);
@@ -733,7 +745,13 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
             )
         }));
     stopped(req)?;
-    sink.begin(&main_variant(stored), &layout(files, &tensored, &versions)?)?;
+    let mut layout = layout(files, &tensored, &versions)?;
+    for folder in &mut layout.components {
+        if let Some(adapter) = adapters.remove(&folder.name) {
+            (folder.config, folder.config_file) = (adapter.config, Some(lora::ADAPTER_CONFIG.into()));
+        }
+    }
+    sink.begin(&main_variant(stored), &layout)?;
     let opened: Vec<File> = set
         .files
         .iter()
