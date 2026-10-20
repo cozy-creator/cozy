@@ -3,8 +3,8 @@
 use std::collections::HashSet;
 use std::io::{self, Read};
 
-use crate::failure::{fail, Failure, Kind, Result};
-use crate::format::{ObjectRef, Tree};
+use crate::failure::{Failure, Result};
+use crate::format::ObjectRef;
 use crate::sha256::{hex, Sha256};
 use crate::store2::{Checkpoint, Error};
 
@@ -25,7 +25,6 @@ impl VerificationReport {
 pub(crate) fn verify(
     checkpoint: &Checkpoint,
     objects: impl IntoIterator<Item = ObjectRef>,
-    tree: Option<&ObjectRef>,
 ) -> Result<VerificationReport> {
     let mut report = VerificationReport::default();
     let mut seen = HashSet::new();
@@ -36,18 +35,7 @@ pub(crate) fn verify(
         if !seen.insert((object.sha256.clone(), object.length)) {
             continue;
         }
-        inspect(checkpoint, &object, false, &mut report, &mut buffer)?;
-    }
-    if let Some(tree) = tree {
-        if let Some(bytes) = inspect(checkpoint, tree, true, &mut report, &mut buffer)? {
-            // Parse exactly the bytes just hashed, never reopen a mutable tree path.
-            // Other variant headers and weights are outside this checkpoint's closure.
-            for (_, object) in Tree::from_json(&bytes)?.repo_files() {
-                if seen.insert((object.sha256.clone(), object.length)) {
-                    inspect(checkpoint, object, false, &mut report, &mut buffer)?;
-                }
-            }
-        }
+        inspect(checkpoint, &object, &mut report, &mut buffer)?;
     }
     Ok(report)
 }
@@ -55,38 +43,29 @@ pub(crate) fn verify(
 fn inspect(
     checkpoint: &Checkpoint,
     object: &ObjectRef,
-    capture: bool,
     report: &mut VerificationReport,
     buffer: &mut [u8],
-) -> Result<Option<Vec<u8>>> {
+) -> Result<()> {
     let file = match checkpoint.verification_file(object) {
         Ok(file) => file,
         Err(Error::Absent(_)) => {
             report.missing.push(object.clone());
-            return Ok(None);
+            return Ok(());
         }
         Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
             report.missing.push(object.clone());
-            return Ok(None);
+            return Ok(());
         }
         Err(Error::Mismatch { .. }) => {
             report.corrupt.push(object.clone());
-            return Ok(None);
+            return Ok(());
         }
         Err(error) => return Err(error.into()),
     };
     if file.metadata()?.len() != object.length {
         report.corrupt.push(object.clone());
-        return Ok(None);
+        return Ok(());
     }
-    // Match the endpoint's JSON document bound; payload chunks are streamed.
-    if capture && object.length > 16 << 20 {
-        return fail(
-            Kind::Unsupported,
-            "verification tree exceeds the 16 MiB document limit",
-        );
-    }
-    let mut bytes = Vec::new();
     let mut file = file.take(object.length.saturating_add(1));
     let mut hash = Sha256::new();
     let mut length = 0;
@@ -96,13 +75,6 @@ fn inspect(
             Ok(n) => {
                 length += n as u64;
                 hash.update(&buffer[..n]);
-                if capture {
-                    if length > object.length {
-                        report.corrupt.push(object.clone());
-                        return Ok(None);
-                    }
-                    bytes.extend_from_slice(&buffer[..n]);
-                }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
@@ -114,7 +86,6 @@ fn inspect(
     }
     if length != object.length || hex(&hash.finish()) != object.sha256 {
         report.corrupt.push(object.clone());
-        return Ok(None);
     }
-    Ok(Some(bytes))
+    Ok(())
 }

@@ -192,12 +192,12 @@ impl Checkpoint {
 
     /// Inspect the header and selected components' complete chunks/assets locally.
     /// An empty selection still checks the header. No data is fetched or changed.
-    pub fn verify_selected(&self, components: Option<&[String]>, tree: Option<&ObjectRef>) -> crate::Result<crate::VerificationReport> {
+    pub fn verify_selected(&self, components: Option<&[String]>) -> crate::Result<crate::VerificationReport> {
         let objects = match components {
             Some(components) => wanted(&self.header, Some(components))?,
             None => self.header.objects().cloned().collect(),
         };
-        crate::verification::verify(self, objects, tree.filter(|_| components.is_none()))
+        crate::verification::verify(self, objects)
     }
 
     /// Hash the actual header file and closure without changing them. Missing or corrupt

@@ -1017,8 +1017,7 @@ impl PyCheckpoint {
     #[pyo3(signature = (components=None))]
     fn verify(&self, py: Python<'_>, components: Option<Vec<String>>) -> PyResult<crate::verification::PyVerificationReport> {
         let checkpoint = self.stored(py)?;
-        let tree = self.named.as_ref().and_then(|named| named.tree.as_ref());
-        let report = py.detach(|| checkpoint.verify_selected(components.as_deref(), tree)).or_raise(py)?;
+        let report = py.detach(|| checkpoint.verify_selected(components.as_deref())).or_raise(py)?;
         Ok(report.into())
     }
 
