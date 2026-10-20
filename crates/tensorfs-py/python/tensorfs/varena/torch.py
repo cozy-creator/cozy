@@ -829,7 +829,8 @@ class Memory:
             with self.lock:
                 model.flight -= 1
                 model.aloft = False
-                _unbind(model.common)
+                # _enter rolls back its own acquisition. A failure before it must
+                # leave the common weights held by other users (e.g. a graph) bound.
             raise
         finally:
             with self.changed:
