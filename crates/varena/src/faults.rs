@@ -1,4 +1,4 @@
-//! Fault points on the host tier, armed only by tests (cargo feature `faults`).
+//! Host-tier and GPU completion fault points, armed only by tests (cargo feature `faults`).
 //! Without the feature every point is a no-op.
 
 #[cfg(feature = "faults")]

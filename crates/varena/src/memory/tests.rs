@@ -1,0 +1,443 @@
+//! CPU ownership controls, not CUDA execution. Handles below are inert metadata: the tests
+//! enter production failure helpers before any driver use. Actual post-enqueue GPU proof is
+//! separate. Retained objects deliberately live until this test process exits.
+
+use super::*;
+
+fn error(what: &str) -> Error {
+    Error::Io(what.into())
+}
+
+fn weights_with_host(with_host: bool) -> (Arc<Weights>, i32) {
+    let file = std::fs::File::open("/dev/null").unwrap();
+    let fd = file.as_raw_fd();
+    let source = Source::files(vec![(tensorfs::ids::ObjectRef::of(&[]), file)], false, 0);
+    let layout = Layout {
+        parts: vec![],
+        regions: vec![crate::layout::Region {
+            offset: 0,
+            nbytes: 0,
+            span: REGION_ALIGN,
+            items: vec![],
+        }],
+        nbytes: REGION_ALIGN,
+        digest: "0".repeat(64),
+        names: vec![vec![]],
+    };
+    let host = with_host.then(|| HostMem::create("ownership-control", &layout).unwrap());
+    (
+        Arc::new(Weights {
+            name: "ownership".into(),
+            layout,
+            parts: vec![],
+            source,
+            host,
+        }),
+        fd,
+    )
+}
+
+fn gpu_with_host(with_host: bool) -> (Arc<Gpu>, Weak<Weights>, i32) {
+    let (w, fd) = weights_with_host(with_host);
+    let weak = Arc::downgrade(&w);
+    let z = Counters::default();
+    let set = Set {
+        w,
+        base: 0,
+        regs: vec![Reg {
+            home: true,
+            map: Some(Mapping {
+                pins: 1,
+                ..Default::default()
+            }),
+        }],
+        step: z,
+        last: z,
+        total: z,
+        used: 0,
+        warm: true,
+        busy: false,
+        shared: false,
+    };
+    let inner = Arc::new(Inner {
+        ordinal: 0,
+        ctx: std::ptr::null_mut(),
+        pci: String::new(),
+        ceiling: 0.0,
+        prop: AllocationProp::device(0, 0),
+        shared: None,
+        chunk: 64 << 20,
+        events: Arc::new(Events {
+            ctx: std::ptr::null_mut(),
+            free: Mutex::default(),
+        }),
+        copy: std::ptr::null_mut(),
+        readers: Readers::new(1),
+        tally: IoTally::default(),
+        staging: Staging::new(vec![]),
+        jobs: Default::default(),
+        st: Mutex::new(State {
+            sets: vec![Some(set)],
+            ..Default::default()
+        }),
+        owner: Mutex::default(),
+        custody: Mutex::default(),
+    });
+    let gpu = Arc::new(Gpu {
+        inner: inner.clone(),
+        mover: None,
+    });
+    *inner.owner.lock().unwrap() = Arc::downgrade(&gpu);
+    (gpu, weak, fd)
+}
+
+struct Fixture {
+    gpu: Arc<Gpu>,
+    ws: Option<Arc<WeightSet>>,
+    fd: i32,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        Self::with_host(false)
+    }
+
+    fn with_host(with_host: bool) -> Self {
+        let (gpu, w, fd) = gpu_with_host(with_host);
+        let ws = Arc::new(WeightSet {
+            gpu: gpu.clone(),
+            id: 0,
+            base: 0,
+            weights: w.upgrade().unwrap(),
+        });
+        Self {
+            gpu,
+            ws: Some(ws),
+            fd,
+        }
+    }
+
+    fn ws(&self) -> &Arc<WeightSet> {
+        self.ws.as_ref().unwrap()
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // Synthetic VA/stream metadata must never enter successful driver teardown.
+        self.gpu
+            .inner
+            .poison(error("CPU ownership fixture finished"));
+        self.gpu.inner.readers.stop();
+    }
+}
+
+fn fd_is_open(fd: i32) -> bool {
+    // SAFETY: F_GETFD only queries this process's descriptor table.
+    (unsafe { libc::fcntl(fd, libc::F_GETFD) }) >= 0
+}
+
+fn buffer() -> Buf {
+    Buf {
+        ptr: std::ptr::null_mut(),
+        last: None,
+    }
+}
+
+#[test]
+fn unknown_fill_retains_sources_and_refuses_bind_prefetch_and_eviction() {
+    let mut f = Fixture::new();
+    let g = &f.gpu.inner;
+    let fill = Arc::new(Fill {
+        state: Mutex::new(None),
+        cv: Condvar::new(),
+    });
+    fill.set(g.failed_fill(error("copy submitted"), Err(error("drain failed"))));
+    {
+        let mut st = g.lock();
+        let m = st.reg(0, 0).unwrap().map.as_mut().unwrap();
+        m.pins = 0;
+        m.fill = Some(fill.clone());
+        assert!(!m.dead());
+        assert!(!m.settled());
+        assert!(!m.quiet().unwrap());
+    }
+    assert!(fill.wait().is_err());
+    assert!(f.ws().bind(0, 0).is_err());
+    assert!(f.ws().prefetch(0).is_err());
+    assert!(f.ws().evict(None).is_err());
+    let weights = Arc::downgrade(&f.ws().weights);
+    drop(f.ws.take());
+    assert!(weights.upgrade().is_some());
+    assert!(g.lock().sets[0].is_some());
+    assert!(fd_is_open(f.fd));
+}
+
+#[test]
+fn ordinary_copy_error_with_confirmed_drain_stays_reclaimable() {
+    let f = Fixture::new();
+    let g = &f.gpu.inner;
+    let fill = Arc::new(Fill {
+        state: Mutex::new(None),
+        cv: Condvar::new(),
+    });
+    fill.set(g.failed_fill(error("read failed"), Ok(())));
+    let mut m = Mapping {
+        fill: Some(fill),
+        ..Default::default()
+    };
+    assert!(m.dead());
+    assert!(m.settled());
+    assert!(m.quiet().unwrap());
+    assert!(g.check().is_ok());
+}
+
+#[test]
+fn a_successful_copy_drain_cannot_cover_an_unproven_consumer_dependency() {
+    let f = Fixture::new();
+    let g = &f.gpu.inner;
+    let release = Arc::new(Ev {
+        raw: std::ptr::null_mut(),
+        timing: false,
+        pool: g.events.clone(),
+    });
+    let weak = Arc::downgrade(&release);
+    let error = g.failed_dependencies(
+        error("wait enqueue failed"),
+        std::slice::from_ref(&release),
+        Err(error("consumer fence failed")),
+    );
+    let filled = g.failed_fill(error, Ok(()));
+    let fill = Arc::new(Fill {
+        state: Mutex::new(Some(filled)),
+        cv: Condvar::new(),
+    });
+    let mut map = Mapping {
+        fill: Some(fill),
+        ..Default::default()
+    };
+    assert!(!map.dead());
+    assert!(!map.settled());
+    assert!(!map.quiet().unwrap());
+    g.retain_waits(std::slice::from_ref(&release));
+    assert_eq!(g.custody.lock().unwrap().releases.len(), 1);
+    drop(release);
+    assert!(weak.upgrade().is_some());
+}
+
+#[test]
+fn failed_wait_with_independent_consumer_completion_keeps_normal_recovery() {
+    let f = Fixture::new();
+    let g = &f.gpu.inner;
+    let error = g.failed_dependencies(error("wait enqueue failed"), &[], Ok(()));
+    let filled = g.failed_fill(error, Ok(()));
+    assert!(matches!(filled, Filled::Failed(_)));
+    assert!(g.check().is_ok());
+    assert!(g.custody.lock().unwrap().releases.is_empty());
+}
+
+#[test]
+fn unproven_staging_buffer_never_reenters_pool_and_readers_finish_with_error() {
+    let f = Fixture::new();
+    let (tx, rx) = mpsc::channel();
+    let waiter = f.gpu.clone();
+    let thread = std::thread::spawn(move || tx.send(waiter.inner.staging.take().is_err()).unwrap());
+    let res = f.gpu.inner.finish_piece(
+        buffer(),
+        None,
+        Err(error("event record failed")),
+        Some(Err(error("drain failed"))),
+    );
+    assert!(res.is_err());
+    assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap());
+    thread.join().unwrap();
+    let b = f.gpu.inner.staging.buffers.lock().unwrap();
+    assert!(b.free.is_empty());
+    assert_eq!(b.held.len(), 1);
+    assert!(b.error.is_some());
+}
+
+#[test]
+fn staging_error_with_confirmed_drain_or_no_submission_returns_its_buffer() {
+    for drained in [Some(Ok(())), None] {
+        let f = Fixture::new();
+        assert!(f
+            .gpu
+            .inner
+            .finish_piece(buffer(), None, Err(error("copy or read failed")), drained)
+            .is_err());
+        assert!(f.gpu.inner.check().is_ok());
+        assert!(f.gpu.inner.staging.take().is_ok());
+    }
+}
+
+#[test]
+fn failed_final_pin_retains_actual_weight_set_gpu_and_source_once() {
+    let mut f = Fixture::new();
+    let ws = f.ws.take().unwrap();
+    let weak_ws = Arc::downgrade(&ws);
+    let weak_gpu = Arc::downgrade(&f.gpu);
+    for _ in 0..3 {
+        ws.finish_pin(At::Home, 0, Err(error("release record failed")), || {
+            Err(error("consumer drain failed"))
+        });
+    }
+    assert_eq!(f.gpu.inner.custody.lock().unwrap().pins.len(), 1);
+    assert_eq!(
+        f.gpu
+            .inner
+            .lock()
+            .reg(0, 0)
+            .unwrap()
+            .map
+            .as_ref()
+            .unwrap()
+            .pins,
+        1
+    );
+    let fd = f.fd;
+    drop(ws);
+    drop(f);
+    assert!(weak_ws.upgrade().is_some());
+    assert!(weak_gpu.upgrade().is_some());
+    assert!(fd_is_open(fd));
+}
+
+#[test]
+fn failed_release_record_with_confirmed_consumer_drain_releases_the_pin() {
+    let f = Fixture::new();
+    f.ws()
+        .finish_pin(At::Home, 0, Err(error("release record failed")), || Ok(()));
+    assert_eq!(
+        f.gpu
+            .inner
+            .lock()
+            .reg(0, 0)
+            .unwrap()
+            .map
+            .as_ref()
+            .unwrap()
+            .pins,
+        0
+    );
+    assert!(f.gpu.inner.check().is_ok());
+    assert!(f.gpu.inner.custody.lock().unwrap().pins.is_empty());
+}
+
+#[test]
+fn a_retained_pin_refuses_even_a_same_stream_wait_after_poison() {
+    let f = Fixture::new();
+    let ready = Arc::new(Ev {
+        raw: std::ptr::null_mut(),
+        timing: false,
+        pool: f.gpu.inner.events.clone(),
+    });
+    let pin = Pinned {
+        ws: f.ws().clone(),
+        at: At::Home,
+        region: 0,
+        ptr: 0,
+        nbytes: 0,
+        fresh: false,
+        writable: true,
+        stream: 7,
+        ready,
+    };
+    f.gpu.inner.poison(error("completion unknown"));
+    assert!(pin.wait_on(7).is_err());
+    drop(pin);
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn final_pinned_drop_keeps_the_last_weight_set_arc_after_context_and_drain_failure() {
+    let mut f = Fixture::new();
+    let ws = f.ws.take().unwrap();
+    let weak = Arc::downgrade(&ws);
+    let ready = Arc::new(Ev {
+        raw: std::ptr::null_mut(),
+        timing: false,
+        pool: f.gpu.inner.events.clone(),
+    });
+    let pin = Pinned {
+        ws,
+        at: At::Home,
+        region: 0,
+        ptr: 0,
+        nbytes: 0,
+        fresh: false,
+        writable: true,
+        stream: 0,
+        ready,
+    };
+    crate::faults::arm("pin-release-context", 1);
+    crate::faults::arm("pin-release-drain", 1);
+    drop(pin);
+    assert!(weak.upgrade().is_some());
+    assert_eq!(f.gpu.inner.custody.lock().unwrap().pins.len(), 1);
+    assert!(fd_is_open(f.fd));
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn failed_weight_set_context_entry_retains_its_set_and_source() {
+    let mut f = Fixture::new();
+    crate::faults::arm("set-drop-context", 1);
+    let ws = f.ws.take().unwrap();
+    let source = Arc::downgrade(&ws.weights);
+    drop(ws);
+    assert!(f.gpu.inner.check().is_err());
+    assert!(f.gpu.inner.lock().sets[0].is_some());
+    assert!(source.upgrade().is_some());
+    assert!(fd_is_open(f.fd));
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn failed_final_driver_entry_retains_actual_mapping_source_and_queued_job() {
+    let (gpu, source, fd) = gpu_with_host(false);
+    let (w, job_fd) = weights_with_host(false);
+    let job_source = Arc::downgrade(&w);
+    let fill = Arc::new(Fill {
+        state: Mutex::new(None),
+        cv: Condvar::new(),
+    });
+    gpu.inner.jobs.0.lock().unwrap().q.push_back(Job {
+        set: 0,
+        w,
+        region: 0,
+        dst: 0,
+        waits: vec![],
+        fill,
+    });
+    crate::faults::arm("inner-drop-driver", 1);
+    drop(gpu);
+    assert!(source.upgrade().is_some());
+    assert!(job_source.upgrade().is_some());
+    assert!(fd_is_open(fd));
+    assert!(fd_is_open(job_fd));
+}
+
+#[cfg(all(feature = "faults", target_os = "linux"))]
+#[test]
+fn failed_unregister_retains_the_actual_host_mapping_and_source() {
+    let mut f = Fixture::with_host(true);
+    let ws = f.ws.take().unwrap();
+    let host = ws.weights.host.as_ref().unwrap();
+    let (host_fd, base) = (host.fd(), host.base());
+    let source = Arc::downgrade(&ws.weights);
+    crate::faults::arm("set-unregister", 1);
+    // The production post-fence helper, with failure injected before any CUDA call. The
+    // host memfd/mapping are real CPU objects, rather than simulated owner counters.
+    assert!(!ws.unregister_host());
+    drop(ws);
+    drop(f);
+    assert!(source.upgrade().is_some());
+    assert!(fd_is_open(host_fd));
+    let mut resident = 0u8;
+    // SAFETY: mincore only queries residency; EFAULT would expose a lost mapping.
+    assert_eq!(
+        unsafe { libc::mincore(base.cast(), PART_ALIGN as usize, &mut resident) },
+        0
+    );
+}
