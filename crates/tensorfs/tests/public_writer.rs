@@ -761,9 +761,47 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
     let local = failed
         .committed()
         .expect("stream failure lost sealed local checkpoint");
+    let failed_tree = local.tree().unwrap().clone();
+    let failed_cache = scratch.0.join("failed-cache");
+    let operator = tensorfs::store2::Store::open(&failed_cache)
+        .unwrap()
+        .with_grace(std::time::Duration::ZERO);
+    let durable = operator
+        .get_pin(&failed_tree.sha256)
+        .unwrap()
+        .expect("failed upload has no durable retry root");
+    assert!(durable.owner.is_none() && durable.roots.contains(&failed_tree));
     failed.abandon().unwrap();
     drop(bad);
     assert_eq!(local.component("model").unwrap().read("w").unwrap(), WEIGHT);
+    drop(local);
+    // Remove only the disposable roots: a failed result must survive independently of TTL
+    // and of the dropped Checkpoint/Writer native owners.
+    for (name, pin) in operator.pins().unwrap() {
+        if pin.owner.as_deref() == Some("tensorfs.cache/1") {
+            assert!(operator.unpin(&name).unwrap());
+        }
+    }
+    let disposable = operator
+        .put_bytes(b"failed-upload collector positive control")
+        .unwrap();
+    operator.collect(0, std::time::Duration::ZERO).unwrap();
+    assert!(!failed_cache.join(disposable.key()).exists());
+    drop(operator);
+    let recovered = self::client(&failed_cache, &broken)
+        .open(
+            &failed_tree.id(),
+            &Open {
+                local_files_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.component("model").unwrap().read("w").unwrap(),
+        WEIGHT
+    );
 }
 
 struct WriterRefusal(tensorfs::Failure);
