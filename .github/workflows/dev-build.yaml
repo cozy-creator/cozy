@@ -179,8 +179,9 @@ jobs:
           args: --release --locked --target-dir ../../target/manylinux --out dist
           docker-options: -e TENSORFS_REQUIRE_AOT=1
           before-script-linux: |
-            cargo build --release --locked --target-dir ../../target/manylinux -p tensorfs --bin tfs
-            install -D -m 755 ../../target/manylinux/release/tfs wheel-data/scripts/tfs
+            # Match maturin's explicit target so the CLI and extension share dependency builds.
+            cargo build --release --locked --target x86_64-unknown-linux-gnu --target-dir ../../target/manylinux -p tensorfs --bin tfs
+            install -D -m 755 ../../target/manylinux/x86_64-unknown-linux-gnu/release/tfs wheel-data/scripts/tfs
       # The container leaves root-owned files the tests and the cache post-step write.
       - if: always() && contains(inputs.build, 'tensorfs')
         run: sudo chown -R "$(id -u):$(id -g)" target crates/tensorfs-py
