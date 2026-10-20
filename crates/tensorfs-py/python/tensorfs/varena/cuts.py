@@ -847,7 +847,8 @@ def _group_norm(func: OpOverload, args: Args, kwargs: Kwargs) -> _Plan | None:
 
 _UPSAMPLES = [f"{p}{d}d" for p in ("upsample_nearest", "_upsample_nearest_exact") for d in "123"]
 _SPEC = {
-    _contiguous: "contiguous",
+    # Tensor.contiguous also dispatches clone(memory_format=contiguous_format).
+    _contiguous: "contiguous clone",
     _conv: "convolution conv1d conv2d conv3d",
     _pad: "constant_pad_nd pad",
     _upsample: " ".join(_UPSAMPLES),
