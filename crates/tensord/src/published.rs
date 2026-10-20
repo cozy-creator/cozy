@@ -1277,7 +1277,7 @@ impl Publisher {
                 format!("uv {step}:\n{}", crate::api::install::stderr_tail(&stderr)),
             )),
             Supervised::Canceled => Err(canceled()),
-            Supervised::Wedged(verdict) => Err(("package_installation_stalled", format!("uv {step}: {verdict}"))),
+            Supervised::Wedged(verdict) => Err(("no_progress", format!("uv {step}: {verdict}"))),
         }
     }
 
