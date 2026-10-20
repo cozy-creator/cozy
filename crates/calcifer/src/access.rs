@@ -260,9 +260,12 @@ impl Hubs {
 }
 
 /// The existing outbound Hub context also names public model defaults resolved later by
-/// TensorD. Copying its transport acquires no credential and makes no network call.
+/// TensorD. Copying public transport acquires no credential and makes no network call.
+/// Scoped access must reach the request provider rather than an anonymous override.
 pub(crate) fn anonymous_tensorfs(spec: &v1::RunSpec) -> Option<v1::TensorFSOptions> {
-    let hub = spec.hub.as_ref().filter(|hub| !hub.origin.is_empty())?;
+    let hub = spec.hub.as_ref().filter(|hub| {
+        !hub.origin.is_empty() && hub.capability.is_empty() && hub.key.is_empty() && hub.issued_token.is_none()
+    })?;
     Some(v1::TensorFSOptions {
         endpoint: hub.origin.clone(),
         ca_der: hub.ca_der.clone(),
@@ -683,6 +686,18 @@ mod tests {
             "ordinary-cache-first"
         );
         assert!(!format!("{sent:?}").contains("ordinary-cache-first"));
+        for access in [
+            v1::HubAccess { capability: "scoped-capability".into(), ..Default::default() },
+            v1::HubAccess { key: "request-key".into(), ..Default::default() },
+            v1::HubAccess { issued_token: Some("issued-token".into()), ..Default::default() },
+        ] {
+            let mut scoped = row.spec.clone();
+            calcifer.finish_spec(&row, &mut scoped, Access {
+                hub: Some(v1::HubAccess { origin: origin.to_string(), ..access }),
+                ..Default::default()
+            });
+            assert!(scoped.tensorfs.is_none(), "an anonymous override must not shadow request access");
+        }
         assert!(
             calcifer
                 .store()
