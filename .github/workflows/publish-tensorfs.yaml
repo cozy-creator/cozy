@@ -1,8 +1,8 @@
 name: publish-tensorfs
 # TensorFS's Python package (design §2): wheels for every platform cozy ships, each built and smoke-installed
-# on a runner of its own platform; the sdist; fresh-venv installs on CPython 3.10 to 3.14; and every example
-# in the docs, run on the wheel against small real models. PRs that touch TensorFS run it. A release is its
-# tensorfs-vX.Y.Z tag:
+# on a runner of its own platform; the sdist; fresh-venv installs on CPython 3.10 to 3.14; and the end to end
+# check with every example in the docs, on the wheel against small real models. PRs that touch TensorFS run
+# it. A release is its tensorfs-vX.Y.Z tag:
 #   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref <branch>                         # build and prove
 #   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref tensorfs-vX.Y.Z -f publish=true  # PyPI
 #   gh workflow run publish-tensorfs.yaml -R cozy-creator/cozy-creator --ref <branch> -f dev=true             # <version>+dev.g<sha>
@@ -102,21 +102,6 @@ jobs:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked -p tensorfs --test import -- --test-threads=2
-
-  # Design §11: the standalone e2e on the Linux wheel in a fresh venv, with no Cozy and no account.
-  e2e:
-    if: github.event_name == 'workflow_dispatch'
-    needs: wheel
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
-        with:
-          name: wheel-linux-x86_64
-          path: wheel
-      - uses: astral-sh/setup-uv@v7
-      - run: crates/tensorfs-py/scripts/e2e.sh wheel/*.whl "$RUNNER_TEMP/e2e"
 
   # Per platform, one cp311-abi3 wheel (CPython 3.11 and later) and one cp310 wheel. The CUDA kernels
   # ship where CUDA exists; the other wheels read on the CPU. Windows on Arm has no CPython 3.10.
@@ -263,9 +248,10 @@ jobs:
           uv pip install --python "$RUNNER_TEMP/venv/bin/python" --torch-backend cpu torch
           cd "$RUNNER_TEMP" && "$RUNNER_TEMP/venv/bin/python" -c 'import tensorfs.varena.torch, tensorfs.varena.cuts'
 
-  # Every Python, shell and Rust example in the docs, on the Linux wheel in a fresh venv, against small
-  # real models; scripts/docs_examples.py says how `me/model` resolves.
-  docs:
+  # Design §11: the standalone end to end check on the Linux wheel in a fresh venv, with no Cozy and no
+  # account, then every Python, shell and Rust example in the docs against what it published
+  # (scripts/e2e.py).
+  e2e:
     needs: wheel
     # A failed platform fails its own entries, not the others.
     if: ${{ !cancelled() }}
@@ -281,9 +267,9 @@ jobs:
           merge-multiple: true
           path: wheels
       - run: |
-          uv venv --python 3.12 "$RUNNER_TEMP/docs"
-          UV_TORCH_BACKEND=cpu uv pip install --python "$RUNNER_TEMP/docs/bin/python" wheels/*-abi3-*.whl torch numpy transformers
-          "$RUNNER_TEMP/docs/bin/python" crates/tensorfs-py/scripts/docs_examples.py --wheels wheels \
+          uv venv --python 3.12 "$RUNNER_TEMP/e2e"
+          UV_TORCH_BACKEND=cpu uv pip install --python "$RUNNER_TEMP/e2e/bin/python" wheels/*-abi3-*.whl torch numpy transformers
+          "$RUNNER_TEMP/e2e/bin/python" crates/tensorfs-py/scripts/e2e.py --wheels wheels \
             crates/tensorfs-py/README.md crates/tensorfs-py/API.md crates/tensorfs/API.md
 
   # The sdist builds with Rust (it carries the module, not the `tfs` binary the wheels do) and refuses
@@ -325,7 +311,7 @@ jobs:
   # Every platform and the sdist, or nothing.
   publish:
     if: inputs.publish && !inputs.dev
-    needs: [gate, pull, store, import, e2e, wheel, install, docs, sdist]
+    needs: [gate, pull, store, import, e2e, wheel, install, sdist]
     runs-on: ubuntu-24.04
     environment: pypi
     # Hang bound, not a work budget.

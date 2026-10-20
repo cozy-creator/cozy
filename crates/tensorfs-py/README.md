@@ -389,5 +389,5 @@ requires that scheme's implementation.
 The [cozytensors specification](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs/spec/cozytensors.md) is the format contract. The header is deterministic CBOR;
 trees and repository documents are canonical JSON. Construction order contributes to identity. The
 [conformance corpus](https://github.com/cozy-creator/cozy-creator/tree/master/crates/tensorfs/conformance) checks independent readers, and the [source fixtures](https://github.com/cozy-creator/cozy-creator/tree/master/crates/tensorfs/vectors) retain source
-provenance without model payloads. CI [runs every example](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs-py/scripts/docs_examples.py) in these documents
-against a tiny public model.
+provenance without model payloads. The [end to end check](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs-py/scripts/e2e.py) converts a tiny
+public model, publishes and reopens it, and runs every example in these documents against it in CI.
