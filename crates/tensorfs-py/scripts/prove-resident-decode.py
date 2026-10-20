@@ -497,13 +497,57 @@ def gpu_main(vectors):
         aliased["weight"] = (kind, shape, Export(carrier))
         refuses(tensorfs.InvalidError, lambda: invoke(row, aliased, overlapping))
         assert bytes_of(overlapping.value) == before
+
+        host_source = helper.OwnedTensor(payload)
+        mixed_input = operands(row)
+        mixed_input["weight"] = (kind, shape, host_source)
+        gpu_out = Export(
+            torch.full(row["shape"], 99, dtype=dtype[row["dtype"]], device="cuda")
+        )
+        before = bytes_of(gpu_out.value)
+        refuses(tensorfs.UnsupportedError, lambda: invoke(row, mixed_input, gpu_out))
+        helper.released(host_source)
+        assert host_source.released_bytes == payload
+        assert bytes_of(gpu_out.value) == before
+        assert all(
+            helper._name(id(value.capsules[0])) == helper._used
+            for _, _, value in mixed_input.values()
+            if value is not host_source
+        )
+        assert helper._name(id(gpu_out.capsules[0])) == helper._used
+
+        host_sentinel = torch.full(
+            row["shape"], 99, dtype=dtype[row["dtype"]], device="cpu"
+        )
+        sentinel_bytes = bytes_of(host_sentinel)
+        host_out = helper.OwnedTensor(sentinel_bytes)
+        host_out.shape = (C.c_int64 * len(row["shape"]))(*row["shape"])
+        host_out.managed.dl_tensor.ndim = len(row["shape"])
+        host_out.managed.dl_tensor.shape = host_out.shape
+        code, bits = {"F32": (2, 32), "F16": (2, 16), "BF16": (4, 16)}[row["dtype"]]
+        host_out.managed.dl_tensor.dtype = helper.Dtype(code, bits, 1)
+        mixed_output = operands(row)
+        torch.cuda.synchronize()  # All test-owned preparation has completed before the refusal.
+        refuses(tensorfs.UnsupportedError, lambda: invoke(row, mixed_output, host_out))
+        helper.released(host_out)
+        assert host_out.released_bytes == sentinel_bytes
+        assert all(
+            helper._name(id(value.capsules[0])) == helper._used
+            for _, _, value in mixed_output.values()
+        )
+        host_source.capsule = host_out.capsule = None
         return {
             "byte_offset": 8,
-            "managed_deletions": 1,
+            "managed_deletions": 3,
+            "cuda_managed_deletions": 1,
+            "mixed_cpu_managed_deletions": 2,
             "actual_cuda_owner_released": True,
             "used_alias_refused": True,
             "overlap_family": "invalid",
             "overlap_output_unchanged": True,
+            "mixed_host_cuda_family": "unsupported",
+            "mixed_cuda_host_family": "unsupported",
+            "mixed_outputs_unchanged": True,
         }
 
     records, metadata_casts = [], set()
@@ -630,7 +674,7 @@ def gpu_main(vectors):
         source.synchronize()
         previous.synchronize()
     assert len(records) == 34 and len({row["key"] for row in records}) == 34
-    assert raw_calls == 39 and not helper._live and not helper._callback_errors
+    assert raw_calls == 41 and not helper._live and not helper._callback_errors
     print(
         json.dumps(
             {
