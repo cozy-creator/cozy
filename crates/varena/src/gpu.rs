@@ -461,16 +461,41 @@ impl Gpu {
 
     /// Called on an I/O worker, outside the policy lock. A concurrent bind sees Filling.
     pub fn fill(&self, id: PageId) -> Result<ReadStats> {
-        self.fill_bytes(id, None)
+        self.fill_bytes(id, None, |_, _, _| Ok(()))
     }
 
     /// The RAM-tier lease must remain alive for this call. TensorFS still performs
     /// the transfer; the mechanism only selects a ready source and its destination.
     pub fn fill_from_ram(&self, id: PageId, bytes: &[u8]) -> Result<ReadStats> {
-        self.fill_bytes(id, Some(bytes))
+        self.fill_bytes(id, Some(bytes), |_, _, _| Ok(()))
     }
 
-    fn fill_bytes(&self, id: PageId, ram: Option<&[u8]>) -> Result<ReadStats> {
+    /// A declared page-in transform runs only on a new, private writable mapping.
+    /// It must order GPU work onto the supplied stream; completion is checked before
+    /// the page becomes read-only and may be shared or exported.
+    pub fn fill_with(
+        &self,
+        id: PageId,
+        transform: impl FnOnce(u64, u64, usize) -> Result<()>,
+    ) -> Result<ReadStats> {
+        self.fill_bytes(id, None, transform)
+    }
+
+    pub fn fill_from_ram_with(
+        &self,
+        id: PageId,
+        bytes: &[u8],
+        transform: impl FnOnce(u64, u64, usize) -> Result<()>,
+    ) -> Result<ReadStats> {
+        self.fill_bytes(id, Some(bytes), transform)
+    }
+
+    fn fill_bytes(
+        &self,
+        id: PageId,
+        ram: Option<&[u8]>,
+        transform: impl FnOnce(u64, u64, usize) -> Result<()>,
+    ) -> Result<ReadStats> {
         let page = self.page(id)?;
         if ram.is_some_and(|bytes| bytes.len() as u64 != page.bytes) {
             return Err(invalid("RAM region size differs from the mapped page"));
@@ -517,6 +542,8 @@ impl Gpu {
                     )
                 }?,
             };
+            transform(mapping.ptr(), mapping.bytes, self.device.stream.raw())?;
+            self.device.stream.drain()?;
             let _context = self.device.enter()?;
             self.device.access(mapping.ptr(), mapping.bytes, true)?;
             mapping.ready = Some(Event::record(&self.device, self.device.stream.raw())?);
