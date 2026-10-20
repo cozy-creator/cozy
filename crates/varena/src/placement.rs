@@ -33,6 +33,13 @@ pub enum Relief {
     Exhausted(u64),
 }
 
+fn activation_oom_target(available: u64, need: u64) -> Result<u64> {
+    available
+        .checked_add(1)
+        .map(|progress| need.max(progress))
+        .ok_or_else(|| invalid("OOM reclaim target overflow"))
+}
+
 #[derive(Default)]
 struct BindRetry {
     available: Option<u64>,
@@ -1343,7 +1350,7 @@ impl Placement {
     pub fn relief(&self, request: RequestId, need: u64, lower: bool) -> Result<Relief> {
         self.gpu.recover()?;
         self.refresh()?;
-        let reclaim_from = {
+        let (reclaim_from, target) = {
             let mut inner = self.inner.lock();
             if let Some(facts) = inner
                 .table
@@ -1352,11 +1359,30 @@ impl Placement {
                 .find(|row| row.id == request)
             {
                 facts.can_cut = !lower;
+                if !lower {
+                    // A new actual OOM may ask the same owner again. An ACK
+                    // within this operation still bounds every re-decision.
+                    facts.reclaim_round = facts
+                        .reclaim_round
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("OOM reclaim round overflow"))?;
+                }
             }
-            inner
+            let occupied = inner
                 .table
                 .occupied()
-                .ok_or_else(|| invalid("occupied bytes overflow"))?
+                .ok_or_else(|| invalid("occupied bytes overflow"))?;
+            // CUDA already refused the allocation. A logical free estimate is
+            // not proof of physical room (for example, a new CUDA context may
+            // not yet have a process measurement). Keep one fixed target across
+            // remote acknowledgements and re-decisions: Complete must reclaim
+            // actual bytes, without enlarging the allocator's real budget.
+            let target = if lower {
+                need
+            } else {
+                activation_oom_target(inner.table.available(), need)?
+            };
+            (occupied, target)
         };
         self.drive(
             request,
@@ -1370,7 +1396,10 @@ impl Placement {
                     reclaim: 1,
                 }
             } else {
-                Trigger::Oom { request, need }
+                Trigger::Oom {
+                    request,
+                    need: target,
+                }
             },
         )
     }
@@ -2817,6 +2846,126 @@ mod gpu_tests {
         trim.begin();
         trim.finish(true);
         assert_eq!(trim.pins(), 1, "unchanged facts still stop another retry");
+    }
+
+    #[test]
+    fn activation_oom_reclaims_foreign_bytes_even_when_the_logical_estimate_fits() {
+        let mut table = plan::Table {
+            capacity: 25_153_044_480,
+            rows: vec![
+                plan::Row {
+                    id: 1,
+                    alive: true,
+                    reaping: false,
+                },
+                plan::Row {
+                    id: 2,
+                    alive: true,
+                    reaping: false,
+                },
+            ],
+            requests: vec![plan::Request {
+                id: 1,
+                row: 1,
+                position: plan::Position { step: 0, order: 0 },
+                working_sets: vec![None],
+                starved: false,
+                sharing_limit: None,
+                resident_steps: BTreeSet::new(),
+                joint_steps: BTreeSet::new(),
+                model_positions: BTreeMap::new(),
+                can_cut: true,
+                can_lower: true,
+                reclaim_round: 0,
+            }],
+            remote: vec![plan::Remote {
+                row: 2,
+                classes: [4_313_555_456, 0, 0, 20_021_510_144, 0, 0, 100_949_504],
+                context: 331_350_016,
+                remaining: vec![],
+                reaping: false,
+            }],
+            ..Default::default()
+        };
+        let need = 96 << 20; // Actual 32MiB failure plus the caller's existing 64MiB slack.
+        let available = table.available();
+        assert_eq!(available, 385_679_360);
+        assert!(
+            plan::decide(&table, Trigger::Oom { request: 1, need }).is_empty(),
+            "the old target did not ask this idle owner to release anything"
+        );
+        let target = activation_oom_target(available, need).unwrap();
+        let trigger = Trigger::Oom {
+            request: 1,
+            need: target,
+        };
+        assert_eq!(
+            plan::decide(&table, trigger),
+            vec![Action::Ask {
+                row: 2,
+                need: 1,
+                ceiling: Class::Orphan,
+            }]
+        );
+        table.reclaims.push(plan::Reclaim {
+            step: plan::Step {
+                request: 1,
+                index: 0,
+            },
+            round: 0,
+            row: 2,
+            ceiling: Class::Orphan,
+            complete: true,
+        });
+        assert_eq!(
+            plan::decide(&table, trigger),
+            vec![Action::Ask {
+                row: 2,
+                need: 1,
+                ceiling: Class::Unused,
+            }],
+            "a no-op acknowledgement is not real freed room"
+        );
+        table.reclaims[0].ceiling = Class::Declared;
+        assert!(
+            matches!(plan::decide(&table, trigger).as_slice(), [Action::Cut(1)]),
+            "unreclaimable remote bytes must not produce Complete"
+        );
+        table.remote[0].classes[Class::Free.as_usize()] -= 1;
+        assert!(
+            plan::decide(&table, trigger).is_empty(),
+            "credit only the new published byte"
+        );
+        table.requests[0].reclaim_round += 1;
+        let next = Trigger::Oom {
+            request: 1,
+            need: activation_oom_target(table.available(), need).unwrap(),
+        };
+        assert_eq!(
+            plan::decide(&table, next),
+            vec![Action::Ask {
+                row: 2,
+                need: 1,
+                ceiling: Class::Orphan,
+            }],
+            "a fresh OOM must not reuse the previous operation's acknowledgement"
+        );
+        assert_eq!(table.capacity, 25_153_044_480);
+        assert_eq!(table.remote[0].context, 331_350_016);
+        assert_eq!(
+            table.remote[0].classes[Class::Pinned.as_usize()],
+            100_949_504
+        );
+    }
+
+    #[test]
+    fn activation_oom_target_preserves_real_shortfalls_and_checks_overflow() {
+        assert_eq!(activation_oom_target(8, 9).unwrap(), 9);
+        assert_eq!(activation_oom_target(8, 4).unwrap(), 9);
+        assert!(matches!(
+            activation_oom_target(u64::MAX, 1),
+            Err(Error::Invalid(_))
+        ));
     }
 
     #[test]
@@ -4365,4 +4514,269 @@ mod gpu_tests {
         placement.close().unwrap();
         println!("PASS controlled lower preserves fitting home, pins and bounded physical reclaim {uuid}");
     }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn idle_observed_peak_allows_adaptive_warm_use_without_dropping_live_pins() {
+        const MIB: u64 = 1 << 20;
+        let probe = Gpu::open(0).expect("real CUDA device");
+        let uuid = assigned_gpu(&probe);
+        assert!(probe.capacity().unwrap() >= 32 * MIB);
+        drop(probe);
+        let name = format!(
+            "idle-observed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        struct Named(String);
+        impl Drop for Named {
+            fn drop(&mut self) {
+                let uid = unsafe { libc::geteuid() };
+                let _ = std::fs::remove_file(format!("/dev/shm/varena-{}-{uid}", self.0));
+            }
+        }
+        let _named = Named(name.clone());
+        let ledger = Ledger::create(&name, 32 * MIB).unwrap();
+        let grant = ledger.grant_unbound().unwrap();
+        let placement =
+            Placement::open(0, Some((grant.table, grant.events, grant.channel))).unwrap();
+        let weight = 20 * MIB;
+        let layout = Layout {
+            parts: vec![],
+            regions: vec![crate::layout::Region {
+                offset: 0,
+                nbytes: weight,
+                span: weight,
+                items: vec![Item {
+                    offset: 0,
+                    len: weight,
+                    part_end: true,
+                    source: ItemSource::Inline(vec![7; weight as usize].into()),
+                }],
+            }],
+            nbytes: weight,
+            digest: "idle-observed-peak".into(),
+            names: vec![],
+        };
+        let pages = placement
+            .register(
+                1,
+                "idle-observed".into(),
+                [61; 32],
+                &layout,
+                Arc::new(Source::files(vec![], false, 0)),
+                None,
+            )
+            .unwrap();
+        let context = tensorfs::io::DeviceBuffer::new(0, (4 * MIB) as usize).unwrap();
+        placement.allocator(4 * MIB, 0, 0).unwrap();
+        placement
+            .begin(1, vec![vec![1]], "idle-observed".into(), "shape".into())
+            .unwrap();
+        let retained = placement.bind(1, pages[0], 0).unwrap();
+        let scratch = tensorfs::io::DeviceBuffer::new(0, (8 * MIB) as usize).unwrap();
+        placement.allocator(4 * MIB, 8 * MIB, 8 * MIB).unwrap();
+        placement.leave(1, 8 * MIB).unwrap();
+        drop(scratch);
+        placement.allocator(4 * MIB, 0, 0).unwrap();
+        placement.end(1).unwrap();
+        assert_eq!(ledger.measured("idle-observed", "shape"), Some(28 * MIB));
+        assert_eq!(placement.allocator_budget().unwrap(), 8 * MIB);
+        assert!(
+            !ledger.fits("idle-observed", "shape").unwrap(),
+            "idle cache acknowledgement must come first"
+        );
+        observe(
+            &ledger,
+            "no-op idle acknowledgement never admitted adaptive warm use",
+            || ledger.fits("idle-observed", "shape").unwrap(),
+        );
+        let idle = ledger.status().unwrap();
+        assert_eq!(idle.capacity, 32 * MIB);
+        assert_eq!(
+            idle.rows[0].snapshot.classes[Class::Pinned.as_usize()],
+            weight,
+            "admission silently discarded a live pin"
+        );
+        assert_eq!(
+            placement.allocator_budget().unwrap(),
+            8 * MIB,
+            "admission inflated actual available bytes"
+        );
+        placement
+            .begin(2, vec![vec![1]], "idle-observed".into(), "shape".into())
+            .unwrap();
+        let warm = placement.bind(2, pages[0], 0).unwrap();
+        let scratch = tensorfs::io::DeviceBuffer::new(0, (8 * MIB) as usize).unwrap();
+        placement.allocator(4 * MIB, 8 * MIB, 8 * MIB).unwrap();
+        let mut bytes = [0_u8; 32];
+        // Both live pins own the mapping throughout this checked real D2H read.
+        unsafe {
+            tensorfs::io::read(
+                &[tensorfs::io::Copy {
+                    src: tensorfs::io::Src::Device {
+                        device: 0,
+                        ptr: warm.ptr,
+                        stream: 0,
+                    },
+                    dst: tensorfs::io::Dst::host(&mut bytes),
+                }],
+                &tensorfs::io::ReadOpts::default(),
+            )
+        }
+        .expect("unchanged pinned CUDA content");
+        assert_eq!(bytes, [7; 32]);
+        drop(warm);
+        placement.leave(2, 8 * MIB).unwrap();
+        let stats = placement.end(2).unwrap();
+        assert!(
+            stats.copies.is_empty(),
+            "warm use unnecessarily refilled held weight bytes"
+        );
+        drop((scratch, retained));
+        placement.gpu.wait_pending().unwrap();
+        drop(context);
+        placement.allocator(0, 0, 0).unwrap();
+        placement.close().unwrap();
+        println!("PASS idle observed peak admits adaptive warm use without dropping pins {uuid}");
+    }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn activation_oom_waits_for_foreign_idle_reclaim_and_keeps_live_pins() {
+        let uuid = fill_worker(|| {
+            const MIB: u64 = 1 << 20;
+            let fixture = FillLedger::new();
+            let owner = fixture.placement();
+            let requester = fixture.placement();
+            let uuid = assigned_gpu(&owner.gpu);
+            assert_eq!(requester.gpu_uuid().unwrap(), uuid);
+            let pages = owner
+                .register(
+                    1,
+                    "foreign-idle".into(),
+                    [62; 32],
+                    &fill_layout(4, 7),
+                    Arc::new(Source::files(vec![], false, 0)),
+                    None,
+                )
+                .unwrap();
+            owner.load(1, Tier::Gpu).unwrap();
+            let retained = owner.gpu.bind(pages[0], 0).unwrap();
+            owner.refresh().unwrap();
+            let slack = Arc::new(Mutex::new(Some(
+                tensorfs::io::DeviceBuffer::new(0, (4 * MIB) as usize).unwrap(),
+            )));
+            let (entered, waiting) = mpsc::channel();
+            let (release, finish) = mpsc::channel();
+            let gate = ReleaseGate(Some(release));
+            let finish = Mutex::new(finish);
+            let weak = Arc::downgrade(&owner);
+            let held = slack.clone();
+            owner.trim_with(Arc::new(move |_| {
+                entered.send(()).unwrap();
+                finish.lock().recv().unwrap();
+                // This real allocator cache remains busy. Its acknowledgement
+                // must not be mistaken for physical progress by the requester.
+                assert!(held.lock().is_some());
+                weak.upgrade().unwrap().allocator(0, 0, 4 * MIB)?;
+                Ok(0)
+            }));
+            owner.allocator(0, 0, 4 * MIB).unwrap();
+            requester
+                .begin(1, vec![], "foreign-requester".into(), "shape".into())
+                .unwrap();
+            let available = requester.available().unwrap();
+            assert_eq!(available, 4 * MIB);
+            let budget = requester.allocator_budget().unwrap();
+            assert_eq!(budget, available);
+            let (sent, done) = mpsc::channel();
+            let asking = requester.clone();
+            let worker = thread::spawn(move || {
+                sent.send(asking.relief(1, MIB, false)).unwrap();
+            });
+            waiting
+                .recv_timeout(Duration::from_secs(5))
+                .expect("no foreign trim request");
+            assert!(
+                matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "relief returned before the actual foreign callback acknowledged"
+            );
+            drop(gate);
+            assert_eq!(
+                done.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(),
+                Relief::Complete
+            );
+            worker.join().unwrap();
+            assert!(
+                slack.lock().is_some(),
+                "the callback did not actually free its cache"
+            );
+            assert!(
+                requester.available().unwrap() >= available + 4 * MIB,
+                "no-op acknowledgement reset the fixed reclaim target"
+            );
+            assert!(
+                requester.allocator_budget().unwrap() > budget,
+                "actual remote reclamation did not reach the allocator ceiling"
+            );
+            for remaining in [8 * MIB, 4 * MIB] {
+                assert_eq!(
+                    requester.relief(1, MIB, false).unwrap(),
+                    Relief::Complete,
+                    "a new OOM in the same unchanged request reused an old remote ACK"
+                );
+                assert_eq!(
+                    owner.resident().unwrap()[0].1,
+                    remaining,
+                    "each actual OOM must reclaim one more unpinned CUDA region"
+                );
+            }
+            assert!(
+                matches!(
+                    requester.relief(1, MIB, false).unwrap(),
+                    Relief::Cut(_) | Relief::Lower(_) | Relief::Exhausted(_)
+                ),
+                "a no-progress owner produced Complete or discarded its protected bytes"
+            );
+            assert_eq!(owner.ledger.capacity(), 24 * MIB);
+            let mut bytes = [0_u8; 32];
+            // The independent row's real pin survives another row's pressure.
+            unsafe {
+                tensorfs::io::read(
+                    &[tensorfs::io::Copy {
+                        src: tensorfs::io::Src::Device {
+                            device: 0,
+                            ptr: retained.ptr,
+                            stream: 0,
+                        },
+                        dst: tensorfs::io::Dst::host(&mut bytes),
+                    }],
+                    &tensorfs::io::ReadOpts::default(),
+                )
+            }
+            .expect("foreign pinned CUDA content");
+            assert_eq!(bytes, [7; 32]);
+            let allocated = tensorfs::io::DeviceBuffer::new(0, (MIB) as usize).unwrap();
+            requester.allocator(0, MIB, MIB).unwrap();
+            drop(allocated);
+            requester.allocator(0, 0, 0).unwrap();
+            requester.end(1).unwrap();
+            drop(retained);
+            owner.gpu.wait_pending().unwrap();
+            drop(slack.lock().take());
+            owner.allocator(0, 0, 0).unwrap();
+            requester.close().unwrap();
+            owner.close().unwrap();
+            uuid
+        });
+        println!(
+            "PASS activation OOM acknowledges foreign idle reclaim and preserves live pins {uuid}"
+        );
+    }
+
+
 }
