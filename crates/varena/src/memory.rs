@@ -965,6 +965,30 @@ impl Inner {
         Ok(h)
     }
 
+    /// Kept pages mapped at `va` read back what the host layout at `host` holds, at their first,
+    /// middle and last bytes: else (a stale or foreign page, a mapping that reads nothing) they
+    /// unmap and the region fills from the host. Without a host copy they are taken on trust.
+    fn holds(&self, h: Handle, va: u64, span: u64, nbytes: u64, host: Option<usize>) -> Result<Handle> {
+        let Some(host) = host.filter(|_| nbytes > 0) else { return Ok(h) };
+        let n = nbytes.min(4096);
+        let mut got = vec![0u8; n as usize];
+        let read = [0, nbytes / 2 / 4096 * 4096, nbytes - n].iter().try_for_each(|&at| {
+            call!("cuMemcpyDtoH", memcpy_dtoh(got.as_mut_ptr() as *mut c_void, va + at, n as usize))?;
+            // SAFETY: inside the host layout's live mapping; the region is Ready.
+            let want = unsafe { std::slice::from_raw_parts((host + at as usize) as *const u8, n as usize) };
+            match got == want {
+                true => Ok(()),
+                false => Err(Error::Invalid(format!("byte {at} differs from the host layout"))),
+            }
+        });
+        if let Err(e) = read {
+            call!("cuMemUnmap", mem_unmap(va, span as usize))?;
+            call!("cuMemRelease", mem_release(h))?;
+            return Err(e);
+        }
+        Ok(h)
+    }
+
     /// Unmaps a mapping nothing in flight touches; its chunks go idle, its kept pages too.
     fn unmap(&self, st: &mut State, m: Mapping) -> Result<()> {
         call!("cuMemUnmap", mem_unmap(m.va, m.span as usize))?;
@@ -1368,7 +1392,9 @@ impl WeightSet {
                 if !st.set(self.id).shared || st.reg(self.id, r)?.map.is_some() || !st.reg(self.id, r)?.home {
                     continue;
                 }
-                match g.import(base + x.offset, x.span, &fd) {
+                let host = w.host.as_ref().filter(|m| m.ready(r)).map(|m| m.base() as usize + x.offset as usize);
+                let va = base + x.offset;
+                match g.import(va, x.span, &fd).and_then(|h| g.holds(h, va, x.span, x.nbytes, host)) {
                     Ok(handle) => {
                         let ready = match g.events.record(g.copy, false) {
                             Ok(ev) => Filled::Ready(ev),

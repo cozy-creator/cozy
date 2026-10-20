@@ -190,14 +190,16 @@ def relax() -> None:
     with card, torch.no_grad():
         out = cuts.run(s, ff, (x,), {})
     cut = {k: v for k, v in memo.sizes.items() if k[0] == "ffn"}
-    needs, steps = [cuts.relaxing(shape, 10)], 0
+    needs, steps, doubled = [cuts.relaxing(shape, 10)], 0, True
     while needs[-1] is not None:
+        before = {k: memo.sizes[k] for k in cut}
         cuts.coarser(shape)
+        doubled &= all(memo.sizes[k] <= 2 * v for k, v in before.items())
         steps += 1
         needs.append(cuts.relaxing(shape, 10))
     relaxed = all(memo.sizes[k] >= shape.scopes[k][0] for k in cut)  # each scope's whole
     check("a cut relaxes back to whole", same(out, whole) and cut and relaxed, (cut, memo.sizes))
-    doubled = all(memo.sizes[k] <= 2 * v for k, v in cut.items()) and needs[0] == 20
+    doubled &= needs[0] == 20
     check("never uncut, a step doubles at most, needing twice the peak", steps and doubled, needs)
     cuts.peaked(s.track, 7)  # a pass ran uncut: its peak is the shape's whole
     memo.sizes.update(cut)
@@ -382,8 +384,8 @@ def attention_cut() -> None:
         check("attention that may not cut runs out of memory", False)
     except torch.OutOfMemoryError:
         check(
-            "attention that may not cut runs out of memory, once retried",
-            memo.retries == 1,
+            "attention that may not cut runs out of memory, never retried without room made",
+            memo.retries == 0,
             memo.retries,
         )
 

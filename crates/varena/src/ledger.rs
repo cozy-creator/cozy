@@ -785,6 +785,11 @@ impl Ledger {
         if rows.iter().any(|r| r.state != State::Live) || left.iter().any(|l| *l < 0) {
             return Ok(false);
         }
+        // A new process's context takes bytes free now: no row can be asked before it exists.
+        let context = if spawn { rows.iter().map(|r| r.facts.context).max().unwrap_or(0) } else { 0 };
+        if self.capacity().saturating_sub(sum(rows.iter().map(RowFacts::held))) < context {
+            return Ok(false);
+        }
         let prefix = format!("{package}|");
         let peak = match shape {
             Some(shape) => self.peak(&format!("{prefix}{shape}")),
@@ -793,7 +798,6 @@ impl Ledger {
         let Some(peak) = peak else {
             return Ok(left.is_empty());
         };
-        let context = if spawn { rows.iter().map(|r| r.facts.context).max().unwrap_or(0) } else { 0 };
         let reserved = rows.iter().map(RowFacts::unevictable).chain(left.iter().map(|l| *l as u64));
         Ok(sum(reserved.chain([context, peak])) <= self.capacity())
     }

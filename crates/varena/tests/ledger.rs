@@ -263,6 +263,12 @@ fn fits_reserves_remaining_peaks_and_never_admits_beside_the_unmeasured_or_the_d
     assert!(ledger.fits("plan", Some("wide"), false).unwrap(), "3 + 10 + 10.5 of 24");
     assert!(!ledger.fits("plan", Some("wide"), true).unwrap(), "and a new process's 1 GiB context");
     a.call("running");
+    let cold = |gib: u64| Facts { resident: gib * GIB, cold: gib * GIB, ..Facts { context: GIB, torch_allocated: 2 * GIB, torch_reserved: 2 * GIB, last_use: 1, ..Facts::default() } };
+    a.call(&publish(&cold(21)));
+    assert!(ledger.fits("plan", Some("s"), false).unwrap(), "cold weights give way to an ask");
+    assert!(!ledger.fits("plan", Some("s"), true).unwrap(), "a context needs free bytes: no ask comes before it");
+    a.call(&publish(&cold(20)));
+    assert!(ledger.fits("plan", Some("s"), true).unwrap(), "1 GiB free for the 1 GiB context");
     a.kill9();
     assert!(!ledger.fits("plan", Some("s"), false).unwrap(), "beside a dead row's bytes");
 }
