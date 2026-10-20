@@ -160,14 +160,20 @@ impl From<Repo> for RepoWire {
     }
 }
 
-/// The default among `tags` (spec §7), the one "newest" ordering: of the public, non-yanked tags,
-/// the highest final PEP 440 version (a post-release is final), else the highest pre-release
-/// (`a`, `b`, `rc`, `.dev`); of equal versions (`1.0`, `1.0.0`), the last given (created).
+/// The one "newest" ordering (spec §7): of `items`, the one whose `version` is the highest final
+/// PEP 440 version (a post-release is final), else the highest pre-release (`a`, `b`, `rc`,
+/// `.dev`); of equal versions (`1.0`, `1.0.0`), the last given. Items whose version does not parse
+/// are skipped; callers filter anything else first.
+pub fn newest_by<T>(items: impl IntoIterator<Item = T>, version: impl Fn(&T) -> &str) -> Option<T> {
+    let versioned = items.into_iter().filter_map(|item| Some((Version::from_str(version(&item)).ok()?, item)));
+    let order = |(a, _): &(Version, T), (b, _): &(Version, T)| a.is_stable().cmp(&b.is_stable()).then_with(|| a.cmp(b));
+    versioned.max_by(order).map(|(_, item)| item)
+}
+
+/// The unversioned default among `tags`: [`newest_by`] of the public, non-yanked ones, in
+/// creation order.
 pub fn newest<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Option<&'a Tag> {
-    let released = tags.into_iter().filter(|t| t.public && !t.yanked);
-    let versioned = released.filter_map(|t| Some((Version::from_str(&t.name).ok()?, t)));
-    let order = |(a, _): &(Version, &Tag), (b, _): &(Version, &Tag)| a.is_stable().cmp(&b.is_stable()).then_with(|| a.cmp(b));
-    versioned.max_by(order).map(|(_, t)| t)
+    newest_by(tags.into_iter().filter(|t| t.public && !t.yanked), |t| t.name.as_str())
 }
 
 /// A tag name: a segment that cannot be read as a digest.
