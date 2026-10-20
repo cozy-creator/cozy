@@ -29,6 +29,13 @@ done
 
 "$py" scripts/version_contract.py source
 
+if [ "$(uname -s)" != Darwin ]; then
+    if [ ! -f ../tensorfs/kernels/aot/catalog.rs ]; then
+        uv run --no-project --python 3.12 --with triton==3.8.0 python kernels/build.py
+    fi
+    export TENSORFS_REQUIRE_AOT=1
+fi
+
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 nice -n 19 cargo build --release --locked -p tensorfs --bin tfs
 # The cozy workspace's target directory, not this tree's.

@@ -149,9 +149,9 @@ fn a_model_uploaded_by_one_machine_is_pulled_bit_identical_by_another() {
     let second = machine(&home, "m2");
     let checkpoint = format!("{model}#{source}");
     let run = completed(&home, &cozy(&home, None, &["--json", "model", "download", &checkpoint, "--on", "m2"]));
-    assert_eq!(run["result"]["models"][0]["manifest"], source.as_str(), "{run}");
+    assert_eq!(run["result"]["models"][0]["tree"], source.as_str(), "{run}");
     let (made, pulled) = (closure(&first.store(), &source), closure(&second.store(), &source));
-    assert!(made.len() >= 3, "a manifest, a header and its chunks: {}", made.len());
+    assert!(made.len() >= 3, "a tree, a header and its chunks: {}", made.len());
     assert!(made == pulled, "the pulled checkpoint differs from the uploaded one");
 
     let ca = std::fs::read(std::env::var("TENSORHUB_CA").expect("the Hub's CA")).unwrap();
@@ -164,7 +164,7 @@ fn a_model_uploaded_by_one_machine_is_pulled_bit_identical_by_another() {
     assert!(anonymous.is_err(), "an owner's checkpoint read anonymously: {anonymous:?}");
     let hub = TensorhubOrigin::new(&client, &url).unwrap().bearer(home.token());
     let library = store.pull_hub(client, hub, &reference, None).unwrap();
-    assert_eq!((library.named.manifest.id(), library.named.release), (source.clone(), None));
+    assert_eq!((library.named.tree.as_ref().map(ObjectRef::id), library.named.release), (Some(source.clone()), None));
     assert!(closure(third.path(), &source) == made, "the library's pull differs from the uploaded checkpoint");
 }
 
@@ -186,7 +186,7 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     let _other = machine(&home, "m2");
     let checkpoint = format!("{model}#{source}");
     let run = completed(&home, &cozy(&home, None, &["--json", "model", "download", &checkpoint, "--on", "m2"]));
-    assert_eq!(run["result"]["models"][0]["manifest"], source.as_str(), "{run}");
+    assert_eq!(run["result"]["models"][0]["tree"], source.as_str(), "{run}");
 
     // A release names it; info shows the lane and its checkpoint.
     let lane = format!("f32={source}");

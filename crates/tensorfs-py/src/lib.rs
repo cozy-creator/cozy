@@ -1,13 +1,22 @@
 //! tensorfs-py: the `tensorfs` wheel's compiled half. It marshals; every byte-level fact comes
 //! from `tensorfs` and `tensorfs-plane`. Torch stays outside: tensors cross as DLPack.
 
-mod docs;
+mod cleanup;
 mod errors;
 #[cfg_attr(windows, path = "varena_windows.rs")]
 mod varena;
-mod readplan;
 #[cfg(feature = "store")]
 mod store;
+#[cfg(feature = "store")]
+mod tensors;
+#[cfg(feature = "store")]
+mod credentials;
+#[cfg(feature = "store")]
+mod dlpack_source;
+#[cfg(feature = "store")]
+mod verification;
+#[cfg(feature = "store")]
+mod resident_decode;
 
 use pyo3::prelude::*;
 
@@ -28,13 +37,9 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The store format and plane claim protocol the `cozy` binary must share (format_contract.py).
     m.add("STORE_FORMAT", tensorfs::STORE_FORMAT)?;
     m.add("CLAIM_PROTOCOL", tensorfs::CLAIM_PROTOCOL)?;
-    // The CBOR header codec's Python projection (owner ruling, 2026-10-18).
-    m.add_function(wrap_pyfunction!(docs::parse_header, m)?)?;
-    m.add_class::<docs::PyClosure>()?;
-    // The v1 read plan the plane registers from, until varena registers checkpoints (U8).
-    m.add_function(wrap_pyfunction!(readplan::plan, m)?)?;
-    m.add_class::<readplan::PyPlan>()?;
     #[cfg(feature = "store")]
     store::install(m)?;
+    #[cfg(feature = "store")]
+    credentials::install(m)?;
     varena::install(m)
 }

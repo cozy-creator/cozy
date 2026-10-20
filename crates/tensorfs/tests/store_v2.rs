@@ -2,7 +2,7 @@
 //! commit and a GC, then reopen and check; a writer racing a collector; exact usage over shared
 //! chunks; and the two durability classes, counted by strace.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -12,8 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tensorfs::format::{
-    Body, Component, Dtype, Header, Location, Manifest, ObjectRef, Release, Repo, Tensor,
-    HEADER_PATH,
+    variant_of, Body, Component, Dtype, Header, Location, ObjectRef, Release, Repo, Tensor, Tree,
 };
 use tensorfs::store2::{fault, Durability, Pin, Store};
 
@@ -55,7 +54,7 @@ fn bytes(tag: &str, n: usize) -> Vec<u8> {
         .collect()
 }
 
-/// A checkpoint: its chunks, a header over them, `files`, and the manifest; the manifest's ref.
+/// A tree: its variant `int8`'s chunks and header over them, and the repo `files`; its ref.
 fn checkpoint(store: &Store, chunks: &[Vec<u8>], files: &[(&str, Vec<u8>)]) -> ObjectRef {
     let chunks: Vec<ObjectRef> = chunks.iter().map(|c| store.put_bytes(c).unwrap()).collect();
     let tensors = chunks
@@ -78,40 +77,40 @@ fn checkpoint(store: &Store, chunks: &[Vec<u8>], files: &[(&str, Vec<u8>)]) -> O
     let unet = Component {
         name: "unet".into(),
         tensors,
+        ..Default::default()
     };
-    let header = Header::new(chunks, vec![unet], Default::default()).unwrap();
-    let mut manifest = Manifest::default();
-    let header = store.put_bytes(&header.to_cbor().unwrap()).unwrap();
-    manifest.files.insert(HEADER_PATH.into(), header);
+    let header = Header::new(chunks, None, vec![unet], Default::default()).unwrap();
+    let mut tree = Tree::default();
+    tree.set_variant("int8", store.put_bytes(&header.to_cbor().unwrap()).unwrap());
     for (path, file) in files {
-        manifest
-            .files
+        tree.files
             .insert((*path).into(), store.put_bytes(file).unwrap());
     }
-    store.put_bytes(&manifest.to_json().unwrap()).unwrap()
+    store.put_tree(&tree).unwrap()
 }
 
-fn repo(name: &str, manifest: ObjectRef) -> Repo {
+fn repo(name: &str, tree: ObjectRef) -> Repo {
     Repo {
         name: name.into(),
         releases: vec![Release {
             version: "1.0".into(),
-            lanes: BTreeMap::from([("int8".into(), manifest)]),
-            ..Default::default()
+            tree,
+            yanked: false,
+            revision: 0,
         }],
         ..Default::default()
     }
 }
 
-/// `root`, and when it is a manifest, its files and its header's chunks: walked here, apart from
-/// the store's own GC.
+/// `root`, and when it is a tree, its files and its headers' chunks: walked here, apart from the
+/// store's own GC.
 fn closure(store: &Store, root: &ObjectRef) -> BTreeSet<ObjectRef> {
     let mut reach = BTreeSet::from([root.clone()]);
-    let Ok(manifest) = store.read(root).map(|b| Manifest::from_json(&b)) else {
+    let Ok(Ok(tree)) = store.read(root).map(|b| Tree::from_json(&b)) else {
         return reach;
     };
-    for (path, file) in manifest.into_iter().flat_map(|m| m.files) {
-        if path == HEADER_PATH {
+    for (path, file) in tree.files {
+        if variant_of(&path).is_some() {
             let header = Header::from_cbor(&store.read(&file).unwrap()).unwrap();
             reach.extend(header.chunks);
         }
@@ -129,9 +128,7 @@ fn live(store: &Store) -> BTreeSet<ObjectRef> {
         .flat_map(|p| p.1.roots)
         .collect();
     for repo in store.refs().unwrap() {
-        for release in repo.releases {
-            roots.extend(release.lanes.into_values());
-        }
+        roots.extend(repo.releases.into_iter().map(|r| r.tree));
     }
     roots.iter().flat_map(|root| closure(store, root)).collect()
 }
@@ -452,7 +449,9 @@ fn kill_during_a_record_commit_keeps_the_old_record_or_the_new() {
     assert_eq!(store.get_pin("p").unwrap().unwrap().roots, vec![a, b]);
 
     let lane = |store: &Store| {
-        store.get_ref("ACME/Model").unwrap().unwrap().releases[0].lanes["int8"].clone()
+        store.get_ref("ACME/Model").unwrap().unwrap().releases[0]
+            .tree
+            .clone()
     };
     let job = Job::Ref("acme/model".into(), second.clone());
     kill_at(&request(&root, Some("record.written"), job));
@@ -568,10 +567,36 @@ fn an_object_reused_while_gc_sweeps_it_survives() {
         let mut gc = Child::spawn(&request(&root, Some("gc.trashed"), Job::Gc));
         gc.wait_for("FAULT gc.trashed");
         assert_eq!(trash(&store), 1);
-        assert_eq!(
-            store.read(&object).unwrap(),
-            reused,
-            "it still reads mid-sweep"
+        // The collector holds an exclusive inode fence until it finishes its trash decision.
+        // A real reader waits for that fence. Keep the controller free to restore the
+        // namespace and resume GC; a synchronous read here would deadlock the fixture.
+        let (sent, received) = std::sync::mpsc::channel();
+        let (started, waiting) = std::sync::mpsc::sync_channel(0);
+        let reading = store.clone();
+        let read_object = object.clone();
+        let reader = std::thread::spawn(move || {
+            if started.send(()).is_ok() {
+                let _ = sent.send(reading.read(&read_object));
+            }
+        });
+        waiting
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reader thread never started");
+        let probe = File::open(root.join("tmp/gc").join(&object.sha256)).unwrap();
+        assert!(
+            matches!(
+                probe.try_lock_shared(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ),
+            "GC did not hold the actual trash inode's exclusive fence"
+        );
+        drop(probe);
+        assert!(
+            matches!(
+                received.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the reader completed while GC held the exclusive inode fence"
         );
         if put {
             assert_eq!(store.put_bytes(&reused).unwrap(), object);
@@ -580,6 +605,15 @@ fn an_object_reused_while_gc_sweeps_it_survives() {
         }
         assert_eq!(trash(&store), 0);
         gc.resume();
+        let read = received
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reader stayed blocked after GC resumed");
+        reader.join().expect("the reader thread panicked");
+        assert_eq!(
+            read.unwrap(),
+            reused,
+            "the concurrent reader gets the exact bytes"
+        );
         gc.finish();
         assert!(store.verify(&object).unwrap());
     }
@@ -760,10 +794,15 @@ fn open_creates_only_in_an_empty_place_and_refuses_another_format() {
     fs::write(busy.join("notes.txt"), "mine").unwrap();
     assert_eq!(Store::open(&busy).unwrap_err().code(), "invalid");
     assert!(!busy.join("blobs").exists());
+    let old = scratch.0.join("old");
+    fs::create_dir_all(&old).unwrap();
+    fs::write(old.join("format"), r#"{"format":"tensorfs.store/2"}"#).unwrap();
+    let refused = Store::open(&old).unwrap_err();
+    assert!(refused.to_string().contains("pull again"), "{refused}");
     let fresh = Store::open(scratch.root()).unwrap();
     assert_eq!(
         fs::read_to_string(fresh.root().join("format")).unwrap(),
-        r#"{"format":"tensorfs.store/2"}"#
+        r#"{"format":"tensorfs.store/3"}"#
     );
     Store::open(scratch.root()).unwrap();
 }
