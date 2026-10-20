@@ -3,6 +3,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -326,6 +327,86 @@ fn named_table_and_measured_peaks_survive_coordinator_restart() {
     assert!(!restarted.fits("package", "shape").unwrap());
     assert_eq!(restarted.status().unwrap().rows[0].owner, child.owner);
     assert_eq!(restarted.peaks(), vec![("package|shape".into(), 600)]);
+}
+
+#[test]
+fn restart_collects_unknown_dead_rows_without_losing_peaks_or_existing_custody() {
+    let fixture = Fixture::new();
+    fixture.ledger.record_peak("package", "shape", 800).unwrap();
+    let mut child = ChildRow::spawn(&fixture.ledger);
+    child.call("publish 300");
+    child.call("keep");
+    child.kill();
+    assert_eq!(fixture.ledger.status().unwrap().rows[0].state, State::Dead);
+    let restarted = Ledger::create(&fixture.name, CAPACITY).unwrap();
+    assert!(
+        restarted.status().unwrap().rows.is_empty(),
+        "startup must collect owners it never tracked"
+    );
+    assert!(restarted.fits("package", "shape").unwrap());
+    assert_eq!(restarted.peaks(), vec![("package|shape".into(), 800)]);
+    // A second coordinator's collection must not destroy another service's
+    // still-held page containers. Reuse recognizes the old exact owner as orphaned.
+    let mut next = ChildRow::spawn(&fixture.ledger);
+    assert_eq!(next.owner.row, child.owner.row);
+    assert!(next.owner.generation > child.owner.generation);
+    assert_eq!(next.call("take"), "1 page-data");
+}
+
+#[test]
+fn admission_collects_an_unknown_owner_that_dies_after_restart() {
+    let fixture = Fixture::new();
+    let mut child = ChildRow::spawn(&fixture.ledger);
+    child.call("running unknown");
+    let restarted = Ledger::create(&fixture.name, CAPACITY).unwrap();
+    assert!(!restarted.fits("package", "shape").unwrap());
+    child.kill();
+    assert!(restarted.fits("package", "shape").unwrap());
+    assert!(restarted.status().unwrap().rows.is_empty());
+}
+
+#[test]
+fn live_kernel_claims_survive_restart_and_pid_reuse_even_with_nonexistent_pid_metadata() {
+    let fixture = Fixture::new();
+    let pid = u32::MAX;
+    let mut old = ChildRow::spawn(&fixture.ledger);
+    old.kill();
+    fixture.ledger.reap(old.process.id()).unwrap();
+    let mut live = ChildRow::spawn(&fixture.ledger);
+    assert_eq!(live.owner.row, old.owner.row);
+    assert!(live.owner.generation > old.owner.generation);
+    live.call("publish 300");
+    // Change only this uniquely named fixture's PID hint, after its child has
+    // claimed normally. The checked Slot ABI keeps pid at header64 + row576 +8.
+    // The live child's independent OFD must win over misleading PID metadata.
+    let table = std::fs::File::from(fixture.ledger.fd().try_clone_to_owned().unwrap());
+    table
+        .write_all_at(&pid.to_ne_bytes(), 64 + u64::from(live.owner.row) * 576 + 8)
+        .unwrap();
+    fixture.ledger.record_peak("package", "shape", 800).unwrap();
+    let restarted = Ledger::create(&fixture.name, CAPACITY).unwrap();
+    assert_eq!(restarted.status().unwrap().rows[0].state, State::Live);
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            let ledger = &restarted;
+            scope.spawn(move || {
+                for _ in 0..32 {
+                    assert!(
+                        ledger.reap(pid).is_err(),
+                        "a PID hint cannot override a live OFD claim"
+                    );
+                    assert!(!ledger.fits("package", "shape").unwrap());
+                }
+            });
+        }
+        assert_eq!(live.call("publish 300"), "ok");
+    });
+    let rows = restarted.status().unwrap().rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].owner, live.owner);
+    assert_eq!(rows[0].snapshot.classes, [300; 7]);
+    assert_eq!(rows[0].pid, pid);
+    assert_eq!(rows[0].state, State::Live);
 }
 
 #[test]
