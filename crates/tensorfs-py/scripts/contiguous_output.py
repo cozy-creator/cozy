@@ -93,7 +93,8 @@ class CpuBound(TorchDispatchMode):
         full_empty = (func in (torch.ops.aten.empty_strided.default, torch.ops.aten.empty.memory_format)
                       and tuple(args[0]) == self.shape and str(kwargs.get("device")) != "meta")
         full_silu = func is torch.ops.aten.silu.default and tuple(args[0].shape) == self.shape
-        if full_copy or full_empty or full_silu:
+        full_add = func is torch.ops.aten.add.Tensor and tuple(args[0].shape) == self.shape
+        if full_copy or full_empty or full_silu or full_add:
             self.refused += 1
             raise torch.OutOfMemoryError("Tried to allocate 1 MiB")
         return func(*args, **kwargs)
@@ -169,6 +170,65 @@ def silu_cpu(cuts):
     print("PASS SiLU CPU: exact native bands, four dtypes, strided offsets, fresh output and unchanged autograd")
 
 
+def add_cpu(cuts):
+    op = torch.ops.aten.add.Tensor
+    for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raw = torch.linspace(-7, 7, 2 * 4 * 8 * 32, dtype=dtype).reshape(2, 4, 8, 32)
+        other = torch.cos(raw)
+        pairs = [(raw[..., :16].contiguous(), other[..., :16].contiguous()),
+                 (raw[..., 1::2], other[..., ::2]), (raw[..., 1::2], raw[..., 1::2])]
+        for left, right in pairs:
+            for alpha in (-2, -0.5, 0, 1, 2.25):
+                expected = op(left, right, alpha=alpha)
+                before, versions = (left.clone(), right.clone()), (left._version, right._version)
+                room = Room()
+                cuts.serve(cuts.Memo(), room)
+                with torch.no_grad(), CpuBound(left.shape) as bound, cuts.caught():
+                    actual = op(left, right, alpha=alpha)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                assert actual.dtype == expected.dtype and actual.shape == expected.shape
+                assert actual.stride() == expected.stride()
+                assert actual.data_ptr() not in (left.data_ptr(), right.data_ptr())
+                assert torch.equal(left, before[0]) and torch.equal(right, before[1])
+                assert (left._version, right._version) == versions
+                assert bound.refused and len(room.outputs) == 1 and len(room.outputs[0].writes) > 1
+        with torch.no_grad():
+            assert cuts._add(op, (raw, raw[..., :1]), {}) is None, "broadcast is unsupported"
+            assert cuts._add(op, (raw, 1), {}) is None, "scalar add is unsupported"
+            assert cuts._add(op, (raw, raw.to("meta")), {}) is None, "devices must match"
+            transposed = raw.transpose(1, 2)
+            assert cuts._add(op, (transposed, transposed), {}) is None, "output must be contiguous"
+            destination = torch.empty_like(raw)
+            assert cuts._add(torch.ops.aten.add.out, (raw, raw), {"out": destination}) is None
+            with cuts.caught():
+                assert torch.ops.aten.add.out(raw, raw, alpha=-0.5, out=destination) is destination
+            torch.testing.assert_close(destination, op(raw, raw, alpha=-0.5), rtol=0, atol=0)
+            inplace = raw.clone()
+            pointer = inplace.data_ptr()
+            assert cuts._add(torch.ops.aten.add_.Tensor, (inplace, raw), {}) is None
+            with cuts.caught():
+                assert torch.ops.aten.add_.Tensor(inplace, raw, alpha=-0.5) is inplace
+            assert inplace.data_ptr() == pointer
+            torch.testing.assert_close(inplace, op(raw, raw, alpha=-0.5), rtol=0, atol=0)
+        assert cuts._add(op, (raw, raw), {}) is None, "autograd keeps the native op"
+        train, peer = raw.clone().requires_grad_(), other.clone().requires_grad_()
+        reference, reference_peer = train.detach().clone().requires_grad_(), peer.detach().clone().requires_grad_()
+        with cuts.caught():
+            op(train, peer, alpha=-0.5).sum().backward()
+        op(reference, reference_peer, alpha=-0.5).sum().backward()
+        torch.testing.assert_close(train.grad, reference.grad, rtol=0, atol=0)
+        torch.testing.assert_close(peer.grad, reference_peer.grad, rtol=0, atol=0)
+    # Promotion and its larger result use the native meta dtype and both input byte sizes.
+    left, right = torch.arange(512, dtype=torch.float16).reshape(2, 4, 64), torch.ones(2, 4, 64)
+    cuts.serve(cuts.Memo(), Room())
+    with torch.no_grad(), CpuBound(left.shape), cuts.caught():
+        actual = op(left, right, alpha=-0.5)
+    torch.testing.assert_close(actual, op(left, right, alpha=-0.5), rtol=0, atol=0)
+    assert actual.dtype == torch.float32
+    assert torch.ops.aten.add_ not in cuts._RULES
+    print("PASS add CPU: four native dtypes and alpha, offsets, input aliases, promotion and unchanged autograd")
+
+
 def cpu(cuts):
     from rmsnorm_bands import upstream_class
 
@@ -210,6 +270,76 @@ def cpu(cuts):
     print("PASS contiguous CPU: exact locked DupUp3D, strided offsets, later-axis bands, formats and aliases")
     print(json.dumps({"omitted_memory_format": defaults}))
     silu_cpu(cuts)
+    add_cpu(cuts)
+
+
+def add_cuda(memory, device, side, total):
+    from tensorfs.varena import cuts
+
+    op = torch.ops.aten.add.Tensor
+    torch.cuda.set_per_process_memory_fraction(
+        (torch.cuda.memory_allocated(device) + (12 << 20)) / total, device)
+    like = torch.empty((1, 32, 128, 2048), dtype=torch.float32, device="meta")
+    left_host, right_host = memory.mapped_output(like, device), memory.mapped_output(like, device)
+    assert left_host is not None and right_host is not None
+    left, right = left_host.tensor, right_host.tensor
+    pointers = weakref.ref(left), weakref.ref(right)
+    authority = Room(memory, room=8 << 20)
+    cuts.serve(cuts.Memo(), authority)
+    with torch.cuda.stream(side):
+        for at in range(32):
+            piece = torch.linspace(-7 + at / 32, 7 - at / 32, 128 * 2048,
+                                   device=device).reshape(1, 1, 128, 2048)
+            peer = torch.cos(piece)
+            left_host.write_band(piece, 1, at)
+            right_host.write_band(peer, 1, at)
+            del piece, peer
+        with cuts.caught():
+            result = op(left, right, alpha=-0.5)
+    side.synchronize()
+    assert result.shape == left.shape and result.dtype == left.dtype and result.is_contiguous()
+    assert result.data_ptr() not in (left.data_ptr(), right.data_ptr())
+    assert len(authority.outputs) == 1
+    writes = authority.outputs[0].writes
+    assert len(writes) > 1 and max(row[3] for row in writes) <= 4 << 20
+    for at in range(32):
+        expected_left = torch.linspace(-7 + at / 32, 7 - at / 32, 128 * 2048,
+                                       device=device).reshape(1, 1, 128, 2048)
+        expected_right = torch.cos(expected_left)
+        assert torch.equal(left.narrow(1, at, 1), expected_left), "add mutated its left input"
+        assert torch.equal(right.narrow(1, at, 1), expected_right), "add mutated its right input"
+        expected = op(expected_left, expected_right, alpha=-0.5)
+        assert torch.equal(result.narrow(1, at, 1), expected)
+        del expected, expected_left, expected_right
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        assert cuts._add(op, (left, right), {}) is None, "capture cannot allocate a mapped result"
+    del graph
+    destination = torch.empty(0, device=device)
+    assert cuts._add(torch.ops.aten.add.out, (left, right), {"out": destination}) is None
+    assert cuts._add(torch.ops.aten.add_.Tensor, (left, right), {}) is None
+    before_outputs = len(authority.outputs)
+    try:
+        with cuts.caught():
+            torch.ops.aten.add.out(left, right, alpha=-0.5, out=destination)
+    except torch.OutOfMemoryError:
+        pass
+    else:
+        raise AssertionError("add out= bypassed its real allocator quota")
+    assert len(authority.outputs) == before_outputs, "out= acquired fresh replacement storage"
+    del destination
+    alias = result.view(-1)[7:39]
+    expected_alias = alias.clone()
+    del result, left, right, left_host, right_host
+    authority.outputs.clear()
+    gc.collect()
+    assert all(pointer() is None for pointer in pointers), "add memo retained mapped input storage"
+    with torch.cuda.stream(side):
+        observed = op(alias, alias, alpha=-0.5)
+    side.synchronize()
+    torch.testing.assert_close(observed, op(expected_alias, expected_alias, alpha=-0.5), rtol=0, atol=0)
+    del alias, observed, expected_alias
+    return max(row[3] for row in writes)
 
 
 def cuda():
@@ -311,14 +441,18 @@ def cuda():
             gc.collect()
             assert activation_pointer() is None, "activation memo retained its mapped input"
             torch.cuda.set_per_process_memory_fraction(fraction, device)
+            add_largest = add_cuda(memory, device, side, total)
+            torch.cuda.set_per_process_memory_fraction(fraction, device)
         assert request.stats is not None and not request.cleanup_errors
         assert request.stats.leftover == ((0, 0),)
         print("PASS contiguous mapped CUDA: real quota, exact strided bands, actual stream and alias lifetime")
         print("PASS SiLU mapped CUDA: real quota, mapped input, exact native activation bands and no retained input")
+        print("PASS add mapped CUDA: real quota, two mapped inputs, exact native alpha bands and alias lifetime")
         print(json.dumps({"gpu": str(torch.cuda.get_device_properties(device).uuid),
                           "input_bytes": 32 << 20, "largest_band_bytes": max(row[3] for row in writes),
                           "omitted_memory_format": defaults,
                           "silu_largest_band_bytes": max(row[3] for row in activation_writes),
+                          "add_largest_band_bytes": add_largest,
                           "leftover": request.stats.leftover, "scope": "isolated cut/output; not native relief policy"}))
     finally:
         torch.cuda.set_per_process_memory_fraction(fraction, device)

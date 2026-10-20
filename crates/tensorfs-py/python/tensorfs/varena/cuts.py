@@ -776,6 +776,34 @@ def _silu(func: OpOverload, args: Args, kwargs: Kwargs) -> _Plan | None:
     return _plan(made, x, axis, band)
 
 
+
+def _add(func: OpOverload, args: Args, kwargs: Kwargs) -> _Plan | None:
+    """Equal-shape inference add in native bands, preserving alpha and promotion."""
+    if func is not aten.add.Tensor:
+        return None
+    a = _arguments(func, args, kwargs)
+    x, y = a.get("self"), a.get("other")
+    if (not isinstance(x, Tensor) or not isinstance(y, Tensor)
+            or x.layout is not torch.strided or y.layout is not torch.strided
+            or x.shape != y.shape or x.device != y.device
+            or torch.is_grad_enabled() or _capturing()):
+        return None
+    made = _meta(func, args, kwargs)
+    axes = [i for i, size in enumerate(x.shape) if size > 1]
+    if not axes or not made or not made[0].is_contiguous():
+        return None
+    row_bytes = _nbytes(made[0]) + _nbytes(x) + _nbytes(y)
+    room = _served.rungs.available(x.device)
+    axis = next((i for i in axes if not room or 2 * row_bytes // x.shape[i] <= room),
+                max(axes, key=lambda i: x.shape[i]))
+    alpha = a.get("alpha", 1)
+
+    def band(lo: int, hi: int) -> Tensor:
+        return func(x.narrow(axis, lo, hi - lo), y.narrow(axis, lo, hi - lo), alpha=alpha)
+
+    return _Plan(x, made[0], axis, band, row_bytes // int(x.shape[axis]))
+
+
 def _conv(func: OpOverload, args: Args, kwargs: Kwargs) -> _Plan | None:
     """Output rows [a, b) read input rows [a*s - p, (b-1)*s - p + d*(k-1) + 1), zeros past the
     edges."""
@@ -877,6 +905,7 @@ _SPEC = {
     # Tensor.contiguous also dispatches clone(memory_format=contiguous_format).
     _contiguous: "contiguous clone",
     _silu: "silu",
+    _add: "add",
     _conv: "convolution conv1d conv2d conv3d",
     _pad: "constant_pad_nd pad",
     _upsample: " ".join(_UPSAMPLES),
