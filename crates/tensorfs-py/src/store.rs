@@ -77,7 +77,7 @@ pub(crate) fn metadata<'py>(py: Python<'py>, map: &Metadata) -> PyResult<Bound<'
     Ok(dict)
 }
 
-fn from_py(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+pub(crate) fn from_py(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if let Ok(b) = obj.cast::<PyBool>() {
         return Ok(Value::Bool(b.is_true()));
     }
@@ -1712,6 +1712,21 @@ impl Dlpack {
             .and_then(|release| release.stream.as_ref())
     }
 
+    /// Check completion without releasing any member of a borrowed decode group.
+    pub(crate) fn checked_drain(&mut self) -> tensorfs::Result<()> {
+        match self.lifetime.0.as_mut() {
+            Some(release) => release.drain(),
+            None => Ok(()),
+        }
+    }
+
+    /// Preserve the actual transferred owner after another group member loses proof.
+    pub(crate) fn retain(&mut self) {
+        if let Some(release) = self.lifetime.0.as_mut() {
+            release.retain();
+        }
+    }
+
     pub(crate) fn record_cuda_error(&mut self) {
         if self.device.0 == KDL_CUDA {
             self.lifetime.record_cuda_error();
@@ -2131,6 +2146,7 @@ pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let raw = PyModule::new(m.py(), "raw")?;
     raw.add_class::<PyPart>()?;
     raw.add_function(wrap_pyfunction!(raw_parts, &raw)?)?;
+    crate::resident_decode::install(&raw)?;
     m.add_submodule(&raw)?;
     m.add_class::<PyArray>()?;
     m.add_class::<PyTensors>()?;

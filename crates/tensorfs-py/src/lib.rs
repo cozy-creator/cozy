@@ -15,6 +15,8 @@ mod credentials;
 mod dlpack_source;
 #[cfg(feature = "store")]
 mod verification;
+#[cfg(feature = "store")]
+mod resident_decode;
 
 use pyo3::prelude::*;
 
