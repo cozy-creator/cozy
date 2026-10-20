@@ -910,17 +910,16 @@ impl Placement {
                     .iter_mut()
                     .find(|row| row.id == request)
                 {
-                    if facts.position.step != next {
-                        facts.position = Position {
-                            step: next,
-                            order: 0,
-                        };
-                        facts.model_positions.clear();
-                        facts.starved = false;
-                    }
+                    facts.entered(next, model);
                 }
             } else {
-                return Err(invalid("model is absent from the remaining plan"));
+                let name = inner
+                    .models
+                    .get(&model)
+                    .map_or("<unknown>", |data| data.name.as_str());
+                return Err(Error::Invalid(format!(
+                    "model is absent from the remaining plan (request {request}, model {model} [{name}], current step {from})"
+                )));
             }
         }
         if demand {
@@ -2871,6 +2870,153 @@ mod gpu_tests {
         assert!(matches!(gpu.try_pin(1, 0).unwrap(), BindState::Empty));
         gpu.unregister(1).unwrap();
         println!("PASS actual readiness survives concurrent fill and unmap {uuid}");
+    }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn repeated_component_forward_keeps_its_declared_step() {
+        let probe = Gpu::open(0).expect("real CUDA device");
+        let uuid = assigned_gpu(&probe);
+        let capacity = 32 << 20;
+        assert!(probe.capacity().unwrap() >= capacity);
+        drop(probe);
+        let name = format!(
+            "declared-step-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        struct Named(String);
+        impl Drop for Named {
+            fn drop(&mut self) {
+                let uid = unsafe { libc::geteuid() };
+                let _ = std::fs::remove_file(format!("/dev/shm/varena-{}-{uid}", self.0));
+            }
+        }
+        let _named = Named(name.clone());
+        let ledger = Ledger::create(&name, capacity).unwrap();
+        let grant = ledger.grant_unbound().unwrap();
+        let placement = Placement::open(0, Some((grant.table, grant.events, grant.channel)))
+            .expect("actual CUDA placement");
+        let mut pages = BTreeMap::new();
+        for (model, label) in [(1, "A"), (2, "VAE"), (3, "audio"), (4, "DiT"), (5, "LoRA")] {
+            let count = if model == 2 { 2 } else { 1 };
+            let layout = Layout {
+                parts: vec![],
+                regions: (0..count)
+                    .map(|index| crate::layout::Region {
+                        offset: index * crate::layout::REGION_ALIGN,
+                        nbytes: 32,
+                        span: crate::layout::REGION_ALIGN,
+                        items: vec![Item {
+                            offset: index * crate::layout::REGION_ALIGN,
+                            len: 32,
+                            source: ItemSource::Inline(vec![7; 32].into()),
+                            part_end: true,
+                        }],
+                    })
+                    .collect(),
+                nbytes: count * crate::layout::REGION_ALIGN,
+                digest: format!("declared-step-{model}"),
+                names: vec![],
+            };
+            pages.insert(
+                model,
+                placement
+                    .register(
+                        model,
+                        label.into(),
+                        [model as u8; 32],
+                        &layout,
+                        Arc::new(Source::files(vec![], false, 0)),
+                        None,
+                    )
+                    .unwrap(),
+            );
+        }
+        placement
+            .begin(
+                1,
+                vec![vec![1], vec![2, 3], vec![4, 5], vec![3], vec![2]],
+                "declared-step".into(),
+                "".into(),
+            )
+            .unwrap();
+        let forward = |model| {
+            placement.enter(1, model).expect("declared model entry");
+            for page in &pages[&model] {
+                let pin = placement.bind(1, *page, 0).unwrap();
+                // A nested/repeated pin does not start another model forward.
+                let nested = placement.bind(1, *page, 0).unwrap();
+                drop(nested);
+                drop(pin);
+            }
+            placement.gpu.wait_pending().unwrap();
+            placement.leave(1, 0).expect("completed model forward");
+        };
+        forward(1);
+        forward(3);
+        for _ in 0..50 {
+            forward(2);
+            let inner = placement.inner.lock();
+            let facts = inner.table.request(1).unwrap();
+            assert_eq!(
+                facts.position.step, 1,
+                "VAE encode selected a future decode step"
+            );
+            assert_eq!(
+                facts.model_positions.get(&3),
+                Some(&1),
+                "joint peer rewound"
+            );
+        }
+        forward(4);
+        forward(5);
+        assert_eq!(
+            placement
+                .inner
+                .lock()
+                .table
+                .request(1)
+                .unwrap()
+                .position
+                .step,
+            2
+        );
+        forward(3);
+        assert_eq!(
+            placement
+                .inner
+                .lock()
+                .table
+                .request(1)
+                .unwrap()
+                .position
+                .step,
+            3
+        );
+        forward(2);
+        assert_eq!(
+            placement
+                .inner
+                .lock()
+                .table
+                .request(1)
+                .unwrap()
+                .position
+                .step,
+            4
+        );
+        let error = placement
+            .enter(1, 1)
+            .expect_err("past steps remain invalid");
+        let detail = error.to_string();
+        assert!(detail.contains("model 1 [A]") && detail.contains("current step 4"));
+        placement.end(1).unwrap();
+        placement.close().unwrap();
+        println!("PASS repeated component forward keeps its declared step {uuid}");
     }
 
     #[test]

@@ -132,6 +132,21 @@ pub struct Request {
 }
 
 impl Request {
+    /// A model entry starts one actual forward in the explicitly selected step.
+    /// Repeated forwards may revisit pages; their binds must never infer a later
+    /// step from that model's future use. A joint peer keeps its own cursor.
+    pub(crate) fn entered(&mut self, step: u32, model: ModelId) {
+        if self.position.step != step {
+            self.position = Position { step, order: 0 };
+            self.model_positions.clear();
+            self.starved = false;
+        } else if self.joint_steps.contains(&step) {
+            self.model_positions.remove(&model);
+        } else {
+            self.position.order = 0;
+        }
+    }
+
     fn pending(&self, page: &Page, usage: &Use) -> bool {
         if usage.request != self.id || usage.position.step < self.position.step {
             return false;
@@ -391,17 +406,15 @@ impl Table {
         let next = self.page(page).and_then(|page| {
             page.uses
                 .iter()
-                .filter(|usage| current.pending(page, usage))
+                .filter(|usage| {
+                    usage.position.step == current.position.step && current.pending(page, usage)
+                })
                 .map(|usage| (page.model, usage.position))
                 .min()
         });
         if let (Some((model, next)), Some(row)) =
             (next, self.requests.iter_mut().find(|row| row.id == request))
         {
-            if row.position.step != next.step {
-                row.model_positions.clear();
-            }
-            row.position.step = next.step;
             if row.joint_steps.contains(&next.step) {
                 if let Some(model) = model {
                     row.model_positions
@@ -1351,6 +1364,57 @@ mod tests {
             request,
             position: Position { step, order: 0 },
         }
+    }
+
+    #[test]
+    fn repeated_binds_cannot_select_a_later_declared_step() {
+        let mut run = request(1);
+        run.position.step = 1;
+        run.working_sets.resize(5, Some(0));
+        run.joint_steps.insert(1);
+        let mut vae = page(2, 10);
+        vae.model = Some(2);
+        vae.uses = vec![usage(1, 1), usage(1, 4)];
+        let mut table = Table {
+            capacity: 100,
+            requests: vec![run],
+            pages: vec![vae],
+            rows: vec![Row {
+                id: 1,
+                alive: true,
+                reaping: false,
+            }],
+            ..Default::default()
+        };
+        assert!(table.valid());
+        table.bound(1, 2);
+        for _ in 0..50 {
+            table.bound(1, 2);
+            assert_eq!(table.requests[0].position.step, 1);
+        }
+        assert_eq!(table.requests[0].model_positions.get(&2), Some(&1));
+        assert_eq!(table.pages[0].uses, vec![usage(1, 1), usage(1, 4)]);
+    }
+
+    #[test]
+    fn entering_a_joint_member_resets_only_its_forward_cursor() {
+        let mut run = request(1);
+        run.position.step = 1;
+        run.joint_steps.insert(1);
+        run.model_positions.extend([(2, 5), (3, 7)]);
+        run.starved = true;
+        run.entered(1, 2);
+        assert_eq!(run.position.step, 1);
+        assert_eq!(run.model_positions.get(&2), None);
+        assert_eq!(run.model_positions.get(&3), Some(&7));
+        assert!(run.starved, "a repeated forward must not undo lowering");
+        run.entered(2, 4);
+        assert_eq!(run.position, Position { step: 2, order: 0 });
+        assert!(run.model_positions.is_empty());
+        assert!(!run.starved);
+        run.position.order = 8;
+        run.entered(2, 4);
+        assert_eq!(run.position.order, 0);
     }
 
     #[test]
