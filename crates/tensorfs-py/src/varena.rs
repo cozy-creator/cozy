@@ -224,7 +224,7 @@ impl PyPlane {
     fn new(py: Python<'_>, device: i32, grant: Option<(i32, i32, i32)>) -> PyResult<Self> {
         let core = native(py, || {
             let grant = grant
-                .map(|(table, event, channel)| {
+                .map(|(table, event, channel)| -> Result<_> {
                     Ok((duplicate(table)?, duplicate(event)?, duplicate(channel)?))
                 })
                 .transpose()?;
@@ -255,7 +255,7 @@ impl PyPlane {
         let core = self.core(py)?;
         let id = self
             .next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| raise(py, Error::Invalid("model ids exhausted".into())))?;
         let page_map = Arc::new(Mutex::new(Vec::<u64>::new()));
         let transform = fill.map(|callback| {
