@@ -24,7 +24,7 @@ impl Remote {
     pub async fn fetch(&self, objects: &[ObjectRef], want: &Download<'_>) -> Result<Fetched> {
         let unique: BTreeMap<_, _> = objects.iter().map(|o| (&o.sha256, o.clone())).collect();
         let objects: Vec<_> = unique.into_values().collect();
-        let _hold = self.store.cache_hold(&objects)?;
+        let _hold = self.store.hold(&objects)?;
         let total = objects.iter().map(|o| o.length).sum();
         if let Some(report) = want.progress {
             report(0, total)?;
@@ -218,23 +218,21 @@ impl Remote {
 
     fn remember(&self, reference: &Ref, root: &ObjectRef, version: Option<&str>) -> Result<()> {
         if let Some(version) = version {
-            if let Some(repo) = self.store.update_ref(&reference.repo_id, |old| {
+            self.store.update_ref(&reference.repo_id, |old| {
                 Some(fetch::with_tree(
                     old,
                     &reference.repo_id,
                     root,
                     Some(version),
                 ))
-            })? {
-                self.store.cache_ref(&repo)?;
-            }
+            })?;
         }
         Ok(())
     }
 
     pub async fn open(&self, mut reference: Ref) -> Result<Checkpoint> {
         let (root, version) = self.root(&reference).await?;
-        let _root_hold = self.store.cache_hold(std::slice::from_ref(&root))?;
+        let _root_hold = self.store.hold(std::slice::from_ref(&root))?;
         self.fetch(std::slice::from_ref(&root), &Download::default())
             .await?;
         let bytes = self.store.read(&root)?;
@@ -254,7 +252,7 @@ impl Remote {
                 (None, root.clone(), reference.variant.clone(), Vec::new())
             }
         };
-        let _metadata_hold = self.store.cache_hold(std::slice::from_ref(&header))?;
+        let _metadata_hold = self.store.hold(std::slice::from_ref(&header))?;
         self.fetch(std::slice::from_ref(&header), &Download::default())
             .await?;
         let raw = match &tree {
@@ -289,7 +287,7 @@ impl Remote {
         local_dir: Option<&Path>,
     ) -> Result<PathBuf> {
         let (root, version) = self.root(reference).await?;
-        let _root_hold = self.store.cache_hold(std::slice::from_ref(&root))?;
+        let _root_hold = self.store.hold(std::slice::from_ref(&root))?;
         self.fetch(std::slice::from_ref(&root), &Download::default())
             .await?;
         let tree = self.store.tree(&root)?;
@@ -297,7 +295,7 @@ impl Remote {
             Some(variant) => vec![tree.variant(Some(variant))?.1.clone()],
             None => tree.variants().map(|(_, h)| h.clone()).collect(),
         };
-        let _header_hold = self.store.cache_hold(&headers)?;
+        let _header_hold = self.store.hold(&headers)?;
         self.fetch(&headers, &Download::default()).await?;
         let mut payload = Vec::new();
         for header in &headers {
@@ -308,7 +306,7 @@ impl Remote {
         }
         let mut objects: Vec<_> = tree.repo_files().map(|(_, r)| r.clone()).collect();
         objects.extend(payload.iter().cloned());
-        let _object_hold = self.store.cache_hold(&objects)?;
+        let _object_hold = self.store.hold(&objects)?;
         self.fetch(&objects, want).await?;
         self.remember(reference, &root, version.as_deref())?;
         let identity = match &want.selection {
@@ -321,15 +319,11 @@ impl Remote {
                 .as_bytes(),
             ),
         };
+        let used = std::iter::once(&root).chain(&headers).chain(&objects);
+        self.store.used(&identity, used)?;
         let dest = local_dir
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.store.root().join("snapshots").join(identity));
-        let _directory = if local_dir.is_none() {
-            Some(self.store.cache_directory(&dest)?)
-        } else {
-            self.store.cache_preserve_snapshot(&dest)?;
-            None
-        };
         // Materialize the selected closure, not every payload that happens to be
         // present in the shared cache. Existing materialize owns all copying.
         std::fs::create_dir_all(dest.join(crate::format::CHUNKS_DIR))
@@ -350,11 +344,7 @@ impl Remote {
                 &dest.join(crate::format::CHUNKS_DIR).join(&object.sha256),
             )?;
         }
-        if local_dir.is_none() {
-            self.store.cache_snapshot(&dest)?;
-        }
-        self.store.cache_touch(&root)?;
-        let _ = self.store.cache_maintain(0)?;
+        self.store.maintain(0)?;
         Ok(dest)
     }
 
@@ -365,7 +355,7 @@ impl Remote {
         local_dir: Option<&Path>,
     ) -> Result<PathBuf> {
         let (root, version) = self.root(reference).await?;
-        let _root_hold = self.store.cache_hold(std::slice::from_ref(&root))?;
+        let _root_hold = self.store.hold(std::slice::from_ref(&root))?;
         self.fetch(std::slice::from_ref(&root), &Download::default())
             .await?;
         let tree = self.store.tree(&root)?;
@@ -373,26 +363,17 @@ impl Remote {
             kind: Kind::NotFound,
             detail: format!("no repo file {filename:?}"),
         })?;
-        let _object_hold = self.store.cache_hold(std::slice::from_ref(object))?;
+        let _object_hold = self.store.hold(std::slice::from_ref(object))?;
         self.fetch(std::slice::from_ref(object), &Download::default())
             .await?;
         self.remember(reference, &root, version.as_deref())?;
+        self.store.used(&root.sha256, [&root, object])?;
         let folder = local_dir
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.store.root().join("snapshots").join(&root.sha256));
-        let _directory = if local_dir.is_none() {
-            Some(self.store.cache_directory(&folder)?)
-        } else {
-            self.store.cache_preserve_snapshot(&folder)?;
-            None
-        };
         let dest = folder.join(filename);
         self.store.materialize(object, &dest)?;
-        if local_dir.is_none() {
-            self.store.cache_snapshot(&folder)?;
-        }
-        self.store.cache_touch(&root)?;
-        let _ = self.store.cache_maintain(0)?;
+        self.store.maintain(0)?;
         Ok(dest)
     }
 }
