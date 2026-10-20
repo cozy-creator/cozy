@@ -47,12 +47,27 @@ def part(role, dtype, shape, chunk, offset, length):
     return [role, dtype, shape, [chunk, offset, length]]
 
 
+PIPELINE = ["diffusers.FluxPipeline", {
+    "_class_name": "FluxPipeline", "_diffusers_version": "0.30.0", "scheduler": [None, None],
+    "tokenizer": ["transformers", "CLIPTokenizer"], "transformer": ["diffusers", "FluxTransformer2DModel"],
+    "vae": ["diffusers", "AutoencoderKL"]}]
+TOKENIZER = ["tokenizer", "transformers.CLIPTokenizer",
+             {"clean_up_tokenization_spaces": False, "do_lower_case": True, "model_max_length": 77,
+              "pad_token": "<|endoftext|>"},
+             [],
+             {"merges.txt": [digest("merges"), 524619], "special_tokens_map.json": [digest("special"), 588],
+              "vocab.json": [digest("vocab"), 1059962]},
+             "tokenizer_config.json"]
+
 BASIC = [
     TAG,
     [[digest("chunk 0"), 65536], [digest("chunk 1"), 12292], [digest("chunk 2"), 288]],
     ENCODINGS,
+    PIPELINE,
     [
-        ["transformer", [
+        ["transformer", "diffusers.FluxTransformer2DModel",
+         {"_class_name": "FluxTransformer2DModel", "axes_dims_rope": [16, 56, 56], "eps": 1e-06,
+          "guidance_embeds": True, "out_channels": None, "patch_size": 1, "ratio": 100000.0, "theta": 10000.0}, [
             ["blocks.0.attn.to_q.weight", "BF16", [64, 64], 1, [
                 part("weight", "F8_E4M3", [64, 64], 0, 0, 4096), part("scale", "F32", [64], 0, 4096, 256)]],
             ["blocks.0.attn.to_k.weight", "BF16", [64, 64], 2, [
@@ -71,8 +86,12 @@ BASIC = [
             ["blocks.0.norm.weight", "F32", [64], 0, [1, 4096, 256]],
             ["blocks.0.proj.weight", "BF16", [8, 64], 7, [
                 part("weight", "I8", [8, 64], 1, 8192, 512), part("scale", "F32", [], 1, 12288, 4)]],
-        ]],
-        ["vae", [["decoder.conv_in.weight", "F16", [4, 4, 3, 3], 0, [2, 0, 288]]]],
+        ], {}],
+        ["vae", "diffusers.AutoencoderKL",
+         {"_class_name": "AutoencoderKL", "force_upcast": True, "latents_mean": None, "scaling_factor": 0.3611,
+          "shift_factor": 0.1159},
+         [["decoder.conv_in.weight", "F16", [4, 4, 3, 3], 0, [2, 0, 288]]], {}],
+        TOKENIZER,
     ],
     {"n": 1, "ok": True, "name": "basic", "tags": ["a", "b"]},
 ]
@@ -83,7 +102,8 @@ def plain(key, dtype, shape, chunk, offset, length):
 
 
 def one(tensors, chunks, encodings=(), metadata=None):
-    return [TAG, chunks, list(encodings), [["unet", tensors]], metadata or {}]
+    """No pipeline; one component of unknown class with no config."""
+    return [TAG, chunks, list(encodings), [], [["unet", "", {}, tensors, {}]], metadata or {}]
 
 
 A = plain("a.weight", "F32", [2], 0, 0, 8)
@@ -96,23 +116,38 @@ WIDTH = {"F4": 1, "F6_E2M3": 3, "F6_E3M2": 3, "I16": 2, "U16": 2, "F16": 2, "BF1
 
 
 def appended():
+    """Later fields. A component's follow its config_file, which is then present (`config.json`
+    for the default)."""
     h = copy.deepcopy(BASIC)
     h[0] = TAG + ".7"
     h.append({"future": [1, {"hex": "00ff"}]})
     h[1][0].append(True)
     h[2][0].append("note")
-    h[3][0].append({"k": []})
-    t = h[3][0][1][0]
+    h[3].append([])
+    h[4][2].append({"k": []})
+    h[4][0] += ["config.json", 0]
+    h[4][2][4]["vocab.json"].append(0)
+    t = h[4][0][3][0]
     t.append(-1)
     t[4][0].append(0)
     t[4][0][3].append({"hex": ""})
-    h[3][0][1][6][4].append([])
+    h[4][0][3][6][4].append([])
     return h
+
+
+CONFIG = {
+    "f16": 0.5, "f16-max": 65504.0, "f16-subnormal": 2.0**-24, "f32": 100000.0, "f32-subnormal": 2.0**-149,
+    "f64": 0.1, "f64-subnormal": 5e-324, "f64-max": 1.7976931348623157e308, "negative-zero": -0.0, "one": 1.0,
+    "int": 1, "null": None, "u64": 2**64 - 1, "i64": -(2**63), "text": "x", "bool": False,
+    "nested": [0.00085, None, {"beta_end": 0.012, "betas": [[]]}],
+}
 
 
 GREEN = {
     "basic": BASIC,
-    "empty": [TAG, [], [], [], {}],
+    "empty": [TAG, [], [], [], [], {}],
+    "configs": [TAG, [], [], ["", CONFIG],
+                [["scheduler", "diffusers.EulerDiscreteScheduler", CONFIG, [], {}, "scheduler_config.json"]], {}],
     "order-a": one([A, B], [[digest("order"), 4104]]),
     "order-b": one([B, A], [[digest("order"), 4104]]),
     "span": one([plain("x", "U8", [10000], 0, 4096, 10000)],
@@ -123,7 +158,7 @@ GREEN = {
     "unknown-dtype": one([plain("x", "F3_E1M1", [8], 0, 0, 6)], [[digest("future"), 6]]),
     "unknown-scheme": one([["q.weight", "F32", [2, 32], 1, [part("q", "U8", [24], 0, 0, 24)]]],
                           [[digest("acme"), 24]], [["acme.int3", {"bits": 3, "group": [64, {"pack": "lsb"}]}]]),
-    "values": [TAG, [], [], [], {
+    "values": [TAG, [], [], [], [], {
         "": "", "a": 0, "b": 23, "c": 24, "d": 255, "e": 256, "f": 65535, "g": 65536, "h": 2**32 - 1,
         "i": 2**32, "j": 2**64 - 1, "k": -1, "l": -24, "m": -25, "n": -(2**63), "aa": True, "ab": False,
         "ü→😀": "ü→😀", "x" * 23: "23", "x" * 24: "24", "list": [[], [[]], {"z": {"y": [1, -1]}}]}],
@@ -132,43 +167,48 @@ GREEN = {
 }
 
 
+DELETE = object()
+
+
 def edit(path, value):
-    """BASIC with the item at `path` (indices into the tree) replaced or appended; None deletes it."""
+    """BASIC with the item at `path` (indices and keys into the tree) replaced, appended or
+    (DELETE) deleted."""
     h = copy.deepcopy(BASIC)
     *parents, last = path
     node = h
     for i in parents:
         node = node[i]
-    if value is None:
+    if value is DELETE:
         del node[last]
-    elif last == len(node):
+    elif type(node) is list and last == len(node):
         node.append(value)
     else:
         node[last] = value
     return h
 
 
-TENSORS = (3, 0, 1)  # BASIC[3][0][1]: the transformer's tensors
+TENSORS = (4, 0, 3)  # BASIC[4][0][3]: the transformer's tensors
 Q = (*TENSORS, 0)  # its first tensor
 NORM = (*TENSORS, 6)
+VAE = (4, 1)
+ASSETS = (4, 2, 4)  # the tokenizer's
 
 
 def swap_encodings():
     h = copy.deepcopy(BASIC)
     h[2][0], h[2][1] = h[2][1], h[2][0]
-    tensors = h[3][0][1]
+    tensors = h[4][0][3]
     tensors[0][3], tensors[1][3] = 2, 1
     return h
 
 
-def reordered_params():
-    """nvfp4's params with their keys in reverse order."""
-    good = encode(BASIC)
-    params = ENCODINGS[5][1]
-    canonical = cbor2.dumps(unproject(params), canonical=True)
-    raw = b"\xa4" + b"".join(cbor2.dumps(k) + cbor2.dumps(params[k]) for k in sorted(params, reverse=True))
+def reordered(m: dict) -> bytes:
+    """BASIC with the map `m` (found once) written with its keys in reverse order."""
+    canonical = cbor2.dumps(unproject(m), canonical=True)
+    raw = bytes([0xa0 + len(m)]) + b"".join(cbor2.dumps(k) + cbor2.dumps(unproject(m[k]), canonical=True)
+                                            for k in sorted(m, reverse=True))
     assert raw != canonical and len(raw) == len(canonical)
-    return swap(good, canonical, raw)
+    return swap(encode(BASIC), canonical, raw)
 
 
 def swap(data: bytes, old: bytes, new: bytes) -> bytes:
@@ -178,19 +218,23 @@ def swap(data: bytes, old: bytes, new: bytes) -> bytes:
 
 def reds() -> dict[str, bytes]:
     good = encode(BASIC)
-    meta = cbor2.dumps(unproject(BASIC[4]), canonical=True)
+    meta = cbor2.dumps(unproject(BASIC[5]), canonical=True)
     assert meta == bytes.fromhex("a4616e01626f6bf5646e616d6565626173696364746167738261616162")
     out = {
         # Twins: BASIC's content in bytes other than its one encoding.
         "twin-nonpreferred-uint": swap(good, b"\x61n\x01", b"\x61n\x18\x01"),
         "twin-nonpreferred-uint32": swap(good, b"\x1a\x00\x01\x00\x00", b"\x1b" + bytes(5) + b"\x01\x00\x00"),
-        "twin-nonpreferred-array": b"\x98\x05" + good[1:],
+        "twin-nonpreferred-array": b"\x98\x06" + good[1:],
         "twin-nonpreferred-text": swap(good, b"\x6dcozytensors/1", b"\x78\x0dcozytensors/1"),
         "twin-indefinite-array": b"\x9f" + good[1:] + b"\xff",
         "twin-indefinite-map": swap(good, meta, b"\xbf" + meta[1:] + b"\xff"),
         "twin-indefinite-text": swap(good, b"\x65basic", b"\x7f\x63bas\x62ic\xff"),
         "twin-map-order": swap(good, b"\x61n\x01\x62ok\xf5", b"\x62ok\xf5\x61n\x01"),
-        "twin-params-order": reordered_params(),
+        "twin-params-order": reordered(ENCODINGS[5][1]),
+        "twin-assets-order": reordered(TOKENIZER[4]),
+        "twin-config-order": reordered(PIPELINE[1]),
+        "twin-float-single": swap(good, b"\xf9\x70\xe2", b"\xfa\x46\x1c\x40\x00"),
+        "twin-float-double": swap(good, b"\xf9\x70\xe2", b"\xfb\x40\xc3\x88" + bytes(5)),
         "twin-encodings-order": encode(swap_encodings()),
         "twin-repeated-key": swap(good, meta, b"\xa5\x61n\x01" + meta[1:]),
         # Items outside the allowed kinds.
@@ -209,6 +253,18 @@ def reds() -> dict[str, bytes]:
         "truncated": good[:-1],
         "not-array": cbor2.dumps({"format": TAG}, canonical=True),
         "short-root": encode(BASIC[:4]),
+        "float-later-field": encode([*BASIC, 1.5]),
+        "float-asset-length": encode(edit((*ASSETS, "vocab.json", 1), 1059962.0)),
+        "null-params": encode(edit((2, 0, 1, "axis"), None)),
+        "null-class": encode(edit((*VAE, 1), None)),
+        "nan": swap(good, b"\xf9\x70\xe2", b"\xf9\x7e\x00"),
+        "infinity": swap(good, b"\xf9\x70\xe2", b"\xf9\x7c\x00"),
+        "nan-single": swap(good, b"\xf9\x70\xe2", b"\xfa\x7f\xc0\x00\x00"),
+        "config-tag": swap(good, b"\x6cforce_upcast\xf5", b"\x6cforce_upcast\xc1\xf5"),
+        "config-undefined": swap(good, b"\x6cforce_upcast\xf5", b"\x6cforce_upcast\xf7"),
+        "config-bytes": encode(edit((*VAE, 2, "force_upcast"), {"hex": "01"})),
+        "config-array": encode(edit((*VAE, 2), [])),
+        "config-int-key": swap(good, b"\x6cforce_upcast\xf5", b"\x01\xf5"),
         # The format tag.
         "format-major-2": encode(["cozytensors/2", *BASIC[1:]]),
         "format-kind": encode(["tensorfs.manifest/1", *BASIC[1:]]),
@@ -222,7 +278,7 @@ def reds() -> dict[str, bytes]:
         "offset-unaligned": encode(edit((*NORM, 4, 1), 4100)),
         "offset-past-chunk": encode(edit((*NORM, 4, 1), 16384)),
         "length-mismatch": encode(edit((*NORM, 4, 2), 260)),
-        "past-chunks": encode(edit((3, 1, 1, 0, 4), [2, 0, 576])),
+        "past-chunks": encode(edit((*VAE, 3, 0, 4), [2, 0, 576])),
         "location-short": encode(edit((*NORM, 4), [1, 4096])),
         "encoding-index": encode(edit((*Q, 3), 8)),
         "encoding-unused": encode(edit((2, 7), ["fp8.rowwise", {"axis": 1, "scale_dtype": "F32"}])),
@@ -231,12 +287,25 @@ def reds() -> dict[str, bytes]:
         "scheme-empty": encode(edit((2, 0, 0), "")),
         "params-array": encode(edit((2, 0, 1), [])),
         "plain-with-parts": encode(edit((*NORM, 4), [part("", "F32", [64], 1, 4096, 256)])),
+        "pipeline-one-field": encode(edit((3,), PIPELINE[:1])),
+        "pipeline-not-array": encode(edit((3,), {})),
+        "pipeline-class-int": encode(edit((3, 0), 7)),
+        "pipeline-config-array": encode(edit((3, 1), [])),
+        "component-short": encode(edit((*VAE, 4), DELETE)),
+        "component-class-int": encode(edit((*VAE, 1), 7)),
+        "config-file-default": encode(edit((4, 2, 5), "config.json")),
+        "config-file-int": encode(edit((4, 2, 5), 7)),
+        "config-file-dotdot": encode(edit((4, 2, 5), "../tokenizer_config.json")),
+        "asset-path": encode(edit((*ASSETS, "a//b"), TOKENIZER[4]["vocab.json"])),
+        "asset-is-config": encode(edit((*ASSETS, "tokenizer_config.json"), TOKENIZER[4]["vocab.json"])),
+        "asset-digest-31": encode(edit((*ASSETS, "vocab.json", 0), {"hex": "00" * 31})),
+        "asset-array": encode(edit(ASSETS, [])),
         "encoded-no-parts": encode(edit((*Q, 4), [])),
         "encoded-location": encode(edit((*Q, 4), [0, 0, 4096])),
-        "component-slash": encode(edit((3, 1, 0), "va/e")),
-        "component-dotdot": encode(edit((3, 1, 0), "..")),
-        "component-empty": encode(edit((3, 1, 0), "")),
-        "component-repeated": encode(edit((3, 1, 0), "transformer")),
+        "component-slash": encode(edit((*VAE, 0), "va/e")),
+        "component-dotdot": encode(edit((*VAE, 0), "..")),
+        "component-empty": encode(edit((*VAE, 0), "")),
+        "component-repeated": encode(edit((*VAE, 0), "transformer")),
         "key-empty": encode(edit((*NORM, 0), "")),
         "key-repeated": encode(edit((*NORM, 0), "blocks.0.ff.gate.weight")),
         "role-empty": encode(edit((*Q, 4, 1, 0), "")),
@@ -245,8 +314,8 @@ def reds() -> dict[str, bytes]:
         "dtype-code": encode(edit((*NORM, 1), 17)),
         "shape-negative": encode(edit((*NORM, 2), [-64])),
         "shape-bool": encode(edit((*NORM, 2), [True])),
-        "tensor-short": encode(edit((*NORM, 4), None)),
-        "metadata-array": encode([*edit((4,), [])[:5], 0]),  # six fields: not the pre-cut shape
+        "tensor-short": encode(edit((*NORM, 4), DELETE)),
+        "metadata-array": encode(edit((5,), [])),
     }
     return out
 
