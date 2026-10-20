@@ -320,7 +320,7 @@ impl Origin {
                 token_endpoint: format!("{}/token", self.url),
                 client_id: "public-provider-test".into(),
                 resource: "https://resource.example".into(),
-                claims: json!({"capability":"fixture-one-time"})
+                claims: json!({"purpose":"fixture-one-time"})
                     .as_object()
                     .unwrap()
                     .clone(),
