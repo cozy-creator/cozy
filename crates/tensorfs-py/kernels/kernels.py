@@ -8,6 +8,7 @@ No framework is imported, and deployed decoding loads the emitted CUDA binaries.
 
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 @triton.jit
@@ -153,6 +154,34 @@ def unpack(out, words, slots, scale, term, table, factor, post, index, error, pa
 
 
 @triton.jit
+def requantize(out, words, slots, scale, term, table, factor, post, index, error, params,
+               OUT: tl.constexpr, BLOCK: tl.constexpr):
+    """Stored4/6-bit levels -> relative-scaled, ties-even/saturated exact int8 values."""
+    e = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    valid = e < tl.load(params)
+    cols, bits, group = tl.load(params + 2), tl.load(params + 8), tl.load(params + 18)
+    i, j = e // cols, e % cols
+    width = cols * bits // 8
+    low = (_word(words, i * width + j // 2, valid, 8) >> (4 * (j % 2)).to(tl.uint32)) & 15
+    q = low
+    if bits == 6:
+        high = (_word(words, i * width + cols // 2 + j // 4, valid, 8)
+                >> (2 * (j % 4)).to(tl.uint32)) & 3
+        q = low | (high << 4)
+    if tl.load(params + 24):
+        value = tl.load(table + q, mask=valid, other=0.0)
+    else:
+        value = q.to(tl.float32) - (1 << (bits - 1)).to(tl.float32)
+    relative = tl.load(scale + i * (cols // group) + j // group, mask=valid, other=0.0)
+    value = value * relative
+    bad = valid & (value != value)
+    tl.atomic_or(error + e * 0, 2, mask=bad, sem="relaxed")
+    rounded = libdevice.nearbyint(tl.where(bad, 0.0, value))
+    q8 = tl.minimum(tl.maximum(rounded, -127.0), 127.0).to(tl.int32)
+    tl.store(out + e, q8, mask=valid)
+
+
+@triton.jit
 def hadamard(out, words, slots, scale, term, table, factor, post, index, error, params,
              OUT: tl.constexpr, BLOCK: tl.constexpr):
     e = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
@@ -177,6 +206,57 @@ def rotated(out, words, slots, scale, term, table, factor, post, index, error, p
     q = _word(words, e, valid, 32).to(tl.int32, bitcast=True)
     v = _value(q, e, scale, term, table, factor, post, index, error, params, valid)
     _store(out, dst, v, valid, OUT)
+
+
+@triton.jit
+def _hadamard_prefix(n, j, block, root):
+    """Exact integer sum H_B[0:n,j] in log4(B), with no logical host expansion."""
+    span, weight = block, root.to(tl.int32)
+    sign = tl.full(n.shape, 1, tl.int32)
+    total = tl.full(n.shape, 0, tl.int32)
+    left = n
+    while span > 1:
+        span = span // 4
+        weight = weight // 2
+        a, b = left // span, (j // span) % 4
+        total = total + sign * (a.to(tl.int32) - 2 * ((3 - b) < a).to(tl.int32)) * weight
+        sign = tl.where(a + b == 3, -sign, sign)
+        left = left % span
+    return tl.where(n == block, root.to(tl.int32), total)
+
+
+@triton.jit
+def grouped_rotated(out, words, slots, scale, term, table, factor, post, index, error, params,
+                    OUT: tl.constexpr, BLOCK: tl.constexpr):
+    """Integer Hadamard result x channel scale, ordered correction, then unit/round_L."""
+    begin, count = tl.load(params + 4), tl.load(params + 5)
+    dst = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    valid = dst < count
+    e = _stored(begin + dst, params)
+    cols, group, block = tl.load(params + 2), tl.load(params + 18), tl.load(params + 28)
+    row, col = e // cols, e % cols
+    q = _word(words, e, valid, 32).to(tl.int32, bitcast=True)
+    value = q.to(tl.float32) * tl.load(factor + row, mask=valid, other=0.0)
+    if tl.load(params + 29):
+        base = col // block * block
+        first, last = base // group, (base + block + group - 1) // group
+        z = tl.full((BLOCK,), 0.0, tl.float32)
+        k = 0
+        while k < (block + group - 1) // group + 1:
+            g = first + k
+            active = valid & (g < last)
+            lo = tl.minimum(tl.maximum(g * group - base, 0), block)
+            hi = tl.minimum(tl.maximum((g + 1) * group - base, 0), block)
+            root = tl.load(params + 30)
+            m = _hadamard_prefix(hi, col % block, block, root) - _hadamard_prefix(lo, col % block, block, root)
+            correction = tl.load(term + g * tl.load(params + 1) + row, mask=active, other=0.0)
+            part = correction * m.to(tl.float32)
+            # Do not add a synthetic leading/trailing zero: order and signed zero matter.
+            z = tl.where(active, tl.where(k == 0, part, z + part), z)
+            k += 1
+        value = value + z
+    value = _by_post(post, col, value, valid, tl.load(params + 27))
+    _store(out, dst, value, valid, OUT)
 
 
 @triton.jit  # type: ignore[untyped-decorator]

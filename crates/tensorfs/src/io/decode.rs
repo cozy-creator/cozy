@@ -251,7 +251,7 @@ fn execute(device: i32, launch: &Launch<'_>) -> Result<DeviceBuffer> {
     // Keep every allocation alive until the stream is drained, also on launch/read errors.
     let scratch = &mut hold.scratch;
     let result = (|| {
-        if launch.kind == "rotated" {
+        if matches!(launch.kind, "rotated" | "grouped_rotated") {
             let total = launch.params[0];
             let len = total
                 .checked_mul(4)
@@ -262,7 +262,12 @@ fn execute(device: i32, launch: &Launch<'_>) -> Result<DeviceBuffer> {
                 })?;
             scratch.push(DeviceBuffer::new(device, len)?);
             scratch.push(DeviceBuffer::new(device, len)?);
-            call("unpack", scratch[0].ptr(), inputs[0].ptr(), total)?;
+            let unpack = if launch.kind == "grouped_rotated" {
+                "requantize"
+            } else {
+                "unpack"
+            };
+            call(unpack, scratch[0].ptr(), inputs[0].ptr(), total)?;
             let mut current = 0;
             let mut stride = 1;
             while stride < launch.params[28] {
@@ -279,7 +284,7 @@ fn execute(device: i32, launch: &Launch<'_>) -> Result<DeviceBuffer> {
                 stride *= 4;
             }
             call(
-                "rotated",
+                launch.kind,
                 output.ptr(),
                 scratch[current].ptr(),
                 launch.params[5],
@@ -300,7 +305,8 @@ fn execute(device: i32, launch: &Launch<'_>) -> Result<DeviceBuffer> {
         if i32::from_le_bytes(error) != 0 {
             return Err(Failure {
                 kind: Kind::Decode,
-                detail: "CUDA decode encountered an invalid scale index".into(),
+                detail: "CUDA decode encountered an invalid index or a NaN requantized value"
+                    .into(),
             });
         }
         Ok(())

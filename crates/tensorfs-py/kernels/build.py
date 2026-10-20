@@ -23,7 +23,7 @@ STRUCTS = {name: getattr(k, "_" + name) for name in (
     "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "q1_0", "q2_0"
 )}
 STRUCTS.update(mxfp4=k._mxfp4_struct, nvfp4=k._nvfp4_struct)
-STAGES = ("unpack", "hadamard", "rotated")
+STAGES = ("unpack", "hadamard", "rotated", "requantize", "grouped_rotated")
 
 
 def main() -> None:
@@ -43,7 +43,7 @@ def main() -> None:
             variants += [(name, k.structs, {"DECODE": fn, "BLOCK": 256}) for name, fn in STRUCTS.items()]
             variants += [(name, getattr(k, name), {"BLOCK": 256}) for name in STAGES]
             for kind, fn, constants in variants:
-                stage_signature = {**signature, "out": "*i32"} if kind in ("unpack", "hadamard") else signature
+                stage_signature = {**signature, "out": "*i32"} if kind in ("unpack", "hadamard", "requantize") else signature
                 compiled = triton.compile(ASTSource(fn, stage_signature, {"OUT": output, **constants}), target=target,
                                           options={"enable_fp_fusion": False, "num_warps": 4})
                 image = compiled.asm["cubin"]
