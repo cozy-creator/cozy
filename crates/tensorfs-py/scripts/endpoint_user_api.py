@@ -135,6 +135,8 @@ assert not cache.exists(), "the anonymous reader's store must start empty"
 assert os.environ["TENSORFS_ENDPOINT"] == "http://127.0.0.1:1"
 assert "TENSORFS_TOKEN" not in os.environ
 assert "TENSORFS_MIRROR" not in os.environ
+assert "SSL_CERT_FILE" not in os.environ
+assert "SSL_CERT_DIR" not in os.environ
 assert request["endpoint"].startswith("https://"), "the CA forwarding case requires TLS"
 connection = Connection(
     endpoint=request["endpoint"],
@@ -164,7 +166,10 @@ print(json.dumps({
 '''
 anonymous_env = os.environ.copy()
 anonymous_env["TENSORFS_ENDPOINT"] = "http://127.0.0.1:1"
-for name in ("TENSORFS_TOKEN", "TENSORFS_MIRROR", "HF_TOKEN", "CIVITAI_TOKEN"):
+for name in (
+    "TENSORFS_TOKEN", "TENSORFS_MIRROR", "HF_TOKEN", "CIVITAI_TOKEN",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+):
     anonymous_env.pop(name, None)
 anonymous_result = subprocess.run(
     [sys.executable, "-I", "-c", anonymous_program],
