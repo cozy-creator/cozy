@@ -148,11 +148,11 @@ async fn verification_includes_selected_assets_and_classifies_wrong_lengths_as_c
     fs::write(f.object(&f.asset), b"short").unwrap();
     let report = ck.verify(&components(&["model", "model"])).unwrap();
     assert!(report.missing.is_empty());
-    assert_eq!(report.corrupt, [f.asset.clone()]);
+    assert_eq!(report.corrupt.as_slice(), std::slice::from_ref(&f.asset));
     assert!(ck.verify(&components(&["other"])).unwrap().is_ok());
     fs::remove_file(f.object(&f.asset)).unwrap();
     let report = ck.verify(&components(&["model"])).unwrap();
-    assert_eq!(report.missing, [f.asset.clone()]);
+    assert_eq!(report.missing.as_slice(), std::slice::from_ref(&f.asset));
     assert!(report.corrupt.is_empty());
 }
 
@@ -185,12 +185,12 @@ async fn verification_always_checks_the_actual_header_even_for_an_empty_selectio
     fs::write(&path, &bytes).unwrap();
     let report = ck.verify(&components(&[])).unwrap();
     assert!(report.missing.is_empty());
-    assert_eq!(report.corrupt, [f.header.clone()]);
+    assert_eq!(report.corrupt.as_slice(), std::slice::from_ref(&f.header));
     assert_eq!(fs::read(&path).unwrap(), bytes);
     fs::remove_file(path).unwrap();
     assert_eq!(
-        ck.verify(&components(&[])).unwrap().missing,
-        [f.header.clone()]
+        ck.verify(&components(&[])).unwrap().missing.as_slice(),
+        std::slice::from_ref(&f.header)
     );
 }
 
@@ -221,8 +221,8 @@ async fn verification_all_includes_declared_chunks_unused_by_components() {
     let ck = f.open().await;
     fs::remove_file(f.object(&f.unused)).unwrap();
     assert_eq!(
-        ck.verify(&Selection::All).unwrap().missing,
-        [f.unused.clone()]
+        ck.verify(&Selection::All).unwrap().missing.as_slice(),
+        std::slice::from_ref(&f.unused)
     );
     assert!(ck
         .verify(&components(&["model", "other", "shared"]))
@@ -283,7 +283,7 @@ async fn verification_all_includes_known_repo_files_but_not_other_variant_weight
     assert!(ck.verify(&Selection::All).unwrap().is_ok());
     fs::remove_file(config.cache_dir.join(readme.key())).unwrap();
     let report = ck.verify(&Selection::All).unwrap();
-    assert_eq!(report.missing, [readme.clone()]);
+    assert_eq!(report.missing.as_slice(), std::slice::from_ref(&readme));
     assert!(report.corrupt.is_empty());
     assert!(ck.verify(&components(&["model"])).unwrap().is_ok());
     let tree = ck.tree().unwrap().clone();
@@ -297,7 +297,7 @@ async fn verification_all_includes_known_repo_files_but_not_other_variant_weight
     fs::write(&tree_path, &altered).unwrap();
     fs::remove_file(config.cache_dir.join(f.chunks[0].key())).unwrap();
     let report = ck.verify(&Selection::All).unwrap();
-    assert_eq!(report.corrupt, [tree.clone()]);
+    assert_eq!(report.corrupt.as_slice(), std::slice::from_ref(&tree));
     assert_eq!(
         report.missing,
         [f.chunks[0].clone()],
