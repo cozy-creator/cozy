@@ -1,15 +1,14 @@
 //! The machine's caches manage themselves, with no purge verb. Each expires a TTL after its
-//! last use. A disk is low when no more than its reserve is free (`storage::Disk`).
+//! last use. A disk is low when no more than its reserve is free (`Disk`). The TensorFS store
+//! evicts on its own.
 //! On a low disk a sweep frees what lifts it back above the reserve, but only when what it may
-//! drop together covers that; otherwise it drops only the store's garbage. The plan drops, in
+//! drop together covers that; otherwise it drops nothing more. The plan drops, in
 //! order: collected result copies, settled logs, memoized stages, downloaded wheels no
-//! environment links, unused generations, then the store's least recently used model caches,
-//! compiled kernels last. Only bytes an unlink frees
+//! environment links, unused generations, compiled kernels last. Only bytes an unlink frees
 //! on the measured filesystem count: single-link files this process does not hold open, on
 //! that filesystem. Optional cache writes are skipped on a low disk. Never evicted:
 //! uncollected results (durable outputs), journal rows, a generation a run holds or an
-//! installation names, a model a live executor, an unfinished run or a preparation names
-//! (`keep`), a kernel namespace a live executor or kernel boot holds.
+//! installation names, a kernel namespace a live executor or kernel boot holds.
 use crate::{catalog::Catalog, execution::Engine};
 use fs2::FileExt;
 use std::{
@@ -20,18 +19,60 @@ use std::{
     time::{Duration, SystemTime},
 };
 use platform::durable::{self, FileId};
-use crate::storage::{self, Store};
-
-pub use crate::storage::Disk;
 
 pub const TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Installed or used within one sweep period counts as in use, even on a low disk: an
 /// install is never evicted between its creation and its first run or binding.
 pub const IDLE: Duration = Duration::from_secs(10 * 60);
 
+/// 1/50 of the filesystem, at least 1 GiB and at most 10 GiB.
+const RESERVE_BYTES: (u64, u64) = (1 << 30, 10 << 30);
+const RESERVE_DIVISOR: u64 = 50;
+const RESERVE_INODES: u64 = 32;
+
+/// One filesystem: its size and what is free on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Disk {
+    pub capacity: u64,
+    pub available: u64,
+    /// Zero when the filesystem has no inode limit.
+    pub inodes: u64,
+    pub available_inodes: u64,
+}
+
+impl Disk {
+    pub fn measure(root: &Path) -> io::Result<Disk> {
+        let space = platform::durable::space(root).map_err(|error| {
+            io::Error::other(format!("cannot measure the filesystem under {}: {error}", root.display()))
+        })?;
+        Ok(Disk {
+            capacity: space.total,
+            available: space.free,
+            inodes: space.inodes,
+            available_inodes: space.free_inodes,
+        })
+    }
+
+    /// Never written into by an optional cache.
+    pub fn reserve(&self) -> u64 {
+        (self.capacity / RESERVE_DIVISOR).clamp(RESERVE_BYTES.0, RESERVE_BYTES.1)
+    }
+
+    /// A low disk has no more than its reserve free: the bytes to free before it has more.
+    pub fn short(&self) -> Option<u64> {
+        let low = self.available <= self.reserve()
+            || (self.inodes > 0 && self.available_inodes <= RESERVE_INODES);
+        low.then(|| (self.reserve() + 1).saturating_sub(self.available).max(1))
+    }
+    /// What a write may still take: what is free past the reserve.
+    pub fn free(&self) -> u64 {
+        self.available.saturating_sub(self.reserve())
+    }
+}
+
 /// The filesystem under `path`, now.
 pub fn measure(path: &Path) -> io::Result<Disk> {
-    Disk::measure(path).map_err(io::Error::other)
+    Disk::measure(path)
 }
 
 /// What one sweep removed, by kind.
@@ -42,10 +83,6 @@ pub struct Swept {
     pub results: usize,
     pub kernels: usize,
     pub generations: usize,
-    /// Adapter views that expired.
-    pub adapter_views: usize,
-    /// Bytes the store's GC collected: garbage, and expired or evicted model caches.
-    pub store_bytes: u64,
     /// Memoized stage results (`memo::Memo`).
     pub memo: usize,
     /// Unpacked wheels of the machine's uv cache (`uv_entries`).
@@ -68,13 +105,6 @@ pub fn kernel_hold(kernels: &Path, namespace: &str) -> io::Result<File> {
         .open(kernels.join(format!(".{namespace}.hold")))
 }
 
-/// The models the TensorFS store caches, and those it must keep.
-pub struct StoreCaches<'a> {
-    pub store: &'a Store,
-    /// Manifests live executors read, unfinished runs prepared, or preparations fetch.
-    pub keep: Vec<String>,
-}
-
 /// Everything one sweep looks at.
 pub struct Caches<'a> {
     pub engine: &'a Engine,
@@ -85,7 +115,6 @@ pub struct Caches<'a> {
     pub memo: Option<&'a crate::memo::Memo>,
     /// The machine's own uv download cache (`Publisher::uv_cache`).
     pub uv_cache: Option<&'a Path>,
-    pub store: Option<StoreCaches<'a>>,
     /// The filesystem the machine's state is on (`measure`; a test's own).
     pub disk: &'a dyn Fn() -> io::Result<Disk>,
 }
@@ -464,12 +493,6 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
             add(Kind::Generation, entry.path(), used, vec![]);
         }
     }
-    // The TTL, low disk or not.
-    if let Some(store) = &caches.store {
-        let expired = storage::expire(store.store, &store.keep, TTL)?;
-        swept.adapter_views = expired.pins.iter().filter(|id| id.starts_with("view-")).count();
-        swept.store_bytes += expired.bytes;
-    }
     // Kernel namespaces stay locked from here until the sweep ends: an executor that starts
     // meanwhile waits for it.
     let (wheels, _installs) = caches.uv_cache.map(uv_entries).unwrap_or_default();
@@ -491,26 +514,6 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
     }
 
     let filesystem = FileId::at(root)?.dev;
-    let store = caches.store.as_ref();
-    // A store on its own filesystem is relieved under TensorFS's rule for it.
-    let shared = match store {
-        Some(store) if FileId::at(store.store.root())?.dev != filesystem => {
-            if let Some(short) = Disk::measure(store.store.root())?.short() {
-                swept.store_bytes += storage::relieve(store.store, &store.keep, short)?.bytes;
-            }
-            None
-        }
-        other => other,
-    };
-    if (caches.disk)()?.short().is_none() {
-        return Ok(swept);
-    }
-    // Garbage first: what nothing references costs nothing to drop.
-    let mut models = 0;
-    if let Some(store) = shared {
-        swept.store_bytes += store.store.gc().map_err(storage::io_error)?.bytes;
-        models = storage::reclaimable(store.store, &store.keep)?.0.iter().map(|pin| pin.marginal).sum();
-    }
     let Some(short) = (caches.disk)()?.short() else {
         return Ok(swept);
     };
@@ -537,7 +540,7 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
     }
     plan.sort_by_key(|(entry, _)| (entry.kind, entry.used));
     let local: u64 = plan.iter().map(|(_, bytes)| bytes).sum();
-    if local + models < short {
+    if local < short {
         return Ok(swept);
     }
     let (kernels, before): (Vec<_>, Vec<_>) = plan
@@ -550,11 +553,6 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
         if entry.remove()? {
             entry.kind.count(&mut swept);
         }
-    }
-    // Models after the local caches and before compiled kernels: the fewest least recently
-    // used that cover what is still missing, or all of them when kernels must go too.
-    if let (Some(store), Some(short)) = (shared.filter(|_| models > 0), (caches.disk)()?.short()) {
-        swept.store_bytes += storage::relieve(store.store, &store.keep, short.min(models))?.bytes;
     }
     // Kernels go only if they alone cover what is still missing.
     let cover: u64 = kernels.iter().map(|(_, bytes)| bytes).sum();

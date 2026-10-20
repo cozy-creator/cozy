@@ -34,8 +34,9 @@ pub(crate) fn number(path: &Path) -> Option<u64> {
     text.parse::<u64>().ok().filter(|&n| n > 0 && n < (1 << 60))
 }
 
-/// (`inactive_file` + `active_file`, `shmem`) from a cgroup's `memory.stat`; v1 states its
-/// subtree's under `total_`.
+/// (`inactive_file`, `shmem`) from a cgroup's `memory.stat`: the page cache the kernel gives
+/// back before it OOM-kills (active file pages may not go in time); v1 states its subtree's
+/// under `total_`.
 fn stat(cgroup: &Path) -> Option<(u64, u64)> {
     let text = fs::read_to_string(cgroup.join("memory.stat")).ok()?;
     let row = |name: &str| -> u64 {
@@ -50,7 +51,7 @@ fn stat(cgroup: &Path) -> Option<(u64, u64)> {
             .or_else(|| find(name))
             .unwrap_or(0)
     };
-    Some((row("inactive_file") + row("active_file"), row("shmem")))
+    Some((row("inactive_file"), row("shmem")))
 }
 
 /// This process's memory cgroup and every parent up to the controller root, innermost first,
@@ -106,8 +107,8 @@ pub(crate) fn cgroups() -> Option<(Vec<PathBuf>, &'static [&'static str], &'stat
 }
 
 /// The live budget: the tightest of every cgroup on this process's path (each `memory.high`
-/// and `memory.max`, less what that cgroup uses and cannot give back; page cache is
-/// reclaimable) and the host's `MemAvailable`.
+/// and `memory.max`, less what that cgroup uses and cannot give back; inactive page cache is
+/// reclaimable; a missing file is no limit) and the host's `MemAvailable`.
 pub(super) fn read() -> HostMemory {
     let mem_available = meminfo("MemAvailable");
     let mut best = HostMemory {

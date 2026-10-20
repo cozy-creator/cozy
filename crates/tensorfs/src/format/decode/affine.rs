@@ -1,7 +1,6 @@
-//! Bit packing and the affine decode (spec §6, building blocks): `b`-bit codes packed in words, then
-//! `(q − z) × s` (or `q × s + b`) on a scale grid.
+//! Bit packing (spec §6, building blocks): `b`-bit codes packed in words. The affine decode,
+//! `(q − z) × s` on a scale grid, is a `plan::Codes`.
 
-use super::grid::Grid;
 use super::Shape;
 use crate::format::{Error, Result};
 
@@ -53,16 +52,20 @@ pub struct Packing<'a> {
     pub codes: Codes,
 }
 
-/// The word width of an integer container dtype.
-pub fn word_bits(dtype: &crate::format::Dtype) -> Option<u32> {
-    use crate::format::Dtype::*;
-    match dtype {
-        U8 | I8 => Some(8),
-        U16 | I16 => Some(16),
-        U32 | I32 => Some(32),
-        _ => None,
-    }
-}
+/// One code per byte: unsigned (an 8-bit element format's code, a `U8` index), or `I8`.
+pub const BYTES: Packing = Packing {
+    bits: 8,
+    word: 8,
+    transposed: false,
+    axis: 1,
+    fill: Fill::Word,
+    order: Order::LowFirst,
+    codes: Codes::Unsigned(0),
+};
+pub const SIGNED_BYTES: Packing = Packing {
+    codes: Codes::Signed,
+    ..BYTES
+};
 
 fn bad(detail: String) -> Error {
     Error::Decode(detail)
@@ -204,46 +207,12 @@ impl Packing<'_> {
     }
 }
 
-/// The term beside the scale.
-#[derive(Debug, Clone, Copy)]
-pub enum Offset<'a> {
-    /// `q × s`.
-    None,
-    /// `(q − z) × s`.
-    Zero(&'a [f32]),
-    /// `q × s + b`.
-    Bias(&'a [f32]),
-}
-
-/// The affine decode of the `[R, C]` codes `q`: scale and offset on one grid, each operation one
-/// f32 rounding.
-pub fn dequant(
-    q: &[i32],
-    s: &[f32],
-    offset: Offset,
-    grid: &Grid,
-    rows: usize,
-    cols: usize,
-) -> Vec<f32> {
-    let mut out = Vec::with_capacity(rows * cols);
-    for i in 0..rows {
-        for j in 0..cols {
-            let g = grid.at(rows, cols, i, j);
-            let v = q[i * cols + j] as f32;
-            out.push(match offset {
-                Offset::None => v * s[g],
-                Offset::Zero(z) => (v - z[g]) * s[g],
-                Offset::Bias(b) => v * s[g] + b[g],
-            });
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::decode::grid::ScaleLayout;
+    use crate::format::decode::grid::{Grid, ScaleLayout};
+    use crate::format::decode::plan::{self, Core, Elems, Plan, Post, Term};
+    use crate::format::Dtype;
 
     fn packing(bits: u32, word: u32, axis: usize, fill: Fill, order: Order) -> Packing {
         Packing {
@@ -381,19 +350,40 @@ mod tests {
     #[test]
     fn affine_terms_on_a_grid() {
         // GPTQ act-order: g_idx picks each column's group; scales and zeros stored [W, R].
-        let q = [3, 5, 7, 9, 0, 15, 8, 1];
-        let s = [0.5f32, 2.0, 0.25, 4.0];
-        let z = [8.0f32, 1.0, 7.0, 0.0];
+        let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let (s, z) = (f32s(&[0.5, 2.0, 0.25, 4.0]), [8u8, 1, 7, 0]);
+        let elems = |dtype, b: &[u8]| Elems {
+            dtype,
+            bytes: b.to_vec().into(),
+        };
+        let codes = |term, grid| plan::Codes {
+            bytes: (&[0x53, 0x97, 0xf0, 0x18][..]).into(),
+            packing: packing(4, 8, 1, Fill::Word, Order::LowFirst),
+            flat: false,
+            table: None,
+            scale: elems(Dtype::F32, &s),
+            grid,
+            term,
+            global: None,
+        };
+        let values = |c| {
+            (Plan {
+                core: Core::Codes(c),
+                post: Post::None,
+            })
+            .values(2, 4, 2)
+            .unwrap()
+        };
         let g = Grid::Blocks {
             size: 2,
             layout: ScaleLayout::Transposed,
-            index: Some(&[1, 0, 1, 0]),
+            index: Some(vec![1, 0, 1, 0]),
         };
-        // (i, j) → s[b·R + i] with b = g_idx[j].
-        let got = dequant(&q, &s, Offset::Zero(&z), &g, 2, 4);
+        // q = [3, 5, 7, 9, 0, 15, 8, 1]; (i, j) → s[b·R + i] with b = g_idx[j].
+        let got = values(codes(Term::Zero(elems(Dtype::U8, &z)), g));
         assert_eq!(got, [-1.0, -1.5, 0.0, 0.5, 0.0, 28.0, 32.0, 0.0]);
-        let b = dequant(&q, &s, Offset::Bias(&z), &Grid::Row, 2, 4);
+        let b = values(codes(Term::Bias(elems(Dtype::U8, &z)), Grid::Row));
         assert_eq!(b[5], 15.0 * 2.0 + 1.0);
-        assert_eq!(dequant(&q, &s, Offset::None, &Grid::Tensor, 2, 4)[1], 2.5);
+        assert_eq!(values(codes(Term::None, Grid::Tensor))[1], 2.5);
     }
 }

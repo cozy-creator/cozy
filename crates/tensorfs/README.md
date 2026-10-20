@@ -8,7 +8,6 @@ sharing cozytensors checkpoints. The Python package is built from the same imple
 - [Rust API and examples](API.md): create a client, call it, and use the returned objects.
 - [Python API and examples](../tensorfs-py/API.md): import the library, read tensors, write and publish.
 
-The guides describe the planned 0.13 interface while its implementation is being integrated.
 For reference documentation generated from the checked-in Rust code, run
 `cargo doc -p tensorfs --no-deps --open`.
 

@@ -244,6 +244,57 @@ fn an_update_installs_the_hubs_target_and_then_has_nothing_to_do() {
     );
 }
 
+/// Real CLI/controller/TensorD wire and restart control. CUDA is absent here; actual GPU
+/// enforcement belongs to the hardware matrix, not this installed-software check.
+fn gpu_cap_update(old_controller: Option<PathBuf>) {
+    let Some(home) = Home::new() else { return };
+    // A cap-only update must never consult an old or unreachable software target.
+    home.write_config("hub = \"offline\"\n[hubs]\noffline = \"http://127.0.0.1:9\"\n");
+    let current = PathBuf::from(env!("CARGO_BIN_EXE_cozy"));
+    if let Some(old) = &old_controller { home.use_binary(old); }
+    let machine = tensord::added(&home, "cap-wire");
+    let holder = home.root().join("calcifer/calcifer.lock.holder");
+    let controller = std::fs::read(&holder).expect("controller's exact process identity");
+    home.use_binary(current);
+    let root = machine.root();
+    let config = root.parent().unwrap().join(".cozy/config.toml");
+    let sdk = root.join("var/lib/cozy/tensord/sdk/current");
+    let sdk_before = std::fs::read_link(&sdk).expect("installed SDK generation");
+    let before = home.json(["machine", "show", "cap-wire", "--json"]);
+    let mut generation = before["status"]["started_at_ms"].as_i64().expect("service generation");
+    for (spelling, expected) in [("6GiB", Some(6u64 << 30)), ("12GiB", Some(12u64 << 30)), ("none", None)] {
+        let out = home.cozy(["machine", "update", "cap-wire", "--gpu-memory-limit", spelling, "--json"]);
+        assert_eq!(out.code, 0, "{spelling}: {out:?}");
+        let completed: Value = out.stdout.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v["type"] == "run.completed").expect("completed update run");
+        assert_eq!(completed["run"]["result"]["from"], completed["run"]["result"]["to"],
+            "a cap-only update keeps exact binary/SDK versions and wheel digests: {completed}");
+        let text = std::fs::read_to_string(&config).unwrap();
+        let (loaded, _) = protocol::config::Config::parse(&text, "fixture config").unwrap();
+        assert_eq!(loaded.machine.gpu_memory_limit, expected);
+        assert_eq!(std::fs::read_link(&sdk).unwrap(), sdk_before, "SDK generation is preserved");
+        let after = home.json(["machine", "show", "cap-wire", "--json"]);
+        assert_eq!(after["status"]["commit"], before["status"]["commit"], "binary source is preserved");
+        assert_eq!(after["status"]["runtime"], before["status"]["runtime"]);
+        assert_eq!(after["status"]["tensorfs"], before["status"]["tensorfs"]);
+        let next = after["status"]["started_at_ms"].as_i64().unwrap();
+        assert!(next > generation, "cap {spelling} starts a new service generation: {after}");
+        generation = next;
+        assert_eq!(std::fs::read(&holder).unwrap(), controller, "the shared old controller is not replaced");
+    }
+}
+
+#[test]
+fn a_gpu_cap_only_update_restarts_without_downgrading_software() {
+    gpu_cap_update(None);
+}
+
+#[test]
+fn a_gpu_cap_update_passes_through_the_old_b517_controller_unchanged() {
+    let Some(old) = common::needs("COZY_TEST_OLD_CALCIFER", "the exact b517 Calcifer binary") else { return };
+    gpu_cap_update(Some(old.into()));
+}
+
 /// PyPI's newest Runtime and the TensorFS it accepts (a newer TensorFS may be out first), wheels
 /// for this platform, downloaded into `dir`.
 fn downloaded(dir: &Path) -> (PathBuf, PathBuf) {

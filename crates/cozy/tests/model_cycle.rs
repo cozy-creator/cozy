@@ -2,8 +2,8 @@
 //! job (TENSORHUB_URL, TENSORHUB_LOG; MinIO storage; its public origin behind a private CA) and the
 //! TensorD COZY_TEST_TENSORD names (this workspace's). The machines trust that CA
 //! only as each run's Hub access names it, never through their environment, so every Hub call a
-//! run makes proves it: the capability's trade, the upload's presign and publication, a private
-//! checkpoint's closure, a package's card and install plan. The machine pins, makes, quantizes
+//! run makes proves it: the upload, a private checkpoint's read under the owner's bearer, a
+//! package's card and install plan. The machine pins, makes, quantizes
 //! and uploads every byte; this computer only asks.
 //!
 //! upload → private download elsewhere → publish → info → family → quantize (a package's
@@ -15,11 +15,31 @@ use std::path::{Path, PathBuf};
 
 use common::{Home, Out};
 use serde_json::Value;
+use std::sync::Arc;
+
 use tensorfs::{
-    fetch::{Client, SourcePolicy, TensorhubOrigin},
+    err::{refuse, Code, Result},
+    fetch::{bearer, Client, Config, Endpoint, Fetcher, Origin, SourcePolicy, Want},
     format::ObjectRef,
-    store2::Store,
+    store::Store,
 };
+
+/// `model`'s tree `tree` (`sha256:<hex>`) from the Hub's distribution endpoint through TensorFS's
+/// fetcher: the library's own pull. The repo document names it only to its owner.
+fn pull(store: &Store, client: &Client, hub: Endpoint, model: &str, tree: &str) -> Result<ObjectRef> {
+    let hub = Arc::new(hub);
+    tensorfs::fetch::runtime()?.block_on(async {
+        let repo = hub.repo(model).await?.map(|(repo, _)| repo);
+        let Some(named) = repo.iter().flat_map(|repo| repo.roots()).find(|root| root.id() == tree).cloned() else {
+            return refuse(Code::REF_NOT_FOUND, format!("{model} names no {tree} here"));
+        };
+        let origin: Arc<dyn Origin> = hub.clone();
+        let fetcher = Fetcher::new(Arc::new(store.clone()), client.clone(), None, Config::default());
+        fetcher.pull_tree(&origin, &named, None, &Want::default()).await?;
+        fetcher.settled().await;
+        Ok(named)
+    })
+}
 
 /// `cozy args` in `dir`. Each step is named, timestamped and flushed before it starts, and its
 /// output streams into the log as it comes, so the job's own timeout shows the step it stopped in.
@@ -132,8 +152,8 @@ fn closure(root: &Path, manifest: &str) -> Vec<(String, Vec<u8>)> {
 
 /// TensorFS end to end (xs-045 U9a): one machine imports a Hugging Face model into its store
 /// and puts it in the Hub's custody; a second, fresh machine pulls it by its digest under the
-/// run's capability, and the library's Tensorhub origin pulls it into a third store with the
-/// owner's bearer token (and is refused without one). Every store holds the same objects, byte
+/// run's owner bearer, and the library's distribution `Endpoint` pulls it into a third store
+/// with that bearer (and is refused without one). Every store holds the same objects, byte
 /// for byte.
 #[test]
 fn a_model_uploaded_by_one_machine_is_pulled_bit_identical_by_another() {
@@ -149,22 +169,21 @@ fn a_model_uploaded_by_one_machine_is_pulled_bit_identical_by_another() {
     let second = machine(&home, "m2");
     let checkpoint = format!("{model}#{source}");
     let run = completed(&home, &cozy(&home, None, &["--json", "model", "download", &checkpoint, "--on", "m2"]));
-    assert_eq!(run["result"]["models"][0]["manifest"], source.as_str(), "{run}");
+    assert_eq!(run["result"]["models"][0]["tree"], source.as_str(), "{run}");
     let (made, pulled) = (closure(&first.store(), &source), closure(&second.store(), &source));
-    assert!(made.len() >= 3, "a manifest, a header and its chunks: {}", made.len());
+    assert!(made.len() >= 3, "a tree, a header and its chunks: {}", made.len());
     assert!(made == pulled, "the pulled checkpoint differs from the uploaded one");
 
     let ca = std::fs::read(std::env::var("TENSORHUB_CA").expect("the Hub's CA")).unwrap();
     let url = std::env::var("TENSORHUB_ORIGIN").unwrap();
     let policy = SourcePolicy { any_host: true, allow_local: true, max_redirects: 5, ..SourcePolicy::default() };
     let client = Client::with_roots(policy, &ca).unwrap();
-    let (third, reference) = (tempfile::tempdir().unwrap(), format!("{model}@{source}"));
+    let third = tempfile::tempdir().unwrap();
     let store = Store::open(third.path()).unwrap();
-    let anonymous = store.pull_hub(client.clone(), TensorhubOrigin::new(&client, &url).unwrap(), &reference, None);
+    let anonymous = pull(&store, &client, Endpoint::new(&client, &url, None).unwrap().anonymous(), &model, &source);
     assert!(anonymous.is_err(), "an owner's checkpoint read anonymously: {anonymous:?}");
-    let hub = TensorhubOrigin::new(&client, &url).unwrap().bearer(home.token());
-    let library = store.pull_hub(client, hub, &reference, None).unwrap();
-    assert_eq!((library.named.manifest.id(), library.named.release), (source.clone(), None));
+    let hub = Endpoint::new(&client, &url, Some(bearer(home.token()))).unwrap();
+    assert_eq!(pull(&store, &client, hub, &model, &source).unwrap().id(), source);
     assert!(closure(third.path(), &source) == made, "the library's pull differs from the uploaded checkpoint");
 }
 
@@ -182,11 +201,11 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     assert_eq!(made["published"]["destination"], model.as_str(), "{run}");
     let source = made["published"]["checkpoint"].as_str().unwrap().to_owned();
 
-    // Another machine reads the private checkpoint by its digest, under the run's capability.
+    // Another machine reads the private checkpoint by its digest, under the run's owner bearer.
     let _other = machine(&home, "m2");
     let checkpoint = format!("{model}#{source}");
     let run = completed(&home, &cozy(&home, None, &["--json", "model", "download", &checkpoint, "--on", "m2"]));
-    assert_eq!(run["result"]["models"][0]["manifest"], source.as_str(), "{run}");
+    assert_eq!(run["result"]["models"][0]["tree"], source.as_str(), "{run}");
 
     // A release names it; info shows the lane and its checkpoint.
     let lane = format!("f32={source}");

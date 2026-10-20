@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use platform::{
     durable::Mode as _,
-    handles::Owned,
     ipc::{LocalListener, LocalStream},
 };
 use std::{
@@ -28,8 +27,8 @@ use std::os::{
     unix::process::{CommandExt, ExitStatusExt},
 };
 
-/// Chunks of one weight set's shared GPU regions crossing in one exchange.
-const MAX_SHARED_FDS: u32 = 1 << 16;
+/// Bound descriptor counts even for a malformed or unsupported request.
+const MAX_REQUEST_FDS: u32 = 1 << 16;
 pub const RESULT_DOCUMENT: &str = "result.canonical";
 
 #[derive(Clone, Debug)]
@@ -153,10 +152,13 @@ pub struct Group {
     /// `Load`/`Invoke`: each rank's own process cap, rank 0 first (-1: uncapped).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rank_caps: Vec<i64>,
+    /// Start: one table/eventfd/private-channel triple per rank, in rank order.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ledgers: u32,
 }
 impl Group {
     pub fn is_empty(&self) -> bool {
-        !self.rank_cells && self.rank_caps.is_empty()
+        !self.rank_cells && self.rank_caps.is_empty() && self.ledgers == 0
     }
 }
 
@@ -174,6 +176,9 @@ pub enum DeviceCommand {
     Shutdown,
     Start {
         devices: String,
+        /// Applied after ranks spawn; import-only parents never initialize CUDA.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        authorized_device_limit_bytes: Option<u64>,
         application: String,
         package_interface: PathBuf,
         sequence_parallel_degree: u32,
@@ -188,6 +193,11 @@ pub enum DeviceCommand {
         constructions: Vec<Construction>,
     },
     Load {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tensorfs: Option<protocol::machine::TensorFSOptions>,
+        /// The request's signer: the Runtime keeps its bearer per signer and endpoint.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        actor: String,
         construction: String,
         devices: String,
         sequence_parallel_degree: u32,
@@ -201,17 +211,6 @@ pub enum DeviceCommand {
         authorized_device_limit_bytes: Option<u64>,
         #[serde(skip_serializing_if = "String::is_empty")]
         attention_pin: String,
-        /// Each weight set asks for TensorD's sealed CPU-buffer layout.
-        #[serde(skip_serializing_if = "is_false")]
-        sealed_tiers: bool,
-        /// TensorD supplies the selected header/assets (`model_source`) for Runtime to parse
-        /// and construct its model. With sealed tiers, no executor Store open is needed.
-        #[serde(skip_serializing_if = "is_false")]
-        model_sources: bool,
-        /// This machine stages layouts in part and hands over object files
-        /// (`sealed_stage`, `object_files`): an executor asks for them only when told so.
-        #[serde(skip_serializing_if = "is_false")]
-        staged_tiers: bool,
         /// The pinned budget, applied before any weight set registers.
         #[serde(skip_serializing_if = "Option::is_none")]
         pinned_bytes: Option<i64>,
@@ -241,6 +240,8 @@ pub enum DeviceCommand {
         input_metadata: BTreeMap<String, Value>,
     },
     Invoke {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tensorfs: Option<Box<protocol::machine::TensorFSOptions>>,
         /// Retained asset capacity derived from the actual installed result schema.
         max_output_bytes: u64,
         request_id: String,
@@ -272,12 +273,19 @@ pub enum DeviceCommand {
         /// Degree 2 for this call; None leaves the executor's setting.
         #[serde(skip_serializing_if = "Option::is_none")]
         device_weights: Option<bool>,
-        /// Each `Weights[M]` parameter's checkpoint (`sha256:<hex>`), read through `weights_writer`.
+        /// Each `Weights[M]` parameter's checkpoint (`sha256:<hex>`, its header), which the
+        /// Runtime opens from the store itself.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         sources: BTreeMap<String, String>,
-        /// The weights outputs this attempt may write: output id to its byte bound.
+        /// Declared outputs and bounds, enforced by Runtime's public Writer.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         weights: BTreeMap<String, u64>,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        destination: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        actor: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        operation: String,
     },
     Budget {
         vram_bytes: i64,
@@ -294,15 +302,6 @@ pub enum DeviceCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         floor_bytes: Option<u64>,
     },
-    /// Offer the machine every GPU region filled and not shared yet.
-    Share,
-    /// Release the machine's GPU regions of one layout, or only `regions` of it.
-    Revoke {
-        layout: String,
-        generation: u64,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        regions: Vec<u32>,
-    },
     Unload {
         construction: String,
     },
@@ -314,6 +313,12 @@ pub enum DeviceCommand {
         socket: PathBuf,
         root: PathBuf,
         environment: BTreeMap<String, String>,
+    },
+    /// `actor`'s newest bearer at `tensorfs.endpoint`, sent outside any exchange (`Line`) and
+    /// answered by nothing: the executor's reads and uploads there present it from now on.
+    Bearer {
+        actor: String,
+        tensorfs: protocol::machine::TensorFSOptions,
     },
 }
 
@@ -362,11 +367,10 @@ impl DeviceCommand {
             Self::Invoke { .. } => "invoke",
             Self::Budget { .. } => "budget",
             Self::Map { .. } => "map",
-            Self::Share => "share",
-            Self::Revoke { .. } => "revoke",
             Self::Unload { .. } => "unload",
             Self::Probe { .. } => "probe",
             Self::Fork { .. } => "fork",
+            Self::Bearer { .. } => "bearer",
         }
     }
 }
@@ -383,11 +387,7 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
-    ModelSource,
-    SealedTier,
-    SealedStage,
-    ObjectFiles,
-    DeviceTier,
+    CheckpointItem,
     BudgetCell,
     DeviceRoom,
     Publish,
@@ -402,10 +402,6 @@ pub enum Kind {
     ChildEvents,
     GpuRelease,
     ModelPrefetch,
-    /// An attempt's weights: one source read, one output written, or an output adopted.
-    WeightsWriter,
-    /// A fresh channel over the call's checkpoints held in part (`access::Fetch::channel`).
-    FetchChannel,
     /// A `progress` event carrying a retained `log` observation (`Telemetry.log`).
     Log,
     #[default]
@@ -657,6 +653,7 @@ pub struct Frame {
     /// A group's followers' own plane facts, rank 1 first (None: not stated yet).
     pub rank_planes: Vec<Option<PlaneFacts>>,
     pub metrics: Option<Metrics>,
+    pub memory: Option<crate::memory::call::RequestMemory>,
     pub shortfall: Option<Shortfall>,
     pub stage: String,
     pub position: Option<u64>,
@@ -673,19 +670,17 @@ pub struct Frame {
     pub fields: Value,
     /// PrepareRequest: the request's normalized features (its shape).
     pub features: BTreeMap<String, Value>,
-    /// `device_tier`: fds that follow the frame, one per chunk of `regions`.
+    /// Extra descriptors are drained before an unsupported operation is refused.
     pub descriptors: u32,
-    /// `sealed_tier`/`sealed_stage`: the regions to stage (the ones the executor streams).
-    pub stage_regions: Option<Vec<u32>>,
     pub device: String,
-    pub regions: Vec<crate::resident_custody::SharedRegion>,
-    /// `device_tier`: what the regions hold beside the stored bytes ("": nothing; in an ask
-    /// "*": the layout's latest baked variant).
     pub variant: String,
     pub shared_bytes: u64,
     pub released_bytes: u64,
     // `publish` (Outputs.publish): one product of a declared output.
     pub output: String,
+    /// `checkpoint_item`: the immutable TensorFS reference Runtime committed or uploaded.
+    pub repo_id: String,
+    pub revision: String,
     pub label: String,
     pub asset_ref: String,
     pub asset_kind: String,
@@ -718,10 +713,6 @@ pub struct Frame {
     pub numerics: String,
     pub local: String,
     pub cost_ms: f64,
-    /// `weights_writer`: `source`, `output` or `adopt`, its output and its transaction.
-    pub operation: String,
-    pub output_slot: String,
-    pub transaction: String,
 }
 
 impl Frame {
@@ -765,33 +756,11 @@ pub struct Answer {
     pub ok: bool,
     pub code: String,
     pub detail: String,
-    pub held: bool,
-    /// A `DeviceRoom` answer: the process cap raised into the room made; -1 keeps it.
-    pub cap_bytes: i64,
     /// One fd follows the answer. Sent only when true: a `Tier` answer types it as the fd.
     #[serde(skip_serializing_if = "is_false")]
     pub descriptor: bool,
     pub sha256: String,
     pub length: u64,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub generation: u64,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub regions: Vec<crate::resident_custody::SharedRegion>,
-    #[serde(skip_serializing_if = "is_false")]
-    pub duplicate: bool,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub descriptors: u64,
-    /// `device_tier`: the holding's layout digest, which the reader's plane verifies.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub layout: String,
-    /// `device_tier`: the last fd after the answer is the reader's lease socket.
-    #[serde(skip_serializing_if = "is_false")]
-    pub lease: bool,
-    /// `device_tier`: this machine keys holdings by variant, and the answered holding's.
-    #[serde(skip_serializing_if = "is_false")]
-    pub variants: bool,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub variant: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub digest: String,
     #[serde(skip_serializing_if = "is_zero")]
@@ -807,17 +776,9 @@ pub struct Answer {
     pub byte_grants: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<Value>,
-    /// `Opened` (a weights output) and `Adopted`: its transaction, run and manifest.
+    /// A failed child call's raising traceback, whole (its triage's).
     #[serde(skip_serializing_if = "String::is_empty")]
-    pub transaction: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub request_id: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub manifest: String,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub manifest_length: u64,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub receipt_digest: String,
+    pub traceback: String,
     /// A memo hit: the entry's verified copy in the run's spool, and what producing it cost.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub local: String,
@@ -831,14 +792,6 @@ pub struct Answer {
     pub stored: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub reason: String,
-    /// `object_files`: the SHA-256 of the objects whose fds follow, in the order the executor
-    /// derives from its own plan (`HostTier::objects_digest`), in place of the list (SDXL's
-    /// UNet: about 1,700 objects).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub objects_sha256: String,
-    /// `sealed_stage`: the regions staged or staging (the rest stay holes).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub staged: Vec<u32>,
 }
 fn is_zero_ms(value: &f64) -> bool {
     *value == 0.0
@@ -851,19 +804,9 @@ impl Answer {
             ok: false,
             code: "capability_unavailable".into(),
             detail: "owner has not qualified this operation".into(),
-            held: false,
-            cap_bytes: -1,
             descriptor: false,
             sha256: String::new(),
             length: 0,
-            generation: 0,
-            regions: Vec::new(),
-            duplicate: false,
-            descriptors: 0,
-            layout: String::new(),
-            lease: false,
-            variants: false,
-            variant: String::new(),
             digest: String::new(),
             sequence: 0,
             state: String::new(),
@@ -871,18 +814,12 @@ impl Answer {
             result: String::new(),
             byte_grants: Vec::new(),
             progress: None,
-            transaction: String::new(),
-            request_id: String::new(),
-            manifest: String::new(),
-            manifest_length: 0,
-            receipt_digest: String::new(),
+            traceback: String::new(),
             local: String::new(),
             cost_ms: 0.0,
             disputed: false,
             stored: false,
             reason: String::new(),
-            objects_sha256: String::new(),
-            staged: Vec::new(),
         }
     }
     pub fn ok(seq: u64) -> Self {
@@ -912,26 +849,7 @@ pub trait Services {
         drop(descriptor);
         Ok((Answer::unavailable(frame.seq), None))
     }
-    /// `device_tier`: `fds` arrived with the request; the returned ones
-    /// follow the answer, the lease socket last when `answer.lease`.
-    fn device_tier(
-        &mut self,
-        frame: &Frame,
-        fds: Vec<Owned>,
-    ) -> io::Result<(Answer, Vec<Owned>)> {
-        drop(fds);
-        Ok((Answer::unavailable(frame.seq), Vec::new()))
-    }
-    /// `object_files`: the plan's memfd arrived with the request; the
-    /// verified object files follow the answer, one fd per `objects` entry.
-    fn object_files(
-        &mut self,
-        frame: &Frame,
-        plan: Option<File>,
-    ) -> io::Result<(Answer, Vec<File>)> {
-        drop(plan);
-        Ok((Answer::unavailable(frame.seq), Vec::new()))
-    }
+
 }
 
 pub struct Baseline;
@@ -942,7 +860,9 @@ pub struct DeviceExecutor {
     /// Forked from an import-only executor (`fork/1`), which is its parent and reaps it.
     forked: bool,
     exact: Exact,
+    /// Read here; written only through `writer`, which a `Line` shares.
     stream: LocalStream,
+    writer: Arc<Mutex<LocalStream>>,
     pub birth: Birth,
     pub hello: Hello,
     /// Sampling resolution of the wedge rule. Tests shorten it; nothing else changes it.
@@ -964,6 +884,24 @@ pub struct DeviceExecutor {
     /// Where its stderr stood when the request it serves began.
     log_from: u64,
     memo: Option<Arc<crate::memo::Memo>>,
+}
+
+/// The executor's seam for frames sent outside any command's exchange, under the lock every
+/// command and answer is written with. Gone with the executor.
+#[derive(Clone)]
+pub struct Line(std::sync::Weak<Mutex<LocalStream>>);
+impl Line {
+    /// Sends `command`, answered by nothing; false once the executor is gone.
+    pub fn send(&self, command: &DeviceCommand) -> bool {
+        let Some(writer) = self.0.upgrade() else {
+            return false;
+        };
+        let mut stream = writer.lock().unwrap();
+        write_command(&mut stream, command, &Group::default(), false).is_ok()
+    }
+    pub fn same(&self, other: &Line) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
 }
 
 /// Cooperative first: the executor stops at its next safe point. The running invocation's
@@ -1754,6 +1692,7 @@ impl DeviceExecutor {
             child: None,
             forked: unready.child.is_none(),
             exact,
+            writer: Arc::new(Mutex::new(stream.try_clone()?)),
             stream,
             birth,
             hello: Hello::default(),
@@ -1818,6 +1757,9 @@ impl DeviceExecutor {
     pub fn stderr_tail(&self) -> String {
         crate::process::tail_from(&self.root.join("stderr.log"), self.log_from, crate::triage::MAX_STDERR)
     }
+    pub fn line(&self) -> Line {
+        Line(Arc::downgrade(&self.writer))
+    }
     pub fn cancellation(&self) -> Cancellation {
         Cancellation {
             root: self.root.clone(),
@@ -1853,6 +1795,24 @@ impl DeviceExecutor {
         group: &Group,
         services: &mut impl Services,
     ) -> io::Result<Frame> {
+        self.command_with_grants(command, group, Vec::new(), services)
+    }
+
+    /// Start with one private placement grant per rank. Descriptors immediately follow the
+    /// Start frame, before any Runtime reply. Their local duplicates close after transfer.
+    pub fn command_with_grants(
+        &mut self,
+        command: &DeviceCommand,
+        group: &Group,
+        grants: Vec<crate::memory::slim::Grant>,
+        services: &mut impl Services,
+    ) -> io::Result<Frame> {
+        if grants.len() != group.ledgers as usize
+            || (!grants.is_empty() && !matches!(command, DeviceCommand::Start { .. }))
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "placement grants require a matching Start ledger count"));
+        }
         let meter = match (command, &self.activity) {
             (DeviceCommand::Invoke { .. }, Some(_)) => Meter::Work,
             (DeviceCommand::Invoke { .. }, None) => Meter::Frames,
@@ -1868,7 +1828,7 @@ impl DeviceExecutor {
             command.name(),
         )?;
         *self.watched.lock().unwrap() = Some(watching.watch());
-        let result = self.exchange(command, group, services, &watching.watch());
+        let result = self.exchange(command, group, &grants, services, &watching.watch());
         *self.watched.lock().unwrap() = None;
         // Whatever the run was computing when its exchange ended, its waiters compute themselves.
         if let (Some(memo), Some((run, _))) = (&self.memo, command.spool()) {
@@ -1888,23 +1848,21 @@ impl DeviceExecutor {
         &mut self,
         command: &DeviceCommand,
         group: &Group,
+        grants: &[crate::memory::slim::Grant],
         services: &mut impl Services,
         watch: &Watch,
     ) -> io::Result<Frame> {
-        let mut value = serde_json::to_value(command)?;
-        if let (false, Some(object), Value::Object(extra)) = (
-            group.is_empty(),
-            value.as_object_mut(),
-            serde_json::to_value(group)?,
-        ) {
-            object.extend(extra);
+        {
+            // The command and every grant are one wire unit: a refreshed bearer must
+            // never land between a command and its SCM_RIGHTS descriptors.
+            let mut writer = self.writer.lock().unwrap();
+            write_command(&mut writer, command, group, self.memo.is_some())?;
+            for grant in grants {
+                for fd in [&grant.table, &grant.events, &grant.channel] {
+                    platform::handles::send_fd(&writer, fd)?;
+                }
+            }
         }
-        // The executor's memoized stages go to the machine tier.
-        if matches!(command, DeviceCommand::Start { .. }) && self.memo.is_some() {
-            value["memo"] =
-                serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
-        }
-        write_frame(&mut self.stream, &value)?;
         loop {
             let frame = read_frame(&mut self.stream)?
                 .ok_or_else(|| {
@@ -1913,28 +1871,14 @@ impl DeviceExecutor {
             watch.frame();
             match frame.event {
                 Some(Event::Request) if !frame.malformed.is_empty() => {
-                    refuse_malformed(&mut self.stream, &frame)?
+                    refuse_malformed(&mut self.writer.lock().unwrap(), &frame)?
                 }
                 Some(Event::Progress) if !frame.malformed.is_empty() => (),
                 Some(Event::Progress) => services.progress(&frame),
-                Some(Event::Request) if frame.kind == Kind::DeviceTier => {
-                    if frame.descriptors > MAX_SHARED_FDS {
-                        return Err(io::Error::other("device tier names too many descriptors"));
-                    }
-                    let mut fds = Vec::with_capacity(frame.descriptors as usize);
-                    for _ in 0..frame.descriptors {
-                        fds.push(platform::handles::recv_fd(&self.stream)?);
-                    }
-                    let (mut answer, out) = services.device_tier(&frame, fds)?;
-                    answer.event = "answer";
-                    answer.seq = frame.seq;
-                    answer.descriptor = false;
-                    // Chunk fds, then the lease socket when there is one.
-                    answer.descriptors = out.len().saturating_sub(usize::from(answer.lease)) as u64;
-                    write_frame(&mut self.stream, &answer)?;
-                    for fd in &out {
-                        platform::handles::send_fd(&self.stream, fd)?;
-                    }
+                Some(Event::Request) if frame.descriptors > 0 => {
+                    if frame.descriptors > MAX_REQUEST_FDS { return Err(io::Error::other("request names too many descriptors")); }
+                    for _ in 0..frame.descriptors { drop(platform::handles::recv_fd(&self.stream)?); }
+                    write_frame(&mut self.writer.lock().unwrap(), &Answer::refused(frame.seq,"unsupported_descriptors","this operation does not accept multiple descriptors"))?;
                 }
                 Some(Event::Request)
                     if matches!(frame.kind, Kind::StageMemoLookup | Kind::StageMemoStore) =>
@@ -1946,26 +1890,7 @@ impl DeviceExecutor {
                         _ => Answer::unavailable(frame.seq),
                     };
                     watch.serving(false);
-                    write_frame(&mut self.stream, &answer)?;
-                }
-                Some(Event::Request) if frame.kind == Kind::ObjectFiles => {
-                    let plan = if frame.descriptor {
-                        Some(File::from(platform::handles::recv_fd(&self.stream)?))
-                    } else {
-                        None
-                    };
-                    watch.serving(true);
-                    let answered = services.object_files(&frame, plan);
-                    watch.serving(false);
-                    let (mut answer, out) = answered?;
-                    answer.event = "answer";
-                    answer.seq = frame.seq;
-                    answer.descriptor = false;
-                    answer.descriptors = out.len() as u64;
-                    write_frame(&mut self.stream, &answer)?;
-                    for file in &out {
-                        platform::handles::send_fd(&self.stream, file)?;
-                    }
+                    write_frame(&mut self.writer.lock().unwrap(), &answer)?;
                 }
                 Some(Event::Request) => {
                     // The machine's own answer time is not the executor's stillness.
@@ -1976,6 +1901,8 @@ impl DeviceExecutor {
                 }
                 Some(Event::Unknown) => (),
                 None if frame.reply == command.name() => return Ok(frame),
+                // A Runtime without the `bearer` handler refuses it as a command.
+                None if frame.reply == "bearer" => (),
                 None => return Err(io::Error::other("out-of-order stock executor reply")),
             }
         }
@@ -1991,9 +1918,10 @@ impl DeviceExecutor {
         answer.event = "answer";
         answer.seq = frame.seq;
         answer.descriptor = descriptor.is_some();
-        write_frame(&mut self.stream, &answer)?;
+        let mut writer = self.writer.lock().unwrap();
+        write_frame(&mut writer, &answer)?;
         if let Some(descriptor) = descriptor {
-            platform::handles::send_fd(&self.stream, &descriptor)?;
+            platform::handles::send_fd(&writer, &descriptor)?;
         }
         Ok(())
     }
@@ -2186,6 +2114,28 @@ fn write_frame(
     scan(&value)?;
     seam::write_body(stream, &serde_json::to_vec(&value)?)
 }
+
+fn write_command(stream: &mut LocalStream, command: &DeviceCommand, group: &Group, memo: bool) -> io::Result<()> {
+    let mut value = serde_json::to_value(command)?;
+    if let (false, Some(object), Value::Object(extra)) = (group.is_empty(), value.as_object_mut(), serde_json::to_value(group)?) {
+        object.extend(extra);
+    }
+    if matches!(command, DeviceCommand::Start { .. }) && memo {
+        value["memo"] = serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
+    }
+    let bytes = serde_json::to_vec(&value)?;
+    // Only this typed field may carry supplied access. Validate everything else; the original
+    // wire bytes above still contain the token, and arbitrary JSON never grants this exception.
+    if let (true, Some(options)) = (
+        matches!(command, DeviceCommand::Load { tensorfs: Some(_), .. } | DeviceCommand::Invoke { tensorfs: Some(_), .. }
+            | DeviceCommand::Bearer { .. }),
+        value.get_mut("tensorfs").and_then(Value::as_object_mut),
+    ) {
+        options.remove("token");
+    }
+    scan(&value)?;
+    seam::write_body(stream, &bytes)
+}
 /// SDK control framing shared with the CPU source-qualification receiver.
 pub fn read_frame(stream: &mut LocalStream) -> io::Result<Option<Frame>> {
     seam::read_body(stream)?.map(|bytes| decode_frame(&bytes)).transpose()
@@ -2229,7 +2179,7 @@ fn refuse_malformed(
     stream: &mut LocalStream,
     frame: &Frame,
 ) -> io::Result<()> {
-    if frame.descriptors > MAX_SHARED_FDS {
+    if frame.descriptors > MAX_REQUEST_FDS {
         return Err(io::Error::other("a malformed request names too many descriptors"));
     }
     for _ in 0..u32::from(frame.descriptor) + frame.descriptors {
@@ -2273,8 +2223,112 @@ fn scan(value: &Value) -> io::Result<()> {
 mod codec_tests {
     use super::*;
 
-    /// No credential crosses the seam, and a spooled result unlike the executor's reference is
-    /// refused.
+    fn ordinary_options() -> protocol::machine::TensorFSOptions {
+        protocol::machine::TensorFSOptions {
+            endpoint: "https://ordinary.example.test".into(), token: "supplied-test-bearer".into(),
+            ca_der: vec![1, 2, 3], ..Default::default()
+        }
+    }
+
+    fn ordinary_load() -> DeviceCommand {
+        DeviceCommand::Load {
+            tensorfs: Some(ordinary_options()), actor: String::new(), construction: "construction".into(), devices: String::new(),
+            sequence_parallel_degree: 1, binding: Box::default(), budgets: Budgets::default(), models: vec![],
+            authorized_device_limit_bytes: None, attention_pin: String::new(),
+            pinned_bytes: None, device_weights: false, cap_bytes: None,
+        }
+    }
+
+    fn ordinary_invoke() -> DeviceCommand {
+        DeviceCommand::Invoke {
+            tensorfs: Some(Box::new(ordinary_options())), max_output_bytes: 1024, request_id: "request".into(),
+            construction: "construction".into(), entrypoint: "write".into(), spool: PathBuf::from("spool"), deadline_s: None,
+            attention_kernel: String::new(), bits: 0, cap_bytes: None, inputs: BTreeMap::new(), trees: BTreeMap::new(),
+            floor_bytes: None, activation_bytes: BTreeMap::new(), squeezed_bytes: BTreeMap::new(), device_weights: None,
+            sources: BTreeMap::new(), weights: BTreeMap::new(), destination: "owner/model".into(), actor: "actor".into(), operation: "operation".into(),
+        }
+    }
+
+    fn rejected_without_a_partial_frame(write: impl FnOnce(&mut LocalStream) -> io::Result<()>) {
+        let (mut machine, mut runtime) = platform::ipc::pair().unwrap();
+        let error = write(&mut machine).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!error.to_string().contains("supplied-test-bearer"));
+        write_command(&mut machine, &DeviceCommand::Hello, &Group::default(), false).unwrap();
+        let bytes = seam::read_body(&mut runtime).unwrap().unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), serde_json::json!({"cmd": "hello"}));
+    }
+
+    #[test]
+    fn ordinary_tensorfs_tokens_cross_the_actual_typed_command_writer_unchanged() {
+        let group = Group { rank_caps: vec![17], ..Default::default() };
+        let bearer = DeviceCommand::Bearer { actor: "signer".into(), tensorfs: ordinary_options() };
+        for command in [ordinary_load(), ordinary_invoke(), bearer] {
+            let mut expected = serde_json::to_value(&command).unwrap();
+            expected.as_object_mut().unwrap().extend(serde_json::to_value(&group).unwrap().as_object().unwrap().clone());
+            let (mut machine, mut runtime) = platform::ipc::pair().unwrap();
+            write_command(&mut machine, &command, &group, false).unwrap();
+            let bytes = seam::read_body(&mut runtime).unwrap().unwrap();
+            let received: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(received, expected, "the framing writer must not redact supplied access");
+            assert_eq!(received["tensorfs"]["token"], "supplied-test-bearer");
+            assert!(!format!("{command:?}").contains("supplied-test-bearer"));
+        }
+        let start = DeviceCommand::Start {
+            authorized_device_limit_bytes: None, devices: String::new(), application: "module:app".into(),
+            package_interface: PathBuf::from("interface.json"), sequence_parallel_degree: 1,
+            import_only: true, call_interfaces: vec![], constructions: vec![] };
+        let (mut machine, mut runtime) = platform::ipc::pair().unwrap();
+        write_command(&mut machine, &start, &group, true).unwrap();
+        let bytes = seam::read_body(&mut runtime).unwrap().unwrap();
+        let received: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(received["memo"]["entry_bytes"], crate::memo::ENTRY_BYTES);
+        assert_eq!(received["rank_caps"], serde_json::json!([17]));
+    }
+
+    #[test]
+    fn ordinary_tensorfs_access_never_authorizes_nested_credentials_or_fake_configuration() {
+        for name in ["token", "Credential", "authorization", "SECRET", "jwt"] {
+            let mut command = ordinary_invoke();
+            if let DeviceCommand::Invoke { inputs, .. } = &mut command {
+                let forbidden = Value::Object(serde_json::Map::from_iter([(name.into(), "forbidden".into())]));
+                inputs.insert("config".into(), serde_json::json!({"nested": [forbidden]}));
+            }
+            rejected_without_a_partial_frame(|stream| write_command(stream, &command, &Group::default(), false));
+        }
+        let mut command = ordinary_invoke();
+        if let DeviceCommand::Invoke { inputs, .. } = &mut command {
+            inputs.insert("payload".into(), serde_json::json!({"cmd": "load", "tensorfs": {"token": "forbidden"}}));
+        }
+        rejected_without_a_partial_frame(|stream| write_command(stream, &command, &Group::default(), false));
+        let mut load = ordinary_load();
+        if let DeviceCommand::Load { binding, .. } = &mut load {
+            binding.snapshots.insert("token".into(), "forbidden".into());
+        }
+        rejected_without_a_partial_frame(|stream| write_command(stream, &load, &Group::default(), false));
+    }
+
+    #[test]
+    fn ordinary_tensorfs_access_is_not_authorized_by_other_commands_json_or_answers() {
+        let command = DeviceCommand::PrepareRequest { request_id: "request".into(), construction: "construction".into(),
+            entrypoint: "write".into(), payload: serde_json::json!({"tensorfs": {"token": "forbidden"}}),
+            attention_kernel: String::new(), bits: 0, input_metadata: BTreeMap::new() };
+        rejected_without_a_partial_frame(|stream| write_command(stream, &command, &Group::default(), false));
+        let fork = DeviceCommand::Fork { socket: PathBuf::from("socket"), root: PathBuf::from("root"),
+            environment: BTreeMap::from([("token".into(), "forbidden".into())]) };
+        rejected_without_a_partial_frame(|stream| write_command(stream, &fork, &Group::default(), false));
+        for discriminator in ["cmd", "command", "reply"] {
+            let forged = Value::Object(serde_json::Map::from_iter([
+                (discriminator.into(), "load".into()), ("tensorfs".into(), serde_json::json!({"token": "forbidden"}))]));
+            rejected_without_a_partial_frame(|stream| write_frame(stream, &forged));
+        }
+        rejected_without_a_partial_frame(|stream| write_frame(stream, &ordinary_load()));
+        let mut answer = Answer::ok(7);
+        answer.progress = Some(serde_json::json!({"reply": "invoke", "tensorfs": {"token": "forbidden"}}));
+        rejected_without_a_partial_frame(|stream| write_answer(stream, &answer));
+    }
+
+    /// Generic frames reject credentials; a spooled result unlike the executor's reference is refused.
     #[test]
     fn a_credential_never_crosses_and_a_changed_result_is_refused() {
         let refused = scan(&serde_json::json!({"payload": [{"Credential": "x"}]})).unwrap_err();

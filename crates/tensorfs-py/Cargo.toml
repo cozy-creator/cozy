@@ -1,6 +1,6 @@
 [package]
 name = "tensorfs-py"
-version = "0.11.0"
+version = "0.13.0"
 edition = "2021"
 publish.workspace = true
 
@@ -9,7 +9,12 @@ name = "_ext"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+async-trait.workspace = true
+base64.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
 platform.workspace = true
+libc.workspace = true
 tensorfs.workspace = true
 varena.workspace = true
 pyo3 = { version = "0.29.2", features = ["abi3-py312"] }

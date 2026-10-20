@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use tensorfs::err::Code;
 use tensorfs::format::{decode, Body, Dtype, Encoding, PartBytes};
 use tensorfs::import::{Access, Request};
-use tensorfs::store2::{Checkpoint, Store};
+use tensorfs::store::{Checkpoint, Store};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/quantized")
@@ -45,8 +45,8 @@ fn import(case: &str, store: &Path) -> tensorfs::err::Result<Checkpoint> {
         progress: &|_, _, _| {},
         stop: None,
     };
-    let manifest = store.import(&req, None)?;
-    Ok(store.checkpoint(&manifest).unwrap())
+    let (header, _) = store.import(&req, None)?;
+    Ok(store.checkpoint(&header).unwrap())
 }
 
 fn values(bf16: &[u8]) -> Vec<f64> {

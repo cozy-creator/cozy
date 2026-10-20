@@ -38,6 +38,16 @@ pub fn pair() -> &'static [PathBuf] {
     })
 }
 
+/// The named pair as the image's (`<root>/opt/cozy/wheels`), so a machine started on `root` runs
+/// it rather than PyPI's newest.
+pub fn image(root: &Path) {
+    let wheels = root.join("opt/cozy/wheels");
+    for wheel in pair() {
+        std::fs::create_dir_all(&wheels).unwrap();
+        std::fs::copy(wheel, wheels.join(wheel.file_name().unwrap())).unwrap();
+    }
+}
+
 /// The named Runtime's version and the commit stamped in it; a wheel without one proves nothing.
 pub fn named() -> Option<&'static (String, String)> {
     static NAMED: OnceLock<Option<(String, String)>> = OnceLock::new();

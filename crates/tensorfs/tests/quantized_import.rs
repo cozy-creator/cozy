@@ -12,7 +12,7 @@ use std::process::Command;
 use tensorfs::err::Code;
 use tensorfs::format::{decode, Body, Dtype, Encoding, PartBytes, SCHEMES};
 use tensorfs::import::{Access, Request};
-use tensorfs::store2::{Checkpoint, Store};
+use tensorfs::store::{Checkpoint, Store};
 
 struct Scratch(PathBuf);
 
@@ -106,8 +106,8 @@ fn import(store: &Store, source: &Path) -> tensorfs::err::Result<Checkpoint> {
         progress: &|_, _, _| {},
         stop: None,
     };
-    let manifest = store.import(&req, None)?;
-    Ok(store.checkpoint(&manifest).unwrap())
+    let (header, _) = store.import(&req, None)?;
+    Ok(store.checkpoint(&header).unwrap())
 }
 
 fn bf16s(bytes: &[u8]) -> Vec<u16> {
@@ -587,7 +587,7 @@ fn comfy_int8_tensorwise_rowwise_and_convrot() {
             },
             Want {
                 key: "ff.down.weight",
-                encoding: r#"int8.convrot {rotation: "hadamard", rotation_size: 64, scale_dtype: "F32"}"#,
+                encoding: r#"int8.convrot {rotation: "kron_regular_h4", rotation_size: 64, scale_dtype: "F32"}"#,
                 parts: &[
                     ("weight", "I8", &[16, 128], "weight"),
                     ("scale", "F32", &[16, 1], "weight_scale"),
@@ -674,11 +674,11 @@ fn unknown_undeclared_and_ambiguous_carriers_are_refused() {
         t.retain(|(k, ..)| k != "ff.up.comfy_quant");
         t.push(marker(
             "ff.up",
-            serde_json::json!({"format": "convrot_w4a4"}),
+            serde_json::json!({"format": "svdquant_w4a4"}),
         ));
     });
     assert_eq!(e.code, Code::UNREGISTERED_ENCODING, "{}", e.detail);
-    assert!(e.detail.contains("convrot_w4a4"), "{}", e.detail);
+    assert!(e.detail.contains("svdquant_w4a4"), "{}", e.detail);
 
     // AWQ's pre_quant_scale has one element per input column.
     let e = refused("modelopt-nvfp4", &|t, _, _| {
@@ -738,6 +738,9 @@ fn every_carrier_names_a_complete_encoding() {
             ("fp8.blockwise", _) => Encoding::fp8_blockwise(128, 128, &Dtype::F32),
             ("mxfp4", Producer::GptOss) => Encoding::mxfp4(true),
             ("mxfp4", _) => Encoding::mxfp4(false),
+            ("comfy.asym_w4a8_int8", _) => Encoding::comfy_asym_w4a8_int8(16, 256),
+            ("comfy.w6a8_int8", _) => Encoding::comfy_w6a8_int8(16, 256),
+            ("comfy.convrot_w4a4", _) => Encoding::comfy_convrot_w4a4(256),
             other => panic!("{other:?}"),
         };
         let mut encoding = c.encoding.clone();
@@ -774,13 +777,13 @@ fn tfs_inspect_shows_comfy_nvfp4_at_a_glance() {
     };
     let source = fixtures().join("comfy-nvfp4");
     tfs(&[
-        "import",
+        "convert",
         source.to_str().unwrap(),
         "--name",
-        "acme/comfy-nvfp4",
+        "local/comfy-nvfp4@1",
     ]);
     let doc: serde_json::Value =
-        serde_json::from_str(tfs(&["--json", "inspect", "acme/comfy-nvfp4"]).trim()).unwrap();
+        serde_json::from_str(tfs(&["--json", "inspect", "local/comfy-nvfp4"]).trim()).unwrap();
     let tensors = doc["components"][0]["tensors"].as_array().unwrap();
     let qkv = tensors
         .iter()
@@ -790,7 +793,7 @@ fn tfs_inspect_shows_comfy_nvfp4_at_a_glance() {
         qkv,
         &serde_json::json!({"key": "blocks.0.attn.qkv.weight", "dtype": "BF16", "shape": [144, 80], "encoding": NVFP4_COMFY})
     );
-    let human = tfs(&["inspect", "acme/comfy-nvfp4"]);
+    let human = tfs(&["inspect", "local/comfy-nvfp4"]);
     assert!(
         human.contains(&format!("    2 × {NVFP4_COMFY}\n")),
         "{human}"
@@ -1285,7 +1288,7 @@ fn comfy_marker_params_are_read_or_refused() {
     };
     assert_eq!(
         encoding.to_string(),
-        r#"int8.convrot {rotation: "hadamard", rotation_size: 64, scale_dtype: "F32"}"#
+        r#"int8.convrot {rotation: "kron_regular_h4", rotation_size: 64, scale_dtype: "F32"}"#
     );
 }
 
@@ -1404,4 +1407,236 @@ fn real_bytes_from_comfyui_and_modelopt() {
         .map(drop)
         .unwrap_err();
     assert_eq!(e.code, Code::AMBIGUOUS_CLASSIFICATION, "{}", e.detail);
+}
+
+const W4A8: &str = "comfy.asym_w4a8_int8 {group_size: 16, rotation_size: 256}";
+const W6A8: &str = "comfy.w6a8_int8 {group_size: 32, rotation_size: 256}";
+const W4A4: &str = "comfy.convrot_w4a4 {rotation_size: 256}";
+
+/// xs-049 U7's real bytes (`comfy-provenance.json`: 64 rows × 512 columns of MiniMax-H3 linears,
+/// with Comfy-Org's bf16 weights): each ComfyUI integer format imports at its marker's params and
+/// decodes to the spec's rotation of kitchen's own int8 values, within its error of the bf16 weight
+/// (7.3% W4A8, 2.3% W6A8, 16–22% W4A4 over whole layers).
+#[test]
+fn comfy_w4a8_w6a8_w4a4_from_real_files() {
+    check(
+        "real-comfy-w4a8",
+        &[Want {
+            key: "blocks.20.attn.qkv_proj.weight",
+            encoding: W4A8,
+            parts: &[
+                ("weight", "I8", &[64, 256], "weight"),
+                ("weight_s_rel", "F8_E4M3", &[64, 32], "weight_s_rel"),
+                ("weight_s_channel", "F32", &[64], "weight_s_channel"),
+                ("weight_codebook", "F32", &[16], "weight_codebook"),
+            ],
+            meets: Meets::Exactly,
+            error: 0.08,
+        }],
+    );
+    check(
+        "real-comfy-w6a8",
+        &[Want {
+            key: "blocks.20.mlp.fc1.weight",
+            encoding: W6A8,
+            parts: &[
+                ("weight", "I8", &[64, 384], "weight"),
+                ("weight_s_rel", "F8_E4M3", &[64, 16], "weight_s_rel"),
+                ("weight_s_channel", "F32", &[64], "weight_s_channel"),
+            ],
+            meets: Meets::Exactly,
+            error: 0.03,
+        }],
+    );
+    check(
+        "real-comfy-w4a4",
+        &[Want {
+            key: "blocks.20.attn.out_proj.weight",
+            encoding: W4A4,
+            parts: &[
+                ("weight", "I8", &[64, 256], "weight"),
+                ("weight_scale", "F32", &[64], "weight_scale"),
+            ],
+            meets: Meets::Exactly,
+            error: 0.25,
+        }],
+    );
+}
+
+/// The markers the real files write (with `convrot`, without it, in `_quantization_metadata` with
+/// toxicdog's `quant_group_size: 64`) read; `U8` group scales (JoaoZaokk's LTX-2.5) read as
+/// `F8_E4M3`. What ComfyUI would decode differently or kitchen refuses is refused by name.
+#[test]
+fn comfy_int_markers_and_shapes_are_read_or_refused() {
+    let w4a8 = "blocks.20.attn.qkv_proj";
+    let w4a4 = "blocks.20.attn.out_proj";
+    let reconf = |module: &'static str, conf: serde_json::Value| {
+        move |t: &mut Tensors, _: &mut Metadata, _: &Path| {
+            let key = format!("{module}.comfy_quant");
+            t.retain(|(k, ..)| *k != key);
+            t.push(marker(module, conf.clone()));
+        }
+    };
+    let encoding = |ck: &Checkpoint, module: &str| match &ck
+        .tensor("model", &format!("{module}.weight"))
+        .unwrap()
+        .body
+    {
+        Body::Encoded { encoding, parts } => {
+            let dtypes: Vec<&str> = parts.iter().map(|p| p.dtype.name()).collect();
+            format!("{encoding} {dtypes:?}")
+        }
+        Body::Data(_) => panic!("plain"),
+    };
+    let conf =
+        serde_json::json!({"format": "asym_w4a8_int8", "group_size": 16, "convrot_groupsize": 256});
+    let (_d, ck) = edited("real-comfy-w4a8", &reconf(w4a8, conf));
+    assert_eq!(
+        encoding(&ck, w4a8),
+        format!(r#"{W4A8} ["I8", "F8_E4M3", "F32", "F32"]"#)
+    );
+    let u8_scales = |t: &mut Tensors, _: &mut Metadata, _: &Path| {
+        let s = t
+            .iter_mut()
+            .find(|(k, ..)| k.ends_with(".weight_s_rel"))
+            .unwrap();
+        s.1 = "U8".into();
+    };
+    let (_d, ck) = edited("real-comfy-w4a8", &u8_scales);
+    assert_eq!(
+        encoding(&ck, w4a8),
+        format!(r#"{W4A8} ["I8", "F8_E4M3", "F32", "F32"]"#)
+    );
+    let metadata = |t: &mut Tensors, m: &mut Metadata, _: &Path| {
+        t.retain(|(k, ..)| !k.ends_with(".comfy_quant"));
+        let layers = serde_json::json!({"format_version": "1.0", "layers": {w4a4: {
+            "format": "convrot_w4a4", "convrot_groupsize": 256, "quant_group_size": 64, "linear_dtype": "int8"}}});
+        m.insert("_quantization_metadata".into(), layers.to_string().into());
+    };
+    let (_d, ck) = edited("real-comfy-w4a4", &metadata);
+    assert_eq!(encoding(&ck, w4a4), format!(r#"{W4A4} ["I8", "F32"]"#));
+
+    let refusal = |case, edit: &dyn Fn(&mut Tensors, &mut Metadata, &Path), want: &str| {
+        let e = refused(case, edit);
+        assert!(e.detail.contains(want), "{want}: {}", e.detail);
+    };
+    let conf = serde_json::json!({"format": "asym_w4a8_int8", "group_size": 16, "convrot": false});
+    refusal(
+        "real-comfy-w4a8",
+        &reconf(w4a8, conf),
+        "with convrot: false",
+    );
+    let conf = serde_json::json!({"format": "asym_w4a8_int8", "group_size": 32, "convrot": true});
+    refusal("real-comfy-w4a8", &reconf(w4a8, conf), "not [64, 16]");
+    let conf = serde_json::json!({"format": "asym_w4a8_int8", "mma_packed": true});
+    refusal(
+        "real-comfy-w4a8",
+        &reconf(w4a8, conf),
+        "marker mma_packed: true is not read",
+    );
+    let six = |t: &mut Tensors, m: &mut Metadata, p: &Path| {
+        t.retain(|(k, ..)| !k.ends_with(".weight_codebook"));
+        reconf(
+            w4a8,
+            serde_json::json!({"format": "w6a8_int8", "group_size": 16}),
+        )(t, m, p);
+    };
+    refusal("real-comfy-w4a8", &six, "not 6-bit rows");
+    let conf = serde_json::json!({"format": "convrot_w4a4", "quant_group_size": 32});
+    refusal(
+        "real-comfy-w4a4",
+        &reconf(w4a4, conf),
+        "marker quant_group_size: 32",
+    );
+    let group_scales = |t: &mut Tensors, _: &mut Metadata, _: &Path| {
+        let s = t
+            .iter_mut()
+            .find(|(k, ..)| k.ends_with(".weight_scale"))
+            .unwrap();
+        s.2 = vec![8, 8];
+    };
+    refusal("real-comfy-w4a4", &group_scales, "not [64] or [64]+[1]");
+}
+
+#[test]
+fn comfy_empty_packed_rows_recover_large_widths_without_overflow() {
+    // These headers contain no weight bytes. Multiplying their physical widths by eight
+    // overflows even though the logical widths and every part's zero byte count fit.
+    let columns = 1u64 << 63;
+    for (format, bits, group) in [
+        ("convrot_w4a4", 4, None),
+        ("asym_w4a8_int8", 4, Some(16)),
+        ("w6a8_int8", 6, Some(32)),
+    ] {
+        let width = if bits == 4 {
+            columns / 2
+        } else {
+            (columns / 4) * 3
+        };
+        let (_dir, ck) = edited("empty-comfy-width", &|t, _, _| {
+            let conf = match group {
+                Some(g) => serde_json::json!({
+                    "format": format, "convrot_groupsize": 256, "group_size": g
+                }),
+                None => serde_json::json!({
+                    "format": format, "convrot_groupsize": 256
+                }),
+            };
+            t.push(marker("proj", conf));
+            t.push(("norm.weight".into(), "BF16".into(), vec![1], vec![0; 2]));
+            t.push(("proj.weight".into(), "I8".into(), vec![0, width], vec![]));
+            match group {
+                None => t.push(("proj.weight_scale".into(), "F32".into(), vec![0], vec![])),
+                Some(g) => {
+                    t.push((
+                        "proj.weight_s_rel".into(),
+                        "F32".into(),
+                        vec![0, columns / g],
+                        vec![],
+                    ));
+                    t.push((
+                        "proj.weight_s_channel".into(),
+                        "F32".into(),
+                        vec![0],
+                        vec![],
+                    ));
+                }
+            }
+        });
+        assert_eq!(
+            ck.tensor("model", "proj.weight").unwrap().shape,
+            [0, columns]
+        );
+    }
+    for (format, width, why) in [
+        ("convrot_w4a4", 1u64 << 63, "packed logical width overflow"),
+        (
+            "w6a8_int8",
+            (1u64 << 62) * 3,
+            "packed logical width overflow",
+        ),
+        ("w6a8_int8", 1u64 << 61, "not 6-bit rows"),
+    ] {
+        let e = refused("invalid-comfy-width", &|t, _, _| {
+            t.push(marker(
+                "proj",
+                serde_json::json!({"format": format, "convrot_groupsize": 256}),
+            ));
+            t.push(("norm.weight".into(), "BF16".into(), vec![1], vec![0; 2]));
+            t.push(("proj.weight".into(), "I8".into(), vec![0, width], vec![]));
+            if format == "convrot_w4a4" {
+                t.push(("proj.weight_scale".into(), "F32".into(), vec![0], vec![]));
+            } else {
+                t.push(("proj.weight_s_rel".into(), "F32".into(), vec![0, 1], vec![]));
+                t.push((
+                    "proj.weight_s_channel".into(),
+                    "F32".into(),
+                    vec![0],
+                    vec![],
+                ));
+            }
+        });
+        assert_eq!(e.code, Code::MISSING_COMPANION_ROLE, "{}", e.detail);
+        assert!(e.detail.contains(why), "{format}: {}", e.detail);
+    }
 }

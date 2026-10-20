@@ -50,23 +50,32 @@ allocations, but that executor still needs its own model objects and CUDA contex
 - 4-byte big-endian length + JSON, any size. `seam::MAX_FRAME` (256 MiB, as Runtime's
   `seam.MAX_FRAME`) refuses only a corrupt or hostile prefix. Bulk data goes through the spool.
 - Any outgoing object key named `token`, `credential`, `authorization`, `secret` or `jwt` is
-  refused. Credentials cannot cross the seam.
+  refused, except `tensorfs.token` on `load`, `invoke` and `bearer`: the request's owner bearer.
 - Commands (`cmd`): `hello`, `start`, `load`, `activate`, `prepare_request`, `invoke`, `budget`,
-  `prefetch`, `share`, `revoke`, `unload`, `probe`, `shutdown`. The usual sequence is
+  `unload`, `probe`, `shutdown`. The usual sequence is
   Hello -> Start -> Load -> Activate -> PrepareRequest -> Invoke.
+- `bearer` (`{"cmd":"bearer","actor","tensorfs":{"endpoint","token","expires_unix_ms"}}`) goes
+  outside any exchange, at any time (a `Line`, under the lock every write takes), and is
+  answered by nothing. TensorD sends it to each executor a Load or Invoke gave that signer's
+  token for that endpoint (the same string), whenever `hub::Bearer` holds a newer one. The
+  Runtime routes it as it reads it, like a cancel, and keeps per signer and endpoint the token
+  that expires latest (0: unknown, replaces); a call's TensorFS provider presents it per request
+  and asks once more after a 401 for a token replaced in flight. Load and Invoke name `actor`.
+  A Runtime without the handler answers `reply: bearer`, which TensorD ignores.
 - While waiting for a reply, `event=progress` frames go to `Services::progress`. `event=request`
   frames (optionally with an `SCM_RIGHTS` fd) go to `Services::request`. The reply must name the
   command, otherwise it is an error. Unknown events and fields are ignored.
 - `Baseline` services answer every request `capability_unavailable`.
-- A successful `model_source_read` answer must pass a read-only regular-file fd of the declared length.
-- `device_tier` requests carry `descriptors: N` and are followed by N fds (an offer's exported GPU
-  chunks); the answer names its own `descriptors` and the fds follow it (an ask that is `held`).
-  They go to `Services::device_tier` ([resident custody](RESIDENT-CUSTODY.md)).
+- `Start.ledgers` counts rank grants. Each grant follows the command as three descriptors:
+  the shared placement table, its eventfd, and a private custody/RAM channel. Each Runtime
+  rank claims its own row after it exists; TensorD does not open a CUDA context.
+- Runtime replies carry typed `memory` measurements and their placement trace. GPU pages
+  are retained by the [placement library](../../varena/src/ledger.rs), not by seam callbacks.
 
 ## Capabilities
 
-The oldest Runtime is 0.27.0, which takes every command and field here; `Hello.memory` is not
-read. Hello's version fields are provenance only. There is no SDK or TensorFS version gate.
+The placement stack uses the paired Runtime's three-descriptor rank grants. Hello's version
+fields remain provenance; admission never uses a version-number gate.
 
 ## Observations
 

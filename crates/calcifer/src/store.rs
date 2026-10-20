@@ -18,10 +18,8 @@ use protocol::{
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
-/// The version at which runs' specs and outcomes are JSON.
-/// The store's version (`PRAGMA user_version`), and the schema a new store is made with. A store
-/// at an older version is from before cozy 0.9.4, which this cozy does not read.
-const VERSION: i64 = 5;
+/// Version 6 adds checkpoint references to version 5's JSON specs and outcomes.
+const VERSION: i64 = 6;
 const SCHEMA: &str = "
     CREATE TABLE machines (
         name TEXT PRIMARY KEY,
@@ -88,6 +86,7 @@ const SCHEMA: &str = "
         seq INTEGER NOT NULL,
         failed_rev INTEGER,
         export_error TEXT,
+        checkpoint TEXT,
         PRIMARY KEY (run, name, idx)
     ) STRICT, WITHOUT ROWID;
     CREATE INDEX outputs_unexported ON outputs (run) WHERE exported_rev IS NOT rev;
@@ -117,7 +116,7 @@ pub enum StoreError {
     #[error("Calcifer's store: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error(
-        "Calcifer's store is at version {0}: this cozy reads version 5, the stores of cozy 0.9.4 on"
+        "Calcifer's store is at version {0}: this cozy reads versions 5 and 6, the stores of cozy 0.9.4 on"
     )]
     Version(i64),
     #[error("idempotency key {0:?} already names another submission")]
@@ -283,6 +282,7 @@ pub struct OutputRow {
     pub exported_rev: Option<u64>,
     /// Why this revision will not be exported.
     pub export_error: Option<String>,
+    pub checkpoint: Option<v1::CheckpointRef>,
 }
 
 /// The store: writes on one connection, one at a time, each commit durable; reads on their own,
@@ -305,6 +305,12 @@ impl Store {
             0 => {
                 let tx = writer.transaction()?;
                 tx.execute_batch(SCHEMA)?;
+                tx.pragma_update(None, "user_version", VERSION)?;
+                tx.commit()?;
+            }
+            5 => {
+                let tx = writer.transaction()?;
+                tx.execute_batch("ALTER TABLE outputs ADD COLUMN checkpoint TEXT")?;
                 tx.pragma_update(None, "user_version", VERSION)?;
                 tx.commit()?;
             }
@@ -959,6 +965,7 @@ impl Store {
                         rev: item.rev,
                         length: item.length,
                         appended_from: None,
+                        checkpoint: item.checkpoint.clone(),
                     }
                 });
             }
@@ -985,7 +992,7 @@ impl Store {
             let mut statement = conn.prepare(
                 "SELECT DISTINCT runs.id, runs.number FROM outputs JOIN runs ON runs.id = outputs.run
                  WHERE outputs.exported_rev IS NOT outputs.rev AND outputs.failed_rev IS NOT outputs.rev
-                   AND outputs.media_type IS NOT ?1
+                   AND outputs.media_type IS NOT ?1 AND outputs.checkpoint IS NULL
                  ORDER BY runs.number",
             )?;
             let rows = statement
@@ -1006,6 +1013,7 @@ impl Store {
                  FROM outputs JOIN runs ON runs.id = outputs.run
                  WHERE runs.machine = ?1 AND outputs.exported_rev IS NOT outputs.rev
                    AND outputs.failed_rev IS NOT outputs.rev AND outputs.media_type IS NOT ?2
+                   AND outputs.checkpoint IS NULL
                  ORDER BY runs.number, outputs.created_seq",
             )?;
             let rows = statement
@@ -1035,12 +1043,12 @@ impl Store {
     }
 
     /// The run's outputs to export, in the order they first appeared. A checkpoint is never
-    /// exported: it stays on its machine (`OutputItem::is_checkpoint`), so it is owed nowhere.
+    /// exported (`OutputItem::is_checkpoint`), so it is owed nowhere.
     pub fn outputs_to_export(&self, run: &str) -> Result<Vec<OutputRow>> {
         self.read(|conn| {
             let mut statement = conn.prepare(&format!(
                 "SELECT {OUTPUT_COLUMNS} FROM outputs WHERE run = ?1 AND exported_rev IS NOT rev
-                 AND failed_rev IS NOT rev AND media_type IS NOT ?2 ORDER BY created_seq"
+                 AND failed_rev IS NOT rev AND media_type IS NOT ?2 AND checkpoint IS NULL ORDER BY created_seq"
             ))?;
             Ok(statement
                 .query_map([run, CHECKPOINT], output_row)?
@@ -1147,7 +1155,21 @@ fn export_settled(
 }
 
 const OUTPUT_COLUMNS: &str = "name, idx, rev, length, digest, media_type, done, path, exported_rev,
-    CASE WHEN failed_rev = rev THEN export_error END";
+    CASE WHEN failed_rev = rev THEN export_error END, checkpoint";
+
+fn checkpoint_ref(row: &Row, column: usize) -> rusqlite::Result<Option<v1::CheckpointRef>> {
+    row.get::<_, Option<String>>(column)?
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
+}
 
 fn output_row(r: &Row) -> rusqlite::Result<OutputRow> {
     Ok(OutputRow {
@@ -1161,6 +1183,7 @@ fn output_row(r: &Row) -> rusqlite::Result<OutputRow> {
         path: r.get::<_, Option<String>>(7)?.map(PathBuf::from),
         exported_rev: r.get::<_, Option<i64>>(8)?.map(|rev| rev as u64),
         export_error: r.get(9)?,
+        checkpoint: checkpoint_ref(r, 10)?,
     })
 }
 
@@ -1567,22 +1590,36 @@ fn put_output(tx: &Transaction, row: &RunRow, product: &v1::Product) -> Result<V
         return Ok(vec![]);
     }
     let seq = next_seq(tx, id)?;
+    let checkpoint = product
+        .checkpoint
+        .as_ref()
+        .map(|c| serde_json::to_string(c).expect("serializes"));
+    let (length, digest, media_type, duration_us) = match product.checkpoint {
+        Some(_) => (0, "", "", 0),
+        None => (
+            product.length,
+            product.digest.as_str(),
+            product.media_type.as_str(),
+            product.duration_us,
+        ),
+    };
     tx.execute(
-        "INSERT INTO outputs (run, name, idx, rev, length, digest, media_type, label, duration_us, created_seq, seq)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+        "INSERT INTO outputs (run, name, idx, rev, length, digest, media_type, label, duration_us, created_seq, seq, checkpoint)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11)
          ON CONFLICT (run, name, idx) DO UPDATE SET rev = ?4, length = ?5, digest = ?6, media_type = ?7,
-             label = ?8, duration_us = ?9, seq = ?10",
+             label = ?8, duration_us = ?9, seq = ?10, checkpoint = ?11",
         params![
             id,
             product.output,
             index,
             product.rev as i64,
-            product.length as i64,
-            product.digest,
-            product.media_type,
+            length as i64,
+            digest,
+            media_type,
             product.label,
-            product.duration_us as i64,
+            duration_us as i64,
             seq as i64,
+            checkpoint,
         ],
     )?;
     let run = record(tx, row)?;
@@ -1606,8 +1643,9 @@ fn put_output(tx: &Transaction, row: &RunRow, product: &v1::Product) -> Result<V
             output_index,
             item_id: item.id,
             rev: product.rev,
-            length: product.length,
-            appended_from: product.appended_from,
+            length: item.length,
+            appended_from: product.appended_from.filter(|_| item.checkpoint.is_none()),
+            checkpoint: item.checkpoint,
         },
     }])
 }
@@ -1616,7 +1654,8 @@ fn put_output(tx: &Transaction, row: &RunRow, product: &v1::Product) -> Result<V
 fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
     let mut statement = conn.prepare(
         "SELECT name, idx, rev, length, digest, media_type, label, done,
-             CASE WHEN exported_rev = rev THEN path END, CASE WHEN failed_rev = rev THEN export_error END
+             CASE WHEN exported_rev = rev THEN path END, CASE WHEN failed_rev = rev THEN export_error END,
+             checkpoint
          FROM outputs WHERE run = ?1 ORDER BY created_seq",
     )?;
     let settled_ok = row.status == Some(Status::Completed);
@@ -1626,6 +1665,7 @@ fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
         let digest: String = r.get(4)?;
         let done: bool = r.get(7)?;
         let path: Option<String> = r.get(8)?;
+        let checkpoint = checkpoint_ref(r, 10)?;
         let id = match index {
             0 => format!("{}/{name}", row.number),
             i => format!("{}/{name}/{i}", row.number),
@@ -1643,12 +1683,15 @@ fn record(conn: &Connection, row: &RunRow) -> Result<Run> {
             length: r.get::<_, i64>(3)? as u64,
             media_type: r.get(5)?,
             label: r.get(6)?,
-            sha256: (status == ItemStatus::Completed)
+            sha256: (status == ItemStatus::Completed && checkpoint.is_none())
                 .then(|| digest.parse().ok())
                 .flatten(),
             status,
-            path: path.map(PathBuf::from),
-            export_error: r.get(9)?,
+            path: path.filter(|_| checkpoint.is_none()).map(PathBuf::from),
+            export_error: r
+                .get::<_, Option<String>>(9)?
+                .filter(|_| checkpoint.is_none()),
+            checkpoint,
         })
     })?;
     Ok(Run {
