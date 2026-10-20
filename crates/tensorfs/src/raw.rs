@@ -29,9 +29,10 @@ pub async fn fetch_objects(
 /// Fill caller-owned host or device destinations through the existing byte engine.
 ///
 /// # Safety
-/// Every destination must be valid for the complete transfer and remain owned until
-/// this call completes, including its error path. Device pointers and streams must
-/// satisfy the same requirements as [`crate::io::read`].
+/// Every source and destination must satisfy [`crate::io::read`]'s ownership and
+/// pointer requirements. An error does not prove GPU completion: retain device
+/// destinations and direct host/device source owners until [`crate::io::drain`]
+/// succeeds for every participating device and any producer stream also drains.
 #[allow(unsafe_code)]
 pub unsafe fn read_into(
     checkpoint: &crate::Checkpoint,
