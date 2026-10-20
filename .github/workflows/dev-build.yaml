@@ -207,7 +207,7 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.runtime_run }}
           name: cozy-runtime-${{ inputs.runtime_ref }}
-          path: ${{ runner.temp }}/runtime
+          path: ${{ runner.temp }}/runtime-artifact
       - name: Verify native Runtime source and bytes
         if: inputs.runtime_run != ''
         env:
@@ -220,11 +220,14 @@ jobs:
           import json
           import os
           import pathlib
+          import shutil
           import zipfile
           from email.parser import BytesParser
 
-          wheels = list((pathlib.Path(os.environ["RUNNER_TEMP"]) / "runtime").glob("cozy_runtime-*.whl"))
-          assert len(wheels) == 1, "expected one selected Runtime wheel"
+          temporary = pathlib.Path(os.environ["RUNNER_TEMP"])
+          wheels = [path for path in (temporary / "runtime-artifact").glob("cozy_runtime-*.whl")
+                    if hashlib.file_digest(path.open("rb"), "sha256").hexdigest() == os.environ["NATIVE_RUNTIME_SHA256"]]
+          assert len(wheels) == 1, "expected one Runtime wheel matching the selected hash"
           wheel = wheels[0]
           digest = hashlib.file_digest(wheel.open("rb"), "sha256").hexdigest()
           assert digest == os.environ["NATIVE_RUNTIME_SHA256"], "Runtime wheel hash mismatch"
@@ -239,6 +242,10 @@ jobs:
               assert BytesParser().parsebytes(archive.read(metadata[0]))["Root-Is-Purelib"] == "false"
               modules = [f"cozy_runtime/_kernels/{name}.abi3.so" for name in ("_gemm", "_norm", "_fa3")]
               assert all(archive.read(name).startswith(b"\x7fELF") for name in modules), "missing native Runtime modules"
+          selected = temporary / "runtime"
+          selected.mkdir(exist_ok=True)
+          assert not list(selected.glob("*.whl")), "Runtime selection was already populated"
+          shutil.copyfile(wheel, selected / wheel.name)
           print(json.dumps({"runtime_source": commits[0], "wheel_sha256": digest, "native_modules": modules}))
           PY
       # Without runtime_ref, the Runtime machines install today: the newest published wheel.
