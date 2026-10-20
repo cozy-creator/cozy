@@ -1,84 +1,59 @@
-//! `tensorfs.varena` on Windows: the plane is a Unix mechanism (weight sets cross processes as
-//! descriptors) and its Windows tier does not exist yet (xs-043 unit WM). Every name imports;
-//! constructing or calling one raises `Unsupported`.
-
+//! CPU-only wheels keep the placement import surface, without pretending to provide a GPU
+//! ledger on Windows. TensorFS reading remains available independently.
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
-create_exception!(tensorfs.varena, PlaneError, PyException, "A weight-plane error; `.code` names its class.");
-create_exception!(tensorfs.varena, BudgetExceeded, PlaneError);
-create_exception!(tensorfs.varena, Shortfall, PlaneError);
-create_exception!(tensorfs.varena, BelowFloor, PlaneError);
-create_exception!(tensorfs.varena, LeaseViolation, PlaneError);
-create_exception!(tensorfs.varena, Poisoned, PlaneError);
-create_exception!(tensorfs.varena, CudaError, PlaneError);
-create_exception!(tensorfs.varena, CudaUnavailable, PlaneError);
-create_exception!(tensorfs.varena, Invalid, PlaneError);
-create_exception!(tensorfs.varena, IoError, PlaneError);
-create_exception!(tensorfs.varena, Closed, PlaneError);
-create_exception!(tensorfs.varena, Unsupported, PlaneError);
-
-fn unsupported(py: Python<'_>) -> PyErr {
-    let error = Unsupported::new_err("the weight plane has no Windows tier yet; read objects through Store leases");
+create_exception!(
+    tensorfs.varena,
+    VarenaError,
+    PyException,
+    "A placement error; code and sticky describe recovery."
+);
+create_exception!(tensorfs.varena, Unsupported, VarenaError);
+fn unavailable(py: Python<'_>) -> PyErr {
+    let error = Unsupported::new_err("GPU placement has no Windows tier yet");
     let _ = error.value(py).setattr("code", "UNSUPPORTED");
+    let _ = error.value(py).setattr("sticky", false);
     error
 }
-
-macro_rules! unconstructible {
-    ($($rust:ident = $name:literal),*) => {$(
-        #[pyclass(name = $name, module = "tensorfs.varena", frozen)]
+macro_rules! unavailable_type {
+    ($($rust:ident=$name:literal),* $(,)?)=>{$(
+        #[pyclass(name=$name,module="tensorfs.varena",frozen)]
         struct $rust;
-
         #[pymethods]
         impl $rust {
             #[new]
-            #[pyo3(signature = (*_args, **_kwargs))]
-            fn new(py: Python<'_>, _args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-                Err(unsupported(py))
-            }
+            #[pyo3(signature=(*_args,**_kwargs))]
+            fn new(py:Python<'_>,_args:&Bound<'_,PyTuple>,_kwargs:Option<&Bound<'_,PyDict>>)->PyResult<Self>{Err(unavailable(py))}
         }
     )*};
 }
-
-unconstructible!(Plane = "Plane", Source = "Source", WeightSet = "WeightSet", Ticket = "Ticket",
-    Lease = "Lease", Cursor = "Cursor", DeviceView = "DeviceView");
-
-macro_rules! refused {
-    ($($name:ident),*) => {$(
-        #[pyfunction]
-        #[pyo3(signature = (*_args, **_kwargs))]
-        fn $name(py: Python<'_>, _args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
-            Err(unsupported(py))
-        }
-    )*};
+unavailable_type!(
+    Plane = "Plane",
+    WeightSet = "WeightSet",
+    Pinned = "Pinned",
+    Part = "Part",
+    Copy = "Copy"
+);
+#[pyfunction]
+fn copies() -> Vec<Py<PyAny>> {
+    Vec::new()
 }
-
-refused!(hold_tier, release_tier, reserve);
-
 pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
     let m = PyModule::new(py, "varena")?;
     m.add_class::<Plane>()?;
-    m.add_class::<Source>()?;
     m.add_class::<WeightSet>()?;
-    m.add_class::<Ticket>()?;
-    m.add_class::<Lease>()?;
-    m.add_class::<Cursor>()?;
-    m.add_class::<DeviceView>()?;
-    m.add_function(wrap_pyfunction!(hold_tier, &m)?)?;
-    m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
-    m.add_function(wrap_pyfunction!(reserve, &m)?)?;
-    #[cfg(feature = "store")]
-    m.add_function(wrap_pyfunction!(crate::store::regions, &m)?)?;
-    m.add("SEALED_WHILE_FILLING", false)?;
-    m.add("SEALED_HOLES", false)?;
-    macro_rules! add_errors {
-        ($($e:ident),*) => { $(m.add(stringify!($e), py.get_type::<$e>())?;)* };
-    }
-    add_errors!(PlaneError, BudgetExceeded, Shortfall, BelowFloor, LeaseViolation, Poisoned, CudaError,
-        CudaUnavailable, Invalid, IoError, Closed, Unsupported);
+    m.add_class::<Pinned>()?;
+    m.add_class::<Part>()?;
+    m.add_class::<Copy>()?;
+    m.add_function(wrap_pyfunction!(copies, &m)?)?;
+    m.add("VarenaError", py.get_type::<VarenaError>())?;
+    m.add("Unsupported", py.get_type::<Unsupported>())?;
     parent.add_submodule(&m)?;
-    py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.varena", &m)
+    py.import("sys")?
+        .getattr("modules")?
+        .set_item("tensorfs._ext.varena", &m)
 }
