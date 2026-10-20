@@ -13,7 +13,7 @@ import threading
 import traceback
 import weakref
 from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol, TypeAlias
@@ -432,8 +432,20 @@ class Cache:
         if self.memory.native is not None:
             self.memory.native.cache_bytes(self.id, value)
 
-    def serving(self) -> AbstractContextManager[None]:
-        return cuts.caught() if self.memory.cuda else nullcontext()
+    @contextmanager
+    def serving(self) -> Iterator[None]:
+        native = self.memory.native
+        if native is not None:
+            native.cache_active(self.id, True)
+            request = self.memory._current()
+            for hold in self.holds:
+                native.retained_bind(request.native_id, hold.model.ws.id)
+        try:
+            with cuts.caught() if self.memory.cuda else nullcontext():
+                yield
+        finally:
+            if native is not None and not self.closed:
+                native.cache_active(self.id, False)
 
     def hold(self, model: Model) -> Hold:
         if model.home_bytes() < model.nbytes:
