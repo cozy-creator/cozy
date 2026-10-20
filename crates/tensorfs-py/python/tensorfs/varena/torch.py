@@ -1144,6 +1144,9 @@ class Memory:
     def free(self, device: torch.device, need: int) -> bool:
         if self.native is None or device != self.device:
             return False
+        # Inner arithmetic can allocate since the last model boundary. Relief
+        # must see those live allocations before deciding whether room exists.
+        self._measure()
         outcome = self.native.relief(self._current().native_id, need, False)
         # Relief may release another owner's pages or allocator slack. The next
         # allocation must see that room in Torch's ceiling too, even after a cut.
@@ -1153,6 +1156,7 @@ class Memory:
     def lower(self, device: torch.device, need: int) -> bool:
         if self.native is None or device != self.device:
             return False
+        self._measure()
         outcome = self.native.relief(self._current().native_id, need, True)
         self._measure()
         return outcome[0] == "complete"

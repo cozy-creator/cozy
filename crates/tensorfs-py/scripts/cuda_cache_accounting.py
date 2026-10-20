@@ -13,6 +13,24 @@ memory = Memory.open(device)
 owned: list[torch.Tensor] = []
 
 
+class ObservedPlane:
+    def __init__(self, plane, available: int, growth: int) -> None:
+        self.plane, self.available, self.growth = plane, available, growth
+        self.observed: list[int] = []
+
+    def __getattr__(self, name: str):
+        return getattr(self.plane, name)
+
+    def relief(self, *args):
+        available = self.plane.available()
+        self.observed.append(available)
+        assert self.available - available == self.growth, (
+            "relief saw stale live CUDA allocations",
+            self.available, available, self.growth,
+        )
+        return self.plane.relief(*args)
+
+
 def shrink(_need: int) -> int:
     before = torch.cuda.memory_allocated(device)
     owned.clear()
@@ -116,6 +134,30 @@ try:
     finally:
         memory.limit_bytes = original_limit
         memory._measure()
+
+    # Real allocations between model boundaries must reach the placement policy
+    # before it decides whether relief is necessary. Observe the real plane at
+    # that boundary; no allocator, policy decision or allocation is simulated.
+    for lowering in (False, True):
+        with memory.request(f"current-allocations-before-relief-{lowering}") as current:
+            torch.cuda.empty_cache()
+            memory._measure()
+            available = memory.available()
+            reserved = torch.cuda.memory_reserved(device)
+            temporary = torch.empty(8 << 20, dtype=torch.uint8, device=device)
+            growth = torch.cuda.memory_reserved(device) - reserved
+            assert growth >= 8 << 20
+            plane = memory.native
+            assert plane is not None
+            observer = ObservedPlane(plane, available, growth)
+            memory.native = observer
+            try:
+                (memory.lower if lowering else memory.free)(device, 1)
+            finally:
+                memory.native = plane
+                del temporary
+            assert len(observer.observed) == 1
+        assert current.stats is not None and current.stats.leftover == ((0, 0),)
 finally:
     owned.clear()
     cache.close()
