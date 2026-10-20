@@ -440,6 +440,18 @@ impl Stream {
     pub fn device(&self) -> i32 {
         self.device
     }
+    /// Wait for work previously ordered onto this stream in its retained primary context.
+    ///
+    /// Only success proves completion. On error, callers must retain this stream and every
+    /// producer/allocation owner whose release requires that work to have stopped. Best-effort
+    /// destruction is not a substitute for this checked ownership boundary.
+    pub fn drain(&self) -> Result<()> {
+        let driver = driver()?;
+        let _context = CtxGuard::enter(self.ctx)?;
+        check("cuStreamSynchronize", unsafe {
+            (driver.stream_synchronize)(self.raw)
+        })
+    }
     pub(crate) fn context(&self) -> CUcontext {
         self.ctx
     }
@@ -521,7 +533,9 @@ impl HostPin {
         if self.owned {
             let driver = driver()?;
             let _context = CtxGuard::enter(self.ctx)?;
-            check("cuMemHostUnregister", unsafe { (driver.mem_host_unregister)(self.ptr) })?;
+            check("cuMemHostUnregister", unsafe {
+                (driver.mem_host_unregister)(self.ptr)
+            })?;
             self.owned = false;
         }
         Ok(())
