@@ -1096,3 +1096,64 @@ fn dropped_public_convert_wakes_stalled_io_without_restarting_the_callers_curren
     );
     assert!(actual_headers(&scratch.0.join("cache/blobs")).is_empty());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_objects_before_header(
+) {
+    let scratch = Scratch::new();
+    let folder = fixture(&scratch.0);
+    let endpoint = scratch.0.join("endpoint");
+    let producer = client(&scratch.0.join("source-cache"), &endpoint);
+    let plain = producer
+        .open(folder.to_str().unwrap(), &Open::default())
+        .await
+        .unwrap();
+    let chunk = folder.join("chunks").join(&ObjectRef::of(WEIGHT).sha256);
+    fs::write(&chunk, [0, 0, 0, 0]).unwrap();
+    let bad_chunk = scratch.0.join("bad-chunk-export");
+    assert_eq!(
+        export(&plain, &bad_chunk, Format::Cozytensors, None)
+            .unwrap_err()
+            .kind,
+        Kind::Integrity
+    );
+    assert!(
+        !bad_chunk.join("model.cozytensors").exists(),
+        "corrupt source published a portable header"
+    );
+    assert!(
+        !bad_chunk
+            .join("chunks")
+            .join(&ObjectRef::of(WEIGHT).sha256)
+            .exists(),
+        "corrupt object was atomically named as valid"
+    );
+    fs::write(&chunk, WEIGHT).unwrap();
+    export(&plain, &bad_chunk, Format::Cozytensors, None).unwrap();
+    let tree = producer
+        .upload_folder(&"acme/integrity".parse().unwrap(), &folder, None)
+        .await
+        .unwrap();
+    let cache = scratch.0.join("reader-cache");
+    let reader = client(&cache, &endpoint);
+    let managed = reader.open(&tree.id(), &Open::default()).await.unwrap();
+    managed.fetch(&Fetch::default()).await.unwrap();
+    let readme = cache.join(ObjectRef::of(README).key());
+    fs::write(&readme, vec![b'!'; README.len()]).unwrap();
+    let bad_repo = scratch.0.join("bad-repo-export");
+    assert_eq!(
+        export(&managed, &bad_repo, Format::Cozytensors, None)
+            .unwrap_err()
+            .kind,
+        Kind::Integrity
+    );
+    assert!(!bad_repo.join("model.cozytensors").exists());
+    assert!(!bad_repo.join("README.bin").exists());
+    fs::write(readme, README).unwrap();
+    export(&managed, &bad_repo, Format::Cozytensors, None).unwrap();
+    assert_eq!(fs::read(bad_repo.join("README.bin")).unwrap(), README);
+    assert_eq!(
+        ObjectRef::of(&fs::read(bad_repo.join("model.cozytensors")).unwrap()),
+        *managed.id()
+    );
+}

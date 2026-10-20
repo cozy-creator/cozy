@@ -51,6 +51,7 @@ pub const SHARD: u64 = 20_000_000_000;
 pub(crate) fn cozytensors(
     ck: &Checkpoint,
     repo: &BTreeMap<String, PathBuf>,
+    repo_objects: &BTreeMap<String, ObjectRef>,
     dir: &Path,
     variant: &str,
     header: &[u8],
@@ -67,18 +68,24 @@ pub(crate) fn cozytensors(
     for object in ck.header().objects() {
         let path = format!("{}/{}", crate::format::CHUNKS_DIR, object.sha256);
         if let std::collections::btree_map::Entry::Vacant(entry) = sources.entry(path) {
-            entry.insert(ck.object(object)?);
+            entry.insert((ck.object(object)?, Some(object.clone())));
         }
     }
     for (name, path) in repo {
         crate::format::check_file(name)?;
         if variant_of(name).is_none() {
-            sources.insert(name.clone(), File::open(path).map_err(|e| io(path, e))?);
+            sources.insert(
+                name.clone(),
+                (
+                    File::open(path).map_err(|e| io(path, e))?,
+                    repo_objects.get(name).cloned(),
+                ),
+            );
         }
     }
     let mut written = Vec::new();
-    for (name, mut source) in sources {
-        copy(&mut source, &dir.join(&name))?;
+    for (name, (mut source, expected)) in sources {
+        copy_checked(&mut source, &dir.join(&name), expected.as_ref())?;
         written.push(name);
     }
     write(&dir.join(&header_path), header)?;
@@ -305,6 +312,23 @@ fn write(dest: &Path, bytes: &[u8]) -> Result<()> {
 
 /// An asset or repo file, byte-exact.
 fn copy(from: &mut File, dest: &Path) -> Result<()> {
+    copy_checked(from, dest, None)
+}
+
+struct Hashing<'a> {
+    source: &'a mut File,
+    hash: crate::sha256::Sha256,
+}
+
+impl Read for Hashing<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.source.read(buf)?;
+        self.hash.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+fn copy_checked(from: &mut File, dest: &Path, expected: Option<&ObjectRef>) -> Result<()> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let parent = dest.parent().expect("a file has a directory");
     fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
@@ -320,9 +344,29 @@ fn copy(from: &mut File, dest: &Path) -> Result<()> {
             Err(e) => return Err(io(&temp, e)),
         }
     };
-    let result = io::copy(from, &mut out)
-        .and_then(|_| out.sync_all())
-        .map_err(|e| io(&temp, e));
+    let mut source = Hashing {
+        source: from,
+        hash: crate::sha256::Sha256::new(),
+    };
+    let result = io::copy(&mut source, &mut out)
+        .map_err(|e| io(&temp, e))
+        .and_then(|length| {
+            if let Some(expected) = expected {
+                if length != expected.length
+                    || crate::sha256::hex(&source.hash.finish()) != expected.sha256
+                {
+                    return fail(
+                        Kind::Integrity,
+                        format!(
+                            "{}: copied bytes differ from {}",
+                            dest.display(),
+                            expected.id()
+                        ),
+                    );
+                }
+            }
+            out.sync_all().map_err(|e| io(&temp, e))
+        });
     drop(out);
     let result = result.and_then(|()| fs::rename(&temp, dest).map_err(|e| io(dest, e)));
     if result.is_err() {
