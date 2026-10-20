@@ -117,6 +117,7 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
         for command in [
             start(&generation, &interface, false),
             DeviceCommand::Load {
+                tensorfs: None,
                 construction: "lifecycle".into(),
                 devices: String::new(),
                 sequence_parallel_degree: 1,
@@ -163,6 +164,11 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
         let reply = child
             .command(
                 &DeviceCommand::Invoke {
+                    tensorfs: None,
+                    weights: Default::default(),
+                    destination: String::new(),
+                    actor: String::new(),
+                    operation: String::new(),
                     max_output_bytes: tensord::output_capacity::DEFAULT_BYTES,
                     request_id: "forked".into(),
                     construction: "lifecycle".into(),
@@ -179,7 +185,6 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
                     squeezed_bytes: Default::default(),
                     device_weights: None,
                     sources: Default::default(),
-                    weights: Default::default(),
                 },
                 &mut Baseline,
             )

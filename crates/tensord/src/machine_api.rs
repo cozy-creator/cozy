@@ -487,6 +487,9 @@ impl MachineBackend for NativeBackend {
             .filter(|p| p.output == output && p.op == op as i32 && p.index == position)
             .collect();
         let current = revisions.last().ok_or_else(absent)?;
+        if current.checkpoint.is_some() {
+            return Err(Error::validation("output_is_a_checkpoint", "checkpoint outputs are TensorFS references"));
+        }
         let content = current
             .content
             .as_ref()
@@ -1128,13 +1131,15 @@ fn output_entries(products: &[domain::RunProduct]) -> Result<Vec<Value>, Error> 
         } else {
             product.output.clone()
         };
-        let entry = json!({
+        let entry = if let Some(checkpoint) = &product.checkpoint {
+            json!({"output_id": output_id, "checkpoint": checkpoint})
+        } else { json!({
             "output_id":output_id,
             "digest":document["content"]["digest"],
             "length":document["content"]["length"],
             "mime_type":product.media_type,
             "native_tree":document["source"]["source"]
-        });
+        }) };
         if entries.insert(output_id, entry).is_some() {
             return Err(Error::internal("custody_corrupt", "output binding path is ambiguous"));
         }
@@ -1224,6 +1229,9 @@ print(json.dumps({"identity": generation.identity}))
                 let answer =
                     crate::products::publish(self.store, self.engine, self.id, &self.spool, frame);
                 return Ok((answer, None));
+            }
+            if frame.kind == device_executor::Kind::CheckpointItem {
+                return Ok((crate::products::checkpoint(self.engine, self.id, frame), None));
             }
             Ok((device_executor::Answer::unavailable(frame.seq), None))
         }
@@ -1399,6 +1407,7 @@ print(json.dumps({"identity": generation.identity}))
                     command(
                         &mut executor,
                         &DeviceCommand::Load {
+                            tensorfs: None,
                             construction: "fixture".into(),
                             devices: String::new(),
                             sequence_parallel_degree: 1,
@@ -1441,6 +1450,11 @@ print(json.dumps({"identity": generation.identity}))
                     let spool = engine.staging(&id)?;
                     let reply = executor.command(
                         &DeviceCommand::Invoke {
+                            tensorfs: None,
+                            weights: Default::default(),
+                            destination: String::new(),
+                            actor: String::new(),
+                            operation: String::new(),
                             max_output_bytes: crate::output_capacity::DEFAULT_BYTES,
                             request_id: id.clone(),
                             construction: "fixture".into(),
@@ -1457,7 +1471,6 @@ print(json.dumps({"identity": generation.identity}))
                             squeezed_bytes: Default::default(),
                             device_weights: None,
                             sources: Default::default(),
-                            weights: Default::default(),
                         },
                         &mut Publisher {
                             store: &task_store,

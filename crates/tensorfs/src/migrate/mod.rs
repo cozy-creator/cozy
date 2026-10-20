@@ -18,6 +18,7 @@
 //! Without a store it is a plan: the census, the names and the new bytes, from the manifest and
 //! header alone ([`hub`] fetches just those from a Hub).
 
+pub mod d10;
 pub mod hub;
 pub mod v1;
 
@@ -30,7 +31,7 @@ use crate::failure::{fail, Failure, Kind, Result};
 use crate::format::layout::{self, GRID, STANDALONE};
 use crate::format::{
     Body, Dtype, Encoding, GlobalScale, Location, NibbleOrder, ObjectRef, Release, Repo,
-    ScaleLayout, Value, HEADER_PATH,
+    ScaleLayout, Tree, Value, HEADER_PATH,
 };
 use crate::import::order::{self, constructor_order};
 use crate::import::tables;
@@ -54,7 +55,7 @@ pub struct Report {
     pub pass: bool,
     pub v1: BTreeSet<ObjectRef>,
     pub v2: BTreeSet<ObjectRef>,
-    /// The v1 manifest, and its v2 manifest once committed.
+    /// The v1 manifest, and its v2 tree (its header as `model.cozytensors`) once committed.
     pub manifests: (ObjectRef, Option<ObjectRef>),
 }
 
@@ -192,49 +193,55 @@ pub fn totals(reports: &[Report]) -> Json {
     })
 }
 
-/// `repo`'s v2 refs file from its own v1 rows alone: each release's lanes, yanked and revision,
-/// and the checkpoints no release cites, every manifest replaced by its migration. The v1
-/// manifests that did not migrate when any did not.
-pub fn refs(repo: &v1::Repo, reports: &[Report]) -> std::result::Result<Repo, Vec<String>> {
+/// `repo`'s v2 refs file from its own v1 rows alone: each release a tree of its lanes'
+/// migrations (each lane a variant, their repo files merged), its yanked and revision, and the
+/// checkpoints no release cites; the trees put in `store`. The v1 manifests that did not
+/// migrate when any did not.
+pub fn refs(store: &Store, repo: &v1::Repo, reports: &[Report]) -> Result<std::result::Result<Repo, Vec<String>>> {
     let migrated: HashMap<&ObjectRef, &ObjectRef> = (reports.iter())
         .filter(|r| r.pass)
         .filter_map(|r| Some((&r.manifests.0, r.manifests.1.as_ref()?)))
         .collect();
     let mut missing = Vec::new();
-    let mut v2 = |v1: &ObjectRef| match migrated.get(v1) {
-        Some(m) => Some((*m).clone()),
-        None => {
-            missing.push(v1.sha256.clone());
-            None
+    let mut releases = Vec::new();
+    for r in &repo.releases {
+        let mut tree = Tree::default();
+        for (lane, m) in &r.lanes {
+            let Some(one) = migrated.get(m) else {
+                missing.push(m.sha256.clone());
+                continue;
+            };
+            let one = store.tree(one)?;
+            tree.files.extend(one.repo_files().map(|(p, o)| (p.to_owned(), o.clone())));
+            tree.set_variant(lane, one.header("").expect("a migration's tree has its header").clone());
         }
-    };
-    let releases: Vec<Release> = (repo.releases.iter())
-        .map(|r| Release {
+        releases.push(Release {
             version: r.version.clone(),
-            lanes: (r.lanes.iter())
-                .filter_map(|(lane, m)| Some((lane.clone(), v2(m)?)))
-                .collect(),
+            tree: store.put_tree(&tree)?,
             yanked: r.yanked,
             revision: r.revision,
-        })
-        .collect();
+        });
+    }
     let cited: BTreeSet<&ObjectRef> = repo
         .releases
         .iter()
         .flat_map(|r| r.lanes.iter().map(|l| &l.1))
         .collect();
-    let checkpoints = (repo.checkpoints.iter())
-        .filter(|c| !cited.contains(c))
-        .filter_map(&mut v2)
-        .collect();
-    match missing.is_empty() {
+    let mut checkpoints = Vec::new();
+    for c in repo.checkpoints.iter().filter(|c| !cited.contains(c)) {
+        match migrated.get(c) {
+            Some(tree) => checkpoints.push((*tree).clone()),
+            None => missing.push(c.sha256.clone()),
+        }
+    }
+    Ok(match missing.is_empty() {
         true => Ok(Repo {
             name: repo.name.clone(),
             releases,
             checkpoints,
         }),
         false => Err(missing),
-    }
+    })
 }
 
 fn object(o: &ObjectRef) -> Json {
@@ -362,8 +369,8 @@ fn migrate(
     w.set_metadata("migrated_from", Value::Str(lane.manifest.sha256.clone()));
     for (path, file) in &files {
         match file {
-            File::Reuse(object) => w.reuse_file(path, object)?,
-            File::Bytes(bytes) => w.file(path, bytes)?,
+            File::Reuse(object) => w.repo_file(path, &src.read(object)?)?,
+            File::Bytes(bytes) => w.repo_file(path, bytes)?,
             File::Assemble { segments, object } => {
                 let mut bytes = Vec::new();
                 for s in segments {
@@ -372,24 +379,30 @@ fn migrate(
                 if ObjectRef::of(&bytes) != *object {
                     return integrity(format!("asset {path} is not {}", object.sha256));
                 }
-                w.file(path, &bytes)?
+                w.repo_file(path, &bytes)?
             }
-            File::Split { v1, component } => w.file(path, &split(v1, component)?)?,
+            File::Split { v1, component } => w.repo_file(path, &split(v1, component)?)?,
         }
     }
-    let manifest = w.commit()?;
+    let header = w.commit()?;
+    let mut tree = Tree {
+        files: w.repo_files().clone(),
+    };
+    tree.set_variant("", header.clone());
+    let manifest = store.put_tree(&tree)?;
+    store.pin(&key, &crate::store2::Pin::new(vec![manifest.clone()]))?;
     r.manifests.1 = Some(manifest.clone());
-    let ck = store.checkpoint(&manifest)?;
+    let ck = store.checkpoint(&header)?;
     r.v2.insert(manifest.clone());
-    r.v2.extend(ck.manifest().files.values().cloned());
+    r.v2.extend(tree.files.values().cloned());
     r.v2.extend(ck.header().chunks.iter().cloned());
     let new: BTreeSet<ObjectRef> = r.v2.difference(&r.v1).cloned().collect();
     let reused: BTreeSet<ObjectRef> = r.v2.intersection(&r.v1).cloned().collect();
     let mut v2_doc = json!({
         "manifest": object(&manifest),
-        "header": object(&ck.manifest().files[HEADER_PATH]),
+        "header": object(&header),
         "chunks": ck.header().chunks.len(),
-        "files": ck.manifest().files.len() - 1,
+        "files": tree.files.len() - 1,
     });
     v2_doc
         .as_object_mut()
@@ -1030,7 +1043,7 @@ fn put(
         },
         _ => Data::Plain(parts.pop().expect("a plain tensor has one part").data),
     };
-    Ok(w.put(c2, k2, &t.dtype, &t.shape, data)?)
+    Ok(w.get(c2).put(k2, &t.dtype, &t.shape, data)?)
 }
 
 /// A file of the v2 tree.
@@ -1134,7 +1147,8 @@ fn verify(
     files: &BTreeMap<String, File>,
     expected: &[(&str, &str)],
 ) -> Result<Json> {
-    let ck = store.checkpoint(manifest)?;
+    let tree = store.tree(manifest)?;
+    let ck = store.variant(manifest, Some(""))?;
     let header = ck.header();
     let (mut tensors, mut reused, mut packed, mut packed_bytes) = (0usize, 0u64, 0u64, 0u64);
     let mut misordered_parts = None;
@@ -1226,7 +1240,7 @@ fn verify(
     if let Some(what) = misordered_parts {
         return integrity(format!("order: {what}'s parts are not in v1's order"));
     }
-    let mut stored = ck.manifest().files.clone();
+    let mut stored = tree.files.clone();
     stored.remove(HEADER_PATH);
     if !stored.keys().eq(files.keys()) {
         return integrity("the v2 files are not v1's");
@@ -1234,11 +1248,11 @@ fn verify(
     for (path, file) in files {
         let same = match file {
             File::Reuse(object) => stored[path] == *object,
-            File::Bytes(bytes) => ck.file(path)? == *bytes,
+            File::Bytes(bytes) => store.read(&stored[path])? == *bytes,
             File::Assemble { object, .. } => stored[path] == *object,
             File::Split { v1, component } => {
                 let parse = |b: &[u8]| serde_json::from_slice::<Json>(b).unwrap_or_default();
-                let v2 = parse(&ck.file(path)?);
+                let v2 = parse(&store.read(&stored[path])?);
                 !v2.is_null() && v2 == parse(v1)[component.as_str()]
             }
         };
