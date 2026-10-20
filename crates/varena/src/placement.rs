@@ -35,12 +35,20 @@ pub enum Relief {
 
 #[derive(Clone, Debug)]
 pub struct Event {
+    pub sequence: u64,
     pub request: RequestId,
     pub step: u32,
+    pub model: Option<ModelId>,
     pub page: PageId,
     pub class: Class,
     pub kind: &'static str,
+    pub reason: &'static str,
     pub bytes: u64,
+    pub capacity: u64,
+    pub working_set: Option<u64>,
+    pub resident: u64,
+    pub orphan_bytes: u64,
+    pub speculative_budget: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -850,6 +858,11 @@ impl Placement {
     }
 
     fn drive(&self, request: RequestId, trigger: Trigger) -> Result<Relief> {
+        let reason = match trigger {
+            Trigger::FillLanded(_) | Trigger::PinReleased(_) => "speculation",
+            Trigger::Lower { .. } => "lower",
+            _ => "demand",
+        };
         'decide: loop {
             if self.stop.load(Ordering::Acquire) {
                 return Err(Error::Closed("placement".into()));
@@ -882,13 +895,13 @@ impl Placement {
                             }
                             return Err(invalid("unmap stayed pinned without a progress event"));
                         }
-                        self.event(request, page, "evict")?;
+                        self.event(request, page, "evict", reason)?;
                     }
                     Action::ReleaseKept(page) => {
                         let key = self.inner.lock().orphaned.get(&page).copied();
                         if let Some(key) = key {
                             self.channel.release_orphan(self.row.owner(), key)?;
-                            self.event(request, page, "orphan")?;
+                            self.event(request, page, "evict", "orphan")?;
                         }
                     }
                     Action::Trim(page) => {
@@ -1023,26 +1036,54 @@ impl Placement {
             .unwrap_or(0)
     }
 
-    fn event(&self, request: RequestId, page: PageId, kind: &'static str) -> Result<()> {
+    fn event(
+        &self,
+        request: RequestId,
+        page: PageId,
+        kind: &'static str,
+        reason: &'static str,
+    ) -> Result<()> {
         let mut inner = self.inner.lock();
-        let facts = inner
+        let (class, bytes, model) = inner
             .table
             .page(page)
-            .ok_or_else(|| invalid("page facts absent"))?;
-        let (class, bytes) = (inner.table.class(facts), facts.bytes);
+            .map_or((Class::Free, 0, None), |facts| {
+                (inner.table.class(facts), facts.bytes, facts.model)
+            });
         let step = inner
             .table
             .request(request)
             .map_or(0, |row| row.position.step);
+        let event = Event {
+            sequence: inner.progress,
+            request,
+            step,
+            page,
+            model,
+            class,
+            kind,
+            reason,
+            bytes,
+            capacity: inner.table.capacity,
+            working_set: inner.table.remaining(request),
+            resident: inner
+                .table
+                .pages
+                .iter()
+                .filter(|page| page.mapped())
+                .map(|page| page.bytes)
+                .sum(),
+            orphan_bytes: inner
+                .table
+                .pages
+                .iter()
+                .filter(|page| page.mapped() && inner.table.class(page) == Class::Orphan)
+                .map(|page| page.bytes)
+                .sum(),
+            speculative_budget: inner.table.speculative_budget(request),
+        };
         if let Some(run) = inner.requests.get_mut(&request) {
-            run.stats.events.push(Event {
-                request,
-                step,
-                page,
-                class,
-                kind,
-                bytes,
-            });
+            run.stats.events.push(event);
         }
         inner.progress = inner.progress.saturating_add(1);
         Ok(())
@@ -1055,6 +1096,28 @@ impl Placement {
         from: Tier,
         speculative: Option<Step>,
     ) -> Result<()> {
+        self.event(
+            request,
+            page,
+            "fill",
+            if speculative.is_some() {
+                "speculation"
+            } else {
+                "demand"
+            },
+        )?;
+        if let Some(step) = speculative {
+            if let Some(row) = self
+                .inner
+                .lock()
+                .table
+                .pages
+                .iter_mut()
+                .find(|row| row.id == page)
+            {
+                row.attempted.insert(step);
+            }
+        }
         let (transform, key) = {
             let inner = self.inner.lock();
             let model = inner
