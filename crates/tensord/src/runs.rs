@@ -483,12 +483,13 @@ impl Runs {
     fn prepare(&self, actor: &str, id: &str, spec: Spec, stoppable: &Stoppable) -> Result<Option<ResultRecord>, Refused> {
         let (engine, stop) = (self.service.engine.clone(), stoppable.stop.clone());
         let run = id.to_string();
-        // Byte counts arrive per chunk: a new stage shows at once, bytes at most 4 times a second.
+        // Byte counts arrive per chunk: a new stage and a finished count show at once, bytes at
+        // most 4 times a second.
         let last = std::sync::Mutex::new((String::new(), std::time::Instant::now()));
         let observe = Arc::new(move |stage: &str, done: u64, total: u64| {
             stop.moved();
             let mut last = last.lock().unwrap();
-            if last.0 == stage && last.1.elapsed() < std::time::Duration::from_millis(250) && done < total {
+            if last.0 == stage && last.1.elapsed() < std::time::Duration::from_millis(250) && (total == 0 || done < total) {
                 return;
             }
             *last = (stage.to_string(), std::time::Instant::now());
