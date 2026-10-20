@@ -428,6 +428,7 @@ impl Checkpoint {
         crate::io::source::Source::checkpoint(&self.view(), direct_io)
     }
 
+    #[cfg(unix)]
     fn view(&self) -> crate::io::view::View {
         let checkpoint = self.clone();
         crate::io::view::View::from(&self.data.raw).with_fetch(move |objects| {

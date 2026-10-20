@@ -260,6 +260,7 @@ unsafe fn read_impl(
     let mut stats = if host_copies.is_empty() {
         ReadStats::default()
     } else {
+        #[cfg(unix)]
         let host_start = Instant::now();
         let stats = unsafe { host::fill(&host_copies, opts) }.map_err(|e| Error {
             copy: host[e.copy].0,

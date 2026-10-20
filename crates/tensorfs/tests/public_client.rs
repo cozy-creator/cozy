@@ -531,6 +531,7 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
         .unwrap()
         .iter()
         .all(|(_, _, authorized)| *authorized));
+    #[cfg(unix)]
     let source = checkpoint.source(false);
     drop(warm);
     drop(tokenizer);
@@ -543,6 +544,7 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
         "last children must still own retention"
     );
     drop(component);
+    #[cfg(unix)]
     drop(source);
     #[cfg(target_os = "linux")]
     {

@@ -66,11 +66,14 @@ pub(crate) fn disk_run(files: &[&File], bytes: u64, ns: u64, direct: u64, cached
 }
 
 /// A `st_dev` as `durable::device` names its volume.
+#[cfg(target_os = "linux")]
 fn volume(dev: u64) -> u64 {
-    match cfg!(target_os = "linux") {
-        true => u64::from(libc::major(dev)) << 32 | u64::from(libc::minor(dev)),
-        false => dev,
-    }
+    u64::from(libc::major(dev)) << 32 | u64::from(libc::minor(dev))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn volume(dev: u64) -> u64 {
+    dev
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
