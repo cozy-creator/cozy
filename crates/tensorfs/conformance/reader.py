@@ -173,11 +173,13 @@ def version(name: str) -> Version | None:
 
 
 def default_tag(repo: dict) -> dict | None:
-    """The public, non-yanked tag with the highest version; of equal versions, the last created."""
-    best = None
+    """Of the public, non-yanked tags, the highest final version, else the highest pre-release
+    (a, b, rc, .dev); of equal versions, the last created."""
+    best, key = None, None
     for t in repo["tags"]:
-        if t["public"] and not t["yanked"] and (best is None or version(t["name"]) >= version(best["name"])):
-            best = t
+        v = version(t["name"]) if t["public"] and not t["yanked"] else None
+        if v is not None and (best is None or (not v.is_prerelease, v) >= key):
+            best, key = t, (not v.is_prerelease, v)
     return best
 
 
@@ -495,6 +497,12 @@ def check(vectors: Path) -> int:
     for t in doc["trees"]:
         data = json.dumps(t, sort_keys=True, separators=(",", ":")).encode()
         trees[hashlib.sha256(data).hexdigest()] = parse_tree(data)
+    for case in doc["defaults"]:
+        t = default_tag(parse_repo(json.dumps(case["repo"]).encode()))
+        ok = (t and t["name"]) == case.get("default")
+        passed += ok
+        if not ok:
+            failures.append(f"default: {case['why']}")
     for case in doc["cases"]:
         got = resolve(repo, case.get("revision"), lambda c: trees[c["sha256"]])
         ok = got == ((case["commit"], case.get("variant")) if "commit" in case else None)

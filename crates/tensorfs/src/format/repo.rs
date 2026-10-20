@@ -160,6 +160,22 @@ impl From<Repo> for RepoWire {
     }
 }
 
+/// The one "newest" ordering (spec §7): of `items`, the one whose `version` is the highest final
+/// PEP 440 version (a post-release is final), else the highest pre-release (`a`, `b`, `rc`,
+/// `.dev`); of equal versions (`1.0`, `1.0.0`), the last given. Items whose version does not parse
+/// are skipped; callers filter anything else first.
+pub fn newest_by<T>(items: impl IntoIterator<Item = T>, version: impl Fn(&T) -> &str) -> Option<T> {
+    let versioned = items.into_iter().filter_map(|item| Some((Version::from_str(version(&item)).ok()?, item)));
+    let order = |(a, _): &(Version, T), (b, _): &(Version, T)| a.is_stable().cmp(&b.is_stable()).then_with(|| a.cmp(b));
+    versioned.max_by(order).map(|(_, item)| item)
+}
+
+/// The unversioned default among `tags`: [`newest_by`] of the public, non-yanked ones, in
+/// creation order.
+pub fn newest<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Option<&'a Tag> {
+    newest_by(tags.into_iter().filter(|t| t.public && !t.yanked), |t| t.name.as_str())
+}
+
 /// A tag name: a segment that cannot be read as a digest.
 pub fn tag_name(name: &str) -> bool {
     segment(name) && !name.starts_with("sha256:")
@@ -241,11 +257,9 @@ impl Repo {
         self.tags.iter_mut().find(|t| t.name == name)
     }
 
-    /// The default: the public, non-yanked tag with the highest version (of equal versions, the
-    /// last created).
+    /// The unversioned default: [`newest`] of the tags.
     pub fn default_tag(&self) -> Option<&Tag> {
-        let versioned = self.tags.iter().filter(|t| t.public && !t.yanked);
-        versioned.filter_map(|t| Some((Version::from_str(&t.name).ok()?, t))).max_by(|a, b| a.0.cmp(&b.0)).map(|(_, t)| t)
+        newest(&self.tags)
     }
 
     /// Resolves `revision` once (§7): none is the default; `sha256:<hex>` a tag's commit, else a

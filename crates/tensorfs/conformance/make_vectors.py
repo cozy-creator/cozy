@@ -426,7 +426,29 @@ def resolution() -> dict:
         {"why": "a tag name is exact, not a version match", "revision": "1.9.0"},
         {"why": "no such tag", "revision": "nope"},
     ]
-    return {"repo": doc, "trees": [json.loads(t) for t in trees], "cases": cases}
+    # The unversioned default alone, over tag lists: finals before pre-releases, then PEP 440 order.
+    def default(why, tags, expect=None):
+        out = {"why": why, "repo": repo(*(tag(name, **flags) for name, flags in tags))}
+        return {**out, "default": expect} if expect else out
+    public, yanked = {"public": True}, {"public": True, "yanked": True}
+    defaults = [
+        default("a final beats a newer pre-release", [("1.0", public), ("2.0rc1", public)], "1.0"),
+        default("a final beats a newer dev release", [("1.0", public), ("1.1.dev1", public)], "1.0"),
+        default("a post-release is final", [("1.0", public), ("1.0.post1", public)], "1.0.post1"),
+        default("a post-release's dev release is a pre-release", [("1.0", public), ("1.0.post1.dev1", public)], "1.0"),
+        default("only pre-releases: the highest", [("1.0a1", public), ("1.0rc1", public), ("1.0b2", public),
+                                                    ("0.9.dev3", public)], "1.0rc1"),
+        default("equal versions: the later created", [("1.0", public), ("1.0.0", public)], "1.0.0"),
+        default("equal versions, the other way round", [("1.0.0", public), ("1.0", public)], "1.0"),
+        default("a yanked final falls back to an older final, not a newer pre-release",
+                [("1.0", public), ("2.0", yanked), ("2.1rc1", public)], "1.0"),
+        default("a local version is final and orders after its public one", [("1.0+local.1", public), ("1.0", public)],
+                "1.0+local.1"),
+        default("an epoch outranks a larger release", [("2!0.1", public), ("10.0", public)], "2!0.1"),
+        default("private tags are not candidates", [("1.0", public), ("2.0", {})], "1.0"),
+        default("no public, non-yanked tag: none", [("main", {}), ("1.0", yanked)]),
+    ]
+    return {"repo": doc, "trees": [json.loads(t) for t in trees], "cases": cases, "defaults": defaults}
 
 
 def main():
@@ -438,11 +460,12 @@ def main():
             (verdict / f"repo-{name}.json").write_bytes(canonical(doc))
     (HERE / "../spec/examples/repo-basic.json").write_bytes(canonical(REPO_BASIC))
     doc = resolution()
-    lines = ",\n".join(canonical(c).decode() for c in doc["cases"])
+    rows = lambda key: ",\n".join(canonical(c).decode() for c in doc[key])  # noqa: E731
     (HERE / "vectors" / "resolve.json").write_text(
-        '{"repo":' + canonical(doc["repo"]).decode() + ',\n"trees":[\n'
-        + ",\n".join(canonical(t).decode() for t in doc["trees"]) + '],\n"cases":[\n' + lines + "\n]}\n")
-    print(f"{len(REPOS_GREEN)} green and {len(REPOS_RED)} red repo vectors, {len(doc['cases'])} resolutions")
+        '{"repo":' + canonical(doc["repo"]).decode() + ',\n"trees":[\n' + rows("trees") + '],\n"cases":[\n'
+        + rows("cases") + '],\n"defaults":[\n' + rows("defaults") + "\n]}\n")
+    print(f"{len(REPOS_GREEN)} green and {len(REPOS_RED)} red repo vectors, {len(doc['cases'])} resolutions, "
+          f"{len(doc['defaults'])} defaults")
     for path in [*green.glob("header-*"), *red.glob("header-*")]:
         if not path.name.startswith("header-pre-cut"):
             path.unlink()
