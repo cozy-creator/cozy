@@ -740,3 +740,16 @@ fn only_a_sealed_varena_ledger_is_adopted() {
     }
     assert!(Ledger::adopt(fd.as_fd(), None).unwrap().claim(9).is_ok());
 }
+
+/// What an answer gave in Rust leaves the row at once: a second ask sees only what is left, so a
+/// stale row never absorbs an ask another row could answer.
+#[test]
+fn an_answer_sheds_what_it_gave_from_the_row() {
+    let (ledger, _fd) = Ledger::create("GPU-shed", 24 * GIB).unwrap();
+    let row = ledger.claim(std::process::id()).unwrap();
+    row.publish(&Facts { context: GIB, resident: 6 * GIB, cold: 4 * GIB, kept: 3 * GIB, idle: GIB, last_use: 1, ..Facts::default() });
+    row.shed(5 * GIB);
+    let f = ledger.snapshot().unwrap().into_iter().find(|r| r.slot == row.id()).unwrap().facts;
+    assert_eq!((f.resident, f.cold, f.kept, f.idle), (2 * GIB, 0, 0, 0));
+    assert_eq!(f.context, GIB);
+}

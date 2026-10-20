@@ -91,7 +91,7 @@ class Shape:
     shape: str
     peak: int = -1
     cuts: dict[str, int] = field(default_factory=dict)
-    #: the cuts its passes ran: key -> (total, finest, shrink), what `finer` steps
+    #: the cuts its passes ran: key -> (total, finest, shrink), what `coarser` relaxes
     scopes: dict[tuple[object, ...], tuple[int, int, Callable[[int], int]]] = field(
         default_factory=dict
     )
@@ -284,19 +284,19 @@ def _settle[T](
     return size, out
 
 
-def finer(shape: Shape | None) -> bool:
-    """Rung 3 ahead of the planner's rung 4: every cut a shape's passes ran goes one step finer,
-    and its peak waits to be measured again. False when each is at its finest already."""
+def coarser(shape: Shape | None) -> bool:
+    """Relaxation (the planner's): every cut a shape's passes ran goes one step back toward
+    whole, twice its size, and its peak waits to be measured again. False when none is cut."""
     if shape is None:
         return False
     memo, moved = _served.memo, False
-    for key, (total, finest, shrink) in shape.scopes.items():
+    for key, (total, _, _) in shape.scopes.items():
         size = min(memo.sizes.get(key, total), total)
-        if size > finest:
-            memo.sizes[key] = max(finest, shrink(size))
+        if size < total:
+            memo.sizes[key] = min(total, 2 * size)
             moved = True
     if moved:
-        shape.peak = -1
+        shape.peak, shape.cuts = -1, {}
     return moved
 
 

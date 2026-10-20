@@ -431,6 +431,18 @@ impl Row {
         self.write(0, &f.words());
     }
 
+    /// Its facts less `freed` bytes an answer gave in Rust (cold weights, then idle chunks), so
+    /// later asks see what is left before the process publishes again.
+    pub fn shed(&self, freed: u64) {
+        let mut f = Facts::from_words(&lock(&self.words)[..FACTS]);
+        let weights = freed.min(f.cold);
+        f.cold -= weights;
+        f.resident = f.resident.saturating_sub(weights);
+        f.kept = f.kept.min(f.cold);
+        f.idle = f.idle.saturating_sub(freed - weights);
+        self.publish(&f);
+    }
+
     /// Its running requests and the most each still needs beyond what it holds (-1: unmeasured).
     pub fn running(&self, requests: &[(String, i64)]) -> Result<()> {
         if requests.len() > RUNNING {

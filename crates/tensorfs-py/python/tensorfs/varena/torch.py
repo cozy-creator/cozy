@@ -164,7 +164,7 @@ class Declared:
 @dataclass(frozen=True, slots=True)
 class Step:
     """One pass of a model: bytes at home and resident, copied home and streamed, the prefetch
-    stall, and torch's allocated peak above the pass's start."""
+    stall, torch's allocated peak above the pass's start, and torch's allocated bytes then."""
 
     model: str
     gpu: int
@@ -175,6 +175,7 @@ class Step:
     streamed: int
     stall_ns: int
     activations: int
+    allocated: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -754,7 +755,9 @@ class Memory:
         home if it fits beside its reserve and the idle bytes and cold weights worth less, else a
         spread set; one run once takes only free room. Unmeasured, a repeating model stays at
         home and one run once keeps only what is resident. Within a request it never rises.
-        Measured, the pass's working set gets its room before it runs, not from its own OOM."""
+        Planning never cuts: cuts in force relax a step (`cuts.coarser`) whenever twice the
+        measured peak still leaves the model two streaming slots, since a step at most doubles
+        it. Measured, the pass's working set gets its room before it runs, not from its OOM."""
         repeating = model.repeats >= 2
         if not model.blocks or (model.reserve < 0 and repeating):
             return
@@ -762,17 +765,17 @@ class Memory:
             want = {b for b in model.home if _resident(model, b)}
         else:
             spare = self.core.stats()  # type: ignore[union-attr]
-            room = self.available() + spare.idle + spare.slot_bytes - model.reserve
+            room = self.available() + spare.idle + spare.slot_bytes
             room += _set(model)[0] - model.common.nbytes
             if repeating:
                 keep = self._keep(model)
                 cold = (m for m in self.models.values() if self._victim(m))
                 room += sum(_set(m)[0] for m in cold if self._keep(m) < keep)
             sizes = _sizes(model)
+            if room - 2 * model.reserve >= 2 * max(sizes) and cuts.coarser(model.track.shape):
+                model.reserve *= 2
+            room -= model.reserve
             fits = sum(sizes) <= room
-            if not fits and repeating and cuts.finer(model.track.shape):
-                model.reserve = -1  # cut finer first (rung 3); the next pass measures it
-                return
             want = set(model.order if fits else _spread(model.order, sizes, room - 2 * max(sizes)))
         if self.active:
             want &= model.home
@@ -895,7 +898,9 @@ class Memory:
         cuts.peaked(model.track, activations)
         home = model.home_bytes()
         moved = (paged - last_paged, streamed - last_streamed, stall - last_stall)
-        step = Step(model.name, self.gpu, model.steps, home, resident, *moved, activations)
+        step = Step(
+            model.name, self.gpu, model.steps, home, resident, *moved, activations, model.base
+        )
         model.steps += 1
         for request in self._requests():
             request.steps.append(step)

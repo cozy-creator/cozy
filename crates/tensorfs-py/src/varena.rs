@@ -206,8 +206,13 @@ impl PyGpu {
 
     /// Answers other processes' asks of `row` from now on with `give`, on a Rust thread.
     fn serve(&self, py: Python<'_>, row: PyRef<'_, PyRow>) -> PyResult<()> {
-        let gpu = self.0.clone();
-        row.0.serve(move |want| gpu.give(want).map_or(0, |gave| gave.iter().map(|g| g.1).sum())).map(drop).or_raise(py)
+        let (gpu, facts) = (self.0.clone(), row.0.clone());
+        let answer = move |want| {
+            let freed = gpu.give(want).map_or(0, |gave| gave.iter().map(|g| g.1).sum());
+            facts.shed(freed);
+            freed
+        };
+        row.0.serve(answer).map(drop).or_raise(py)
     }
 
     fn step(&self, py: Python<'_>) -> PyResult<()> {
