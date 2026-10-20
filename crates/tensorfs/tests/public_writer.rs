@@ -620,7 +620,7 @@ async fn portable_export_preflights_full_closure_and_atomically_replaces_shared_
             &reopened,
             &incomplete,
             Format::Cozytensors,
-            Some(&Dtype::F32)
+            Some(Dtype::F32)
         )
         .unwrap_err()
         .kind,
