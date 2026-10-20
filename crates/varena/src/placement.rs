@@ -213,8 +213,28 @@ impl Placement {
                     Ok(())
                 })
             };
-            if let Err(error) = result {
+            if let Err(error) = result.and_then(|()| this.settle()) {
                 tracing::warn!(%error, "reclaim failed");
+            }
+        }
+    }
+
+    /// A CUDA completion does not ring the ledger's eventfd. After a release wake,
+    /// wait on actual submitted work before sleeping again, then publish and reconsider
+    /// pages that were still protected when the wake was first processed.
+    fn settle(&self) -> Result<()> {
+        loop {
+            let pending = self.gpu.wait_pending()?;
+            self.refresh()?;
+            if self.stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let requests: Vec<_> = self.inner.lock().requests.keys().copied().collect();
+            for request in requests {
+                self.drive(request, Trigger::PinReleased(request))?;
+            }
+            if !pending {
+                return Ok(());
             }
         }
     }
