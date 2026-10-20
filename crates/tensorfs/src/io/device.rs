@@ -6,8 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use platform::durable;
-
 use super::cuda::{self, CUcontext, CUevent, CUstream, CtxGuard};
 use super::{host, Copy, Dst, Error, ReadOpts, ReadStats, Src};
 
@@ -702,20 +700,15 @@ impl Engine {
         }
         match job.c.src {
             Src::File(file, offset) => {
-                let at = offset + job.at as u64;
                 let copy = Copy {
-                    src: Src::File(file, at),
+                    src: Src::File(file, offset + job.at as u64),
                     dst: Dst::Host {
                         ptr: slot.ptr,
                         len: job.len,
                     },
                 };
-                // One residency check per piece: a resident piece is read through the page
-                // cache unchecked, any other per request as host reads are.
-                let cached = durable::cached(file, at, job.len as u64).unwrap_or(false);
                 let options = ReadOpts {
                     threads: 1,
-                    direct: opts.direct && !cached,
                     ..opts.clone()
                 };
                 let stats = unsafe { host::fill(&[copy], &options) }.map_err(|e| Error {
