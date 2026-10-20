@@ -125,7 +125,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         self_replace::self_delete_outside_path(dir).map_err(|e| failed(&exe, e))?;
     }
     for dir in &dirs {
-        remove(dir, &keep).map_err(|e| failed(dir, e))?;
+        remove(dir, &keep)?;
     }
 
     if ctx.json {
@@ -257,25 +257,24 @@ fn size(path: &Path, keep: &[PathBuf]) -> u64 {
     }
 }
 
-/// Removes `path`, all but what `keep` names under it.
-fn remove(path: &Path, keep: &[PathBuf]) -> io::Result<()> {
-    if keep.iter().any(|k| k == path) {
-        return Ok(());
+/// Removes `path`, all but what `keep` names under it; a failure names the file it hit.
+fn remove(path: &Path, keep: &[PathBuf]) -> Result<(), Error> {
+    let at = |e| failed(path, e);
+    let meta = match fs::symlink_metadata(path) {
+        _ if keep.iter().any(|k| k == path) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        meta => meta.map_err(at)?,
+    };
+    if !meta.is_dir() {
+        return fs::remove_file(path).map_err(at);
     }
-    if !keep.iter().any(|k| k.starts_with(path)) {
-        return match fs::remove_dir_all(path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            done => done,
-        };
+    for entry in fs::read_dir(path).map_err(at)? {
+        remove(&entry.map_err(at)?.path(), keep)?;
     }
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        match entry.file_type()?.is_dir() {
-            true => remove(&entry.path(), keep)?,
-            false => fs::remove_file(entry.path())?,
-        }
+    match keep.iter().any(|k| k.starts_with(path)) {
+        true => Ok(()),
+        false => fs::remove_dir(path).map_err(at),
     }
-    Ok(())
 }
 
 fn env(name: &str) -> Option<PathBuf> {
