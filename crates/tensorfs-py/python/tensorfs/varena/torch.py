@@ -9,6 +9,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import itertools
+import sys
 import threading
 import time
 import traceback
@@ -513,6 +514,16 @@ class Request:
     raw_plan: tuple[PlanStep, ...] = ()
     reads: dict[str, tuple[int, int, int]] = field(default_factory=dict)
     passes: dict[str, int] = field(default_factory=dict)
+    cleanup_errors: tuple[BaseException, ...] = field(default=(), init=False, repr=False)
+    _failed: bool = field(default=False, init=False, repr=False)
+
+    def mark_failed(self) -> None:
+        """Retire unused allocator slack on exit, including a failure returned as a value.
+
+        Cleanup faults remain in cleanup_errors with detached tracebacks. A caller
+        reporting an existing failure must report them without replacing that outcome.
+        """
+        self._failed = True
 
     def plan(self, steps: Sequence[PlanStep] | None) -> None:
         self.raw_plan = tuple(
@@ -1071,69 +1082,116 @@ class Memory:
             with cuts.caught() if self.cuda else nullcontext():
                 yield request
         except BaseException as exc:
+            request.mark_failed()
             _clear_frames(exc)
             raise
         finally:
             stack.remove(request)
             self.active.pop(request, None)
-            gc.collect()
+
+            def cleanup(call: Callable[[], Any]) -> Any:
+                try:
+                    return call()
+                except BaseException as error:  # noqa: BLE001 - Every stage must still attempt End.
+                    # Errors are observations, never owners of frames/tensors.
+                    pending = [error]
+                    while pending:
+                        current = pending.pop()
+                        if isinstance(current, BaseExceptionGroup):
+                            pending.extend(current.exceptions)
+                        current.__traceback__ = None
+                        current.__cause__ = None
+                        current.__context__ = None
+                    request.cleanup_errors += (error,)
+                    return None
+
+            cleanup(gc.collect)
+            if request._failed and self.cuda:
+                # Failed activations may leave a nearly full allocator cache.
+                # Release only unused Torch blocks; live caches and weight maps
+                # keep their owners. Successful requests keep their warm slack.
+                cleanup(lambda: self._trim(0))
             # Admission reads the published row before another forward can
             # refresh it. Do not leave a completed step's activation peak pinned.
-            try:
-                self._measure()
-            finally:
-                raw: dict[str, Any] = (
+            cleanup(self._measure)
+            raw: dict[str, Any] | None = cleanup(
+                lambda: (
                     self.native.end(request.native_id)
                     if self.native is not None
                     else {"events": [], "copies": [], "io": [], "peak": 0}
                 )
-            trace = tuple(
-                {
-                    **event,
-                    "request": id,
-                    "model": self._names.get(event.get("model"), ""),
-                    "gpu": self.gpu,
-                }
-                for event in raw["events"]
             )
-            copied = sum(row["stats"]["bytes"] for row in raw["copies"])
-            # Persistent graph/KV caches have a live reclaim owner. Compare the
-            # uncached amount at both ends so shrinking an old cache cannot hide
-            # newly retained package tensors.
-            leftover = max(self._uncached_bytes() - request.start, 0)
-            request.stats = RequestStats(
-                id,
-                tuple(request.steps),
-                tuple(
-                    Eviction(
-                        str(event["model"] or ""),
-                        self.gpu,
+            if raw is not None:
+                def collect(data: dict[str, Any]) -> RequestStats:
+                    trace = tuple(
                         {
-                            "free": 0,
-                            "orphan": 1,
-                            "speculative": 2,
-                            "unused": 3,
-                            "declared": 4,
-                            "working": 5,
-                            "pinned": 6,
-                        }[str(event["class"])],
-                        str(event["reason"]),
-                        int(event["bytes"]),
+                            **event,
+                            "request": id,
+                            "model": self._names.get(event.get("model"), ""),
+                            "gpu": self.gpu,
+                        }
+                        for event in data["events"]
                     )
-                    for event in trace
-                    if event["kind"] == "evict"
-                ),
-                ((self.gpu, leftover),) if self.cuda else (),
-                copied,
-                self.memo.retries,
-                (),
-                request.declared,
-                tuple(_copy(row) for row in raw["io"]),
-                trace,
-                ({**raw["proof"], "gpu": self.gpu, "request": id},)
-                if "proof" in raw
-                else (),
-            )
+                    copied = sum(row["stats"]["bytes"] for row in data["copies"])
+                    # Persistent graph/KV caches have a live reclaim owner. Compare the
+                    # uncached amount at both ends so shrinking an old cache cannot hide
+                    # newly retained package tensors.
+                    leftover = max(self._uncached_bytes() - request.start, 0)
+                    return RequestStats(
+                        id,
+                        tuple(request.steps),
+                        tuple(
+                            Eviction(
+                                str(event["model"] or ""),
+                                self.gpu,
+                                {
+                                    "free": 0,
+                                    "orphan": 1,
+                                    "speculative": 2,
+                                    "unused": 3,
+                                    "declared": 4,
+                                    "working": 5,
+                                    "pinned": 6,
+                                }[str(event["class"])],
+                                str(event["reason"]),
+                                int(event["bytes"]),
+                            )
+                            for event in trace
+                            if event["kind"] == "evict"
+                        ),
+                        ((self.gpu, leftover),) if self.cuda else (),
+                        copied,
+                        self.memo.retries,
+                        (),
+                        request.declared,
+                        tuple(_copy(row) for row in data["io"]),
+                        trace,
+                        ({**data["proof"], "gpu": self.gpu, "request": id},)
+                        if "proof" in data
+                        else (),
+                    )
+
+                request.stats = cleanup(lambda: collect(raw))
+
+            if request.cleanup_errors:
+                if not request._failed:
+                    failure = request.cleanup_errors[0]
+                    for error in request.cleanup_errors[1:]:
+                        failure.add_note(f"request cleanup also failed: {error}")
+                    request.cleanup_errors = ()
+                    try:
+                        raise failure
+                    finally:
+                        failure = None
+                original = sys.exception()
+                try:
+                    if original is not None:
+                        for error in request.cleanup_errors:
+                            original.add_note(f"request cleanup failed: {error}")
+                finally:
+                    # The original traceback includes this generator frame.
+                    # Never leave a local reference completing an exception cycle.
+                    original = None
 
     def resident(self) -> dict[str, int]:
         if self.native is not None:
