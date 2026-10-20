@@ -3,7 +3,7 @@
 //! A decision uses one immutable snapshot. The mechanism applies its actions in order and
 //! takes a fresh snapshot after asynchronous work; it must not treat an ask as freed memory.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type PageId = u64;
 pub type ModelId = u64;
@@ -92,6 +92,7 @@ pub struct Page {
     /// Kept until the corresponding request ends, even if a speculative fill is dropped.
     pub attempted: BTreeSet<Step>,
     pub ram_ready: bool,
+    pub lowered: BTreeSet<RequestId>,
 }
 
 impl Page {
@@ -228,6 +229,10 @@ pub enum Action {
         bytes: u64,
     },
     Unmap(PageId),
+    DropHome {
+        request: RequestId,
+        page: PageId,
+    },
     Map(PageId),
     Fill {
         page: PageId,
@@ -349,7 +354,11 @@ impl Table {
             return Class::Free;
         }
         let next = self.next_use(page);
-        if next.is_some_and(|(step, _)| step == 0) {
+        if self
+            .requests
+            .iter()
+            .any(|request| !page.lowered.contains(&request.id) && current(page, request))
+        {
             return Class::Working;
         }
         if page.speculative_for.is_some() {
@@ -401,17 +410,56 @@ impl Table {
         })
     }
 
-    fn reserve(&self) -> Option<u64> {
-        let need = self
-            .requests
-            .iter()
-            .try_fold(0_u64, |sum, request| sum.checked_add(request.measured()?))?;
+    fn stream_reserve(&self) -> Option<u64> {
+        let mut models: BTreeMap<(RequestId, ModelId), (u64, u64, u64)> = BTreeMap::new();
+        for request in &self.requests {
+            for page in self
+                .pages
+                .iter()
+                .filter(|page| page.lowered.contains(&request.id) && current(page, request))
+            {
+                let Some(model) = page.model else {
+                    continue;
+                };
+                let row = models.entry((request.id, model)).or_default();
+                row.0 = row.0.max(page.bytes);
+                row.1 = row.1.saturating_add(1);
+                if page.mapped() {
+                    row.2 = row.2.saturating_add(page.bytes);
+                }
+            }
+        }
+        models
+            .values()
+            .try_fold(0_u64, |sum, (largest, count, mapped)| {
+                sum.checked_add(
+                    largest
+                        .checked_mul((*count).min(3))?
+                        .saturating_sub(*mapped),
+                )
+            })
+    }
+
+    fn reserve_known(&self, measured: bool) -> Option<u64> {
+        let need = self.requests.iter().try_fold(0_u64, |sum, request| {
+            let peak = if measured {
+                request.measured()?
+            } else {
+                request.measured().unwrap_or(0)
+            };
+            sum.checked_add(peak)
+        })?;
         let scratch = self
             .pages
             .iter()
             .filter(|page| page.mapped() && matches!(page.kind, Kind::Scratch(_)))
             .try_fold(0_u64, |sum, page| sum.checked_add(page.bytes))?;
-        Some(need.saturating_sub(scratch))
+        need.saturating_sub(scratch)
+            .checked_add(self.stream_reserve()?)
+    }
+
+    fn reserve(&self) -> Option<u64> {
+        self.reserve_known(true)
     }
 
     fn protected_room(&self) -> Option<u64> {
@@ -545,7 +593,14 @@ pub fn decide(table: &Table, trigger: Trigger) -> Vec<Action> {
             demand(table, request, item.bytes, Some(page))
         }
         Trigger::Begin(request) | Trigger::StepStart(request) => step_start(table, request),
-        Trigger::FillLanded(request) | Trigger::PinReleased(request) => speculate(table, request),
+        Trigger::FillLanded(request) | Trigger::PinReleased(request) => {
+            let stream = stream(table, request);
+            if stream.is_empty() {
+                speculate(table, request)
+            } else {
+                stream
+            }
+        }
     }
 }
 
@@ -767,8 +822,22 @@ fn demand(table: &Table, id: RequestId, need: u64, page: Option<PageId>) -> Vec<
         return vec![Action::Invalid("unknown request")];
     };
     let mut plan = Planner::new(table);
-    let Some(need) = need.checked_add(table.reserve().unwrap_or(0)) else {
-        return vec![Action::Invalid("working set overflow")];
+    if let Some(target) = page.and_then(|id| table.page(id)) {
+        if !stream_slot(&mut plan, request, target) {
+            return vec![Action::Exhausted { request: id, need }];
+        }
+    }
+    let reserve = table.reserve_known(false).unwrap_or(0);
+    let need = if page
+        .and_then(|id| table.page(id))
+        .is_some_and(|page| page.lowered.contains(&id))
+    {
+        need.max(reserve)
+    } else {
+        let Some(total) = need.checked_add(reserve) else {
+            return vec![Action::Invalid("working set overflow")];
+        };
+        total
     };
     if plan.room(request, need) {
         if let Some(page) = page.and_then(|id| table.page(id)) {
@@ -796,6 +865,14 @@ fn reclaim(table: &Table, row: RowId, need: u64, ceiling: Class) -> Vec<Action> 
     plan.actions
 }
 
+fn current(page: &Page, request: &Request) -> bool {
+    page.uses.iter().any(|usage| {
+        usage.request == request.id
+            && usage.position.step == request.position.step
+            && usage.position >= request.position
+    })
+}
+
 fn lower(table: &Table, id: RequestId, need: u64) -> Vec<Action> {
     let Some(request) = table.request(id) else {
         return vec![Action::Invalid("unknown request")];
@@ -804,30 +881,65 @@ fn lower(table: &Table, id: RequestId, need: u64) -> Vec<Action> {
         .pages
         .iter()
         .filter(|page| {
-            page.mapped()
-                && page.row == request.row
+            page.row == request.row
                 && table.class(page) == Class::Working
-                && page
-                    .uses
+                && current(page, request)
+                && !table
+                    .requests
                     .iter()
-                    .any(|usage| usage.request == id && usage.position >= request.position)
-                && !page.uses.iter().any(|usage| {
-                    usage.request != id
-                        && table.request(usage.request).is_some_and(|other| {
-                            usage.position.step == other.position.step
-                                && usage.position >= other.position
-                        })
-                })
+                    .any(|other| other.id != id && current(page, other))
         })
         .collect();
     pages.sort_by_key(|page| (std::cmp::Reverse(page.spread_rank), page.id));
+    let mut home = pages
+        .iter()
+        .map(|page| page.bytes)
+        .fold(0_u64, u64::saturating_add);
+    let mapped = pages
+        .iter()
+        .filter(|page| page.mapped())
+        .map(|page| page.bytes)
+        .fold(0_u64, u64::saturating_add);
+    let fixed = table.occupied().unwrap_or(u64::MAX).saturating_sub(mapped);
+    let mut largest: BTreeMap<ModelId, (u64, u64, u64)> = BTreeMap::new();
+    for page in table
+        .pages
+        .iter()
+        .filter(|page| page.row == request.row && current(page, request))
+    {
+        if let Some(model) = page.model {
+            let row = largest.entry(model).or_default();
+            row.0 = row.0.max(page.bytes);
+            row.1 = row.1.saturating_add(1);
+            if page.mapped() && page.lowered.contains(&id) {
+                row.2 = row.2.saturating_add(page.bytes);
+            }
+        }
+    }
+    let ring = largest
+        .values()
+        .map(|(max, count, mapped)| max.saturating_mul((*count).min(3)).saturating_sub(*mapped))
+        .fold(0_u64, u64::saturating_add);
+    let budget = table
+        .capacity
+        .saturating_sub(fixed)
+        .saturating_sub(table.reserve_known(false).unwrap_or(0))
+        .saturating_sub(ring)
+        .saturating_sub(need);
     let mut plan = Planner::new(table);
     let before = plan.allocated;
     for page in pages {
-        if before.saturating_sub(plan.allocated) >= need {
+        if home <= budget && before.saturating_sub(plan.allocated) >= need {
             break;
         }
-        plan.evict(page);
+        plan.actions.push(Action::DropHome {
+            request: id,
+            page: page.id,
+        });
+        home = home.saturating_sub(page.bytes);
+        if page.mapped() {
+            plan.evict(page);
+        }
     }
     if before.saturating_sub(plan.allocated) < need {
         plan.actions.push(Action::Exhausted {
@@ -838,10 +950,79 @@ fn lower(table: &Table, id: RequestId, need: u64) -> Vec<Action> {
     plan.actions
 }
 
+fn stream(table: &Table, id: RequestId) -> Vec<Action> {
+    let Some(request) = table.request(id) else {
+        return Vec::new();
+    };
+    if request.measured().is_none() {
+        return Vec::new();
+    }
+    let mut next: Vec<_> = table
+        .pages
+        .iter()
+        .filter(|page| {
+            page.lowered.contains(&id) && current(page, request) && !page.mapped() && !page.filling
+        })
+        .collect();
+    next.sort_by_key(|page| (table.next_use(page), page.id));
+    let Some(page) = next.first().copied() else {
+        return Vec::new();
+    };
+    let mut plan = Planner::new(table);
+    if !stream_slot(&mut plan, request, page) {
+        return Vec::new();
+    }
+    let reserve = table.protected_room().unwrap_or(u64::MAX).max(page.bytes);
+    plan.take(reserve, |candidate, class| {
+        class <= Class::Orphan
+            || (candidate.row == request.row
+                && (class <= Class::Unused
+                    || (class == Class::Declared
+                        && candidate.lowered.contains(&id)
+                        && candidate.id != page.id)))
+    });
+    if plan.free >= reserve {
+        plan.fill(page, None);
+        plan.actions
+    } else {
+        Vec::new()
+    }
+}
+
+fn stream_slot(plan: &mut Planner<'_>, request: &Request, target: &Page) -> bool {
+    if !target.lowered.contains(&request.id) {
+        return true;
+    }
+    let mut mapped = plan
+        .table
+        .pages
+        .iter()
+        .filter(|page| {
+            page.mapped() && page.model == target.model && page.lowered.contains(&request.id)
+        })
+        .count();
+    for page in plan.candidates(|page, class| {
+        page.model == target.model
+            && page.lowered.contains(&request.id)
+            && class < Class::Working
+            && page.id != target.id
+    }) {
+        if mapped < 3 {
+            break;
+        }
+        plan.evict(page);
+        mapped = mapped.saturating_sub(1);
+    }
+    mapped < 3
+}
+
 fn step_start(table: &Table, id: RequestId) -> Vec<Action> {
     let Some(request) = table.request(id) else {
         return vec![Action::Invalid("unknown request")];
     };
+    if request.measured().is_none() {
+        return Vec::new();
+    }
     let mut plan = Planner::new(table);
     let reserve = table.reserve().unwrap_or(0);
     if !plan.room(request, reserve) {
@@ -970,6 +1151,7 @@ mod tests {
             speculative_for: None,
             attempted: BTreeSet::new(),
             ram_ready: false,
+            lowered: BTreeSet::new(),
         }
     }
 
@@ -1088,6 +1270,7 @@ mod tests {
         if let Some(request) = table.requests.first_mut() {
             request.working_sets = vec![None];
         }
+        assert_eq!(decide(&table, Trigger::StepStart(1)), Vec::new());
         assert_eq!(decide(&table, Trigger::PinReleased(1)), Vec::new());
         if let Some(request) = table.requests.first_mut() {
             request.working_sets = vec![Some(0), Some(0)];
@@ -1100,6 +1283,50 @@ mod tests {
             });
         }
         assert_eq!(decide(&table, Trigger::PinReleased(1)), Vec::new());
+
+        // A lowered home target persists; step start must not restore the page.
+        let mut lowered = Table {
+            capacity: 100,
+            pages: vec![page(7, 40)],
+            rows: vec![Row {
+                id: 1,
+                alive: true,
+                reaping: false,
+            }],
+            requests: vec![request(1)],
+            ..Default::default()
+        };
+        if let Some(page) = lowered.pages.first_mut() {
+            page.uses.push(usage(1, 0));
+        }
+        assert_eq!(
+            decide(
+                &lowered,
+                Trigger::Lower {
+                    request: 1,
+                    need: 10
+                }
+            ),
+            vec![
+                Action::DropHome {
+                    request: 1,
+                    page: 7
+                },
+                Action::Unmap(7)
+            ]
+        );
+        if let Some(page) = lowered.pages.first_mut() {
+            page.lowered.insert(1);
+            page.tier = Tier::Disk;
+        }
+        if let Some(request) = lowered.requests.first_mut() {
+            request.resident_steps.insert(0);
+        }
+        assert_eq!(decide(&lowered, Trigger::StepStart(1)), Vec::new());
+        assert_eq!(
+            lowered.pages.first().map(|page| lowered.class(page)),
+            Some(Class::Declared)
+        );
 
         // An ask must complete before the caller evicts its own declared future.
         if let Some(page) = table.pages.iter_mut().find(|page| page.id == 6) {
@@ -1190,6 +1417,7 @@ fn speculate(table: &Table, id: RequestId) -> Vec<Action> {
                 || page.filling
                 || page.kind != Kind::Weight
                 || page.attempted.contains(&request.step())
+                || page.lowered.contains(&id)
                 || table.class(page) == Class::Working
             {
                 return None;
