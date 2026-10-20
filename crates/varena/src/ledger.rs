@@ -971,6 +971,40 @@ impl Ram {
                 .offset
                 .checked_add(region.len)
                 .ok_or_else(|| Error::Invalid("RAM region overflow".into()))?;
+            let mut intervals = Vec::new();
+            for item in &region.items {
+                let item_end = item
+                    .offset
+                    .checked_add(item.len)
+                    .ok_or_else(|| Error::Invalid("RAM item overflow".into()))?;
+                if item.offset < region.offset || item_end > end {
+                    return Err(Error::Invalid("RAM item exceeds its region".into()));
+                }
+                match &item.source {
+                    ItemSource::Object(range)
+                        if range.len != item.len
+                            || range
+                                .off
+                                .checked_add(range.len)
+                                .is_none_or(|n| n > range.obj.length) =>
+                    {
+                        return Err(Error::Invalid("RAM object range exceeds source".into()))
+                    }
+                    ItemSource::Inline(bytes) if bytes.len() as u64 != item.len => {
+                        return Err(Error::Invalid("RAM inline length differs".into()))
+                    }
+                    _ => (),
+                }
+                intervals.push((item.offset, item_end));
+            }
+            intervals.sort_unstable();
+            let mut previous = region.offset;
+            for (start, finish) in intervals {
+                if start < previous {
+                    return Err(Error::Invalid("RAM items overlap".into()));
+                }
+                previous = finish;
+            }
         }
         let len =
             usize::try_from(end).map_err(|_| Error::Invalid("RAM layout too large".into()))?;
@@ -1672,6 +1706,20 @@ impl Channel {
     ) -> Result<bool> {
         if files.len() > 4096 || regions.len() > MAX_RAM_ITEMS {
             return Err(Error::Invalid("RAM registration is too large".into()));
+        }
+        let canonical = |object: &ObjectRef| {
+            object.sha256.len() == 64
+                && object
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        };
+        if files.iter().any(|(object, _)| !canonical(object))
+            || regions.iter().flat_map(|r| &r.items).any(
+                |item| matches!(&item.source,ItemSource::Object(range) if !canonical(&range.obj)),
+            )
+        {
+            return Err(Error::Invalid("noncanonical RAM source hash".into()));
         }
         let (mut items, mut inline) = (0usize, 0usize);
         for region in regions {
