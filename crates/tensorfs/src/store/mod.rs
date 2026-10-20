@@ -1,41 +1,39 @@
-//! The store (design §4): one host, the filesystem only.
+//! The store (design §2): the local cache of cozytensors that any process reads and writes.
 //!
-//! `<root>/{format, blobs/<aa>/<bb>/<sha256>, refs/<org>/<name>.json, pins/<id>.json, tmp/}`
+//! `<root>/{format, blobs/<aa>/<bb>/<sha256>, refs/<org>/<name>.json, holds/, files/, uses/,
+//! snapshots/<name>/, tmp/}`
 //!
 //! - Objects are trees, cozytensors headers, chunks, assets and repo files. A ref names a
-//!   model's releases of trees; a pin keeps trees or headers. A cozytensors is opened by its
-//!   header ([`Store::checkpoint`]) or a tree's variant ([`Store::variant`]); a plain folder
-//!   enters by [`Store::admit_folder`] and leaves by [`Store::snapshot`].
+//!   model's releases of trees. A cozytensors is opened by its header ([`Store::checkpoint`]) or
+//!   a tree's variant ([`Store::variant`]); a plain folder enters by [`Store::admit_folder`] and
+//!   leaves by [`Store::snapshot`].
 //! - One door admits objects ([`Store::admit`], [`Store::put`]): streamed into `tmp/`, hashed,
 //!   checked, flushed per [`Durability`] and renamed into `blobs/`. An object is verified there
 //!   once and trusted after; [`Store::verify`] rehashes on demand.
-//! - Refs name models; pins are the one retention record (`records.rs`).
-//! - GC marks from refs and pins and sweeps unmarked objects older than the grace (`gc.rs`). So
-//!   whatever newly references an object makes it young first: `put` and `reuse` touch it, and
-//!   `pin` and `update_ref` touch their new roots' closures.
+//! - One retention regime (`retention.rs`): holds, header files and `local/` refs root objects;
+//!   all else is cache, kept for a TTL after its last use and evicted least recently used first
+//!   when the disk runs low. GC marks and sweeps (`gc.rs`) what is older than the grace, so
+//!   whatever newly references an object makes it young first: `put` and `reuse` touch it.
 //! - Processes share a store with no leases, markers or boot-time rehash: a torn write never has
 //!   a name, and an open descriptor outlives an unlink.
 
-mod cache;
 mod checkpoint;
 mod folder;
 mod gc;
 mod records;
 pub(crate) mod retention;
 
-#[doc(hidden)]
-pub use cache::CacheGuard;
-pub use checkpoint::{wanted, Checkpoint, ChunkRead, Piece, Placed, ReadPlan};
-pub use gc::{Collected, PinUsage, Usage};
+pub use checkpoint::{wanted, Checkpoint};
+pub use gc::Collected;
 pub(crate) use records::is_name;
-pub use records::Pin;
+pub use retention::TTL;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use platform::durable::{self, DiskClass, FileId};
 
@@ -46,7 +44,7 @@ use crate::sha256::{hex, Sha256};
 
 /// [`crate::STORE_FORMAT`] as the store's `format` record.
 const FORMAT: &str = "tensorfs.store/3";
-const LAYOUT: [&str; 4] = ["blobs", "refs", "pins", "tmp"];
+const LAYOUT: [&str; 6] = ["blobs", "refs", "holds", "files", "uses", "tmp"];
 
 /// How long an unreferenced object outlives its last write or reuse.
 pub const GRACE: Duration = Duration::from_secs(3600);
@@ -178,19 +176,11 @@ pub(crate) fn same_family(tag: &str, want: &str) -> bool {
     tag.split_once('/').map(|t| t.0) == want.split_once('/').map(|w| w.0)
 }
 
-pub(crate) fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
-}
-
 #[derive(Clone, Debug)]
 pub struct Store {
     root: PathBuf,
     durability: Durability,
     grace: Duration,
-    /// Opted-in consumer cache policy; raw and operator stores remain durable.
-    cache_mode: bool,
     /// This handle admitted objects that no `syncfs` covers yet (ephemeral only).
     unsynced: Arc<AtomicBool>,
 }
@@ -245,7 +235,6 @@ impl Store {
         Ok(Store {
             durability: Durability::of(&root),
             grace: GRACE,
-            cache_mode: false,
             root,
             unsynced: Arc::default(),
         })
@@ -300,7 +289,7 @@ impl Store {
         if let Some(expect) = expect {
             self.path(expect)?;
         }
-        if !self.cache_maintain(expect.map_or(0, |object| object.length))? {
+        if !self.maintain(expect.map_or(0, |object| object.length))? {
             return Err(Error::Full { op: "admit", path: self.root.clone() });
         }
         let (temp, file) = self.temp("put")?;
@@ -347,7 +336,7 @@ impl Store {
     /// True when `object` is here, and then it is young for GC: call it before referencing an
     /// object this process did not just put.
     pub fn reuse(&self, object: &ObjectRef) -> Result<bool> {
-        let Some(file) = self.hold(&object.sha256)? else {
+        let Some(file) = self.young(&object.sha256)? else {
             return Ok(false);
         };
         let length = file
@@ -470,7 +459,7 @@ impl Store {
     /// Opens object `sha256` and makes it young; `None` when it is gone. One a sweep is moving
     /// right now is taken back from GC's trash. It is held only once, after the touch, its name
     /// names it again: a sweep that moves it from then on finds it young and puts it back.
-    fn hold(&self, sha256: &str) -> Result<Option<File>> {
+    fn young(&self, sha256: &str) -> Result<Option<File>> {
         let blob = self.blob(sha256)?;
         let trash = self.trash(sha256);
         loop {
@@ -502,7 +491,7 @@ impl Store {
 
     /// Names a finished temp `blob`, unless a copy is there already, which is kept young.
     fn install(&self, temp: &Path, blob: &Path, sha256: &str) -> Result<()> {
-        if self.hold(sha256)?.is_some() {
+        if self.young(sha256)?.is_some() {
             let _ = fs::remove_file(temp);
             return Ok(());
         }
@@ -637,11 +626,6 @@ impl Write for Admission {
                     "longer than the expected object",
                 ));
             }
-        }
-        match self.store.cache_maintain(bytes.len() as u64) {
-            Ok(true) => {}
-            Ok(false) => return Err(io::Error::new(io::ErrorKind::StorageFull, "cache reserve exhausted")),
-            Err(error) => return Err(io::Error::other(error)),
         }
         let file = self
             .file

@@ -10,27 +10,25 @@ use std::sync::Arc;
 
 use platform::durable;
 
+use super::retention::{self, Hold};
 use super::{fail, invalid, Error, Result, Store};
-use super::retention::{self, DirectoryGuard, Retention};
-use crate::format::layout::ALIGN;
-use crate::io::{Copy, Dst, ReadOpts, Src};
 use crate::format::{
     self, decode, variant_of, variant_path, Body, Component, Header, Location, ObjectRef,
     PartBytes, Pipeline, Tensor, Tree, CHUNKS_DIR,
 };
+use crate::io::{Copy, Dst, ReadOpts, Src};
 use crate::sha256::{hex, Sha256};
 
 /// One cozytensors: its parsed header, and where its chunks and assets are read. Opening one
 /// reads the header and nothing more; a chunk is found when it is read, so some may be absent
-/// (a pull of some components, a thin folder).
+/// (a pull of some components, a thin folder). While open, it holds what it reads from a store.
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
     objects: Objects,
     id: ObjectRef,
     header: Arc<Header>,
     header_file: Option<PathBuf>,
-    _retention: Option<Arc<Retention>>,
-    _directories: Arc<[DirectoryGuard]>,
+    _hold: Option<Arc<Hold>>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,27 +38,15 @@ enum Objects {
     Folder { dir: PathBuf, cache: Option<Store> },
 }
 
-fn cached_directory(store: &Store, dir: &Path) -> Result<Option<DirectoryGuard>> {
-    let root = fs::canonicalize(store.root()).map_err(fail("resolve", store.root()))?;
-    let real = fs::canonicalize(dir).map_err(fail("resolve", dir))?;
-    for area in ["snapshots", "views"] {
-        if let Ok(relative) = real.strip_prefix(root.join(area)) {
-            if let Some(first) = relative.components().next() {
-                return retention::directory(store, &root.join(area).join(first.as_os_str())).map(Some);
-            }
-        }
-    }
-    Ok(None)
-}
-
 impl Store {
     /// The cozytensors whose header is `header`.
     pub fn checkpoint(&self, header: &ObjectRef) -> Result<Checkpoint> {
-        let acquisition = retention::acquire(self)?;
-        let ck = Checkpoint::opened(Objects::Store(self.clone()), header.clone(), Header::from_cbor(&self.read(header)?)?, None)?;
-        drop(acquisition);
-        self.cache_touch(header)?;
-        let _ = self.cache_maintain(0)?;
+        let fence = retention::acquire(self)?;
+        let parsed = Header::from_cbor(&self.read(header)?)?;
+        let ck = Checkpoint::opened(Objects::Store(self.clone()), header.clone(), parsed, None)?;
+        drop(fence);
+        self.used(&header.sha256, ck.closure())?;
+        self.maintain(0)?;
         Ok(ck)
     }
 
@@ -71,57 +57,50 @@ impl Store {
 
     /// `variant` of `tree` (its only one when `None`).
     pub fn variant(&self, tree: &ObjectRef, variant: Option<&str>) -> Result<Checkpoint> {
-        let acquisition = retention::acquire(self)?;
+        let fence = retention::acquire(self)?;
         let parsed = self.tree(tree)?;
         let header = parsed.variant(variant)?.1;
         let ck = Checkpoint::opened(Objects::Store(self.clone()), header.clone(), Header::from_cbor(&self.read(header)?)?, None)?;
-        if let Some(hold) = &ck._retention {
-            hold.extend(std::iter::once(tree.clone()).chain(parsed.files.values().cloned()))?;
+        let files = std::iter::once(tree).chain(parsed.files.values());
+        if let Some(hold) = &ck._hold {
+            hold.extend(files.clone().map(|o| o.sha256.clone()))?;
         }
-        drop(acquisition);
-        self.cache_touch(header)?;
-        let _ = self.cache_maintain(0)?;
+        drop(fence);
+        self.used(&tree.sha256, files.chain(ck.closure()))?;
+        self.maintain(0)?;
         Ok(ck)
     }
 }
 
 impl Checkpoint {
+    /// Holds the header and what it cites in the store it reads, and the snapshot folder it is in.
     fn opened(objects: Objects, id: ObjectRef, header: Header, header_file: Option<PathBuf>) -> Result<Self> {
-        let store = match &objects {
-            Objects::Store(store) | Objects::Folder { cache: Some(store), .. } => Some(store),
+        let hold = match &objects {
+            Objects::Store(store) | Objects::Folder { cache: Some(store), .. } => {
+                let mut held: Vec<String> = std::iter::once(&id).chain(header.objects()).map(|o| o.sha256.clone()).collect();
+                if let Objects::Folder { dir, .. } = &objects {
+                    let real = fs::canonicalize(dir).ok();
+                    let snapshot = real.as_deref().and_then(|r| r.strip_prefix(store.root().join("snapshots")).ok());
+                    held.extend(snapshot.and_then(|p| p.iter().next()?.to_str().map(str::to_owned)));
+                }
+                Some(Hold::new(store, held)?)
+            }
             Objects::Folder { cache: None, .. } => None,
         };
-        let mut directories = Vec::new();
-        let hold = if let Some(store) = store {
-            let hold = Retention::new(store, std::iter::once(id.clone()).chain(header.objects().cloned()))?;
-            // Retain existing compatibility folders without creating unused areas or sidecars.
-            // These immutable descriptors survive fork without touching an inherited mutex.
-            let view = store.root().join("views").join(&id.sha256);
-            if view.is_dir() {
-                directories.push(retention::directory(store, &view)?);
-            }
-            if matches!(&objects, Objects::Store(_)) {
-                let snapshot = store.root().join("snapshots").join(&id.sha256);
-                if snapshot.is_dir() {
-                    directories.push(retention::directory(store, &snapshot)?);
-                }
-            } else if let Objects::Folder { dir, .. } = &objects {
-                if let Some(guard) = cached_directory(store, dir)? { directories.push(guard); }
-            }
-            Some(hold)
-        } else { None };
-        Ok(Self { objects, id, header: Arc::new(header), header_file, _retention: hold, _directories: directories.into() })
+        Ok(Self { objects, id, header: Arc::new(header), header_file, _hold: hold })
+    }
+
+    /// The header and every object it cites.
+    fn closure(&self) -> impl Iterator<Item = &ObjectRef> {
+        std::iter::once(&self.id).chain(self.header.objects())
     }
 
     /// `variant` of the plain folder `dir` (its only one when `None`): its header file, and its
     /// chunks and assets from `dir/chunks/`, else from `cache`. Lengths are checked; digests are
     /// checked where bytes enter a store ([`Store::admit_folder`]).
     pub fn folder(dir: &Path, variant: Option<&str>, cache: Option<&Store>) -> Result<Checkpoint> {
-        let _acquisition = cache.map(retention::acquire).transpose()?;
-        // Hold the actual source directory before its header is read. A collector cannot
-        // prune a cached snapshot between metadata parsing and owner publication.
-        let source_dir = if dir.is_file() { dir.parent().unwrap_or_else(|| Path::new(".")) } else { dir };
-        let _source_directory = cache.map(|store| cached_directory(store, source_dir)).transpose()?.flatten();
+        // No collection runs between reading the header and holding what it names.
+        let _fence = cache.map(retention::acquire).transpose()?;
         if dir.is_file() {
             let parent = dir.parent().unwrap_or_else(|| Path::new("."));
             let bytes = fs::read(dir).map_err(fail("read", dir))?;
@@ -229,11 +208,10 @@ impl Checkpoint {
             Objects::Folder { dir, .. } => Ok(dir.clone()),
             Objects::Store(store) => {
                 let dir = store.root().join("snapshots").join(&self.id.sha256);
-                store.cache_snapshot(&dir)?;
+                store.used(&self.id.sha256, self.closure())?;
                 let mut tree = Tree::default();
                 tree.set_variant(variant, self.id.clone());
                 store.snapshot(&store.put_tree(&tree)?, &dir, None)?;
-                store.cache_snapshot(&dir)?;
                 Ok(dir)
             }
         }
@@ -422,71 +400,6 @@ impl Checkpoint {
             }
         }
     }
-
-    /// Reads for `tensors` (all their parts), merged per chunk: every read starts and ends on
-    /// [`ALIGN`] in its chunk and lands at an aligned offset of one buffer, so O_DIRECT can fill
-    /// it. Reads go in chunk order, which is the writer's execution order.
-    pub fn plan(&self, tensors: &[(&str, &str)]) -> Result<ReadPlan> {
-        let mut wanted: Vec<(usize, Location, Placed)> = Vec::new();
-        for (component, key) in tensors {
-            let tensor = self.tensor(component, key)?;
-            for (role, at) in tensor.locations() {
-                let placed = Placed {
-                    component: component.to_string(),
-                    key: key.to_string(),
-                    role: role.to_string(),
-                    pieces: Vec::new(),
-                };
-                wanted.push((wanted.len(), at, placed));
-            }
-        }
-        // Each part's spans, then all spans in chunk order.
-        let mut spans: Vec<(usize, u64, u64, usize)> = Vec::new();
-        for (i, at, _) in &wanted {
-            spans.extend(
-                self.header
-                    .spans(at)
-                    .into_iter()
-                    .map(|s| (s.chunk, s.start, s.length, *i)),
-            );
-        }
-        spans.sort();
-        let mut reads: Vec<ChunkRead> = Vec::new();
-        let mut bytes = 0;
-        for (chunk, start, length, part) in spans {
-            let (first, end) = (align_down(start), (start + length).next_multiple_of(ALIGN));
-            let merge = reads
-                .last()
-                .is_some_and(|r| r.chunk == chunk && first <= r.offset + r.length);
-            if !merge {
-                reads.push(ChunkRead {
-                    chunk,
-                    object: self.header.chunks[chunk].clone(),
-                    offset: first,
-                    length: 0,
-                    dest: bytes,
-                });
-            }
-            let read = reads.last_mut().expect("a read was pushed");
-            read.length = read.length.max(end - read.offset);
-            bytes = read.dest + read.length;
-            let dest = read.dest + start - read.offset;
-            let pieces = &mut wanted[part].2.pieces;
-            match pieces.last_mut() {
-                Some(last) if last.dest + last.length == dest => last.length += length,
-                _ => pieces.push(Piece { dest, length }),
-            }
-        }
-        Ok(ReadPlan {
-            reads,
-            parts: wanted.into_iter().map(|(_, _, placed)| placed).collect(),
-            bytes,
-        })
-    }
-}
-
-fn align_down(n: u64) -> u64 {
-    n - n % ALIGN
 }
 
 fn absent(component: &str, key: &str) -> super::Error {
@@ -556,41 +469,4 @@ pub fn wanted(header: &Header, components: Option<&[String]>) -> Result<Vec<Obje
         }
     }
     Ok(out)
-}
-
-/// A merged read plan over chunks for a set of tensors.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadPlan {
-    pub reads: Vec<ChunkRead>,
-    /// Each part's place in the buffer, in the order asked (a plain tensor is role `""`).
-    pub parts: Vec<Placed>,
-    /// The buffer's size.
-    pub bytes: u64,
-}
-
-/// `length` bytes of chunk `chunk` from `offset`, into the buffer at `dest`; all three are
-/// multiples of [`ALIGN`]. The file may end before `offset + length`: the read is then short.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChunkRead {
-    pub chunk: usize,
-    pub object: ObjectRef,
-    pub offset: u64,
-    pub length: u64,
-    pub dest: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Placed {
-    pub component: String,
-    pub key: String,
-    pub role: String,
-    /// Where the part's bytes land, in order. One piece for a checkpoint written by the chunk
-    /// rule; another writer's part spanning unaligned chunk ends takes several.
-    pub pieces: Vec<Piece>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Piece {
-    pub dest: u64,
-    pub length: u64,
 }

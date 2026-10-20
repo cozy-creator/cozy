@@ -18,7 +18,7 @@ use crate::failure::{fail, Failure, Kind, Result};
 use crate::fetch::{self, Client, Endpoint, Fetcher, Fresh, Origin, Payload, SourcePolicy, Want};
 use crate::format::{Component, Config, Header, ObjectRef, Release, Repo, Tree, Value, HEADER_PATH};
 use crate::import::{layout, remote};
-use crate::store::{Pin, Store};
+use crate::store::Store;
 
 /// A family's pinned upstream and what it fills where a lane has none: a path, a folder
 /// (`tokenizer/`), or `README`/`LICENSE` (any top-level file so named).
@@ -469,22 +469,13 @@ async fn upload(endpoint: &Endpoint, objects: &Objects) -> Result<(usize, u64)> 
     Ok(sent)
 }
 
-/// The store at `root` in place: pins naming old objects go, the format record becomes this
-/// build's, and each repo of `refs/` migrates through the store as a directory endpoint.
+/// The store at `root` in place: its pins go (a store has none now), the format record becomes
+/// this build's, and each repo of `refs/` migrates through the store as a directory endpoint.
 pub fn store(root: &Path, migrator: &mut Migrator) -> Result<Json> {
     let root = root.canonicalize()?;
-    let mut dropped = 0;
-    for file in fs::read_dir(root.join("pins")).into_iter().flatten() {
-        let path = file?.path();
-        let pin: Option<Pin> = fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
-        let old = |o: &ObjectRef| {
-            let doc = |b: &[u8]| serde_json::from_slice::<Doc>(b).is_ok_and(|d| d.format.starts_with("tensorfs.manifest/"));
-            fs::read(root.join(o.key())).is_ok_and(|b| b.first() == Some(&0x85) || doc(&b))
-        };
-        if pin.is_none_or(|p| p.roots.iter().any(old)) {
-            fs::remove_file(&path)?;
-            dropped += 1;
-        }
+    let dropped = fs::read_dir(root.join("pins")).map_or(0, |d| d.count());
+    if dropped > 0 {
+        fs::remove_dir_all(root.join("pins"))?;
     }
     let io = |e: platform::Error| Failure { kind: Kind::Io, detail: e.to_string() };
     let format = format!("{{\"format\":\"tensorfs.store/{}\"}}", crate::STORE_FORMAT);

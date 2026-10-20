@@ -192,7 +192,7 @@ impl Client {
         if config.cache_dir.as_os_str().is_empty() {
             return fail(Kind::Invalid, "name cache_dir or set TENSORFS_HOME/HOME");
         }
-        let store = Store::open(&config.cache_dir)?.with_cache();
+        let store = Store::open(&config.cache_dir)?;
         Ok(Self {
             store,
             config: Arc::new(config),
@@ -212,6 +212,11 @@ impl Client {
                 options.variant.as_deref(),
                 Some(&self.store),
             )?;
+            // A header file is a handle into the cache, rooted where it is opened; the cache's
+            // own files are not.
+            if path.is_file() && !path.starts_with(self.store.root()) {
+                self.store.root_file(&path, raw.id())?;
+            }
             let source = remote::Remote {
                 store: self.store.clone(),
                 endpoint: Endpoint::with_config(
@@ -240,8 +245,7 @@ impl Client {
         Ok(checkpoint)
     }
 
-    /// Retains every fetched object while building the view. Explicit local_dir
-    /// belongs to the caller, even when it happens to sit below snapshots/.
+    /// Holds every fetched object while building the view. A `local_dir` belongs to the caller.
     pub async fn materialize(
         &self,
         reference: &Ref,
@@ -286,7 +290,7 @@ impl Client {
         for (_, header) in parsed.variants() {
             objects.extend(self.store.checkpoint(header)?.header().objects().cloned());
         }
-        let _hold = self.store.cache_hold(&objects)?;
+        let _hold = self.store.hold(&objects)?;
         let total = objects.iter().map(|object| object.length).sum();
         if let Some(report) = progress {
             report(0, total)?;
