@@ -4194,9 +4194,17 @@ fn owns_birth(leader: &Birth, followers: &[platform::process::Exact], candidate:
 }
 
 fn executor_births(leader: &Birth, followers: &[platform::process::Exact]) -> Vec<Birth> {
-    let mut processes = platform::process::group_members(leader);
-    processes.extend(followers.iter().map(|exact| exact.birth().clone()));
+    let mut processes: Vec<_> = followers.iter().map(|exact| exact.birth().clone()).collect();
     processes.push(leader.clone());
+    let current = || Birth::of(leader.pid).ok().as_ref() == Some(leader);
+    if current() {
+        let members = platform::process::group_members(leader);
+        if current() {
+            for member in members {
+                if !processes.contains(&member) { processes.push(member); }
+            }
+        }
+    }
     processes
 }
 
@@ -4207,10 +4215,10 @@ fn defer_completion(
     engine.defer_completion(id, outcome, executor_births(leader, followers))
 }
 
-/// Complete a quiescent PrepareRequest refusal, before the executor returns to the pool.
+/// Hold a quiescent PrepareRequest outcome until the executor returns to the pool.
 fn complete_preentry(
-    engine: &Arc<Engine>, id: &str, _leader: &Birth,
-    _followers: &[platform::process::Exact], prepared: &Frame,
+    engine: &Arc<Engine>, id: &str, leader: &Birth,
+    followers: &[platform::process::Exact], prepared: &Frame,
     triage: impl FnOnce(&device_executor::Outcome),
 ) -> io::Result<()> {
     let outcome = if prepared.terminal == "canceled" && engine.get(id)?.cancel_actor.is_some() {
@@ -4223,16 +4231,13 @@ fn complete_preentry(
         });
         Outcome::Failed(Failure::executor(terminal, &prepared.origin, &prepared.code, &prepared.detail))
     };
-    engine.finish(id, outcome).map(drop)
+    defer_completion(engine, id, leader, followers, outcome)
 }
 
 fn await_executor_exit(engine: &Arc<Engine>, births: &[Birth]) {
     let exited = || -> io::Result<bool> {
         for birth in births {
             if !birth.ended()? { return Ok(false); }
-            if platform::process::group_members(birth).iter().any(|b| !b.ended().unwrap_or(false)) {
-                return Ok(false);
-            }
         }
         Ok(true)
     };
@@ -4244,8 +4249,7 @@ fn await_executor_exit(engine: &Arc<Engine>, births: &[Birth]) {
             Ok(false) => (),
             Err(error) => tracing::warn!("pending executor exit remains unproven: {error}"),
         }
-        let members = births.iter().flat_map(platform::process::group_members);
-        for birth in births.iter().cloned().chain(members) {
+        for birth in births.iter().cloned() {
             if watched.insert(birth.clone()) {
                 if let Err(error) = engine.watch_process(birth) {
                     tracing::warn!("pending executor exit observer: {error}");
@@ -5494,10 +5498,11 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
             stale.start_ticks = stale.start_ticks.checked_sub(1).unwrap();
             assert!(stale.ended().unwrap());
             assert!(platform::process::group_members(&stale).contains(&foreign_member.1));
+            let captured_stale = executor_births(&stale, &[]);
             let pending = crate::journal::PendingCompletion { outcome: Outcome::Canceled, processes: vec![stale.clone()] };
             let journal_ready = pending.exited().unwrap();
             let mut known = Child::in_group(0);
-            let recorded = vec![stale, known.1.clone()];
+            let recorded = vec![stale.clone(), known.1.clone()];
             let pending = crate::journal::PendingCompletion { outcome: Outcome::Canceled, processes: recorded.clone() };
             assert!(!pending.exited().unwrap(), "a recorded live process still blocks completion");
             let (root, pool, engine) = pool_of(0);
@@ -5509,6 +5514,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
             foreign_member.end();
             foreign.end();
             waiter.join().unwrap();
+            assert_eq!(captured_stale, vec![stale], "initial capture adopted a reused group");
             assert!(journal_ready, "pending completion adopted the reused PID's foreign group");
             assert!(observed.is_ok() && foreign_live, "exit waiting followed a foreign group after its recorded process ended");
             pool.stop().unwrap();

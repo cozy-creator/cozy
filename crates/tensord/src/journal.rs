@@ -2475,16 +2475,10 @@ pub(crate) struct PendingCompletion {
 }
 impl PendingCompletion {
     pub fn exited(&self) -> io::Result<bool> {
-        // Re-read groups as well: a member born after custody was recorded may outlive its
-        // leader. Unknown identities never count as exit proof.
+        // The captured members outlive their leader; its numeric process group may be reused.
         for birth in &self.processes {
             if !birth.ended()? {
                 return Ok(false);
-            }
-            for member in platform::process::group_members(birth) {
-                if !member.ended()? {
-                    return Ok(false);
-                }
             }
         }
         Ok(true)
