@@ -165,7 +165,7 @@ impl Machines {
         }))
     }
 
-    fn device_key(&self, origin: &Origin) -> Result<DeviceKey, Denied> {
+    pub(crate) fn device_key(&self, origin: &Origin) -> Result<DeviceKey, Denied> {
         let hub = config::Hub {
             name: None,
             origin: origin.clone(),

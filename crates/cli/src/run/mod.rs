@@ -375,6 +375,7 @@ async fn invoke(
         attention_kernel: args.attention_kernel.as_deref().unwrap_or_default(),
     };
     let out = args.out.map(|dir| terms.cwd.join(dir));
+    gpuless(ctx, &on, callable, &target).await;
     let submission = call.submission(on, &hub.origin, &call.spec(&bound)?, Some(&bound), out);
     send(ctx, submission, &terms.key, args.detach).await
 }
@@ -432,6 +433,31 @@ fn fidelity(term: &str) -> Result<String, String> {
 async fn send(ctx: &Context, submission: SubmitRun, key: &str, detach: bool) -> Result<Run, Error> {
     let submitted = submit(ctx, submission, Some(key)).await?;
     follow(ctx, submitted.run, detach).await
+}
+
+/// Warns that a GPU function sent to a ready machine with no supported GPU runs on its CPU, and
+/// how to rent one instead.
+pub(crate) async fn gpuless(ctx: &Context, on: &On, callable: &Callable, target: &str) {
+    let On::Machine(name) = on else { return };
+    if callable.accelerator == Some(false) {
+        return;
+    }
+    let Ok(calcifer) = ctx.calcifer().await else {
+        return;
+    };
+    let Ok(listed) = calcifer.machines().await else {
+        return;
+    };
+    let none = listed.machines.iter().any(|m| {
+        (m.name == *name || m.alias.as_deref() == Some(name))
+            && (m.status.as_ref()).is_some_and(|s| s.phase == "ready" && s.gpus.is_empty())
+    });
+    if none {
+        output::warn(&format!(
+            "{name} has no supported GPU, so {target} runs on its CPU, slowly; \
+             `--on new` rents one: cozy run {target} … --on new"
+        ));
+    }
 }
 
 /// Binds `terms` to `function` of `card`, against its release.
