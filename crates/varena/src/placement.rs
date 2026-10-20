@@ -214,8 +214,15 @@ struct SlackTrim {
     busy: bool,
     changed: bool,
     blocked: bool,
+    published: bool,
 }
 impl SlackTrim {
+    fn publish(&mut self, changed: bool) {
+        self.published |= self.busy;
+        if changed {
+            self.rearm();
+        }
+    }
     fn rearm(&mut self) {
         self.blocked = false;
         self.changed |= self.busy;
@@ -224,11 +231,13 @@ impl SlackTrim {
         debug_assert!(!self.busy);
         self.busy = true;
         self.changed = false;
+        self.published = false;
     }
     fn finish(&mut self, no_progress: bool) {
         self.busy = false;
         self.blocked = no_progress && !self.changed;
         self.changed = false;
+        self.published = false;
     }
     fn pins(&self) -> u32 {
         u32::from(self.busy || self.blocked)
@@ -251,6 +260,9 @@ struct Inner {
 impl Inner {
     fn rearm_slack(&mut self) {
         self.slack_trim.rearm();
+        self.sync_slack_pin();
+    }
+    fn sync_slack_pin(&mut self) {
         if let Some(page) = self
             .table
             .pages
@@ -1532,8 +1544,9 @@ impl Placement {
                 });
             }
         }
+        inner.slack_trim.publish(changed);
         if changed {
-            inner.rearm_slack();
+            inner.sync_slack_pin();
         }
         drop(inner);
         if changed {
@@ -1863,15 +1876,18 @@ impl Placement {
                         };
                         drop(operation);
                         let freed = trim(bytes)?;
-                        if let Some(row) = self
-                            .inner
-                            .lock()
-                            .table
-                            .pages
-                            .iter_mut()
-                            .find(|row| row.id == page)
                         {
-                            row.bytes = row.bytes.saturating_sub(freed);
+                            let mut inner = self.inner.lock();
+                            // An allocator publication is authoritative, including
+                            // a partial trim already reflected in reserved bytes.
+                            // Only callbacks without a publication use delta accounting.
+                            if !inner.slack_trim.published {
+                                if let Some(row) =
+                                    inner.table.pages.iter_mut().find(|row| row.id == page)
+                                {
+                                    row.bytes = row.bytes.saturating_sub(freed);
+                                }
+                            }
                         }
                         callback.keep_pin = freed == 0;
                         drop(callback);
@@ -2404,7 +2420,13 @@ mod gpu_tests {
     fn rearmed_facts_keep_the_callback_pin_and_outlive_its_zero_result() {
         let mut trim = SlackTrim::default();
         trim.begin();
+        trim.publish(false);
+        assert!(trim.published);
+        trim.finish(true);
+        assert_eq!(trim.pins(), 1, "unchanged publication is not progress");
         trim.rearm();
+        trim.begin();
+        trim.publish(true);
         trim.rearm();
         assert_eq!(trim.pins(), 1, "a running callback still owns its pin");
         trim.finish(true);
@@ -2690,6 +2712,7 @@ mod gpu_tests {
         let finish = Arc::new(Mutex::new(finish));
         let release = ReleaseGate(Some(release));
         let (buffers, calls) = (idle.clone(), attempts.clone());
+        let weak = Arc::downgrade(&placement);
         placement.trim_with(Arc::new(move |_| {
             match calls.fetch_add(1, Ordering::AcqRel) {
                 0 => {
@@ -2698,6 +2721,20 @@ mod gpu_tests {
                     Ok(0) // This trim observed the old, still-busy allocation state.
                 }
                 1 => {
+                    let (retired, remaining) = {
+                        let mut buffers = buffers.lock();
+                        let retired = buffers.remove(0);
+                        let remaining = buffers.iter().map(|buffer| buffer.len() as u64).sum();
+                        (retired, remaining)
+                    };
+                    let freed = retired.len() as u64;
+                    drop(retired);
+                    // A real partial free can be measured before the callback
+                    // returns. The published remainder must not be subtracted twice.
+                    weak.upgrade().unwrap().allocator(0, 0, remaining)?;
+                    Ok(freed)
+                }
+                2 => {
                     let buffers = std::mem::take(&mut *buffers.lock());
                     let freed = buffers.iter().map(|buffer| buffer.len() as u64).sum();
                     drop(buffers); // Actual CUDA frees precede the freed-byte report.
@@ -2716,6 +2753,7 @@ mod gpu_tests {
         let trimming = placement.clone();
         let worker = std::thread::spawn(move || trimming.relief(3, 1, false));
         waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+        placement.allocator(0, 4 << 20, 16 << 20).unwrap();
         // This is the actual owner transition: the former live allocation now
         // belongs to the idle cache. Publish it while the old trim is in flight.
         idle.lock().push(live);
@@ -2745,7 +2783,23 @@ mod gpu_tests {
             "a stale zero trim suppressed the now-idle CUDA allocations"
         );
         assert_eq!(attempts.load(Ordering::Acquire), 2);
+        assert_eq!(idle.lock().len(), 1);
+        assert_eq!(
+            placement.available().unwrap(),
+            capacity - weight - (4 << 20),
+            "partial trim bytes were subtracted again after their publication"
+        );
+        assert_eq!(
+            placement.relief(3, 9 << 20, false).unwrap(),
+            Relief::Complete
+        );
+        assert_eq!(attempts.load(Ordering::Acquire), 3);
         assert!(idle.lock().is_empty());
+        assert_eq!(
+            placement.available().unwrap(),
+            capacity - weight,
+            "unchanged-facts callback must retain ordinary freed-byte accounting"
+        );
         assert_eq!(
             placement.resident().unwrap()[0].1,
             weight,
