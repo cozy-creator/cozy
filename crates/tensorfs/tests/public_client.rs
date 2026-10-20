@@ -898,6 +898,7 @@ async fn public_names_match_the_generic_format_with_unicode_reserved_characters_
     let data = fixture(&scratch.0);
     let origin = scratch.0.join("origin");
     let client = Client::new(config(&scratch.0.join("cache"), origin.to_str().unwrap())).unwrap();
+    let offline = Client::new(config(&scratch.0.join("cache"), "http://127.0.0.1:1")).unwrap();
     let endpoint = Endpoint::new(origin.to_str().unwrap(), None).unwrap();
     for name in ["AcMe Space/MoDEL%?#É", "Org%2F/.Hidden", "組/名"] {
         let mut reference: Ref = name.parse().unwrap();
@@ -920,6 +921,18 @@ async fn public_names_match_the_generic_format_with_unicode_reserved_characters_
             .await
             .unwrap();
         assert_eq!(checkpoint.id(), &data.header);
+        let cached = offline
+            .open(
+                name,
+                &Open {
+                    revision: Some("1".into()),
+                    local_files_only: true,
+                    ..Open::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached.id(), &data.header);
         checkpoint.download(&Download::default()).await.unwrap();
         assert_eq!(
             checkpoint.component("model").unwrap().read("w").unwrap(),
