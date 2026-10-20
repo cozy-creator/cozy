@@ -114,6 +114,8 @@ class HostReads(unittest.TestCase):
     def test_encoded_raw_parts_and_logical_bytes(self) -> None:
         raw = self.tensors.read("quantized", decode=False)
         self.assertIsInstance(raw, tfs.Encoded)
+        self.assertIsInstance(self.tensors.read("quantized"), tfs.Encoded)
+        self.assertIsInstance(self.tensors.read(["quantized"])["quantized"], tfs.Encoded)
         self.assertEqual(raw.scheme, "fp8.rowwise")
         self.assertEqual(raw.params, {"axis": 0, "scale_dtype": "F32"})
         self.assertEqual(set(raw.parts), {"weight", "scale"})
@@ -122,13 +124,13 @@ class HostReads(unittest.TestCase):
         self.tensors.read_into("quantized", scale, role="scale", offset=2)
         self.assertEqual(scale, raw.parts["scale"].tobytes()[2:7])
         want = np.repeat(np.array([0.5, 2.0], dtype=np.float32), 16).reshape(2, 16)
-        np.testing.assert_array_equal(np.from_dlpack(self.tensors.read("quantized")), want)
+        np.testing.assert_array_equal(np.from_dlpack(self.tensors.read("quantized", decode=True)), want)
         logical = bytearray(19)
         self.tensors.read_into("quantized", logical, offset=63)
         self.assertEqual(logical, want.tobytes()[63:82])
         self.assertEqual(self.tensors.read("unknown", decode=False).parts["packed"].tobytes(), b"test")
         with self.assertRaises(tfs.UnknownSchemeError):
-            self.tensors.read("unknown")
+            self.tensors.read("unknown", decode=True)
 
     def test_invalid_destinations_ranges_roles_and_devices(self) -> None:
         for out in [b"readonly", memoryview(bytearray(20))[::2]]:

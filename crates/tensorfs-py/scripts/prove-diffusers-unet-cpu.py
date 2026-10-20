@@ -114,7 +114,7 @@ def prove(root, device_name="cpu"):
     assert component.asset("proof.txt") == asset
     assert component.config == config
     with phase("read_all"):
-        arrays = component.tensors.read(device=device_name)
+        arrays = component.tensors.read(device=device_name, decode=True)
     assert set(arrays) == set(state)
     with phase("dlpack_assign_verify"):
         loaded = {key: torch.from_dlpack(array) for key, array in arrays.items()}

@@ -183,13 +183,13 @@ def main() -> None:
         want = getattr(upstream, component).state_dict()
         for key, info in ck.components[component].tensors.items():
             assert info.encoding is None and not hasattr(info, "parts"), (key, info)
-            got = torch.from_dlpack(ck.components[component].tensors.read(key))
+            got = torch.from_dlpack(ck.components[component].tensors.read(key, decode=True))
             assert tuple(got.shape) == info.shape and got.dtype == DTYPES[info.dtype], (key, got.dtype, info)
             if key in want:
                 assert torch.equal(got, want[key]), f"{component}/{key} differs from upstream"
                 compared += 1
     assert compared > 100, compared
-    conv = ck.components["unet"].tensors.read("conv_in.weight")
+    conv = ck.components["unet"].tensors.read("conv_in.weight", decode=True)
     want_np = upstream.unet.state_dict()["conv_in.weight"].numpy()
     assert np.array_equal(np.from_dlpack(conv), want_np), "numpy reads it too"
     assert conv.tobytes() == want_np.tobytes()
@@ -224,7 +224,7 @@ def main() -> None:
     q = ck3.components["extra"].tensors["q.weight"]
     assert q.encoding is not None and q.encoding.scheme == "fp8.rowwise" and set(_raw.parts(ck3, "extra", "q.weight")) == {"weight", "scale"}
     assert str(q.encoding) == 'fp8.rowwise {axis: 0, scale_dtype: "F32"}', q.encoding
-    assert torch.equal(torch.from_dlpack(ck3.components["extra"].tensors.read("q.weight")), torch.tensor([[0.5] * 16, [2.0] * 16]))
+    assert torch.equal(torch.from_dlpack(ck3.components["extra"].tensors.read("q.weight", decode=True)), torch.tensor([[0.5] * 16, [2.0] * 16]))
     try:
         tfs.open("local/nothing", local_files_only=True)
         raise AssertionError("no such ref")
@@ -250,7 +250,7 @@ def main() -> None:
         for key, info in tensors.items():
             assert (parsed.components[component].tensors[key].dtype, parsed.components[component].tensors[key].shape) == (info.dtype, info.shape)
     try:
-        parsed.components["unet"].tensors.read("conv_in.weight")
+        parsed.components["unet"].tensors.read("conv_in.weight", decode=True)
         raise AssertionError("a parsed header has no chunks")
     except tfs.UnsupportedError:
         pass
