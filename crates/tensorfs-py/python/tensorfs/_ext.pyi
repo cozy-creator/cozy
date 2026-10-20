@@ -262,8 +262,8 @@ class _Client:
     def open(self, name_or_path: str, *, revision: str | None = None,
              variant: str | None = None, local_files_only: bool = False,
              lazy: bool = True) -> Checkpoint: ...
-    def materialize(self, repo_id: str, *, revision: str | None = None,
-                          variant: str | None = None, components: Sequence[str] | None = None,
+    def materialize(self, identity: tuple[str, str | None, str | None], *,
+                          components: Sequence[str] | None = None,
                           local_dir: StrPath | None = None, local_files_only: bool = False) -> str: ...
     def download_file(self, repo_id: str, filename: str, *, revision: str | None = None,
                      local_dir: StrPath | None = None, local_files_only: bool = False) -> str: ...

@@ -38,7 +38,7 @@ def open(name_or_path, *, revision=None, variant=None, endpoint=None, local_file
 
 def materialize(repo_id: str, *, revision=None, variant=None, components=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
     return str(_client(cache_dir, endpoint, token, ca_der).materialize(
-        repo_id, revision=revision, variant=variant, components=components,
+        (repo_id, revision, variant), components=components,
         local_dir=local_dir, local_files_only=local_files_only,
     ))
 
