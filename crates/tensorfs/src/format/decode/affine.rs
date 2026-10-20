@@ -221,9 +221,9 @@ impl Packing<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::Dtype;
     use crate::format::decode::grid::{Grid, ScaleLayout};
     use crate::format::decode::plan::{self, Core, Elems, Plan, Post, Term};
-    use crate::format::Dtype;
 
     fn packing(bits: u32, word: u32, axis: usize, fill: Fill, order: Order) -> Packing {
         Packing {
@@ -368,7 +368,7 @@ mod tests {
             bytes: b.to_vec().into(),
         };
         let codes = |term, grid| plan::Codes {
-            bytes: &[0x53, 0x97, 0xf0, 0x18],
+            bytes: (&[0x53, 0x97, 0xf0, 0x18][..]).into(),
             packing: packing(4, 8, 1, Fill::Word, Order::LowFirst),
             flat: false,
             table: None,

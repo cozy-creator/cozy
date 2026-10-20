@@ -7,14 +7,14 @@ use super::affine::{Codes, Fill, Order, Packing};
 use super::grid::{Grid, ScaleLayout};
 use super::int8::ROTATION_SIZE;
 use super::plan::{Codes as PlanCodes, Core, Elems, Plan, Post, RequantCodes, RequantPacking};
-use super::{elem, Allowed, Ctx, Dtypes, Param, Part, Scheme, Shape, View};
+use super::{Allowed, Ctx, Dtypes, Param, Part, Scheme, Shape, View, elem};
 use crate::format::{Result, Value};
 
 const I8: Dtypes = Dtypes::Of(&["I8"]);
 const F32: Dtypes = Dtypes::Of(&["F32"]);
 const S_REL: Dtypes = Dtypes::Of(&["F8_E4M3", "F32"]);
 
-pub const ASYM_W4A8_INT8: Scheme = Scheme {
+pub static ASYM_W4A8_INT8: Scheme = Scheme {
     name: "comfy.asym_w4a8_int8",
     view: View::Matrix,
     params: &[
@@ -38,7 +38,7 @@ pub const ASYM_W4A8_INT8: Scheme = Scheme {
     decode: |c| grouped(c, 4),
 };
 
-pub const W6A8_INT8: Scheme = Scheme {
+pub static W6A8_INT8: Scheme = Scheme {
     name: "comfy.w6a8_int8",
     view: View::Matrix,
     params: &[
@@ -56,7 +56,7 @@ pub const W6A8_INT8: Scheme = Scheme {
     decode: |c| grouped(c, 6),
 };
 
-pub const CONVROT_W4A4: Scheme = Scheme {
+pub static CONVROT_W4A4: Scheme = Scheme {
     name: "comfy.convrot_w4a4",
     view: View::Matrix,
     params: &[ROTATION_SIZE],
@@ -66,9 +66,9 @@ pub const CONVROT_W4A4: Scheme = Scheme {
     ],
     decode: |c| {
         let codes = PlanCodes::new(
-            c.part("weight").bytes,
+            c.source("weight"),
             nibbles(Codes::Signed),
-            c.part("weight_scale"),
+            c.elements("weight_scale"),
             Grid::Row,
         );
         Ok(rotation(
@@ -80,6 +80,12 @@ pub const CONVROT_W4A4: Scheme = Scheme {
         ))
     },
 };
+
+pub(super) fn supports_sources(scheme: &Scheme) -> bool {
+    [&ASYM_W4A8_INT8, &W6A8_INT8, &CONVROT_W4A4]
+        .into_iter()
+        .any(|s| std::ptr::eq(s, scheme))
+}
 
 fn w4_group(v: &Value) -> bool {
     v.as_u64()
@@ -152,27 +158,27 @@ fn rotation<'a>(c: &Ctx<'a>, core: Core<'a>) -> Plan<'a> {
 /// only scale/table metadata; GPU lowering never expands the logical weight on the host.
 fn grouped<'a>(c: &Ctx<'a>, bits: usize) -> Result<Plan<'a>> {
     let codes = RequantCodes {
-        bytes: c.part("weight").bytes,
+        bytes: c.source("weight"),
         packing: if bits == 4 {
             RequantPacking::Nibbles
         } else {
             RequantPacking::SplitSix
         },
         group: c.uint("group_size"),
-        relative: Elems::part(c.part("weight_s_rel")),
+        relative: c.elements("weight_s_rel"),
         table: c
             .has("weight_codebook")
-            .then(|| Elems::part(c.part("weight_codebook"))),
+            .then(|| c.elements("weight_codebook")),
     };
     Ok(rotation(
         c,
         Core::RequantizedRotation {
             codes,
             block: c.uint("rotation_size"),
-            scale: Elems::part(c.part("weight_s_channel")),
+            scale: c.elements("weight_s_channel"),
             correction: c
                 .has("weight_correction")
-                .then(|| Elems::part(c.part("weight_correction"))),
+                .then(|| c.elements("weight_correction")),
         },
     ))
 }

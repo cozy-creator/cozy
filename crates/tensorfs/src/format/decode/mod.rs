@@ -190,6 +190,17 @@ pub struct PartBytes<'a> {
     pub bytes: &'a [u8],
 }
 
+/// Stored part metadata, independent of whether its bytes live on the Host or a device.
+#[derive(Clone, Copy, Debug)]
+pub struct PartMetadata<'a> {
+    pub role: &'a str,
+    pub dtype: &'a Dtype,
+    pub shape: &'a [u64],
+    pub len: usize,
+}
+
+type Slots<'a> = BTreeMap<&'a str, (usize, usize)>;
+
 /// What a decode fn sees: the view, the checked params and the checked parts.
 pub struct Ctx<'a> {
     pub scheme: &'static str,
@@ -199,6 +210,7 @@ pub struct Ctx<'a> {
     pub cols: usize,
     params: &'a BTreeMap<String, Value>,
     parts: &'a BTreeMap<&'a str, PartBytes<'a>>,
+    slots: Option<&'a Slots<'a>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -227,6 +239,19 @@ impl<'a> Ctx<'a> {
     /// A present part (dtype and shape checked against the row).
     pub fn part(&self, role: &str) -> PartBytes<'a> {
         self.parts[role]
+    }
+    /// The SAME checked scheme mapping can refer to an engine-bound input slot.
+    pub(crate) fn source(&self, role: &str) -> plan::Bytes<'a> {
+        match self.slots.and_then(|s| s.get(role)) {
+            Some(&(index, len)) => plan::Bytes::slot(index, len),
+            None => self.part(role).bytes.into(),
+        }
+    }
+    pub(crate) fn elements(&self, role: &str) -> plan::Elems<'a> {
+        plan::Elems {
+            dtype: self.part(role).dtype.clone(),
+            bytes: self.source(role),
+        }
     }
     /// A present part's elements as f32 (`elem::floats`).
     pub fn floats(&self, role: &str) -> Vec<f32> {
@@ -300,8 +325,90 @@ pub fn planned<R>(
     let Some(scheme) = SCHEMES.iter().find(|s| s.name == name) else {
         return Err(Error::UnknownScheme(name.into()));
     };
-    run(scheme, dtype, shape, &encoding.params, parts, read, f).map_err(|e| match e {
+    run(scheme, dtype, shape, &encoding.params, parts, None, read, f).map_err(|e| match e {
         Error::Decode(detail) => Error::Decode(format!("{name}: {detail}")),
+        e => e,
+    })
+}
+
+/// Metadata preflight using the existing registry; no data is read or device initialized.
+pub fn check_metadata(
+    dtype: &Dtype,
+    shape: &[u64],
+    encoding: &Encoding,
+    parts: &[PartMetadata<'_>],
+) -> Result<()> {
+    inputs(dtype, shape, encoding, parts, false, |_, _| Ok(()))
+}
+
+pub(crate) fn supports_sources(encoding: &Encoding) -> bool {
+    SCHEMES
+        .iter()
+        .any(|scheme| scheme.name == encoding.scheme && comfy::supports_sources(scheme))
+}
+
+/// Plan external sources with the SAME U7 Scheme::decode functions used by Host reads.
+pub(crate) fn planned_sources<R>(
+    dtype: &Dtype,
+    shape: &[u64],
+    encoding: &Encoding,
+    parts: &[PartMetadata<'_>],
+    f: impl FnOnce(Plan, Geometry) -> Result<R>,
+) -> Result<R> {
+    inputs(dtype, shape, encoding, parts, true, f)
+}
+
+fn inputs<R>(
+    dtype: &Dtype,
+    shape: &[u64],
+    encoding: &Encoding,
+    parts: &[PartMetadata<'_>],
+    read: bool,
+    f: impl FnOnce(Plan, Geometry) -> Result<R>,
+) -> Result<R> {
+    let name = encoding.scheme.as_str();
+    let scheme = SCHEMES
+        .iter()
+        .find(|s| s.name == name)
+        .copied()
+        .ok_or_else(|| Error::UnknownScheme(name.into()))?;
+    if read && !comfy::supports_sources(scheme) {
+        return Err(Error::Decode(format!(
+            "{name}: resident sources have no device plan"
+        )));
+    }
+    let (mut metadata, mut slots) = (BTreeMap::new(), BTreeMap::new());
+    for (index, p) in parts.iter().enumerate() {
+        if metadata
+            .insert(
+                p.role,
+                PartBytes {
+                    dtype: p.dtype,
+                    shape: p.shape,
+                    bytes: &[],
+                },
+            )
+            .is_some()
+        {
+            return Err(Error::Decode(format!(
+                "{name}: duplicate part {:?}",
+                p.role
+            )));
+        }
+        slots.insert(p.role, (index, p.len));
+    }
+    run(
+        scheme,
+        dtype,
+        shape,
+        &encoding.params,
+        &metadata,
+        Some(&slots),
+        read,
+        f,
+    )
+    .map_err(|e| match e {
+        Error::Decode(d) => Error::Decode(format!("{name}: {d}")),
         e => e,
     })
 }
@@ -312,6 +419,7 @@ fn run<R>(
     shape: &[u64],
     params: &BTreeMap<String, Value>,
     parts: &BTreeMap<&str, PartBytes>,
+    slots: Option<&Slots>,
     read: bool,
     f: impl FnOnce(Plan, Geometry) -> Result<R>,
 ) -> Result<R> {
@@ -367,7 +475,7 @@ fn run<R>(
         _ => {
             return Err(fail(format!(
                 "logical shape {shape:?} is not rank 2 or more"
-            )))
+            )));
         }
     };
     let ctx = Ctx {
@@ -378,6 +486,7 @@ fn run<R>(
         cols,
         params,
         parts,
+        slots,
     };
     for rule in scheme.parts {
         let Some(p) = parts.get(rule.role) else {
@@ -394,7 +503,11 @@ fn run<R>(
             Shape::Exact(want) => p.shape == want.as_slice(),
             Shape::Count(n) => p.shape.iter().try_fold(1u64, |a, b| a.checked_mul(*b)) == Some(n),
         };
-        if !fits || (read && p.dtype.byte_len(p.shape) != Some(p.bytes.len() as u64)) {
+        let len = slots
+            .and_then(|s| s.get(rule.role))
+            .map(|(_, len)| *len)
+            .or_else(|| read.then_some(p.bytes.len()));
+        if !fits || len.is_some_and(|len| p.dtype.byte_len(p.shape) != Some(len as u64)) {
             return Err(fail(format!("part {} has shape {:?}", rule.role, p.shape)));
         }
     }

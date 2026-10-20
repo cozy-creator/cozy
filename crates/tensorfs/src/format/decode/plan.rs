@@ -4,9 +4,9 @@
 
 use std::borrow::Cow;
 
-use super::affine::{Packing, BYTES};
+use super::affine::{BYTES, Packing};
 use super::grid::Grid;
-use super::{blocks, elem, PartBytes};
+use super::{PartBytes, blocks, elem};
 use crate::format::{Dtype, Error, Result};
 
 /// `core` over the `[R, C]` view, then each value `× post`.
@@ -58,7 +58,60 @@ pub enum Post<'a> {
 /// bytes the plan derived (zeros as `U8`/`I8` codes).
 pub struct Elems<'a> {
     pub dtype: Dtype,
-    pub bytes: Cow<'a, [u8]>,
+    pub bytes: Bytes<'a>,
+}
+
+/// A plan input is actual Host bytes or a source-neutral slot bound by the I/O engine.
+/// The format layer contains no device pointer, context or driver.
+pub struct Bytes<'a>(Data<'a>);
+
+enum Data<'a> {
+    Host(Cow<'a, [u8]>),
+    Slot { index: usize, len: usize },
+}
+
+impl<'a> From<&'a [u8]> for Bytes<'a> {
+    fn from(bytes: &'a [u8]) -> Self {
+        Self(Data::Host(Cow::Borrowed(bytes)))
+    }
+}
+impl From<Vec<u8>> for Bytes<'_> {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(Data::Host(Cow::Owned(bytes)))
+    }
+}
+impl<'a> From<Cow<'a, [u8]>> for Bytes<'a> {
+    fn from(bytes: Cow<'a, [u8]>) -> Self {
+        Self(Data::Host(bytes))
+    }
+}
+impl Bytes<'_> {
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            Data::Host(bytes) => bytes.len(),
+            Data::Slot { len, .. } => *len,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn host(&self) -> Result<&[u8]> {
+        match &self.0 {
+            Data::Host(bytes) => Ok(bytes),
+            Data::Slot { .. } => Err(Error::Decode(
+                "resident part bytes require the I/O engine".into(),
+            )),
+        }
+    }
+    pub(crate) fn slot(index: usize, len: usize) -> Self {
+        Self(Data::Slot { index, len })
+    }
+    pub(crate) fn binding(&self) -> Option<(usize, usize)> {
+        match self.0 {
+            Data::Slot { index, len } => Some((index, len)),
+            Data::Host(_) => None,
+        }
+    }
 }
 
 /// Storage for a group-scaled quantizer's unsigned integer codes.
@@ -90,7 +143,7 @@ impl RequantPacking {
 /// `clamp(round_even(level[code] * relative[i,j/group]), -127,127)` as exact i32.
 /// Without a table the level is `code - 2^(bits-1)`.
 pub struct RequantCodes<'a> {
-    pub bytes: &'a [u8],
+    pub bytes: Bytes<'a>,
     pub packing: RequantPacking,
     pub group: usize,
     pub relative: Elems<'a>,
@@ -111,19 +164,20 @@ impl RequantCodes<'_> {
                 "requantized codes have a wrong byte length".into(),
             ));
         }
-        let relative = self.relative.floats();
+        let relative = self.relative.floats()?;
         if rows.checked_mul(cols / self.group) != Some(relative.len()) {
             return Err(Error::Decode("relative scales have a wrong length".into()));
         }
-        let table = self.table.as_ref().map(Elems::floats);
+        let table = self.table.as_ref().map(Elems::floats).transpose()?;
         if table.as_ref().is_some_and(|t| bits != 4 || t.len() != 16) {
             return Err(Error::Decode(
                 "requantized codebook is not16 levels of four-bit codes".into(),
             ));
         }
+        let bytes = self.bytes.host()?;
         let mut out = Vec::with_capacity(rows * cols);
         for i in 0..rows {
-            let row = &self.bytes[i * width..(i + 1) * width];
+            let row = &bytes[i * width..(i + 1) * width];
             for j in 0..cols {
                 let lo = (row[j / 2] >> (4 * (j % 2))) & 15;
                 let q = match self.packing {
@@ -151,19 +205,25 @@ impl<'a> Elems<'a> {
     pub fn part(p: PartBytes<'a>) -> Elems<'a> {
         Elems {
             dtype: p.dtype.clone(),
-            bytes: Cow::Borrowed(p.bytes),
+            bytes: p.bytes.into(),
         }
     }
 
     pub fn f32(v: f32) -> Elems<'static> {
         Elems {
             dtype: Dtype::F32,
-            bytes: Cow::Owned(v.to_le_bytes().to_vec()),
+            bytes: v.to_le_bytes().to_vec().into(),
         }
     }
 
-    pub fn floats(&self) -> Vec<f32> {
-        elem::floats(&self.dtype, &self.bytes)
+    pub fn floats(&self) -> Result<Vec<f32>> {
+        Ok(elem::floats(&self.dtype, self.bytes.host()?))
+    }
+}
+
+impl<'a> From<PartBytes<'a>> for Elems<'a> {
+    fn from(part: PartBytes<'a>) -> Self {
+        Self::part(part)
     }
 }
 
@@ -176,7 +236,7 @@ pub enum Term<'a> {
 
 /// `q × s`, `(q − z) × s`, `q × s + b` or `table[q] × s` on `grid`, then the global factor.
 pub struct Codes<'a> {
-    pub bytes: &'a [u8],
+    pub bytes: Bytes<'a>,
     pub packing: Packing<'a>,
     /// One lane over the whole tensor in row-major order (§5's `F4`), not one lane per row.
     pub flat: bool,
@@ -192,17 +252,17 @@ pub struct Codes<'a> {
 impl<'a> Codes<'a> {
     /// `× s` of `scale` on `grid`, nothing else.
     pub fn new(
-        bytes: &'a [u8],
+        bytes: impl Into<Bytes<'a>>,
         packing: Packing<'a>,
-        scale: PartBytes<'a>,
+        scale: impl Into<Elems<'a>>,
         grid: Grid,
     ) -> Codes<'a> {
         Codes {
-            bytes,
+            bytes: bytes.into(),
             packing,
             flat: false,
             table: None,
-            scale: Elems::part(scale),
+            scale: scale.into(),
             grid,
             term: Term::None,
             global: None,
@@ -219,23 +279,23 @@ impl<'a> Codes<'a> {
 
     pub fn unpack(&self, rows: usize, cols: usize) -> Result<Vec<i32>> {
         match self.flat {
-            true => self.packing.unpack(self.bytes, 1, rows * cols),
-            false => self.packing.unpack(self.bytes, rows, cols),
+            true => self.packing.unpack(self.bytes.host()?, 1, rows * cols),
+            false => self.packing.unpack(self.bytes.host()?, rows, cols),
         }
     }
 
     /// The values of codes `q`, each operation one f32 rounding, left to right.
     fn values(&self, q: &[i32], rows: usize, cols: usize, height: usize) -> Result<Vec<f32>> {
-        let s = self.scale.floats();
+        let s = self.scale.floats()?;
         let (z, b) = match &self.term {
             Term::None => (None, None),
-            Term::Zero(z) => (Some(z.floats()), None),
-            Term::Bias(b) => (None, Some(b.floats())),
+            Term::Zero(z) => (Some(z.floats()?), None),
+            Term::Bias(b) => (None, Some(b.floats()?)),
         };
-        let g = self
-            .global
-            .as_ref()
-            .map(|(g, divide)| (g.floats(), *divide));
+        let g = match &self.global {
+            Some((g, divide)) => Some((g.floats()?, *divide)),
+            None => None,
+        };
         let mut out = Vec::with_capacity(rows * cols);
         for i in 0..rows {
             let g = g
@@ -307,8 +367,8 @@ impl Plan<'_> {
                 let group = codes.group;
                 let mut q = codes.unpack(rows, cols)?;
                 q.chunks_mut(block).for_each(hadamard);
-                let scale = scale.floats();
-                let correction = correction.as_ref().map(Elems::floats);
+                let scale = scale.floats()?;
+                let correction = correction.as_ref().map(Elems::floats).transpose()?;
                 if scale.len() != rows
                     || correction
                         .as_ref()
@@ -340,11 +400,11 @@ impl Plan<'_> {
         match self.post {
             Post::None => {}
             Post::One(f) => {
-                let f = f.floats()[0];
+                let f = f.floats()?[0];
                 v.iter_mut().for_each(|x| *x *= f);
             }
             Post::Cols(f) => {
-                let f = f.floats();
+                let f = f.floats()?;
                 (v.iter_mut().enumerate()).for_each(|(k, x)| *x *= f[k % cols]);
             }
         }
