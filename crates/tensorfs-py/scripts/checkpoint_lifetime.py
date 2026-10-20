@@ -50,13 +50,15 @@ with tempfile.TemporaryDirectory() as temp:
         component = writer.component("model", cls="test.Model", config={"size": 4})
         component.put("weight", b"data", dtype="U8", shape=[4])
         component.asset("vocab.txt", b"a\nb\n")
-    tensorfs.export(writer.commit(), root / "source", format="cozytensors")
+    tensorfs.materialize(writer.commit(), local_dir=root / "source")
     endpoint = (root / "origin").as_uri()
     tensorfs.upload_folder(repo_id="acme/lifetime", revision="one", folder_path=root / "source",
                            endpoint=endpoint, cache_dir=root / "upload")
     with serve(root / "origin") as endpoint:
         provider = Provider()
         alive = weakref.ref(provider)
+        released = threading.Event()
+        weakref.finalize(provider, released.set)
         checkpoint = tensorfs.open("acme/lifetime", revision="one", endpoint=endpoint,
                                    token=provider, cache_dir=root / "reader")
         assert provider.calls > 0, "the real HTTP transport did not use the provider"
@@ -77,31 +79,37 @@ with tempfile.TemporaryDirectory() as temp:
         array = tensors.read("weight")
         del tensors
         gc.collect()
+        assert released.wait(10), "deferred final Tensors release did not finish within 10 seconds"
         assert alive() is None, "the dropped checkpoint/components/Tensors retained their request provider"
         assert array.tobytes() == b"data", "Array bytes depend on the checkpoint/provider lifetime"
 
         provider = Provider()
         alive = weakref.ref(provider)
+        released = threading.Event()
+        weakref.finalize(provider, released.set)
         checkpoint = tensorfs.open("acme/lifetime", revision="one", endpoint=endpoint,
                                    token=provider, cache_dir=root / "close-reader")
         assert "model" in checkpoint.components
         del provider
         checkpoint.close()
         gc.collect()
+        assert released.wait(10), "deferred closed-parent release did not finish within 10 seconds"
         assert alive() is None, "a closed parent retained its cached components/provider"
 
         provider = Provider()
         alive = weakref.ref(provider)
+        released = threading.Event()
+        weakref.finalize(provider, released.set)
         checkpoint = tensorfs.open("acme/lifetime", revision="one", endpoint=endpoint,
                                    token=provider, cache_dir=root / "race-reader")
         provider.block = True
         entered, resume = provider.entered, provider.resume
-        fetch = checkpoint.fetch
+        download = checkpoint.download
         errors = []
 
         def fetching():
             try:
-                fetch()
+                download()
             except BaseException as error:
                 errors.append(error)
 
@@ -116,9 +124,33 @@ with tempfile.TemporaryDirectory() as temp:
         resume.set()
         thread.join(10)
         assert not thread.is_alive() and not errors, errors
-        del fetch, checkpoint
+        del download, checkpoint
         gc.collect()
+        assert released.wait(10), "deferred completed-call release did not finish within 10 seconds"
         assert alive() is None, "a completed call retained its closed parent's provider"
+
+        # Keep the exception traceback (and the facade's local checkpoint) alive. Its
+        # finally-close must still release native access after materialization fails.
+        provider = Provider()
+        alive = weakref.ref(provider)
+        released = threading.Event()
+        weakref.finalize(provider, released.set)
+        blocked = root / "blocked-materialize"
+        blocked.write_bytes(b"not a directory")
+        failures = []
+        try:
+            tensorfs.materialize("acme/lifetime", revision="one", endpoint=endpoint,
+                                 token=provider, cache_dir=root / "materialize-reader",
+                                 local_dir=blocked, format="safetensors")
+        except tensorfs.Error as error:
+            failures.append(error)
+        else:
+            raise AssertionError("materialization accepted a file as its destination directory")
+        assert provider.calls > 0 and failures[0].__traceback__ is not None
+        del provider
+        gc.collect()
+        assert released.wait(10), "failed materialization did not close its temporary checkpoint"
+        assert alive() is None, "a retained traceback kept temporary checkpoint access alive"
 
     with tensorfs.open(root / "source", cache_dir=root / "isolated") as checkpoint:
         assert checkpoint.__enter__() is checkpoint
@@ -153,7 +185,7 @@ with tempfile.TemporaryDirectory() as temp:
         header.write_bytes(saved_header)
         assert checkpoint.verify().ok
         descriptor = checkpoint.open_chunk(part.chunk)
-    for call in [lambda: checkpoint.components, lambda: checkpoint.missing(), lambda: checkpoint.fetch(),
+    for call in [lambda: checkpoint.components, lambda: checkpoint.missing(), lambda: checkpoint.download(),
                  lambda: checkpoint.open_chunk(0), lambda: checkpoint.verify(), lambda: checkpoint.__enter__()]:
         try:
             call()

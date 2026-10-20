@@ -10,7 +10,7 @@ use crate::format::{Header, ObjectRef, Tree};
 use crate::store2::Store;
 
 use super::provider::from_native;
-use super::{io_failure, Checkpoint, Endpoint, Fetch, Fetched, Ref};
+use super::{io_failure, Checkpoint, Endpoint, Download, Fetched, Ref};
 
 #[derive(Clone)]
 pub(super) struct Remote {
@@ -21,7 +21,7 @@ pub(super) struct Remote {
 }
 
 impl Remote {
-    pub async fn fetch(&self, objects: &[ObjectRef], want: &Fetch<'_>) -> Result<Fetched> {
+    pub async fn fetch(&self, objects: &[ObjectRef], want: &Download<'_>) -> Result<Fetched> {
         let unique: BTreeMap<_, _> = objects.iter().map(|o| (&o.sha256, o.clone())).collect();
         let objects: Vec<_> = unique.into_values().collect();
         let _hold = self.store.cache_hold(&objects)?;
@@ -235,7 +235,7 @@ impl Remote {
     pub async fn open(&self, mut reference: Ref) -> Result<Checkpoint> {
         let (root, version) = self.root(&reference).await?;
         let _root_hold = self.store.cache_hold(std::slice::from_ref(&root))?;
-        self.fetch(std::slice::from_ref(&root), &Fetch::default())
+        self.fetch(std::slice::from_ref(&root), &Download::default())
             .await?;
         let bytes = self.store.read(&root)?;
         let (tree, header, variant, mut extra) = match Tree::from_json(&bytes) {
@@ -255,7 +255,7 @@ impl Remote {
             }
         };
         let _metadata_hold = self.store.cache_hold(std::slice::from_ref(&header))?;
-        self.fetch(std::slice::from_ref(&header), &Fetch::default())
+        self.fetch(std::slice::from_ref(&header), &Download::default())
             .await?;
         let raw = match &tree {
             Some(tree) => self.store.variant(tree, variant.as_deref())?,
@@ -285,12 +285,12 @@ impl Remote {
     pub async fn snapshot(
         &self,
         reference: &Ref,
-        want: &Fetch<'_>,
+        want: &Download<'_>,
         local_dir: Option<&Path>,
     ) -> Result<PathBuf> {
         let (root, version) = self.root(reference).await?;
         let _root_hold = self.store.cache_hold(std::slice::from_ref(&root))?;
-        self.fetch(std::slice::from_ref(&root), &Fetch::default())
+        self.fetch(std::slice::from_ref(&root), &Download::default())
             .await?;
         let tree = self.store.tree(&root)?;
         let headers: Vec<_> = match reference.variant.as_deref() {
@@ -298,7 +298,7 @@ impl Remote {
             None => tree.variants().map(|(_, h)| h.clone()).collect(),
         };
         let _header_hold = self.store.cache_hold(&headers)?;
-        self.fetch(&headers, &Fetch::default()).await?;
+        self.fetch(&headers, &Download::default()).await?;
         let mut payload = Vec::new();
         for header in &headers {
             payload.extend(super::selection::objects(
@@ -366,7 +366,7 @@ impl Remote {
     ) -> Result<PathBuf> {
         let (root, version) = self.root(reference).await?;
         let _root_hold = self.store.cache_hold(std::slice::from_ref(&root))?;
-        self.fetch(std::slice::from_ref(&root), &Fetch::default())
+        self.fetch(std::slice::from_ref(&root), &Download::default())
             .await?;
         let tree = self.store.tree(&root)?;
         let object = tree.files.get(filename).ok_or_else(|| Failure {
@@ -374,7 +374,7 @@ impl Remote {
             detail: format!("no repo file {filename:?}"),
         })?;
         let _object_hold = self.store.cache_hold(std::slice::from_ref(object))?;
-        self.fetch(std::slice::from_ref(object), &Fetch::default())
+        self.fetch(std::slice::from_ref(object), &Download::default())
             .await?;
         self.remember(reference, &root, version.as_deref())?;
         let folder = local_dir

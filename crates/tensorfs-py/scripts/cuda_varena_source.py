@@ -84,7 +84,7 @@ def fixture(tensorfs):
             writer.component("model", cls="test.Model", config={}).put(
                 "weight", DATA, dtype="U8", shape=[len(DATA)]
             )
-        tensorfs.export(writer.commit(), root / "source", format="cozytensors")
+        tensorfs.materialize(writer.commit(), local_dir=root / "source")
         tensorfs.upload_folder(
             repo_id="acme/placement",
             revision="one",

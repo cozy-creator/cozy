@@ -15,7 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tensorfs::format::{self, Body, Dtype, Header, Location, ObjectRef, Tensor};
 use tensorfs::{
-    bearer, Client, Config, Endpoint, Failure, Fetch, Kind, Open, Ref, Request, Selection,
+    bearer, Client, Config, Endpoint, Failure, Download, Kind, Open, Ref, Request, Selection,
     TokenProvider,
 };
 
@@ -262,6 +262,92 @@ fn owned_fds(root: &Path) -> usize {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn eager_open_downloads_checkpoint_bytes_without_materializing_a_repository() {
+    assert!(Open::default().lazy);
+    let scratch = Scratch::new();
+    let data = fixture(&scratch.0);
+    let origin = scratch.0.join("origin");
+    let producer = Client::new(config(
+        &scratch.0.join("producer"),
+        &format!("file://{}", origin.display()),
+    ))
+    .unwrap();
+    let tree = producer
+        .upload_folder(&"account/eager@1".parse().unwrap(), &data.folder, None)
+        .await
+        .unwrap();
+    let http = Http::new(origin);
+    let cache = scratch.0.join("consumer");
+    let client = Client::new(config(&cache, &http.url)).unwrap();
+    let options = Open {
+        revision: Some("1".into()),
+        ..Open::default()
+    };
+    let lazy = client.open("account/eager", &options).await.unwrap();
+    assert!(!lazy.missing(&Selection::All).unwrap().is_empty());
+    assert!(!http.fetched(&data.chunks[0]) && !http.fetched(&data.asset));
+    let eager = client
+        .open("account/eager", &Open { lazy: false, ..options.clone() })
+        .await
+        .unwrap();
+    assert!(eager.missing(&Selection::All).unwrap().is_empty());
+    for object in data.chunks.iter().chain([&data.asset]) {
+        assert!(http.fetched(object));
+    }
+    assert!(!cache.join("snapshots").join(&tree.sha256).exists());
+    let readme = ObjectRef::of(b"local fixture, no downloaded model\n");
+    assert!(!http.fetched(&readme), "eager open downloaded a repository file");
+    let requests = http.requests.lock().unwrap().len();
+    assert!(client
+        .open("account/eager", &Open { lazy: false, local_files_only: true, ..options.clone() })
+        .await
+        .is_ok());
+    fs::remove_file(cache.join(data.chunks[0].key())).unwrap();
+    assert_eq!(client
+        .open("account/eager", &Open { lazy: false, local_files_only: true, ..options })
+        .await
+        .unwrap_err()
+        .kind, Kind::NotFound);
+    assert_eq!(http.requests.lock().unwrap().len(), requests);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn eager_local_header_honors_offline_before_using_its_configured_origin() {
+    let scratch = Scratch::new();
+    let data = fixture(&scratch.0);
+    let origin = scratch.0.join("origin");
+    let producer = Client::new(config(
+        &scratch.0.join("producer"),
+        &format!("file://{}", origin.display()),
+    ))
+    .unwrap();
+    producer
+        .upload_folder(&"account/local@1".parse().unwrap(), &data.folder, None)
+        .await
+        .unwrap();
+    let http = Http::new(origin);
+    let header = scratch.0.join("local.cozytensors");
+    fs::copy(data.folder.join("model.cozytensors"), &header).unwrap();
+    let client = Client::new(config(&scratch.0.join("consumer"), &http.url)).unwrap();
+    let source = header.to_str().unwrap();
+    assert!(client.open(source, &Open::default()).await.is_ok());
+    assert_eq!(client
+        .open(source, &Open { lazy: false, local_files_only: true, ..Open::default() })
+        .await
+        .unwrap_err()
+        .kind, Kind::NotFound);
+    assert!(http.requests.lock().unwrap().is_empty());
+    let eager = client
+        .open(source, &Open { lazy: false, ..Open::default() })
+        .await
+        .unwrap();
+    assert_eq!(eager.id(), &data.header);
+    assert!(eager.missing(&Selection::All).unwrap().is_empty());
+    assert_eq!(eager.component("model").unwrap().read("w").unwrap(), b"abcdefghijklmnop");
+    assert!(!scratch.0.join("chunks").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn actual_public_client_selects_fetches_and_retains_children() {
     let scratch = Scratch::new();
     let data = fixture(&scratch.0);
@@ -309,12 +395,12 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
         "unfetched support-file export created output"
     );
     checkpoint
-        .fetch(&Fetch {
+        .download(&Download {
             selection: Selection::Assets {
                 component: "tokenizer".into(),
                 names: None,
             },
-            ..Fetch::default()
+            ..Download::default()
         })
         .await
         .unwrap();
@@ -347,14 +433,14 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
     assert!(!http.fetched(&data.chunks[0]) && !http.fetched(&data.chunks[2]));
 
     checkpoint
-        .fetch(&Fetch {
+        .download(&Download {
             selection: Selection::Part {
                 component: "model".into(),
                 key: "w".into(),
                 role: Some(String::new()),
                 range: Some(0..4),
             },
-            ..Fetch::default()
+            ..Download::default()
         })
         .await
         .unwrap();
@@ -364,27 +450,27 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
     component.read_part_into("w", "", 0, &mut prefix).unwrap();
     assert_eq!(&prefix, b"abcd");
     let invalid = checkpoint
-        .fetch(&Fetch {
+        .download(&Download {
             selection: Selection::Part {
                 component: "model".into(),
                 key: "w".into(),
                 role: Some(String::new()),
                 range: Some(15..17),
             },
-            ..Fetch::default()
+            ..Download::default()
         })
         .await
         .unwrap_err();
     assert_eq!(invalid.kind, Kind::Invalid);
 
-    checkpoint.fetch(&Fetch::default()).await.unwrap();
+    checkpoint.download(&Download::default()).await.unwrap();
     assert!(checkpoint.missing(&Selection::All).unwrap().is_empty());
-    let selected = Fetch {
+    let selected = Download {
         selection: Selection::Components(vec!["model".into()]),
-        ..Fetch::default()
+        ..Download::default()
     };
     let snapshot = client
-        .snapshot_download(&reference, &selected, None, false)
+        .materialize(&reference, &selected, None, false)
         .await
         .unwrap();
     assert!(snapshot
@@ -408,14 +494,14 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
     fs::write(user_dir.join("mine"), b"owned by caller").unwrap();
     assert_eq!(
         client
-            .snapshot_download(&reference, &selected, Some(&user_dir), false)
+            .materialize(&reference, &selected, Some(&user_dir), false)
             .await
             .unwrap(),
         user_dir
     );
     assert_eq!(fs::read(user_dir.join("mine")).unwrap(), b"owned by caller");
     let readme = client
-        .hub_download(
+        .download_file(
             &reference,
             "README.md",
             Some(&scratch.0.join("readme")),
@@ -433,7 +519,7 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
         .open("account/model@1", &Open::default())
         .await
         .unwrap();
-    warm.fetch(&Fetch::default()).await.unwrap();
+    warm.download(&Download::default()).await.unwrap();
     assert_eq!(
         http.count(),
         before,
@@ -534,13 +620,13 @@ async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects(
         Ok(())
     };
     let landed = checkpoint
-        .fetch(&Fetch {
+        .download(&Download {
             selection: Selection::Tensors {
                 component: "model".into(),
                 keys: vec!["w".into()],
             },
             progress: Some(&report),
-            ..Fetch::default()
+            ..Download::default()
         })
         .await
         .unwrap();
@@ -591,9 +677,6 @@ async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects(
         .iter()
         .cloned()
         .chain(std::iter::once(data.asset.clone()))
-        .chain(std::iter::once(ObjectRef::of(
-            &fs::read(data.folder.join("README.md")).unwrap(),
-        )))
         .collect();
     assert_eq!(
         immutable
@@ -602,7 +685,7 @@ async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects(
             .into_iter()
             .collect::<BTreeSet<_>>(),
         expected,
-        "All names the exact model chunks, asset, and repository file"
+        "All names the exact checkpoint chunks and component assets"
     );
     let named = offline
         .open(
@@ -616,12 +699,12 @@ async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects(
         .unwrap();
     assert_eq!(named.named().unwrap().revision.as_deref(), Some("1"));
     named
-        .fetch(&Fetch {
+        .download(&Download {
             selection: Selection::Assets {
                 component: "tokenizer".into(),
                 names: None,
             },
-            ..Fetch::default()
+            ..Download::default()
         })
         .await
         .unwrap();
@@ -643,9 +726,9 @@ async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects(
     fs::remove_file(&corrupt).unwrap();
     fs::write(corrupt, b"XXXXXXXX").unwrap();
     let error = checkpoint
-        .fetch(&Fetch {
+        .download(&Download {
             selection: Selection::Components(vec!["other".into()]),
-            ..Fetch::default()
+            ..Download::default()
         })
         .await
         .unwrap_err();
@@ -743,12 +826,12 @@ async fn public_provider_headers_and_retry_failures_survive_metadata_and_payload
             (expected.kind, expected.detail.as_str())
         );
         let error = checkpoint
-            .fetch(&Fetch {
+            .download(&Download {
                 selection: Selection::Tensors {
                     component: "model".into(),
                     keys: vec!["w".into()],
                 },
-                ..Fetch::default()
+                ..Download::default()
             })
             .await
             .unwrap_err();
@@ -815,6 +898,7 @@ async fn public_names_match_the_generic_format_with_unicode_reserved_characters_
     let data = fixture(&scratch.0);
     let origin = scratch.0.join("origin");
     let client = Client::new(config(&scratch.0.join("cache"), origin.to_str().unwrap())).unwrap();
+    let offline = Client::new(config(&scratch.0.join("cache"), "http://127.0.0.1:1")).unwrap();
     let endpoint = Endpoint::new(origin.to_str().unwrap(), None).unwrap();
     for name in ["AcMe Space/MoDEL%?#É", "Org%2F/.Hidden", "組/名"] {
         let mut reference: Ref = name.parse().unwrap();
@@ -837,7 +921,19 @@ async fn public_names_match_the_generic_format_with_unicode_reserved_characters_
             .await
             .unwrap();
         assert_eq!(checkpoint.id(), &data.header);
-        checkpoint.fetch(&Fetch::default()).await.unwrap();
+        let cached = offline
+            .open(
+                name,
+                &Open {
+                    revision: Some("1".into()),
+                    local_files_only: true,
+                    ..Open::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached.id(), &data.header);
+        checkpoint.download(&Download::default()).await.unwrap();
         assert_eq!(
             checkpoint.component("model").unwrap().read("w").unwrap(),
             b"abcdefghijklmnop"
@@ -893,7 +989,7 @@ async fn advanced_exact_object_fetch_does_not_widen_the_window_and_uses_the_exis
         tensorfs::raw::fetch_objects(
             &checkpoint,
             &[ObjectRef::of(b"unrelated")],
-            &Fetch::default()
+            &Download::default()
         )
         .await
         .unwrap_err()
@@ -905,13 +1001,13 @@ async fn advanced_exact_object_fetch_does_not_widen_the_window_and_uses_the_exis
         ..data.chunks[0].clone()
     };
     assert_eq!(
-        tensorfs::raw::fetch_objects(&checkpoint, &[wrong_length], &Fetch::default())
+        tensorfs::raw::fetch_objects(&checkpoint, &[wrong_length], &Download::default())
             .await
             .unwrap_err()
             .kind,
         Kind::Invalid
     );
-    tensorfs::raw::fetch_objects(&checkpoint, &data.chunks[..1], &Fetch::default())
+    tensorfs::raw::fetch_objects(&checkpoint, &data.chunks[..1], &Download::default())
         .await
         .unwrap();
     assert!(cache.join(data.chunks[0].key()).exists());

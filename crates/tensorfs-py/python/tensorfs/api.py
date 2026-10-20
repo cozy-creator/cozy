@@ -30,21 +30,48 @@ def _client(cache_dir=None, endpoint=None, token=None, ca_der=None, *, configure
     return _ext._Client(_cache(cache_dir), endpoint=_endpoint(endpoint), token=credential, ca_der=ca_der)
 
 
-def open(name_or_path, *, revision=None, variant=None, endpoint=None, local_files_only=False, cache_dir=None, token=None, ca_der=None):
+def open(name_or_path, *, revision=None, variant=None, endpoint=None, local_files_only=False, cache_dir=None, token=None, ca_der=None, lazy=True):
     return _client(cache_dir, endpoint, token, ca_der).open(
-        os.fspath(name_or_path), revision=revision, variant=variant, local_files_only=local_files_only
+        os.fspath(name_or_path), revision=revision, variant=variant, local_files_only=local_files_only, lazy=lazy
     )
 
 
-def snapshot_download(repo_id: str, *, revision=None, variant=None, components=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
-    return str(_client(cache_dir, endpoint, token, ca_der).snapshot_download(
-        (repo_id, revision, variant), components=components,
-        local_dir=local_dir, local_files_only=local_files_only,
-    ))
+def materialize(source: str | _ext.Checkpoint, *, local_dir=None, format="cozytensors", dequantize=None, revision=None, variant=None, components=None, cache_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
+    if format not in {"cozytensors", "safetensors"}:
+        raise ValueError("format must be cozytensors or safetensors")
+    if format == "cozytensors" and dequantize is not None:
+        raise ValueError("dequantize requires format='safetensors'")
+    if isinstance(source, _ext.Checkpoint):
+        if components is not None:
+            raise ValueError("components selection requires a repository source in cozytensors format")
+        if local_dir is None:
+            raise ValueError("a checkpoint requires an explicit local_dir")
+        if local_files_only or any(value is not None for value in
+                                   (revision, variant, cache_dir, token, endpoint, ca_der)):
+            raise ValueError("repository and client options do not apply to a checkpoint")
+        return str(_ext._materialize(source, local_dir, format=format, dequantize=dequantize))
+    if not isinstance(source, str):
+        raise TypeError("source must be a repository reference or Checkpoint")
+    if format == "cozytensors":
+        return str(_client(cache_dir, endpoint, token, ca_der).materialize(
+            (source, revision, variant), components=components,
+            local_dir=local_dir, local_files_only=local_files_only,
+        ))
+    if components is not None:
+        raise ValueError("components selection is not supported for safetensors materialization")
+    if local_dir is None:
+        raise ValueError("safetensors materialization requires an explicit local_dir")
+    checkpoint = _client(cache_dir, endpoint, token, ca_der).open(
+        source, revision=revision, variant=variant, local_files_only=local_files_only,
+    )
+    try:
+        return str(_ext._materialize(checkpoint, local_dir, format=format, dequantize=dequantize))
+    finally:
+        checkpoint.close()
 
 
-def hub_download(repo_id: str, filename: str, *, revision=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
-    return str(_client(cache_dir, endpoint, token, ca_der).hub_download(
+def download_file(repo_id: str, filename: str, *, revision=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
+    return str(_client(cache_dir, endpoint, token, ca_der).download_file(
         repo_id, filename, revision=revision, local_dir=local_dir, local_files_only=local_files_only,
     ))
 
@@ -53,20 +80,10 @@ def upload_folder(*, repo_id: str, folder_path, revision=None, token=None, endpo
     return _client(cache_dir, endpoint, token, ca_der).upload_folder(Path(folder_path), repo_id, revision)
 
 
-def convert(source: str | Sequence[str], *, converter=None, variant=None, cache_dir=None, token=None, progress=None):
-    return _client(cache_dir, token=token, configured_token=False).convert(
+def convert_to_cozytensors(source: str | Sequence[str], *, converter=None, variant=None, cache_dir=None, token=None, progress=None):
+    return _client(cache_dir, token=token, configured_token=False).convert_to_cozytensors(
         source, converter=converter, variant=variant, progress=progress,
     )
-
-
-def resolve_source(source: str, *, token=None) -> str:
-    return _client(token=token, configured_token=False).resolve_source(source)
-
-
-def export(src, dir, *, format="safetensors", dequantize=None) -> list[str]:
-    if format not in {"safetensors", "cozytensors"}:
-        raise ValueError("format must be safetensors or cozytensors")
-    return _ext._export(src, dir, format=format, dequantize=dequantize)
 
 
 class Endpoint:

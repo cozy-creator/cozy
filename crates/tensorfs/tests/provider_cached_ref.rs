@@ -13,7 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tensorfs::format::{Dtype, ObjectRef, Repo};
 use tensorfs::{
-    export, Client, Config, Endpoint, Failure, Fetch, Format, Kind, Open, Request, TokenProvider,
+    Client, Config, Download, Endpoint, Failure, Format, Kind, Open, Request, TokenProvider,
     WriterOptions,
 };
 
@@ -200,7 +200,10 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
         .unwrap();
     let checkpoint = writer.commit().await.unwrap();
     let folder = scratch.0.join("portable");
-    export(&checkpoint, &folder, Format::Cozytensors, None).unwrap();
+    checkpoint
+        .materialize(&folder, Format::Cozytensors, None)
+        .await
+        .unwrap();
     let tree = producer
         .upload_folder(&"acme/provider@1".parse().unwrap(), &folder, None)
         .await
@@ -221,7 +224,7 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
     .await
     .unwrap()
     .unwrap();
-    warm.fetch(&Fetch::default()).await.unwrap();
+    warm.download(&Download::default()).await.unwrap();
     assert_eq!(warm.component("model").unwrap().read("w").unwrap(), WEIGHT);
     assert_eq!(warm.tree(), Some(&tree));
     assert!(

@@ -17,11 +17,11 @@ pub fn regions(
     crate::client::regions(header, max_bytes, boundaries, only)
 }
 
-/// Fetch exactly these objects after checking that they belong to the checkpoint.
+/// Download exactly these objects after checking that they belong to the checkpoint.
 pub async fn fetch_objects(
     checkpoint: &crate::Checkpoint,
     objects: &[crate::format::ObjectRef],
-    want: &crate::Fetch<'_>,
+    want: &crate::Download<'_>,
 ) -> Result<crate::Fetched> {
     checkpoint.fetch_objects_exact(objects, want).await
 }

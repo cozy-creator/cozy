@@ -127,12 +127,26 @@ fn is_digest(s: &str) -> bool {
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Open {
     pub revision: Option<String>,
     pub variant: Option<String>,
     pub endpoint: Option<String>,
     pub local_files_only: bool,
+    /// Load metadata only by default; false also waits for this checkpoint's bytes.
+    pub lazy: bool,
+}
+
+impl Default for Open {
+    fn default() -> Self {
+        Self {
+            revision: None,
+            variant: None,
+            endpoint: None,
+            local_files_only: false,
+            lazy: true,
+        }
+    }
 }
 
 /// A failing progress callback cancels this fetch. Values are held and total bytes.
@@ -160,7 +174,7 @@ pub enum Selection {
 }
 
 #[derive(Default)]
-pub struct Fetch<'a> {
+pub struct Download<'a> {
     pub selection: Selection,
     pub priority: u64,
     pub progress: Option<&'a Progress<'a>>,
@@ -186,10 +200,10 @@ impl Client {
     }
 
     /// One path for a plain folder, local identity, digest, or remote repository.
-    /// Remote opens fetch metadata only. Payload movement is explicitly async.
+    /// Lazy opens return metadata only; eager opens await this checkpoint's bytes.
     pub async fn open(&self, name_or_path: &str, options: &Open) -> Result<Checkpoint> {
         let path = Path::new(name_or_path);
-        if path.exists() {
+        let checkpoint = if path.exists() {
             let path = path
                 .canonicalize()
                 .map_err(|e| io_failure(path.display(), e))?;
@@ -207,26 +221,31 @@ impl Client {
                 mirror: self.config.mirror.clone(),
                 offline: options.local_files_only,
             };
-            return Checkpoint::local(raw, source, &path);
+            Checkpoint::local(raw, source, &path)?
+        } else {
+            let mut reference: Ref = name_or_path.parse()?;
+            if let Some(revision) = &options.revision {
+                reference.revision = Some(revision.clone());
+            }
+            if let Some(variant) = &options.variant {
+                reference.variant = Some(variant.clone());
+            }
+            reference.endpoint = options.endpoint.clone();
+            let source = self.source(&reference, options.local_files_only)?;
+            source.open(reference).await?
+        };
+        if !options.lazy {
+            checkpoint.download(&Download::default()).await?;
         }
-        let mut reference: Ref = name_or_path.parse()?;
-        if let Some(revision) = &options.revision {
-            reference.revision = Some(revision.clone());
-        }
-        if let Some(variant) = &options.variant {
-            reference.variant = Some(variant.clone());
-        }
-        reference.endpoint = options.endpoint.clone();
-        let source = self.source(&reference, options.local_files_only)?;
-        source.open(reference).await
+        Ok(checkpoint)
     }
 
     /// Retains every fetched object while building the view. Explicit local_dir
     /// belongs to the caller, even when it happens to sit below snapshots/.
-    pub async fn snapshot_download(
+    pub async fn materialize(
         &self,
         reference: &Ref,
-        want: &Fetch<'_>,
+        want: &Download<'_>,
         local_dir: Option<&Path>,
         local_files_only: bool,
     ) -> Result<PathBuf> {
@@ -234,7 +253,7 @@ impl Client {
         source.snapshot(reference, want, local_dir).await
     }
 
-    pub async fn hub_download(
+    pub async fn download_file(
         &self,
         reference: &Ref,
         filename: &str,
@@ -321,29 +340,9 @@ fn io_failure(context: impl fmt::Display, error: std::io::Error) -> Failure {
     }
 }
 
-/// Output supported by the existing serializer; payload must be fetched before this sync door.
+/// Output supported by the existing serializer.
 #[derive(Clone, Copy, Debug)]
 pub enum Format {
     Safetensors,
     Cozytensors,
-}
-
-pub fn export(
-    checkpoint: &Checkpoint,
-    dir: &Path,
-    format: Format,
-    dequantize: Option<crate::format::Dtype>,
-) -> Result<Vec<String>> {
-    match format {
-        Format::Safetensors => checkpoint.export_to(dir, dequantize.as_ref()),
-        Format::Cozytensors => {
-            if dequantize.is_some() {
-                return fail(
-                    Kind::Invalid,
-                    "native cozytensors export preserves encoded bytes; dequantize is unsupported",
-                );
-            }
-            checkpoint.export_cozytensors(dir)
-        }
-    }
 }

@@ -224,7 +224,7 @@ class Checkpoint:
     def metadata(self) -> dict[str, Any]: ...
     def missing(self, components: Sequence[str] | None = None) -> list[tuple[str, int]]:
         """The chunks and assets of `components` (all when None) not here."""
-    def fetch(self, components: Sequence[str] | None = None, *, priority: int = 0,
+    def download(self, components: Sequence[str] | None = None, *, priority: int = 0,
               progress: Callable[[str, int, int], object] | None = None) -> None: ...
 
 class ComponentWriter:
@@ -270,18 +270,18 @@ class _Client:
     def __init__(self, root: StrPath, *, endpoint: str | None = None,
                  token: _Token | None = None, ca_der: bytes | None = None) -> None: ...
     def open(self, name_or_path: str, *, revision: str | None = None,
-             variant: str | None = None, local_files_only: bool = False) -> Checkpoint: ...
-    def snapshot_download(self, identity: tuple[str, str | None, str | None], *,
+             variant: str | None = None, local_files_only: bool = False,
+             lazy: bool = True) -> Checkpoint: ...
+    def materialize(self, identity: tuple[str, str | None, str | None], *,
                           components: Sequence[str] | None = None,
                           local_dir: StrPath | None = None, local_files_only: bool = False) -> str: ...
-    def hub_download(self, repo_id: str, filename: str, *, revision: str | None = None,
+    def download_file(self, repo_id: str, filename: str, *, revision: str | None = None,
                      local_dir: StrPath | None = None, local_files_only: bool = False) -> str: ...
     def upload_folder(self, folder_path: StrPath, repo_id: str,
                       revision: str | None = None) -> str: ...
-    def convert(self, source: str | Sequence[str], *, converter: str | None = None,
+    def convert_to_cozytensors(self, source: str | Sequence[str], *, converter: str | None = None,
                 variant: str | None = None,
                 progress: Callable[[str, int, int], object] | None = None) -> Checkpoint: ...
-    def resolve_source(self, source: str) -> str: ...
 
 
 class DPoP:
@@ -305,5 +305,5 @@ class Endpoint:
 
 _Token = str | DPoP | TokenProvider | Callable[[str, str, Mapping[str, str], str | None], Mapping[str, str]]
 
-def _export(checkpoint: Checkpoint, directory: StrPath, *, format: str = "safetensors",
-            dequantize: str | None = None) -> list[str]: ...
+def _materialize(checkpoint: Checkpoint, directory: StrPath, *, format: str = "cozytensors",
+                 dequantize: str | None = None) -> str: ...

@@ -171,8 +171,8 @@ def main() -> None:
 
     # 2. The Python API.
     tfs.configure(cache_dir=work / "c")
-    m = tfs.convert(f"hf://{REPO}")
-    folder = tfs.snapshot_download(m.tree, local_files_only=True)
+    m = tfs.convert_to_cozytensors(f"hf://{REPO}")
+    folder = tfs.materialize(m.tree, local_files_only=True)
     tfs.upload_folder(repo_id=NAME, revision="1", folder_path=folder)
     assert m.id == f"sha256:{imported['header']['sha256']}", "imports are deterministic"
     ck = tfs.open(NAME, revision="1", local_files_only=True)
@@ -198,14 +198,14 @@ def main() -> None:
     assert sorted(names) == sorted(f"{c}/{k}" for c, component in ck.components.items() for k in component.tensors), "every tensor in one region"
     print(f"Python: {compared} tensors equal upstream's through DLPack; {len(grouped)} regions")
 
-    written = tfs.export(m, work / "out2")
-    assert "unet/diffusion_pytorch_model.safetensors" in written
+    written = pathlib.Path(tfs.materialize(m, local_dir=work / "out2", format="safetensors"))
+    assert (written / "unet/diffusion_pytorch_model.safetensors").is_file()
     assert tree(work / "out2") == tree(work / "out"), "the Python export is the CLI's, byte for byte"
     same_image(work / "out2", reference)
     origin = (work / "origin2").as_uri()
     remote_name = "conformance/tiny-sdxl"
     tfs.upload_folder(repo_id=remote_name, revision="1", folder_path=folder, endpoint=origin)
-    downloaded = tfs.snapshot_download(remote_name, revision="1", endpoint=origin, cache_dir=work / "d")
+    downloaded = tfs.materialize(remote_name, revision="1", endpoint=origin, cache_dir=work / "d")
     assert tfs.open(downloaded).id == m.id
 
     w = tfs.Writer(base=m)
