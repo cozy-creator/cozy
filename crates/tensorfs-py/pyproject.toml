@@ -1,23 +1,49 @@
 [build-system]
 requires = ["maturin>=1.15,<2"]
-build-backend = "maturin"
+# maturin, behind a clear refusal when an sdist build finds no Rust (backend/tensorfs_build.py).
+build-backend = "tensorfs_build"
+backend-path = ["backend"]
 
 [project]
 name = "tensorfs"
 version = "0.11.0"
-description = "TensorFS — canonical tensor artifact substrate"
-requires-python = ">=3.12"
+description = "Load, store and share model weights: a self-describing tensor format, a deduplicating local store and the tfs CLI"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Cozy Creator" }]
+requires-python = ">=3.10"
+keywords = ["model weights", "tensors", "safetensors", "quantization", "pytorch", "diffusers"]
 classifiers = [
-    "Programming Language :: Python :: 3",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[project.urls]
+Homepage = "https://github.com/cozy-creator/cozy-creator/tree/master/crates/tensorfs-py"
+Documentation = "https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs-py/API.md"
+Repository = "https://github.com/cozy-creator/cozy-creator"
+Issues = "https://github.com/cozy-creator/cozy-creator/issues"
 
 [tool.maturin]
 manifest-path = "Cargo.toml"
 module-name = "tensorfs._ext"
 python-source = "python"
-features = ["extension-module", "store"]
+# abi3 needs the limited API's buffer protocol, which starts at 3.11: one cp311-abi3 wheel serves
+# 3.11 and later, and a cp310 wheel serves 3.10 (`-i python3.10 python3.11` builds both).
+features = ["extension-module", "store", { feature = "pyo3/abi3-py311", python-version = ">=3.11" }]
 # One artifact, one version (tfs-051): the wheel carries the `tfs` binary at
 # .data/scripts/, so `pip install tensorfs==<v>` yields module AND CLI everywhere.
 # maturin cannot build a bin target beside a pyo3 extension, so the binary is staged
@@ -27,5 +53,5 @@ data = "wheel-data"
 # Git and the sdist carry the empty data dir through this placeholder, so a source build (a
 # git dependency or the sdist) works; it never ships in a wheel. tensorfs carries the
 # documents it compiles in itself (crates/tensorfs/vectors/).
-include = [{ path = "wheel-data/scripts/.gitkeep", format = "sdist" }]
+include = [{ path = "wheel-data/scripts/.gitkeep", format = "sdist" }, { path = "backend/*.py", format = "sdist" }, { path = "LICENSE", format = "sdist" }]
 exclude = [{ path = "wheel-data/scripts/.gitkeep", format = "wheel" }]

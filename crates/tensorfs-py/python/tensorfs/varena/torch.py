@@ -124,7 +124,7 @@ class _Short(Exception):
 
 
 #: `bind(key, parts)`: a stored tensor's part views -> the module tensors they become, by name.
-type Bind = Callable[[str, Mapping[str, Tensor]], Mapping[str, Tensor]]
+Bind: TypeAlias = "Callable[[str, Mapping[str, Tensor]], Mapping[str, Tensor]]"
 
 
 class Fill(Protocol):

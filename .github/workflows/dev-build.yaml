@@ -167,7 +167,7 @@ jobs:
           target: x86_64
           manylinux: auto
           working-directory: crates/tensorfs-py
-          args: --release --locked --target-dir ../../target/manylinux --out dist
+          args: --release --locked --target-dir ../../target/manylinux --out dist -i python3.11
           docker-options: -e TENSORFS_REQUIRE_AOT=1
           before-script-linux: |
             cargo build --release --locked --target-dir ../../target/manylinux -p tensorfs --bin tfs

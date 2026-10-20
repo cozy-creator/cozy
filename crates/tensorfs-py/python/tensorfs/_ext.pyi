@@ -1,9 +1,10 @@
 """`tensorfs._ext`, checked against the built extension by `scripts/stub_conform.py`."""
 
-from collections.abc import Buffer, Callable, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
+from collections.abc import Callable, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
 from os import PathLike
 from types import ModuleType
 from typing import Any, Protocol, TypeVar, overload
+from typing_extensions import Buffer
 
 __version__: str
 STORE_FORMAT: int

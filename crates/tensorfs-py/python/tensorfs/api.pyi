@@ -1,7 +1,8 @@
-from collections.abc import Buffer, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from os import PathLike
 from types import TracebackType
 from typing import Protocol
+from typing_extensions import Buffer
 
 from ._ext import Checkpoint, Component, TokenProvider
 
