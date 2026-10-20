@@ -398,11 +398,8 @@ fn _export(
         _ => return Err(invalid(py, "format must be safetensors or cozytensors")),
     };
     let dtype = dequantize.map(|d| Dtype::parse(&d.to_ascii_uppercase()));
-    py.detach(move || {
-        bridge(checkpoint.download(&Download::default()))?;
-        tensorfs::export(&checkpoint, &directory, format, dtype)
-    })
-    .or_raise(py)
+    py.detach(move || bridge(tensorfs::export(&checkpoint, &directory, format, dtype)))
+        .or_raise(py)
 }
 
 // ---------------------------------------------------------------- checkpoints

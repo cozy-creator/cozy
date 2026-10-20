@@ -2,12 +2,17 @@
 #![cfg(feature = "store")]
 
 use std::fs::{self, File, TryLockError};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use tensorfs::format::{Body, Component, Dtype, Header, Location, ObjectRef, Tensor, Tree};
 use tensorfs::store2::{Checkpoint, Store};
-use tensorfs::{Client, Config, Download, Open};
+use tensorfs::{Client, Config, Download, Format, Kind, Open, Ref};
 
 const README: &[u8] = b"known repository file outside the checkpoint";
 
@@ -152,4 +157,183 @@ fn explicit_cached_folder_retains_its_existing_directory() {
         !store.root().join("views").exists(),
         "opening an explicit snapshot created an unused views area"
     );
+}
+
+struct Http {
+    url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Http {
+    fn new(root: PathBuf, repo_status: u16) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (ending, seen) = (Arc::clone(&stop), Arc::clone(&requests));
+        let worker = thread::spawn(move || {
+            while !ending.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => Self::serve(stream, &root, repo_status, &seen),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            }
+        });
+        Self {
+            url,
+            requests,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn serve(mut stream: TcpStream, root: &Path, repo_status: u16, seen: &Mutex<Vec<String>>) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0];
+        while !request.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).unwrap_or(0) == 0 {
+                return;
+            }
+            request.push(byte[0]);
+            assert!(request.len() < 32_768);
+        }
+        let request = String::from_utf8(request).unwrap();
+        let mut first = request.lines().next().unwrap().split_whitespace();
+        let method = first.next().unwrap();
+        let path = first.next().unwrap();
+        seen.lock().unwrap().push(path.to_owned());
+        assert!(!path.contains(".."));
+        let (status, bytes) =
+            if path.trim_start_matches('/') == ObjectRef::of(README).key() && repo_status != 200 {
+                (repo_status, Vec::new())
+            } else {
+                match fs::read(root.join(path.trim_start_matches('/'))) {
+                    Ok(bytes) => (200, bytes),
+                    Err(_) => (404, Vec::new()),
+                }
+            };
+        let response = format!(
+            "HTTP/1.1 {status} test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        if method != "HEAD" {
+            let _ = stream.write_all(&bytes);
+        }
+    }
+
+    fn repo_requests(&self) -> usize {
+        let path = format!("/{}", ObjectRef::of(README).key());
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| **seen == path)
+            .count()
+    }
+}
+
+impl Drop for Http {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.worker.take().unwrap().join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn explicit_export_fetches_known_repo_files_and_never_omits_refused_files() {
+    for status in [200, 404, 403] {
+        let scratch = Scratch::new();
+        let source = Store::open(scratch.0.join("source")).unwrap();
+        let (header, tree) = seed(&source);
+        source.put_bytes(README).unwrap();
+        let server = Http::new(source.root().to_path_buf(), status);
+        let cache = scratch.0.join("cache");
+        let mut config = Config::from_env();
+        config.cache_dir = cache.clone();
+        config.endpoint = server.url.clone();
+        config.token = None;
+        config.mirror = None;
+        let client = Client::new(config).unwrap();
+        let checkpoint = client
+            .open(
+                &tree.id(),
+                &Open {
+                    variant: Some("main".into()),
+                    lazy: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(checkpoint.missing(&Default::default()).unwrap().is_empty());
+        assert_eq!(
+            server.repo_requests(),
+            0,
+            "ordinary eager open fetched a repo file"
+        );
+        assert!(!cache.join(ObjectRef::of(README).key()).exists());
+        for area in ["views", "snapshots"] {
+            assert!(!cache.join(area).exists());
+        }
+
+        let destination = scratch.0.join("export");
+        let result = tensorfs::export(&checkpoint, &destination, Format::Cozytensors, None).await;
+        assert!(
+            server.repo_requests() > 0,
+            "explicit export did not prepare its repo file"
+        );
+        if status != 200 {
+            assert_eq!(
+                result.unwrap_err().kind,
+                if status == 403 {
+                    Kind::Denied
+                } else {
+                    Kind::NotFound
+                }
+            );
+            assert!(
+                !destination.exists(),
+                "failed export wrote a partial directory"
+            );
+            continue;
+        }
+        result.unwrap();
+        assert_eq!(fs::read(destination.join("README.md")).unwrap(), README);
+        assert_eq!(
+            ObjectRef::of(&fs::read(destination.join("model.main.cozytensors")).unwrap()),
+            header
+        );
+        let snapshot = scratch.0.join("snapshot");
+        let reference = Ref {
+            repo_id: tree.id(),
+            revision: None,
+            variant: Some("main".into()),
+            endpoint: None,
+        };
+        client
+            .materialize(&reference, &Download::default(), Some(&snapshot), false)
+            .await
+            .unwrap();
+        assert_eq!(fs::read(snapshot.join("README.md")).unwrap(), README);
+        assert_eq!(
+            ObjectRef::of(&fs::read(snapshot.join("model.main.cozytensors")).unwrap()),
+            header
+        );
+        for object in checkpoint.header().objects() {
+            assert_eq!(
+                ObjectRef::of(&fs::read(snapshot.join("chunks").join(&object.sha256)).unwrap()),
+                *object
+            );
+        }
+    }
 }

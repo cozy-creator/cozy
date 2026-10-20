@@ -104,11 +104,17 @@ impl Checkpoint {
         let mut directories = Vec::new();
         let hold = if let Some(store) = store {
             let hold = Retention::new(store, std::iter::once(id.clone()).chain(header.objects().cloned()))?;
+            // Retain existing compatibility folders without creating unused areas or sidecars.
             // These immutable descriptors survive fork without touching an inherited mutex.
-            // The sidecars are outside the returned plain folders.
-            directories.push(retention::directory(store, &store.root().join("views").join(&id.sha256))?);
+            let view = store.root().join("views").join(&id.sha256);
+            if view.is_dir() {
+                directories.push(retention::directory(store, &view)?);
+            }
             if matches!(&objects, Objects::Store(_)) {
-                directories.push(retention::directory(store, &store.root().join("snapshots").join(&id.sha256))?);
+                let snapshot = store.root().join("snapshots").join(&id.sha256);
+                if snapshot.is_dir() {
+                    directories.push(retention::directory(store, &snapshot)?);
+                }
             } else if let Objects::Folder { dir, .. } = &objects {
                 if let Some(guard) = cached_directory(store, dir)? { directories.push(guard); }
             }
