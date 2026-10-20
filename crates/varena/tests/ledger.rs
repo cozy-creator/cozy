@@ -307,17 +307,13 @@ fn killed_exporter_leaves_one_importable_page_and_live_eviction_leaves_none() {
 #[test]
 fn ram_service_fills_through_tensorfs_and_retains_a_readers_layout() {
     use std::sync::Arc;
-    use tensorfs::io::{
-        source::{Item, Source},
-        ItemSource,
-    };
+    use tensorfs::io::{source::Item, ItemSource};
     use varena::ledger::RamRegion;
     let fixture = Fixture::new();
     let row = fixture.ledger.claim(std::process::id()).unwrap();
     let grant = fixture.ledger.grant(std::process::id()).unwrap();
     let channel = Channel::new(grant.channel);
     let layout = [9; 32];
-    let source = Arc::new(Source::files(Vec::new(), false, 0));
     let regions = vec![RamRegion {
         offset: 0,
         len: 4,
@@ -328,7 +324,9 @@ fn ram_service_fills_through_tensorfs_and_retains_a_readers_layout() {
             part_end: true,
         }],
     }];
-    assert!(fixture.ledger.cache_ram(layout, source, regions).unwrap());
+    assert!(channel
+        .cache_ram(row.owner(), layout, &[], &regions)
+        .unwrap());
     let view = loop {
         if let Some(view) = channel.ram(row.owner(), layout, 0).unwrap() {
             break view;
