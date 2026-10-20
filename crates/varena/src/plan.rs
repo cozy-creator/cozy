@@ -259,11 +259,11 @@ impl Table {
     }
 
     pub fn class(&self, page: &Page) -> Class {
-        if page.pins != 0 || page.filling || matches!(page.kind, Kind::Context | Kind::Scratch(_)) {
-            return Class::Pinned;
-        }
         if !self.rows.iter().any(|row| row.id == page.row && row.alive) {
             return Class::Orphan;
+        }
+        if page.pins != 0 || page.filling || matches!(page.kind, Kind::Context | Kind::Scratch(_)) {
+            return Class::Pinned;
         }
         if page.kind == Kind::Slack {
             return Class::Free;
@@ -449,6 +449,12 @@ impl<'a> Planner<'a> {
         }
     }
 
+    fn shortfall(&self, need: u64) -> u64 {
+        self.allocated
+            .saturating_sub(self.table.capacity)
+            .saturating_add(need.saturating_sub(self.free))
+    }
+
     fn evict(&mut self, page: &Page) {
         if !self.removed.insert(page.id) {
             return;
@@ -550,7 +556,7 @@ impl<'a> Planner<'a> {
                 None => {
                     self.actions.push(Action::Ask {
                         row,
-                        need: need.saturating_sub(self.free),
+                        need: self.shortfall(need),
                         ceiling,
                     });
                     return true;
@@ -593,12 +599,12 @@ impl<'a> Planner<'a> {
         } else if request.can_lower {
             Action::Lower {
                 request: request.id,
-                need: need.saturating_sub(self.free),
+                need: self.shortfall(need),
             }
         } else {
             Action::Exhausted {
                 request: request.id,
-                need: need.saturating_sub(self.free),
+                need: self.shortfall(need),
             }
         });
         false
@@ -640,10 +646,14 @@ fn demand(table: &Table, id: RequestId, need: u64, page: Option<PageId>) -> Vec<
 fn reclaim(table: &Table, row: RowId, need: u64, ceiling: Class) -> Vec<Action> {
     let mut plan = Planner::new(table);
     let before = plan.allocated;
-    let target = plan.free.saturating_add(need);
-    plan.take(target, |page, class| {
-        page.row == row && class <= ceiling.min(Class::Declared)
-    });
+    for page in
+        plan.candidates(|page, class| page.row == row && class <= ceiling.min(Class::Declared))
+    {
+        if before.saturating_sub(plan.allocated) >= need {
+            break;
+        }
+        plan.evict(page);
+    }
     plan.actions.push(Action::Acknowledge {
         row,
         freed: before.saturating_sub(plan.allocated),
@@ -677,17 +687,17 @@ fn lower(table: &Table, id: RequestId, need: u64) -> Vec<Action> {
         .collect();
     pages.sort_by_key(|page| (std::cmp::Reverse(page.spread_rank), page.id));
     let mut plan = Planner::new(table);
-    let target = plan.free.saturating_add(need);
+    let before = plan.allocated;
     for page in pages {
-        if plan.free >= target {
+        if before.saturating_sub(plan.allocated) >= need {
             break;
         }
         plan.evict(page);
     }
-    if plan.free < target {
+    if before.saturating_sub(plan.allocated) < need {
         plan.actions.push(Action::Exhausted {
             request: id,
-            need: target.saturating_sub(plan.free),
+            need: need.saturating_sub(before.saturating_sub(plan.allocated)),
         });
     }
     plan.actions
