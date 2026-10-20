@@ -621,7 +621,29 @@ fn cgroup_pressure_refuses_warming_without_claiming_readiness_or_blocking_admiss
         return;
     };
     let group = std::path::Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
-    std::fs::write(group.join("memory.max"), (32 << 20).to_string()).unwrap();
+    let limit = group.join("memory.max");
+    if let Err(error) = std::fs::write(&limit, (32 << 20).to_string()) {
+        // systemd delegates membership to the runner but retains ownership of
+        // controller knobs. Only this fixture's freshly created child is changed.
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_some(),
+            "set child limit: {error}"
+        );
+        let mut setter = Command::new("sudo")
+            .args(["-n", "tee"])
+            .arg(&limit)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        setter
+            .stdin
+            .take()
+            .unwrap()
+            .write_all((32 << 20).to_string().as_bytes())
+            .unwrap();
+        assert!(setter.wait().unwrap().success(), "set fixture memory.max");
+    }
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",

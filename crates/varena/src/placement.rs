@@ -77,6 +77,7 @@ struct Model {
     source: Arc<Source>,
     regions: Vec<ledger::RamRegion>,
     ram: Arc<RamWarm>,
+    ram_generation: Option<u64>,
 }
 
 struct RamWarm {
@@ -88,7 +89,7 @@ impl RamWarm {
     fn new() -> Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let token = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .map_err(|_| invalid("RAM registration token exhausted"))?;
@@ -480,6 +481,7 @@ impl Placement {
                     })
                     .collect(),
                 ram: Arc::new(RamWarm::new()?),
+                ram_generation: None,
             },
         );
         self.refresh()?;
@@ -1168,12 +1170,13 @@ impl Placement {
             }
             (model.pages, model.fingerprint, model.ram.token)
         };
-        self.channel
-            .forget_ram(self.row.owner(), fingerprint, token)?;
+        let forgotten = self
+            .channel
+            .forget_ram(self.row.owner(), fingerprint, token);
         for page in pages {
             self.gpu.unregister(page)?;
         }
-        self.refresh()
+        self.refresh().and(forgotten)
     }
 
     pub fn trim_with(&self, trim: Arc<Shrink>) {
@@ -1275,10 +1278,20 @@ impl Placement {
         for (id, state, status) in ram {
             let pages = match inner
                 .models
-                .get(&id)
+                .get_mut(&id)
                 .filter(|model| Arc::ptr_eq(&model.ram, &state))
             {
-                Some(model) => model.pages.clone(),
+                Some(model) => {
+                    if status
+                        .as_ref()
+                        .zip(model.ram_generation)
+                        .is_some_and(|(status, prior)| status.generation < prior)
+                    {
+                        continue;
+                    }
+                    model.ram_generation = status.as_ref().map(|status| status.generation);
+                    model.pages.clone()
+                }
                 None => continue,
             };
             for (index, id) in pages.into_iter().enumerate() {
@@ -1882,7 +1895,9 @@ impl Drop for Registration<'_> {
             }
         }
         let mut inner = self.owner.inner.lock();
-        inner.models.remove(&self.model);
+        if let Some(model) = inner.models.remove(&self.model) {
+            model.ram.cancelled.store(true, Ordering::Release);
+        }
         inner.table.pages.retain(|page| !gone.contains(&page.id));
         inner.retired.extend(retained);
         let _ = self.owner.row.wake();
@@ -1891,6 +1906,12 @@ impl Drop for Registration<'_> {
 
 impl Drop for Placement {
     fn drop(&mut self) {
+        for model in self.inner.get_mut().models.values() {
+            model.ram.cancelled.store(true, Ordering::Release);
+            let _ = self
+                .channel
+                .forget_ram(self.row.owner(), model.fingerprint, model.ram.token);
+        }
         self.stop.store(true, Ordering::Release);
         let _ = self.row.wake();
         if let Some(worker) = self.worker.get_mut().take() {
@@ -2019,6 +2040,112 @@ mod gpu_tests {
             };
             assert_eq!(read, 8, "read ledger event");
         }
+    }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn ram_warm_returns_before_export_and_close_prevents_stale_registration() {
+        let probe = Gpu::open(0).expect("real CUDA device");
+        let uuid = probe.uuid().expect("GPU UUID");
+        let ledger =
+            Ledger::create(&uuid, probe.capacity().expect("capacity")).expect("observer ledger");
+        let grant = ledger.grant_unbound().expect("rank grant");
+        drop(probe);
+        let placement = Placement::open(0, Some((grant.table, grant.events, grant.channel)))
+            .expect("placement");
+        let blocker =
+            platform::shm::frozen("blocked-ram-export", b"data").expect("verified source");
+        blocker.lock().expect("hold the export's shared-lock gate");
+        let file = std::fs::File::from(
+            platform::shm::reopen(blocker.as_fd(), false).expect("source description"),
+        );
+        let object = tensorfs::format::ObjectRef::of(b"data");
+        let length = crate::layout::REGION_ALIGN;
+        let layout = Layout {
+            parts: vec![],
+            regions: vec![crate::layout::Region {
+                offset: 0,
+                nbytes: 4,
+                span: length,
+                items: vec![Item {
+                    offset: 0,
+                    len: 4,
+                    part_end: true,
+                    source: ItemSource::Object(tensorfs::io::ObjectRange {
+                        obj: object.clone(),
+                        off: 0,
+                        len: 4,
+                    }),
+                }],
+            }],
+            nbytes: length,
+            digest: "blocked-ram-export".into(),
+            names: vec![],
+        };
+        let pages = placement
+            .register(
+                1,
+                "blocked-export".into(),
+                [28; 32],
+                &layout,
+                Arc::new(Source::files(vec![(object, file)], false, 0)),
+                None,
+            )
+            .expect("model");
+        let state = placement
+            .inner
+            .lock()
+            .models
+            .get(&1)
+            .expect("registered model")
+            .ram
+            .clone();
+        let (finished, result) = mpsc::channel();
+        let warming = placement.clone();
+        let caller = std::thread::spawn(move || {
+            finished
+                .send(warming.load(1, Tier::Ram))
+                .expect("report load")
+        });
+        assert_eq!(
+            result
+                .recv_timeout(Duration::from_secs(5))
+                .expect("RAM load waited for export")
+                .expect("load"),
+            Relief::Complete
+        );
+        caller.join().expect("load caller");
+        assert!(state.pending.load(Ordering::Acquire));
+        placement
+            .begin(1, vec![vec![1]], "ram-export-test".into(), "tiny".into())
+            .expect("request starts while warming is blocked");
+        let pin = placement
+            .bind(1, *pages.first().expect("page"), 0)
+            .expect("disk demand does not wait for RAM");
+        assert_eq!(
+            placement
+                .stats(1)
+                .expect("stats")
+                .copies
+                .first()
+                .expect("actual demand copy")
+                .tier,
+            Tier::Disk
+        );
+        drop(pin);
+        placement.end(1).expect("request ends");
+        placement
+            .close_model(1)
+            .expect("close while export is blocked");
+        blocker.unlock().expect("release exporter");
+        observe(&ledger, "cancelled export did not finish", || {
+            !state.pending.load(Ordering::Acquire)
+        });
+        assert!(
+            ledger.ram_status([28; 32]).is_none(),
+            "a closed model published a stale cache"
+        );
+        placement.close().expect("close placement");
     }
 
     #[test]
