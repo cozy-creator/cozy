@@ -694,7 +694,8 @@ impl Gpu {
         *generation = generation.wrapping_add(1);
         self.changed.notify_all();
         drop(generation);
-        if let Some(wakeup) = self.wakeup.lock().clone() {
+        let wakeup = self.wakeup.lock().clone();
+        if let Some(wakeup) = wakeup {
             let _ = catch_unwind(AssertUnwindSafe(|| wakeup()));
         }
     }
@@ -926,12 +927,18 @@ impl Gpu {
     pub fn facts(&self) -> Result<Vec<(PageId, u64, usize, bool)>> {
         self.poll()?;
         let mut facts = Vec::new();
-        for (id, page) in self.pages.lock().iter() {
+        let pages: Vec<_> = self
+            .pages
+            .lock()
+            .iter()
+            .map(|(id, page)| (*id, page.clone()))
+            .collect();
+        for (id, page) in pages {
             facts.push(match &mut *page.state.lock() {
-                State::Empty => (*id, 0, 0, false),
-                State::Filling => (*id, page.bytes, 0, true),
-                State::Ready(mapping) => (*id, mapping.bytes, mapping.pins, !mapping.idle()?),
-                State::Failed(mapping, _) => (*id, mapping.bytes, mapping.pins, true),
+                State::Empty => (id, 0, 0, false),
+                State::Filling => (id, page.bytes, 0, true),
+                State::Ready(mapping) => (id, mapping.bytes, mapping.pins, !mapping.idle()?),
+                State::Failed(mapping, _) => (id, mapping.bytes, mapping.pins, true),
             });
         }
         Ok(facts)
