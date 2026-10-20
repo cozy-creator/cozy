@@ -4491,6 +4491,22 @@ mod tests {
                 assert_eq!(pool.inventory(&device.entry).unwrap().memory_bytes, 8 << 30);
             }
             assert!(pool.budget(2, &[]).unwrap() <= effective);
+            // A rank learns CUDA's usable total after the CPU coordinator has
+            // initialized from inventory. Every later decision reads that same
+            // shared ceiling; a smaller configured cap remains unchanged.
+            let usable = 7 << 30;
+            for device in &pool.devices {
+                device.memory.placement().unwrap().ledger().limit_capacity(usable).unwrap();
+            }
+            let corrected = effective.min(usable);
+            assert_eq!(pool.device_limit(pool.lane(0, 2).unwrap()), Some(corrected));
+            assert_eq!(pool.decide("fixture", 0, 2, false).unwrap(), vec![Some(corrected); 2]);
+            assert!(pool.budget(2, &[]).unwrap() <= corrected);
+            for device in &pool.devices {
+                assert_eq!(device.memory.capacity(), Some(corrected));
+                assert_eq!(pool.inventory(&device.entry).unwrap().memory_bytes, 8 << 30);
+            }
+            assert_eq!(pool.config.gpu_memory_limit, Some(limit));
             pool.stop().unwrap();
             drop(pool);
             crate::scratch::remove(&root);
