@@ -1,4 +1,5 @@
-//! Native owners keep unread objects across collectors in another process. No network or GPU.
+//! Holds keep unread objects across collectors in another process, and cache expires on its own.
+//! No network or GPU.
 #![cfg(all(unix, feature = "store"))]
 
 use std::fs::{self, File};
@@ -183,14 +184,8 @@ fn collected(store: &Store, objects: &[ObjectRef]) {
             object.sha256
         );
     }
-    assert!(
-        store
-            .pins()
-            .unwrap()
-            .iter()
-            .all(|(_, pin)| pin.owner.as_deref() != Some("tensorfs.native-retention/1")),
-        "dead owner record was not reaped"
-    );
+    let holds = fs::read_dir(store.root().join("holds")).unwrap();
+    assert_eq!(holds.count(), 1, "a dead holder's record was not reaped");
 }
 fn pressure(store: &Store) {
     age(store);
@@ -524,23 +519,18 @@ fn native_owner_process() {
     }
 }
 
-/// Exercise the real TTL policy with aged records/files, not a substituted collector.
-fn expire_managed_cache(store: &Store) {
-    for (id, mut pin) in store.pins().unwrap() {
-        if id.starts_with("cache-") {
-            pin.last_use = 0;
-            store.pin(&id, &pin).unwrap();
-        }
+/// Ages every use past the TTL and collects by the TTL.
+fn expire(store: &Store) {
+    let then = SystemTime::now() - tensorfs::store::TTL - Duration::from_secs(60);
+    for entry in fs::read_dir(store.root().join("uses")).unwrap() {
+        File::open(entry.unwrap().path()).unwrap().set_modified(then).unwrap();
     }
     age(store);
-    let state = store.root().join("tmp/cache");
-    fs::create_dir_all(&state).unwrap();
-    fs::write(state.join("sweep.json"), br#"{"last_use":0}"#).unwrap();
-    let _ = store.cache_maintain(0).unwrap();
+    store.collect(u64::MAX, tensorfs::store::TTL).unwrap();
 }
 
 #[test]
-fn managed_writer_results_expire_but_raw_pins_and_finished_local_replays_remain() {
+fn writer_results_expire_but_local_replays_remain() {
     use tensorfs::fetch::{Client, Endpoint, SourcePolicy, Stream};
 
     let repo_bytes: [&[u8]; 2] = [
@@ -549,7 +539,7 @@ fn managed_writer_results_expire_but_raw_pins_and_finished_local_replays_remain(
     ];
     for mode in ["anonymous", "keyed", "streamed"] {
         let scratch = Scratch::new();
-        let store = scratch.store().with_cache();
+        let store = scratch.store();
         let key = (mode == "keyed").then_some("managed-resume");
         if key.is_some() {
             let mut writer = store.writer(None, key).unwrap();
@@ -619,27 +609,17 @@ fn managed_writer_results_expire_but_raw_pins_and_finished_local_replays_remain(
                 );
             }
             result = Some(id.clone());
-            assert!(
-                store.get_pin(&id.sha256).unwrap().is_none(),
-                "managed result leaked an ordinary digest pin"
-            );
-            if let Some(key) = key {
-                assert!(
-                    store.get_pin(key).unwrap().is_none(),
-                    "managed result leaked an ordinary key pin"
-                );
-            }
             let ck = store.checkpoint(&id).unwrap();
             assert_eq!(ck.read("c", "weight").unwrap(), b"saved");
             assert_eq!(store.read(&ObjectRef::of(bytes)).unwrap(), *bytes);
-            drop(ck); // Reopening touched the header cache pin; repo-file roots must survive that.
+            drop(ck); // Reopening is a use of the header; the repo files' use must survive it.
         }
         for bytes in repo_bytes {
             assert_eq!(store.read(&ObjectRef::of(bytes)).unwrap(), bytes);
         }
         let id = result.unwrap();
         let h = Header::from_cbor(&store.read(&id).unwrap()).unwrap();
-        expire_managed_cache(&store);
+        expire(&store);
         collected(&store, &[id]);
         collected(&store, &h.chunks);
         for bytes in repo_bytes {
@@ -686,24 +666,18 @@ fn managed_writer_results_expire_but_raw_pins_and_finished_local_replays_remain(
         })
     })
     .unwrap();
-    expire_managed_cache(&raw.clone().with_cache());
-    assert!(
-        raw.get_pin("operator-key").unwrap().is_some(),
-        "operator retention was changed by consumer policy"
-    );
-    assert!(raw.unpin("operator-key").unwrap());
-    expire_managed_cache(&raw.clone().with_cache());
+    expire(&raw);
     let repo = raw.get_ref("local/derived").unwrap().unwrap();
     let ck = raw.variant(&repo.releases[0].tree, None).unwrap();
     assert_eq!(ck.read("c", "weight").unwrap(), b"saved");
 }
 
 #[test]
-fn failed_managed_stream_retains_local_bytes_until_the_last_native_owner() {
+fn failed_stream_retains_local_bytes_until_the_last_holder() {
     use tensorfs::fetch::{Client, Endpoint, SourcePolicy, Stream};
 
     let scratch = Scratch::new();
-    let store = scratch.store().with_cache();
+    let store = scratch.store();
     // A real file cannot be an endpoint directory. The asynchronous upload fails at flush.
     let destination = scratch.0.join("not-a-directory");
     fs::write(&destination, b"an actual filesystem failure").unwrap();
@@ -738,15 +712,14 @@ fn failed_managed_stream_retains_local_bytes_until_the_last_native_owner() {
         .committed()
         .expect("local commit must precede failed upload")
         .clone();
-    assert!(store.get_pin(&id.sha256).unwrap().is_none());
-    expire_managed_cache(&store); // The failed Writer is the only native owner at this point.
+    expire(&store); // The failed Writer is the only holder at this point.
     assert!(
         store.verify(&id).unwrap(),
         "failed Writer lost its committed header before an error checkpoint was opened"
     );
     let ck = store.checkpoint(&id).unwrap();
     let chunks = ck.header().chunks.clone();
-    expire_managed_cache(&store);
+    expire(&store);
     assert_eq!(ck.read("c", "weight").unwrap(), b"saved");
     assert_eq!(
         store.read(&ObjectRef::of(LATE)).unwrap(),
@@ -754,108 +727,14 @@ fn failed_managed_stream_retains_local_bytes_until_the_last_native_owner() {
         "failed Writer still owns its repo bytes"
     );
     drop(writer);
-    expire_managed_cache(&store);
+    expire(&store);
     assert_eq!(
         ck.read("c", "weight").unwrap(),
         b"saved",
         "the retained checkpoint survives the failed Writer"
     );
     drop(ck);
-    expire_managed_cache(&store);
+    expire(&store);
     collected(&store, &[id, ObjectRef::of(LATE)]);
     collected(&store, &chunks);
-}
-
-#[test]
-fn manual_hold_prefix_pins_survive_while_native_owner_records_are_reaped() {
-    use tensorfs::store::Pin;
-
-    let scratch = Scratch::new();
-    let store = scratch.store();
-    let mut raw = store.writer(None, Some("hold-operator")).unwrap();
-    raw.get("c")
-        .put(
-            "weight",
-            &Dtype::U8,
-            &[8],
-            Data::Plain(WriterSource::Read(&mut &b"operator"[..])),
-        )
-        .unwrap();
-    let operator = raw.commit().unwrap();
-    assert!(store
-        .get_pin("hold-operator")
-        .unwrap()
-        .unwrap()
-        .owner
-        .is_none());
-    let manual = store.put_bytes(b"a manually pinned object").unwrap();
-    let manual_id = format!("hold-{}-123-4", std::process::id());
-    store
-        .pin(&manual_id, &Pin::new(vec![manual.clone()]))
-        .unwrap();
-    let released: Vec<_> = store
-        .pins()
-        .unwrap()
-        .into_iter()
-        .filter(|(_, pin)| pin.owner.as_deref() == Some("tensorfs.native-retention/1"))
-        .map(|(id, _)| id)
-        .collect();
-    assert!(
-        !released.is_empty(),
-        "committed Writer should leave a released hold for maintenance"
-    );
-    age(&store);
-    store.gc().unwrap();
-    for id in released {
-        assert!(
-            store.get_pin(&id).unwrap().is_none(),
-            "released Writer hold was not reaped"
-        );
-    }
-
-    let f = fixture(&scratch);
-    store.put_bytes(LATE).unwrap();
-    let ck = store.variant(&f.tree, Some("main")).unwrap();
-    let held: Vec<_> = store
-        .pins()
-        .unwrap()
-        .into_iter()
-        .filter(|(_, pin)| pin.owner.as_deref() == Some("tensorfs.native-retention/1"))
-        .map(|(id, _)| id)
-        .collect();
-    assert!(!held.is_empty());
-    age(&store);
-    store.gc().unwrap();
-    for id in &held {
-        assert!(
-            store.get_pin(id).unwrap().is_some(),
-            "live native owner was reaped"
-        );
-    }
-    assert!(store.get_pin("hold-operator").unwrap().is_some());
-    assert!(store.get_pin(&manual_id).unwrap().is_some());
-    assert!(store.verify(&operator).unwrap());
-    assert!(store.verify(&manual).unwrap());
-
-    drop(ck);
-    age(&store);
-    store.gc().unwrap();
-    for id in held {
-        assert!(
-            store.get_pin(&id).unwrap().is_none(),
-            "released native owner was not reaped"
-        );
-    }
-    collected(&store, &f.held);
-    assert!(
-        store.get_pin("hold-operator").unwrap().is_some(),
-        "ordinary Writer key was mistaken for a native hold"
-    );
-    assert!(
-        store.get_pin(&manual_id).unwrap().is_some(),
-        "a synthetic-looking ordinary pin was mistaken for a native hold"
-    );
-    let raw = store.checkpoint(&operator).unwrap();
-    assert_eq!(raw.read("c", "weight").unwrap(), b"operator");
-    assert_eq!(store.read(&manual).unwrap(), b"a manually pinned object");
 }

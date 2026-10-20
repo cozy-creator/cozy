@@ -74,9 +74,8 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
     drop(writer);
     drop(producer);
 
-    // An ordinary raw operator runs the real collector without pressure or TTL pin removal.
-    // Age actual owned files beyond the default one-hour grace, while their cache recency
-    // remains fresh and well inside the seven-day library cache lifetime.
+    // Another handle runs the real collector, with no pressure and no TTL expiry. Age the files
+    // past the one-hour grace while their use stays fresh, well inside the seven-day TTL.
     let operator = tensorfs::store::Store::open(&cache).unwrap();
     let stale = operator
         .put_bytes(b"unrooted stale positive GC control")
@@ -111,7 +110,7 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
     }
     assert!(
         cache.join(tree.key()).exists(),
-        "returned Writer tree expired at GRACE while its header cache pin is still fresh"
+        "returned Writer tree expired at GRACE while its use is still fresh"
     );
     drop(operator);
 

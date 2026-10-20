@@ -441,30 +441,15 @@ async fn read_into_decodes_an_encoded_tensor_only_when_asked() {
     assert!(refused.kind == Kind::Invalid && refused.detail.contains("scale"), "{}", refused.detail);
 }
 
-/// Ages every cache entry past its TTL and runs ordinary cache maintenance.
+/// Ages every use past the TTL and collects by it, with no grace: only roots keep anything.
 fn expire_cache(cache: &Path) {
-    fn age(path: &Path, then: std::time::SystemTime) {
-        for entry in fs::read_dir(path).unwrap() {
-            let entry = entry.unwrap();
-            if entry.file_type().unwrap().is_dir() {
-                age(&entry.path(), then);
-            } else {
-                fs::File::open(entry.path()).unwrap().set_modified(then).unwrap();
-            }
-        }
+    let ttl = tensorfs::store::TTL;
+    let then = std::time::SystemTime::now() - ttl * 2;
+    for entry in fs::read_dir(cache.join("uses")).unwrap() {
+        fs::File::open(entry.unwrap().path()).unwrap().set_modified(then).unwrap();
     }
-    let store = tensorfs::store::Store::open(cache).unwrap().with_cache();
-    for (id, mut pin) in store.pins().unwrap() {
-        if id.starts_with("cache-") {
-            pin.last_use = 0;
-            store.pin(&id, &pin).unwrap();
-        }
-    }
-    let then = std::time::SystemTime::now() - tensorfs::store::GRACE * 2;
-    age(&cache.join("blobs"), then);
-    fs::create_dir_all(cache.join("tmp/cache")).unwrap();
-    fs::write(cache.join("tmp/cache/sweep.json"), br#"{"last_use":0}"#).unwrap();
-    store.cache_maintain(0).unwrap();
+    let store = tensorfs::store::Store::open(cache).unwrap();
+    store.with_grace(std::time::Duration::ZERO).collect(u64::MAX, ttl).unwrap();
 }
 
 async fn save(client: &Client, dest: &Path, weight: &[u8]) -> (ObjectRef, Vec<ObjectRef>) {
@@ -525,6 +510,30 @@ async fn a_header_file_roots_its_data_only_while_it_holds_that_header() {
         assert_eq!(reopened.id(), id);
         assert_eq!(reopened.component("model").unwrap().read_decoded("w").unwrap(), weight);
     }
+}
+
+/// A header file is rooted where it is opened: a copy that gets opened keeps the data after the
+/// original goes, and lets it go when it goes too.
+#[tokio::test(flavor = "current_thread")]
+async fn an_opened_copy_of_a_header_file_roots_its_data_until_it_is_gone() {
+    let scratch = Scratch::new();
+    let cache = scratch.0.join("cache");
+    let client = client(&cache, &scratch.0.join("endpoint"));
+    let original = scratch.0.join("written").join("model.cozytensors");
+    let (id, objects) = save(&client, &original, &[21, 22, 23, 24]).await;
+    let copy = scratch.0.join("moved").join("copy.cozytensors");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    fs::copy(&original, &copy).unwrap();
+    fs::remove_file(&original).unwrap();
+    let offline = Open { local_files_only: true, ..Open::default() };
+    let opened = client.open(copy.to_str().unwrap(), &offline).await.unwrap();
+    assert_eq!(opened.id(), &id);
+    drop((opened, client));
+    expire_cache(&cache);
+    assert!(objects.iter().all(|o| cache.join(o.key()).exists()), "an opened copy did not root its data");
+    fs::remove_file(&copy).unwrap();
+    expire_cache(&cache);
+    assert!(objects.iter().all(|o| !cache.join(o.key()).exists()), "a deleted copy still roots its data");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -783,29 +792,18 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
         .expect("stream failure lost sealed local checkpoint");
     let failed_tree = local.tree().unwrap().clone();
     let failed_cache = scratch.0.join("failed-cache");
-    let operator = tensorfs::store::Store::open(&failed_cache)
-        .unwrap()
-        .with_grace(std::time::Duration::ZERO);
-    let durable = operator
-        .get_pin(&failed_tree.sha256)
-        .unwrap()
-        .expect("failed upload has no durable retry root");
-    assert!(durable.owner.is_none() && durable.roots.contains(&failed_tree));
     failed.abandon().unwrap();
     drop(bad);
     assert_eq!(local.component("model").unwrap().read_decoded("w").unwrap(), WEIGHT);
     drop(local);
-    // Remove only the disposable roots: a failed result must survive independently of TTL
-    // and of the dropped Checkpoint/Writer native owners.
-    for (name, pin) in operator.pins().unwrap() {
-        if pin.owner.as_deref() == Some("tensorfs.cache/1") {
-            assert!(operator.unpin(&name).unwrap());
-        }
-    }
+    // A failed result is cache: it outlives every handle until the TTL.
+    let operator = tensorfs::store::Store::open(&failed_cache)
+        .unwrap()
+        .with_grace(std::time::Duration::ZERO);
     let disposable = operator
         .put_bytes(b"failed-upload collector positive control")
         .unwrap();
-    operator.collect(0, std::time::Duration::ZERO).unwrap();
+    operator.gc().unwrap();
     assert!(!failed_cache.join(disposable.key()).exists());
     drop(operator);
     let recovered = self::client(&failed_cache, &broken)
@@ -822,6 +820,9 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
         recovered.component("model").unwrap().read_decoded("w").unwrap(),
         WEIGHT
     );
+    drop(recovered);
+    expire_cache(&failed_cache);
+    assert!(!failed_cache.join(failed_tree.key()).exists(), "a failed result outlived the TTL");
 }
 
 struct WriterRefusal(tensorfs::Failure);
@@ -1355,24 +1356,21 @@ fn public_conversion_without_a_tokio_caller_refuses_instead_of_starting_a_runtim
     assert!(actual_headers(&cache.join("blobs")).is_empty());
 }
 
+/// A header file a Writer saved inside a snapshot folder is a root, and keeps its folder; a folder
+/// nothing roots or uses goes.
 #[tokio::test(flavor = "current_thread")]
-async fn literal_writer_inside_classified_snapshot_preserves_the_callers_header_from_ttl_prune() {
+async fn a_header_file_written_inside_a_snapshot_folder_keeps_that_folder() {
     let scratch = Scratch::new();
     let cache = scratch.0.join("cache");
     let client = client(&cache, &scratch.0.join("endpoint"));
-    let operator = tensorfs::store::Store::open(&cache).unwrap().with_cache();
-    let chosen = ObjectRef::of(b"caller chooses an internally classified snapshot root").sha256;
-    let control = ObjectRef::of(b"expired internal snapshot positive control").sha256;
+    let chosen = ObjectRef::of(b"caller chooses a snapshot folder").sha256;
+    let control = ObjectRef::of(b"unused snapshot positive control").sha256;
     for digest in [&chosen, &control] {
         let folder = cache.join("snapshots").join(digest);
-        operator.cache_snapshot(&folder).unwrap();
         fs::create_dir_all(&folder).unwrap();
         fs::write(folder.join("old-cached-file"), b"cache fixture").unwrap();
     }
-    let dest = cache
-        .join("snapshots")
-        .join(&chosen)
-        .join("literal.cozytensors");
+    let dest = cache.join("snapshots").join(&chosen).join("literal.cozytensors");
     let mut writer = client
         .writer(WriterOptions {
             dest: Some(&dest),
@@ -1384,44 +1382,11 @@ async fn literal_writer_inside_classified_snapshot_preserves_the_callers_header_
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
-    let checkpoint = writer.commit().await.unwrap();
-    let chosen_record = cache
-        .join("tmp/cache/snapshots")
-        .join(format!("snapshots-{chosen}.json"));
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&fs::read(&chosen_record).unwrap()).unwrap()
-            ["owned"],
-        true
-    );
-    drop(checkpoint);
-    drop(writer);
-    drop(client);
-    for digest in [&chosen, &control] {
-        let record = cache
-            .join("tmp/cache/snapshots")
-            .join(format!("snapshots-{digest}.json"));
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
-        value["last_use"] = 0.into();
-        fs::write(record, serde_json::to_vec(&value).unwrap()).unwrap();
-        // Effective recency is max(record, directory mtime); age both real inputs to TTL.
-        let folder = cache.join("snapshots").join(digest);
-        platform::durable::open_dir(&folder)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
-            .unwrap();
-    }
-    fs::write(cache.join("tmp/cache/sweep.json"), br#"{"last_use":0}"#).unwrap();
-    operator.cache_maintain(0).unwrap();
-    assert!(
-        !cache.join("snapshots").join(control).exists(),
-        "TTL prune positive control did not run"
-    );
-    assert!(
-        dest.exists(),
-        "TTL pruned an explicitly chosen literal header"
-    );
-    drop(operator);
+    drop(writer.commit().await.unwrap());
+    drop((writer, client));
+    expire_cache(&cache);
+    assert!(!cache.join("snapshots").join(control).exists(), "the positive control stayed");
+    assert!(dest.exists(), "a rooted header file's folder was swept");
     let reopened = self::client(&cache, &scratch.0.join("endpoint"))
         .open(
             dest.to_str().unwrap(),
