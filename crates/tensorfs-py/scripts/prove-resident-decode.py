@@ -369,7 +369,11 @@ def gpu_main(vectors):
             )
         return held
 
+    raw_calls = 0
+
     def invoke(row, parts, out):
+        nonlocal raw_calls
+        raw_calls += 1
         raw.decode_into(
             row["encoding"]["scheme"],
             parts,
@@ -432,6 +436,76 @@ def gpu_main(vectors):
             source.synchronize()
             previous.synchronize()
 
+    def storage_controls(row):
+        parts = operands(row)
+        kind, shape, _original = parts["weight"]
+        payload = base64.b64decode(
+            next(p["bits"] for p in row["parts"] if p["role"] == "weight")
+        )
+        owner = helper.OwnedTensor(payload)
+        owner.gpu = torch.frombuffer(
+            bytearray(b"prefix!!" + payload), dtype=torch.uint8
+        ).to("cuda")
+        owner.managed.dl_tensor.device = helper.Device(2, 0)
+        owner.managed.dl_tensor.data = owner.gpu.data_ptr()
+        owner.managed.dl_tensor.byte_offset = 8
+        deleted = []
+
+        def release_gpu():
+            assert owner.gpu is not None
+            owner.gpu = None  # Release the actual last Torch owner of this allocation.
+            deleted.append(True)
+
+        owner.on_delete = release_gpu
+        torch.cuda.synchronize()  # This custom real producer is ready before export.
+
+        class OffsetOwner:
+            def __init__(self):
+                self.capsules = []
+
+            def __dlpack_device__(self):
+                return (2, 0)
+
+            def __dlpack__(self, *, stream=None):
+                self.capsules.append(owner.capsule)
+                return owner.capsule
+
+        offset = OffsetOwner()
+        parts["weight"] = (kind, shape, offset)
+        out = Export(
+            torch.empty(row["shape"], dtype=dtype[row["dtype"]], device="cuda")
+        )
+        invoke(row, parts, out)
+        claimed(parts, out)
+        assert bytes_of(out.value) == base64.b64decode(row["expect"])
+        helper.released(owner)
+        assert (
+            deleted == [True] and owner.gpu is None and owner.released_bytes == payload
+        )
+        fresh = torch.empty(row["shape"], dtype=dtype[row["dtype"]], device="cuda")
+        refuses(tensorfs.InvalidError, lambda: invoke(row, parts, fresh))
+        assert owner.deletions == 1
+        owner.capsule = None
+        offset.capsules.clear()
+
+        overlapping = Export(
+            torch.full(row["shape"], 99, dtype=dtype[row["dtype"]], device="cuda")
+        )
+        before = bytes_of(overlapping.value)
+        aliased = operands(row)
+        carrier = overlapping.value.view(torch.uint8).reshape(-1)[: len(payload)]
+        aliased["weight"] = (kind, shape, Export(carrier))
+        refuses(tensorfs.InvalidError, lambda: invoke(row, aliased, overlapping))
+        assert bytes_of(overlapping.value) == before
+        return {
+            "byte_offset": 8,
+            "managed_deletions": 1,
+            "actual_cuda_owner_released": True,
+            "used_alias_refused": True,
+            "overlap_family": "invalid",
+            "overlap_output_unchanged": True,
+        }
+
     records, metadata_casts = [], set()
     for row in positive:
         parts = operands(row)
@@ -452,6 +526,7 @@ def gpu_main(vectors):
         )
     assert len(records) == 19 and {"F8_E4M3", "BF16", "F16"} <= metadata_casts
     ordering = stream_control(positive[0])
+    storage = storage_controls(positive[0])
 
     for row in negative:
         parts = operands(row)
@@ -526,6 +601,7 @@ def gpu_main(vectors):
             marker.fill_(7)
             prior.record()
         assert not produced.query() and not prior.query()
+        raw_calls += 1
         raw.decode_into(
             "comfy.asym_w4a8_int8",
             parts,
@@ -554,6 +630,7 @@ def gpu_main(vectors):
         source.synchronize()
         previous.synchronize()
     assert len(records) == 34 and len({row["key"] for row in records}) == 34
+    assert raw_calls == 39 and not helper._live and not helper._callback_errors
     print(
         json.dumps(
             {
@@ -567,6 +644,8 @@ def gpu_main(vectors):
                 "completion_control": 1,
                 "cases": records,
                 "stream_control": ordering,
+                "storage_controls": storage,
+                "raw_calls": raw_calls,
                 "metadata_cast_dtypes": sorted(metadata_casts),
                 "corpus_sha256": hashlib.sha256(corpus).hexdigest(),
                 "tensorfs_version": tensorfs.__version__,
