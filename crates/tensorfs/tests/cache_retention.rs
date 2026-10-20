@@ -449,7 +449,7 @@ fn native_owner_process() {
                 ..Default::default()
             };
             let reference = format!("sha256:{}", f.tree.sha256);
-            let opened = tensorfs::raw::runtime().unwrap().block_on(client.open(&reference, &open)).unwrap();
+            let opened = tensorfs::raw::block_on(client.open(&reference, &open)).unwrap();
             let source = opened.source(false);
             drop((ck, opened, client));
             report("ready");

@@ -7,20 +7,35 @@ TensorFS itself never imports either framework.
 
 import gc
 import sys
+import tempfile
 import threading
 import time
+from pathlib import Path
+
+import numpy as np
 
 import tensorfs
 
 assert "torch" not in sys.modules
 import torch
 
-from read_engine import HostReads
-
 assert torch.cuda.is_available(), "this gate requires an actual CUDA GPU"
-HostReads.setUpClass()
+tmp = tempfile.TemporaryDirectory()
 try:
-    tensors = HostReads.tensors
+    writer = tensorfs.Writer(cache_dir=Path(tmp.name) / "store")
+    component = writer.component("model", cls="test.Model", config={})
+    plain = np.arange(12, dtype=np.float32).reshape(3, 4)
+    component.put("plain", plain)
+    component.put("empty", b"", dtype="U8", shape=[0])
+    component.put("big", np.arange((64 << 20) + 257, dtype=np.uint8))
+    component.put_encoded(
+        "quantized", dtype="F32", shape=[2, 16], scheme="fp8.rowwise",
+        parts={"weight": ("F8_E4M3", [2, 16], bytes([0x38]) * 32),
+               "scale": ("F32", [2], np.array([0.5, 2.0], dtype=np.float32))},
+        params={"axis": 0, "scale_dtype": "F32"},
+    )
+    ck = writer.commit()
+    tensors = ck.components["model"].tensors
     arrays = tensors.read(["empty", "plain", "big", "quantized"], device="cuda:0", decode=True)
     for key, array in arrays.items():
         assert isinstance(array, tensorfs.Array)
@@ -37,7 +52,7 @@ try:
         tensors.read_into("plain", destination)
         odd = torch.empty(9, dtype=torch.uint8, device="cuda:0")
         tensors.read_into("quantized", odd, decode=True, offset=3)
-    assert torch.equal(destination, torch.tensor(HostReads.plain, device="cuda:0"))
+    assert torch.equal(destination, torch.tensor(plain, device="cuda:0"))
     assert bytes(odd.cpu().tolist()) == tensors.read("quantized", decode=True).tobytes()[3:12]
     for consumer_stream in [-1, 1, 2, stream.cuda_stream]:
         try:
@@ -92,14 +107,14 @@ try:
     copied = torch.from_dlpack(arrays["plain"].__dlpack__(copy=True))
     assert first.is_cuda and first.data_ptr() == second.data_ptr()
     assert first.data_ptr() != copied.data_ptr()
-    expected = torch.tensor(HostReads.plain, device="cuda:0")
+    expected = torch.tensor(plain, device="cuda:0")
     expected_quantized = torch.frombuffer(bytearray(tensors.read("quantized", decode=True).tobytes()), dtype=torch.float32).reshape(2, 16)
     # Consumers on a separate stream see a completed read and retain native allocations
     # after the parent checkpoint, cached component map and Array wrappers are released.
     with torch.cuda.stream(stream):
         independent = torch.from_dlpack(arrays["quantized"]).clone()
-    HostReads.ck.close()
-    HostReads.ck = HostReads.tensors = tensors = None
+    ck.close()
+    ck = tensors = None
     del arrays, encoded, host_parts, array
     gc.collect()
     stream.synchronize()
@@ -108,6 +123,6 @@ try:
     assert torch.equal(independent.cpu(), expected_quantized), "a retained consumer lost its source bytes"
     torch.cuda.synchronize()
 finally:
-    HostReads.tearDownClass()
+    tmp.cleanup()
 
 print("CUDA arrays: chunk-spanning reads, prebuilt decode, raw parts, DLPack sharing/copy and retained consumers passed")
