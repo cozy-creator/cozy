@@ -238,8 +238,8 @@ pub enum Format { Safetensors, Cozytensors }
 
 ## Low-level streaming input
 
-This is for raw encoded-stream producers. Ordinary readers and model consumers do not
-need storage descriptors or this module.
+This input is for custom encoded-stream producers. Ordinary checkpoint readers do not
+need it; integrations with existing host/GPU buffers can use the separate operations below.
 
 ```rust
 pub mod raw {
@@ -251,3 +251,75 @@ pub mod raw {
     }
 }
 ```
+
+## Advanced resident-buffer decoding
+
+Source-reviewed target at Rust wrapper `5fc6f2320b803212037de90e38fe0d0ce0e10d9f`.
+Combined native and GPU acceptance remains pending. These declarations extend the same
+`raw` module above; they do not add a second codec or byte engine.
+
+```rust
+// tensorfs::format::decode
+pub struct PartMetadata<'a> {
+    pub role: &'a str,
+    pub dtype: &'a Dtype,
+    pub shape: &'a [u64],
+    pub len: usize,
+}
+
+// tensorfs::io: existing contiguous host/device descriptors.
+// Other engine Src variants exist, but resident decoding rejects File and Zero.
+pub enum Src<'a> {
+    Zero,
+    File(&'a File, u64),
+    Host(*const u8),
+    Device { device: i32, ptr: u64, stream: usize },
+}
+pub enum Dst {
+    Host { ptr: *mut u8, len: usize },
+    Device { device: i32, ptr: u64, len: usize, stream: usize },
+}
+impl Dst {
+    pub fn host(buf: &mut [u8]) -> Dst;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+}
+
+// tensorfs::io::decode, re-exported by raw as DecodePart and DecodeOutput.
+pub struct Part<'a> {
+    pub role: &'a str,
+    pub dtype: &'a Dtype,
+    pub shape: &'a [u64],
+    pub src: io::Src<'a>,
+    pub len: usize,
+}
+pub struct Output<'a> {
+    pub dtype: &'a Dtype,
+    pub shape: &'a [u64],
+    pub dst: io::Dst,
+}
+
+pub mod raw {
+    pub use crate::io::decode::{Part as DecodePart, Output as DecodeOutput};
+    pub fn check_decode(
+        encoding: &Encoding, dtype: &Dtype, shape: &[u64],
+        parts: &[format::decode::PartMetadata<'_>],
+    ) -> Result<()>;
+    pub unsafe fn decode_into(
+        encoding: &Encoding, dtype: &Dtype, shape: &[u64],
+        parts: &[DecodePart<'_>], out: DecodeOutput<'_>,
+    ) -> Result<()>;
+}
+```
+
+Format metadata and actual storage are separate: a packed format may use a U8 carrier,
+but its descriptor and exact byte length still describe the encoding. The output's
+actual dtype/shape must equal the logical descriptor. All-host or same-device CUDA
+spans are accepted; no implicit copy or final cast is performed. CUDA resident-input
+support initially covers the three Comfy schemes named in the [usage guide](API.md#advanced-decode-existing-host-or-gpu-buffers).
+
+`check_decode` performs metadata validation without reading bytes or initializing CUDA.
+`decode_into` additionally checks spans, placement, alignment and aliasing before writes.
+The caller owns pointer validity, exclusive output access, producer ordering and lifetimes.
+Success establishes completion. After any error, retain all owners until `io::drain` and
+all producer streams complete successfully; runtime/value errors leave output unspecified.

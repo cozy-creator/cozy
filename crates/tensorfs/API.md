@@ -10,6 +10,7 @@ can still expose the preceding interface. The [Python API](../tensorfs-py/API.md
 - [Create a client and read a model](#rust-create-a-client-and-read-a-model)
 - [Write, convert and publish](#rust-write-convert-and-publish)
 - [Options and returned objects](#rust-options-and-returned-objects)
+- [Decode existing host or GPU buffers](#advanced-decode-existing-host-or-gpu-buffers)
 - [Errors and value types](#errors-and-value-types)
 
 The [temporary type-declaration dump](API-TYPES.md) is available for signature and naming review.
@@ -243,6 +244,43 @@ For converters or custom encoders that stream already encoded bytes,
 and a borrowed `data: &mut dyn Read` stream. This low-level input does not require the
 caller to choose disk chunks or byte offsets; TensorFS assigns those. Physical format
 structures stay in the format/inspection interface, outside ordinary model-loading code.
+
+## Advanced: decode existing host or GPU buffers
+
+Ordinary checkpoint reads select and decode their stored arrays for you. An integration
+that already owns encoded arrays in RAM or GPU memory can instead use
+`raw::check_decode` and `unsafe raw::decode_into`. These operations use the same format
+registry and decode engine; they do not open a checkpoint, fetch chunks or allocate the
+output. `decode_into` returns `Result<()>` after writing into your existing destination.
+
+Supply an `Encoding`, the logical tensor's dtype and shape, and one `raw::DecodePart` per
+named encoded array. Each part holds its format dtype/shape and a contiguous `io::Src`
+byte span. The actual carrier can differ: packed four-bit values may live in a byte array,
+while their format descriptor still describes packed values. `raw::DecodeOutput` holds
+the actual destination dtype, shape and `io::Dst`; they must match the requested logical
+tensor exactly. There is no implicit final dtype conversion.
+
+`check_decode` accepts `format::decode::PartMetadata` (role, dtype, shape and byte length)
+and validates the descriptors without reading bytes or initializing CUDA. It does not
+validate pointers or establish buffer ownership. The call to `decode_into` also checks
+placement, lengths, alignment and input/output overlap before writing.
+
+All-host spans use the CPU decoder. All-CUDA spans must share one device and use a
+supported resident-input scheme; the initial target covers `comfy.asym_w4a8_int8`,
+`comfy.w6a8_int8` and `comfy.convrot_w4a4`. Mixed host/device input, file/zero sources and
+implicit transfers are refused. Keep input allocations alive, the output exclusively
+writable, and producer/output streams valid in that device's primary context on the
+calling thread. Rust's raw pointers do not enforce these requirements for you.
+
+Success establishes completion. After an error, keep **all** input and output owners
+until `io::drain` for the device and every producer stream report checked completion;
+an error alone does not establish quiescence. Descriptor and overlap refusals precede
+writes; after a runtime or value error the output contents are unspecified.
+
+The [exact declarations](API-TYPES.md#advanced-resident-buffer-decoding) are a
+source-reviewed 0.13 target, pinned to the Rust wrapper at
+`5fc6f2320b803212037de90e38fe0d0ce0e10d9f`. Its combined native and GPU gates are still
+pending; the existing 25a1 native-wheel results do not qualify this new interface.
 
 ## Errors and value types
 
