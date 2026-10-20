@@ -401,3 +401,32 @@ fn a_claimed_source_that_does_not_verify_is_refused() {
     assert!(refused.detail.contains("does not verify"), "{}", refused.detail);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn checkpoints_differing_only_in_dropped_metadata_become_one_tree() {
+    let dir = scratch("same-tree");
+    let files = lane_files(&dir, GPT2_FULL);
+    let old = blob(&dir, &files["model.cozytensors"].sha256);
+    let mut d = Decoder::new(&old);
+    let root = items(&old, &mut d);
+    let manifests: Vec<ObjectRef> = ["a", "b"]
+        .iter()
+        .map(|from| {
+            // The same header but for `migrated_from`, which D10 drops.
+            let mut bytes = vec![0x85];
+            root[..4].iter().for_each(|item| bytes.extend_from_slice(item));
+            bytes.extend([0xa1, 0x6d]);
+            bytes.extend(b"migrated_from");
+            bytes.extend([0x61, from.as_bytes()[0]]);
+            let mut lane = files.clone();
+            lane.insert("model.cozytensors".into(), put(&dir, &bytes));
+            put(&dir, &serde_json::to_vec(&json!({"format": "tensorfs.manifest/1", "files": lane})).unwrap())
+        })
+        .collect();
+    let doc = serde_json::to_vec(&json!({"name": "acme/gpt2", "releases": [], "checkpoints": manifests})).unwrap();
+    let mut migrator = Migrator::new(Access::from_env(), TABLE);
+    let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
+    assert_eq!(migrated.repo.checkpoints.len(), 1);
+    assert_eq!(migrated.report["checkpoints"].as_array().unwrap().len(), 2);
+    std::fs::remove_dir_all(dir).unwrap();
+}

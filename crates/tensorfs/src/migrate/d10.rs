@@ -283,7 +283,10 @@ impl<'t> Migrator<'t> {
             tree.set_variant("", lane.header.clone());
             let at = put(&mut objects, &tree)?;
             unreleased.push(json!({"old": c.id(), "tree": at.id(), "lane": lane.report}));
-            checkpoints.push(at);
+            // Old checkpoints differing only in metadata D10 drops become one tree, named once.
+            if !checkpoints.contains(&at) {
+                checkpoints.push(at);
+            }
         }
         let repo = Repo { name: old.name.clone(), releases, checkpoints };
         let report = json!({"model": old.name, "upstream": upstream.map(|u| u.from), "releases": reports, "checkpoints": unreleased});
