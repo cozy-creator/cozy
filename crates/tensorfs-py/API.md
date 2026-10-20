@@ -64,20 +64,17 @@ A `Pipeline` has `cls` and `config`. A `Component` exposes:
 | `tensors` | A `Tensors` mapping, described below. |
 | `assets` | Supporting filenames mapped to `(sha256_hex, byte_length)` references; this does not load file contents. |
 | `asset(name)` | Read a supporting file, fetching it if needed; returns `bytes`. |
-| `export_files(directory)` | Explicitly write configuration and supporting files to a directory for a file-based consumer; returns its path. Does not export tensor weights. |
 
 An asset is a supporting file needed by the component, such as a tokenizer's
 `tokenizer.json`, `vocab.json` or `merges.txt`. All of these files belong to the checkpoint;
-they are stored by content hash alongside the tensor data. Our own consumers read `config`
-and file bytes directly. Export is an explicit compatibility step for a library that only
-accepts filenames, such as a tokenizer's `from_pretrained(path)`; it fetches missing asset
-bytes and writes the chosen directory:
+they are stored by content hash alongside the tensor data. Native consumers read `config`
+and file bytes directly through TensorFS; no directory export is part of loading a
+cozytensors checkpoint:
 
 ```python
 tokenizer = checkpoint.components["tokenizer"]
 print(list(tokenizer.assets))
 tokenizer_bytes = tokenizer.asset("tokenizer.json")
-tokenizer_folder = tokenizer.export_files("./tokenizer-files")
 ```
 
 For import/export compatibility, the format internally retains the filename to use
@@ -256,6 +253,23 @@ A `ComponentWriter` supports:
 | `asset(name, data)` | Write a supporting file. |
 | `order(keys)` | Set tensor construction order. |
 | `has(key)` | Check a current/resumed write. |
+
+### Compatibility export for legacy file-based libraries
+
+Direct TensorFS/cozytensors loading is the normal integration path, including in our
+Runtime. Libraries should consume component configuration, supporting-file bytes and
+tensor arrays directly. Export is a convenience for libraries that still require
+filenames; it is not a required preparation step.
+
+```python
+# Only for a legacy consumer that requires a directory:
+folder = checkpoint.components["tokenizer"].export_files("./tokenizer-files")
+```
+
+`Component.export_files(directory)` explicitly writes configuration and supporting files,
+fetching any missing asset bytes. It returns the directory path and does not export tensor
+weights. Original filenames are preserved internally for compatibility. The full-checkpoint
+`tensorfs.export` operation below also exports weight files when that is needed.
 
 ### Convert an existing model and export ordinary files
 

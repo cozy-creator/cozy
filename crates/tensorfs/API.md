@@ -154,9 +154,11 @@ a separate worker-permission mechanism.
 A `Component` provides `name()`, `class()`, `config()`, `tensors()` and
 `assets()` metadata views. Its `read(key)` returns decoded `Vec<u8>`;
 `read_part_into(key, role, offset, &mut [u8])` fills a stored byte range;
-`asset(name)` returns `Vec<u8>`. For file-based consumers, `export_files(directory)` explicitly
-writes configuration and supporting files and returns `PathBuf`; it does not export weights.
-The I/O calls return `Result`.
+`asset(name)` returns `Vec<u8>`. These direct configuration, file and tensor reads are the
+normal cozytensors integration path. `export_files(directory)` is only a convenience for
+legacy libraries that require filenames: it explicitly writes configuration and supporting
+files and returns `PathBuf`, without exporting weights. Native consumers, including our
+Runtime, do not need that step. The I/O calls return `Result`.
 Selections control exactly which component/tensor/part/asset bytes are fetched, including
 when other model data happens to be present in the cache.
 
