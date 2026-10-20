@@ -99,14 +99,14 @@ with tempfile.TemporaryDirectory() as temporary:
                       "shape": case["shape"], "full_bytes": len(expected), "full_passed": True}
             if length:
                 # Byte offset/length intentionally cross logical element boundaries.
-                tensors.read_into("value", arrays["window"], offset=1)
+                tensors.read_into("value", arrays["window"], decode=True, offset=1)
                 assert arrays["window"].tobytes() == expected[1:1 + length], f"{label}: window differs"
                 odd_windows += 1
                 result["window"] = {"offset": 1, "length": length, "passed": True}
             extra = []
             for kind, offset, size in partition_windows(case, len(expected)):
                 assert size == arrays["window"].nbytes, label
-                tensors.read_into("value", arrays["window"], offset=offset)
+                tensors.read_into("value", arrays["window"], decode=True, offset=offset)
                 assert arrays["window"].tobytes() == expected[offset:offset + size], f"{label}: {kind} window differs"
                 partitions[kind] += 1
                 extra.append({"kind": kind, "offset": offset, "length": size, "passed": True})

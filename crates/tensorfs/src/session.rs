@@ -12,7 +12,7 @@ mod selection;
 mod writer;
 
 pub use crate::fetch::Landed as Fetched;
-pub use checkpoint::{Checkpoint, Component, Read};
+pub use checkpoint::{Checkpoint, Component, Read, ReadInto};
 pub use convert::{Convert, ConvertProgress};
 pub use endpoint::Endpoint;
 pub use provider::{bearer, HeaderMap, Request, TokenProvider};

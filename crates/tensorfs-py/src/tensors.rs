@@ -7,7 +7,7 @@ use std::sync::Arc;
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyIterator, PyString};
+use pyo3::types::{PyDict, PyIterator, PyString, PyTuple};
 use tensorfs::format::{decode, Body, Dtype, Encoding, PartBytes};
 use tensorfs::io::{DeviceBuffer, Dst, ReadOpts, Target};
 use tensorfs::{Checkpoint, Failure, Kind};
@@ -25,9 +25,12 @@ pub struct PyTensors {
     ck: Option<Arc<CheckpointAccess>>,
 }
 
-/// An encoded tensor as stored (`decode=False`): its scheme and params, and each part.
+/// An encoded tensor as stored (`decode=False`): its logical dtype and shape, its scheme and
+/// params, and each part.
 #[pyclass(name = "Encoded", module = "tensorfs", frozen, get_all)]
 pub struct PyEncoded {
+    dtype: String,
+    shape: Py<PyTuple>,
     scheme: String,
     params: Py<PyDict>,
     parts: Py<PyDict>,
@@ -74,6 +77,7 @@ impl PyTensors {
         py: Python<'_>,
         key: String,
         role: Option<&str>,
+        decode_: bool,
         offset: u64,
         dst: Dst,
     ) -> PyResult<()> {
@@ -83,7 +87,19 @@ impl PyTensors {
             .header()
             .tensor(&self.component, &key)
             .ok_or_else(|| invalid(py, "no such tensor"))?;
-        if let (None, Body::Encoded { encoding, .. }) = (role, &t.body) {
+        if role.is_some() && decode_ {
+            return Err(invalid(
+                py,
+                "role and decode exclude each other: a role reads one stored part",
+            ));
+        }
+        if let (None, Body::Encoded { encoding, parts }) = (role, &t.body) {
+            if !decode_ {
+                let roles: Vec<_> = parts.iter().map(|p| p.role.as_str()).collect();
+                let roles = roles.join(", ");
+                let detail = format!("{key} is encoded: pass decode=True or a role ({roles})");
+                return Err(invalid(py, detail));
+            }
             let length = t
                 .dtype
                 .byte_len(&t.shape)
@@ -358,6 +374,8 @@ impl PyTensors {
                 dict.set_item(w.role.clone(), Bound::new(py, array(w))?)?;
             }
             let e = PyEncoded {
+                dtype: t.dtype.name().to_owned(),
+                shape: PyTuple::new(py, &t.shape)?.unbind(),
                 scheme: encoding.scheme.clone(),
                 params: metadata(py, &encoding.params)?.unbind(),
                 parts: dict.unbind(),
@@ -480,20 +498,23 @@ impl PyTensors {
         Ok(out.into_any())
     }
 
-    /// `len(out)` bytes of `key` from `offset` into the writable buffer `out`: its stored data,
-    /// one part (`role`), or, for an encoded tensor with no role, its decoded bytes.
-    #[pyo3(signature = (key, out, *, role = None, offset = 0))]
+    /// `len(out)` bytes of `key` from `offset` into the writable buffer `out`: a plain tensor's
+    /// data, one stored part (`role`), or with `decode=True` an encoded tensor's logical bytes.
+    /// An encoded tensor with neither is an `InvalidError` naming its roles.
+    #[pyo3(signature = (key, out, *, role = None, decode = false, offset = 0))]
     fn read_into(
         &self,
         py: Python<'_>,
         key: String,
         out: &Bound<'_, PyAny>,
         role: Option<String>,
+        decode: bool,
         offset: u64,
     ) -> PyResult<()> {
         if out.hasattr("__dlpack__")? {
             let mut held = crate::store::Dlpack::of(py, out, None, None)?;
-            let result = self.fill_target(py, key, role.as_deref(), offset, held.destination());
+            let result =
+                self.fill_target(py, key, role.as_deref(), decode, offset, held.destination());
             if result.is_err() {
                 held.record_cuda_error();
             }
@@ -517,6 +538,6 @@ impl PyTensors {
             ptr: buf.buf_ptr() as *mut u8,
             len: buf.len_bytes(),
         };
-        self.fill_target(py, key, role.as_deref(), offset, dst)
+        self.fill_target(py, key, role.as_deref(), decode, offset, dst)
     }
 }

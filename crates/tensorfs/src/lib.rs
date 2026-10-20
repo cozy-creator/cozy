@@ -42,8 +42,8 @@ mod session;
 #[cfg(feature = "store")]
 pub use session::{
     bearer, Checkpoint, Client, Component, ComponentWriter, Config, Convert, ConvertProgress,
-    Download, Endpoint, Fetched, Format, HeaderMap, Open, Progress, Read, Ref, Request, Selection,
-    TokenProvider, Writer, WriterOptions,
+    Download, Endpoint, Fetched, Format, HeaderMap, Open, Progress, Read, ReadInto, Ref, Request,
+    Selection, TokenProvider, Writer, WriterOptions,
 };
 
 /// This TensorFS's release version.

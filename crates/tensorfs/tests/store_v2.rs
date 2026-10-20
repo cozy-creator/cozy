@@ -688,7 +688,7 @@ fn usage_counts_shared_objects_once_and_collect_drops_the_least_recent_pin() {
         let pin = Pin {
             last_use,
             owner: Some("tensord".into()),
-            roots,
+            ..Pin::new(roots)
         };
         store.pin(id, &pin).unwrap();
     };

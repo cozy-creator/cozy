@@ -49,12 +49,7 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
     let scratch = Scratch::new();
     let cache = scratch.0.join("cache");
     let producer = client(&cache);
-    let mut writer = producer
-        .writer(WriterOptions {
-            variant: Some("u8"),
-            ..WriterOptions::default()
-        })
-        .unwrap();
+    let mut writer = producer.writer(WriterOptions::default()).unwrap();
     {
         let mut model = writer
             .component("model", "test.Model", Default::default(), None)
@@ -69,7 +64,7 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
         .expect("Writer returned no tree identity")
         .clone();
     let payload: Vec<_> = checkpoint.header().objects().cloned().collect();
-    assert_eq!(checkpoint.variant(), Some("u8"));
+    assert_eq!(checkpoint.variant(), Some(""));
     assert_eq!(
         checkpoint.component("model").unwrap().read_decoded("w").unwrap(),
         WEIGHT
@@ -132,7 +127,7 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
         .unwrap();
     assert_eq!(reopened.id(), &header);
     assert_eq!(reopened.tree(), Some(&tree));
-    assert_eq!(reopened.variant(), Some("u8"));
+    assert_eq!(reopened.variant(), Some(""));
     assert_eq!(
         reopened.component("model").unwrap().read_decoded("w").unwrap(),
         WEIGHT
