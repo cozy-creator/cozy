@@ -813,3 +813,73 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
         .getattr("modules")?
         .set_item("tensorfs._ext.varena", &m)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::PyList;
+
+    #[test]
+    fn request_stats_keep_the_runtime_container_shape() {
+        Python::initialize();
+        Python::attach(|py| {
+            let report = stats(
+                py,
+                Stats {
+                    copies: vec![varena::placement::Copy {
+                        request: 1,
+                        page: 2,
+                        tier: Tier::Disk,
+                        speculative: false,
+                        stats: tensorfs::io::ReadStats {
+                            bytes: 7,
+                            ..Default::default()
+                        },
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let report = report.bind(py);
+            assert!(report.get_item("events").unwrap().is_some());
+            let copied = report.get_item("copies").unwrap().unwrap();
+            let copied = copied.cast::<PyList>().unwrap();
+            let first = copied.get_item(0).unwrap();
+            assert_eq!(
+                first
+                    .get_item("stats")
+                    .unwrap()
+                    .get_item("bytes")
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                7
+            );
+        });
+    }
+
+    #[test]
+    fn memory_failure_exposes_typed_recovery_fields() {
+        Python::initialize();
+        Python::attach(|py| {
+            let error = raise(
+                py,
+                Error::DeviceFull {
+                    need: 16,
+                    deficit: 8,
+                },
+            );
+            let value = error.value(py);
+            assert_eq!(
+                value.getattr("code").unwrap().extract::<String>().unwrap(),
+                "DEVICE_FULL"
+            );
+            assert!(!value.getattr("sticky").unwrap().extract::<bool>().unwrap());
+            assert_eq!(value.getattr("need").unwrap().extract::<u64>().unwrap(), 16);
+            assert_eq!(
+                value.getattr("deficit").unwrap().extract::<u64>().unwrap(),
+                8
+            );
+        });
+    }
+}
