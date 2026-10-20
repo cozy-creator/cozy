@@ -28,6 +28,7 @@ KERNEL_FILE = 'crates/tensorfs-py/scripts/cuda_kernel_conform.py'
 KERNEL_CASES = 'crates/tensorfs/conformance/vectors/cases/'
 RUNTIME_TAG = 'cp312-abi3-manylinux_2_28_x86_64'
 RUNTIME_KERNELS = {f'cozy_runtime/_kernels/{name}.abi3.so' for name in ('_gemm', '_norm', '_fa3')}
+PYTORCH_INDEX = 'https://download.pytorch.org/whl/cu130'
 
 
 def git(repo, *args):
@@ -91,8 +92,8 @@ def requirements(path):
               'tqdm', 'psutil', 'pyyaml', 'packaging', 'comfy-kitchen', 'comfy-aimdo'}
     if not needed <= versions.keys():
         raise ValueError('requirements missing consumer dependency pins')
-    if re.search(r'\+cu[0-9]+$', versions['torch']) is None:
-        raise ValueError('Torch requires its exact CUDA build tag in the dependency freeze')
+    if not versions['torch'].endswith('+cu130'):
+        raise ValueError('Torch requires its exact CUDA build tag +cu130 in the dependency freeze')
     return {'sha256': digest(raw), 'requirements': values, 'versions': versions}, raw
 
 
@@ -233,6 +234,8 @@ def generate(args):
     header = '# /// script\n# requires-python = ' + json.dumps(runtime['requires_python']) + '\n'
     header += '# dependencies = ' + json.dumps(dependency_pins) + '\n# [tool.uv.sources]\n'
     header += ''.join(f'# {name} = {{ path = {json.dumps(path)} }}\n' for name, path in paths.items())
+    header += '# torch = { index = "pytorch-cu130" }\n# [[tool.uv.index]]\n'
+    header += '# name = "pytorch-cu130"\n# url = ' + json.dumps(PYTORCH_INDEX) + '\n# explicit = true\n'
     header += '# ///\n'
     worker = (HERE / 'worker.py').read_text().replace('NATIVE_ASSET_BYTES', str(native['bytes'])).replace('COMFY_ASSET_BYTES', str(upstream['bytes']))
     payload = header + '\nSPEC = ' + repr(spec) + '\nFILES = ' + repr(files) + '\n\n' + worker

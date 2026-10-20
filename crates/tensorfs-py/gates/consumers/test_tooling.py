@@ -210,7 +210,15 @@ class Contract(unittest.TestCase):
         metadata = tomllib.loads('\n'.join(line[2:] for line in metadata.splitlines()))
         self.assertIn('cozy-runtime==0.28.2', metadata['dependencies'])
         self.assertNotIn('cozy-runtime[media]==0.30.0', metadata['dependencies'])
-        self.assertEqual(set(metadata['tool']['uv']['sources']), {'cozy-runtime', 'tensorfs'})
+        sources = metadata['tool']['uv']['sources']
+        self.assertEqual(set(sources), {'cozy-runtime', 'tensorfs', 'torch'})
+        self.assertEqual(sources['cozy-runtime'], {'path': self.runtime.name})
+        self.assertEqual(sources['tensorfs'], {'path': self.native.name})
+        self.assertEqual(sources['torch'], {'index': 'pytorch-cu130'})
+        self.assertEqual(metadata['tool']['uv']['index'], [{
+            'name': 'pytorch-cu130', 'url': 'https://download.pytorch.org/whl/cu130', 'explicit': True,
+        }])
+        self.assertIn('torch==2.14.0+cu130', metadata['dependencies'])
         self.assertLess(len(raw.encode()), 32 << 20)
 
     def test_real_cpu_receipts_are_negative_even_with_zero_error(self):
@@ -442,6 +450,13 @@ class Contract(unittest.TestCase):
             self.inventory(root)
             with self.assertRaisesRegex(ValueError, 'installed dependency differs: torch'):
                 validate.validate(root, expected, run, machine, launch)
+
+    def test_other_cuda_index_build_is_refused_before_writing(self):
+        self.requirements.write_text(self.requirements.read_text().replace('torch==2.14.0+cu130', 'torch==2.14.0+cu128'))
+        with self.assertRaisesRegex(ValueError, r'exact CUDA build tag \+cu130'):
+            make_payload.generate(self.args)
+        self.assertFalse(self.args.output.exists())
+        self.assertFalse(self.args.output.with_suffix('.manifest.json').exists())
 
     def test_installed_runtime_kernel_hashes_must_match(self):
         root, expected, run, machine, launch = self.fixture()
