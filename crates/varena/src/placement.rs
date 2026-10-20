@@ -952,6 +952,7 @@ impl Placement {
         let status = self.ledger.status()?;
         let orphans = self.channel.orphans(self.row.owner())?;
         let mut inner = self.inner.lock();
+        inner.table.capacity = status.capacity;
         let present: BTreeSet<_> = facts.iter().map(|(id, _, _, _)| *id).collect();
         let finished: BTreeSet<_> = inner.retired.difference(&present).copied().collect();
         inner

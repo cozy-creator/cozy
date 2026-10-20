@@ -273,7 +273,8 @@ impl Table {
 
     pub fn working_set(&self, request: RequestId) -> Option<u64> {
         let request = self.request(request)?;
-        self.pages
+        let home = self
+            .pages
             .iter()
             .filter(|page| {
                 self.class(page) == Class::Working
@@ -283,6 +284,37 @@ impl Table {
             })
             .try_fold(request.measured()?, |bytes, page| {
                 bytes.checked_add(page.bytes)
+            })?;
+        home.checked_add(self.stream_footprint(request.id, request.position.step)?)
+    }
+
+    fn stream_footprint(&self, request: RequestId, step: u32) -> Option<u64> {
+        let mut groups: BTreeMap<ModelId, (u64, u64, u64)> = BTreeMap::new();
+        for page in self.pages.iter().filter(|page| {
+            page.lowered.contains(&request)
+                && page
+                    .uses
+                    .iter()
+                    .any(|usage| usage.request == request && usage.position.step == step)
+        }) {
+            let Some(model) = page.model else {
+                continue;
+            };
+            let group = groups.entry(model).or_default();
+            group.0 = group.0.max(page.bytes);
+            group.1 = group.1.saturating_add(1);
+            if page.mapped() && self.class(page) == Class::Pinned {
+                group.2 = group.2.checked_add(page.bytes)?;
+            }
+        }
+        groups
+            .values()
+            .try_fold(0_u64, |sum, (largest, count, pinned)| {
+                sum.checked_add(
+                    largest
+                        .checked_mul((*count).min(3))?
+                        .saturating_sub(*pinned),
+                )
             })
     }
     pub fn speculative_budget(&self, request: RequestId) -> Option<u64> {
@@ -440,7 +472,7 @@ impl Table {
             })
     }
 
-    fn reserve_known(&self, measured: bool) -> Option<u64> {
+    fn activation_reserve(&self, measured: bool) -> Option<u64> {
         let need = self.requests.iter().try_fold(0_u64, |sum, request| {
             let peak = if measured {
                 request.measured()?
@@ -454,7 +486,11 @@ impl Table {
             .iter()
             .filter(|page| page.mapped() && matches!(page.kind, Kind::Scratch(_)))
             .try_fold(0_u64, |sum, page| sum.checked_add(page.bytes))?;
-        need.saturating_sub(scratch)
+        Some(need.saturating_sub(scratch))
+    }
+
+    fn reserve_known(&self, measured: bool) -> Option<u64> {
+        self.activation_reserve(measured)?
             .checked_add(self.stream_reserve()?)
     }
 
@@ -514,6 +550,7 @@ impl Table {
                     .iter()
                     .filter(|page| {
                         page.kind == Kind::Weight
+                            && !page.lowered.contains(&id)
                             && self.class(page) != Class::Pinned
                             && page.uses.iter().any(|usage| {
                                 usage.request == id
@@ -522,7 +559,13 @@ impl Table {
                             })
                     })
                     .try_fold(0_u64, |sum, page| sum.checked_add(page.bytes))?;
-                Some(largest.max(weights.checked_add((*extra)?)?))
+                Some(
+                    largest.max(
+                        weights
+                            .checked_add((*extra)?)?
+                            .checked_add(self.stream_footprint(id, step)?)?,
+                    ),
+                )
             })
     }
 
@@ -923,7 +966,7 @@ fn lower(table: &Table, id: RequestId, need: u64) -> Vec<Action> {
     let budget = table
         .capacity
         .saturating_sub(fixed)
-        .saturating_sub(table.reserve_known(false).unwrap_or(0))
+        .saturating_sub(table.activation_reserve(false).unwrap_or(0))
         .saturating_sub(ring)
         .saturating_sub(need);
     let mut plan = Planner::new(table);
