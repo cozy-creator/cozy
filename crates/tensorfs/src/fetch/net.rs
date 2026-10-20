@@ -30,8 +30,6 @@ use super::policy::{CheckedUrl, SourcePolicy};
 use super::token::{Request as Presented, TokenProvider};
 use crate::err::{refuse, Code, Refusal, Result};
 
-/// The headers of an answer, for the fetch modules beside the client: hyper is named only here.
-
 /// RFC 8305's connection attempt delay: the next address is dialed while the last is silent
 /// this long. A stagger, never a verdict.
 const STAGGER: Duration = Duration::from_millis(250);
