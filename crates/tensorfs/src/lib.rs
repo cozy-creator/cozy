@@ -3,9 +3,8 @@
 // Unsafe code lives only in platform, the OS seam.
 #![deny(unsafe_code)]
 
-pub mod b64;
 #[cfg(feature = "store")]
-pub mod descriptors;
+pub(crate) mod descriptors;
 pub mod err;
 #[cfg(feature = "store")]
 pub mod export;

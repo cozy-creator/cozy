@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
+use base64::engine::{general_purpose::STANDARD, Engine as _};
 use super::net::Uri;
 use serde_json::Value;
 
@@ -359,7 +360,7 @@ impl Endpoint {
         let target = reply.header("location").map(|at| join(&url.parse::<Uri>().expect("sent"), at));
         let auth = target.as_deref().is_none_or(|t| same_origin(t, &url));
         let target = target.unwrap_or_else(|| url.clone());
-        let checksum = crate::b64::encode(&decode_hex(&object.sha256));
+        let checksum = STANDARD.encode(decode_hex(&object.sha256));
         let headers = vec![
             ("content-length".to_owned(), object.length.to_string()),
             ("x-amz-checksum-sha256".to_owned(), checksum),
