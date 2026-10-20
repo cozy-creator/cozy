@@ -451,7 +451,14 @@ mod tests {
 
     #[test]
     fn metadata_preflight_presigns_old_manifest_without_object_get() {
-        let checkpoint = Arc::new(common::components("acme/old-checkpoint", &[1], 16, 3, &[]));
+        let bytes = tensorfs::limits::INLINE_MAX_BYTES as usize + 4;
+        let checkpoint = Arc::new(common::components(
+            "acme/old-checkpoint",
+            &[1],
+            bytes,
+            3,
+            &[],
+        ));
         let hub = common::hub(
             vec![checkpoint.clone()],
             None,
@@ -486,7 +493,14 @@ mod tests {
 
     #[test]
     fn changed_manifest_stops_before_presign_or_object_get() {
-        let checkpoint = Arc::new(common::components("acme/old-checkpoint", &[1], 16, 4, &[]));
+        let bytes = tensorfs::limits::INLINE_MAX_BYTES as usize + 4;
+        let checkpoint = Arc::new(common::components(
+            "acme/old-checkpoint",
+            &[1],
+            bytes,
+            4,
+            &[],
+        ));
         let hub = common::hub(
             vec![checkpoint.clone()],
             None,
