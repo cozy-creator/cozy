@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tensorfs::client::regions;
 use tensorfs::format::Dtype;
 use tensorfs::ids::ObjectRef;
-use tensorfs::store2::{Checkpoint, Store};
+use tensorfs::store::{Checkpoint, Store};
 use tensorfs::writer::{Data, Source};
 use tensorfs::io::view::View;
 use varena::{cuda, memory, Error, Gpu, Host, HostSet};

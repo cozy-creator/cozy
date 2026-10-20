@@ -15,7 +15,7 @@ use std::time::Instant;
 use tensorfs::format::{Body, Component, Dtype, Encoding, Header, Location, ObjectRef, Part, Tensor, CHUNKS_DIR};
 use tensorfs::import::{Access, Request};
 use tensorfs::io::{self, Copy, Dst, ReadOpts, ReadStats, Src, Target};
-use tensorfs::store2::{Checkpoint, Store};
+use tensorfs::store::{Checkpoint, Store};
 use tensorfs::writer::{Data, PartData, Source, Writer};
 
 const MIB: usize = 1 << 20;

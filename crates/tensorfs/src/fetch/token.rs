@@ -1,7 +1,6 @@
 //! What a request presents (tensorfs-api §1): a token provider is asked per request with its
-//! method, URL, headers and payload digest, so a bearer token, DPoP proofs ([`super::dpop`])
-//! and S3 SigV4 all fit. [`default_for`] picks the provider an endpoint gets when the caller
-//! gives none, by host.
+//! method, URL, headers and payload digest, so a bearer token and S3 SigV4 both fit.
+//! [`default_for`] picks the provider an endpoint gets when the caller gives none, by host.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -14,7 +13,7 @@ use aws_sigv4::http_request::{
 };
 use aws_sigv4::sign::v4;
 
-pub use hyper::HeaderMap;
+pub use super::net::HeaderMap;
 use super::policy::base_host;
 use super::tensorhub::TENSORHUB;
 use crate::err::{refuse, Code, Refusal, Result};

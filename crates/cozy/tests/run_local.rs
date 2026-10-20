@@ -141,7 +141,7 @@ fn runtime_checkpoint_writes_replay_and_survive_calcifer_restart() {
         }
         let reference = output["checkpoint"].clone();
         assert_eq!(reference["repo_id"], "local/derived", "{reference}");
-        let store = tensorfs::store2::Store::open(&store_path).unwrap();
+        let store = tensorfs::store::Store::open(&store_path).unwrap();
         let revision = reference["revision"].as_str().unwrap();
         let mut tree = tensorfs::format::ObjectRef {
             sha256: revision.strip_prefix("sha256:").unwrap().into(), length: 0,
@@ -188,7 +188,7 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
             upload_tree,
         },
         format::{Dtype, Tree},
-        store2::Store,
+        store::Store,
         writer::{Data, Source},
     };
 
@@ -578,7 +578,7 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
 fn runtime_checkpoint_uploads_local_alias_on_disk() {
     use tensorfs::{
         format::Dtype,
-        store2::Store,
+        store::Store,
         writer::{Data, Source},
     };
     let Some(home) = Home::new() else { return };

@@ -71,6 +71,23 @@ impl Default for Access {
     }
 }
 
+impl Access {
+    /// Provider credentials from `HF_TOKEN` and `CIVITAI_TOKEN`.
+    pub fn from_env() -> Access {
+        let bearer = |var: &str| {
+            std::env::var(var)
+                .ok()
+                .filter(|t| !t.trim().is_empty())
+                .map_or_else(String::new, |t| format!("bearer {}", t.trim()))
+        };
+        Access {
+            huggingface_token: bearer("HF_TOKEN"),
+            civitai_token: bearer("CIVITAI_TOKEN"),
+            ..Access::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Spec {
     Hf {

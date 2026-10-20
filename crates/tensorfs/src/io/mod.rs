@@ -22,6 +22,21 @@ pub use device::DeviceBuffer;
 pub use plan::Target;
 pub use probe::{ceiling, disk, Ceiling};
 
+/// `len` bytes of object `obj` from `off`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRange {
+    pub obj: crate::format::ObjectRef,
+    pub off: u64,
+    pub len: u64,
+}
+
+/// Where placed bytes come from.
+#[derive(Debug, Clone)]
+pub enum ItemSource {
+    Object(ObjectRange),
+    Inline(std::sync::Arc<[u8]>),
+}
+
 use std::fs::File;
 use std::time::Instant;
 

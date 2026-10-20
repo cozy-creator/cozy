@@ -15,7 +15,7 @@ use tensorfs::client::access;
 use tensorfs::failure::Result as Done;
 use tensorfs::fetch::{policy::is_loopback_origin, token::bearer, Client, Endpoint, SourcePolicy};
 use tensorfs::migrate::d10::{self, Migrator, UPSTREAMS};
-use tensorfs::store2::Store;
+use tensorfs::store::Store;
 
 use crate::context::hub_error;
 use crate::{output, Context};

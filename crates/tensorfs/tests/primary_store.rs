@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use tensorfs::format::{Body, Component, Dtype, Header, Location, ObjectRef, Tensor, Tree};
-use tensorfs::store2::{Checkpoint, Store};
+use tensorfs::store::{Checkpoint, Store};
 use tensorfs::{Client, Config, Download, Format, Kind, Open, Ref};
 
 const README: &[u8] = b"known repository file outside the checkpoint";

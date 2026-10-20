@@ -25,7 +25,7 @@ async fn mixed_case_model_inputs_reach_the_existing_hub_receiver_as_canonical_op
     use tensorfs::{
         fetch::{self, Client as FetchClient, Endpoint, SourcePolicy, upload_tree},
         format::{Config as HeaderConfig, Dtype, Tree},
-        store2::Store,
+        store::Store,
         writer::{Data, Source},
     };
 

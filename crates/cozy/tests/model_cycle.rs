@@ -18,7 +18,7 @@ use serde_json::Value;
 use tensorfs::{
     fetch::{Client, SourcePolicy, TensorhubOrigin},
     format::ObjectRef,
-    store2::Store,
+    store::Store,
 };
 
 /// `cozy args` in `dir`. Each step is named, timestamped and flushed before it starts, and its

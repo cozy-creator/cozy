@@ -11,7 +11,7 @@ use std::{
 use tensorfs::{
     fetch::Endpoint,
     format::{Dtype, ObjectRef, Repo, Tree},
-    store2::Store,
+    store::Store,
     writer::{Data, Source},
 };
 

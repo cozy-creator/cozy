@@ -7,13 +7,13 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::client::io;
+use super::io;
 use crate::failure::{fail, Kind, Result};
 use crate::format::decode::gguf::Type;
 use crate::format::Body;
 use crate::import::gguf::{self, Meta};
 use crate::import::ROOT_COMPONENT;
-use crate::store2::Checkpoint;
+use crate::store::Checkpoint;
 
 /// Writes each GGUF of `ck` into `dir`; the paths written, relative.
 pub fn gguf(ck: &Checkpoint, dir: &Path) -> Result<Vec<String>> {

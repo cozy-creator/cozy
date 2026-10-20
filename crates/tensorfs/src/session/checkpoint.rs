@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::failure::{fail, Kind, Result};
 use crate::format::{self, Body, ObjectRef, PartBytes};
 use crate::io::{Dst, ReadOpts, Target};
-use crate::store2::{CacheGuard, Checkpoint as Stored, Store};
+use crate::store::{CacheGuard, Checkpoint as Stored, Store};
 
 use super::{remote::Remote, Download, Fetched, Format, Ref, Selection};
 

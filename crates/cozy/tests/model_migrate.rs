@@ -16,7 +16,7 @@ use common::{Home, Out};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tensorfs::format::{Body, ObjectRef};
-use tensorfs::store2::Store;
+use tensorfs::store::Store;
 
 /// tensorhub `migrations/postgres/0102_drop_tensorfs_v1.up.sql` at 250e29ef (#1203), verbatim.
 const RELEASE_TWO: &str = include_str!("fixtures/migrate/0102_drop_tensorfs_v1.up.sql");

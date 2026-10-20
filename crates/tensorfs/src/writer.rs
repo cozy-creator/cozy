@@ -42,9 +42,9 @@ use crate::format::{
     Part, Pipeline, Tensor, Value, CHUNKS_DIR, CONFIG_FILE,
 };
 use crate::import;
-use crate::store2::retention::{self, Retention};
+use crate::store::retention::{self, Retention};
 use crate::sha256::{hex, Sha256};
-use crate::store2::{fail, fault, is_name, sync_dir, Admission, Checkpoint, Error, Pin, Result, Store};
+use crate::store::{fail, fault, is_name, sync_dir, Admission, Checkpoint, Error, Pin, Result, Store};
 
 const SPOOL: &str = "spool";
 const JOURNAL: &str = "journal";

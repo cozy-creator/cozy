@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tensorfs::format::{
     variant_of, Body, Component, Dtype, Header, Location, ObjectRef, Release, Repo, Tensor, Tree,
 };
-use tensorfs::store2::{fault, Durability, Pin, Store};
+use tensorfs::store::{fault, Durability, Pin, Store};
 
 const HOUR: Duration = Duration::from_secs(3600);
 

@@ -103,7 +103,7 @@ fn on_volume(cache: &Path) -> usize {
 #[tokio::test]
 async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
     let source = std::env::temp_dir().join(format!("tensord-volume-source-{}", uuid::Uuid::new_v4()));
-    let store = tensorfs::store2::Store::open(&source).unwrap();
+    let store = tensorfs::store::Store::open(&source).unwrap();
     let manifest = hub_oauth::checkpoint(&store, &vec![5; 1 << 20]);
     let objects = store.closure(&manifest).unwrap().len();
     let model = names_hub::Model {

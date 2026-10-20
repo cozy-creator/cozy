@@ -25,7 +25,7 @@ use tensord::{
     origin::Publication,
     stop::Stop,
 };
-use tensorfs::{err::Code, format::ObjectRef, store2::Store};
+use tensorfs::{err::Code, format::ObjectRef, store::Store};
 
 /// The patience a stopped publication is held to.
 const SAMPLE_SECONDS: f64 = 1.0;

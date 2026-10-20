@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use tensorfs::err::Code;
 use tensorfs::format::{decode, Body, Dtype, Encoding, PartBytes};
 use tensorfs::import::{Access, Request};
-use tensorfs::store2::{Checkpoint, Store};
+use tensorfs::store::{Checkpoint, Store};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/quantized")

@@ -12,7 +12,7 @@ use tensorfs::fetch::{
     upload_tree, Client, Config, Endpoint, Fetcher, Fresh, ObjectStore, Origin, Payload, SourcePolicy, Stream, Want,
 };
 use tensorfs::format::{Config as HeaderConfig, Dtype, ObjectRef, Tree};
-use tensorfs::store2::Store;
+use tensorfs::store::Store;
 use tensorfs::writer::{Data, Source};
 
 const MIB: usize = 1 << 20;

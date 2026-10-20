@@ -19,7 +19,7 @@ use hub_client::{types, ResponseValue};
 use tensorfs::{
     err::{refuse, Code, Refusal, Result},
     format::ObjectRef,
-    store2::Store,
+    store::Store,
 };
 
 use crate::{

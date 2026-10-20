@@ -15,7 +15,9 @@ use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
-use hyper::{Method, Request, Response, Uri};
+use hyper::{Method, Request, Response};
+/// The HTTP types the rest of `fetch` names; hyper stays inside this file.
+pub use hyper::{HeaderMap, Uri};
 use tokio::io::AsyncReadExt;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -29,7 +31,6 @@ use super::token::{Request as Presented, TokenProvider};
 use crate::err::{refuse, Code, Refusal, Result};
 
 /// The headers of an answer, for the fetch modules beside the client: hyper is named only here.
-pub(crate) use hyper::HeaderMap;
 
 /// RFC 8305's connection attempt delay: the next address is dialed while the last is silent
 /// this long. A stagger, never a verdict.

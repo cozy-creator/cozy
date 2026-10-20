@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use tensorfs::{
     format::ObjectRef,
     migrate::{self, v1},
-    store2::Store,
+    store::Store,
 };
 
 use crate::{
@@ -53,7 +53,7 @@ fn rewrite(src: &v1::Source, store: &Store, lane: v1::Lane) -> Result<(ObjectRef
 /// pins go and every unreferenced object goes at once, the old ones fetched for them included.
 /// No grace: the Hub path runs on a machine that does nothing else, so disk holds one lane.
 fn clear(store: &Store) -> Result<(), Refused> {
-    let failed = |e: tensorfs::store2::Error| refused("migration_failed", e.to_string());
+    let failed = |e: tensorfs::store::Error| refused("migration_failed", e.to_string());
     for (id, _) in store.pins().map_err(failed)?.into_iter().filter(|(id, _)| id.starts_with("migrate-")) {
         store.unpin(&id).map_err(failed)?;
     }

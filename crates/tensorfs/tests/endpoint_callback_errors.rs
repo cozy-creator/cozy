@@ -15,7 +15,7 @@ use tensorfs::fetch::{
     Want,
 };
 use tensorfs::format::ObjectRef;
-use tensorfs::store2::Store;
+use tensorfs::store::Store;
 
 const DETAIL: &str = "the credential callback's literal network failure";
 const PAYLOAD: &[u8] = b"ordinary endpoint payload";

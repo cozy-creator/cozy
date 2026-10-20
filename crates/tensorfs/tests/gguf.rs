@@ -14,7 +14,7 @@ use tensorfs::format::decode::{elem::f16, f16 as f16_bits};
 use tensorfs::format::{encode, Body, Dtype, PartBytes, Value};
 use tensorfs::import::gguf::{self, At};
 use tensorfs::import::{remote, Access, Request};
-use tensorfs::store2::{Checkpoint, Store};
+use tensorfs::store::{Checkpoint, Store};
 
 struct Scratch(PathBuf);
 
@@ -318,16 +318,16 @@ fn tfs_imports_and_exports_a_gguf() {
             String::from_utf8_lossy(&out.stderr)
         );
     };
-    tfs(&["import", source.to_str().unwrap(), "--name", "test/llama"]);
+    tfs(&["convert", source.to_str().unwrap(), "--name", "local/llama@1"]);
     let out = scratch.0.join("out");
-    tfs(&["export", "test/llama", out.to_str().unwrap(), "--gguf"]);
+    tfs(&["export", "local/llama", out.to_str().unwrap(), "--gguf"]);
     assert_eq!(
         fs::read(out.join("llama-moe.gguf")).unwrap(),
         fs::read(&source).unwrap()
     );
     tfs(&[
         "export",
-        "test/llama",
+        "local/llama",
         scratch.0.join("st").to_str().unwrap(),
         "--safetensors",
     ]);

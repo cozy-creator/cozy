@@ -16,7 +16,7 @@ use super::{Client, Config, Fetcher, ObjectStore, Origin, Want};
 use crate::err::{Code, Refusal, Result};
 use crate::format::{repo_key, Config as HeaderConfig, Dtype, ObjectRef, Repo, Tree};
 use crate::sha256::hex_digest;
-use crate::store2::Store;
+use crate::store::Store;
 use crate::writer::{Data, Source};
 
 pub const FIXTURE: &str = "conformance/endpoint";
@@ -56,7 +56,7 @@ fn expect(cond: bool, why: impl FnOnce() -> String) -> std::result::Result<(), S
 /// The fixture in a store under `scratch`: a one-component cozytensors as variant `int8` of a
 /// tree with a README. The tree.
 fn fixture(scratch: &Path) -> Result<(Store, ObjectRef)> {
-    let failed = crate::store2::Error::refusal;
+    let failed = crate::store::Error::refusal;
     let store = Store::open(scratch.join("fixture")).map_err(failed)?;
     let mut w = store.writer(None, None).map_err(failed)?;
     let bytes: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
@@ -97,11 +97,11 @@ async fn write_side(endpoint: &Arc<Endpoint>, store: &Store, tree: &ObjectRef, n
     let outcome = expect(sent.is_err() && !held, || format!("answered {sent:?}, holds it: {held}"));
     cases.record("upload: wrong bytes are refused and not stored", true, Some(outcome));
 
-    let readme = Tree::from_json(&store.read(tree).map_err(crate::store2::Error::refusal)?)
+    let readme = Tree::from_json(&store.read(tree).map_err(crate::store::Error::refusal)?)
         .map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() })?
         .files["README.md"]
         .clone();
-    let bytes = Bytes::from(store.read(&readme).map_err(crate::store2::Error::refusal)?);
+    let bytes = Bytes::from(store.read(&readme).map_err(crate::store::Error::refusal)?);
     let checksum = crate::b64::encode(&crate::sha256::digest(&bytes));
     let headers = vec![
         ("content-length".to_owned(), bytes.len().to_string()),
@@ -142,12 +142,12 @@ async fn write_side(endpoint: &Arc<Endpoint>, store: &Store, tree: &ObjectRef, n
 
     let mut trees = Vec::new();
     for i in 0..8 {
-        let readme = store.put_bytes(format!("writer {i} {nonce}").as_bytes()).map_err(crate::store2::Error::refusal)?;
+        let readme = store.put_bytes(format!("writer {i} {nonce}").as_bytes()).map_err(crate::store::Error::refusal)?;
         let t = store.put_tree(&Tree { files: BTreeMap::from([("README.md".to_owned(), readme.clone())]) });
-        let t = t.map_err(crate::store2::Error::refusal)?;
+        let t = t.map_err(crate::store::Error::refusal)?;
         for object in [&readme, &t] {
             let (from, at) = (store.clone(), object.clone());
-            endpoint.upload(object, &move || from.file(&at).map(Payload::File).map_err(crate::store2::Error::refusal)).await?;
+            endpoint.upload(object, &move || from.file(&at).map(Payload::File).map_err(crate::store::Error::refusal)).await?;
         }
         trees.push(t);
     }
@@ -195,7 +195,7 @@ async fn read_side(
     cases.record("refs: an absent repo is 404", true, Some(expect(absent == Fresh::Absent, || format!("{absent:?}"))));
 
     // Down through the Fetcher: redirects followed, every object checked.
-    let into = Store::open(scratch.join("pulled")).map_err(crate::store2::Error::refusal)?;
+    let into = Store::open(scratch.join("pulled")).map_err(crate::store::Error::refusal)?;
     let fetcher = Fetcher::new(Arc::new(into.clone()) as Arc<dyn ObjectStore>, client.clone(), None, Config::default());
     let origin: Arc<dyn Origin> = endpoint.clone();
     let pulled = fetcher.pull(&origin, FIXTURE, Some("1"), Some("int8"), &Want::default()).await;
@@ -203,7 +203,7 @@ async fn read_side(
     let outcome = pulled.map(|p| p.objects).map_err(|e| e.to_string()).and_then(|n| expect(n >= 4, || format!("{n} objects")));
     cases.record("blobs: GET returns each object, verified", true, Some(outcome));
 
-    let header = Tree::from_json(&store.read(tree).map_err(crate::store2::Error::refusal)?)
+    let header = Tree::from_json(&store.read(tree).map_err(crate::store::Error::refusal)?)
         .map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() })?
         .header("int8")
         .cloned()
@@ -216,7 +216,7 @@ async fn read_side(
     cases.record("blobs: HEAD is 200 with the length", true, outcome);
     let last = header.length - 1;
     let ranged = endpoint.raw("GET", &header.key(), vec![("range".into(), format!("bytes={last}-{last}"))], None).await?;
-    let expected = store.read(&header).map_err(crate::store2::Error::refusal)?[last as usize];
+    let expected = store.read(&header).map_err(crate::store::Error::refusal)?[last as usize];
     let outcome = ranged.map(|(status, _, body)| match status {
         300..=399 => Ok(()),
         _ => expect(status == 206 && body == [expected], || format!("answered {status} with {} bytes", body.len())),

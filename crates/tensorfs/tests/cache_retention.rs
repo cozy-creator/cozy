@@ -21,8 +21,8 @@ use tensorfs::io::{
     view::View,
     Dst,
 };
-use tensorfs::read::ObjectRange;
-use tensorfs::store2::Store;
+use tensorfs::io::ObjectRange;
+use tensorfs::store::Store;
 use tensorfs::writer::{Data, Source as WriterSource};
 
 const LATE: &[u8] = b"\x85raw unread bytes, deliberately resembling a CBOR header";
@@ -311,7 +311,7 @@ fn read_late(source: &Source, object: &ObjectRef) {
         len: object.length,
         part_end: true,
         source: ItemSource::Object(ObjectRange {
-            obj: tensorfs::ids::ObjectRef {
+            obj: tensorfs::format::ObjectRef {
                 sha256: object.sha256.clone(),
                 length: object.length,
             },
@@ -759,7 +759,7 @@ fn failed_managed_stream_retains_local_bytes_until_the_last_native_owner() {
 
 #[test]
 fn manual_hold_prefix_pins_survive_while_native_owner_records_are_reaped() {
-    use tensorfs::store2::Pin;
+    use tensorfs::store::Pin;
 
     let scratch = Scratch::new();
     let store = scratch.store();

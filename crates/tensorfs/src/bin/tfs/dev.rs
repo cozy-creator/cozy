@@ -8,7 +8,7 @@ use std::io::Read;
 
 use tensorfs::failure::Result;
 use tensorfs::format::{Dtype, Encoding, GlobalScale, NibbleOrder, ObjectRef, ScaleLayout};
-use tensorfs::store2::Store;
+use tensorfs::store::Store;
 use tensorfs::writer::{Data, PartData, Source};
 
 pub struct Noise {

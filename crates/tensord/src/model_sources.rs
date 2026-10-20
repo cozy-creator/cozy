@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 use crate::storage::{self, Store};
-use tensorfs::store2::Checkpoint;
+use tensorfs::store::Checkpoint;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SelectedManifest {

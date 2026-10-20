@@ -22,7 +22,7 @@ use tensord::storage::Store;
 use tensorfs::{
     format::{Dtype, ObjectRef},
     io::{self, Copy, Dst, ReadOpts, Src},
-    store2::Checkpoint,
+    store::Checkpoint,
     writer::{Data, Source},
 };
 use varena::{host::HostMem, layout::Layout};

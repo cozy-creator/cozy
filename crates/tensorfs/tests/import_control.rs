@@ -12,12 +12,11 @@ use std::thread;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tensorfs::client::ImportOptions;
 use tensorfs::err::{Code, Result};
 use tensorfs::fetch::token::{HeaderMap, TokenProvider};
 use tensorfs::format::{ObjectRef, Value};
 use tensorfs::import::{self, Access, Request};
-use tensorfs::store2::Store;
+use tensorfs::store::Store;
 
 const COMMIT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DATA: &[u8] = b"0123456789abcdef";
@@ -536,40 +535,6 @@ fn stop_after_real_tensor_write_prevents_final_commit() {
     assert!(
         writer.committed().is_none(),
         "cancellation committed the header"
-    );
-}
-
-#[test]
-fn final_progress_stop_prevents_header_tree_and_ref_publication() {
-    let scratch = Scratch::new();
-    let file = scratch.0.join("model.safetensors");
-    fs::write(&file, safetensors()).unwrap();
-    let sources = vec![file.to_str().unwrap().to_owned()];
-    let store = Store::open(scratch.0.join("store")).unwrap();
-    let stop = AtomicBool::new(false);
-    let progress = |stage: &str, _, _| {
-        if stage == "imported" {
-            stop.store(true, Ordering::Release)
-        }
-    };
-    let stopping = || stop.load(Ordering::Acquire);
-    let error = store
-        .import_named(
-            &sources,
-            &ImportOptions {
-                name: Some("local/no-ref"),
-                converter: None,
-                variant: None,
-                progress: &progress,
-                stop: Some(&stopping),
-            },
-        )
-        .unwrap_err();
-    assert_eq!(error.kind, tensorfs::Kind::Network);
-    assert!(store.get_ref("local/no-ref").unwrap().is_none());
-    assert!(
-        store.get_pin("import.local.no-ref").unwrap().is_none(),
-        "final progress cancellation committed a header"
     );
 }
 

@@ -20,7 +20,7 @@ use tensorfs::{
     err::{refuse, Code, Refusal, Result},
     fetch::{Client, Config, Fetcher, Landed, Origin, Progress, Pulled, SourcePolicy, VolumeOrigin, Want},
     format::ObjectRef,
-    store2::Store,
+    store::Store,
 };
 
 pub use hub::{remote, resolve_hash, resolve_named, Resolved};

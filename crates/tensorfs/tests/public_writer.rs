@@ -438,7 +438,7 @@ async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_mo
         "a persistent header got a disposable cache pin"
     );
     // The content digest is an ordinary operator pin id, not a reserved namespace.
-    let operator = tensorfs::store2::Store::open(&cache).unwrap();
+    let operator = tensorfs::store::Store::open(&cache).unwrap();
     let manual = operator
         .put_bytes(b"operator-owned unrelated content")
         .unwrap();
@@ -496,7 +496,7 @@ async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_mo
     drop(new);
     drop(client);
     // Operator maintenance is used solely to exercise the real collector, not to create output.
-    let operator = tensorfs::store2::Store::open(&cache)
+    let operator = tensorfs::store::Store::open(&cache)
         .unwrap()
         .with_grace(std::time::Duration::ZERO);
     let disposable = operator
@@ -786,7 +786,7 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
         .expect("stream failure lost sealed local checkpoint");
     let failed_tree = local.tree().unwrap().clone();
     let failed_cache = scratch.0.join("failed-cache");
-    let operator = tensorfs::store2::Store::open(&failed_cache)
+    let operator = tensorfs::store::Store::open(&failed_cache)
         .unwrap()
         .with_grace(std::time::Duration::ZERO);
     let durable = operator
@@ -1029,7 +1029,7 @@ async fn public_convert_result_callback_can_refuse_the_final_stage_and_returns_a
             "callback refusal published a repo"
         );
         // The returned error means the worker has drained, not merely that its await was dropped.
-        let operator = tensorfs::store2::Store::open(&cache).unwrap();
+        let operator = tensorfs::store::Store::open(&cache).unwrap();
         assert!(
             operator.sweep_writers(std::time::Duration::ZERO).unwrap() > 0,
             "writer fence still active after callback error returned"
@@ -1361,7 +1361,7 @@ async fn literal_writer_inside_classified_snapshot_preserves_the_callers_header_
     let scratch = Scratch::new();
     let cache = scratch.0.join("cache");
     let client = client(&cache, &scratch.0.join("endpoint"));
-    let operator = tensorfs::store2::Store::open(&cache).unwrap().with_cache();
+    let operator = tensorfs::store::Store::open(&cache).unwrap().with_cache();
     let chosen = ObjectRef::of(b"caller chooses an internally classified snapshot root").sha256;
     let control = ObjectRef::of(b"expired internal snapshot positive control").sha256;
     for digest in [&chosen, &control] {

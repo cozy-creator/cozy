@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 
 use minicbor::Decoder;
 use serde_json::Value as Json;
-use tensorfs::client::access;
+use tensorfs::import::Access;
 use tensorfs::format::{Config, Header, ObjectRef, Repo, Tree, Value};
 use tensorfs::migrate::d10::{self, Migrator, Upstream};
-use tensorfs::store2::Store;
+use tensorfs::store::Store;
 
 const SDXL: &str = "hf://hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2";
 const GPT2: &str = "hf://hf-internal-testing/tiny-random-gpt2@71034c5d8bde858ff824298bdedc65515b97d2b9";
@@ -145,7 +145,7 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
     let _ = std::fs::remove_dir_all(&dir);
     let root = dir.join("store");
     copy(&fixture, &root);
-    let mut migrator = Migrator::new(access(), TABLE);
+    let mut migrator = Migrator::new(Access::from_env(), TABLE);
     let report = d10::store(&root, &mut migrator).unwrap();
     println!("{report:#}");
 
@@ -245,7 +245,7 @@ fn partial_tokenizer_keeps_existing_files_and_fills_missing_files() {
     let doc = serde_json::to_vec(&serde_json::json!({
         "name": "acme/tiny", "releases": [{"version": "1", "lanes": {"full": object}}]
     })).unwrap();
-    let mut migrator = Migrator::new(access(), TABLE);
+    let mut migrator = Migrator::new(Access::from_env(), TABLE);
     let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
     let read = |o: &ObjectRef| migrated.objects.iter().find(|(at, _)| at == o).unwrap().1.clone();
     let tree = Tree::from_json(&read(&migrated.repo.releases[0].tree)).unwrap();

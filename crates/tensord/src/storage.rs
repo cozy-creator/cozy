@@ -19,7 +19,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub use tensorfs::store2::{Collected, Pin, Store, Usage};
+pub use tensorfs::store::{Collected, Pin, Store, Usage};
 use tensorfs::format::ObjectRef;
 
 /// A cache pin unused this long expires.
@@ -101,11 +101,11 @@ pub fn transport(store: &Store, kind: &str, subject: &str, detail: &str) {
     }
 }
 
-pub fn io_error(error: tensorfs::store2::Error) -> io::Error {
+pub fn io_error(error: tensorfs::store::Error) -> io::Error {
     let kind = match &error {
-        tensorfs::store2::Error::Full { .. } => io::ErrorKind::StorageFull,
-        tensorfs::store2::Error::Absent(_) => io::ErrorKind::NotFound,
-        tensorfs::store2::Error::Io { source, .. } => source.kind(),
+        tensorfs::store::Error::Full { .. } => io::ErrorKind::StorageFull,
+        tensorfs::store::Error::Absent(_) => io::ErrorKind::NotFound,
+        tensorfs::store::Error::Io { source, .. } => source.kind(),
         _ => io::ErrorKind::InvalidData,
     };
     io::Error::new(kind, error.to_string())
@@ -288,7 +288,7 @@ pub fn held(store: &Store, id: &str) -> io::Result<ObjectRef> {
 }
 
 /// The checkpoint `id` names, held here (its structure; chunks may be absent).
-pub fn checkpoint(store: &Store, id: &str) -> io::Result<tensorfs::store2::Checkpoint> {
+pub fn checkpoint(store: &Store, id: &str) -> io::Result<tensorfs::store::Checkpoint> {
     store.checkpoint(&held(store, id)?).map_err(io_error)
 }
 
@@ -299,7 +299,7 @@ pub fn present(store: &Store, object: &ObjectRef) -> bool {
 
 /// The chunks and assets `components` read (all components when empty), each once; none when
 /// it names a component the checkpoint lacks.
-pub fn chunks(checkpoint: &tensorfs::store2::Checkpoint, components: &[String]) -> Vec<ObjectRef> {
+pub fn chunks(checkpoint: &tensorfs::store::Checkpoint, components: &[String]) -> Vec<ObjectRef> {
     tensorfs::fetch::wanted(checkpoint.header(), (!components.is_empty()).then_some(components)).unwrap_or_default()
 }
 

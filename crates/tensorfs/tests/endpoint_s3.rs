@@ -11,7 +11,7 @@ use tensorfs::fetch::{
     upload_tree, with_tree, Client, Config, Endpoint, Fetcher, Fresh, ObjectStore, Origin, Payload, SourcePolicy, Want,
 };
 use tensorfs::format::{Config as HeaderConfig, Dtype, ObjectRef, Tree};
-use tensorfs::store2::Store;
+use tensorfs::store::Store;
 use tensorfs::writer::{Data, Source};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

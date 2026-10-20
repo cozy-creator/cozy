@@ -4,16 +4,12 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-#[cfg(feature = "store")]
-use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
 
+pub use super::{ItemSource, ObjectRange};
 use super::{Copy, Dst, ReadOpts, ReadStats, Src};
 use crate::failure::{Failure, Kind};
-use crate::ids::ObjectRef;
-use crate::read::ObjectRange;
-#[cfg(feature = "store")]
-use crate::{meta::Meta, read::ReadLease, store::Store};
+use crate::format::ObjectRef;
 
 #[derive(Debug, Clone)]
 pub struct Item {
@@ -21,12 +17,6 @@ pub struct Item {
     pub len: u64,
     pub source: ItemSource,
     pub part_end: bool,
-}
-
-#[derive(Debug, Clone)]
-pub enum ItemSource {
-    Object(ObjectRange),
-    Inline(Arc<[u8]>),
 }
 
 #[derive(Debug, Default)]
@@ -63,44 +53,14 @@ fn invalid(detail: impl Into<String>) -> Error {
 
 pub struct Source {
     #[cfg(feature = "store")]
-    lease: RwLock<Option<ReadLease>>,
-    #[cfg(feature = "store")]
-    meta: Option<Arc<Meta>>,
-    #[cfg(feature = "store")]
-    store: Option<Arc<Store>>,
-    #[cfg(feature = "store")]
     view: Option<super::view::View>,
     files: Mutex<HashMap<String, Arc<File>>>,
     direct_io: bool,
 }
 
 impl Source {
-    #[cfg(feature = "store")]
-    pub fn new(
-        store: Arc<Store>,
-        meta: Arc<Meta>,
-        lease: ReadLease,
-        direct_io: bool,
-        _plane: usize,
-    ) -> Source {
-        Source {
-            lease: RwLock::new(Some(lease)),
-            meta: Some(meta),
-            store: Some(store),
-            view: None,
-            files: Mutex::default(),
-            direct_io,
-        }
-    }
-
     pub fn files(files: Vec<(ObjectRef, File)>, direct_io: bool, _plane: usize) -> Source {
         Source {
-            #[cfg(feature = "store")]
-            lease: RwLock::new(None),
-            #[cfg(feature = "store")]
-            meta: None,
-            #[cfg(feature = "store")]
-            store: None,
             #[cfg(feature = "store")]
             view: None,
             files: Mutex::new(
@@ -147,37 +107,10 @@ impl Source {
         if let Some(file) = self.files.lock().unwrap().get(&object.sha256).cloned() {
             return Ok(file);
         }
-        #[cfg(feature = "store")]
-        if let Some(store) = &self.store {
-            let file = store.open_verified(&object.sha256).map_err(Failure::from)?;
-            if file.len() != object.length {
-                return Err(invalid(format!(
-                    "{}: verified length {} differs from {}",
-                    object.sha256,
-                    file.len(),
-                    object.length
-                )));
-            }
-            let file = Arc::new(file.into_file());
-            self.files
-                .lock()
-                .unwrap()
-                .insert(object.sha256.clone(), file.clone());
-            return Ok(file);
-        }
         Err(invalid(format!(
             "{}: source has no verified file",
             object.sha256
         )))
-    }
-
-    pub fn close_object(&self, sha256: &str) {
-        #[cfg(feature = "store")]
-        if self.store.is_some() {
-            self.files.lock().unwrap().remove(sha256);
-        }
-        #[cfg(not(feature = "store"))]
-        let _ = sha256;
     }
 
     pub fn resident(&self, obj: &ObjectRef, _tally: &IoTally) -> Result<bool> {
@@ -202,8 +135,6 @@ impl Source {
         mode: Mode,
         tally: &IoTally,
     ) -> Result<ReadStats> {
-        #[cfg(feature = "store")]
-        let lease = self.lease.read().unwrap();
         let mut intervals = items
             .iter()
             .map(|item| {
@@ -271,10 +202,6 @@ impl Source {
         let mut files = HashMap::new();
         for item in items {
             if let ItemSource::Object(range) = &item.source {
-                #[cfg(feature = "store")]
-                if let Some(lease) = lease.as_ref() {
-                    lease.covers(range).map_err(Failure::from)?;
-                }
                 files
                     .entry(range.obj.sha256.clone())
                     .or_insert(self.file(&range.obj)?);
@@ -367,16 +294,5 @@ impl Source {
             )
         }
         .map(|_| ())
-    }
-}
-
-impl Drop for Source {
-    fn drop(&mut self) {
-        #[cfg(feature = "store")]
-        if let (Some(lease), Some(meta)) = (self.lease.get_mut().unwrap().take(), &self.meta) {
-            if let Err(error) = lease.release(meta) {
-                tracing::warn!("tensorfs: read lease release failed: {error}");
-            }
-        }
     }
 }

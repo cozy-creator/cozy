@@ -4,7 +4,7 @@
 use crate::err::{Code, Refusal};
 use crate::format;
 #[cfg(feature = "store")]
-use crate::store2;
+use crate::store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -156,11 +156,11 @@ impl From<crate::io::cuda::Error> for Failure {
 }
 
 #[cfg(feature = "store")]
-impl From<store2::Error> for Failure {
-    fn from(e: store2::Error) -> Failure {
+impl From<store::Error> for Failure {
+    fn from(e: store::Error) -> Failure {
         let kind = match &e {
-            store2::Error::Format(f) => return f.clone().into(),
-            store2::Error::Io { source, .. } => {
+            store::Error::Format(f) => return f.clone().into(),
+            store::Error::Io { source, .. } => {
                 if let Some(refusal) = source.get_ref().and_then(|cause| cause.downcast_ref::<Refusal>()) {
                     return refusal.clone().into();
                 }
@@ -169,10 +169,10 @@ impl From<store2::Error> for Failure {
                 }
                 Kind::Io
             }
-            store2::Error::Full { .. } => Kind::Full,
-            store2::Error::Absent(_) => Kind::NotFound,
-            store2::Error::Mismatch { .. } => Kind::Integrity,
-            store2::Error::Invalid { .. } => Kind::Invalid,
+            store::Error::Full { .. } => Kind::Full,
+            store::Error::Absent(_) => Kind::NotFound,
+            store::Error::Mismatch { .. } => Kind::Integrity,
+            store::Error::Invalid { .. } => Kind::Invalid,
         };
         Failure {
             kind,

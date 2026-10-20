@@ -10,7 +10,7 @@ use super::{Copy, ReadOpts, ReadStats, Src};
 #[cfg(feature = "store")]
 use crate::format::{self, Body, Location, Tensor};
 #[cfg(feature = "store")]
-use crate::store2::{Checkpoint, Error, Result};
+use crate::store::{Checkpoint, Error, Result};
 
 /// `dst.len()` stored bytes of one tensor from `offset`: a plain tensor's data (`role` `""`),
 /// or one part of an encoded tensor.

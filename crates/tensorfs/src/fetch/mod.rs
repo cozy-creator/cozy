@@ -9,7 +9,6 @@
 
 pub mod conform;
 mod download;
-mod dpop;
 mod endpoint;
 mod net;
 mod origin;
@@ -24,7 +23,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub use dpop::{DPoP, JwtBearer};
 pub use endpoint::{upload_tree, upload_tree_with, with_tree, Endpoint, Fresh, Payload, Stream, UploadControl, Uploaded};
 pub use net::Client;
 pub(crate) use net::GetError;
@@ -325,7 +323,7 @@ pub fn wanted(header: &Header, components: Option<&[String]>) -> Result<Vec<Obje
         let has: Vec<&str> = header.components().iter().map(|c| c.name.as_str()).collect();
         return refuse(Code::REF_NOT_FOUND, format!("no component {name:?} (has {has:?})"));
     }
-    crate::store2::wanted(header, components).map_err(crate::store2::Error::refusal)
+    crate::store::wanted(header, components).map_err(crate::store::Error::refusal)
 }
 
 /// A runtime for callers without one (a CLI, Python): two threads for sockets and timers.

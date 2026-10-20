@@ -12,7 +12,7 @@ use tensorfs::err::Code;
 use tensorfs::fetch::{
     Config, Fetcher, Endpoint, ObjectStore, Origin, Progress, VolumeOrigin, Want,
 };
-use tensorfs::store2::Store;
+use tensorfs::store::Store;
 
 const SAMPLE: Duration = Duration::from_millis(10);
 

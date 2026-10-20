@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::failure::{fail, Failure, Kind, Result};
 use crate::fetch::{self, Fetcher, ObjectStore, Origin, VolumeOrigin, Want};
 use crate::format::{Header, ObjectRef, Tree};
-use crate::store2::Store;
+use crate::store::Store;
 
 use super::provider::from_native;
 use super::{io_failure, Checkpoint, Endpoint, Download, Fetched, Ref};

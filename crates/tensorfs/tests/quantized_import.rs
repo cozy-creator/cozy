@@ -12,7 +12,7 @@ use std::process::Command;
 use tensorfs::err::Code;
 use tensorfs::format::{decode, Body, Dtype, Encoding, PartBytes, SCHEMES};
 use tensorfs::import::{Access, Request};
-use tensorfs::store2::{Checkpoint, Store};
+use tensorfs::store::{Checkpoint, Store};
 
 struct Scratch(PathBuf);
 
@@ -777,13 +777,13 @@ fn tfs_inspect_shows_comfy_nvfp4_at_a_glance() {
     };
     let source = fixtures().join("comfy-nvfp4");
     tfs(&[
-        "import",
+        "convert",
         source.to_str().unwrap(),
         "--name",
-        "acme/comfy-nvfp4",
+        "local/comfy-nvfp4@1",
     ]);
     let doc: serde_json::Value =
-        serde_json::from_str(tfs(&["--json", "inspect", "acme/comfy-nvfp4"]).trim()).unwrap();
+        serde_json::from_str(tfs(&["--json", "inspect", "local/comfy-nvfp4"]).trim()).unwrap();
     let tensors = doc["components"][0]["tensors"].as_array().unwrap();
     let qkv = tensors
         .iter()
@@ -793,7 +793,7 @@ fn tfs_inspect_shows_comfy_nvfp4_at_a_glance() {
         qkv,
         &serde_json::json!({"key": "blocks.0.attn.qkv.weight", "dtype": "BF16", "shape": [144, 80], "encoding": NVFP4_COMFY})
     );
-    let human = tfs(&["inspect", "acme/comfy-nvfp4"]);
+    let human = tfs(&["inspect", "local/comfy-nvfp4"]);
     assert!(
         human.contains(&format!("    2 × {NVFP4_COMFY}\n")),
         "{human}"

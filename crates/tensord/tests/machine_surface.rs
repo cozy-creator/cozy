@@ -1059,7 +1059,7 @@ mod v1_api {
         assert_eq!(widened.status, "succeeded", "{widened:?}");
         let other = widened.outputs.iter().find(|p| p.output == "model").unwrap();
         assert_ne!(other.digest, written.digest, "a size-128 table replayed the size-64 output");
-        let held = tensorfs::store2::Store::open(machine.store()).unwrap();
+        let held = tensorfs::store::Store::open(machine.store()).unwrap();
         let reference = tensorfs::format::ObjectRef {
             sha256: written.digest.trim_start_matches("sha256:").into(),
             length: written.length,
@@ -1212,7 +1212,7 @@ mod v1_api {
     }
 
     /// A one-tensor checkpoint of `n` f32 elements a model slot constructs from, and its config.
-    fn constructible(store: &tensorfs::store2::Store, n: usize) -> tensorfs::format::ObjectRef {
+    fn constructible(store: &tensorfs::store::Store, n: usize) -> tensorfs::format::ObjectRef {
         use tensorfs::{format::{ConfigValue, Dtype}, writer::{Data, Source}};
         let mut writer = store.writer(None, None).unwrap();
         let config = tensorfs::format::Config::from_iter([("n".to_string(), ConfigValue::from(n))]);
@@ -1237,7 +1237,7 @@ mod v1_api {
         let mut args = installing_args(&tools);
         args.extend(["--gpu-config".into(), config.clone().into_os_string()]);
         let machine = Machine::start_args(|state, _| {
-            let store = tensorfs::store2::Store::open(state.join("tensorfs")).unwrap();
+            let store = tensorfs::store::Store::open(state.join("tensorfs")).unwrap();
             let manifest = constructible(&store, 2048);
             fs::write(&config, serde_json::json!({"devices": "0,1", "environment": {
                 "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home},
@@ -1312,7 +1312,7 @@ mod v1_api {
         let mut args = installing_args(&tools);
         args.extend(["--gpu-config".into(), config.clone().into_os_string()]);
         let machine = Machine::start_args(|state, _| {
-            let store = tensorfs::store2::Store::open(state.join("tensorfs")).unwrap();
+            let store = tensorfs::store::Store::open(state.join("tensorfs")).unwrap();
             let manifest = constructible(&store, (WEIGHT_MIB << 18) as usize);
             fs::write(&config, serde_json::json!({"devices": "0", "environment": {
                 "PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home},
@@ -1399,7 +1399,7 @@ mod v1_api {
         let requires: Vec<String> = requirements.split("dependencies = [").nth(1).unwrap().split(']').next().unwrap()
             .split('"').skip(1).step_by(2).map(str::to_string).collect();
         let source = std::env::temp_dir().join(format!("cm-update-{}", uuid::Uuid::new_v4()));
-        let store = tensorfs::store2::Store::open(&source).unwrap();
+        let store = tensorfs::store::Store::open(&source).unwrap();
         let model = names_hub::Model { repository: "acme/weight".into(), release: "1".into(), lane: "f32".into(),
             header: constructible(&store, (weight_mib << 18) as usize) };
         let release = |release: &str| names_hub::Package {
@@ -1502,7 +1502,7 @@ mod v1_api {
         let authkit = hub_oauth::AuthKit::start(&upstream);
         let mut held = None;
         let machine = Machine::start_with(|state, _| {
-            let store = tensorfs::store2::Store::open(state.join("tensorfs")).unwrap();
+            let store = tensorfs::store::Store::open(state.join("tensorfs")).unwrap();
             let manifest = hub_oauth::checkpoint(&store, &[7; 8192]);
             tensord::storage::set_local(&store, "tiny", &manifest, &Default::default()).unwrap();
             held = Some(tensord::storage::local_tree(&store, "local/tiny").unwrap().unwrap().id());
@@ -1610,7 +1610,7 @@ mod v1_api {
     #[tokio::test]
     async fn runs_name_their_release_and_model_and_a_warm_run_asks_the_hub_nothing() {
         let source = std::env::temp_dir().join(format!("cm-names-{}", uuid::Uuid::new_v4()));
-        let store = tensorfs::store2::Store::open(&source).unwrap();
+        let store = tensorfs::store::Store::open(&source).unwrap();
         let manifest = hub_oauth::checkpoint(&store, &[5; 8192]);
         let model = names_hub::Model {
             repository: "acme/model".into(),
@@ -1746,7 +1746,7 @@ mod v1_api {
             return;
         }
         let source = std::env::temp_dir().join(format!("cm-tasks-{}", uuid::Uuid::new_v4()));
-        let store = tensorfs::store2::Store::open(&source).unwrap();
+        let store = tensorfs::store::Store::open(&source).unwrap();
         // 300 objects each: a pull would start a stream for every one.
         let model = |name: &str, tag: u32| {
             let bodies: Vec<Vec<u8>> = (0..300u32)
@@ -1797,7 +1797,7 @@ mod v1_api {
     #[ignore = "real AuthKit: go and AUTHKIT_TEST_DATABASE_URL"]
     async fn the_owners_checkpoint_by_hash_reads_under_the_runs_capability() {
         let source = std::env::temp_dir().join(format!("cm-private-{}", uuid::Uuid::new_v4()));
-        let store = tensorfs::store2::Store::open(&source).unwrap();
+        let store = tensorfs::store::Store::open(&source).unwrap();
         let manifest = hub_oauth::checkpoint(&store, &[9; 8192]);
         let model = names_hub::Model {
             repository: "acme/private".into(),
@@ -1964,7 +1964,7 @@ mod v1_api {
         let result: serde_json::Value = json(&done.result);
         let model = &result["models"][0];
         assert_eq!(model["published"]["destination"], "local/unet", "{result}");
-        let store = tensorfs::store2::Store::open(machine.store()).unwrap();
+        let store = tensorfs::store::Store::open(machine.store()).unwrap();
         let header = tensord::storage::local(&store, "unet").unwrap().unwrap();
         assert_eq!(model["checkpoint"], header.id());
     }
@@ -2791,7 +2791,7 @@ mod v1_api {
             }).unwrap();
         let described: serde_json::Value = serde_json::from_slice(&described.stdout).unwrap();
         let source = std::env::temp_dir().join(format!("cm-callee-{}", uuid::Uuid::new_v4()));
-        let store = tensorfs::store2::Store::open(&source).unwrap();
+        let store = tensorfs::store::Store::open(&source).unwrap();
         let model = names_hub::Model {
             repository: "acme/model".into(), release: "1.0.0".into(), lane: "bf16".into(),
             header: hub_oauth::checkpoint(&store, &[5; 8192]),

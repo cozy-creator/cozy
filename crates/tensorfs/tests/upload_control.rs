@@ -9,7 +9,7 @@ use std::{
 use tensorfs::{
     fetch::{upload_tree, upload_tree_with, Client, Endpoint, SourcePolicy, UploadControl},
     format::{Dtype, ObjectRef, Tree},
-    store2::Store,
+    store::Store,
     writer::{Data, Source},
 };
 

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use hyper::Uri;
+use super::net::Uri;
 use serde_json::Value;
 
 use super::net::{join, same_origin, Body, Client, GetError, HeaderMap};
@@ -32,7 +32,7 @@ use super::token::{default_for, s3_base, Request, TokenProvider};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::format::{repo_key, Header, ObjectRef, Repo, Tree};
 use crate::sha256::{digest, hex, hex_digest};
-use crate::store2::Store;
+use crate::store::Store;
 
 /// The most bytes a repo document may have.
 const REPO_BYTES: usize = 16 << 20;
@@ -343,7 +343,7 @@ impl Endpoint {
                     Payload::File(file) => store.put(file, Some(&object)),
                 });
                 let put = put.await.map_err(|e| Refusal { code: Code::IO_FAILED, detail: e.to_string() })?;
-                put.map_err(crate::store2::Error::refusal)?;
+                put.map_err(crate::store::Error::refusal)?;
                 return Ok(true);
             }
         };
@@ -396,7 +396,7 @@ impl Endpoint {
         if let Some(store) = store.get() {
             return Ok(store);
         }
-        let opened = Store::open(root).map_err(crate::store2::Error::refusal)?;
+        let opened = Store::open(root).map_err(crate::store::Error::refusal)?;
         Ok(store.get_or_init(|| opened))
     }
 
@@ -592,7 +592,7 @@ pub async fn upload_tree_with(endpoint: &Endpoint, name: &str, tree: &ObjectRef,
     if (control.cancelled)() {
         return Err(stopped());
     }
-    let refusal = crate::store2::Error::refusal;
+    let refusal = crate::store::Error::refusal;
     let parsed = store.tree(tree).map_err(refusal)?;
     let mut leaves = Vec::new();
     let mut headers = Vec::new();
@@ -616,7 +616,7 @@ pub async fn upload_tree_with(endpoint: &Endpoint, name: &str, tree: &ObjectRef,
         let mut sending = futures::stream::iter(stage)
             .map(|object| async move {
                 let (from, at) = (store.clone(), object.clone());
-                let payload = move || from.file(&at).map(Payload::File).map_err(crate::store2::Error::refusal);
+                let payload = move || from.file(&at).map(Payload::File).map_err(crate::store::Error::refusal);
                 endpoint.upload(&object, &payload).await.map(|s| (s, object.length))
             })
             .buffer_unordered(STREAMS);
@@ -727,7 +727,7 @@ impl Stream {
         let (endpoint, permits) = (Arc::clone(&self.endpoint), Arc::clone(&self.permits));
         let task = self.runtime.spawn(async move {
             let _permit = permits.acquire_owned().await.expect("never closed");
-            let make = || store.file(&at).map(Payload::File).map_err(crate::store2::Error::refusal);
+            let make = || store.file(&at).map(Payload::File).map_err(crate::store::Error::refusal);
             endpoint.upload(&at, &make).await.map(drop)
         });
         self.sending.lock().unwrap().push(task);

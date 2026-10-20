@@ -18,7 +18,7 @@ use std::{
 use tensorfs::{
     err::{Code, Refusal},
     format::ObjectRef,
-    store2::Checkpoint,
+    store::Checkpoint,
 };
 
 /// Where `header`, a checkpoint this machine pulled from `source`'s Hub, comes from: the Hub

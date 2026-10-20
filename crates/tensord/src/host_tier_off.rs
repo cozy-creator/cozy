@@ -7,7 +7,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fs::File, io, sync::Arc, time::Duration};
 use crate::storage::Store;
-use tensorfs::store2::Checkpoint;
+use tensorfs::store::Checkpoint;
 
 #[derive(Clone, Debug)]
 pub struct HostTierConfig {

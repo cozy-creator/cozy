@@ -114,7 +114,7 @@ impl Client {
             cancelled: Some(control.cancelled.clone()),
             cancel_notify: Some(control.notify.clone()),
             ca_der: self.config.ca_der.clone(),
-            ..crate::client::access()
+            ..crate::import::Access::from_env()
         })
     }
 

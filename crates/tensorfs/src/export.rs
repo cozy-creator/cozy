@@ -34,14 +34,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{json, Map, Value as Json};
 
-use crate::client::io;
 use crate::failure::{fail, Kind, Result};
 use crate::format::{
     decode, variant_of, Body, Component, Config, ConfigValue, Dtype, Location, ObjectRef,
     PartBytes, Value,
 };
 use crate::import::{FILE_METADATA, PIPELINE_FILE, ROOT_COMPONENT};
-use crate::store2::Checkpoint;
+use crate::store::Checkpoint;
 
 /// The largest shard, as Diffusers and Transformers write them (20 GB).
 pub const SHARD: u64 = 20_000_000_000;
@@ -566,4 +565,10 @@ fn decode_as(ck: &Checkpoint, component: &str, key: &str, dtype: &Dtype) -> Resu
         })
         .collect();
     Ok(decode(dtype, &t.shape, encoding, &views)?)
+}
+
+pub(crate) fn io(path: &Path, e: std::io::Error) -> crate::failure::Failure {
+    let mut failure = crate::failure::Failure::from(e);
+    failure.detail = format!("{}: {}", path.display(), failure.detail);
+    failure
 }

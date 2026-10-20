@@ -2,7 +2,7 @@
 
 use tensorfs::err::{Code, Refusal};
 use tensorfs::failure::{Failure, Kind};
-use tensorfs::store2::Error;
+use tensorfs::store::Error;
 
 #[test]
 fn transport_causes_keep_their_public_family_through_a_writer_error() {

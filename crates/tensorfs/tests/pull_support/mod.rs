@@ -16,7 +16,7 @@ use tensorfs::fetch::{Client, SourcePolicy};
 use tensorfs::format::{
     Body, Component, Dtype, Header, Location, ObjectRef, Repo, Tensor, Tree,
 };
-use tensorfs::store2::Store;
+use tensorfs::store::Store;
 
 pub const MIB: usize = 1 << 20;
 

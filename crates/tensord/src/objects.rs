@@ -20,7 +20,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use crate::storage::{self, pin, Disk, Store};
-use tensorfs::{format::ObjectRef, sha256, store2::Error};
+use tensorfs::{format::ObjectRef, sha256, store::Error};
 
 /// The largest memoized result record this machine holds for reuse.
 const MEMO_RESULT_BYTES: usize = 48 << 10;

@@ -6,7 +6,7 @@ use std::io::{self, Read};
 use crate::failure::{Failure, Result};
 use crate::format::ObjectRef;
 use crate::sha256::{hex, Sha256};
-use crate::store2::{Checkpoint, Error};
+use crate::store::{Checkpoint, Error};
 
 /// Local objects absent from disk or present with the wrong length/content.
 /// Verification never fetches, repairs or removes objects.

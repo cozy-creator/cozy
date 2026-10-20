@@ -4,11 +4,10 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::sync::Arc;
 
-use crate::failure::{fail, Kind, Result};
-use crate::format::Header;
-use crate::ids::ObjectRef;
-use crate::read::{ObjectRange, Order, PlanItem, ReadPlan, Source};
-use crate::store2::Checkpoint;
+use super::{ItemSource, ObjectRange};
+use crate::failure::{Kind, Result};
+use crate::format::{Header, ObjectRef};
+use crate::store::Checkpoint;
 
 type Fetch = dyn Fn(&[crate::format::ObjectRef]) -> Result<()> + Send + Sync;
 
@@ -16,8 +15,16 @@ type Fetch = dyn Fn(&[crate::format::ObjectRef]) -> Result<()> + Send + Sync;
 pub struct View {
     header: Arc<Header>,
     chunks: Arc<BTreeMap<String, (u64, usize)>>,
-    stored: Option<Checkpoint>,
+    stored: Checkpoint,
     fetch: Option<Arc<Fetch>>,
+}
+
+/// `len` stored bytes of the part `what` (`component/key#role`), in part order.
+#[derive(Debug, Clone)]
+pub struct Span {
+    pub what: String,
+    pub len: u64,
+    pub source: ItemSource,
 }
 
 pub struct Part {
@@ -30,12 +37,12 @@ pub struct Part {
 
 impl From<&Checkpoint> for View {
     fn from(checkpoint: &Checkpoint) -> View {
-        View::new(checkpoint.header().clone(), Some(checkpoint.clone()))
+        View::new(checkpoint.header().clone(), checkpoint.clone())
     }
 }
 
 impl View {
-    fn new(header: Header, stored: Option<Checkpoint>) -> Self {
+    fn new(header: Header, stored: Checkpoint) -> Self {
         let chunks = header
             .chunks
             .iter()
@@ -50,10 +57,6 @@ impl View {
         }
     }
 
-    pub fn parsed(header: Header) -> View {
-        Self::new(header, None)
-    }
-
     /// Keep the source context and use its one downloader for the selected chunks.
     pub fn with_fetch(
         mut self,
@@ -63,11 +66,8 @@ impl View {
         self
     }
 
-    pub fn has_source(&self) -> bool {
-        self.stored.is_some()
-    }
-
-    pub fn plan(&self, regions: &[Vec<String>]) -> Result<(ReadPlan, Vec<usize>)> {
+    /// The stored spans of the parts `regions` name, in header order, and the chunks they read.
+    pub fn plan(&self, regions: &[Vec<String>]) -> Result<(Vec<Span>, Vec<usize>)> {
         let header = &self.header;
         let mut wanted = Vec::new();
         for name in regions.iter().flatten() {
@@ -78,7 +78,7 @@ impl View {
         }
         wanted.sort_unstable();
         wanted.dedup();
-        let (mut items, mut chunks, mut dest) = (Vec::new(), Vec::new(), 0);
+        let (mut items, mut chunks) = (Vec::new(), Vec::new());
         for (ci, ti, only) in wanted {
             let component = &header.components()[ci];
             let tensor = &component.tensors[ti];
@@ -90,47 +90,31 @@ impl View {
                 let what = format!("{}/{}#{role}", component.name, tensor.key);
                 let spans = header.spans(&at);
                 if spans.is_empty() {
-                    items.push(PlanItem {
+                    items.push(Span {
                         what,
-                        dest_off: dest,
                         len: 0,
-                        source: Source::Inline(Vec::new()),
+                        source: ItemSource::Inline(Arc::from([])),
                     });
                     continue;
                 }
                 for span in spans {
                     let object = &header.chunks[span.chunk];
-                    let obj = ObjectRef {
-                        sha256: object.sha256.clone(),
-                        length: object.length,
-                    };
-                    items.push(PlanItem {
+                    items.push(Span {
                         what: what.clone(),
-                        dest_off: dest,
                         len: span.length,
-                        source: Source::Object(ObjectRange {
-                            obj,
+                        source: ItemSource::Object(ObjectRange {
+                            obj: object.clone(),
                             off: span.start,
                             len: span.length,
                         }),
                     });
                     chunks.push(span.chunk);
-                    dest += span.length;
                 }
             }
         }
         chunks.sort_unstable();
         chunks.dedup();
-        Ok((
-            ReadPlan {
-                io_bytes: dest,
-                bytes: dest,
-                items,
-                inline_parts: 0,
-                order: Order::Destination,
-            },
-            chunks,
-        ))
+        Ok((items, chunks))
     }
 
     pub fn files_for(&self, objects: &[ObjectRef]) -> Result<Vec<(ObjectRef, File)>> {
@@ -151,9 +135,7 @@ impl View {
     }
 
     pub fn files(&self, chunks: &[usize]) -> Result<Vec<(ObjectRef, File)>> {
-        let Some(checkpoint) = &self.stored else {
-            return fail(Kind::Unsupported, "a parsed header has no chunk source");
-        };
+        let checkpoint = &self.stored;
         let objects = chunks
             .iter()
             .map(|&index| {
@@ -174,13 +156,7 @@ impl View {
             .iter()
             .zip(objects)
             .map(|(&index, chunk)| {
-                Ok((
-                    ObjectRef {
-                        sha256: chunk.sha256,
-                        length: chunk.length,
-                    },
-                    checkpoint.chunk(index)?,
-                ))
+                Ok((chunk, checkpoint.chunk(index)?))
             })
             .collect()
     }

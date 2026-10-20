@@ -27,7 +27,7 @@ use tensord::{
 use tensorfs::{
     fetch::{Client, Endpoint, SourcePolicy},
     format::{Dtype, ObjectRef, Repo, Tree},
-    store2::Store,
+    store::Store,
     writer::{Data, Source},
 };
 

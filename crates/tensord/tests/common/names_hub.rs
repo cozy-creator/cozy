@@ -18,7 +18,7 @@ use std::{
 };
 use tensorfs::{
     format::{ObjectRef, Tree},
-    store2::Store,
+    store::Store,
 };
 
 /// One released model: `repository` at `release` in `lane`, its cozytensors `header` held in a

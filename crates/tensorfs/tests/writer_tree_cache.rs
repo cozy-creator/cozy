@@ -82,11 +82,11 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
     // An ordinary raw operator runs the real collector without pressure or TTL pin removal.
     // Age actual owned files beyond the default one-hour grace, while their cache recency
     // remains fresh and well inside the seven-day library cache lifetime.
-    let operator = tensorfs::store2::Store::open(&cache).unwrap();
+    let operator = tensorfs::store::Store::open(&cache).unwrap();
     let stale = operator
         .put_bytes(b"unrooted stale positive GC control")
         .unwrap();
-    let old = SystemTime::now() - tensorfs::store2::GRACE - Duration::from_secs(60);
+    let old = SystemTime::now() - tensorfs::store::GRACE - Duration::from_secs(60);
     for object in [&header, &tree, &stale].into_iter().chain(&payload) {
         let path = cache.join(object.key());
         File::open(&path)
@@ -95,7 +95,7 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
             .unwrap();
         assert!(
             fs::metadata(path).unwrap().modified().unwrap()
-                < SystemTime::now() - tensorfs::store2::GRACE
+                < SystemTime::now() - tensorfs::store::GRACE
         );
     }
     operator.gc().unwrap();

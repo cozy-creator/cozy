@@ -15,7 +15,7 @@ pub use crate::fetch::Landed as Fetched;
 pub use checkpoint::{Checkpoint, Component};
 pub use convert::{Convert, ConvertProgress};
 pub use endpoint::Endpoint;
-pub use provider::{bearer, DPoP, HeaderMap, JwtBearer, Request, TokenProvider};
+pub use provider::{bearer, HeaderMap, Request, TokenProvider};
 pub use writer::{ComponentWriter, PartData, Writer, WriterOptions};
 
 use std::fmt;
@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use crate::failure::{fail, Failure, Kind, Result};
 use crate::format::ObjectRef;
-use crate::store2::Store;
+use crate::store::Store;
 
 /// Locations and an ordinary supplied provider. Credentials are never formatted.
 #[derive(Clone)]
@@ -207,7 +207,7 @@ impl Client {
             let path = path
                 .canonicalize()
                 .map_err(|e| io_failure(path.display(), e))?;
-            let raw = crate::store2::Checkpoint::folder(
+            let raw = crate::store::Checkpoint::folder(
                 &path,
                 options.variant.as_deref(),
                 Some(&self.store),

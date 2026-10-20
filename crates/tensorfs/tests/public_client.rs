@@ -537,7 +537,6 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
     drop(tokenizer);
     drop(checkpoint);
     drop(client);
-    assert!(view.has_source());
     assert_eq!(component.read("w").unwrap(), b"abcdefghijklmnop");
     let mut bytes = [0; 8];
     file.read_exact(&mut bytes).unwrap();

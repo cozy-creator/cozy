@@ -21,7 +21,7 @@ use tensorfs::format::{
     Value, CHUNKS_DIR,
 };
 use tensorfs::import::{self, source::SourceSet, Access, Request};
-use tensorfs::store2::{fault, Checkpoint, Store};
+use tensorfs::store::{fault, Checkpoint, Store};
 use tensorfs::writer::{Data, PartData, Source, Writer};
 
 const MIB: usize = 1 << 20;
@@ -936,107 +936,6 @@ fn the_header_keeps_the_producers_order() {
     assert_layout(&c);
 }
 
-/// The owner's real pre-cut lanes (read-only): the reader refuses their headers as pre-cut; a
-/// checkpoint the writer makes from them, tensor by tensor in their order, has their order, and
-/// migrate's old decoder refuses its header. The bytes are one-byte stand-ins of an unknown dtype; the
-/// order is under test, and the chunk counts the rule gives the real part lengths are reported.
-#[test]
-#[ignore = "reads the owner's ~/.tensorfs v1 lanes"]
-fn real_v1_lanes_keep_their_order() {
-    use tensorfs::header::Header as V1;
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".tensorfs");
-    let blob = |sha: &str| {
-        fs::read(
-            home.join("blobs")
-                .join(&sha[..2])
-                .join(&sha[2..4])
-                .join(sha),
-        )
-        .unwrap()
-    };
-    let scratch = Scratch::new("v1");
-    let store = scratch.store("store");
-    // (lane, manifest prefix, chunk count design §3 measured by the rule)
-    for (lane, prefix, chunks) in [
-        ("sdxl-int8", "3eb5674846e8", 203),
-        ("sdxl-fp8", "d33267e269ae", 201),
-        ("qwen-int8", "e7c79ee942b8", 544),
-        ("anima-fp8", "9bbe72e3b132", 173),
-        ("h3-fp8", "302eec1e11fd", 2138),
-    ] {
-        let dir = home
-            .join("manifests")
-            .join(&prefix[..2])
-            .join(&prefix[2..4]);
-        let manifest = (fs::read_dir(&dir).unwrap().flatten())
-            .find(|e| e.file_name().to_string_lossy().starts_with(prefix))
-            .unwrap()
-            .path();
-        let doc: serde_json::Value = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
-        let entry = (doc["entries"].as_array().unwrap().iter())
-            .find(|e| e["kind"] == "cozytensors")
-            .unwrap();
-        let old = blob(entry["blob"]["sha256"].as_str().unwrap());
-        let err = tensorfs::format::Header::from_cbor(&old).unwrap_err();
-        assert_eq!(err.code(), "pre_cut", "{lane}: {err}");
-        let v1 = V1::parse(&old).unwrap();
-        let mut w = store.writer(None, None).unwrap();
-        let mut want = Vec::new();
-        let mut items = Vec::new();
-        for (component, tensors) in &v1.components {
-            for (key, t) in tensors {
-                let roles: Vec<&str> = t.parts.iter().map(|(r, _)| r.as_str()).collect();
-                let stand_in = Dtype::Other("V1".into());
-                let data: Vec<Vec<u8>> = roles.iter().map(|_| vec![7u8]).collect();
-                let mut readers: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
-                let parts = (roles.iter().zip(readers.iter_mut()))
-                    .map(|(role, data)| PartData {
-                        role: role.to_string(),
-                        dtype: stand_in.clone(),
-                        shape: vec![],
-                        data: Source::Read(data),
-                    })
-                    .collect();
-                let encoding = Encoding {
-                    scheme: "v1".into(),
-                    params: Default::default(),
-                };
-                let data = Data::Encoded { encoding, parts };
-                w.get(component).put(key, &stand_in, &[], data).unwrap();
-                want.push((
-                    component.clone(),
-                    key.clone(),
-                    roles.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
-                ));
-                for (role, p) in &t.parts {
-                    items.push((
-                        component.clone(),
-                        key.clone(),
-                        role.clone(),
-                        p.nbytes(key).unwrap(),
-                    ));
-                }
-            }
-        }
-        let ck = store.checkpoint(&w.commit().unwrap()).unwrap();
-        assert_eq!(layout_names(&ck), want, "{lane}: v2 order is v1 order");
-        let new = store.read(ck.id()).unwrap();
-        assert!(tensorfs::migrate::v1::header(&new).is_err(), "{lane}");
-        let items: Vec<Item> = (items.iter())
-            .map(|(c, k, r, n)| Item {
-                component: c,
-                key: k,
-                role: r,
-                length: *n,
-            })
-            .collect();
-        // The design measured its counts in natural key order; v1 order closes packs at other
-        // block boundaries, so the count is reported, not asserted.
-        let planned = layout::plan(&items).chunks.len();
-        println!("{lane}: {} tensors, v2 order = v1 order; {planned} chunks in v1 order (design §3, natural order: {chunks})", want.len());
-    }
-}
-
 // --------------------------------------------------------------- variants, trees and GC
 
 /// A repo of two variants: `bf16` with a pipeline, configs (floats and nulls among them), an
@@ -1147,11 +1046,7 @@ fn a_two_variant_repo_shares_chunks_and_files_and_gc_keeps_its_closure() {
         assert!(store.verify(o).unwrap(), "{} is kept", o.sha256);
     }
 
-    let n = store.resolve("acme/sdxl@1.0", Some("int8")).unwrap();
-    assert_eq!((n.header, n.tree, n.variant), (int8.id().clone(), Some(at.clone()), Some("int8".to_owned())));
-    assert!(store.resolve("acme/sdxl", None).is_err(), "two variants: name one");
-    let by_tree = store.resolve(&format!("sha256:{}", at.sha256), Some("bf16")).unwrap();
-    assert_eq!((by_tree.header, by_tree.name.as_deref()), (bf16.id().clone(), Some("Acme/SDXL")));
+    assert_eq!(store.variant(&at, Some("int8")).unwrap().id(), int8.id());
     let ck = store.variant(&at, Some("bf16")).unwrap();
     for (key, bytes) in &tensors {
         assert!(ck.read("unet", key).unwrap() == *bytes, "{key}");

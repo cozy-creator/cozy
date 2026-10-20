@@ -579,7 +579,7 @@ mod tests {
                 Client, Config, Endpoint, Fetcher, ObjectStore, SourcePolicy, Want, upload_tree,
             },
             format::{Config as HeaderConfig, Dtype, Tree},
-            store2::Store,
+            store::Store,
             writer::{Data, Source},
         };
 

@@ -13,7 +13,7 @@ use std::{
 
 use serde::Serialize;
 use tensorfs::format::{Body, Component, Dtype, Header, ObjectRef, Tensor};
-use tensorfs::store2::{Checkpoint, Store};
+use tensorfs::store::{Checkpoint, Store};
 
 use crate::storage::{self, pin};
 

@@ -269,7 +269,8 @@ fn int8(input: &Input) -> Result<Vec<OwnedPart>> {
     let (mut q, mut scb) = (Vec::with_capacity(x.len()), Vec::new());
     for row in x.chunks(k.max(1) as usize) {
         let am = row.iter().fold(0f32, |a, v| a.max(v.abs()));
-        let s = (1.0 / am) * 127.0; // torch's 127.0 / t is reciprocal(t) * 127
+        // PyTorch computes 127.0 / t as reciprocal(t) * 127; match its rounding.
+        let s = (1.0 / am) * 127.0;
         q.extend(row.iter().map(|v| match am {
             0.0 => 0,
             _ => (v * s).round_ties_even() as i8 as u8,

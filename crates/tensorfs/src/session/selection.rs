@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::failure::{fail, Kind, Result};
 use crate::format::{Body, ObjectRef};
-use crate::store2::Checkpoint;
+use crate::store::Checkpoint;
 
 use super::Selection;
 
@@ -19,7 +19,7 @@ pub(super) fn objects(checkpoint: &Checkpoint, selection: &Selection) -> Result<
             }
         }
         Selection::Components(components) => {
-            for object in crate::store2::wanted(checkpoint.header(), Some(components))? {
+            for object in crate::store::wanted(checkpoint.header(), Some(components))? {
                 add(object);
             }
         }

@@ -1,7 +1,7 @@
-//! The `tfs` binary on v2 stores: a synthetic checkpoint with every scheme exports to
-//! safetensors bit-identical to its stored parts (and to the reference decode with
-//! `--dequantize`), exports as a static origin that pulls into a second store byte-identical,
-//! and `verify` removes a corrupted object that the next pull fetches again.
+//! The `tfs` binary: a synthetic checkpoint with every scheme exports to safetensors
+//! bit-identical to its stored parts (and to the reference decode with `--dequantize`),
+//! uploads to a directory endpoint that a second store downloads byte-identical, and `verify`
+//! reports a corrupted object.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value as Json;
-use tensorfs::client::regions;
+use tensorfs::raw::regions;
 use tensorfs::format::{decode, Body, Dtype, PartBytes};
-use tensorfs::store2::{Checkpoint, Store};
+use tensorfs::store::{Checkpoint, Store};
 
 struct Scratch(PathBuf);
 
@@ -110,25 +110,18 @@ fn blobs(root: &Path) -> BTreeMap<String, Vec<u8>> {
 }
 
 #[test]
-fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
+fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
     let dir = Scratch::new("round-trip");
     let (a, b) = (dir.0.join("a"), dir.0.join("b"));
     let written = ok(
         &a,
         &[
-            "dev", "ckpt", "--blocks", "2", "--scale", "2", "--name", "acme/syn",
+            "dev", "ckpt", "--blocks", "2", "--scale", "2", "--name", "local/syn@1",
         ],
     );
-    assert_eq!(
-        (
-            written["name"].as_str(),
-            written["release"].as_str(),
-            written["variant"].as_str()
-        ),
-        (Some("acme/syn"), Some("1"), Some("mixed"))
-    );
+    assert_eq!(written["name"], "local/syn@1");
 
-    let inspected = ok(&a, &["inspect", "acme/syn"]);
+    let inspected = ok(&a, &["inspect", "local/syn"]);
     assert_eq!(inspected["header"], written["header"]);
     let unet = &inspected["components"][0];
     assert_eq!(unet["name"], "unet");
@@ -158,7 +151,7 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
     let out = Command::new(env!("CARGO_BIN_EXE_tfs"))
         .arg("--store")
         .arg(&a)
-        .args(["inspect", "acme/syn"])
+        .args(["inspect", "local/syn"])
         .output()
         .unwrap();
     let human = String::from_utf8(out.stdout).unwrap();
@@ -190,7 +183,7 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
     let out = dir.0.join("out");
     let exported = ok(
         &a,
-        &["export", "acme/syn", out.to_str().unwrap(), "--safetensors"],
+        &["export", "local/syn", out.to_str().unwrap(), "--safetensors"],
     );
     assert!(exported["files"]
         .as_array()
@@ -254,7 +247,7 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
         &a,
         &[
             "export",
-            "acme/syn",
+            "local/syn",
             deq.to_str().unwrap(),
             "--safetensors",
             "--dequantize",
@@ -292,40 +285,33 @@ fn a_synthetic_checkpoint_exports_pulls_and_verifies() {
         }
     }
 
-    // A static origin, pulled into a second store byte-identical.
-    let origin = dir.0.join("origin");
-    ok(
-        &a,
-        &["export", "acme/syn", origin.to_str().unwrap(), "--origin"],
-    );
-    let pulled = ok(&b, &["pull", origin.to_str().unwrap(), "acme/syn@1"]);
-    assert_eq!((&pulled["header"], &pulled["tree"]), (&written["header"], &written["tree"]));
-    assert_eq!(blobs(&b), blobs(&a));
-    assert_eq!(
-        fs::read(b.join("refs/acme/syn.json")).unwrap(),
-        fs::read(a.join("refs/acme/syn.json")).unwrap()
-    );
-    assert_eq!(ok(&b, &["verify"])["corrupt"], serde_json::json!([]));
+    // Uploaded to a directory endpoint and downloaded into a second store byte-identical.
+    let portable = dir.0.join("portable");
+    ok(&a, &["export", "local/syn", portable.to_str().unwrap()]);
+    let origin = format!("file://{}", dir.0.join("origin").display());
+    let endpoint = |store: &Path, args: &[&str]| ok(store, &[&["--endpoint", origin.as_str()], args].concat());
+    let uploaded = endpoint(&a, &["upload", portable.to_str().unwrap(), "acme/syn@1"]);
+    assert_eq!(uploaded["tree"], written["tree"]);
+    endpoint(&b, &["download", "acme/syn@1"]);
+    assert_eq!(endpoint(&b, &["inspect", "acme/syn@1"])["header"], written["header"]);
+    let theirs = blobs(&b);
+    assert!(blobs(&a).iter().all(|(k, v)| theirs.get(k).is_none_or(|t| t == v)));
+    assert!(ck.header().chunks.iter().all(|c| theirs.contains_key(&c.sha256)));
+    endpoint(&b, &["verify", "acme/syn@1"]);
 
-    // A corrupted object is found, removed, and fetched again.
+    // A corrupted object is reported.
     let chunk = &ck.header().chunks[0];
     let path = Store::open(&b).unwrap().path(chunk).unwrap();
     let mut bytes = fs::read(&path).unwrap();
     bytes[100] ^= 0xff;
     fs::remove_file(&path).unwrap();
     fs::write(&path, &bytes).unwrap();
-    let (success, verified) = tfs(&b, &["verify", "acme/syn"]);
+    let (success, verified) = tfs(&b, &["--endpoint", origin.as_str(), "verify", "acme/syn@1"]);
     assert!(!success);
     assert_eq!(verified["error"]["code"], "integrity");
-    assert_eq!(verified["corrupt"], serde_json::json!([chunk.sha256]));
-    assert!(!path.exists());
-    let again = ok(&b, &["pull", origin.to_str().unwrap(), "acme/syn"]);
-    assert_eq!(again["fetched"], chunk.length);
-    assert_eq!(blobs(&b), blobs(&a));
 
     // Typed failures.
-    let (success, missing) = tfs(&b, &["inspect", "acme/none"]);
+    let (success, missing) = tfs(&b, &["inspect", "local/none"]);
     assert!(!success);
     assert_eq!(missing["error"]["code"], "not_found");
-    assert_eq!(ok(&a, &["gc"])["objects"], 0, "everything is referenced");
 }

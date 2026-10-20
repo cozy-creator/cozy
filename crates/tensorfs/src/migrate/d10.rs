@@ -18,7 +18,7 @@ use crate::failure::{fail, Failure, Kind, Result};
 use crate::fetch::{self, Client, Endpoint, Fetcher, Fresh, Origin, Payload, SourcePolicy, Want};
 use crate::format::{Component, Config, Header, ObjectRef, Release, Repo, Tree, Value, HEADER_PATH};
 use crate::import::{layout, remote};
-use crate::store2::{Pin, Store};
+use crate::store::{Pin, Store};
 
 /// A family's pinned upstream and what it fills where a lane has none: a path, a folder
 /// (`tokenizer/`), or `README`/`LICENSE` (any top-level file so named).

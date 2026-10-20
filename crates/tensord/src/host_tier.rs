@@ -32,7 +32,7 @@ use tensorfs::{
     format,
     ids,
     read::{self, Source as Item},
-    store2::Checkpoint,
+    store::Checkpoint,
 };
 use varena::{
     host::{self, OpenFill},

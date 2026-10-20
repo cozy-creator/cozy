@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::failure::{fail, Failure, Kind, Result};
 use crate::format::{Config, Dtype, Encoding, ObjectRef, Tree, Value};
-use crate::store2::Store;
+use crate::store::Store;
 use crate::writer::{self as native, Data, Source};
 
 use super::{Checkpoint, Client, Component, Endpoint, Ref, TokenProvider};
@@ -57,8 +57,8 @@ pub struct ComponentWriter<'a> {
     name: String,
 }
 
-fn from_writer(error: crate::store2::Error) -> Failure {
-    if let crate::store2::Error::Io { source, .. } = &error {
+fn from_writer(error: crate::store::Error) -> Failure {
+    if let crate::store::Error::Io { source, .. } = &error {
         if let Some(error) = source
             .get_ref()
             .and_then(|e| e.downcast_ref::<crate::err::Refusal>())

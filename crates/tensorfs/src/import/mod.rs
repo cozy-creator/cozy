@@ -31,7 +31,7 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::format::{
     Config, ConfigValue, Dtype, Encoding, Metadata, ObjectRef, Pipeline, Value, CONFIG_FILE,
 };
-use crate::store2::Error;
+use crate::store::Error;
 use crate::writer::{Data, PartData, Source, Writer};
 
 pub use engine::{tables, Table};
