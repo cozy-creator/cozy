@@ -174,6 +174,70 @@ fn terminal(reply: &Frame) -> &str {
 }
 
 #[test]
+#[ignore = "needs installed cpu_lifecycle generations with the resolve_weights Runtime"]
+fn metadata_helper_reads_the_sealed_store_before_start_without_torch() {
+    use tensorfs::{format::{Dtype, Tree}, writer::{Data, Source}};
+    for (generation, hold) in generations() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tensorfs::store2::Store::open(&root.path().join("store")).unwrap();
+        let mut writer = store.writer(None, None).unwrap();
+        writer.get("model").put("weight", &Dtype::F32, &[1], Data::Plain(Source::Read(&mut &[0u8; 4][..]))).unwrap();
+        let header = writer.commit().unwrap();
+        let mut tree = Tree::default();
+        tree.set_variant("custom", header.clone());
+        let tree = store.put_tree(&tree).unwrap();
+        let mut seal = Seal::prepare(root.path(), None, "metadata", &generation.identity, "").unwrap();
+        seal.tensorfs_home = Some(store.root().to_path_buf());
+        let mut executor = DeviceExecutor::spawn(ExecutorConfig {
+            python: generation.python.clone(), root: root.path().join("executor"),
+            socket: root.path().join("executor.sock"), environment: BTreeMap::new(), seal,
+            generation_hold: Some(Arc::new(hold.try_clone().unwrap())), identity: None,
+            cgroup_namespace: Some("lifecycle".into()),
+        }).unwrap();
+        assert!(!executor.hello.torch_loaded);
+        let reply = executor.command(&DeviceCommand::ResolveWeights {
+            request_id: "metadata-1".into(), hub: None,
+            models: vec![tensord::device_executor::MetadataModel {
+                slot: "model".into(), repo_id: "local/metadata".into(), revision: Some(tree.id()),
+                variants: vec!["bf16".into()], fallback_to_only_variant: true,
+            }],
+        }, &mut Baseline).unwrap();
+        assert!(reply.ok, "{reply:?}");
+        assert_eq!(reply.request_id, "metadata-1");
+        assert_eq!(reply.resolved.len(), 1);
+        assert_eq!(reply.resolved[0].tree.as_ref(), Some(&tree));
+        assert_eq!(reply.resolved[0].header, header);
+        assert_eq!(reply.resolved[0].variant, "custom");
+        assert_eq!(reply.resolved[0].components, ["model"]);
+        assert!(reply.issued_token.is_none());
+        assert!(!executor.command(&DeviceCommand::Hello, &mut Baseline).unwrap().hello.torch_loaded);
+        executor.shutdown().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "needs installed cpu_lifecycle generations with request-scoped Unload"]
+fn metadata_request_cleanup_keeps_the_warm_executor_usable() {
+    for (generation, hold) in generations() {
+        let (mut executor, root, _) = launch(&generation, &hold);
+        let pid = executor.birth.pid;
+        let first = invoke(&mut executor, &root, "first", "steps", json!({"steps": 1})).unwrap();
+        assert_eq!(terminal(&first), "succeeded");
+        for _ in 0..2 {
+            let reply = executor.command(&DeviceCommand::Unload {
+                construction: String::new(), request_id: Some("first".into()),
+            }, &mut Baseline).unwrap();
+            assert!(reply.ok, "{reply:?}");
+        }
+        let second = invoke(&mut executor, &root, "second", "steps", json!({"steps": 1})).unwrap();
+        assert_eq!(terminal(&second), "succeeded");
+        assert_eq!(executor.birth.pid, pid);
+        executor.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 #[ignore = "needs installed cpu_lifecycle generations"]
 fn launch_is_sealed_grouped_and_reaped_after_cooperative_shutdown() {
     for (generation, hold) in generations() {
