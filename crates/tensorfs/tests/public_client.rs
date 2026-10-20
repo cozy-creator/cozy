@@ -447,7 +447,7 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
     assert!(http.fetched(&data.chunks[0]) && !http.fetched(&data.chunks[1]));
     let component = checkpoint.component("model").unwrap().clone();
     let mut prefix = [0; 4];
-    component.read_part_into("w", "", 0, &mut prefix).unwrap();
+    component.read_into("w", &mut prefix, &Default::default()).unwrap();
     assert_eq!(&prefix, b"abcd");
     let invalid = checkpoint
         .download(&Download {

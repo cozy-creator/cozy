@@ -156,6 +156,7 @@ below; normal model consumers do not need it.
 | `VerificationReport` | Separate `missing` and `corrupt` object-reference vectors; `is_ok()` checks both are empty. |
 | `Convert` | Optional `converter`, `variant`, borrowed conversion-progress callback. |
 | `WriterOptions` | Optional `dest`, `variant` (only with `repo_id`), `base`, `resume`, `repo_id`, `endpoint`, `token`; implements `Default`. |
+| `ReadInto` | `role: Option<&str>`, `decode: bool`, `offset: u64` for `Component::read_into`; implements `Default`. |
 | `Format` | `Safetensors` or native portable `Cozytensors` export. |
 
 `Progress` is a borrowed `Fn(u64, u64) -> Result<()> + Sync` (held bytes, total bytes).
@@ -198,12 +199,17 @@ typed errors rather than being classified as corruption.
 
 A `Component` provides `name()`, `class()`, `config()`, `tensors()` and
 `assets()` metadata views. Its `read(key)` returns the tensor as stored, as Python's
-`decode=False`: `Read::Plain(Vec<u8>)`, or `Read::Encoded { encoding, parts }` with each
-stored part's bytes by role. `read_decoded(key)` returns logical bytes in the tensor's dtype,
-as `decode=True`;
-`read_part_into(key, role, offset, &mut [u8])` fills a stored byte range;
-`asset(name)` returns `Vec<u8>`. These direct configuration, file and tensor reads are the
-normal cozytensors integration path. `export_files(directory)` is only a convenience for
+`decode=False`: `Read::Plain(Vec<u8>)`, or `Read::Encoded { dtype, shape, encoding, parts }`
+with the logical dtype and shape and each stored part's bytes by role. `read_decoded(key)`
+returns logical bytes in the tensor's dtype, as `decode=True`. `asset(name)` returns `Vec<u8>`.
+
+`read_into(key, &mut out, &ReadInto { role, decode, offset })` fills `out` from byte
+`offset`, as Python's `read_into`. A plain tensor gives its data. A `role` selects that stored
+part, and `decode: true` an encoded tensor's logical bytes. An encoded tensor with neither
+returns `Invalid` naming its roles; a role with `decode` is also `Invalid`.
+
+These direct configuration, file and tensor reads are the normal cozytensors integration
+path. `export_files(directory)` is only a convenience for
 libraries that require filenames: it explicitly writes configuration and supporting
 files and returns `PathBuf`, without exporting weights. Native consumers, including our
 Runtime, do not need that step. The I/O calls return `Result`.

@@ -134,10 +134,17 @@ impl Component {
     // Stored bytes (Python's decode=False); read_decoded is decode=True.
     pub fn read(&self, key: &str) -> Result<Read>;
     pub fn read_decoded(&self, key: &str) -> Result<Vec<u8>>;
-    pub fn read_part_into(&self, key: &str, role: &str, offset: u64, buf: &mut [u8]) -> Result<()>;
+    // An encoded tensor with neither role nor decode returns Invalid, naming its roles.
+    pub fn read_into(&self, key: &str, out: &mut [u8], options: &ReadInto<'_>) -> Result<()>;
     pub fn asset(&self, name: &str) -> Result<Vec<u8>>;
     pub fn export_files(&self, directory: &Path) -> Result<PathBuf>;
 }
+pub enum Read {
+    Plain(Vec<u8>),
+    Encoded { dtype: Dtype, shape: Vec<u64>, encoding: Encoding, parts: BTreeMap<String, Vec<u8>> },
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadInto<'a> { pub role: Option<&'a str>, pub decode: bool, pub offset: u64 }
 // Tensors selects every part of each named key. Part selects the chunks overlapping
 // its stored byte range. Invalid names, roles and ranges return Failure.
 // A selected snapshot contains only the requested objects, even when others are cached.

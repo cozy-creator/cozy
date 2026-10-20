@@ -159,7 +159,16 @@ class Array:
         ...
 
 class Encoded:
-    """A tensor's stored scheme, params and raw part arrays (`decode=False`)."""
+    """An encoded tensor as stored (`decode=False`): logical dtype and shape, scheme, params
+    and part arrays by role."""
+
+    @property
+    def dtype(self) -> str:
+        ...
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        ...
 
     @property
     def scheme(self) -> str:
@@ -217,8 +226,10 @@ class Tensors(Mapping[str, TensorMetadata]):
     def read(self, keys: Sequence[str] | None = None, *, device: str = "cpu", decode: bool = False) -> dict[str, Array | Encoded]:
         ...
 
-    def read_into(self, key: str, out: object, *, role: str | None=None, offset: int=0) -> None:
-        """Fill a writable contiguous Buffer or DLPack array; a role selects stored part bytes."""
+    def read_into(self, key: str, out: object, *, role: str | None=None, decode: bool=False, offset: int=0) -> None:
+        """Fill a writable contiguous Buffer or DLPack array from `offset`: a plain tensor's data,
+        one stored part (`role`), or with `decode=True` an encoded tensor's logical bytes. An
+        encoded tensor with neither raises `InvalidError` naming its roles."""
 
     def __repr__(self) -> str:
         ...

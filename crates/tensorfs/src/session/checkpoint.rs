@@ -437,14 +437,28 @@ impl Checkpoint {
     }
 }
 
-/// A tensor as stored: a plain tensor's data, or an encoded tensor's parts by role.
+/// A tensor as stored: a plain tensor's data, or an encoded tensor's logical dtype and shape,
+/// encoding, and parts by role.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Read {
     Plain(Vec<u8>),
     Encoded {
+        dtype: format::Dtype,
+        shape: Vec<u64>,
         encoding: format::Encoding,
         parts: BTreeMap<String, Vec<u8>>,
     },
+}
+
+/// What [`Component::read_into`] reads, as Python's `read_into` keywords.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadInto<'a> {
+    /// One stored part of an encoded tensor; `""` is a plain tensor's data.
+    pub role: Option<&'a str>,
+    /// An encoded tensor's logical bytes, through its scheme's decode.
+    pub decode: bool,
+    /// The first byte read.
+    pub offset: u64,
 }
 
 #[derive(Clone)]
@@ -496,11 +510,13 @@ impl Component {
         let tensor = self.data.raw.tensor(&self.name, key)?;
         let part = |role: &str, length: u64| {
             let mut bytes = vec![0; length as usize];
-            self.read_part_into(key, role, 0, &mut bytes).map(|()| bytes)
+            self.read_part(key, role, 0, &mut bytes).map(|()| bytes)
         };
         Ok(match &tensor.body {
             Body::Data(at) => Read::Plain(part("", at.length)?),
             Body::Encoded { encoding, parts } => Read::Encoded {
+                dtype: tensor.dtype.clone(),
+                shape: tensor.shape.clone(),
                 encoding: encoding.clone(),
                 parts: parts
                     .iter()
@@ -516,7 +532,9 @@ impl Component {
         let tensor = self.data.raw.tensor(&self.name, key)?;
         let (encoding, parts) = match (self.read(key)?, &tensor.body) {
             (Read::Plain(bytes), _) => return Ok(bytes),
-            (Read::Encoded { encoding, parts }, Body::Encoded { parts: stored, .. }) => (encoding, (parts, stored)),
+            (Read::Encoded { encoding, parts, .. }, Body::Encoded { parts: stored, .. }) => {
+                (encoding, (parts, stored))
+            }
             _ => unreachable!("a read follows the tensor's body"),
         };
         let (bytes, stored) = parts;
@@ -530,9 +548,46 @@ impl Component {
         Ok(format::decode(&tensor.dtype, &tensor.shape, &encoding, &views)?)
     }
 
+    /// `out.len()` bytes of `key` from `offset`, as Python's `read_into`: a plain tensor's data,
+    /// one stored part (`role`), or with `decode` an encoded tensor's logical bytes. An encoded
+    /// tensor with neither is `Invalid`, naming its roles. Download the payload first.
+    pub fn read_into(&self, key: &str, out: &mut [u8], options: &ReadInto<'_>) -> Result<()> {
+        let tensor = self.data.raw.tensor(&self.name, key)?;
+        let role = match (options.role, &tensor.body) {
+            (Some(_), _) if options.decode => {
+                return fail(Kind::Invalid, "a role reads one stored part; decode the whole tensor");
+            }
+            (Some(role), _) => role,
+            (None, Body::Data(_)) => "",
+            (None, Body::Encoded { parts, .. }) if !options.decode => {
+                let roles: Vec<_> = parts.iter().map(|p| p.role.as_str()).collect();
+                return fail(
+                    Kind::Invalid,
+                    format!("{key} is encoded: read it with decode or one role of {}", roles.join(", ")),
+                );
+            }
+            (None, Body::Encoded { .. }) => {
+                let bytes = self.read_decoded(key)?;
+                let range = usize::try_from(options.offset)
+                    .ok()
+                    .and_then(|start| Some(start..start.checked_add(out.len())?))
+                    .filter(|range| range.end <= bytes.len());
+                let Some(range) = range else {
+                    return fail(
+                        Kind::Invalid,
+                        format!("{key}: {} bytes from {} of {}", out.len(), options.offset, bytes.len()),
+                    );
+                };
+                out.copy_from_slice(&bytes[range]);
+                return Ok(());
+            }
+        };
+        self.read_part(key, role, options.offset, out)
+    }
+
     /// This safe borrow is held until the existing synchronous engine returns.
     #[allow(unsafe_code)]
-    pub fn read_part_into(&self, key: &str, role: &str, offset: u64, buf: &mut [u8]) -> Result<()> {
+    fn read_part(&self, key: &str, role: &str, offset: u64, buf: &mut [u8]) -> Result<()> {
         let target = Target {
             component: &self.name,
             key,

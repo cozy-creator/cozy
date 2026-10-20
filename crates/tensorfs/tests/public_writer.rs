@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tensorfs::format::{Body, Component, Dtype, Header, Location, ObjectRef, Tensor};
-use tensorfs::{Client, Config, Download, Format, Kind, Open, Ref, Selection, WriterOptions};
+use tensorfs::{
+    Client, Config, Download, Format, Kind, Open, ReadInto, Ref, Selection, WriterOptions,
+};
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -383,19 +385,60 @@ async fn public_writer_resumes_reopens_components_and_keeps_encoded_bytes_and_or
     drop(client);
     assert_eq!(child.read_decoded("copied").unwrap(), WEIGHT);
     assert_eq!(child.asset("tokenizer.json").unwrap(), ASSET);
-    let mut bytes = [0; 4];
-    child
-        .read_part_into("packed", "scale", 0, &mut bytes)
-        .unwrap();
-    assert_eq!(bytes, [9, 10, 11, 12]);
+    let mut bytes = [0; 3];
+    let scale = ReadInto { role: Some("scale"), offset: 1, ..ReadInto::default() };
+    child.read_into("packed", &mut bytes, &scale).unwrap();
+    assert_eq!(bytes, [10, 11, 12]);
+    // An encoded tensor without a role or decode names its roles instead of guessing.
+    let refused = child.read_into("packed", &mut bytes, &ReadInto::default()).unwrap_err();
+    assert_eq!(refused.kind, Kind::Invalid);
+    assert!(refused.detail.contains("weight, scale") || refused.detail.contains("scale, weight"), "{}", refused.detail);
+    let both = ReadInto { role: Some("scale"), decode: true, ..ReadInto::default() };
+    assert_eq!(child.read_into("packed", &mut bytes, &both).unwrap_err().kind, Kind::Invalid);
+    let decode = ReadInto { decode: true, ..ReadInto::default() };
+    assert_eq!(child.read_into("packed", &mut bytes, &decode).unwrap_err().kind, Kind::UnknownScheme);
+    let mut plain = [0; 2];
+    child.read_into("copied", &mut plain, &ReadInto { offset: 2, ..decode }).unwrap();
+    assert_eq!(plain, WEIGHT[2..]);
     // `read` returns what is stored, as Python's decode=False: an encoded tensor's parts.
-    let tensorfs::Read::Encoded { encoding, parts } = child.read("packed").unwrap() else {
+    let tensorfs::Read::Encoded { dtype, shape, encoding, parts } = child.read("packed").unwrap() else {
         panic!("an encoded tensor reads as its parts");
     };
-    assert_eq!(encoding.scheme, "acme-q");
+    assert_eq!((dtype, shape, encoding.scheme.as_str()), (Dtype::F32, vec![2], "acme-q"));
     assert_eq!((parts["weight"].as_slice(), parts["scale"].as_slice()), (&[5, 6, 7, 8][..], &[9, 10, 11, 12][..]));
     assert_eq!(child.read("copied").unwrap(), tensorfs::Read::Plain(WEIGHT.to_vec()));
     assert_eq!(child.read_decoded("packed").unwrap_err().kind, Kind::UnknownScheme);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn read_into_decodes_an_encoded_tensor_only_when_asked() {
+    let scratch = Scratch::new();
+    let client = client(&scratch.0.join("cache"), &scratch.0.join("endpoint"));
+    let mut writer = client.writer(WriterOptions::default()).unwrap();
+    let encoding = tensorfs::format::Encoding {
+        scheme: "fp8.tensorwise".into(),
+        params: [("scale_dtype".to_owned(), "F32".into())].into(),
+    };
+    let (mut weight, mut scale): (&[u8], &[u8]) = (&[0x38; 4], &2f32.to_le_bytes());
+    let parts = vec![
+        tensorfs::raw::PartData { role: "weight".into(), dtype: Dtype::F8_E4M3, shape: vec![4], data: &mut weight },
+        tensorfs::raw::PartData { role: "scale".into(), dtype: Dtype::F32, shape: vec![1], data: &mut scale },
+    ];
+    writer
+        .component("model", "test.Model", Default::default(), None)
+        .unwrap()
+        .put_encoded("q", Dtype::F32, &[4], encoding, parts)
+        .unwrap();
+    let checkpoint = writer.commit().await.unwrap();
+    let model = checkpoint.component("model").unwrap();
+    let logical: Vec<u8> = [2f32; 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut out = [0; 6];
+    model.read_into("q", &mut out, &ReadInto { decode: true, offset: 5, ..ReadInto::default() }).unwrap();
+    assert_eq!(out, logical[5..11]);
+    let past = ReadInto { decode: true, offset: 11, ..ReadInto::default() };
+    assert_eq!(model.read_into("q", &mut out, &past).unwrap_err().kind, Kind::Invalid);
+    let refused = model.read_into("q", &mut out, &ReadInto::default()).unwrap_err();
+    assert!(refused.kind == Kind::Invalid && refused.detail.contains("scale"), "{}", refused.detail);
 }
 
 /// Ages every cache entry past its TTL and runs ordinary cache maintenance.

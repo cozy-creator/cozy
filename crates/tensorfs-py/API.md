@@ -179,8 +179,9 @@ as `weight[row, column] * scale[row]`.
 These are ordinary arrays with their own dtype and shape. Consumers receive their values;
 TensorFS handles the underlying chunk locations and byte offsets.
 
-For an encoded tensor, `decode=False` returns `Encoded`: the loaded `scheme`, `params`,
-and a role-to-`Array` mapping named `parts`. For a plain tensor it still returns `Array`.
+For an encoded tensor, `decode=False` returns `Encoded`: the logical `dtype` and `shape`,
+the loaded `scheme` and `params`, and a role-to-`Array` mapping named `parts`. For a plain
+tensor it still returns `Array`.
 A consumer of encoded weights must understand that scheme and its parameters.
 `device` chooses where the arrays live; `decode` chooses their representation. Our
 Runtime keeps supported quantized weights encoded for its matching compute kernels.
@@ -196,11 +197,18 @@ copied_bytes = bytes(destination)
 encoded = unet.tensors.read("some_quantized.weight", decode=False)
 packed = bytearray(encoded.parts["weight"].nbytes)
 unet.tensors.read_into("some_quantized.weight", packed, role="weight", offset=0)
+
+# Or its decoded logical bytes, from byte 64:
+window = bytearray(256)
+unet.tensors.read_into("some_quantized.weight", window, decode=True, offset=64)
 ```
 
-The destination determines the number of bytes copied. `offset` is a byte offset, and
-`role` selects an encoded part. Without a role, encoded weights are decoded. This call
-does not convert to the destination's dtype; provide the appropriate size and representation.
+`read_into(key, out, *, role=None, decode=False, offset=0)` follows `read`. The destination
+determines the number of bytes copied, and `offset` is a byte offset. A plain tensor gives
+its data. `role` selects one stored part of an encoded tensor, and `decode=True` gives its
+decoded logical bytes. An encoded tensor with neither raises `InvalidError` naming its
+roles, and a role with `decode=True` is refused too. This call does not convert to the
+destination's dtype; provide the appropriate size and representation.
 
 ### Download, verify and manage a checkpoint
 
