@@ -384,8 +384,8 @@ def attention_cut() -> None:
         check("attention that may not cut runs out of memory", False)
     except torch.OutOfMemoryError:
         check(
-            "attention that may not cut runs out of memory, once retried",
-            memo.retries == 1,
+            "attention that may not cut runs out of memory, never retried without room made",
+            memo.retries == 0,
             memo.retries,
         )
 

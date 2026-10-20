@@ -291,7 +291,10 @@ def _settle[T](
                 if need is None or _capturing() or scope and size <= finest and not again:
                     raise
                 _clear(exc)
-                rungs.free(device, need + SLACK)
+                if not rungs.free(device, need + SLACK) and again:
+                    again = False  # the same size again, with no room made, fails the same way
+                    if scope and size <= finest:
+                        raise
             memo.retries += 1
             if again:
                 again = False

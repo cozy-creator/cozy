@@ -989,8 +989,8 @@ class Memory:
         a busy set), then caches; then other processes' weights (rung 2). No prefetch refills
         what demand freed until the plan moves on."""
         self.starved = True
-        self._idle()  # torch's slack and idle chunks: room, but no page given up
-        freed = self._ask(target, spare=True)
+        freed = self._idle()  # torch's slack and idle chunks: room, but no page given up
+        freed += self._ask(target, spare=True)
         if self.plans:
             for model in sorted(filter(self._victim, self.models.values()), key=self._keep):
                 if self._free() >= target:
@@ -1022,10 +1022,12 @@ class Memory:
         if need <= 0:
             return 0
         victims = table.ask(need, row.id)
+        if not victims:  # no row holds what it could give
+            return 0
         for asked in victims:
             table.wait(asked)
         got = max(self._free() - before, 0)
-        rows = ", ".join(f"pid {v.pid} {v.bytes} B" for v in victims) or "no row could give"
+        rows = ", ".join(f"pid {v.pid} {v.bytes} B" for v in victims)
         self.noted(2, f"asked {need} B{' spare' if spare else ''}: {rows}", got)
         return got
 
