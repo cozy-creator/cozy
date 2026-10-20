@@ -766,8 +766,11 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
         filled,
         file_metadata,
     };
-    // This is the final cooperative cancellation boundary. Once this call starts, a
+    // Reports completed conversion before publication: even the final progress callback
+    // can refuse without committing a header. This is the final cooperative cancellation
+    // boundary. Once commit starts, a
     // dropped future cannot promise to undo the writer's atomic finalization.
+    progress("imported", total, total);
     stopped(req)?;
     sink.commit(imported.metadata())?;
     drop(opened);
@@ -780,6 +783,5 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
         }
         _ => {}
     }
-    progress("imported", total, total);
     Ok(imported)
 }
