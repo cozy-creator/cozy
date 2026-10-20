@@ -10,6 +10,7 @@ import ast
 import gc
 import sys
 import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -86,6 +87,17 @@ class Bound(TorchDispatchMode):
                 self.arithmetic += 1
                 raise torch.OutOfMemoryError("Tried to allocate 1 MiB")
         return func(*args, **(kwargs or {}))
+
+
+@contextmanager
+def measured_site(cuts, memo):
+    measured = memo.shape("rms", "mapped-output")
+    previous = cuts._local.site
+    cuts._local.site = cuts.Site(("rms", 1), torch.device("cpu"), cuts.Track("rms", measured))
+    try:
+        yield
+    finally:
+        cuts._local.site = previous
 
 
 def generic(cuts):
@@ -190,7 +202,7 @@ def rms(cuts, cls, shape, first, images, dtype, bias, *, admit=True, deny_output
     assert cuts.install(module) == 1
     room, memo = Room(admit), cuts.Memo()
     cuts.serve(memo, room)
-    with torch.no_grad(), Bound(shape, deny_output=deny_output) as bound, cuts.caught():
+    with torch.no_grad(), measured_site(cuts, memo), Bound(shape, deny_output=deny_output) as bound, cuts.caught():
         try:
             actual = module(value)
         except Exhausted:
@@ -213,6 +225,7 @@ def rms(cuts, cls, shape, first, images, dtype, bias, *, admit=True, deny_output
     del value
     gc.collect()
     assert pointer() is None, "mapped result memo retained its input"
+    assert len(memo.shapes[("rms", "mapped-output")].scopes) == 1
 
 
 def main():
