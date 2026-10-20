@@ -1235,8 +1235,11 @@ impl Publisher {
         let mut command = Command::new(&self.sdk.uv);
         command.args(args).env_clear().envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         platform::process::own_group(&mut command);
-        for name in ["PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG"] {
-            if let Some(value) = protocol::config::environment().get(name) {
+        // Windows spells its names in any case (`Path`), and resolves no host name for a
+        // process without `SystemRoot`; TEMP and TMP are its temporary directory.
+        const KEPT: [&str; 7] = ["PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG", "SYSTEMROOT", "TEMP", "TMP"];
+        for (name, value) in protocol::config::environment() {
+            if KEPT.iter().any(|kept| kept.eq_ignore_ascii_case(name)) {
                 command.env(name, value);
             }
         }
