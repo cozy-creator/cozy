@@ -3637,13 +3637,6 @@ fn binds_models(interface: &serde_json::Value) -> bool {
         })
 }
 
-/// Degree 2 stays off on a GPU that drives a display until qualified there. Unknown is "yes".
-fn display_active(device: &str) -> bool {
-    platform::gpu::Device::open(device)
-        .and_then(|device| device.display_active())
-        .unwrap_or(true)
-}
-
 /// An error ends its executor; the exact exit is observed before the run settles, and a
 /// kill's measurement joins the reason.
 fn ended_with(engine: &Engine, id: &str, error: io::Error, executor: DeviceExecutor) -> io::Error {
