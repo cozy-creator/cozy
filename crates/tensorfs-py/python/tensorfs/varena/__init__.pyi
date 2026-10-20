@@ -69,6 +69,11 @@ class Plane:
     def __init__(
         self, device: int, grant: tuple[int, int, int] | None = ...
     ) -> None: ...
+    def mapped_output(
+        self, shape: tuple[int, ...], dtype: str, stream: int
+    ) -> tensorfs.Array | None:
+        """Fresh host-admitted CUDA output; unavailable during capture or without host room."""
+        ...
     def register(
         self,
         name: str,
