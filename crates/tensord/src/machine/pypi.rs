@@ -129,7 +129,7 @@ struct Url(String);
 
 #[async_trait]
 impl Origin for Url {
-    async fn resolve(&self, name: &str, _: Option<&str>, _: Option<&str>) -> Result<ObjectRef> {
+    async fn repo_of(&self, name: &str) -> Result<tensorfs::format::Repo> {
         refuse(Code::REF_NOT_FOUND, format!("{} names no model {name}", self.0))
     }
 

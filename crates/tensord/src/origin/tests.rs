@@ -80,7 +80,8 @@ fn checkpoint(store: &Store) -> ObjectRef {
     let mut tree = Tree::default();
     tree.set_variant("bf16", header.clone());
     let mut repo = Repo::new("acme/model");
-    repo.set_release("1.0", store.put_tree(&tree).unwrap());
+    repo.set_tag("1.0", store.put_tree(&tree).unwrap());
+    repo.tags[0].public = true;
     store.update_ref("acme/model", |_| Some(repo)).unwrap();
     header
 }
