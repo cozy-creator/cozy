@@ -782,7 +782,7 @@ mod tests {
                 routed += 1;
             }
         }
-        assert_eq!(routed, 13, "the spec's routes");
+        assert_eq!(routed, 14, "the spec's routes");
     }
 
     /// A read from any offset answers exactly the bytes after it, across parts, and reads
