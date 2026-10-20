@@ -79,6 +79,7 @@ struct Inner {
     requests: BTreeMap<RequestId, Request>,
     caches: BTreeMap<PageId, Arc<Shrink>>,
     orphaned: BTreeMap<PageId, PageKey>,
+    retired: BTreeSet<PageId>,
     next_page: PageId,
     progress: u64,
     trim: Option<Arc<Shrink>>,
@@ -131,6 +132,7 @@ impl Placement {
                 requests: BTreeMap::new(),
                 caches: BTreeMap::new(),
                 orphaned: BTreeMap::new(),
+                retired: BTreeSet::new(),
                 next_page: 1,
                 progress: 0,
                 trim: None,
@@ -140,6 +142,10 @@ impl Placement {
             worker: Mutex::new(None),
         });
         out.inner.lock().table.capacity = out.ledger.capacity();
+        let wake = row.clone();
+        out.gpu.set_wakeup(Arc::new(move || {
+            let _ = wake.wake();
+        }));
         let weak = Arc::downgrade(&out);
         let stop = out.stop.clone();
         let worker = std::thread::Builder::new()
@@ -153,22 +159,35 @@ impl Placement {
     }
 
     fn serve(weak: Weak<Self>, row: Arc<ledger::Row>, stop: Arc<AtomicBool>) {
-        while let Ok(Some(ask)) = row.wait_ask(&stop) {
+        let mut seen = 0;
+        while !stop.load(Ordering::Acquire) {
+            let ask = match row.wait_event(&mut seen, &stop) {
+                Ok(ask) => ask,
+                Err(error) => {
+                    tracing::warn!(%error, "reclaim wait failed");
+                    break;
+                }
+            };
             let Some(this) = weak.upgrade() else {
                 break;
             };
-            let result = this.drive(
-                0,
-                Trigger::Ask {
-                    row: row.owner().row,
-                    need: ask.bytes,
-                    ceiling: ask.ceiling,
-                },
-            );
+            let result = if let Some(ask) = ask {
+                let result = this.drive(
+                    0,
+                    Trigger::Ask {
+                        row: row.owner().row,
+                        need: ask.bytes,
+                        ceiling: ask.ceiling,
+                    },
+                );
+                let _ = row.ack(ask);
+                result.map(|_| ())
+            } else {
+                this.refresh()
+            };
             if let Err(error) = result {
                 tracing::warn!(%error, "reclaim failed");
             }
-            let _ = row.ack(ask);
         }
     }
 
@@ -611,6 +630,30 @@ impl Placement {
         inner.table.pages.retain(|page| page.id != id);
     }
 
+    pub fn close_model(&self, id: ModelId) -> Result<()> {
+        let pages = {
+            let mut inner = self.inner.lock();
+            let Some(model) = inner.models.remove(&id) else {
+                return Ok(());
+            };
+            inner.retired.extend(model.pages.iter().copied());
+            for page in inner
+                .table
+                .pages
+                .iter_mut()
+                .filter(|page| page.model == Some(id))
+            {
+                page.loaded = false;
+                page.uses.clear();
+            }
+            model.pages
+        };
+        for page in pages {
+            self.gpu.unregister(page)?;
+        }
+        self.refresh()
+    }
+
     pub fn trim_with(&self, trim: Arc<Shrink>) {
         self.inner.lock().trim = Some(trim);
     }
@@ -691,6 +734,13 @@ impl Placement {
         let status = self.ledger.status()?;
         let orphans = self.channel.orphans(self.row.owner())?;
         let mut inner = self.inner.lock();
+        let present: BTreeSet<_> = facts.iter().map(|(id, _, _, _)| *id).collect();
+        let finished: BTreeSet<_> = inner.retired.difference(&present).copied().collect();
+        inner
+            .table
+            .pages
+            .retain(|page| !finished.contains(&page.id));
+        inner.retired.retain(|id| !finished.contains(id));
         for (id, bytes, pins, pending) in facts {
             if let Some(page) = inner.table.pages.iter_mut().find(|page| page.id == id) {
                 page.tier = if bytes == 0 { Tier::Disk } else { Tier::Gpu };
@@ -842,15 +892,34 @@ impl Placement {
                         }
                     }
                     Action::Trim(page) => {
-                        let trim = self.inner.lock().trim.clone()
-                            .ok_or_else(|| invalid("allocator trim callback was not registered"))?;
-                        let bytes = self.inner.lock().table.page(page).map_or(0, |row| row.bytes);
+                        let trim =
+                            self.inner.lock().trim.clone().ok_or_else(|| {
+                                invalid("allocator trim callback was not registered")
+                            })?;
+                        let bytes = self
+                            .inner
+                            .lock()
+                            .table
+                            .page(page)
+                            .map_or(0, |row| row.bytes);
                         let freed = trim(bytes)?;
-                        if let Some(row) = self.inner.lock().table.pages.iter_mut().find(|row| row.id == page) {
+                        if let Some(row) = self
+                            .inner
+                            .lock()
+                            .table
+                            .pages
+                            .iter_mut()
+                            .find(|row| row.id == page)
+                        {
                             row.bytes = row.bytes.saturating_sub(freed);
-                            if freed == 0 { row.pins = 1; }
+                            if freed == 0 {
+                                row.pins = 1;
+                            }
                         }
-                        if freed < bytes { drop(operation); continue 'decide; }
+                        if freed < bytes {
+                            drop(operation);
+                            continue 'decide;
+                        }
                     }
                     Action::Shrink { page, bytes } => {
                         let shrink = self
@@ -870,9 +939,14 @@ impl Placement {
                             .find(|row| row.id == page)
                         {
                             page.bytes = page.bytes.saturating_sub(freed);
-                            if freed == 0 { page.pins = 1; }
+                            if freed == 0 {
+                                page.pins = 1;
+                            }
                         }
-                        if freed < bytes { drop(operation); continue 'decide; }
+                        if freed < bytes {
+                            drop(operation);
+                            continue 'decide;
+                        }
                     }
                     Action::Starve(step) => {
                         if let Some(row) = self
