@@ -1,9 +1,5 @@
 # cozytensors/1 conformance
 
-These executable fixtures accompany the current checked-in reader. The TensorFS 0.13.0
-[target specification](../spec/cozytensors.md), [schemas](../spec/schema/) and
-[readable examples](../spec/examples/) are ahead of that implementation while it is integrated.
-
 For anyone implementing [cozytensors/1](../spec/cozytensors.md).
 
 | Path | What |
@@ -35,7 +31,7 @@ uv run --no-project --python 3.12 --with numpy --with cbor2==6.1.4 python -I con
 cargo test -p tensorfs --no-default-features --test format_conformance --test format_docs --test format_cores
 ```
 
-After a deliberate change, `task -d crates/tensorfs vectors` regenerates everything in one run: `make_vectors.py`
+After a deliberate change, `task -d crates/tensorfs-py vectors` regenerates everything in one run: `make_vectors.py`
 rewrites the header vectors and normalizes the case files, then `cargo test ... --test format_conformance -- --ignored
 regenerate` rewrites `vectors/store/`. A new family adds only its own files: `cases/<family>.json`, its repo and its
 objects in the store.

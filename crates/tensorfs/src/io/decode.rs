@@ -546,7 +546,7 @@ fn execute_into(
     };
     binary(launch.kind)?;
     if matches!(launch.kind, "rotated" | "grouped_rotated") {
-        binary("hadamard")?;
+        binary("regular_h4")?;
         binary(if launch.kind == "grouped_rotated" {
             "requantize"
         } else {
@@ -618,7 +618,7 @@ fn execute_into(
                     .expect("parameter allocation live");
                 write(parameter_buffer, bytes(&next), stream.raw())?;
                 call(
-                    "hadamard",
+                    "regular_h4",
                     scratch[start + 1 - current].ptr(),
                     scratch[start + current].ptr(),
                     total,

@@ -76,7 +76,7 @@ def case(key, scheme, dtype, shape, params, parts, expect=None, **extra):
 # ------------------------------------------------------------------ the spec's decode
 
 
-def hadamard(b):
+def kron_regular_h4(b):
     h4 = torch.tensor([[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]], dtype=torch.int64)
     h = h4
     while h.shape[0] < b:
@@ -88,7 +88,7 @@ def spec(L, q8, s, b, corr=None, g=None) -> bytes:
     """round_L(((y x s[i]) + z) x 2^-k), y = q8 . H_B exact, z = sum_b corr(i, b) x M_b left to right."""
     r, c = q8.shape
     k = b.bit_length() // 2
-    h = hadamard(b)
+    h = kron_regular_h4(b)
     v = (q8.long().reshape(r, c // b, b) @ h).float() * s.float().reshape(r, 1, 1)
     if corr is not None:
         ct, z = corr.float().t(), torch.empty_like(v)

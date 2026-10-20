@@ -983,6 +983,64 @@ fn a_tiny_hf_sdxl_imports_end_to_end() {
 /// The generated references order a source's sorted keys into the constructor order that the
 /// converter tables (generated from the same classes' state_dict) list, for every SDXL and
 /// Anima component: two independent generators agree.
+/// network: Hugging Face. A pipeline's components take their classes from `model_index.json`
+/// as written, even where the component's own config names another (`T5Tokenizer`,
+/// `architectures`) or none (a preprocessor config).
+#[test]
+fn model_index_names_every_component_class() {
+    let dir = scratch("model-index-classes");
+    let classes = |repo: &str| {
+        let source = format!("hf://hf-internal-testing/{repo}");
+        let out = run(&dir.join("tmp"), &[source], None).unwrap();
+        (out.layout.components.iter())
+            .map(|c| (c.name.clone(), c.class.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let sd = classes("tiny-stable-diffusion-pipe-variants-all-kinds");
+    assert_eq!(sd["safety_checker"], "stable_diffusion.StableDiffusionSafetyChecker");
+    assert_eq!(sd["feature_extractor"], "transformers.CLIPFeatureExtractor");
+    assert_eq!(sd["tokenizer"], "transformers.CLIPTokenizer");
+    let flux = classes("tiny-flux-pipe");
+    assert_eq!(flux["tokenizer_2"], "transformers.T5TokenizerFast");
+    assert_eq!(flux["text_encoder_2"], "transformers.T5EncoderModel");
+    assert_eq!(flux["scheduler"], "diffusers.FlowMatchEulerDiscreteScheduler");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// network: Hugging Face (configs only, no weights). The same on the full-size repos.
+#[test]
+fn full_size_pipelines_take_model_index_classes() {
+    let access = Access::default();
+    let classes = |source: &str| {
+        let listing = import::remote::list(&import::remote::parse(source).unwrap(), &access).unwrap();
+        let members = import::remote::select(listing, None, import::remote::Files::All, &|m| {
+            import::remote::read_small(m, &access)
+        })
+        .unwrap();
+        let mut files = BTreeMap::new();
+        let mut tensored = Vec::new();
+        for m in &members {
+            let folder = m.path.rsplit_once('/').map_or("", |(f, _)| f).to_owned();
+            if import::remote::weights(&m.path) {
+                if !tensored.contains(&folder) {
+                    tensored.push(folder);
+                }
+            } else if m.length.unwrap_or(0) < 4 << 20 {
+                files.insert(m.path.clone(), import::remote::read_small(m, &access).unwrap());
+            }
+        }
+        let layout = import::layout(files, &tensored).unwrap();
+        (layout.components.iter())
+            .map(|c| (c.name.clone(), c.class.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let sd = classes("hf://stable-diffusion-v1-5/stable-diffusion-v1-5");
+    assert_eq!(sd["safety_checker"], "stable_diffusion.StableDiffusionSafetyChecker");
+    assert_eq!(sd["feature_extractor"], "transformers.CLIPImageProcessor");
+    let lite = classes("hf://Freepik/flux.1-lite-8B");
+    assert_eq!(lite["tokenizer_2"], "transformers.T5TokenizerFast");
+}
+
 #[test]
 fn references_reproduce_the_tables_constructor_order() {
     let class = |table: &str, component: &str| match (table, component) {

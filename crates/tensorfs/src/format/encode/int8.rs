@@ -11,7 +11,7 @@ impl Encoding {
     }
     pub fn int8_convrot(rotation_size: u64, scale: &Dtype) -> Encoding {
         let p = [
-            ("rotation", "hadamard".into()),
+            ("rotation", "kron_regular_h4".into()),
             ("rotation_size", rotation_size.into()),
             ("scale_dtype", scale.name().into()),
         ];

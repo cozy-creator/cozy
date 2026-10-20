@@ -587,7 +587,7 @@ fn comfy_int8_tensorwise_rowwise_and_convrot() {
             },
             Want {
                 key: "ff.down.weight",
-                encoding: r#"int8.convrot {rotation: "hadamard", rotation_size: 64, scale_dtype: "F32"}"#,
+                encoding: r#"int8.convrot {rotation: "kron_regular_h4", rotation_size: 64, scale_dtype: "F32"}"#,
                 parts: &[
                     ("weight", "I8", &[16, 128], "weight"),
                     ("scale", "F32", &[16, 1], "weight_scale"),
@@ -1288,7 +1288,7 @@ fn comfy_marker_params_are_read_or_refused() {
     };
     assert_eq!(
         encoding.to_string(),
-        r#"int8.convrot {rotation: "hadamard", rotation_size: 64, scale_dtype: "F32"}"#
+        r#"int8.convrot {rotation: "kron_regular_h4", rotation_size: 64, scale_dtype: "F32"}"#
     );
 }
 

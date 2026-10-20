@@ -1,7 +1,5 @@
 # cozytensors distribution/1
 
-Status: normative target for TensorFS 0.13.0; implementation is being integrated.
-
 How a client reads and publishes cozytensors repos at an **endpoint**, so any server, bucket or
 directory can serve them. Tensorhub implements it; `tfs conform endpoint` checks an implementation. Documents and
 objects are as in [cozytensors.md](cozytensors.md). The key words are as in RFC 2119.
