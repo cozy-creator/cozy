@@ -133,7 +133,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     let mut record = output::Record::new().field("removed", output::bytes(total));
     for item in &kept {
         record = record.note(format!(
-            "kept the model store at {} ({}); `cozy uninstall --all` would have removed it",
+            "kept the model store at {} ({}); delete that folder to free it",
             item.path.display(),
             output::bytes(item.bytes)
         ));
@@ -142,7 +142,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// What it removes and keeps, and their sizes, on stderr before asking.
+/// What it removes and keeps, and their sizes, before it asks.
 fn plan(ctx: &Context, removed: &[Item], kept: &[Item], rc: &[PathBuf]) {
     let mut table = output::Table::new(ctx, ["REMOVES", "SIZE"]);
     for item in removed {
