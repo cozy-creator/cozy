@@ -732,7 +732,7 @@ impl Inner {
         self.events.recover()
     }
 
-    /// Never called by the mover: releasing a last retained WeightSet may join that thread.
+    /// Recover retained pin owners on caller GPU operations, outside placement locks.
     fn recover(&self) -> Result<()> {
         let pins = std::mem::take(&mut self.retained.lock().unwrap().pins);
         if !pins.is_empty() {
