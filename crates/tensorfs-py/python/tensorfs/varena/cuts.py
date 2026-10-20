@@ -813,13 +813,14 @@ def _ffn(kind: str, width: int, forward: Callable[..., object]) -> Callable[...,
         if tokens < 2 or key in _served.memo.whole:
             return forward(x)
         per_token = max(width, x.shape[-1]) * x.element_size()
+        device = x.device
 
         def shrink(size: int) -> int:  # half, or the tokens the room holds
-            return min(size // 2, _served.rungs.available(x.device) // per_token or size)
+            return min(size // 2, _served.rungs.available(device) // per_token or size)
 
         try:
             run = functools.partial(_tokens, forward, x, tokens)
-            return _settle(run, tokens, 1, shrink, x.device, "ffn tokens", key)[1]
+            return _settle(run, tokens, 1, shrink, device, "ffn tokens", key)[1]
         except _Whole:
             _served.memo.whole.add(key)
         return forward(x)
