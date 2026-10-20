@@ -27,6 +27,43 @@ These are different guarantees. A definition hash can make C reproducible but
 cannot turn it into A. A can describe a fixed mathematical family without
 carrying every operation as a graph. B describes the operations themselves.
 
+## Existing formats and standards
+
+This problem has substantial prior art. The formats below occupy different
+levels; they should not be treated as interchangeable kinds of “graph.”
+
+| Prior art | What it describes | Relevance |
+|---|---|---|
+| [GGUF](https://github.com/ggml-org/ggml/blob/a05c9922613c6a2230dbb1d0de679519ecafb4f0/docs/gguf.md) | Architecture identity, typed configuration, standardized tensor names and packed tensor types | Closest precedent for A; engines still implement each architecture |
+| [ONNX](https://onnx.ai/onnx/repo-docs/IR.html) | A typed operator graph with versioned operator semantics | Practical candidate for B; execution still depends on backend support |
+| [Khronos NNEF](https://registry.khronos.org/NNEF/specs/1.0/nnef-1.0.5.html) | Network graph, separate tensor data and quantization descriptions | Direct graph-plus-weights precedent; finite-arithmetic correctness is outside its contract and quantization descriptions are advisory |
+| [StableHLO](https://openxla.org/stablehlo/spec) | Compiler-facing tensor programs and operation semantics | Useful with an XLA/IREE-oriented compiler stack; not an entire model package |
+| [PyTorch ExportedProgram](https://docs.pytorch.org/docs/stable/export) | Captured tensor computation, state and shape constraints | An export front end; PyTorch-specific operator and serialization constraints remain |
+| [TensorRT engine/plan](https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/engine-compatibility.html) | Optimized deployment artifact with selected implementations | A derived execution product, with version/hardware/platform compatibility rules |
+
+GGUF is particularly relevant: its converter normalizes source conventions,
+and its architecture-specific metadata includes attention heads and rotary
+settings. Its specification does not contain an arbitrary model's executable
+graph. The llama.cpp [new-model guide](https://github.com/ggml-org/llama.cpp/blob/3bb63cbcbfb62056c84fe9e521b0f3d756d29c32/docs/development/HOWTO-add-model.md)
+still requires an architecture implementation. Reuse established role/config
+vocabulary where the semantics match; do not assume GGUF supplies a fully
+versioned mathematical definition for every architecture.
+
+[FX](https://docs.pytorch.org/docs/2.14/fx.html) is a Python graph-capture and
+transformation interface. [CUDA Graphs](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html)
+describe concrete GPU work and resource dependencies for replay. Neither is
+the same contract as a portable model-interchange file.
+
+TensorRT portability is configurable, not simply absent. Compatibility modes
+can broaden an engine's supported targets. TensorRT-RTX also documents
+[CPU-built engines portable across supported RTX targets](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/inference-library/cpu-engines.html),
+with its own runtime-version requirements. These remain deployment artifacts;
+they should not be the sole definition of a generic checkpoint's semantics.
+
+The recommendation is therefore to borrow the GGUF-style architecture/config/
+role pattern for A, or reuse a graph standard such as ONNX if choosing B. Do
+not create a new graph language as an incidental extension to TensorFS.
+
 ## A: architecture contract
 
 An illustrative header extension would identify a model schema and carry its
