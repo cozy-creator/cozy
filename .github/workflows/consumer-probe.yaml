@@ -7,6 +7,7 @@ permissions:
   contents: read
 jobs:
   probe:
+    if: contains(github.event.head_commit.message, '[probe]')
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +34,7 @@ jobs:
           name: transcript-${{ matrix.os }}
           path: transcript.md
   master:
+    if: contains(github.event.head_commit.message, '[master]')
     strategy:
       fail-fast: false
       matrix:
@@ -55,7 +57,63 @@ jobs:
         with:
           name: master-${{ matrix.os }}
           path: transcript.md
+  installers:
+    if: contains(github.event.head_commit.message, '[installers]')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: fix/xs-060-windows-reinstall
+      - run: |
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-dist-installer.sh | sh
+          dist build --artifacts=global --output-format=json > /dev/null
+          scripts/patch-installers.sh target/distrib
+          ls target/distrib
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installers
+          path: target/distrib/cozy-installer.*
+  reinstall:
+    if: contains(github.event.head_commit.message, '[reinstall]')
+    needs: installers
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2025, ps: powershell }
+          - { os: windows-11-arm, ps: pwsh }
+          - { os: ubuntu-24.04 }
+          - { os: macos-15 }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: installers
+          path: inst
+      - env:
+          PS: ${{ matrix.ps }}
+          COZY_DOWNLOAD_URL: https://github.com/cozy-creator/cozy-creator/releases/download/v0.10.1
+        run: |
+          install() {
+            if [ "$RUNNER_OS" = Windows ]; then $PS -NoProfile -ExecutionPolicy Bypass -File "$1"; else sh "$1"; fi
+          }
+          cozy=$HOME/.cozy/bin/cozy; [ "$RUNNER_OS" != Windows ] || cozy=$cozy.exe
+          ext=sh; [ "$RUNNER_OS" != Windows ] || ext=ps1
+          install inst/cozy-installer.$ext
+          "$cozy" up
+          "$cozy" machine enable
+          "$cozy" status
+          echo "== the patched installer again, over the running cozy"
+          install inst/cozy-installer.$ext; echo "exit $?"
+          "$cozy" --version && "$cozy" status
+          ls -la "$(dirname "$cozy")"
+          echo "== control: v0.10.1's own installer over the running cozy"
+          curl -sSfLo old.$ext "$COZY_DOWNLOAD_URL/cozy-installer.$ext"; install old.$ext; echo "exit $?"
   distros:
+    if: contains(github.event.head_commit.message, '[distros]')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
