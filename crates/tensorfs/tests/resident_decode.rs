@@ -1,4 +1,5 @@
 //! Existing frozen scheme bytes through the store-free resident-parts entrypoint.
+#![cfg(feature = "store")]
 
 use base64::Engine;
 use serde::Deserialize;
