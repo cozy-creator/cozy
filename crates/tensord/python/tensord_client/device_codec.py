@@ -1,4 +1,4 @@
-"""The selected SDK's encoder for one executor's audio/video frames.
+"""The selected SDK's encoder for one executor's registered frames: image, audio and video.
 
 Embedded by Rust and started once per executor: one JSON request per stdin line, one JSON
 answer per stdout line; it ends on stdin EOF. It imports the selected installed SDK; no
@@ -9,20 +9,8 @@ import os
 import stat
 import sys
 import uuid
-from pathlib import Path
 
 from cozy_runtime.author._codec import FRAME_MEDIA_TYPES, encode_frame
-
-
-def blob_path(spool, ref):
-    # A file a child returned, which this run hands on as its own (the machine's jobs::grant).
-    digest = ref.removeprefix("sha256:")
-    if digest != ref and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
-        return spool / f"sha256-{digest}"
-    tail = ref.rsplit("/", 2)
-    if len(tail) < 3 or not tail[-1] or tail[-1] != Path(tail[-1]).name:
-        return None
-    return spool / f"{tail[-2]}-{tail[-1]}"
 
 
 def regular(directory, name):
@@ -50,13 +38,14 @@ def read_regular(directory, name):
 
 
 def encode(request, directory):
-    spool = Path(f"/proc/self/fd/{directory}")
+    """Each frame encoded into the spool name the machine gave it: its media type, by handle."""
+    media = {}
     for frame in request["frames"]:
         raw = read_regular(directory, frame["raw"])
         if len(raw) != frame["raw_bytes"]:
             raise ValueError("registered raw frame length changed")
-        destination = blob_path(spool, frame["handle"])
-        if destination is None:
+        name = frame["name"]
+        if not name or name != os.path.basename(name) or name in (".", ".."):
             raise ValueError("SDK frame has no owned output binding")
         encoded = encode_frame(frame["codec"], frame["facts"], raw)
         temporary = ".codec-" + uuid.uuid4().hex
@@ -64,29 +53,9 @@ def encode(request, directory):
                      dir_fd=directory)
         with os.fdopen(fd, "wb") as stream:
             stream.write(encoded)
-        os.rename(temporary, destination.name, src_dir_fd=directory, dst_dir_fd=directory)
-    bindings = []
-    frames = {frame["handle"]: frame for frame in request["frames"]}
-    total = 0
-    for output in request["outputs"]:
-        destination = blob_path(spool, output["asset_ref"])
-        if destination is None:
-            raise ValueError("SDK output has no owned spool binding")
-        # Its bytes are read once, by the machine's custody; here only their length is bound.
-        handle, status = regular(directory, destination.name)
-        os.close(handle)
-        length = status.st_size
-        if output.get("size_bytes") is not None and output["size_bytes"] != length:
-            raise ValueError("SDK output byte length changed")
-        frame = frames.get(output["asset_ref"])
-        media = FRAME_MEDIA_TYPES[frame["codec"]] if frame else output["media_type"]
-        total += length
-        if request.get("max_output_bytes") is not None and total > request["max_output_bytes"]:
-            raise ValueError("encoded output exceeds the authored aggregate allowance")
-        bindings.append({"output_id": output["output_id"], "asset_ref": output["asset_ref"],
-                         "name": destination.name, "kind": output["kind"], "media_type": media,
-                         "length": length})
-    return {"bindings": bindings}
+        os.rename(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+        media[frame["handle"]] = FRAME_MEDIA_TYPES[frame["codec"]]
+    return {"media": media}
 
 
 def main():
