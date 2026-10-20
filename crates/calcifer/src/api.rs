@@ -576,10 +576,16 @@ impl RunsWatch {
         }
     }
 
-    /// Owes `id` an update unless `event` leaves its record as it was (a log line, an output's
-    /// growth) or it is owed one already.
+    /// Owes `id` an update unless `event` is a log line or byte growth, or it is owed one already.
     fn owe(&mut self, id: RunId, event: &Event) {
-        let shown = !matches!(event, Event::Log { .. } | Event::OutputDelta { .. });
+        let shown = !matches!(
+            event,
+            Event::Log { .. }
+                | Event::OutputDelta {
+                    checkpoint: None,
+                    ..
+                }
+        );
         if shown && !self.pending.contains(&id) {
             self.pending.push_back(id);
         }

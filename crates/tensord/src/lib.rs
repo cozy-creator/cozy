@@ -2,17 +2,16 @@
 // costs nothing worth boxing it for.
 #![allow(clippy::result_large_err)]
 pub mod access;
+pub mod adapter;
 mod archive;
 pub mod api;
 mod boundary_json;
 mod call_memo;
 pub mod catalog;
 pub mod config;
-pub mod derive;
 pub mod child_launcher;
 pub mod device_executor;
 pub mod execution;
-pub mod frame;
 mod gpu_allocation;
 pub mod gpu_service;
 pub mod held_models;
@@ -51,7 +50,6 @@ pub mod resident_custody;
 #[path = "resident_custody_off.rs"]
 pub mod resident_custody;
 pub mod runs;
-pub mod weights;
 #[cfg(test)]
 mod scratch;
 #[cfg(test)]

@@ -4,7 +4,7 @@ Scheme decoders are in schemes/, one module per family.
 
     python reader.py <vectors-dir>     run the conformance vectors (exit 1 on any failure)
 
-As a library: `Store(root).checkpoint("org/name", lane="x")` -> (manifest, header),
+As a library: `Store(root).checkpoint("org/name", variant="x")` -> (tree, header),
 `read(store, header, component, key)` -> the tensor's logical bytes, `parse_header(bytes)` and
 `encode(projection)`: a header's diagnostic projection (the CBOR tree as JSON, byte strings as
 {"hex": ...}) to its canonical bytes.
@@ -16,6 +16,7 @@ import base64
 import hashlib
 import itertools
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -27,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # schemes/, also under
 from schemes import affine, blocks, decode, grid, table  # noqa: E402
 from schemes.base import Refused  # noqa: E402
 
-HEADER, MANIFEST, REPO = "cozytensors/1", "tensorfs.manifest/1", "tensorfs.repo/1"
+HEADER, TREE, REPO = "cozytensors/1", "tensorfs.tree/1", "tensorfs.repo/1"
 BITS = {
     "BOOL": 8, "F4": 4, "F6_E2M3": 6, "F6_E3M2": 6, "U8": 8, "I8": 8, "F8_E5M2": 8, "F8_E4M3": 8,
     "F8_E8M0": 8, "F8_E4M3FNUZ": 8, "F8_E5M2FNUZ": 8, "I16": 16, "U16": 16, "F16": 16, "BF16": 16,
@@ -130,13 +131,17 @@ def byte_len(dtype, shape) -> int | None:
     return bits // 8
 
 
-def parse_manifest(data: bytes) -> dict:
-    doc = load(data, MANIFEST)
+def parse_tree(data: bytes) -> dict:
+    """A repo revision's files; `model.<variant>.cozytensors` is a variant's header."""
+    doc = load(data, TREE)
     files = field(doc, "files", dict)
-    for path in files:
-        need(all(segment(s) for s in path.split("/")), f"bad path {path!r}")
-    meta = field(doc, "metadata", dict, optional=True)
-    return {"files": {p: object_ref(r) for p, r in files.items()}, "metadata": meta}
+    for p in files:
+        need(path(p) and p.split("/")[0] != "chunks", f"bad repo file path {p!r}")
+    return {"files": {p: object_ref(r) for p, r in files.items()}}
+
+
+def variant_path(variant: str) -> str:
+    return f"model.{variant}.cozytensors" if variant else "model.cozytensors"
 
 
 def parse_repo(data: bytes) -> dict:
@@ -150,9 +155,7 @@ def parse_repo(data: bytes) -> dict:
         version = field(r, "version", str)
         need(version != "" and version not in seen, f"empty or repeated version {version!r}")
         seen.add(version)
-        lanes = field(r, "lanes", dict)
-        need("" not in lanes, "empty lane name")
-        releases.append({"version": version, "lanes": {k: object_ref(v) for k, v in lanes.items()},
+        releases.append({"version": version, "tree": object_ref(field(r, "tree", dict)),
                          "yanked": field(r, "yanked", bool, optional=True),
                          "revision": field(r, "revision", int, optional=True)})
     checkpoints = [object_ref(c) for c in field(doc, "checkpoints", list, optional=True)]
@@ -172,8 +175,9 @@ def release(repo: dict, version: str | None) -> dict:
 def strict(data: bytes):
     """The CBOR item of a header, refusing anything but its one deterministic encoding (spec §9):
     the canonical re-encoding must reproduce the bytes, which rules out non-preferred heads,
-    indefinite lengths, unordered or repeated map keys and trailing bytes; then only integers in
-    [-2^63, 2^64), byte and text strings, arrays, maps with text keys, true and false remain."""
+    indefinite lengths, unordered or repeated map keys, floats not in their shortest form and
+    trailing bytes; then only integers in [-2^63, 2^64), byte and text strings, arrays, maps with
+    text keys, true, false, floats and null remain (header() keeps the last two to configs)."""
     try:
         item = cbor2.loads(data)
         same = cbor2.dumps(item, canonical=True) == data
@@ -192,7 +196,7 @@ def strict(data: bytes):
         elif t is int:
             need(-(2**63) <= v < 2**64, f"{v} is outside [-2^63, 2^64)")
         else:
-            need(t in (str, bytes, bool), f"a {t.__name__} item")
+            need(t in (str, bytes, bool, float, type(None)), f"a {t.__name__} item")
     return item
 
 
@@ -200,6 +204,16 @@ def record(v, n: int, what: str) -> list:
     """An array of at least `n` fields; fields after them are a later version's and are skipped."""
     need(type(v) is list and len(v) >= n, f"{what} is not an array of at least {n}")
     return v
+
+
+def path(s) -> bool:
+    return isinstance(s, str) and all(segment(x) for x in s.split("/"))
+
+
+def obj(v, what: str) -> dict:
+    sha, length = record(v, 2, what)[:2]
+    need(type(sha) is bytes and len(sha) == 32 and uint(length), f"{what} is not [bstr .size 32, uint]")
+    return {"sha256": sha.hex(), "length": length}
 
 
 def location(v, dtype, shape, chunks, rooms, what) -> dict:
@@ -216,28 +230,27 @@ def location(v, dtype, shape, chunks, rooms, what) -> dict:
 
 
 def parse_header(data: bytes) -> dict:
-    """Components, tensors and parts as dicts, which keep the header's (construction) order."""
+    """Pipeline, components, tensors and parts as dicts, which keep the header's (construction)
+    order."""
     if data[:1] == b"{":
         raise Refused("pre_cut", PRE_CUT)
     root = strict(data)
     try:
         return header(root)
     except Refused:
-        # The first CBOR layout: exactly five fields, the fifth the components array.
-        if type(root) is list and len(root) == 5 and type(root[4]) is list:
+        # A layout before the pipeline: a cozytensors/1 root of exactly five fields.
+        if type(root) is list and len(root) == 5:
+            check_format(root[0], HEADER)
             raise Refused("pre_cut", PRE_CUT) from None
         raise
 
 
 def header(root) -> dict:
-    tag, chunk_rows, encoding_rows, component_rows, meta = record(root, 5, "the header")[:5]
-    check_format(tag, HEADER)
+    need(type(root) is list and root, "the header is not an array")
+    check_format(root[0], HEADER)
+    chunk_rows, encoding_rows, pipeline_row, component_rows, meta = record(root, 6, "the header")[1:6]
     need(type(chunk_rows) is list, "chunks is not an array")
-    chunks = []
-    for c in chunk_rows:
-        sha, length = record(c, 2, "a chunk")[:2]
-        need(type(sha) is bytes and len(sha) == 32 and uint(length), "a chunk is not [bstr .size 32, uint]")
-        chunks.append({"sha256": sha.hex(), "length": length})
+    chunks = [obj(c, "a chunk") for c in chunk_rows]
     rooms = list(itertools.accumulate((c["length"] for c in reversed(chunks))))[::-1]  # bytes of chunks[i:]
     need(type(encoding_rows) is list, "encodings is not an array")
     encodings, seen = [], set()
@@ -248,11 +261,30 @@ def header(root) -> dict:
         need(identity not in seen, f"encoding {scheme} is listed twice")
         seen.add(identity)
         encodings.append({"scheme": scheme, "params": params})
+    need(type(pipeline_row) is list and len(pipeline_row) != 1, "the pipeline is not [] or [class, config]")
+    pipeline, configs = None, []
+    if pipeline_row:
+        cls, cfg = pipeline_row[:2]
+        need(type(cls) is str and type(cfg) is dict, "the pipeline is not [class, config]")
+        pipeline = {"class": cls, "config": cfg}
+        configs.append(cfg)
     need(type(component_rows) is list, "components is not an array")
     components, cited = {}, 0
     for c in component_rows:
-        name, tensor_rows = record(c, 2, "a component")[:2]
+        name, cls, cfg, tensor_rows, asset_rows = record(c, 5, "a component")[:5]
         need(segment(name) and name not in components, f"bad or repeated component name {name!r}")
+        need(type(cls) is str and type(cfg) is dict, f"{name}: class or config")
+        configs.append(cfg)
+        config_file = c[5] if len(c) > 5 else None
+        if len(c) > 6 and config_file == "config.json":
+            config_file = None  # later fields follow it: the default, written out
+        need(config_file is None or (path(config_file) and config_file != "config.json"),
+             f"{name}: config_file {config_file!r}")
+        need(type(asset_rows) is dict, f"{name}: assets is not a map")
+        assets = {}
+        for k, v in asset_rows.items():
+            need(path(k) and k != (config_file or "config.json"), f"{name}: asset {k!r}")
+            assets[k] = obj(v, f"{name} asset {k}")
         need(type(tensor_rows) is list, f"{name}: tensors is not an array")
         tensors = {}
         for t in tensor_rows:
@@ -276,19 +308,31 @@ def header(root) -> dict:
                     loc = location(loc, pd, ps, chunks, rooms, f"{what} part {role}")
                     out["parts"][role] = {"dtype": pd, "shape": ps, **loc}
             tensors[key] = out
-        components[name] = tensors
+        components[name] = {"class": cls, "config": cfg, "tensors": tensors, "assets": assets,
+                            "config_file": config_file}
     need(cited == len(encodings), f"{cited} of {len(encodings)} encodings are cited")
     need(type(meta) is dict, "metadata is not a map")
-    for v in [meta, *(e["params"] for e in encodings)]:
+    for v in [meta, *(e["params"] for e in encodings), *configs]:
         no_bytes(v)
-    return {"chunks": chunks, "components": components, "metadata": meta}
+    only_in(root, {id(c) for c in configs})
+    return {"chunks": chunks, "pipeline": pipeline, "components": components, "metadata": meta}
 
 
 def no_bytes(v):
-    """Metadata and params hold values: no byte strings (only later fields may)."""
-    need(type(v) is not bytes, "a byte string value")
+    """Metadata, params and configs hold values: no byte strings (only later fields may), and
+    floats (configs only) are finite."""
+    need(type(v) is not bytes and (type(v) is not float or math.isfinite(v)), f"a value {v!r}")
     for x in v.values() if type(v) is dict else v if type(v) is list else ():
         no_bytes(x)
+
+
+def only_in(v, configs: set):
+    """Floats and null appear only inside configs."""
+    if id(v) in configs:
+        return
+    need(type(v) not in (float, type(None)), "a float or null outside a config")
+    for x in v.values() if type(v) is dict else v if type(v) is list else ():
+        only_in(x, configs)
 
 
 def project(item):
@@ -338,10 +382,10 @@ class Store:
             raise invalid(f"object {sha} does not match its ref")
         return data
 
-    def checkpoint(self, name: str, version: str | None = None, lane: str = ""):
+    def checkpoint(self, name: str, version: str | None = None, variant: str = ""):
         repo = parse_repo((self.root / repo_key(name)).read_bytes())
-        manifest = parse_manifest(self.blob(release(repo, version)["lanes"][lane]))
-        return manifest, parse_header(self.blob(manifest["files"]["model.cozytensors"]))
+        tree = parse_tree(self.blob(release(repo, version)["tree"]))
+        return tree, parse_header(self.blob(tree["files"][variant_path(variant)]))
 
 
 def gather(store: Store, header: dict, loc: dict) -> bytes:
@@ -354,7 +398,7 @@ def gather(store: Store, header: dict, loc: dict) -> bytes:
 
 
 def read(store: Store, header: dict, component: str, key: str) -> bytes:
-    t = header["components"][component][key]
+    t = header["components"][component]["tensors"][key]
     if "data" in t:
         return gather(store, header, t["data"])
     parts = {r: (p["dtype"], p["shape"], gather(store, header, p)) for r, p in t["parts"].items()}
@@ -372,9 +416,9 @@ def check(vectors: Path) -> int:
         cases = load_cases(path)
         repo = f"Conformance/{family}"
         for lane in dict.fromkeys(ln for ln, _, _ in cases):
-            _, header = store.checkpoint(repo, lane=lane)
-            for comp, tensors in header["components"].items():
-                for key in tensors:
+            _, header = store.checkpoint(repo, variant=lane)
+            for comp, c in header["components"].items():
+                for key in c["tensors"]:
                     case = cases.get((lane, comp, key))
                     try:
                         got = read(store, header, comp, key)
@@ -384,18 +428,20 @@ def check(vectors: Path) -> int:
                     passed += ok
                     if not ok:
                         failures.append(f"{family}:{lane}:{comp}/{key}")
-            missing = [k for k in cases if k[0] == lane and k[2] not in header["components"].get(k[1], {})]
+            missing = [k for k in cases
+                       if k[0] == lane and k[2] not in header["components"].get(k[1], {"tensors": {}})["tensors"]]
             failures += [f"{family}:{lane}:{c}/{k} missing from the store" for _, c, k in missing]
             # Order is data: components by first appearance, tensors and parts as the file lists them.
             want = [(c, k, [p["role"] for p in case.get("parts", [])]) for (ln, c, k), case in cases.items() if ln == lane]
             want = [w for comp in dict.fromkeys(c for c, _, _ in want) for w in want if w[0] == comp]
-            got = [(c, k, list(t.get("parts", {}))) for c, ts in header["components"].items() for k, t in ts.items()]
+            got = [(c, k, list(t.get("parts", {})))
+                   for c, comp in header["components"].items() for k, t in comp["tensors"].items()]
             ok = got == want
             passed += ok
             if not ok:
                 failures.append(f"{family}:{lane}: header order differs from {path.name}")
-    # Core's release 2 is yanked and swaps its lanes: only an explicit version reaches it.
-    _, yanked = store.checkpoint("Conformance/core", version="2", lane="all")
+    # Core's release 2 is yanked and swaps its variants: only an explicit version reaches it.
+    _, yanked = store.checkpoint("Conformance/core", version="2", variant="all")
     ok = list(yanked["components"]) == ["spans"]
     passed += ok
     if not ok:
@@ -403,7 +449,7 @@ def check(vectors: Path) -> int:
     core_failures = check_cores(vectors / "cores.json")
     failures += core_failures
     passed += len(json.loads((vectors / "cores.json").read_text())["cases"]) - len(core_failures)
-    parsers = {"header": parse_header, "manifest": parse_manifest, "repo": parse_repo}
+    parsers = {"header": parse_header, "tree": parse_tree, "repo": parse_repo}
     for verdict in ("green", "red"):
         for path in sorted((vectors / verdict).iterdir()):
             kind = path.name.split("-")[0]
