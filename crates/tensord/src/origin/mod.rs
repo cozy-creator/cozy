@@ -5,10 +5,8 @@
 //!
 //! - [`hub`]: TensorFS's `TensorhubOrigin` under the run's Cozy credentials.
 //! - [`publish`]: a checkpoint put in a Hub repository's custody.
-//! - [`serve`]: the executor's fetch channel.
 mod hub;
 mod publish;
-mod serve;
 
 use std::{
     future::Future,
@@ -27,7 +25,6 @@ use tensorfs::{
 
 pub use hub::{remote, resolve_hash, resolve_named, Resolved};
 pub use publish::{Publication, Published};
-pub use serve::{serve, Grant};
 
 use crate::{stop::Stop, storage};
 
@@ -125,31 +122,45 @@ impl Machine {
         answer.recv().unwrap_or_else(|_| refuse(Code::TRANSFER_FAILED, "the fetch runtime ended"))
     }
 
-    /// `manifest`'s checkpoint, the `components` given (all when `None`): manifest, header,
-    /// files, then, once the disk has room for them, the chunks the components read.
+    /// `variant` of `tree` (its only one when `None`): its name and header, the tree document
+    /// landed here (its repo files are not: nothing on a machine reads them).
+    pub fn variant(&self, remote: &Remote, tree: &ObjectRef, variant: Option<&str>, stop: &Stop) -> Result<(String, ObjectRef)> {
+        let (fetcher, store, origin) = (self.of(remote)?, self.store.clone(), remote.origin.clone());
+        let (tree, variant) = (tree.clone(), variant.map(str::to_owned));
+        self.block(stop, async move {
+            fetcher.objects(&origin, std::slice::from_ref(&tree), &Want { priority: priority::NOW, ..Want::default() }).await?;
+            let tree = tokio::task::spawn_blocking(move || store.tree(&tree).map_err(|e| e.refusal()))
+                .await
+                .map_err(|e| Refusal { code: Code::IO_FAILED, detail: e.to_string() })??;
+            tensorfs::fetch::variant_of_tree(&tree, variant.as_deref())
+        })
+    }
+
+    /// The cozytensors whose header is `header`, the `components` given (all when `None`): its
+    /// header, then, once the disk has room for them, the chunks and assets the components read.
     pub fn pull(
         &self,
         remote: &Remote,
-        manifest: &ObjectRef,
+        header: &ObjectRef,
         components: Option<&[String]>,
         priority: u64,
         progress: Option<Arc<Progress>>,
         stop: &Stop,
     ) -> Result<Pulled> {
         let (fetcher, store, origin) = (self.of(remote)?, self.store.clone(), remote.origin.clone());
-        let (manifest, components) = (manifest.clone(), components.map(<[String]>::to_vec));
+        let (header, components) = (header.clone(), components.map(<[String]>::to_vec));
         self.block(stop, async move {
             let want = |components| Want { components, priority, progress: progress.as_deref() };
-            let structure = fetcher.pull_manifest(&origin, &manifest, &want(Some(&[]))).await?;
+            let structure = fetcher.pull_header(&origin, &header, &want(Some(&[]))).await?;
             if components.as_deref() == Some(&[]) {
                 return Ok(structure);
             }
-            let (held, id) = (store.clone(), manifest.clone());
+            let (held, id) = (store.clone(), header.clone());
             let checkpoint = tokio::task::spawn_blocking(move || held.checkpoint(&id).map_err(|e| e.refusal()))
                 .await
                 .map_err(|e| Refusal { code: Code::IO_FAILED, detail: e.to_string() })??;
-            admit(&store, &tensorfs::fetch::chunks(checkpoint.header(), components.as_deref())?)?;
-            let mut pulled = fetcher.pull_manifest(&origin, &manifest, &want(components.as_deref())).await?;
+            admit(&store, &tensorfs::fetch::wanted(checkpoint.header(), components.as_deref())?)?;
+            let mut pulled = fetcher.pull_header(&origin, &header, &want(components.as_deref())).await?;
             (pulled.landed.origin, pulled.landed.volume) =
                 (pulled.landed.origin + structure.landed.origin, pulled.landed.volume + structure.landed.volume);
             Ok(pulled)

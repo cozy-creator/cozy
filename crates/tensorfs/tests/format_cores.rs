@@ -5,9 +5,11 @@ use std::path::Path;
 
 use base64::Engine;
 use serde_json::Value;
-use tensorfs::format::decode::affine::{dequant, Codes, Fill, Offset, Order, Packing};
+use tensorfs::format::decode::affine::{Codes, Fill, Order, Packing};
+use tensorfs::format::decode::blocks;
 use tensorfs::format::decode::grid::{Grid, ScaleLayout};
-use tensorfs::format::decode::{blocks, table};
+use tensorfs::format::decode::plan::{self, Elems, Plan, Term};
+use tensorfs::format::Dtype;
 
 fn b64(v: &Value) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
@@ -56,7 +58,7 @@ fn packing<'a>(p: &Value, slots: &'a [u8]) -> Packing<'a> {
     }
 }
 
-fn grid<'a>(g: &Value, index: &'a [u32]) -> Grid<'a> {
+fn grid(g: &Value, index: Vec<u32>) -> Grid {
     match g["kind"].as_str().unwrap() {
         "tensor" => Grid::Tensor,
         "row" => Grid::Row,
@@ -69,12 +71,19 @@ fn grid<'a>(g: &Value, index: &'a [u32]) -> Grid<'a> {
     }
 }
 
+fn f32_elems(v: &Value) -> Elems<'static> {
+    Elems {
+        dtype: Dtype::F32,
+        bytes: b64(v).into(),
+    }
+}
+
 /// gguf's q4_0 `{f16 d; u8 qs[16]}` (element j in qs[j]'s low nibble, j + 16 in its high one,
 /// `(q − 8) × d`) and q8_0 `{f16 d; i8 qs[32]}` (`q × d`).
 fn gguf(kind: &str, block: &[u8], out: &mut [f32]) -> tensorfs::format::Result<()> {
     let (bits, fill, codes, zero) = match kind {
-        "q4_0" => (4, Fill::Planar, Codes::Unsigned(0), Offset::Zero(&[8.0])),
-        _ => (8, Fill::Word, Codes::Signed, Offset::None),
+        "q4_0" => (4, Fill::Planar, Codes::Unsigned(0), 8.0),
+        _ => (8, Fill::Word, Codes::Signed, 0.0),
     };
     let p = Packing {
         bits,
@@ -85,21 +94,18 @@ fn gguf(kind: &str, block: &[u8], out: &mut [f32]) -> tensorfs::format::Result<(
         order: Order::LowFirst,
         codes,
     };
+    let d = blocks::f16_at(block, 0);
     let q = p.lane(&block[2..], out.len())?;
-    out.copy_from_slice(&dequant(
-        &q,
-        &[blocks::f16_at(block, 0)],
-        zero,
-        &Grid::Tensor,
-        1,
-        out.len(),
-    ));
+    for (v, q) in out.iter_mut().zip(q) {
+        *v = (q as f32 - zero) * d;
+    }
     Ok(())
 }
 
 #[test]
 fn cores_decode_every_case() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/vectors/cores.json");
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensorfs/conformance/vectors/cores.json");
     let doc: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let mut seen = 0;
     for case in doc["cases"].as_array().unwrap() {
@@ -120,21 +126,23 @@ fn cores_decode_every_case() {
                 let index: Vec<u32> = (case["grid"]["index"].as_array().into_iter().flatten())
                     .map(|v| v.as_u64().unwrap() as u32)
                     .collect();
-                let p = packing(&case["packing"], &slots);
-                let g = grid(&case["grid"], &index);
-                let q = p.unpack(&b64(&case["words"]), rows, cols).unwrap();
-                let s = f32s(&case["scale"]);
-                if core == "table" {
-                    table::decode(&q, &f32s(&case["table"]), &s, &g, rows, cols).unwrap()
-                } else {
-                    let (zero, bias) = (case.get("zero").map(f32s), case.get("bias").map(f32s));
-                    let offset = match (&zero, &bias) {
-                        (Some(z), _) => Offset::Zero(z),
-                        (_, Some(b)) => Offset::Bias(b),
-                        _ => Offset::None,
-                    };
-                    dequant(&q, &s, offset, &g, rows, cols)
-                }
+                let words = b64(&case["words"]);
+                let term = match (case.get("zero"), case.get("bias")) {
+                    (Some(z), _) => Term::Zero(f32_elems(z)),
+                    (_, Some(b)) => Term::Bias(f32_elems(b)),
+                    _ => Term::None,
+                };
+                let codes = plan::Codes {
+                    bytes: &words,
+                    packing: packing(&case["packing"], &slots),
+                    flat: false,
+                    table: (core == "table").then(|| f32s(&case["table"])),
+                    scale: f32_elems(&case["scale"]),
+                    grid: grid(&case["grid"], index),
+                    term,
+                    global: None,
+                };
+                Plan::from(codes).values(rows, cols, rows.max(1)).unwrap()
             }
         };
         let want = f32s(&case["expect"]);
@@ -150,7 +158,7 @@ fn cores_decode_every_case() {
 #[test]
 fn spec_tables_match_their_digests() {
     use sha2::{Digest, Sha256};
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("spec/cozytensors.md");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensorfs/spec/cozytensors.md");
     let spec = std::fs::read_to_string(path).unwrap();
     let appendix = &spec[spec.find("## Appendix A.").unwrap()..];
     let mut lines = appendix.lines();

@@ -280,6 +280,8 @@ pub struct Ref {
 #[serde(default)]
 pub struct RunProduct {
     pub output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<protocol::machine::CheckpointRef>,
     pub op: i32,
     pub index: u32,
     pub content: Option<Ref>,
