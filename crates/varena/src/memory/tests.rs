@@ -43,6 +43,7 @@ fn gpu_with_host(with_host: bool) -> (Arc<Gpu>, Weak<Weights>, i32) {
     let z = Counters::default();
     let set = Set {
         w,
+        pending: vec![],
         base: 0,
         regs: vec![Reg {
             home: true,
@@ -237,15 +238,103 @@ fn failed_wait_with_independent_consumer_completion_keeps_normal_recovery() {
 }
 
 #[test]
+fn source_completion_snapshot_survives_streaming_slot_reassignment() {
+    let mut f = Fixture::new();
+    let ready = Arc::new(Ev {
+        raw: std::ptr::null_mut(),
+        timing: false,
+        pool: f.gpu.inner.events.clone(),
+    });
+    let fill = Arc::new(Fill {
+        state: Mutex::new(Some(Filled::Ready(ready))),
+        cv: Condvar::new(),
+    });
+    {
+        let mut st = f.gpu.inner.lock();
+        st.set(0).track_fill(fill.clone());
+        st.slots.push(Some(Slot {
+            m: Mapping {
+                fill: Some(fill.clone()),
+                ..Default::default()
+            },
+            holds: Some((0, 0)),
+            pending: false,
+            used: 0,
+        }));
+        // Simulate only the metadata handoff; no fake successful CUDA mapping or fence.
+        st.slot(0).holds = Some((1, 0));
+        st.slot(0).m.fill = None;
+        let (closing, _) = st.close_fences(0).unwrap();
+        assert_eq!(closing.len(), 1);
+        assert!(Arc::ptr_eq(&closing[0], &fill));
+    }
+    let source = Arc::downgrade(&f.ws().weights);
+    f.gpu
+        .inner
+        .poison(error("historical producer completion unknown"));
+    drop(f.ws.take());
+    assert!(source.upgrade().is_some());
+    assert!(fd_is_open(f.fd));
+    assert_eq!(
+        f.gpu.inner.lock().sets[0].as_ref().unwrap().pending.len(),
+        1
+    );
+}
+
+#[test]
+fn confirmed_completed_fill_history_retires_during_existing_activity() {
+    let f = Fixture::new();
+    let fill = Arc::new(Fill {
+        state: Mutex::new(Some(Filled::Failed(error("confirmed drained failure")))),
+        cv: Condvar::new(),
+    });
+    let weak = Arc::downgrade(&fill);
+    let mut st = f.gpu.inner.lock();
+    st.set(0).track_fill(fill);
+    f.gpu.inner.reap_fills(&mut st, 0).unwrap();
+    assert!(st.set(0).pending.is_empty());
+    assert!(weak.upgrade().is_none());
+}
+
+#[cfg(feature = "faults")]
+#[test]
+fn failed_completion_query_retains_pending_source_and_event() {
+    let f = Fixture::new();
+    let ready = Arc::new(Ev {
+        raw: std::ptr::null_mut(),
+        timing: false,
+        pool: f.gpu.inner.events.clone(),
+    });
+    let weak = Arc::downgrade(&ready);
+    let fill = Arc::new(Fill {
+        state: Mutex::new(Some(Filled::Ready(ready))),
+        cv: Condvar::new(),
+    });
+    let mut st = f.gpu.inner.lock();
+    st.set(0).track_fill(fill);
+    crate::faults::arm("fill-query", 1);
+    assert!(f.gpu.inner.reap_fills(&mut st, 0).is_err());
+    assert_eq!(st.set(0).pending.len(), 1);
+    assert!(weak.upgrade().is_some());
+    assert!(fd_is_open(f.fd));
+}
+
+#[test]
 fn unproven_staging_buffer_never_reenters_pool_and_readers_finish_with_error() {
     let f = Fixture::new();
     let (tx, rx) = mpsc::channel();
     let waiter = f.gpu.clone();
     let thread = std::thread::spawn(move || tx.send(waiter.inner.staging.take().is_err()).unwrap());
+    let previous = Arc::new(Ev {
+        raw: std::ptr::null_mut(),
+        timing: false,
+        pool: f.gpu.inner.events.clone(),
+    });
+    let retained = Arc::downgrade(&previous);
     let res = f.gpu.inner.finish_piece(
         buffer(),
-        None,
-        Err(error("event record failed")),
+        Some(previous),
+        Err(error("prior event synchronize failed")),
         Some(Err(error("drain failed"))),
     );
     assert!(res.is_err());
@@ -255,6 +344,27 @@ fn unproven_staging_buffer_never_reenters_pool_and_readers_finish_with_error() {
     assert!(b.free.is_empty());
     assert_eq!(b.held.len(), 1);
     assert!(b.error.is_some());
+    assert!(b.held[0].last.is_some());
+    assert!(retained.upgrade().is_some());
+}
+
+#[test]
+fn unproven_post_enqueue_buffer_without_an_event_stays_unavailable() {
+    let f = Fixture::new();
+    assert!(f
+        .gpu
+        .inner
+        .finish_piece(
+            buffer(),
+            None,
+            Err(error("post-enqueue record failed")),
+            Some(Err(error("drain failed")))
+        )
+        .is_err());
+    let b = f.gpu.inner.staging.buffers.lock().unwrap();
+    assert!(b.free.is_empty());
+    assert_eq!(b.held.len(), 1);
+    assert!(b.held[0].last.is_none());
 }
 
 #[test]

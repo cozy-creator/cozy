@@ -275,7 +275,10 @@ impl Fill {
     /// Nothing of it is in flight on the device.
     fn landed(&self) -> Result<bool> {
         match &*self.state.lock().unwrap() {
-            Some(Filled::Ready(ready)) => ready.done(),
+            Some(Filled::Ready(ready)) => {
+                crate::faults::hit("fill-query")?;
+                ready.done()
+            }
             Some(Filled::Failed(_)) => Ok(true),
             Some(Filled::Unknown(_)) => Ok(false),
             None => Ok(false),
@@ -418,6 +421,8 @@ struct Reg {
 
 struct Set {
     w: Arc<Weights>,
+    /// Every submitted source read until positively completed, independent of slot reassignment.
+    pending: Vec<Arc<Fill>>,
     base: u64,
     regs: Vec<Reg>,
     step: Counters,
@@ -433,6 +438,19 @@ struct Set {
 }
 
 impl Set {
+    fn track_fill(&mut self, fill: Arc<Fill>) {
+        self.pending.push(fill);
+    }
+
+    fn reap_fills(&mut self) -> Result<()> {
+        let mut error = None;
+        self.pending.retain(|fill| match fill.landed() {
+            Ok(done) => !done,
+            Err(e) => { error.get_or_insert(e); true }
+        });
+        error.map_or(Ok(()), Err)
+    }
+
     fn count(&mut self, f: impl Fn(&mut Counters)) {
         f(&mut self.step);
         f(&mut self.total);
@@ -471,6 +489,21 @@ struct State {
 }
 
 impl State {
+    fn close_fences(&self, id: usize) -> Option<(Vec<Arc<Fill>>, Vec<EvRef>)> {
+        let set = self.sets.get(id)?.as_ref()?;
+        let maps = set.regs.iter().filter_map(|r| r.map.as_ref()).chain(
+            self.slots.iter().flatten().filter(|s| s.holds.is_some_and(|(set, _)| set == id)).map(|s| &s.m));
+        let mut fills = set.pending.clone();
+        let mut releases = vec![];
+        for m in maps {
+            if let Some(fill) = m.fill.as_ref().filter(|fill| !fills.iter().any(|held| Arc::ptr_eq(held, fill))) {
+                fills.push(fill.clone());
+            }
+            releases.extend(m.released.iter().cloned());
+        }
+        Some((fills, releases))
+    }
+
     fn set(&mut self, id: usize) -> &mut Set {
         self.sets[id].as_mut().expect("a live weight set")
     }
@@ -625,7 +658,7 @@ impl Gpu {
         let base = reserve_va(weights.layout.nbytes.max(REGION_ALIGN))?;
         let regs = weights.layout.regions.iter().map(|_| Reg { home: true, map: None }).collect();
         let (w, z) = (weights.clone(), Counters::default());
-        st.sets.push(Some(Set { w, base, regs, step: z, last: z, total: z, used: 0, warm: true, busy: false, shared: false }));
+        st.sets.push(Some(Set { w, pending: vec![], base, regs, step: z, last: z, total: z, used: 0, warm: true, busy: false, shared: false }));
         Ok(Arc::new(WeightSet { gpu: self.clone(), id: st.sets.len() - 1, base, weights }))
     }
 
@@ -743,6 +776,10 @@ impl Drop for Gpu {
 }
 
 impl Inner {
+    fn reap_fills(&self, st: &mut State, id: usize) -> Result<()> {
+        st.set(id).reap_fills().map_err(|e| self.poison(e))
+    }
+
     fn check(&self) -> Result<()> {
         self.custody.lock().unwrap().error.clone().map_or(Ok(()), Err)
     }
@@ -1188,8 +1225,13 @@ impl Inner {
         let (w, span) = (st.set(set).w.clone(), st.slot_span);
         let x = w.layout.region(r)?;
         let held = st.slots.iter().position(|s| s.as_ref().is_some_and(|s| s.holds == Some((set, r))));
+        if let Some(i) = held {
+            if !st.slot(i).m.dead() {
+                return Ok(Some(i));
+            }
+        }
+        self.reap_fills(st, set)?;
         let i = match held {
-            Some(i) if !st.slot(i).m.dead() => return Ok(Some(i)),
             Some(i) => i,
             None => {
                 let live = st.slots.iter().enumerate().filter_map(|(i, s)| Some((i, s.as_ref()?)));
@@ -1209,12 +1251,14 @@ impl Inner {
             c.streamed_bytes += x.nbytes;
             c.faults += urgent as u64;
         });
+        st.set(set).track_fill(fill.clone());
         self.submit(Job { set, w, region: r, dst, waits, fill }, urgent);
         Ok(Some(i))
     }
 
     /// Maps region `r` at home and queues its fill.
     fn map_home(&self, st: &mut State, set: usize, r: u32, urgent: bool) -> Result<()> {
+        self.reap_fills(st, set)?;
         let (w, base) = (st.set(set).w.clone(), st.set(set).base);
         let x = w.layout.region(r)?;
         let t = Instant::now();
@@ -1228,6 +1272,7 @@ impl Inner {
             c.paged_in += x.nbytes;
             c.faults += urgent as u64;
         });
+        st.set(set).track_fill(fill.clone());
         self.submit(Job { set, w, region: r, dst, waits, fill }, urgent);
         Ok(())
     }
@@ -1558,19 +1603,7 @@ impl Drop for WeightSet {
             Err(e) => { g.poison(e); return; }
         };
         // Leave the source and mappings in State until every copy and consumer fence is proven.
-        let (fills, releases) = {
-            let st = g.lock();
-            let Some(set) = st.sets[self.id].as_ref() else { return };
-            let maps = set.regs.iter().filter_map(|r| r.map.as_ref()).chain(
-                st.slots.iter().flatten().filter(|s| s.holds.is_some_and(|(id, _)| id == self.id)).map(|s| &s.m));
-            let mut fills = vec![];
-            let mut releases = vec![];
-            for m in maps {
-                fills.extend(m.fill.iter().cloned());
-                releases.extend(m.released.iter().cloned());
-            }
-            (fills, releases)
-        };
+        let Some((fills, releases)) = g.lock().close_fences(self.id) else { return };
         for fill in fills {
             let completed = match fill.completion() {
                 Filled::Ready(ev) => ev.sync(),
