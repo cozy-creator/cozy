@@ -5,7 +5,38 @@ use std::sync::Arc;
 
 use crate::{Failure, Result};
 
+pub use crate::io::decode::{Output as DecodeOutput, Part as DecodePart};
 pub use crate::session::PartData;
+
+/// Check encoded-part descriptors through the shared format registry without reading data.
+pub fn check_decode(
+    encoding: &crate::format::Encoding,
+    dtype: &crate::format::Dtype,
+    shape: &[u64],
+    parts: &[crate::format::decode::PartMetadata<'_>],
+) -> Result<()> {
+    crate::io::decode::check(encoding, dtype, shape, parts)
+}
+
+/// Decode existing part buffers into an existing, exactly typed destination.
+///
+/// # Safety
+/// Every span must satisfy [`crate::io::decode::into`]'s validity, placement and stream
+/// requirements. Retain all source and destination owners through checked completion.
+/// After an error, retain them until [`crate::io::drain`] and every producer stream
+/// succeed; an error does not prove quiescence. Output is unspecified after a runtime
+/// or value error, while descriptor and overlap refusals precede writes.
+#[allow(unsafe_code)]
+pub unsafe fn decode_into(
+    encoding: &crate::format::Encoding,
+    dtype: &crate::format::Dtype,
+    shape: &[u64],
+    parts: &[DecodePart<'_>],
+    out: DecodeOutput<'_>,
+) -> Result<()> {
+    // SAFETY: the caller supplies and retains all buffers under the contract above.
+    unsafe { crate::io::decode::into(encoding, dtype, shape, parts, out) }
+}
 
 /// Group tensor metadata for placement without opening or fetching payload files.
 pub fn regions(
@@ -48,6 +79,9 @@ pub unsafe fn read_into(
 pub fn runtime() -> Result<Arc<tokio::runtime::Runtime>> {
     crate::fetch::runtime().map_err(|error| {
         let detail = error.detail.clone();
-        Failure { detail, ..Failure::from(error) }
+        Failure {
+            detail,
+            ..Failure::from(error)
+        }
     })
 }
