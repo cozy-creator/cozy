@@ -1,13 +1,14 @@
 //! Owned byte sources for placement. TensorFS keeps verified descriptors and checkpoint
 //! source context, then runs every transfer through the same host/device read engine.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
-pub use super::{ItemSource, ObjectRange};
 use super::{Copy, Dst, ReadOpts, ReadStats, Src};
+pub use super::{ItemSource, ObjectRange};
 use crate::failure::{Failure, Kind};
 use crate::format::ObjectRef;
 
@@ -111,6 +112,71 @@ impl Source {
             "{}: source has no verified file",
             object.sha256
         )))
+    }
+
+    /// Export the selected full objects as owned read-only descriptors. Missing checkpoint
+    /// objects use this source's verified downloader; inline items need no descriptor.
+    /// The returned files retain their read locks independently of this source. Like
+    /// `read_items`, a checkpoint-backed export must run outside an async runtime context.
+    pub fn export_files(&self, items: &[Item]) -> Result<Vec<(ObjectRef, File)>> {
+        let mut objects = BTreeMap::new();
+        for item in items {
+            match &item.source {
+                ItemSource::Object(range) => {
+                    if range.len != item.len
+                        || range
+                            .off
+                            .checked_add(range.len)
+                            .is_none_or(|n| n > range.obj.length)
+                    {
+                        return Err(invalid("object range exceeds its verified source"));
+                    }
+                    if objects
+                        .insert(range.obj.sha256.clone(), range.obj.clone())
+                        .is_some_and(|old: ObjectRef| old.length != range.obj.length)
+                    {
+                        return Err(invalid("one source object has conflicting lengths"));
+                    }
+                }
+                ItemSource::Inline(bytes) if bytes.len() as u64 != item.len => {
+                    return Err(invalid("inline length differs from item"));
+                }
+                ItemSource::Inline(_) => {}
+            }
+        }
+        let objects: Vec<_> = objects.into_values().collect();
+        #[cfg(feature = "store")]
+        self.load(&objects)?;
+        objects
+            .into_iter()
+            .map(|object| {
+                let file = self.file(&object)?;
+                let failure = |error: std::io::Error| {
+                    Error::Source(Failure {
+                        kind: Kind::Io,
+                        detail: format!("export {}: {error}", object.sha256),
+                    })
+                };
+                if file.metadata().map_err(failure)?.len() != object.length {
+                    return Err(invalid("exported source length differs from its object"));
+                }
+                // SAFETY: F_GETFL only reads access flags of this retained descriptor.
+                let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+                if flags < 0 {
+                    return Err(failure(std::io::Error::last_os_error()));
+                }
+                let exported = if flags & libc::O_ACCMODE == libc::O_RDONLY {
+                    file.try_clone().map_err(failure)?
+                } else {
+                    File::from(
+                        platform::shm::reopen(file.as_fd(), false)
+                            .map_err(|error| failure(error.into()))?,
+                    )
+                };
+                exported.lock_shared().map_err(failure)?;
+                Ok((object, exported))
+            })
+            .collect()
     }
 
     pub fn resident(&self, obj: &ObjectRef, _tally: &IoTally) -> Result<bool> {

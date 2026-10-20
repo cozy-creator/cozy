@@ -222,6 +222,27 @@ fn child() {
                 }
                 println!("@{} {}", handles.len(), bytes);
             }
+            "warm" => {
+                let worker = channel.fork(row.owner()).unwrap();
+                worker
+                    .cache_ram(
+                        row.owner(),
+                        [19; 32],
+                        &[],
+                        &[varena::ledger::RamRegion {
+                            offset: 0,
+                            len: 4,
+                            items: vec![tensorfs::io::source::Item {
+                                offset: 0,
+                                len: 4,
+                                part_end: true,
+                                source: tensorfs::io::ItemSource::Inline(b"warm".to_vec().into()),
+                            }],
+                        }],
+                    )
+                    .unwrap();
+                println!("@ok");
+            }
             _ => panic!("unknown test command"),
         }
         std::io::stdout().flush().unwrap();
@@ -436,6 +457,198 @@ fn ram_service_fills_through_tensorfs_and_retains_a_readers_layout() {
             8
         );
     }
+}
+
+fn observe(ledger: &Ledger, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "RAM state did not progress");
+        let mut poll = libc::pollfd {
+            fd: ledger.events().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut poll, 1, remaining.as_millis() as i32) },
+            1
+        );
+        let mut word = [0u8; 8];
+        assert_eq!(
+            unsafe { libc::read(poll.fd, word.as_mut_ptr().cast(), word.len()) },
+            8
+        );
+    }
+}
+
+#[test]
+fn forked_cross_process_registration_uses_the_original_service_custody() {
+    let fixture = Fixture::new();
+    let mut child = ChildRow::spawn(&fixture.ledger);
+    assert_eq!(child.call("warm"), "ok");
+    observe(&fixture.ledger, || {
+        fixture
+            .ledger
+            .ram_status([19; 32])
+            .is_some_and(|s| !s.filling)
+    });
+    let status = fixture.ledger.ram_status([19; 32]).unwrap();
+    assert_eq!(status.ready, vec![true]);
+    let row = fixture.ledger.claim(std::process::id()).unwrap();
+    let channel = Channel::new(fixture.ledger.grant(std::process::id()).unwrap().channel);
+    let view = channel.ram(row.owner(), [19; 32], 0).unwrap().unwrap();
+    let mut bytes = String::new();
+    std::fs::File::from(view.file)
+        .read_to_string(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, "warm");
+}
+
+#[test]
+fn ram_generations_and_tagged_cancellation_follow_actual_custody() {
+    let fixture = Fixture::new();
+    let row = fixture.ledger.claim(std::process::id()).unwrap();
+    let channel = Channel::new(fixture.ledger.grant(std::process::id()).unwrap().channel);
+    let regions = [varena::ledger::RamRegion {
+        offset: 0,
+        len: 4,
+        items: vec![tensorfs::io::source::Item {
+            offset: 0,
+            len: 4,
+            part_end: true,
+            source: tensorfs::io::ItemSource::Inline(b"warm".to_vec().into()),
+        }],
+    }];
+    channel
+        .cache_ram_tagged(row.owner(), [20; 32], &[], &regions, 1)
+        .unwrap();
+    observe(&fixture.ledger, || {
+        channel
+            .ram_status(row.owner(), [20; 32])
+            .unwrap()
+            .is_some_and(|s| !s.filling)
+    });
+    let first = channel.ram_status(row.owner(), [20; 32]).unwrap().unwrap();
+    assert_eq!(first.ready, vec![true]);
+    assert!(!channel
+        .cache_ram_tagged(row.owner(), [20; 32], &[], &regions, 2)
+        .unwrap());
+    channel.forget_ram(row.owner(), [20; 32], 1).unwrap();
+    assert_eq!(
+        channel.ram_status(row.owner(), [20; 32]).unwrap(),
+        Some(first.clone())
+    );
+    channel.forget_ram(row.owner(), [20; 32], 2).unwrap();
+    assert!(channel.ram_status(row.owner(), [20; 32]).unwrap().is_none());
+    assert!(channel.ram(row.owner(), [20; 32], 0).unwrap().is_none());
+    channel
+        .cache_ram_tagged(row.owner(), [20; 32], &[], &regions, 3)
+        .unwrap();
+    observe(&fixture.ledger, || {
+        channel
+            .ram_status(row.owner(), [20; 32])
+            .unwrap()
+            .is_some_and(|s| !s.filling)
+    });
+    assert!(
+        channel
+            .ram_status(row.owner(), [20; 32])
+            .unwrap()
+            .unwrap()
+            .generation
+            > first.generation
+    );
+    assert!(fixture.ledger.release_ram([20; 32]));
+    assert!(channel.ram_status(row.owner(), [20; 32]).unwrap().is_none());
+}
+
+#[test]
+#[ignore = "child of the delegated-cgroup pressure test"]
+fn pressure_child() {
+    println!("@ready");
+    std::io::stdout().flush().unwrap();
+    let mut command = String::new();
+    std::io::stdin().read_line(&mut command).unwrap();
+    let fixture = Fixture::new();
+    let row = fixture.ledger.claim(std::process::id()).unwrap();
+    let channel = Channel::new(fixture.ledger.grant(std::process::id()).unwrap().channel);
+    let len = 64 << 20;
+    assert!(platform::contain::host_memory::read().available < len as i64);
+    assert!(channel
+        .cache_ram(
+            row.owner(),
+            [21; 32],
+            &[],
+            &[varena::ledger::RamRegion {
+                offset: 0,
+                len,
+                items: vec![],
+            }]
+        )
+        .unwrap());
+    observe(&fixture.ledger, || {
+        channel
+            .ram_status(row.owner(), [21; 32])
+            .unwrap()
+            .is_some_and(|s| !s.filling)
+    });
+    assert_eq!(
+        channel
+            .ram_status(row.owner(), [21; 32])
+            .unwrap()
+            .unwrap()
+            .ready,
+        vec![false]
+    );
+    assert!(channel.ram(row.owner(), [21; 32], 0).unwrap().is_none());
+    assert!(
+        fixture
+            .ledger
+            .fits("unmeasured", "starts-under-pressure")
+            .unwrap(),
+        "host pressure never blocks admission"
+    );
+}
+
+#[test]
+fn cgroup_pressure_refuses_warming_without_claiming_readiness_or_blocking_admission() {
+    let scope = platform::contain::Scope::create("varena-ram-pressure").unwrap();
+    let Some(relative) = scope.cgroup_relative() else {
+        assert!(
+            std::env::var_os("GITHUB_ACTIONS").is_none(),
+            "hosted proof requires delegated cgroup-v2"
+        );
+        return;
+    };
+    let group = std::path::Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+    std::fs::write(group.join("memory.max"), (32 << 20).to_string()).unwrap();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "pressure_child",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    while !line.contains("@ready") {
+        line.clear();
+        assert!(output.read_line(&mut line).unwrap() > 0);
+    }
+    scope.adopt(child.id()).unwrap();
+    child.stdin.take().unwrap().write_all(b"go\n").unwrap();
+    let mut rest = String::new();
+    output.read_to_string(&mut rest).unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "pressure child failed: {rest}"
+    );
+    scope.end().unwrap();
 }
 
 #[test]

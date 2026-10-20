@@ -4,12 +4,12 @@
 //! private file description, so even SIGKILL drops the claim. Snapshot copies are atomics:
 //! an interrupted publisher leaves the preceding complete copy readable.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering::*};
@@ -265,6 +265,13 @@ impl Table {
         let changed = &self.shared().header.changed;
         changed.fetch_add(1, Release);
         wake(changed);
+    }
+    fn signal(&self, owner: Owner) -> Result<()> {
+        let slot = self.slot(owner)?;
+        slot.bell.fetch_add(1, Release);
+        wake(&slot.bell);
+        self.changed();
+        Ok(())
     }
     fn rows(&self) -> Result<Vec<RowStatus>> {
         let mut out = Vec::new();
@@ -800,7 +807,10 @@ impl Ledger {
         source: Arc<Source>,
         regions: Vec<RamRegion>,
     ) -> Result<bool> {
-        register_ram(&self.table, &self.custody, layout, source, regions)
+        register_ram(&self.table, &self.custody, layout, source, regions, None)
+    }
+    pub fn ram_status(&self, layout: [u8; 32]) -> Option<RamStatus> {
+        ram_status(&self.custody.lock(), layout)
     }
     /// Explicit pressure reclamation: never drops a layout with a live reader lease.
     pub fn release_ram(&self, layout: [u8; 32]) -> bool {
@@ -810,8 +820,18 @@ impl Ledger {
                 .retain(|reader| !platform::handles::hung_up(reader));
             held.readers.is_empty() && !held.layout.filling.load(Acquire)
         });
+        let observers = if idle {
+            custody
+                .ram
+                .remove(&layout)
+                .map(|held| held.observers)
+                .unwrap_or_default()
+        } else {
+            BTreeSet::new()
+        };
+        drop(custody);
+        notify_owners(&self.table, observers);
         if idle {
-            custody.ram.remove(&layout);
             self.table.changed();
         }
         idle
@@ -832,7 +852,13 @@ impl Ledger {
             .min_by_key(|(_, used)| *used)
             .map(|(key, _)| key);
         if let Some(key) = victim {
-            custody.ram.remove(&key);
+            let observers = custody
+                .ram
+                .remove(&key)
+                .map(|held| held.observers)
+                .unwrap_or_default();
+            drop(custody);
+            notify_owners(&self.table, observers);
             self.table.changed();
             true
         } else {
@@ -951,11 +977,7 @@ impl Row {
     }
     /// Wake a blocked reclaim worker after its close flag changes.
     pub fn wake(&self) -> Result<()> {
-        let slot = self.table.slot(self.owner)?;
-        slot.bell.fetch_add(1, Release);
-        wake(&slot.bell);
-        self.table.changed();
-        Ok(())
+        self.table.signal(self.owner)
     }
     pub fn ack(&self, ask: Ask) -> Result<()> {
         let slot = self.table.slot(self.owner)?;
@@ -1001,6 +1023,12 @@ pub struct RamRegion {
     pub len: u64,
     pub items: Vec<Item>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RamStatus {
+    pub generation: u64,
+    pub filling: bool,
+    pub ready: Vec<bool>,
+}
 struct Ram {
     file: File,
     base: usize,
@@ -1008,6 +1036,7 @@ struct Ram {
     regions: Vec<RamRegion>,
     ready: Vec<AtomicBool>,
     filling: AtomicBool,
+    cancelled: AtomicBool,
 }
 // SAFETY: regions are disjoint, one worker writes them, and a region is published only after
 // its TensorFS read finishes. Receivers get read-only file descriptions, never this pointer.
@@ -1089,6 +1118,7 @@ impl Ram {
             len,
             ready: regions.iter().map(|_| AtomicBool::new(false)).collect(),
             filling: AtomicBool::new(true),
+            cancelled: AtomicBool::new(false),
             regions,
         };
         shm::seal(ram.file.as_fd()).map_err(crate::os("seal RAM layout"))?;
@@ -1106,6 +1136,8 @@ impl Drop for Ram {
 struct RamHeld {
     layout: Arc<Ram>,
     readers: Vec<UnixStream>,
+    observers: BTreeSet<(Owner, u64)>,
+    generation: u64,
     used: u64,
 }
 #[derive(Default)]
@@ -1138,23 +1170,100 @@ fn orphan(table: &Table, page: &Kept) -> bool {
     })
 }
 
+fn notify_owners(table: &Table, observers: BTreeSet<(Owner, u64)>) {
+    for (owner, _) in observers {
+        let _ = table.signal(owner);
+    }
+}
+fn notify_ram(table: &Table, custody: &Mutex<Custody>, layout: [u8; 32], generation: u64) {
+    let observers = custody
+        .lock()
+        .ram
+        .get(&layout)
+        .filter(|held| held.generation == generation)
+        .map(|held| held.observers.clone())
+        .unwrap_or_default();
+    notify_owners(table, observers);
+    table.changed();
+}
+fn ram_status(custody: &Custody, layout: [u8; 32]) -> Option<RamStatus> {
+    let held = custody.ram.get(&layout)?;
+    Some(RamStatus {
+        generation: held.generation,
+        filling: held.layout.filling.load(Acquire),
+        ready: held
+            .layout
+            .ready
+            .iter()
+            .map(|ready| ready.load(Acquire))
+            .collect(),
+    })
+}
 fn register_ram(
     table: &Arc<Table>,
-    custody: &Mutex<Custody>,
+    custody: &Arc<Mutex<Custody>>,
     layout: [u8; 32],
     source: Arc<Source>,
     regions: Vec<RamRegion>,
+    observer: Option<(Owner, u64)>,
 ) -> Result<bool> {
-    let ram = Arc::new(Ram::new(regions)?);
-    let mut custody = custody.lock();
-    if custody.ram.contains_key(&layout) {
-        return Ok(false);
+    let existing = |held: &mut RamHeld| -> Result<bool> {
+        if held.layout.regions.len() != regions.len()
+            || held
+                .layout
+                .regions
+                .iter()
+                .zip(&regions)
+                .any(|(a, b)| a.offset != b.offset || a.len != b.len)
+        {
+            return Err(Error::Invalid(
+                "RAM fingerprint has a different layout".into(),
+            ));
+        }
+        held.observers.extend(observer);
+        Ok(false)
+    };
+    if let Some(held) = custody.lock().ram.get_mut(&layout) {
+        return existing(held);
     }
-    let (fill, table) = (ram.clone(), table.clone());
-    std::thread::Builder::new()
+    let ram = Arc::new(Ram::new(regions.clone())?);
+    let generation = {
+        let mut held = custody.lock();
+        if let Some(held) = held.ram.get_mut(&layout) {
+            return existing(held);
+        }
+        held.clock = held
+            .clock
+            .checked_add(1)
+            .ok_or_else(|| Error::Invalid("RAM generation exhausted".into()))?;
+        let generation = held.clock;
+        held.ram.insert(
+            layout,
+            RamHeld {
+                layout: ram.clone(),
+                readers: Vec::new(),
+                observers: observer.into_iter().collect(),
+                generation,
+                used: generation,
+            },
+        );
+        generation
+    };
+    let (fill, table, custody) = (ram, table.clone(), custody.clone());
+    let failed_table = table.clone();
+    let failed_custody = custody.clone();
+    let started = std::thread::Builder::new()
         .name("varena-ram".into())
         .spawn(move || {
             for (region, ready) in fill.regions.iter().zip(&fill.ready) {
+                // A warm cache never consumes the last observed host headroom. Refusing to warm
+                // a region is normal: demand still has its verified disk source.
+                let available = platform::contain::host_memory::read().available;
+                if fill.cancelled.load(Acquire)
+                    || u64::try_from(available).map_or(true, |bytes| bytes < region.len)
+                {
+                    break;
+                }
                 // SAFETY: validated nonoverlapping ranges in this worker's writable mapping.
                 let result = unsafe {
                     source.read_items(
@@ -1172,25 +1281,24 @@ fn register_ram(
                 match result {
                     Ok(_) => {
                         ready.store(true, Release);
-                        table.changed();
+                        notify_ram(&table, &custody, layout, generation);
                     }
                     Err(error) => tracing::warn!(%error, "RAM region remains on disk"),
                 }
             }
             fill.filling.store(false, Release);
-            table.changed();
-        })
-        .map_err(|e| io("start RAM fill", e))?;
-    custody.clock = custody.clock.saturating_add(1);
-    let used = custody.clock;
-    custody.ram.insert(
-        layout,
-        RamHeld {
-            layout: ram,
-            readers: Vec::new(),
-            used,
-        },
-    );
+            notify_ram(&table, &custody, layout, generation);
+        });
+    if let Err(error) = started {
+        let observers = failed_custody
+            .lock()
+            .ram
+            .remove(&layout)
+            .map(|held| held.observers)
+            .unwrap_or_default();
+        notify_owners(&failed_table, observers);
+        return Err(io("start RAM fill", error));
+    }
     Ok(true)
 }
 
@@ -1445,10 +1553,59 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                         key.fingerprint,
                         Arc::new(Source::files(files, true, 0)),
                         regions,
+                        Some((owner, key.page)),
                     )?;
                     stream
                         .write_all(&[u8::from(accepted)])
                         .map_err(|e| io("ack RAM registration", e))?;
+                }
+                Some(8) => {
+                    let status = ram_status(&custody.lock(), key.fingerprint);
+                    stream
+                        .write_all(&[u8::from(status.is_some())])
+                        .map_err(|e| io("send RAM status", e))?;
+                    if let Some(status) = status {
+                        stream
+                            .write_all(&status.generation.to_le_bytes())
+                            .and_then(|_| stream.write_all(&[u8::from(status.filling)]))
+                            .and_then(|_| {
+                                stream.write_all(&(status.ready.len() as u64).to_le_bytes())
+                            })
+                            .and_then(|_| {
+                                stream.write_all(
+                                    &status.ready.into_iter().map(u8::from).collect::<Vec<_>>(),
+                                )
+                            })
+                            .map_err(|e| io("send RAM readiness", e))?;
+                    }
+                }
+                Some(9) => {
+                    let mut held = custody.lock();
+                    let remove = held.ram.get_mut(&key.fingerprint).is_some_and(|ram| {
+                        ram.observers.remove(&(owner, key.page));
+                        ram.observers.is_empty()
+                    });
+                    if remove {
+                        if let Some(ram) = held.ram.remove(&key.fingerprint) {
+                            ram.layout.cancelled.store(true, Release);
+                        }
+                    }
+                    drop(held);
+                    stream
+                        .write_all(&[1])
+                        .map_err(|e| io("ack RAM unsubscribe", e))?;
+                }
+                Some(10) => {
+                    let (server, client) =
+                        UnixStream::pair().map_err(|e| io("fork grant channel", e))?;
+                    let (table, custody, pid) =
+                        (table.clone(), custody.clone(), slot.pid.load(Acquire));
+                    std::thread::Builder::new()
+                        .name("varena-custody".into())
+                        .spawn(move || serve(server, pid, table, custody))
+                        .map_err(|e| io("start forked grant", e))?;
+                    platform::handles::send_fd(&stream, &client)
+                        .map_err(crate::os("send forked grant"))?;
                 }
                 _ => return Err(Error::Invalid("unknown custody command".into())),
             }
@@ -1464,6 +1621,26 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
 /// Executor half of a grant. Operations are serialized, with no background CUDA work.
 pub struct Channel(Mutex<UnixStream>);
 impl Channel {
+    /// A separate stream to the same service custody, including for adopted ledgers.
+    /// Background cache registration cannot occupy the GPU demand stream.
+    pub fn fork(&self, owner: Owner) -> Result<Self> {
+        let mut stream = self.0.lock();
+        Self::header(
+            &mut stream,
+            10,
+            owner,
+            PageKey {
+                fingerprint: [0; 32],
+                page: 0,
+            },
+            0,
+        )?;
+        let fd = platform::handles::recv_fd(&stream).map_err(crate::os("receive forked grant"))?;
+        drop(stream);
+        let channel = Self::new(fd);
+        channel.bind(owner)?;
+        Ok(channel)
+    }
     pub fn new(fd: OwnedFd) -> Self {
         Self(Mutex::new(UnixStream::from(fd)))
     }
@@ -1613,6 +1790,75 @@ impl Channel {
 }
 
 impl Channel {
+    /// Withdraw a closed model's interest. Existing reader FDs remain valid; an
+    /// unobserved cache stops warming and disappears from subsequent snapshots.
+    pub fn forget_ram(&self, owner: Owner, layout: [u8; 32], token: u64) -> Result<()> {
+        let mut stream = self.0.lock();
+        Self::header(
+            &mut stream,
+            9,
+            owner,
+            PageKey {
+                fingerprint: layout,
+                page: token,
+            },
+            0,
+        )?;
+        let mut ack = [0];
+        stream
+            .read_exact(&mut ack)
+            .map_err(|e| io("read RAM unsubscribe", e))?;
+        if ack != [1] {
+            return Err(Error::Invalid("invalid RAM unsubscribe".into()));
+        }
+        Ok(())
+    }
+    /// Snapshot only. Completion and eviction also wake subscribed owner rows.
+    pub fn ram_status(&self, owner: Owner, layout: [u8; 32]) -> Result<Option<RamStatus>> {
+        let mut stream = self.0.lock();
+        Self::header(
+            &mut stream,
+            8,
+            owner,
+            PageKey {
+                fingerprint: layout,
+                page: 0,
+            },
+            0,
+        )?;
+        let mut present = [0];
+        stream
+            .read_exact(&mut present)
+            .map_err(|e| io("read RAM status", e))?;
+        if present == [0] {
+            return Ok(None);
+        }
+        if present != [1] {
+            return Err(Error::Invalid("invalid RAM status".into()));
+        }
+        let generation = read_u64(&mut stream)?;
+        let mut filling = [0];
+        stream
+            .read_exact(&mut filling)
+            .map_err(|e| io("read RAM fill status", e))?;
+        let count = usize::try_from(read_u64(&mut stream)?)
+            .map_err(|_| Error::Invalid("RAM region count overflow".into()))?;
+        if count > MAX_RAM_ITEMS || filling[0] > 1 {
+            return Err(Error::Invalid("invalid RAM readiness".into()));
+        }
+        let mut ready = vec![0; count];
+        stream
+            .read_exact(&mut ready)
+            .map_err(|e| io("read RAM readiness", e))?;
+        if ready.iter().any(|value| *value > 1) {
+            return Err(Error::Invalid("invalid RAM ready flag".into()));
+        }
+        Ok(Some(RamStatus {
+            generation,
+            filling: filling[0] == 1,
+            ready: ready.into_iter().map(|v| v == 1).collect(),
+        }))
+    }
     pub fn release_orphan(&self, owner: Owner, key: PageKey) -> Result<bool> {
         let mut stream = self.0.lock();
         Self::header(&mut stream, 5, owner, key, 0)?;
@@ -1767,6 +2013,18 @@ impl Channel {
         files: &[(ObjectRef, OwnedFd)],
         regions: &[RamRegion],
     ) -> Result<bool> {
+        self.cache_ram_tagged(owner, layout, files, regions, 0)
+    }
+    /// A model-specific subscription prevents a closing registration from withdrawing
+    /// a newer model's interest in the same shared layout.
+    pub fn cache_ram_tagged(
+        &self,
+        owner: Owner,
+        layout: [u8; 32],
+        files: &[(ObjectRef, OwnedFd)],
+        regions: &[RamRegion],
+        token: u64,
+    ) -> Result<bool> {
         if files.len() > 4096 || regions.len() > MAX_RAM_ITEMS {
             return Err(Error::Invalid("RAM registration is too large".into()));
         }
@@ -1803,7 +2061,7 @@ impl Channel {
             owner,
             PageKey {
                 fingerprint: layout,
-                page: 0,
+                page: token,
             },
             files.len(),
         )?;

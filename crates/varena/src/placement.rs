@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
@@ -74,6 +74,30 @@ struct Model {
     pages: Vec<PageId>,
     fingerprint: [u8; 32],
     transform: Option<Arc<Transform>>,
+    source: Arc<Source>,
+    regions: Vec<ledger::RamRegion>,
+    ram: Arc<RamWarm>,
+}
+
+struct RamWarm {
+    token: u64,
+    pending: AtomicBool,
+    cancelled: AtomicBool,
+}
+impl RamWarm {
+    fn new() -> Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let token = NEXT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| invalid("RAM registration token exhausted"))?;
+        Ok(Self {
+            token,
+            pending: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+        })
+    }
 }
 
 struct Request {
@@ -109,7 +133,7 @@ pub struct Placement {
     gpu: Arc<Gpu>,
     ledger: Arc<Ledger>,
     row: Arc<ledger::Row>,
-    channel: Channel,
+    channel: Arc<Channel>,
     inner: Mutex<Inner>,
     operations: Mutex<()>,
     changed: Condvar,
@@ -132,7 +156,7 @@ impl Placement {
             }
         };
         let row = Arc::new(ledger.claim(std::process::id())?);
-        let channel = Channel::new(channel);
+        let channel = Arc::new(Channel::new(channel));
         channel.bind(row.owner())?;
         let owner = row.owner().row;
         let out = Arc::new(Self {
@@ -274,6 +298,9 @@ impl Placement {
     }
 
     pub fn load(&self, model: ModelId, level: Tier) -> Result<Relief> {
+        if level == Tier::Ram {
+            return self.warm_ram(model);
+        }
         self.drive(
             0,
             Trigger::Load {
@@ -282,6 +309,83 @@ impl Placement {
                 level,
             },
         )
+    }
+
+    /// Warming is a cache hint. Downloading and registration never delay admission or
+    /// hold the demand channel; a GPU miss continues through its verified disk source.
+    fn warm_ram(&self, model: ModelId) -> Result<Relief> {
+        let (fingerprint, source, regions, state) = {
+            let mut inner = self.inner.lock();
+            let data = inner
+                .models
+                .get(&model)
+                .ok_or_else(|| invalid("unknown model"))?;
+            let work = (
+                data.fingerprint,
+                data.source.clone(),
+                data.regions.clone(),
+                data.ram.clone(),
+            );
+            for page in inner
+                .table
+                .pages
+                .iter_mut()
+                .filter(|page| page.model == Some(model))
+            {
+                page.loaded = true;
+            }
+            work
+        };
+        if state.cancelled.load(Ordering::Acquire) || state.pending.swap(true, Ordering::AcqRel) {
+            return Ok(Relief::Complete);
+        }
+        let demand = self.channel.clone();
+        let row = self.row.clone();
+        let worker_state = state.clone();
+        let started = std::thread::Builder::new()
+            .name("varena-warm".into())
+            .spawn(move || {
+                let warm = || -> Result<()> {
+                    if worker_state.cancelled.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let items: Vec<_> = regions
+                        .iter()
+                        .flat_map(|region| region.items.iter().cloned())
+                        .collect();
+                    let files = source
+                        .export_files(&items)
+                        .map_err(|error| Error::Io(error.to_string()))?
+                        .into_iter()
+                        .map(|(object, file)| (object, file.into()))
+                        .collect::<Vec<_>>();
+                    if worker_state.cancelled.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let channel = demand.fork(row.owner())?;
+                    channel.cache_ram_tagged(
+                        row.owner(),
+                        fingerprint,
+                        &files,
+                        &regions,
+                        worker_state.token,
+                    )?;
+                    if worker_state.cancelled.load(Ordering::Acquire) {
+                        channel.forget_ram(row.owner(), fingerprint, worker_state.token)?;
+                    }
+                    Ok(())
+                };
+                if let Err(error) = warm() {
+                    tracing::warn!(%error, "RAM warming skipped; disk source remains available");
+                }
+                worker_state.pending.store(false, Ordering::Release);
+                let _ = row.wake();
+            });
+        if let Err(error) = started {
+            state.pending.store(false, Ordering::Release);
+            tracing::warn!(%error, "RAM warm worker unavailable; disk source remains available");
+        }
+        Ok(Relief::Complete)
     }
 
     pub fn register(
@@ -365,6 +469,17 @@ impl Placement {
                 pages: pages.clone(),
                 fingerprint,
                 transform,
+                source,
+                regions: layout
+                    .regions
+                    .iter()
+                    .map(|region| ledger::RamRegion {
+                        offset: region.offset,
+                        len: region.span,
+                        items: region.items.clone(),
+                    })
+                    .collect(),
+                ram: Arc::new(RamWarm::new()?),
             },
         );
         self.refresh()?;
@@ -1035,11 +1150,12 @@ impl Placement {
     }
 
     pub fn close_model(&self, id: ModelId) -> Result<()> {
-        let pages = {
+        let (pages, fingerprint, token) = {
             let mut inner = self.inner.lock();
             let Some(model) = inner.models.remove(&id) else {
                 return Ok(());
             };
+            model.ram.cancelled.store(true, Ordering::Release);
             inner.retired.extend(model.pages.iter().copied());
             for page in inner
                 .table
@@ -1050,8 +1166,10 @@ impl Placement {
                 page.loaded = false;
                 page.uses.clear();
             }
-            model.pages
+            (model.pages, model.fingerprint, model.ram.token)
         };
+        self.channel
+            .forget_ram(self.row.owner(), fingerprint, token)?;
         for page in pages {
             self.gpu.unregister(page)?;
         }
@@ -1138,7 +1256,41 @@ impl Placement {
         let facts = self.gpu.facts()?;
         let status = self.ledger.status()?;
         let orphans = self.channel.orphans(self.row.owner())?;
+        let models: Vec<_> = self
+            .inner
+            .lock()
+            .models
+            .iter()
+            .map(|(id, model)| (*id, model.fingerprint, model.ram.clone()))
+            .collect();
+        let ram = models
+            .into_iter()
+            .map(|(id, fingerprint, state)| {
+                self.channel
+                    .ram_status(self.row.owner(), fingerprint)
+                    .map(|status| (id, state, status))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut inner = self.inner.lock();
+        for (id, state, status) in ram {
+            let pages = match inner
+                .models
+                .get(&id)
+                .filter(|model| Arc::ptr_eq(&model.ram, &state))
+            {
+                Some(model) => model.pages.clone(),
+                None => continue,
+            };
+            for (index, id) in pages.into_iter().enumerate() {
+                if let Some(page) = inner.table.pages.iter_mut().find(|page| page.id == id) {
+                    page.ram_ready = status
+                        .as_ref()
+                        .and_then(|status| status.ready.get(index))
+                        .copied()
+                        .unwrap_or(false);
+                }
+            }
+        }
         inner.table.capacity = status.capacity;
         let present: BTreeSet<_> = facts.iter().map(|(id, _, _, _)| *id).collect();
         let finished: BTreeSet<_> = inner.retired.difference(&present).copied().collect();
@@ -1302,9 +1454,15 @@ impl Placement {
                         speculative,
                     } => {
                         if to == Tier::Ram {
-                            return Err(Error::Unsupported(
-                                "shared RAM source registration is unavailable".into(),
-                            ));
+                            let model = self
+                                .inner
+                                .lock()
+                                .table
+                                .page(page)
+                                .and_then(|page| page.model)
+                                .ok_or_else(|| invalid("RAM page model absent"))?;
+                            drop(operation);
+                            return self.warm_ram(model);
                         }
                         self.inner.lock().filling.insert(page);
                         let filling = Filling { owner: self, page };
