@@ -415,10 +415,7 @@ async fn read_into_decodes_an_encoded_tensor_only_when_asked() {
     let scratch = Scratch::new();
     let client = client(&scratch.0.join("cache"), &scratch.0.join("endpoint"));
     let mut writer = client.writer(WriterOptions::default()).unwrap();
-    let encoding = tensorfs::format::Encoding {
-        scheme: "fp8.tensorwise".into(),
-        params: [("scale_dtype".to_owned(), "F32".into())].into(),
-    };
+    let encoding = tensorfs::format::Encoding::fp8_tensorwise();
     let (mut weight, mut scale): (&[u8], &[u8]) = (&[0x38; 4], &2f32.to_le_bytes());
     let parts = vec![
         tensorfs::raw::PartData { role: "weight".into(), dtype: Dtype::F8_E4M3, shape: vec![4], data: &mut weight },

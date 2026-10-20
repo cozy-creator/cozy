@@ -146,8 +146,6 @@ struct Want {
 const NVFP4_MODELOPT: &str = r#"nvfp4 {block_size: 16, global_scale: "multiply", nibble_order: "low_first", scale_layout: "row_major"}"#;
 const NVFP4_CT: &str = r#"nvfp4 {block_size: 16, global_scale: "divide", nibble_order: "low_first", scale_layout: "row_major"}"#;
 const NVFP4_COMFY: &str = r#"nvfp4 {block_size: 16, global_scale: "multiply", nibble_order: "high_first", scale_layout: "cublas_128x4"}"#;
-const NVFP4_COMFY_AWQ: &str = r#"nvfp4 {block_size: 16, global_scale: "multiply", nibble_order: "high_first", pre_quant_scale_dtype: "BF16", scale_layout: "cublas_128x4"}"#;
-const NVFP4_MODELOPT_AWQ: &str = r#"nvfp4 {block_size: 16, global_scale: "multiply", nibble_order: "low_first", pre_quant_scale_dtype: "BF16", scale_layout: "row_major"}"#;
 const MXFP8_ROWS: &str = r#"mxfp8 {block_size: 32, scale_layout: "row_major"}"#;
 const MXFP8_TILES: &str = r#"mxfp8 {block_size: 32, scale_layout: "cublas_128x4"}"#;
 
@@ -348,7 +346,6 @@ fn modelopt_nvfp4_awq_keeps_pre_quant_scale() {
         nvfp4!("mlp.up_proj", 96, 64),
         nvfp4!("mlp.down_proj", 64, 96),
     ];
-    wants[3].encoding = NVFP4_MODELOPT_AWQ;
     wants[3].parts = &[
         ("weight", "F4", &[64, 64], "weight"),
         ("scale", "F8_E4M3", &[64, 4], "weight_scale"),
@@ -519,7 +516,7 @@ fn comfy_fp8_tensorwise_rowwise_and_legacy() {
         &[
             Want {
                 key: "attn.to_q.weight",
-                encoding: r#"fp8.tensorwise {scale_dtype: "F32"}"#,
+                encoding: r#"fp8.tensorwise {}"#,
                 parts: &[
                     ("weight", "F8_E4M3", &[32, 64], "weight"),
                     ("scale", "F32", &[], "weight_scale"),
@@ -530,7 +527,7 @@ fn comfy_fp8_tensorwise_rowwise_and_legacy() {
             },
             Want {
                 key: "attn.to_k.weight",
-                encoding: r#"fp8.rowwise {axis: 0, scale_dtype: "F32"}"#,
+                encoding: r#"fp8.rowwise {axis: 0}"#,
                 parts: &[
                     ("weight", "F8_E4M3", &[32, 64], "weight"),
                     ("scale", "F32", &[32, 1], "weight_scale"),
@@ -545,7 +542,7 @@ fn comfy_fp8_tensorwise_rowwise_and_legacy() {
         "comfy-scaled-fp8",
         &[Want {
             key: "attn.to_v.weight",
-            encoding: r#"fp8.tensorwise {scale_dtype: "F32"}"#,
+            encoding: r#"fp8.tensorwise {}"#,
             parts: &[
                 ("weight", "F8_E4M3", &[32, 64], "weight"),
                 ("scale", "F32", &[1], "scale_weight"),
@@ -567,7 +564,7 @@ fn comfy_int8_tensorwise_rowwise_and_convrot() {
         &[
             Want {
                 key: "ff.up.weight",
-                encoding: r#"int8.tensorwise {scale_dtype: "F32"}"#,
+                encoding: r#"int8.tensorwise {}"#,
                 parts: &[
                     ("weight", "I8", &[32, 64], "weight"),
                     ("scale", "F32", &[], "weight_scale"),
@@ -577,7 +574,7 @@ fn comfy_int8_tensorwise_rowwise_and_convrot() {
             },
             Want {
                 key: "ff.gate.weight",
-                encoding: r#"int8.rowwise {axis: 0, scale_dtype: "F32"}"#,
+                encoding: r#"int8.rowwise {axis: 0}"#,
                 parts: &[
                     ("weight", "I8", &[32, 64], "weight"),
                     ("scale", "F32", &[32, 1], "weight_scale"),
@@ -587,7 +584,7 @@ fn comfy_int8_tensorwise_rowwise_and_convrot() {
             },
             Want {
                 key: "ff.down.weight",
-                encoding: r#"int8.convrot {rotation: "kron_regular_h4", rotation_size: 64, scale_dtype: "F32"}"#,
+                encoding: r#"int8.convrot {rotation: "kron_regular_h4", rotation_size: 64}"#,
                 parts: &[
                     ("weight", "I8", &[16, 128], "weight"),
                     ("scale", "F32", &[16, 1], "weight_scale"),
@@ -710,7 +707,6 @@ fn every_carrier_names_a_complete_encoding() {
     use tensorfs::format::{GlobalScale::*, NibbleOrder::*, ScaleLayout::*};
     use tensorfs::import::carriers::{carriers, Producer};
     for c in carriers() {
-        let awq = |e: Encoding| e.with_pre_quant_scale(&Dtype::F32);
         if c.from_config {
             // The producer's config names the width: every width it may name is a scheme here.
             let widths: &[u32] = match c.producer {
@@ -725,17 +721,17 @@ fn every_carrier_names_a_complete_encoding() {
             continue;
         }
         let want = match (c.encoding.scheme.as_str(), c.producer) {
-            ("nvfp4", Producer::Modelopt) => awq(Encoding::nvfp4(Multiply, LowFirst, RowMajor)),
+            ("nvfp4", Producer::Modelopt) => Encoding::nvfp4(Multiply, LowFirst, RowMajor),
             ("nvfp4", Producer::CompressedTensors) => Encoding::nvfp4(Divide, LowFirst, RowMajor),
-            ("nvfp4", Producer::Comfy) => awq(Encoding::nvfp4(Multiply, HighFirst, Cublas128x4)),
+            ("nvfp4", Producer::Comfy) => Encoding::nvfp4(Multiply, HighFirst, Cublas128x4),
             ("mxfp8", Producer::Comfy) => Encoding::mxfp8(Cublas128x4),
             ("mxfp8", _) => Encoding::mxfp8(RowMajor),
-            ("fp8.tensorwise", _) => Encoding::fp8_tensorwise(&Dtype::F32),
-            ("fp8.rowwise", _) => Encoding::fp8_rowwise(0, &Dtype::F32),
-            ("int8.tensorwise", _) => Encoding::int8_tensorwise(&Dtype::F32),
-            ("int8.rowwise", _) => Encoding::int8_rowwise(0, &Dtype::F32),
-            ("int8.convrot", _) => Encoding::int8_convrot(256, &Dtype::F32),
-            ("fp8.blockwise", _) => Encoding::fp8_blockwise(128, 128, &Dtype::F32),
+            ("fp8.tensorwise", _) => Encoding::fp8_tensorwise(),
+            ("fp8.rowwise", _) => Encoding::fp8_rowwise(0),
+            ("int8.tensorwise", _) => Encoding::int8_tensorwise(),
+            ("int8.rowwise", _) => Encoding::int8_rowwise(0),
+            ("int8.convrot", _) => Encoding::int8_convrot(256),
+            ("fp8.blockwise", _) => Encoding::fp8_blockwise(128, 128),
             ("mxfp4", Producer::GptOss) => Encoding::mxfp4(true),
             ("mxfp4", _) => Encoding::mxfp4(false),
             ("comfy.asym_w4a8_int8", _) => Encoding::comfy_asym_w4a8_int8(16, 256),
@@ -749,9 +745,6 @@ fn every_carrier_names_a_complete_encoding() {
         }
         for (param, (_, default)) in &c.marker_params {
             encoding.params.insert(param.clone(), (*default).into());
-        }
-        for param in c.dtype_params.keys() {
-            encoding.params.insert(param.clone(), "F32".into());
         }
         assert_eq!(encoding, want, "{:?} {:?}", c.producer, c.formats);
     }
@@ -1135,13 +1128,13 @@ fn real_int_checkpoints_import_and_decode() {
         (
             "real-ct-int8-channel",
             "BF16",
-            r#"int8.rowwise {axis: 0, scale_dtype: "BF16"}"#,
+            r#"int8.rowwise {axis: 0}"#,
             0.02,
         ),
         (
             "real-ct-fp8-channel",
             "BF16",
-            r#"fp8.rowwise {axis: 0, scale_dtype: "BF16"}"#,
+            r#"fp8.rowwise {axis: 0}"#,
             0.03,
         ),
     ];
@@ -1288,7 +1281,7 @@ fn comfy_marker_params_are_read_or_refused() {
     };
     assert_eq!(
         encoding.to_string(),
-        r#"int8.convrot {rotation: "kron_regular_h4", rotation_size: 64, scale_dtype: "F32"}"#
+        r#"int8.convrot {rotation: "kron_regular_h4", rotation_size: 64}"#
     );
 }
 
@@ -1361,7 +1354,7 @@ fn real_bytes_from_comfyui_and_modelopt() {
     let Body::Encoded { encoding, parts } = &t.body else {
         panic!()
     };
-    assert_eq!(encoding.to_string(), NVFP4_COMFY_AWQ);
+    assert_eq!(encoding.to_string(), NVFP4_COMFY);
     let roles: Vec<&str> = parts.iter().map(|p| p.role.as_str()).collect();
     assert_eq!(roles, ["weight", "scale", "scale_2", "pre_quant_scale"]);
     let source = read_safetensors(&fixtures().join("real-comfy-nvfp4-awq.expect.safetensors"));
@@ -1397,9 +1390,7 @@ fn real_bytes_from_comfyui_and_modelopt() {
         })
         .collect();
     views.remove("pre_quant_scale");
-    let mut without = encoding.clone();
-    without.params.remove("pre_quant_scale_dtype");
-    let wrong = error(&bf16s(&decode(&t.dtype, &t.shape, &without, &views).unwrap()));
+    let wrong = error(&bf16s(&decode(&t.dtype, &t.shape, encoding, &views).unwrap()));
     assert!(wrong > 0.30, "without pre_quant_scale: {wrong}");
     // ModelOpt's post-processed export carries both declarations: refused until the rule that
     // reads it (xs-049) lands.

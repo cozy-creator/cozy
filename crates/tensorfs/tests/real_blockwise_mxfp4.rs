@@ -134,10 +134,7 @@ fn check(case: &str, wants: &[Want]) {
     let _ = fs::remove_dir_all(&dir);
 }
 
-const TILES_F16: &str = r#"fp8.blockwise {block_size: [128, 128], scale_dtype: "F16"}"#;
-const TILES_F32: &str = r#"fp8.blockwise {block_size: [128, 128], scale_dtype: "F32"}"#;
-const TILES_BF16: &str = r#"fp8.blockwise {block_size: [128, 128], scale_dtype: "BF16"}"#;
-const TILES_E8M0: &str = r#"fp8.blockwise {block_size: [128, 128], scale_dtype: "F8_E8M0"}"#;
+const TILES: &str = r#"fp8.blockwise {block_size: [128, 128]}"#;
 const MXFP4: &str = "mxfp4 {block_size: 32, transposed: false}";
 const MXFP4_TRANSPOSED: &str = "mxfp4 {block_size: 32, transposed: true}";
 
@@ -149,7 +146,7 @@ fn deepseek_dialect_fp8_tiles() {
         &[
             Want {
                 key: "model.layers.0.self_attn.q_proj.weight",
-                encoding: TILES_F16,
+                encoding: TILES,
                 parts: &[
                     (
                         "weight",
@@ -168,7 +165,7 @@ fn deepseek_dialect_fp8_tiles() {
             },
             Want {
                 key: "model.layers.0.mlp.down_proj.weight",
-                encoding: TILES_F16,
+                encoding: TILES,
                 parts: &[
                     (
                         "weight",
@@ -192,7 +189,7 @@ fn deepseek_dialect_fp8_tiles() {
         "real-deepseek-v3.1",
         &[Want {
             key: "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
-            encoding: TILES_F32,
+            encoding: TILES,
             parts: &[
                 (
                     "weight",
@@ -216,7 +213,7 @@ fn deepseek_dialect_fp8_tiles() {
         &[
             Want {
                 key: "layers.1.attn.wkv.weight",
-                encoding: TILES_E8M0,
+                encoding: TILES,
                 parts: &[
                     ("weight", "F8_E4M3", &[16, 256], "layers.1.attn.wkv.weight"),
                     ("scale", "F8_E8M0", &[1, 2], "layers.1.attn.wkv.scale"),
@@ -252,7 +249,7 @@ fn compressed_tensors_block_and_mxfp4() {
         "real-ct-fp8-block",
         &[Want {
             key: "model.layers.0.self_attn.q_proj.weight",
-            encoding: TILES_BF16,
+            encoding: TILES,
             parts: &[
                 (
                     "weight",

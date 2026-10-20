@@ -8,7 +8,7 @@ use std::path::Path;
 
 use base64::Engine;
 use serde::Deserialize;
-use tensorfs::format::encode::{quantize, Input};
+use tensorfs::format::encode::{quantize, quantize_fp8_blockwise, Input};
 use tensorfs::format::{decode, Dtype, Encoding, PartBytes};
 
 #[derive(Deserialize)]
@@ -66,7 +66,12 @@ fn encoders_reproduce_their_producers() {
                 encoding,
                 arrays: &arrays,
             };
-            let parts = quantize(&input).unwrap_or_else(|e| panic!("{}: {e}", c.key));
+            // fp8.blockwise's producer is the scale dtype's: the case's scale part names it.
+            let parts = match encoding.scheme.as_str() {
+                "fp8.blockwise" => quantize_fp8_blockwise(&input, &c.parts[1].dtype),
+                _ => quantize(&input),
+            };
+            let parts = parts.unwrap_or_else(|e| panic!("{}: {e}", c.key));
             assert_eq!(parts.len(), c.parts.len(), "{}", c.key);
             for (got, want) in parts.iter().zip(&c.parts) {
                 let what = format!("{} {}", c.key, want.role);
