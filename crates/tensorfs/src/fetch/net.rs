@@ -43,6 +43,12 @@ pub(crate) struct Answer {
     pub until: Option<Instant>,
 }
 
+/// Downloads may retry an exchange failure, but never a caller's credential callback.
+pub(crate) enum GetError {
+    Provider(Refusal),
+    Exchange(Refusal),
+}
+
 impl Answer {
     pub fn status(&self) -> u16 {
         self.response.status().as_u16()
@@ -180,7 +186,14 @@ impl Client {
 
     /// GET `url`, following redirects the policy allows, each hop checked again. Credentials
     /// go only to the origin they were given for: another origin gets only the `range`.
-    pub(crate) async fn get_authorized(&self, url: &str, headers: &[(String, String)], mut provider: Option<&dyn TokenProvider>) -> Result<Answer> {
+    pub(crate) async fn get_authorized(&self, url: &str, headers: &[(String, String)], provider: Option<&dyn TokenProvider>) -> Result<Answer> {
+        self.get_authorized_attempt(url, headers, provider).await.map_err(|error| match error {
+            GetError::Provider(refusal) | GetError::Exchange(refusal) => refusal,
+        })
+    }
+
+    /// Retain failure origin for the downloader's retry decision; import callers return both.
+    pub(crate) async fn get_authorized_attempt(&self, url: &str, headers: &[(String, String)], mut provider: Option<&dyn TokenProvider>) -> std::result::Result<Answer, GetError> {
         let mut url = url.to_string();
         let mut headers = headers.to_vec();
         let (mut hops, mut until) = (0, None::<Instant>);
@@ -188,14 +201,14 @@ impl Client {
         loop {
             let mut presented = headers.clone();
             if let Some(provider) = provider {
-                presented.extend(provider.headers(&Presented { method: "GET", url: &url, headers: &headers, payload: None }).await?);
+                presented.extend(provider.headers(&Presented { method: "GET", url: &url, headers: &headers, payload: None }).await.map_err(GetError::Provider)?);
             }
-            let response = self.send("GET", &url, &presented, None).await?.response;
+            let response = self.send("GET", &url, &presented, None).await.map_err(GetError::Exchange)?.response;
             let uri: Uri = url.parse().expect("sent");
             let status = response.status().as_u16();
             let sent = Presented { method: "GET", url: &url, headers: &presented, payload: None };
             let retry = match provider {
-                Some(provider) => provider.retry(&sent, status, response.headers())?,
+                Some(provider) => provider.retry(&sent, status, response.headers()).map_err(GetError::Provider)?,
                 None => false,
             };
             if retry && !challenged {
@@ -211,7 +224,7 @@ impl Client {
                     return refuse(
                         Code::REDIRECT_REFUSED,
                         format!("{url}: {status} without a Location"),
-                    );
+                    ).map_err(GetError::Exchange);
                 };
                 let next = join(&uri, next);
                 hops += 1;
@@ -222,7 +235,7 @@ impl Client {
                             "{url}: redirected to {next}, past the policy's {} hops",
                             self.policy.max_redirects
                         ),
-                    );
+                    ).map_err(GetError::Exchange);
                 }
                 if !same_origin(&url, &next) {
                     headers.retain(|(name, _)| name.eq_ignore_ascii_case("range"));
@@ -244,7 +257,7 @@ impl Client {
             {
                 if !encoding.trim().is_empty() && !encoding.trim().eq_ignore_ascii_case("identity")
                 {
-                    return refuse(Code::TRANSFER_FAILED, format!("{url}: the origin sent content-encoding {encoding:?} against `accept-encoding: identity`"));
+                    return refuse(Code::TRANSFER_FAILED, format!("{url}: the origin sent content-encoding {encoding:?} against `accept-encoding: identity`")).map_err(GetError::Exchange);
                 }
             }
             return Ok(Answer { url, response, until });

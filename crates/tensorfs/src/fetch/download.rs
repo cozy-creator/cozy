@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Notify, Semaphore};
 
-use super::net::{same_origin, Client};
+use super::net::{same_origin, Client, GetError};
 use super::origin::{HttpLocation, Location, Origin};
 use super::token::TokenProvider;
 use super::volume::{blocking, VolumeOrigin, Wrote, STEP};
@@ -909,12 +909,13 @@ impl Shared {
             ));
         }
         let answer = tokio::select! {
-            answer = self.client.get_authorized(url, &headers, provider) => answer,
+            answer = self.client.get_authorized_attempt(url, &headers, provider) => answer,
             () = flight.aborted() => return Shared::dropped(flight),
         };
         let mut answer = match answer {
             Ok(answer) => answer,
-            Err(refusal) => {
+            Err(GetError::Provider(refusal)) => return Attempt::Fatal(refusal),
+            Err(GetError::Exchange(refusal)) => {
                 if refusal.code == Code::FD_HEADROOM {
                     self.backoff();
                 }

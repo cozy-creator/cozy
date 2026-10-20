@@ -412,24 +412,20 @@ impl Endpoint {
             let authorized = match ask.auth {
                 true => self.watched(self.authorize(ask.method, ask.url, &ask.headers, ask.payload), &moved).await,
                 false => Ok(vec![]),
+            }?;
+            // A provider's failure is the caller's verdict, not failed network traffic.
+            headers.extend(authorized);
+            let body = match ask.body {
+                Some(make) => Some(match make()? {
+                    Payload::Bytes(bytes) => Body::Bytes(bytes),
+                    Payload::File(file) => {
+                        let length = file.metadata().map_err(|e| crate::err::classify_io(ask.url, e))?.len();
+                        Body::File { file, length, sent: Arc::clone(&moved) }
+                    }
+                }),
+                None => None,
             };
-            let outcome = match authorized {
-                Ok(auth) => {
-                    headers.extend(auth);
-                    let body = match ask.body {
-                        Some(make) => Some(match make()? {
-                            Payload::Bytes(bytes) => Body::Bytes(bytes),
-                            Payload::File(file) => {
-                                let length = file.metadata().map_err(|e| crate::err::classify_io(ask.url, e))?.len();
-                                Body::File { file, length, sent: Arc::clone(&moved) }
-                            }
-                        }),
-                        None => None,
-                    };
-                    self.watched(self.round_trip(ask.method, ask.url, &headers, body, &moved), &moved).await
-                }
-                Err(e) => Err(e),
-            };
+            let outcome = self.watched(self.round_trip(ask.method, ask.url, &headers, body, &moved), &moved).await;
             // Bytes that moved before a transport failure are progress; a "not now" is not.
             let progressed = outcome.is_err() && moved.load(Ordering::Relaxed) > 0;
             let (why, stated) = match outcome {
