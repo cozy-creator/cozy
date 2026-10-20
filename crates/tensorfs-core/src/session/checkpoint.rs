@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::File;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::failure::{fail, Kind, Result};
@@ -16,6 +16,8 @@ struct Data {
     named: Option<Ref>,
     tree: Option<ObjectRef>,
     remote: Option<Remote>,
+    store: Store,
+    local_repo: Option<PathBuf>,
     _extra: CacheGuard,
 }
 
@@ -36,9 +38,25 @@ impl fmt::Debug for Checkpoint {
 }
 
 impl Checkpoint {
-    pub(super) fn local(raw: Stored, source: Remote) -> Result<Self> {
+    pub(super) fn local(raw: Stored, source: Remote, path: &Path) -> Result<Self> {
+        let local_repo = if path.is_file() {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        } else {
+            path.to_path_buf()
+        };
         let store = source.store.clone();
-        Self::managed(raw, None, None, Some(source), Vec::new(), store)
+        let data = Data {
+            raw,
+            named: None,
+            tree: None,
+            remote: Some(source),
+            _extra: store.cache_hold(&[])?,
+            store,
+            local_repo: Some(local_repo),
+        };
+        Ok(Self::from_data(data))
     }
 
     pub(super) fn managed(
@@ -49,13 +67,19 @@ impl Checkpoint {
         extra: Vec<ObjectRef>,
         store: Store,
     ) -> Result<Self> {
-        let data = Arc::new(Data {
+        Ok(Self::from_data(Data {
             raw,
             named,
             tree,
             remote,
             _extra: store.cache_hold(&extra)?,
-        });
+            store,
+            local_repo: None,
+        }))
+    }
+
+    fn from_data(data: Data) -> Self {
+        let data = Arc::new(data);
         let components = data
             .raw
             .components()
@@ -66,7 +90,7 @@ impl Checkpoint {
             })
             .collect::<Vec<_>>()
             .into();
-        Ok(Self { data, components })
+        Self { data, components }
     }
 
     pub fn id(&self) -> &ObjectRef {
@@ -110,7 +134,7 @@ impl Checkpoint {
     }
 
     pub fn missing(&self, selection: &Selection) -> Result<Vec<ObjectRef>> {
-        super::selection::objects(&self.data.raw, selection)?
+        self.wanted(selection)?
             .into_iter()
             .filter_map(|object| match self.data.raw.holds(&object) {
                 Ok(true) => None,
@@ -121,7 +145,7 @@ impl Checkpoint {
     }
 
     pub async fn fetch(&self, want: &Fetch<'_>) -> Result<Fetched> {
-        let objects = super::selection::objects(&self.data.raw, &want.selection)?;
+        let objects = self.wanted(&want.selection)?;
         let total = objects.iter().map(|o| o.length).sum();
         let mut local = 0;
         let mut missing = Vec::new();
@@ -161,6 +185,54 @@ impl Checkpoint {
                 format!("{} is not present", missing[0].id()),
             ),
         }
+    }
+
+    fn wanted(&self, selection: &Selection) -> Result<Vec<ObjectRef>> {
+        let mut objects = super::selection::objects(&self.data.raw, selection)?;
+        if matches!(selection, Selection::All) {
+            if let Some(tree) = &self.data.tree {
+                objects.extend(
+                    self.data
+                        .store
+                        .tree(tree)?
+                        .repo_files()
+                        .map(|(_, object)| object.clone()),
+                );
+            }
+        }
+        Ok(objects
+            .into_iter()
+            .map(|o| (o.sha256.clone(), o))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect())
+    }
+
+    pub(super) fn export_to(
+        &self,
+        dir: &Path,
+        dequantize: Option<&format::Dtype>,
+    ) -> Result<Vec<String>> {
+        // This synchronous door never starts a runtime or hidden download. Fetch All first.
+        if let Some(missing) = self.missing(&Selection::All)?.first() {
+            return fail(
+                Kind::NotFound,
+                format!(
+                    "{} is not present; fetch it asynchronously first",
+                    missing.id()
+                ),
+            );
+        }
+        let mut repo = BTreeMap::new();
+        if let Some(tree) = &self.data.tree {
+            for (path, object) in self.data.store.tree(tree)?.repo_files() {
+                repo.insert(path.to_owned(), self.data.store.path(object)?);
+            }
+        } else if let Some(folder) = &self.data.local_repo {
+            local_repo_files(folder, folder, &mut repo)?;
+        }
+        self.data.store.cache_preserve_snapshot(dir)?;
+        crate::export::safetensors(&self.data.raw, &repo, dir, dequantize)
     }
 
     pub fn folder(&self) -> Result<PathBuf> {
@@ -308,4 +380,37 @@ impl Component {
     pub fn folder(&self) -> Result<PathBuf> {
         Ok(self.data.raw.component_path(&self.name)?)
     }
+}
+
+// A plain D10 folder stores repository files outside chunks/ and variant headers. Keep paths
+// until export, rather than admitting every payload during metadata-only Client::open.
+fn local_repo_files(root: &Path, folder: &Path, out: &mut BTreeMap<String, PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(folder).map_err(|e| super::io_failure(folder.display(), e))? {
+        let entry = entry.map_err(|e| super::io_failure(folder.display(), e))?;
+        if folder == root && entry.file_name() == format::CHUNKS_DIR {
+            continue;
+        }
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|e| super::io_failure(path.display(), e))?;
+        if kind.is_dir() {
+            local_repo_files(root, &path, out)?;
+        } else if kind.is_file() {
+            let name = path
+                .strip_prefix(root)
+                .expect("walk remains under its root")
+                .to_str()
+                .ok_or_else(|| crate::failure::Failure {
+                    kind: Kind::Invalid,
+                    detail: "repository paths must be UTF-8".into(),
+                })?
+                .replace('\\', "/");
+            format::check_file(&name)?;
+            if format::variant_of(&name).is_none() {
+                out.insert(name, path);
+            }
+        }
+    }
+    Ok(())
 }
