@@ -14,7 +14,7 @@ import time
 import traceback
 import weakref
 from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol, TypeAlias
@@ -394,10 +394,12 @@ class Model:
         for block in (self.common, *self.blocks):
             _unhook(block)
             _unbind(block)
-        if self.memory.native is not None:
-            self.memory.native.close_model(self.ws.id)
-        self.memory.models.pop(self.name, None)
-        self.memory.by_module.pop(self.module, None)
+        try:
+            if self.memory.native is not None:
+                self.memory.native.close_model(self.ws.id)
+        finally:
+            self.memory.models.pop(self.name, None)
+            self.memory.by_module.pop(self.module, None)
 
 
 class Hold:
@@ -488,11 +490,16 @@ class Request:
     steps: list[Step] = field(default_factory=list)
     declared: tuple[tuple[str, ...], ...] = ()
     stats: RequestStats | None = None
+    raw_plan: tuple[PlanStep, ...] = ()
     reads: dict[str, tuple[int, int, int]] = field(default_factory=dict)
     passes: dict[str, int] = field(default_factory=dict)
 
     def plan(self, steps: Sequence[PlanStep] | None) -> None:
-        names, models = self.memory._plan(steps or ())
+        self.raw_plan = tuple(
+            step if isinstance(step, (str, Model, nn.Module)) else tuple(step)
+            for step in (steps or ())
+        )
+        names, models = self.memory._plan(self.raw_plan)
         self.declared = names
         if self.memory.native is not None:
             self.memory.native.declare(self.native_id, models)
@@ -704,7 +711,7 @@ class Memory:
                 if len(matches) != 1:
                     raise Unbound(f"plan model {entry!r} is absent or ambiguous")
                 found.extend(matches)
-            names.append(tuple(sorted(model.name for model in found)))
+            names.append(tuple(sorted(model.component for model in found)))
             ids.append(
                 [model.ws.id for model in found] if self.native is not None else []
             )
@@ -721,7 +728,7 @@ class Memory:
             self._register(model)
             self.native.close_model(old)
             for request in self.active:
-                request.plan(request.declared)
+                request.plan(request.raw_plan)
 
     def _start(self, model: Model) -> None:
         with self.lock:
@@ -885,6 +892,10 @@ class Memory:
         }
         names, models = self._plan(plan or ())
         request.declared = names
+        request.raw_plan = tuple(
+            step if isinstance(step, (str, Model, nn.Module)) else tuple(step)
+            for step in (plan or ())
+        )
         if self.native is not None:
             self._measure()
             self.native.begin(request.native_id, models, package, shape)
@@ -991,12 +1002,13 @@ class Memory:
         return Exhausted(self.gpu, need, op, self.resident(), peaks)
 
     def close(self) -> None:
-        for model in list(self.models.values()):
-            model.close()
-        for cache in list(self.caches):
-            cache.close()
-        if self.native is not None:
-            self.native.close()
+        with ExitStack() as closing:
+            if self.native is not None:
+                closing.callback(self.native.close)
+            for model in list(self.models.values()):
+                closing.callback(model.close)
+            for cache in list(self.caches):
+                closing.callback(cache.close)
 
 
 def _declared(module: nn.Module) -> Declared:
@@ -1031,15 +1043,11 @@ def regions_of(module: nn.Module) -> list[list[str]]:
         )
     keys = None if grant.keys is None else set(grant.keys)
     prefix, paths = f"{grant.component}/", blocks_of(module)
-    runs: list[tuple[str | None, list[str]]] = []
+    regions: dict[str | None, list[str]] = {}
     for key in grant.ck.components[grant.component].tensors:
-        if keys is not None and key not in keys:
-            continue
-        home = _block_of(key, paths)
-        if not runs or runs[-1][0] != home:
-            runs.append((home, []))
-        runs[-1][1].append(prefix + key)
-    return [names for _, names in runs]
+        if keys is None or key in keys:
+            regions.setdefault(_block_of(key, paths), []).append(prefix + key)
+    return list(regions.values())
 
 
 def _layout(
