@@ -444,7 +444,6 @@ impl Placement {
             });
             let key = PageKey {
                 fingerprint,
-                ram_key: tensorfs::sha256::digest(layout.digest.as_bytes()),
                 page: index as u64,
             };
             let imported = self.channel.take(self.row.owner(), key)?;
@@ -471,6 +470,7 @@ impl Placement {
                 name,
                 pages: pages.clone(),
                 fingerprint,
+                ram_key: tensorfs::sha256::digest(layout.digest.as_bytes()),
                 transform,
                 source,
                 regions: layout
@@ -1786,11 +1786,17 @@ impl Placement {
             )
         };
         let apply = |pin| transform.as_ref().map_or(Ok(()), |fill| fill(page, pin));
-        let ram = self.channel.ram(self.row.owner(), ram_key, key.page)?;
+        let ram = self.channel.ram(self.row.owner(), ram_key, key.page)?
+            .and_then(|view| match Ram::map(view) {
+                Ok(mapped) => Some(mapped),
+                Err(error) => {
+                    tracing::warn!(%error, "RAM view unavailable; reading the verified disk source");
+                    None
+                }
+            });
         let actual = if ram.is_some() { Tier::Ram } else { Tier::Disk };
         let stats = if let Some(ram) = ram {
-            let mapped = Ram::map(ram)?;
-            self.gpu.fill_from_ram_with(page, mapped.bytes(), apply)?
+            self.gpu.fill_from_ram_with(page, ram.bytes(), apply)?
         } else {
             self.gpu.fill_with(page, apply)?
         };
