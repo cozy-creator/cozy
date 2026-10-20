@@ -177,8 +177,8 @@ def ffn_cut() -> None:
 
 
 def relax() -> None:
-    """Planning relaxes a cut (`cuts.coarser`): twice its size a step, back to whole, its peak
-    to be measured again; then nothing is left to relax."""
+    """Planning relaxes a cut (`cuts.coarser`): never run uncut, twice its size a step needing
+    twice its peak, back to whole; run uncut before, whole at once needing that peak."""
     torch.manual_seed(0)
     x = torch.randn(2, 300, 64)
     ff = FeedForward(64, mult=4, activation_fn="gelu").eval()
@@ -190,13 +190,21 @@ def relax() -> None:
     with card, torch.no_grad():
         out = cuts.run(s, ff, (x,), {})
     cut = {k: v for k, v in memo.sizes.items() if k[0] == "ffn"}
-    shape.peak, steps = 1, 0
-    while cuts.coarser(shape):
+    needs, steps = [cuts.relaxing(shape, 10)], 0
+    while needs[-1] is not None:
+        cuts.coarser(shape)
         steps += 1
+        needs.append(cuts.relaxing(shape, 10))
     relaxed = all(memo.sizes[k] >= shape.scopes[k][0] for k in cut)  # each scope's whole
     check("a cut relaxes back to whole", same(out, whole) and cut and relaxed, (cut, memo.sizes))
-    doubled = all(memo.sizes[k] <= 2 * v for k, v in cut.items())
-    check("relaxing doubles at most; the peak waits", steps and doubled and shape.peak == -1, steps)
+    doubled = all(memo.sizes[k] <= 2 * v for k, v in cut.items()) and needs[0] == 20
+    check("never uncut, a step doubles at most, needing twice the peak", steps and doubled, needs)
+    cuts.peaked(s.track, 7)  # a pass ran uncut: its peak is the shape's whole
+    memo.sizes.update(cut)
+    need = cuts.relaxing(shape, 3)
+    cuts.coarser(shape)
+    at_once = all(memo.sizes[k] >= shape.scopes[k][0] for k in cut) and shape.peak == -1
+    check("run uncut before, it relaxes whole at once, needing that peak", need == 7 and at_once)
     seen = weakref.ref(x)
     del x
     gc.collect()

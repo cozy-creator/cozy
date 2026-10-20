@@ -751,9 +751,9 @@ class Memory:
         home if it fits beside its reserve and the idle bytes and cold weights worth less, else a
         spread set; one run once takes only free room. Unmeasured, a repeating model stays at
         home and one run once keeps only what is resident. Within a request it never rises.
-        Planning never cuts: cuts in force relax a step (`cuts.coarser`) whenever twice the
-        measured peak still leaves the model two streaming slots, since a step at most doubles
-        it. Measured, the pass's working set gets its room before it runs, not from its OOM."""
+        Planning never cuts: cuts in force relax (`cuts.coarser`) whenever the peak the relaxed
+        pass needs (its peak measured uncut, else twice the cut one) still leaves the model two
+        streaming slots. Measured, the pass's working set gets its room before it runs, not from its OOM."""
         repeating = model.repeats >= 2
         if not model.blocks or (model.reserve < 0 and repeating):
             return
@@ -763,13 +763,15 @@ class Memory:
             spare = self.core.stats()  # type: ignore[union-attr]
             room = self.available() + spare.idle + spare.slot_bytes
             room += _set(model)[0] - model.common.nbytes
-            if repeating:  # and what other processes give back on an ask
+            if repeating:  # and what idle tenants give back on an ask
                 keep = self._keep(model)
                 cold = (m for m in self.models.values() if self._victim(m))
                 room += sum(_set(m)[0] for m in cold if self._keep(m) < keep) + self._others()
             sizes = _sizes(model)
-            if room - 2 * model.reserve >= 2 * max(sizes) and cuts.coarser(model.track.shape):
-                model.reserve *= 2
+            need = cuts.relaxing(model.track.shape, model.reserve)
+            if need is not None and room - need >= 2 * max(sizes):
+                cuts.coarser(model.track.shape)  # type: ignore[arg-type]
+                model.reserve = need
             room -= model.reserve
             fits = sum(sizes) <= room
             want = set(model.order if fits else _spread(model.order, sizes, room - 2 * max(sizes)))
@@ -994,12 +996,13 @@ class Memory:
         return max(self._free() - before, 0)
 
     def _others(self) -> int:
-        """What other live rows can give on an ask (§5.6: their cold weights, slack, caches)."""
+        """What idle tenants can give on an ask (§5.6: their cold weights, slack, caches): rows
+        running nothing, so planning never counts on another request's pages."""
         if self.row is None:
             return 0
         table, row = self.row
-        live = (f for f in table.snapshot() if f.state == "live" and f.slot != row.id)
-        return sum(f.reclaimable for f in live)
+        idle = (f for f in table.snapshot() if f.state == "live" and f.slot != row.id)
+        return sum(f.reclaimable for f in idle if not f.running)
 
     def _landed(self, model: Model) -> None:
         """Demand outranks a prefetch: copies still landing hold pages no eviction may take, so
