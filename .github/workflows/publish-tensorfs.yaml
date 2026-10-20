@@ -218,6 +218,8 @@ jobs:
   # wheel (cp310 or abi3) from both of the platform's.
   install:
     needs: wheel
+    # A failed platform fails its own entries, not the others.
+    if: ${{ !cancelled() }}
     name: install ${{ matrix.wheel }} py${{ matrix.python }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -265,6 +267,8 @@ jobs:
   # real models; scripts/docs_examples.py says how `me/model` resolves.
   docs:
     needs: wheel
+    # A failed platform fails its own entries, not the others.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
