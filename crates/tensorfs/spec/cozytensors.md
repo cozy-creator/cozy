@@ -8,11 +8,11 @@ without TensorFS, Cozy or Tensorhub. Library APIs, cache policy and GPU executio
 
 cozytensors/1 describes model weights as immutable, content-addressed objects. One **header** describes one model
 variant: its pipeline, components, plain or encoded tensors, and the chunks and assets those components use.
-A **tree** groups variant headers with shared repository files such as README and LICENSE. A **repo** document
-is the mutable index of releases and unreleased trees.
+A **tree** groups variant headers with shared repository files such as README and LICENSE; it is a repo's commit. A
+**repo** document is the mutable list of tags naming commits: public tags are releases, private ones the owner's.
 
 ```text
-repo -> release or unreleased tree -> variant header -> tensor chunks and component assets
+repo -> tag -> commit (tree) -> variant header -> tensor chunks and component assets
                                   -> shared repository files
 ```
 
@@ -631,27 +631,37 @@ or source-tree layout.
 
 ```
 {format: "cozytensors.repo/1", name: "<org>/<name>",
- releases: [{version, tree: object-ref, yanked?}], checkpoints?: [object-ref]}
+ tags: [{name, commit: object-ref, public?, yanked?}]}
 ```
 
-- `name` is two segments. Versions MUST be non-empty and unique. Each release names a tree (§3); its variants are
-  the tree's files. Releases are listed in publication order, newest last.
-- `yanked` (boolean, default `false`) withdraws a release from unversioned lookups. A release carries no edit
-  counter: a writer conditions a change on the whole document it read (its ETag, [distribution.md](distribution.md)
-  §4).
-- `checkpoints` (default empty) lists trees uploaded but not yet in any release.
-- **Resolution.** An unversioned lookup takes the newest release that is not yanked; an explicit version takes that
-  release, yanked or not (a reader MAY warn). The variant is then looked up in that release's tree. Without an
-  explicit variant, exactly one variant is selected automatically; zero gives no variant and more than one
-  requires an explicit choice. The unnamed variant has no implicit priority over other variants.
-- **Roots.** Every release's tree, yanked included, and every checkpoint are referenced roots of this repo document.
-  Keeping a complete copy of the repo requires keeping their closures. Local cache eviction policy is not part
-  of the document format.
+A repo is a set of **commits** and the **tags** that point at them, as in git:
+
+- A **commit** is an immutable repo state: a tree (§3). Its id is the tree's object ref. Every upload makes one.
+- A **tag** is a movable name for a commit. `tags` lists them in creation order: moving a tag keeps its place, a new
+  one is appended, a deleted one is removed. Names MUST be unique segments (§2) that do not start with `sha256:`.
+- `public` (boolean, default `false`): a public tag is a release, and its name MUST be a version (PEP 440). A private
+  tag is the owner's: a server serves it only to readers who may write the repo (distribution.md §4).
+- `yanked` (boolean, default `false`) withdraws a tag from unversioned lookups.
+- Any change is a new document: a writer conditions it on the whole document it read (its ETag, distribution.md §4).
+  Nothing in it counts edits.
+- **Resolution** of a `revision`, once, to a commit:
+  - none: the public, non-yanked tag with the highest version (PEP 440 ordering);
+  - `sha256:<hex>`: the tag commit with that digest; else a variant header with that digest, at the commit that cites
+    it (the default's if it does, else the last-created tag's whose commit does); else not found;
+  - otherwise the tag of that name, yanked or not (a reader MAY warn); else not found.
+
+  The variant is then looked up in that commit's tree. Without an explicit variant, exactly one variant is selected
+  automatically; zero gives no variant and more than one requires an explicit choice. The unnamed variant has no
+  implicit priority over other variants. Only a header digest is a pin: a tag moves, and a commit no tag names is
+  collected.
+- **Roots.** The tags' commits, yanked or private included, are this repo's referenced roots; nothing else is. Keeping
+  a complete copy of the repo requires keeping their closures. Local cache eviction policy is not part of the
+  document format.
 - Repo names are case-insensitive: `Acme/SDXL` and `acme/sdxl` are one repo. Keys and paths use the name with ASCII
   `A`–`Z` lowered (`refs/acme/sdxl.json`); the document's `name` keeps the writer's spelling.
 - A **store** or **static origin** is a directory, bucket or HTTP prefix holding `refs/<org>/<name>.json` and
-  `blobs/…` (§1). A reader resolves name → release → tree → variant header → chunks and assets, verifying every object
-  where it enters.
+  `blobs/…` (§1). A reader resolves name → tag → commit (tree) → variant header → chunks and assets, verifying every
+  object where it enters.
 - Reading and publishing at an endpoint over HTTP, S3 or a directory: [distribution.md](distribution.md).
 
 **Closure.** A cozytensors' closure is its header's closure (§4): the header and every object it cites, its `chunks`
@@ -709,7 +719,7 @@ wrong JSON type. Whitespace between tokens is allowed. A writer MUST produce the
 - strings with `"` and `\` escaped as `\"` and `\\`, the controls U+0008, U+0009, U+000A, U+000C and U+000D as `\b`,
   `\t`, `\n`, `\f`, `\r`, other controls below U+0020 as `\u00XX` (lowercase hex), and every other character as its
   UTF-8 bytes (Python: `json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`);
-- optional fields at their default omitted: empty `checkpoints`, `yanked: false`.
+- optional fields at their default omitted: `public: false`, `yanked: false`; `tags` is always written.
 
 ## 10. Chunks (informative)
 
