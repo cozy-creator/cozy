@@ -1,15 +1,16 @@
 //! The header's bytes (spec §9, `conformance/schema/header.cddl`): RFC 8949 core deterministic
 //! CBOR, read strictly. Allowed: unsigned and negative integers, byte and text strings, arrays,
-//! maps with text keys, `true`, `false`; every head in its shortest form, definite lengths
-//! only, map keys in bytewise order of their encodings. A header has one encoding, so decoding
-//! and re-encoding reproduces its bytes. A reader skips, still strictly, any elements after the
-//! fields it knows at the end of the root and of every record: later versions append fields.
+//! maps with text keys, `true`, `false`, and inside configs only finite floats (in their
+//! shortest exact form) and `null`; every head in its shortest form, definite lengths only, map keys in
+//! bytewise order of their encodings. A header has one encoding, so decoding and re-encoding
+//! reproduces its bytes. A reader skips, still strictly, any elements after the fields it knows
+//! at the end of the root and of every record: later versions append fields.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use super::{
-    Body, Component, Dtype, Encoding, Error, HEADER_FORMAT, Header, Location, Metadata, ObjectRef,
-    Part, Result, Tensor, Value, check_format, invalid,
+    check_format, invalid, Body, Component, ConfigValue, Dtype, Encoding, Error, Header, Location,
+    Metadata, ObjectRef, Part, Pipeline, Result, Tensor, Value, CONFIG_FILE, HEADER_FORMAT,
 };
 
 /// The deepest nesting a value may use.
@@ -24,6 +25,7 @@ const MAP: u8 = 5;
 const SIMPLE: u8 = 7;
 const FALSE: u8 = 0xf4;
 const TRUE: u8 = 0xf5;
+const NULL: u8 = 0xf6;
 
 struct Writer(Vec<u8>);
 
@@ -67,68 +69,135 @@ impl Writer {
         self.uint(at.offset);
         self.uint(at.length);
     }
+    fn object(&mut self, r: &ObjectRef) {
+        self.array(2);
+        self.head(BYTES, 32);
+        let hex = r.sha256.as_bytes();
+        self.0.extend(hex.chunks(2).map(|d| nibble(d[0]) << 4 | nibble(d[1])));
+        self.uint(r.length);
+    }
+    fn int(&mut self, i: i128) -> Result<()> {
+        match (u64::try_from(i), i64::try_from(i)) {
+            (Ok(n), _) => self.uint(n),
+            (_, Ok(n)) => self.head(NINT, !(n as u64)),
+            _ => return invalid(format!("{i} is outside [-2^63, 2^64)")),
+        }
+        Ok(())
+    }
     fn value(&mut self, v: &Value) -> Result<()> {
         match v {
             Value::Bool(b) => self.0.push(if *b { TRUE } else { FALSE }),
-            Value::Int(i) => match (u64::try_from(*i), i64::try_from(*i)) {
-                (Ok(n), _) => self.uint(n),
-                (_, Ok(n)) => self.head(NINT, !(n as u64)),
-                _ => return invalid(format!("{i} is outside [-2^63, 2^64)")),
-            },
+            Value::Int(i) => self.int(*i)?,
             Value::Str(s) => self.text(s),
             Value::List(items) => {
                 self.array(items.len());
                 items.iter().try_for_each(|item| self.value(item))?;
             }
-            Value::Map(map) => self.map(map)?,
+            Value::Map(map) => self.map(map, Writer::value)?,
         }
         Ok(())
     }
+    fn config(&mut self, v: &ConfigValue) -> Result<()> {
+        match v {
+            ConfigValue::Null => self.0.push(NULL),
+            ConfigValue::Bool(b) => self.0.push(if *b { TRUE } else { FALSE }),
+            ConfigValue::Number(n) => match (n.as_u64(), n.as_i64(), n.as_f64()) {
+                (Some(u), _, _) => self.uint(u),
+                (_, Some(i), _) => self.int(i.into())?,
+                (_, _, Some(f)) => self.float(f),
+                _ => return invalid(format!("config number {n}")),
+            },
+            ConfigValue::String(s) => self.text(s),
+            ConfigValue::Array(items) => {
+                self.array(items.len());
+                items.iter().try_for_each(|item| self.config(item))?;
+            }
+            ConfigValue::Object(map) => self.map(map, Writer::config)?,
+        }
+        Ok(())
+    }
+    /// The shortest of half, single and double that holds a finite `f` exactly.
+    fn float(&mut self, f: f64) {
+        if let Some(h) = half(f) {
+            self.0.push(0xf9);
+            self.0.extend(h.to_be_bytes());
+        } else if f as f32 as f64 == f {
+            self.0.push(0xfa);
+            self.0.extend((f as f32).to_bits().to_be_bytes());
+        } else {
+            self.0.push(0xfb);
+            self.0.extend(f.to_bits().to_be_bytes());
+        }
+    }
     /// Text keys in bytewise order of their encodings: shorter first, then by bytes.
-    fn map(&mut self, map: &BTreeMap<String, Value>) -> Result<()> {
-        let mut keys: Vec<&String> = map.keys().collect();
-        keys.sort_by(|a, b| (a.len(), a.as_bytes()).cmp(&(b.len(), b.as_bytes())));
-        self.head(MAP, keys.len() as u64);
-        for k in keys {
+    fn map<'m, V: 'm>(
+        &mut self,
+        map: impl IntoIterator<Item = (&'m String, &'m V)>,
+        mut item: impl FnMut(&mut Self, &V) -> Result<()>,
+    ) -> Result<()> {
+        let mut entries: Vec<(&String, &V)> = map.into_iter().collect();
+        entries.sort_by(|a, b| (a.0.len(), a.0.as_bytes()).cmp(&(b.0.len(), b.0.as_bytes())));
+        self.head(MAP, entries.len() as u64);
+        for (k, v) in entries {
             self.text(k);
-            self.value(&map[k])?;
+            item(self, v)?;
         }
         Ok(())
     }
 }
 
+/// A finite `f` as an IEEE half, when that is exact.
+fn half(f: f64) -> Option<u16> {
+    let sign = if f.is_sign_negative() { 0x8000 } else { 0 };
+    let a = f.abs();
+    let e = (a.to_bits() >> 52) as i32 - 1023;
+    let (bits, m) = match e {
+        16.. => return None,
+        -14..=15 => (((e + 15) as u16) << 10, a * 2f64.powi(10 - e) - 1024.0),
+        _ => (0, a * 2f64.powi(24)),
+    };
+    (m.fract() == 0.0 && m < 1024.0).then_some(sign | bits | m as u16)
+}
+
+/// An IEEE half's value; NaN for an infinity or NaN.
+fn from_half(h: u16) -> f64 {
+    let (e, m) = (i32::from(h >> 10 & 31), f64::from(h & 1023));
+    let a = match e {
+        0 => m * 2f64.powi(-24),
+        31 => f64::NAN,
+        _ => (1024.0 + m) * 2f64.powi(e - 25),
+    };
+    if h >> 15 == 1 { -a } else { a }
+}
+
 pub(crate) fn write(h: &Header) -> Result<Vec<u8>> {
-    let mut encodings: Vec<&Encoding> = Vec::new();
-    let mut index: HashMap<&Encoding, u64> = HashMap::new();
-    for (_, t) in h.tensors() {
-        if let Body::Encoded { encoding, .. } = &t.body {
-            index.entry(encoding).or_insert_with(|| {
-                encodings.push(encoding);
-                encodings.len() as u64
-            });
-        }
-    }
+    let encodings = h.encodings();
+    let index = |e: &Encoding| encodings.iter().position(|x| *x == e).unwrap() as u64 + 1;
     let mut w = Writer(Vec::with_capacity(256 * 1024));
-    w.array(5);
+    w.array(6);
     w.text(HEADER_FORMAT);
     w.array(h.chunks.len());
-    for c in &h.chunks {
-        w.array(2);
-        w.head(BYTES, 32);
-        let hex = c.sha256.as_bytes();
-        w.0.extend(hex.chunks(2).map(|d| nibble(d[0]) << 4 | nibble(d[1])));
-        w.uint(c.length);
-    }
+    h.chunks.iter().for_each(|c| w.object(c));
     w.array(encodings.len());
     for e in &encodings {
         w.array(2);
         w.text(&e.scheme);
-        w.map(&e.params)?;
+        w.map(&e.params, Writer::value)?;
+    }
+    match h.pipeline() {
+        None => w.array(0),
+        Some(p) => {
+            w.array(2);
+            w.text(&p.class);
+            w.map(&p.config, Writer::config)?;
+        }
     }
     w.array(h.components().len());
     for c in h.components() {
-        w.array(2);
+        w.array(5 + c.config_file.is_some() as usize);
         w.text(&c.name);
+        w.text(&c.class);
+        w.map(&c.config, Writer::config)?;
         w.array(c.tensors.len());
         for t in &c.tensors {
             w.array(5);
@@ -141,7 +210,7 @@ pub(crate) fn write(h: &Header) -> Result<Vec<u8>> {
                     w.location(at);
                 }
                 Body::Encoded { encoding, parts } => {
-                    w.uint(index[encoding]);
+                    w.uint(index(encoding));
                     w.array(parts.len());
                     for p in parts {
                         w.array(4);
@@ -153,8 +222,12 @@ pub(crate) fn write(h: &Header) -> Result<Vec<u8>> {
                 }
             }
         }
+        w.map(&c.assets, |w, r| { w.object(r); Ok(()) })?;
+        if let Some(file) = &c.config_file {
+            w.text(file);
+        }
     }
-    w.map(&h.metadata)?;
+    w.map(&h.metadata, Writer::value)?;
     Ok(w.0)
 }
 
@@ -197,9 +270,9 @@ impl<'a> Reader<'a> {
         let (major, info) = (first >> 5, first & 31);
         match first {
             FALSE | TRUE => return Ok((SIMPLE, (first == TRUE) as u64)),
-            0xf6 => return invalid(format!("null at byte {at}")),
+            NULL => return invalid(format!("null outside a config at byte {at}")),
             0xf7 => return invalid(format!("undefined at byte {at}")),
-            0xf9..=0xfb => return invalid(format!("a float at byte {at}")),
+            0xf9..=0xfb => return invalid(format!("a float outside a config at byte {at}")),
             _ if major == SIMPLE => {
                 return invalid(format!("simple value {first:#x} at byte {at}"));
             }
@@ -296,6 +369,17 @@ impl<'a> Reader<'a> {
             name => Ok(Dtype::parse(name)),
         }
     }
+    fn object(&mut self, what: &str) -> Result<ObjectRef> {
+        let fields = self.record(2, what)?;
+        let sha = self.expect(BYTES, what)?;
+        if sha != 32 {
+            return invalid(format!("{what}: its sha256 is {sha} bytes"));
+        }
+        let sha256 = hex(self.take(32)?);
+        let length = self.uint(what)?;
+        self.skip(fields, 2)?;
+        Ok(ObjectRef { sha256, length })
+    }
     fn location(&mut self) -> Result<Location> {
         let more = self.record(3, "a location")?;
         let at = Location {
@@ -328,15 +412,74 @@ impl<'a> Reader<'a> {
             ),
             MAP => {
                 self.at = at;
-                Value::Map(self.map(depth)?)
+                Value::Map(self.map(depth, Reader::value)?)
             }
             SIMPLE => Value::Bool(n == 1),
             _ => return invalid(format!("a byte string value at byte {at}")),
         })
     }
 
+    /// A config value: a value, or a finite float in its shortest exact form, or null.
+    fn config(&mut self, depth: usize) -> Result<ConfigValue> {
+        if depth > DEPTH {
+            return invalid("values nested too deep");
+        }
+        let at = self.at;
+        match self.b.get(at).copied() {
+            Some(NULL) => {
+                self.at += 1;
+                return Ok(ConfigValue::Null);
+            }
+            Some(first @ 0xf9..=0xfb) => {
+                let bits = self.take(1 + (1usize << (first - 0xf8)))?[1..]
+                    .iter()
+                    .fold(0u64, |a, b| a << 8 | *b as u64);
+                let f = match first {
+                    0xf9 => from_half(bits as u16),
+                    0xfa => f32::from_bits(bits as u32) as f64,
+                    _ => f64::from_bits(bits),
+                };
+                let Some(n) = serde_json::Number::from_f64(f) else {
+                    return invalid(format!("a float that is not finite at byte {at}"));
+                };
+                let mut shortest = Writer(Vec::with_capacity(9));
+                shortest.float(f);
+                if shortest.0 != self.b[at..self.at] {
+                    return invalid(format!("a float not in its shortest form at byte {at}"));
+                }
+                return Ok(ConfigValue::Number(n));
+            }
+            _ => {}
+        }
+        let (major, n) = self.head()?;
+        Ok(match major {
+            UINT => ConfigValue::from(n),
+            NINT if n <= i64::MAX as u64 => ConfigValue::from(-1 - n as i64),
+            NINT => return invalid(format!("an integer below -2^63 at byte {at}")),
+            TEXT => {
+                self.at = at;
+                ConfigValue::from(self.text("a string")?)
+            }
+            ARRAY => ConfigValue::Array(
+                (0..n)
+                    .map(|_| self.config(depth + 1))
+                    .collect::<Result<_>>()?,
+            ),
+            MAP => {
+                self.at = at;
+                ConfigValue::Object(self.map(depth, Reader::config)?.into_iter().collect())
+            }
+            SIMPLE => ConfigValue::Bool(n == 1),
+            _ => return invalid(format!("a byte string value at byte {at}")),
+        })
+    }
+
     /// A map with text keys in bytewise order of their encodings, none repeated.
-    fn map(&mut self, depth: usize) -> Result<BTreeMap<String, Value>> {
+    fn map<T>(
+        &mut self,
+        depth: usize,
+        mut item: impl FnMut(&mut Self, usize) -> Result<T>,
+    ) -> Result<BTreeMap<String, T>> {
         let n = self.expect(MAP, "a map")?;
         let mut out = BTreeMap::new();
         let mut previous: &[u8] = &[];
@@ -348,7 +491,7 @@ impl<'a> Reader<'a> {
                 return invalid(format!("map key {key:?} is out of order or repeated"));
             }
             previous = encoded;
-            out.insert(key.to_owned(), self.value(depth + 1)?);
+            out.insert(key.to_owned(), item(self, depth + 1)?);
         }
         Ok(out)
     }
@@ -367,40 +510,32 @@ pub(crate) fn read(bytes: &[u8]) -> Result<Header> {
     parse(bytes).map_err(|e| if pre_cut(bytes) { Error::PreCut } else { e })
 }
 
-/// A header from before the cut: the JSON layout, or the first CBOR layout, a well-formed root
-/// of exactly five elements whose last is the components array where this one has the metadata
-/// map.
+/// A header from before the cut: the JSON layout, or a CBOR layout without a pipeline, a
+/// well-formed `cozytensors/1` root of exactly five elements.
 fn pre_cut(bytes: &[u8]) -> bool {
     let mut r = Reader { b: bytes, at: 0 };
     let mut old = || -> Result<bool> {
         if r.record(5, "the header")? > 0 {
             return Ok(false);
         }
-        r.text("format")?;
-        r.skip(3, 1)?;
-        let (major, n) = r.head()?;
-        r.skip(n, 1)?;
-        Ok(major == ARRAY && r.at == bytes.len())
+        check_format(r.text("format")?, HEADER_FORMAT)?;
+        r.skip(4, 1)?;
+        Ok(r.at == bytes.len())
     };
     bytes.first() == Some(&b'{') || old().unwrap_or(false)
 }
 
 fn parse(bytes: &[u8]) -> Result<Header> {
     let mut r = Reader { b: bytes, at: 0 };
-    let more = r.record(5, "the header")?;
+    let fields = r.list("the header")?;
     check_format(r.text("format")?, HEADER_FORMAT)?;
+    let Some(more) = fields.checked_sub(6) else {
+        return invalid(format!("the header: {fields} fields, not at least 6"));
+    };
     let n = r.list("chunks")?;
     let mut chunks = Vec::with_capacity(room(n));
     for _ in 0..n {
-        let fields = r.record(2, "a chunk")?;
-        let sha = r.expect(BYTES, "a chunk's sha256")?;
-        if sha != 32 {
-            return invalid(format!("a chunk's sha256 is {sha} bytes"));
-        }
-        let sha256 = hex(r.take(32)?);
-        let length = r.uint("a chunk's length")?;
-        r.skip(fields, 2)?;
-        chunks.push(ObjectRef { sha256, length });
+        chunks.push(r.object("a chunk")?);
     }
     let mut encodings = Vec::new();
     let mut seen = HashSet::new();
@@ -408,7 +543,7 @@ fn parse(bytes: &[u8]) -> Result<Header> {
         let fields = r.record(2, "an encoding")?;
         let start = r.at;
         let scheme = r.text("a scheme")?.to_owned();
-        let params = r.map(1)?;
+        let params = r.map(1, Reader::value)?;
         let identity = &bytes[start..r.at];
         r.skip(fields, 2)?;
         if scheme.is_empty() || !seen.insert(identity) {
@@ -416,19 +551,48 @@ fn parse(bytes: &[u8]) -> Result<Header> {
         }
         encodings.push(Encoding { scheme, params });
     }
+    let pipeline = match r.list("the pipeline")? {
+        0 => None,
+        1 => return invalid("the pipeline: 1 field, not 0 or at least 2"),
+        n => {
+            let class = r.text("the pipeline's class")?.to_owned();
+            let config = r.map(1, Reader::config)?.into_iter().collect();
+            r.skip(n - 2, 2)?;
+            Some(Pipeline { class, config })
+        }
+    };
     let mut cited = 0;
     let n = r.list("components")?;
     let mut components = Vec::with_capacity(room(n));
     for _ in 0..n {
-        let fields = r.record(2, "a component")?;
+        let mut fields = r.record(5, "a component")?;
         let name = r.text("a component name")?.to_owned();
+        let class = r.text("a component class")?.to_owned();
+        let config = r.map(2, Reader::config)?.into_iter().collect();
         let n = r.list("tensors")?;
         let mut tensors = Vec::with_capacity(room(n));
         for _ in 0..n {
             tensors.push(tensor(&mut r, &encodings, &mut cited)?);
         }
+        let assets = r.map(2, |r, _| r.object("an asset"))?;
+        // Later fields follow config_file, which is then `config.json` for the default.
+        let config_file = match fields {
+            0 => None,
+            _ => {
+                fields -= 1;
+                Some(r.text("a config file")?.to_owned())
+                    .filter(|f| fields == 0 || f != CONFIG_FILE)
+            }
+        };
         r.skip(fields, 2)?;
-        components.push(Component { name, tensors });
+        components.push(Component {
+            name,
+            class,
+            config,
+            tensors,
+            assets,
+            config_file,
+        });
     }
     if cited != encodings.len() {
         return invalid(format!(
@@ -436,12 +600,12 @@ fn parse(bytes: &[u8]) -> Result<Header> {
             encodings.len()
         ));
     }
-    let metadata: Metadata = r.map(0)?;
+    let metadata: Metadata = r.map(0, Reader::value)?;
     r.skip(more, 1)?;
     if r.at != bytes.len() {
         return invalid(format!("{} bytes after the header", bytes.len() - r.at));
     }
-    Header::new(chunks, components, metadata)
+    Header::new(chunks, pipeline, components, metadata)
 }
 
 /// One tensor. `cited` counts the encodings cited so far: each is first cited in table order.

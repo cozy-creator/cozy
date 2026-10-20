@@ -110,7 +110,7 @@ async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
         repository: "acme/model".into(),
         release: "1.0.0".into(),
         lane: "bf16".into(),
-        manifest,
+        header: manifest,
     };
     let (hub, heard) = names_hub::serve(&store, model, Vec::<names_hub::Package>::new());
     // A mount point, as the Hub's: a tmpfs directory named from a disk directory.

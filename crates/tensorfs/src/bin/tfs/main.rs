@@ -5,6 +5,7 @@
 mod dev;
 mod v1;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value as Json};
 use tensorfs::client::{self, ImportOptions, Named};
 use tensorfs::export;
+use tensorfs::fetch;
 use tensorfs::failure::{fail, Failure, Kind, Result};
 use tensorfs::format::{Body, Dtype, ObjectRef};
 use tensorfs::migrate::{self, v1 as old};
@@ -22,22 +24,25 @@ use tensorfs::store2::Store;
 const USAGE: &str = "usage: tfs [--store <dir>] [--json] <verb> ...
   import <src>... [--name <org/name>] [--converter <table>] [--variant <variant>]
       src: a file, a directory, hf://<org>/<repo>[@<rev>][/<path>], civitai://<version>[/<file>], a URL
-  pull [<origin>] <org/name[@release]> [--lane <lane>] [--hub <url>]
+  pull [<origin>] <org/name[@release]> [--variant <variant>] [--hub <url>]
       from Tensorhub (--hub, else https://tensorhub.com; $TENSORFS_HUB_TOKEN reads private
-      checkpoints), or from a static origin's URL or directory
+      trees), or from a static origin's URL or directory
   export <ref> <dir> --safetensors [--dequantize bf16|f16|f32]
   export <ref> <dir> --origin
   export <ref> <dir> --gguf      every GGUF the checkpoint was imported from, rebuilt
   inspect <ref>
   verify [<ref>]
   gc [--older-than <7d|12h|30m|90s>]
+  conform endpoint <url> [--write] [--token-env <VAR>]
+      checks an endpoint against the distribution spec; --write uploads the fixture first
   dev ckpt [--name <org/name>] [--blocks <n>] [--scale <n>] [--plain] [--no-configs]
   dev migrate <v1-dir> [<manifest-sha256>|<org/name>]... [--dry-run | --plan]
       v1-dir: a v1 store (read only) or a directory of a v1 manifest and its objects;
       --plan: the census, names and new bytes from manifests and headers alone, no store
   dev headers <hub-url> <dir> <org/name@release/lane>...   a released lane's v1 manifest and header
-<ref> is org/name[@release] (--lane names a lane, else the release's only one) or a manifest
-sha256. The store is --store, else $TENSORFS_HOME, else ~/.tensorfs; it is created when absent.";
+<ref> is org/name[@release] (--variant names a variant, else the release's only one) or the
+sha256 of a tree or a cozytensors. The store is --store, else $TENSORFS_HOME, else
+~/.cache/tensorfs; it is created when absent.";
 
 const SWITCHES: &[&str] = &[
     "json",
@@ -48,20 +53,21 @@ const SWITCHES: &[&str] = &[
     "no-configs",
     "dry-run",
     "plan",
+    "write",
 ];
 const VALUED: &[&str] = &[
     "store",
     "hub",
     "name",
-    "lane",
     "dequantize",
     "older-than",
     "converter",
     "variant",
     "blocks",
     "scale",
+    "token-env",
 ];
-const VERBS: &[&str] = &["import", "pull", "export", "inspect", "verify", "dev"];
+const VERBS: &[&str] = &["import", "pull", "export", "inspect", "verify", "dev", "conform"];
 
 struct Args {
     pos: Vec<String>,
@@ -202,7 +208,7 @@ fn store_root(args: &Args) -> Result<PathBuf> {
         return Ok(PathBuf::from(dir));
     }
     match std::env::var_os("HOME").filter(|d| !d.is_empty()) {
-        Some(home) => Ok(Path::new(&home).join(".tensorfs")),
+        Some(home) => Ok(Path::new(&home).join(".cache").join("tensorfs")),
         None => fail(
             Kind::Invalid,
             "no store: pass --store, or set TENSORFS_HOME or HOME",
@@ -215,22 +221,33 @@ fn object(o: &ObjectRef) -> Json {
 }
 
 fn named(n: &Named) -> Map<String, Json> {
-    let doc = json!({"manifest": object(&n.manifest), "name": n.name, "release": n.release, "lane": n.lane});
+    let tree = n.tree.as_ref().map(object);
+    let doc = json!({"header": object(&n.header), "tree": tree, "name": n.name, "release": n.release, "variant": n.variant});
     doc.as_object().expect("an object").clone()
 }
 
 fn label(n: &Named) -> String {
-    match (&n.name, &n.release, &n.lane) {
-        (Some(name), Some(release), Some(lane)) => {
-            format!("{name}@{release} lane {lane}: sha256:{}", n.manifest.sha256)
+    match (&n.name, &n.release, &n.variant) {
+        (Some(name), Some(release), Some(variant)) => {
+            format!("{name}@{release} variant {variant:?}: sha256:{}", n.header.sha256)
         }
-        _ => format!("sha256:{}", n.manifest.sha256),
+        _ => format!("sha256:{}", n.header.sha256),
     }
+}
+
+/// The repo files of the tree naming `n`, as store paths.
+fn repo_files(store: &Store, n: &Named) -> Result<BTreeMap<String, PathBuf>> {
+    let Some(tree) = &n.tree else {
+        return Ok(BTreeMap::new());
+    };
+    let tree = store.tree(tree)?;
+    let files = tree.repo_files().map(|(p, o)| Ok((p.to_owned(), store.path(o)?)));
+    files.collect::<std::result::Result<_, tensorfs::store2::Error>>().map_err(Failure::from)
 }
 
 fn run(args: &Args) -> Done {
     let pos: Vec<&str> = args.pos.iter().map(String::as_str).collect();
-    let lane = args.get("lane");
+    let lane = args.get("variant");
     let store = || Store::open(store_root(args)?).map_err(Failure::from);
     match pos.as_slice() {
         ["import", sources @ ..] if !sources.is_empty() => {
@@ -250,6 +267,7 @@ fn run(args: &Args) -> Done {
                 converter: args.get("converter"),
                 variant: args.get("variant"),
                 progress: &progress,
+                stop: None,
             };
             let n = store()?.import_named(&sources, &opts)?;
             Ok(Some((
@@ -294,10 +312,11 @@ fn run(args: &Args) -> Done {
             ) {
                 (true, false, false, dequantize) => {
                     let dtype = dequantize.map(|d| Dtype::parse(&d.to_ascii_uppercase()));
-                    export::safetensors(&store.checkpoint(&n.manifest)?, dir, dtype.as_ref())?
+                    let repo = repo_files(&store, &n)?;
+                    export::safetensors(&store.checkpoint(&n.header)?, &repo, dir, dtype.as_ref())?
                 }
                 (false, true, false, None) => client::export_origin(&store, &n, dir)?,
-                (false, false, true, None) => export::gguf(&store.checkpoint(&n.manifest)?, dir)?,
+                (false, false, true, None) => export::gguf(&store.checkpoint(&n.header)?, dir)?,
                 _ => return Ok(None),
             };
             let human = format!(
@@ -311,6 +330,7 @@ fn run(args: &Args) -> Done {
             Ok(Some((Json::Object(doc), human)))
         }
         ["inspect", reference] => inspect(&store()?, reference, lane),
+        ["conform", "endpoint", url] => conform(url, args.on("write"), args.get("token-env"), args.on("json")),
         ["verify"] => verify(&store()?, None),
         ["verify", reference] => verify(&store()?, Some((reference, lane))),
         ["gc"] => {
@@ -332,7 +352,7 @@ fn run(args: &Args) -> Done {
             let store = store()?;
             let plain = args.on("plain");
             let scale = args.number("scale", 1)?.max(1);
-            let manifest = dev::ckpt(
+            let header = dev::ckpt(
                 &store,
                 args.number("blocks", 12)?,
                 scale,
@@ -340,19 +360,10 @@ fn run(args: &Args) -> Done {
                 !args.on("no-configs"),
             )?;
             let name = args.get("name").unwrap_or("dev/ckpt");
-            let n = store.set_lane(
-                name,
-                "1",
-                Some(if plain { "bf16" } else { "mixed" }),
-                &manifest,
-            )?;
-            store.unpin(&manifest.sha256)?;
-            let ck = store.checkpoint(&manifest)?;
-            let mut objects: Vec<ObjectRef> = vec![manifest.clone()];
-            objects.extend(ck.manifest().files.values().cloned());
-            objects.extend(ck.header().chunks.iter().cloned());
-            objects.sort();
-            objects.dedup();
+            let variant = Some(if plain { "bf16" } else { "mixed" });
+            let n = store.set_variant(name, "1", variant, &header, &BTreeMap::new())?;
+            store.unpin(&header.sha256)?;
+            let objects = store.closure(n.tree.as_ref().expect("a named tree"))?;
             let mut doc = named(&n);
             doc.insert("objects".into(), objects.iter().map(object).collect());
             let human = format!("wrote {} ({} objects)", label(&n), objects.len());
@@ -455,7 +466,7 @@ fn migrate_v1(store: Option<&Store>, root: &str, select: &[&str], dry_run: bool)
             if !named.chain(&repo.checkpoints).any(|m| wanted.contains(&m)) {
                 continue;
             }
-            refs.push(match migrate::refs(&repo, &reports) {
+            refs.push(match migrate::refs(store, &repo, &reports)? {
                 Ok(v2) => {
                     store.update_ref(&v2.name, |_| Some(v2.clone()))?;
                     json!({"name": v2.name, "written": true, "releases": v2.releases.len(), "checkpoints": v2.checkpoints.len()})
@@ -521,7 +532,7 @@ fn duration(text: &str) -> Result<Duration> {
 
 fn inspect(store: &Store, reference: &str, lane: Option<&str>) -> Done {
     let n = store.resolve(reference, lane)?;
-    let ck = store.checkpoint(&n.manifest)?;
+    let ck = store.checkpoint(&n.header)?;
     let header = ck.header();
     let mut human = vec![label(&n)];
     // Arrays in header (construction) order.
@@ -556,23 +567,23 @@ fn inspect(store: &Store, reference: &str, lane: Option<&str>) -> Done {
             c.tensors.len()
         ));
         human.extend(encodings.iter().map(|(e, n)| format!("    {n} × {e}")));
-        components.push(json!({"name": c.name, "bytes": bytes, "tensors": tensors}));
+        let assets: Map<String, Json> = c.assets.iter().map(|(p, o)| (p.clone(), object(o))).collect();
+        components.push(json!({"name": c.name, "class": c.class, "config": c.config, "assets": assets, "bytes": bytes, "tensors": tensors}));
     }
     let chunk_bytes: u64 = header.chunks.iter().map(|c| c.length).sum();
+    let files: Map<String, Json> = match &n.tree {
+        Some(tree) => (store.tree(tree)?.files.iter()).map(|(p, o)| (p.clone(), object(o))).collect(),
+        None => Map::new(),
+    };
     human.push(format!(
-        "  {} chunks, {chunk_bytes} bytes; {} files",
+        "  {} chunks, {chunk_bytes} bytes; {} files in the tree",
         header.chunks.len(),
-        ck.manifest().files.len()
+        files.len()
     ));
-    let files: Map<String, Json> = ck
-        .manifest()
-        .files
-        .iter()
-        .map(|(p, o)| (p.clone(), object(o)))
-        .collect();
     let mut doc = named(&n);
     doc.extend([
         ("files".into(), Json::Object(files)),
+        ("pipeline".into(), json!(header.pipeline().map(|p| json!({"class": p.class, "config": p.config})))),
         ("chunks".into(), header.chunks.len().into()),
         ("bytes".into(), chunk_bytes.into()),
         ("metadata".into(), json!(header.metadata)),
@@ -586,10 +597,11 @@ fn verify(store: &Store, reference: Option<(&str, Option<&str>)>) -> Done {
     let objects: Vec<ObjectRef> = match reference {
         Some((reference, lane)) => {
             let n = store.resolve(reference, lane)?;
-            let ck = store.checkpoint(&n.manifest)?;
-            let mut all = vec![n.manifest.clone()];
-            all.extend(ck.manifest().files.values().cloned());
-            all.extend(ck.header().chunks.iter().cloned());
+            let mut all = store.closure(&n.header)?;
+            if let Some(tree) = &n.tree {
+                all.push(tree.clone());
+                all.extend(store.tree(tree)?.repo_files().map(|(_, o)| o.clone()));
+            }
             all.sort();
             all.dedup();
             all
@@ -656,4 +668,48 @@ fn blobs(store: &Store) -> Result<Vec<ObjectRef>> {
     }
     out.sort();
     Ok(out)
+}
+
+/// `tfs conform endpoint`: every case, and a failure when a MUST failed.
+fn conform(url: &str, write: bool, token_env: Option<&str>, json: bool) -> Done {
+    let token = match token_env {
+        Some(var) => match std::env::var(var).ok().filter(|t| !t.is_empty()) {
+            Some(token) => Some(fetch::bearer(token)),
+            None => return Err(Failure { kind: Kind::Invalid, detail: format!("${var} is unset") }.into()),
+        },
+        None => None,
+    };
+    let scratch = std::env::temp_dir().join(format!("tfs-conform-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let cases = fetch::runtime().map_err(Failure::from)?.block_on(async {
+        let policy = fetch::SourcePolicy {
+            any_host: true,
+            allow_local: fetch::policy::is_loopback_origin(url),
+            max_redirects: 5,
+            ..Default::default()
+        };
+        let client = fetch::Client::new(policy);
+        let endpoint = std::sync::Arc::new(fetch::Endpoint::new(&client, url, token)?);
+        fetch::conform::endpoint(endpoint, &client, write, &scratch).await
+    });
+    let _ = fs::remove_dir_all(&scratch);
+    let cases = cases.map_err(Failure::from)?;
+    let mark = |c: &fetch::conform::Case| match (c.ok, c.must) {
+        (None, _) => "n/a ",
+        (Some(true), _) => "pass",
+        (Some(false), true) => "FAIL",
+        (Some(false), false) => "warn",
+    };
+    let human: Vec<String> = cases.iter().map(|c| format!("{}  {}  {}", mark(c), c.name, c.detail).trim_end().to_owned()).collect();
+    let docs: Vec<Json> = cases.iter().map(|c| json!({"case": c.name, "must": c.must, "ok": c.ok, "detail": c.detail})).collect();
+    let failed = cases.iter().filter(|c| c.must && c.ok == Some(false)).count();
+    let doc = json!({"endpoint": url, "cases": docs, "failed": failed});
+    if failed == 0 {
+        return Ok(Some((doc, human.join("\n"))));
+    }
+    if !json {
+        eprintln!("{}", human.join("\n"));
+    }
+    let failure = Failure { kind: Kind::Invalid, detail: format!("{url}: {failed} MUST case(s) failed") };
+    Err(Failed(failure, doc.as_object().cloned()))
 }

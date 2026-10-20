@@ -1,32 +1,40 @@
-//! Fetching checkpoints into a store (design §5). An [`Origin`] names a model's manifest and
-//! locates objects ([`TensorhubOrigin`] by default, [`HttpOrigin`] and [`VolumeOrigin`] for a
-//! static layout); the [`Fetcher`] walks the closure (manifest → header → the selected
-//! components' chunks), reads each object through the tiers local store → volume → origin,
+//! Fetching into a store (design §5). An [`Origin`] names a model's tree and locates objects
+//! ([`Endpoint`], the distribution protocol's client; [`TensorhubOrigin`] until TensorD moves to
+//! it; [`VolumeOrigin`] for a datacenter volume);
+//! the [`Fetcher`] walks the closure (tree → its repo files and the chosen variant's header →
+//! the wanted components' chunks and assets), reads each object through the tiers local store →
+//! volume → origin,
 //! and admits it through the store, which verifies it. One HTTP client ([`Client`]) and one
 //! downloader serve every origin.
 
+pub mod conform;
 mod download;
+mod dpop;
+mod endpoint;
 mod net;
 mod origin;
 pub mod policy;
 mod tensorhub;
+pub mod token;
 mod volume;
 
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub use dpop::{DPoP, JwtBearer};
+pub use endpoint::{upload_tree, upload_tree_with, with_tree, Endpoint, Fresh, Payload, Stream, UploadControl, Uploaded};
 pub use net::Client;
-pub use origin::{choose, HttpOrigin, Location, Origin};
+pub use origin::{choose, release_of, variant_of_tree, Chosen, Location, Origin};
 pub use policy::SourcePolicy;
-pub use tensorhub::{Credential, Resolved, TensorhubOrigin, TENSORHUB};
+pub use tensorhub::{Resolved, TensorhubOrigin, TENSORHUB};
+pub use token::{bearer, SigV4, TokenProvider};
 pub use volume::VolumeOrigin;
 
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::format::{self, Header, Manifest, ObjectRef};
+use crate::format::{self, Header, ObjectRef, Tree};
 use download::Shared;
 
 /// The store objects are admitted into (design §4).
@@ -116,9 +124,12 @@ pub struct Progress {
     pub held: AtomicU64,
 }
 
+/// What a pull took: the tree (when it walked one), the variant and its header, and its objects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pulled {
-    pub manifest: ObjectRef,
+    pub tree: Option<ObjectRef>,
+    pub variant: String,
+    pub header: ObjectRef,
     pub objects: usize,
     pub landed: Landed,
 }
@@ -185,49 +196,56 @@ impl Fetcher {
         self.shared.settled().await
     }
 
-    /// `name` at `release` and `lane` from `origin`, the components `want` selects.
+    /// `name` at `release` and `variant` from `origin`, the components `want` selects.
     pub async fn pull(
         &self,
         origin: &Arc<dyn Origin>,
         name: &str,
         release: Option<&str>,
-        lane: Option<&str>,
+        variant: Option<&str>,
         want: &Want<'_>,
     ) -> Result<Pulled> {
-        let manifest = origin.resolve(name, release, lane).await?;
-        self.pull_manifest(origin, &manifest, want).await
+        let tree = origin.resolve(name, release, variant).await?;
+        self.pull_tree(origin, &tree, variant, want).await
     }
 
-    /// The checkpoint `manifest` names, the components `want` selects.
-    pub async fn pull_manifest(
+    /// The tree `tree`: its repo files, and its `variant` (its only one when `None`) with the
+    /// components `want` selects.
+    pub async fn pull_tree(
         &self,
         origin: &Arc<dyn Origin>,
-        manifest: &ObjectRef,
+        tree: &ObjectRef,
+        variant: Option<&str>,
         want: &Want<'_>,
     ) -> Result<Pulled> {
-        let mut landed = self
-            .objects(origin, std::slice::from_ref(manifest), want)
-            .await?;
-        let files =
-            Manifest::from_json(&self.read(manifest).await?).map_err(|e| invalid(manifest, e))?;
-        let mut wanted: Vec<ObjectRef> = files.files.values().cloned().collect();
-        if let Some(header) = files.header() {
-            landed.join(
-                self.objects(origin, std::slice::from_ref(header), want)
-                    .await?,
-            );
-            let parsed =
-                Header::from_cbor(&self.read(header).await?).map_err(|e| invalid(header, e))?;
-            wanted.retain(|object| object != header);
-            wanted.extend(chunks(&parsed, want.components)?);
-        }
-        wanted.sort();
-        wanted.dedup();
+        let mut landed = self.objects(origin, std::slice::from_ref(tree), want).await?;
+        let parsed = Tree::from_json(&self.read(tree).await?).map_err(|e| invalid(tree, e))?;
+        let (variant, header) = variant_of_tree(&parsed, variant)?;
+        let files: Vec<ObjectRef> = parsed.repo_files().map(|(_, r)| r.clone()).collect();
+        landed.join(self.objects(origin, &files, want).await?);
+        let mut pulled = self.pull_header(origin, &header, want).await?;
+        pulled.landed.join(landed);
+        pulled.objects += 1 + files.len();
+        (pulled.tree, pulled.variant) = (Some(tree.clone()), variant);
+        Ok(pulled)
+    }
+
+    /// The cozytensors whose header is `header`, the components `want` selects.
+    pub async fn pull_header(
+        &self,
+        origin: &Arc<dyn Origin>,
+        header: &ObjectRef,
+        want: &Want<'_>,
+    ) -> Result<Pulled> {
+        let mut landed = self.objects(origin, std::slice::from_ref(header), want).await?;
+        let parsed = Header::from_cbor(&self.read(header).await?).map_err(|e| invalid(header, e))?;
+        let wanted = wanted(&parsed, want.components)?;
         landed.join(self.objects(origin, &wanted, want).await?);
-        let objects = wanted.len() + 1 + usize::from(files.header().is_some());
         Ok(Pulled {
-            manifest: manifest.clone(),
-            objects,
+            tree: None,
+            variant: String::new(),
+            header: header.clone(),
+            objects: wanted.len() + 1,
             landed,
         })
     }
@@ -299,49 +317,19 @@ fn invalid(object: &ObjectRef, error: format::Error) -> Refusal {
     }
 }
 
-/// The chunks the tensors of `components` (every component when `None`) live in, each once.
-pub fn chunks(header: &Header, components: Option<&[String]>) -> Result<Vec<ObjectRef>> {
-    let names: Vec<&str> = match components {
-        Some(names) => names.iter().map(String::as_str).collect(),
-        None => header
-            .components()
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect(),
-    };
-    let mut wanted = BTreeSet::new();
-    for name in names {
-        let Some(component) = header.component(name) else {
-            let has: Vec<&str> = header
-                .components()
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect();
-            return refuse(
-                Code::REF_NOT_FOUND,
-                format!("no component {name:?} (has {has:?})"),
-            );
-        };
-        for tensor in &component.tensors {
-            let at: Vec<format::Location> =
-                tensor.locations().into_iter().map(|(_, at)| at).collect();
-            wanted.extend(
-                at.iter()
-                    .flat_map(|at| header.spans(at))
-                    .map(|span| span.chunk),
-            );
-        }
+/// The chunks the tensors of `components` (every component when `None`) live in, then their
+/// assets; each once.
+pub fn wanted(header: &Header, components: Option<&[String]>) -> Result<Vec<ObjectRef>> {
+    if let Some(name) = components.into_iter().flatten().find(|n| header.component(n).is_none()) {
+        let has: Vec<&str> = header.components().iter().map(|c| c.name.as_str()).collect();
+        return refuse(Code::REF_NOT_FOUND, format!("no component {name:?} (has {has:?})"));
     }
-    Ok(wanted
-        .into_iter()
-        .map(|chunk| header.chunks[chunk].clone())
-        .collect())
+    crate::store2::wanted(header, components).map_err(crate::store2::Error::refusal)
 }
 
 /// A runtime for callers without one (a CLI, Python): two threads for sockets and timers.
 pub fn runtime() -> Result<Arc<tokio::runtime::Runtime>> {
-    static RUNTIME: Mutex<Option<Arc<tokio::runtime::Runtime>>> = Mutex::new(None);
-    let mut held = RUNTIME
+    let mut held = runtime_slot()?
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(runtime) = held.as_ref() {
@@ -358,3 +346,77 @@ pub fn runtime() -> Result<Arc<tokio::runtime::Runtime>> {
         })?;
     Ok(Arc::clone(held.insert(Arc::new(runtime))))
 }
+
+type RuntimeSlot = Mutex<Option<Arc<tokio::runtime::Runtime>>>;
+
+#[cfg(not(unix))]
+fn runtime_slot() -> Result<&'static RuntimeSlot> {
+    static RUNTIME: RuntimeSlot = Mutex::new(None);
+    Ok(&RUNTIME)
+}
+
+#[cfg(unix)]
+fn runtime_slot() -> Result<&'static RuntimeSlot> {
+    process_runtime::slot()
+}
+
+/// The POSIX process boundary for the lazy network runtime. An inherited Tokio runtime
+/// has no workers in a fork child, and its mutex may be owned by a vanished parent thread.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+mod process_runtime {
+    use super::{Code, Refusal, Result, RuntimeSlot};
+    use std::ptr;
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+
+    static SLOT: AtomicPtr<RuntimeSlot> = AtomicPtr::new(ptr::null_mut());
+    static REGISTERED: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn after_fork() {
+        // Only an atomic store: no allocation, lock, refcount change or destructor is
+        // permitted here. Deliberately abandon the inherited holder in this child.
+        SLOT.store(ptr::null_mut(), Ordering::Release);
+    }
+
+    pub(super) fn slot() -> Result<&'static RuntimeSlot> {
+        if !REGISTERED.load(Ordering::Acquire) {
+            // SAFETY: after_fork has a static C ABI and touches only the lock-free pointer.
+            // Register before publishing a holder. There is deliberately no "initializing"
+            // state or Once lock for a concurrent fork to inherit. Racing first callers may
+            // register the same idempotent callback; every registration completes before use.
+            let error = unsafe { libc::pthread_atfork(None, None, Some(after_fork)) };
+            if error != 0 {
+                return Err(Refusal {
+                    code: Code::TRANSFER_FAILED,
+                    detail: format!("the fetch runtime fork hook could not register: {}", std::io::Error::from_raw_os_error(error)),
+                });
+            }
+            REGISTERED.store(true, Ordering::Release);
+        }
+        // The registered handler itself is inherited, so REGISTERED stays true in children.
+        // Resetting the pointer on every fork also covers descendant forks and PID reuse;
+        // no process identity comparison can mistake an ancestor's holder for a live one.
+        let mut slot = SLOT.load(Ordering::Acquire);
+        if slot.is_null() {
+            let candidate: *mut RuntimeSlot = Box::into_raw(Box::new(RuntimeSlot::new(None)));
+            slot = match SLOT.compare_exchange(ptr::null_mut(), candidate, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => candidate,
+                Err(published) => {
+                    // SAFETY: a losing candidate was never published and contains no runtime.
+                    // Its allocation belongs only to this thread in the current process.
+                    unsafe { drop(Box::from_raw(candidate)); }
+                    published
+                }
+            };
+        }
+        // SAFETY: published holders are never freed. Threads in this process share its
+        // mutex; a fork child clears SLOT before returning to callers and never locks or
+        // drops the inherited holder. Keeping its Arc also prevents an inherited temporary
+        // Arc from being the last owner and dropping the parent-created Tokio runtime.
+        Ok(unsafe { &*slot })
+    }
+}
+
+#[cfg(all(test, unix))]
+#[allow(unsafe_code)]
+mod runtime_fork_tests;

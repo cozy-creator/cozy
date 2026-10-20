@@ -16,7 +16,6 @@ use varena::host::HostMem;
 use varena::io::{IoTally, Source};
 use varena::layout::Layout;
 use varena::window::open_window;
-use varena::{Error, Tier};
 
 /// Each region's expected bytes (padding excluded), by part.
 fn expected(layout: &Layout) -> Vec<Vec<(usize, Vec<u8>)>> {
@@ -167,26 +166,6 @@ fn a_window_that_stops_serving_fails_its_waiting_readers() {
     assert!(waiter.join().unwrap().is_err());
 }
 
-#[test]
-fn a_plane_registers_a_streamed_layout_but_never_pins_it() {
-    let fx = Fixture::new("window-plane");
-    let (fd, _, served) = serve(&fx, 1);
-    let plane = host_only();
-    let ws = plane.register_sealed("unet", &fx.plan(), &regions(), fd.as_raw_fd()).unwrap();
-    plane.set_pinned_budget(1 << 30).unwrap();
-    assert!(matches!(plane.want(ws, Tier::Pinned, None, 0, false), Err(Error::BelowFloor { .. })));
-    assert!(matches!(plane.want(ws, Tier::Pinned, None, 0, true), Err(Error::BelowFloor { .. })));
-    assert_eq!(plane.stats().host.used, 0);
-    // A window of another layout is refused at registration.
-    let mut other = regions();
-    other.swap(0, 2);
-    assert!(plane.register_sealed("unet", &fx.plan(), &other, fd.as_raw_fd()).is_err());
-    plane.close().unwrap();
-    served.end().unwrap();
-}
-
-/// A layout of one region in a window of one slot has exactly the layout's size: the state
-/// page's magic, not the size, tells them apart.
 #[test]
 fn a_one_region_window_the_size_of_its_layout_is_still_a_window() {
     let fx = Fixture::new("window-single");

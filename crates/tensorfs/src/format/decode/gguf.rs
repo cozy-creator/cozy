@@ -1,8 +1,9 @@
 //! `gguf.<type>` (spec §6 `gguf.*`): ggml's block structs as llama.cpp writes them in a GGUF, each
 //! element in ggml's own f32 order (`dequantize_row_*`, `ggml-quants.c` at llama.cpp ff5a233).
 
-use super::blocks::{f16_at, u32_at, walk};
-use super::{elem, one, Allowed, Ctx, Dtypes, Param, Part, Scheme, Shape, View};
+use super::blocks::{f16_at, u32_at};
+use super::plan::{Core, Elems, Post, Struct};
+use super::{elem, one, Allowed, Ctx, Dtypes, Param, Part, Plan, Scheme, Shape, View};
 use crate::format::{Encoding, Result};
 
 /// A ggml type: id, name, elements per block, bytes per block.
@@ -158,34 +159,50 @@ fn shape(c: &Ctx) -> Result<Shape> {
     }
 }
 
-fn decode(c: &Ctx) -> Result<Vec<f32>> {
-    let ty = ty(c);
-    let f: fn(&[u8], &mut [f32]) = match ty.name {
-        "q4_0" => q4_0,
-        "q4_1" => q4_1,
-        "q5_0" => q5_0,
-        "q5_1" => q5_1,
-        "q8_0" => q8_0,
-        "q2_k" => q2_k,
-        "q3_k" => q3_k,
-        "q4_k" => q4_k,
-        "q5_k" => q5_k,
-        "q6_k" => q6_k,
-        "mxfp4" => mxfp4,
-        "nvfp4" => nvfp4,
-        "q1_0" => q1_0,
-        _ => q2_0,
-    };
-    let (n, size) = (ty.block as usize, ty.size as usize);
-    let mut out = walk(c.rows, c.cols, c.part("blocks").bytes, n, size, |b, y| {
-        f(b, y);
-        Ok(())
-    })?;
-    if c.has("scale") {
-        let s = c.floats("scale")[0];
-        out.iter_mut().for_each(|v| *v *= s);
+/// The struct types a scheme decodes, in the GPU kernels' order (`tensorfs/kernels.py` `STRUCTS`).
+pub static STRUCTS: [Struct; 14] = [
+    st("q4_0", 32, 18, q4_0),
+    st("q4_1", 32, 20, q4_1),
+    st("q5_0", 32, 22, q5_0),
+    st("q5_1", 32, 24, q5_1),
+    st("q8_0", 32, 34, q8_0),
+    st("q2_k", 256, 84, q2_k),
+    st("q3_k", 256, 110, q3_k),
+    st("q4_k", 256, 144, q4_k),
+    st("q5_k", 256, 176, q5_k),
+    st("q6_k", 256, 210, q6_k),
+    st("mxfp4", 32, 17, mxfp4),
+    st("nvfp4", 64, 36, nvfp4),
+    st("q1_0", 128, 18, q1_0),
+    st("q2_0", 64, 18, q2_0),
+];
+
+const fn st(name: &'static str, n: usize, size: usize, decode: fn(&[u8], &mut [f32])) -> Struct {
+    Struct {
+        name,
+        n,
+        size,
+        decode,
     }
-    Ok(out)
+}
+
+fn decode<'a>(c: &Ctx<'a>) -> Result<Plan<'a>> {
+    let name = ty(c).name;
+    let kind = STRUCTS
+        .iter()
+        .find(|s| s.name == name)
+        .expect("every row's type is a struct");
+    let post = match c.has("scale") {
+        true => Post::One(Elems::part(c.part("scale"))),
+        false => Post::None,
+    };
+    Ok(Plan {
+        core: Core::Structs {
+            bytes: c.part("blocks").bytes,
+            kind,
+        },
+        post,
+    })
 }
 
 /// `q4_0`'s nibble order: element `j` in `qs[j]`'s low nibble, `j + 16` in its high one.

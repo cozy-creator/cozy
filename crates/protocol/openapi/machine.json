@@ -912,6 +912,24 @@
           }
         }
       },
+      "CheckpointRef": {
+        "type": "object",
+        "description": "A checkpoint stored by Runtime. `revision` names its immutable TensorFS tree.",
+        "properties": {
+          "repo_id": {
+            "type": "string",
+            "default": ""
+          },
+          "revision": {
+            "type": "string",
+            "default": ""
+          },
+          "variant": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
       "Disk": {
         "type": "object",
         "properties": {
@@ -1582,7 +1600,7 @@
       },
       "Product": {
         "type": "object",
-        "description": "One revision of an output: a single output is replaced by each, a list output grows. Its bytes\nare `GET /v1/runs/{id}/outputs/{output}`.",
+        "description": "One revision of an output: a single output is replaced by each, a list output grows. Byte\noutputs use `GET /v1/runs/{id}/outputs/{output}`; checkpoints are immutable references.",
         "properties": {
           "appended_from": {
             "type": [
@@ -1593,6 +1611,17 @@
             "description": "These bytes extend the previous revision's, from here.",
             "default": null,
             "minimum": 0
+          },
+          "checkpoint": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CheckpointRef"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "digest": {
             "type": "string",
@@ -1916,6 +1945,18 @@
             ],
             "default": null
           },
+          "tensorfs": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TensorFSOptions",
+                "description": "Ordinary TensorFS connection settings supplied by the caller, forwarded to Runtime."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "weights_destination": {
             "type": "string",
             "description": "org/name: the requester's repository for the call's weights outputs, or a warm run's\nsource model.",
@@ -2172,6 +2213,26 @@
             "default": null
           },
           "worker_id": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "TensorFSOptions": {
+        "type": "object",
+        "description": "Public TensorFS transport options. TensorD forwards a supplied token without acquiring one.",
+        "properties": {
+          "ca_der": {
+            "type": "string",
+            "format": "byte",
+            "description": "An endpoint's private CA, base64 DER on the wire.",
+            "default": []
+          },
+          "endpoint": {
+            "type": "string",
+            "default": ""
+          },
+          "token": {
             "type": "string",
             "default": ""
           }
