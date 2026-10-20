@@ -393,6 +393,9 @@ impl SetFixture {
             // SAFETY: our new writable host layout has BYTES of data and no readers yet.
             unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), h.base(), data.len()) };
             h.set_ready(0, true);
+            // Preserve the ordinary first-copy policy, then establish actual registration
+            // before the gate. No registration attempt may be deferred into gated work.
+            assert!(!h.pin_region(0, 0, BYTES), "first-copy policy changed");
             assert!(
                 h.pin_region(0, 0, BYTES),
                 "REFUSED: direct source registration unsupported"
