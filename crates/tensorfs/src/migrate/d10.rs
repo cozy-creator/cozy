@@ -44,6 +44,12 @@ const H3: &str = "hf://MiniMaxAI/MiniMax-H3@42ed227ee7df40d41602854ae760620d6eb6
 /// What a civitai SDXL fine-tune lacks: SDXL's pipeline and both tokenizers, never its docs.
 const PIPELINE: [&str; 3] = ["model_index.json", "tokenizer/", "tokenizer_2/"];
 const ANIMA_RUN: [&str; 3] = ["modular_model_index.json", "tokenizer/", "t5_tokenizer/"];
+/// SDXL base's own lanes take any run file they lack from the base, configs included: the lanes'
+/// configs are the base's.
+const SDXL_RUN: [&str; 10] = [
+    "model_index.json", "scheduler/", "tokenizer/", "tokenizer_2/", "text_encoder/config.json",
+    "text_encoder_2/config.json", "unet/config.json", "vae/config.json", "README", "LICENSE",
+];
 const DOCS: [&str; 2] = ["README", "LICENSE"];
 
 const fn row(models: &'static [&'static str], from: &'static str, files: &'static [&'static str]) -> Upstream {
@@ -57,7 +63,7 @@ const fn civitai(models: &'static [&'static str], version: &'static str) -> Upst
 /// The owner-approved table (2026-10-19, civitai and source rulings 2026-10-20), each entry
 /// checked against its pin. Civitai fine-tunes get run data only, never README or LICENSE.
 pub const UPSTREAMS: &[Upstream] = &[
-    row(&["*/sdxl", "*/sdxl-fp8-postcut-proof", "paul/d1-*sdxl*"], SDXL, &["model_index.json", "tokenizer/", "tokenizer_2/", "README", "LICENSE"]),
+    row(&["*/sdxl", "*/sdxl-fp8-postcut-proof", "paul/d1-*sdxl*"], SDXL, &SDXL_RUN),
     civitai(&["*/babes-pony"], "civitai://2937668"),
     civitai(&["*/big-love-xl"], "civitai://2857189"),
     civitai(&["*/cyberrealistic-pony"], "civitai://2884631"),
@@ -510,7 +516,8 @@ fn array(out: &mut Vec<u8>, n: u64) {
     }
 }
 
-/// What [`migrate`] did, and the repo document it replaced, for [`restore`].
+/// What [`migrate`] did, and the repo document it replaced: the rollback is that document put
+/// back in the endpoint's storage (a D10 Hub refuses a release going back to lanes).
 pub struct Done {
     pub report: Json,
     pub before: Vec<u8>,
@@ -535,23 +542,6 @@ pub fn migrate(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &
         if rt.block_on(endpoint.put_repo_bytes(name, bytes, Some(&etag)))? {
             m.report["sent"] = json!({"objects": sent.0, "bytes": sent.1});
             return Ok(Done { report: m.report, before: doc });
-        }
-    }
-}
-
-/// Puts `before` back as repo `name`'s document (the rollback): false when it already is. Its
-/// old objects stay at the endpoint until GC, which the rollback window must outlast.
-pub fn restore(endpoint: &Endpoint, name: &str, before: &[u8]) -> Result<bool> {
-    let rt = fetch::runtime()?;
-    loop {
-        let Fresh::Doc(now, etag) = rt.block_on(endpoint.repo_bytes(name, None))? else {
-            return fail(Kind::NotFound, format!("no repo {name} at {}", endpoint.url()));
-        };
-        if now == before {
-            return Ok(false);
-        }
-        if rt.block_on(endpoint.put_repo_bytes(name, before.to_vec(), Some(&etag)))? {
-            return Ok(true);
         }
     }
 }
