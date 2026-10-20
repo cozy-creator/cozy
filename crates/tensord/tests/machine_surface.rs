@@ -1006,8 +1006,8 @@ mod v1_api {
     }
 
     /// `cozy model quantize`'s shape on CPU: a job's Runtime writes its declared weights output
-    /// into the machine's store and publishes its header, a product of its log. A warm run keeps
-    /// that held checkpoint under a local alias.
+    /// into the machine's store as a `local/derived` tree and shows its reference, a product of
+    /// its log. A warm run keeps that held tree's checkpoint under a local alias.
     #[tokio::test]
     async fn a_job_writes_a_weights_output_kept_under_a_local_alias() {
         let (machine, tools) = installing_machine().await;
@@ -1030,19 +1030,18 @@ mod v1_api {
             after: 0,
             spec: Some(spec),
         };
+        let written = |done: &v1::Outcome| -> protocol::machine::CheckpointRef {
+            let product = done.outputs.iter().find(|p| p.output == "model").unwrap_or_else(|| panic!("{done:?}"));
+            product.checkpoint.clone().unwrap_or_else(|| panic!("{product:?} is no checkpoint"))
+        };
         let events = collect(run_events(&client, &all, run("weights", job.clone())).await.unwrap())
             .await
             .unwrap();
         let done = outcome(&events);
         assert_eq!(done.status, "succeeded", "{done:?}");
-        let written = done
-            .outputs
-            .iter()
-            .find(|p| p.output == "model")
-            .unwrap_or_else(|| panic!("{done:?}"));
-        assert_eq!(written.media_type, protocol::calcifer::CHECKPOINT);
-        let result: serde_json::Value = json(&done.result);
-        assert!(result.to_string().contains(&written.digest), "{result} names {written:?}");
+        let first = written(&done);
+        assert_eq!(first.repo_id, "local/derived", "{first:?}");
+        assert!(first.revision.starts_with("sha256:"), "a revision is the tree's id: {first:?}");
         // A writer is never memoized: the same call runs again. Its derivation replays the
         // committed output of the same code and declaration, so its output is the same.
         assert!(!done.memoized && done.computation_digest.is_empty(), "{done:?}");
@@ -1052,31 +1051,28 @@ mod v1_api {
         let again = outcome(&events);
         assert_eq!(again.status, "succeeded", "{again:?}");
         assert!(!again.memoized && again.computation_digest.is_empty(), "{again:?}");
-        let rewritten = again.outputs.iter().find(|p| p.output == "model").unwrap();
-        assert_eq!((&rewritten.digest, rewritten.length), (&written.digest, written.length));
+        assert_eq!(written(&again), first);
         // A parameter that is not a weight is the request too: the same function, slot and
         // derivation with another size derives anew, never replaying the first output.
         let wider = v1::RunSpec { payload: v1::Json::parse(r#"{"size":128}"#).ok(), ..job.clone() };
         let events = collect(run_events(&client, &all, run("weights-wider", wider)).await.unwrap()).await.unwrap();
         let widened = outcome(&events);
         assert_eq!(widened.status, "succeeded", "{widened:?}");
-        let other = widened.outputs.iter().find(|p| p.output == "model").unwrap();
-        assert_ne!(other.digest, written.digest, "a size-128 table replayed the size-64 output");
-        let held = tensorfs::store::Store::open(machine.store()).unwrap();
-        let reference = tensorfs::format::ObjectRef {
-            sha256: written.digest.trim_start_matches("sha256:").into(),
-            length: written.length,
-        };
-        held.checkpoint(&reference).unwrap();
+        assert_ne!(written(&widened).revision, first.revision, "a size-128 table replayed the size-64 output");
+        let store = tensord::storage::open(&machine.store()).unwrap();
+        let tree = tensord::storage::held(&store, &first.revision).unwrap();
+        let header = store.tree(&tree).unwrap().variant(Some(&first.variant)).unwrap().1.clone();
 
-        // The held checkpoint kept under a local alias, as `cozy model download … local/tiny`
-        // keeps a model: no Hub, no publication.
+        // The held tree's checkpoint kept under a local alias, as `cozy model download …
+        // local/tiny` keeps a model: no Hub, no publication.
         let keep = v1::RunSpec {
             kind: v1::RunKind::Warm,
             models: vec![v1::ModelChoice {
                 parameter: "model".into(),
-                manifest: written.digest.clone(),
-                manifest_length: written.length,
+                repository: first.repo_id.clone(),
+                manifest: first.revision.clone(),
+                manifest_length: tree.length,
+                lane: first.variant.clone(),
                 ..Default::default()
             }],
             weights_destination: "local/tiny".into(),
@@ -1090,7 +1086,9 @@ mod v1_api {
         assert_eq!(done.status, "succeeded", "{done:?}");
         let result: serde_json::Value = json(&done.result);
         assert_eq!(result["models"][0]["published"]["destination"], "local/tiny", "{result}");
-        assert_eq!(result["models"][0]["published"]["checkpoint"], written.digest, "{result}");
+        assert_eq!(result["models"][0]["published"]["checkpoint"], header.id(), "{result}");
+        let kept = tensord::storage::local(&store, "local/tiny", None, None).unwrap().unwrap();
+        assert_eq!(kept.header, header);
 
         // A file that was never written is refused at submit: the run takes custody of none.
         let unwritten = v1::RunSpec {
