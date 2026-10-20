@@ -12,7 +12,7 @@ use pyo3::exceptions::{PyBufferError, PyException};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use pyo3::{create_exception, ffi};
-use varena::gpu::Pin;
+use varena::gpu::{FillPin, Pin};
 use varena::placement::{Placement, Relief, Stats};
 use varena::plan::Tier;
 use varena::{Error, Result};
@@ -113,25 +113,26 @@ struct PyPart {
     key: String,
     role: String,
     dtype: String,
-    shape: Vec<u64>,
+    shape: Py<PyTuple>,
     region: u32,
     offset: u64,
     nbytes: u64,
 }
-impl From<Part> for PyPart {
-    fn from(p: Part) -> Self {
-        Self {
+impl PyPart {
+    fn new(py: Python<'_>, p: Part) -> PyResult<Self> {
+        Ok(Self {
             component: p.component,
             key: p.key,
             role: p.role,
             dtype: p.dtype,
-            shape: p.shape,
+            shape: PyTuple::new(py, p.shape)?.unbind(),
             region: p.region,
             offset: p.offset,
             nbytes: p.nbytes,
-        }
+        })
     }
 }
+
 #[pyclass(name = "WeightSet", module = "tensorfs.varena", frozen)]
 struct PyWeightSet(Arc<Model>);
 #[pymethods]
@@ -157,8 +158,13 @@ impl PyWeightSet {
         self.0.regions.clone()
     }
     #[getter]
-    fn parts(&self) -> Vec<PyPart> {
-        self.0.parts.clone().into_iter().map(Into::into).collect()
+    fn parts(&self, py: Python<'_>) -> PyResult<Vec<PyPart>> {
+        self.0
+            .parts
+            .clone()
+            .into_iter()
+            .map(|part| PyPart::new(py, part))
+            .collect()
     }
 }
 
@@ -237,13 +243,35 @@ impl PyPlane {
             .next
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| raise(py, Error::Invalid("model ids exhausted".into())))?;
-        // The GPU-owned writable callback guard is wired with Placement's fill seam.
-        if fill.is_some() {
-            return Err(raise(
-                py,
-                Error::Unsupported("writable fill guard is being integrated".into()),
-            ));
-        }
+        let page_map = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let transform = fill.map(|callback| {
+            let page_map = page_map.clone();
+            Arc::new(move |page: u64, write: FillPin| {
+                let region = page_map
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .position(|id| *id == page)
+                    .ok_or_else(|| Error::Invalid("fill page is not registered".into()))?;
+                let (raw, owner) = PyPinned::writable(write, region as u32);
+                let stream = raw.stream;
+                let result = Python::attach(|py| {
+                    let raw = Py::new(py, raw)?;
+                    let result = callback
+                        .bind(py)
+                        .call1((region, raw.clone_ref(py), stream))
+                        .map(|_| ());
+                    raw.drop_ref(py);
+                    result
+                });
+                // No consumer retained this view: publish its release now, outside the GIL,
+                // before the fill checks for escaped write leases. Escaped views keep it.
+                if Arc::strong_count(&owner) == 1 {
+                    owner.release_inline();
+                }
+                result.map_err(callback_error)
+            }) as Arc<varena::placement::Transform>
+        });
         let model = native(py, || {
             let layout = varena::layout::Layout::build(&ck.spans(&regions)?, &regions)?;
             let identity = serde_json::to_vec(&(&layout.digest, &fingerprint, core.gpu_uuid()?))
@@ -272,8 +300,11 @@ impl PyPlane {
                 fingerprint,
                 &layout,
                 Arc::new(ck.source(true)),
-                None,
+                transform,
             )?;
+            *page_map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = pages.clone();
             Ok(Arc::new(Model {
                 id,
                 name,
@@ -480,10 +511,45 @@ fn stats(py: Python<'_>, value: Stats) -> PyResult<Py<PyDict>> {
     Ok(out.unbind())
 }
 
-struct HeldPin(Option<Pin>);
+enum PinKind {
+    Read(Pin),
+    Write(FillPin),
+}
+impl PinKind {
+    fn wait_on(&self, stream: usize) -> Result<()> {
+        match self {
+            Self::Read(pin) => pin.wait_on(stream),
+            Self::Write(pin) => pin.wait_on(stream),
+        }
+    }
+}
+struct HeldPin(Mutex<Option<PinKind>>);
+impl HeldPin {
+    fn wait_on(&self, stream: usize) -> Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .ok_or_else(|| Error::Closed("pinned region".into()))?
+            .wait_on(stream)
+    }
+    fn release_inline(&self) {
+        drop(
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
+}
 impl Drop for HeldPin {
     fn drop(&mut self) {
-        if let Some(pin) = self.0.take() {
+        if let Some(pin) = self
+            .0
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
             crate::cleanup::defer(pin);
         }
     }
@@ -499,6 +565,7 @@ struct PyPinned {
     #[pyo3(get)]
     writable: bool,
     device: i32,
+    stream: usize,
     pin: Arc<HeldPin>,
 }
 impl PyPinned {
@@ -509,8 +576,25 @@ impl PyPinned {
             nbytes: pin.bytes,
             writable: false,
             device,
-            pin: Arc::new(HeldPin(Some(pin))),
+            stream: 0,
+            pin: Arc::new(HeldPin(Mutex::new(Some(PinKind::Read(pin))))),
         }
+    }
+    fn writable(pin: FillPin, region: u32) -> (Self, Arc<HeldPin>) {
+        let (ptr, nbytes, device, stream) = (pin.ptr, pin.bytes, pin.device(), pin.stream);
+        let owner = Arc::new(HeldPin(Mutex::new(Some(PinKind::Write(pin)))));
+        (
+            Self {
+                region,
+                ptr,
+                nbytes,
+                writable: true,
+                device,
+                stream,
+                pin: owner.clone(),
+            },
+            owner,
+        )
     }
 }
 const KDL_CUDA: i32 = 2;
@@ -590,9 +674,7 @@ impl PyPinned {
             return Err(PyBufferError::new_err("pinned region is on another device"));
         }
         let stream = crate::varena::stream(stream)?;
-        if let Some(pin) = &self.pin.0 {
-            native(py, || pin.wait_on(stream))?;
-        }
+        native(py, || self.pin.wait_on(stream))?;
         let len = i64::try_from(self.nbytes)
             .map_err(|_| PyBufferError::new_err("region is too large for DLPack"))?;
         let held = Box::into_raw(Box::new(Held {
