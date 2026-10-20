@@ -252,19 +252,13 @@ impl Runs {
                 continue;
             }
             // A tree's files were written too: each its manifest names.
-            let manifest: Value = serde_json::from_slice(&std::fs::read(path)?)
-                .map_err(|_| refused("invalid_request", format!("input tree {} has no readable manifest", input.input_id)))?;
-            for entry in manifest["entries"].as_array().into_iter().flatten() {
-                let (Some(sha), Some(length)) = (entry["blob"]["sha256"].as_str(), entry["blob"]["length"].as_u64()) else {
-                    return Err(refused("invalid_request", format!("input tree {} names a file without its blob", input.input_id)));
-                };
-                if self.objects.path(actor, &format!("sha256:{sha}"))?.is_none_or(|(_, held)| held != length) {
-                    return Err(unwritten(&format!("{}/{}", input.input_id, entry["path"].as_str().unwrap_or_default())));
+            let files = crate::trees::parse(&std::fs::read(path)?)
+                .map_err(|e| refused("invalid_request", format!("input tree {}: {e}", input.input_id)))?;
+            for (member, object) in files {
+                if self.objects.path(actor, &format!("sha256:{}", object.sha256))?.is_none_or(|(_, held)| held != object.length) {
+                    return Err(unwritten(&format!("{}/{member}", input.input_id)));
                 }
-                references.push(ObjectRef {
-                    sha256: sha.into(),
-                    length,
-                });
+                references.push(object);
             }
         }
         // A local source is refused here, not accepted to fail: the run takes custody of its
