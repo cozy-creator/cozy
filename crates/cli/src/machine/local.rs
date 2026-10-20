@@ -10,6 +10,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use platform::{
     lock::{Kind as LockKind, LockFile},
+    process::Birth,
     service::{ServiceSpec, Services},
 };
 use protocol::{
@@ -282,21 +283,36 @@ pub(crate) fn root_and_store(ctx: &Context) -> Result<(PathBuf, Option<PathBuf>)
 /// For `cozy uninstall`: ends the machine now, with whatever it runs, removes its service, and
 /// waits until every process it was has exited.
 pub(crate) fn end(ctx: &Context, root: &Path) -> Result<(), Error> {
-    let holder = LockFile::new(root.join("var/lib/cozy/machine/agent.lock")).holder();
-    let birth = holder
-        .ok()
-        .flatten()
-        .and_then(|record| serde_json::from_slice::<platform::process::Birth>(&record).ok());
-    let tree = (birth.filter(|_| !free(root))).map_or(vec![], |b| platform::process::tree(b.pid));
+    let tree = processes(root);
     let services = services(ctx);
     if services.available() {
         services
             .uninstall(SERVICE)
             .map_err(|e| service_error("machine_stop_failed", e))?;
     }
-    end_detached(root)?;
     platform::process::end_tree(&tree)
-        .map_err(|e| Error::new(Kind::Unavailable, "machine_stop_failed", e.to_string()))
+        .map_err(|e| Error::new(Kind::Unavailable, "machine_stop_failed", e.to_string()))?;
+    end_detached(root)
+}
+
+/// The running machine's processes, eldest first: the holder of its root's lock and all it
+/// started, and on Windows the stable parent above it, which would start a killed service again.
+fn processes(root: &Path) -> Vec<platform::process::Exact> {
+    let lock = LockFile::new(root.join("var/lib/cozy/machine/agent.lock"));
+    let holder = (!free(root))
+        .then(|| lock.holder().ok().flatten())
+        .flatten();
+    let Some(birth) = holder.and_then(|record| serde_json::from_slice::<Birth>(&record).ok())
+    else {
+        return vec![];
+    };
+    // A parent is born before its child; an older PID's reuse is not.
+    #[cfg(windows)]
+    let birth = (platform::process::parent_of(birth.pid).ok())
+        .and_then(|pid| Birth::of(pid).ok())
+        .filter(|parent| parent.start_ticks <= birth.start_ticks)
+        .unwrap_or(birth);
+    platform::process::tree(birth.pid)
 }
 
 /// Whether nothing holds the machine's root: no machine has run there, or none runs now.
