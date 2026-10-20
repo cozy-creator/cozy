@@ -184,3 +184,68 @@ fn metadata_lengths_duplicates_output_and_overlap_are_checked_before_write() {
     assert_eq!(error.kind, Kind::Invalid);
     assert_eq!(storage, before);
 }
+
+#[test]
+fn zero_logical_output_can_still_have_a_nonempty_codebook_owner() {
+    let shape = [0, 256];
+    let weight = [0, 128];
+    let relative = [0, 16];
+    let channel = [0];
+    let codebook = [16];
+    let table: Vec<_> = (0..16).flat_map(|i| (i as f32).to_le_bytes()).collect();
+    let encoding = Encoding {
+        scheme: "comfy.asym_w4a8_int8".into(),
+        params: std::collections::BTreeMap::from([
+            ("group_size".into(), 16u64.into()),
+            ("rotation_size".into(), 256u64.into()),
+        ]),
+    };
+    let parts = [
+        Part {
+            role: "weight",
+            dtype: &Dtype::I8,
+            shape: &weight,
+            src: Src::Host(std::ptr::null()),
+            len: 0,
+        },
+        Part {
+            role: "weight_s_rel",
+            dtype: &Dtype::F32,
+            shape: &relative,
+            src: Src::Host(std::ptr::null()),
+            len: 0,
+        },
+        Part {
+            role: "weight_s_channel",
+            dtype: &Dtype::F32,
+            shape: &channel,
+            src: Src::Host(std::ptr::null()),
+            len: 0,
+        },
+        Part {
+            role: "weight_codebook",
+            dtype: &Dtype::F32,
+            shape: &codebook,
+            src: Src::Host(table.as_ptr()),
+            len: table.len(),
+        },
+    ];
+    assert_eq!(parts.iter().map(|p| p.len).sum::<usize>(), 64);
+    unsafe {
+        decode::into(
+            &encoding,
+            &Dtype::BF16,
+            &shape,
+            &parts,
+            Output {
+                dtype: &Dtype::BF16,
+                shape: &shape,
+                dst: Dst::Host {
+                    ptr: std::ptr::null_mut(),
+                    len: 0,
+                },
+            },
+        )
+    }
+    .unwrap();
+}
