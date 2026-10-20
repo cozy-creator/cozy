@@ -2874,6 +2874,9 @@ mod admission_tests {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::with_capacity(1024)
+        }
+        fn with_capacity(capacity: u64) -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let name = format!(
                 "admission-{}-{}",
@@ -2881,7 +2884,7 @@ mod admission_tests {
                 NEXT.fetch_add(1, Relaxed)
             );
             Self {
-                ledger: Ledger::create(&name, 1024).unwrap(),
+                ledger: Ledger::create(&name, capacity).unwrap(),
                 name,
             }
         }
@@ -2940,27 +2943,50 @@ mod admission_tests {
 
     #[test]
     fn an_idle_adaptive_request_can_try_after_noop_cache_release_despite_its_observed_peak() {
-        let name = format!("idle-admission-{}", uuid::Uuid::new_v4());
-        let fixture = Fixture { ledger: Ledger::create(&name, 25_153_044_480).unwrap(), name };
+        let fixture = Fixture::with_capacity(25_153_044_480);
         let row = fixture.ledger.claim(std::process::id()).unwrap();
-        let mut snapshot = Snapshot { context: 331_350_016, ..Default::default() };
+        let mut snapshot = Snapshot {
+            context: 331_350_016,
+            ..Default::default()
+        };
         snapshot.classes[Class::Pinned.as_usize()] = 100_949_504;
-        fixture.ledger.record_peak("h3", "shape", 24_777_107_456).unwrap();
+        fixture
+            .ledger
+            .record_peak("h3", "shape", 24_777_107_456)
+            .unwrap();
         row.publish(&snapshot, 10998).unwrap();
         assert!(!fixture.ledger.fits("h3", "shape").unwrap());
-        let release = row.cache_release().unwrap().expect("idle cache release requested");
-        assert!(!fixture.ledger.fits("h3", "shape").unwrap(), "in-flight cleanup is not quiescence");
+        let release = row
+            .cache_release()
+            .unwrap()
+            .expect("idle cache release requested");
+        assert!(
+            !fixture.ledger.fits("h3", "shape").unwrap(),
+            "in-flight cleanup is not quiescence"
+        );
         drop(release); // A real no-op acknowledgement: context and pins stay exactly as published.
-        assert!(fixture.ledger.fits("h3", "shape").unwrap(), "observed peak permanently blocked an idle adaptive call");
+        assert!(
+            fixture.ledger.fits("h3", "shape").unwrap(),
+            "observed peak permanently blocked an idle adaptive call"
+        );
         assert_eq!(fixture.ledger.table.rows().unwrap()[0].snapshot, snapshot);
         assert_eq!(fixture.ledger.capacity(), 25_153_044_480);
         assert_eq!(fixture.ledger.measured("h3", "shape"), Some(24_777_107_456));
-        snapshot.requests = vec![Running { id: 2, remaining: Some(1) }];
+        snapshot.requests = vec![Running {
+            id: 2,
+            remaining: Some(1),
+        }];
         row.publish(&snapshot, 10999).unwrap();
-        assert!(!fixture.ledger.fits("h3", "shape").unwrap(), "running work lost conservative admission");
+        assert!(
+            !fixture.ledger.fits("h3", "shape").unwrap(),
+            "running work lost conservative admission"
+        );
         snapshot.requests[0].remaining = None;
         row.publish(&snapshot, 11000).unwrap();
-        assert!(!fixture.ledger.fits("h3", "shape").unwrap(), "unknown running work was admitted beside");
+        assert!(
+            !fixture.ledger.fits("h3", "shape").unwrap(),
+            "unknown running work was admitted beside"
+        );
     }
 
     #[test]
