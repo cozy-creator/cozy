@@ -1,0 +1,178 @@
+{
+  "acquisitions": [
+    {
+      "kind": "source-metadata",
+      "object": {
+        "length": 743,
+        "sha256": "bebd6c6966f33bf53d176bbc3520ed2021854f5bcd8446b2ad2819ff3e6d4cff"
+      },
+      "via": "existing-presign-and-immutable-GET"
+    },
+    {
+      "kind": "source-metadata",
+      "object": {
+        "length": 1666,
+        "sha256": "aa56482a2df92f23ffe118192b3408f9fcc29fffeb3146a8072867fdce340a0e"
+      },
+      "via": "existing-presign-and-immutable-GET"
+    },
+    {
+      "kind": "source-metadata",
+      "object": {
+        "length": 370585,
+        "sha256": "740292010b05a829458fe85ead36dbb4a070eb432e798654b06b216825eaab6f"
+      },
+      "via": "existing-presign-and-immutable-GET"
+    },
+    {
+      "kind": "source-metadata",
+      "object": {
+        "length": 1302,
+        "sha256": "f863fed961b1de37794461db969655df65776ed5bdcd1295dcf3d0de42c78195"
+      },
+      "via": "existing-presign-and-immutable-GET"
+    },
+    {
+      "kind": "source-metadata",
+      "object": {
+        "length": 36592,
+        "sha256": "5046ca193cb7cf3149f81b6a6b3916478d8d16b05a2022f0d72edb82b3e09b31"
+      },
+      "via": "existing-presign-and-immutable-GET"
+    },
+    {
+      "kind": "source-metadata",
+      "object": {
+        "length": 36593,
+        "sha256": "94b559f5707a02b1122e5cac4ee3bc269bd881cb13eed2c7452f7faa8a46d5be"
+      },
+      "via": "existing-presign-and-immutable-GET"
+    },
+    {
+      "kind": "source-metadata",
+      "object": {
+        "length": 1572,
+        "sha256": "8839b77f10da756d0ac5962e68862ca9867a195eafe64d930fb8a3630d72ab99"
+      },
+      "via": "existing-presign-and-immutable-GET"
+    },
+    {
+      "canonical_url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/LICENSE",
+      "kind": "upstream-metadata",
+      "object": {
+        "length": 17604,
+        "sha256": "59b99642b95ea21630e311198ddbfffbfe05aadba0c2f5d884cbdf4efcc90f44"
+      },
+      "via": "recorded-HTTPS-GET"
+    },
+    {
+      "canonical_url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/README.md",
+      "kind": "upstream-metadata",
+      "object": {
+        "length": 38406,
+        "sha256": "f0116a90332496bdfcc827320c603a26b849c73bf804f2674d03682fbbd2334a"
+      },
+      "via": "recorded-HTTPS-GET"
+    }
+  ],
+  "format": "cozy.a11.metadata-bundle/1",
+  "objects": {
+    "5046ca193cb7cf3149f81b6a6b3916478d8d16b05a2022f0d72edb82b3e09b31": {
+      "length": 36592,
+      "sha256": "5046ca193cb7cf3149f81b6a6b3916478d8d16b05a2022f0d72edb82b3e09b31"
+    },
+    "740292010b05a829458fe85ead36dbb4a070eb432e798654b06b216825eaab6f": {
+      "length": 370585,
+      "sha256": "740292010b05a829458fe85ead36dbb4a070eb432e798654b06b216825eaab6f"
+    },
+    "8839b77f10da756d0ac5962e68862ca9867a195eafe64d930fb8a3630d72ab99": {
+      "length": 1572,
+      "sha256": "8839b77f10da756d0ac5962e68862ca9867a195eafe64d930fb8a3630d72ab99"
+    },
+    "94b559f5707a02b1122e5cac4ee3bc269bd881cb13eed2c7452f7faa8a46d5be": {
+      "length": 36593,
+      "sha256": "94b559f5707a02b1122e5cac4ee3bc269bd881cb13eed2c7452f7faa8a46d5be"
+    },
+    "aa56482a2df92f23ffe118192b3408f9fcc29fffeb3146a8072867fdce340a0e": {
+      "length": 1666,
+      "sha256": "aa56482a2df92f23ffe118192b3408f9fcc29fffeb3146a8072867fdce340a0e"
+    },
+    "bebd6c6966f33bf53d176bbc3520ed2021854f5bcd8446b2ad2819ff3e6d4cff": {
+      "length": 743,
+      "sha256": "bebd6c6966f33bf53d176bbc3520ed2021854f5bcd8446b2ad2819ff3e6d4cff"
+    },
+    "f863fed961b1de37794461db969655df65776ed5bdcd1295dcf3d0de42c78195": {
+      "length": 1302,
+      "sha256": "f863fed961b1de37794461db969655df65776ed5bdcd1295dcf3d0de42c78195"
+    }
+  },
+  "replay": {
+    "/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/LICENSE": {
+      "length": 17604,
+      "sha256": "59b99642b95ea21630e311198ddbfffbfe05aadba0c2f5d884cbdf4efcc90f44"
+    },
+    "/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/README.md": {
+      "length": 38406,
+      "sha256": "f0116a90332496bdfcc827320c603a26b849c73bf804f2674d03682fbbd2334a"
+    },
+    "/api/models/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe?recursive=true": {
+      "length": 193,
+      "sha256": "31f01d85c846e78e5b85bec9be4ebd9a29730768d0bbc350f1168088c616f4ef"
+    }
+  },
+  "repos": [
+    {
+      "checkpoints": [],
+      "name": "paul/minimax-h3",
+      "releases": [
+        {
+          "lanes": {
+            "int8": {
+              "length": 743,
+              "sha256": "bebd6c6966f33bf53d176bbc3520ed2021854f5bcd8446b2ad2819ff3e6d4cff"
+            }
+          },
+          "revision": 7,
+          "version": "1.0.0-rc.3",
+          "yanked": false
+        }
+      ]
+    }
+  ],
+  "source_base": "25a1d2f6bfbf07e84f06a110b30083b9fb5a45f2",
+  "source_read_lists": [
+    {
+      "files": {
+        "audio_vae/config.json": {
+          "length": 1666,
+          "sha256": "aa56482a2df92f23ffe118192b3408f9fcc29fffeb3146a8072867fdce340a0e"
+        },
+        "model.cozytensors": {
+          "length": 370585,
+          "sha256": "740292010b05a829458fe85ead36dbb4a070eb432e798654b06b216825eaab6f"
+        },
+        "text_encoder/config.json": {
+          "length": 1302,
+          "sha256": "f863fed961b1de37794461db969655df65776ed5bdcd1295dcf3d0de42c78195"
+        },
+        "transformer/config.json": {
+          "length": 36592,
+          "sha256": "5046ca193cb7cf3149f81b6a6b3916478d8d16b05a2022f0d72edb82b3e09b31"
+        },
+        "transformer_ref/config.json": {
+          "length": 36593,
+          "sha256": "94b559f5707a02b1122e5cac4ee3bc269bd881cb13eed2c7452f7faa8a46d5be"
+        },
+        "vae/config.json": {
+          "length": 1572,
+          "sha256": "8839b77f10da756d0ac5962e68862ca9867a195eafe64d930fb8a3630d72ab99"
+        }
+      },
+      "manifest": {
+        "length": 743,
+        "sha256": "bebd6c6966f33bf53d176bbc3520ed2021854f5bcd8446b2ad2819ff3e6d4cff"
+      },
+      "name": "paul/minimax-h3"
+    }
+  ]
+}
