@@ -6,6 +6,7 @@
 //! blobs the Hub lacks are sent, then the repo document is replaced under `If-Match`. Running it
 //! again changes nothing. Each model's document as it was is kept in the audit directory: the
 //! rollback puts it back in the Hub's storage, since the Hub never takes a release back to lanes.
+//! `--dry-run` reads and converts, writes the D10 document beside the old one and sends nothing.
 //! `--local` migrates a TensorFS 0.12 store in place; stop its machine.
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -32,6 +33,9 @@ pub(crate) struct Args {
     /// Where each model's report, and its document as it was, are written.
     #[arg(long, value_name = "DIR", default_value = "migrate-headers-audit")]
     audit: PathBuf,
+    /// Convert and report only: no object is sent and no document replaced.
+    #[arg(long, conflicts_with = "local")]
+    dry_run: bool,
 }
 
 fn failed(detail: impl Into<String>) -> Error {
@@ -77,22 +81,28 @@ pub(crate) async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     for model in args.models {
         let (token, origin, name) = (session.bearer(&client).await.map_err(hub_error)?.token, hub.origin.to_string(), model.clone());
         let file = |kind: &str| args.audit.join(format!("{}.{kind}json", model.replace('/', "__")));
-        let before = file("before.");
-        let access = access.clone();
+        let (before, after) = (file("before."), file("after."));
+        let (access, dry_run) = (access.clone(), args.dry_run);
         let done = blocking(move || {
             let local = is_loopback_origin(&origin);
             let http = Client::new(SourcePolicy { any_host: true, allow_local: local, max_redirects: 5, ..Default::default() });
             let endpoint = Arc::new(Endpoint::new(&http, &origin, Some(bearer(token)))?);
             let scratch = tempfile::tempdir()?;
             let store = Store::open(scratch.path())?;
-            let done = d10::migrate(&endpoint, &http, &name, &store, &mut Migrator::new(access, UPSTREAMS))?;
-            Ok((done.report, done.before))
+            let mut migrator = Migrator::new(access, UPSTREAMS);
+            let done = match dry_run {
+                true => d10::plan(&endpoint, &http, &name, &store, &mut migrator)?,
+                false => d10::migrate(&endpoint, &http, &name, &store, &mut migrator)?,
+            };
+            Ok((done.report, done.before, done.after))
         });
         let report = match done.await {
-            Ok((report, doc)) => {
+            Ok((report, doc, new)) => {
+                let io = |p: &Path, e: std::io::Error| failed(format!("{}: {e}", p.display()));
                 if !before.exists() {
-                    std::fs::write(&before, doc).map_err(|e| failed(format!("{}: {e}", before.display())))?;
+                    std::fs::write(&before, doc).map_err(|e| io(&before, e))?;
                 }
+                std::fs::write(&after, new).map_err(|e| io(&after, e))?;
                 report
             }
             Err(e) => {
@@ -101,7 +111,12 @@ pub(crate) async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             }
         };
         write(&file(""), &report)?;
-        output::say(ctx, &format!("{model}: {}", if report.get("error").is_some() { "failed" } else { "migrated" }));
+        let done = match (report.get("error").is_some(), args.dry_run) {
+            (true, _) => "failed",
+            (false, true) => "planned",
+            (false, false) => "migrated",
+        };
+        output::say(ctx, &format!("{model}: {done}"));
         reports.push(report);
     }
     let summary = json!({"models": reports, "audit": args.audit});

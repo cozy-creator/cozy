@@ -673,11 +673,33 @@ fn array(out: &mut Vec<u8>, n: u64) {
     }
 }
 
-/// What [`migrate`] did, and the repo document as it first read it: the rollback is that
-/// document put back in the endpoint's storage (a D10 Hub refuses a release going back to lanes).
+/// What [`migrate`] did, the repo document as it first read it (the rollback puts it back in the
+/// endpoint's storage, or deletes a v1 repo's) and the D10 document.
 pub struct Done {
     pub report: Json,
     pub before: Vec<u8>,
+    pub after: Vec<u8>,
+}
+
+/// The repo document as read, its ETag, and the D10 repo it becomes.
+fn convert(rt: &tokio::runtime::Runtime, endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &Store, migrator: &mut Migrator) -> Result<(Vec<u8>, String, Migrated)> {
+    let Fresh::Doc(doc, etag) = rt.block_on(endpoint.repo_bytes(name, None))? else {
+        return fail(Kind::NotFound, format!("no repo {name} at {}", endpoint.url()));
+    };
+    rt.block_on(old_objects(endpoint, client, scratch, &doc))?;
+    let m = migrator.repo(&doc, &|o| Ok(scratch.read(o)?))?;
+    Ok((doc, etag, m))
+}
+
+/// What [`migrate`] would do to repo `name`, sending nothing: the D10 document and the objects
+/// it would offer the endpoint (those the endpoint holds are skipped there).
+pub fn plan(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &Store, migrator: &mut Migrator) -> Result<Done> {
+    let (doc, _, mut m) = convert(&fetch::runtime()?, endpoint, client, name, scratch, migrator)?;
+    let after = m.repo.to_json()?;
+    if after != doc {
+        m.report["would_offer"] = json!({"objects": m.objects.len(), "bytes": m.objects.iter().map(|(o, _)| o.length).sum::<u64>()});
+    }
+    Ok(Done { report: m.report, before: doc, after })
 }
 
 /// Repo `name` at `endpoint` in D10: the old objects it cites fetched into `scratch` over
@@ -687,23 +709,19 @@ pub fn migrate(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &
     let rt = fetch::runtime()?;
     let (mut first, mut refused) = (None, 0);
     loop {
-        let Fresh::Doc(doc, etag) = rt.block_on(endpoint.repo_bytes(name, None))? else {
-            return fail(Kind::NotFound, format!("no repo {name} at {}", endpoint.url()));
-        };
+        let (doc, etag, mut m) = convert(&rt, endpoint, client, name, scratch, migrator)?;
         let before = first.get_or_insert_with(|| doc.clone()).clone();
-        rt.block_on(old_objects(endpoint, client, scratch, &doc))?;
-        let mut m = migrator.repo(&doc, &|o| Ok(scratch.read(o)?))?;
         if refused > 0 {
             m.report["refused_puts"] = json!(refused);
         }
-        let bytes = m.repo.to_json()?;
-        if bytes == doc {
-            return Ok(Done { report: m.report, before });
+        let after = m.repo.to_json()?;
+        if after == doc {
+            return Ok(Done { report: m.report, before, after });
         }
         let sent = rt.block_on(upload(endpoint, &m.objects))?;
-        if rt.block_on(endpoint.put_repo_bytes(name, bytes, Some(&etag)))? {
+        if rt.block_on(endpoint.put_repo_bytes(name, after.clone(), Some(&etag)))? {
             m.report["sent"] = json!({"objects": sent.0, "bytes": sent.1});
-            return Ok(Done { report: m.report, before });
+            return Ok(Done { report: m.report, before, after });
         }
         refused += 1;
     }
