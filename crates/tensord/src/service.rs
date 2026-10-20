@@ -188,12 +188,24 @@ impl Service {
         births.len()
     }
     pub fn configure_pool(&self, pool: Arc<Pool>) -> io::Result<()> {
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        self.configure_pool_with(pool, runtime.as_ref())
+    }
+    /// Production setup runs outside Tokio's entered context, just like dispatch.
+    /// Use its existing runtime explicitly; synchronous bookkeeping fixtures need none.
+    pub fn configure_pool_on(&self, pool: Arc<Pool>, runtime: &tokio::runtime::Handle) -> io::Result<()> {
+        self.configure_pool_with(pool, Some(runtime))
+    }
+    fn configure_pool_with(&self, pool: Arc<Pool>, runtime: Option<&tokio::runtime::Handle>) -> io::Result<()> {
         let mut current = self.pool.lock().unwrap();
         if current.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "the executor pool is already configured",
             ));
+        }
+        if let Some(runtime) = runtime {
+            pool.watch_memory(&self.engine, runtime)?;
         }
         *current = Some(pool.clone());
         drop(current);

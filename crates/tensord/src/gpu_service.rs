@@ -1979,28 +1979,31 @@ impl Pool {
         self.devices[device].memory.fits(plan)
     }
     #[cfg(not(unix))]
-    fn watch_memory(self: &Arc<Self>, _: &Arc<Engine>) {}
+    pub(crate) fn watch_memory(self: &Arc<Self>, _: &Arc<Engine>, _: &tokio::runtime::Handle) -> io::Result<()> { Ok(()) }
     #[cfg(unix)]
-    fn watch_memory(self: &Arc<Self>, engine: &Arc<Engine>) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return; };
+    pub(crate) fn watch_memory(self: &Arc<Self>, engine: &Arc<Engine>, runtime: &tokio::runtime::Handle) -> io::Result<()> {
         let mut watchers = self.memory_watchers.lock().unwrap();
-        if !watchers.is_empty() { return; }
-        for device in &self.devices {
-            let Ok(source) = device.memory.placement().and_then(|m| m.event_source()) else { continue; };
-            let ledger = device.memory.placement().ok().map(|m| m.ledger().clone());
+        if !watchers.is_empty() { return Ok(()); }
+        // The machine's synchronous setup and dispatch threads have no current
+        // reactor. Register all descriptors on its existing runtime before dispatch.
+        let _entered = runtime.enter();
+        let sources = self.devices.iter().map(|device| {
+            let memory = device.memory.placement()?;
+            Ok((memory.event_source()?, memory.ledger().clone()))
+        }).collect::<io::Result<Vec<_>>>()?;
+        for (source, ledger) in sources {
             let (engine, pool) = (Arc::downgrade(engine), Arc::downgrade(self));
             watchers.push(runtime.spawn(async move {
                 while crate::memory::slim::Memory::changed(&source).await.is_ok() {
                     let (Some(engine), Some(pool)) = (engine.upgrade(), pool.upgrade()) else { break; };
-                    if let Some(ledger) = &ledger {
-                        if let Ok(stalled) = ledger.stalled() {
-                            for pid in stalled { pool.end_stalled(pid); }
-                        }
+                    if let Ok(stalled) = ledger.stalled() {
+                        for pid in stalled { pool.end_stalled(pid); }
                     }
                     engine.notify_activity();
                 }
             }));
         }
+        Ok(())
     }
     #[cfg(unix)]
     fn end_stalled(&self, pid: u32) {
@@ -2030,7 +2033,6 @@ impl Pool {
         lane: Option<std::ops::Range<usize>>,
         claims: &mut Claims,
     ) -> Option<(usize, Permit)> {
-        self.watch_memory(engine);
         let range = lane.clone().unwrap_or(0..self.devices.len());
         let degree = plan.degree as usize;
         let take = |start: usize, claims: &Claims| {
@@ -4571,6 +4573,94 @@ mod tests {
         let engine = Engine::open(&root.join("execution")).unwrap();
         (root, pool, engine)
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "the eventfd admission test runs this private process"]
+    fn admission_event_ledger_child() {
+        use std::io::Read;
+        use std::os::fd::{AsFd, FromRawFd};
+        assert_eq!(std::env::var("COZY_ADMISSION_EVENT_HELPER").as_deref(), Ok("1"));
+        // SAFETY: the parent installs only this child's private control socket at stdin.
+        let mut control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(0) };
+        let file = platform::handles::recv_fd(&control).unwrap();
+        let events = platform::handles::recv_fd(&control).unwrap();
+        let ledger = varena::ledger::Ledger::adopt(file.as_fd(), events.as_fd()).unwrap();
+        let row = ledger.claim(std::process::id()).unwrap();
+        row.publish(&varena::ledger::Snapshot {
+            requests: vec![varena::ledger::Running { id: 1, remaining: None }],
+            ..Default::default()
+        }, 1).unwrap();
+        control.write_all(&[1]).unwrap();
+        control.read_exact(&mut [0]).unwrap();
+        row.publish(&varena::ledger::Snapshot::default(), 2).unwrap();
+        control.write_all(&[2]).unwrap();
+        control.read_exact(&mut [0]).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plain_setup_thread_registers_ledger_events_before_dispatch() {
+        use std::io::Read;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::{Child, Stdio};
+        struct Owner(Child);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let runtime = tokio::runtime::Handle::current();
+        // Production setup is synchronous, and its dispatcher is another plain thread.
+        let (root, pool, service) = std::thread::spawn(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            let (root, pool, unused_engine) = pool_of(1);
+            drop(unused_engine);
+            let service = crate::service::Service::open(&root.join("service"), &root.join("generations"), 1).unwrap();
+            service.configure_pool_on(pool.clone(), &runtime).unwrap();
+            assert_eq!(pool.memory_watchers.lock().unwrap().len(), 1,
+                "the plain setup thread silently omitted the ledger observer");
+            (root, pool, service)
+        }).join().unwrap();
+        let ledger = pool.devices[0].memory.placement().unwrap().ledger().clone();
+        let (mut control, theirs) = UnixStream::pair().unwrap();
+        control.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "gpu_service::tests::admission_event_ledger_child", "--ignored", "--nocapture"])
+            .env("COZY_ADMISSION_EVENT_HELPER", "1")
+            .stdin(Stdio::from(OwnedFd::from(theirs))).stdout(Stdio::null()).spawn().unwrap();
+        let child = Owner(child);
+        for fd in [ledger.fd(), ledger.events()] { platform::handles::send_fd(&control, &fd).unwrap(); }
+        control.read_exact(&mut [0]).unwrap();
+        assert!(!ledger.fits("event-only", "").unwrap(), "unknown live work must block admission");
+        let (armed, ready) = std::sync::mpsc::channel();
+        let (engine, observed) = (service.engine.clone(), ledger.clone());
+        let waiting = std::thread::spawn(move || {
+            let deadline = Instant::now() + std::time::Duration::from_secs(3);
+            let mut epoch = engine.activity_epoch();
+            armed.send(()).unwrap();
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let next = engine.wait_activity(epoch, Some(remaining));
+                assert_ne!(next, epoch, "ledger publication did not wake the engine without a new submission");
+                if observed.fits("event-only", "").unwrap() { break; }
+                epoch = next;
+            }
+        });
+        ready.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        // The only action after arming is the child publishing its completed snapshot.
+        // It stays alive, so no process exit, request arrival or permit release can wake us.
+        control.write_all(&[1]).unwrap();
+        control.read_exact(&mut [0]).unwrap();
+        waiting.join().unwrap();
+        assert!(ledger.fits("event-only", "").unwrap());
+        assert!(service.stop().unwrap());
+        drop((child, control, ledger, service, pool));
+        crate::scratch::remove(&root);
+    }
+
     fn plan(id: &str, degree: u32) -> Plan {
         Plan {
             id: id.into(),

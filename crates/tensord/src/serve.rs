@@ -170,7 +170,7 @@ pub fn dev(args: Dev) -> io::Result<()> {
         Some(config) => crate::gpu_service::GpuConfig::load(&config)?,
         None => crate::gpu_service::GpuConfig::deviceless(&root.join("cpu").join("home"))?,
     };
-    service.configure_pool(crate::gpu_service::Pool::new(&root.join("gpu"), pool, store.clone())?)?;
+    service.configure_pool_on(crate::gpu_service::Pool::new(&root.join("gpu"), pool, store.clone())?, machine_runtime()?.handle())?;
     // A Runtime wheel named here is the operator's choice, as an update's `--runtime-wheel` is: it
     // runs every package whatever the package's bounds on the pair.
     let runtime_build = (args.package_sdk.iter())
@@ -355,11 +355,11 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
         let config: crate::gpu_service::GpuConfig =
             serde_json::from_value(config).map_err(io::Error::other)?;
         let store = store.clone();
-        service.configure_pool(crate::gpu_service::Pool::new(
+        service.configure_pool_on(crate::gpu_service::Pool::new(
             &engine.join("gpu"),
             config,
             store,
-        )?)?;
+        )?, machine_runtime()?.handle())?;
     }
     if let Some(hub) = grant.hub.clone().filter(|_| rental) {
         identity.hubs = vec![(hub.origin.clone(), hub.worker_id.clone())];
