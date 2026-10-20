@@ -308,12 +308,20 @@ impl Runs {
             // Nothing moving past its learned patience fails it `no_progress`, at once: a fetch
             // stuck in a read may never return to fail it, and its rental must start idling.
             let (done, finished) = std::sync::mpsc::channel::<()>();
-            let (engine, judged, stop) = (this.service.engine.clone(), run.clone(), stoppable.stop.clone());
+            // One stall report per preparation, whichever side measured it.
+            let reported = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stalled = {
+                let (service, reported) = (this.service.clone(), reported.clone());
+                move || if !reported.swap(true, std::sync::atomic::Ordering::AcqRel) { service.stalled() }
+            };
+            let judge_stalled = stalled.clone();
+            let (service, judged, stop) = (this.service.clone(), run.clone(), stoppable.stop.clone());
             let judge = std::thread::Builder::new().name(format!("judge-{run}")).spawn(move || {
-                let waits = || engine.get(&judged).is_ok_and(|record| record.waiting.is_some());
+                let waits = || service.engine.get(&judged).is_ok_and(|record| record.waiting.is_some());
                 if let Some(verdict) = crate::process::judge_preparation(&stop, &finished, waits) {
                     let failure = Failure::machine("no_progress", verdict);
-                    if let Err(error) = engine.end_preparation(&judged, Outcome::Failed(failure)) {
+                    judge_stalled();
+                    if let Err(error) = service.engine.end_preparation(&judged, Outcome::Failed(failure)) {
                         tracing::warn!("run {judged}: its stalled preparation did not end: {error}");
                     }
                     stop.cancel();
@@ -335,6 +343,9 @@ impl Runs {
                 Ok(None) => Ok(()),
                 Ok(Some(result)) => this.service.engine.end_preparation(&run, Outcome::Completed(result)).map(drop),
                 Err(Refused { code, message }) => {
+                    if code == "no_progress" {
+                        stalled();
+                    }
                     let origin = if code.starts_with("invalid") || code.ends_with("_absent") { 6 } else { 3 };
                     let failure = Failure { status: 3, cause: 7, origin, code: code.into(), message };
                     this.service.engine.end_preparation(&run, Outcome::Failed(failure)).map(drop)
@@ -1661,6 +1672,10 @@ mod tests {
     fn a_wedged_install_fails_its_run() {
         let root = std::env::temp_dir().join(format!("cm-wedge-{}", uuid::Uuid::new_v4()));
         let (runs, objects) = local_runs(&root);
+        // A rental tells its Hub, once, which marks the offer it was bought on suspect.
+        let stalls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = stalls.clone();
+        runs.service.on_stall(move || drop(counted.fetch_add(1, std::sync::atomic::Ordering::AcqRel)));
         let manifest = hanging_package(&objects, &root.join("backend.pid"), false);
         let accepted = runs.submit("alice", "warm-1", spec(Source::Local(manifest), true, "w1")).unwrap();
         let backend = backend_pid(&runs.service.engine, &accepted.id, &root.join("backend.pid"));
@@ -1669,6 +1684,7 @@ mod tests {
         let failure = failed.failure.unwrap();
         assert!(failure.contains("no_progress") && failure.contains("no measurable progress"), "{failure}");
         assert!(gone(backend));
+        assert_eq!(stalls.load(std::sync::atomic::Ordering::Acquire), 1, "one report");
         let _ = fs::remove_dir_all(root);
     }
 

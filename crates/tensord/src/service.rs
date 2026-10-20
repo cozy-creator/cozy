@@ -54,6 +54,8 @@ pub struct Service {
     /// While it holds (an update activating), no new root run starts: queued runs are journaled
     /// and start after the restart.
     held: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// A rental's report to its Hub that a preparation made no progress (`on_stall`).
+    stall: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 /// Held while one preparation runs; the machine is not idle meanwhile.
 pub struct Preparing(Arc<Service>);
@@ -129,6 +131,7 @@ impl Service {
             started_ticks,
             queue: Default::default(),
             held: Default::default(),
+            stall: Default::default(),
         });
         service.engine.reconcile()?;
         service.reclaim();
@@ -351,6 +354,16 @@ impl Service {
     }
     pub fn hold_while(&self, held: impl Fn() -> bool + Send + Sync + 'static) {
         let _ = self.held.set(Box::new(held));
+    }
+    /// What a rental does when a preparation fails `no_progress`: tells its Hub, which marks the
+    /// offer it was bought on suspect.
+    pub fn on_stall(&self, stall: impl Fn() + Send + Sync + 'static) {
+        let _ = self.stall.set(Box::new(stall));
+    }
+    pub(crate) fn stalled(&self) {
+        if let Some(stall) = self.stall.get() {
+            stall();
+        }
     }
     pub fn preparing(self: &Arc<Self>) -> Preparing {
         self.preparing
