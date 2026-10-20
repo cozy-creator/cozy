@@ -14,7 +14,7 @@ mod value;
 
 pub use decode::{check, decode, grid::ScaleLayout, PartBytes, SCHEMES};
 pub use doc::{
-    Body, Component, Encoding, Header, Location, Metadata, ObjectRef, Part, Span, Tensor,
+    Body, ClassRef, Component, Encoding, Header, Location, Metadata, ObjectRef, Part, Span, Tensor,
 };
 pub use repo::{repo_key, Release, Repo, Tree, CHUNKS_DIR};
 #[cfg(feature = "store")]

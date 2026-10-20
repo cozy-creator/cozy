@@ -304,10 +304,10 @@ pub fn compose(store: &Store, base: &ObjectRef, selections: &[Selection]) -> io:
     let graph = serde_json_canonicalizer::to_vec(&graph).map_err(io::Error::other)?;
     let mut writer = store.writer(None, Some(&id)).map_err(storage::io_error)?;
     if let Some(pipeline) = base.pipeline() {
-        writer.pipeline(&pipeline.class, pipeline.config.clone());
+        writer.pipeline(pipeline.class.clone(), pipeline.config.clone());
     }
     for component in base.components() {
-        let mut declared = (writer.component(&component.name, &component.class, component.config.clone(), component.config_file.as_deref()))
+        let mut declared = (writer.component(&component.name, component.class.clone(), component.config.clone(), component.config_file.as_deref()))
             .map_err(storage::io_error)?;
         for (name, object) in &component.assets {
             declared.reuse_asset(name, object).map_err(storage::io_error)?;
@@ -336,7 +336,11 @@ pub fn compose(store: &Store, base: &ObjectRef, selections: &[Selection]) -> io:
 pub(crate) mod tests {
     use super::*;
     use std::time::Duration;
-    use tensorfs::format::{Config, ConfigValue, Value};
+    use tensorfs::format::{ClassRef, Config, ConfigValue, Value};
+
+    fn unet_class() -> ClassRef {
+        ClassRef::new("diffusers", "0.35.1", "UNet2DConditionModel")
+    }
     use tensorfs::writer::{Data, Source};
 
     pub(crate) fn f32s(n: usize, seed: f32) -> Vec<u8> {
@@ -348,7 +352,7 @@ pub(crate) mod tests {
     pub(crate) fn checkpoint(store: &Store, key: &str, component: &str, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> ObjectRef {
         let mut writer = store.writer(None, Some(key)).unwrap();
         let config = Config::from_iter([("a".to_string(), ConfigValue::from(1))]);
-        let mut declared = writer.component(component, "diffusers.UNet2DConditionModel", config, None).unwrap();
+        let mut declared = writer.component(component, unet_class(), config, None).unwrap();
         for (name, shape, bytes) in tensors {
             declared.put(name, &Dtype::F32, shape, Data::Plain(Source::Read(&mut bytes.as_slice()))).unwrap();
         }
@@ -389,7 +393,7 @@ pub(crate) mod tests {
         assert!(composed.tensor("unet", "proj.weight").is_err());
         assert_eq!(objects(composed, "unet", "proj.base_layer.weight"), objects(&held, "unet", "proj.weight"));
         let unet = composed.component("unet").unwrap();
-        assert_eq!((unet.class.as_str(), &unet.config), ("diffusers.UNet2DConditionModel", &held.component("unet").unwrap().config));
+        assert_eq!((&unet.class, &unet.config), (&unet_class(), &held.component("unet").unwrap().config));
         assert_eq!(composed.asset("unet", "tokenizer.json").unwrap(), b"{}");
         assert_eq!(composed.header().metadata.get("normalized"), Some(&Value::Bool(true)));
         let graph: serde_json::Value = serde_json::from_slice(&composed.asset("unet", GRAPH_FILE).unwrap()).unwrap();

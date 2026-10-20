@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value as Json};
 use tensorfs::failure::{fail, Failure, Kind, Result};
-use tensorfs::format::{Body, ObjectRef, Tree};
+use tensorfs::format::{Body, ClassRef, ObjectRef, Tree};
 use tensorfs::store::Store;
 use tensorfs::{fetch, Checkpoint, Client, Config, Convert, Download, Format, Open, Ref, Selection};
 
@@ -369,19 +369,24 @@ fn inspect(ck: &Checkpoint) -> Done {
         human.push(format!("  {}: {} tensors, {bytes} bytes", c.name, c.tensors.len()));
         human.extend(encodings.iter().map(|(e, n)| format!("    {n} × {e}")));
         let assets: Map<String, Json> = c.assets.iter().map(|(p, o)| (p.clone(), object(o))).collect();
-        components.push(json!({"name": c.name, "class": c.class, "config": c.config, "assets": assets, "bytes": bytes, "tensors": tensors}));
+        components.push(json!({"name": c.name, "class": class(&c.class), "config": c.config, "assets": assets, "bytes": bytes, "tensors": tensors}));
     }
     let chunk_bytes: u64 = header.chunks.iter().map(|c| c.length).sum();
     human.push(format!("  {} chunks, {chunk_bytes} bytes", header.chunks.len()));
     let mut doc = identity(ck);
     doc.extend([
-        ("pipeline".into(), json!(header.pipeline().map(|p| json!({"class": p.class, "config": p.config})))),
+        ("pipeline".into(), json!(header.pipeline().map(|p| json!({"class": class(&p.class), "config": p.config})))),
         ("chunks".into(), header.chunks.len().into()),
         ("bytes".into(), chunk_bytes.into()),
         ("metadata".into(), json!(header.metadata)),
         ("components".into(), Json::Array(components)),
     ]);
     Ok(Some((Json::Object(doc), human.join("\n"))))
+}
+
+/// A class as the header writes it, `[library, version, name]`.
+fn class(c: &ClassRef) -> Json {
+    json!([c.library, c.version, c.name])
 }
 
 /// `tfs conform endpoint`: every case, and a failure when a MUST failed.

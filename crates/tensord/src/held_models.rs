@@ -164,7 +164,7 @@ pub fn fixture(root: &Path) -> std::io::Result<()> {
     let store = storage::open(root)?;
     let model = |key: &str, tensor: &[u8]| -> std::io::Result<ObjectRef> {
         let mut writer = store.writer(None, Some(key)).map_err(storage::io_error)?;
-        let mut unet = writer.component("unet", "", Default::default(), None).map_err(storage::io_error)?;
+        let mut unet = writer.component("unet", Default::default(), Default::default(), None).map_err(storage::io_error)?;
         unet.asset("tokenizer.json", &[1; 1000]).map_err(storage::io_error)?;
         let shape = [tensor.len() as u64];
         unet.put("w", &tensorfs::format::Dtype::U8, &shape, Data::Plain(Source::Read(&mut &tensor[..]))).map_err(storage::io_error)?;

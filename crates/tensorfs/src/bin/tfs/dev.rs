@@ -7,7 +7,7 @@
 use std::io::Read;
 
 use tensorfs::failure::Result;
-use tensorfs::format::{Dtype, Encoding, GlobalScale, NibbleOrder, ObjectRef, ScaleLayout};
+use tensorfs::format::{ClassRef, Dtype, Encoding, GlobalScale, NibbleOrder, ObjectRef, ScaleLayout};
 use tensorfs::store::Store;
 use tensorfs::writer::{Data, PartData, Source};
 
@@ -218,16 +218,16 @@ fn plan(blocks: u64, scale: u64, plain: bool) -> Vec<Item> {
 }
 
 /// The configs: (component, class, config).
-const CONFIGS: [(&str, &str, &str); 2] = [
+const CONFIGS: [(&str, [&str; 3], &str); 2] = [
     (
         "unet",
-        "diffusers.UNet2DConditionModel",
-        r#"{"_class_name":"UNet2DConditionModel","block_out_channels":[320,640,1280],"in_channels":4}"#,
+        ["diffusers", "0.35.1", "UNet2DConditionModel"],
+        r#"{"_class_name":"UNet2DConditionModel","_diffusers_version":"0.35.1","block_out_channels":[320,640,1280],"in_channels":4}"#,
     ),
     (
         "text_encoder",
-        "transformers.CLIPTextModel",
-        r#"{"architectures":["CLIPTextModel"],"hidden_size":2048}"#,
+        ["transformers", "4.57.0", "CLIPTextModel"],
+        r#"{"architectures":["CLIPTextModel"],"hidden_size":2048,"transformers_version":"4.57.0"}"#,
     ),
 ];
 
@@ -235,12 +235,13 @@ const CONFIGS: [(&str, &str, &str); 2] = [
 pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) -> Result<ObjectRef> {
     let mut w = store.writer(None, None)?;
     if files {
-        for (component, class, config) in CONFIGS {
+        for (component, [library, version, name], config) in CONFIGS {
             let config = serde_json::from_str(config).expect("a config");
-            w.component(component, class, config, None)?;
+            w.component(component, ClassRef::new(library, version, name), config, None)?;
         }
         let vocab = "<pad>0</pad>\n<pad>1</pad>\n";
-        w.component("tokenizer", "transformers.CLIPTokenizer", Default::default(), None)?
+        let tokenizer = ClassRef::new("transformers", "4.57.0", "CLIPTokenizer");
+        w.component("tokenizer", tokenizer, Default::default(), None)?
             .asset("vocab.txt", vocab.as_bytes())?;
     }
     for it in plan(blocks, scale, plain) {
