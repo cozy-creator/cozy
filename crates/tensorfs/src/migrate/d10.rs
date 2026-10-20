@@ -398,7 +398,7 @@ impl<'t> Migrator<'t> {
                 }
                 let mut tensors = Vec::new();
                 for c in old.components() {
-                    let ts = c.tensors.iter().cloned().map(|t| part_dtypes(&c.name, t)).collect::<Result<_>>()?;
+                    let ts = c.tensors.iter().cloned().map(|t| d10_encoding(&c.name, t)).collect::<Result<_>>()?;
                     tensors.push((c.name.clone(), ts));
                 }
                 (old.chunks.clone(), tensors, old.metadata.clone(), bytes, None)
@@ -584,10 +584,19 @@ fn check(chunks: &[ObjectRef], tensors: &[(String, Vec<Tensor>)], new: &Header, 
 /// 0.12's encodings named their scales' dtypes; D10 takes each from its part (owner,
 /// 2026-10-20), and its decoder refuses the params. Each goes once it agrees with its part.
 const DTYPE_PARAMS: [(&str, &str); 2] = [("scale_dtype", "scale"), ("pre_quant_scale_dtype", "pre_quant_scale")];
+/// 0.12 param values D10 renamed, the bytes' meaning unchanged: ConvRot's rotation was always the
+/// Kronecker power of the regular H4, misnamed "hadamard" (3253cbd2e).
+const RENAMED: [(&str, &str, &str, &str); 1] = [("int8.convrot", "rotation", "hadamard", "kron_regular_h4")];
 
-fn part_dtypes(component: &str, mut t: Tensor) -> Result<Tensor> {
+/// A 0.12 tensor's encoding in D10's terms, checked by D10's decoder.
+fn d10_encoding(component: &str, mut t: Tensor) -> Result<Tensor> {
     let Body::Encoded { encoding, parts } = &mut t.body else { return Ok(t) };
     let what = format!("{component}/{}", t.key);
+    for (scheme, key, from, to) in RENAMED {
+        if encoding.scheme == scheme && encoding.params.get(key).and_then(Value::as_str) == Some(from) {
+            encoding.params.insert(key.into(), Value::Str(to.into()));
+        }
+    }
     for (param, role) in DTYPE_PARAMS {
         let Some(named) = encoding.params.remove(param) else { continue };
         let part = parts.iter().find(|p| p.role == role).map(|p| p.dtype.name());
