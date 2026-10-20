@@ -27,8 +27,8 @@ uv pip install tensorfs
 import tensorfs
 
 checkpoint = tensorfs.open("me/model", revision="1.0", variant="bf16")
-# The same call accepts a local model folder:
-local = tensorfs.open("./model")
+# The same call accepts a local header file (and portable folders):
+local = tensorfs.open("./model.cozytensors")
 print(list(local.components))
 ```
 
@@ -195,7 +195,6 @@ Additional checkpoint properties and operations:
 | `pipeline`, `components` | Pipeline description and ordered component mapping. |
 | `metadata` | Loading/provenance metadata. |
 | `chunks`, `chunk_paths` | Chunk references and their local paths. |
-| `path` | Fetch and materialize the whole checkpoint as a folder. |
 | `Checkpoint.parse(header_bytes)` | Inspect a binary header without a store; it does not grant access to its objects. |
 | `open_chunk(index)` | Return a new read-only OS file descriptor; the caller must close it. |
 | `close()` | Release this checkpoint handle. Existing child handles remain valid. |
@@ -207,7 +206,7 @@ These representations are not serialization formats.
 
 ## Python: write, convert and publish
 
-### Write a model folder
+### Save a checkpoint file
 
 `Writer` writes the cozytensors format. To create Safetensors files, first commit the
 checkpoint and then use `tensorfs.export(..., format="safetensors")`. The export writes
@@ -217,7 +216,7 @@ weight files plus the separate configuration and supporting files required by th
 from array import array
 import tensorfs
 
-with tensorfs.Writer("./output", variant="f32") as writer:
+with tensorfs.Writer("./model.cozytensors") as writer:
     writer.metadata["source"] = "my-training-run"
     writer.pipeline("my_package.MyPipeline", {"version": 1})
     model = writer.component("model", cls="my_package.MyModel", config={"width": 2})
@@ -233,26 +232,29 @@ The context commits on normal exit. `commit()` returns a `Checkpoint` and return
 result on later successful calls. A raw Python buffer needs explicit `dtype` and `shape`;
 a DLPack input supplies them, and contradictory explicit values are refused.
 
-After commit, this example produces a folder like:
+The destination is one header file; tensor and supporting-file bytes are admitted once
+into the configured shared store:
 
 ```text
-output/
-  model.f32.cozytensors
-  chunks/
-    <sha256>
-    ...
+./model.cozytensors          # binary metadata and content-hash references
+$TENSORFS_HOME/blobs/...     # shared tensor and supporting-file bytes
 ```
 
-The `.cozytensors` file is the binary header: pipeline/component configuration, tensor
-names, dtypes, shapes, encodings and references to the data objects. The tensor and
-supporting-file bytes live in `chunks/`. Together they form the checkpoint; the header
-alone is not a self-contained model. An unnamed variant uses `model.cozytensors`.
+The header contains pipeline/component configuration, tensor names, dtypes, shapes,
+encodings and references. Store paths, credentials and endpoint URLs stay in configuration,
+not in the file. Moving or copying the file preserves its content identity. Opening it
+uses the configured store and, when needed and allowed, the configured source.
 
-`Writer(dest=None, ...)` writes to the shared store when no folder is supplied. Its options are:
+A successful save retains its data as a durable store root before atomically publishing
+the header. Ordinary cache cleanup must not evict that root. Deleting the file removes
+only that handle; releasing the shared data is an explicit store-management operation.
+
+`Writer(dest=None, ...)` keeps the checkpoint in the shared store without writing a header
+file. `dest` is a literal file path, not a directory. Its options are:
 
 | Option or member | Use |
 |---|---|
-| `variant` | Name the representation being written. |
+| `variant` | Optional repository/export label; the tensor encodings describe the stored representation. |
 | `base` | Start from an existing checkpoint and reuse unchanged data. |
 | `resume` | Resume keyed local write state. |
 | `repo_id`, `endpoint`, `token`, `ca_der` | Stream the new checkpoint to a repository using supplied access. |
@@ -279,6 +281,20 @@ A `ComponentWriter` supports:
 | `asset(name, data)` | Write a supporting file. |
 | `order(keys)` | Set tensor construction order. |
 | `has(key)` | Check a current/resumed write. |
+
+### Portable cozytensors export
+
+To transfer a complete checkpoint without relying on another machine's store, explicitly
+export the native portable folder:
+
+```python
+files = tensorfs.export(saved, "./portable", format="cozytensors")
+```
+
+This writes `model.cozytensors` (or its named variant) plus `chunks/`, keeping the same
+header bytes and content hashes. It fetches required missing objects or fails; it must not
+silently produce an incomplete portable export. Native export preserves encodings and
+does not accept `dequantize`.
 
 ### Compatibility export for legacy file-based libraries
 
@@ -310,14 +326,14 @@ and `progress`. It returns a `Checkpoint`. `resolve_source(source, token=None)` 
 pinned source reference without performing the conversion.
 
 `export(checkpoint, directory, format="safetensors", dequantize=None)` returns written
-paths. Omit `dequantize` to retain supported encoded representations in the export.
+paths. Formats are `"safetensors"` and `"cozytensors"` (native portable folder). Omit `dequantize` to retain supported encoded representations in the export.
 
 ### Download files or publish a folder
 
 ```python
 folder = tensorfs.snapshot_download("me/model", variant="bf16")
 license_path = tensorfs.hub_download("me/model", "LICENSE")
-tree_id = tensorfs.upload_folder(repo_id="me/model", folder_path="./output", token=my_token)
+tree_id = tensorfs.upload_folder(repo_id="me/model", folder_path="./portable", token=my_token)
 ```
 
 `my_token` in the examples is a credential you obtained for your endpoint.

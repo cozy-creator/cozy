@@ -101,7 +101,6 @@ impl Checkpoint {
     pub fn chunk(&self, index: usize) -> Result<File>;
     pub fn missing(&self, selection: &Selection) -> Result<Vec<ObjectRef>>;
     pub async fn fetch(&self, want: &Fetch<'_>) -> Result<Fetched>;
-    pub fn folder(&self) -> Result<PathBuf>;
 }
 // Synchronous chunk/read/asset/folder operations use bytes made available by fetch().
 // view() retains its source and availability state for the byte engine.
@@ -199,7 +198,7 @@ impl ComponentWriter<'_> {
     pub fn order(&mut self, keys: &[String]) -> Result<()>;
     pub fn has(&self, key: &str) -> Result<bool>;
 }
-pub enum Format { Safetensors }
+pub enum Format { Safetensors, Cozytensors }
 pub fn export(checkpoint: &Checkpoint, dir: &Path, format: Format,
     dequantize: Option<Dtype>) -> Result<Vec<String>>;
 ```

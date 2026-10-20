@@ -38,9 +38,9 @@ let bytes = unet.read("conv_in.weight")?;
 println!("{} bytes", bytes.len());
 ```
 
-`Client::open` also accepts a local folder or immutable reference. It returns a checkpoint
+`Client::open` also accepts a local .cozytensors file, a portable folder, or an immutable reference. It returns a checkpoint
 with metadata and source access. Rust network operations use your runtime: explicitly fetch
-before synchronous `read`, `asset`, `chunk` or `folder` operations. There is no hidden core
+before synchronous `read`, `asset`, `chunk` or `export_files` operations. There is no hidden core
 Tokio runtime.
 
 A borrowed component follows Rust's ordinary borrow rules. Clone the `Component` if it
@@ -53,8 +53,7 @@ use std::path::Path;
 use tensorfs::{Dtype, WriterOptions};
 
 let mut writer = client.writer(WriterOptions {
-    dest: Some(Path::new("./output")),
-    variant: Some("f32"),
+    dest: Some(Path::new("./model.cozytensors")),
     ..Default::default()
 })?;
 let bytes: Vec<u8> = [1.0_f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -66,6 +65,11 @@ let mut input = bytes.as_slice();
 let saved = writer.commit().await?;
 println!("saved {}", saved.id().id());
 ```
+
+A file destination writes only the header; data is retained in the shared content-addressed
+store before the header is atomically published. Store roots and endpoint configuration are
+not embedded as paths in the file. A native portable export writes a complete folder with
+chunks; ordinary file saving does not.
 
 The component borrows its writer while being filled. `commit(&mut self)` is async for both
 local and remote writes. After an upload failure, `writer.committed()` can return the strong
@@ -86,14 +90,15 @@ exact remote tree.
 For example, parse a repository reference and use the returned folder or tree:
 
 ```rust
-use tensorfs::Ref;
+use tensorfs::{Format, Ref};
 
 let model: Ref = "me/model@1.0/bf16".parse()?;
 let folder = client.snapshot_download(&model, &Fetch::default(), None, false).await?;
 println!("downloaded to {}", folder.display());
 
+tensorfs::export(&saved, Path::new("./portable"), Format::Cozytensors, None)?;
 let destination: Ref = "me/output".parse()?;
-let tree = client.upload_folder(&destination, Path::new("./output"), None).await?;
+let tree = client.upload_folder(&destination, Path::new("./portable"), None).await?;
 println!("published {}", tree.id());
 ```
 
@@ -124,7 +129,7 @@ below; normal model consumers do not need it.
 | `Fetched` | Byte counts `local`, `volume`, `origin`. |
 | `Convert` | Optional `converter`, `variant`, borrowed conversion-progress callback. |
 | `WriterOptions` | Optional `dest`, `variant`, `base`, `resume`, `repo_id`, `endpoint`, `token`, `ca_der`; implements `Default`. |
-| `Format` | `Safetensors` export. |
+| `Format` | `Safetensors` or native portable `Cozytensors` export. |
 
 `Progress` is a borrowed `Fn(u64, u64) -> Result<()> + Sync` (held bytes, total bytes).
 `ConvertProgress` additionally receives a stage string. Returning an error cancels the
@@ -149,7 +154,6 @@ a separate worker-permission mechanism.
 | `chunk(index)` | `Result<File>`; the returned file owns its descriptor. |
 | `missing(&Selection)` | `Result<Vec<ObjectRef>>`. |
 | `fetch(&Fetch).await` | `Result<Fetched>`. |
-| `folder()` | `Result<PathBuf>`, materializing available data. |
 
 A `Component` provides `name()`, `class()`, `config()`, `tensors()` and
 `assets()` metadata views. Its `read(key)` returns decoded `Vec<u8>`;

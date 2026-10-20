@@ -77,7 +77,7 @@ print(unet.cls, info.dtype, info.shape, value.nbytes)
 
 `read` returns one DLPack array for a name, or a dictionary for a list of names or the whole component; `decode=False` returns stored encoded parts. Frameworks wrap arrays
 through their DLPack entry point. `component.config` is structured JSON, `component.asset(name)` reads an asset,
-and `component.path` renders the config and assets for a path-only tokenizer or model loader.
+and explicit `component.export_files(directory)` is only a compatibility convenience for legacy path-only loaders.
 
 ## Checkpoints and repositories
 
@@ -108,19 +108,22 @@ Encoded tensors retain their parts unless `dequantize=` requests ordinary values
 from array import array
 import tensorfs
 
-with tensorfs.Writer("./output", variant="f32") as writer:
+with tensorfs.Writer("./model.cozytensors") as writer:
     component = writer.component("model", cls="", config={"width": 2})
     component.put("weight", array("f", [1, 2]), dtype="F32", shape=[2])
     component.asset("tokenizer.json", b"{}")
 checkpoint = writer.commit()
+tensorfs.export(checkpoint, "./portable", format="cozytensors")
 
-tensorfs.upload_folder(repo_id="local/example", revision="draft", folder_path="./output")
-tensorfs.upload_folder(repo_id="acme/example", folder_path="./output", endpoint="file:///srv/origin")
+tensorfs.upload_folder(repo_id="local/example", revision="draft", folder_path="./portable")
+tensorfs.upload_folder(repo_id="acme/example", folder_path="./portable", endpoint="file:///srv/origin")
 ```
 
-A plain folder holds `model.<variant>.cozytensors`, ordinary repository files, and `chunks/<sha256>` for cited
-objects. Folder writers put the header last. `Writer()` writes directly into the shared store; `base=` reuses
-unchanged tensors and `resume=` journals local work. `Writer(repo_id=…, endpoint=…, token=…)` streams new objects
+A normal save writes one .cozytensors header file, with its tensors and supporting-file bytes retained in
+the shared store. The file contains content hashes, not physical store paths. `Writer()` without a destination
+keeps the checkpoint in the store without writing a user-visible header file. An explicit native portable export
+writes `model.cozytensors` (or a named variant) plus complete `chunks/<sha256>` objects. `base=` reuses unchanged
+tensors and `resume=` journals local work. `Writer(repo_id=…, endpoint=…, token=…)` streams new objects
 and appends an unreleased tree. Its successful checkpoint carries the exact published tree; an upload failure keeps
 `writer.local_checkpoint` and remains an error.
 
@@ -132,9 +135,9 @@ Public data needs no account. [Distribution](../tensorfs/spec/distribution.md) d
 
 ## Storage and ownership
 
-The cache is internal. Its default root is `~/.cache/tensorfs`; `cache_dir=` and `TENSORFS_HOME` override it. Processes
+The shared local store is internal. Its default root is `~/.cache/tensorfs`; `cache_dir=` and `TENSORFS_HOME` override it. Processes
 share immutable objects and coordinated records. Admission hashes bytes before installing them by rename; ordinary
-opens check lengths. Explicit verification rehashes on demand. TensorFS is a library and has no daemon.
+opens check lengths. Saved local roots are retained separately from evictable download-cache entries; deleting a header file only removes that handle. Explicit verification rehashes on demand. TensorFS is a library and has no daemon.
 
 Runtime and TensorD use this same public API. Callers read and write the shared store and upload with a supplied
 credential. TensorFS owns I/O and decoding; varena owns memory placement. Installing the wheel does

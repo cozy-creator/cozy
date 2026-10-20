@@ -334,10 +334,6 @@ class Checkpoint:
         ...
 
     @property
-    def path(self) -> str:
-        ...
-
-    @property
     def pipeline(self) -> Pipeline | None:
         ...
 
