@@ -201,6 +201,7 @@ pub unsafe fn read(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats, Error>
 /// Temporary host sources are copied only into the same bounded engine-owned B7 slots.
 /// GPU work never borrows those host source addresses beyond this call, including on error.
 /// Device destination ownership still follows `read`'s checked error-completion contract.
+#[cfg(any(feature = "store", unix))]
 pub(crate) unsafe fn read_staged(copies: &[Copy], opts: &ReadOpts) -> Result<ReadStats, Error> {
     unsafe { read_impl(copies, opts, true) }
 }

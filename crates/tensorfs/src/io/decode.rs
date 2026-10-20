@@ -55,15 +55,37 @@ fn io_error(error: super::Error) -> Failure {
     error.source.into()
 }
 
-fn upload(device: i32, bytes: &[u8]) -> Result<DeviceBuffer> {
-    let buffer = DeviceBuffer::new(device, bytes.len())?;
-    if let Err(error) = write(&buffer, bytes, 0) {
-        // Staging owns any outstanding host bytes; retain this actual device allocation
-        // until the same engine proves completion, instead of freeing it on an I/O error.
-        super::device::retain_decode(None, vec![buffer]);
-        return Err(error);
+struct UploadHold(Option<DeviceBuffer>);
+impl Drop for UploadHold {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.0.take() {
+            super::device::retain_decode(None, vec![buffer]);
+        }
     }
-    Ok(buffer)
+}
+
+fn upload(device: i32, bytes: &[u8]) -> Result<DeviceBuffer> {
+    let mut hold = UploadHold(Some(DeviceBuffer::new(device, bytes.len())?));
+    write(hold.0.as_ref().expect("upload buffer live"), bytes, 0)?;
+    Ok(hold.0.take().expect("completed upload buffer"))
+}
+
+struct DecodeHold {
+    output: Option<DeviceBuffer>,
+    inputs: Vec<DeviceBuffer>,
+    scratch: Vec<DeviceBuffer>,
+    stream: Option<cuda::Stream>,
+    complete: bool,
+}
+impl Drop for DecodeHold {
+    fn drop(&mut self) {
+        if !self.complete {
+            let mut buffers = std::mem::take(&mut self.inputs);
+            buffers.append(&mut self.scratch);
+            buffers.extend(self.output.take());
+            super::device::retain_decode(self.stream.take(), buffers);
+        }
+    }
 }
 
 fn write(buffer: &DeviceBuffer, bytes: &[u8], stream: usize) -> Result<()> {
@@ -173,7 +195,16 @@ fn execute(device: i32, launch: &Launch<'_>) -> Result<DeviceBuffer> {
         upload(device, bytes(&[0i32]))?,
         upload(device, bytes(&launch.params))?,
     ];
-    let stream = cuda::Stream::new(device)?;
+    let mut hold = DecodeHold {
+        output: Some(output),
+        inputs: Vec::from(inputs),
+        scratch: Vec::new(),
+        stream: Some(cuda::Stream::new(device)?),
+        complete: false,
+    };
+    let output = hold.output.as_ref().expect("decode output live");
+    let inputs = &hold.inputs;
+    let stream = hold.stream.as_ref().expect("decode stream live");
     let _context = CtxGuard::enter(output.context())?;
     let driver = cuda::driver()?;
     let call = |stage: &str, out: u64, words: u64, n: u64| -> Result<()> {
@@ -218,7 +249,7 @@ fn execute(device: i32, launch: &Launch<'_>) -> Result<DeviceBuffer> {
         Ok(())
     };
     // Keep every allocation alive until the stream is drained, also on launch/read errors.
-    let mut scratch = Vec::new();
+    let scratch = &mut hold.scratch;
     let result = (|| {
         if launch.kind == "rotated" {
             let total = launch.params[0];
@@ -282,19 +313,15 @@ fn execute(device: i32, launch: &Launch<'_>) -> Result<DeviceBuffer> {
         }
     });
     if let Err(error) = drained {
-        // The private kernel stream and every allocation it can touch remain actual owners.
-        // io::drain retries this work through the same engine before a later release.
-        let mut buffers = Vec::from(inputs);
-        buffers.extend(scratch);
-        buffers.push(output);
-        super::device::retain_decode(Some(stream), buffers);
+        // DecodeHold retains the private stream and every allocation, including on unwind.
         return match result {
             Err(error) => Err(error),
             Ok(()) => Err(error.into()),
         };
     }
+    hold.complete = true;
     result?;
-    Ok(output)
+    Ok(hold.output.take().expect("completed decode output"))
 }
 
 #[cfg(test)]
