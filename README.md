@@ -18,18 +18,31 @@ Windows (PowerShell):
 irm https://tensorhub.com/install.ps1 | iex
 ```
 
-Both put `cozy` in `~/.cozy/bin`; `cozy update` moves to the newest release.
+Both put `cozy` in `~/.cozy/bin` and on your PATH for new terminals: open a new one, or run the line
+the installer prints. `cozy update` moves to the newest release.
 
 ## Use
 
 ```sh
 cozy login you@example.com
-cozy run fidika/sdxl prompt='a lighthouse at dusk' seed=7
+cozy run fidika/sdxl/generate prompt='a lighthouse at dusk' seed=7
 cozy machine rent            # what is for rent; then cozy machine rent <sku>
 cozy model search sdxl
 ```
 
+`cozy login` signs you up on first use, with a code it emails. Without an NVIDIA GPU here (a Mac,
+say), add `--on new` to run on a rented one. Outputs land in `~/.cozy/outputs`.
+
 `cozy --help` and `cozy <verb> --help` are the reference.
+
+## Uninstall
+
+```sh
+cozy uninstall        # lists what it removes, with sizes, and asks; --yes skips the question
+```
+
+It stops Calcifer and the machine and removes their services, `~/.cozy`, `~/.config/cozy` and the
+installer's PATH lines. Downloaded models stay unless `--all`.
 
 ## Build
 

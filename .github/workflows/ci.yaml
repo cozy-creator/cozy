@@ -9,6 +9,8 @@ on:
 
 permissions:
   contents: read
+  # Reusable dev builds may download artifacts from another run.
+  actions: read
 
 # A PR's newer push replaces its running check; every other run stands alone.
 concurrency:
@@ -30,7 +32,17 @@ jobs:
       test: >-
         uv pip install --python "$TENSORFS_TEST_PYTHON" torch &&
         "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/varena-plan.py &&
-        cargo test --workspace --locked --no-fail-fast --exclude cozy --exclude calcifer
+        cargo test --locked --no-fail-fast -p tensord
+
+  # The library suites do not install or launch a Runtime, so they need no release wheel.
+  # Run them beside the process-heavy daemon suite, preserving every previous target.
+  libraries:
+    uses: ./.github/workflows/dev-build.yaml
+    secrets: inherit
+    with:
+      ref: ${{ github.sha }}
+      build: none
+      test: cargo test --workspace --locked --no-fail-fast --exclude cozy --exclude calcifer --exclude tensord
 
   owner-day:
     if: github.event_name == 'push'

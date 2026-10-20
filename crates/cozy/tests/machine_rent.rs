@@ -27,8 +27,11 @@ fn the_catalog_lists_products_by_expected_total() {
         out.stdout.contains("NAME") && out.stdout.contains("EXPECTED"),
         "{out:?}"
     );
-    match skus.first() {
-        Some(_) => assert!(out.stderr.contains("EXPECTED is"), "{out:?}"),
+    let download = (skus.iter())
+        .map(|s| s["widths"][0]["expected_price"]["download_gb"].as_i64().unwrap())
+        .max();
+    match download {
+        Some(gb) => assert!(out.stderr.contains(&format!("and a {gb} GB model download")), "{out:?}"),
         None => assert!(out.stderr.contains("No machine is for rent"), "{out:?}"),
     }
 }

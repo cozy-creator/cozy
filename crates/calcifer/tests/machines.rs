@@ -233,24 +233,23 @@ async fn an_any_run_waits_for_a_rental_that_fits_and_goes_to_it() {
     let spec = || common::warm_spec(&hub.origin(), vec![]);
     let state = |id: &RunId| calcifer.store().run(id.as_str()).unwrap().unwrap();
 
-    // No rental yet: the run waits in the outbox, unplaced.
+    // No rental yet: the run waits in the outbox, unplaced, and says how to rent one.
     let early = calcifer
         .submit("k0", submit("any", spec()))
         .await
         .unwrap()
         .run
         .id;
-    until(&mut events, &early, |e| matches!(e, Event::Waiting { .. })).await;
+    until(&mut events, &early, |e| {
+        matches!(e, Event::Waiting { reason } if reason.starts_with("no rental is up or on its way: `--on new` rents one"))
+    })
+    .await;
     assert_eq!(state(&early).machine, None);
-    let bare = calcifer
-        .submit("k1", submit("new", spec()))
-        .await
-        .unwrap()
-        .run
-        .id;
-    // A bare `new` asks its Hub where to run it, and this computer is signed in to none.
-    let end = until(&mut events, &bare, Event::is_terminal).await;
-    assert_eq!(reason(&end), "signed_out");
+    // A bare `new` needs this computer signed in to its Hub: refused before it is recorded.
+    let bare = calcifer.submit("k1", submit("new", spec())).await;
+    let Err(calcifer::Error::Refused(refused)) = bare else { panic!("{bare:?}") };
+    assert_eq!(refused.code, "signed_out");
+    assert!(calcifer.store().run_by_number(2).unwrap().is_none(), "only k0 is recorded");
     machines.close();
 
     // A rental its Hub answered for, recorded before this Calcifer started: the waiting run
@@ -292,7 +291,7 @@ async fn an_any_run_waits_for_a_rental_that_fits_and_goes_to_it() {
         .run
         .id;
     until(&mut events, &too_big, |e| {
-        matches!(e, Event::Waiting { .. })
+        matches!(e, Event::Waiting { reason } if reason.starts_with("no rental up or on its way has 4 GPUs"))
     })
     .await;
     calcifer.cancel(&too_big).unwrap();

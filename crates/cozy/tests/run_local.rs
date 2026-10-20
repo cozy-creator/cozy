@@ -92,6 +92,14 @@ fn local_code_runs_on_a_real_machine_and_runs_again_as_edited() {
     ));
     assert_eq!(again["result"]["value"], "edited, and run again", "{again}");
 
+    // A GPU function sent to a machine with no supported GPU: it says so, and how to rent one.
+    std::fs::write(work.join("gpu.py"), SCRIPT.replace("# accelerator = false\n", "")).unwrap();
+    let gpu = cozy(&home, &work, &["run", "gpu.py", "--on", "m1", "--detach"]);
+    assert!(
+        gpu.stderr.contains("m1 has no supported GPU") && gpu.stderr.contains("--on new"),
+        "{gpu:?}"
+    );
+
     // A project directory: its functions, then one of them.
     copy(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/package/tiny"),

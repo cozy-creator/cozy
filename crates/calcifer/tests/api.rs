@@ -667,11 +667,18 @@ async fn a_run_for_a_disabled_local_machine_or_an_unknown_one_is_refused_unrecor
     let local = local.json::<Envelope>().await.unwrap().error;
     assert_eq!(local.code, "machine_not_found");
     assert_eq!(local.message, "this computer's machine is not enabled");
-    assert_eq!(
-        local.remedy.as_deref(),
-        Some("`cozy machine enable` makes this computer a machine")
-    );
-    assert_eq!(local.next, ["cozy run … --on any", "cozy machine list"]);
+    let (remedy, next) = match cfg!(target_os = "macos") {
+        true => (
+            "this Mac has no supported GPU: rent one, or `cozy machine enable` for CPU functions",
+            ["cozy run … --on new", "cozy machine enable"],
+        ),
+        false => (
+            "`cozy machine enable` makes this computer a machine; without a supported GPU, rent one",
+            ["cozy machine enable", "cozy run … --on new"],
+        ),
+    };
+    assert_eq!(local.remedy.as_deref(), Some(remedy));
+    assert_eq!(local.next, next);
     let other = submit("kiyui").await.unwrap().json::<Envelope>().await;
     assert_eq!(other.unwrap().error.message, r#"no machine named "kiyui""#);
     let listed: RunList = calcifer
