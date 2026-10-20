@@ -2,14 +2,17 @@
 //! five-field layout) become D10: a cozytensors per lane, a tree per release. Header-only:
 //! every chunk, tensor, part and location stays as it was. Run data a lane lacks comes from
 //! its family's pinned upstream ([`UPSTREAMS`], owner Decision 1) and is recorded in the
-//! header's `filled`. Deleted once it has run.
+//! header's `filled`; every lane records its `source`. Deleted once it has run.
 
 use std::collections::{btree_map::Entry, BTreeMap, HashMap};
 use std::fs;
+use std::io::Read as _;
 use std::path::Path;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use bytes::Bytes;
+use flate2::read::ZlibDecoder;
 use minicbor::Decoder;
 use serde::Deserialize;
 use serde_json::{json, Value as Json};
@@ -25,59 +28,63 @@ use crate::store::{Pin, Store};
 pub struct Upstream {
     /// `org/name` patterns, `*` any run of characters.
     pub models: &'static [&'static str],
+    /// The pinned upstream the files come from; `""` when nothing is filled.
     pub from: &'static str,
     pub files: &'static [&'static str],
-    /// The weights' pinned source, when it is not `from`.
+    /// The weights' source, when it is not `from`: `civitai://<version>`, another pin, `local`.
     pub source: Option<&'static str>,
     pub note: &'static str,
 }
 
 const NOTE: &str = "run data the lane lacked, from its family's upstream at a pinned commit";
 const SDXL: &str = "hf://stabilityai/stable-diffusion-xl-base-1.0@462165984030d82259a11f4367a4eed129e94a7b";
+const ANIMA: &str = "hf://circlestone-labs/Anima-Base-v1.0-Diffusers@073c3a9db359c31ad0e8aa268d15775473c2176c";
+const QWEN_IMAGE: &str = "hf://Qwen/Qwen-Image-2.1@790c92633540aa0cb11d9abf19eb46d861714758";
+const H3: &str = "hf://MiniMaxAI/MiniMax-H3@42ed227ee7df40d41602854ae760620d6eb651fe";
+/// What a civitai SDXL fine-tune lacks: SDXL's pipeline and both tokenizers, never its docs.
 const PIPELINE: [&str; 3] = ["model_index.json", "tokenizer/", "tokenizer_2/"];
+const ANIMA_RUN: [&str; 3] = ["modular_model_index.json", "tokenizer/", "t5_tokenizer/"];
 const DOCS: [&str; 2] = ["README", "LICENSE"];
 
 const fn row(models: &'static [&'static str], from: &'static str, files: &'static [&'static str]) -> Upstream {
     Upstream { models, from, files, source: None, note: NOTE }
 }
 
-/// The owner-approved table (2026-10-19). Civitai fine-tunes get run data only.
+const fn civitai(models: &'static [&'static str], version: &'static str) -> Upstream {
+    Upstream { models, from: SDXL, files: &PIPELINE, source: Some(version), note: NOTE }
+}
+
+/// The owner-approved table (2026-10-19, civitai and source rulings 2026-10-20), each entry
+/// checked against its pin. Civitai fine-tunes get run data only, never README or LICENSE.
 pub const UPSTREAMS: &[Upstream] = &[
-    row(&["*/sdxl", "paul/d1-*sdxl*"], SDXL, &["model_index.json", "tokenizer/", "tokenizer_2/", "README", "LICENSE"]),
-    row(
-        &[
-            "*/babes-pony", "*/big-love-xl", "*/cyberrealistic-pony", "*/cyberrealistic-xl",
-            "*/diving-illustrious-anime", "*/furrytoonmix-xl", "*/gonzalomo-xl", "*/nova-anime-xl",
-            "*/nova-furry-xl", "*/nova-orange-xl", "*/perfectdeliberate-anime", "*/pie-models-mango",
-            "*/prefect-illustrious-xl", "*/realism-illustrious", "*/wai-illustrious", "*/civitai-2831949",
-        ],
-        SDXL,
-        &PIPELINE,
-    ),
-    row(&["*/anima"], ANIMA, &["model_index.json", "tokenizer/", "README", "LICENSE"]),
-    row(&["*/anima-civitai"], ANIMA, &["model_index.json", "tokenizer/"]),
-    row(&["*/flux-3-klein"], "hf://black-forest-labs/flux-3-image-klein@8454017f9ebaada30c998fccd9f67a80c7580f68", &KLEIN),
-    row(&["*/flux-3-klein-base"], "hf://black-forest-labs/flux-3-image-klein-base@1469d27cfb9bb1bd81d3a93f5a023b39dbf136e4", &KLEIN),
+    row(&["*/sdxl", "*/sdxl-fp8-postcut-proof", "paul/d1-*sdxl*"], SDXL, &["model_index.json", "tokenizer/", "tokenizer_2/", "README", "LICENSE"]),
+    civitai(&["*/babes-pony"], "civitai://2937668"),
+    civitai(&["*/big-love-xl"], "civitai://2857189"),
+    civitai(&["*/cyberrealistic-pony"], "civitai://2884631"),
+    civitai(&["*/cyberrealistic-xl"], "civitai://2840768"),
+    civitai(&["*/diving-illustrious-anime"], "civitai://2939886"),
+    civitai(&["*/furrytoonmix-xl"], "civitai://2961728"),
+    civitai(&["*/gonzalomo-xl"], "civitai://2951793"),
+    civitai(&["*/nova-anime-xl"], "civitai://2940478"),
+    civitai(&["*/nova-furry-xl"], "civitai://2943166"),
+    civitai(&["*/nova-orange-xl"], "civitai://2945776"),
+    civitai(&["*/perfectdeliberate-anime"], "civitai://2925672"),
+    civitai(&["*/pie-models-mango"], "civitai://2913030"),
+    civitai(&["*/prefect-illustrious-xl"], "civitai://2864868"),
+    civitai(&["*/realism-illustrious", "*/civitai-2831949"], "civitai://2831949"),
+    civitai(&["*/wai-illustrious"], "civitai://2883731"),
+    row(&["*/anima"], ANIMA, &["modular_model_index.json", "tokenizer/", "t5_tokenizer/", "README", "LICENSE"]),
+    Upstream { models: &["*/anima-civitai"], from: ANIMA, files: &ANIMA_RUN, source: Some("civitai://2945208"), note: NOTE },
+    row(&["*/flux-3-klein"], "hf://black-forest-labs/flux-3-image-klein@8454017f9ebaada30c998fccd9f67a80c7580f68", &DOCS),
+    row(&["*/flux-3-klein-base"], "hf://black-forest-labs/flux-3-image-klein-base@1469d27cfb9bb1bd81d3a93f5a023b39dbf136e4", &DOCS),
     row(
         &["*/flux-3-klein-upsampler"],
         "hf://black-forest-labs/flux-3-image-klein-pup@8b069751eb5dcab23829d9c5eccb470eb8b8a4ed",
-        &["special_tokens_map.json", "README", "LICENSE"],
+        &["system_prompts.json", "README"],
     ),
-    row(
-        &["*/qwen-image-2.1", "*/reference-image"],
-        "hf://Qwen/Qwen-Image-2.1@790c92633540aa0cb11d9abf19eb46d861714758",
-        &["model_index.json", "scheduler/", "tokenizer/", "README", "LICENSE"],
-    ),
-    row(
-        &["*/qwen3.5-9b", "*/qwen3.5-9b-mtp"],
-        "hf://Qwen/Qwen3.5-9B@c202236235762e1c871ad0ccb60c8ee5ba337b9a",
-        &["generation_config.json", "special_tokens_map.json", "README", "LICENSE"],
-    ),
-    row(
-        &["*/minimax-h3", "*/minimax-h3-vsa-gate", "*/minimax-h3-turbo-exp", "*/minimax-h3-turbo-lora"],
-        "hf://MiniMaxAI/MiniMax-H3@42ed227ee7df40d41602854ae760620d6eb651fe",
-        &DOCS,
-    ),
+    row(&["*/qwen-image-2.1", "*/reference-image"], QWEN_IMAGE, &["model_index.json", "scheduler/", "processor/", "README", "LICENSE"]),
+    row(&["*/qwen3.5-9b", "*/qwen3.5-9b-mtp"], "hf://Qwen/Qwen3.5-9B@c202236235762e1c871ad0ccb60c8ee5ba337b9a", &["merges.txt", "vocab.json", "README", "LICENSE"]),
+    row(&["*/minimax-h3", "*/minimax-h3-vsa-gate", "*/minimax-h3-turbo-exp", "*/minimax-h3-turbo-lora"], H3, &DOCS),
     Upstream {
         models: &["*/minimax-h3-lightx2v", "*/minimax-h3-lightx2v-source"],
         from: "hf://lightx2v/Minimax-h3-Turbo@9bc1f3c0407805b00da9f762639cb435c644b2dc",
@@ -89,17 +96,28 @@ pub const UPSTREAMS: &[Upstream] = &[
     Upstream {
         models: &["*/seedvr2-7b"],
         from: "hf://ByteDance-Seed/SeedVR2-7B@eb0c4281d41ba3767d4f14370f0e37e9e9180c16",
-        files: &DOCS,
+        files: &["README"],
         source: Some("hf://numz/SeedVR2_comfyUI@09ced71023636e9bc8cdf9cdecfb2625d1e691e8"),
         note: NOTE,
     },
     row(&["*/birefnet"], "hf://ZhengPeng7/BiRefNet@e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4", &["README"]),
+    // Cozy's own test fixtures and outputs: nothing to fill, made here.
+    Upstream {
+        models: &[
+            "paul/attention-kernel-benchmark-*", "paul/cache-persistence-proof", "paul/cozy-mixed-input-proof",
+            "paul/creator-output-*", "paul/hardcut-upload-proof-*", "paul/h3-cp-producer-lifecycle-*",
+            "paul/h3-vae-pipeline-check", "paul/xs040-*",
+        ],
+        from: "",
+        files: &[],
+        source: Some("local"),
+        note: "",
+    },
 ];
-const ANIMA: &str = "hf://circlestone-labs/Anima-Base-v1.0-Diffusers@073c3a9db359c31ad0e8aa268d15775473c2176c";
-const KLEIN: [&str; 3] = ["model_index.json", "scheduler/", "tokenizer/"];
 
 /// Old metadata D10's loading metadata drops; `sources` becomes `source`.
 const DROPPED: [&str; 4] = ["normalized", "converters", "sources", "migrated_from"];
+const CONFIG: &str = "config.json";
 
 fn matches(pattern: &str, name: &str) -> bool {
     let (pattern, name) = (pattern.to_ascii_lowercase(), name.to_ascii_lowercase());
@@ -259,7 +277,11 @@ impl<'t> Migrator<'t> {
     /// One old lane: its header in D10 (old tensors, filled run data, configs, assets) and its
     /// repo files; every lane file is checked to have landed in one of them.
     fn lane(&mut self, manifest: &ObjectRef, upstream: Option<&Upstream>, read: Read, objects: &mut Objects) -> Result<Lane> {
-        let doc: Doc = serde_json::from_slice(&read(manifest)?).map_err(|e| invalid(format!("{}: {e}", manifest.id())))?;
+        let raw = read(manifest)?;
+        if serde_json::from_slice::<Json>(&raw).is_ok_and(|d| d.get("entries").is_some()) {
+            return fail(Kind::Invalid, format!("{} is a v1 checkpoint: U12 (`cozy model migrate`) moves it first", manifest.id()));
+        }
+        let doc: Doc = serde_json::from_slice(&raw).map_err(|e| invalid(format!("{}: {e}", manifest.id())))?;
         if !doc.format.starts_with("tensorfs.manifest/") {
             return fail(Kind::Invalid, format!("{} is a {}, not a manifest", manifest.id(), doc.format));
         }
@@ -272,6 +294,7 @@ impl<'t> Migrator<'t> {
         for (path, object) in &files {
             bytes.insert(path.clone(), read(object)?);
         }
+        let (unwrapped, provenance) = unwrap(&mut bytes).map_err(|e| invalid(format!("{}: {}", manifest.id(), e.detail)))?;
         let mut filled = Vec::new();
         for (u, entry) in upstream.iter().flat_map(|u| u.files.iter().map(move |e| (u, e))) {
             for (path, b) in self.upstream(u.from, entry)? {
@@ -298,12 +321,16 @@ impl<'t> Migrator<'t> {
         let mut metadata = old.metadata.clone();
         let sources = metadata.remove("sources");
         DROPPED.iter().for_each(|k| drop(metadata.remove(*k)));
-        let source = match (upstream, sources) {
-            (Some(u), _) => Some(Value::Str(u.source.unwrap_or(u.from).to_owned())),
+        let recorded = match (provenance, sources) {
+            (Some(p), _) => Some(Value::Str(p)),
             (None, Some(Value::List(mut s))) if s.len() == 1 => Some(s.remove(0)),
             (None, s) => s,
         };
-        metadata.extend(source.map(|s| ("source".to_owned(), s)));
+        let listed = upstream.map(|u| u.source.unwrap_or(u.from)).filter(|s| !s.is_empty());
+        let Some(source) = listed.map(|s| Value::Str(s.to_owned())).or(recorded) else {
+            return fail(Kind::Invalid, format!("{}: no source; give its model an UPSTREAMS row", manifest.id()));
+        };
+        metadata.insert("source".into(), source);
         if let (Some(u), false) = (upstream, filled.is_empty()) {
             let text = |s: &str| Value::Str(s.to_owned());
             metadata.insert("filled".into(), Value::Map(BTreeMap::from([
@@ -319,6 +346,9 @@ impl<'t> Migrator<'t> {
         let mut report = json!({"old": manifest.id(), "header": at.id()});
         if !filled.is_empty() {
             report["filled"] = json!(filled);
+        }
+        if !unwrapped.is_empty() {
+            report["unwrapped"] = json!(unwrapped);
         }
         Ok(Lane { header: at, files: repo_files, report })
     }
@@ -344,6 +374,69 @@ impl<'t> Migrator<'t> {
 
 fn invalid(detail: String) -> Failure {
     Failure { kind: Kind::Invalid, detail }
+}
+
+/// Cozy's native config wrappers become the files they hold, every key accounted for:
+/// `config.json` as `{files: {name: zlib, base64}, model_config}` (a Transformers folder), or
+/// as component configs beside `processor` files and `provenance` (Qwen-Image's first layout).
+/// Returns the files it wrote and the wrapper's recorded source.
+fn unwrap(bytes: &mut BTreeMap<String, Vec<u8>>) -> Result<(Vec<String>, Option<String>)> {
+    let Some(Ok(Json::Object(mut w))) = bytes.get(CONFIG).map(|b| serde_json::from_slice::<Json>(b)) else {
+        return Ok((vec![], None));
+    };
+    let pretty = |v: &Json| serde_json::to_vec_pretty(v).expect("JSON");
+    let (mut out, mut source) = (Vec::new(), None);
+    let transformers = w.len() == 2 && w.get("files").is_some_and(Json::is_object) && w.contains_key("model_config");
+    if transformers {
+        for (name, value) in w["files"].as_object().expect("an object") {
+            out.push((name.clone(), inflate(name, value)?));
+        }
+        out.push((CONFIG.to_owned(), pretty(&w["model_config"])));
+    } else if let Some(Json::Object(p)) = w.remove("provenance") {
+        let text = |k: &str| p.get(k).and_then(Json::as_str).unwrap_or_default().to_owned();
+        source = Some(format!("hf://{}@{}", text("source_repository"), text("source_revision")));
+        for (name, value) in w {
+            match (name.as_str(), &value) {
+                ("processor", Json::Object(files)) => {
+                    for (key, v) in files {
+                        let (file, bytes) = match (key.as_str(), v) {
+                            ("chat_template", Json::String(t)) => ("chat_template.jinja", t.clone().into_bytes()),
+                            ("tokenizer", _) => ("tokenizer.json", inflate(key, v)?),
+                            ("tokenizer_config", _) => ("tokenizer_config.json", pretty(v)),
+                            ("image_processor", _) => ("preprocessor_config.json", pretty(v)),
+                            ("video_processor", _) => ("video_preprocessor_config.json", pretty(v)),
+                            _ => return fail(Kind::Invalid, format!("config wrapper: processor {key}")),
+                        };
+                        out.push((format!("processor/{file}"), bytes));
+                    }
+                }
+                ("scheduler", Json::Object(_)) => out.push(("scheduler/scheduler_config.json".into(), pretty(&value))),
+                (_, Json::Object(_)) => out.push((format!("{name}/{CONFIG}"), pretty(&value))),
+                _ => return fail(Kind::Invalid, format!("config wrapper: {name}")),
+            }
+        }
+    } else {
+        return Ok((vec![], None));
+    }
+    bytes.remove(CONFIG);
+    let mut paths = Vec::new();
+    for (path, b) in out {
+        if bytes.insert(path.clone(), b).is_some() {
+            return fail(Kind::Invalid, format!("config wrapper and lane both hold {path}"));
+        }
+        paths.push(path);
+    }
+    Ok((paths, source))
+}
+
+/// A wrapped file: zlib, then URL-safe base64.
+fn inflate(name: &str, value: &Json) -> Result<Vec<u8>> {
+    let bad = |e: String| invalid(format!("config wrapper {name}: {e}"));
+    let text = value.as_str().ok_or_else(|| bad("not a string".into()))?;
+    let packed = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(text.trim_end_matches('=')).map_err(|e| bad(e.to_string()))?;
+    let mut out = Vec::new();
+    ZlibDecoder::new(&packed[..]).read_to_end(&mut out).map_err(|e| bad(e.to_string()))?;
+    Ok(out)
 }
 
 /// The D10 header against the old one and the lane's files: the same chunks and tensors, its
@@ -417,10 +510,16 @@ fn array(out: &mut Vec<u8>, n: u64) {
     }
 }
 
+/// What [`migrate`] did, and the repo document it replaced, for [`restore`].
+pub struct Done {
+    pub report: Json,
+    pub before: Vec<u8>,
+}
+
 /// Repo `name` at `endpoint` in D10: the old objects it cites fetched into `scratch` over
 /// `client`, what the D10 document adds uploaded where missing, then the document replaced while
 /// it is as read (read and migrated again when another writer won).
-pub fn migrate(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &Store, migrator: &mut Migrator) -> Result<Json> {
+pub fn migrate(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &Store, migrator: &mut Migrator) -> Result<Done> {
     let rt = fetch::runtime()?;
     loop {
         let Fresh::Doc(doc, etag) = rt.block_on(endpoint.repo_bytes(name, None))? else {
@@ -430,12 +529,29 @@ pub fn migrate(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &
         let mut m = migrator.repo(&doc, &|o| Ok(scratch.read(o)?))?;
         let bytes = m.repo.to_json()?;
         if bytes == doc {
-            return Ok(m.report);
+            return Ok(Done { report: m.report, before: doc });
         }
         let sent = rt.block_on(upload(endpoint, &m.objects))?;
         if rt.block_on(endpoint.put_repo_bytes(name, bytes, Some(&etag)))? {
             m.report["sent"] = json!({"objects": sent.0, "bytes": sent.1});
-            return Ok(m.report);
+            return Ok(Done { report: m.report, before: doc });
+        }
+    }
+}
+
+/// Puts `before` back as repo `name`'s document (the rollback): false when it already is. Its
+/// old objects stay at the endpoint until GC, which the rollback window must outlast.
+pub fn restore(endpoint: &Endpoint, name: &str, before: &[u8]) -> Result<bool> {
+    let rt = fetch::runtime()?;
+    loop {
+        let Fresh::Doc(now, etag) = rt.block_on(endpoint.repo_bytes(name, None))? else {
+            return fail(Kind::NotFound, format!("no repo {name} at {}", endpoint.url()));
+        };
+        if now == before {
+            return Ok(false);
+        }
+        if rt.block_on(endpoint.put_repo_bytes(name, before.to_vec(), Some(&etag)))? {
+            return Ok(true);
         }
     }
 }
@@ -499,7 +615,7 @@ pub fn store(root: &Path, migrator: &mut Migrator) -> Result<Json> {
             let path = file?.path();
             if let (Some(o), Some(name), Some("json")) = (org.file_name(), path.file_stem(), path.extension().and_then(|e| e.to_str())) {
                 let name = format!("{}/{}", o.to_string_lossy(), name.to_string_lossy());
-                repos.push(migrate(&endpoint, &client, &name, &store, migrator)?);
+                repos.push(migrate(&endpoint, &client, &name, &store, migrator)?.report);
             }
         }
     }
