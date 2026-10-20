@@ -32,7 +32,14 @@ fn raise(py: Python<'_>, error: Error) -> PyErr {
         VarenaError::new_err(error.to_string())
     };
     let value = result.value(py);
-    let _ = value.setattr("code", error.code());
+    let _ = value.setattr(
+        "code",
+        if error.is_oom() {
+            "DEVICE_FULL"
+        } else {
+            error.code()
+        },
+    );
     let _ = value.setattr("sticky", error.is_sticky());
     if let Error::DeviceFull { need, deficit } = error {
         let _ = value.setattr("need", need);
@@ -455,6 +462,14 @@ impl PyPlane {
     fn cache_bytes(&self, py: Python<'_>, cache: u64, nbytes: u64) -> PyResult<()> {
         let c = self.core(py)?;
         native(py, || c.cache_bytes(cache, nbytes))
+    }
+    fn cache_active(&self, py: Python<'_>, cache: u64, active: bool) -> PyResult<()> {
+        let c = self.core(py)?;
+        native(py, || c.cache_active(cache, active))
+    }
+    fn retained_bind(&self, py: Python<'_>, request: u64, model: u64) -> PyResult<()> {
+        let c = self.core(py)?;
+        native(py, || c.retained_bind(request, model))
     }
     fn close_cache(&self, py: Python<'_>, cache: u64) -> PyResult<()> {
         let c = self.core(py)?;
