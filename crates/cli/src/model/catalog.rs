@@ -33,7 +33,7 @@ fn available(release: &ModelCatalogRelease) -> bool {
 }
 
 fn found(card: &ModelCard) -> Found {
-    let release = card.releases.iter().find(|r| available(r));
+    let release = tensorfs::format::newest_by(card.releases.iter().filter(|r| available(r)), |r| r.release.as_str());
     Found {
         model: format!("{}/{}", card.model.org, card.model.name),
         family: card.model.family.clone().filter(|f| !f.is_empty()),

@@ -40,10 +40,13 @@ async fn checkpoint(ctx: &Context, hub: &Hub, model: &ModelRef) -> Result<(Strin
         }
         ModelRef::Hub { repo, release, lane } => {
             let card = hub_answer(client.get_model(&repo.org, &repo.name).await)?;
-            let found = card.releases.iter().find(|r| match release {
-                Some(want) => &r.release == want,
-                None => r.yanked != Some(true) && r.yanked_at.as_deref().is_none_or(str::is_empty),
-            });
+            let found = match release {
+                Some(want) => card.releases.iter().find(|r| &r.release == want),
+                None => {
+                    let live = card.releases.iter().filter(|r| r.yanked != Some(true) && r.yanked_at.as_deref().is_none_or(str::is_empty));
+                    tensorfs::format::newest_by(live, |r| r.release.as_str())
+                }
+            };
             let found = found.ok_or_else(|| {
                 Error::new(Kind::NotFound, "model_release_not_found", format!("{repo} has no release {}", release.as_deref().unwrap_or("available")))
                     .next(format!("cozy model info {repo}"))

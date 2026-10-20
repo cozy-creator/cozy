@@ -10,7 +10,7 @@ use protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{PackageRef, release_order};
+use super::PackageRef;
 use crate::{
     Context,
     machine::{Notices, route, until_ready},
@@ -527,7 +527,10 @@ pub async fn update(ctx: &Context, names: &[String], on: On) -> Result<ExitCode,
         };
         for env in held
             .iter()
-            .filter(|env| release_order(&env.release) < release_order(&row.to))
+            .filter(|env| {
+                let older = [env.release.as_str(), row.to.as_str()];
+                env.release != row.to && tensorfs::format::newest_by(older, |r| *r) == Some(row.to.as_str())
+            })
         {
             let source = Source::Installation(env.installation.clone());
             let target = format!("{package}@{}", env.release);
