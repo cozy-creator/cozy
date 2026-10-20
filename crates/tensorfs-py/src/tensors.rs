@@ -11,7 +11,7 @@ use pyo3::types::{PyDict, PyIterator, PyString};
 use tensorfs::failure::{Failure, Kind};
 use tensorfs::format::{decode, Body, Dtype, Encoding, PartBytes};
 use tensorfs::io::{DeviceBuffer, Dst, ReadOpts, Target};
-use tensorfs::store2::{Checkpoint, Error};
+use tensorfs::Checkpoint;
 
 use crate::store::{
     invalid, metadata, raise, Aligned, ArrayBuffer, CheckpointAccess, DeviceArray, FetchTensor,
@@ -59,7 +59,7 @@ impl PyTensors {
 
     fn checkpoint(&self, py: Python<'_>) -> PyResult<&Checkpoint> {
         match &self.ck {
-            Some(ck) => Ok(&ck.checkpoint),
+            Some(ck) => Ok(ck),
             None => Err(raise(
                 py,
                 Failure {
@@ -80,7 +80,10 @@ impl PyTensors {
     ) -> PyResult<()> {
         let len = dst.len();
         let ck = self.checkpoint(py)?;
-        let t = ck.tensor(&self.component, &key).or_raise(py)?;
+        let t = ck
+            .header()
+            .tensor(&self.component, &key)
+            .ok_or_else(|| invalid(py, "no such tensor"))?;
         if let (None, Body::Encoded { encoding, .. }) = (role, &t.body) {
             let length = t
                 .dtype
@@ -168,7 +171,7 @@ impl PyTensors {
             dst,
         };
         // SAFETY: the exporter keeps `out` alive and writable while `buf` is held.
-        py.detach(|| unsafe { ck.read_into(&[target], &ReadOpts::default()) })
+        py.detach(|| unsafe { tensorfs::raw::read_into(ck, &[target], &ReadOpts::default()) })
             .or_raise(py)?;
         Ok(())
     }
@@ -195,7 +198,10 @@ impl PyTensors {
             .fetch_tensors(py, &self.component, &reads)?;
         let mut wants = Vec::new();
         for (i, key) in keys.iter().enumerate() {
-            let t = ck.tensor(&self.component, key).or_raise(py)?;
+            let t = ck
+                .header()
+                .tensor(&self.component, key)
+                .ok_or_else(|| invalid(py, "no such tensor"))?;
             let parts: Vec<(&str, &Dtype, &[u64], u64)> = match &t.body {
                 Body::Data(at) => vec![("", &t.dtype, &t.shape, at.length)],
                 Body::Encoded { parts, .. } => parts
@@ -246,7 +252,7 @@ impl PyTensors {
             })
             .collect();
         // SAFETY: each destination is its own buffer, held until the read returns.
-        py.detach(|| unsafe { ck.read_into(&targets, &ReadOpts::default()) })
+        py.detach(|| unsafe { tensorfs::raw::read_into(ck, &targets, &ReadOpts::default()) })
             .or_raise(py)?;
         drop(targets);
         let mut by_key: Vec<Vec<Want>> = keys.iter().map(|_| Vec::new()).collect();
@@ -276,7 +282,10 @@ impl PyTensors {
         };
         let mut out = Vec::with_capacity(keys.len());
         for (key, mut parts) in keys.iter().zip(by_key) {
-            let t = ck.tensor(&self.component, key).or_raise(py)?;
+            let t = ck
+                .header()
+                .tensor(&self.component, key)
+                .ok_or_else(|| invalid(py, "no such tensor"))?;
             let Body::Encoded { encoding, .. } = &t.body else {
                 out.push(Bound::new(py, array(parts.remove(0)))?.into_any());
                 continue;
@@ -405,7 +414,7 @@ impl PyTensors {
     }
 
     /// Read one tensor, a chosen sequence, or all tensors in construction order.
-    #[pyo3(signature = (keys = None, *, device = "cpu", decode = true))]
+    #[pyo3(signature = (keys = None, *, device = "cpu", decode = false))]
     fn read<'py>(
         &self,
         py: Python<'py>,
@@ -416,9 +425,17 @@ impl PyTensors {
         let device = match device {
             "cpu" => None,
             "cuda" => Some(0),
-            text => Some(text.strip_prefix("cuda:")
-                .and_then(|n| n.parse::<i32>().ok()).filter(|n| *n >= 0)
-                .ok_or_else(|| invalid(py, format!("device {text:?}: expected cpu, cuda, or cuda:N")))?),
+            text => Some(
+                text.strip_prefix("cuda:")
+                    .and_then(|n| n.parse::<i32>().ok())
+                    .filter(|n| *n >= 0)
+                    .ok_or_else(|| {
+                        invalid(
+                            py,
+                            format!("device {text:?}: expected cpu, cuda, or cuda:N"),
+                        )
+                    })?,
+            ),
         };
         let single = keys.is_some_and(|keys| keys.is_instance_of::<PyString>());
         let mut keys = match keys {
@@ -458,8 +475,7 @@ impl PyTensors {
     ) -> PyResult<()> {
         if out.hasattr("__dlpack__")? {
             let held = crate::store::Dlpack::of(py, out, None, None)?;
-            let result =
-                self.fill_target(py, key, role.as_deref(), offset, held.destination());
+            let result = self.fill_target(py, key, role.as_deref(), offset, held.destination());
             py.detach(move || drop(held));
             return result;
         }
