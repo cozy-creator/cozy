@@ -18,11 +18,12 @@ class OfflineCache(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.cache = self.root / "reader"
         with tensorfs.Writer(
-            self.root / "source", cache_dir=self.root / "author"
+            cache_dir=self.root / "author"
         ) as writer:
             writer.component("model", cls="test.Model", config={}).put(
                 "weight", b"data", dtype="U8", shape=[4]
             )
+        tensorfs.export(writer.commit(), self.root / "source", format="cozytensors")
         tensorfs.upload_folder(
             repo_id="acme/offline",
             revision="one",
@@ -99,11 +100,12 @@ class OfflineCache(unittest.TestCase):
 
     def test_online_default_refreshes_then_offline_uses_last_resolution(self):
         with tensorfs.Writer(
-            self.root / "second", cache_dir=self.root / "author"
+            cache_dir=self.root / "author"
         ) as writer:
             writer.component("model", cls="test.Model", config={}).put(
                 "weight", b"next", dtype="U8", shape=[4]
             )
+        tensorfs.export(writer.commit(), self.root / "second", format="cozytensors")
         tensorfs.upload_folder(
             repo_id="acme/offline",
             revision="two",

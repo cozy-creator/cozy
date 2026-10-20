@@ -80,10 +80,11 @@ class Provider:
 def fixture(tensorfs):
     with tempfile.TemporaryDirectory(prefix="tensorfs-cuda-source-") as temp:
         root = Path(temp)
-        with tensorfs.Writer(root / "source", cache_dir=root / "writer") as writer:
+        with tensorfs.Writer(cache_dir=root / "writer") as writer:
             writer.component("model", cls="test.Model", config={}).put(
                 "weight", DATA, dtype="U8", shape=[len(DATA)]
             )
+        tensorfs.export(writer.commit(), root / "source", format="cozytensors")
         tensorfs.upload_folder(
             repo_id="acme/placement",
             revision="one",
