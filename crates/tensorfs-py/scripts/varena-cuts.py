@@ -211,6 +211,26 @@ def relax() -> None:
     check("the memo keeps no cut's input (no leftover)", seen() is None)
 
 
+def swapped() -> None:
+    """A class swapped in after the cut is installed serves (a package's fused module), and the
+    cut marks itself so a package's shape check can allow it."""
+    ff = FeedForward(64, mult=4, activation_fn="swiglu").eval()
+    cuts.install(ff)
+    calls: list[int] = []
+
+    class Counting(SwiGLU):
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            calls.append(1)
+            return SwiGLU.forward(self, hidden_states)
+
+    ff.net[0].__class__ = Counting
+    fresh(1 << 40)
+    with torch.no_grad():
+        ff(torch.randn(1, 8, 64))
+    check("a class swapped in after the cut serves", calls, calls)
+    check("the cut is marked", getattr(vars(ff.net[0])["forward"], "_varena", False))
+
+
 class FusedSwiGLU(SwiGLU):
     """A package's fused SwiGLU (H3's glue): its own forward, diffusers' class underneath."""
 
@@ -616,7 +636,7 @@ def lattice() -> None:
 
 
 def main() -> int:
-    for test in (ffn_cut, relax, fused_ffn, attention_cut, bands, vae_decode, block_catch, lattice):
+    for test in (ffn_cut, relax, swapped, fused_ffn, attention_cut, bands, vae_decode, block_catch, lattice):
         test()
     print(f"{sum(results)}/{len(results)} passed", flush=True)
     return 0 if all(results) else 1

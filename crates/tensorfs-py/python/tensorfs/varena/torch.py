@@ -1735,10 +1735,13 @@ def _fly(model: Model) -> None:
 
 
 def _hook(block: Block) -> None:
+    """The block's forward, bound: its own forward if it has one, else its class's at each call
+    (a package's later class swap, such as a fused block, takes effect)."""
     module, memory, site = block.module, block.model.memory, block.site
     assert module is not None and site is not None
     block.own_forward = "forward" in module.__dict__
-    forward = block.forward = module.forward
+    block.forward = module.forward
+    forward = block.forward if block.own_forward else cuts.current(module)
 
     def bound(*args: object, **kwargs: object) -> object:
         loose = not block.model.aloft  # run outside its model's forward: common binds with it
@@ -1754,6 +1757,7 @@ def _hook(block: Block) -> None:
             if loose:
                 memory._exit(block.model.common)
 
+    bound._varena = True  # type: ignore[attr-defined]  # what a package's shape check allows
     module.forward = bound  # type: ignore[method-assign]
 
 
