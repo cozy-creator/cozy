@@ -31,11 +31,20 @@ fn boot(home: &Path) -> (Machine, Client) {
     std::fs::create_dir_all(&keys).unwrap();
     let owner = SigningKey::from_bytes(&[6; 32]);
     std::fs::write(keys.join("owner.pem"), owner.to_pkcs8_pem(Default::default()).unwrap().as_bytes()).unwrap();
-    // The operator's GPU settings over the probe's: this runner has no GPU, so the envelope is
-    // named here. Nothing in the fixture touches a device.
+    // CPU scheduler/process fixture only: the declared envelope and inventory agree,
+    // so admission can create real ledger rows without touching CUDA. Unique identities
+    // prevent concurrent tests sharing a ledger; this does not qualify GPU placement.
     let state = home.join(".cozy/machine/var/lib/cozy/machine");
     std::fs::create_dir_all(&state).unwrap();
-    std::fs::write(state.join("gpu-config.json"), r#"{"devices": "0,1", "prespawn": false}"#).unwrap();
+    let identity = uuid::Uuid::new_v4().simple().to_string();
+    let inventory: Vec<_> = (0..2).map(|index| serde_json::json!({
+        "device_index": index, "device_name": "CPU scheduler fixture",
+        "device_uuid": format!("GPU-scheduler-{identity}-{index}"),
+        "driver_version": "fixture", "memory_bytes": 8u64 << 30, "pci_bus_id": "fixture"
+    })).collect();
+    std::fs::write(state.join("gpu-config.json"), serde_json::to_vec(&serde_json::json!({
+        "devices": "0,1", "inventory": inventory, "prespawn": false
+    })).unwrap()).unwrap();
     named_runtime::image(&home.join(".cozy/machine"));
     let mut machine = Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
