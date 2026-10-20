@@ -203,11 +203,11 @@ impl Interface {
         Ok(out)
     }
 
-    /// The public callables' names: GPU functions first (a package's main work, before its
-    /// CPU conversions), each group sorted.
+    /// The public callables' names: the package's own work first (GPU before CPU), then its
+    /// conversions, each group sorted.
     pub fn public(&self) -> Vec<&str> {
         let mut public: Vec<&Callable> = self.callables.iter().filter(|c| !c.internal).collect();
-        public.sort_unstable_by_key(|c| (c.accelerator == Some(false), c.name.as_str()));
+        public.sort_unstable_by_key(|c| (c.is_conversion(), c.accelerator == Some(false), c.name.as_str()));
         public.into_iter().map(|c| c.name.as_str()).collect()
     }
 }
