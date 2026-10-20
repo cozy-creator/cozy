@@ -541,17 +541,19 @@ fn stats(py: Python<'_>, value: Stats) -> PyResult<Py<PyDict>> {
         item.set_item("page", c.page)?;
         item.set_item("tier", format!("{:?}", c.tier).to_ascii_lowercase())?;
         item.set_item("speculative", c.speculative)?;
-        item.set_item("bytes", c.stats.bytes)?;
-        item.set_item("ns", c.stats.ns)?;
-        item.set_item("direct", c.stats.direct)?;
-        item.set_item("cached", c.stats.cached)?;
-        item.set_item("bounced", c.stats.bounced)?;
-        item.set_item("pin_ns", c.stats.pin_ns)?;
-        item.set_item("staged", c.stats.staged)?;
-        item.set_item("busy_ns", c.stats.busy_ns)?;
+        let measured = PyDict::new(py);
+        measured.set_item("bytes", c.stats.bytes)?;
+        measured.set_item("ns", c.stats.ns)?;
+        measured.set_item("direct", c.stats.direct)?;
+        measured.set_item("cached", c.stats.cached)?;
+        measured.set_item("bounced", c.stats.bounced)?;
+        measured.set_item("pin_ns", c.stats.pin_ns)?;
+        measured.set_item("staged", c.stats.staged)?;
+        measured.set_item("busy_ns", c.stats.busy_ns)?;
+        item.set_item("stats", measured)?;
         copies.push(item.unbind());
     }
-    out.set_item("trace", events)?;
+    out.set_item("events", events)?;
     out.set_item("copies", copies)?;
     out.set_item("peak", value.peak)?;
     Ok(out.unbind())
