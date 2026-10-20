@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use hub_client::{types, Credential};
+use hub_client::{Credential, types};
 use serde_json::json;
 use tensorfs::sha256::hex_digest;
 
