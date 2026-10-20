@@ -1,8 +1,8 @@
-//! TensorFS checkpoints through the plane's `register`: the parts a weight set's regions
-//! name, in header order (the construction order, #624), become a read plan over their chunk
-//! files, and those files are the weight set's source. Nothing else of the checkpoint is
-//! walked or opened, so a window registers in time proportional to the window. A part's bytes
-//! keep their chunk's 4 KiB alignment in the layout, so a region's reads are runs of whole chunks.
+//! TensorFS checkpoints through `register` and `seal`: the parts a weight set's regions name, in
+//! header order (the construction order, #624), become a read plan over their chunk files, and
+//! those files are the weight set's source. Nothing else of the checkpoint is walked or opened,
+//! so a set registers in time proportional to its regions. A part's bytes keep their chunk's
+//! 4 KiB alignment in the layout; a chunk two regions share is read once per region.
 
 use std::fs::File;
 
@@ -12,6 +12,21 @@ use tensorfs::read::{ObjectRange, Order, PlanItem, ReadPlan, Source};
 use tensorfs::store2::Checkpoint;
 
 use crate::{Error, Result};
+
+/// A checkpoint as varena reads it: its header, and the stored checkpoint when a store holds
+/// it. A header parsed alone (an executor's, granted by TensorD) has none: the grant's files
+/// or a sealed host layout are its only source.
+#[derive(Clone, Copy)]
+pub struct Ck<'a> {
+    pub header: &'a Header,
+    pub stored: Option<&'a Checkpoint>,
+}
+
+impl<'a> From<&'a Checkpoint> for Ck<'a> {
+    fn from(ck: &'a Checkpoint) -> Self {
+        Ck { header: ck.header(), stored: Some(ck) }
+    }
+}
 
 /// The parts `regions` name (`component/key` for all of a tensor's parts, `component/key#role`
 /// for one, `value` being a plain tensor's data), in header order, each named
