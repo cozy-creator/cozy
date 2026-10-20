@@ -126,6 +126,12 @@ async fn public_python_api_uses_an_ordinary_owner_credential() {
         receipt["runtime_library"]["publication_replay_without_rewrite"],
         true
     );
+    assert_eq!(receipt["cold_anonymous_read"]["cold_store"], true);
+    assert_eq!(receipt["cold_anonymous_read"]["anonymous"], true);
+    assert_eq!(
+        receipt["cold_anonymous_read"]["metadata_only_then_payload"],
+        true
+    );
     println!("{stdout}");
     let _ = std::fs::remove_dir_all(scratch);
 }

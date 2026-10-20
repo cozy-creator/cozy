@@ -3,6 +3,7 @@
 import hashlib
 import importlib.metadata
 import json
+import os
 import ssl
 import subprocess
 import sys
@@ -112,6 +113,71 @@ assert tree.startswith("sha256:")
 readme = tensorfs.download_file(request["model"], "README.md", revision="1", endpoint=request["endpoint"],
                                token=request["token"], ca_der=ca, cache_dir=cache / "reader")
 assert Path(readme).read_text() == "normal owner upload\n"
+
+# A separate process has no configured provider or inherited in-memory checkpoint.
+# Its empty store and deliberately unusable default endpoint prevent a warm/default
+# path from concealing failure to forward the ordinary anonymous endpoint and CA.
+anonymous_program = r'''
+import hashlib
+import json
+import os
+import ssl
+import sys
+from pathlib import Path
+
+import tensorfs
+import cozy_runtime
+from cozy_runtime.weights_store import Connection, open_checkpoint
+
+request = json.load(sys.stdin)
+cache = Path(request["cache_dir"])
+assert not cache.exists(), "the anonymous reader's store must start empty"
+assert os.environ["TENSORFS_ENDPOINT"] == "http://127.0.0.1:1"
+assert "TENSORFS_TOKEN" not in os.environ
+connection = Connection(
+    endpoint=request["endpoint"],
+    token=None,
+    ca_der=ssl.PEM_cert_to_DER_cert(Path(request["ca"]).read_text()),
+)
+assert connection.token is None
+with open_checkpoint(cache, request["reference"], connection) as checkpoint:
+    assert checkpoint.id == request["header"]
+    assert checkpoint.missing(), "the cold metadata open fetched all payloads"
+    value = checkpoint.components["model"].tensors.read("weight").tobytes()
+    assert len(value) == request["length"]
+    assert hashlib.sha256(value).hexdigest() == request["sha256"]
+    assert checkpoint.components["model"].asset("tokenizer.json") == b"{}"
+    assert not checkpoint.missing()
+print(json.dumps({
+    "cold_store": True,
+    "anonymous": connection.token is None,
+    "explicit_endpoint_and_ca": True,
+    "default_endpoint_disabled": True,
+    "metadata_only_then_payload": True,
+    "header": request["header"],
+    "bytes": len(value),
+    "tensorfs_path": str(Path(tensorfs.__file__).resolve()),
+    "runtime_path": str(Path(cozy_runtime.__file__).resolve()),
+}))
+'''
+anonymous_env = os.environ.copy()
+anonymous_env["TENSORFS_ENDPOINT"] = "http://127.0.0.1:1"
+for name in ("TENSORFS_TOKEN", "HF_TOKEN", "CIVITAI_TOKEN"):
+    anonymous_env.pop(name, None)
+anonymous_result = subprocess.run(
+    [sys.executable, "-I", "-c", anonymous_program],
+    input=json.dumps({
+        "endpoint": request["endpoint"], "ca": request["ca"],
+        "cache_dir": str(cache / "anonymous-cold"),
+        "reference": request["model"] + "@1/f32", "header": published.id,
+        "length": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+    }),
+    env=anonymous_env, capture_output=True, text=True, timeout=60,
+)
+assert anonymous_result.returncode == 0, anonymous_result.stderr
+cold_anonymous_read = json.loads(anonymous_result.stdout)
+assert cold_anonymous_read["tensorfs_path"] == str(Path(tensorfs.__file__).resolve())
+assert cold_anonymous_read["runtime_path"] == str(Path(cozy_runtime.__file__).resolve())
 
 
 class RetryFailure(Credential):
@@ -268,5 +334,6 @@ print(json.dumps({
     "runtime": runtime_provenance,
     "tensorfs": {"owner_read_write": True, "rival_denied": True, "retained_upload_without_rerun": productions == 1},
     "runtime_library": {"publication_replay_without_rewrite": runtime_productions == 1},
+    "cold_anonymous_read": cold_anonymous_read,
     "failure_families_and_writer_threads": True,
 }, sort_keys=True))
