@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -84,6 +85,34 @@ def convert_to_cozytensors(source: str | Sequence[str], *, converter=None, sourc
     return _client(cache_dir, token=token, configured_token=False).convert_to_cozytensors(
         source, converter=converter, source_variant=source_variant, progress=progress,
     )
+
+
+class CheckpointFile(io.RawIOBase):
+    """The checkpoint as one read-only, seekable file: its header, then its chunks and assets in
+    header order at 4 KiB-aligned offsets, assembled from the store on demand; nothing is written."""
+
+    def __init__(self, native):
+        super().__init__()
+        self._native = native
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        return self._native.readinto(buffer)
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        return self._native.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._native.tell()
+
+    def close(self) -> None:
+        self._native.close()
+        super().close()
 
 
 class Endpoint:

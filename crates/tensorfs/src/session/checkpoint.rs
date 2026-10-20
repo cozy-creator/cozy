@@ -118,6 +118,10 @@ impl Checkpoint {
         &self.data.raw
     }
 
+    pub(super) fn header_bytes(&self) -> Arc<[u8]> {
+        self.data.header_bytes.clone()
+    }
+
     pub fn id(&self) -> &ObjectRef {
         self.data.raw.id()
     }

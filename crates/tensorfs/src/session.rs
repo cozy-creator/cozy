@@ -6,6 +6,7 @@
 mod checkpoint;
 mod convert;
 mod endpoint;
+mod file;
 mod provider;
 mod remote;
 mod selection;
@@ -15,6 +16,7 @@ pub use crate::fetch::Landed as Fetched;
 pub use checkpoint::{Checkpoint, Component, Read, ReadInto};
 pub use convert::{Convert, ConvertProgress};
 pub use endpoint::Endpoint;
+pub use file::CheckpointFile;
 pub use provider::{bearer, HeaderMap, Request, TokenProvider};
 pub use writer::{ComponentWriter, PartData, Writer, WriterOptions};
 

@@ -1,10 +1,11 @@
+import io
 from collections.abc import Callable, Mapping, Sequence
 from os import PathLike
 from types import TracebackType
 from typing import Protocol
 from typing_extensions import Buffer
 
-from ._ext import Checkpoint, Component, TokenProvider
+from ._ext import Checkpoint, Component, TokenProvider, _CheckpointFile
 
 StrPath = str | PathLike[str]
 Token = str | TokenProvider | Callable[[str, str, Mapping[str, str], str | None], Mapping[str, str]]
@@ -33,6 +34,17 @@ def upload_folder(*, repo_id: str, folder_path: StrPath, revision: str | None = 
 def convert_to_cozytensors(source: str | Sequence[str], *, converter: str | None = None, source_variant: str | None = None,
             cache_dir: StrPath | None = None, token: Token | None = None,
             progress: Callable[[str, int, int], object] | None = None) -> Checkpoint: ...
+
+class CheckpointFile(io.RawIOBase):
+    """The checkpoint as one read-only, seekable file: its header, then its chunks and assets in
+    header order at 4 KiB-aligned offsets, assembled from the store on demand; nothing is written."""
+    def __init__(self, native: _CheckpointFile) -> None: ...
+    def readable(self) -> bool: ...
+    def seekable(self) -> bool: ...
+    def readinto(self, buffer: Buffer, /) -> int: ...
+    def seek(self, offset: int, whence: int = 0, /) -> int: ...
+    def tell(self) -> int: ...
+    def close(self) -> None: ...
 
 class Endpoint:
     def __init__(self, url: str, token: Token | None = None, *, ca_der: bytes | None = None, cache_dir: StrPath | None = None) -> None: ...

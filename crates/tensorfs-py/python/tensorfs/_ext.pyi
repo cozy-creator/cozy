@@ -7,6 +7,8 @@ from types import ModuleType
 from typing import Any, Protocol, TypeVar, overload
 from typing_extensions import Buffer
 
+from .api import CheckpointFile
+
 __version__: str
 STORE_FORMAT: int
 
@@ -221,10 +223,21 @@ class Checkpoint:
         """The header's chunk objects in order: `(sha256, length)`."""
     @property
     def metadata(self) -> dict[str, Any]: ...
+    def open_file(self) -> CheckpointFile:
+        """The checkpoint as one read-only, seekable file: its header, then its chunks and assets
+        in header order at 4 KiB-aligned offsets, assembled from the store on demand; nothing is
+        written."""
     def missing(self, components: Sequence[str] | None = None) -> list[tuple[str, int]]:
         """The chunks and assets of `components` (all when None) not here."""
     def download(self, components: Sequence[str] | None = None, *, priority: int = 0,
               progress: Callable[[str, int, int], object] | None = None) -> None: ...
+
+class _CheckpointFile:
+    """The native half of `CheckpointFile`."""
+    def readinto(self, buffer: Buffer) -> int: ...
+    def seek(self, offset: int, whence: int = 0) -> int: ...
+    def tell(self) -> int: ...
+    def close(self) -> None: ...
 
 class ComponentWriter:
     @property

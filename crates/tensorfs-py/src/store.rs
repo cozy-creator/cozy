@@ -867,6 +867,13 @@ impl PyCheckpoint {
         Ok(components.clone_ref(py))
     }
 
+    /// The checkpoint as one read-only, seekable file: its header, then its chunks and assets in
+    /// header order at 4 KiB-aligned offsets, assembled from the store on demand; nothing is
+    /// written.
+    fn open_file<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::file::open(py, self.core(py)?)
+    }
+
     /// The header's chunks, in order: `(sha256, length)`.
     #[getter]
     fn chunks(&self) -> Vec<(String, u64)> {
@@ -2063,6 +2070,7 @@ pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::verification::PyVerificationReport>()?;
     m.add_class::<PyClient>()?;
     m.add_class::<PyCheckpoint>()?;
+    m.add_class::<crate::file::PyCheckpointFile>()?;
     m.add_class::<PyPipeline>()?;
     m.add_class::<PyComponent>()?;
     m.add_class::<PyComponentWriter>()?;
