@@ -168,7 +168,7 @@ async def weigh(ctx: Context, *, payload: Weigh) -> Weighed:
         length = sum(
             len(value.tobytes())
             for component in checkpoint.components.values()
-            for value in component.tensors.read_all().values()
+            for value in component.tensors.read().values()
         )
         return Weighed(length)
     finally:
