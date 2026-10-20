@@ -4,8 +4,9 @@
 //! yanked releases too, and each other old checkpoint a tree of its own; run data a lane lacked
 //! comes from its family's pinned upstream. Chunks never move: only the headers, trees and small
 //! blobs the Hub lacks are sent, then the repo document is replaced under `If-Match`. Running it
-//! again changes nothing. Each model's document as it was is kept in the audit directory, and
-//! `--restore` puts it back. `--local` migrates a TensorFS 0.12 store in place; stop its machine.
+//! again changes nothing. Each model's document as it was is kept in the audit directory: the
+//! rollback puts it back in the Hub's storage, since the Hub never takes a release back to lanes.
+//! `--local` migrates a TensorFS 0.12 store in place; stop its machine.
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -31,9 +32,6 @@ pub(crate) struct Args {
     /// Where each model's report, and its document as it was, are written.
     #[arg(long, value_name = "DIR", default_value = "migrate-headers-audit")]
     audit: PathBuf,
-    /// Instead: put back the models' documents as they were before migrating (from `--audit`).
-    #[arg(long, conflicts_with = "local")]
-    restore: bool,
 }
 
 fn failed(detail: impl Into<String>) -> Error {
@@ -65,24 +63,19 @@ pub(crate) async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     for model in args.models {
         let (token, origin, name) = (session.bearer(&client).await.map_err(hub_error)?, hub.origin.to_string(), model.clone());
         let file = |kind: &str| args.audit.join(format!("{}.{kind}json", model.replace('/', "__")));
-        let (before, restore) = (file("before."), args.restore);
-        let kept = if restore { Some(std::fs::read(&before).map_err(|e| failed(format!("{}: {e}", before.display())))?) } else { None };
+        let before = file("before.");
         let done = blocking(move || {
             let local = is_loopback_origin(&origin);
             let http = Client::new(SourcePolicy { any_host: true, allow_local: local, max_redirects: 5, ..Default::default() });
             let endpoint = Arc::new(Endpoint::new(&http, &origin, Some(bearer(token)))?);
-            if let Some(kept) = kept {
-                let put = d10::restore(&endpoint, &name, &kept)?;
-                return Ok((json!({"model": name, "restored": put}), None));
-            }
             let scratch = tempfile::tempdir()?;
             let store = Store::open(scratch.path())?;
             let done = d10::migrate(&endpoint, &http, &name, &store, &mut Migrator::new(tensorfs::import::Access::from_env(), UPSTREAMS))?;
-            Ok((done.report, Some(done.before)))
+            Ok((done.report, done.before))
         });
         let report = match done.await {
-            Ok((report, before_doc)) => {
-                if let Some(doc) = before_doc.filter(|_| !before.exists()) {
+            Ok((report, doc)) => {
+                if !before.exists() {
                     std::fs::write(&before, doc).map_err(|e| failed(format!("{}: {e}", before.display())))?;
                 }
                 report
@@ -92,11 +85,8 @@ pub(crate) async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
                 json!({"model": model, "error": e.message})
             }
         };
-        if !restore {
-            write(&file(""), &report)?;
-        }
-        let did = if report.get("error").is_some() { "failed" } else if restore { "restored" } else { "migrated" };
-        output::say(ctx, &format!("{model}: {did}"));
+        write(&file(""), &report)?;
+        output::say(ctx, &format!("{model}: {}", if report.get("error").is_some() { "failed" } else { "migrated" }));
         reports.push(report);
     }
     let summary = json!({"models": reports, "audit": args.audit});

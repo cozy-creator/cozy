@@ -11,7 +11,6 @@ use base64::Engine as _;
 use flate2::write::ZlibEncoder;
 use minicbor::Decoder;
 use serde_json::{json, Value as Json};
-use tensorfs::fetch::{Client, Endpoint, SourcePolicy};
 use tensorfs::import::Access;
 use tensorfs::format::{Config, Header, ObjectRef, Repo, Tree, Value};
 use tensorfs::migrate::d10::{self, Migrator, Upstream};
@@ -230,13 +229,9 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
     d10::store(&root, &mut migrator).unwrap();
     assert_eq!(refs(&root), before);
 
-    // The rollback puts the 0.12 document back, once; migrating again gives the same D10 one.
-    let client = Client::new(SourcePolicy::default());
-    let endpoint = Endpoint::new(&client, &root.to_string_lossy(), None).unwrap();
+    // The rollback, the 0.12 document put back in storage: migrating again gives the same D10 one.
     let old = std::fs::read(fixture.join("refs/acme/tiny.json")).unwrap();
-    assert!(d10::restore(&endpoint, "acme/tiny", &old).unwrap());
-    assert_eq!(std::fs::read(root.join("refs/acme/tiny.json")).unwrap(), old);
-    assert!(!d10::restore(&endpoint, "acme/tiny", &old).unwrap());
+    std::fs::write(root.join("refs/acme/tiny.json"), &old).unwrap();
     d10::store(&root, &mut migrator).unwrap();
     assert_eq!(refs(&root), before);
     std::fs::remove_dir_all(&dir).unwrap();
