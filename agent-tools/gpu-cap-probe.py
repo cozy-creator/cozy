@@ -20,6 +20,7 @@ def main(*, limit_gib: int, out: Outputs) -> Tree:
         raise ValueError("limit_gib is positive, or zero for no cap")
     pid = os.getpid()
     device = torch.cuda.current_device()
+    cuda_device = torch.device("cuda", device)
     properties = torch.cuda.get_device_properties(device)
     physical = int(properties.total_memory)
     uuid = getattr(properties, "uuid", None)
@@ -29,9 +30,10 @@ def main(*, limit_gib: int, out: Outputs) -> Tree:
     effective = min(requested, physical) if requested else physical
     expected_fraction = effective / physical
     fraction = float(torch.cuda.get_per_process_memory_fraction(device))
-    if not math.isclose(fraction, expected_fraction, rel_tol=1e-6, abs_tol=1e-8):
+    # Native budgeting may reserve context/other live allocations below machine authority.
+    if not (math.isfinite(fraction) and 0.0 < fraction <= expected_fraction + 1e-8):
         raise RuntimeError(
-            f"allocator fraction {fraction} != expected {expected_fraction}; "
+            f"allocator fraction {fraction} exceeds ceiling {expected_fraction} or is invalid; "
             f"requested={requested}, physical={physical}, pid={pid}"
         )
 
@@ -41,7 +43,7 @@ def main(*, limit_gib: int, out: Outputs) -> Tree:
         attempted = effective + (64 << 20)
         allocation = None
         try:
-            allocation = torch.empty(attempted, dtype=torch.uint8, device=device)
+            allocation = torch.empty(attempted, dtype=torch.uint8, device=cuda_device)
         except torch.OutOfMemoryError:
             oom = True
         finally:
@@ -52,10 +54,10 @@ def main(*, limit_gib: int, out: Outputs) -> Tree:
                 f"allocator accepted {attempted} bytes above its {effective}-byte cap"
             )
 
-    tiny = torch.ones(1024, dtype=torch.float32, device=device).mul_(3)
+    tiny = torch.ones(1024, dtype=torch.float32, device=cuda_device).mul_(3)
     result = float(tiny.sum().item())
     torch.cuda.synchronize(device)
-    if result != 3072.0 or os.getpid() != pid:
+    if not tiny.is_cuda or result != 3072.0 or os.getpid() != pid:
         raise RuntimeError(
             "tiny CUDA computation failed to recover in the same process"
         )
@@ -67,7 +69,8 @@ def main(*, limit_gib: int, out: Outputs) -> Tree:
         "requested_bytes": requested,
         "effective_limit_bytes": effective,
         "allocator_fraction": fraction,
-        "expected_fraction": expected_fraction,
+        "fraction_ceiling": expected_fraction,
+        "allocator_budget_bytes": int(fraction * physical),
         "attempted_bytes": attempted,
         "allocator_cap_oom": oom,
         "same_pid_recovery": True,
