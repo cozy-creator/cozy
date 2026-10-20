@@ -527,7 +527,7 @@ def _q2_0(base, el, mask):  # type: ignore[no-untyped-def]
 def cast_metadata(out, words, slots, scale, term, table, factor, post, index, error, params,
                   OUT: tl.constexpr, BLOCK: tl.constexpr):  # type: ignore[no-untyped-def]
     """Normalize only stored factor cells to f32; no logical weight expansion."""
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     n = tl.load(params)
     mode = tl.load(params + 1)
     mask = i < n
