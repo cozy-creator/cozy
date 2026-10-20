@@ -35,10 +35,18 @@ on:
         description: cozy-runtime branch, tag or SHA whose wheel tests get as COZY_TEST_RUNTIME_WHEEL; empty for the newest published
         type: string
         default: ''
+      runtime_download:
+        description: Download the published Runtime wheel for tests when runtime_ref is empty
+        type: boolean
+        default: true
       tensorfs_run:
         description: Existing dev-build run whose TensorFS wheel the targeted tests install
         type: string
         default: ''
+      tensorfs_artifact_pattern:
+        description: Artifact name or pattern within tensorfs_run containing exactly one TensorFS wheel
+        type: string
+        default: tensorfs-wheel-*
       tensorhub_ref:
         description: Optional Tensorhub source to check out at .tensorhub for targeted live tests
         type: string
@@ -194,15 +202,24 @@ jobs:
         with:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.tensorfs_run }}
-          pattern: tensorfs-wheel-*
+          pattern: ${{ inputs.tensorfs_artifact_pattern }}
           merge-multiple: true
           path: ${{ runner.temp }}/tensorfs-artifact
       - if: inputs.tensorfs_run != ''
         run: |
+          wheel=$(python3 - "$RUNNER_TEMP/tensorfs-artifact" <<'PY'
+          import sys
+          from pathlib import Path
+          wheels = sorted(Path(sys.argv[1]).rglob('tensorfs-*.whl'))
+          if len(wheels) != 1:
+              raise SystemExit(f'expected one TensorFS wheel, found {len(wheels)}: {wheels}')
+          print(wheels[0].resolve())
+          PY
+          )
           uv venv --python 3.12 "$RUNNER_TEMP/tensorfs"
-          uv pip install --python "$RUNNER_TEMP/tensorfs/bin/python" "$RUNNER_TEMP"/tensorfs-artifact/*.whl
+          uv pip install --python "$RUNNER_TEMP/tensorfs/bin/python" "$wheel"
           echo "TENSORFS_TEST_PYTHON=$RUNNER_TEMP/tensorfs/bin/python" >> "$GITHUB_ENV"
-          echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$RUNNER_TEMP"/tensorfs-artifact/*.whl)" >> "$GITHUB_ENV"
+          echo "COZY_TEST_TENSORFS_WHEEL=$wheel" >> "$GITHUB_ENV"
       - if: inputs.runtime_ref != ''
         uses: actions/checkout@v5
         with:
@@ -217,11 +234,11 @@ jobs:
           python3 .runtime/scripts/stamp-build-provenance.py "$(git -C .runtime rev-parse HEAD)"
           uv build --wheel --out-dir "$RUNNER_TEMP/runtime" .runtime
       # Without runtime_ref, the Runtime machines install today: the newest published wheel.
-      - if: inputs.test != '' && inputs.runtime_ref == ''
+      - if: inputs.test != '' && inputs.runtime_ref == '' && inputs.runtime_download
         run: |
           uvx --from pip pip download --quiet --no-deps --only-binary :all: --python-version 3.12 \
             --platform manylinux_2_28_x86_64 --dest "$RUNNER_TEMP/runtime" cozy-runtime
-      - if: inputs.test != '' || inputs.runtime_ref != ''
+      - if: inputs.runtime_ref != '' || (inputs.test != '' && inputs.runtime_download)
         run: echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
       - if: inputs.tensorhub_ref != ''
         uses: actions/checkout@v5
