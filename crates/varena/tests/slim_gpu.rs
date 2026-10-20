@@ -74,7 +74,7 @@ fn pages_pin_evict_refill_and_survive_clean_owner_exit() {
     assert_eq!(bytes(&pin), data);
     assert!(!gpu.unmap(1).expect("pinned page cannot evict"));
     assert!(gpu.unmap(2).expect("other page independently evicts"));
-    let fault = gpu.fill_with(2, |_, _, _| panic!("injected page transform panic"));
+    let fault = gpu.fill_with(2, |_| panic!("injected page transform panic"));
     assert!(matches!(fault, Err(varena::Error::Internal(_))));
     gpu.recover().expect("failed request recovers in process");
     gpu.fill_from_ram(2, &data)
