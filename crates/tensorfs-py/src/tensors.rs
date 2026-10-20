@@ -263,13 +263,8 @@ impl PyTensors {
         let page = layout::ALIGN as usize;
         let out_len = place(true, if device.is_some() { DEVICE_ALIGN } else { page })?;
         let in_len = place(false, page)?;
-        let gpu = match device {
-            Some(device) => Some(
-                py.detach(|| DeviceBuffer::new(device, out_len).map(DeviceArray::new))
-                    .or_raise(py)?,
-            ),
-            None => None,
-        };
+        let alloc = |d| py.detach(|| DeviceBuffer::new(d, out_len).map(DeviceArray::new));
+        let gpu = device.map(alloc).transpose().or_raise(py)?;
         let mut host = Aligned::new(if gpu.is_some() { 0 } else { out_len });
         let mut inputs = Aligned::new(in_len);
         let (host_ptr, inputs_ptr) = (host.as_mut_ptr(), inputs.as_mut_ptr());
