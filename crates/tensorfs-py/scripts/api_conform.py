@@ -58,8 +58,18 @@ with TemporaryDirectory() as temp:
             pass
         else:
             raise AssertionError(f"invalid materialization reached the origin: {options}")
+    for target in ("I8", "F64", "unknown"):
+        unused_cache = root / f"invalid-target-{target}"
+        try:
+            tensorfs.materialize("never/contact", local_dir=root / "refused", format="safetensors",
+                                 dequantize=target, endpoint="http://127.0.0.1:1", cache_dir=unused_cache)
+        except tensorfs.InvalidError:
+            pass
+        else:
+            raise AssertionError(f"invalid dequantization target was accepted: {target}")
+        assert not unused_cache.exists(), "invalid target constructed a client before rejection"
     converted = root / "checkpoint-safetensors"
-    assert Path(tensorfs.materialize(ck, local_dir=converted, format="safetensors")) == converted
+    assert Path(tensorfs.materialize(ck, local_dir=converted, format="safetensors", dequantize="f32")) == converted
     assert list(converted.rglob("*.safetensors"))
     assert tensorfs.open(root / "folder", variant="f32").id == ck.id
     assert tensorfs.open(root / "folder/model.f32.cozytensors").id == ck.id
