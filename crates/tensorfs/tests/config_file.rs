@@ -79,19 +79,15 @@ async fn export_files_without_a_directory_renders_a_cache_folder_that_expires() 
     drop(saved);
     drop(client);
 
-    // Age the folder past the cache TTL; ordinary maintenance evicts it, never the caller's copy.
+    // Age the folder's use past the TTL; a collection by the TTL evicts it, never the caller's copy.
+    let then = std::time::SystemTime::now() - tensorfs::store::TTL * 2;
     let name = managed.file_name().unwrap().to_str().unwrap();
-    let record = cache.join("tmp/cache/snapshots").join(format!("snapshots-{name}.json"));
-    let mut value: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
-    assert_eq!(value["owned"], false);
-    value["last_use"] = 0.into();
-    fs::write(&record, serde_json::to_vec(&value).unwrap()).unwrap();
+    fs::File::open(cache.join("uses").join(name)).unwrap().set_modified(then).unwrap();
     platform::durable::open_dir(&managed)
         .unwrap()
-        .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+        .set_times(fs::FileTimes::new().set_modified(then))
         .unwrap();
-    fs::write(cache.join("tmp/cache/sweep.json"), br#"{"last_use":0}"#).unwrap();
-    Store::open(&cache).unwrap().with_cache().cache_maintain(0).unwrap();
+    Store::open(&cache).unwrap().collect(u64::MAX, tensorfs::store::TTL).unwrap();
     assert!(!managed.exists(), "an expired export folder outlived the cache TTL");
     assert!(explicit.join("vocab.json").is_file());
 }

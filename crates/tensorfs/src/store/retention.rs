@@ -1,313 +1,401 @@
-//! Native owners retain ordinary tree roots while their kernel-held fence is locked.
-//! Final release closes descriptors only; collection reaps unlocked records and directories.
+//! One retention regime for every store. What roots an object:
+//!
+//! - a live hold: an open checkpoint, a writer, an operation in progress (`holds/<id>`, the
+//!   digests it holds, under its holder's `flock`; a dead holder's file is reaped);
+//! - a header file a Writer wrote or `open(path)` opened, while that file still holds that header
+//!   (`files/<sha256 of the path>`);
+//! - a `local/` repo ref.
+//!
+//! Everything else is cache. A use (`uses/<name>`: the digests it keeps, its mtime the last use)
+//! keeps them and `snapshots/<name>/` for [`TTL`]; a use a live hold names is in use now. On a low
+//! disk the least recently used go first. Nothing is pinned, by hand or forever.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
-use super::{fail, invalid, Pin, Result, Store};
-use crate::format::{ObjectRef, Tree};
+use serde::{Deserialize, Serialize};
 
-pub(crate) const PREFIX: &str = "hold-";
-const OWNER: &str = "tensorfs.native-retention/1";
+use super::{fail, invalid, is_digest, platform, Result, Store};
+use crate::format::{Header, ObjectRef, Repo};
 
-fn synthetic(id: &str) -> bool {
-    let Some(parts) = id.strip_prefix(PREFIX) else {
-        return false;
-    };
-    let mut fields = parts.split('-');
-    let (Some(pid), Some(tick), Some(counter), None) =
-        (fields.next(), fields.next(), fields.next(), fields.next())
-    else {
-        return false;
-    };
-    let (Ok(pid), Ok(tick), Ok(counter)) = (
-        pid.parse::<u32>(),
-        u128::from_str_radix(tick, 16),
-        u64::from_str_radix(counter, 16),
-    ) else {
-        return false;
-    };
-    pid != 0 && id == format!("{PREFIX}{pid}-{tick:x}-{counter:x}")
-}
+/// How long a use keeps what it names.
+pub const TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// How often maintenance expires uses.
+const SWEEP: Duration = Duration::from_secs(10 * 60);
 
-/// Ordinary manual/Writer keys may start with hold-; only our tagged synthetic records reap.
-pub(crate) fn owned(id: &str, pin: &Pin) -> bool {
-    pin.owner.as_deref() == Some(OWNER) && synthetic(id)
-}
-
+/// Digests kept while a process holds them: never unlocked by hand, so a forked child that
+/// inherited the descriptor keeps holding them until it exits or execs.
 #[derive(Debug)]
-pub(crate) struct Retention {
+pub(crate) struct Hold {
     store: Store,
-    id: String,
-    objects: Mutex<BTreeMap<String, ObjectRef>>,
-    // Never explicitly unlock: an inherited descriptor in a fork child owns the same fence.
-    _fence: File,
+    file: File,
+    held: Mutex<BTreeSet<String>>,
 }
 
-impl Retention {
-    pub(crate) fn new(
-        store: &Store,
-        objects: impl IntoIterator<Item = ObjectRef>,
-    ) -> Result<Arc<Self>> {
-        // Internal ownership metadata must not recursively invoke cache admission/maintenance.
-        let mut store = store.clone();
-        store.cache_mode = false;
-        let _acquisition = acquire(&store)?;
+impl Hold {
+    pub(crate) fn new(store: &Store, digests: impl IntoIterator<Item = String>) -> Result<Arc<Hold>> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let parent = store.root().join("tmp/holds");
-        fs::create_dir_all(&parent).map_err(fail("create", &parent))?;
-        let (id, fence) = loop {
-            let tick = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let id = format!(
-                "{PREFIX}{}-{tick:x}-{:x}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            );
-            let dir = parent.join(&id);
-            match fs::create_dir(&dir) {
-                Ok(()) => {}
+        let _fence = acquire(store)?;
+        loop {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = store.root.join("holds").join(format!("{}-{n}", std::process::id()));
+            let file = match OpenOptions::new().append(true).create_new(true).open(&path) {
+                Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(fail("create", &dir)(e)),
-            }
-            let path = dir.join("lock");
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(fail("create", &path))?;
+                Err(e) => return Err(fail("create", &path)(e)),
+            };
             file.lock().map_err(fail("lock", &path))?;
-            break (id, file);
-        };
-        let hold = Arc::new(Self {
-            store,
-            id,
-            objects: Mutex::default(),
-            _fence: fence,
-        });
-        hold.extend(objects)?;
-        Ok(hold)
+            let hold = Hold { store: store.clone(), file, held: Mutex::default() };
+            hold.extend(digests)?;
+            return Ok(Arc::new(hold));
+        }
     }
 
-    pub(crate) fn acquire(&self) -> Result<AcquisitionGuard> {
+    /// The short fence over reading metadata and holding what it names.
+    pub(crate) fn acquire(&self) -> Result<Fence> {
         acquire(&self.store)
     }
 
-    pub(crate) fn extend(&self, objects: impl IntoIterator<Item = ObjectRef>) -> Result<()> {
-        let _acquisition = acquire(&self.store)?;
-        let mut held = self.objects.lock().unwrap();
-        let mut next = held.clone();
-        for object in objects {
-            if next.get(&object.sha256).is_some_and(|old| old != &object) {
-                return Err(invalid(
-                    self.store.root(),
-                    "a retained digest has conflicting lengths",
-                ));
+    pub(crate) fn extend(&self, digests: impl IntoIterator<Item = String>) -> Result<()> {
+        let _fence = acquire(&self.store)?;
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lines = String::new();
+        for digest in digests {
+            if !held.contains(&digest) {
+                lines.push_str(&digest);
+                lines.push('\n');
+                held.insert(digest);
             }
-            next.insert(object.sha256.clone(), object);
         }
-        if next == *held
-            && self
-                .store
-                .get_pin(&self.id)?
-                .as_ref()
-                .is_some_and(|pin| owned(&self.id, pin))
-        {
-            return Ok(());
+        (&self.file)
+            .write_all(lines.as_bytes())
+            .map_err(fail("write", self.store.root.join("holds")))
+    }
+}
+
+/// Held shared by whoever reads metadata and then holds or uses what it names; exclusive by a
+/// collection, which skips while any is held and never waits.
+#[derive(Debug)]
+pub(crate) struct Fence(#[allow(dead_code)] File);
+
+fn fence_file(store: &Store) -> Result<File> {
+    let path = store.root.join("holds").join("gc.lock");
+    let opened = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path);
+    opened.map_err(fail("open", &path))
+}
+
+pub(crate) fn acquire(store: &Store) -> Result<Fence> {
+    let file = fence_file(store)?;
+    file.lock_shared().map_err(fail("lock", &store.root))?;
+    Ok(Fence(file))
+}
+
+pub(crate) fn try_collect(store: &Store) -> Result<Option<Fence>> {
+    let file = fence_file(store)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(Fence(file))),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => Err(fail("lock", &store.root)(e)),
+    }
+}
+
+/// `files/<id>`: a header file outside the store's own data.
+#[derive(Serialize, Deserialize)]
+struct FileRoot {
+    path: PathBuf,
+    header: ObjectRef,
+}
+
+/// The header `root`'s file holds, when it still holds it; an unreadable file still holds it.
+fn file_header(root: &FileRoot) -> Option<Option<Header>> {
+    let kept = |e: io::Error| !matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory);
+    match fs::metadata(&root.path) {
+        Ok(meta) if !meta.is_file() || meta.len() != root.header.length => None,
+        Ok(_) => match fs::read(&root.path) {
+            Ok(bytes) if ObjectRef::of(&bytes) == root.header => Some(Header::from_cbor(&bytes).ok()),
+            Ok(_) => None,
+            Err(e) => kept(e).then_some(None),
+        },
+        Err(e) => kept(e).then_some(None),
+    }
+}
+
+/// The lines of `path` (none when absent).
+fn lines(path: &Path) -> Result<Option<BTreeSet<String>>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text.lines().map(str::to_owned).collect())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(fail("read", path)(e)),
+    }
+}
+
+pub(super) fn list(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(fail("list", dir)(e)),
+    };
+    entries.map(|e| e.map(|e| e.path()).map_err(fail("list", dir))).collect()
+}
+
+/// A recorded use: its name and when it was last used, and what it keeps.
+pub(super) struct Use {
+    pub name: String,
+    pub used: SystemTime,
+    pub digests: BTreeSet<String>,
+}
+
+impl Store {
+    pub(crate) fn hold(&self, objects: &[ObjectRef]) -> Result<Arc<Hold>> {
+        Hold::new(self, objects.iter().map(|o| o.sha256.clone()))
+    }
+
+    /// Records a use of `objects` under `name` (a digest): they and `snapshots/<name>/` stay for
+    /// the TTL after the last use. A use only ever adds what it keeps.
+    pub(crate) fn used<'a>(&self, name: &str, objects: impl IntoIterator<Item = &'a ObjectRef>) -> Result<()> {
+        let path = self.root.join("uses").join(name);
+        if !is_digest(name) {
+            return Err(invalid(&path, "a use is named by a digest"));
         }
-        // Non-variant entries retain raw objects without trying to parse chunk bytes as headers.
-        let tree = Tree {
-            files: next
-                .iter()
-                .map(|(sha, object)| (format!("held/{sha}"), object.clone()))
-                .collect(),
-        };
-        let root = self.store.put_tree(&tree)?;
-        let mut pin = Pin::new(vec![root]);
-        pin.owner = Some(OWNER.to_owned());
-        self.store.pin(&self.id, &pin)?;
-        *held = next;
+        let _fence = acquire(self)?;
+        let _lock = self.lock("uses")?;
+        let old = lines(&path)?;
+        let mut keep = old.clone().unwrap_or_default();
+        keep.extend(objects.into_iter().map(|o| o.sha256.clone()));
+        if old.as_ref() == Some(&keep) {
+            return touch(&path);
+        }
+        let text: String = keep.iter().map(|d| format!("{d}\n")).collect();
+        self.commit(&path, text.as_bytes(), false)
+    }
+
+    /// Roots `header` while the file at `path` (absolute) holds it: one record per path, so saving
+    /// another header there replaces it.
+    pub(crate) fn root_file(&self, path: &Path, header: &ObjectRef) -> Result<()> {
+        let path = fs::canonicalize(path).map_err(fail("resolve", path))?;
+        let id = ObjectRef::of(path.as_os_str().as_encoded_bytes()).sha256;
+        let record = self.root.join("files").join(id);
+        let root = FileRoot { path, header: header.clone() };
+        let bytes = serde_json::to_vec(&root).map_err(|e| invalid(&record, e))?;
+        let _fence = acquire(self)?;
+        self.commit(&record, &bytes, true)
+    }
+
+    /// What the roots keep, each digest once; reaps dead holds and files that let go.
+    pub(super) fn roots(&self) -> Result<BTreeSet<String>> {
+        let mut roots = BTreeSet::new();
+        for path in list(&self.root.join("holds"))? {
+            if path.file_name().is_some_and(|n| n == "gc.lock") {
+                continue;
+            }
+            let file = match File::open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(fail("open", &path)(e)),
+            };
+            match file.try_lock() {
+                Ok(()) => drop(fs::remove_file(&path)),
+                Err(TryLockError::WouldBlock) => roots.extend(lines(&path)?.unwrap_or_default()),
+                Err(TryLockError::Error(e)) => return Err(fail("lock", &path)(e)),
+            }
+        }
+        for record in list(&self.root.join("files"))? {
+            let bytes = fs::read(&record).map_err(fail("read", &record))?;
+            let root: FileRoot = serde_json::from_slice(&bytes).map_err(|e| invalid(&record, e))?;
+            match file_header(&root) {
+                Some(header) => {
+                    roots.extend(header.iter().flat_map(Header::objects).map(|o| o.sha256.clone()));
+                    roots.insert(root.header.sha256);
+                    // A header file inside a snapshot keeps its folder.
+                    if let Ok(inside) = root.path.strip_prefix(self.root.join("snapshots")) {
+                        roots.extend(inside.iter().next().and_then(|n| n.to_str()).map(str::to_owned));
+                    }
+                }
+                None => drop(self.remove_record(&record)?),
+            }
+        }
+        for repo in self.refs()?.iter().filter(|r| local(r)) {
+            for tree in repo.roots() {
+                roots.extend(self.closure(tree)?.into_iter().map(|o| o.sha256));
+            }
+        }
+        Ok(roots)
+    }
+
+    /// Every recorded use; one a root names is used now.
+    pub(super) fn uses(&self, roots: &BTreeSet<String>) -> Result<Vec<Use>> {
+        let mut uses = Vec::new();
+        for path in list(&self.root.join("uses"))? {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).filter(|n| is_digest(n)) else {
+                continue;
+            };
+            let Some(digests) = lines(&path)? else { continue };
+            let used = if roots.contains(name) {
+                touch(&path)?;
+                SystemTime::now()
+            } else {
+                fs::metadata(&path).and_then(|m| m.modified()).map_err(fail("stat", &path))?
+            };
+            uses.push(Use { name: name.to_owned(), used, digests });
+        }
+        Ok(uses)
+    }
+
+    /// The cache's upkeep, run as bytes come in and checkpoints open: once per sweep period,
+    /// expire uses past the TTL; then, while the disk is short of `incoming` bytes and a reserve,
+    /// drop the least recently used. False when `incoming` still does not fit: skip the write.
+    pub fn maintain(&self, incoming: u64) -> Result<bool> {
+        let short = || shortfall(&self.root, incoming);
+        let stamp = self.root.join("uses").join(".swept");
+        let due = fs::metadata(&stamp)
+            .and_then(|m| m.modified())
+            .map_or(true, |t| t.elapsed().map_or(true, |age| age >= SWEEP));
+        if !due && short()? == 0 {
+            return Ok(true);
+        }
+        if let Some(_gc) = try_collect(self)? {
+            // A store GC cannot walk (a ref or header of another format) keeps all it holds.
+            if let Err(e) = self.upkeep(due, &stamp, &short) {
+                tracing::warn!("tensorfs: cache upkeep skipped: {e}");
+            }
+        }
+        Ok(short()? == 0)
+    }
+
+    fn upkeep(&self, due: bool, stamp: &Path, short: &dyn Fn() -> Result<u64>) -> Result<()> {
+        if due {
+            let created = File::create(stamp).and_then(|f| f.set_modified(SystemTime::now()));
+            created.map_err(fail("create", stamp))?;
+            self.sweep_writers(TTL)?;
+            self.collect_locked(u64::MAX, TTL)?;
+        }
+        loop {
+            let need = short()?;
+            if need == 0 || self.collect_locked(need, Duration::ZERO)?.uses.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Every store follows the one regime. TensorD still calls these two; delete them with it.
+    #[doc(hidden)]
+    pub fn with_cache(self) -> Store {
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn cache_ref(&self, _: &Repo) -> Result<()> {
         Ok(())
     }
 }
 
-fn fence(store: &Store, id: &str) -> PathBuf {
-    store.root().join("tmp/holds").join(id).join("lock")
+/// `local/` repos are never evicted.
+fn local(repo: &Repo) -> bool {
+    repo.name.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("local/"))
 }
 
-/// A reserved hold record is live only while its ordinary kernel fence is held.
-pub(crate) fn protected(store: &Store, id: &str) -> Result<bool> {
-    if !synthetic(id)
-        || !store
-            .get_pin(id)?
-            .as_ref()
-            .is_some_and(|pin| owned(id, pin))
-    {
-        return Ok(false);
-    }
-    let path = fence(store, id);
-    let file = match OpenOptions::new().read(true).write(true).open(&path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(fail("open", &path)(e)),
-    };
-    match file.try_lock() {
-        Ok(()) => Ok(false),
-        Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(e)) => Err(fail("lock", &path)(e)),
-    }
+/// Bytes missing for `incoming` and a reserve of 2% of the disk, within 1 to 10 GiB.
+fn shortfall(root: &Path, incoming: u64) -> Result<u64> {
+    let space = platform::durable::space(root).map_err(platform("measure space", root))?;
+    let reserve = (space.total / 50).clamp(1 << 30, 10 << 30);
+    Ok(reserve.saturating_add(incoming.max(1)).saturating_sub(space.free))
 }
 
-/// Called by maintenance, never by Drop. A live or fork-inherited fence is never removed.
-pub(crate) fn reap(store: &Store) -> Result<usize> {
-    let mut removed = 0;
-    let pins: BTreeMap<_, _> = store.pins()?.into_iter().collect();
-    let mut ids: BTreeSet<String> = pins
-        .iter()
-        .filter(|(id, pin)| owned(id, pin))
-        .map(|(id, _)| id.clone())
-        .collect();
-    let parent = store.root().join("tmp/holds");
-    match fs::read_dir(&parent) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry.map_err(fail("list", &parent))?;
-                if entry
-                    .file_type()
-                    .map_err(fail("stat", entry.path()))?
-                    .is_dir()
-                {
-                    if let Some(id) = entry.file_name().to_str().filter(|id| {
-                        synthetic(id) && pins.get(*id).is_none_or(|pin| owned(id, pin))
-                    }) {
-                        ids.insert(id.to_owned());
-                    }
-                }
+fn touch(path: &Path) -> Result<()> {
+    let file = OpenOptions::new().append(true).open(path).map_err(fail("open", path))?;
+    file.set_modified(SystemTime::now()).map_err(fail("touch", path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::writer::{Data, Source};
+
+    struct Scratch(Store);
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!("tensorfs-retention-{}-{n}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            Self(Store::open(&root).unwrap().with_grace(Duration::ZERO))
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0.root);
+        }
+    }
+
+    fn age(path: &Path, by: Duration) {
+        if path.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                age(&entry.unwrap().path(), by);
             }
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(fail("list", &parent)(e)),
+        platform::durable::set_times(path, fs::FileTimes::new().set_modified(SystemTime::now() - by)).unwrap();
     }
-    for id in ids {
-        let path = fence(store, &id);
-        let guard = match OpenOptions::new().read(true).write(true).open(&path) {
-            Ok(file) => match file.try_lock() {
-                Ok(()) => Some(file),
-                Err(TryLockError::WouldBlock) => continue,
-                Err(TryLockError::Error(e)) => return Err(fail("lock", &path)(e)),
-            },
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(fail("open", &path)(e)),
+
+    /// Maintenance expires a use past the TTL, and its folder, and reaps abandoned writers; a
+    /// live hold keeps its use fresh, and a recent keyed journal still resumes.
+    #[test]
+    fn maintenance_expires_uses_past_the_ttl_but_not_held_ones() {
+        let scratch = Scratch::new();
+        let store = &scratch.0;
+        let (old, held) = (store.put_bytes(&[1; 4096]).unwrap(), store.put_bytes(&[2; 4096]).unwrap());
+        store.used(&old.sha256, [&old]).unwrap();
+        store.used(&held.sha256, [&held]).unwrap();
+        let folder = store.root.join("snapshots").join(&old.sha256);
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("copy"), b"cache").unwrap();
+        let hold = store.hold(std::slice::from_ref(&held)).unwrap();
+        let write = |key| {
+            let mut w = store.writer(None, Some(key)).unwrap();
+            let data = Data::Plain(Source::Read(&mut &[3u8; 64][..]));
+            w.get("model").put("weight", &crate::format::Dtype::U8, &[64], data).unwrap();
+            w
         };
-        if store.remove_hold_pin(&id)? {
-            removed += 1;
+        drop(write("abandoned"));
+        drop(write("recent"));
+        let past = TTL + Duration::from_secs(60);
+        for path in ["uses", "snapshots", "blobs", "tmp/writers/abandoned"] {
+            age(&store.root.join(path), past);
         }
-        if let Some(dir) = path.parent() {
-            match fs::remove_dir_all(dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(fail("remove", dir)(e)),
-            }
-        }
-        drop(guard);
+        age(&store.root.join("uses/.swept"), SWEEP);
+        assert!(store.maintain(0).unwrap());
+        assert!(!store.path(&old).unwrap().exists() && !folder.exists(), "an expired use stayed");
+        assert!(!store.root.join("uses").join(&old.sha256).exists());
+        assert!(store.reuse(&held).unwrap(), "a held use expired");
+        let fresh = fs::metadata(store.root.join("uses").join(&held.sha256)).unwrap().modified().unwrap();
+        assert!(fresh.elapsed().unwrap() < SWEEP, "a held use was not refreshed");
+        assert!(!store.root.join("tmp/writers/abandoned").exists());
+        let recent = store.writer(None, Some("recent")).unwrap();
+        assert!(recent.has("model", "weight"), "the recent keyed journal still resumes");
+        drop(recent);
+        drop(hold);
+        assert_eq!(store.collect(u64::MAX, Duration::ZERO).unwrap().uses, std::slice::from_ref(&held.sha256));
+        assert!(!store.path(&held).unwrap().exists());
     }
-    Ok(removed)
-}
 
-#[derive(Debug)]
-pub(crate) struct DirectoryGuard(#[allow(dead_code)] File);
-
-#[derive(Debug)]
-pub(crate) struct AcquisitionGuard(#[allow(dead_code)] File);
-
-fn collection_file(store: &Store) -> Result<File> {
-    let path = store.root().join("tmp/holds/gc.lock");
-    fs::create_dir_all(path.parent().expect("a collection fence has a parent"))
-        .map_err(fail("create", &path))?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(fail("open", &path))
-}
-
-/// Only the short metadata-to-retention publication, never a checkpoint's lifetime.
-pub(crate) fn acquire(store: &Store) -> Result<AcquisitionGuard> {
-    let file = collection_file(store)?;
-    file.lock_shared().map_err(fail("lock", store.root()))?;
-    Ok(AcquisitionGuard(file))
-}
-
-/// Collection skips a concurrent acquisition; it never waits on a caller/provider.
-pub(crate) fn try_collect(store: &Store) -> Result<Option<AcquisitionGuard>> {
-    let file = collection_file(store)?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(AcquisitionGuard(file))),
-        Err(TryLockError::WouldBlock) => Ok(None),
-        Err(TryLockError::Error(e)) => Err(fail("lock", store.root())(e)),
-    }
-}
-
-fn sidecar(path: &Path) -> Result<PathBuf> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid(path, "a cache view needs a parent"))?;
-    let mut name = OsString::from(".");
-    name.push(
-        path.file_name()
-            .ok_or_else(|| invalid(path, "a cache view needs a name"))?,
-    );
-    name.push(".tensorfs-lock");
-    Ok(parent.join(name))
-}
-
-fn directory_file(path: &Path) -> Result<File> {
-    let sidecar = sidecar(path)?;
-    fs::create_dir_all(sidecar.parent().expect("a sidecar has a parent"))
-        .map_err(fail("create", &sidecar))?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&sidecar)
-        .map_err(fail("open", sidecar))
-}
-
-pub(crate) fn directory(store: &Store, path: &Path) -> Result<DirectoryGuard> {
-    let _acquisition = acquire(store)?;
-    let file = directory_file(path)?;
-    file.lock_shared().map_err(fail("lock", path))?;
-    Ok(DirectoryGuard(file))
-}
-
-pub(crate) fn try_directory(path: &Path) -> Result<Option<DirectoryGuard>> {
-    let file = directory_file(path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(DirectoryGuard(file))),
-        Err(TryLockError::WouldBlock) => Ok(None),
-        Err(TryLockError::Error(e)) => Err(fail("lock", path)(e)),
-    }
-}
-
-/// Maintenance only, after removing the entry while holding both the exclusive collection
-/// gate and this entry's exclusive directory guard. New openers take the shared gate first.
-pub(crate) fn remove_directory_fence(path: &Path, _guard: &DirectoryGuard) -> Result<()> {
-    let sidecar = sidecar(path)?;
-    match fs::remove_file(&sidecar) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(fail("remove", sidecar)(e)),
+    /// A dead holder's file is reaped by the next collection; a live one's is kept and read.
+    #[test]
+    fn a_dead_hold_is_reaped_and_a_live_one_roots() {
+        let scratch = Scratch::new();
+        let store = &scratch.0;
+        let object = store.put_bytes(b"held").unwrap();
+        let hold = store.hold(std::slice::from_ref(&object)).unwrap();
+        hold.extend(["not-an-object".to_owned()]).unwrap();
+        store.gc().unwrap();
+        assert!(store.reuse(&object).unwrap());
+        assert_eq!(list(&store.root.join("holds")).unwrap().len(), 2, "the hold and the fence");
+        drop(hold);
+        store.gc().unwrap();
+        assert!(!store.reuse(&object).unwrap());
+        assert_eq!(list(&store.root.join("holds")).unwrap().len(), 1, "only the fence");
     }
 }
