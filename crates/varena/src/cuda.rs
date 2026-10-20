@@ -139,6 +139,30 @@ pub struct Driver {
     pub mem_import: unsafe extern "C" fn(*mut Handle, *mut c_void, u32) -> CUresult,
 }
 
+/// Only the private Rust proof uses these optional operations, through the retained table.
+#[cfg(all(test, feature = "faults", target_os = "linux"))]
+pub(crate) mod proof {
+    use super::*;
+
+    pub(crate) type HostFn = unsafe extern "C" fn(*mut c_void);
+    #[derive(Clone, Copy)]
+    pub(crate) struct Symbols {
+        pub host: unsafe extern "C" fn(CUstream, HostFn, *mut c_void) -> CUresult,
+        pub dtoh: unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult,
+    }
+
+    pub(crate) fn symbols() -> Result<Symbols> {
+        let d = driver()?;
+        // SAFETY: documented Linux driver ABIs; d's process-wide library outlives the pointers.
+        unsafe {
+            Ok(Symbols {
+                host: *d._lib.get(b"cuLaunchHostFunc\0").map_err(|e| Error::Unsupported(format!("GPU proof host gate: {e}")))?,
+                dtoh: *d._lib.get(b"cuMemcpyDtoHAsync_v2\0").map_err(|e| Error::Unsupported(format!("GPU proof readback: {e}")))?,
+            })
+        }
+    }
+}
+
 // The table is immutable after load and the driver entry points are thread-safe.
 unsafe impl Send for Driver {}
 unsafe impl Sync for Driver {}

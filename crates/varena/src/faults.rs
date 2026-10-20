@@ -60,3 +60,26 @@ pub(crate) fn stall(_point: &'static str) {}
 pub(crate) fn hit(_point: &'static str) -> crate::Result<()> {
     Ok(())
 }
+
+/// One-shot CPU phase acknowledgements, absent from library builds and Python bindings.
+#[cfg(all(test, feature = "faults"))]
+pub(crate) mod phases {
+    use std::sync::{mpsc, Mutex};
+    static WATCHERS: Mutex<Vec<(&'static str, mpsc::Sender<()>)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn watch(point: &'static str) -> mpsc::Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        let mut watchers = WATCHERS.lock().unwrap();
+        assert!(!watchers.iter().any(|(p, _)| *p == point), "duplicate proof phase");
+        watchers.push((point, tx));
+        rx
+    }
+
+    pub(crate) fn reached(point: &'static str) {
+        let mut watchers = WATCHERS.lock().unwrap();
+        if let Some(i) = watchers.iter().position(|(p, _)| *p == point) {
+            let (_, tx) = watchers.swap_remove(i);
+            let _ = tx.send(());
+        }
+    }
+}
