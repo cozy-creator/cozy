@@ -441,7 +441,7 @@ pub(crate) mod tests {
         ]});
         let read = Interface::parse(&described).unwrap();
         assert!(read.unavailable.is_empty(), "{:?}", read.unavailable);
-        assert_eq!(read.public(), ["echo", "nulls"]);
+        assert_eq!(read.public(), ["nulls", "echo"], "GPU functions first");
         let echo = &read.callables[0];
         assert!(echo.models.is_empty() && echo.weights_outputs.is_empty() && !echo.is_conversion());
         assert_eq!(echo.field("text").unwrap().wire, Wire::Optional);
