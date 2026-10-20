@@ -16,6 +16,7 @@ use std::os::unix::net::UnixStream;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread::{self, ThreadId};
 
 use crossbeam_queue::SegQueue;
 use parking_lot::{Condvar, Mutex};
@@ -302,7 +303,7 @@ impl Drop for Mapping {
 
 enum State {
     Empty,
-    Filling,
+    Filling(ThreadId),
     Ready(Mapping),
     Failed(Mapping, Error),
 }
@@ -567,7 +568,7 @@ impl Gpu {
             if let Some(owner) = host_owner {
                 page.host_sources.lock().push(owner);
             }
-            *state = State::Filling;
+            *state = State::Filling(thread::current().id());
         }
         let allocation = catch_unwind(AssertUnwindSafe(|| {
             Mapping::allocate(page.range.clone(), page.offset, page.bytes)
@@ -685,7 +686,10 @@ impl Gpu {
             State::Ready(mapping) => mapping,
             State::Failed(_, error) => return Err(error.clone()),
             State::Empty => return Ok(BindState::Empty),
-            State::Filling => {
+            State::Filling(owner) => {
+                if *owner == thread::current().id() {
+                    return Err(invalid("page fill depends on its own unfinished page"));
+                }
                 return Ok(BindState::Filling(Pending {
                     event: None,
                     fill_generation: Some(*generation),
@@ -855,7 +859,10 @@ impl Gpu {
         for page in pages {
             let state = page.state.lock();
             match &*state {
-                State::Filling => filling = true,
+                // A transform may lazily bind another model. It cannot wait for
+                // its own outer fill to finish: return the existing relief rung
+                // so that dependency can make room, or report exhaustion.
+                State::Filling(owner) => filling |= *owner != thread::current().id(),
                 State::Ready(mapping) => {
                     for event in mapping.ready.iter().chain(&mapping.releases) {
                         if !event.done()? {
@@ -904,7 +911,7 @@ impl Gpu {
         let mut state = page.state.lock();
         match &mut *state {
             State::Empty => Ok(true),
-            State::Filling => Ok(false),
+            State::Filling(_) => Ok(false),
             State::Ready(mapping) => {
                 if !mapping.idle()? {
                     return Ok(false);
@@ -1116,7 +1123,7 @@ impl Gpu {
         for (id, page) in pages {
             facts.push(match &mut *page.state.lock() {
                 State::Empty => (id, 0, 0, false),
-                State::Filling => (id, page.bytes, 0, true),
+                State::Filling(_) => (id, page.bytes, 0, true),
                 State::Ready(mapping) => (id, mapping.bytes, mapping.pins, !mapping.idle()?),
                 State::Failed(mapping, _) => (id, mapping.bytes, mapping.pins, true),
             });

@@ -8,7 +8,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle, ThreadId};
 
 use parking_lot::{Condvar, Mutex};
 use tensorfs::io::source::Source;
@@ -251,7 +251,7 @@ struct Inner {
     caches: BTreeMap<PageId, Cache>,
     orphaned: BTreeMap<PageId, PageKey>,
     retired: BTreeSet<PageId>,
-    filling: BTreeSet<PageId>,
+    filling: BTreeMap<PageId, ThreadId>,
     next_page: PageId,
     progress: u64,
     trim: Option<Arc<Shrink>>,
@@ -371,7 +371,7 @@ impl Placement {
                 caches: BTreeMap::new(),
                 orphaned: BTreeMap::new(),
                 retired: BTreeSet::new(),
-                filling: BTreeSet::new(),
+                filling: BTreeMap::new(),
                 next_page: 1,
                 progress: 0,
                 trim: None,
@@ -1114,7 +1114,11 @@ impl Placement {
                 }
                 Relief::Lower(short) => {
                     self.refresh()?;
-                    let reclaim_from = self.inner.lock().table.occupied()
+                    let reclaim_from = self
+                        .inner
+                        .lock()
+                        .table
+                        .occupied()
                         .ok_or_else(|| invalid("occupied bytes overflow"))?;
                     if !matches!(
                         self.drive(
@@ -1157,7 +1161,13 @@ impl Placement {
 
     fn wait_fill(&self, page: PageId) -> Result<()> {
         let mut inner = self.inner.lock();
-        while inner.filling.contains(&page) && !self.stop.load(Ordering::Acquire) {
+        while let Some(owner) = inner.filling.get(&page) {
+            if self.stop.load(Ordering::Acquire) {
+                break;
+            }
+            if *owner == thread::current().id() {
+                return Err(invalid("page fill depends on its own unfinished page"));
+            }
             self.changed.wait(&mut inner);
         }
         if self.stop.load(Ordering::Acquire) {
@@ -1326,10 +1336,18 @@ impl Placement {
         self.refresh()?;
         let reclaim_from = {
             let mut inner = self.inner.lock();
-            if let Some(facts) = inner.table.requests.iter_mut().find(|row| row.id == request) {
+            if let Some(facts) = inner
+                .table
+                .requests
+                .iter_mut()
+                .find(|row| row.id == request)
+            {
                 facts.can_cut = !lower;
             }
-            inner.table.occupied().ok_or_else(|| invalid("occupied bytes overflow"))?
+            inner
+                .table
+                .occupied()
+                .ok_or_else(|| invalid("occupied bytes overflow"))?
         };
         self.drive(
             request,
@@ -1655,7 +1673,7 @@ impl Placement {
             .retain(|page| !finished.contains(&page.id));
         inner.retired.retain(|id| !finished.contains(id));
         for (id, bytes, pins, pending) in facts {
-            let reserved = inner.filling.contains(&id);
+            let reserved = inner.filling.contains_key(&id);
             if let Some(page) = inner.table.pages.iter_mut().find(|page| page.id == id) {
                 page.tier = if bytes == 0 && !reserved {
                     Tier::Disk
@@ -1837,7 +1855,10 @@ impl Placement {
                             drop(operation);
                             return self.warm_ram(model);
                         }
-                        self.inner.lock().filling.insert(page);
+                        self.inner
+                            .lock()
+                            .filling
+                            .insert(page, thread::current().id());
                         let filling = Filling { owner: self, page };
                         drop(operation);
                         let result = self.fill(request, page, from, speculative);
@@ -2542,6 +2563,271 @@ mod gpu_tests {
         .expect("visible devices");
         assert_eq!(count, 1, "this proof requires exactly one assigned GPU");
         gpu.uuid().expect("GPU UUID")
+    }
+
+    // An old recursive pending wait must fail one bounded test, not strand the
+    // native proof runner. All CUDA owners live on the worker if it wedges.
+    fn fill_worker(run: impl FnOnce() -> String + Send + 'static) -> String {
+        let (sent, done) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+            let _ = sent.send(result);
+        });
+        let result = done
+            .recv_timeout(Duration::from_secs(10))
+            .expect("fill callback waited for its own unfinished fill");
+        worker.join().unwrap();
+        result.unwrap_or_else(|error| std::panic::resume_unwind(error))
+    }
+
+    fn fill_layout(regions: u64, value: u8) -> Layout {
+        let span = 4 << 20;
+        let bytes: Arc<[u8]> = vec![value; span as usize].into();
+        Layout {
+            parts: vec![],
+            regions: (0..regions)
+                .map(|index| crate::layout::Region {
+                    offset: index * span,
+                    nbytes: span,
+                    span,
+                    items: vec![Item {
+                        offset: index * span,
+                        len: span,
+                        source: ItemSource::Inline(bytes.clone()),
+                        part_end: true,
+                    }],
+                })
+                .collect(),
+            nbytes: regions * span,
+            digest: format!("fill-dependency-{regions}-{value}"),
+            names: vec![],
+        }
+    }
+
+    struct FillLedger {
+        ledger: Ledger,
+        name: String,
+    }
+    impl FillLedger {
+        fn new() -> Self {
+            let name = format!(
+                "fill-dependency-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            Self {
+                ledger: Ledger::create(&name, 24 << 20).unwrap(),
+                name,
+            }
+        }
+        fn placement(&self) -> Arc<Placement> {
+            let grant = self.ledger.grant_unbound().unwrap();
+            Placement::open(0, Some((grant.table, grant.events, grant.channel))).unwrap()
+        }
+    }
+    impl Drop for FillLedger {
+        fn drop(&mut self) {
+            let uid = unsafe { libc::geteuid() };
+            let _ = std::fs::remove_file(format!("/dev/shm/varena-{}-{uid}", self.name));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn a_fill_can_bind_another_model_under_pressure_without_waiting_for_itself() {
+        let uuid = fill_worker(|| {
+            let fixture = FillLedger::new();
+            let placement = fixture.placement();
+            let uuid = assigned_gpu(&placement.gpu);
+            let source = Arc::new(Source::files(vec![], false, 0));
+            let factors = placement
+                .register(
+                    2,
+                    "factors".into(),
+                    [91; 32],
+                    &fill_layout(1, 11),
+                    source.clone(),
+                    None,
+                )
+                .unwrap();
+            let weak = Arc::downgrade(&placement);
+            let active = Arc::new(AtomicBool::new(false));
+            let enabled = active.clone();
+            let first = Arc::new(AtomicU64::new(0));
+            let target = first.clone();
+            let transform = Arc::new(move |page, write: FillPin| {
+                if !enabled.load(Ordering::Acquire) || page != target.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let placement = weak.upgrade().unwrap();
+                // The outer page is actually Filling, and every other base page
+                // is Working. The nested dependency must reach Lower, not wait
+                // for this same callback to finish before returning that rung.
+                let factor = placement.bind(9, factors[0], write.stream)?;
+                unsafe {
+                    tensorfs::io::read(
+                        &[tensorfs::io::Copy {
+                            src: tensorfs::io::Src::Device {
+                                device: 0,
+                                ptr: factor.ptr,
+                                stream: write.stream,
+                            },
+                            dst: tensorfs::io::Dst::Device {
+                                device: 0,
+                                ptr: write.ptr,
+                                len: write.bytes as usize,
+                                stream: write.stream,
+                            },
+                        }],
+                        &tensorfs::io::ReadOpts::default(),
+                    )?;
+                }
+                Ok(())
+            });
+            let base = placement
+                .register(
+                    1,
+                    "base".into(),
+                    [92; 32],
+                    &fill_layout(6, 7),
+                    source,
+                    Some(transform),
+                )
+                .unwrap();
+            first.store(base[0], Ordering::Release);
+            assert_eq!(placement.load(1, Tier::Gpu).unwrap(), Relief::Complete);
+            assert_eq!(
+                placement
+                    .resident()
+                    .unwrap()
+                    .iter()
+                    .map(|(_, n)| n)
+                    .sum::<u64>(),
+                24 << 20
+            );
+            assert!(placement.gpu.unmap(base[0]).unwrap());
+            active.store(true, Ordering::Release);
+            placement
+                .begin(
+                    9,
+                    vec![vec![1, 2]],
+                    "fill-dependency".into(),
+                    "shape".into(),
+                )
+                .unwrap();
+            placement.enter(9, 1).unwrap();
+            let pin = placement.bind(9, base[0], 0).unwrap();
+            let mut bytes = [0_u8; 32];
+            unsafe {
+                tensorfs::io::read(
+                    &[tensorfs::io::Copy {
+                        src: tensorfs::io::Src::Device {
+                            device: 0,
+                            ptr: pin.ptr,
+                            stream: 0,
+                        },
+                        dst: tensorfs::io::Dst::host(&mut bytes),
+                    }],
+                    &tensorfs::io::ReadOpts::default(),
+                )
+            }
+            .unwrap();
+            assert_eq!(
+                bytes, [11; 32],
+                "the callback must read the actual other model"
+            );
+            assert!(placement
+                .stats(9)
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| event.kind == "lower"));
+            active.store(false, Ordering::Release);
+            drop(pin);
+            placement.gpu.wait_pending().unwrap();
+            placement.end(9).unwrap();
+            placement.close().unwrap();
+            uuid
+        });
+        println!(
+            "PASS a fill binds another model under pressure without waiting for itself {uuid}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn self_region_fill_refuses_and_the_same_request_recovers() {
+        let uuid = fill_worker(|| {
+            let fixture = FillLedger::new();
+            let placement = fixture.placement();
+            let uuid = assigned_gpu(&placement.gpu);
+            let weak = Arc::downgrade(&placement);
+            let recurse = Arc::new(AtomicBool::new(true));
+            let enabled = recurse.clone();
+            let transform = Arc::new(move |page, write: FillPin| {
+                if enabled.load(Ordering::Acquire) {
+                    let placement = weak.upgrade().unwrap();
+                    let direct = placement.gpu.bind(page, write.stream).err().unwrap();
+                    assert!(
+                        matches!(direct, Error::Invalid(message) if message.contains("own unfinished page"))
+                    );
+                    let error = placement.bind(9, page, write.stream).err().unwrap();
+                    assert!(
+                        matches!(&error, Error::Invalid(message) if message.contains("own unfinished page"))
+                    );
+                    return Err(error);
+                }
+                Ok(())
+            });
+            let pages = placement
+                .register(
+                    1,
+                    "self".into(),
+                    [93; 32],
+                    &fill_layout(1, 7),
+                    Arc::new(Source::files(vec![], false, 0)),
+                    Some(transform),
+                )
+                .unwrap();
+            placement
+                .begin(9, vec![vec![1]], "self-fill".into(), "shape".into())
+                .unwrap();
+            let error = placement.bind(9, pages[0], 0).err().unwrap();
+            assert!(
+                matches!(error, Error::Invalid(message) if message.contains("own unfinished page"))
+            );
+            assert!(placement.inner.lock().filling.is_empty());
+            placement.gpu.recover().unwrap();
+            recurse.store(false, Ordering::Release);
+            let pin = placement
+                .bind(9, pages[0], 0)
+                .expect("the same request recovers");
+            let mut bytes = [0_u8; 32];
+            unsafe {
+                tensorfs::io::read(
+                    &[tensorfs::io::Copy {
+                        src: tensorfs::io::Src::Device {
+                            device: 0,
+                            ptr: pin.ptr,
+                            stream: 0,
+                        },
+                        dst: tensorfs::io::Dst::host(&mut bytes),
+                    }],
+                    &tensorfs::io::ReadOpts::default(),
+                )
+            }
+            .unwrap();
+            assert_eq!(bytes, [7; 32]);
+            drop(pin);
+            placement.gpu.wait_pending().unwrap();
+            placement.end(9).unwrap();
+            placement.close().unwrap();
+            uuid
+        });
+        println!("PASS self-region fill refuses and the same request recovers {uuid}");
     }
 
     #[test]

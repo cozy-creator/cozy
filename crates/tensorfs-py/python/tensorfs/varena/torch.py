@@ -346,6 +346,7 @@ class Block:
     tensors: dict[str, dict[str, _PartAt]] = field(default_factory=dict)
     count: int = 0
     binding: bool = False
+    binding_owner: int | None = None
     stream: torch.cuda.Stream | None = None
     pins: list[Tensor] = field(default_factory=list)
     written: list[tuple[_Site, Tensor | None]] = field(default_factory=list)
@@ -927,9 +928,12 @@ class Memory:
         stream = torch.cuda.current_stream(self.device)
         with self.changed:
             while block.binding:
+                if block.binding_owner == threading.get_ident():
+                    raise Unbound("a block cannot read its own unfinished binding")
                 self.changed.wait()
             bind = block.count == 0
             block.binding = bind
+            block.binding_owner = threading.get_ident() if bind else None
             held_stream = block.stream
             acquired = not bind
             if acquired:
@@ -964,6 +968,7 @@ class Memory:
             if bind:
                 with self.changed:
                     block.binding = False
+                    block.binding_owner = None
                     self.changed.notify_all()
 
     def _exit(self, block: Block) -> None:
