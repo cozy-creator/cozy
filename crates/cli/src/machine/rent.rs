@@ -198,9 +198,9 @@ pub(crate) fn agree(ctx: &Context, said: &str) -> Result<bool, Error> {
     let _ = std::io::stderr().flush();
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
+        return Ok(false);
     }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes")
+    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes"))
 }
 
 /// Follows the boot over Calcifer's machine events until the machine is ready, saying the Hub's
