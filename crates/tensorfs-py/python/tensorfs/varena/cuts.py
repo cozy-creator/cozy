@@ -333,10 +333,10 @@ def _settle(
 def planned(shape: Shape | None, short: int, block: int) -> int:
     """Planning's one cut: FFN tokens, never attention. The widest FFN scope of `shape` (its
     bytes per token over its tokens) goes to the fewest pieces whose saving (those bytes over
-    the tokens no longer live at once) covers `short`; when none does, to as many pieces as a
-    doubling still saves a `block` with, so more of the model stays home. The bytes it saves;
-    0, cutting nothing, without an FFN or when the shape measured an FFN cut no lower than
-    whole."""
+    the tokens no longer live at once) covers `short`; when no piece count does, to as many
+    as a doubling still saves a `block` with, so more of the model stays home. The bytes it
+    saves, at most `short`; 0, cutting nothing, without an FFN or when the shape measured an
+    FFN cut no lower than whole."""
     if shape is None or shape.whole_only or not shape.units:
         return 0
     memo = _served.memo
@@ -344,18 +344,23 @@ def planned(shape: Shape | None, short: int, block: int) -> int:
     unit, (total, finest, _) = shape.units[key], shape.scopes[key]
     size = min(memo.sizes.get(key, total), total)
 
+    def piece(pieces: int) -> int:
+        return -(-total // pieces)
+
     def saved(pieces: int) -> int:
-        return unit * (size - -(-total // pieces))
+        return unit * (size - piece(pieces))
 
     pieces = 2
-    while -(-total // pieces) > finest and saved(pieces) < short:
-        if saved(2 * pieces) - saved(pieces) < block:
-            break
+    while piece(pieces) > finest and saved(pieces) < short:
         pieces *= 2
+    if saved(pieces) < short:
+        pieces = 2
+        while piece(pieces) > finest and saved(2 * pieces) - saved(pieces) >= block:
+            pieces *= 2
     if saved(pieces) <= 0:
         return 0
-    memo.sizes[key] = -(-total // pieces)
-    return saved(pieces)
+    memo.sizes[key] = piece(pieces)
+    return min(saved(pieces), short)
 
 
 def relaxing(shape: Shape | None, peak: int) -> int | None:
