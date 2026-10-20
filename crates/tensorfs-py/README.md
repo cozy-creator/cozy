@@ -47,6 +47,77 @@ representation for a compatible compute kernel or decode a supported encoding in
 tensors. Components, configuration and supporting assets are described in the same checkpoint,
 so consumers do not have to reverse-engineer filenames and producer-specific tensor names.
 
+#### Why the exact encoding matters
+
+These are concrete cases from our format and importer work, captured by the
+[encoding definitions](../tensorfs/spec/cozytensors.md):
+
+| Case | Why dtype, shape or names were not enough | What cozytensors records |
+|---|---|---|
+| Ordinary INT8 versus ConvRot INT8 | Both can contain an INT8 matrix and row scales, but ConvRot quantized rotated weights. Multiplying by the scales alone does not reconstruct the original weight. | Distinct schemes, the Hadamard rotation and its size, and the decoding formula. |
+| NVFP4 from different producers | ComfyUI and ModelOpt can order the two 4-bit values in a byte differently and lay out block scales differently. Global scale conventions can multiply or divide. | Nibble order, scale layout and scale convention, rather than guessing from an “NVFP4” label. |
+| H3's NVFP4 AWQ text encoder | Our audit had to establish that `pre_quant_scale` multiplies each input column. Omitting it or dividing by it produces different weights. | The optional per-column factor and its exact role in decoding. |
+| ComfyUI W4A4 grouping | Our initial survey confused a kernel's tile size with the quantization grouping; the format uses per-row scales. Compute geometry does not define the stored encoding. | The scheme's actual scale granularity, independent of a particular kernel's tile size. |
+| GPTQ and other packed 4-bit formats | GPTQ versions differ in how zero points are stored; AWQ uses a different packed element order. The same integer dtype does not identify either rule. | The specific scheme, group size, zero-point convention and any required index/permutation arrays. |
+
+We also tested guessing NVFP4 layouts from tensor shapes or from how plausible decoded values
+looked. Neither reliably distinguished the formats. An importer must resolve the producer's
+convention or refuse an ambiguous source. Once imported, those decisions are explicit in the
+cozytensors header, so every reader can apply the same rules.
+
+#### Choose the representation your runtime needs
+
+For a quantized matrix named `proj.weight`, inspect and retain its stored encoding when your
+runtime has a matching compute kernel:
+
+```python
+import tensorfs
+
+checkpoint = tensorfs.open("owner/model", variant="int8")
+tensors = checkpoint.components["unet"].tensors
+stored = tensors.read("proj.weight", device="cuda:0", decode=False)
+print(stored.scheme, stored.params)
+# stored.parts contains the GPU arrays for that encoding's compute kernel.
+```
+
+A runtime that expects ordinary floating-point weights can instead request decoding:
+
+```python
+import torch
+
+dense = tensors.read("proj.weight", device="cuda:0", decode=True)
+weight = torch.from_dlpack(dense)  # ordinary values; no input-format-specific unpacker
+weight = weight.to(torch.bfloat16)  # only if this runtime requires BF16
+```
+
+`decode=True` reconstructs the header's declared logical dtype; it does not always mean BF16.
+The same call can decode supported ConvRot, GPTQ, NF4 or other stored schemes. Selecting CUDA
+chooses the destination, not a different quantization.
+
+#### Convert to another quantization at load time
+
+Changing from one quantization to another means decoding the stored values, then applying
+the target encoder. For example, a runtime that expects symmetric, per-row INT8 can prepare
+weights decoded from ConvRot or another supported encoding as follows:
+
+```python
+values = torch.from_dlpack(
+    tensors.read("proj.weight", device="cuda:0", decode=True)
+).float()
+scales = values.abs().amax(dim=1, keepdim=True) / 127
+scales = torch.where(scales == 0, torch.ones_like(scales), scales)
+weights_i8 = (values / scales).round().clamp(-127, 127).to(torch.int8)
+row_scales = scales.squeeze(1)
+# weights_i8 and row_scales are ready for a matching rowwise-INT8 kernel.
+```
+
+This target representation is `int8.rowwise` with `axis=0` and `scale_dtype="F32"`.
+TensorFS handles the source encoding; the target quantizer above is ordinary PyTorch code.
+The current Python API does not yet expose a general re-encoding call.
+`ComponentWriter.put_encoded(...)` can store already-encoded arrays, but does not quantize them.
+Prepare this once when loading, rather than on every forward pass. Re-quantizing can add error;
+methods requiring calibration need their own calibration step, not merely a dtype cast.
+
 ### Problem 2: Safetensors has no built-in de-duplication
 
 A safetensors file contains its own payload. Two checkpoints containing the same text encoder
