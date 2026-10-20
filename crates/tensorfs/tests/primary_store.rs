@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tensorfs::format::{Body, Component, Dtype, Header, Location, ObjectRef, Tensor, Tree};
 use tensorfs::store2::{Checkpoint, Store};
-use tensorfs::{Client, Config, Fetch, Open};
+use tensorfs::{Client, Config, Download, Open};
+
+const README: &[u8] = b"known repository file outside the checkpoint";
 
 struct Scratch(PathBuf);
 
@@ -62,6 +64,7 @@ fn seed(store: &Store) -> (ObjectRef, ObjectRef) {
     let header = store.put_bytes(&header.to_cbor().unwrap()).unwrap();
     let mut tree = Tree::default();
     tree.set_variant("main", header.clone());
+    tree.files.insert("README.md".into(), ObjectRef::of(README));
     (header, store.put_tree(&tree).unwrap())
 }
 
@@ -103,12 +106,15 @@ async fn normal_open_read_and_fetch_do_not_create_compatibility_directories() {
             &Open {
                 variant: Some("main".into()),
                 local_files_only: true,
+                lazy: false,
                 ..Default::default()
             },
         )
         .await
         .unwrap();
-    checkpoint.fetch(&Fetch::default()).await.unwrap();
+    // Normal checkpoint access must not reopen the enclosing tree or consult its README.
+    fs::remove_file(store.path(&tree).unwrap()).unwrap();
+    checkpoint.download(&Download::default()).await.unwrap();
     assert_eq!(
         checkpoint
             .component("model")
@@ -126,6 +132,7 @@ fn explicit_cached_folder_retains_its_existing_directory() {
     let scratch = Scratch::new();
     let store = Store::open(scratch.0.join("store")).unwrap().with_cache();
     let (_, tree) = seed(&store);
+    store.put_bytes(README).unwrap();
     let directory = store.root().join("snapshots").join(&tree.sha256);
     store.snapshot(&tree, &directory, None).unwrap();
     assert!(!fs::read(directory.join("model.main.cozytensors"))
