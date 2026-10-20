@@ -777,16 +777,9 @@ fn unmeasured_admission_sheds_cached_regions_and_suppresses_optional_warms_until
         channel
             .ram_status(row.owner(), [31; 32])
             .unwrap()
-            .is_some_and(|s| !s.filling)
+            .is_none_or(|s| !s.filling)
     });
-    assert_eq!(
-        channel
-            .ram_status(row.owner(), [31; 32])
-            .unwrap()
-            .unwrap()
-            .ready,
-        vec![false]
-    );
+    assert!(channel.ram_status(row.owner(), [31; 32]).unwrap().is_none());
     fixture.ledger.finish_host(1, None);
     assert!(channel
         .cache_ram(row.owner(), [31; 32], &[], &regions)

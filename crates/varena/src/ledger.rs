@@ -1398,11 +1398,14 @@ impl Drop for RamFill {
     fn drop(&mut self) {
         self.ram.filling.store(false, Release);
         self.ram.pending.store(false, Release);
+        let room = self
+            .host
+            .can_warm(platform::contain::host_memory::read().available, 0);
         let observers = {
             let mut state = self.host.state.lock();
             state.clock = state.clock.saturating_add(1);
             let generation = state.clock;
-            state
+            let observers = state
                 .ram
                 .get_mut(&self.layout)
                 .filter(|held| held.identity == self.identity)
@@ -1413,10 +1416,27 @@ impl Drop for RamFill {
                         .is_some_and(|ram| Arc::ptr_eq(ram, &self.ram))
                 })
                 .map(|held| {
+                    if !room {
+                        if let Some(slot) = held.slots.get_mut(self.index) {
+                            if slot.idle() {
+                                if let Some(ram) = slot.buffer.take() {
+                                    ram.cancelled.store(true, Release);
+                                }
+                            }
+                        }
+                    }
                     held.generation = generation;
                     held.observers.clone()
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            if state
+                .ram
+                .get(&self.layout)
+                .is_some_and(|held| held.slots.iter().all(|slot| slot.buffer.is_none()))
+            {
+                state.ram.remove(&self.layout);
+            }
+            observers
         };
         notify_owners(observers);
         self.table.changed();
