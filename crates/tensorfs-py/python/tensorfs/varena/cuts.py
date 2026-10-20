@@ -329,23 +329,32 @@ def _settle[T](
     return size, out
 
 
-def planned(shape: Shape | None, short: int) -> bool:
-    """Planning's one cut: FFN tokens, never attention. The widest FFN scope of `shape` (the
-    outermost: its bytes per token over its tokens) that can cover `short` bytes goes to the
-    fewest pieces whose saving (those bytes over the tokens no longer live at once) does;
-    False, cutting nothing, when none can or the shape measured a cut no lower than whole."""
-    if shape is None or shape.whole_only:
-        return False
+def planned(shape: Shape | None, short: int, block: int) -> int:
+    """Planning's one cut: FFN tokens, never attention. The widest FFN scope of `shape` (its
+    bytes per token over its tokens) goes to the fewest pieces whose saving (those bytes over
+    the tokens no longer live at once) covers `short`; when none does, to as many pieces as a
+    doubling still saves a `block` with, so more of the model stays home. The bytes it saves;
+    0, cutting nothing, without an FFN or when the shape measured an FFN cut no lower than
+    whole."""
+    if shape is None or shape.whole_only or not shape.units:
+        return 0
     memo = _served.memo
-    for key in sorted(shape.units, key=lambda k: -shape.units[k] * shape.scopes[k][0]):
-        unit, (total, finest, _) = shape.units[key], shape.scopes[key]
-        size, pieces = min(memo.sizes.get(key, total), total), 2
-        while (piece := -(-total // pieces)) > finest and unit * (size - piece) < short:
-            pieces *= 2
-        if piece < size and unit * (size - piece) >= short:
-            memo.sizes[key] = piece
-            return True
-    return False
+    key = max(shape.units, key=lambda k: shape.units[k] * shape.scopes[k][0])
+    unit, (total, finest, _) = shape.units[key], shape.scopes[key]
+    size = min(memo.sizes.get(key, total), total)
+
+    def saved(pieces: int) -> int:
+        return unit * (size - -(-total // pieces))
+
+    pieces = 2
+    while -(-total // pieces) > finest and saved(pieces) < short:
+        if saved(2 * pieces) - saved(pieces) < block:
+            break
+        pieces *= 2
+    if saved(pieces) <= 0:
+        return 0
+    memo.sizes[key] = -(-total // pieces)
+    return saved(pieces)
 
 
 def relaxing(shape: Shape | None, peak: int) -> int | None:
