@@ -174,12 +174,26 @@ struct PyPlane {
     models: Mutex<BTreeMap<u64, Arc<Model>>>,
     next: AtomicU64,
 }
+struct CoreRef(std::mem::ManuallyDrop<Arc<Placement>>);
+impl std::ops::Deref for CoreRef {
+    type Target = Arc<Placement>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for CoreRef {
+    fn drop(&mut self) {
+        // SAFETY: taken exactly once at the wrapper's final drop.
+        crate::cleanup::defer(unsafe { std::mem::ManuallyDrop::take(&mut self.0) });
+    }
+}
 impl PyPlane {
-    fn core(&self, py: Python<'_>) -> PyResult<Arc<Placement>> {
+    fn core(&self, py: Python<'_>) -> PyResult<CoreRef> {
         self.core
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+            .map(|core| CoreRef(std::mem::ManuallyDrop::new(core)))
             .ok_or_else(|| raise(py, Error::Closed("placement".into())))
     }
     fn model(&self, py: Python<'_>, id: u64) -> PyResult<Arc<Model>> {
@@ -460,8 +474,9 @@ impl PyPlane {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         if let Some(c) = core {
-            native(py, || c.close())?;
+            let result = native(py, || c.close());
             crate::cleanup::defer(c);
+            result?;
         }
         Ok(())
     }
