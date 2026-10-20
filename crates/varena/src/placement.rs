@@ -695,6 +695,38 @@ impl Placement {
         inner.table.pages.retain(|page| page.id != id);
     }
 
+    pub fn cache_active(&self, id: PageId, active: bool) -> Result<()> {
+        let mut inner = self.inner.lock();
+        let page = inner
+            .table
+            .pages
+            .iter_mut()
+            .find(|page| page.id == id && page.kind == Kind::Cache)
+            .ok_or_else(|| invalid("unknown cache"))?;
+        page.pins = if active {
+            page.pins.saturating_add(1)
+        } else {
+            page.pins.saturating_sub(1)
+        };
+        Ok(())
+    }
+
+    pub fn retained_bind(&self, request: RequestId, model: ModelId) -> Result<()> {
+        self.enter(request, model)?;
+        let pages = self
+            .inner
+            .lock()
+            .models
+            .get(&model)
+            .ok_or_else(|| invalid("unknown model"))?
+            .pages
+            .clone();
+        for page in pages {
+            self.event(request, page, "bind", "retained")?;
+        }
+        Ok(())
+    }
+
     pub fn close_model(&self, id: ModelId) -> Result<()> {
         let pages = {
             let mut inner = self.inner.lock();
@@ -1024,10 +1056,8 @@ impl Placement {
                                 page.pins = 1;
                             }
                         }
-                        if freed < bytes {
-                            drop(operation);
-                            continue 'decide;
-                        }
+                        drop(operation);
+                        continue 'decide;
                     }
                     Action::Starve(step) => {
                         if let Some(row) = self
