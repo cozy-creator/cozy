@@ -11,7 +11,7 @@ from tensorfs import _ext
 
 manifest = pathlib.Path(__file__).parents[2] / "tensorfs/kernels/aot/manifest.json"
 records = json.loads(manifest.read_text())["binaries"]
-assert len(records) == 324
+assert len(records) == 378
 for expected in records:
     image, symbol, shared, warps = _ext._kernel_binary(expected["family"], expected["kind"], expected["dtype"])
     assert image.startswith(b"\x7fELF")

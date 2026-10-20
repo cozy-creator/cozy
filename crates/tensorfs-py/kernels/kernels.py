@@ -521,3 +521,25 @@ def _q1_0(base, el, mask):  # type: ignore[no-untyped-def]
 def _q2_0(base, el, mask):  # type: ignore[no-untyped-def]
     q = (u8_at(base, 2 + el // 4, mask) >> (2 * (el % 4))) & 3
     return (q - 1).to(tl.float32) * f16_at(base, 0, mask)
+
+
+@triton.jit
+def cast_metadata(out, words, slots, scale, term, table, factor, post, index, error, params,
+                  OUT: tl.constexpr, BLOCK: tl.constexpr):  # type: ignore[no-untyped-def]
+    """Normalize only stored factor cells to f32; no logical weight expansion."""
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    n = tl.load(params)
+    mode = tl.load(params + 1)
+    mask = i < n
+    if mode == 0:
+        lo = tl.load(words + 2 * i, mask, 0).to(tl.uint32)
+        hi = tl.load(words + 2 * i + 1, mask, 0).to(tl.uint32)
+        value = ((lo | (hi << 8)) << 16).to(tl.float32, bitcast=True)
+    elif mode == 1:
+        lo = tl.load(words + 2 * i, mask, 0).to(tl.uint16)
+        hi = tl.load(words + 2 * i + 1, mask, 0).to(tl.uint16)
+        value = (lo | (hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+    else:
+        code = tl.load(words + i, mask, 0).to(tl.int32)
+        value = tl.load(table + code, mask, 0)
+    tl.store(out + i, value, mask)

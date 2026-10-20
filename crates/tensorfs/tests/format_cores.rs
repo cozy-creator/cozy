@@ -5,11 +5,11 @@ use std::path::Path;
 
 use base64::Engine;
 use serde_json::Value;
+use tensorfs::format::Dtype;
 use tensorfs::format::decode::affine::{Codes, Fill, Order, Packing};
 use tensorfs::format::decode::blocks;
 use tensorfs::format::decode::grid::{Grid, ScaleLayout};
 use tensorfs::format::decode::plan::{self, Elems, Plan, Term};
-use tensorfs::format::Dtype;
 
 fn b64(v: &Value) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
@@ -133,7 +133,7 @@ fn cores_decode_every_case() {
                     _ => Term::None,
                 };
                 let codes = plan::Codes {
-                    bytes: &words,
+                    bytes: words.as_slice().into(),
                     packing: packing(&case["packing"], &slots),
                     flat: false,
                     table: (core == "table").then(|| f32s(&case["table"])),

@@ -3,18 +3,19 @@
 
 use crate::format::decode::affine::{Codes as CodeType, Fill, Order};
 use crate::format::decode::grid::{Grid, ScaleLayout};
-use crate::format::decode::plan::{Core, Plan, Post, Term};
-use crate::format::decode::{round, Geometry};
+use crate::format::decode::plan::{Bytes, Core, Elems, Plan, Post, Term};
+use crate::format::decode::{Geometry, round};
 use crate::format::{Dtype, Error, Result};
 
 pub const FAMILIES: [u32; 6] = [80, 86, 89, 90, 100, 120];
-pub const CORE_KINDS: [&str; 6] = [
+pub const CORE_KINDS: [&str; 7] = [
     "codes",
     "unpack",
     "hadamard",
     "rotated",
     "requantize",
     "grouped_rotated",
+    "cast_metadata",
 ];
 
 pub struct Binary {
@@ -48,15 +49,73 @@ pub enum Prepared<'a> {
 pub struct Launch<'a> {
     pub kind: &'static str,
     pub dtype: Dtype,
-    pub words: &'a [u8],
+    pub words: Bytes<'a>,
     pub slots: Vec<i32>,
-    pub scale: Vec<f32>,
-    pub term: Vec<f32>,
-    pub table: Vec<f32>,
-    pub global: Vec<f32>,
-    pub post: Vec<f32>,
+    pub scale: Factors,
+    pub term: Factors,
+    pub table: Factors,
+    pub global: Factors,
+    pub post: Factors,
     pub index: Vec<u32>,
     pub params: [u64; 32],
+}
+
+/// Float kernel arguments are either normalized Host values or a typed external input.
+/// A slot carries no pointer; the read engine binds it and casts metadata on the device.
+pub enum Factors {
+    Host(Vec<f32>),
+    Slot {
+        index: usize,
+        dtype: Dtype,
+        count: usize,
+    },
+}
+impl From<Vec<f32>> for Factors {
+    fn from(values: Vec<f32>) -> Self {
+        Self::Host(values)
+    }
+}
+impl TryFrom<Elems<'_>> for Factors {
+    type Error = Error;
+    fn try_from(values: Elems<'_>) -> Result<Self> {
+        match values.bytes.binding() {
+            Some((index, len)) => {
+                let width = values
+                    .dtype
+                    .byte_len(&[1])
+                    .ok_or_else(|| Error::Decode("unsupported factor dtype".into()))?
+                    as usize;
+                if width == 0 || !len.is_multiple_of(width) {
+                    return Err(Error::Decode("factor byte length is not integral".into()));
+                }
+                Ok(Self::Slot {
+                    index,
+                    dtype: values.dtype,
+                    count: len / width,
+                })
+            }
+            None => Ok(Self::Host(values.floats()?)),
+        }
+    }
+}
+impl Factors {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Host(v) => v.len(),
+            Self::Slot { count, .. } => *count,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn host(&self) -> Result<&[f32]> {
+        match self {
+            Self::Host(v) => Ok(v),
+            Self::Slot { .. } => Err(Error::Decode(
+                "resident factors require the I/O engine".into(),
+            )),
+        }
+    }
 }
 
 impl Launch<'_> {
@@ -103,13 +162,13 @@ pub fn prepare<'a>(
     let mut launch = Launch {
         kind: "codes",
         dtype: dtype.clone(),
-        words: &[],
+        words: (&[] as &[u8]).into(),
         slots: vec![0],
-        scale: vec![1.0],
-        term: vec![0.0],
-        table: vec![0.0],
-        global: vec![1.0],
-        post: vec![1.0],
+        scale: vec![1.0].into(),
+        term: vec![0.0].into(),
+        table: vec![0.0].into(),
+        global: vec![1.0].into(),
+        post: vec![1.0].into(),
         index: vec![0],
         params: [0; 32],
     };
@@ -126,11 +185,11 @@ pub fn prepare<'a>(
         Post::None => {}
         Post::One(f) => {
             launch.params[27] = 1;
-            launch.post = f.floats();
+            launch.post = f.try_into()?;
         }
         Post::Cols(f) => {
             launch.params[27] = 2;
-            launch.post = f.floats();
+            launch.post = f.try_into()?;
         }
     }
     let codes = match plan.core {
@@ -168,8 +227,8 @@ pub fn prepare<'a>(
             }
             launch.kind = "grouped_rotated";
             launch.words = codes.bytes;
-            launch.scale = codes.relative.floats();
-            launch.global = scale.floats();
+            launch.scale = codes.relative.try_into()?;
+            launch.global = scale.try_into()?;
             let cells = g.rows.checked_mul(g.cols / group);
             if cells != Some(launch.scale.len()) || launch.global.len() != g.rows {
                 return Err(Error::Decode(
@@ -177,14 +236,14 @@ pub fn prepare<'a>(
                 ));
             }
             if let Some(correction) = correction {
-                launch.term = correction.floats();
+                launch.term = correction.try_into()?;
                 if cells != Some(launch.term.len()) {
                     return Err(Error::Decode("correction has a wrong length".into()));
                 }
                 launch.params[29] = 1;
             }
             if let Some(table) = codes.table {
-                launch.table = table.floats();
+                launch.table = table.try_into()?;
                 if bits != 4 || launch.table.len() != 16 {
                     return Err(Error::Decode(
                         "requantized codebook is not16 four-bit levels".into(),
@@ -200,18 +259,19 @@ pub fn prepare<'a>(
         }
         Core::Structs { bytes, kind } => {
             launch.kind = kind.name;
-            launch.words = bytes;
+            launch.words = bytes.into();
             launch.params[29] = kind.n as u64;
             launch.params[30] = kind.size as u64;
             return Ok(Prepared::Kernel(Box::new(launch)));
         }
         Core::Values(mut v) => {
+            let post = launch.post.host()?;
             match launch.params[27] {
-                1 => v.iter_mut().for_each(|x| *x *= launch.post[0]),
+                1 => v.iter_mut().for_each(|x| *x *= post[0]),
                 2 => v
                     .iter_mut()
                     .enumerate()
-                    .for_each(|(i, x)| *x *= launch.post[i % g.cols]),
+                    .for_each(|(i, x)| *x *= post[i % g.cols]),
                 _ => {}
             }
             if g.swap {
@@ -266,7 +326,7 @@ pub fn prepare<'a>(
     ]);
     launch.words = codes.bytes;
     launch.slots = slots;
-    launch.scale = codes.scale.floats();
+    launch.scale = codes.scale.try_into()?;
     match codes.grid {
         Grid::Tensor => {}
         Grid::Row => launch.params[17] = 1,
@@ -298,20 +358,20 @@ pub fn prepare<'a>(
         Term::None => {}
         Term::Zero(v) => {
             launch.params[23] = 1;
-            launch.term = v.floats();
+            launch.term = v.try_into()?;
         }
         Term::Bias(v) => {
             launch.params[23] = 2;
-            launch.term = v.floats();
+            launch.term = v.try_into()?;
         }
     }
     if let Some(table) = codes.table {
         launch.params[24] = table.len() as u64;
-        launch.table = table;
+        launch.table = table.into();
     }
     if let Some((v, divide)) = codes.global {
         launch.params[25] = if divide { 2 } else { 1 };
-        launch.global = v.floats();
+        launch.global = v.try_into()?;
         launch.params[26] = launch.global.len() as u64;
     }
     Ok(Prepared::Kernel(Box::new(launch)))

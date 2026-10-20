@@ -2,10 +2,10 @@
 //! tensor in blocks scaled by their absmax (itself 8-bit codes with `double_quant`), and LLM.int8()
 //! rows.
 
-use super::affine::{Codes, Fill, Order, Packing, BYTES, SIGNED_BYTES};
+use super::affine::{BYTES, Codes, Fill, Order, Packing, SIGNED_BYTES};
 use super::grid::{Grid, ScaleLayout};
 use super::plan::{self, Elems, Post};
-use super::{logical, one, Allowed, Ctx, Dtypes, Param, Part, Plan, Scheme, Shape, View};
+use super::{Allowed, Ctx, Dtypes, Param, Part, Plan, Scheme, Shape, View, logical, one};
 use crate::format::{Dtype, Result};
 
 /// Appendix A.3: NF4.
@@ -150,7 +150,7 @@ fn four_bit<'a>(c: &Ctx<'a>, map: &[f32; 16]) -> Result<Plan<'a>> {
         let codes = plan::Codes {
             table: Some(c.floats("nested_quant_map")),
             ..plan::Codes::new(
-                absmax.bytes.as_ref(),
+                absmax.bytes.host()?,
                 BYTES,
                 c.part("nested_absmax"),
                 run(NESTED),
