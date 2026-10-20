@@ -1,1 +1,1 @@
-{"format":"cozytensors.repo/1","name":"Conformance/ct","releases":[{"tree":{"length":256,"sha256":"fdf5cda9b5cb64a39de187aed3f68253397c7b11f6ef03d78d432ed7420d8de9"},"version":"1"}]}
+{"format":"cozytensors.repo/1","name":"Conformance/ct","tags":[{"commit":{"length":256,"sha256":"fdf5cda9b5cb64a39de187aed3f68253397c7b11f6ef03d78d432ed7420d8de9"},"name":"1","public":true}]}

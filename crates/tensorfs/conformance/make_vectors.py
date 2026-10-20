@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Writes the header vectors: vectors/green/header-*.{cbor,json} from the projections below, and
-vectors/red/header-*.cbor, each a green's twin or a single defect. Then checks every decode-case
+vectors/red/header-*.cbor, each a green's twin or a single defect; the repo documents
+vectors/{green,red}/repo-*.json and vectors/resolve.json, revisions resolved to commits. Then checks every decode-case
 file, vectors/cases/<family>.json (its cases come from the family's producer, mine/<family>.py),
 and rewrites it in its one form: one case per line, keys sorted. Deterministic; run from anywhere:
 
-    uv run --no-project --with numpy --with cbor2==6.1.4 python -I conformance/make_vectors.py
+    uv run --no-project --with numpy --with cbor2==6.1.4 --with packaging==25.0 python -I conformance/make_vectors.py
 
 `cargo test -p tensorfs --test format_conformance -- --ignored regenerate` then writes each
 family's repo, Conformance/<family>, into vectors/store.
@@ -25,6 +26,7 @@ sys.path.insert(0, str(HERE))
 from reader import encode, unproject  # noqa: E402
 
 TAG = "cozytensors/1"
+TREE, REPO = "cozytensors.tree/1", "cozytensors.repo/1"
 
 
 def digest(label: str) -> dict:
@@ -339,8 +341,108 @@ def check_cases(path: Path) -> list:
     return cases
 
 
+def canonical(doc) -> bytes:
+    return json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def ref(data: bytes) -> dict:
+    return {"length": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+# The example trees' refs: tree-unnamed.json and tree-basic.json.
+T1 = ref((HERE / "vectors" / "green" / "tree-unnamed.json").read_bytes())
+T2 = ref((HERE / "vectors" / "green" / "tree-basic.json").read_bytes())
+
+
+def repo(*tags, name="acme/tiny", **extra) -> dict:
+    return {"format": REPO, "name": name, "tags": [dict(t) for t in tags], **extra}
+
+
+def tag(name, commit=T2, public=None, yanked=None, **extra) -> dict:
+    flags = {k: v for k, v in (("public", public), ("yanked", yanked)) if v is not None}
+    return {"name": name, "commit": commit, **flags, **extra}
+
+
+REPO_BASIC = repo(tag("1.0", T1, public=True), tag("1.1", public=True), tag("main"))
+REPOS_GREEN = {
+    "basic": REPO_BASIC,
+    "mixed-case": {**REPO_BASIC, "name": "Acme/Tiny-SDXL"},
+    "no-tags": repo(),
+    "minor-version": {**REPO_BASIC, "format": REPO + ".3"},
+    "unknown-fields": repo(tag("1.0", T1, public=True, future=1), tag("main"), future={"x": [1, True, "ok"]}),
+    "yanked-private": repo(tag("1.0", T1, public=True), tag("1.1", public=True, yanked=True), tag("run-42", T1),
+                           tag("main", yanked=True), tag("2.0")),
+    "private-names": repo(tag("nightly"), tag("Run_2026.10.20 draft"), tag("Main"), tag("main"), tag("sha256")),
+    "pep440-forms": repo(*(tag(v, public=True) for v in ("1.0rc1", "1.0.post1", "2!0.1", "1.0+local.7", "v1.2",
+                                                         "1.0.dev3", "1.0.0", "01.2"))),
+    "shared-commit": repo(tag("1.0", public=True), tag("main"), tag("1.0.1", public=True)),
+    "explicit-false": repo(tag("1.0", T1, public=False, yanked=False)),
+}
+REPOS_RED = {
+    "bad-name": {**REPO_BASIC, "name": "acme"},
+    "deep-name": {**REPO_BASIC, "name": "acme/tiny/x"},
+    "old-kind": {**REPO_BASIC, "format": "tensorfs.repo/1"},
+    "releases": {"format": REPO, "name": "acme/tiny", "releases": [{"tree": T1, "version": "1.0"}]},
+    "duplicate-tag": repo(tag("main", T1), tag("main")),
+    "duplicate-public-private": repo(tag("1.0", T1, public=True), tag("1.0")),
+    "empty-tag": repo(tag("")),
+    "dot-tag": repo(tag("..")),
+    "slash-tag": repo(tag("runs/42")),
+    "digest-tag": repo(tag("sha256:" + T1["sha256"])),
+    "public-not-version": repo(tag("main", public=True)),
+    "public-wildcard": repo(tag("1.0.*", public=True)),
+    "no-commit": repo({"name": "main"}),
+    "public-not-bool": repo(tag("1.0", public="true")),
+    "yanked-not-bool": repo(tag("1.0", public=True, yanked=1)),
+    "tags-not-list": {**repo(), "tags": {"main": T1}},
+    "bad-commit": repo(tag("main", {"length": 1, "sha256": T1["sha256"][:63]})),
+}
+
+
+def header_ref(label: str) -> dict:
+    return {"length": 1000, "sha256": hashlib.sha256(label.encode()).hexdigest()}
+
+
+def resolution() -> dict:
+    """A repo whose tags cover every §7 rule, its commits' trees, and revisions resolved."""
+    trees = [canonical({"format": TREE, "files": {f"model.{v}.cozytensors": header_ref(h) for v, h in files.items()}})
+             for files in ({"bf16": "h1"}, {"bf16": "h2", "fp8": "h3"}, {"bf16": "h4"}, {"bf16": "h2"},
+                           {"bf16": "h5", "fp8": "h3"}, {"bf16": "h6", "fp8": "h3"})]
+    c1, c2, c3, c4, c5, c6 = (ref(t) for t in trees)
+    doc = repo(tag("1.0", c1, public=True), tag("1.9", c2, public=True), tag("2.0", c3, public=True, yanked=True),
+               tag("1.10", c4, public=True), tag("main", c5), tag("exp", c6))
+    h = lambda label: "sha256:" + header_ref(label)["sha256"]  # noqa: E731
+    cases = [
+        {"why": "the highest public, non-yanked version (1.10 > 1.9)", "commit": c4},
+        {"why": "a yanked tag by name", "revision": "2.0", "commit": c3},
+        {"why": "a private tag by name", "revision": "main", "commit": c5},
+        {"why": "a tag's commit", "revision": "sha256:" + c2["sha256"], "commit": c2},
+        {"why": "a private tag's commit", "revision": "sha256:" + c5["sha256"], "commit": c5},
+        {"why": "a header the default's commit cites", "revision": h("h2"), "commit": c4, "variant": "bf16"},
+        {"why": "a header the default does not cite: the last-created tag's commit", "revision": h("h3"),
+         "commit": c6, "variant": "fp8"},
+        {"why": "a header one commit cites", "revision": h("h1"), "commit": c1, "variant": "bf16"},
+        {"why": "a header no commit cites", "revision": h("h0")},
+        {"why": "a tag name is exact, not a version match", "revision": "1.9.0"},
+        {"why": "no such tag", "revision": "nope"},
+    ]
+    return {"repo": doc, "trees": [json.loads(t) for t in trees], "cases": cases}
+
+
 def main():
     green, red = HERE / "vectors" / "green", HERE / "vectors" / "red"
+    for path in [*green.glob("repo-*"), *red.glob("repo-*")]:
+        path.unlink()
+    for verdict, docs in ((green, REPOS_GREEN), (red, REPOS_RED)):
+        for name, doc in docs.items():
+            (verdict / f"repo-{name}.json").write_bytes(canonical(doc))
+    (HERE / "../spec/examples/repo-basic.json").write_bytes(canonical(REPO_BASIC))
+    doc = resolution()
+    lines = ",\n".join(canonical(c).decode() for c in doc["cases"])
+    (HERE / "vectors" / "resolve.json").write_text(
+        '{"repo":' + canonical(doc["repo"]).decode() + ',\n"trees":[\n'
+        + ",\n".join(canonical(t).decode() for t in doc["trees"]) + '],\n"cases":[\n' + lines + "\n]}\n")
+    print(f"{len(REPOS_GREEN)} green and {len(REPOS_RED)} red repo vectors, {len(doc['cases'])} resolutions")
     for path in [*green.glob("header-*"), *red.glob("header-*")]:
         if not path.name.startswith("header-pre-cut"):
             path.unlink()
