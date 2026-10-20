@@ -8,14 +8,27 @@ Safetensors describes arrays: their names, dtypes, shapes and byte offsets. It d
 standardize how those arrays form a quantized tensor. An INT8 weight and a scale array do not
 tell a reader which axis to scale, how values were packed, or whether a rotation must be
 undone. Its optional metadata can carry conventions, but the reader must already understand
-them. See the [safetensors format](https://github.com/safetensors/safetensors#format).
+them.
 
-Each ecosystem therefore supplies its own rules. For example, ComfyUI's
-[MXFP8 format](https://github.com/Comfy-Org/comfy-quants/blob/main/docs/formats/mxfp8.md)
-uses `weight_scale` arrays in a particular block layout and a `comfy_quant` JSON marker stored
-as a byte tensor. Transformers' [bitsandbytes integration](https://huggingface.co/docs/transformers/main/en/quantization/bitsandbytes)
-publishes quantization configuration alongside the weights. These work with the corresponding
-loaders; a generic safetensors reader cannot recover their meaning from the array declarations.
+Each ecosystem therefore supplies its own rules, sometimes reserving tensor names for entries
+that are actually metadata rather than model weights:
+
+- ComfyUI's [MXFP8 format](https://github.com/Comfy-Org/comfy-quants/blob/main/docs/formats/mxfp8.md)
+  stores `<layer>.comfy_quant` as a `uint8` tensor containing JSON such as
+  `{"format": "mxfp8"}`. Its loader recognizes that special name, parses the bytes as JSON,
+  and interprets `<layer>.weight_scale` using ComfyUI's particular block layout.
+- [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes/blob/main/bitsandbytes/functional.py)
+  packs non-tensor quantization properties into a tensor under a key such as
+  `<layer>.weight.quant_state.bitsandbytes__nf4`. Its loader looks for that naming convention
+  and unpacks the metadata to recover properties such as the logical dtype and block size.
+  Transformers also publishes [quantization configuration alongside the weights](https://huggingface.co/docs/transformers/main/en/quantization/bitsandbytes).
+
+To safetensors, those metadata entries are just arrays with arbitrary names. It defines no
+standard relationship between them and the weights they describe. Saving a valid file therefore
+does not guarantee that another library can reconstruct the intended tensors: the reader must
+implement the same conventions as the writer. A matching loader can read them reliably; a
+different loader may reject the file or misinterpret its contents. Compatibility depends on
+finding a loader that knows those conventions, rather than on the `.safetensors` extension alone.
 
 cozytensors makes that meaning part of the format: each logical tensor declares its encoding,
 parameters and stored arrays, with specified decoding rules. TensorFS can preserve the encoded
