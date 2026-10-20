@@ -22,7 +22,7 @@ def observations(destination):
 def complete_rows():
     return [{"rep": rep, "destination": dst, "reader": reader, "cold": cold,
              "seconds": 1 if reader == "tensorfs" else 2, "verified": True, "bytes": 100,
-             "metrics": h3.copy_metrics(observations(dst), dst) if reader == "tensorfs" else None}
+             "metrics": h3.copy_metrics(observations(dst), dst, 100) if reader == "tensorfs" else None}
             for rep, dst, reader, cold in h3.schedule()]
 
 
@@ -104,23 +104,60 @@ class Completeness(unittest.TestCase):
         for row in rows:
             if row["reader"] == "safetensors-cuda":
                 row["seconds"] = 0.5
-        self.assertFalse(h3.summarize(rows, 100)["parity_pass"])
+        summary = h3.summarize(rows, 100)
+        self.assertTrue(summary["complete"])
+        self.assertFalse(summary["parity_pass"])
 
     def test_missing_engine_observations_do_not_qualify(self):
         rows = complete_rows()
         first_gpu = next(r for r in rows if r["reader"] == "tensorfs" and r["destination"] == "cuda")
-        first_gpu["metrics"] = h3.copy_metrics([], "cuda")
+        first_gpu["metrics"] = h3.copy_metrics([], "cuda", 100)
         self.assertFalse(h3.summarize(rows, 100)["observations_complete"])
         record = observations("cuda")[0]
-        for change in ({"ceiling": 0}, {"ns": 0}, {"link": ""}):
-            self.assertFalse(h3.copy_metrics([{**record, **change}], "cuda")["measured"])
+        for change in ({"ceiling": 0}, {"ns": 0}, {"link": ""}, {"bytes": 1}):
+            self.assertFalse(h3.copy_metrics([{**record, **change}], "cuda", 100)["measured"])
 
     def test_no_fake_disk_telemetry_required_for_raw_cpu_reads(self):
         rows = complete_rows()
         for row in rows:
             if row["reader"] == "tensorfs" and row["destination"] == "cpu":
-                row["metrics"] = h3.copy_metrics([], "cpu")
+                row["metrics"] = h3.copy_metrics([], "cpu", 100)
         self.assertTrue(h3.summarize(rows, 100)["observations_complete"])
+
+    def test_summary_rechecks_full_telemetry_coverage(self):
+        rows = complete_rows()
+        row = next(r for r in rows if r["reader"] == "tensorfs" and r["destination"] == "cuda")
+        row["metrics"].update(measured=True, bytes=1)
+        summary = h3.summarize(rows, 100)
+        self.assertTrue(summary["complete"])
+        self.assertFalse(summary["observations_complete"])
+
+
+class CleanupAndNamespace(unittest.TestCase):
+    def test_exact_one_gpu_and_cuda_zero(self):
+        h3.device_namespace(1, "cuda:0")
+        for count, device in ((0, "cuda:0"), (2, "cuda:0"), (1, "cuda:1"), (1, "cpu")):
+            with self.subTest(count=count, device=device), self.assertRaises(ValueError):
+                h3.device_namespace(count, device)
+
+    def test_delayed_native_release_recovers_before_next_read(self):
+        now, reads, waits = [0.0], iter((10, 90, 100)), []
+        def pause(seconds):
+            waits.append(seconds)
+            now[0] += seconds
+        result = h3.recover_memory(lambda: next(reads), 100, clock=lambda: now[0], pause=pause)
+        self.assertEqual(result["settled_free"], 100)
+        self.assertEqual(result["samples"], 3)
+        self.assertEqual(len(waits), 2)
+        self.assertEqual(result["floor"], 100)
+
+    def test_timeout_cannot_ratchet_down_the_fixed_baseline(self):
+        now = [0.0]
+        def pause(_):
+            now[0] += 1
+        with self.assertRaisesRegex(ValueError, "fixed floor=100"):
+            h3.recover_memory(lambda: 99, 100, clock=lambda: now[0], pause=pause)
+        self.assertEqual(now[0], h3.RECOVERY_SECONDS)
 
 
 class FakeArray:

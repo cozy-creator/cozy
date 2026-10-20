@@ -11,6 +11,8 @@ All five components are required. Preparation makes equivalent plain-U8
 TensorFS/safetensors fixtures from every stored part. Five rotated repetitions
 measure full host/GPU cold/warm loads, including allocation and completion.
 Checksums, fixture preparation, engine initialization and cleanup are untimed.
+This is one visible GPU at cuda:0. For the known H3 geometry the conservative
+owned-output plus warm-source host guard is about156GB, derived at runtime.
 This is a byte-loading benchmark, not decoding, inference or model loading.
 Only stdlib imports occur until main explicitly loads the installed cohort.
 """
@@ -44,6 +46,9 @@ READERS = {"cpu": ("tensorfs", "safetensors-copy"),
            "cuda": ("tensorfs", "fastsafetensors", "safetensors-cuda", "safetensors-cpu-cuda")}
 COPY_FIELDS = ("kind", "gpu", "bytes", "ns", "ceiling", "link", "busy_ns", "pin_ns", "staged", "cached")
 GIB = 1 << 30
+INIT_OVERHEAD = 64 << 20
+STEADY_OVERHEAD = 2 << 20
+RECOVERY_SECONDS = 10
 
 
 def require(condition, message):
@@ -104,6 +109,26 @@ def capacity(payload, largest_part, host_available, gpu_available, disk_availabl
     return {"host_required": host_need, "gpu_required": gpu_need}
 
 
+def device_namespace(visible_count, device):
+    require(visible_count == 1 and device == "cuda:0",
+            f"benchmark requires exactly one visible GPU and cuda:0; got {visible_count}, {device}")
+
+
+def recover_memory(free_bytes, floor, *, clock=time.monotonic, pause=time.sleep):
+    """Untimed, fixed-floor wait for asynchronous native frees; never relax the target."""
+    start, samples = clock(), 0
+    while True:
+        free = free_bytes()
+        samples += 1
+        elapsed = clock() - start
+        if free >= floor:
+            return {"floor": floor, "settled_free": free, "seconds": elapsed,
+                    "samples": samples, "deadline_seconds": RECOVERY_SECONDS}
+        require(elapsed < RECOVERY_SECONDS,
+                f"native cleanup did not recover GPU memory: free={free}, fixed floor={floor}, elapsed={elapsed}")
+        pause(0.01)  # Release the GIL while the native cleanup worker returns buffers.
+
+
 def schedule():
     for rep in range(REPS):
         for destination, readers in READERS.items():
@@ -131,7 +156,8 @@ def summarize(rows, payload):
             cells[f"{destination} {'cold' if cold else 'warm'}"] = result
     expected = len(list(schedule()))
     observed = [r for r in rows if r["reader"] == "tensorfs" and r["destination"] == "cuda"]
-    observations_complete = len(observed) == 2 * REPS and all(r["metrics"]["measured"] for r in observed)
+    observations_complete = len(observed) == 2 * REPS and all(
+        r["metrics"]["measured"] and r["metrics"]["bytes"] >= payload for r in observed)
     return {"cells": cells, "complete": len(rows) == expected and all(c["complete"] for c in cells.values()),
             "parity_pass": len(rows) == expected and all(c["parity_pass"] for c in cells.values()),
             "observations_complete": observations_complete, "link_threshold": None,
@@ -139,12 +165,13 @@ def summarize(rows, payload):
             "r4_link_review_required": True, "r4_lifecycle_review_required": True}
 
 
-def copy_metrics(records, destination):
+def copy_metrics(records, destination, payload):
     kind = "disk" if destination == "cpu" else "h2d"
     selected = [r for r in records if r["kind"] == kind]
-    measured = bool(selected) and all(r["bytes"] > 0 and r["ns"] > 0 and r["ceiling"] > 0
-                                      and (kind == "disk" or r["link"]) for r in selected)
     nbytes, ns = sum(r["bytes"] for r in selected), sum(r["ns"] for r in selected)
+    measured = nbytes >= payload and bool(selected) and all(
+        r["bytes"] > 0 and r["ns"] > 0 and r["ceiling"] > 0
+        and (kind == "disk" or r["link"]) for r in selected)
     return {"kind": kind, "measured": measured, "bytes": nbytes,
             "gbps": nbytes / ns if ns else None,
             "ceiling_ratio": sum(r["bytes"] / r["ceiling"] for r in selected) / ns if measured else None}
@@ -366,9 +393,12 @@ class Fixture:
             require(actual == p["sha256"], f"output SHA256 mismatch: {p['control_key']}")
         return self.payload
 
-    def once(self, destination, reader, torch, device, ordinal):
+    def once(self, destination, reader, torch, device, ordinal, recovery_floor):
         varena = self.tfs.varena
         varena.copies()
+        before_free = torch.cuda.mem_get_info(ordinal)[0]
+        require(before_free >= recovery_floor,
+                f"GPU memory below fixed recovery floor before read: {before_free} < {recovery_floor}")
         arrays = {}
         try:
             with ExitStack() as stack:
@@ -378,6 +408,7 @@ class Fixture:
                     if destination == "cuda":
                         torch.cuda.synchronize(ordinal)
                     seconds = time.perf_counter() - started
+                    after_read_free = torch.cuda.mem_get_info(ordinal)[0]
                     copies = [{name: getattr(c, name) for name in COPY_FIELDS} for c in varena.copies()]
                     # Every part remains owned through completion and untimed validation.
                     moved = self.validate(arrays, destination, reader, torch, ordinal)
@@ -387,8 +418,14 @@ class Fixture:
             arrays.clear()
             gc.collect()
             torch.cuda.empty_cache()
+        try:
+            recovery = recover_memory(lambda: torch.cuda.mem_get_info(ordinal)[0], recovery_floor)
+        except ValueError as error:
+            raise ValueError(f"{error}; before_free={before_free}; after_read_free={after_read_free}") from error
+        recovery.update(before_free=before_free, after_read_free=after_read_free)
         return {"seconds": seconds, "bytes": moved, "verified": True, "copies": copies,
-                "metrics": copy_metrics(copies, destination) if reader == "tensorfs" else None}
+                "metrics": copy_metrics(copies, destination, self.payload) if reader == "tensorfs" else None,
+                "recovery": recovery}
 
 
 def run(args, receipt):
@@ -398,14 +435,16 @@ def run(args, receipt):
     receipt["cohort"] = installed_provenance(args.wheel, args.wheel_sha256, args.native_source)
     torch, tfs, versions = load_cohort(args.torch_version)
     receipt["versions"] = versions
-    require(re.fullmatch(r"cuda:[0-9]+", args.device), "an explicit cuda:N device is required")
-    ordinal = int(args.device.split(":")[1])
+    visible = torch.cuda.device_count()
+    device_namespace(visible, args.device)
+    ordinal = 0
     torch.cuda.set_device(ordinal)
     torch.cuda.init()
     props = torch.cuda.get_device_properties(ordinal)
     receipt["environment"] = {"python": sys.version, "platform": platform.platform(), "pid": os.getpid(),
                               "device": args.device, "device_name": torch.cuda.get_device_name(ordinal),
                               "device_uuid": str(props.uuid), "device_total_memory": props.total_memory,
+                              "expected_visible_gpus": 1, "actual_visible_gpus": visible,
                               "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
                               "cpus": os.cpu_count(), "affinity": sorted(os.sched_getaffinity(0)),
                               "torch_cuda": torch.version.cuda, "harness_sha256": digest(__file__),
@@ -427,7 +466,7 @@ def run(args, receipt):
         fixture.source.close()
     if args.prepare_only:
         receipt.update(stage="fixtures only", status="prepared_unmeasured")
-        return False
+        return True
     receipt["stage"] = "engine initialization"
     # Initialize the same shared TensorFS engine and fastsafetensors runtime outside the clock.
     nogds = importlib.import_module("fastsafetensors.copier.nogds")
@@ -438,35 +477,50 @@ def run(args, receipt):
     receipt["environment"]["cudart"] = {"path": runtime, "sha256": digest(runtime)}
     nogds.resolve_runtime_lib_name = lambda framework=None: runtime
     nogds.load_library_func(framework.get_framework_op("pytorch"))
+    initial_free = torch.cuda.mem_get_info(ordinal)[0]
+    initial_floor = initial_free - INIT_OVERHEAD
+    receipt["initialization"] = []
     for destination, readers in READERS.items():
         for reader in readers:
-            fixture.once(destination, reader, torch, args.device, ordinal)
+            row = fixture.once(destination, reader, torch, args.device, ordinal, initial_floor)
+            receipt["initialization"].append({"destination": destination, "reader": reader,
+                                              "recovery": row["recovery"]})
+    baseline = torch.cuda.mem_get_info(ordinal)[0]
+    recovery_floor = baseline - STEADY_OVERHEAD
+    receipt["gpu_recovery"] = {"initial_free": initial_free, "initial_floor": initial_floor,
+                               "initial_allowance": INIT_OVERHEAD, "baseline_free": baseline,
+                               "fixed_floor": recovery_floor, "steady_allowance": STEADY_OVERHEAD}
     receipt["stage"], receipt["rows"] = "measurements", []
     for rep, destination, reader, cold in schedule():
         receipt["active_cell"] = {"rep": rep, "destination": destination, "reader": reader, "cold": cold}
         if cold:
             fixture.drop_cache(reader)
+            warmup = None
         else:
-            fixture.once(destination, reader, torch, args.device, ordinal)
+            warmup = fixture.once(destination, reader, torch, args.device, ordinal, recovery_floor)["recovery"]
         state = memory_state()
         free, _ = torch.cuda.mem_get_info(ordinal)
         # Page cache is reclaimable; the original admission guard accounted for both it and outputs.
         require(state["available"] >= fixture.payload + 2 * fixture.largest + 2 * GIB,
                 "insufficient host memory before full measurement")
         require(free >= fixture.payload + max(2 * GIB, fixture.payload // 20), "full GPU capacity no longer available")
-        row = fixture.once(destination, reader, torch, args.device, ordinal)
+        row = fixture.once(destination, reader, torch, args.device, ordinal, recovery_floor)
         row.update(rep=rep, destination=destination, reader=reader, cold=cold,
                    host_available=state["available"], gpu_free=free,
+                   warmup_recovery=warmup,
                    cache_control="POSIX_FADV_DONTNEED requested" if cold else "untimed full read")
         receipt["rows"].append(row)
         receipt["summary"] = summarize(receipt["rows"], fixture.payload)
         Path(args.result).write_bytes(canonical(receipt))
         print(f"rep {rep + 1} {destination} {reader} {'cold' if cold else 'warm'}: {row['seconds']:.6f}s", flush=True)
-    passed = receipt["summary"]["parity_pass"] and receipt["summary"]["observations_complete"]
-    receipt["status"] = "passed" if passed else "unqualified"
+    receipt["measurement_complete"] = receipt["summary"]["complete"]
+    receipt["parity_pass"] = receipt["summary"]["parity_pass"]
+    qualified = receipt["measurement_complete"] and receipt["summary"]["observations_complete"]
+    receipt["status"] = ("complete_parity_pass" if receipt["parity_pass"] else "complete_slower") if qualified else "incomplete_observations"
     receipt["stage"] = "complete"
     receipt.pop("active_cell")
-    return passed
+    # A slower complete result is valid benchmark data; parity remains a separate review gate.
+    return qualified
 
 
 def main(argv=None):
@@ -478,6 +532,7 @@ def main(argv=None):
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args(argv)
     receipt = {"format": "tensorfs.h3-load/1", "status": "incomplete", "stage": "starting",
+               "measurement_complete": False, "parity_pass": False,
                "scope": "all stored tensor parts; no decode/inference/offload/window",
                "cold_is_advisory": True, "r4_link_review_required": True, "r4_lifecycle_review_required": True}
     with Path(args.result).open("xb") as stream:
