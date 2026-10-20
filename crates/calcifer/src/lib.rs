@@ -44,6 +44,7 @@ use futures_util::{Stream, StreamExt as _};
 use tracing::warn;
 
 pub use link::{Link, LinkError};
+pub use rentals::Shape;
 use store::{Acceptance, Batch, MachineRow, NewRun, RunRow, State, Store, StoreError};
 
 #[derive(Debug, thiserror::Error)]

@@ -663,8 +663,8 @@ pub struct Rented {
     pub replay: bool,
 }
 
-/// The Hub's price for the exact rental asked: the machine and its disk an hour, traffic a GB, and
-/// what an hour plus its download is expected to cost.
+/// The Hub's price for the exact rental asked (`POST /v1/rental-quotes`): the machine and its disk an
+/// hour, traffic a GB, and what an hour plus its download is expected to cost.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Quote {
     pub gpu_usd_micros_per_hour: i64,
@@ -675,6 +675,28 @@ pub struct Quote {
     pub expected_hours: f64,
     pub expected_download_gb: u32,
     pub expected_total_usd_micros: i64,
+}
+
+impl Quote {
+    /// The machine and its disk, an hour.
+    pub fn hourly(&self) -> i64 {
+        self.gpu_usd_micros_per_hour + self.storage_usd_micros_per_hour
+    }
+
+    pub fn agreed(&self) -> Agreed {
+        Agreed {
+            usd_micros_per_hour: self.hourly(),
+            usd_micros_per_gb: self.bandwidth_usd_micros_per_gb.unwrap_or_default(),
+        }
+    }
+}
+
+/// The most a renter agreed to pay: the machine and its disk an hour, and traffic a GB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Agreed {
+    pub usd_micros_per_hour: i64,
+    #[serde(default)]
+    pub usd_micros_per_gb: i64,
 }
 
 /// `DELETE /v1/machines/{name}[?force=true]`: `changed` is false when it had ended already. While
@@ -725,6 +747,9 @@ pub enum NewMachine {
         /// one; the Hub refuses anyone else.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         image: Option<String>,
+        /// The quote the renter agreed to (`POST /v1/rental-quotes`): a dearer one rents nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agreed: Option<Agreed>,
     },
     Add {
         name: String,
