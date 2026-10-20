@@ -40,10 +40,16 @@ pub(super) fn start(dir: &Path, spec: &ServiceSpec) -> Result<()> {
     if !running(&spec.name) {
         let _ = launchctl(&["bootout", &target(&spec.name)]).output();
     }
-    // Already bootstrapped is the one expected refusal; kickstart then says whether it runs.
-    let _ = launchctl(&["bootstrap", &domain()])
+    // RunAtLoad already starts a successfully bootstrapped job. A quick successful exit
+    // before kickstart would otherwise request a second launch and wait out its throttle.
+    if launchctl(&["bootstrap", &domain()])
         .arg(plist(dir, &spec.name))
-        .output();
+        .output()
+        .is_ok_and(|out| out.status.success())
+    {
+        return Ok(());
+    }
+    // Already bootstrapped is the one expected refusal; kickstart then says whether it runs.
     run(MANAGER, &mut launchctl(&["kickstart", &target(&spec.name)]))
 }
 
