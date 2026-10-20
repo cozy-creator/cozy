@@ -113,6 +113,18 @@ pub fn tree_of(store: &Store, header: &ObjectRef) -> io::Result<ObjectRef> {
     store.put_tree(&tree).map_err(io_error)
 }
 
+/// The held object `object` read by its format: a tree (a commit), else a cozytensors header
+/// (`None`); refused when it is neither.
+pub fn tree_or_header(store: &Store, object: &ObjectRef) -> io::Result<Option<Tree>> {
+    let bytes = store.read(object).map_err(io_error)?;
+    if let Ok(tree) = Tree::from_json(&bytes) {
+        return Ok(Some(tree));
+    }
+    tensorfs::format::Header::from_cbor(&bytes).map(|_| None).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("{} is neither a tree nor a cozytensors header: {e}", object.id()))
+    })
+}
+
 /// The object `id` (`sha256:<hex>` or bare hex) as the store holds it, its length read off disk.
 pub fn held(store: &Store, id: &str) -> io::Result<ObjectRef> {
     let sha256 = id.trim_start_matches("sha256:").to_string();

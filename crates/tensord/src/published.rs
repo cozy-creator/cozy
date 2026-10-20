@@ -162,9 +162,10 @@ pub struct Request {
 }
 
 /// A Hub checkpoint as a run names it (th-245): `repository` at `release` (empty: the newest) in
-/// `lane` (empty: the lane rule's), or the owner's tree by hash (`tree` and no release). A lane
-/// is a variant of its release's tree. Resolved, it carries the release, lane and tree the Hub
-/// named and the lane's header there, which is the checkpoint's id on this machine.
+/// `lane` (empty: the lane rule's), or by hash (`tree` and no release): a commit (tree), or one
+/// variant's header, which resolves to that header alone (no tree). A lane is a variant of its
+/// release's tree. Resolved, it carries the release, lane and tree the Hub named and the lane's
+/// header there, which is the checkpoint's id on this machine.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Named {
     pub repository: String,
@@ -542,7 +543,7 @@ impl Publisher {
     /// from the datacenter volume. Whatever is here moves nothing.
     fn pull(&self, source: &hub::Source, named: &Named, components: Option<&[String]>, stop: Option<&Stop>,
         bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(u64, u64), Failure> {
-        let (tree, header) = (named.tree()?, named.header()?);
+        let header = named.header()?;
         let remote = origin::remote(&self.machine, source).map_err(|e| refused("model_download_failed", e))?;
         let stop = stop.cloned().unwrap_or_default();
         let failed = |e: Refusal| match stop.is_cancelled() {
@@ -550,6 +551,20 @@ impl Publisher {
             false => refused("model_download_failed", e),
         };
         let (started, subject) = (Instant::now(), format!("{}@{} {}", named.repository, named.release, named.lane));
+        let failed = |e: Refusal| {
+            storage::transport(&self.store, "pull-failed", &subject, &format!("origin={}: {e}", source.origin));
+            failed(e)
+        };
+        let mut structure = self.machine.pull(&remote, header, Some(&[]), priority::NOW, None, &stop).map_err(failed)?;
+        // A header by hash is recorded under a tree naming it alone.
+        let tree = match &named.tree {
+            Some(tree) => {
+                let landed = self.machine.objects(&remote, std::slice::from_ref(tree), priority::NOW, &stop).map_err(failed)?;
+                (structure.landed.origin, structure.landed.volume) = (structure.landed.origin + landed.origin, structure.landed.volume + landed.volume);
+                tree.clone()
+            }
+            None => storage::tree_of(&self.store, header).map_err(io_failure)?,
+        };
         let logged = |pulled: &tensorfs::fetch::Pulled| {
             let (fetched, reused) = (pulled.landed.origin + pulled.landed.volume, pulled.landed.local);
             let seconds = started.elapsed().as_secs_f64();
@@ -557,13 +572,6 @@ impl Publisher {
                 header.id(), tree.id(), pulled.objects, source.origin);
             storage::transport(&self.store, "pull", &subject, &detail);
         };
-        let failed = |e: Refusal| {
-            storage::transport(&self.store, "pull-failed", &subject, &format!("origin={}: {e}", source.origin));
-            failed(e)
-        };
-        let mut structure = self.machine.pull(&remote, header, Some(&[]), priority::NOW, None, &stop).map_err(failed)?;
-        let landed = self.machine.objects(&remote, std::slice::from_ref(tree), priority::NOW, &stop).map_err(failed)?;
-        (structure.landed.origin, structure.landed.volume) = (structure.landed.origin + landed.origin, structure.landed.volume + landed.volume);
         let pulled = Pulled { repository: named.repository.clone(), release: named.release.clone(), lane: named.lane.clone(), tree: tree.clone() };
         pulled.record(&self.store).map_err(io_failure)?;
         if components == Some(&[]) {
@@ -1706,10 +1714,11 @@ fn newest_key(request: &Request) -> String {
     json!(["newest", hub::origin_key(&request.source.origin), request.package]).to_string()
 }
 
-/// A tree named by its hash, with what a hash alone does not say: its length (the Hub's) and its
-/// lane's header, read once under the run's access (its request's bearer for the owner's) and
-/// kept, since a hash never names other bytes.
-fn measured(machine: &Machine, service: &Service, source: &hub::Source, mut named: Named) -> Result<Named, Failure> {
+/// A checkpoint named by its hash, with what a hash alone does not say: its length (the Hub's) and
+/// its format; a tree (a commit) resolves to its lane's header, a header is the checkpoint itself.
+/// Read once under the run's access (its request's bearer for the owner's) and kept, since a hash
+/// never names other bytes.
+fn measured(machine: &Machine, service: &Service, source: &hub::Source, named: Named) -> Result<Named, Failure> {
     if named.header.is_some() {
         return Ok(named);
     }
@@ -1717,14 +1726,21 @@ fn measured(machine: &Machine, service: &Service, source: &hub::Source, mut name
     let key = json!([hub::origin_key(&source.origin).unwrap_or_default(), named.repository, tree.id(), named.lane]).to_string();
     let held = service.engine.with_journal(|j| j.named(&key, "")).map_err(io_failure)?;
     if let Some((tree, lane, header)) = held.and_then(|held| serde_json::from_str(&held).ok()) {
-        return Ok(Named { tree: Some(tree), lane, header: Some(header), ..named });
+        return Ok(Named { tree, lane, header: Some(header), ..named });
     }
-    if tree.length == 0 {
-        let object = origin::object(machine, source, &tree.sha256).map_err(|e| refused("model_resolution_failed", e))?;
-        named.tree = Some(object);
-    }
+    let failed = |e| refused("model_resolution_failed", e);
+    let object = match tree.length {
+        0 => origin::object(machine, source, &tree.sha256).map_err(failed)?,
+        _ => tree,
+    };
+    let remote = origin::remote(machine, source).map_err(failed)?;
+    machine.objects(&remote, std::slice::from_ref(&object), priority::NOW, &Stop::default()).map_err(failed)?;
+    let commit = storage::tree_or_header(machine.store(), &object).map_err(|e| ("model_resolution_failed", e.to_string()))?.is_some();
     let lane = named.lane.clone();
-    let named = named.landed(machine, source, &[lane])?;
+    let named = match commit {
+        true => Named { tree: Some(object), ..named }.landed(machine, source, &[lane])?,
+        false => Named { tree: None, header: Some(object), ..named },
+    };
     let answer = json!([named.tree, named.lane, named.header]).to_string();
     service.engine.with_journal(|j| j.bind_named(&key, "", &answer)).map_err(io_failure)?;
     Ok(named)
@@ -2753,6 +2769,32 @@ pub(crate) mod tests {
         let asked = heard.lock().unwrap().len();
         bench.publisher.structure(&hub, &[named], &job).unwrap();
         assert_eq!(heard.lock().unwrap().len(), asked, "a held structure asks nothing");
+        let _ = fs::remove_dir_all(&bench.root);
+    }
+
+    /// A hash names a commit (its tree: the lane's header there) or one variant's header (that
+    /// checkpoint alone, its pull recorded under a tree naming it, so its calls fetch from the Hub).
+    #[test]
+    fn a_hash_names_a_commit_or_a_variant_header() {
+        let bench = Bench::new();
+        let manifest = checkpoint(&bench.source, 3, 4);
+        let (hub, held, _) = bench.hub("acme/pinned", &manifest, 0);
+        let service = Service::open(&bench.root.join("state"), &bench.root.join("generations"), 1).unwrap();
+        let pin = |object: &ObjectRef| Named {
+            repository: "acme/pinned".into(), lane: "bf16".into(),
+            tree: Some(ObjectRef { sha256: object.sha256.clone(), length: 0 }), ..Default::default()
+        };
+        let tree = held.tree.unwrap();
+        let commit = bench.publisher.resolve(&service, &hub, pin(&tree), &[], "").unwrap();
+        assert_eq!((commit.tree.as_ref(), commit.header.as_ref()), (Some(&tree), Some(&manifest)));
+        let header = bench.publisher.resolve(&service, &hub, pin(&manifest), &[], "").unwrap();
+        assert_eq!((header.tree.as_ref(), header.header.as_ref(), header.lane.as_str()), (None, Some(&manifest), "bf16"));
+        assert_eq!(bench.publisher.resolve(&service, &hub, pin(&manifest), &[], "").unwrap().header, Some(manifest.clone()));
+        bench.publisher.structure(&hub, std::slice::from_ref(&header), &Job::default()).unwrap();
+        let store = bench.publisher.store();
+        let pulled = Pulled::of(store, &manifest).unwrap().unwrap();
+        assert_eq!((pulled.repository.as_str(), pulled.tree), ("acme/pinned", crate::storage::tree_of(store, &manifest).unwrap()));
+        assert!(crate::access::remote(bench.publisher.machine(), &hub, &manifest).unwrap().is_some());
         let _ = fs::remove_dir_all(&bench.root);
     }
 

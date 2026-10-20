@@ -189,25 +189,28 @@ fn refused(code: &'static str, message: impl Into<String>) -> Refused {
     }
 }
 
-/// A named tree already held for an upload. Empty-repository choices retain their legacy
-/// header meaning; local trees never fall back to a remote repository or its newest release.
+/// A named commit (tree) or variant header already held for an upload. Empty-repository choices
+/// retain their legacy header meaning; local trees never fall back to a remote repository or its
+/// newest release.
 fn held_tree(store: &crate::storage::Store, choice: &domain::ModelChoice) -> Result<Option<crate::published::Named>, Refused> {
     let Some(manifest) = choice.manifest.as_ref().filter(|_| !choice.repository.is_empty()) else {
         return Ok(None);
     };
     let id = tensorfs::sha256::hex(&manifest.digest);
-    let tree = match crate::storage::held(store, &id) {
-        Ok(tree) => tree,
+    let object = match crate::storage::held(store, &id) {
+        Ok(object) => object,
         Err(error) if error.kind() == io::ErrorKind::NotFound && !choice.repository.starts_with("local/") => return Ok(None),
-        Err(error) => return Err(refused("checkpoint_absent", format!("held tree sha256:{id}: {error}"))),
+        Err(error) => return Err(refused("checkpoint_absent", format!("held checkpoint sha256:{id}: {error}"))),
     };
-    let parsed = store.tree(&tree).map_err(|error| refused("checkpoint_invalid", error.to_string()))?;
+    let named = |lane, tree, header| crate::published::Named {
+        repository: choice.repository.clone(), release: choice.release.clone(), lane, tree, header: Some(header),
+    };
+    let Some(parsed) = crate::storage::tree_or_header(store, &object).map_err(|error| refused("checkpoint_invalid", error.to_string()))? else {
+        return Ok(Some(named(choice.lane.clone(), None, object)));
+    };
     let (lane, header) = tensorfs::fetch::variant_of_tree(&parsed, (!choice.lane.is_empty()).then_some(choice.lane.as_str()))
         .map_err(|error| refused("checkpoint_variant_absent", error.to_string()))?;
-    Ok(Some(crate::published::Named {
-        repository: choice.repository.clone(), release: choice.release.clone(), lane,
-        tree: Some(tree), header: Some(header),
-    }))
+    Ok(Some(named(lane, Some(object), header)))
 }
 
 impl Runs {
@@ -435,10 +438,9 @@ impl Runs {
                 (held, None, row)
             } else if let Some(named) = if destination.is_empty() { None } else { held_tree(publisher.store(), choice)? } {
                 let header = named.header().map_err(|(code, message)| refused(code, message))?.clone();
-                let tree = named.tree().map_err(|(code, message)| refused(code, message))?.clone();
                 let row = json!({"parameter": choice.parameter, "repository": named.repository,
-                    "lane": named.lane, "tree": tree.id(), "checkpoint": header.id()});
-                (header, Some(tree), row)
+                    "lane": named.lane, "tree": named.tree.as_ref().map(ObjectRef::id), "checkpoint": header.id()});
+                (header, named.tree, row)
             } else {
                 // A Hub checkpoint by name, or the owner's by hash; no lane is the one this
                 // machine's GPUs would run at the run's bits (`precision`).

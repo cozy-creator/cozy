@@ -116,7 +116,10 @@ impl Fixture {
     }
 
     fn submit(&self, id: &str, endpoint: &str, variant: &str) -> String {
-        let digest = self.tree_digest.clone();
+        self.pinned(id, endpoint, variant, self.tree_digest.clone())
+    }
+
+    fn pinned(&self, id: &str, endpoint: &str, variant: &str, digest: Vec<u8>) -> String {
         let spec = Spec {
             warm: true,
             remove: false,
@@ -403,6 +406,23 @@ fn a_failed_ref_update_retries_the_exact_held_tree_without_uploading_admitted_bl
         true
     );
     assert_eq!(http.state.puts.lock().unwrap().len(), sent);
+}
+
+/// `org/name#sha256:<header>`: the variant itself, uploaded as a tree naming it alone.
+#[test]
+fn a_held_header_by_hash_uploads_a_tree_naming_it_alone() {
+    let fixture = Fixture::new();
+    let http = Http::new(0);
+    let digest = tensorfs::sha256::digest(&fixture.store.read(&fixture.header).unwrap()).to_vec();
+    let run = fixture.pinned("header", &http.origin, "", digest);
+    let result = fixture.settled(&run);
+    assert_eq!(result.state, State::Completed, "{:?}", result.failure);
+    let row = &result.result.as_ref().unwrap().value["models"][0];
+    let tree = tensord::storage::tree_of(&fixture.store, &fixture.header).unwrap();
+    assert!(row["tree"].is_null(), "{row}");
+    assert_eq!(row["published"]["tree"], tree.id());
+    assert_eq!(row["published"]["checkpoint"], fixture.header.id());
+    assert_eq!(http.state.store.tree(&tree).unwrap().variant(None).unwrap().1, &fixture.header);
 }
 
 #[test]
