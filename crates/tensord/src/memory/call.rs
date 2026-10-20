@@ -97,6 +97,16 @@ pub struct TraceEvent {
     pub class: String,
     pub working_set: Option<u64>,
     pub speculative_budget: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill: Option<FillResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FillResult {
+    pub phase: String,
+    pub outcome: String,
+    pub error: Option<String>,
+    pub io_runs: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -279,6 +289,24 @@ mod tests {
                 serde_json::from_value::<Frame>(serde_json::json!({"memory": memory})).is_err()
             );
         }
+    }
+
+    #[test]
+    fn fill_outcomes_survive_the_reply_to_public_trace_boundary() {
+        let fill = serde_json::json!({"phase": "allocate", "outcome": "refused",
+            "error": "DEVICE_FULL", "io_runs": 0});
+        let reply: Frame = serde_json::from_value(serde_json::json!({"memory": {"trace": [
+            {"kind": "fill-refused", "fill": fill}, {"kind": "bind"}
+        ]}}))
+        .unwrap();
+        let public =
+            serde_json::to_value(CallMemory::of(&reply, &PlaneFacts::default()).unwrap()).unwrap();
+        assert_eq!(public["trace"][0]["fill"], fill);
+        assert!(public["trace"][1].get("fill").is_none());
+        let invalid = serde_json::json!({"memory": {"trace": [{"fill": {
+            "phase": "allocate", "outcome": "refused", "error": "DEVICE_FULL", "io_runs": -1
+        }}]}});
+        assert!(serde_json::from_value::<Frame>(invalid).is_err());
     }
 
     #[test]
