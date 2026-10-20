@@ -12,6 +12,7 @@ import tempfile
 import weakref
 
 import tensorfs
+from tensorfs import raw
 
 
 class Provider:
@@ -65,7 +66,7 @@ with tempfile.TemporaryDirectory() as temp:
         gc.collect()
         assert alive() is not None, "a live component lost its request provider"
         assert component.asset("vocab.txt") == b"a\nb\n"
-        assert (pathlib.Path(component.path) / "vocab.txt").read_bytes() == b"a\nb\n"
+        assert component.asset("vocab.txt") == b"a\nb\n"
         assert tensors.read("weight").tobytes() == b"data"
         with tensorfs.Writer(root / "copy", cache_dir=root / "copy-cache") as copy:
             copy.component("copy", cls="test.Copy", config={}).copy("weight", component)
@@ -123,7 +124,7 @@ with tempfile.TemporaryDirectory() as temp:
         assert checkpoint.__enter__() is checkpoint
         assert checkpoint.verify() == []
         component = checkpoint.components["model"]
-        part = component.tensors["weight"].parts[""]
+        part = raw.parts(checkpoint, "model", "weight")[""]
         chunk = checkpoint.chunks[part.chunk]
         descriptor = checkpoint.open_chunk(part.chunk)
         os.lseek(descriptor, part.offset, os.SEEK_SET)

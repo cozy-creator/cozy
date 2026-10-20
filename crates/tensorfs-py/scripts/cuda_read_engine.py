@@ -21,12 +21,12 @@ assert torch.cuda.is_available(), "this gate requires an actual CUDA GPU"
 HostReads.setUpClass()
 try:
     tensors = HostReads.tensors
-    arrays = tensors.read_all(["empty", "plain", "big", "quantized"], device="cuda:0")
+    arrays = tensors.read(["empty", "plain", "big", "quantized"], device="cuda:0")
     for key, array in arrays.items():
         assert isinstance(array, tensorfs.Array)
         assert array.__dlpack_device__() == (2, 0)
         assert array.tobytes() == tensors.read(key).tobytes(), key
-    encoded = tensors.read_all(["quantized"], device="cuda", decode=False)["quantized"]
+    encoded = tensors.read(["quantized"], device="cuda", decode=False)["quantized"]
     host_parts = tensors.read("quantized", decode=False).parts
     for role, array in encoded.parts.items():
         assert array.__dlpack_device__() == (2, 0)
@@ -49,7 +49,7 @@ try:
     # An unconsumed capsule is destroyed with Python's GIL held. Its final allocation
     # release may synchronize CUDA work, so an independent Python heartbeat must progress.
     free_before, _ = torch.cuda.mem_get_info()
-    victim = tensors.read_all(["big"], device="cuda:0")["big"]
+    victim = tensors.read(["big"], device="cuda:0")["big"]
     allocation_size = victim.nbytes
     capsule = victim.__dlpack__()
     del victim

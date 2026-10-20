@@ -60,7 +60,7 @@ with tempfile.TemporaryDirectory() as temporary:
             component.put("window", bytes(length), dtype="U8", shape=[length])
             checkpoint = writer.commit()
             tensors = checkpoint.components["model"].tensors
-            arrays = tensors.read_all(["value", "window"], device=f"cuda:{args.device}")
+            arrays = tensors.read(["value", "window"], device=f"cuda:{args.device}")
             label = f"{family.stem}/{case['component']}/{case['key']}"
             actual = arrays["value"].__dlpack_device__()
             assert actual == (2, args.device), label

@@ -15,6 +15,9 @@ def _kernel_binary(family: int, core: str, dtype: str) -> tuple[bytes, str, int,
 #: `tensorfs._ext.varena`, typed in full by `varena/__init__.pyi` (the public package).
 varena: ModuleType
 
+#: Physical format inspection for storage integrations.
+raw: ModuleType
+
 StrPath = str | PathLike[str]
 _T = TypeVar("_T")
 
@@ -60,20 +63,6 @@ class ConflictError(Error):
 class UnsupportedError(Error):
     """A source or target this build cannot represent (`unsupported`)."""
 
-class Part:
-    """One stored part: a plain tensor's data (role `""`) or an encoded tensor's part."""
-
-    @property
-    def dtype(self) -> str: ...
-    @property
-    def shape(self) -> tuple[int, ...]: ...
-    @property
-    def chunk(self) -> int: ...
-    @property
-    def offset(self) -> int: ...
-    @property
-    def length(self) -> int: ...
-
 class Encoding:
     """A scheme and its complete params; str() is `scheme {key: value, ...}`."""
 
@@ -83,8 +72,8 @@ class Encoding:
     def params(self) -> dict[str, Any]: ...
     def __str__(self) -> str: ...
 
-class Info:
-    """A tensor's logical dtype and shape, its encoding (None when plain), its parts."""
+class TensorMetadata:
+    """A tensor's logical dtype and shape, its encoding (None when plain)."""
 
     @property
     def dtype(self) -> str: ...
@@ -92,8 +81,6 @@ class Info:
     def shape(self) -> tuple[int, ...]: ...
     @property
     def encoding(self) -> Encoding | None: ...
-    @property
-    def parts(self) -> dict[str, Part]: ...
 
 class Array:
     """Owned CPU or CUDA bytes; DLPack consumers share them, and tobytes copies to the host."""
@@ -125,26 +112,28 @@ class Encoded:
     @property
     def parts(self) -> dict[str, Array]: ...
 
-class Tensors(Mapping[str, Info]):
+class Tensors(Mapping[str, TensorMetadata]):
     """Tensor metadata in construction order, with engine-backed host and CUDA reads."""
 
     def __len__(self) -> int: ...
     def __iter__(self) -> Iterator[str]: ...
-    def __getitem__(self, key: str) -> Info: ...
+    def __getitem__(self, key: str) -> TensorMetadata: ...
     def __contains__(self, key: object) -> bool: ...
     def keys(self) -> KeysView[str]: ...
-    def values(self) -> ValuesView[Info]: ...
-    def items(self) -> ItemsView[str, Info]: ...
+    def values(self) -> ValuesView[TensorMetadata]: ...
+    def items(self) -> ItemsView[str, TensorMetadata]: ...
     @overload
-    def get(self, key: str, default: None = None) -> Info | None: ...
+    def get(self, key: str, default: None = None) -> TensorMetadata | None: ...
     @overload
-    def get(self, key: str, default: Info) -> Info: ...
+    def get(self, key: str, default: TensorMetadata) -> TensorMetadata: ...
     @overload
-    def get(self, key: str, default: _T) -> Info | _T: ...
-    def read(self, key: str, *, decode: bool = True) -> Array | Encoded: ...
-    def read_all(
-        self, keys: Sequence[str] | None = None, *, device: str = "cpu", decode: bool = True
-    ) -> dict[str, Array | Encoded]: ...
+    def get(self, key: str, default: _T) -> TensorMetadata | _T: ...
+    @overload
+    def read(self, keys: str, *, device: str = "cpu", decode: bool = True) -> Array | Encoded: ...
+    @overload
+    def read(self, keys: Sequence[str] | None = None, *, device: str = "cpu", decode: bool = True) -> dict[str, Array | Encoded]: ...
+    @overload
+    def read(self, keys: str | Sequence[str] | None = None, *, device: str = "cpu", decode: bool = True) -> Array | Encoded | dict[str, Array | Encoded]: ...
     def read_into(self, key: str, out: object, *, role: str | None = None, offset: int = 0) -> None:
         """Fill a writable contiguous Buffer or DLPack array; a role selects stored part bytes."""
 
@@ -168,18 +157,15 @@ class Component:
     @property
     def config(self) -> dict[str, Any]: ...
     @property
-    def config_file(self) -> str:
-        """The rendered config's file name (`config.json` by default)."""
-    @property
     def tensors(self) -> Tensors:
-        """`key -> Info`, in construction order."""
+        """`key -> TensorMetadata`, in construction order."""
     @property
     def assets(self) -> dict[str, tuple[str, int]]:
         """`name -> (sha256, length)`: run data in the component's folder."""
     def asset(self, name: str) -> bytes:
         """An asset's bytes; a parsed header raises `UnsupportedError`."""
-    @property
-    def path(self) -> str: ...
+    def export_files(self, directory: StrPath) -> str:
+        """Explicit compatibility export of config and assets only; never model weights."""
 
 class Checkpoint:
     """One cozytensors read from a store, or only its header (`parse`)."""
@@ -225,7 +211,7 @@ class Checkpoint:
         """In construction order."""
     @property
     def chunks(self) -> list[tuple[str, int]]:
-        """The header's chunk objects in order: `(sha256, length)` (`Part.chunk` indexes them)."""
+        """The header's chunk objects in order: `(sha256, length)`."""
     @property
     def chunk_paths(self) -> list[str]:
         """Each chunk's file in the store, in header order; a parsed header raises."""
@@ -266,7 +252,7 @@ class Writer:
                  endpoint: str | None = None, token: Any = None, ca_der: bytes | None = None) -> None: ...
     def pipeline(self, cls: str, config: Mapping[str, Any]) -> None: ...
     def component(
-        self, name: str, cls: str = "", config: Mapping[str, Any] | None = None, config_file: str | None = None
+        self, name: str, cls: str = "", config: Mapping[str, Any] | None = None
     ) -> ComponentWriter:
         """Declares a component (again: class and config change, tensors stay)."""
     def repo_file(self, path: str, data: Buffer) -> None: ...

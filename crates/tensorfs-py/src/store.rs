@@ -761,10 +761,7 @@ pub struct PyComponent {
     cls: String,
     #[pyo3(get)]
     config: Py<PyDict>,
-    /// The config's file name when it isn't `config.json`.
-    #[pyo3(get)]
-    config_file: String,
-    /// `key -> Info`, in construction order; reads go through the engine.
+    /// `key -> TensorMetadata`, in construction order; reads go through the engine.
     #[pyo3(get)]
     tensors: Py<PyTensors>,
     /// `name -> (sha256, length)`: run data in the component's folder.
@@ -775,12 +772,12 @@ pub struct PyComponent {
 
 #[pymethods]
 impl PyComponent {
-    #[getter]
-    fn path(&self, py: Python<'_>) -> PyResult<PathBuf> {
-        let checkpoint = self.ck.as_ref().ok_or_else(|| invalid(py, "a parsed header has no asset path"))?;
+    /// Export config and supporting files to an explicit compatibility directory.
+    fn export_files(&self, py: Python<'_>, directory: PathBuf) -> PyResult<PathBuf> {
+        let checkpoint = self.ck.as_ref().ok_or_else(|| invalid(py, "a parsed header has no support files here"))?;
         checkpoint.fetch_assets(py, &self.name, None)?;
         let ck = &checkpoint.checkpoint;
-        py.detach(|| ck.component_path(&self.name)).or_raise(py)
+        py.detach(|| ck.export_component_files(&self.name, &directory)).or_raise(py)
     }
     /// Asset `name`'s bytes; a parsed header has none.
     fn asset<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyBytes>> {
@@ -799,7 +796,7 @@ impl PyComponent {
 }
 
 /// One part as stored: a plain tensor's data (role `""`) or an encoded tensor's part.
-#[pyclass(name = "Part", module = "tensorfs", frozen, get_all)]
+#[pyclass(name = "Part", module = "tensorfs.raw", frozen, get_all)]
 pub struct PyPart {
     dtype: String,
     shape: Py<PyTuple>,
@@ -830,57 +827,56 @@ impl PyEncoding {
     }
 }
 
-/// A tensor's logical dtype and shape, its encoding (`None` when plain) and its stored parts.
-#[pyclass(name = "Info", module = "tensorfs", frozen, get_all)]
-pub struct PyInfo {
+/// A tensor's logical dtype, shape and encoding (`None` when plain).
+#[pyclass(name = "TensorMetadata", module = "tensorfs", frozen, get_all)]
+pub struct PyTensorMetadata {
     dtype: String,
     shape: Py<PyTuple>,
     encoding: Option<Py<PyEncoding>>,
-    parts: Py<PyDict>,
 }
 
 #[pymethods]
-impl PyInfo {
+impl PyTensorMetadata {
     fn __repr__(&self, py: Python<'_>) -> String {
-        let scheme = self
-            .encoding
-            .as_ref()
-            .map_or(String::new(), |e| format!(", {}", e.get().scheme));
-        format!("Info({}, {}{scheme})", self.dtype, self.shape.bind(py))
+        let scheme = self.encoding.as_ref().map_or(String::new(), |e| format!(", {}", e.get().scheme));
+        format!("TensorMetadata({}, {}{scheme})", self.dtype, self.shape.bind(py))
     }
 }
 
-fn info(py: Python<'_>, t: &Tensor) -> PyResult<PyInfo> {
-    let parts = PyDict::new(py);
-    let part = |dtype: &Dtype, shape: &[u64], at: (u64, u64, u64)| -> PyResult<Py<PyPart>> {
-        let p = PyPart {
-            dtype: dtype.name().into(),
-            shape: PyTuple::new(py, shape)?.unbind(),
-            chunk: at.0,
-            offset: at.1,
-            length: at.2,
-        };
-        Py::new(py, p)
+fn info(py: Python<'_>, tensor: &Tensor) -> PyResult<PyTensorMetadata> {
+    let encoding = match &tensor.body {
+        Body::Data(_) => None,
+        Body::Encoded { encoding, .. } => Some(Py::new(py, PyEncoding {
+            scheme: encoding.scheme.clone(), params: metadata(py, &encoding.params)?.unbind(),
+        })?),
     };
-    let encoding = match &t.body {
-        Body::Data(at) => {
-            parts.set_item("", part(&t.dtype, &t.shape, (at.chunk, at.offset, at.length))?)?;
-            None
-        }
-        Body::Encoded { encoding, parts: stored } => {
-            for p in stored {
-                parts.set_item(&p.role, part(&p.dtype, &p.shape, (p.chunk, p.offset, p.length))?)?;
-            }
-            let params = metadata(py, &encoding.params)?.unbind();
-            Some(Py::new(py, PyEncoding { scheme: encoding.scheme.clone(), params })?)
-        }
-    };
-    Ok(PyInfo {
-        dtype: t.dtype.name().into(),
-        shape: PyTuple::new(py, &t.shape)?.unbind(),
+    Ok(PyTensorMetadata {
+        dtype: tensor.dtype.name().into(),
+        shape: PyTuple::new(py, &tensor.shape)?.unbind(),
         encoding,
-        parts: parts.unbind(),
     })
+}
+
+/// Inspect physical stored ranges without fetching or loading array bytes.
+#[pyfunction(name = "parts")]
+fn raw_parts<'py>(py: Python<'py>, checkpoint: &PyCheckpoint, component: &str, key: &str) -> PyResult<Bound<'py, PyDict>> {
+    let component = checkpoint.header.components().iter().find(|c| c.name == component)
+        .ok_or_else(|| raise(py, Failure { kind: Kind::NotFound, detail: format!("no component {component:?}") }))?;
+    let tensor = component.tensors.iter().find(|t| t.key == key)
+        .ok_or_else(|| raise(py, Failure { kind: Kind::NotFound, detail: format!("no tensor {key:?}") }))?;
+    let parts = PyDict::new(py);
+    let part = |dtype: &Dtype, shape: &[u64], chunk: u64, offset: u64, length: u64| {
+        Py::new(py, PyPart { dtype: dtype.name().into(), shape: PyTuple::new(py, shape)?.unbind(), chunk, offset, length })
+    };
+    match &tensor.body {
+        Body::Data(at) => parts.set_item("", part(&tensor.dtype, &tensor.shape, at.chunk, at.offset, at.length)?)?,
+        Body::Encoded { parts: stored, .. } => {
+            for p in stored {
+                parts.set_item(&p.role, part(&p.dtype, &p.shape, p.chunk, p.offset, p.length)?)?;
+            }
+        }
+    }
+    Ok(parts)
 }
 
 pub(crate) struct FetchTensor<'a> {
@@ -1114,7 +1110,6 @@ impl PyCheckpoint {
             for (name, o) in &c.assets { assets.set_item(name, (o.sha256.clone(), o.length))?; }
             let component = PyComponent {
                 name: c.name.clone(), cls: c.class.clone(), config: config_dict(py, &c.config)?.unbind(),
-                config_file: c.config_file.clone().unwrap_or_else(|| "config.json".into()),
                 tensors: Py::new(py, PyTensors::new(&c.name, self.tensor_dict(py, c)?, access.clone()))?,
                 assets: assets.unbind(), ck: access.clone(),
             };
@@ -1126,7 +1121,7 @@ impl PyCheckpoint {
         Ok(components.clone_ref(py))
     }
 
-    /// The header's chunks, in order: `(sha256, length)` (`Part.chunk` indexes them).
+    /// The header's chunks, in order: `(sha256, length)`.
     #[getter]
     fn chunks(&self) -> Vec<(String, u64)> {
         (self.header.chunks.iter())
@@ -1675,18 +1670,17 @@ impl PyWriter {
 
     /// Declares component `name` (again: its class and config change, its tensors stay) and
     /// hands back its writer.
-    #[pyo3(signature = (name, cls = "", config = None, config_file = None))]
+    #[pyo3(signature = (name, cls = "", config = None))]
     fn component(
         slf: &Bound<'_, Self>,
         name: String,
         cls: &str,
         config: Option<&Bound<'_, PyDict>>,
-        config_file: Option<String>,
     ) -> PyResult<PyComponentWriter> {
         let py = slf.py();
         let config = config.map(config_map).transpose()?.unwrap_or_default();
         slf.get().with(py, |w| {
-            w.component(&name, cls, config, config_file.as_deref())?;
+            w.component(&name, cls, config, None)?;
             Ok(())
         })?;
         Ok(PyComponentWriter { w: slf.clone().unbind(), name })
@@ -1907,9 +1901,12 @@ pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPipeline>()?;
     m.add_class::<PyComponent>()?;
     m.add_class::<PyComponentWriter>()?;
-    m.add_class::<PyInfo>()?;
+    m.add_class::<PyTensorMetadata>()?;
     m.add_class::<PyEncoding>()?;
-    m.add_class::<PyPart>()?;
+    let raw = PyModule::new(m.py(), "raw")?;
+    raw.add_class::<PyPart>()?;
+    raw.add_function(wrap_pyfunction!(raw_parts, &raw)?)?;
+    m.add_submodule(&raw)?;
     m.add_class::<PyArray>()?;
     m.add_class::<PyTensors>()?;
     m.add_class::<PyEncoded>()?;

@@ -28,7 +28,7 @@ import torch
 from fastsafetensors import SafeTensorsFileLoader
 from fastsafetensors.frameworks import get_framework_op
 from safetensors import safe_open
-from tensorfs import varena
+from tensorfs import raw, varena
 
 # fastsafetensors dlopens libcudart.so; Torch wheels carry the versioned filename.
 _cudart = sorted(glob.glob(str(Path(torch.__file__).parent / ".." / "nvidia" / "**" / "libcudart.so*"), recursive=True))
@@ -96,7 +96,7 @@ class Model:
         self.parts = []
         for component, held in self.source.components.items():
             for key in sorted(held.tensors, key=natkey):
-                for role, part in held.tensors[key].parts.items():
+                for role, part in raw.parts(self.source, component, key).items():
                     self.parts.append((component, key, role, part.length, part.dtype, list(part.shape)))
         self.bytes = sum(part[3] for part in self.parts)
         self.window_bytes = sum(part[3] for part in self.parts if self.in_window(part[0], part[1]))
@@ -191,7 +191,7 @@ class Model:
         # Select before read_all allocates a destination or reads a tensor.
         selected = self.selected(window)
         opened = time.perf_counter() - started
-        arrays = {component: ck.components[component].tensors.read_all(keys, device="cuda:0", decode=False)
+        arrays = {component: ck.components[component].tensors.read(keys, device="cuda:0", decode=False)
                   for component, keys in selected.items() if keys}
         torch.cuda.synchronize()
         moved = sum(array.nbytes for tensors in arrays.values() for array in tensors.values())

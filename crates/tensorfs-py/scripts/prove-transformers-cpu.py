@@ -109,7 +109,7 @@ def make_checkpoint(root):
     source = root / "tokenizer-source"
     tokenizer.save_pretrained(source)
     tokenizer_files = {p.name: p.read_bytes() for p in source.iterdir() if p.is_file()}
-    tokenizer_config = json.loads(tokenizer_files.pop("tokenizer_config.json"))
+    tokenizer_config = json.loads(tokenizer_files["tokenizer_config.json"])
     refs = [weakref.ref(tokenizer), *(weakref.ref(m) for m in models_by_name.values()),
             *(weakref.ref(p) for m in models_by_name.values() for p in m.parameters())]
     manifests = {}
@@ -126,7 +126,6 @@ def make_checkpoint(root):
             manifests[name][key] = digest(value)
     component = writer.component(
         "tokenizer", cls="transformers.TokenizersBackend", config=tokenizer_config,
-        config_file="tokenizer_config.json",
     )
     for name, data in tokenizer_files.items():
         component.asset(name, data)
@@ -157,7 +156,7 @@ def prove(root):
         if name == "tokenizer":
             assert component.cls == "transformers.TokenizersBackend"
             assert len(component.tensors) == 0
-            path = Path(component.path)
+            path = Path(component.export_files(root / "compatibility-tokenizer"))
             assert path != root / "tokenizer-source"
             assert json.loads((path / "tokenizer_config.json").read_text()) == component.config
             assert set(component.assets) == set(assets)
@@ -167,8 +166,7 @@ def prove(root):
             continue
         config_cls, model_cls = constructors[name]
         assert component.cls == f"transformers.{model_cls.__name__}"
-        assert json.loads((Path(component.path) / "config.json").read_text()) == component.config
-        arrays = component.tensors.read_all(device="cpu")
+        arrays = component.tensors.read(device="cpu")
         assert set(arrays) == set(manifests[name])
         loaded = {key: torch.from_dlpack(array) for key, array in arrays.items()}
         for key, value in loaded.items():
@@ -189,7 +187,7 @@ def prove(root):
     del checkpoint, component
     gc.collect()
     assert all(ref() is None for ref in refs)
-    # The tokenizer was reconstructed from c.path, and now both it and the models
+    # The tokenizer was reconstructed with explicit export_files, and now both it and the models
     # must run after every TensorFS handle/Array and original producer is gone.
     encoded = tokenizer(TEXTS, padding=True, return_tensors="pt")
     assert encoded.input_ids.tolist() == TOKEN_IDS
