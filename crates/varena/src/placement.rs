@@ -258,6 +258,11 @@ impl Placement {
             return Err(invalid("model already registered"));
         }
         let range = self.gpu.reserve(layout.nbytes)?;
+        let mut rollback = Registration {
+            owner: self,
+            pages: Vec::new(),
+            committed: false,
+        };
         let mut pages = Vec::new();
         for (index, region) in layout.regions.iter().enumerate() {
             let page = self.new_page()?;
@@ -271,6 +276,7 @@ impl Placement {
                 region.offset,
                 tensorfs::sha256::hex(&fingerprint),
             )?;
+            rollback.pages.push(page);
             let key = PageKey {
                 fingerprint,
                 page: index as u64,
@@ -320,6 +326,7 @@ impl Placement {
             },
         );
         self.refresh()?;
+        rollback.committed = true;
         Ok(pages)
     }
 
@@ -343,13 +350,12 @@ impl Placement {
         if self.inner.lock().requests.contains_key(&id) {
             return Err(invalid("request already active"));
         }
-        let known = self.ledger.measured(&package, &shape);
         let mut inner = self.inner.lock();
         inner.table.requests.push(plan::Request {
             id,
             row: self.row.owner().row,
             position: Position { step: 0, order: 0 },
-            working_sets: vec![known; steps.len().max(1)],
+            working_sets: vec![None; steps.len().max(1)],
             starved: false,
             sharing_limit: None,
             resident_steps: BTreeSet::new(),
@@ -373,6 +379,7 @@ impl Placement {
             return Err(error);
         }
         drop(inner);
+        self.hydrate(id)?;
         self.refresh()?;
         self.event(id, 0, "begin", "request")
     }
@@ -380,6 +387,7 @@ impl Placement {
     pub fn declare(&self, id: RequestId, steps: Vec<Vec<ModelId>>) -> Result<()> {
         let _operation = self.operations.lock();
         Self::declare_locked(&mut self.inner.lock(), id, steps)?;
+        self.hydrate(id)?;
         self.refresh()
     }
 
@@ -555,26 +563,96 @@ impl Placement {
         Ok(())
     }
 
+    fn step_key(inner: &Inner, request: RequestId, step: usize) -> Result<String> {
+        let run = inner
+            .requests
+            .get(&request)
+            .ok_or_else(|| invalid("unknown request"))?;
+        let models = run
+            .steps
+            .get(step)
+            .ok_or_else(|| invalid("unknown request step"))?;
+        let mut fingerprint = run.package.as_bytes().to_vec();
+        for model in models {
+            fingerprint.extend_from_slice(
+                &inner
+                    .models
+                    .get(model)
+                    .ok_or_else(|| invalid("unknown model"))?
+                    .fingerprint,
+            );
+        }
+        Ok(format!(
+            "step:{}",
+            tensorfs::sha256::hex_digest(&fingerprint)
+        ))
+    }
+
+    fn hydrate(&self, request: RequestId) -> Result<()> {
+        let mut inner = self.inner.lock();
+        let run = inner
+            .requests
+            .get(&request)
+            .ok_or_else(|| invalid("unknown request"))?;
+        let shape = run.shape.clone();
+        let peaks = (0..run.steps.len())
+            .map(|step| {
+                Self::step_key(&inner, request, step).map(|key| self.ledger.measured(&key, &shape))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(facts) = inner
+            .table
+            .requests
+            .iter_mut()
+            .find(|row| row.id == request)
+        {
+            facts.working_sets = if peaks.is_empty() { vec![None] } else { peaks };
+        }
+        Ok(())
+    }
+
     pub fn leave(&self, request: RequestId, peak: u64) -> Result<()> {
-        let (package, shape) = {
+        let (key, shape) = {
             let mut inner = self.inner.lock();
+            let step = inner
+                .table
+                .request(request)
+                .ok_or_else(|| invalid("unknown request"))?
+                .position
+                .step as usize;
+            let key = Self::step_key(&inner, request, step)?;
+            let models = inner
+                .requests
+                .get(&request)
+                .ok_or_else(|| invalid("unknown request"))?
+                .steps
+                .get(step)
+                .cloned()
+                .ok_or_else(|| invalid("unknown request step"))?;
+            let resident = inner
+                .table
+                .pages
+                .iter()
+                .filter(|page| page.mapped() && page.model.is_some_and(|id| models.contains(&id)))
+                .map(|page| page.bytes)
+                .fold(0_u64, u64::saturating_add);
             let facts = inner
                 .table
                 .requests
                 .iter_mut()
                 .find(|row| row.id == request)
                 .ok_or_else(|| invalid("unknown request"))?;
-            if let Some(measured) = facts.working_sets.get_mut(facts.position.step as usize) {
+            if let Some(measured) = facts.working_sets.get_mut(step) {
                 *measured = Some(measured.unwrap_or(0).max(peak));
             }
             let run = inner
                 .requests
                 .get_mut(&request)
                 .ok_or_else(|| invalid("unknown request"))?;
-            run.stats.peak = run.stats.peak.max(peak);
-            (run.package.clone(), run.shape.clone())
+            run.stats.peak = run.stats.peak.max(resident.saturating_add(peak));
+            (key, run.shape.clone())
         };
-        self.ledger.record_peak(&package, &shape, peak)?;
+        self.ledger.record_peak(&key, &shape, peak)?;
         self.refresh()?;
         self.capture_budget(request);
         self.row.wake()
@@ -584,6 +662,15 @@ impl Placement {
         let recovered = self.gpu.recover();
         self.event(request, 0, "end", "request")?;
         let mut inner = self.inner.lock();
+        let measured = inner
+            .table
+            .request(request)
+            .is_some_and(|row| row.working_sets.iter().all(Option::is_some));
+        let peak = inner
+            .requests
+            .get(&request)
+            .filter(|_| measured)
+            .map(|run| (run.package.clone(), run.shape.clone(), run.stats.peak));
         inner.table.requests.retain(|row| row.id != request);
         inner
             .table
@@ -607,6 +694,9 @@ impl Placement {
         drop(inner);
         self.refresh()?;
         recovered?;
+        if let Some((package, shape, peak)) = peak {
+            self.ledger.record_peak(&package, &shape, peak)?;
+        }
         Ok(stats)
     }
 
@@ -1287,6 +1377,36 @@ impl Placement {
                 run.budgets.entry(step).or_insert(budget);
             }
         }
+    }
+}
+
+struct Registration<'a> {
+    owner: &'a Placement,
+    pages: Vec<PageId>,
+    committed: bool,
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut gone = BTreeSet::new();
+        let mut retained = BTreeSet::new();
+        for page in &self.pages {
+            match self.owner.gpu.unregister(*page) {
+                Ok(true) => {
+                    gone.insert(*page);
+                }
+                Ok(false) | Err(_) => {
+                    retained.insert(*page);
+                }
+            }
+        }
+        let mut inner = self.owner.inner.lock();
+        inner.table.pages.retain(|page| !gone.contains(&page.id));
+        inner.retired.extend(retained);
+        let _ = self.owner.row.wake();
     }
 }
 
