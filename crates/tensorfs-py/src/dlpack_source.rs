@@ -4,78 +4,70 @@
 
 use std::io::{self, Read};
 
-use pyo3::{Py, PyAny};
-use tensorfs::io::{self as engine, cuda::Stream, Copy, Dst, ReadOpts, Src};
+use tensorfs::io::{self as engine, Copy, Dst, ReadOpts, Src};
+
+use crate::store::Dlpack;
 
 const MAX_READ: usize = 8 << 20;
 
 pub(crate) struct DeviceSource {
-    // Drop the synchronizing stream before releasing the producer's allocation, including
-    // when construction succeeded but the Writer never requested a byte.
-    stream: Stream,
-    _capsule: Py<PyAny>,
-    device: i32,
-    ptr: u64,
-    nbytes: usize,
+    // The shared parser's consumed producer owner and checked stream lifetime.
+    view: Dlpack,
     offset: usize,
+    failed: bool,
 }
 
 impl DeviceSource {
-    /// `capsule` is the unconsumed capsule for the bridge's validated, contiguous CUDA
-    /// tensor. `ptr` already includes its byte_offset; `nbytes` is the validated dtype/shape
-    /// size. The producer's `__dlpack__(stream=stream.raw())` orders access to these bytes.
-    pub(crate) fn new(
-        capsule: Py<PyAny>,
-        stream: Stream,
-        device: i32,
-        ptr: u64,
-        nbytes: usize,
-    ) -> io::Result<Self> {
-        if device < 0 || stream.device() != device {
+    /// Take the shared parser's validated, consumed CUDA tensor. No second ABI parse.
+    pub(crate) fn new(view: Dlpack) -> io::Result<Self> {
+        let stream = view.stream().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "a CUDA source needs a stream")
+        })?;
+        if view.device.1 < 0 || stream.device() != view.device.1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "DLPack source and consumer stream use different CUDA devices",
             ));
         }
-        let len = u64::try_from(nbytes).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "DLPack byte size overflows")
-        })?;
-        if ptr.checked_add(len).is_none() || (nbytes != 0 && ptr == 0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "DLPack device address is invalid",
-            ));
-        }
         Ok(Self {
-            stream,
-            _capsule: capsule,
-            device,
-            ptr,
-            nbytes,
+            view,
             offset: 0,
+            failed: false,
         })
+    }
+
+    /// Called after the Writer releases its mutex, including on operation errors.
+    pub(crate) fn finish(&mut self) -> tensorfs::Result<()> {
+        self.view.finish()
     }
 }
 
 impl Read for DeviceSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let len = buf.len().min(self.nbytes - self.offset).min(MAX_READ);
+        if self.failed {
+            return Err(io::Error::other("the previous CUDA source read failed"));
+        }
+        let len = buf.len().min(self.view.len - self.offset).min(MAX_READ);
         if len == 0 {
             return Ok(0);
         }
         let copy = Copy {
             src: Src::Device {
-                device: self.device,
-                ptr: self.ptr + self.offset as u64,
-                stream: self.stream.raw(),
+                device: self.view.device.1,
+                ptr: self.view.address as u64 + self.offset as u64,
+                stream: self.view.stream().expect("live CUDA source").raw(),
             },
             dst: Dst::host(&mut buf[..len]),
         };
-        // SAFETY: the bridge's validated capsule retains the source allocation and the
+        // SAFETY: the shared parser's unique managed owner retains the source allocation and the
         // stream orders producer access. The constructor checked the complete address
         // range; this copy stays within it. The exclusive buffer borrow is its destination.
-        // The engine completes or drains the transfer before returning, including errors.
-        unsafe { engine::read(&[copy], &ReadOpts::default()) }.map_err(|error| error.source)?;
+        // A failed engine read is not a completion proof for its other copy streams.
+        if let Err(error) = unsafe { engine::read(&[copy], &ReadOpts::default()) } {
+            self.failed = true;
+            self.view.retain_after_cuda_error();
+            return Err(error.source);
+        }
         self.offset += len;
         Ok(len)
     }
