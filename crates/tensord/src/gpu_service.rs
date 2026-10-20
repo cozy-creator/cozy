@@ -822,6 +822,12 @@ impl Pool {
             self.reserve.lock().unwrap().quiet(others);
         }
     }
+    /// Host RAM for a fill of `need` bytes (a layout an executor seals): rungs go back while the
+    /// host's room is short of it, with or without a PSI trigger, so the kernel never has to
+    /// kill an executor for it (no host-RAM floor: what does not fit pages to disk).
+    pub fn host_room_for(&self, need: u64) {
+        while self.host_room_now().is_some_and(|room| room < need) && self.give_back_one() {}
+    }
     /// One rung back to the host, in the agreed order: sealed layouts no tenant holds, an
     /// import-only parent with no live child, an idle deviceless executor, then an idle
     /// executor (outside every warm set first) on a GPU no call holds. Whether anything went
@@ -3745,12 +3751,14 @@ struct Callbacks<'a> {
     kept: Vec<Option<(&'a GpuLedger, u32, &'a str)>>,
 }
 impl Callbacks<'_> {
-    /// The weight set's chunk files, once its objects landed, and their digest in `answer`.
+    /// The weight set's chunk files, once its objects landed, and their digest in `answer`. The
+    /// executor seals a host layout from them: host RAM for their bytes is made first.
     fn chunks(&self, manifest: &str) -> io::Result<(Vec<File>, String)> {
         let objects = self.sources.chunks(manifest)?;
         if let Some(fetch) = self.fetch {
             fetch.wait(manifest, &objects)?;
         }
+        self.pool.host_room_for(objects.iter().map(|o| o.length).sum());
         Ok((self.sources.files(&objects)?, crate::deposits::objects_digest(&objects)))
     }
 }
