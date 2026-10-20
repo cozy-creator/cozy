@@ -75,7 +75,7 @@ pub(crate) async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     let (mut reports, mut ok) = (vec![], true);
     std::fs::create_dir_all(&args.audit).map_err(|e| failed(format!("{}: {e}", args.audit.display())))?;
     for model in args.models {
-        let (token, origin, name) = (session.bearer(&client).await.map_err(hub_error)?, hub.origin.to_string(), model.clone());
+        let (token, origin, name) = (session.bearer(&client).await.map_err(hub_error)?.token, hub.origin.to_string(), model.clone());
         let file = |kind: &str| args.audit.join(format!("{}.{kind}json", model.replace('/', "__")));
         let before = file("before.");
         let access = access.clone();

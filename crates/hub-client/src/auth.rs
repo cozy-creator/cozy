@@ -61,7 +61,7 @@ impl Client {
             Credential::Anonymous => vec![],
             Credential::User(session) => {
                 // Login is itself a call through this client: boxed, as the future recurses.
-                let token = Box::pin(session.bearer(&self.anonymous())).await?;
+                let token = Box::pin(session.bearer(&self.anonymous())).await?.token;
                 vec![("authorization", format!("Bearer {token}"))]
             }
             Credential::Bearer(token) => vec![("authorization", format!("Bearer {token}"))],

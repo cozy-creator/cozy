@@ -10,6 +10,38 @@
     "version": "1"
   },
   "paths": {
+    "/v1/bearer": {
+      "put": {
+        "tags": [],
+        "summary": "The signer's newest ordinary bearer at the Hub `endpoint` names: every later read there under\nits owner's access presents it, until one that expires later comes. Kept in memory only.",
+        "operationId": "bearer",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TensorFSOptions"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Kept"
+          },
+          "400": {
+            "description": "`invalid_bearer`: no token, or not a Hub origin",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/health": {
       "get": {
         "tags": [],
@@ -2220,6 +2252,12 @@
           "endpoint": {
             "type": "string",
             "default": ""
+          },
+          "expires_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When `token` expires; 0: unknown.",
+            "default": 0
           },
           "token": {
             "type": "string",

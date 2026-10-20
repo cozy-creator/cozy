@@ -29,6 +29,8 @@ pub mod path {
     pub const OBJECT: &str = "/v1/objects/{digest}";
     /// `POST` a [`super::HeldRequest`]: what the machine holds of many objects, in one request.
     pub const OBJECTS_HELD: &str = "/v1/objects/held";
+    /// `PUT` a [`super::TensorFSOptions`]: the signer's newest bearer at a Hub.
+    pub const BEARER: &str = "/v1/bearer";
 }
 
 /// The header naming the byte ranges of an object the machine holds: `0-1048575,2097152-4194303`
@@ -321,10 +323,17 @@ pub struct TensorFSOptions {
     pub endpoint: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub token: String,
+    /// When `token` expires; 0: unknown.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub expires_unix_ms: i64,
     /// An endpoint's private CA, base64 DER on the wire.
     #[serde(with = "base64_bytes", skip_serializing_if = "Vec::is_empty")]
     #[schema(value_type = String, format = Byte)]
     pub ca_der: Vec<u8>,
+}
+
+fn is_zero(value: &i64) -> bool {
+    *value == 0
 }
 
 impl std::fmt::Debug for TensorFSOptions {

@@ -1,8 +1,8 @@
 //! Run sources and preparation inside a run (`cozy.machine.v1` Run). A run is accepted at
 //! once and prepares inside itself: its code installs, its models resolve at the run's Hub and
-//! download, and each stage is the run's progress. The Hub token lives only in memory, for that
-//! preparation and the run's life (its children prepare with it); a restart before it
-//! completes ends the run FAILED (`journal::PREPARING`).
+//! download, and each stage is the run's progress. Its owner's Hub bearer lives only in memory
+//! (`hub::Bearer`), as do its provider tokens, for the run's life (its children prepare with
+//! them); a restart before it completes ends the run FAILED (`journal::PREPARING`).
 use crate::{
     api::domain,
     call_memo::{self, Memo},
@@ -69,7 +69,7 @@ pub struct Spec {
     pub gpus: u32,
     /// The run's weight precision (16, 8 or 4); 0 lets the lane rule choose each slot's.
     pub bits: u32,
-    /// The Hub the run reads, under its request's bearer there (memory only).
+    /// The Hub the run reads, under its owner's newest bearer there when its request carried one.
     pub hub: Option<hub::Source>,
     /// Provider tokens for source models, held in memory only.
     pub providers: Providers,
@@ -97,7 +97,7 @@ pub struct Runs {
     /// On a rental: its own Hub, where a run that names none reads anonymously.
     pub own_hub: Option<hub::Source>,
     /// Unfinished runs' preparation: their children prepare with it, and their weights are
-    /// fetched and published with its access. Tokens live only here.
+    /// fetched and published with its access.
     pub contexts: Mutex<HashMap<String, RunContext>>,
 }
 
@@ -476,10 +476,15 @@ impl Runs {
                     true => Ok(Client::new(policy)),
                     false => Client::with_roots(policy, hub::pem(&options.ca_der).as_bytes()),
                 }.map_err(|error| refused("upload_failed", error.to_string()))?;
-                let token = (!options.token.is_empty()).then(|| bearer(options.token.clone()));
+                // The owner's newest bearer at the run's Hub, else the one the request carried.
+                let token = match hub.as_ref().and_then(|hub| hub.bearer_at(&options.endpoint)) {
+                    Some(bearer) => Some(bearer as Arc<dyn tensorfs::fetch::TokenProvider>),
+                    None => (!options.token.is_empty()).then(|| bearer(options.token.clone())),
+                };
+                let anonymous = token.is_none();
                 let mut endpoint = Endpoint::new(&client, &options.endpoint, token)
                     .map_err(|error| refused("upload_failed", error.to_string()))?;
-                if options.token.is_empty() {
+                if anonymous {
                     endpoint = endpoint.anonymous();
                 }
                 let runtime = tensorfs::fetch::runtime().map_err(|error| refused("upload_failed", error.to_string()))?;
@@ -769,7 +774,7 @@ impl Runs {
         stoppable: &Stoppable,
     ) -> Result<Option<ResultRecord>, Refused> {
         let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
-        let (mut members, mut kept, mut rows, mut fetches) = (vec![], vec![], vec![], vec![]);
+        let (mut members, mut kept, mut rows) = (vec![], vec![], vec![]);
         for item in items {
             let (held, release) = match &item.source {
                 Source::Installation(alias) => {
@@ -840,11 +845,10 @@ impl Runs {
                 })
                 .map_err(io::Error::other)?);
                 let held = self.service.catalog.resolve(&installation.generation)?;
-                // A member's weights come under the warm run's access, after every run's.
+                // A member's weights come under its owner's newest bearer, after every run's.
                 let fetch = self.publisher.as_ref().filter(|_| plan.is_some()).map(|publisher| {
                     crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), u64::MAX)
                 });
-                fetches.extend(fetch.clone());
                 members.push(Member::new(held, plan, item.level, fetch));
             }
         }
@@ -860,8 +864,6 @@ impl Runs {
             }
             None => members.iter().map(|member| without_gpus(member.level)).collect(),
         };
-        // The set outlives this run: past its first pass, its members read anonymously.
-        fetches.iter().for_each(|fetch| fetch.detach());
         // An item's level is its lowest member's, and why that one is held back.
         let mut holds = holds.into_iter();
         let rows: Vec<Value> = rows
@@ -1202,8 +1204,15 @@ impl Runs {
         self.contexts.lock().unwrap().get_mut(id).and_then(|context| context.ahead.take())
     }
 
+    /// The run's TensorFS options for its Runtime, with its owner's newest bearer at its Hub.
     pub(crate) fn tensorfs(&self, id: &str) -> Option<protocol::machine::TensorFSOptions> {
-        self.contexts.lock().unwrap().get(id).and_then(|context| context.tensorfs.clone())
+        let contexts = self.contexts.lock().unwrap();
+        let context = contexts.get(id)?;
+        let mut options = context.tensorfs.clone()?;
+        if let Some(bearer) = context.hub.as_ref().and_then(|hub| hub.bearer_at(&options.endpoint)) {
+            (options.token, options.expires_unix_ms) = bearer.held();
+        }
+        Some(options)
     }
 
     pub(crate) fn destination(&self, id: &str) -> String {

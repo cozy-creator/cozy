@@ -4,7 +4,8 @@
 //! layout TensorFS's own `upload_tree` wrote, `GET /refs/<org>/<name>.json` and `GET`/`HEAD
 //! /blobs/…`, each blob GET redirected to another origin (`/o/<sha>` at `localhost`), as the Hub
 //! redirects to storage. Anonymous callers see releases and their closures; the owner's bearer
-//! ([`OWNER`]) sees unreleased trees too; any other credential is 401. It records every request.
+//! ([`OWNER`], or those [`admit`] names) sees unreleased trees too; any other credential is 401.
+//! It records every request.
 #![allow(dead_code)]
 use axum::{
     extract::State,
@@ -26,6 +27,14 @@ use tensorfs::{
 
 /// The owner's ordinary bearer at this Hub.
 pub const OWNER: &str = "names-hub-owner";
+
+/// The owner bearers each Hub (by origin) admits, when not just [`OWNER`].
+static ADMITTED: Mutex<BTreeMap<String, Vec<String>>> = Mutex::new(BTreeMap::new());
+
+/// The Hub at `origin` admits exactly `bearers` as the owner's from now on: the rest are revoked.
+pub fn admit(origin: &str, bearers: &[&str]) {
+    ADMITTED.lock().unwrap().insert(origin.into(), bearers.iter().map(|b| b.to_string()).collect());
+}
 
 /// One model: `repository` at `release` in `lane` (no release: the owner's unreleased tree), its
 /// cozytensors `header` held in a source store.
@@ -93,7 +102,8 @@ struct Served {
     pace: std::time::Duration,
 }
 
-/// What a request was heard as: `METHOD path`, and `+credential` when it carried one.
+/// What a request was heard as: `METHOD path`, and `+credential` when it carried an admitted
+/// bearer (`+refused`: another).
 pub type Heard = Arc<Mutex<Vec<String>>>;
 
 pub fn serve(store: &Store, model: Model, packages: impl IntoIterator<Item = Package>) -> (String, Heard) {
@@ -113,6 +123,11 @@ pub fn paced(
 /// Several models, or several lanes of one release.
 pub fn models(store: &Store, models: Vec<Model>) -> (String, Heard) {
     start(store, models, None, std::time::Duration::ZERO)
+}
+
+/// `models`, each object answering after `pace`.
+pub fn paced_models(store: &Store, models: Vec<Model>, pace: std::time::Duration) -> (String, Heard) {
+    start(store, models, None, pace)
 }
 
 /// Each model's tree uploaded from `store` into a directory endpoint at `layout`, as a release or
@@ -247,18 +262,20 @@ fn ranged(bytes: &[u8], headers: &HeaderMap) -> Response {
 async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, headers: HeaderMap) -> Response {
     let path = uri.path().to_string();
     let presented = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let mut heard = format!("{method} {path}");
-    if presented.is_some() {
-        heard.push_str(" +credential");
-    }
+    let admitted = ADMITTED.lock().unwrap().get(&served.origin).cloned().unwrap_or_else(|| vec![OWNER.into()]);
+    let owner = presented.map(|value| admitted.iter().any(|bearer| value == format!("Bearer {bearer}")));
+    let heard = match owner {
+        None => format!("{method} {path}"),
+        Some(true) => format!("{method} {path} +credential"),
+        Some(false) => format!("{method} {path} +refused"),
+    };
     served.heard.lock().unwrap().push(heard);
-    let owner = match presented {
-        None => false,
-        Some(value) if value == format!("Bearer {OWNER}") => true,
-        Some(_) => {
+    let owner = match owner {
+        Some(false) => {
             let body = r#"{"error":{"code":"unauthorized","message":"the bearer is not valid"}}"#;
             return (StatusCode::UNAUTHORIZED, [("www-authenticate", "Bearer")], body).into_response();
         }
+        owner => owner.is_some(),
     };
     let first = served.packages.first();
     let release_path = |p: &Package| format!("/v1/packages/{}/releases/{}", p.name, p.release);
