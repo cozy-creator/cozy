@@ -1136,10 +1136,27 @@ mod v1_api {
             let result: serde_json::Value = json(&done.result);
             served.push((result["pid"].as_u64().unwrap(), result["served"].as_u64().unwrap()));
         }
+        // An idle deviceless executor goes back to the host only under host memory pressure
+        // (shared mode, a stall anywhere on the host), and the machine logs each such give-back.
+        // A busy test host can stall, so a call may start a new executor only after one.
+        let gave = walkdir(&machine.root)
+            .into_iter()
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("memory.log")))
+            .filter_map(|p| fs::read_to_string(p).ok())
+            .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
+            .filter(|line| line.contains("\"event\":\"host_pressure\"") && line.contains("\"gave\":true"))
+            .count();
+        let mut switches = 0;
         for (ordinal, (pid, count)) in served.iter().enumerate() {
-            assert_eq!(*pid, served[0].0, "one executor served every sequential call: {served:?}");
-            assert_eq!(*count, ordinal as u64 + 1, "{served:?}");
+            match ordinal > 0 && *pid != served[ordinal - 1].0 {
+                true => {
+                    switches += 1;
+                    assert_eq!(*count, 1, "a new executor starts its own count: {served:?}");
+                }
+                false => assert_eq!(*count, served.get(ordinal.wrapping_sub(1)).map_or(1, |p| p.1 + 1), "{served:?}"),
+            }
         }
+        assert!(switches <= gave, "{switches} executor switches but {gave} host-pressure give-backs: {served:?}");
         let _ = fs::remove_dir_all(tools);
     }
 
@@ -2557,15 +2574,16 @@ mod v1_api {
         assert_eq!(notes[0], [b"note 5".to_vec(), b"note 6".to_vec()]);
         assert_eq!(notes[1], notes[0], "the reused result is the same files");
         assert_eq!(fs::read_to_string(&noted).unwrap(), "2", "the second job ran its calls again");
-        // The store loses one file (as its GC does once reclaim released it): that call runs.
+        // TensorD's run-object store loses one file (as its sweep does once released): that
+        // call runs.
         let hex = tensorfs::sha256::hex_digest(b"note 5");
-        let blob = walkdir(&machine.root.join("state/tensorfs"))
+        let blob = walkdir(&machine.root)
             .into_iter()
             .find(|p| {
-                p.components().any(|c| c.as_os_str() == "blobs")
-                    && p.file_name().is_some_and(|n| n.to_string_lossy().contains(&hex))
+                p.components().any(|c| c.as_os_str() == "objects")
+                    && p.file_name().is_some_and(|n| n.to_string_lossy() == hex)
             })
-            .expect("the note's bytes are in the store");
+            .expect("the note's bytes are in the run-object store");
         fs::remove_file(blob).unwrap();
         let events = collect(run_as(&client, annotate("annotate-3")).await.unwrap()).await.unwrap();
         assert_eq!(outcome(&events).status, "succeeded", "{events:?}");

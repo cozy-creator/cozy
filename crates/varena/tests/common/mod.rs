@@ -56,7 +56,7 @@ pub fn checkpoint(root: &Path, tensors: &[(&str, &str, Vec<u8>)]) -> (Store, Che
     let client = Client::new(Config { cache_dir: root.to_path_buf(), ..Config::from_env() }).unwrap();
     let open = Open { local_files_only: true, ..Default::default() };
     let reference = format!("sha256:{}", header.sha256);
-    let ck = tensorfs::raw::runtime().unwrap().block_on(client.open(&reference, &open)).unwrap();
+    let ck = tensorfs::raw::block_on(client.open(&reference, &open)).unwrap();
     (store, ck)
 }
 

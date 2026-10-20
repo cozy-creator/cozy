@@ -407,6 +407,16 @@ fn many_destinations_at_once_from_a_writers_folder() {
 /// Host reads, by tensor or by stored location, go through the engine and log a disk run.
 #[test]
 fn host_reads_run_through_the_engine_and_log_a_disk_run() {
+    // The copy log is process-wide and bounded: run alone, apart from the other reads here.
+    if std::env::var_os("TENSORFS_IO_LOG_CHILD").is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "host_reads_run_through_the_engine_and_log_a_disk_run", "--nocapture"])
+            .env("TENSORFS_IO_LOG_CHILD", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
     let scratch = Scratch::new("logged");
     let ck = written(&scratch.0, 4);
     let Body::Data(big) = ck.tensor("unet", "big").unwrap().body else { unreachable!() };

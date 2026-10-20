@@ -2,7 +2,6 @@
 //! `_ext.pyi`. Marshal only: every call that moves bytes runs detached from the GIL.
 
 use std::ffi::{c_void, CStr};
-use std::future::Future;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -14,6 +13,7 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
 use tensorfs::format::{
     Body, Config, ConfigValue, Dtype, Encoding, Header, Metadata, ObjectRef, Tensor, Value,
 };
+use tensorfs::raw::block_on;
 use tensorfs::{
     Checkpoint, Client, Convert, Failure, Download, Format, Kind, Open, Ref, Selection, Writer,
     WriterOptions,
@@ -40,11 +40,6 @@ impl<T, E: Into<Failure>> OrRaise<T> for Result<T, E> {
     fn or_raise(self, py: Python<'_>) -> PyResult<T> {
         self.map_err(|e| raise(py, e.into()))
     }
-}
-
-/// Synchronous Python calls drive the one existing process-owned async bridge.
-pub(crate) fn bridge<T>(future: impl Future<Output = tensorfs::Result<T>>) -> tensorfs::Result<T> {
-    tensorfs::raw::runtime()?.block_on(future)
 }
 
 // ---------------------------------------------------------------- values
@@ -264,7 +259,7 @@ impl PyClient {
             ..Open::default()
         };
         let checkpoint = py
-            .detach(|| bridge(self.client.open(name_or_path, &options)))
+            .detach(|| block_on(self.client.open(name_or_path, &options)))
             .or_raise(py)?;
         Ok(PyCheckpoint::from_core(checkpoint))
     }
@@ -285,7 +280,7 @@ impl PyClient {
             ..Download::default()
         };
         py.detach(|| {
-            bridge(self.client.materialize(
+            block_on(self.client.materialize(
                 &reference,
                 &want,
                 local_dir.as_deref(),
@@ -307,7 +302,7 @@ impl PyClient {
     ) -> PyResult<PathBuf> {
         let reference = reference(repo_id, revision, None).or_raise(py)?;
         py.detach(|| {
-            bridge(self.client.download_file(
+            block_on(self.client.download_file(
                 &reference,
                 filename,
                 local_dir.as_deref(),
@@ -326,7 +321,7 @@ impl PyClient {
         revision: Option<String>,
     ) -> PyResult<String> {
         let reference = reference(repo_id, revision, None).or_raise(py)?;
-        py.detach(|| bridge(self.client.upload_folder(&reference, &folder_path, None)))
+        py.detach(|| block_on(self.client.upload_folder(&reference, &folder_path, None)))
             .map(|tree| tree.id())
             .or_raise(py)
     }
@@ -364,7 +359,7 @@ impl PyClient {
                 .as_ref()
                 .map(|_| &notify as &tensorfs::ConvertProgress<'_>),
         };
-        let result = py.detach(|| bridge(self.client.convert_to_cozytensors(&sources, &options)));
+        let result = py.detach(|| block_on(self.client.convert_to_cozytensors(&sources, &options)));
         if let Some(error) = callback_error
             .into_inner()
             .unwrap_or_else(|e| e.into_inner())
@@ -392,7 +387,7 @@ fn _materialize(
         _ => return Err(invalid(py, "format must be safetensors or cozytensors")),
     };
     let dtype = dequantize.map(|d| Dtype::parse(&d.to_ascii_uppercase()));
-    py.detach(move || bridge(checkpoint.materialize(&directory, format, dtype)))
+    py.detach(move || block_on(checkpoint.materialize(&directory, format, dtype)))
         .or_raise(py)
 }
 
@@ -733,7 +728,7 @@ impl CheckpointAccess {
             for selection in &selections {
                 self.missing(selection)?;
             }
-            bridge(async {
+            block_on(async {
                 for selection in selections {
                     self.download(&Download {
                         selection,
@@ -755,7 +750,7 @@ impl CheckpointAccess {
             },
             ..Download::default()
         };
-        py.detach(|| bridge(self.download(&want)))
+        py.detach(|| block_on(self.download(&want)))
             .or_raise(py)
             .map(drop)
     }
@@ -799,17 +794,6 @@ impl PyCheckpoint {
     #[getter]
     fn id(&self) -> String {
         self.id.id()
-    }
-
-    #[getter]
-    fn header_ref(&self) -> (String, u64) {
-        (self.id.sha256.clone(), self.id.length)
-    }
-    #[getter]
-    fn tree_ref(&self) -> Option<(String, u64)> {
-        self.tree
-            .as_ref()
-            .map(|tree| (tree.sha256.clone(), tree.length))
     }
 
     /// The tree, repo, revision and variant naming it, when one does.
@@ -936,7 +920,7 @@ impl PyCheckpoint {
                 .as_ref()
                 .map(|_| &report as &tensorfs::Progress<'_>),
         };
-        let result = py.detach(|| bridge(access.download(&want))).map(drop);
+        let result = py.detach(|| block_on(access.download(&want))).map(drop);
         if let Some(error) = callback_error
             .into_inner()
             .unwrap_or_else(|e| e.into_inner())
@@ -1734,7 +1718,7 @@ impl PyWriter {
                     repo_id: repo_id.as_deref(),
                     ..WriterOptions::default()
                 };
-                bridge(async { client.writer(options) })
+                block_on(async { client.writer(options) })
             })
             .or_raise(py)?;
         Ok(Self {
@@ -1786,7 +1770,7 @@ impl PyWriter {
                     None,
                 );
             };
-            let result = bridge(writer.commit());
+            let result = block_on(writer.commit());
             let retained = writer.committed();
             if result.is_ok() {
                 guard.take();
