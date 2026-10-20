@@ -1,17 +1,11 @@
 //! hub-client against a real Tensorhub (Tensorhub's dev-build `cozy_ref` job starts one):
 //! device-key enrollment and login, the account, model info and search, a checkpoint assessment
-//! reaching the Hub's inspector, a rental quote, a
-//! closure read, a run capability traded for a DPoP-bound token over real TLS, and (with the
-//! job's docker provider) a rental that boots to ready and ends.
+//! reaching the Hub's inspector, a rental quote, a closure read, and (with the job's docker
+//! provider) a rental that boots to ready and ends.
 //!
-//! TENSORHUB_URL is where the hub listens (plain HTTP on loopback), TENSORHUB_ORIGIN its public
-//! https origin (SSL_CERT_FILE trusts its CA), TENSORHUB_LOG the hub's log, where the development
-//! mail sender writes codes.
-use hub_client::{
-    Client, Credential, DeviceKey, Error, P256Key, RunCapability, RunToken, UserSession, testing,
-    types,
-};
-use serde_json::json;
+//! TENSORHUB_URL is where the hub listens (plain HTTP on loopback), TENSORHUB_LOG the hub's log,
+//! where the development mail sender writes codes.
+use hub_client::{Client, Credential, DeviceKey, Error, UserSession, testing, types};
 use sha2::{Digest as _, Sha256};
 use std::path::Path;
 use std::sync::Arc;
@@ -19,7 +13,6 @@ use std::time::{Duration, Instant};
 
 struct Hub {
     url: String,
-    origin: String,
     log: String,
 }
 
@@ -27,7 +20,6 @@ fn hub() -> Option<Hub> {
     let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
     Some(Hub {
         url: var("TENSORHUB_URL")?,
-        origin: var("TENSORHUB_ORIGIN")?,
         log: var("TENSORHUB_LOG")?,
     })
 }
@@ -40,9 +32,9 @@ fn refused<T: std::fmt::Debug>(answer: Result<T, Error>) -> (u16, String) {
 }
 
 #[tokio::test]
-async fn a_user_and_a_machine_at_a_real_hub() {
+async fn a_user_at_a_real_hub() {
     let Some(hub) = hub() else {
-        eprintln!("skipped: TENSORHUB_URL, TENSORHUB_ORIGIN and TENSORHUB_LOG name no hub");
+        eprintln!("skipped: TENSORHUB_URL and TENSORHUB_LOG name no hub");
         return;
     };
     let nonce = format!("{:x}", Sha256::digest(format!("{:?}", Instant::now())))[..10].to_string();
@@ -136,7 +128,7 @@ async fn a_user_and_a_machine_at_a_real_hub() {
     let ask = types::RentalRequest {
         accelerator_count: None,
         container_disk_gb: None,
-        creator_public_key: hub_client::P256Key::generate().thumbprint(),
+        creator_public_key: session.key().public_key(),
         development: None,
         excluded_provider_machines: vec![],
         image: None,
@@ -185,60 +177,6 @@ async fn a_user_and_a_machine_at_a_real_hub() {
         )
         .0,
         404
-    );
-
-    // A run capability: signed offline by the device key, traded by the machine's leaf for a
-    // DPoP-bound token over TLS, and good for exactly what it names.
-    let endpoint = user.token_endpoint().await.unwrap();
-    assert!(endpoint.starts_with(&hub.origin), "{endpoint}");
-    let leaf = Arc::new(P256Key::generate());
-    let capability = session.key().sign_run_capability(&RunCapability {
-        user_id: me.user_id.clone(),
-        hub: hub.origin.clone(),
-        machine: leaf.thumbprint(),
-        run: format!("run-{nonce}"),
-        operations: vec![
-            json!({"type": "tensorhub_model_publish", "model": format!("{account}/model")}),
-        ],
-        lifetime: Duration::from_secs(300),
-    });
-    let run = Arc::new(RunToken::new(&capability, &endpoint, leaf).unwrap());
-    let machine = Client::connect(
-        &hub.origin,
-        reqwest::Client::new(),
-        Credential::Run(run.clone()),
-    );
-    let declared = types::PublicationDeclaration {
-        objects: vec![object(b"machine")],
-    };
-    let opened = machine
-        .open_model_publication(&account, "model", "op-machine", &declared)
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(opened.publication.operation, "op-machine");
-    let absent = format!("sha256:{:x}", Sha256::digest(b"absent"));
-    assert_eq!(
-        refused(
-            machine
-                .get_model_checkpoint(&account, "model", &absent)
-                .await
-                .map_err(Error::from)
-        )
-        .0,
-        404
-    );
-    let other = machine
-        .open_model_publication(&account, "other", "op", &declared)
-        .await
-        .map_err(Error::from);
-    assert_eq!(
-        refused(other),
-        (403, "capability.operation_forbidden".into())
-    );
-    assert!(
-        run.ended().is_none(),
-        "a refused operation does not end the capability"
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }

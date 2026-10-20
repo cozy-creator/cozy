@@ -282,7 +282,7 @@ pub struct RunSpec {
     /// org/name: the requester's repository for the call's weights outputs, or a warm run's
     /// source model.
     pub weights_destination: String,
-    /// Where the run reads, and its capability there.
+    /// The Hub the run reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hub: Option<HubAccess>,
     /// Ordinary TensorFS connection settings supplied by the caller, forwarded to Runtime.
@@ -290,7 +290,7 @@ pub struct RunSpec {
     pub tensorfs: Option<TensorFSOptions>,
     /// The account that org-relative references of local code name.
     pub owner: String,
-    /// Provider tokens for source models, memory only like `hub`.
+    /// Provider tokens for source models, kept in memory only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub providers: Option<ProviderAccess>,
     /// `warm/2`: the caller's whole warm set, replacing its previous one; no items clears it.
@@ -426,15 +426,6 @@ pub struct HubAccess {
     #[serde(with = "base64_bytes", skip_serializing_if = "Vec::is_empty")]
     #[schema(value_type = String, format = Byte)]
     pub ca_der: Vec<u8>,
-    /// The Hub's object-storage hosts downloads may follow.
-    pub object_hosts: Vec<String>,
-    /// The owner's capability for this run's private operations (th-241): a compact JWS its
-    /// device key signed for this machine's leaf (`cnf.jkt`) and the Hub's resource (`aud`),
-    /// naming each operation in `authorization_details`. The machine trades it once, at the run's
-    /// first private operation, at `token_endpoint`. Empty: a public-only run.
-    pub capability: String,
-    /// The Hub's authorization server's, as its metadata names it.
-    pub token_endpoint: String,
 }
 
 /// One entry of a run's log, as `GET /v1/runs/{id}/events` sends it: SSE `event: <variant>`,

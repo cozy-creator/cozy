@@ -5,8 +5,8 @@ The `cozy` binary's TensorFS and a machine's tensorfs wheel share stores, so bot
 STORE_FORMAT:
 
     format_contract.py binary [--wheel W]  the newest published wheel (or wheel file W) speaks this tree's
-                                           integers; prints its version
-    format_contract.py wheel               integers unlike the newest published wheel's need a newer minor
+                                           format; prints its version
+    format_contract.py wheel               a different store format needs a newer minor
 
 Read-only: PyPI's JSON and the wheel itself (`uv`), nothing uploaded.
 """
@@ -60,7 +60,7 @@ def main() -> int:
         mode = ""
     ours = source()
     version, theirs = speaks(str(pathlib.Path(wheel).resolve())) if wheel else published()
-    said = lambda ints: "nothing" if ints is None else f"store format {ints[0]}, claim protocol {ints[1]}"
+    said = lambda ints: "no store format" if ints is None else f"store format {ints[0]}"
     if mode == "binary":
         if theirs != ours:
             which = f"the wheel {wheel}" if wheel else "the newest on PyPI"
@@ -74,7 +74,7 @@ def main() -> int:
             declared = tomllib.load(pyproject)["project"]["version"]
         if theirs is not None and theirs != ours and minor(declared) <= minor(version):
             print(f"tensorfs {declared} speaks {said(ours)} but {version} speaks {said(theirs)}:"
-                  " a changed format or protocol needs a new minor", file=sys.stderr)
+                  " a changed store format needs a new minor", file=sys.stderr)
             return 1
         print(f"tensorfs {declared}: {said(ours)}; newest published {version}: {said(theirs)}")
         return 0

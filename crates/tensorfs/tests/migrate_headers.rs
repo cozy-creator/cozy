@@ -254,3 +254,84 @@ fn partial_tokenizer_keeps_existing_files_and_fills_missing_files() {
     assert_eq!(filled(&header).unwrap().1, BTreeSet::from([missing.to_owned()]));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+fn migration_scratch(name: &str) -> PathBuf {
+    let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("a11-{name}-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+fn contents(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, path: &Path, found: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, found);
+            } else {
+                found.insert(path.strip_prefix(root).unwrap().to_path_buf(), std::fs::read(path).unwrap());
+            }
+        }
+    }
+    let mut found = BTreeMap::new();
+    visit(root, root, &mut found);
+    found
+}
+
+#[test]
+fn local_migration_refuses_other_formats_before_changing_any_file() {
+    let root = migration_scratch("formats");
+    for (index, record) in [
+        "store-format 1\nclaim-protocol 1\n",
+        r#"{"format":"tensorfs.store/1"}"#,
+        r#"{"format":"tensorfs.store/4"}"#,
+        "not a format record",
+    ].into_iter().enumerate() {
+        let store = root.join(index.to_string());
+        std::fs::create_dir_all(store.join("pins")).unwrap();
+        std::fs::create_dir_all(store.join("repos/local")).unwrap();
+        std::fs::write(store.join("format"), record).unwrap();
+        std::fs::write(store.join("tensorfs.sqlite"), b"legacy catalog remains").unwrap();
+        std::fs::write(store.join("pins/kept.json"), b"retained root").unwrap();
+        std::fs::write(store.join("repos/local/kept.json"), b"persisted local model").unwrap();
+        let before = contents(&store);
+        let error = d10::store(&store, &mut Migrator::new(Access::from_env(), TABLE)).unwrap_err();
+        assert_eq!(error.kind, tensorfs::failure::Kind::Format);
+        assert!(error.detail.contains("this store was not changed"), "{error}");
+        assert_eq!(contents(&store), before, "an unsupported store changed");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn local_migration_refuses_incomplete_layout_before_dropping_pins() {
+    let root = migration_scratch("layout");
+    std::fs::create_dir(root.join("pins")).unwrap();
+    std::fs::write(root.join("format"), r#"{"format":"tensorfs.store/2"}"#).unwrap();
+    std::fs::write(root.join("pins/kept.json"), b"retained root").unwrap();
+    let before = contents(&root);
+    let error = d10::store(&root, &mut Migrator::new(Access::from_env(), TABLE)).unwrap_err();
+    assert_eq!(error.kind, tensorfs::failure::Kind::Format);
+    assert_eq!(contents(&root), before);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn local_migration_refuses_a_running_store_owner_without_changes() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/store-0.12");
+    let root = migration_scratch("owner");
+    copy(&fixture, &root);
+    std::fs::create_dir_all(root.join("pins")).unwrap();
+    std::fs::write(root.join("pins/kept.json"), b"retained root").unwrap();
+    let owner = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(root.join("owner.lock")).unwrap();
+    assert!(platform::lock::try_claim(&owner).unwrap());
+    let before = contents(&root);
+    let error = d10::store(&root, &mut Migrator::new(Access::from_env(), TABLE)).unwrap_err();
+    assert_eq!(error.kind, tensorfs::failure::Kind::Conflict);
+    assert!(error.detail.contains("stop its machine"), "{error}");
+    assert_eq!(contents(&root), before, "the running owner's store changed");
+    drop(owner);
+    std::fs::remove_dir_all(root).unwrap();
+}
