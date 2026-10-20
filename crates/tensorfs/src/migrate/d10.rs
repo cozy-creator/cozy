@@ -521,7 +521,11 @@ impl<'t> Migrator<'t> {
         let cbor = new.to_cbor()?;
         check(&chunks, &tensors, &new, &cbor, &bytes, &repo_files)?;
         let at = add(objects, cbor);
-        let mut report = json!({"old": manifest.id(), "header": at.id()});
+        let classes: serde_json::Map<String, Json> = (new.components().iter())
+            .filter(|c| !c.tensors.is_empty())
+            .map(|c| (c.name.clone(), json!([c.class.library, c.class.version, c.class.name])))
+            .collect();
+        let mut report = json!({"old": manifest.id(), "header": at.id(), "classes": classes});
         if !filled.is_empty() {
             report["filled"] = json!(filled);
         }
