@@ -59,6 +59,19 @@ pub struct SubmitRun {
     /// What the CLI noticed while binding the run (fields it dropped, …), kept with the run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<Warning>,
+    /// The quote a `new` run's renter agreed to (`POST /v1/run-quotes`): Calcifer refuses a `new`
+    /// run without one, and a dearer rental rents nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agreed: Option<Agreed>,
+}
+
+/// `POST /v1/run-quotes`: what a `new` run would rent, and its price.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunQuote {
+    pub sku: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpus: Option<u32>,
+    pub quote: Quote,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -896,6 +909,7 @@ mod tests {
     #[test]
     fn a_submission_round_trips_with_its_spec_and_unknown_fields_ignored() {
         let submit = SubmitRun {
+            agreed: None,
             on: On::New(Some("rtx-4090".into())),
             hub: "https://tensorhub.com".into(),
             kind: Kind::Warm,

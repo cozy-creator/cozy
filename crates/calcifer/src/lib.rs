@@ -217,10 +217,15 @@ impl Calcifer {
         key: &str,
         submit: SubmitRun,
     ) -> Result<Submitted, Error> {
+        // The same run asked again is the same submission whatever price it was quoted since.
+        let asked = SubmitRun {
+            agreed: None,
+            ..submit.clone()
+        };
         let digest = format!(
             "sha256:{}",
             hex::encode(Sha256::digest(
-                serde_json::to_vec(&submit).expect("serializes")
+                serde_json::to_vec(&asked).expect("serializes")
             ))
         );
         if !self.store.recorded(key)?
@@ -252,6 +257,7 @@ impl Calcifer {
             warnings: submit.warnings,
             inputs: vec![],
             wants,
+            agreed: submit.agreed,
         };
         let (me, key, given) = (self.clone(), key.to_owned(), submit.inputs);
         let (row, fresh) = tokio::task::spawn_blocking(move || {

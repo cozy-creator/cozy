@@ -508,6 +508,7 @@ pub fn package_run(dir: &Path, gate: &Path, big: u64) -> SubmitRun {
         ..Default::default()
     };
     SubmitRun {
+        agreed: None,
         on: On::Machine("m".into()),
         hub: String::new(),
         kind: Kind::Call,

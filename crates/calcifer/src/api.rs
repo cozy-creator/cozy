@@ -120,6 +120,7 @@ pub fn router(api: Arc<Api>) -> Router {
         .route("/v1/machines/{name}/keepalive", post(machines::keepalive))
         .route("/v1/machines/{name}/logs/{log}", get(machines::logs))
         .route("/v1/rental-quotes", post(machines::quote))
+        .route("/v1/run-quotes", post(machines::run_quote))
         // Routes go above this line: the bearer and the admission gate guard only those.
         .route_layer(middleware::from_fn_with_state(api.clone(), admit))
         .fallback(unknown_route)

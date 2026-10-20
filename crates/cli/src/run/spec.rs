@@ -154,6 +154,7 @@ impl Call<'_> {
             .into_iter()
             .collect();
         SubmitRun {
+            agreed: None,
             on,
             hub: hub.to_owned(),
             kind,

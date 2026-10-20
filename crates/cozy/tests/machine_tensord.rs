@@ -175,7 +175,7 @@ fn a_rental_runs_a_dev_binary_and_refuses_one_its_glibc_cannot_load() {
     let Some(home) = Home::with_hub() else { return };
     let (worker, version) = dev_binary();
     home.sign_in("tensord@cozy.test");
-    let rented = home.json(["machine", "rent", "cpu", "--detach", "--json"]);
+    let rented = home.json(["machine", "rent", "cpu", "--yes", "--detach", "--json"]);
     let id = rented["machine"]["rental_id"].as_str().unwrap().to_string();
     let update = |binary: &Path| {
         let binary = binary.to_str().unwrap();

@@ -335,6 +335,7 @@ async fn the_route_serves_a_landed_output_and_says_why_another_has_not_landed() 
         warnings: vec![],
         inputs: vec![],
         wants: None,
+        agreed: None,
     };
     store.submit("k", "sha256:k", new).unwrap();
     assert!(store.mark_sent(id.as_str(), "m").unwrap());
@@ -885,6 +886,7 @@ async fn every_output_ends_landed_kept_or_lost_and_a_checkpoint_waits_on_nothing
         warnings: vec![],
         inputs: vec![],
         wants: None,
+        agreed: None,
     };
     store.submit("kept", "sha256:kept", new).unwrap();
     assert!(store.mark_sent(kept.as_str(), "c").unwrap());

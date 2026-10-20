@@ -129,6 +129,7 @@ async fn install(ctx: &Context, hub: &str, on: On, local: &Local) -> Result<Inst
         ..Default::default()
     };
     let submission = SubmitRun {
+        agreed: None,
         on,
         hub: hub.to_owned(),
         kind: RunKind::Warm,
