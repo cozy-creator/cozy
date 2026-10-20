@@ -1289,26 +1289,8 @@
             "description": "An origin's private CA (DER, base64), when it has one.",
             "default": []
           },
-          "capability": {
-            "type": "string",
-            "description": "The owner's capability for this run's private operations (th-241): a compact JWS its\ndevice key signed for this machine's leaf (`cnf.jkt`) and the Hub's resource (`aud`),\nnaming each operation in `authorization_details`. The machine trades it once, at the run's\nfirst private operation, at `token_endpoint`. Empty: a public-only run.",
-            "default": ""
-          },
-          "object_hosts": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "The Hub's object-storage hosts downloads may follow.",
-            "default": []
-          },
           "origin": {
             "type": "string",
-            "default": ""
-          },
-          "token_endpoint": {
-            "type": "string",
-            "description": "The Hub's authorization server's, as its metadata names it.",
             "default": ""
           }
         }
@@ -1873,7 +1855,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/HubAccess",
-                "description": "Where the run reads, and its capability there."
+                "description": "The Hub the run reads."
               },
               {
                 "type": "null"
@@ -1921,7 +1903,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/ProviderAccess",
-                "description": "Provider tokens for source models, memory only like `hub`."
+                "description": "Provider tokens for source models, kept in memory only."
               },
               {
                 "type": "null"

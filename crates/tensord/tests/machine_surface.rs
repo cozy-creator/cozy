@@ -1403,7 +1403,7 @@ mod v1_api {
             source: Some(v1::Source::Release(v1::Release { package: format!("acme/{}", FIXTURE.1), release: release.into() })),
             models: vec![v1::ModelChoice { parameter: "model".into(), repository: "acme/weight".into(),
                 release: "1".into(), lane: "f32".into(), ..Default::default() }],
-            hub: Some(v1::HubAccess { origin: origin.clone(), object_hosts: vec!["localhost".into()], ..Default::default() }),
+            hub: Some(v1::HubAccess { origin: origin.clone(), ..Default::default() }),
             catalog_revision: "r1".into(),
             ..Default::default()
         };
@@ -1531,11 +1531,7 @@ mod v1_api {
                 v1::Source::Release(v1::Release { package: "acme/pkg".into(), release: release.into() })
             }),
             models: vec![v1::ModelChoice { parameter: "model".into(), ..choice }],
-            hub: Some(v1::HubAccess {
-                origin: origin.clone(),
-                object_hosts: vec!["localhost".into()],
-                ..Default::default()
-            }),
+            hub: Some(v1::HubAccess { origin: origin.clone(), ..Default::default() }),
             catalog_revision: revision.into(),
             owner: "alice".into(),
             ..Default::default()
@@ -1669,7 +1665,7 @@ mod v1_api {
                     lane: "bf16".into(),
                     ..Default::default()
                 }],
-                hub: Some(v1::HubAccess { origin: origins[at].clone(), object_hosts: vec!["localhost".into()], ..Default::default() }),
+                hub: Some(v1::HubAccess { origin: origins[at].clone(), ..Default::default() }),
                 owner: "alice".into(),
                 ..Default::default()
             };
@@ -2629,7 +2625,7 @@ mod v1_api {
                 source: Some(v1::Source::Release(v1::Release {
                     package: "acme/tensord-cpu-caller".into(), release: "0.1.0".into() })),
                 payload: raw(&serde_json::json!({"values": [3, 4], "counter": counter})),
-                hub: Some(v1::HubAccess { origin, object_hosts: vec!["localhost".into()], ..Default::default() }),
+                hub: Some(v1::HubAccess { origin, ..Default::default() }),
                 catalog_revision: "r1".into(),
                 ..Default::default()
             }),
