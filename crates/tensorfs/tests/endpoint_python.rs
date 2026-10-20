@@ -25,7 +25,7 @@ async fn public_python_api_uses_an_ordinary_owner_credential() {
     user.register_account(&account, &types::Empty(Default::default())).await.unwrap();
     let scratch = std::env::temp_dir().join(format!("tfs-python-api-{nonce}"));
     let request = json!({"endpoint": reach, "ca": ca, "model": format!("{account}/model"), "token": bearer.token, "cache_dir": scratch});
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensorfs/scripts/endpoint_user_api.py");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tensorfs-py/scripts/endpoint_user_api.py");
     let mut child = Command::new(python).arg("-I").arg(script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     child.stdin.take().unwrap().write_all(&serde_json::to_vec(&request).unwrap()).unwrap();
     let started = Instant::now();
