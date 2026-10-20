@@ -194,6 +194,8 @@ def short(exc: BaseException, first: bool = False) -> int | None:
     """The bytes a device allocation failure asked for (0: not said); None for any other. A
     `first` failure counts a cuBLAS or cuDNN status too (its own allocation may be behind it): it
     runs once more with room made, and a second is the library's own."""
+    if type(exc).__module__ == "tensorfs.varena" and getattr(exc, "code", None) == "DEVICE_FULL":
+        return int(getattr(exc, "deficit", getattr(exc, "need", 0)))
     if isinstance(exc, torch.OutOfMemoryError):
         found = _ALLOCATE.search(str(exc))
         return int(float(found[1]) * _UNITS[found[2]]) if found else 0

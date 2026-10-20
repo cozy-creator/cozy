@@ -261,6 +261,41 @@ pub enum Action {
 type Distance = (u32, u32);
 
 impl Table {
+    pub fn speculative_budget(&self, request: RequestId) -> Option<u64> {
+        let request = self.request(request)?;
+        if request.starved {
+            return Some(0);
+        }
+        let reclaim = self
+            .pages
+            .iter()
+            .filter(|page| {
+                page.mapped()
+                    && (self.class(page) == Class::Orphan
+                        || (page.row == request.row
+                            && matches!(self.class(page), Class::Free | Class::Unused)))
+            })
+            .try_fold(0_u64, |sum, page| sum.checked_add(page.bytes))?;
+        let budget = self
+            .capacity
+            .saturating_sub(self.occupied()?.saturating_sub(reclaim))
+            .saturating_sub(self.protected_room()?);
+        let own = self
+            .pages
+            .iter()
+            .filter(|page| {
+                page.mapped()
+                    && page.row == request.row
+                    && !matches!(self.class(page), Class::Free | Class::Unused)
+            })
+            .try_fold(0_u64, |sum, page| sum.checked_add(page.bytes))?;
+        Some(
+            request
+                .sharing_limit
+                .map_or(budget, |limit| budget.min(limit.saturating_sub(own))),
+        )
+    }
+
     pub fn request(&self, id: RequestId) -> Option<&Request> {
         self.requests.iter().find(|request| request.id == id)
     }
