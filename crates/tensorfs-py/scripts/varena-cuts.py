@@ -215,7 +215,8 @@ def relax() -> None:
 
 def plans() -> None:
     """Planning's one cut: an FFN's tokens in the fewest pieces whose saving covers the bytes
-    short; none when no piece count can, or the shape measured a cut no lower than whole."""
+    short, else as far as a doubling still saves a block; none once an FFN cut measured no
+    lower than whole."""
     ff = FeedForward(64, mult=4, activation_fn="gelu").eval()
     cuts.install(ff)
     memo, _, _ = fresh(1 << 40)
@@ -225,11 +226,18 @@ def plans() -> None:
         cuts.run(s, ff, (torch.randn(1, 300, 64),), {})
     key = max(shape.units, key=lambda k: shape.units[k] * shape.scopes[k][0])
     unit, total = shape.units[key], shape.scopes[key][0]
-    planned = cuts.planned(shape, unit * (total - total // 4) - 1)
-    check("planning cuts an FFN to the fewest pieces that cover it", planned and memo.sizes[key] == 75)
-    check("no piece count covers more than the FFN holds", not cuts.planned(shape, unit * total))
+    saved = cuts.planned(shape, unit * (total - total // 4) - 1, 1)
+    check("planning cuts an FFN to the fewest pieces that cover it", saved and memo.sizes[key] == 75)
+    del memo.sizes[key]
+    block = unit * total // 8
+    saved = cuts.planned(shape, unit * total, block)
+    check(
+        "short of more than the FFN holds, it cuts while a doubling saves a block",
+        memo.sizes[key] == 75 and saved == unit * (total - 75),
+        (memo.sizes[key], saved),
+    )
     shape.whole_only = True
-    check("a shape whose cut was no lower than whole is never cut again", not cuts.planned(shape, 1))
+    check("a shape whose cut was no lower than whole is never cut again", not cuts.planned(shape, 1, 1))
 
 
 def swapped() -> None:
