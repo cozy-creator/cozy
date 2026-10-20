@@ -1,19 +1,20 @@
 # Model descriptions in cozytensors: design exploration
 
-Status: proposal, 2026-10-19. This does not change the stored format, current
+Status: deferred research, 2026-10-19. The user questioned the need and cost of
+additional model contracts and computation graphs. None is current implementation
+scope or a release requirement. This does not change the stored format, current
 Python/Rust interfaces, or the TensorFS build being qualified.
 
-## Recommendation
+## Current decision
 
-Prototype a small, framework-independent, versioned model contract for one
-architecture that has two real consumers. Keep one canonical parameter layout
-per version and use the existing import/read machinery. Do not add a per-file
-tensor transformation language or a universal graph executor to TensorFS.
+Keep the existing class/config/component description, explicit tensor encodings
+and tested source importers. Finish the already planned storage, loading and
+writing work. Do not add a new architecture registry, model-contract adapter,
+computation graph or inference engine to this work.
 
-The prototype must prove more than preserving a class name: an independent
-consumer must recover the parameters' mathematical roles, configuration and
-axis conventions without importing the producer's Python model class. Only
-then should the contract become part of the normative format.
+The alternatives below remain background research. Revisit them if a concrete
+consumer needs functionality the existing design cannot provide. Any future
+prototype would need to demonstrate its benefit before changing the format.
 
 ## Three alternatives
 
