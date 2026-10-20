@@ -767,7 +767,7 @@ class Memory:
             spare = self.core.stats()  # type: ignore[union-attr]
             room = self.available() + spare.idle + spare.slot_bytes
             room += _set(model)[0] - model.common.nbytes
-            if repeating:  # and what other processes give back on an ask
+            if repeating:  # and what idle tenants give back on an ask
                 keep = self._keep(model)
                 cold = (m for m in self.models.values() if self._victim(m))
                 room += sum(_set(m)[0] for m in cold if self._keep(m) < keep) + self._others()
@@ -998,12 +998,13 @@ class Memory:
         return max(self._free() - before, 0)
 
     def _others(self) -> int:
-        """What other live rows can give on an ask (§5.6: their cold weights, slack, caches)."""
+        """What idle tenants can give on an ask (§5.6: their cold weights, slack, caches): rows
+        running nothing, so planning never counts on another request's pages."""
         if self.row is None:
             return 0
         table, row = self.row
-        live = (f for f in table.snapshot() if f.state == "live" and f.slot != row.id)
-        return sum(f.reclaimable for f in live)
+        idle = (f for f in table.snapshot() if f.state == "live" and f.slot != row.id)
+        return sum(f.reclaimable for f in idle if not f.running)
 
     def _landed(self, model: Model) -> None:
         """Demand outranks a prefetch: copies still landing hold pages no eviction may take, so
