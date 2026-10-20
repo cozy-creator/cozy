@@ -138,6 +138,17 @@ impl Live {
             // An empty reason: it no longer waits.
             Event::Waiting { reason } => self.run.waiting = Some(reason).filter(|r| !r.is_empty()),
             Event::OutputAdded { item, .. } | Event::OutputDone { item, .. } => self.output(item),
+            Event::OutputDelta {
+                item_id,
+                rev,
+                checkpoint: Some(checkpoint),
+                ..
+            } => {
+                if let Some(item) = self.run.output.iter_mut().find(|item| item.id == item_id) {
+                    item.rev = rev;
+                    item.checkpoint = Some(checkpoint);
+                }
+            }
             Event::Log { text, .. } => {
                 self.logs.push_back(text);
                 if self.logs.len() > LOG {

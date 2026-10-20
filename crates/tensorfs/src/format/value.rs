@@ -1,4 +1,5 @@
-//! Free-form values for metadata and scheme params: no null, integers only, codec-agnostic.
+//! Free-form values for metadata and scheme params (no null, integers only), and config values
+//! (parsed JSON). Codec-agnostic.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -137,3 +138,9 @@ impl<'de> Visitor<'de> for ValueVisitor {
         Ok(Value::Map(out))
     }
 }
+
+/// A config's value: parsed JSON, so also floats (finite) and null, which only configs hold.
+pub type ConfigValue = serde_json::Value;
+
+/// A structured config: `config.json` as parsed JSON, never a file.
+pub type Config = serde_json::Map<String, ConfigValue>;
