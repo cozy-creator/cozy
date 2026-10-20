@@ -8,7 +8,7 @@ use std::{
     process::ExitCode,
 };
 
-use platform::service::Services;
+use platform::{process, service::Services};
 use protocol::{
     calcifer::{MachineKind, MachineState},
     error::{Error, Kind},
@@ -95,7 +95,10 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
 
     machine::end(ctx, &root)?;
     if let Some((calcifer, _)) = calcifer {
+        let tree = calcifer.holder().map_or(vec![], |h| process::tree(h.pid));
         calcifer.stop().await?;
+        process::end_tree(&tree)
+            .map_err(|e| Error::new(Kind::Unavailable, "calcifer_stop_failed", e.to_string()))?;
     }
     let services = Services::new(&ctx.home, &ctx.user_home);
     if services.available() {

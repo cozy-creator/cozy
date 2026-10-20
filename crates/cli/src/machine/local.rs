@@ -279,15 +279,24 @@ pub(crate) fn root_and_store(ctx: &Context) -> Result<(PathBuf, Option<PathBuf>)
     Ok((root, store))
 }
 
-/// For `cozy uninstall`: ends the machine now, with whatever it runs, and removes its service.
+/// For `cozy uninstall`: ends the machine now, with whatever it runs, removes its service, and
+/// waits until every process it was has exited.
 pub(crate) fn end(ctx: &Context, root: &Path) -> Result<(), Error> {
+    let holder = LockFile::new(root.join("var/lib/cozy/machine/agent.lock")).holder();
+    let birth = holder
+        .ok()
+        .flatten()
+        .and_then(|record| serde_json::from_slice::<platform::process::Birth>(&record).ok());
+    let tree = (birth.filter(|_| !free(root))).map_or(vec![], |b| platform::process::tree(b.pid));
     let services = services(ctx);
     if services.available() {
         services
             .uninstall(SERVICE)
             .map_err(|e| service_error("machine_stop_failed", e))?;
     }
-    end_detached(root)
+    end_detached(root)?;
+    platform::process::end_tree(&tree)
+        .map_err(|e| Error::new(Kind::Unavailable, "machine_stop_failed", e.to_string()))
 }
 
 /// Whether nothing holds the machine's root: no machine has run there, or none runs now.
