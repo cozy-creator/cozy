@@ -75,7 +75,7 @@ value = unet.tensors.read("conv_in.weight")
 print(unet.cls, info.dtype, info.shape, value.nbytes)
 ```
 
-`read` and `read_all` return DLPack arrays; `decode=False` returns stored encoded parts. Frameworks wrap arrays
+`read` returns one DLPack array for a name, or a dictionary for a list of names or the whole component; `decode=False` returns stored encoded parts. Frameworks wrap arrays
 through their DLPack entry point. `component.config` is structured JSON, `component.asset(name)` reads an asset,
 and `component.path` renders the config and assets for a path-only tokenizer or model loader.
 

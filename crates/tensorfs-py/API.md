@@ -96,18 +96,25 @@ key raises `KeyError`; `get` returns its default.
 
 The returned `TensorMetadata` describes the whole tensor: its logical `dtype`, `shape`
 and optional `encoding`. It contains metadata, not tensor values. Inspect its shape/dtype,
-then call `read` or `read_all`. Physical chunk locations and byte offsets are internal.
+then call `read`. Physical chunk locations and byte offsets are internal.
 
 ### Read a tensor, or a component's weights
 
 ```python
 weight = unet.tensors.read("conv_in.weight")
-weights = unet.tensors.read_all()
-selected = unet.tensors.read_all(["conv_in.weight", "conv_in.bias"])
+weights = unet.tensors.read()
+selected = unet.tensors.read(["conv_in.weight", "conv_in.bias"])
 ```
 
-`read` returns CPU data. `read_all(keys=None, device="cpu", decode=True)` returns a
-name-to-value dictionary and also accepts `device="cuda"` or `device="cuda:N"`.
+`read(keys=None, device="cpu", decode=True)` accepts a tensor name, a sequence of
+names, or no selection. A single name returns one value; a sequence returns a name-to-value
+dictionary; no selection (or `None`) reads every tensor in this component. An empty list
+returns an empty dictionary without fetching data. Explicit selections keep the requested
+order, with duplicate names included once; an all-tensor read uses construction order.
+An unknown name raises `KeyError`.
+
+All forms accept `device="cpu"` (the default), `device="cuda"` or `device="cuda:N"`,
+and the same `decode` option.
 
 A decoded value is an `Array`, with `dtype`, `shape`, `nbytes` and `tobytes()`. To hand an
 array to a framework, use DLPack:
@@ -116,7 +123,7 @@ array to a framework, use DLPack:
 import torch
 
 torch_weight = torch.from_dlpack(weight)
-gpu_weights = unet.tensors.read_all(device="cuda:0")
+gpu_weights = unet.tensors.read(device="cuda:0")
 state_dict = {name: torch.from_dlpack(value) for name, value in gpu_weights.items()}
 ```
 
