@@ -1,12 +1,8 @@
-//! varena: the memory of the process computing with model weights.
+//! GPU placement follows Runtime-declared plans through one decision procedure.
 //!
-//! `memory` places a weight set's regions on a GPU (home pages, scratch slots, pins as tensor
-//! lifetimes, eviction of what nothing uses); `Host` serves them from host memory where there
-//! is no GPU. The host tier (`host`, `window`) is the machine's: sealed memfds a TensorD fills
-//! and executors adopt read-only. `tensorfs` owns parsing, source custody and every host/device byte transfer.
-//!
-//! The host tier is Linux-only and answers [`Error::Unsupported`] elsewhere. On Windows the
-//! crate is empty until its tier exists (xs-043 unit WM).
+//! `plan` decides; `placement` applies decisions; `gpu` owns mappings and pins;
+//! `ledger` shares measured facts, wakeups and read-only page custody with TensorD.
+//! TensorFS owns layout interpretation, source custody and every byte transfer.
 #![cfg(unix)]
 
 pub use tensorfs::io::{cuda, metrics as ceiling};
