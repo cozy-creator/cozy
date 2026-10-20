@@ -253,6 +253,17 @@ impl Placement {
             }
         };
         let row = Arc::new(ledger.claim(std::process::id())?);
+        // NVML inventory may include driver-reserved bytes absent from CUDA's
+        // usable total. Correct the one shared ceiling after the fork boundary,
+        // before this owner can register pages or publish an allocator budget.
+        let before = ledger.capacity();
+        let usable = gpu.capacity()?;
+        let capacity = ledger.limit_capacity(usable)?;
+        if capacity < before {
+            tracing::info!(gpu = %gpu.uuid()?, previous_limit_bytes = before,
+                cuda_usable_bytes = usable, effective_limit_bytes = capacity,
+                "GPU memory capacity corrected");
+        }
         let channel = Arc::new(Channel::new(channel));
         channel.bind(row.owner())?;
         let owner = row.owner().row;

@@ -429,19 +429,26 @@ impl Ledger {
         if table.shared().header.magic.load(Acquire) != MAGIC {
             return Err(Error::Invalid("ledger protocol differs".into()));
         }
-        if table.shared().header.capacity.load(Acquire) != capacity {
-            if table.rows()?.iter().any(|row| row.state == State::Live) {
+        let current = table.shared().header.capacity.load(Acquire);
+        if current != capacity {
+            let live = table.rows()?.iter().any(|row| row.state == State::Live);
+            if live && capacity < current {
                 return Err(Error::Invalid(
-                    "cannot change a GPU cap while an executor owns a row".into(),
+                    "cannot lower a GPU cap while an executor owns a row".into(),
                 ));
             }
-            table.shared().header.capacity.store(capacity, Release);
-            // Cuts and resident targets were measured under the old limit.
-            // The first request under the new cap must establish its own peak.
-            for peak in &table.shared().peaks {
-                peak.state.store(0, Release);
+            // A child may have discovered less CUDA-usable memory than NVML's
+            // inventory total. A coordinator reopening beside live rows retains
+            // that correction; raising a cap still requires a drained generation.
+            if !live {
+                table.shared().header.capacity.store(capacity, Release);
+                // Cuts and resident targets were measured under the old limit.
+                // The first request under the new cap must establish its own peak.
+                for peak in &table.shared().peaks {
+                    peak.state.store(0, Release);
+                }
+                table.changed();
             }
-            table.changed();
         }
         shm::region_lock(
             table.file.as_fd(),
@@ -511,6 +518,37 @@ impl Ledger {
     }
     pub fn capacity(&self) -> u64 {
         self.table.shared().header.capacity.load(Acquire)
+    }
+    /// Reduce the shared ceiling to this device's usable total. CUDA is queried by
+    /// the child before this call; no per-process reserve or second authority is stored.
+    pub fn limit_capacity(&self, capacity: u64) -> Result<u64> {
+        if capacity == 0 {
+            return Err(Error::Invalid("GPU usable capacity is zero".into()));
+        }
+        // Serialize against coordinator initialization, which may replace an idle
+        // table's cap. Placement already owns its row before calling this method.
+        let lock = shm::reopen(self.fd(), true).map_err(crate::os("open capacity lock"))?;
+        shm::region_lock(lock.as_fd(), 0, size_of::<Header>(), Region::Write, true)
+            .map_err(crate::os("lock capacity"))?;
+        let before = self
+            .table
+            .shared()
+            .header
+            .capacity
+            .fetch_min(capacity, AcqRel);
+        drop(lock);
+        if capacity < before {
+            // Owner workers sleep on their row bells; TensorD's eventfd bridge
+            // sleeps on the header. Wake both without manufacturing reclaim asks.
+            for slot in &self.table.shared().rows {
+                if slot.state.load(Acquire) & 3 == LIVE {
+                    slot.bell.fetch_add(1, Release);
+                    wake(&slot.bell);
+                }
+            }
+            self.table.changed();
+        }
+        Ok(before.min(capacity))
     }
     /// A private rank channel created before the rank process exists. Its first bind pins
     /// one live row generation; no later message may name a different owner.

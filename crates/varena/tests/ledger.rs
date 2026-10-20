@@ -165,6 +165,16 @@ fn child() {
                 .unwrap();
                 println!("@ok");
             }
+            "limit" => {
+                let capacity = args[1].parse().unwrap();
+                println!("@{}", ledger.limit_capacity(capacity).unwrap());
+            }
+            "capacity" => println!("@{}", ledger.capacity()),
+            "capacity_event" => {
+                row.wait_event(&mut 0, &std::sync::atomic::AtomicBool::new(false))
+                    .unwrap();
+                println!("@{}", ledger.capacity());
+            }
             "running" => {
                 let left = args[1].parse().ok();
                 row.publish(
@@ -330,6 +340,68 @@ fn a_new_cap_requires_every_executor_to_release_its_claim() {
     assert_eq!(resized.capacity(), CAPACITY / 2);
     assert_eq!(fixture.ledger.capacity(), CAPACITY / 2);
     assert!(resized.peaks().is_empty());
+}
+
+#[test]
+fn a_child_corrects_shared_capacity_and_wakes_owners_and_admission() {
+    let fixture = Fixture::new();
+    let mut owner = ChildRow::spawn(&fixture.ledger);
+    let mut correcting = ChildRow::spawn(&fixture.ledger);
+    fixture.ledger.record_peak("package", "shape", 400).unwrap();
+    owner.call("running 500");
+    assert!(fixture.ledger.fits("package", "shape").unwrap());
+
+    // Its event bridge starts after all earlier publications, so this eventfd
+    // wake must follow the child's clamp rather than an earlier snapshot.
+    let reopened = Ledger::create(&fixture.name, CAPACITY).unwrap();
+    owner.send("capacity_event");
+    assert_eq!(correcting.call("limit 900"), "900");
+    let mut ready = libc::pollfd {
+        fd: owner.output.get_ref().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(unsafe { libc::poll(&mut ready, 1, 3000) }, 1, "owner wake");
+    assert_eq!(
+        owner.reply(),
+        "900",
+        "an existing owner missed its row wake"
+    );
+    let mut poll = libc::pollfd {
+        fd: reopened.events().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(unsafe { libc::poll(&mut poll, 1, 3000) }, 1);
+    assert_eq!(fixture.ledger.capacity(), 900);
+    assert_eq!(reopened.status().unwrap().capacity, 900);
+    assert!(!reopened.fits("package", "shape").unwrap());
+    assert_eq!(owner.call("capacity"), "900");
+
+    // Different ranks observe one usable total, not one deduction per process.
+    assert_eq!(owner.call("limit 900"), "900");
+    assert_eq!(correcting.call("limit 1024"), "900");
+    let restarted = Ledger::create(&fixture.name, CAPACITY).unwrap();
+    assert_eq!(restarted.capacity(), 900);
+    assert_eq!(restarted.peaks(), vec![("package|shape".into(), 400)]);
+    assert!(Ledger::create(&fixture.name, 800).is_err());
+    assert!(fixture.ledger.limit_capacity(0).is_err());
+    assert_eq!(fixture.ledger.capacity(), 900);
+}
+
+#[test]
+fn usable_capacity_preserves_a_smaller_authorized_cap() {
+    let fixture = Fixture::new();
+    let capped = Ledger::create(&fixture.name, CAPACITY / 2).unwrap();
+    let mut owner = ChildRow::spawn(&capped);
+    capped.record_peak("package", "shape", 400).unwrap();
+    assert_eq!(owner.call("limit 900"), "512");
+    assert_eq!(fixture.ledger.capacity(), 512);
+    assert_eq!(capped.peaks(), vec![("package|shape".into(), 400)]);
+    drop(owner);
+    let raised = Ledger::create(&fixture.name, CAPACITY).unwrap();
+    assert_eq!(raised.capacity(), CAPACITY);
+    assert!(raised.peaks().is_empty());
 }
 
 #[test]
