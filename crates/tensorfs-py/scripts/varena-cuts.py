@@ -178,7 +178,9 @@ def ffn_cut() -> None:
 
 def relax() -> None:
     """Planning relaxes a cut (`cuts.coarser`): never run uncut, twice its size a step needing
-    twice its peak, back to whole; run uncut before, whole at once needing that peak."""
+    the peak plus its FFN bytes per token over the tokens it adds, back to whole, which forgets
+    the size (a prompt two tokens longer runs whole, 12288); a cut measured beside whole bounds
+    those bytes; run uncut before, whole at once needing that peak."""
     torch.manual_seed(0)
     x = torch.randn(2, 300, 64)
     ff = FeedForward(64, mult=4, activation_fn="gelu").eval()
@@ -190,23 +192,34 @@ def relax() -> None:
     with card, torch.no_grad():
         out = cuts.run(s, ff, (x,), {})
     cut = {k: v for k, v in memo.sizes.items() if k[0] == "ffn"}
+    total = {k: shape.scopes[k][0] for k in cut}
+    step = lambda t, v: -(-t // ((-(-t // v) + 1) // 2))  # noqa: E731  (half the pieces)
+    grow = sum(shape.units[k] * (step(total[k], v) - v) for k, v in cut.items() if v < total[k])
     needs, steps, doubled = [cuts.relaxing(shape, 10)], 0, True
     while needs[-1] is not None:
-        before = {k: memo.sizes[k] for k in cut}
+        before = {k: memo.sizes.get(k, total[k]) for k in cut}
         cuts.coarser(shape)
-        doubled &= all(memo.sizes[k] <= 2 * v for k, v in before.items())
+        doubled &= all(memo.sizes.get(k, total[k]) <= 2 * v for k, v in before.items())
         steps += 1
         needs.append(cuts.relaxing(shape, 10))
-    relaxed = all(memo.sizes[k] >= shape.scopes[k][0] for k in cut)  # each scope's whole
+    relaxed = not any(k in memo.sizes for k in cut)  # each scope's whole, no size left
     check("a cut relaxes back to whole", same(out, whole) and cut and relaxed, (cut, memo.sizes))
-    doubled &= needs[0] == 20
-    check("never uncut, a step doubles at most, needing twice the peak", steps and doubled, needs)
-    cuts.peaked(s.track, 7)  # a pass ran uncut: its peak is the shape's whole
+    doubled &= grow > 0 and needs[0] == 10 + grow
+    check("never uncut, a step doubles at most, needing its FFN units more", steps and doubled, needs)
+    with torch.no_grad():
+        longer = cuts.run(s, ff, (torch.randn(2, 302, 64),), {})
+    check("relaxed whole, a shape 2 tokens longer runs uncut", cuts.relaxing(shape, 10) is None
+          and not shape.cuts and longer.shape == (2, 302, 64), (memo.sizes, shape.cuts))  # fmt: skip
+    cuts.peaked(s.track, 7 << 20)  # a pass ran uncut: its peak is the shape's whole
+    outer = next(k for k in cut if k[1] == "FeedForward")
+    memo.sizes[outer] = cut[outer]  # one FFN cut, measured to free 10 B a token
+    cuts.peaked(s.track, (7 << 20) - 10 * (shape.scopes[outer][0] - cut[outer]))
+    check("a cut's measured saving bounds its FFN's bytes per token", shape.units[outer] == 10, shape.units)
     memo.sizes.update(cut)
     need = cuts.relaxing(shape, 3)
     cuts.coarser(shape)
-    at_once = all(memo.sizes[k] >= shape.scopes[k][0] for k in cut) and shape.peak == -1
-    check("run uncut before, it relaxes whole at once, needing that peak", need == 7 and at_once)
+    at_once = not any(k in memo.sizes for k in cut) and shape.peak == -1
+    check("run uncut before, it relaxes whole at once, needing that peak", need == 7 << 20 and at_once)
     seen = weakref.ref(x)
     del x
     gc.collect()
