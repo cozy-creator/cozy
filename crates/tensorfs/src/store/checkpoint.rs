@@ -7,7 +7,6 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{fail, invalid, Error, Result, Store};
 use super::retention::{self, DirectoryGuard, Retention};
@@ -36,18 +35,6 @@ enum Objects {
     Store(Store),
     /// A plain folder's `chunks/<sha256>`, else the cache.
     Folder { dir: PathBuf, cache: Option<Store> },
-}
-
-fn write_view(path: &Path, bytes: &[u8]) -> Result<()> {
-    if path.is_file() {
-        return Ok(());
-    }
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let parent = path.parent().expect("a view file has a parent");
-    fs::create_dir_all(parent).map_err(fail("create", parent))?;
-    let temp = parent.join(format!(".view-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-    fs::write(&temp, bytes).map_err(fail("write", &temp))?;
-    fs::rename(&temp, path).map_err(fail("rename", path))
 }
 
 fn cached_directory(store: &Store, dir: &Path) -> Result<Option<DirectoryGuard>> {
@@ -196,16 +183,6 @@ impl Checkpoint {
         Err(Error::Absent(object.sha256.clone()))
     }
 
-    /// Inspect the header and selected components' complete chunks/assets locally.
-    /// An empty selection still checks the header. No data is fetched or changed.
-    pub fn verify_selected(&self, components: Option<&[String]>) -> crate::Result<crate::VerificationReport> {
-        let objects = match components {
-            Some(components) => wanted(&self.header, Some(components))?,
-            None => self.header.objects().cloned().collect(),
-        };
-        crate::verification::verify(self, objects)
-    }
-
     /// Hash the actual header file and closure without changing them. Missing or corrupt
     /// objects are returned; other filesystem errors remain errors.
     pub fn verify(&self) -> Result<Vec<ObjectRef>> {
@@ -257,29 +234,6 @@ impl Checkpoint {
                 Ok(dir)
             }
         }
-    }
-
-    /// The rendered config and assets for a path-only model loader.
-    pub fn component_path(&self, name: &str) -> Result<PathBuf> {
-        let c = self.component(name)?;
-        let root = match &self.objects {
-            Objects::Store(store) | Objects::Folder { cache: Some(store), .. } => store.root().to_path_buf(),
-            Objects::Folder { dir, .. } => dir.join("chunks"),
-        };
-        let entry = root.join("views").join(&self.id.sha256);
-        if let Some(store) = self.store() { store.cache_snapshot(&entry)?; }
-        let dir = entry.join(name);
-        fs::create_dir_all(&dir).map_err(fail("create", &dir))?;
-        let config = dir.join(c.config_file.as_deref().unwrap_or("config.json"));
-        let bytes = serde_json::to_vec(&c.config).map_err(|e| invalid(&config, e.to_string()))?;
-        write_view(&config, &bytes)?;
-        for name in c.assets.keys() {
-            write_view(&dir.join(name), &self.asset(&c.name, name)?)?;
-        }
-        if let Some(store) = self.store() {
-            store.cache_snapshot(&entry)?;
-        }
-        Ok(dir)
     }
 
     /// Export only a component's config and support files to the caller's directory.
