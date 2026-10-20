@@ -6,7 +6,7 @@ pub mod policy;
 #[cfg_attr(not(unix), path = "slim_off.rs")]
 pub mod slim;
 
-use policy::{Facts, Gpu, Holding, Step};
+use policy::{Facts, Gpu};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -80,28 +80,11 @@ impl GpuMemory {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
-    pub fn fits(&self, plan: &str, _: impl Fn() -> Vec<Holding>) -> bool {
+    pub fn fits(&self, plan: &str) -> bool {
         self.placement.as_ref().is_some_and(|m| {
             m.fits(plan, &self.with(|g| g.shape_key(plan).to_owned()))
                 .unwrap_or(false)
         })
-    }
-    pub fn admits(&self, plan: &str, holdings: impl Fn() -> Vec<Holding>) -> bool {
-        self.fits(plan, holdings)
-    }
-    pub fn admit_member(
-        &self,
-        plan: &str,
-        _: bool,
-        holdings: impl Fn() -> Vec<Holding>,
-        _: impl FnMut(&Step) -> std::io::Result<bool>,
-    ) -> std::io::Result<Option<Option<u64>>> {
-        Ok(self.fits(plan, holdings).then(|| self.capacity()))
-    }
-    pub fn learn_holding(&self, plan: &str, id: &str) {
-        self.with(|g| {
-            g.learned.holding(plan, policy::holding_name(id));
-        });
     }
     fn measured(&self, change: impl FnOnce(&mut learned::Learned)) {
         self.with(|g| {
