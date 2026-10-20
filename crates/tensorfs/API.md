@@ -19,7 +19,7 @@ The [temporary type-declaration dump](API-TYPES.md) is available for signature a
 Inside an async Rust function, create one client and reuse it:
 
 ```rust
-use tensorfs::{Client, Config, Fetch, Open, Selection};
+use tensorfs::{Client, Config, Download, Open, Selection};
 
 let client = Client::new(Config::from_env())?;
 let checkpoint = client.open("me/model", &Open {
@@ -28,7 +28,7 @@ let checkpoint = client.open("me/model", &Open {
     ..Default::default()
 }).await?;
 
-checkpoint.fetch(&Fetch {
+checkpoint.download(&Download {
     selection: Selection::Components(vec!["unet".into()]),
     ..Default::default()
 }).await?;
@@ -38,10 +38,15 @@ let bytes = unet.read("conv_in.weight")?;
 println!("{} bytes", bytes.len());
 ```
 
-`Client::open` also accepts a local folder or immutable reference. It returns a checkpoint
-with metadata and source access. Rust network operations use your runtime: explicitly fetch
-before synchronous `read`, `asset`, `chunk` or `folder` operations. There is no hidden core
-Tokio runtime.
+`Client::open` also accepts a local .cozytensors file, a portable folder, or an immutable
+reference. The default `Open { lazy: true, .. }` loads metadata and retains source access.
+Set `lazy: false` to wait until the checkpoint's declared chunks and component assets are
+available locally before returning. This does not unpack weights, load a GPU or create a
+snapshot folder.
+
+Rust network operations use your runtime. With a lazy checkpoint, call `download` for
+the required selection before synchronous `read`, `asset`, `chunk` or `export_files`
+operations. There is no hidden core Tokio runtime.
 
 A borrowed component follows Rust's ordinary borrow rules. Clone the `Component` if it
 must outlive the parent checkpoint; owned child handles retain their source and data holds.
@@ -53,8 +58,7 @@ use std::path::Path;
 use tensorfs::{Dtype, WriterOptions};
 
 let mut writer = client.writer(WriterOptions {
-    dest: Some(Path::new("./output")),
-    variant: Some("f32"),
+    dest: Some(Path::new("./model.cozytensors")),
     ..Default::default()
 })?;
 let bytes: Vec<u8> = [1.0_f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -67,6 +71,21 @@ let saved = writer.commit().await?;
 println!("saved {}", saved.id().id());
 ```
 
+A file destination writes only the header; data is retained in the shared content-addressed
+store before the header is atomically published. Store roots and endpoint configuration are
+not embedded as paths in the file. A native portable export writes a complete folder with
+chunks; ordinary file saving does not.
+
+`dest` is the exact filename; TensorFS does not append a variant or create a directory.
+Leave `variant` unset for a file destination. Variant labels belong to repository trees;
+setting both `dest` and `variant` is invalid. With no destination, the writer retains the
+checkpoint in the shared store and may assign a repository variant.
+
+A standalone header identifies one checkpoint. It does not contain its enclosing tree,
+release label, README or LICENSE. Moving or copying it preserves that checkpoint identity;
+repository context is available only when separately known. Deleting or replacing the
+file does not release its saved data automatically.
+
 The component borrows its writer while being filled. `commit(&mut self)` is async for both
 local and remote writes. After an upload failure, `writer.committed()` can return the strong
 local checkpoint; the operation still returns an error. Successful publication records the
@@ -75,31 +94,38 @@ exact remote tree.
 | Client operation | Inputs and result |
 |---|---|
 | `Client::new(config)` | Validate configuration and create a reusable client; returns `Result<Client>`. |
-| `open(name_or_path, &Open)` | Metadata/source access; returns `Result<Checkpoint>`. |
-| `snapshot_download(&Ref, &Fetch, local_dir, local_files_only)` | Fetch/materialize selected repository content; returns `Result<PathBuf>`. |
-| `hub_download(&Ref, filename, local_dir, local_files_only)` | Fetch one repository file; returns `Result<PathBuf>`. |
+| `open(name_or_path, &Open)` | Open metadata, optionally waiting for all checkpoint data with `lazy: false`; returns `Result<Checkpoint>`. |
+| `materialize(&Ref, &Download, local_dir, local_files_only)` | Make selected repository content available as a normal folder; returns `Result<PathBuf>`. |
+| `download_file(&Ref, filename, local_dir, local_files_only)` | Fetch one repository file; returns `Result<PathBuf>`. |
 | `upload_folder(&Ref, folder, progress)` | Publish the folder; returns `Result<ObjectRef>`. |
-| `convert(&[String], &Convert)` | Convert pinned sources; returns `Result<Checkpoint>`. |
-| `resolve_source(source)` | Resolve an upstream source; returns `Result<String>`. |
+| `convert_to_cozytensors(&[String], &Convert)` | Convert pinned sources; returns `Result<Checkpoint>`. |
 | `writer(WriterOptions)` | Begin a write; returns `Result<Writer>`. |
 
 For example, parse a repository reference and use the returned folder or tree:
 
 ```rust
-use tensorfs::Ref;
+use tensorfs::{Format, Ref};
 
 let model: Ref = "me/model@1.0/bf16".parse()?;
-let folder = client.snapshot_download(&model, &Fetch::default(), None, false).await?;
+let folder = client.materialize(&model, &Download::default(), None, false).await?;
 println!("downloaded to {}", folder.display());
 
+saved.materialize(Path::new("./portable"), Format::Cozytensors, None).await?;
 let destination: Ref = "me/output".parse()?;
-let tree = client.upload_folder(&destination, Path::new("./output"), None).await?;
+let tree = client.upload_folder(&destination, Path::new("./portable"), None).await?;
 println!("published {}", tree.id());
 ```
 
+Checkpoint materialization includes that checkpoint and any known repository files.
+Use `Client::materialize` for an entire native repository, including all variants when no
+variant is selected. A standalone header cannot supply unknown repository files or release
+metadata.
+
 All operations involving network/source resolution above are async except construction and
-`writer`. Export uses `tensorfs::export(&checkpoint, directory, Format::Safetensors,
-dequantize)` and returns `Result<Vec<String>>`; ensure required bytes are available first.
+`writer`. `checkpoint.materialize(directory, format, dequantize).await` returns
+`Result<PathBuf>`; choose `Format::Safetensors` or `Format::Cozytensors`. It first makes
+the required checkpoint data and known repository files available, then writes the folder.
+Missing or denied source objects fail the operation.
 
 A `Writer` also has `pipeline(class, config)`, `component(name, class, config)`,
 `set_metadata(key, Value)`, `has(component, key)`, `committed()` and `abandon(self)`. Its
@@ -118,13 +144,14 @@ below; normal model consumers do not need it.
 |---|---|
 | `Config` | `endpoint: String`, `cache_dir: PathBuf`, `mirror: Option<PathBuf>`, `token: Option<Arc<dyn TokenProvider>>`, `ca_der: Option<Vec<u8>>`. `Config::from_env()` returns configuration; `Client::new` validates it. Debug output redacts access material. |
 | `Ref` | `repo_id`, optional `revision`, `variant`, `endpoint`; implements `FromStr`. Use explicit fields/options when names contain shorthand separators. |
-| `Open` | Optional `revision`, `variant`, `endpoint`, plus `local_files_only`; implements `Default`. |
+| `Open` | Optional `revision`, `variant`, `endpoint`, plus `local_files_only` and `lazy`; defaults to `lazy: true`. |
 | `Selection` | `All`, `Components(Vec<String>)`, `Tensors { component, keys }`, `Part { component, key, role: Option<String>, range: Option<Range<u64>> }`, or `Assets { component, names: Option<Vec<String>> }`. Part ranges are stored byte ranges; absent asset names selects all assets. |
-| `Fetch` | `selection`, `priority: u64`, optional borrowed progress callback; defaults to all. |
+| `Download` | `selection`, `priority: u64`, optional borrowed progress callback; defaults to all. |
 | `Fetched` | Byte counts `local`, `volume`, `origin`. |
+| `VerificationReport` | Separate `missing` and `corrupt` object-reference vectors; `is_ok()` checks both are empty. |
 | `Convert` | Optional `converter`, `variant`, borrowed conversion-progress callback. |
 | `WriterOptions` | Optional `dest`, `variant`, `base`, `resume`, `repo_id`, `endpoint`, `token`, `ca_der`; implements `Default`. |
-| `Format` | `Safetensors` export. |
+| `Format` | `Safetensors` or native portable `Cozytensors` export. |
 
 `Progress` is a borrowed `Fn(u64, u64) -> Result<()> + Sync` (held bytes, total bytes).
 `ConvertProgress` additionally receives a stage string. Returning an error cancels the
@@ -144,12 +171,21 @@ a separate worker-permission mechanism.
 | `pipeline()` | `Option<&format::Pipeline>`. |
 | `components()` | `&[Component]`. |
 | `component(name)` | `Result<&Component>`. |
-| `verify()` | `Result<Vec<ObjectRef>>`, describing absent/corrupt objects. |
+| `verify(&Selection)` | `Result<VerificationReport>`, separating absent objects from length/digest failures. |
 | `view()` | An owned `io::view::View` for byte-engine/placement integration. |
 | `chunk(index)` | `Result<File>`; the returned file owns its descriptor. |
 | `missing(&Selection)` | `Result<Vec<ObjectRef>>`. |
-| `fetch(&Fetch).await` | `Result<Fetched>`. |
-| `folder()` | `Result<PathBuf>`, materializing available data. |
+| `download(&Download).await` | `Result<Fetched>`. |
+| `materialize(directory, Format, dequantize).await` | `Result<PathBuf>` for the complete checkpoint folder. |
+
+`download` completes when the selected chunks and supporting files are verified and locally
+available; the open checkpoint retains them. `missing` is optional availability inspection.
+Use `verify` for an explicit local audit, not after every download: admission already checks
+incoming bytes. Verification always checks the header, then the selected complete objects,
+and never fetches, repairs or deletes data. `Selection::All` covers the checkpoint's
+declared chunks and component assets, not its enclosing repository files; checking a
+shared chunk hashes that whole object. Other local I/O failures remain
+typed errors rather than being classified as corruption.
 
 A `Component` provides `name()`, `class()`, `config()`, `tensors()` and
 `assets()` metadata views. Its `read(key)` returns decoded `Vec<u8>`;
@@ -175,6 +211,13 @@ on a conflict. `Endpoint::new("local", ...)` addresses local repository referenc
 `retry(&Request, status, &HeaderMap) -> Result<bool>` defaults to `Ok(false)`.
 `Request` contains borrowed `method`, `url`, existing `headers`, and optional body-digest
 `payload`. The public result uses the same error families as the other client operations.
+
+`DPoP` is a cloneable `TokenProvider` for callers using proof-of-possession credentials.
+`DPoP::token(key, access_token, resource, endpoint)` wraps an already issued token;
+`DPoP::grant(&config, key, JwtBearer { token_endpoint, client_id, resource, claims })`
+configures a lazy JWT-bearer exchange. The key is a private P-256 JWK. Clones share the
+same native token state. `issued_token().await` returns `Option<String>` without starting
+an exchange. These provider operations use the common `Failure` families.
 
 `ObjectRef` has `sha256: String` and `length: u64`; `of(bytes)` hashes content, `id()` returns
 `sha256:…` and `key()` gives its object-storage key. `Metadata` is `BTreeMap<String, Value>`.
