@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Validate full H3 receipts and the actual public run that returned them."""
 import argparse
-import hashlib
 import json
 from pathlib import Path
 
-from contract import (CLIENT_SHA, HARNESS_SHA, MAX_WALL, check_benchmark, check_capacity, check_spec,
-                      check_stage, deadline_budget, exact, finite, require)
+from contract import (HARNESS_SHA, check_benchmark, check_capacity, check_spec,
+                      check_stage, deadline_budget, finite, require)
 from public_binding import physical, public_tree, sha
 
 
 def read(path):
-    return json.loads(Path(path).read_text(), parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+    def invalid(value):
+        raise ValueError("nonfinite JSON number: " + value)
+    return json.loads(Path(path).read_text(), parse_constant=invalid)
 
 
 def validate(root, manifest, run, machine, launch):
