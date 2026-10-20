@@ -277,7 +277,7 @@ fn canonical_tags_round_trip_at_a_real_hub_without_a_machine() {
         let (named, named_etag) = owner.repo(&name).await.unwrap().unwrap();
         assert_eq!(named.tag(&replay).unwrap().commit, first);
         assert!(!named.tag(&replay).unwrap().public);
-        owner.update_repo(&name, |old| Ok(old)).await.unwrap();
+        owner.update_repo(&name, Ok).await.unwrap();
         assert_eq!(
             owner.repo(&name).await.unwrap().unwrap(),
             (named.clone(), named_etag.clone()),
