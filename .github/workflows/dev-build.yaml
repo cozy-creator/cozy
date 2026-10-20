@@ -64,6 +64,15 @@ jobs:
     runs-on: ${{ inputs.runner }}
     # Hang bound, not a work budget.
     timeout-minutes: 60
+    services:
+      # Started only for tests (TensorD's tests/hub_oauth.rs reads AUTHKIT_TEST_DATABASE_URL).
+      postgres:
+        image: ${{ inputs.test != '' && 'postgres:18-alpine' || '' }}
+        env:
+          POSTGRES_PASSWORD: ci-only
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
     steps:
       - uses: actions/checkout@v5
         with:
@@ -77,6 +86,12 @@ jobs:
           sparse-checkout-cone-mode: false
       - id: sha
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # Only older refs carry the OAuth Go harness; newer refs removed it.
+      - uses: actions/setup-go@v6
+        if: inputs.test != '' && hashFiles('crates/tensord/tests/hub-oauth/go.mod') != ''
+        with:
+          go-version-file: crates/tensord/tests/hub-oauth/go.mod
+          cache-dependency-path: crates/tensord/tests/hub-oauth/go.sum
       - uses: astral-sh/setup-uv@v6
         if: inputs.test != '' || inputs.runtime_ref != '' || inputs.tensorfs_run != '' || contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
       # The Rust workspace: rust-toolchain.toml's toolchain installs on first use. target/manylinux
@@ -227,14 +242,16 @@ jobs:
       - if: inputs.test != ''
         env:
           TEST: ${{ inputs.test }}
+          AUTHKIT_TEST_DATABASE_URL: postgres://postgres:ci-only@127.0.0.1:5432/postgres?sslmode=disable
         run: |
           locations=()
-          for name in TENSORFS_TEST_PYTHON COZY_TEST_RUNTIME_WHEEL COZY_TEST_TENSORFS_WHEEL COZY_TEST_DEV_BINARY; do
+          for name in AUTHKIT_TEST_DATABASE_URL TENSORFS_TEST_PYTHON COZY_TEST_RUNTIME_WHEEL COZY_TEST_TENSORFS_WHEEL COZY_TEST_DEV_BINARY; do
             [ -z "${!name:-}" ] || locations+=("--setenv=$name=${!name}")
           done
           bash "$GITHUB_WORKSPACE/workflow/scripts/ci-delegated.sh" "cozy-dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --uid="$(id -u)" --gid="$(id -g)" --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=UV_TORCH_BACKEND=cpu \
+            --setenv="GOCACHE=$(go env GOCACHE)" --setenv="GOMODCACHE=$(go env GOMODCACHE)" \
             --setenv=CARGO_TERM_COLOR=never --setenv=GITHUB_ACTIONS=true "${locations[@]}" \
             bash -euo pipefail -c "$TEST"
       # Targeted proof commands may produce portable test executables and their source/hash

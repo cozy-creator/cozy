@@ -159,7 +159,7 @@ pub(crate) async fn upload(ctx: &Context, args: Upload) -> Result<ExitCode, Erro
     if !ctx.signed_in(&ctx.hub()?) {
         // The machine publishes under this computer's sign-in; refuse before anything is made.
         return Err(Error::new(Kind::Credential, "not_logged_in", "an upload publishes as your account: sign in first")
-            .next(crate::context::login(&ctx.hub()?)));
+            .next(ctx.login(&ctx.hub()?)));
     }
     let target = format!("{} → {destination}", args.source);
     warm(ctx, &args.placement, args.detach, target, made, destination.to_string()).await

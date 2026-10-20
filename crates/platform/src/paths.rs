@@ -2,6 +2,14 @@
 //! and hands it in, and nothing here reads the environment.
 use crate::{Result, durable};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::ERROR_FILE_NOT_FOUND,
+    System::Registry::{
+        HKEY_CURRENT_USER, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
+        RegSetKeyValueW,
+    },
+};
 
 /// The `~/.cozy` home: `%USERPROFILE%\.cozy` on Windows, the same layout on every OS.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,6 +136,67 @@ pub fn venv_site_packages(venv: &Path) -> Option<PathBuf> {
 /// Unix, the profile directory on Windows. `None` when it cannot be read.
 pub fn login_home() -> Option<PathBuf> {
     login::home()
+}
+
+/// Removes `dir` from this user's PATH (`HKCU\Environment`), where the PowerShell installer put
+/// it: whether it was there.
+#[cfg(windows)]
+pub fn remove_from_user_path(dir: &Path) -> Result<bool> {
+    let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (key, value) = (wide("Environment"), wide("Path"));
+    let failed = |op, status: u32| crate::Error::Os {
+        op,
+        source: std::io::Error::from_raw_os_error(status as i32),
+    };
+    // An environment variable holds at most 32767 characters.
+    let (mut kind, mut data) = (0u32, vec![0u16; 32768]);
+    let mut bytes = (data.len() * 2) as u32;
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+    // SAFETY: NUL-terminated names; the buffer holds `bytes` bytes.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            flags,
+            &mut kind,
+            data.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    match status {
+        0 => {}
+        ERROR_FILE_NOT_FOUND => return Ok(false),
+        _ => return Err(failed("read the user PATH", status)),
+    }
+    let path = String::from_utf16_lossy(&data[..bytes as usize / 2]);
+    let path = path.trim_end_matches('\0');
+    let ours = dir.to_string_lossy();
+    let same = |entry: &str| {
+        entry
+            .trim_end_matches('\\')
+            .eq_ignore_ascii_case(ours.trim_end_matches('\\'))
+    };
+    let kept: Vec<&str> = path.split(';').filter(|entry| !same(entry)).collect();
+    if kept.len() == path.split(';').count() {
+        return Ok(false);
+    }
+    let kept = wide(&kept.join(";"));
+    // SAFETY: NUL-terminated names and the data's exact byte length.
+    let status = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            kind,
+            kept.as_ptr().cast(),
+            (kept.len() * 2) as u32,
+        )
+    };
+    match status {
+        0 => Ok(true),
+        _ => Err(failed("write the user PATH", status)),
+    }
 }
 
 /// Whether `user_home` is this OS user's own home.

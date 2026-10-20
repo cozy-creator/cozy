@@ -23,6 +23,7 @@ mod package;
 mod run;
 pub mod tools;
 pub mod tui;
+mod uninstall;
 mod update;
 
 pub use context::Context;
@@ -74,6 +75,8 @@ enum Command {
     Logs(daemon::Logs),
     /// Replace this binary with the newest release.
     Update(update::Args),
+    /// Remove cozy from this computer: its services, ~/.cozy and its PATH lines.
+    Uninstall(uninstall::Args),
     /// Print a shell completion script.
     Completion(completion::Args),
     /// Check a machine: driver, GPUs, toolchain, kernels.
@@ -154,6 +157,7 @@ async fn dispatch(ctx: &Context, command: Command) -> Result<ExitCode, Error> {
         Command::Status(args) => daemon::status(ctx, args).await,
         Command::Logs(args) => daemon::logs(ctx, args).await,
         Command::Update(args) => update::exec(ctx, args).await,
+        Command::Uninstall(args) => uninstall::exec(ctx, args).await,
         Command::Completion(args) => completion::exec(ctx, args).await,
         Command::Doctor(args) => doctor::exec(ctx, args).await,
         Command::Tools(args) => tools::exec(ctx, args).await,

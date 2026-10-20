@@ -12,7 +12,7 @@ use serde_json::json;
 
 use crate::{
     Context,
-    context::{self, hub_answer, hub_error},
+    context::{hub_answer, hub_error},
     output,
 };
 
@@ -225,7 +225,7 @@ pub async fn whoami(ctx: &Context, _args: Whoami) -> Result<ExitCode, Error> {
     }
     record.print(ctx);
     if !accepted || account.is_none() {
-        output::next(ctx, &[&context::login(&hub)]);
+        output::next(ctx, &[&ctx.login(&hub)]);
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -38,6 +38,16 @@ fn a_missing_ffmpeg_is_installed_pinned_and_doctor_shows_it() {
         )
     };
     let before = json(&cozy(&["doctor", "--json"]));
+    // xdg-open and systemctl are Linux's: macOS and Windows have their own opener and login start.
+    let names: Vec<&str> = before["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for linux in ["xdg-open", "systemctl"] {
+        assert_eq!(names.contains(&linux), cfg!(target_os = "linux"), "{names:?}");
+    }
     let missing = ffmpeg(&before);
     assert_eq!(
         (

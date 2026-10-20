@@ -112,7 +112,7 @@ pub(crate) fn rows(ctx: &Context, side: Side) -> Vec<Row> {
     let path = path();
     TOOLS
         .iter()
-        .filter(|tool| tool.side == side)
+        .filter(|tool| tool.side == side && tools::used_here(tool))
         .map(|tool| {
             let found: Option<Found> = (tool.probe)(&ctx.home.tools(), &path);
             Row {

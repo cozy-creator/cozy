@@ -50,6 +50,8 @@ jobs:
           chmod +x ~/.cargo/bin/dist
           tag=; [ -z "$TAG" ] || [ "$TAG" = dry-run ] || tag=--tag=$TAG
           dist build $tag --artifacts=global --output-format=json > global-dist-manifest.json
+          # The installers the release ships: release.yml's global job patches them the same way.
+          scripts/patch-installers.sh target/distrib
           mv global-dist-manifest.json target/distrib/
           mkdir mirror
           # The release's dist-manifest.json: every build's manifest merged, as `dist host` merges them.
@@ -102,6 +104,7 @@ jobs:
           - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
           - { os: macos-15, target: aarch64-apple-darwin }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
           # Windows PowerShell 5.1 on x64, PowerShell 7 on arm64 (5.1 there reports x64 and gets that build).
           - { os: windows-2025, target: x86_64-pc-windows-msvc, ps: powershell }
           - { os: windows-11-arm, target: aarch64-pc-windows-msvc, ps: pwsh }
@@ -127,8 +130,9 @@ jobs:
           until curl -sf "$COZY_DOWNLOAD_URL/dist-manifest.json" > /dev/null; do sleep 1; done
 
           if [ "$RUNNER_OS" = Windows ]; then
-            installed=$($PS -NoProfile -ExecutionPolicy Bypass -c "irm $COZY_DOWNLOAD_URL/cozy-installer.ps1 | iex" 2>&1)
+            installed=$($PS -NoProfile -ExecutionPolicy Bypass -c "irm $COZY_DOWNLOAD_URL/cozy-installer.ps1 | iex; 'this session runs ' + (Get-Command cozy -ErrorAction SilentlyContinue).Source" 2>&1)
             cozy=$HOME/.cozy/bin/cozy.exe
+            case $installed in *'this session runs '*'\.cozy\bin\cozy.exe'*) ;; *) echo "::error::the installing PowerShell does not find cozy"; exit 1 ;; esac
             path=$(powershell -NoProfile -c "[Environment]::GetEnvironmentVariable('Path', 'User')")
             case ${path,,} in *'\.cozy\bin'*) ;; *) echo "::error::the user PATH lacks .cozy\bin: $path"; exit 1 ;; esac
           else
