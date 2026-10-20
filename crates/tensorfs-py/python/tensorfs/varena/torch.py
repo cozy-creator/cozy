@@ -810,10 +810,12 @@ class Memory:
             while model.starting:
                 self.changed.wait()
             model.flight += 1
-            if model.flight != 1:
-                return
+            first = model.flight == 1
             model.starting = True
         try:
+            if not first:
+                self._enter(model.common, record=False)
+                return
             self._fresh(model)
             self._measure()
             assert self.native is not None
@@ -828,7 +830,8 @@ class Memory:
         except BaseException:
             with self.lock:
                 model.flight -= 1
-                model.aloft = False
+                if first:
+                    model.aloft = False
                 # _enter rolls back its own acquisition. A failure before it must
                 # leave the common weights held by other users (e.g. a graph) bound.
             raise
@@ -849,19 +852,22 @@ class Memory:
             if not model.flight:
                 return
             model.flight -= 1
-            if model.flight:
-                return
-            self._capture_peaks()
-            aloft, model.aloft = model.aloft, False
-            model.starting = True
+            last = model.flight == 0
+            aloft = model.aloft
+            if last:
+                self._capture_peaks()
+                model.aloft = False
+                model.starting = True
         try:
             if aloft:
                 self._exit(model.common)
-            self._step(model)
+            if last:
+                self._step(model)
         finally:
-            with self.changed:
-                model.starting = False
-                self.changed.notify_all()
+            if last:
+                with self.changed:
+                    model.starting = False
+                    self.changed.notify_all()
 
     def _enter(
         self,
@@ -1266,14 +1272,31 @@ def _fly(model: Model) -> None:
     """A forward of the root or a direct child (`vae.decode` calls `decoder`) is the model in
     use, counted so concurrent forwards share it (cr-202)."""
     memory = model.memory
-    for module in (model.module, *model.module.children()):
+
+    def install(module: nn.Module) -> None:
+        local = threading.local()
+
+        def start(*_: object) -> None:
+            calls = local.__dict__.setdefault("calls", [])
+            calls.append(False)
+            memory._start(model)
+            calls[-1] = True
+
+        def land(*_: object) -> None:
+            calls = getattr(local, "calls", ())
+            if calls and calls.pop():
+                memory._land(model)
+
+        # Run before other pre-hooks so their failures still release this call's
+        # acquisition. A failed start must not release another overlapping call.
         model.handles.append(
-            module.register_forward_pre_hook(lambda *_: memory._start(model))
+            module.register_forward_pre_hook(start, prepend=True)
         )
-        hook = module.register_forward_hook(
-            lambda *_: memory._land(model), always_call=True
-        )
+        hook = module.register_forward_hook(land, always_call=True)
         model.handles.append(hook)
+
+    for module in (model.module, *model.module.children()):
+        install(module)
 
 
 def _hook(block: Block) -> None:
