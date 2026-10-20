@@ -10,6 +10,7 @@ import gc
 import hashlib
 import itertools
 import threading
+import time
 import traceback
 import weakref
 from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, Sequence
@@ -368,6 +369,7 @@ class Model:
         self.ws: WeightSet
         self.flight, self.aloft, self.held = 0, False, 0
         self.steps, self.base = 0, 0
+        self.binding_ns = 0
         self.closed = False
         self.version: Hashable | None = None
         self.track = cuts.Track(self.name)
@@ -486,6 +488,8 @@ class Request:
     steps: list[Step] = field(default_factory=list)
     declared: tuple[tuple[str, ...], ...] = ()
     stats: RequestStats | None = None
+    reads: dict[str, tuple[int, int, int]] = field(default_factory=dict)
+    passes: dict[str, int] = field(default_factory=dict)
 
     def plan(self, steps: Sequence[PlanStep] | None) -> None:
         names, models = self.memory._plan(steps or ())
@@ -784,6 +788,7 @@ class Memory:
         self._measure()
         block.stream = stream
         views: dict[str, dict[str, Tensor]] = {}
+        started = time.perf_counter_ns()
         try:
             for region in block.regions:
                 pinned = self._pin(block.model, region, stream.cuda_stream)
@@ -794,6 +799,8 @@ class Memory:
         except BaseException:
             _unbind(block)
             raise
+        finally:
+            block.model.binding_ns += time.perf_counter_ns() - started
 
     def _pin(self, model: Model, region: int, stream: int) -> Any:
         assert self.native is not None
@@ -811,9 +818,34 @@ class Memory:
     def _step(self, model: Model) -> None:
         if self.native is None:
             return
+        request = self._current()
         peak = max(torch.cuda.max_memory_allocated(self.gpu) - model.base, 0)
-        self.native.leave(self._current().native_id, peak)
+        self.native.leave(request.native_id, peak)
         cuts.peaked(model.track, peak)
+        raw = self.native.stats(request.native_id)
+        copies_ = [
+            row for row in raw["copies"] if self._names.get(row["model"]) == model.name
+        ]
+        paged = sum(row["stats"]["bytes"] for row in copies_ if not row["streamed"])
+        streamed = sum(row["stats"]["bytes"] for row in copies_ if row["streamed"])
+        prior = request.reads.get(model.name, (0, 0, 0))
+        resident = dict(self.native.resident()).get(model.name, 0)
+        step = request.passes.get(model.name, 0)
+        request.steps.append(
+            Step(
+                model.name,
+                self.gpu,
+                step,
+                resident,
+                resident,
+                paged - prior[0],
+                streamed - prior[1],
+                model.binding_ns - prior[2],
+                peak,
+            )
+        )
+        request.passes[model.name] = step + 1
+        request.reads[model.name] = (paged, streamed, model.binding_ns)
         model.steps += 1
 
     @contextmanager
@@ -848,6 +880,9 @@ class Memory:
             self,
             torch.cuda.memory_allocated(self.gpu) if self.cuda else 0,
         )
+        request.reads = {
+            model.name: (0, 0, model.binding_ns) for model in self.models.values()
+        }
         names, models = self._plan(plan or ())
         request.declared = names
         if self.native is not None:
@@ -889,7 +924,25 @@ class Memory:
             request.stats = RequestStats(
                 id,
                 tuple(request.steps),
-                (),
+                tuple(
+                    Eviction(
+                        str(event["model"] or ""),
+                        self.gpu,
+                        {
+                            "free": 0,
+                            "orphan": 1,
+                            "speculative": 2,
+                            "unused": 3,
+                            "declared": 4,
+                            "working": 5,
+                            "pinned": 6,
+                        }[str(event["class"])],
+                        str(event["reason"]),
+                        int(event["bytes"]),
+                    )
+                    for event in trace
+                    if event["kind"] == "evict"
+                ),
                 ((self.gpu, leftover),) if self.cuda else (),
                 copied,
                 self.memo.retries,
