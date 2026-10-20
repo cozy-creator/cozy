@@ -1,4 +1,4 @@
-//! Public DPoP on real loopback HTTP: no AuthKit mock transport, GPU or model download.
+//! Public DPoP on a real loopback HTTP issuer; no GPU or model download.
 #![cfg(feature = "store")]
 
 use std::collections::BTreeMap;
@@ -318,7 +318,7 @@ impl Origin {
             &key(),
             JwtBearer {
                 token_endpoint: format!("{}/token", self.url),
-                client_id: "worker-test".into(),
+                client_id: "public-provider-test".into(),
                 resource: "https://resource.example".into(),
                 claims: json!({"capability":"fixture-one-time"})
                     .as_object()
@@ -424,7 +424,7 @@ async fn success_and_clones_share_one_signed_exchange() {
         .split('&')
         .find_map(|part| part.strip_prefix("assertion="))
         .unwrap();
-    assert_eq!(claims(assertion)["capability"], "fixture-one-time");
+    assert_eq!(claims(assertion)["purpose"], "fixture-one-time");
     assert_eq!(
         claims(&sent.headers["dpop"])["htu"],
         format!("{}/token", origin.url)
