@@ -138,6 +138,7 @@ fn child() {
     let channel = Channel::new(platform::handles::recv_fd(&control).unwrap());
     let ledger = Ledger::adopt(table.as_fd(), events.as_fd()).unwrap();
     let row = ledger.claim(std::process::id()).unwrap();
+    channel.bind(row.owner()).unwrap();
     println!("@{} {}", row.owner().row, row.owner().generation);
     let mut containers = Vec::new();
     for command in std::io::stdin().lock().lines().map(Result::unwrap) {

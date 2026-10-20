@@ -153,10 +153,13 @@ pub struct Group {
     /// `Load`/`Invoke`: each rank's own process cap, rank 0 first (-1: uncapped).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rank_caps: Vec<i64>,
+    /// Start: one table/eventfd/private-channel triple per rank, in rank order.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ledgers: u32,
 }
 impl Group {
     pub fn is_empty(&self) -> bool {
-        !self.rank_cells && self.rank_caps.is_empty()
+        !self.rank_cells && self.rank_caps.is_empty() && self.ledgers == 0
     }
 }
 
@@ -1797,6 +1800,24 @@ impl DeviceExecutor {
         group: &Group,
         services: &mut impl Services,
     ) -> io::Result<Frame> {
+        self.command_with_grants(command, group, Vec::new(), services)
+    }
+
+    /// Start with one private placement grant per rank. Descriptors immediately follow the
+    /// Start frame, before any Runtime reply. Their local duplicates close after transfer.
+    pub fn command_with_grants(
+        &mut self,
+        command: &DeviceCommand,
+        group: &Group,
+        grants: Vec<varena::ledger::Grant>,
+        services: &mut impl Services,
+    ) -> io::Result<Frame> {
+        if grants.len() != group.ledgers as usize
+            || (!grants.is_empty() && !matches!(command, DeviceCommand::Start { .. }))
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "placement grants require a matching Start ledger count"));
+        }
         let meter = match (command, &self.activity) {
             (DeviceCommand::Invoke { .. }, Some(_)) => Meter::Work,
             (DeviceCommand::Invoke { .. }, None) => Meter::Frames,
@@ -1812,7 +1833,7 @@ impl DeviceExecutor {
             command.name(),
         )?;
         *self.watched.lock().unwrap() = Some(watching.watch());
-        let result = self.exchange(command, group, services, &watching.watch());
+        let result = self.exchange(command, group, &grants, services, &watching.watch());
         *self.watched.lock().unwrap() = None;
         // Whatever the run was computing when its exchange ended, its waiters compute themselves.
         if let (Some(memo), Some((run, _))) = (&self.memo, command.spool()) {
@@ -1832,10 +1853,16 @@ impl DeviceExecutor {
         &mut self,
         command: &DeviceCommand,
         group: &Group,
+        grants: &[varena::ledger::Grant],
         services: &mut impl Services,
         watch: &Watch,
     ) -> io::Result<Frame> {
         write_command(&mut self.stream, command, group, self.memo.is_some())?;
+        for grant in grants {
+            for fd in [&grant.table, &grant.events, &grant.channel] {
+                platform::handles::send_fd(&self.stream, fd)?;
+            }
+        }
         loop {
             let frame = read_frame(&mut self.stream)?
                 .ok_or_else(|| {
