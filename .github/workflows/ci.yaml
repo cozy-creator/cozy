@@ -23,9 +23,9 @@ jobs:
     with:
       ref: ${{ github.sha }}
       build: tensorfs
-      # Build the focused Runtime that consumes this public TensorFS API; the published
-      # Runtime and the current 0.12 release candidate use the earlier native interface.
-      runtime_ref: 9b1a5ae73aec1949c4e9a11fd717a240465cb3d2
+      # Build the Runtime that consumes this ordinary TensorFS API. Source pins distinguish
+      # compatible development wheels even when their package versions are the same.
+      runtime_ref: c5738dc391c69c5569c310b11f27e485713410ab
       # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below.
       test: cargo test --workspace --locked --no-fail-fast --exclude cozy --exclude calcifer
 
@@ -34,7 +34,7 @@ jobs:
     uses: ./.github/workflows/owner-day.yml
     secrets: inherit
     with:
-      # Ordinary D10 distribution and the focused Runtime are separate from the current
-      # 0.12 cohort. Freeze both source inputs until this interface is released.
-      tensorhub_ref: da8effea817f2ec90fac19a4f553616a5ef73a15
-      runtime_ref: 9b1a5ae73aec1949c4e9a11fd717a240465cb3d2
+      # Freeze the ordinary Hub fixture and matching Runtime source independently of
+      # the release cohort until this interface is released.
+      tensorhub_ref: a67f65eb0aee2e1d022dbaa8eba6ae4bd17d8662
+      runtime_ref: c5738dc391c69c5569c310b11f27e485713410ab
