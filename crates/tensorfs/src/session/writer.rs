@@ -256,14 +256,17 @@ impl Writer {
             Ok(())
         })
     }
+    /// Declares component `name`. `config_file` names the file its config exports as
+    /// (`scheduler_config.json`); `None` keeps a reopened or base component's, else `config.json`.
     pub fn component(
         &mut self,
         name: &str,
         class: &str,
         config: Config,
+        config_file: Option<&str>,
     ) -> Result<ComponentWriter<'_>> {
         self.with(|raw| {
-            raw.component(name, class, config, None)
+            raw.component(name, class, config, config_file)
                 .map(drop)
                 .map_err(from_writer)
         })?;

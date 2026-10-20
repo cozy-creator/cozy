@@ -438,7 +438,7 @@ Its options and members are:
 | `metadata` | Mutable loading/provenance metadata dictionary. |
 | `local_checkpoint` | A committed local result retained after an upload failure, if one exists. |
 | `pipeline(cls, config)` | Set the pipeline description. |
-| `component(name, cls=..., config=...)` | Create or reopen a component and return its `ComponentWriter`. |
+| `component(name, cls=..., config=..., config_file=None)` | Create or reopen a component and return its `ComponentWriter`. `config_file` names the file its config exports as (`scheduler_config.json`); the default keeps a reopened or base component's, else `config.json`. |
 | `has(component, key)` | Check a current/resumed write, excluding untouched tensors inherited from the base. |
 | `commit()` | Finish and return the checkpoint; a first commit error is cached and re-raised. |
 | `abandon()` | End without producing a new checkpoint. |

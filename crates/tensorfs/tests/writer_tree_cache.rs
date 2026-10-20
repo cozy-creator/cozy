@@ -57,7 +57,7 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
         .unwrap();
     {
         let mut model = writer
-            .component("model", "test.Model", Default::default())
+            .component("model", "test.Model", Default::default(), None)
             .unwrap();
         model.put("w", Dtype::U8, &[4], &mut &WEIGHT[..]).unwrap();
         model.asset("vocab.bin", ASSET).unwrap();

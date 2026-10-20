@@ -1737,17 +1737,18 @@ impl PyWriter {
         self.with(py, |writer| writer.pipeline(&cls, config))
     }
 
-    #[pyo3(signature = (name, cls = "", config = None))]
+    #[pyo3(signature = (name, cls = "", config = None, config_file = None))]
     fn component(
         slf: &Bound<'_, Self>,
         name: String,
         cls: &str,
         config: Option<&Bound<'_, PyDict>>,
+        config_file: Option<&str>,
     ) -> PyResult<PyComponentWriter> {
         let py = slf.py();
         let config = config.map(config_map).transpose()?.unwrap_or_default();
         slf.get()
-            .with(py, |writer| writer.component(&name, cls, config).map(drop))?;
+            .with(py, |writer| writer.component(&name, cls, config, config_file).map(drop))?;
         Ok(PyComponentWriter {
             w: slf.clone().unbind(),
             name,

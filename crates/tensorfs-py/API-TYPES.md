@@ -397,7 +397,7 @@ class Writer:
     def pipeline(self, cls: str, config: Mapping[str, object]) -> None:
         ...
 
-    def component(self, name: str, *, cls: str, config: Mapping[str, object]) -> ComponentWriter:
+    def component(self, name: str, *, cls: str, config: Mapping[str, object], config_file: str | None=None) -> ComponentWriter:
         ...
 
     def commit(self) -> Checkpoint:

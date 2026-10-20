@@ -126,7 +126,7 @@ async fn saved_handle_reopens_after_all_producers_drop_and_deletion_keeps_conten
         .unwrap();
     let mut input = DATA;
     writer
-        .component("model", "test.File", ComponentConfig::new())
+        .component("model", "test.File", ComponentConfig::new(), None)
         .unwrap()
         .put("value", Dtype::U8, &[DATA.len() as u64], &mut input)
         .unwrap();

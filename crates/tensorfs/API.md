@@ -65,7 +65,7 @@ let mut writer = client.writer(WriterOptions {
 let bytes: Vec<u8> = [1.0_f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
 let mut input = bytes.as_slice();
 {
-    let mut model = writer.component("model", "", Default::default())?;
+    let mut model = writer.component("model", "", Default::default(), None)?;
     model.put("weight", Dtype::F32, &[2], &mut input)?;
 }
 let saved = writer.commit().await?;
@@ -132,7 +132,9 @@ Missing or denied source objects fail the operation.
 `Some(Dtype::F32)`, `Some(Dtype::BF16)` or `Some(Dtype::F16)`, or `None`.
 Other combinations return `Invalid` before source preparation.
 
-A `Writer` also has `pipeline(class, config)`, `component(name, class, config)`,
+A `Writer` also has `pipeline(class, config)`, `component(name, class, config, config_file)`
+(`config_file` names the file the config exports as, such as `scheduler_config.json`; `None`
+keeps a reopened or base component's, else `config.json`),
 `component_writer(name)`, `set_metadata(key, Value)`, `has(component, key)`, `committed()`
 and `abandon(self)`. `component_writer` reopens a declared component without changing
 its class or configuration. `ComponentWriter` supports `put(key, Dtype, shape, &mut Read)`,

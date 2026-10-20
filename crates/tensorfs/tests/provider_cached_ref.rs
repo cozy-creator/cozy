@@ -194,7 +194,7 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
     .unwrap();
     let mut writer = producer.writer(WriterOptions::default()).unwrap();
     writer
-        .component("model", "test.Model", Default::default())
+        .component("model", "test.Model", Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut &WEIGHT[..])
         .unwrap();

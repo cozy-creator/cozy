@@ -245,7 +245,8 @@ class Writer:
                  endpoint: str | None = None, token: _Token | None = None, ca_der: bytes | None = None) -> None: ...
     def pipeline(self, cls: str, config: Mapping[str, Any]) -> None: ...
     def component(
-        self, name: str, cls: str = "", config: Mapping[str, Any] | None = None
+        self, name: str, cls: str = "", config: Mapping[str, Any] | None = None,
+        config_file: str | None = None,
     ) -> ComponentWriter:
         """Declares a component (again: class and config change, tensors stay)."""
     def set_metadata(self, key: str, value: Any) -> None: ...

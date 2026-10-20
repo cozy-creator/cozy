@@ -201,8 +201,9 @@ pub struct WriterOptions<'a> {
 pub struct Writer { /* owned local and optional remote write state */ }
 impl Writer {
     pub fn pipeline(&mut self, class: &str, config: format::Config) -> Result<()>;
-    pub fn component(&mut self, name: &str, class: &str,
-        config: format::Config) -> Result<ComponentWriter<'_>>;
+    // config_file: the file the config exports as; None keeps a reopened or base one's.
+    pub fn component(&mut self, name: &str, class: &str, config: format::Config,
+        config_file: Option<&str>) -> Result<ComponentWriter<'_>>;
     // Reopen a declared component without changing its class or config.
     pub fn component_writer(&mut self, name: &str) -> Result<ComponentWriter<'_>>;
     pub fn set_metadata(&mut self, key: &str, value: Value) -> Result<()>;

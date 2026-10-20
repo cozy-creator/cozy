@@ -286,7 +286,7 @@ async fn public_writer_resumes_reopens_components_and_keeps_encoded_bytes_and_or
         })
         .unwrap();
     first
-        .component("model", "test.Model", config)
+        .component("model", "test.Model", config, None)
         .unwrap()
         .put("first", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -304,6 +304,7 @@ async fn public_writer_resumes_reopens_components_and_keeps_encoded_bytes_and_or
             "model",
             "test.Model",
             serde_json::from_str(r#"{"width":8}"#).unwrap(),
+            None,
         )
         .unwrap();
     assert_eq!(
@@ -418,7 +419,7 @@ async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_mo
         })
         .unwrap();
     first
-        .component("model", "test.Model", Default::default())
+        .component("model", "test.Model", Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -454,7 +455,7 @@ async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_mo
         })
         .unwrap();
     identical
-        .component("model", "test.Model", Default::default())
+        .component("model", "test.Model", Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -474,7 +475,7 @@ async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_mo
         })
         .unwrap();
     let replacement = [2, 4, 6, 8];
-    next.component("model", "test.Model", Default::default())
+    next.component("model", "test.Model", Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut &replacement[..])
         .unwrap();
@@ -543,7 +544,7 @@ async fn failed_file_publication_still_exposes_the_committed_local_checkpoint() 
         })
         .unwrap();
     writer
-        .component("model", "test.Model", Default::default())
+        .component("model", "test.Model", Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -730,7 +731,7 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
         })
         .unwrap();
     writer
-        .component("model", "test.Model", Default::default())
+        .component("model", "test.Model", Default::default(), None)
         .unwrap()
         .asset("tokenizer.json", ASSET)
         .unwrap();
@@ -776,7 +777,7 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
         })
         .unwrap();
     failed
-        .component("model", "test.Model", Default::default())
+        .component("model", "test.Model", Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -861,7 +862,7 @@ async fn writer_provider_error_keeps_the_exact_family_and_detail_including_empty
                 })
                 .unwrap();
             writer
-                .component("model", "test.Model", Default::default())
+                .component("model", "test.Model", Default::default(), None)
                 .unwrap()
                 .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
                 .unwrap();
@@ -1280,6 +1281,7 @@ async fn streaming_writer_resumes_its_keyed_journal_after_drop_then_publishes_th
             "model",
             "test.Model",
             serde_json::from_str(r#"{"width":4}"#).unwrap(),
+            None,
         )
         .unwrap()
         .put("before", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
@@ -1307,6 +1309,7 @@ async fn streaming_writer_resumes_its_keyed_journal_after_drop_then_publishes_th
             "model",
             "test.Model",
             serde_json::from_str(r#"{"width":4}"#).unwrap(),
+            None,
         )
         .unwrap();
     resumed
@@ -1381,7 +1384,7 @@ async fn literal_writer_inside_classified_snapshot_preserves_the_callers_header_
         })
         .unwrap();
     writer
-        .component("model", "test.Model", Default::default())
+        .component("model", "test.Model", Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
