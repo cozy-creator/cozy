@@ -4,14 +4,24 @@
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 pub use varena::ledger::Grant;
+pub use varena::ledger::HostCache;
 use varena::ledger::{Ledger, Status};
 
 pub struct Memory(Arc<Ledger>);
 impl Memory {
     pub fn create(gpu_uuid: &str, card_bytes: u64, limit: Option<u64>) -> varena::Result<Self> {
-        Ledger::create(
+        Self::create_with_host(gpu_uuid, card_bytes, limit, Arc::new(HostCache::default()))
+    }
+    pub fn create_with_host(
+        gpu_uuid: &str,
+        card_bytes: u64,
+        limit: Option<u64>,
+        host: Arc<HostCache>,
+    ) -> varena::Result<Self> {
+        Ledger::create_with_host(
             gpu_uuid,
             limit.map_or(card_bytes, |cap| cap.min(card_bytes)),
+            host,
         )
         .map(|l| Self(Arc::new(l)))
     }
@@ -35,6 +45,12 @@ impl Memory {
     }
     pub fn release_unused_ram(&self) -> bool {
         self.0.release_unused_ram()
+    }
+    pub fn prepare_host(&self, reservation: u64, need: Option<u64>) {
+        self.0.prepare_host(reservation, need);
+    }
+    pub fn finish_host(&self, reservation: u64) {
+        self.0.finish_host(reservation);
     }
     pub fn capacity(&self) -> u64 {
         self.0.capacity()

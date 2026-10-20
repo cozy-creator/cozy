@@ -7,16 +7,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering::*};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use platform::shm::{self, Region};
 
 use crate::plan::Class;
@@ -198,6 +198,7 @@ fn signal(fd: BorrowedFd<'_>) {
 
 struct Table {
     file: File,
+    identity: (u64, u64),
     base: *mut Shared,
 }
 // SAFETY: only atomics are shared; references cannot outlive this mapping's Arc.
@@ -213,7 +214,8 @@ impl Drop for Table {
 }
 impl Table {
     fn map(file: File) -> Result<Self> {
-        if file.metadata().map_err(|e| io("stat ledger", e))?.len() != size_of::<Shared>() as u64 {
+        let metadata = file.metadata().map_err(|e| io("stat ledger", e))?;
+        if metadata.len() != size_of::<Shared>() as u64 {
             return Err(Error::Invalid(
                 "ledger size differs from this protocol".into(),
             ));
@@ -234,6 +236,7 @@ impl Table {
         }
         Ok(Self {
             file,
+            identity: (metadata.dev(), metadata.ino()),
             base: base.cast(),
         })
     }
@@ -265,6 +268,13 @@ impl Table {
         let changed = &self.shared().header.changed;
         changed.fetch_add(1, Release);
         wake(changed);
+    }
+    fn signal(&self, owner: Owner) -> Result<()> {
+        let slot = self.slot(owner)?;
+        slot.bell.fetch_add(1, Release);
+        wake(&slot.bell);
+        self.changed();
+        Ok(())
     }
     fn rows(&self) -> Result<Vec<RowStatus>> {
         let mut out = Vec::new();
@@ -364,11 +374,18 @@ pub struct Ledger {
     events: Arc<OwnedFd>,
     _watcher: Option<Watcher>,
     custody: Arc<Mutex<Custody>>,
+    host: Arc<HostCache>,
     observations: Mutex<HashMap<Owner, (u64, u64)>>,
 }
 impl Ledger {
     /// Open the machine/user's existing ledger, or initialize it under the file's OFD lock.
     pub fn create(gpu_uuid: &str, capacity: u64) -> Result<Self> {
+        Self::create_with_host(gpu_uuid, capacity, Arc::new(HostCache::default()))
+    }
+    /// TensorD supplies one host cache for all of its device ledgers. CUDA page
+    /// custody and the shared per-device placement table remain independent.
+    pub fn create_with_host(gpu_uuid: &str, capacity: u64, host: Arc<HostCache>) -> Result<Self> {
+        host.check_process()?;
         if gpu_uuid.is_empty()
             || gpu_uuid.len() > 96
             || !gpu_uuid
@@ -460,6 +477,7 @@ impl Ledger {
                 join: Some(join),
             }),
             custody: Arc::default(),
+            host,
             observations: Mutex::default(),
         })
     }
@@ -481,6 +499,7 @@ impl Ledger {
             events,
             _watcher: None,
             custody: Arc::default(),
+            host: Arc::new(HostCache::default()),
             observations: Mutex::default(),
         })
     }
@@ -499,11 +518,12 @@ impl Ledger {
         self.grant(0)
     }
     pub fn grant(&self, pid: u32) -> Result<Grant> {
+        self.host.check_process()?;
         let (server, client) = UnixStream::pair().map_err(|e| io("create grant channel", e))?;
-        let (table, custody) = (self.table.clone(), self.custody.clone());
+        let (table, custody, host) = (self.table.clone(), self.custody.clone(), self.host.clone());
         std::thread::Builder::new()
             .name("varena-custody".into())
-            .spawn(move || serve(server, pid, table, custody))
+            .spawn(move || serve(server, pid, table, custody, host))
             .map_err(|e| io("start grant service", e))?;
         Ok(Grant {
             table: self
@@ -595,6 +615,7 @@ impl Ledger {
         Err(Error::Invalid("ledger has no free row".into()))
     }
     pub fn status(&self) -> Result<Status> {
+        self.host.check_process()?;
         let kept = self
             .custody
             .lock()
@@ -609,16 +630,21 @@ impl Ledger {
             peaks: self.peaks(),
             kept,
             ram_bytes: sum(self
-                .custody
+                .host
+                .state
                 .lock()
                 .ram
                 .values()
-                .map(|r| r.layout.len as u64)),
+                .flat_map(|held| &held.slots)
+                .filter_map(|slot| slot.buffer.as_ref())
+                .filter(|ram| ram.ready.load(Acquire) || ram.filling.load(Acquire))
+                .map(|ram| ram.len as u64)),
         })
     }
     /// Reap only kernel-released claims. Their custody remains available until consumed or
     /// explicitly dropped; no GPU context is needed to close the queued handle containers.
     pub fn reap(&self, pid: u32) -> Result<()> {
+        self.host.check_process()?;
         for row in self.table.rows()?.into_iter().filter(|r| r.pid == pid) {
             if row.state == State::Live {
                 return Err(Error::Invalid("cannot reap a live row".into()));
@@ -627,6 +653,11 @@ impl Ledger {
             slot.state
                 .store(row.owner.generation << 2 | REAPING, Release);
             self.custody.lock().orphan(row.owner);
+            for held in self.host.state.lock().ram.values_mut() {
+                held.observers.retain(|subscriber, _| {
+                    subscriber.table != self.table.identity || subscriber.owner != row.owner
+                });
+            }
             slot.state.store(row.owner.generation << 2, Release);
         }
         self.table.changed();
@@ -800,44 +831,119 @@ impl Ledger {
         source: Arc<Source>,
         regions: Vec<RamRegion>,
     ) -> Result<bool> {
-        register_ram(&self.table, &self.custody, layout, source, regions)
+        self.host.check_process()?;
+        register_ram(&self.table, &self.host, layout, source, regions, None)
     }
-    /// Explicit pressure reclamation: never drops a layout with a live reader lease.
-    pub fn release_ram(&self, layout: [u8; 32]) -> bool {
-        let mut custody = self.custody.lock();
-        let idle = custody.ram.get_mut(&layout).is_some_and(|held| {
-            held.readers
-                .retain(|reader| !platform::handles::hung_up(reader));
-            held.readers.is_empty() && !held.layout.filling.load(Acquire)
-        });
-        if idle {
-            custody.ram.remove(&layout);
-            self.table.changed();
+    pub fn ram_status(&self, layout: [u8; 32]) -> Option<RamStatus> {
+        self.host.check_process().ok()?;
+        ram_status(&self.host.state.lock(), layout)
+    }
+    /// Tell the cache about a starting executor before admitting it. Unknown peaks
+    /// suppress optional warming and shed every idle/queued region; measured peaks
+    /// shed only until their room is available. The caller always admits demand.
+    pub fn prepare_host(&self, reservation: u64, need: Option<u64>) {
+        if self.host.check_process().is_err() {
+            return;
         }
-        idle
+        {
+            let mut state = self.host.state.lock();
+            state.claims.insert(reservation, need);
+        }
+        while !self
+            .host
+            .can_warm(platform::contain::host_memory::read().available, 0)
+        {
+            if !self.release_unused_ram() {
+                break;
+            }
+        }
     }
-    /// On real host pressure, release the oldest completed RAM layout with no live view.
-    /// No GPU pages or running-request buffers are considered here.
-    pub fn release_unused_ram(&self) -> bool {
-        let mut custody = self.custody.lock();
-        let victim = custody
-            .ram
-            .iter_mut()
-            .filter_map(|(key, held)| {
-                held.readers
-                    .retain(|reader| !platform::handles::hung_up(reader));
-                (held.readers.is_empty() && !held.layout.filling.load(Acquire))
-                    .then_some((*key, held.used))
-            })
-            .min_by_key(|(_, used)| *used)
-            .map(|(key, _)| key);
-        if let Some(key) = victim {
-            custody.ram.remove(&key);
+    pub fn finish_host(&self, reservation: u64) {
+        if self.host.check_process().is_err() {
+            return;
+        }
+        let mut state = self.host.state.lock();
+        state.claims.remove(&reservation);
+    }
+    /// Explicit layout invalidation, only when every region is idle. Pressure
+    /// instead calls release_unused_ram, whose unit is a single region.
+    pub fn release_ram(&self, layout: [u8; 32]) -> bool {
+        if self.host.check_process().is_err() {
+            return false;
+        }
+        let removed = {
+            let mut state = self.host.state.lock();
+            let idle = state.ram.get_mut(&layout).is_some_and(|held| {
+                held.slots
+                    .iter_mut()
+                    .all(|slot| slot.buffer.is_none() || slot.idle())
+            });
+            if idle {
+                state.ram.remove(&layout)
+            } else {
+                None
+            }
+        };
+        if let Some(held) = removed {
+            for slot in &held.slots {
+                if let Some(ram) = &slot.buffer {
+                    ram.cancelled.store(true, Release);
+                }
+            }
+            self.host.wake_warm();
+            notify_owners(held.observers);
             self.table.changed();
             true
         } else {
             false
         }
+    }
+    /// Reclaim one least-recently-used idle region. A live lease or actual byte
+    /// fill protects only that region; other regions of its layout can give way.
+    pub fn release_unused_ram(&self) -> bool {
+        if self.host.check_process().is_err() {
+            return false;
+        }
+        let mut state = self.host.state.lock();
+        let victim = state
+            .ram
+            .iter_mut()
+            .flat_map(|(key, held)| {
+                held.slots
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(move |(index, slot)| {
+                        slot.idle().then_some((*key, index, slot.used))
+                    })
+            })
+            .min_by_key(|(_, _, used)| *used)
+            .map(|(key, index, _)| (key, index));
+        let Some((key, index)) = victim else {
+            return false;
+        };
+        state.clock = state.clock.saturating_add(1);
+        let generation = state.clock;
+        let Some(held) = state.ram.get_mut(&key) else {
+            return false;
+        };
+        let removed = held
+            .slots
+            .get_mut(index)
+            .and_then(|slot| slot.buffer.take());
+        if let Some(ram) = &removed {
+            ram.cancelled.store(true, Release);
+        }
+        held.generation = generation;
+        let observers = held.observers.clone();
+        if held.slots.iter().all(|slot| slot.buffer.is_none()) {
+            state.ram.remove(&key);
+        }
+        drop(state);
+        drop(removed); // actually unmap/free this region outside the table lock
+        self.host.wake_warm();
+        notify_owners(observers);
+        self.table.changed();
+        true
     }
     pub fn drop_kept(&self) {
         self.custody.lock().pages.clear();
@@ -951,11 +1057,7 @@ impl Row {
     }
     /// Wake a blocked reclaim worker after its close flag changes.
     pub fn wake(&self) -> Result<()> {
-        let slot = self.table.slot(self.owner)?;
-        slot.bell.fetch_add(1, Release);
-        wake(&slot.bell);
-        self.table.changed();
-        Ok(())
+        self.table.signal(self.owner)
     }
     pub fn ack(&self, ask: Ask) -> Result<()> {
         let slot = self.table.slot(self.owner)?;
@@ -1001,75 +1103,88 @@ pub struct RamRegion {
     pub len: u64,
     pub items: Vec<Item>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RamStatus {
+    pub generation: u64,
+    pub filling: bool,
+    pub ready: Vec<bool>,
+}
+fn validate_regions(regions: &[RamRegion]) -> Result<()> {
+    let mut end = 0u64;
+    for region in regions {
+        if region.len == 0 || region.offset < end {
+            return Err(Error::Invalid(
+                "RAM regions must be ordered and nonoverlapping".into(),
+            ));
+        }
+        end = region
+            .offset
+            .checked_add(region.len)
+            .ok_or_else(|| Error::Invalid("RAM region overflow".into()))?;
+        let mut intervals = Vec::new();
+        for item in &region.items {
+            let item_end = item
+                .offset
+                .checked_add(item.len)
+                .ok_or_else(|| Error::Invalid("RAM item overflow".into()))?;
+            if item.offset < region.offset || item_end > end {
+                return Err(Error::Invalid("RAM item exceeds its region".into()));
+            }
+            match &item.source {
+                ItemSource::Object(range)
+                    if range.len != item.len
+                        || range
+                            .off
+                            .checked_add(range.len)
+                            .is_none_or(|n| n > range.obj.length) =>
+                {
+                    return Err(Error::Invalid("RAM object range exceeds source".into()))
+                }
+                ItemSource::Inline(bytes) if bytes.len() as u64 != item.len => {
+                    return Err(Error::Invalid("RAM inline length differs".into()))
+                }
+                _ => (),
+            }
+            intervals.push((item.offset, item_end));
+        }
+        intervals.sort_unstable();
+        let mut previous = region.offset;
+        for (start, finish) in intervals {
+            if start < previous {
+                return Err(Error::Invalid("RAM items overlap".into()));
+            }
+            previous = finish;
+        }
+    }
+    if regions.is_empty() {
+        return Err(Error::Invalid("empty RAM layout".into()));
+    }
+    Ok(())
+}
 struct Ram {
     file: File,
     base: usize,
     len: usize,
-    regions: Vec<RamRegion>,
-    ready: Vec<AtomicBool>,
+    region: RamRegion,
+    ready: AtomicBool,
+    pending: AtomicBool,
     filling: AtomicBool,
+    cancelled: AtomicBool,
 }
-// SAFETY: regions are disjoint, one worker writes them, and a region is published only after
-// its TensorFS read finishes. Receivers get read-only file descriptions, never this pointer.
+// SAFETY: one worker owns writes, then ready publishes an immutable region.
+// Readers receive read-only descriptions and hold independent region leases.
 unsafe impl Send for Ram {}
 unsafe impl Sync for Ram {}
 impl Ram {
-    fn new(regions: Vec<RamRegion>) -> Result<Self> {
-        let mut end = 0u64;
-        for region in &regions {
-            if region.len == 0 || region.offset < end {
-                return Err(Error::Invalid(
-                    "RAM regions must be ordered and nonoverlapping".into(),
-                ));
-            }
-            end = region
-                .offset
-                .checked_add(region.len)
-                .ok_or_else(|| Error::Invalid("RAM region overflow".into()))?;
-            let mut intervals = Vec::new();
-            for item in &region.items {
-                let item_end = item
-                    .offset
-                    .checked_add(item.len)
-                    .ok_or_else(|| Error::Invalid("RAM item overflow".into()))?;
-                if item.offset < region.offset || item_end > end {
-                    return Err(Error::Invalid("RAM item exceeds its region".into()));
-                }
-                match &item.source {
-                    ItemSource::Object(range)
-                        if range.len != item.len
-                            || range
-                                .off
-                                .checked_add(range.len)
-                                .is_none_or(|n| n > range.obj.length) =>
-                    {
-                        return Err(Error::Invalid("RAM object range exceeds source".into()))
-                    }
-                    ItemSource::Inline(bytes) if bytes.len() as u64 != item.len => {
-                        return Err(Error::Invalid("RAM inline length differs".into()))
-                    }
-                    _ => (),
-                }
-                intervals.push((item.offset, item_end));
-            }
-            intervals.sort_unstable();
-            let mut previous = region.offset;
-            for (start, finish) in intervals {
-                if start < previous {
-                    return Err(Error::Invalid("RAM items overlap".into()));
-                }
-                previous = finish;
-            }
-        }
-        let len =
-            usize::try_from(end).map_err(|_| Error::Invalid("RAM layout too large".into()))?;
-        if len == 0 {
-            return Err(Error::Invalid("empty RAM layout".into()));
-        }
-        let file =
-            File::from(shm::memfd_named("varena-ram").map_err(crate::os("create RAM layout"))?);
-        file.set_len(end).map_err(|e| io("size RAM layout", e))?;
-        // SAFETY: a sized memfd; this mapping is the sole writer and is retained until drop.
+    fn new(region: RamRegion) -> Result<Self> {
+        let len = usize::try_from(region.len)
+            .map_err(|_| Error::Invalid("RAM region too large".into()))?;
+        let file = File::from(
+            shm::memfd_named("varena-ram-region").map_err(crate::os("create RAM region"))?,
+        );
+        file.set_len(region.len)
+            .map_err(|e| io("size RAM region", e))?;
+        // SAFETY: a sized, nonempty region; this is its sole writable mapping.
         let base = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -1081,38 +1196,178 @@ impl Ram {
             )
         };
         if base == libc::MAP_FAILED {
-            return Err(last("map RAM layout"));
+            return Err(last("map RAM region"));
         }
         let ram = Self {
             file,
             base: base as usize,
             len,
-            ready: regions.iter().map(|_| AtomicBool::new(false)).collect(),
-            filling: AtomicBool::new(true),
-            regions,
+            region,
+            ready: AtomicBool::new(false),
+            pending: AtomicBool::new(true),
+            filling: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         };
-        shm::seal(ram.file.as_fd()).map_err(crate::os("seal RAM layout"))?;
+        shm::seal(ram.file.as_fd()).map_err(crate::os("seal RAM region"))?;
         Ok(ram)
     }
 }
 impl Drop for Ram {
     fn drop(&mut self) {
-        // SAFETY: the worker and service retain an Arc until they finish using this mapping.
+        // SAFETY: active writers/readers retain their own Arc or file/lease owners.
         unsafe {
             libc::munmap(self.base as *mut libc::c_void, self.len);
         }
     }
 }
-struct RamHeld {
-    layout: Arc<Ram>,
+struct RamSlot {
+    buffer: Option<Arc<Ram>>,
     readers: Vec<UnixStream>,
     used: u64,
+}
+impl RamSlot {
+    fn missing(&self) -> bool {
+        self.buffer
+            .as_ref()
+            .is_none_or(|ram| !ram.pending.load(Acquire) && !ram.ready.load(Acquire))
+    }
+    fn idle(&mut self) -> bool {
+        self.readers
+            .retain(|reader| !platform::handles::hung_up(reader));
+        self.readers.is_empty()
+            && self
+                .buffer
+                .as_ref()
+                .is_some_and(|ram| !ram.filling.load(Acquire))
+    }
+}
+struct RamHeld {
+    regions: Vec<RamRegion>,
+    slots: Vec<RamSlot>,
+    observers: BTreeMap<Subscriber, Weak<Table>>,
+    identity: u64,
+    generation: u64,
+}
+impl RamHeld {
+    fn prune(&mut self) {
+        self.observers.retain(|subscriber, table| {
+            table.upgrade().is_some_and(|table| {
+                table
+                    .slot(subscriber.owner)
+                    .is_ok_and(|slot| slot.state.load(Acquire) & 3 == LIVE)
+            })
+        });
+    }
 }
 #[derive(Default)]
 struct Custody {
     pages: BTreeMap<PageKey, Kept>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Subscriber {
+    table: (u64, u64),
+    owner: Owner,
+    token: u64,
+}
+/// A machine service's explicitly owned host tier. It is shared by that service's
+/// per-GPU ledgers, never by a static registry, and drops with its last owner.
+pub struct HostCache {
+    process: u32,
+    state: Mutex<HostState>,
+    warming: Mutex<bool>,
+    next_warm: Condvar,
+}
+#[derive(Default)]
+struct HostState {
     ram: BTreeMap<[u8; 32], RamHeld>,
     clock: u64,
+    claims: BTreeMap<u64, Option<u64>>,
+}
+impl HostState {
+    fn can_warm(&self, available: i64, bytes: u64) -> bool {
+        let Some(claimed) = self
+            .claims
+            .values()
+            .try_fold(0_u64, |sum, need| need.map(|need| sum.saturating_add(need)))
+        else {
+            return false;
+        };
+        u64::try_from(available).is_ok_and(|available| available >= bytes.saturating_add(claimed))
+    }
+}
+impl Default for HostCache {
+    fn default() -> Self {
+        Self {
+            process: std::process::id(),
+            state: Mutex::default(),
+            warming: Mutex::new(false),
+            next_warm: Condvar::new(),
+        }
+    }
+}
+impl HostCache {
+    fn wake_warm(&self) {
+        let _active = self.warming.lock();
+        self.next_warm.notify_all();
+    }
+    fn can_warm(&self, available: i64, bytes: u64) -> bool {
+        self.state.lock().can_warm(available, bytes)
+    }
+    fn begin_fill(
+        &self,
+        layout: [u8; 32],
+        identity: u64,
+        index: usize,
+        ram: &Arc<Ram>,
+        available: i64,
+    ) -> bool {
+        let state = self.state.lock();
+        if !state.can_warm(available, ram.len as u64) || ram.cancelled.load(Acquire) {
+            return false;
+        }
+        let current = state
+            .ram
+            .get(&layout)
+            .filter(|held| held.identity == identity)
+            .and_then(|held| held.slots.get(index))
+            .and_then(|slot| slot.buffer.as_ref())
+            .is_some_and(|current| Arc::ptr_eq(current, ram));
+        if current {
+            ram.filling.store(true, Release);
+        }
+        current
+    }
+    fn check_process(&self) -> Result<()> {
+        if self.process != std::process::id() {
+            return Err(Error::Invalid(
+                "host cache must be created after fork; adopt a grant instead".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn warm_slot(&self, ram: &Ram) -> Option<WarmSlot<'_>> {
+        let mut active = self.warming.lock();
+        while *active {
+            if ram.cancelled.load(Acquire) {
+                return None;
+            }
+            self.next_warm.wait(&mut active);
+        }
+        if ram.cancelled.load(Acquire) {
+            return None;
+        }
+        *active = true;
+        Some(WarmSlot(self))
+    }
+}
+/// Serialize optional cache fills so they cannot spend the same observed host
+/// headroom twice. The coordination mutex is released before any byte I/O.
+struct WarmSlot<'a>(&'a HostCache);
+impl Drop for WarmSlot<'_> {
+    fn drop(&mut self) {
+        *self.0.warming.lock() = false;
+        self.0.next_warm.notify_all();
+    }
 }
 impl Custody {
     fn orphan(&mut self, owner: Owner) {
@@ -1138,31 +1393,227 @@ fn orphan(table: &Table, page: &Kept) -> bool {
     })
 }
 
+fn notify_owners(observers: BTreeMap<Subscriber, Weak<Table>>) {
+    for (subscriber, table) in observers {
+        if let Some(table) = table.upgrade() {
+            let _ = table.signal(subscriber.owner);
+        }
+    }
+}
+fn ram_status(state: &HostState, layout: [u8; 32]) -> Option<RamStatus> {
+    let held = state.ram.get(&layout)?;
+    Some(RamStatus {
+        generation: held.generation,
+        filling: held.slots.iter().any(|slot| {
+            slot.buffer
+                .as_ref()
+                .is_some_and(|ram| ram.pending.load(Acquire))
+        }),
+        ready: held
+            .slots
+            .iter()
+            .map(|slot| {
+                slot.buffer
+                    .as_ref()
+                    .is_some_and(|ram| ram.ready.load(Acquire))
+            })
+            .collect(),
+    })
+}
+struct RamFill {
+    ram: Arc<Ram>,
+    index: usize,
+    table: Arc<Table>,
+    host: Arc<HostCache>,
+    layout: [u8; 32],
+    identity: u64,
+    complete: bool,
+}
+impl Drop for RamFill {
+    fn drop(&mut self) {
+        let available = platform::contain::host_memory::read().available;
+        let observers = {
+            let mut state = self.host.state.lock();
+            let room = state.can_warm(available, 0);
+            self.ram.ready.store(self.complete, Release);
+            self.ram.filling.store(false, Release);
+            self.ram.pending.store(false, Release);
+            state.clock = state.clock.saturating_add(1);
+            let generation = state.clock;
+            let observers = state
+                .ram
+                .get_mut(&self.layout)
+                .filter(|held| held.identity == self.identity)
+                .filter(|held| {
+                    held.slots
+                        .get(self.index)
+                        .and_then(|slot| slot.buffer.as_ref())
+                        .is_some_and(|ram| Arc::ptr_eq(ram, &self.ram))
+                })
+                .map(|held| {
+                    if !room {
+                        if let Some(slot) = held.slots.get_mut(self.index) {
+                            if slot.idle() {
+                                if let Some(ram) = slot.buffer.take() {
+                                    ram.cancelled.store(true, Release);
+                                }
+                            }
+                        }
+                    }
+                    held.generation = generation;
+                    held.observers.clone()
+                })
+                .unwrap_or_default();
+            if state
+                .ram
+                .get(&self.layout)
+                .is_some_and(|held| held.slots.iter().all(|slot| slot.buffer.is_none()))
+            {
+                state.ram.remove(&self.layout);
+            }
+            observers
+        };
+        notify_owners(observers);
+        self.table.changed();
+    }
+}
+fn same_regions(a: &[RamRegion], b: &[RamRegion]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(a, b)| a.offset == b.offset && a.len == b.len)
+}
 fn register_ram(
     table: &Arc<Table>,
-    custody: &Mutex<Custody>,
+    host: &Arc<HostCache>,
     layout: [u8; 32],
     source: Arc<Source>,
     regions: Vec<RamRegion>,
+    observer: Option<(Owner, u64)>,
 ) -> Result<bool> {
-    let ram = Arc::new(Ram::new(regions)?);
-    let mut custody = custody.lock();
-    if custody.ram.contains_key(&layout) {
+    validate_regions(&regions)?;
+    let missing = {
+        let state = host.state.lock();
+        if let Some(held) = state.ram.get(&layout) {
+            if !same_regions(&held.regions, &regions) {
+                return Err(Error::Invalid(
+                    "RAM fingerprint has a different layout".into(),
+                ));
+            }
+            held.slots
+                .iter()
+                .enumerate()
+                .filter_map(|(index, slot)| slot.missing().then_some(index))
+                .collect::<Vec<_>>()
+        } else {
+            (0..regions.len()).collect()
+        }
+    };
+    // Creating/sealing mappings never holds the host table lock.
+    let created = missing
+        .into_iter()
+        .map(|index| {
+            let region = regions
+                .get(index)
+                .ok_or_else(|| Error::Invalid("RAM region absent".into()))?
+                .clone();
+            Ram::new(region).map(|ram| (index, Arc::new(ram)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (identity, work, retired) = {
+        let mut state = host.state.lock();
+        if !state.ram.contains_key(&layout) {
+            state.clock = state
+                .clock
+                .checked_add(1)
+                .ok_or_else(|| Error::Invalid("RAM generation exhausted".into()))?;
+            let identity = state.clock;
+            state.ram.insert(
+                layout,
+                RamHeld {
+                    regions: regions.clone(),
+                    slots: regions
+                        .iter()
+                        .map(|_| RamSlot {
+                            buffer: None,
+                            readers: vec![],
+                            used: identity,
+                        })
+                        .collect(),
+                    observers: BTreeMap::new(),
+                    identity,
+                    generation: identity,
+                },
+            );
+        }
+        let held = state
+            .ram
+            .get_mut(&layout)
+            .ok_or_else(|| Error::Invalid("RAM layout absent".into()))?;
+        if !same_regions(&held.regions, &regions) {
+            return Err(Error::Invalid(
+                "RAM fingerprint has a different layout".into(),
+            ));
+        }
+        held.prune();
+        if let Some((owner, token)) = observer {
+            held.observers.insert(
+                Subscriber {
+                    table: table.identity,
+                    owner,
+                    token,
+                },
+                Arc::downgrade(table),
+            );
+        }
+        let mut work = Vec::new();
+        let mut retired = Vec::new();
+        for (index, ram) in created {
+            if let Some(slot) = held.slots.get_mut(index).filter(|slot| slot.missing()) {
+                if let Some(old) = slot.buffer.replace(ram.clone()) {
+                    retired.push(old);
+                }
+                work.push((index, ram));
+            }
+        }
+        (held.identity, work, retired)
+    };
+    drop(retired);
+    if work.is_empty() {
         return Ok(false);
     }
-    let (fill, table) = (ram.clone(), table.clone());
-    std::thread::Builder::new()
+    let (table, host) = (table.clone(), host.clone());
+    let (failed_host, failed_table) = (host.clone(), table.clone());
+    let started = std::thread::Builder::new()
         .name("varena-ram".into())
         .spawn(move || {
-            for (region, ready) in fill.regions.iter().zip(&fill.ready) {
-                // SAFETY: validated nonoverlapping ranges in this worker's writable mapping.
+            let active = work
+                .iter()
+                .find(|(_, ram)| !ram.cancelled.load(Acquire))
+                .map(|(_, ram)| ram.clone());
+            let permit = active.as_ref().and_then(|ram| host.warm_slot(ram));
+            for (index, ram) in work {
+                let mut finished = RamFill {
+                    ram: ram.clone(),
+                    index,
+                    table: table.clone(),
+                    host: host.clone(),
+                    layout,
+                    identity,
+                    complete: false,
+                };
+                let available = platform::contain::host_memory::read().available;
+                if permit.is_none() || !host.begin_fill(layout, identity, index, &ram, available) {
+                    continue;
+                }
+                // SAFETY: this worker exclusively writes this independent region mapping.
                 let result = unsafe {
                     source.read_items(
-                        &region.items,
-                        region.offset,
+                        &ram.region.items,
+                        ram.region.offset,
                         Dst::Host {
-                            ptr: (fill.base + region.offset as usize) as *mut u8,
-                            len: region.len as usize,
+                            ptr: ram.base as *mut u8,
+                            len: ram.len,
                         },
                         1,
                         Mode::Cache,
@@ -1170,34 +1621,52 @@ fn register_ram(
                     )
                 };
                 match result {
-                    Ok(_) => {
-                        ready.store(true, Release);
-                        table.changed();
-                    }
+                    Ok(_) => finished.complete = true,
                     Err(error) => tracing::warn!(%error, "RAM region remains on disk"),
                 }
             }
-            fill.filling.store(false, Release);
-            table.changed();
-        })
-        .map_err(|e| io("start RAM fill", e))?;
-    custody.clock = custody.clock.saturating_add(1);
-    let used = custody.clock;
-    custody.ram.insert(
-        layout,
-        RamHeld {
-            layout: ram,
-            readers: Vec::new(),
-            used,
-        },
-    );
+        });
+    if let Err(error) = started {
+        let mut removed = Vec::new();
+        let observers = {
+            let mut state = failed_host.state.lock();
+            state
+                .ram
+                .get_mut(&layout)
+                .filter(|held| held.identity == identity)
+                .map(|held| {
+                    for slot in &mut held.slots {
+                        if slot.buffer.as_ref().is_some_and(|ram| {
+                            ram.pending.load(Acquire) && !ram.filling.load(Acquire)
+                        }) {
+                            if let Some(ram) = slot.buffer.take() {
+                                ram.cancelled.store(true, Release);
+                                removed.push(ram);
+                            }
+                        }
+                    }
+                    held.observers.clone()
+                })
+                .unwrap_or_default()
+        };
+        drop(removed);
+        notify_owners(observers);
+        failed_table.changed();
+        return Err(io("start RAM fill", error));
+    }
     Ok(true)
 }
 
 /// The grant channel carries only placement custody, never model headers or data bytes.
 /// Packet: op/u8, row/u32, generation/u64, fingerprint/32 bytes, page/u64, count/u32,
 /// spans/count*u64; an offer then sends one SCM_RIGHTS container. Imports consume it once.
-fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex<Custody>>) {
+fn serve(
+    mut stream: UnixStream,
+    pid: u32,
+    table: Arc<Table>,
+    custody: Arc<Mutex<Custody>>,
+    host: Arc<HostCache>,
+) {
     let result = (|| -> Result<()> {
         let mut bound = None;
         loop {
@@ -1345,35 +1814,53 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                         .map_err(|e| io("acknowledge release", e))?;
                 }
                 Some(4) => {
-                    let mut held = custody.lock();
-                    held.clock = held.clock.saturating_add(1);
-                    let used = held.clock;
-                    let ready = held.ram.get_mut(&key.fingerprint).and_then(|ram| {
-                        let index = usize::try_from(key.page).ok()?;
-                        let region = ram.layout.regions.get(index)?;
-                        let (offset, len) = (region.offset, region.len);
-                        ram.layout
-                            .ready
-                            .get(index)?
-                            .load(Acquire)
-                            .then_some((ram, offset, len))
-                    });
-                    if let Some((ram, offset, len)) = ready {
-                        ram.used = used;
+                    let ready = {
+                        let held = host.state.lock();
+                        held.ram.get(&key.fingerprint).and_then(|held| {
+                            let index = usize::try_from(key.page).ok()?;
+                            let slot = held.slots.get(index)?;
+                            let ram = slot.buffer.as_ref()?;
+                            ram.ready
+                                .load(Acquire)
+                                .then(|| (ram.clone(), held.identity, index))
+                        })
+                    };
+                    let ready = if let Some((ram, identity, index)) = ready {
                         let (ours, theirs) =
                             UnixStream::pair().map_err(|e| io("create RAM reader lease", e))?;
-                        let file = shm::reopen(ram.layout.file.as_fd(), false)
+                        let file = shm::reopen(ram.file.as_fd(), false)
                             .map_err(crate::os("open read-only RAM"))?;
+                        let mut state = host.state.lock();
+                        state.clock = state.clock.saturating_add(1);
+                        let used = state.clock;
+                        state
+                            .ram
+                            .get_mut(&key.fingerprint)
+                            .filter(|held| held.identity == identity)
+                            .and_then(|held| held.slots.get_mut(index))
+                            .filter(|slot| {
+                                slot.buffer
+                                    .as_ref()
+                                    .is_some_and(|current| Arc::ptr_eq(current, &ram))
+                            })
+                            .map(|slot| {
+                                slot.used = used;
+                                slot.readers.push(ours);
+                                (file, theirs, ram.len as u64)
+                            })
+                    } else {
+                        None
+                    };
+                    if let Some((file, lease, len)) = ready {
                         stream
                             .write_all(&[1])
-                            .and_then(|_| stream.write_all(&offset.to_le_bytes()))
+                            .and_then(|_| stream.write_all(&0_u64.to_le_bytes()))
                             .and_then(|_| stream.write_all(&len.to_le_bytes()))
                             .map_err(|e| io("send RAM region", e))?;
                         platform::handles::send_fd(&stream, &file)
                             .map_err(crate::os("send RAM file"))?;
-                        platform::handles::send_fd(&stream, &theirs)
+                        platform::handles::send_fd(&stream, &lease)
                             .map_err(crate::os("send RAM lease"))?;
-                        ram.readers.push(ours);
                     } else {
                         stream.write_all(&[0]).map_err(|e| io("send RAM miss", e))?;
                     }
@@ -1441,14 +1928,80 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                         .collect::<Result<Vec<_>>>()?;
                     let accepted = register_ram(
                         &table,
-                        &custody,
+                        &host,
                         key.fingerprint,
                         Arc::new(Source::files(files, true, 0)),
                         regions,
+                        Some((owner, key.page)),
                     )?;
                     stream
                         .write_all(&[u8::from(accepted)])
                         .map_err(|e| io("ack RAM registration", e))?;
+                }
+                Some(8) => {
+                    let status = ram_status(&host.state.lock(), key.fingerprint);
+                    stream
+                        .write_all(&[u8::from(status.is_some())])
+                        .map_err(|e| io("send RAM status", e))?;
+                    if let Some(status) = status {
+                        stream
+                            .write_all(&status.generation.to_le_bytes())
+                            .and_then(|_| stream.write_all(&[u8::from(status.filling)]))
+                            .and_then(|_| {
+                                stream.write_all(&(status.ready.len() as u64).to_le_bytes())
+                            })
+                            .and_then(|_| {
+                                stream.write_all(
+                                    &status.ready.into_iter().map(u8::from).collect::<Vec<_>>(),
+                                )
+                            })
+                            .map_err(|e| io("send RAM readiness", e))?;
+                    }
+                }
+                Some(9) => {
+                    let mut held = host.state.lock();
+                    let remove = held.ram.get_mut(&key.fingerprint).is_some_and(|ram| {
+                        ram.observers.remove(&Subscriber {
+                            table: table.identity,
+                            owner,
+                            token: key.page,
+                        });
+                        ram.prune();
+                        ram.observers.is_empty()
+                    });
+                    let removed = if remove {
+                        held.ram.remove(&key.fingerprint)
+                    } else {
+                        None
+                    };
+                    drop(held);
+                    if let Some(ram) = removed {
+                        for slot in &ram.slots {
+                            if let Some(buffer) = &slot.buffer {
+                                buffer.cancelled.store(true, Release);
+                            }
+                        }
+                    }
+                    host.wake_warm();
+                    stream
+                        .write_all(&[1])
+                        .map_err(|e| io("ack RAM unsubscribe", e))?;
+                }
+                Some(10) => {
+                    let (server, client) =
+                        UnixStream::pair().map_err(|e| io("fork grant channel", e))?;
+                    let (table, custody, host, pid) = (
+                        table.clone(),
+                        custody.clone(),
+                        host.clone(),
+                        slot.pid.load(Acquire),
+                    );
+                    std::thread::Builder::new()
+                        .name("varena-custody".into())
+                        .spawn(move || serve(server, pid, table, custody, host))
+                        .map_err(|e| io("start forked grant", e))?;
+                    platform::handles::send_fd(&stream, &client)
+                        .map_err(crate::os("send forked grant"))?;
                 }
                 _ => return Err(Error::Invalid("unknown custody command".into())),
             }
@@ -1464,6 +2017,26 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
 /// Executor half of a grant. Operations are serialized, with no background CUDA work.
 pub struct Channel(Mutex<UnixStream>);
 impl Channel {
+    /// A separate stream to the same service custody, including for adopted ledgers.
+    /// Background cache registration cannot occupy the GPU demand stream.
+    pub fn fork(&self, owner: Owner) -> Result<Self> {
+        let mut stream = self.0.lock();
+        Self::header(
+            &mut stream,
+            10,
+            owner,
+            PageKey {
+                fingerprint: [0; 32],
+                page: 0,
+            },
+            0,
+        )?;
+        let fd = platform::handles::recv_fd(&stream).map_err(crate::os("receive forked grant"))?;
+        drop(stream);
+        let channel = Self::new(fd);
+        channel.bind(owner)?;
+        Ok(channel)
+    }
     pub fn new(fd: OwnedFd) -> Self {
         Self(Mutex::new(UnixStream::from(fd)))
     }
@@ -1613,6 +2186,75 @@ impl Channel {
 }
 
 impl Channel {
+    /// Withdraw a closed model's interest. Existing reader FDs remain valid; an
+    /// unobserved cache stops warming and disappears from subsequent snapshots.
+    pub fn forget_ram(&self, owner: Owner, layout: [u8; 32], token: u64) -> Result<()> {
+        let mut stream = self.0.lock();
+        Self::header(
+            &mut stream,
+            9,
+            owner,
+            PageKey {
+                fingerprint: layout,
+                page: token,
+            },
+            0,
+        )?;
+        let mut ack = [0];
+        stream
+            .read_exact(&mut ack)
+            .map_err(|e| io("read RAM unsubscribe", e))?;
+        if ack != [1] {
+            return Err(Error::Invalid("invalid RAM unsubscribe".into()));
+        }
+        Ok(())
+    }
+    /// Snapshot only. Completion and eviction also wake subscribed owner rows.
+    pub fn ram_status(&self, owner: Owner, layout: [u8; 32]) -> Result<Option<RamStatus>> {
+        let mut stream = self.0.lock();
+        Self::header(
+            &mut stream,
+            8,
+            owner,
+            PageKey {
+                fingerprint: layout,
+                page: 0,
+            },
+            0,
+        )?;
+        let mut present = [0];
+        stream
+            .read_exact(&mut present)
+            .map_err(|e| io("read RAM status", e))?;
+        if present == [0] {
+            return Ok(None);
+        }
+        if present != [1] {
+            return Err(Error::Invalid("invalid RAM status".into()));
+        }
+        let generation = read_u64(&mut stream)?;
+        let mut filling = [0];
+        stream
+            .read_exact(&mut filling)
+            .map_err(|e| io("read RAM fill status", e))?;
+        let count = usize::try_from(read_u64(&mut stream)?)
+            .map_err(|_| Error::Invalid("RAM region count overflow".into()))?;
+        if count > MAX_RAM_ITEMS || filling[0] > 1 {
+            return Err(Error::Invalid("invalid RAM readiness".into()));
+        }
+        let mut ready = vec![0; count];
+        stream
+            .read_exact(&mut ready)
+            .map_err(|e| io("read RAM readiness", e))?;
+        if ready.iter().any(|value| *value > 1) {
+            return Err(Error::Invalid("invalid RAM ready flag".into()));
+        }
+        Ok(Some(RamStatus {
+            generation,
+            filling: filling[0] == 1,
+            ready: ready.into_iter().map(|v| v == 1).collect(),
+        }))
+    }
     pub fn release_orphan(&self, owner: Owner, key: PageKey) -> Result<bool> {
         let mut stream = self.0.lock();
         Self::header(&mut stream, 5, owner, key, 0)?;
@@ -1767,6 +2409,18 @@ impl Channel {
         files: &[(ObjectRef, OwnedFd)],
         regions: &[RamRegion],
     ) -> Result<bool> {
+        self.cache_ram_tagged(owner, layout, files, regions, 0)
+    }
+    /// A model-specific subscription prevents a closing registration from withdrawing
+    /// a newer model's interest in the same shared layout.
+    pub fn cache_ram_tagged(
+        &self,
+        owner: Owner,
+        layout: [u8; 32],
+        files: &[(ObjectRef, OwnedFd)],
+        regions: &[RamRegion],
+        token: u64,
+    ) -> Result<bool> {
         if files.len() > 4096 || regions.len() > MAX_RAM_ITEMS {
             return Err(Error::Invalid("RAM registration is too large".into()));
         }
@@ -1803,7 +2457,7 @@ impl Channel {
             owner,
             PageKey {
                 fingerprint: layout,
-                page: 0,
+                page: token,
             },
             files.len(),
         )?;

@@ -1098,3 +1098,66 @@ async fn advanced_exact_object_fetch_does_not_widen_the_window_and_uses_the_exis
     .unwrap();
     assert_eq!(fs::read(cache.join(repo_object.key())).unwrap(), readme);
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn source_export_lazily_downloads_only_selected_verified_objects() {
+    use tensorfs::io::{source::Item, ItemSource, ObjectRange};
+    let scratch = Scratch::new();
+    let data = fixture(&scratch.0);
+    let origin = scratch.0.join("origin");
+    let producer = Client::new(config(
+        &scratch.0.join("producer"),
+        origin.to_str().unwrap(),
+    ))
+    .unwrap();
+    let tree = producer
+        .upload_folder(&"acme/export".parse().unwrap(), &data.folder, None)
+        .await
+        .unwrap();
+    let http = Http::new(origin);
+    let reader = Client::new(config(&scratch.0.join("reader"), &http.url)).unwrap();
+    let checkpoint = reader.open(&tree.id(), &Open::default()).await.unwrap();
+    let source = checkpoint.source(false);
+    let object = data.chunks[1].clone();
+    let selected = object.clone();
+    let exported = tokio::task::spawn_blocking(move || {
+        source.export_files(&[Item {
+            offset: 0,
+            len: 3,
+            part_end: true,
+            source: ItemSource::Object(ObjectRange {
+                obj: selected,
+                off: 2,
+                len: 3,
+            }),
+        }])
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(exported.len(), 1);
+    assert_eq!(exported[0].0, object);
+    assert_eq!(
+        checkpoint
+            .missing(&Selection::All)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            data.chunks[0].clone(),
+            data.chunks[2].clone(),
+            data.asset.clone()
+        ])
+    );
+    drop(checkpoint);
+    drop(reader);
+    let mut bytes = Vec::new();
+    exported[0]
+        .1
+        .try_clone()
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, b"ijklmnop");
+}

@@ -738,6 +738,7 @@ impl Pool {
         crate::launch_identity::remove_stale_jit(root, &incarnation);
         remove_old_executor_roots(root);
         let mut devices = vec![];
+        let host_cache = Arc::new(crate::memory::slim::HostCache::default());
         for entry in &envelope {
             // Per GPU: its own sample log and learned file (two writers would tear them).
             let mut memory = config.memory.clone();
@@ -756,8 +757,8 @@ impl Pool {
                 .filter(|gpu| gpu.memory_bytes > 0 && !gpu.device_uuid.is_empty())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,
                     format!("GPU {entry} needs an inventory UUID and a nonzero memory capacity")))?;
-            let placement = Some(crate::memory::slim::Memory::create(
-                &physical.device_uuid, physical.memory_bytes, config.authorized_device_limit_bytes)
+            let placement = Some(crate::memory::slim::Memory::create_with_host(
+                &physical.device_uuid, physical.memory_bytes, config.authorized_device_limit_bytes, host_cache.clone())
                 .map_err(io::Error::other)?);
             devices.push(Device {
                 entry: entry.clone(),
@@ -871,6 +872,16 @@ impl Pool {
             || self.end_idle_parent(false) > 0
             || self.end_idle_deviceless(|_| true)
             || self.end_lru_idle("", false, 0..0)
+    }
+    fn prepare_host_cache(&self, reservation: u64, need: Option<u64>) {
+        if let Some(memory) = self.devices.iter().find_map(|device| device.memory.placement().ok()) {
+            memory.prepare_host(reservation, need);
+        }
+    }
+    fn finish_host_cache(&self, reservation: u64) {
+        if let Some(memory) = self.devices.iter().find_map(|device| device.memory.placement().ok()) {
+            memory.finish_host(reservation);
+        }
     }
     /// End the least recently used idle deviceless executor `which` picks; whether one ended.
     fn end_idle_deviceless(&self, which: impl Fn(&Session) -> bool) -> bool {
@@ -1024,7 +1035,7 @@ impl Pool {
         drop(levels);
         let mut admitted = self.admitted.lock().unwrap();
         if admitted.get(&key).and_then(|admission| admission.birth.as_ref()).is_some_and(|owner| gone.contains(owner)) {
-            admitted.remove(&key);
+            if let Some(admission) = admitted.remove(&key) { self.finish_host_cache(admission.reservation); }
         }
         drop(admitted);
         self.leaders.lock().unwrap().retain(|_, (birth, p, lane)|
@@ -1038,7 +1049,7 @@ impl Pool {
                 } else {
                     device.memory.finished(plan);
                     device.memory.with(|gpu| gpu.ended(plan));
-                    accounting.remove(&slot);
+                    if let Some(owner) = accounting.remove(&slot) { self.finish_host_cache(owner.reservation); }
                 }
             }
         }
@@ -1086,7 +1097,7 @@ impl Pool {
         let key = session_key(plan, start);
         let mut admitted = self.admitted.lock().unwrap();
         if admitted.get(&key).is_some_and(|admission| admission.reservation == reservation && admission.birth.is_none()) {
-            admitted.remove(&key);
+            if let Some(admission) = admitted.remove(&key) { self.finish_host_cache(admission.reservation); }
         }
     }
 
@@ -1134,6 +1145,7 @@ impl Pool {
         if degree > 0 && owners.get(&(plan.to_owned(), start)).and_then(|owner| owner.birth.as_ref()) != Some(birth) {
             return;
         }
+        if let Some(owner) = owners.get(&(plan.to_owned(), start)) { self.finish_host_cache(owner.reservation); }
         for device in self.lane(start, degree).unwrap_or_default() {
             device.memory.finished(plan);
         }
@@ -2787,6 +2799,12 @@ impl Pool {
             Some(session) => {
                 *disposition = Disposition::Unknown(executor_births(&session.executor.birth, &session.followers));
                 self.born(&session.plan, session.start, session.degree, &session.executor.birth);
+                let reservation = self.accounting.lock().unwrap().get(&(session.plan.clone(), session.start)).map(|owner| owner.reservation);
+                if let Some(reservation) = reservation {
+                    let need = self.devices.get(start).map(|device| device.memory.with(|gpu|
+                        gpu.learned.plans.get(&plan.construction).map_or(0, |plan| plan.host_bytes))).filter(|bytes| *bytes > 0);
+                    self.prepare_host_cache(reservation, need);
+                }
                 self.followed(&session.plan, session.start, &session.executor.birth, &session.followers);
                 engine.register_managed(
                     id,
@@ -3170,7 +3188,11 @@ impl Pool {
             let mut admitted = self.admitted.lock().unwrap();
             let key = session_key(&construction, start);
             if admitted.get(&key).and_then(|admission| admission.birth.as_ref()) == Some(&session.executor.birth) {
-                admitted.remove(&key);
+                if let Some(admission) = admitted.remove(&key) {
+                    let measured = self.devices.get(start).map(|device| device.memory.with(|gpu|
+                        gpu.learned.plans.get(&construction).map_or(0, |plan| plan.host_bytes))).filter(|bytes| *bytes > 0);
+                    self.prepare_host_cache(admission.reservation, measured);
+                }
             }
         }
         if load_only {
@@ -3397,7 +3419,12 @@ impl Pool {
                 .get(plan)
                 .map_or(0, |learned| learned.host_bytes)
         });
+        self.prepare_host_cache(reservation, (need > 0).then_some(need));
         if need == 0 {
+            let previous = self.admitted.lock().unwrap().insert(session_key(plan, start), Admission { bytes: 0, reservation, birth: None });
+            if let Some(previous) = previous.filter(|previous| previous.reservation != reservation) {
+                self.finish_host_cache(previous.reservation);
+            }
             return true;
         }
         loop {
@@ -3412,7 +3439,8 @@ impl Pool {
             let others: u64 = admitted.iter().filter(|(k, _)| **k != key).map(|(_, admission)| admission.bytes).sum();
             let available = available.map(|available| available.saturating_sub(others));
             if available.is_none_or(|available| available >= need) {
-                admitted.insert(key, Admission { bytes: need, reservation, birth: None });
+                let previous = admitted.insert(key, Admission { bytes: need, reservation, birth: None });
+                if let Some(previous) = previous.filter(|previous| previous.reservation != reservation) { self.finish_host_cache(previous.reservation); }
                 return true;
             }
             drop(admitted);
@@ -3420,12 +3448,16 @@ impl Pool {
             // A parent with no live child (cheaper to recreate than an executor with its
             // weights), then idle executors.
             let own = start..start + degree as usize;
-            let ended = self.end_idle_parent(spare) > 0 || self.end_lru_idle(plan, spare, own);
+            let ended = self.devices.iter().any(|device| device.memory.placement().is_ok_and(|memory| memory.release_unused_ram()))
+                || self.end_idle_parent(spare) > 0 || self.end_lru_idle(plan, spare, own);
             self.notes.note(serde_json::json!({"event": "host_room", "plan": plan,
                 "need": need, "available": available, "ended": ended}));
             if !ended {
                 if !spare {
-                    self.admitted.lock().unwrap().insert(key, Admission { bytes: need, reservation, birth: None });
+                    let previous = self.admitted.lock().unwrap().insert(key, Admission { bytes: need, reservation, birth: None });
+                    if let Some(previous) = previous.filter(|previous| previous.reservation != reservation) { self.finish_host_cache(previous.reservation); }
+                } else {
+                    self.finish_host_cache(reservation);
                 }
                 return false;
             }
@@ -5104,6 +5136,36 @@ mod tests {
         assert!(pool.host_room("image", 1, 1, false, 2));
         pool.admitted.lock().unwrap().clear();
 
+        pool.stop().unwrap();
+        crate::scratch::remove(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_admission_sheds_library_regions_for_unknown_and_measured_peaks_without_psi() {
+        let (root, pool, _engine) = pool_of(1);
+        let memory = pool.devices[0].memory.placement().unwrap();
+        let ledger = memory.ledger().clone();
+        let events = memory.event_source().unwrap();
+        for (reservation, measured) in [(1, false), (2, true)] {
+            let key = [reservation as u8; 32];
+            ledger.cache_ram(key, Arc::new(tensorfs::io::source::Source::files(vec![], false, 0)),
+                vec![varena::ledger::RamRegion { offset: 0, len: 4 << 20, items: vec![] }]).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while ledger.ram_status(key).is_some_and(|status| status.filling) {
+                    crate::memory::slim::Memory::changed(&events).await.unwrap();
+                }
+            }).await.unwrap();
+            assert_eq!(ledger.ram_status(key).unwrap().ready, vec![true]);
+            if measured {
+                pool.devices[0].memory.with(|gpu| gpu.learned.plans.entry("host-demand".into()).or_default().host_bytes = u64::MAX);
+            }
+            assert_eq!(pool.host_room("host-demand", 0, 1, false, reservation), !measured);
+            assert_eq!(pool.admitted.lock().unwrap().get(&session_key("host-demand", 0)).unwrap().reservation, reservation,
+                "demand is admitted even when its host peak exceeds available room");
+            assert!(ledger.ram_status(key).is_none(), "admission retained optional RAM before a large/unknown allocation");
+            pool.clear_unborn("host-demand", 0, 1, reservation);
+        }
         pool.stop().unwrap();
         crate::scratch::remove(&root);
     }
