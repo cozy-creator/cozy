@@ -291,6 +291,33 @@ fn named_table_and_measured_peaks_survive_coordinator_restart() {
 }
 
 #[test]
+fn a_new_cap_requires_every_executor_to_release_its_claim() {
+    let fixture = Fixture::new();
+    fixture.ledger.record_peak("package", "shape", 900).unwrap();
+    let mut child = ChildRow::spawn(&fixture.ledger);
+    assert!(Ledger::create(&fixture.name, CAPACITY / 2).is_err());
+    child.kill();
+    fixture.ledger.reap(child.process.id()).unwrap();
+    let resized = Ledger::create(&fixture.name, CAPACITY / 2).unwrap();
+    assert_eq!(resized.capacity(), CAPACITY / 2);
+    assert_eq!(fixture.ledger.capacity(), CAPACITY / 2);
+    assert!(resized.peaks().is_empty());
+}
+
+#[test]
+fn a_normal_close_can_reopen_without_reaping_the_live_process() {
+    let fixture = Fixture::new();
+    let row = fixture.ledger.claim(std::process::id()).unwrap();
+    let old = row.owner();
+    drop(row);
+    assert!(fixture.ledger.status().unwrap().rows.is_empty());
+    let next = fixture.ledger.claim(std::process::id()).unwrap();
+    assert_ne!(next.owner(), old);
+    assert!(fixture.ledger.ask(old, 1, Class::Unused).is_err());
+    assert_eq!(fixture.ledger.status().unwrap().rows.len(), 1);
+}
+
+#[test]
 fn killed_exporter_leaves_one_importable_page_and_live_eviction_leaves_none() {
     let fixture = Fixture::new();
     let mut first = ChildRow::spawn(&fixture.ledger);
@@ -390,7 +417,25 @@ fn ram_service_fills_through_tensorfs_and_retains_a_readers_layout() {
     assert_eq!(data, "datadata");
     assert!(!fixture.ledger.release_ram(layout));
     drop(view);
-    assert!(fixture.ledger.release_ram(layout));
+    // Region readiness can precede completion of the final fill bookkeeping.
+    // A busy return is followed by the ledger's completion wake, not a timer poll.
+    while !fixture.ledger.release_ram(layout) {
+        let mut pending = libc::pollfd {
+            fd: fixture.ledger.events().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut pending, 1, 3000) },
+            1,
+            "fill did not finish"
+        );
+        let mut word = [0u8; 8];
+        assert_eq!(
+            unsafe { libc::read(pending.fd, word.as_mut_ptr().cast(), word.len()) },
+            8
+        );
+    }
 }
 
 #[test]

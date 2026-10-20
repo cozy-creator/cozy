@@ -1037,7 +1037,17 @@ impl Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
-        let safe = io::drain(self.device.ordinal).is_ok() && self.device.stream.drain().is_ok();
+        let safe = io::drain(self.device.ordinal).is_ok()
+            && self.device.stream.drain().is_ok()
+            && self
+                .device
+                .enter()
+                .and_then(|_context| {
+                    // Last-owner teardown includes consumer streams whose release
+                    // is still queued, including per-thread default streams.
+                    call!("cuCtxSynchronize", ctx_synchronize())
+                })
+                .is_ok();
         if !safe {
             // An unfinished engine read may still borrow source descriptors and host
             // mappings. Keep the complete owner graph alive until process teardown.
