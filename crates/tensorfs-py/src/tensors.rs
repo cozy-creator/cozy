@@ -473,10 +473,13 @@ impl PyTensors {
         offset: u64,
     ) -> PyResult<()> {
         if out.hasattr("__dlpack__")? {
-            let held = crate::store::Dlpack::of(py, out, None, None)?;
+            let mut held = crate::store::Dlpack::of(py, out, None, None)?;
             let result = self.fill_target(py, key, role.as_deref(), offset, held.destination());
-            py.detach(move || drop(held));
-            return result;
+            if result.is_err() {
+                held.retain_after_cuda_error();
+            }
+            let finished = py.detach(move || held.finish()).or_raise(py);
+            return result.and(finished);
         }
         let view = py
             .import("builtins")?

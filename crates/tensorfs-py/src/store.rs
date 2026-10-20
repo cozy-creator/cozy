@@ -1192,6 +1192,7 @@ pub struct PyArray {
 const KDL_CPU: i32 = 1;
 const KDL_CUDA: i32 = 2;
 const DLTENSOR: &CStr = c"dltensor";
+const USED_DLTENSOR: &CStr = c"used_dltensor";
 
 #[repr(C)]
 struct DLDevice {
@@ -1428,12 +1429,101 @@ impl PyArray {
     }
 }
 
-/// The shared contiguous DLPack view used by both the Writer and destination reads.
-/// Callers move/drop this owner in a detached closure: the stream drains before the capsule
-/// releases its producer allocation, including when an operation refuses the view.
+/// The transferred DLPack lifetime. Final release always runs on the existing cleanup
+/// worker, after native operations and Writer locks have ended.
+struct DlpackRelease {
+    stream: Option<tensorfs::io::cuda::Stream>,
+    producer: Option<Py<PyAny>>,
+    capsule: Option<Py<PyAny>>,
+    managed: Option<usize>,
+    quiescent: bool,
+}
+
+impl DlpackRelease {
+    fn retain(&mut self) {
+        // Failed completion is not permission to free producer memory. Preserve every
+        // actual owner, including the stream/context, rather than an address-only guard.
+        std::mem::forget(self.stream.take());
+        std::mem::forget(self.producer.take());
+        std::mem::forget(self.capsule.take());
+        let _ = self.managed.take();
+    }
+
+    fn drain(&mut self) -> tensorfs::Result<()> {
+        if self.quiescent {
+            return Ok(());
+        }
+        if let Some(stream) = &self.stream {
+            if let Err(error) = stream.drain() {
+                self.retain();
+                return Err(error.into());
+            }
+        }
+        self.quiescent = true;
+        Ok(())
+    }
+}
+
+impl Drop for DlpackRelease {
+    fn drop(&mut self) {
+        if self.drain().is_err() {
+            return;
+        }
+        // A checked drain has proved quiescence. Destroy the stream/context before
+        // calling a foreign producer, whose deleter may acquire Python or native locks.
+        drop(self.stream.take());
+        if Python::try_attach(|_| {
+            if let Some(managed) = self.managed.take() {
+                let managed = managed as *mut DLManagedTensor;
+                // SAFETY: successful capsule rename transferred this unique managed
+                // tensor to us; all uses have completed and it is released exactly once.
+                if let Some(deleter) = unsafe { (*managed).deleter } {
+                    unsafe { deleter(managed) };
+                }
+            }
+            drop(self.capsule.take());
+            drop(self.producer.take());
+        })
+        .is_none()
+        {
+            // Interpreter shutdown cannot safely run a Python-aware foreign deleter.
+            self.retain();
+        }
+    }
+}
+
+struct DlpackLifetime(Option<DlpackRelease>);
+
+impl DlpackLifetime {
+    fn retain_uncertain(&mut self) {
+        // An engine error does not currently prove its other copy streams stopped.
+        // Keep the actual stream and producer owners, not merely the raw pointer.
+        std::mem::forget(self.0.take());
+    }
+
+    fn finish(&mut self) -> tensorfs::Result<()> {
+        if let Some(release) = &mut self.0 {
+            release.drain()?;
+        }
+        crate::cleanup::defer(self.0.take());
+        Ok(())
+    }
+}
+
+impl Drop for DlpackLifetime {
+    fn drop(&mut self) {
+        // Never acquire Python or invoke a producer while a caller's Writer/GPU mutex
+        // is held. This also covers validation errors and a never-read device source.
+        if let Some(release) = self.0.take() {
+            crate::cleanup::defer(release);
+        }
+    }
+}
+
+/// The one shared contiguous DLPack parser for Writer sources and read destinations.
+/// Validated legacy capsules are consumed once and retain a unique managed deleter.
 pub(crate) struct Dlpack {
-    pub(crate) stream: Option<tensorfs::io::cuda::Stream>,
-    pub(crate) capsule: Py<PyAny>,
+    lifetime: DlpackLifetime,
     pub(crate) device: (i32, i32),
     pub(crate) dtype: Dtype,
     pub(crate) shape: Vec<u64>,
@@ -1465,31 +1555,40 @@ impl Dlpack {
                 ))
             }
         };
-        let exported = (|| {
-            if let Some(stream) = &stream {
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("stream", stream.raw())?;
-                data.call_method("__dlpack__", (), Some(&kwargs))
-            } else {
-                data.call_method0("__dlpack__")
-            }
-        })();
-        let capsule = match exported {
-            Ok(capsule) => capsule.unbind(),
-            Err(error) => {
-                py.detach(move || drop(stream));
-                return Err(error);
-            }
-        };
+        let mut lifetime = DlpackLifetime(Some(DlpackRelease {
+            stream,
+            producer: Some(data.clone().unbind()),
+            capsule: None,
+            managed: None,
+            quiescent: false,
+        }));
+        let exported = if let Some(stream) = &lifetime.0.as_ref().unwrap().stream {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("stream", stream.raw())?;
+            data.call_method("__dlpack__", (), Some(&kwargs))
+        } else {
+            data.call_method0("__dlpack__")
+        }?;
+        lifetime.0.as_mut().unwrap().capsule = Some(exported.unbind());
         let parsed = (|| {
-            let capsule = capsule.bind(py);
+            let capsule = lifetime
+                .0
+                .as_ref()
+                .unwrap()
+                .capsule
+                .as_ref()
+                .unwrap()
+                .bind(py);
             if unsafe { ffi::PyCapsule_IsValid(capsule.as_ptr(), DLTENSOR.as_ptr()) } != 1 {
                 return Err(invalid(py, "__dlpack__ did not return a dltensor capsule"));
             }
             let managed = unsafe {
                 ffi::PyCapsule_GetPointer(capsule.as_ptr(), DLTENSOR.as_ptr())
-                    as *const DLManagedTensor
+                    as *mut DLManagedTensor
             };
+            if managed.is_null() {
+                return Err(PyErr::fetch(py));
+            }
             let tensor = unsafe { &(*managed).dl_tensor };
             if tensor.device.device_type != device.0
                 || (device.0 == KDL_CUDA && tensor.device.device_id != device.1)
@@ -1553,21 +1652,19 @@ impl Dlpack {
             if address.checked_add(len).is_none() {
                 return Err(invalid(py, "DLPack address range overflows"));
             }
-            Ok((dtype, shape, len, address))
+            Ok((dtype, shape, len, address, managed as usize))
         })();
-        let (dtype, shape, len, address) = match parsed {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                py.detach(move || {
-                    drop(stream);
-                    drop(capsule);
-                });
-                return Err(error);
-            }
-        };
+        let (dtype, shape, len, address, managed) = parsed?;
+        let release = lifetime.0.as_mut().unwrap();
+        let capsule = release.capsule.as_ref().unwrap().bind(py);
+        // SAFETY: both names have static storage. Validation completed before this
+        // single ownership transfer; no fallible work lies between rename and guard.
+        if unsafe { ffi::PyCapsule_SetName(capsule.as_ptr(), USED_DLTENSOR.as_ptr()) } != 0 {
+            return Err(PyErr::fetch(py));
+        }
+        release.managed = Some(managed);
         Ok(Self {
-            stream,
-            capsule,
+            lifetime,
             device,
             dtype,
             shape,
@@ -1576,8 +1673,25 @@ impl Dlpack {
         })
     }
 
+    pub(crate) fn stream(&self) -> Option<&tensorfs::io::cuda::Stream> {
+        self.lifetime
+            .0
+            .as_ref()
+            .and_then(|release| release.stream.as_ref())
+    }
+
+    pub(crate) fn retain_after_cuda_error(&mut self) {
+        if self.device.0 == KDL_CUDA {
+            self.lifetime.retain_uncertain();
+        }
+    }
+
+    pub(crate) fn finish(&mut self) -> tensorfs::Result<()> {
+        self.lifetime.finish()
+    }
+
     pub(crate) fn destination(&self) -> tensorfs::io::Dst {
-        match &self.stream {
+        match self.stream() {
             Some(stream) => tensorfs::io::Dst::Device {
                 device: self.device.1,
                 ptr: self.address as u64,
@@ -1794,39 +1908,33 @@ impl PyComponentWriter {
             let shape = shape.ok_or_else(|| invalid(py, "a buffer needs shape"))?;
             return self.put(py, key, dtype, shape, data);
         }
-        let view = Dlpack::of(py, data, dtype, shape)?;
-        self.w.get().with(py, move |writer| {
-            let Dlpack {
-                stream,
-                capsule,
-                device,
-                dtype,
-                shape,
-                len,
-                address,
-            } = view;
-            if let Some(stream) = stream {
-                let mut source = crate::dlpack_source::DeviceSource::new(
-                    capsule,
-                    stream,
-                    device.1,
-                    address as u64,
-                    len,
-                )?;
-                return writer
+        let mut view = Dlpack::of(py, data, dtype, shape)?;
+        let dtype = view.dtype.clone();
+        let shape = view.shape.clone();
+        if view.stream().is_some() {
+            let mut source = crate::dlpack_source::DeviceSource::new(view).or_raise(py)?;
+            let result = self.w.get().with(py, |writer| {
+                writer
                     .component_writer(&self.name)?
-                    .put(&key, dtype, &shape, &mut source);
-            }
-            let _capsule = capsule;
-            let mut bytes = if len == 0 {
+                    .put(&key, dtype, &shape, &mut source)
+            });
+            // The Writer mutex has been released before drain or foreign cleanup.
+            let finished = py.detach(|| source.finish()).or_raise(py);
+            return result.and(finished);
+        }
+        let result = self.w.get().with(py, |writer| {
+            let mut bytes = if view.len == 0 {
                 &[][..]
             } else {
-                unsafe { std::slice::from_raw_parts(address as *const u8, len) }
+                // SAFETY: the consumed managed owner remains in view until after put.
+                unsafe { std::slice::from_raw_parts(view.address as *const u8, view.len) }
             };
             writer
                 .component_writer(&self.name)?
                 .put(&key, dtype, &shape, &mut bytes)
-        })
+        });
+        let finished = py.detach(|| view.finish()).or_raise(py);
+        result.and(finished)
     }
 
     fn put(
