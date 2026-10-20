@@ -353,13 +353,13 @@ tensorfs.upload_folder(repo_id="acme/example", folder_path="./portable", endpoin
 
 A `.cozytensors` file is a small handle into the shared local store, not a self-contained file: a save writes the
 header, and its tensors and supporting-file bytes stay in the store while that file holds this header. Delete or
-overwrite the file and the data ages out like any other cache entry. The copy for another machine is
+overwrite the file and the data expires like any other local copy. The copy for another machine is
 `materialize(checkpoint, local_dir=…)`: `model.cozytensors` (or a named variant) plus complete `chunks/<sha256>`
 objects. `Writer()` without a destination keeps the checkpoint in the store as a cache entry. `base=` reuses
 unchanged tensors and `resume=` journals local work. `Writer(repo_id=…, endpoint=…, token=…)` streams new objects
 and appends an unreleased tree, named `model.<variant>.cozytensors` by `variant=`, which needs `repo_id`. Its
-successful checkpoint carries the exact published tree; an upload failure keeps `writer.local_checkpoint` and
-remains an error.
+successful checkpoint carries the exact published tree; an upload failure keeps `writer.local_checkpoint`, which
+can be published again for 7 days, and remains an error.
 
 The default endpoint is `https://tensorhub.com`; `configure(endpoint=…)` or `TENSORFS_ENDPOINT` changes it.
 `token=` accepts a string, a callable, or an object with `headers(method, url, headers,
@@ -371,7 +371,9 @@ Public data needs no account. [Distribution](https://github.com/cozy-creator/coz
 
 The shared local store is internal. Its default root is `~/.cache/tensorfs`; `cache_dir=` and `TENSORFS_HOME` override it. Processes
 share immutable objects and coordinated records. Admission hashes bytes before installing them by rename; ordinary
-opens check lengths. A saved header file roots its data until the file is deleted or holds another header. Explicit verification rehashes on demand. TensorFS is a library and has no daemon.
+opens check lengths. Local copies expire 7 days after their last use, least recently used first when the disk runs low;
+header files (written by `Writer(dest)` or opened by path) and `local/` references keep their data while they exist.
+Explicit verification rehashes on demand. TensorFS is a library and has no daemon.
 
 Runtime and TensorD use this same public API. Callers read and write the shared store and upload with a supplied
 credential. TensorFS owns I/O and decoding; varena owns memory placement. Installing the wheel does

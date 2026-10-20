@@ -233,9 +233,8 @@ checkpoint.download(components=["unet"], priority=0, progress=on_progress)
 ```
 
 `download` returns when all requested chunks and supporting files are verified and locally
-available, or raises an error. The open checkpoint retains them. Closing its last handle
-allows ordinary cache policy to apply again; a saved header file roots its data while it
-holds that header.
+available, or raises an error. The open checkpoint retains them; closing its last handle
+returns them to the [cache](#the-local-cache).
 Progress callbacks receive `(stage, completed, total)`; download counts are locally available
 bytes out of requested bytes, while conversion counts are tensors.
 
@@ -427,10 +426,11 @@ encodings and references. Store paths, credentials and endpoint URLs stay in con
 not in the file. Opening it uses the configured store and, when needed and allowed, the
 configured source.
 
-The store keeps the saved data while that file still holds this header. Once the file is
-deleted, moved or overwritten with another header, the data ages out like any other cache
-entry; open checkpoints keep their bytes meanwhile. To copy a checkpoint to another machine,
-write the portable form with `tensorfs.materialize(saved, local_dir=...)` (described below).
+The store keeps the saved data while that file exists and holds this header. `open(path)` on a
+header file holds its data the same way where it is opened, so a moved or copied file is held
+once it is opened. Without such a file the data is an ordinary [cache](#the-local-cache) entry;
+open checkpoints keep their bytes meanwhile. To copy a checkpoint to another machine, write the
+portable form with `tensorfs.materialize(saved, local_dir=...)` (described below).
 
 The file identifies one checkpoint, not an enclosing repository tree. It contains no release
 label or repository README/LICENSE files; those remain available on a checkpoint opened
@@ -461,7 +461,8 @@ Its options and members are:
 
 An exceptional context exit abandons the writer unless a resume key requests retained state.
 An upload failure remains an error; it can also carry `error.checkpoint` and populate
-`writer.local_checkpoint`. Retry publication of the retained result without rerunning training.
+`writer.local_checkpoint`. That result can be published again without rerunning training for as
+long as the [cache](#the-local-cache) keeps it: 7 days after its last use.
 
 A `ComponentWriter` supports:
 
@@ -526,6 +527,14 @@ to try again after a response. These are duck-typed protocols, not classes you m
 Progress and repository-change callback exceptions can propagate normally. An ordinary
 exception from a token provider is wrapped as `DeniedError`; a TensorFS exception retains
 its family. Credentials do not follow cross-origin redirects.
+
+### The local cache
+
+Every process on a machine shares one store: `cache_dir=`, else `TENSORFS_HOME`, else
+`~/.cache/tensorfs`. Local copies expire 7 days after their last use, and the least recently
+used are evicted first when the disk runs low. Header files (written by `Writer(dest)` or
+opened by path) and `local/` references keep their data while they exist. There is no public
+cache API.
 
 ### Optional filesystem escape hatches
 
