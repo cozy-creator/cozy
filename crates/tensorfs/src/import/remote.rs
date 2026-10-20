@@ -72,18 +72,16 @@ impl Default for Access {
 }
 
 impl Access {
-    /// Provider credentials from `HF_TOKEN` and `CIVITAI_TOKEN`.
+    /// Provider credentials as the environment holds them for each provider's host.
     pub fn from_env() -> Access {
-        let bearer = |var: &str| {
-            std::env::var(var)
-                .ok()
-                .filter(|t| !t.trim().is_empty())
-                .map_or_else(String::new, |t| format!("bearer {}", t.trim()))
+        let access = Access::default();
+        let bearer = |base: &str| {
+            crate::fetch::token::env_token(base).map_or_else(String::new, |t| format!("bearer {t}"))
         };
         Access {
-            huggingface_token: bearer("HF_TOKEN"),
-            civitai_token: bearer("CIVITAI_TOKEN"),
-            ..Access::default()
+            huggingface_token: bearer(&access.huggingface),
+            civitai_token: bearer(&access.civitai),
+            ..access
         }
     }
 }

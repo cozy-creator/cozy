@@ -103,19 +103,26 @@ impl Client {
             kind: Kind::Unsupported,
             detail: "conversion needs the caller's active Tokio runtime".into(),
         })?;
+        // The caller's credential is the sources' one: it replaces the environment's, so a
+        // request carries one Authorization.
+        let token = self.config.token.clone().map(|p| {
+            Arc::new(provider::NativeProvider(p)) as Arc<dyn crate::fetch::TokenProvider>
+        });
+        let environment = match token {
+            Some(_) => Access::default(),
+            None => Access::from_env(),
+        };
         Ok(Access {
             // A supplied loopback source is the existing explicit local-source carve-out.
             allow_local: sources
                 .iter()
                 .any(|s| crate::fetch::policy::is_loopback_origin(s)),
-            token: self.config.token.clone().map(|p| {
-                Arc::new(provider::NativeProvider(p)) as Arc<dyn crate::fetch::TokenProvider>
-            }),
+            token,
             runtime: Some(runtime),
             cancelled: Some(control.cancelled.clone()),
             cancel_notify: Some(control.notify.clone()),
             ca_der: self.config.ca_der.clone(),
-            ..crate::import::Access::from_env()
+            ..environment
         })
     }
 
