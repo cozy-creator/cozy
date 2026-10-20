@@ -263,6 +263,14 @@ def generate(args):
             commands.append(copied)
         spec['native_io'] = {'source': proof_source, 'contract_sha256': digest(raw_contract), 'commands': commands}
         spec['requested'].extend(native_io.IDS)
+    if getattr(args, 'include_resident_decode', False):
+        for path in native_io.RESIDENT_FILES:
+            try:
+                files[path] = git(args.creator_repo, 'show', f'{proof_source}:{path}').decode()
+            except subprocess.CalledProcessError as error:
+                raise ValueError('resident source/corpus unavailable: ' + path) from error
+        spec['resident_decode'] = {'source': proof_source, **native_io.resident_contract(files)}
+        spec['requested'].append(native_io.RESIDENT)
     spec['pending'] = contract['pending']
     spec['unrequested'] = [name for name in native_io.ALL if name not in spec['requested']]
     spec['sources'] = {name: digest(text.encode()) for name, text in files.items()}
@@ -306,5 +314,6 @@ if __name__ == '__main__':
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--include-kernel', action='store_true', help='include the source-matched clean-child kernel proof')
     p.add_argument('--include-native-io', action='store_true', help='include source-matched read/provider/fork proofs')
+    p.add_argument('--include-resident-decode', action='store_true', help='include the frozen resident GPU decode proof')
     p.add_argument('--require-native-mode', action='append', default=[], help='fail if this owner-approved mode is absent')
     print(generate(p.parse_args()))

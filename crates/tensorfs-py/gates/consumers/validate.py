@@ -164,7 +164,7 @@ def physical(run, machine, identities, launch, payload_sha):
             'evidence': 'positive public GPU execution UUID/index/PID/time + sealed child Torch UUID/NVML + public one-GPU launch/machine snapshot'}
 
 
-def validate(root, expected, run, machine, launch, require_kernel=False):
+def validate(root, expected, run, machine, launch, require_kernel=False, require_resident=False):
     root = Path(root)
     spec = dict(expected)
     payload_sha = spec.pop('payload_sha256')
@@ -182,8 +182,10 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
             requested == [name for name in native_io.ALL if name in requested], 'wrong requested consumer/case set')
     require(all(name in requested for name in native_io.IDS) == any(name in requested for name in native_io.IDS), 'partial native I/O batch')
     require(('native_io' in spec) == all(name in requested for name in native_io.IDS), 'native I/O request/contract differs')
+    require(('resident_decode' in spec) == (native_io.RESIDENT in requested), 'resident request/contract differs')
     require(spec.get('unrequested') == [name for name in native_io.ALL if name not in requested], 'unrequested cases are ambiguous')
     require(not require_kernel or 'kernel' in requested, 'kernel proof was not requested')
+    require(not require_resident or native_io.RESIDENT in requested, 'resident proof was not requested')
     require(read(root / 'manifest.json') == spec, 'returned manifest differs from coordinator freeze')
     require(sha(root / 'source/payload.py') == payload_sha, 'executed payload source differs')
     for name, (filename, count, size) in CONSUMERS.items():
@@ -207,6 +209,10 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
     require(set(actual) == expected_files, 'unexpected/missing receipt files or model/checkpoint bytes')
     for name, expected_sha in spec['sources'].items():
         require(sha(root / 'source' / name) == expected_sha, 'retained source hash differs')
+    if 'resident_decode' in spec:
+        files = {path: (root / 'source' / path).read_text() for path in native_io.RESIDENT_FILES}
+        require(exact(spec['resident_decode'], {'source': spec['proof_source'], **native_io.resident_contract(files)}),
+                'resident frozen source/contract differs')
     require(sha(root / 'source/requirements.txt') == spec['dependencies']['sha256'], 'requirements freeze differs')
     if 'native_io' in spec:
         path = root / 'source/native/contract.json'
@@ -281,16 +287,21 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
         require(child.get('cublas_workspace_config') == ':4096:8', f'{name}: missing pre-init deterministic matmul environment')
         value = read(root / f'reports/{name}.json')
         stdout = (root / f'logs/{name}.stdout').read_text()
-        rows = []
-        for line in stdout.splitlines():
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(row, dict) and ((name != 'kernel' and row.get('proof') == value.get('proof')) or
-                                         (name == 'kernel' and row.get('schema') == KERNEL_SCHEMA)):
-                rows.append(row)
-        require(rows == [value], f'{name}: report differs from actual subprocess stdout')
+        if name == native_io.RESIDENT:
+            require(exact(value, native_io.parse_resident(stdout, spec['resident_decode'], spec['native'],
+                                                         versions['torch'], child.get('gpu_uuid'))),
+                    'resident report differs from actual subprocess stdout')
+        else:
+            rows = []
+            for line in stdout.splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and ((name != 'kernel' and row.get('proof') == value.get('proof')) or
+                                             (name == 'kernel' and row.get('schema') == KERNEL_SCHEMA)):
+                    rows.append(row)
+            require(rows == [value], f'{name}: report differs from actual subprocess stdout')
         if name == 'kernel':
             require(child.get('torch_present') is False and child.get('triton_present') is False and
                     child.get('torch_loaded') is False and child.get('triton_loaded') is False, 'kernel child is not clean TensorFS-only')
@@ -322,13 +333,23 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
                 child.get('cuda_initialized_before_probe') is False, f'{name}: no exact real CUDA/pre-init observation')
         visible = child.get('cuda_visible_devices')
         require(isinstance(visible, str) and visible and ',' not in visible and visible == identity.get('cuda_visible_devices'), f'{name}: sealed GPU visibility differs')
-        consumer(name, value, spec, child)
+        if name == native_io.RESIDENT:
+            argv = part.get('command', [])
+            contract = spec['resident_decode']
+            require(len(argv) == 8 and all(isinstance(a, str) and a for a in argv) and
+                    type(part['timeout_s']) is int and part['timeout_s'] == native_io.RESIDENT_TIMEOUT and
+                    argv[1].endswith('/source/child.py') and
+                    argv[2].endswith('/reports/resident-decode-identity.json') and argv[3] == name and
+                    argv[4].endswith('/source/' + contract['file']) and argv[5:7] == ['--gpu', '--vectors'] and
+                    argv[7].endswith('/source/' + contract['vectors_file']), 'resident child invocation differs')
+        else:
+            consumer(name, value, spec, child)
         devices.append(child)
     observed = physical(run, machine, devices, launch, payload_sha)
     bound = public_tree(root, run, identity)
     return {'ok': True, 'requested': requested, 'unrequested': spec['unrequested'],
             'context_device': identity['context_device'], 'physical': observed, 'public_tree': bound,
-            'scope': 'tiny model/library forwards; no ComfyUI graph/visual or unrequested kernel qualification'}
+            'scope': 'requested tiny model/library probes only; no ComfyUI graph/visual or unrequested mode qualification'}
 
 
 if __name__ == '__main__':
@@ -339,8 +360,9 @@ if __name__ == '__main__':
     p.add_argument('--machine-show', type=Path, required=True)
     p.add_argument('--launch', type=Path, required=True, help='coordinator-recorded actual public cozy argv and payload_sha256')
     p.add_argument('--require-kernel', action='store_true')
+    p.add_argument('--require-resident-decode', action='store_true')
     args = p.parse_args()
     try:
-        print(json.dumps(validate(args.tree, read(args.manifest), read(args.run_show), read(args.machine_show), read(args.launch), args.require_kernel)))
+        print(json.dumps(validate(args.tree, read(args.manifest), read(args.run_show), read(args.machine_show), read(args.launch), args.require_kernel, args.require_resident_decode)))
     except (OSError, ValueError, TypeError, KeyError, IndexError, tarfile.TarError) as error:
         raise SystemExit(f'GPU consumer receipt refused: {error}') from error
