@@ -123,6 +123,8 @@ pub struct Request {
     pub resident_steps: BTreeSet<u32>,
     /// Members of these steps are needed together, with no order between models.
     pub joint_steps: BTreeSet<u32>,
+    /// Consumed pages within each member of the current joint step.
+    pub model_positions: BTreeMap<ModelId, u32>,
     pub can_cut: bool,
     pub can_lower: bool,
     /// Increment after a completed demand so a later demand can ask rows again.
@@ -130,6 +132,20 @@ pub struct Request {
 }
 
 impl Request {
+    fn pending(&self, page: &Page, usage: &Use) -> bool {
+        if usage.request != self.id || usage.position.step < self.position.step {
+            return false;
+        }
+        let order = if self.joint_steps.contains(&self.position.step) {
+            page.model
+                .and_then(|id| self.model_positions.get(&id))
+                .copied()
+                .unwrap_or(0)
+        } else {
+            self.position.order
+        };
+        usage.position.step > self.position.step || usage.position.order >= order
+    }
     pub fn step(&self) -> Step {
         Step {
             request: self.id,
@@ -363,27 +379,32 @@ impl Table {
     }
 
     pub fn bound(&mut self, request: RequestId, page: PageId) {
-        let Some(current) = self.request(request).map(|row| row.position) else {
+        let Some(current) = self.request(request) else {
             return;
         };
         let next = self.page(page).and_then(|page| {
             page.uses
                 .iter()
-                .filter(|usage| usage.request == request && usage.position >= current)
-                .map(|usage| usage.position)
+                .filter(|usage| current.pending(page, usage))
+                .map(|usage| (page.model, usage.position))
                 .min()
         });
-        if let (Some(next), Some(row)) =
+        if let (Some((model, next)), Some(row)) =
             (next, self.requests.iter_mut().find(|row| row.id == request))
         {
-            row.position = Position {
-                step: next.step,
-                order: if row.joint_steps.contains(&next.step) {
-                    0
-                } else {
-                    next.order.saturating_add(1)
-                },
-            };
+            if row.position.step != next.step {
+                row.model_positions.clear();
+            }
+            row.position.step = next.step;
+            if row.joint_steps.contains(&next.step) {
+                if let Some(model) = model {
+                    row.model_positions
+                        .insert(model, next.order.saturating_add(1));
+                }
+                row.position.order = 0;
+            } else {
+                row.position.order = next.order.saturating_add(1);
+            }
         }
     }
 
@@ -392,7 +413,7 @@ impl Table {
             .iter()
             .filter_map(|usage| {
                 let request = self.request(usage.request)?;
-                (usage.position >= request.position).then(|| {
+                request.pending(page, usage).then(|| {
                     (
                         usage.position.step.saturating_sub(request.position.step),
                         usage.position.order,
@@ -582,7 +603,7 @@ impl Table {
                             && page.uses.iter().any(|usage| {
                                 usage.request == id
                                     && usage.position.step == step
-                                    && usage.position >= request.position
+                                    && request.pending(page, usage)
                             })
                     })
                     .try_fold(0_u64, |sum, page| sum.checked_add(page.bytes))?;
@@ -893,7 +914,7 @@ fn demand(table: &Table, id: RequestId, need: u64, page: Option<PageId>) -> Vec<
     };
     let mut plan = Planner::new(table);
     if let Some(target) = page.and_then(|id| table.page(id)) {
-        if !stream_slot(&mut plan, request, target) {
+        if !stream_slot(&mut plan, request, target, true) {
             return vec![Action::Exhausted { request: id, need }];
         }
     }
@@ -939,7 +960,7 @@ fn current(page: &Page, request: &Request) -> bool {
     page.uses.iter().any(|usage| {
         usage.request == request.id
             && usage.position.step == request.position.step
-            && usage.position >= request.position
+            && request.pending(page, usage)
     })
 }
 
@@ -1024,7 +1045,7 @@ fn stream(table: &Table, id: RequestId) -> Vec<Action> {
     let Some(request) = table.request(id) else {
         return Vec::new();
     };
-    if request.measured().is_none() {
+    if request.measured().is_none() || request.joint_steps.contains(&request.position.step) {
         return Vec::new();
     }
     let mut next: Vec<_> = table
@@ -1039,17 +1060,12 @@ fn stream(table: &Table, id: RequestId) -> Vec<Action> {
         return Vec::new();
     };
     let mut plan = Planner::new(table);
-    if !stream_slot(&mut plan, request, page) {
+    if !stream_slot(&mut plan, request, page, false) {
         return Vec::new();
     }
     let reserve = table.protected_room().unwrap_or(u64::MAX).max(page.bytes);
     plan.take(reserve, |candidate, class| {
-        class <= Class::Orphan
-            || (candidate.row == request.row
-                && (class <= Class::Unused
-                    || (class == Class::Declared
-                        && candidate.lowered.contains(&id)
-                        && candidate.id != page.id)))
+        class <= Class::Orphan || (candidate.row == request.row && class <= Class::Unused)
     });
     if plan.free >= reserve {
         plan.fill(page, None);
@@ -1059,7 +1075,7 @@ fn stream(table: &Table, id: RequestId) -> Vec<Action> {
     }
 }
 
-fn stream_slot(plan: &mut Planner<'_>, request: &Request, target: &Page) -> bool {
+fn stream_slot(plan: &mut Planner<'_>, request: &Request, target: &Page, demand: bool) -> bool {
     if !target.lowered.contains(&request.id) {
         return true;
     }
@@ -1075,6 +1091,7 @@ fn stream_slot(plan: &mut Planner<'_>, request: &Request, target: &Page) -> bool
         page.model == target.model
             && page.lowered.contains(&request.id)
             && class < Class::Working
+            && (demand || class <= Class::Unused)
             && page.id != target.id
     }) {
         if mapped < 3 {
@@ -1110,7 +1127,7 @@ fn step_start(table: &Table, id: RequestId) -> Vec<Action> {
                     && page.uses.iter().any(|usage| {
                         usage.request == id
                             && usage.position.step == request.position.step
-                            && usage.position >= request.position
+                            && request.pending(page, usage)
                     })
             })
             .collect();
@@ -1199,6 +1216,7 @@ mod tests {
             sharing_limit: None,
             resident_steps: BTreeSet::new(),
             joint_steps: BTreeSet::new(),
+            model_positions: BTreeMap::new(),
             can_cut: false,
             can_lower: false,
             reclaim_round: 0,
@@ -1474,7 +1492,7 @@ mod tests {
         b.model = Some(2);
         b.uses.push(Use {
             request: 1,
-            position: Position { step: 0, order: 1 },
+            position: Position { step: 0, order: 0 },
         });
         let mut group = Table {
             capacity: 100,
@@ -1489,15 +1507,51 @@ mod tests {
         };
         // Joint members may bind B before A; neither model is an earlier ordered step.
         group.bound(1, 2);
-        assert!(group
-            .pages
-            .iter()
-            .all(|page| group.class(page) == Class::Working));
+        assert_eq!(group.class(group.page(1).expect("A")), Class::Working);
+        assert_eq!(group.class(group.page(2).expect("B")), Class::Unused);
         group.bound(1, 1);
         assert!(group
             .pages
             .iter()
-            .all(|page| group.class(page) == Class::Working));
+            .all(|page| group.class(page) == Class::Unused));
+
+        let mut ring = Table {
+            capacity: 100,
+            requests: vec![request(1)],
+            rows: vec![Row {
+                id: 1,
+                alive: true,
+                reaping: false,
+            }],
+            ..Default::default()
+        };
+        for id in 1..=4 {
+            let mut item = page(id, 10);
+            item.lowered.insert(1);
+            item.tier = if id < 4 { Tier::Gpu } else { Tier::Disk };
+            item.uses.push(Use {
+                request: 1,
+                position: Position {
+                    step: 0,
+                    order: id as u32 - 1,
+                },
+            });
+            ring.pages.push(item);
+        }
+        // A full ring may not exchange one unconsumed future page for another.
+        assert!(decide(&ring, Trigger::PinReleased(1)).is_empty());
+        ring.bound(1, 1);
+        let refill = decide(&ring, Trigger::PinReleased(1));
+        assert!(refill.contains(&Action::Unmap(1)));
+        assert!(refill
+            .iter()
+            .any(|action| matches!(action, Action::Fill { page: 4, .. })));
+        assert!(!refill.contains(&Action::Unmap(2)) && !refill.contains(&Action::Unmap(3)));
+        ring.requests[0].joint_steps.insert(0);
+        assert!(
+            decide(&ring, Trigger::PinReleased(1)).is_empty(),
+            "joint groups refill only on actual demand"
+        );
     }
 }
 

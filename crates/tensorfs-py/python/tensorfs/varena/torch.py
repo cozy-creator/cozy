@@ -393,11 +393,9 @@ class Model:
             return
         self.closed = True
         with ExitStack() as cleanup:
-            cleanup.callback(self.memory.models.pop, self.name, None)
-            cleanup.callback(self.memory.by_module.pop, self.module, None)
+            cleanup.callback(self.memory._forget, self)
             weights = getattr(self, "ws", None)
             if self.memory.native is not None and weights is not None:
-                cleanup.callback(self.memory._names.pop, weights.id, None)
                 cleanup.callback(self.memory.native.close_model, weights.id)
             for block in (self.common, *self.blocks):
                 cleanup.callback(_unbind, block)
@@ -605,7 +603,8 @@ class Memory:
         ck: tensorfs.Checkpoint | None,
         component: str | None,
     ) -> Model:
-        model = self.by_module.get(module)
+        with self.lock:
+            model = self.by_module.get(module)
         if model is not None:
             if self.native is not None:
                 self.native.load(model.ws.id, Level(level).value)
@@ -675,8 +674,17 @@ class Memory:
                 else:
                     vars(module)["_varena"] = original_declaration
             raise
-        self.models[model.name], self.by_module[module] = model, model
+        with self.lock:
+            self.models[model.name], self.by_module[module] = model, model
         return model
+
+    def _forget(self, model: Model) -> None:
+        with self.lock:
+            self.models.pop(model.name, None)
+            self.by_module.pop(model.module, None)
+            weights = getattr(model, "ws", None)
+            if weights is not None:
+                self._names.pop(weights.id, None)
 
     def _register(self, model: Model) -> None:
         assert self.native is not None
@@ -704,7 +712,8 @@ class Memory:
             fill if model.fill is not None else None,
         )
         model.version = version
-        self._names[model.ws.id] = model.name
+        with self.lock:
+            self._names[model.ws.id] = model.name
 
     def _load_host(self, model: Model) -> None:
         tensors = model.source.ck.components[model.component].tensors
@@ -1088,7 +1097,8 @@ class Memory:
     def resident(self) -> dict[str, int]:
         if self.native is not None:
             return dict(self.native.resident())
-        return {name: model.nbytes for name, model in self.models.items()}
+        with self.lock:
+            return {name: model.nbytes for name, model in self.models.items()}
 
     def free(self, device: torch.device, need: int) -> bool:
         if self.native is None or device != self.device:
