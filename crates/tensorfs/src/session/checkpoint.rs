@@ -427,35 +427,7 @@ impl Component {
     /// Write config and support files into the caller's directory, never model weights.
     /// Fetch Selection::Assets first; this synchronous operation never downloads.
     pub fn export_files(&self, dir: &Path) -> Result<PathBuf> {
-        let metadata = self.metadata();
-        for object in metadata.assets.values() {
-            if !self.data.raw.holds(object)? {
-                return fail(
-                    Kind::NotFound,
-                    format!(
-                        "{} is not present; fetch assets asynchronously first",
-                        object.id()
-                    ),
-                );
-            }
-        }
-        self.data.store.cache_preserve_snapshot(dir)?;
-        fs::create_dir_all(dir).map_err(|e| super::io_failure(dir.display(), e))?;
-        let config = dir.join(metadata.config_name());
-        if let Some(parent) = config.parent() {
-            fs::create_dir_all(parent).map_err(|e| super::io_failure(parent.display(), e))?;
-        }
-        fs::write(&config, crate::export::config_json(&metadata.config))
-            .map_err(|e| super::io_failure(config.display(), e))?;
-        for name in metadata.assets.keys() {
-            let path = dir.join(name);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|e| super::io_failure(parent.display(), e))?;
-            }
-            fs::write(&path, self.asset(name)?)
-                .map_err(|e| super::io_failure(path.display(), e))?;
-        }
-        Ok(dir.to_path_buf())
+        Ok(self.data.raw.export_component_files(&self.name, dir)?)
     }
 }
 
