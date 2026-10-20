@@ -669,6 +669,19 @@ class Memory:
     def _plan(
         self, steps: Sequence[PlanStep]
     ) -> tuple[tuple[tuple[str, ...], ...], list[list[int]]]:
+        if self.native is None:
+            names = []
+            for step in steps:
+                entries = [step] if isinstance(step, (str, Model, nn.Module)) else step
+                names.append(
+                    tuple(
+                        sorted(
+                            entry.name if isinstance(entry, Model) else str(entry)
+                            for entry in entries
+                        )
+                    )
+                )
+            return tuple(names), [[] for _ in names]
         names, ids = [], []
         for step in steps:
             entries = [step] if isinstance(step, (str, Model, nn.Module)) else step
@@ -687,7 +700,7 @@ class Memory:
                 if len(matches) != 1:
                     raise Unbound(f"plan model {entry!r} is absent or ambiguous")
                 found.extend(matches)
-            names.append(tuple(model.name for model in found))
+            names.append(tuple(sorted(model.name for model in found)))
             ids.append(
                 [model.ws.id for model in found] if self.native is not None else []
             )
