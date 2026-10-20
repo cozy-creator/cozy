@@ -390,14 +390,16 @@ A `ComponentWriter` supports:
 ### Convert an existing model and export ordinary files
 
 ```python
-checkpoint = tensorfs.convert("hf://owner/model", variant="bf16")
+checkpoint = tensorfs.convert_to_cozytensors("hf://owner/model", variant="bf16")
 files = tensorfs.export(checkpoint, "./exported", dequantize="BF16")
 ```
 
-`convert` accepts one source or a sequence. Sources include supported local files/folders,
-Hugging Face, Civitai and HTTPS. Options are `converter`, `variant`, `cache_dir`, `token`
-and `progress`. It returns a `Checkpoint`. `resolve_source(source, token=None)` returns the
-pinned source reference without performing the conversion.
+`convert_to_cozytensors` imports an existing model into the cozytensors format and shared
+store, then returns a `Checkpoint` you can read normally. It accepts one source or a
+sequence: supported local files/folders, Hugging Face, Civitai and HTTPS. Options are
+`converter`, `variant`, `cache_dir`, `token` and `progress`.
+`resolve_source(source, token=None)` returns the pinned source reference without performing
+the conversion.
 
 `export(checkpoint, directory, format="safetensors", dequantize=None)` returns written
 paths. Formats are `"safetensors"` and `"cozytensors"` (native portable folder). Omit `dequantize` to retain supported encoded representations in the export.
@@ -411,13 +413,21 @@ tensorfs.configure(endpoint="https://tensorhub.com", cache_dir="/path/to/cache",
 print(tensorfs.__version__)
 ```
 
+`configure` optionally sets process-wide defaults for future calls. It returns `None`,
+does not write a configuration file and does not change existing checkpoint handles.
+You can instead pass settings directly to each operation:
+
+```python
+checkpoint = tensorfs.open("me/model", endpoint="https://tensorhub.com", token=my_token)
+```
+
 The default endpoint is `https://tensorhub.com`; environment settings include
 `TENSORFS_ENDPOINT`, `TENSORFS_HOME` and `TENSORFS_TOKEN`. Public reads need no account.
 Private CA input is DER bytes through `ca_der`.
 
 In the current frozen wrapper, `configure` updates only non-`None` arguments. Its configured
 token applies to open/download/upload/Writer. Pass provider-specific tokens explicitly to
-`convert` and `resolve_source`; an explicitly constructed `Endpoint` has its own token.
+`convert_to_cozytensors` and `resolve_source`; an explicitly constructed `Endpoint` has its own token.
 Configuration scoping is being reviewed as the common Rust client is integrated.
 
 For refreshable access, supply a callable or object whose `headers(method, url, headers,
@@ -526,7 +536,7 @@ A conflict can cause the callback to run again, so it must tolerate retries.
 |---|---|
 | `configure` | `None` |
 | `open` | `Checkpoint`; `lazy=True` loads metadata, `lazy=False` waits for all checkpoint data locally |
-| `convert` | `Checkpoint` |
+| `convert_to_cozytensors` | `Checkpoint` |
 | `resolve_source` | Pinned source string |
 | `export` | List of written paths |
 | `materialize` | Local folder path |

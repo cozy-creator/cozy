@@ -98,7 +98,7 @@ exact remote tree.
 | `materialize(&Ref, &Download, local_dir, local_files_only)` | Make selected repository content available as a normal folder; returns `Result<PathBuf>`. |
 | `download_file(&Ref, filename, local_dir, local_files_only)` | Fetch one repository file; returns `Result<PathBuf>`. |
 | `upload_folder(&Ref, folder, progress)` | Publish the folder; returns `Result<ObjectRef>`. |
-| `convert(&[String], &Convert)` | Convert pinned sources; returns `Result<Checkpoint>`. |
+| `convert_to_cozytensors(&[String], &Convert)` | Convert pinned sources; returns `Result<Checkpoint>`. |
 | `resolve_source(source)` | Resolve an upstream source; returns `Result<String>`. |
 | `writer(WriterOptions)` | Begin a write; returns `Result<Writer>`. |
 

@@ -105,7 +105,7 @@ repository file. These folder/file operations are optional compatibility tools.
 
 ## Convert, write and share
 
-`convert` accepts files, directories, `hf://`, `civitai://` and HTTPS sources. It pins upstream revisions and records
+`convert_to_cozytensors` accepts files, directories, `hf://`, `civitai://` and HTTPS sources. It pins upstream revisions and records
 source metadata. Recognized source layouts use converter tables; `converter=` declares a layout that cannot be
 inferred safely. `export(checkpoint, directory)` renders ordinary Hugging Face filenames, configs and assets.
 Encoded tensors retain their parts unless `dequantize=` requests ordinary values.

@@ -192,7 +192,7 @@ pub struct Convert<'a> {
     pub progress: Option<&'a ConvertProgress<'a>>,
 }
 impl Client {
-    pub async fn convert(&self, sources: &[String], options: &Convert<'_>) -> Result<Checkpoint>;
+    pub async fn convert_to_cozytensors(&self, sources: &[String], options: &Convert<'_>) -> Result<Checkpoint>;
     pub async fn resolve_source(&self, source: &str) -> Result<String>;
     pub fn writer(&self, options: WriterOptions<'_>) -> Result<Writer>;
 }
