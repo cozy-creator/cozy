@@ -1,9 +1,7 @@
 # cozytensors/1
 
-Status: normative target for TensorFS 0.13.0, version 1.1. The implementation is being integrated;
-the code currently on master still uses the preceding layout. Start with the
-[Rust and Python usage guide](../README.md).
-Readable target documents are in [examples/](examples/); their schemas are in [schema/](schema/).
+Start with the [Rust and Python usage guide](../README.md). Readable documents are in [examples/](examples/); their
+schemas are in [schema/](schema/).
 
 This is the authoritative specification of the stored format and its decode semantics. A reader can implement it
 without TensorFS, Cozy or Tensorhub. Library APIs, cache policy and GPU execution are outside the format contract.
@@ -331,8 +329,7 @@ each struct's little-endian fields and the formula of its `n` elements, using th
 logical tensor `[lead…, A, B]` as `S = [lead…, B, A]`: its view `[R, C]`, its parts' shapes and its formula all
 apply to `S`, and `value[lead…, a, b] = S[lead…, b, a]`. Its blocks therefore run along the logical axis −2. A
 producer that keeps a weight as `[out, in]` where its framework's tensor is `[in, out]` (gpt-oss) is read under
-the framework's key and shape. `mxfp4` has the param; ModelOpt's fused gpt-oss NVFP4 export (`[E, K/2, N]`) is
-the next user, through `nvfp4`.
+the framework's key and shape. `mxfp4` has the param.
 
 ### `fp8.tensorwise`
 
@@ -578,7 +575,47 @@ LLM.int8() weights (Transformers' `load_in_8bit`), one absmax per output row.
 - Decode: `round_L((weight[i, j] × SCB[i]) × r)`, with `r = 0x3C010204`, the f32 nearest 1/127. bnb multiplies by
   `r`, so this is not `int8.rowwise`.
 
-<!-- comfy.* -->
+### `comfy.asym_w4a8_int8`, `comfy.w6a8_int8`
+
+comfy-kitchen's `AsymW4A8Int8Layout` at 4 and 6 bits, as ComfyUI stores it (`<key>.weight`, `.weight_s_rel`,
+`.weight_s_channel`, `.weight_codebook`, `.weight_correction`; the marker's `group_size` and `convrot_groupsize`):
+`b`-bit codes (`b` is 4 or 6) in the rotated basis, requantized to int8 by a scale per group of `g` inputs, then
+rotated back by `kron_regular_h4` per block of `B` inputs and scaled per row.
+- Params: `group_size`: `g`, for `asym_w4a8_int8` 4, 8 or a multiple of 16, for `w6a8_int8` a multiple of 16;
+  `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8`.
+- Parts:
+  - `weight`: `I8 [lead…, C·b/8]`, `C` a multiple of `B` and of `g`. A row is `C/2` bytes of unsigned 4-bit codes,
+    column `j` in bits `4·(j mod 2)` of byte `⌊j/2⌋`; at 6 bits, then `C/4` bytes of each code's two high bits,
+    column `j` in bits `2·(j mod 4)` of byte `C/2 + ⌊j/4⌋`.
+  - `weight_s_rel`: `F8_E4M3` or `F32` on row blocks of `g`, `row_major`.
+  - `weight_s_channel`: `F32` on the row grid.
+  - `weight_codebook` (optional, `asym_w4a8_int8` only): `F32`, 16 elements, any shape.
+  - `weight_correction` (optional, `asym_w4a8_int8` only): `F32`, `BF16` or `F16` on row blocks of `g`,
+    `transposed` (`[C/g, R]`).
+- Decode, with `y` and `k` as `int8.convrot`:
+  1. The level: `v = weight_codebook[q]`, or `q − 2^(b−1)` without a codebook.
+  2. `q8[i, j] = clamp(round(v × s_rel(i, j)), −127, 127)`, the product one f32 multiply rounded to nearest, ties to
+     even; a NaN product refuses the decode.
+  3. `y[i, g, ·] = q8[i, gB : gB + B] · H_B`, exact.
+  4. `value[i, gB + j] = round_L(((y[i, g, j] × s_channel[i]) + z(i, gB + j)) × 2^−k)`, with `+ z` only where there
+     is a `weight_correction`: `z(i, c) = Σ_h corr(i, h) × M_h(c)` over the groups `h` that meet `c`'s block, in
+     ascending order, summed left to right from the first term. `M_h(c)` is the exact integer sum of column
+     `c mod B` of `H_B` over the rows of the block that group `h` covers.
+
+The codebook is kitchen's 16 levels (a frozen Lloyd-Max table, or one fitted to the layer); without one the grid is
+uniform. `weight_correction` is kitchen's asymmetric grid's per-group offset in the rotated basis, which the
+rotation carries back with the block.
+
+### `comfy.convrot_w4a4`
+
+comfy-kitchen's `TensorCoreConvRotW4A4Layout` (`<key>.weight`, `.weight_scale`; the marker's `convrot_groupsize`):
+`int8.convrot` with signed 4-bit codes.
+- Params: `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8`.
+- Parts: `weight`: `I8 [lead…, C/2]`, `C` a multiple of `B`: 4-bit codes packed as `asym_w4a8_int8`'s, each a
+  two's-complement integer (−8 … 7). `weight_scale`: `F32` on the row grid.
+- Decode: `round_L((y[i, g, j] × weight_scale[i]) × 2^−k)`, `y` as `int8.convrot`'s with these codes as `weight`.
+
+The marker's `quant_group_size` (64) is the activations' group and enters no decode.
 
 ### Plain tensors
 
@@ -586,7 +623,7 @@ A plain tensor's bytes are its value; reading it is a copy, whatever its dtype.
 
 ### Defining another scheme
 
-A new scheme is a minor extension (§8). Its definition must specify the name, complete parameter set and accepted
+A new scheme is an addition within major 1 (§8). Its definition must specify the name, complete parameter set and accepted
 values, each part's role/dtype/shape, physical packing, decoding arithmetic and rounding. Any fixed table must
 include its exact values and byte digest. Conformance cases should include independently obtained values and
 invalid inputs. These requirements describe the format; they do not require a particular implementation language
@@ -632,23 +669,13 @@ reader, copier or collector to discover a new kind of reference edge.
 
 ## 8. Versioning
 
-- Minor versions add fields, trailing record elements, schemes and dtypes; their absence keeps the old meaning, and
-  readers of the same major read them. New fields must use the existing extension value domain (§9) and closure
-  rules (§7).
-- A new scheme or dtype is a minor change: every location carries its `length`, so an old reader reads the document,
+- Within major 1, a writer may add fields, trailing record elements, schemes and dtypes, and the tag stays
+  `<kind>/1`. Their absence keeps the old meaning, and readers of the major read them. New fields use the existing
+  extension value domain (§9) and closure rules (§7).
+- Every location carries its `length`, so a reader reads a document with a scheme or dtype it does not know,
   locates and verifies every byte, and refuses only a decode or typed view of the tensors that use it. A new param of
-  an existing scheme is too: an old decoder refuses the tensors whose params it does not know (§6).
+  an existing scheme is the same: a decoder refuses the tensors whose params it does not know (§6).
 - A change that alters the meaning of an existing field, scheme or param is a new major.
-
-These compatibility rules begin with the six-element header containing pipeline and component records defined
-here. Earlier provisional JSON and five-element CBOR layouts used the same historical `/1` tag but are not members
-of this specification. Their deliberate hard cut is an exception to the versioning rule, not a precedent for
-reinterpreting future same-major documents. Readers identify and refuse them as specified in §9.
-
-Minors: 1.1 adds `nvfp4`'s `pre_quant_scale` and a `scale_2` per matrix, and tiles each matrix of a stack on its own
-in `cublas_128x4` (before any stacked file was written); the schemes `fp8.blockwise`, `mxfp4`, `gguf.*`, `gptq.int2`,
-`gptq.int3`, `gptq.int4`, `gptq.int8`, `awq.int4`, `ct.int1` … `ct.int8`, `bnb.nf4`, `bnb.fp4` and `bnb.int8`; and the
-`tiles` grid and transposed storage.
 
 ## 9. Encoding
 
@@ -671,10 +698,9 @@ Lossless decoding and re-encoding of the complete CBOR value reproduces its byte
 recognized fields and discard extensions; reconstructing a header from that projection creates a new object.
 A copier that preserves object identity MUST retain the original bytes, including its format tag and extensions.
 
-A header that fails to read and is a
-**pre-cut** layout, the provisional JSON (first byte `{`) or a well-formed `cozytensors/1` root of exactly five
-elements (the layouts before the pipeline), MUST be refused as such ("pre-cut cozytensors header (old layout);
-re-import or migrate"): the tag is the same, so only the structure tells them apart.
+A header that fails to read and is JSON (first byte `{`) or a well-formed `cozytensors/1` root of exactly five
+elements is a **pre-cut** header, a layout without the pipeline under the same tag. A reader MUST refuse it as such
+("pre-cut cozytensors header (old layout); re-import or migrate"): only the structure tells it apart.
 
 **Tree and repo: JSON.** UTF-8 JSON (RFC 8259) whose top level is an object; §2's values map to JSON in the obvious
 way. A reader MUST refuse invalid UTF-8 or JSON, a top level that is not an object, a repeated key in any object, any
@@ -759,4 +785,3 @@ ggml's `kvalues_fp4`: E2M1's values doubled, by code.
  -0.0, -0.0052083335, -0.6666667, -1.0, -0.33333334, -0.5, -0.16666667, -0.25]
 ```
 
-<!-- comfy tables -->

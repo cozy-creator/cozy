@@ -171,7 +171,7 @@ impl RequantCodes<'_> {
         let table = self.table.as_ref().map(Elems::floats).transpose()?;
         if table.as_ref().is_some_and(|t| bits != 4 || t.len() != 16) {
             return Err(Error::Decode(
-                "requantized codebook is not16 levels of four-bit codes".into(),
+                "requantized codebook is not 16 levels of four-bit codes".into(),
             ));
         }
         let bytes = self.bytes.host()?;
