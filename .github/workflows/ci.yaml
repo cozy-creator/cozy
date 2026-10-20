@@ -25,10 +25,10 @@ jobs:
       ref: ${{ github.sha }}
       build: tensorfs
       # Build the matching ordinary TensorFS 0.13 / Runtime 0.30 candidate until publication.
-      runtime_ref: 3a0f8d9dd3d507faeecdf342f826f612c992768a
+      runtime_ref: 786a570568d6b1ecbf1be263a6f76253e926ab50
       # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below.
       test: |
-        cargo test --locked --no-fail-fast -p tensord
+        python3 scripts/cargo-test-binaries.py --self-test && python3 scripts/cargo-test-binaries.py
         uv pip install --torch-backend cpu --python "$TENSORFS_TEST_PYTHON" "$COZY_TEST_RUNTIME_WHEEL" pytest torch
         "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/ffn_scope_lifetime.py
         uv pip install --python "$TENSORFS_TEST_PYTHON" --no-deps diffusers==0.41.0
@@ -60,4 +60,4 @@ jobs:
       # Use the compatible Hub routes and the expand-only migration during this cohort rollout.
       tensorhub_ref: e1b09ab11c2e6af5e15fb752f6bd5ebd6fb1379e
       # Use this Runtime and TensorFS pair until both releases are published.
-      runtime_ref: 3a0f8d9dd3d507faeecdf342f826f612c992768a
+      runtime_ref: 786a570568d6b1ecbf1be263a6f76253e926ab50
