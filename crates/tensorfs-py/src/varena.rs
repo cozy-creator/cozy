@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{c_void, CStr};
 use std::os::fd::{FromRawFd, OwnedFd};
+#[cfg(feature = "store")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -135,7 +136,12 @@ impl From<tensorfs::io::Ceiling> for PyCeiling {
 fn ceiling(py: Python<'_>, device: Option<i32>, path: Option<std::path::PathBuf>) -> PyResult<PyCeiling> {
     let path = match path {
         Some(path) => path,
-        None => tensorfs::home::resolve(None).map_err(|e| raise(py, e.into()))?,
+        None => {
+            #[cfg(feature = "store")]
+            { tensorfs::home::resolve(None).map_err(|e| raise(py, e.into()))? }
+            #[cfg(not(feature = "store"))]
+            { return Err(raise(py, Error::Unsupported("a ceiling probe without store support requires an explicit path".into()))); }
+        },
     };
     py.detach(|| tensorfs::io::ceiling(device, &path)).map(Into::into).map_err(|e| match e.kind() {
         std::io::ErrorKind::Unsupported => raise(py, Error::Unsupported(e.to_string())),
@@ -208,6 +214,7 @@ impl PyWeightSet {
 struct PyPlane {
     core: Mutex<Option<Arc<Placement>>>,
     models: Mutex<BTreeMap<u64, Arc<Model>>>,
+    #[cfg(feature = "store")]
     next: AtomicU64,
 }
 struct CoreRef(std::mem::ManuallyDrop<Arc<Placement>>);
@@ -269,6 +276,7 @@ impl PyPlane {
         Ok(Self {
             core: Mutex::new(Some(core)),
             models: Mutex::default(),
+            #[cfg(feature = "store")]
             next: AtomicU64::new(1),
         })
     }
