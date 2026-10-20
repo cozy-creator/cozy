@@ -114,6 +114,13 @@ impl Checkpoint {
         Self { data, components }
     }
 
+    pub(super) fn stored(&self) -> &Stored {
+        &self.data.raw
+    }
+    pub(super) fn storage(&self) -> &Store {
+        &self.data.store
+    }
+
     pub fn id(&self) -> &ObjectRef {
         self.data.raw.id()
     }
@@ -343,6 +350,10 @@ impl Component {
             .raw
             .component(&self.name)
             .expect("component validated against an immutable header")
+    }
+
+    pub(super) fn stored(&self) -> &Stored {
+        &self.data.raw
     }
 
     pub fn name(&self) -> &str {
