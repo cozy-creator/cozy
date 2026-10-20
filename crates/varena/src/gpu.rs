@@ -13,9 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_int, c_void};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, ThreadId};
 
 use crossbeam_queue::SegQueue;
@@ -922,11 +922,20 @@ impl Gpu {
 
     fn wait_write_returns(&self, page: &Page) -> Result<()> {
         loop {
+            // A different poller may return or requeue the lease while this poll
+            // is running. Capture before poll so its notification cannot precede
+            // registration unnoticed, including errors that leave write_pins > 0.
+            let before = *self.generation.lock();
             self.poll()?;
             let mut generation = self.generation.lock();
             if page.write_pins.load(Ordering::Acquire) == 0 {
                 return Ok(());
             }
+            if *generation != before {
+                continue;
+            }
+            // Both this predicate check/registration and write_changed's notify
+            // hold generation. CUDA work above never runs under that mutex.
             #[cfg(test)]
             self.write_waiters.fetch_add(1, Ordering::AcqRel);
             self.changed.wait(&mut generation);
@@ -1349,6 +1358,35 @@ pub(crate) fn returned_write_release_interleaving() -> Result<()> {
         )
     }?;
     assert_eq!(bytes, [7]);
+    drop(pin);
+    gpu.wait_pending()?;
+    assert!(gpu.unmap(1)?);
+
+    // The opposite ordering must not wait for an already-delivered notification:
+    // finish the returned lease inside the callback, before the producer enters
+    // wait_write_returns. This uses real event recording and the same page again.
+    gpu.fill_with(1, |write| {
+        drop(write);
+        gpu.poll()?;
+        assert_eq!(page.write_pins.load(Ordering::Acquire), 0);
+        Ok(())
+    })?;
+    let pin = gpu.bind(1, 0)?;
+    unsafe {
+        io::read(
+            &[io::Copy {
+                src: io::Src::Device {
+                    device: 0,
+                    ptr: pin.ptr,
+                    stream: 0,
+                },
+                dst: io::Dst::host(&mut bytes),
+            }],
+            &io::ReadOpts::default(),
+        )
+    }?;
+    assert_eq!(bytes, [7]);
+    assert_eq!(gpu.write_waiters.load(Ordering::Acquire), 0);
     drop(pin);
     gpu.wait_pending()?;
     assert!(gpu.unregister(1)?);
