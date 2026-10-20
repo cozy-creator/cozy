@@ -233,12 +233,21 @@ impl Placement {
 
     pub fn close(&self) -> Result<()> {
         let models: Vec<_> = self.inner.lock().models.keys().copied().collect();
+        let mut error = None;
         for model in models {
-            self.close_model(model)?;
+            if let Err(failure) = self.close_model(model) {
+                if error.is_none() {
+                    error = Some(failure);
+                }
+            }
         }
         self.stop.store(true, Ordering::Release);
         self.changed.notify_all();
-        self.row.wake()
+        let wake = self.row.wake();
+        match error {
+            Some(error) => Err(error),
+            None => wake,
+        }
     }
 
     pub fn load(&self, model: ModelId, level: Tier) -> Result<Relief> {
