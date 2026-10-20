@@ -305,13 +305,14 @@ def run_case(case):
             pin = weights.bind(0, stream.cuda_stream)
             # Make the fill already ready: readiness must not erase later consumers.
             stream.synchronize()
-            consumer = torch.cuda.ExternalStream(1, device=0) if legacy else torch.cuda.Stream(device=0)
+            consumer = torch.cuda.default_stream(0) if legacy else torch.cuda.Stream(device=0)
             assert stream.cuda_stream > 2
-            assert consumer.cuda_stream == 1 if legacy else consumer.cuda_stream > 2
+            assert consumer.cuda_stream == 0 if legacy else consumer.cuda_stream > 2
             assert consumer.cuda_stream != stream.cuda_stream
             with torch.cuda.stream(consumer):
                 # An explicit capsule preserves stream=None: Torch must not replace it
-                # with its own producer call. Consumer work uses CU_STREAM_LEGACY (1).
+                # with its own producer call. Native None means legacy1; Torch's
+                # default stream uses raw0, which its CUDA runtime treats as legacy.
                 tensor = torch.from_dlpack(pin.__dlpack__(stream=None)) if legacy else torch.from_dlpack(pin)
                 assert tensor.is_cuda and tensor.device.index == 0
                 assert tensor.dtype == torch.uint8 and tensor.numel() == len(DATA)
@@ -353,7 +354,7 @@ def run_case(case):
                 assert heartbeat[0] - ticks >= 3, "consumer B release stopped Python's heartbeat"
                 consumer_proof = {
                     "bind_stream": stream.cuda_stream,
-                    "consumer_stream": consumer.cuda_stream,
+                    "consumer_stream": 1 if legacy else consumer.cuda_stream,
                     "distinct_nondefault": not legacy,
                     "fill_ready_before_consume": True,
                     "pending_after_drop": True,
@@ -366,6 +367,7 @@ def run_case(case):
                     consumer_proof.update(
                         scope="final-release-custody",
                         dlpack_stream=None,
+                        torch_consumer_stream=consumer.cuda_stream,
                         default_legacy=True,
                         pending_readiness_device_proof=False,
                     )
