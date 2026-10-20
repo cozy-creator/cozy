@@ -13,9 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_int, c_void};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread::{self, ThreadId};
 
 use crossbeam_queue::SegQueue;
