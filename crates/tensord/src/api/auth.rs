@@ -43,14 +43,19 @@ impl Keys {
         Ok(Self { source: Some(Arc::new(source)), ..Self::fixed(keys) })
     }
     /// `check` over the admitted keys; when it refuses and the set has a source, once more over
-    /// the source's current set.
+    /// the source's current set. A concurrent check may have renewed the set meanwhile (a
+    /// controller's first calls, as its key is written): the set read decides, not the one
+    /// refused.
     pub fn check<T, E>(&self, check: impl Fn(&[VerifyingKey]) -> Result<T, E>) -> Result<T, E> {
-        let first = check(&self.admitted());
+        let admitted = self.admitted();
+        let first = check(&admitted);
         let (Err(_), Some(source)) = (&first, &self.source) else { return first };
         match source() {
-            Ok(keys) if keys != self.admitted() => {
-                self.replace(keys);
-                check(&self.admitted())
+            Ok(keys) if keys != admitted => {
+                if keys != self.admitted() {
+                    self.replace(keys.clone());
+                }
+                check(&keys)
             }
             Ok(_) => first,
             Err(error) => {
@@ -198,6 +203,29 @@ pub struct VerifiedActor {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+
+    /// A controller's key written after the machine started is admitted at its first call, also
+    /// by a call refused on the set another call renewed meanwhile (`machine show` right after
+    /// `machine enable`, beside Calcifer's status watch).
+    #[test]
+    fn a_key_written_after_start_is_admitted_by_concurrent_first_calls() {
+        let key = SigningKey::from_bytes(&[7; 32]).verifying_key();
+        let on_disk = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let read = on_disk.clone();
+        let keys = Keys::read(move || Ok(read.lock().unwrap().clone())).unwrap();
+        *on_disk.lock().unwrap() = vec![key];
+        let admits = |set: &[VerifyingKey]| if set.contains(&key) { Ok(()) } else { Err(()) };
+        // This call is refused on the set as it was; the other call renews it in the meantime.
+        let other = std::cell::Cell::new(None);
+        let this = keys.check(|set| {
+            if other.get().is_none() {
+                other.set(Some(keys.check(admits)));
+            }
+            admits(set)
+        });
+        assert_eq!((other.get(), this), (Some(Ok(())), Ok(())));
+        assert_eq!(keys.admitted(), [key]);
+    }
 
     /// Revocation ends a stream mid-flight; a signed expiry ends a quiet one.
     #[tokio::test]

@@ -204,12 +204,17 @@ pub fn link(pci: &str) -> Option<Link> {
 
 /// The current PCIe link of CUDA device `device`, without creating a second context.
 pub fn device_link(device: i32) -> Option<Link> {
+    link(&pci_address(device)?)
+}
+
+/// CUDA device `device`'s PCI address as sysfs names it (`0000:65:00.0`).
+pub(crate) fn pci_address(device: i32) -> Option<String> {
     let d = cuda::driver().ok()?;
     let mut dev = 0;
     // SAFETY: driver out-param; an invalid ordinal returns an error.
     cuda::check("cuDeviceGet", unsafe { (d.device_get)(&mut dev, device) }).ok()?;
     let attr = |a| cuda::attribute(dev, a).ok();
-    link(&format!(
+    Some(format!(
         "{:04x}:{:02x}:{:02x}.0",
         attr(cuda::ATTR_PCI_DOMAIN_ID)?,
         attr(cuda::ATTR_PCI_BUS_ID)?,

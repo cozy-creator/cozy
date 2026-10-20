@@ -87,6 +87,18 @@ pub fn detail(bundle: &[u8]) -> Option<String> {
     Some(masked(capped(&tail, DETAIL_BYTES)))
 }
 
+/// A failed attempt's whole raising traceback (else its executor's stderr), secrets masked:
+/// what a failed child call hands its caller.
+pub fn traceback(bundle: &[u8]) -> Option<String> {
+    let bundle: serde_json::Value = serde_json::from_slice(bundle).ok()?;
+    let text = [&bundle["terminal"]["traceback"], &bundle["executor"]["stderr_tail"]]
+        .into_iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .find(|text| !text.is_empty())?;
+    Some(masked(text))
+}
+
 fn capped(text: &str, limit: usize) -> &str {
     if text.len() <= limit {
         return text;
@@ -186,8 +198,13 @@ mod tests {
         assert_eq!(tail.lines().count(), 40, "{tail}");
         assert!(tail.ends_with("ValueError: fetch https://***@hub.example/x failed"), "{tail}");
         assert!(!tail.contains("frame 20\n"), "{tail}");
+        let whole = super::traceback(bundle.to_string().as_bytes()).unwrap();
+        assert_eq!(whole.lines().count(), 61, "{whole}");
+        assert!(whole.starts_with("frame 0\n"), "{whole}");
+        assert!(whole.ends_with("ValueError: fetch https://***@hub.example/x failed"), "{whole}");
         let crashed = json!({"terminal": {"traceback": ""}, "executor": {"stderr_tail": "Fatal Python error: Segmentation fault\n"}});
         assert_eq!(detail(crashed.to_string().as_bytes()).unwrap(), "Fatal Python error: Segmentation fault");
+        assert_eq!(super::traceback(crashed.to_string().as_bytes()).unwrap(), "Fatal Python error: Segmentation fault");
         assert_eq!(detail(json!({"terminal": {}, "executor": {}}).to_string().as_bytes()), None);
     }
 }

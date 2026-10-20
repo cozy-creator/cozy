@@ -407,11 +407,12 @@ async fn ended(events: &mut Events) -> v1::Outcome {
     panic!("the run's log ended without an outcome");
 }
 
-/// A job queued for the rental (here a controller's warm request) holds it past its idle window,
-/// twice over; the clock starts when that job ends, and the used rental releases one window
-/// later.
+/// A job queued for the rental (here a controller's warm request) holds it while it may still
+/// move. One stalled on a Hub that holds its request open moves nothing: past its preparation's
+/// patience it fails `no_progress` on that measurement (xs-047), its end starts the idle clock,
+/// and the used rental releases one window later.
 #[tokio::test]
-async fn a_job_holds_the_rental_and_its_end_starts_the_idle_clock() {
+async fn a_stalled_job_fails_no_progress_and_its_end_starts_the_idle_clock() {
     let root = root("idle-job");
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let (provider_port, received) = provider();
@@ -424,28 +425,30 @@ async fn a_job_holds_the_rental_and_its_end_starts_the_idle_clock() {
     assert!((renewed - at - idle_ms).abs() < 1_000, "keepalive answers the real deadline: {renewed} at {at}");
     let hub = held_hub();
     // A controller's warm request is a job: asked of the machine, it holds the rental.
+    let submitted = now_ms();
     let mut events = submit_kind(&client, "stalled-1", &hub.origin, v1::RunKind::Warm).await;
     assert_eq!(deadline(&client, false).await, 0, "a queued job has no deadline");
     assert_eq!(deadline(&client, true).await, 0, "nor does a keepalive give it one");
-    // Its Hub connection is waited on while alive and probed for liveness at the transfer's
-    // measured window (a 5 s sample, 6 still samples): a dead one fails the job.
+    // Its Hub connection is probed for liveness at the transfer's measured window (a 5 s
+    // sample, 6 still samples): a dead one fails the job sooner.
     let (local, remote) = hub.accepted.recv_timeout(Duration::from_secs(30)).expect("the run never reached its Hub");
     let probe = keepalive_timer(local, remote).expect("the Hub connection has no keepalive probing");
     assert!(probe <= 30.0, "first keepalive probe in {probe} s");
     assert!(
-        received.recv_timeout(Duration::from_millis(2 * idle_ms as u64)).is_err(),
+        received.recv_timeout(Duration::from_millis(idle_ms as u64)).is_err(),
         "the rental released itself while a job was queued for it"
     );
-    let closed = now_ms();
-    drop(hub.close);
-    let outcome = tokio::time::timeout(Duration::from_secs(120), ended(&mut events)).await.unwrap();
+    // The Hub stays open and silent: the job alone decides it stopped moving.
+    let outcome = tokio::time::timeout(Duration::from_secs(180), ended(&mut events)).await.unwrap();
     let end = now_ms();
-    assert_eq!(outcome.status, "failed", "{outcome:?}");
+    let reason = outcome.reason.clone().unwrap_or_default();
+    assert_eq!((outcome.status.as_str(), reason.code.as_str()), ("failed", "no_progress"), "{outcome:?}");
+    assert!(reason.message.contains("no measurable progress"), "{reason:?}");
     // Status reads the jobs the machine sampled within the last second.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let due = deadline(&client, false).await;
-    // The job ended between the Hub's close and its outcome reaching this client.
-    assert!(due >= closed + idle_ms && due <= end + idle_ms, "{due} vs closed {closed}, end {end}");
+    // The job ended past its patience's floor (30 s) and before its outcome reached this client.
+    assert!(due >= submitted + 30_000 + idle_ms && due <= end + idle_ms, "{due} vs submitted {submitted}, end {end}");
     let (method, _, _, body) = received
         .recv_timeout(Duration::from_secs(60))
         .expect("the used rental did not release itself after its idle window");
@@ -453,6 +456,7 @@ async fn a_job_holds_the_rental_and_its_end_starts_the_idle_clock() {
     assert!(method == "POST" && body.contains("podTerminate"), "{body}");
     assert!(released >= due - 500, "released at {released}, before its deadline {due}");
     assert!(released < due + 15_000, "released at {released}, long after its deadline {due}");
+    drop(hub.close);
     drop(machine);
     std::fs::remove_dir_all(root).unwrap();
 }

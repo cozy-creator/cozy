@@ -4,10 +4,13 @@
 //! configs equal parsed, its other files byte-exact as assets or repo files; run data a lane
 //! lacked comes from the pinned upstream (live Hugging Face) and is recorded.
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use flate2::write::ZlibEncoder;
 use minicbor::Decoder;
-use serde_json::Value as Json;
+use serde_json::{json, Value as Json};
 use tensorfs::import::Access;
 use tensorfs::format::{Config, Header, ObjectRef, Repo, Tree, Value};
 use tensorfs::migrate::d10::{self, Migrator, Upstream};
@@ -16,9 +19,13 @@ use tensorfs::store::Store;
 const SDXL: &str = "hf://hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2";
 const GPT2: &str = "hf://hf-internal-testing/tiny-random-gpt2@71034c5d8bde858ff824298bdedc65515b97d2b9";
 const TABLE: &[Upstream] = &[
-    Upstream { models: &["acme/tiny"], from: SDXL, files: &["model_index.json", "tokenizer/", "tokenizer_2/", "README"], source: None, note: "test" },
+    Upstream { models: &["acme/tiny"], from: SDXL, files: &["model_index.json", "tokenizer/", "tokenizer_2/", "unet/config.json", "README"], source: None, note: "test" },
     Upstream { models: &["acme/gpt2"], from: GPT2, files: &["special_tokens_map.json", "README"], source: None, note: "test" },
+    Upstream { models: &["acme/wrapped"], from: "", files: &[], source: Some("local"), note: "" },
+    Upstream { models: &["acme/false"], from: "", files: &[], source: Some(NOWHERE), note: "" },
 ];
+/// A pin no Hugging Face repo has.
+const NOWHERE: &str = "hf://hf-internal-testing/a11-no-such-repo@0000000000000000000000000000000000000000";
 /// The fixture's manifests: tiny-sdxl-pipe whole, without its run data and README (`ft`), the
 /// same with another README, tiny-random-gpt2 whole and without special_tokens_map.json.
 const FULL: &str = "90bac0063e68b5ac3726751c2bd5f04f616032cdf78fcdd6e31df68aed59d664";
@@ -224,6 +231,12 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
     let before = refs(&root);
     d10::store(&root, &mut migrator).unwrap();
     assert_eq!(refs(&root), before);
+
+    // The rollback, the 0.12 document put back in storage: migrating again gives the same D10 one.
+    let old = std::fs::read(fixture.join("refs/acme/tiny.json")).unwrap();
+    std::fs::write(root.join("refs/acme/tiny.json"), &old).unwrap();
+    d10::store(&root, &mut migrator).unwrap();
+    assert_eq!(refs(&root), before);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -236,6 +249,7 @@ fn partial_tokenizer_keeps_existing_files_and_fills_missing_files() {
     let mut manifest: Json = serde_json::from_slice(&blob(&fixture, FULL)).unwrap();
     let missing = "tokenizer/vocab.json";
     let expected: ObjectRef = serde_json::from_value(manifest["files"].as_object_mut().unwrap().remove(missing).unwrap()).unwrap();
+    let config: ObjectRef = serde_json::from_value(manifest["files"].as_object_mut().unwrap().remove("unet/config.json").unwrap()).unwrap();
     assert!(manifest["files"].get("tokenizer/tokenizer_config.json").is_some());
     let bytes = serde_json::to_vec(&manifest).unwrap();
     let object = ObjectRef::of(&bytes);
@@ -251,7 +265,169 @@ fn partial_tokenizer_keeps_existing_files_and_fills_missing_files() {
     let tree = Tree::from_json(&read(&migrated.repo.releases[0].tree)).unwrap();
     let header = Header::from_cbor(&read(tree.variant(Some("full")).unwrap().1)).unwrap();
     assert_eq!(header.component("tokenizer").unwrap().assets["vocab.json"], expected);
-    assert_eq!(filled(&header).unwrap().1, BTreeSet::from([missing.to_owned()]));
+    assert_eq!(filled(&header).unwrap().1, BTreeSet::from([missing.to_owned(), "unet/config.json".to_owned()]));
+    assert_eq!(header.component("unet").unwrap().config, parse(&std::fs::read(dir.join(config.key())).unwrap()));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A copy of the fixture to write lanes into.
+fn scratch(tag: &str) -> PathBuf {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/store-0.12");
+    let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("migrate-{tag}-{}-{unique}", std::process::id()));
+    copy(&fixture, &dir);
+    dir
+}
+
+fn put(dir: &Path, bytes: &[u8]) -> ObjectRef {
+    let object = ObjectRef::of(bytes);
+    let path = dir.join(object.key());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+    object
+}
+
+/// A fixture manifest's files, its header included.
+fn lane_files(dir: &Path, sha256: &str) -> BTreeMap<String, ObjectRef> {
+    serde_json::from_value(serde_json::from_slice::<Json>(&blob(dir, sha256)).unwrap()["files"].clone()).unwrap()
+}
+
+/// As Cozy wrapped files: zlib, then URL-safe base64 with padding.
+fn deflate(bytes: &[u8]) -> Json {
+    let mut z = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    z.write_all(bytes).unwrap();
+    Json::String(base64::engine::general_purpose::URL_SAFE.encode(z.finish().unwrap()))
+}
+
+/// Model `name`, one release of one lane with manifest `files`, in D10: its header, tree and
+/// the lane's report.
+fn migrate_lane(dir: &Path, name: &str, files: BTreeMap<String, ObjectRef>) -> (Header, Tree, Json) {
+    let manifest = put(dir, &serde_json::to_vec(&json!({"format": "tensorfs.manifest/1", "files": files})).unwrap());
+    let doc = serde_json::to_vec(&json!({"name": name, "releases": [{"version": "1", "lanes": {"lane": manifest}}]})).unwrap();
+    let mut migrator = Migrator::new(Access::from_env(), TABLE);
+    let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
+    let read = |o: &ObjectRef| migrated.objects.iter().find(|(at, _)| at == o).unwrap().1.clone();
+    let tree = Tree::from_json(&read(&migrated.repo.releases[0].tree)).unwrap();
+    let header = Header::from_cbor(&read(tree.variant(Some("lane")).unwrap().1)).unwrap();
+    (header, tree, migrated.report["releases"][0]["lanes"]["lane"].clone())
+}
+
+#[test]
+fn a_transformers_config_wrapper_becomes_its_files() {
+    let dir = scratch("wrapper-a");
+    let mut files = lane_files(&dir, GPT2_FULL);
+    let wrapped = ["merges.txt", "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json", "vocab.json"];
+    let config = files.remove("config.json").unwrap();
+    let packed: serde_json::Map<String, Json> = wrapped.iter().map(|p| (p.to_string(), deflate(&blob(&dir, &files[*p].sha256)))).collect();
+    let model_config: Json = serde_json::from_slice(&blob(&dir, &config.sha256)).unwrap();
+    let wrapper = put(&dir, &serde_json::to_vec(&json!({"files": packed, "model_config": model_config})).unwrap());
+    let kept: BTreeMap<String, ObjectRef> = wrapped.iter().map(|p| (p.to_string(), files.remove(*p).unwrap())).collect();
+    files.insert("config.json".into(), wrapper);
+
+    let (h, tree, report) = migrate_lane(&dir, "acme/wrapped", files);
+    let model = h.component("model").unwrap();
+    assert_eq!(model.config, parse(&blob(&dir, &config.sha256)));
+    for (path, object) in &kept {
+        assert_eq!(&model.assets[path.as_str()], object, "{path} byte-exact");
+    }
+    assert!(!tree.files.contains_key("config.json"));
+    assert_eq!(report["unwrapped"].as_array().unwrap().len(), wrapped.len() + 1);
+    assert_eq!(h.metadata.get("source"), Some(&Value::Str("local".into())));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_component_config_wrapper_becomes_its_files_and_records_its_source() {
+    let dir = scratch("wrapper-b");
+    let mut files = lane_files(&dir, FULL);
+    let configs = ["text_encoder/config.json", "text_encoder_2/config.json", "unet/config.json", "vae/config.json", "scheduler/scheduler_config.json"];
+    let mut wrapper = serde_json::Map::new();
+    for path in configs {
+        let object = files.remove(path).unwrap();
+        wrapper.insert(path.split('/').next().unwrap().into(), serde_json::from_slice(&blob(&dir, &object.sha256)).unwrap());
+    }
+    let vocab = blob(&dir, &files["tokenizer/vocab.json"].sha256);
+    wrapper.insert("processor".into(), json!({"tokenizer": deflate(&vocab), "chat_template": "{{ x }}"}));
+    wrapper.insert("provenance".into(), json!({"source_repository": "hf-internal-testing/tiny-sdxl-pipe",
+        "source_revision": "20594cbc343cfcfe447af5c87cdaf6c436b453f2"}));
+    files.insert("config.json".into(), put(&dir, &serde_json::to_vec(&wrapper).unwrap()));
+
+    // No UPSTREAMS row: the wrapper's own record is the lane's source.
+    let (h, tree, report) = migrate_lane(&dir, "acme/unlisted", files);
+    let full = lane_files(&dir, FULL);
+    for path in configs {
+        let (name, _) = path.split_once('/').unwrap();
+        assert_eq!(h.component(name).unwrap().config, parse(&blob(&dir, &full[path].sha256)), "{path}");
+    }
+    assert_eq!(h.pipeline().unwrap().class, "diffusers.StableDiffusionXLPipeline");
+    assert_eq!(tree.files["processor/tokenizer.json"], ObjectRef::of(&vocab));
+    assert_eq!(tree.files["processor/chat_template.jinja"], ObjectRef::of(b"{{ x }}"));
+    assert!(!tree.files.contains_key("config.json"));
+    assert_eq!(report["unwrapped"].as_array().unwrap().len(), configs.len() + 2);
+    assert_eq!(h.metadata.get("source"), Some(&Value::Str(SDXL.into())));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// GPT-2's lane with its header's metadata emptied: a lane that records no source.
+fn unsourced(dir: &Path) -> BTreeMap<String, ObjectRef> {
+    let mut files = lane_files(dir, GPT2_FULL);
+    let old = blob(dir, &files["model.cozytensors"].sha256);
+    let mut d = Decoder::new(&old);
+    let root = items(&old, &mut d);
+    let mut bytes = vec![0x85];
+    root[..4].iter().for_each(|item| bytes.extend_from_slice(item));
+    bytes.push(0xa0);
+    files.insert("model.cozytensors".into(), put(dir, &bytes));
+    files
+}
+
+#[test]
+fn a_lane_nobody_sourced_converts_as_unknown_and_unfilled() {
+    let dir = scratch("unknown");
+    let (h, _, report) = migrate_lane(&dir, "acme/unlisted", unsourced(&dir));
+    assert_eq!(h.metadata.get("source"), Some(&Value::Str(d10::UNKNOWN.into())));
+    assert!(!h.metadata.contains_key("filled") && report.get("filled").is_none());
+    assert_eq!(h.component("model").unwrap().config, parse(&blob(&dir, &lane_files(&dir, GPT2_FULL)["config.json"].sha256)));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_claimed_source_that_does_not_verify_is_refused() {
+    let dir = scratch("nowhere");
+    let manifest = put(&dir, &serde_json::to_vec(&json!({"format": "tensorfs.manifest/1", "files": unsourced(&dir)})).unwrap());
+    let doc = serde_json::to_vec(&json!({"name": "acme/false", "releases": [{"version": "1", "lanes": {"lane": manifest}}]})).unwrap();
+    let mut migrator = Migrator::new(Access::from_env(), TABLE);
+    let refused = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).err().unwrap();
+    assert!(refused.detail.contains("does not verify"), "{}", refused.detail);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn checkpoints_differing_only_in_dropped_metadata_become_one_tree() {
+    let dir = scratch("same-tree");
+    let files = lane_files(&dir, GPT2_FULL);
+    let old = blob(&dir, &files["model.cozytensors"].sha256);
+    let mut d = Decoder::new(&old);
+    let root = items(&old, &mut d);
+    let manifests: Vec<ObjectRef> = ["a", "b"]
+        .iter()
+        .map(|from| {
+            // The same header but for `migrated_from`, which D10 drops.
+            let mut bytes = vec![0x85];
+            root[..4].iter().for_each(|item| bytes.extend_from_slice(item));
+            bytes.extend([0xa1, 0x6d]);
+            bytes.extend(b"migrated_from");
+            bytes.extend([0x61, from.as_bytes()[0]]);
+            let mut lane = files.clone();
+            lane.insert("model.cozytensors".into(), put(&dir, &bytes));
+            put(&dir, &serde_json::to_vec(&json!({"format": "tensorfs.manifest/1", "files": lane})).unwrap())
+        })
+        .collect();
+    let doc = serde_json::to_vec(&json!({"name": "acme/gpt2", "releases": [], "checkpoints": manifests})).unwrap();
+    let mut migrator = Migrator::new(Access::from_env(), TABLE);
+    let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
+    assert_eq!(migrated.repo.checkpoints.len(), 1);
+    assert_eq!(migrated.report["checkpoints"].as_array().unwrap().len(), 2);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

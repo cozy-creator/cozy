@@ -19,6 +19,8 @@ faults = ["store"]
 
 [dependencies]
 base64.workspace = true
+# The A11 header migration reads upstream config wrappers.
+flate2.workspace = true
 platform.workspace = true
 libloading.workspace = true
 minicbor = { version = "2.3.0", default-features = false, features = ["alloc"] }

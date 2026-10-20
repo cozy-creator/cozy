@@ -1,5 +1,9 @@
 //! `cozy machine rent`: the catalog, and one paid order Calcifer places and keeps under its key.
-use std::{num::NonZeroU64, process::ExitCode};
+use std::{
+    io::{IsTerminal as _, Write as _},
+    num::NonZeroU64,
+    process::ExitCode,
+};
 
 use protocol::{
     calcifer::{Machine, MachineState, NewMachine, Quote, Rented},
@@ -24,6 +28,9 @@ pub struct Rent {
     /// Return once the Hub accepts the order, without following the boot.
     #[arg(long, requires = "sku")]
     detach: bool,
+    /// Rent at the Hub's quote without asking: on a terminal it asks first.
+    #[arg(long, short = 'y', requires = "sku")]
+    yes: bool,
     /// Resume this paid order instead of placing a new one.
     #[arg(long, requires = "sku")]
     idempotency_key: Option<String>,
@@ -55,19 +62,29 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
     admit(ctx, &hub, &sku, gpus).await?;
     let minted = rent.idempotency_key.is_none();
     let key = rent.idempotency_key.unwrap_or_else(mint_key);
-    let ask = NewMachine::Rent {
+    let ask = |agreed| NewMachine::Rent {
         sku: sku.clone(),
         hub: hub.origin.to_string(),
         gpus: rent.gpus,
         disk_gb: rent.disk_gb,
-        image: rent.image_digest,
+        image: rent.image_digest.clone(),
+        agreed,
     };
-    let rented: Rented = match ctx
-        .calcifer()
-        .await?
-        .post("/v1/machines", &ask, Some(&key))
-        .await
-    {
+    let calcifer = ctx.calcifer().await?;
+    // The Hub's price for exactly this order, before it is placed; a resumed order was agreed.
+    let agreed = match minted {
+        true => {
+            let quote: Quote = calcifer.post("/v1/rental-quotes", &ask(None), None).await?;
+            output::say(ctx, &price(&sku, gpus, &quote));
+            if !(rent.yes || ctx.json || agreed_here()) {
+                output::say(ctx, "nothing was rented");
+                return Ok(ExitCode::SUCCESS);
+            }
+            Some(quote.agreed())
+        }
+        false => None,
+    };
+    let rented: Rented = match calcifer.post("/v1/machines", &ask(agreed), Some(&key)).await {
         // An answer lost on the way back may still have placed the order: only its key resumes it.
         Err(e) if minted && matches!(e.kind, Kind::Unavailable | Kind::Internal) => {
             return Err(e.remedy(format!(
@@ -77,7 +94,9 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
         }
         answer => answer?,
     };
-    output::say(ctx, &price(&sku, &rented.quote));
+    if agreed.is_none() {
+        output::say(ctx, &price(&sku, gpus, &rented.quote));
+    }
     let mut notices = Notices::default();
     for note in notices.fresh(&rented.machine) {
         output::say(ctx, note);
@@ -107,10 +126,7 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
         .field("machine", &machine.name)
         .field("state", state_cell(&machine))
         .field("gpus", gpus)
-        .field(
-            "$/hour",
-            usd(q.gpu_usd_micros_per_hour + q.storage_usd_micros_per_hour),
-        )
+        .field("$/hour", usd(q.hourly()))
         .note(format!(
             "billing continues until `cozy machine end {}` confirms its release",
             machine.name
@@ -157,23 +173,39 @@ impl Notices {
     }
 }
 
-/// The price the order is held to: per hour and for the Hub's assumed hours and download.
-fn price(sku: &str, q: &Quote) -> String {
+/// The price the order is held to, in the catalog's terms: $/HOUR (the machine and its disk) and
+/// EXPECTED (the Hub's assumed hours and download, with its traffic).
+fn price(sku: &str, gpus: u32, q: &Quote) -> String {
     let mut line = format!(
-        "{sku} with a {} GB disk: {}/h GPU + {}/h disk",
-        q.disk_gb,
+        "{sku} ×{gpus}: {}/h ({} GPU + {} for a {} GB disk)",
+        usd(q.hourly()),
         usd(q.gpu_usd_micros_per_hour),
-        usd(q.storage_usd_micros_per_hour)
+        usd(q.storage_usd_micros_per_hour),
+        q.disk_gb
     );
     if let Some(per_gb) = q.bandwidth_usd_micros_per_gb.filter(|p| *p > 0) {
         line += &format!(", traffic up to ${:.3}/GB", per_gb as f64 / 1e6);
     }
     line + &format!(
-        "; about {} for {} h and a {} GB download",
+        "; expected {} for {} h and a {} GB download",
         usd(q.expected_total_usd_micros),
         q.expected_hours,
         q.expected_download_gb
     )
+}
+
+/// A person's yes to the quote on a terminal; without one, the command is the yes.
+fn agreed_here() -> bool {
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return true;
+    }
+    anstream::eprint!("Rent it? [Y/n] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes")
 }
 
 /// Follows the boot over Calcifer's machine events until the machine is ready, saying the Hub's

@@ -50,7 +50,7 @@ struct RunArgs {
     #[command(flatten)]
     placement: Placement,
     /// Use at most N GPUs for the run and its calls.
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, value_name = "N", value_parser = gpu_count)]
     gpus: Option<u32>,
     /// Weight precision for every model; absent, the machine's rules choose per GPU.
     #[arg(long, value_parser = ["16", "8", "4"])]
@@ -381,7 +381,7 @@ async fn invoke(
         attention_kernel: args.attention_kernel.as_deref().unwrap_or_default(),
     };
     let out = args.out.map(|dir| terms.cwd.join(dir));
-    gpuless(ctx, &on, callable, &target).await;
+    gpuless(ctx, &on, callable, &target, bits).await;
     let submission = call.submission(on, &hub.origin, &call.spec(&bound)?, Some(&bound), out);
     send(ctx, submission, &terms.key, args.detach).await
 }
@@ -405,6 +405,19 @@ fn terms(ctx: &Context, args: &RunArgs) -> Result<Terms, Error> {
         digests: Some(ctx.home.root().join("cache").join("digests")),
         manifests: Some(ctx.home.root().join("cache").join("trees")),
     })
+}
+
+/// `--gpus`: 1 or more. Where a run uses the CPU is its function's and its machine's to say.
+fn gpu_count(text: &str) -> Result<u32, String> {
+    match text.parse::<u32>() {
+        Ok(0) => Err(
+            "a run uses the CPU when its function declares accelerator=False or its \
+             machine has no GPU: `--on new:cpu` rents a machine with none"
+                .into(),
+        ),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("{text:?} is not a number of GPUs")),
+    }
 }
 
 /// `--bits`; 0 lets the machine's rules choose.
@@ -441,11 +454,13 @@ async fn send(ctx: &Context, submission: SubmitRun, key: &str, detach: bool) -> 
     follow(ctx, submitted.run, detach).await
 }
 
-/// Warns that a GPU function sent to a ready machine with no supported GPU runs on its CPU, and
-/// how to rent one instead.
-pub(crate) async fn gpuless(ctx: &Context, on: &On, callable: &Callable, target: &str) {
+/// Warns that a run sent to a ready machine with no supported GPU runs on its CPU (a GPU
+/// function slowly) and that its models take their 16-bit lanes whatever `--bits` asked (a CPU
+/// runs no 8- or 4-bit format), and how to rent one instead.
+pub(crate) async fn gpuless(ctx: &Context, on: &On, callable: &Callable, target: &str, bits: u32) {
     let On::Machine(name) = on else { return };
-    if callable.accelerator == Some(false) {
+    let (slow, narrow) = (callable.accelerator != Some(false), matches!(bits, 4 | 8));
+    if !slow && !narrow {
         return;
     }
     let Ok(calcifer) = ctx.calcifer().await else {
@@ -459,9 +474,17 @@ pub(crate) async fn gpuless(ctx: &Context, on: &On, callable: &Callable, target:
             && (m.status.as_ref()).is_some_and(|s| s.phase == "ready" && s.gpus.is_empty())
     });
     if none {
+        let said: Vec<_> = [
+            slow.then(|| format!("{target} runs on its CPU, slowly")),
+            narrow
+                .then(|| format!("its models take their 16-bit lanes (--bits {bits} needs a GPU)")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         output::warn(&format!(
-            "{name} has no supported GPU, so {target} runs on its CPU, slowly; \
-             `--on new` rents one: cozy run {target} … --on new"
+            "{name} has no supported GPU, so {}; `--on new` rents one: cozy run {target} … --on new",
+            said.join(", and ")
         ));
     }
 }
