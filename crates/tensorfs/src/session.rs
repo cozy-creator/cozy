@@ -12,7 +12,7 @@ mod selection;
 pub use crate::fetch::Landed as Fetched;
 pub use checkpoint::{Checkpoint, Component};
 pub use endpoint::Endpoint;
-pub use provider::{bearer, HeaderMap, Request, TokenProvider};
+pub use provider::{bearer, DPoP, HeaderMap, JwtBearer, Request, TokenProvider};
 
 use std::fmt;
 use std::ops::Range;
