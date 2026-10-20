@@ -70,6 +70,7 @@ fn pages_pin_evict_refill_and_survive_clean_owner_exit() {
         gpu.fill(id).expect("real TensorFS disk fill");
     }
     let pin = gpu.bind(1, 0).expect("bind");
+    let _busy_custody = gpu.export(1).expect("read-only custody while pinned");
     assert_eq!(bytes(&pin), data);
     assert!(!gpu.unmap(1).expect("pinned page cannot evict"));
     assert!(gpu.unmap(2).expect("other page independently evicts"));
