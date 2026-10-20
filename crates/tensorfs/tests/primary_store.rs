@@ -1,7 +1,7 @@
 //! Normal checkpoint access stays in the shared store; directory exports are explicit.
 #![cfg(feature = "store")]
 
-use std::fs::{self, File, TryLockError};
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -85,7 +85,7 @@ fn no_compatibility_directories(store: &Store) {
 #[tokio::test]
 async fn normal_open_read_and_fetch_do_not_create_compatibility_directories() {
     let scratch = Scratch::new();
-    let store = Store::open(scratch.0.join("store")).unwrap().with_cache();
+    let store = Store::open(scratch.0.join("store")).unwrap();
     let (header, tree) = seed(&store);
     no_compatibility_directories(&store);
 
@@ -132,31 +132,24 @@ async fn normal_open_read_and_fetch_do_not_create_compatibility_directories() {
     no_compatibility_directories(&store);
 }
 
+/// A checkpoint open on a snapshot folder holds the folder; closed, the folder is cache that
+/// nothing uses, and a collection takes it.
 #[test]
-fn explicit_cached_folder_retains_its_existing_directory() {
+fn an_open_snapshot_folder_is_held_and_goes_when_closed() {
     let scratch = Scratch::new();
-    let store = Store::open(scratch.0.join("store")).unwrap().with_cache();
+    let store = Store::open(scratch.0.join("store")).unwrap().with_grace(Duration::ZERO);
     let (_, tree) = seed(&store);
     store.put_bytes(README).unwrap();
     let directory = store.root().join("snapshots").join(&tree.sha256);
     store.snapshot(&tree, &directory, None).unwrap();
-    assert!(!fs::read(directory.join("model.main.cozytensors"))
-        .unwrap()
-        .is_empty());
     let checkpoint = Checkpoint::folder(&directory, Some("main"), Some(&store)).unwrap();
-    let fence = directory
-        .parent()
-        .unwrap()
-        .join(format!(".{}.tensorfs-lock", tree.sha256));
-    let file = File::open(fence).unwrap();
-    assert!(matches!(file.try_lock(), Err(TryLockError::WouldBlock)));
+    store.collect(u64::MAX, Duration::ZERO).unwrap();
+    assert!(directory.join("model.main.cozytensors").is_file(), "an open folder was swept");
     assert_eq!(checkpoint.read("model", "weight").unwrap(), b"shared bytes");
     drop(checkpoint);
-    file.try_lock().unwrap();
-    assert!(
-        !store.root().join("views").exists(),
-        "opening an explicit snapshot created an unused views area"
-    );
+    store.collect(u64::MAX, Duration::ZERO).unwrap();
+    assert!(!directory.exists(), "a folder nothing holds or uses outlived a collection");
+    assert!(!store.root().join("views").exists());
 }
 
 #[tokio::test]

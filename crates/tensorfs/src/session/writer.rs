@@ -205,15 +205,8 @@ impl Context {
             self.store.clone(),
             Some(self.variant.clone()),
         )?;
-        // The generated public tree has its own cache lifetime, independent of the header
-        // and the native owner's flat repository-file root.
-        self.store.cache_touch(&tree)?;
-        if self.repo_id.is_some() && published.is_none() {
-            // A failed upload is a durable, retryable local result after every live handle
-            // drops. Its normal tree pin retains header, payload and repository bytes.
-            self.store
-                .pin_roots(&tree.sha256, std::slice::from_ref(&tree))?;
-        }
+        // The tree is a use of its own: a failed upload stays retryable for the TTL.
+        self.store.used(&tree.sha256, std::iter::once(&tree).chain(files.values()))?;
         Ok(checkpoint)
     }
 
@@ -221,7 +214,6 @@ impl Context {
     /// header. Until the root lands, the live checkpoint holds the bytes.
     fn publish_file(&self, checkpoint: &Checkpoint) -> Result<()> {
         if let Some(dest) = &self.dest {
-            self.store.cache_preserve_snapshot(dest)?;
             let header = checkpoint.id();
             let bytes = self.store.read(header)?;
             if let Some(parent) = dest.parent() {
@@ -230,7 +222,7 @@ impl Context {
             }
             platform::durable::replace(dest, &bytes, 0o644)
                 .map_err(|e| super::io_failure(dest.display(), e.into()))?;
-            self.store.pin_file(dest, header)?;
+            self.store.root_file(dest, header)?;
         }
         Ok(())
     }

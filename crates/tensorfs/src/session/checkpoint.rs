@@ -7,7 +7,8 @@ use std::sync::Arc;
 use crate::failure::{fail, Kind, Result};
 use crate::format::{self, Body, ObjectRef, PartBytes};
 use crate::io::{Dst, ReadOpts, Target};
-use crate::store::{CacheGuard, Checkpoint as Stored, Store};
+use crate::store::retention::Hold;
+use crate::store::{Checkpoint as Stored, Store};
 
 use super::{remote::Remote, Download, Fetched, Format, Ref, Selection};
 
@@ -25,7 +26,7 @@ struct Data {
     store: Store,
     local_repo: Option<LocalRepo>,
     variant: Option<String>,
-    _extra: CacheGuard,
+    _extra: Option<Arc<Hold>>,
 }
 
 /// An owned source. A cloned component keeps this data alive after its parent drops.
@@ -66,7 +67,7 @@ impl Checkpoint {
             named: None,
             tree: None,
             remote: Some(source),
-            _extra: store.cache_hold(&[])?,
+            _extra: None,
             store,
             local_repo,
             variant,
@@ -83,7 +84,7 @@ impl Checkpoint {
         store: Store,
         variant: Option<String>,
     ) -> Result<Self> {
-        let extra = store.cache_hold(&extra)?;
+        let extra = Some(store.hold(&extra)?);
         let header_bytes = store.read(raw.id())?;
         Ok(Self::from_data(Data {
             raw,
@@ -325,7 +326,6 @@ impl Checkpoint {
         dequantize: Option<&format::Dtype>,
     ) -> Result<Vec<String>> {
         let repo = self.export_paths()?;
-        self.data.store.cache_preserve_snapshot(dir)?;
         crate::export::safetensors(&self.data.raw, &repo, dir, dequantize)
     }
 
@@ -388,7 +388,6 @@ impl Checkpoint {
                 .collect(),
             None => BTreeMap::new(),
         };
-        self.data.store.cache_preserve_snapshot(dir)?;
         crate::export::cozytensors(
             &self.data.raw,
             &repo,
@@ -621,17 +620,14 @@ impl Component {
     pub fn export_files(&self, dir: Option<&Path>) -> Result<PathBuf> {
         let store = &self.data.store;
         if let Some(dir) = dir {
-            store.cache_preserve_snapshot(dir)?;
             return Ok(self.data.raw.export_component_files(&self.name, dir)?);
         }
         let identity = format!("{}:files:{}", self.data.raw.id().sha256, self.name);
-        let dir = store
-            .root()
-            .join("snapshots")
-            .join(crate::sha256::hex_digest(identity.as_bytes()));
-        let _directory = store.cache_directory(&dir)?;
+        let name = crate::sha256::hex_digest(identity.as_bytes());
+        store.used(&name, [])?;
+        let dir = store.root().join("snapshots").join(name);
         self.data.raw.export_component_files(&self.name, &dir)?;
-        let _ = store.cache_maintain(0)?;
+        store.maintain(0)?;
         Ok(dir)
     }
 }

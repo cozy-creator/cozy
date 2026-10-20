@@ -16,7 +16,7 @@
 //! - A keyed writer journals finished tensors and assets and, reopened after a crash, skips them
 //!   (`has`); the producer declares its components again. Its fence is `flock` on an O_CLOEXEC
 //!   descriptor: a forked child holds it only until it execs, and a second opener waits.
-//! - Objects the writer refers to are kept young while it runs, so GC's grace never takes them.
+//! - The writer holds every object it refers to until it commits or ends.
 //! - A folder writer writes `chunks/<sha256>` first and `model.<variant>.cozytensors` last, by
 //!   rename: a folder without the header is unfinished. Objects its base's store holds are
 //!   referenced, not copied (a thin folder).
@@ -29,7 +29,6 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use platform::durable::{self, FileId};
 use serde::{Deserialize, Serialize};
@@ -42,9 +41,9 @@ use crate::format::{
     Part, Pipeline, Tensor, Value, CHUNKS_DIR, CONFIG_FILE,
 };
 use crate::import;
-use crate::store::retention::{self, Retention};
+use crate::store::retention::{self, Hold};
 use crate::sha256::{hex, Sha256};
-use crate::store::{fail, fault, is_name, sync_dir, Admission, Checkpoint, Error, Pin, Result, Store};
+use crate::store::{fail, fault, is_name, sync_dir, Admission, Checkpoint, Error, Result, Store};
 
 const SPOOL: &str = "spool";
 const JOURNAL: &str = "journal";
@@ -200,7 +199,7 @@ pub struct Writer {
     key: Option<String>,
     /// Held until commit or abandon.
     fence: Option<File>,
-    retention: Option<Arc<Retention>>,
+    hold: Option<Arc<Hold>>,
     base: Option<Checkpoint>,
     pipeline: Option<Pipeline>,
     /// Components declared, in order.
@@ -220,7 +219,6 @@ pub struct Writer {
     /// Journal lines whose bytes are not yet durable.
     pending: Vec<u8>,
     unflushed: u64,
-    touched: Instant,
     buffer: Vec<u8>,
     committed: Option<ObjectRef>,
     published: Option<ObjectRef>,
@@ -234,8 +232,8 @@ pub struct ComponentWriter<'w> {
 
 impl Store {
     /// A writer of a new cozytensors in this store, starting from `base` when given. With `key`,
-    /// it resumes what an interrupted writer of that key journaled, and waits while one holds it;
-    /// the committed header is pinned under the key (else its digest).
+    /// it resumes what an interrupted writer of that key journaled, and waits while one holds it.
+    /// The committed header is cached like any other use.
     pub fn writer(&self, base: Option<&Checkpoint>, key: Option<&str>) -> Result<Writer> {
         let writers = self.root().join("tmp").join("writers");
         let name = match key {
@@ -309,7 +307,7 @@ impl Store {
 
     /// Imports `req` into a committed cozytensors: (its header, the source's repo files). With
     /// `key`, an interrupted import resumes: the tensors its journal holds are not converted
-    /// again. The header and repo files stay pinned under the key (else the header's digest).
+    /// again. The header and repo files are cached like any other use.
     pub fn import(
         &self,
         req: &import::Request,
@@ -351,14 +349,14 @@ impl Writer {
         let _acquisition = dest.store().map(retention::acquire).transpose()?;
         let spool = open(&dir.join(SPOOL), key.is_none(), false)?;
         let journal = key.map(|_| open(&dir.join(JOURNAL), false, true)).transpose()?;
-        let objects = base.map_or_else(Vec::new, |b| std::iter::once(b.id().clone()).chain(b.header().objects().cloned()).collect());
-        let retention = dest.store().map(|store| Retention::new(store, objects)).transpose()?;
+        let objects: Vec<String> = base.map_or_else(Vec::new, |b| std::iter::once(b.id()).chain(b.header().objects()).map(|o| o.sha256.clone()).collect());
+        let hold = dest.store().map(|store| Hold::new(store, objects)).transpose()?;
         let mut writer = Writer {
             dest,
             dir,
             key: key.map(str::to_owned),
             fence: Some(fence),
-            retention,
+            hold,
             base: base.cloned(),
             pipeline: None,
             specs: Vec::new(),
@@ -373,7 +371,6 @@ impl Writer {
             journal,
             pending: Vec::new(),
             unflushed: 0,
-            touched: Instant::now(),
             buffer: vec![0; 1 << 20],
             committed: None,
             published: None,
@@ -467,7 +464,7 @@ impl Writer {
     }
 
     /// A repo file (README, LICENSE): never inside the cozytensors. Into the store it is an
-    /// object listed by [`Writer::repo_files`] and pinned with the header; into a folder, a
+    /// object listed by [`Writer::repo_files`] and kept with the header; into a folder, a
     /// file at its path.
     pub fn repo_file(&mut self, path: &str, bytes: &[u8]) -> Result<()> {
         self.live()?;
@@ -476,7 +473,7 @@ impl Writer {
             return Err(bad(format!("{path:?} names a variant, not a repo file")));
         }
         let object = match &self.dest {
-            Dest::Store(_) => self.dest.put_bytes(&self.dir, bytes, self.retention.as_ref())?,
+            Dest::Store(_) => self.dest.put_bytes(&self.dir, bytes, self.hold.as_ref())?,
             Dest::Folder { root, .. } => {
                 let at = root.join(path);
                 let parent = at.parent().expect("a file has a directory");
@@ -487,7 +484,7 @@ impl Writer {
             Dest::Endpoint { store, stream, .. } => {
                 let acquisition = retention::acquire(store)?;
                 let object = store.put_bytes(bytes)?;
-                if let Some(hold) = &self.retention { hold.extend([object.clone()])?; }
+                if let Some(hold) = &self.hold { hold.extend([object.sha256.clone()])?; }
                 drop(acquisition);
                 stream.put_stored(store, &object).map_err(sent)?;
                 object
@@ -502,9 +499,9 @@ impl Writer {
         &self.repo
     }
 
-    /// Lays out the chunks in header order and writes the header: into the store, pinned under
-    /// the key (or its own digest) with the repo files; or into the folder, last. The journal
-    /// and spool go; the writer is spent.
+    /// Lays out the chunks in header order and writes the header: into the store, a use of it
+    /// with the repo files; or into the folder, last. The journal and spool go; the writer is
+    /// spent.
     pub fn commit(&mut self) -> Result<ObjectRef> {
         self.live()?;
         let base = self.base.take();
@@ -542,7 +539,7 @@ impl Writer {
         }
         for (chunk, mut members) in packs {
             members.sort_by_key(|i| plan.places[*i].offset);
-            let mut admit = self.dest.admit(&self.dir, self.retention.as_ref())?;
+            let mut admit = self.dest.admit(&self.dir, self.hold.as_ref())?;
             let mut end = 0;
             for i in members {
                 let (place, stored) = (plan.places[i], list[i].2);
@@ -591,18 +588,12 @@ impl Writer {
                 }
             }
         }
+        let objects: Vec<ObjectRef> = header.objects().cloned().collect();
         let header = header.to_cbor()?;
         let id = match &self.dest {
             Dest::Store(store) => {
                 let id = self.admit_header(store, &header)?;
-                if !store.cache_writer(&id, &self.repo)? {
-                    let roots: Vec<ObjectRef> = std::iter::once(id.clone()).chain(self.repo.values().cloned()).collect();
-                    match &self.key {
-                        Some(key) => store.pin(key, &Pin::new(roots))?,
-                        None => store.pin_roots(&id.sha256, &roots)?,
-                    }
-                }
-                fault::point("writer.pinned");
+                store.used(&id.sha256, std::iter::once(&id).chain(&objects).chain(self.repo.values()))?;
                 id
             }
             Dest::Folder { root, variant, .. } => {
@@ -613,10 +604,7 @@ impl Writer {
             }
             Dest::Endpoint { store, stream, name, variant } => {
                 let id = self.admit_header(store, &header)?;
-                if !store.cache_writer(&id, &self.repo)? {
-                    let roots: Vec<ObjectRef> = std::iter::once(id.clone()).chain(self.repo.values().cloned()).collect();
-                    store.pin_roots(&id.sha256, &roots)?;
-                }
+                store.used(&id.sha256, std::iter::once(&id).chain(&objects).chain(self.repo.values()))?;
                 self.committed = Some(id.clone());
                 self.published = Some(stream.commit(name, variant, header, &self.repo).map_err(sent)?);
                 id
@@ -630,7 +618,7 @@ impl Writer {
     // The local header must join the same native hold before publication can fail. Use the
     // retained local admission path; an Endpoint header is uploaded later by Stream::commit.
     fn admit_header(&self, store: &Store, header: &[u8]) -> Result<ObjectRef> {
-        let mut admit = Admit::Store(store.admit(None)?, self.retention.clone());
+        let mut admit = Admit::Store(store.admit(None)?, self.hold.clone());
         admit.write_all(header).map_err(fail("write", &self.dir))?;
         admit.finish()
     }
@@ -659,7 +647,7 @@ impl Writer {
                     }
                 }
                 for object in c.assets.values() {
-                    self.dest.copy_in(&self.dir, base, object, self.retention.as_ref())?;
+                    self.dest.copy_in(&self.dir, base, object, self.hold.as_ref())?;
                 }
                 specs.push(Spec {
                     name: c.name.clone(),
@@ -721,10 +709,10 @@ impl Writer {
     }
 
     fn live(&mut self) -> Result<()> {
-        if self.fence.is_none() {
-            return Err(bad("the writer has committed"));
+        match self.fence {
+            Some(_) => Ok(()),
+            None => Err(bad("the writer has committed")),
         }
-        self.keep().map(drop)
     }
 
     fn ready(&mut self, component: &str, key: &str) -> Result<()> {
@@ -734,24 +722,7 @@ impl Writer {
         self.live()
     }
 
-    /// Makes every object the writer refers to young again, a quarter of the grace after the
-    /// last time, so a long write never loses its objects to GC; true when it did.
-    fn keep(&mut self) -> Result<bool> {
-        let Some(store) = self.dest.store() else {
-            return Ok(false);
-        };
-        if self.touched.elapsed() < store.grace() / 4 {
-            return Ok(false);
-        }
-        for object in self.referenced() {
-            store.reuse(&object)?;
-        }
-        self.touched = Instant::now();
-        Ok(true)
-    }
-
-    /// `length` bytes of `data` as objects, one per 64 MiB from the first byte, keeping what the
-    /// writer refers to young between objects.
+    /// `length` bytes of `data` as objects, one per 64 MiB from the first byte.
     fn grid(&mut self, data: &mut dyn Read, length: u64, what: &str) -> Result<Vec<ObjectRef>> {
         let mut buffer = std::mem::take(&mut self.buffer);
         let mut objects = Vec::new();
@@ -761,7 +732,7 @@ impl Writer {
                 break Ok(());
             }
             let n = left.min(GRID);
-            let written = (self.dest.admit(&self.dir, self.retention.as_ref()))
+            let written = (self.dest.admit(&self.dir, self.hold.as_ref()))
                 .and_then(|mut admit| pour(data, &mut admit, n, &mut buffer, what).and_then(|()| admit.finish()));
             match written {
                 Ok(object) => objects.push(object),
@@ -769,23 +740,13 @@ impl Writer {
             }
             left -= n;
             fault::point("writer.grid");
-            match self.keep() {
-                Ok(true) => {
-                    let store = self.dest.store().expect("a refresh has a store");
-                    if let Err(e) = objects.iter().try_for_each(|o| store.reuse(o).map(drop)) {
-                        break Err(e);
-                    }
-                }
-                Ok(false) => {}
-                Err(e) => break Err(e),
-            }
         };
         self.buffer = buffer;
         laid.map(|()| objects)
     }
 
     fn retain_referenced(&self) -> Result<()> {
-        if let Some(hold) = &self.retention { hold.extend(self.referenced())?; }
+        if let Some(hold) = &self.hold { hold.extend(self.referenced().into_iter().map(|o| o.sha256))?; }
         Ok(())
     }
 
@@ -854,7 +815,7 @@ impl Writer {
             let place = match (at.length >= STANDALONE, on_grid) {
                 (true, true) => {
                     for (object, ..) in &ranges {
-                        self.dest.copy_in(&self.dir, from, object, self.retention.as_ref())?;
+                        self.dest.copy_in(&self.dir, from, object, self.hold.as_ref())?;
                     }
                     At::Grid(ranges.iter().map(|r| r.0.clone()).collect())
                 }
@@ -1064,7 +1025,7 @@ impl Writer {
             let _ = fs::remove_dir(&writing);
         }
         self.fence = None;
-        self.retention = None;
+        self.hold = None;
         self.base = None;
     }
 }
@@ -1081,7 +1042,7 @@ impl Drop for Writer {
                 // Do not perform filesystem cleanup from a final owner (possibly under a GIL).
                 // sweep_anonymous/sweep_writers already reclaim unlocked workdirs.
                 self.fence = None;
-                self.retention = None;
+                self.hold = None;
                 self.base = None;
             },
         }
@@ -1158,7 +1119,7 @@ impl ComponentWriter<'_> {
     pub fn asset(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
         self.w.live()?;
         asset_name(&self.name, name)?;
-        let object = self.w.dest.put_bytes(&self.w.dir, bytes, self.w.retention.as_ref())?;
+        let object = self.w.dest.put_bytes(&self.w.dir, bytes, self.w.hold.as_ref())?;
         self.add_asset(name, object, false, bytes.len() as u64)
     }
 
@@ -1277,7 +1238,7 @@ impl Dest {
         }
     }
 
-    fn admit(&self, work: &Path, hold: Option<&Arc<Retention>>) -> Result<Admit> {
+    fn admit(&self, work: &Path, hold: Option<&Arc<Hold>>) -> Result<Admit> {
         match self {
             Dest::Store(store) => Ok(Admit::Store(store.admit(None)?, hold.cloned())),
             Dest::Folder { root, .. } => {
@@ -1299,17 +1260,17 @@ impl Dest {
         }
     }
 
-    fn put_bytes(&self, work: &Path, bytes: &[u8], hold: Option<&Arc<Retention>>) -> Result<ObjectRef> {
+    fn put_bytes(&self, work: &Path, bytes: &[u8], hold: Option<&Arc<Hold>>) -> Result<ObjectRef> {
         let mut admit = self.admit(work, hold)?;
         admit.write_all(bytes).map_err(fail("write", work))?;
         admit.finish()
     }
 
     /// Copies `object` from `from` unless it is here already.
-    fn copy_in(&self, work: &Path, from: &Checkpoint, object: &ObjectRef, hold: Option<&Arc<Retention>>) -> Result<()> {
+    fn copy_in(&self, work: &Path, from: &Checkpoint, object: &ObjectRef, hold: Option<&Arc<Hold>>) -> Result<()> {
         let acquisition = self.store().map(retention::acquire).transpose()?;
         if self.has(object)? {
-            if let Some(hold) = hold { hold.extend([object.clone()])?; }
+            if let Some(hold) = hold { hold.extend([object.sha256.clone()])?; }
             return Ok(());
         }
         drop(acquisition);
@@ -1329,9 +1290,9 @@ impl Dest {
 
 /// Bytes on their way to becoming an object of the destination.
 enum Admit {
-    Store(Admission, Option<Arc<Retention>>),
+    Store(Admission, Option<Arc<Hold>>),
     Folder(FolderObject),
-    Endpoint(Store, Arc<Stream>, Admission, Option<Arc<Retention>>),
+    Endpoint(Store, Arc<Stream>, Admission, Option<Arc<Hold>>),
 }
 
 /// A send that failed, as the writer's error.
@@ -1354,7 +1315,7 @@ impl Admit {
             Admit::Store(admission, hold) => {
                 let _acquisition = hold.as_ref().map(|hold| hold.acquire()).transpose()?;
                 let object = admission.finish()?;
-                if let Some(hold) = hold { hold.extend([object.clone()])?; }
+                if let Some(hold) = hold { hold.extend([object.sha256.clone()])?; }
                 Ok(object)
             },
             Admit::Folder(mut o) => {
@@ -1372,7 +1333,7 @@ impl Admit {
             Admit::Endpoint(store, stream, admission, hold) => {
                 let acquisition = hold.as_ref().map(|hold| hold.acquire()).transpose()?;
                 let object = admission.finish()?;
-                if let Some(hold) = hold { hold.extend([object.clone()])?; }
+                if let Some(hold) = hold { hold.extend([object.sha256.clone()])?; }
                 drop(acquisition);
                 stream.put_stored(&store, &object).map_err(sent)?;
                 Ok(object)
