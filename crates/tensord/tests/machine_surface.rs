@@ -1746,6 +1746,91 @@ mod v1_api {
         let _ = fs::remove_dir_all(source);
     }
 
+    /// A run keeps reading its owner's checkpoints after its request's bearer is revoked: the newer
+    /// bearer pushed since (`PUT /v1/bearer`) is presented instead. A refused bearer with none newer
+    /// fails the read, naming when it expired.
+    #[tokio::test]
+    async fn a_pushed_bearer_outlives_the_requests_revoked_one() {
+        let source = std::env::temp_dir().join(format!("cm-bearer-{}", uuid::Uuid::new_v4()));
+        let store = tensorfs::store::Store::open(&source).unwrap();
+        let model = |repository: &str, weight: u8| names_hub::Model {
+            repository: repository.into(),
+            release: String::new(),
+            lane: "bf16".into(),
+            header: names_hub::checkpoint(&store, &[weight; 8192]),
+        };
+        let names = ["acme/first", "acme/second", "acme/third"];
+        let models = vec![model(names[0], 1), model(names[1], 2), model(names[2], 3)];
+        let trees = names_hub::trees(&store, &models);
+        // Storage answers each object after 2 s: the first model is still downloading when the
+        // bearer moves, and the run reads the second only after.
+        let (origin, heard) = names_hub::paced_models(&store, models, Duration::from_secs(2));
+        let machine = Machine::start().await;
+        let client = client(&machine);
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let bearer = |token: &str, expires_unix_ms| v1::TensorFSOptions {
+            endpoint: origin.clone(),
+            token: token.into(),
+            expires_unix_ms,
+            ..Default::default()
+        };
+        let spec = |given: v1::TensorFSOptions, read: &[usize]| v1::RunSpec {
+            kind: v1::RunKind::Warm,
+            models: read.iter().map(|&at| v1::ModelChoice {
+                parameter: names[at].into(),
+                repository: names[at].into(),
+                manifest: trees[at].id(),
+                ..Default::default()
+            }).collect(),
+            hub: Some(v1::HubAccess { origin: origin.clone(), ..Default::default() }),
+            tensorfs: Some(given),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+
+        names_hub::admit(&origin, &["first"]);
+        let stale = settle(&client, &all, "bearer-stale", spec(bearer("stale", 1_760_000_000_000), &[0])).await;
+        let reason = stale.reason.unwrap();
+        assert_eq!(reason.code, "hub_credential_refused");
+        assert!(reason.message.contains("the owner's bearer expired at 2025-10-09T08:53:20Z"), "{reason:?}");
+        let refused = by(&client, &all).bearer(&bearer("", now)).await.err().unwrap();
+        assert_eq!(refused.code(), Some("invalid_bearer"));
+        heard.lock().unwrap().clear();
+
+        let running = tokio::spawn({
+            let (client, all, spec) = (client.clone(), all.clone(), spec(bearer("first", now + 3_600_000), &[0, 1]));
+            async move { settle(&client, &all, "bearer-pushed", spec).await }
+        });
+        let first = format!("/{} +credential", trees[0].key());
+        // Test harness bound on a wedged download; the product has no such limit.
+        let until = Instant::now() + Duration::from_secs(60);
+        while !heard.lock().unwrap().iter().any(|asked| asked.ends_with(&first)) {
+            assert!(Instant::now() < until, "the run never read its first model");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The newer bearer is valid before the old one is revoked, as a refreshed one is.
+        names_hub::admit(&origin, &["first", "second"]);
+        by(&client, &all).bearer(&bearer("second", now + 7_200_000)).await.unwrap();
+        names_hub::admit(&origin, &["second"]);
+        let revoked = heard.lock().unwrap().len();
+        let done = running.await.unwrap();
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let after: Vec<String> = heard.lock().unwrap()[revoked..].to_vec();
+        let second = format!("/{} +credential", trees[1].key());
+        assert!(after.iter().any(|asked| asked.ends_with(&second)), "{after:?}");
+        assert!(after.iter().all(|asked| !asked.ends_with("+refused")), "{after:?}");
+
+        // A bearer that expires earlier never replaces the newest; once that is revoked too, a
+        // read fails naming when it expires.
+        names_hub::admit(&origin, &[]);
+        let done = settle(&client, &all, "bearer-revoked", spec(bearer("first", now + 3_600_000), &[2])).await;
+        let reason = done.reason.unwrap();
+        assert_eq!(reason.code, "hub_credential_refused", "{reason:?}");
+        assert!(reason.message.contains("the Hub refused the owner's bearer, which expires at"), "{reason:?}");
+        let _ = fs::remove_dir_all(source);
+    }
+
     /// `cozy model upload <file>` and `cozy model download … local/name` on the serve process:
     /// a file the client wrote is made into a model with no provider and kept under a local
     /// alias. Real network for the fixture and its profile's reference configs.

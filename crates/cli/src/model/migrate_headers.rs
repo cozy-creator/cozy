@@ -58,7 +58,7 @@ pub(crate) async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     let (session, client) = (ctx.hub_session(&hub)?, ctx.hub_signed_in(&hub)?);
     let (mut reports, mut ok) = (vec![], true);
     for model in args.models {
-        let (token, origin, name) = (session.bearer(&client).await.map_err(hub_error)?, hub.origin.to_string(), model.clone());
+        let (token, origin, name) = (session.bearer(&client).await.map_err(hub_error)?.token, hub.origin.to_string(), model.clone());
         let done = blocking(move || {
             let local = is_loopback_origin(&origin);
             let http = Client::new(SourcePolicy { any_host: true, allow_local: local, max_redirects: 5, ..Default::default() });

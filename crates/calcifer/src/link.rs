@@ -159,6 +159,11 @@ impl Link {
         Ok(Box::pin(self.machine.watch().await?.map_err(LinkError::from)))
     }
 
+    /// Gives the machine this computer's newest bearer at the Hub `bearer.endpoint` names.
+    pub async fn bearer(&self, bearer: &v1::TensorFSOptions) -> Result<(), LinkError> {
+        Ok(self.machine.bearer(bearer).await?)
+    }
+
     /// Starts a rental's idle clock over; answers the picture with its new deadline.
     pub async fn keepalive(&self) -> Result<v1::StatusFrame, LinkError> {
         Ok(self.machine.keepalive().await?)
