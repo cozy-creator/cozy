@@ -257,10 +257,37 @@ fn end_detached(root: &Path) -> Result<(), Error> {
 
 /// The machine's root as the service will read it: the config's `[machine] root` as written now.
 fn machine_root(ctx: &Context) -> Result<PathBuf, Error> {
+    Ok(machine_config(ctx)?.root(&ctx.home))
+}
+
+fn machine_config(ctx: &Context) -> Result<protocol::config::MachineConfig, Error> {
     let path = ctx.home.config();
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let (config, _) = protocol::config::Config::parse(&text, &path.display().to_string())?;
-    Ok(config.machine.root(&ctx.home))
+    Ok(config.machine)
+}
+
+/// For `cozy uninstall`: the machine's root, and the model store it keeps there (none when the
+/// config names a store elsewhere, which may be shared).
+pub(crate) fn root_and_store(ctx: &Context) -> Result<(PathBuf, Option<PathBuf>), Error> {
+    let config = machine_config(ctx)?;
+    let root = config.root(&ctx.home);
+    let store = config
+        .store
+        .is_none()
+        .then(|| root.join("var/lib/tensorfs"));
+    Ok((root, store))
+}
+
+/// For `cozy uninstall`: ends the machine now, with whatever it runs, and removes its service.
+pub(crate) fn end(ctx: &Context, root: &Path) -> Result<(), Error> {
+    let services = services(ctx);
+    if services.available() {
+        services
+            .uninstall(SERVICE)
+            .map_err(|e| service_error("machine_stop_failed", e))?;
+    }
+    end_detached(root)
 }
 
 /// Whether nothing holds the machine's root: no machine has run there, or none runs now.
