@@ -1309,7 +1309,10 @@ pub(crate) fn returned_write_release_interleaving() -> Result<()> {
             drop(write);
             // This standalone Gpu has no automatic poller. Retain the exact release
             // as another poller would after dequeue, before recording its fences.
-            let release = filling.releases.pop().expect("returned writable lease");
+            let release = filling
+                .releases
+                .pop()
+                .ok_or(Error::Internal("writable lease was not returned"))?;
             assert!(sent.send(release).is_ok(), "release observer disappeared");
             Ok(())
         })
