@@ -16,15 +16,15 @@ use tensorfs::store::Store;
 use tensorfs::{fetch, Checkpoint, Client, Config, Convert, Download, Format, Open, Ref, Selection};
 
 const VERBS: &[&str] = &[
-    "convert <source>... [--converter <c>] [--variant <v>] [--name local/<name>[@revision]]",
+    "convert <source>... [--converter <c>] [--variant <v>] [--name local/<name>[@tag]]",
     "download <ref> [--dir <dir>]",
-    "upload <folder> <org/name>[@revision]      the token is $TENSORFS_TOKEN",
+    "upload <folder> <org/name>[@tag]           moves the tag (main) to the new commit; the token is $TENSORFS_TOKEN",
     "export <ref> <dir> [--safetensors [--dequantize bf16|f16|f32] | --gguf]",
     "inspect <ref>",
     "verify <ref>",
     "ceiling [<path>] [--gpu <n>]              measure what reads from <path>'s volume (and to GPU n) reach",
     "conform endpoint <url> [--write] [--token-env <VAR>]",
-    "dev ckpt [--name local/<name>[@revision]] [--blocks <n>] [--scale <n>] [--plain] [--no-configs]",
+    "dev ckpt [--name local/<name>[@tag]] [--blocks <n>] [--scale <n>] [--plain] [--no-configs]",
     "version",
 ];
 
@@ -41,7 +41,8 @@ fn usage(verb: Option<&str>) -> String {
         text.push_str(line);
     }
     text.push_str(
-        "\n<ref> is org/name[@revision][/variant], sha256:<hex>, a .cozytensors file or a folder;
+        "\n<ref> is org/name[@revision][/variant], sha256:<hex>, a .cozytensors file or a folder; a revision is
+a tag, or sha256:<hex> of a commit or a variant header, and none is the highest public version;
 --variant picks a variant. The store is --store, else $TENSORFS_HOME, else ~/.cache/tensorfs.",
     );
     text
@@ -225,8 +226,10 @@ async fn run(args: &Args) -> Done {
         }
         ["upload", folder, reference] => {
             let reference: Ref = reference.parse()?;
-            let tree = client.upload_folder(&reference, Path::new(folder), None).await?;
-            Ok(Some((json!({"tree": object(&tree)}), format!("uploaded sha256:{}", tree.sha256))))
+            let commit = client.upload_folder(&reference, Path::new(folder), None).await?;
+            let tag = reference.revision.as_deref().unwrap_or(fetch::MAIN);
+            let human = format!("uploaded sha256:{}, {}@{tag}", commit.sha256, reference.repo_id);
+            Ok(Some((json!({"commit": object(&commit), "tag": tag}), human)))
         }
         ["export", reference, dir] => {
             let ck = open(&client, args, reference).await?;
@@ -297,15 +300,16 @@ async fn run(args: &Args) -> Done {
     }
 }
 
-/// Names `tree` in the local repo `local/<name>[@revision]`: that release, or with none an
-/// unreleased checkpoint.
+/// Makes `tree` a commit of the local repo `local/<name>[@tag]`, moving that tag (none: `main`)
+/// to it; a new tag is private.
 fn name_locally(store: &Store, name: &str, tree: &ObjectRef) -> Result<()> {
     let named: Ref = name.parse()?;
-    if !named.repo_id.starts_with("local/") || named.variant.is_some() {
-        return fail(Kind::Invalid, format!("--name {name:?}: a local name is local/<name>[@revision]"));
+    let tag = named.revision.as_deref().unwrap_or(fetch::MAIN);
+    if !named.repo_id.starts_with("local/") || named.variant.is_some() || !tensorfs::format::tag_name(tag) {
+        return fail(Kind::Invalid, format!("--name {name:?}: a local name is local/<name>[@tag]"));
     }
-    let (repo, revision) = (named.repo_id.as_str(), named.revision.as_deref());
-    store.update_ref(repo, |old| Some(fetch::with_tree(old, repo, tree, revision)))?;
+    let repo = named.repo_id.as_str();
+    store.update_ref(repo, |old| Some(fetch::with_tag(old, repo, tag, tree)))?;
     Ok(())
 }
 

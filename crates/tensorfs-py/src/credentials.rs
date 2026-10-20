@@ -168,6 +168,14 @@ impl PyEndpoint {
         .transpose()
     }
 
+    /// `revision` of `repo_id` as a commit: (its id, the tag it resolved through or None).
+    fn commit(&self, py: Python<'_>, repo_id: &str, revision: &str) -> PyResult<(String, Option<String>)> {
+        let (commit, tag) = py
+            .detach(|| block_on(self.endpoint.commit(repo_id, revision)))
+            .or_raise(py)?;
+        Ok((commit.id(), tag))
+    }
+
     fn update_repo<'py>(
         &self,
         py: Python<'py>,

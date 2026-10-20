@@ -1,1 +1,1 @@
-{"format":"cozytensors.repo/1","name":"Conformance/bnb","releases":[{"tree":{"length":256,"sha256":"c4d1bc860c4c47816c7cf71b3cd391ecc74f6699630a667fa6c71839b2d5d3a9"},"version":"1"}]}
+{"format":"cozytensors.repo/1","name":"Conformance/bnb","tags":[{"commit":{"length":256,"sha256":"c4d1bc860c4c47816c7cf71b3cd391ecc74f6699630a667fa6c71839b2d5d3a9"},"name":"1","public":true}]}

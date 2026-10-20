@@ -1716,7 +1716,7 @@ impl Drop for PyWriter {
 #[pymethods]
 impl PyWriter {
     #[new]
-    #[pyo3(signature = (dest = None, *, variant = None, base = None, resume = None, cache_dir = None, repo_id = None, endpoint = None, token = None, ca_der = None))]
+    #[pyo3(signature = (dest = None, *, variant = None, base = None, resume = None, cache_dir = None, repo_id = None, revision = None, endpoint = None, token = None, ca_der = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -1726,6 +1726,7 @@ impl PyWriter {
         resume: Option<String>,
         cache_dir: Option<PathBuf>,
         repo_id: Option<String>,
+        revision: Option<String>,
         endpoint: Option<String>,
         token: Option<&Bound<'_, PyAny>>,
         ca_der: Option<Vec<u8>>,
@@ -1741,6 +1742,7 @@ impl PyWriter {
                     base: base.as_ref(),
                     resume: resume.as_deref(),
                     repo_id: repo_id.as_deref(),
+                    revision: revision.as_deref(),
                     ..WriterOptions::default()
                 };
                 block_on(async { client.writer(options) })
