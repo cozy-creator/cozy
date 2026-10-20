@@ -77,6 +77,7 @@ def prove(cuts, cls, shape, dtype, channel_first, images, bias):
             reference.bias.uniform_(-0.1, 0.1)
     module = copy.deepcopy(reference)
     installed = cuts.install(module)
+    assert cuts.install(module) == 0, "normalization was wrapped twice"
     memo = cuts.Memo()
     cuts.serve(memo, Room())
     measured = memo.shape("rms", str((shape, dtype, channel_first)))
@@ -104,6 +105,9 @@ def prove(cuts, cls, shape, dtype, channel_first, images, bias):
 
 
 def unsupported(cuts, cls):
+    spatial_affine = cls(7, channel_first=True, images=True)
+    spatial_affine.gamma = nn.Parameter(torch.ones(7, 2, 1))
+    assert cuts.install(spatial_affine) == 0, "spatial affine escaped the channel-only contract"
     module = cls(7, channel_first=True, images=True)
     reference = copy.deepcopy(module)
     cuts.install(module)
