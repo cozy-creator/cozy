@@ -878,9 +878,9 @@ impl Pool {
             memory.prepare_host(reservation, need);
         }
     }
-    fn finish_host_cache(&self, reservation: u64, measured: Option<u64>) {
+    fn finish_host_cache(&self, reservation: u64) {
         if let Some(memory) = self.devices.iter().find_map(|device| device.memory.placement().ok()) {
-            memory.finish_host(reservation, measured);
+            memory.finish_host(reservation);
         }
     }
     /// End the least recently used idle deviceless executor `which` picks; whether one ended.
@@ -1035,7 +1035,7 @@ impl Pool {
         drop(levels);
         let mut admitted = self.admitted.lock().unwrap();
         if admitted.get(&key).and_then(|admission| admission.birth.as_ref()).is_some_and(|owner| gone.contains(owner)) {
-            if let Some(admission) = admitted.remove(&key) { self.finish_host_cache(admission.reservation, None); }
+            if let Some(admission) = admitted.remove(&key) { self.finish_host_cache(admission.reservation); }
         }
         drop(admitted);
         self.leaders.lock().unwrap().retain(|_, (birth, p, lane)|
@@ -1049,7 +1049,7 @@ impl Pool {
                 } else {
                     device.memory.finished(plan);
                     device.memory.with(|gpu| gpu.ended(plan));
-                    if let Some(owner) = accounting.remove(&slot) { self.finish_host_cache(owner.reservation, None); }
+                    if let Some(owner) = accounting.remove(&slot) { self.finish_host_cache(owner.reservation); }
                 }
             }
         }
@@ -1097,7 +1097,7 @@ impl Pool {
         let key = session_key(plan, start);
         let mut admitted = self.admitted.lock().unwrap();
         if admitted.get(&key).is_some_and(|admission| admission.reservation == reservation && admission.birth.is_none()) {
-            if let Some(admission) = admitted.remove(&key) { self.finish_host_cache(admission.reservation, None); }
+            if let Some(admission) = admitted.remove(&key) { self.finish_host_cache(admission.reservation); }
         }
     }
 
@@ -1145,7 +1145,7 @@ impl Pool {
         if degree > 0 && owners.get(&(plan.to_owned(), start)).and_then(|owner| owner.birth.as_ref()) != Some(birth) {
             return;
         }
-        if let Some(owner) = owners.get(&(plan.to_owned(), start)) { self.finish_host_cache(owner.reservation, None); }
+        if let Some(owner) = owners.get(&(plan.to_owned(), start)) { self.finish_host_cache(owner.reservation); }
         for device in self.lane(start, degree).unwrap_or_default() {
             device.memory.finished(plan);
         }
@@ -3423,7 +3423,7 @@ impl Pool {
         if need == 0 {
             let previous = self.admitted.lock().unwrap().insert(session_key(plan, start), Admission { bytes: 0, reservation, birth: None });
             if let Some(previous) = previous.filter(|previous| previous.reservation != reservation) {
-                self.finish_host_cache(previous.reservation, None);
+                self.finish_host_cache(previous.reservation);
             }
             return true;
         }
@@ -3440,7 +3440,7 @@ impl Pool {
             let available = available.map(|available| available.saturating_sub(others));
             if available.is_none_or(|available| available >= need) {
                 let previous = admitted.insert(key, Admission { bytes: need, reservation, birth: None });
-                if let Some(previous) = previous.filter(|previous| previous.reservation != reservation) { self.finish_host_cache(previous.reservation, None); }
+                if let Some(previous) = previous.filter(|previous| previous.reservation != reservation) { self.finish_host_cache(previous.reservation); }
                 return true;
             }
             drop(admitted);
@@ -3455,9 +3455,9 @@ impl Pool {
             if !ended {
                 if !spare {
                     let previous = self.admitted.lock().unwrap().insert(key, Admission { bytes: need, reservation, birth: None });
-                    if let Some(previous) = previous.filter(|previous| previous.reservation != reservation) { self.finish_host_cache(previous.reservation, None); }
+                    if let Some(previous) = previous.filter(|previous| previous.reservation != reservation) { self.finish_host_cache(previous.reservation); }
                 } else {
-                    self.finish_host_cache(reservation, None);
+                    self.finish_host_cache(reservation);
                 }
                 return false;
             }
@@ -5136,6 +5136,35 @@ mod tests {
         assert!(pool.host_room("image", 1, 1, false, 2));
         pool.admitted.lock().unwrap().clear();
 
+        pool.stop().unwrap();
+        crate::scratch::remove(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_admission_sheds_library_regions_for_unknown_and_measured_peaks_without_psi() {
+        let (root, pool, _engine) = pool_of(1);
+        let memory = pool.devices[0].memory.placement().unwrap();
+        let ledger = memory.ledger().clone();
+        let events = memory.event_source().unwrap();
+        for (reservation, measured) in [(1, false), (2, true)] {
+            let key = [reservation as u8; 32];
+            ledger.cache_ram(key, Arc::new(tensorfs::io::source::Source::files(vec![], false, 0)),
+                vec![varena::ledger::RamRegion { offset: 0, len: 4 << 20, items: vec![] }]).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while ledger.ram_status(key).is_some_and(|status| status.filling) {
+                    crate::memory::slim::Memory::changed(&events).await.unwrap();
+                }
+            }).await.unwrap();
+            assert_eq!(ledger.ram_status(key).unwrap().ready, vec![true]);
+            if measured {
+                let available = u64::try_from(platform::contain::host_memory::read().available).unwrap();
+                pool.devices[0].memory.with(|gpu| gpu.learned.plans.entry("host-demand".into()).or_default().host_bytes = available + (1 << 20));
+            }
+            assert!(pool.host_room("host-demand", 0, 1, false, reservation));
+            assert!(ledger.ram_status(key).is_none(), "admission retained optional RAM before a large/unknown allocation");
+            pool.clear_unborn("host-demand", 0, 1, reservation);
+        }
         pool.stop().unwrap();
         crate::scratch::remove(&root);
     }

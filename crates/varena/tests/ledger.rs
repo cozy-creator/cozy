@@ -780,7 +780,7 @@ fn unmeasured_admission_sheds_cached_regions_and_suppresses_optional_warms_until
             .is_none_or(|s| !s.filling)
     });
     assert!(channel.ram_status(row.owner(), [31; 32]).unwrap().is_none());
-    fixture.ledger.finish_host(1, None);
+    fixture.ledger.finish_host(1);
     assert!(channel
         .cache_ram(row.owner(), [31; 32], &[], &regions)
         .unwrap());

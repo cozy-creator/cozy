@@ -46,7 +46,7 @@ impl Memory {
         false
     }
     pub fn prepare_host(&self, _: u64, _: Option<u64>) {}
-    pub fn finish_host(&self, _: u64, _: Option<u64>) {}
+    pub fn finish_host(&self, _: u64) {}
     pub fn capacity(&self) -> u64 {
         0
     }

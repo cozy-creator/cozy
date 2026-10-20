@@ -858,7 +858,7 @@ impl Ledger {
             }
         }
     }
-    pub fn finish_host(&self, reservation: u64, _measured: Option<u64>) {
+    pub fn finish_host(&self, reservation: u64) {
         if self.host.check_process().is_err() {
             return;
         }

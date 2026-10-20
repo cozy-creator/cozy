@@ -49,8 +49,8 @@ impl Memory {
     pub fn prepare_host(&self, reservation: u64, need: Option<u64>) {
         self.0.prepare_host(reservation, need);
     }
-    pub fn finish_host(&self, reservation: u64, measured: Option<u64>) {
-        self.0.finish_host(reservation, measured);
+    pub fn finish_host(&self, reservation: u64) {
+        self.0.finish_host(reservation);
     }
     pub fn capacity(&self) -> u64 {
         self.0.capacity()
