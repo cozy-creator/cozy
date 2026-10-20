@@ -215,6 +215,7 @@ mod tests {
             repo_id: "local/derived".into(),
             revision: format!("sha256:{}", "a".repeat(64)),
             variant: "f32".into(),
+            tag: String::new(),
         };
         held.output[0].checkpoint = Some(reference.clone());
         let item = weights(&held, Some("model")).unwrap();
