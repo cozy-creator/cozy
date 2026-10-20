@@ -894,9 +894,10 @@ mod v1_api {
     /// named. Kept in `tools`.
     fn describing_python(tools: &Path) -> PathBuf {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") else {
+        let pair = named_runtime::pair();
+        if pair.is_empty() {
             return installing_args(tools)[1].clone().into();
-        };
+        }
         let env = tools.join("describing");
         let uv = |args: &[&std::ffi::OsStr]| {
             assert!(Command::new("uv").current_dir(repo).args(args).status().unwrap().success(), "uv {args:?}");
@@ -909,8 +910,10 @@ mod v1_api {
             "--no-hashes".as_ref(), "-o".as_ref(), requirements.as_os_str()]);
         let python = env.join("bin/python");
         uv(&["pip".as_ref(), "install".as_ref(), "--python".as_ref(), python.as_os_str(), "-r".as_ref(), requirements.as_os_str()]);
-        uv(&["pip".as_ref(), "install".as_ref(), "--python".as_ref(), python.as_os_str(), runtime.as_os_str(),
-            "-e".as_ref(), repo.as_os_str()]);
+        let mut install = vec!["pip".as_ref(), "install".as_ref(), "--python".as_ref(), python.as_os_str()];
+        install.extend(pair.iter().map(|wheel| wheel.as_os_str()));
+        install.extend(["-e".as_ref(), repo.as_os_str()]);
+        uv(&install);
         python
     }
 
