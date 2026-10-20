@@ -9,7 +9,7 @@ use crate::format::{self, Body, ObjectRef, PartBytes};
 use crate::io::{Dst, ReadOpts, Target};
 use crate::store2::{CacheGuard, Checkpoint as Stored, Store};
 
-use super::{remote::Remote, Download, Fetched, Ref, Selection};
+use super::{remote::Remote, Download, Fetched, Format, Ref, Selection};
 
 struct LocalRepo {
     root: PathBuf,
@@ -225,8 +225,56 @@ impl Checkpoint {
         super::selection::objects(&self.data.raw, selection)
     }
 
+    /// Download the checkpoint and known repository files, then write an explicit directory.
+    pub async fn materialize(
+        &self,
+        dir: &Path,
+        format: Format,
+        dequantize: Option<format::Dtype>,
+    ) -> Result<PathBuf> {
+        if matches!(format, Format::Cozytensors) && dequantize.is_some() {
+            return fail(
+                Kind::Invalid,
+                "native cozytensors export preserves encoded bytes; dequantize is unsupported",
+            );
+        }
+        self.prepare_export().await?;
+        let (checkpoint, dir) = (self.clone(), dir.to_path_buf());
+        let worker = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+            match format {
+                Format::Safetensors => checkpoint.export_to(&dir, dequantize.as_ref()),
+                Format::Cozytensors => checkpoint.export_cozytensors(&dir),
+            }?;
+            Ok(dir)
+        });
+        match worker.await {
+            Ok(result) => result,
+            Err(error) => fail(Kind::Io, format!("export worker failed: {error}")),
+        }
+    }
+
+    async fn prepare_export(&self) -> Result<()> {
+        let mut objects = self.wanted(&Selection::All)?;
+        if let Some(tree) = &self.data.tree {
+            objects.extend(
+                self.data
+                    .store
+                    .tree(tree)?
+                    .repo_files()
+                    .map(|(_, object)| object.clone()),
+            );
+        }
+        let objects = objects
+            .into_iter()
+            .map(|object| (object.sha256.clone(), object))
+            .collect::<BTreeMap<_, _>>();
+        self.fetch_list(objects.into_values().collect(), &Download::default())
+            .await?;
+        Ok(())
+    }
+
     fn export_paths(&self) -> Result<BTreeMap<String, PathBuf>> {
-        // This synchronous door never starts a runtime or hidden download. Download All first.
+        // Serialization follows the explicit export operation's async preparation.
         if let Some(missing) = self.missing(&Selection::All)?.first() {
             return fail(
                 Kind::NotFound,

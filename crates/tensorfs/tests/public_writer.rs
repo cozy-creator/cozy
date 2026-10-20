@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tensorfs::format::{Body, Component, Dtype, Header, Location, ObjectRef, Tensor};
-use tensorfs::{export, Client, Config, Download, Format, Kind, Open, Ref, Selection, WriterOptions};
+use tensorfs::{Client, Config, Download, Format, Kind, Open, Ref, Selection, WriterOptions};
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -126,8 +126,11 @@ async fn public_export_keeps_plain_folder_repository_bytes_without_admitting_pay
     drop(client);
     checkpoint.download(&Download::default()).await.unwrap();
     let destination = scratch.0.join("export");
-    let paths = export(&checkpoint, &destination, Format::Safetensors, None).unwrap();
-    assert!(paths.iter().any(|p| p == "README.bin"));
+    let path = checkpoint
+        .materialize(&destination, Format::Safetensors, None)
+        .await
+        .unwrap();
+    assert_eq!(path, destination);
     check_export(&destination);
 }
 
@@ -147,17 +150,6 @@ async fn public_export_requires_selected_repo_bytes_and_owns_them_after_client_d
         .open(&format!("acme/tiny@{}", tree.id()), &Open::default())
         .await
         .unwrap();
-    let destination = scratch.0.join("export");
-    assert_eq!(
-        export(&checkpoint, &destination, Format::Safetensors, None)
-            .unwrap_err()
-            .kind,
-        Kind::NotFound
-    );
-    assert!(
-        !destination.exists(),
-        "failed availability check created an export"
-    );
     checkpoint
         .download(&Download {
             selection: Selection::Assets {
@@ -168,7 +160,7 @@ async fn public_export_requires_selected_repo_bytes_and_owns_them_after_client_d
         })
         .await
         .unwrap();
-    assert!(checkpoint
+    assert!(!checkpoint
         .missing(&Selection::All)
         .unwrap()
         .contains(&ObjectRef::of(README)));
@@ -189,8 +181,17 @@ async fn public_export_requires_selected_repo_bytes_and_owns_them_after_client_d
     );
     checkpoint.download(&Download::default()).await.unwrap();
     assert!(checkpoint.missing(&Selection::All).unwrap().is_empty());
+    assert!(!scratch
+        .0
+        .join("reader-cache")
+        .join(ObjectRef::of(README).key())
+        .exists());
     drop(reader);
-    export(&checkpoint, &destination, Format::Safetensors, None).unwrap();
+    let destination = scratch.0.join("export");
+    checkpoint
+        .materialize(&destination, Format::Safetensors, None)
+        .await
+        .unwrap();
     check_export(&destination);
 }
 
@@ -231,8 +232,12 @@ async fn same_header_repository_trees_keep_distinct_folders_through_public_uploa
     b.download(&Download::default()).await.unwrap();
     let a_folder = scratch.0.join("portable-first");
     let b_folder = scratch.0.join("portable-second");
-    export(&a, &a_folder, Format::Cozytensors, None).unwrap();
-    export(&b, &b_folder, Format::Cozytensors, None).unwrap();
+    a.materialize(&a_folder, Format::Cozytensors, None)
+        .await
+        .unwrap();
+    b.materialize(&b_folder, Format::Cozytensors, None)
+        .await
+        .unwrap();
     assert_eq!(fs::read(a_folder.join("README.bin")).unwrap(), README);
     assert_eq!(
         fs::read(b_folder.join("README.bin")).unwrap(),
@@ -259,7 +264,10 @@ async fn same_header_repository_trees_keep_distinct_folders_through_public_uploa
     drop(a);
     drop(b);
     let destination = scratch.0.join("export-roundtrip");
-    export(&roundtrip, &destination, Format::Safetensors, None).unwrap();
+    roundtrip
+        .materialize(&destination, Format::Safetensors, None)
+        .await
+        .unwrap();
     check_export(&destination);
 }
 
@@ -572,8 +580,14 @@ async fn portable_export_preflights_full_closure_and_atomically_replaces_shared_
         portable.join("model.cozytensors"),
     )
     .unwrap();
-    export(&checkpoint, &portable, Format::Cozytensors, None).unwrap();
-    export(&checkpoint, &folder, Format::Cozytensors, None).unwrap();
+    checkpoint
+        .materialize(&portable, Format::Cozytensors, None)
+        .await
+        .unwrap();
+    checkpoint
+        .materialize(&folder, Format::Cozytensors, None)
+        .await
+        .unwrap();
     assert_eq!(fs::read(folder.join("README.bin")).unwrap(), README);
     assert_eq!(
         fs::read(folder.join("chunks").join(&ObjectRef::of(WEIGHT).sha256)).unwrap(),
@@ -609,21 +623,20 @@ async fn portable_export_preflights_full_closure_and_atomically_replaces_shared_
     fs::remove_file(portable.join("chunks").join(&ObjectRef::of(WEIGHT).sha256)).unwrap();
     let incomplete = scratch.0.join("refused");
     assert_eq!(
-        export(&reopened, &incomplete, Format::Cozytensors, None)
+        reopened
+            .materialize(&incomplete, Format::Cozytensors, None)
+            .await
             .unwrap_err()
             .kind,
         Kind::NotFound
     );
     assert!(!incomplete.join("model.cozytensors").exists());
     assert_eq!(
-        export(
-            &reopened,
-            &incomplete,
-            Format::Cozytensors,
-            Some(Dtype::F32)
-        )
-        .unwrap_err()
-        .kind,
+        reopened
+            .materialize(&incomplete, Format::Cozytensors, Some(Dtype::F32))
+            .await
+            .unwrap_err()
+            .kind,
         Kind::Invalid
     );
 }
@@ -657,7 +670,11 @@ async fn literal_header_fetches_selected_missing_payload_online_but_not_offline_
         .await
         .unwrap();
     assert_eq!(
-        offline.download(&Download::default()).await.unwrap_err().kind,
+        offline
+            .download(&Download::default())
+            .await
+            .unwrap_err()
+            .kind,
         Kind::NotFound
     );
     let cache = scratch.0.join("online-cache");
@@ -686,7 +703,10 @@ async fn literal_header_fetches_selected_missing_payload_online_but_not_offline_
     assert!(!cache.join(ObjectRef::of(WEIGHT).key()).exists());
     online.download(&Download::default()).await.unwrap();
     let output = scratch.0.join("literal-portable");
-    export(&online, &output, Format::Cozytensors, None).unwrap();
+    online
+        .materialize(&output, Format::Cozytensors, None)
+        .await
+        .unwrap();
     assert!(!output.join("README.bin").exists());
     assert_eq!(
         online.component("model").unwrap().read("w").unwrap(),
@@ -924,7 +944,10 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
     assert_eq!(checkpoint.variant(), Some("u8"));
     let child = checkpoint.component("model").unwrap().clone();
     let portable = scratch.0.join("converted-portable");
-    export(&checkpoint, &portable, Format::Cozytensors, None).unwrap();
+    checkpoint
+        .materialize(&portable, Format::Cozytensors, None)
+        .await
+        .unwrap();
     assert_eq!(fs::read(portable.join("README.bin")).unwrap(), README);
     let tree = client
         .upload_folder(&"local/converted".parse().unwrap(), &portable, None)
@@ -944,7 +967,10 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
     drop(checkpoint);
     drop(client);
     let result = scratch.0.join("converted-hf");
-    export(&reopened, &result, Format::Safetensors, None).unwrap();
+    reopened
+        .materialize(&result, Format::Safetensors, None)
+        .await
+        .unwrap();
     check_export(&result);
     drop(reopened);
     assert_eq!(child.read("w").unwrap(), WEIGHT);
@@ -1173,7 +1199,9 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
     fs::write(&chunk, [0, 0, 0, 0]).unwrap();
     let bad_chunk = scratch.0.join("bad-chunk-export");
     assert_eq!(
-        export(&plain, &bad_chunk, Format::Cozytensors, None)
+        plain
+            .materialize(&bad_chunk, Format::Cozytensors, None)
+            .await
             .unwrap_err()
             .kind,
         Kind::Integrity
@@ -1190,7 +1218,10 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
         "corrupt object was atomically named as valid"
     );
     fs::write(&chunk, WEIGHT).unwrap();
-    export(&plain, &bad_chunk, Format::Cozytensors, None).unwrap();
+    plain
+        .materialize(&bad_chunk, Format::Cozytensors, None)
+        .await
+        .unwrap();
     let tree = producer
         .upload_folder(&"acme/integrity".parse().unwrap(), &folder, None)
         .await
@@ -1200,10 +1231,13 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
     let managed = reader.open(&tree.id(), &Open::default()).await.unwrap();
     managed.download(&Download::default()).await.unwrap();
     let readme = cache.join(ObjectRef::of(README).key());
+    fs::create_dir_all(readme.parent().unwrap()).unwrap();
     fs::write(&readme, vec![b'!'; README.len()]).unwrap();
     let bad_repo = scratch.0.join("bad-repo-export");
     assert_eq!(
-        export(&managed, &bad_repo, Format::Cozytensors, None)
+        managed
+            .materialize(&bad_repo, Format::Cozytensors, None)
+            .await
             .unwrap_err()
             .kind,
         Kind::Integrity
@@ -1211,7 +1245,10 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
     assert!(!bad_repo.join("model.cozytensors").exists());
     assert!(!bad_repo.join("README.bin").exists());
     fs::write(readme, README).unwrap();
-    export(&managed, &bad_repo, Format::Cozytensors, None).unwrap();
+    managed
+        .materialize(&bad_repo, Format::Cozytensors, None)
+        .await
+        .unwrap();
     assert_eq!(fs::read(bad_repo.join("README.bin")).unwrap(), README);
     assert_eq!(
         ObjectRef::of(&fs::read(bad_repo.join("model.cozytensors")).unwrap()),
@@ -1304,9 +1341,11 @@ fn public_conversion_without_a_tokio_caller_refuses_instead_of_starting_a_runtim
     let client = client(&cache, &scratch.0.join("endpoint"));
     let sources = [source.to_str().unwrap().to_owned()];
     assert_eq!(
-        futures::executor::block_on(client.convert_to_cozytensors(&sources, &tensorfs::Convert::default()))
-            .unwrap_err()
-            .kind,
+        futures::executor::block_on(
+            client.convert_to_cozytensors(&sources, &tensorfs::Convert::default())
+        )
+        .unwrap_err()
+        .kind,
         Kind::Unsupported
     );
     assert!(actual_headers(&cache.join("blobs")).is_empty());

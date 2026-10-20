@@ -340,29 +340,9 @@ fn io_failure(context: impl fmt::Display, error: std::io::Error) -> Failure {
     }
 }
 
-/// Output supported by the existing serializer; payload must be fetched before this sync door.
+/// Output supported by the existing serializer.
 #[derive(Clone, Copy, Debug)]
 pub enum Format {
     Safetensors,
     Cozytensors,
-}
-
-pub fn export(
-    checkpoint: &Checkpoint,
-    dir: &Path,
-    format: Format,
-    dequantize: Option<crate::format::Dtype>,
-) -> Result<Vec<String>> {
-    match format {
-        Format::Safetensors => checkpoint.export_to(dir, dequantize.as_ref()),
-        Format::Cozytensors => {
-            if dequantize.is_some() {
-                return fail(
-                    Kind::Invalid,
-                    "native cozytensors export preserves encoded bytes; dequantize is unsupported",
-                );
-            }
-            checkpoint.export_cozytensors(dir)
-        }
-    }
 }
