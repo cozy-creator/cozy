@@ -186,7 +186,7 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
         .collect();
     assert_eq!(files, expect);
     assert_eq!(ft.pipeline(), full.pipeline());
-    assert_eq!(ft.pipeline().unwrap().class, "diffusers.StableDiffusionXLPipeline");
+    assert_eq!(ft.pipeline().unwrap().class.name, "StableDiffusionXLPipeline");
     for name in ["tokenizer", "tokenizer_2", "scheduler", "unet"] {
         assert_eq!(ft.component(name), full.component(name), "{name}");
     }
@@ -359,7 +359,7 @@ fn a_component_config_wrapper_becomes_its_files_and_records_its_source() {
         let (name, _) = path.split_once('/').unwrap();
         assert_eq!(h.component(name).unwrap().config, parse(&blob(&dir, &full[path].sha256)), "{path}");
     }
-    assert_eq!(h.pipeline().unwrap().class, "diffusers.StableDiffusionXLPipeline");
+    assert_eq!(h.pipeline().unwrap().class.name, "StableDiffusionXLPipeline");
     assert_eq!(tree.files["processor/tokenizer.json"], ObjectRef::of(&vocab));
     assert_eq!(tree.files["processor/chat_template.jinja"], ObjectRef::of(b"{{ x }}"));
     assert!(!tree.files.contains_key("config.json"));

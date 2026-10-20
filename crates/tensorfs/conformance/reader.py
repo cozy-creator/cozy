@@ -244,6 +244,13 @@ def parse_header(data: bytes) -> dict:
         raise
 
 
+def class_ref(c, what: str) -> list:
+    """[library, version, name], exactly; an empty library is the unknown class ["", "", ""]."""
+    need(type(c) is list and len(c) == 3 and all(type(t) is str for t in c), f"{what}: a class is not [library, version, name]")
+    need(c[0] != "" or c == ["", "", ""], f"{what}: a class with a name or version names its library")
+    return c
+
+
 def header(root) -> dict:
     need(type(root) is list and root, "the header is not an array")
     check_format(root[0], HEADER)
@@ -264,15 +271,16 @@ def header(root) -> dict:
     pipeline, configs = None, []
     if pipeline_row:
         cls, cfg = pipeline_row[:2]
-        need(type(cls) is str and type(cfg) is dict, "the pipeline is not [class, config]")
-        pipeline = {"class": cls, "config": cfg}
+        need(type(cfg) is dict, "the pipeline is not [class, config]")
+        pipeline = {"class": class_ref(cls, "the pipeline"), "config": cfg}
         configs.append(cfg)
     need(type(component_rows) is list, "components is not an array")
     components, cited = {}, 0
     for c in component_rows:
         name, cls, cfg, tensor_rows, asset_rows = record(c, 5, "a component")[:5]
         need(segment(name) and name not in components, f"bad or repeated component name {name!r}")
-        need(type(cls) is str and type(cfg) is dict, f"{name}: class or config")
+        class_ref(cls, name)
+        need(type(cfg) is dict, f"{name}: config is not a map")
         configs.append(cfg)
         config_file = c[5] if len(c) > 5 else None
         if len(c) > 6 and config_file == "config.json":

@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use tensorfs::format::ClassRef;
 use tensorfs::err::Code;
 use tensorfs::fetch::{
     upload_tree, with_tree, Client, Config, Endpoint, Fetcher, Fresh, ObjectStore, Origin, Payload, SourcePolicy, Want,
@@ -37,7 +38,7 @@ async fn a_bucket_serves_the_protocol_under_sigv4() {
     let mut w = source.writer(None, None).unwrap();
     let big: Vec<u8> = (0..20u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
     let config: HeaderConfig = serde_json::from_str(r#"{"layers":1}"#).unwrap();
-    let mut unet = w.component("unet", "diffusers.Thing", config, None).unwrap();
+    let mut unet = w.component("unet", ClassRef::new("diffusers", "0.35.1", "Thing"), config, None).unwrap();
     unet.put("w", &Dtype::U8, &[big.len() as u64], Data::Plain(Source::Read(&mut &big[..]))).unwrap();
     unet.put("b", &Dtype::U8, &[3], Data::Plain(Source::Read(&mut &b"abc"[..]))).unwrap();
     let header = w.commit().unwrap();

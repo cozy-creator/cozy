@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tensorfs::format::ClassRef;
 use tensorfs::format::{Body, Component, Dtype, Header, Location, ObjectRef, Tensor};
 use tensorfs::{
     Client, Config, Download, Format, Kind, Open, ReadInto, Ref, Selection, WriterOptions,
@@ -51,7 +52,7 @@ fn fixture(root: &Path) -> PathBuf {
         None,
         vec![Component {
             name: "model".into(),
-            class: "transformers.TestModel".into(),
+            class: ClassRef::new("transformers", "4.57.0", "TestModel"),
             config: serde_json::from_str(r#"{"width":4,"optional":null}"#).unwrap(),
             tensors: vec![Tensor {
                 key: "w".into(),
@@ -288,7 +289,7 @@ async fn public_writer_resumes_reopens_components_and_keeps_encoded_bytes_and_or
         })
         .unwrap();
     first
-        .component("model", "test.Model", config, None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), config, None)
         .unwrap()
         .put("first", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -304,7 +305,7 @@ async fn public_writer_resumes_reopens_components_and_keeps_encoded_bytes_and_or
     writer
         .component(
             "model",
-            "test.Model",
+            ClassRef::new("test", "1.0", "Model"),
             serde_json::from_str(r#"{"width":8}"#).unwrap(),
             None,
         )
@@ -422,7 +423,7 @@ async fn read_into_decodes_an_encoded_tensor_only_when_asked() {
         tensorfs::raw::PartData { role: "scale".into(), dtype: Dtype::F32, shape: vec![1], data: &mut scale },
     ];
     writer
-        .component("model", "test.Model", Default::default(), None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
         .unwrap()
         .put_encoded("q", Dtype::F32, &[4], encoding, parts)
         .unwrap();
@@ -457,7 +458,7 @@ async fn save(client: &Client, dest: &Path, weight: &[u8]) -> (ObjectRef, Vec<Ob
         })
         .unwrap();
     writer
-        .component("model", "test.Model", Default::default(), None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[weight.len() as u64], &mut &weight[..])
         .unwrap();
@@ -546,7 +547,7 @@ async fn failed_file_publication_still_exposes_the_committed_local_checkpoint() 
         })
         .unwrap();
     writer
-        .component("model", "test.Model", Default::default(), None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -733,7 +734,7 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
         })
         .unwrap();
     writer
-        .component("model", "test.Model", Default::default(), None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
         .unwrap()
         .asset("tokenizer.json", ASSET)
         .unwrap();
@@ -779,7 +780,7 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
         })
         .unwrap();
     failed
-        .component("model", "test.Model", Default::default(), None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -856,7 +857,7 @@ async fn writer_provider_error_keeps_the_exact_family_and_detail_including_empty
                 })
                 .unwrap();
             writer
-                .component("model", "test.Model", Default::default(), None)
+                .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
                 .unwrap()
                 .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
                 .unwrap();
@@ -1273,7 +1274,7 @@ async fn streaming_writer_resumes_its_keyed_journal_after_drop_then_publishes_th
     interrupted
         .component(
             "model",
-            "test.Model",
+            ClassRef::new("test", "1.0", "Model"),
             serde_json::from_str(r#"{"width":4}"#).unwrap(),
             None,
         )
@@ -1301,7 +1302,7 @@ async fn streaming_writer_resumes_its_keyed_journal_after_drop_then_publishes_th
     resumed
         .component(
             "model",
-            "test.Model",
+            ClassRef::new("test", "1.0", "Model"),
             serde_json::from_str(r#"{"width":4}"#).unwrap(),
             None,
         )
@@ -1375,7 +1376,7 @@ async fn a_header_file_written_inside_a_snapshot_folder_keeps_that_folder() {
         })
         .unwrap();
     writer
-        .component("model", "test.Model", Default::default(), None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
+use tensorfs::format::ClassRef;
 use tensorfs::err::Code;
 use tensorfs::fetch::{
     upload_tree, Client, Config, Endpoint, Fetcher, Fresh, ObjectStore, Origin, Payload, SourcePolicy, Stream, Want,
@@ -58,7 +59,7 @@ fn checkpoint(store: &Store, seed: u64) -> (ObjectRef, ObjectRef, BTreeMap<(Stri
     let config: HeaderConfig = serde_json::from_str(r#"{"layers":2}"#).unwrap();
     for (component, key, n) in [("unet", "big.weight", 40 * MIB), ("unet", "norm.weight", 3000), ("vae", "conv.weight", 2 * MIB)] {
         let bytes = noise(seed + n as u64, n);
-        let mut c = w.component(component, "diffusers.Thing", config.clone(), None).unwrap();
+        let mut c = w.component(component, ClassRef::new("diffusers", "0.35.1", "Thing"), config.clone(), None).unwrap();
         c.put(key, &Dtype::U8, &[n as u64], Data::Plain(Source::Read(&mut &bytes[..]))).unwrap();
         tensors.insert((component.to_owned(), key.to_owned()), bytes);
     }
@@ -217,7 +218,7 @@ fn a_streaming_writer_tees_to_the_store_before_publishing() {
     let stream = Arc::new(Stream::new(Arc::clone(&endpoint), runtime.handle().clone()));
     let mut w = local.streaming_writer(Arc::clone(&stream), "acme/streamed", "int8", None).unwrap();
     let big = noise(9, 70 * MIB);
-    let mut c = w.component("unet", "diffusers.Thing", Default::default(), None).unwrap();
+    let mut c = w.component("unet", ClassRef::new("diffusers", "0.35.1", "Thing"), Default::default(), None).unwrap();
     c.put("big", &Dtype::U8, &[big.len() as u64], Data::Plain(Source::Read(&mut &big[..]))).unwrap();
     c.put("small", &Dtype::U8, &[5], Data::Plain(Source::Read(&mut &b"small"[..]))).unwrap();
     stream.flush().unwrap();
@@ -259,7 +260,7 @@ async fn stored_stream_puts_work_inside_the_callers_runtime() {
         writer.repo_file(&format!("file-{index}.txt"), &bytes).unwrap();
         files.push((ObjectRef::of(&bytes), bytes));
     }
-    writer.component("model", "", Default::default(), None).unwrap()
+    writer.component("model", Default::default(), Default::default(), None).unwrap()
         .put("weight", &Dtype::U8, &[7], Data::Plain(Source::Read(&mut &b"weights"[..]))).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
@@ -310,7 +311,7 @@ fn an_upload_failure_keeps_the_local_checkpoint_and_stays_failed() {
     let local = Store::open(scratch.0.join("local")).unwrap();
     let stream = Arc::new(Stream::new(Arc::clone(&endpoint), runtime.handle().clone()));
     let mut w = local.streaming_writer(Arc::clone(&stream), "acme/failed", "int8", None).unwrap();
-    w.component("unet", "diffusers.Thing", Default::default(), None).unwrap()
+    w.component("unet", ClassRef::new("diffusers", "0.35.1", "Thing"), Default::default(), None).unwrap()
         .put("w", &Dtype::U8, &[5], Data::Plain(Source::Read(&mut &b"saved"[..]))).unwrap();
     assert!(w.commit().is_err(), "the real read-only server refuses PUT");
     assert!(w.published().is_none(), "no remote commit was made");

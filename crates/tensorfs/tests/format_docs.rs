@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 use tensorfs::format::{
-    variant_of, variant_path, Body, Component, Config, ConfigValue, Dtype, Encoding, Header,
+    variant_of, variant_path, Body, ClassRef, Component, Config, ConfigValue, Dtype, Encoding, Header,
     Location, ObjectRef, Part, Pipeline, Release, Repo, Tensor, Tree, Value, HEADER_PATH,
 };
 use tensorfs::writer::{Data, Source, Writer};
@@ -51,7 +51,7 @@ fn config(json: serde_json::Value) -> Config {
 fn components(tensors: Vec<Tensor>) -> Vec<Component> {
     let unet = Component {
         name: "unet".into(),
-        class: "diffusers.UNet2DConditionModel".into(),
+        class: ClassRef::new("diffusers", "0.35.1", "UNet2DConditionModel"),
         config: config(json!({"_class_name": "UNet2DConditionModel", "sample_size": 128,
             "norm_eps": 1e-5, "addition_embed_type": null, "upcast": 1.0})),
         tensors,
@@ -59,7 +59,7 @@ fn components(tensors: Vec<Tensor>) -> Vec<Component> {
     };
     let tokenizer = Component {
         name: "tokenizer".into(),
-        class: "transformers.CLIPTokenizer".into(),
+        class: ClassRef::new("transformers", "4.57.0", "CLIPTokenizer"),
         config: config(json!({"model_max_length": 77})),
         assets: [
             ("vocab.json".into(), ObjectRef::of(b"{}")),
@@ -75,7 +75,7 @@ fn components(tensors: Vec<Tensor>) -> Vec<Component> {
 fn header_with(tensors: Vec<Tensor>) -> Header {
     let chunks = vec![ObjectRef::of(&[7u8; 8192]), ObjectRef::of(&[1u8; 100])];
     let pipeline = Pipeline {
-        class: "diffusers.StableDiffusionXLPipeline".into(),
+        class: ClassRef::new("diffusers", "0.35.1", "StableDiffusionXLPipeline"),
         config: config(json!({"_class_name": "StableDiffusionXLPipeline",
             "unet": ["diffusers", "UNet2DConditionModel"], "tokenizer": ["transformers", "CLIPTokenizer"]})),
     };
@@ -101,7 +101,8 @@ fn a_written_checkpoint_tags_its_header_exactly() {
     let dir = std::env::temp_dir().join(format!("tfs-format-tag-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut w = Writer::folder(&dir, "bf16", None, false).unwrap();
-    let mut c = w.component("unet", "diffusers.UNet2DConditionModel", Config::new(), None).unwrap();
+    let unet = ClassRef::new("diffusers", "0.35.1", "UNet2DConditionModel");
+    let mut c = w.component("unet", unet, Config::new(), None).unwrap();
     let bytes = [7u8; 12];
     c.put("a.weight", &Dtype::BF16, &[2, 3], Data::Plain(Source::Read(&mut &bytes[..]))).unwrap();
     let id = w.commit().unwrap();
@@ -124,12 +125,14 @@ fn writer_is_deterministic_and_reader_round_trips() {
     assert!(bytes.ends_with(b"\xa1\x66prompt\xa2\x61n\x01\x64rows\x81\x65a cat"));
     assert_eq!(Header::from_cbor(&bytes).unwrap(), h);
     assert_eq!(Header::from_cbor(&bytes).unwrap().to_cbor().unwrap(), bytes);
-    // The tokenizer: [name, class, config, tensors, assets, config_file], assets keyed by path.
-    let tokenizer = [b"\x86\x69tokenizer\x78\x1atransformers.CLIPTokenizer".as_slice(), b"\xa1"].concat();
+    // The tokenizer: [name, [library, version, name], config, tensors, assets, config_file],
+    // assets keyed by path.
+    let class = b"\x83\x6ctransformers\x664.57.0\x6dCLIPTokenizer";
+    let tokenizer = [b"\x86\x69tokenizer".as_slice(), class, b"\xa1"].concat();
     assert!(bytes.windows(tokenizer.len()).any(|w| w == tokenizer));
     assert!(bytes.windows(22).any(|w| w == b"\x75tokenizer_config.json"));
     let read = Header::from_cbor(&bytes).unwrap();
-    assert_eq!(read.pipeline().unwrap().class, "diffusers.StableDiffusionXLPipeline");
+    assert_eq!(read.pipeline().unwrap().class.name, "StableDiffusionXLPipeline");
     let unet = read.component("unet").unwrap();
     assert_eq!(unet.config["norm_eps"], json!(1e-5));
     assert_eq!(unet.config["addition_embed_type"], ConfigValue::Null);
@@ -192,7 +195,7 @@ fn appended_fields_newer_dtypes_and_schemes_read() {
     let mut newer = patch(&good, b"\x86\x6dcozytensors/1", b"\x87\x6fcozytensors/1.9");
     newer = patch(&newer, &chunk, &longer);
     // A later field in the pipeline, in a component after its config_file, and in an asset.
-    newer = patch(&newer, b"\x82\x78\x23diffusers.StableDiffusionXLPipeline", b"\x83\x78\x23diffusers.StableDiffusionXLPipeline");
+    newer = patch(&newer, &[b"\x82", PIPELINE].concat(), &[b"\x83", PIPELINE].concat());
     newer = patch(&newer, b"\x82\x85\x64unet", b"\xf5\x82\x85\x64unet");
     newer = patch(&newer, b"\x86\x69tokenizer", b"\x87\x69tokenizer");
     newer = patch(&newer, b"\x6avocab.json\x82", b"\x6avocab.json\x83");
@@ -220,6 +223,18 @@ fn appended_fields_newer_dtypes_and_schemes_read() {
     assert_eq!(read.read("unet", "b.weight", chunk).unwrap_err().code(), "unknown_scheme");
     let again = Header::from_cbor(&read.to_cbor().unwrap()).unwrap();
     assert_eq!(again, read, "this writer drops the fields it does not know");
+}
+
+/// The header's pipeline and tokenizer classes, as encoded.
+const PIPELINE: &[u8] = b"\x83\x69diffusers\x660.35.1\x78\x19StableDiffusionXLPipeline";
+const TOKENIZER: &[u8] = b"\x83\x6ctransformers\x664.57.0\x6dCLIPTokenizer";
+
+/// A known library without a recorded version reads.
+#[test]
+fn a_class_without_a_version_reads() {
+    let unversioned = patch(&header().to_cbor().unwrap(), b"\x664.57.0", b"\x60");
+    let read = Header::from_cbor(&unversioned).unwrap();
+    assert_eq!(read.component("tokenizer").unwrap().class, ClassRef::new("transformers", "", "CLIPTokenizer"));
 }
 
 /// `bytes` with `from` (found once) replaced by `to`.
@@ -255,8 +270,12 @@ fn red_documents_are_refused() {
         ("float not shortest", patch(&good, b"\xf9\x3c\x00", b"\xfa\x3f\x80\x00\x00"), "invalid"),
         ("double not shortest", patch(&good, b"\xf9\x3c\x00", b"\xfb\x3f\xf0\0\0\0\0\0\0"), "invalid"),
         ("NaN payload", patch(&good, b"\xf9\x3c\x00", b"\xf9\x7e\x01"), "invalid"),
-        ("float as a class", patch(&good, b"\x78\x1atransformers.CLIPTokenizer", b"\xf9\x3c\x00"), "invalid"),
-        ("pipeline of one field", patch(&good, b"\x82\x78\x23diffusers", b"\x81\x78\x23diffusers"), "invalid"),
+        ("float as a class", patch(&good, TOKENIZER, b"\xf9\x3c\x00"), "invalid"),
+        ("class as text", patch(&good, TOKENIZER, b"\x6dCLIPTokenizer"), "invalid"),
+        ("class of two", patch(&good, TOKENIZER, b"\x82\x6ctransformers\x6dCLIPTokenizer"), "invalid"),
+        ("class of four", patch(&good, TOKENIZER, &[b"\x84", &TOKENIZER[1..], b"\x60"].concat()), "invalid"),
+        ("class without library", patch(&good, b"\x83\x6ctransformers", b"\x83\x60"), "invalid"),
+        ("pipeline of one field", patch(&good, &[b"\x82", PIPELINE].concat(), &[b"\x81", PIPELINE].concat()), "invalid"),
         ("short component", patch(&good, b"\x85\x64unet", b"\x84\x64unet"), "invalid"),
         ("config_file not text", patch(&good, b"\x75tokenizer_config.json", b"\x15"), "invalid"),
         ("config_file default", patch(&good, b"\x75tokenizer_config.json", b"\x6bconfig.json"), "invalid"),
@@ -441,13 +460,13 @@ fn config_floats_take_their_shortest_exact_form() {
     let nested = config(json!({"a": [1, 1.5, null, {"b": -2.5e-8}], "c": -3, "d": "x", "e": true}));
     let mut c = components(vec![]);
     c[0].config = nested.clone();
-    let pipeline = Pipeline { class: String::new(), config: nested };
+    let pipeline = Pipeline { class: ClassRef::default(), config: nested };
     let h = Header::new(vec![], Some(pipeline), c, Default::default()).unwrap();
     assert_eq!(Header::from_cbor(&h.to_cbor().unwrap()).unwrap(), h);
     let json = serde_json::to_value(&h.components()[0].config).unwrap();
     assert_eq!(json, json!({"a": [1, 1.5, null, {"b": -2.5e-8}], "c": -3, "d": "x", "e": true}));
     let one = config(json!({"v": 1.0}));
-    let bytes = Header::new(vec![], Some(Pipeline { class: String::new(), config: one }), vec![], Default::default());
+    let bytes = Header::new(vec![], Some(Pipeline { class: ClassRef::default(), config: one }), vec![], Default::default());
     assert!(bytes.unwrap().to_cbor().unwrap().windows(3).any(|w| w == b"\xf9\x3c\x00"), "1.0 stays a float");
 }
 

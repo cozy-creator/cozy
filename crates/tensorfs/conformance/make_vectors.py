@@ -47,11 +47,11 @@ def part(role, dtype, shape, chunk, offset, length):
     return [role, dtype, shape, [chunk, offset, length]]
 
 
-PIPELINE = ["diffusers.FluxPipeline", {
+PIPELINE = [["diffusers", "0.30.0", "FluxPipeline"], {
     "_class_name": "FluxPipeline", "_diffusers_version": "0.30.0", "scheduler": [None, None],
     "tokenizer": ["transformers", "CLIPTokenizer"], "transformer": ["diffusers", "FluxTransformer2DModel"],
     "vae": ["diffusers", "AutoencoderKL"]}]
-TOKENIZER = ["tokenizer", "transformers.CLIPTokenizer",
+TOKENIZER = ["tokenizer", ["transformers", "4.44.0", "CLIPTokenizer"],
              {"clean_up_tokenization_spaces": False, "do_lower_case": True, "model_max_length": 77,
               "pad_token": "<|endoftext|>"},
              [],
@@ -65,7 +65,7 @@ BASIC = [
     ENCODINGS,
     PIPELINE,
     [
-        ["transformer", "diffusers.FluxTransformer2DModel",
+        ["transformer", ["diffusers", "0.30.0", "FluxTransformer2DModel"],
          {"_class_name": "FluxTransformer2DModel", "axes_dims_rope": [16, 56, 56], "eps": 1e-06,
           "guidance_embeds": True, "out_channels": None, "patch_size": 1, "ratio": 100000.0, "theta": 10000.0}, [
             ["blocks.0.attn.to_q.weight", "BF16", [64, 64], 1, [
@@ -87,7 +87,7 @@ BASIC = [
             ["blocks.0.proj.weight", "BF16", [8, 64], 7, [
                 part("weight", "I8", [8, 64], 1, 8192, 512), part("scale", "F32", [], 1, 12288, 4)]],
         ], {}],
-        ["vae", "diffusers.AutoencoderKL",
+        ["vae", ["diffusers", "0.30.0", "AutoencoderKL"],
          {"_class_name": "AutoencoderKL", "force_upcast": True, "latents_mean": None, "scaling_factor": 0.3611,
           "shift_factor": 0.1159},
          [["decoder.conv_in.weight", "F16", [4, 4, 3, 3], 0, [2, 0, 288]]], {}],
@@ -97,13 +97,16 @@ BASIC = [
 ]
 
 
+UNKNOWN = ["", "", ""]
+
+
 def plain(key, dtype, shape, chunk, offset, length):
     return [key, dtype, shape, 0, [chunk, offset, length]]
 
 
 def one(tensors, chunks, encodings=(), metadata=None):
     """No pipeline; one component of unknown class with no config."""
-    return [TAG, chunks, list(encodings), [], [["unet", "", {}, tensors, {}]], metadata or {}]
+    return [TAG, chunks, list(encodings), [], [["unet", UNKNOWN, {}, tensors, {}]], metadata or {}]
 
 
 A = plain("a.weight", "F32", [2], 0, 0, 8)
@@ -146,8 +149,9 @@ CONFIG = {
 GREEN = {
     "basic": BASIC,
     "empty": [TAG, [], [], [], [], {}],
-    "configs": [TAG, [], [], ["", CONFIG],
-                [["scheduler", "diffusers.EulerDiscreteScheduler", CONFIG, [], {}, "scheduler_config.json"]], {}],
+    "configs": [TAG, [], [], [UNKNOWN, CONFIG],
+                [["scheduler", ["diffusers", "0.30.0", "EulerDiscreteScheduler"], CONFIG, [], {},
+                  "scheduler_config.json"]], {}],
     "order-a": one([A, B], [[digest("order"), 4104]]),
     "order-b": one([B, A], [[digest("order"), 4104]]),
     "span": one([plain("x", "U8", [10000], 0, 4096, 10000)],
@@ -192,6 +196,7 @@ Q = (*TENSORS, 0)  # its first tensor
 NORM = (*TENSORS, 6)
 VAE = (4, 1)
 ASSETS = (4, 2, 4)  # the tokenizer's
+GREEN["class-unversioned"] = edit((4, 2, 1, 1), "")  # a known library whose version nothing records
 
 
 def swap_encodings():
@@ -293,6 +298,13 @@ def reds() -> dict[str, bytes]:
         "pipeline-config-array": encode(edit((3, 1), [])),
         "component-short": encode(edit((*VAE, 4), DELETE)),
         "component-class-int": encode(edit((*VAE, 1), 7)),
+        "class-text": encode(edit((*VAE, 1), "diffusers.AutoencoderKL")),
+        "class-short": encode(edit((*VAE, 1), ["diffusers", "AutoencoderKL"])),
+        "class-long": encode(edit((*VAE, 1), ["diffusers", "0.30.0", "AutoencoderKL", ""])),
+        "class-name-int": encode(edit((*VAE, 1, 2), 7)),
+        "class-no-library": encode(edit((*VAE, 1, 0), "")),
+        "class-version-only": encode(edit((*VAE, 1), ["", "0.30.0", ""])),
+        "pipeline-class-no-library": encode(edit((3, 0, 0), "")),
         "config-file-default": encode(edit((4, 2, 5), "config.json")),
         "config-file-int": encode(edit((4, 2, 5), 7)),
         "config-file-dotdot": encode(edit((4, 2, 5), "../tokenizer_config.json")),

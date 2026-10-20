@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use tensorfs::format::ClassRef;
 use tensorfs::format::{Config as ComponentConfig, Dtype, ObjectRef};
 use tensorfs::{Client, Config, Download, Open, WriterOptions};
 
@@ -126,7 +127,7 @@ async fn saved_handle_reopens_after_all_producers_drop_and_deletion_keeps_conten
         .unwrap();
     let mut input = DATA;
     writer
-        .component("model", "test.File", ComponentConfig::new(), None)
+        .component("model", ClassRef::new("test", "1.0", "File"), ComponentConfig::new(), None)
         .unwrap()
         .put("value", Dtype::U8, &[DATA.len() as u64], &mut input)
         .unwrap();

@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from ._ext import (
     Array,
     Checkpoint,
+    ClassRef,
     Component,
     ConflictError,
     DecodeError,
@@ -44,6 +45,7 @@ __all__ = [
     "Array",
     "Checkpoint",
     "CheckpointFile",
+    "ClassRef",
     "Component",
     "ConflictError",
     "ComponentWriter",

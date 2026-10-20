@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use tensorfs::format::ClassRef;
 use tensorfs::format::{Body, Component, Dtype, Header, Location, ObjectRef, Tensor};
 use tensorfs::raw::block_on;
 use tensorfs::store::Store;
@@ -100,7 +101,7 @@ fn fixture(root: &Path) -> (PathBuf, Vec<Vec<u8>>) {
         vec![
             Component {
                 name: "text_encoder".into(),
-                class: "test.Text".into(),
+                class: ClassRef::new("test", "1.0", "Text"),
                 tensors: vec![tensor("a", 0), tensor("b", 1)],
                 assets: BTreeMap::from([
                     ("vocab.json".into(), vocab.clone()),

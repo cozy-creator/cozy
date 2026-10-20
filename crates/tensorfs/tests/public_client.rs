@@ -13,6 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tensorfs::format::ClassRef;
 use tensorfs::format::{self, Body, Dtype, Header, Location, ObjectRef, Tensor};
 use tensorfs::{
     bearer, Client, Config, Endpoint, Failure, Download, Kind, Open, Ref, Request, Selection,
@@ -81,7 +82,7 @@ fn fixture(root: &Path) -> Fixture {
         vec![
             format::Component {
                 name: "model".into(),
-                class: "test.Tiny".into(),
+                class: ClassRef::new("test", "1.0", "Tiny"),
                 config: serde_json::from_str("{\"width\":16,\"eps\":0.001,\"activation\":null}")
                     .unwrap(),
                 tensors: vec![Tensor {
