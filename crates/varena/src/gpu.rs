@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_int, c_void};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use crossbeam_queue::SegQueue;
@@ -507,14 +508,18 @@ impl Gpu {
             }
             *state = State::Filling;
         }
-        let mut mapping = match Mapping::allocate(page.range.clone(), page.offset, page.bytes) {
+        let allocation = catch_unwind(AssertUnwindSafe(|| {
+            Mapping::allocate(page.range.clone(), page.offset, page.bytes)
+        }))
+        .unwrap_or(Err(Error::Internal("VMM allocation panicked")));
+        let mut mapping = match allocation {
             Ok(mapping) => mapping,
             Err(error) => {
                 *page.state.lock() = State::Empty;
                 return Err(error);
             }
         };
-        let result: Result<ReadStats> = (|| {
+        let result: Result<ReadStats> = catch_unwind(AssertUnwindSafe(|| {
             let destination = Dst::Device {
                 device: self.device.ordinal,
                 ptr: mapping.ptr(),
@@ -548,7 +553,8 @@ impl Gpu {
             self.device.access(mapping.ptr(), mapping.bytes, true)?;
             mapping.ready = Some(Event::record(&self.device, self.device.stream.raw())?);
             Ok(stats)
-        })();
+        }))
+        .unwrap_or(Err(Error::Internal("page fill or transform panicked")));
         let mut state = page.state.lock();
         match result {
             Ok(stats) => {
