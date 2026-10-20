@@ -349,12 +349,6 @@ impl Machine {
         }
     }
 
-    /// Its TLS leaf's private key (PKCS#8 DER): the key it proves itself with at a Hub.
-    pub fn leaf_key(&self) -> Vec<u8> {
-        let key = self.root.path().join("machine/run/cozy/bootstrap/tls.key");
-        pem_der(&std::fs::read_to_string(key).unwrap())
-    }
-
     pub fn row(&self, name: &str, key: &Path) -> MachineRow {
         machine(name, Some(self.endpoint.clone()), key)
     }
@@ -416,15 +410,22 @@ pub fn installing_machine_at(listen: &str) -> Tensord {
         );
         (python, wheel)
     });
-    Tensord::start_at(
-        listen,
-        &[
-            OsStr::new("--installer-python"),
-            python.as_os_str(),
-            OsStr::new("--client-wheel"),
-            wheel.as_os_str(),
-        ],
-    )
+    // A hosted job's named pair (`COZY_TEST_RUNTIME_WHEEL`, `COZY_TEST_TENSORFS_WHEEL`) runs the
+    // packages, as an update naming it would; with none named, PyPI's newest.
+    let named: Vec<std::ffi::OsString> = ["COZY_TEST_RUNTIME_WHEEL", "COZY_TEST_TENSORFS_WHEEL"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .collect();
+    let mut args = vec![
+        OsStr::new("--installer-python"),
+        python.as_os_str(),
+        OsStr::new("--client-wheel"),
+        wheel.as_os_str(),
+    ];
+    for wheel in &named {
+        args.extend([OsStr::new("--package-sdk"), wheel.as_os_str()]);
+    }
+    Tensord::start_at(listen, &args)
 }
 
 /// The client wheel the TensorD binary embeds: the zip in it whose dist-info is

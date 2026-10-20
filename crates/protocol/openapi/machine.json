@@ -10,6 +10,38 @@
     "version": "1"
   },
   "paths": {
+    "/v1/bearer": {
+      "put": {
+        "tags": [],
+        "summary": "The signer's newest ordinary bearer at the Hub `endpoint` names: every later read there under\nits owner's access presents it, until one that expires later comes. Kept in memory only.",
+        "operationId": "bearer",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TensorFSOptions"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Kept"
+          },
+          "400": {
+            "description": "`invalid_bearer`: no token, or not a Hub origin",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/health": {
       "get": {
         "tags": [],
@@ -912,6 +944,24 @@
           }
         }
       },
+      "CheckpointRef": {
+        "type": "object",
+        "description": "A checkpoint stored by Runtime. `revision` names its immutable TensorFS tree.",
+        "properties": {
+          "repo_id": {
+            "type": "string",
+            "default": ""
+          },
+          "revision": {
+            "type": "string",
+            "default": ""
+          },
+          "variant": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
       "Disk": {
         "type": "object",
         "properties": {
@@ -1135,6 +1185,13 @@
             "description": "discrete, coherent (GH200, GB200), unified (GB10); empty: unread.",
             "default": ""
           },
+          "memory_limit_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Effective memory offered by this machine; zero means the whole physical card.",
+            "default": 0,
+            "minimum": 0
+          },
           "name": {
             "type": "string",
             "default": ""
@@ -1264,26 +1321,8 @@
             "description": "An origin's private CA (DER, base64), when it has one.",
             "default": []
           },
-          "capability": {
-            "type": "string",
-            "description": "The owner's capability for this run's private operations (th-241): a compact JWS its\ndevice key signed for this machine's leaf (`cnf.jkt`) and the Hub's resource (`aud`),\nnaming each operation in `authorization_details`. The machine trades it once, at the run's\nfirst private operation, at `token_endpoint`. Empty: a public-only run.",
-            "default": ""
-          },
-          "object_hosts": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "The Hub's object-storage hosts downloads may follow.",
-            "default": []
-          },
           "origin": {
             "type": "string",
-            "default": ""
-          },
-          "token_endpoint": {
-            "type": "string",
-            "description": "The Hub's authorization server's, as its metadata names it.",
             "default": ""
           }
         }
@@ -1582,7 +1621,7 @@
       },
       "Product": {
         "type": "object",
-        "description": "One revision of an output: a single output is replaced by each, a list output grows. Its bytes\nare `GET /v1/runs/{id}/outputs/{output}`.",
+        "description": "One revision of an output: a single output is replaced by each, a list output grows. Byte\noutputs use `GET /v1/runs/{id}/outputs/{output}`; checkpoints are immutable references.",
         "properties": {
           "appended_from": {
             "type": [
@@ -1593,6 +1632,17 @@
             "description": "These bytes extend the previous revision's, from here.",
             "default": null,
             "minimum": 0
+          },
+          "checkpoint": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CheckpointRef"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "digest": {
             "type": "string",
@@ -1837,7 +1887,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/HubAccess",
-                "description": "Where the run reads, and its capability there."
+                "description": "The Hub the run reads."
               },
               {
                 "type": "null"
@@ -1885,7 +1935,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/ProviderAccess",
-                "description": "Provider tokens for source models, memory only like `hub`."
+                "description": "Provider tokens for source models, kept in memory only."
               },
               {
                 "type": "null"
@@ -1909,6 +1959,18 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/Source"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "tensorfs": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TensorFSOptions",
+                "description": "Ordinary TensorFS connection settings supplied by the caller, forwarded to Runtime."
               },
               {
                 "type": "null"
@@ -2172,6 +2234,32 @@
             "default": null
           },
           "worker_id": {
+            "type": "string",
+            "default": ""
+          }
+        }
+      },
+      "TensorFSOptions": {
+        "type": "object",
+        "description": "Public TensorFS transport options. TensorD forwards a supplied token without acquiring one.",
+        "properties": {
+          "ca_der": {
+            "type": "string",
+            "format": "byte",
+            "description": "An endpoint's private CA, base64 DER on the wire.",
+            "default": []
+          },
+          "endpoint": {
+            "type": "string",
+            "default": ""
+          },
+          "expires_unix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When `token` expires; 0: unknown.",
+            "default": 0
+          },
+          "token": {
             "type": "string",
             "default": ""
           }

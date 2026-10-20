@@ -24,11 +24,17 @@ jobs:
     with:
       ref: ${{ github.sha }}
       build: tensorfs
-      # Until Runtime 0.30.0 (tensorfs 0.12) is on PyPI, the newest published Runtime cannot pair with
-      # this TensorFS: tests build the Runtime of the xs-045 tree.
-      runtime_ref: 4a63e5b1fba951ebe287621ce9674f014a19ff0c
+      # Build the matching ordinary TensorFS 0.13 / Runtime 0.30 candidate until publication.
+      runtime_ref: 7ca70fef2863764b282d7884af9753e04e210711
       # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below.
-      test: python3 scripts/cargo-test-binaries.py --self-test && python3 scripts/cargo-test-binaries.py
+      test: |
+        python3 scripts/cargo-test-binaries.py --self-test && python3 scripts/cargo-test-binaries.py
+        uv pip install --torch-backend cpu --python "$TENSORFS_TEST_PYTHON" "$COZY_TEST_RUNTIME_WHEEL" pytest torch
+        "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/ffn_scope_lifetime.py
+        uv pip install --python "$TENSORFS_TEST_PYTHON" --no-deps diffusers==0.41.0
+        "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/rmsnorm_bands.py
+        "$TENSORFS_TEST_PYTHON" crates/tensorfs-py/scripts/request_failure_boundary.py
+        "$TENSORFS_TEST_PYTHON" -m pytest -q .runtime/tests/test_weight_source_loading.py .runtime/tests/test_retention_quiescence.py
 
   # The library suites do not install or launch a Runtime, so they need no release wheel.
   # Run them beside the process-heavy daemon suite, preserving every previous target.
@@ -38,15 +44,20 @@ jobs:
     with:
       ref: ${{ github.sha }}
       build: none
-      test: cargo test --workspace --locked --no-fail-fast --exclude cozy --exclude calcifer --exclude tensord
+      test: |
+        failed=0
+        cargo test --workspace --locked --no-fail-fast --exclude cozy --exclude calcifer --exclude tensord --exclude varena || failed=1
+        # Unrelated concurrent forks briefly inherit CLOEXEC reader leases before
+        # exec. Isolate cases; each ledger case still runs its real child processes.
+        cargo test -p varena --locked --no-fail-fast -- --test-threads=1 || failed=1
+        exit "$failed"
 
   owner-day:
     if: github.event_name == 'push'
     uses: ./.github/workflows/owner-day.yml
     secrets: inherit
     with:
-      # cozy master is TensorFS v2: its gate runs against the v2 Hub, tensorhub #1202's head. This line
-      # goes when #1202 lands on tensorhub master.
-      tensorhub_ref: b8e24df5a8e309708c1bf550fe1c4cd3fe9d5b06
-      # The tests' Runtime and TensorFS pair; this line goes when Runtime 0.30.0 and tensorfs 0.12 are on PyPI.
-      runtime_ref: 4a63e5b1fba951ebe287621ce9674f014a19ff0c
+      # Use the compatible Hub routes and the expand-only migration during this cohort rollout.
+      tensorhub_ref: e1b09ab11c2e6af5e15fb752f6bd5ebd6fb1379e
+      # Use this Runtime and TensorFS pair until both releases are published.
+      runtime_ref: 7ca70fef2863764b282d7884af9753e04e210711

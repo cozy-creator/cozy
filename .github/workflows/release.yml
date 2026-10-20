@@ -46,7 +46,7 @@ on:
         required: true
         default: dry-run
         type: string
-      # HAND-EDITED (dist-workspace.toml allow-dirty): these two inputs and the plan job's first step.
+      # HAND-EDITED (dist-workspace.toml allow-dirty): cohort inputs and the plan job's first step.
       must_contain:
         description: Comma-separated commits the release must contain
         required: false
@@ -54,6 +54,16 @@ on:
         type: string
       tensorfs_run:
         description: A publish-tensorfs run whose unpublished wheel stands in for PyPI's (dry runs and prereleases)
+        required: false
+        default: ''
+        type: string
+      tensorhub_ref:
+        description: Hub source and owner-day harness; master by default
+        required: false
+        default: master
+        type: string
+      runtime_ref:
+        description: Exact Runtime source paired with this TensorFS for owner-day; empty uses the published pair
         required: false
         default: ''
         type: string
@@ -282,6 +292,8 @@ jobs:
     uses: ./.github/workflows/owner-day.yml
     with:
       plan: ${{ needs.plan.outputs.val }}
+      tensorhub_ref: ${{ inputs.tensorhub_ref || 'master' }}
+      runtime_ref: ${{ inputs.runtime_ref || '' }}
     secrets: inherit
   # Determines if we should publish/announce
   host:

@@ -3,6 +3,8 @@
 //! queued run, and keeps its runs through a restart (xs-047).
 #[path = "common/child.rs"]
 mod child;
+#[path = "common/named_runtime.rs"]
+mod named_runtime;
 use child::BareEnv;
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 use std::{
@@ -31,6 +33,7 @@ fn boot(home: &Path) -> (Machine, Client) {
     std::fs::create_dir_all(&keys).unwrap();
     let owner = SigningKey::from_bytes(&[5; 32]);
     std::fs::write(keys.join("owner.pem"), owner.to_pkcs8_pem(Default::default()).unwrap().as_bytes()).unwrap();
+    named_runtime::image(&home.join(".cozy/machine"));
     let mut machine = Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
             .arg("--persistent")
@@ -247,8 +250,9 @@ async fn update(client: &Client, id: &str, spec: v1::RunSpec) -> Vec<v1::RunEven
     }
 }
 
-/// A machine with the cpu_bulk tree installed, and an update installing the published pair its
-/// runs execute on: it holds no pair of its own yet, so the update installs it and restarts.
+/// A machine with the cpu_bulk tree installed, and an update it installs and restarts on: the
+/// named pair with its Runtime rebuilt (the same files, other bytes), else the published pair its
+/// runs execute on, which it holds none of yet.
 async fn updatable(home: &Path) -> (Machine, Client, String, v1::RunSpec) {
     let (machine, client) = boot(home);
     let manifest = tree(&client, "").await;
@@ -257,8 +261,24 @@ async fn updatable(home: &Path) -> (Machine, Client, String, v1::RunSpec) {
     client.submit(&v1::RunRequest { id: "n".into(), spec: spec(&manifest, "nap", r#"{"seconds":0.0}"#) }).await.unwrap();
     let ran = follow(&client, "n").await.2;
     let measured: serde_json::Value = serde_json::from_str(ran.measurements.as_ref().unwrap().get()).unwrap();
-    let pair = serde_json::json!({"runtime": measured["software"]["runtime"], "tensorfs": measured["software"]["tensorfs"]});
-    let install = v1::RunSpec { kind: v1::RunKind::Update, payload: v1::Json::parse(pair.to_string()).ok(), ..Default::default() };
+    let mut pair = serde_json::json!({"runtime": measured["software"]["runtime"], "tensorfs": measured["software"]["tensorfs"]});
+    let mut inputs = vec![];
+    if let [runtime, tensorfs_wheel] = named_runtime::pair() {
+        // A zip comment: other bytes, the same files.
+        let mut rebuilt = std::fs::read(runtime).unwrap();
+        let end = rebuilt.len() - 2;
+        assert_eq!(rebuilt[end..], [0, 0], "{runtime:?} already has a zip comment");
+        rebuilt.truncate(end);
+        rebuilt.extend(b"\x07\x00rebuilt");
+        let bulk = client.bulk().unwrap();
+        for (field, wheel, bytes) in [("runtime", runtime, rebuilt), ("tensorfs", tensorfs_wheel, std::fs::read(tensorfs_wheel).unwrap())] {
+            let (digest, length) = (format!("sha256:{}", tensorfs::sha256::hex_digest(&bytes)), bytes.len() as u64);
+            bulk.put(&digest, (0, length, length), bytes).await.unwrap();
+            pair[field] = wheel.file_name().unwrap().to_str().unwrap().into();
+            inputs.push(v1::InputFile { field: field.into(), digest, ..Default::default() });
+        }
+    }
+    let install = v1::RunSpec { kind: v1::RunKind::Update, payload: v1::Json::parse(pair.to_string()).ok(), inputs, ..Default::default() };
     (machine, client, manifest, install)
 }
 

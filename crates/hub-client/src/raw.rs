@@ -36,23 +36,6 @@ impl Client {
         self.send(request, "attach_checkpoint_assessment").await
     }
 
-    /// Dev builds only (xs-045 U12): every index row of a model the caller owns, its yanked
-    /// releases' lanes and its unreleased checkpoints included, with which are pre-cut (`v1`).
-    #[cfg(feature = "migrate")]
-    pub async fn model_rows(&self, org: &str, name: &str) -> Result<serde_json::Value, Error> {
-        let url = format!(
-            "{}/v1/models/{}/{}/rows",
-            self.baseurl(),
-            encode_path(org),
-            encode_path(name),
-        );
-        let request = (self.client().get(url))
-            .header(ACCEPT, "application/json")
-            .header("api-version", Self::api_version())
-            .build();
-        self.send(request, "read_model_rows").await
-    }
-
     async fn send<T: serde::de::DeserializeOwned>(
         &self,
         request: reqwest::Result<reqwest::Request>,

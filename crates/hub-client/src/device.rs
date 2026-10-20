@@ -1,13 +1,13 @@
-//! A user's device key (Ed25519, AuthKit device keys): enrollment by emailed code, silent login
-//! to a short Bearer, and the run capabilities it signs offline for a machine to trade.
+//! A user's device key (Ed25519, AuthKit device keys): enrollment by emailed code, and silent
+//! login to a short Bearer.
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer as _, SigningKey};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
-use crate::jws::{b64, jti, now, signing_input, unb64};
 use crate::{Client, Error, types};
 use progenitor_client::ClientInfo;
 
@@ -76,35 +76,6 @@ impl DeviceKey {
         let message = [domain.as_bytes(), &[0], &challenge].concat();
         Ok(b64(key.sign(&message).to_bytes()))
     }
-
-    /// Signs `capability` offline: the compact JWS a machine trades for a token (th-241).
-    pub fn sign_run_capability(&self, capability: &RunCapability) -> String {
-        let header = json!({"alg": "EdDSA", "typ": "authkit-capability+jwt", "kid": self.id});
-        let issued = now();
-        let claims = json!({
-            "sub": capability.user_id, "aud": capability.hub, "cnf": {"jkt": capability.machine},
-            "run": capability.run, "jti": jti(), "iat": issued,
-            "exp": issued + capability.lifetime.as_secs(),
-            "authorization_details": capability.operations,
-        });
-        let input = signing_input(&header, &claims);
-        format!(
-            "{input}.{}",
-            b64(self.key.sign(input.as_bytes()).to_bytes())
-        )
-    }
-}
-
-/// What one run may do at a Hub for its owner: the operations (RFC 9396
-/// `authorization_details`) the machine whose leaf thumbprint is `machine` performs for `run`.
-pub struct RunCapability {
-    pub user_id: String,
-    /// The Hub's public origin, the token's audience.
-    pub hub: String,
-    pub machine: String,
-    pub run: String,
-    pub operations: Vec<Value>,
-    pub lifetime: Duration,
 }
 
 /// A short user Bearer.
@@ -143,6 +114,11 @@ impl Bearer {
     fn live(&self) -> bool {
         self.expires > now() + MARGIN
     }
+
+    /// When the session mints the next one (Unix seconds).
+    pub fn refresh_at(&self) -> u64 {
+        self.expires.saturating_sub(MARGIN)
+    }
 }
 
 /// One user signed in by a device key: a Bearer kept in memory and, if given a path, beside
@@ -167,11 +143,11 @@ impl UserSession {
     }
 
     /// A live Bearer: held, kept, or from a fresh login at `hub`.
-    pub async fn bearer(&self, hub: &Client) -> Result<String, Error> {
+    pub async fn bearer(&self, hub: &Client) -> Result<Bearer, Error> {
         let mut held = self.bearer.lock().await;
         let ours = |b: &Bearer| b.live() && b.device_key_id == self.key.id;
         if let Some(bearer) = held.as_ref().filter(|b| ours(b)) {
-            return Ok(bearer.token.clone());
+            return Ok(bearer.clone());
         }
         let kept = self
             .cache
@@ -194,9 +170,8 @@ impl UserSession {
                 bearer
             }
         };
-        let token = bearer.token.clone();
-        *held = Some(bearer);
-        Ok(token)
+        *held = Some(bearer.clone());
+        Ok(bearer)
     }
 
     /// The Hub refused `token`: the next request logs in again.
@@ -250,7 +225,7 @@ impl Enrollment {
     ) -> Result<Self, Error> {
         let key = match existing {
             Some(existing) => existing.key.clone(),
-            None => SigningKey::from_bytes(&crate::jws::random()),
+            None => SigningKey::from_bytes(&random()),
         };
         let begun = hub
             .begin_device_key_enrollment(&types::AuthDeviceKeyEnrollBeginRequest {
@@ -297,11 +272,33 @@ impl Enrollment {
 }
 
 /// Writes `bytes` to `path` owner-only, through a rename so a reader never sees half.
+fn b64(bytes: impl AsRef<[u8]>) -> String {
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn unb64(text: &str) -> Option<Vec<u8>> {
+    URL_SAFE_NO_PAD.decode(text).ok()
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+fn random<const N: usize>() -> [u8; N] {
+    let mut raw = [0u8; N];
+    SystemRandom::new()
+        .fill(&mut raw)
+        .expect("the system random source");
+    raw
+}
+
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     let fail = |e: std::io::Error| Error::Key(format!("{}: {e}", path.display()));
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(fail)?;
-    let staged = dir.join(format!(".{}.tmp", jti()));
+    let staged = dir.join(format!(".{}.tmp", b64(random::<24>())));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -320,7 +317,6 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signature, Verifier as _};
 
     fn key() -> DeviceKey {
         DeviceKey {
@@ -331,10 +327,10 @@ mod tests {
         }
     }
 
-    /// A key survives its file, and the run capability it signs verifies under it.
+    /// A key survives its file.
     #[test]
-    fn a_kept_key_signs_a_verifiable_capability() {
-        let dir = std::env::temp_dir().join(format!("hub-client-{}", jti()));
+    fn a_kept_key_survives_its_file() {
+        let dir = std::env::temp_dir().join(format!("hub-client-{}", b64(random::<24>())));
         let path = dir.join("key.json");
         key().save(&path).unwrap();
         let loaded = DeviceKey::load(&path).unwrap();
@@ -342,26 +338,6 @@ mod tests {
         assert_eq!(
             (loaded.id.as_str(), loaded.key.to_bytes()),
             ("dk1", [7; 32])
-        );
-        let jws = loaded.sign_run_capability(&RunCapability {
-            user_id: "u1".into(),
-            hub: "https://hub.example".into(),
-            machine: "jkt".into(),
-            run: "r1".into(),
-            operations: vec![json!({"type": "tensorhub_model_publish", "model": "a/b"})],
-            lifetime: Duration::from_secs(60),
-        });
-        let (input, signature) = jws.rsplit_once('.').unwrap();
-        let signature = Signature::from_slice(&unb64(signature).unwrap()).unwrap();
-        loaded
-            .key
-            .verifying_key()
-            .verify(input.as_bytes(), &signature)
-            .unwrap();
-        let claims = crate::jws::claims(&jws).unwrap();
-        assert_eq!(
-            (claims["cnf"]["jkt"].as_str(), claims["aud"].as_str()),
-            (Some("jkt"), Some("https://hub.example"))
         );
     }
 }

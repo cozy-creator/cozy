@@ -9,7 +9,7 @@ control and SSE over HTTP/2, bulk bytes over HTTP/1.1. The routes, bodies and ev
 gRPC call maps onto them is `~/cozy_v2/tracker/design/machine-http-api.md` §2. In short:
 
 - `GET /v1/status` (identity and readiness receipt without a cap; the whole picture, as SSE on
-  change, with one), `POST /v1/keepalive`;
+  change, with one), `POST /v1/keepalive`, `PUT /v1/bearer` (the owner's newest Hub bearer);
 - `POST /v1/runs` (idempotent on id per signer), `GET /v1/runs/{id}/events` (SSE after
   `Last-Event-ID`; closing it never cancels), `POST /v1/runs/{id}/cancel`;
 - `GET /v1/runs/{id}/outputs/{output}` (ranged, `ETag` = revision, readable while it grows),
@@ -41,24 +41,25 @@ it and Runtime gets it with each request. Zero: the lane rule (`precision.rs`, t
 - **Prepare and warm-up** are runs (`kind: warm`); uninstall is `kind: remove` (`remove/1`).
 - **Acknowledge** is deleted. A read that reaches the final length of an output's final revision
   marks it delivered, and delivered bytes are evicted first.
-- **Hub access** (th-241): released content is read anonymously. A run's private operations
-  (reading the owner's checkpoint by hash, publishing to the owner's repositories) are named
-  by `hub.capability`, which the owner's CLI signs offline with its device key for this machine's
-  leaf. At the run's first private operation the machine trades it, once, at `hub.token_endpoint`
-  (AuthKit's JWT-bearer grant: an assertion its leaf signs carries the capability, with a DPoP
-  proof from the same key) and uses the token until the capability expires; child runs share it.
-  A publication the capability does not name ends `capability_required` before the Hub hears of
-  it; a refused trade or token `capability_refused`, an expired capability `capability_expired`,
-  an operation the Hub narrowed away `capability_exceeded`. Tokens live in memory only. If the
-  machine restarts before preparation completes, the run ends FAILED with a typed reason; started
-  work is never re-run.
+- **Hub access**: released content is read anonymously. A run that reads its owner's private
+  checkpoints or publishes to the owner's repositories carries the owner's bearer
+  (`tensorfs.token`, with the Hub's `endpoint`, `ca_der` and `expires_unix_ms`), taken at send
+  from the CLI's signed-in session. Calcifer also gives each machine it sent one every bearer
+  the session mints after, at the session's own refresh point (`PUT /v1/bearer`). The machine
+  keeps the newest per signer and Hub, in memory only, and reads models through TensorFS's
+  distribution `Endpoint` under it: runs, warm-set members, prefetches and calls alike. Each
+  executor given it on a Load or Invoke hears of every newer one (`bearer`, see
+  [DEVICE-EXECUTOR.md](DEVICE-EXECUTOR.md)), so a call that outlives its bearer still uploads.
+  It presents it only to that Hub's origin; its scope is the owner's account. A refused bearer
+  ends the run `hub_credential_refused`, naming its expiry. If the machine restarts before
+  preparation completes, the run ends FAILED with a typed reason; started work is never re-run.
 - **Names** (th-245): the machine resolves them at the run's Hub. A release (`org/name`, its
   release or none for the newest) installs from the card and locked requirements it reads there
   by name. A model slot is the run's choice, else its declared `default` release (a callee's
   too): `repository` at `release` (none: the newest) in its `lane`, else in the first lane of the
-  rule's order its release publishes, else in its only lane. Anonymous closure calls name its
-  manifest, then the pull is pinned to that lane's checkpoint. `manifest` names a
-  checkpoint by hash only: the owner's (under the capability) or one the machine holds. Name
+  rule's order its release publishes, else in its only lane: the repo document names the release,
+  its tree the lane's header. `manifest` names a checkpoint by hash only: the owner's (under the
+  bearer) or one the machine holds. Name
   resolutions and held preparations are kept per `catalog_revision`, so a warm run reads nothing
   at a Hub and a revision the caller moved resolves once more; there is no TTL guess or forget verb.
 - **List** is deleted. Status shows live runs; history is the CLI's own records plus a run's events.

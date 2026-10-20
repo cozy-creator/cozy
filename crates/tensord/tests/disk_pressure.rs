@@ -1,5 +1,5 @@
-//! A low disk (no more than the TensorFS reserve free) drops a covering plan or nothing: only
-//! bytes an unlink frees count, local caches go before models, compiled kernels last.
+//! A low disk (no more than its reserve free) drops a covering plan or nothing: only bytes an
+//! unlink frees count, compiled kernels last. The TensorFS store evicts on its own.
 //! The disk's free space is each test's own figure (it cannot fill a real filesystem); what
 //! is deleted, and what that frees, is real.
 use tensord::{
@@ -7,7 +7,7 @@ use tensord::{
     execution::Engine,
     journal::{Invocation, Outcome},
     launch_identity::Seal,
-    reclaim::{self, Caches, Disk, KernelCaches, StoreCaches, Swept},
+    reclaim::{self, Caches, Disk, KernelCaches, Swept},
 };
 use platform::durable;
 use std::{
@@ -17,8 +17,6 @@ use std::{
     sync::Arc,
     time::SystemTime,
 };
-use tensord::storage::{self, Store};
-use tensorfs::format::{Manifest, Metadata, ObjectRef};
 
 const MIB: u64 = 1 << 20;
 const CAPACITY: u64 = 100 << 30;
@@ -28,7 +26,6 @@ struct Fixture {
     engine: Arc<Engine>,
     catalog: Catalog,
     kernels: KernelCaches,
-    store: Store,
 }
 
 impl Fixture {
@@ -39,13 +36,11 @@ impl Fixture {
         let kernels = KernelCaches {
             root: root.join("kernels"),
         };
-        let store = storage::open(&root.join("store")).unwrap().as_ref().clone().with_grace(std::time::Duration::ZERO);
         Self {
             root,
             engine,
             catalog,
             kernels,
-            store,
         }
     }
     fn kernel(&self, namespace: &str, name: &str) -> PathBuf {
@@ -90,16 +85,6 @@ impl Fixture {
         fs::create_dir_all(log.parent().unwrap()).unwrap();
         fs::write(&log, vec![4u8; MIB as usize]).unwrap();
         (result, log)
-    }
-    /// A model the store cached from a Hub: one object, pinned as a pulled checkpoint.
-    fn model(&self, name: &str, mib: u64) -> (ObjectRef, String) {
-        let body = vec![name.as_bytes()[0]; (mib * MIB) as usize];
-        let object = self.store.put_bytes(&body).unwrap();
-        let files = [("model.bin".to_string(), object.clone())].into();
-        let manifest = Manifest { files, metadata: Metadata::new() };
-        let manifest = self.store.put_bytes(&manifest.to_json().unwrap()).unwrap();
-        storage::hold(&self.store, &storage::pin::model(&manifest.sha256), vec![manifest.clone()], None).unwrap();
-        (object, manifest.id())
     }
     /// A disk `short` bytes from leaving its reserve, gaining whatever this fixture frees.
     fn low(&self, short: u64) -> impl Fn() -> io::Result<Disk> + '_ {
@@ -149,7 +134,7 @@ impl Fixture {
             .unwrap();
         assert!(installed.success());
     }
-    fn sweep(&self, keep: Option<&[String]>, disk: &dyn Fn() -> io::Result<Disk>) -> Swept {
+    fn sweep(&self, disk: &dyn Fn() -> io::Result<Disk>) -> Swept {
         reclaim::sweep(&Caches {
             engine: &self.engine,
             catalog: &self.catalog,
@@ -157,10 +142,6 @@ impl Fixture {
             kernels: Some(&self.kernels),
             memo: None,
             uv_cache: Some(&self.root.join("uv-cache")),
-            store: keep.map(|keep| StoreCaches {
-                store: &self.store,
-                keep: keep.to_vec(),
-            }),
             disk,
         })
         .unwrap()
@@ -217,14 +198,14 @@ fn a_disk_above_its_reserve_and_a_plan_that_cannot_cover_drop_nothing() {
     let fixture = Fixture::new();
     let (result, log) = fixture.collected("done");
     let (generation, kernel) = (fixture.generation('a'), fixture.kernel("u1", "valuable"));
-    // A fortieth free is not low: the reserve is the store's (2% within 1 to 10 GiB).
+    // A fortieth free is not low: the reserve is 2% within 1 to 10 GiB.
     assert_eq!(disk(CAPACITY / 40).short(), None);
     assert_eq!(
-        fixture.sweep(None, &|| Ok(disk(CAPACITY / 40))),
+        fixture.sweep(&|| Ok(disk(CAPACITY / 40))),
         Swept::default()
     );
     // Low by a gibibyte, with four mebibytes droppable: nothing covers it.
-    assert_eq!(fixture.sweep(None, &fixture.low(1 << 30)), Swept::default());
+    assert_eq!(fixture.sweep(&fixture.low(1 << 30)), Swept::default());
     assert!(result.exists() && log.exists() && generation.exists() && kernel.exists());
 }
 
@@ -252,7 +233,7 @@ fn held_linked_and_open_bytes_do_not_make_a_plan_cover() {
     fs::write(outside.join("kernel"), vec![1u8; MIB as usize]).unwrap();
     durable::symlink(&fixture.root.join("outside"), &fixture.kernels.root.join("u2")).unwrap();
     // Counted by size alone these would cover half a mebibyte many times over.
-    assert_eq!(fixture.sweep(None, &fixture.low(MIB / 2)), Swept::default());
+    assert_eq!(fixture.sweep(&fixture.low(MIB / 2)), Swept::default());
     assert!(held.exists() && linked.exists() && kernel.exists());
     assert!(served.as_ref().is_none_or(|(result, _)| result.exists()));
     assert!(outside.join("kernel").exists());
@@ -264,13 +245,13 @@ fn a_covering_plan_drops_results_logs_generations_then_kernels() {
     let fixture = Fixture::new();
     let (result, log) = fixture.collected("done");
     let (generation, kernel) = (fixture.generation('a'), fixture.kernel("u1", "compiled"));
-    let swept = fixture.sweep(None, &fixture.low(MIB / 2));
+    let swept = fixture.sweep(&fixture.low(MIB / 2));
     assert_eq!(
         (swept.results, swept.logs, swept.generations, swept.kernels),
         (1, 0, 0, 0)
     );
     assert!(!result.exists() && log.exists() && generation.exists() && kernel.exists());
-    let swept = fixture.sweep(None, &fixture.low(MIB + MIB / 2));
+    let swept = fixture.sweep(&fixture.low(MIB + MIB / 2));
     assert_eq!(
         (swept.logs, swept.generations, swept.kernels),
         (1, 1, 0),
@@ -278,29 +259,10 @@ fn a_covering_plan_drops_results_logs_generations_then_kernels() {
     );
     assert!(!log.exists() && !generation.exists() && kernel.exists());
     // Kernels alone must cover what is missing, or they stay.
-    assert_eq!(fixture.sweep(None, &fixture.low(2 * MIB)), Swept::default());
+    assert_eq!(fixture.sweep(&fixture.low(2 * MIB)), Swept::default());
     assert!(kernel.exists());
-    assert_eq!(fixture.sweep(None, &fixture.low(MIB / 2)).kernels, 1);
+    assert_eq!(fixture.sweep(&fixture.low(MIB / 2)).kernels, 1);
     assert!(!kernel.exists());
-}
-
-#[test]
-fn models_go_after_local_caches_and_before_kernels() {
-    let fixture = Fixture::new();
-    let present = |object: &ObjectRef| storage::present(&fixture.store, object);
-    let garbage = fixture.store.put_bytes(&[9u8; 4096]).unwrap();
-    let (model, manifest) = fixture.model("unused", 4);
-    let (generation, kernel) = (fixture.generation('a'), fixture.kernel("u1", "compiled"));
-    // A model an unfinished run names is kept, and what remains cannot cover three
-    // mebibytes: only the store's garbage goes.
-    let swept = fixture.sweep(Some(&[manifest]), &fixture.low(3 * MIB));
-    assert_eq!((swept.generations, swept.kernels), (0, 0), "{swept:?}");
-    assert!(!present(&garbage) && present(&model) && generation.exists() && kernel.exists());
-    // Unnamed, it goes once the generation has, and the kernel is not needed.
-    let swept = fixture.sweep(Some(&[]), &fixture.low(3 * MIB));
-    assert_eq!((swept.generations, swept.kernels), (1, 0), "{swept:?}");
-    assert!(swept.store_bytes >= 4 * MIB, "{swept:?}");
-    assert!(!present(&model) && !generation.exists() && kernel.exists());
 }
 
 #[test]
@@ -314,10 +276,10 @@ fn a_live_seal_holds_its_kernel_namespace() {
     )
     .unwrap();
     let kernel = seal.kernels.join("triton/compiled");
-    assert_eq!(fixture.sweep(None, &fixture.low(MIB / 2)), Swept::default());
+    assert_eq!(fixture.sweep(&fixture.low(MIB / 2)), Swept::default());
     assert!(kernel.exists());
     drop(seal);
-    assert!(fixture.sweep(None, &fixture.low(MIB / 2)).kernels >= 1);
+    assert!(fixture.sweep(&fixture.low(MIB / 2)).kernels >= 1);
     assert!(!kernel.exists());
 }
 
@@ -348,7 +310,7 @@ fn queued_and_unknown_runs_keep_the_generations_they_name() {
             [&other.id],
         )
         .unwrap();
-    assert_eq!(fixture.sweep(None, &fixture.low(MIB / 2)), Swept::default());
+    assert_eq!(fixture.sweep(&fixture.low(MIB / 2)), Swept::default());
     assert!(queued.exists() && unknown.exists());
 }
 
@@ -372,12 +334,12 @@ fn the_uv_cache_drops_wheels_no_environment_links_before_generations_and_never_m
     assert_eq!(unpacked(), 2);
     // Fresh, it outlives the TTL pass.
     assert_eq!(
-        fixture.sweep(None, &|| Ok(disk(CAPACITY / 40))),
+        fixture.sweep(&|| Ok(disk(CAPACITY / 40))),
         Swept::default()
     );
     // Low by an eighth of a mebibyte: beta's unpacked wheel covers it, before the generation.
     // Alpha's is a live environment's (its files are linked twice): it frees nothing, stays.
-    let swept = fixture.sweep(None, &fixture.low(MIB / 8));
+    let swept = fixture.sweep(&fixture.low(MIB / 8));
     assert_eq!((swept.uv_cache, swept.generations), (1, 0), "{swept:?}");
     assert_eq!(unpacked(), 1);
     assert!(generation.exists() && module.exists());
@@ -391,7 +353,7 @@ fn the_uv_cache_drops_wheels_no_environment_links_before_generations_and_never_m
     // whole environment build: nothing of it goes, so the generation is what covers.
     let install = fs::File::open(fixture.root.join("uv-cache/.lock")).unwrap();
     fs2::FileExt::lock_shared(&install).unwrap();
-    let swept = fixture.sweep(None, &fixture.low(MIB / 8));
+    let swept = fixture.sweep(&fixture.low(MIB / 8));
     assert_eq!((swept.uv_cache, swept.generations), (0, 1), "{swept:?}");
     assert_eq!(unpacked(), 2);
 }

@@ -37,7 +37,7 @@ jobs:
   owner-day:
     runs-on: ubuntu-latest
     # Hang bound, not a work budget.
-    timeout-minutes: 50
+    timeout-minutes: 90
     services:
       postgres:
         image: postgres:18-alpine
@@ -79,17 +79,31 @@ jobs:
           ref: ${{ inputs.runtime_ref }}
           ssh-key: ${{ secrets.COZY_RUNTIME_READ_KEY }}
           path: .runtime
-      # The wheel carries `tfs`, built first into its scripts directory, as the release does.
-      - name: Runtime and TensorFS wheels
+      - name: The selected Runtime wheel
         if: inputs.runtime_ref != ''
         run: |
           uv run --no-project python .runtime/scripts/stamp-build-provenance.py "$(git -C .runtime rev-parse HEAD)"
           uv build --wheel --out-dir "$RUNNER_TEMP/runtime" .runtime
           echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
-          (cd .cozy-src && cargo build --release --locked -p tensorfs --bin tfs)
-          install -D -m 755 .cozy-src/target/release/tfs .cozy-src/crates/tensorfs-py/wheel-data/scripts/tfs
-          (cd .cozy-src/crates/tensorfs-py && uvx maturin@1.15.0 build --release --out "$RUNNER_TEMP/tensorfs")
-          echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$RUNNER_TEMP"/tensorfs/tensorfs-*.whl)" >> "$GITHUB_ENV"
+      # Both native components run in Debian CI workers as well as on this Ubuntu host.
+      # Match dev-build's manylinux floor for the extension and the bundled tfs binary.
+      - name: The matching TensorFS wheel
+        if: inputs.runtime_ref != ''
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.15.0
+          target: x86_64
+          manylinux: '2_28'
+          working-directory: .cozy-src/crates/tensorfs-py
+          args: --release --locked --target-dir ../../target/manylinux --out dist
+          before-script-linux: |
+            cargo build --release --locked --target-dir ../../target/manylinux -p tensorfs --bin tfs
+            install -D -m 755 ../../target/manylinux/release/tfs wheel-data/scripts/tfs
+      - if: inputs.runtime_ref != ''
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" .cozy-src/target .cozy-src/crates/tensorfs-py
+          echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$PWD"/.cozy-src/crates/tensorfs-py/dist/tensorfs-*.whl)" >> "$GITHUB_ENV"
+          echo "COZY_TEST_CREATOR_SHA=$(git -C .cozy-src rev-parse HEAD)" >> "$GITHUB_ENV"
           rm -rf .cozy-src/target
       - if: inputs.plan != ''
         uses: actions/download-artifact@v8

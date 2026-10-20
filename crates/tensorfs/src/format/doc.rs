@@ -1,6 +1,5 @@
-//! The three documents and the tensor model. The manifest and repo parse through a `Wire` twin
-//! that carries the `format` tag, the header through `cbor`; validation happens once, in
-//! `TryFrom<Wire>` and [`Header::new`].
+//! Objects, the header and the tensor model. The header parses through `cbor`; validation
+//! happens once, in [`Header::new`].
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -8,10 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::layout::ALIGN;
-use super::{
-    cbor, check_format, decode, invalid, json, Dtype, Error, PartBytes, Result, Value, HEADER_PATH,
-    MANIFEST_FORMAT, REPO_FORMAT,
-};
+use super::{cbor, decode, invalid, Config, Dtype, Error, PartBytes, Result, Value};
 
 /// Free-form metadata, and a scheme's params.
 pub type Metadata = BTreeMap<String, Value>;
@@ -69,70 +65,17 @@ impl ObjectRef {
     }
 }
 
-/// `tensorfs.manifest/1`: a checkpoint as a file tree. `model.cozytensors` is its header.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(try_from = "ManifestWire", into = "ManifestWire")]
-pub struct Manifest {
-    pub files: BTreeMap<String, ObjectRef>,
-    pub metadata: Metadata,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct ManifestWire {
-    format: String,
-    files: BTreeMap<String, ObjectRef>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    metadata: Metadata,
-}
-
-impl TryFrom<ManifestWire> for Manifest {
-    type Error = Error;
-    fn try_from(w: ManifestWire) -> Result<Self> {
-        check_format(&w.format, MANIFEST_FORMAT)?;
-        for path in w.files.keys() {
-            if !path.split('/').all(segment) {
-                return invalid(format!(
-                    "file path {path:?} is not a relative path of plain segments"
-                ));
-            }
-        }
-        Ok(Manifest {
-            files: w.files,
-            metadata: w.metadata,
-        })
-    }
-}
-
-impl From<Manifest> for ManifestWire {
-    fn from(m: Manifest) -> Self {
-        ManifestWire {
-            format: MANIFEST_FORMAT.into(),
-            files: m.files,
-            metadata: m.metadata,
-        }
-    }
-}
-
-impl Manifest {
-    pub fn from_json(bytes: &[u8]) -> Result<Manifest> {
-        json::read(bytes, MANIFEST_FORMAT)
-    }
-    pub fn to_json(&self) -> Result<Vec<u8>> {
-        json::write(self)
-    }
-    pub fn header(&self) -> Option<&ObjectRef> {
-        self.files.get(HEADER_PATH)
-    }
-}
-
-/// `cozytensors/1`: chunk objects and the tensors that live in them. Components, each
-/// component's tensors and each tensor's parts are in construction order (the order a model
-/// builds and fills them), which the header's bytes and digest carry. Lookup by name goes
-/// through an index built by [`Header::new`].
+/// `cozytensors/1`: one variant of a model, self-contained: its pipeline, its components (class,
+/// config, tensors, assets), the chunk objects the tensors live in, and loading metadata.
+/// Components, each component's tensors and each tensor's parts are in construction order (the
+/// order a model builds and fills them), which the header's bytes and digest carry. Lookup by
+/// name goes through an index built by [`Header::new`].
 #[derive(Debug, Clone, Default)]
 pub struct Header {
     pub chunks: Vec<ObjectRef>,
+    pipeline: Option<Pipeline>,
     components: Vec<Component>,
+    /// Loading metadata: `source`, `filled`, per-file safetensors `__metadata__`.
     pub metadata: Metadata,
     /// Component name → (its index, tensor key → tensor index).
     index: HashMap<String, (usize, HashMap<String, usize>)>,
@@ -140,16 +83,42 @@ pub struct Header {
 
 impl PartialEq for Header {
     fn eq(&self, other: &Header) -> bool {
-        (&self.chunks, &self.components, &self.metadata)
-            == (&other.chunks, &other.components, &other.metadata)
+        (&self.chunks, &self.pipeline, &self.components, &self.metadata)
+            == (&other.chunks, &other.pipeline, &other.components, &other.metadata)
     }
+}
+
+/// What `model_index.json` held.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Pipeline {
+    /// `<library>.<Class>` (`diffusers.StableDiffusionXLPipeline`), `""` when unknown.
+    pub class: String,
+    pub config: Config,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Component {
     pub name: String,
+    /// `<library>.<Class>` (`transformers.CLIPTextModel`), `""` when unknown.
+    pub class: String,
+    pub config: Config,
     pub tensors: Vec<Tensor>,
+    /// Run data in the component's folder (`tokenizer.json`, `vocab.json`, ...), by path
+    /// relative to it.
+    pub assets: BTreeMap<String, ObjectRef>,
+    /// The config's file name, when it isn't `config.json`.
+    pub config_file: Option<String>,
 }
+
+impl Component {
+    /// The config's file name: [`Component::config_file`] or `config.json`.
+    pub fn config_name(&self) -> &str {
+        self.config_file.as_deref().unwrap_or(CONFIG_FILE)
+    }
+}
+
+/// A component config's file name unless `config_file` says otherwise.
+pub const CONFIG_FILE: &str = "config.json";
 
 /// A tensor: its key, logical dtype and shape, and either its bytes or its encoded parts.
 #[derive(Debug, Clone, PartialEq)]
@@ -246,14 +215,17 @@ pub struct Span {
 
 impl Header {
     /// A header with `components` in the given (construction) order. Refuses repeated names,
-    /// keys or roles, and locations outside `chunks`.
+    /// keys or roles, locations outside `chunks`, asset names that are not paths, and a
+    /// `config_file` of `config.json` or that names an asset.
     pub fn new(
         chunks: Vec<ObjectRef>,
+        pipeline: Option<Pipeline>,
         components: Vec<Component>,
         metadata: Metadata,
     ) -> Result<Header> {
         let mut header = Header {
             chunks,
+            pipeline,
             components: Vec::new(),
             metadata,
             index: HashMap::new(),
@@ -273,6 +245,18 @@ impl Header {
                     "component name {name:?} is not one plain path segment"
                 ));
             }
+            if let Some(file) = &component.config_file {
+                if file == CONFIG_FILE || !path(file) {
+                    return invalid(format!("component {name:?}: config_file {file:?}"));
+                }
+            }
+            if let Some(asset) = (component.assets.keys())
+                .find(|a| !path(a) || *a == component.config_name())
+            {
+                return invalid(format!(
+                    "component {name:?}: asset {asset:?} is not a path or is its config file"
+                ));
+            }
             let mut keys = HashMap::with_capacity(component.tensors.len());
             for (ti, t) in component.tensors.iter().enumerate() {
                 let key = &t.key;
@@ -286,6 +270,13 @@ impl Header {
                         header.check(&rooms, loc, &t.dtype, &t.shape, || format!("{name}/{key}"))?
                     }
                     Body::Encoded { encoding, parts } => {
+                        // The logical size is a format constraint, even for an unknown scheme.
+                        if t.dtype.bits().is_some() && t.dtype.byte_len(&t.shape).is_none() {
+                            return invalid(format!(
+                                "{name}/{key}: {} {:?} overflows or is not whole bytes",
+                                t.dtype, t.shape
+                            ));
+                        }
                         if encoding.scheme.is_empty() || parts.is_empty() {
                             return invalid(format!("{name}/{key}: no scheme or no parts"));
                         }
@@ -319,9 +310,40 @@ impl Header {
         cbor::write(self)
     }
 
+    /// What `model_index.json` held; `None` for a checkpoint of one model.
+    pub fn pipeline(&self) -> Option<&Pipeline> {
+        self.pipeline.as_ref()
+    }
+
     /// The components, in construction order.
     pub fn components(&self) -> &[Component] {
         &self.components
+    }
+
+    /// Every component's assets: (component, asset path, object).
+    pub fn assets(&self) -> impl Iterator<Item = (&str, &str, &ObjectRef)> {
+        self.components.iter().flat_map(|c| {
+            (c.assets.iter()).map(move |(path, r)| (c.name.as_str(), path.as_str(), r))
+        })
+    }
+
+    /// The header's closure besides itself: its chunks, then every component's assets.
+    pub fn objects(&self) -> impl Iterator<Item = &ObjectRef> {
+        self.chunks.iter().chain(self.assets().map(|(_, _, r)| r))
+    }
+
+    /// The distinct encodings, in order of first citation by the tensors (the header's table).
+    pub fn encodings(&self) -> Vec<&Encoding> {
+        let mut out: Vec<&Encoding> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (_, t) in self.tensors() {
+            if let Body::Encoded { encoding, .. } = &t.body {
+                if seen.insert(encoding) {
+                    out.push(encoding);
+                }
+            }
+        }
+        out
     }
 
     pub fn component(&self, name: &str) -> Option<&Component> {
@@ -475,119 +497,11 @@ impl Header {
     }
 }
 
-/// `refs/<org>/<name>.json`, ASCII-lowercased: repo names are case-insensitive, one identity.
-pub fn repo_key(name: &str) -> String {
-    format!("refs/{}.json", name.to_ascii_lowercase())
-}
-
-/// `tensorfs.repo/1`: a model's releases, each mapping lanes to manifests, and its unreleased
-/// checkpoints. Kept at [`repo_key`]; releases are in publication order.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(try_from = "RepoWire", into = "RepoWire")]
-pub struct Repo {
-    pub name: String,
-    pub releases: Vec<Release>,
-    /// Uploaded checkpoints no release cites yet. GC roots, like release lanes.
-    pub checkpoints: Vec<ObjectRef>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct Release {
-    pub version: String,
-    pub lanes: BTreeMap<String, ObjectRef>,
-    /// Skipped by an unversioned lookup; an explicit version still resolves it.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub yanked: bool,
-    /// The release's expected-revision counter: each change to it increments this.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub revision: u64,
-}
-
-fn is_false(b: &bool) -> bool {
-    !b
-}
-
-fn is_zero(n: &u64) -> bool {
-    *n == 0
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct RepoWire {
-    format: String,
-    name: String,
-    releases: Vec<Release>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    checkpoints: Vec<ObjectRef>,
-}
-
-impl TryFrom<RepoWire> for Repo {
-    type Error = Error;
-    fn try_from(w: RepoWire) -> Result<Self> {
-        check_format(&w.format, REPO_FORMAT)?;
-        match w.name.split_once('/') {
-            Some((org, name)) if segment(org) && segment(name) => {}
-            _ => return invalid(format!("repo name {:?} is not <org>/<name>", w.name)),
-        }
-        let mut seen = std::collections::HashSet::new();
-        for r in &w.releases {
-            if r.version.is_empty() || !seen.insert(&r.version) {
-                return invalid(format!(
-                    "release version {:?} is empty or repeated",
-                    r.version
-                ));
-            }
-            if r.lanes.keys().any(String::is_empty) {
-                return invalid(format!("release {:?} has an empty lane name", r.version));
-            }
-        }
-        Ok(Repo {
-            name: w.name,
-            releases: w.releases,
-            checkpoints: w.checkpoints,
-        })
-    }
-}
-
-impl From<Repo> for RepoWire {
-    fn from(r: Repo) -> Self {
-        RepoWire {
-            format: REPO_FORMAT.into(),
-            name: r.name,
-            releases: r.releases,
-            checkpoints: r.checkpoints,
-        }
-    }
-}
-
-impl Repo {
-    pub fn from_json(bytes: &[u8]) -> Result<Repo> {
-        json::read(bytes, REPO_FORMAT)
-    }
-    pub fn to_json(&self) -> Result<Vec<u8>> {
-        json::write(self)
-    }
-    /// The repo's key in a store or static origin: [`repo_key`] of its name.
-    pub fn key(&self) -> String {
-        repo_key(&self.name)
-    }
-    /// Release `version`, yanked or not; with `None`, the newest release that is not yanked.
-    pub fn release(&self, version: Option<&str>) -> Option<&Release> {
-        match version {
-            Some(v) => self.releases.iter().find(|r| r.version == v),
-            None => self.releases.iter().rev().find(|r| !r.yanked),
-        }
-    }
-    /// A lane's manifest in [`Repo::release`]`(version)`.
-    pub fn lane(&self, version: Option<&str>, lane: &str) -> Option<&ObjectRef> {
-        self.release(version)?.lanes.get(lane)
-    }
-    /// Every manifest the repo keeps alive: each release's lanes (yanked too) and each checkpoint.
-    pub fn roots(&self) -> impl Iterator<Item = &ObjectRef> {
-        let lanes = self.releases.iter().flat_map(|r| r.lanes.values());
-        lanes.chain(&self.checkpoints)
-    }
-}
-
-fn segment(s: &str) -> bool {
+pub(super) fn segment(s: &str) -> bool {
     !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0'])
+}
+
+/// One or more segments joined by `/`.
+pub(super) fn path(s: &str) -> bool {
+    s.split('/').all(segment)
 }

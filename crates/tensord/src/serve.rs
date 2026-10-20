@@ -87,6 +87,7 @@ fn run(lifetime: Lifetime, service_ready: Option<u64>) -> io::Result<()> {
     update::retire_agent(&paths);
     #[cfg(unix)]
     let ready = supervise::supervise(&paths, grant.provider.clone())?;
+    config.gpu_memory_limit = config::gpu_memory_limit()?;
     run_machine(config, ready)
 }
 
@@ -109,17 +110,15 @@ fn hold_handed_descriptors() {
     }
 }
 
-/// The machine's one async runtime: its API, its lifecycle and TensorFS's transport, where every
-/// object request in flight is a task, never a thread. Made in the service, after the stable
-/// parent's fork and before anything fetches.
+/// The machine's async runtime: its API and its lifecycle, where every request in flight is a
+/// task, never a thread. Made in the service, after the stable parent's fork. TensorFS fetches
+/// on its own runtime (`fetch::runtime`).
 fn machine_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     if let Some(runtime) = RUNTIME.get() {
         return Ok(runtime);
     }
-    // The API's two threads and the transport's two, together.
-    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).thread_name("tensord").enable_all().build()?;
-    tensorfs::transport::use_runtime(runtime.handle().clone());
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("tensord").enable_all().build()?;
     Ok(RUNTIME.get_or_init(|| runtime))
 }
 
@@ -171,7 +170,7 @@ pub fn dev(args: Dev) -> io::Result<()> {
         Some(config) => crate::gpu_service::GpuConfig::load(&config)?,
         None => crate::gpu_service::GpuConfig::deviceless(&root.join("cpu").join("home"))?,
     };
-    service.configure_pool(crate::gpu_service::Pool::new(&root.join("gpu"), pool, store.clone())?)?;
+    service.configure_pool_on(crate::gpu_service::Pool::new(&root.join("gpu"), pool, store.clone())?, machine_runtime()?.handle())?;
     // A Runtime wheel named here is the operator's choice, as an update's `--runtime-wheel` is: it
     // runs every package whatever the package's bounds on the pair.
     let runtime_build = (args.package_sdk.iter())
@@ -246,7 +245,7 @@ pub fn version() -> io::Result<()> {
 /// Runs the machine from its grant: identity and readiness under the machine root, the engine
 /// under `var/lib/cozy/tensord`, the API on the granted port.
 fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Ready) -> io::Result<()> {
-    let config::Config { mut grant, visible_devices, endpoint, logs, .. } = config;
+    let config::Config { mut grant, visible_devices, gpu_memory_limit, endpoint, logs, .. } = config;
     let runtime = machine_runtime()?;
     use crate::machine::{identity, receipt};
     let layout = grant.layout.clone();
@@ -282,10 +281,6 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
     let engine = layout.engine();
     identity.store = Some(layout.store.clone());
     let generations = engine.join("generations");
-    // A rental's own store only: never the datacenter volume or an operator-named root.
-    if rental && layout.own_store() {
-        crate::storage::drop_pre_cut(&layout.store)?;
-    }
     let (_owned, store) = own(&engine, &layout.store)?;
     // The machine's one downloader, held for its life: it reads the datacenter volume before the
     // Hub and fills it. A variable naming no mount point (the volume was not delivered) is none.
@@ -333,6 +328,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
         gpus.clear();
     }
     identity.gpus = gpus.clone();
+    identity.gpu_memory_limit = gpu_memory_limit;
     {
         let devices: Vec<String> = gpus.iter().map(|g| g.device_index.to_string()).collect();
         let home = engine.join("executor-home");
@@ -341,6 +337,7 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
             "devices": devices.join(","),
             "inventory": gpus,
             "authorized_device_limit_bytes": null,
+            "gpu_memory_limit": gpu_memory_limit,
             "environment": {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": home, "COZY_HOME": home},
             // A rented pod is the machine's alone (its grant says so); anywhere else it is a guest.
             "host": {"mode": if rental { "dedicated" } else { "shared" }},
@@ -353,14 +350,16 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
                 serde_json::from_reader(file).map_err(io::Error::other)?;
             config.as_object_mut().expect("an object").extend(settings);
         }
+        // The persistent machine setting wins over an older GPU-settings file.
+        config["gpu_memory_limit"] = serde_json::json!(gpu_memory_limit);
         let config: crate::gpu_service::GpuConfig =
             serde_json::from_value(config).map_err(io::Error::other)?;
         let store = store.clone();
-        service.configure_pool(crate::gpu_service::Pool::new(
+        service.configure_pool_on(crate::gpu_service::Pool::new(
             &engine.join("gpu"),
             config,
             store,
-        )?)?;
+        )?, machine_runtime()?.handle())?;
     }
     if let Some(hub) = grant.hub.clone().filter(|_| rental) {
         identity.hubs = vec![(hub.origin.clone(), hub.worker_id.clone())];
@@ -497,30 +496,19 @@ fn start_api(
         }
         _ => None,
     };
-    let objects = Arc::new(crate::objects::Objects::new(
-        &root.join("writes"),
-        store.clone(),
-        service.engine.clone(),
-    )?);
+    let objects = Arc::new(crate::objects::Objects::new(&root.join("writes"), service.engine.clone())?);
     service.engine.hold_memos(&objects);
-    // The leaf the CLI pins is the key a run's capability names (th-241).
-    let leaf = crate::hub::Leaf::from_pem(&identity.key_pem).map_err(|e| io::Error::other(e.0))?;
     backend.runs = Some(Arc::new(crate::runs::Runs {
         service: service.clone(),
         objects: objects.clone(),
         publisher: backend.publisher.clone(),
         local: backend.installer.clone().map(|installer| {
-            Arc::new(crate::local_source::LocalSources::new(
-                objects,
-                installer,
-                store.clone(),
-            ))
+            Arc::new(crate::local_source::LocalSources::new(objects, installer))
         }),
         own_hub: own_hub
-            .map(|hub| crate::hub::Source::new(&hub.origin, hub.ca_der, hub.object_hosts, None))
+            .map(|hub| crate::hub::Source::new(&hub.origin, hub.ca_der, None))
             .transpose()
             .map_err(|e| io::Error::other(e.0))?,
-        leaf: Some(Arc::new(leaf)),
         contexts: Default::default(),
     }));
     crate::calls::Calls::configure(service, machine.clone(), backend.runs.as_ref())?;

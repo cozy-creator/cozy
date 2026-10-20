@@ -73,7 +73,7 @@ fn open(root: &Path, tools: &Tools) -> Machine {
     let service = Service::open(&state, &root.join("generations"), 1).unwrap();
     let store = tensord::storage::open(&state.join("tensorfs")).unwrap();
     let objects =
-        Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
+        Arc::new(Objects::new(&root.join("writes"), service.engine.clone()).unwrap());
     service.engine.hold_memos(&objects);
     let local = LocalSources::new(
         objects.clone(),
@@ -91,7 +91,6 @@ fn open(root: &Path, tools: &Tools) -> Machine {
             uv: "uv".into(),
             seed_cache: None,
         },
-        store.clone(),
     );
     let runs = Arc::new(Runs {
         service: service.clone(),
@@ -99,7 +98,7 @@ fn open(root: &Path, tools: &Tools) -> Machine {
         publisher: None,
         local: Some(Arc::new(local)),
         own_hub: None,
-        leaf: None,
+       
         contexts: Default::default(),
     });
     let config = GpuConfig::deviceless(&root.join("home")).unwrap();
@@ -170,6 +169,7 @@ fn film(manifest: &str, reference: &(String, u64), segments: &[&str], hold_at: i
         bits: 0,
         hub: None,
         providers: Default::default(),
+            tensorfs: None,
         weights_destination: String::new(),
         owner: ACTOR.into(),
         catalog_revision: String::new(),

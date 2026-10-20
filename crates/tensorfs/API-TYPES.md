@@ -1,8 +1,7 @@
-# Rust API declarations for review
+# Rust API declarations
 
-Temporary review copy of the concrete planned TensorFS 0.13 interface. Implementation is
-in progress; declarations omit bodies and are not a standalone compilable module.
-For normal development, use the [Rust usage guide](API.md).
+The public declarations of the `tensorfs` crate, without bodies. For usage, see the
+[Rust guide](API.md).
 
 ## Client, selection and returned objects
 
@@ -104,12 +103,15 @@ impl Checkpoint {
     pub fn variant(&self) -> Option<&str>;
     pub fn tree(&self) -> Option<&ObjectRef>;
     pub fn verify(&self, selection: &Selection) -> Result<VerificationReport>;
-    pub fn view(&self) -> io::view::View;
+    // Placement (varena): stored spans of named regions, a part's stored dtype/shape, and a
+    // read-engine source that fetches absent chunks on the process runtime.
+    pub fn spans(&self, regions: &[Vec<String>]) -> Result<Vec<io::Span>>;
+    pub fn stored_part(&self, name: &str) -> Option<io::StoredPart>;
+    pub fn source(&self, direct_io: bool) -> io::source::Source;
     pub fn named(&self) -> Option<&Ref>;
     pub fn pipeline(&self) -> Option<&format::Pipeline>;
     pub fn components(&self) -> &[Component];
     pub fn component(&self, name: &str) -> Result<&Component>;
-    pub fn chunk(&self, index: usize) -> Result<File>;
     pub fn missing(&self, selection: &Selection) -> Result<Vec<ObjectRef>>;
     pub async fn download(&self, want: &Download<'_>) -> Result<Fetched>;
     // Cozytensors requires None; Safetensors accepts F32/BF16/F16 when Some.
@@ -127,13 +129,24 @@ impl Component {
     pub fn name(&self) -> &str;
     pub fn class(&self) -> &str;
     pub fn config(&self) -> &format::Config;
+    pub fn config_file(&self) -> &str; // the config's export name; config.json by default
     pub fn tensors(&self) -> &[format::Tensor];
     pub fn assets(&self) -> &BTreeMap<String, ObjectRef>;
-    pub fn read(&self, key: &str) -> Result<Vec<u8>>;
-    pub fn read_part_into(&self, key: &str, role: &str, offset: u64, buf: &mut [u8]) -> Result<()>;
+    // Stored bytes (Python's decode=False); read_decoded is decode=True.
+    pub fn read(&self, key: &str) -> Result<Read>;
+    pub fn read_decoded(&self, key: &str) -> Result<Vec<u8>>;
+    // An encoded tensor with neither role nor decode returns Invalid, naming its roles.
+    pub fn read_into(&self, key: &str, out: &mut [u8], options: &ReadInto<'_>) -> Result<()>;
     pub fn asset(&self, name: &str) -> Result<Vec<u8>>;
-    pub fn export_files(&self, directory: &Path) -> Result<PathBuf>;
+    // None: a folder the cache manages and evicts like its other entries.
+    pub fn export_files(&self, directory: Option<&Path>) -> Result<PathBuf>;
 }
+pub enum Read {
+    Plain(Vec<u8>),
+    Encoded { dtype: Dtype, shape: Vec<u64>, encoding: Encoding, parts: BTreeMap<String, Vec<u8>> },
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadInto<'a> { pub role: Option<&'a str>, pub decode: bool, pub offset: u64 }
 // Tensors selects every part of each named key. Part selects the chunks overlapping
 // its stored byte range. Invalid names, roles and ranges return Failure.
 // A selected snapshot contains only the requested objects, even when others are cached.
@@ -170,21 +183,6 @@ pub trait TokenProvider: Send + Sync {
 }
 pub fn bearer(token: impl Into<String>) -> Arc<dyn TokenProvider>;
 
-pub struct JwtBearer {
-    pub token_endpoint: String,
-    pub client_id: String,
-    pub resource: String,
-    pub claims: serde_json::Map<String, serde_json::Value>,
-}
-#[derive(Clone)]
-pub struct DPoP { /* shared native token state */ }
-impl DPoP {
-    pub fn grant(config: &Config, key: &str, grant: JwtBearer) -> Result<Self>;
-    pub fn token(key: &str, access_token: &str, resource: Option<&str>,
-        endpoint: Option<&str>) -> Result<Self>;
-    pub async fn issued_token(&self) -> Option<String>;
-}
-// DPoP implements TokenProvider. key is a private P-256 JWK.
 ```
 
 ## Conversion, writers and export
@@ -203,18 +201,20 @@ impl Client {
 }
 #[derive(Default)]
 pub struct WriterOptions<'a> {
-    // Exact header-file path, or None for a checkpoint in the shared store.
-    // A file destination cannot be combined with variant or repo_id.
+    // Exact header-file path, or None for a checkpoint in the shared store. The file is a
+    // handle into the store, rooting its data while it holds this header.
+    // dest and repo_id exclude each other; variant needs repo_id.
     pub dest: Option<&'a Path>, pub variant: Option<&'a str>,
     pub base: Option<&'a Checkpoint>, pub resume: Option<&'a str>,
     pub repo_id: Option<&'a str>, pub endpoint: Option<&'a str>,
-    pub token: Option<Arc<dyn TokenProvider>>, pub ca_der: Option<&'a [u8]>,
+    pub token: Option<Arc<dyn TokenProvider>>,
 }
 pub struct Writer { /* owned local and optional remote write state */ }
 impl Writer {
     pub fn pipeline(&mut self, class: &str, config: format::Config) -> Result<()>;
-    pub fn component(&mut self, name: &str, class: &str,
-        config: format::Config) -> Result<ComponentWriter<'_>>;
+    // config_file: the file the config exports as; None keeps a reopened or base one's.
+    pub fn component(&mut self, name: &str, class: &str, config: format::Config,
+        config_file: Option<&str>) -> Result<ComponentWriter<'_>>;
     // Reopen a declared component without changing its class or config.
     pub fn component_writer(&mut self, name: &str) -> Result<ComponentWriter<'_>>;
     pub fn set_metadata(&mut self, key: &str, value: Value) -> Result<()>;
@@ -254,9 +254,8 @@ pub mod raw {
 
 ## Advanced resident-buffer decoding
 
-Source-reviewed target at Rust wrapper `5fc6f2320b803212037de90e38fe0d0ce0e10d9f`.
-Combined native and GPU acceptance remains pending. These declarations extend the same
-`raw` module above; they do not add a second codec or byte engine.
+These declarations extend the same `raw` module above; they add no second codec or byte
+engine.
 
 ```rust
 // tensorfs::format::decode

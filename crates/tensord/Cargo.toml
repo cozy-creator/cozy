@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 serde_json_canonicalizer.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 fs2.workspace = true
 libc.workspace = true
 self-replace.workspace = true
@@ -51,10 +52,6 @@ time.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
-
-[features]
-# Dev builds only (xs-045 U12): migration runs (src/migrate.rs). Never in a release.
-migrate = ["protocol/migrate"]
 
 [dev-dependencies]
 tower.workspace = true

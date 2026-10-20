@@ -2,10 +2,11 @@
 //! tensor in blocks scaled by their absmax (itself 8-bit codes with `double_quant`), and LLM.int8()
 //! rows.
 
-use super::affine::{Codes, Fill, Order, Packing};
+use super::affine::{Codes, Fill, Order, Packing, BYTES, SIGNED_BYTES};
 use super::grid::{Grid, ScaleLayout};
-use super::{logical, one, table, Allowed, Ctx, Dtypes, Param, Part, Scheme, Shape, View};
-use crate::format::Result;
+use super::plan::{self, Elems, Post};
+use super::{logical, one, Allowed, Ctx, Dtypes, Param, Part, Plan, Scheme, Shape, View};
+use crate::format::{Dtype, Result};
 
 /// Appendix A.3: NF4.
 pub const NF4_MAP: [f32; 16] = [
@@ -121,7 +122,7 @@ fn blocks(c: &Ctx) -> usize {
     c.cols.div_ceil(c.uint("block_size"))
 }
 
-fn run(size: usize) -> Grid<'static> {
+fn run(size: usize) -> Grid {
     Grid::Blocks {
         size,
         layout: ScaleLayout::RowMajor,
@@ -131,7 +132,7 @@ fn run(size: usize) -> Grid<'static> {
 
 /// `map[q] × s_b`, `s_b` the absmax of the code's block, or with `double_quant`
 /// `(nested_quant_map[c_b] × nested_absmax[⌊b/256⌋]) + nested_offset`.
-fn four_bit(c: &Ctx, map: &[f32; 16]) -> Result<Vec<f32>> {
+fn four_bit<'a>(c: &Ctx<'a>, map: &[f32; 16]) -> Result<Plan<'a>> {
     let dq = c.flag("double_quant");
     if c.part("absmax").dtype.name() != if dq { "U8" } else { "F32" } {
         return Err(c.fail("absmax is U8 codes exactly when double_quant"));
@@ -144,30 +145,57 @@ fn four_bit(c: &Ctx, map: &[f32; 16]) -> Result<Vec<f32>> {
     if nested.iter().any(|r| c.has(r) != dq) {
         return Err(c.fail("the nested parts are present exactly when double_quant"));
     }
-    let absmax = if dq {
-        let codes = table::bytes(c.part("absmax").bytes);
-        let (nested, scale) = (c.floats("nested_quant_map"), c.floats("nested_absmax"));
+    let mut absmax = Elems::part(c.part("absmax"));
+    if dq {
+        let codes = plan::Codes {
+            table: Some(c.floats("nested_quant_map")),
+            ..plan::Codes::new(
+                absmax.bytes.host()?,
+                BYTES,
+                c.part("nested_absmax"),
+                run(NESTED),
+            )
+        };
         let offset = c.floats("nested_offset")[0];
-        let s = table::decode(&codes, &nested, &scale, &run(NESTED), 1, blocks(c))?;
-        s.into_iter().map(|v| v + offset).collect()
-    } else {
-        c.floats("absmax")
-    };
-    let q = NIBBLES.unpack(c.part("weight").bytes, 1, c.cols)?;
-    table::decode(&q, map, &absmax, &run(c.uint("block_size")), 1, c.cols)
+        let s = Plan::from(codes).values(1, blocks(c), 1)?;
+        let bytes = s
+            .into_iter()
+            .flat_map(|v| (v + offset).to_le_bytes())
+            .collect::<Vec<u8>>();
+        absmax = Elems {
+            dtype: Dtype::F32,
+            bytes: bytes.into(),
+        };
+    }
+    Ok(plan::Codes {
+        table: Some(map.to_vec()),
+        scale: absmax,
+        ..plan::Codes::new(
+            c.part("weight").bytes,
+            NIBBLES,
+            c.part("absmax"),
+            run(c.uint("block_size")),
+        )
+    }
+    .into())
 }
 
 /// `(q × SCB[i]) × r`, `r` the f32 nearest 1/127: bitsandbytes multiplies by it.
-fn int8(c: &Ctx) -> Result<Vec<f32>> {
+fn int8<'a>(c: &Ctx<'a>) -> Result<Plan<'a>> {
     if c.shape.len() != 2 {
         return Err(c.fail(format!("shape {:?} is not [N, K]", c.shape)));
     }
     if c.has("weight_format") && c.part("weight_format").bytes != [0] {
         return Err(c.fail("weight_format is not 0 (row-major)"));
     }
-    let (scb, r) = (c.floats("SCB"), f32::from_bits(R127));
-    let w = c.part("weight").bytes;
-    Ok((w.iter().enumerate())
-        .map(|(k, q)| (*q as i8 as f32 * scb[k / c.cols]) * r)
-        .collect())
+    let codes = plan::Codes::new(
+        c.part("weight").bytes,
+        SIGNED_BYTES,
+        c.part("SCB"),
+        Grid::Row,
+    );
+    Ok(Plan {
+        post: Post::One(Elems::f32(f32::from_bits(R127))),
+        ..codes.into()
+    })
 }

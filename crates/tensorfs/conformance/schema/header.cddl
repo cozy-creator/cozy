@@ -1,14 +1,16 @@
 ; cozytensors header (spec §4, §9): RFC 8949 core deterministic CBOR.
 ; Definite lengths, shortest heads, map keys in bytewise order of their encodings.
-; No tags, floats, null, undefined or simple values besides true and false.
+; No tags, undefined or simple values besides true and false; floats (finite, the shortest
+; of half, single and double that holds the value) and null only in configs.
 ; A reader skips trailing elements (`* any`) of the root and of every record: later
 ; versions only append fields.
 
-header     = [format: tstr, chunks: [* chunk], encodings: [* encoding],
+header     = [format: tstr, chunks: [* object], encodings: [* encoding], pipeline: pipeline,
               components: [* component], metadata: {* tstr => value}, * any]
-; format: "cozytensors/1" or "cozytensors/1.<minor>"; a reader takes any minor.
+; format: "cozytensors/1" or "cozytensors/1.<minor>"; a reader takes any minor. A root of
+; exactly five elements is a pre-cut layout, refused as such.
 
-chunk      = [sha256: bstr .size 32, length: uint, * any]
+object     = [sha256: bstr .size 32, length: uint, * any]
 
 encoding   = [scheme: tstr .size (1..), params: {* tstr => value}, * any]
 ; Each distinct [scheme, params] once, in order of first citation. The scheme and its
@@ -17,9 +19,19 @@ encoding   = [scheme: tstr .size (1..), params: {* tstr => value}, * any]
 ; repeats a part's dtype and disagrees with it. A scale whose dtype the scheme leaves free
 ; (tensorwise, rowwise, convrot) names it in scale_dtype: "F32", "BF16" or "F16".
 
-component  = [name: tstr, tensors: [* tensor], * any]
+pipeline   = [] / [class: tstr, config: config, * any]
+; What model_index.json held. class is "<library>.<Class>", or "" when unknown.
+
+component  = [name: tstr, class: tstr, config: config, tensors: [* tensor],
+              assets: {* tstr => object}, ? (config_file: tstr, * any)]
 ; name is one path segment (non-empty, not "." or "..", no "/", "\" or NUL), unique.
+; config_file is a path, present only when not "config.json" or when later fields follow.
+; Asset keys are paths relative to the component's folder, never the config's file name.
 ; Components, tensors and parts are in construction order and never sorted.
+
+config     = {* tstr => config-value}
+config-value = bool / int / tstr / float / null / [* config-value] / {* tstr => config-value}
+; A config is parsed JSON: its floats are finite.
 
 tensor     = plain / encoded
 plain      = [key: tstr, dtype, shape, 0, location, * any]

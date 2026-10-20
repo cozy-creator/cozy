@@ -1,0 +1,6264 @@
+[
+ {
+  "configs": {
+   "scheduler": {
+    "_class_name": "EulerDiscreteScheduler",
+    "_diffusers_version": "0.19.0.dev0",
+    "beta_end": 0.012,
+    "beta_schedule": "scaled_linear",
+    "beta_start": 0.00085,
+    "clip_sample": false,
+    "interpolation_type": "linear",
+    "num_train_timesteps": 1000,
+    "prediction_type": "epsilon",
+    "sample_max_value": 1,
+    "set_alpha_to_one": false,
+    "skip_prk_steps": true,
+    "steps_offset": 1,
+    "timestep_spacing": "leading",
+    "trained_betas": null,
+    "use_karras_sigmas": false
+   },
+   "text_encoder": {
+    "architectures": [
+     "CLIPTextModel"
+    ],
+    "attention_dropout": 0,
+    "bos_token_id": 0,
+    "dropout": 0,
+    "eos_token_id": 2,
+    "hidden_act": "quick_gelu",
+    "hidden_size": 768,
+    "initializer_factor": 1,
+    "initializer_range": 0.02,
+    "intermediate_size": 3072,
+    "layer_norm_eps": 1e-05,
+    "max_position_embeddings": 77,
+    "model_type": "clip_text_model",
+    "num_attention_heads": 12,
+    "num_hidden_layers": 12,
+    "pad_token_id": 1,
+    "projection_dim": 768,
+    "torch_dtype": "float16",
+    "transformers_version": "4.32.0.dev0",
+    "vocab_size": 49408
+   },
+   "text_encoder_2": {
+    "architectures": [
+     "CLIPTextModelWithProjection"
+    ],
+    "attention_dropout": 0,
+    "bos_token_id": 0,
+    "dropout": 0,
+    "eos_token_id": 2,
+    "hidden_act": "gelu",
+    "hidden_size": 1280,
+    "initializer_factor": 1,
+    "initializer_range": 0.02,
+    "intermediate_size": 5120,
+    "layer_norm_eps": 1e-05,
+    "max_position_embeddings": 77,
+    "model_type": "clip_text_model",
+    "num_attention_heads": 20,
+    "num_hidden_layers": 32,
+    "pad_token_id": 1,
+    "projection_dim": 1280,
+    "torch_dtype": "float16",
+    "transformers_version": "4.32.0.dev0",
+    "vocab_size": 49408
+   },
+   "unet": {
+    "_class_name": "UNet2DConditionModel",
+    "_diffusers_version": "0.19.0.dev0",
+    "act_fn": "silu",
+    "addition_embed_type": "text_time",
+    "addition_embed_type_num_heads": 64,
+    "addition_time_embed_dim": 256,
+    "attention_head_dim": [
+     5,
+     10,
+     20
+    ],
+    "block_out_channels": [
+     320,
+     640,
+     1280
+    ],
+    "center_input_sample": false,
+    "class_embed_type": null,
+    "class_embeddings_concat": false,
+    "conv_in_kernel": 3,
+    "conv_out_kernel": 3,
+    "cross_attention_dim": 2048,
+    "cross_attention_norm": null,
+    "down_block_types": [
+     "DownBlock2D",
+     "CrossAttnDownBlock2D",
+     "CrossAttnDownBlock2D"
+    ],
+    "downsample_padding": 1,
+    "dual_cross_attention": false,
+    "encoder_hid_dim": null,
+    "encoder_hid_dim_type": null,
+    "flip_sin_to_cos": true,
+    "freq_shift": 0,
+    "in_channels": 4,
+    "layers_per_block": 2,
+    "mid_block_only_cross_attention": null,
+    "mid_block_scale_factor": 1,
+    "mid_block_type": "UNetMidBlock2DCrossAttn",
+    "norm_eps": 1e-05,
+    "norm_num_groups": 32,
+    "num_attention_heads": null,
+    "num_class_embeds": null,
+    "only_cross_attention": false,
+    "out_channels": 4,
+    "projection_class_embeddings_input_dim": 2816,
+    "resnet_out_scale_factor": 1,
+    "resnet_skip_time_act": false,
+    "resnet_time_scale_shift": "default",
+    "sample_size": 128,
+    "time_cond_proj_dim": null,
+    "time_embedding_act_fn": null,
+    "time_embedding_dim": null,
+    "time_embedding_type": "positional",
+    "timestep_post_act": null,
+    "transformer_layers_per_block": [
+     1,
+     2,
+     10
+    ],
+    "up_block_types": [
+     "CrossAttnUpBlock2D",
+     "CrossAttnUpBlock2D",
+     "UpBlock2D"
+    ],
+    "upcast_attention": null,
+    "use_linear_projection": true
+   },
+   "vae": {
+    "_class_name": "AutoencoderKL",
+    "_diffusers_version": "0.20.0.dev0",
+    "act_fn": "silu",
+    "block_out_channels": [
+     128,
+     256,
+     512,
+     512
+    ],
+    "down_block_types": [
+     "DownEncoderBlock2D",
+     "DownEncoderBlock2D",
+     "DownEncoderBlock2D",
+     "DownEncoderBlock2D"
+    ],
+    "force_upcast": true,
+    "in_channels": 3,
+    "latent_channels": 4,
+    "layers_per_block": 2,
+    "norm_num_groups": 32,
+    "out_channels": 3,
+    "sample_size": 1024,
+    "scaling_factor": 0.13025,
+    "up_block_types": [
+     "UpDecoderBlock2D",
+     "UpDecoderBlock2D",
+     "UpDecoderBlock2D",
+     "UpDecoderBlock2D"
+    ]
+   }
+  },
+  "manifest": {
+   "length": 164,
+   "sha256": "67e2348fdbe6ef5744ee71288c8526eca715e1975c0c77fe11c1e04ed00090da"
+  },
+  "name": "paul/d1-gate5-sdxl-b",
+  "parts": [
+   "4a3164d0d0465cd624f805c01e03aede29934509481259543a9baad1c0d57fdd",
+   "786f2f65b17850eafa82f344afc729b59eb80aff2f7846a8a6f41ff1ec229001",
+   "800bad821678663f06f408afcff97b64517b6e2746213d4391c0f28de41683c1",
+   "8ce49c09f40487d285179fa6404b486743ca19e0c9dc76422e9b03f484a5402b",
+   "a2b0538dd45a33eca66f0629e2a6fd194d3f88233d65118c49b68629ce95118b",
+   "b4fa672bb65e0fd06e8f7d1b0297a426b97ec9884e76afba8fcfa5ad9818c3d8"
+  ],
+  "tensors": [
+   "vae/decoder.up_blocks.2.resnets.0.conv1.bias",
+   "vae/decoder.up_blocks.2.resnets.0.conv2.bias",
+   "vae/decoder.conv_out.bias",
+   "unet/conv_out.bias",
+   "unet/down_blocks.0.resnets.0.time_emb_proj.weight"
+  ]
+ },
+ {
+  "configs": {
+   "model": {
+    "fixture": "h3-cp-producer-lifecycle/1",
+    "head_dim": 128,
+    "heads": 2,
+    "hidden_size": 128
+   }
+  },
+  "manifest": {
+   "length": 162,
+   "sha256": "2d1bcbc7a5db58b1fccd03291646008b7baf7f1a90b90a8ab634275a7466d900"
+  },
+  "name": "acme/v1-h3-tiny",
+  "parts": [
+   "1ede9ebfa1ad011b89a3e3df648a958674d64afa0726d98858a68b8a4da14ee0",
+   "66564fbad73bf143b7ee937e2a21b045f6813d64dcc08b04a3fd73d1327f9e9e",
+   "b7cf3e07fbb06babdadacd81e478a64541ec736bb0aa9ff09bcc3ba5bda8236a"
+  ],
+  "tensors": [
+   "dit/transformer_blocks.0.attn.to_k.weight",
+   "dit/transformer_blocks.0.attn.to_out.0.weight",
+   "dit/transformer_blocks.0.attn.norm_k.weight",
+   "dit/transformer_blocks.0.attn.norm_q.weight"
+  ]
+ },
+ {
+  "configs": {},
+  "manifest": {
+   "length": 161,
+   "sha256": "91c677ff6c1f8e35a782cfd88b372c017c8858433270c62c51f62ba5d5e1543e"
+  },
+  "name": "acme/v1-object",
+  "parts": [
+   "b9e8b63a06482ba7c2ab3193a931c8ef41e1a656028b068f0a747b1a4417a972"
+  ],
+  "tensors": [
+   "model/weight"
+  ]
+ },
+ {
+  "configs": {
+   "normalization": {
+    "converter": "identity/1",
+    "dialect": "safetensors",
+    "state": "raw"
+   }
+  },
+  "manifest": {
+   "length": 161,
+   "sha256": "c27358fab58c882c6a6ed43fb61778cfe31735e349da0b53cc540a83a0b6e280"
+  },
+  "name": "acme/v1-inline",
+  "parts": [
+   "fe2c378962118dff1b9b78dcdb81f5f4a190b62ec2d7a80ddd0f132c25931910"
+  ],
+  "tensors": [
+   "model/weight"
+  ]
+ },
+ {
+  "configs": {
+   "scheduler": {
+    "_class_name": "EulerDiscreteScheduler",
+    "_diffusers_version": "0.19.0.dev0",
+    "beta_end": 0.012,
+    "beta_schedule": "scaled_linear",
+    "beta_start": 0.00085,
+    "clip_sample": false,
+    "interpolation_type": "linear",
+    "num_train_timesteps": 1000,
+    "prediction_type": "epsilon",
+    "sample_max_value": 1,
+    "set_alpha_to_one": false,
+    "skip_prk_steps": true,
+    "steps_offset": 1,
+    "timestep_spacing": "leading",
+    "trained_betas": null,
+    "use_karras_sigmas": false
+   },
+   "text_encoder": {
+    "architectures": [
+     "CLIPTextModel"
+    ],
+    "attention_dropout": 0,
+    "bos_token_id": 0,
+    "dropout": 0,
+    "eos_token_id": 2,
+    "hidden_act": "quick_gelu",
+    "hidden_size": 768,
+    "initializer_factor": 1,
+    "initializer_range": 0.02,
+    "intermediate_size": 3072,
+    "layer_norm_eps": 1e-05,
+    "max_position_embeddings": 77,
+    "model_type": "clip_text_model",
+    "num_attention_heads": 12,
+    "num_hidden_layers": 12,
+    "pad_token_id": 1,
+    "projection_dim": 768,
+    "torch_dtype": "float16",
+    "transformers_version": "4.32.0.dev0",
+    "vocab_size": 49408
+   },
+   "text_encoder_2": {
+    "architectures": [
+     "CLIPTextModelWithProjection"
+    ],
+    "attention_dropout": 0,
+    "bos_token_id": 0,
+    "dropout": 0,
+    "eos_token_id": 2,
+    "hidden_act": "gelu",
+    "hidden_size": 1280,
+    "initializer_factor": 1,
+    "initializer_range": 0.02,
+    "intermediate_size": 5120,
+    "layer_norm_eps": 1e-05,
+    "max_position_embeddings": 77,
+    "model_type": "clip_text_model",
+    "num_attention_heads": 20,
+    "num_hidden_layers": 32,
+    "pad_token_id": 1,
+    "projection_dim": 1280,
+    "torch_dtype": "float16",
+    "transformers_version": "4.32.0.dev0",
+    "vocab_size": 49408
+   },
+   "unet": {
+    "_class_name": "UNet2DConditionModel",
+    "_diffusers_version": "0.19.0.dev0",
+    "act_fn": "silu",
+    "addition_embed_type": "text_time",
+    "addition_embed_type_num_heads": 64,
+    "addition_time_embed_dim": 256,
+    "attention_head_dim": [
+     5,
+     10,
+     20
+    ],
+    "block_out_channels": [
+     320,
+     640,
+     1280
+    ],
+    "center_input_sample": false,
+    "class_embed_type": null,
+    "class_embeddings_concat": false,
+    "conv_in_kernel": 3,
+    "conv_out_kernel": 3,
+    "cross_attention_dim": 2048,
+    "cross_attention_norm": null,
+    "down_block_types": [
+     "DownBlock2D",
+     "CrossAttnDownBlock2D",
+     "CrossAttnDownBlock2D"
+    ],
+    "downsample_padding": 1,
+    "dual_cross_attention": false,
+    "encoder_hid_dim": null,
+    "encoder_hid_dim_type": null,
+    "flip_sin_to_cos": true,
+    "freq_shift": 0,
+    "in_channels": 4,
+    "layers_per_block": 2,
+    "mid_block_only_cross_attention": null,
+    "mid_block_scale_factor": 1,
+    "mid_block_type": "UNetMidBlock2DCrossAttn",
+    "norm_eps": 1e-05,
+    "norm_num_groups": 32,
+    "num_attention_heads": null,
+    "num_class_embeds": null,
+    "only_cross_attention": false,
+    "out_channels": 4,
+    "projection_class_embeddings_input_dim": 2816,
+    "resnet_out_scale_factor": 1,
+    "resnet_skip_time_act": false,
+    "resnet_time_scale_shift": "default",
+    "sample_size": 128,
+    "time_cond_proj_dim": null,
+    "time_embedding_act_fn": null,
+    "time_embedding_dim": null,
+    "time_embedding_type": "positional",
+    "timestep_post_act": null,
+    "transformer_layers_per_block": [
+     1,
+     2,
+     10
+    ],
+    "up_block_types": [
+     "CrossAttnUpBlock2D",
+     "CrossAttnUpBlock2D",
+     "UpBlock2D"
+    ],
+    "upcast_attention": null,
+    "use_linear_projection": true
+   },
+   "vae": {
+    "_class_name": "AutoencoderKL",
+    "_diffusers_version": "0.20.0.dev0",
+    "act_fn": "silu",
+    "block_out_channels": [
+     128,
+     256,
+     512,
+     512
+    ],
+    "down_block_types": [
+     "DownEncoderBlock2D",
+     "DownEncoderBlock2D",
+     "DownEncoderBlock2D",
+     "DownEncoderBlock2D"
+    ],
+    "force_upcast": true,
+    "in_channels": 3,
+    "latent_channels": 4,
+    "layers_per_block": 2,
+    "norm_num_groups": 32,
+    "out_channels": 3,
+    "sample_size": 1024,
+    "scaling_factor": 0.13025,
+    "up_block_types": [
+     "UpDecoderBlock2D",
+     "UpDecoderBlock2D",
+     "UpDecoderBlock2D",
+     "UpDecoderBlock2D"
+    ]
+   }
+  },
+  "manifest": {
+   "length": 164,
+   "sha256": "6d15fe236a9807e3bfd5945a64b411df0b8a697bb5c63eac28d9e119b39c9aaf"
+  },
+  "name": "acme/v1-sdxl-int8",
+  "parts": [
+   "800bad821678663f06f408afcff97b64517b6e2746213d4391c0f28de41683c1",
+   "8ce49c09f40487d285179fa6404b486743ca19e0c9dc76422e9b03f484a5402b",
+   "a134cf5a513468779196e6442d2ecaf8638fb7e393fdb5b1d50c69acfadc67cb",
+   "a2b0538dd45a33eca66f0629e2a6fd194d3f88233d65118c49b68629ce95118b",
+   "aa9ef73397564a7993468884da1bda69c134b82bb2ebd23166d524a255d05e82",
+   "b4fa672bb65e0fd06e8f7d1b0297a426b97ec9884e76afba8fcfa5ad9818c3d8"
+  ],
+  "tensors": [
+   "vae/decoder.up_blocks.2.resnets.0.conv1.bias",
+   "vae/decoder.up_blocks.2.resnets.0.conv2.bias",
+   "vae/decoder.conv_out.bias",
+   "unet/conv_out.bias",
+   "text_encoder/encoder.layers.0.self_attn.k_proj.weight"
+  ]
+ },
+ {
+  "configs": {
+   "model": {
+    "audio_vae": {
+     "_class_name": "AutoencoderKLMiniMaxH3Audio",
+     "_diffusers_version": "0.36.0.dev0",
+     "decoder_dim": 1024,
+     "decoder_kernel_sizes": [
+      9,
+      9,
+      4,
+      4,
+      4,
+      4,
+      4
+     ],
+     "decoder_rates": [
+      5,
+      5,
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "encoder_dim": 64,
+     "encoder_rates": [
+      2,
+      4,
+      4,
+      5,
+      5
+     ],
+     "latent_channels": 32,
+     "latent_dim": 2048,
+     "latents_mean": [
+      -0.020211687488382354,
+      0.3876466479950502,
+      -0.04398279799186767,
+      -0.28591514936373,
+      0.08179686214561671,
+      -0.35782641352446604,
+      0.040623809960919084,
+      -0.01552534501956604,
+      -0.223362481667332,
+      0.1821006842509091,
+      0.2941778783780663,
+      -0.07901167601970885,
+      -0.056815072777201,
+      -0.3699028221860095,
+      -0.31616315591624855,
+      0.5905951377425391,
+      -0.052139568068853864,
+      0.013673160263486295,
+      -0.03691647864630577,
+      0.09732660653298163,
+      -0.3394662328788498,
+      -0.30685677538541667,
+      -0.24504598907458763,
+      -0.034698524462007344,
+      0.02868032184767538,
+      -0.21217779266454084,
+      -0.1678263169941987,
+      0.3221287889040614,
+      -0.1223055851554907,
+      0.4356604928128464,
+      -0.0502599202236253,
+      0.3979258376211797
+     ],
+     "latents_std": [
+      1.6895524230479284,
+      2.76263727217653,
+      1.7945344281264435,
+      1.6801681847309828,
+      1.6390226546605453,
+      2.7788298348882177,
+      1.7659090095747236,
+      1.6199757612137327,
+      2.6336525640336896,
+      1.8539356672817833,
+      2.5056497896915633,
+      1.811019237886178,
+      1.9579657790720237,
+      1.6685498243529284,
+      1.4922469314453364,
+      3.298670198067373,
+      1.9491804496832168,
+      1.8720003270431442,
+      1.8334080103291832,
+      1.6488070416529093,
+      1.6176957696319716,
+      1.9131449234774398,
+      1.5695245398428617,
+      1.6943659940415912,
+      1.8318420762504692,
+      1.5540637421583379,
+      1.9344930328968526,
+      1.599198216109855,
+      1.718045989838149,
+      1.6307219190837705,
+      1.8661226051202384,
+      1.5613768203168363
+     ],
+     "num_attention_heads": 8,
+     "resblock_dilation_sizes": [
+      [
+       1,
+       3,
+       5
+      ],
+      [
+       1,
+       3,
+       5
+      ],
+      [
+       1,
+       3,
+       5
+      ]
+     ],
+     "resblock_kernel_sizes": [
+      3,
+      7,
+      11
+     ],
+     "sampling_rate": 32000
+    },
+    "fl2va_dit": {
+     "_class_name": "MiniMaxH3Transformer3DModel",
+     "_diffusers_version": "0.36.0.dev0",
+     "attention_head_dim": 128,
+     "audio_in_channels": 32,
+     "cozy_h3": {
+      "modulation": "adaln-pruned",
+      "table_keys": {
+       "block_modulation": [
+        {
+         "index": 0,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x0.0p+0"
+        },
+        {
+         "index": 1,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x0.0p+0"
+        },
+        {
+         "index": 2,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x0.0p+0"
+        },
+        {
+         "index": 3,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.ff7cee0000000p-1"
+        },
+        {
+         "index": 4,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.0000000000000p+0"
+        },
+        {
+         "index": 5,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.7792000000000p-9"
+        },
+        {
+         "index": 6,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.7792000000000p-9"
+        },
+        {
+         "index": 7,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.745d800000000p-7"
+        },
+        {
+         "index": 8,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.83c9000000000p-8"
+        },
+        {
+         "index": 9,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.83c9000000000p-8"
+        },
+        {
+         "index": 10,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.7d06400000000p-6"
+        },
+        {
+         "index": 11,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.2ca0000000000p-7"
+        },
+        {
+         "index": 12,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.2ca0000000000p-7"
+        },
+        {
+         "index": 13,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.2492600000000p-5"
+        },
+        {
+         "index": 14,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.9ec9800000000p-7"
+        },
+        {
+         "index": 15,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.9ec9800000000p-7"
+        },
+        {
+         "index": 16,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.8f9c200000000p-5"
+        },
+        {
+         "index": 17,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0c96c00000000p-6"
+        },
+        {
+         "index": 18,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0c96c00000000p-6"
+        },
+        {
+         "index": 19,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.ffffe00000000p-5"
+        },
+        {
+         "index": 20,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.4e5e000000000p-6"
+        },
+        {
+         "index": 21,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.4e5e000000000p-6"
+        },
+        {
+         "index": 22,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.3b13a00000000p-4"
+        },
+        {
+         "index": 23,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.9542400000000p-6"
+        },
+        {
+         "index": 24,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.9542400000000p-6"
+        },
+        {
+         "index": 25,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.7943600000000p-4"
+        },
+        {
+         "index": 26,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.e1e1c00000000p-6"
+        },
+        {
+         "index": 27,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.e1e1c00000000p-6"
+        },
+        {
+         "index": 28,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.bacf900000000p-4"
+        },
+        {
+         "index": 29,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.1a7ba00000000p-5"
+        },
+        {
+         "index": 30,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.1a7ba00000000p-5"
+        },
+        {
+         "index": 31,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.0000080000000p-3"
+        },
+        {
+         "index": 32,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.47ae200000000p-5"
+        },
+        {
+         "index": 33,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.47ae200000000p-5"
+        },
+        {
+         "index": 34,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.2492500000000p-3"
+        },
+        {
+         "index": 35,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.7909a00000000p-5"
+        },
+        {
+         "index": 36,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.7909a00000000p-5"
+        },
+        {
+         "index": 37,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.4b4b480000000p-3"
+        },
+        {
+         "index": 38,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.af28600000000p-5"
+        },
+        {
+         "index": 39,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.af28600000000p-5"
+        },
+        {
+         "index": 40,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.745d100000000p-3"
+        },
+        {
+         "index": 41,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.eac3c00000000p-5"
+        },
+        {
+         "index": 42,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.eac3c00000000p-5"
+        },
+        {
+         "index": 43,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.9ffff80000000p-3"
+        },
+        {
+         "index": 44,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.165e700000000p-4"
+        },
+        {
+         "index": 45,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.165e700000000p-4"
+        },
+        {
+         "index": 46,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.ce73a00000000p-3"
+        },
+        {
+         "index": 47,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.3b13b00000000p-4"
+        },
+        {
+         "index": 48,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.3b13b00000000p-4"
+        },
+        {
+         "index": 49,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.0000000000000p-2"
+        },
+        {
+         "index": 50,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.642c800000000p-4"
+        },
+        {
+         "index": 51,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.642c800000000p-4"
+        },
+        {
+         "index": 52,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.1a7b940000000p-2"
+        },
+        {
+         "index": 53,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.927f400000000p-4"
+        },
+        {
+         "index": 54,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.927f400000000p-4"
+        },
+        {
+         "index": 55,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.36db700000000p-2"
+        },
+        {
+         "index": 56,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.c71c800000000p-4"
+        },
+        {
+         "index": 57,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.c71c800000000p-4"
+        },
+        {
+         "index": 58,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5555540000000p-2"
+        },
+        {
+         "index": 59,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.01b2000000000p-3"
+        },
+        {
+         "index": 60,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.01b2000000000p-3"
+        },
+        {
+         "index": 61,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.7627600000000p-2"
+        },
+        {
+         "index": 62,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.2492500000000p-3"
+        },
+        {
+         "index": 63,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.2492500000000p-3"
+        },
+        {
+         "index": 64,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.99999c0000000p-2"
+        },
+        {
+         "index": 65,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.4d65380000000p-3"
+        },
+        {
+         "index": 66,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.4d65380000000p-3"
+        },
+        {
+         "index": 67,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.c000000000000p-2"
+        },
+        {
+         "index": 68,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.7dd4980000000p-3"
+        },
+        {
+         "index": 69,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.7dd4980000000p-3"
+        },
+        {
+         "index": 70,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.e9bd340000000p-2"
+        },
+        {
+         "index": 71,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.b839680000000p-3"
+        },
+        {
+         "index": 72,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.b839680000000p-3"
+        },
+        {
+         "index": 73,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.0ba2e80000000p-1"
+        },
+        {
+         "index": 74,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0000040000000p-2"
+        },
+        {
+         "index": 75,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0000040000000p-2"
+        },
+        {
+         "index": 76,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.24924a0000000p-1"
+        },
+        {
+         "index": 77,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.2d2d300000000p-2"
+        },
+        {
+         "index": 78,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.2d2d300000000p-2"
+        },
+        {
+         "index": 79,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.4000000000000p-1"
+        },
+        {
+         "index": 80,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.67c8a40000000p-2"
+        },
+        {
+         "index": 81,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.67c8a40000000p-2"
+        },
+        {
+         "index": 82,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5e50d60000000p-1"
+        },
+        {
+         "index": 83,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.b6db700000000p-2"
+        },
+        {
+         "index": 84,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.b6db700000000p-2"
+        },
+        {
+         "index": 85,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.8000000000000p-1"
+        },
+        {
+         "index": 86,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.13b13a0000000p-1"
+        },
+        {
+         "index": 87,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.13b13a0000000p-1"
+        },
+        {
+         "index": 88,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.a5a5a40000000p-1"
+        },
+        {
+         "index": 89,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.6a25760000000p-1"
+        },
+        {
+         "index": 90,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.6a25760000000p-1"
+        },
+        {
+         "index": 91,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.d000000000000p-1"
+        },
+        {
+         "index": 92,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.1778000000000p-9"
+        },
+        {
+         "index": 93,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.1778000000000p-9"
+        },
+        {
+         "index": 94,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.15b1800000000p-7"
+        },
+        {
+         "index": 95,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.1e2f000000000p-8"
+        },
+        {
+         "index": 96,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.1e2f000000000p-8"
+        },
+        {
+         "index": 97,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.1a7bc00000000p-6"
+        },
+        {
+         "index": 98,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.b7d6000000000p-8"
+        },
+        {
+         "index": 99,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.b7d6000000000p-8"
+        },
+        {
+         "index": 100,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.af28400000000p-6"
+        },
+        {
+         "index": 101,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.8181800000000p-7"
+        },
+        {
+         "index": 102,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.8181800000000p-7"
+        },
+        {
+         "index": 103,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.745d200000000p-5"
+        },
+        {
+         "index": 104,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.dae5800000000p-7"
+        },
+        {
+         "index": 105,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.dae5800000000p-7"
+        },
+        {
+         "index": 106,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.c71c600000000p-5"
+        },
+        {
+         "index": 107,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.1c96000000000p-6"
+        },
+        {
+         "index": 108,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.1c96000000000p-6"
+        },
+        {
+         "index": 109,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.0e7db00000000p-4"
+        },
+        {
+         "index": 110,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.8306400000000p-6"
+        },
+        {
+         "index": 111,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.8306400000000p-6"
+        },
+        {
+         "index": 112,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.6969800000000p-4"
+        },
+        {
+         "index": 113,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.bacf800000000p-6"
+        },
+        {
+         "index": 114,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.bacf800000000p-6"
+        },
+        {
+         "index": 115,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.9999a00000000p-4"
+        },
+        {
+         "index": 116,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.f604000000000p-6"
+        },
+        {
+         "index": 117,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.f604000000000p-6"
+        },
+        {
+         "index": 118,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.cbc1400000000p-4"
+        },
+        {
+         "index": 119,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.3c03000000000p-5"
+        },
+        {
+         "index": 120,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.3c03000000000p-5"
+        },
+        {
+         "index": 121,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.1b3be00000000p-3"
+        },
+        {
+         "index": 122,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.5fcdc00000000p-5"
+        },
+        {
+         "index": 123,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.5fcdc00000000p-5"
+        },
+        {
+         "index": 124,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.37a6f80000000p-3"
+        },
+        {
+         "index": 125,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.8618600000000p-5"
+        },
+        {
+         "index": 126,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.8618600000000p-5"
+        },
+        {
+         "index": 127,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5555580000000p-3"
+        },
+        {
+         "index": 128,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.af28800000000p-5"
+        },
+        {
+         "index": 129,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.af28800000000p-5"
+        },
+        {
+         "index": 130,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.745d180000000p-3"
+        },
+        {
+         "index": 131,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.db4de00000000p-5"
+        },
+        {
+         "index": 132,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.db4de00000000p-5"
+        },
+        {
+         "index": 133,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.94d6600000000p-3"
+        },
+        {
+         "index": 134,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0572600000000p-4"
+        },
+        {
+         "index": 135,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0572600000000p-4"
+        },
+        {
+         "index": 136,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.b6db600000000p-3"
+        },
+        {
+         "index": 137,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.1f2c600000000p-4"
+        },
+        {
+         "index": 138,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.1f2c600000000p-4"
+        },
+        {
+         "index": 139,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.da89600000000p-3"
+        },
+        {
+         "index": 140,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.5972200000000p-4"
+        },
+        {
+         "index": 141,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.5972200000000p-4"
+        },
+        {
+         "index": 142,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.13b13c0000000p-2"
+        },
+        {
+         "index": 143,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.7a9f400000000p-4"
+        },
+        {
+         "index": 144,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.7a9f400000000p-4"
+        },
+        {
+         "index": 145,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.286bcc0000000p-2"
+        },
+        {
+         "index": 146,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.9f03600000000p-4"
+        },
+        {
+         "index": 147,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.9f03600000000p-4"
+        },
+        {
+         "index": 148,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.3e452c0000000p-2"
+        },
+        {
+         "index": 149,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.c71c700000000p-4"
+        },
+        {
+         "index": 150,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.c71c700000000p-4"
+        },
+        {
+         "index": 151,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.f383200000000p-4"
+        },
+        {
+         "index": 152,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.f383200000000p-4"
+        },
+        {
+         "index": 153,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.6db6dc0000000p-2"
+        },
+        {
+         "index": 154,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.1279680000000p-3"
+        },
+        {
+         "index": 155,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.1279680000000p-3"
+        },
+        {
+         "index": 156,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.87878c0000000p-2"
+        },
+        {
+         "index": 157,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.2e29f80000000p-3"
+        },
+        {
+         "index": 158,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.2e29f80000000p-3"
+        },
+        {
+         "index": 159,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.a2e8bc0000000p-2"
+        },
+        {
+         "index": 160,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.70e4f80000000p-3"
+        },
+        {
+         "index": 161,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.70e4f80000000p-3"
+        },
+        {
+         "index": 162,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.def7bc0000000p-2"
+        },
+        {
+         "index": 163,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.9999980000000p-3"
+        },
+        {
+         "index": 164,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.9999980000000p-3"
+        },
+        {
+         "index": 165,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.0000000000000p-1"
+        },
+        {
+         "index": 166,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.c8bf900000000p-3"
+        },
+        {
+         "index": 167,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.c8bf900000000p-3"
+        },
+        {
+         "index": 168,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.11a7ba0000000p-1"
+        },
+        {
+         "index": 169,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0000000000000p-2"
+        },
+        {
+         "index": 170,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0000000000000p-2"
+        },
+        {
+         "index": 171,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.2492480000000p-1"
+        },
+        {
+         "index": 172,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.20d2100000000p-2"
+        },
+        {
+         "index": 173,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.20d2100000000p-2"
+        },
+        {
+         "index": 174,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.38e3900000000p-1"
+        },
+        {
+         "index": 175,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.4873ec0000000p-2"
+        },
+        {
+         "index": 176,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.4873ec0000000p-2"
+        },
+        {
+         "index": 177,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.4ec4ec0000000p-1"
+        },
+        {
+         "index": 178,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.7943600000000p-2"
+        },
+        {
+         "index": 179,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.7943600000000p-2"
+        },
+        {
+         "index": 180,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.6666660000000p-1"
+        },
+        {
+         "index": 181,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.b6db6c0000000p-2"
+        },
+        {
+         "index": 182,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.b6db6c0000000p-2"
+        },
+        {
+         "index": 183,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0381c00000000p-1"
+        },
+        {
+         "index": 184,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0381c00000000p-1"
+        },
+        {
+         "index": 185,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.9bd37a0000000p-1"
+        },
+        {
+         "index": 186,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.39ce740000000p-1"
+        },
+        {
+         "index": 187,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.39ce740000000p-1"
+        },
+        {
+         "index": 188,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.ba2e8c0000000p-1"
+        },
+        {
+         "index": 189,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.8787880000000p-1"
+        },
+        {
+         "index": 190,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.8787880000000p-1"
+        },
+        {
+         "index": 191,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.db6db60000000p-1"
+        },
+        {
+         "index": 192,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.bd14000000000p-10"
+        },
+        {
+         "index": 193,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.bd14000000000p-10"
+        },
+        {
+         "index": 194,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.bacf000000000p-8"
+        },
+        {
+         "index": 195,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.c58a000000000p-9"
+        },
+        {
+         "index": 196,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.c58a000000000p-9"
+        },
+        {
+         "index": 197,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.c0e1000000000p-7"
+        },
+        {
+         "index": 198,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.5ac1000000000p-8"
+        },
+        {
+         "index": 199,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.5ac1000000000p-8"
+        },
+        {
+         "index": 200,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5555800000000p-6"
+        },
+        {
+         "index": 201,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.d77b000000000p-8"
+        },
+        {
+         "index": 202,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.d77b000000000p-8"
+        },
+        {
+         "index": 203,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.cd85c00000000p-6"
+        },
+        {
+         "index": 204,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.702e800000000p-7"
+        },
+        {
+         "index": 205,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.702e800000000p-7"
+        },
+        {
+         "index": 206,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.642ca00000000p-5"
+        },
+        {
+         "index": 207,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.b694000000000p-7"
+        },
+        {
+         "index": 208,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.b694000000000p-7"
+        },
+        {
+         "index": 209,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.a5a5c00000000p-5"
+        },
+        {
+         "index": 210,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0000400000000p-6"
+        },
+        {
+         "index": 211,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0000400000000p-6"
+        },
+        {
+         "index": 212,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.e913200000000p-5"
+        },
+        {
+         "index": 213,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.2652800000000p-6"
+        },
+        {
+         "index": 214,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.2652800000000p-6"
+        },
+        {
+         "index": 215,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.1745c00000000p-4"
+        },
+        {
+         "index": 216,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.783fc00000000p-6"
+        },
+        {
+         "index": 217,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.783fc00000000p-6"
+        },
+        {
+         "index": 218,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5ffff00000000p-4"
+        },
+        {
+         "index": 219,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.a41a400000000p-6"
+        },
+        {
+         "index": 220,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.a41a400000000p-6"
+        },
+        {
+         "index": 221,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.8618600000000p-4"
+        },
+        {
+         "index": 222,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.d211000000000p-6"
+        },
+        {
+         "index": 223,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.d211000000000p-6"
+        },
+        {
+         "index": 224,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.ad6b600000000p-4"
+        },
+        {
+         "index": 225,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0125e00000000p-5"
+        },
+        {
+         "index": 226,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0125e00000000p-5"
+        },
+        {
+         "index": 227,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.d608600000000p-4"
+        },
+        {
+         "index": 228,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.3521c00000000p-5"
+        },
+        {
+         "index": 229,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.3521c00000000p-5"
+        },
+        {
+         "index": 230,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.15b1f00000000p-3"
+        },
+        {
+         "index": 231,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.5133800000000p-5"
+        },
+        {
+         "index": 232,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.5133800000000p-5"
+        },
+        {
+         "index": 233,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.2c23580000000p-3"
+        },
+        {
+         "index": 234,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.6ece600000000p-5"
+        },
+        {
+         "index": 235,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.6ece600000000p-5"
+        },
+        {
+         "index": 236,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.435e500000000p-3"
+        },
+        {
+         "index": 237,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.8e13a00000000p-5"
+        },
+        {
+         "index": 238,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.8e13a00000000p-5"
+        },
+        {
+         "index": 239,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5b6db80000000p-3"
+        },
+        {
+         "index": 240,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.d236000000000p-5"
+        },
+        {
+         "index": 241,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.d236000000000p-5"
+        },
+        {
+         "index": 242,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.8e38d80000000p-3"
+        },
+        {
+         "index": 243,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.f76b200000000p-5"
+        },
+        {
+         "index": 244,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.f76b200000000p-5"
+        },
+        {
+         "index": 245,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.a90e700000000p-3"
+        },
+        {
+         "index": 246,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0f7e100000000p-4"
+        },
+        {
+         "index": 247,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0f7e100000000p-4"
+        },
+        {
+         "index": 248,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.c4ec400000000p-3"
+        },
+        {
+         "index": 249,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.2492500000000p-4"
+        },
+        {
+         "index": 250,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.2492500000000p-4"
+        },
+        {
+         "index": 251,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.e1e1e00000000p-3"
+        },
+        {
+         "index": 252,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.5328c00000000p-4"
+        },
+        {
+         "index": 253,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.5328c00000000p-4"
+        },
+        {
+         "index": 254,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.0fac6c0000000p-2"
+        },
+        {
+         "index": 255,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.6cfd900000000p-4"
+        },
+        {
+         "index": 256,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.6cfd900000000p-4"
+        },
+        {
+         "index": 257,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.2000040000000p-2"
+        },
+        {
+         "index": 258,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.88c4700000000p-4"
+        },
+        {
+         "index": 259,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.88c4700000000p-4"
+        },
+        {
+         "index": 260,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.3105740000000p-2"
+        },
+        {
+         "index": 261,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.a6b8000000000p-4"
+        },
+        {
+         "index": 262,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.a6b8000000000p-4"
+        },
+        {
+         "index": 263,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.42c8580000000p-2"
+        },
+        {
+         "index": 264,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5555580000000p-2"
+        },
+        {
+         "index": 265,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.ea41300000000p-4"
+        },
+        {
+         "index": 266,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.ea41300000000p-4"
+        },
+        {
+         "index": 267,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.68ba300000000p-2"
+        },
+        {
+         "index": 268,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0842180000000p-3"
+        },
+        {
+         "index": 269,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0842180000000p-3"
+        },
+        {
+         "index": 270,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.7d05f80000000p-2"
+        },
+        {
+         "index": 271,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.1d2a200000000p-3"
+        },
+        {
+         "index": 272,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.1d2a200000000p-3"
+        },
+        {
+         "index": 273,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.9249280000000p-2"
+        },
+        {
+         "index": 274,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.341b300000000p-3"
+        },
+        {
+         "index": 275,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.341b300000000p-3"
+        },
+        {
+         "index": 276,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.a895dc0000000p-2"
+        },
+        {
+         "index": 277,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.4d65300000000p-3"
+        },
+        {
+         "index": 278,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.4d65300000000p-3"
+        },
+        {
+         "index": 279,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.6969600000000p-3"
+        },
+        {
+         "index": 280,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.6969600000000p-3"
+        },
+        {
+         "index": 281,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.d89d880000000p-2"
+        },
+        {
+         "index": 282,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.889f300000000p-3"
+        },
+        {
+         "index": 283,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.889f300000000p-3"
+        },
+        {
+         "index": 284,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.f286bc0000000p-2"
+        },
+        {
+         "index": 285,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.ab9ab80000000p-3"
+        },
+        {
+         "index": 286,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.ab9ab80000000p-3"
+        },
+        {
+         "index": 287,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.06eb400000000p-1"
+        },
+        {
+         "index": 288,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.d316800000000p-3"
+        },
+        {
+         "index": 289,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.d316800000000p-3"
+        },
+        {
+         "index": 290,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.1555580000000p-1"
+        },
+        {
+         "index": 291,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.19c5980000000p-2"
+        },
+        {
+         "index": 292,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.19c5980000000p-2"
+        },
+        {
+         "index": 293,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.34b4b60000000p-1"
+        },
+        {
+         "index": 294,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.37a6f40000000p-2"
+        },
+        {
+         "index": 295,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.37a6f40000000p-2"
+        },
+        {
+         "index": 296,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.45d1740000000p-1"
+        },
+        {
+         "index": 297,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.5ab5680000000p-2"
+        },
+        {
+         "index": 298,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.5ab5680000000p-2"
+        },
+        {
+         "index": 299,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5800000000000p-1"
+        },
+        {
+         "index": 300,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.8469f00000000p-2"
+        },
+        {
+         "index": 301,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.8469f00000000p-2"
+        },
+        {
+         "index": 302,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.6b5ad80000000p-1"
+        },
+        {
+         "index": 303,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.f51b3c0000000p-2"
+        },
+        {
+         "index": 304,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.f51b3c0000000p-2"
+        },
+        {
+         "index": 305,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.9611a80000000p-1"
+        },
+        {
+         "index": 306,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.21ed800000000p-1"
+        },
+        {
+         "index": 307,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.21ed800000000p-1"
+        },
+        {
+         "index": 308,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.adb6dc0000000p-1"
+        },
+        {
+         "index": 309,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.5555560000000p-1"
+        },
+        {
+         "index": 310,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.5555560000000p-1"
+        },
+        {
+         "index": 311,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.c71c720000000p-1"
+        },
+        {
+         "index": 312,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.9b47580000000p-1"
+        },
+        {
+         "index": 313,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.9b47580000000p-1"
+        },
+        {
+         "index": 314,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.e276280000000p-1"
+        }
+       ],
+       "final_normalization": [
+        {
+         "index": 0,
+         "timestep": "0x0.0p+0"
+        },
+        {
+         "index": 1,
+         "timestep": "0x1.ff7cee0000000p-1"
+        },
+        {
+         "index": 2,
+         "timestep": "0x1.0000000000000p+0"
+        },
+        {
+         "index": 3,
+         "timestep": "0x1.7792000000000p-9"
+        },
+        {
+         "index": 4,
+         "timestep": "0x1.745d800000000p-7"
+        },
+        {
+         "index": 5,
+         "timestep": "0x1.83c9000000000p-8"
+        },
+        {
+         "index": 6,
+         "timestep": "0x1.7d06400000000p-6"
+        },
+        {
+         "index": 7,
+         "timestep": "0x1.2ca0000000000p-7"
+        },
+        {
+         "index": 8,
+         "timestep": "0x1.2492600000000p-5"
+        },
+        {
+         "index": 9,
+         "timestep": "0x1.9ec9800000000p-7"
+        },
+        {
+         "index": 10,
+         "timestep": "0x1.8f9c200000000p-5"
+        },
+        {
+         "index": 11,
+         "timestep": "0x1.0c96c00000000p-6"
+        },
+        {
+         "index": 12,
+         "timestep": "0x1.ffffe00000000p-5"
+        },
+        {
+         "index": 13,
+         "timestep": "0x1.4e5e000000000p-6"
+        },
+        {
+         "index": 14,
+         "timestep": "0x1.3b13a00000000p-4"
+        },
+        {
+         "index": 15,
+         "timestep": "0x1.9542400000000p-6"
+        },
+        {
+         "index": 16,
+         "timestep": "0x1.7943600000000p-4"
+        },
+        {
+         "index": 17,
+         "timestep": "0x1.e1e1c00000000p-6"
+        },
+        {
+         "index": 18,
+         "timestep": "0x1.bacf900000000p-4"
+        },
+        {
+         "index": 19,
+         "timestep": "0x1.1a7ba00000000p-5"
+        },
+        {
+         "index": 20,
+         "timestep": "0x1.0000080000000p-3"
+        },
+        {
+         "index": 21,
+         "timestep": "0x1.47ae200000000p-5"
+        },
+        {
+         "index": 22,
+         "timestep": "0x1.2492500000000p-3"
+        },
+        {
+         "index": 23,
+         "timestep": "0x1.7909a00000000p-5"
+        },
+        {
+         "index": 24,
+         "timestep": "0x1.4b4b480000000p-3"
+        },
+        {
+         "index": 25,
+         "timestep": "0x1.af28600000000p-5"
+        },
+        {
+         "index": 26,
+         "timestep": "0x1.745d100000000p-3"
+        },
+        {
+         "index": 27,
+         "timestep": "0x1.eac3c00000000p-5"
+        },
+        {
+         "index": 28,
+         "timestep": "0x1.9ffff80000000p-3"
+        },
+        {
+         "index": 29,
+         "timestep": "0x1.165e700000000p-4"
+        },
+        {
+         "index": 30,
+         "timestep": "0x1.ce73a00000000p-3"
+        },
+        {
+         "index": 31,
+         "timestep": "0x1.3b13b00000000p-4"
+        },
+        {
+         "index": 32,
+         "timestep": "0x1.0000000000000p-2"
+        },
+        {
+         "index": 33,
+         "timestep": "0x1.642c800000000p-4"
+        },
+        {
+         "index": 34,
+         "timestep": "0x1.1a7b940000000p-2"
+        },
+        {
+         "index": 35,
+         "timestep": "0x1.927f400000000p-4"
+        },
+        {
+         "index": 36,
+         "timestep": "0x1.36db700000000p-2"
+        },
+        {
+         "index": 37,
+         "timestep": "0x1.c71c800000000p-4"
+        },
+        {
+         "index": 38,
+         "timestep": "0x1.5555540000000p-2"
+        },
+        {
+         "index": 39,
+         "timestep": "0x1.01b2000000000p-3"
+        },
+        {
+         "index": 40,
+         "timestep": "0x1.7627600000000p-2"
+        },
+        {
+         "index": 41,
+         "timestep": "0x1.99999c0000000p-2"
+        },
+        {
+         "index": 42,
+         "timestep": "0x1.4d65380000000p-3"
+        },
+        {
+         "index": 43,
+         "timestep": "0x1.c000000000000p-2"
+        },
+        {
+         "index": 44,
+         "timestep": "0x1.7dd4980000000p-3"
+        },
+        {
+         "index": 45,
+         "timestep": "0x1.e9bd340000000p-2"
+        },
+        {
+         "index": 46,
+         "timestep": "0x1.b839680000000p-3"
+        },
+        {
+         "index": 47,
+         "timestep": "0x1.0ba2e80000000p-1"
+        },
+        {
+         "index": 48,
+         "timestep": "0x1.0000040000000p-2"
+        },
+        {
+         "index": 49,
+         "timestep": "0x1.24924a0000000p-1"
+        },
+        {
+         "index": 50,
+         "timestep": "0x1.2d2d300000000p-2"
+        },
+        {
+         "index": 51,
+         "timestep": "0x1.4000000000000p-1"
+        },
+        {
+         "index": 52,
+         "timestep": "0x1.67c8a40000000p-2"
+        },
+        {
+         "index": 53,
+         "timestep": "0x1.5e50d60000000p-1"
+        },
+        {
+         "index": 54,
+         "timestep": "0x1.b6db700000000p-2"
+        },
+        {
+         "index": 55,
+         "timestep": "0x1.8000000000000p-1"
+        },
+        {
+         "index": 56,
+         "timestep": "0x1.13b13a0000000p-1"
+        },
+        {
+         "index": 57,
+         "timestep": "0x1.a5a5a40000000p-1"
+        },
+        {
+         "index": 58,
+         "timestep": "0x1.6a25760000000p-1"
+        },
+        {
+         "index": 59,
+         "timestep": "0x1.d000000000000p-1"
+        },
+        {
+         "index": 60,
+         "timestep": "0x1.1778000000000p-9"
+        },
+        {
+         "index": 61,
+         "timestep": "0x1.15b1800000000p-7"
+        },
+        {
+         "index": 62,
+         "timestep": "0x1.1e2f000000000p-8"
+        },
+        {
+         "index": 63,
+         "timestep": "0x1.1a7bc00000000p-6"
+        },
+        {
+         "index": 64,
+         "timestep": "0x1.b7d6000000000p-8"
+        },
+        {
+         "index": 65,
+         "timestep": "0x1.af28400000000p-6"
+        },
+        {
+         "index": 66,
+         "timestep": "0x1.8181800000000p-7"
+        },
+        {
+         "index": 67,
+         "timestep": "0x1.745d200000000p-5"
+        },
+        {
+         "index": 68,
+         "timestep": "0x1.dae5800000000p-7"
+        },
+        {
+         "index": 69,
+         "timestep": "0x1.c71c600000000p-5"
+        },
+        {
+         "index": 70,
+         "timestep": "0x1.1c96000000000p-6"
+        },
+        {
+         "index": 71,
+         "timestep": "0x1.0e7db00000000p-4"
+        },
+        {
+         "index": 72,
+         "timestep": "0x1.8306400000000p-6"
+        },
+        {
+         "index": 73,
+         "timestep": "0x1.6969800000000p-4"
+        },
+        {
+         "index": 74,
+         "timestep": "0x1.bacf800000000p-6"
+        },
+        {
+         "index": 75,
+         "timestep": "0x1.9999a00000000p-4"
+        },
+        {
+         "index": 76,
+         "timestep": "0x1.f604000000000p-6"
+        },
+        {
+         "index": 77,
+         "timestep": "0x1.cbc1400000000p-4"
+        },
+        {
+         "index": 78,
+         "timestep": "0x1.3c03000000000p-5"
+        },
+        {
+         "index": 79,
+         "timestep": "0x1.1b3be00000000p-3"
+        },
+        {
+         "index": 80,
+         "timestep": "0x1.5fcdc00000000p-5"
+        },
+        {
+         "index": 81,
+         "timestep": "0x1.37a6f80000000p-3"
+        },
+        {
+         "index": 82,
+         "timestep": "0x1.8618600000000p-5"
+        },
+        {
+         "index": 83,
+         "timestep": "0x1.5555580000000p-3"
+        },
+        {
+         "index": 84,
+         "timestep": "0x1.af28800000000p-5"
+        },
+        {
+         "index": 85,
+         "timestep": "0x1.745d180000000p-3"
+        },
+        {
+         "index": 86,
+         "timestep": "0x1.db4de00000000p-5"
+        },
+        {
+         "index": 87,
+         "timestep": "0x1.94d6600000000p-3"
+        },
+        {
+         "index": 88,
+         "timestep": "0x1.0572600000000p-4"
+        },
+        {
+         "index": 89,
+         "timestep": "0x1.b6db600000000p-3"
+        },
+        {
+         "index": 90,
+         "timestep": "0x1.1f2c600000000p-4"
+        },
+        {
+         "index": 91,
+         "timestep": "0x1.da89600000000p-3"
+        },
+        {
+         "index": 92,
+         "timestep": "0x1.5972200000000p-4"
+        },
+        {
+         "index": 93,
+         "timestep": "0x1.13b13c0000000p-2"
+        },
+        {
+         "index": 94,
+         "timestep": "0x1.7a9f400000000p-4"
+        },
+        {
+         "index": 95,
+         "timestep": "0x1.286bcc0000000p-2"
+        },
+        {
+         "index": 96,
+         "timestep": "0x1.9f03600000000p-4"
+        },
+        {
+         "index": 97,
+         "timestep": "0x1.3e452c0000000p-2"
+        },
+        {
+         "index": 98,
+         "timestep": "0x1.c71c700000000p-4"
+        },
+        {
+         "index": 99,
+         "timestep": "0x1.f383200000000p-4"
+        },
+        {
+         "index": 100,
+         "timestep": "0x1.6db6dc0000000p-2"
+        },
+        {
+         "index": 101,
+         "timestep": "0x1.1279680000000p-3"
+        },
+        {
+         "index": 102,
+         "timestep": "0x1.87878c0000000p-2"
+        },
+        {
+         "index": 103,
+         "timestep": "0x1.2e29f80000000p-3"
+        },
+        {
+         "index": 104,
+         "timestep": "0x1.a2e8bc0000000p-2"
+        },
+        {
+         "index": 105,
+         "timestep": "0x1.70e4f80000000p-3"
+        },
+        {
+         "index": 106,
+         "timestep": "0x1.def7bc0000000p-2"
+        },
+        {
+         "index": 107,
+         "timestep": "0x1.9999980000000p-3"
+        },
+        {
+         "index": 108,
+         "timestep": "0x1.0000000000000p-1"
+        },
+        {
+         "index": 109,
+         "timestep": "0x1.c8bf900000000p-3"
+        },
+        {
+         "index": 110,
+         "timestep": "0x1.11a7ba0000000p-1"
+        },
+        {
+         "index": 111,
+         "timestep": "0x1.2492480000000p-1"
+        },
+        {
+         "index": 112,
+         "timestep": "0x1.20d2100000000p-2"
+        },
+        {
+         "index": 113,
+         "timestep": "0x1.38e3900000000p-1"
+        },
+        {
+         "index": 114,
+         "timestep": "0x1.4873ec0000000p-2"
+        },
+        {
+         "index": 115,
+         "timestep": "0x1.4ec4ec0000000p-1"
+        },
+        {
+         "index": 116,
+         "timestep": "0x1.7943600000000p-2"
+        },
+        {
+         "index": 117,
+         "timestep": "0x1.6666660000000p-1"
+        },
+        {
+         "index": 118,
+         "timestep": "0x1.b6db6c0000000p-2"
+        },
+        {
+         "index": 119,
+         "timestep": "0x1.0381c00000000p-1"
+        },
+        {
+         "index": 120,
+         "timestep": "0x1.9bd37a0000000p-1"
+        },
+        {
+         "index": 121,
+         "timestep": "0x1.39ce740000000p-1"
+        },
+        {
+         "index": 122,
+         "timestep": "0x1.ba2e8c0000000p-1"
+        },
+        {
+         "index": 123,
+         "timestep": "0x1.8787880000000p-1"
+        },
+        {
+         "index": 124,
+         "timestep": "0x1.db6db60000000p-1"
+        },
+        {
+         "index": 125,
+         "timestep": "0x1.bd14000000000p-10"
+        },
+        {
+         "index": 126,
+         "timestep": "0x1.bacf000000000p-8"
+        },
+        {
+         "index": 127,
+         "timestep": "0x1.c58a000000000p-9"
+        },
+        {
+         "index": 128,
+         "timestep": "0x1.c0e1000000000p-7"
+        },
+        {
+         "index": 129,
+         "timestep": "0x1.5ac1000000000p-8"
+        },
+        {
+         "index": 130,
+         "timestep": "0x1.5555800000000p-6"
+        },
+        {
+         "index": 131,
+         "timestep": "0x1.d77b000000000p-8"
+        },
+        {
+         "index": 132,
+         "timestep": "0x1.cd85c00000000p-6"
+        },
+        {
+         "index": 133,
+         "timestep": "0x1.702e800000000p-7"
+        },
+        {
+         "index": 134,
+         "timestep": "0x1.642ca00000000p-5"
+        },
+        {
+         "index": 135,
+         "timestep": "0x1.b694000000000p-7"
+        },
+        {
+         "index": 136,
+         "timestep": "0x1.a5a5c00000000p-5"
+        },
+        {
+         "index": 137,
+         "timestep": "0x1.0000400000000p-6"
+        },
+        {
+         "index": 138,
+         "timestep": "0x1.e913200000000p-5"
+        },
+        {
+         "index": 139,
+         "timestep": "0x1.2652800000000p-6"
+        },
+        {
+         "index": 140,
+         "timestep": "0x1.1745c00000000p-4"
+        },
+        {
+         "index": 141,
+         "timestep": "0x1.783fc00000000p-6"
+        },
+        {
+         "index": 142,
+         "timestep": "0x1.5ffff00000000p-4"
+        },
+        {
+         "index": 143,
+         "timestep": "0x1.a41a400000000p-6"
+        },
+        {
+         "index": 144,
+         "timestep": "0x1.8618600000000p-4"
+        },
+        {
+         "index": 145,
+         "timestep": "0x1.d211000000000p-6"
+        },
+        {
+         "index": 146,
+         "timestep": "0x1.ad6b600000000p-4"
+        },
+        {
+         "index": 147,
+         "timestep": "0x1.0125e00000000p-5"
+        },
+        {
+         "index": 148,
+         "timestep": "0x1.d608600000000p-4"
+        },
+        {
+         "index": 149,
+         "timestep": "0x1.3521c00000000p-5"
+        },
+        {
+         "index": 150,
+         "timestep": "0x1.15b1f00000000p-3"
+        },
+        {
+         "index": 151,
+         "timestep": "0x1.5133800000000p-5"
+        },
+        {
+         "index": 152,
+         "timestep": "0x1.2c23580000000p-3"
+        },
+        {
+         "index": 153,
+         "timestep": "0x1.6ece600000000p-5"
+        },
+        {
+         "index": 154,
+         "timestep": "0x1.435e500000000p-3"
+        },
+        {
+         "index": 155,
+         "timestep": "0x1.8e13a00000000p-5"
+        },
+        {
+         "index": 156,
+         "timestep": "0x1.5b6db80000000p-3"
+        },
+        {
+         "index": 157,
+         "timestep": "0x1.d236000000000p-5"
+        },
+        {
+         "index": 158,
+         "timestep": "0x1.8e38d80000000p-3"
+        },
+        {
+         "index": 159,
+         "timestep": "0x1.f76b200000000p-5"
+        },
+        {
+         "index": 160,
+         "timestep": "0x1.a90e700000000p-3"
+        },
+        {
+         "index": 161,
+         "timestep": "0x1.0f7e100000000p-4"
+        },
+        {
+         "index": 162,
+         "timestep": "0x1.c4ec400000000p-3"
+        },
+        {
+         "index": 163,
+         "timestep": "0x1.2492500000000p-4"
+        },
+        {
+         "index": 164,
+         "timestep": "0x1.e1e1e00000000p-3"
+        },
+        {
+         "index": 165,
+         "timestep": "0x1.5328c00000000p-4"
+        },
+        {
+         "index": 166,
+         "timestep": "0x1.0fac6c0000000p-2"
+        },
+        {
+         "index": 167,
+         "timestep": "0x1.6cfd900000000p-4"
+        },
+        {
+         "index": 168,
+         "timestep": "0x1.2000040000000p-2"
+        },
+        {
+         "index": 169,
+         "timestep": "0x1.88c4700000000p-4"
+        },
+        {
+         "index": 170,
+         "timestep": "0x1.3105740000000p-2"
+        },
+        {
+         "index": 171,
+         "timestep": "0x1.a6b8000000000p-4"
+        },
+        {
+         "index": 172,
+         "timestep": "0x1.42c8580000000p-2"
+        },
+        {
+         "index": 173,
+         "timestep": "0x1.5555580000000p-2"
+        },
+        {
+         "index": 174,
+         "timestep": "0x1.ea41300000000p-4"
+        },
+        {
+         "index": 175,
+         "timestep": "0x1.68ba300000000p-2"
+        },
+        {
+         "index": 176,
+         "timestep": "0x1.0842180000000p-3"
+        },
+        {
+         "index": 177,
+         "timestep": "0x1.7d05f80000000p-2"
+        },
+        {
+         "index": 178,
+         "timestep": "0x1.1d2a200000000p-3"
+        },
+        {
+         "index": 179,
+         "timestep": "0x1.9249280000000p-2"
+        },
+        {
+         "index": 180,
+         "timestep": "0x1.341b300000000p-3"
+        },
+        {
+         "index": 181,
+         "timestep": "0x1.a895dc0000000p-2"
+        },
+        {
+         "index": 182,
+         "timestep": "0x1.4d65300000000p-3"
+        },
+        {
+         "index": 183,
+         "timestep": "0x1.6969600000000p-3"
+        },
+        {
+         "index": 184,
+         "timestep": "0x1.d89d880000000p-2"
+        },
+        {
+         "index": 185,
+         "timestep": "0x1.889f300000000p-3"
+        },
+        {
+         "index": 186,
+         "timestep": "0x1.f286bc0000000p-2"
+        },
+        {
+         "index": 187,
+         "timestep": "0x1.ab9ab80000000p-3"
+        },
+        {
+         "index": 188,
+         "timestep": "0x1.06eb400000000p-1"
+        },
+        {
+         "index": 189,
+         "timestep": "0x1.d316800000000p-3"
+        },
+        {
+         "index": 190,
+         "timestep": "0x1.1555580000000p-1"
+        },
+        {
+         "index": 191,
+         "timestep": "0x1.19c5980000000p-2"
+        },
+        {
+         "index": 192,
+         "timestep": "0x1.34b4b60000000p-1"
+        },
+        {
+         "index": 193,
+         "timestep": "0x1.37a6f40000000p-2"
+        },
+        {
+         "index": 194,
+         "timestep": "0x1.45d1740000000p-1"
+        },
+        {
+         "index": 195,
+         "timestep": "0x1.5ab5680000000p-2"
+        },
+        {
+         "index": 196,
+         "timestep": "0x1.5800000000000p-1"
+        },
+        {
+         "index": 197,
+         "timestep": "0x1.8469f00000000p-2"
+        },
+        {
+         "index": 198,
+         "timestep": "0x1.6b5ad80000000p-1"
+        },
+        {
+         "index": 199,
+         "timestep": "0x1.f51b3c0000000p-2"
+        },
+        {
+         "index": 200,
+         "timestep": "0x1.9611a80000000p-1"
+        },
+        {
+         "index": 201,
+         "timestep": "0x1.21ed800000000p-1"
+        },
+        {
+         "index": 202,
+         "timestep": "0x1.adb6dc0000000p-1"
+        },
+        {
+         "index": 203,
+         "timestep": "0x1.5555560000000p-1"
+        },
+        {
+         "index": 204,
+         "timestep": "0x1.c71c720000000p-1"
+        },
+        {
+         "index": 205,
+         "timestep": "0x1.9b47580000000p-1"
+        },
+        {
+         "index": 206,
+         "timestep": "0x1.e276280000000p-1"
+        }
+       ]
+      },
+      "task": "fl2va"
+     },
+     "ffn_dim": 14336,
+     "final_norm_eps": 1e-05,
+     "freq_dim": 256,
+     "hidden_size": 5376,
+     "in_channels": 24,
+     "norm_eps": 1e-05,
+     "num_attention_heads": 56,
+     "num_layers": 50,
+     "num_refiner_layers": 2,
+     "patch_size": [
+      1,
+      2,
+      2
+     ],
+     "qk_norm_eps": 1e-05,
+     "rope_freq_dim": 16,
+     "rope_theta": 10000,
+     "text_dim": 5120,
+     "time_embed_dim": 2688,
+     "time_embed_hidden_dim": 5376
+    },
+    "ref2va_dit": {
+     "_class_name": "MiniMaxH3Transformer3DModel",
+     "_diffusers_version": "0.36.0.dev0",
+     "attention_head_dim": 128,
+     "audio_in_channels": 32,
+     "cozy_h3": {
+      "modulation": "adaln-pruned",
+      "table_keys": {
+       "block_modulation": [
+        {
+         "index": 0,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x0.0p+0"
+        },
+        {
+         "index": 1,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x0.0p+0"
+        },
+        {
+         "index": 2,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x0.0p+0"
+        },
+        {
+         "index": 3,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.ff7cee0000000p-1"
+        },
+        {
+         "index": 4,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.0000000000000p+0"
+        },
+        {
+         "index": 5,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.7792000000000p-9"
+        },
+        {
+         "index": 6,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.7792000000000p-9"
+        },
+        {
+         "index": 7,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.745d800000000p-7"
+        },
+        {
+         "index": 8,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.83c9000000000p-8"
+        },
+        {
+         "index": 9,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.83c9000000000p-8"
+        },
+        {
+         "index": 10,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.7d06400000000p-6"
+        },
+        {
+         "index": 11,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.2ca0000000000p-7"
+        },
+        {
+         "index": 12,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.2ca0000000000p-7"
+        },
+        {
+         "index": 13,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.2492600000000p-5"
+        },
+        {
+         "index": 14,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.9ec9800000000p-7"
+        },
+        {
+         "index": 15,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.9ec9800000000p-7"
+        },
+        {
+         "index": 16,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.8f9c200000000p-5"
+        },
+        {
+         "index": 17,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0c96c00000000p-6"
+        },
+        {
+         "index": 18,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0c96c00000000p-6"
+        },
+        {
+         "index": 19,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.ffffe00000000p-5"
+        },
+        {
+         "index": 20,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.4e5e000000000p-6"
+        },
+        {
+         "index": 21,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.4e5e000000000p-6"
+        },
+        {
+         "index": 22,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.3b13a00000000p-4"
+        },
+        {
+         "index": 23,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.9542400000000p-6"
+        },
+        {
+         "index": 24,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.9542400000000p-6"
+        },
+        {
+         "index": 25,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.7943600000000p-4"
+        },
+        {
+         "index": 26,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.e1e1c00000000p-6"
+        },
+        {
+         "index": 27,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.e1e1c00000000p-6"
+        },
+        {
+         "index": 28,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.bacf900000000p-4"
+        },
+        {
+         "index": 29,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.1a7ba00000000p-5"
+        },
+        {
+         "index": 30,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.1a7ba00000000p-5"
+        },
+        {
+         "index": 31,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.0000080000000p-3"
+        },
+        {
+         "index": 32,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.47ae200000000p-5"
+        },
+        {
+         "index": 33,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.47ae200000000p-5"
+        },
+        {
+         "index": 34,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.2492500000000p-3"
+        },
+        {
+         "index": 35,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.7909a00000000p-5"
+        },
+        {
+         "index": 36,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.7909a00000000p-5"
+        },
+        {
+         "index": 37,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.4b4b480000000p-3"
+        },
+        {
+         "index": 38,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.af28600000000p-5"
+        },
+        {
+         "index": 39,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.af28600000000p-5"
+        },
+        {
+         "index": 40,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.745d100000000p-3"
+        },
+        {
+         "index": 41,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.eac3c00000000p-5"
+        },
+        {
+         "index": 42,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.eac3c00000000p-5"
+        },
+        {
+         "index": 43,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.9ffff80000000p-3"
+        },
+        {
+         "index": 44,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.165e700000000p-4"
+        },
+        {
+         "index": 45,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.165e700000000p-4"
+        },
+        {
+         "index": 46,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.ce73a00000000p-3"
+        },
+        {
+         "index": 47,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.3b13b00000000p-4"
+        },
+        {
+         "index": 48,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.3b13b00000000p-4"
+        },
+        {
+         "index": 49,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.0000000000000p-2"
+        },
+        {
+         "index": 50,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.642c800000000p-4"
+        },
+        {
+         "index": 51,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.642c800000000p-4"
+        },
+        {
+         "index": 52,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.1a7b940000000p-2"
+        },
+        {
+         "index": 53,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.927f400000000p-4"
+        },
+        {
+         "index": 54,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.927f400000000p-4"
+        },
+        {
+         "index": 55,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.36db700000000p-2"
+        },
+        {
+         "index": 56,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.c71c800000000p-4"
+        },
+        {
+         "index": 57,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.c71c800000000p-4"
+        },
+        {
+         "index": 58,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5555540000000p-2"
+        },
+        {
+         "index": 59,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.01b2000000000p-3"
+        },
+        {
+         "index": 60,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.01b2000000000p-3"
+        },
+        {
+         "index": 61,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.7627600000000p-2"
+        },
+        {
+         "index": 62,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.2492500000000p-3"
+        },
+        {
+         "index": 63,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.2492500000000p-3"
+        },
+        {
+         "index": 64,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.99999c0000000p-2"
+        },
+        {
+         "index": 65,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.4d65380000000p-3"
+        },
+        {
+         "index": 66,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.4d65380000000p-3"
+        },
+        {
+         "index": 67,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.c000000000000p-2"
+        },
+        {
+         "index": 68,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.7dd4980000000p-3"
+        },
+        {
+         "index": 69,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.7dd4980000000p-3"
+        },
+        {
+         "index": 70,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.e9bd340000000p-2"
+        },
+        {
+         "index": 71,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.b839680000000p-3"
+        },
+        {
+         "index": 72,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.b839680000000p-3"
+        },
+        {
+         "index": 73,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.0ba2e80000000p-1"
+        },
+        {
+         "index": 74,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0000040000000p-2"
+        },
+        {
+         "index": 75,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0000040000000p-2"
+        },
+        {
+         "index": 76,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.24924a0000000p-1"
+        },
+        {
+         "index": 77,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.2d2d300000000p-2"
+        },
+        {
+         "index": 78,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.2d2d300000000p-2"
+        },
+        {
+         "index": 79,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.4000000000000p-1"
+        },
+        {
+         "index": 80,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.67c8a40000000p-2"
+        },
+        {
+         "index": 81,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.67c8a40000000p-2"
+        },
+        {
+         "index": 82,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5e50d60000000p-1"
+        },
+        {
+         "index": 83,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.b6db700000000p-2"
+        },
+        {
+         "index": 84,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.b6db700000000p-2"
+        },
+        {
+         "index": 85,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.8000000000000p-1"
+        },
+        {
+         "index": 86,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.13b13a0000000p-1"
+        },
+        {
+         "index": 87,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.13b13a0000000p-1"
+        },
+        {
+         "index": 88,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.a5a5a40000000p-1"
+        },
+        {
+         "index": 89,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.6a25760000000p-1"
+        },
+        {
+         "index": 90,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.6a25760000000p-1"
+        },
+        {
+         "index": 91,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.d000000000000p-1"
+        },
+        {
+         "index": 92,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.1778000000000p-9"
+        },
+        {
+         "index": 93,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.1778000000000p-9"
+        },
+        {
+         "index": 94,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.15b1800000000p-7"
+        },
+        {
+         "index": 95,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.1e2f000000000p-8"
+        },
+        {
+         "index": 96,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.1e2f000000000p-8"
+        },
+        {
+         "index": 97,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.1a7bc00000000p-6"
+        },
+        {
+         "index": 98,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.b7d6000000000p-8"
+        },
+        {
+         "index": 99,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.b7d6000000000p-8"
+        },
+        {
+         "index": 100,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.af28400000000p-6"
+        },
+        {
+         "index": 101,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.8181800000000p-7"
+        },
+        {
+         "index": 102,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.8181800000000p-7"
+        },
+        {
+         "index": 103,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.745d200000000p-5"
+        },
+        {
+         "index": 104,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.dae5800000000p-7"
+        },
+        {
+         "index": 105,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.dae5800000000p-7"
+        },
+        {
+         "index": 106,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.c71c600000000p-5"
+        },
+        {
+         "index": 107,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.1c96000000000p-6"
+        },
+        {
+         "index": 108,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.1c96000000000p-6"
+        },
+        {
+         "index": 109,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.0e7db00000000p-4"
+        },
+        {
+         "index": 110,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.8306400000000p-6"
+        },
+        {
+         "index": 111,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.8306400000000p-6"
+        },
+        {
+         "index": 112,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.6969800000000p-4"
+        },
+        {
+         "index": 113,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.bacf800000000p-6"
+        },
+        {
+         "index": 114,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.bacf800000000p-6"
+        },
+        {
+         "index": 115,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.9999a00000000p-4"
+        },
+        {
+         "index": 116,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.f604000000000p-6"
+        },
+        {
+         "index": 117,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.f604000000000p-6"
+        },
+        {
+         "index": 118,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.cbc1400000000p-4"
+        },
+        {
+         "index": 119,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.3c03000000000p-5"
+        },
+        {
+         "index": 120,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.3c03000000000p-5"
+        },
+        {
+         "index": 121,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.1b3be00000000p-3"
+        },
+        {
+         "index": 122,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.5fcdc00000000p-5"
+        },
+        {
+         "index": 123,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.5fcdc00000000p-5"
+        },
+        {
+         "index": 124,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.37a6f80000000p-3"
+        },
+        {
+         "index": 125,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.8618600000000p-5"
+        },
+        {
+         "index": 126,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.8618600000000p-5"
+        },
+        {
+         "index": 127,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5555580000000p-3"
+        },
+        {
+         "index": 128,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.af28800000000p-5"
+        },
+        {
+         "index": 129,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.af28800000000p-5"
+        },
+        {
+         "index": 130,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.745d180000000p-3"
+        },
+        {
+         "index": 131,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.db4de00000000p-5"
+        },
+        {
+         "index": 132,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.db4de00000000p-5"
+        },
+        {
+         "index": 133,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.94d6600000000p-3"
+        },
+        {
+         "index": 134,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0572600000000p-4"
+        },
+        {
+         "index": 135,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0572600000000p-4"
+        },
+        {
+         "index": 136,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.b6db600000000p-3"
+        },
+        {
+         "index": 137,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.1f2c600000000p-4"
+        },
+        {
+         "index": 138,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.1f2c600000000p-4"
+        },
+        {
+         "index": 139,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.da89600000000p-3"
+        },
+        {
+         "index": 140,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.5972200000000p-4"
+        },
+        {
+         "index": 141,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.5972200000000p-4"
+        },
+        {
+         "index": 142,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.13b13c0000000p-2"
+        },
+        {
+         "index": 143,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.7a9f400000000p-4"
+        },
+        {
+         "index": 144,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.7a9f400000000p-4"
+        },
+        {
+         "index": 145,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.286bcc0000000p-2"
+        },
+        {
+         "index": 146,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.9f03600000000p-4"
+        },
+        {
+         "index": 147,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.9f03600000000p-4"
+        },
+        {
+         "index": 148,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.3e452c0000000p-2"
+        },
+        {
+         "index": 149,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.c71c700000000p-4"
+        },
+        {
+         "index": 150,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.c71c700000000p-4"
+        },
+        {
+         "index": 151,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.f383200000000p-4"
+        },
+        {
+         "index": 152,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.f383200000000p-4"
+        },
+        {
+         "index": 153,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.6db6dc0000000p-2"
+        },
+        {
+         "index": 154,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.1279680000000p-3"
+        },
+        {
+         "index": 155,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.1279680000000p-3"
+        },
+        {
+         "index": 156,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.87878c0000000p-2"
+        },
+        {
+         "index": 157,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.2e29f80000000p-3"
+        },
+        {
+         "index": 158,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.2e29f80000000p-3"
+        },
+        {
+         "index": 159,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.a2e8bc0000000p-2"
+        },
+        {
+         "index": 160,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.70e4f80000000p-3"
+        },
+        {
+         "index": 161,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.70e4f80000000p-3"
+        },
+        {
+         "index": 162,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.def7bc0000000p-2"
+        },
+        {
+         "index": 163,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.9999980000000p-3"
+        },
+        {
+         "index": 164,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.9999980000000p-3"
+        },
+        {
+         "index": 165,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.0000000000000p-1"
+        },
+        {
+         "index": 166,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.c8bf900000000p-3"
+        },
+        {
+         "index": 167,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.c8bf900000000p-3"
+        },
+        {
+         "index": 168,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.11a7ba0000000p-1"
+        },
+        {
+         "index": 169,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0000000000000p-2"
+        },
+        {
+         "index": 170,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0000000000000p-2"
+        },
+        {
+         "index": 171,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.2492480000000p-1"
+        },
+        {
+         "index": 172,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.20d2100000000p-2"
+        },
+        {
+         "index": 173,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.20d2100000000p-2"
+        },
+        {
+         "index": 174,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.38e3900000000p-1"
+        },
+        {
+         "index": 175,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.4873ec0000000p-2"
+        },
+        {
+         "index": 176,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.4873ec0000000p-2"
+        },
+        {
+         "index": 177,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.4ec4ec0000000p-1"
+        },
+        {
+         "index": 178,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.7943600000000p-2"
+        },
+        {
+         "index": 179,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.7943600000000p-2"
+        },
+        {
+         "index": 180,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.6666660000000p-1"
+        },
+        {
+         "index": 181,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.b6db6c0000000p-2"
+        },
+        {
+         "index": 182,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.b6db6c0000000p-2"
+        },
+        {
+         "index": 183,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0381c00000000p-1"
+        },
+        {
+         "index": 184,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0381c00000000p-1"
+        },
+        {
+         "index": 185,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.9bd37a0000000p-1"
+        },
+        {
+         "index": 186,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.39ce740000000p-1"
+        },
+        {
+         "index": 187,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.39ce740000000p-1"
+        },
+        {
+         "index": 188,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.ba2e8c0000000p-1"
+        },
+        {
+         "index": 189,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.8787880000000p-1"
+        },
+        {
+         "index": 190,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.8787880000000p-1"
+        },
+        {
+         "index": 191,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.db6db60000000p-1"
+        },
+        {
+         "index": 192,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.bd14000000000p-10"
+        },
+        {
+         "index": 193,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.bd14000000000p-10"
+        },
+        {
+         "index": 194,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.bacf000000000p-8"
+        },
+        {
+         "index": 195,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.c58a000000000p-9"
+        },
+        {
+         "index": 196,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.c58a000000000p-9"
+        },
+        {
+         "index": 197,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.c0e1000000000p-7"
+        },
+        {
+         "index": 198,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.5ac1000000000p-8"
+        },
+        {
+         "index": 199,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.5ac1000000000p-8"
+        },
+        {
+         "index": 200,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5555800000000p-6"
+        },
+        {
+         "index": 201,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.d77b000000000p-8"
+        },
+        {
+         "index": 202,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.d77b000000000p-8"
+        },
+        {
+         "index": 203,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.cd85c00000000p-6"
+        },
+        {
+         "index": 204,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.702e800000000p-7"
+        },
+        {
+         "index": 205,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.702e800000000p-7"
+        },
+        {
+         "index": 206,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.642ca00000000p-5"
+        },
+        {
+         "index": 207,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.b694000000000p-7"
+        },
+        {
+         "index": 208,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.b694000000000p-7"
+        },
+        {
+         "index": 209,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.a5a5c00000000p-5"
+        },
+        {
+         "index": 210,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0000400000000p-6"
+        },
+        {
+         "index": 211,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0000400000000p-6"
+        },
+        {
+         "index": 212,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.e913200000000p-5"
+        },
+        {
+         "index": 213,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.2652800000000p-6"
+        },
+        {
+         "index": 214,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.2652800000000p-6"
+        },
+        {
+         "index": 215,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.1745c00000000p-4"
+        },
+        {
+         "index": 216,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.783fc00000000p-6"
+        },
+        {
+         "index": 217,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.783fc00000000p-6"
+        },
+        {
+         "index": 218,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5ffff00000000p-4"
+        },
+        {
+         "index": 219,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.a41a400000000p-6"
+        },
+        {
+         "index": 220,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.a41a400000000p-6"
+        },
+        {
+         "index": 221,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.8618600000000p-4"
+        },
+        {
+         "index": 222,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.d211000000000p-6"
+        },
+        {
+         "index": 223,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.d211000000000p-6"
+        },
+        {
+         "index": 224,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.ad6b600000000p-4"
+        },
+        {
+         "index": 225,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0125e00000000p-5"
+        },
+        {
+         "index": 226,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0125e00000000p-5"
+        },
+        {
+         "index": 227,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.d608600000000p-4"
+        },
+        {
+         "index": 228,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.3521c00000000p-5"
+        },
+        {
+         "index": 229,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.3521c00000000p-5"
+        },
+        {
+         "index": 230,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.15b1f00000000p-3"
+        },
+        {
+         "index": 231,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.5133800000000p-5"
+        },
+        {
+         "index": 232,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.5133800000000p-5"
+        },
+        {
+         "index": 233,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.2c23580000000p-3"
+        },
+        {
+         "index": 234,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.6ece600000000p-5"
+        },
+        {
+         "index": 235,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.6ece600000000p-5"
+        },
+        {
+         "index": 236,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.435e500000000p-3"
+        },
+        {
+         "index": 237,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.8e13a00000000p-5"
+        },
+        {
+         "index": 238,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.8e13a00000000p-5"
+        },
+        {
+         "index": 239,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5b6db80000000p-3"
+        },
+        {
+         "index": 240,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.d236000000000p-5"
+        },
+        {
+         "index": 241,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.d236000000000p-5"
+        },
+        {
+         "index": 242,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.8e38d80000000p-3"
+        },
+        {
+         "index": 243,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.f76b200000000p-5"
+        },
+        {
+         "index": 244,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.f76b200000000p-5"
+        },
+        {
+         "index": 245,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.a90e700000000p-3"
+        },
+        {
+         "index": 246,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0f7e100000000p-4"
+        },
+        {
+         "index": 247,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0f7e100000000p-4"
+        },
+        {
+         "index": 248,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.c4ec400000000p-3"
+        },
+        {
+         "index": 249,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.2492500000000p-4"
+        },
+        {
+         "index": 250,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.2492500000000p-4"
+        },
+        {
+         "index": 251,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.e1e1e00000000p-3"
+        },
+        {
+         "index": 252,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.5328c00000000p-4"
+        },
+        {
+         "index": 253,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.5328c00000000p-4"
+        },
+        {
+         "index": 254,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.0fac6c0000000p-2"
+        },
+        {
+         "index": 255,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.6cfd900000000p-4"
+        },
+        {
+         "index": 256,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.6cfd900000000p-4"
+        },
+        {
+         "index": 257,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.2000040000000p-2"
+        },
+        {
+         "index": 258,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.88c4700000000p-4"
+        },
+        {
+         "index": 259,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.88c4700000000p-4"
+        },
+        {
+         "index": 260,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.3105740000000p-2"
+        },
+        {
+         "index": 261,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.a6b8000000000p-4"
+        },
+        {
+         "index": 262,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.a6b8000000000p-4"
+        },
+        {
+         "index": 263,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.42c8580000000p-2"
+        },
+        {
+         "index": 264,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5555580000000p-2"
+        },
+        {
+         "index": 265,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.ea41300000000p-4"
+        },
+        {
+         "index": 266,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.ea41300000000p-4"
+        },
+        {
+         "index": 267,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.68ba300000000p-2"
+        },
+        {
+         "index": 268,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.0842180000000p-3"
+        },
+        {
+         "index": 269,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.0842180000000p-3"
+        },
+        {
+         "index": 270,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.7d05f80000000p-2"
+        },
+        {
+         "index": 271,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.1d2a200000000p-3"
+        },
+        {
+         "index": 272,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.1d2a200000000p-3"
+        },
+        {
+         "index": 273,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.9249280000000p-2"
+        },
+        {
+         "index": 274,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.341b300000000p-3"
+        },
+        {
+         "index": 275,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.341b300000000p-3"
+        },
+        {
+         "index": 276,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.a895dc0000000p-2"
+        },
+        {
+         "index": 277,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.4d65300000000p-3"
+        },
+        {
+         "index": 278,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.4d65300000000p-3"
+        },
+        {
+         "index": 279,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.6969600000000p-3"
+        },
+        {
+         "index": 280,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.6969600000000p-3"
+        },
+        {
+         "index": 281,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.d89d880000000p-2"
+        },
+        {
+         "index": 282,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.889f300000000p-3"
+        },
+        {
+         "index": 283,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.889f300000000p-3"
+        },
+        {
+         "index": 284,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.f286bc0000000p-2"
+        },
+        {
+         "index": 285,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.ab9ab80000000p-3"
+        },
+        {
+         "index": 286,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.ab9ab80000000p-3"
+        },
+        {
+         "index": 287,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.06eb400000000p-1"
+        },
+        {
+         "index": 288,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.d316800000000p-3"
+        },
+        {
+         "index": 289,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.d316800000000p-3"
+        },
+        {
+         "index": 290,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.1555580000000p-1"
+        },
+        {
+         "index": 291,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.19c5980000000p-2"
+        },
+        {
+         "index": 292,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.19c5980000000p-2"
+        },
+        {
+         "index": 293,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.34b4b60000000p-1"
+        },
+        {
+         "index": 294,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.37a6f40000000p-2"
+        },
+        {
+         "index": 295,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.37a6f40000000p-2"
+        },
+        {
+         "index": 296,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.45d1740000000p-1"
+        },
+        {
+         "index": 297,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.5ab5680000000p-2"
+        },
+        {
+         "index": 298,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.5ab5680000000p-2"
+        },
+        {
+         "index": 299,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.5800000000000p-1"
+        },
+        {
+         "index": 300,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.8469f00000000p-2"
+        },
+        {
+         "index": 301,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.8469f00000000p-2"
+        },
+        {
+         "index": 302,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.6b5ad80000000p-1"
+        },
+        {
+         "index": 303,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.f51b3c0000000p-2"
+        },
+        {
+         "index": 304,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.f51b3c0000000p-2"
+        },
+        {
+         "index": 305,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.9611a80000000p-1"
+        },
+        {
+         "index": 306,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.21ed800000000p-1"
+        },
+        {
+         "index": 307,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.21ed800000000p-1"
+        },
+        {
+         "index": 308,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.adb6dc0000000p-1"
+        },
+        {
+         "index": 309,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.5555560000000p-1"
+        },
+        {
+         "index": 310,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.5555560000000p-1"
+        },
+        {
+         "index": 311,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.c71c720000000p-1"
+        },
+        {
+         "index": 312,
+         "modality": "video",
+         "modality_tag": 0,
+         "timestep": "0x1.9b47580000000p-1"
+        },
+        {
+         "index": 313,
+         "modality": "text",
+         "modality_tag": 1,
+         "timestep": "0x1.9b47580000000p-1"
+        },
+        {
+         "index": 314,
+         "modality": "audio",
+         "modality_tag": 2,
+         "timestep": "0x1.e276280000000p-1"
+        }
+       ],
+       "final_normalization": [
+        {
+         "index": 0,
+         "timestep": "0x0.0p+0"
+        },
+        {
+         "index": 1,
+         "timestep": "0x1.ff7cee0000000p-1"
+        },
+        {
+         "index": 2,
+         "timestep": "0x1.0000000000000p+0"
+        },
+        {
+         "index": 3,
+         "timestep": "0x1.7792000000000p-9"
+        },
+        {
+         "index": 4,
+         "timestep": "0x1.745d800000000p-7"
+        },
+        {
+         "index": 5,
+         "timestep": "0x1.83c9000000000p-8"
+        },
+        {
+         "index": 6,
+         "timestep": "0x1.7d06400000000p-6"
+        },
+        {
+         "index": 7,
+         "timestep": "0x1.2ca0000000000p-7"
+        },
+        {
+         "index": 8,
+         "timestep": "0x1.2492600000000p-5"
+        },
+        {
+         "index": 9,
+         "timestep": "0x1.9ec9800000000p-7"
+        },
+        {
+         "index": 10,
+         "timestep": "0x1.8f9c200000000p-5"
+        },
+        {
+         "index": 11,
+         "timestep": "0x1.0c96c00000000p-6"
+        },
+        {
+         "index": 12,
+         "timestep": "0x1.ffffe00000000p-5"
+        },
+        {
+         "index": 13,
+         "timestep": "0x1.4e5e000000000p-6"
+        },
+        {
+         "index": 14,
+         "timestep": "0x1.3b13a00000000p-4"
+        },
+        {
+         "index": 15,
+         "timestep": "0x1.9542400000000p-6"
+        },
+        {
+         "index": 16,
+         "timestep": "0x1.7943600000000p-4"
+        },
+        {
+         "index": 17,
+         "timestep": "0x1.e1e1c00000000p-6"
+        },
+        {
+         "index": 18,
+         "timestep": "0x1.bacf900000000p-4"
+        },
+        {
+         "index": 19,
+         "timestep": "0x1.1a7ba00000000p-5"
+        },
+        {
+         "index": 20,
+         "timestep": "0x1.0000080000000p-3"
+        },
+        {
+         "index": 21,
+         "timestep": "0x1.47ae200000000p-5"
+        },
+        {
+         "index": 22,
+         "timestep": "0x1.2492500000000p-3"
+        },
+        {
+         "index": 23,
+         "timestep": "0x1.7909a00000000p-5"
+        },
+        {
+         "index": 24,
+         "timestep": "0x1.4b4b480000000p-3"
+        },
+        {
+         "index": 25,
+         "timestep": "0x1.af28600000000p-5"
+        },
+        {
+         "index": 26,
+         "timestep": "0x1.745d100000000p-3"
+        },
+        {
+         "index": 27,
+         "timestep": "0x1.eac3c00000000p-5"
+        },
+        {
+         "index": 28,
+         "timestep": "0x1.9ffff80000000p-3"
+        },
+        {
+         "index": 29,
+         "timestep": "0x1.165e700000000p-4"
+        },
+        {
+         "index": 30,
+         "timestep": "0x1.ce73a00000000p-3"
+        },
+        {
+         "index": 31,
+         "timestep": "0x1.3b13b00000000p-4"
+        },
+        {
+         "index": 32,
+         "timestep": "0x1.0000000000000p-2"
+        },
+        {
+         "index": 33,
+         "timestep": "0x1.642c800000000p-4"
+        },
+        {
+         "index": 34,
+         "timestep": "0x1.1a7b940000000p-2"
+        },
+        {
+         "index": 35,
+         "timestep": "0x1.927f400000000p-4"
+        },
+        {
+         "index": 36,
+         "timestep": "0x1.36db700000000p-2"
+        },
+        {
+         "index": 37,
+         "timestep": "0x1.c71c800000000p-4"
+        },
+        {
+         "index": 38,
+         "timestep": "0x1.5555540000000p-2"
+        },
+        {
+         "index": 39,
+         "timestep": "0x1.01b2000000000p-3"
+        },
+        {
+         "index": 40,
+         "timestep": "0x1.7627600000000p-2"
+        },
+        {
+         "index": 41,
+         "timestep": "0x1.99999c0000000p-2"
+        },
+        {
+         "index": 42,
+         "timestep": "0x1.4d65380000000p-3"
+        },
+        {
+         "index": 43,
+         "timestep": "0x1.c000000000000p-2"
+        },
+        {
+         "index": 44,
+         "timestep": "0x1.7dd4980000000p-3"
+        },
+        {
+         "index": 45,
+         "timestep": "0x1.e9bd340000000p-2"
+        },
+        {
+         "index": 46,
+         "timestep": "0x1.b839680000000p-3"
+        },
+        {
+         "index": 47,
+         "timestep": "0x1.0ba2e80000000p-1"
+        },
+        {
+         "index": 48,
+         "timestep": "0x1.0000040000000p-2"
+        },
+        {
+         "index": 49,
+         "timestep": "0x1.24924a0000000p-1"
+        },
+        {
+         "index": 50,
+         "timestep": "0x1.2d2d300000000p-2"
+        },
+        {
+         "index": 51,
+         "timestep": "0x1.4000000000000p-1"
+        },
+        {
+         "index": 52,
+         "timestep": "0x1.67c8a40000000p-2"
+        },
+        {
+         "index": 53,
+         "timestep": "0x1.5e50d60000000p-1"
+        },
+        {
+         "index": 54,
+         "timestep": "0x1.b6db700000000p-2"
+        },
+        {
+         "index": 55,
+         "timestep": "0x1.8000000000000p-1"
+        },
+        {
+         "index": 56,
+         "timestep": "0x1.13b13a0000000p-1"
+        },
+        {
+         "index": 57,
+         "timestep": "0x1.a5a5a40000000p-1"
+        },
+        {
+         "index": 58,
+         "timestep": "0x1.6a25760000000p-1"
+        },
+        {
+         "index": 59,
+         "timestep": "0x1.d000000000000p-1"
+        },
+        {
+         "index": 60,
+         "timestep": "0x1.1778000000000p-9"
+        },
+        {
+         "index": 61,
+         "timestep": "0x1.15b1800000000p-7"
+        },
+        {
+         "index": 62,
+         "timestep": "0x1.1e2f000000000p-8"
+        },
+        {
+         "index": 63,
+         "timestep": "0x1.1a7bc00000000p-6"
+        },
+        {
+         "index": 64,
+         "timestep": "0x1.b7d6000000000p-8"
+        },
+        {
+         "index": 65,
+         "timestep": "0x1.af28400000000p-6"
+        },
+        {
+         "index": 66,
+         "timestep": "0x1.8181800000000p-7"
+        },
+        {
+         "index": 67,
+         "timestep": "0x1.745d200000000p-5"
+        },
+        {
+         "index": 68,
+         "timestep": "0x1.dae5800000000p-7"
+        },
+        {
+         "index": 69,
+         "timestep": "0x1.c71c600000000p-5"
+        },
+        {
+         "index": 70,
+         "timestep": "0x1.1c96000000000p-6"
+        },
+        {
+         "index": 71,
+         "timestep": "0x1.0e7db00000000p-4"
+        },
+        {
+         "index": 72,
+         "timestep": "0x1.8306400000000p-6"
+        },
+        {
+         "index": 73,
+         "timestep": "0x1.6969800000000p-4"
+        },
+        {
+         "index": 74,
+         "timestep": "0x1.bacf800000000p-6"
+        },
+        {
+         "index": 75,
+         "timestep": "0x1.9999a00000000p-4"
+        },
+        {
+         "index": 76,
+         "timestep": "0x1.f604000000000p-6"
+        },
+        {
+         "index": 77,
+         "timestep": "0x1.cbc1400000000p-4"
+        },
+        {
+         "index": 78,
+         "timestep": "0x1.3c03000000000p-5"
+        },
+        {
+         "index": 79,
+         "timestep": "0x1.1b3be00000000p-3"
+        },
+        {
+         "index": 80,
+         "timestep": "0x1.5fcdc00000000p-5"
+        },
+        {
+         "index": 81,
+         "timestep": "0x1.37a6f80000000p-3"
+        },
+        {
+         "index": 82,
+         "timestep": "0x1.8618600000000p-5"
+        },
+        {
+         "index": 83,
+         "timestep": "0x1.5555580000000p-3"
+        },
+        {
+         "index": 84,
+         "timestep": "0x1.af28800000000p-5"
+        },
+        {
+         "index": 85,
+         "timestep": "0x1.745d180000000p-3"
+        },
+        {
+         "index": 86,
+         "timestep": "0x1.db4de00000000p-5"
+        },
+        {
+         "index": 87,
+         "timestep": "0x1.94d6600000000p-3"
+        },
+        {
+         "index": 88,
+         "timestep": "0x1.0572600000000p-4"
+        },
+        {
+         "index": 89,
+         "timestep": "0x1.b6db600000000p-3"
+        },
+        {
+         "index": 90,
+         "timestep": "0x1.1f2c600000000p-4"
+        },
+        {
+         "index": 91,
+         "timestep": "0x1.da89600000000p-3"
+        },
+        {
+         "index": 92,
+         "timestep": "0x1.5972200000000p-4"
+        },
+        {
+         "index": 93,
+         "timestep": "0x1.13b13c0000000p-2"
+        },
+        {
+         "index": 94,
+         "timestep": "0x1.7a9f400000000p-4"
+        },
+        {
+         "index": 95,
+         "timestep": "0x1.286bcc0000000p-2"
+        },
+        {
+         "index": 96,
+         "timestep": "0x1.9f03600000000p-4"
+        },
+        {
+         "index": 97,
+         "timestep": "0x1.3e452c0000000p-2"
+        },
+        {
+         "index": 98,
+         "timestep": "0x1.c71c700000000p-4"
+        },
+        {
+         "index": 99,
+         "timestep": "0x1.f383200000000p-4"
+        },
+        {
+         "index": 100,
+         "timestep": "0x1.6db6dc0000000p-2"
+        },
+        {
+         "index": 101,
+         "timestep": "0x1.1279680000000p-3"
+        },
+        {
+         "index": 102,
+         "timestep": "0x1.87878c0000000p-2"
+        },
+        {
+         "index": 103,
+         "timestep": "0x1.2e29f80000000p-3"
+        },
+        {
+         "index": 104,
+         "timestep": "0x1.a2e8bc0000000p-2"
+        },
+        {
+         "index": 105,
+         "timestep": "0x1.70e4f80000000p-3"
+        },
+        {
+         "index": 106,
+         "timestep": "0x1.def7bc0000000p-2"
+        },
+        {
+         "index": 107,
+         "timestep": "0x1.9999980000000p-3"
+        },
+        {
+         "index": 108,
+         "timestep": "0x1.0000000000000p-1"
+        },
+        {
+         "index": 109,
+         "timestep": "0x1.c8bf900000000p-3"
+        },
+        {
+         "index": 110,
+         "timestep": "0x1.11a7ba0000000p-1"
+        },
+        {
+         "index": 111,
+         "timestep": "0x1.2492480000000p-1"
+        },
+        {
+         "index": 112,
+         "timestep": "0x1.20d2100000000p-2"
+        },
+        {
+         "index": 113,
+         "timestep": "0x1.38e3900000000p-1"
+        },
+        {
+         "index": 114,
+         "timestep": "0x1.4873ec0000000p-2"
+        },
+        {
+         "index": 115,
+         "timestep": "0x1.4ec4ec0000000p-1"
+        },
+        {
+         "index": 116,
+         "timestep": "0x1.7943600000000p-2"
+        },
+        {
+         "index": 117,
+         "timestep": "0x1.6666660000000p-1"
+        },
+        {
+         "index": 118,
+         "timestep": "0x1.b6db6c0000000p-2"
+        },
+        {
+         "index": 119,
+         "timestep": "0x1.0381c00000000p-1"
+        },
+        {
+         "index": 120,
+         "timestep": "0x1.9bd37a0000000p-1"
+        },
+        {
+         "index": 121,
+         "timestep": "0x1.39ce740000000p-1"
+        },
+        {
+         "index": 122,
+         "timestep": "0x1.ba2e8c0000000p-1"
+        },
+        {
+         "index": 123,
+         "timestep": "0x1.8787880000000p-1"
+        },
+        {
+         "index": 124,
+         "timestep": "0x1.db6db60000000p-1"
+        },
+        {
+         "index": 125,
+         "timestep": "0x1.bd14000000000p-10"
+        },
+        {
+         "index": 126,
+         "timestep": "0x1.bacf000000000p-8"
+        },
+        {
+         "index": 127,
+         "timestep": "0x1.c58a000000000p-9"
+        },
+        {
+         "index": 128,
+         "timestep": "0x1.c0e1000000000p-7"
+        },
+        {
+         "index": 129,
+         "timestep": "0x1.5ac1000000000p-8"
+        },
+        {
+         "index": 130,
+         "timestep": "0x1.5555800000000p-6"
+        },
+        {
+         "index": 131,
+         "timestep": "0x1.d77b000000000p-8"
+        },
+        {
+         "index": 132,
+         "timestep": "0x1.cd85c00000000p-6"
+        },
+        {
+         "index": 133,
+         "timestep": "0x1.702e800000000p-7"
+        },
+        {
+         "index": 134,
+         "timestep": "0x1.642ca00000000p-5"
+        },
+        {
+         "index": 135,
+         "timestep": "0x1.b694000000000p-7"
+        },
+        {
+         "index": 136,
+         "timestep": "0x1.a5a5c00000000p-5"
+        },
+        {
+         "index": 137,
+         "timestep": "0x1.0000400000000p-6"
+        },
+        {
+         "index": 138,
+         "timestep": "0x1.e913200000000p-5"
+        },
+        {
+         "index": 139,
+         "timestep": "0x1.2652800000000p-6"
+        },
+        {
+         "index": 140,
+         "timestep": "0x1.1745c00000000p-4"
+        },
+        {
+         "index": 141,
+         "timestep": "0x1.783fc00000000p-6"
+        },
+        {
+         "index": 142,
+         "timestep": "0x1.5ffff00000000p-4"
+        },
+        {
+         "index": 143,
+         "timestep": "0x1.a41a400000000p-6"
+        },
+        {
+         "index": 144,
+         "timestep": "0x1.8618600000000p-4"
+        },
+        {
+         "index": 145,
+         "timestep": "0x1.d211000000000p-6"
+        },
+        {
+         "index": 146,
+         "timestep": "0x1.ad6b600000000p-4"
+        },
+        {
+         "index": 147,
+         "timestep": "0x1.0125e00000000p-5"
+        },
+        {
+         "index": 148,
+         "timestep": "0x1.d608600000000p-4"
+        },
+        {
+         "index": 149,
+         "timestep": "0x1.3521c00000000p-5"
+        },
+        {
+         "index": 150,
+         "timestep": "0x1.15b1f00000000p-3"
+        },
+        {
+         "index": 151,
+         "timestep": "0x1.5133800000000p-5"
+        },
+        {
+         "index": 152,
+         "timestep": "0x1.2c23580000000p-3"
+        },
+        {
+         "index": 153,
+         "timestep": "0x1.6ece600000000p-5"
+        },
+        {
+         "index": 154,
+         "timestep": "0x1.435e500000000p-3"
+        },
+        {
+         "index": 155,
+         "timestep": "0x1.8e13a00000000p-5"
+        },
+        {
+         "index": 156,
+         "timestep": "0x1.5b6db80000000p-3"
+        },
+        {
+         "index": 157,
+         "timestep": "0x1.d236000000000p-5"
+        },
+        {
+         "index": 158,
+         "timestep": "0x1.8e38d80000000p-3"
+        },
+        {
+         "index": 159,
+         "timestep": "0x1.f76b200000000p-5"
+        },
+        {
+         "index": 160,
+         "timestep": "0x1.a90e700000000p-3"
+        },
+        {
+         "index": 161,
+         "timestep": "0x1.0f7e100000000p-4"
+        },
+        {
+         "index": 162,
+         "timestep": "0x1.c4ec400000000p-3"
+        },
+        {
+         "index": 163,
+         "timestep": "0x1.2492500000000p-4"
+        },
+        {
+         "index": 164,
+         "timestep": "0x1.e1e1e00000000p-3"
+        },
+        {
+         "index": 165,
+         "timestep": "0x1.5328c00000000p-4"
+        },
+        {
+         "index": 166,
+         "timestep": "0x1.0fac6c0000000p-2"
+        },
+        {
+         "index": 167,
+         "timestep": "0x1.6cfd900000000p-4"
+        },
+        {
+         "index": 168,
+         "timestep": "0x1.2000040000000p-2"
+        },
+        {
+         "index": 169,
+         "timestep": "0x1.88c4700000000p-4"
+        },
+        {
+         "index": 170,
+         "timestep": "0x1.3105740000000p-2"
+        },
+        {
+         "index": 171,
+         "timestep": "0x1.a6b8000000000p-4"
+        },
+        {
+         "index": 172,
+         "timestep": "0x1.42c8580000000p-2"
+        },
+        {
+         "index": 173,
+         "timestep": "0x1.5555580000000p-2"
+        },
+        {
+         "index": 174,
+         "timestep": "0x1.ea41300000000p-4"
+        },
+        {
+         "index": 175,
+         "timestep": "0x1.68ba300000000p-2"
+        },
+        {
+         "index": 176,
+         "timestep": "0x1.0842180000000p-3"
+        },
+        {
+         "index": 177,
+         "timestep": "0x1.7d05f80000000p-2"
+        },
+        {
+         "index": 178,
+         "timestep": "0x1.1d2a200000000p-3"
+        },
+        {
+         "index": 179,
+         "timestep": "0x1.9249280000000p-2"
+        },
+        {
+         "index": 180,
+         "timestep": "0x1.341b300000000p-3"
+        },
+        {
+         "index": 181,
+         "timestep": "0x1.a895dc0000000p-2"
+        },
+        {
+         "index": 182,
+         "timestep": "0x1.4d65300000000p-3"
+        },
+        {
+         "index": 183,
+         "timestep": "0x1.6969600000000p-3"
+        },
+        {
+         "index": 184,
+         "timestep": "0x1.d89d880000000p-2"
+        },
+        {
+         "index": 185,
+         "timestep": "0x1.889f300000000p-3"
+        },
+        {
+         "index": 186,
+         "timestep": "0x1.f286bc0000000p-2"
+        },
+        {
+         "index": 187,
+         "timestep": "0x1.ab9ab80000000p-3"
+        },
+        {
+         "index": 188,
+         "timestep": "0x1.06eb400000000p-1"
+        },
+        {
+         "index": 189,
+         "timestep": "0x1.d316800000000p-3"
+        },
+        {
+         "index": 190,
+         "timestep": "0x1.1555580000000p-1"
+        },
+        {
+         "index": 191,
+         "timestep": "0x1.19c5980000000p-2"
+        },
+        {
+         "index": 192,
+         "timestep": "0x1.34b4b60000000p-1"
+        },
+        {
+         "index": 193,
+         "timestep": "0x1.37a6f40000000p-2"
+        },
+        {
+         "index": 194,
+         "timestep": "0x1.45d1740000000p-1"
+        },
+        {
+         "index": 195,
+         "timestep": "0x1.5ab5680000000p-2"
+        },
+        {
+         "index": 196,
+         "timestep": "0x1.5800000000000p-1"
+        },
+        {
+         "index": 197,
+         "timestep": "0x1.8469f00000000p-2"
+        },
+        {
+         "index": 198,
+         "timestep": "0x1.6b5ad80000000p-1"
+        },
+        {
+         "index": 199,
+         "timestep": "0x1.f51b3c0000000p-2"
+        },
+        {
+         "index": 200,
+         "timestep": "0x1.9611a80000000p-1"
+        },
+        {
+         "index": 201,
+         "timestep": "0x1.21ed800000000p-1"
+        },
+        {
+         "index": 202,
+         "timestep": "0x1.adb6dc0000000p-1"
+        },
+        {
+         "index": 203,
+         "timestep": "0x1.5555560000000p-1"
+        },
+        {
+         "index": 204,
+         "timestep": "0x1.c71c720000000p-1"
+        },
+        {
+         "index": 205,
+         "timestep": "0x1.9b47580000000p-1"
+        },
+        {
+         "index": 206,
+         "timestep": "0x1.e276280000000p-1"
+        }
+       ]
+      },
+      "task": "ref2va"
+     },
+     "ffn_dim": 14336,
+     "final_norm_eps": 1e-05,
+     "freq_dim": 256,
+     "hidden_size": 5376,
+     "in_channels": 24,
+     "norm_eps": 1e-05,
+     "num_attention_heads": 56,
+     "num_layers": 50,
+     "num_refiner_layers": 2,
+     "patch_size": [
+      1,
+      2,
+      2
+     ],
+     "qk_norm_eps": 1e-05,
+     "rope_freq_dim": 16,
+     "rope_theta": 10000,
+     "text_dim": 5120,
+     "time_embed_dim": 2688,
+     "time_embed_hidden_dim": 5376
+    },
+    "text_encoder": {
+     "architectures": [
+      "Qwen3VLForConditionalGeneration"
+     ],
+     "cozy_h3": {
+      "conditioning_hidden_state": 50,
+      "language_model_head": false,
+      "output": "pre_norm",
+      "retained_decoder_layers": 50,
+      "source_architecture": "Qwen3VLForConditionalGeneration"
+     },
+     "image_token_id": 151655,
+     "model_type": "qwen3_vl",
+     "text_config": {
+      "attention_bias": false,
+      "attention_dropout": 0,
+      "bos_token_id": 151643,
+      "dtype": "bfloat16",
+      "eos_token_id": 151645,
+      "head_dim": 128,
+      "hidden_act": "silu",
+      "hidden_size": 5120,
+      "initializer_range": 0.02,
+      "intermediate_size": 25600,
+      "max_position_embeddings": 262144,
+      "model_type": "qwen3_vl_text",
+      "num_attention_heads": 64,
+      "num_hidden_layers": 64,
+      "num_key_value_heads": 8,
+      "rms_norm_eps": 1e-06,
+      "rope_scaling": {
+       "mrope_interleaved": true,
+       "mrope_section": [
+        24,
+        20,
+        20
+       ],
+       "rope_type": "default"
+      },
+      "rope_theta": 5000000,
+      "use_cache": true,
+      "vocab_size": 151936
+     },
+     "tie_word_embeddings": false,
+     "transformers_version": "4.57.0.dev0",
+     "video_token_id": 151656,
+     "vision_config": {
+      "deepstack_visual_indexes": [
+       8,
+       16,
+       24
+      ],
+      "depth": 27,
+      "hidden_act": "gelu_pytorch_tanh",
+      "hidden_size": 1152,
+      "in_channels": 3,
+      "initializer_range": 0.02,
+      "intermediate_size": 4304,
+      "model_type": "qwen3_vl",
+      "num_heads": 16,
+      "num_position_embeddings": 2304,
+      "out_hidden_size": 5120,
+      "patch_size": 16,
+      "spatial_merge_size": 2,
+      "temporal_patch_size": 2
+     },
+     "vision_end_token_id": 151653,
+     "vision_start_token_id": 151652
+    },
+    "video_vae": {
+     "_class_name": "AutoencoderKLMiniMaxH3",
+     "_diffusers_version": "0.36.0.dev0",
+     "block_out_channels": [
+      128,
+      256,
+      256,
+      512,
+      512,
+      1024
+     ],
+     "clip_length": 17,
+     "decoder_attention_head_dim": 64,
+     "decoder_ffn_mult": 4,
+     "decoder_norm_eps": 1e-05,
+     "decoder_num_attention_heads": 32,
+     "decoder_num_layers": 36,
+     "decoder_num_register_tokens": 4,
+     "decoder_rope_dim_ratio": 0.75,
+     "decoder_rope_theta": 100,
+     "in_channels": 3,
+     "latent_channels": 24,
+     "latents_mean": [
+      0.858090341091156,
+      -0.9606591463088989,
+      1.0661640167236328,
+      -0.5090325474739075,
+      -0.2727581858634949,
+      -1.3675414323806763,
+      -0.2553254961967468,
+      -0.26907554268836975,
+      -0.5376840829849243,
+      -0.0464097298681736,
+      0.6657370328903198,
+      0.19690127670764923,
+      -0.5460608005523682,
+      -0.4035342037677765,
+      -0.23683024942874908,
+      0.25928452610969543,
+      -0.30133944749832153,
+      0.211341992020607,
+      -1.1206848621368408,
+      0.3581933379173279,
+      -0.04225143790245056,
+      0.2604829967021942,
+      0.22864092886447906,
+      0.7056031823158264
+     ],
+     "latents_std": [
+      1.2223774194717407,
+      1.2767263650894165,
+      1.6831774711608887,
+      1.7549455165863037,
+      1.5636216402053833,
+      2.194143533706665,
+      0.9653137922286987,
+      1.0569885969161987,
+      0.841948926448822,
+      0.7729952931404114,
+      1.8955937623977661,
+      0.946841835975647,
+      0.7996809482574463,
+      0.44988900423049927,
+      0.7197399735450745,
+      0.6936293244361877,
+      2.961095094680786,
+      2.7694199085235596,
+      3.0496184825897217,
+      2.1088054180145264,
+      3.276226282119751,
+      3.1627357006073,
+      2.2816812992095947,
+      2.6127843856811523
+     ],
+     "layers_per_block": 2,
+     "norm_eps": 1e-06,
+     "norm_num_groups": 32,
+     "out_channels": 3,
+     "spatial_downsample_factors": [
+      2,
+      2,
+      2,
+      2,
+      1,
+      1
+     ],
+     "spatial_padding_mode": "reflect",
+     "temporal_downsample_factors": [
+      1,
+      2,
+      2,
+      1,
+      1,
+      1
+     ],
+     "token_drop": 3
+    }
+   }
+  },
+  "manifest": {
+   "length": 164,
+   "sha256": "ddf7981a6081dfeb4b4b4e7345d006e22d1922fbf08cbfef0b2bf9055a33b52e"
+  },
+  "name": "acme/v1-h3",
+  "parts": [
+   "38e0a12d0b0f4617ff5761e9f979ac2ff4a614fceae5662d2c3b705e22ba2c4d",
+   "5b15b024d02977f8ddc7e3a901b5a1fa10101430c1abf2e91ea78698c921a38e",
+   "82dfe06d92f2667d093db1b6dfd01328e1b5ec2ecc77dd9b0eb17812717e68e4",
+   "b53aa5bbb89bf59781a91d20005846a9d1884b7750b16c8113310712f31b40b1"
+  ],
+  "tensors": [
+   "fl2va_dit/proj_out.bias",
+   "ref2va_dit/proj_out.bias",
+   "audio_vae/decoder.conv_post.weight_g",
+   "audio_vae/decoder.activation_post.act.alpha"
+  ]
+ }
+]
