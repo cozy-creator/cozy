@@ -44,7 +44,10 @@ pub const MEMHOSTREGISTER_PORTABLE: c_uint = 0x1;
 /// The range is mapped read-only (a sealed layout); the device only reads it.
 pub const MEMHOSTREGISTER_READ_ONLY: c_uint = 0x8;
 pub const MEMHOSTALLOC_PORTABLE: c_uint = 0x1;
+pub const MEMHOSTALLOC_DEVICEMAP: c_uint = 0x2;
 
+pub const ATTR_CAN_MAP_HOST_MEMORY: c_int = 19;
+pub const ATTR_UNIFIED_ADDRESSING: c_int = 41;
 pub const ATTR_VMM_SUPPORTED: c_int = 102;
 pub const ATTR_PCI_BUS_ID: c_int = 33;
 pub const ATTR_PCI_DEVICE_ID: c_int = 34;
@@ -127,6 +130,7 @@ pub struct Driver {
     pub stream_create: unsafe extern "C" fn(*mut CUstream, c_uint) -> CUresult,
     pub stream_destroy: F<CUstream>,
     pub stream_synchronize: F<CUstream>,
+    pub stream_is_capturing: unsafe extern "C" fn(CUstream, *mut c_int) -> CUresult,
     pub stream_wait_event: unsafe extern "C" fn(CUstream, CUevent, c_uint) -> CUresult,
     pub event_create: unsafe extern "C" fn(*mut CUevent, c_uint) -> CUresult,
     pub event_destroy: F<CUevent>,
@@ -172,6 +176,8 @@ pub struct Driver {
     pub mem_host_register: unsafe extern "C" fn(*mut c_void, usize, c_uint) -> CUresult,
     pub mem_host_unregister: F<*mut c_void>,
     pub mem_host_alloc: unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> CUresult,
+    pub mem_host_get_device_pointer:
+        unsafe extern "C" fn(*mut CUdeviceptr, *mut c_void, c_uint) -> CUresult,
     pub mem_free_host: F<*mut c_void>,
     pub mem_alloc: unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult,
     pub pointer_get_attribute: unsafe extern "C" fn(*mut c_void, c_int, CUdeviceptr) -> CUresult,
@@ -254,6 +260,7 @@ impl Driver {
             stream_create: load!(lib, b"cuStreamCreate"),
             stream_destroy: load!(lib, b"cuStreamDestroy_v2"),
             stream_synchronize: load!(lib, b"cuStreamSynchronize"),
+            stream_is_capturing: load!(lib, b"cuStreamIsCapturing"),
             stream_wait_event: load!(lib, b"cuStreamWaitEvent"),
             event_create: load!(lib, b"cuEventCreate"),
             event_destroy: load!(lib, b"cuEventDestroy_v2"),
@@ -275,6 +282,7 @@ impl Driver {
             mem_host_register: load!(lib, b"cuMemHostRegister_v2"),
             mem_host_unregister: load!(lib, b"cuMemHostUnregister"),
             mem_host_alloc: load!(lib, b"cuMemHostAlloc"),
+            mem_host_get_device_pointer: load!(lib, b"cuMemHostGetDevicePointer_v2"),
             mem_free_host: load!(lib, b"cuMemFreeHost"),
             mem_alloc: load!(lib, b"cuMemAlloc_v2"),
             pointer_get_attribute: load!(lib, b"cuPointerGetAttribute"),

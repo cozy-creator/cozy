@@ -995,6 +995,32 @@ impl Drop for DeviceArray {
     }
 }
 
+pub(crate) struct MappedArray {
+    buffer: Option<tensorfs::io::MappedBuffer>,
+    pub(crate) access: Mutex<()>,
+}
+
+impl MappedArray {
+    pub(crate) fn new(buffer: tensorfs::io::MappedBuffer) -> Arc<Self> {
+        Arc::new(Self { buffer: Some(buffer), access: Mutex::new(()) })
+    }
+}
+
+impl std::ops::Deref for MappedArray {
+    type Target = tensorfs::io::MappedBuffer;
+    fn deref(&self) -> &Self::Target {
+        self.buffer.as_ref().expect("live mapped host allocation")
+    }
+}
+
+impl Drop for MappedArray {
+    fn drop(&mut self) {
+        // The actual host allocation and admission lease move together. The existing
+        // cleanup worker performs the buffer's checked consumer completion off Python.
+        crate::cleanup::defer(self.buffer.take());
+    }
+}
+
 /// An unsuccessful CUDA operation may still reference these actual allocations. Cleanup
 /// runs after caller locks have ended; the shared engine owns the completion proof.
 struct FailedCuda<T> {
@@ -1022,6 +1048,7 @@ pub(crate) fn defer_failed_cuda<T: Send + 'static>(device: i32, owner: T) {
 pub(crate) enum ArrayBuffer {
     Host(Arc<Aligned>),
     Device(Arc<DeviceArray>),
+    Mapped(Arc<MappedArray>),
 }
 
 impl ArrayBuffer {
@@ -1029,24 +1056,27 @@ impl ArrayBuffer {
         match self {
             Self::Host(b) => b.len,
             Self::Device(b) => b.len(),
+            Self::Mapped(b) => b.len(),
         }
     }
     pub(crate) fn host(&self) -> Option<&[u8]> {
         match self {
             Self::Host(b) => Some(b.bytes()),
-            Self::Device(_) => None,
+            Self::Device(_) | Self::Mapped(_) => None,
         }
     }
     fn ptr(&self) -> *mut c_void {
         match self {
             Self::Host(b) => b.ptr() as _,
             Self::Device(b) => b.ptr() as usize as _,
+            Self::Mapped(b) => b.ptr() as usize as _,
         }
     }
     fn device(&self) -> (i32, i32) {
         match self {
             Self::Host(_) => (KDL_CPU, 0),
             Self::Device(b) => (KDL_CUDA, b.device()),
+            Self::Mapped(b) => (KDL_CUDA, b.device()),
         }
     }
     fn duplicate(&self) -> Result<Self, Failure> {
@@ -1073,6 +1103,24 @@ impl ArrayBuffer {
                     },
                 };
                 // SAFETY: both allocations remain held until the copy completes.
+                if let Err(error) = unsafe { io::read(&[request], &ReadOpts::default()) } {
+                    defer_failed_cuda(b.device(), (Arc::clone(b), copy));
+                    return Err(error.source.into());
+                }
+                Self::Device(DeviceArray::new(copy))
+            }
+            Self::Mapped(b) => {
+                let _access = b.access.lock().unwrap_or_else(|e| e.into_inner());
+                b.synchronize()?;
+                // An explicit DLPack copy is a normal CUDA allocation. It never creates
+                // a second host allocation without a new admission reservation.
+                let copy = io::DeviceBuffer::new(b.device(), b.len())?;
+                let request = Copy {
+                    src: Src::Host(b.host_ptr()),
+                    dst: Dst::Device {
+                        device: b.device(), ptr: copy.ptr(), len: copy.len(), stream: 0,
+                    },
+                };
                 if let Err(error) = unsafe { io::read(&[request], &ReadOpts::default()) } {
                     defer_failed_cuda(b.device(), (Arc::clone(b), copy));
                     return Err(error.source.into());
@@ -1201,29 +1249,44 @@ impl PyArray {
         if let Some(bytes) = self.buf.host() {
             return Ok(PyBytes::new(py, bytes));
         }
-        let ArrayBuffer::Device(buffer) = &self.buf else {
-            unreachable!()
-        };
+        let buffer = self.buf.clone();
+        let device = buffer.device().1;
         let bytes = py
             .detach(|| -> Result<Vec<u8>, Failure> {
                 use tensorfs::io::{self, Copy, Dst, ReadOpts, Src};
+                let _access = match &buffer {
+                    ArrayBuffer::Mapped(b) => Some(b.access.lock().unwrap_or_else(|e| e.into_inner())),
+                    _ => None,
+                };
                 let mut bytes = vec![0; buffer.len()];
                 let request = Copy {
-                    src: Src::Device {
-                        device: buffer.device(),
-                        ptr: buffer.ptr(),
-                        stream: 0,
+                    src: match &buffer {
+                        ArrayBuffer::Device(b) => Src::Device {
+                            device, ptr: b.ptr(), stream: 0,
+                        },
+                        ArrayBuffer::Mapped(b) => {
+                            b.synchronize()?;
+                            Src::Host(b.host_ptr())
+                        }
+                        ArrayBuffer::Host(_) => unreachable!(),
                     },
                     dst: Dst::host(&mut bytes),
                 };
                 if let Err(error) = unsafe { io::read(&[request], &ReadOpts::default()) } {
-                    defer_failed_cuda(buffer.device(), (Arc::clone(buffer), bytes));
+                    defer_failed_cuda(device, (buffer.clone(), bytes));
                     return Err(error.source.into());
                 }
                 Ok(bytes)
             })
             .or_raise(py)?;
         Ok(PyBytes::new(py, &bytes))
+    }
+
+    #[pyo3(signature = (source, axis, offset, *, stream))]
+    fn _write_band(
+        &self, py: Python<'_>, source: &Bound<'_, PyAny>, axis: usize, offset: u64, stream: usize,
+    ) -> PyResult<()> {
+        crate::tensors::write_band(py, self, source, axis, offset, stream)
     }
 
     #[pyo3(signature = (*, stream = None, max_version = None, dl_device = None, copy = None))]
@@ -1249,6 +1312,13 @@ impl PyArray {
                 return Err(pyo3::exceptions::PyBufferError::new_err(
                     "CUDA DLPack copy=True with an explicit consumer stream is unsupported",
                 ));
+            }
+            if let ArrayBuffer::Mapped(buffer) = &self.buf {
+                if value != -1 && py.detach(|| buffer.is_capturing(value as usize)).or_raise(py)? {
+                    return Err(pyo3::exceptions::PyBufferError::new_err(
+                        "mapped host DLPack export during CUDA capture is unsupported",
+                    ));
+                }
             }
             // Every TensorFS read/launch drains before returning. The allocation is ready
             // on every consumer stream, including the DLPack default-stream sentinels.
@@ -1431,7 +1501,8 @@ impl Drop for DlpackLifetime {
     }
 }
 
-/// The one shared contiguous DLPack parser for Writer sources and read destinations.
+/// The one shared DLPack parser for Writer sources and read destinations. Contiguous by
+/// default; mapped-output band sources additionally permit validated nonnegative strides.
 /// Validated legacy capsules are consumed once and retain a unique managed deleter.
 pub(crate) struct Dlpack {
     lifetime: DlpackLifetime,
@@ -1440,6 +1511,7 @@ pub(crate) struct Dlpack {
     pub(crate) shape: Vec<u64>,
     pub(crate) len: usize,
     pub(crate) address: usize,
+    pub(crate) strides: Vec<u64>,
 }
 
 impl Dlpack {
@@ -1448,6 +1520,17 @@ impl Dlpack {
         data: &Bound<'_, PyAny>,
         dtype: Option<String>,
         shape: Option<Vec<u64>>,
+    ) -> PyResult<Self> {
+        Self::parse(py, data, dtype, shape, false)
+    }
+
+    pub(crate) fn strided(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Self::parse(py, data, None, None, true)
+    }
+
+    fn parse(
+        py: Python<'_>, data: &Bound<'_, PyAny>, dtype: Option<String>,
+        shape: Option<Vec<u64>>, strided: bool,
     ) -> PyResult<Self> {
         let device: (i32, i32) = data.call_method0("__dlpack_device__")?.extract()?;
         let stream = match device {
@@ -1525,10 +1608,16 @@ impl Dlpack {
                 .map(|d| u64::try_from(*d).map_err(|_| invalid(py, "DLPack shape is negative")))
                 .collect::<PyResult<_>>()?;
             let mut stride = 1i64;
+            let mut strides = vec![0; dims.len()];
             for i in (0..dims.len()).rev() {
-                if !tensor.strides.is_null()
+                let actual = if tensor.strides.is_null() { stride } else {
+                    unsafe { *tensor.strides.add(i) }
+                };
+                strides[i] = u64::try_from(if strided { actual } else { stride })
+                    .map_err(|_| invalid(py, "negative DLPack strides are unsupported"))?;
+                if !strided
                     && dims[i] > 1
-                    && unsafe { *tensor.strides.add(i) } != stride
+                    && actual != stride
                 {
                     return Err(invalid(py, "expected a contiguous DLPack array"));
                 }
@@ -1564,9 +1653,21 @@ impl Dlpack {
             if address.checked_add(len).is_none() {
                 return Err(invalid(py, "DLPack address range overflows"));
             }
-            Ok((dtype, shape, len, address, managed as usize))
+            if strided && len != 0 {
+                let width = dtype.byte_len(&[1])
+                    .ok_or_else(|| invalid(py, "DLPack element width is unsupported"))?;
+                let end = inferred_shape.iter().zip(&strides).try_fold(0u64, |end, (&dim, &step)| {
+                    dim.saturating_sub(1).checked_mul(step).and_then(|part| end.checked_add(part))
+                }).and_then(|end| end.checked_add(1)).and_then(|end| end.checked_mul(width))
+                    .and_then(|end| usize::try_from(end).ok())
+                    .and_then(|span| address.checked_add(span));
+                if end.is_none() {
+                    return Err(invalid(py, "strided DLPack address range overflows"));
+                }
+            }
+            Ok((dtype, shape, len, address, managed as usize, strides))
         })();
-        let (dtype, shape, len, address, managed) = parsed?;
+        let (dtype, shape, len, address, managed, strides) = parsed?;
         let release = lifetime.0.as_mut().unwrap();
         let capsule = release.capsule.as_ref().unwrap().bind(py);
         // SAFETY: both names have static storage. Validation completed before this
@@ -1582,6 +1683,7 @@ impl Dlpack {
             shape,
             len,
             address,
+            strides,
         })
     }
 
