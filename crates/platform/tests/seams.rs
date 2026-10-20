@@ -112,6 +112,11 @@ fn main() {
             a_user_service_starts_and_stops,
             true,
         ),
+        (
+            "a_service_that_exited_starts_again_at_once",
+            a_service_that_exited_starts_again_at_once,
+            true,
+        ),
     ];
     let mut failed = vec![];
     for &(name, test, installing) in tests {
@@ -205,6 +210,12 @@ fn child(args: &[String]) {
             loop {
                 thread::park();
             }
+        }
+        ["service-exit", file, home, name] => {
+            Services::new(&Home::at(home), Path::new(home))
+                .announce(name)
+                .unwrap();
+            durable::replace(Path::new(file), b"ran", 0o600).unwrap();
         }
         _ => panic!("unknown child role {args:?}"),
     }
@@ -645,6 +656,54 @@ fn a_user_service_starts_and_stops() {
         service.wait().unwrap();
     }
     services.uninstall(&spec.name).unwrap();
+}
+
+/// A service that ended by itself, as Calcifer does on `cozy down`, starts again as soon as it is
+/// asked: launchd holds a loaded job's next spawn until 10 s after its last (macOS, ~9 s).
+fn a_service_that_exited_starts_again_at_once() {
+    let dir = scratch("service-exit");
+    let home = Home::at(dir.join("home"));
+    home.open().unwrap();
+    #[allow(deprecated)]
+    let services = Services::new(&home, &env::home_dir().unwrap());
+    if !services.available() {
+        println!("no user service manager in this session: nothing installed");
+        return;
+    }
+    let file = dir.join("report");
+    let name = format!("platform-test-exit-{}", std::process::id());
+    let spec = ServiceSpec {
+        name: name.clone(),
+        program: env::current_exe().unwrap(),
+        args: vec![
+            "child".into(),
+            "service-exit".into(),
+            file.clone().into(),
+            home.root().into(),
+            name.into(),
+        ],
+        log: Some(dir.join("service.log")),
+    };
+    // Asked again until it runs, as the CLI starts Calcifer.
+    let ran = || {
+        let asked = std::time::Instant::now();
+        loop {
+            services.start(&spec).unwrap();
+            thread::sleep(Duration::from_millis(50));
+            if fs::remove_file(&file).is_ok() {
+                return asked.elapsed();
+            }
+        }
+    };
+    ran();
+    // It wrote its report just before it exited: let it be gone.
+    thread::sleep(Duration::from_millis(500));
+    let again = ran();
+    services.uninstall(&spec.name).unwrap();
+    assert!(
+        again < Duration::from_secs(5),
+        "a start of a service that exited waited {again:?}"
+    );
 }
 
 /// The service's report, once it runs: it has no visible console window, and it is alive.
