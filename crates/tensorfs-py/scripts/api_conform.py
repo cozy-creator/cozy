@@ -38,6 +38,7 @@ with TemporaryDirectory() as temp:
     (root / "folder/README.md").write_text("a repo file\n")
     ck = writer.commit()
     assert not hasattr(ck, "read") and not hasattr(ck, "tensors") and not hasattr(ck, "path"), "checkpoint-wide tensor APIs remain public"
+    assert callable(ck.download) and not hasattr(ck, "fetch")
     assert tensorfs.open(root / "folder", variant="f32").id == ck.id
     assert tensorfs.open(root / "folder/model.f32.cozytensors").id == ck.id
     assert np.array_equal(np.from_dlpack(ck.components["model"].tensors.read("weight")), values)
@@ -93,8 +94,24 @@ with TemporaryDirectory() as temp:
     assert selected.missing(["optimizer"]), "a model-only snapshot fetched the optimizer"
     assert np.array_equal(np.from_dlpack(selected.components["model"].tensors.read("weight")), values)
     assert metadata.missing(["optimizer"]), "reading one component fetched another"
+    eager_cache = root / "eager-cache"
+    eager = tensorfs.open("acme/example", revision="1", variant="f32", endpoint=origin,
+                          cache_dir=eager_cache, lazy=False)
+    assert eager.missing() == [] and eager.id == ck.id
+    assert eager.components["model"].asset("tokenizer.json") == b"{}"
+    assert not (eager_cache / "snapshots" / remote_tree.removeprefix("sha256:")).exists()
+    thin = root / "thin.cozytensors"
+    thin.write_bytes((root / "folder/model.f32.cozytensors").read_bytes())
+    offline = dict(endpoint="http://127.0.0.1:1", cache_dir=root / "offline", local_files_only=True)
+    assert tensorfs.open(thin, **offline).id == ck.id
+    try:
+        tensorfs.open(thin, lazy=False, **offline)
+    except tensorfs.NotFoundError:
+        pass
+    else:
+        raise AssertionError("eager local-only open returned with missing checkpoint data")
     progress = []
-    metadata.fetch(["model"], progress=lambda stage, held, total: progress.append((stage, held, total)))
+    metadata.download(["model"], progress=lambda stage, held, total: progress.append((stage, held, total)))
     assert progress[0][0] == "fetch" and progress[-1][1] == progress[-1][2]
     callback_failure = tensorfs.NetworkError("consumer progress failed")
 
@@ -102,7 +119,7 @@ with TemporaryDirectory() as temp:
         raise callback_failure
 
     try:
-        metadata.fetch(progress=stop)
+        metadata.download(progress=stop)
     except tensorfs.NetworkError as error:
         assert error is callback_failure
     else:

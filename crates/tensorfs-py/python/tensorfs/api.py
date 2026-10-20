@@ -30,9 +30,9 @@ def _client(cache_dir=None, endpoint=None, token=None, ca_der=None, *, configure
     return _ext._Client(_cache(cache_dir), endpoint=_endpoint(endpoint), token=credential, ca_der=ca_der)
 
 
-def open(name_or_path, *, revision=None, variant=None, endpoint=None, local_files_only=False, cache_dir=None, token=None, ca_der=None):
+def open(name_or_path, *, revision=None, variant=None, endpoint=None, local_files_only=False, cache_dir=None, token=None, ca_der=None, lazy=True):
     return _client(cache_dir, endpoint, token, ca_der).open(
-        os.fspath(name_or_path), revision=revision, variant=variant, local_files_only=local_files_only
+        os.fspath(name_or_path), revision=revision, variant=variant, local_files_only=local_files_only, lazy=lazy
     )
 
 

@@ -47,7 +47,7 @@ assert reader.missing(), "opening metadata fetched data"
 assert reader.components["model"].asset("tokenizer.json") == b"{}"
 assert reader.missing(), "a component path fetched its weights"
 progress = []
-reader.fetch(progress=lambda stage, held, total: progress.append((stage, held, total)))
+reader.download(progress=lambda stage, held, total: progress.append((stage, held, total)))
 assert progress and progress[-1][0] == "fetch" and progress[-1][1] == progress[-1][2]
 assert reader.components["model"].tensors.read("weight").tobytes() == data
 folder = tensorfs.materialize(published.tree, local_files_only=True, cache_dir=cache)

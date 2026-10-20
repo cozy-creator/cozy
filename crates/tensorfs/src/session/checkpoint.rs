@@ -9,7 +9,7 @@ use crate::format::{self, Body, ObjectRef, PartBytes};
 use crate::io::{Dst, ReadOpts, Target};
 use crate::store2::{CacheGuard, Checkpoint as Stored, Store};
 
-use super::{remote::Remote, Fetch, Fetched, Ref, Selection};
+use super::{remote::Remote, Download, Fetched, Ref, Selection};
 
 struct LocalRepo {
     root: PathBuf,
@@ -174,12 +174,12 @@ impl Checkpoint {
             .collect()
     }
 
-    pub async fn fetch(&self, want: &Fetch<'_>) -> Result<Fetched> {
+    pub async fn download(&self, want: &Download<'_>) -> Result<Fetched> {
         let objects = self.wanted(&want.selection)?;
         self.fetch_list(objects, want).await
     }
 
-    async fn fetch_list(&self, objects: Vec<ObjectRef>, want: &Fetch<'_>) -> Result<Fetched> {
+    async fn fetch_list(&self, objects: Vec<ObjectRef>, want: &Download<'_>) -> Result<Fetched> {
         let total = objects.iter().map(|o| o.length).sum();
         let mut local = 0;
         let mut missing = Vec::new();
@@ -205,10 +205,10 @@ impl Checkpoint {
                     Some(report) => report(local + held, total),
                     None => Ok(()),
                 };
-                let selected = Fetch {
+                let selected = Download {
                     priority: want.priority,
                     progress: want.progress.map(|_| &progress as &super::Progress<'_>),
-                    ..Fetch::default()
+                    ..Download::default()
                 };
                 let mut landed = remote.fetch(&missing, &selected).await?;
                 landed.local += local;
@@ -222,28 +222,11 @@ impl Checkpoint {
     }
 
     fn wanted(&self, selection: &Selection) -> Result<Vec<ObjectRef>> {
-        let mut objects = super::selection::objects(&self.data.raw, selection)?;
-        if matches!(selection, Selection::All) {
-            if let Some(tree) = &self.data.tree {
-                objects.extend(
-                    self.data
-                        .store
-                        .tree(tree)?
-                        .repo_files()
-                        .map(|(_, object)| object.clone()),
-                );
-            }
-        }
-        Ok(objects
-            .into_iter()
-            .map(|o| (o.sha256.clone(), o))
-            .collect::<BTreeMap<_, _>>()
-            .into_values()
-            .collect())
+        super::selection::objects(&self.data.raw, selection)
     }
 
     fn export_paths(&self) -> Result<BTreeMap<String, PathBuf>> {
-        // This synchronous door never starts a runtime or hidden download. Fetch All first.
+        // This synchronous door never starts a runtime or hidden download. Download All first.
         if let Some(missing) = self.missing(&Selection::All)?.first() {
             return fail(
                 Kind::NotFound,
@@ -280,7 +263,7 @@ impl Checkpoint {
     pub(crate) async fn fetch_objects_exact(
         &self,
         objects: &[ObjectRef],
-        want: &Fetch<'_>,
+        want: &Download<'_>,
     ) -> Result<Fetched> {
         let mut allowed = self.wanted(&Selection::All)?;
         allowed.push(self.id().clone());
@@ -473,7 +456,7 @@ impl Component {
         Ok(self.data.raw.asset(&self.name, name)?)
     }
     /// Write config and support files into the caller's directory, never model weights.
-    /// Fetch Selection::Assets first; this synchronous operation never downloads.
+    /// Download Selection::Assets first; this synchronous operation never downloads.
     pub fn export_files(&self, dir: &Path) -> Result<PathBuf> {
         Ok(self.data.raw.export_component_files(&self.name, dir)?)
     }
