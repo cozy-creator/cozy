@@ -189,8 +189,11 @@ impl Client {
     pub async fn open(&self, name_or_path: &str, options: &Open) -> Result<Checkpoint> {
         let path = Path::new(name_or_path);
         if path.exists() {
+            let path = path
+                .canonicalize()
+                .map_err(|e| io_failure(path.display(), e))?;
             let raw = crate::store2::Checkpoint::folder(
-                path,
+                &path,
                 options.variant.as_deref(),
                 Some(&self.store),
             )?;
@@ -202,7 +205,7 @@ impl Client {
                 // mounted mirror, but never falls through to a remote endpoint.
                 offline: true,
             };
-            return Checkpoint::local(raw, source);
+            return Checkpoint::local(raw, source, &path);
         }
         let mut reference: Ref = name_or_path.parse()?;
         if let Some(revision) = &options.revision {
@@ -313,5 +316,22 @@ fn io_failure(context: impl fmt::Display, error: std::io::Error) -> Failure {
             Kind::Io
         },
         detail: format!("{context}: {error}"),
+    }
+}
+
+/// Output supported by the existing serializer; payload must be fetched before this sync door.
+#[derive(Clone, Copy, Debug)]
+pub enum Format {
+    Safetensors,
+}
+
+pub fn export(
+    checkpoint: &Checkpoint,
+    dir: &Path,
+    format: Format,
+    dequantize: Option<crate::format::Dtype>,
+) -> Result<Vec<String>> {
+    match format {
+        Format::Safetensors => checkpoint.export_to(dir, dequantize.as_ref()),
     }
 }
