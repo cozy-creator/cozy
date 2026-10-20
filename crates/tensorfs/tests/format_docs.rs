@@ -7,6 +7,7 @@ use tensorfs::format::{
     variant_of, variant_path, Body, Component, Config, ConfigValue, Dtype, Encoding, Header,
     Location, ObjectRef, Part, Pipeline, Release, Repo, Tensor, Tree, Value, HEADER_PATH,
 };
+use tensorfs::writer::{Data, Source, Writer};
 
 fn tensors() -> Vec<Tensor> {
     let plain = Tensor {
@@ -91,6 +92,24 @@ fn header_with(tensors: Vec<Tensor>) -> Header {
 
 fn header() -> Header {
     header_with(tensors())
+}
+
+/// A written checkpoint's header carries exactly `cozytensors/1`: its id is its digest, so one
+/// header has one spelling of its tag.
+#[test]
+fn a_written_checkpoint_tags_its_header_exactly() {
+    let dir = std::env::temp_dir().join(format!("tfs-format-tag-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut w = Writer::folder(&dir, "bf16", None, false).unwrap();
+    let mut c = w.component("unet", "diffusers.UNet2DConditionModel", Config::new(), None).unwrap();
+    let bytes = [7u8; 12];
+    c.put("a.weight", &Dtype::BF16, &[2, 3], Data::Plain(Source::Read(&mut &bytes[..]))).unwrap();
+    let id = w.commit().unwrap();
+    let header = std::fs::read(dir.join(variant_path("bf16"))).unwrap();
+    assert_eq!(&header[..15], b"\x86\x6dcozytensors/1");
+    assert_eq!(header.windows(12).filter(|w| w == b"cozytensors/").count(), 1);
+    assert_eq!(ObjectRef::of(&header), id);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

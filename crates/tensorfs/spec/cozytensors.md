@@ -44,8 +44,9 @@ representations that produce the same logical tensor need not have the same id.
 
 ## 2. Documents
 
-Trees, headers and repos are documents. Each carries a `format` tag `<kind>/<major>` or `<kind>/<major>.<minor>`,
-where major and minor are decimal digits:
+Trees, headers and repos are documents. Each carries a `format` tag `<kind>/1`. A writer MUST write exactly that
+(`cozytensors/1`, never `cozytensors/1.0` or another minor): a document's id is its digest, so one document has one
+spelling. A reader also accepts `<kind>/1.<minor>`, the minor one or more decimal digits.
 
 | Document | `format` kind | Encoding (§9) | Usual name |
 |---|---|---|---|
@@ -56,11 +57,9 @@ where major and minor are decimal digits:
 The schemas describe structure; they do not replace the rules below for canonical encoding, duplicate keys,
 value domains, arithmetic bounds and reference closure.
 
-- A reader MUST refuse a document whose kind differs or whose major is not `1`. Within the baseline defined here
-  it MUST accept any minor, subject to the structural rules below. The provisional pre-cut layouts are a specific
-  exception, described in §8 and §9.
-- A reader MUST ignore what a later minor adds: unknown fields of a JSON document, at every level, and trailing
-  elements of the header's records (§4). Adding them never needs a new major.
+- A reader MUST refuse a document whose kind differs or whose major is not `1`, and a pre-cut header (§9).
+- A reader MUST ignore what a later writer adds (§8): unknown fields of a JSON document, at every level, and
+  trailing elements of the header's records (§4).
 - Values are booleans, integers in [−2^63, 2^64), strings, lists and maps with string keys. There are no null values
   and no floating-point numbers anywhere in a document, except inside a header's configs (§4). A map MUST NOT repeat
   a key.
