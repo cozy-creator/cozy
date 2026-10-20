@@ -116,7 +116,6 @@ code is still not sandboxed.
 | `host_tier.rs` | Degree 1 host tier: machine-filled sealed layouts, adopted read-only, sized by live headroom; a region's absent objects are fetched (Now) and copied as they land | `HostTier`, `HostGrant`, `TierLimit`, `HostTierFacts` | B1 |
 | `host_memory.rs` | Live host headroom (cgroup v1/v2 path, `MemAvailable`) | `HostMemory` | B1 |
 | `model_sources.rs` | Selected model headers/assets as verified bytes and sealed read-only descriptors; component byte facts for planning | `ModelSources`, `SelectedManifest` | B1 |
-| `resident_custody.rs` | Degree 2: executor-exported GPU regions kept as driver fds (no CUDA), leases, revocation | `ResidentCustody`, `HoldingKey`, `SharedRegion` | C |
 | `boundary_json.rs` | Strict JSON parse (no duplicate keys) for boundary records | — | D1 |
 
 
@@ -131,7 +130,6 @@ code is still not sandboxed.
 
 | Path | Use | Owner |
 |---|---|---|
-| `src/bin/degree2-pilot.rs` | Degree 2 on a rental: stock executors share GPU weights through `ResidentCustody` (replacement, count-once, revoke, output equality) | C |
 | `src/bin/model-source-check.rs`, `scripts/check-model-source-descriptor.py` | Check a selected snapshot's sources | B1 |
 | `src/bin/install-capture.rs` | Run the installer path on a captured archive (used by Python tests) | D1 |
 | `scripts/gate/` | Matched ComfyUI vs TensorD gate through ordinary `cozy run` | F |
@@ -156,7 +154,7 @@ the checkpoint reference Runtime reports; failed uploads leave Runtime's local c
 - [Device executor](DEVICE-EXECUTOR.md): executor launch and control seam.
 - [GPU service](GPU-SERVICE.md): GPU pool, config, launch identity.
 - [Host tier](HOST-TIER.md), [model sources](MODEL-SOURCES.md): Degree 1.
-- [Resident custody](RESIDENT-CUSTODY.md): Degree 2 foundation.
+- [Placement ledger](../../varena/src/ledger.rs): per-GPU facts, event wakes, RAM and read-only page custody.
 - [Matched gate](../scripts/gate/README.md): ComfyUI vs TensorD, ordinary CLI.
 
 ## Build and test
