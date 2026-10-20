@@ -118,6 +118,7 @@ pub struct Driver {
     pub event_elapsed_time: unsafe extern "C" fn(*mut f32, CUevent, CUevent) -> CUresult,
     pub memcpy_htod_async:
         unsafe extern "C" fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult,
+    pub memcpy_dtoh: unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult,
     pub mem_host_register: unsafe extern "C" fn(*mut c_void, usize, c_uint) -> CUresult,
     pub mem_host_unregister: F<*mut c_void>,
     pub mem_host_alloc: unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> CUresult,
@@ -194,6 +195,7 @@ impl Driver {
             event_synchronize: load!(lib, b"cuEventSynchronize"),
             event_elapsed_time: load!(lib, b"cuEventElapsedTime"),
             memcpy_htod_async: load!(lib, b"cuMemcpyHtoDAsync_v2"),
+            memcpy_dtoh: load!(lib, b"cuMemcpyDtoH_v2"),
             mem_host_register: load!(lib, b"cuMemHostRegister_v2"),
             mem_host_unregister: load!(lib, b"cuMemHostUnregister"),
             mem_host_alloc: load!(lib, b"cuMemHostAlloc"),
