@@ -13,8 +13,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use platform::paths::Home;
 use protocol::{
     calcifer::{
-        Ended, HubListing, HubProblem, Machine, MachineKind, MachineState, Quote, Reason, Rental,
-        Rented, Warning,
+        Agreed, Ended, HubListing, HubProblem, Machine, MachineKind, MachineState, Quote, Reason,
+        Rental, Rented, Warning,
     },
     config,
     error::{Error, Kind},
@@ -177,21 +177,22 @@ impl Hubs {
 }
 
 impl Machines {
+    /// The Hub's price for renting `sku` at `hub` in `shape`, exactly as a rent would ask it.
+    /// Nothing is recorded or kept.
+    pub async fn quote(&self, hub: &str, sku: &str, shape: Shape) -> Result<Quote, Error> {
+        let origin = config::Origin::parse(hub)?;
+        let (request, ..) = request(sku, shape)?;
+        Ok(quote_of(&self.quoted(&origin, &request).await?))
+    }
+
     /// Rents a machine at `hub` under `key`: the same key again answers the same rental.
     pub async fn rent(
         self: &Arc<Self>,
         key: &str,
         hub: &str,
         sku: &str,
-        gpus: Option<u32>,
-        disk_gb: Option<u32>,
-        image: Option<String>,
+        shape: Shape,
     ) -> Result<Rented, Error> {
-        let shape = Shape {
-            gpus,
-            disk_gb,
-            image,
-        };
         let (ask, fresh) = self.ask_rent(key, hub, sku, shape, None).await?;
         let quote = quote_of(&RentBody::of(&ask)?.quote);
         let row = match ask.state {
@@ -243,16 +244,11 @@ impl Machines {
         shape: Shape,
         run: Option<RunId>,
     ) -> Result<(Ask, bool), Error> {
-        let Shape {
-            gpus,
-            disk_gb,
-            image,
-        } = shape;
         let origin = config::Origin::parse(hub)?;
-        let mut intent =
-            serde_json::json!({"hub": origin, "sku": sku, "gpus": gpus, "disk_gb": disk_gb});
+        let mut intent = serde_json::json!({"hub": origin, "sku": sku, "gpus": shape.gpus,
+            "disk_gb": shape.disk_gb});
         // Only an image joins the intent, so a key asked before images keeps its digest.
-        if let Some(image) = &image {
+        if let Some(image) = &shape.image {
             intent["image"] = image.as_str().into();
         }
         let digest = hex::encode(Sha256::digest(intent.to_string()));
@@ -269,38 +265,23 @@ impl Machines {
         // An ask the Hub would refuse unasked, or one this computer cannot sign, records nothing.
         types::CreateRentalIdempotencyKey::try_from(key)
             .map_err(|e| Error::new(Kind::Usage, "idempotency_key_invalid", e.to_string()))?;
-        let client = self.hubs.client(&origin)?;
-        let mut random = [0; 68];
-        getrandom::fill(&mut random).expect("the OS provides randomness");
-        let alias = format!("rent-{}", hex::encode(&random[..4]));
-        let signer = SigningKey::from_bytes(random[36..].try_into().expect("32 bytes"));
-        let request = types::RentalRequest {
-            accelerator_count: gpus.map(i64::from),
-            container_disk_gb: disk_gb.map(i64::from),
-            creator_public_key: URL_SAFE_NO_PAD.encode(signer.verifying_key().to_bytes()),
-            development: None,
-            excluded_provider_machines: vec![],
-            image: image.map(|image| image.try_into()).transpose().map_err(
-                |e: types::error::ConversionError| {
-                    Error::new(Kind::Usage, "image_invalid", e.to_string())
-                },
-            )?,
-            // The Hub holds a media plane's token hash; machines serve bytes over Read instead.
-            media_token_sha256: hex::encode(Sha256::digest(&random[4..36])),
-            name: alias.clone(),
-            planned_source_bytes: None,
-            provider: None,
-            serving_models: vec![],
-            sku: sku.to_owned(),
-        };
-        let quote = match client.quote_rental(&request).await {
-            Ok(quote) => quote.into_inner(),
-            Err(e) => {
-                return Err(match asked(&origin, e.into()) {
-                    Asked::Refused(e) | Asked::Unanswered(e) => e,
-                });
-            }
-        };
+        let agreed = shape.agreed;
+        let (request, alias, signer) = request(sku, shape)?;
+        let quote = self.quoted(&origin, &request).await?;
+        // Dearer than the renter agreed to a moment ago: nothing is rented.
+        let now = quote_of(&quote).agreed();
+        if let Some(agreed) = agreed.filter(|agreed| above(&now, agreed)) {
+            return Err(Error::new(
+                Kind::Conflict,
+                "rental_price_rose",
+                format!(
+                    "{sku} now costs {}, above the {} agreed; nothing was rented",
+                    rate(&now),
+                    rate(&agreed)
+                ),
+            )
+            .next(format!("cozy machine rent {sku}")));
+        }
         write_key(&self.home.rental_key(&alias), &signer)?;
         let ask = Ask {
             key: key.to_owned(),
@@ -322,6 +303,21 @@ impl Machines {
             e => internal(e),
         })?;
         Ok((ask, fresh))
+    }
+
+    /// The Hub's price for `request`; a refusal is the Hub's.
+    async fn quoted(
+        &self,
+        origin: &config::Origin,
+        request: &types::RentalRequest,
+    ) -> Result<types::RentalQuote, Error> {
+        let client = self.hubs.client(origin)?;
+        match client.quote_rental(request).await {
+            Ok(quote) => Ok(quote.into_inner()),
+            Err(e) => Err(match asked(origin, e.into()) {
+                Asked::Refused(e) | Asked::Unanswered(e) => e,
+            }),
+        }
     }
 
     /// Makes a recorded rent ask. The Hub's acceptance records the rental as a booting machine
@@ -368,7 +364,7 @@ impl Machines {
                 }
                 Ok(rental) => {
                     let alias = ask.machine.clone().unwrap_or_default();
-                    let quoted = RentBody::of(ask)?.quote.price_usd_micros_per_hour;
+                    let quoted = quote_of(&RentBody::of(ask)?.quote);
                     // Asked under its alias; the boot follower takes the Hub's name for it.
                     let row = MachineRow {
                         name: alias.clone(),
@@ -381,13 +377,18 @@ impl Machines {
                         served: false,
                         reason: None,
                     };
-                    // The price shown is the price locked: an acceptance above the quote is
-                    // released at once.
-                    if rental.hourly_rate_usd_micros > quoted {
+                    // The price shown is the price locked: an acceptance above the quote (the
+                    // machine and its disk an hour, or traffic a GB) is released at once.
+                    let locked = Agreed {
+                        usd_micros_per_hour: hourly(&rental),
+                        usd_micros_per_gb: rental.bandwidth_usd_micros_per_gb.unwrap_or_default(),
+                    };
+                    if above(&locked, &quoted.agreed()) {
                         let reason = format!(
-                            "rental.hourly_rate_changed: {} locked {} micro-USD an hour, above the {quoted} \
-                             quoted; it is released",
-                            ask.hub, rental.hourly_rate_usd_micros
+                            "rental.rate_changed: {} locked {}, above the {} quoted; it is released",
+                            ask.hub,
+                            rate(&locked),
+                            rate(&quoted.agreed())
                         );
                         let id = rental.rental_id.clone();
                         self.hubs.seen(&ask.hub, rental);
@@ -462,8 +463,7 @@ impl Machines {
                 let hub = run.hub.as_deref().unwrap_or_default();
                 let shape = Shape {
                     gpus,
-                    disk_gb: None,
-                    image: None,
+                    ..Shape::default()
                 };
                 let asked = me.ask_rent(&key, hub, &sku, shape, Some(run.id.clone()));
                 Ok(asked.await?.0)
@@ -1044,12 +1044,21 @@ fn boot_phase(rental: &types::Rental) -> Option<String> {
     (!words.is_empty()).then(|| words.join(": "))
 }
 
+/// What the rental costs an hour, the machine and its disk: until a machine is bought the Hub's
+/// `hourly_rate` is the machine's alone.
+fn hourly(rental: &types::Rental) -> i64 {
+    match rental.compute_usd_micros_per_hour {
+        Some(compute) => compute + rental.storage_usd_micros_per_hour.unwrap_or_default(),
+        None => rental.hourly_rate_usd_micros,
+    }
+}
+
 fn view(rental: &types::Rental, sku: Option<String>) -> Rental {
     Rental {
         sku: sku.unwrap_or_else(|| rental.requested_accelerator_model.clone()),
         accelerator: rental.requested_accelerator_model.clone(),
         gpus: u32::try_from(rental.accelerator_count).unwrap_or_default(),
-        usd_micros_per_hour: rental.hourly_rate_usd_micros,
+        usd_micros_per_hour: hourly(rental),
         spend_usd_micros: Some(rental.spend_usd_micros),
         spend_basis: Some(rental.spend_basis.clone()).filter(|b| !b.is_empty()),
         rented_at_ms: ms(&rental.created_at).unwrap_or_default(),
@@ -1064,11 +1073,53 @@ fn view(rental: &types::Rental, sku: Option<String>) -> Rental {
     }
 }
 
-/// The machine a rent asks for, beyond its SKU.
-struct Shape {
-    gpus: Option<u32>,
-    disk_gb: Option<u32>,
-    image: Option<String>,
+/// The machine a rent asks for, beyond its SKU, and the most its renter agreed to pay.
+#[derive(Default)]
+pub struct Shape {
+    pub gpus: Option<u32>,
+    pub disk_gb: Option<u32>,
+    pub image: Option<String>,
+    pub agreed: Option<Agreed>,
+}
+
+/// The Hub's request for renting `sku` in `shape`, under a fresh alias and signing key.
+fn request(sku: &str, shape: Shape) -> Result<(types::RentalRequest, String, SigningKey), Error> {
+    let mut random = [0; 68];
+    getrandom::fill(&mut random).expect("the OS provides randomness");
+    let alias = format!("rent-{}", hex::encode(&random[..4]));
+    let signer = SigningKey::from_bytes(random[36..].try_into().expect("32 bytes"));
+    let request = types::RentalRequest {
+        accelerator_count: shape.gpus.map(i64::from),
+        container_disk_gb: shape.disk_gb.map(i64::from),
+        creator_public_key: URL_SAFE_NO_PAD.encode(signer.verifying_key().to_bytes()),
+        development: None,
+        excluded_provider_machines: vec![],
+        image: (shape.image.map(|image| image.try_into()).transpose()).map_err(
+            |e: types::error::ConversionError| Error::new(Kind::Usage, "image_invalid", e.to_string()),
+        )?,
+        // The Hub holds a media plane's token hash; machines serve bytes over Read instead.
+        media_token_sha256: hex::encode(Sha256::digest(&random[4..36])),
+        name: alias.clone(),
+        planned_source_bytes: None,
+        provider: None,
+        serving_models: vec![],
+        sku: sku.to_owned(),
+    };
+    Ok((request, alias, signer))
+}
+
+/// Whether `now` asks more than `agreed`, an hour or a GB.
+fn above(now: &Agreed, agreed: &Agreed) -> bool {
+    now.usd_micros_per_hour > agreed.usd_micros_per_hour
+        || now.usd_micros_per_gb > agreed.usd_micros_per_gb
+}
+
+fn rate(price: &Agreed) -> String {
+    format!(
+        "${:.2}/h and up to ${:.3}/GB",
+        price.usd_micros_per_hour as f64 / 1e6,
+        price.usd_micros_per_gb as f64 / 1e6
+    )
 }
 
 /// An RFC 3339 time of the Hub's, in unix milliseconds.

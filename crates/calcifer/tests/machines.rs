@@ -479,7 +479,7 @@ async fn a_rent_at_a_hub_this_computer_is_not_signed_in_to_records_nothing() {
     let calcifer = calcifer(home.path());
     let machines = machines(&calcifer, home.path());
     let refused = machines
-        .rent("key-1", NO_HUB, "h100", None, None, None)
+        .rent("key-1", NO_HUB, "h100", Default::default())
         .await
         .unwrap_err();
     assert_eq!(refused.code, "signed_out");

@@ -122,6 +122,50 @@ fn machine_usage_refusals() {
     }
 }
 
+/// The Hub's quote for exactly the order comes before it is placed, in the catalog's terms: on a
+/// terminal it asks, and a no rents nothing; without one the command is the yes, and the rental
+/// costs what was quoted. On the Hub's docker provider: nothing is bought from a provider.
+#[cfg(unix)]
+#[test]
+fn a_rent_says_its_quote_before_it_is_placed() {
+    let Some(home) = Home::with_hub() else { return };
+    home.sign_in("quote@example.com");
+    let mut command = home.command();
+    command.args(["machine", "rent", "cpu"]);
+    let mut asked = common::pty::Pty::spawn(&command);
+    let screen = asked.until("the quote and its question", |s| s.contains("Rent it? [Y/n]"));
+    assert!(
+        screen.contains("cpu ×1: $") && screen.contains("; expected $"),
+        "{screen}"
+    );
+    asked.key("n\r");
+    assert!(asked.wait().success());
+    assert!(asked.screen().contains("nothing was rented"), "{}", asked.screen());
+    let rentals = |home: &Home| -> Vec<Value> {
+        let listed = home.json(["machine", "list", "--json"]);
+        let machines = listed["machines"].as_array().unwrap().iter();
+        machines.filter(|m| m["kind"] == "rental").cloned().collect()
+    };
+    assert!(rentals(&home).is_empty(), "a no rented nothing");
+
+    let out = home.cozy(["machine", "rent", "cpu", "--detach"]);
+    assert_eq!(out.code, 0, "{out:?}");
+    let quoted = out.stderr.lines().find(|l| l.starts_with("cpu ×1: $"));
+    let quoted = quoted.unwrap_or_else(|| panic!("no quote: {out:?}"));
+    let rented = rentals(&home);
+    let [rental] = rented.as_slice() else {
+        panic!("one rental: {rented:?}")
+    };
+    let hourly = rental["rental"]["usd_micros_per_hour"].as_i64().unwrap();
+    assert!(
+        quoted.contains(&format!(": ${:.2}/h (", hourly as f64 / 1e6)),
+        "rented at {hourly} µ$/h, quoted {quoted}"
+    );
+    let id = rental["rental_id"].as_str().unwrap();
+    let ended = home.json(["machine", "end", id, "--json"]);
+    assert_eq!(ended["machine"]["state"], "ended", "{ended}");
+}
+
 /// With the Hub's docker provider (Tensorhub's dev-build `hub_set`), a CPU rental is quoted and asked
 /// once under its key, seen booting, and ended only when the Hub affirms its container gone. Nothing
 /// is bought from a provider.

@@ -425,6 +425,7 @@ pub fn supervise(
             .fold((0u64, 0u64), |(cpu, moved), (c, m)| (cpu + c, moved + m));
         if last.is_some_and(|(cpu, moved): (u64, u64)| reading.1 != moved || reading.0.saturating_sub(cpu) >= tick.as_nanos() as u64 / 10) {
             advances += 1;
+            stop.inspect(|stop| stop.moved());
         }
         last = Some(reading);
         pace.observe(Some(advances), now);
@@ -444,6 +445,25 @@ pub fn supervise(
     }
     let status = child.wait()?;
     Ok(ended.unwrap_or(Supervised::Exited(status)))
+}
+
+/// A preparation's verdict, on its measured progress (`Stop::progress`) as an invocation's is:
+/// still past its pace's patience. None once `ended` says it finished. Waiting on work watched
+/// elsewhere (another run's install of the same code) is not stillness.
+pub fn judge_preparation(stop: &crate::stop::Stop, ended: &std::sync::mpsc::Receiver<()>, waits: impl Fn() -> bool) -> Option<String> {
+    let (liveness, mut pace) = (Liveness::default(), Pace::default());
+    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = ended.recv_timeout(liveness.sample) {
+        let now = Instant::now();
+        pace.observe(Some(stop.progress()), now);
+        if waits() {
+            pace.excuse(now);
+        }
+        let still = pace.still_since().map(|since| now - since).unwrap_or_default();
+        if still > pace.patience(liveness.floor()) {
+            return Some(format!("preparing: {}", pace.verdict(still, liveness.floor())));
+        }
+    }
+    None
 }
 
 /// The last bytes of a log, for a failure reason.

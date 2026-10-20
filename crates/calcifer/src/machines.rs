@@ -52,7 +52,7 @@ use crate::{
     Calcifer,
     api::{Api, Refusal, parse},
     link::{self, Link, LinkError},
-    rentals::Hubs,
+    rentals::{Hubs, Shape},
     store::{AskKind, Endpoint, MachineRow, RunRow, Store},
 };
 
@@ -830,6 +830,36 @@ async fn fresh(machines: &Arc<Machines>, text: &str) -> Result<Machine, Error> {
     machines.picture(&row)
 }
 
+/// `POST /v1/rental-quotes`: the Hub's price for a `Rent`, exactly as `POST /v1/machines` would
+/// ask it. Nothing is rented or recorded.
+pub(crate) async fn quote(
+    State(api): State<Arc<Api>>,
+    body: Bytes,
+) -> Result<Json<wire::Quote>, Refusal> {
+    let NewMachine::Rent {
+        sku,
+        hub,
+        gpus,
+        disk_gb,
+        image,
+        agreed: _,
+    } = parse::<NewMachine>(&body)?
+    else {
+        return Err(Refusal(Error::new(
+            Kind::Usage,
+            "quote_needs_rent",
+            "only a rent has a price",
+        )));
+    };
+    let shape = Shape {
+        gpus,
+        disk_gb,
+        image,
+        agreed: None,
+    };
+    Ok(Json(api.machines.quote(&hub, &sku, shape).await.map_err(Refusal)?))
+}
+
 /// Rents one under the request's `Idempotency-Key` (202, or 200 when the key had), or adds
 /// another computer's.
 pub(crate) async fn create(
@@ -844,6 +874,7 @@ pub(crate) async fn create(
             gpus,
             disk_gb,
             image,
+            agreed,
         } => {
             let key = headers
                 .get("idempotency-key")
@@ -860,11 +891,13 @@ pub(crate) async fn create(
                         .remedy("one key names one rental forever; retrying under it is safe"),
                     )
                 })?;
-            let rented = api
-                .machines
-                .rent(key, &hub, &sku, gpus, disk_gb, image)
-                .await
-                .map_err(Refusal)?;
+            let shape = Shape {
+                gpus,
+                disk_gb,
+                image,
+                agreed,
+            };
+            let rented = (api.machines.rent(key, &hub, &sku, shape).await).map_err(Refusal)?;
             let status = match rented.replay {
                 true => StatusCode::OK,
                 false => StatusCode::ACCEPTED,
