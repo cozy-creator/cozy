@@ -1500,6 +1500,48 @@ mod tests {
     }
 
     #[test]
+    fn lower_retry_credits_the_same_operations_completed_reclaim() {
+        let mut pages = vec![page(1, 40), page(2, 40)];
+        for page in &mut pages {
+            page.uses = vec![usage(1, 0)];
+        }
+        let mut table = Table {
+            capacity: 150,
+            pages,
+            rows: vec![Row {
+                id: 1,
+                alive: true,
+                reaping: false,
+            }],
+            requests: vec![request(1)],
+            ..Default::default()
+        };
+        let lower = Trigger::Lower {
+            request: 1,
+            allocation: 10,
+            reclaim: 1,
+        };
+        assert_eq!(
+            decide(&table, lower),
+            vec![
+                Action::DropHome {
+                    request: 1,
+                    page: 2
+                },
+                Action::Unmap(2),
+            ]
+        );
+        // The mechanism waited for this unmap. It re-decides the SAME
+        // operation after completion, rather than reporting another OOM.
+        table.pages[1].lowered.insert(1);
+        table.pages[1].tier = Tier::Disk;
+        assert!(
+            decide(&table, lower).is_empty(),
+            "completed reclaim demanded another home page"
+        );
+    }
+
+    #[test]
     fn repeated_binds_cannot_select_a_later_declared_step() {
         let mut run = request(1);
         run.position.step = 1;
