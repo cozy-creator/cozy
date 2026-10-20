@@ -7,6 +7,7 @@ import base64
 from email.parser import Parser
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -22,10 +23,15 @@ CONSUMERS = {
 }
 PRE_GPU = {"88a49ac8e634035301a3314088a856d214e55db8", "f0601a0d5323cd4ed3da829072ab9d6ca61d7748"}
 SCRIPT_ROOT = 'crates/tensorfs-py/scripts/'
-KERNEL_CORPUS = '92a0f4f01f4490c2f7f8c391e5eb600f5e5b33d647eed48d91ff7c21e7af57d4'
+KERNEL_CORPUS = 'fa2f92b926ba1f0e1195027eaf4066ae0d72c20ca4119584ca8547d5e91167b1'
 KERNEL_SCHEMA = 'tensorfs.cuda-kernel-conformance/1'
 KERNEL_FILE = 'crates/tensorfs-py/scripts/cuda_kernel_conform.py'
 KERNEL_CASES = 'crates/tensorfs/conformance/vectors/cases/'
+KERNEL_PARTITIONS = {'nonzero-element': 18, 'group': 15, 'rotation': 7,
+                     'row': 18, 'matrix': 1, 'near-end-partial': 18}
+KERNEL_COUNTS = {'full': 227, 'odd_windows': 227, 'partition_windows': 77,
+                 'windows': 304, 'total': 531, 'cases': 227, 'schemes': 42}
+PARTITION_SCHEMES = {'comfy.asym_w4a8_int8', 'comfy.w6a8_int8', 'comfy.convrot_w4a4'}
 RUNTIME_TAG = 'cp312-abi3-manylinux_2_28_x86_64'
 RUNTIME_KERNELS = {f'cozy_runtime/_kernels/{name}.abi3.so' for name in ('_gemm', '_norm', '_fa3')}
 PYTORCH_INDEX = 'https://download.pytorch.org/whl/cu130'
@@ -33,6 +39,28 @@ PYTORCH_INDEX = 'https://download.pytorch.org/whl/cu130'
 
 def git(repo, *args):
     return subprocess.check_output(['git', '-C', str(repo), *args], timeout=15)
+
+
+def expected_partitions(case, length):
+    """Byte windows from frozen geometry, independent of the GPU subject script."""
+    if case['encoding']['scheme'] not in PARTITION_SCHEMES:
+        return []
+    width = {'F32': 4, 'BF16': 2, 'F16': 2}[case['dtype']]
+    shape, params = case['shape'], case['encoding']['params']
+    row_bytes = shape[-1] * width
+    offsets = [('nonzero-element', 3 * width + 1)]
+    for label, elements in [('group', params.get('group_size')), ('rotation', params['rotation_size'])]:
+        if elements is not None and elements < shape[-1]:
+            offsets.append((label, elements * width - width + 1))
+    if math.prod(shape[:-1]) > 1:
+        offsets.append(('row', row_bytes - width + 1))
+    if len(shape) > 2 and math.prod(shape[:-2]) > 1:
+        offsets.append(('matrix', shape[-2] * row_bytes - width + 1))
+    offsets.append(('near-end-partial', length - 13))
+    if any(offset < width or offset + 13 > length or not (offset % width or 13 % width)
+           for _, offset in offsets):
+        raise ValueError('frozen kernel boundary window is outside its logical bytes')
+    return [{'kind': kind, 'offset': offset, 'length': 13, 'passed': True} for kind, offset in offsets]
 
 
 def kernel_cases(files):
@@ -47,12 +75,25 @@ def kernel_cases(files):
             if case.get('encoding') is None or case.get('expect') is None:
                 continue
             length = len(base64.b64decode(case['expect'], validate=True))
-            rows.append({'case': f"{Path(filename).stem}/{case['component']}/{case['key']}",
-                         'scheme': case['encoding']['scheme'], 'dtype': case['dtype'], 'shape': case['shape'],
-                         'full_bytes': length, 'full_passed': True,
-                         'window': {'offset': 1, 'length': min(13, max(0, length - 1)), 'passed': True}})
-    if corpus.hexdigest() != KERNEL_CORPUS or len(rows) != 209 or len({r['case'] for r in rows}) != 209 or len({r['scheme'] for r in rows}) != 39:
+            row = {'case': f"{Path(filename).stem}/{case['component']}/{case['key']}",
+                   'scheme': case['encoding']['scheme'], 'dtype': case['dtype'], 'shape': case['shape'],
+                   'full_bytes': length, 'full_passed': True}
+            window = min(13, max(0, length - 1))
+            if window:
+                row['window'] = {'offset': 1, 'length': window, 'passed': True}
+            partitions = expected_partitions(case, length)
+            if partitions:
+                row['partition_windows'] = partitions
+            rows.append(row)
+    if (corpus.hexdigest() != KERNEL_CORPUS or len(rows) != 227 or len({r['case'] for r in rows}) != 227
+            or len({r['scheme'] for r in rows}) != 42 or sum('window' in r for r in rows) != 227):
         raise ValueError('frozen kernel corpus/hash/case set differs')
+    counts = {kind: 0 for kind in KERNEL_PARTITIONS}
+    for row in rows:
+        for window in row.get('partition_windows', []):
+            counts[window['kind']] += 1
+    if counts != KERNEL_PARTITIONS or sum(counts.values()) != KERNEL_COUNTS['partition_windows']:
+        raise ValueError('frozen kernel boundary inventory differs')
     return rows
 
 
@@ -195,6 +236,7 @@ def generate(args):
         rows = kernel_cases(files)
         spec['kernel'] = {'source': proof_source, 'sha256': digest(data), 'file': KERNEL_FILE,
                           'schema': KERNEL_SCHEMA, 'corpus_sha256': KERNEL_CORPUS,
+                          'counts': dict(KERNEL_COUNTS), 'partition_windows': dict(KERNEL_PARTITIONS),
                           'cases': [r['case'] for r in rows], 'schemes': sorted({r['scheme'] for r in rows}),
                           'argv': ['--device', '0']}
         spec['requested'].append('kernel')
