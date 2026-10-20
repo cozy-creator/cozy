@@ -243,6 +243,62 @@ fn a_streaming_writer_tees_to_the_store_before_publishing() {
     assert!(into.checkpoint(&header).unwrap().read("unet", "big").unwrap() == big);
 }
 
+/// Synchronous puts must also work from the caller's Tokio runtime. The finalizer may
+/// block off-thread, but sealed files should already be uploading before it is called.
+#[tokio::test(flavor = "current_thread")]
+async fn stored_stream_puts_work_inside_the_callers_runtime() {
+    let scratch = Scratch::new("async-stored");
+    let dir = scratch.0.join("endpoint");
+    let endpoint = Arc::new(Endpoint::new(&client(), dir.to_str().unwrap(), None).unwrap());
+    let local = Store::open(scratch.0.join("local")).unwrap();
+    let stream = Arc::new(Stream::new(Arc::clone(&endpoint), tokio::runtime::Handle::current()));
+    let mut writer = local.streaming_writer(Arc::clone(&stream), "acme/async-stored", "bf16", None).unwrap();
+    let mut files = Vec::new();
+    for index in 0..9 {
+        let bytes = format!("stored file {index}").into_bytes();
+        writer.repo_file(&format!("file-{index}.txt"), &bytes).unwrap();
+        files.push((ObjectRef::of(&bytes), bytes));
+    }
+    writer.component("model", "", Default::default(), None).unwrap()
+        .put("weight", &Dtype::U8, &[7], Data::Plain(Source::Read(&mut &b"weights"[..]))).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let mut complete = true;
+            for (object, _) in &files {
+                complete &= endpoint.has(object).await.unwrap();
+            }
+            if complete { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("sealed files upload before commit");
+    assert!(endpoint.repo("acme/async-stored").await.unwrap().is_none());
+    for (object, bytes) in &files {
+        assert_eq!(&std::fs::read(dir.join(object.key())).unwrap(), bytes);
+    }
+    let (header, tree) = tokio::task::spawn_blocking(move || {
+        let header = writer.commit().unwrap();
+        (header, writer.published().unwrap().clone())
+    }).await.unwrap();
+    assert_eq!(local.checkpoint(&header).unwrap().read("model", "weight").unwrap(), b"weights");
+    assert_eq!(endpoint.repo("acme/async-stored").await.unwrap().unwrap().0.checkpoints, vec![tree]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_a_stored_stream_cancels_unstarted_uploads() {
+    let scratch = Scratch::new("async-abandon");
+    let endpoint = Arc::new(Endpoint::new(&client(), scratch.0.join("endpoint").to_str().unwrap(), None).unwrap());
+    let local = Store::open(scratch.0.join("local")).unwrap();
+    let stream = Arc::new(Stream::new(Arc::clone(&endpoint), tokio::runtime::Handle::current()));
+    let mut writer = local.streaming_writer(Arc::clone(&stream), "acme/abandoned", "bf16", None).unwrap();
+    let bytes = b"never uploaded";
+    writer.repo_file("README.md", bytes).unwrap();
+    writer.abandon();
+    drop(stream);
+    tokio::task::yield_now().await;
+    assert!(!endpoint.has(&ObjectRef::of(bytes)).await.unwrap());
+    assert!(endpoint.repo("acme/abandoned").await.unwrap().is_none());
+}
+
 #[test]
 fn an_upload_failure_keeps_the_local_checkpoint_and_stays_failed() {
     let scratch = Scratch::new("stream-failure");

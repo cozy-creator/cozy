@@ -255,7 +255,10 @@ impl Remote {
         let _metadata_hold = self.store.cache_hold(std::slice::from_ref(&header))?;
         self.fetch(std::slice::from_ref(&header), &Fetch::default())
             .await?;
-        let raw = self.store.checkpoint(&header)?;
+        let raw = match &tree {
+            Some(tree) => self.store.variant(tree, variant.as_deref())?,
+            None => self.store.checkpoint(&header)?,
+        };
         if tree.is_some() {
             self.remember(&reference, &root, version.as_deref())?;
         }
@@ -264,6 +267,7 @@ impl Remote {
         if let Some(tree) = &tree {
             extra.push(tree.clone());
         }
+        let variant = reference.variant.clone();
         let named = (!reference.repo_id.starts_with("sha256:")).then_some(reference);
         Checkpoint::managed(
             raw,
@@ -272,6 +276,7 @@ impl Remote {
             Some(self.clone()),
             extra,
             self.store.clone(),
+            variant,
         )
     }
 

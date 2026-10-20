@@ -60,7 +60,7 @@ let mut writer = client.writer(WriterOptions {
 let bytes: Vec<u8> = [1.0_f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
 let mut input = bytes.as_slice();
 {
-    let mut model = writer.component("model", "", Default::default(), None)?;
+    let mut model = writer.component("model", "", Default::default())?;
     model.put("weight", Dtype::F32, &[2], &mut input)?;
 }
 let saved = writer.commit().await?;
@@ -101,7 +101,7 @@ All operations involving network/source resolution above are async except constr
 `writer`. Export uses `tensorfs::export(&checkpoint, directory, Format::Safetensors,
 dequantize)` and returns `Result<Vec<String>>`; ensure required bytes are available first.
 
-A `Writer` also has `pipeline(class, config)`, `component(name, class, config, config_file)`,
+A `Writer` also has `pipeline(class, config)`, `component(name, class, config)`,
 `set_metadata(key, Value)`, `has(component, key)`, `committed()` and `abandon(self)`. Its
 `ComponentWriter` supports `put(key, Dtype, shape, &mut Read)`,
 `copy(key, &Component, as_key)`,
@@ -151,10 +151,14 @@ a separate worker-permission mechanism.
 | `fetch(&Fetch).await` | `Result<Fetched>`. |
 | `folder()` | `Result<PathBuf>`, materializing available data. |
 
-A `Component` provides `name()`, `class()`, `config()`, `config_file()`, `tensors()` and
+A `Component` provides `name()`, `class()`, `config()`, `tensors()` and
 `assets()` metadata views. Its `read(key)` returns decoded `Vec<u8>`;
 `read_part_into(key, role, offset, &mut [u8])` fills a stored byte range;
-`asset(name)` returns `Vec<u8>`; `folder()` returns `PathBuf`. The I/O calls return `Result`.
+`asset(name)` returns `Vec<u8>`. These direct configuration, file and tensor reads are the
+normal cozytensors integration path. `export_files(directory)` is only a convenience for
+legacy libraries that require filenames: it explicitly writes configuration and supporting
+files and returns `PathBuf`, without exporting weights. Native consumers, including our
+Runtime, do not need that step. The I/O calls return `Result`.
 Selections control exactly which component/tensor/part/asset bytes are fetched, including
 when other model data happens to be present in the cache.
 

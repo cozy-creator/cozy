@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::File;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::failure::{fail, Kind, Result};
@@ -11,11 +11,20 @@ use crate::store2::{CacheGuard, Checkpoint as Stored, Store};
 
 use super::{remote::Remote, Fetch, Fetched, Ref, Selection};
 
+struct LocalRepo {
+    root: PathBuf,
+    header: Option<PathBuf>,
+}
+
 struct Data {
     raw: Stored,
     named: Option<Ref>,
     tree: Option<ObjectRef>,
     remote: Option<Remote>,
+    store: Store,
+    local_repo: Option<LocalRepo>,
+    variant: Option<String>,
+    _folder: Option<CacheGuard>,
     _extra: CacheGuard,
 }
 
@@ -36,9 +45,30 @@ impl fmt::Debug for Checkpoint {
 }
 
 impl Checkpoint {
-    pub(super) fn local(raw: Stored, source: Remote) -> Result<Self> {
+    pub(super) fn local(raw: Stored, source: Remote, path: &Path) -> Result<Self> {
+        let local_repo = LocalRepo {
+            root: if path.is_file() {
+                path.parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
+            } else {
+                path.to_path_buf()
+            },
+            header: path.is_file().then(|| path.to_path_buf()),
+        };
         let store = source.store.clone();
-        Self::managed(raw, None, None, Some(source), Vec::new(), store)
+        let data = Data {
+            raw,
+            named: None,
+            tree: None,
+            remote: Some(source),
+            _extra: store.cache_hold(&[])?,
+            store,
+            local_repo: Some(local_repo),
+            variant: None,
+            _folder: None,
+        };
+        Ok(Self::from_data(data))
     }
 
     pub(super) fn managed(
@@ -48,14 +78,29 @@ impl Checkpoint {
         remote: Option<Remote>,
         extra: Vec<ObjectRef>,
         store: Store,
+        variant: Option<String>,
     ) -> Result<Self> {
-        let data = Arc::new(Data {
+        let extra = store.cache_hold(&extra)?;
+        // Immutable owned directory fencing is acquired before this tree-key path exists.
+        let folder = tree
+            .as_ref()
+            .map(|tree| store.cache_directory(&store.root().join("snapshots").join(&tree.sha256)))
+            .transpose()?;
+        Ok(Self::from_data(Data {
             raw,
             named,
             tree,
             remote,
-            _extra: store.cache_hold(&extra)?,
-        });
+            _extra: extra,
+            _folder: folder,
+            variant,
+            store,
+            local_repo: None,
+        }))
+    }
+
+    fn from_data(data: Data) -> Self {
+        let data = Arc::new(data);
         let components = data
             .raw
             .components()
@@ -66,7 +111,7 @@ impl Checkpoint {
             })
             .collect::<Vec<_>>()
             .into();
-        Ok(Self { data, components })
+        Self { data, components }
     }
 
     pub fn id(&self) -> &ObjectRef {
@@ -110,7 +155,7 @@ impl Checkpoint {
     }
 
     pub fn missing(&self, selection: &Selection) -> Result<Vec<ObjectRef>> {
-        super::selection::objects(&self.data.raw, selection)?
+        self.wanted(selection)?
             .into_iter()
             .filter_map(|object| match self.data.raw.holds(&object) {
                 Ok(true) => None,
@@ -121,7 +166,7 @@ impl Checkpoint {
     }
 
     pub async fn fetch(&self, want: &Fetch<'_>) -> Result<Fetched> {
-        let objects = super::selection::objects(&self.data.raw, &want.selection)?;
+        let objects = self.wanted(&want.selection)?;
         let total = objects.iter().map(|o| o.length).sum();
         let mut local = 0;
         let mut missing = Vec::new();
@@ -163,12 +208,89 @@ impl Checkpoint {
         }
     }
 
+    fn wanted(&self, selection: &Selection) -> Result<Vec<ObjectRef>> {
+        let mut objects = super::selection::objects(&self.data.raw, selection)?;
+        if matches!(selection, Selection::All) {
+            if let Some(tree) = &self.data.tree {
+                objects.extend(
+                    self.data
+                        .store
+                        .tree(tree)?
+                        .repo_files()
+                        .map(|(_, object)| object.clone()),
+                );
+            }
+        }
+        Ok(objects
+            .into_iter()
+            .map(|o| (o.sha256.clone(), o))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect())
+    }
+
+    pub(super) fn export_to(
+        &self,
+        dir: &Path,
+        dequantize: Option<&format::Dtype>,
+    ) -> Result<Vec<String>> {
+        // This synchronous door never starts a runtime or hidden download. Fetch All first.
+        if let Some(missing) = self.missing(&Selection::All)?.first() {
+            return fail(
+                Kind::NotFound,
+                format!(
+                    "{} is not present; fetch it asynchronously first",
+                    missing.id()
+                ),
+            );
+        }
+        let mut repo = BTreeMap::new();
+        if let Some(tree) = &self.data.tree {
+            for (path, object) in self.data.store.tree(tree)?.repo_files() {
+                repo.insert(path.to_owned(), self.data.store.path(object)?);
+            }
+        } else if let Some(folder) = &self.data.local_repo {
+            local_repo_files(folder, &folder.root, &mut repo)?;
+        }
+        self.data.store.cache_preserve_snapshot(dir)?;
+        crate::export::safetensors(&self.data.raw, &repo, dir, dequantize)
+    }
+
     pub fn folder(&self) -> Result<PathBuf> {
-        let variant = self
-            .named()
-            .and_then(|r| r.variant.as_deref())
-            .unwrap_or("");
-        Ok(self.data.raw.path_for(variant)?)
+        if let Some(local) = &self.data.local_repo {
+            return Ok(local.root.clone());
+        }
+        if let Some(tree) = &self.data.tree {
+            if let Some(missing) = self.missing(&Selection::All)?.first() {
+                return fail(
+                    Kind::NotFound,
+                    format!(
+                        "{} is not present; fetch it asynchronously first",
+                        missing.id()
+                    ),
+                );
+            }
+            let parsed = self.data.store.tree(tree)?;
+            let variant = match self.data.variant.as_deref() {
+                Some(variant) => variant.to_owned(),
+                None => parsed
+                    .variants()
+                    .find(|(_, header)| *header == self.id())
+                    .map(|(variant, _)| variant.to_owned())
+                    .ok_or_else(|| crate::failure::Failure {
+                        kind: Kind::Integrity,
+                        detail: "checkpoint header is not a variant of its source tree".into(),
+                    })?,
+            };
+            let dir = self.data.store.root().join("snapshots").join(&tree.sha256);
+            self.data.store.snapshot(tree, &dir, Some(&[variant]))?;
+            self.data.store.cache_snapshot(&dir)?;
+            return Ok(dir);
+        }
+        Ok(self
+            .data
+            .raw
+            .path_for(self.data.variant.as_deref().unwrap_or(""))?)
     }
 
     pub fn tree(&self) -> Option<&ObjectRef> {
@@ -231,9 +353,6 @@ impl Component {
     }
     pub fn config(&self) -> &format::Config {
         &self.metadata().config
-    }
-    pub fn config_file(&self) -> &str {
-        self.metadata().config_name()
     }
     pub fn tensors(&self) -> &[format::Tensor] {
         &self.metadata().tensors
@@ -305,7 +424,52 @@ impl Component {
     pub fn asset(&self, name: &str) -> Result<Vec<u8>> {
         Ok(self.data.raw.asset(&self.name, name)?)
     }
-    pub fn folder(&self) -> Result<PathBuf> {
-        Ok(self.data.raw.component_path(&self.name)?)
+    /// Write config and support files into the caller's directory, never model weights.
+    /// Fetch Selection::Assets first; this synchronous operation never downloads.
+    pub fn export_files(&self, dir: &Path) -> Result<PathBuf> {
+        Ok(self.data.raw.export_component_files(&self.name, dir)?)
     }
+}
+
+// A plain D10 folder stores repository files outside chunks/ and variant headers. Keep paths
+// until export, rather than admitting every payload during metadata-only Client::open.
+fn local_repo_files(
+    source: &LocalRepo,
+    folder: &Path,
+    out: &mut BTreeMap<String, PathBuf>,
+) -> Result<()> {
+    for entry in fs::read_dir(folder).map_err(|e| super::io_failure(folder.display(), e))? {
+        let entry = entry.map_err(|e| super::io_failure(folder.display(), e))?;
+        if folder == source.root && entry.file_name() == format::CHUNKS_DIR {
+            continue;
+        }
+        let path = entry.path();
+        if source.header.as_ref() == Some(&path) {
+            continue;
+        }
+        let kind = entry
+            .file_type()
+            .map_err(|e| super::io_failure(path.display(), e))?;
+        if kind.is_dir() {
+            local_repo_files(source, &path, out)?;
+        } else if kind.is_file() {
+            let name = path
+                .strip_prefix(&source.root)
+                .expect("walk remains under its root")
+                .iter()
+                .map(|part| {
+                    part.to_str().ok_or_else(|| crate::failure::Failure {
+                        kind: Kind::Invalid,
+                        detail: "repository paths must be UTF-8".into(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join("/");
+            format::check_file(&name)?;
+            if format::variant_of(&name).is_none() {
+                out.insert(name, path);
+            }
+        }
+    }
+    Ok(())
 }

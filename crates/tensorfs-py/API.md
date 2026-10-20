@@ -64,27 +64,23 @@ A `Pipeline` has `cls` and `config`. A `Component` exposes:
 | `tensors` | A `Tensors` mapping, described below. |
 | `assets` | Supporting filenames mapped to `(sha256_hex, byte_length)` references; this does not load file contents. |
 | `asset(name)` | Read a supporting file, fetching it if needed; returns `bytes`. |
-| `path` | A folder containing this component's configuration and assets; obtaining it does not fetch tensor weights. |
 
 An asset is a supporting file needed by the component, such as a tokenizer's
 `tokenizer.json`, `vocab.json` or `merges.txt`. All of these files belong to the checkpoint;
-they are stored by content hash alongside the tensor data. `component.path` creates a local
-view of those included files for libraries that expect a directory, such as a tokenizer's
-`from_pretrained(path)`. The files come from the checkpoint itself; materializing the
-directory fetches any missing asset bytes. Read a file directly when the consumer accepts
-bytes, or request the compatible directory:
+they are stored by content hash alongside the tensor data. Native consumers read `config`
+and file bytes directly through TensorFS; no directory export is part of loading a
+cozytensors checkpoint:
 
 ```python
 tokenizer = checkpoint.components["tokenizer"]
 print(list(tokenizer.assets))
 tokenizer_bytes = tokenizer.asset("tokenizer.json")
-tokenizer_folder = tokenizer.path
 ```
 
-For import/export compatibility, a component also retains `config_file`, the filename to
-use when recreating its configuration file. For example, a scheduler can require
+For import/export compatibility, the format internally retains the filename to use
+when recreating a component's configuration file. For example, a scheduler can require
 `scheduler_config.json` rather than `config.json`. Loading directly from `config` does not
-require this field; conversion normally preserves it automatically.
+require a filename; conversion preserves it automatically.
 
 ### Inspect tensor metadata without reading weights
 
@@ -238,7 +234,7 @@ a DLPack input supplies them, and contradictory explicit values are refused.
 | `metadata` | Mutable loading/provenance metadata dictionary. |
 | `local_checkpoint` | A committed local result retained after an upload failure, if one exists. |
 | `pipeline(cls, config)` | Set the pipeline description. |
-| `component(name, cls=..., config=..., config_file="config.json")` | Create or reopen a component and return its `ComponentWriter`. |
+| `component(name, cls=..., config=...)` | Create or reopen a component and return its `ComponentWriter`. |
 | `has(component, key)` | Check a current/resumed write, excluding untouched tensors inherited from the base. |
 | `commit()` | Finish and return the checkpoint; a first commit error is cached and re-raised. |
 | `abandon()` | End without producing a new checkpoint. |
@@ -257,6 +253,23 @@ A `ComponentWriter` supports:
 | `asset(name, data)` | Write a supporting file. |
 | `order(keys)` | Set tensor construction order. |
 | `has(key)` | Check a current/resumed write. |
+
+### Compatibility export for legacy file-based libraries
+
+Direct TensorFS/cozytensors loading is the normal integration path, including in our
+Runtime. Libraries should consume component configuration, supporting-file bytes and
+tensor arrays directly. Export is a convenience for libraries that still require
+filenames; it is not a required preparation step.
+
+```python
+# Only for a legacy consumer that requires a directory:
+folder = checkpoint.components["tokenizer"].export_files("./tokenizer-files")
+```
+
+`Component.export_files(directory)` explicitly writes configuration and supporting files,
+fetching any missing asset bytes. It returns the directory path and does not export tensor
+weights. Original filenames are preserved internally for compatibility. The full-checkpoint
+`tensorfs.export` operation below also exports weight files when that is needed.
 
 ### Convert an existing model and export ordinary files
 
