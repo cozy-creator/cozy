@@ -2868,7 +2868,13 @@ pub(crate) mod tests {
         let plan = Plan { id: "warm".into(), construction: "warm".into(), installation: "i".into(), generation: identity.clone(),
             entrypoint: "render".into(), slots: vec![slot(&manifest, false), slot(&later, true)], sources: vec![], degree: 1 };
         assert_eq!(plan.upfront(), [(manifest.id(), vec!["model".to_string()])]);
-        let config = serde_json::from_value(json!({"devices": "GPU-test-0", "authorized_device_limit_bytes": null, "prespawn": true})).unwrap();
+        let device = format!("GPU-test-warm-{}", uuid::Uuid::new_v4());
+        let config = serde_json::from_value(json!({
+            "devices": device, "authorized_device_limit_bytes": null, "prespawn": true,
+            "inventory": [{"device_index": 0, "device_name": "CPU download fixture",
+                "device_uuid": device, "driver_version": "fixture",
+                "memory_bytes": 8u64 << 30, "pci_bus_id": "fixture"}]
+        })).unwrap();
         let pool = Pool::new(&bench.root.join("gpu"), config, store.clone()).unwrap();
         let engine = crate::execution::Engine::open(&bench.root.join("execution")).unwrap();
         let fetch = crate::access::Fetch::new(bench.publisher.machine().clone(), Some(hub), u64::MAX);

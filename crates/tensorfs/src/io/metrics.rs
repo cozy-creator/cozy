@@ -1,8 +1,10 @@
 //! What TensorFS copies are measured against: a GPU's pinned host→device bandwidth (best of 1,
 //! 2 and 4 streams) and PCIe link, and a volume's O_DIRECT read (`probe`). Ceilings are kept per
 //! boot (`probe::keep`), the GPU's by UUID and driver. Reads never measure one (`io::ceiling`
-//! does); a run faster than its ceiling raises it. Every copy run lands in one log (`take`).
+//! does); a run faster than its ceiling raises it. An operation can capture its own synchronous
+//! copies; unscoped copies land in the legacy process log (`take`).
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
@@ -40,24 +42,76 @@ pub struct Copy {
 
 static LOG: Mutex<Vec<Copy>> = Mutex::new(Vec::new());
 
+thread_local! {
+    static CAPTURES: RefCell<Vec<Vec<Copy>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Collect the copies made synchronously by `operation` on this thread. TensorFS records a
+/// device run after its worker streams complete, on the calling thread. Concurrent callers
+/// cannot consume each other's records. Nested captures are included in their outer capture;
+/// a panic discards only its unfinished capture and restores the enclosing scope.
+pub fn capture<T>(operation: impl FnOnce() -> T) -> (T, Vec<Copy>) {
+    struct Scope;
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            CAPTURES.with(|captures| {
+                captures.borrow_mut().pop();
+            });
+        }
+    }
+
+    CAPTURES.with(|captures| captures.borrow_mut().push(Vec::new()));
+    let scope = Scope;
+    let result = operation();
+    let copies = CAPTURES.with(|captures| {
+        captures
+            .borrow_mut()
+            .last_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    });
+    drop(scope);
+    (result, copies)
+}
+
 pub(crate) fn record(c: Copy) {
-    let mut log = LOG.lock().unwrap();
+    let captured = CAPTURES.with(|captures| {
+        let mut captures = captures.borrow_mut();
+        for rows in captures.iter_mut() {
+            rows.push(c.clone());
+        }
+        !captures.is_empty()
+    });
+    if captured {
+        return;
+    }
+    let mut log = LOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if log.len() >= LOG_KEEP {
         log.remove(0);
     }
     log.push(c);
 }
 
-/// Every copy run since the last call.
+/// Every unscoped copy run since the last call. Operation-owned captures are not drained.
 pub fn take() -> Vec<Copy> {
-    std::mem::take(&mut LOG.lock().unwrap())
+    std::mem::take(
+        &mut LOG
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 /// A run of reads from `files`, logged against its volume's kept ceiling. Only a run the page
 /// cache had no part in measures the volume: one of a probe's size seeds the ceiling, any that
 /// beats it raises it. A run that read cached bytes is logged unmeasured (ceiling 0).
 pub(crate) fn disk_run(files: &[&File], bytes: u64, ns: u64, direct: u64, cached: u64) {
-    let Some(volume) = files.first().and_then(|f| f.metadata().ok()).map(|m| volume(m.dev())) else {
+    let Some(volume) = files
+        .first()
+        .and_then(|f| f.metadata().ok())
+        .map(|m| volume(m.dev()))
+    else {
         return;
     };
     let rate = direct as f64 / ns.max(1) as f64;
@@ -71,7 +125,15 @@ pub(crate) fn disk_run(files: &[&File], bytes: u64, ns: u64, direct: u64, cached
         (0, None) if measures => rate,
         _ => 0.0,
     };
-    record(Copy { kind: "disk", gpu: -1, bytes, ns, cached, ceiling, ..Default::default() });
+    record(Copy {
+        kind: "disk",
+        gpu: -1,
+        bytes,
+        ns,
+        cached,
+        ceiling,
+        ..Default::default()
+    });
 }
 
 /// A run of copies to GPU `c.gpu`, logged against its kept H2D ceiling (0 until `io::ceiling`
@@ -81,7 +143,10 @@ pub(crate) fn h2d_run(mut c: Copy) {
     if let Some(kept) = key.as_deref().and_then(probe::known) {
         let rate = c.bytes as f64 / c.ns.max(1) as f64;
         if rate > kept[0] {
-            probe::keep(key.as_deref().unwrap(), &[rate, kept.get(1).copied().unwrap_or(1.0)]);
+            probe::keep(
+                key.as_deref().unwrap(),
+                &[rate, kept.get(1).copied().unwrap_or(1.0)],
+            );
         }
         c.ceiling = kept[0].max(rate);
     }
@@ -286,4 +351,65 @@ fn measure_h2d(device: i32, ctx: cuda::CUcontext, retained: PrimaryContext) -> R
         }
     }
     Ok(best)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{capture, record, Copy};
+
+    fn sample(bytes: u64) {
+        record(Copy {
+            kind: "test",
+            bytes,
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn concurrent_operations_own_their_copy_records() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = [11, 29]
+            .into_iter()
+            .map(|bytes| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let (value, rows) = capture(|| {
+                        barrier.wait();
+                        sample(bytes);
+                        barrier.wait();
+                        bytes
+                    });
+                    assert_eq!(value, bytes);
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].bytes, bytes);
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn nested_and_unwound_operations_restore_the_outer_capture() {
+        let (_, outer) = capture(|| {
+            sample(1);
+            let (_, inner) = capture(|| sample(2));
+            assert_eq!(inner.iter().map(|row| row.bytes).collect::<Vec<_>>(), [2]);
+            let failed = std::panic::catch_unwind(|| {
+                capture(|| {
+                    sample(3);
+                    panic!("operation failed");
+                });
+            });
+            assert!(failed.is_err());
+            sample(4);
+        });
+        assert_eq!(
+            outer.iter().map(|row| row.bytes).collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        let (_, fresh) = capture(|| sample(5));
+        assert_eq!(fresh.iter().map(|row| row.bytes).collect::<Vec<_>>(), [5]);
+    }
 }
