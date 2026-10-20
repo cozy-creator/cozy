@@ -1770,6 +1770,12 @@ impl Placement {
             .map(|copy| copy.bytes)
             .sum();
         if let Some(run) = self.inner.lock().requests.get_mut(&request) {
+            if result
+                .as_ref()
+                .is_ok_and(|reported| stats.bytes < reported.bytes)
+            {
+                run.stats.proof.invalidate("missing-fill-copy-records");
+            }
             if result.is_err() {
                 run.stats.proof.invalidate("fill-failed");
             }
