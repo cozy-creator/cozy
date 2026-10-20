@@ -26,7 +26,7 @@ import weakref
 from pathlib import Path
 from urllib.parse import urlsplit
 
-CASES = ("last-weightset", "callback-close", "last-pin", "last-consumer")
+CASES = ("last-weightset", "callback-close", "last-pin", "last-consumer", "pending-consumer-b")
 WAIT = 12
 AUTH = "r2-source-proof"
 DATA = bytes(range(256)) * 256
@@ -269,6 +269,7 @@ def run_case(case):
         checkpoint.close()
         del checkpoint
 
+        consumer_proof = {}
         if case == "last-weightset":
             holder = [weights]
             del weights, provider
@@ -298,6 +299,76 @@ def run_case(case):
             else:
                 raise AssertionError("the provider did not close its actual handle")
             del weights, provider
+        elif case == "pending-consumer-b":
+            pin = weights.bind(0, stream.cuda_stream)
+            # Make the fill already ready: readiness must not erase later consumers.
+            stream.synchronize()
+            consumer = torch.cuda.Stream(device=0)
+            assert stream.cuda_stream > 2 and consumer.cuda_stream > 2
+            assert consumer.cuda_stream != stream.cuda_stream
+            with torch.cuda.stream(consumer):
+                tensor = torch.from_dlpack(pin)
+                assert tensor.is_cuda and tensor.device.index == 0
+                assert tensor.dtype == torch.uint8 and tensor.numel() == len(DATA)
+                assert tensor.data_ptr() == pin.ptr
+                copied = torch.empty_like(tensor)
+                assert copied.data_ptr() != tensor.data_ptr()
+            # Allocate the independent result before the driver-free baseline. Neither
+            # this output nor its byte comparison may keep the foreign source alive.
+            held_free = gpu.stats().driver_free
+            foreign = weakref.ref(tensor)
+            heartbeat, stop = [0], threading.Event()
+
+            def beat_consumer():
+                while not stop.wait(0.001):
+                    heartbeat[0] += 1
+
+            ticker = threading.Thread(target=beat_consumer, daemon=True)
+            ticker.start()
+            end = torch.cuda.Event()
+            try:
+                with torch.cuda.stream(consumer):
+                    torch.cuda._sleep(2_000_000_000)
+                    copied.copy_(tensor, non_blocking=True)
+                    end.record()
+                assert not end.query(), "consumer B needs actual pending GPU work"
+                weights.close()
+                del weights, provider, pin
+                ticks, started = heartbeat[0], time.monotonic()
+                del tensor
+                elapsed = time.monotonic() - started
+                gc.collect()
+                assert foreign() is None, "a Python tensor still masks final consumer release"
+                # No .cpu(), stats/recovery, trim or synchronization here: those could
+                # complete B and hide a release incorrectly fenced only on bind stream A.
+                time.sleep(0.1)
+                assert not end.query(), "consumer B completed before the retention observation"
+                assert alive() is not None, "pending consumer B lost its native source/provider"
+                assert elapsed < 0.25, "last consumer B release waited for CUDA work"
+                assert heartbeat[0] - ticks >= 3, "consumer B release stopped Python's heartbeat"
+                consumer_proof = {
+                    "bind_stream": stream.cuda_stream,
+                    "consumer_stream": consumer.cuda_stream,
+                    "distinct_nondefault": True,
+                    "fill_ready_before_consume": True,
+                    "pending_after_drop": True,
+                    "source_retained_while_pending": True,
+                    "foreign_python_owner_collected": True,
+                    "drop_seconds": elapsed,
+                    "heartbeat_ticks": heartbeat[0] - ticks,
+                }
+            finally:
+                # Rescue our own queued read even when an assertion fails. The existing
+                # isolated-child timeout still bounds a broken driver/native teardown.
+                try:
+                    consumer.synchronize()
+                finally:
+                    stop.set()
+                    ticker.join(2)
+            assert not ticker.is_alive(), "the owned heartbeat did not stop"
+            assert bytes(copied.cpu().tolist()) == DATA, "consumer B read released or reused pages"
+            consumer_proof.update(copied_bytes=len(DATA), copied_sha256=hashlib.sha256(DATA).hexdigest())
+            del copied
         else:
             pin = weights.bind(0, stream.cuda_stream)
             tensor = values(torch, pin)
@@ -365,6 +436,7 @@ def run_case(case):
             result="passed",
             callback=observed,
             cleanup=released,
+            **({"consumer": consumer_proof} if consumer_proof else {}),
             h2d=[
                 {
                     "bytes": copy.bytes,
