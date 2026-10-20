@@ -46,6 +46,12 @@ try:
             assert array.__dlpack_device__() == (2, 0)
             result = torch.from_dlpack(array)
             assert result.device == device and result.dtype == dtype
+            try:
+                array.__dlpack__(copy=True)
+            except BufferError:
+                pass
+            else:
+                raise AssertionError("mapped copy=True bypassed the framework allocator")
             # A noncontiguous source, and a band that is noncontiguous in the full output.
             source = torch.arange(48, dtype=dtype, device=device).reshape(2, 3, 8)[:, :, ::4]
             assert not source.is_contiguous()

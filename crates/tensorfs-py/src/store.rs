@@ -1109,24 +1109,10 @@ impl ArrayBuffer {
                 }
                 Self::Device(DeviceArray::new(copy))
             }
-            Self::Mapped(b) => {
-                let _access = b.access.lock().unwrap_or_else(|e| e.into_inner());
-                b.synchronize()?;
-                // An explicit DLPack copy is a normal CUDA allocation. It never creates
-                // a second host allocation without a new admission reservation.
-                let copy = io::DeviceBuffer::new(b.device(), b.len())?;
-                let request = Copy {
-                    src: Src::Host(b.host_ptr()),
-                    dst: Dst::Device {
-                        device: b.device(), ptr: copy.ptr(), len: copy.len(), stream: 0,
-                    },
-                };
-                if let Err(error) = unsafe { io::read(&[request], &ReadOpts::default()) } {
-                    defer_failed_cuda(b.device(), (Arc::clone(b), copy));
-                    return Err(error.source.into());
-                }
-                Self::Device(DeviceArray::new(copy))
-            }
+            Self::Mapped(_) => return Err(Failure {
+                kind: Kind::Unsupported,
+                detail: "mapped output copies require the owning framework allocator".into(),
+            }),
         })
     }
 }
@@ -1300,6 +1286,11 @@ impl PyArray {
     ) -> PyResult<Bound<'py, PyAny>> {
         let _ = max_version;
         let device = self.buf.device();
+        if copy == Some(true) && matches!(&self.buf, ArrayBuffer::Mapped(_)) {
+            return Err(pyo3::exceptions::PyBufferError::new_err(
+                "mapped output copy=True requires the owning framework allocator",
+            ));
+        }
         if let Some(stream) = stream {
             let value = stream.extract::<i64>()?;
             if device.0 == KDL_CPU || value == 0 || value < -1 {
