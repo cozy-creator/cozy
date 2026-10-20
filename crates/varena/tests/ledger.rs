@@ -293,6 +293,7 @@ fn named_table_and_measured_peaks_survive_coordinator_restart() {
 #[test]
 fn a_new_cap_requires_every_executor_to_release_its_claim() {
     let fixture = Fixture::new();
+    fixture.ledger.record_peak("package", "shape", 900).unwrap();
     let mut child = ChildRow::spawn(&fixture.ledger);
     assert!(Ledger::create(&fixture.name, CAPACITY / 2).is_err());
     child.kill();
@@ -300,6 +301,7 @@ fn a_new_cap_requires_every_executor_to_release_its_claim() {
     let resized = Ledger::create(&fixture.name, CAPACITY / 2).unwrap();
     assert_eq!(resized.capacity(), CAPACITY / 2);
     assert_eq!(fixture.ledger.capacity(), CAPACITY / 2);
+    assert!(resized.peaks().is_empty());
 }
 
 #[test]
