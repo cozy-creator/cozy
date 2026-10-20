@@ -9,7 +9,7 @@ control and SSE over HTTP/2, bulk bytes over HTTP/1.1. The routes, bodies and ev
 gRPC call maps onto them is `~/cozy_v2/tracker/design/machine-http-api.md` §2. In short:
 
 - `GET /v1/status` (identity and readiness receipt without a cap; the whole picture, as SSE on
-  change, with one), `POST /v1/keepalive`;
+  change, with one), `POST /v1/keepalive`, `PUT /v1/bearer` (the owner's newest Hub bearer);
 - `POST /v1/runs` (idempotent on id per signer), `GET /v1/runs/{id}/events` (SSE after
   `Last-Event-ID`; closing it never cancels), `POST /v1/runs/{id}/cancel`;
 - `GET /v1/runs/{id}/outputs/{output}` (ranged, `ETag` = revision, readable while it grows),
@@ -43,12 +43,14 @@ it and Runtime gets it with each request. Zero: the lane rule (`precision.rs`, t
   marks it delivered, and delivered bytes are evicted first.
 - **Hub access**: released content is read anonymously. A run that reads its owner's private
   checkpoints or publishes to the owner's repositories carries the owner's bearer
-  (`tensorfs.token`, with the Hub's `endpoint` and `ca_der`), taken at send from the CLI's
-  signed-in session. The machine reads models through TensorFS's distribution `Endpoint` and
-  presents the bearer only to that Hub's origin; it lives in memory only and its scope is the
-  owner's account. A refused bearer ends the run `hub_credential_refused`. If the machine
-  restarts before preparation completes, the run ends FAILED with a typed reason; started work
-  is never re-run.
+  (`tensorfs.token`, with the Hub's `endpoint`, `ca_der` and `expires_unix_ms`), taken at send
+  from the CLI's signed-in session. Calcifer also gives each machine it sent one every bearer
+  the session mints after, at the session's own refresh point (`PUT /v1/bearer`). The machine
+  keeps the newest per signer and Hub, in memory only, and reads models through TensorFS's
+  distribution `Endpoint` under it: runs, warm-set members, prefetches and calls alike. It
+  presents it only to that Hub's origin; its scope is the owner's account. A refused bearer ends
+  the run `hub_credential_refused`, naming its expiry. If the machine restarts before
+  preparation completes, the run ends FAILED with a typed reason; started work is never re-run.
 - **Names** (th-245): the machine resolves them at the run's Hub. A release (`org/name`, its
   release or none for the newest) installs from the card and locked requirements it reads there
   by name. A model slot is the run's choice, else its declared `default` release (a callee's
