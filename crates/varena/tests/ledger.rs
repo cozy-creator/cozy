@@ -797,14 +797,24 @@ fn two_gpu_ledgers_share_raw_ram_but_close_and_reap_keep_device_owners_separate(
     assert_eq!(child.call("warm"), "ok");
     child.kill();
     first.ledger.reap(child.process.id()).unwrap();
+    // This ordered RPC also proves channel B finished its earlier lease handoff:
+    // recv_fd alone can return before the sender drops its local descriptor.
     assert_eq!(
         channel.ram_status(row.owner(), [19; 32]).unwrap(),
-        Some(original),
+        Some(original.clone()),
         "device A's reap removed device B"
     );
     assert!(
         !first.ledger.release_unused_ram(),
         "pressure cannot reclaim a live reader on either device"
+    );
+    // Channel A is independent: B's RPC cannot order A's descriptor handoff.
+    // Acknowledge A too before testing release of the clients' last lease copies.
+    assert_eq!(
+        first_channel
+            .ram_status(first_row.owner(), [19; 32])
+            .unwrap(),
+        Some(original)
     );
     drop((a, b));
     assert!(
