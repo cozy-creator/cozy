@@ -810,6 +810,8 @@ impl Ledger {
                         Err(error) => tracing::warn!(%error, "RAM region remains on disk"),
                     }
                 }
+                fill.filling.store(false, Release);
+                table.changed();
             })
             .map_err(|e| io("start RAM fill", e))?;
         custody.ram.insert(
@@ -827,7 +829,7 @@ impl Ledger {
         let idle = custody.ram.get_mut(&layout).is_some_and(|held| {
             held.readers
                 .retain(|reader| !platform::handles::hung_up(reader));
-            held.readers.is_empty()
+            held.readers.is_empty() && !held.layout.filling.load(Acquire)
         });
         if idle {
             custody.ram.remove(&layout);
@@ -978,6 +980,7 @@ struct Ram {
     len: usize,
     regions: Vec<RamRegion>,
     ready: Vec<AtomicBool>,
+    filling: AtomicBool,
 }
 // SAFETY: regions are disjoint, one worker writes them, and a region is published only after
 // its TensorFS read finishes. Receivers get read-only file descriptions, never this pointer.
@@ -1024,6 +1027,7 @@ impl Ram {
             base: base as usize,
             len,
             ready: regions.iter().map(|_| AtomicBool::new(false)).collect(),
+            filling: AtomicBool::new(true),
             regions,
         };
         shm::seal(ram.file.as_fd()).map_err(crate::os("seal RAM layout"))?;

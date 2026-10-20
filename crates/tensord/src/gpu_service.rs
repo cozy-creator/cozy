@@ -655,6 +655,14 @@ pub struct Pool {
     // Drop session/resource custody before ending the actual spawning thread.
     launcher: crate::child_launcher::ChildLauncher,
 }
+impl Drop for Pool {
+    fn drop(&mut self) {
+        for watcher in self.memory_watchers.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..) {
+            watcher.abort();
+        }
+    }
+}
+
 struct Admission {
     bytes: u64,
     reservation: u64,
