@@ -103,7 +103,7 @@ pub(crate) struct Download {
 pub(crate) struct Upload {
     /// A provider source, local/<alias>, a Hub model or checkpoint, or ./file.safetensors.
     source: String,
-    /// The Hub repository (org/name) the checkpoint goes to.
+    /// Where it goes: org/name[@tag], the Hub repository and the private tag the upload moves (main).
     destination: String,
     /// A reviewed TensorFS profile to convert with; repeat to compose one model.
     #[arg(long = "source-profile", value_name = "PROFILE")]
@@ -120,7 +120,7 @@ pub(crate) struct Upload {
 pub(crate) struct Quantize {
     /// org/name[@release[/lane]] or org/name#sha256:….
     model: String,
-    /// The Hub repository (org/name) the checkpoint goes to; default: the model's own.
+    /// Where it goes: org/name[@tag], the tag whose tree takes the variant (main); default: the model's own.
     destination: Option<String>,
     /// Write the int8 lane (int8-convrot).
     #[arg(long)]

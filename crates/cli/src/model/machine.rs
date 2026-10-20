@@ -137,7 +137,8 @@ fn made(ctx: &Context, run: &Run) {
         && !destination.starts_with("local/")
     {
         let model = destination.split('@').next().unwrap_or(destination);
-        output::next(ctx, &[&format!("cozy model publish {model} --release <version> --commit {checkpoint}")]);
+        let at = published["tag"].as_str().filter(|t| !t.is_empty()).unwrap_or(checkpoint);
+        output::next(ctx, &[&format!("cozy model publish {model} --release <version> --commit {at}")]);
     }
 }
 
