@@ -204,6 +204,7 @@ fn exec(
     let loaded = executor.command(
         &DeviceCommand::Load {
             tensorfs: None,
+            actor: String::new(),
             construction: "pilot".into(),
             devices,
             sequence_parallel_degree: 1,

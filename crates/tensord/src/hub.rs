@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use crate::device_executor::{DeviceCommand, Line};
+use protocol::machine::TensorFSOptions;
 use tensorfs::{
     err::{refuse, Code},
     fetch::token::{HeaderMap, Request, TokenProvider},
@@ -154,9 +156,14 @@ fn pooled(pool: &Pool, ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal
 }
 
 /// One signer's newest ordinary bearer at one Hub: every read under its owner's access presents
-/// the one held when it is sent. In memory only, for the life of the process.
-#[derive(Default)]
-pub struct Bearer(Mutex<(String, i64)>);
+/// the one held when it is sent, and each executor given it for a request hears of each newer
+/// one (`DeviceCommand::Bearer`). In memory only, for the life of the process.
+pub struct Bearer {
+    actor: String,
+    held: Mutex<(String, i64)>,
+    /// The executors given it, each with the endpoint its requests named.
+    lines: Mutex<Vec<(Line, String)>>,
+}
 
 impl Bearer {
     /// `actor`'s at `origin`, offered `token` (until `expires_unix_ms`; 0: unknown), which it
@@ -164,18 +171,45 @@ impl Bearer {
     pub fn offer(actor: &str, origin: &str, token: &str, expires_unix_ms: i64) -> Option<Arc<Bearer>> {
         static HELD: Mutex<BTreeMap<(String, String), Arc<Bearer>>> = Mutex::new(BTreeMap::new());
         let key = (actor.to_string(), origin_key(origin).filter(|_| !token.is_empty())?);
-        let bearer = HELD.lock().unwrap().entry(key).or_default().clone();
-        let mut held = bearer.0.lock().unwrap();
-        if expires_unix_ms == 0 || expires_unix_ms >= held.1 {
+        let bearer = HELD.lock().unwrap().entry(key).or_insert_with(|| Arc::new(Bearer {
+            actor: actor.into(), held: Mutex::default(), lines: Mutex::default(),
+        })).clone();
+        let mut held = bearer.held.lock().unwrap();
+        let newer = (expires_unix_ms == 0 || expires_unix_ms >= held.1) && held.0 != token;
+        if newer {
             *held = (token.to_string(), expires_unix_ms);
         }
         drop(held);
+        if newer {
+            bearer.forward();
+        }
         Some(bearer)
     }
 
     /// The token held now, and when it expires.
     pub fn held(&self) -> (String, i64) {
-        self.0.lock().unwrap().clone()
+        self.held.lock().unwrap().clone()
+    }
+
+    /// The token held now for a request `line`'s executor serves at `endpoint`, which hears of
+    /// each newer one from now on.
+    pub fn given(&self, line: Line, endpoint: &str) -> (String, i64) {
+        let mut lines = self.lines.lock().unwrap();
+        if !lines.iter().any(|(given, at)| given.same(&line) && at == endpoint) {
+            lines.push((line, endpoint.to_string()));
+        }
+        self.held()
+    }
+
+    /// Each executor given it hears of the token held now; a gone one is forgotten.
+    fn forward(&self) {
+        let (token, expires_unix_ms) = self.held();
+        self.lines.lock().unwrap().retain(|(line, endpoint)| {
+            line.send(&DeviceCommand::Bearer {
+                actor: self.actor.clone(),
+                tensorfs: TensorFSOptions { endpoint: endpoint.clone(), token: token.clone(), expires_unix_ms, ..Default::default() },
+            })
+        });
     }
 }
 

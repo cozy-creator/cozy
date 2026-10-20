@@ -1407,6 +1407,7 @@ print(json.dumps({"identity": generation.identity}))
                         &mut executor,
                         &DeviceCommand::Load {
                             tensorfs: None,
+                            actor: String::new(),
                             construction: "fixture".into(),
                             devices: String::new(),
                             sequence_parallel_degree: 1,
