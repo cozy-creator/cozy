@@ -10,7 +10,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use protocol::config::Hub;
 use protocol::error::{Error, Kind};
 use serde::Serialize;
-use tensorfs::format::{Repo as Doc, Resolution};
+use tensorfs::format::{ObjectRef, Repo as Doc};
 use tensorfs::{Config, Endpoint, Failure};
 
 use super::refs::{ModelRef, Repo, label};
@@ -26,11 +26,32 @@ fn usage(code: &str, message: impl Into<String>) -> Error {
     Error::new(Kind::Usage, code, message)
 }
 
+/// Where a release goes: where a tag is when the edit is written, or a commit.
+enum At {
+    Tag(String),
+    Commit(ObjectRef),
+}
+
+impl At {
+    /// `--commit` of `release`: a tag, or a commit id (`sha256:`), resolved once since a commit
+    /// is immutable (a variant header's is the commit that cites it); none is the release's own.
+    async fn of(endpoint: &Endpoint, model: &str, release: &str, commit: Option<String>) -> Result<At, Error> {
+        Ok(match commit {
+            Some(id) if id.starts_with("sha256:") => match endpoint.commit(model, &id).await {
+                Ok((commit, _)) => At::Commit(commit),
+                Err(f) if f.kind == tensorfs::Kind::NotFound => return Err(Error::new(Kind::NotFound, "commit_not_found", f.detail)),
+                Err(f) => return Err(failed(f)),
+            },
+            Some(tag) => At::Tag(tag),
+            None => At::Tag(release.to_owned()),
+        })
+    }
+}
+
 /// One owner's change to a model's repo document.
 enum Edit {
-    /// Tag `release` public at the commit `commit` names (a tag, or a tag's commit), or where
-    /// it is.
-    Publish { release: String, commit: Option<String> },
+    /// Tag `release` public at `at`.
+    Publish { release: String, at: At },
     Yank { release: String, yanked: bool },
     /// Removes one tag, or with none every tag: the model.
     Delete { tag: Option<String> },
@@ -45,26 +66,21 @@ impl Edit {
         })?;
         let absent = |tag: &str| Error::new(Kind::NotFound, "tag_not_found", format!("{model} has no tag {tag}"));
         match self {
-            Edit::Publish { release, commit } => {
-                let named = commit.as_deref().unwrap_or(release);
-                let at = match doc.resolve(Some(named)) {
-                    Some(Resolution::Tag(tag)) => tag.commit.clone(),
-                    // A header or an untagged commit: resolving it reads the endpoint's trees.
-                    Some(Resolution::Header(..)) => {
-                        return Err(Error::new(Kind::NotFound, "commit_not_found", format!("{named} is no tag's commit in {model}"))
-                            .remedy("name a tag, or a tag's commit"));
-                    }
-                    None if commit.is_none() => {
-                        return Err(absent(named).remedy("name the commit it releases with --commit <tag|sha256:…>"));
-                    }
-                    None => return Err(absent(named)),
+            Edit::Publish { release, at } => {
+                let commit = match at {
+                    At::Commit(commit) => commit.clone(),
+                    At::Tag(tag) => match doc.tag(tag) {
+                        Some(tag) => tag.commit.clone(),
+                        None if tag == release => {
+                            return Err(absent(tag).remedy("name the commit it releases with --commit <tag|sha256:…>"));
+                        }
+                        None => return Err(absent(tag)),
+                    },
                 };
-                doc.set_tag(release, at);
-                if let Some(tag) = doc.tags.iter_mut().find(|t| &t.name == release) {
-                    tag.public = true;
-                }
+                doc.set_tag(release, commit);
+                doc.tag_mut(release).expect("set").public = true;
             }
-            Edit::Yank { release, yanked } => match doc.tags.iter_mut().find(|t| &t.name == release) {
+            Edit::Yank { release, yanked } => match doc.tag_mut(release) {
                 Some(tag) => tag.yanked = *yanked,
                 None => return Err(absent(release)),
             },
@@ -77,7 +93,7 @@ impl Edit {
 
 /// Writes what `edit` makes of `model`'s document at `endpoint`: the document as written, and
 /// whether it changed.
-async fn commit(
+async fn edit_repo(
     endpoint: &Endpoint,
     model: &str,
     mut edit: impl FnMut(Option<Doc>) -> Result<Doc, Error>,
@@ -154,10 +170,8 @@ struct Changed {
 }
 
 /// `edit` of `model`'s tag `release`, and the tag as written.
-async fn one_tag(ctx: &Context, model: &str, release: &str, edit: Edit) -> Result<ExitCode, Error> {
-    let model = Repo::hub(model)?.to_string();
-    let endpoint = endpoint(ctx, &ctx.hub()?).await?;
-    let (doc, changed) = commit(&endpoint, &model, |old| edit.apply(&model, old)).await?;
+async fn one_tag(ctx: &Context, endpoint: &Endpoint, model: String, release: &str, edit: Edit) -> Result<ExitCode, Error> {
+    let (doc, changed) = edit_repo(endpoint, &model, |old| edit.apply(&model, old)).await?;
     let tag = doc.tag(release).expect("the edit keeps its tag");
     let view = Changed { model, tag: tag.name.clone(), commit: tag.commit.id(), public: tag.public, yanked: tag.yanked, changed };
     match ctx.json {
@@ -168,13 +182,16 @@ async fn one_tag(ctx: &Context, model: &str, release: &str, edit: Edit) -> Resul
 }
 
 pub(crate) async fn publish(ctx: &Context, args: Publish) -> Result<ExitCode, Error> {
-    let release = label("--release", &args.release)?;
-    one_tag(ctx, &args.model, &release, Edit::Publish { release: release.clone(), commit: args.commit }).await
+    let (model, release) = (Repo::hub(&args.model)?.to_string(), label("--release", &args.release)?);
+    let endpoint = endpoint(ctx, &ctx.hub()?).await?;
+    let at = At::of(&endpoint, &model, &release, args.commit).await?;
+    one_tag(ctx, &endpoint, model, &release, Edit::Publish { release: release.clone(), at }).await
 }
 
 pub(crate) async fn yank(ctx: &Context, args: Yank) -> Result<ExitCode, Error> {
-    let release = label("--release", &args.release)?;
-    one_tag(ctx, &args.model, &release, Edit::Yank { release: release.clone(), yanked: !args.undo }).await
+    let (model, release) = (Repo::hub(&args.model)?.to_string(), label("--release", &args.release)?);
+    let endpoint = endpoint(ctx, &ctx.hub()?).await?;
+    one_tag(ctx, &endpoint, model, &release, Edit::Yank { release: release.clone(), yanked: !args.undo }).await
 }
 
 #[derive(Serialize)]
@@ -200,7 +217,7 @@ pub(crate) async fn delete(ctx: &Context, args: Delete) -> Result<ExitCode, Erro
     }
     let model = repo.to_string();
     let edit = Edit::Delete { tag: tag.clone() };
-    let (_, removed) = commit(&endpoint(ctx, &hub).await?, &model, |old| edit.apply(&model, old)).await?;
+    let (_, removed) = edit_repo(&endpoint(ctx, &hub).await?, &model, |old| edit.apply(&model, old)).await?;
     let view = Deleted { model, tag, removed };
     match ctx.json {
         true => output::json(&view),
@@ -213,33 +230,49 @@ pub(crate) async fn delete(ctx: &Context, args: Delete) -> Result<ExitCode, Erro
 mod tests {
     use std::path::Path;
 
-    use tensorfs::format::{ObjectRef, Tag, Tree};
+    use tensorfs::format::{Tag, Tree};
 
     use super::*;
 
     const MODEL: &str = "fidika/tiny";
 
-    /// A real commit (tree) of `variants`, each naming a header of its own name's bytes.
-    fn commit_of(variants: &[&str]) -> ObjectRef {
+    /// A commit of `variants`, each naming a header of its own name's bytes, stored at the
+    /// directory endpoint `dir` as plain files.
+    fn commit_of(dir: &Path, variants: &[&str]) -> ObjectRef {
         let mut tree = Tree::default();
         for variant in variants {
             tree.set_variant(variant, ObjectRef::of(variant.as_bytes()));
         }
-        ObjectRef::of(&tree.to_json().unwrap())
+        let bytes = tree.to_json().unwrap();
+        let commit = ObjectRef::of(&bytes);
+        let path = dir.join(commit.key());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+        commit
     }
 
-    fn at(dir: &Path) -> Endpoint {
+    fn endpoint_at(dir: &Path) -> Endpoint {
         Endpoint::new(&format!("file://{}", dir.display()), None).unwrap()
     }
 
     async fn edit(endpoint: &Endpoint, edit: Edit) -> Result<(Doc, bool), Error> {
-        commit(endpoint, MODEL, |old| edit.apply(MODEL, old)).await
+        edit_repo(endpoint, MODEL, |old| edit.apply(MODEL, old)).await
+    }
+
+    /// `release` published at what `--commit` names, as `cozy model publish` does.
+    async fn publish(endpoint: &Endpoint, release: &str, commit: Option<&str>) -> Result<(Doc, bool), Error> {
+        let at = At::of(endpoint, MODEL, release, commit.map(str::to_owned)).await?;
+        edit(endpoint, Edit::Publish { release: release.into(), at }).await
+    }
+
+    fn release(release: &str, tag: &str) -> Edit {
+        Edit::Publish { release: release.into(), at: At::Tag(tag.into()) }
     }
 
     /// `change` by another writer, landing now through its own endpoint over the same directory.
     fn elsewhere<T: Send + 'static>(dir: &Path, change: impl FnOnce(Endpoint) -> T + Send + 'static) -> T {
         let dir = dir.to_owned();
-        std::thread::spawn(move || change(at(&dir))).join().unwrap()
+        std::thread::spawn(move || change(endpoint_at(&dir))).join().unwrap()
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -259,57 +292,53 @@ mod tests {
         });
     }
 
-    fn publish(release: &str, commit: Option<&str>) -> Edit {
-        Edit::Publish { release: release.into(), commit: commit.map(str::to_owned) }
-    }
-
     fn tags(doc: &Doc) -> Vec<(&str, String, bool, bool)> {
         doc.tags.iter().map(|t| (t.name.as_str(), t.commit.id(), t.public, t.yanked)).collect()
     }
 
     #[tokio::test]
-    async fn a_commit_is_released_and_the_release_moves_or_goes_public() {
+    async fn a_commit_is_released_by_tag_commit_or_header_and_moves_or_goes_public() {
         let dir = tempfile::tempdir().unwrap();
-        let (base, more) = (commit_of(&["f32"]), commit_of(&["f32", "fp8"]));
+        let (base, more) = (commit_of(dir.path(), &["f32"]), commit_of(dir.path(), &["f32", "fp8"]));
         uploaded(dir.path(), "main", &base);
-        let endpoint = at(dir.path());
+        let endpoint = endpoint_at(dir.path());
 
-        let (doc, changed) = edit(&endpoint, publish("1.0.0", Some("main"))).await.unwrap();
+        let (doc, changed) = publish(&endpoint, "1.0.0", Some("main")).await.unwrap();
         assert!(changed);
         assert_eq!(tags(&doc), [("main", base.id(), false, false), ("1.0.0", base.id(), true, false)]);
-        assert!(!edit(&endpoint, publish("1.0.0", Some(&base.id()))).await.unwrap().1, "the same commit again");
+        assert!(!publish(&endpoint, "1.0.0", Some(&base.id())).await.unwrap().1, "the same commit again");
 
-        // An upload moves main; the release moves to it by the commit's id, keeping its place.
-        uploaded(dir.path(), "main", &more);
-        let (doc, _) = edit(&endpoint, publish("1.0.0", Some(&more.id()))).await.unwrap();
-        assert_eq!(tags(&doc), [("main", more.id(), false, false), ("1.0.0", more.id(), true, false)]);
+        // A commit no tag names, by its id: the release moves there and keeps its place.
+        let (doc, _) = publish(&endpoint, "1.0.0", Some(&more.id())).await.unwrap();
+        assert_eq!(tags(&doc), [("main", base.id(), false, false), ("1.0.0", more.id(), true, false)]);
         assert_eq!(endpoint.repo(MODEL).await.unwrap().unwrap().0, doc, "what the endpoint holds");
+        // A variant header names the commit that cites it.
+        let fp8 = ObjectRef::of(b"fp8").id();
+        let (doc, _) = publish(&endpoint, "1.1.0", Some(&fp8)).await.unwrap();
+        assert_eq!(doc.tag("1.1.0").map(|t| t.commit.id()), Some(more.id()));
 
         // A private tag goes public where it is.
         uploaded(dir.path(), "2.0.0", &base);
-        let (doc, _) = edit(&endpoint, publish("2.0.0", None)).await.unwrap();
+        let (doc, _) = publish(&endpoint, "2.0.0", None).await.unwrap();
         assert_eq!(doc.tag("2.0.0").map(|t| (t.commit.id(), t.public)), Some((base.id(), true)));
 
-        for (ask, code) in [
-            (publish("3.0.0", None), "tag_not_found"),
-            (publish("3.0.0", Some("nightly")), "tag_not_found"),
-            (publish("3.0.0", Some(&commit_of(&["int8"]).id())), "commit_not_found"),
-        ] {
-            let error = edit(&endpoint, ask).await.unwrap_err();
+        let int8 = ObjectRef::of(b"int8").id();
+        for (release, commit, code) in [("3.0.0", None, "tag_not_found"), ("3.0.0", Some("nightly"), "tag_not_found"), ("3.0.0", Some(int8.as_str()), "commit_not_found")] {
+            let error = publish(&endpoint, release, commit).await.unwrap_err();
             assert_eq!(error.code, code, "{error:?}");
         }
-        let unversioned = edit(&endpoint, publish("nightly", Some("main"))).await.unwrap_err();
+        let unversioned = publish(&endpoint, "nightly", Some("main")).await.unwrap_err();
         assert!(unversioned.kind == Kind::Validation && unversioned.message.contains("PEP 440"), "{unversioned:?}");
-        let nothing = commit(&at(&dir.path().join("empty")), MODEL, |old| publish("1.0.0", Some("main")).apply(MODEL, old)).await;
-        assert_eq!(nothing.unwrap_err().code, "model_not_found");
+        let nothing = edit(&endpoint_at(&dir.path().join("empty")), release("1.0.0", "main")).await.unwrap_err();
+        assert_eq!(nothing.code, "model_not_found", "{nothing:?}");
     }
 
     #[tokio::test]
     async fn a_release_is_yanked_and_unyanked_and_tags_and_models_are_deleted() {
         let dir = tempfile::tempdir().unwrap();
-        uploaded(dir.path(), "main", &commit_of(&["f32"]));
-        let endpoint = at(dir.path());
-        edit(&endpoint, publish("1.0.0", Some("main"))).await.unwrap();
+        uploaded(dir.path(), "main", &commit_of(dir.path(), &["f32"]));
+        let endpoint = endpoint_at(dir.path());
+        edit(&endpoint, release("1.0.0", "main")).await.unwrap();
 
         let yank = |yanked| Edit::Yank { release: "1.0.0".into(), yanked };
         let (doc, changed) = edit(&endpoint, yank(true)).await.unwrap();
@@ -332,18 +361,18 @@ mod tests {
     #[tokio::test]
     async fn a_concurrent_edit_is_read_again_and_the_edit_applied_to_it() {
         let dir = tempfile::tempdir().unwrap();
-        let (base, more) = (commit_of(&["f32"]), commit_of(&["f32", "fp8"]));
+        let (base, more) = (commit_of(dir.path(), &["f32"]), commit_of(dir.path(), &["f32", "fp8"]));
         uploaded(dir.path(), "main", &base);
-        let endpoint = at(dir.path());
+        let endpoint = endpoint_at(dir.path());
 
         // An upload moves main between this edit's read and its write: 1.0.0 goes where main is.
         let mut reads = 0;
-        let (doc, changed) = commit(&endpoint, MODEL, |old| {
+        let (doc, changed) = edit_repo(&endpoint, MODEL, |old| {
             reads += 1;
             if reads == 1 {
                 uploaded(dir.path(), "main", &more);
             }
-            publish("1.0.0", Some("main")).apply(MODEL, old)
+            release("1.0.0", "main").apply(MODEL, old)
         })
         .await
         .unwrap();
@@ -353,12 +382,12 @@ mod tests {
 
         // Another writer deletes main first: this edit no longer applies, and says why.
         let mut reads = 0;
-        let refused = commit(&endpoint, MODEL, |old| {
+        let refused = edit_repo(&endpoint, MODEL, |old| {
             reads += 1;
             if reads == 1 {
                 elsewhere(dir.path(), |other| block_on(edit(&other, Edit::Delete { tag: Some("main".into()) }))).unwrap();
             }
-            publish("2.0.0", Some("main")).apply(MODEL, old)
+            release("2.0.0", "main").apply(MODEL, old)
         })
         .await
         .unwrap_err();
@@ -370,14 +399,14 @@ mod tests {
     #[tokio::test]
     async fn a_document_that_changes_under_every_write_is_reported_busy() {
         let dir = tempfile::tempdir().unwrap();
-        let base = commit_of(&["f32"]);
+        let base = commit_of(dir.path(), &["f32"]);
         uploaded(dir.path(), "main", &base);
-        let endpoint = at(dir.path());
+        let endpoint = endpoint_at(dir.path());
         let mut reads = 0;
-        let busy = commit(&endpoint, MODEL, |old| {
+        let busy = edit_repo(&endpoint, MODEL, |old| {
             reads += 1;
             uploaded(dir.path(), &format!("draft{reads}"), &base);
-            publish("1.0.0", Some("main")).apply(MODEL, old)
+            release("1.0.0", "main").apply(MODEL, old)
         })
         .await
         .unwrap_err();

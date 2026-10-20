@@ -148,7 +148,8 @@ pub(crate) struct Publish {
     /// The release: a PEP 440 version.
     #[arg(long)]
     release: String,
-    /// The commit it names: a tag, or a commit's sha256:<hex>; default: where the tag is.
+    /// The commit it names: a tag, or sha256:<hex> of a commit or a variant header; default: the
+    /// release's own tag.
     #[arg(long, value_name = "COMMIT")]
     commit: Option<String>,
 }
