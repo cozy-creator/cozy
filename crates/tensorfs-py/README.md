@@ -71,11 +71,14 @@ import tensorfs
 checkpoint = tensorfs.open("local/example", local_files_only=True)
 unet = checkpoint.components["unet"]
 info = unet.tensors["conv_in.weight"]
-value = unet.tensors.read("conv_in.weight")
+value = unet.tensors.read("conv_in.weight", decode=True)
 print(unet.cls, info.dtype, info.shape, value.nbytes)
 ```
 
-`read` returns one DLPack array for a name, or a dictionary for a list of names or the whole component; `decode=False` returns stored encoded parts. Frameworks wrap arrays
+`read` accepts one name, a list of names, or no selection for the whole component.
+It preserves the stored representation by default: plain tensors return DLPack arrays,
+and quantized tensors return their encoded arrays and parameters. Use `decode=True`, as
+above, when the consumer needs ordinary floating-point weights. Frameworks wrap arrays
 through their DLPack entry point. `component.config` is structured JSON, `component.asset(name)` reads an asset,
 and explicit `component.export_files(directory)` is only a compatibility convenience for legacy path-only loaders.
 

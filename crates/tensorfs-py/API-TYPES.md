@@ -217,11 +217,11 @@ class Tensors(Mapping[str, TensorMetadata]):
         ...
 
     @overload
-    def read(self, keys: str, *, device: str = "cpu", decode: bool = True) -> Array | Encoded:
+    def read(self, keys: str, *, device: str = "cpu", decode: bool = False) -> Array | Encoded:
         ...
 
     @overload
-    def read(self, keys: Sequence[str] | None = None, *, device: str = "cpu", decode: bool = True) -> dict[str, Array | Encoded]:
+    def read(self, keys: Sequence[str] | None = None, *, device: str = "cpu", decode: bool = False) -> dict[str, Array | Encoded]:
         ...
 
     def read_into(self, key: str, out: object, *, role: str | None=None, offset: int=0) -> None:

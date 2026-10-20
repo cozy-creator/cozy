@@ -106,7 +106,7 @@ weights = unet.tensors.read()
 selected = unet.tensors.read(["conv_in.weight", "conv_in.bias"])
 ```
 
-`read(keys=None, device="cpu", decode=True)` accepts a tensor name, a sequence of
+`read(keys=None, device="cpu", decode=False)` accepts a tensor name, a sequence of
 names, or no selection. A single name returns one value; a sequence returns a name-to-value
 dictionary; no selection (or `None`) reads every tensor in this component. An empty list
 returns an empty dictionary without fetching data. Explicit selections keep the requested
@@ -116,13 +116,16 @@ An unknown name raises `KeyError`.
 All forms accept `device="cpu"` (the default), `device="cuda"` or `device="cuda:N"`,
 and the same `decode` option.
 
-A decoded value is an `Array`, with `dtype`, `shape`, `nbytes` and `tobytes()`.
-`decode=True` is the default: quantized weights are unpacked into the tensor's declared
+`decode=False` is the default: a plain tensor returns an `Array`, and a quantized tensor
+returns `Encoded` with its stored arrays and encoding parameters. Reading does not
+automatically expand quantized weights. An `Array` has `dtype`, `shape`, `nbytes` and
+`tobytes()`.
+
+With explicit `decode=True`, quantized weights are unpacked into the tensor's declared
 logical dtype (`TensorMetadata.dtype`), such as BF16, F16 or F32; BF16 is not forced.
-Plain tensors keep their dtype. The default destination is CPU; `device="cuda:0"` requests
-a GPU array. Supported GPU decoders unpack there; schemes with a host-only decoder use
-the CPU fallback. `decode=False` preserves the encoded representation for a consumer
-with a compatible compute kernel.
+Plain tensors keep their dtype with either setting. The default destination is CPU;
+`device="cuda:0"` requests GPU arrays. Supported GPU decoders unpack there; schemes with
+a host-only decoder use the CPU fallback.
 
 Decode when the model's compute code needs ordinary floating-point weights. For example,
 a standard PyTorch layer can consume a decoded BF16 array, but cannot directly consume
@@ -135,8 +138,9 @@ To hand an array to a framework, use DLPack:
 ```python
 import torch
 
+weight = unet.tensors.read("conv_in.weight", decode=True)
 torch_weight = torch.from_dlpack(weight)
-gpu_weights = unet.tensors.read(device="cuda:0")
+gpu_weights = unet.tensors.read(device="cuda:0", decode=True)
 state_dict = {name: torch.from_dlpack(value) for name, value in gpu_weights.items()}
 ```
 
@@ -145,12 +149,12 @@ The returned arrays and their framework consumers retain the storage they need.
 ### Keep quantized weights encoded
 
 ```python
-value = unet.tensors.read("some_quantized.weight", decode=False)
+value = unet.tensors.read("some_quantized.weight")  # decode=False is the default
 print(value.scheme, value.params)
 print(value.parts.keys())
 
 # GPU placement does not require decoding:
-gpu_value = unet.tensors.read("some_quantized.weight", device="cuda:0", decode=False)
+gpu_value = unet.tensors.read("some_quantized.weight", device="cuda:0")
 ```
 
 `Encoding` describes how the stored arrays reconstruct the logical tensor: a scheme
