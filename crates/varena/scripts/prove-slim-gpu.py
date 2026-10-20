@@ -46,6 +46,7 @@ def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
     logs = root / "logs"
     logs.mkdir()
     results = []
+    gpu_uuids = set()
     cases = [(executable, name, marker) for name, marker in CASES.items()]
     cases += [(placement_executable, name, marker) for name, marker in PLACEMENT_CASES.items()]
     for program, name, marker in cases:
@@ -65,6 +66,13 @@ def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
         summary = re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored", text)
         if process.returncode or marker not in text or not summary or summary[-1] != ("1", "0", "0"):
             raise RuntimeError(f"Native GPU case {name} failed (exit {process.returncode})")
+        identities = [line.split(marker, 1)[1].split()[0]
+                      for line in text.splitlines() if marker in line]
+        if not identities:
+            raise RuntimeError(f"Native GPU case {name} did not report its physical GPU")
+        gpu_uuids.update(identities)
+        if len(gpu_uuids) != 1:
+            raise RuntimeError(f"Native GPU cases used different physical GPUs: {sorted(gpu_uuids)}")
         results.append(name)
-    (logs / "result.json").write_text(json.dumps({"passed": results, "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}, indent=2))
+    (logs / "result.json").write_text(json.dumps({"passed": results, "gpu_uuid": next(iter(gpu_uuids)), "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}, indent=2))
     return out.save_tree(logs)
