@@ -201,11 +201,21 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
     let checkpoint = writer.commit().await.unwrap();
     let folder = scratch.0.join("portable");
     checkpoint
-        .materialize(&folder, Format::Cozytensors, None)
+        .materialize(&folder, Format::Cozytensors, false)
         .await
         .unwrap();
     let tree = producer
         .upload_folder(&"acme/provider@1".parse().unwrap(), &folder, None)
+        .await
+        .unwrap();
+    // Release 1: the default an unversioned open resolves.
+    Endpoint::new(origin.to_str().unwrap(), None)
+        .unwrap()
+        .update_repo("acme/provider", |old| {
+            let mut repo = old.unwrap();
+            repo.tag_mut("1").unwrap().public = true;
+            Ok(Some(repo))
+        })
         .await
         .unwrap();
     let http = Http::new(origin);

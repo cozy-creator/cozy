@@ -100,7 +100,7 @@ fn import(store: &Store, source: &Path) -> tensorfs::err::Result<Checkpoint> {
     let req = Request {
         sources: &[source.display().to_string()],
         converter: None,
-        variant: None,
+        source_variant: None,
         access: &access,
         tmp: &tmp,
         progress: &|_, _, _| {},
@@ -776,7 +776,7 @@ fn tfs_inspect_shows_comfy_nvfp4_at_a_glance() {
         "local/comfy-nvfp4@1",
     ]);
     let doc: serde_json::Value =
-        serde_json::from_str(tfs(&["--json", "inspect", "local/comfy-nvfp4"]).trim()).unwrap();
+        serde_json::from_str(tfs(&["--json", "inspect", "local/comfy-nvfp4@1"]).trim()).unwrap();
     let tensors = doc["components"][0]["tensors"].as_array().unwrap();
     let qkv = tensors
         .iter()
@@ -786,7 +786,7 @@ fn tfs_inspect_shows_comfy_nvfp4_at_a_glance() {
         qkv,
         &serde_json::json!({"key": "blocks.0.attn.qkv.weight", "dtype": "BF16", "shape": [144, 80], "encoding": NVFP4_COMFY})
     );
-    let human = tfs(&["inspect", "local/comfy-nvfp4"]);
+    let human = tfs(&["inspect", "local/comfy-nvfp4@1"]);
     assert!(
         human.contains(&format!("    2 × {NVFP4_COMFY}\n")),
         "{human}"

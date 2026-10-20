@@ -118,6 +118,10 @@ impl Checkpoint {
         &self.data.raw
     }
 
+    pub(super) fn header_bytes(&self) -> Arc<[u8]> {
+        self.data.header_bytes.clone()
+    }
+
     pub fn id(&self) -> &ObjectRef {
         self.data.raw.id()
     }
@@ -219,28 +223,11 @@ impl Checkpoint {
     }
 
     /// Download the checkpoint and known repository files, then write an explicit directory.
-    pub async fn materialize(
-        &self,
-        dir: &Path,
-        format: Format,
-        dequantize: Option<format::Dtype>,
-    ) -> Result<PathBuf> {
-        if matches!(format, Format::Cozytensors) && dequantize.is_some() {
-            return fail(
-                Kind::Invalid,
-                "native cozytensors export preserves encoded bytes; dequantize is unsupported",
-            );
-        }
-        if let (Format::Safetensors, Some(dtype)) = (format, dequantize.as_ref()) {
-            if !matches!(
-                dtype,
-                format::Dtype::F32 | format::Dtype::BF16 | format::Dtype::F16
-            ) {
-                return fail(
-                    Kind::Invalid,
-                    format!("dequantize to {dtype}: one of F32, BF16, F16"),
-                );
-            }
+    /// `decode` writes each encoded tensor in its logical dtype (safetensors only); otherwise
+    /// the stored encoding is kept.
+    pub async fn materialize(&self, dir: &Path, format: Format, decode: bool) -> Result<PathBuf> {
+        if matches!(format, Format::Cozytensors) && decode {
+            return fail(Kind::Invalid, "decode requires the safetensors format");
         }
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|error| crate::failure::Failure {
@@ -264,7 +251,7 @@ impl Checkpoint {
         let worker = runtime.spawn_blocking(move || -> Result<PathBuf> {
             fs::create_dir_all(&dir).map_err(|error| super::io_failure(dir.display(), error))?;
             match format {
-                Format::Safetensors => checkpoint.export_to(&dir, dequantize.as_ref()),
+                Format::Safetensors => checkpoint.export_to(&dir, decode),
                 Format::Cozytensors => checkpoint.export_cozytensors(&dir),
             }?;
             Ok(dir)
@@ -320,13 +307,9 @@ impl Checkpoint {
         Ok(repo)
     }
 
-    pub(super) fn export_to(
-        &self,
-        dir: &Path,
-        dequantize: Option<&format::Dtype>,
-    ) -> Result<Vec<String>> {
+    pub(super) fn export_to(&self, dir: &Path, decode: bool) -> Result<Vec<String>> {
         let repo = self.export_paths()?;
-        crate::export::safetensors(&self.data.raw, &repo, dir, dequantize)
+        crate::export::safetensors(&self.data.raw, &repo, dir, decode)
     }
 
     pub(crate) async fn fetch_objects_exact(

@@ -1560,7 +1560,7 @@ fn make_source(
     let request = tensorfs::import::Request {
         sources: &[source.to_string()],
         converter,
-        variant: None,
+        source_variant: None,
         access: &access,
         tmp: &store.root().join("tmp"),
         progress: &counted,

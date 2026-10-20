@@ -46,7 +46,7 @@ fn import(store: &Store, source: &Path) -> tensorfs::err::Result<Checkpoint> {
     let req = Request {
         sources: &[source.display().to_string()],
         converter: None,
-        variant: None,
+        source_variant: None,
         access: &access,
         tmp: &tmp,
         progress: &|_, _, _| {},
@@ -320,14 +320,14 @@ fn tfs_imports_and_exports_a_gguf() {
     };
     tfs(&["convert", source.to_str().unwrap(), "--name", "local/llama@1"]);
     let out = scratch.0.join("out");
-    tfs(&["export", "local/llama", out.to_str().unwrap(), "--gguf"]);
+    tfs(&["export", "local/llama@1", out.to_str().unwrap(), "--gguf"]);
     assert_eq!(
         fs::read(out.join("llama-moe.gguf")).unwrap(),
         fs::read(&source).unwrap()
     );
     tfs(&[
         "export",
-        "local/llama",
+        "local/llama@1",
         scratch.0.join("st").to_str().unwrap(),
         "--safetensors",
     ]);
