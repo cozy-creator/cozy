@@ -11,9 +11,10 @@ import re
 
 IDS = ['read-engine', 'provider-cleanup', 'fork-cleanup']
 ALL = ['diffusers', 'comfy', 'kernel', *IDS]
-CASES = ['last-weightset', 'callback-close', 'last-pin', 'last-consumer']
+CASES = ['last-weightset', 'callback-close', 'last-pin', 'last-consumer', 'pending-consumer-b', 'pending-ptds-consumer']
 READ_MARKER = 'CUDA arrays: chunk-spanning reads, prebuilt decode, raw parts, DLPack sharing/copy and retained consumers passed'
-TIMEOUT = {'read-engine': 120, 'provider-cleanup': 210, 'fork-cleanup': 90}
+TIMEOUT = {'read-engine': 120, 'provider-cleanup': 300, 'fork-cleanup': 90}
+PROVIDER_DATA_SHA256 = hashlib.sha256(bytes(range(256)) * 256).hexdigest()
 
 
 def require(ok, message):
@@ -33,6 +34,10 @@ def contract(raw):
     for row in commands:
         require(row.get('timeout_s') == TIMEOUT[row['id']], 'native I/O timeout differs')
         require(row.get('profile') == ('clean' if row['id'] == 'fork-cleanup' else 'torch'), 'native I/O profile differs')
+        if row['id'] == 'provider-cleanup':
+            require(row.get('cases') == CASES and type(row.get('case_timeout_s')) is int
+                    and row['case_timeout_s'] == 45 and row['argv'] == ['--timeout', '45'],
+                    'provider child inventory/timeout differs')
         for name in [row['file'], *row['helper_files']]:
             require(PurePosixPath(name).name == name and name.endswith('.py'), 'native I/O source path differs')
     return value
@@ -70,6 +75,32 @@ def finite(value):
     return type(value) in (int, float) and math.isfinite(value) and value > 0
 
 
+def consumer_receipt(case, value):
+    require(isinstance(value, dict), 'pending consumer evidence missing')
+    for name in ('fill_ready_before_consume', 'pending_after_drop', 'source_retained_while_pending',
+                 'foreign_python_owner_collected'):
+        require(value.get(name) is True, 'pending consumer evidence differs: ' + name)
+    require(finite(value.get('drop_seconds')) and value['drop_seconds'] < 0.25,
+            'pending consumer release blocked')
+    require(type(value.get('heartbeat_ticks')) is int and value['heartbeat_ticks'] >= 3,
+            'pending consumer heartbeat missing')
+    require(type(value.get('copied_bytes')) is int and value['copied_bytes'] == 65536
+            and value.get('copied_sha256') == PROVIDER_DATA_SHA256, 'pending consumer byte proof differs')
+    if case == 'pending-consumer-b':
+        require(value.get('distinct_nondefault') is True
+                and all(type(value.get(k)) is int and value[k] > 2 for k in ('bind_stream', 'consumer_stream'))
+                and value['bind_stream'] != value['consumer_stream'], 'consumer B streams are not distinct')
+    else:
+        require(case == 'pending-ptds-consumer' and value.get('scope') == 'final-release-custody', 'PTDS scope differs')
+        require(all(type(value.get(k)) is int and value[k] == 2 for k in ('bind_stream', 'consumer_stream')),
+                'PTDS stream identity differs')
+        require(all(type(value.get(k)) is int and value[k] > 0 for k in ('bind_thread', 'consumer_thread'))
+                and value['bind_thread'] != value['consumer_thread'], 'PTDS threads are not distinct')
+        for name in ('distinct_threads', 'bind_thread_alive_while_pending', 'bind_thread_source_handles_released', 'ptds'):
+            require(value.get(name) is True, 'PTDS evidence differs: ' + name)
+        require(value.get('pending_readiness_device_proof') is False, 'PTDS final release is not a readiness proof')
+
+
 def parse(name, stdout, native, gpu_uuid):
     lines = [line for line in stdout.splitlines() if line.strip()]
     if name == 'read-engine':
@@ -84,7 +115,8 @@ def parse(name, stdout, native, gpu_uuid):
     def invalid(value):
         raise ValueError('nonfinite native I/O number: ' + value)
     records = [json.loads(line, parse_constant=invalid) for line in lines]
-    require(len(records) == 9 and all(isinstance(row, dict) for row in records), 'provider missing/duplicate/extra record')
+    require(len(records) == 2 * len(CASES) + 1 and all(isinstance(row, dict) for row in records),
+            'provider missing/duplicate/extra record')
     final = records[-1]
     require(final == {'result': 'passed', 'cases': CASES, 'timeout_per_child': 45}
             and type(final.get('timeout_per_child')) is int, 'provider final case set differs')
@@ -105,6 +137,8 @@ def parse(name, stdout, native, gpu_uuid):
                 'provider never fetched real chunks')
         require(any(type(c.get('bytes')) is int and c['bytes'] == 65536 and finite(c.get('ns'))
                     for c in passed.get('h2d', [])), 'provider missing real H2D record')
+        if case in ('pending-consumer-b', 'pending-ptds-consumer'):
+            consumer_receipt(case, passed.get('consumer'))
     return {'case': name, 'format': 'json-lines', 'records': records}
 
 

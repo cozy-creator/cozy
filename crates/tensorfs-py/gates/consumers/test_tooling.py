@@ -21,7 +21,7 @@ from owned_child import CONSUMER_SECONDS, KERNEL_SECONDS, SETUP_SECONDS, run_own
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[3]
-PROOF_SOURCE = '85ab9f3d92736a640548a9c3da70e3f374368c55'
+PROOF_SOURCE = '25a1d2f6bfbf07e84f06a110b30083b9fb5a45f2'
 UUID = 'GPU-12345678-1234-1234-1234-123456789abc'
 
 
@@ -133,6 +133,19 @@ class Contract(unittest.TestCase):
                                      'distribution': spec['native']['version'], 'tensorfs': spec['native']['version']},
                                     {'case': case, 'result': 'passed', 'cleanup': dict.fromkeys(('sets', 'mapped', 'idle', 'slots'), 0),
                                      'callback': {'chunks': 1}, 'h2d': [{'bytes': 65536, 'ns': 1}]}]
+                        if case in ('pending-consumer-b', 'pending-ptds-consumer'):
+                            consumer = {'fill_ready_before_consume': True, 'pending_after_drop': True,
+                                        'source_retained_while_pending': True, 'foreign_python_owner_collected': True,
+                                        'drop_seconds': 0.01, 'heartbeat_ticks': 3, 'copied_bytes': 65536,
+                                        'copied_sha256': native_io.PROVIDER_DATA_SHA256}
+                            if case == 'pending-consumer-b':
+                                consumer.update(bind_stream=3, consumer_stream=4, distinct_nondefault=True)
+                            else:
+                                consumer.update(scope='final-release-custody', bind_stream=2, consumer_stream=2,
+                                                bind_thread=100, consumer_thread=101, distinct_threads=True,
+                                                bind_thread_alive_while_pending=True, bind_thread_source_handles_released=True,
+                                                ptds=True, pending_readiness_device_proof=False)
+                            records[-1]['consumer'] = consumer
                     records.append({'result': 'passed', 'cases': native_io.CASES, 'timeout_per_child': 45})
                     stdout = ''.join(json.dumps(r) + '\n' for r in records)
                 write(root / f'reports/{name}.json', native_io.parse(name, stdout, spec['native'], UUID))
@@ -439,6 +452,43 @@ class Contract(unittest.TestCase):
         self.inventory(root)
         with self.assertRaisesRegex(ValueError, 'Runtime native kernel hashes'):
             validate.validate(root, expected, run, machine, launch)
+
+    def test_six_provider_cases_and_source_hash_are_frozen(self):
+        root, expected, run, machine, launch = self.fixture(native=True)
+        contract = next(c for c in expected['native_io']['commands'] if c['id'] == 'provider-cleanup')
+        self.assertEqual(contract['timeout_s'], 300)
+        self.assertEqual(contract['case_timeout_s'], 45)
+        self.assertEqual(contract['cases'], native_io.CASES)
+        self.assertEqual(expected['sources'][contract['file']],
+                         'bc4f439e5770b6d6f1dacc7adf843a9864f1628962a80e37c9dc3231cb5f8797')
+        self.assertEqual(expected['pending'], [])
+        records = validate.read(root / 'reports/provider-cleanup.json')['records']
+        self.assertEqual(len(records), 13)
+        self.assertTrue(validate.validate(root, expected, run, machine, launch)['ok'])
+
+    def test_pending_consumer_evidence_cannot_be_omitted_or_substituted(self):
+        root, expected, *_ = self.fixture(native=True)
+        records = validate.read(root / 'reports/provider-cleanup.json')['records']
+        mutations = [(9, 'pending_after_drop', False), (9, 'consumer_stream', 3),
+                     (9, 'copied_sha256', '0' * 64), (9, 'heartbeat_ticks', 2),
+                     (11, 'pending_readiness_device_proof', True), (11, 'consumer_thread', 100),
+                     (11, 'bind_thread_alive_while_pending', False), (11, 'bind_stream', False)]
+        for index, key, value in mutations:
+            with self.subTest(key=key):
+                changed = copy.deepcopy(records)
+                changed[index]['consumer'][key] = value
+                with self.assertRaises(ValueError):
+                    native_io.parse('provider-cleanup', '\n'.join(json.dumps(r) for r in changed),
+                                    expected['native'], UUID)
+        with self.assertRaisesRegex(ValueError, 'missing/duplicate/extra'):
+            native_io.parse('provider-cleanup', '\n'.join(json.dumps(r) for r in records[:8] + [records[-1]]),
+                            expected['native'], UUID)
+
+    def test_old_four_case_provider_source_is_refused(self):
+        source = make_payload.git(REPO, 'show',
+            '85ab9f3d92736a640548a9c3da70e3f374368c55:crates/tensorfs-py/scripts/cuda_varena_source.py').decode()
+        with self.assertRaisesRegex(ValueError, 'provider mode inventory differs'):
+            native_io.check_source('provider-cleanup', source)
 
 
 class OwnedChild(unittest.TestCase):
