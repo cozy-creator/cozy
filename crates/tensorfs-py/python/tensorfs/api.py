@@ -41,6 +41,10 @@ def materialize(source: str | _ext.Checkpoint, *, local_dir=None, format="cozyte
         raise ValueError("format must be cozytensors or safetensors")
     if format == "cozytensors" and dequantize is not None:
         raise ValueError("dequantize requires format='safetensors'")
+    if dequantize is not None:
+        if not isinstance(dequantize, str) or dequantize.upper() not in {"F32", "BF16", "F16"}:
+            raise _ext.InvalidError("dequantize must be F32, BF16 or F16")
+        dequantize = dequantize.upper()
     if isinstance(source, _ext.Checkpoint):
         if components is not None:
             raise ValueError("components selection requires a repository source in cozytensors format")
