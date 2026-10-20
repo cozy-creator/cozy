@@ -2207,6 +2207,7 @@ mod gpu_tests {
     #[ignore = "requires an owned rental; never run on the local GPU"]
     fn failed_begin_rolls_back_and_reuses_the_request_identity() {
         let placement = Placement::open(0, None).expect("real CUDA placement");
+        let uuid = assigned_gpu(&placement.gpu);
         assert!(placement
             .begin(7, vec![vec![999]], "test".into(), "shape".into())
             .is_err());
@@ -2223,6 +2224,18 @@ mod gpu_tests {
         assert_eq!(stats.proof.version, 1);
         assert!(stats.proof.complete);
         placement.close().expect("close placement");
+        println!("PASS failed begin rolls back and reuses its request {uuid}");
+    }
+
+    fn assigned_gpu(gpu: &Gpu) -> String {
+        let driver = cuda::driver().expect("driver");
+        let mut count = 0;
+        cuda::check("cuDeviceGetCount", unsafe {
+            (driver.device_get_count)(&mut count)
+        })
+        .expect("visible devices");
+        assert_eq!(count, 1, "this proof requires exactly one assigned GPU");
+        gpu.uuid().expect("GPU UUID")
     }
 
     struct ConsumerGate {
@@ -2290,6 +2303,7 @@ mod gpu_tests {
     #[ignore = "requires an owned rental; never run on the local GPU"]
     fn failed_direct_ram_fill_retains_its_source_until_checked_recovery() {
         let gpu = Gpu::open(0).expect("real CUDA device");
+        let uuid = assigned_gpu(&gpu);
         let bytes = crate::layout::REGION_ALIGN;
         let range = gpu.reserve(bytes).expect("page reservation");
         gpu.register(
@@ -2319,13 +2333,14 @@ mod gpu_tests {
             lifetime.upgrade().is_none(),
             "checked recovery retained a completed source"
         );
+        println!("PASS failed RAM fill retains its source through recovery {uuid}");
     }
 
     #[test]
     #[ignore = "requires an owned rental; never run on the local GPU"]
     fn ram_warm_returns_before_export_and_close_prevents_stale_registration() {
         let probe = Gpu::open(0).expect("real CUDA device");
-        let uuid = probe.uuid().expect("GPU UUID");
+        let uuid = assigned_gpu(&probe);
         let ledger =
             Ledger::create(&uuid, probe.capacity().expect("capacity")).expect("observer ledger");
         let grant = ledger.grant_unbound().expect("rank grant");
@@ -2427,6 +2442,9 @@ mod gpu_tests {
             "a closed model published a stale cache"
         );
         placement.close().expect("close placement");
+        println!(
+            "PASS RAM warming stays asynchronous and closes without stale registration {uuid}"
+        );
     }
 
     #[test]

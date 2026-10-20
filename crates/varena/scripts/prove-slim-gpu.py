@@ -29,6 +29,12 @@ CASES = {
 
 
 PLACEMENT_CASES = {
+    "placement::gpu_tests::failed_begin_rolls_back_and_reuses_the_request_identity":
+        "PASS failed begin rolls back and reuses its request",
+    "placement::gpu_tests::failed_direct_ram_fill_retains_its_source_until_checked_recovery":
+        "PASS failed RAM fill retains its source through recovery",
+    "placement::gpu_tests::ram_warm_returns_before_export_and_close_prevents_stale_registration":
+        "PASS RAM warming stays asynchronous and closes without stale registration",
     "placement::gpu_tests::idle_worker_retires_after_pending_consumer_finishes":
         "PASS idle worker retires after pending consumer",
 }
