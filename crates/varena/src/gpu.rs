@@ -1053,10 +1053,10 @@ impl Drop for Gpu {
             // the coordinator. Last-pin teardown must revoke their queued custody;
             // only unretired pages are intentionally kept for a replacement owner.
             for page in self.pages.get_mut().values() {
-                if page.retired.load(Ordering::Acquire)
-                    && let State::Ready(mapping) | State::Failed(mapping, _) =
-                        &mut *page.state.lock()
-                {
+                if !page.retired.load(Ordering::Acquire) {
+                    continue;
+                }
+                if let State::Ready(mapping) | State::Failed(mapping, _) = &mut *page.state.lock() {
                     let _ = mapping.release(true);
                 }
             }

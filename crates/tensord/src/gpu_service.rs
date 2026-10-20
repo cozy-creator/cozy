@@ -1970,6 +1970,7 @@ impl Pool {
             }));
         }
     }
+    #[cfg(unix)]
     fn end_stalled(&self, pid: u32) {
         let birth = self.accounting.lock().unwrap().values()
             .filter_map(|owner| owner.birth.as_ref()).find(|birth| birth.pid == pid).cloned();
