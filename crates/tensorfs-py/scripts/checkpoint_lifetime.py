@@ -122,7 +122,7 @@ with tempfile.TemporaryDirectory() as temp:
 
     with tensorfs.open(root / "source", cache_dir=root / "isolated") as checkpoint:
         assert checkpoint.__enter__() is checkpoint
-        assert checkpoint.verify() == []
+        assert checkpoint.verify().ok
         component = checkpoint.components["model"]
         part = raw.parts(checkpoint, "model", "weight")[""]
         chunk = checkpoint.chunks[part.chunk]
@@ -140,18 +140,18 @@ with tempfile.TemporaryDirectory() as temp:
         saved = blob.read_bytes()
         corrupted = bytes([saved[0] ^ 1]) + saved[1:]
         blob.write_bytes(corrupted)
-        assert chunk in checkpoint.verify()
+        assert chunk in checkpoint.verify().corrupt
         assert blob.read_bytes() == corrupted, "verify changed the user's file"
         blob.unlink()
-        assert chunk in checkpoint.verify()
+        assert chunk in checkpoint.verify().missing
         blob.write_bytes(saved)
-        assert checkpoint.verify() == []
+        assert checkpoint.verify().ok
         header = root / "source/model.cozytensors"
         saved_header = header.read_bytes()
         header.write_bytes(saved_header[:-1] + bytes([saved_header[-1] ^ 1]))
-        assert checkpoint.header_ref in checkpoint.verify()
+        assert checkpoint.header_ref in checkpoint.verify().corrupt
         header.write_bytes(saved_header)
-        assert checkpoint.verify() == []
+        assert checkpoint.verify().ok
         descriptor = checkpoint.open_chunk(part.chunk)
     for call in [lambda: checkpoint.components, lambda: checkpoint.missing(), lambda: checkpoint.fetch(),
                  lambda: checkpoint.open_chunk(0), lambda: checkpoint.verify(), lambda: checkpoint.__enter__()]:

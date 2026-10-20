@@ -33,6 +33,7 @@ from ._ext import (
     Tensors,
     UnknownSchemeError,
     UnsupportedError,
+    VerificationReport,
     __version__,
 )
 from . import raw
@@ -65,6 +66,7 @@ __all__ = [
     "Tensors",
     "UnknownSchemeError",
     "UnsupportedError",
+    "VerificationReport",
     "Writer",
     "__version__",
     "configure",

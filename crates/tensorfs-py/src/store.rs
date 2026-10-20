@@ -1014,10 +1014,12 @@ impl PyCheckpoint {
         self.close();
     }
 
-    fn verify(&self, py: Python<'_>) -> PyResult<Vec<(String, u64)>> {
+    #[pyo3(signature = (components=None))]
+    fn verify(&self, py: Python<'_>, components: Option<Vec<String>>) -> PyResult<crate::verification::PyVerificationReport> {
         let checkpoint = self.stored(py)?;
-        let bad = py.detach(|| checkpoint.verify()).or_raise(py)?;
-        Ok(bad.into_iter().map(|o| (o.sha256, o.length)).collect())
+        let tree = self.named.as_ref().and_then(|named| named.tree.as_ref());
+        let report = py.detach(|| checkpoint.verify_selected(components.as_deref(), tree)).or_raise(py)?;
+        Ok(report.into())
     }
 
     fn open_chunk(&self, py: Python<'_>, index: usize) -> PyResult<i32> {
@@ -1896,6 +1898,7 @@ fn _kernel_binary<'py>(py: Python<'py>, family: u32, core: &str, dtype: &str) ->
 }
 
 pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<crate::verification::PyVerificationReport>()?;
     m.add_class::<PyStore>()?;
     m.add_class::<PyCheckpoint>()?;
     m.add_class::<PyPipeline>()?;

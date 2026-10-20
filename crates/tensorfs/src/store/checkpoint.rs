@@ -163,6 +163,43 @@ impl Checkpoint {
         &self.id
     }
 
+    pub(crate) fn verification_file(&self, object: &ObjectRef) -> Result<File> {
+        if let (Some(path), true) = (&self.header_file, object == &self.id) {
+            return File::open(path).map_err(fail("open", path));
+        }
+        let store = match &self.objects {
+            Objects::Store(store) => Some(store),
+            Objects::Folder { dir, cache } => {
+                if let Some(file) = verification_open(&dir.join(CHUNKS_DIR).join(&object.sha256))? {
+                    return Ok(file);
+                }
+                cache.as_ref()
+            }
+        };
+        if let Some(store) = store {
+            let path = store.path(object)?;
+            // Preserve a moving GC object's readable copy, but never mask EACCES,
+            // ELOOP or another I/O failure by trying a different physical copy.
+            for path in [&path, &store.trash(&object.sha256), &path] {
+                if let Some(file) = verification_open(path)? {
+                    file.lock_shared().map_err(fail("lock", path))?;
+                    return Ok(file);
+                }
+            }
+        }
+        Err(Error::Absent(object.sha256.clone()))
+    }
+
+    /// Inspect the header and selected components' complete chunks/assets locally.
+    /// An empty selection still checks the header. No data is fetched or changed.
+    pub fn verify_selected(&self, components: Option<&[String]>, tree: Option<&ObjectRef>) -> crate::Result<crate::VerificationReport> {
+        let objects = match components {
+            Some(components) => wanted(&self.header, Some(components))?,
+            None => self.header.objects().cloned().collect(),
+        };
+        crate::verification::verify(self, objects, tree.filter(|_| components.is_none()))
+    }
+
     /// Hash the actual header file and closure without changing them. Missing or corrupt
     /// objects are returned; other filesystem errors remain errors.
     pub fn verify(&self) -> Result<Vec<ObjectRef>> {
@@ -499,6 +536,14 @@ fn absent(component: &str, key: &str) -> super::Error {
 }
 
 /// A folder's copy of `object`, when it has one of its length.
+fn verification_open(path: &Path) -> Result<Option<File>> {
+    match File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(fail("open", path)(error)),
+    }
+}
+
 fn folder_file(dir: &Path, object: &ObjectRef) -> Result<Option<File>> {
     let path = dir.join(CHUNKS_DIR).join(&object.sha256);
     let file = match File::open(&path) {

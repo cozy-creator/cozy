@@ -63,6 +63,16 @@ class ConflictError(Error):
 class UnsupportedError(Error):
     """A source or target this build cannot represent (`unsupported`)."""
 
+class VerificationReport:
+    """Local object references found missing or corrupt; verification never repairs them."""
+
+    @property
+    def missing(self) -> list[tuple[str, int]]: ...
+    @property
+    def corrupt(self) -> list[tuple[str, int]]: ...
+    @property
+    def ok(self) -> bool: ...
+
 class Encoding:
     """A scheme and its complete params; str() is `scheme {key: value, ...}`."""
 
@@ -174,8 +184,8 @@ class Checkpoint:
         """Release this handle's access and cached components; existing child handles remain usable."""
     def __enter__(self) -> Checkpoint: ...
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None: ...
-    def verify(self) -> list[tuple[str, int]]:
-        """Hash locally available header, chunks and assets; report missing or corrupt objects."""
+    def verify(self, components: Sequence[str] | None = None) -> VerificationReport:
+        """Check the actual header and selected full chunks/assets, without fetching or repair."""
     def open_chunk(self, index: int) -> int:
         """A new read-only OS descriptor owned and closed by the caller."""
 
