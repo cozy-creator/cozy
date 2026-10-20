@@ -2796,6 +2796,7 @@ impl Pool {
                 d.memory.as_ref().zip(pid).map(|(memory, pid)| (memory, pid, d.entry.as_str()))
             }).collect(),
             selections: plan.selections(),
+            adopted: false,
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
@@ -3063,8 +3064,11 @@ impl Pool {
         // Rank 0 answered, so a follower that ended during the call is the group's first fault.
         let lost = self.lost_followers(start, degree, &session.followers);
         if !reply.ok || !reply.quiescent || !reply.poisoned.is_empty() || !lost.is_empty() {
-            // It may have faulted on its GPU: what it or any process kept there is not trusted.
-            gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(GpuLedger::forget_kept);
+            // It may have faulted on its GPU: what it or any process kept there is not trusted,
+            // and after a fault in a request that mapped kept pages none is kept again (B8).
+            let refuse = callbacks.adopted && !(reply.ok && reply.poisoned.is_empty());
+            let ledgers = gpus.iter().filter_map(|d| d.memory.as_ref());
+            ledgers.for_each(if refuse { GpuLedger::refuse_kept } else { GpuLedger::forget_kept });
             // The author's failure keeps its traceback and origin in triage; the executor's
             // end would record only "executor_ended".
             if let Some(outcome) = reply.outcome.as_ref().filter(|o| !o.traceback.is_empty()) {
@@ -3725,6 +3729,8 @@ struct Callbacks<'a> {
     kept: Vec<Option<(&'a GpuLedger, u32, &'a str)>>,
     /// The checkpoints the call reads and their components: what a missed grant seals.
     selections: Vec<SelectedManifest>,
+    /// A rank mapped GPU pages a gone executor kept (`read_grant`).
+    adopted: bool,
 }
 /// A call's end: a layout it was sealing and never deposited is nobody's to wait for.
 struct Sealing<'a>(&'a Deposits, &'a str);
@@ -3769,6 +3775,7 @@ impl Services for Callbacks<'_> {
                 answer.pages.push(page);
                 fds.push(fd);
             }
+            self.adopted = true;
             (answer.fingerprint, answer.descriptors) = (fingerprint, fds.len() as u64);
         }
         self.pool.notes.note(serde_json::json!({"event": "read_grant", "manifest": frame.manifest,

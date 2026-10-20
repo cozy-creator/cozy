@@ -62,4 +62,7 @@ impl GpuLedger {
     pub fn forget_kept(&self) {
         match *self {}
     }
+    pub fn refuse_kept(&self) {
+        match *self {}
+    }
 }

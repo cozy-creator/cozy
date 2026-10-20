@@ -19,7 +19,7 @@ use std::{
         unix::net::UnixStream,
     },
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, OnceLock,
     },
     time::Instant,
@@ -44,6 +44,9 @@ struct Inner {
     context: AtomicU64,
     /// Kept GPU pages by layout key.
     kept: Mutex<BTreeMap<String, Holding>>,
+    /// A request that mapped kept pages here faulted: none are kept or handed out again until
+    /// TensorD restarts; executors refill from RAM (B8's fallback).
+    refused: AtomicBool,
     log: MemoryLog,
     end: OnceLock<Ender>,
     freed: OnceLock<Freed>,
@@ -169,6 +172,7 @@ impl GpuLedger {
             floor,
             context: AtomicU64::new(floor),
             kept: Mutex::default(),
+            refused: AtomicBool::new(false),
             log,
             end: OnceLock::new(),
             freed: OnceLock::new(),
@@ -277,6 +281,9 @@ impl GpuLedger {
     /// Holds GPU pages `pid` kept of layout `key` (region, bytes, container); a deposit by
     /// another process or of other contents replaces what was held.
     pub fn keep(&self, key: &str, fingerprint: &str, pid: u32, pages: Vec<(Page, File)>) {
+        if self.inner.refused.load(Ordering::Acquire) {
+            return;
+        }
         let mut kept = self.inner.kept.lock().unwrap();
         let fresh = || Holding { fingerprint: fingerprint.into(), pid, pages: BTreeMap::new(), taken: false, used: Instant::now() };
         let held = kept.entry(key.into()).or_insert_with(fresh);
@@ -309,6 +316,13 @@ impl GpuLedger {
         let dropped = std::mem::take(&mut *self.inner.kept.lock().unwrap()).len();
         self.inner.publish();
         self.inner.log.note(serde_json::json!({"event": "kept_forgotten", "gpu": self.inner.entry, "layouts": dropped}));
+    }
+
+    /// A device fault in a request that mapped kept pages: none is kept here again.
+    pub fn refuse_kept(&self) {
+        self.inner.refused.store(true, Ordering::Release);
+        self.forget_kept();
+        self.inner.log.note(serde_json::json!({"event": "kept_refused", "gpu": self.inner.entry}));
     }
 }
 

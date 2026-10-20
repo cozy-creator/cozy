@@ -946,11 +946,13 @@ impl Inner {
         Ok(m)
     }
 
-    /// Imports kept pages `fd` and maps them at `va`; the handle, or nothing mapped.
+    /// Imports kept pages `fd` and maps them at `va`; the handle, or nothing mapped. Mapped
+    /// read-write, as this process's own pages are: it is their one user now, and every request
+    /// that read imported pages through a read-only mapping faulted (12166, 12172, 12176).
     fn import(&self, va: u64, span: u64, fd: &OwnedFd) -> Result<Handle> {
         let mut h: Handle = 0;
         call!("cuMemImportFromShareableHandle", mem_import(&mut h, fd.as_raw_fd() as usize as *mut c_void, cuda::MEM_HANDLE_TYPE_POSIX_FD))?;
-        let desc = AccessDesc { location: self.prop.location, flags: cuda::MEM_ACCESS_PROT_READ };
+        let desc = AccessDesc { location: self.prop.location, flags: cuda::MEM_ACCESS_PROT_READWRITE };
         let mapped = call!("cuMemMap", mem_map(va, span as usize, 0, h, 0));
         let access = match &mapped {
             Ok(()) => call!("cuMemSetAccess", mem_set_access(va, span as usize, &desc, 1)),
@@ -1403,7 +1405,7 @@ impl WeightSet {
                         };
                         let fill = Arc::new(Fill { state: Mutex::new(Some(ready)), cv: Condvar::new() });
                         let chunks = vec![Chunk { handle, size: x.span, shared: true }];
-                        let m = Mapping { va: base + x.offset, span: x.span, chunks, fill: Some(fill), fresh: true, kept: Some(contain(fd)?), read_only: true, ..Default::default() };
+                        let m = Mapping { va: base + x.offset, span: x.span, chunks, fill: Some(fill), fresh: true, kept: Some(contain(fd)?), ..Default::default() };
                         st.reg(self.id, r)?.map = Some(m);
                         st.mapped += x.span;
                         adopted += x.nbytes;

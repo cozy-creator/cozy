@@ -476,4 +476,12 @@ fn kept_pages_outlive_their_executor_and_go_on_an_ask() {
         asker.wait(victim).unwrap();
     }
     assert!(kept(&ledger) == 0 && ledger.take_kept("layout-b").is_none(), "an ask closed them");
+
+    // A request that mapped kept pages faulted: none is kept or handed out again here.
+    ledger.refuse_kept();
+    let mut next = Command::new("sleep").arg("1000").spawn().unwrap();
+    ledger.keep("layout-a", "fp-a", next.id(), vec![page(0, "zero")]);
+    next.kill().unwrap();
+    next.wait().unwrap();
+    assert!(kept(&ledger) == 0 && ledger.take_kept("layout-a").is_none(), "refused: RAM refills");
 }
