@@ -677,9 +677,6 @@ async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects(
         .iter()
         .cloned()
         .chain(std::iter::once(data.asset.clone()))
-        .chain(std::iter::once(ObjectRef::of(
-            &fs::read(data.folder.join("README.md")).unwrap(),
-        )))
         .collect();
     assert_eq!(
         immutable
@@ -688,7 +685,7 @@ async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects(
             .into_iter()
             .collect::<BTreeSet<_>>(),
         expected,
-        "All names the exact model chunks, asset, and repository file"
+        "All names the exact checkpoint chunks and component assets"
     );
     let named = offline
         .open(
