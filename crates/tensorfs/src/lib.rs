@@ -107,8 +107,9 @@ pub mod raw;
 mod session;
 #[cfg(feature = "store")]
 pub use session::{
-    bearer, export, Checkpoint, Client, Component, Config, DPoP, Endpoint, Fetch, Fetched,
-    Format, HeaderMap, JwtBearer, Open, Progress, Ref, Request, Selection, TokenProvider,
+    bearer, export, Checkpoint, Client, Component, ComponentWriter, Config, DPoP, Endpoint,
+    Fetch, Fetched, Format, HeaderMap, JwtBearer, Open, Progress, Ref, Request, Selection,
+    TokenProvider, Writer, WriterOptions,
 };
 
 
