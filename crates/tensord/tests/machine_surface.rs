@@ -1494,82 +1494,28 @@ mod v1_api {
         let _ = fs::remove_dir_all(tools);
     }
 
-    /// `cozy model upload local/tiny acme/tiny` under the run's capability (th-241): the spec
-    /// names the Hub and carries the owner's device-key-signed capability for this machine's
-    /// leaf; the machine trades it once at the upload and AuthKit verifies every proof. With no
-    /// capability, or one signed by a revoked device key, the run ends typed.
+    /// `cozy model upload local/tiny acme/tiny` on a run that names no TensorFS endpoint: TensorD
+    /// publishes nothing itself, so the run is refused, typed, and moves nothing.
     #[tokio::test]
-    #[ignore = "real AuthKit: needs go and AUTHKIT_TEST_DATABASE_URL"]
-    async fn a_warm_run_publishes_a_local_alias_under_its_capability() {
-        let (upstream, hub) = hub_oauth::test_hub();
-        let authkit = hub_oauth::AuthKit::start(&upstream);
-        let mut held = None;
+    async fn an_upload_without_a_tensorfs_endpoint_is_refused() {
         let machine = Machine::start_with(|state, _| {
-            let store = tensorfs::store::Store::open(state.join("tensorfs")).unwrap();
+            let store = tensord::storage::open(&state.join("tensorfs")).unwrap();
             let manifest = hub_oauth::checkpoint(&store, &[7; 8192]);
             tensord::storage::set_local(&store, "tiny", &manifest, &Default::default()).unwrap();
-            held = Some(tensord::storage::local_tree(&store, "local/tiny").unwrap().unwrap().id());
         })
         .await;
-        let manifest = held.unwrap();
-        let jkt = leaf_jkt(&machine);
         let client = client(&machine);
-        let all = cap(Grant {
-            action: MACHINE.into(),
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let spec = v1::RunSpec {
+            kind: v1::RunKind::Warm,
+            models: vec![v1::ModelChoice { parameter: "model".into(), repository: "local/tiny".into(), ..Default::default() }],
+            weights_destination: "acme/tiny".into(),
+            owner: "alice".into(),
             ..Default::default()
-        });
-        let ops = serde_json::json!([{"type": "tensorhub_model_publish", "model": "acme/tiny"}]);
-        let upload = |id: &str, capability: String| RunRequest {
-            id: id.into(),
-            after: 0,
-            spec: Some(v1::RunSpec {
-                kind: v1::RunKind::Warm,
-                models: vec![v1::ModelChoice {
-                    parameter: "model".into(),
-                    repository: "local/tiny".into(),
-                    ..Default::default()
-                }],
-                weights_destination: "acme/tiny".into(),
-                hub: Some(v1::HubAccess {
-                    origin: authkit.hub.clone(),
-                    object_hosts: vec!["localhost".into()],
-                    capability,
-                    token_endpoint: authkit.token_endpoint.clone(),
-                    ..Default::default()
-                }),
-                owner: "alice".into(),
-                ..Default::default()
-            }),
         };
-        let done = |events: Vec<v1::RunEvent>| outcome(&events);
-        let refused = done(collect(run_events(&client, &all, upload("upload-0", String::new())).await.unwrap()).await.unwrap());
+        let refused = settle(&client, &all, "upload-0", spec).await;
         assert_eq!(refused.status, "failed", "{refused:?}");
-        assert_eq!(refused.reason.unwrap().code, "capability_required");
-        assert_eq!(authkit.exchanges(), 0);
-
-        for id in ["upload-1", "upload-2"] {
-            let signed = authkit.capability(&jkt, &ops, 600);
-            let done = done(collect(run_events(&client, &all, upload(id, signed)).await.unwrap()).await.unwrap());
-            assert_eq!(done.status, "succeeded", "{id}: {done:?}");
-            let result: serde_json::Value = json(&done.result);
-            assert_eq!(result["models"][0]["published"]["checkpoint"], manifest, "{result}");
-        }
-        {
-            let hub = hub.lock().unwrap();
-            assert_eq!(hub.finalized, [manifest.clone(), manifest.clone()]);
-            assert_eq!(hub.credentialed_uploads, 0);
-        }
-        assert_eq!(authkit.exchanges(), 2, "one trade per run");
-        let owner = authkit.owner();
-        let verified = authkit.verified();
-        assert!(!verified.is_empty() && verified.iter().all(|s| s["owner"] == owner.as_str()), "{verified:?}");
-
-        let signed = authkit.capability(&jkt, &ops, 600);
-        authkit.revoke_device_key();
-        let revoked = done(collect(run_events(&client, &all, upload("upload-3", signed)).await.unwrap()).await.unwrap());
-        assert_eq!(revoked.status, "failed", "{revoked:?}");
-        assert_eq!(revoked.reason.unwrap().code, "capability_refused");
-        assert_eq!(hub.lock().unwrap().finalized.len(), 2);
+        assert_eq!(refused.reason.unwrap().code, "upload_endpoint_absent");
     }
 
     /// A wheel with one module and nothing else: `name` `version`.
@@ -1862,64 +1808,6 @@ mod v1_api {
         let _ = fs::remove_dir_all(source);
     }
 
-    /// `cozy model upload` on the serve process: a warm run of one provider source makes it
-    /// with TensorFS and puts its checkpoint in the destination under the machine's authority;
-    /// every object reaches the Hub, then finalization.
-    #[tokio::test]
-    #[ignore = "real network: huggingface.co; real AuthKit: go and AUTHKIT_TEST_DATABASE_URL"]
-    async fn a_warm_run_uploads_its_source_model_to_its_destination() {
-        let (upstream, hub) = hub_oauth::test_hub();
-        let authkit = hub_oauth::AuthKit::start(&upstream);
-        let machine = Machine::start().await;
-        let ops = serde_json::json!([{"type": "tensorhub_model_publish", "model": "acme/tiny"}]);
-        let capability = authkit.capability(&leaf_jkt(&machine), &ops, 600);
-        let client = client(&machine);
-        let all = cap(Grant {
-            action: MACHINE.into(),
-            ..Default::default()
-        });
-        let spec = v1::RunSpec {
-            kind: v1::RunKind::Warm,
-            models: vec![v1::ModelChoice {
-                parameter: "model".into(),
-                source: "hf://hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2/unet/diffusion_pytorch_model.safetensors".into(),
-                ..Default::default()
-            }],
-            weights_destination: "acme/tiny".into(),
-            hub: Some(v1::HubAccess {
-                origin: authkit.hub.clone(),
-                object_hosts: vec!["localhost".into()],
-                capability,
-                token_endpoint: authkit.token_endpoint.clone(),
-                ..Default::default()
-            }),
-            owner: "alice".into(),
-            ..Default::default()
-        };
-        let request = RunRequest {
-            id: "upload-1".into(),
-            after: 0,
-            spec: Some(spec),
-        };
-        let events = collect(run_events(&client, &all, request).await.unwrap())
-            .await
-            .unwrap();
-        let done = outcome(&events);
-        assert_eq!(done.status, "succeeded", "{done:?}");
-        let result: serde_json::Value = json(&done.result);
-        let model = &result["models"][0];
-        assert_eq!(model["published"]["destination"], "acme/tiny");
-        let held = hub.lock().unwrap();
-        assert_eq!(held.credentialed_uploads, 0);
-        assert_eq!(held.finalized, [model["published"]["checkpoint"].as_str().unwrap()], "the made model's tree");
-        assert!(held.declared.contains(&held.finalized[0]));
-        let mut uploaded: Vec<_> = held.uploaded.keys().cloned().collect();
-        let mut declared = held.declared.clone();
-        uploaded.sort();
-        declared.sort();
-        assert_eq!(uploaded, declared);
-    }
-
     /// `cozy model upload <file>` and `cozy model download … local/name` on the serve process:
     /// a file the client wrote is made into a model with no provider and kept under a local
     /// alias. Real network for the fixture and its profile's reference configs.
@@ -1967,8 +1855,8 @@ mod v1_api {
         let result: serde_json::Value = json(&done.result);
         let model = &result["models"][0];
         assert_eq!(model["published"]["destination"], "local/unet", "{result}");
-        let store = tensorfs::store::Store::open(machine.store()).unwrap();
-        let header = tensord::storage::local(&store, "unet").unwrap().unwrap();
+        let store = tensord::storage::open(&machine.store()).unwrap();
+        let header = tensord::storage::local(&store, "local/unet", None, None).unwrap().unwrap().header;
         assert_eq!(model["checkpoint"], header.id());
     }
 

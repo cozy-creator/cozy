@@ -7,7 +7,6 @@ use axum::{
 };
 use serde_json::json;
 use std::{
-    collections::BTreeMap,
     io,
     sync::{
         Arc, Mutex,
@@ -72,14 +71,11 @@ impl Fixture {
         let tree = store.put_tree(&tree).unwrap();
         let tree_digest = tensorfs::sha256::digest(&store.read(&tree).unwrap()).to_vec();
         // The newest local name is deliberately different from the exact retained output.
+        let mut newer = Tree::default();
+        newer.set_variant("f32", other.clone());
+        let newer = store.put_tree(&newer).unwrap();
         store
-            .set_variant(
-                "local/derived",
-                "newer",
-                Some("f32"),
-                &other,
-                &BTreeMap::new(),
-            )
+            .update_ref("local/derived", |old| Some(tensorfs::fetch::with_tree(old, "local/derived", &newer, Some("newer"))))
             .unwrap();
         let service = Service::open(
             &root.path().join("state"),
@@ -96,7 +92,6 @@ impl Fixture {
         let objects = Arc::new(
             Objects::new(
                 &root.path().join("objects"),
-                store.clone(),
                 service.engine.clone(),
             )
             .unwrap(),

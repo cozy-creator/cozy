@@ -1,11 +1,11 @@
-//! The models this machine's store holds, for Status: each local model (`local/<name>` refs)
-//! and each Hub checkpoint it pulled (`model-` pins), with what it weighs. A listing is read
+//! The models this machine's store holds, for Status: each local model (`local/<name>`) and
+//! each Hub checkpoint it pulled (cached Hub refs), with what it weighs. A listing is read
 //! again only when the set of models changed, not when one was merely used.
 use crate::api::v1;
 use crate::storage::{self, Store};
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
+    io,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -18,19 +18,49 @@ pub struct Listing {
     pub bytes: u64,
 }
 
-/// What a `model-` pin's owner records: the checkpoint as the Hub named it, and the tree its
-/// release names there.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A Hub checkpoint this machine pulled: `lane` of `tree`, `repository`'s release `release`
+/// (empty: the owner's tree by hash). The store's ref of the repository records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pulled {
     pub repository: String,
     pub release: String,
     pub lane: String,
-    pub tree: Option<ObjectRef>,
+    pub tree: ObjectRef,
 }
 
 impl Pulled {
-    pub fn owner(&self) -> String {
-        serde_json::to_string(self).expect("plain strings")
+    /// Names the pull in the store: `repository`'s ref, a cache TensorFS may expire. The tree
+    /// must be here.
+    pub fn record(&self, store: &Store) -> io::Result<()> {
+        let release = (!self.release.is_empty()).then_some(self.release.as_str());
+        let named = store
+            .update_ref(&self.repository, |old| Some(tensorfs::fetch::with_tree(old, &self.repository, &self.tree, release)))
+            .map_err(storage::io_error)?;
+        match named {
+            Some(repo) => store.cache_ref(&repo).map_err(storage::io_error),
+            None => Ok(()),
+        }
+    }
+
+    /// The Hub checkpoint `header` is, as this machine pulled it; None for one never pulled.
+    pub fn of(store: &Store, header: &ObjectRef) -> io::Result<Option<Pulled>> {
+        for repo in store.refs().map_err(storage::io_error)? {
+            if repo.name.starts_with("local/") {
+                continue;
+            }
+            let releases = repo.releases.iter().map(|r| (r.version.as_str(), &r.tree));
+            for (release, tree) in releases.chain(repo.checkpoints.iter().map(|tree| ("", tree))) {
+                let Ok(parsed) = store.tree(tree) else {
+                    continue;
+                };
+                let lane = parsed.variants().find(|(_, h)| *h == header).map(|(lane, _)| lane.to_string());
+                if let Some(lane) = lane {
+                    let (repository, release) = (repo.name.clone(), release.to_string());
+                    return Ok(Some(Pulled { repository, release, lane, tree: tree.clone() }));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -69,31 +99,18 @@ pub fn listing(root: &Path) -> Listing {
 fn seen(store: &Store) -> std::io::Result<Seen> {
     let mut seen = Seen::new();
     for repo in store.refs().map_err(storage::io_error)? {
-        for release in &repo.releases {
-            let tree = store.tree(&release.tree).map_err(storage::io_error)?;
-            let version = if repo.name.starts_with("local/") { "" } else { release.version.as_str() };
-            for (variant, header) in tree.variants() {
-                seen.push((repo.name.clone(), version.into(), variant.into(), header.clone()));
+        let local = repo.name.starts_with("local/");
+        let releases = repo.releases.iter().map(|r| (r.version.as_str(), &r.tree));
+        for (release, tree) in releases.chain(repo.checkpoints.iter().map(|tree| ("", tree))) {
+            let Ok(tree) = store.tree(tree) else {
+                continue;
+            };
+            let release = if local { "" } else { release };
+            // A Hub tree names every lane its release publishes: the ones pulled are here.
+            for (variant, header) in tree.variants().filter(|(_, h)| storage::present(store, h)) {
+                seen.push((repo.name.clone(), release.into(), variant.into(), header.clone()));
             }
         }
-    }
-    // Only the pulled checkpoints' pins are read: Status asks every second, and run objects
-    // can number thousands.
-    let mut ids: Vec<String> = std::fs::read_dir(store.root().join("pins"))?
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.strip_suffix(".json").map(str::to_string))
-        .filter(|id| id.starts_with("model-"))
-        .collect();
-    ids.sort();
-    for id in ids {
-        let Some(pin) = store.get_pin(&id).map_err(storage::io_error)? else {
-            continue;
-        };
-        let Some(header) = pin.roots.first() else {
-            continue;
-        };
-        let pulled: Pulled = pin.owner.as_deref().and_then(|o| serde_json::from_str(o).ok()).unwrap_or_default();
-        seen.push((pulled.repository, pulled.release, pulled.lane, header.clone()));
     }
     seen.sort();
     Ok(seen)
@@ -149,9 +166,11 @@ pub fn fixture(root: &Path) -> std::io::Result<()> {
         writer.commit().map_err(storage::io_error)
     };
     let acme = model("acme", &[2; 300])?;
-    let pulled = Pulled { repository: "acme/base".into(), release: "1.0.0".into(), lane: "fp8".into(), tree: None };
-    storage::hold(&store, &storage::pin::model(&acme.sha256), vec![acme], Some(pulled.owner()))?;
-    storage::set_local(&store, "mine", &model("mine", &[3; 50])?, &Default::default())
+    let mut tree = tensorfs::format::Tree::default();
+    tree.set_variant("fp8", acme);
+    let tree = store.put_tree(&tree).map_err(storage::io_error)?;
+    Pulled { repository: "acme/base".into(), release: "1.0.0".into(), lane: "fp8".into(), tree }.record(&store)?;
+    storage::set_local(&store, "mine", &model("mine", &[3; 50])?, &Default::default()).map(drop)
 }
 
 #[cfg(test)]
@@ -189,8 +208,10 @@ mod tests {
         assert_eq!(held.models[1].checkpoints[0].release, "", "a local model has no release");
         // A use answers from the last read; a removed model is seen.
         let acme = storage::held(&store, &release.manifest).unwrap();
-        store.touch_pin(&storage::pin::model(&acme.sha256)).unwrap();
+        drop(store.checkpoint(&acme).unwrap());
         assert_eq!(listing(&root), held);
+        let pulled = Pulled::of(&store, &acme).unwrap().unwrap();
+        assert_eq!((pulled.repository.as_str(), pulled.release.as_str(), pulled.lane.as_str()), ("acme/base", "1.0.0", "fp8"));
         store.update_ref("local/mine", |_| None).unwrap();
         assert_eq!(listing(&root).models.len(), 1);
         std::fs::remove_dir_all(&root).unwrap();

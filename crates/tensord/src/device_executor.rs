@@ -203,17 +203,6 @@ pub enum DeviceCommand {
         authorized_device_limit_bytes: Option<u64>,
         #[serde(skip_serializing_if = "String::is_empty")]
         attention_pin: String,
-        /// Each weight set asks for TensorD's sealed CPU-buffer layout.
-        #[serde(skip_serializing_if = "is_false")]
-        sealed_tiers: bool,
-        /// TensorD supplies the selected header/assets (`model_source`) for Runtime to parse
-        /// and construct its model. With sealed tiers, no executor Store open is needed.
-        #[serde(skip_serializing_if = "is_false")]
-        model_sources: bool,
-        /// This machine stages layouts in part and hands over object files
-        /// (`sealed_stage`, `object_files`): an executor asks for them only when told so.
-        #[serde(skip_serializing_if = "is_false")]
-        staged_tiers: bool,
         /// The pinned budget, applied before any weight set registers.
         #[serde(skip_serializing_if = "Option::is_none")]
         pinned_bytes: Option<i64>,
@@ -395,10 +384,6 @@ pub enum Event {
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     CheckpointItem,
-    ModelSource,
-    SealedTier,
-    SealedStage,
-    ObjectFiles,
     DeviceTier,
     BudgetCell,
     DeviceRoom,
@@ -683,8 +668,6 @@ pub struct Frame {
     pub features: BTreeMap<String, Value>,
     /// `device_tier`: fds that follow the frame, one per chunk of `regions`.
     pub descriptors: u32,
-    /// `sealed_tier`/`sealed_stage`: the regions to stage (the ones the executor streams).
-    pub stage_regions: Option<Vec<u32>>,
     pub device: String,
     pub regions: Vec<crate::resident_custody::SharedRegion>,
     /// `device_tier`: what the regions hold beside the stored bytes ("": nothing; in an ask
@@ -827,14 +810,6 @@ pub struct Answer {
     pub stored: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub reason: String,
-    /// `object_files`: the SHA-256 of the objects whose fds follow, in the order the executor
-    /// derives from its own plan (`HostTier::objects_digest`), in place of the list (SDXL's
-    /// UNet: about 1,700 objects).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub objects_sha256: String,
-    /// `sealed_stage`: the regions staged or staging (the rest stay holes).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub staged: Vec<u32>,
 }
 fn is_zero_ms(value: &f64) -> bool {
     *value == 0.0
@@ -872,8 +847,6 @@ impl Answer {
             disputed: false,
             stored: false,
             reason: String::new(),
-            objects_sha256: String::new(),
-            staged: Vec::new(),
         }
     }
     pub fn ok(seq: u64) -> Self {
@@ -911,16 +884,6 @@ pub trait Services {
         fds: Vec<Owned>,
     ) -> io::Result<(Answer, Vec<Owned>)> {
         drop(fds);
-        Ok((Answer::unavailable(frame.seq), Vec::new()))
-    }
-    /// `object_files`: the plan's memfd arrived with the request; the
-    /// verified object files follow the answer, one fd per `objects` entry.
-    fn object_files(
-        &mut self,
-        frame: &Frame,
-        plan: Option<File>,
-    ) -> io::Result<(Answer, Vec<File>)> {
-        drop(plan);
         Ok((Answer::unavailable(frame.seq), Vec::new()))
     }
 }
@@ -1916,25 +1879,6 @@ impl DeviceExecutor {
                     watch.serving(false);
                     write_frame(&mut self.stream, &answer)?;
                 }
-                Some(Event::Request) if frame.kind == Kind::ObjectFiles => {
-                    let plan = if frame.descriptor {
-                        Some(File::from(platform::handles::recv_fd(&self.stream)?))
-                    } else {
-                        None
-                    };
-                    watch.serving(true);
-                    let answered = services.object_files(&frame, plan);
-                    watch.serving(false);
-                    let (mut answer, out) = answered?;
-                    answer.event = "answer";
-                    answer.seq = frame.seq;
-                    answer.descriptor = false;
-                    answer.descriptors = out.len() as u64;
-                    write_frame(&mut self.stream, &answer)?;
-                    for file in &out {
-                        platform::handles::send_fd(&self.stream, file)?;
-                    }
-                }
                 Some(Event::Request) => {
                     // The machine's own answer time is not the executor's stillness.
                     watch.serving(true);
@@ -2273,8 +2217,8 @@ mod codec_tests {
         DeviceCommand::Load {
             tensorfs: Some(ordinary_options()), construction: "construction".into(), devices: String::new(),
             sequence_parallel_degree: 1, binding: Box::default(), budgets: Budgets::default(), models: vec![],
-            authorized_device_limit_bytes: None, attention_pin: String::new(), sealed_tiers: false,
-            model_sources: false, staged_tiers: false, pinned_bytes: None, device_weights: false, cap_bytes: None,
+            authorized_device_limit_bytes: None, attention_pin: String::new(),
+            pinned_bytes: None, device_weights: false, cap_bytes: None,
         }
     }
 

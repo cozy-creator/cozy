@@ -4,8 +4,8 @@
 //! `model_adapters.json` holds the ordered graph the executor binds with PEFT. Nothing is computed, and large parts keep their
 //! objects. Factors must already be canonical PEFT keys (`<path>.lora_A.weight`,
 //! `<path>.lora_B.weight`, optional scalar `<path>.alpha`): foreign layouts are normalized when a
-//! model is imported, never here. A view is pinned `view-<id>`, a cache that expires like the
-//! machine's others (`storage::expire`).
+//! model is imported, never here. A view is the store's like any checkpoint written to it: kept
+//! while open, then a cache TensorFS evicts.
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
@@ -15,7 +15,7 @@ use serde::Serialize;
 use tensorfs::format::{Body, Component, Dtype, Header, ObjectRef, Tensor};
 use tensorfs::store::{Checkpoint, Store};
 
-use crate::storage::{self, pin};
+use crate::storage;
 
 pub const FORMAT: &str = "cozy.model.lora/1";
 /// The graph's asset in each adapted component of the view.
@@ -32,11 +32,11 @@ pub struct Selection {
     pub strength: f64,
 }
 
-/// The composed checkpoint and the pin that keeps it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The composed view, `view-<composition>`, open: the store keeps it while the caller holds it.
+#[derive(Clone, Debug)]
 pub struct Composed {
-    pub pin: String,
-    pub checkpoint: ObjectRef,
+    pub name: String,
+    pub checkpoint: Checkpoint,
 }
 
 fn refuse(code: &str, detail: impl Into<String>) -> io::Error {
@@ -285,8 +285,8 @@ fn plan(base: &Checkpoint, adapters: &[(Selection, Checkpoint)]) -> io::Result<(
     Ok((takes, graph))
 }
 
-/// The adapter view of `base` with `selections`. A held view is reused (and its last use
-/// renewed); one collected, or left unfinished by a crash, is composed again.
+/// The adapter view of `base` with `selections`, composed (the same bytes, so the same id, each
+/// time); one left unfinished by a crash resumes.
 pub fn compose(store: &Store, base: &ObjectRef, selections: &[Selection]) -> io::Result<Composed> {
     let rows: Vec<_> = selections
         .iter()
@@ -295,13 +295,7 @@ pub fn compose(store: &Store, base: &ObjectRef, selections: &[Selection]) -> io:
     let identity = tensorfs::sha256::hex_digest(
         &serde_json_canonicalizer::to_vec(&serde_json::json!([FORMAT, base.id(), rows])).map_err(io::Error::other)?,
     );
-    let id = pin::view(&identity[..40]);
-    if let Some(held) = store.get_pin(&id).map_err(storage::io_error)? {
-        if let Some(header) = held.roots.first().filter(|h| store.reuse(h).unwrap_or(false)) {
-            store.touch_pin(&id).map_err(storage::io_error)?;
-            return Ok(Composed { pin: id, checkpoint: header.clone() });
-        }
-    }
+    let id = format!("view-{}", &identity[..40]);
     let checkpoint = |header: &ObjectRef| store.checkpoint(header).map_err(storage::io_error);
     let base = checkpoint(base)?;
     let adapters = selections.iter().map(|s| Ok((s.clone(), checkpoint(&s.checkpoint)?))).collect::<io::Result<Vec<_>>>()?;
@@ -335,7 +329,7 @@ pub fn compose(store: &Store, base: &ObjectRef, selections: &[Selection]) -> io:
         writer.set_metadata(key, value.clone());
     }
     let header = writer.commit().map_err(storage::io_error)?;
-    Ok(Composed { pin: id, checkpoint: header })
+    Ok(Composed { name: id, checkpoint: checkpoint(&header)? })
 }
 
 #[cfg(test)]
@@ -373,26 +367,27 @@ pub(crate) mod tests {
 
     /// An adapter view renames the base projection, grafts the factors under their adapter's
     /// name and carries the rest (config, assets, metadata); every tensor reads back
-    /// bit-identical and the large base part keeps its objects. A held view is reused; a
-    /// collected one composes again identically.
+    /// bit-identical and the large base part keeps its objects. Composed again, it is the same
+    /// view. Open, it outlives a collection; closed, it goes, and composes again identically.
     #[test]
     fn an_adapter_view_grafts_factors_onto_the_base() {
         let root = std::env::temp_dir().join(format!("adapter-{}", uuid::Uuid::new_v4()));
-        let store = Store::open(&root).unwrap().with_grace(Duration::ZERO);
+        let store = Store::open(&root).unwrap().with_cache().with_grace(Duration::ZERO);
         let (weight, bias, other) = (f32s(2048 * 2048, 0.5), f32s(2048, 1.5), f32s(8, 2.5));
         let base = checkpoint(&store, "base", "unet", &[("proj.weight", vec![2048, 2048], weight.clone()), ("proj.bias", vec![2048], bias.clone()), ("other.weight", vec![8], other.clone())]);
         let (a, b) = (f32s(2 * 2048, 0.125), f32s(2048 * 2, 0.75));
         let lora = checkpoint(&store, "lora", "adapter", &[("proj.lora_A.weight", vec![2, 2048], a.clone()), ("proj.lora_B.weight", vec![2048, 2], b.clone()), ("proj.alpha", vec![], 4.0f32.to_le_bytes().to_vec())]);
+        // The caller holds its inputs open, as a call's fetch does.
+        let (held, adapter) = (store.checkpoint(&base).unwrap(), store.checkpoint(&lora).unwrap());
         let selection = [Selection { checkpoint: lora.clone(), component: String::new(), source_component: String::new(), strength: 1.0 }];
         let view = compose(&store, &base, &selection).unwrap();
-        let composed = store.checkpoint(&view.checkpoint).unwrap();
+        let composed = &view.checkpoint;
         for (key, bytes) in [("proj.base_layer.weight", &weight), ("proj.base_layer.bias", &bias), ("other.weight", &other),
             ("proj.lora_A.adapter_0.weight", &a), ("proj.lora_B.adapter_0.weight", &b)] {
             assert_eq!(&composed.read("unet", key).unwrap(), bytes, "{key}");
         }
         assert!(composed.tensor("unet", "proj.weight").is_err());
-        let held = store.checkpoint(&base).unwrap();
-        assert_eq!(objects(&composed, "unet", "proj.base_layer.weight"), objects(&held, "unet", "proj.weight"));
+        assert_eq!(objects(composed, "unet", "proj.base_layer.weight"), objects(&held, "unet", "proj.weight"));
         let unet = composed.component("unet").unwrap();
         assert_eq!((unet.class.as_str(), &unet.config), ("diffusers.UNet2DConditionModel", &held.component("unet").unwrap().config));
         assert_eq!(composed.asset("unet", "tokenizer.json").unwrap(), b"{}");
@@ -400,15 +395,21 @@ pub(crate) mod tests {
         let graph: serde_json::Value = serde_json::from_slice(&composed.asset("unet", GRAPH_FILE).unwrap()).unwrap();
         assert_eq!(graph["layers"][0]["alpha"], 4.0);
         assert_eq!(graph["layers"][0]["component"], "unet");
-        assert_eq!(compose(&store, &base, &selection).unwrap(), view, "a held view is reused");
-        let nested = compose(&store, &view.checkpoint, &selection).unwrap_err();
+        let again = compose(&store, &base, &selection).unwrap();
+        assert_eq!((&again.name, again.checkpoint.id()), (&view.name, composed.id()), "composed again, the same view");
+        let nested = compose(&store, composed.id(), &selection).unwrap_err();
         assert!(nested.to_string().starts_with("adapter_nested"), "{nested}");
 
-        store.unpin(&view.pin).unwrap();
-        store.gc().unwrap();
-        assert!(!store.reuse(&view.checkpoint).unwrap(), "the view went with its pin");
-        assert!(store.checkpoint(&base).unwrap().read("unet", "proj.weight").is_ok(), "the base did not");
-        assert_eq!(compose(&store, &base, &selection).unwrap(), view, "composed again, identically");
+        // An open view holds its bytes across a collection: no pin is involved.
+        let id = composed.id().clone();
+        store.collect(u64::MAX, Duration::ZERO).unwrap();
+        assert!(store.reuse(&id).unwrap(), "the open view stays");
+        drop((view, again));
+        store.collect(u64::MAX, Duration::ZERO).unwrap();
+        assert!(!store.reuse(&id).unwrap(), "the view went with its last handle");
+        assert_eq!(held.read("unet", "proj.weight").unwrap(), weight, "the open base did not");
+        assert_eq!(compose(&store, &base, &selection).unwrap().checkpoint.id(), &id, "composed again, identically");
+        drop((held, adapter));
         let _ = std::fs::remove_dir_all(root);
     }
 }
