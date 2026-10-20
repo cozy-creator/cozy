@@ -235,8 +235,8 @@ async fn run() -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(90))
         .build()?;
-    let hub =
-        hub_client::Client::connect(&plan.origin, http.clone(), Credential::User(user.clone()));
+    // Login calls must not re-enter this session's hook while bearer holds its mutex.
+    let hub = hub_client::Client::connect(&plan.origin, http.clone(), Credential::Anonymous);
     let owner = Arc::new(Owner {
         origin: plan.origin.clone(),
         user,
