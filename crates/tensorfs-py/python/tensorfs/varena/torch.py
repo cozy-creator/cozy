@@ -879,9 +879,7 @@ class Memory:
             if bind:
                 with _disable_current_modes():
                     self._bind(block, stream)
-            elif (
-                stream != held_stream and not torch.cuda.is_current_stream_capturing()
-            ):
+            elif stream != held_stream and not torch.cuda.is_current_stream_capturing():
                 stream.wait_stream(held_stream)
             with self.changed:
                 if bind:
@@ -1095,7 +1093,8 @@ class Memory:
                 tuple(_copy(row) for row in raw["io"]),
                 trace,
                 ({**raw["proof"], "gpu": self.gpu, "request": id},)
-                if "proof" in raw else (),
+                if "proof" in raw
+                else (),
             )
 
     def resident(self) -> dict[str, int]:
