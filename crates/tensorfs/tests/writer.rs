@@ -154,7 +154,7 @@ fn a_tiny_hf_sdxl_imports_and_reads_back_bit_identical() {
     let request = Request {
         sources: &sources,
         converter: None,
-        variant: None,
+        source_variant: None,
         access: &access,
         tmp: &store.root().join("tmp"),
         progress: &|_, _, _| {},
