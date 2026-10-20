@@ -216,7 +216,10 @@ fn named(store: &Store, reference: &Bound<'_, PyAny>, variant: Option<&str>) -> 
 }
 
 fn opened(py: Python<'_>, store: &Store, named: Named) -> PyResult<PyCheckpoint> {
-    let ck = py.detach(|| store.checkpoint(&named.header)).or_raise(py)?;
+    let ck = py.detach(|| match &named.tree {
+        Some(tree) => store.variant(tree, named.variant.as_deref()),
+        None => store.checkpoint(&named.header),
+    }).or_raise(py)?;
     Ok(PyCheckpoint::new(ck.header().clone(), Some(ck), Some(named)))
 }
 
@@ -242,6 +245,7 @@ impl Remote {
     }
 
     fn fetch_progress(&self, objects: &[ObjectRef], priority: u64, report: &(dyn Fn(u64, u64) -> Result<(), Failure> + Sync)) -> Result<(), Failure> {
+        let _hold = self.store.cache_hold(objects)?;
         let total = objects.iter().map(|object| object.length).sum();
         report(0, total)?;
         if self.offline {
@@ -297,8 +301,25 @@ impl Remote {
             }
         }
         if self.offline { return Err(Failure { kind: Kind::NotFound, detail: format!("{name} is not cached") }); }
-        let (repo, _) = fetch::runtime()?.block_on(self.endpoint.repo(name))?
-            .ok_or_else(|| Failure { kind: Kind::NotFound, detail: format!("no repo {name}") })?;
+        let resolved = fetch::runtime()?.block_on(self.endpoint.repo(name)).map_err(Failure::from);
+        let (repo, _) = match resolved {
+            Ok(Some(repo)) => repo,
+            Ok(None) => return Err(Failure { kind: Kind::NotFound, detail: format!("no repo {name}") }),
+            Err(error) => {
+                // The last named resolution is useful without a network. A refusal,
+                // invalid response or absent repo must still be visible to the caller.
+                if matches!(error.kind, Kind::Network) {
+                    if let Some(repo) = self.store.get_ref(name)? {
+                        if let Ok((version, tree)) = fetch::release_of(&repo, revision) {
+                            if self.store.reuse(&tree)? {
+                                return Ok((tree, Some(version)));
+                            }
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        };
         let (version, tree) = fetch::release_of(&repo, revision)?;
         Ok((tree, Some(version)))
     }
@@ -312,7 +333,7 @@ impl PyStore {
             (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
             _ => root,
         };
-        let store = py.detach(|| Store::open(root)).or_raise(py)?;
+        let store = py.detach(|| Store::open(root).map(Store::with_cache)).or_raise(py)?;
         Ok(PyStore { store })
     }
 
@@ -323,7 +344,11 @@ impl PyStore {
 
     #[pyo3(signature = (path, variant = None))]
     fn open_path(&self, py: Python<'_>, path: PathBuf, variant: Option<String>) -> PyResult<PyCheckpoint> {
-        let ck = py.detach(|| Checkpoint::folder(&path, variant.as_deref(), Some(&self.store))).or_raise(py)?;
+        let ck = py.detach(|| -> Result<_, Failure> {
+            let ck = Checkpoint::folder(&path, variant.as_deref(), Some(&self.store))?;
+            let _ = self.store.cache_maintain(0)?;
+            Ok(ck)
+        }).or_raise(py)?;
         Ok(PyCheckpoint::new(ck.header().clone(), Some(ck), None))
     }
 
@@ -335,6 +360,7 @@ impl PyStore {
         let remote = Remote { store: self.store.clone(), client, endpoint, offline: false };
         let named = py.detach(|| -> Result<Named, Failure> {
             let (root, version) = remote.root(&repo_id, revision.as_deref())?;
+            let _hold = self.store.cache_hold(std::slice::from_ref(&root))?;
             remote.fetch(std::slice::from_ref(&root), 0)?;
             let bytes = self.store.read(&root)?;
             let (tree, header, chosen) = match Tree::from_json(&bytes) {
@@ -349,7 +375,9 @@ impl PyStore {
                 }
             };
             if let (Some(tree), Some(version)) = (&tree, &version) {
-                self.store.update_ref(&repo_id, |old| Some(fetch::with_tree(old, &repo_id, tree, Some(version))))?;
+                if let Some(repo) = self.store.update_ref(&repo_id, |old| Some(fetch::with_tree(old, &repo_id, tree, Some(version))))? {
+                    self.store.cache_ref(&repo)?;
+                }
             }
             Ok(Named { header, tree, name: Some(repo_id), release: version, variant: chosen })
         }).or_raise(py)?;
@@ -422,6 +450,7 @@ impl PyStore {
         let remote = Remote { store: self.store.clone(), client, endpoint, offline: local_files_only || repo_id.starts_with("local/") };
         py.detach(|| -> Result<PathBuf, Failure> {
             let (root, version) = remote.root(repo_id, revision.as_deref())?;
+            let _root_hold = self.store.cache_hold(std::slice::from_ref(&root))?;
             remote.fetch(std::slice::from_ref(&root), 0)?;
             let tree = self.store.tree(&root)?;
             let chosen: Vec<_> = match variant.as_deref() {
@@ -429,19 +458,31 @@ impl PyStore {
                 None => tree.variants().collect(),
             };
             let headers: Vec<_> = chosen.iter().map(|(_, h)| (*h).clone()).collect();
+            let _header_hold = self.store.cache_hold(&headers)?;
             remote.fetch(&headers, 0)?;
             let mut objects: Vec<_> = tree.repo_files().map(|(_, r)| r.clone()).collect();
             for header in headers {
                 let header = Header::from_cbor(&self.store.read(&header)?)?;
                 objects.extend(tensorfs::store2::wanted(&header, components.as_deref())?);
             }
+            let _object_hold = self.store.cache_hold(&objects)?;
             remote.fetch(&objects, 0)?;
             if let Some(version) = version {
-                self.store.update_ref(repo_id, |old| Some(fetch::with_tree(old, repo_id, &root, Some(&version))))?;
+                if let Some(repo) = self.store.update_ref(repo_id, |old| Some(fetch::with_tree(old, repo_id, &root, Some(&version))))? {
+                    self.store.cache_ref(&repo)?;
+                }
             }
+            let internal = local_dir.is_none();
             let dest = local_dir.unwrap_or_else(|| self.store.root().join("snapshots").join(&root.sha256));
+            let _view_hold = if internal { Some(self.store.cache_directory(&dest)?) } else {
+                self.store.cache_preserve_snapshot(&dest)?;
+                None
+            };
             let variants: Option<Vec<_>> = variant.map(|v| vec![v]);
             self.store.snapshot(&root, &dest, variants.as_deref())?;
+            if internal { self.store.cache_snapshot(&dest)?; }
+            self.store.cache_touch(&root)?;
+            let _ = self.store.cache_maintain(0)?;
             Ok(dest)
         }).or_raise(py)
     }
@@ -453,13 +494,28 @@ impl PyStore {
         let endpoint = Arc::new(Endpoint::new(&client, endpoint, crate::credentials::provider(token)?).or_raise(py)?);
         let remote = Remote { store: self.store.clone(), client, endpoint, offline: local_files_only || repo_id.starts_with("local/") };
         py.detach(|| -> Result<PathBuf, Failure> {
-            let (root, _) = remote.root(repo_id, revision.as_deref())?;
+            let (root, version) = remote.root(repo_id, revision.as_deref())?;
+            let _root_hold = self.store.cache_hold(std::slice::from_ref(&root))?;
             remote.fetch(std::slice::from_ref(&root), 0)?;
             let tree = self.store.tree(&root)?;
             let object = tree.files.get(filename).ok_or_else(|| Failure { kind: Kind::NotFound, detail: format!("no file {filename}") })?;
             remote.fetch(std::slice::from_ref(object), 0)?;
-            let dest = local_dir.unwrap_or_else(|| self.store.root().join("snapshots").join(&root.sha256)).join(filename);
+            if let Some(version) = version {
+                if let Some(repo) = self.store.update_ref(repo_id, |old| Some(fetch::with_tree(old, repo_id, &root, Some(&version))))? {
+                    self.store.cache_ref(&repo)?;
+                }
+            }
+            let internal = local_dir.is_none();
+            let folder = local_dir.unwrap_or_else(|| self.store.root().join("snapshots").join(&root.sha256));
+            let _view_hold = if internal { Some(self.store.cache_directory(&folder)?) } else {
+                self.store.cache_preserve_snapshot(&folder)?;
+                None
+            };
+            let dest = folder.join(filename);
             self.store.materialize(object, &dest)?;
+            if internal { self.store.cache_snapshot(&folder)?; }
+            self.store.cache_touch(&root)?;
+            let _ = self.store.cache_maintain(0)?;
             Ok(dest)
         }).or_raise(py)
     }
@@ -1594,7 +1650,7 @@ impl PyWriter {
             Some(Arc::new(Endpoint::new(&client, &url, crate::credentials::provider(token)?).or_raise(py)?))
         } else { None };
         let (store, w) = py.detach(|| -> Result<_, Failure> {
-            let store = Store::open(&root)?;
+            let store = Store::open(&root)?.with_cache();
             let w = match (&dest, &repo_id, endpoint) {
                 (Some(dest), _, _) => Writer::folder(dest, variant.as_deref().unwrap_or(""), base.as_ref(), resume.is_some())?,
                 (_, Some(name), Some(endpoint)) => {

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{fail, invalid, Error, Result, Store};
+use super::retention::{self, DirectoryGuard, Retention};
 use crate::format::layout::ALIGN;
 use crate::format::{
     self, decode, variant_of, variant_path, Body, Component, Header, Location, ObjectRef,
@@ -26,6 +27,8 @@ pub struct Checkpoint {
     id: ObjectRef,
     header: Arc<Header>,
     header_file: Option<PathBuf>,
+    _retention: Option<Arc<Retention>>,
+    _directories: Arc<[DirectoryGuard]>,
 }
 
 #[derive(Clone, Debug)]
@@ -47,15 +50,28 @@ fn write_view(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::rename(&temp, path).map_err(fail("rename", path))
 }
 
+fn cached_directory(store: &Store, dir: &Path) -> Result<Option<DirectoryGuard>> {
+    let root = fs::canonicalize(store.root()).map_err(fail("resolve", store.root()))?;
+    let real = fs::canonicalize(dir).map_err(fail("resolve", dir))?;
+    for area in ["snapshots", "views"] {
+        if let Ok(relative) = real.strip_prefix(root.join(area)) {
+            if let Some(first) = relative.components().next() {
+                return retention::directory(store, &root.join(area).join(first.as_os_str())).map(Some);
+            }
+        }
+    }
+    Ok(None)
+}
+
 impl Store {
     /// The cozytensors whose header is `header`.
     pub fn checkpoint(&self, header: &ObjectRef) -> Result<Checkpoint> {
-        Ok(Checkpoint {
-            objects: Objects::Store(self.clone()),
-            header: Arc::new(Header::from_cbor(&self.read(header)?)?),
-            id: header.clone(),
-            header_file: None,
-        })
+        let acquisition = retention::acquire(self)?;
+        let ck = Checkpoint::opened(Objects::Store(self.clone()), header.clone(), Header::from_cbor(&self.read(header)?)?, None)?;
+        drop(acquisition);
+        self.cache_touch(header)?;
+        let _ = self.cache_maintain(0)?;
+        Ok(ck)
     }
 
     /// The tree document `tree`.
@@ -65,25 +81,55 @@ impl Store {
 
     /// `variant` of `tree` (its only one when `None`).
     pub fn variant(&self, tree: &ObjectRef, variant: Option<&str>) -> Result<Checkpoint> {
-        let tree = self.tree(tree)?;
-        self.checkpoint(tree.variant(variant)?.1)
+        let acquisition = retention::acquire(self)?;
+        let parsed = self.tree(tree)?;
+        let header = parsed.variant(variant)?.1;
+        let ck = Checkpoint::opened(Objects::Store(self.clone()), header.clone(), Header::from_cbor(&self.read(header)?)?, None)?;
+        if let Some(hold) = &ck._retention {
+            hold.extend(std::iter::once(tree.clone()).chain(parsed.files.values().cloned()))?;
+        }
+        drop(acquisition);
+        self.cache_touch(header)?;
+        let _ = self.cache_maintain(0)?;
+        Ok(ck)
     }
 }
 
 impl Checkpoint {
+    fn opened(objects: Objects, id: ObjectRef, header: Header, header_file: Option<PathBuf>) -> Result<Self> {
+        let store = match &objects {
+            Objects::Store(store) | Objects::Folder { cache: Some(store), .. } => Some(store),
+            Objects::Folder { cache: None, .. } => None,
+        };
+        let mut directories = Vec::new();
+        let hold = if let Some(store) = store {
+            let hold = Retention::new(store, std::iter::once(id.clone()).chain(header.objects().cloned()))?;
+            // These immutable descriptors survive fork without touching an inherited mutex.
+            // The sidecars are outside the returned plain folders.
+            directories.push(retention::directory(store, &store.root().join("views").join(&id.sha256))?);
+            if matches!(&objects, Objects::Store(_)) {
+                directories.push(retention::directory(store, &store.root().join("snapshots").join(&id.sha256))?);
+            } else if let Objects::Folder { dir, .. } = &objects {
+                if let Some(guard) = cached_directory(store, dir)? { directories.push(guard); }
+            }
+            Some(hold)
+        } else { None };
+        Ok(Self { objects, id, header: Arc::new(header), header_file, _retention: hold, _directories: directories.into() })
+    }
+
     /// `variant` of the plain folder `dir` (its only one when `None`): its header file, and its
     /// chunks and assets from `dir/chunks/`, else from `cache`. Lengths are checked; digests are
     /// checked where bytes enter a store ([`Store::admit_folder`]).
     pub fn folder(dir: &Path, variant: Option<&str>, cache: Option<&Store>) -> Result<Checkpoint> {
+        let _acquisition = cache.map(retention::acquire).transpose()?;
+        // Hold the actual source directory before its header is read. A collector cannot
+        // prune a cached snapshot between metadata parsing and owner publication.
+        let source_dir = if dir.is_file() { dir.parent().unwrap_or_else(|| Path::new(".")) } else { dir };
+        let _source_directory = cache.map(|store| cached_directory(store, source_dir)).transpose()?.flatten();
         if dir.is_file() {
             let parent = dir.parent().unwrap_or_else(|| Path::new("."));
             let bytes = fs::read(dir).map_err(fail("read", dir))?;
-            return Ok(Checkpoint {
-                objects: Objects::Folder { dir: parent.to_path_buf(), cache: cache.cloned() },
-                header: Arc::new(Header::from_cbor(&bytes)?),
-                id: ObjectRef::of(&bytes),
-                header_file: Some(dir.to_path_buf()),
-            });
+            return Self::opened(Objects::Folder { dir: parent.to_path_buf(), cache: cache.cloned() }, ObjectRef::of(&bytes), Header::from_cbor(&bytes)?, Some(dir.to_path_buf()));
         }
         let name = match variant {
             Some(v) => variant_path(v),
@@ -109,15 +155,7 @@ impl Checkpoint {
             io::ErrorKind::NotFound => Error::Absent(path.display().to_string()),
             _ => fail("read", &path)(e),
         })?;
-        Ok(Checkpoint {
-            objects: Objects::Folder {
-                dir: dir.to_path_buf(),
-                cache: cache.cloned(),
-            },
-            header: Arc::new(Header::from_cbor(&bytes)?),
-            id: ObjectRef::of(&bytes),
-            header_file: Some(path),
-        })
+        Self::opened(Objects::Folder { dir: dir.to_path_buf(), cache: cache.cloned() }, ObjectRef::of(&bytes), Header::from_cbor(&bytes)?, Some(path))
     }
 
     /// The header's object: the cozytensors' id.
@@ -168,9 +206,11 @@ impl Checkpoint {
             Objects::Folder { dir, .. } => Ok(dir.clone()),
             Objects::Store(store) => {
                 let dir = store.root().join("snapshots").join(&self.id.sha256);
+                store.cache_snapshot(&dir)?;
                 let mut tree = Tree::default();
                 tree.set_variant(variant, self.id.clone());
                 store.snapshot(&store.put_tree(&tree)?, &dir, None)?;
+                store.cache_snapshot(&dir)?;
                 Ok(dir)
             }
         }
@@ -183,13 +223,18 @@ impl Checkpoint {
             Objects::Store(store) | Objects::Folder { cache: Some(store), .. } => store.root().to_path_buf(),
             Objects::Folder { dir, .. } => dir.join("chunks"),
         };
-        let dir = root.join("views").join(&self.id.sha256).join(name);
+        let entry = root.join("views").join(&self.id.sha256);
+        if let Some(store) = self.store() { store.cache_snapshot(&entry)?; }
+        let dir = entry.join(name);
         fs::create_dir_all(&dir).map_err(fail("create", &dir))?;
         let config = dir.join(c.config_file.as_deref().unwrap_or("config.json"));
         let bytes = serde_json::to_vec(&c.config).map_err(|e| invalid(&config, e.to_string()))?;
         write_view(&config, &bytes)?;
         for name in c.assets.keys() {
             write_view(&dir.join(name), &self.asset(&c.name, name)?)?;
+        }
+        if let Some(store) = self.store() {
+            store.cache_snapshot(&entry)?;
         }
         Ok(dir)
     }

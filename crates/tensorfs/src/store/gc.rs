@@ -1,6 +1,6 @@
 //! GC: mark from refs and pins through trees and headers to blobs, chunks and assets, then sweep
-//! what is unmarked and older than the grace. When to collect, and how much, is the caller's
-//! policy (TensorD: TTL, low-disk LRU).
+//! what is unmarked and older than the grace. Raw stores keep caller policy; explicitly enabled
+//! library caches add TTL and pressure policy without treating local refs as disposable.
 //!
 //! A swept object is first renamed into `tmp/gc/`, then deleted only if it is still old: a put
 //! or reuse that raced the sweep made it young, and it goes back. A GC killed in between leaves
@@ -9,7 +9,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+use platform::durable::{self, FileId};
+
+use super::cache::Need;
+use super::retention;
 
 use super::{fail, fault, invalid, is_digest, now_secs, same_family, Result, Store};
 use crate::format::{self, variant_of, Header, ObjectRef, Tree, HEADER_FORMAT, TREE_FORMAT};
@@ -59,6 +65,7 @@ struct Pinned {
     id: String,
     last_use: u64,
     owner: Option<String>,
+    cache: bool,
     reach: BTreeSet<String>,
 }
 
@@ -117,7 +124,8 @@ impl Store {
         }
         let mut bytes = first.to_vec();
         file.read_to_end(&mut bytes).map_err(fail("read", &path))?;
-        let unwalkable = |found: &str| Err(invalid(&path, format!("cannot walk a {found} document")));
+        let unwalkable =
+            |found: &str| Err(invalid(&path, format!("cannot walk a {found} document")));
         if first[0] == b'{' {
             return match Tree::from_json(&bytes) {
                 Ok(tree) => Ok(Some(Document::Tree(tree))),
@@ -162,7 +170,19 @@ impl Store {
         let mut refs = HashSet::new();
         for repo in self.refs()? {
             for tree in repo.roots() {
-                refs.extend(reach(tree)?);
+                if self.cached_ref(&repo)? {
+                    // Keep offline resolution metadata while allowing cached payload to expire.
+                    refs.insert(tree.sha256.clone());
+                    if let Some(Document::Tree(tree)) = self.document(tree)? {
+                        refs.extend(
+                            tree.files
+                                .into_iter()
+                                .filter_map(|(path, file)| variant_of(&path).map(|_| file.sha256)),
+                        );
+                    }
+                } else {
+                    refs.extend(reach(tree)?);
+                }
             }
         }
         let mut pins = Vec::new();
@@ -175,8 +195,10 @@ impl Store {
             for object in &objects {
                 *count.entry(object.clone()).or_default() += 1;
             }
+            let cache = super::cache::owned(&id, &pin);
             pins.push(Pinned {
                 id,
+                cache,
                 last_use: pin.last_use,
                 owner: pin.owner,
                 reach: objects,
@@ -265,6 +287,15 @@ impl Store {
     /// Drops pins unused for `older_than`, least recently used first, until `need` bytes would
     /// be free, then sweeps. Refs are never dropped.
     pub fn collect(&self, need: u64, older_than: Duration) -> Result<Collected> {
+        let Some(_guard) = retention::try_collect(self)? else {
+            return Ok(Collected::default());
+        };
+        self.collect_locked(need, older_than)
+    }
+
+    /// The caller owns the exclusive acquisition fence for the complete mark/sweep.
+    pub(super) fn collect_locked(&self, need: u64, older_than: Duration) -> Result<Collected> {
+        retention::reap(self)?;
         let started = SystemTime::now();
         let cutoff = started
             .checked_sub(self.grace)
@@ -354,9 +385,86 @@ impl Store {
         Ok(dropped)
     }
 
+    /// Choose a covering LRU plan before dropping any fresh cache root. Actual disk space
+    /// is sampled again by the caller; namespace bytes are never admission credit.
+    pub(super) fn cache_pressure(&self, need: Need) -> Result<()> {
+        retention::reap(self)?;
+        let census = self.census()?;
+        let cutoff = SystemTime::now()
+            .checked_sub(self.grace)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut pins: Vec<_> = census.pins.iter().filter(|pin| pin.cache).collect();
+        pins.sort_by_key(|pin| (pin.last_use, &pin.id));
+        let mut snapshots = self.cache_snapshots()?;
+        snapshots.sort_by_key(|snapshot| snapshot.used);
+        let mut count = census.count.clone();
+        let mut paths = Vec::new();
+        let mut selected_pins = Vec::new();
+        let mut selected_snapshots = Vec::new();
+        let open = open_files();
+        let filesystem = FileId::at(&self.root)
+            .map_err(super::platform("identify cache filesystem", &self.root))?
+            .dev;
+        let objects = |count: &HashMap<String, u32>| -> Result<Vec<PathBuf>> {
+            census
+                .objects
+                .iter()
+                .filter(|(sha, object)| {
+                    object.modified < cutoff
+                        && !census.refs.contains(*sha)
+                        && count.get(*sha).copied().unwrap_or(0) == 0
+                })
+                .map(|(sha, _)| self.blob(sha))
+                .collect()
+        };
+        let covered = |paths: &[PathBuf], count: &HashMap<String, u32>| -> Result<bool> {
+            let mut all = paths.to_vec();
+            all.extend(objects(count)?);
+            let (bytes, inodes) = releasable(&all, filesystem, &open)?;
+            Ok(need.covered(bytes, inodes))
+        };
+        // Snapshot copies and root pins share an LRU, and shared chunks accrue only once.
+        let mut folders = snapshots.into_iter().peekable();
+        let mut pins = pins.into_iter().peekable();
+        while !covered(&paths, &count)? {
+            let folder_first = match (folders.peek(), pins.peek()) {
+                (Some(folder), Some(pin)) => folder.used <= pin.last_use,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => return Ok(()), // No covering plan: preserve fresh cache roots.
+            };
+            if folder_first {
+                let folder = folders.next().expect("peeked folder");
+                paths.extend(folder.files()?);
+                selected_snapshots.push(folder);
+            } else {
+                let pin = pins.next().expect("peeked pin");
+                for sha in &pin.reach {
+                    *count.get_mut(sha).expect("a pin counts what it reaches") -= 1;
+                }
+                paths.push(self.root.join("pins").join(format!("{}.json", pin.id)));
+                selected_pins.push(pin);
+            }
+        }
+        for pin in selected_pins {
+            self.unpin_unused(&pin.id, pin.last_use)?;
+        }
+        for folder in selected_snapshots {
+            folder.remove(self)?;
+        }
+        self.collect_locked(0, Duration::MAX)?;
+        Ok(())
+    }
+
     /// Deletes `sha256` unless it became young since it was listed; its size when deleted.
     fn discard(&self, sha256: &str, cutoff: SystemTime) -> Result<Option<u64>> {
         let blob = self.blob(sha256)?;
+        let open = open_files();
+        let Some(held) = exclusive(&blob)? else {
+            return Ok(None);
+        };
+        let id = FileId::of(&held).map_err(super::platform("identify GC object", &blob))?;
+        let external_open = open.contains(&id);
         let trash = self.trash(sha256);
         // Windows refuses to move a file someone holds open; it is collected another time.
         if fs::rename(&blob, &trash).is_err() {
@@ -376,8 +484,15 @@ impl Store {
                 _ => Ok(None),
             };
         }
+        let freed = if !external_open
+            && durable::links(&trash).map_err(super::platform("count GC links", &trash))? == 1
+        {
+            durable::allocated(&metadata)
+        } else {
+            0
+        };
         match fs::remove_file(&trash) {
-            Ok(()) => Ok(Some(metadata.len())),
+            Ok(()) => Ok(Some(freed)),
             Err(error) if gone(&error) => Ok(None),
             Err(error) => Err(fail("remove", &trash)(error)),
         }
@@ -414,7 +529,9 @@ impl Store {
                 continue;
             };
             if metadata.is_file() && metadata.modified().is_ok_and(|m| m < cutoff) {
-                let _ = fs::remove_file(&entry);
+                if let Some(_held) = exclusive(&entry)? {
+                    let _ = fs::remove_file(&entry);
+                }
             }
         }
         Ok(())
@@ -430,4 +547,83 @@ fn list(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     entries
         .map(|entry| entry.map(|e| e.path()).map_err(fail("list", dir)))
         .collect()
+}
+
+/// A process-held descriptor is not free space. Cross-process native object readers also
+/// take shared file locks, which the exclusive probe below observes.
+fn open_files() -> HashSet<FileId> {
+    let Ok(entries) = fs::read_dir("/proc/self/fd") else {
+        return HashSet::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| FileId::at(&entry.path()).ok())
+        .collect()
+}
+
+fn exclusive(path: &Path) -> Result<Option<File>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(fail("open collection candidate", path)(error)),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(fail("lock collection candidate", path)(error))
+        }
+    }
+}
+
+/// Count only inodes for which this plan removes every hard link on this filesystem.
+/// Shared cache aliases are grouped, sparse allocation is respected, and open/locked files
+/// contribute no capacity. A conservative estimate can refuse admission, never over-admit.
+fn releasable(paths: &[PathBuf], filesystem: u64, open: &HashSet<FileId>) -> Result<(u64, u64)> {
+    struct Inode {
+        paths: u64,
+        links: u64,
+        bytes: u64,
+        blocked: bool,
+    }
+    let mut inodes: HashMap<FileId, Inode> = HashMap::new();
+    let mut unique = HashSet::new();
+    for path in paths {
+        if !unique.insert(path) {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(fail("stat collection candidate", path)(error)),
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let id =
+            FileId::at(path).map_err(super::platform("identify collection candidate", path))?;
+        if id.dev != filesystem {
+            continue;
+        }
+        let links = if metadata.is_dir() {
+            1
+        } else {
+            durable::links(path).map_err(super::platform("count collection links", path))?
+        };
+        let blocked = open.contains(&id) || (!metadata.is_dir() && exclusive(path)?.is_none());
+        let inode = inodes.entry(id).or_insert(Inode {
+            paths: 0,
+            links,
+            bytes: durable::allocated(&metadata),
+            blocked: false,
+        });
+        inode.paths += 1;
+        inode.blocked |= blocked;
+    }
+    Ok(inodes
+        .values()
+        .filter(|inode| !inode.blocked && inode.paths >= inode.links)
+        .fold((0, 0), |(bytes, count), inode| {
+            (bytes.saturating_add(inode.bytes), count + 1)
+        }))
 }

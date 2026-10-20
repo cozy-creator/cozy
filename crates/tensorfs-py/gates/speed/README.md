@@ -20,7 +20,9 @@ python crates/tensorfs-py/gates/speed/speedgate.py WORK RESULT.json --sources=so
 
 Use a new owned `WORK` and result filename. The script never downloads weights or erases existing fixtures.
 `--build-only` prepares identical U8 stored-part fixtures through public `read_into`/`Writer`, outside the
-clock; it is explicitly unmeasured. Five rotated repetitions cover all eight lane/cold/warm/full/window
+clock; it is explicitly unmeasured. Safetensors keys are `component/key#role` in every header/filter/reader;
+TensorFS keys remain `key#role` within their component. Bytes, shapes and order are unchanged. Fixture
+identity `/3` refuses reuse of earlier unqualified-key fixtures. Five rotated repetitions cover all eight lane/cold/warm/full/window
 cells. Missing cells, controls or full-warm memory headroom cannot pass. `--cells=window` is a diagnostic
 subset and exits nonzero as an incomplete R4 gate. The shared rental's R4 spend cap is $3; qualification
 also requires ending it and verifying it gone.

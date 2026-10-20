@@ -34,6 +34,7 @@ pub mod err;
 #[cfg(feature = "store")]
 pub mod export;
 pub mod failure;
+pub use failure::{Failure, Kind, Result};
 #[cfg(feature = "store")]
 pub mod fetch;
 #[cfg(feature = "store")]
@@ -97,6 +98,15 @@ pub mod unsynced;
 pub mod vectors;
 #[cfg(feature = "store")]
 pub mod writer;
+
+/// The public session API; networking uses the caller's async runtime.
+#[cfg(feature = "store")]
+mod session;
+#[cfg(feature = "store")]
+pub use session::{
+    bearer, Checkpoint, Client, Component, Config, Endpoint, Fetch, Fetched, HeaderMap, Open,
+    Progress, Ref, Request, Selection, TokenProvider,
+};
 
 
 /// This TensorFS's release version.
