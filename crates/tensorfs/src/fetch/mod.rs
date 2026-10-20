@@ -202,12 +202,15 @@ impl Fetcher {
         want: &Want<'_>,
     ) -> Result<Pulled> {
         let repo = origin.repo_of(name).await?;
-        let chosen = choose(&repo, revision, variant, async |commit: &ObjectRef| {
-            self.objects(origin, std::slice::from_ref(commit), want).await?;
+        // Only a header digest reads trees to resolve; the chosen one is then local.
+        let quiet = Want { priority: want.priority, ..Want::default() };
+        let (tag, cited) = resolve(&repo, revision, async |commit: &ObjectRef| {
+            self.objects(origin, std::slice::from_ref(commit), &quiet).await?;
             Tree::from_json(&self.read(commit).await?).map_err(|e| invalid(commit, e))
         })
         .await?;
-        self.pull_tree(origin, &chosen.tag.commit, Some(&chosen.variant), want).await
+        let variant = pick_variant(revision, cited, variant)?;
+        self.pull_tree(origin, &tag.commit, variant.as_deref(), want).await
     }
 
     /// The tree `tree`: its repo files, and its `variant` (its only one when `None`) with the

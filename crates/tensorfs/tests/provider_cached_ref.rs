@@ -208,6 +208,16 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
         .upload_folder(&"acme/provider@1".parse().unwrap(), &folder, None)
         .await
         .unwrap();
+    // Release 1: the default an unversioned open resolves.
+    Endpoint::new(origin.to_str().unwrap(), None)
+        .unwrap()
+        .update_repo("acme/provider", |old| {
+            let mut repo = old.unwrap();
+            repo.tag_mut("1").unwrap().public = true;
+            Ok(Some(repo))
+        })
+        .await
+        .unwrap();
     let http = Http::new(origin);
     let cache = scratch.0.join("reader");
     let provider = Arc::new(Provider {

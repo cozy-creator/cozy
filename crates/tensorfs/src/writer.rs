@@ -21,7 +21,7 @@
 //!   rename: a folder without the header is unfinished. Objects its base's store holds are
 //!   referenced, not copied (a thin folder).
 //! - A streaming writer sends each object to an endpoint as it seals it ([`Stream`]) and, at
-//!   commit, the header and a tree of it, which becomes an unreleased checkpoint of its repo.
+//!   commit, the header and a tree of it, a commit of its repo that a tag moves to.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
