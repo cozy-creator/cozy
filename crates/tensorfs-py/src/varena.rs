@@ -541,7 +541,7 @@ impl PyPinned {
         }
         let stream = pinned_dlpack_stream(self.pin.gpu.is_some(), stream).map_err(PyBufferError::new_err)?;
         if let (Some(p), Some(s)) = (&self.pin.gpu, stream) {
-            py.detach(|| p.wait_on(s as u64)).or_raise(py)?;
+            py.detach(|| p.wait_on(s)).or_raise(py)?;
         }
         let held = Box::into_raw(Box::new(Held { dims: [self.nbytes as i64, 1], _pin: self.pin.clone() }));
         // SAFETY: `held` is live until the deleter runs.
