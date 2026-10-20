@@ -301,7 +301,7 @@ impl Remote {
             }
         }
         if self.offline { return Err(Failure { kind: Kind::NotFound, detail: format!("{name} is not cached") }); }
-        let resolved = fetch::runtime()?.block_on(self.endpoint.repo(name));
+        let resolved = fetch::runtime()?.block_on(self.endpoint.repo(name)).map_err(Failure::from);
         let (repo, _) = match resolved {
             Ok(Some(repo)) => repo,
             Ok(None) => return Err(Failure { kind: Kind::NotFound, detail: format!("no repo {name}") }),
