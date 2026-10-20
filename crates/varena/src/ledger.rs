@@ -794,6 +794,29 @@ impl Ledger {
         }
         idle
     }
+    /// On real host pressure, release the oldest completed RAM layout with no live view.
+    /// No GPU pages or running-request buffers are considered here.
+    pub fn release_unused_ram(&self) -> bool {
+        let mut custody = self.custody.lock();
+        let victim = custody
+            .ram
+            .iter_mut()
+            .filter_map(|(key, held)| {
+                held.readers
+                    .retain(|reader| !platform::handles::hung_up(reader));
+                (held.readers.is_empty() && !held.layout.filling.load(Acquire))
+                    .then_some((*key, held.used))
+            })
+            .min_by_key(|(_, used)| *used)
+            .map(|(key, _)| key);
+        if let Some(key) = victim {
+            custody.ram.remove(&key);
+            self.table.changed();
+            true
+        } else {
+            false
+        }
+    }
     pub fn drop_kept(&self) {
         self.custody.lock().pages.clear();
         self.table.changed();
@@ -1051,11 +1074,13 @@ impl Drop for Ram {
 struct RamHeld {
     layout: Arc<Ram>,
     readers: Vec<UnixStream>,
+    used: u64,
 }
 #[derive(Default)]
 struct Custody {
     pages: BTreeMap<PageKey, Kept>,
     ram: BTreeMap<[u8; 32], RamHeld>,
+    clock: u64,
 }
 impl Custody {
     fn orphan(&mut self, owner: Owner) {
@@ -1124,11 +1149,14 @@ fn register_ram(
             table.changed();
         })
         .map_err(|e| io("start RAM fill", e))?;
+    custody.clock = custody.clock.saturating_add(1);
+    let used = custody.clock;
     custody.ram.insert(
         layout,
         RamHeld {
             layout: ram,
             readers: Vec::new(),
+            used,
         },
     );
     Ok(true)
@@ -1286,6 +1314,8 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                 }
                 Some(4) => {
                     let mut held = custody.lock();
+                    held.clock = held.clock.saturating_add(1);
+                    let used = held.clock;
                     let ready = held.ram.get_mut(&key.fingerprint).and_then(|ram| {
                         let index = usize::try_from(key.page).ok()?;
                         let region = ram.layout.regions.get(index)?;
@@ -1297,6 +1327,7 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                             .then_some((ram, offset, len))
                     });
                     if let Some((ram, offset, len)) = ready {
+                        ram.used = used;
                         let (ours, theirs) =
                             UnixStream::pair().map_err(|e| io("create RAM reader lease", e))?;
                         let file = shm::reopen(ram.layout.file.as_fd(), false)
