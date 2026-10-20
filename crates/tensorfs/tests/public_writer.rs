@@ -80,7 +80,10 @@ fn client(cache: &Path, endpoint: &Path) -> Client {
     Client::new(config).unwrap()
 }
 fn check_export(folder: &Path) {
-    assert_eq!(fs::read(folder.join("README.bin")).unwrap(), README);
+    check_export_readme(folder, "README.bin");
+}
+fn check_export_readme(folder: &Path, readme: &str) {
+    assert_eq!(fs::read(folder.join(readme)).unwrap(), README);
     assert_eq!(fs::read(folder.join("tokenizer.json")).unwrap(), ASSET);
     let config: serde_json::Value =
         serde_json::from_slice(&fs::read(folder.join("config.json")).unwrap()).unwrap();
@@ -878,7 +881,7 @@ fn conversion_source(root: &Path) -> PathBuf {
     )
     .unwrap();
     fs::write(folder.join("tokenizer.json"), ASSET).unwrap();
-    fs::write(folder.join("README.bin"), README).unwrap();
+    fs::write(folder.join("README.md"), README).unwrap();
     folder
 }
 fn actual_headers(root: &Path) -> Vec<PathBuf> {
@@ -936,7 +939,7 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
     let child = checkpoint.component("model").unwrap().clone();
     let portable = scratch.0.join("converted-portable");
     export(&checkpoint, &portable, Format::Cozytensors, None).unwrap();
-    assert_eq!(fs::read(portable.join("README.bin")).unwrap(), README);
+    assert_eq!(fs::read(portable.join("README.md")).unwrap(), README);
     let tree = client
         .upload_folder(&"local/converted".parse().unwrap(), &portable, None)
         .await
@@ -956,7 +959,7 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
     drop(client);
     let result = scratch.0.join("converted-hf");
     export(&reopened, &result, Format::Safetensors, None).unwrap();
-    check_export(&result);
+    check_export_readme(&result, "README.md");
     drop(reopened);
     assert_eq!(child.read("w").unwrap(), WEIGHT);
     assert_eq!(child.asset("tokenizer.json").unwrap(), ASSET);
@@ -1211,7 +1214,9 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
     let managed = reader.open(&tree.id(), &Open::default()).await.unwrap();
     managed.fetch(&Fetch::default()).await.unwrap();
     let readme = cache.join(ObjectRef::of(README).key());
-    fs::write(&readme, vec![b'!'; README.len()]).unwrap();
+    // CAS files are intentionally read-only and may be hard-linked. Replace only this
+    // fixture inode, preserving the source origin while injecting same-length corruption.
+    platform::durable::replace(&readme, &vec![b'!'; README.len()], 0o444).unwrap();
     let bad_repo = scratch.0.join("bad-repo-export");
     assert_eq!(
         export(&managed, &bad_repo, Format::Cozytensors, None)
@@ -1221,7 +1226,7 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
     );
     assert!(!bad_repo.join("model.cozytensors").exists());
     assert!(!bad_repo.join("README.bin").exists());
-    fs::write(readme, README).unwrap();
+    platform::durable::replace(&readme, README, 0o444).unwrap();
     export(&managed, &bad_repo, Format::Cozytensors, None).unwrap();
     assert_eq!(fs::read(bad_repo.join("README.bin")).unwrap(), README);
     assert_eq!(
@@ -1378,6 +1383,12 @@ async fn literal_writer_inside_classified_snapshot_preserves_the_callers_header_
             serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
         value["last_use"] = 0.into();
         fs::write(record, serde_json::to_vec(&value).unwrap()).unwrap();
+        // Effective recency is max(record, directory mtime); age both real inputs to TTL.
+        let folder = cache.join("snapshots").join(digest);
+        platform::durable::open_dir(&folder)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
     }
     fs::write(cache.join("tmp/cache/sweep.json"), br#"{"last_use":0}"#).unwrap();
     operator.cache_maintain(0).unwrap();
