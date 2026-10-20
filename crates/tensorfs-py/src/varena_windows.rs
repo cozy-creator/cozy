@@ -35,11 +35,18 @@ unavailable_type!(
     WeightSet = "WeightSet",
     Pinned = "Pinned",
     Part = "Part",
-    Copy = "Copy"
+    Copy = "Copy",
+    Ceiling = "Ceiling"
 );
 #[pyfunction]
 fn copies() -> Vec<Py<PyAny>> {
     Vec::new()
+}
+#[pyfunction]
+#[pyo3(signature = (device=None, path=None))]
+fn ceiling(py: Python<'_>, device: Option<i32>, path: Option<std::path::PathBuf>) -> PyResult<()> {
+    let _ = (device, path);
+    Err(unavailable(py))
 }
 pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
@@ -49,7 +56,9 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Pinned>()?;
     m.add_class::<Part>()?;
     m.add_class::<Copy>()?;
+    m.add_class::<Ceiling>()?;
     m.add_function(wrap_pyfunction!(copies, &m)?)?;
+    m.add_function(wrap_pyfunction!(ceiling, &m)?)?;
     m.add("VarenaError", py.get_type::<VarenaError>())?;
     m.add("Unsupported", py.get_type::<Unsupported>())?;
     parent.add_submodule(&m)?;

@@ -484,27 +484,26 @@ impl Log {
 }
 
 /// Accepts a run, or answers the one a re-sent spec already names (false). The run reads its
-/// Hub's public content anonymously; its capability, if any, is traded at its first private
-/// operation.
+/// Hub's public content anonymously, and private content under its request's bearer.
 fn accept(runs: &Arc<crate::runs::Runs>, actor: &str, id: &str, spec: crate::runs::Spec, hub: Option<v1::HubAccess>) -> Result<bool, Error> {
     if runs.existing(actor, id, &spec.digest)?.is_some() {
         return Ok(false);
     }
-    runs.submit(actor, id, reach(runs, spec, hub)?)?;
+    runs.submit(actor, id, reach(spec, hub)?)?;
     Ok(true)
 }
 
-/// `spec` reading `hub` under its capability, if any.
-fn reach(runs: &crate::runs::Runs, mut spec: crate::runs::Spec, hub: Option<v1::HubAccess>) -> Result<crate::runs::Spec, Error> {
+/// `spec` reading `hub`, under the ordinary bearer its TensorFS options carry for that origin
+/// (a token goes only to the origin it was given for).
+fn reach(mut spec: crate::runs::Spec, hub: Option<v1::HubAccess>) -> Result<crate::runs::Spec, Error> {
     if let Some(hub) = hub {
-        let invalid = |e: crate::hub::Refusal| refused("hub_access_invalid", &e.0);
-        let capability = match (hub.capability.is_empty(), &runs.leaf) {
-            (true, _) => None,
-            (false, Some(leaf)) => Some(crate::hub::Capability::new(&hub.capability, &hub.token_endpoint, leaf.clone()).map_err(invalid)?),
-            (false, None) => return Err(refused("hub_access_invalid", "this machine holds no key to trade a capability with")),
-        };
+        let origin = crate::hub::origin_key(&hub.origin);
+        let token = (spec.tensorfs.as_ref())
+            .filter(|options| origin.is_some() && crate::hub::origin_key(&options.endpoint) == origin)
+            .map(|options| options.token.clone());
         let ca = Some(hub.ca_der).filter(|der| !der.is_empty());
-        spec.hub = Some(crate::hub::Source::new(&hub.origin, ca, hub.object_hosts, capability).map_err(invalid)?);
+        let source = crate::hub::Source::new(&hub.origin, ca, token).map_err(|e| refused("hub_access_invalid", &e.0))?;
+        spec.hub = Some(source);
     }
     Ok(spec)
 }
@@ -516,11 +515,8 @@ pub(crate) fn resume(runs: &Arc<crate::runs::Runs>) -> std::io::Result<()> {
         let spec = serde_json::from_slice(&sent)
             .map_err(|e| refused("preparation_interrupted", format!("its kept spec is unreadable: {e}")))
             .and_then(spec_of)
-            .and_then(|(spec, hub)| reach(runs, spec, hub));
+            .and_then(|(spec, hub)| reach(spec, hub));
         let failure = match spec {
-            Ok(spec) if spec.hub.as_ref().and_then(|hub| hub.capability.as_ref()).is_some_and(|c| c.expired()) => {
-                crate::journal::Failure::machine("capability_expired", "the machine restarted while this run prepared, and its Hub capability has expired since; run it again")
-            }
             Ok(spec) => {
                 runs.prepare_later(&actor, &run, spec)?;
                 continue;
@@ -815,7 +811,7 @@ mod tests {
             publisher: None,
             local: None,
             own_hub: None,
-            leaf: None,
+           
             contexts: Default::default(),
         });
         let mut resent = original;
@@ -865,26 +861,17 @@ mod tests {
         assert!(crate::api::machine_status::CAPABILITIES.contains(&"run-gpus/1"));
     }
 
-    /// A capability a machine cannot trade (it holds no key) refuses a new run, never the
-    /// accepted run a re-sent spec names.
+    /// A request's bearer reads its Hub only when its TensorFS options name that origin.
     #[test]
-    fn unusable_access_refuses_only_a_new_run() {
-        let root = std::env::temp_dir().join(format!("cm-accept-{}", uuid::Uuid::new_v4()));
-        let service = crate::service::Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
-        let objects = Arc::new(crate::objects::Objects::new(&root.join("writes"), service.engine.clone()).unwrap());
-        let runs = Arc::new(crate::runs::Runs {
-            service: service.clone(), objects, publisher: None, local: None, own_hub: None, leaf: None, contexts: Default::default(),
-        });
-        let held = authored();
-        let (spec, access) = spec_of(held.clone()).unwrap();
-        let invocation = crate::journal::Invocation { package: "org/package".into(), input: spec.input.clone(), ..Default::default() };
-        let accepted = service.engine.accept_run("alice", "run-1", &spec.digest, invocation).unwrap().0;
-        let (resent, again) = spec_of(held).unwrap();
-        accept(&runs, "alice", "run-1", resent, again).unwrap();
-        assert_eq!(service.engine.get_public("alice", "run-1").unwrap().id, accepted.id);
-        let refusal = accept(&runs, "alice", "run-2", spec, access).unwrap_err();
-        assert_eq!(refusal.code, "hub_access_invalid");
-        let _ = std::fs::remove_dir_all(root);
+    fn a_bearer_goes_only_to_the_origin_it_was_given_for() {
+        let read = |endpoint: &str| {
+            let mut sent = authored();
+            sent.tensorfs = Some(v1::TensorFSOptions { endpoint: endpoint.into(), token: "owner".into(), ..Default::default() });
+            let (spec, hub) = spec_of(sent).unwrap();
+            reach(spec, hub).unwrap().hub.unwrap().token
+        };
+        assert_eq!(read("https://HUB.example.test:443"), Some("owner".into()));
+        assert_eq!(read("https://other.example.test"), None);
     }
 
     /// A digest of 64 non-hex bytes is refused, not sliced mid-character.

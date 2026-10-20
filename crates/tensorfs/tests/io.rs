@@ -176,6 +176,34 @@ fn evict(ck: &Checkpoint) {
     let _ = ck;
 }
 
+/// Pages of `ck`'s chunk files not in the page cache (a loaded host evicts some).
+#[cfg(target_os = "linux")]
+fn evicted_pages(ck: &Checkpoint) -> u64 {
+    let mut evicted = 0;
+    for i in 0..ck.header().chunks.len() {
+        let f = ck.chunk(i).unwrap();
+        let len = f.metadata().unwrap().len() as usize;
+        if len == 0 {
+            continue;
+        }
+        // SAFETY: a read-only shared mapping of our own file, unmapped below.
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0) };
+        assert_ne!(p, libc::MAP_FAILED);
+        let mut v = vec![0u8; len.div_ceil(4096)];
+        // SAFETY: the vector holds one byte per page of the mapping.
+        assert_eq!(unsafe { libc::mincore(p, len, v.as_mut_ptr()) }, 0);
+        // SAFETY: our mapping.
+        unsafe { libc::munmap(p, len) };
+        evicted += v.iter().filter(|b| **b & 1 == 0).count() as u64;
+    }
+    evicted
+}
+
+#[cfg(not(target_os = "linux"))]
+fn evicted_pages(_: &Checkpoint) -> u64 {
+    0
+}
+
 fn direct_ok(ck: &Checkpoint) -> bool {
     platform::durable::open_direct(&ck.chunk(0).unwrap()).unwrap().is_some()
 }
@@ -225,11 +253,14 @@ fn sweep(ck: &Checkpoint, what: &str) {
             let cold = read_everything(ck, skew, &opts);
             // The engine reads past the page cache, so a buffered read warms it.
             read_everything(ck, skew, &buffered);
+            let evicted = evicted_pages(ck);
             let warm = read_everything(ck, skew, &opts);
             println!("{what} skew {skew} {opts:?}\n  cold {cold:?}\n  warm {warm:?}");
             if opts.direct && direct_ok(ck) {
                 assert!(cold.direct > 0, "a cold read goes O_DIRECT: {cold:?}");
-                assert_eq!(warm.direct, 0, "a warm read stays in the page cache: {warm:?}");
+                // Only a piece with a page the host evicted since the warm-up goes direct.
+                let allowed = evicted * opts.request.max(4096) as u64;
+                assert!(warm.direct <= allowed, "a warm read stays in the page cache ({evicted} pages evicted): {warm:?}");
             } else {
                 assert_eq!(cold.direct, 0);
             }
@@ -404,14 +435,17 @@ fn many_destinations_at_once_from_a_writers_folder() {
     assert_eq!(io::ceiling(Some(0), &scratch.0).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
 }
 
-/// Host reads, by tensor or by stored location, go through the engine and log a disk run.
+/// Host reads, by tensor or by stored location, go through the engine and log a disk run. A run
+/// the page cache served is unmeasured; a cold one that beats the kept ceiling raises it.
 #[test]
 fn host_reads_run_through_the_engine_and_log_a_disk_run() {
-    // The copy log is process-wide and bounded: run alone, apart from the other reads here.
+    // The copy log is process-wide and bounded, and the ceiling table is this child's own.
     if std::env::var_os("TENSORFS_IO_LOG_CHILD").is_none() {
+        let home = Scratch::new("logged-home");
         let status = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "host_reads_run_through_the_engine_and_log_a_disk_run", "--nocapture"])
             .env("TENSORFS_IO_LOG_CHILD", "1")
+            .env("TENSORFS_HOME", &home.0)
             .status()
             .unwrap();
         assert!(status.success());
@@ -425,6 +459,23 @@ fn host_reads_run_through_the_engine_and_log_a_disk_run() {
     let runs = io::metrics::take();
     let run = runs.iter().find(|c| c.kind == "disk" && c.bytes == big.length);
     assert!(run.is_some_and(|c| c.gpu == -1 && c.ns > 0), "{runs:?}");
+    assert!(runs.iter().all(|c| c.cached == 0 || c.ceiling == 0.0), "{runs:?}");
+    if !cfg!(target_os = "linux") || !direct_ok(&ck) {
+        return;
+    }
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    let volume = platform::durable::device(&scratch.0).unwrap();
+    let table = PathBuf::from(std::env::var_os("TENSORFS_HOME").unwrap()).join("tmp/ceilings/table");
+    fs::create_dir_all(table.parent().unwrap()).unwrap();
+    fs::write(&table, format!("{} disk {volume}\t0.000001\t1\n", boot.trim())).unwrap();
+    evict(&ck);
+    assert_eq!(ck.read("unet", "big").unwrap(), noise(9, big.length as usize));
+    let runs = io::metrics::take();
+    // A loaded host may keep a page through the eviction; that run is unmeasured.
+    let Some(cold) = runs.iter().find(|c| c.kind == "disk" && c.cached == 0) else { return };
+    let rate = cold.bytes as f64 / cold.ns as f64;
+    assert!((cold.ceiling - rate).abs() < 1e-9, "a run faster than its ceiling raises it: {cold:?}");
+    assert_eq!(fs::read_to_string(&table).unwrap().lines().count(), 2);
 }
 
 /// Host read GB/s on this machine against `cat` and `dd iflag=direct` over the same chunk files

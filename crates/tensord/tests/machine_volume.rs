@@ -3,8 +3,6 @@
 //! the volume, as its run's record says; a machine without the variable downloads from the Hub.
 #![cfg(target_os = "linux")]
 mod common;
-#[path = "common/hub_oauth.rs"]
-mod hub_oauth;
 #[path = "common/names_hub.rs"]
 mod names_hub;
 
@@ -104,7 +102,7 @@ fn on_volume(cache: &Path) -> usize {
 async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
     let source = std::env::temp_dir().join(format!("tensord-volume-source-{}", uuid::Uuid::new_v4()));
     let store = tensorfs::store::Store::open(&source).unwrap();
-    let manifest = hub_oauth::checkpoint(&store, &vec![5; 1 << 20]);
+    let manifest = names_hub::checkpoint(&store, &vec![5; 1 << 20]);
     let objects = store.closure(&manifest).unwrap().len();
     let model = names_hub::Model {
         repository: "acme/model".into(),
@@ -136,7 +134,7 @@ async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
     let second = download(&client, "volume-b", &hub).await;
     assert_eq!((&second["bytes"]["hub"], &second["bytes"]["volume"]), (&0.into(), &total.into()), "{second}");
     let asked = std::mem::take(&mut *heard.lock().unwrap());
-    assert!(asked.iter().all(|heard| heard.starts_with("POST /v1/tensorfs/closure")), "{asked:?}");
+    assert_eq!(asked, ["GET /refs/acme/model.json"], "only the name is the Hub's");
     drop(b);
 
     // No variable, no volume: the Hub, as before.

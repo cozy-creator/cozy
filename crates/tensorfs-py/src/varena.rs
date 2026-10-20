@@ -114,6 +114,35 @@ struct Part {
     nbytes: u64,
 }
 
+#[pyclass(name = "Ceiling", module = "tensorfs.varena", frozen, get_all)]
+struct PyCeiling {
+    disk_gbps: f64,
+    disk_direct: bool,
+    h2d_gbps: Option<f64>,
+    streams: Option<u32>,
+}
+impl From<tensorfs::io::Ceiling> for PyCeiling {
+    fn from(value: tensorfs::io::Ceiling) -> Self {
+        Self { disk_gbps: value.disk_gbps, disk_direct: value.disk_direct,
+            h2d_gbps: value.h2d_gbps, streams: value.streams }
+    }
+}
+
+/// What reads can reach, measured unless kept this boot: `path`'s volume (default: the TensorFS
+/// cache) and, with `device`, pinned H2D to that GPU. Reads never measure; they log against this.
+#[pyfunction]
+#[pyo3(signature = (device=None, path=None))]
+fn ceiling(py: Python<'_>, device: Option<i32>, path: Option<std::path::PathBuf>) -> PyResult<PyCeiling> {
+    let path = match path {
+        Some(path) => path,
+        None => tensorfs::home::resolve(None).map_err(|e| raise(py, e.into()))?,
+    };
+    py.detach(|| tensorfs::io::ceiling(device, &path)).map(Into::into).map_err(|e| match e.kind() {
+        std::io::ErrorKind::Unsupported => raise(py, Error::Unsupported(e.to_string())),
+        _ => raise(py, Error::Io(e.to_string())),
+    })
+}
+
 #[pyclass(name = "Part", module = "tensorfs.varena", frozen, get_all)]
 struct PyPart {
     component: String,
@@ -811,7 +840,9 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPinned>()?;
     m.add_class::<PyPart>()?;
     m.add_class::<PyCopy>()?;
+    m.add_class::<PyCeiling>()?;
     m.add_function(wrap_pyfunction!(copies, &m)?)?;
+    m.add_function(wrap_pyfunction!(ceiling, &m)?)?;
     m.add("VarenaError", py.get_type::<VarenaError>())?;
     m.add("Unsupported", py.get_type::<Unsupported>())?;
     parent.add_submodule(&m)?;

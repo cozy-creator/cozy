@@ -1,5 +1,5 @@
 //! `tfs`: the Python verbs on the command line (`convert`, `download`, `upload`, `export`,
-//! `inspect`, `verify`), plus `conform endpoint`, `dev ckpt` and `version`.
+//! `inspect`, `verify`), plus `ceiling`, `conform endpoint`, `dev ckpt` and `version`.
 
 mod dev;
 
@@ -22,6 +22,7 @@ const USAGE: &str = "usage: tfs [--store <dir>] [--endpoint <url>] [--json] <ver
   export <ref> <dir> [--safetensors [--dequantize bf16|f16|f32] | --gguf]
   inspect <ref>
   verify <ref>
+  ceiling [<path>] [--gpu <n>]              measure what reads from <path>'s volume (and to GPU n) reach
   conform endpoint <url> [--write] [--token-env <VAR>]
   dev ckpt [--name local/<name>[@revision]] [--blocks <n>] [--scale <n>] [--plain] [--no-configs]
   version
@@ -31,7 +32,7 @@ const USAGE: &str = "usage: tfs [--store <dir>] [--endpoint <url>] [--json] <ver
 const SWITCHES: &[&str] = &["json", "safetensors", "gguf", "plain", "no-configs", "write"];
 const VALUED: &[&str] = &[
     "store", "endpoint", "name", "dequantize", "converter", "variant", "blocks", "scale",
-    "token-env", "dir",
+    "token-env", "dir", "gpu",
 ];
 
 struct Args {
@@ -230,6 +231,20 @@ async fn run(args: &Args) -> Done {
                     format!("{} corrupt and {} missing objects: {}", report.corrupt.len(), report.missing.len(), Json::Object(doc)),
                 ),
             }
+        }
+        ["ceiling", path @ ..] if path.len() <= 1 => {
+            let path = path.first().map_or(root, PathBuf::from);
+            let gpu = args.get("gpu").map(|_| args.number("gpu", 0)).transpose()?.map(|n| n as i32);
+            let c = tensorfs::io::ceiling(gpu, &path).map_err(|e| Failure {
+                kind: if e.kind() == std::io::ErrorKind::Unsupported { Kind::Unsupported } else { Kind::Io },
+                detail: format!("{}: {e}", path.display()),
+            })?;
+            let doc = json!({"disk_gbps": c.disk_gbps, "disk_direct": c.disk_direct, "h2d_gbps": c.h2d_gbps, "streams": c.streams});
+            let mut human = format!("disk {:.2} GB/s{}", c.disk_gbps, if c.disk_direct { "" } else { " (through the page cache)" });
+            if let Some(h2d) = c.h2d_gbps {
+                human += &format!("\nh2d {h2d:.2} GB/s on {} streams", c.streams.unwrap_or(1));
+            }
+            Ok(Some((doc, human)))
         }
         ["dev", "ckpt"] => {
             let store = Store::open(&root)?;

@@ -67,7 +67,7 @@ pub struct MemoryCopy {
     pub seconds: f64,
     pub gbps: f64,
     pub ceiling: f64,
-    pub pct: f64,
+    pub pct: Option<f64>,
     pub link: String,
     pub busy_s: f64,
     pub pin_s: f64,

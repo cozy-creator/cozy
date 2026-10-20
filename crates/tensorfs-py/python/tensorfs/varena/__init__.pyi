@@ -1,9 +1,20 @@
 """Native marshalling for the slim page manager."""
 
+import os
 from collections.abc import Callable
 from typing import Any
 
 import tensorfs
+
+class Ceiling:
+    disk_gbps: float
+    disk_direct: bool
+    h2d_gbps: float | None
+    streams: int | None
+
+def ceiling(device: int | None = ..., path: str | os.PathLike[str] | None = ...) -> Ceiling:
+    """Measure through TensorFS explicitly; normal reads never run a probe."""
+    ...
 
 class VarenaError(Exception):
     code: str

@@ -1,6 +1,7 @@
 """Native page placement. TensorFS owns I/O; Runtime supplies model and request plans."""
 
 from .._ext.varena import (
+    Ceiling,
     Copy,
     Part,
     Pinned,
@@ -8,10 +9,12 @@ from .._ext.varena import (
     Unsupported,
     VarenaError,
     WeightSet,
+    ceiling,
     copies,
 )
 
 __all__ = [
+    "Ceiling",
     "Copy",
     "Part",
     "Pinned",
@@ -19,5 +22,6 @@ __all__ = [
     "Unsupported",
     "VarenaError",
     "WeightSet",
+    "ceiling",
     "copies",
 ]

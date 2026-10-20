@@ -177,7 +177,8 @@ class Peak:
 class Copy:
     """A run of weight copies since the last request (`varena.copies()`): a restore, refill or
     fill (`h2d`), or a host layout read from disk (`disk`), against the measured `ceiling` GB/s.
-    `busy_s` is the GPU's copy time, `pin_s` the host's page locking."""
+    `pct` is None while that ceiling is unmeasured. `busy_s` is the GPU's copy time, `pin_s` the
+    host's page locking."""
 
     kind: str
     gpu: int
@@ -185,7 +186,7 @@ class Copy:
     seconds: float
     gbps: float
     ceiling: float
-    pct: float
+    pct: float | None
     link: str
     busy_s: float
     pin_s: float
@@ -195,7 +196,7 @@ class Copy:
 
 def _copy(c: CopyRun) -> Copy:
     gbps = c.bytes / c.ns if c.ns else 0.0
-    pct = round(100 * gbps / c.ceiling, 1) if c.ceiling else 0.0
+    pct = round(100 * gbps / c.ceiling, 1) if c.ceiling else None
     seconds, busy, pin = c.ns / 1e9, c.busy_ns / 1e9, c.pin_ns / 1e9
     ceiling = round(c.ceiling, 2)
     return Copy(
