@@ -276,7 +276,7 @@ pub(crate) fn root_and_store(ctx: &Context) -> Result<(PathBuf, Option<PathBuf>)
     let store = config
         .store
         .is_none()
-        .then(|| root.join("var/lib/tensorfs"));
+        .then(|| root.join("var").join("lib").join("tensorfs"));
     Ok((root, store))
 }
 
