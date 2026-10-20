@@ -4,8 +4,9 @@ An op out of device memory runs again, each try strictly smaller (no timers; fre
 progress): rungs 1-2, the innermost cut around it finer, its own bands, rung 4, else `exhausted`.
 Cuts are exact and keep results on the device; the size that fit is remembered per shape key
 (the memo) and applied up front after. A block whose first run wrote no tensor that existed before
-it and changed none of its attributes runs bare; out of memory it gets its generators and declared
-state back and runs again under the dispatch layer, which catches other blocks' ops at the op.
+it, joined no collective and changed none of its attributes runs bare; out of memory it gets its
+generators and declared state back and runs again under the dispatch layer, which catches other
+blocks' ops at the op.
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import Protocol
 
 import torch
@@ -45,6 +45,8 @@ _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40
 #: diffusers' token-wise feed-forwards and the activation projections inside them
 _FFN = frozenset({"FeedForward", "GELU", "GEGLU", "SwiGLU", "ApproximateGELU", "LinearActivation"})
 _PLAIN = (int, float, bool, str, bytes, type(None))
+#: ops another GPU waits on: a block that runs one never runs again on this GPU alone
+_COLLECTIVES = frozenset({"c10d", "_c10d_functional", "_c10d_functional_autograd"})
 _MISSING = object()
 
 
@@ -530,8 +532,8 @@ def _trait(func: OpOverload) -> Trait:
 
 @dataclass(eq=False, slots=True)
 class _Journal:
-    """A block's first run: the storages its ops made, whether one wrote into any other, and
-    the generators its seeded ops drew from."""
+    """A block's first run: the storages its ops made, whether one wrote into any other or
+    joined a collective, and the generators its seeded ops drew from."""
 
     made: set[int] = field(default_factory=set)
     wrote: bool = False
@@ -539,6 +541,7 @@ class _Journal:
 
     def before(self, func: OpOverload, args: Args, kwargs: Kwargs) -> None:
         writes, seeded, _, _ = _trait(func)
+        self.wrote |= func.namespace in _COLLECTIVES
         if writes and not self.wrote:
             written = [args[i] if i < len(args) else kwargs.get(n) for i, n in writes]
             self.wrote = any(p and p not in self.made for p in map(_storage, _tensors(written)))
@@ -754,8 +757,9 @@ def _arguments(func: OpOverload, args: Args, kwargs: Kwargs) -> dict[str, object
     return named
 
 
-#: page-locked host blocks rung 5 put results in, kept until the request ends (`hosted_end`)
-_HOSTED: list[Tensor] = []
+#: page-locked host blocks whose tensors are gone, until the device passes their readers
+_DEAD: list[Tensor] = []
+_made = 0
 _COPIES = (aten.contiguous, aten.clone, aten._to_copy)
 
 
@@ -811,14 +815,38 @@ def _spill(device: torch.device, need: int, operands: object) -> int:
     return moved
 
 
+class _Block:
+    """A rung-5 block's CUDA face: its tensor keeps it. When that tensor goes, the block waits in
+    `_DEAD` until the device has passed every kernel that may still read it (`_reclaim`)."""
+
+    def __init__(self, nbytes: int) -> None:
+        global _made
+        self.host = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        _made += nbytes
+        data = (self.host.data_ptr(), False)
+        self.__cuda_array_interface__ = {"shape": (nbytes,), "typestr": "|u1", "data": data, "version": 3}
+
+    def __del__(self) -> None:
+        _DEAD.append(self.host)
+
+
+def _reclaim(device: torch.device) -> int:
+    """Dead blocks go back to the host allocator once the device passed their readers; the bytes."""
+    n = len(_DEAD)
+    if not n:
+        return 0
+    torch.cuda.synchronize(device)
+    nbytes = sum(h.numel() for h in _DEAD[:n])
+    del _DEAD[:n]
+    return nbytes
+
+
 def _host(nbytes: int, device: torch.device) -> Tensor:
     """A CUDA uint8 tensor of `nbytes` whose bytes are page-locked host memory, which the GPU
-    addresses over the bus; held until the request ends, so no kernel still reading it sees
-    the host allocator hand it out again."""
-    host = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-    _HOSTED.append(host)
-    face = {"shape": (nbytes,), "typestr": "|u1", "data": (host.data_ptr(), False), "version": 3}
-    return torch.as_tensor(SimpleNamespace(__cuda_array_interface__=face, host=host), device=device)
+    addresses over the bus. They go back once the tensor goes (`_Block`), not at the request's
+    end: a pass hosting a result per block would otherwise hold every one of them."""
+    _reclaim(device)
+    return torch.as_tensor(_Block(nbytes), device=device)
 
 
 def _host_like(like: Tensor, device: torch.device) -> Tensor:
@@ -828,11 +856,13 @@ def _host_like(like: Tensor, device: torch.device) -> Tensor:
     return _host(nbytes, device).view(like.dtype).as_strided(like.shape, like.stride())
 
 
-def hosted_end() -> int:
-    """The request's rung-5 blocks go back (their results' tensors keep theirs); the bytes."""
-    nbytes = sum(h.numel() for h in _HOSTED)
-    _HOSTED.clear()
-    return nbytes
+def hosted_end(device: torch.device) -> int:
+    """At a request's end, dead blocks go back (live results keep theirs); the bytes rung 5
+    hosted since the last end, so the caller empties the host allocator's cache when any."""
+    global _made
+    _reclaim(device)
+    made, _made = _made, 0
+    return made
 
 
 def _meta(func: OpOverload, args: Args, kwargs: Kwargs) -> list[Tensor]:
