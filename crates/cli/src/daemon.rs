@@ -1,6 +1,6 @@
 //! `cozy up|down|status|logs`: Calcifer's lifecycle. Stopping Calcifer never stops work: machines
 //! run what they accepted, and the next Calcifer resumes what it owed.
-use std::{path::Path, process::ExitCode};
+use std::process::ExitCode;
 
 use clap::ValueEnum;
 use protocol::{
@@ -59,14 +59,14 @@ pub async fn down(ctx: &Context, _args: Down) -> Result<ExitCode, Error> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Stops a running Calcifer and starts `program`'s in its place: `cozy update` after it replaced
-/// the binary. `false`: none was running, and none is started.
-pub(crate) async fn restart(ctx: &Context, program: &Path) -> Result<bool, Error> {
+/// Stops a running Calcifer and starts the installed `cozy`'s in its place, after something
+/// replaced that binary. `false`: none was running, and none is started.
+pub(crate) async fn restart(ctx: &Context) -> Result<bool, Error> {
     let Some(client) = Client::running(ctx).await? else {
         return Ok(false);
     };
     client.stop().await?;
-    Client::new(ctx, program.to_owned())?.ready().await?;
+    client.ready().await?;
     Ok(true)
 }
 

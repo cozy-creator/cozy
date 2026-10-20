@@ -302,20 +302,11 @@ pub async fn update(
         out: None,
         warnings: vec![],
     };
-    // `local` runs from this computer's cozy: named now, before the machine renames over it.
-    let here = match dev && m.kind == MachineKind::Local {
-        true => Some(
-            std::env::current_exe()
-                .and_then(|exe| exe.canonicalize())
-                .map_err(|e| Error::new(Kind::Internal, "binary_unknown", e.to_string()))?,
-        ),
-        false => None,
-    };
     let submitted = crate::run::submit(ctx, submit, None).await?;
     let run = crate::run::follow(ctx, submitted.run, false).await?;
-    if let Some(here) = here.filter(|_| run.status == calcifer::Status::Completed) {
-        // That cozy is the dev binary now: Calcifer runs it too.
-        crate::daemon::restart(ctx, &here).await?;
+    if dev && m.kind == MachineKind::Local && run.status == calcifer::Status::Completed {
+        // `local` runs the installed cozy, the dev binary now: Calcifer runs it too.
+        crate::daemon::restart(ctx).await?;
         let version = run.result.as_ref().and_then(|r| r["to"]["cozy"].as_str());
         output::warn(&format!(
             "this computer's cozy is now {}, a dev build; `cozy update` returns it to a release",

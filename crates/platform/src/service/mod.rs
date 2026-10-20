@@ -59,20 +59,24 @@ impl Services {
         sys::install(&self.dir, spec)
     }
 
+    /// Whether the definition kept here is `spec`'s: one read, no flush, no manager reload.
+    pub fn current(&self, spec: &ServiceSpec) -> bool {
+        sys::current(&self.dir, spec)
+    }
+
     /// Installs it when the definition kept here is not `spec`'s (a first start, a new binary):
-    /// true when it wrote one. A current definition costs one read: no flush, no manager reload.
+    /// true when it wrote one.
     pub fn ensure(&self, spec: &ServiceSpec) -> Result<bool> {
-        if sys::current(&self.dir, spec) {
+        if self.current(spec) {
             return Ok(false);
         }
         sys::install(&self.dir, spec)?;
         Ok(true)
     }
 
-    /// Starts it now, installing it first if its definition changed. One already running is left
-    /// as it is.
+    /// Starts it now from the definition kept here, which only `install` and `ensure` write. One
+    /// already running is left as it is.
     pub fn start(&self, spec: &ServiceSpec) -> Result<()> {
-        self.ensure(spec)?;
         sys::start(&self.dir, spec)
     }
 

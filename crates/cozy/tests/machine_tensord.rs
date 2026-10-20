@@ -16,11 +16,7 @@ use serde_json::Value;
 /// `cozy` installed in this home, as the installer puts it (the machine's launch path), and its
 /// machine enabled.
 fn enabled(home: &Home) -> PathBuf {
-    let bin = home.root().join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let launch = bin.join(format!("cozy{}", std::env::consts::EXE_SUFFIX));
-    std::fs::copy(env!("CARGO_BIN_EXE_cozy"), &launch).unwrap();
-    home.use_binary(&launch);
+    let launch = home.installed();
     let out = home.cozy(["machine", "enable", "--json"]);
     assert_eq!(out.code, 0, "{out:?}");
     launch

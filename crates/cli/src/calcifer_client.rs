@@ -1,8 +1,8 @@
 //! The CLI's client of Calcifer: loopback HTTP/1.1 with the bearer from Calcifer's lock record,
 //! typed refusals from its envelope, and a run's event stream. Any call starts Calcifer when none
-//! runs: as this user's service where a service manager answers, else as a detached
-//! `cozy calcifer`. Nothing here gives up because time passed: a start is waited on until
-//! Calcifer publishes its record or its refusal, and a long wait is reported as it goes.
+//! runs, from the home's installed `cozy` only: as this user's service where a service manager
+//! answers, else as a detached `cozy calcifer`. Nothing here gives up because time passed: a start
+//! is waited on until Calcifer publishes its record or its refusal, and a long wait is reported.
 use std::{
     fs::OpenOptions,
     io::{self, Write as _},
@@ -45,30 +45,27 @@ struct Inner {
     home: Home,
     user_home: PathBuf,
     json: bool,
-    /// What a start runs: this binary, or the one `cozy update` just put in place.
-    program: PathBuf,
     holder: Mutex<Option<Holder>>,
 }
 
 impl Client {
     /// Calcifer, started if none runs.
     pub async fn connect(ctx: &Context) -> Result<Self, Error> {
-        let client = Self::new(ctx, this_binary()?)?;
+        let client = Self::new(ctx)?;
         client.ready().await?;
         Ok(client)
     }
 
     /// The running Calcifer, or `None`: never starts one.
     pub async fn running(ctx: &Context) -> Result<Option<Self>, Error> {
-        let client = Self::new(ctx, this_binary()?)?;
+        let client = Self::new(ctx)?;
         Ok(client.live().await.map(|holder| {
             client.remember(Some(holder));
             client
         }))
     }
 
-    /// A client whose starts run `program`.
-    pub fn new(ctx: &Context, program: PathBuf) -> Result<Self, Error> {
+    fn new(ctx: &Context) -> Result<Self, Error> {
         let http = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -78,7 +75,6 @@ impl Client {
             home: ctx.home.clone(),
             user_home: ctx.user_home.clone(),
             json: ctx.json,
-            program,
             holder: Mutex::new(None),
         })))
     }
@@ -281,6 +277,7 @@ impl Client {
     /// Starts Calcifer and waits for its record or its refusal.
     async fn start(&self) -> Result<Holder, Error> {
         let home = &self.0.home;
+        let installed = installed(home)?;
         let failed = |e: platform::Error| {
             Error::new(Kind::Unavailable, "calcifer_start_failed", e.to_string())
         };
@@ -298,7 +295,11 @@ impl Client {
         }
         let services = Services::new(home, &self.0.user_home);
         let mut steps = Steps::new(home.calcifer_log());
-        let managed = services.available();
+        // Another cozy (a build, a copy) never writes the service: it starts it only as already
+        // defined for the installed cozy, else runs the installed one detached.
+        let exe = std::env::current_exe().and_then(|exe| exe.canonicalize());
+        let ours = matches!((exe, installed.canonicalize()), (Ok(exe), Ok(it)) if exe == it);
+        let managed = services.available() && (ours || services.current(&self.spec()));
         // Started detached for want of systemctl: no login starts it again.
         let path: Vec<_> =
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
@@ -309,7 +310,7 @@ impl Client {
         {
             output::warn(&warning);
         }
-        if managed {
+        if managed && ours {
             let wrote = services.ensure(&self.spec()).map_err(failed)?;
             steps.done(match wrote {
                 true => "wrote Calcifer's service and reloaded its manager",
@@ -368,7 +369,7 @@ impl Client {
     fn spec(&self) -> ServiceSpec {
         ServiceSpec {
             name: "calcifer".into(),
-            program: self.0.program.clone(),
+            program: self.0.home.binary(),
             args: vec!["calcifer".into()],
             log: Some(self.0.home.calcifer_log()),
         }
@@ -679,9 +680,20 @@ pub fn path(segments: &[&str]) -> String {
     url.path().to_owned()
 }
 
-fn this_binary() -> Result<PathBuf, Error> {
-    std::env::current_exe().map_err(|e| Error::new(Kind::Internal, "current_exe", e.to_string()))
+/// The home's installed `cozy`, the only one Calcifer and the machine run.
+pub(crate) fn installed(home: &Home) -> Result<PathBuf, Error> {
+    let binary = home.binary();
+    let message = format!("Calcifer runs only {}, which is missing", binary.display());
+    match binary.is_file() {
+        true => Ok(binary),
+        false => Err(Error::new(Kind::NotFound, "cozy_not_installed", message).next(INSTALL)),
+    }
 }
+
+const INSTALL: &str = match cfg!(windows) {
+    true => "irm https://tensorhub.com/install.ps1 | iex",
+    false => "curl -LsSf https://tensorhub.com/install.sh | sh",
+};
 
 /// The refusal a Calcifer that could not start left.
 fn refusal(path: &Path) -> Option<Error> {
