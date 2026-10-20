@@ -395,6 +395,10 @@ impl PyPlane {
         let c = self.core(py)?;
         stats(py, native(py, || c.end(request))?)
     }
+    fn stats(&self, py: Python<'_>, request: u64) -> PyResult<Py<PyDict>> {
+        let c = self.core(py)?;
+        stats(py, native(py, || c.stats(request))?)
+    }
     fn relief(
         &self,
         py: Python<'_>,
@@ -539,6 +543,8 @@ fn stats(py: Python<'_>, value: Stats) -> PyResult<Py<PyDict>> {
         let item = PyDict::new(py);
         item.set_item("request", c.request)?;
         item.set_item("page", c.page)?;
+        item.set_item("model", c.model)?;
+        item.set_item("streamed", c.streamed)?;
         item.set_item("tier", format!("{:?}", c.tier).to_ascii_lowercase())?;
         item.set_item("speculative", c.speculative)?;
         let measured = PyDict::new(py);
