@@ -287,7 +287,7 @@ uv venv --python 3.12
 source .venv/bin/activate
 uv pip install tensorfs
 
-tfs import hf://hf-internal-testing/tiny-sdxl-pipe --name local/example
+tfs convert hf://hf-internal-testing/tiny-sdxl-pipe --name local/example@1
 tfs inspect local/example
 tfs export local/example ./example --safetensors
 ```
@@ -361,7 +361,7 @@ and appends an unreleased tree. Its successful checkpoint carries the exact publ
 `writer.local_checkpoint` and remains an error.
 
 The default endpoint is `https://tensorhub.com`; `configure(endpoint=…)` or `TENSORFS_ENDPOINT` changes it.
-`token=` accepts a string, a native DPoP provider, a callable, or an object with `headers(method, url, headers,
+`token=` accepts a string, a callable, or an object with `headers(method, url, headers,
 payload)` and optional `retry(method, url, headers, payload, status, response_headers)`. The payload is its SHA-256
 hex digest when known. Credentials are presented afresh per request and removed on redirects to another origin.
 Public data needs no account. [Distribution](../tensorfs/spec/distribution.md) defines endpoint routes and publication.
