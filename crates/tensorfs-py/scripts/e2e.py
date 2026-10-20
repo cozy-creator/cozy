@@ -1,238 +1,256 @@
 #!/usr/bin/env python3
-"""The standalone e2e (design §11): no Cozy, no account, run by `e2e.sh` in a fresh venv.
+"""The standalone end to end check, with no Cozy and no account, then every Python, shell and Rust
+example in the given Markdown documents against what it built. Exits 1 when any fails. CI runs it
+on the built wheel (publish-tensorfs.yaml):
 
-1. CLI: `tfs import hf://hf-internal-testing/tiny-sdxl-pipe`; `tfs export --safetensors`, which is
-   every file of the repository and imports again as a fixed point (so do a Transformers model with
-   its tokenizer, a sharded model and a sharded fp16 variant), and from which
-   Diffusers renders exactly the upstream repo's image (CPU, fixed seed); `tfs export
-   --origin`, served by `python -m http.server`, then `tfs pull` into a second store,
-   byte-identical; a corrupted object is removed by `tfs verify` and fetched again.
-2. The same through `tensorfs`, plus DLPack reads equal to upstream's own tensors, regions,
-   the component writer (a config with floats and None, an encoded tensor) and typed errors.
-3. A parsed header carries the stored checkpoint's pipeline, components and tensors, with no
-   store behind it.
+    e2e.py [--wheels DIR] [--work DIR] DOC.md...
 
-    e2e.py <workdir>
+End to end: hf-internal-testing/tiny-sdxl-pipe is converted, and its Safetensors export must be
+the upstream repository byte for byte. It is published as `me/model`, release `1.0`, to a
+`file://` endpoint, in a `bf16` variant and an `int8` one whose UNet matrices are `int8.rowwise`,
+with a README and LICENSE. Each variant, opened by repo and revision from an empty store and from
+the repository materialized as cozytensors, has the written header and tensors and verifies.
+
+The docs: each document gets its own copy of the endpoint, named by TENSORFS_ENDPOINT; an example's
+`https://tensorhub.com` means that copy. Each document runs in its own process and working
+directory with an empty TENSORFS_HOME. Its Python blocks share one namespace, in which `my_token`
+is a placeholder token and `private_ca_der` a real CA certificate. Shell blocks run with bash,
+where `uv pip install tensorfs` and `pip install tensorfs` install the wheels in --wheels. A
+document's Rust blocks run last, together, as one `cargo run --example` program. An example whose
+code (not its comments) names CUDA is skipped where torch sees no CUDA device.
 """
 
 from __future__ import annotations
 
-import contextlib
-import hashlib
+import argparse
 import json
+import os
 import pathlib
+import re
+import shutil
+import ssl
 import subprocess
 import sys
-from collections.abc import Iterator
+import tempfile
+import traceback
+import urllib.request
 
 import numpy as np
-import torch
-from diffusers import StableDiffusionXLPipeline
-from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
-import tensorfs as tfs
-from tensorfs import raw as _raw
-from tensorfs import varena
+import tensorfs
 
+ROOT = pathlib.Path(__file__).resolve().parents[3]
+FENCE = re.compile(r"^```(\w*)[^\n]*\n(.*?)^```[ \t]*$", re.M | re.S)
+LANGS = {"python": "python", "bash": "shell", "sh": "shell", "shell": "shell", "rust": "rust"}
+TENSORHUB = "https://tensorhub.com"
 REPO = "hf-internal-testing/tiny-sdxl-pipe"
-#: Sources whose export keeps every file and imports as a fixed point, and their variant.
-SOURCES = [
-    (REPO, None),
-    ("hf-internal-testing/tiny-random-LlamaForCausalLM", None),
-    ("hf-internal-testing/tiny-random-bert-sharded-safetensors", None),
-    ("hf-internal-testing/tiny-stable-diffusion-pipe-variants-right-format", "fp16"),
-]
-OTHER_WEIGHTS = (".bin", ".onnx", ".msgpack", ".h5")
-NAME = "local/tiny-sdxl"
-TFS = str(pathlib.Path(sys.executable).with_name("tfs"))
-DTYPES = {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16, "I64": torch.int64}
+SOURCE = f"hf://{REPO}"
 
 
-def cli(store: pathlib.Path, *args: str, ok: bool = True) -> dict:
-    out = subprocess.run([TFS, "--store", str(store), "--json", *args], capture_output=True, text=True)
-    if ok and out.returncode:
-        raise SystemExit(f"tfs {' '.join(args)} failed:\n{out.stdout}{out.stderr}")
-    return json.loads(out.stdout)
+def blocks(doc: pathlib.Path) -> list[dict]:
+    text = doc.read_text()
+    found = []
+    for m in FENCE.finditer(text):
+        lang = LANGS.get(m.group(1))
+        if lang:
+            found.append({"line": text.count("\n", 0, m.start()) + 1, "lang": lang, "code": m.group(2)})
+    return found
 
 
-def render(source: str | pathlib.Path) -> tuple[np.ndarray, StableDiffusionXLPipeline]:
-    pipe = StableDiffusionXLPipeline.from_pretrained(source, use_safetensors=True)
-    pipe.set_progress_bar_config(disable=True)
-    generator = torch.Generator("cpu").manual_seed(0)
-    image = pipe("a red cube on a table", num_inference_steps=2, generator=generator, output_type="np")
-    return image.images[0], pipe
+def write(source: tensorfs.Checkpoint, dest: pathlib.Path, variant: str, store: pathlib.Path) -> tensorfs.Checkpoint:
+    """`source` in BF16; for `int8`, the UNet's matrices `int8.rowwise` too."""
+    with tensorfs.Writer(dest, cache_dir=store) as writer:
+        writer.metadata["source"] = SOURCE
+        writer.pipeline(source.pipeline.cls, source.pipeline.config)
+        for name, component in source.components.items():
+            out = writer.component(name, cls=component.cls, config=component.config, config_file=component.config_file)
+            for key, info in component.tensors.items():
+                data, shape = component.tensors.read(key).tobytes(), list(info.shape)
+                if info.dtype != "F32":
+                    out.put(key, data, dtype=info.dtype, shape=shape)
+                    continue
+                values = np.frombuffer(data, np.float32).reshape(shape)
+                if variant == "int8" and name == "unet" and len(shape) == 2:
+                    scale = np.abs(values).max(axis=1) / 127
+                    scale[scale == 0] = 1
+                    weight = np.clip(np.round(values / scale[:, None]), -127, 127).astype(np.int8)
+                    parts = {"weight": ("I8", shape, weight.tobytes()), "scale": ("F32", shape[:1], scale.astype(np.float32).tobytes())}
+                    out.put_encoded(key, dtype="BF16", shape=shape, scheme="int8.rowwise",
+                                    params={"axis": 0, "scale_dtype": "F32"}, parts=parts)
+                else:
+                    bits = values.view(np.uint32)
+                    out.put(key, ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).astype(np.uint16).tobytes(), dtype="BF16", shape=shape)
+            for asset in component.assets:
+                out.asset(asset, component.asset(asset))
+    return writer.commit()
 
 
-def same_image(folder: pathlib.Path, reference: np.ndarray) -> None:
-    image, _ = render(folder)
-    diff = float(np.abs(image - reference).max())
-    print(f"render {folder.name}: {image.shape}, max |diff| vs upstream {diff}")
-    assert diff == 0.0, f"{folder}: the image differs from upstream's by {diff}"
+def e2e(work: pathlib.Path) -> pathlib.Path:
+    """The end to end check (module docstring); returns the endpoint it published to."""
+    store, folder, endpoint = work / "store", work / "me-model", work / "endpoint"
+    source = tensorfs.convert_to_cozytensors(SOURCE, cache_dir=store)
+    revision = source.metadata["source"].rsplit("@", 1)[1]
+    exported = pathlib.Path(tensorfs.materialize(source, local_dir=work / "safetensors", format="safetensors"))
+    files = sorted(p.relative_to(exported).as_posix() for p in exported.rglob("*") if p.is_file())
+    for name in files:
+        with urllib.request.urlopen(f"https://huggingface.co/{REPO}/resolve/{revision}/{name}") as upstream:
+            assert (exported / name).read_bytes() == upstream.read(), f"{name} differs from {REPO}@{revision}"
+    print(f"e2e: converted {SOURCE}@{revision}; its Safetensors export is upstream's {len(files)} files byte for byte", flush=True)
+
+    folder.mkdir()
+    written = {variant: write(source, folder / f"model.{variant}.cozytensors", variant, store) for variant in ("bf16", "int8")}
+    (folder / "README.md").write_text(f"# me/model\n\n{SOURCE} converted by TensorFS, in bf16 and int8 variants.\n")
+    (folder / "LICENSE").write_text(f"The terms of https://huggingface.co/{REPO} apply.\n")
+    url = endpoint.as_uri()
+    tensorfs.upload_folder(repo_id="me/model", revision="1.0", folder_path=folder, endpoint=url, cache_dir=store)
+
+    fresh = work / "fresh"
+    opened = {v: tensorfs.open("me/model", revision="1.0", variant=v, endpoint=url, cache_dir=fresh) for v in written}
+    repo = tensorfs.materialize("me/model", revision="1.0", local_dir=work / "repo", endpoint=url, cache_dir=fresh)
+    reopened = {v: tensorfs.open(repo, variant=v, cache_dir=work / "from-folder") for v in written}
+    for variant, saved in written.items():
+        for checkpoint in (opened[variant], reopened[variant]):
+            assert checkpoint.id == saved.id, (variant, checkpoint.id, saved.id)
+            for name, component in checkpoint.components.items():
+                for key in component.tensors:
+                    got = component.tensors.read(key, decode=True).tobytes()
+                    assert got == saved.components[name].tensors.read(key, decode=True).tobytes(), (variant, name, key)
+            assert checkpoint.verify().ok, variant
+    print(f"e2e: me/model@1.0 (bf16, int8) published to {url}; opened from an empty store and from its "
+          "cozytensors folder, every tensor reads as written and verifies", flush=True)
+    return endpoint
 
 
-def same_folder(store: pathlib.Path, name: str, folder: pathlib.Path, repo: str) -> None:
-    """The export holds every non-weight file of the repository byte for byte, and an index only
-    of shards it wrote; imported, exported and imported again, it is the same checkpoint."""
-    def kept(path: str) -> bool:
-        return ".safetensors" not in path and not (path.endswith(OTHER_WEIGHTS) or ".bin.index" in path)
-
-    allow = [p for p in HfApi().list_repo_files(repo) if kept(p)]
-    upstream = pathlib.Path(snapshot_download(repo, allow_patterns=allow))
-    files = {str(p.relative_to(folder)): p for p in folder.rglob("*") if p.is_file()}
-    assert sorted(p for p in files if kept(p)) == sorted(allow), f"{repo}: {sorted(files)}"
-    differ = [p for p in allow if files[p].read_bytes() != (upstream / p).read_bytes()]
-    assert not differ, f"{repo}: {differ} differ from upstream's"
-    for path in (p for p in files if ".safetensors.index" in p):
-        shards = set(json.loads(files[path].read_text())["weight_map"].values())
-        assert all((files[path].parent / s).is_file() for s in shards), f"{repo}: {path}"
-    again = [cli(store, "import", str(folder), "--name", f"{name}-again")["header"]]
-    cli(store, "export", f"{name}-again", str(folder), "--safetensors")
-    again.append(cli(store, "import", str(folder), "--name", f"{name}-twice")["header"])
-    assert again[0] == again[1], f"{repo}: import of an export is a fixed point"
-    print(f"export of {repo}: its {len(allow)} other files byte for byte; re-import a fixed point")
+def placeholders() -> dict:
+    """The values a reader supplies: a token, and their private CA (any real one will do)."""
+    pem = pathlib.Path(ssl.get_default_verify_paths().cafile or "/etc/ssl/certs/ca-certificates.crt").read_text()
+    first = pem[: pem.index("-----END CERTIFICATE-----") + len("-----END CERTIFICATE-----")]
+    return {"my_token": "docs-example-token", "private_ca_der": ssl.PEM_cert_to_DER_cert(first)}
 
 
-def same_files(folder: pathlib.Path) -> None:
-    """Every exported weights file is the repository's own, byte for byte: export lays a file out
-    as safetensors writes it, so its tensors sit where upstream's do (CPU kernels round
-    differently on differently aligned weights)."""
-    files = sorted(p for p in folder.rglob("*.safetensors"))
-    for p in files:
-        upstream = pathlib.Path(hf_hub_download(REPO, str(p.relative_to(folder))))
-        assert p.read_bytes() == upstream.read_bytes(), f"{p} differs from {REPO}'s"
-    print(f"export: {len(files)} weights files byte-identical to upstream")
+def child(spec_path: str) -> None:
+    """One document's Python and shell blocks, in order; one result line each."""
+    spec = json.loads(pathlib.Path(spec_path).read_text())
+    os.chdir(spec["cwd"])
+    namespace = {"__name__": "__main__", **placeholders()}
+    with open(spec["results"], "a") as results:
+        for block in spec["blocks"]:
+            status, detail = "pass", ""
+            if block["skip"]:
+                status, detail = "skip", block["skip"]
+            elif block["lang"] == "python":
+                try:
+                    # Leading newlines keep a traceback's line numbers the document's.
+                    exec(compile("\n" * block["line"] + block["code"], spec["doc"], "exec"), namespace)
+                except BaseException as error:  # noqa: BLE001 - every failure is the example's
+                    status = "fail"
+                    detail = "".join(traceback.format_exception_only(type(error), error)).strip()
+                    traceback.print_exc()
+            else:
+                ran = subprocess.run(["bash", "-eo", "pipefail", "-c", block["code"]], check=False)
+                if ran.returncode:
+                    status, detail = "fail", f"bash exited {ran.returncode}"
+            print(f"{spec['doc']}:{block['line']} {block['lang']}: {status} {detail}".rstrip(), flush=True)
+            results.write(json.dumps({"line": block["line"], "lang": block["lang"], "status": status, "detail": detail}) + "\n")
+            results.flush()
 
 
-@contextlib.contextmanager
-def serve(folder: pathlib.Path) -> Iterator[str]:
-    args = [sys.executable, "-u", "-m", "http.server", "0", "--bind", "127.0.0.1", "--directory", str(folder)]
-    server = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+def rust(doc: pathlib.Path, code: list[dict], cwd: pathlib.Path, env: dict) -> dict:
+    """A document's Rust blocks, in order, as the body of one async main in a tensorfs example."""
+    name = "docs_" + re.sub(r"\W", "_", str(doc.relative_to(ROOT)).removesuffix(".md"))
+    example = ROOT / "crates/tensorfs/examples" / f"{name}.rs"
+    body = "\n".join(block["code"] for block in code)
+    example.parent.mkdir(exist_ok=True)
+    example.write_text(
+        f"//! Generated from {doc.relative_to(ROOT)} by e2e.py; not committed.\n"
+        "#[tokio::main]\nasync fn main() -> Result<(), Box<dyn std::error::Error>> {\n"
+        f"{body}\nOk(())\n}}\n"
+    )
     try:
-        line = server.stdout.readline()  # Serving HTTP on 127.0.0.1 port <n> (...)
-        port = int(line.split(" port ")[1].split()[0])
-        yield f"http://127.0.0.1:{port}"
+        ran = subprocess.run(
+            ["cargo", "run", "--locked", "--quiet", "--manifest-path", str(ROOT / "Cargo.toml"), "-p", "tensorfs", "--example", name],
+            cwd=cwd, env=env, capture_output=True, text=True, check=False,
+        )
     finally:
-        server.kill()
-        server.wait()
+        example.unlink()
+    print(ran.stdout + ran.stderr, flush=True)
+    lines = ", ".join(str(block["line"]) for block in code)
+    detail = "" if ran.returncode == 0 else f"blocks at lines {lines}: " + " | ".join(ran.stderr.strip().splitlines()[-8:])
+    return {"line": code[0]["line"], "lang": "rust", "status": "fail" if ran.returncode else "pass", "detail": detail}
 
 
-def blobs(store: pathlib.Path) -> dict[str, str]:
-    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (store / "blobs").rglob("*") if p.is_file()}
+def overrides(wheels: pathlib.Path | None, work: pathlib.Path) -> dict:
+    """`uv pip install tensorfs` and `pip install tensorfs` take the wheels under test."""
+    if wheels is None:
+        return {}
+    lines = []
+    for wheel in sorted(wheels.glob("tensorfs-*.whl")):
+        marker = 'python_version < "3.11"' if "-cp310-cp310-" in wheel.name else 'python_version >= "3.11"'
+        lines.append(f"tensorfs @ {wheel.resolve().as_uri()} ; {marker}")
+    path = work / "overrides.txt"
+    path.write_text("\n".join(lines) + "\n")
+    return {"UV_OVERRIDE": str(path), "PIP_FIND_LINKS": str(wheels.resolve()), "PIP_NO_INDEX": "1"}
 
 
-def tree(folder: pathlib.Path) -> dict[str, bytes]:
-    return {str(p.relative_to(folder)): p.read_bytes() for p in folder.rglob("*") if p.is_file()}
+def gpu() -> bool:
+    """Torch sees a CUDA device (torch is the examples' GPU consumer)."""
+    probe = "import torch, sys; sys.exit(not torch.cuda.is_available())"
+    return subprocess.run([sys.executable, "-c", probe], capture_output=True, check=False).returncode == 0
 
 
-def corrupt_and_refetch(store: pathlib.Path, origin: str) -> None:
-    victim = max((p for p in (store / "blobs").rglob("*") if p.is_file()), key=lambda p: p.stat().st_size)
-    data = bytearray(victim.read_bytes())
-    data[len(data) // 2] ^= 0xFF
-    victim.unlink()
-    victim.write_bytes(data)
-    verified = cli(store, "verify", ok=False)
-    assert verified["error"]["code"] == "integrity" and verified["corrupt"] == [victim.name], verified
-    assert not victim.exists(), "verify removes a corrupt object"
-    again = cli(store, "pull", origin, NAME)
-    assert again["fetched"] == len(data), again
-    cli(store, "verify")
-    print(f"corrupted {victim.name[:12]} ({len(data)} B): refused, removed, fetched again")
-
-
-def main() -> None:
-    work = pathlib.Path(sys.argv[1])
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("docs", nargs="*", type=pathlib.Path)
+    parser.add_argument("--wheels", type=pathlib.Path)
+    parser.add_argument("--work", type=pathlib.Path)
+    parser.add_argument("--child")
+    args = parser.parse_args()
+    if args.child:
+        child(args.child)
+        return 0
+    work = (args.work or pathlib.Path(tempfile.mkdtemp(prefix="tensorfs-docs-"))).resolve()
     work.mkdir(parents=True, exist_ok=True)
-    reference, upstream = render(REPO)
-    print(f"upstream {REPO}: {reference.shape}")
-
-    # 1. The CLI.
-    a, b = work / "a", work / "b"
-    imported = cli(a, "import", f"hf://{REPO}", "--name", NAME)
-    assert imported["name"] == NAME and imported["release"] == "1", imported
-    inspected = cli(a, "inspect", NAME)
-    names = [c["name"] for c in inspected["components"]]  # header order (#624)
-    assert {"text_encoder", "text_encoder_2", "unet", "vae", "tokenizer", "tokenizer_2", "scheduler"} <= set(names), names
-    cli(a, "export", NAME, str(work / "out"), "--safetensors")
-    same_files(work / "out")
-    for i, (repo, variant) in enumerate(SOURCES):
-        flags = ["--variant", variant] if variant else []
-        cli(work / "sources", "import", f"hf://{repo}", "--name", f"local/source-{i}", *flags)
-        cli(work / "sources", "export", f"local/source-{i}", str(work / f"source-{i}"), "--safetensors")
-        same_folder(work / "sources", f"local/source-{i}", work / f"source-{i}", repo)
-    same_image(work / "out", reference)
-    cli(a, "export", NAME, str(work / "origin"), "--origin")
-    with serve(work / "origin") as url:
-        pulled = cli(b, "pull", url, NAME)
-        assert pulled["header"] == imported["header"], (pulled, imported)
-        assert blobs(b) == blobs(a), "the pulled store is byte-identical"
-        corrupt_and_refetch(b, url)
-        assert blobs(b) == blobs(a)
-    print(f"CLI: import, export, origin, pull: {len(blobs(a))} objects identical")
-
-    # 2. The Python API.
-    tfs.configure(cache_dir=work / "c")
-    m = tfs.convert_to_cozytensors(f"hf://{REPO}")
-    folder = tfs.materialize(m.tree, local_files_only=True)
-    tfs.upload_folder(repo_id=NAME, revision="1", folder_path=folder)
-    assert m.id == f"sha256:{imported['header']['sha256']}", "imports are deterministic"
-    ck = tfs.open(NAME, revision="1", local_files_only=True)
-    assert (ck.repo_id, ck.revision) == (NAME, "1")
-    assert (ck.id, ck.tree) == (m.id, m.tree)
-    compared = 0
-    for component in ("unet", "vae", "text_encoder", "text_encoder_2"):
-        want = getattr(upstream, component).state_dict()
-        for key, info in ck.components[component].tensors.items():
-            assert info.encoding is None and not hasattr(info, "parts"), (key, info)
-            got = torch.from_dlpack(ck.components[component].tensors.read(key, decode=True))
-            assert tuple(got.shape) == info.shape and got.dtype == DTYPES[info.dtype], (key, got.dtype, info)
-            if key in want:
-                assert torch.equal(got, want[key]), f"{component}/{key} differs from upstream"
-                compared += 1
-    assert compared > 100, compared
-    conv = ck.components["unet"].tensors.read("conv_in.weight", decode=True)
-    want_np = upstream.unet.state_dict()["conv_in.weight"].numpy()
-    assert np.array_equal(np.from_dlpack(conv), want_np), "numpy reads it too"
-    assert conv.tobytes() == want_np.tobytes()
-    grouped = varena.regions(ck, 1 << 20)
-    names = [n for r in grouped for n in r]
-    assert sorted(names) == sorted(f"{c}/{k}" for c, component in ck.components.items() for k in component.tensors), "every tensor in one region"
-    print(f"Python: {compared} tensors equal upstream's through DLPack; {len(grouped)} regions")
-
-    written = pathlib.Path(tfs.materialize(m, local_dir=work / "out2", format="safetensors"))
-    assert (written / "unet/diffusion_pytorch_model.safetensors").is_file()
-    assert tree(work / "out2") == tree(work / "out"), "the Python export is the CLI's, byte for byte"
-    same_image(work / "out2", reference)
-    origin = (work / "origin2").as_uri()
-    remote_name = "conformance/tiny-sdxl"
-    tfs.upload_folder(repo_id=remote_name, revision="1", folder_path=folder, endpoint=origin)
-    downloaded = tfs.materialize(remote_name, revision="1", endpoint=origin, cache_dir=work / "d")
-    assert tfs.open(downloaded).id == m.id
-
-    w = tfs.Writer(base=m)
-    config = {"scale": 0.18215, "eps": 1e-05, "act": None, "blocks": [1, 2.5], "name": "x"}
-    extra = w.component("extra", cls="diffusers.Extra", config=config)
-    extra.put("x.weight", np.arange(4, dtype=np.float32).reshape(2, 2))
-    parts = {"weight": ("F8_E4M3", [2, 16], bytes([0x38]) * 32), "scale": ("F32", [2], np.array([0.5, 2.0], dtype=np.float32))}
-    extra.put_encoded("q.weight", dtype="F32", shape=[2, 16], scheme="fp8.rowwise", parts=parts, params={"axis": 0, "scale_dtype": "F32"})
-    extra.asset("vocab.txt", b"a\nb\n")
-    assert extra.has("q.weight") and w.has("extra", "x.weight")
-    ck3 = w.commit()
-    assert ck3.components["unet"].tensors.keys() == ck.components["unet"].tensors.keys(), "the base carries over"
-    e = ck3.components["extra"]
-    assert (e.cls, e.config) == ("diffusers.Extra", config), (e.cls, e.config)
-    assert e.assets["vocab.txt"][1] == 4 and e.asset("vocab.txt") == b"a\nb\n"
-    q = ck3.components["extra"].tensors["q.weight"]
-    assert q.encoding is not None and q.encoding.scheme == "fp8.rowwise" and set(_raw.parts(ck3, "extra", "q.weight")) == {"weight", "scale"}
-    assert str(q.encoding) == 'fp8.rowwise {axis: 0, scale_dtype: "F32"}', q.encoding
-    assert torch.equal(torch.from_dlpack(ck3.components["extra"].tensors.read("q.weight", decode=True)), torch.tensor([[0.5] * 16, [2.0] * 16]))
-    try:
-        tfs.open("local/nothing", local_files_only=True)
-        raise AssertionError("no such ref")
-    except tfs.NotFoundError as e:
-        assert e.code == "not_found" and isinstance(e, tfs.Error), e
-
-    print("e2e: all green")
+    seeded = e2e(work)
+    has_gpu = gpu()
+    rows = []
+    for doc in (d.resolve() for d in args.docs):
+        cwd = work / re.sub(r"\W", "_", str(doc.relative_to(ROOT)))
+        cwd.mkdir()
+        endpoint = shutil.copytree(seeded, cwd / ".endpoint").as_uri()
+        env = {
+            **os.environ,
+            **overrides(args.wheels, work),
+            "TENSORFS_HOME": str(cwd / ".tensorfs"),
+            "TENSORFS_ENDPOINT": endpoint,
+            "PATH": os.pathsep.join([str(pathlib.Path(sys.executable).parent), os.environ["PATH"]]),
+        }
+        found = blocks(doc)
+        for block in found:
+            block["code"] = block["code"].replace(TENSORHUB, endpoint)
+            uses_cuda = re.search(r"\bcuda\b", re.sub(r"#.*", "", block["code"]))
+            block["skip"] = "needs CUDA" if uses_cuda and not has_gpu else ""
+        spec = {"doc": str(doc), "cwd": str(cwd), "results": str(cwd / ".results.jsonl"),
+                "blocks": [b for b in found if b["lang"] != "rust"]}
+        (cwd / ".spec.json").write_text(json.dumps(spec))
+        ran = subprocess.run([sys.executable, __file__, "--child", str(cwd / ".spec.json")], env=env, check=False)
+        done = [json.loads(line) for line in pathlib.Path(spec["results"]).read_text().splitlines()] if pathlib.Path(spec["results"]).exists() else []
+        for block in spec["blocks"][len(done):]:
+            done.append({"line": block["line"], "lang": block["lang"], "status": "fail", "detail": f"not run: the document's process exited {ran.returncode}"})
+        code = [b for b in found if b["lang"] == "rust"]
+        if code:
+            done.append(rust(doc, code, cwd, env))
+        rows += [{"doc": str(doc.relative_to(ROOT)), **row} for row in done]
+    failed = [r for r in rows if r["status"] == "fail"]
+    table = ["| example | language | result | detail |", "|---|---|---|---|"]
+    table += [f"| {r['doc']}:{r['line']} | {r['lang']} | {r['status']} | {r['detail'].replace('|', '/')[:300]} |" for r in rows]
+    counts = {s: sum(r["status"] == s for r in rows) for s in ("pass", "fail", "skip")}
+    summary = f"docs examples: {counts['pass']} pass, {counts['fail']} fail, {counts['skip']} skipped"
+    print("\n".join(["", summary, *table]))
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
+            out.write("\n".join([f"## {summary}", "", *table, ""]))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

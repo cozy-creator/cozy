@@ -15,21 +15,39 @@ use tensorfs::format::{Body, Dtype, ObjectRef, Tree};
 use tensorfs::store::Store;
 use tensorfs::{fetch, Checkpoint, Client, Config, Convert, Download, Format, Open, Ref, Selection};
 
-const USAGE: &str = "usage: tfs [--store <dir>] [--endpoint <url>] [--json] <verb>
-  convert <source>... [--converter <c>] [--variant <v>] [--name local/<name>[@revision]]
-  download <ref> [--dir <dir>]
-  upload <folder> <org/name>[@revision]      the token is $TENSORFS_TOKEN
-  export <ref> <dir> [--safetensors [--dequantize bf16|f16|f32] | --gguf]
-  inspect <ref>
-  verify <ref>
-  ceiling [<path>] [--gpu <n>]              measure what reads from <path>'s volume (and to GPU n) reach
-  conform endpoint <url> [--write] [--token-env <VAR>]
-  dev ckpt [--name local/<name>[@revision]] [--blocks <n>] [--scale <n>] [--plain] [--no-configs]
-  version
-<ref> is org/name[@revision][/variant], sha256:<hex>, a .cozytensors file or a folder;
---variant picks a variant. The store is --store, else $TENSORFS_HOME, else ~/.cache/tensorfs.";
+const VERBS: &[&str] = &[
+    "convert <source>... [--converter <c>] [--variant <v>] [--name local/<name>[@revision]]",
+    "download <ref> [--dir <dir>]",
+    "upload <folder> <org/name>[@revision]      the token is $TENSORFS_TOKEN",
+    "export <ref> <dir> [--safetensors [--dequantize bf16|f16|f32] | --gguf]",
+    "inspect <ref>",
+    "verify <ref>",
+    "ceiling [<path>] [--gpu <n>]              measure what reads from <path>'s volume (and to GPU n) reach",
+    "conform endpoint <url> [--write] [--token-env <VAR>]",
+    "dev ckpt [--name local/<name>[@revision]] [--blocks <n>] [--scale <n>] [--plain] [--no-configs]",
+    "version",
+];
 
-const SWITCHES: &[&str] = &["json", "safetensors", "gguf", "plain", "no-configs", "write"];
+fn known(verb: &str) -> bool {
+    VERBS.iter().any(|l| l.split(' ').next() == Some(verb))
+}
+
+/// The usage of `verb`, or of every verb when it names none.
+fn usage(verb: Option<&str>) -> String {
+    let verb = verb.filter(|v| known(v));
+    let mut text = String::from("usage: tfs [--store <dir>] [--endpoint <url>] [--json] <verb>");
+    for line in VERBS.iter().filter(|l| verb.is_none_or(|v| l.split(' ').next() == Some(v))) {
+        text.push_str("\n  ");
+        text.push_str(line);
+    }
+    text.push_str(
+        "\n<ref> is org/name[@revision][/variant], sha256:<hex>, a .cozytensors file or a folder;
+--variant picks a variant. The store is --store, else $TENSORFS_HOME, else ~/.cache/tensorfs.",
+    );
+    text
+}
+
+const SWITCHES: &[&str] = &["help", "json", "safetensors", "gguf", "plain", "no-configs", "write"];
 const VALUED: &[&str] = &[
     "store", "endpoint", "name", "dequantize", "converter", "variant", "blocks", "scale",
     "token-env", "dir", "gpu",
@@ -45,7 +63,10 @@ impl Args {
         let (mut pos, mut flags) = (Vec::new(), Vec::new());
         let mut it = argv.iter();
         while let Some(token) = it.next() {
-            let Some(name) = token.strip_prefix("--") else {
+            let Some(name) = token.strip_prefix("--").or((token == "-h").then_some("help")) else {
+                if token.len() > 1 && token.starts_with('-') {
+                    return Err(format!("unknown flag {token}"));
+                }
                 pos.push(token.clone());
                 continue;
             };
@@ -92,9 +113,21 @@ fn main() -> ExitCode {
     let args = match Args::parse(&argv) {
         Ok(args) => args,
         Err(why) => {
-            eprintln!("tfs: {why}\n{USAGE}");
+            eprintln!("tfs: {why}\n{}", usage(None));
             return ExitCode::from(2);
         }
+    };
+    let verb = args.pos.first().map(String::as_str);
+    if args.on("help") || verb == Some("help") {
+        let topic = args.pos.get(usize::from(verb == Some("help"))).map(String::as_str);
+        println!("{}", usage(topic));
+        return ExitCode::SUCCESS;
+    }
+    // Before the store opens, so a typo never depends on its state.
+    let Some(verb) = verb.filter(|v| known(v)) else {
+        let why = verb.map_or("no verb".to_owned(), |v| format!("unknown verb {v:?}"));
+        eprintln!("tfs: {why}\n{}", usage(None));
+        return ExitCode::from(2);
     };
     let json = args.on("json");
     let ran = fetch::runtime().map_err(Failure::from).and_then(|rt| rt.block_on(run(&args)));
@@ -104,7 +137,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(None) => {
-            eprintln!("{USAGE}");
+            eprintln!("tfs: {verb}: wrong arguments\n{}", usage(Some(verb)));
             ExitCode::from(2)
         }
         Err(f) => {

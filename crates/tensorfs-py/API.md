@@ -12,7 +12,7 @@ are separate documents.
 - [Configuration and advanced operations](#python-configuration-and-advanced-operations)
 - [Errors and value types](#errors-and-value-types)
 
-The [temporary type-declaration dump](API-TYPES.md) is available for signature and naming review.
+[API-TYPES.md](API-TYPES.md) lists every declaration.
 
 ## Python: import and open a model
 
@@ -29,6 +29,8 @@ checkpoint = tensorfs.open("me/model", revision="1.0", variant="bf16")
 weight = checkpoint.components["unet"].tensors.read("conv_in.weight")
 ```
 
+In these examples `me/model` stands for a repository you can read, with `bf16` and `int8` variants.
+
 `open` returns a `Checkpoint`. By default (`lazy=True`), it loads metadata; reading
 tensors then downloads the objects those tensors need. `revision` selects a release or immutable reference;
 `variant` selects a representation such as `bf16` or `int8`. Without a variant, a
@@ -39,7 +41,7 @@ explicitly materialized folder; those are optional input forms.
 To download the complete checkpoint into the shared store before continuing:
 
 ```python
-checkpoint = tensorfs.open("me/model", lazy=False)
+checkpoint = tensorfs.open("me/model", variant="bf16", lazy=False)
 ```
 
 This waits for all declared chunks and component assets. It does not create a folder,
@@ -84,7 +86,7 @@ cozytensors checkpoint:
 ```python
 tokenizer = checkpoint.components["tokenizer"]
 print(list(tokenizer.assets))
-tokenizer_bytes = tokenizer.asset("tokenizer.json")
+vocab = tokenizer.asset("vocab.json")
 ```
 
 For import/export compatibility, `config_file` is the filename to use when recreating a
@@ -154,8 +156,14 @@ import torch
 
 weight = unet.tensors.read("conv_in.weight", decode=True)
 torch_weight = torch.from_dlpack(weight)
+state_dict = {name: torch.from_dlpack(value) for name, value in unet.tensors.read(decode=True).items()}
+```
+
+On a GPU:
+
+```python
 gpu_weights = unet.tensors.read(device="cuda:0", decode=True)
-state_dict = {name: torch.from_dlpack(value) for name, value in gpu_weights.items()}
+gpu_state_dict = {name: torch.from_dlpack(value) for name, value in gpu_weights.items()}
 ```
 
 The returned arrays and their framework consumers retain the storage they need.
@@ -163,12 +171,16 @@ The returned arrays and their framework consumers retain the storage they need.
 ### Keep quantized weights encoded
 
 ```python
-value = unet.tensors.read("some_quantized.weight")  # decode=False is the default
+quantized = tensorfs.open("me/model", revision="1.0", variant="int8").components["unet"]
+value = quantized.tensors.read("time_embedding.linear_1.weight")  # decode=False is the default
 print(value.scheme, value.params)
 print(value.parts.keys())
+```
 
-# GPU placement does not require decoding:
-gpu_value = unet.tensors.read("some_quantized.weight", device="cuda:0")
+GPU placement does not require decoding:
+
+```python
+gpu_value = quantized.tensors.read("time_embedding.linear_1.weight", device="cuda:0")
 ```
 
 `Encoding` describes how the stored arrays reconstruct the logical tensor: a scheme
@@ -195,13 +207,13 @@ unet.tensors.read_into("conv_in.weight", destination, offset=0)
 copied_bytes = bytes(destination)
 
 # For stored encoded bytes, size the destination for that part and select its role.
-encoded = unet.tensors.read("some_quantized.weight", decode=False)
+encoded = quantized.tensors.read("time_embedding.linear_1.weight", decode=False)
 packed = bytearray(encoded.parts["weight"].nbytes)
-unet.tensors.read_into("some_quantized.weight", packed, role="weight", offset=0)
+quantized.tensors.read_into("time_embedding.linear_1.weight", packed, role="weight", offset=0)
 
 # Or its decoded logical bytes, from byte 64:
 window = bytearray(256)
-unet.tensors.read_into("some_quantized.weight", window, decode=True, offset=64)
+quantized.tensors.read_into("time_embedding.linear_1.weight", window, decode=True, offset=64)
 ```
 
 `read_into(key, out, *, role=None, decode=False, offset=0)` follows `read`. The destination
@@ -221,9 +233,8 @@ checkpoint.download(components=["unet"], priority=0, progress=on_progress)
 ```
 
 `download` returns when all requested chunks and supporting files are verified and locally
-available, or raises an error. The open checkpoint retains them. Closing its last handle
-allows ordinary cache policy to apply again; a saved header file roots its data while it
-holds that header.
+available, or raises an error. The open checkpoint retains them; closing its last handle
+returns them to the [cache](#the-local-cache).
 Progress callbacks receive `(stage, completed, total)`; download counts are locally available
 bytes out of requested bytes, while conversion counts are tensors.
 
@@ -252,8 +263,8 @@ Additional checkpoint properties and operations:
 
 | Attribute or call | Meaning |
 |---|---|
-| `id`, `header_ref` | Header identity: `sha256:…` string and `(hex, length)` pair. |
-| `tree`, `tree_ref` | Repository-tree identity in the same two forms, when known. |
+| `id` | Header identity, a `sha256:…` string. |
+| `tree` | Repository-tree identity, a `sha256:…` string, when known. |
 | `repo_id` | Repository name, when known. |
 | `revision` | Release label, when known. |
 | `variant` | Selected repository variant, when known. A standalone header does not store this label. |
@@ -277,7 +288,9 @@ the blocking call to a worker thread so the event loop remains responsive:
 import asyncio
 
 async def load_model():
-    return await asyncio.to_thread(tensorfs.open, "me/model", lazy=False)
+    return await asyncio.to_thread(tensorfs.open, "me/model", variant="bf16", lazy=False)
+
+checkpoint = asyncio.run(load_model())
 ```
 
 The same pattern works for `checkpoint.download` and tensor reads. Cancelling the
@@ -308,7 +321,7 @@ and `read` instead of managing these ranges.
 destination. It does not open a checkpoint or fetch data. Ordinary model code continues to
 use `component.tensors.read(..., decode=True)`. Its signature in `tensorfs.raw` is:
 
-```python
+```pyi
 def decode_into(
     scheme: str,
     parts: Mapping[str, tuple[str, Sequence[int], Buffer | DLPack]],
@@ -329,7 +342,7 @@ reinterprets those bytes; it does not numerically convert the encoded weights.
 `dtype` and `shape` describe the logical result and its final format rounding. `out` must
 already have exactly that actual dtype, shape and byte length, with writable contiguous
 storage. It is not cast or resized. Primitive buffer outputs support F32 and F16; BF16
-outputs use a supported DLPack carrier. For example, this planned CPU call decodes stored
+outputs use a supported DLPack carrier. For example, this CPU call decodes stored
 rowwise INT8 bytes into an existing F32 array:
 
 ```python
@@ -413,10 +426,11 @@ encodings and references. Store paths, credentials and endpoint URLs stay in con
 not in the file. Opening it uses the configured store and, when needed and allowed, the
 configured source.
 
-The store keeps the saved data while that file still holds this header. Once the file is
-deleted, moved or overwritten with another header, the data ages out like any other cache
-entry; open checkpoints keep their bytes meanwhile. To copy a checkpoint to another machine,
-write the portable form with `tensorfs.materialize(saved, local_dir=...)` (described below).
+The store keeps the saved data while that file exists and holds this header. `open(path)` on a
+header file holds its data the same way where it is opened, so a moved or copied file is held
+once it is opened. Without such a file the data is an ordinary [cache](#the-local-cache) entry;
+open checkpoints keep their bytes meanwhile. To copy a checkpoint to another machine, write the
+portable form with `tensorfs.materialize(saved, local_dir=...)` (described below).
 
 The file identifies one checkpoint, not an enclosing repository tree. It contains no release
 label or repository README/LICENSE files; those remain available on a checkpoint opened
@@ -447,7 +461,8 @@ Its options and members are:
 
 An exceptional context exit abandons the writer unless a resume key requests retained state.
 An upload failure remains an error; it can also carry `error.checkpoint` and populate
-`writer.local_checkpoint`. Retry publication of the retained result without rerunning training.
+`writer.local_checkpoint`. That result can be published again without rerunning training for as
+long as the [cache](#the-local-cache) keeps it: 7 days after its last use.
 
 A `ComponentWriter` supports:
 
@@ -463,7 +478,7 @@ A `ComponentWriter` supports:
 ### Import an existing model
 
 ```python
-checkpoint = tensorfs.convert_to_cozytensors("hf://owner/model")
+checkpoint = tensorfs.convert_to_cozytensors("hf://hf-internal-testing/tiny-sdxl-pipe")
 print(list(checkpoint.components))
 ```
 
@@ -481,17 +496,19 @@ resolution call is needed. These are upstream source revisions, not Tensorhub br
 ### Choose defaults and credentials
 
 ```python
-tensorfs.configure(endpoint="https://tensorhub.com", cache_dir="/path/to/cache", token=my_token,
+tensorfs.configure(endpoint="https://tensorhub.com", cache_dir="./tensorfs-cache", token=my_token,
                    ca_der=private_ca_der)
 print(tensorfs.__version__)
 ```
+
+`my_token` in the examples is a credential you obtained for your endpoint, and `private_ca_der` your CA's DER bytes.
 
 `configure` optionally sets process-wide defaults for future calls. It returns `None`,
 does not write a configuration file and does not change existing checkpoint handles.
 You can instead pass settings directly to each operation:
 
 ```python
-checkpoint = tensorfs.open("me/model", endpoint="https://tensorhub.com", token=my_token)
+checkpoint = tensorfs.open("me/model", variant="bf16", endpoint="https://tensorhub.com", token=my_token)
 ```
 
 The default endpoint is `https://tensorhub.com`; environment settings include
@@ -510,6 +527,14 @@ to try again after a response. These are duck-typed protocols, not classes you m
 Progress and repository-change callback exceptions can propagate normally. An ordinary
 exception from a token provider is wrapped as `DeniedError`; a TensorFS exception retains
 its family. Credentials do not follow cross-origin redirects.
+
+### The local cache
+
+Every process on a machine shares one store: `cache_dir=`, else `TENSORFS_HOME`, else
+`~/.cache/tensorfs`. Local copies expire 7 days after their last use, and the least recently
+used are evicted first when the disk runs low. Header files (written by `Writer(dest)` or
+opened by path) and `local/` references keep their data while they exist. There is no public
+cache API.
 
 ### Optional filesystem escape hatches
 
@@ -577,8 +602,6 @@ needed.
 license_path = tensorfs.download_file("me/model", "LICENSE")
 tree_id = tensorfs.upload_folder(repo_id="me/model", folder_path="./portable", token=my_token)
 ```
-
-`my_token` in the examples is a credential you obtained for your endpoint.
 
 `download_file` returns one file path and accepts revision, location and authentication
 options, without component or variant selection.

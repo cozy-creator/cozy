@@ -1,10 +1,11 @@
 """`tensorfs._ext`: the compiled extension's types."""
 
-from collections.abc import Buffer, Callable, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
+from collections.abc import Callable, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
 from os import PathLike
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Protocol, TypeVar, overload
+from typing_extensions import Buffer
 
 __version__: str
 STORE_FORMAT: int

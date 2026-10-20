@@ -293,7 +293,7 @@ impl Store {
             return Err(Error::Full { op: "admit", path: self.root.clone() });
         }
         let (temp, file) = self.temp("put")?;
-        file.lock_shared().map_err(fail("lock", &temp))?;
+        platform::lock::share(&file).map_err(platform("lock", &temp))?;
         Ok(Admission {
             store: self.clone(),
             expect: expect.cloned(),
@@ -518,7 +518,7 @@ impl Store {
     fn commit(&self, path: &Path, bytes: &[u8], flush: bool) -> Result<()> {
         let flush = flush && self.flushes();
         let (temp, mut file) = self.temp("record")?;
-        file.lock_shared().map_err(fail("lock", &temp))?;
+        platform::lock::share(&file).map_err(platform("lock", &temp))?;
         let written = file
             .write_all(bytes)
             .and_then(|()| if flush { file.sync_data() } else { Ok(()) });

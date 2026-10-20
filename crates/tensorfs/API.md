@@ -11,7 +11,7 @@ are separate documents.
 - [Decode existing host or GPU buffers](#advanced-decode-existing-host-or-gpu-buffers)
 - [Errors and value types](#errors-and-value-types)
 
-The [temporary type-declaration dump](API-TYPES.md) is available for signature and naming review.
+[API-TYPES.md](API-TYPES.md) lists every declaration.
 
 ## Rust: create a client and read a model
 
@@ -72,9 +72,10 @@ println!("saved {}", saved.id().id());
 
 A `.cozytensors` file is a small handle into the shared local store, not a self-contained
 file: `dest` gets only the header, and the tensor and asset bytes stay in the store. The
-store keeps them while that file still holds this header. Once the file is deleted, moved or
-overwritten with another header, the data ages out like any other cache entry. Open
-checkpoints keep their bytes in the meantime. To copy a checkpoint to another machine,
+store keeps them while that file exists and holds this header; opening a header file by path
+holds its data the same way, so a moved or copied file is held once it is opened. Otherwise
+local copies expire 7 days after their last use, least recently used first when the disk runs
+low. Open checkpoints keep their bytes in the meantime. To copy a checkpoint to another machine,
 write the portable form with `saved.materialize(dir, Format::Cozytensors, None)`.
 
 `dest` is the exact filename; TensorFS does not append a variant or create a directory.

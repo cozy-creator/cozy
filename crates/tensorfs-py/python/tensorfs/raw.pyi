@@ -1,6 +1,7 @@
 """Physical format inspection; ordinary reads use Component.tensors."""
 
-from collections.abc import Buffer, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing_extensions import Buffer
 
 from ._ext import Checkpoint
 from .api import DLPack

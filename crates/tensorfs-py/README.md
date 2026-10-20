@@ -64,7 +64,7 @@ so consumers do not have to reverse-engineer filenames and producer-specific ten
 #### Why the exact encoding matters
 
 These are concrete cases from our format and importer work, captured by the
-[encoding definitions](../tensorfs/spec/cozytensors.md):
+[encoding definitions](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs/spec/cozytensors.md):
 
 | Case | Why dtype, shape or names were not enough | What cozytensors records |
 |---|---|---|
@@ -100,17 +100,18 @@ conventions carrying their quantization meaning had not been applied correctly.
 
 #### Choose the representation your runtime needs
 
-For a quantized matrix named `proj.weight`, inspect and retain its stored encoding when your
-runtime has a matching compute kernel:
+In these examples `me/model` stands for a repository you can read, here with `int8` and `bf16`
+variants. For a quantized matrix, inspect and retain its stored encoding when your runtime has a
+matching compute kernel:
 
 ```python
 import tensorfs
 
-checkpoint = tensorfs.open("owner/model", variant="int8")
+checkpoint = tensorfs.open("me/model", variant="int8")
 tensors = checkpoint.components["unet"].tensors
-stored = tensors.read("proj.weight", device="cuda:0", decode=False)
+stored = tensors.read("time_embedding.linear_1.weight", decode=False)
 print(stored.scheme, stored.params)
-# stored.parts contains the GPU arrays for that encoding's compute kernel.
+# stored.parts holds the encoded arrays; device="cuda:0" puts them on the GPU for that kernel.
 ```
 
 A runtime that expects ordinary floating-point weights can instead request decoding:
@@ -118,13 +119,13 @@ A runtime that expects ordinary floating-point weights can instead request decod
 ```python
 import torch
 
-dense = tensors.read("proj.weight", device="cuda:0", decode=True)
+dense = tensors.read("time_embedding.linear_1.weight", decode=True)
 weight = torch.from_dlpack(dense)  # ordinary values; no input-format-specific unpacker
 weight = weight.to(torch.bfloat16)  # only if this runtime requires BF16
 ```
 
 `decode=True` reconstructs the header's declared logical dtype; it does not always mean BF16.
-The same call can decode supported ConvRot, GPTQ, NF4 or other stored schemes. Selecting CUDA
+The same call can decode supported ConvRot, GPTQ, NF4 or other stored schemes. `device="cuda:0"`
 chooses the destination, not a different quantization.
 
 #### Convert to another quantization at load time
@@ -134,9 +135,7 @@ the target encoder. For example, a runtime that expects symmetric, per-row INT8 
 weights decoded from ConvRot or another supported encoding as follows:
 
 ```python
-values = torch.from_dlpack(
-    tensors.read("proj.weight", device="cuda:0", decode=True)
-).float()
+values = torch.from_dlpack(tensors.read("time_embedding.linear_1.weight", decode=True)).float()
 scales = values.abs().amax(dim=1, keepdim=True) / 127
 scales = torch.where(scales == 0, torch.ones_like(scales), scales)
 weights_i8 = (values / scales).round().clamp(-127, 127).to(torch.int8)
@@ -146,8 +145,7 @@ row_scales = scales.squeeze(1)
 
 This target representation is `int8.rowwise` with `axis=0` and `scale_dtype="F32"`.
 TensorFS handles the source encoding; the target quantizer above is ordinary PyTorch code.
-The current Python API does not yet expose a general re-encoding call.
-`ComponentWriter.put_encoded(...)` can store already-encoded arrays, but does not quantize them.
+TensorFS has no re-encoding call: `ComponentWriter.put_encoded(...)` stores already-encoded arrays.
 Prepare this once when loading, rather than on every forward pass. Re-quantizing can add error;
 methods requiring calibration need their own calibration step, not merely a dtype cast.
 
@@ -249,7 +247,7 @@ an import/export format, so existing Diffusers and Transformers workflows can us
 
 Use TensorFS through its Rust API, Python library or `tfs` command-line tool. It works with local
 files, static origins and Tensorhub, without requiring Cozy, a Tensorhub account or PyTorch.
-The [cozytensors specification](../tensorfs/spec/cozytensors.md) defines the format and exact decoding rules.
+The [cozytensors specification](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs/spec/cozytensors.md) defines the format and exact decoding rules.
 
 ## Timing versus safetensors
 
@@ -272,16 +270,17 @@ make the selected-block reads 211 MB and 227 MB respectively.
 
 They measure serialized-byte loading,
 excluding dequantization, model construction and inference. Hardware and cache conditions affect
-results. [Measurements and provenance](gates/speed/measurements.json) include the earlier failed
+results. [Measurements and provenance](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs-py/gates/speed/measurements.json) include the earlier failed
 window cell; [the recorded harness](https://github.com/cozy-creator/cozy-creator/blob/0a6e71ee2c919db3e6e9b5844c8234ca9749cedb/crates/tensorfs/gates/speed/speedgate.py)
 defines the workloads. Download projections are separate from these measured timings.
 
 ## Get started
 
-Python 3.12 or later is required. The wheel includes the Python module and `tfs`:
+It needs CPython 3.10 or later. Wheels for Linux (x86_64, aarch64), macOS (arm64, x86_64) and Windows
+(x86_64, arm64) include the Python module and the `tfs` command:
 
 ```bash
-uv venv --python 3.12
+uv venv
 source .venv/bin/activate
 uv pip install tensorfs
 
@@ -338,6 +337,7 @@ Encoded tensors retain their parts unless `dequantize=` requests ordinary values
 
 ```python
 from array import array
+from pathlib import Path
 import tensorfs
 
 with tensorfs.Writer("./model.cozytensors") as writer:
@@ -348,44 +348,46 @@ checkpoint = writer.commit()
 tensorfs.materialize(checkpoint, local_dir="./portable", format="cozytensors")
 
 tensorfs.upload_folder(repo_id="local/example", revision="draft", folder_path="./portable")
-tensorfs.upload_folder(repo_id="acme/example", folder_path="./portable", endpoint="file:///srv/origin")
+tensorfs.upload_folder(repo_id="acme/example", folder_path="./portable", endpoint=Path("origin").absolute().as_uri())
 ```
 
 A `.cozytensors` file is a small handle into the shared local store, not a self-contained file: a save writes the
 header, and its tensors and supporting-file bytes stay in the store while that file holds this header. Delete or
-overwrite the file and the data ages out like any other cache entry. The copy for another machine is
+overwrite the file and the data expires like any other local copy. The copy for another machine is
 `materialize(checkpoint, local_dir=…)`: `model.cozytensors` (or a named variant) plus complete `chunks/<sha256>`
 objects. `Writer()` without a destination keeps the checkpoint in the store as a cache entry. `base=` reuses
 unchanged tensors and `resume=` journals local work. `Writer(repo_id=…, endpoint=…, token=…)` streams new objects
 and appends an unreleased tree, named `model.<variant>.cozytensors` by `variant=`, which needs `repo_id`. Its
-successful checkpoint carries the exact published tree; an upload failure keeps `writer.local_checkpoint` and
-remains an error.
+successful checkpoint carries the exact published tree; an upload failure keeps `writer.local_checkpoint`, which
+can be published again for 7 days, and remains an error.
 
 The default endpoint is `https://tensorhub.com`; `configure(endpoint=…)` or `TENSORFS_ENDPOINT` changes it.
 `token=` accepts a string, a callable, or an object with `headers(method, url, headers,
 payload)` and optional `retry(method, url, headers, payload, status, response_headers)`. The payload is its SHA-256
 hex digest when known. Credentials are presented afresh per request and removed on redirects to another origin.
-Public data needs no account. [Distribution](../tensorfs/spec/distribution.md) defines endpoint routes and publication.
+Public data needs no account. [Distribution](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs/spec/distribution.md) defines endpoint routes and publication.
 
 ## Storage and ownership
 
 The shared local store is internal. Its default root is `~/.cache/tensorfs`; `cache_dir=` and `TENSORFS_HOME` override it. Processes
 share immutable objects and coordinated records. Admission hashes bytes before installing them by rename; ordinary
-opens check lengths. A saved header file roots its data until the file is deleted or holds another header. Explicit verification rehashes on demand. TensorFS is a library and has no daemon.
+opens check lengths. Local copies expire 7 days after their last use, least recently used first when the disk runs low;
+header files (written by `Writer(dest)` or opened by path) and `local/` references keep their data while they exist.
+Explicit verification rehashes on demand. TensorFS is a library and has no daemon.
 
 Runtime and TensorD use this same public API. Callers read and write the shared store and upload with a supplied
 credential. TensorFS owns I/O and decoding; varena owns memory placement. Installing the wheel does
 not grant access to private data or managed executions.
 
-The [usage guide](../tensorfs/README.md) summarizes the target public calls. The
-[native type declarations](python/tensorfs/_ext.pyi) describe the checked-in implementation while the 0.13 bindings are integrated. Every format, storage and transport failure derives from `tensorfs.Error`; `.code` identifies one of
+The [Python API](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs-py/API.md) and [Rust API](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs/API.md) guides cover every call; the
+wheel ships type declarations. Every format, storage and transport failure derives from `tensorfs.Error`; `.code` identifies one of
 twelve families, including `denied` and `conflict`. Unknown encodings remain inspectable and transferable; decoding
 requires that scheme's implementation.
 
 ## Format and development
 
-The [cozytensors specification](../tensorfs/spec/cozytensors.md) is the format contract. The header is deterministic CBOR;
+The [cozytensors specification](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs/spec/cozytensors.md) is the format contract. The header is deterministic CBOR;
 trees and repository documents are canonical JSON. Construction order contributes to identity. The
-[conformance corpus](../tensorfs/conformance/) checks independent readers, and the [source fixtures](../tensorfs/vectors/) retain source
-provenance without model payloads. The [standalone end-to-end check](scripts/e2e.sh) converts a tiny public model,
-exports it for Diffusers, compares its render and downloads the same bytes through an ordinary endpoint.
+[conformance corpus](https://github.com/cozy-creator/cozy-creator/tree/master/crates/tensorfs/conformance) checks independent readers, and the [source fixtures](https://github.com/cozy-creator/cozy-creator/tree/master/crates/tensorfs/vectors) retain source
+provenance without model payloads. The [end to end check](https://github.com/cozy-creator/cozy-creator/blob/master/crates/tensorfs-py/scripts/e2e.py) converts a tiny
+public model, publishes and reopens it, and runs every example in these documents against it in CI.

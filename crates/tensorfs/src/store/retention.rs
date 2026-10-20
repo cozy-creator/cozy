@@ -44,7 +44,8 @@ impl Hold {
         loop {
             let n = NEXT.fetch_add(1, Ordering::Relaxed);
             let path = store.root.join("holds").join(format!("{}-{n}", std::process::id()));
-            let file = match OpenOptions::new().append(true).create_new(true).open(&path) {
+            // Windows locks need read or write access, which append alone does not grant.
+            let file = match OpenOptions::new().read(true).append(true).create_new(true).open(&path) {
                 Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(fail("create", &path)(e)),

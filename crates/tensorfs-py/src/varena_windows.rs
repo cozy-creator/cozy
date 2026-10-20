@@ -18,7 +18,7 @@ create_exception!(tensorfs.varena, Unsupported, VarenaError);
 create_exception!(tensorfs.varena, LedgerError, PyException, "A ledger error; `.code` names its class.");
 
 fn unsupported(py: Python<'_>) -> PyErr {
-    let error = Unsupported::new_err("varena has no Windows tier yet; read objects through Store leases");
+    let error = Unsupported::new_err("varena has no Windows tier yet; read tensors through tensorfs.open");
     let _ = error.value(py).setattr("code", "UNSUPPORTED");
     error
 }
