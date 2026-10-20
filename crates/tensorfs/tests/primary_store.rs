@@ -159,6 +159,58 @@ fn explicit_cached_folder_retains_its_existing_directory() {
     );
 }
 
+#[tokio::test]
+async fn empty_safetensors_materialization_returns_a_directory_and_refuses_a_file() {
+    let scratch = Scratch::new();
+    let store = Store::open(scratch.0.join("store")).unwrap();
+    let header = Header::new(
+        vec![],
+        None,
+        vec![Component {
+            name: "empty".into(),
+            ..Default::default()
+        }],
+        Default::default(),
+    )
+    .unwrap();
+    let object = store.put_bytes(&header.to_cbor().unwrap()).unwrap();
+    let mut config = Config::from_env();
+    config.cache_dir = store.root().to_path_buf();
+    config.token = None;
+    config.mirror = None;
+    let client = Client::new(config).unwrap();
+    let checkpoint = client
+        .open(
+            &object.id(),
+            &Open {
+                local_files_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let destination = scratch.0.join("empty-directory");
+    let path = checkpoint
+        .materialize(&destination, Format::Safetensors, None)
+        .await
+        .unwrap();
+    assert_eq!(path, destination);
+    assert!(path.is_dir());
+    assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+
+    let file = scratch.0.join("existing-file");
+    fs::write(&file, b"keep me").unwrap();
+    assert_eq!(
+        checkpoint
+            .materialize(&file, Format::Safetensors, None)
+            .await
+            .unwrap_err()
+            .kind,
+        Kind::Io
+    );
+    assert_eq!(fs::read(file).unwrap(), b"keep me");
+}
+
 struct Http {
     url: String,
     requests: Arc<Mutex<Vec<String>>>,
@@ -297,6 +349,28 @@ async fn explicit_export_fetches_known_repo_files_and_never_omits_refused_files(
         );
         assert_eq!(server.repo_requests(), 0);
         assert!(!invalid.exists());
+        let requests_before = server.requests.lock().unwrap().len();
+        let invalid = scratch.0.join("invalid-safetensors");
+        let error = checkpoint
+            .materialize(&invalid, Format::Safetensors, Some(Dtype::I8))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, Kind::Invalid);
+        assert_eq!(error.detail, "dequantize to I8: one of F32, BF16, F16");
+        assert_eq!(server.requests.lock().unwrap().len(), requests_before);
+        assert!(!invalid.exists());
+        let file = scratch.0.join("existing-file");
+        fs::write(&file, b"keep me").unwrap();
+        assert_eq!(
+            checkpoint
+                .materialize(&file, Format::Safetensors, None)
+                .await
+                .unwrap_err()
+                .kind,
+            Kind::Io
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), requests_before);
+        assert_eq!(fs::read(&file).unwrap(), b"keep me");
 
         let destination = scratch.0.join("export");
         let result = checkpoint
