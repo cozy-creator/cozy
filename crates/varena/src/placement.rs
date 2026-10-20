@@ -82,11 +82,17 @@ struct Request {
     budgets: BTreeMap<u32, u64>,
 }
 
+struct Cache {
+    shrink: Arc<Shrink>,
+    active: u32,
+    blocked: bool,
+}
+
 struct Inner {
     table: plan::Table,
     models: BTreeMap<ModelId, Model>,
     requests: BTreeMap<RequestId, Request>,
-    caches: BTreeMap<PageId, Arc<Shrink>>,
+    caches: BTreeMap<PageId, Cache>,
     orphaned: BTreeMap<PageId, PageKey>,
     retired: BTreeSet<PageId>,
     filling: BTreeSet<PageId>,
@@ -260,6 +266,7 @@ impl Placement {
         let range = self.gpu.reserve(layout.nbytes)?;
         let mut rollback = Registration {
             owner: self,
+            model: id,
             pages: Vec::new(),
             committed: false,
         };
@@ -277,6 +284,24 @@ impl Placement {
                 tensorfs::sha256::hex(&fingerprint),
             )?;
             rollback.pages.push(page);
+            self.inner.lock().table.pages.push(plan::Page {
+                id: page,
+                row: self.row.owner().row,
+                model: Some(id),
+                bytes: region.span,
+                tier: Tier::Disk,
+                kind: Kind::Weight,
+                pins: 0,
+                filling: false,
+                loaded: false,
+                last_used: 0,
+                spread_rank: spread_rank(index, layout.regions.len()),
+                uses: vec![],
+                speculative_for: None,
+                attempted: BTreeSet::new(),
+                ram_ready: false,
+                lowered: BTreeSet::new(),
+            });
             let key = PageKey {
                 fingerprint,
                 page: index as u64,
@@ -298,23 +323,6 @@ impl Placement {
                 )?;
             }
             pages.push(page);
-            self.inner.lock().table.pages.push(plan::Page {
-                id: page,
-                row: self.row.owner().row,
-                model: Some(id),
-                bytes: region.span,
-                tier: Tier::Disk,
-                kind: Kind::Weight,
-                pins: 0,
-                filling: false,
-                loaded: false,
-                last_used: 0,
-                spread_rank: index as u32,
-                uses: vec![],
-                speculative_for: None,
-                attempted: BTreeSet::new(),
-                ram_ready: false,
-            });
         }
         self.inner.lock().models.insert(
             id,
@@ -679,6 +687,7 @@ impl Placement {
         for page in &mut inner.table.pages {
             page.uses.retain(|usage| usage.request != request);
             page.attempted.retain(|step| step.request != request);
+            page.lowered.remove(&request);
             if page
                 .speculative_for
                 .is_some_and(|step| step.request == request)
@@ -746,7 +755,14 @@ impl Placement {
         let id = self.new_page()?;
         let mut inner = self.inner.lock();
         let last_used = inner.progress;
-        inner.caches.insert(id, shrink);
+        inner.caches.insert(
+            id,
+            Cache {
+                shrink,
+                active: 0,
+                blocked: false,
+            },
+        );
         inner.table.pages.push(plan::Page {
             id,
             row: self.row.owner().row,
@@ -763,12 +779,19 @@ impl Placement {
             speculative_for: None,
             attempted: BTreeSet::new(),
             ram_ready: false,
+            lowered: BTreeSet::new(),
         });
         Ok(id)
     }
 
     pub fn cache_bytes(&self, id: PageId, bytes: u64) -> Result<()> {
         let mut inner = self.inner.lock();
+        let cache = inner
+            .caches
+            .get_mut(&id)
+            .ok_or_else(|| invalid("unknown cache"))?;
+        cache.blocked = false;
+        let pins = cache.active;
         let page = inner
             .table
             .pages
@@ -776,6 +799,7 @@ impl Placement {
             .find(|page| page.id == id && page.kind == Kind::Cache)
             .ok_or_else(|| invalid("unknown cache"))?;
         page.bytes = bytes;
+        page.pins = pins;
         Ok(())
     }
 
@@ -787,17 +811,23 @@ impl Placement {
 
     pub fn cache_active(&self, id: PageId, active: bool) -> Result<()> {
         let mut inner = self.inner.lock();
+        let cache = inner
+            .caches
+            .get_mut(&id)
+            .ok_or_else(|| invalid("unknown cache"))?;
+        cache.active = if active {
+            cache.active.saturating_add(1)
+        } else {
+            cache.active.saturating_sub(1)
+        };
+        let pins = cache.active.saturating_add(u32::from(cache.blocked));
         let page = inner
             .table
             .pages
             .iter_mut()
             .find(|page| page.id == id && page.kind == Kind::Cache)
             .ok_or_else(|| invalid("unknown cache"))?;
-        page.pins = if active {
-            page.pins.saturating_add(1)
-        } else {
-            page.pins.saturating_sub(1)
-        };
+        page.pins = pins;
         Ok(())
     }
 
@@ -882,6 +912,7 @@ impl Placement {
                     speculative_for: None,
                     attempted: BTreeSet::new(),
                     ram_ready: false,
+                    lowered: BTreeSet::new(),
                 });
             }
         }
@@ -1014,6 +1045,7 @@ impl Placement {
                 speculative_for: None,
                 attempted: BTreeSet::new(),
                 ram_ready: false,
+                lowered: BTreeSet::new(),
             });
         }
         let snapshot = ledger::Snapshot {
@@ -1057,6 +1089,20 @@ impl Placement {
             let mut wait = None;
             for action in actions {
                 match action {
+                    Action::DropHome { request, page } => {
+                        self.event(request, page, "lower", "lower")?;
+                        if let Some(page) = self
+                            .inner
+                            .lock()
+                            .table
+                            .pages
+                            .iter_mut()
+                            .find(|row| row.id == page)
+                        {
+                            page.lowered.insert(request);
+                            page.speculative_for = None;
+                        }
+                    }
                     Action::Map(_) => {} // Gpu.fill atomically allocates and fills the page.
                     Action::Fill {
                         page,
@@ -1070,10 +1116,10 @@ impl Placement {
                             ));
                         }
                         self.inner.lock().filling.insert(page);
+                        let filling = Filling { owner: self, page };
                         drop(operation);
                         let result = self.fill(request, page, from, speculative);
-                        self.inner.lock().filling.remove(&page);
-                        self.changed.notify_all();
+                        drop(filling);
                         result?;
                         continue 'decide;
                     }
@@ -1130,9 +1176,16 @@ impl Placement {
                             .lock()
                             .caches
                             .get(&page)
-                            .cloned()
+                            .map(|cache| cache.shrink.clone())
                             .ok_or_else(|| invalid("cache callback absent"))?;
                         let freed = shrink(bytes)?;
+                        let pins = {
+                            let mut inner = self.inner.lock();
+                            inner.caches.get_mut(&page).map(|cache| {
+                                cache.blocked = freed == 0;
+                                cache.active.saturating_add(u32::from(cache.blocked))
+                            })
+                        };
                         if let Some(page) = self
                             .inner
                             .lock()
@@ -1142,9 +1195,7 @@ impl Placement {
                             .find(|row| row.id == page)
                         {
                             page.bytes = page.bytes.saturating_sub(freed);
-                            if freed == 0 {
-                                page.pins = 1;
-                            }
+                            page.pins = pins.unwrap_or(0);
                         }
                         drop(operation);
                         continue 'decide;
@@ -1382,8 +1433,21 @@ impl Placement {
 
 struct Registration<'a> {
     owner: &'a Placement,
+    model: ModelId,
     pages: Vec<PageId>,
     committed: bool,
+}
+
+struct Filling<'a> {
+    owner: &'a Placement,
+    page: PageId,
+}
+impl Drop for Filling<'_> {
+    fn drop(&mut self) {
+        self.owner.inner.lock().filling.remove(&self.page);
+        self.owner.changed.notify_all();
+        let _ = self.owner.row.wake();
+    }
 }
 
 impl Drop for Registration<'_> {
@@ -1404,6 +1468,7 @@ impl Drop for Registration<'_> {
             }
         }
         let mut inner = self.owner.inner.lock();
+        inner.models.remove(&self.model);
         inner.table.pages.retain(|page| !gone.contains(&page.id));
         inner.retired.extend(retained);
         let _ = self.owner.row.wake();
@@ -1465,4 +1530,9 @@ impl Drop for Ram {
 
 fn invalid(message: &str) -> Error {
     Error::Invalid(message.to_owned())
+}
+
+fn spread_rank(index: usize, count: usize) -> u32 {
+    let bits = (usize::BITS - count.saturating_sub(1).leading_zeros()).clamp(1, 32);
+    (index as u32).reverse_bits() >> (32 - bits)
 }
