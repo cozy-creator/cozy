@@ -21,8 +21,11 @@ const GPT2: &str = "hf://hf-internal-testing/tiny-random-gpt2@71034c5d8bde858ff8
 const TABLE: &[Upstream] = &[
     Upstream { models: &["acme/tiny"], from: SDXL, files: &["model_index.json", "tokenizer/", "tokenizer_2/", "unet/config.json", "README"], source: None, note: "test" },
     Upstream { models: &["acme/gpt2"], from: GPT2, files: &["special_tokens_map.json", "README"], source: None, note: "test" },
-    Upstream { models: &["acme/wrapped"], from: "", files: &[], source: Some("civitai://1"), note: "" },
+    Upstream { models: &["acme/wrapped"], from: "", files: &[], source: Some("local"), note: "" },
+    Upstream { models: &["acme/false"], from: "", files: &[], source: Some(NOWHERE), note: "" },
 ];
+/// A pin no Hugging Face repo has.
+const NOWHERE: &str = "hf://hf-internal-testing/a11-no-such-repo@0000000000000000000000000000000000000000";
 /// The fixture's manifests: tiny-sdxl-pipe whole, without its run data and README (`ft`), the
 /// same with another README, tiny-random-gpt2 whole and without special_tokens_map.json.
 const FULL: &str = "90bac0063e68b5ac3726751c2bd5f04f616032cdf78fcdd6e31df68aed59d664";
@@ -329,7 +332,7 @@ fn a_transformers_config_wrapper_becomes_its_files() {
     }
     assert!(!tree.files.contains_key("config.json"));
     assert_eq!(report["unwrapped"].as_array().unwrap().len(), wrapped.len() + 1);
-    assert_eq!(h.metadata.get("source"), Some(&Value::Str("civitai://1".into())));
+    assert_eq!(h.metadata.get("source"), Some(&Value::Str("local".into())));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -345,7 +348,8 @@ fn a_component_config_wrapper_becomes_its_files_and_records_its_source() {
     }
     let vocab = blob(&dir, &files["tokenizer/vocab.json"].sha256);
     wrapper.insert("processor".into(), json!({"tokenizer": deflate(&vocab), "chat_template": "{{ x }}"}));
-    wrapper.insert("provenance".into(), json!({"source_repository": "acme/upstream", "source_revision": "abc"}));
+    wrapper.insert("provenance".into(), json!({"source_repository": "hf-internal-testing/tiny-sdxl-pipe",
+        "source_revision": "20594cbc343cfcfe447af5c87cdaf6c436b453f2"}));
     files.insert("config.json".into(), put(&dir, &serde_json::to_vec(&wrapper).unwrap()));
 
     // No UPSTREAMS row: the wrapper's own record is the lane's source.
@@ -360,7 +364,7 @@ fn a_component_config_wrapper_becomes_its_files_and_records_its_source() {
     assert_eq!(tree.files["processor/chat_template.jinja"], ObjectRef::of(b"{{ x }}"));
     assert!(!tree.files.contains_key("config.json"));
     assert_eq!(report["unwrapped"].as_array().unwrap().len(), configs.len() + 2);
-    assert_eq!(h.metadata.get("source"), Some(&Value::Str("hf://acme/upstream@abc".into())));
+    assert_eq!(h.metadata.get("source"), Some(&Value::Str(SDXL.into())));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -372,5 +376,39 @@ fn a_v1_checkpoint_is_refused_until_u12_moves_it() {
     let mut migrator = Migrator::new(Access::from_env(), TABLE);
     let refused = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).err().unwrap();
     assert!(refused.detail.contains("v1 checkpoint"), "{}", refused.detail);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// GPT-2's lane with its header's metadata emptied: a lane that records no source.
+fn unsourced(dir: &Path) -> BTreeMap<String, ObjectRef> {
+    let mut files = lane_files(dir, GPT2_FULL);
+    let old = blob(dir, &files["model.cozytensors"].sha256);
+    let mut d = Decoder::new(&old);
+    let root = items(&old, &mut d);
+    let mut bytes = vec![0x85];
+    root[..4].iter().for_each(|item| bytes.extend_from_slice(item));
+    bytes.push(0xa0);
+    files.insert("model.cozytensors".into(), put(dir, &bytes));
+    files
+}
+
+#[test]
+fn a_lane_nobody_sourced_converts_as_unknown_and_unfilled() {
+    let dir = scratch("unknown");
+    let (h, _, report) = migrate_lane(&dir, "acme/unlisted", unsourced(&dir));
+    assert_eq!(h.metadata.get("source"), Some(&Value::Str(d10::UNKNOWN.into())));
+    assert!(h.metadata.get("filled").is_none() && report.get("filled").is_none());
+    assert_eq!(h.component("model").unwrap().config, parse(&blob(&dir, &lane_files(&dir, GPT2_FULL)["config.json"].sha256)));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_claimed_source_that_does_not_verify_is_refused() {
+    let dir = scratch("nowhere");
+    let manifest = put(&dir, &serde_json::to_vec(&json!({"format": "tensorfs.manifest/1", "files": unsourced(&dir)})).unwrap());
+    let doc = serde_json::to_vec(&json!({"name": "acme/false", "releases": [{"version": "1", "lanes": {"lane": manifest}}]})).unwrap();
+    let mut migrator = Migrator::new(Access::from_env(), TABLE);
+    let refused = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).err().unwrap();
+    assert!(refused.detail.contains("does not verify"), "{}", refused.detail);
     std::fs::remove_dir_all(dir).unwrap();
 }

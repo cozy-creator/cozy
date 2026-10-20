@@ -116,10 +116,15 @@ pub const UPSTREAMS: &[Upstream] = &[
         ],
         from: "",
         files: &[],
-        source: Some("local"),
+        source: Some(LOCAL),
         note: "",
     },
 ];
+
+/// Cozy made it here; no upstream to name.
+const LOCAL: &str = "local";
+/// A lane whose source nobody recorded (owner, 2026-10-20): converted, never filled.
+pub const UNKNOWN: &str = "unknown";
 
 /// Old metadata D10's loading metadata drops; `sources` becomes `source`.
 const DROPPED: [&str; 4] = ["normalized", "converters", "sources", "migrated_from"];
@@ -335,9 +340,10 @@ impl<'t> Migrator<'t> {
             (None, s) => s,
         };
         let listed = upstream.map(|u| u.source.unwrap_or(u.from)).filter(|s| !s.is_empty());
-        let Some(source) = listed.map(|s| Value::Str(s.to_owned())).or(recorded) else {
-            return fail(Kind::Invalid, format!("{}: no source; give its model an UPSTREAMS row", manifest.id()));
-        };
+        let source = listed.map(|s| Value::Str(s.to_owned())).or(recorded).unwrap_or_else(|| Value::Str(UNKNOWN.into()));
+        if let Value::Str(claim) = &source {
+            self.verify(claim).map_err(|e| invalid(format!("{}: source {claim} does not verify: {}", manifest.id(), e.detail)))?;
+        }
         metadata.insert("source".into(), source);
         if let (Some(u), false) = (upstream, filled.is_empty()) {
             let text = |s: &str| Value::Str(s.to_owned());
@@ -361,12 +367,20 @@ impl<'t> Migrator<'t> {
         Ok(Lane { header: at, files: repo_files, report })
     }
 
+    /// A claimed source resolves where it says (`hf://…@commit`, `civitai://<version>`):
+    /// listed once. `local` and `unknown` are markers, not claims.
+    fn verify(&mut self, source: &str) -> Result<()> {
+        if [LOCAL, UNKNOWN].contains(&source) || self.listings.contains_key(source) {
+            return Ok(());
+        }
+        let listing = remote::list(&remote::parse(source)?, &self.access)?;
+        self.listings.insert(source.to_owned(), listing.members);
+        Ok(())
+    }
+
     /// The files under `entry` at the pinned upstream `from`, by path.
     fn upstream(&mut self, from: &str, entry: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        if !self.listings.contains_key(from) {
-            let listing = remote::list(&remote::parse(from)?, &self.access)?;
-            self.listings.insert(from.to_owned(), listing.members);
-        }
+        self.verify(from)?;
         let members: Vec<remote::Member> = self.listings[from].iter().filter(|m| under(entry, &m.path)).cloned().collect();
         let mut out = Vec::new();
         for m in members {
