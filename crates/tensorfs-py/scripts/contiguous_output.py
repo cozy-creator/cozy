@@ -113,6 +113,20 @@ def check(cuts, source, expected, *, room=0):
     return actual, authority
 
 
+def default_formats(cuts, source):
+    """Exercise the rule itself, before CPU can lower omitted contiguous to clone."""
+    contiguous, clone = torch.ops.aten.contiguous.default, torch.ops.aten.clone.default
+    defaults = {name: repr(cuts._arguments(op, (source,), {}).get("memory_format"))
+                for name, op in (("contiguous", contiguous), ("clone", clone))}
+    assert cuts._contiguous(contiguous, (source,), {}) is not None, defaults
+    for op in (contiguous, clone):
+        assert cuts._contiguous(op, (source,), {"memory_format": torch.contiguous_format}) is not None
+        assert cuts._contiguous(op, (source,), {"memory_format": 0}) is not None
+        assert cuts._contiguous(op, (source,), {"memory_format": torch.preserve_format}) is None
+    assert cuts._contiguous(clone, (source,), {}) is None, "omitted clone must preserve its format"
+    return defaults
+
+
 def cpu(cuts):
     from rmsnorm_bands import upstream_class
 
@@ -124,6 +138,8 @@ def cpu(cuts):
         repeated = x.repeat_interleave(module.repeats, dim=1)
         source = repeated.view(1, 3, 2, 2, 2, 1, 3, 5).permute(0, 1, 5, 2, 6, 3, 7, 4)
         expected = source.contiguous()
+        with torch.no_grad():
+            defaults = default_formats(cuts, source)
         actual, authority = check(cuts, source, expected)
         expected_decode = module(x, first_chunk=True)
         cuts.serve(cuts.Memo(), Room())
@@ -150,6 +166,7 @@ def cpu(cuts):
         gc.collect()
         assert pointer() is None, "contiguous memo retained source storage"
     print("PASS contiguous CPU: exact locked DupUp3D, strided offsets, later-axis bands, formats and aliases")
+    print(json.dumps({"omitted_memory_format": defaults}))
 
 
 def cuda():
@@ -178,6 +195,7 @@ def cuda():
             torch.cuda.set_per_process_memory_fraction(quota / total, device)
             authority = Room(memory, room=8 << 20)
             cuts.serve(cuts.Memo(), authority)
+            defaults = default_formats(cuts, source)
             with torch.cuda.stream(side):
                 side.wait_stream(torch.cuda.current_stream(device))
                 with cuts.caught():
@@ -208,6 +226,7 @@ def cuda():
         print("PASS contiguous mapped CUDA: real quota, exact strided bands, actual stream and alias lifetime")
         print(json.dumps({"gpu": str(torch.cuda.get_device_properties(device).uuid),
                           "input_bytes": 32 << 20, "largest_band_bytes": max(row[3] for row in writes),
+                          "omitted_memory_format": defaults,
                           "leftover": request.stats.leftover, "scope": "isolated cut/output; not native relief policy"}))
     finally:
         torch.cuda.set_per_process_memory_fraction(fraction, device)

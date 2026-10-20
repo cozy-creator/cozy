@@ -730,9 +730,13 @@ def _contiguous(func: OpOverload, args: Args, kwargs: Kwargs) -> _Plan | None:
     """Copy logical rows to fresh contiguous storage, with only one device band staged."""
     a = _arguments(func, args, kwargs)
     x = a.get("self")
+    memory_format = a.get("memory_format")
+    # ATen exposes contiguous's omitted default as enum integer 0. Clone's
+    # omitted default is None (preserve format), which must remain distinct.
+    contiguous = memory_format is torch.contiguous_format or type(memory_format) is int and memory_format == 0
     if (not isinstance(x, Tensor) or x.layout is not torch.strided
             or torch.is_grad_enabled() or _capturing() or x.is_contiguous()
-            or a.get("memory_format") is not torch.contiguous_format):
+            or not contiguous):
         return None
     axes = [i for i, size in enumerate(x.shape) if size > 1]
     if not axes:
