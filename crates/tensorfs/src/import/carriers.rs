@@ -48,6 +48,9 @@ pub struct Carrier {
     /// ComfyUI's `convrot` flag.
     #[serde(default)]
     pub convrot: bool,
+    /// ComfyUI always rotates this format: its marker's `convrot` may be absent or true, never false.
+    #[serde(default)]
+    pub rotated: bool,
     /// The data part first.
     pub parts: Vec<PartRule>,
     pub encoding: Encoding,
@@ -136,6 +139,14 @@ pub enum Geometry {
     BlockTiles,
     /// As the producer stores it, checked by the scheme's own rules (`from_config`).
     Scheme,
+    /// The data part, `n` bits per element along the last axis: `[*lead, C·n/8]`.
+    Packed(u64),
+    /// Row-major scales per group of the encoding's `group_size`, `[*lead, C/g]`.
+    Groups,
+    /// The same, transposed: `[C/g, R]`.
+    GroupsTransposed,
+    /// `n` elements, any shape.
+    Count(u64),
 }
 
 #[derive(Debug, Deserialize)]
@@ -649,6 +660,7 @@ fn geometry(
     t: &Tensor,
     shape: &[u64],
     block: Option<[u64; 2]>,
+    group: Option<u64>,
 ) -> std::result::Result<Vec<u64>, String> {
     let (lead, c) = match shape {
         [lead @ .., c] => (lead, *c),
@@ -657,7 +669,7 @@ fn geometry(
     let blocks = |n: u64| c.div_ceil(n);
     let block_scheme = !matches!(
         rule.shape,
-        Geometry::Logical | Geometry::One | Geometry::Scheme
+        Geometry::Logical | Geometry::One | Geometry::Scheme | Geometry::Count(_)
     );
     if block_scheme && shape.len() < 2 {
         return Err(format!("a logical shape {shape:?} of rank under 2"));
@@ -700,6 +712,25 @@ fn geometry(
             match t.shape == want {
                 true => want,
                 false => return Err(format!("{:?}, not cuBLAS tiles {want:?}", t.shape)),
+            }
+        }
+        Geometry::Packed(bits) => [lead, &[c * bits / 8]].concat(),
+        Geometry::Count(n) => match numel(&t.shape) == n {
+            true => t.shape.clone(),
+            false => return Err(format!("{:?}, not {n} elements", t.shape)),
+        },
+        Geometry::Groups | Geometry::GroupsTransposed => {
+            let g = group.filter(|g| *g > 0 && c % g == 0);
+            let Some(g) = g else {
+                return Err(format!("{c} columns are not whole groups of {group:?}"));
+            };
+            let want = match rule.shape {
+                Geometry::Groups => [lead, &[c / g]].concat(),
+                _ => vec![c / g, numel(lead)],
+            };
+            match t.shape == want {
+                true => want,
+                false => return Err(format!("{:?}, not {want:?}", t.shape)),
             }
         }
         Geometry::BlockTiles => {
@@ -750,13 +781,29 @@ fn fit(
                 }
             }
             if let Some(last) = shape.last_mut() {
-                *last = *last * from / to;
+                *last = match data.shape {
+                    Geometry::Packed(bits) if (*last * 8).is_multiple_of(bits) => *last * 8 / bits,
+                    Geometry::Packed(bits) => {
+                        return Err(format!(".{}: not {bits}-bit rows", data.suffix))
+                    }
+                    _ => *last * from / to,
+                };
             }
             shape
         }
         logical => logical_shape(logical, present, read)?,
     };
     let mut encoding = carrier.encoding.clone();
+    for (param, (key, default)) in &carrier.marker_params {
+        let value = match conf.and_then(|c| conf_get(c, key)) {
+            None => *default,
+            Some(v) => v
+                .as_u64()
+                .ok_or(format!("marker {key} is {v}, not a count"))?,
+        };
+        encoding.params.insert(param.clone(), Value::from(value));
+    }
+    let group = encoding.params.get("group_size").and_then(Value::as_u64);
     for (param, key) in &carrier.config_params {
         let stated = conf.and_then(|c| conf_get(c, key)).filter(|v| !v.is_null());
         let v = stated
@@ -786,8 +833,8 @@ fn fit(
                 rule.suffix, t.dtype, rule.dtypes
             ));
         }
-        let part_shape =
-            geometry(rule, t, &shape, block).map_err(|e| format!(".{}: {e}", rule.suffix))?;
+        let part_shape = geometry(rule, t, &shape, block, group)
+            .map_err(|e| format!(".{}: {e}", rule.suffix))?;
         parts.push(FoldedPart {
             role: rule.role.clone(),
             dtype: rule.stored.clone().unwrap_or_else(|| t.dtype.clone()),
@@ -807,15 +854,6 @@ fn fit(
     }
     if let (Producer::Comfy, Some(conf)) = (carrier.producer, conf) {
         marker_keys(carrier, conf)?;
-    }
-    for (param, (key, default)) in &carrier.marker_params {
-        let value = match conf.and_then(|c| conf_get(c, key)) {
-            None => *default,
-            Some(v) => v
-                .as_u64()
-                .ok_or(format!("marker {key} is {v}, not a count"))?,
-        };
-        encoding.params.insert(param.clone(), Value::from(value));
     }
     // A param naming an optional part's dtype is there exactly when the part is.
     for (param, role) in &carrier.dtype_params {
@@ -1322,13 +1360,17 @@ fn fold_group(set: &SourceSet, group: &Group, d: &Declared) -> Result<Folds> {
             }
             None => d.formats.clone(),
         };
-        let convrot = conf
+        let stated = conf
             .and_then(|c| conf_get(c, "convrot"))
-            .and_then(Json::as_bool)
-            .unwrap_or(false);
+            .and_then(Json::as_bool);
+        let convrot = stated.unwrap_or(false);
         let candidates: Vec<&&Carrier> = rows
             .iter()
-            .filter(|c| c.convrot == convrot && c.formats.iter().any(|f| formats.contains(f)))
+            .filter(|c| match c.rotated {
+                true => stated != Some(false),
+                false => c.convrot == convrot,
+            })
+            .filter(|c| c.formats.iter().any(|f| formats.contains(f)))
             .collect();
         let found = || {
             let found: Vec<String> = (present.values())
@@ -1344,7 +1386,11 @@ fn fold_group(set: &SourceSet, group: &Group, d: &Declared) -> Result<Folds> {
                     "{label}: {module} is {:?} format {formats:?}{}, which this import does not \
                      read (it reads {known:?}); found {}",
                     d.producer,
-                    if convrot { " with convrot" } else { "" },
+                    match stated {
+                        Some(true) => " with convrot",
+                        Some(false) => " with convrot: false",
+                        None => "",
+                    },
                     found()
                 ),
             );
