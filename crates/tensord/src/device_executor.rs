@@ -653,6 +653,7 @@ pub struct Frame {
     /// A group's followers' own plane facts, rank 1 first (None: not stated yet).
     pub rank_planes: Vec<Option<PlaneFacts>>,
     pub metrics: Option<Metrics>,
+    pub memory: Option<crate::memory::call::RequestMemory>,
     pub shortfall: Option<Shortfall>,
     pub stage: String,
     pub position: Option<u64>,
