@@ -252,7 +252,7 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
     let source_repo = format!("{account}/writer-source");
     runtime.block_on(async {
         let endpoint = Endpoint::new(&client, &origin, Some(bearer(home.token()))).unwrap();
-        upload_tree(&endpoint, &source_repo, &source_tree, &source_store, None)
+        upload_tree(&endpoint, &source_repo, &source_tree, &source_store, tensorfs::fetch::MAIN)
             .await
             .unwrap();
     });
@@ -357,11 +357,12 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
         let endpoint =
             Arc::new(Endpoint::new(&client, &origin, Some(bearer(home.token()))).unwrap());
         let (repo, _) = endpoint.repo(&destination).await.unwrap().unwrap();
-        let published = repo
-            .checkpoints
+        let published = &repo
+            .tags
             .iter()
-            .find(|tree| tree.id() == remote["revision"].as_str().unwrap())
-            .unwrap();
+            .find(|tag| !tag.public && tag.commit.id() == remote["revision"].as_str().unwrap())
+            .expect("the returned immutable revision is retained by a private tag")
+            .commit;
         let endpoint: Arc<dyn Origin> = endpoint;
         let fetcher = Fetcher::new(
             Arc::new(downloaded.clone()) as Arc<dyn ObjectStore>,
@@ -400,7 +401,7 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
             &refused_destination,
             &source_tree,
             &source_store,
-            None,
+            tensorfs::fetch::MAIN,
         )
         .await
         .unwrap();
@@ -505,7 +506,7 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
             Arc::new(Endpoint::new(&client, &origin, Some(bearer(home.token()))).unwrap());
         let (repo, _) = endpoint.repo(&retry_destination).await.unwrap().unwrap();
         assert!(
-            repo.checkpoints.contains(&retained_tree),
+            repo.tags.iter().any(|tag| !tag.public && tag.commit == retained_tree),
             "the retry did not publish its retained tree"
         );
         let endpoint: Arc<dyn Origin> = endpoint;
@@ -685,7 +686,7 @@ fn runtime_checkpoint_uploads_local_alias_on_disk() {
     );
     let repo = store.get_ref("local/output").unwrap().unwrap();
     assert!(
-        repo.checkpoints.contains(&tree),
+        repo.tags.iter().any(|tag| !tag.public && tag.commit == tree),
         "local repository lost its checkpoint"
     );
     let chosen = store
