@@ -129,14 +129,15 @@ fn pages_pin_evict_refill_and_survive_clean_owner_exit() {
         "same-layout/encoding/transform/rank/device".into(),
     )
     .expect("replacement metadata");
-    assert!(next
-        .import(
+    assert!(
+        next.import(
             1,
             "same-layout/encoding/transform/rank/device",
             &spans,
             container
         )
-        .expect("import"));
+        .expect("import")
+    );
     let retained = next.bind(1, 0).expect("imported bind");
     assert_eq!(bytes(&retained), data);
     assert!(!next.unregister(1).expect("close defers a live view"));
@@ -601,9 +602,10 @@ fn killed_owner_keeps_read_only_pages() {
     let (gpu, data) = test_page();
     assert_eq!(gpu.uuid().expect("replacement GPU"), holder);
     io::metrics::take();
-    assert!(gpu
-        .import(1, "slim-gpu-owned-view-test", &spans, container)
-        .expect("import after SIGKILL"));
+    assert!(
+        gpu.import(1, "slim-gpu-owned-view-test", &spans, container)
+            .expect("import after SIGKILL")
+    );
     assert!(
         io::metrics::take().is_empty(),
         "import must not refill the source"
@@ -616,4 +618,127 @@ fn killed_owner_keeps_read_only_pages() {
     synchronize();
     assert!(gpu.unregister(1).expect("release killed-owner page"));
     println!("PASS SIGKILL read-only page custody {holder}");
+}
+
+struct ConsumerGate(std::sync::Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>);
+
+impl ConsumerGate {
+    fn install(stream: usize) -> Self {
+        unsafe extern "C" fn hold(raw: *mut std::ffi::c_void) {
+            let state = unsafe {
+                Arc::from_raw(raw.cast::<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>())
+            };
+            let mut flags = state
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            flags.0 = true;
+            state.1.notify_all();
+            while !flags.1 {
+                flags = state
+                    .1
+                    .wait(flags)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+        let gate = Self(Arc::new((
+            std::sync::Mutex::new((false, false)),
+            std::sync::Condvar::new(),
+        )));
+        let raw = Arc::into_raw(gate.0.clone());
+        let (device, context) = io::cuda::primary_context(0).expect("gate context");
+        let guard = io::cuda::CtxGuard::enter(context).expect("gate context entry");
+        let code = unsafe {
+            (io::cuda::driver().expect("driver").launch_host_func)(
+                stream as io::cuda::CUstream,
+                hold,
+                raw.cast_mut().cast(),
+            )
+        };
+        if code != io::cuda::SUCCESS {
+            drop(unsafe { Arc::from_raw(raw) });
+        }
+        drop(guard);
+        io::cuda::check("cuDevicePrimaryCtxRelease", unsafe {
+            (io::cuda::driver().expect("driver").primary_ctx_release)(device)
+        })
+        .expect("release gate context");
+        io::cuda::check("cuLaunchHostFunc", code).expect("launch consumer gate");
+        let flags = gate.0.0.lock().expect("gate state");
+        let (flags, bound) = gate
+            .0
+            .1
+            .wait_timeout_while(flags, std::time::Duration::from_secs(10), |flags| !flags.0)
+            .expect("gate entry");
+        assert!(
+            !bound.timed_out() && flags.0,
+            "consumer callback did not enter its test gate"
+        );
+        drop(flags);
+        gate
+    }
+    fn release(&self) {
+        let mut flags = self
+            .0
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        flags.1 = true;
+        self.0.1.notify_all();
+    }
+}
+impl Drop for ConsumerGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[test]
+#[ignore = "requires an owned rental; never run on the local GPU"]
+fn retired_page_releases_custody_after_last_view() {
+    use std::os::fd::AsRawFd;
+    let uuid = one_device();
+    let (gpu, _) = test_page();
+    gpu.fill(1).expect("fill retired page");
+    let stream = io::cuda::Stream::new(0).expect("real consumer stream");
+    let pin = gpu.bind(1, stream.raw()).expect("external read view");
+    let (_, container) = gpu.export(1).expect("publish restart custody");
+    let receiver = std::os::unix::net::UnixStream::from(container);
+    let mut pending = 0_i32;
+    assert_eq!(
+        unsafe { libc::ioctl(receiver.as_raw_fd(), libc::FIONREAD, &mut pending) },
+        0
+    );
+    assert!(pending > 0, "export must contain a real queued CUDA handle");
+    let gate = ConsumerGate::install(stream.raw());
+    assert!(!gpu.unregister(1).expect("retire with a live consumer"));
+    let weak = Arc::downgrade(&gpu);
+    drop(gpu);
+    assert!(
+        weak.upgrade().is_some(),
+        "view retains the real allocation owner"
+    );
+    let releasing = std::thread::spawn(move || drop(pin));
+    gate.release();
+    releasing.join().expect("last-view teardown completes");
+    assert!(
+        weak.upgrade().is_none(),
+        "the retired allocation owner must be gone"
+    );
+    assert_eq!(
+        unsafe { libc::ioctl(receiver.as_raw_fd(), libc::FIONREAD, &mut pending) },
+        0
+    );
+    assert_eq!(
+        pending, 0,
+        "retired page must revoke its queued custody handle"
+    );
+    receiver
+        .set_nonblocking(true)
+        .expect("nonblocking custody read");
+    assert!(
+        platform::handles::recv_fd(&receiver).is_err(),
+        "no importable retired handle remains"
+    );
+    println!("PASS retired custody closes after last view completion {uuid}");
 }

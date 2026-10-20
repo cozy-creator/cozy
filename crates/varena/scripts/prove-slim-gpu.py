@@ -24,6 +24,7 @@ CASES = {
     "read_only_fault_is_contained_in_its_process": "PASS read-only VMM protection and healthy replacement",
     "cuda_oom_is_recovered_in_process": "PASS real CUDA OOM recovery",
     "killed_owner_keeps_read_only_pages": "PASS SIGKILL read-only page custody",
+    "retired_page_releases_custody_after_last_view": "PASS retired custody closes after last view completion",
 }
 
 
