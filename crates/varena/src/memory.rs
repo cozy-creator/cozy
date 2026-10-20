@@ -1287,7 +1287,8 @@ impl Drop for Inner {
         }
         let Ok(d) = crate::faults::hit("inner-drop-driver").and_then(|_| cuda::driver()) else { self.retain_resources(); return };
         let Ok(_c) = CtxGuard::enter(self.ctx) else { self.retain_resources(); return };
-        if self.check().is_err() || call!("cuStreamSynchronize", stream_synchronize(self.copy)).is_err() {
+        // SAFETY: our live stream in its current context. Drop cannot use the fallible macro.
+        if self.check().is_err() || cuda::check("cuStreamSynchronize", unsafe { (d.stream_synchronize)(self.copy) }).is_err() {
             self.retain_resources();
             return;
         }
