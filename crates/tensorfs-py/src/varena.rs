@@ -501,6 +501,32 @@ unsafe extern "C" fn capsule_destructor(capsule: *mut ffi::PyObject) {
     }
 }
 
+/// Normalize only the stream forms Varena can retain through final release. PTDS is fenced
+/// by its captured context; an unspecified GPU stream means CUDA's explicit legacy stream.
+fn pinned_dlpack_stream(gpu: bool, stream: Option<i64>) -> std::result::Result<Option<u64>, &'static str> {
+    match (gpu, stream) {
+        (false, None) => Ok(None),
+        (false, Some(_)) => Err("a CPU bound region accepts only stream=None"),
+        (true, None) => Ok(Some(1)),
+        (true, Some(stream)) if stream > 0 => Ok(Some(stream as u64)),
+        (true, Some(_)) => Err("a CUDA bound region requires stream=None, 1, 2, or a positive stream handle"),
+    }
+}
+
+#[cfg(test)]
+mod pinned_stream_tests {
+    use super::pinned_dlpack_stream;
+
+    #[test]
+    fn dlpack_stream_normalization_preserves_defaults_and_refuses_unknown_consumers() {
+        assert_eq!(pinned_dlpack_stream(false, None), Ok(None));
+        for stream in [-2, -1, 0, 1, 2, 1234] { assert!(pinned_dlpack_stream(false, Some(stream)).is_err()); }
+        assert_eq!(pinned_dlpack_stream(true, None), Ok(Some(1)));
+        for stream in [1, 2, 1234, i64::MAX] { assert_eq!(pinned_dlpack_stream(true, Some(stream)), Ok(Some(stream as u64))); }
+        for stream in [-2, -1, 0] { assert!(pinned_dlpack_stream(true, Some(stream)).is_err()); }
+    }
+}
+
 #[pymethods]
 impl PyPinned {
     /// `stream`: the consumer's, which also waits for the bytes (the bind stream already does).
@@ -513,7 +539,8 @@ impl PyPinned {
         if dl_device.is_some_and(|d| d != self.dl) {
             return Err(PyBufferError::new_err(format!("a bound region lives on {:?}", self.dl)));
         }
-        if let (Some(p), Some(s)) = (&self.pin.gpu, stream.filter(|&s| s > 0)) {
+        let stream = pinned_dlpack_stream(self.pin.gpu.is_some(), stream).map_err(PyBufferError::new_err)?;
+        if let (Some(p), Some(s)) = (&self.pin.gpu, stream) {
             py.detach(|| p.wait_on(s as u64)).or_raise(py)?;
         }
         let held = Box::into_raw(Box::new(Held { dims: [self.nbytes as i64, 1], _pin: self.pin.clone() }));

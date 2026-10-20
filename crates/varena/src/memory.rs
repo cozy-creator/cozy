@@ -4,7 +4,7 @@
 //! takes only unpinned pages whose fill and release events completed. Copies run on our own
 //! stream; consumers wait on events, the host never syncs.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{c_int, c_void};
 #[cfg(feature = "store")]
 use std::fs::File;
@@ -111,7 +111,7 @@ impl Events {
     fn recover(&self) -> Result<()> {
         let failed = self.failed.lock().unwrap().clone();
         for (_, stream) in &failed {
-            call!("cuStreamSynchronize", stream_synchronize(*stream as CUstream))?;
+            ConsumerFence::of(*stream).complete(self.ctx)?;
         }
         let released = {
             let mut held = self.failed.lock().unwrap();
@@ -140,6 +140,27 @@ impl Drop for Events {
 /// Wait on `ev` in `stream` (enqueued; the host does not wait).
 fn wait_in(stream: CUstream, ev: &Ev) -> Result<()> {
     call!("cuStreamWaitEvent", stream_wait_event(stream, ev.raw, 0))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsumerFence {
+    Stream(u64),
+    /// CUDA's per-thread default stream cannot be addressed from a later cleanup thread.
+    Context,
+}
+
+impl ConsumerFence {
+    fn of(stream: u64) -> Self {
+        if stream == 2 { Self::Context } else { Self::Stream(stream) }
+    }
+
+    fn complete(self, context: CUcontext) -> Result<()> {
+        let _context = CtxGuard::enter(context)?;
+        match self {
+            Self::Context => call!("cuCtxSynchronize", ctx_synchronize()),
+            Self::Stream(stream) => call!("cuStreamSynchronize", stream_synchronize(stream as CUstream)),
+        }
+    }
 }
 
 /// Keeps the events not yet passed; true when none is left.
@@ -382,6 +403,14 @@ impl Mapping {
         self.pins += 1;
         (self.va, self.fill.clone().expect("a bound mapping has a fill"), std::mem::take(&mut self.fresh))
     }
+
+    fn release(&mut self, events: Vec<EvRef>) {
+        self.pins -= 1;
+        if !events.is_empty() {
+            let _ = passed(&mut self.released);
+            self.released.extend(events);
+        }
+    }
 }
 
 struct Reg {
@@ -514,7 +543,8 @@ struct FailedPin {
     ws: Arc<WeightSet>,
     at: At,
     region: u32,
-    stream: u64,
+    streams: Vec<u64>,
+    events: Vec<EvRef>,
 }
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
@@ -739,10 +769,10 @@ impl Inner {
             let checked = self.checked_copies().and_then(|()| {
                 let _c = CtxGuard::enter(self.ctx)?;
                 for pin in &pins {
-                    call!(
-                        "cuStreamSynchronize",
-                        stream_synchronize(pin.stream as CUstream)
-                    )?;
+                    for stream in &pin.streams {
+                        ConsumerFence::of(*stream).complete(self.ctx)?;
+                    }
+                    for event in &pin.events { event.sync()?; }
                 }
                 Ok(())
             });
@@ -751,7 +781,7 @@ impl Inner {
                 return Err(error);
             }
             for pin in pins {
-                pin.ws.release(pin.at, pin.region, None);
+                pin.ws.release(pin.at, pin.region, Vec::new());
             }
         }
         self.recover_retired()
@@ -1350,9 +1380,9 @@ impl WeightSet {
             }
         };
         g.hurry(&fill);
-        let ready = fill.wait().inspect_err(|_| self.release(at, region, None))?;
+        let ready = fill.wait().inspect_err(|_| self.release(at, region, Vec::new()))?;
         let nbytes = self.weights.layout.regions[region as usize].nbytes;
-        let pinned = Pinned { ws: self.clone(), at, region, ptr, nbytes, fresh, writable, stream, ready };
+        let pinned = Pinned { ws: self.clone(), at, region, ptr, nbytes, fresh, writable, stream, ready, consumers: Consumers::new(stream) };
         if !pinned.ready.done()? {
             let s = stream as CUstream;
             let a = g.events.record(s, true)?;
@@ -1494,7 +1524,7 @@ impl WeightSet {
         self.gpu.inner.lock().set(self.id).busy = busy;
     }
 
-    fn release(&self, at: At, region: u32, ev: Option<EvRef>) {
+    fn release(&self, at: At, region: u32, events: Vec<EvRef>) {
         let mut st = self.gpu.inner.lock();
         let m = match at {
             At::Home => match st.reg(self.id, region) {
@@ -1503,11 +1533,7 @@ impl WeightSet {
             },
             At::Slot(i) => &mut st.slot(i).m,
         };
-        m.pins -= 1;
-        if let Some(e) = ev {
-            let _ = passed(&mut m.released);
-            m.released.push(e);
-        }
+        m.release(events);
     }
 }
 
@@ -1533,6 +1559,51 @@ enum At {
     Slot(usize),
 }
 
+/// Readiness does not fence later consumer work. Every stream that receives the pointer
+/// stays in the release set, including an already-ready or failed readiness request.
+struct Consumers(Mutex<BTreeSet<u64>>);
+
+impl Consumers {
+    fn new(bind: u64) -> Self { Self(Mutex::new(BTreeSet::from([bind]))) }
+
+    fn wait_on(&self, stream: u64, wait: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.0.lock().unwrap().insert(stream);
+        wait()
+    }
+
+    fn streams(&self) -> Vec<u64> { self.0.lock().unwrap().iter().copied().collect() }
+}
+
+/// Collect every consumer fence before releasing the ONE logical pin. A partial failure
+/// keeps successful fence owners too, rather than losing them at the first error.
+struct ConsumerRelease<E> {
+    streams: Vec<u64>,
+    events: Vec<E>,
+    failure: Option<Error>,
+}
+
+impl<E> ConsumerRelease<E> {
+    fn record(streams: Vec<u64>, mut record: impl FnMut(u64) -> Result<Option<E>>) -> Self {
+        let mut events = Vec::with_capacity(streams.len());
+        let mut failure = None;
+        for &stream in &streams {
+            match record(stream) {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => {},
+                Err(error) => { failure.get_or_insert(error); },
+            }
+        }
+        Self { streams, events, failure }
+    }
+
+    fn finish(self, release: impl FnOnce(Vec<E>), retain: impl FnOnce(Vec<u64>, Vec<E>, Error)) {
+        match self.failure {
+            Some(error) => retain(self.streams, self.events, error),
+            None => release(self.events),
+        }
+    }
+}
+
 /// A bound region: its pages stay mapped while it lives; dropping it records a release event.
 pub struct Pinned {
     ws: Arc<WeightSet>,
@@ -1545,6 +1616,7 @@ pub struct Pinned {
     pub writable: bool,
     stream: u64,
     ready: EvRef,
+    consumers: Consumers,
 }
 
 impl Pinned {
@@ -1556,31 +1628,34 @@ impl Pinned {
         self.ws.device()
     }
 
-    /// Make `stream` wait for the bytes too (a consumer other than the bind stream).
+    /// Make `stream` wait for the bytes and retain it for final release, even if ready.
+    /// CUDA PTDS (2) uses a captured-context completion fence after the final consumer drops.
     pub fn wait_on(&self, stream: u64) -> Result<()> {
-        if stream == self.stream || self.ready.done()? {
-            return Ok(());
-        }
-        let _c = CtxGuard::enter(self.ws.gpu.inner.ctx)?;
-        wait_in(stream as CUstream, &self.ready)
+        self.consumers.wait_on(stream, || {
+            if stream == self.stream || self.ready.done()? { return Ok(()); }
+            let _c = CtxGuard::enter(self.ws.gpu.inner.ctx)?;
+            wait_in(stream as CUstream, &self.ready)
+        })
     }
 }
 
 impl Drop for Pinned {
     fn drop(&mut self) {
         let g = &self.ws.gpu.inner;
-        match CtxGuard::enter(g.ctx).map_err(Error::from).and_then(|_c| g.events.record(self.stream as CUstream, false)) {
-            Ok(e) => self.ws.release(self.at, self.region, Some(e)),
-            Err(e) => {
-                g.retain();
-                g.retained.lock().unwrap().pins.push(FailedPin {
-                    ws: self.ws.clone(),
-                    at: self.at,
-                    region: self.region,
-                    stream: self.stream,
-                }); tracing::warn!("varena: retained pin owner after release could not be recorded, region {}: {e}", self.region);
+        let streams = self.consumers.streams();
+        let context = CtxGuard::enter(g.ctx).map_err(Error::from);
+        let release = ConsumerRelease::record(streams, |stream| {
+            context.as_ref().map_err(Clone::clone)?;
+            match ConsumerFence::of(stream) {
+                ConsumerFence::Context => ConsumerFence::Context.complete(g.ctx).map(|()| None),
+                ConsumerFence::Stream(stream) => g.events.record(stream as CUstream, false).map(Some),
             }
-        }
+        });
+        release.finish(|events| self.ws.release(self.at, self.region, events), |streams, events, error| {
+            g.retain();
+            g.retained.lock().unwrap().pins.push(FailedPin { ws: self.ws.clone(), at: self.at, region: self.region, streams, events });
+            tracing::warn!("varena: retained pin owner until every consumer release is checked, region {}: {error}", self.region);
+        });
     }
 }
 
@@ -1749,6 +1824,56 @@ mod completion_tests {
     fn fd_open((fd, dev, ino): (i32, u64, u64)) -> bool {
         // Inode identity makes this robust if a parallel test reuses the descriptor number.
         std::fs::metadata(format!("/dev/fd/{fd}")).is_ok_and(|m| m.dev() == dev && m.ino() == ino)
+    }
+
+    #[test]
+    fn readiness_fast_path_and_failed_wait_both_keep_the_consumer_release_set() {
+        let consumers = Consumers::new(11);
+        // The actual wait_on helper admits B before invoking readiness, including the
+        // already-ready early return. Readiness failure also cannot discard B's custody.
+        consumers.wait_on(22, || {
+            assert_eq!(consumers.streams(), vec![11, 22]);
+            Ok(())
+        }).unwrap();
+        consumers.wait_on(11, || Ok(())).unwrap();
+        let failure = consumers.wait_on(33, || {
+            assert_eq!(consumers.streams(), vec![11, 22, 33]);
+            Err(Error::Invalid("literal readiness failure".into()))
+        }).unwrap_err();
+        assert_eq!(failure.code(), "INVALID");
+        assert_eq!(consumers.streams(), vec![11, 22, 33]);
+        assert_eq!(ConsumerFence::of(1), ConsumerFence::Stream(1));
+        assert_eq!(ConsumerFence::of(2), ConsumerFence::Context);
+        assert_eq!(ConsumerFence::of(1234), ConsumerFence::Stream(1234));
+    }
+
+    #[test]
+    fn consumer_partial_failure_retains_actual_owners_and_releases_the_pin_only_once() {
+        let (source, fd) = source_owner();
+        let observed = Arc::downgrade(&source);
+        let mut seen = Vec::new();
+        let release = ConsumerRelease::record(vec![11, 22, 33, 44], |stream| {
+            seen.push(stream);
+            if stream == 22 { Err(Error::Invalid("literal release failure".into())) }
+            else { Ok(Some(source.clone())) }
+        });
+        drop(source);
+        let mut map = Mapping { pins: 1, ..Default::default() };
+        let mut retained = None;
+        release.finish(|_| map.release(Vec::new()), |streams, owners, error| retained = Some((streams, owners, error)));
+        assert_eq!(seen, vec![11, 22, 33, 44], "a failed fence skipped later consumers");
+        assert_eq!(map.pins, 1, "partial success released the logical pin");
+        let (streams, owners, error) = retained.unwrap();
+        assert_eq!(streams, seen);
+        assert_eq!(owners.len(), 3);
+        assert_eq!(error.code(), "INVALID");
+        assert!(observed.upgrade().is_some() && fd_open(fd));
+        drop(owners);
+        assert!(observed.upgrade().is_none() && !fd_open(fd));
+
+        let release = ConsumerRelease::<()>::record(vec![11, 22, 33], |_| Ok(None));
+        release.finish(|_| map.release(Vec::new()), |_, _, _| panic!("all fences succeeded"));
+        assert_eq!(map.pins, 0, "consumer count changed the logical release count");
     }
 
     #[test]
