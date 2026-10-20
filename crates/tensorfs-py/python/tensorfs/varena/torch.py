@@ -1419,9 +1419,9 @@ class Memory:
 
     def _restore(self) -> None:
         """At an explicit load: the watermarks rise. Warm models refill most worth keeping
-        first, into free room and then cold pages of this process's models worth less, always
-        leaving the largest reserve and a streamed model's slots. The copies are prefetches: an
-        ask evicts them at once."""
+        first, into free room and then cold pages of this process's models worth less with no
+        declared use, always leaving the largest reserve and a streamed model's slots. The
+        copies are prefetches: an ask evicts them at once."""
         models = list(self.models.values())
         slots = max(
             (_SLOTS * max(_sizes(m), default=0) for m in models if m.repeats < 2), default=0
@@ -1431,7 +1431,7 @@ class Memory:
         for i, model in enumerate(ranked):
             if model.level is not Level.GPU:
                 return
-            lower = [m for m in ranked[i + 1 :] if not m.flight and not m.held]
+            lower = [m for m in ranked[i + 1 :] if self._spare(m)]
             for b in model.order:
                 block = model.blocks[b]
                 if b in model.home and _resident(model, b):
@@ -1458,7 +1458,8 @@ class Memory:
         the current step does not need: its pages not yet resident, a streamed model's slots and
         its measured activation peak. Unmeasured, the current step gets no prefetch beside it;
         once demand made room in a step, nothing refills it until the plan moves on. Victims are
-        pages with a later declared use or none. The copies run on the core's copy stream."""
+        only pages with no declared use: a page needed later goes only for the running step's
+        demand. The copies run on the core's copy stream."""
         if not self.cuda:
             return
         self._now()
@@ -1479,11 +1480,8 @@ class Memory:
         slots = max((_SLOTS * max(_sizes(m)) for m in now if m.home != set(m.order)), default=0)
         room = self._free() - owed - slots - max(peaks, default=0)
         later = [m for m in models if near[m] < math.inf and m not in now]
+        victims = sorted(filter(self._spare, models), key=self._keep)
         for model in sorted(later, key=near.get):
-            victims = sorted(
-                (v for v in models if near[v] > near[model] and not (v.flight or v.held)),
-                key=self._keep,
-            )
             for block in (model.common, *(model.blocks[b] for b in model.order)):
                 if all(model.ws.resident(r) for r in block.regions):
                     continue
@@ -1503,6 +1501,11 @@ class Memory:
                         self.landing.setdefault(model, set()).add(region)
                 except DeviceFull:
                     return
+
+    def _spare(self, model: Model) -> bool:
+        """Its pages may go for a restore or prefetch: nothing runs or holds it and no declared
+        plan uses it again."""
+        return not (model.flight or model.held) and self._distance(model) == math.inf
 
     def _need(self, model: Model) -> int:
         """Torch bytes a pass of `model` takes above its start: the running shape's measured

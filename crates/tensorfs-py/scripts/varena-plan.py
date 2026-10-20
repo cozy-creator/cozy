@@ -11,7 +11,7 @@ H3 ref2va_turbo 5 s runs with its declared plan, cold then warm, at the sizes of
 11951-11955 on 2x RTX 4090: 24 GiB on one GPU; an 8 GiB limit on the 24 GiB card with a gone
 executor's kept pages over the limit (11955). 8 GiB at 2 GPUs is one such memory per GPU.
 
-Each request must complete, and: no restore evicts a page of the step running; no prefetch
+Each request must complete, and: no restore evicts a page with a declared use; no prefetch
 refills a step after demand made room in it; no region comes back twice in a step; the bytes
 moved stay within one read per pass plus one prefetch per model; on 24 GiB the warm DiT reads
 nothing after its first pass. Kept pages no process uses go back on demand. A failed request
@@ -454,7 +454,7 @@ def plan_checks(case: str, mem: vt.Memory, core: Core, since: int, moved: int, s
         demanded, restored = False, Counter()
         for e in events:
             if e[0] == "evicted":
-                if e[2] == "restore" and e[4] == 0:
+                if e[2] == "restore" and e[4] < float("inf"):
                     restore_now.append(e)
                 demanded |= e[2] != "restore"
             elif e[0] in ("prefetch", "stream") and e[1] not in current[step]:
@@ -462,7 +462,7 @@ def plan_checks(case: str, mem: vt.Memory, core: Core, since: int, moved: int, s
                 if demanded:
                     refill.append(e)
         twice += [k for k, n in restored.items() if n > 1]
-    check(f"{case}: no restore evicts the current step", not restore_now, restore_now[:3])
+    check(f"{case}: no restore evicts a page with a declared use", not restore_now, restore_now[:3])
     check(f"{case}: no prefetch refills a step after demand", not refill, refill[:3])
     check(f"{case}: no region restored twice in a step", not twice, twice[:3])
     sizes = {ws.name.rsplit("/", 1)[-1]: ws.nbytes for ws in core.sets}
