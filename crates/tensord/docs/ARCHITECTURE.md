@@ -24,7 +24,7 @@ PyTorch model.
 TensorFS `Store::ensure_owned` retains the store claim through live handles and read leases,
 coordinates GC pins and excludes outside collectors. Cooperating ordinary processes can
 still share its store for reads and writes. Its
-[TensorFS storage guide](../../tensorfs/README.md#storage-and-ownership)
+[TensorFS storage guide](../../tensorfs-py/README.md#storage-and-ownership)
 describes storage and retention. TensorD retains the node-specific sealed memfd cache and
 peer/process leases. [Recovery](RECOVERY.md) distinguishes
 executor replacement, daemon restart and software activation guarantees.
