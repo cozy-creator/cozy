@@ -768,7 +768,7 @@ impl Pool {
                 &physical.device_uuid, physical.memory_bytes, limit, host_cache.clone())
                 .map_err(io::Error::other)?);
             tracing::info!(gpu = %physical.device_uuid, physical_bytes = physical.memory_bytes,
-                configured_limit_bytes = config.gpu_memory_limit,
+                configured_limit_bytes = config.gpu_memory_limit.unwrap_or(0), generation = %incarnation,
                 effective_limit_bytes = placement.as_ref().expect("placement").capacity(),
                 "GPU memory capacity");
             devices.push(Device {
