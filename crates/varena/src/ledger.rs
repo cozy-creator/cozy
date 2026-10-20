@@ -1424,11 +1424,10 @@ struct RamFill {
 }
 impl Drop for RamFill {
     fn drop(&mut self) {
-        let room = self
-            .host
-            .can_warm(platform::contain::host_memory::read().available, 0);
+        let available = platform::contain::host_memory::read().available;
         let observers = {
             let mut state = self.host.state.lock();
+            let room = state.can_warm(available, 0);
             self.ram.filling.store(false, Release);
             self.ram.pending.store(false, Release);
             state.clock = state.clock.saturating_add(1);
