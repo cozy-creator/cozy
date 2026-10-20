@@ -603,7 +603,7 @@ impl Machines {
     /// it could only fail once it was.
     pub(crate) fn admit(&self, submit: &SubmitRun) -> Result<(), Error> {
         let signed_out = || {
-            config::Origin::parse(&submit.hub).is_ok_and(|hub| self.device_key(&hub).is_err())
+            config::Origin::parse(&submit.hub).is_ok_and(|hub| self.hubs.client(hub.as_str()).is_err())
         };
         match &submit.on {
             On::New(_) if signed_out() => Err(crate::rentals::signed_out(&submit.hub)),
