@@ -323,7 +323,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "`first-last,…` inclusive; empty: nothing"
+                "description": "`first-last,\u2026` inclusive; empty: nothing"
               }
             }
           }
@@ -770,7 +770,7 @@
           },
           "source": {
             "type": "string",
-            "description": "A provider source (`civitai://<version>`, `hf://…`) made here and normalized at ingest,\nunder these reviewed `profiles` (none: the one its headers select); never with `model`.",
+            "description": "A provider source (`civitai://<version>`, `hf://\u2026`) made here and normalized at ingest,\nunder these reviewed `profiles` (none: the one its headers select); never with `model`.",
             "default": ""
           }
         }
@@ -803,7 +803,7 @@
           },
           "source": {
             "type": "string",
-            "description": "`handler`, or what the Runtime applied: `policy`, `checkpoint:…`, `adapter:…`.",
+            "description": "`handler`, or what the Runtime applied: `policy`, `checkpoint:\u2026`, `adapter:\u2026`.",
             "default": ""
           }
         }
@@ -1152,6 +1152,13 @@
             "type": "string",
             "description": "discrete, coherent (GH200, GB200), unified (GB10); empty: unread.",
             "default": ""
+          },
+          "memory_limit_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Effective memory offered by this machine; zero means the whole physical card.",
+            "default": 0,
+            "minimum": 0
           },
           "name": {
             "type": "string",

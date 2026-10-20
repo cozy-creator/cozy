@@ -114,6 +114,10 @@ pub struct MachineConfig {
     pub object_storage_hosts: Vec<String>,
     /// CUDA_VISIBLE_DEVICES: indices or UUIDs; empty is no GPU.
     pub visible_devices: Option<String>,
+    /// The most memory each GPU offers, below its own (`8GiB` or bytes): a larger card stands in
+    /// for a smaller one (`cozy machine update --gpu-memory-limit`).
+    #[serde(deserialize_with = "size")]
+    pub gpu_memory_limit: Option<u64>,
 }
 
 impl MachineConfig {
@@ -139,6 +143,42 @@ fn list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error>
         List::Spelled(text) => split(&text),
         List::Items(items) => items,
     })
+}
+
+fn size<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Size {
+        Bytes(u64),
+        Spelled(String),
+    }
+    match Option::<Size>::deserialize(d)? {
+        None => Ok(None),
+        Some(Size::Bytes(n)) => Ok(Some(n)),
+        Some(Size::Spelled(text)) => parse_size(&text).map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+/// A size as people write it: bytes, or a number of `KiB`, `MiB`, `GiB` or `TiB` (any case,
+/// with or without a space): `8GiB`, `1.5 GiB`, `512MiB`.
+pub fn parse_size(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let digits = text.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(text.len());
+    let (number, unit) = text.split_at(digits);
+    let shift = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "kib" => 10,
+        "mib" => 20,
+        "gib" => 30,
+        "tib" => 40,
+        _ => return Err(format!("{text:?} is not a size: write bytes or KiB, MiB, GiB, TiB (8GiB)")),
+    };
+    let value: f64 = number.parse().map_err(|_| format!("{text:?} is not a size: no number"))?;
+    let bytes = value * (1u64 << shift) as f64;
+    if !bytes.is_finite() || bytes < 0.0 || bytes >= i64::MAX as f64 {
+        return Err(format!("{text:?} is outside the supported size range"));
+    }
+    Ok(bytes as u64)
 }
 
 fn split(text: &str) -> Vec<String> {
@@ -476,6 +516,19 @@ mod tests {
 
     fn parse(text: &str) -> (Config, Vec<String>) {
         Config::parse(text, "config.toml").unwrap()
+    }
+
+    #[test]
+    fn a_gpu_memory_limit_reads_as_bytes_or_a_size() {
+        for (text, bytes) in [("8GiB", 8 << 30), ("1.5 gib", 3 << 29), ("512MiB", 512 << 20), ("4096", 4096)] {
+            assert_eq!(parse_size(text), Ok(bytes), "{text}");
+        }
+        assert!(parse_size("8GB").is_err() && parse_size("GiB").is_err());
+        let limit = |text: &str| parse(text).0.machine.gpu_memory_limit;
+        assert_eq!(limit("[machine]\ngpu_memory_limit = \"8GiB\"\n"), Some(8 << 30));
+        assert_eq!(limit("[machine]\ngpu_memory_limit = 1073741824\n"), Some(1 << 30));
+        assert_eq!(limit(""), None);
+        assert!(Config::parse("[machine]\ngpu_memory_limit = \"lots\"\n", "config.toml").is_err());
     }
 
     #[test]

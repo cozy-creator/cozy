@@ -793,6 +793,8 @@ pub struct Gpu {
     pub family: String,
     /// discrete, coherent (GH200, GB200), unified (GB10); empty: unread.
     pub memory_class: String,
+    /// Effective memory offered by this machine; zero means the whole physical card.
+    pub memory_limit_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ToSchema)]

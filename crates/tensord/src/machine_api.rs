@@ -1394,6 +1394,7 @@ print(json.dumps({"identity": generation.identity}))
                     command(
                         &mut executor,
                         &DeviceCommand::Start {
+                            authorized_device_limit_bytes: None,
                             devices: String::new(),
                             application: held.record.application.clone(),
                             package_interface: interface.clone(),

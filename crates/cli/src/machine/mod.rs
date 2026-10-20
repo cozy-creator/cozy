@@ -82,6 +82,10 @@ enum Verb {
         /// on `local` it becomes this computer's cozy, which `cozy update` returns to a release.
         #[arg(long, value_name = "FILE|URL")]
         tensord: Option<std::path::PathBuf>,
+        /// Use at most this much of each GPU's memory (`8GiB`), as a smaller card would; `none`
+        /// lifts it. The machine keeps it in its config, across updates and restarts.
+        #[arg(long, value_name = "SIZE|none", value_parser = gpu_memory_limit)]
+        gpu_memory_limit: Option<u64>,
     },
     /// A machine's build toolchain, for cards no prebuilt kernel serves.
     Toolchain {
@@ -133,13 +137,25 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             runtime_wheel,
             tensorfs_wheel,
             tensord,
-        } => end::update(ctx, &name, runtime_wheel, tensorfs_wheel, tensord).await,
+            gpu_memory_limit,
+        } => end::update(ctx, &name, runtime_wheel, tensorfs_wheel, tensord, gpu_memory_limit).await,
         Verb::Toolchain {
             verb: ToolchainVerb::Install { on },
         } => end::toolchain(ctx, &on).await,
         Verb::Enable => local::enable(ctx).await,
         Verb::Disable => local::disable(ctx).await,
         Verb::Authorize { public_key } => local::authorize(ctx, &public_key),
+    }
+}
+
+/// `--gpu-memory-limit`: a size, or `none` (0, which the machine reads as no limit).
+fn gpu_memory_limit(text: &str) -> Result<u64, String> {
+    match text {
+        "none" | "off" => Ok(0),
+        size => match protocol::config::parse_size(size)? {
+            0 => Err("a limit of 0 bytes: write `none` to lift it".into()),
+            bytes => Ok(bytes),
+        },
     }
 }
 
@@ -224,4 +240,31 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_gpu_memory_limit_is_a_size_or_off_and_shows_beside_the_card() {
+        for gib in [6, 8, 12, 24] { assert_eq!(gpu_memory_limit(&format!("{gib}GiB")), Ok(gib << 30)); }
+        assert_eq!(gpu_memory_limit("none"), Ok(0));
+        assert_eq!(gpu_memory_limit("off"), Ok(0));
+        for bad in ["0", "8GB", "-1GiB", "99999999999999999999TiB", "0.00000000001GiB"] { assert!(gpu_memory_limit(bad).is_err(), "{bad}"); }
+        let gpu = |limit| protocol::calcifer::Gpu {
+            index: 0,
+            name: "RTX 5070".into(),
+            memory_bytes: 12 << 30,
+            memory_limit_bytes: limit,
+            ..Default::default()
+        };
+        let field = |gpus| {
+            let status = protocol::calcifer::MachineStatus { gpus, ..Default::default() };
+            status_fields(&status).into_iter().find(|(k, _)| k == "gpu memory limit").map(|(_, v)| v)
+        };
+        assert_eq!(field(vec![gpu(8 << 30), protocol::calcifer::Gpu { index: 1, ..gpu(8 << 30) }]).as_deref(),
+            Some("8.0 GiB of GPU 0's 12 GiB, GPU 1's 12 GiB"));
+        assert_eq!(field(vec![gpu(0)]), None);
+    }
 }

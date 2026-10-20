@@ -63,6 +63,7 @@ fn config(generation: &Generation, hold: &File, root: &Path, name: &str) -> Exec
 
 fn start(generation: &Generation, interface: &Path, import_only: bool) -> DeviceCommand {
     DeviceCommand::Start {
+        authorized_device_limit_bytes: None,
         devices: String::new(),
         application: generation.application.clone(),
         package_interface: interface.to_path_buf(),

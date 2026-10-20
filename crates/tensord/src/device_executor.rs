@@ -176,6 +176,9 @@ pub enum DeviceCommand {
     Shutdown,
     Start {
         devices: String,
+        /// Applied after ranks spawn; import-only parents never initialize CUDA.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        authorized_device_limit_bytes: Option<u64>,
         application: String,
         package_interface: PathBuf,
         sequence_parallel_degree: u32,
@@ -2223,7 +2226,8 @@ mod codec_tests {
             assert_eq!(received["tensorfs"]["token"], "supplied-test-bearer");
             assert!(!format!("{command:?}").contains("supplied-test-bearer"));
         }
-        let start = DeviceCommand::Start { devices: String::new(), application: "module:app".into(),
+        let start = DeviceCommand::Start {
+            authorized_device_limit_bytes: None, devices: String::new(), application: "module:app".into(),
             package_interface: PathBuf::from("interface.json"), sequence_parallel_degree: 1,
             import_only: true, call_interfaces: vec![], constructions: vec![] };
         let (mut machine, mut runtime) = platform::ipc::pair().unwrap();

@@ -516,7 +516,8 @@ class Memory:
     """One native page manager per device. Python only supplies declarations and hooks."""
 
     def __init__(
-        self, device: torch.device, grant: tuple[int, int, int] | None
+        self, device: torch.device, grant: tuple[int, int, int] | None,
+        *, limit_bytes: int | None = None,
     ) -> None:
         self.device = device
         self.gpu = (device.index or 0) if device.type == "cuda" else -1
@@ -532,17 +533,20 @@ class Memory:
         self._ids = itertools.count(1)
         self._names: dict[int, str] = {}
         self.context = 0
+        self.limit_bytes = limit_bytes
         self.measure: Callable[[], int | None] = lambda: None
         self.memo = cuts.Memo()
         cuts.serve(self.memo, self)
         if self.native is not None:
             self.native.trim_with(self._trim)
+            self._measure()
 
     @classmethod
     def open(
         cls,
         device: torch.device | None = None,
         grant: tuple[int, int, int] | None = None,
+        *, limit_bytes: int | None = None,
     ) -> Memory:
         if device is None:
             device = (
@@ -550,7 +554,7 @@ class Memory:
                 if torch.cuda.is_available()
                 else torch.device("cpu")
             )
-        return cls(device, grant)
+        return cls(device, grant, limit_bytes=limit_bytes)
 
     @property
     def cuda(self) -> bool:
@@ -574,9 +578,10 @@ class Memory:
         )
         self.native.allocator(context, allocated, reserved)
         total = torch.cuda.get_device_properties(self.gpu).total_memory
-        torch.cuda.set_per_process_memory_fraction(
-            min(self.native.allocator_budget() / total, 1.0), self.gpu
-        )
+        budget = self.native.allocator_budget()
+        if self.limit_bytes is not None:
+            budget = min(budget, self.limit_bytes)
+        torch.cuda.set_per_process_memory_fraction(min(budget / total, 1.0), self.gpu)
 
     def load(
         self,

@@ -565,6 +565,13 @@ pub struct Gpu {
     pub family: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_class: Option<String>,
+    /// Effective memory offered by the machine; zero means the whole physical card.
+    #[serde(default, skip_serializing_if = "unlimited")]
+    pub memory_limit_bytes: u64,
+}
+
+fn unlimited(bytes: &u64) -> bool {
+    *bytes == 0
 }
 
 /// A model repository the machine holds.

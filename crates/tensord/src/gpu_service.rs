@@ -81,6 +81,9 @@ pub struct GpuConfig {
     pub inventory: Vec<crate::machine::receipt::Gpu>,
     /// Load's device limit where NVML cannot read the device total.
     pub authorized_device_limit_bytes: Option<u64>,
+    /// Persistent per-machine cap; inventory retains the real card size.
+    #[serde(default)]
+    pub gpu_memory_limit: Option<u64>,
     #[serde(default)]
     pub memory: MemoryConfig,
     /// Explicitly configured locations; the executor seal is imposed on top of them.
@@ -757,9 +760,17 @@ impl Pool {
                 .filter(|gpu| gpu.memory_bytes > 0 && !gpu.device_uuid.is_empty())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,
                     format!("GPU {entry} needs an inventory UUID and a nonzero memory capacity")))?;
+            let limit = match (config.authorized_device_limit_bytes, config.gpu_memory_limit.filter(|&n| n > 0)) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             let placement = Some(crate::memory::slim::Memory::create_with_host(
-                &physical.device_uuid, physical.memory_bytes, config.authorized_device_limit_bytes, host_cache.clone())
+                &physical.device_uuid, physical.memory_bytes, limit, host_cache.clone())
                 .map_err(io::Error::other)?);
+            tracing::info!(gpu = %physical.device_uuid, physical_bytes = physical.memory_bytes,
+                configured_limit_bytes = config.gpu_memory_limit,
+                effective_limit_bytes = placement.as_ref().expect("placement").capacity(),
+                "GPU memory capacity");
             devices.push(Device {
                 entry: entry.clone(),
                 memory: GpuMemory::start(entry, &memory, &learned, notes.clone()).with_placement(placement),
@@ -956,7 +967,7 @@ impl Pool {
     /// memory before any. None when the inventory names no memory.
     pub fn budget(&self, degree: u32, constructions: &[String]) -> Option<u64> {
         let lane = &self.devices[..self.devices.len().min(degree as usize)];
-        let memory = lane.iter().map(|d| self.inventory(&d.entry).map(|g| g.memory_bytes)).min()??;
+        let memory = self.device_limit(lane)?;
         let peak = lane.iter().flat_map(|d| constructions.iter().filter_map(|c| d.memory.with(|g| g.learned.peak(c)))).max();
         Some(memory.saturating_sub(peak.unwrap_or(memory / 4)))
     }
@@ -2619,6 +2630,7 @@ impl Pool {
             let interface = self.interface_file(&executor, held)?;
             let reply = executor.command(
                 &DeviceCommand::Start {
+                    authorized_device_limit_bytes: None,
                     devices: self.lane_devices(0, self.devices.len().min(1) as u32)?,
                     application: held.record.application.clone(),
                     call_interfaces: crate::calls::call_interfaces(held, &interface),
@@ -3054,6 +3066,7 @@ impl Pool {
                 .grant_unbound().map_err(io::Error::other)).collect::<io::Result<Vec<_>>>()?;
             let started = command_ok(session.executor.command_with_grants(
                 &DeviceCommand::Start {
+                    authorized_device_limit_bytes: self.device_limit(gpus),
                     devices: lane.clone(),
                     application: held.record.application.clone(),
                     package_interface: interface_path.clone(),
@@ -3107,7 +3120,7 @@ impl Pool {
                     }),
                     budgets: Budgets::default(),
                     models: vec![],
-                    authorized_device_limit_bytes: None,
+                    authorized_device_limit_bytes: self.device_limit(gpus),
                     attention_pin: String::new(),
                     pinned_bytes: None,
                     device_weights: false,
@@ -4467,6 +4480,24 @@ mod tests {
     }
 
     #[test]
+    fn a_persistent_cap_bounds_every_ledger_and_plan_without_rewriting_inventory() {
+        // Scheduler bookkeeping only; actual GPU enforcement is a hardware gate.
+        for limit in [6u64 << 30, 8 << 30, 24 << 30] {
+            let (root, pool, _) = pool_with_limit(2, Some(limit));
+            let effective = limit.min(8 << 30);
+            assert_eq!(pool.device_limit(pool.lane(0, 2).unwrap()), Some(effective));
+            for device in &pool.devices {
+                assert_eq!(device.memory.placement().unwrap().status().unwrap().capacity, effective);
+                assert_eq!(pool.inventory(&device.entry).unwrap().memory_bytes, 8 << 30);
+            }
+            assert!(pool.budget(2, &[]).unwrap() <= effective);
+            pool.stop().unwrap();
+            drop(pool);
+            crate::scratch::remove(&root);
+        }
+    }
+
+    #[test]
     fn incomplete_inventory_fails_at_start_instead_of_queueing_forever() {
         for inventory in [
             json!([]),
@@ -4488,6 +4519,9 @@ mod tests {
     /// A CPU scheduler fixture with explicit GPU identities/capacities. This tests queue
     /// bookkeeping only and never claims GPU execution or placement qualification.
     fn pool_of(width: usize) -> (PathBuf, Arc<Pool>, Arc<Engine>) {
+        pool_with_limit(width, None)
+    }
+    fn pool_with_limit(width: usize, limit: Option<u64>) -> (PathBuf, Arc<Pool>, Arc<Engine>) {
         let root = std::env::temp_dir().join(format!("gpu-place-{}", uuid::Uuid::new_v4()));
         let unique = uuid::Uuid::new_v4().simple().to_string();
         let devices: Vec<_> = (0..width).map(|gpu| format!("GPU-test-{unique}-{gpu}")).collect();
@@ -4496,7 +4530,7 @@ mod tests {
             "driver_version":"fixture","memory_bytes":8u64<<30,"pci_bus_id":"fixture"
         })).collect();
         let config: GpuConfig = serde_json::from_value(json!({"devices": devices.join(","),
-            "inventory":inventory,"authorized_device_limit_bytes": null, "prespawn": false})).unwrap();
+            "inventory":inventory,"authorized_device_limit_bytes": null, "gpu_memory_limit":limit,"prespawn": false})).unwrap();
         let store = crate::storage::open(&root.join("store")).unwrap();
         let pool = Pool::new(&root.join("gpu"), config, store).unwrap();
         let engine = Engine::open(&root.join("execution")).unwrap();

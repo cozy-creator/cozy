@@ -48,6 +48,8 @@ struct Cohort {
     toolchain: Option<String>,
     /// The `cozy` release the caller installed at the machine's launch path (`cozy update`).
     cozy: Option<String>,
+    /// The most memory each GPU offers, in bytes; 0 lifts it (`--gpu-memory-limit`).
+    gpu_memory_limit: Option<u64>,
     /// A dev `cozy` binary (`--tensord`): the `binary` input's file, or `{url, sha256}`.
     binary: Option<Member>,
     #[serde(flatten)]
@@ -228,12 +230,17 @@ fn stage(
             return Err(Error::validation("toolchain_unknown", format!("the toolchain is installed, not {other:?}")));
         }
     };
+    let limit = cohort.gpu_memory_limit;
+    if limit.is_some_and(|bytes| bytes > i64::MAX as u64) {
+        return Err(Error::validation("gpu_memory_limit_invalid", "GPU memory limit exceeds the configuration's supported size"));
+    }
     let request = Request {
         operation: id.into(),
         pin: None,
         runtime: choose("runtime", cohort.runtime)?,
         tensorfs: choose("tensorfs", cohort.tensorfs)?,
         cozy: cohort.cozy,
+        gpu_memory_limit: limit,
         binary,
         toolchain,
     };

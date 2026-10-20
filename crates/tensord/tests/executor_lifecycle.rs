@@ -77,6 +77,7 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
     .unwrap();
     for command in [
         DeviceCommand::Start {
+            authorized_device_limit_bytes: None,
             devices: String::new(),
             application: generation.application.clone(),
             package_interface: interface.clone(),
@@ -486,6 +487,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
     .unwrap();
     for command in [
         DeviceCommand::Start {
+            authorized_device_limit_bytes: None,
             devices: String::new(),
             application: generation.application.clone(),
             package_interface: interface.clone(),
