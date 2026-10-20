@@ -1992,6 +1992,9 @@ impl Pool {
     fn fits(&self, plan: &str, device: usize) -> bool {
         self.devices[device].memory.fits(plan, Vec::new)
     }
+    #[cfg(not(unix))]
+    fn watch_memory(self: &Arc<Self>, _: &Arc<Engine>) {}
+    #[cfg(unix)]
     fn watch_memory(self: &Arc<Self>, engine: &Arc<Engine>) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else { return; };
         let mut watchers = self.memory_watchers.lock().unwrap();
