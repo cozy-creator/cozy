@@ -20,6 +20,8 @@ const CASES: &[&str] = &[
     "last_pin",
     "healthy_drain",
     "unregister",
+    "secondary_consumer_ready_positive",
+    "secondary_consumer_partial_record_negative",
 ];
 
 #[derive(Default)]
@@ -215,6 +217,8 @@ fn gated_cuda_custody() {
         "last_pin" => last_pin(),
         "healthy_drain" => healthy_drain(),
         "unregister" => unregister(),
+        "secondary_consumer_ready_positive" => secondary_consumer(false),
+        "secondary_consumer_partial_record_negative" => secondary_consumer(true),
         _ => unreachable!(),
     }
     let mut dev = 0;
@@ -858,4 +862,156 @@ fn unregister() {
     consumer.enqueue(va);
     consumer.verify(&gpu, set.byte);
     gate.check();
+}
+
+/// The producer is genuinely complete before B admission. Only B's real read is gated;
+/// A is distinct and proven complete, so neither the ready shortcut nor A alone can cover B.
+fn secondary_consumer(negative: bool) {
+    let (gpu, a) = setup();
+    let b = Consumer::new(&gpu);
+    let mut set = SetFixture::new(&gpu, true, true, 0x5a);
+    let id = set.ws().id;
+    let produced = crate::faults::phases::watch("job-owner-dropped");
+    let va = warm(&gpu, &set, true);
+    phase(produced, "secondary producer owner released");
+    let pin = set.ws().bind(0, a.stream).unwrap();
+    assert_eq!(pin.ptr, va);
+    let ready = {
+        let _c = CtxGuard::enter(gpu.inner.ctx).unwrap();
+        pin.ready.done().unwrap()
+    };
+    assert!(
+        ready,
+        "producer must be complete before ready-fastpath admission"
+    );
+    sync(&gpu, a.stream as CUstream);
+    let handles = {
+        let mut st = gpu.inner.lock();
+        st.reg(id, 0)
+            .unwrap()
+            .map
+            .as_ref()
+            .unwrap()
+            .chunks
+            .iter()
+            .map(|c| c.handle)
+            .collect::<Vec<_>>()
+    };
+    let ws = Arc::downgrade(set.ws());
+    let g = Arc::downgrade(&gpu);
+    let dropped = crate::faults::phases::watch("pin-drop");
+    let closing = (!negative).then(|| crate::faults::phases::watch("set-close-fences"));
+    let _c = CtxGuard::enter(gpu.inner.ctx).unwrap();
+    // All streams, registrations, mappings, buffers and event resources now exist.
+    let gate = Gate::arm(b.stream as CUstream);
+    pin.wait_on(b.stream).unwrap();
+    assert_eq!(consumer_ids(&pin), [a.stream, b.stream]);
+    assert!(pin.ready.done().unwrap());
+    println!("VARENA_GPU_PHASE {{\"phase\":\"secondary_consumer_admitted_ready\"}}");
+    b.enqueue(va);
+    let pending = gpu
+        .inner
+        .events
+        .record(b.stream as CUstream, false)
+        .unwrap();
+    assert!(
+        !pending.done().unwrap(),
+        "gate did not hold the real B read"
+    );
+    drop(set.ws.take()); // The actual Pinned is now the last external WeightSet owner.
+    if negative {
+        // The known list is [A,B]. A really records and drains; only B's second record
+        // and second fallback drain fail, after its real read was enqueued.
+        crate::faults::arm("pin-release", 2);
+        crate::faults::arm("pin-release-drain", 2);
+        drop(pin);
+        phase(dropped, "actual partial all-stream Pinned Drop");
+        assert!(!pending.done().unwrap());
+        let partial = {
+            let custody = gpu.inner.custody.lock().unwrap();
+            assert_eq!(
+                custody.releases.len(),
+                1,
+                "actual A release event not retained"
+            );
+            assert!(
+                custody.releases[0].done().unwrap(),
+                "A completion not proven"
+            );
+            assert_eq!(custody.pins.len(), 1);
+            assert!(custody.pins.contains_key(&id));
+            assert!(custody.error.is_some());
+            Arc::downgrade(&custody.releases[0])
+        };
+        let pins = {
+            let mut st = gpu.inner.lock();
+            let m = st.reg(id, 0).unwrap().map.as_ref().unwrap();
+            assert_eq!(m.pins, 1, "unknown B completion decremented the pin");
+            m.pins
+        };
+        same_mapping(&gpu, id, At::Home, va, &handles);
+        set.assert_source();
+        assert!(ws.upgrade().is_some() && partial.upgrade().is_some());
+        assert!(gpu.trim().is_err());
+        {
+            // This short-lived upgrade only invokes a real poisoned admission. It is
+            // gone before the final last-owner witness and cannot provide custody.
+            let actual = ws.upgrade().unwrap();
+            assert!(actual.bind(0, b.stream).is_err());
+            assert!(actual.prefetch(0).is_err());
+        }
+        println!("VARENA_GPU_WITNESS {{\"kind\":\"secondary_partial_owners\",\"partial_events\":1,\"pin_count\":{pins},\"weight_set\":true,\"gpu\":true,\"poison_refuses\":true}}");
+        gate.release();
+        b.verify(&gpu, set.byte);
+        gate.check();
+        drop(gpu);
+        // Actual custody, not test-owned strong clones, keeps the owner graph alive.
+        assert!(ws.upgrade().is_some() && g.upgrade().is_some());
+        assert!(partial.upgrade().is_some());
+        set.assert_source();
+    } else {
+        let closing = closing.unwrap();
+        let dropping = std::thread::spawn(move || drop(pin));
+        phase(dropped, "actual all-stream Pinned Drop");
+        phase(closing, "actual secondary-consumer WeightSet close");
+        assert!(
+            !dropping.is_finished(),
+            "last close completed while B was gated"
+        );
+        assert!(!pending.done().unwrap());
+        {
+            let mut st = gpu.inner.lock();
+            let m = st.reg(id, 0).unwrap().map.as_mut().unwrap();
+            assert_eq!(m.pins, 0, "successful records must release exactly once");
+            assert_eq!(m.released.len(), 2);
+            assert!(
+                m.released[0].done().unwrap(),
+                "A must be complete independently"
+            );
+            assert!(
+                !m.released[1].done().unwrap(),
+                "B's release fence was bypassed"
+            );
+            assert!(
+                !m.quiet().unwrap(),
+                "ready producer and completed A covered gated B"
+            );
+        }
+        assert!(
+            gpu.give(BYTES).unwrap().is_empty(),
+            "gated B mapping was evicted"
+        );
+        same_mapping(&gpu, id, At::Home, va, &handles);
+        set.assert_source();
+        println!("VARENA_GPU_WITNESS {{\"kind\":\"secondary_release_fences\",\"stream_count\":2,\"pin_count\":0,\"release_events\":2,\"producer_ready\":true,\"a_complete\":true,\"b_pending\":true}}");
+        // Gate's independent Drop/watchdog releases even if any preceding assertion fails.
+        gate.release();
+        dropping.join().unwrap();
+        b.verify(&gpu, set.byte);
+        assert!(set.source.upgrade().is_none() && !set.fd.alive());
+        assert!(gpu.inner.lock().sets[id].is_none());
+        assert!(gpu.inner.check().is_ok());
+        gate.check();
+        println!("VARENA_GPU_WITNESS {{\"kind\":\"secondary_close_completed\",\"source_retired\":true,\"mapping_removed\":true}}");
+    }
 }
