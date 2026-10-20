@@ -82,6 +82,7 @@ impl Drop for Ev {
 struct Events {
     ctx: CUcontext,
     free: Mutex<[Vec<CUevent>; 2]>,
+    failed: Mutex<Vec<(EvRef, u64)>>,
 }
 unsafe impl Send for Events {}
 unsafe impl Sync for Events {}
@@ -99,8 +100,29 @@ impl Events {
             }
         };
         let e = Arc::new(Ev { raw, timing, pool: self.clone() });
-        call!("cuEventRecord", event_record(e.raw, stream))?;
+        let recorded = (|| call!("cuEventRecord", event_record(e.raw, stream)))();
+        if let Err(error) = recorded {
+            self.failed.lock().unwrap().push((e, stream as u64));
+            return Err(error);
+        }
         Ok(e)
+    }
+
+    fn recover(&self) -> Result<()> {
+        let failed = self.failed.lock().unwrap().clone();
+        for (_, stream) in &failed {
+            call!("cuStreamSynchronize", stream_synchronize(*stream as CUstream))?;
+        }
+        let released = {
+            let mut held = self.failed.lock().unwrap();
+            let (released, remaining) = std::mem::take(&mut *held).into_iter().partition::<Vec<_>, _>(|(event, _)| {
+                failed.iter().any(|(old, _)| Arc::ptr_eq(old, event))
+            });
+            *held = remaining;
+            released
+        };
+        drop(released);
+        Ok(())
     }
 }
 
@@ -229,7 +251,7 @@ enum Filled {
     Pending,
     Ready(EvRef),
     Failed(Error),
-    Unknown { error: Error, source: Arc<Weights> },
+    Unknown { error: Error, source: Arc<Weights>, waits: Vec<EvRef> },
 }
 struct Fill {
     state: Mutex<Filled>,
@@ -261,10 +283,11 @@ impl Fill {
     }
 
     /// Called only after checked engine and placement-stream completion.
-    fn completed(&self) -> Option<Arc<Weights>> {
+    fn completed(&self, proof: &Result<()>) -> Result<Option<Arc<Weights>>> {
+        proof.as_ref().map_err(Clone::clone)?;
         let mut state = self.state.lock().unwrap();
-        match std::mem::replace(&mut *state, Filled::Pending) {
-            Filled::Unknown { error, source } => {
+        Ok(match std::mem::replace(&mut *state, Filled::Pending) {
+            Filled::Unknown { error, source, .. } => {
                 *state = Filled::Failed(error);
                 Some(source)
             }
@@ -272,7 +295,7 @@ impl Fill {
                 *state = old;
                 None
             }
-        }
+        })
     }
 
     /// Nothing of it is in flight on the device.
@@ -529,7 +552,7 @@ impl Gpu {
             prop,
             shared,
             chunk,
-            events: Arc::new(Events { ctx, free: Mutex::default() }),
+            events: Arc::new(Events { ctx, free: Mutex::default(), failed: Mutex::default() }),
             copy: s,
             tally: IoTally::default(),
             jobs: Default::default(),
@@ -669,12 +692,17 @@ impl Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
-        self.inner.jobs.0.lock().unwrap().stop = true;
-        self.inner.jobs.1.notify_all();
-        if let Some(t) = self.mover.take() {
-            let _ = t.join();
-        }
+        // A provider may drop the final Gpu on the mover or on a callback thread the mover
+        // awaits. Joining here would deadlock either case. The mover's Arc<Inner> retains
+        // every placement/source owner until it finishes; Drop is not a completion fence.
+        stop_mover(&self.inner.jobs, self.mover.take());
     }
+}
+
+fn stop_mover(jobs: &(Mutex<Jobs>, Condvar), mover: Option<JoinHandle<()>>) {
+    jobs.0.lock().unwrap().stop = true;
+    jobs.1.notify_all();
+    drop(mover);
 }
 
 impl Inner {
@@ -700,7 +728,8 @@ impl Inner {
     fn checked_copies(&self) -> Result<()> {
         byte_io::drain(self.ordinal)?;
         let _c = CtxGuard::enter(self.ctx)?;
-        call!("cuStreamSynchronize", stream_synchronize(self.copy))
+        call!("cuStreamSynchronize", stream_synchronize(self.copy))?;
+        self.events.recover()
     }
 
     /// Never called by the mover: releasing a last retained WeightSet may join that thread.
@@ -728,7 +757,8 @@ impl Inner {
         self.recover_retired()
     }
 
-    /// Recover only mappings/source owners. No Arc<Gpu/WeightSet> drops on the mover.
+    /// Recover mappings/source owners after actual completion. A final source closure may
+    /// own Gpu; its destructor stops/detaches the mover rather than joining this thread.
     fn recover_retired(&self) -> Result<()> {
         let (unknown, candidates, events) = {
             let st = self.lock();
@@ -764,6 +794,9 @@ impl Inner {
                 })
                 .collect();
             let mut events = Vec::new();
+            for fill in &unknown {
+                if let Filled::Unknown { waits, .. } = &*fill.state.lock().unwrap() { events.extend(waits.iter().cloned()); }
+            }
             for &id in &candidates {
                 let home = st.sets[id]
                     .as_ref()
@@ -786,19 +819,18 @@ impl Inner {
             }
             (unknown, candidates, events)
         };
-        if !unknown.is_empty() || !candidates.is_empty() {
+        let failed_events = !self.events.failed.lock().unwrap().is_empty();
+        if !unknown.is_empty() || !candidates.is_empty() || failed_events {
             let _c = CtxGuard::enter(self.ctx)?;
-            self.checked_copies()?;
-            for event in events {
-                event.sync()?;
-            }
+            let proof = self.checked_copies().and_then(|()| {
+                for event in events { event.sync()?; }
+                Ok(())
+            });
             // Drop source owners outside both placement and fill locks.
-            drop(
-                unknown
-                    .iter()
-                    .filter_map(|f| f.completed())
-                    .collect::<Vec<_>>(),
-            );
+            let mut sources = Vec::new();
+            for fill in unknown { sources.extend(fill.completed(&proof)?); }
+            proof?;
+            drop(sources);
             for id in candidates {
                 let mut st = self.lock();
                 let Some(mut set) = st.sets[id].take() else {
@@ -895,7 +927,12 @@ impl Inner {
             });
             let filled = match filled {
                 Ok(ready) => Filled::Ready(ready),
-                Err(error) => match self.checked_copies() {
+                Err(error) => match self.checked_copies().and_then(|()| {
+                    // run may fail at the first wait: the rest were never enqueued. Check
+                    // every consumer fence before treating the failed mapping as quiescent.
+                    for wait in &job.waits { wait.sync()?; }
+                    Ok(())
+                }) {
                     Ok(()) => Filled::Failed(error),
                     Err(drain) => {
                         self.retain();
@@ -903,6 +940,7 @@ impl Inner {
                         Filled::Unknown {
                             error,
                             source: job.w.clone(),
+                            waits: job.waits.clone(),
                         }
                     }
                 },
@@ -1399,8 +1437,12 @@ impl WeightSet {
                 if !ready {
                     continue;
                 }
-                let filled = m.fill.as_ref().and_then(|f| f.state.lock().unwrap().clone());
-                if m.kept.is_none() && filled.map_or(Ok(false), |f| f.map_or(Ok(false), |ev| ev.done()))? {
+                let filled = m.fill.as_ref().map_or(Ok(false), |f| match &*f.state.lock().unwrap() {
+                    Filled::Ready(event) => event.done(),
+                    Filled::Pending => Ok(false),
+                    Filled::Failed(error) | Filled::Unknown { error, .. } => Err(error.clone()),
+                })?;
+                if m.kept.is_none() && filled {
                     let desc = AccessDesc { location: g.prop.location, flags: cuda::MEM_ACCESS_PROT_READ };
                     call!("cuMemSetAccess", mem_set_access(m.va, m.span as usize, &desc, 1))?;
                     m.read_only = true;
@@ -1670,4 +1712,101 @@ fn reserve_va(size: u64) -> Result<u64> {
 
 fn free_va(base: u64, size: u64) -> Result<()> {
     call!("cuMemAddressFree", mem_address_free(base, size as usize))
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    fn source_owner() -> (Arc<Weights>, (i32, u64, u64)) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let (path, mut file) = loop {
+            let path = std::env::temp_dir().join(format!("varena-completion-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            match OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
+                Ok(file) => break (path, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(error) => panic!("owned source file: {error}"),
+            }
+        };
+        file.write_all(b"data").unwrap();
+        let metadata = file.metadata().unwrap();
+        let fd = (file.as_raw_fd(), metadata.dev(), metadata.ino());
+        std::fs::remove_file(path).unwrap();
+        let source = Source::files(vec![(tensorfs::ids::ObjectRef::of(b"data"), file)], false, 0);
+        let weights = Arc::new(Weights {
+            name: "completion-proof".into(),
+            layout: Layout { parts: vec![], regions: vec![], nbytes: 0, digest: String::new(), names: vec![] },
+            parts: vec![], source, host: None,
+        });
+        (weights, fd)
+    }
+
+    fn fd_open((fd, dev, ino): (i32, u64, u64)) -> bool {
+        // Inode identity makes this robust if a parallel test reuses the descriptor number.
+        std::fs::metadata(format!("/dev/fd/{fd}")).is_ok_and(|m| m.dev() == dev && m.ino() == ino)
+    }
+
+    #[test]
+    fn unknown_fill_retains_actual_source_until_successful_completion_proof() {
+        let (owner, fd) = source_owner();
+        let observed = Arc::downgrade(&owner);
+        let fill = Arc::new(Fill { state: Mutex::new(Filled::Pending), cv: Condvar::new() });
+        let mut map = Mapping { fill: Some(fill.clone()), ..Default::default() };
+        assert!(!map.settled() && !map.dead() && !map.quiet().unwrap());
+        fill.set(Filled::Unknown { error: Error::Invalid("literal fill error".into()), source: owner, waits: vec![] });
+        assert_eq!(fill.wait().err().unwrap().code(), "INVALID");
+        assert!(!map.settled() && !map.dead() && !map.quiet().unwrap());
+        let failed = Err(Error::Io("completion still unknown".into()));
+        assert!(fill.completed(&failed).is_err());
+        assert!(observed.upgrade().is_some() && fd_open(fd));
+        assert!(!map.settled() && !map.dead() && !map.quiet().unwrap());
+        // The same actual source owner is released outside the fill/placement locks only
+        // after the caller's checked proof succeeds. This is a CPU state/RAII test, not CUDA.
+        let released = fill.completed(&Ok(())).unwrap();
+        assert!(observed.upgrade().is_some() && fd_open(fd));
+        assert!(map.settled() && map.dead() && map.quiet().unwrap());
+        drop(released);
+        assert!(observed.upgrade().is_none());
+        assert!(!fd_open(fd));
+        assert_eq!(fill.wait().err().unwrap().code(), "INVALID");
+    }
+
+    #[test]
+    fn stopping_mover_does_not_join_blocked_callback_or_release_its_source() {
+        let (source, fd) = source_owner();
+        let observed = Arc::downgrade(&source);
+        let jobs = Arc::new((Mutex::new(Jobs::default()), Condvar::new()));
+        let (entered, started) = std::sync::mpsc::sync_channel(1);
+        let (resume, callback) = std::sync::mpsc::sync_channel(1);
+        let (finished, drained) = std::sync::mpsc::sync_channel(1);
+        let mover = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            callback.recv().unwrap(); // A real outstanding callback owns its source.
+            drop(source);
+            finished.send(()).unwrap();
+        });
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (closed, stopped) = std::sync::mpsc::sync_channel(1);
+        let state = jobs.clone();
+        let dropper = std::thread::spawn(move || {
+            stop_mover(&state, Some(mover));
+            closed.send(()).unwrap();
+        });
+        let bounded = stopped.recv_timeout(Duration::from_millis(500)).is_ok();
+        let held = observed.upgrade().is_some() && fd_open(fd);
+        // Always release/drain both test workers before reporting a regression.
+        resume.send(()).unwrap();
+        drained.recv_timeout(Duration::from_secs(2)).unwrap();
+        dropper.join().unwrap();
+        assert!(bounded, "Gpu destruction joined a callback-dependent mover");
+        assert!(held, "detaching the mover dropped its actual source too early");
+        assert!(jobs.0.lock().unwrap().stop);
+        assert!(observed.upgrade().is_none());
+        assert!(!fd_open(fd));
+    }
 }
