@@ -7,6 +7,16 @@ use crate::{Failure, Result};
 
 pub use crate::session::PartData;
 
+/// Group tensor metadata for placement without opening or fetching payload files.
+pub fn regions(
+    header: &crate::format::Header,
+    max_bytes: u64,
+    boundaries: &[String],
+    only: &[String],
+) -> Vec<Vec<String>> {
+    crate::client::regions(header, max_bytes, boundaries, only)
+}
+
 /// Fetch exactly these objects after checking that they belong to the checkpoint.
 pub async fn fetch_objects(
     checkpoint: &crate::Checkpoint,
