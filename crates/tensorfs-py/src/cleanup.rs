@@ -105,8 +105,8 @@ fn retry(state: &State) {
     }
 }
 
-/// Fail module import before installing native classes if the first worker cannot start.
-/// A forked child reinitializes lazily; destructor failures retain payloads for a later retry.
+/// Exercise worker initialization without moving an owner; production starts on first defer.
+#[cfg(test)]
 pub(crate) fn init() -> std::io::Result<()> {
     let state = state()?;
     retry(state);
@@ -122,7 +122,7 @@ fn submit(task: Task, queue: std::io::Result<&State>) {
         Err(_) => {
             retain(task);
             // Do not enter a process-global logger from a post-fork destructor: its
-            // lock may also belong to a vanished parent thread. init() reports errors.
+            // lock may also belong to a vanished parent thread. A later defer retries.
         }
     }
 }

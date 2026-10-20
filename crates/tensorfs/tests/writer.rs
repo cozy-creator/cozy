@@ -74,6 +74,32 @@ fn config(json: &str) -> Config {
     serde_json::from_str(json).unwrap()
 }
 
+#[test]
+fn logical_config_edits_preserve_imported_filename_for_explicit_export() {
+    let scratch = Scratch::new("config-filename");
+    let store = scratch.store("store");
+    let mut writer = store.writer(None, None).unwrap();
+    writer.component("tokenizer", "transformers.Tokenizer", config("{\"version\":1}"), Some("tokenizer_config.json")).unwrap();
+    writer.get("tokenizer").asset("vocab.txt", b"hello\n").unwrap();
+    let base = store.checkpoint(&writer.commit().unwrap()).unwrap();
+
+    let mut edited = store.writer(Some(&base), None).unwrap();
+    edited.component("tokenizer", "transformers.Tokenizer", config("{\"version\":2}"), None).unwrap();
+    edited.component("tokenizer", "transformers.Tokenizer", config("{\"version\":3}"), None).unwrap();
+    let checkpoint = store.checkpoint(&edited.commit().unwrap()).unwrap();
+    let exported = checkpoint.export_component_files("tokenizer", &scratch.0.join("support")).unwrap();
+    assert_eq!(fs::read(exported.join("vocab.txt")).unwrap(), b"hello\n");
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&fs::read(exported.join("tokenizer_config.json")).unwrap()).unwrap(), serde_json::json!({"version": 3}));
+    assert!(!exported.join("config.json").exists());
+    assert!(!exported.join(CHUNKS_DIR).exists());
+
+    // The raw importer retains an explicit way to replace the known source filename.
+    let mut reset = store.writer(Some(&checkpoint), None).unwrap();
+    reset.component("tokenizer", "transformers.Tokenizer", Config::new(), Some("config.json")).unwrap();
+    let checkpoint = store.checkpoint(&reset.commit().unwrap()).unwrap();
+    assert_eq!(checkpoint.component("tokenizer").unwrap().config_file, None);
+}
+
 fn blobs(store: &Store) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     for top in fs::read_dir(store.root().join("blobs")).unwrap().flatten() {

@@ -413,7 +413,7 @@ impl Writer {
     }
 
     /// Declares component `name` (again: its class and config change, its tensors stay) and
-    /// hands it back. `config_file` names the config's source file when it isn't `config.json`.
+    /// hands it back. `config_file` names the source file; None preserves a known filename.
     pub fn component(
         &mut self,
         name: &str,
@@ -424,11 +424,20 @@ impl Writer {
         if !segment(name) {
             return Err(bad(format!("component name {name:?} is not one plain path segment")));
         }
+        let config_file = match config_file {
+            Some(file) => (file != CONFIG_FILE).then(|| file.to_owned()),
+            None => match self.specs.iter().find(|spec| spec.name == name) {
+                Some(spec) => spec.config_file.clone(),
+                None => self.base.as_ref()
+                    .and_then(|base| base.components().iter().find(|component| component.name == name))
+                    .and_then(|component| component.config_file.clone()),
+            },
+        };
         let spec = Spec {
             name: name.to_owned(),
             class: class.to_owned(),
             config,
-            config_file: config_file.filter(|f| *f != CONFIG_FILE).map(str::to_owned),
+            config_file,
         };
         match self.specs.iter_mut().find(|s| s.name == name) {
             Some(s) => *s = spec,
