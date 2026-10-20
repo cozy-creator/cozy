@@ -141,7 +141,11 @@ impl Service {
                     .unwrap()
                     .insert(record.id.clone(), held.retention());
             }
-            if let Some(birth) = record.process {
+            if let Some(pending) = record.pending_completion {
+                for birth in pending.processes {
+                    service.engine.end_orphan(birth)?;
+                }
+            } else if let Some(birth) = record.process {
                 service.engine.end_orphan(birth)?;
             }
         }
@@ -405,9 +409,6 @@ impl Service {
     pub fn reclaim(&self) -> crate::reclaim::Swept {
         // Released Write roots first, so the store's GC can collect their bytes.
         if let Some(calls) = self.calls() {
-            if let Err(error) = calls.sweep_canceled_outputs(&self.engine) {
-                tracing::warn!("reclaim canceled native outputs: {error}");
-            }
             if let Err(error) = calls.sweep_objects() {
                 tracing::warn!("reclaim object roots: {error}");
             }

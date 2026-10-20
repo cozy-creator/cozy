@@ -2,7 +2,8 @@
 //! tensor, or one per row or column.
 
 use super::grid::Grid;
-use super::{elem, logical, one, table, Allowed, Ctx, Dtypes, Param, Part, Scheme, Shape, View};
+use super::plan::Codes;
+use super::{logical, one, Allowed, Ctx, Dtypes, Param, Part, Plan, Scheme, Shape, View};
 use crate::format::Result;
 
 const FP8: Dtypes = Dtypes::Of(&["F8_E4M3", "F8_E5M2"]);
@@ -16,7 +17,7 @@ pub const TENSORWISE: Scheme = Scheme {
         Part::req("scale", SCALE, one),
         Part::opt("input_scale", Dtypes::Of(&["F32"]), one),
     ],
-    decode: |c| scaled(c, &Grid::Tensor),
+    decode: |c| Ok(scaled(c, Grid::Tensor)),
 };
 
 pub const ROWWISE: Scheme = Scheme {
@@ -27,7 +28,7 @@ pub const ROWWISE: Scheme = Scheme {
         Part::req("weight", FP8, logical),
         Part::req("scale", SCALE, per_axis),
     ],
-    decode: |c| scaled(c, &axis_grid(c)),
+    decode: |c| Ok(scaled(c, axis_grid(c))),
 };
 
 /// A scale whose dtype the scheme leaves free, as the producer stored it: read exactly.
@@ -43,7 +44,7 @@ pub const AXIS: Param = Param {
     allowed: Allowed::Uint(&[0, 1]),
 };
 
-pub fn axis_grid(c: &Ctx) -> Grid<'static> {
+pub fn axis_grid(c: &Ctx) -> Grid {
     if c.uint("axis") == 0 {
         Grid::Row
     } else {
@@ -57,15 +58,6 @@ pub fn per_axis(c: &Ctx) -> Result<Shape> {
 }
 
 /// `weight × s(i, j)`: the element table looked up by the weight's bytes.
-fn scaled(c: &Ctx, grid: &Grid) -> Result<Vec<f32>> {
-    let w = c.part("weight");
-    let t = elem::table(w.dtype).expect("an 8-bit element format");
-    table::decode(
-        &table::bytes(w.bytes),
-        &t,
-        &c.floats("scale"),
-        grid,
-        c.rows,
-        c.cols,
-    )
+fn scaled<'a>(c: &Ctx<'a>, grid: Grid) -> Plan<'a> {
+    Codes::elements(c.part("weight"), c.part("scale"), grid).into()
 }
