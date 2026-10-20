@@ -520,6 +520,8 @@ class Ledger:
         """Blocks until the free generation is other than `seen`; returns it."""
     def peak(self, key: str) -> int | None:
         """The measured peak recorded under `key` (`<package>|<shape>`, at most 120 bytes)."""
+    def peaks(self) -> list[tuple[str, int]]:
+        """Every request peak recorded here, `(key, bytes)`."""
     def set_peak(self, key: str, nbytes: int) -> None: ...
     def dispatched(self, request_id: str) -> str | None:
         """The key TensorD dispatched `request_id` under; None: it runs unrecorded."""
