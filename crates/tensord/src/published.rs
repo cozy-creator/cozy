@@ -1120,7 +1120,8 @@ impl Publisher {
         let blob = crate::machine::pypi::object_at(&self.machine, &file.url, &file.sha256, length, trust, &stop)
             .map_err(|e| match stop.is_cancelled() {
                 true => canceled(),
-                false => ("package_file_download_failed", format!("{}: {e}", file.url)),
+                // Named by its file: a plan's URL is presigned, its query a credential.
+                false => ("package_file_download_failed", format!("{}: {}", file.name, e.to_string().replace(&file.url, &file.name))),
             })?;
         let path = wheels.join(&file.name);
         fs::hard_link(&blob, &path)
@@ -2085,7 +2086,9 @@ pub(crate) mod tests {
                         header.clear();
                     }
                     let mut words = line.split_whitespace();
-                    let (method, path) = (words.next().unwrap().to_string(), words.next().unwrap().to_string());
+                    let method = words.next().unwrap().to_string();
+                    // An object store answers a presigned URL by its path; the query is its signature.
+                    let path = words.next().unwrap().split('?').next().unwrap().to_string();
                     asks.lock().unwrap().push(format!("{method} {path} {range:?}"));
                     // The first ask of the stalled part answers nothing, as a cold R2 object can.
                     if stall.is_some() && range.map(|(first, _)| first) == stall
@@ -2262,9 +2265,12 @@ pub(crate) mod tests {
         assert_eq!(named(&BTreeMap::from([("acme-pkg".into(), "acme/acme-pkg".into())])), "acme/acme-pkg");
         assert_eq!(named(&BTreeMap::new()), "local/acme-pkg", "without the lock's identity");
 
-        let tampered = HubFile::new(&door("acme-pkg/1.0/acme_pkg-1.0-py3-none-any.whl"), &bad, "acme_pkg-1.0-py3-none-any.whl", 0).unwrap();
+        let signed = door("acme-pkg/1.0/acme_pkg-1.0-py3-none-any.whl") + "?X-Amz-Credential=key&X-Amz-Signature=secret";
+        let tampered = HubFile::new(&signed, &bad, "acme_pkg-1.0-py3-none-any.whl", 0).unwrap();
         let (code, why) = publisher.fetch_hub(&[tampered], &source, &root.join("tampered"), &Job::default()).unwrap_err();
         assert_eq!(code, "package_file_download_failed", "{why}");
+        // The run's reason names the file and never carries a presigned URL's signature.
+        assert!(why.starts_with("acme_pkg-1.0-py3-none-any.whl: ") && !why.contains("X-Amz-"), "{why}");
         assert!(!publisher.store.path(&ObjectRef { sha256: bad.clone(), length: 0 }).unwrap().exists());
         let _ = fs::remove_dir_all(root);
     }
