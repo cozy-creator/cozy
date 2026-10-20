@@ -8,8 +8,9 @@ from pathlib import Path
 import re
 import tarfile
 
-from make_payload import (COMFY, CONSUMERS, PRE_GPU, KERNEL_SOURCE, KERNEL_SCRIPT,
+from make_payload import (COMFY, CONSUMERS, PRE_GPU, SCRIPT_ROOT,
                           KERNEL_CORPUS, KERNEL_SCHEMA, KERNEL_FILE, kernel_cases)
+import native_io
 from owned_child import CONSUMER_SECONDS, KERNEL_SECONDS, SETUP_SECONDS
 
 
@@ -112,9 +113,10 @@ def consumer(name, value, spec, device):
     require(re.fullmatch('sha256:[0-9a-f]{64}', value.get('header', '')) is not None, f'{name}: no checkpoint identity')
     if name == 'comfy':
         require(value.get('comfy_source') == COMFY and value.get('model_class') == 'comfy.ldm.modules.diffusionmodules.openaimodel.UNetModel', 'wrong upstream Comfy model/source')
-        require(value.get('comfy_kitchen') == '0.2.39' and value.get('comfy_aimdo') == '0.5.6', 'Comfy dependency pins differ')
+        require(value.get('comfy_kitchen') == spec['dependencies']['versions']['comfy-kitchen'] and
+                value.get('comfy_aimdo') == spec['dependencies']['versions']['comfy-aimdo'], 'Comfy dependency pins differ')
     else:
-        require(value.get('diffusers') == '0.40.0', 'Diffusers dependency pin differs')
+        require(value.get('diffusers') == spec['dependencies']['versions']['diffusers'], 'Diffusers dependency pin differs')
 
 
 def physical(run, machine, identities, launch, payload_sha):
@@ -170,32 +172,52 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
         require(re.fullmatch('[0-9a-f]{40}', spec[name].get('source', '')) is not None and
                 re.fullmatch('[0-9a-f]{64}', spec[name].get('sha256', '')) is not None, f'{name}: malformed artifact/source hash')
     require(spec['native']['source'] not in PRE_GPU, 'known pre-GPU/fork-fix source')
+    require(spec.get('proof_source') == spec['native']['source'], 'proof source differs from wheel producer')
     requested = spec.get('requested')
-    require(requested in (['diffusers', 'comfy'], ['diffusers', 'comfy', 'kernel']), 'wrong requested consumer/case set')
-    require(spec.get('unrequested') == ([] if 'kernel' in requested else ['kernel']), 'unrequested cases are ambiguous')
+    require(isinstance(requested, list) and requested[:2] == ['diffusers', 'comfy'] and
+            requested == [name for name in native_io.ALL if name in requested], 'wrong requested consumer/case set')
+    require(all(name in requested for name in native_io.IDS) == any(name in requested for name in native_io.IDS), 'partial native I/O batch')
+    require(('native_io' in spec) == all(name in requested for name in native_io.IDS), 'native I/O request/contract differs')
+    require(spec.get('unrequested') == [name for name in native_io.ALL if name not in requested], 'unrequested cases are ambiguous')
     require(not require_kernel or 'kernel' in requested, 'kernel proof was not requested')
     require(read(root / 'manifest.json') == spec, 'returned manifest differs from coordinator freeze')
     require(sha(root / 'source/payload.py') == payload_sha, 'executed payload source differs')
-    for name, (ref, _, source_sha, count, size) in CONSUMERS.items():
+    for name, (filename, count, size) in CONSUMERS.items():
         c = spec['consumers'][name]
-        require((c['source'], c['sha256'], c['tensors'], c['bytes']) == (ref, source_sha, count, size), f'{name}: altered frozen consumer contract')
+        require((c['source'], c['path'], c['file'], c['tensors'], c['bytes']) ==
+                (spec['proof_source'], SCRIPT_ROOT + filename, filename, count, size) and
+                c['sha256'] == spec['sources'].get(filename), f'{name}: altered frozen consumer contract')
     inventory = read(root / 'files.json')
     require(not any(p.is_symlink() for p in root.rglob('*')), 'receipt Tree contains symlinks')
     actual = {str(p.relative_to(root)): sha(p) for p in root.rglob('*') if p.is_file() and p != root / 'files.json'}
     require(actual == inventory, 'receipt file inventory/hash differs')
     expected_files = {'manifest.json', 'identity.json', 'verdict.json', 'source/payload.py',
                       'source/comfy-upstream.tar'}
-    setup_names = ['comfy-init', 'comfy-remote', 'comfy-fetch', 'comfy-checkout', 'comfy-archive']
-    setup_names += [name + '-purelib' for name in requested]
+    setup_names = native_io.setup_names(requested)
     for name in setup_names:
         expected_files.update({f'logs/{name}.stdout', f'logs/{name}.stderr'})
     expected_files.update('source/' + name for name in spec['sources'])
     for name in requested:
-        expected_files.update({f'logs/{name}.stdout', f'logs/{name}.stderr', f'reports/{name}.json',
-                               f'reports/{name}-identity.json'})
+        expected_files.update({f'logs/{name}.stdout', f'logs/{name}.stderr', f'reports/{name}.json'})
+        expected_files.add(f'reports/{name}-environment.json' if name in native_io.IDS else f'reports/{name}-identity.json')
     require(set(actual) == expected_files, 'unexpected/missing receipt files or model/checkpoint bytes')
     for name, expected_sha in spec['sources'].items():
         require(sha(root / 'source' / name) == expected_sha, 'retained source hash differs')
+    require(sha(root / 'source/requirements.txt') == spec['dependencies']['sha256'], 'requirements freeze differs')
+    if 'native_io' in spec:
+        path = root / 'source/native/contract.json'
+        contract = native_io.contract(path.read_bytes())
+        require(sha(path) == spec['native_io']['contract_sha256'] and
+                spec['native_io']['source'] == spec['proof_source'], 'native I/O frozen contract differs')
+        for row, command in zip(contract['commands'], spec['native_io']['commands']):
+            require(command['id'] == row['id'] and command['profile'] == row['profile'] and
+                    command['argv'] == row['argv'] and command['timeout_s'] == row['timeout_s'] and
+                    command['file'] == SCRIPT_ROOT + row['file'], 'native I/O command differs')
+            for source in command['sources']:
+                source_path = root / 'source' / source['path']
+                require(spec['sources'].get(source['path']) == source['sha256'] and source_path.stat().st_size == source['bytes'],
+                        'native I/O source hash/length differs')
+            native_io.check_source(row['id'], (root / 'source' / command['file']).read_text())
     identity, verdict = read(root / 'identity.json'), read(root / 'verdict.json')
     require(identity.get('ok') is True and verdict.get('ok') is True, 'worker failed')
     operations = identity.get('operations', [])
@@ -205,6 +227,12 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
             identity.get('python_optimize') == 0, 'missing public Context/optimized Python')
     require(identity.get('runtime_source') == spec['runtime']['source'] and identity.get('runtime') == spec['runtime']['version'], 'live Runtime differs')
     require(identity.get('native_sha256') == spec['native']['sha256'], 'native input differs')
+    require(identity.get('comfy_bundle_sha256') == spec['comfy_bundle']['sha256'], 'Comfy input differs')
+    versions = identity.get('dependencies', {})
+    for name, expected_version in spec['dependencies']['versions'].items():
+        actual_version = versions.get(name, '')
+        require(actual_version == expected_version or ('+' not in expected_version and actual_version.split('+')[0] == expected_version),
+                'installed dependency differs: ' + name)
     require(identity.get('outer_torch_present') is True, 'outer Runtime lacks Torch identity path')
     require(identity.get('triton_interpret') in ('', '0'), 'interpreter fallback')
     require(sha(root / 'source/comfy-upstream.tar') == identity.get('comfy_archive_sha256'), 'Comfy archive hash differs')
@@ -218,8 +246,30 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
     devices = []
     for part in parts:
         name = part['name']
-        require(completed_child(part, KERNEL_SECONDS if name == 'kernel' else CONSUMER_SECONDS),
+        require(completed_child(part, native_io.TIMEOUT.get(name, KERNEL_SECONDS if name == 'kernel' else CONSUMER_SECONDS)),
                 f'{name}: child failed/timed out/not reaped')
+        if name in native_io.IDS:
+            require(devices, 'native I/O lacks preceding real consumer GPU identity')
+            stdout = (root / f'logs/{name}.stdout').read_text()
+            require(exact(read(root / f'reports/{name}.json'), native_io.parse(name, stdout, spec['native'], devices[0]['gpu_uuid'])),
+                    'native I/O receipt differs from actual stdout')
+            row = next(c for c in spec['native_io']['commands'] if c['id'] == name)
+            observed = read(root / f'reports/{name}-environment.json')
+            argv = part.get('command', [])
+            require(len(argv) == 3 + len(row['argv']) and argv[0] == observed.get('executable') and
+                    argv[1] == '-u' and str(argv[2]).endswith('/source/' + row['file']) and argv[3:] == row['argv'],
+                    'native I/O direct-script invocation differs')
+            require(observed.get('installed_native_extension_sha256') == spec['native']['extension_sha256'] and
+                    observed.get('cuda_visible_devices') == identity.get('cuda_visible_devices') and
+                    observed.get('profile') == row['profile'] and observed.get('python_optimize') == 0 and
+                    observed.get('no_user_site') == 1 and observed.get('cublas_workspace_config') == ':4096:8',
+                    'native I/O environment/artifact differs')
+            if row['profile'] == 'clean':
+                require(observed.get('torch') is None and observed.get('triton') is None, 'native I/O clean profile contains a framework')
+            else:
+                require(observed.get('torch') == versions.get('torch') and observed.get('numpy') == versions.get('numpy'),
+                        'native I/O framework versions differ')
+            continue
         child = read(root / f'reports/{name}-identity.json')
         require(child.get('ok') is True and child.get('python_optimize') == 0 and child.get('triton_interpret') in ('', '0'), f'{name}: skipped/interpreter/optimized child')
         require(child.get('script_completed') is True and child.get('native_extension_sha256') == spec['native']['extension_sha256'], f'{name}: native binary differs or child incomplete')
@@ -242,9 +292,8 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
             contract = spec['kernel']
             require((contract.get('source'), contract.get('sha256'), contract.get('file'), contract.get('schema'),
                      contract.get('corpus_sha256'), contract.get('argv')) ==
-                    (KERNEL_SOURCE, KERNEL_SCRIPT, KERNEL_FILE, KERNEL_SCHEMA, KERNEL_CORPUS, ['--device', '0']),
+                    (spec['proof_source'], spec['sources'][KERNEL_FILE], KERNEL_FILE, KERNEL_SCHEMA, KERNEL_CORPUS, ['--device', '0']),
                     'kernel frozen source/contract differs')
-            require(spec['sources'].get(KERNEL_FILE) == KERNEL_SCRIPT, 'kernel script hash differs')
             files = {name: (root / 'source' / name).read_text() for name in spec['sources']}
             expected_cases = kernel_cases(files)
             schemes = sorted({c['scheme'] for c in expected_cases})

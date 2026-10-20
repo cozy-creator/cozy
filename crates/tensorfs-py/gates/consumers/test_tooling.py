@@ -15,11 +15,13 @@ import unittest
 import zipfile
 
 import make_payload
+import native_io
 import validate
 from owned_child import CONSUMER_SECONDS, KERNEL_SECONDS, SETUP_SECONDS, run_owned
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[3]
+PROOF_SOURCE = '85ab9f3d92736a640548a9c3da70e3f374368c55'
 UUID = 'GPU-12345678-1234-1234-1234-123456789abc'
 
 
@@ -41,6 +43,15 @@ class Contract(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.native = self.root / 'tensorfs-0.11.0-cp312-abi3-linux_x86_64.whl'
         self.runtime = self.root / 'cozy_runtime-0.28.2-py3-none-any.whl'
+        self.requirements = self.root / 'requirements.txt'
+        self.requirements.write_text('\n'.join([
+            'torch==2.14.0', 'diffusers==0.40.0', 'numpy==2.3.0', 'einops==0.8.0',
+            'safetensors==0.8.0', 'Pillow==12.0.0', 'scipy==1.16.0', 'tqdm==4.67.0',
+            'psutil==7.0.0', 'pyyaml==6.0.0', 'packaging==25.0',
+            'comfy-kitchen==0.2.39', 'comfy-aimdo==0.5.6']) + '\n')
+        # Metadata-only test input: never fetched/checked out as a real Git bundle.
+        self.bundle = self.root / 'comfy.bundle'
+        self.bundle.write_bytes(('# v2 git bundle\n' + make_payload.COMFY + ' refs/heads/proof\n\nPACK synthetic fixture').encode())
         for path, name, version in [(self.native, 'tensorfs', '0.11.0'), (self.runtime, 'cozy-runtime', '0.28.2')]:
             with zipfile.ZipFile(path, 'w') as archive:
                 archive.writestr(f'{name.replace("-", "_")}-{version}.dist-info/METADATA',
@@ -49,14 +60,18 @@ class Contract(unittest.TestCase):
                     archive.writestr('tensorfs/_ext.abi3.so', b'unit-fixture-not-a-native-binary')
                 else:
                     archive.writestr('cozy_runtime/_build_provenance.py', 'COMMIT = ' + repr('3' * 40))
-        self.args = argparse.Namespace(creator_repo=REPO, native_wheel=self.native, native_source='2' * 40,
+        self.args = argparse.Namespace(creator_repo=REPO, proof_source=PROOF_SOURCE,
+                                      native_wheel=self.native, native_source=PROOF_SOURCE,
                                       native_sha256=validate.sha(self.native), runtime_wheel=self.runtime,
                                       runtime_source='3' * 40, runtime_sha256=validate.sha(self.runtime),
-                                      output=self.root / 'payload.py', include_kernel=False)
+                                      output=self.root / 'payload.py', include_kernel=False, include_native_io=False,
+                                      require_native_mode=[], requirements=self.requirements,
+                                      comfy_bundle=self.bundle, comfy_sha256=validate.sha(self.bundle))
 
-    def fixture(self, kernel=False):
+    def fixture(self, kernel=False, native=False):
         if kernel:
             self.args.include_kernel = True
+        self.args.include_native_io = native
         sidecar = make_payload.generate(self.args)
         expected = validate.read(sidecar)
         spec = dict(expected)
@@ -73,7 +88,7 @@ class Contract(unittest.TestCase):
             (root / 'source' / name).parent.mkdir(parents=True, exist_ok=True)
             (root / 'source' / name).write_text(source)
         operations = []
-        for name in ['comfy-init', 'comfy-remote', 'comfy-fetch', 'comfy-checkout', 'comfy-archive'] + [n + '-purelib' for n in spec['requested']]:
+        for name in native_io.setup_names(spec['requested']):
             (root / f'logs/{name}.stdout').write_text('fixture source setup\n')
             (root / f'logs/{name}.stderr').write_text('')
             operations.append({'name': name, **completed(SETUP_SECONDS)})
@@ -87,10 +102,40 @@ class Contract(unittest.TestCase):
                     'cuda_visible_devices': '0', 'triton_interpret': '', 'runtime_source': '3' * 40,
                     'runtime': '0.28.2', 'native_sha256': spec['native']['sha256'],
                     'comfy_archive_sha256': validate.sha(root / 'source/comfy-upstream.tar'), 'operations': operations,
+                    'comfy_bundle_sha256': spec['comfy_bundle']['sha256'],
+                    'dependencies': spec['dependencies']['versions'],
                     'outer_torch_present': True}
         write(root / 'identity.json', identity)
         parts = []
         for name in spec['requested']:
+            if name in native_io.IDS:
+                row = next(r for r in spec['native_io']['commands'] if r['id'] == name)
+                executable = f'/fixture/{name}/python'
+                clean = row['profile'] == 'clean'
+                observed = {'executable': executable, 'python_optimize': 0, 'no_user_site': 1,
+                            'cuda_visible_devices': '0', 'cublas_workspace_config': ':4096:8',
+                            'profile': row['profile'], 'installed_native_extension_sha256': spec['native']['extension_sha256'],
+                            'torch': None if clean else '2.14.0', 'triton': None, 'numpy': None if clean else '2.3.0'}
+                write(root / f'reports/{name}-environment.json', observed)
+                if name == 'read-engine':
+                    stdout = native_io.READ_MARKER + '\n'
+                elif name == 'fork-cleanup':
+                    stdout = 'CUDA fork cleanup: CPU-only parent import, child allocation/capsule release recovered 33554449 bytes\n'
+                else:
+                    records = []
+                    for case in native_io.CASES:
+                        records += [{'case': case, 'device': 0, 'uuid': UUID, 'extension_sha256': spec['native']['extension_sha256'],
+                                     'distribution': spec['native']['version'], 'tensorfs': spec['native']['version']},
+                                    {'case': case, 'result': 'passed', 'cleanup': dict.fromkeys(('sets', 'mapped', 'idle', 'slots'), 0),
+                                     'callback': {'chunks': 1}, 'h2d': [{'bytes': 65536, 'ns': 1}]}]
+                    records.append({'result': 'passed', 'cases': native_io.CASES, 'timeout_per_child': 45})
+                    stdout = ''.join(json.dumps(r) + '\n' for r in records)
+                write(root / f'reports/{name}.json', native_io.parse(name, stdout, spec['native'], UUID))
+                (root / f'logs/{name}.stdout').write_text(stdout)
+                (root / f'logs/{name}.stderr').write_text('')
+                parts.append({'name': name, **completed(row['timeout_s']),
+                              'command': [executable, '-u', '/fixture/source/' + row['file'], *row['argv']]})
+                continue
             child = {'ok': True, 'mode': name, 'python_optimize': 0, 'triton_interpret': '', 'script_completed': True,
                      'cublas_workspace_config': ':4096:8', 'cuda_visible_devices': '0', 'cuda_available': True,
                      'device_count': 1, 'cuda_initialized_before_probe': False, 'gpu_uuid': UUID,
@@ -110,7 +155,8 @@ class Contract(unittest.TestCase):
                 value = validate.read(HERE / 'fixtures' / f'{name}-cpu.json')['evidence']
                 value.update(proof=f'public-tensorfs-{name}-unet-cuda', device='cuda:0', gpu_origin_writer=True,
                              device_info={'type': 'cuda', 'uuid': UUID}, torch='2.14.0+cu130', torch_cuda='13.0',
-                             native_source=spec['native']['source'], wheel_sha256=spec['native']['sha256'])
+                             native_source=spec['native']['source'], wheel_sha256=spec['native']['sha256'],
+                             script_sha256=spec['consumers'][name]['sha256'])
             write(root / f'reports/{name}-identity.json', child)
             self.result(root, name, value)
             parts.append({'name': name, **completed(KERNEL_SECONDS if name == 'kernel' else CONSUMER_SECONDS)})
@@ -305,7 +351,46 @@ class Contract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'hash differs'):
             make_payload.generate(self.args)
         self.args.native_source = '88a49ac8e634035301a3314088a856d214e55db8'
+        self.args.proof_source = self.args.native_source
         with self.assertRaisesRegex(ValueError, 'pre-GPU/fork-fix'):
+            make_payload.generate(self.args)
+
+    def test_current_source_and_split_crate_layout_are_frozen(self):
+        root, expected, run, machine, launch = self.fixture(kernel=True, native=True)
+        self.assertEqual(expected['proof_source'], PROOF_SOURCE)
+        self.assertEqual(expected['native_io']['source'], PROOF_SOURCE)
+        script = root / 'source' / make_payload.KERNEL_FILE
+        self.assertTrue((script.parents[2] / 'tensorfs/conformance/vectors/cases').is_dir())
+        self.assertNotIn('read_all(', script.read_text())
+        self.assertEqual(expected['kernel']['sha256'], validate.sha(script))
+        self.assertTrue(validate.validate(root, expected, run, machine, launch)['ok'])
+
+    def test_missing_mode_requirements_bundle_and_source_fail_before_writing(self):
+        self.args.require_native_mode = ['future-ab']
+        with self.assertRaisesRegex(ValueError, 'mode absent'):
+            make_payload.generate(self.args)
+        self.args.require_native_mode = []
+        self.requirements.write_text('torch>=2.14\n')
+        with self.assertRaisesRegex(ValueError, 'exact name==version'):
+            make_payload.generate(self.args)
+        self.assertFalse(self.args.output.exists())
+
+    def test_native_io_actual_stdout_is_required(self):
+        root, expected, run, machine, launch = self.fixture(native=True)
+        self.assertTrue(validate.validate(root, expected, run, machine, launch)['ok'])
+        (root / 'logs/fork-cleanup.stdout').write_text('skipped\n')
+        self.inventory(root)
+        with self.assertRaisesRegex(ValueError, 'fork recovery'):
+            validate.validate(root, expected, run, machine, launch)
+
+    def test_proof_source_must_be_the_wheel_producer(self):
+        self.args.native_source = '2' * 40
+        with self.assertRaisesRegex(ValueError, 'wheel producer'):
+            make_payload.generate(self.args)
+
+    def test_changed_bundle_fails_before_writing(self):
+        self.args.comfy_sha256 = '0' * 64
+        with self.assertRaisesRegex(ValueError, 'Comfy bundle hash'):
             make_payload.generate(self.args)
 
 

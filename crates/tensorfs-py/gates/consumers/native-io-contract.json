@@ -1,0 +1,30 @@
+{
+  "schema": "tensorfs.gpu-proof-command-contract/2",
+  "commands": [
+    {
+      "id": "read-engine",
+      "file": "cuda_read_engine.py",
+      "helper_files": ["read_engine.py"],
+      "profile": "torch",
+      "argv": [],
+      "timeout_s": 120
+    },
+    {
+      "id": "provider-cleanup",
+      "file": "cuda_varena_source.py",
+      "helper_files": [],
+      "profile": "torch",
+      "argv": ["--timeout", "45"],
+      "timeout_s": 210
+    },
+    {
+      "id": "fork-cleanup",
+      "file": "cuda_fork_cleanup.py",
+      "helper_files": [],
+      "profile": "clean",
+      "argv": [],
+      "timeout_s": 90
+    }
+  ],
+  "pending": ["R1 A/B: exact source and command contract not supplied"]
+}

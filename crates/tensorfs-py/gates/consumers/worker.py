@@ -9,10 +9,11 @@ import site
 import sys
 import tempfile
 import traceback
+from typing import Annotated
 import venv
 import zipfile
 
-from cozy_runtime.author import Context, FileAsset, Outputs, Tree
+from cozy_runtime.author import AssetBound, Context, FileAsset, Outputs, Tree
 
 
 def digest(data):
@@ -33,7 +34,8 @@ def report(stdout, marker):
     return rows[0]
 
 
-def main(ctx: Context, *, native_wheel: FileAsset, out: Outputs) -> Tree:
+def main(ctx: Context, *, native_wheel: Annotated[FileAsset, AssetBound(max_bytes=NATIVE_ASSET_BYTES)],
+         comfy_bundle: Annotated[FileAsset, AssetBound(max_bytes=COMFY_ASSET_BYTES)], out: Outputs) -> Tree:
     root = Path(tempfile.mkdtemp(prefix='cozy-consumer-proof-'))
     receipts, work = root / 'receipts', root / 'work'
     for name in ('source', 'logs', 'reports'):
@@ -51,6 +53,8 @@ def main(ctx: Context, *, native_wheel: FileAsset, out: Outputs) -> Tree:
     helper = {}
     exec(compile(FILES['owned_child.py'], 'owned_child.py', 'exec'), helper)
     run_owned = helper['run_owned']
+    native = {}
+    exec(compile(FILES['native_io.py'], 'native_io.py', 'exec'), native)
 
     def setup(name, command, env, cwd=None, timeout=60):
         result = run_owned(command, receipts / f'logs/{name}.stdout', receipts / f'logs/{name}.stderr',
@@ -73,23 +77,34 @@ def main(ctx: Context, *, native_wheel: FileAsset, out: Outputs) -> Tree:
         from cozy_runtime._build_provenance import COMMIT
         identity.update(runtime_source=COMMIT, runtime=importlib.metadata.version('cozy-runtime'))
         assert COMMIT == SPEC['runtime']['source'] and identity['runtime'] == SPEC['runtime']['version'], 'wrong live candidate Runtime'
+        assert SPEC['proof_source'] == SPEC['native']['source'], 'proof/native source mismatch'
+        identity['dependencies'] = {name: importlib.metadata.version(name) for name in SPEC['dependencies']['versions']}
+        for name, expected in SPEC['dependencies']['versions'].items():
+            actual = identity['dependencies'][name]
+            assert actual == expected or ('+' not in expected and actual.split('+')[0] == expected), 'installed dependency differs: ' + name
         raw = native_wheel.read_bytes()
         assert digest(raw) == SPEC['native']['sha256'] and len(raw) == SPEC['native']['bytes'], 'wrong native FileAsset'
         wheel = work / SPEC['native']['file']
         wheel.write_bytes(raw)
         identity['native_sha256'] = digest(raw)
+        bundled = comfy_bundle.read_bytes()
+        assert len(bundled) == SPEC['comfy_bundle']['bytes'] and digest(bundled) == SPEC['comfy_bundle']['sha256'], 'wrong Comfy bundle FileAsset'
+        bundle = work / 'comfy.bundle'
+        bundle.write_bytes(bundled)
+        identity['comfy_bundle_sha256'] = digest(bundled)
         comfy = work / 'comfy'
         commands = [['git', 'init', '--quiet', str(comfy)],
-                    ['git', '-C', str(comfy), 'remote', 'add', 'origin', 'https://github.com/Comfy-Org/ComfyUI.git'],
-                    ['git', '-C', str(comfy), 'fetch', '--quiet', '--depth=1', 'origin', SPEC['comfy_source']],
+                    ['git', '-C', str(comfy), 'bundle', 'verify', str(bundle)],
+                    ['git', '-C', str(comfy), 'fetch', '--quiet', str(bundle), SPEC['comfy_source']],
                     ['git', '-C', str(comfy), 'checkout', '--quiet', '--detach', 'FETCH_HEAD']]
-        for name, command in zip(('comfy-init', 'comfy-remote', 'comfy-fetch', 'comfy-checkout'), commands):
+        for name, command in zip(('comfy-init', 'comfy-bundle-verify', 'comfy-fetch', 'comfy-checkout'), commands):
             setup(name, command, env)
         archive = setup('comfy-archive', ['git', '-C', str(comfy), 'archive', '--format=tar', 'HEAD', 'comfy', 'LICENSE'], env)
         (receipts / 'source/comfy-upstream.tar').write_bytes(archive)
         identity['comfy_archive_sha256'] = digest(archive)
         for name in SPEC['requested']:
-            clean = name == 'kernel'
+            native_case = name in native['IDS']
+            clean = name in ('kernel', 'fork-cleanup')
             directory = work / name
             directory.mkdir()
             venv.EnvBuilder(with_pip=False).create(directory / 'venv')
@@ -100,24 +115,51 @@ def main(ctx: Context, *, native_wheel: FileAsset, out: Outputs) -> Tree:
             with zipfile.ZipFile(wheel) as source:
                 assert all(not Path(n).is_absolute() and '..' not in Path(n).parts for n in source.namelist())
                 source.extractall(purelib)
-            if clean:
+            if native_case:
+                row = next(c for c in SPEC['native_io']['commands'] if c['id'] == name)
+                script = receipts / 'source' / row['file']
+                # The metadata-only check runs in a different process. The direct proof
+                # starts with no imported framework or initialized CUDA, including fork.
+                code = ('import importlib.metadata as m,json,os,sys; '
+                        'versions={d.metadata["Name"].lower().replace("_","-"):d.version for d in m.distributions()}; '
+                        'print(json.dumps({"executable":sys.executable,"python_optimize":sys.flags.optimize,'
+                        '"no_user_site":sys.flags.no_user_site,"cuda_visible_devices":os.environ.get("CUDA_VISIBLE_DEVICES"),'
+                        '"cublas_workspace_config":os.environ.get("CUBLAS_WORKSPACE_CONFIG"),'
+                        '"torch":versions.get("torch"),"triton":versions.get("triton"),"numpy":versions.get("numpy")}))')
+                observed = json.loads(setup(name + '-environment', [str(py), '-c', code], env))
+                observed['profile'] = row['profile']
+                observed['installed_native_extension_sha256'] = digest((purelib / SPEC['native']['extension_file']).read_bytes())
+                assert observed['installed_native_extension_sha256'] == SPEC['native']['extension_sha256']
+                assert (observed['torch'] is None and observed['triton'] is None) if clean else bool(observed['torch'] and observed['numpy'])
+                (receipts / f'reports/{name}-environment.json').write_text(json.dumps(observed, indent=2) + '\n')
+                command = [str(py), '-u', str(script), *row['argv']]
+                limit = row['timeout_s']
+            elif clean:
                 script = receipts / 'source' / SPEC['kernel']['file']
                 extra = SPEC['kernel']['argv']
                 marker = SPEC['kernel']['schema']
             else:
                 script = receipts / 'source' / SPEC['consumers'][name]['file']
-                extra = ['--device', 'cuda:0', '--native-source', SPEC['native']['source'], '--wheel', str(wheel)]
+                extra = ['--device', 'cuda:0', '--native-source', SPEC['native']['source'], '--wheel', str(wheel),
+                         '--wheel-sha256', SPEC['native']['sha256']]
                 if name == 'comfy':
                     extra += ['--comfy-root', str(comfy)]
                 marker = f'public-tensorfs-{name}-unet-cuda'
-            command = [str(py), str(receipts / 'source/child.py'), str(receipts / f'reports/{name}-identity.json'),
-                       name, str(script), *extra]
+            if not native_case:
+                command = [str(py), str(receipts / 'source/child.py'), str(receipts / f'reports/{name}-identity.json'),
+                           name, str(script), *extra]
+                limit = helper['KERNEL_SECONDS'] if clean else helper['CONSUMER_SECONDS']
             done = run_owned(command, receipts / f'logs/{name}.stdout', receipts / f'logs/{name}.stderr',
-                             timeout=helper['KERNEL_SECONDS'] if clean else helper['CONSUMER_SECONDS'], env=env, cwd=directory)
+                             timeout=limit, env=env, cwd=directory)
             part = {'name': name, **done, 'ok': False}
             parts.append(part)
             try:
-                result = report((receipts / f'logs/{name}.stdout').read_text(), marker)
+                stdout = (receipts / f'logs/{name}.stdout').read_text()
+                if native_case:
+                    gpu = json.loads((receipts / 'reports/diffusers-identity.json').read_text())['gpu_uuid']
+                    result = native['parse'](name, stdout, SPEC['native'], gpu)
+                else:
+                    result = report(stdout, marker)
                 (receipts / f'reports/{name}.json').write_text(json.dumps(result, indent=2) + '\n')
                 part['ok'] = done['ok']
             except ValueError as error:
