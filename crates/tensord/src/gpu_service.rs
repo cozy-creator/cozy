@@ -3738,9 +3738,6 @@ impl Pool {
             .join(", ")
     }
 
-    /// An executor's out-of-memory retry asks for `free_bytes` from the other tenants: idle
-    /// weights leave first, then idle processes; its cap rises into what they gave.
-
 }
 
 /// A grant from one cap per GPU: rank 0's, and for a group every rank's own. A GPU that
