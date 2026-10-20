@@ -399,7 +399,7 @@ fn runtime_checkpoint_uploads_with_the_ordinary_owner_credential() {
             &refused_destination,
             &source_tree,
             &source_store,
-            None,
+            "main",
         )
         .await
         .unwrap();
