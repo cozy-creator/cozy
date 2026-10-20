@@ -80,7 +80,7 @@ async fn download(client: &Client, id: &str, hub: &str) -> serde_json::Value {
             lane: "bf16".into(),
             ..Default::default()
         }],
-        hub: Some(v1::HubAccess { origin: hub.into(), object_hosts: vec!["localhost".into()], ..Default::default() }),
+        hub: Some(v1::HubAccess { origin: hub.into(), ..Default::default() }),
         catalog_revision: "r1".into(),
         owner: "alice".into(),
         ..Default::default()

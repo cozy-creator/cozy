@@ -37,7 +37,7 @@ pub(crate) struct Hubs {
     home: Home,
     pub(crate) configured: Vec<config::Hub>,
     listings: Mutex<HashMap<String, Listing>>,
-    /// This computer's account at each Hub, for runs' capabilities.
+    /// This computer's account at each Hub and where machines read it, for runs' access.
     pub(crate) facts: Mutex<HashMap<config::Origin, crate::access::Facts>>,
 }
 
