@@ -349,12 +349,6 @@ impl Machine {
         }
     }
 
-    /// Its TLS leaf's private key (PKCS#8 DER): the key it proves itself with at a Hub.
-    pub fn leaf_key(&self) -> Vec<u8> {
-        let key = self.root.path().join("machine/run/cozy/bootstrap/tls.key");
-        pem_der(&std::fs::read_to_string(key).unwrap())
-    }
-
     pub fn row(&self, name: &str, key: &Path) -> MachineRow {
         machine(name, Some(self.endpoint.clone()), key)
     }

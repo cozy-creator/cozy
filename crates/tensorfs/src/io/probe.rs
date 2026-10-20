@@ -21,7 +21,9 @@ use super::host::{read_at, Bounce};
 const PROBE: u64 = 1 << 30;
 /// Bytes a probe must read for its rate to stand for the volume (and be kept).
 pub(super) const KEEP: u64 = 256 << 20;
-const BLOCK: usize = 8 << 20;
+/// Reads as a cold device read does: 1 MiB requests (`ReadOpts::default().request`) on 8 threads.
+/// 8 MiB blocks measured 3-7% under that on the same volumes.
+const BLOCK: usize = 1 << 20;
 const THREADS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
