@@ -680,6 +680,44 @@ fn pressure_child() {
     let fixture = Fixture::new();
     let row = fixture.ledger.claim(std::process::id()).unwrap();
     let channel = Channel::new(fixture.ledger.grant(std::process::id()).unwrap().channel);
+    let warm = 20 << 20;
+    for key in [[22; 32], [23; 32]] {
+        assert!(channel
+            .cache_ram(
+                row.owner(),
+                key,
+                &[],
+                &[varena::ledger::RamRegion {
+                    offset: 0,
+                    len: warm,
+                    items: vec![],
+                }]
+            )
+            .unwrap());
+    }
+    observe(&fixture.ledger, || {
+        [[22; 32], [23; 32]].into_iter().all(|key| {
+            channel
+                .ram_status(row.owner(), key)
+                .unwrap()
+                .is_some_and(|status| !status.filling)
+        })
+    });
+    assert_eq!(
+        [[22; 32], [23; 32]]
+            .into_iter()
+            .filter(|key| {
+                channel
+                    .ram_status(row.owner(), *key)
+                    .unwrap()
+                    .unwrap()
+                    .ready
+                    == [true]
+            })
+            .count(),
+        1,
+        "concurrent cache hints cannot spend the same cgroup headroom twice"
+    );
     let len = 64 << 20;
     assert!(platform::contain::host_memory::read().available < len as i64);
     assert!(channel

@@ -16,7 +16,7 @@ use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering::*};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use platform::shm::{self, Region};
 
 use crate::plan::Class;
@@ -1195,6 +1195,8 @@ struct Subscriber {
 pub struct HostCache {
     process: u32,
     state: Mutex<HostState>,
+    warming: Mutex<bool>,
+    next_warm: Condvar,
 }
 #[derive(Default)]
 struct HostState {
@@ -1206,6 +1208,8 @@ impl Default for HostCache {
         Self {
             process: std::process::id(),
             state: Mutex::default(),
+            warming: Mutex::new(false),
+            next_warm: Condvar::new(),
         }
     }
 }
@@ -1217,6 +1221,29 @@ impl HostCache {
             ));
         }
         Ok(())
+    }
+    fn warm_slot(&self, ram: &Ram) -> Option<WarmSlot<'_>> {
+        let mut active = self.warming.lock();
+        while *active {
+            if ram.cancelled.load(Acquire) {
+                return None;
+            }
+            self.next_warm.wait(&mut active);
+        }
+        if ram.cancelled.load(Acquire) {
+            return None;
+        }
+        *active = true;
+        Some(WarmSlot(self))
+    }
+}
+/// Serialize optional cache fills so they cannot spend the same observed host
+/// headroom twice. The coordination mutex is released before any byte I/O.
+struct WarmSlot<'a>(&'a HostCache);
+impl Drop for WarmSlot<'_> {
+    fn drop(&mut self) {
+        *self.0.warming.lock() = false;
+        self.0.next_warm.notify_all();
     }
 }
 impl Custody {
@@ -1371,6 +1398,9 @@ fn register_ram(
                 host: host.clone(),
                 layout,
                 generation,
+            };
+            let Some(_slot) = host.warm_slot(&fill) else {
+                return;
             };
             for (region, ready) in fill.regions.iter().zip(&fill.ready) {
                 // A warm cache never consumes the last observed host headroom. Refusing to warm
