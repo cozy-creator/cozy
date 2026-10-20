@@ -839,6 +839,12 @@ impl Pool {
             self.reserve.lock().unwrap().quiet(others);
         }
     }
+    /// Host RAM for a fill of `need` bytes (a layout an executor seals): rungs go back while the
+    /// host's room is short of it, with or without a PSI trigger, so the kernel never has to
+    /// kill an executor for it (no host-RAM floor: what does not fit pages to disk).
+    pub fn host_room_for(&self, need: u64) {
+        while self.host_room_now().is_some_and(|room| room < need) && self.give_back_one() {}
+    }
     /// One rung back to the host, in the agreed order: sealed layouts no tenant holds, an
     /// import-only parent with no live child, an idle deviceless executor, then an idle
     /// executor (outside every warm set first) on a GPU no call holds. Whether anything went
@@ -2787,6 +2793,7 @@ impl Pool {
                 let pid = if rank == 0 { Some(session.executor.birth.pid) } else { session.followers.get(rank - 1).map(|f| f.birth().pid) };
                 d.memory.as_ref().zip(pid).map(|(memory, pid)| (memory, pid, d.entry.as_str()))
             }).collect(),
+            selections: plan.selections(),
         };
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
@@ -3714,14 +3721,22 @@ struct Callbacks<'a> {
     caller: Option<&'a crate::calls::Caller>,
     /// Each rank's GPU ledger, corresponding executor process and physical lane entry.
     kept: Vec<Option<(&'a GpuLedger, u32, &'a str)>>,
+    /// The checkpoints the call reads and their components: what a missed grant seals.
+    selections: Vec<SelectedManifest>,
 }
 impl Services for Callbacks<'_> {
     /// A weight set's held bytes: the sealed host layout an executor deposited for its manifest
-    /// and layout, else nothing (TensorD never fills).
+    /// and layout, else nothing (TensorD never fills). On a miss the executor seals a host
+    /// layout from the checkpoint: host RAM for its selected bytes is made first.
     fn read_grant(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
         drop(plan);
         let (mut answer, mut fds) = granted(frame.seq, self.deposits.grant(&frame.manifest, &frame.layout));
         let held = answer.held;
+        let id = |m: &str| m.trim_start_matches("sha256:").to_string();
+        let selected = self.selections.iter().find(|s| id(&s.manifest) == id(&frame.manifest));
+        if let Some((need, _)) = selected.filter(|_| !held).and_then(|s| selected_bytes(&self.pool.store, &s.manifest, &s.components).ok()) {
+            self.pool.host_room_for(need);
+        }
         // GPU pages a gone executor kept of this layout follow its host layout.
         let rank = self.kept.get(frame.rank as usize).copied().flatten();
         if let Some((fingerprint, pages)) = rank.filter(|_| held).and_then(|(m, _, _)| m.take_kept(&frame.layout)) {
