@@ -48,11 +48,16 @@ it holds, making room in other executors through the GPU's ledger (design memory
 - 4-byte big-endian length + JSON, any size. `seam::MAX_FRAME` (256 MiB, as Runtime's
   `seam.MAX_FRAME`) refuses only a corrupt or hostile prefix. Bulk data goes through the spool.
 - Any outgoing object key named `token`, `credential`, `authorization`, `secret` or `jwt` is
-  refused. Credentials cannot cross the seam.
+  refused, except `tensorfs.token` on `load`, `invoke` and `bearer`: the request's owner bearer.
 - Commands (`cmd`): `hello`, `start`, `load`, `activate`, `prepare_request`, `invoke`, `map`
   (warming: load the construction's models at `level` `gpu` or `ram`),
   `unload`, `probe`, `fork`, `shutdown`. The usual sequence is
   Hello -> Start -> Load -> Activate -> PrepareRequest -> Invoke.
+- `bearer` (`{"cmd":"bearer","actor","tensorfs":{"endpoint","token","expires_unix_ms"}}`) goes
+  outside any exchange (a `Line`, under the lock every write takes) and is answered by nothing.
+  TensorD sends it to each executor a Load or Invoke gave that signer's token for that endpoint,
+  whenever it holds a newer one. Load and Invoke name `actor`. A Runtime without the handler
+  answers `reply: bearer`, which TensorD ignores.
 - `start` names `ledgers: N` and `memory_mode` (`shared` or `dedicated`); 2N fds follow the
   frame, each GPU of `devices` in order its ledger memfd then its eventfd. Rank 0 claims its row
   in the first and hands follower r its pair.

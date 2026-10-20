@@ -5,6 +5,7 @@
 //! them); a restart before it completes ends the run FAILED (`journal::PREPARING`).
 use crate::{
     api::domain,
+    device_executor::Line,
     call_memo::{self, Memo},
     execution::Stoppable,
     gpu_service::{without_gpus, KeptMember, Level, Member},
@@ -1204,13 +1205,14 @@ impl Runs {
         self.contexts.lock().unwrap().get_mut(id).and_then(|context| context.ahead.take())
     }
 
-    /// The run's TensorFS options for its Runtime, with its owner's newest bearer at its Hub.
-    pub(crate) fn tensorfs(&self, id: &str) -> Option<protocol::machine::TensorFSOptions> {
+    /// The run's TensorFS options for the Runtime `line` reaches, with its owner's newest bearer
+    /// at its Hub, of which that executor hears each newer one.
+    pub(crate) fn tensorfs(&self, id: &str, line: Line) -> Option<protocol::machine::TensorFSOptions> {
         let contexts = self.contexts.lock().unwrap();
         let context = contexts.get(id)?;
         let mut options = context.tensorfs.clone()?;
         if let Some(bearer) = context.hub.as_ref().and_then(|hub| hub.bearer_at(&options.endpoint)) {
-            (options.token, options.expires_unix_ms) = bearer.held();
+            (options.token, options.expires_unix_ms) = bearer.given(line, &options.endpoint);
         }
         Some(options)
     }

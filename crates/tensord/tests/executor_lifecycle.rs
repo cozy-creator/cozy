@@ -89,6 +89,7 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
         },
         DeviceCommand::Load {
             tensorfs: None,
+            actor: String::new(),
             construction: "lifecycle".into(),
             devices: String::new(),
             sequence_parallel_degree: 1,
@@ -490,6 +491,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
         },
         DeviceCommand::Load {
             tensorfs: None,
+            actor: String::new(),
             construction: "lifecycle".into(),
             devices: String::new(),
             sequence_parallel_degree: 1,
