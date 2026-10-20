@@ -532,8 +532,6 @@ class Memory:
         self.demands = 0
         #: host tiers sealed here for the executor to deposit
         self.deposits: list[tuple[Model, int]] = []
-        #: granted host tiers adopted before their modules exist (`adopt`), by grant key
-        self.adopted: dict[str, WeightSet] = {}
         #: its requests waiting for room (§2), counted under `freeing`
         self.waiting = 0
         self.freeing = threading.Lock()
@@ -606,37 +604,6 @@ class Memory:
         self._publish()
         return model
 
-    def adopt(self, grant: WeightGrant) -> None:
-        """Before its module is built: the host tier granted for it (`grant.host_fd`), registered
-        from the regions it carries, its copies to the GPU started into free room. `load` binds
-        the module to it when the module's regions are the same; else it is a miss, and the
-        module loads as if nothing were granted."""
-        if grant.host_fd is None:
-            return
-        with self.lock:
-            files = list(grant.files) or None
-            ws = self.core.adopt(self._name(grant.key), grant.ck, grant.host_fd, files)
-            self._share(ws, grant)
-            self.adopted[grant.key] = ws
-            room = self._free() - self._headroom() if self.cuda else 0
-            for region, span in enumerate(ws.spans):
-                if span > room:
-                    break
-                try:
-                    ws.prefetch(region)
-                except DeviceFull:
-                    break
-                room -= span
-        self._publish()
-
-    def unclaimed(self) -> None:
-        """Let go of what `adopt` took that no `load` bound."""
-        with self.lock:
-            adopted, self.adopted = self.adopted, {}
-        for ws in adopted.values():
-            ws.close()
-        self._publish()
-
     def _share(self, ws: WeightSet, grant: WeightGrant) -> None:
         """Under TensorD, a set's home pages can be kept past this process; pages a gone
         executor kept for it map now, no copy, when they hold what this set holds."""
@@ -645,7 +612,7 @@ class Memory:
                 ws.adopt_pages(list(grant.pages))
 
     def _name(self, key: str) -> str:
-        taken = {*self.models, *(ws.name for ws in self.adopted.values())}
+        taken = set(self.models)
         name, n = key, 1
         while name in taken:
             n += 1
@@ -664,27 +631,24 @@ class Memory:
         if grant is None:
             raise Unbound(f"{type(module).__name__}: no weights attached (`Declared.weights`)")
         paths, regions = blocks_of(module), regions_of(module)
+        # One load, fresh or after a restart: the held host layout TensorD granted, else one sealed
+        # now; then the pages a gone executor kept of it, a cache hit (a fill's are never kept)
         files, host_fd = list(grant.files) or None, grant.host_fd
-        # a fill's model keeps its early copies: they stay fresh until bound, and its pages are
-        # never kept (`Model.kept`), so none it adopted was baked elsewhere
-        ws = self.adopted.pop(grant.key, None)
-        if ws is None and host_fd is not None:
+        ws, sealed = None, None
+        if host_fd is not None:
             ws = self.core.adopt(self._name(grant.key), grant.ck, host_fd, files)
-            if declared.fill is None:
-                self._share(ws, grant)
-        if ws is not None and ws.regions != regions:
-            ws.close()
-            if grant.ck.manifest is None and not files:
-                raise LayoutChanged("a held layout of other regions needs its chunk-file grant")
-            ws, host_fd = None, None
-        sealed = None
+            if ws.regions != regions:
+                ws.close()
+                if grant.ck.manifest is None and not files:
+                    raise LayoutChanged("a held layout of other regions needs its chunk-file grant")
+                ws, host_fd = None, None
         if ws is None:
             name = self._name(grant.key)
             if host_fd is None and self.cuda and self.granted:
                 host_fd = sealed = seal(grant.ck, regions, name, files=files)
             ws = self.core.register(name, grant.ck, regions, host_fd, files)
-            if declared.fill is None:
-                self._share(ws, grant)
+        if declared.fill is None:
+            self._share(ws, grant)
         model = Model(self, ws.name, grant.key, module, ws, declared)
         if sealed is not None:
             self.deposits.append((model, sealed))
@@ -1296,15 +1260,14 @@ class Memory:
         resident = {s.name: int(s.resident) for s in self.core.stats().sets}  # type: ignore[union-attr]
         models = list(self.models.values())
         bytes_of = lambda ms: sum(resident.get(m.name, 0) for m in ms)  # noqa: E731
-        adopted = sum(resident.get(ws.name, 0) for ws in self.adopted.values())
         cold = [m for m in models if not m.flight and not m.held]
         reserved, allocated = torch.cuda.memory_reserved(gpu), torch.cuda.memory_allocated(gpu)
         row.publish(
             context=self.context,
-            resident=bytes_of(models) + adopted,
+            resident=bytes_of(models),
             cold=bytes_of(cold),
             kept=bytes_of(m for m in cold if m.level is Level.GPU),
-            pinned=bytes_of(m for m in models if m.flight or m.held) + adopted,
+            pinned=bytes_of(m for m in models if m.flight or m.held),
             torch_reserved=reserved,
             torch_allocated=allocated,
             cache=sum(c.nbytes for c in list(self.caches)),
