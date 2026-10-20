@@ -15,7 +15,7 @@ use tensorfs::format::{
     Body, Config, ConfigValue, Dtype, Encoding, Header, Metadata, ObjectRef, Tensor, Value,
 };
 use tensorfs::{
-    Checkpoint, Client, Convert, Failure, Fetch, Format, Kind, Open, Ref, Selection, Writer,
+    Checkpoint, Client, Convert, Failure, Download, Format, Kind, Open, Ref, Selection, Writer,
     WriterOptions,
 };
 
@@ -246,7 +246,7 @@ impl PyClient {
         Ok(Self { client })
     }
 
-    #[pyo3(signature = (name_or_path, *, revision = None, variant = None, local_files_only = false))]
+    #[pyo3(signature = (name_or_path, *, revision = None, variant = None, local_files_only = false, lazy = true))]
     fn open(
         &self,
         py: Python<'_>,
@@ -254,11 +254,13 @@ impl PyClient {
         revision: Option<String>,
         variant: Option<String>,
         local_files_only: bool,
+        lazy: bool,
     ) -> PyResult<PyCheckpoint> {
         let options = Open {
             revision,
             variant,
             local_files_only,
+            lazy,
             ..Open::default()
         };
         let checkpoint = py
@@ -268,7 +270,7 @@ impl PyClient {
     }
 
     #[pyo3(signature = (repo_id, *, revision = None, variant = None, components = None, local_dir = None, local_files_only = false))]
-    fn snapshot_download(
+    fn materialize(
         &self,
         py: Python<'_>,
         repo_id: &str,
@@ -280,12 +282,12 @@ impl PyClient {
     ) -> PyResult<PathBuf> {
         let reference = reference(repo_id, revision, variant).or_raise(py)?;
         let selection = components.map(Selection::Components).unwrap_or_default();
-        let want = Fetch {
+        let want = Download {
             selection,
-            ..Fetch::default()
+            ..Download::default()
         };
         py.detach(|| {
-            bridge(self.client.snapshot_download(
+            bridge(self.client.materialize(
                 &reference,
                 &want,
                 local_dir.as_deref(),
@@ -296,7 +298,7 @@ impl PyClient {
     }
 
     #[pyo3(signature = (repo_id, filename, *, revision = None, local_dir = None, local_files_only = false))]
-    fn hub_download(
+    fn download_file(
         &self,
         py: Python<'_>,
         repo_id: &str,
@@ -307,7 +309,7 @@ impl PyClient {
     ) -> PyResult<PathBuf> {
         let reference = reference(repo_id, revision, None).or_raise(py)?;
         py.detach(|| {
-            bridge(self.client.hub_download(
+            bridge(self.client.download_file(
                 &reference,
                 filename,
                 local_dir.as_deref(),
@@ -397,7 +399,7 @@ fn _export(
     };
     let dtype = dequantize.map(|d| Dtype::parse(&d.to_ascii_uppercase()));
     py.detach(move || {
-        bridge(checkpoint.fetch(&Fetch::default()))?;
+        bridge(checkpoint.download(&Download::default()))?;
         tensorfs::export(&checkpoint, &directory, format, dtype)
     })
     .or_raise(py)
@@ -725,7 +727,7 @@ impl PyCheckpoint {
                 bridge(tensorfs::raw::fetch_objects(
                     &access,
                     objects,
-                    &Fetch::default(),
+                    &Download::default(),
                 ))
                 .map(drop)
             }),
@@ -779,9 +781,9 @@ impl CheckpointAccess {
             }
             bridge(async {
                 for selection in selections {
-                    self.fetch(&Fetch {
+                    self.download(&Download {
                         selection,
-                        ..Fetch::default()
+                        ..Download::default()
                     })
                     .await?;
                 }
@@ -792,14 +794,14 @@ impl CheckpointAccess {
     }
 
     fn fetch_assets(&self, py: Python<'_>, component: &str, name: Option<&str>) -> PyResult<()> {
-        let want = Fetch {
+        let want = Download {
             selection: Selection::Assets {
                 component: component.to_owned(),
                 names: name.map(|n| vec![n.to_owned()]),
             },
-            ..Fetch::default()
+            ..Download::default()
         };
-        py.detach(|| bridge(self.fetch(&want)))
+        py.detach(|| bridge(self.download(&want)))
             .or_raise(py)
             .map(drop)
     }
@@ -848,7 +850,7 @@ impl PyCheckpoint {
             bridge(tensorfs::raw::fetch_objects(
                 &access,
                 std::slice::from_ref(object),
-                &Fetch::default(),
+                &Download::default(),
             ))
         })
         .or_raise(py)?;
@@ -996,7 +998,7 @@ impl PyCheckpoint {
     }
 
     #[pyo3(signature = (components = None, *, priority = 0, progress = None))]
-    fn fetch(
+    fn download(
         &self,
         py: Python<'_>,
         components: Option<Vec<String>>,
@@ -1018,14 +1020,14 @@ impl PyCheckpoint {
             }
             Ok(())
         };
-        let want = Fetch {
+        let want = Download {
             selection: components.map(Selection::Components).unwrap_or_default(),
             priority,
             progress: progress
                 .as_ref()
                 .map(|_| &report as &tensorfs::Progress<'_>),
         };
-        let result = py.detach(|| bridge(access.fetch(&want))).map(drop);
+        let result = py.detach(|| bridge(access.download(&want))).map(drop);
         if let Some(error) = callback_error
             .into_inner()
             .unwrap_or_else(|e| e.into_inner())

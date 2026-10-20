@@ -11,6 +11,10 @@ import tensorfs
 from tensorfs import _ext, raw, varena
 
 assert not hasattr(tensorfs, "Store"), "the cache implementation leaked into the public API"
+for name in ("materialize", "download_file"):
+    assert name in tensorfs.__all__ and callable(getattr(tensorfs, name)), name
+for obsolete in ("snapshot_download", "hub_download", "download"):
+    assert not hasattr(tensorfs, obsolete) and not hasattr(tensorfs.api, obsolete), obsolete
 for obsolete in ("Closure", "ReadPlan", "parse_header", "plan", "regions", "Info", "Part"):
     assert not hasattr(tensorfs, obsolete) and not hasattr(_ext, obsolete), obsolete
 assert importlib.util.find_spec("tensorfs.records") is None, "the legacy projection remains importable"
@@ -34,6 +38,7 @@ with TemporaryDirectory() as temp:
     (root / "folder/README.md").write_text("a repo file\n")
     ck = writer.commit()
     assert not hasattr(ck, "read") and not hasattr(ck, "tensors") and not hasattr(ck, "path"), "checkpoint-wide tensor APIs remain public"
+    assert callable(ck.download) and not hasattr(ck, "fetch")
     assert tensorfs.open(root / "folder", variant="f32").id == ck.id
     assert tensorfs.open(root / "folder/model.f32.cozytensors").id == ck.id
     assert np.array_equal(np.from_dlpack(ck.components["model"].tensors.read("weight")), values)
@@ -64,11 +69,11 @@ with TemporaryDirectory() as temp:
         derived.component("copy", cls=component.cls, config=component.config).copy("weight", component)
     again = derived.commit()
     assert np.array_equal(np.from_dlpack(again.components["copy"].tensors.read("weight")), values)
-    downloaded = tensorfs.snapshot_download("local/example", revision="draft", local_dir=root / "download")
+    downloaded = tensorfs.materialize("local/example", revision="draft", local_dir=root / "download")
     assert tensorfs.open(downloaded, variant="f32").id == ck.id
     assert (Path(downloaded) / "model.f16.cozytensors").is_file()
-    assert Path(tensorfs.hub_download("local/example", "README.md", revision="draft")).read_text() == "a repo file\n"
-    default_snapshot = tensorfs.snapshot_download("local/example", revision="draft")
+    assert Path(tensorfs.download_file("local/example", "README.md", revision="draft")).read_text() == "a repo file\n"
+    default_snapshot = tensorfs.materialize("local/example", revision="draft")
     assert Path(default_snapshot).name == tree.removeprefix("sha256:")
     origin = (root / "origin").as_uri()
     remote_tree = tensorfs.upload_folder(repo_id="acme/example", revision="1", folder_path=root / "folder", endpoint=origin)
@@ -82,15 +87,31 @@ with TemporaryDirectory() as temp:
     exported = Path(metadata.components["model"].export_files(root / "remote-support"))
     assert (exported / "tokenizer.json").read_bytes() == b"{}"
     assert metadata.missing(["model"]), "exporting support files fetched its tensors"
-    only = tensorfs.snapshot_download("acme/example", revision="1", variant="f32", components=["model"], endpoint=origin, cache_dir=remote_cache)
+    only = tensorfs.materialize("acme/example", revision="1", variant="f32", components=["model"], endpoint=origin, cache_dir=remote_cache)
     assert not (Path(only) / "model.f16.cozytensors").exists()
     selected = tensorfs.open(only, cache_dir=remote_cache)
     assert selected.missing(["model"]) == []
     assert selected.missing(["optimizer"]), "a model-only snapshot fetched the optimizer"
     assert np.array_equal(np.from_dlpack(selected.components["model"].tensors.read("weight")), values)
     assert metadata.missing(["optimizer"]), "reading one component fetched another"
+    eager_cache = root / "eager-cache"
+    eager = tensorfs.open("acme/example", revision="1", variant="f32", endpoint=origin,
+                          cache_dir=eager_cache, lazy=False)
+    assert eager.missing() == [] and eager.id == ck.id
+    assert eager.components["model"].asset("tokenizer.json") == b"{}"
+    assert not (eager_cache / "snapshots" / remote_tree.removeprefix("sha256:")).exists()
+    thin = root / "thin.cozytensors"
+    thin.write_bytes((root / "folder/model.f32.cozytensors").read_bytes())
+    offline = dict(endpoint="http://127.0.0.1:1", cache_dir=root / "offline", local_files_only=True)
+    assert tensorfs.open(thin, **offline).id == ck.id
+    try:
+        tensorfs.open(thin, lazy=False, **offline)
+    except tensorfs.NotFoundError:
+        pass
+    else:
+        raise AssertionError("eager local-only open returned with missing checkpoint data")
     progress = []
-    metadata.fetch(["model"], progress=lambda stage, held, total: progress.append((stage, held, total)))
+    metadata.download(["model"], progress=lambda stage, held, total: progress.append((stage, held, total)))
     assert progress[0][0] == "fetch" and progress[-1][1] == progress[-1][2]
     callback_failure = tensorfs.NetworkError("consumer progress failed")
 
@@ -98,7 +119,7 @@ with TemporaryDirectory() as temp:
         raise callback_failure
 
     try:
-        metadata.fetch(progress=stop)
+        metadata.download(progress=stop)
     except tensorfs.NetworkError as error:
         assert error is callback_failure
     else:

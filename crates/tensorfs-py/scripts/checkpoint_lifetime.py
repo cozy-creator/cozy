@@ -96,12 +96,12 @@ with tempfile.TemporaryDirectory() as temp:
                                    token=provider, cache_dir=root / "race-reader")
         provider.block = True
         entered, resume = provider.entered, provider.resume
-        fetch = checkpoint.fetch
+        download = checkpoint.download
         errors = []
 
         def fetching():
             try:
-                fetch()
+                download()
             except BaseException as error:
                 errors.append(error)
 
@@ -116,7 +116,7 @@ with tempfile.TemporaryDirectory() as temp:
         resume.set()
         thread.join(10)
         assert not thread.is_alive() and not errors, errors
-        del fetch, checkpoint
+        del download, checkpoint
         gc.collect()
         assert alive() is None, "a completed call retained its closed parent's provider"
 
@@ -153,7 +153,7 @@ with tempfile.TemporaryDirectory() as temp:
         header.write_bytes(saved_header)
         assert checkpoint.verify() == []
         descriptor = checkpoint.open_chunk(part.chunk)
-    for call in [lambda: checkpoint.components, lambda: checkpoint.missing(), lambda: checkpoint.fetch(),
+    for call in [lambda: checkpoint.components, lambda: checkpoint.missing(), lambda: checkpoint.download(),
                  lambda: checkpoint.open_chunk(0), lambda: checkpoint.verify(), lambda: checkpoint.__enter__()]:
         try:
             call()

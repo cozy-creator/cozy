@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tensorfs::format::{Config as ComponentConfig, Dtype, ObjectRef};
-use tensorfs::{Client, Config, Fetch, Open, WriterOptions};
+use tensorfs::{Client, Config, Download, Open, WriterOptions};
 
 const DATA: &[u8] = b"native-file-process-proof";
 
@@ -93,7 +93,7 @@ fn native_handle_reader_child() {
             .await
             .unwrap();
         assert_eq!(checkpoint.id().id(), expected);
-        checkpoint.fetch(&Fetch::default()).await.unwrap();
+        checkpoint.download(&Download::default()).await.unwrap();
         assert_eq!(
             checkpoint
                 .component("model")

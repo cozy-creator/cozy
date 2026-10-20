@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tensorfs::format::{Body, Component, Dtype, Header, Location, ObjectRef, Tensor};
-use tensorfs::{export, Client, Config, Fetch, Format, Kind, Open, Ref, Selection, WriterOptions};
+use tensorfs::{export, Client, Config, Download, Format, Kind, Open, Ref, Selection, WriterOptions};
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -124,7 +124,7 @@ async fn public_export_keeps_plain_folder_repository_bytes_without_admitting_pay
         "metadata-only open admitted asset payload"
     );
     drop(client);
-    checkpoint.fetch(&Fetch::default()).await.unwrap();
+    checkpoint.download(&Download::default()).await.unwrap();
     let destination = scratch.0.join("export");
     let paths = export(&checkpoint, &destination, Format::Safetensors, None).unwrap();
     assert!(paths.iter().any(|p| p == "README.bin"));
@@ -159,12 +159,12 @@ async fn public_export_requires_selected_repo_bytes_and_owns_them_after_client_d
         "failed availability check created an export"
     );
     checkpoint
-        .fetch(&Fetch {
+        .download(&Download {
             selection: Selection::Assets {
                 component: "model".into(),
                 names: None,
             },
-            ..Fetch::default()
+            ..Download::default()
         })
         .await
         .unwrap();
@@ -187,7 +187,7 @@ async fn public_export_requires_selected_repo_bytes_and_owns_them_after_client_d
             .unwrap(),
         ASSET
     );
-    checkpoint.fetch(&Fetch::default()).await.unwrap();
+    checkpoint.download(&Download::default()).await.unwrap();
     assert!(checkpoint.missing(&Selection::All).unwrap().is_empty());
     drop(reader);
     export(&checkpoint, &destination, Format::Safetensors, None).unwrap();
@@ -227,8 +227,8 @@ async fn same_header_repository_trees_keep_distinct_folders_through_public_uploa
         .unwrap();
     assert_eq!(a.id(), b.id());
     assert_ne!(a.tree(), b.tree());
-    a.fetch(&Fetch::default()).await.unwrap();
-    b.fetch(&Fetch::default()).await.unwrap();
+    a.download(&Download::default()).await.unwrap();
+    b.download(&Download::default()).await.unwrap();
     let a_folder = scratch.0.join("portable-first");
     let b_folder = scratch.0.join("portable-second");
     export(&a, &a_folder, Format::Cozytensors, None).unwrap();
@@ -657,7 +657,7 @@ async fn literal_header_fetches_selected_missing_payload_online_but_not_offline_
         .await
         .unwrap();
     assert_eq!(
-        offline.fetch(&Fetch::default()).await.unwrap_err().kind,
+        offline.download(&Download::default()).await.unwrap_err().kind,
         Kind::NotFound
     );
     let cache = scratch.0.join("online-cache");
@@ -666,12 +666,12 @@ async fn literal_header_fetches_selected_missing_payload_online_but_not_offline_
         .await
         .unwrap();
     online
-        .fetch(&Fetch {
+        .download(&Download {
             selection: Selection::Assets {
                 component: "model".into(),
                 names: None,
             },
-            ..Fetch::default()
+            ..Download::default()
         })
         .await
         .unwrap();
@@ -684,7 +684,7 @@ async fn literal_header_fetches_selected_missing_payload_online_but_not_offline_
         ASSET
     );
     assert!(!cache.join(ObjectRef::of(WEIGHT).key()).exists());
-    online.fetch(&Fetch::default()).await.unwrap();
+    online.download(&Download::default()).await.unwrap();
     let output = scratch.0.join("literal-portable");
     export(&online, &output, Format::Cozytensors, None).unwrap();
     assert!(!output.join("README.bin").exists());
@@ -738,7 +738,7 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
         .open(&format!("acme/streamed@{}", tree.id()), &Open::default())
         .await
         .unwrap();
-    remote.fetch(&Fetch::default()).await.unwrap();
+    remote.download(&Download::default()).await.unwrap();
     assert_eq!(
         remote.component("model").unwrap().read("w").unwrap(),
         WEIGHT
@@ -1209,7 +1209,7 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
     let cache = scratch.0.join("reader-cache");
     let reader = client(&cache, &endpoint);
     let managed = reader.open(&tree.id(), &Open::default()).await.unwrap();
-    managed.fetch(&Fetch::default()).await.unwrap();
+    managed.download(&Download::default()).await.unwrap();
     let readme = cache.join(ObjectRef::of(README).key());
     fs::write(&readme, vec![b'!'; README.len()]).unwrap();
     let bad_repo = scratch.0.join("bad-repo-export");
@@ -1295,7 +1295,7 @@ async fn streaming_writer_resumes_its_keyed_journal_after_drop_then_publishes_th
         .open(&checkpoint.tree().unwrap().id(), &Open::default())
         .await
         .unwrap();
-    remote.fetch(&Fetch::default()).await.unwrap();
+    remote.download(&Download::default()).await.unwrap();
     drop(client);
     drop(resumed);
     drop(checkpoint);

@@ -30,21 +30,21 @@ def _client(cache_dir=None, endpoint=None, token=None, ca_der=None, *, configure
     return _ext._Client(_cache(cache_dir), endpoint=_endpoint(endpoint), token=credential, ca_der=ca_der)
 
 
-def open(name_or_path, *, revision=None, variant=None, endpoint=None, local_files_only=False, cache_dir=None, token=None, ca_der=None):
+def open(name_or_path, *, revision=None, variant=None, endpoint=None, local_files_only=False, cache_dir=None, token=None, ca_der=None, lazy=True):
     return _client(cache_dir, endpoint, token, ca_der).open(
-        os.fspath(name_or_path), revision=revision, variant=variant, local_files_only=local_files_only
+        os.fspath(name_or_path), revision=revision, variant=variant, local_files_only=local_files_only, lazy=lazy
     )
 
 
-def snapshot_download(repo_id: str, *, revision=None, variant=None, components=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
-    return str(_client(cache_dir, endpoint, token, ca_der).snapshot_download(
+def materialize(repo_id: str, *, revision=None, variant=None, components=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
+    return str(_client(cache_dir, endpoint, token, ca_der).materialize(
         repo_id, revision=revision, variant=variant, components=components,
         local_dir=local_dir, local_files_only=local_files_only,
     ))
 
 
-def hub_download(repo_id: str, filename: str, *, revision=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
-    return str(_client(cache_dir, endpoint, token, ca_der).hub_download(
+def download_file(repo_id: str, filename: str, *, revision=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
+    return str(_client(cache_dir, endpoint, token, ca_der).download_file(
         repo_id, filename, revision=revision, local_dir=local_dir, local_files_only=local_files_only,
     ))
 

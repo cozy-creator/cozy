@@ -36,7 +36,7 @@ from ._ext import (
     __version__,
 )
 from . import raw
-from .api import ComponentWriter, Endpoint, Writer, configure, convert, export, hub_download, open, resolve_source, snapshot_download, upload_folder
+from .api import ComponentWriter, Endpoint, Writer, configure, convert, export, download_file, open, resolve_source, materialize, upload_folder
 
 Mapping.register(Tensors)
 
@@ -70,9 +70,9 @@ __all__ = [
     "configure",
     "convert",
     "export",
-    "hub_download",
+    "download_file",
     "resolve_source",
     "open",
-    "snapshot_download",
+    "materialize",
     "upload_folder",
 ]
