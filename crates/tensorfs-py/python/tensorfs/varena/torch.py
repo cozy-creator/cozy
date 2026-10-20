@@ -1444,7 +1444,7 @@ class Memory:
             torch.cuda.synchronize(self.gpu)
             torch._C._cuda_clearCublasWorkspaces()  # cuBLAS keeps one per stream: not the request's
             torch.cuda.empty_cache()
-            if cuts.hosted_end():  # rung 5's page-locked blocks go back to the host
+            if cuts.hosted_end(self.device):  # rung 5's page-locked blocks go back to the host
                 torch.accelerator.empty_host_cache()
             tail = torch.cuda.max_memory_allocated(self.gpu) - request.start
             request.peak = max(request.peak, tail)
