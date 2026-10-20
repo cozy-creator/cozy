@@ -312,12 +312,7 @@ fn convert(
 fn assert_bytes(store: &Store, id: &ObjectRef, files: &BTreeMap<String, ObjectRef>) {
     let ck = store.checkpoint(id).unwrap();
     assert_eq!(ck.read("model", "weight").unwrap(), DATA);
-    let component = ck
-        .header()
-        .components
-        .iter()
-        .find(|component| component.name == "model")
-        .unwrap();
+    let component = ck.component("model").unwrap();
     assert_eq!(
         component.config_file.as_deref(),
         Some("scheduler_config.json")
