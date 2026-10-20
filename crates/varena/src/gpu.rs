@@ -486,13 +486,13 @@ impl Gpu {
 
     /// Called on an I/O worker, outside the policy lock. A concurrent bind sees Filling.
     pub fn fill(self: &Arc<Self>, id: PageId) -> Result<ReadStats> {
-        self.fill_bytes(id, None, |_| Ok(()))
+        self.fill_bytes(id, None, None, |_| Ok(()))
     }
 
     /// The RAM-tier lease must remain alive for this call. TensorFS still performs
     /// the transfer; the mechanism only selects a ready source and its destination.
     pub fn fill_from_ram(self: &Arc<Self>, id: PageId, bytes: &[u8]) -> Result<ReadStats> {
-        self.fill_bytes(id, Some(bytes), |_| Ok(()))
+        self.fill_bytes(id, Some(bytes), None, |_| Ok(()))
     }
 
     /// A declared page-in transform runs only on a new, private writable mapping.
@@ -503,7 +503,7 @@ impl Gpu {
         id: PageId,
         transform: impl FnOnce(FillPin) -> Result<()>,
     ) -> Result<ReadStats> {
-        self.fill_bytes(id, None, transform)
+        self.fill_bytes(id, None, None, transform)
     }
 
     pub fn fill_from_ram_with(
@@ -512,7 +512,7 @@ impl Gpu {
         bytes: &[u8],
         transform: impl FnOnce(FillPin) -> Result<()>,
     ) -> Result<ReadStats> {
-        self.fill_bytes(id, Some(bytes), transform)
+        self.fill_bytes(id, Some(bytes), None, transform)
     }
 
     /// Retain a direct host source through failed CUDA work. The page's complete
@@ -523,19 +523,19 @@ impl Gpu {
         source: Arc<T>,
         transform: impl FnOnce(FillPin) -> Result<()>,
     ) -> Result<ReadStats> {
-        let page = self.page(id)?;
-        page.host_sources.lock().push(source.clone());
-        let result = self.fill_bytes(id, Some(source.as_ref().as_ref()), transform);
-        if result.is_ok() {
-            page.host_sources.lock().clear();
-        }
-        result
+        self.fill_bytes(
+            id,
+            Some(source.as_ref().as_ref()),
+            Some(source.clone()),
+            transform,
+        )
     }
 
     fn fill_bytes(
         self: &Arc<Self>,
         id: PageId,
         ram: Option<&[u8]>,
+        host_owner: Option<Arc<dyn Send + Sync>>,
         transform: impl FnOnce(FillPin) -> Result<()>,
     ) -> Result<ReadStats> {
         let page = self.page(id)?;
@@ -550,6 +550,9 @@ impl Gpu {
             if !matches!(*state, State::Empty) {
                 return Err(invalid("page is not empty"));
             }
+            if let Some(owner) = host_owner {
+                page.host_sources.lock().push(owner);
+            }
             *state = State::Filling;
         }
         let allocation = catch_unwind(AssertUnwindSafe(|| {
@@ -559,7 +562,10 @@ impl Gpu {
         let mut mapping = match allocation {
             Ok(mapping) => mapping,
             Err(error) => {
-                *page.state.lock() = State::Empty;
+                let mut state = page.state.lock();
+                *state = State::Empty;
+                page.host_sources.lock().clear();
+                drop(state);
                 self.notify();
                 return Err(error);
             }
@@ -623,6 +629,7 @@ impl Gpu {
         let result = match result {
             Ok(stats) => {
                 *state = State::Ready(mapping);
+                page.host_sources.lock().clear();
                 Ok(stats)
             }
             Err(error) => {
