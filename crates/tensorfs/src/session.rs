@@ -133,7 +133,7 @@ pub struct Open {
     pub variant: Option<String>,
     pub endpoint: Option<String>,
     pub local_files_only: bool,
-    /// Return metadata immediately by default; false waits for this checkpoint's bytes.
+    /// Load metadata only by default; false also waits for this checkpoint's bytes.
     pub lazy: bool,
 }
 
