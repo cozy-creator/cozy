@@ -28,6 +28,8 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2.workspace = true
 thiserror.workspace = true
+# Canonical public tags and default ordering use Python's PEP 440 version rules.
+pep440_rs = { version = "0.7.3", default-features = false }
 rustix = { version = "1.1.4", default-features = false, features = ["std", "net", "event"], optional = true }
 # The one HTTP client (src/fetch/net.rs). rustls is the one TLS stack, used only there;
 # scripts/fence.py refuses it anywhere else.
