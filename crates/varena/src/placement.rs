@@ -3368,10 +3368,22 @@ mod gpu_tests {
             placement.relief(1, 24 * MIB, true).unwrap(),
             Relief::Complete
         );
-        assert_eq!(
-            placement.resident().unwrap(),
-            vec![("lower".into(), 8 * MIB)]
+        let stats = placement.stats(1).unwrap();
+        let lowered: Vec<_> = stats
+            .events
+            .iter()
+            .filter(|event| event.kind == "lower")
+            .map(|event| event.page)
+            .collect();
+        assert_eq!(lowered.len(), 4, "only four home pages need to leave");
+        assert!(
+            !lowered.contains(&pages[0]),
+            "a current source pin was lowered"
         );
+        // The worker may already have prefetched up to three streaming slots.
+        // Those mapped bytes do not restore the lowered home watermark.
+        let resident = placement.resident().unwrap()[0].1;
+        assert!((8 * MIB..=20 * MIB).contains(&resident));
         let allocated = tensorfs::io::DeviceBuffer::new(0, (24 * MIB) as usize)
             .expect("the requested allocation fits after controlled relief");
         placement.allocator(4 * MIB, 32 * MIB, 32 * MIB).unwrap();
@@ -3386,8 +3398,14 @@ mod gpu_tests {
             Relief::Complete
         );
         assert_eq!(
-            placement.resident().unwrap(),
-            vec![("lower".into(), 4 * MIB)]
+            placement
+                .stats(1)
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| event.kind == "lower")
+                .count(),
+            5
         );
         assert!(
             matches!(placement.relief(1, 4 * MIB, true).unwrap(), Relief::Exhausted(n) if n > 0),
