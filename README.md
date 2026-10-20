@@ -52,7 +52,8 @@ cozy run fidika/sdxl/generate prompt='a lighthouse at dusk' seed=7 --on new
 
 `cozy login` signs you up on first use, with a code it emails; a new account starts with $2 of
 credit (`cozy credits`). `--on new` rents the cheapest card that holds the model, shows its price
-and asks first (`--yes` agrees without asking). The rental takes more runs with `--on <name>`, ends
+and asks first. Scripts and agents, with no terminal to ask on, pass `--yes`; without it nothing is
+rented and the refusal (`quote_unagreed`) carries the price. The rental takes more runs with `--on <name>`, ends
 itself after 15 minutes with nothing to run, and `cozy machine end <name>` ends it at once.
 `cozy machine list` shows your rentals and `cozy machine rent` what is for rent.
 
