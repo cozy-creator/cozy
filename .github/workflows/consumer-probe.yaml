@@ -117,7 +117,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ref: [master, fix/xs-060-windows-uv-env]
+        ref: [fix/xs-060-windows-uv-env]
     runs-on: windows-2025
     defaults:
       run:
@@ -134,6 +134,9 @@ jobs:
           mkdir work && cd work
           printf '%s\n' '# /// script' '# requires-python = ">=3.12"' '# dependencies = ["cozy-runtime"]' '# [tool.cozy]' '# accelerator = false' '# ///' 'def main() -> str:' '    return "hello from Windows"' > greet.py
           "$cozy" run ./greet.py || true
+          "$cozy" run show 1 || true
+          # A published package: its install creates a venv with a downloaded Python (DNS).
+          "$cozy" run fidika/sdxl/generate prompt=x seed=1 || true
           "$cozy" run list || true
   distros:
     if: contains(github.event.head_commit.message, '[distros]')
