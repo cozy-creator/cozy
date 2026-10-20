@@ -275,6 +275,19 @@ class Component:
     def __repr__(self) -> str:
         ...
 
+class VerificationReport:
+    @property
+    def missing(self) -> list[tuple[str, int]]:
+        """Absent local objects, as (sha256_hex, byte_length)."""
+
+    @property
+    def corrupt(self) -> list[tuple[str, int]]:
+        """Local objects whose stored length or digest is wrong."""
+
+    @property
+    def ok(self) -> bool:
+        """True when both collections are empty."""
+
 class Checkpoint:
     """One cozytensors read from a store, or only its header (`parse`)."""
 
@@ -287,8 +300,8 @@ class Checkpoint:
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         ...
 
-    def verify(self) -> list[tuple[str, int]]:
-        """Hash locally available header, chunks and assets; report missing or corrupt objects."""
+    def verify(self, components: Sequence[str] | None=None) -> VerificationReport:
+        """Audit the header and selected local data; never fetch, repair or delete objects."""
 
     def open_chunk(self, index: int) -> int:
         """A new read-only OS descriptor owned and closed by the caller."""

@@ -142,6 +142,7 @@ below; normal model consumers do not need it.
 | `Selection` | `All`, `Components(Vec<String>)`, `Tensors { component, keys }`, `Part { component, key, role: Option<String>, range: Option<Range<u64>> }`, or `Assets { component, names: Option<Vec<String>> }`. Part ranges are stored byte ranges; absent asset names selects all assets. |
 | `Fetch` | `selection`, `priority: u64`, optional borrowed progress callback; defaults to all. |
 | `Fetched` | Byte counts `local`, `volume`, `origin`. |
+| `VerificationReport` | Separate `missing` and `corrupt` object-reference vectors; `is_ok()` checks both are empty. |
 | `Convert` | Optional `converter`, `variant`, borrowed conversion-progress callback. |
 | `WriterOptions` | Optional `dest`, `variant`, `base`, `resume`, `repo_id`, `endpoint`, `token`, `ca_der`; implements `Default`. |
 | `Format` | `Safetensors` or native portable `Cozytensors` export. |
@@ -164,11 +165,19 @@ a separate worker-permission mechanism.
 | `pipeline()` | `Option<&format::Pipeline>`. |
 | `components()` | `&[Component]`. |
 | `component(name)` | `Result<&Component>`. |
-| `verify()` | `Result<Vec<ObjectRef>>`, describing absent/corrupt objects. |
+| `verify(&Selection)` | `Result<VerificationReport>`, separating absent objects from length/digest failures. |
 | `view()` | An owned `io::view::View` for byte-engine/placement integration. |
 | `chunk(index)` | `Result<File>`; the returned file owns its descriptor. |
 | `missing(&Selection)` | `Result<Vec<ObjectRef>>`. |
 | `fetch(&Fetch).await` | `Result<Fetched>`. |
+
+`fetch` completes when the selected chunks and supporting files are verified and locally
+available; the open checkpoint retains them. `missing` is optional availability inspection.
+Use `verify` for an explicit local audit, not after every fetch: admission already checks
+incoming bytes. Verification always checks the header, then the selected complete objects,
+and never fetches, repairs or deletes data. `Selection::All` also covers known repository
+files; checking a shared chunk hashes that whole object. Other local I/O failures remain
+typed errors rather than being classified as corruption.
 
 A `Component` provides `name()`, `class()`, `config()`, `tensors()` and
 `assets()` metadata views. Its `read(key)` returns decoded `Vec<u8>`;

@@ -65,6 +65,14 @@ pub struct Fetch<'a> {
     // Callback arguments: held bytes, total bytes. Error cancels this fetch.
 }
 pub struct Fetched { pub local: u64, pub volume: u64, pub origin: u64 }
+#[derive(Clone, Debug, Default)]
+pub struct VerificationReport {
+    pub missing: Vec<ObjectRef>,
+    pub corrupt: Vec<ObjectRef>,
+}
+impl VerificationReport {
+    pub fn is_ok(&self) -> bool;
+}
 
 #[derive(Clone)]
 pub struct Client { /* private store/config */ }
@@ -92,7 +100,7 @@ impl Checkpoint {
     pub fn metadata(&self) -> &Metadata;
     pub fn chunks(&self) -> &[ObjectRef];
     pub fn tree(&self) -> Option<&ObjectRef>;
-    pub fn verify(&self) -> Result<Vec<ObjectRef>>;
+    pub fn verify(&self, selection: &Selection) -> Result<VerificationReport>;
     pub fn view(&self) -> io::view::View;
     pub fn named(&self) -> Option<&Ref>;
     pub fn pipeline(&self) -> Option<&format::Pipeline>;

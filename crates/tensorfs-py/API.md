@@ -196,15 +196,34 @@ does not convert to the destination's dtype; provide the appropriate size and re
 def on_progress(stage, completed, total):
     print(f"{stage}: {completed}/{total}")
 
-missing = checkpoint.missing(components=["unet"])
 checkpoint.fetch(components=["unet"], priority=0, progress=on_progress)
-missing_or_corrupt = checkpoint.verify()
 ```
 
-`missing(components=None)` reports absent object references. `fetch(components=None,
-priority=0, progress=None)` fetches selected or all components. Progress callbacks receive
-`(stage, completed, total)`; download counts are bytes, conversion counts are tensors.
-`verify()` hashes available objects and reports missing or corrupt references.
+`fetch` returns when all requested chunks and supporting files are verified and locally
+available, or raises an error. The open checkpoint retains them. Closing its last handle
+allows ordinary cache policy to apply again; saving a checkpoint uses durable retention.
+Progress callbacks receive `(stage, completed, total)`; fetch counts are locally available
+bytes out of requested bytes, while conversion counts are tensors.
+
+For optional availability inspection or an explicit integrity audit:
+
+```python
+missing = checkpoint.missing(components=["unet"])
+report = checkpoint.verify(components=["unet"])
+print(report.ok, report.missing, report.corrupt)
+```
+
+`missing` checks local availability without downloading or rehashing. `verify` re-reads
+and hashes local objects, returning a `VerificationReport` with separate `missing` and
+`corrupt` object-reference lists. `ok` is true when both are empty. Verification never
+downloads, repairs or deletes data; other I/O failures raise the usual typed error.
+There is no need to call it after every fetch: incoming data is already verified when
+admitted to the store.
+
+All three methods accept the same component selection. `None` covers every component
+and known repository files; a component list covers those components' complete chunks
+and assets. Verification always includes the header, even with `components=[]`. A chunk
+shared by selected and unselected tensors is checked as one complete stored object.
 
 Additional checkpoint properties and operations:
 
