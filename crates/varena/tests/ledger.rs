@@ -305,6 +305,19 @@ fn a_new_cap_requires_every_executor_to_release_its_claim() {
 }
 
 #[test]
+fn a_normal_close_can_reopen_without_reaping_the_live_process() {
+    let fixture = Fixture::new();
+    let row = fixture.ledger.claim(std::process::id()).unwrap();
+    let old = row.owner();
+    drop(row);
+    assert!(fixture.ledger.status().unwrap().rows.is_empty());
+    let next = fixture.ledger.claim(std::process::id()).unwrap();
+    assert_ne!(next.owner(), old);
+    assert!(fixture.ledger.ask(old, 1, Class::Unused).is_err());
+    assert_eq!(fixture.ledger.status().unwrap().rows.len(), 1);
+}
+
+#[test]
 fn killed_exporter_leaves_one_importable_page_and_live_eviction_leaves_none() {
     let fixture = Fixture::new();
     let mut first = ChildRow::spawn(&fixture.ledger);

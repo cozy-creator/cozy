@@ -968,6 +968,16 @@ impl Row {
 impl Drop for Row {
     fn drop(&mut self) {
         drop(self._claim.take());
+        if let Ok(slot) = self.table.slot(self.owner) {
+            // A normal close needs no waitpid/reap of this still-live process.
+            // Preserve the generation so a stale grant cannot target its next row.
+            let _ = slot.state.compare_exchange(
+                self.owner.generation << 2 | LIVE,
+                self.owner.generation << 2,
+                AcqRel,
+                Acquire,
+            );
+        }
         self.table.changed();
     }
 }
