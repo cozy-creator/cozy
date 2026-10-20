@@ -128,7 +128,7 @@ async fn saved_handle_reopens_after_all_producers_drop_and_deletion_keeps_conten
     writer
         .component("model", "test.File", ComponentConfig::new())
         .unwrap()
-        .put("value", &Dtype::U8, &[DATA.len() as u64], &mut input)
+        .put("value", Dtype::U8, &[DATA.len() as u64], &mut input)
         .unwrap();
     let checkpoint = writer.commit().await.unwrap();
     let expected = checkpoint.id().id();
