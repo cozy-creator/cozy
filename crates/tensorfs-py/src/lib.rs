@@ -33,6 +33,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The library's warnings reach the process's stderr.
     let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
     errors::install(m)?;
+    cleanup::install(m)?;
     m.add("__version__", python_distribution_version())?;
     // The store format every process on the machine shares.
     m.add("STORE_FORMAT", tensorfs::STORE_FORMAT)?;

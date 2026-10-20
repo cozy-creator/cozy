@@ -208,6 +208,9 @@ jobs:
     name: install ${{ matrix.wheel }} py${{ matrix.python }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      # A crash names its frames.
+      PYTHONFAULTHANDLER: "1"
     strategy:
       fail-fast: false
       matrix:

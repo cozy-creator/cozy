@@ -1,8 +1,10 @@
 //! Final native releases must not wait under the GIL, or on a mover that a release joins.
 //! Queue state is process-owned: Runtime imports TensorFS before its CPU-only parent forks.
 
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::sync::mpsc;
+
+use pyo3::prelude::*;
 
 type Task = Box<dyn FnOnce() + Send + 'static>;
 struct State {
@@ -37,7 +39,7 @@ fn state() -> Result<&'static State, std::io::Error> {
                         task();
                         // Native waits/locks have finished. Flush PyO3's deferred refs so
                         // provider weakrefs can observe release without another API call.
-                        pyo3::Python::try_attach(|_| {});
+                        flush();
                     }));
                 }
             })?;
@@ -49,6 +51,45 @@ fn state() -> Result<&'static State, std::io::Error> {
             Err(_) => drop(unsafe { Box::from_raw(fresh) }),
         }
     }
+}
+
+// The worker attaches only until the interpreter starts to finalize: attaching while it tears
+// down crashed CPython 3.14 at exit. An atexit hook ends the attaches and waits one out;
+// `ATTACHING` names the process whose worker is attaching, so a fork never waits on a parent's.
+static FINAL: AtomicBool = AtomicBool::new(false);
+static ATTACHING: AtomicU32 = AtomicU32::new(0);
+
+struct Attaching;
+impl Drop for Attaching {
+    fn drop(&mut self) {
+        ATTACHING.store(0, Ordering::SeqCst);
+    }
+}
+
+fn flush() {
+    ATTACHING.store(std::process::id(), Ordering::SeqCst);
+    let _attaching = Attaching;
+    if !FINAL.load(Ordering::SeqCst) {
+        pyo3::Python::try_attach(|_| {});
+    }
+}
+
+#[pyfunction]
+fn finalizing(py: Python<'_>) {
+    FINAL.store(true, Ordering::SeqCst);
+    let pid = std::process::id();
+    py.detach(|| {
+        while ATTACHING.load(Ordering::SeqCst) == pid {
+            std::thread::yield_now();
+        }
+    });
+}
+
+/// Registers the atexit hook that ends the worker's attaches.
+pub(crate) fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let hook = wrap_pyfunction!(finalizing, m)?;
+    m.py().import("atexit")?.call_method1("register", (hook,))?;
+    Ok(())
 }
 
 fn retain(task: Task) {
