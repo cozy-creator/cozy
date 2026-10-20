@@ -184,7 +184,7 @@ codes![
     CHECKPOINT_ABSENT,
     CHECKPOINT_REFERENCED,
     RELEASE_CONFLICT,
-    RELEASE_ABSENT,
+    REVISION_ABSENT,
 ];
 
 #[derive(Debug, Clone)]

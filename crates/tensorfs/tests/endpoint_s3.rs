@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tensorfs::format::ClassRef;
 use tensorfs::err::Code;
 use tensorfs::fetch::{
-    upload_tree, with_tree, Client, Config, Endpoint, Fetcher, Fresh, ObjectStore, Origin, Payload, SourcePolicy, Want,
+    upload_tree, with_tag, Client, Config, Endpoint, Fetcher, Fresh, ObjectStore, Origin, Payload, SourcePolicy, Want,
 };
 use tensorfs::format::{Config as HeaderConfig, Dtype, ObjectRef, Tree};
 use tensorfs::store::Store;
@@ -47,9 +47,9 @@ async fn a_bucket_serves_the_protocol_under_sigv4() {
     tree.files.insert("README.md".into(), source.put_bytes(b"# s3").unwrap());
     let tree = source.put_tree(&tree).unwrap();
 
-    let up = upload_tree(&endpoint, "acme/s3", &tree, &source, Some("1.0")).await.unwrap();
+    let up = upload_tree(&endpoint, "acme/s3", &tree, &source, "1.0").await.unwrap();
     assert_eq!(up.sent, up.objects);
-    assert_eq!(upload_tree(&endpoint, "acme/s3", &tree, &source, Some("1.0")).await.unwrap().sent, 0);
+    assert_eq!(upload_tree(&endpoint, "acme/s3", &tree, &source, "1.0").await.unwrap().sent, 0);
     let (_, etag) = endpoint.repo("acme/s3").await.unwrap().unwrap();
     assert_eq!(endpoint.repo_since("acme/s3", Some(&etag)).await.unwrap(), Fresh::Unchanged, "a 304");
 
@@ -58,23 +58,23 @@ async fn a_bucket_serves_the_protocol_under_sigv4() {
     let wrong = endpoint.upload(&claimed, &|| Ok(Payload::Bytes(b"something else!!!"[..].into()))).await;
     assert!(wrong.is_err() && !endpoint.has(&claimed).await.unwrap(), "{wrong:?}");
 
-    // Eight writers race conditional PUTs (If-Match): every checkpoint lands.
+    // Eight writers race conditional PUTs (If-Match): every tag lands.
     let mut trees = Vec::new();
     for i in 0..8u8 {
         let readme = source.put_bytes(&[b's', i]).unwrap();
         let t = source.put_tree(&Tree { files: BTreeMap::from([("README.md".to_owned(), readme)]) }).unwrap();
-        upload_tree(&endpoint, "acme/s3-scratch", &t, &source, None).await.unwrap();
+        upload_tree(&endpoint, "acme/s3-scratch", &t, &source, "main").await.unwrap();
         trees.push(t);
     }
-    let writers = trees.iter().cloned().map(|t| {
+    let writers = trees.iter().cloned().enumerate().map(|(i, t)| {
         let endpoint = Arc::clone(&endpoint);
-        tokio::spawn(async move { endpoint.update_repo("acme/s3", |old| Ok(Some(with_tree(old, "acme/s3", &t, None)))).await })
+        tokio::spawn(async move { endpoint.update_repo("acme/s3", |old| Ok(Some(with_tag(old, "acme/s3", &format!("w{i}"), &t)))).await })
     });
     for writer in futures::future::join_all(writers).await {
         writer.unwrap().unwrap();
     }
     let (repo, _) = endpoint.repo("acme/s3").await.unwrap().unwrap();
-    let mut landed = repo.checkpoints.clone();
+    let mut landed: Vec<ObjectRef> = repo.tags.iter().filter(|t| t.name != "1.0").map(|t| t.commit.clone()).collect();
     landed.sort();
     trees.sort();
     assert_eq!(landed, trees);

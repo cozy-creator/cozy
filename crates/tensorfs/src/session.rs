@@ -270,15 +270,20 @@ impl Client {
         source.file(reference, filename, local_dir).await
     }
 
-    /// None revision adds an unreleased tree, for local and remote repositories. The folder may
-    /// be thin (headers and repo files): a chunk or asset it lacks comes from the store, and a
-    /// remote repository refuses only one the endpoint lacks too.
+    /// Makes the folder a commit of the repository and moves tag `reference.revision` (none:
+    /// [`fetch::MAIN`]) to it: a new tag is private, an existing one keeps its flags. The folder
+    /// may be thin (headers and repo files): a chunk or asset it lacks comes from the store, and a
+    /// remote repository refuses only one the endpoint lacks too. The commit.
     pub async fn upload_folder(
         &self,
         reference: &Ref,
         folder: &Path,
         progress: Option<&Progress<'_>>,
     ) -> Result<ObjectRef> {
+        let tag = reference.revision.as_deref().unwrap_or(crate::fetch::MAIN);
+        if !crate::format::tag_name(tag) {
+            return fail(Kind::Invalid, format!("{tag:?} is not a tag name"));
+        }
         let (tree, absent) = self.store.admit_folder(folder)?;
         if let (Some(object), true) = (absent.first(), reference.repo_id.starts_with("local/")) {
             return fail(
@@ -299,12 +304,7 @@ impl Client {
         }
         if reference.repo_id.starts_with("local/") {
             self.store.update_ref(&reference.repo_id, |old| {
-                Some(crate::fetch::with_tree(
-                    old,
-                    &reference.repo_id,
-                    &tree,
-                    reference.revision.as_deref(),
-                ))
+                Some(crate::fetch::with_tag(old, &reference.repo_id, tag, &tree))
             })?;
         } else {
             let source = self.source(reference, false)?;
@@ -313,7 +313,7 @@ impl Client {
                 &reference.repo_id,
                 &tree,
                 &self.store,
-                reference.revision.as_deref(),
+                tag,
             )
             .await
             .map_err(provider::from_native)?;

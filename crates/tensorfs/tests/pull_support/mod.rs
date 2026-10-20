@@ -185,7 +185,8 @@ pub fn model(origin: &Path, name: &str, components: &[(&str, &[usize])], seed: u
     tree.set_variant("int8", header_ref.clone());
     let tree_ref = put(origin, &tree.to_json().unwrap());
     let mut repo = Repo::new(name);
-    repo.set_release("1.0", tree_ref.clone());
+    repo.set_tag("1.0", tree_ref.clone());
+    repo.tags[0].public = true;
     let path = origin.join(repo.key());
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, repo.to_json().unwrap()).unwrap();

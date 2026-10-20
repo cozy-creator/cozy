@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 use tensorfs::format::{
-    variant_of, variant_path, Body, ClassRef, Component, Config, ConfigValue, Dtype, Encoding, Header,
-    Location, ObjectRef, Part, Pipeline, Release, Repo, Tensor, Tree, Value, HEADER_PATH,
+    variant_of, variant_path, Body, ClassRef, Component, Config, ConfigValue, Dtype, Encoding,
+    Header, Location, ObjectRef, Part, Pipeline, Repo, Tensor, Tree, Value, HEADER_PATH,
 };
 use tensorfs::writer::{Data, Source, Writer};
 
@@ -168,19 +168,21 @@ fn writer_is_deterministic_and_reader_round_trips() {
     assert_eq!(files, ["README.md"]);
     assert_eq!(HEADER_PATH, "model.cozytensors");
 
-    let r = Repo {
-        name: "Acme/Tiny".into(),
-        releases: vec![Release {
-            version: "1.0".into(),
-            tree: ObjectRef::of(&tb),
-            yanked: false,
-        }],
-        ..Default::default()
-    };
+    let mut r = Repo::new("Acme/Tiny");
+    r.set_tag("1.0", ObjectRef::of(&tb));
+    assert!(r.to_json().is_ok() && r.default_tag().is_none(), "a new tag is private");
+    r.tags[0].public = true;
+    r.set_tag("main", ObjectRef::of(b"draft"));
+    r.set_tag("1.0", ObjectRef::of(&tb));
     let rb = r.to_json().unwrap();
+    assert!(rb.starts_with(br#"{"format":"cozytensors.repo/1","name":"Acme/Tiny","tags":[{"commit":"#), "{}", String::from_utf8_lossy(&rb));
+    assert!(rb.ends_with(br#""name":"main"}]}"#), "a private, unyanked tag writes no flags");
     assert_eq!(Repo::from_json(&rb).unwrap(), r);
     assert_eq!(r.key(), "refs/acme/tiny.json");
-    assert_eq!(r.release(None).map(|r| &r.tree), Some(&ObjectRef::of(&tb)));
+    assert_eq!(r.default_tag().map(|t| &t.commit), Some(&ObjectRef::of(&tb)));
+    assert_eq!(r.roots().count(), 2);
+    r.tags[1].public = true;
+    assert!(r.to_json().is_err(), "a public tag is a version");
 }
 
 /// Later versions append fields to the root and to records, and add dtypes and schemes: this
@@ -330,12 +332,11 @@ fn red_documents_are_refused() {
         assert!(Tree::from_json(doc.to_string().as_bytes()).is_err(), "{path:?}");
     }
     let tree = json!({"sha256": "0".repeat(64), "length": 0});
-    let repo = json!({"format": "cozytensors.repo/1", "name": "acme/tiny", "releases": [
-        {"version": "1", "tree": tree}, {"version": "1", "tree": tree}]});
+    let repo = json!({"format": "cozytensors.repo/1", "name": "acme/tiny", "tags": [
+        {"name": "1", "commit": tree}, {"name": "1", "commit": tree, "public": true}]});
     assert!(Repo::from_json(repo.to_string().as_bytes()).is_err());
-    let lanes = json!({"format": "cozytensors.repo/1", "name": "acme/tiny", "releases": [
-        {"version": "1", "lanes": {}}]});
-    assert!(Repo::from_json(lanes.to_string().as_bytes()).is_err(), "a release names a tree");
+    let lanes = json!({"format": "cozytensors.repo/1", "name": "acme/tiny", "tags": [{"name": "1", "lanes": {}}]});
+    assert!(Repo::from_json(lanes.to_string().as_bytes()).is_err(), "a tag names a commit");
 }
 
 fn tweak(f: impl FnOnce(&mut Vec<Tensor>)) -> Vec<Tensor> {

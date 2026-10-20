@@ -121,20 +121,24 @@ async fn a_tree_goes_up_to_a_directory_and_down_over_http() {
     let dir = scratch.0.join("endpoint");
     let endpoint = Endpoint::new(&client(), &format!("file://{}", dir.display()), None).unwrap();
 
-    let up = upload_tree(&endpoint, "Acme/Tiny", &tree, &source, Some("1.0")).await.unwrap();
+    let up = upload_tree(&endpoint, "Acme/Tiny", &tree, &source, "1.0").await.unwrap();
     let closure = source.closure(&tree).unwrap().len();
     assert_eq!((up.sent, up.objects), (closure, closure));
-    assert_eq!(up.repo.release(Some("1.0")).unwrap().tree, tree);
+    let tag = up.repo.tag("1.0").unwrap();
+    assert_eq!((&tag.commit, tag.public), (&tree, false), "a new tag is private");
     assert!(dir.join("refs/acme/tiny.json").is_file(), "keys are lowercased");
-    let again = upload_tree(&endpoint, "acme/tiny", &tree, &source, Some("1.0")).await.unwrap();
+    let again = upload_tree(&endpoint, "acme/tiny", &tree, &source, "1.0").await.unwrap();
     assert_eq!((again.sent, again.repo), (0, up.repo.clone()), "a second upload sends nothing and changes nothing");
+    let published = endpoint.update_repo("acme/tiny", |old| Ok(old.map(|mut r| (r.tag_mut("1.0").unwrap().public = true, r).1))).await.unwrap();
     let notes = Tree { files: BTreeMap::from([("README.md".to_owned(), source.put_bytes(b"notes").unwrap())]) };
     let notes = source.put_tree(&notes).unwrap();
-    let unreleased = upload_tree(&endpoint, "acme/tiny", &notes, &source, None).await.unwrap().repo;
-    assert_eq!((unreleased.checkpoints, unreleased.releases), (vec![notes.clone()], up.repo.releases.clone()));
-    let moved = upload_tree(&endpoint, "acme/tiny", &notes, &source, Some("1.0")).await.unwrap().repo;
-    assert_eq!((&moved.release(Some("1.0")).unwrap().tree, moved.checkpoints.len()), (&notes, 0), "the release moves");
-    endpoint.update_repo("acme/tiny", |_| Ok(Some(up.repo.clone()))).await.unwrap();
+    let drafted = upload_tree(&endpoint, "acme/tiny", &notes, &source, "main").await.unwrap().repo;
+    let tags: Vec<(&str, &ObjectRef, bool)> = drafted.tags.iter().map(|t| (t.name.as_str(), &t.commit, t.public)).collect();
+    assert_eq!(tags, [("1.0", &tree, true), ("main", &notes, false)], "a new tag goes last");
+    let moved = upload_tree(&endpoint, "acme/tiny", &notes, &source, "1.0").await.unwrap().repo;
+    let tag = moved.tag("1.0").unwrap();
+    assert_eq!((&tag.commit, tag.public, moved.tags.len()), (&notes, true, 2), "the tag moves and keeps its flags");
+    endpoint.update_repo("acme/tiny", |_| Ok(Some(published.clone()))).await.unwrap();
 
     let (_, etag) = endpoint.repo("acme/tiny").await.unwrap().unwrap();
     assert_eq!(endpoint.repo_since("acme/tiny", Some(&etag)).await.unwrap(), Fresh::Unchanged);
@@ -145,7 +149,7 @@ async fn a_tree_goes_up_to_a_directory_and_down_over_http() {
     let server = HttpServer::start(&dir);
     let http = Arc::new(Endpoint::new(&client(), &server.1, None).unwrap());
     let (repo, etag) = http.repo("acme/tiny").await.unwrap().unwrap();
-    assert_eq!(repo, up.repo);
+    assert_eq!(repo, published);
     assert_eq!(http.repo_since("acme/tiny", Some(&etag)).await.unwrap(), Fresh::Unchanged);
     assert!(http.has(&tree).await.unwrap());
     pull_and_check(http.clone(), &Store::open(scratch.0.join("by-http")).unwrap(), &header, &tensors).await;
@@ -177,17 +181,17 @@ async fn concurrent_writers_all_land_and_wrong_bytes_never_do() {
         }
         trees.push(tree);
     }
-    let writers = trees.iter().cloned().map(|tree| {
+    let writers = trees.iter().cloned().enumerate().map(|(i, tree)| {
         let endpoint = Arc::clone(&endpoint);
         tokio::spawn(async move {
-            endpoint.update_repo("acme/many", |old| Ok(Some(tensorfs::fetch::with_tree(old, "acme/many", &tree, None)))).await
+            endpoint.update_repo("acme/many", |old| Ok(Some(tensorfs::fetch::with_tag(old, "acme/many", &format!("w{i}"), &tree)))).await
         })
     });
     for writer in futures::future::join_all(writers).await {
         writer.unwrap().unwrap();
     }
     let (repo, _) = endpoint.repo("acme/many").await.unwrap().unwrap();
-    let mut landed = repo.checkpoints.clone();
+    let mut landed: Vec<ObjectRef> = repo.tags.iter().map(|t| t.commit.clone()).collect();
     landed.sort();
     trees.sort();
     assert_eq!(landed, trees);
@@ -205,7 +209,7 @@ async fn concurrent_writers_all_land_and_wrong_bytes_never_do() {
 
     let deleted = endpoint.update_repo("acme/many", |_| Ok(None)).await.unwrap();
     assert_eq!(endpoint.repo("acme/many").await.unwrap().unwrap().0, deleted);
-    assert!(deleted.releases.is_empty() && deleted.checkpoints.is_empty(), "deleting is a document of nothing");
+    assert!(deleted.tags.is_empty(), "deleting is a document of no tags");
 }
 
 #[test]
@@ -216,7 +220,7 @@ fn a_streaming_writer_tees_to_the_store_before_publishing() {
     let endpoint = Arc::new(Endpoint::new(&client(), dir.to_str().unwrap(), None).unwrap());
     let local = Store::open(scratch.0.join("local")).unwrap();
     let stream = Arc::new(Stream::new(Arc::clone(&endpoint), runtime.handle().clone()));
-    let mut w = local.streaming_writer(Arc::clone(&stream), "acme/streamed", "int8", None).unwrap();
+    let mut w = local.streaming_writer(Arc::clone(&stream), "acme/streamed", "run-7", "int8", None).unwrap();
     let big = noise(9, 70 * MIB);
     let mut c = w.component("unet", ClassRef::new("diffusers", "0.35.1", "Thing"), Default::default(), None).unwrap();
     c.put("big", &Dtype::U8, &[big.len() as u64], Data::Plain(Source::Read(&mut &big[..]))).unwrap();
@@ -231,13 +235,14 @@ fn a_streaming_writer_tees_to_the_store_before_publishing() {
     assert_eq!(runtime.block_on(endpoint.object(&header.id())).unwrap(), Some(header.clone()));
     assert!(runtime.block_on(endpoint.object("not-a-digest")).is_err());
     let (repo, _) = runtime.block_on(endpoint.repo("acme/streamed")).unwrap().unwrap();
-    assert_eq!((repo.releases.len(), repo.checkpoints.len()), (0, 1), "an unreleased checkpoint");
-    assert_eq!(w.published(), Some(&repo.checkpoints[0]), "this writer's exact committed tree");
+    let tag = &repo.tags[..];
+    assert_eq!((tag.len(), tag[0].name.as_str(), tag[0].public), (1, "run-7", false), "a private tag");
+    assert_eq!(w.published(), Some(&tag[0].commit), "this writer's exact committed tree");
     let into = Store::open(scratch.0.join("into")).unwrap();
     runtime.block_on(async {
         let fetcher = Fetcher::new(Arc::new(into.clone()) as Arc<dyn ObjectStore>, client(), None, Config::default());
         let origin: Arc<dyn Origin> = endpoint.clone();
-        let pulled = fetcher.pull_tree(&origin, &repo.checkpoints[0], None, &Want::default()).await.unwrap();
+        let pulled = fetcher.pull(&origin, "acme/streamed", Some(&header.id()), None, &Want::default()).await.unwrap();
         fetcher.settled().await;
         assert_eq!((pulled.header, pulled.variant.as_str()), (header.clone(), "int8"));
     });
@@ -253,7 +258,7 @@ async fn stored_stream_puts_work_inside_the_callers_runtime() {
     let endpoint = Arc::new(Endpoint::new(&client(), dir.to_str().unwrap(), None).unwrap());
     let local = Store::open(scratch.0.join("local")).unwrap();
     let stream = Arc::new(Stream::new(Arc::clone(&endpoint), tokio::runtime::Handle::current()));
-    let mut writer = local.streaming_writer(Arc::clone(&stream), "acme/async-stored", "bf16", None).unwrap();
+    let mut writer = local.streaming_writer(Arc::clone(&stream), "acme/async-stored", "main", "bf16", None).unwrap();
     let mut files = Vec::new();
     for index in 0..9 {
         let bytes = format!("stored file {index}").into_bytes();
@@ -281,7 +286,7 @@ async fn stored_stream_puts_work_inside_the_callers_runtime() {
         (header, writer.published().unwrap().clone())
     }).await.unwrap();
     assert_eq!(local.checkpoint(&header).unwrap().read("model", "weight").unwrap(), b"weights");
-    assert_eq!(endpoint.repo("acme/async-stored").await.unwrap().unwrap().0.checkpoints, vec![tree]);
+    assert_eq!(endpoint.repo("acme/async-stored").await.unwrap().unwrap().0.tag("main").unwrap().commit, tree);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -290,7 +295,7 @@ async fn dropping_a_stored_stream_cancels_unstarted_uploads() {
     let endpoint = Arc::new(Endpoint::new(&client(), scratch.0.join("endpoint").to_str().unwrap(), None).unwrap());
     let local = Store::open(scratch.0.join("local")).unwrap();
     let stream = Arc::new(Stream::new(Arc::clone(&endpoint), tokio::runtime::Handle::current()));
-    let mut writer = local.streaming_writer(Arc::clone(&stream), "acme/abandoned", "bf16", None).unwrap();
+    let mut writer = local.streaming_writer(Arc::clone(&stream), "acme/abandoned", "main", "bf16", None).unwrap();
     let bytes = b"never uploaded";
     writer.repo_file("README.md", bytes).unwrap();
     writer.abandon();
@@ -310,7 +315,7 @@ fn an_upload_failure_keeps_the_local_checkpoint_and_stays_failed() {
     let endpoint = Arc::new(Endpoint::new(&client(), &server.1, None).unwrap());
     let local = Store::open(scratch.0.join("local")).unwrap();
     let stream = Arc::new(Stream::new(Arc::clone(&endpoint), runtime.handle().clone()));
-    let mut w = local.streaming_writer(Arc::clone(&stream), "acme/failed", "int8", None).unwrap();
+    let mut w = local.streaming_writer(Arc::clone(&stream), "acme/failed", "main", "int8", None).unwrap();
     w.component("unet", ClassRef::new("diffusers", "0.35.1", "Thing"), Default::default(), None).unwrap()
         .put("w", &Dtype::U8, &[5], Data::Plain(Source::Read(&mut &b"saved"[..]))).unwrap();
     assert!(w.commit().is_err(), "the real read-only server refuses PUT");
@@ -344,7 +349,7 @@ fn a_directory_and_a_static_server_conform() {
     let runtime = tensorfs::fetch::runtime().unwrap();
     let endpoint = Endpoint::new(&client(), &server.1, None).unwrap();
     let fixture = runtime.block_on(endpoint.repo(tensorfs::fetch::conform::FIXTURE)).unwrap().unwrap().0;
-    let tree = &fixture.releases[0].tree;
+    let tree = &fixture.tag("1").unwrap().commit;
     assert_eq!(runtime.block_on(endpoint.object(&tree.sha256)).unwrap(), Some(tree.clone()));
     let (ok, failed, cases) = conform(&server.1, false);
     assert!(ok && failed == 0, "{cases:#?}");

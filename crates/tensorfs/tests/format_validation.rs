@@ -17,7 +17,7 @@ fn tree_and_repo_reject_null_in_ignored_fields() {
         let err = Tree::from_json(&serde_json::to_vec(&tree).unwrap()).unwrap_err();
         assert_eq!(err.code(), "invalid", "{tree}: {err}");
         let repo = json!({
-            "format": "cozytensors.repo/1", "name": "acme/model", "releases": [], "future": value,
+            "format": "cozytensors.repo/1", "name": "acme/model", "tags": [], "future": value,
         });
         let err = Repo::from_json(&serde_json::to_vec(&repo).unwrap()).unwrap_err();
         assert_eq!(err.code(), "invalid", "{repo}: {err}");
@@ -25,7 +25,7 @@ fn tree_and_repo_reject_null_in_ignored_fields() {
     // An extension nested inside a known record still participates in the strict walk.
     let mut repo = json!({
         "format": "cozytensors.repo/1", "name": "acme/model",
-        "releases": [{"version": "1", "tree": ObjectRef::of(b"tree"), "future": {"value": null}}],
+        "tags": [{"name": "1", "commit": ObjectRef::of(b"tree"), "future": {"value": null}}],
     });
     assert_eq!(
         Repo::from_json(&serde_json::to_vec(&repo).unwrap())
@@ -33,7 +33,7 @@ fn tree_and_repo_reject_null_in_ignored_fields() {
             .code(),
         "invalid"
     );
-    repo["releases"][0]["future"] = json!({"value": [1, true, "ok"]});
+    repo["tags"][0]["future"] = json!({"value": [1, true, "ok"]});
     assert!(Repo::from_json(&serde_json::to_vec(&repo).unwrap()).is_ok());
 }
 

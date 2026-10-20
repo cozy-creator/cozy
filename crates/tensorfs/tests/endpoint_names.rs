@@ -120,7 +120,7 @@ async fn repo_names_are_encoded_for_http_and_raw_on_disk() {
         ("組/名", "/refs/%E7%B5%84/%E5%90%8D.json"),
     ] {
         let mut initial = Repo::new(name);
-        initial.checkpoints.push(ObjectRef::of(b"first"));
+        initial.set_tag("first", ObjectRef::of(b"first"));
         directory
             .update_repo(name, |_| Ok(Some(initial.clone())))
             .await
@@ -138,7 +138,7 @@ async fn repo_names_are_encoded_for_http_and_raw_on_disk() {
         let updated = http
             .update_repo(name, |old| {
                 let mut repo = old.unwrap();
-                repo.checkpoints.push(ObjectRef::of(b"second"));
+                repo.set_tag("second", ObjectRef::of(b"second"));
                 Ok(Some(repo))
             })
             .await

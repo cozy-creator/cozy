@@ -88,7 +88,7 @@ fn a_refused_commit_keeps_admitted_blobs_for_the_same_public_uploader_to_retry()
             "owner/model",
             &f.tree,
             &f.store,
-            None,
+            "main",
             &control
         ))
         .is_err());
@@ -110,7 +110,7 @@ fn a_refused_commit_keeps_admitted_blobs_for_the_same_public_uploader_to_retry()
             "owner/model",
             &f.tree,
             &f.store,
-            None,
+            "main",
         ))
         .unwrap();
     assert_eq!(retry.sent, 0);
@@ -118,14 +118,14 @@ fn a_refused_commit_keeps_admitted_blobs_for_the_same_public_uploader_to_retry()
         !retry.converged,
         "deduplicated blobs do not mean the ref was already published"
     );
-    assert!(retry.repo.checkpoints.contains(&f.tree));
+    assert_eq!(retry.repo.tag("main").unwrap().commit, f.tree);
     let again = runtime
         .block_on(upload_tree(
             &f.endpoint,
             "owner/model",
             &f.tree,
             &f.store,
-            None,
+            "main",
         ))
         .unwrap();
     assert!(again.converged);
@@ -156,7 +156,7 @@ fn cancellation_before_the_gate_never_commits_and_cancel_after_acceptance_cannot
             "owner/model",
             &f.tree,
             &f.store,
-            None,
+            "main",
             &control
         ))
         .is_err());
@@ -181,11 +181,11 @@ fn cancellation_before_the_gate_never_commits_and_cancel_after_acceptance_cannot
             "owner/model",
             &f.tree,
             &f.store,
-            None,
+            "main",
             &control,
         ))
         .unwrap();
     assert!(canceled.load(Ordering::Acquire));
     assert_eq!(commits.load(Ordering::Relaxed), 1);
-    assert!(uploaded.repo.checkpoints.contains(&f.tree));
+    assert_eq!(uploaded.repo.tag("main").unwrap().commit, f.tree);
 }

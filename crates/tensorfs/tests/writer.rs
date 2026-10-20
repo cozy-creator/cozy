@@ -903,7 +903,7 @@ fn a_two_variant_repo_shares_chunks_and_files_and_gc_keeps_its_closure() {
     let at = store.put_tree(&tree).unwrap();
     let named = |at: ObjectRef| move |_: Option<Repo>| {
         let mut repo = Repo::new("Local/SDXL");
-        repo.set_release("1.0", at.clone());
+        repo.set_tag("1.0", at.clone());
         Some(repo)
     };
     store.update_ref("local/sdxl", named(at.clone())).unwrap();
