@@ -98,12 +98,14 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
         let open = Open { revision: Some(tree.id()), endpoint: Some(root.to_string_lossy().into()), ..Open::default() };
         let ck = rt.block_on(client.open(&lane.name, &open)).unwrap();
 
-        // No new chunk: the migration uploaded headers, trees and small files, never a chunk.
-        assert_eq!(ck.chunks().len() as u64, report["lane"]["from_v1"]["v1"]["chunks"].as_u64().unwrap());
-        assert!(ck.chunks().iter().all(|c| !uploaded.contains(&c.sha256)), "{}: a chunk is new", lane.name);
-        let inline = report["lane"]["from_v1"]["v1"]["inline_parts"].as_u64().unwrap();
-        let v1_header = report["lane"]["from_v1"]["v1"]["header"].as_str().unwrap();
-        assert_eq!(inline > 0, ck.chunks().iter().any(|c| c.id() == v1_header), "{}", lane.name);
+        // One new chunk at most: the pack of the inline parts (D10 cites only 4 KiB-aligned
+        // ranges). Every other chunk is a v1 object, cited where it is.
+        let v1 = &report["lane"]["from_v1"]["v1"];
+        assert_eq!(ck.chunks().len() as u64, v1["chunks"].as_u64().unwrap());
+        let new: Vec<String> = ck.chunks().iter().filter(|c| uploaded.contains(&c.sha256)).map(ObjectRef::id).collect();
+        let pack: Vec<String> = v1["pack"].as_str().map(str::to_owned).into_iter().collect();
+        assert_eq!(new, pack, "{}", lane.name);
+        assert_eq!(v1["inline_parts"].as_u64().unwrap() > 0, !pack.is_empty(), "{}", lane.name);
 
         // Every tensor whose chunks the fixture holds reads back exactly the selected v1 bytes.
         let mut found = BTreeSet::new();
