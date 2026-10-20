@@ -2,8 +2,8 @@
 //! own and never takes an open checkpoint's bytes. A model TensorD keeps, it holds open.
 //!
 //! - A checkpoint's id is its cozytensors header's object (`sha256:<hex>`).
-//! - Local models are `local/<name>` repos, never evicted: one release, named by its tree.
-//! - A Hub model this machine pulled is a cached ref, its release's tree (`held_models::Pulled`).
+//! - Local models are `local/<name>` repos, never evicted: one tag, `main`, at its commit.
+//! - A Hub model this machine pulled is a cached ref, a tag at its commit (`held_models::Pulled`).
 use std::{
     collections::BTreeMap,
     io::{self, Write as _},
@@ -13,7 +13,10 @@ use std::{
 };
 
 pub use tensorfs::store::Store;
-use tensorfs::format::{ObjectRef, Tree};
+use tensorfs::{
+    fetch::{pick_variant, with_tag, MAIN},
+    format::{ObjectRef, Resolution, Tree},
+};
 
 /// Opens (or creates) the machine store at `root`; one in an older format is refused (its
 /// models pull again into a new one).
@@ -71,7 +74,7 @@ pub fn io_error(error: tensorfs::store::Error) -> io::Error {
     io::Error::new(kind, error.to_string())
 }
 
-/// A local model: its release, tree, variant and that variant's header.
+/// A local model: its tag, commit (tree), variant and that variant's header.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Local {
     pub release: String,
@@ -80,28 +83,36 @@ pub struct Local {
     pub header: ObjectRef,
 }
 
-/// The local model `repo` (`local/<name>`) at `release` (its newest when `None`) in `variant`
-/// (its only one when `None`); None when the name holds nothing.
-pub fn local(store: &Store, repo: &str, release: Option<&str>, variant: Option<&str>) -> io::Result<Option<Local>> {
+/// The local model `repo` (`local/<name>`) at `revision` (none: its default, else `main`) in
+/// `variant` (its only one when `None`); None when the name holds nothing.
+pub fn local(store: &Store, repo: &str, revision: Option<&str>, variant: Option<&str>) -> io::Result<Option<Local>> {
     let Some(named) = store.get_ref(repo).map_err(io_error)? else {
         return Ok(None);
     };
-    let (release, tree) = tensorfs::fetch::release_of(&named, release)
-        .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
-    let parsed = store.tree(&tree).map_err(io_error)?;
-    let (variant, header) = parsed.variant(variant).map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
-    Ok(Some(Local { release, variant: variant.into(), header: header.clone(), tree }))
+    let absent = |detail: String| io::Error::new(io::ErrorKind::NotFound, detail);
+    let resolution = match revision {
+        Some(_) => named.resolve(revision),
+        None => named.resolve(None).or_else(|| named.tag(MAIN).map(Resolution::Tag)),
+    };
+    let found = resolution.map(|r| r.find(|commit| store.tree(commit))).transpose().map_err(io_error)?.flatten();
+    let Some((tag, cited)) = found else {
+        return Err(absent(format!("{repo} has no revision {}", revision.unwrap_or(MAIN))));
+    };
+    let variant = pick_variant(revision, cited, variant).map_err(|e| absent(e.to_string()))?;
+    let parsed = store.tree(&tag.commit).map_err(io_error)?;
+    let (variant, header) = parsed.variant(variant.as_deref()).map_err(|e| absent(e.to_string()))?;
+    Ok(Some(Local { release: tag.name.clone(), variant: variant.into(), header: header.clone(), tree: tag.commit.clone() }))
 }
 
-/// Names `header` (with its source's repo `files`) the local model `local/<name>`: one release,
-/// named by its tree, replacing what the name held.
+/// Names `header` (with its source's repo `files`) the local model `local/<name>`: its `main`
+/// at a new commit, replacing what the name held.
 pub fn set_local(store: &Store, name: &str, header: &ObjectRef, files: &BTreeMap<String, ObjectRef>) -> io::Result<ObjectRef> {
     let mut tree = Tree { files: files.clone() };
     tree.set_variant("", header.clone());
     let tree = store.put_tree(&tree).map_err(io_error)?;
     let repo = format!("local/{name}");
     store
-        .update_ref(&repo, |_| Some(tensorfs::fetch::with_tree(None, &repo, &tree, Some(&tree.id()))))
+        .update_ref(&repo, |_| Some(with_tag(None, &repo, MAIN, &tree)))
         .map_err(io_error)?;
     Ok(tree)
 }

@@ -388,10 +388,14 @@ impl Runs {
         if !destination.is_empty() && spec.models.len() != 1 {
             return Err(refused("invalid_request", "a weights destination takes one model"));
         }
-        // An upload goes to the run's TensorFS endpoint; TensorD publishes nothing itself.
+        // An upload goes to the run's TensorFS endpoint (`org/name@tag`: the tag moves to its
+        // commit); TensorD publishes nothing itself.
         let upload = match (destination.is_empty() || destination.starts_with("local/"), &spec.tensorfs) {
             (true, _) => None,
-            (false, Some(options)) => Some(options),
+            (false, Some(options)) => match destination.split_once('@') {
+                Some((repository, tag)) if !tag.is_empty() => Some((options, repository, tag)),
+                _ => return Err(refused("invalid_request", format!("upload destination {destination:?} names no tag (org/name@tag)"))),
+            },
             (false, None) => return Err(refused("upload_endpoint_absent",
                 format!("uploading to {destination} takes the run's TensorFS endpoint (`tensorfs` options), and it carries none"))),
         };
@@ -465,7 +469,7 @@ impl Runs {
                 crate::storage::set_local(publisher.store(), name, &header, &Default::default())
                     .map_err(|e| refused("local_alias_refused", e.to_string()))?;
                 row["published"] = json!({"destination": destination, "checkpoint": header.id(), "converged": false});
-            } else if let Some(options) = upload {
+            } else if let Some((options, repository, tag)) = upload {
                 use tensorfs::fetch::{bearer, upload_tree_with, Client, Endpoint, SourcePolicy, UploadControl};
                 // A tree goes up: the model's own, else one naming its header alone.
                 let tree = match tree {
@@ -490,7 +494,7 @@ impl Runs {
                     endpoint = endpoint.anonymous();
                 }
                 let runtime = tensorfs::fetch::runtime().map_err(|error| refused("upload_failed", error.to_string()))?;
-                let uploaded = runtime.block_on(upload_tree_with(&endpoint, destination, &tree, publisher.store(), None, &UploadControl {
+                let uploaded = runtime.block_on(upload_tree_with(&endpoint, repository, &tree, publisher.store(), tag, &UploadControl {
                     cancelled: &|| stoppable.stop.is_cancelled(),
                     progress: &|done, total| observe(&stage, done, total),
                     commit: &|| stoppable.commit(),
@@ -498,7 +502,7 @@ impl Runs {
                     true => refused(crate::published::CANCELED, "the upload was canceled before its ref update; admitted objects remain available"),
                     false => refused("upload_failed", error.to_string()),
                 })?;
-                row["published"] = json!({"destination": destination, "tree": tree.id(),
+                row["published"] = json!({"destination": destination, "tree": tree.id(), "tag": tag,
                     "checkpoint": header.id(), "converged": uploaded.converged});
             }
             models.push(row);

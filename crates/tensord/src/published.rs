@@ -178,7 +178,7 @@ pub(crate) struct Named {
 }
 
 impl Named {
-    /// Its release's tree at the Hub (no release: the newest not yanked).
+    /// Its tag's commit at the Hub (no tag: the default, the newest public version not yanked).
     fn at_hub(mut self, machine: &Machine, source: &hub::Source) -> Result<Self, Failure> {
         let (release, tree) = origin::release(machine, source, &self.repository, &self.release)
             .map_err(|e| refused("model_resolution_failed", e))?;
@@ -3121,7 +3121,7 @@ pub(crate) mod tests {
             tree.set_variant(variant, header.clone());
         }
         let tree = store.put_tree(&tree).unwrap();
-        store.update_ref("local/multi", |old| Some(tensorfs::fetch::with_tree(old, "local/multi", &tree, Some("v1")))).unwrap();
+        store.update_ref("local/multi", |old| Some(tensorfs::fetch::with_tag(old, "local/multi", "v1", &tree))).unwrap();
         let mut request = local_alias_request(&machine, vec![domain::ModelChoice {
             parameter: "source".into(), repository: "local/multi".into(), release: "v1".into(), lane: "f32".into(),
             ..Default::default() }]);

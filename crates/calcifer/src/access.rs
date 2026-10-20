@@ -581,9 +581,14 @@ mod tests {
         });
         let files = temp.path().join("endpoint");
         let seed = Endpoint::new(&client, &format!("file://{}", files.display()), None).unwrap();
-        upload_tree(&seed, "public/model", &tree, &source, Some("1"))
-            .await
-            .unwrap();
+        upload_tree(&seed, "public/model", &tree, &source, "1").await.unwrap();
+        seed.update_repo("public/model", |old| {
+            let mut repo = old.unwrap();
+            repo.tag_mut("1").unwrap().public = true;
+            Ok(Some(repo))
+        })
+        .await
+        .unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let observed = requests.clone();
         let app = Router::new().route(

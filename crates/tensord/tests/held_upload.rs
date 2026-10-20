@@ -75,7 +75,7 @@ impl Fixture {
         newer.set_variant("f32", other.clone());
         let newer = store.put_tree(&newer).unwrap();
         store
-            .update_ref("local/derived", |old| Some(tensorfs::fetch::with_tree(old, "local/derived", &newer, Some("newer"))))
+            .update_ref("local/derived", |old| Some(tensorfs::fetch::with_tag(old, "local/derived", "newer", &newer)))
             .unwrap();
         let service = Service::open(
             &root.path().join("state"),
@@ -146,7 +146,7 @@ impl Fixture {
                 token: TOKEN.into(),
                 ..Default::default()
             }),
-            weights_destination: "owner/retry".into(),
+            weights_destination: "owner/retry@main".into(),
             owner: "owner".into(),
             catalog_revision: String::new(),
             application: String::new(),
@@ -370,7 +370,7 @@ fn a_failed_ref_update_retries_the_exact_held_tree_without_uploading_admitted_bl
         &std::fs::read(http.state.store.root().join("refs/owner/retry.json")).unwrap(),
     )
     .unwrap();
-    assert!(repo.checkpoints.contains(&fixture.tree));
+    assert_eq!(repo.tag("main").map(|t| &t.commit), Some(&fixture.tree), "the destination's tag");
     assert_eq!(
         http.state.store.tree(&fixture.tree).unwrap(),
         fixture.store.tree(&fixture.tree).unwrap(),

@@ -112,7 +112,7 @@ async fn checkpoint(
     let tree = store.put_tree(&tree).unwrap();
     let client = Client::new(SourcePolicy::default());
     let endpoint = Endpoint::new(&client, &format!("file://{}", layout.display()), None).unwrap();
-    upload_tree(&endpoint, repository, &tree, store, None)
+    upload_tree(&endpoint, repository, &tree, store, tensorfs::fetch::MAIN)
         .await
         .unwrap();
     tree
