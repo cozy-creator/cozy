@@ -1,820 +1,1316 @@
-//! The per-GPU ledger (design memory-varena §5.6): a memfd of rows, one per process, each held
-//! by an OFD lock that dies with it; then measured peaks (`<package>|<shape>` → bytes) and
-//! TensorD's dispatches (request id → that key). Rows are atomics; facts are a two-copy latch,
-//! so readers never tear nor wait on a dead writer. Asks are cumulative counters, frees bump a
-//! futex generation and an eventfd. No CUDA, no clocks: stalls are progress that did not move.
+//! Shared placement facts and handle custody. No eviction policy or CUDA calls live here.
+//!
+//! A named table survives a TensorD restart. Each executor holds its row's OFD lock on a
+//! private file description, so even SIGKILL drops the claim. Snapshot copies are atomics:
+//! an interrupted publisher leaves the preceding complete copy readable.
 
-use std::collections::HashMap;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use std::sync::atomic::{fence, AtomicU32, AtomicU64};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering::*};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
-use platform::shm::{self, Region, RESIZE_SEALS};
+use parking_lot::Mutex;
+use platform::shm::{self, Region};
 
+use crate::plan::Class;
 use crate::{Error, Result};
+use tensorfs::io::{
+    source::{IoTally, Item, Mode, Source},
+    Dst,
+};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"vledger3");
-pub const ROWS: u32 = 64;
-pub const REQUEST_ID: usize = 64;
-pub const PEAK_KEY: usize = 120;
-pub const RUNNING: usize = 8;
-const HEADER: usize = 256;
-const ROW: usize = 1536;
-const PEAKS: usize = 512;
-const DISPATCH: usize = 64;
-const FACTS: usize = 12;
-const ID: usize = REQUEST_ID / 8;
-const KEY: usize = PEAK_KEY / 8;
-/// The latch: the facts, the running count, then (id, remaining) per request.
-const WORDS: usize = FACTS + 1 + RUNNING * (ID + 1);
-const LEN: usize = HEADER + ROWS as usize * ROW + PEAKS * size_of::<Peak>() + DISPATCH * size_of::<Dispatch>();
-
-const FREE: u64 = 0;
+pub const ROWS: usize = 64;
+const RUNNING: usize = 8;
+const CLASSES: usize = 7;
+const WORDS: usize = CLASSES + 2 + RUNNING * 2;
+const KEYS: usize = 256;
+const KEY_WORDS: usize = 24;
+const MAGIC: u64 = u64::from_le_bytes(*b"vslim001");
 const LIVE: u64 = 1;
 const REAPING: u64 = 2;
-const CLAIMING: u64 = 1;
-const READY: u64 = 2;
 
-#[repr(C)]
+#[repr(C, align(64))]
 struct Header {
-    magic: u64,
-    /// The free generation: a futex word `freed` bumps.
-    freed: AtomicU32,
-    capacity: u64,
-    uuid: [u64; 8],
+    magic: AtomicU64,
+    capacity: AtomicU64,
+    changed: AtomicU32,
 }
-
-#[repr(C, align(256))]
+#[repr(C, align(64))]
 struct Slot {
-    /// `gen << 2 | state`: unchanged around a read, the read saw one row.
-    word: AtomicU64,
+    state: AtomicU64,
     pid: AtomicU32,
-    /// A futex word rung by asks, acks, reaps and returns.
     bell: AtomicU32,
     seq: AtomicU64,
-    asked: AtomicU64,
-    handled: AtomicU64,
-    freed: AtomicU64,
+    copies: [[AtomicU64; WORDS]; 2],
+    asked: [AtomicU64; CLASSES],
+    handled: [AtomicU64; CLASSES],
+    wakeups: AtomicU64,
     progress: AtomicU64,
-    reaping: AtomicU64,
-    latch: [[AtomicU64; WORDS]; 2],
 }
-
-/// Filled in a prefix, never freed: 0, then `CLAIMING` while its words are written, then `READY`.
 #[repr(C)]
 struct Peak {
-    word: AtomicU64,
-    key: [AtomicU64; KEY],
-    peak: AtomicU64,
-}
-
-#[repr(C)]
-struct Dispatch {
-    /// `gen << 1 | 1` while it names a request; each fill and clear moves it.
     state: AtomicU64,
-    id: [AtomicU64; ID],
-    key: [AtomicU64; KEY],
+    key: [AtomicU64; KEY_WORDS],
+    bytes: AtomicU64,
+}
+#[repr(C)]
+struct Shared {
+    header: Header,
+    rows: [Slot; ROWS],
+    peaks: [Peak; KEYS],
 }
 
-const _: () = assert!(size_of::<Slot>() == ROW && size_of::<Header>() <= HEADER);
-
-/// `text` as zero-padded words; None when longer than they hold or holding a NUL.
-fn pack<const N: usize>(text: &str) -> Option<[u64; N]> {
-    if text.len() > N * 8 || text.contains('\0') {
-        return None;
-    }
-    let mut words = [0u64; N];
-    for (w, chunk) in words.iter_mut().zip(text.as_bytes().chunks(8)) {
-        let mut b = [0u8; 8];
-        b[..chunk.len()].copy_from_slice(chunk);
-        *w = u64::from_le_bytes(b);
-    }
-    Some(words)
+/// A stable row reference; a reused slot never answers an old generation's ask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Owner {
+    pub row: u32,
+    pub generation: u64,
 }
-
-fn packed<const N: usize>(what: &str, text: &str) -> Result<[u64; N]> {
-    pack(text).ok_or_else(|| Error::Invalid(format!("{what} {text:?}: at most {} bytes, no NUL", N * 8)))
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Running {
+    pub id: u64,
+    /// Largest remaining working set, excluding the separately counted context and pins.
+    pub remaining: Option<u64>,
 }
-
-fn unpack(words: &[u64]) -> String {
-    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    String::from_utf8_lossy(&bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())]).into_owned()
-}
-
-fn load<const N: usize>(words: &[AtomicU64; N]) -> [u64; N] {
-    std::array::from_fn(|i| words[i].load(Relaxed))
-}
-
-fn store(atomics: &[AtomicU64], words: &[u64]) {
-    atomics.iter().zip(words).for_each(|(a, v)| a.store(*v, Relaxed));
-}
-
-fn sum(xs: impl IntoIterator<Item = u64>) -> u64 {
-    xs.into_iter().fold(0, u64::saturating_add)
-}
-
-/// A row's bytes on this GPU, and `last_use` in CLOCK_MONOTONIC ns. `cold`: resident pages an
-/// ask evicts, `kept` the warm set's share of them (asked last). `cache`: torch bytes shed on an
-/// ask. `idle`: varena's idle chunks. `active_peak`: the active requests' measured peak.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Facts {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    /// Derived by plan::Table; transport only, never a second set of accounting counters.
+    pub classes: [u64; CLASSES],
     pub context: u64,
-    pub resident: u64,
-    pub cold: u64,
-    pub kept: u64,
-    pub pinned: u64,
-    pub torch_reserved: u64,
-    pub torch_allocated: u64,
-    pub cache: u64,
-    pub idle: u64,
-    pub active_peak: u64,
-    pub last_use: u64,
-    pub waiting: u64,
+    pub requests: Vec<Running>,
 }
-
-impl Facts {
-    fn words(&self) -> [u64; FACTS] {
-        let f = self;
-        [f.context, f.resident, f.cold, f.kept, f.pinned, f.torch_reserved, f.torch_allocated, f.cache, f.idle, f.active_peak, f.last_use, f.waiting]
-    }
-
-    fn from_words(w: &[u64]) -> Facts {
-        let [context, resident, cold, kept, pinned, torch_reserved, torch_allocated, cache, idle, active_peak, last_use, waiting] =
-            w[..FACTS].try_into().unwrap();
-        Facts { context, resident, cold, kept, pinned, torch_reserved, torch_allocated, cache, idle, active_peak, last_use, waiting }
-    }
-
-    /// Torch bytes no ask frees: live tensors outside caches, or the active peak if higher.
-    fn activations(&self) -> u64 {
-        self.torch_allocated.saturating_sub(self.cache).max(self.active_peak)
-    }
-
-    /// Every byte the process holds now or will for its active requests.
-    pub fn held(&self) -> u64 {
-        sum([self.context, self.resident, self.idle, self.torch_reserved.max(self.activations().saturating_add(self.cache))])
-    }
-
-    /// What no ask frees: the context, weights in use or pinned, and activations.
-    pub fn unevictable(&self) -> u64 {
-        sum([self.context, self.resident.saturating_sub(self.cold), self.activations()])
-    }
-
-    /// What an ask frees, in order: idle chunks, caches and slack; cold weights; kept ones.
-    fn reclaim(&self) -> [u64; 3] {
-        let cold = self.cold.min(self.resident);
-        let kept = self.kept.min(cold);
-        [self.held().saturating_sub(self.unevictable()).saturating_sub(cold), cold - kept, kept]
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Live,
-    /// Its process is gone; its bytes count until reaped and returned.
     Dead,
     Reaping,
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RowFacts {
-    pub slot: u32,
-    pub gen: u64,
+#[derive(Clone, Debug)]
+pub struct RowStatus {
+    pub owner: Owner,
     pub pid: u32,
     pub state: State,
-    pub facts: Facts,
-    pub want: u64,
-    pub acked: u64,
+    pub snapshot: Snapshot,
     pub progress: u64,
-    pub reaping: u64,
-    /// (request id, remaining measured peak; -1 never measured).
-    pub running: Vec<(String, i64)>,
+    pub wakeups: u64,
 }
-
-impl RowFacts {
-    pub fn held(&self) -> u64 {
-        if self.state == State::Reaping { self.reaping } else { self.facts.held() }
-    }
-
-    /// Bytes an ask can get from this row: only a live one answers.
-    pub fn reclaimable(&self) -> u64 {
-        if self.state == State::Live { self.facts.held().saturating_sub(self.facts.unevictable()) } else { 0 }
-    }
-
-    pub fn unevictable(&self) -> u64 {
-        self.held() - self.reclaimable()
-    }
-}
-
-/// A row asked (or, from `admit`, to ask) for `bytes`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Victim {
-    pub slot: u32,
-    pub gen: u64,
-    pub pid: u32,
-    pub bytes: u64,
-    /// The row's `handled` that answers this ask.
-    until: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Admit {
-    Now,
-    /// `victims` (least recently used first) cover the gap but `short`, which no ask frees.
-    After { victims: Vec<Victim>, short: u64 },
-}
-
-/// A table at a glance (TensorD's `status`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Status {
     pub capacity: u64,
-    pub freed: u64,
-    pub rows: Vec<RowFacts>,
+    pub rows: Vec<RowStatus>,
     pub peaks: Vec<(String, u64)>,
-    pub dispatched: Vec<(String, String)>,
+    pub kept: Vec<(PageKey, u64)>,
+    pub ram_bytes: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ask {
+    pub ceiling: Class,
+    pub bytes: u64,
+    pub sequence: u64,
 }
 
-fn io(what: &str) -> Error {
-    Error::Io(format!("{what}: {}", std::io::Error::last_os_error()))
+fn io(what: &str, error: impl std::fmt::Display) -> Error {
+    Error::Io(format!("{what}: {error}"))
 }
-
-/// Copy 0 is written while `seq` is odd, copy 1 while even; a reader reads the other.
-fn latch_write(seq: &AtomicU64, copies: &[[AtomicU64; WORDS]; 2], words: &[u64; WORDS]) {
-    let s = seq.load(Relaxed);
-    seq.store(s + 1, Relaxed);
-    fence(Release);
-    store(&copies[0], words);
-    seq.store(s + 2, Release);
-    fence(Release);
-    store(&copies[1], words);
+fn last(what: &str) -> Error {
+    io(what, std::io::Error::last_os_error())
 }
-
-fn latch_read(seq: &AtomicU64, copies: &[[AtomicU64; WORDS]; 2]) -> [u64; WORDS] {
-    loop {
-        let s = seq.load(Acquire);
-        let words = load(&copies[(s & 1) as usize]);
-        fence(Acquire);
-        if seq.load(Relaxed) == s {
-            return words;
+fn words(text: &str) -> Result<[u64; KEY_WORDS]> {
+    if text.len() > KEY_WORDS * 8 || text.contains('\0') {
+        return Err(Error::Invalid(
+            "ledger key is too long or contains NUL".into(),
+        ));
+    }
+    let mut out = [0; KEY_WORDS];
+    for (word, bytes) in out.iter_mut().zip(text.as_bytes().chunks(8)) {
+        let mut padded = [0; 8];
+        for (dst, src) in padded.iter_mut().zip(bytes) {
+            *dst = *src;
         }
+        *word = u64::from_le_bytes(padded);
+    }
+    Ok(out)
+}
+fn text(words: &[u64]) -> String {
+    let bytes: Vec<_> = words
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .take_while(|b| *b != 0)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+fn sum(values: impl IntoIterator<Item = u64>) -> u64 {
+    values.into_iter().fold(0, u64::saturating_add)
+}
+#[cfg(target_os = "linux")]
+fn wait(word: &AtomicU32, before: u32) {
+    // SAFETY: the shared mapping owns this aligned atomic until the waiter returns.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word.as_ptr(),
+            libc::FUTEX_WAIT,
+            before,
+            std::ptr::null::<libc::timespec>(),
+        );
     }
 }
-
-#[cfg(target_os = "linux")]
-fn wait(word: &AtomicU32, seen: u32) {
-    // SAFETY: a futex wait on a live shared word; it returns on a change, a wake or a signal.
-    unsafe { libc::syscall(libc::SYS_futex, word.as_ptr(), libc::FUTEX_WAIT, seen, std::ptr::null::<libc::timespec>()) };
-}
-
 #[cfg(target_os = "linux")]
 fn wake(word: &AtomicU32) {
-    // SAFETY: a futex wake on a live shared word.
-    unsafe { libc::syscall(libc::SYS_futex, word.as_ptr(), libc::FUTEX_WAKE, i32::MAX) };
+    // SAFETY: FUTEX_WAKE does not access memory beyond this atomic word.
+    unsafe {
+        libc::syscall(libc::SYS_futex, word.as_ptr(), libc::FUTEX_WAKE, i32::MAX);
+    }
 }
-
-// Elsewhere no ledger can be created (no memfd), so these are never reached.
 #[cfg(not(target_os = "linux"))]
 fn wait(_: &AtomicU32, _: u32) {}
-
 #[cfg(not(target_os = "linux"))]
 fn wake(_: &AtomicU32) {}
-
-/// Blocks on futex `word` until `done` answers.
-fn until<T>(word: &AtomicU32, mut done: impl FnMut() -> Option<T>) -> T {
-    loop {
-        let seen = word.load(Acquire);
-        if let Some(x) = done() {
-            return x;
+fn eventfd() -> Result<OwnedFd> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: eventfd has only scalar arguments and returns a fresh descriptor.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(last("create ledger eventfd"));
         }
-        wait(word, seen);
+        // SAFETY: owned descriptor from the successful call above.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
+    #[cfg(not(target_os = "linux"))]
+    Err(Error::Unsupported("varena ledger requires Linux".into()))
 }
-
-#[cfg(target_os = "linux")]
-fn eventfd() -> Result<OwnedFd> {
-    // SAFETY: eventfd(2) with no shared state; a negative return is an error.
-    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if fd < 0 {
-        return Err(io("eventfd"));
-    }
-    // SAFETY: a descriptor we just created and own.
-    Ok(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn eventfd() -> Result<OwnedFd> {
-    Err(Error::Invalid("the ledger's eventfd is Linux's".into()))
-}
-
-impl Slot {
-    fn ring(&self) {
-        self.bell.fetch_add(1, Release);
-        wake(&self.bell);
+fn signal(fd: BorrowedFd<'_>) {
+    let one = 1u64.to_ne_bytes();
+    // SAFETY: eight readable bytes and a live eventfd. EAGAIN means it is already signalled.
+    unsafe {
+        libc::write(fd.as_raw_fd(), one.as_ptr().cast(), one.len());
     }
 }
 
 struct Table {
-    /// This process's own description: mapped and probed, never locked.
-    fd: OwnedFd,
-    base: *mut u8,
+    file: File,
+    base: *mut Shared,
 }
-
-// SAFETY: the mapping is only reached through atomics (rows) or read-only data (the header).
+// SAFETY: only atomics are shared; references cannot outlive this mapping's Arc.
 unsafe impl Send for Table {}
-// SAFETY: as above.
 unsafe impl Sync for Table {}
-
 impl Drop for Table {
     fn drop(&mut self) {
-        // SAFETY: our mapping; no reference into it outlives the Table (rows hold an Arc).
-        unsafe { libc::munmap(self.base.cast(), LEN) };
+        // SAFETY: this is the mapping created by Table::map, with no remaining users.
+        unsafe {
+            libc::munmap(self.base.cast(), size_of::<Shared>());
+        }
     }
 }
-
 impl Table {
-    fn map(fd: OwnedFd) -> Result<Table> {
-        // SAFETY: a shared mapping of a memfd whose size is (or is about to be) sealed.
-        let base = unsafe { libc::mmap(std::ptr::null_mut(), LEN, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0) };
-        if base == libc::MAP_FAILED {
-            return Err(io("map ledger"));
+    fn map(file: File) -> Result<Self> {
+        if file.metadata().map_err(|e| io("stat ledger", e))?.len() != size_of::<Shared>() as u64 {
+            return Err(Error::Invalid(
+                "ledger size differs from this protocol".into(),
+            ));
         }
-        Ok(Table { fd, base: base.cast() })
-    }
-
-    fn header(&self) -> &Header {
-        // SAFETY: the header is written once, before the memfd is handed out.
-        unsafe { &*(self.base as *const Header) }
-    }
-
-    /// `n` records at byte `at`: the rows, then the peaks, then the dispatches.
-    fn array<T>(&self, at: usize, n: usize) -> &[T] {
-        // SAFETY: inside the mapping and aligned for `T`, whose fields are all atomic.
-        unsafe { std::slice::from_raw_parts(self.base.add(at) as *const T, n) }
-    }
-
-    fn slot(&self, i: u32) -> &Slot {
-        &self.array(HEADER, ROWS as usize)[i as usize]
-    }
-
-    fn peaks(&self) -> &[Peak] {
-        self.array(HEADER + ROWS as usize * ROW, PEAKS)
-    }
-
-    fn dispatch(&self) -> &[Dispatch] {
-        self.array(HEADER + ROWS as usize * ROW + PEAKS * size_of::<Peak>(), DISPATCH)
-    }
-
-    fn alive(&self, i: u32) -> Result<bool> {
-        let holder = shm::region_holder(self.fd.as_fd(), HEADER + i as usize * ROW, ROW).map_err(crate::os("probe ledger row"))?;
-        Ok(holder.is_some())
-    }
-
-    fn read(&self, i: u32) -> Result<Option<RowFacts>> {
-        let s = self.slot(i);
-        loop {
-            let w = s.word.load(Acquire);
-            let state = match w & 3 {
-                FREE => return Ok(None),
-                REAPING => State::Reaping,
-                _ if self.alive(i)? => State::Live,
-                _ => State::Dead,
-            };
-            let words = latch_read(&s.seq, &s.latch);
-            let (pid, asked, handled) = (s.pid.load(Relaxed), s.asked.load(Relaxed), s.handled.load(Relaxed));
-            let (acked, progress, reaping) = (s.freed.load(Relaxed), s.progress.load(Relaxed), s.reaping.load(Relaxed));
-            fence(Acquire);
-            if s.word.load(Relaxed) != w {
-                continue;
-            }
-            let running = words[FACTS + 1..].chunks(ID + 1).take((words[FACTS] as usize).min(RUNNING));
-            let running = running.map(|r| (unpack(&r[..ID]), r[ID] as i64)).collect();
-            let (facts, want) = (Facts::from_words(&words), asked.saturating_sub(handled));
-            return Ok(Some(RowFacts { slot: i, gen: w >> 2, pid, state, facts, want, acked, progress, reaping, running }));
-        }
-    }
-}
-
-/// One process's row. Dropping it drops the lock: the row reads dead until reaped and returned.
-pub struct Row {
-    t: Arc<Table>,
-    slot: u32,
-    gen: u64,
-    pid: u32,
-    _lock: OwnedFd,
-    seen: AtomicU64,
-    /// The latch's words as last written; one writer at a time.
-    words: Mutex<[u64; WORDS]>,
-}
-
-impl Row {
-    pub fn id(&self) -> u32 {
-        self.slot
-    }
-
-    pub fn gen(&self) -> u64 {
-        self.gen
-    }
-
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    fn write(&self, at: usize, part: &[u64]) {
-        let mut words = self.words.lock().unwrap_or_else(PoisonError::into_inner);
-        words[at..at + part.len()].copy_from_slice(part);
-        let s = self.t.slot(self.slot);
-        latch_write(&s.seq, &s.latch, &words);
-        s.progress.fetch_add(1, Release);
-    }
-
-    pub fn publish(&self, f: &Facts) {
-        self.write(0, &f.words());
-    }
-
-    /// Its running requests and the most each still needs beyond what it holds (-1: unmeasured).
-    pub fn running(&self, requests: &[(String, i64)]) -> Result<()> {
-        if requests.len() > RUNNING {
-            return Err(Error::Invalid(format!("{} running requests: at most {RUNNING}", requests.len())));
-        }
-        let mut words = [0u64; WORDS - FACTS];
-        words[0] = requests.len() as u64;
-        for ((id, left), w) in requests.iter().zip(words[1..].chunks_mut(ID + 1)) {
-            w[..ID].copy_from_slice(&packed::<ID>("request id", id)?);
-            w[ID] = *left as u64;
-        }
-        self.write(FACTS, &words);
-        Ok(())
-    }
-
-    /// Bytes others asked of this row and it has not answered.
-    pub fn want(&self) -> u64 {
-        let s = self.t.slot(self.slot);
-        let asked = s.asked.load(Acquire);
-        self.seen.fetch_max(asked, Relaxed);
-        asked.saturating_sub(s.handled.load(Relaxed))
-    }
-
-    /// Blocks until something is asked of this row; returns `want()`.
-    pub fn wait_want(&self) -> u64 {
-        until(&self.t.slot(self.slot).bell, || Some(self.want()).filter(|w| *w > 0))
-    }
-
-    /// Answers every ask `want()` saw, having freed `freed` bytes for them.
-    pub fn ack(&self, freed: u64) {
-        let s = self.t.slot(self.slot);
-        s.handled.fetch_max(self.seen.load(Relaxed), Release);
-        s.freed.fetch_add(freed, Release);
-        s.progress.fetch_add(1, Release);
-        s.ring();
-    }
-
-    /// Answers asks on a thread of its own with `answer(want) -> freed`; each answer is progress,
-    /// so a process busy in one long kernel is never stalled.
-    pub fn serve(self: &Arc<Self>, answer: impl Fn(u64) -> u64 + Send + 'static) -> Result<std::thread::JoinHandle<()>> {
-        let row = self.clone();
-        let serve = move || loop {
-            row.ack(answer(row.wait_want()));
+        // SAFETY: a correctly sized shared file, with atomically accessed fields.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size_of::<Shared>(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
         };
-        std::thread::Builder::new().name("varena-ask".into()).spawn(serve).map_err(|e| Error::Io(format!("spawn the ask thread: {e}")))
+        if base == libc::MAP_FAILED {
+            return Err(last("map ledger"));
+        }
+        Ok(Self {
+            file,
+            base: base.cast(),
+        })
+    }
+    fn shared(&self) -> &Shared {
+        // SAFETY: Table owns a valid aligned mapping for its entire lifetime.
+        unsafe { &*self.base }
+    }
+    fn slot(&self, owner: Owner) -> Result<&Slot> {
+        let slot = self
+            .shared()
+            .rows
+            .get(owner.row as usize)
+            .ok_or_else(|| Error::Invalid("ledger row out of range".into()))?;
+        if slot.state.load(Acquire) >> 2 != owner.generation {
+            return Err(Error::Closed("ledger row was reused".into()));
+        }
+        Ok(slot)
+    }
+    fn alive(&self, row: usize) -> Result<bool> {
+        shm::region_holder(
+            self.file.as_fd(),
+            size_of::<Header>() + row * size_of::<Slot>(),
+            size_of::<Slot>(),
+        )
+        .map(|v| v.is_some())
+        .map_err(crate::os("probe ledger claim"))
+    }
+    fn changed(&self) {
+        let changed = &self.shared().header.changed;
+        changed.fetch_add(1, Release);
+        wake(changed);
+    }
+    fn rows(&self) -> Result<Vec<RowStatus>> {
+        let mut out = Vec::new();
+        for (row, slot) in self.shared().rows.iter().enumerate() {
+            loop {
+                let before = slot.state.load(Acquire);
+                if before & 3 == 0 {
+                    break;
+                }
+                let state = if before & 3 == REAPING {
+                    State::Reaping
+                } else if self.alive(row)? {
+                    State::Live
+                } else {
+                    State::Dead
+                };
+                let data = loop {
+                    let seq = slot.seq.load(Acquire);
+                    let data = slot
+                        .copies
+                        .get((seq & 1) as usize)
+                        .ok_or_else(|| Error::Invalid("ledger latch index".into()))?
+                        .each_ref()
+                        .map(|v| v.load(Relaxed));
+                    fence(Acquire);
+                    if slot.seq.load(Relaxed) == seq {
+                        break data;
+                    }
+                };
+                let context = data.get(CLASSES).copied().unwrap_or(0);
+                let count = data.get(CLASSES + 1).copied().unwrap_or(0) as usize;
+                let requests = data
+                    .iter()
+                    .skip(CLASSES + 2)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .chunks_exact(2)
+                    .take(count.min(RUNNING))
+                    .filter_map(|r| r.first().zip(r.get(1)))
+                    .map(|(id, bytes)| Running {
+                        id: *id,
+                        remaining: (*bytes != u64::MAX).then_some(*bytes),
+                    })
+                    .collect();
+                let snapshot = Snapshot {
+                    classes: std::array::from_fn(|i| data.get(i).copied().unwrap_or(0)),
+                    context,
+                    requests,
+                };
+                let found = RowStatus {
+                    owner: Owner {
+                        row: row as u32,
+                        generation: before >> 2,
+                    },
+                    pid: slot.pid.load(Relaxed),
+                    state,
+                    snapshot,
+                    progress: slot.progress.load(Acquire),
+                    wakeups: slot.wakeups.load(Acquire),
+                };
+                if slot.state.load(Acquire) == before {
+                    out.push(found);
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
-/// One GPU's table, mapped in this process, and the eventfd beside it.
+struct Watcher {
+    stop: Arc<AtomicBool>,
+    table: Arc<Table>,
+    join: Option<JoinHandle<()>>,
+}
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Release);
+        self.table.changed();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Descriptors passed to one executor. The row claim is made by that executor, not TensorD.
+/// TensorD must drop its copy after descriptor transfer, especially the service channel.
+pub struct Grant {
+    pub table: OwnedFd,
+    pub events: OwnedFd,
+    pub channel: OwnedFd,
+    pub pid: u32,
+}
+
+/// One GPU table. It does not choose victims: the owning executor applies plan::decide.
 pub struct Ledger {
-    t: Arc<Table>,
-    /// `stalled`'s last look: (slot, gen) -> progress.
-    looks: Mutex<HashMap<(u32, u64), u64>>,
-    events: Option<OwnedFd>,
-    /// One writer of the dispatch table in this process (TensorD is its only writer).
-    dispatching: Mutex<()>,
+    table: Arc<Table>,
+    events: Arc<OwnedFd>,
+    _watcher: Option<Watcher>,
+    custody: Arc<Mutex<Custody>>,
+    observations: Mutex<HashMap<Owner, (u64, u64)>>,
 }
-
 impl Ledger {
-    fn new(t: Table, events: Option<OwnedFd>) -> Ledger {
-        Ledger { t: Arc::new(t), looks: Mutex::default(), events, dispatching: Mutex::default() }
-    }
-
-    /// A new table and eventfd; returns it and the memfd to hand to other processes.
-    pub fn create(gpu_uuid: &str, capacity: u64) -> Result<(Ledger, OwnedFd)> {
-        let uuid = packed("gpu uuid", gpu_uuid)?;
-        let fd = shm::memfd_named(&format!("varena-ledger:{gpu_uuid}")).map_err(crate::os("memfd_create"))?;
-        // SAFETY: sizing a memfd only we hold.
-        if unsafe { libc::ftruncate(fd.as_raw_fd(), LEN as libc::off_t) } != 0 {
-            return Err(io("size ledger"));
+    /// Open the machine/user's existing ledger, or initialize it under the file's OFD lock.
+    pub fn create(gpu_uuid: &str, capacity: u64) -> Result<Self> {
+        if gpu_uuid.is_empty()
+            || gpu_uuid.len() > 96
+            || !gpu_uuid
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+        {
+            return Err(Error::Invalid("GPU UUID is not a safe ledger name".into()));
         }
-        let t = Table::map(shm::reopen(fd.as_fd(), true).map_err(crate::os("reopen ledger"))?)?;
-        // SAFETY: nobody else holds this memfd yet.
-        unsafe { (t.base as *mut Header).write(Header { magic: MAGIC, freed: AtomicU32::new(0), capacity, uuid }) };
-        shm::seal_with(fd.as_fd(), RESIZE_SEALS).map_err(crate::os("seal ledger"))?;
-        Ok((Ledger::new(t, Some(eventfd()?)), fd))
-    }
-
-    /// The table behind `fd`, and the eventfd `freed` signals when the caller has it.
-    pub fn adopt(fd: BorrowedFd<'_>, events: Option<BorrowedFd<'_>>) -> Result<Ledger> {
-        if shm::seals(fd).map_err(crate::os("read ledger seals"))? & RESIZE_SEALS != RESIZE_SEALS {
-            return Err(Error::Invalid("not a ledger: its size is not sealed".into()));
+        // SAFETY: geteuid reads the process's numeric user ID.
+        let uid = unsafe { libc::geteuid() };
+        let name = format!("/dev/shm/varena-{gpu_uuid}-{uid}");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(name)
+            .map_err(|e| io("open named ledger", e))?;
+        let meta = file.metadata().map_err(|e| io("stat named ledger", e))?;
+        if meta.uid() != uid || !meta.is_file() {
+            return Err(Error::Invalid("ledger owner or file type differs".into()));
         }
-        let own = std::fs::File::from(shm::reopen(fd, true).map_err(crate::os("reopen ledger"))?);
-        if own.metadata().map_err(|e| Error::Io(format!("stat ledger: {e}")))?.len() != LEN as u64 {
-            return Err(Error::Invalid("not a varena ledger: its size".into()));
+        shm::region_lock(file.as_fd(), 0, size_of::<Header>(), Region::Write, true)
+            .map_err(crate::os("initialize ledger"))?;
+        let fresh = file
+            .metadata()
+            .map_err(|e| io("restat named ledger", e))?
+            .len()
+            == 0;
+        if fresh {
+            file.set_len(size_of::<Shared>() as u64)
+                .map_err(|e| io("size ledger", e))?;
         }
-        let t = Table::map(own.into())?;
-        if t.header().magic != MAGIC {
-            return Err(Error::Invalid("not a varena ledger".into()));
+        let table = Arc::new(Table::map(file)?);
+        if fresh {
+            table.shared().header.capacity.store(capacity, Relaxed);
+            table.shared().header.magic.store(MAGIC, Release);
         }
-        let events = events.map(|e| e.try_clone_to_owned()).transpose().map_err(|e| Error::Io(format!("dup eventfd: {e}")))?;
-        Ok(Ledger::new(t, events))
+        if table.shared().header.magic.load(Acquire) != MAGIC {
+            return Err(Error::Invalid("ledger protocol differs".into()));
+        }
+        if table.shared().header.capacity.load(Acquire) != capacity {
+            return Err(Error::Invalid(
+                "ledger capacity differs; use one cap per GPU".into(),
+            ));
+        }
+        shm::region_lock(
+            table.file.as_fd(),
+            0,
+            size_of::<Header>(),
+            Region::Unlock,
+            false,
+        )
+        .map_err(crate::os("unlock ledger initialization"))?;
+        let events = Arc::new(eventfd()?);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (watched, stopping, bell) = (table.clone(), stop.clone(), events.clone());
+        let mut before = table.shared().header.changed.load(Acquire);
+        let join = std::thread::Builder::new()
+            .name("varena-events".into())
+            .spawn(move || {
+                while !stopping.load(Acquire) {
+                    wait(&watched.shared().header.changed, before);
+                    let after = watched.shared().header.changed.load(Acquire);
+                    if after != before {
+                        signal(bell.as_fd());
+                        before = after;
+                    }
+                }
+            })
+            .map_err(|e| io("start ledger event bridge", e))?;
+        Ok(Self {
+            table: table.clone(),
+            events,
+            _watcher: Some(Watcher {
+                stop,
+                table,
+                join: Some(join),
+            }),
+            custody: Arc::default(),
+            observations: Mutex::default(),
+        })
     }
-
-    pub fn events(&self) -> Option<BorrowedFd<'_>> {
-        self.events.as_ref().map(AsFd::as_fd)
+    /// Adopt the descriptors in a grant. No named-file lookup or CUDA initialization occurs.
+    pub fn adopt(table: BorrowedFd<'_>, events: BorrowedFd<'_>) -> Result<Self> {
+        let table = Arc::new(Table::map(File::from(
+            shm::reopen(table, true).map_err(crate::os("reopen ledger"))?,
+        ))?);
+        if table.shared().header.magic.load(Acquire) != MAGIC {
+            return Err(Error::Invalid("ledger protocol differs".into()));
+        }
+        let events = Arc::new(
+            events
+                .try_clone_to_owned()
+                .map_err(|e| io("duplicate ledger eventfd", e))?,
+        );
+        Ok(Self {
+            table,
+            events,
+            _watcher: None,
+            custody: Arc::default(),
+            observations: Mutex::default(),
+        })
     }
-
     pub fn fd(&self) -> BorrowedFd<'_> {
-        self.t.fd.as_fd()
+        self.table.file.as_fd()
     }
-
-    pub fn gpu_uuid(&self) -> String {
-        unpack(&self.t.header().uuid)
+    pub fn events(&self) -> BorrowedFd<'_> {
+        self.events.as_fd()
     }
-
     pub fn capacity(&self) -> u64 {
-        self.t.header().capacity
+        self.table.shared().header.capacity.load(Acquire)
     }
-
-    /// A free row for `pid`, held by an OFD lock on a description of this process's own.
+    pub fn grant(&self, pid: u32) -> Result<Grant> {
+        let (server, client) = UnixStream::pair().map_err(|e| io("create grant channel", e))?;
+        let (table, custody) = (self.table.clone(), self.custody.clone());
+        std::thread::Builder::new()
+            .name("varena-custody".into())
+            .spawn(move || serve(server, pid, table, custody))
+            .map_err(|e| io("start grant service", e))?;
+        Ok(Grant {
+            table: self
+                .fd()
+                .try_clone_to_owned()
+                .map_err(|e| io("duplicate table", e))?,
+            events: self
+                .events()
+                .try_clone_to_owned()
+                .map_err(|e| io("duplicate eventfd", e))?,
+            channel: client.into(),
+            pid,
+        })
+    }
     pub fn claim(&self, pid: u32) -> Result<Row> {
-        if let Some(r) = self.snapshot()?.iter().find(|r| r.pid == pid && r.state == State::Live) {
-            return Err(Error::Invalid(format!("pid {pid} already holds row {}", r.slot)));
+        if pid != std::process::id() {
+            return Err(Error::Invalid(
+                "only the executor may claim its own row".into(),
+            ));
         }
-        let lock = shm::reopen(self.t.fd.as_fd(), true).map_err(crate::os("reopen ledger"))?;
-        let range = |i: u32, region| shm::region_lock(lock.as_fd(), HEADER + i as usize * ROW, ROW, region, false).map_err(crate::os("lock ledger row"));
-        for i in 0..ROWS {
-            let s = self.t.slot(i);
-            let w = s.word.load(Acquire);
-            if w & 3 != FREE || !range(i, Region::Write)? {
+        let lock = shm::reopen(self.fd(), true).map_err(crate::os("open private ledger claim"))?;
+        for (row, slot) in self.table.shared().rows.iter().enumerate() {
+            if slot.state.load(Acquire) & 3 != 0 {
                 continue;
             }
-            if s.word.load(Acquire) != w {
-                range(i, Region::Unlock)?;
+            let start = size_of::<Header>() + row * size_of::<Slot>();
+            if !shm::region_lock(lock.as_fd(), start, size_of::<Slot>(), Region::Write, false)
+                .map_err(crate::os("claim row"))?
+            {
                 continue;
             }
-            fence(Release);
-            let gen = (w >> 2) + 1;
-            s.pid.store(pid, Relaxed);
-            // A writer that died mid-write left `seq` odd: start the new one even.
-            s.seq.store((s.seq.load(Relaxed) | 1) + 1, Relaxed);
-            s.latch.iter().flatten().for_each(|a| a.store(0, Relaxed));
-            [&s.asked, &s.handled, &s.freed, &s.progress, &s.reaping].iter().for_each(|a| a.store(0, Relaxed));
-            if s.word.compare_exchange(w, gen << 2 | LIVE, Release, Relaxed).is_err() {
-                range(i, Region::Unlock)?;
+            let before = slot.state.load(Acquire);
+            if before & 3 != 0 {
+                shm::region_lock(
+                    lock.as_fd(),
+                    start,
+                    size_of::<Slot>(),
+                    Region::Unlock,
+                    false,
+                )
+                .map_err(crate::os("unclaim row"))?;
                 continue;
             }
-            let (t, seen, words) = (self.t.clone(), AtomicU64::new(0), Mutex::new([0; WORDS]));
-            return Ok(Row { t, slot: i, gen, pid, _lock: lock, seen, words });
-        }
-        Err(Error::Invalid(format!("ledger {} is full: {ROWS} rows", self.gpu_uuid())))
-    }
-
-    pub fn snapshot(&self) -> Result<Vec<RowFacts>> {
-        (0..ROWS).filter_map(|i| self.t.read(i).transpose()).collect()
-    }
-
-    /// Asks other live rows for up to `need` bytes, as `pick` orders them, and rings each.
-    pub fn ask(&self, from: Option<u32>, need: u64) -> Result<Vec<Victim>> {
-        let (mut victims, _) = pick(&self.snapshot()?, from, need);
-        victims.retain_mut(|v| {
-            let s = self.t.slot(v.slot);
-            if s.word.load(Acquire) != v.gen << 2 | LIVE {
-                return false;
+            slot.pid.store(pid, Relaxed);
+            slot.seq.store(0, Relaxed);
+            for word in slot
+                .copies
+                .iter()
+                .flatten()
+                .chain(&slot.asked)
+                .chain(&slot.handled)
+            {
+                word.store(0, Relaxed);
             }
-            v.until = s.asked.fetch_add(v.bytes, AcqRel) + v.bytes;
-            s.ring();
-            true
-        });
-        Ok(victims)
-    }
-
-    /// The victim answered the ask, or its row is dead or gone.
-    pub fn answered(&self, v: &Victim) -> Result<bool> {
-        let s = self.t.slot(v.slot);
-        Ok(s.word.load(Acquire) != v.gen << 2 | LIVE || s.handled.load(Acquire) >= v.until || !self.t.alive(v.slot)?)
-    }
-
-    /// Blocks until `answered`. A victim that dies without answering ends the wait when reaped.
-    pub fn wait(&self, v: &Victim) -> Result<()> {
-        until(&self.t.slot(v.slot).bell, || self.answered(v).map(|done| done.then_some(())).transpose())
-    }
-
-    /// `Now` only if `need` bytes are free beside every byte the rows hold. Never below need.
-    pub fn admit(&self, need: u64) -> Result<Admit> {
-        let rows = self.snapshot()?;
-        let free = self.capacity().saturating_sub(sum(rows.iter().map(RowFacts::held)));
-        if free >= need {
-            return Ok(Admit::Now);
+            slot.progress.store(0, Relaxed);
+            slot.wakeups.store(0, Relaxed);
+            let owner = Owner {
+                row: row as u32,
+                generation: (before >> 2) + 1,
+            };
+            slot.state.store(owner.generation << 2 | LIVE, Release);
+            self.table.changed();
+            return Ok(Row {
+                table: self.table.clone(),
+                owner,
+                _claim: Some(lock),
+                write: Mutex::new(()),
+            });
         }
-        let (victims, short) = pick(&rows, None, need - free);
-        Ok(Admit::After { victims, short })
+        Err(Error::Invalid("ledger has no free row".into()))
     }
-
-    /// Marks `pid`'s dead rows reaping; their bytes count until `returned`. Refuses a live pid.
-    pub fn reap(&self, pid: u32) -> Result<u64> {
-        let rows: Vec<RowFacts> = self.snapshot()?.into_iter().filter(|r| r.pid == pid).collect();
-        let dead: Vec<&RowFacts> = rows.iter().filter(|r| r.state == State::Dead).collect();
-        if let Some(r) = rows.iter().find(|r| r.state == State::Live).filter(|_| dead.is_empty()) {
-            return Err(Error::Invalid(format!("pid {pid} is alive: it holds row {}", r.slot)));
-        }
-        let mut held = 0;
-        for r in dead {
-            let s = self.t.slot(r.slot);
-            s.reaping.store(r.facts.held(), Relaxed);
-            if s.word.compare_exchange(r.gen << 2 | LIVE, r.gen << 2 | REAPING, AcqRel, Relaxed).is_ok() {
-                held += r.facts.held();
-                s.ring();
+    pub fn status(&self) -> Result<Status> {
+        let kept = self
+            .custody
+            .lock()
+            .pages
+            .iter()
+            .map(|(key, page)| (*key, sum(page.spans.iter().copied())))
+            .collect();
+        Ok(Status {
+            capacity: self.capacity(),
+            rows: self.table.rows()?,
+            peaks: self.peaks(),
+            kept,
+            ram_bytes: sum(self
+                .custody
+                .lock()
+                .ram
+                .values()
+                .map(|r| r.layout.len as u64)),
+        })
+    }
+    /// Reap only kernel-released claims. Their custody remains available until consumed or
+    /// explicitly dropped; no GPU context is needed to close the queued handle containers.
+    pub fn reap(&self, pid: u32) -> Result<()> {
+        for row in self.table.rows()?.into_iter().filter(|r| r.pid == pid) {
+            if row.state == State::Live {
+                return Err(Error::Invalid("cannot reap a live row".into()));
             }
+            let slot = self.table.slot(row.owner)?;
+            slot.state
+                .store(row.owner.generation << 2 | REAPING, Release);
+            self.custody.lock().orphan(row.owner);
+            slot.state.store(row.owner.generation << 2, Release);
         }
-        Ok(held)
-    }
-
-    /// `pid`'s reaped bytes are back on the GPU (NVML shows them): its rows are free.
-    pub fn returned(&self, pid: u32) -> Result<()> {
-        let mut back = false;
-        for s in (0..ROWS).map(|i| self.t.slot(i)) {
-            let w = s.word.load(Acquire);
-            if w & 3 == REAPING && s.pid.load(Relaxed) == pid && s.word.compare_exchange(w, w & !3, Release, Relaxed).is_ok() {
-                s.ring();
-                back = true;
-            }
-        }
-        if back {
-            self.freed();
-        }
+        self.table.changed();
         Ok(())
     }
-
-    /// Asked rows whose progress has not moved since this handle's last look.
+    /// An exact-class ask; plan::decide, not the ledger, orders victims and ceilings.
+    pub fn ask(&self, owner: Owner, bytes: u64, ceiling: Class) -> Result<Ask> {
+        let slot = self.table.slot(owner)?;
+        if slot.state.load(Acquire) & 3 != LIVE || !self.table.alive(owner.row as usize)? {
+            return Err(Error::Closed("asked row is not live".into()));
+        }
+        let counter = slot
+            .asked
+            .get(ceiling.as_usize())
+            .ok_or_else(|| Error::Invalid("invalid class ceiling".into()))?;
+        let sequence = counter.fetch_add(bytes, AcqRel).saturating_add(bytes);
+        slot.bell.fetch_add(1, Release);
+        wake(&slot.bell);
+        Ok(Ask {
+            bytes,
+            ceiling,
+            sequence,
+        })
+    }
+    pub fn answered(&self, owner: Owner, ask: Ask) -> Result<bool> {
+        let slot = self.table.slot(owner)?;
+        Ok(slot
+            .handled
+            .get(ask.ceiling.as_usize())
+            .is_some_and(|v| v.load(Acquire) >= ask.sequence)
+            || !self.table.alive(owner.row as usize)?)
+    }
+    /// Only a victim's own wakeups count as observations; repeated status reads cannot kill it.
     pub fn stalled(&self) -> Result<Vec<u32>> {
-        let rows = self.snapshot()?;
-        let mut looks = self.looks.lock().unwrap_or_else(PoisonError::into_inner);
-        let asked: Vec<&RowFacts> = rows.iter().filter(|r| r.state == State::Live && r.want > 0).collect();
-        let stalled = asked.iter().filter(|r| looks.get(&(r.slot, r.gen)) == Some(&r.progress)).map(|r| r.pid).collect();
-        *looks = asked.iter().map(|r| ((r.slot, r.gen), r.progress)).collect();
+        let mut observations = self.observations.lock();
+        let mut stalled = Vec::new();
+        for row in self.table.rows()? {
+            let slot = self.table.slot(row.owner)?;
+            let pending = slot
+                .asked
+                .iter()
+                .zip(&slot.handled)
+                .any(|(a, h)| a.load(Acquire) > h.load(Acquire));
+            if row.state == State::Live && pending {
+                match observations.get(&row.owner).copied() {
+                    Some((progress, wakeups)) if row.progress == progress => {
+                        if row.wakeups >= wakeups.saturating_add(2) {
+                            stalled.push(row.pid);
+                        }
+                    }
+                    _ => {
+                        observations.insert(row.owner, (row.progress, row.wakeups));
+                    }
+                }
+            } else {
+                observations.remove(&row.owner);
+            }
+        }
         Ok(stalled)
     }
-
-    /// Bytes freed on this GPU: the free generation moves and the eventfd is signalled.
-    pub fn freed(&self) {
-        let word = &self.t.header().freed;
-        word.fetch_add(1, Release);
-        wake(word);
-        if let Some(events) = &self.events {
-            let one = 1u64.to_ne_bytes();
-            // SAFETY: an 8-byte write to an eventfd we hold; a full counter (EAGAIN) is a signal already.
-            unsafe { libc::write(events.as_raw_fd(), one.as_ptr().cast(), 8) };
-        }
-    }
-
-    pub fn freed_gen(&self) -> u64 {
-        self.t.header().freed.load(Acquire) as u64
-    }
-
-    /// Blocks until the free generation is other than `seen`; returns it.
-    pub fn wait_freed(&self, seen: u64) -> u64 {
-        until(&self.t.header().freed, || Some(self.freed_gen()).filter(|g| *g != seen))
-    }
-
-    /// The measured peak of `key` (`<package>|<shape>`), if any process recorded one.
-    pub fn peak(&self, key: &str) -> Option<u64> {
-        self.peaks().into_iter().find(|(k, _)| k == key).map(|(_, peak)| peak)
-    }
-
-    /// Records `key`'s measured peak (any process; the latest write stands).
-    pub fn set_peak(&self, key: &str, bytes: u64) -> Result<()> {
-        let (words, peaks): ([u64; KEY], _) = (packed("peak key", key)?, self.t.peaks());
-        let mut i = 0;
-        while let Some(slot) = peaks.get(i) {
-            match slot.word.load(Acquire) {
-                READY if load(&slot.key) == words => {
-                    slot.peak.store(bytes, Release);
-                    return Ok(());
-                }
-                0 if slot.word.compare_exchange(0, CLAIMING, AcqRel, Acquire).is_ok() => {
-                    store(&slot.key, &words);
-                    slot.peak.store(bytes, Relaxed);
-                    slot.word.store(READY, Release);
-                    return Ok(());
-                }
-                0 => {}
-                _ => i += 1,
-            }
-        }
-        Err(Error::Invalid(format!("ledger peaks are full: {PEAKS} keys")))
-    }
-
-    pub fn peaks(&self) -> Vec<(String, u64)> {
-        let ready = self.t.peaks().iter().filter(|s| s.word.load(Acquire) == READY);
-        ready.map(|s| (unpack(&load(&s.key)), s.peak.load(Acquire))).collect()
-    }
-
-    /// Names the key a request's peak is recorded under (TensorD's write, before it runs).
-    pub fn dispatch(&self, request_id: &str, key: &str) -> Result<()> {
-        let (id, key) = (packed::<ID>("request id", request_id)?, packed::<KEY>("peak key", key)?);
-        let _one = self.dispatching.lock().unwrap_or_else(PoisonError::into_inner);
-        self.clear(&id);
-        let free = self.t.dispatch().iter().find(|s| s.state.load(Acquire) & 1 == 0);
-        let slot = free.ok_or_else(|| Error::Invalid(format!("ledger dispatch table is full: {DISPATCH} requests")))?;
-        // Its words change only after the clear that freed it is visible.
-        fence(Release);
-        store(&slot.id, &id);
-        store(&slot.key, &key);
-        slot.state.fetch_add(3, Release);
-        Ok(())
-    }
-
-    /// The request's entry goes (TensorD's write, once it ended).
-    pub fn undispatch(&self, request_id: &str) {
-        let _one = self.dispatching.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(id) = pack(request_id) {
-            self.clear(&id);
-        }
-    }
-
-    fn clear(&self, id: &[u64; ID]) {
-        for slot in self.t.dispatch().iter().filter(|s| s.state.load(Acquire) & 1 == 1 && load(&s.id) == *id) {
-            slot.state.fetch_sub(1, Release);
-        }
-    }
-
-    /// The key TensorD named for `request_id`, if it is dispatched.
-    pub fn dispatched(&self, request_id: &str) -> Option<String> {
-        self.dispatched_all().into_iter().find(|(id, _)| id == request_id).map(|(_, key)| key)
-    }
-
-    fn dispatched_all(&self) -> Vec<(String, String)> {
-        let mut entries = vec![];
-        for slot in self.t.dispatch() {
-            let state = slot.state.load(Acquire);
-            let (id, key) = (load(&slot.id), load(&slot.key));
-            fence(Acquire);
-            if state & 1 == 1 && slot.state.load(Relaxed) == state {
-                entries.push((unpack(&id), unpack(&key)));
-            }
-        }
-        entries
-    }
-
-    /// Whether a request can start now (design §5.6): never beside a dead row or an unmeasured
-    /// request, unmeasured itself only alone; else its peak (at `shape`, or the widest) beside all
-    /// unevictable bytes and remaining peaks, plus the largest context if it `spawn`s a process.
-    pub fn fits(&self, package: &str, shape: Option<&str>, spawn: bool) -> Result<bool> {
-        let rows = self.snapshot()?;
-        let left: Vec<i64> = rows.iter().flat_map(|r| r.running.iter().map(|(_, left)| *left)).collect();
-        if rows.iter().any(|r| r.state != State::Live) || left.iter().any(|l| *l < 0) {
+    /// Measured remaining working sets are declarations, not a learned usage prediction.
+    pub fn fits(&self, package: &str, shape: &str) -> Result<bool> {
+        let rows = self.table.rows()?;
+        if rows.iter().any(|r| r.state != State::Live) {
             return Ok(false);
         }
-        let prefix = format!("{package}|");
-        let peak = match shape {
-            Some(shape) => self.peak(&format!("{prefix}{shape}")),
-            None => self.peaks().into_iter().filter(|(key, _)| key.starts_with(&prefix)).map(|(_, peak)| peak).max(),
+        let running: Vec<_> = rows.iter().flat_map(|r| &r.snapshot.requests).collect();
+        if running.iter().any(|r| r.remaining.is_none()) {
+            return Ok(false);
+        }
+        let key = format!("{package}|{shape}");
+        let Some(peak) = self
+            .peaks()
+            .into_iter()
+            .find_map(|(k, v)| (k == key).then_some(v))
+        else {
+            return Ok(running.is_empty());
         };
-        let Some(peak) = peak else {
-            return Ok(left.is_empty());
-        };
-        let context = if spawn { rows.iter().map(|r| r.facts.context).max().unwrap_or(0) } else { 0 };
-        let reserved = rows.iter().map(RowFacts::unevictable).chain(left.iter().map(|l| *l as u64));
-        Ok(sum(reserved.chain([context, peak])) <= self.capacity())
+        let fixed = sum(rows.iter().map(|r| {
+            r.snapshot.context.saturating_add(
+                r.snapshot
+                    .classes
+                    .get(Class::Pinned.as_usize())
+                    .copied()
+                    .unwrap_or(0),
+            )
+        }));
+        Ok(fixed
+            .saturating_add(sum(running.iter().filter_map(|r| r.remaining)))
+            .saturating_add(peak)
+            <= self.capacity())
     }
-
-    pub fn status(&self) -> Result<Status> {
-        let (capacity, freed, peaks, dispatched) = (self.capacity(), self.freed_gen(), self.peaks(), self.dispatched_all());
-        Ok(Status { capacity, freed, rows: self.snapshot()?, peaks, dispatched })
+    pub fn record_peak(&self, package: &str, shape: &str, bytes: u64) -> Result<()> {
+        let key = words(&format!("{package}|{shape}"))?;
+        let lock = shm::reopen(self.fd(), true).map_err(crate::os("open peak lock"))?;
+        shm::region_lock(lock.as_fd(), 0, size_of::<Header>(), Region::Write, true)
+            .map_err(crate::os("lock peaks"))?;
+        // Only the peak writer holds this lock. A dead writer's incomplete slot is reusable.
+        for peak in &self.table.shared().peaks {
+            if peak.state.load(Acquire) == 1 {
+                peak.state.store(0, Release);
+            }
+        }
+        for peak in &self.table.shared().peaks {
+            let state = peak.state.load(Acquire);
+            if state == 2 && peak.key.each_ref().map(|v| v.load(Relaxed)) == key {
+                peak.bytes.fetch_max(bytes, Release);
+                self.table.changed();
+                return Ok(());
+            }
+            if state == 0 && peak.state.compare_exchange(0, 1, AcqRel, Acquire).is_ok() {
+                for (word, value) in peak.key.iter().zip(key) {
+                    word.store(value, Relaxed);
+                }
+                peak.bytes.store(bytes, Relaxed);
+                peak.state.store(2, Release);
+                self.table.changed();
+                return Ok(());
+            }
+        }
+        Err(Error::Invalid("ledger peak table is full".into()))
+    }
+    pub fn peaks(&self) -> Vec<(String, u64)> {
+        self.table
+            .shared()
+            .peaks
+            .iter()
+            .filter(|p| p.state.load(Acquire) == 2)
+            .map(|p| {
+                (
+                    text(&p.key.each_ref().map(|v| v.load(Relaxed))),
+                    p.bytes.load(Acquire),
+                )
+            })
+            .collect()
+    }
+    /// Register a RAM layout once. A library worker reads its disjoint regions using TensorFS;
+    /// a consumer sees only completed regions and otherwise immediately falls back to disk.
+    pub fn cache_ram(
+        &self,
+        layout: [u8; 32],
+        source: Arc<Source>,
+        regions: Vec<RamRegion>,
+    ) -> Result<bool> {
+        let ram = Arc::new(Ram::new(regions)?);
+        let mut custody = self.custody.lock();
+        if custody.ram.contains_key(&layout) {
+            return Ok(false);
+        }
+        let (fill, table) = (ram.clone(), self.table.clone());
+        std::thread::Builder::new()
+            .name("varena-ram".into())
+            .spawn(move || {
+                for (region, ready) in fill.regions.iter().zip(&fill.ready) {
+                    // SAFETY: validated nonoverlapping ranges in this worker's writable mapping.
+                    let result = unsafe {
+                        source.read_items(
+                            &region.items,
+                            region.offset,
+                            Dst::Host {
+                                ptr: (fill.base + region.offset as usize) as *mut u8,
+                                len: region.len as usize,
+                            },
+                            1,
+                            Mode::Cache,
+                            &IoTally::default(),
+                        )
+                    };
+                    match result {
+                        Ok(_) => {
+                            ready.store(true, Release);
+                            table.changed();
+                        }
+                        Err(error) => tracing::warn!(%error, "RAM region remains on disk"),
+                    }
+                }
+            })
+            .map_err(|e| io("start RAM fill", e))?;
+        custody.ram.insert(
+            layout,
+            RamHeld {
+                layout: ram,
+                readers: Vec::new(),
+            },
+        );
+        Ok(true)
+    }
+    /// Explicit pressure reclamation: never drops a layout with a live reader lease.
+    pub fn release_ram(&self, layout: [u8; 32]) -> bool {
+        let mut custody = self.custody.lock();
+        let idle = custody.ram.get_mut(&layout).is_some_and(|held| {
+            held.readers
+                .retain(|reader| !platform::handles::hung_up(reader));
+            held.readers.is_empty()
+        });
+        if idle {
+            custody.ram.remove(&layout);
+            self.table.changed();
+        }
+        idle
+    }
+    pub fn drop_kept(&self) {
+        self.custody.lock().pages.clear();
+        self.table.changed();
     }
 }
 
-/// Victims for `need` among live rows but `from`: idle bytes, then cold, then kept, each least
-/// recently used first, net of what each was already asked; and what they leave short.
-fn pick(rows: &[RowFacts], from: Option<u32>, need: u64) -> (Vec<Victim>, u64) {
-    let mut lru: Vec<&RowFacts> = rows.iter().filter(|r| r.state == State::Live && Some(r.slot) != from).collect();
-    lru.sort_by_key(|r| r.facts.last_use);
-    let avail: Vec<[u64; 3]> = lru
-        .iter()
-        .map(|r| {
-            let mut asked = r.want;
-            r.facts.reclaim().map(|t| {
-                let taken = asked.min(t);
-                asked -= taken;
-                t - taken
-            })
-        })
-        .collect();
-    let (mut asked, mut left) = (vec![0u64; lru.len()], need);
-    for tier in 0..3 {
-        for (a, avail) in asked.iter_mut().zip(&avail) {
-            let take = left.min(avail[tier]);
-            *a += take;
-            left -= take;
+pub struct Row {
+    table: Arc<Table>,
+    owner: Owner,
+    _claim: Option<OwnedFd>,
+    write: Mutex<()>,
+}
+impl Row {
+    pub fn owner(&self) -> Owner {
+        self.owner
+    }
+    pub fn publish(&self, snapshot: &Snapshot, progress: u64) -> Result<()> {
+        if snapshot.requests.len() > RUNNING {
+            return Err(Error::Invalid(
+                "too many running requests in ledger row".into(),
+            ));
+        }
+        let _write = self.write.lock();
+        let slot = self.table.slot(self.owner)?;
+        let mut data = [0; WORDS];
+        for (dst, value) in data.iter_mut().zip(snapshot.classes) {
+            *dst = value;
+        }
+        if let Some(dst) = data.get_mut(CLASSES) {
+            *dst = snapshot.context;
+        }
+        if let Some(dst) = data.get_mut(CLASSES + 1) {
+            *dst = snapshot.requests.len() as u64;
+        }
+        for (pair, request) in data
+            .iter_mut()
+            .skip(CLASSES + 2)
+            .collect::<Vec<_>>()
+            .chunks_mut(2)
+            .zip(&snapshot.requests)
+        {
+            if let Some(id) = pair.first_mut() {
+                **id = request.id;
+            }
+            if let Some(left) = pair.get_mut(1) {
+                **left = request.remaining.unwrap_or(u64::MAX);
+            }
+        }
+        let seq = slot.seq.load(Relaxed);
+        slot.seq.store(seq.wrapping_add(1), Release);
+        fence(Release);
+        if let Some(copy) = slot.copies.first() {
+            for (dst, value) in copy.iter().zip(data) {
+                dst.store(value, Relaxed);
+            }
+        }
+        slot.seq.store(seq.wrapping_add(2), Release);
+        fence(Release);
+        if let Some(copy) = slot.copies.get(1) {
+            for (dst, value) in copy.iter().zip(data) {
+                dst.store(value, Relaxed);
+            }
+        }
+        slot.progress.store(progress, Release);
+        self.table.changed();
+        Ok(())
+    }
+    pub fn wait_ask(&self) -> Result<Ask> {
+        let slot = self.table.slot(self.owner)?;
+        loop {
+            let before = slot.bell.load(Acquire);
+            for ceiling in Class::ALL {
+                let index = ceiling.as_usize();
+                let (asked, handled) = slot
+                    .asked
+                    .get(index)
+                    .zip(slot.handled.get(index))
+                    .ok_or_else(|| Error::Invalid("invalid class ceiling".into()))?;
+                let (sequence, done) = (asked.load(Acquire), handled.load(Acquire));
+                if sequence > done {
+                    slot.wakeups.fetch_add(1, Release);
+                    self.table.changed();
+                    return Ok(Ask {
+                        ceiling,
+                        bytes: sequence - done,
+                        sequence,
+                    });
+                }
+            }
+            wait(&slot.bell, before);
         }
     }
-    let victims = lru.iter().zip(asked).filter(|(_, bytes)| *bytes > 0);
-    (victims.map(|(r, bytes)| Victim { slot: r.slot, gen: r.gen, pid: r.pid, bytes, until: 0 }).collect(), left)
+    pub fn ack(&self, ask: Ask) -> Result<()> {
+        let slot = self.table.slot(self.owner)?;
+        slot.handled
+            .get(ask.ceiling.as_usize())
+            .ok_or_else(|| Error::Invalid("invalid class ceiling".into()))?
+            .fetch_max(ask.sequence, Release);
+        self.table.changed();
+        Ok(())
+    }
+}
+impl Drop for Row {
+    fn drop(&mut self) {
+        drop(self._claim.take());
+        self.table.changed();
+    }
+}
+
+/// Fingerprint includes the TensorFS layout, encoding, transform, rank shard and GPU UUID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PageKey {
+    pub fingerprint: [u8; 32],
+    pub page: u64,
+}
+struct Kept {
+    owner: Option<Owner>,
+    spans: Vec<u64>,
+    container: UnixStream,
+}
+#[derive(Clone, Debug)]
+pub struct RamRegion {
+    pub offset: u64,
+    pub len: u64,
+    pub items: Vec<Item>,
+}
+struct Ram {
+    file: File,
+    base: usize,
+    len: usize,
+    regions: Vec<RamRegion>,
+    ready: Vec<AtomicBool>,
+}
+// SAFETY: regions are disjoint, one worker writes them, and a region is published only after
+// its TensorFS read finishes. Receivers get read-only file descriptions, never this pointer.
+unsafe impl Send for Ram {}
+unsafe impl Sync for Ram {}
+impl Ram {
+    fn new(regions: Vec<RamRegion>) -> Result<Self> {
+        let mut end = 0u64;
+        for region in &regions {
+            if region.len == 0 || region.offset < end {
+                return Err(Error::Invalid(
+                    "RAM regions must be ordered and nonoverlapping".into(),
+                ));
+            }
+            end = region
+                .offset
+                .checked_add(region.len)
+                .ok_or_else(|| Error::Invalid("RAM region overflow".into()))?;
+        }
+        let len =
+            usize::try_from(end).map_err(|_| Error::Invalid("RAM layout too large".into()))?;
+        if len == 0 {
+            return Err(Error::Invalid("empty RAM layout".into()));
+        }
+        let file =
+            File::from(shm::memfd_named("varena-ram").map_err(crate::os("create RAM layout"))?);
+        file.set_len(end).map_err(|e| io("size RAM layout", e))?;
+        // SAFETY: a sized memfd; this mapping is the sole writer and is retained until drop.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(last("map RAM layout"));
+        }
+        let ram = Self {
+            file,
+            base: base as usize,
+            len,
+            ready: regions.iter().map(|_| AtomicBool::new(false)).collect(),
+            regions,
+        };
+        shm::seal(ram.file.as_fd()).map_err(crate::os("seal RAM layout"))?;
+        Ok(ram)
+    }
+}
+impl Drop for Ram {
+    fn drop(&mut self) {
+        // SAFETY: the worker and service retain an Arc until they finish using this mapping.
+        unsafe {
+            libc::munmap(self.base as *mut libc::c_void, self.len);
+        }
+    }
+}
+struct RamHeld {
+    layout: Arc<Ram>,
+    readers: Vec<UnixStream>,
+}
+#[derive(Default)]
+struct Custody {
+    pages: BTreeMap<PageKey, Kept>,
+    ram: BTreeMap<[u8; 32], RamHeld>,
+}
+impl Custody {
+    fn orphan(&mut self, owner: Owner) {
+        for page in self.pages.values_mut().filter(|p| p.owner == Some(owner)) {
+            page.owner = None;
+        }
+    }
+}
+
+/// The grant channel carries only placement custody, never model headers or data bytes.
+/// Packet: op/u8, row/u32, generation/u64, fingerprint/32 bytes, page/u64, count/u32,
+/// spans/count*u64; an offer then sends one SCM_RIGHTS container. Imports consume it once.
+fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex<Custody>>) {
+    let result = (|| -> Result<()> {
+        loop {
+            let mut header = [0u8; 57];
+            match stream.read_exact(&mut header) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(io("read custody command", e)),
+            }
+            let read = |start: usize, len: usize| {
+                header
+                    .get(start..start + len)
+                    .ok_or_else(|| Error::Invalid("custody header".into()))
+            };
+            let owner = Owner {
+                row: u32::from_le_bytes(
+                    read(1, 4)?
+                        .try_into()
+                        .map_err(|_| Error::Invalid("row".into()))?,
+                ),
+                generation: u64::from_le_bytes(
+                    read(5, 8)?
+                        .try_into()
+                        .map_err(|_| Error::Invalid("generation".into()))?,
+                ),
+            };
+            let slot = table.slot(owner)?;
+            if slot.pid.load(Acquire) != pid {
+                return Err(Error::Invalid("grant used by another row owner".into()));
+            }
+            let key = PageKey {
+                fingerprint: read(13, 32)?
+                    .try_into()
+                    .map_err(|_| Error::Invalid("fingerprint".into()))?,
+                page: u64::from_le_bytes(
+                    read(45, 8)?
+                        .try_into()
+                        .map_err(|_| Error::Invalid("page".into()))?,
+                ),
+            };
+            let count = u32::from_le_bytes(
+                read(53, 4)?
+                    .try_into()
+                    .map_err(|_| Error::Invalid("count".into()))?,
+            ) as usize;
+            if count > 4096 {
+                return Err(Error::Invalid("too many custody chunks".into()));
+            }
+            match header.first().copied() {
+                Some(1) => {
+                    let mut spans = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let mut bytes = [0; 8];
+                        stream
+                            .read_exact(&mut bytes)
+                            .map_err(|e| io("read chunk span", e))?;
+                        spans.push(u64::from_le_bytes(bytes));
+                    }
+                    let container = platform::handles::recv_fd(&stream)
+                        .map_err(crate::os("receive kept container"))?;
+                    let mut held = custody.lock();
+                    let replace = held.pages.get(&key).is_none_or(|p| {
+                        p.owner == Some(owner)
+                            || p.owner
+                                .is_none_or(|o| !table.alive(o.row as usize).unwrap_or(true))
+                    });
+                    if replace {
+                        held.pages.insert(
+                            key,
+                            Kept {
+                                owner: Some(owner),
+                                spans,
+                                container: UnixStream::from(container),
+                            },
+                        );
+                    }
+                    stream
+                        .write_all(&[u8::from(replace)])
+                        .map_err(|e| io("acknowledge kept page", e))?;
+                }
+                Some(2) => {
+                    let mut held = custody.lock();
+                    let available = held.pages.get(&key).is_some_and(|p| {
+                        p.owner
+                            .is_none_or(|o| !table.alive(o.row as usize).unwrap_or(true))
+                    });
+                    let page = if available {
+                        held.pages.remove(&key)
+                    } else {
+                        None
+                    };
+                    drop(held);
+                    let mut handles = Vec::new();
+                    if let Some(page) = &page {
+                        page.container
+                            .set_nonblocking(true)
+                            .map_err(|e| io("read kept page without waiting", e))?;
+                        for _ in &page.spans {
+                            match platform::handles::recv_fd(&page.container) {
+                                Ok(fd) => handles.push(fd),
+                                Err(_) => {
+                                    handles.clear();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let spans = page
+                        .filter(|p| handles.len() == p.spans.len())
+                        .map(|p| p.spans)
+                        .unwrap_or_default();
+                    stream
+                        .write_all(&(spans.len() as u32).to_le_bytes())
+                        .map_err(|e| io("send kept page size", e))?;
+                    for span in spans {
+                        stream
+                            .write_all(&span.to_le_bytes())
+                            .map_err(|e| io("send kept chunk span", e))?;
+                    }
+                    for handle in handles {
+                        platform::handles::send_fd(&stream, &handle)
+                            .map_err(crate::os("send kept handle"))?;
+                    }
+                }
+                Some(3) => {
+                    let mut held = custody.lock();
+                    if held.pages.get(&key).is_some_and(|p| p.owner == Some(owner)) {
+                        held.pages.remove(&key);
+                    }
+                    stream
+                        .write_all(&[1])
+                        .map_err(|e| io("acknowledge release", e))?;
+                }
+                Some(4) => {
+                    let mut held = custody.lock();
+                    let ready = held.ram.get_mut(&key.fingerprint).and_then(|ram| {
+                        let index = usize::try_from(key.page).ok()?;
+                        let region = ram.layout.regions.get(index)?;
+                        let (offset, len) = (region.offset, region.len);
+                        ram.layout
+                            .ready
+                            .get(index)?
+                            .load(Acquire)
+                            .then_some((ram, offset, len))
+                    });
+                    if let Some((ram, offset, len)) = ready {
+                        let (ours, theirs) =
+                            UnixStream::pair().map_err(|e| io("create RAM reader lease", e))?;
+                        let file = shm::reopen(ram.layout.file.as_fd(), false)
+                            .map_err(crate::os("open read-only RAM"))?;
+                        stream
+                            .write_all(&[1])
+                            .and_then(|_| stream.write_all(&offset.to_le_bytes()))
+                            .and_then(|_| stream.write_all(&len.to_le_bytes()))
+                            .map_err(|e| io("send RAM region", e))?;
+                        platform::handles::send_fd(&stream, &file)
+                            .map_err(crate::os("send RAM file"))?;
+                        platform::handles::send_fd(&stream, &theirs)
+                            .map_err(crate::os("send RAM lease"))?;
+                        ram.readers.push(ours);
+                    } else {
+                        stream.write_all(&[0]).map_err(|e| io("send RAM miss", e))?;
+                    }
+                }
+                _ => return Err(Error::Invalid("unknown custody command".into())),
+            }
+            table.changed();
+        }
+    })();
+    if let Err(error) = result {
+        tracing::warn!(%error, "varena custody channel ended");
+    }
+    for page in custody.lock().pages.values_mut().filter(|p| {
+        p.owner
+            .is_some_and(|o| table.slot(o).is_ok_and(|s| s.pid.load(Acquire) == pid))
+    }) {
+        page.owner = None;
+    }
+    table.changed();
+}
+
+/// Executor half of a grant. Operations are serialized, with no background CUDA work.
+pub struct Channel(Mutex<UnixStream>);
+impl Channel {
+    pub fn new(fd: OwnedFd) -> Self {
+        Self(Mutex::new(UnixStream::from(fd)))
+    }
+    fn header(
+        stream: &mut UnixStream,
+        op: u8,
+        owner: Owner,
+        key: PageKey,
+        count: usize,
+    ) -> Result<()> {
+        stream
+            .write_all(&[op])
+            .and_then(|_| stream.write_all(&owner.row.to_le_bytes()))
+            .and_then(|_| stream.write_all(&owner.generation.to_le_bytes()))
+            .and_then(|_| stream.write_all(&key.fingerprint))
+            .and_then(|_| stream.write_all(&key.page.to_le_bytes()))
+            .and_then(|_| stream.write_all(&(count as u32).to_le_bytes()))
+            .map_err(|e| io("write custody command", e))
+    }
+    pub fn keep(
+        &self,
+        owner: Owner,
+        key: PageKey,
+        spans: &[u64],
+        container: BorrowedFd<'_>,
+    ) -> Result<bool> {
+        if spans.is_empty() || spans.len() > 4096 || spans.contains(&0) {
+            return Err(Error::Invalid("invalid kept chunk spans".into()));
+        }
+        let mut stream = self.0.lock();
+        Self::header(&mut stream, 1, owner, key, spans.len())?;
+        for span in spans {
+            stream
+                .write_all(&span.to_le_bytes())
+                .map_err(|e| io("write kept span", e))?;
+        }
+        platform::handles::send_fd(&stream, &container)
+            .map_err(crate::os("send kept container"))?;
+        let mut ack = [0];
+        stream
+            .read_exact(&mut ack)
+            .map_err(|e| io("read keep acknowledgement", e))?;
+        Ok(ack == [1])
+    }
+    pub fn take(&self, owner: Owner, key: PageKey) -> Result<Vec<(u64, OwnedFd)>> {
+        let mut stream = self.0.lock();
+        Self::header(&mut stream, 2, owner, key, 0)?;
+        let mut size = [0; 4];
+        stream
+            .read_exact(&mut size)
+            .map_err(|e| io("read imported size", e))?;
+        let count = u32::from_le_bytes(size) as usize;
+        if count > 4096 {
+            return Err(Error::Invalid("too many imported chunks".into()));
+        }
+        let mut spans = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut value = [0; 8];
+            stream
+                .read_exact(&mut value)
+                .map_err(|e| io("read imported span", e))?;
+            spans.push(u64::from_le_bytes(value));
+        }
+        spans
+            .into_iter()
+            .map(|span| {
+                platform::handles::recv_fd(&stream)
+                    .map(|fd| (span, fd))
+                    .map_err(crate::os("receive imported page"))
+            })
+            .collect()
+    }
+    pub fn release(&self, owner: Owner, key: PageKey) -> Result<()> {
+        let mut stream = self.0.lock();
+        Self::header(&mut stream, 3, owner, key, 0)?;
+        let mut ack = [0];
+        stream
+            .read_exact(&mut ack)
+            .map_err(|e| io("read release acknowledgement", e))?;
+        Ok(())
+    }
+}
+
+/// Retain the lease as long as the CUDA host registration or any reader still uses this file.
+pub struct RamView {
+    pub file: OwnedFd,
+    pub lease: OwnedFd,
+    pub offset: u64,
+    pub len: u64,
+}
+impl Channel {
+    pub fn ram(&self, owner: Owner, layout: [u8; 32], region: u64) -> Result<Option<RamView>> {
+        let mut stream = self.0.lock();
+        Self::header(
+            &mut stream,
+            4,
+            owner,
+            PageKey {
+                fingerprint: layout,
+                page: region,
+            },
+            0,
+        )?;
+        let mut ready = [0];
+        stream
+            .read_exact(&mut ready)
+            .map_err(|e| io("read RAM readiness", e))?;
+        if ready == [0] {
+            return Ok(None);
+        }
+        let mut offset = [0; 8];
+        let mut len = [0; 8];
+        stream
+            .read_exact(&mut offset)
+            .and_then(|_| stream.read_exact(&mut len))
+            .map_err(|e| io("read RAM range", e))?;
+        let file = platform::handles::recv_fd(&stream).map_err(crate::os("receive RAM file"))?;
+        let lease = platform::handles::recv_fd(&stream).map_err(crate::os("receive RAM lease"))?;
+        Ok(Some(RamView {
+            file,
+            lease,
+            offset: u64::from_le_bytes(offset),
+            len: u64::from_le_bytes(len),
+        }))
+    }
 }
