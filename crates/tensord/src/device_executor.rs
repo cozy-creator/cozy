@@ -2284,7 +2284,8 @@ mod codec_tests {
     #[test]
     fn ordinary_tensorfs_tokens_cross_the_actual_typed_command_writer_unchanged() {
         let group = Group { rank_caps: vec![17], ..Default::default() };
-        for command in [ordinary_load(), ordinary_invoke()] {
+        let bearer = DeviceCommand::Bearer { actor: "signer".into(), tensorfs: ordinary_options() };
+        for command in [ordinary_load(), ordinary_invoke(), bearer] {
             let mut expected = serde_json::to_value(&command).unwrap();
             expected.as_object_mut().unwrap().extend(serde_json::to_value(&group).unwrap().as_object().unwrap().clone());
             let (mut machine, mut runtime) = platform::ipc::pair().unwrap();
