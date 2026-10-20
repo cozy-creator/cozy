@@ -73,7 +73,7 @@ fn relief(value: Relief) -> (&'static str, u64) {
 fn callback_error(error: PyErr) -> Error {
     Error::Io(format!("Python memory callback: {error}"))
 }
-fn shrink(callback: Py<PyAny>) -> Arc<varena::placement::Shrink> {
+fn shrink_callback(callback: Py<PyAny>) -> Arc<varena::placement::Shrink> {
     Arc::new(move |need| {
         Python::attach(|py| {
             callback
@@ -338,26 +338,26 @@ impl PyPlane {
     fn begin(
         &self,
         py: Python<'_>,
-        id: u64,
+        request: u64,
         plan: Vec<Vec<u64>>,
         package: String,
         shape: String,
     ) -> PyResult<()> {
         let c = self.core(py)?;
-        native(py, || c.begin(id, plan, package, shape))
+        native(py, || c.begin(request, plan, package, shape))
     }
-    fn declare(&self, py: Python<'_>, id: u64, plan: Vec<Vec<u64>>) -> PyResult<()> {
+    fn declare(&self, py: Python<'_>, request: u64, plan: Vec<Vec<u64>>) -> PyResult<()> {
         let c = self.core(py)?;
-        native(py, || c.declare(id, plan))
+        native(py, || c.declare(request, plan))
     }
-    fn enter(&self, py: Python<'_>, id: u64, model: u64) -> PyResult<(&'static str, u64)> {
+    fn enter(&self, py: Python<'_>, request: u64, model: u64) -> PyResult<(&'static str, u64)> {
         let c = self.core(py)?;
-        native(py, || c.enter(id, model)).map(relief)
+        native(py, || c.enter(request, model)).map(relief)
     }
     fn bind(
         &self,
         py: Python<'_>,
-        id: u64,
+        request: u64,
         model: u64,
         region: u32,
         stream: usize,
@@ -370,28 +370,28 @@ impl PyPlane {
             .copied()
             .ok_or_else(|| raise(py, Error::Invalid("region outside weight set".into())))?;
         let device = c.device();
-        let pin = native(py, || c.bind(id, page, stream))?;
+        let pin = native(py, || c.bind(request, page, stream))?;
         Ok(PyPinned::new(pin, region, device))
     }
-    fn leave(&self, py: Python<'_>, id: u64, peak: u64) -> PyResult<()> {
+    fn leave(&self, py: Python<'_>, request: u64, peak: u64) -> PyResult<()> {
         let c = self.core(py)?;
-        native(py, || c.leave(id, peak))
+        native(py, || c.leave(request, peak))
     }
-    fn end(&self, py: Python<'_>, id: u64) -> PyResult<Py<PyDict>> {
+    fn end(&self, py: Python<'_>, request: u64) -> PyResult<Py<PyDict>> {
         let c = self.core(py)?;
-        stats(py, native(py, || c.end(id))?)
+        stats(py, native(py, || c.end(request))?)
     }
     fn relief(
         &self,
         py: Python<'_>,
-        id: u64,
+        request: u64,
         need: u64,
         lower: bool,
     ) -> PyResult<(&'static str, u64)> {
         let c = self.core(py)?;
-        native(py, || c.relief(id, need, lower)).map(relief)
+        native(py, || c.relief(request, need, lower)).map(relief)
     }
-    fn load(&self, py: Python<'_>, model: u64, level: &str) -> PyResult<(&'static str, u64)> {
+    fn load(&self, py: Python<'_>, model: u64, level: &str) -> PyResult<()> {
         let level = match level {
             "ram" => Tier::Ram,
             "gpu" => Tier::Gpu,
@@ -403,7 +403,16 @@ impl PyPlane {
             }
         };
         let c = self.core(py)?;
-        native(py, || c.load(model, level)).map(relief)
+        match native(py, || c.load(model, level))? {
+            Relief::Complete => Ok(()),
+            Relief::Cut(need) | Relief::Lower(need) | Relief::Exhausted(need) => Err(raise(
+                py,
+                Error::DeviceFull {
+                    need,
+                    deficit: need,
+                },
+            )),
+        }
     }
     fn resident(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let c = self.core(py)?;
@@ -435,32 +444,32 @@ impl PyPlane {
     fn trim_with(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
         let c = self.core(py)?;
         native(py, || {
-            c.trim_with(shrink(callback));
+            c.trim_with(shrink_callback(callback));
             Ok(())
         })
     }
-    fn cache(&self, py: Python<'_>, bytes: u64, callback: Py<PyAny>) -> PyResult<u64> {
+    fn cache(&self, py: Python<'_>, nbytes: u64, shrink: Py<PyAny>) -> PyResult<u64> {
         let c = self.core(py)?;
-        native(py, || c.cache(bytes, shrink(callback)))
+        native(py, || c.cache(nbytes, shrink_callback(shrink)))
     }
-    fn cache_bytes(&self, py: Python<'_>, id: u64, bytes: u64) -> PyResult<()> {
+    fn cache_bytes(&self, py: Python<'_>, cache: u64, nbytes: u64) -> PyResult<()> {
         let c = self.core(py)?;
-        native(py, || c.cache_bytes(id, bytes))
+        native(py, || c.cache_bytes(cache, nbytes))
     }
-    fn close_cache(&self, py: Python<'_>, id: u64) -> PyResult<()> {
+    fn close_cache(&self, py: Python<'_>, cache: u64) -> PyResult<()> {
         let c = self.core(py)?;
         native(py, || {
-            c.close_cache(id);
+            c.close_cache(cache);
             Ok(())
         })
     }
-    fn close_model(&self, py: Python<'_>, id: u64) -> PyResult<()> {
+    fn close_model(&self, py: Python<'_>, model: u64) -> PyResult<()> {
         let c = self.core(py)?;
-        native(py, || c.close_model(id))?;
+        native(py, || c.close_model(model))?;
         self.models
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
+            .remove(&model);
         Ok(())
     }
     fn close(&self, py: Python<'_>) -> PyResult<()> {
