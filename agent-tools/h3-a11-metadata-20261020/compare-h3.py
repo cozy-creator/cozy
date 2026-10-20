@@ -88,6 +88,7 @@ def main():
                 dtypes[dtype] = dtypes.get(dtype, 0) + 1
                 if encoding == 0:
                     stored += body[2]
+                    parts += 1
                 else:
                     stored += sum(part[3][2] for part in body)
                     parts += len(body)
@@ -162,6 +163,11 @@ def main():
             "local_chunk_files": 0, "pinned_docs": docs, "component_classes": classes,
             "source": pinned, "original_metadata_sha256": sha(canonical(old[4])),
         })
+    assert sum(
+        component["stored_parts"]
+        for report in reports
+        for component in report["components"].values()
+    ) == 4834, "the selected H3 lane has 2882 plain plus 1952 encoded stored parts"
     receipt = {
         "format": "cozy.r4.selected-metadata-provenance/1",
         "selection": "one exact recorded H3 int8 lane in own staging destination; no live update",
