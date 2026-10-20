@@ -348,7 +348,7 @@ pub fn lane(m: &Manifest, raw: &[u8]) -> Result<Lane> {
                     let at = place(&p.body);
                     parts.push(Part { role, dtype, shape, chunk: at.chunk, offset: at.offset, length: at.length });
                 }
-                let encoding = encoding(t, scheme);
+                let encoding = encoding(scheme);
                 let meta: Vec<PartMetadata> = (parts.iter())
                     .map(|p| PartMetadata { role: &p.role, dtype: &p.dtype, shape: &p.shape, len: p.length as usize })
                     .collect();
@@ -397,13 +397,12 @@ fn role(t: &V1Tensor, scheme: &str, roles: &[(&str, &str)], p: &V1Part) -> std::
     })
 }
 
-/// `t`'s encoding under `scheme`, every scale in the dtype v1 stored it in (U12's mapping).
-fn encoding(t: &V1Tensor, scheme: &str) -> Encoding {
-    let scale = |role: &str| t.parts.iter().find(|p| p.role == role).map_or(Dtype::F32, |p| p.dtype.clone());
+/// The encoding of `scheme` (U12's mapping); each part keeps the dtype v1 stored it in.
+fn encoding(scheme: &str) -> Encoding {
     match scheme {
-        "fp8.rowwise" => Encoding::fp8_rowwise(0, &scale("scale")),
-        "fp8.tensorwise" => Encoding::fp8_tensorwise(&scale("weight_scale")),
-        "int8.convrot" => Encoding::int8_convrot(256, &scale("scale")),
+        "fp8.rowwise" => Encoding::fp8_rowwise(0),
+        "fp8.tensorwise" => Encoding::fp8_tensorwise(),
+        "int8.convrot" => Encoding::int8_convrot(256),
         "mxfp8" => Encoding::mxfp8(ScaleLayout::RowMajor),
         // v1's nvfp4 is ModelOpt's layout.
         "nvfp4" => Encoding::nvfp4(GlobalScale::Multiply, NibbleOrder::LowFirst, ScaleLayout::RowMajor),

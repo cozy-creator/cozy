@@ -55,7 +55,7 @@ async fn a_thin_folder_uploads_from_the_store_or_what_the_endpoint_holds() {
     let mut writer = a.writer(WriterOptions::default()).unwrap();
     writer.component("model", "", Default::default(), None).unwrap().put("w", Dtype::U8, &[weight.len() as u64], &mut &weight[..]).unwrap();
     let saved = writer.commit().await.unwrap();
-    let full = saved.materialize(&dir.0.join("full"), Format::Cozytensors, None).await.unwrap();
+    let full = saved.materialize(&dir.0.join("full"), Format::Cozytensors, false).await.unwrap();
     let folder = dir.0.join("thin");
     thin(&full, &folder);
     fs::write(folder.join("README.md"), "thin\n").unwrap();

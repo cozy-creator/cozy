@@ -1,1 +1,1 @@
-{"format":"tensorfs.repo/1","name":"acme/tiny","releases":[{"lanes":{"bf16":{"length":248,"sha256":"7691ce3b86047fffac7f60978dacbf4d63a5c9ad386361cda94264d191029d79"}},"version":"1.0"}]}
+{"format":"cozytensors.repo/1","name":"acme/tiny","releases":[{"lanes":{"bf16":{"length":248,"sha256":"7691ce3b86047fffac7f60978dacbf4d63a5c9ad386361cda94264d191029d79"}},"version":"1.0"}]}

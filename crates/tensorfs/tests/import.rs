@@ -122,7 +122,7 @@ fn run(tmp: &Path, sources: &[String], converter: Option<&str>) -> Result<Collec
     let req = Request {
         sources,
         converter,
-        variant: None,
+        source_variant: None,
         access: &access,
         tmp,
         progress: &|_, _, _| {},
@@ -1341,7 +1341,7 @@ fn a_single_file_sdxl_becomes_the_upstream_layout() {
     let req = Request {
         sources: &sources,
         converter: None,
-        variant: None,
+        source_variant: None,
         access: &access,
         tmp: &tmp,
         progress: &|_, _, _| {},
@@ -1544,7 +1544,7 @@ fn a_convert_survives_export() {
             let req = Request {
                 sources: &sources,
                 converter: None,
-                variant,
+                source_variant: variant,
                 access: &access,
                 tmp: &tmp,
                 progress: &|_, _, _| {},
@@ -1562,7 +1562,7 @@ fn a_convert_survives_export() {
                 .map(|p| (p.clone(), folder.join(p)))
                 .collect();
             let _ = fs::remove_dir_all(out);
-            tensorfs::export::safetensors(ck, &repo, out, None).unwrap();
+            tensorfs::export::safetensors(ck, &repo, out, false).unwrap();
             tree(out)
         };
         let source = format!("hf://{repo}");

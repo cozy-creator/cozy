@@ -315,7 +315,7 @@ fn convert(
     let request = Request {
         sources: &sources,
         converter: None,
-        variant: None,
+        source_variant: None,
         access,
         tmp: &tmp,
         progress: &|_, _, _| {},
@@ -478,7 +478,7 @@ fn cancellation_after_progress_stops_before_tensor_write() {
         &Request {
             sources: &sources,
             converter: None,
-            variant: None,
+            source_variant: None,
             access: &access,
             tmp: &tmp,
             progress: &progress,
@@ -540,7 +540,7 @@ fn stop_after_real_tensor_write_prevents_final_commit() {
         &Request {
             sources: &sources,
             converter: None,
-            variant: None,
+            source_variant: None,
             access: &access,
             tmp: &tmp,
             progress: &|_, _, _| {},
@@ -586,7 +586,7 @@ fn stop_after_finalization_begins_cannot_undo_committed_header() {
         &Request {
             sources: &sources,
             converter: None,
-            variant: None,
+            source_variant: None,
             access: &access,
             tmp: &tmp,
             progress: &progress,

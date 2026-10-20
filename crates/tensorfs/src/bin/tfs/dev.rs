@@ -267,8 +267,8 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
             }
             Scheme::Fp8Rowwise | Scheme::Fp8Tensorwise => (
                 match it.scheme {
-                    Scheme::Fp8Rowwise => Encoding::fp8_rowwise(0, &Dtype::F32),
-                    _ => Encoding::fp8_tensorwise(&Dtype::F32),
+                    Scheme::Fp8Rowwise => Encoding::fp8_rowwise(0),
+                    _ => Encoding::fp8_tensorwise(),
                 },
                 vec![
                     part(
@@ -309,9 +309,9 @@ pub fn ckpt(store: &Store, blocks: u64, scale: u64, plain: bool, files: bool) ->
             ),
             Scheme::Int8Tensorwise | Scheme::Int8Rowwise | Scheme::Int8Convrot => (
                 match it.scheme {
-                    Scheme::Int8Tensorwise => Encoding::int8_tensorwise(&Dtype::F32),
-                    Scheme::Int8Rowwise => Encoding::int8_rowwise(0, &Dtype::F32),
-                    _ => Encoding::int8_convrot(256, &Dtype::F32),
+                    Scheme::Int8Tensorwise => Encoding::int8_tensorwise(),
+                    Scheme::Int8Rowwise => Encoding::int8_rowwise(0),
+                    _ => Encoding::int8_convrot(256),
                 },
                 vec![
                     part(

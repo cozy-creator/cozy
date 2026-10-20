@@ -176,7 +176,7 @@ jobs:
           # manylinux2014, which cannot execute the shared manylinux_2_28 cache.
           manylinux: '2_28'
           working-directory: crates/tensorfs-py
-          args: --release --locked --target-dir ../../target/manylinux --out dist
+          args: --release --locked --target-dir ../../target/manylinux --out dist -i python3.11
           docker-options: -e TENSORFS_REQUIRE_AOT=1
           before-script-linux: |
             cargo build --release --locked --target-dir ../../target/manylinux -p tensorfs --bin tfs

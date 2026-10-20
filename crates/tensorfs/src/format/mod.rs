@@ -25,11 +25,11 @@ pub use doc::{Pipeline, CONFIG_FILE};
 pub use value::{Config, ConfigValue, Value};
 
 pub const HEADER_FORMAT: &str = "cozytensors/1";
-pub const REPO_FORMAT: &str = "tensorfs.repo/1";
+pub const REPO_FORMAT: &str = "cozytensors.repo/1";
 /// The tree path of an unnamed variant's header.
 pub const HEADER_PATH: &str = "model.cozytensors";
 /// A repo's file tree: `{format, files: {path: object}}`.
-pub const TREE_FORMAT: &str = "tensorfs.tree/1";
+pub const TREE_FORMAT: &str = "cozytensors.tree/1";
 
 /// The variant a repo file holds: `model.<variant>.cozytensors` → `<variant>`,
 /// `model.cozytensors` → `""`; `None` for any other path.

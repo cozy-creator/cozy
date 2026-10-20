@@ -15,7 +15,8 @@ pub type ConvertProgress<'a> = dyn Fn(&str, u64, u64) -> Result<()> + Sync + 'a;
 #[derive(Default)]
 pub struct Convert<'a> {
     pub converter: Option<&'a str>,
-    pub variant: Option<&'a str>,
+    /// The source's Diffusers weights variant (`fp16`), when a folder has several.
+    pub source_variant: Option<&'a str>,
     pub progress: Option<&'a ConvertProgress<'a>>,
 }
 
@@ -102,19 +103,26 @@ impl Client {
             kind: Kind::Unsupported,
             detail: "conversion needs the caller's active Tokio runtime".into(),
         })?;
+        // The caller's credential is the sources' one: it replaces the environment's, so a
+        // request carries one Authorization.
+        let token = self.config.token.clone().map(|p| {
+            Arc::new(provider::NativeProvider(p)) as Arc<dyn crate::fetch::TokenProvider>
+        });
+        let environment = match token {
+            Some(_) => Access::default(),
+            None => Access::from_env(),
+        };
         Ok(Access {
             // A supplied loopback source is the existing explicit local-source carve-out.
             allow_local: sources
                 .iter()
                 .any(|s| crate::fetch::policy::is_loopback_origin(s)),
-            token: self.config.token.clone().map(|p| {
-                Arc::new(provider::NativeProvider(p)) as Arc<dyn crate::fetch::TokenProvider>
-            }),
+            token,
             runtime: Some(runtime),
             cancelled: Some(control.cancelled.clone()),
             cancel_notify: Some(control.notify.clone()),
             ca_der: self.config.ca_der.clone(),
-            ..crate::import::Access::from_env()
+            ..environment
         })
     }
 
@@ -129,7 +137,7 @@ impl Client {
         let access = self.import_access(sources, &control)?;
         let (sources, store) = (sources.to_owned(), self.store.clone());
         let converter = options.converter.map(str::to_owned);
-        let variant = options.variant.map(str::to_owned);
+        let source_variant = options.source_variant.map(str::to_owned);
         let worker_control = control.clone();
         blocking(control, options.progress, move |events| {
             let report = |stage: &str, held, total| {
@@ -152,7 +160,7 @@ impl Client {
             let request = import::Request {
                 sources: &sources,
                 converter: converter.as_deref(),
-                variant: variant.as_deref(),
+                source_variant: source_variant.as_deref(),
                 access: &access,
                 tmp: &tmp,
                 progress: &report,

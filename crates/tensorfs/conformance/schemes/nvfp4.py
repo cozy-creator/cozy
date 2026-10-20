@@ -4,7 +4,7 @@ of a row, a global scale per matrix and optionally AWQ's per-column factor."""
 import numpy as np
 
 from . import affine, elem, grid, table
-from .base import Part, PartDtype, Scheme, logical, one
+from .base import Part, Scheme, logical, one
 from .mxfp8 import LAYOUTS, blocks
 
 
@@ -40,11 +40,10 @@ def decode(c):
 
 SCHEMES = (
     Scheme("nvfp4", {"block_size": (16,), "global_scale": ("multiply", "divide"),
-                     "nibble_order": ("low_first", "high_first"), "scale_layout": LAYOUTS,
-                     "pre_quant_scale_dtype": PartDtype("pre_quant_scale", ("F32", "BF16", "F16"))},
+                     "nibble_order": ("low_first", "high_first"), "scale_layout": LAYOUTS},
            (Part("weight", ("F4",), logical), Part("scale", ("F8_E4M3",), scale_shape),
             Part("scale_2", ("F32",), per_matrix("scale_2")),
             Part("input_scale", ("F32",), per_matrix("input_scale"), required=False),
-            Part("pre_quant_scale", "pre_quant_scale_dtype", lambda c: grid.shape(grid.COL, c), required=False)),
+            Part("pre_quant_scale", ("F32", "BF16", "F16"), lambda c: grid.shape(grid.COL, c), required=False)),
            decode),
 )

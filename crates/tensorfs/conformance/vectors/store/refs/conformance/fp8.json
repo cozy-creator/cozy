@@ -1,1 +1,1 @@
-{"format":"tensorfs.repo/1","name":"Conformance/fp8","releases":[{"tree":{"length":253,"sha256":"7d13d69791838649288ef2658c2a2ab8369133628ea794329c5bf670464c3da8"},"version":"1"}]}
+{"format":"cozytensors.repo/1","name":"Conformance/fp8","releases":[{"tree":{"length":256,"sha256":"339297065efbf08dd65f3630ac3e77b076a3520325798181ef4ac666b02ca256"},"version":"1"}]}

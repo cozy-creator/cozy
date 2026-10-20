@@ -108,7 +108,7 @@ pub(super) async fn submit<B: MachineBackend>(
         if !identity.readiness.proved() {
             return Err(Error::unavailable("machine_booting", "the machine is starting; update it once it is ready"));
         }
-        stage(&updates, &*backend, actor, &id, request.spec)?;
+        stage(&updates, &*backend, actor, &id, request.spec, &identity.gpus)?;
         let update = updates.update(&id).ok_or_else(|| Error::internal("update_unrecorded", "the update was not recorded"))?;
         Ok((true, state(&id, &update)))
     })
@@ -162,6 +162,7 @@ fn stage(
     actor: VerifiedActor,
     id: &str,
     spec: v1::RunSpec,
+    gpus: &[crate::machine::receipt::Gpu],
 ) -> Result<(), Error> {
     let payload = spec.payload.as_ref().map_or("{}", |payload| payload.get());
     let cohort: Cohort = serde_json::from_str(payload).map_err(|e| {

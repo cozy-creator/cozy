@@ -46,7 +46,7 @@ fn import(store: &Store, source: &Path) -> tensorfs::err::Result<Checkpoint> {
     let req = Request {
         sources: &[source.display().to_string()],
         converter: None,
-        variant: None,
+        source_variant: None,
         access: &access,
         tmp: &tmp,
         progress: &|_, _, _| {},

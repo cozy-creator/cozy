@@ -39,11 +39,9 @@ PYTHON -I -m cozy_runtime.internal.trampoline --expect-parent <pid> --oom-adj 10
 ## Weight loading
 
 TensorD's `Load` command asks Runtime to construct the model in this executor. TensorD supplies
-the selected stored metadata/assets and CPU weight buffers or object descriptors; Runtime uses
-its own TensorFS library to parse and plan reads, then its weight plane/device APIs to perform
-GPU allocation, transfer, mapping and unmapping. Machine-wide budget and eviction decisions remain with
-TensorD. Its retained exported GPU handles can let a replacement executor attach existing
-allocations, but that executor still needs its own model objects and CUDA context.
+the selected TensorFS source and metadata/assets; Runtime parses
+and plans reads with its own TensorFS library, and varena in the executor decides every GPU byte
+it holds, making room in other executors through the GPU's ledger (design memory-varena).
 
 ## Wire
 
@@ -51,36 +49,34 @@ allocations, but that executor still needs its own model objects and CUDA contex
   `seam.MAX_FRAME`) refuses only a corrupt or hostile prefix. Bulk data goes through the spool.
 - Any outgoing object key named `token`, `credential`, `authorization`, `secret` or `jwt` is
   refused, except `tensorfs.token` on `load`, `invoke` and `bearer`: the request's owner bearer.
-- Commands (`cmd`): `hello`, `start`, `load`, `activate`, `prepare_request`, `invoke`, `budget`,
-  `unload`, `probe`, `shutdown`. The usual sequence is
+- Commands (`cmd`): `hello`, `start`, `load`, `activate`, `prepare_request`, `invoke`, `map`,
+  `budget`, `unload`, `probe`, `fork`, `shutdown`. The usual sequence is
   Hello -> Start -> Load -> Activate -> PrepareRequest -> Invoke.
 - `bearer` (`{"cmd":"bearer","actor","tensorfs":{"endpoint","token","expires_unix_ms"}}`) goes
-  outside any exchange, at any time (a `Line`, under the lock every write takes), and is
-  answered by nothing. TensorD sends it to each executor a Load or Invoke gave that signer's
-  token for that endpoint (the same string), whenever `hub::Bearer` holds a newer one. The
-  Runtime routes it as it reads it, like a cancel, and keeps per signer and endpoint the token
-  that expires latest (0: unknown, replaces); a call's TensorFS provider presents it per request
-  and asks once more after a 401 for a token replaced in flight. Load and Invoke name `actor`.
-  A Runtime without the handler answers `reply: bearer`, which TensorD ignores.
+  outside any exchange (a `Line`, under the lock every write takes) and is answered by nothing.
+  TensorD sends it to each executor a Load or Invoke gave that signer's token for that endpoint,
+  whenever it holds a newer one. Load and Invoke name `actor`. A Runtime without the handler
+  answers `reply: bearer`, which TensorD ignores.
+- `Start.ledgers` counts rank grants. Each grant follows the command as three descriptors:
+  the shared placement table, its eventfd, and a private custody/RAM channel. Each Runtime
+  rank claims its own row after it exists; TensorD does not open a CUDA context.
 - While waiting for a reply, `event=progress` frames go to `Services::progress`. `event=request`
   frames (optionally with an `SCM_RIGHTS` fd) go to `Services::request`. The reply must name the
   command, otherwise it is an error. Unknown events and fields are ignored.
 - `Baseline` services answer every request `capability_unavailable`.
-- `Start.ledgers` counts rank grants. Each grant follows the command as three descriptors:
-  the shared placement table, its eventfd, and a private custody/RAM channel. Each Runtime
-  rank claims its own row after it exists; TensorD does not open a CUDA context.
-- Runtime replies carry typed `memory` measurements and their placement trace. GPU pages
-  are retained by the [placement library](../../varena/src/ledger.rs), not by seam callbacks.
+- Runtime replies carry typed request memory and placement trace. The library channel
+  retains read-only pages and raw RAM regions; seam callbacks do not own that custody.
 
 ## Capabilities
 
-The placement stack uses the paired Runtime's three-descriptor rank grants. Hello's version
-fields remain provenance; admission never uses a version-number gate.
+The paired Runtime must implement the grant wire above. Hello's version fields remain
+provenance; the seam does not select a different implementation from a version string.
 
 ## Observations
 
-`LoadFacts`, `PlaneFacts` and `Metrics` are typed optional records. An absent value is unknown,
-and signed byte fields keep the SDK's `-1` sentinel. Observations never authorize kills.
+`LoadFacts`, `Metrics` and an invoke's `memory` (varena's per-request stats, kept whole) are
+typed optional records. An absent value is unknown, and signed byte fields keep the SDK's `-1`
+sentinel. Observations never authorize kills.
 
 ## Results
 
@@ -130,10 +126,9 @@ longer than eight times the longest pause it has shown, and at least six samples
   and at each token scope's end. Untokened processes, such as an operator's SSH jobs, are never
   touched.
 - No copy drain before a kill: a kill only follows a measured wedge, so the executor is not
-  cooperating and could not drain. Nothing it was copying is shared yet: Degree 2 regions are
-  offered to custody only by `Share` after a synchronized, completed call; host-tier layouts are
-  sealed read-only memfds the machine filled; outputs are taken into custody only from a
-  quiescent reply. Sources it read stay retained until its exit is observed.
+  cooperating and could not drain. Nothing it was copying is shared: GPU pages are its own;
+  host-tier layouts are sealed read-only memfds the machine filled; outputs are taken into
+  custody only from a quiescent reply. Sources it read stay retained until its exit is observed.
 
 ## Known gaps
 
@@ -144,5 +139,4 @@ longer than eight times the longest pause it has shown, and at least six samples
   `cgroup.procs`, or (token) exec with a scrubbed environment and escape its ancestry. A fork's
   fork-only descendants carry its import-only parent's token, so they end with that parent. It
   can also reopen store paths.
-- For degree > 1, Runtime rank 0 coordinates its followers' weight delivery. Sharing exported
-  GPU allocations through TensorD's Degree 2 custody remains world-one.
+- For degree > 1, Runtime rank 0 coordinates its followers' weight delivery.
