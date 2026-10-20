@@ -117,8 +117,9 @@ a full multi-variant tree snapshot; use `snapshot_download` for repository mater
 Exporting a standalone header cannot recover unknown repository files or release metadata.
 
 All operations involving network/source resolution above are async except construction and
-`writer`. Export uses `tensorfs::export(&checkpoint, directory, Format::Safetensors,
-dequantize)` and returns `Result<Vec<String>>`; ensure required bytes are available first.
+`writer`. Export uses `tensorfs::export(&checkpoint, directory, format, dequantize)` and
+returns `Result<Vec<String>>`; choose `Format::Safetensors` or `Format::Cozytensors`, and
+ensure required bytes are available first.
 
 A `Writer` also has `pipeline(class, config)`, `component(name, class, config)`,
 `set_metadata(key, Value)`, `has(component, key)`, `committed()` and `abandon(self)`. Its

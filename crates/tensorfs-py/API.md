@@ -256,12 +256,14 @@ file removes only that handle; releasing its saved data is an explicit store-man
 operation.
 
 `Writer(dest=None, ...)` keeps the checkpoint in the shared store without writing a header
-file. `dest` is a literal file path, not a directory. Its options are:
+file. `dest` is a literal file path, not a directory.
 
 Leave `variant` unset when `dest` is supplied; that combination is invalid. TensorFS does
 not append or infer a variant label from the filename. For example,
 `Writer("model.f32.cozytensors")` writes that exact filename without assigning a repository
 variant. Tensor dtypes and encodings describe the representation independently.
+
+Its options and members are:
 
 | Option or member | Use |
 |---|---|
