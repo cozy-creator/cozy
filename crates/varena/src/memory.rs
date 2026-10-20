@@ -151,6 +151,12 @@ enum ConsumerFence {
 
 fn consumer_stream(stream: u64) -> u64 { if stream == 0 { 1 } else { stream } }
 
+fn same_consumer(bind: u64, stream: u64) -> bool {
+    // Numeric 2 names a DIFFERENT stream on each caller thread. Enqueue its dependency on
+    // this caller even when the original bind also used PTDS; no ThreadId registry is needed.
+    stream != 2 && consumer_stream(bind) == consumer_stream(stream)
+}
+
 impl ConsumerFence {
     fn of(stream: u64) -> Self {
         if stream == 2 { Self::Context } else { Self::Stream(consumer_stream(stream)) }
@@ -1634,8 +1640,9 @@ impl Pinned {
     /// CUDA PTDS (2) uses a captured-context completion fence after the final consumer drops.
     pub fn wait_on(&self, stream: u64) -> Result<()> {
         self.consumers.wait_on(stream, || {
-            if consumer_stream(stream) == consumer_stream(self.stream) || self.ready.done()? { return Ok(()); }
+            if same_consumer(self.stream, stream) { return Ok(()); }
             let _c = CtxGuard::enter(self.ws.gpu.inner.ctx)?;
+            if self.ready.done()? { return Ok(()); }
             wait_in(stream as CUstream, &self.ready)
         })
     }
@@ -1851,6 +1858,9 @@ mod completion_tests {
         let legacy = Consumers::new(0);
         legacy.wait_on(1, || Ok(())).unwrap();
         assert_eq!(legacy.streams(), vec![1], "native default and DLPack legacy duplicated a consumer");
+        assert!(same_consumer(0, 1) && same_consumer(1, 0));
+        assert!(same_consumer(1234, 1234));
+        assert!(!same_consumer(2, 2), "PTDS numeric equality cannot skip another thread's wait");
     }
 
     #[test]
