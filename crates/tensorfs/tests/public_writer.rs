@@ -941,7 +941,7 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
         Ok(())
     };
     let checkpoint = client
-        .convert(
+        .convert_to_cozytensors(
             &[source.to_str().unwrap().into()],
             &tensorfs::Convert {
                 progress: Some(&progress),
@@ -1010,7 +1010,7 @@ async fn public_convert_result_callback_can_refuse_the_final_stage_and_returns_a
         };
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            client.convert(
+            client.convert_to_cozytensors(
                 &[source.to_str().unwrap().into()],
                 &tensorfs::Convert {
                     progress: Some(&progress),
@@ -1041,7 +1041,7 @@ async fn public_convert_result_callback_can_refuse_the_final_stage_and_returns_a
         );
         drop(operator);
         let checkpoint = client
-            .convert(
+            .convert_to_cozytensors(
                 &[source.to_str().unwrap().into()],
                 &tensorfs::Convert::default(),
             )
@@ -1157,7 +1157,7 @@ fn dropped_public_convert_wakes_stalled_io_without_restarting_the_callers_curren
     let client = Client::new(config).unwrap();
     let sources = [origin.source.clone()];
     let options = tensorfs::Convert::default();
-    let mut future = Box::pin(client.convert(&sources, &options));
+    let mut future = Box::pin(client.convert_to_cozytensors(&sources, &options));
     runtime.block_on(async {
         tokio::select! {
             result = &mut future => panic!("conversion finished before the HTTP body stalled: {result:?}"),
@@ -1345,7 +1345,7 @@ fn public_conversion_without_a_tokio_caller_refuses_instead_of_starting_a_runtim
     let client = client(&cache, &scratch.0.join("endpoint"));
     let sources = [source.to_str().unwrap().to_owned()];
     assert_eq!(
-        futures::executor::block_on(client.convert(&sources, &tensorfs::Convert::default()))
+        futures::executor::block_on(client.convert_to_cozytensors(&sources, &tensorfs::Convert::default()))
             .unwrap_err()
             .kind,
         Kind::Unsupported

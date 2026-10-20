@@ -269,18 +269,16 @@ impl PyClient {
         Ok(PyCheckpoint::from_core(checkpoint))
     }
 
-    #[pyo3(signature = (repo_id, *, revision = None, variant = None, components = None, local_dir = None, local_files_only = false))]
+    #[pyo3(signature = (identity, *, components = None, local_dir = None, local_files_only = false))]
     fn materialize(
         &self,
         py: Python<'_>,
-        repo_id: &str,
-        revision: Option<String>,
-        variant: Option<String>,
+        identity: (String, Option<String>, Option<String>),
         components: Option<Vec<String>>,
         local_dir: Option<PathBuf>,
         local_files_only: bool,
     ) -> PyResult<PathBuf> {
-        let reference = reference(repo_id, revision, variant).or_raise(py)?;
+        let reference = reference(&identity.0, identity.1, identity.2).or_raise(py)?;
         let selection = components.map(Selection::Components).unwrap_or_default();
         let want = Download {
             selection,
@@ -334,7 +332,7 @@ impl PyClient {
     }
 
     #[pyo3(signature = (source, *, converter = None, variant = None, progress = None))]
-    fn convert(
+    fn convert_to_cozytensors(
         &self,
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
@@ -366,7 +364,7 @@ impl PyClient {
                 .as_ref()
                 .map(|_| &notify as &tensorfs::ConvertProgress<'_>),
         };
-        let result = py.detach(|| bridge(self.client.convert(&sources, &options)));
+        let result = py.detach(|| bridge(self.client.convert_to_cozytensors(&sources, &options)));
         if let Some(error) = callback_error
             .into_inner()
             .unwrap_or_else(|e| e.into_inner())

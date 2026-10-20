@@ -136,7 +136,7 @@ impl Client {
     /// Convert into the managed store with the same native Writer, layouts and byte engine.
     /// Callbacks may refuse until finalization starts; an atomic commit already in progress
     /// cannot be undone by dropping its awaiting future.
-    pub async fn convert(&self, sources: &[String], options: &Convert<'_>) -> Result<Checkpoint> {
+    pub async fn convert_to_cozytensors(&self, sources: &[String], options: &Convert<'_>) -> Result<Checkpoint> {
         if sources.is_empty() {
             return fail(Kind::Invalid, "convert needs a source");
         }

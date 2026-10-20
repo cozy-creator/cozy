@@ -38,7 +38,7 @@ def open(name_or_path, *, revision=None, variant=None, endpoint=None, local_file
 
 def materialize(repo_id: str, *, revision=None, variant=None, components=None, cache_dir=None, local_dir=None, local_files_only=False, token=None, endpoint=None, ca_der=None) -> str:
     return str(_client(cache_dir, endpoint, token, ca_der).materialize(
-        repo_id, revision=revision, variant=variant, components=components,
+        (repo_id, revision, variant), components=components,
         local_dir=local_dir, local_files_only=local_files_only,
     ))
 
@@ -53,8 +53,8 @@ def upload_folder(*, repo_id: str, folder_path, revision=None, token=None, endpo
     return _client(cache_dir, endpoint, token, ca_der).upload_folder(Path(folder_path), repo_id, revision)
 
 
-def convert(source: str | Sequence[str], *, converter=None, variant=None, cache_dir=None, token=None, progress=None):
-    return _client(cache_dir, token=token, configured_token=False).convert(
+def convert_to_cozytensors(source: str | Sequence[str], *, converter=None, variant=None, cache_dir=None, token=None, progress=None):
+    return _client(cache_dir, token=token, configured_token=False).convert_to_cozytensors(
         source, converter=converter, variant=variant, progress=progress,
     )
 
