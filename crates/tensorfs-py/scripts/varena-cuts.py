@@ -211,6 +211,25 @@ def relax() -> None:
     check("the memo keeps no cut's input (no leftover)", seen() is None)
 
 
+def plans() -> None:
+    """Planning's one cut: an FFN's tokens in the fewest pieces whose saving covers the bytes
+    short; none when no piece count can, or the shape measured a cut no lower than whole."""
+    ff = FeedForward(64, mult=4, activation_fn="gelu").eval()
+    cuts.install(ff)
+    memo, _, _ = fresh(1 << 40)
+    s = site("plans")
+    shape = s.track.shape = memo.shape("plans", "x")
+    with torch.no_grad():
+        cuts.run(s, ff, (torch.randn(1, 300, 64),), {})
+    key = max(shape.units, key=lambda k: shape.units[k] * shape.scopes[k][0])
+    unit, total = shape.units[key], shape.scopes[key][0]
+    planned = cuts.planned(shape, unit * (total - total // 4) - 1)
+    check("planning cuts an FFN to the fewest pieces that cover it", planned and memo.sizes[key] == 75)
+    check("no piece count covers more than the FFN holds", not cuts.planned(shape, unit * total))
+    shape.whole_only = True
+    check("a shape whose cut was no lower than whole is never cut again", not cuts.planned(shape, 1))
+
+
 def swapped() -> None:
     """A class swapped in after the cut is installed serves (a package's fused module), and the
     cut marks itself so a package's shape check can allow it."""
@@ -636,7 +655,7 @@ def lattice() -> None:
 
 
 def main() -> int:
-    for test in (ffn_cut, relax, swapped, fused_ffn, attention_cut, bands, vae_decode, block_catch, lattice):
+    for test in (ffn_cut, relax, plans, swapped, fused_ffn, attention_cut, bands, vae_decode, block_catch, lattice):
         test()
     print(f"{sum(results)}/{len(results)} passed", flush=True)
     return 0 if all(results) else 1
