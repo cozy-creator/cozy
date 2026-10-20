@@ -652,8 +652,8 @@ A repo is a set of **commits** and the **tags** that point at them, as in git:
 
   The variant is then looked up in that commit's tree. Without an explicit variant, exactly one variant is selected
   automatically; zero gives no variant and more than one requires an explicit choice. The unnamed variant has no
-  implicit priority over other variants. Only a header digest is a pin: a tag moves, and a commit no tag names is
-  collected.
+  implicit priority over other variants. A commit id and a header digest name immutable content; a tag moves,
+  and a commit no tag names is collected (below).
 - **Roots.** The tags' commits, yanked or private included, are this repo's referenced roots; nothing else is. Keeping
   a complete copy of the repo requires keeping their closures. Local cache eviction policy is not part of the
   document format.
