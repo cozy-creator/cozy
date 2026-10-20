@@ -1077,6 +1077,9 @@ class Memory:
             stack.remove(request)
             self.active.pop(request, None)
             gc.collect()
+            # Admission reads the published row before another forward can
+            # refresh it. Do not leave a completed step's activation peak pinned.
+            self._measure()
             raw: dict[str, Any] = (
                 self.native.end(request.native_id)
                 if self.native is not None

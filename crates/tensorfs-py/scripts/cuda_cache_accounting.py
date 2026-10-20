@@ -42,6 +42,18 @@ try:
         leaked = torch.cuda.memory_allocated(device) - before
     assert leaked >= 1 << 20
     assert third.stats is not None and third.stats.leftover == ((0, leaked),)
+
+    # A nested scope's released activations must become allocator slack before
+    # its still-running caller needs room, without starting another request.
+    with memory.request("outer-after-inner-cleanup"):
+        with memory.request("temporary-allocation") as fourth:
+            temporary = torch.empty(4 << 20, dtype=torch.uint8, device=device)
+            memory._measure()  # A real model measures its allocator while live.
+            del temporary
+        assert fourth.stats is not None and fourth.stats.leftover == ((0, 0),)
+        assert memory.free(device, memory.available() + 1), (
+            "completed scope left released activations charged as pinned scratch"
+        )
     del retained, another
 finally:
     owned.clear()
