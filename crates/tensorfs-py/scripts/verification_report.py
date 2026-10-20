@@ -23,8 +23,8 @@ shutil.copytree(folder, repo_source)
 readme_bytes = b"repository notes"
 (repo_source / "README.md").write_bytes(readme_bytes)
 repo_cache = folder.parent / "repo-cache"
-tensorfs.upload_folder(repo_id="local/verification", folder_path=repo_source, cache_dir=repo_cache)
-named = tensorfs.open("local/verification", local_files_only=True, cache_dir=repo_cache)
+tree_id = tensorfs.upload_folder(repo_id="local/verification", folder_path=repo_source, cache_dir=repo_cache)
+named = tensorfs.open(tree_id, local_files_only=True, cache_dir=repo_cache)
 
 def blob(reference):
     digest = reference[0]
