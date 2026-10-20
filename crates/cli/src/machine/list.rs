@@ -62,8 +62,11 @@ pub async fn list(ctx: &Context, once: bool) -> Result<ExitCode, Error> {
         );
     }
     for hub in &list.signed_out {
-        let label = hub_label(ctx, hub);
-        println!("hub {label}: not logged in; `cozy login <email> --tensorhub={label}`");
+        let login = match ctx.config.resolve(hub) {
+            Ok(hub) => ctx.login(&hub),
+            Err(_) => format!("cozy login <email> --tensorhub {hub}"),
+        };
+        println!("hub {}: not logged in; `{login}`", hub_label(ctx, hub));
     }
     let mut table = output::Table::new(ctx, HEADERS);
     for row in rows(ctx, &list) {

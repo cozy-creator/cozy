@@ -16,8 +16,8 @@ pub(crate) const HEADERS: [&str; 7] = [
 ];
 /// The newest runs a list shows unless `--limit` says otherwise.
 const SHOWN: u64 = 50;
-/// A reason is one table cell; `cozy run show` has it whole.
-const REASON: usize = 72;
+/// A target or reason is one table cell; `cozy run show` has it whole.
+const CELL: usize = 72;
 
 /// `GET /v1/runs`' filters.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -108,6 +108,14 @@ pub(crate) fn matches(ctx: &Context, query: &Query, run: &Run) -> Result<bool, E
     Ok(state && package && hub)
 }
 
+/// `text` cut to one cell's width.
+fn clip(text: String) -> String {
+    match text.chars().count() > CELL {
+        true => format!("{}…", text.chars().take(CELL - 1).collect::<String>()),
+        false => text,
+    }
+}
+
 /// A run as one row of the table and the live view.
 pub(crate) fn row(run: &Run) -> Vec<String> {
     let mut target = run.target.clone();
@@ -146,18 +154,14 @@ pub(crate) fn row(run: &Run) -> Vec<String> {
         _ => String::new(),
     };
     let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
-    let reason = match reason.chars().count() > REASON {
-        true => format!("{}…", reason.chars().take(REASON - 1).collect::<String>()),
-        false => reason,
-    };
     vec![
         run.number.to_string(),
-        target,
+        clip(target),
         run.machine.clone().unwrap_or_else(|| "—".into()),
         follow::status(run),
         progress,
         time,
-        reason,
+        clip(reason),
     ]
 }
 

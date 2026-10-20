@@ -364,14 +364,17 @@ async fn catalog(ctx: &Context, hub: &Hub) -> Result<ExitCode, Error> {
         ]);
     }
     table.print();
-    match skus.first() {
-        Some(first) => {
-            let expected = &first.widths[0].expected_price;
+    // The cheapest is often a CPU or free-traffic offer that assumes no download: say the most any
+    // row assumes, which is what makes EXPECTED exceed $/HOUR.
+    let download = skus.iter().map(|s| s.widths[0].expected_price.download_gb).max();
+    match skus.first().zip(download) {
+        Some((first, download)) => {
             output::say(
                 ctx,
                 &format!(
-                    "Prices are for the fewest GPUs. EXPECTED is {} h and a {} GB download: GPU, disk and traffic.",
-                    expected.hours, expected.download_gb
+                    "Prices are for the fewest GPUs. EXPECTED is {} h and a {download} GB model download: \
+                     GPU, disk and the provider's traffic price.",
+                    first.widths[0].expected_price.hours
                 ),
             );
             output::next(ctx, &["cozy machine rent <name> [--gpus N]"]);

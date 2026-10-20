@@ -32,7 +32,7 @@ jobs:
           TAG: ${{ github.event.inputs.tag }}
           MUST: ${{ github.event.inputs.must_contain }}
           TENSORFS_RUN: ${{ github.event.inputs.tensorfs_run }}
-          RUNNERS: ubuntu-24.04 ubuntu-24.04-arm macos-15 windows-2025 windows-11-arm
+          RUNNERS: ubuntu-24.04 ubuntu-24.04-arm macos-15 macos-15-intel windows-2025 windows-11-arm
         run: |
           runs=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs
           refusals=() notes=()

@@ -753,7 +753,7 @@ class Memory:
         home and one run once keeps only what is resident. Within a request it never rises.
         Planning never cuts: cuts in force relax (`cuts.coarser`) whenever the peak the relaxed
         pass needs (its peak measured uncut, else twice the cut one) still leaves the model two
-        streaming slots. Measured, the pass's working set gets its room before it runs, not from its OOM."""
+        streaming slots, or is no higher than the cut one. Measured, the pass's working set gets its room before it runs, not from its OOM."""
         repeating = model.repeats >= 2
         if not model.blocks or (model.reserve < 0 and repeating):
             return
@@ -768,8 +768,8 @@ class Memory:
                 cold = (m for m in self.models.values() if self._victim(m))
                 room += sum(_set(m)[0] for m in cold if self._keep(m) < keep) + self._others()
             sizes = _sizes(model)
-            need = cuts.relaxing(model.track.shape, model.reserve)
-            if need is not None and room - need >= 2 * max(sizes):
+            need = cuts.relaxing(model.track.shape, model.reserve)  # a cut no lower goes
+            if need is not None and (need <= model.reserve or room - need >= 2 * max(sizes)):
                 cuts.coarser(model.track.shape)  # type: ignore[arg-type]
                 model.reserve = need
             room -= model.reserve
@@ -1731,10 +1731,13 @@ def _fly(model: Model) -> None:
 
 
 def _hook(block: Block) -> None:
+    """The block's forward, bound: its own forward if it has one, else its class's at each call
+    (a package's later class swap, such as a fused block, takes effect)."""
     module, memory, site = block.module, block.model.memory, block.site
     assert module is not None and site is not None
     block.own_forward = "forward" in module.__dict__
-    forward = block.forward = module.forward
+    block.forward = module.forward
+    forward = block.forward if block.own_forward else cuts.current(module)
 
     def bound(*args: object, **kwargs: object) -> object:
         loose = not block.model.aloft  # run outside its model's forward: common binds with it
@@ -1750,6 +1753,7 @@ def _hook(block: Block) -> None:
             if loose:
                 memory._exit(block.model.common)
 
+    bound._varena = True  # type: ignore[attr-defined]  # what a package's shape check allows
     module.forward = bound  # type: ignore[method-assign]
 
 

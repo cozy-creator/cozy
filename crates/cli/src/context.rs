@@ -77,6 +77,15 @@ impl Context {
         ))
     }
 
+    /// `cozy login` for `hub`, spelled for the next step: `--tensorhub` only for a Hub other than
+    /// the current one.
+    pub fn login(&self, hub: &Hub) -> String {
+        match self.config.current() {
+            Ok(current) if current.origin == hub.origin => "cozy login <email>".into(),
+            _ => format!("cozy login <email> --tensorhub {}", hub.label()),
+        }
+    }
+
     /// This computer's device key at `hub` and the Bearer it mints, kept beside it.
     pub fn hub_session(&self, hub: &Hub) -> Result<Arc<UserSession>, Error> {
         if !self.signed_in(hub) {
@@ -85,7 +94,7 @@ impl Context {
                 "not_logged_in",
                 format!("this computer is not signed in to {hub}"),
             )
-            .next(login(hub)));
+            .next(self.login(hub)));
         }
         let key = DeviceKey::load(&hub.device_key(&self.home)).map_err(hub_error)?;
         Ok(Arc::new(UserSession::new(
@@ -103,13 +112,6 @@ impl Context {
     }
 }
 
-/// `cozy login` for `hub`, spelled for the next step.
-pub fn login(hub: &Hub) -> String {
-    match &hub.name {
-        Some(name) => format!("cozy login <email> --tensorhub {name}"),
-        None => format!("cozy login <email> --tensorhub {}", hub.origin),
-    }
-}
 
 /// A Hub call's answer, or its refusal as the CLI's own.
 pub fn hub_answer<T, E>(

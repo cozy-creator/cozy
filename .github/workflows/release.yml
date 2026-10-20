@@ -263,6 +263,9 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      # HAND-EDITED: the installers as the release ships them (scripts/patch-installers.sh).
+      - name: Patch the installers
+        run: scripts/patch-installers.sh target/distrib
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v7
         with:

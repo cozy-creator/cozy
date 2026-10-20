@@ -312,12 +312,14 @@ def relaxing(shape: Shape | None, peak: int) -> int | None:
 
 def coarser(shape: Shape) -> None:
     """Relaxation (the planner's): a shape's cuts go back to whole when it ran uncut before,
-    else one step toward it (twice their size); its peak waits to be measured again."""
+    else one step toward it, half as many pieces (a floor-halved size doubles back to whole
+    exactly); its peak waits to be measured again."""
     memo = _served.memo
     for key, (total, _, _) in shape.scopes.items():
         size = min(memo.sizes.get(key, total), total)
         if size < total:
-            memo.sizes[key] = total if shape.whole >= 0 else min(total, 2 * size)
+            pieces = 1 if shape.whole >= 0 else -(-total // size) // 2
+            memo.sizes[key] = -(-total // max(pieces, 1))
     shape.peak, shape.cuts = -1, {}
 
 
@@ -879,10 +881,16 @@ def install(module: nn.Module) -> int:
         if kind is not None and "_varena_ffn" not in vars(sub):
             # a quantized lane's linears are encoded leaves: any module naming out_features counts
             width = sum(int(getattr(m, "out_features", 0) or 0) for m in sub.modules())
-            sub.forward = _ffn(kind, width, sub.forward)  # type: ignore[method-assign]
+            own = vars(sub).get("forward")
+            sub.forward = _ffn(kind, width, own or current(sub))  # type: ignore[method-assign]
             vars(sub)["_varena_ffn"] = True
             count += 1
     return count
+
+
+def current(module: nn.Module) -> Callable[..., object]:
+    """`module`'s class forward as it is at each call."""
+    return lambda *args, **kwargs: type(module).forward(module, *args, **kwargs)
 
 
 def _ffn(kind: str, width: int, forward: Callable[..., object]) -> Callable[..., object]:
@@ -904,6 +912,7 @@ def _ffn(kind: str, width: int, forward: Callable[..., object]) -> Callable[...,
             _served.memo.whole.add(key)
         return forward(x)
 
+    cut._varena = True  # type: ignore[attr-defined]  # what a package's shape check allows
     return cut
 
 

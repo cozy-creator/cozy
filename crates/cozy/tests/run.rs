@@ -36,15 +36,31 @@ fn a_package_lists_its_functions_and_describes_each() {
         .iter()
         .map(|f| f["function"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["fp8", "generate", "int8"]);
+    assert_eq!(names, ["generate", "fp8", "int8"]);
     let human = home.cozy(["run", "fidika/sdxl@2.10.0"]);
     assert_eq!(human.code, 0, "{human:?}");
     assert!(
-        human.stdout.contains("generate")
-            && human
-                .stdout
-                .contains("next: cozy run fidika/sdxl/fp8 --describe"),
+        human
+            .stdout
+            .contains("next: cozy run fidika/sdxl/generate --describe"),
         "{human:?}"
+    );
+    // Inputs given to the package, as a first run types them: refused, naming the command.
+    let unnamed = home.cozy([
+        "run",
+        "fidika/sdxl@2.10.0",
+        "prompt=a lighthouse",
+        "seed=7",
+        "--json",
+    ]);
+    assert_eq!(
+        (unnamed.code, unnamed.refusal()["code"].as_str()),
+        (2, Some("function_unnamed")),
+        "{unnamed:?}"
+    );
+    assert_eq!(
+        unnamed.refusal()["next"][0],
+        "cozy run fidika/sdxl/generate@2.10.0 prompt='a lighthouse' seed=7"
     );
 
     let contract = home.cozy(["run", "fidika/sdxl/generate@2.10.0", "--describe"]);
@@ -71,7 +87,10 @@ fn a_package_lists_its_functions_and_describes_each() {
         (1, Some("callable_unknown")),
         "{unknown:?}"
     );
-    assert_eq!(unknown.refusal()["next"][0], "cozy run fidika/sdxl/fp8");
+    assert_eq!(
+        unknown.refusal()["next"][0],
+        "cozy run fidika/sdxl/generate"
+    );
 }
 
 #[test]

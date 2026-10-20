@@ -54,6 +54,9 @@ pub enum Error {
     Invalid(String),
     #[error("cannot stage input {path}: {message}")]
     Input { path: PathBuf, message: String },
+    /// Refused at submit, before anything is recorded.
+    #[error("{0}")]
+    Refused(protocol::error::Error),
 }
 
 pub struct Calcifer {
@@ -229,6 +232,11 @@ impl Calcifer {
                 serde_json::to_vec(&submit).expect("serializes")
             ))
         );
+        if !self.store.recorded(key)?
+            && let Some(machines) = self.granting.get().and_then(Weak::upgrade)
+        {
+            machines.admit(&submit).map_err(Error::Refused)?;
+        }
         let (machine, pinned, wants) = match &submit.on {
             On::Machine(name) => (Some(name.clone()), true, None),
             on => (None, false, Some(on.to_string())),
@@ -444,7 +452,7 @@ impl Calcifer {
         }
     }
 
-    fn waiting(&self, id: &RunId, reason: String) {
+    pub(crate) fn waiting(&self, id: &RunId, reason: String) {
         let mut live = lock(&self.live);
         let entry = live.entry(id.clone()).or_default();
         if entry.waiting.as_ref() != Some(&reason) {
@@ -502,7 +510,9 @@ impl Calcifer {
                 return;
             }
             let Some(name) = run.machine.clone() else {
-                self.waiting(id, "waiting for a machine to be chosen".into());
+                if run.wants != "any" {
+                    self.waiting(id, "waiting for a machine to be chosen".into());
+                }
                 wake.notified().await;
                 continue;
             };

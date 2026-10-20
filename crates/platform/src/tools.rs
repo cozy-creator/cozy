@@ -149,6 +149,12 @@ pub const TOOLS: &[Tool] = &[
     },
 ];
 
+/// Whether this OS uses `tool`: macOS and Windows open URLs and start Calcifer at login with their
+/// own built-ins, so xdg-open and systemctl are Linux's alone.
+pub fn used_here(tool: &Tool) -> bool {
+    cfg!(target_os = "linux") || !matches!(tool.name, "xdg-open" | "systemctl")
+}
+
 /// The table's entry for `name`.
 pub fn tool(name: &str) -> &'static Tool {
     TOOLS

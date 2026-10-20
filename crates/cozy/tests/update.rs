@@ -24,7 +24,7 @@ fn release(sha256: &str, bundles: &str) -> String {
         "artifacts": {"cozy.tar.gz": {
             "kind": "executable-zip",
             "target_triples": ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin",
-                "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"],
+                "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"],
             "checksums": {"sha256": sha256},
         }},
     });

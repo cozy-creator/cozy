@@ -34,6 +34,9 @@ const ATTEMPTS: u32 = 4;
 const RETRYABLE: [u16; 7] = [408, 425, 429, 500, 502, 503, 504];
 /// The most bytes one Hub answer may have.
 const ANSWER_BYTES: u64 = 16 << 20;
+/// The most bytes one presign body may have: the Hub's request cap. A Hub with a smaller cap
+/// refuses a batch as `request_too_large`, and the batch is halved.
+const PRESIGN_BODY_BYTES: usize = 128 << 10;
 
 /// What the Hub named: the model, the release and variant it chose (both empty for a tree
 /// asked by hash) and their tree.
@@ -301,19 +304,28 @@ impl Origin for TensorhubOrigin {
                 state.listed = Some(self.list(&at).await?);
             }
             let (listed, bound) = state.listed.clone().expect("listed");
+            let mut size = bound.min(fits(&at.manifest));
             // One round trip presigns the asked objects and as many of the rest as fit.
             for object in &listed {
-                if ask.len() >= bound {
+                if ask.len() >= size {
                     break;
                 }
                 if !fresh(&state, &object.sha256) && !ask.contains(&object.sha256) {
                     ask.push(object.sha256.clone());
                 }
             }
-            for batch in ask.chunks(bound) {
-                let mut digests = batch.to_vec();
+            let mut rest = &ask[..];
+            while !rest.is_empty() {
+                let mut digests = rest[..size.min(rest.len())].to_vec();
                 digests.sort();
-                let presigned = self.presign(&digests, &at.manifest).await?;
+                let presigned = match self.presign(&digests, &at.manifest).await {
+                    Err(e) if size > 1 && e.detail.contains("request_too_large") => {
+                        size /= 2;
+                        continue;
+                    }
+                    answer => answer?,
+                };
+                rest = &rest[digests.len()..];
                 let life = Duration::from_secs(presigned.expires_at_unix.saturating_sub(presigned.server_time_unix));
                 let until = SystemTime::now() + life / 2;
                 for digest in digests {
@@ -343,6 +355,13 @@ fn pinned(name: &str, release: &str, manifest: &ObjectRef) -> String {
         true => format!("{name}@sha256:{}", manifest.sha256),
         false => format!("{name}@{release}@sha256:{}", manifest.sha256),
     }
+}
+
+/// How many digests a presign body for `manifest` holds within [`PRESIGN_BODY_BYTES`]: each is
+/// `"<64 hex>",`.
+fn fits(manifest: &ObjectRef) -> usize {
+    let empty = json!({"digests": [], "manifest": manifest.sha256}).to_string().len();
+    (PRESIGN_BODY_BYTES - empty) / 67
 }
 
 /// A closure's objects with its manifest, sorted.
@@ -381,6 +400,89 @@ fn envelope(status: u16, raw: &[u8], url: &str) -> Option<Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fetch::SourcePolicy;
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A loopback Hub serving one checkpoint of `objects` objects, which declares `bound` digests
+    /// per presign and refuses a body over `cap` bytes as Tensorhub does. Counts the refusals and
+    /// keeps the largest body it took.
+    fn hub(objects: usize, bound: usize, cap: usize) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (refused, largest) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (counted, kept, origin) = (Arc::clone(&refused), Arc::clone(&largest), base.clone());
+        let digest = |i: usize| format!("{i:064x}");
+        std::thread::spawn(move || {
+            for socket in listener.incoming().flatten() {
+                let mut reader = BufReader::new(&socket);
+                let (mut line, mut length) = (String::new(), 0);
+                reader.read_line(&mut line).unwrap();
+                let path = line.split(' ').nth(1).unwrap_or_default().to_string();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let (status, answer) = if length > cap {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    let message = format!("the request body exceeds this route's {cap} B cap: the caller sent {length} B");
+                    (413, json!({"error": {"code": "tensorfs.request_too_large", "message": message}}))
+                } else if path == "/v1/tensorfs/closure" {
+                    let objects: Vec<_> = (1..=objects).map(|i| json!({"sha256": digest(i), "length": 1})).collect();
+                    let page = json!({"complete": true, "lane": "bf16", "manifest": {"sha256": digest(0), "length": 1},
+                        "model": "fidika/sdxl", "objects": objects, "presign_max_digests": bound, "public": true,
+                        "release": "1.0.0", "scope": "runtime"});
+                    (200, page)
+                } else {
+                    kept.fetch_max(length, Ordering::Relaxed);
+                    let asked: Value = serde_json::from_slice(&body).unwrap();
+                    let urls: serde_json::Map<String, Value> = (asked["digests"].as_array().unwrap().iter())
+                        .map(|d| (d.as_str().unwrap().to_string(), json!(format!("{origin}/obj/{}", d.as_str().unwrap()))))
+                        .collect();
+                    (200, json!({"urls": urls, "expires_at_unix": 7200, "server_time_unix": 0}))
+                };
+                let answer = answer.to_string();
+                let mut socket = &socket;
+                let head = format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", answer.len());
+                let _ = socket.write_all(head.as_bytes()).and_then(|()| socket.write_all(answer.as_bytes()));
+            }
+        });
+        (base, refused, largest)
+    }
+
+    /// sdxl bf16 is 2602 objects plus its manifest, and the Hub that served it (v0.32.2)
+    /// declared 1956 digests per presign, 71 B over its own 128 KiB request cap: the first
+    /// download of that lane failed. Batches now fit the cap, and a Hub with a smaller cap than
+    /// assumed has each refused batch halved until it fits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn presign_batches_fit_the_hubs_request_cap_and_halve_on_its_refusal() {
+        for (cap, halved) in [(PRESIGN_BODY_BYTES, false), (PRESIGN_BODY_BYTES / 3, true)] {
+            let (base, refused, largest) = hub(2602, 1956, cap);
+            let policy = SourcePolicy { allowed_hosts: vec!["127.0.0.1".into()], allow_local: true, ..Default::default() };
+            let origin = TensorhubOrigin::new(&Client::new(policy), &base).unwrap();
+            let named = origin.named("fidika/sdxl", Some("1.0.0"), Some("bf16")).await.unwrap();
+            let objects: Vec<ObjectRef> = (0..=2602).map(|i| ObjectRef { sha256: format!("{i:064x}"), length: 1 }).collect();
+            assert_eq!(named.tree, objects[0]);
+            let located = origin.locate(&objects).await.unwrap();
+            for (object, location) in objects.iter().zip(&located) {
+                let Location::Url { url, .. } = location else { panic!("{location:?}") };
+                assert!(url.ends_with(&object.sha256), "{url}");
+            }
+            assert!(largest.load(Ordering::Relaxed) <= cap, "a {} B body passed a {cap} B cap", largest.load(Ordering::Relaxed));
+            assert_eq!(refused.load(Ordering::Relaxed) > 0, halved, "cap {cap}");
+        }
+    }
 
     #[test]
     fn the_hubs_envelope_crosses_verbatim_with_its_class() {

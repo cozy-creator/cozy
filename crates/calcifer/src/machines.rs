@@ -28,7 +28,7 @@ use platform::{durable, paths::Home};
 use protocol::{
     calcifer::{
         self as wire, Ended, Event, Keepalive, Machine, MachineKind, MachineList, MachineLog,
-        MachineState, MachineStatus, MachinesEvent, NewMachine,
+        MachineState, MachineStatus, MachinesEvent, NewMachine, On, SubmitRun,
     },
     config,
     error::{Error, Kind},
@@ -53,7 +53,7 @@ use crate::{
     api::{Api, Refusal, parse},
     link::{self, Link, LinkError},
     rentals::Hubs,
-    store::{AskKind, Endpoint, MachineRow, Store},
+    store::{AskKind, Endpoint, MachineRow, RunRow, Store},
 };
 
 pub struct Machines {
@@ -575,13 +575,16 @@ impl Machines {
             Ok(unplaced) => unplaced,
             Err(e) => return warn!("reading unplaced runs: {e}"),
         };
-        for (run, wants) in unplaced {
+        for run in unplaced {
             let gpus = run.spec.gpus;
-            let placed = match wants.as_str() {
+            let placed = match run.wants.as_str() {
                 // It waits for a rental that fits while none does.
                 "any" => match self.fitting(gpus) {
                     Ok(Some(name)) => self.calcifer.place(&run.id, &name).map(drop),
-                    Ok(None) => Ok(()),
+                    Ok(None) => {
+                        self.calcifer.waiting(&run.id, self.unfitted(&run));
+                        Ok(())
+                    }
                     Err(e) => Err(crate::Error::Invalid(e.message)),
                 },
                 // `new` rents what the Hub places it on; `new:<sku>` that product.
@@ -594,6 +597,34 @@ impl Machines {
                 warn!(run = %run.id, "placing it: {e}");
             }
         }
+    }
+
+    /// Refuses `new` from a computer not signed in to the run's Hub before the run is recorded:
+    /// it could only fail once it was.
+    pub(crate) fn admit(&self, submit: &SubmitRun) -> Result<(), Error> {
+        let signed_out = || {
+            config::Origin::parse(&submit.hub).is_ok_and(|hub| self.device_key(&hub).is_err())
+        };
+        match &submit.on {
+            On::New(_) if signed_out() => Err(crate::rentals::signed_out(&submit.hub)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Why an `any` run no rental fits waits: a rental on order, or that none is coming.
+    fn unfitted(&self, run: &RunRow) -> String {
+        let asks = self.store().pending_asks().unwrap_or_default();
+        if asks.iter().any(|ask| ask.kind == AskKind::Rent) {
+            return "waiting for the rental on order".into();
+        }
+        let none = match run.spec.gpus {
+            0 => "no rental is up or on its way".to_owned(),
+            gpus => format!("no rental up or on its way has {gpus} GPUs"),
+        };
+        format!(
+            "{none}: `--on new` rents one; this run waits for one (`cozy run cancel {}`)",
+            run.number
+        )
     }
 
     /// The least busy rental of this controller that fits a run of `gpus` GPUs (0: any), a

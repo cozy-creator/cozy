@@ -66,6 +66,7 @@ pub async fn run(
         (Some(function), _) => function,
         (None, [only]) if script => (*only).to_owned(),
         (None, _) => {
+            super::unnamed(&local.package, None, &installed.interface, &args)?;
             super::functions_of(ctx, &local.package, "local", None, &installed.interface);
             return Ok(ExitCode::SUCCESS);
         }
@@ -102,6 +103,9 @@ pub async fn run(
         Some(level) => call.warm(level, &bound.models)?,
         None => call.spec(&bound)?,
     };
+    if args.warm.is_none() {
+        super::gpuless(ctx, &on, callable, &target).await;
+    }
     let bound = args.warm.is_none().then_some(&bound);
     let out = args.out.as_ref().map(|dir| terms.cwd.join(dir));
     let mut submission = call.submission(on, &hub.origin, &spec, bound, out);
@@ -271,7 +275,7 @@ mod tests {
             ),
             (Some("local-0123"), Some("local"))
         );
-        assert_eq!(installed.interface.public(), ["fp8", "generate", "int8"]);
+        assert_eq!(installed.interface.public(), ["generate", "fp8", "int8"]);
     }
 
     #[test]

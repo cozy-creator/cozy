@@ -171,6 +171,8 @@ pub struct RunRow {
     pub inputs: Vec<(Digest, u64)>,
     /// Its machine's outcome, once settled by one.
     pub outcome: Option<v1::Outcome>,
+    /// Where an unplaced run goes: `any`, or `new[:sku]` to rent one.
+    pub wants: String,
 }
 
 /// Which runs a listing answers, newest first.
@@ -439,23 +441,15 @@ impl Store {
     }
 
     /// Unsettled runs no machine was chosen for, oldest first, with where each may go.
-    pub fn unplaced(&self) -> Result<Vec<(RunRow, String)>> {
+    pub fn unplaced(&self) -> Result<Vec<RunRow>> {
         self.read(|conn| {
             let mut statement = conn.prepare(&format!(
-                "SELECT {RUN_COLUMNS}, COALESCE(wants, 'any') FROM runs
-                 WHERE state = 'queued' AND machine IS NULL ORDER BY number"
+                "SELECT {RUN_COLUMNS} FROM runs WHERE state = 'queued' AND machine IS NULL ORDER BY number"
             ))?;
             let rows = statement
-                .query_map([], |r| {
-                    Ok((
-                        run_row(r)?,
-                        r.get::<_, String>(RUN_COLUMNS.split(',').count())?,
-                    ))
-                })?
+                .query_map([], run_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows.into_iter()
-                .map(|(row, wants)| Ok((row?, wants)))
-                .collect()
+            rows.into_iter().collect()
         })
     }
 
@@ -554,6 +548,14 @@ impl Store {
 
     /// Records `new` under `key`, once: the same key again answers the recorded run (`false`), and
     /// with another submission (`digest`) is a conflict.
+    /// Whether a run is recorded under `key`.
+    pub fn recorded(&self, key: &str) -> Result<bool> {
+        self.read(|db| {
+            let found = db.query_row("SELECT 1 FROM runs WHERE idempotency_key = ?1", [key], |_| Ok(()));
+            Ok(found.optional()?.is_some())
+        })
+    }
+
     pub fn submit(&self, key: &str, digest: &str, new: NewRun) -> Result<(RunRow, bool)> {
         let (id, fresh) = self.write(|tx| {
             let recorded: Option<(String, String)> = tx
@@ -1216,7 +1218,7 @@ fn put_machine_in(tx: &Transaction, machine: &MachineRow) -> Result<()> {
 
 const RUN_COLUMNS: &str = "id, number, kind, target, hub, machine, pinned, spec, out_dir, state, cancel_requested,
     cursor, machine_state, status, reason_code, reason, state_seq, created_at, accepted_at, settled_at, warnings,
-    inputs, outcome";
+    inputs, outcome, wants";
 
 fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
     let id: String = r.get(0)?;
@@ -1231,6 +1233,7 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
     let inputs: String = r.get(21)?;
     let spec: Vec<u8> = r.get(7)?;
     let outcome: Option<Vec<u8>> = r.get(22)?;
+    let wants: Option<String> = r.get(23)?;
     Ok((|| {
         Ok(RunRow {
             id: RunId::try_from(id).map_err(|_| corrupt("a run id"))?,
@@ -1278,6 +1281,7 @@ fn run_row(r: &Row) -> rusqlite::Result<Result<RunRow>> {
                 }
                 None => None,
             },
+            wants: wants.unwrap_or_else(|| "any".into()),
         })
     })())
 }
