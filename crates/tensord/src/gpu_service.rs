@@ -1063,7 +1063,7 @@ impl Pool {
         let mut owners = self.accounting.lock().unwrap();
         for (index, device) in (start..).zip(self.lane(start, degree).unwrap_or_default()) {
             owners.insert((plan.to_owned(), index), ChargeOwner { reservation, birth: None });
-            device.memory.with(|gpu| gpu.starting(plan, gpu.spawn_need(plan)));
+            device.memory.with(|gpu| gpu.starting(plan));
         }
         if let Some(admission) = self.admitted.lock().unwrap().get_mut(&session_key(plan, start)) {
             admission.reservation = reservation;
@@ -1340,7 +1340,7 @@ impl Pool {
             &DeviceCommand::Map {
                 construction: plan.construction.clone(),
                 cap_bytes: cap,
-                floor_bytes: self.first().floor(),
+                floor_bytes: None,
             },
             &mut device_executor::Baseline,
         );
@@ -3266,13 +3266,6 @@ impl Pool {
             // NVML charges each GPU's own process: rank r drives the group's GPU r.
             self.followed(&session.plan, session.start, &session.executor.birth, &session.followers);
             let (load_cap, load_group) = rank_grant(&load_caps[..load_caps.len().min(ranks as usize)]);
-            // Its pinned budget, applied by the Load before any weight set registers.
-            let plane = !plan.slots.is_empty();
-            let pinned = (degree > 0)
-                .then(|| self.pinned_budgets(&construction, start))
-                .flatten()
-                .and_then(|split| split.get(&session_key(&construction, start)).copied())
-                .map_or(-1, |share| i64::try_from(share).unwrap_or(i64::MAX));
             let load = match plan.slots.first() {
                 // A call that constructs nothing: its weightless construction.
                 None => DeviceCommand::Load {
@@ -3326,7 +3319,7 @@ impl Pool {
                             true => String::new(),
                             false => engine.get(id)?.invocation.attention_kernel,
                         },
-                        pinned_bytes: plane.then_some(pinned),
+                        pinned_bytes: None,
                         device_weights: sharing,
                         cap_bytes: load_cap,
                     }
@@ -3448,9 +3441,6 @@ impl Pool {
         }
         session.sharing = share;
         callbacks.custody = self.custody.as_ref().filter(|_| share);
-        if degree > 0 {
-            self.shed(&construction, start);
-        }
         // A real grant for the whole call: one tenant needs no per-stage turns.
         // A group's cap holds on every GPU of it (each rank caps its own process).
         let caps = self.decide(&construction, start, degree, false)?;
@@ -3505,7 +3495,7 @@ impl Pool {
                 cap_bytes,
                 inputs: inputs.inputs,
                 trees: inputs.trees,
-                floor_bytes: gpu.and_then(GpuMemory::floor),
+                floor_bytes: None,
                 activation_bytes: gpu.map(|gpu| gpu.with(|gpu| gpu.seeds(&construction))).unwrap_or_default(),
                 squeezed_bytes: gpu.map(|gpu| gpu.with(|gpu| gpu.squeezed(&construction))).unwrap_or_default(),
                 device_weights: Some(share),
@@ -3618,11 +3608,7 @@ impl Pool {
         Ok(true)
     }
 
-    /// Degree 2 for `plan`'s executor: GPU weights the machine keeps across executors. It
-    /// keeps every component resident until revoked, and a running call never revokes what
-    /// it reads, so only when the whole construction and its activations fit beside the other
-    /// tenants, as measured here or in an earlier run (unmeasured: Degree 1, where stages
-    /// evict each other). World-one on the first GPU only: a group or a replica shares nothing.
+    /// Page-level custody replaces the retired whole-model sharing path.
     fn degree2(&self, _: &str, _: usize, _: u32) -> io::Result<bool> {
         // The old whole-model custody channel is superseded by page-level grants.
         Ok(false)
@@ -3715,12 +3701,6 @@ impl Pool {
             }
         }
     }
-
-    /// Idle tenants pinning more than their share of the host's pinned total give it back
-    /// (their planes punch the least recently used regions; page cache and disk stay beneath)
-    /// before `plan` runs. An idle executor's pinned tier is optional: a failure is noted.
-    fn shed(&self, _: &str, _: usize) {}
-    fn pinned_budgets(&self, _: &str, _: usize) -> Option<BTreeMap<String, u64>> { None }
 
     /// Followers whose process has ended, as people name their GPUs ("GPU 1's process 3224
     /// ended"); empty while the whole group lives.
@@ -5230,7 +5210,7 @@ mod tests {
         let (root, pool, engine) = pool_of(4);
         let (image, film) = (plan("image", 1), plan("film", 2));
         let place = |plan: &Plan, seq: u64, claims: &mut [Option<u64>]| pool.place(&engine, plan, (seq, None), None, claims);
-        let serving = |gpu: usize| pool.devices[gpu].memory.with(|ledger| ledger.starting("image", 0));
+        let serving = |gpu: usize| pool.devices[gpu].memory.with(|ledger| ledger.starting("image"));
         let mut claims = [None; 4];
         let (gpu, first) = place(&image, 1, &mut claims).unwrap();
         assert_eq!(gpu, 0);
@@ -5474,10 +5454,10 @@ mod tests {
         let mut claims = [None; 2];
         let (gpu, first) = pool.place(&engine, &image, (1, None), None, &mut claims).unwrap();
         assert_eq!(gpu, 0);
-        pool.devices[0].memory.with(|ledger| ledger.starting("image", 0));
+        pool.devices[0].memory.with(|ledger| ledger.starting("image"));
         let (gpu, second) = pool.place(&engine, &image, (2, None), None, &mut claims).unwrap();
         assert_eq!(gpu, 1);
-        pool.devices[1].memory.with(|ledger| ledger.starting("image", 0));
+        pool.devices[1].memory.with(|ledger| ledger.starting("image"));
         assert!(pool.place(&engine, &image, (3, None), None, &mut claims).is_none());
         assert_eq!(claims, [Some(3), Some(3)]);
         drop((first, second));
