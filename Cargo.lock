@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "calcifer"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -642,7 +642,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "cli"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "anstream",
  "anstyle",
@@ -803,7 +803,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cozy"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "base64 0.22.1",
  "calcifer",
@@ -1696,7 +1696,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hub-client"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -2621,7 +2621,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "platform"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
@@ -2789,7 +2789,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -4119,7 +4119,7 @@ dependencies = [
 
 [[package]]
 name = "tensord"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -4174,7 +4174,7 @@ dependencies = [
 
 [[package]]
 name = "tensorfs"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "aws-credential-types",
@@ -4206,7 +4206,7 @@ dependencies = [
 
 [[package]]
 name = "tensorfs-py"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
