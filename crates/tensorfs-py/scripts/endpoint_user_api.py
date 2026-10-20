@@ -65,6 +65,7 @@ class Credential:
     def __init__(self, token):
         self.token = token
         self.calls, self.retries = [], []
+        self.responses = []
 
     def headers(self, method, url, headers, payload):
         self.calls.append((method, payload))
@@ -73,6 +74,7 @@ class Credential:
 
     def retry(self, method, url, headers, payload, status, response_headers):
         self.retries.append((method, status))
+        self.responses.append((method, url, status))
         return False
 
 
@@ -220,17 +222,36 @@ except tensorfs.DeniedError as error:
 else:
     raise AssertionError("an unavailable credential provider accepted an upload")
 
+def assert_write_refusal(error, repo_id, responses):
+    # A hidden resource is an authorization refusal only with the caller's separate
+    # owner readbacks and a refused PUT of this exact destination.
+    if isinstance(error, tensorfs.NotFoundError):
+        family, statuses = tensorfs.NotFoundError.code, (404,)
+    else:
+        assert isinstance(error, tensorfs.DeniedError)
+        family, statuses = tensorfs.DeniedError.code, (401, 403)
+    assert error.code == family
+    url = request["endpoint"].rstrip("/") + "/refs/" + repo_id.lower() + ".json"
+    assert error.detail.startswith("PUT " + url + ":"), "failure was not the destination PUT"
+    assert any(method == "PUT" and target == url and status in statuses
+               for method, target, status in responses), "no corresponding destination PUT refusal"
+    return family
+
+
 # A real server refusal must keep all local bytes, and retry only uploads that result.
 productions = 0
-repo_before_denial = tensorfs.Endpoint(request["endpoint"], token=owner, ca_der=ca).repo(request["model"])[0]
+owner_endpoint = tensorfs.Endpoint(request["endpoint"], token=owner, ca_der=ca)
+owner_view = owner_endpoint.repo(request["model"])
+assert owner_view is not None, "the owner's destination must exist before the rival write"
+repo_before_denial = owner_view[0]
 denied = tensorfs.Writer(repo_id=request["model"], variant="f32", **{**options, "token": rival})
 denied.component("model", cls="conformance.Retained", config={"attempt": 1}).put("weight", b"retained-after-denial", dtype="U8", shape=[21])
 productions += 1
-denials_before = len(rival.retries)
+denials_before = len(rival.responses)
 try:
     denied.commit()
-except tensorfs.DeniedError as error:
-    assert error.code == "denied"
+except (tensorfs.DeniedError, tensorfs.NotFoundError) as error:
+    denial_family = assert_write_refusal(error, request["model"], rival.responses[denials_before:])
     retained = denied.local_checkpoint
     assert retained is not None
     retained_id = retained.id
@@ -238,15 +259,14 @@ except tensorfs.DeniedError as error:
     assert not retained.missing()
     try:
         denied.commit()
-    except tensorfs.DeniedError as repeated:
+    except (tensorfs.DeniedError, tensorfs.NotFoundError) as repeated:
         assert repeated is error
     else:
         raise AssertionError("a refused publication later reported success")
 else:
     raise AssertionError("a rival published into the owner's repo")
-assert any(status in (401, 403) for _, status in rival.retries[denials_before:]), "no HTTP authorization refusal was observed"
-after_denial = tensorfs.Endpoint(request["endpoint"], token=owner, ca_der=ca).repo(request["model"])[0]
-assert after_denial == repo_before_denial, "a denied publication changed the owner's repo"
+after_denial = owner_endpoint.repo(request["model"])
+assert after_denial is not None and after_denial[0] == repo_before_denial, "a denied publication changed the owner's repo"
 retry_folder = cache / "retained-export"
 tensorfs.materialize(retained, local_dir=retry_folder, format="cozytensors")
 retry_tree = tensorfs.upload_folder(repo_id=request["model"], revision="2", folder_path=retry_folder, **options)
@@ -256,12 +276,18 @@ assert retried.components["model"].tensors.read("weight").tobytes() == b"retaine
 assert productions == 1
 
 # Exercise Runtime's real publication/replay library; this is not an executor/CLI test.
+# Seed the destination with an owner write so a hidden 404 cannot mean it never existed.
+runtime_seed = tensorfs.upload_folder(repo_id=request["runtime_model"], folder_path=retry_folder, **options)
+runtime_owner_view = owner_endpoint.repo(request["runtime_model"])
+assert runtime_owner_view is not None
+runtime_repo_before = runtime_owner_view[0]
+assert any(tree["sha256"] == runtime_seed.removeprefix("sha256:") for tree in runtime_repo_before["checkpoints"])
 runtime_cache = cache / "runtime"
 shown = []
 runtime_options = dict(store=runtime_cache, request_id="endpoint-proof", actor="ordinary-owner",
                        code="endpoint-proof", bounds={"model": 4096}, show=lambda *item: shown.append(item),
                        destination=request["runtime_model"])
-runtime_denials_before = len(rival.retries)
+runtime_denials_before = len(rival.responses)
 outputs = Outputs(**runtime_options, connection=Connection(endpoint=request["endpoint"], token=rival, ca_der=ca))
 runtime_productions = 0
 with outputs.open("model", Derivation(None)) as output:
@@ -271,10 +297,12 @@ with outputs.open("model", Derivation(None)) as output:
         outputs.adopt(output)
     except Exception as error:
         assert getattr(error, "code", None) == "upload_failed"
-        assert isinstance(error.__cause__, tensorfs.DeniedError), "Runtime failed before the real authorization refusal"
+        runtime_denial_family = assert_write_refusal(error.__cause__, request["runtime_model"],
+                                                    rival.responses[runtime_denials_before:])
     else:
         raise AssertionError("Runtime published with the rival credential")
-assert any(status in (401, 403) for _, status in rival.retries[runtime_denials_before:])
+runtime_after_denial = owner_endpoint.repo(request["runtime_model"])
+assert runtime_after_denial is not None and runtime_after_denial[0] == runtime_repo_before, "Runtime refusal changed the owner's repo"
 assert len(shown) == 1 and shown[0][1] == "local/derived"
 runtime_retained = tensorfs.open(shown[0][2], cache_dir=runtime_cache, local_files_only=True)
 assert runtime_retained.components["model"].tensors.read("weight").tobytes() == b"runtime-retained"
@@ -339,8 +367,10 @@ assert not failures, failures
 print(json.dumps({
     "native": native_provenance,
     "runtime": runtime_provenance,
-    "tensorfs": {"owner_read_write": True, "rival_denied": True, "retained_upload_without_rerun": productions == 1},
-    "runtime_library": {"publication_replay_without_rewrite": runtime_productions == 1},
+    "tensorfs": {"owner_read_write": True, "rival_denied": True, "denial_family": denial_family,
+                 "retained_upload_without_rerun": productions == 1},
+    "runtime_library": {"publication_replay_without_rewrite": runtime_productions == 1,
+                        "denial_family": runtime_denial_family},
     "cold_anonymous_read": cold_anonymous_read,
     "failure_families_and_writer_threads": True,
 }, sort_keys=True))
