@@ -1675,7 +1675,9 @@ mod tests {
         // A rental tells its Hub, once, which marks the offer it was bought on suspect.
         let stalls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = stalls.clone();
-        runs.service.on_stall(move || drop(counted.fetch_add(1, std::sync::atomic::Ordering::AcqRel)));
+        runs.service.on_stall(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        });
         let manifest = hanging_package(&objects, &root.join("backend.pid"), false);
         let accepted = runs.submit("alice", "warm-1", spec(Source::Local(manifest), true, "w1")).unwrap();
         let backend = backend_pid(&runs.service.engine, &accepted.id, &root.join("backend.pid"));
