@@ -437,12 +437,15 @@ fn ram_service_fills_through_tensorfs_and_retains_a_readers_layout() {
         };
         assert_eq!(read, 8);
     };
-    assert_eq!((view.offset, view.len), (4, 4));
+    assert_eq!((view.offset, view.len), (0, 4));
     let mut data = String::new();
     std::fs::File::from(view.file.try_clone().unwrap())
         .read_to_string(&mut data)
         .unwrap();
-    assert_eq!(data, "datadata");
+    assert_eq!(
+        data, "data",
+        "each independently reclaimable region has its own memfd"
+    );
     assert!(!fixture.ledger.release_ram(layout));
     drop(view);
     // Region readiness can precede completion of the final fill bookkeeping.
@@ -671,6 +674,136 @@ fn explicitly_owned_host_cache_drops_with_its_last_ledger() {
     assert!(
         lifetime.upgrade().is_none(),
         "there is no global owner retaining host custody"
+    );
+}
+
+#[test]
+fn pressure_reclaims_one_region_while_another_reader_stays_live_then_refills_the_hole() {
+    let fixture = Fixture::new();
+    let row = fixture.ledger.claim(std::process::id()).unwrap();
+    let channel = Channel::new(fixture.ledger.grant(std::process::id()).unwrap().channel);
+    let regions = (0..2)
+        .map(|index| varena::ledger::RamRegion {
+            offset: index * 4096,
+            len: 4096,
+            items: vec![tensorfs::io::source::Item {
+                offset: index * 4096,
+                len: 4,
+                part_end: true,
+                source: tensorfs::io::ItemSource::Inline(b"warm".to_vec().into()),
+            }],
+        })
+        .collect::<Vec<_>>();
+    assert!(channel
+        .cache_ram(row.owner(), [30; 32], &[], &regions)
+        .unwrap());
+    observe(&fixture.ledger, || {
+        channel
+            .ram_status(row.owner(), [30; 32])
+            .unwrap()
+            .is_some_and(|s| !s.filling)
+    });
+    let first = channel.ram_status(row.owner(), [30; 32]).unwrap().unwrap();
+    assert_eq!(first.ready, vec![true, true]);
+    let live = channel.ram(row.owner(), [30; 32], 1).unwrap().unwrap();
+    assert!(fixture.ledger.release_unused_ram());
+    let partial = channel.ram_status(row.owner(), [30; 32]).unwrap().unwrap();
+    assert_eq!(partial.ready, vec![false, true]);
+    assert!(partial.generation > first.generation);
+    assert!(channel.ram(row.owner(), [30; 32], 0).unwrap().is_none());
+    assert!(
+        !fixture.ledger.release_unused_ram(),
+        "only the reader's own region stays protected"
+    );
+    assert!(
+        channel
+            .cache_ram(row.owner(), [30; 32], &[], &regions)
+            .unwrap(),
+        "a later hint refills only the missing region"
+    );
+    observe(&fixture.ledger, || {
+        channel
+            .ram_status(row.owner(), [30; 32])
+            .unwrap()
+            .is_some_and(|s| !s.filling)
+    });
+    assert_eq!(
+        channel
+            .ram_status(row.owner(), [30; 32])
+            .unwrap()
+            .unwrap()
+            .ready,
+        vec![true, true]
+    );
+    let mut bytes = [0; 4];
+    std::fs::File::from(live.file.try_clone().unwrap())
+        .read_exact(&mut bytes)
+        .unwrap();
+    assert_eq!(&bytes, b"warm");
+    drop(live);
+}
+
+#[test]
+fn unmeasured_admission_sheds_cached_regions_and_suppresses_optional_warms_until_finished() {
+    let fixture = Fixture::new();
+    let row = fixture.ledger.claim(std::process::id()).unwrap();
+    let channel = Channel::new(fixture.ledger.grant(std::process::id()).unwrap().channel);
+    let regions = [varena::ledger::RamRegion {
+        offset: 0,
+        len: 4096,
+        items: vec![tensorfs::io::source::Item {
+            offset: 0,
+            len: 4,
+            part_end: true,
+            source: tensorfs::io::ItemSource::Inline(b"warm".to_vec().into()),
+        }],
+    }];
+    channel
+        .cache_ram(row.owner(), [31; 32], &[], &regions)
+        .unwrap();
+    observe(&fixture.ledger, || {
+        channel
+            .ram_status(row.owner(), [31; 32])
+            .unwrap()
+            .is_some_and(|s| !s.filling)
+    });
+    fixture.ledger.prepare_host(1, None);
+    assert!(channel.ram_status(row.owner(), [31; 32]).unwrap().is_none());
+    assert!(fixture.ledger.fits("unknown-host-peak", "new").unwrap());
+    channel
+        .cache_ram(row.owner(), [31; 32], &[], &regions)
+        .unwrap();
+    observe(&fixture.ledger, || {
+        channel
+            .ram_status(row.owner(), [31; 32])
+            .unwrap()
+            .is_some_and(|s| !s.filling)
+    });
+    assert_eq!(
+        channel
+            .ram_status(row.owner(), [31; 32])
+            .unwrap()
+            .unwrap()
+            .ready,
+        vec![false]
+    );
+    fixture.ledger.finish_host(1, None);
+    assert!(channel
+        .cache_ram(row.owner(), [31; 32], &[], &regions)
+        .unwrap());
+    observe(&fixture.ledger, || {
+        channel
+            .ram_status(row.owner(), [31; 32])
+            .unwrap()
+            .is_some_and(|s| !s.filling)
+    });
+    assert_eq!(
+        channel
+            .ram_status(row.owner(), [31; 32])
+            .unwrap()
+            .unwrap()
+            .ready,
+        vec![true]
     );
 }
 
