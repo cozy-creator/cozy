@@ -675,11 +675,18 @@ impl Ledger {
             return Ok(false);
         }
         let key = format!("{package}|{shape}");
-        let Some(peak) = self
-            .peaks()
-            .into_iter()
-            .find_map(|(k, v)| (k == key).then_some(v))
-        else {
+        let peaks = self.peaks();
+        let peak = if shape.is_empty() {
+            let prefix = format!("{package}|");
+            peaks
+                .into_iter()
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .map(|(_, v)| v)
+                .max()
+        } else {
+            peaks.into_iter().find_map(|(k, v)| (k == key).then_some(v))
+        };
+        let Some(peak) = peak else {
             return Ok(running.is_empty());
         };
         let fixed = sum(rows.iter().map(|r| {
