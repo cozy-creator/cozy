@@ -233,6 +233,21 @@ The context commits on normal exit. `commit()` returns a `Checkpoint` and return
 result on later successful calls. A raw Python buffer needs explicit `dtype` and `shape`;
 a DLPack input supplies them, and contradictory explicit values are refused.
 
+After commit, this example produces a folder like:
+
+```text
+output/
+  model.f32.cozytensors
+  chunks/
+    <sha256>
+    ...
+```
+
+The `.cozytensors` file is the binary header: pipeline/component configuration, tensor
+names, dtypes, shapes, encodings and references to the data objects. The tensor and
+supporting-file bytes live in `chunks/`. Together they form the checkpoint; the header
+alone is not a self-contained model. An unnamed variant uses `model.cozytensors`.
+
 `Writer(dest=None, ...)` writes to the shared store when no folder is supplied. Its options are:
 
 | Option or member | Use |
