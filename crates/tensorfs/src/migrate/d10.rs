@@ -1,8 +1,9 @@
-//! xs-053 A11: models from before D10 (a `tensorfs.manifest/1` per lane, its header in the
-//! five-field layout) become D10: a cozytensors per lane, a tree per release. Header-only:
-//! every chunk, tensor, part and location stays as it was. Run data a lane lacks comes from
-//! its family's pinned upstream ([`UPSTREAMS`], owner Decision 1) and is recorded in the
-//! header's `filled`; every lane records its `source`. Deleted once it has run.
+//! xs-053 A11: models from before D10 become D10, a cozytensors per lane and a tree per release.
+//! A lane is a v1 checkpoint (production's; [`super::v1`] reads it) or a 0.12 one (a
+//! `tensorfs.manifest/1` and a five-field header). Header-only: every chunk, tensor, part and
+//! location stays where it was. Run data a lane lacks comes from its family's pinned upstream
+//! ([`UPSTREAMS`], owner Decision 1) and is recorded in the header's `filled`; every lane records
+//! its `source`, `unknown` when nobody did. Deleted once it has run.
 
 use std::collections::{btree_map::Entry, BTreeMap, HashMap};
 use std::fs;
@@ -19,9 +20,11 @@ use serde_json::{json, Value as Json};
 
 use crate::failure::{fail, Failure, Kind, Result};
 use crate::fetch::{self, Client, Endpoint, Fetcher, Fresh, Origin, Payload, SourcePolicy, Want};
-use crate::format::{Component, Config, Header, ObjectRef, Release, Repo, Tree, Value, HEADER_PATH};
+use crate::format::{Component, Config, Header, Metadata, ObjectRef, Release, Repo, Tensor, Tree, Value, HEADER_PATH};
 use crate::import::{layout, remote};
 use crate::store::{Pin, Store};
+
+use super::v1;
 
 /// A family's pinned upstream and what it fills where a lane has none: a path, a folder
 /// (`tokenizer/`), or `README`/`LICENSE` (any top-level file so named).
@@ -270,8 +273,8 @@ impl<'t> Migrator<'t> {
         let cited: Vec<&ObjectRef> = old.releases.iter().flat_map(|r| r.lanes.iter().flat_map(|l| l.values())).collect();
         let (mut checkpoints, mut unreleased) = (Vec::new(), Vec::new());
         for c in old.checkpoints.iter().filter(|c| !cited.contains(c)) {
-            let doc: Doc = serde_json::from_slice(&read(c)?).map_err(|e| invalid(format!("{}: {e}", c.id())))?;
-            if doc.format.starts_with("tensorfs.tree/") {
+            let doc: Json = serde_json::from_slice(&read(c)?).map_err(|e| invalid(format!("{}: {e}", c.id())))?;
+            if doc["format"].as_str().is_some_and(|f| f.starts_with("tensorfs.tree/")) {
                 checkpoints.push(c.clone());
                 continue;
             }
@@ -291,22 +294,37 @@ impl<'t> Migrator<'t> {
     /// repo files; every lane file is checked to have landed in one of them.
     fn lane(&mut self, manifest: &ObjectRef, upstream: Option<&Upstream>, read: Read, objects: &mut Objects) -> Result<Lane> {
         let raw = read(manifest)?;
-        if serde_json::from_slice::<Json>(&raw).is_ok_and(|d| d.get("entries").is_some()) {
-            return fail(Kind::Invalid, format!("{} is a v1 checkpoint: U12 (`cozy model migrate`) moves it first", manifest.id()));
-        }
-        let doc: Doc = serde_json::from_slice(&raw).map_err(|e| invalid(format!("{}: {e}", manifest.id())))?;
-        if !doc.format.starts_with("tensorfs.manifest/") {
-            return fail(Kind::Invalid, format!("{} is a {}, not a manifest", manifest.id(), doc.format));
-        }
-        let mut files = doc.files;
-        let Some(header) = files.remove(HEADER_PATH) else {
-            return fail(Kind::Invalid, format!("{} names no header", manifest.id()));
+        let (chunks, tensors, mut metadata, mut bytes, v1_report) = match v1::manifest(&raw)? {
+            Some(m) => {
+                let v = v1::lane(&m, &read(&m.header)?)?;
+                let mut bytes = BTreeMap::new();
+                for (path, file) in v.files {
+                    let b = match file {
+                        v1::File::Object(o) => read(&o)?,
+                        v1::File::Bytes(b) => b,
+                    };
+                    bytes.insert(path, b);
+                }
+                (v.chunks, v.components, Metadata::new(), bytes, Some(v.report))
+            }
+            None => {
+                let doc: Doc = serde_json::from_slice(&raw).map_err(|e| invalid(format!("{}: {e}", manifest.id())))?;
+                if !doc.format.starts_with("tensorfs.manifest/") {
+                    return fail(Kind::Invalid, format!("{} is a {}, not a manifest", manifest.id(), doc.format));
+                }
+                let mut files = doc.files;
+                let Some(header) = files.remove(HEADER_PATH) else {
+                    return fail(Kind::Invalid, format!("{} names no header", manifest.id()));
+                };
+                let old = upgrade(&read(&header)?)?;
+                let mut bytes = BTreeMap::new();
+                for (path, object) in &files {
+                    bytes.insert(path.clone(), read(object)?);
+                }
+                let tensors = old.components().iter().map(|c| (c.name.clone(), c.tensors.clone())).collect();
+                (old.chunks.clone(), tensors, old.metadata.clone(), bytes, None)
+            }
         };
-        let old = upgrade(&read(&header)?)?;
-        let mut bytes = BTreeMap::new();
-        for (path, object) in &files {
-            bytes.insert(path.clone(), read(object)?);
-        }
         let (unwrapped, provenance) = unwrap(&mut bytes).map_err(|e| invalid(format!("{}: {}", manifest.id(), e.detail)))?;
         let mut filled = Vec::new();
         for (u, entry) in upstream.iter().flat_map(|u| u.files.iter().map(move |e| (u, e))) {
@@ -317,12 +335,12 @@ impl<'t> Migrator<'t> {
                 }
             }
         }
-        let tensored: Vec<String> = old.components().iter().map(|c| c.name.clone()).collect();
+        let tensored: Vec<String> = tensors.iter().map(|(name, _)| name.clone()).collect();
         let l = layout(bytes.clone(), &tensored)?;
         let mut keep = |b: Vec<u8>| add(objects, b);
         let components = (l.components.into_iter())
             .map(|f| Component {
-                tensors: old.component(&f.name).map(|c| c.tensors.clone()).unwrap_or_default(),
+                tensors: tensors.iter().find(|(name, _)| *name == f.name).map(|(_, t)| t.clone()).unwrap_or_default(),
                 assets: f.assets.into_iter().map(|(p, b)| (p, keep(b))).collect(),
                 name: f.name,
                 class: f.class,
@@ -331,7 +349,6 @@ impl<'t> Migrator<'t> {
             })
             .collect();
         let repo_files: BTreeMap<String, ObjectRef> = l.files.into_iter().map(|(p, b)| (p, keep(b))).collect();
-        let mut metadata = old.metadata.clone();
         let sources = metadata.remove("sources");
         DROPPED.iter().for_each(|k| drop(metadata.remove(*k)));
         let recorded = match (provenance, sources) {
@@ -353,9 +370,9 @@ impl<'t> Migrator<'t> {
                 ("note".to_owned(), text(u.note)),
             ])));
         }
-        let new = Header::new(old.chunks.clone(), l.pipeline, components, metadata)?;
+        let new = Header::new(chunks.clone(), l.pipeline, components, metadata)?;
         let cbor = new.to_cbor()?;
-        check(&old, &new, &cbor, &bytes, &repo_files)?;
+        check(&chunks, &tensors, &new, &cbor, &bytes, &repo_files)?;
         let at = add(objects, cbor);
         let mut report = json!({"old": manifest.id(), "header": at.id()});
         if !filled.is_empty() {
@@ -363,6 +380,9 @@ impl<'t> Migrator<'t> {
         }
         if !unwrapped.is_empty() {
             report["unwrapped"] = json!(unwrapped);
+        }
+        if let Some(v1) = v1_report {
+            report["from_v1"] = v1;
         }
         Ok(Lane { header: at, files: repo_files, report })
     }
@@ -461,14 +481,14 @@ fn inflate(name: &str, value: &Json) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The D10 header against the old one and the lane's files: the same chunks and tensors, its
-/// bytes reading back to it, and each file a config, an asset or a repo file.
-fn check(old: &Header, new: &Header, cbor: &[u8], files: &BTreeMap<String, Vec<u8>>, repo: &BTreeMap<String, ObjectRef>) -> Result<()> {
+/// The D10 header against the old lane's chunks and tensors and its files: the same chunks and
+/// tensors, its bytes reading back to it, and each file a config, an asset or a repo file.
+fn check(chunks: &[ObjectRef], tensors: &[(String, Vec<Tensor>)], new: &Header, cbor: &[u8], files: &BTreeMap<String, Vec<u8>>, repo: &BTreeMap<String, ObjectRef>) -> Result<()> {
     let integrity = |what: String| fail(Kind::Integrity, what);
-    if new.chunks != old.chunks || Header::from_cbor(cbor)? != *new {
+    if new.chunks != chunks || Header::from_cbor(cbor)? != *new {
         return integrity("the chunks moved, or the header does not read back".into());
     }
-    if let Some((c, t)) = old.tensors().find(|(c, t)| new.tensor(c, &t.key) != Some(t)) {
+    if let Some((c, t)) = (tensors.iter()).flat_map(|(c, ts)| ts.iter().map(move |t| (c, t))).find(|(c, t)| new.tensor(c, &t.key) != Some(*t)) {
         return integrity(format!("{c}/{} changed", t.key));
     }
     let configs: Vec<&Config> = new.components().iter().map(|c| &c.config).chain(new.pipeline().map(|p| &p.config)).collect();
@@ -570,12 +590,25 @@ async fn old_objects(endpoint: &Arc<Endpoint>, client: &Client, scratch: &Store,
     let (origin, want): (Arc<dyn Origin>, Want) = (endpoint.clone(), Want::default());
     let fetcher = Fetcher::new(Arc::new(scratch.clone()), client.clone(), None, fetch::Config::default());
     fetcher.objects(&origin, &roots, &want).await?;
-    let mut files = Vec::new();
+    let (mut files, mut v1_headers) = (Vec::new(), Vec::new());
     for root in &roots {
-        let doc: Option<Doc> = serde_json::from_slice(&scratch.read(root)?).ok();
+        let raw = scratch.read(root)?;
+        if let Some(m) = v1::manifest(&raw)? {
+            files.extend(m.files.into_iter().map(|(_, o)| o));
+            files.push(m.header.clone());
+            v1_headers.push(m.header);
+            continue;
+        }
+        let doc: Option<Doc> = serde_json::from_slice(&raw).ok();
         files.extend(doc.filter(|d| d.format.starts_with("tensorfs.manifest/")).into_iter().flat_map(|d| d.files.into_values()));
     }
     fetcher.objects(&origin, &files, &want).await?;
+    // A v1 header's assets are objects of their own.
+    let mut assets = Vec::new();
+    for h in &v1_headers {
+        assets.extend(v1::assets(&scratch.read(h)?)?);
+    }
+    fetcher.objects(&origin, &assets, &want).await?;
     Ok(())
 }
 

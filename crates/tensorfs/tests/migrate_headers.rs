@@ -368,17 +368,6 @@ fn a_component_config_wrapper_becomes_its_files_and_records_its_source() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-#[test]
-fn a_v1_checkpoint_is_refused_until_u12_moves_it() {
-    let dir = scratch("v1");
-    let v1 = put(&dir, br#"{"entries":[{"blob":{"length":1,"sha256":"00"},"kind":"cozytensors","path":"model.cozytensors"}]}"#);
-    let doc = serde_json::to_vec(&json!({"name": "acme/tiny", "releases": [{"version": "1", "lanes": {"bf16": v1}}]})).unwrap();
-    let mut migrator = Migrator::new(Access::from_env(), TABLE);
-    let refused = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).err().unwrap();
-    assert!(refused.detail.contains("v1 checkpoint"), "{}", refused.detail);
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
 /// GPT-2's lane with its header's metadata emptied: a lane that records no source.
 fn unsourced(dir: &Path) -> BTreeMap<String, ObjectRef> {
     let mut files = lane_files(dir, GPT2_FULL);
