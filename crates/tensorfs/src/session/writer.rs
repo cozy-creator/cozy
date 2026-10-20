@@ -189,7 +189,7 @@ impl Context {
             );
         }
         let named = published
-            .and_then(|_| self.repo_id.as_ref())
+            .and(self.repo_id.as_ref())
             .map(|name| Ref {
                 repo_id: name.clone(),
                 revision: None,
