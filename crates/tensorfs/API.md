@@ -1,11 +1,9 @@
 # TensorFS Rust API
 
 Create a client, perform an operation, then use the checkpoint, component or byte data
-it returns. This guide covers the complete planned application-facing Rust API by task.
-
-This is the **0.13 target**, currently being integrated. The implementation on `master`
-can still expose the preceding interface. The [Python API](../tensorfs-py/API.md) and
-[technical file-format specification](spec/cozytensors.md) are separate documents.
+it returns. This guide covers the application-facing Rust API by task. The
+[Python API](../tensorfs-py/API.md) and [file-format specification](spec/cozytensors.md)
+are separate documents.
 
 - [Create a client and read a model](#rust-create-a-client-and-read-a-model)
 - [Write, convert and publish](#rust-write-convert-and-publish)
@@ -207,7 +205,7 @@ as `decode=True`;
 `read_part_into(key, role, offset, &mut [u8])` fills a stored byte range;
 `asset(name)` returns `Vec<u8>`. These direct configuration, file and tensor reads are the
 normal cozytensors integration path. `export_files(directory)` is only a convenience for
-legacy libraries that require filenames: it explicitly writes configuration and supporting
+libraries that require filenames: it explicitly writes configuration and supporting
 files and returns `PathBuf`, without exporting weights. Native consumers, including our
 Runtime, do not need that step. The I/O calls return `Result`.
 Selections control exactly which component/tensor/part/asset bytes are fetched, including
@@ -276,10 +274,7 @@ until `io::drain` for the device and every producer stream report checked comple
 an error alone does not establish quiescence. Descriptor and overlap refusals precede
 writes; after a runtime or value error the output contents are unspecified.
 
-The [exact declarations](API-TYPES.md#advanced-resident-buffer-decoding) are a
-source-reviewed 0.13 target, pinned to the Rust wrapper at
-`5fc6f2320b803212037de90e38fe0d0ce0e10d9f`. Its combined native and GPU gates are still
-pending; the existing 25a1 native-wheel results do not qualify this new interface.
+The [exact declarations](API-TYPES.md#advanced-resident-buffer-decoding) list the types.
 
 ## Errors and value types
 
