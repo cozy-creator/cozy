@@ -261,6 +261,25 @@ pub enum Action {
 type Distance = (u32, u32);
 
 impl Table {
+    pub fn available(&self) -> u64 {
+        self.occupied()
+            .map_or(0, |bytes| self.capacity.saturating_sub(bytes))
+    }
+
+    pub fn working_set(&self, request: RequestId) -> Option<u64> {
+        let request = self.request(request)?;
+        self.pages
+            .iter()
+            .filter(|page| {
+                self.class(page) == Class::Working
+                    && page.uses.iter().any(|usage| {
+                        usage.request == request.id && usage.position.step == request.position.step
+                    })
+            })
+            .try_fold(request.measured()?, |bytes, page| {
+                bytes.checked_add(page.bytes)
+            })
+    }
     pub fn speculative_budget(&self, request: RequestId) -> Option<u64> {
         let request = self.request(request)?;
         if request.starved {
@@ -677,7 +696,14 @@ impl<'a> Planner<'a> {
 
     fn room(&mut self, request: &Request, need: u64) -> bool {
         self.take(need, |page, class| {
-            class == Class::Orphan || (page.row == request.row && class <= Class::Unused)
+            page.row == request.row && class == Class::Free
+        });
+        self.take(need, |_, class| class == Class::Orphan);
+        if self.free < need && self.ask(request, need, Class::Orphan) {
+            return false;
+        }
+        self.take(need, |page, class| {
+            page.row == request.row && class <= Class::Unused
         });
         if self
             .removed
