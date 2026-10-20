@@ -288,7 +288,8 @@ async fn explicit_export_fetches_known_repo_files_and_never_omits_refused_files(
 
         let invalid = scratch.0.join("invalid-export");
         assert_eq!(
-            tensorfs::export(&checkpoint, &invalid, Format::Cozytensors, Some(Dtype::F32))
+            checkpoint
+                .materialize(&invalid, Format::Cozytensors, Some(Dtype::F32))
                 .await
                 .unwrap_err()
                 .kind,
@@ -298,7 +299,9 @@ async fn explicit_export_fetches_known_repo_files_and_never_omits_refused_files(
         assert!(!invalid.exists());
 
         let destination = scratch.0.join("export");
-        let result = tensorfs::export(&checkpoint, &destination, Format::Cozytensors, None).await;
+        let result = checkpoint
+            .materialize(&destination, Format::Cozytensors, None)
+            .await;
         assert!(
             server.repo_requests() > 0,
             "explicit export did not prepare its repo file"

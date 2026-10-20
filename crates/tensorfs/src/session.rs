@@ -346,28 +346,3 @@ pub enum Format {
     Safetensors,
     Cozytensors,
 }
-
-/// Fetch the checkpoint's payload and known repository files, then serialize them to `dir`.
-pub async fn export(
-    checkpoint: &Checkpoint,
-    dir: &Path,
-    format: Format,
-    dequantize: Option<crate::format::Dtype>,
-) -> Result<Vec<String>> {
-    if matches!(format, Format::Cozytensors) && dequantize.is_some() {
-        return fail(
-            Kind::Invalid,
-            "native cozytensors export preserves encoded bytes; dequantize is unsupported",
-        );
-    }
-    checkpoint.prepare_export().await?;
-    let (checkpoint, dir) = (checkpoint.clone(), dir.to_path_buf());
-    let worker = tokio::task::spawn_blocking(move || match format {
-        Format::Safetensors => checkpoint.export_to(&dir, dequantize.as_ref()),
-        Format::Cozytensors => checkpoint.export_cozytensors(&dir),
-    });
-    match worker.await {
-        Ok(result) => result,
-        Err(error) => fail(Kind::Io, format!("export worker failed: {error}")),
-    }
-}

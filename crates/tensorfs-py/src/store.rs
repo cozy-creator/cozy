@@ -381,14 +381,14 @@ impl PyClient {
 }
 
 #[pyfunction]
-#[pyo3(signature = (checkpoint, directory, *, format = "safetensors", dequantize = None))]
-fn _export(
+#[pyo3(signature = (checkpoint, directory, *, format = "cozytensors", dequantize = None))]
+fn _materialize(
     py: Python<'_>,
     checkpoint: &PyCheckpoint,
     directory: PathBuf,
     format: &str,
     dequantize: Option<String>,
-) -> PyResult<Vec<String>> {
+) -> PyResult<PathBuf> {
     let checkpoint = checkpoint.core(py)?;
     let format = match format {
         "safetensors" => Format::Safetensors,
@@ -396,7 +396,7 @@ fn _export(
         _ => return Err(invalid(py, "format must be safetensors or cozytensors")),
     };
     let dtype = dequantize.map(|d| Dtype::parse(&d.to_ascii_uppercase()));
-    py.detach(move || bridge(tensorfs::export(&checkpoint, &directory, format, dtype)))
+    py.detach(move || bridge(checkpoint.materialize(&directory, format, dtype)))
         .or_raise(py)
 }
 
@@ -1995,6 +1995,6 @@ pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEncoded>()?;
     m.add_class::<PyWriter>()?;
     m.add_function(wrap_pyfunction!(_kernel_binary, m)?)?;
-    m.add_function(wrap_pyfunction!(_export, m)?)?;
+    m.add_function(wrap_pyfunction!(_materialize, m)?)?;
     Ok(())
 }

@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tensorfs::format::{Body, Component, Dtype, Header, Location, ObjectRef, Tensor};
-use tensorfs::{
-    export, Client, Config, Download, Format, Kind, Open, Ref, Selection, WriterOptions,
-};
+use tensorfs::{Client, Config, Download, Format, Kind, Open, Ref, Selection, WriterOptions};
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -128,10 +126,11 @@ async fn public_export_keeps_plain_folder_repository_bytes_without_admitting_pay
     drop(client);
     checkpoint.download(&Download::default()).await.unwrap();
     let destination = scratch.0.join("export");
-    let paths = export(&checkpoint, &destination, Format::Safetensors, None)
+    let path = checkpoint
+        .materialize(&destination, Format::Safetensors, None)
         .await
         .unwrap();
-    assert!(paths.iter().any(|p| p == "README.bin"));
+    assert_eq!(path, destination);
     check_export(&destination);
 }
 
@@ -189,7 +188,8 @@ async fn public_export_requires_selected_repo_bytes_and_owns_them_after_client_d
         .exists());
     drop(reader);
     let destination = scratch.0.join("export");
-    export(&checkpoint, &destination, Format::Safetensors, None)
+    checkpoint
+        .materialize(&destination, Format::Safetensors, None)
         .await
         .unwrap();
     check_export(&destination);
@@ -232,10 +232,10 @@ async fn same_header_repository_trees_keep_distinct_folders_through_public_uploa
     b.download(&Download::default()).await.unwrap();
     let a_folder = scratch.0.join("portable-first");
     let b_folder = scratch.0.join("portable-second");
-    export(&a, &a_folder, Format::Cozytensors, None)
+    a.materialize(&a_folder, Format::Cozytensors, None)
         .await
         .unwrap();
-    export(&b, &b_folder, Format::Cozytensors, None)
+    b.materialize(&b_folder, Format::Cozytensors, None)
         .await
         .unwrap();
     assert_eq!(fs::read(a_folder.join("README.bin")).unwrap(), README);
@@ -264,7 +264,8 @@ async fn same_header_repository_trees_keep_distinct_folders_through_public_uploa
     drop(a);
     drop(b);
     let destination = scratch.0.join("export-roundtrip");
-    export(&roundtrip, &destination, Format::Safetensors, None)
+    roundtrip
+        .materialize(&destination, Format::Safetensors, None)
         .await
         .unwrap();
     check_export(&destination);
@@ -579,10 +580,12 @@ async fn portable_export_preflights_full_closure_and_atomically_replaces_shared_
         portable.join("model.cozytensors"),
     )
     .unwrap();
-    export(&checkpoint, &portable, Format::Cozytensors, None)
+    checkpoint
+        .materialize(&portable, Format::Cozytensors, None)
         .await
         .unwrap();
-    export(&checkpoint, &folder, Format::Cozytensors, None)
+    checkpoint
+        .materialize(&folder, Format::Cozytensors, None)
         .await
         .unwrap();
     assert_eq!(fs::read(folder.join("README.bin")).unwrap(), README);
@@ -620,7 +623,8 @@ async fn portable_export_preflights_full_closure_and_atomically_replaces_shared_
     fs::remove_file(portable.join("chunks").join(&ObjectRef::of(WEIGHT).sha256)).unwrap();
     let incomplete = scratch.0.join("refused");
     assert_eq!(
-        export(&reopened, &incomplete, Format::Cozytensors, None)
+        reopened
+            .materialize(&incomplete, Format::Cozytensors, None)
             .await
             .unwrap_err()
             .kind,
@@ -628,15 +632,11 @@ async fn portable_export_preflights_full_closure_and_atomically_replaces_shared_
     );
     assert!(!incomplete.join("model.cozytensors").exists());
     assert_eq!(
-        export(
-            &reopened,
-            &incomplete,
-            Format::Cozytensors,
-            Some(Dtype::F32)
-        )
-        .await
-        .unwrap_err()
-        .kind,
+        reopened
+            .materialize(&incomplete, Format::Cozytensors, Some(Dtype::F32))
+            .await
+            .unwrap_err()
+            .kind,
         Kind::Invalid
     );
 }
@@ -703,7 +703,8 @@ async fn literal_header_fetches_selected_missing_payload_online_but_not_offline_
     assert!(!cache.join(ObjectRef::of(WEIGHT).key()).exists());
     online.download(&Download::default()).await.unwrap();
     let output = scratch.0.join("literal-portable");
-    export(&online, &output, Format::Cozytensors, None)
+    online
+        .materialize(&output, Format::Cozytensors, None)
         .await
         .unwrap();
     assert!(!output.join("README.bin").exists());
@@ -954,7 +955,8 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
     assert_eq!(checkpoint.variant(), Some("u8"));
     let child = checkpoint.component("model").unwrap().clone();
     let portable = scratch.0.join("converted-portable");
-    export(&checkpoint, &portable, Format::Cozytensors, None)
+    checkpoint
+        .materialize(&portable, Format::Cozytensors, None)
         .await
         .unwrap();
     assert_eq!(fs::read(portable.join("README.bin")).unwrap(), README);
@@ -976,7 +978,8 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
     drop(checkpoint);
     drop(client);
     let result = scratch.0.join("converted-hf");
-    export(&reopened, &result, Format::Safetensors, None)
+    reopened
+        .materialize(&result, Format::Safetensors, None)
         .await
         .unwrap();
     check_export(&result);
@@ -1207,7 +1210,8 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
     fs::write(&chunk, [0, 0, 0, 0]).unwrap();
     let bad_chunk = scratch.0.join("bad-chunk-export");
     assert_eq!(
-        export(&plain, &bad_chunk, Format::Cozytensors, None)
+        plain
+            .materialize(&bad_chunk, Format::Cozytensors, None)
             .await
             .unwrap_err()
             .kind,
@@ -1225,7 +1229,8 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
         "corrupt object was atomically named as valid"
     );
     fs::write(&chunk, WEIGHT).unwrap();
-    export(&plain, &bad_chunk, Format::Cozytensors, None)
+    plain
+        .materialize(&bad_chunk, Format::Cozytensors, None)
         .await
         .unwrap();
     let tree = producer
@@ -1241,7 +1246,8 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
     fs::write(&readme, vec![b'!'; README.len()]).unwrap();
     let bad_repo = scratch.0.join("bad-repo-export");
     assert_eq!(
-        export(&managed, &bad_repo, Format::Cozytensors, None)
+        managed
+            .materialize(&bad_repo, Format::Cozytensors, None)
             .await
             .unwrap_err()
             .kind,
@@ -1250,7 +1256,8 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
     assert!(!bad_repo.join("model.cozytensors").exists());
     assert!(!bad_repo.join("README.bin").exists());
     fs::write(readme, README).unwrap();
-    export(&managed, &bad_repo, Format::Cozytensors, None)
+    managed
+        .materialize(&bad_repo, Format::Cozytensors, None)
         .await
         .unwrap();
     assert_eq!(fs::read(bad_repo.join("README.bin")).unwrap(), README);
@@ -1345,9 +1352,11 @@ fn public_conversion_without_a_tokio_caller_refuses_instead_of_starting_a_runtim
     let client = client(&cache, &scratch.0.join("endpoint"));
     let sources = [source.to_str().unwrap().to_owned()];
     assert_eq!(
-        futures::executor::block_on(client.convert_to_cozytensors(&sources, &tensorfs::Convert::default()))
-            .unwrap_err()
-            .kind,
+        futures::executor::block_on(
+            client.convert_to_cozytensors(&sources, &tensorfs::Convert::default())
+        )
+        .unwrap_err()
+        .kind,
         Kind::Unsupported
     );
     assert_eq!(
