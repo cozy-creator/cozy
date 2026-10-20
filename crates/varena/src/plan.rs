@@ -1091,9 +1091,12 @@ fn lower(table: &Table, id: RequestId, allocation: u64, reclaim: u64) -> Vec<Act
             plan.evict(page);
         }
     }
-    let shortfall = plan
-        .shortfall(target)
-        .max(reclaim.saturating_sub(before.saturating_sub(plan.allocated)));
+    let unreclaimed = reclaim.saturating_sub(before.saturating_sub(plan.allocated));
+    let shortfall = if unreclaimed != 0 {
+        unreclaimed
+    } else {
+        plan.shortfall(target)
+    };
     if shortfall != 0 {
         plan.actions.push(Action::Exhausted {
             request: id,
@@ -1400,7 +1403,7 @@ mod tests {
         scratch.model = None;
         scratch.kind = Kind::Scratch(1);
         pages.extend([context, scratch]);
-        let table = Table {
+        let mut table = Table {
             capacity: 1400 * MIB,
             pages,
             rows: vec![Row {
@@ -1433,6 +1436,67 @@ mod tests {
             .iter()
             .any(|a| matches!(a, Action::Exhausted { .. })));
         assert!(!actions.contains(&Action::Unmap(7)) && !actions.contains(&Action::Unmap(8)));
+
+        // Another 200 MiB of measured activation reserve consumes another
+        // 200 MiB of capacity: it must not buy back either retained page.
+        table.capacity = 1600 * MIB;
+        table.requests[0].working_sets[0] = Some(400 * MIB);
+        let actions = decide(
+            &table,
+            Trigger::Lower {
+                request: 1,
+                allocation: 600 * MIB,
+                reclaim: 1,
+            },
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::DropHome { .. }))
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn lower_after_a_real_oom_requires_progress_even_when_logical_room_fits() {
+        let mut weight = page(1, 40);
+        weight.uses = vec![usage(1, 0)];
+        let mut table = Table {
+            capacity: 100,
+            pages: vec![weight],
+            rows: vec![Row {
+                id: 1,
+                alive: true,
+                reaping: false,
+            }],
+            requests: vec![request(1)],
+            ..Default::default()
+        };
+        let lower = Trigger::Lower {
+            request: 1,
+            allocation: 10,
+            reclaim: 1,
+        };
+        assert_eq!(
+            decide(&table, lower),
+            vec![
+                Action::DropHome {
+                    request: 1,
+                    page: 1
+                },
+                Action::Unmap(1),
+            ]
+        );
+        table.pages[0].lowered.insert(1);
+        table.pages[0].tier = Tier::Disk;
+        assert_eq!(
+            decide(&table, lower),
+            vec![Action::Exhausted {
+                request: 1,
+                need: 1
+            }]
+        );
     }
 
     #[test]

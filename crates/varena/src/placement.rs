@@ -3287,4 +3287,136 @@ mod gpu_tests {
         placement.close().expect("close placement");
         println!("PASS idle worker retires after pending consumer {uuid}");
     }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn lower_relief_keeps_fitting_home_and_requires_real_reclaim() {
+        const MIB: u64 = 1 << 20;
+        let probe = Gpu::open(0).expect("real CUDA device");
+        let uuid = assigned_gpu(&probe);
+        assert!(probe.capacity().unwrap() >= 56 * MIB);
+        drop(probe);
+        // The real CUDA allocations use an isolated 56 MiB ledger; the
+        // machine service's cap and every other executor remain untouched.
+        let name = format!(
+            "lower-target-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        struct Named(String);
+        impl Drop for Named {
+            fn drop(&mut self) {
+                let uid = unsafe { libc::geteuid() };
+                let _ = std::fs::remove_file(format!("/dev/shm/varena-{}-{uid}", self.0));
+            }
+        }
+        let _named = Named(name.clone());
+        let ledger = Ledger::create(&name, 56 * MIB).expect("scoped lower ledger");
+        let grant = ledger.grant_unbound().expect("rank grant");
+        let placement = Placement::open(0, Some((grant.table, grant.events, grant.channel)))
+            .expect("actual CUDA placement");
+        let layout = Layout {
+            parts: vec![],
+            regions: (0..6)
+                .map(|index| crate::layout::Region {
+                    offset: index * 4 * MIB,
+                    nbytes: 4 * MIB,
+                    span: 4 * MIB,
+                    items: vec![Item {
+                        offset: 0,
+                        len: 4 * MIB,
+                        part_end: true,
+                        source: ItemSource::Inline(vec![7; (4 * MIB) as usize].into()),
+                    }],
+                })
+                .collect(),
+            nbytes: 24 * MIB,
+            digest: "controlled-lower".into(),
+            names: vec![],
+        };
+        let pages = placement
+            .register(
+                1,
+                "lower".into(),
+                [62; 32],
+                &layout,
+                Arc::new(Source::files(vec![], false, 0)),
+                None,
+            )
+            .unwrap();
+        assert_eq!(pages.len(), 6);
+        assert_eq!(placement.load(1, Tier::Gpu).unwrap(), Relief::Complete);
+        let context = tensorfs::io::DeviceBuffer::new(0, (4 * MIB) as usize).unwrap();
+        let scratch = tensorfs::io::DeviceBuffer::new(0, (8 * MIB) as usize).unwrap();
+        placement.allocator(4 * MIB, 8 * MIB, 8 * MIB).unwrap();
+        placement
+            .begin(1, vec![vec![1]], "controlled-lower".into(), "shape".into())
+            .unwrap();
+        placement.enter(1, 1).unwrap();
+        placement.leave(1, 8 * MIB).unwrap();
+        placement.enter(1, 1).unwrap();
+        let pin = placement
+            .bind(1, pages[0], 0)
+            .expect("protected current source");
+
+        // Scaled six-page witness: 4 context + 8 live activation + 8
+        // retained weights + 12 ring + 24 upcoming allocation = 56 MiB.
+        assert_eq!(
+            placement.relief(1, 24 * MIB, true).unwrap(),
+            Relief::Complete
+        );
+        assert_eq!(
+            placement.resident().unwrap(),
+            vec![("lower".into(), 8 * MIB)]
+        );
+        let allocated = tensorfs::io::DeviceBuffer::new(0, (24 * MIB) as usize)
+            .expect("the requested allocation fits after controlled relief");
+        placement.allocator(4 * MIB, 32 * MIB, 32 * MIB).unwrap();
+        drop(allocated);
+        placement.allocator(4 * MIB, 8 * MIB, 8 * MIB).unwrap();
+
+        // A reported allocator failure still requires real reclaim when the
+        // logical free room already covers both the allocation and its ring.
+        assert!(placement.available().unwrap() >= 16 * MIB);
+        assert_eq!(
+            placement.relief(1, 4 * MIB, true).unwrap(),
+            Relief::Complete
+        );
+        assert_eq!(
+            placement.resident().unwrap(),
+            vec![("lower".into(), 4 * MIB)]
+        );
+        assert!(
+            matches!(placement.relief(1, 4 * MIB, true).unwrap(), Relief::Exhausted(n) if n > 0),
+            "a repeated failure with no reclaimable home must not succeed as a no-op"
+        );
+        let mut bytes = [0_u8; 32];
+        unsafe {
+            tensorfs::io::read(
+                &[tensorfs::io::Copy {
+                    src: tensorfs::io::Src::Device {
+                        device: 0,
+                        ptr: pin.ptr,
+                        stream: 0,
+                    },
+                    dst: tensorfs::io::Dst::host(&mut bytes),
+                }],
+                &tensorfs::io::ReadOpts::default(),
+            )
+        }
+        .expect("pinned source stays readable through every relief");
+        assert_eq!(bytes, [7; 32]);
+        drop(pin);
+        placement.gpu.wait_pending().unwrap();
+        placement.leave(1, 32 * MIB).unwrap();
+        placement.end(1).unwrap();
+        drop(scratch);
+        drop(context);
+        placement.allocator(0, 0, 0).unwrap();
+        placement.close().unwrap();
+        println!("PASS controlled lower preserves fitting home, pins and bounded physical reclaim {uuid}");
+    }
 }
