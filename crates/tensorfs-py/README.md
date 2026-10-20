@@ -23,12 +23,23 @@ that are actually metadata rather than model weights:
   and unpacks the metadata to recover properties such as the logical dtype and block size.
   Transformers also publishes [quantization configuration alongside the weights](https://huggingface.co/docs/transformers/main/en/quantization/bitsandbytes).
 
-To safetensors, those metadata entries are just arrays with arbitrary names. It defines no
-standard relationship between them and the weights they describe. Saving a valid file therefore
-does not guarantee that another library can reconstruct the intended tensors: the reader must
-implement the same conventions as the writer. A matching loader can read them reliably; a
-different loader may reject the file or misinterpret its contents. Compatibility depends on
-finding a loader that knows those conventions, rather than on the `.safetensors` extension alone.
+Even the model's structure comes from conventions outside the weights file:
+[Diffusers](https://huggingface.co/docs/diffusers/main/en/using-diffusers/loading) uses
+`model_index.json`, component subfolders and configuration files to choose and construct its
+pipeline classes.
+
+Much of the model-loading ecosystem is therefore held together by agreements between producers
+and loaders: expected filenames, tensor names, metadata keys, configuration schemas and code
+that knows how to interpret them. These agreements can be documented and reliable within one
+ecosystem, but they are not part of the safetensors format. To a generic safetensors reader,
+the metadata entries above are just arrays with arbitrary names, with no standard relationship
+to the weights they describe.
+
+Two tools can both support safetensors and still disagree about how to reconstruct the model.
+A valid file is not enough: compatibility depends on finding a loader that implements the
+writer's conventions. A matching loader can read it reliably; a different loader may reject
+it or misinterpret its contents. The `.safetensors` extension alone does not establish that
+shared contract.
 
 cozytensors makes that meaning part of the format: each logical tensor declares its encoding,
 parameters and stored arrays, with specified decoding rules. TensorFS can preserve the encoded
