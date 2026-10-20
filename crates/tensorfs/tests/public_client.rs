@@ -2,7 +2,7 @@
 //! origin. No raw Store, private downloader, pretrained data or GPU is used.
 #![cfg(feature = "store")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -548,7 +548,14 @@ async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects(
         b"abcdefghijklmnop"
     );
     assert_eq!(progress.lock().unwrap().last(), Some(&(16, 16)));
-    assert_eq!(checkpoint.missing(&Selection::All).unwrap().len(), 2);
+    assert_eq!(
+        checkpoint
+            .missing(&Selection::All)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([data.chunks[2].clone(), data.asset.clone()])
+    );
     assert!(
         !cache.join(data.chunks[0].key()).exists(),
         "existing folder payload was copied to cache"
@@ -573,7 +580,24 @@ async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects(
         .await
         .unwrap();
     assert_eq!(immutable.id(), &data.header);
-    assert_eq!(immutable.missing(&Selection::All).unwrap().len(), 4);
+    let expected: BTreeSet<_> = data
+        .chunks
+        .iter()
+        .cloned()
+        .chain(std::iter::once(data.asset.clone()))
+        .chain(std::iter::once(ObjectRef::of(
+            &fs::read(data.folder.join("README.md")).unwrap(),
+        )))
+        .collect();
+    assert_eq!(
+        immutable
+            .missing(&Selection::All)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        expected,
+        "All names the exact model chunks, asset, and repository file"
+    );
     let named = offline
         .open(
             "account/model",

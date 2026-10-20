@@ -27,22 +27,64 @@ mod gguf;
 pub use gguf::gguf;
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{json, Map, Value as Json};
 
 use crate::client::io;
 use crate::failure::{fail, Kind, Result};
 use crate::format::{
-    decode, variant_of, Body, Component, Config, ConfigValue, Dtype, Location, PartBytes, Value,
+    decode, variant_of, Body, Component, Config, ConfigValue, Dtype, Location, ObjectRef,
+    PartBytes, Value,
 };
 use crate::import::{FILE_METADATA, PIPELINE_FILE, ROOT_COMPONENT};
 use crate::store2::Checkpoint;
 
 /// The largest shard, as Diffusers and Transformers write them (20 GB).
 pub const SHARD: u64 = 20_000_000_000;
+
+/// Complete portable native folder. Open every required source before creating any output;
+/// the exact source header is atomically published last, after its bounded file copies.
+pub(crate) fn cozytensors(
+    ck: &Checkpoint,
+    repo: &BTreeMap<String, PathBuf>,
+    dir: &Path,
+    variant: &str,
+    header: &[u8],
+) -> Result<Vec<String>> {
+    if &ObjectRef::of(header) != ck.id() {
+        return fail(
+            Kind::Integrity,
+            "export header differs from the opened checkpoint",
+        );
+    }
+    let header_path = crate::format::variant_path(variant);
+    crate::format::check_file(&header_path)?;
+    let mut sources = BTreeMap::new();
+    for object in ck.header().objects() {
+        let path = format!("{}/{}", crate::format::CHUNKS_DIR, object.sha256);
+        if let std::collections::btree_map::Entry::Vacant(entry) = sources.entry(path) {
+            entry.insert(ck.object(object)?);
+        }
+    }
+    for (name, path) in repo {
+        crate::format::check_file(name)?;
+        if variant_of(name).is_none() {
+            sources.insert(name.clone(), File::open(path).map_err(|e| io(path, e))?);
+        }
+    }
+    let mut written = Vec::new();
+    for (name, mut source) in sources {
+        copy(&mut source, &dir.join(&name))?;
+        written.push(name);
+    }
+    write(&dir.join(&header_path), header)?;
+    written.push(header_path);
+    Ok(written)
+}
 
 /// Where one safetensors tensor's bytes come from.
 enum Bytes<'a> {
@@ -236,7 +278,10 @@ pub fn safetensors(
         if n > 1 {
             let file = format!("{folder}{weights}.safetensors.index.json");
             let doc = json!({"metadata": {"total_size": total}, "weight_map": weight_map});
-            write(&dir.join(&file), &config_json(doc.as_object().expect("a map")))?;
+            write(
+                &dir.join(&file),
+                &config_json(doc.as_object().expect("a map")),
+            )?;
             written.push(file);
         }
     }
@@ -255,16 +300,36 @@ fn weights_name(c: &Component) -> String {
 fn write(dest: &Path, bytes: &[u8]) -> Result<()> {
     let parent = dest.parent().expect("a file has a directory");
     fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
-    fs::write(dest, bytes).map_err(|e| io(dest, e))
+    platform::durable::replace(dest, bytes, 0o644).map_err(|e| io(dest, e.into()))
 }
 
 /// An asset or repo file, byte-exact.
 fn copy(from: &mut File, dest: &Path) -> Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let parent = dest.parent().expect("a file has a directory");
     fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
-    let mut out = File::create(dest).map_err(|e| io(dest, e))?;
-    io::copy(from, &mut out).map_err(|e| io(dest, e))?;
-    Ok(())
+    let (temp, mut out) = loop {
+        let temp = parent.join(format!(
+            ".tensorfs-export-{}-{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(out) => break (temp, out),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(io(&temp, e)),
+        }
+    };
+    let result = io::copy(from, &mut out)
+        .and_then(|_| out.sync_all())
+        .map_err(|e| io(&temp, e));
+    drop(out);
+    let result = result.and_then(|()| fs::rename(&temp, dest).map_err(|e| io(dest, e)));
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result?;
+    platform::durable::sync_dir(parent).map_err(|e| io(parent, e.into()))
 }
 
 /// A config as the Diffusers and Transformers writers write one, `json.dumps(config, indent=2,
@@ -313,9 +378,9 @@ fn value(out: &mut String, v: &ConfigValue, depth: usize) {
         ConfigValue::Number(n) if n.is_f64() => {
             out.push_str(&python_float(n.as_f64().expect("a float")))
         }
-        ConfigValue::Array(l) => {
-            nested(out, '[', ']', depth, l.iter(), |out, v| value(out, v, depth + 1))
-        }
+        ConfigValue::Array(l) => nested(out, '[', ']', depth, l.iter(), |out, v| {
+            value(out, v, depth + 1)
+        }),
         ConfigValue::Object(m) => map(out, m, depth),
         scalar => out.push_str(&scalar.to_string()),
     }
@@ -325,7 +390,9 @@ fn value(out: &mut String, v: &ConfigValue, depth: usize) {
 /// positional for decimal exponents -4 through 15, else `d.ddde±XX`.
 fn python_float(f: f64) -> String {
     let ryu = serde_json::to_string(&f).expect("a finite float");
-    let (sign, ryu) = ryu.strip_prefix('-').map_or(("", ryu.as_str()), |r| ("-", r));
+    let (sign, ryu) = ryu
+        .strip_prefix('-')
+        .map_or(("", ryu.as_str()), |r| ("-", r));
     let (mantissa, exp) = ryu.split_once('e').unwrap_or((ryu, "0"));
     let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     let all = format!("{int}{frac}");
@@ -350,7 +417,11 @@ fn python_float(f: f64) -> String {
         1 => digits.to_owned(),
         _ => format!("{}.{}", &digits[..1], &digits[1..]),
     };
-    format!("{sign}{mantissa}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs())
+    format!(
+        "{sign}{mantissa}e{}{:02}",
+        if exp < 0 { '-' } else { '+' },
+        exp.abs()
+    )
 }
 
 fn write_file(

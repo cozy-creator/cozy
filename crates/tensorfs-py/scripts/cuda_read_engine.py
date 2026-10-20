@@ -21,11 +21,11 @@ assert torch.cuda.is_available(), "this gate requires an actual CUDA GPU"
 HostReads.setUpClass()
 try:
     tensors = HostReads.tensors
-    arrays = tensors.read(["empty", "plain", "big", "quantized"], device="cuda:0")
+    arrays = tensors.read(["empty", "plain", "big", "quantized"], device="cuda:0", decode=True)
     for key, array in arrays.items():
         assert isinstance(array, tensorfs.Array)
         assert array.__dlpack_device__() == (2, 0)
-        assert array.tobytes() == tensors.read(key).tobytes(), key
+        assert array.tobytes() == tensors.read(key, decode=True).tobytes(), key
     encoded = tensors.read(["quantized"], device="cuda", decode=False)["quantized"]
     host_parts = tensors.read("quantized", decode=False).parts
     for role, array in encoded.parts.items():
@@ -38,7 +38,7 @@ try:
         odd = torch.empty(9, dtype=torch.uint8, device="cuda:0")
         tensors.read_into("quantized", odd, offset=3)
     assert torch.equal(destination, torch.tensor(HostReads.plain, device="cuda:0"))
-    assert bytes(odd.cpu().tolist()) == tensors.read("quantized").tobytes()[3:12]
+    assert bytes(odd.cpu().tolist()) == tensors.read("quantized", decode=True).tobytes()[3:12]
     for consumer_stream in [-1, 1, 2, stream.cuda_stream]:
         try:
             arrays["plain"].__dlpack__(copy=True, stream=consumer_stream)
@@ -93,7 +93,7 @@ try:
     assert first.is_cuda and first.data_ptr() == second.data_ptr()
     assert first.data_ptr() != copied.data_ptr()
     expected = torch.tensor(HostReads.plain, device="cuda:0")
-    expected_quantized = torch.frombuffer(bytearray(tensors.read("quantized").tobytes()), dtype=torch.float32).reshape(2, 16)
+    expected_quantized = torch.frombuffer(bytearray(tensors.read("quantized", decode=True).tobytes()), dtype=torch.float32).reshape(2, 16)
     # Consumers on a separate stream see a completed read and retain native allocations
     # after the parent checkpoint, cached component map and Array wrappers are released.
     with torch.cuda.stream(stream):

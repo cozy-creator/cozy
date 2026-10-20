@@ -166,7 +166,7 @@ def prove(root):
             continue
         config_cls, model_cls = constructors[name]
         assert component.cls == f"transformers.{model_cls.__name__}"
-        arrays = component.tensors.read(device="cpu")
+        arrays = component.tensors.read(device="cpu", decode=True)
         assert set(arrays) == set(manifests[name])
         loaded = {key: torch.from_dlpack(array) for key, array in arrays.items()}
         for key, value in loaded.items():

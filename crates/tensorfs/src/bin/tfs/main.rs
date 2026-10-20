@@ -267,6 +267,7 @@ fn run(args: &Args) -> Done {
                 converter: args.get("converter"),
                 variant: args.get("variant"),
                 progress: &progress,
+                stop: None,
             };
             let n = store()?.import_named(&sources, &opts)?;
             Ok(Some((

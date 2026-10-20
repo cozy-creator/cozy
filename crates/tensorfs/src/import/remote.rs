@@ -8,7 +8,11 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+use base64::{engine::general_purpose::STANDARD, Engine};
 
 use serde::Deserialize;
 
@@ -29,11 +33,21 @@ pub struct Access {
     pub civitai_token: String,
     pub allow_local: bool,
     pub token: Option<Arc<dyn crate::fetch::TokenProvider>>,
+    /// The async caller's runtime, driven from its blocking import worker. None keeps the
+    /// existing synchronous CLI/Python path.
+    pub runtime: Option<tokio::runtime::Handle>,
+    /// Owned by the async frontend's drop/callback guard.
+    pub cancelled: Option<Arc<AtomicBool>>,
+    /// Extra source trust roots supplied by the caller, in DER.
+    pub ca_der: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Access {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Access").field("huggingface", &self.huggingface).field("civitai", &self.civitai).finish_non_exhaustive()
+        f.debug_struct("Access")
+            .field("huggingface", &self.huggingface)
+            .field("civitai", &self.civitai)
+            .finish_non_exhaustive()
     }
 }
 
@@ -46,6 +60,9 @@ impl Default for Access {
             civitai_token: String::new(),
             allow_local: false,
             token: None,
+            runtime: None,
+            cancelled: None,
+            ca_der: None,
         }
     }
 }
@@ -202,42 +219,127 @@ impl Access {
             Provider::Web => return vec![],
         };
         let token = token.strip_prefix("bearer ").unwrap_or(token).trim();
-        let ours = base_host(self.base(p)).is_ok_and(|host| base_host(url).is_ok_and(|at| at == host));
+        let ours =
+            base_host(self.base(p)).is_ok_and(|host| base_host(url).is_ok_and(|at| at == host));
         match token.is_empty() || !ours {
             true => vec![],
             false => vec![("authorization".into(), format!("Bearer {token}"))],
         }
     }
+}
+
+pub(super) struct Scope<'a> {
+    access: &'a Access,
+    stop: Option<&'a (dyn Fn() -> bool + Sync)>,
+}
+
+impl std::ops::Deref for Scope<'_> {
+    type Target = Access;
+    fn deref(&self) -> &Access {
+        self.access
+    }
+}
+
+impl<'a> Scope<'a> {
+    pub(super) fn new(access: &'a Access, stop: Option<&'a (dyn Fn() -> bool + Sync)>) -> Self {
+        Self { access, stop }
+    }
+
+    pub(super) fn check(&self) -> Result<()> {
+        if self
+            .cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+            || self.stop.is_some_and(|stop| stop())
+        {
+            return refuse(Code::TRANSFER_FAILED, "the import was stopped");
+        }
+        Ok(())
+    }
+
+    async fn until<T>(&self, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        let mut work = std::pin::pin!(work);
+        loop {
+            self.check()?;
+            tokio::select! {
+                biased;
+                answer = &mut work => { self.check()?; return answer; },
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {},
+            }
+        }
+    }
+
+    pub(super) fn list(&self, spec: &Spec) -> Result<Listing> {
+        list_in(spec, self)
+    }
+    pub(super) fn land(&self, member: &Member, dest: &Path) -> Result<PathBuf> {
+        land_in(member, dest, self)
+    }
+    pub(super) fn read_small(&self, member: &Member) -> Result<Vec<u8>> {
+        read_small_in(member, self)
+    }
 
     /// GET `url` from `p` (bytes `range` when given: from, and through), handing each body
     /// frame to `sink`; the `Link: rel="next"` page when the answer names one.
-    fn get(&self, p: Provider, url: &str, range: Option<(u64, Option<u64>)>, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<Option<String>> {
+    fn get(
+        &self,
+        p: Provider,
+        url: &str,
+        range: Option<(u64, Option<u64>)>,
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<Option<String>> {
         let mut headers = self.headers(p, url);
         if let Some((from, through)) = range {
             let through = through.map_or(String::new(), |t| t.to_string());
             headers.push(("range".into(), format!("bytes={from}-{through}")));
         }
-        let client = Client::new(self.policy(p));
-        crate::fetch::runtime()?.block_on(async {
-            let mut answer = client.get_authorized(url, &headers, self.token.as_deref()).await?;
+        self.check()?;
+        let client = match self.ca_der.as_deref() {
+            Some(der) => Client::with_roots(
+                self.policy(p),
+                format!(
+                    "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                    STANDARD.encode(der)
+                )
+                .as_bytes(),
+            )?,
+            None => Client::new(self.policy(p)),
+        };
+        let work = async {
+            let mut answer = self
+                .until(client.get_authorized(url, &headers, self.token.as_deref()))
+                .await?;
             let status = answer.status();
-            let ranged = range.is_some_and(|(from, _)| from > 0) || range.is_some_and(|(_, t)| t.is_some());
+            let ranged =
+                range.is_some_and(|(from, _)| from > 0) || range.is_some_and(|(_, t)| t.is_some());
             match status {
                 200 if !ranged => {}
                 206 if range.is_some() => {}
                 404 | 410 => return refuse(Code::REF_NOT_FOUND, format!("{url}: HTTP {status}")),
-                401 | 403 => return refuse(Code::PERMISSION_DENIED, format!("{url}: HTTP {status}")),
+                401 | 403 => {
+                    return refuse(Code::PERMISSION_DENIED, format!("{url}: HTTP {status}"))
+                }
                 _ => return refuse(Code::TRANSFER_FAILED, format!("{url}: HTTP {status}")),
             }
             let next = answer.header("link").and_then(next_link);
-            while let Some(frame) = answer.frame().await? {
+            while let Some(frame) = self.until(answer.frame()).await? {
+                self.check()?;
                 sink(&frame)?;
             }
+            self.check()?;
             Ok(next)
-        })
+        };
+        match &self.runtime {
+            Some(runtime) => runtime.block_on(work),
+            None => crate::fetch::runtime()?.block_on(work),
+        }
     }
 
-    fn get_json<T: for<'d> Deserialize<'d>>(&self, p: Provider, url: &str) -> Result<(T, Option<String>)> {
+    fn get_json<T: for<'d> Deserialize<'d>>(
+        &self,
+        p: Provider,
+        url: &str,
+    ) -> Result<(T, Option<String>)> {
         let body = self.document(p, url)?;
         let doc = serde_json::from_slice(&body.0).map_err(|e| Refusal {
             code: Code::MALFORMED_JSON,
@@ -251,7 +353,10 @@ impl Access {
         let mut body = Vec::new();
         let next = self.get(p, url, None, &mut |frame| {
             if body.len() + frame.len() > DOCUMENT_BYTES {
-                return refuse(Code::SIZE_CAP, format!("{url}: more than {DOCUMENT_BYTES} bytes"));
+                return refuse(
+                    Code::SIZE_CAP,
+                    format!("{url}: more than {DOCUMENT_BYTES} bytes"),
+                );
             }
             body.extend_from_slice(frame);
             Ok(())
@@ -263,7 +368,8 @@ impl Access {
 fn next_link(header: &str) -> Option<String> {
     header.split(',').find_map(|part| {
         let (target, params) = part.trim().split_once('>')?;
-        (params.contains("rel=\"next\"") || params.contains("rel=next")).then(|| target.trim_start_matches('<').to_string())
+        (params.contains("rel=\"next\"") || params.contains("rel=next"))
+            .then(|| target.trim_start_matches('<').to_string())
     })
 }
 
@@ -314,6 +420,11 @@ pub struct Listing {
 }
 
 pub fn list(spec: &Spec, access: &Access) -> Result<Listing> {
+    list_in(spec, &Scope::new(access, None))
+}
+
+fn list_in(spec: &Spec, access: &Scope<'_>) -> Result<Listing> {
+    access.check()?;
     match spec {
         Spec::Hf {
             org,
@@ -528,7 +639,16 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Member>) -> Result<()> {
 /// Weights in a format the import does not read: other serializations of the weights it
 /// converts from safetensors. They are the only files of a source a model does not keep.
 const OTHER_WEIGHTS: [&str; 11] = [
-    ".bin", ".pt", ".pth", ".ckpt", ".onnx", ".onnx_data", ".msgpack", ".h5", ".gguf", ".ot",
+    ".bin",
+    ".pt",
+    ".pth",
+    ".ckpt",
+    ".onnx",
+    ".onnx_data",
+    ".msgpack",
+    ".h5",
+    ".gguf",
+    ".ot",
     ".tflite",
 ];
 
@@ -745,6 +865,11 @@ pub fn select(
 /// Lands `m` at `dest`: resumes a partial file, then checks length and sha256 when the
 /// provider states them. A local member is read where it is.
 pub fn land(m: &Member, dest: &Path, access: &Access) -> Result<PathBuf> {
+    land_in(m, dest, &Scope::new(access, None))
+}
+
+fn land_in(m: &Member, dest: &Path, access: &Scope<'_>) -> Result<PathBuf> {
+    access.check()?;
     let (url, provider) = match &m.at {
         At::Local(path) => return Ok(path.clone()),
         At::Remote { url, provider } => (url, *provider),
@@ -768,9 +893,12 @@ pub fn land(m: &Member, dest: &Path, access: &Access) -> Result<PathBuf> {
             .open(dest)
             .map_err(io)?;
         let range = (from > 0).then_some((from, None));
-        access.get(provider, url, range, &mut |frame| out.write_all(frame).map_err(io))?;
+        access.get(provider, url, range, &mut |frame| {
+            out.write_all(frame).map_err(io)
+        })?;
         out.sync_all().map_err(io)?;
     }
+    access.check()?;
     let len = std::fs::metadata(dest).map_err(io)?.len();
     if m.length.is_some_and(|l| l != len) {
         return refuse(
@@ -802,16 +930,27 @@ pub fn read_range(m: &Member, from: u64, to: u64, access: &Access) -> Result<Vec
             format!("{} is not remote", m.path),
         );
     };
+    let access = Scope::new(access, None);
     let mut out = Vec::new();
-    access.get(*provider, url, Some((from, Some(to.saturating_sub(1)))), &mut |frame| {
-        out.extend_from_slice(frame);
-        Ok(())
-    })?;
+    access.get(
+        *provider,
+        url,
+        Some((from, Some(to.saturating_sub(1)))),
+        &mut |frame| {
+            out.extend_from_slice(frame);
+            Ok(())
+        },
+    )?;
     Ok(out)
 }
 
 /// A document of `m`, whole (an index or a config, never weights).
 pub fn read_small(m: &Member, access: &Access) -> Result<Vec<u8>> {
+    read_small_in(m, &Scope::new(access, None))
+}
+
+fn read_small_in(m: &Member, access: &Scope<'_>) -> Result<Vec<u8>> {
+    access.check()?;
     match &m.at {
         At::Local(path) => std::fs::read(path)
             .map_err(|e| crate::err::classify_io(format!("read {}", path.display()), e)),
