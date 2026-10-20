@@ -55,14 +55,15 @@ fn search_and_info_read_the_public_catalog() {
 #[test]
 fn usage_refusals_reach_no_hub() {
     let Some(home) = Home::new() else { return };
-    let lane = format!("int8=sha256:{}", "a".repeat(64));
+    let tree = format!("sha256:{}", "a".repeat(64));
+    let commit = format!("fidika/x#{tree}");
     let cases: [&[&str]; 9] = [
         &["model", "delete", "fidika/x"],
         &["model", "delete", "fidika/x#latest", "--yes"],
-        &["model", "publish", "local/x", "--release", "1.0.0", "--lane", &lane],
-        &["model", "publish", "fidika/x", "--release", "1.0.0"],
-        &["model", "publish", "fidika/x", "--release", "1.0.0", "--lane", &lane, "--remove-lane", "int8"],
-        &["model", "retarget", "fidika/x", "--release", "1.0.0", "--lane", "int8", "--to", "abc"],
+        &["model", "publish", "local/x", "--release", "1.0.0", "--commit", &tree],
+        &["model", "publish", "fidika/x"],
+        &["model", "publish", "fidika/x", "--release", "_1", "--commit", &tree],
+        &["model", "delete", &commit, "--yes"],
         &["model", "info", "sdxl"],
         &["model", "info", "fidika/sdxl#fp8"],
         &["model", "family", "fidika/x", "anime", "--clear"],

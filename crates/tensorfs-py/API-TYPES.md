@@ -10,6 +10,7 @@ The provider/DLPack protocols describe accepted inputs and are not additional pa
 
 ```python
 from __future__ import annotations
+import io
 from collections.abc import Buffer, Callable, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
 from os import PathLike
 from pathlib import Path
@@ -41,7 +42,7 @@ class DLPack(Protocol):
 def configure(*, endpoint: str | None=None, cache_dir: StrPath | None=None, token: Token | None=None, ca_der: bytes | None=None) -> None:
     ...
 
-def convert_to_cozytensors(source: str | Sequence[str], *, converter: str | None=None, variant: str | None=None, cache_dir: StrPath | None=None, token: Token | None=None, progress: Callable[[str, int, int], object] | None=None) -> Checkpoint:
+def convert_to_cozytensors(source: str | Sequence[str], *, converter: str | None=None, source_variant: str | None=None, cache_dir: StrPath | None=None, token: Token | None=None, progress: Callable[[str, int, int], object] | None=None) -> Checkpoint:
     ...
 
 def download_file(repo_id: str, filename: str, *, revision: str | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None) -> str:
@@ -50,10 +51,10 @@ def download_file(repo_id: str, filename: str, *, revision: str | None=None, cac
 def open(name_or_path: StrPath, *, revision: str | None=None, variant: str | None=None, endpoint: str | None=None, local_files_only: bool=False, cache_dir: StrPath | None=None, token: Token | None=None, lazy: bool=True) -> Checkpoint:
     ...
 
-def materialize(source: str | Checkpoint, *, revision: str | None=None, variant: str | None=None, components: Sequence[str] | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, format: str='cozytensors', dequantize: str | None=None) -> str:
+def materialize(source: str | Checkpoint, *, revision: str | None=None, variant: str | None=None, components: Sequence[str] | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, format: str='cozytensors', decode: bool=False) -> str:
     ...
 
-def upload_folder(*, repo_id: str, folder_path: StrPath, revision: str | None=None, token: Token | None=None, endpoint: str | None=None, cache_dir: StrPath | None=None) -> str:
+def upload_folder(*, repo_id: str, folder_path: StrPath, revision: str='main', token: Token | None=None, endpoint: str | None=None, cache_dir: StrPath | None=None) -> str:
     ...
 
 class Error(Exception):
@@ -235,12 +236,24 @@ class Tensors(Mapping[str, TensorMetadata]):
     def __repr__(self) -> str:
         ...
 
+class ClassRef:
+    """A class as `(library, version, name)`, for any implementation and never an import path:
+    `ClassRef("diffusers", "0.35.1", "SD3Transformer2DModel")`. `ClassRef("", "", "")` is an
+    unknown model; `version` is `""` when nothing records it. A component's tensors are that
+    class's `state_dict` at that version. Frozen; iterates as the 3-tuple; equal and hashable by
+    value. Writers take it or a `(library, version, name)` tuple."""
+
+    def __init__(self, library: str, version: str, name: str) -> None: ...
+    library: str
+    version: str
+    name: str
+
 class Pipeline:
     """What `model_index.json` held."""
 
     @property
-    def cls(self) -> str:
-        """`diffusers.<Class>`, `""` when unknown."""
+    def cls(self) -> ClassRef:
+        ...
 
     @property
     def config(self) -> dict[str, Any]:
@@ -254,8 +267,8 @@ class Component:
         ...
 
     @property
-    def cls(self) -> str:
-        """`<library>.<Class>`, `""` when unknown."""
+    def cls(self) -> ClassRef:
+        """`ClassRef(library, version, name)`; `ClassRef("", "", "")` when unknown."""
 
     @property
     def config(self) -> dict[str, Any]:
@@ -297,6 +310,15 @@ class VerificationReport:
     def ok(self) -> bool:
         """True when both collections are empty."""
 
+class CheckpointFile(io.RawIOBase):
+    """`Checkpoint.open_file()`: readable and seekable, not writable. It holds what it may read until
+    closed, and fetches what it lacks when its checkpoint may fetch."""
+
+    def readinto(self, buffer: Buffer) -> int: ...
+    def seek(self, offset: int, whence: int = 0) -> int: ...
+    def tell(self) -> int: ...
+    def close(self) -> None: ...
+
 class Checkpoint:
     """One cozytensors read from a store."""
 
@@ -311,6 +333,10 @@ class Checkpoint:
 
     def verify(self, components: Sequence[str] | None=None) -> VerificationReport:
         """Audit the header and selected local data; never fetch, repair or delete objects."""
+
+    def open_file(self) -> CheckpointFile:
+        """The checkpoint as one read-only, seekable file: its header, then its chunks and assets in header
+        order at 4 KiB-aligned offsets, assembled from the store on demand; nothing is written."""
 
     @property
     def id(self) -> str:
@@ -365,6 +391,9 @@ class Endpoint:
     def update_repo(self, repo_id: str, change: Callable[[dict[str, object] | None], dict[str, object] | None]) -> dict[str, object]:
         ...
 
+    def commit(self, repo_id: str, revision: str) -> tuple[str, str | None]:
+        """A revision (tag, commit or variant header) to its commit id, and the tag it went through."""
+
 class ComponentWriter:
 
     def put(self, key: str, data: Buffer | DLPack, *, dtype: str | None=None, shape: Sequence[int] | None=None) -> None:
@@ -389,11 +418,12 @@ class Writer:
     metadata: dict[str, object]
     local_checkpoint: Checkpoint | None
 
-    def __init__(self, dest: StrPath | None=None, *, variant: str | None=None, base: Checkpoint | None=None, resume: str | None=None, repo_id: str | None=None, endpoint: str | None=None, token: Token | None=None, cache_dir: StrPath | None=None) -> None:
+    def __init__(self, dest: StrPath | None=None, *, variant: str | None=None, base: Checkpoint | None=None, resume: str | None=None, repo_id: str | None=None, revision: str | None=None, endpoint: str | None=None, token: Token | None=None, cache_dir: StrPath | None=None) -> None:
         """Write an exact header-file path, or only the shared store when dest=None.
 
         The file is a handle into the shared local store that roots its data while it holds
-        this header; `materialize` makes the portable copy. `variant` names
+        this header; `materialize` makes the portable copy. With `repo_id`, commit makes a commit
+        and moves the private tag `revision` (default `main`) to it. `variant` names
         `model.<variant>.cozytensors` in a `repo_id` upload and is refused without `repo_id`.
         """
 

@@ -1677,8 +1677,6 @@ fn apply_adapters(
     Ok(())
 }
 
-/// The newest release of `org/name` at the Hub (a run naming none): the newest final release
-/// by version, else the newest pre-release; yanked ones never.
 /// A catalog read the Hub answered 404 to is the thing named absent there; any other failure
 /// is the read's.
 /// The Hub's own 404 names an absence; one without its envelope (`http_404`: a tunnel or proxy
@@ -1801,6 +1799,8 @@ fn keep_card(generation: &Path, card: &Card) {
     }
 }
 
+/// The newest release of `org/name` at the Hub (a run naming none), by the one version ordering
+/// (`newest_by`): the newest final release, else the newest pre-release; yanked ones never.
 fn newest_release(catalog: &Catalog, org: &str, name: &str) -> Result<String, Failure> {
     let card = catalog
         .package(org, name)
@@ -2166,6 +2166,16 @@ pub(crate) mod tests {
                             }
                             answer
                         }
+                        // A package card: one with finals, a pre-release and a yanked release, and
+                        // one with pre-releases only.
+                        ["", "v1", "packages", "acme", name @ ("pre" | "only-pre")] => {
+                            let releases = match *name {
+                                "pre" => r#"[{"release":"1.0.0"},{"release":"1.1.0rc1"},{"release":"1.2.0","yanked":true},{"release":"0.9.0"}]"#,
+                                _ => r#"[{"release":"1.0.0rc1"},{"release":"1.0.0rc2"}]"#,
+                            };
+                            let body = format!(r#"{{"package":{{"org":"acme","name":"{name}","created_at":"2026-10-01T00:00:00Z"}},"releases":{releases}}}"#);
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
+                        }
                         // The Hub's own refusal: its envelope names the absence.
                         _ => {
                             let body = r#"{"error":{"code":"package.not_found","message":"absent","remedy":""}}"#;
@@ -2330,6 +2340,15 @@ pub(crate) mod tests {
         let (code, message) = newest_release(&catalog, "acme", "nope").unwrap_err();
         assert_eq!(code, "package_absent");
         assert!(message.starts_with("acme/nope is not published at http://127.0.0.1:"), "{message}");
+    }
+
+    /// The newest release is a final before any pre-release, and never a yanked one.
+    #[test]
+    fn the_newest_release_is_a_final_before_any_pre_release() {
+        let origin = file_door(HashMap::new(), Arc::new(Mutex::new(vec![])), None);
+        let catalog = Catalog::new(&hub::Source::new(&origin, None, None).unwrap()).unwrap();
+        assert_eq!(newest_release(&catalog, "acme", "pre").unwrap(), "1.0.0");
+        assert_eq!(newest_release(&catalog, "acme", "only-pre").unwrap(), "1.0.0rc2");
     }
 
     /// The machine's own Runtime goes into an environment whose packages admit it; one whose
