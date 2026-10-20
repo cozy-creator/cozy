@@ -231,30 +231,6 @@ def main() -> None:
     except tfs.NotFoundError as e:
         assert e.code == "not_found" and isinstance(e, tfs.Error), e
 
-    # 3. A parsed header.
-    h = ck3.id.removeprefix("sha256:")
-    parsed = tfs.Checkpoint.parse((work / "c" / "blobs" / h[:2] / h[2:4] / h).read_bytes())
-    assert parsed.id is None and parsed.chunks == ck3.chunks and parsed.metadata == ck3.metadata
-    assert (parsed.pipeline is None) == (ck3.pipeline is None)
-    for name, c in ck3.components.items():
-        p = parsed.components[name]
-        assert (p.cls, p.config, p.assets) == (c.cls, c.config, c.assets), name
-    try:
-        parsed.components["extra"].asset("vocab.txt")
-        raise AssertionError("a parsed header has no assets here")
-    except tfs.UnsupportedError:
-        pass
-    for component, stored_component in ck.components.items():
-        tensors = stored_component.tensors
-        assert list(parsed.components[component].tensors) == list(tensors), component
-        for key, info in tensors.items():
-            assert (parsed.components[component].tensors[key].dtype, parsed.components[component].tensors[key].shape) == (info.dtype, info.shape)
-    try:
-        parsed.components["unet"].tensors.read("conv_in.weight", decode=True)
-        raise AssertionError("a parsed header has no chunks")
-    except tfs.UnsupportedError:
-        pass
-    print(f"parse: {sum(len(c.tensors) for c in parsed.components.values())} tensors, as stored")
     print("e2e: all green")
 
 

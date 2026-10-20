@@ -171,8 +171,9 @@ class Model:
         """F1 cold semantics: request payload eviction, leaving metadata caches alone."""
         if layout == "T64+rust":
             with self.checkpoint() as ck:
-                for index in range(len(ck.chunks)):
-                    fd = ck.open_chunk(index)
+                for sha, _ in ck.chunks:
+                    # The store is plain files: blobs/<aa>/<bb>/<sha256>.
+                    fd = os.open(Path(self.store) / "blobs" / sha[:2] / sha[2:4] / sha, os.O_RDONLY)
                     try:
                         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
                     finally:

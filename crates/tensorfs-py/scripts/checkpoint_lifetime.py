@@ -175,16 +175,6 @@ with tempfile.TemporaryDirectory() as temp:
         component = checkpoint.components["model"]
         part = raw.parts(checkpoint, "model", "weight")[""]
         chunk = checkpoint.chunks[part.chunk]
-        descriptor = checkpoint.open_chunk(part.chunk)
-        os.lseek(descriptor, part.offset, os.SEEK_SET)
-        assert os.read(descriptor, 4) == b"data"
-        try:
-            os.write(descriptor, b"x")
-        except OSError:
-            pass
-        else:
-            raise AssertionError("open_chunk returned a writable descriptor")
-        os.close(descriptor)
         blob = root / "source/chunks" / chunk[0]
         saved = blob.read_bytes()
         corrupted = bytes([saved[0] ^ 1]) + saved[1:]
@@ -201,9 +191,8 @@ with tempfile.TemporaryDirectory() as temp:
         assert checkpoint.header_ref in checkpoint.verify().corrupt
         header.write_bytes(saved_header)
         assert checkpoint.verify().ok
-        descriptor = checkpoint.open_chunk(part.chunk)
     for call in [lambda: checkpoint.components, lambda: checkpoint.missing(), lambda: checkpoint.download(),
-                 lambda: checkpoint.open_chunk(0), lambda: checkpoint.verify(), lambda: checkpoint.__enter__()]:
+                 lambda: checkpoint.verify(), lambda: checkpoint.__enter__()]:
         try:
             call()
         except tensorfs.InvalidError as error:
@@ -211,9 +200,6 @@ with tempfile.TemporaryDirectory() as temp:
         else:
             raise AssertionError("a closed checkpoint still accepted byte access")
     assert component.tensors.read("weight").tobytes() == b"data", "a with-block invalidated an external child"
-    os.lseek(descriptor, part.offset, os.SEEK_SET)
-    assert os.read(descriptor, 4) == b"data", "closing the parent closed the caller's descriptor"
-    os.close(descriptor)
 
     try:
         with tensorfs.open(root / "source", cache_dir=root / "exception") as checkpoint:

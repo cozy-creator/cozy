@@ -170,19 +170,6 @@ class HostReads(unittest.TestCase):
         self.assertEqual(out, self.big[1:18].tobytes())
         self.assertEqual(set(remote.missing()), before - {chunk})
 
-    def test_header_metadata_does_not_imply_local_bytes(self) -> None:
-        header = next((pathlib.Path(self.tmp.name) / "store").rglob(self.ck.id.removeprefix("sha256:")))
-        parsed = tfs.Checkpoint.parse(header.read_bytes())
-        tensors = parsed.components["model"].tensors
-        self.assertEqual(tensors.read([]), {})
-        with self.assertRaises(KeyError):
-            tensors.read(["plain", "absent"])
-        self.assertEqual(list(tensors), list(self.tensors))
-        for call in [lambda: tensors.read("plain"), lambda: tensors.read(),
-                     lambda: tensors.read_into("plain", bytearray(4))]:
-            with self.assertRaises(tfs.UnsupportedError):
-                call()
-
 
 if __name__ == "__main__":
     checks = unittest.main(verbosity=2, exit=False)

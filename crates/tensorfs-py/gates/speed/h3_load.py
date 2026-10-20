@@ -246,17 +246,15 @@ def memory_state():
     return state
 
 
-def physical_files(checkpoint):
+def physical_files(checkpoint, cache_dir):
     files = []
     for index, (sha, length) in enumerate(checkpoint.chunks):
-        fd = checkpoint.open_chunk(index)
-        try:
-            stat = os.fstat(fd)
-            require(stat.st_size == length, f"chunk {index} has wrong local length")
-            files.append({"index": index, "sha256": sha, "length": length,
-                          "path": os.readlink(f"/proc/self/fd/{fd}"), "device": stat.st_dev, "inode": stat.st_ino})
-        finally:
-            os.close(fd)
+        # The store is plain files: blobs/<aa>/<bb>/<sha256>.
+        path = Path(cache_dir) / "blobs" / sha[:2] / sha[2:4] / sha
+        stat = os.stat(path)
+        require(stat.st_size == length, f"chunk {index} has wrong local length")
+        files.append({"index": index, "sha256": sha, "length": length,
+                      "path": str(path), "device": stat.st_dev, "inode": stat.st_ino})
     return files
 
 
@@ -282,7 +280,7 @@ class Fixture:
                 part["control_key"] = part["component"] + "/" + part["name"]
             self.counts, self.payload = counts, plan["stored_bytes"]
             self.largest = max(p["length"] for p in self.parts)
-            self.source_files = physical_files(self.source)
+            self.source_files = physical_files(self.source, plan["cache_dir"])
             self.header, self.cache = self.work / "normalized.cozytensors", self.work / "tensorfs"
             self.st_files = [self.work / f"{c}.safetensors" for c in COMPONENTS]
         except BaseException:
@@ -318,7 +316,7 @@ class Fixture:
                 report = checkpoint.verify()
                 require(report.ok, "normalized TensorFS fixture failed verification")
                 self.normalized_id = checkpoint.id
-                self.normalized_files = physical_files(checkpoint)
+                self.normalized_files = physical_files(checkpoint, self.cache)
         except BaseException:
             if writer is not None:
                 writer.abandon()

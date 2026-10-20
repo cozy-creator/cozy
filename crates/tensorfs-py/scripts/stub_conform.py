@@ -414,15 +414,6 @@ def check_error_families(ext: Any) -> list[str]:
     for name, cls in live.items():
         if getattr(tensorfs, name, None) is not cls:
             faults.append(f"tensorfs.{name} does not re-export its native error family")
-    try:
-        ext.Checkpoint.parse(b"not a header")
-    except ext.Error as error:
-        if error.code != "invalid" or not isinstance(error.detail, str):
-            faults.append("Checkpoint.parse did not preserve its common typed failure")
-    except Exception as error:
-        faults.append(f"Checkpoint.parse escaped the common Error boundary: {type(error).__name__}")
-    else:
-        faults.append("Checkpoint.parse accepted invalid CBOR")
     return faults
 
 
