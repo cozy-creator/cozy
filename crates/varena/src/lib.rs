@@ -16,6 +16,7 @@ pub mod host;
 pub mod io;
 pub mod layout;
 pub mod ledger;
+pub mod plan;
 pub mod memory;
 pub mod window;
 
