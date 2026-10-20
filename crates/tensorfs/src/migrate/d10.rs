@@ -177,8 +177,6 @@ struct OldRelease {
     tree: Option<ObjectRef>,
     #[serde(default)]
     yanked: bool,
-    #[serde(default)]
-    revision: u64,
 }
 
 #[derive(Deserialize)]
@@ -242,7 +240,7 @@ impl<'t> Migrator<'t> {
         for r in &old.releases {
             let named = match (&r.tree, &r.lanes) {
                 (Some(tree), _) => {
-                    releases.push(Release { version: r.version.clone(), tree: tree.clone(), yanked: r.yanked, revision: r.revision });
+                    releases.push(Release { version: r.version.clone(), tree: tree.clone(), yanked: r.yanked });
                     continue;
                 }
                 (None, Some(named)) => named,
@@ -265,9 +263,9 @@ impl<'t> Migrator<'t> {
                 }
                 report.insert(name.clone(), lane.report.clone());
             }
-            let release = Release { version: r.version.clone(), tree: put(&mut objects, &tree)?, yanked: r.yanked, revision: r.revision + 1 };
+            let release = Release { version: r.version.clone(), tree: put(&mut objects, &tree)?, yanked: r.yanked };
             reports.push(json!({"version": release.version, "tree": release.tree.id(), "yanked": release.yanked,
-                "revision": release.revision, "lanes": report, "conflicts": conflicts}));
+                "lanes": report, "conflicts": conflicts}));
             releases.push(release);
         }
         let cited: Vec<&ObjectRef> = old.releases.iter().flat_map(|r| r.lanes.iter().flat_map(|l| l.values())).collect();

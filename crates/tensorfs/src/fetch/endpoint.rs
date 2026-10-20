@@ -547,17 +547,13 @@ impl Origin for Endpoint {
     }
 }
 
-/// `repo` (`name`'s, when there is none) naming `tree`: as release `version`, whose revision
-/// counts each change, or with none among the unreleased checkpoints.
+/// `repo` (`name`'s, when there is none) naming `tree`: as release `version`, or with none among
+/// the unreleased checkpoints.
 pub fn with_tree(repo: Option<Repo>, name: &str, tree: &ObjectRef, version: Option<&str>) -> Repo {
     let mut repo = repo.unwrap_or_else(|| Repo::new(name));
     match version {
         Some(version) => {
-            match repo.releases.iter_mut().find(|r| r.version == version) {
-                Some(r) if r.tree == *tree => {}
-                Some(r) => (r.tree, r.revision) = (tree.clone(), r.revision + 1),
-                None => repo.set_release(version, tree.clone()),
-            }
+            repo.set_release(version, tree.clone());
             repo.checkpoints.retain(|c| c != tree);
         }
         None if repo.roots().any(|r| r == tree) => {}

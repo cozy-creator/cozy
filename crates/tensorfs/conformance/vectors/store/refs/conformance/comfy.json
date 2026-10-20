@@ -1,1 +1,1 @@
-{"format":"tensorfs.repo/1","name":"Conformance/comfy","releases":[{"tree":{"length":253,"sha256":"7c33496d857d756ee5936779fd90c9a1ca8f399479267a05680e66e5ed961126"},"version":"1"}]}
+{"format":"cozytensors.repo/1","name":"Conformance/comfy","releases":[{"tree":{"length":256,"sha256":"cfdebcbed5ffbb0d31542f46e077b69195c0c7fb7abe4bc68669402071cea8d1"},"version":"1"}]}

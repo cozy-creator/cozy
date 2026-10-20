@@ -230,7 +230,7 @@ def modelopt_cases(tmp: Path, greens: list, reds: list):
         expect = to_l(L, spec(shape, raw(w), e4m3(raw(s)), g.numpy(), None if p is None else p.float().numpy()))
         key = f"modelopt-{'awq' if awq else 'nvfp4'}-{L.lower()}"
         print(f"{key}: against ModelOpt's dequantize: {differ(L, expect, raw(modelopt_dequant(f, m).to(dtype)))}")
-        params = dict(PARAMS, **({"pre_quant_scale_dtype": NAME[p.dtype]} if awq else {}))
+        params = PARAMS
         parts = [part("weight", "F4", shape, raw(w)), part("scale", "F8_E4M3", s.shape, raw(s)),
                  part("scale_2", "F32", g.shape, raw(g)), part("input_scale", "F32", i.shape, raw(i))]
         if awq:
@@ -241,16 +241,14 @@ def modelopt_cases(tmp: Path, greens: list, reds: list):
             tiles = to_blocked(s.view(torch.uint8).reshape(shape[0], -1), flatten=False)
             hw = ((w << 4) | (w >> 4)).to(torch.uint8)
             cparts = [part("weight", "F4", shape, raw(hw)), part("scale", "F8_E4M3", tiles.shape, raw(tiles))]
-            greens.append(case("comfy-awq-bf16", L, shape, dict(COMFY, pre_quant_scale_dtype="BF16"),
+            greens.append(case("comfy-awq-bf16", L, shape, COMFY,
                                cparts + parts[2:], expect))
             k = (dequantize_nvfp4(hw, g, tiles.view(torch.float8_e4m3fn), torch.bfloat16) * p).to(torch.bfloat16)
             print(f"comfy-awq-bf16: against comfy_kitchen x pre_quant_scale: {differ(L, expect, raw(k))}")
             red = lambda k, pr, ps: reds.append(case(k, L, shape, pr, ps))  # noqa: E731
             no_pqs = [x for x in parts if x["role"] != "pre_quant_scale"]
-            red("awq-param-missing", PARAMS, parts)
-            red("awq-part-missing", params, no_pqs)
-            red("awq-dtype-mismatch", dict(params, pre_quant_scale_dtype="F32"), parts)
-            red("awq-dtype-fp8", dict(params, pre_quant_scale_dtype="F8_E4M3"), parts)
+            red("awq-dtype-param", dict(params, pre_quant_scale_dtype="BF16"), parts)
+            red("awq-dtype-fp8", params, no_pqs + [part("pre_quant_scale", "F8_E4M3", p.shape, raw(p)[:p.numel()])])
             red("awq-pqs-count", params, no_pqs + [part("pre_quant_scale", "BF16", [32], raw(p[:32]))])
             two = [part("scale_2", "F32", [2], raw(g.reshape(1).repeat(2))) if x["role"] == "scale_2" else x
                    for x in parts]

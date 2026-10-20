@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # schemes/, also under
 from schemes import affine, blocks, decode, grid, table  # noqa: E402
 from schemes.base import Refused  # noqa: E402
 
-HEADER, TREE, REPO = "cozytensors/1", "tensorfs.tree/1", "tensorfs.repo/1"
+HEADER, TREE, REPO = "cozytensors/1", "cozytensors.tree/1", "cozytensors.repo/1"
 BITS = {
     "BOOL": 8, "F4": 4, "F6_E2M3": 6, "F6_E3M2": 6, "U8": 8, "I8": 8, "F8_E5M2": 8, "F8_E4M3": 8,
     "F8_E8M0": 8, "F8_E4M3FNUZ": 8, "F8_E5M2FNUZ": 8, "I16": 16, "U16": 16, "F16": 16, "BF16": 16,
@@ -156,8 +156,7 @@ def parse_repo(data: bytes) -> dict:
         need(version != "" and version not in seen, f"empty or repeated version {version!r}")
         seen.add(version)
         releases.append({"version": version, "tree": object_ref(field(r, "tree", dict)),
-                         "yanked": field(r, "yanked", bool, optional=True),
-                         "revision": field(r, "revision", int, optional=True)})
+                         "yanked": field(r, "yanked", bool, optional=True)})
     checkpoints = [object_ref(c) for c in field(doc, "checkpoints", list, optional=True)]
     return {"name": name, "releases": releases, "checkpoints": checkpoints}
 
