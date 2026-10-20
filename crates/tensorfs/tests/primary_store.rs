@@ -211,6 +211,31 @@ async fn empty_safetensors_materialization_returns_a_directory_and_refuses_a_fil
     assert_eq!(fs::read(file).unwrap(), b"keep me");
 }
 
+#[test]
+fn all_local_materialize_without_tokio_returns_unsupported_without_output() {
+    let scratch = Scratch::new();
+    let store = Store::open(scratch.0.join("store")).unwrap();
+    let (header, _) = seed(&store);
+    let mut config = Config::from_env();
+    config.cache_dir = store.root().to_path_buf();
+    config.token = None;
+    config.mirror = None;
+    let client = Client::new(config).unwrap();
+    let checkpoint = futures::executor::block_on(client.open(
+        &header.id(),
+        &Open {
+            local_files_only: true,
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    let directory = scratch.0.join("no-runtime");
+    let result =
+        futures::executor::block_on(checkpoint.materialize(&directory, Format::Cozytensors, None));
+    assert_eq!(result.unwrap_err().kind, Kind::Unsupported);
+    assert!(!directory.exists());
+}
+
 struct Http {
     url: String,
     requests: Arc<Mutex<Vec<String>>>,

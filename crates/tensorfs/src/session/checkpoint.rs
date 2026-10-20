@@ -249,6 +249,11 @@ impl Checkpoint {
                 );
             }
         }
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|error| crate::failure::Failure {
+                kind: Kind::Unsupported,
+                detail: format!("materialize requires a Tokio runtime: {error}"),
+            })?;
         match fs::metadata(dir) {
             Ok(metadata) if !metadata.is_dir() => {
                 return Err(super::io_failure(
@@ -263,7 +268,7 @@ impl Checkpoint {
         }
         self.prepare_export().await?;
         let (checkpoint, dir) = (self.clone(), dir.to_path_buf());
-        let worker = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        let worker = runtime.spawn_blocking(move || -> Result<PathBuf> {
             fs::create_dir_all(&dir).map_err(|error| super::io_failure(dir.display(), error))?;
             match format {
                 Format::Safetensors => checkpoint.export_to(&dir, dequantize.as_ref()),
