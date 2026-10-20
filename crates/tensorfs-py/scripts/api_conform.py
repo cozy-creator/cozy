@@ -81,7 +81,7 @@ with TemporaryDirectory() as temp:
     assert np.array_equal(np.from_dlpack(ck.components["model"].tensors.read("weight")), values)
     component = ck.components["model"]
     assert component.config == {"width": 6} and component.asset("tokenizer.json") == b"{}"
-    assert not hasattr(component, "path") and not hasattr(component, "config_file")
+    assert not hasattr(component, "path") and component.config_file == "config.json"
     assert isinstance(component.tensors["weight"], tensorfs.TensorMetadata)
     assert not hasattr(component.tensors["weight"], "parts") and not hasattr(component.tensors, "read_all")
     assert raw.parts(ck, "model", "weight")[""].length == values.nbytes
@@ -89,6 +89,9 @@ with TemporaryDirectory() as temp:
     assert sorted(p.name for p in support.iterdir()) == ["config.json", "tokenizer.json"]
     assert json.loads((support / "config.json").read_text()) == component.config
     assert (support / "tokenizer.json").read_bytes() == b"{}"
+    managed = Path(component.export_files())
+    assert managed.parent == root / "cache/snapshots" and Path(component.export_files()) == managed
+    assert sorted(p.name for p in managed.iterdir()) == ["config.json", "tokenizer.json"]
     handle = root / "saved.cozytensors"
     with tensorfs.Writer(handle) as saved:
         saved.component("model", cls="test.File", config={}).put("data", b"handle" * 4096, dtype="U8", shape=[6 * 4096])

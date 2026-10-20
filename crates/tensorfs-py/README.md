@@ -306,7 +306,8 @@ and quantized tensors return their encoded arrays and parameters. Use `decode=Tr
 above, when the consumer needs ordinary floating-point weights. Frameworks wrap arrays
 through their DLPack entry point. DLPack is the memory-sharing protocol, not a separate
 array library to install. `component.config` is structured JSON, `component.asset(name)` reads an asset,
-and explicit `component.export_files(directory)` is only a convenience for path-only loaders.
+and `component.export_files()` (a cache-managed folder, or the directory you name) is only a convenience for
+path-only loaders.
 
 ## Checkpoints and repositories
 

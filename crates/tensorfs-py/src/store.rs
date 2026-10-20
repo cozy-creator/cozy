@@ -447,6 +447,9 @@ pub struct PyComponent {
     cls: String,
     #[pyo3(get)]
     config: Py<PyDict>,
+    /// The file name `config` exports as: `config.json` unless the writer named another.
+    #[pyo3(get)]
+    config_file: String,
     /// `key -> TensorMetadata`, in construction order; reads go through the engine.
     #[pyo3(get)]
     tensors: Py<PyTensors>,
@@ -458,14 +461,16 @@ pub struct PyComponent {
 
 #[pymethods]
 impl PyComponent {
-    /// Export config and supporting files to an explicit compatibility directory.
-    fn export_files(&self, py: Python<'_>, directory: PathBuf) -> PyResult<PathBuf> {
+    /// Export config and supporting files to `directory`, or by default to a folder the cache
+    /// manages and evicts like its other entries.
+    #[pyo3(signature = (directory = None))]
+    fn export_files(&self, py: Python<'_>, directory: Option<PathBuf>) -> PyResult<PathBuf> {
         let checkpoint = self
             .ck
             .as_ref()
             .ok_or_else(|| invalid(py, "a parsed header has no support files here"))?;
         checkpoint.fetch_assets(py, &self.name, None)?;
-        py.detach(|| checkpoint.component(&self.name)?.export_files(&directory))
+        py.detach(|| checkpoint.component(&self.name)?.export_files(directory.as_deref()))
             .or_raise(py)
     }
     /// Asset `name`'s bytes; a parsed header has none.
@@ -856,6 +861,7 @@ impl PyCheckpoint {
                 name: c.name.clone(),
                 cls: c.class.clone(),
                 config: config_dict(py, &c.config)?.unbind(),
+                config_file: c.config_name().to_owned(),
                 tensors: Py::new(
                     py,
                     PyTensors::new(&c.name, self.tensor_dict(py, c)?, access.clone()),

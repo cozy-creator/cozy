@@ -197,11 +197,13 @@ declared chunks and component assets, not its enclosing repository files; checki
 shared chunk hashes that whole object. Other local I/O failures remain
 typed errors rather than being classified as corruption.
 
-A `Component` provides `name()`, `class()`, `config()`, `tensors()` and
-`assets()` metadata views. Its `read(key)` returns the tensor as stored, as Python's
-`decode=False`: `Read::Plain(Vec<u8>)`, or `Read::Encoded { dtype, shape, encoding, parts }`
-with the logical dtype and shape and each stored part's bytes by role. `read_decoded(key)`
-returns logical bytes in the tensor's dtype, as `decode=True`. `asset(name)` returns `Vec<u8>`.
+A `Component` provides `name()`, `class()`, `config()`, `config_file()`, `tensors()` and
+`assets()` metadata views. `config_file()` is the file name the config exports as
+(`config.json` unless the writer named another, such as `scheduler_config.json`). Its
+`read(key)` returns the tensor as stored, as Python's `decode=False`: `Read::Plain(Vec<u8>)`,
+or `Read::Encoded { dtype, shape, encoding, parts }` with the logical dtype and shape and
+each stored part's bytes by role. `read_decoded(key)` returns logical bytes in the tensor's
+dtype, as `decode=True`. `asset(name)` returns `Vec<u8>`.
 
 `read_into(key, &mut out, &ReadInto { role, decode, offset })` fills `out` from byte
 `offset`, as Python's `read_into`. A plain tensor gives its data. A `role` selects that stored
@@ -209,10 +211,11 @@ part, and `decode: true` an encoded tensor's logical bytes. An encoded tensor wi
 returns `Invalid` naming its roles; a role with `decode` is also `Invalid`.
 
 These direct configuration, file and tensor reads are the normal cozytensors integration
-path. `export_files(directory)` is only a convenience for
-libraries that require filenames: it explicitly writes configuration and supporting
-files and returns `PathBuf`, without exporting weights. Native consumers, including our
-Runtime, do not need that step. The I/O calls return `Result`.
+path. `export_files(Some(directory))` is only a convenience for libraries that require
+filenames: it writes configuration and supporting files, never weights, and returns
+`PathBuf`. `export_files(None)` writes them to a folder the cache manages and evicts like its
+other entries. Native consumers, including our Runtime, do not need that step. The I/O calls
+return `Result`.
 Selections control exactly which component/tensor/part/asset bytes are fetched, including
 when other model data happens to be present in the cache.
 

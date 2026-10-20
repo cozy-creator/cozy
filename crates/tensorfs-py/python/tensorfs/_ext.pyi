@@ -2,6 +2,7 @@
 
 from collections.abc import Buffer, Callable, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
 from os import PathLike
+from pathlib import Path
 from types import ModuleType
 from typing import Any, Protocol, TypeVar, overload
 
@@ -174,6 +175,9 @@ class Component:
     @property
     def config(self) -> dict[str, Any]: ...
     @property
+    def config_file(self) -> str:
+        """The file name `config` exports as: `config.json` unless the writer named another."""
+    @property
     def tensors(self) -> Tensors:
         """`key -> TensorMetadata`, in construction order."""
     @property
@@ -181,8 +185,9 @@ class Component:
         """`name -> (sha256, length)`: run data in the component's folder."""
     def asset(self, name: str) -> bytes:
         """An asset's bytes, fetched when absent."""
-    def export_files(self, directory: StrPath) -> str:
-        """Explicit compatibility export of config and assets only; never model weights."""
+    def export_files(self, directory: StrPath | None = None) -> Path:
+        """Config and assets only, never weights, written to `directory`, or by default to a
+        folder the cache manages and evicts like its other entries."""
 
 class Checkpoint:
     """One cozytensors read from a store."""

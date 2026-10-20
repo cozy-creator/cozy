@@ -70,6 +70,7 @@ A `Pipeline` has `cls` and `config`. A `Component` exposes:
 | `name` | Component name, such as `unet`. |
 | `cls` | Model class identifier. |
 | `config` | Parsed JSON configuration as a dictionary. |
+| `config_file` | The file name `config` exports as: `config.json` unless the writer named another. |
 | `tensors` | A `Tensors` mapping, described below. |
 | `assets` | Supporting filenames mapped to `(sha256_hex, byte_length)` references; this does not load file contents. |
 | `asset(name)` | Read a supporting file, fetching it if needed; returns `bytes`. |
@@ -86,10 +87,10 @@ print(list(tokenizer.assets))
 tokenizer_bytes = tokenizer.asset("tokenizer.json")
 ```
 
-For import/export compatibility, the format internally retains the filename to use
-when recreating a component's configuration file. For example, a scheduler can require
+For import/export compatibility, `config_file` is the filename to use when recreating a
+component's configuration file. For example, a scheduler can require
 `scheduler_config.json` rather than `config.json`. Loading directly from `config` does not
-require a filename; conversion preserves it automatically.
+require a filename; conversion and a `Writer(base=...)` rewrite preserve it.
 
 ### Inspect tensor metadata without reading weights
 
@@ -557,13 +558,18 @@ filenames; it is not a required preparation step.
 
 ```python
 # Only for a consumer that requires a directory:
+from transformers import CLIPTokenizer
+
+tokenizer = CLIPTokenizer.from_pretrained(checkpoint.components["tokenizer"].export_files())
 folder = checkpoint.components["tokenizer"].export_files("./tokenizer-files")
 ```
 
-`Component.export_files(directory)` explicitly writes configuration and supporting files,
-fetching any missing asset bytes. It returns the directory path and does not export tensor
-weights. Original filenames are preserved internally for compatibility. The full-checkpoint
-`tensorfs.materialize` operation also writes weight files when that is needed.
+`Component.export_files(directory=None)` writes configuration (as `config_file`) and
+supporting files, fetching any missing asset bytes, and returns the folder's path. It never
+exports tensor weights. Without a directory it writes to a folder the cache manages and
+evicts like its other entries; with one it writes there and leaves it to you. The
+full-checkpoint `tensorfs.materialize` operation also writes weight files when that is
+needed.
 
 #### Download files or publish a folder
 

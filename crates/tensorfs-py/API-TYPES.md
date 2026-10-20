@@ -12,6 +12,7 @@ The provider/DLPack protocols describe accepted inputs and are not additional pa
 from __future__ import annotations
 from collections.abc import Buffer, Callable, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
 from os import PathLike
+from pathlib import Path
 from types import TracebackType
 from typing import Any, Protocol, TypeVar, overload
 StrPath = str | PathLike[str]
@@ -261,6 +262,10 @@ class Component:
         ...
 
     @property
+    def config_file(self) -> str:
+        """The file name `config` exports as: `config.json` unless the writer named another."""
+
+    @property
     def tensors(self) -> Tensors:
         """`key -> TensorMetadata`, in construction order."""
 
@@ -271,8 +276,9 @@ class Component:
     def asset(self, name: str) -> bytes:
         """An asset's bytes, fetched when absent."""
 
-    def export_files(self, directory: str | PathLike[str]) -> str:
-        """Write configuration and supporting files for a file-based consumer; no tensor weights."""
+    def export_files(self, directory: str | PathLike[str] | None=None) -> Path:
+        """Write configuration and supporting files, no tensor weights, to `directory`, or by
+        default to a folder the cache manages and evicts like its other entries."""
         ...
 
     def __repr__(self) -> str:

@@ -129,6 +129,7 @@ impl Component {
     pub fn name(&self) -> &str;
     pub fn class(&self) -> &str;
     pub fn config(&self) -> &format::Config;
+    pub fn config_file(&self) -> &str; // the config's export name; config.json by default
     pub fn tensors(&self) -> &[format::Tensor];
     pub fn assets(&self) -> &BTreeMap<String, ObjectRef>;
     // Stored bytes (Python's decode=False); read_decoded is decode=True.
@@ -137,7 +138,8 @@ impl Component {
     // An encoded tensor with neither role nor decode returns Invalid, naming its roles.
     pub fn read_into(&self, key: &str, out: &mut [u8], options: &ReadInto<'_>) -> Result<()>;
     pub fn asset(&self, name: &str) -> Result<Vec<u8>>;
-    pub fn export_files(&self, directory: &Path) -> Result<PathBuf>;
+    // None: a folder the cache manages and evicts like its other entries.
+    pub fn export_files(&self, directory: Option<&Path>) -> Result<PathBuf>;
 }
 pub enum Read {
     Plain(Vec<u8>),

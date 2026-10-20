@@ -385,7 +385,7 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
         checkpoint
             .component("tokenizer")
             .unwrap()
-            .export_files(&support)
+            .export_files(Some(&support))
             .unwrap_err()
             .kind,
         Kind::NotFound
@@ -408,7 +408,7 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
     assert_eq!(
         fs::read(
             tokenizer
-                .export_files(&support)
+                .export_files(Some(&support))
                 .unwrap()
                 .join("tokenizer.json")
         )

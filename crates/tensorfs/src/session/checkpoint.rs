@@ -497,6 +497,10 @@ impl Component {
     pub fn config(&self) -> &format::Config {
         &self.metadata().config
     }
+    /// The file name the config exports as: `config.json` unless the writer named another.
+    pub fn config_file(&self) -> &str {
+        self.metadata().config_name()
+    }
     pub fn tensors(&self) -> &[format::Tensor] {
         &self.metadata().tensors
     }
@@ -608,10 +612,24 @@ impl Component {
     pub fn asset(&self, name: &str) -> Result<Vec<u8>> {
         Ok(self.data.raw.asset(&self.name, name)?)
     }
-    /// Write config and support files into the caller's directory, never model weights.
-    /// Download Selection::Assets first; this synchronous operation never downloads.
-    pub fn export_files(&self, dir: &Path) -> Result<PathBuf> {
-        Ok(self.data.raw.export_component_files(&self.name, dir)?)
+    /// Write config and support files, never weights, into `dir`; with `None`, into a folder
+    /// the cache manages and evicts like its other entries. Download Selection::Assets first;
+    /// this synchronous operation never downloads.
+    pub fn export_files(&self, dir: Option<&Path>) -> Result<PathBuf> {
+        let store = &self.data.store;
+        if let Some(dir) = dir {
+            store.cache_preserve_snapshot(dir)?;
+            return Ok(self.data.raw.export_component_files(&self.name, dir)?);
+        }
+        let identity = format!("{}:files:{}", self.data.raw.id().sha256, self.name);
+        let dir = store
+            .root()
+            .join("snapshots")
+            .join(crate::sha256::hex_digest(identity.as_bytes()));
+        let _directory = store.cache_directory(&dir)?;
+        self.data.raw.export_component_files(&self.name, &dir)?;
+        let _ = store.cache_maintain(0)?;
+        Ok(dir)
     }
 }
 
