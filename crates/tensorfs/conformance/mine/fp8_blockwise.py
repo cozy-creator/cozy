@@ -63,8 +63,7 @@ def b64(t: torch.Tensor) -> str:
 def case(key, weight, scale, block, out_dtype, expect, source=None, producer=""):
     c = {
         "component": "fp8_blockwise", "key": key, "dtype": DTYPES[out_dtype], "shape": list(weight.shape),
-        "encoding": {"scheme": "fp8.blockwise",
-                     "params": {"block_size": list(block), "scale_dtype": DTYPES[scale.dtype]}},
+        "encoding": {"scheme": "fp8.blockwise", "params": {"block_size": list(block)}},
         "parts": [{"role": "weight", "dtype": "F8_E4M3", "shape": list(weight.shape), "bits": b64(weight)},
                   {"role": "scale", "dtype": DTYPES[scale.dtype], "shape": list(scale.shape), "bits": b64(scale)}],
         "expect": b64(expect.to(out_dtype)), "producer": producer,
@@ -177,8 +176,8 @@ def refusals(base):
         twin("block-size-missing", encoding__params__block_size=None),
         twin("block-size-one-extent", encoding__params__block_size=[16]),
         twin("block-size-zero", encoding__params__block_size=[0, 16]),
-        twin("scale-dtype-not-the-part", encoding__params__scale_dtype="F32"),
-        twin("scale-dtype-u8", encoding__params__scale_dtype="U8", parts__1__dtype="U8", parts__1__bits=first(6)),
+        twin("scale-dtype-param", encoding__params__scale_dtype="BF16"),
+        twin("scale-u8", parts__1__dtype="U8", parts__1__bits=first(6)),
         twin("scale-whole-tiles-only", parts__1__shape=[1, 2], parts__1__bits=first(4)),
         twin("weight-e5m2", parts__0__dtype="F8_E5M2"),
         twin("logical-rank-1", shape=[960], parts__0__shape=[960]),

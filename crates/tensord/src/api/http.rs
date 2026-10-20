@@ -245,17 +245,22 @@ async fn keepalive<B: MachineBackend>(State(m): State<Machine<B>>, headers: Head
 }
 
 /// `PUT /v1/bearer`: the signer's newest ordinary bearer at the Hub `endpoint` names. Every later
-/// read there under its owner's access presents it, until one that expires later comes.
+/// read there under its owner's access presents it, until one that expires later comes, and the
+/// executors given the one it replaces hear of it.
 async fn bearer<B: MachineBackend>(State(m): State<Machine<B>>, headers: HeaderMap, body: Bytes) -> Answer {
     let caller = m.caller(&headers)?;
     caller.machine()?;
     let given: v1::TensorFSOptions = serde_json::from_slice(&body)
         .map_err(|e| Error::validation("invalid_request", format!("the bearer is not JSON: {e}")))?;
+    if !crate::hub::valid_origin(&given.endpoint) || given.token.is_empty() {
+        return Err(Error::validation("invalid_bearer", "a bearer names its Hub's origin and a token").into());
+    }
     let actor = crate::machine_api::actor_id(caller.actor);
-    crate::hub::valid_origin(&given.endpoint)
-        .then(|| crate::hub::Bearer::offer(&actor, &given.endpoint, &given.token, given.expires_unix_ms))
-        .flatten()
-        .ok_or_else(|| Error::validation("invalid_bearer", "a bearer names its Hub's origin and a token"))?;
+    blocking(&m.backend, move |_| {
+        crate::hub::Bearer::offer(&actor, &given.endpoint, &given.token, given.expires_unix_ms);
+        Ok(())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

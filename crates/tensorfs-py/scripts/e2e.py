@@ -76,7 +76,7 @@ def write(source: tensorfs.Checkpoint, dest: pathlib.Path, variant: str, store: 
                     weight = np.clip(np.round(values / scale[:, None]), -127, 127).astype(np.int8)
                     parts = {"weight": ("I8", shape, weight.tobytes()), "scale": ("F32", shape[:1], scale.astype(np.float32).tobytes())}
                     out.put_encoded(key, dtype="BF16", shape=shape, scheme="int8.rowwise",
-                                    params={"axis": 0, "scale_dtype": "F32"}, parts=parts)
+                                    params={}, parts=parts)
                 else:
                     bits = values.view(np.uint32)
                     out.put(key, ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).astype(np.uint16).tobytes(), dtype="BF16", shape=shape)

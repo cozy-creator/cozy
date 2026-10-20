@@ -57,9 +57,6 @@ pub struct Carrier {
     /// Params a module's marker states: param -> (marker key, the producer's own default).
     #[serde(default)]
     pub marker_params: BTreeMap<String, (String, u64)>,
-    /// Params naming a part's stored dtype: param -> part role (`scale_dtype` -> `scale`).
-    #[serde(default)]
-    pub dtype_params: BTreeMap<String, String>,
     /// Marker keys whose value this carrier decodes, and that value.
     #[serde(default)]
     pub marker_values: BTreeMap<String, Json>,
@@ -868,14 +865,6 @@ fn fit(
     }
     if let (Producer::Comfy, Some(conf)) = (carrier.producer, conf) {
         marker_keys(carrier, conf)?;
-    }
-    // A param naming an optional part's dtype is there exactly when the part is.
-    for (param, role) in &carrier.dtype_params {
-        match parts.iter().find(|p| p.role == *role) {
-            Some(part) => encoding.params.insert(param.clone(), Value::from(part.dtype.name())),
-            None if carrier.parts.iter().any(|r| r.role == *role && r.optional) => continue,
-            None => return Err(format!("no {role} part for {param}")),
-        };
     }
     Ok(Folded {
         encoding,

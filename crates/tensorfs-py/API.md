@@ -363,12 +363,12 @@ raw.decode_into(
     memoryview(out),
     dtype="F32",
     shape=[2, 4],
-    params={"axis": 0},
+    params={},
 )
 ```
 
 Host inputs and a host destination use the existing CPU decoder. The initial resident
-CUDA path supports `comfy.convrot_w4a4`, `comfy.asym_w4a8_int8` and `comfy.w6a8_int8`,
+CUDA path supports `int4.convrot`, `comfy.asym_w4a8_int8` and `comfy.w6a8_int8`,
 with F32, BF16 or F16 output. All parts and the destination must be on the same CUDA
 device. Mixed host/device placement and other resident CUDA schemes raise
 `UnsupportedError`; there is no CPU fallback or implicit weight upload. Device metadata

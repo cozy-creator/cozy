@@ -183,6 +183,9 @@ impl From<store::Error> for Failure {
 
 impl From<std::io::Error> for Failure {
     fn from(e: std::io::Error) -> Failure {
+        if let Some(failure) = e.get_ref().and_then(|cause| cause.downcast_ref::<Failure>()) {
+            return failure.clone();
+        }
         #[cfg(feature = "store")]
         if let Some(cuda) = e.get_ref().and_then(|cause| cause.downcast_ref::<crate::io::cuda::Error>()) {
             return cuda.clone().into();

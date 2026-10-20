@@ -1,10 +1,10 @@
-"""int8.tensorwise, int8.rowwise and int8.convrot (spec §6)."""
+"""int8.tensorwise, int8.rowwise, int8.columnwise and int8.convrot (spec §6)."""
 
 import numpy as np
 
 from . import affine, grid
 from .base import Part, Scheme, logical, one
-from .fp8 import axis_grid, per_axis
+from .fp8 import SCALE
 
 
 def weight(c) -> np.ndarray:
@@ -31,15 +31,17 @@ def convrot(c):
 
 
 SCHEMES = (
-    Scheme("int8.tensorwise", {"scale_dtype": ("F32", "BF16", "F16")},
-           (Part("weight", ("I8",), logical), Part("scale", "scale_dtype", one),
+    Scheme("int8.tensorwise", {},
+           (Part("weight", ("I8",), logical), Part("scale", SCALE, one),
             Part("input_scale", ("F32",), one, required=False)),
            lambda c: affine.dequant(weight(c), c.values("scale"), grid.TENSOR), flat=True),
-    Scheme("int8.rowwise", {"axis": (0, 1), "scale_dtype": ("F32", "BF16", "F16")},
-           (Part("weight", ("I8",), logical), Part("scale", "scale_dtype", per_axis)),
-           lambda c: affine.dequant(weight(c), c.values("scale"), axis_grid(c))),
-    Scheme("int8.convrot", {"rotation": ("kron_regular_h4",), "rotation_size": tuple(4**k for k in range(1, 9)),
-                            "scale_dtype": ("F32", "BF16", "F16")},
-           (Part("weight", ("I8",), logical), Part("scale", "scale_dtype", lambda c: grid.shape(grid.ROW, c))),
+    Scheme("int8.rowwise", {},
+           (Part("weight", ("I8",), logical), Part("scale", SCALE, lambda c: grid.shape(grid.ROW, c))),
+           lambda c: affine.dequant(weight(c), c.values("scale"), grid.ROW)),
+    Scheme("int8.columnwise", {},
+           (Part("weight", ("I8",), logical), Part("scale", SCALE, lambda c: grid.shape(grid.COL, c))),
+           lambda c: affine.dequant(weight(c), c.values("scale"), grid.COL)),
+    Scheme("int8.convrot", {"rotation": ("kron_regular_h4",), "rotation_size": tuple(4**k for k in range(1, 9))},
+           (Part("weight", ("I8",), logical), Part("scale", SCALE, lambda c: grid.shape(grid.ROW, c))),
            convrot),
 )

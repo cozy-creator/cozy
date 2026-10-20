@@ -45,9 +45,12 @@ mod comfy;
 pub static SCHEMES: &[&Scheme] = &[
     &fp8::TENSORWISE,
     &fp8::ROWWISE,
+    &fp8::COLUMNWISE,
     &int8::TENSORWISE,
     &int8::ROWWISE,
+    &int8::COLUMNWISE,
     &int8::CONVROT,
+    &comfy::INT4_CONVROT,
     &mxfp8::MXFP8,
     &nvfp4::NVFP4,
     // fp8.blockwise, mxfp4
@@ -89,7 +92,6 @@ pub static SCHEMES: &[&Scheme] = &[
     // comfy.*
     &comfy::ASYM_W4A8_INT8,
     &comfy::W6A8_INT8,
-    &comfy::CONVROT_W4A4,
 ];
 
 /// A scheme: its params, its parts and its decode, as spec §6 lists them.
@@ -127,8 +129,6 @@ pub enum Allowed {
     Bool,
     /// Values `check` accepts, as `what` describes them.
     Check(fn(&Value) -> bool, &'static str),
-    /// The dtype an optional part is stored in, one of these: present exactly when the part is.
-    PartDtype(&'static str, &'static [&'static str]),
 }
 
 pub struct Part {
@@ -158,11 +158,8 @@ impl Part {
     }
 }
 
-/// A part's allowed dtypes, by name: listed, or the one a text param names.
-pub enum Dtypes {
-    Of(&'static [&'static str]),
-    Param(&'static str),
-}
+/// A part's allowed dtypes, by name: the part's own dtype is authoritative.
+pub type Dtypes = &'static [&'static str];
 
 /// A part's required stored shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,11 +447,7 @@ fn run<R>(
         return Err(fail(format!("unknown param {key:?}")));
     }
     for p in scheme.params {
-        let ok = match (&p.allowed, params.get(p.key)) {
-            (Allowed::PartDtype(role, _), v) if !parts.contains_key(role) => v.is_none(),
-            (a, v) => v.is_some_and(|v| allowed(a, v)),
-        };
-        if !ok {
+        if !params.get(p.key).is_some_and(|v| allowed(&p.allowed, v)) {
             return Err(fail(format!(
                 "param {} is not {}",
                 p.key,
@@ -502,12 +495,9 @@ fn run<R>(
         let Some(p) = parts.get(rule.role) else {
             continue;
         };
-        let ok = match rule.dtypes {
-            Dtypes::Of(names) => names.contains(&p.dtype.name()),
-            Dtypes::Param(key) => ctx.text(key) == p.dtype.name(),
-        };
-        if !ok {
-            return Err(fail(format!("part {} is {}", rule.role, p.dtype)));
+        if !rule.dtypes.contains(&p.dtype.name()) {
+            let allowed = rule.dtypes.join(", ");
+            return Err(fail(format!("part {} is {}, not {allowed}", rule.role, p.dtype)));
         }
         let fits = match (rule.shape)(&ctx)? {
             Shape::Exact(want) => p.shape == want.as_slice(),
@@ -558,7 +548,6 @@ fn allowed(a: &Allowed, v: &Value) -> bool {
         Allowed::Range(lo, hi) => v.as_u64().is_some_and(|n| (*lo..=*hi).contains(&n)),
         Allowed::Bool => matches!(v, Value::Bool(_)),
         Allowed::Check(check, _) => check(v),
-        Allowed::PartDtype(_, list) => v.as_str().is_some_and(|s| list.contains(&s)),
     }
 }
 
@@ -569,7 +558,6 @@ fn describe(a: &Allowed) -> String {
         Allowed::Range(lo, hi) => format!("an integer in {lo}..={hi}"),
         Allowed::Bool => "a boolean".into(),
         Allowed::Check(_, what) => what.to_string(),
-        Allowed::PartDtype(role, list) => format!("one of {list:?} with part {role}, else absent"),
     }
 }
 

@@ -1,5 +1,5 @@
 //! The `tfs` binary: a synthetic checkpoint with every scheme exports to safetensors
-//! bit-identical to its stored parts (and to the reference decode with `--dequantize`),
+//! bit-identical to its stored parts (and to the reference decode with `--decode`),
 //! uploads to a directory endpoint that a second store downloads byte-identical, and `verify`
 //! reports a corrupted object.
 
@@ -10,7 +10,7 @@ use std::process::Command;
 
 use serde_json::Value as Json;
 use tensorfs::raw::regions;
-use tensorfs::format::{decode, Body, Dtype, PartBytes};
+use tensorfs::format::{decode, Body, PartBytes};
 use tensorfs::store::{Checkpoint, Store};
 
 struct Scratch(PathBuf);
@@ -135,11 +135,11 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
     };
     let k = |s: &str| format!("down_blocks.0.{s}");
     let want = [
-        ("fp8.tensorwise", k("attn1.to_v.weight"), [1024, 1024], r#"{scale_dtype: "F32"}"#),
-        ("fp8.rowwise", k("attn1.to_q.weight"), [1024, 1024], r#"{axis: 0, scale_dtype: "F32"}"#),
-        ("int8.tensorwise", k("attn2.to_v.weight"), [1024, 1024], r#"{scale_dtype: "F32"}"#),
-        ("int8.rowwise", k("attn2.to_k.weight"), [1024, 1024], r#"{axis: 0, scale_dtype: "F32"}"#),
-        ("int8.convrot", k("attn1.to_k.weight"), [1024, 1024], r#"{rotation: "kron_regular_h4", rotation_size: 256, scale_dtype: "F32"}"#),
+        ("fp8.tensorwise", k("attn1.to_v.weight"), [1024, 1024], r#"{}"#),
+        ("fp8.rowwise", k("attn1.to_q.weight"), [1024, 1024], r#"{}"#),
+        ("int8.tensorwise", k("attn2.to_v.weight"), [1024, 1024], r#"{}"#),
+        ("int8.rowwise", k("attn2.to_k.weight"), [1024, 1024], r#"{}"#),
+        ("int8.convrot", k("attn1.to_k.weight"), [1024, 1024], r#"{rotation: "kron_regular_h4", rotation_size: 256}"#),
         ("mxfp8", k("attn2.to_q.weight"), [1024, 1024], r#"{block_size: 32, scale_layout: "row_major"}"#),
         ("nvfp4", k("ff.net.0.proj.weight"), [1024, 4096], r#"{block_size: 16, global_scale: "multiply", nibble_order: "low_first", scale_layout: "row_major"}"#),
     ];
@@ -241,7 +241,7 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
     }
     assert!(checked > 20);
 
-    // Dequantized: each encoded tensor is the reference decode, rounded once to BF16.
+    // Decoded: each encoded tensor is the reference decode, in its logical dtype.
     let deq = dir.0.join("deq");
     ok(
         &a,
@@ -250,8 +250,7 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
             "local/syn",
             deq.to_str().unwrap(),
             "--safetensors",
-            "--dequantize",
-            "bf16",
+            "--decode",
         ],
     );
     let (tensors, meta) = safetensors(&deq.join("unet/diffusion_pytorch_model.safetensors"));
@@ -276,10 +275,10 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
                     )
                 })
                 .collect();
-            let want = decode(&Dtype::BF16, &t.shape, encoding, &views).unwrap();
+            let want = decode(&t.dtype, &t.shape, encoding, &views).unwrap();
             assert_eq!(
                 tensors[key],
-                ("BF16".to_owned(), t.shape.clone(), want),
+                (t.dtype.name().to_owned(), t.shape.clone(), want),
                 "{key}"
             );
         }

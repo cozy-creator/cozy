@@ -185,7 +185,6 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
                 version: "1".into(),
                 tree: tree(&mut put, &[("all", &variants["all"])]),
                 yanked: false,
-                revision: 0,
             }],
             checkpoints: vec![],
         };
@@ -220,18 +219,14 @@ fn write_family(files: &mut BTreeMap<String, Vec<u8>>, family: &str, cases: &[Ca
     let first = tree(&mut put, &[("all", all), ("spans", spans)]);
     let swapped = tree(&mut put, &[("all", spans), ("spans", all)]);
     let checkpoints = vec![tree(&mut put, &[("spans", spans)])];
-    let release = |version: &str, tree, yanked, revision| Release {
+    let release = |version: &str, tree, yanked| Release {
         version: version.into(),
         tree,
         yanked,
-        revision,
     };
     let repo = Repo {
         name: repo_name(family),
-        releases: vec![
-            release("1", first, false, 3),
-            release("2", swapped, true, 0),
-        ],
+        releases: vec![release("1", first, false), release("2", swapped, true)],
         checkpoints,
     };
     files.insert(repo.key(), repo.to_json().unwrap());

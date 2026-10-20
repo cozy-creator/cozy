@@ -28,7 +28,7 @@ from . import bnb
 # comfy
 from . import comfy
 
-from .base import Ctx, PartDtype, Refused
+from .base import Ctx, Refused
 
 FAMILIES = (
     fp8,
@@ -82,12 +82,10 @@ def _decode(dtype, shape, encoding, parts) -> bytes:
     roles = {p.role for p in scheme.parts}
     if not {p.role for p in scheme.parts if p.required} <= parts.keys() <= roles:
         raise fail(f"parts {sorted(parts)}")
-    need = {k for k, r in scheme.params.items() if not isinstance(r, PartDtype) or r.role in parts}
-    if params.keys() != need:  # all required; an unknown one is refused
+    if params.keys() != scheme.params.keys():  # all required; an unknown one is refused
         raise fail(f"params {sorted(params)}")
-    for key in need:
-        rule = scheme.params[key]
-        if not allowed(rule.dtypes if isinstance(rule, PartDtype) else rule, params[key]):
+    for key, rule in scheme.params.items():
+        if not allowed(rule, params[key]):
             raise fail(f"param {key}={params[key]!r}")
     if dtype not in ("F32", "BF16", "F16"):
         raise fail(f"logical dtype {dtype}")
@@ -109,10 +107,9 @@ def _decode(dtype, shape, encoding, parts) -> bytes:
         if rule.role not in parts:
             continue
         pd, ps, _ = parts[rule.role]
-        names = (params[rule.dtypes],) if isinstance(rule.dtypes, str) else rule.dtypes
         kind, want = rule.shape(c)
         fits = ps == list(want) if kind == "exact" else int(np.prod(ps, dtype=np.int64)) == want
-        if pd not in names or not fits:
+        if pd not in rule.dtypes or not fits:
             raise fail(f"part {rule.role} is {pd} {ps}")
     out = np.asarray(scheme.decode(c), np.float32)
     if transposed:

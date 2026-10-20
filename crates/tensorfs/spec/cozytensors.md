@@ -176,7 +176,16 @@ read them.
 - Component folders, layer names and tensor keys are the upstream on-disk names: the component's Diffusers or
   Transformers folder (`unet`, `text_encoder`, `transformer`, `vae`) and the keys of its upstream `*.safetensors`
   state dict, unchanged.
-- LoRAs are stored under the upstream module names they adapt, with PEFT's `lora_A` and `lora_B` keys.
+- LoRAs are stored under the upstream module names they adapt, with PEFT's `lora_A` and `lora_B` keys:
+  `<module>.lora_A.weight` `[r, in]` and `<module>.lora_B.weight` `[out, r]`, `r` being `lora_A`'s rows. A module
+  adapts its base weight `W [out, in]` as `W' = W + (α / r) · (B · A)`. `α` is the module's scalar `<module>.alpha`
+  when the component has one, else the component config's `lora_alpha`, else `r` (a scale of 1).
+- A LoRA component's config is PEFT's `adapter_config.json` (`config_file`; `peft_type: "LORA"`,
+  `base_model_name_or_path`, `r`, `lora_alpha`, `target_modules`, …). A converter normalizes the scale at ingest:
+  PEFT's `alpha_pattern` (and rsLoRA's `α / √r`) become each module's `.alpha`, its `rank_pattern` is each
+  `lora_A`'s rows already, and both are left empty in the config. Kohya's `<module>.alpha` stays as it is, and its
+  training metadata maps to the config (`ss_network_dim` is `r`, `ss_network_alpha` `lora_alpha`,
+  `ss_sd_model_name` the base model).
 - A writer MUST NOT deviate from these names unless the deviation is listed below with its written, measured reason.
 
 | Model | Upstream name | Stored name | Measured reason |
@@ -229,10 +238,12 @@ formats are `element.granularity` (`fp8.tensorwise`, `int8.rowwise`, `fp8.blockw
 is `producer.type` with the producer's type name verbatim (`gguf.q4_k`, `gptq.int4`, `awq.int4`, `ct.int4`,
 `bnb.nf4`), and a vendor-neutral standard keeps its bare name (`mxfp4`, `mxfp8`, `nvfp4`).
 
-**Params** are snake_case keys in the producer's vocabulary (`axis`, `block_size`, `rotation`, `rotation_size`,
+**Params** are snake_case keys in the producer's vocabulary (`block_size`, `rotation`, `rotation_size`,
 `global_scale`, `nibble_order`, `scale_layout`). Every param the decode reads is required and none has a default, so
 the encoding shows the whole recipe. A param never repeats a part's dtype: each part carries its own (§4), the
-scheme lists the dtypes it allows, and the part's dtype is the one the decode reads.
+scheme lists the dtypes it allows, and the part's dtype is the one the decode reads. Nor does a param choose what a
+part means: a scale on the rows and one on the columns are two schemes (`fp8.rowwise`, `fp8.columnwise`). Roles
+name what a part is (`weight`, `scale`, `group_scale`, `codebook`, `correction`), the same across schemes.
 
 **Four rules** bring any format in without new grammar:
 1. *Keep the producer's bytes.* Parts are the producer's packed bytes (int words, nibbles, block structs, swizzled
@@ -337,20 +348,20 @@ the framework's key and shape. `mxfp4` has the param.
   `input_scale` (optional).
 - Decode, any shape: `round_L(weight × scale)`.
 
-### `fp8.rowwise`
+### `fp8.rowwise`, `fp8.columnwise`
 
-- Params: `axis`: `0` or `1`.
+- Params: none.
 - Parts: `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F32`, `BF16` or `F16`, on the row grid
-  (`axis: 0`) or the column grid (`axis: 1`).
+  (`rowwise`) or the column grid (`columnwise`).
 - Decode: `round_L(weight[i, j] × s(i, j))`.
 
 ### `int8.tensorwise`
 
 - Params, parts and decode as `fp8.tensorwise`, with `weight` `I8`.
 
-### `int8.rowwise`
+### `int8.rowwise`, `int8.columnwise`
 
-- Params, parts and decode as `fp8.rowwise`, with `weight` `I8`.
+- Params, parts and decode as `fp8.rowwise` and `fp8.columnwise`, with `weight` `I8`.
 
 ### `int8.convrot`
 
@@ -366,6 +377,17 @@ Kronecker power of `[[1, 1], [1, −1]]`: the two differ in every row. `H_B` is 
 `H_B · H_B = B · I`, so `2^−k · H_B` is the orthonormal rotation ComfyUI's ConvRot applies before quantizing each
 row. `y` is an exact integer (|y| ≤ 128·B ≤ 2^23), so its conversion to f32 is exact. One way to compute it: view
 each group of `B` as `k` base-4 digits (most significant first) and apply `H₄` along every digit.
+
+### `int4.convrot`
+
+`int8.convrot` with signed 4-bit codes: comfy-kitchen's `TensorCoreConvRotW4A4Layout`, which ComfyUI stores as
+`<key>.weight` and `.weight_scale` with the marker's `convrot_groupsize` (format `convrot_w4a4`).
+- Params: `rotation: "kron_regular_h4"`; `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8`.
+- Parts: `weight`: `I8 [lead…, C/2]`, `C` a multiple of `B`: 4-bit codes packed as `comfy.asym_w4a8_int8`'s, each a
+  two's-complement integer (−8 … 7). `scale`: `F32` on the row grid.
+- Decode: `round_L((y[i, g, j] × scale[i]) × 2^−k)`, `y` as `int8.convrot`'s with these codes as `weight`.
+
+The marker's `quant_group_size` (64) is the activations' group and enters no decode.
 
 ### `mxfp8`
 
@@ -575,45 +597,36 @@ LLM.int8() weights (Transformers' `load_in_8bit`), one absmax per output row.
 
 ### `comfy.asym_w4a8_int8`, `comfy.w6a8_int8`
 
-comfy-kitchen's `AsymW4A8Int8Layout` at 4 and 6 bits, as ComfyUI stores it (`<key>.weight`, `.weight_s_rel`,
-`.weight_s_channel`, `.weight_codebook`, `.weight_correction`; the marker's `group_size` and `convrot_groupsize`):
-`b`-bit codes (`b` is 4 or 6) in the rotated basis, requantized to int8 by a scale per group of `g` inputs, then
-rotated back by `kron_regular_h4` per block of `B` inputs and scaled per row.
+comfy-kitchen's `AsymW4A8Int8Layout` at 4 and 6 bits: `b`-bit codes (`b` is 4 or 6) in the rotated basis,
+requantized to int8 by a scale per group of `g` inputs, then rotated back by `kron_regular_h4` per block of `B`
+inputs and scaled per row. The split-plane packing, codebook and correction are kitchen's own, so the names stay.
+ComfyUI stores the parts as `<key>.weight`, `.weight_s_channel` (`scale`), `.weight_s_rel` (`group_scale`),
+`.weight_codebook` (`codebook`) and `.weight_correction` (`correction`), with the marker's `group_size` and
+`convrot_groupsize`.
 - Params: `group_size`: `g`, for `asym_w4a8_int8` 4, 8 or a multiple of 16, for `w6a8_int8` a multiple of 16;
-  `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8`.
+  `rotation: "kron_regular_h4"`; `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8`.
 - Parts:
   - `weight`: `I8 [lead…, C·b/8]`, `C` a multiple of `B` and of `g`. A row is `C/2` bytes of unsigned 4-bit codes,
     column `j` in bits `4·(j mod 2)` of byte `⌊j/2⌋`; at 6 bits, then `C/4` bytes of each code's two high bits,
     column `j` in bits `2·(j mod 4)` of byte `C/2 + ⌊j/4⌋`.
-  - `weight_s_rel`: `F8_E4M3` or `F32` on row blocks of `g`, `row_major`.
-  - `weight_s_channel`: `F32` on the row grid.
-  - `weight_codebook` (optional, `asym_w4a8_int8` only): `F32`, 16 elements, any shape.
-  - `weight_correction` (optional, `asym_w4a8_int8` only): `F32`, `BF16` or `F16` on row blocks of `g`,
-    `transposed` (`[C/g, R]`).
+  - `group_scale`: `F8_E4M3` or `F32` on row blocks of `g`, `row_major`.
+  - `scale`: `F32` on the row grid.
+  - `codebook` (optional, `asym_w4a8_int8` only): `F32`, 16 elements, any shape.
+  - `correction` (optional, `asym_w4a8_int8` only): `F32`, `BF16` or `F16` on row blocks of `g`, `transposed`
+    (`[C/g, R]`).
 - Decode, with `y` and `k` as `int8.convrot`:
-  1. The level: `v = weight_codebook[q]`, or `q − 2^(b−1)` without a codebook.
-  2. `q8[i, j] = clamp(round(v × s_rel(i, j)), −127, 127)`, the product one f32 multiply rounded to nearest, ties to
-     even; a NaN product refuses the decode.
+  1. The level: `v = codebook[q]`, or `q − 2^(b−1)` without a codebook.
+  2. `q8[i, j] = clamp(round(v × group_scale(i, j)), −127, 127)`, the product one f32 multiply rounded to nearest,
+     ties to even; a NaN product refuses the decode.
   3. `y[i, g, ·] = q8[i, gB : gB + B] · H_B`, exact.
-  4. `value[i, gB + j] = round_L(((y[i, g, j] × s_channel[i]) + z(i, gB + j)) × 2^−k)`, with `+ z` only where there
-     is a `weight_correction`: `z(i, c) = Σ_h corr(i, h) × M_h(c)` over the groups `h` that meet `c`'s block, in
+  4. `value[i, gB + j] = round_L(((y[i, g, j] × scale[i]) + z(i, gB + j)) × 2^−k)`, with `+ z` only where there
+     is a `correction`: `z(i, c) = Σ_h corr(i, h) × M_h(c)` over the groups `h` that meet `c`'s block, in
      ascending order, summed left to right from the first term. `M_h(c)` is the exact integer sum of column
      `c mod B` of `H_B` over the rows of the block that group `h` covers.
 
 The codebook is kitchen's 16 levels (a frozen Lloyd-Max table, or one fitted to the layer); without one the grid is
-uniform. `weight_correction` is kitchen's asymmetric grid's per-group offset in the rotated basis, which the
-rotation carries back with the block.
-
-### `comfy.convrot_w4a4`
-
-comfy-kitchen's `TensorCoreConvRotW4A4Layout` (`<key>.weight`, `.weight_scale`; the marker's `convrot_groupsize`):
-`int8.convrot` with signed 4-bit codes.
-- Params: `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8`.
-- Parts: `weight`: `I8 [lead…, C/2]`, `C` a multiple of `B`: 4-bit codes packed as `asym_w4a8_int8`'s, each a
-  two's-complement integer (−8 … 7). `weight_scale`: `F32` on the row grid.
-- Decode: `round_L((y[i, g, j] × weight_scale[i]) × 2^−k)`, `y` as `int8.convrot`'s with these codes as `weight`.
-
-The marker's `quant_group_size` (64) is the activations' group and enters no decode.
+uniform. `correction` is kitchen's asymmetric grid's per-group offset in the rotated basis, which the rotation
+carries back with the block.
 
 ### Plain tensors
 
@@ -769,7 +782,7 @@ The layout depends only on the header, so every object's offset follows from it.
 A scheme's constants (rule 2). Each table is listed in row-major order with its dtype and shape; its SHA-256 is that
 of its little-endian bytes in that dtype, and a reader MAY check its copy against it.
 
-### A.1 `H₄` (`kron_regular_h4`: `int8.convrot`, `comfy.*`)
+### A.1 `H₄` (`kron_regular_h4`: `int8.convrot`, `int4.convrot`, `comfy.*`)
 
 `I8 [4, 4]`, SHA-256 `8f2b2e629d1df5e0be97981cbf4b4d117c320dfec29a7cd72b2f497dcb680cea`:
 

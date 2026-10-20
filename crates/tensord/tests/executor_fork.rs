@@ -120,6 +120,7 @@ fn a_forked_executor_is_sealed_serves_and_is_reaped_with_its_status() {
             start(&generation, &interface, false),
             DeviceCommand::Load {
                 tensorfs: None,
+                actor: String::new(),
                 construction: "lifecycle".into(),
                 devices: String::new(),
                 sequence_parallel_degree: 1,

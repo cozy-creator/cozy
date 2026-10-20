@@ -1,7 +1,7 @@
 //! `fp8.blockwise`: one scale per tile, by the convention of each scale dtype's producer, bit for
-//! bit. `F32` and `F8_E8M0`: transformers' FineGrainedFP8 (DeepSeek's `weight_scale_inv`;
-//! `scale_fmt: ue8m0` rounds it up to a power of two). `BF16` and `F16`: compressed-tensors'
-//! block strategy (llm-compressor's FP8_BLOCK). Edge tiles may be short.
+//! bit. `F32` (the registry's `quantize`) and `F8_E8M0`: transformers' FineGrainedFP8 (DeepSeek's
+//! `weight_scale_inv`; `scale_fmt: ue8m0` rounds it up to a power of two). `BF16` and `F16`:
+//! compressed-tensors' block strategy (llm-compressor's FP8_BLOCK). Edge tiles may be short.
 
 use super::{elem, encoding, Encoder, Input, OwnedPart};
 use crate::format::decode::{bf16, elem as exact, f16};
@@ -9,18 +9,15 @@ use crate::format::{Dtype, Encoding, Error, Result, Value};
 
 pub const ENCODER: Encoder = Encoder {
     scheme: "fp8.blockwise",
-    quantize: Some(quantize),
+    quantize: Some(|i| quantize_fp8_blockwise(i, &Dtype::F32)),
     pack: None,
 };
 
 impl Encoding {
-    /// Tiles of `rows × cols`, the scale stored as `scale` (`F32`, `BF16`, `F16` or `F8_E8M0`).
-    pub fn fp8_blockwise(rows: u64, cols: u64, scale: &Dtype) -> Encoding {
+    /// Tiles of `rows × cols`; the scale part is `F32`, `BF16`, `F16` or `F8_E8M0`.
+    pub fn fp8_blockwise(rows: u64, cols: u64) -> Encoding {
         let size = Value::List(vec![rows.into(), cols.into()]);
-        encoding(
-            "fp8.blockwise",
-            &[("block_size", size), ("scale_dtype", scale.name().into())],
-        )
+        encoding("fp8.blockwise", &[("block_size", size)])
     }
 }
 
@@ -81,7 +78,8 @@ fn tile(dtype: &Dtype, x: &[f32]) -> (Vec<u8>, Vec<u8>) {
     ((h.to)(s).to_le_bytes().to_vec(), codes(&|v| round(v / s)))
 }
 
-fn quantize(input: &Input) -> Result<Vec<OwnedPart>> {
+/// The parts of `input.encoding` with the scale stored as `scale`, by that dtype's producer.
+pub fn quantize_fp8_blockwise(input: &Input, scale: &Dtype) -> Result<Vec<OwnedPart>> {
     let fail = |d: String| Error::Encode(format!("fp8.blockwise: {d}"));
     let p = &input.encoding.params;
     let size = match p.get("block_size") {
@@ -97,9 +95,9 @@ fn quantize(input: &Input) -> Result<Vec<OwnedPart>> {
     else {
         return Err(fail("block_size is not [rows, cols]".into()));
     };
-    let dtype = match p.get("scale_dtype").and_then(Value::as_str) {
-        Some(n @ ("F32" | "BF16" | "F16" | "F8_E8M0")) => Dtype::parse(n),
-        _ => return Err(fail("scale_dtype is not F32, BF16, F16 or F8_E8M0".into())),
+    let dtype = match scale {
+        Dtype::F32 | Dtype::BF16 | Dtype::F16 | Dtype::F8_E8M0 => scale.clone(),
+        _ => return Err(fail(format!("a {scale} scale is not F32, BF16, F16 or F8_E8M0"))),
     };
     let x = input.values()?;
     let shape = input.shape;

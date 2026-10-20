@@ -143,7 +143,7 @@ row_scales = scales.squeeze(1)
 # weights_i8 and row_scales are ready for a matching rowwise-INT8 kernel.
 ```
 
-This target representation is `int8.rowwise` with `axis=0` and an `F32` `scale` part.
+This target representation is `int8.rowwise` with an `F32` `scale` part per row.
 TensorFS handles the source encoding; the target quantizer above is ordinary PyTorch code.
 TensorFS has no re-encoding call: `ComponentWriter.put_encoded(...)` stores already-encoded arrays.
 Prepare this once when loading, rather than on every forward pass. Re-quantizing can add error;

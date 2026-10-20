@@ -96,7 +96,6 @@ fn repo(name: &str, tree: ObjectRef) -> Repo {
             version: "1.0".into(),
             tree,
             yanked: false,
-            revision: 0,
         }],
         ..Default::default()
     }

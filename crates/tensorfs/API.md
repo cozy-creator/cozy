@@ -273,7 +273,7 @@ placement, lengths, alignment and input/output overlap before writing.
 
 All-host spans use the CPU decoder. All-CUDA spans must share one device and use a
 supported resident-input scheme; the initial target covers `comfy.asym_w4a8_int8`,
-`comfy.w6a8_int8` and `comfy.convrot_w4a4`. Mixed host/device input, file/zero sources and
+`comfy.w6a8_int8` and `int4.convrot`. Mixed host/device input, file/zero sources and
 implicit transfers are refused. Keep input allocations alive, the output exclusively
 writable, and producer/output streams valid in that device's primary context on the
 calling thread. Rust's raw pointers do not enforce these requirements for you.

@@ -383,6 +383,8 @@ class Model:
         #: torch bytes its passes allocated above their start in its last request; -1 unmeasured
         self.reserve = -1
         self.mark = (0, 0, 0)
+        #: `Memory.demands` as its pass started
+        self.demands = 0
         self.handles: list[RemovableHandle] = []
         self.track = cuts.Track(name)
 
@@ -521,10 +523,11 @@ class Memory:
         self.landing: dict[Model, set[int]] = {}
         #: demand made room in the step running now: no prefetch refills it until the plan moves
         self.starved = False
+        #: times the catch's rungs made room (an op short of memory): a pass they ran in
+        #: copies no block ahead from then on, since the next run would take it again
+        self.demands = 0
         #: host tiers sealed here for the executor to deposit
         self.deposits: list[tuple[Model, int]] = []
-        #: granted host tiers adopted before their modules exist (`adopt`), by grant key
-        self.adopted: dict[str, WeightSet] = {}
         #: its requests waiting for room (§2), counted under `freeing`
         self.waiting = 0
         self.freeing = threading.Lock()
@@ -601,36 +604,6 @@ class Memory:
         self._publish()
         return model
 
-    def adopt(self, grant: WeightGrant) -> None:
-        """Before its module is built: the host tier granted for it (`grant.host_fd`), registered
-        from the regions it carries, its copies to the GPU started into free room. `load` binds
-        the module to it when the module's regions are the same; else it is a miss, and the
-        module loads as if nothing were granted."""
-        if grant.host_fd is None:
-            return
-        with self.lock:
-            ws = self.core.adopt(self._name(grant.key), grant.ck, grant.host_fd)
-            self._share(ws, grant)
-            self.adopted[grant.key] = ws
-            room = self._free() if self.cuda else 0
-            for region, span in enumerate(ws.spans):
-                if span > room:
-                    break
-                try:
-                    ws.prefetch(region)
-                except DeviceFull:
-                    break
-                room -= span
-        self._publish()
-
-    def unclaimed(self) -> None:
-        """Let go of what `adopt` took that no `load` bound."""
-        with self.lock:
-            adopted, self.adopted = self.adopted, {}
-        for ws in adopted.values():
-            ws.close()
-        self._publish()
-
     def _share(self, ws: WeightSet, grant: WeightGrant) -> None:
         """Under TensorD, a set's home pages can be kept past this process; pages a gone
         executor kept for it map now, no copy, when they hold what this set holds."""
@@ -639,7 +612,7 @@ class Memory:
                 ws.adopt_pages(list(grant.pages))
 
     def _name(self, key: str) -> str:
-        taken = {*self.models, *(ws.name for ws in self.adopted.values())}
+        taken = set(self.models)
         name, n = key, 1
         while name in taken:
             n += 1
@@ -658,26 +631,22 @@ class Memory:
         if grant is None:
             raise Unbound(f"{type(module).__name__}: no weights attached (`Declared.weights`)")
         paths, regions = blocks_of(module), regions_of(module)
+        # One load, fresh or after a restart: the held host layout TensorD granted, else one sealed
+        # now; then the pages a gone executor kept of it, a cache hit (a fill's are never kept)
         host_fd = grant.host_fd
-        ws = self.adopted.pop(grant.key, None)
-        if self.cuda and declared.fill is not None and ws is not None:
-            ws.close()
-            ws = None
-        if ws is None and host_fd is not None:
+        ws, sealed = None, None
+        if host_fd is not None:
             ws = self.core.adopt(self._name(grant.key), grant.ck, host_fd)
-            if declared.fill is None:
-                self._share(ws, grant)
-        if ws is not None and ws.regions != regions:
-            ws.close()
-            ws, host_fd = None, None
-        sealed = None
+            if ws.regions != regions:
+                ws.close()
+                ws, host_fd = None, None
         if ws is None:
             name = self._name(grant.key)
             if host_fd is None and self.cuda and self.granted:
                 host_fd = sealed = seal(grant.ck, regions, name)
             ws = self.core.register(name, grant.ck, regions, host_fd)
-            if declared.fill is None:
-                self._share(ws, grant)
+        if declared.fill is None:
+            self._share(ws, grant)
         model = Model(self, ws.name, grant.key, module, ws, declared)
         if sealed is not None:
             self.deposits.append((model, sealed))
@@ -780,7 +749,9 @@ class Memory:
             held = held and room - model.reserve >= whole
             loose = not held and room - need >= 2 * max(sizes) if need is not None else False
             if need is not None and (need <= model.reserve or loose):
-                shape.whole_only |= need <= model.reserve  # type: ignore[union-attr]
+                # only an FFN cut that measured no lower than whole rules out planning's
+                ruled_out = need <= model.reserve and cuts.ffn_only(shape)
+                shape.whole_only |= ruled_out  # type: ignore[union-attr]
                 cuts.coarser(shape)  # type: ignore[arg-type]
                 model.reserve = need
             room -= model.reserve
@@ -907,6 +878,7 @@ class Memory:
             if moved or model.planned != self.epoch:
                 model.planned = self.epoch
                 self._plan(model)
+            model.demands = self.demands
         model.seen[block.index] = None
 
     def _step(self, model: Model) -> None:
@@ -933,10 +905,12 @@ class Memory:
         self._running()
 
     def _prefetch(self, block: Block) -> None:
-        """Copy the next blocks of the recorded order now, unless they are resident."""
+        """Copy the next blocks of the recorded order now, unless they are resident, or the
+        catch made room in this pass (its rungs take prefetched pages first: none after
+        starved)."""
         model = block.model
         at = model.position.get(block.index)
-        if at is None:
+        if at is None or model.demands != self.demands:
             return
         for ahead in range(1, _AHEAD + 1):
             nxt = model.order[(at + ahead) % len(model.order)]
@@ -1065,6 +1039,7 @@ class Memory:
         if not self._here(device):
             return False
         with self.lock:  # the allocation just failed: `need` free, past a limit overrun too
+            self.demands += 1
             freed = self._free_upto(max(self._free(), 0) + need, "out of memory")
             self._cap()
             return freed
@@ -1075,7 +1050,7 @@ class Memory:
         if not self._here(device):
             return False
         with self.lock:
-            self.starved = True
+            self.starved, self.demands = True, self.demands + 1
             target = max(self._free(), 0) + max(need, 1)
             self._lower_until(target, "out of memory", None)
             self._last(target, "out of memory")
@@ -1283,15 +1258,14 @@ class Memory:
         resident = {s.name: int(s.resident) for s in self.core.stats().sets}  # type: ignore[union-attr]
         models = list(self.models.values())
         bytes_of = lambda ms: sum(resident.get(m.name, 0) for m in ms)  # noqa: E731
-        adopted = sum(resident.get(ws.name, 0) for ws in self.adopted.values())
         cold = [m for m in models if not m.flight and not m.held]
         reserved, allocated = torch.cuda.memory_reserved(gpu), torch.cuda.memory_allocated(gpu)
         row.publish(
             context=self.context,
-            resident=bytes_of(models) + adopted,
+            resident=bytes_of(models),
             cold=bytes_of(cold),
             kept=bytes_of(m for m in cold if m.level is Level.GPU),
-            pinned=bytes_of(m for m in models if m.flight or m.held) + adopted,
+            pinned=bytes_of(m for m in models if m.flight or m.held),
             torch_reserved=reserved,
             torch_allocated=allocated,
             cache=sum(c.nbytes for c in list(self.caches)),
@@ -1472,6 +1446,21 @@ class Memory:
         self._publish()
         self._freed()
 
+    def _headroom(self) -> int:
+        """What a load leaves free for the requests after it, since its copies are prefetches
+        that run beside them: the widest peak measured on this GPU (this process's models', or
+        any request's the ledger recorded), and the context a process here has yet to grow
+        (kernel modules, library workspaces, NCCL's buffers, which the driver allocates where
+        no rung reaches): the largest any process here reached, less this one's. Without it a
+        restart's first request found the device full and failed in the driver (D9)."""
+        peak = max((max(m.reserve, m.peak) for m in self.models.values()), default=0)
+        if self.row is None:
+            return peak
+        table = self.row[0]
+        self._outside()
+        grown = max((f.context for f in table.snapshot()), default=0) - self.context
+        return max([peak, *(p for _, p in table.peaks())]) + max(grown, 0)
+
     def _restore(self) -> None:
         """At an explicit load: the watermarks rise. Warm models refill most worth keeping
         first, into free room and then cold pages of this process's models worth less with no
@@ -1481,7 +1470,7 @@ class Memory:
         slots = max(
             (_SLOTS * max(_sizes(m), default=0) for m in models if m.repeats < 2), default=0
         )
-        room = self._free() - max((max(m.reserve, 0) for m in models), default=0) - slots
+        room = self._free() - self._headroom() - slots
         ranked = sorted(models, key=self._keep, reverse=True)
         for i, model in enumerate(ranked):
             if model.level is not Level.GPU:

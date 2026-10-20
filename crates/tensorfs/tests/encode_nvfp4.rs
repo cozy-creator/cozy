@@ -145,8 +145,7 @@ fn pre_quant_scale_smooths_and_multiplies_back() {
         GlobalScale::Multiply,
         NibbleOrder::LowFirst,
         ScaleLayout::RowMajor,
-    )
-    .with_pre_quant_scale(pd);
+    );
     let parts = run(encode::quantize, &awq, shape, &arrays);
     assert_eq!(&parts["pre_quant_scale"].bytes, p);
     let out = f32s(&decoded(&awq, shape, &parts));
@@ -159,17 +158,17 @@ fn pre_quant_scale_smooths_and_multiplies_back() {
         .sqrt();
     let norm: f32 = src.iter().map(|v| v * v).sum::<f32>().sqrt();
     assert!(err / norm < 0.1, "{}", err / norm);
-    // Without it the same encoding refuses: the param and the part go together.
-    let plain = Encoding::nvfp4(
-        GlobalScale::Multiply,
-        NibbleOrder::LowFirst,
-        ScaleLayout::RowMajor,
-    );
+    // The part's own dtype is authoritative: one nvfp4 does not allow is refused.
+    let narrow = &p[..ps.iter().product::<u64>() as usize];
+    let fp8 = BTreeMap::from([
+        ("values", view(&Dtype::F32, shape, &values)),
+        ("pre_quant_scale", view(&Dtype::F8_E4M3, ps, narrow)),
+    ]);
     let input = Input {
         dtype: &Dtype::BF16,
         shape,
-        encoding: &plain,
-        arrays: &arrays,
+        encoding: &awq,
+        arrays: &fp8,
     };
     assert!(encode::quantize(&input).is_err());
 }
@@ -231,8 +230,7 @@ fn pack_writes_the_producers_bytes() {
         GlobalScale::Multiply,
         NibbleOrder::LowFirst,
         ScaleLayout::RowMajor,
-    )
-    .with_pre_quant_scale(&Dtype::BF16);
+    );
     let parts = run(encode::pack, &awq, &shape, &arrays);
     for (role, suffix) in [
         ("weight", "weight"),

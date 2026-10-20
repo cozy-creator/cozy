@@ -33,7 +33,7 @@ fn tensors() -> Vec<Tensor> {
         dtype: Dtype::F32,
         shape: vec![4, 1024],
         body: Body::Encoded {
-            encoding: Encoding::fp8_rowwise(0, &Dtype::F32),
+            encoding: Encoding::fp8_rowwise(),
             parts: vec![
                 part("weight", Dtype::F8_E4M3, vec![4, 1024], 0, 4096, 4096),
                 part("scale", Dtype::F32, vec![4], 1, 0, 16),
@@ -155,7 +155,7 @@ fn writer_is_deterministic_and_reader_round_trips() {
     t.set_variant("", ObjectRef::of(&wb));
     let tb = t.to_json().unwrap();
     assert!(tb.starts_with(br#"{"files":{"README.md":"#));
-    assert!(tb.ends_with(br#"}},"format":"tensorfs.tree/1"}"#));
+    assert!(tb.ends_with(br#"}},"format":"cozytensors.tree/1"}"#));
     let back = Tree::from_json(&tb).unwrap();
     assert_eq!(back, t);
     assert_eq!(back.variant(Some("bf16")).unwrap(), ("bf16", &ObjectRef::of(&bytes)));
@@ -171,7 +171,6 @@ fn writer_is_deterministic_and_reader_round_trips() {
             version: "1.0".into(),
             tree: ObjectRef::of(&tb),
             yanked: false,
-            revision: 0,
         }],
         ..Default::default()
     };
@@ -308,14 +307,14 @@ fn red_documents_are_refused() {
     assert_eq!(Header::from_cbor(other).unwrap_err().code(), "format");
 
     for path in ["../x", "/x", "a//b", "a/./b", "", "chunks/x"] {
-        let doc = json!({"format": "tensorfs.tree/1", "files": {path: {"sha256": "0".repeat(64), "length": 0}}});
+        let doc = json!({"format": "cozytensors.tree/1", "files": {path: {"sha256": "0".repeat(64), "length": 0}}});
         assert!(Tree::from_json(doc.to_string().as_bytes()).is_err(), "{path:?}");
     }
     let tree = json!({"sha256": "0".repeat(64), "length": 0});
-    let repo = json!({"format": "tensorfs.repo/1", "name": "acme/tiny", "releases": [
+    let repo = json!({"format": "cozytensors.repo/1", "name": "acme/tiny", "releases": [
         {"version": "1", "tree": tree}, {"version": "1", "tree": tree}]});
     assert!(Repo::from_json(repo.to_string().as_bytes()).is_err());
-    let lanes = json!({"format": "tensorfs.repo/1", "name": "acme/tiny", "releases": [
+    let lanes = json!({"format": "cozytensors.repo/1", "name": "acme/tiny", "releases": [
         {"version": "1", "lanes": {}}]});
     assert!(Repo::from_json(lanes.to_string().as_bytes()).is_err(), "a release names a tree");
 }

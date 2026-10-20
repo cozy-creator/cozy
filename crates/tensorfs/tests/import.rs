@@ -25,7 +25,15 @@ fn vectors() -> PathBuf {
 
 /// A safetensors file of `(key, dtype, shape, bytes)`.
 fn safetensors(path: &Path, tensors: &[(&str, &str, Vec<u64>, Vec<u8>)]) {
+    safetensors_with(path, tensors, serde_json::json!({}));
+}
+
+/// A safetensors file with `__metadata__` `metadata` (string values).
+fn safetensors_with(path: &Path, tensors: &[(&str, &str, Vec<u64>, Vec<u8>)], metadata: serde_json::Value) {
     let mut head = serde_json::Map::new();
+    if metadata.as_object().is_some_and(|m| !m.is_empty()) {
+        head.insert("__metadata__".into(), metadata);
+    }
     let mut data = Vec::new();
     for (key, dtype, shape, bytes) in tensors {
         let start = data.len();
@@ -122,7 +130,7 @@ fn run(tmp: &Path, sources: &[String], converter: Option<&str>) -> Result<Collec
     let req = Request {
         sources,
         converter,
-        variant: None,
+        source_variant: None,
         access: &access,
         tmp,
         progress: &|_, _, _| {},
@@ -866,6 +874,138 @@ fn sdxl_lora_lands_on_the_canonical_modules() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A PEFT adapter folder: keys unwrapped to the base model's module names, `alpha_pattern` (and
+/// rsLoRA) folded into per-module `.alpha`, and `adapter_config.json` the component's config.
+#[test]
+fn a_peft_adapter_becomes_module_keys_and_its_config() {
+    let dir = scratch("peft-lora");
+    let folder = dir.join("in/adapter");
+    let factors = |rank: u64| {
+        let mut t = Vec::new();
+        for (m, r) in [("blocks.0.attn.to_q", rank), ("blocks.0.attn.to_k", 4)] {
+            t.push((format!("base_model.model.{m}.lora_A.weight"), "F32", vec![r, 8], f32s(r * 8, 1)));
+            t.push((format!("base_model.model.{m}.lora_B.weight"), "F32", vec![8, r], f32s(8 * r, 2)));
+        }
+        t
+    };
+    let write = |config: serde_json::Value| {
+        let t = factors(2);
+        let views: Vec<_> = t.iter().map(|(k, d, s, b)| (k.as_str(), *d, s.clone(), b.clone())).collect();
+        safetensors(&folder.join("adapter_model.safetensors"), &views);
+        fs::write(folder.join("adapter_config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    };
+    let sources = [folder.display().to_string()];
+    let config = serde_json::json!({
+        "peft_type": "LORA", "r": 2, "lora_alpha": 4, "base_model_name_or_path": "acme/base",
+        "target_modules": ["to_q", "to_k"], "rank_pattern": {"to_k": 4}, "alpha_pattern": {"attn.to_k": 16},
+    });
+    write(config.clone());
+    let out = run(&dir.join("tmp"), &sources, None).unwrap();
+    let keys: Vec<&str> = out.order.iter().map(|(_, k)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        [
+            "blocks.0.attn.to_q.lora_A.weight",
+            "blocks.0.attn.to_q.lora_B.weight",
+            "blocks.0.attn.to_k.lora_A.weight",
+            "blocks.0.attn.to_k.lora_B.weight",
+            "blocks.0.attn.to_k.alpha",
+        ]
+    );
+    let alpha = |out: &Collect, m: &str| out.tensors.get(&("model".into(), format!("blocks.0.attn.{m}.alpha"))).cloned();
+    assert_eq!(alpha(&out, "to_k"), Some((Dtype::F32, vec![], 16f32.to_le_bytes().to_vec())));
+    assert_eq!(alpha(&out, "to_q"), None, "the config's lora_alpha applies");
+    let model = &out.layout.components[0];
+    assert_eq!((model.name.as_str(), model.config_file.as_deref()), ("model", Some("adapter_config.json")));
+    let mut want = config.as_object().unwrap().clone();
+    want.insert("rank_pattern".into(), serde_json::json!({}));
+    want.insert("alpha_pattern".into(), serde_json::json!({}));
+    assert_eq!(model.config, want);
+    assert!(model.assets.is_empty() && !out.layout.files.contains_key("adapter_config.json"));
+    let imported = out.imported.unwrap();
+    assert!(imported.normalized);
+    assert_eq!(imported.converters, ["peft.lora"]);
+
+    // rsLoRA's α/√r is α·√r over r: every module states it.
+    write(serde_json::json!({"peft_type": "LORA", "r": 2, "lora_alpha": 4, "use_rslora": true}));
+    let out = run(&dir.join("tmp"), &sources, None).unwrap();
+    assert_eq!(alpha(&out, "to_q").unwrap().2, (4.0 * 2f32.sqrt()).to_le_bytes().to_vec());
+    assert_eq!(alpha(&out, "to_k").unwrap().2, 8f32.to_le_bytes().to_vec());
+    assert_eq!(out.layout.components[0].config["use_rslora"], false);
+
+    for (config, code) in [
+        (serde_json::json!({"peft_type": "LORA", "use_dora": true}), Code::ADAPTER_TARGET_UNSUPPORTED),
+        (serde_json::json!({"peft_type": "LOHA"}), Code::ADAPTER_TARGET_UNSUPPORTED),
+        (serde_json::json!({"peft_type": "LORA", "alpha_pattern": {".*to_k": 2}}), Code::ADAPTER_TARGET_UNSUPPORTED),
+        (serde_json::json!({"peft_type": "LORA", "alpha_pattern": {"to_k": 2, "attn.to_k": 3}}), Code::ADAPTER_TARGET_UNSUPPORTED),
+        (serde_json::json!({"peft_type": "LORA", "lora_alpha": "4"}), Code::WRONG_TYPE),
+    ] {
+        write(config.clone());
+        assert_eq!(run(&dir.join("tmp"), &sources, None).err().unwrap().code, code, "{config}");
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The header-level rules a migration shares: PEFT's key spelling and its adapter config.
+#[test]
+fn lora_keys_and_adapter_configs_follow_one_rule() {
+    use tensorfs::import::lora::{adapter_config, peft_key};
+    for (key, want) in [
+        ("lora_unet_x.lora_down.weight", Some("lora_unet_x.lora_A.weight")),
+        ("lora_unet_x.lora_up", Some("lora_unet_x.lora_B.weight")),
+        ("base_model.model.a.b.lora_A.default.weight", Some("a.b.lora_A.weight")),
+        ("a.b.lora_B.weight", Some("a.b.lora_B.weight")),
+        ("base_model.model.a.alpha", Some("a.alpha")),
+        ("a.lora_B.bias", None),
+        ("a.weight", None),
+    ] {
+        assert_eq!(peft_key(key).as_deref(), want, "{key}");
+    }
+    let none = BTreeMap::new();
+    let mixed = [("a".to_owned(), 4), ("b".to_owned(), 8), ("c".to_owned(), 4)];
+    assert_eq!(
+        serde_json::Value::Object(adapter_config(mixed.clone(), &none, None, Some("acme/base"))),
+        serde_json::json!({"peft_type": "LORA", "r": 4, "target_modules": ["a", "b", "c"],
+                           "base_model_name_or_path": "acme/base"}),
+        "ranks differ: no lora_alpha, each module's own r is its α"
+    );
+    let source = serde_json::json!({"lora_alpha": 16, "r": 8, "base_model_name_or_path": "x"});
+    let config = adapter_config(mixed, &none, source.as_object(), None);
+    assert_eq!((&config["lora_alpha"], &config["r"], &config["base_model_name_or_path"]), (&16.into(), &8.into(), &"x".into()));
+    let uniform = adapter_config([("a".to_owned(), 2)], &none, None, None);
+    assert_eq!(uniform["lora_alpha"], 2);
+}
+
+/// Kohya's training metadata is PEFT's config of each LoRA component; its `.alpha` stays.
+#[test]
+fn a_kohya_lora_maps_its_metadata_to_the_adapter_config() {
+    let dir = scratch("kohya-config");
+    let file = dir.join("in/eyes.safetensors");
+    let stem = "lora_unet_input_blocks_4_1_transformer_blocks_0_attn2_to_k";
+    safetensors_with(
+        &file,
+        &[
+            (&format!("{stem}.lora_down.weight"), "F32", vec![4, 2048], f32s(4 * 2048, 4)),
+            (&format!("{stem}.lora_up.weight"), "F32", vec![640, 4], f32s(640 * 4, 3)),
+            (&format!("{stem}.alpha"), "F32", vec![], 2f32.to_le_bytes().to_vec()),
+        ],
+        serde_json::json!({"ss_network_dim": "4", "ss_network_alpha": "2.5", "ss_sd_model_name": "sd_xl_base_1.0.safetensors"}),
+    );
+    let out = run(&dir.join("tmp"), &[file.display().to_string()], None).unwrap();
+    let unet = out.layout.components.iter().find(|c| c.name == "unet").unwrap();
+    assert_eq!(unet.config_file.as_deref(), Some("adapter_config.json"));
+    assert_eq!(
+        serde_json::Value::Object(unet.config.clone()),
+        serde_json::json!({
+            "peft_type": "LORA", "r": 4, "lora_alpha": 2.5, "base_model_name_or_path": "sd_xl_base_1.0.safetensors",
+            "target_modules": ["down_blocks.1.attentions.0.transformer_blocks.0.attn2.to_k"],
+        })
+    );
+    let module = "down_blocks.1.attentions.0.transformer_blocks.0.attn2.to_k";
+    assert_eq!(out.tensors[&("unet".into(), format!("{module}.alpha"))].2, 2f32.to_le_bytes().to_vec());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 /// network: Hugging Face.
 #[test]
 fn a_tiny_hf_sdxl_imports_end_to_end() {
@@ -1341,7 +1481,7 @@ fn a_single_file_sdxl_becomes_the_upstream_layout() {
     let req = Request {
         sources: &sources,
         converter: None,
-        variant: None,
+        source_variant: None,
         access: &access,
         tmp: &tmp,
         progress: &|_, _, _| {},
@@ -1544,7 +1684,7 @@ fn a_convert_survives_export() {
             let req = Request {
                 sources: &sources,
                 converter: None,
-                variant,
+                source_variant: variant,
                 access: &access,
                 tmp: &tmp,
                 progress: &|_, _, _| {},
@@ -1562,7 +1702,7 @@ fn a_convert_survives_export() {
                 .map(|p| (p.clone(), folder.join(p)))
                 .collect();
             let _ = fs::remove_dir_all(out);
-            tensorfs::export::safetensors(ck, &repo, out, None).unwrap();
+            tensorfs::export::safetensors(ck, &repo, out, false).unwrap();
             tree(out)
         };
         let source = format!("hf://{repo}");

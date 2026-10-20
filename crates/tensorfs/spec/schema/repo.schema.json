@@ -1,7 +1,7 @@
 {
  "$schema": "https://json-schema.org/draft/2020-12/schema",
  "$id": "https://github.com/cozy-creator/cozy-creator/crates/tensorfs/spec/schema/repo.schema.json",
- "title": "tensorfs.repo/1",
+ "title": "cozytensors.repo/1",
  "description": "Structure only; byte-length, bounds and duplicate-key rules are in spec/cozytensors.md. Unknown fields are allowed.",
  "type": "object",
  "required": [
@@ -12,7 +12,7 @@
  "properties": {
   "format": {
    "type": "string",
-   "pattern": "^tensorfs\\.repo/1(\\.[0-9]+)?$",
+   "pattern": "^cozytensors\\.repo/1(\\.[0-9]+)?$",
    "not": {
     "pattern": "[\\r\\n]"
    }
@@ -36,13 +36,10 @@
      },
      "tree": {
       "$ref": "#/$defs/objectRef",
-      "description": "The release's tensorfs.tree/1."
+      "description": "The release's cozytensors.tree/1."
      },
      "yanked": {
       "type": "boolean"
-     },
-     "revision": {
-      "$ref": "#/$defs/u64"
      }
     }
    }

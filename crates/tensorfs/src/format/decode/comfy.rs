@@ -1,18 +1,18 @@
-//! ComfyUI's ConvRot integer formats (spec §6 `comfy.*`): comfy-kitchen's `AsymW4A8Int8Layout`
-//! at 4 bits (`asym_w4a8_int8`) and 6 bits (`w6a8_int8`), and `TensorCoreConvRotW4A4Layout`
-//! (`convrot_w4a4`). The codes are in the rotated basis; each block of `rotation_size` columns is
-//! rotated back by `H_B`, as `int8.convrot` does.
+//! ComfyUI's ConvRot integer formats (spec §6): `int4.convrot` (comfy-kitchen's
+//! `TensorCoreConvRotW4A4Layout`), and kitchen's split-plane `AsymW4A8Int8Layout` at 4 bits
+//! (`comfy.asym_w4a8_int8`) and 6 bits (`comfy.w6a8_int8`). The codes are in the rotated basis;
+//! each block of `rotation_size` columns is rotated back by `H_B`, as `int8.convrot` does.
 
 use super::affine::{Codes, Fill, Order, Packing};
 use super::grid::{Grid, ScaleLayout};
-use super::int8::ROTATION_SIZE;
+use super::int8::{ROTATION, ROTATION_SIZE};
 use super::plan::{Codes as PlanCodes, Core, Elems, Plan, Post, RequantCodes, RequantPacking};
 use super::{elem, Allowed, Ctx, Dtypes, Param, Part, Scheme, Shape, View};
 use crate::format::{Result, Value};
 
-const I8: Dtypes = Dtypes::Of(&["I8"]);
-const F32: Dtypes = Dtypes::Of(&["F32"]);
-const S_REL: Dtypes = Dtypes::Of(&["F8_E4M3", "F32"]);
+const I8: Dtypes = &["I8"];
+const F32: Dtypes = &["F32"];
+const S_REL: Dtypes = &["F8_E4M3", "F32"];
 
 pub static ASYM_W4A8_INT8: Scheme = Scheme {
     name: "comfy.asym_w4a8_int8",
@@ -22,18 +22,15 @@ pub static ASYM_W4A8_INT8: Scheme = Scheme {
             key: "group_size",
             allowed: Allowed::Check(w4_group, "4, 8 or a multiple of 16"),
         },
+        ROTATION,
         ROTATION_SIZE,
     ],
     parts: &[
         Part::req("weight", I8, |c| packed(c, 4, true)),
-        Part::req("weight_s_rel", S_REL, |c| groups(c).shape(c)),
-        Part::req("weight_s_channel", F32, |c| Grid::Row.shape(c)),
-        Part::opt("weight_codebook", F32, |_| Ok(Shape::Count(16))),
-        Part::opt(
-            "weight_correction",
-            Dtypes::Of(&["F32", "BF16", "F16"]),
-            |c| correction(c).shape(c),
-        ),
+        Part::req("group_scale", S_REL, |c| groups(c).shape(c)),
+        Part::req("scale", F32, |c| Grid::Row.shape(c)),
+        Part::opt("codebook", F32, |_| Ok(Shape::Count(16))),
+        Part::opt("correction", &["F32", "BF16", "F16"], |c| correction(c).shape(c)),
     ],
     decode: |c| grouped(c, 4),
 };
@@ -46,29 +43,30 @@ pub static W6A8_INT8: Scheme = Scheme {
             key: "group_size",
             allowed: Allowed::Check(w6_group, "a multiple of 16"),
         },
+        ROTATION,
         ROTATION_SIZE,
     ],
     parts: &[
         Part::req("weight", I8, |c| packed(c, 6, true)),
-        Part::req("weight_s_rel", S_REL, |c| groups(c).shape(c)),
-        Part::req("weight_s_channel", F32, |c| Grid::Row.shape(c)),
+        Part::req("group_scale", S_REL, |c| groups(c).shape(c)),
+        Part::req("scale", F32, |c| Grid::Row.shape(c)),
     ],
     decode: |c| grouped(c, 6),
 };
 
-pub static CONVROT_W4A4: Scheme = Scheme {
-    name: "comfy.convrot_w4a4",
+pub static INT4_CONVROT: Scheme = Scheme {
+    name: "int4.convrot",
     view: View::Matrix,
-    params: &[ROTATION_SIZE],
+    params: &[ROTATION, ROTATION_SIZE],
     parts: &[
         Part::req("weight", I8, |c| packed(c, 4, false)),
-        Part::req("weight_scale", F32, |c| Grid::Row.shape(c)),
+        Part::req("scale", F32, |c| Grid::Row.shape(c)),
     ],
     decode: |c| {
         let codes = PlanCodes::new(
             c.source("weight"),
             nibbles(Codes::Signed),
-            c.elements("weight_scale"),
+            c.elements("scale"),
             Grid::Row,
         );
         Ok(rotation(
@@ -82,7 +80,7 @@ pub static CONVROT_W4A4: Scheme = Scheme {
 };
 
 pub(super) fn supports_sources(scheme: &Scheme) -> bool {
-    [&ASYM_W4A8_INT8, &W6A8_INT8, &CONVROT_W4A4]
+    [&ASYM_W4A8_INT8, &W6A8_INT8, &INT4_CONVROT]
         .into_iter()
         .any(|s| std::ptr::eq(s, scheme))
 }
@@ -115,7 +113,7 @@ fn packed(c: &Ctx, bits: usize, group: bool) -> Result<Shape> {
     Ok(Shape::Exact([c.lead(), &[width as u64]].concat()))
 }
 
-/// `weight_s_rel`: row blocks of `group_size`, row-major.
+/// `group_scale`: row blocks of `group_size`, row-major.
 fn groups(c: &Ctx) -> Grid {
     Grid::Blocks {
         size: c.uint("group_size"),
@@ -124,7 +122,7 @@ fn groups(c: &Ctx) -> Grid {
     }
 }
 
-/// `weight_correction`: row blocks of `group_size`, transposed (`[C/g, R]`).
+/// `correction`: row blocks of `group_size`, transposed (`[C/g, R]`).
 fn correction(c: &Ctx) -> Grid {
     Grid::Blocks {
         size: c.uint("group_size"),
@@ -165,20 +163,16 @@ fn grouped<'a>(c: &Ctx<'a>, bits: usize) -> Result<Plan<'a>> {
             RequantPacking::SplitSix
         },
         group: c.uint("group_size"),
-        relative: c.elements("weight_s_rel"),
-        table: c
-            .has("weight_codebook")
-            .then(|| c.elements("weight_codebook")),
+        relative: c.elements("group_scale"),
+        table: c.has("codebook").then(|| c.elements("codebook")),
     };
     Ok(rotation(
         c,
         Core::RequantizedRotation {
             codes,
             block: c.uint("rotation_size"),
-            scale: c.elements("weight_s_channel"),
-            correction: c
-                .has("weight_correction")
-                .then(|| c.elements("weight_correction")),
+            scale: c.elements("scale"),
+            correction: c.has("correction").then(|| c.elements("correction")),
         },
     ))
 }
