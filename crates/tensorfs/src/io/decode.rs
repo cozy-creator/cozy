@@ -7,11 +7,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use super::cuda::{self, CtxGuard};
 use super::{Copy, DeviceBuffer, Dst, ReadOpts, Src};
 use crate::failure::{Failure, Kind, Result};
+use crate::format::decode::plan::{Core, Plan};
 use crate::format::{decode, Dtype, Encoding, PartBytes};
 use crate::kernels::{self, Binary, Launch, Prepared};
 
-/// Decode a logical element window. Stored parts stay compressed until the CUDA kernels;
-/// only plans with an explicit host-only core use the CPU reference fallback.
+/// Decode a logical element window through the prebuilt CUDA catalog. Host-only plans are
+/// unsupported; logical CPU expansion and upload are never a GPU decode fallback.
 pub fn read(
     dtype: &Dtype,
     shape: &[u64],
@@ -22,13 +23,32 @@ pub fn read(
     count: u64,
 ) -> Result<DeviceBuffer> {
     decode::planned(dtype, shape, encoding, parts, true, |plan, geometry| {
-        Ok(
-            match kernels::prepare(plan, geometry, dtype, begin, count)? {
-                Prepared::Host(bytes) => upload(device, &bytes),
-                Prepared::Kernel(launch) => execute(device, &launch),
-            },
-        )
+        Ok(device_plan(plan, geometry, dtype, begin, count)
+            .and_then(|launch| execute(device, &launch)))
     })?
+}
+
+fn device_plan<'a>(
+    plan: Plan<'a>,
+    geometry: decode::Geometry,
+    dtype: &Dtype,
+    begin: u64,
+    count: u64,
+) -> Result<Box<Launch<'a>>> {
+    // Refuse before prepare can apply host factors, transpose or round a Values payload.
+    if matches!(&plan.core, Core::Values(_)) {
+        return crate::failure::fail(
+            Kind::Unsupported,
+            "GPU decode requires a device core; host value plans are unsupported",
+        );
+    }
+    match kernels::prepare(plan, geometry, dtype, begin, count)? {
+        Prepared::Kernel(launch) => Ok(launch),
+        Prepared::Host(_) => crate::failure::fail(
+            Kind::Unsupported,
+            "GPU decode has no prebuilt device core for this plan",
+        ),
+    }
 }
 
 fn io_error(error: super::Error) -> Failure {
@@ -255,4 +275,30 @@ fn execute(device: i32, launch: &Launch<'_>) -> Result<DeviceBuffer> {
     result?;
     drained?;
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::decode::plan::{Elems, Post};
+
+    #[test]
+    fn host_values_and_metadata_only_sentinel_never_expand_or_upload_for_gpu_decode() {
+        let geometry = decode::Geometry {
+            rows: 2,
+            cols: 3,
+            height: 2,
+            swap: true,
+        };
+        for values in [Vec::new(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]] {
+            let plan = Plan {
+                core: Core::Values(values),
+                post: Post::One(Elems::f32(2.0)),
+            };
+            let error = device_plan(plan, geometry, &Dtype::F32, 1, 3)
+                .err()
+                .expect("host values became a GPU decode");
+            assert_eq!(error.kind, Kind::Unsupported);
+        }
+    }
 }
