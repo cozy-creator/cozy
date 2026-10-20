@@ -411,9 +411,13 @@ impl Ledger {
             return Err(Error::Invalid("ledger protocol differs".into()));
         }
         if table.shared().header.capacity.load(Acquire) != capacity {
-            return Err(Error::Invalid(
-                "ledger capacity differs; use one cap per GPU".into(),
-            ));
+            if table.rows()?.iter().any(|row| row.state == State::Live) {
+                return Err(Error::Invalid(
+                    "cannot change a GPU cap while an executor owns a row".into(),
+                ));
+            }
+            table.shared().header.capacity.store(capacity, Release);
+            table.changed();
         }
         shm::region_lock(
             table.file.as_fd(),
@@ -513,6 +517,17 @@ impl Ledger {
                 "only the executor may claim its own row".into(),
             ));
         }
+        // Serialize admission with an idle-only cap change. This private open
+        // file description releases the initialization lock on every return.
+        let initialization = shm::reopen(self.fd(), true).map_err(crate::os("open claim gate"))?;
+        shm::region_lock(
+            initialization.as_fd(),
+            0,
+            size_of::<Header>(),
+            Region::Write,
+            true,
+        )
+        .map_err(crate::os("lock claim gate"))?;
         if self
             .table
             .rows()?
