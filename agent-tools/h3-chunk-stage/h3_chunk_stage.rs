@@ -16,6 +16,8 @@ use tensorfs::store2::{Pin, Store};
 
 const PRODUCT: &str = "25a1d2f6bfbf07e84f06a110b30083b9fb5a45f2";
 const HUB: &str = "https://cozy-e2e-6.ngrok.app";
+const HUB_HOST: &str = "cozy-e2e-6.ngrok.app";
+const OBJECT_HOST: &str = "327b4294d98bb480834acd2660b423d4.r2.cloudflarestorage.com";
 const MODEL: &str = "paul/minimax-h3";
 const RELEASE: &str = "1.0.0-rc.3";
 const LANE: &str = "int8";
@@ -322,7 +324,12 @@ fn pin_store(plan: &Plan) -> Result<Arc<Store>> {
 }
 
 async fn execute(plan: &Plan, download: bool) -> Result<(Value, bool)> {
-    let client = Client::new(SourcePolicy::default());
+    let client = Client::new(SourcePolicy {
+        allowed_hosts: vec![HUB_HOST.into(), OBJECT_HOST.into()],
+        any_host: false,
+        allow_local: false,
+        ..SourcePolicy::default()
+    });
     let identity = Identity {
         model: MODEL,
         release: RELEASE,
@@ -337,6 +344,7 @@ async fn execute(plan: &Plan, download: bool) -> Result<(Value, bool)> {
         "format": "cozy.h3.chunk-stage/1", "product_source": PRODUCT,
         "client_source": option_env!("H3_STAGE_SOURCE_COMMIT"),
         "source_hub": HUB, "source_label": plan.input.source_label,
+        "allowed_hosts": [HUB_HOST, OBJECT_HOST],
         "old_manifest": identity.manifest, "header": header_ref(),
         "cache_dir": plan.cache, "chunk_count": CHUNKS, "physical_chunk_bytes": CHUNK_BYTES,
         "tensor_count": 3858, "stored_parts": 4834, "stored_part_bytes": PART_BYTES,
@@ -466,6 +474,7 @@ mod tests {
             common::serve_all(),
         );
         let client = Client::new(SourcePolicy {
+            allowed_hosts: vec!["127.0.0.1".into()],
             allow_local: true,
             ..SourcePolicy::default()
         });
@@ -508,6 +517,7 @@ mod tests {
             common::serve_all(),
         );
         let client = Client::new(SourcePolicy {
+            allowed_hosts: vec!["127.0.0.1".into()],
             allow_local: true,
             ..SourcePolicy::default()
         });

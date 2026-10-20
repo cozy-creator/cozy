@@ -4,6 +4,8 @@ This source uses Product25's public Rust transport and store. It is not a new Te
 
 Product source is `25a1d2f6bfbf07e84f06a110b30083b9fb5a45f2`; the accepted local header remains `0f03804af2280bac6c81c633cd058f4dfbb5fd71f5db0a3c5829907e4ef21f2e`. Only the old manifest `bebd6c6966f33bf53d176bbc3520ed2021854f5bcd8446b2ad2819ff3e6d4cff` is used at the source Hub. Exactly 1,676 original chunks / 75,535,069,920 physical bytes are requested. No remote request names the new header/tree, and no HF fallback exists.
 
+Egress permits only `cozy-e2e-6.ngrok.app` and the recorded source object host `327b4294d98bb480834acd2660b423d4.r2.cloudflarestorage.com`. The latter is from seven successful metadata-object requests in the existing H3 collection, not a new network probe. Wildcards, arbitrary hosts, private addresses, plaintext HTTP, and redirects remain disabled. Loopback tests separately allow only `127.0.0.1` with the explicit local policy.
+
 In a fresh hosted checkout at Product25, fetch the reviewed client commit without moving HEAD, extract only `agent-tools/h3-chunk-stage`, export its full SHA as `H3_STAGE_SOURCE_COMMIT`, then run:
 
 ```sh
