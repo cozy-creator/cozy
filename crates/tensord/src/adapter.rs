@@ -372,7 +372,7 @@ pub(crate) mod tests {
     #[test]
     fn an_adapter_view_grafts_factors_onto_the_base() {
         let root = std::env::temp_dir().join(format!("adapter-{}", uuid::Uuid::new_v4()));
-        let store = Store::open(&root).unwrap().with_cache().with_grace(Duration::ZERO);
+        let store = Store::open(&root).unwrap().with_grace(Duration::ZERO);
         let (weight, bias, other) = (f32s(2048 * 2048, 0.5), f32s(2048, 1.5), f32s(8, 2.5));
         let base = checkpoint(&store, "base", "unet", &[("proj.weight", vec![2048, 2048], weight.clone()), ("proj.bias", vec![2048], bias.clone()), ("other.weight", vec![8], other.clone())]);
         let (a, b) = (f32s(2 * 2048, 0.125), f32s(2048 * 2, 0.75));

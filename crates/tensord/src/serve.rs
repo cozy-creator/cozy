@@ -493,8 +493,6 @@ fn start_api(
     };
     let objects = Arc::new(crate::objects::Objects::new(&root.join("writes"), service.engine.clone())?);
     service.engine.hold_memos(&objects);
-    // The leaf the CLI pins is the key a run's capability names (th-241).
-    let leaf = crate::hub::Leaf::from_pem(&identity.key_pem).map_err(|e| io::Error::other(e.0))?;
     backend.runs = Some(Arc::new(crate::runs::Runs {
         service: service.clone(),
         objects: objects.clone(),
@@ -503,10 +501,9 @@ fn start_api(
             Arc::new(crate::local_source::LocalSources::new(objects, installer))
         }),
         own_hub: own_hub
-            .map(|hub| crate::hub::Source::new(&hub.origin, hub.ca_der, hub.object_hosts, None))
+            .map(|hub| crate::hub::Source::new(&hub.origin, hub.ca_der, None))
             .transpose()
             .map_err(|e| io::Error::other(e.0))?,
-        leaf: Some(Arc::new(leaf)),
         contexts: Default::default(),
     }));
     crate::calls::Calls::configure(service, machine.clone(), backend.runs.as_ref())?;

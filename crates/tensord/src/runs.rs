@@ -69,7 +69,7 @@ pub struct Spec {
     pub gpus: u32,
     /// The run's weight precision (16, 8 or 4); 0 lets the lane rule choose each slot's.
     pub bits: u32,
-    /// The Hub the run reads and publishes to, under this machine's authority there.
+    /// The Hub the run reads, under its request's bearer there (memory only).
     pub hub: Option<hub::Source>,
     /// Provider tokens for source models, held in memory only.
     pub providers: Providers,
@@ -94,10 +94,8 @@ pub struct Runs {
     pub objects: Arc<Objects>,
     pub publisher: Option<Arc<Publisher>>,
     pub local: Option<Arc<LocalSources>>,
-    /// On a rental: its own Hub, where a run that names none reads.
+    /// On a rental: its own Hub, where a run that names none reads anonymously.
     pub own_hub: Option<hub::Source>,
-    /// This machine's TLS leaf key: it trades a run's capability for its token.
-    pub leaf: Option<Arc<hub::Leaf>>,
     /// Unfinished runs' preparation: their children prepare with it, and their weights are
     /// fetched and published with its access. Tokens live only here.
     pub contexts: Mutex<HashMap<String, RunContext>>,
@@ -752,7 +750,7 @@ impl Runs {
         stoppable: &Stoppable,
     ) -> Result<Option<ResultRecord>, Refused> {
         let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
-        let (mut members, mut kept, mut rows) = (vec![], vec![], vec![]);
+        let (mut members, mut kept, mut rows, mut fetches) = (vec![], vec![], vec![], vec![]);
         for item in items {
             let (held, release) = match &item.source {
                 Source::Installation(alias) => {
@@ -827,6 +825,7 @@ impl Runs {
                 let fetch = self.publisher.as_ref().filter(|_| plan.is_some()).map(|publisher| {
                     crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), u64::MAX)
                 });
+                fetches.extend(fetch.clone());
                 members.push(Member::new(held, plan, item.level, fetch));
             }
         }
@@ -842,6 +841,8 @@ impl Runs {
             }
             None => members.iter().map(|member| without_gpus(member.level)).collect(),
         };
+        // The set outlives this run: past its first pass, its members read anonymously.
+        fetches.iter().for_each(|fetch| fetch.detach());
         // An item's level is its lowest member's, and why that one is held back.
         let mut holds = holds.into_iter();
         let rows: Vec<Value> = rows
@@ -1298,7 +1299,7 @@ mod tests {
         let store = machine.publisher.store().clone();
         let objects = Arc::new(Objects::new(&machine.root.join("writes"), machine.service.engine.clone()).unwrap());
         let runs = Runs { service: machine.service.clone(), objects, publisher: Some(machine.publisher.clone()), local: None,
-            own_hub: None, leaf: None, contexts: Default::default() };
+            own_hub: None, contexts: Default::default() };
         let mut warm = spec(Source::Models, true, "set");
         (warm.hub, warm.owner, warm.catalog_revision) = (Some(machine.hub.clone()), "acme".into(), "r1".into());
         warm.set = Some(vec![SetItem {
@@ -1341,7 +1342,7 @@ mod tests {
         }).unwrap();
         let objects = Arc::new(Objects::new(&root.join("writes"), service.engine.clone()).unwrap());
         let runs = Runs { service: service.clone(), objects, publisher: None, local: None,
-            own_hub: None, leaf: None, contexts: Default::default() };
+            own_hub: None, contexts: Default::default() };
         let root_call = spec(Source::Installation("installed".into()), true, "root");
         let refused = runs.prepare("alice", "root", root_call, &runs.service.engine.stoppable("root")).err().unwrap();
         assert_eq!(refused.code, "callable_internal");
@@ -1542,7 +1543,7 @@ mod tests {
             publisher: None,
             local: Some(Arc::new(local)),
             own_hub: None,
-            leaf: None,
+           
             contexts: Default::default(),
         });
         let config = crate::gpu_service::GpuConfig::deviceless(&root.join("home")).unwrap();
@@ -1731,7 +1732,7 @@ mod tests {
         }).to_string()).unwrap();
         let objects = Arc::new(Objects::new(&root.join("writes"), service.engine.clone()).unwrap());
         let runs = Runs { service: service.clone(), objects, publisher: None, local: None,
-            own_hub: None, leaf: None, contexts: Default::default() };
+            own_hub: None, contexts: Default::default() };
         let installed = service.engine.bind_installation(Installation {
             actor:"alice".into(),alias:"caller".into(),generation:generation.clone(),
             package:"first/caller".into(),release:"1.0.0".into(),interface:serde_json::to_vec(&caller).unwrap(),
@@ -1748,7 +1749,7 @@ mod tests {
         assert_eq!(projected.record.interface, callee);
         assert_eq!(service.catalog.resolve(&generation).unwrap().record.interface, caller);
 
-        let source = hub::Source::new("https://hub.example", None, vec![], None).unwrap();
+        let source = hub::Source::new("https://hub.example", None, None).unwrap();
         runs.contexts.lock().unwrap().insert("7".into(), RunContext {
             installation:"caller".into(),hub:Some(source),owner:"alice".into(),gpus:2,bits:4,
             models:vec![
