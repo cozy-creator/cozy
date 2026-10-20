@@ -489,7 +489,7 @@ fn execute_into(
     } else {
         None
     };
-    if size == 0 {
+    if size == 0 && destination.is_none() {
         return Ok(output);
     }
     let mut hold = DecodeHold {
@@ -500,6 +500,28 @@ fn execute_into(
         complete: false,
     };
     let _context = CtxGuard::enter(hold.stream.as_ref().expect("decode stream live").context())?;
+    // Decode is synchronous. Synchronize each supplied producer/output stream on the calling
+    // OS thread (important for PTDS), before kernels access borrowed allocations.
+    let mut streams = std::collections::BTreeSet::new();
+    for part in parts {
+        if let Src::Device { stream, .. } = part.src {
+            streams.insert(stream);
+        }
+    }
+    if let Some(Dst::Device { stream, .. }) = destination {
+        streams.insert(stream);
+    }
+    for stream in streams {
+        cuda::check("cuStreamSynchronize(decode producer)", unsafe {
+            (cuda::driver()?.stream_synchronize)(stream as _)
+        })?;
+    }
+    // Zero logical output can still have a nonempty optional codebook. Success also
+    // proves those supplied producers are complete before the caller releases owners.
+    if size == 0 {
+        hold.complete = true;
+        return Ok(hold.output.take());
+    }
     let family = (cuda::attribute(device, 75)? * 10 + cuda::attribute(device, 76)?) as u32;
     let binary = |stage: &str| {
         launch.stage_binary(family, stage).ok_or_else(|| Failure {
@@ -517,22 +539,6 @@ fn execute_into(
             "requantize"
         } else {
             "unpack"
-        })?;
-    }
-    // Decode is synchronous. Synchronize each supplied producer/output stream on the calling
-    // OS thread (important for PTDS), before kernels access borrowed allocations.
-    let mut streams = std::collections::BTreeSet::new();
-    for part in parts {
-        if let Src::Device { stream, .. } = part.src {
-            streams.insert(stream);
-        }
-    }
-    if let Some(Dst::Device { stream, .. }) = destination {
-        streams.insert(stream);
-    }
-    for stream in streams {
-        cuda::check("cuStreamSynchronize(decode producer)", unsafe {
-            (cuda::driver()?.stream_synchronize)(stream as _)
         })?;
     }
     let words = match launch.words.binding() {
