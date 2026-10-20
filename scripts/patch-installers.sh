@@ -10,3 +10,7 @@ sed -i "s|for your platform \$_true_arch\"|for your platform \$_true_arch. $supp
 test "$(grep -c "$supported" "$sh")" = 2
 sed -i 's|^    if (Add-Path $dest_dir) {$|&\n        $env:Path = "$dest_dir;$env:Path"|; s|To add $dest_dir to your PATH, either restart your shell or run:|cozy works in this PowerShell now; in terminals already open, restart them or run:|' "$ps"
 test "$(grep -c -e 'cozy works in this PowerShell now' -e '^        $env:Path = "$dest_dir;$env:Path"$' "$ps")" = 2
+# A running cozy.exe (Calcifer, the machine) can be renamed but not overwritten: a reinstall sets it aside.
+aside='    Remove-Item "$dest_dir\\.cozy-replaced-*" -Force -ErrorAction SilentlyContinue\n    $old = Join-Path "$dest_dir" (Split-Path -Path "$bin_path" -Leaf)\n    if (Test-Path $old) { Move-Item -Force $old (Join-Path "$dest_dir" ".cozy-replaced-$(Get-Random).exe") }'
+sed -i "s|^    Copy-Item \"\$bin_path\" -Destination \"\$dest_dir\" -ErrorAction Stop\$|$aside\n&|" "$ps"
+test "$(grep -c -F '    if (Test-Path $old) { Move-Item' "$ps")" = 1

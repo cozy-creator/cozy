@@ -195,6 +195,14 @@ jobs:
           fi
           must machine enable
           must machine show local
+          # The install line again, as an upgrade, while Calcifer and the machine run this binary.
+          if [ "$RUNNER_OS" = Windows ]; then
+            $PS -NoProfile -ExecutionPolicy Bypass -c "irm $COZY_DOWNLOAD_URL/cozy-installer.ps1 | iex" \
+              || { echo "::error::installing over a running cozy failed"; fail=1; }
+          else
+            curl -sSf "$COZY_DOWNLOAD_URL/cozy-installer.sh" | sh || { echo "::error::installing over a running cozy failed"; fail=1; }
+          fi
+          must status
           before=$(ls -i "$cozy")
           step update "$VERSION"
           if [ "$ran" = 1 ]; then
