@@ -9,6 +9,7 @@ host never syncs. `Host` is the CPU core: the same sets, as host memory, and it 
 libcuda.
 """
 
+import os
 from collections.abc import Sequence
 from typing import Literal
 
@@ -317,7 +318,8 @@ class Host:
 class Copy:
     """A run of weight copies: `h2d`, a GPU's copy stream from its first job to its last
     landing; `disk`, a host layout filled from chunk files. `ceiling` is the measured GB/s it
-    is held against (pinned H2D on that GPU, the volume's O_DIRECT read), 0 when unmeasured."""
+    is held against (pinned H2D on that GPU, the volume's O_DIRECT read), 0 when unmeasured
+    (see `ceiling`) or, for `disk`, when the page cache served part of the run."""
 
     @property
     def kind(self) -> str: ...
@@ -342,6 +344,25 @@ class Copy:
 
 def copies() -> list[Copy]:
     """Every copy run since the last call."""
+
+class Ceiling:
+    """What reads can reach: the volume's sequential GB/s (`disk_direct`: past the page cache)
+    and, when a GPU was named, its pinned H2D GB/s and the streams that reached it."""
+
+    @property
+    def disk_gbps(self) -> float: ...
+    @property
+    def disk_direct(self) -> bool: ...
+    @property
+    def h2d_gbps(self) -> float | None: ...
+    @property
+    def streams(self) -> int | None: ...
+
+def ceiling(device: int | None = None, path: str | os.PathLike[str] | None = None) -> Ceiling:
+    """Measures the ceilings `Copy.ceiling` holds runs against, unless kept this boot: `path`'s
+    volume (default: the TensorFS cache) and, with `device`, pinned H2D to that GPU. Reads never
+    measure; a `Copy` is unmeasured (ceiling 0) until this runs, and a run faster than its
+    ceiling raises it."""
 
 def hold_tier(fd: int) -> int:
     """A claim on every region of the host-tier memfd `fd`, for an owner that maps none of it

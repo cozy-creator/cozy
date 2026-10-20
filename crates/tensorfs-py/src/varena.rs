@@ -118,6 +118,25 @@ fn copies() -> Vec<PyCopy> {
     varena::ceiling::take().into_iter().map(Into::into).collect()
 }
 
+record!(PyCeiling = "Ceiling" from tensorfs::io::Ceiling {
+    disk_gbps: f64, disk_direct: bool, h2d_gbps: Option<f64>, streams: Option<u32>
+});
+
+/// What reads can reach, measured unless kept this boot: `path`'s volume (default: the TensorFS
+/// cache) and, with `device`, pinned H2D to that GPU. Reads never measure; they log against this.
+#[pyfunction]
+#[pyo3(signature = (device=None, path=None))]
+fn ceiling(py: Python<'_>, device: Option<i32>, path: Option<std::path::PathBuf>) -> PyResult<PyCeiling> {
+    let path = match path {
+        Some(path) => path,
+        None => tensorfs::home::resolve(None).map_err(|e| IoError::new_err(e.to_string()))?,
+    };
+    py.detach(|| tensorfs::io::ceiling(device, &path)).map(Into::into).map_err(|e| match e.kind() {
+        std::io::ErrorKind::Unsupported => Unsupported::new_err(e.to_string()),
+        _ => IoError::new_err(e.to_string()),
+    })
+}
+
 #[pyclass(name = "Part", module = "tensorfs.varena", frozen, get_all)]
 pub struct PyPart {
     component: String,
@@ -797,8 +816,8 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
             $(m.add(stringify!($e), py.get_type::<$e>())?;)*
         };
     }
-    add!(PyGpu, PyHost, PyWeightSet, PyPinned, PyPart, PyCounters, PySetStats, PyGpuStats, PyCopy, PyLedger, PyRow, PyVictim, PyAdmit, PyRowFacts;
-        copies, hold_tier, release_tier;
+    add!(PyGpu, PyHost, PyWeightSet, PyPinned, PyPart, PyCounters, PySetStats, PyGpuStats, PyCopy, PyCeiling, PyLedger, PyRow, PyVictim, PyAdmit, PyRowFacts;
+        copies, ceiling, hold_tier, release_tier;
         VarenaError, DeviceFull, CudaError, CudaUnavailable, Invalid, IoError, Closed, Unsupported, LedgerError);
     #[cfg(feature = "store")]
     add!(; seal;);

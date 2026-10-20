@@ -435,14 +435,17 @@ fn many_destinations_at_once_from_a_writers_folder() {
     assert_eq!(io::ceiling(Some(0), &scratch.0).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
 }
 
-/// Host reads, by tensor or by stored location, go through the engine and log a disk run.
+/// Host reads, by tensor or by stored location, go through the engine and log a disk run. A run
+/// the page cache served is unmeasured; a cold one that beats the kept ceiling raises it.
 #[test]
 fn host_reads_run_through_the_engine_and_log_a_disk_run() {
-    // The copy log is process-wide and bounded: run alone, apart from the other reads here.
+    // The copy log is process-wide and bounded, and the ceiling table is this child's own.
     if std::env::var_os("TENSORFS_IO_LOG_CHILD").is_none() {
+        let home = Scratch::new("logged-home");
         let status = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "host_reads_run_through_the_engine_and_log_a_disk_run", "--nocapture"])
             .env("TENSORFS_IO_LOG_CHILD", "1")
+            .env("TENSORFS_HOME", &home.0)
             .status()
             .unwrap();
         assert!(status.success());
@@ -456,6 +459,23 @@ fn host_reads_run_through_the_engine_and_log_a_disk_run() {
     let runs = io::metrics::take();
     let run = runs.iter().find(|c| c.kind == "disk" && c.bytes == big.length);
     assert!(run.is_some_and(|c| c.gpu == -1 && c.ns > 0), "{runs:?}");
+    assert!(runs.iter().all(|c| c.cached == 0 || c.ceiling == 0.0), "{runs:?}");
+    if !cfg!(target_os = "linux") || !direct_ok(&ck) {
+        return;
+    }
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    let volume = platform::durable::device(&scratch.0).unwrap();
+    let table = PathBuf::from(std::env::var_os("TENSORFS_HOME").unwrap()).join("tmp/ceilings/table");
+    fs::create_dir_all(table.parent().unwrap()).unwrap();
+    fs::write(&table, format!("{} disk {volume}\t0.000001\t1\n", boot.trim())).unwrap();
+    evict(&ck);
+    assert_eq!(ck.read("unet", "big").unwrap(), noise(9, big.length as usize));
+    let runs = io::metrics::take();
+    // A loaded host may keep a page through the eviction; that run is unmeasured.
+    let Some(cold) = runs.iter().find(|c| c.kind == "disk" && c.cached == 0) else { return };
+    let rate = cold.bytes as f64 / cold.ns as f64;
+    assert!((cold.ceiling - rate).abs() < 1e-9, "a run faster than its ceiling raises it: {cold:?}");
+    assert_eq!(fs::read_to_string(&table).unwrap().lines().count(), 2);
 }
 
 /// Host read GB/s on this machine against `cat` and `dd iflag=direct` over the same chunk files
