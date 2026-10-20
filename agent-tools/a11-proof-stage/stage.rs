@@ -32,11 +32,22 @@ fn refuse(detail: impl Into<String>) -> Failure {
     }
 }
 fn read(root: &Path, bundle: &Bundle, at: &ObjectRef) -> tensorfs::failure::Result<Vec<u8>> {
-    if at.length > CAP || bundle.objects.get(&at.sha256) != Some(at) {
+    if at.length > CAP
+        || at.sha256.len() != 64
+        || !at
+            .sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || bundle.objects.get(&at.sha256) != Some(at)
+    {
         return Err(refuse(format!("not allowlisted metadata: {}", at.sha256)));
     }
-    let bytes = fs::read(root.join("objects").join(&at.sha256))
-        .map_err(|_| refuse(format!("missing metadata: {}", at.sha256)))?;
+    let path = root.join("objects").join(&at.sha256);
+    let metadata = fs::symlink_metadata(&path).map_err(|_| refuse("metadata is absent"))?;
+    if !metadata.is_file() || metadata.len() != at.length {
+        return Err(refuse("metadata file length/type mismatch"));
+    }
+    let bytes = fs::read(path).map_err(|_| refuse(format!("missing metadata: {}", at.sha256)))?;
     if ObjectRef::of(&bytes) != *at {
         return Err(refuse("metadata identity mismatch"));
     }
