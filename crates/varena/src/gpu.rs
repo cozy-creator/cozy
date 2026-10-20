@@ -319,6 +319,9 @@ struct Page {
     state: Mutex<State>,
     retired: AtomicBool,
     write_pins: AtomicUsize,
+    // Live owners are distinct from returned leases whose release is queued or
+    // being processed by another poller. Both remain protected by write_pins.
+    write_live: AtomicUsize,
     write_events: Mutex<Vec<Event>>,
     host_sources: Mutex<Vec<Arc<dyn Send + Sync>>>,
 }
@@ -373,6 +376,8 @@ pub struct Gpu {
     generation: Mutex<u64>,
     changed: Condvar,
     wakeup: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    write_waiters: AtomicUsize,
 }
 
 impl Gpu {
@@ -407,6 +412,8 @@ impl Gpu {
                 generation: Mutex::new(0),
                 changed: Condvar::new(),
                 wakeup: Mutex::new(None),
+                #[cfg(test)]
+                write_waiters: AtomicUsize::new(0),
             })
         })();
         if setup.is_err() {
@@ -506,6 +513,7 @@ impl Gpu {
                 state: Mutex::new(State::Empty),
                 retired: AtomicBool::new(false),
                 write_pins: AtomicUsize::new(0),
+                write_live: AtomicUsize::new(0),
                 write_events: Mutex::new(Vec::new()),
                 host_sources: Mutex::new(Vec::new()),
             }),
@@ -672,6 +680,7 @@ impl Gpu {
             };
             *phase = FillPhase::Transform;
             page.write_pins.fetch_add(1, Ordering::AcqRel);
+            page.write_live.fetch_add(1, Ordering::AcqRel);
             transform(FillPin {
                 gpu: self.clone(),
                 page: page.clone(),
@@ -681,12 +690,12 @@ impl Gpu {
                 streams: Mutex::new(BTreeSet::from([self.device.stream.raw()])),
             })?;
             *phase = FillPhase::Finish;
-            self.poll()?;
-            if page.write_pins.load(Ordering::Acquire) != 0 {
+            if page.write_live.load(Ordering::Acquire) != 0 {
                 return Err(Error::Internal(
                     "a page-in transform retained a writable view",
                 ));
             }
+            self.wait_write_returns(&page)?;
             let mut events = page.write_events.lock();
             for event in events.iter() {
                 event.synchronize()?;
@@ -785,6 +794,7 @@ impl Gpu {
                             .and_then(|_context| call!("cuCtxSynchronize", ctx_synchronize()));
                         if let Err(error) = done {
                             self.releases.push(release);
+                            self.write_changed();
                             return Err(error);
                         }
                         continue;
@@ -794,11 +804,15 @@ impl Gpu {
                         Ok(event) => release.page.write_events.lock().push(event),
                         Err(error) => {
                             self.releases.push(release);
+                            self.write_changed();
                             return Err(error);
                         }
                     }
                 }
                 release.page.write_pins.fetch_sub(1, Ordering::AcqRel);
+                // Wake an owner waiting for this exact returned lease even if a
+                // later unrelated cleanup fails before poll's final notification.
+                self.write_changed();
                 changed = true;
                 continue;
             }
@@ -892,14 +906,32 @@ impl Gpu {
         *self.wakeup.lock() = Some(wakeup);
     }
 
-    fn notify(&self) {
+    fn write_changed(&self) {
         let mut generation = self.generation.lock();
         *generation = generation.wrapping_add(1);
         self.changed.notify_all();
-        drop(generation);
+    }
+
+    fn notify(&self) {
+        self.write_changed();
         let wakeup = self.wakeup.lock().clone();
         if let Some(wakeup) = wakeup {
             let _ = catch_unwind(AssertUnwindSafe(|| wakeup()));
+        }
+    }
+
+    fn wait_write_returns(&self, page: &Page) -> Result<()> {
+        loop {
+            self.poll()?;
+            let mut generation = self.generation.lock();
+            if page.write_pins.load(Ordering::Acquire) == 0 {
+                return Ok(());
+            }
+            #[cfg(test)]
+            self.write_waiters.fetch_add(1, Ordering::AcqRel);
+            self.changed.wait(&mut generation);
+            #[cfg(test)]
+            self.write_waiters.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
@@ -1144,6 +1176,11 @@ impl Gpu {
         self.poll()?;
         let pages: Vec<_> = self.pages.lock().values().cloned().collect();
         for page in pages {
+            if page.write_live.load(Ordering::Acquire) == 0
+                && page.write_pins.load(Ordering::Acquire) != 0
+            {
+                self.wait_write_returns(&page)?;
+            }
             let mut state = page.state.lock();
             if let State::Failed(mapping, _) = &mut *state {
                 if page.write_pins.load(Ordering::Acquire) != 0 {
@@ -1233,6 +1270,91 @@ impl Drop for Gpu {
     }
 }
 
+/// Force the release-dequeued/producer-finishing interleaving on real CUDA.
+/// The observer counter exists only in native test binaries; it changes no wait.
+#[cfg(test)]
+pub(crate) fn returned_write_release_interleaving() -> Result<()> {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let gpu = Gpu::open(0)?;
+    let length = crate::layout::REGION_ALIGN;
+    gpu.register(
+        1,
+        gpu.reserve(length)?,
+        0,
+        length,
+        Arc::new(Source::files(vec![], false, 0)),
+        vec![Item {
+            offset: 0,
+            len: 1,
+            part_end: true,
+            source: io::ItemSource::Inline(vec![7].into()),
+        }],
+        0,
+        "returned-write-interleaving".into(),
+    )?;
+    let (sent, returned) = mpsc::channel();
+    let filling = gpu.clone();
+    let worker = thread::spawn(move || {
+        filling.fill_with(1, |write| {
+            drop(write);
+            // This standalone Gpu has no automatic poller. Retain the exact release
+            // as another poller would after dequeue, before recording its fences.
+            let release = filling.releases.pop().expect("returned writable lease");
+            assert!(sent.send(release).is_ok(), "release observer disappeared");
+            Ok(())
+        })
+    });
+    let release = returned
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| Error::Internal("fill did not return its writable lease"))?;
+    let page = gpu.page(1)?;
+    assert_eq!(page.write_live.load(Ordering::Acquire), 0);
+    assert_eq!(page.write_pins.load(Ordering::Acquire), 1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let waited = loop {
+        if gpu.write_waiters.load(Ordering::Acquire) != 0 {
+            break true;
+        }
+        if worker.is_finished() || Instant::now() >= deadline {
+            break false;
+        }
+        thread::yield_now();
+    };
+    gpu.releases.push(release);
+    let completion = gpu.poll();
+    let filled = worker
+        .join()
+        .map_err(|_| Error::Internal("fill worker panicked"))?;
+    completion?;
+    if !waited {
+        return Err(Error::Internal(
+            "returned write was mistaken for a retained view",
+        ));
+    }
+    filled?;
+    let pin = gpu.bind(1, 0)?;
+    let mut bytes = [0_u8; 1];
+    unsafe {
+        io::read(
+            &[io::Copy {
+                src: io::Src::Device {
+                    device: 0,
+                    ptr: pin.ptr,
+                    stream: 0,
+                },
+                dst: io::Dst::host(&mut bytes),
+            }],
+            &io::ReadOpts::default(),
+        )
+    }?;
+    assert_eq!(bytes, [7]);
+    drop(pin);
+    gpu.wait_pending()?;
+    assert!(gpu.unregister(1)?);
+    Ok(())
+}
+
 /// The storage owner. Every stream that sees its pointer must first call `wait_on`.
 pub struct Pin {
     gpu: Arc<Gpu>,
@@ -1290,6 +1412,7 @@ impl Drop for FillPin {
             streams: self.streams.get_mut().clone(),
             writable: true,
         });
+        self.page.write_live.fetch_sub(1, Ordering::AcqRel);
         self.gpu.notify();
     }
 }
