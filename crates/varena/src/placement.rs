@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use tensorfs::io::source::Source;
 use tensorfs::io::ReadStats;
 
-use crate::gpu::{Gpu, Pin};
+use crate::gpu::{FillPin, Gpu, Pin};
 use crate::layout::Layout;
 use crate::ledger::{self, Channel, Ledger, PageKey};
 use crate::plan::{
@@ -23,7 +23,7 @@ use crate::plan::{
 use crate::{Error, Result};
 
 pub type Shrink = dyn Fn(u64) -> Result<u64> + Send + Sync;
-pub type Transform = dyn Fn(PageId, u64, u64, usize) -> Result<()> + Send + Sync;
+pub type Transform = dyn Fn(PageId, FillPin) -> Result<()> + Send + Sync;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Relief {
@@ -79,6 +79,7 @@ struct Request {
     package: String,
     shape: String,
     stats: Stats,
+    budgets: BTreeMap<u32, u64>,
 }
 
 struct Inner {
@@ -201,6 +202,24 @@ impl Placement {
 
     pub fn device(&self) -> i32 {
         self.gpu.device()
+    }
+
+    pub fn gpu_uuid(&self) -> Result<String> {
+        self.gpu.uuid()
+    }
+
+    pub fn available(&self) -> Result<u64> {
+        self.refresh()?;
+        Ok(self.inner.lock().table.available())
+    }
+
+    pub fn close(&self) -> Result<()> {
+        let models: Vec<_> = self.inner.lock().models.keys().copied().collect();
+        for model in models {
+            self.close_model(model)?;
+        }
+        self.stop.store(true, Ordering::Release);
+        self.row.wake()
     }
 
     pub fn load(&self, model: ModelId, level: Tier) -> Result<Relief> {
@@ -334,11 +353,17 @@ impl Placement {
                 package,
                 shape,
                 stats: Stats::default(),
+                budgets: BTreeMap::new(),
             },
         );
-        Self::declare_locked(&mut inner, id, steps)?;
+        if let Err(error) = Self::declare_locked(&mut inner, id, steps) {
+            inner.table.requests.retain(|request| request.id != id);
+            inner.requests.remove(&id);
+            return Err(error);
+        }
         drop(inner);
-        self.refresh()
+        self.refresh()?;
+        self.event(id, 0, "begin", "request")
     }
 
     pub fn declare(&self, id: RequestId, steps: Vec<Vec<ModelId>>) -> Result<()> {
@@ -455,7 +480,9 @@ impl Placement {
                 }
             }
         }
-        self.drive(request, Trigger::StepStart(request))
+        let result = self.drive(request, Trigger::StepStart(request))?;
+        self.capture_budget(request);
+        Ok(result)
     }
 
     pub fn bind(&self, request: RequestId, page: PageId, stream: usize) -> Result<Pin> {
@@ -468,6 +495,7 @@ impl Placement {
                 });
             }
         }
+        self.event(request, page, "bind", "demand")?;
         let pin = self.gpu.bind(page, stream)?;
         {
             let mut inner = self.inner.lock();
@@ -526,7 +554,8 @@ impl Placement {
     }
 
     pub fn end(&self, request: RequestId) -> Result<Stats> {
-        self.gpu.recover()?;
+        let recovered = self.gpu.recover();
+        self.event(request, 0, "end", "request")?;
         let mut inner = self.inner.lock();
         inner.table.requests.retain(|row| row.id != request);
         inner
@@ -550,6 +579,7 @@ impl Placement {
             .stats;
         drop(inner);
         self.refresh()?;
+        recovered?;
         Ok(stats)
     }
 
@@ -1065,7 +1095,7 @@ impl Placement {
             reason,
             bytes,
             capacity: inner.table.capacity,
-            working_set: inner.table.remaining(request),
+            working_set: inner.table.working_set(request),
             resident: inner
                 .table
                 .pages
@@ -1080,7 +1110,11 @@ impl Placement {
                 .filter(|page| page.mapped() && inner.table.class(page) == Class::Orphan)
                 .map(|page| page.bytes)
                 .sum(),
-            speculative_budget: inner.table.speculative_budget(request),
+            speculative_budget: inner
+                .requests
+                .get(&request)
+                .and_then(|run| run.budgets.get(&step))
+                .copied(),
         };
         if let Some(run) = inner.requests.get_mut(&request) {
             run.stats.events.push(event);
@@ -1093,7 +1127,7 @@ impl Placement {
         &self,
         request: RequestId,
         page: PageId,
-        from: Tier,
+        _from: Tier,
         speculative: Option<Step>,
     ) -> Result<()> {
         self.event(
@@ -1142,14 +1176,11 @@ impl Placement {
                 },
             )
         };
-        let apply = |ptr, bytes, stream| {
-            transform
-                .as_ref()
-                .map_or(Ok(()), |fill| fill(page, ptr, bytes, stream))
-        };
+        let apply = |pin| transform.as_ref().map_or(Ok(()), |fill| fill(page, pin));
         let ram = self
             .channel
             .ram(self.row.owner(), key.fingerprint, key.page)?;
+        let actual = if ram.is_some() { Tier::Ram } else { Tier::Disk };
         let stats = if let Some(ram) = ram {
             let mapped = Ram::map(ram)?;
             self.gpu.fill_from_ram_with(page, mapped.bytes(), apply)?
@@ -1170,13 +1201,24 @@ impl Placement {
             run.stats.copies.push(Copy {
                 request,
                 page,
-                tier: from,
+                tier: actual,
                 speculative: speculative.is_some(),
                 stats,
             });
         }
         inner.progress = inner.progress.saturating_add(1);
         Ok(())
+    }
+
+    fn capture_budget(&self, request: RequestId) {
+        let mut inner = self.inner.lock();
+        let current = inner.table.request(request).map(|row| row.position.step);
+        let budget = inner.table.speculative_budget(request);
+        if let (Some(step), Some(budget)) = (current, budget) {
+            if let Some(run) = inner.requests.get_mut(&request) {
+                run.budgets.entry(step).or_insert(budget);
+            }
+        }
     }
 }
 
