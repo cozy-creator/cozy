@@ -1065,7 +1065,13 @@ mod exact_tests {
         let root = std::env::temp_dir().join(format!("cm-release-{}", uuid::Uuid::new_v4()));
         let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
         let store = crate::storage::open(&root.join("store")).unwrap();
-        let config = serde_json::from_value(json!({"devices": "GPU-test-release", "prespawn": false})).unwrap();
+        let device = format!("GPU-test-release-{}", uuid::Uuid::new_v4());
+        let config = serde_json::from_value(json!({
+            "devices": device, "prespawn": false,
+            "inventory": [{"device_index": 0, "device_name": "CPU lane fixture",
+                "device_uuid": device, "driver_version": "fixture",
+                "memory_bytes": 8u64 << 30, "pci_bus_id": "fixture"}]
+        })).unwrap();
         let pool = crate::gpu_service::Pool::new(&root.join("gpu"), config, store.clone()).unwrap();
         service.configure_pool(pool.clone()).unwrap();
         let broker = Calls::configure(&service, crate::origin::Machine::new(store, None).unwrap(), None).unwrap();
