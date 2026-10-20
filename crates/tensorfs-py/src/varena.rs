@@ -935,13 +935,59 @@ mod tests {
                             bytes: 7,
                             ..Default::default()
                         },
+                        io: vec![tensorfs::io::metrics::Copy {
+                            kind: "h2d",
+                            gpu: 0,
+                            bytes: 7,
+                            ns: 10,
+                            ..Default::default()
+                        }],
                     }],
+                    proof: varena::placement::TransferProof {
+                        version: 1,
+                        complete: true,
+                        isolated: true,
+                        capacity: 4096,
+                        pages: vec![varena::placement::ProofPage {
+                            page: 2,
+                            content: "fingerprint/0".into(),
+                            payload: 7,
+                            mapped: 4096,
+                        }],
+                        initial: vec![2],
+                        invalid: vec![],
+                    },
                     ..Default::default()
                 },
             )
             .unwrap();
             let report = report.bind(py);
             assert!(report.get_item("events").unwrap().is_some());
+            let io = report.get_item("io").unwrap().unwrap();
+            let io = io.cast::<PyList>().unwrap();
+            assert_eq!(io.len(), 1);
+            assert_eq!(
+                io.get_item(0)
+                    .unwrap()
+                    .getattr("bytes")
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                7
+            );
+            let proof = report.get_item("proof").unwrap().unwrap();
+            assert_eq!(
+                proof.get_item("version").unwrap().extract::<u32>().unwrap(),
+                1
+            );
+            assert_eq!(
+                proof
+                    .get_item("initial")
+                    .unwrap()
+                    .extract::<Vec<u64>>()
+                    .unwrap(),
+                [2]
+            );
             let copied = report.get_item("copies").unwrap().unwrap();
             let copied = copied.cast::<PyList>().unwrap();
             let first = copied.get_item(0).unwrap();
