@@ -391,6 +391,16 @@ mod tests {
     }
 
     #[test]
+    fn completed_copies_survive_a_later_operation_error() {
+        let (result, rows): (Result<(), &str>, _) = capture(|| {
+            sample(17);
+            Err("transform failed after I/O")
+        });
+        assert_eq!(result, Err("transform failed after I/O"));
+        assert_eq!(rows.iter().map(|row| row.bytes).collect::<Vec<_>>(), [17]);
+    }
+
+    #[test]
     fn nested_and_unwound_operations_restore_the_outer_capture() {
         let (_, outer) = capture(|| {
             sample(1);

@@ -20,6 +20,7 @@ pub struct RequestMemory {
     pub leftover_by_gpu: Vec<(i32, u64)>,
     pub plan: Vec<Vec<String>>,
     pub copies: Vec<MemoryCopy>,
+    pub proofs: Vec<TransferProof>,
     // Serialized once at CallMemory.trace, not duplicated inside stats.
     #[serde(skip_serializing)]
     pub trace: Vec<TraceEvent>,
@@ -81,6 +82,7 @@ pub struct TraceEvent {
     pub sequence: u64,
     pub request: String,
     pub step: u64,
+    pub pass_index: u64,
     pub page: u64,
     pub gpu: i32,
     pub rank: u32,
@@ -95,6 +97,30 @@ pub struct TraceEvent {
     pub class: String,
     pub working_set: Option<u64>,
     pub speculative_budget: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProofPage {
+    pub page: u64,
+    pub content: String,
+    pub payload: u64,
+    pub mapped: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TransferProof {
+    pub request: String,
+    pub gpu: i32,
+    pub rank: u32,
+    pub version: u32,
+    pub complete: bool,
+    pub isolated: bool,
+    pub capacity: u64,
+    pub pages: Vec<ProofPage>,
+    pub initial: Vec<u64>,
+    pub invalid: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -154,7 +180,11 @@ impl CallMemory {
         };
         Some(Self {
             stats: reply.memory.clone(),
-            trace: reply.memory.as_ref().map(|memory| memory.trace.clone()).unwrap_or_default(),
+            trace: reply
+                .memory
+                .as_ref()
+                .map(|memory| memory.trace.clone())
+                .unwrap_or_default(),
             peak_allocated_bytes: known(metrics.peak_vram_bytes),
             peak_reserved_bytes: known(metrics.peak_reserved_bytes),
             activation_peak_bytes: known(plane.activation_peak_bytes)
@@ -210,6 +240,10 @@ mod tests {
                 "reason": "orphan", "nbytes": 4096}],
             "peaks": [{"model": "dit", "shape": "64x64", "peak": 2048, "cuts": []}],
             "retries": 1, "leftover_by_gpu": [[0, 0]], "plan": [["dit"], ["vae"]],
+            "proofs": [{"request": "request-1", "gpu": 0, "rank": 1, "version": 1,
+                "complete": true, "isolated": true, "capacity": 8192,
+                "pages": [{"page": 3, "content": "fingerprint/0", "payload": 3072, "mapped": 4096}],
+                "initial": [3], "invalid": []}],
             "copies": [{"kind": "h2d", "gpu": 0, "bytes": 8192, "seconds": 0.1,
                 "gbps": 0.00008192, "ceiling": 0.0001, "pct": 81.92, "link": "PCIe"}],
             "trace": [{"sequence": 1, "request": "request-1", "step": 0,
@@ -228,6 +262,7 @@ mod tests {
         assert_eq!(public["stats"]["peaks"], measured["peaks"]);
         assert_eq!(public["stats"]["plan"], measured["plan"]);
         assert_eq!(public["stats"]["copies"][0]["pct"], 81.92);
+        assert_eq!(public["stats"]["proofs"], measured["proofs"]);
         assert_eq!(public["trace"], measured["trace"]);
         assert!(public["stats"].get("trace").is_none());
     }
@@ -239,7 +274,9 @@ mod tests {
             serde_json::json!({"copies": [{"bytes": -1}]}),
             serde_json::json!({"trace": [{"bytes": -1}]}),
         ] {
-            assert!(serde_json::from_value::<Frame>(serde_json::json!({"memory": memory})).is_err());
+            assert!(
+                serde_json::from_value::<Frame>(serde_json::json!({"memory": memory})).is_err()
+            );
         }
     }
 
@@ -254,13 +291,23 @@ mod tests {
                 "request_shape": "vae.decode"}
         }))
         .unwrap();
-        let before = PlaneFacts { h2d_bytes: Some(3000), evictions: Some(2), ..Default::default() };
+        let before = PlaneFacts {
+            h2d_bytes: Some(3000),
+            evictions: Some(2),
+            ..Default::default()
+        };
         let memory = CallMemory::of(&reply, &before).unwrap();
         assert_eq!(memory.peak_reserved_bytes, Some(1000));
         assert_eq!(memory.activation_peak_bytes, Some(350));
         assert_eq!(memory.stage_peaks["vae.decode"], 300);
-        assert_eq!((memory.paged_in_bytes, memory.evictions), (Some(2000), Some(5)));
-        assert_eq!((memory.weights_bytes, memory.context_bytes), (Some(500), None));
+        assert_eq!(
+            (memory.paged_in_bytes, memory.evictions),
+            (Some(2000), Some(5))
+        );
+        assert_eq!(
+            (memory.weights_bytes, memory.context_bytes),
+            (Some(500), None)
+        );
         assert_eq!(memory.paged_out, None);
         assert_eq!(memory.shortfall.unwrap().needed_bytes, 1200);
         assert!(CallMemory::of(&Frame::default(), &before).is_none());

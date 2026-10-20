@@ -28,7 +28,7 @@ from torch.utils.hooks import RemovableHandle
 import tensorfs
 
 from . import Copy as CopyRun
-from . import Plane, VarenaError, WeightSet, copies, cuts
+from . import Plane, VarenaError, WeightSet, cuts
 
 #: TensorFS dtype names; an `F4` part is u8 pairs.
 DTYPES: dict[str, torch.dtype] = {
@@ -175,7 +175,7 @@ class Peak:
 
 @dataclass(frozen=True, slots=True)
 class Copy:
-    """A run of weight copies since the last request (`varena.copies()`): a restore, refill or
+    """A run of weight copies owned by this request's actual fill: a restore, refill or
     fill (`h2d`), or a host layout read from disk (`disk`), against the measured `ceiling` GB/s.
     `pct` is None while that ceiling is unmeasured. `busy_s` is the GPU's copy time, `pin_s` the
     host's page locking."""
@@ -230,6 +230,7 @@ class RequestStats:
     plan: tuple[tuple[str, ...], ...] = ()
     copies: tuple[Copy, ...] = ()
     trace: tuple[Mapping[str, object], ...] = ()
+    proofs: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1047,7 +1048,7 @@ class Memory:
             raw: dict[str, Any] = (
                 self.native.end(request.native_id)
                 if self.native is not None
-                else {"events": [], "copies": [], "peak": 0}
+                else {"events": [], "copies": [], "io": [], "peak": 0}
             )
             trace = tuple(
                 {
@@ -1091,8 +1092,10 @@ class Memory:
                 self.memo.retries,
                 (),
                 request.declared,
-                tuple(_copy(row) for row in copies()),
+                tuple(_copy(row) for row in raw["io"]),
                 trace,
+                ({**raw["proof"], "gpu": self.gpu, "request": id},)
+                if "proof" in raw else (),
             )
 
     def resident(self) -> dict[str, int]:

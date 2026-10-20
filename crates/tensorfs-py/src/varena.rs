@@ -126,8 +126,12 @@ struct PyCeiling {
 }
 impl From<tensorfs::io::Ceiling> for PyCeiling {
     fn from(value: tensorfs::io::Ceiling) -> Self {
-        Self { disk_gbps: value.disk_gbps, disk_direct: value.disk_direct,
-            h2d_gbps: value.h2d_gbps, streams: value.streams }
+        Self {
+            disk_gbps: value.disk_gbps,
+            disk_direct: value.disk_direct,
+            h2d_gbps: value.h2d_gbps,
+            streams: value.streams,
+        }
     }
 }
 
@@ -135,7 +139,11 @@ impl From<tensorfs::io::Ceiling> for PyCeiling {
 /// cache) and, with `device`, pinned H2D to that GPU. Reads never measure; they log against this.
 #[pyfunction]
 #[pyo3(signature = (device=None, path=None))]
-fn ceiling(py: Python<'_>, device: Option<i32>, path: Option<std::path::PathBuf>) -> PyResult<PyCeiling> {
+fn ceiling(
+    py: Python<'_>,
+    device: Option<i32>,
+    path: Option<std::path::PathBuf>,
+) -> PyResult<PyCeiling> {
     let path = match path {
         Some(path) => path,
         None => {
@@ -145,16 +153,21 @@ fn ceiling(py: Python<'_>, device: Option<i32>, path: Option<std::path::PathBuf>
             }
             #[cfg(not(feature = "store"))]
             {
-                return Err(raise(py, Error::Unsupported(
-                    "a ceiling probe without store support requires an explicit path".into(),
-                )));
+                return Err(raise(
+                    py,
+                    Error::Unsupported(
+                        "a ceiling probe without store support requires an explicit path".into(),
+                    ),
+                ));
             }
-        },
+        }
     };
-    py.detach(|| tensorfs::io::ceiling(device, &path)).map(Into::into).map_err(|e| match e.kind() {
-        std::io::ErrorKind::Unsupported => raise(py, Error::Unsupported(e.to_string())),
-        _ => raise(py, Error::Io(e.to_string())),
-    })
+    py.detach(|| tensorfs::io::ceiling(device, &path))
+        .map(Into::into)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::Unsupported => raise(py, Error::Unsupported(e.to_string())),
+            _ => raise(py, Error::Io(e.to_string())),
+        })
 }
 
 #[pyclass(name = "Part", module = "tensorfs.varena", frozen, get_all)]
@@ -566,11 +579,13 @@ fn stats(py: Python<'_>, value: Stats) -> PyResult<Py<PyDict>> {
     let out = PyDict::new(py);
     let mut events = Vec::new();
     let mut copies = Vec::new();
+    let mut io = Vec::new();
     for e in value.events {
         let item = PyDict::new(py);
         item.set_item("sequence", e.sequence)?;
         item.set_item("request", e.request)?;
         item.set_item("step", e.step)?;
+        item.set_item("pass_index", e.pass_index)?;
         item.set_item("model", e.model)?;
         item.set_item("page", e.page)?;
         item.set_item("class", format!("{:?}", e.class).to_ascii_lowercase())?;
@@ -585,6 +600,9 @@ fn stats(py: Python<'_>, value: Stats) -> PyResult<Py<PyDict>> {
         events.push(item.unbind());
     }
     for c in value.copies {
+        for row in c.io {
+            io.push(Py::new(py, PyCopy::from(row))?);
+        }
         let item = PyDict::new(py);
         item.set_item("request", c.request)?;
         item.set_item("page", c.page)?;
@@ -606,6 +624,25 @@ fn stats(py: Python<'_>, value: Stats) -> PyResult<Py<PyDict>> {
     }
     out.set_item("events", events)?;
     out.set_item("copies", copies)?;
+    out.set_item("io", io)?;
+    let proof = PyDict::new(py);
+    proof.set_item("version", value.proof.version)?;
+    proof.set_item("complete", value.proof.complete)?;
+    proof.set_item("isolated", value.proof.isolated)?;
+    proof.set_item("capacity", value.proof.capacity)?;
+    proof.set_item("initial", value.proof.initial)?;
+    proof.set_item("invalid", value.proof.invalid)?;
+    let mut pages = Vec::new();
+    for page in value.proof.pages {
+        let item = PyDict::new(py);
+        item.set_item("page", page.page)?;
+        item.set_item("content", page.content)?;
+        item.set_item("payload", page.payload)?;
+        item.set_item("mapped", page.mapped)?;
+        pages.push(item.unbind());
+    }
+    proof.set_item("pages", pages)?;
+    out.set_item("proof", proof)?;
     out.set_item("peak", value.peak)?;
     Ok(out.unbind())
 }
@@ -835,12 +872,9 @@ struct PyCopy {
     staged: u64,
     cached: u64,
 }
-#[pyfunction]
-fn copies(py: Python<'_>) -> PyResult<Vec<PyCopy>> {
-    let values = native(py, || Ok(tensorfs::io::metrics::take()))?;
-    Ok(values
-        .into_iter()
-        .map(|c| PyCopy {
+impl From<tensorfs::io::metrics::Copy> for PyCopy {
+    fn from(c: tensorfs::io::metrics::Copy) -> Self {
+        Self {
             kind: c.kind.into(),
             gpu: c.gpu,
             bytes: c.bytes,
@@ -851,8 +885,13 @@ fn copies(py: Python<'_>) -> PyResult<Vec<PyCopy>> {
             pin_ns: c.pin_ns,
             staged: c.staged,
             cached: c.cached,
-        })
-        .collect())
+        }
+    }
+}
+#[pyfunction]
+fn copies(py: Python<'_>) -> PyResult<Vec<PyCopy>> {
+    let values = native(py, || Ok(tensorfs::io::metrics::take()))?;
+    Ok(values.into_iter().map(PyCopy::from).collect())
 }
 pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();

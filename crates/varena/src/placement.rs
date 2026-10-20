@@ -38,6 +38,7 @@ pub struct Event {
     pub sequence: u64,
     pub request: RequestId,
     pub step: u32,
+    pub pass_index: u64,
     pub model: Option<ModelId>,
     pub page: PageId,
     pub class: Class,
@@ -60,6 +61,54 @@ pub struct Copy {
     pub speculative: bool,
     pub streamed: bool,
     pub stats: ReadStats,
+    /// Completed I/O, retained even when a later transform or publication fails.
+    pub io: Vec<tensorfs::io::metrics::Copy>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProofPage {
+    pub page: PageId,
+    pub content: String,
+    pub payload: u64,
+    pub mapped: u64,
+}
+
+impl ProofPage {
+    fn catalog(pages: &[PageId], fingerprint: &[u8; 32], layout: &Layout) -> Vec<Self> {
+        pages
+            .iter()
+            .zip(&layout.regions)
+            .enumerate()
+            .map(|(index, (&page, region))| Self {
+                page,
+                content: format!("{}/{}", tensorfs::sha256::hex(fingerprint), index),
+                payload: region.items.iter().map(|item| item.len).sum(),
+                mapped: region.span,
+            })
+            .collect()
+    }
+}
+
+/// A conservative H2D bound may use this catalog only for an isolated request/GPU.
+/// Page identities include the encoding/transform/rank fingerprint and region number.
+#[derive(Clone, Debug, Default)]
+pub struct TransferProof {
+    pub version: u32,
+    pub complete: bool,
+    pub isolated: bool,
+    pub capacity: u64,
+    pub pages: Vec<ProofPage>,
+    pub initial: Vec<PageId>,
+    pub invalid: Vec<&'static str>,
+}
+
+impl TransferProof {
+    fn invalidate(&mut self, reason: &'static str) {
+        self.complete = false;
+        if !self.invalid.contains(&reason) {
+            self.invalid.push(reason);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -67,6 +116,7 @@ pub struct Stats {
     pub events: Vec<Event>,
     pub copies: Vec<Copy>,
     pub peak: u64,
+    pub proof: TransferProof,
 }
 
 struct Model {
@@ -74,6 +124,7 @@ struct Model {
     pages: Vec<PageId>,
     fingerprint: [u8; 32],
     transform: Option<Arc<Transform>>,
+    proof_pages: Vec<ProofPage>,
 }
 
 struct Request {
@@ -83,6 +134,7 @@ struct Request {
     shape: String,
     stats: Stats,
     budgets: BTreeMap<u32, u64>,
+    pass_index: u64,
 }
 
 struct Cache {
@@ -103,6 +155,46 @@ struct Inner {
     next_page: PageId,
     progress: u64,
     trim: Option<Arc<Shrink>>,
+}
+
+impl TransferProof {
+    fn snapshot(inner: &Inner) -> Self {
+        let pages: Vec<_> = inner
+            .models
+            .values()
+            .flat_map(|model| model.proof_pages.iter().cloned())
+            .collect();
+        let initial: Vec<_> = inner
+            .table
+            .pages
+            .iter()
+            .filter(|page| page.kind == Kind::Weight && page.mapped())
+            .map(|page| page.id)
+            .collect();
+        let mut proof = Self {
+            version: 1,
+            complete: true,
+            isolated: inner.requests.is_empty() && !foreign_holdings(inner),
+            capacity: inner.table.capacity,
+            pages,
+            initial,
+            invalid: vec![],
+        };
+        if proof
+            .initial
+            .iter()
+            .any(|id| !proof.pages.iter().any(|page| page.page == *id))
+        {
+            proof.invalidate("unknown-initial-content");
+        }
+        proof
+    }
+}
+
+fn foreign_holdings(inner: &Inner) -> bool {
+    inner.table.remote.iter().any(|row| {
+        row.context != 0 || row.classes.iter().any(|bytes| *bytes != 0) || !row.remaining.is_empty()
+    })
 }
 
 pub struct Placement {
@@ -365,8 +457,12 @@ impl Placement {
                 pages: pages.clone(),
                 fingerprint,
                 transform,
+                proof_pages: ProofPage::catalog(&pages, &fingerprint, layout),
             },
         );
+        for run in self.inner.lock().requests.values_mut() {
+            run.stats.proof.invalidate("registration-changed");
+        }
         self.refresh()?;
         rollback.committed = true;
         Ok(pages)
@@ -389,10 +485,15 @@ impl Placement {
         shape: String,
     ) -> Result<()> {
         let _operation = self.operations.lock();
+        self.refresh()?;
         if self.inner.lock().requests.contains_key(&id) {
             return Err(invalid("request already active"));
         }
         let mut inner = self.inner.lock();
+        let proof = TransferProof::snapshot(&inner);
+        for run in inner.requests.values_mut() {
+            run.stats.proof.isolated = false;
+        }
         inner.table.requests.push(plan::Request {
             id,
             row: self.row.owner().row,
@@ -414,19 +515,29 @@ impl Placement {
                 explicit: false,
                 package,
                 shape,
-                stats: Stats::default(),
+                stats: Stats {
+                    proof,
+                    ..Stats::default()
+                },
                 budgets: BTreeMap::new(),
+                pass_index: 0,
             },
         );
         if let Err(error) = Self::declare_locked(&mut inner, id, steps) {
-            inner.table.requests.retain(|request| request.id != id);
-            inner.requests.remove(&id);
+            Self::remove_request(&mut inner, id);
             return Err(error);
         }
+        Self::event_locked(&mut inner, id, 0, "begin", "request")?;
         drop(inner);
+        let mut rollback = Beginning {
+            owner: self,
+            request: id,
+            committed: false,
+        };
         self.hydrate(id)?;
         self.refresh()?;
-        self.event(id, 0, "begin", "request")
+        rollback.committed = true;
+        Ok(())
     }
 
     pub fn declare(&self, id: RequestId, steps: Vec<Vec<ModelId>>) -> Result<()> {
@@ -826,6 +937,7 @@ impl Placement {
                 .get_mut(&request)
                 .ok_or_else(|| invalid("unknown request"))?;
             run.stats.peak = run.stats.peak.max(resident.saturating_add(peak));
+            run.pass_index = run.pass_index.saturating_add(1);
             (key, run.shape.clone())
         };
         self.ledger.record_peak(&key, &shape, peak)?;
@@ -847,6 +959,19 @@ impl Placement {
             .get(&request)
             .filter(|_| measured)
             .map(|run| (run.package.clone(), run.shape.clone(), run.stats.peak));
+        let stats = Self::remove_request(&mut inner, request)
+            .ok_or_else(|| invalid("unknown request"))?
+            .stats;
+        drop(inner);
+        self.refresh()?;
+        recovered?;
+        if let Some((package, shape, peak)) = peak {
+            self.ledger.record_peak(&package, &shape, peak)?;
+        }
+        Ok(stats)
+    }
+
+    fn remove_request(inner: &mut Inner, request: RequestId) -> Option<Request> {
         inner.table.requests.retain(|row| row.id != request);
         inner
             .table
@@ -863,18 +988,7 @@ impl Placement {
                 page.speculative_for = None;
             }
         }
-        let stats = inner
-            .requests
-            .remove(&request)
-            .ok_or_else(|| invalid("unknown request"))?
-            .stats;
-        drop(inner);
-        self.refresh()?;
-        recovered?;
-        if let Some((package, shape, peak)) = peak {
-            self.ledger.record_peak(&package, &shape, peak)?;
-        }
-        Ok(stats)
+        inner.requests.remove(&request)
     }
 
     pub fn stats(&self, request: RequestId) -> Result<Stats> {
@@ -1040,6 +1154,9 @@ impl Placement {
             let Some(model) = inner.models.remove(&id) else {
                 return Ok(());
             };
+            for run in inner.requests.values_mut() {
+                run.stats.proof.invalidate("registration-changed");
+            }
             inner.retired.extend(model.pages.iter().copied());
             for page in inner
                 .table
@@ -1176,6 +1293,12 @@ impl Placement {
                 reaping: row.state == ledger::State::Reaping,
             })
             .collect();
+        let shared = inner.requests.len() > 1 || foreign_holdings(&inner);
+        let capacity = inner.table.capacity;
+        for run in inner.requests.values_mut() {
+            run.stats.proof.isolated &= !shared;
+            run.stats.proof.capacity = run.stats.proof.capacity.max(capacity);
+        }
         inner.table.rows = status
             .rows
             .iter()
@@ -1504,6 +1627,16 @@ impl Placement {
         reason: &'static str,
     ) -> Result<()> {
         let mut inner = self.inner.lock();
+        Self::event_locked(&mut inner, request, page, kind, reason)
+    }
+
+    fn event_locked(
+        inner: &mut Inner,
+        request: RequestId,
+        page: PageId,
+        kind: &'static str,
+        reason: &'static str,
+    ) -> Result<()> {
         let (class, bytes, model) = inner
             .table
             .page(page)
@@ -1518,6 +1651,7 @@ impl Placement {
             sequence: inner.progress,
             request,
             step,
+            pass_index: inner.requests.get(&request).map_or(0, |run| run.pass_index),
             page,
             model,
             class,
@@ -1547,6 +1681,9 @@ impl Placement {
                 .copied(),
         };
         if let Some(run) = inner.requests.get_mut(&request) {
+            if kind == "bind" && !run.stats.proof.pages.iter().any(|known| known.page == page) {
+                run.stats.proof.invalidate("unknown-demand-content");
+            }
             run.stats.events.push(event);
         }
         inner.progress = inner.progress.saturating_add(1);
@@ -1616,12 +1753,38 @@ impl Placement {
             .channel
             .ram(self.row.owner(), key.fingerprint, key.page)?;
         let actual = if ram.is_some() { Tier::Ram } else { Tier::Disk };
-        let stats = if let Some(ram) = ram {
-            let mapped = Ram::map(ram)?;
-            self.gpu.fill_from_ram_with(page, mapped.bytes(), apply)?
-        } else {
-            self.gpu.fill_with(page, apply)?
-        };
+        let (result, io) = tensorfs::io::metrics::capture(|| {
+            if let Some(ram) = ram {
+                let mapped = Ram::map(ram)?;
+                self.gpu.fill_from_ram_with(page, mapped.bytes(), apply)
+            } else {
+                self.gpu.fill_with(page, apply)
+            }
+        });
+        // Record before propagating the error: a transform may fail after real copies
+        // completed, and a retry must not erase their traffic.
+        let mut stats = result.as_ref().copied().unwrap_or_default();
+        stats.bytes = io
+            .iter()
+            .filter(|copy| copy.kind == "h2d")
+            .map(|copy| copy.bytes)
+            .sum();
+        if let Some(run) = self.inner.lock().requests.get_mut(&request) {
+            if result.is_err() {
+                run.stats.proof.invalidate("fill-failed");
+            }
+            run.stats.copies.push(Copy {
+                request,
+                model,
+                page,
+                tier: actual,
+                speculative: speculative.is_some(),
+                streamed,
+                stats,
+                io,
+            });
+        }
+        result?;
         let (spans, container) = self.gpu.export(page)?;
         self.channel
             .keep(self.row.owner(), key, &spans, container.as_fd())?;
@@ -1631,17 +1794,6 @@ impl Placement {
             if let Some(step) = speculative {
                 row.attempted.insert(step);
             }
-        }
-        if let Some(run) = inner.requests.get_mut(&request) {
-            run.stats.copies.push(Copy {
-                request,
-                model,
-                page,
-                tier: actual,
-                speculative: speculative.is_some(),
-                streamed,
-                stats,
-            });
         }
         inner.progress = inner.progress.saturating_add(1);
         Ok(())
@@ -1655,6 +1807,20 @@ impl Placement {
             if let Some(run) = inner.requests.get_mut(&request) {
                 run.budgets.entry(step).or_insert(budget);
             }
+        }
+    }
+}
+
+struct Beginning<'a> {
+    owner: &'a Placement,
+    request: RequestId,
+    committed: bool,
+}
+impl Drop for Beginning<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            Placement::remove_request(&mut self.owner.inner.lock(), self.request);
+            let _ = self.owner.row.wake();
         }
     }
 }
@@ -1801,6 +1967,62 @@ mod gpu_tests {
     use std::time::{Duration, Instant};
     use tensorfs::io::cuda;
     use tensorfs::io::source::{Item, ItemSource};
+
+    #[test]
+    fn content_catalog_counts_payload_separately_from_padding_and_mapping() {
+        let layout = Layout {
+            parts: vec![],
+            regions: vec![crate::layout::Region {
+                offset: 0,
+                nbytes: 4099,
+                span: crate::layout::REGION_ALIGN,
+                items: vec![
+                    Item {
+                        offset: 0,
+                        len: 3,
+                        source: ItemSource::Inline(vec![1, 2, 3].into()),
+                        part_end: true,
+                    },
+                    Item {
+                        offset: 4096,
+                        len: 3,
+                        source: ItemSource::Inline(vec![4, 5, 6].into()),
+                        part_end: true,
+                    },
+                ],
+            }],
+            nbytes: crate::layout::REGION_ALIGN,
+            digest: "test-layout".into(),
+            names: vec![],
+        };
+        let first = ProofPage::catalog(&[7], &[1; 32], &layout);
+        let other_transform = ProofPage::catalog(&[7], &[2; 32], &layout);
+        assert_eq!(first[0].payload, 6);
+        assert_eq!(first[0].mapped, crate::layout::REGION_ALIGN);
+        assert_ne!(first[0].content, other_transform[0].content);
+    }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn failed_begin_rolls_back_and_reuses_the_request_identity() {
+        let placement = Placement::open(0, None).expect("real CUDA placement");
+        assert!(placement
+            .begin(7, vec![vec![999]], "test".into(), "shape".into())
+            .is_err());
+        assert!(
+            placement.stats(7).is_err(),
+            "failed begin must not retain request state"
+        );
+        placement
+            .begin(7, vec![], "test".into(), "shape".into())
+            .expect("same id starts again");
+        let stats = placement.end(7).expect("request ends");
+        assert_eq!(stats.events.first().map(|event| event.kind), Some("begin"));
+        assert_eq!(stats.events.last().map(|event| event.kind), Some("end"));
+        assert_eq!(stats.proof.version, 1);
+        assert!(stats.proof.complete);
+        placement.close().expect("close placement");
+    }
 
     struct ConsumerGate {
         started: mpsc::Sender<()>,
