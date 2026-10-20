@@ -12,9 +12,8 @@ import weakref
 from pathlib import Path
 
 import torch
-from torch.utils._python_dispatch import TorchDispatchMode, _disable_current_modes
-
 from rmsnorm_bands import source_module, upstream_class
+from torch.utils._python_dispatch import TorchDispatchMode, _disable_current_modes
 
 
 class Exhausted(Exception):
@@ -24,7 +23,7 @@ class Exhausted(Exception):
 class Destination:
     def __init__(self, like):
         with _disable_current_modes():
-            self.tensor = torch.empty_like(like, memory_format=torch.contiguous_format)
+            self.tensor = torch.empty(tuple(like.shape), dtype=like.dtype, device="cpu")
         self.writes = []
 
     def write_band(self, source, axis, offset):
@@ -69,10 +68,13 @@ class Bound(TorchDispatchMode):
         self.full, self.arithmetic = 0, 0
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        if func in (torch.ops.aten.empty.memory_format, torch.ops.aten.empty_strided.default):
-            if self.deny_output and tuple(args[0]) == self.shape:
-                self.full += 1
-                raise torch.OutOfMemoryError("Tried to allocate 1 MiB")
+        shape = args[1] if func is torch.ops.aten.new_empty.default else args[0] if args else ()
+        allocating = func in (torch.ops.aten.empty.memory_format, torch.ops.aten.empty_strided.default,
+                              torch.ops.aten.new_empty.default)
+        if (allocating and self.deny_output and tuple(shape) == self.shape
+                and str((kwargs or {}).get("device")) != "meta"):
+            self.full += 1
+            raise torch.OutOfMemoryError("Tried to allocate 1 MiB")
         if func is torch.ops.aten.mul.Tensor:
             count = max((x.numel() for x in args if isinstance(x, torch.Tensor)), default=0)
             if count > torch.Size(self.shape).numel() // 3:
@@ -81,9 +83,9 @@ class Bound(TorchDispatchMode):
         return func(*args, **(kwargs or {}))
 
 
-def rms(cuts, cls, shape, first, images, dtype, bias, *, admit=True, deny_output=True):
+def rms(cuts, cls, shape, first, images, dtype, bias, *, admit=True, deny_output=True, promote=False):
     channels = shape[1] if first else shape[-1]
-    module = cls(channels, channel_first=first, images=images, bias=bias).to(dtype=dtype)
+    module = cls(channels, channel_first=first, images=images, bias=bias).to(dtype=torch.float32 if promote else dtype)
     value = torch.randn(shape, dtype=dtype)
     pointer = weakref.ref(value)
     with torch.no_grad():
@@ -100,7 +102,9 @@ def rms(cuts, cls, shape, first, images, dtype, bias, *, admit=True, deny_output
             return
     assert admit or not deny_output
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert actual.shape == value.shape and actual.dtype == dtype
+    assert actual.shape == value.shape and actual.dtype == expected.dtype
+    if promote:
+        assert actual.dtype == torch.float32 and value.dtype != actual.dtype
     assert bound.arithmetic > 0
     if deny_output:
         assert bound.full > 0 and len(room.outputs) == 1
@@ -131,6 +135,9 @@ def main():
                     cases += 1
         rms(cuts, cls, (2, 7, 5, 11), True, True, torch.float32, False, admit=False)
         rms(cuts, cls, (2, 7, 5, 11), True, True, torch.float32, False, deny_output=False)
+        for dtype in (torch.float16, torch.bfloat16):
+            rms(cuts, cls, (2, 7, 5, 11), True, True, dtype, True, promote=True)
+            cases += 1
     print(f"PASS mapped-output CPU seam: {cases} exact upstream RMS cases, denied admission, "
           "device-first allocation and no retained input; native CUDA feasibility is separate")
 
