@@ -40,7 +40,13 @@ jobs:
     with:
       ref: ${{ github.sha }}
       build: none
-      test: cargo test --workspace --locked --no-fail-fast --exclude cozy --exclude calcifer --exclude tensord
+      test: |
+        failed=0
+        cargo test --workspace --locked --no-fail-fast --exclude cozy --exclude calcifer --exclude tensord --exclude varena || failed=1
+        # Unrelated concurrent forks briefly inherit CLOEXEC reader leases before
+        # exec. Isolate cases; each ledger case still runs its real child processes.
+        cargo test -p varena --locked --no-fail-fast -- --test-threads=1 || failed=1
+        exit "$failed"
 
   owner-day:
     if: github.event_name == 'push'
