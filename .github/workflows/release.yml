@@ -253,11 +253,11 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
-      # HAND-EDITED: a computer with no download (Alpine's musl, glibc before 2.28, an Intel Mac) is
+      # HAND-EDITED: a computer with no download (Alpine's musl, glibc before 2.28) is
       # told what cozy runs on, and `irm … | iex` puts cozy on the PowerShell's own PATH at once.
       - name: Installers name the supported platforms and fix this PowerShell's PATH
         run: |
-          supported='cozy runs on Linux x86_64 or aarch64 with glibc 2.28 or newer (not musl), macOS on Apple silicon, and Windows x86_64 or arm64'
+          supported='cozy runs on Linux x86_64 or aarch64 with glibc 2.28 or newer (not musl), macOS, and Windows x86_64 or arm64'
           sed -i "s|for your platform \$_true_arch\"|for your platform \$_true_arch. $supported\"|" target/distrib/cozy-installer.sh
           test "$(grep -c "$supported" target/distrib/cozy-installer.sh)" = 2
           sed -i 's|^    if (Add-Path $dest_dir) {$|&\n        $env:Path = "$dest_dir;$env:Path"|; s|To add $dest_dir to your PATH, either restart your shell or run:|cozy works in this PowerShell now; in terminals already open, restart them or run:|' target/distrib/cozy-installer.ps1
