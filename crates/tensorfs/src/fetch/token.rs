@@ -70,6 +70,11 @@ pub fn default_for(url: &str) -> Option<Arc<dyn TokenProvider>> {
     if url.starts_with("s3://") {
         return SigV4::from_env().map(|s| Arc::new(s) as Arc<dyn TokenProvider>);
     }
+    env_token(url).map(bearer)
+}
+
+/// The bearer token the environment holds for `url`'s host, and for no other host.
+pub(crate) fn env_token(url: &str) -> Option<String> {
     let host = base_host(url).ok()?;
     let var = match host.as_str() {
         "huggingface.co" | "hf.co" => "HF_TOKEN",
@@ -77,7 +82,7 @@ pub fn default_for(url: &str) -> Option<Arc<dyn TokenProvider>> {
         h if base_host(&default_endpoint()).is_ok_and(|d| d == h) => "TENSORFS_TOKEN",
         _ => return None,
     };
-    env(var).map(bearer)
+    env(var)
 }
 
 fn env(var: &str) -> Option<String> {
