@@ -23,11 +23,6 @@ that are actually metadata rather than model weights:
   and unpacks the metadata to recover properties such as the logical dtype and block size.
   Transformers also publishes [quantization configuration alongside the weights](https://huggingface.co/docs/transformers/main/en/quantization/bitsandbytes).
 
-Even the model's structure comes from conventions outside the weights file:
-[Diffusers](https://huggingface.co/docs/diffusers/main/en/using-diffusers/loading) uses
-`model_index.json`, component subfolders and configuration files to choose and construct its
-pipeline classes.
-
 Much of the model-loading ecosystem is therefore held together by agreements between producers
 and loaders: expected filenames, tensor names, metadata keys, configuration schemas and code
 that knows how to interpret them. These agreements can be documented and reliable within one
@@ -68,6 +63,21 @@ We also tested guessing NVFP4 layouts from tensor shapes or from how plausible d
 looked. Neither reliably distinguished the formats. An importer must resolve the producer's
 convention or refuse an ambiguous source. Once imported, those decisions are explicit in the
 cozytensors header, so every reader can apply the same rules.
+
+Successful loading does not prove correct interpretation. In a
+[reported GPTQ compatibility failure](https://huggingface.co/TheBloke/Wizard-Vicuna-13B-Uncensored-GPTQ/discussions/12),
+the model ran but produced incoherent replies; the maintainer identified a mismatch between
+the writer's activation-order setting and the reader's `desc_act` configuration, and the user
+confirmed that correcting it resolved the problem. cozytensors makes that setting and the
+group-index mapping part of the GPTQ encoding. A format cannot eliminate buggy kernels or bad
+weights, but it can specify what the bytes mean instead of leaving that agreement implicit.
+
+ComfyUI has also had a [WAN 2.2 regression](https://github.com/Comfy-Org/ComfyUI/issues/13238)
+where inference ran but produced noise, with `scaled_fp8`, `scale_input` and `scale_weight`
+reported as unexpected keys. The [fix](https://github.com/Comfy-Org/ComfyUI/commit/e2ddf28d78f190b27d136668a7dc15c7f0ec75dc)
+re-ran legacy quantization conversion after stripping the checkpoint's tensor-name prefix;
+the reporter confirmed that it resolved the problem. The arrays were readable, but the
+conventions carrying their quantization meaning had not been applied correctly.
 
 #### Choose the representation your runtime needs
 
@@ -122,11 +132,71 @@ The current Python API does not yet expose a general re-encoding call.
 Prepare this once when loading, rather than on every forward pass. Re-quantizing can add error;
 methods requiring calibration need their own calibration step, not merely a dtype cast.
 
-### Problem 2: Safetensors has no built-in de-duplication
+### Problem 2: The weights file is not a complete model package
+
+A usable model needs more than its weight arrays: its architecture and configuration,
+the components in its pipeline, and supporting data such as tokenizer vocabularies.
+Safetensors does not standardize how to package those together. The diffusion ecosystem has
+two common [layouts](https://huggingface.co/docs/diffusers/main/en/using-diffusers/other-formats):
+
+- **Single-file checkpoints**, common in ComfyUI and Automatic1111, collect model weights in
+  one `model.safetensors` file. Tensor-name prefixes and loader conventions identify its
+  components. One file is convenient to share, but it does not necessarily include the
+  architecture configuration, tokenizer files or other data needed to run the pipeline.
+- **Diffusers directories** put components in separate subfolders and describe them with
+  `model_index.json` and configuration files. A typical directory includes:
+
+```text
+model_index.json
+unet/config.json
+unet/diffusion_pytorch_model.safetensors
+scheduler/scheduler_config.json
+tokenizer/tokenizer.json
+...
+```
+
+The loader knows which filenames to seek, how subfolders identify components, and which
+library classes the JSON describes. Passing only the weights file to another tool loses
+that surrounding contract. A different ecosystem may use another layout or infer the model
+from its tensor names. The array container can be valid while the model package is incomplete
+or unintelligible to that reader.
+
+These are different organizations of model data, not different tensor file types: both can
+use safetensors. Even Diffusers' `from_single_file()` may infer the architecture from tensor
+keys and obtain configuration from a known base-model repository, or require an explicit
+`config` argument. A locally available weights file alone does not guarantee a fully local,
+self-contained load.
+
+A [confirmed Transformers regression](https://github.com/huggingface/transformers/pull/47988)
+illustrates the consequence: OLMo loaded and ran, but produced repetitive nonsense because
+`tokenizer.json` and `tokenizer_config.json` disagreed about end-of-sequence handling and a
+loader change stopped applying the override. The weights were not the problem; interpretation
+of the accompanying metadata was.
+
+cozytensors puts the component descriptions, class names, parsed configurations and asset
+references in its header. `checkpoint.components["unet"].config` reads the configuration
+directly; a tokenizer's `asset("tokenizer.json")` reads its supporting data. Consumers do not
+need to discover that structure by walking a particular folder layout. The header supplies
+the manifest while payloads remain in the shared store, and the consuming library supplies
+the model code. Exporting ordinary folders is a compatibility convenience.
+
+### Problem 3: Safetensors has no built-in de-duplication
 
 A safetensors file contains its own payload. Two checkpoints containing the same text encoder
 or VAE still store those bytes in each file unless another storage layer deduplicates them.
 The format itself has no reference that lets both files share one stored copy.
+
+Hugging Face also layers [sharding](https://huggingface.co/docs/transformers/main/en/big_models#sharded-checkpoints)
+on top of safetensors to handle large models: split the checkpoint into files such as
+`model-00001-of-00002.safetensors` and `model-00002-of-00002.safetensors`, then add a
+`model.safetensors.index.json` whose `weight_map` maps each tensor name to its shard.
+This lets loaders process one shard at a time and bound transient memory use. It is another
+file-layout convention that the application must understand, not a feature defined by the
+safetensors container itself.
+
+Sharding alone does not share unchanged regions between different shard files. An identical
+whole shard can be reused by a file cache, but partially changed shards are still distinct
+files. Splitting files and deduplicating their contents solve different problems.
 
 Hugging Face addresses this with [Xet](https://huggingface.co/docs/xet/en/download-protocol),
 a general file-storage layer: it groups content-addressed chunks into containers called
@@ -141,6 +211,10 @@ load directly from that store without reconstructing a separate full model file.
 can reuse its base checkpoint's unchanged chunks and add only new ones. This saves local disk
 space as well as transfer bytes on an ordinary workstation, without requiring a deduplicating
 filesystem or a hosted storage service.
+
+TensorFS also divides large payloads, but the tensor-to-chunk references are part of the
+checkpoint format. Readers follow those references directly; they do not need a separate
+framework-specific shard index or numbered shard filenames to locate each tensor.
 
 
 
