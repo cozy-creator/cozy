@@ -5,6 +5,7 @@ from . import elem, grid, table
 from .base import Part, Scheme, logical, one
 
 FP8 = ("F8_E4M3", "F8_E5M2")
+SCALE = ("F32", "BF16", "F16")  # as the producer stored it
 
 
 def axis_grid(c):
@@ -21,11 +22,11 @@ def scaled(c, g):
 
 
 SCHEMES = (
-    Scheme("fp8.tensorwise", {"scale_dtype": ("F32", "BF16", "F16")},
-           (Part("weight", FP8, logical), Part("scale", "scale_dtype", one),
+    Scheme("fp8.tensorwise", {},
+           (Part("weight", FP8, logical), Part("scale", SCALE, one),
             Part("input_scale", ("F32",), one, required=False)),
            lambda c: scaled(c, grid.TENSOR), flat=True),
-    Scheme("fp8.rowwise", {"axis": (0, 1), "scale_dtype": ("F32", "BF16", "F16")},
-           (Part("weight", FP8, logical), Part("scale", "scale_dtype", per_axis)),
+    Scheme("fp8.rowwise", {"axis": (0, 1)},
+           (Part("weight", FP8, logical), Part("scale", SCALE, per_axis)),
            lambda c: scaled(c, axis_grid(c))),
 )

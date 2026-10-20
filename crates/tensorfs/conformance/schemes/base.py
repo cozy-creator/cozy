@@ -19,16 +19,9 @@ class Refused(Exception):
 @dataclass(frozen=True)
 class Part:
     role: str
-    dtypes: tuple | str  # dtype names, or the text param naming the one dtype
+    dtypes: tuple  # the part's allowed dtype names: its own dtype is authoritative
     shape: Callable  # ctx -> ("exact", [extents]) or ("count", n)
     required: bool = True
-
-
-@dataclass(frozen=True)
-class PartDtype:
-    """A param naming the dtype an optional part is stored in: present exactly when the part is."""
-    role: str
-    dtypes: tuple
 
 
 @dataclass(frozen=True)

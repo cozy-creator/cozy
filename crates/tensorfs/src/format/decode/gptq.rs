@@ -13,8 +13,8 @@ pub const INT3: Scheme = scheme("gptq.int3");
 pub const INT4: Scheme = scheme("gptq.int4");
 pub const INT8: Scheme = scheme("gptq.int8");
 
-pub const I32: Dtypes = Dtypes::Of(&["I32"]);
-pub const HALF: Dtypes = Dtypes::Of(&["F16", "BF16"]);
+pub const I32: Dtypes = &["I32"];
+pub const HALF: Dtypes = &["F16", "BF16"];
 
 /// `group_size`: a positive integer, or `-1` for one group per row.
 pub const GROUP_SIZE: Param = Param {

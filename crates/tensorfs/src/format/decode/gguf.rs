@@ -3,7 +3,7 @@
 
 use super::blocks::{f16_at, u32_at};
 use super::plan::{Core, Elems, Post, Struct};
-use super::{elem, one, Allowed, Ctx, Dtypes, Param, Part, Plan, Scheme, Shape, View};
+use super::{elem, one, Allowed, Ctx, Param, Part, Plan, Scheme, Shape, View};
 use crate::format::{Encoding, Result};
 
 /// A ggml type: id, name, elements per block, bytes per block.
@@ -104,7 +104,7 @@ pub fn blocks_shape(ty: Type, shape: &[u64]) -> Option<Vec<u64>> {
 /// ggml's `kvalues_fp4`: E2M1 doubled (spec Appendix A.2).
 pub const K: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
-const BLOCKS: Part = Part::req("blocks", Dtypes::Of(&["U8"]), shape);
+const BLOCKS: Part = Part::req("blocks", &["U8"], shape);
 
 macro_rules! scheme {
     ($name:literal, $n:literal) => {
@@ -140,8 +140,8 @@ pub const NVFP4: Scheme = scheme!(
     64,
     &[
         BLOCKS,
-        Part::opt("scale", Dtypes::Of(&["F32"]), one),
-        Part::opt("input_scale", Dtypes::Of(&["F32"]), one),
+        Part::opt("scale", &["F32"], one),
+        Part::opt("input_scale", &["F32"], one),
     ]
 );
 pub const Q1_0: Scheme = scheme!("q1_0", 128);

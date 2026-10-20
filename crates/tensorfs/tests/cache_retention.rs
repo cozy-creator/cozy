@@ -129,7 +129,6 @@ fn fixture(scratch: &Scratch) -> Fixture {
                     version: "1.0".into(),
                     tree: local_tree,
                     yanked: false,
-                    revision: 0,
                 }],
                 ..Default::default()
             })
@@ -535,7 +534,7 @@ fn writer_results_expire_but_local_replays_remain() {
 
     let repo_bytes: [&[u8]; 2] = [
         b"\x85raw repository file, not a header",
-        br#"{"format":"tensorfs.tree/1","files":{}}"#,
+        br#"{"format":"cozytensors.tree/1","files":{}}"#,
     ];
     for mode in ["anonymous", "keyed", "streamed"] {
         let scratch = Scratch::new();
@@ -660,7 +659,6 @@ fn writer_results_expire_but_local_replays_remain() {
                 version: "replay-key".into(),
                 tree: root,
                 yanked: false,
-                revision: 0,
             }],
             ..Default::default()
         })

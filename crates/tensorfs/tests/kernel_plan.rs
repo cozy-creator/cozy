@@ -114,7 +114,7 @@ fn every_encoded_green_vector_prepares_a_kernel_without_host_fallback() {
     let digest = format!("{:x}", corpus.finalize());
     assert_eq!(
         digest,
-        "475acde968a69d84d1748e26279cedacc8193c3fade193b56f124d424fe27c1b"
+        "9532af801ee8e54e119332fa101e9f971fe01cd20c285a9b5d11a2a7ebf84008"
     );
     assert_eq!(checked, 227);
     assert_eq!(schemes.len(), 42);

@@ -1,4 +1,4 @@
-//! The repo documents: `tensorfs.tree/1`, a revision's file tree, and `tensorfs.repo/1`, a
+//! The repo documents: `cozytensors.tree/1`, a revision's file tree, and `cozytensors.repo/1`, a
 //! model's releases of trees. Both parse through a `Wire` twin that carries the `format` tag.
 
 use std::collections::BTreeMap;
@@ -12,7 +12,7 @@ use super::{REPO_FORMAT, TREE_FORMAT};
 /// The folder that holds a plain folder's chunks and assets: no repo file lives under it.
 pub const CHUNKS_DIR: &str = "chunks";
 
-/// `tensorfs.tree/1`: a repo revision as files, as on HF. Each `model.<variant>.cozytensors` is
+/// `cozytensors.tree/1`: a repo revision as files, as on HF. Each `model.<variant>.cozytensors` is
 /// a variant's header; every other file (README, LICENSE, images) is a blob shared by them all.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(try_from = "TreeWire", into = "TreeWire")]
@@ -109,7 +109,7 @@ pub fn repo_key(name: &str) -> String {
     format!("refs/{}.json", name.to_ascii_lowercase())
 }
 
-/// `tensorfs.repo/1`: a model's releases, each naming a tree, and its unreleased trees. Kept at
+/// `cozytensors.repo/1`: a model's releases, each naming a tree, and its unreleased trees. Kept at
 /// [`repo_key`]; releases are in publication order.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(try_from = "RepoWire", into = "RepoWire")]
@@ -127,17 +127,10 @@ pub struct Release {
     /// Skipped by an unversioned lookup; an explicit version still resolves it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub yanked: bool,
-    /// The release's expected-revision counter: each change to it increments this.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub revision: u64,
 }
 
 fn is_false(b: &bool) -> bool {
     !b
-}
-
-fn is_zero(n: &u64) -> bool {
-    *n == 0
 }
 
 #[derive(Serialize, Deserialize)]
@@ -212,7 +205,6 @@ impl Repo {
                 version: version.into(),
                 tree,
                 yanked: false,
-                revision: 0,
             }),
         }
     }

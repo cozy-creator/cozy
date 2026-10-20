@@ -38,6 +38,7 @@ mod bnb;
 mod comfy;
 
 pub use comfy::{quantize_with, Kitchen};
+pub use fp8_blockwise::quantize_fp8_blockwise;
 pub use nvfp4::{GlobalScale, NibbleOrder};
 
 /// Every scheme's encoders, one row each.
