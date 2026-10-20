@@ -307,28 +307,54 @@ fn killed_exporter_leaves_one_importable_page_and_live_eviction_leaves_none() {
 #[test]
 fn ram_service_fills_through_tensorfs_and_retains_a_readers_layout() {
     use std::sync::Arc;
-    use tensorfs::io::{source::Item, ItemSource};
+    use tensorfs::io::{source::Item, ItemSource, ObjectRange};
     use varena::ledger::RamRegion;
     let fixture = Fixture::new();
     let row = fixture.ledger.claim(std::process::id()).unwrap();
     let grant = fixture.ledger.grant(std::process::id()).unwrap();
     let channel = Channel::new(grant.channel);
     let layout = [9; 32];
-    let regions = vec![RamRegion {
-        offset: 0,
-        len: 4,
-        items: vec![Item {
+    let object = tensorfs::format::ObjectRef {
+        sha256: "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7".into(),
+        length: 4,
+    };
+    let files = vec![(
+        object.clone(),
+        platform::shm::frozen("RAM-source-test", b"data")
+            .unwrap()
+            .into(),
+    )];
+    let regions = vec![
+        RamRegion {
             offset: 0,
             len: 4,
-            source: ItemSource::Inline(Arc::from(*b"data")),
-            part_end: true,
-        }],
-    }];
+            items: vec![Item {
+                offset: 0,
+                len: 4,
+                source: ItemSource::Inline(Arc::from(*b"data")),
+                part_end: true,
+            }],
+        },
+        RamRegion {
+            offset: 4,
+            len: 4,
+            items: vec![Item {
+                offset: 4,
+                len: 4,
+                source: ItemSource::Object(ObjectRange {
+                    obj: object,
+                    off: 0,
+                    len: 4,
+                }),
+                part_end: true,
+            }],
+        },
+    ];
     assert!(channel
-        .cache_ram(row.owner(), layout, &[], &regions)
+        .cache_ram(row.owner(), layout, &files, &regions)
         .unwrap());
     let view = loop {
-        if let Some(view) = channel.ram(row.owner(), layout, 0).unwrap() {
+        if let Some(view) = channel.ram(row.owner(), layout, 1).unwrap() {
             break view;
         }
         let mut poll = libc::pollfd {
@@ -351,12 +377,12 @@ fn ram_service_fills_through_tensorfs_and_retains_a_readers_layout() {
         };
         assert_eq!(read, 8);
     };
-    assert_eq!((view.offset, view.len), (0, 4));
+    assert_eq!((view.offset, view.len), (4, 4));
     let mut data = String::new();
     std::fs::File::from(view.file.try_clone().unwrap())
         .read_to_string(&mut data)
         .unwrap();
-    assert_eq!(data, "data");
+    assert_eq!(data, "datadata");
     assert!(!fixture.ledger.release_ram(layout));
     drop(view);
     assert!(fixture.ledger.release_ram(layout));
