@@ -11,15 +11,15 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value as Json};
 use tensorfs::failure::{fail, Failure, Kind, Result};
-use tensorfs::format::{Body, Dtype, ObjectRef, Tree};
+use tensorfs::format::{Body, ObjectRef, Tree};
 use tensorfs::store::Store;
 use tensorfs::{fetch, Checkpoint, Client, Config, Convert, Download, Format, Open, Ref, Selection};
 
 const VERBS: &[&str] = &[
-    "convert <source>... [--converter <c>] [--variant <v>] [--name local/<name>[@tag]]",
+    "convert <source>... [--converter <c>] [--source-variant <v>] [--name local/<name>[@tag]]",
     "download <ref> [--dir <dir>]",
     "upload <folder> <org/name>[@tag]           moves the tag (main) to the new commit; the token is $TENSORFS_TOKEN",
-    "export <ref> <dir> [--safetensors [--dequantize bf16|f16|f32] | --gguf]",
+    "export <ref> <dir> [--safetensors [--decode] | --gguf]",
     "inspect <ref>",
     "verify <ref>",
     "ceiling [<path>] [--gpu <n>]              measure what reads from <path>'s volume (and to GPU n) reach",
@@ -43,14 +43,15 @@ fn usage(verb: Option<&str>) -> String {
     text.push_str(
         "\n<ref> is org/name[@revision][/variant], sha256:<hex>, a .cozytensors file or a folder; a revision is
 a tag, or sha256:<hex> of a commit or a variant header, and none is the highest public version;
---variant picks a variant. The store is --store, else $TENSORFS_HOME, else ~/.cache/tensorfs.",
+--variant picks a variant; --source-variant a source's weights variant (fp16). The store is --store,
+else $TENSORFS_HOME, else ~/.cache/tensorfs.",
     );
     text
 }
 
-const SWITCHES: &[&str] = &["help", "json", "safetensors", "gguf", "plain", "no-configs", "write"];
+const SWITCHES: &[&str] = &["help", "json", "safetensors", "decode", "gguf", "plain", "no-configs", "write"];
 const VALUED: &[&str] = &[
-    "store", "endpoint", "name", "dequantize", "converter", "variant", "blocks", "scale",
+    "store", "endpoint", "name", "converter", "variant", "source-variant", "blocks", "scale",
     "token-env", "dir", "gpu",
 ];
 
@@ -208,7 +209,7 @@ async fn run(args: &Args) -> Done {
             };
             let options = Convert {
                 converter: args.get("converter"),
-                variant: args.get("variant"),
+                source_variant: args.get("source-variant"),
                 progress: Some(&progress),
             };
             let ck = client.convert_to_cozytensors(&sources, &options).await?;
@@ -235,15 +236,14 @@ async fn run(args: &Args) -> Done {
             let ck = open(&client, args, reference).await?;
             let dir = Path::new(dir);
             ck.download(&Download::default()).await?;
-            let files: Vec<String> = match (args.on("safetensors"), args.on("gguf"), args.get("dequantize")) {
-                (true, false, dequantize) => {
-                    let dtype = dequantize.map(|d| Dtype::parse(&d.to_ascii_uppercase()));
-                    ck.materialize(dir, Format::Safetensors, dtype).await?;
+            let files: Vec<String> = match (args.on("safetensors"), args.on("gguf"), args.on("decode")) {
+                (true, false, decode) => {
+                    ck.materialize(dir, Format::Safetensors, decode).await?;
                     listing(dir)?
                 }
-                (false, true, None) => tensorfs::export::gguf(&Store::open(&root)?.checkpoint(ck.id())?, dir)?,
-                (false, false, None) => {
-                    ck.materialize(dir, Format::Cozytensors, None).await?;
+                (false, true, false) => tensorfs::export::gguf(&Store::open(&root)?.checkpoint(ck.id())?, dir)?,
+                (false, false, false) => {
+                    ck.materialize(dir, Format::Cozytensors, false).await?;
                     listing(dir)?
                 }
                 _ => return Ok(None),

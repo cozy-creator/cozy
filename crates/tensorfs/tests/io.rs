@@ -280,7 +280,7 @@ fn every_tensor_of_a_tiny_sdxl_reads_through_the_engine_as_read_does() {
     let request = Request {
         sources: &sources,
         converter: None,
-        variant: None,
+        source_variant: None,
         access: &access,
         tmp: &store.root().join("tmp"),
         progress: &|_, _, _| {},

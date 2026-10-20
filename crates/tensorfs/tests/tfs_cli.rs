@@ -1,5 +1,5 @@
 //! The `tfs` binary: a synthetic checkpoint with every scheme exports to safetensors
-//! bit-identical to its stored parts (and to the reference decode with `--dequantize`),
+//! bit-identical to its stored parts (and to the reference decode with `--decode`),
 //! uploads to a directory endpoint that a second store downloads byte-identical, and `verify`
 //! reports a corrupted object.
 
@@ -10,7 +10,7 @@ use std::process::Command;
 
 use serde_json::Value as Json;
 use tensorfs::raw::regions;
-use tensorfs::format::{decode, Body, Dtype, PartBytes};
+use tensorfs::format::{decode, Body, PartBytes};
 use tensorfs::store::{Checkpoint, Store};
 
 struct Scratch(PathBuf);
@@ -121,7 +121,7 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
     );
     assert_eq!(written["name"], "local/syn@1");
 
-    let inspected = ok(&a, &["inspect", "local/syn"]);
+    let inspected = ok(&a, &["inspect", "local/syn@1"]);
     assert_eq!(inspected["header"], written["header"]);
     let unet = &inspected["components"][0];
     assert_eq!(unet["name"], "unet");
@@ -151,7 +151,7 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
     let out = Command::new(env!("CARGO_BIN_EXE_tfs"))
         .arg("--store")
         .arg(&a)
-        .args(["inspect", "local/syn"])
+        .args(["inspect", "local/syn@1"])
         .output()
         .unwrap();
     let human = String::from_utf8(out.stdout).unwrap();
@@ -183,7 +183,7 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
     let out = dir.0.join("out");
     let exported = ok(
         &a,
-        &["export", "local/syn", out.to_str().unwrap(), "--safetensors"],
+        &["export", "local/syn@1", out.to_str().unwrap(), "--safetensors"],
     );
     assert!(exported["files"]
         .as_array()
@@ -241,17 +241,16 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
     }
     assert!(checked > 20);
 
-    // Dequantized: each encoded tensor is the reference decode, rounded once to BF16.
+    // Decoded: each encoded tensor is the reference decode, in its logical dtype.
     let deq = dir.0.join("deq");
     ok(
         &a,
         &[
             "export",
-            "local/syn",
+            "local/syn@1",
             deq.to_str().unwrap(),
             "--safetensors",
-            "--dequantize",
-            "bf16",
+            "--decode",
         ],
     );
     let (tensors, meta) = safetensors(&deq.join("unet/diffusion_pytorch_model.safetensors"));
@@ -276,10 +275,10 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
                     )
                 })
                 .collect();
-            let want = decode(&Dtype::BF16, &t.shape, encoding, &views).unwrap();
+            let want = decode(&t.dtype, &t.shape, encoding, &views).unwrap();
             assert_eq!(
                 tensors[key],
-                ("BF16".to_owned(), t.shape.clone(), want),
+                (t.dtype.name().to_owned(), t.shape.clone(), want),
                 "{key}"
             );
         }
@@ -287,11 +286,11 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
 
     // Uploaded to a directory endpoint and downloaded into a second store byte-identical.
     let portable = dir.0.join("portable");
-    ok(&a, &["export", "local/syn", portable.to_str().unwrap()]);
+    ok(&a, &["export", "local/syn@1", portable.to_str().unwrap()]);
     let origin = format!("file://{}", dir.0.join("origin").display());
     let endpoint = |store: &Path, args: &[&str]| ok(store, &[&["--endpoint", origin.as_str()], args].concat());
     let uploaded = endpoint(&a, &["upload", portable.to_str().unwrap(), "acme/syn@1"]);
-    assert_eq!(uploaded["tree"], written["tree"]);
+    assert_eq!((&uploaded["commit"], &uploaded["tag"]), (&written["tree"], &serde_json::json!("1")));
     endpoint(&b, &["download", "acme/syn@1"]);
     assert_eq!(endpoint(&b, &["inspect", "acme/syn@1"])["header"], written["header"]);
     let theirs = blobs(&b);
