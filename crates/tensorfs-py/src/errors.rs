@@ -3,7 +3,9 @@
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::create_exception;
-use tensorfs::failure::{Failure, Kind};
+#[cfg(feature = "store")]
+use tensorfs::failure::Failure;
+use tensorfs::failure::Kind;
 
 create_exception!(
     tensorfs,
@@ -42,6 +44,7 @@ fn family(py: Python<'_>, kind: Kind) -> Bound<'_, pyo3::types::PyType> {
 }
 
 /// The one conversion: a failure becomes its family's exception, with `.code` and `.detail`.
+#[cfg(feature = "store")]
 pub(crate) fn raise(py: Python<'_>, f: Failure) -> PyErr {
     let err = PyErr::from_type(family(py, f.kind), f.to_string());
     let value = err.value(py);
