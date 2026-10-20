@@ -253,6 +253,13 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      # HAND-EDITED: a computer with no download (Alpine's musl, glibc before 2.28, an Intel Mac) is
+      # told what cozy runs on.
+      - name: Installer names the supported platforms
+        run: |
+          supported='cozy runs on Linux x86_64 or aarch64 with glibc 2.28 or newer (not musl), macOS on Apple silicon, and Windows x86_64 or arm64'
+          sed -i "s|for your platform \$_true_arch\"|for your platform \$_true_arch. $supported\"|" target/distrib/cozy-installer.sh
+          test "$(grep -c "$supported" target/distrib/cozy-installer.sh)" = 2
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v7
         with:
