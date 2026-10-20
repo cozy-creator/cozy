@@ -660,7 +660,8 @@ fn put_dir(root: &Path, key: &str, bytes: &[u8], etag: Option<&str>) -> Result<b
 /// A writer's objects on their way to an endpoint (`Writer(repo_id=…)`): each is sent (HEAD →
 /// PUT → HEAD) as soon as it is sealed while the writer goes on, at most [`IN_FLIGHT`] at once;
 /// at commit the header, then the tree, then the repo's new checkpoint.
-/// Its calls block: a writer runs outside the runtime that sends.
+/// File-backed objects queue without blocking the caller's runtime. Byte-backed puts and
+/// finalization block, so the finalizer runs outside the runtime that sends.
 pub struct Stream {
     endpoint: Arc<Endpoint>,
     runtime: tokio::runtime::Handle,
@@ -676,7 +677,7 @@ impl std::fmt::Debug for Stream {
     }
 }
 
-/// Objects a [`Stream`] holds in memory while they are sent (each at most 64 MiB).
+/// Concurrent transfers; byte-backed objects are also bounded by this limit.
 const IN_FLIGHT: usize = 4;
 
 impl Stream {
@@ -706,8 +707,18 @@ impl Stream {
 
     /// Queues an admitted object without copying its bytes into an upload buffer.
     pub(crate) fn put_stored(&self, store: &Store, object: &ObjectRef) -> Result<()> {
+        if !self.sent.lock().unwrap().insert(object.clone()) {
+            return Ok(());
+        }
         let (store, at) = (store.clone(), object.clone());
-        self.send(object, move || store.file(&at).map(Payload::File).map_err(crate::store2::Error::refusal))
+        let (endpoint, permits) = (Arc::clone(&self.endpoint), Arc::clone(&self.permits));
+        let task = self.runtime.spawn(async move {
+            let _permit = permits.acquire_owned().await.expect("never closed");
+            let make = || store.file(&at).map(Payload::File).map_err(crate::store2::Error::refusal);
+            endpoint.upload(&at, &make).await.map(drop)
+        });
+        self.sending.lock().unwrap().push(task);
+        Ok(())
     }
 
     fn send(&self, object: &ObjectRef, make: impl Fn() -> Result<Payload> + Send + Sync + 'static) -> Result<()> {
@@ -756,6 +767,14 @@ impl Stream {
         let named = self.endpoint.update_repo(name, |old| Ok(Some(with_tree(old, name, &tree, None))));
         self.runtime.block_on(named)?;
         Ok(tree)
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        for task in self.sending.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..) {
+            task.abort();
+        }
     }
 }
 
