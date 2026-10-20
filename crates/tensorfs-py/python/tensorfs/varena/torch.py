@@ -105,7 +105,7 @@ class Unbound(Exception):
 
 
 class _BandWriter(Protocol):
-    def _write_band(self, source: Tensor, axis: int, offset: int) -> None: ...
+    def _write_band(self, source: Tensor, axis: int, offset: int, *, stream: int) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +114,8 @@ class _MappedOutput:
     array: _BandWriter
 
     def write_band(self, source: Tensor, axis: int, offset: int) -> None:
-        self.array._write_band(source, axis, offset)
+        stream = torch.cuda.current_stream(self.tensor.device).cuda_stream
+        self.array._write_band(source, axis, offset, stream=stream)
 
 
 #: `bind(key, parts)`: a stored tensor's part views -> the module tensors they become, by name.
