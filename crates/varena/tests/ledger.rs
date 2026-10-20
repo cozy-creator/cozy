@@ -63,6 +63,11 @@ impl ChildRow {
                 if libc::dup2(inherited, 9) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                // dup2 clears CLOEXEC only when the descriptors differ. Under
+                // parallel tests the socket itself can already be descriptor9.
+                if libc::fcntl(9, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
