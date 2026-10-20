@@ -1,4 +1,4 @@
-"""`tensorfs._ext`, checked against the built extension by `scripts/stub_conform.py`."""
+"""`tensorfs._ext`: the compiled extension's types."""
 
 from collections.abc import Buffer, Callable, ItemsView, Iterator, KeysView, Mapping, Sequence, ValuesView
 from os import PathLike
@@ -202,11 +202,8 @@ class Checkpoint:
     def id(self) -> str:
         """`sha256:<hex>` of the header."""
     @property
-    def header_ref(self) -> tuple[str, int]: ...
-    @property
-    def tree_ref(self) -> tuple[str, int] | None: ...
-    @property
-    def tree(self) -> str | None: ...
+    def tree(self) -> str | None:
+        """`sha256:<hex>` of the repository tree, when known."""
     @property
     def variant(self) -> str | None: ...
     @property

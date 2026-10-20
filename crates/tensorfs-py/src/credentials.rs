@@ -7,9 +7,10 @@ use async_trait::async_trait;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tensorfs::format::Repo;
+use tensorfs::raw::block_on;
 use tensorfs::{bearer, Config, Endpoint, Failure, HeaderMap, Kind, Request, Result, TokenProvider};
 
-use crate::store::{bridge, config_from_py, config_to_py, OrRaise};
+use crate::store::{config_from_py, config_to_py, OrRaise};
 
 pub(crate) fn config(
     endpoint: Option<String>,
@@ -158,7 +159,7 @@ impl PyEndpoint {
         repo_id: &str,
     ) -> PyResult<Option<(Bound<'py, PyAny>, String)>> {
         let repo = py
-            .detach(|| bridge(self.endpoint.repo(repo_id)))
+            .detach(|| block_on(self.endpoint.repo(repo_id)))
             .or_raise(py)?;
         repo.map(|(repo, etag)| {
             let value = serde_json::to_value(repo).expect("Repo is serializable");
@@ -175,7 +176,7 @@ impl PyEndpoint {
     ) -> PyResult<Bound<'py, PyAny>> {
         let callback_error = Mutex::new(None);
         let result = py.detach(|| {
-            bridge(self.endpoint.update_repo(repo_id, |old| {
+            block_on(self.endpoint.update_repo(repo_id, |old| {
                 Python::attach(|py| -> PyResult<Option<Repo>> {
                     let old = serde_json::to_value(old).expect("Repo is serializable");
                     let next = change.bind(py).call1((config_to_py(py, &old)?,))?;
