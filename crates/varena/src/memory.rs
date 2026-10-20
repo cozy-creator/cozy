@@ -522,6 +522,17 @@ impl State {
         self.idle.iter().map(|(s, v)| s * v.len() as u64).sum()
     }
 
+    /// An idle chunk of `size`. An emptied size leaves the map, so `keep_idle`'s largest entry
+    /// always holds a chunk.
+    fn take_idle(&mut self, size: u64) -> Option<Handle> {
+        let std::collections::btree_map::Entry::Occupied(mut e) = self.idle.entry(size) else { return None };
+        let h = e.get_mut().pop();
+        if e.get().is_empty() {
+            e.remove();
+        }
+        h
+    }
+
     fn resolve(&mut self) {
         let (sets, steps) = (&mut self.sets, self.steps);
         self.timings.retain(|t| {
@@ -1071,7 +1082,7 @@ impl Inner {
         let mapped = (|| {
             while m.span < span {
                 let size = if prop.is_some() { span } else { chunk.min(span - m.span) };
-                let idle = if prop.is_none() { st.idle.get_mut(&size).and_then(Vec::pop) } else { None };
+                let idle = if prop.is_none() { st.take_idle(size) } else { None };
                 let handle = match idle {
                     Some(h) => h,
                     None => match self.create(st, size, prop.as_ref().unwrap_or(&self.prop))? {

@@ -983,3 +983,14 @@ fn final_drop_on_another_thread_retains_per_thread_default_owners_without_cuda()
     assert!(held_ws.upgrade().is_some() && held_gpu.upgrade().is_some());
     assert!(held_source.upgrade().is_some() && fd_is_open(fd));
 }
+
+#[test]
+fn an_emptied_idle_size_leaves_the_map_so_the_largest_entry_holds_a_chunk() {
+    let mut st = State::default();
+    st.idle.entry(64 << 20).or_default().push(1);
+    st.idle.entry(REGION_ALIGN).or_default().push(2);
+    assert_eq!(st.take_idle(64 << 20), Some(1));
+    assert_eq!(st.take_idle(64 << 20), None);
+    let (&size, handles) = st.idle.last_key_value().unwrap();
+    assert_eq!((size, handles.as_slice(), st.idle_bytes()), (REGION_ALIGN, &[2][..], REGION_ALIGN));
+}
