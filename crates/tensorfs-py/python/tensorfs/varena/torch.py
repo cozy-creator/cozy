@@ -383,6 +383,8 @@ class Model:
         #: torch bytes its passes allocated above their start in its last request; -1 unmeasured
         self.reserve = -1
         self.mark = (0, 0, 0)
+        #: `Memory.demands` as its pass started
+        self.demands = 0
         self.handles: list[RemovableHandle] = []
         self.track = cuts.Track(name)
 
@@ -521,6 +523,9 @@ class Memory:
         self.landing: dict[Model, set[int]] = {}
         #: demand made room in the step running now: no prefetch refills it until the plan moves
         self.starved = False
+        #: times the catch's rungs made room (an op short of memory): a pass they ran in
+        #: copies no block ahead from then on, since the next run would take it again
+        self.demands = 0
         #: host tiers sealed here for the executor to deposit
         self.deposits: list[tuple[Model, int]] = []
         #: granted host tiers adopted before their modules exist (`adopt`), by grant key
@@ -907,6 +912,7 @@ class Memory:
             if moved or model.planned != self.epoch:
                 model.planned = self.epoch
                 self._plan(model)
+            model.demands = self.demands
         model.seen[block.index] = None
 
     def _step(self, model: Model) -> None:
@@ -933,10 +939,12 @@ class Memory:
         self._running()
 
     def _prefetch(self, block: Block) -> None:
-        """Copy the next blocks of the recorded order now, unless they are resident."""
+        """Copy the next blocks of the recorded order now, unless they are resident, or the
+        catch made room in this pass (its rungs take prefetched pages first: none after
+        starved)."""
         model = block.model
         at = model.position.get(block.index)
-        if at is None:
+        if at is None or model.demands != self.demands:
             return
         for ahead in range(1, _AHEAD + 1):
             nxt = model.order[(at + ahead) % len(model.order)]
@@ -1065,6 +1073,7 @@ class Memory:
         if not self._here(device):
             return False
         with self.lock:  # the allocation just failed: `need` free, past a limit overrun too
+            self.demands += 1
             freed = self._free_upto(max(self._free(), 0) + need, "out of memory")
             self._cap()
             return freed
@@ -1075,7 +1084,7 @@ class Memory:
         if not self._here(device):
             return False
         with self.lock:
-            self.starved = True
+            self.starved, self.demands = True, self.demands + 1
             target = max(self._free(), 0) + max(need, 1)
             self._lower_until(target, "out of memory", None)
             self._last(target, "out of memory")

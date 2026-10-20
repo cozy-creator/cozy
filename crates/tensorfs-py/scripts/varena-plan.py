@@ -599,6 +599,10 @@ def case(name: str, card: Card, limit: int | None, orphans: int = 0, weights: bo
         asks += [e for e in stats.evictions if e.reason.startswith("asked") and e.nbytes > 0]
         plan_checks(label, mem, core, since, core.moved() - moved, stats)
         settled(label, mem, core, start)
+        passes = [s for s in stats.steps if s.model == dit]
+        most = max((s.paged_in + s.streamed for s in passes), default=0)
+        whole = models["transformer_ref"].nbytes
+        check(f"{label}: no DiT pass reads a block twice ({most / 1e9:.1f} GB)", most <= whole, most)
         if warm and limit is None:
             moved = core.moved() - moved
             check(f"{label}: reads {moved / 1e9:.1f} GB, at most 40 GB (B2)", moved <= 40e9)
