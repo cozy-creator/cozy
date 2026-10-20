@@ -3446,32 +3446,8 @@ impl Pool {
                 "executor_not_ready" | "poisoned_generation"
             )
         {
-            // Canceled while it waited for its attention kernel's compile (Runtime 0.23.4).
-            if prepared.terminal == "canceled" && engine.get(id)?.cancel_actor.is_some() {
-                engine.finish(id, Outcome::Canceled)?;
-                return Ok(true);
-            }
-            // A pre-entry refusal leaves the executor Ready; the run ends with its reason.
-            let terminal = if prepared.terminal.is_empty() {
-                "refused"
-            } else {
-                &prepared.terminal
-            };
-            let failure =
-                Failure::executor(terminal, &prepared.origin, &prepared.code, &prepared.detail);
-            keep_triage(
-                engine,
-                id,
-                &session.executor,
-                &device_executor::Outcome {
-                    terminal: terminal.into(),
-                    origin: prepared.origin.clone(),
-                    code: prepared.code.clone(),
-                    message: prepared.detail.clone(),
-                    traceback: prepared.traceback.clone(),
-                },
-            );
-            engine.finish(id, Outcome::Failed(failure))?;
+            complete_preentry(engine, id, &session.executor.birth, &session.followers, &prepared,
+                |outcome| keep_triage(engine, id, &session.executor, outcome))?;
             return Ok(true);
         }
         let prepared = command_ok(prepared)?;
@@ -4229,6 +4205,25 @@ fn defer_completion(
     followers: &[platform::process::Exact], outcome: Outcome,
 ) -> io::Result<()> {
     engine.defer_completion(id, outcome, executor_births(leader, followers))
+}
+
+/// Complete a quiescent PrepareRequest refusal, before the executor returns to the pool.
+fn complete_preentry(
+    engine: &Arc<Engine>, id: &str, _leader: &Birth,
+    _followers: &[platform::process::Exact], prepared: &Frame,
+    triage: impl FnOnce(&device_executor::Outcome),
+) -> io::Result<()> {
+    let outcome = if prepared.terminal == "canceled" && engine.get(id)?.cancel_actor.is_some() {
+        Outcome::Canceled
+    } else {
+        let terminal = if prepared.terminal.is_empty() { "refused" } else { &prepared.terminal };
+        triage(&device_executor::Outcome {
+            terminal: terminal.into(), origin: prepared.origin.clone(), code: prepared.code.clone(),
+            message: prepared.detail.clone(), traceback: prepared.traceback.clone(),
+        });
+        Outcome::Failed(Failure::executor(terminal, &prepared.origin, &prepared.code, &prepared.detail))
+    };
+    engine.finish(id, outcome).map(drop)
 }
 
 fn await_executor_exit(engine: &Arc<Engine>, births: &[Birth]) {
@@ -5411,6 +5406,115 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         pool.stop().unwrap();
         drop((pool, engine));
         crate::scratch::remove(&root);
+    }
+
+    mod completion_regressions {
+        use super::*;
+
+        #[test]
+        fn preentry_outcomes_wait_until_the_executor_returns() {
+            let (root, pool, engine) = pool_of(0);
+            for canceled in [false, true] {
+                let mut child = crate::scratch::until_stdin_closes()
+                    .stdin(std::process::Stdio::piped()).spawn().unwrap();
+                let birth = Birth::of(child.id()).unwrap();
+                let id = engine.submit(&format!("preentry-{canceled}"), crate::journal::Invocation::default()).unwrap().id;
+                let (done, finished) = std::sync::mpsc::channel();
+                let serving = pool.clone();
+                assert!(engine.dispatch_managed(&id, move |engine, id| {
+                    engine.register_managed(&id, birth.clone(), Arc::new(|| Ok(())))?;
+                    assert!(engine.authorize_managed(&id, None)?);
+                    if canceled { engine.cancel(&id, "test")?; }
+                    let prepared = Frame {
+                        ok: false,
+                        terminal: if canceled { "canceled" } else { "refused" }.into(),
+                        origin: "runtime".into(), code: "invalid_parameters".into(),
+                        detail: "rejected before entering the handler".into(),
+                        ..Frame::default()
+                    };
+                    let mut triaged = false;
+                    complete_preentry(&engine, &id, &birth, &[], &prepared, |outcome| {
+                        triaged = outcome.code == "invalid_parameters";
+                    })?;
+                    let pending = engine.get(&id)?;
+                    serving.finish_returned(&engine, &id, "preentry", 0, 0, &Disposition::Cached)?;
+                    let final_record = engine.get(&id)?;
+                    done.send((pending.state, pending.pending_completion.is_some(), final_record.state,
+                        birth.ended()?, triaged)).unwrap();
+                    Ok(())
+                }).unwrap());
+                let observed = finished.recv_timeout(std::time::Duration::from_secs(30));
+                drop(child.stdin.take());
+                child.wait().unwrap();
+                let (state, pending, terminal, ended, triaged) = observed.unwrap();
+                assert_eq!(state, State::Running, "a PrepareRequest outcome was public before pool return");
+                assert!(pending && !ended);
+                assert_eq!(terminal, if canceled { State::Canceled } else { State::Failed });
+                assert_eq!(triaged, !canceled);
+            }
+            pool.stop().unwrap();
+            drop((pool, engine));
+            crate::scratch::remove(&root);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn captured_exit_does_not_follow_a_reused_process_group() {
+            use std::os::unix::process::CommandExt;
+            struct Child(std::process::Child, Birth);
+            impl Child {
+                fn in_group(group: i32) -> Self {
+                    let child = crate::scratch::until_stdin_closes().process_group(group)
+                        .stdin(std::process::Stdio::piped()).spawn().unwrap();
+                    let birth = Birth::of(child.id()).unwrap();
+                    Self(child, birth)
+                }
+                fn end(&mut self) {
+                    drop(self.0.stdin.take());
+                    self.0.wait().unwrap();
+                }
+            }
+            impl Drop for Child {
+                fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+            }
+            let mut leader = Child::in_group(0);
+            let mut follower = Child::in_group(leader.1.pid as i32);
+            let exact = platform::process::Exact::open(&follower.1).unwrap().unwrap();
+            let captured = executor_births(&leader.1, &[exact]);
+            leader.end();
+            let pending = crate::journal::PendingCompletion { outcome: Outcome::Canceled, processes: captured };
+            assert!(!pending.exited().unwrap(), "the captured follower still holds custody");
+            follower.end();
+            assert!(pending.exited().unwrap());
+
+            let mut foreign = Child::in_group(0);
+            let mut foreign_member = Child::in_group(foreign.1.pid as i32);
+            // A real new group occupies the numeric PID of a stale recorded incarnation.
+            let mut stale = foreign.1.clone();
+            stale.start_ticks = stale.start_ticks.checked_sub(1).unwrap();
+            assert!(stale.ended().unwrap());
+            assert!(platform::process::group_members(&stale).contains(&foreign_member.1));
+            let pending = crate::journal::PendingCompletion { outcome: Outcome::Canceled, processes: vec![stale.clone()] };
+            let journal_ready = pending.exited().unwrap();
+            let mut known = Child::in_group(0);
+            let recorded = vec![stale, known.1.clone()];
+            let pending = crate::journal::PendingCompletion { outcome: Outcome::Canceled, processes: recorded.clone() };
+            assert!(!pending.exited().unwrap(), "a recorded live process still blocks completion");
+            let (root, pool, engine) = pool_of(0);
+            let (done, finished) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || { await_executor_exit(&engine, &recorded); done.send(()).unwrap(); });
+            known.end();
+            let observed = finished.recv_timeout(std::time::Duration::from_secs(3));
+            let foreign_live = !foreign.1.ended().unwrap() && !foreign_member.1.ended().unwrap();
+            foreign_member.end();
+            foreign.end();
+            waiter.join().unwrap();
+            assert!(journal_ready, "pending completion adopted the reused PID's foreign group");
+            assert!(observed.is_ok() && foreign_live, "exit waiting followed a foreign group after its recorded process ended");
+            pool.stop().unwrap();
+            drop(pool);
+            crate::scratch::remove(&root);
+        }
     }
 
 
