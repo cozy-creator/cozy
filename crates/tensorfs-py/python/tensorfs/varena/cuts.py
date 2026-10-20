@@ -753,6 +753,26 @@ def _contiguous(func: OpOverload, args: Args, kwargs: Kwargs) -> _Plan | None:
     return _plan(_meta(func, args, kwargs), x, axis, band)
 
 
+def _silu(func: OpOverload, args: Args, kwargs: Kwargs) -> _Plan | None:
+    """Native inference SiLU in exact logical bands; its full result may be mapped."""
+    x = _arguments(func, args, kwargs).get("self")
+    if (not isinstance(x, Tensor) or x.layout is not torch.strided
+            or torch.is_grad_enabled() or _capturing()):
+        return None
+    made = _meta(func, args, kwargs)
+    axes = [i for i, size in enumerate(x.shape) if size > 1]
+    if not axes or not made or not made[0].is_contiguous():
+        return None
+    room = _served.rungs.available(x.device)
+    axis = next((i for i in axes if not room or 2 * _nbytes(x) // x.shape[i] <= room),
+                max(axes, key=lambda i: x.shape[i]))
+
+    def band(lo: int, hi: int) -> Tensor:
+        return func(x.narrow(axis, lo, hi - lo))
+
+    return _plan(made, x, axis, band)
+
+
 def _conv(func: OpOverload, args: Args, kwargs: Kwargs) -> _Plan | None:
     """Output rows [a, b) read input rows [a*s - p, (b-1)*s - p + d*(k-1) + 1), zeros past the
     edges."""
@@ -853,6 +873,7 @@ _UPSAMPLES = [f"{p}{d}d" for p in ("upsample_nearest", "_upsample_nearest_exact"
 _SPEC = {
     # Tensor.contiguous also dispatches clone(memory_format=contiguous_format).
     _contiguous: "contiguous clone",
+    _silu: "silu",
     _conv: "convolution conv1d conv2d conv3d",
     _pad: "constant_pad_nd pad",
     _upsample: " ".join(_UPSAMPLES),

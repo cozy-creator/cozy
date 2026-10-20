@@ -92,7 +92,8 @@ class CpuBound(TorchDispatchMode):
         full_copy = (func is torch.ops.aten.clone.default and tuple(args[0].shape) == self.shape)
         full_empty = (func in (torch.ops.aten.empty_strided.default, torch.ops.aten.empty.memory_format)
                       and tuple(args[0]) == self.shape and str(kwargs.get("device")) != "meta")
-        if full_copy or full_empty:
+        full_silu = func is torch.ops.aten.silu.default and tuple(args[0].shape) == self.shape
+        if full_copy or full_empty or full_silu:
             self.refused += 1
             raise torch.OutOfMemoryError("Tried to allocate 1 MiB")
         return func(*args, **kwargs)
@@ -125,6 +126,35 @@ def default_formats(cuts, source):
         assert cuts._contiguous(op, (source,), {"memory_format": torch.preserve_format}) is None
     assert cuts._contiguous(clone, (source,), {}) is None, "omitted clone must preserve its format"
     return defaults
+
+
+def silu_cpu(cuts):
+    op = torch.ops.aten.silu.default
+    for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raw = torch.linspace(-7, 7, 2 * 4 * 8 * 32, dtype=dtype).reshape(2, 4, 8, 32)
+        for source in (raw[..., :16].contiguous(), raw[..., 1::2]):
+            expected, before = op(source), source.clone()
+            version = source._version
+            room = Room()
+            cuts.serve(cuts.Memo(), room)
+            with torch.no_grad(), CpuBound(source.shape) as bound, cuts.caught():
+                actual = op(source)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert actual.dtype == source.dtype and actual.shape == source.shape
+            assert actual.stride() == expected.stride() and actual.data_ptr() != source.data_ptr()
+            assert torch.equal(source, before) and source._version == version
+            assert bound.refused and len(room.outputs) == 1 and len(room.outputs[0].writes) > 1
+        with torch.no_grad():
+            assert cuts._silu(op, (raw.transpose(1, 2),), {}) is None
+        assert cuts._silu(op, (raw,), {}) is None, "autograd mode must keep the original op"
+        train = raw.clone().requires_grad_()
+        reference = train.detach().clone().requires_grad_()
+        with cuts.caught():
+            op(train).sum().backward()
+        op(reference).sum().backward()
+        torch.testing.assert_close(train.grad, reference.grad, rtol=0, atol=0)
+    assert torch.ops.aten.silu_ not in cuts._RULES, "an in-place activation cannot get a fresh result"
+    print("PASS SiLU CPU: exact native bands, four dtypes, strided offsets, fresh output and unchanged autograd")
 
 
 def cpu(cuts):
@@ -167,6 +197,7 @@ def cpu(cuts):
         assert pointer() is None, "contiguous memo retained source storage"
     print("PASS contiguous CPU: exact locked DupUp3D, strided offsets, later-axis bands, formats and aliases")
     print(json.dumps({"omitted_memory_format": defaults}))
+    silu_cpu(cuts)
 
 
 def cuda():
@@ -221,12 +252,49 @@ def cuda():
             assert torch.equal(observed - 1, alias)
             del alias, observed
             torch.cuda.set_per_process_memory_fraction(fraction, device)
+
+            # The real decode now feeds native SiLU a mapped contiguous result.
+            # Build that input through the admitted writer in bounded GPU bands too.
+            torch.cuda.set_per_process_memory_fraction(
+                (torch.cuda.memory_allocated(device) + (12 << 20)) / total, device)
+            like = torch.empty((1, 32, 128, 2048), dtype=torch.float32, device="meta")
+            host_input = memory.mapped_output(like, device)
+            assert host_input is not None
+            activation_source = host_input.tensor
+            activation_pointer = weakref.ref(activation_source)
+            with torch.cuda.stream(side):
+                for at in range(32):
+                    piece = torch.linspace(-7 + at / 32, 7 - at / 32, 128 * 2048,
+                                           device=device).reshape(1, 1, 128, 2048)
+                    host_input.write_band(piece, 1, at)
+                    del piece
+                activation_room = Room(memory, room=8 << 20)
+                cuts.serve(cuts.Memo(), activation_room)
+                with cuts.caught():
+                    activated = torch.ops.aten.silu.default(activation_source)
+            side.synchronize()
+            assert activated.shape == activation_source.shape and activated.dtype == activation_source.dtype
+            assert activated.is_contiguous() and activated.data_ptr() != activation_source.data_ptr()
+            assert len(activation_room.outputs) == 1
+            activation_writes = activation_room.outputs[0].writes
+            assert len(activation_writes) > 1 and max(row[3] for row in activation_writes) <= 4 << 20
+            for at in range(32):
+                expected = torch.ops.aten.silu.default(activation_source.narrow(1, at, 1))
+                assert torch.equal(activated.narrow(1, at, 1), expected)
+                del expected
+            del activated, activation_source, host_input
+            activation_room.outputs.clear()
+            gc.collect()
+            assert activation_pointer() is None, "activation memo retained its mapped input"
+            torch.cuda.set_per_process_memory_fraction(fraction, device)
         assert request.stats is not None and not request.cleanup_errors
         assert request.stats.leftover == ((0, 0),)
         print("PASS contiguous mapped CUDA: real quota, exact strided bands, actual stream and alias lifetime")
+        print("PASS SiLU mapped CUDA: real quota, mapped input, exact native activation bands and no retained input")
         print(json.dumps({"gpu": str(torch.cuda.get_device_properties(device).uuid),
                           "input_bytes": 32 << 20, "largest_band_bytes": max(row[3] for row in writes),
                           "omitted_memory_format": defaults,
+                          "silu_largest_band_bytes": max(row[3] for row in activation_writes),
                           "leftover": request.stats.leftover, "scope": "isolated cut/output; not native relief policy"}))
     finally:
         torch.cuda.set_per_process_memory_fraction(fraction, device)
