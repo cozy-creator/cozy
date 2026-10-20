@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tensorfs::format::decode::plan::{Core, Elems, Plan, Post};
 use tensorfs::format::decode::{self, gguf, Geometry};
 use tensorfs::format::{Dtype, Encoding, PartBytes};
-use tensorfs::kernels::{self, Prepared, BINARIES, FAMILIES};
+use tensorfs::kernels::{self, Prepared, BINARIES, CORE_KINDS, FAMILIES};
 
 #[test]
 fn every_encoded_green_vector_prepares_a_kernel_without_host_fallback() {
@@ -114,10 +114,10 @@ fn every_encoded_green_vector_prepares_a_kernel_without_host_fallback() {
     let digest = format!("{:x}", corpus.finalize());
     assert_eq!(
         digest,
-        "92a0f4f01f4490c2f7f8c391e5eb600f5e5b33d647eed48d91ff7c21e7af57d4"
+        "fa2f92b926ba1f0e1195027eaf4066ae0d72c20ca4119584ca8547d5e91167b1"
     );
-    assert_eq!(checked, 209);
-    assert_eq!(schemes.len(), 39);
+    assert_eq!(checked, 227);
+    assert_eq!(schemes.len(), 42);
     println!("kernel routing: {checked} full + {checked} odd-byte windows, {} schemes, 0 host fallbacks; corpus {digest}", schemes.len());
 }
 
@@ -178,7 +178,7 @@ fn a_decode_window_is_checked_before_preparing_or_allocating_output() {
 #[test]
 #[ignore = "requires the build-only AOT compile, never a GPU or Triton at runtime"]
 fn prebuilt_images_cover_every_native_core_and_family() {
-    let kinds: Vec<&str> = ["codes", "unpack", "hadamard", "rotated"]
+    let kinds: Vec<&str> = CORE_KINDS
         .into_iter()
         .chain(gguf::STRUCTS.iter().map(|s| s.name))
         .collect();

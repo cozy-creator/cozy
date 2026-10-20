@@ -8,6 +8,14 @@ use crate::format::decode::{round, Geometry};
 use crate::format::{Dtype, Error, Result};
 
 pub const FAMILIES: [u32; 6] = [80, 86, 89, 90, 100, 120];
+pub const CORE_KINDS: [&str; 6] = [
+    "codes",
+    "unpack",
+    "hadamard",
+    "rotated",
+    "requantize",
+    "grouped_rotated",
+];
 
 pub struct Binary {
     pub family: u32,
@@ -23,7 +31,8 @@ include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
 
 #[cfg(require_aot)]
 const _: () = assert!(
-    BINARIES.len() == FAMILIES.len() * (crate::format::decode::gguf::STRUCTS.len() + 4) * 3
+    BINARIES.len()
+        == FAMILIES.len() * (crate::format::decode::gguf::STRUCTS.len() + CORE_KINDS.len()) * 3
 );
 
 pub enum Prepared<'a> {
@@ -34,6 +43,8 @@ pub enum Prepared<'a> {
 
 /// Device arguments, in order: destination, words, slots, scale, term, table, global, post,
 /// index, error (one zeroed i32), params. Factors are f32; words retain their stored bits.
+/// `grouped_rotated`: scale=relative group scales, global=channel scales,
+/// term=optional transposed correction, table=optional levels, post=unit factor.
 pub struct Launch<'a> {
     pub kind: &'static str,
     pub dtype: Dtype,
@@ -128,6 +139,64 @@ pub fn prepare<'a>(
             launch.kind = "rotated";
             launch.params[28] = block as u64;
             codes
+        }
+        Core::RequantizedRotation {
+            codes,
+            block,
+            scale,
+            correction,
+        } => {
+            let bits = codes.packing.bits();
+            let group = codes.group;
+            if group == 0
+                || !g.cols.is_multiple_of(group)
+                || !g.cols.is_multiple_of(4)
+                || !(4..=65536).contains(&block)
+                || !block.is_power_of_two()
+                || block.trailing_zeros() % 2 != 0
+                || !g.cols.is_multiple_of(block)
+            {
+                return Err(Error::Decode(
+                    "invalid requantized rotation geometry".into(),
+                ));
+            }
+            let width = codes.packing.row_bytes(g.cols);
+            if width.checked_mul(g.rows) != Some(codes.bytes.len()) {
+                return Err(Error::Decode(
+                    "requantized codes have a wrong byte length".into(),
+                ));
+            }
+            launch.kind = "grouped_rotated";
+            launch.words = codes.bytes;
+            launch.scale = codes.relative.floats();
+            launch.global = scale.floats();
+            let cells = g.rows.checked_mul(g.cols / group);
+            if cells != Some(launch.scale.len()) || launch.global.len() != g.rows {
+                return Err(Error::Decode(
+                    "relative or channel scales have a wrong length".into(),
+                ));
+            }
+            if let Some(correction) = correction {
+                launch.term = correction.floats();
+                if cells != Some(launch.term.len()) {
+                    return Err(Error::Decode("correction has a wrong length".into()));
+                }
+                launch.params[29] = 1;
+            }
+            if let Some(table) = codes.table {
+                launch.table = table.floats();
+                if bits != 4 || launch.table.len() != 16 {
+                    return Err(Error::Decode(
+                        "requantized codebook is not16 four-bit levels".into(),
+                    ));
+                }
+                launch.params[24] = 16;
+            }
+            launch.params[8] = bits as u64;
+            launch.params[18] = group as u64;
+            launch.params[28] = block as u64;
+            launch.params[30] = 1 << (block.trailing_zeros() / 2);
+            return Ok(Prepared::Kernel(Box::new(launch)));
         }
         Core::Structs { bytes, kind } => {
             launch.kind = kind.name;

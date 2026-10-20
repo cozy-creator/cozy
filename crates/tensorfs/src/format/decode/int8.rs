@@ -10,6 +10,12 @@ use crate::format::Result;
 const I8: Dtypes = Dtypes::Of(&["I8"]);
 const F32: Dtypes = Dtypes::Of(&["F32"]);
 
+/// Every stored ConvRot uses a power-of-four block, shared by all rotation schemes.
+pub(super) const ROTATION_SIZE: Param = Param {
+    key: "rotation_size",
+    allowed: Allowed::Uint(&[4, 16, 64, 256, 1024, 4096, 16384, 65536]),
+};
+
 pub const TENSORWISE: Scheme = Scheme {
     name: "int8.tensorwise",
     view: View::Flat,
@@ -41,10 +47,7 @@ pub const CONVROT: Scheme = Scheme {
             key: "rotation",
             allowed: Allowed::Text(&["hadamard"]),
         },
-        Param {
-            key: "rotation_size",
-            allowed: Allowed::Uint(&[4, 16, 64, 256, 1024, 4096, 16384, 65536]),
-        },
+        ROTATION_SIZE,
         SCALE_DTYPE,
     ],
     parts: &[
