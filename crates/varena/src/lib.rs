@@ -11,6 +11,7 @@
 
 pub use tensorfs::io::{cuda, metrics as ceiling};
 pub mod faults;
+pub mod gpu;
 pub mod host;
 pub mod io;
 pub mod layout;
