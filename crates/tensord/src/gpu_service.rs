@@ -668,6 +668,7 @@ struct ChargeOwner {
 struct Device {
     entry: String,
     memory: GpuMemory,
+    placement: Option<crate::memory::slim::Memory>,
 }
 
 pub(crate) struct Permit {
@@ -752,9 +753,16 @@ impl Pool {
                 learned = root.join(format!("memory-gpu{entry}"));
                 fs::create_dir_all(&learned)?;
             }
+            let physical = config.inventory.iter().find(|gpu|
+                gpu.device_index.to_string() == *entry || gpu.device_uuid == *entry);
+            let placement = physical.filter(|gpu| gpu.memory_bytes > 0)
+                .map(|gpu| crate::memory::slim::Memory::create(
+                    &gpu.device_uuid, gpu.memory_bytes, config.authorized_device_limit_bytes))
+                .transpose().map_err(io::Error::other)?;
             devices.push(Device {
                 entry: entry.clone(),
                 memory: GpuMemory::start(entry, &memory, &learned, notes.clone()),
+                placement,
             });
         }
         let pool = Arc::new(Self {
@@ -990,6 +998,15 @@ impl Pool {
         let gone: std::collections::HashSet<_> = births.iter()
             .filter(|birth| birth.ended().unwrap_or(false)).collect();
         if gone.is_empty() { return; }
+        for device in self.lane(start, degree).unwrap_or_default() {
+            if let Some(memory) = &device.placement {
+                for birth in &gone {
+                    if let Err(error) = memory.reap(birth.pid) {
+                        tracing::warn!(%error, pid = birth.pid, "placement row reap refused");
+                    }
+                }
+            }
+        }
         let mut accounting = self.accounting.lock().unwrap();
         let survivor = self.leaders.lock().unwrap().values()
             .find(|(birth, p, lane)| p == plan && *lane == start && !gone.contains(birth)
@@ -3182,7 +3199,10 @@ impl Pool {
             let constructions = constructions(&plan);
             // Rank 0 spawns and forms every follower inside this command; its watch meters
             // the whole group's work, so formation ends only on measured lack of progress.
-            let started = command_ok(session.executor.command_with(
+            let grants = gpus.iter().map(|device| device.placement.as_ref()
+                .ok_or_else(|| io::Error::other("GPU inventory is required for a placement grant"))?
+                .grant_unbound().map_err(io::Error::other)).collect::<io::Result<Vec<_>>>()?;
+            let started = command_ok(session.executor.command_with_grants(
                 &DeviceCommand::Start {
                     devices: lane.clone(),
                     application: held.record.application.clone(),
@@ -3194,8 +3214,10 @@ impl Pool {
                 },
                 &Group {
                     rank_cells: ranked,
+                    ledgers: grants.len() as u32,
                     ..Group::default()
                 },
+                grants,
                 &mut callbacks,
             )?)?;
             if ranked && (1..ranks).any(|rank| !callbacks.cells.contains_key(&rank)) {

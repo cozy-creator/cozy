@@ -482,6 +482,11 @@ impl Ledger {
     pub fn capacity(&self) -> u64 {
         self.table.shared().header.capacity.load(Acquire)
     }
+    /// A private rank channel created before the rank process exists. Its first bind pins
+    /// one live row generation; no later message may name a different owner.
+    pub fn grant_unbound(&self) -> Result<Grant> {
+        self.grant(0)
+    }
     pub fn grant(&self, pid: u32) -> Result<Grant> {
         let (server, client) = UnixStream::pair().map_err(|e| io("create grant channel", e))?;
         let (table, custody) = (self.table.clone(), self.custody.clone());
@@ -507,6 +512,14 @@ impl Ledger {
             return Err(Error::Invalid(
                 "only the executor may claim its own row".into(),
             ));
+        }
+        if self
+            .table
+            .rows()?
+            .iter()
+            .any(|row| row.pid == pid && row.state == State::Live)
+        {
+            return Err(Error::Invalid("process already owns a ledger row".into()));
         }
         let lock = shm::reopen(self.fd(), true).map_err(crate::os("open private ledger claim"))?;
         for (row, slot) in self.table.shared().rows.iter().enumerate() {
@@ -1006,6 +1019,7 @@ impl Custody {
 /// spans/count*u64; an offer then sends one SCM_RIGHTS container. Imports consume it once.
 fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex<Custody>>) {
     let result = (|| -> Result<()> {
+        let mut bound = None;
         loop {
             let mut header = [0u8; 57];
             match stream.read_exact(&mut header) {
@@ -1031,9 +1045,16 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                 ),
             };
             let slot = table.slot(owner)?;
-            if slot.pid.load(Acquire) != pid {
+            if (pid != 0 && slot.pid.load(Acquire) != pid)
+                || !table.alive(owner.row as usize)?
+                || bound.is_some_and(|previous| previous != owner)
+            {
                 return Err(Error::Invalid("grant used by another row owner".into()));
             }
+            if pid == 0 && bound.is_none() && header.first() != Some(&0) {
+                return Err(Error::Invalid("rank grant must bind before use".into()));
+            }
+            bound = Some(owner);
             let key = PageKey {
                 fingerprint: read(13, 32)?
                     .try_into()
@@ -1053,6 +1074,11 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                 return Err(Error::Invalid("too many custody chunks".into()));
             }
             match header.first().copied() {
+                Some(0) => {
+                    stream
+                        .write_all(&[1])
+                        .map_err(|e| io("bind rank grant", e))?;
+                }
                 Some(1) => {
                     let mut spans = Vec::with_capacity(count);
                     for _ in 0..count {
@@ -1176,12 +1202,6 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
     if let Err(error) = result {
         tracing::warn!(%error, "varena custody channel ended");
     }
-    for page in custody.lock().pages.values_mut().filter(|p| {
-        p.owner
-            .is_some_and(|o| table.slot(o).is_ok_and(|s| s.pid.load(Acquire) == pid))
-    }) {
-        page.owner = None;
-    }
     table.changed();
 }
 
@@ -1190,6 +1210,27 @@ pub struct Channel(Mutex<UnixStream>);
 impl Channel {
     pub fn new(fd: OwnedFd) -> Self {
         Self(Mutex::new(UnixStream::from(fd)))
+    }
+    pub fn bind(&self, owner: Owner) -> Result<()> {
+        let mut stream = self.0.lock();
+        Self::header(
+            &mut stream,
+            0,
+            owner,
+            PageKey {
+                fingerprint: [0; 32],
+                page: 0,
+            },
+            0,
+        )?;
+        let mut ack = [0];
+        stream
+            .read_exact(&mut ack)
+            .map_err(|e| io("read rank binding", e))?;
+        if ack != [1] {
+            return Err(Error::Invalid("rank grant refused".into()));
+        }
+        Ok(())
     }
     fn header(
         stream: &mut UnixStream,
