@@ -36,7 +36,7 @@ from ._ext import (
     __version__,
 )
 from . import raw
-from .api import ComponentWriter, Endpoint, Writer, configure, convert_to_cozytensors, export, download_file, open, materialize, upload_folder
+from .api import ComponentWriter, Endpoint, Writer, configure, convert_to_cozytensors, download_file, open, materialize, upload_folder
 
 Mapping.register(Tensors)
 
@@ -69,7 +69,6 @@ __all__ = [
     "__version__",
     "configure",
     "convert_to_cozytensors",
-    "export",
     "download_file",
     "open",
     "materialize",

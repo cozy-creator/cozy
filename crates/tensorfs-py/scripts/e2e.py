@@ -198,8 +198,8 @@ def main() -> None:
     assert sorted(names) == sorted(f"{c}/{k}" for c, component in ck.components.items() for k in component.tensors), "every tensor in one region"
     print(f"Python: {compared} tensors equal upstream's through DLPack; {len(grouped)} regions")
 
-    written = tfs.export(m, work / "out2")
-    assert "unet/diffusion_pytorch_model.safetensors" in written
+    written = pathlib.Path(tfs.materialize(m, local_dir=work / "out2", format="safetensors"))
+    assert (written / "unet/diffusion_pytorch_model.safetensors").is_file()
     assert tree(work / "out2") == tree(work / "out"), "the Python export is the CLI's, byte for byte"
     same_image(work / "out2", reference)
     origin = (work / "origin2").as_uri()

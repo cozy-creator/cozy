@@ -150,7 +150,7 @@ class HostReads(unittest.TestCase):
     def test_real_endpoint_fetches_only_chunks_touched_by_the_read(self) -> None:
         root = pathlib.Path(self.tmp.name)
         endpoint = (root / "origin").as_uri()
-        tfs.export(self.ck, root / "portable-source", format="cozytensors")
+        tfs.materialize(self.ck, local_dir=root / "portable-source")
         tfs.upload_folder(repo_id="acme/reads", revision="one", folder_path=root / "portable-source",
                           endpoint=endpoint, cache_dir=root / "upload")
         remote = tfs.open("acme/reads", revision="one", endpoint=endpoint, cache_dir=root / "reader")

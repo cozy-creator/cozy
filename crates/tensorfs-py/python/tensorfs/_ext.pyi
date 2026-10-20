@@ -295,5 +295,5 @@ class Endpoint:
 
 _Token = str | DPoP | TokenProvider | Callable[[str, str, Mapping[str, str], str | None], Mapping[str, str]]
 
-def _export(checkpoint: Checkpoint, directory: StrPath, *, format: str = "safetensors",
-            dequantize: str | None = None) -> list[str]: ...
+def _materialize(checkpoint: Checkpoint, directory: StrPath, *, format: str = "cozytensors",
+                 dequantize: str | None = None) -> str: ...

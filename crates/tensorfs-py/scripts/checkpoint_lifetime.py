@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory() as temp:
         component = writer.component("model", cls="test.Model", config={"size": 4})
         component.put("weight", b"data", dtype="U8", shape=[4])
         component.asset("vocab.txt", b"a\nb\n")
-    tensorfs.export(writer.commit(), root / "source", format="cozytensors")
+    tensorfs.materialize(writer.commit(), local_dir=root / "source")
     endpoint = (root / "origin").as_uri()
     tensorfs.upload_folder(repo_id="acme/lifetime", revision="one", folder_path=root / "source",
                            endpoint=endpoint, cache_dir=root / "upload")
@@ -128,6 +128,29 @@ with tempfile.TemporaryDirectory() as temp:
         gc.collect()
         assert released.wait(10), "deferred completed-call release did not finish within 10 seconds"
         assert alive() is None, "a completed call retained its closed parent's provider"
+
+        # Keep the exception traceback (and the facade's local checkpoint) alive. Its
+        # finally-close must still release native access after materialization fails.
+        provider = Provider()
+        alive = weakref.ref(provider)
+        released = threading.Event()
+        weakref.finalize(provider, released.set)
+        blocked = root / "blocked-materialize"
+        blocked.write_bytes(b"not a directory")
+        failures = []
+        try:
+            tensorfs.materialize("acme/lifetime", revision="one", endpoint=endpoint,
+                                 token=provider, cache_dir=root / "materialize-reader",
+                                 local_dir=blocked, format="safetensors")
+        except tensorfs.Error as error:
+            failures.append(error)
+        else:
+            raise AssertionError("materialization accepted a file as its destination directory")
+        assert provider.calls > 0 and failures[0].__traceback__ is not None
+        del provider
+        gc.collect()
+        assert released.wait(10), "failed materialization did not close its temporary checkpoint"
+        assert alive() is None, "a retained traceback kept temporary checkpoint access alive"
 
     with tensorfs.open(root / "source", cache_dir=root / "isolated") as checkpoint:
         assert checkpoint.__enter__() is checkpoint

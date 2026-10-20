@@ -23,7 +23,7 @@ class OfflineCache(unittest.TestCase):
             writer.component("model", cls="test.Model", config={}).put(
                 "weight", b"data", dtype="U8", shape=[4]
             )
-        tensorfs.export(writer.commit(), self.root / "source", format="cozytensors")
+        tensorfs.materialize(writer.commit(), local_dir=self.root / "source")
         tensorfs.upload_folder(
             repo_id="acme/offline",
             revision="one",
@@ -105,7 +105,7 @@ class OfflineCache(unittest.TestCase):
             writer.component("model", cls="test.Model", config={}).put(
                 "weight", b"next", dtype="U8", shape=[4]
             )
-        tensorfs.export(writer.commit(), self.root / "second", format="cozytensors")
+        tensorfs.materialize(writer.commit(), local_dir=self.root / "second")
         tensorfs.upload_folder(
             repo_id="acme/offline",
             revision="two",
