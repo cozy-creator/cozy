@@ -11,7 +11,7 @@ are separate documents.
 - [Decode existing host or GPU buffers](#advanced-decode-existing-host-or-gpu-buffers)
 - [Errors and value types](#errors-and-value-types)
 
-The [temporary type-declaration dump](API-TYPES.md) is available for signature and naming review.
+[API-TYPES.md](API-TYPES.md) lists every declaration.
 
 ## Rust: create a client and read a model
 

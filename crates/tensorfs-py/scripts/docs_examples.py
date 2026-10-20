@@ -4,14 +4,15 @@ models, and exit 1 when any fails. CI runs it on the built wheel (publish-tensor
 
     docs_examples.py [--wheels DIR] [--work DIR] DOC.md...
 
-The fixture: `me/model`, release `1.0`, variant `bf16`, is hf-internal-testing/tiny-sdxl-pipe
-converted by TensorFS and rounded to BF16, uploaded to a `file://` endpoint that TENSORFS_ENDPOINT
-names; an example's `https://tensorhub.com` means that endpoint. Each document runs in its own
-process and working directory with an empty TENSORFS_HOME. Its Python blocks share one namespace,
+The fixture: `me/model`, release `1.0`, is hf-internal-testing/tiny-sdxl-pipe converted by TensorFS,
+in a `bf16` variant and an `int8` one whose UNet matrices are `int8.rowwise`, with a README and
+LICENSE. It is uploaded to a `file://` endpoint; each document gets its own copy of it, named by
+TENSORFS_ENDPOINT, and an example's `https://tensorhub.com` means that copy. Each document runs in
+its own process and working directory with an empty TENSORFS_HOME. Its Python blocks share one namespace,
 in which `my_token` is a placeholder token and `private_ca_der` a real CA certificate. Shell blocks
 run with bash, where `uv pip install tensorfs` and `pip install tensorfs` install the wheels in
 --wheels. A document's Rust blocks run last, together, as one `cargo run --example` program.
-An example that mentions CUDA is skipped where torch sees no CUDA device.
+An example whose code (not its comments) names CUDA is skipped where torch sees no CUDA device.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -48,28 +50,41 @@ def blocks(doc: pathlib.Path) -> list[dict]:
     return found
 
 
-def fixture(work: pathlib.Path) -> str:
-    """`me/model@1.0`, variant bf16, on a directory endpoint; returns its URL."""
-    store, endpoint = work / "fixture-store", work / "endpoint"
+def fixture(work: pathlib.Path) -> pathlib.Path:
+    """`me/model@1.0` on a directory endpoint, returned: variant `bf16` is the tiny SDXL rounded to
+    BF16; `int8` also stores the UNet's matrices as `int8.rowwise`."""
+    store, folder, endpoint = work / "fixture-store", work / "fixture-folder", work / "endpoint"
+    folder.mkdir()
     source = tensorfs.convert_to_cozytensors(SOURCE, cache_dir=store)
-    with tensorfs.Writer(variant="bf16", cache_dir=store) as writer:
-        writer.metadata["source"] = f"{SOURCE}, F32 rounded to BF16"
-        writer.pipeline(source.pipeline.cls, source.pipeline.config)
-        for name, component in source.components.items():
-            out = writer.component(name, cls=component.cls, config=component.config)
-            for key, info in component.tensors.items():
-                data, dtype = component.tensors.read(key).tobytes(), info.dtype
-                if dtype == "F32":
-                    bits = np.frombuffer(data, np.uint32)
-                    data, dtype = ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).astype(np.uint16).tobytes(), "BF16"
-                out.put(key, data, dtype=dtype, shape=list(info.shape))
-            for asset in component.assets:
-                out.asset(asset, component.asset(asset))
-    folder = tensorfs.materialize(writer.commit(), local_dir=work / "fixture-folder")
-    url = endpoint.as_uri()
-    tensorfs.upload_folder(repo_id="me/model", revision="1.0", folder_path=folder, endpoint=url, cache_dir=store)
-    print(f"fixture: me/model@1.0/bf16 ({SOURCE} in BF16) at {url}", flush=True)
-    return url
+    for variant in ("bf16", "int8"):
+        with tensorfs.Writer(folder / f"model.{variant}.cozytensors", cache_dir=store) as writer:
+            writer.metadata["source"] = SOURCE
+            writer.pipeline(source.pipeline.cls, source.pipeline.config)
+            for name, component in source.components.items():
+                out = writer.component(name, cls=component.cls, config=component.config, config_file=component.config_file)
+                for key, info in component.tensors.items():
+                    data, shape = component.tensors.read(key).tobytes(), list(info.shape)
+                    if info.dtype != "F32":
+                        out.put(key, data, dtype=info.dtype, shape=shape)
+                        continue
+                    values = np.frombuffer(data, np.float32).reshape(shape)
+                    if variant == "int8" and name == "unet" and len(shape) == 2:
+                        scale = np.abs(values).max(axis=1) / 127
+                        scale[scale == 0] = 1
+                        weight = np.clip(np.round(values / scale[:, None]), -127, 127).astype(np.int8)
+                        parts = {"weight": ("I8", shape, weight.tobytes()), "scale": ("F32", shape[:1], scale.astype(np.float32).tobytes())}
+                        out.put_encoded(key, dtype="BF16", shape=shape, scheme="int8.rowwise",
+                                        params={"axis": 0, "scale_dtype": "F32"}, parts=parts)
+                    else:
+                        bits = values.view(np.uint32)
+                        out.put(key, ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).astype(np.uint16).tobytes(), dtype="BF16", shape=shape)
+                for asset in component.assets:
+                    out.asset(asset, component.asset(asset))
+    (folder / "README.md").write_text(f"# me/model\n\n{SOURCE} converted by TensorFS, in bf16 and int8 variants.\n")
+    (folder / "LICENSE").write_text(f"The terms of {SOURCE.replace('hf://', 'https://huggingface.co/')} apply.\n")
+    tensorfs.upload_folder(repo_id="me/model", revision="1.0", folder_path=folder, endpoint=endpoint.as_uri(), cache_dir=store)
+    print(f"fixture: me/model@1.0 (bf16, int8) from {SOURCE} at {endpoint}", flush=True)
+    return endpoint
 
 
 def placeholders() -> dict:
@@ -161,12 +176,13 @@ def main() -> int:
         return 0
     work = (args.work or pathlib.Path(tempfile.mkdtemp(prefix="tensorfs-docs-"))).resolve()
     work.mkdir(parents=True, exist_ok=True)
-    endpoint = fixture(work)
+    seeded = fixture(work)
     has_gpu = gpu()
     rows = []
     for doc in (d.resolve() for d in args.docs):
         cwd = work / re.sub(r"\W", "_", str(doc.relative_to(ROOT)))
         cwd.mkdir()
+        endpoint = shutil.copytree(seeded, cwd / ".endpoint").as_uri()
         env = {
             **os.environ,
             **overrides(args.wheels, work),
@@ -177,7 +193,8 @@ def main() -> int:
         found = blocks(doc)
         for block in found:
             block["code"] = block["code"].replace(TENSORHUB, endpoint)
-            block["skip"] = "needs CUDA" if re.search(r"\bcuda\b", block["code"]) and not has_gpu else ""
+            uses_cuda = re.search(r"\bcuda\b", re.sub(r"#.*", "", block["code"]))
+            block["skip"] = "needs CUDA" if uses_cuda and not has_gpu else ""
         spec = {"doc": str(doc), "cwd": str(cwd), "results": str(cwd / ".results.jsonl"),
                 "blocks": [b for b in found if b["lang"] != "rust"]}
         (cwd / ".spec.json").write_text(json.dumps(spec))
