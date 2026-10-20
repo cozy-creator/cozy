@@ -7,7 +7,7 @@
 //! and uploads every byte; this computer only asks.
 //!
 //! upload → private download elsewhere → publish → info → family → quantize (a package's
-//! quantizer) → publish its lane → retarget → yank → delete.
+//! quantizer) → move the release to the commit that adds its lane → yank → delete.
 #![cfg(unix)]
 mod common;
 
@@ -208,9 +208,8 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     assert_eq!(run["result"]["models"][0]["tree"], source.as_str(), "{run}");
 
     // A release names it; info shows the lane and its checkpoint.
-    let lane = format!("f32={source}");
-    let release = json(&home, &["--json", "model", "publish", &model, "--release", "1.0.0", "--lane", &lane]);
-    assert_eq!((release["lanes"]["f32"].as_str(), &release["changed"]), (Some(source.as_str()), &Value::Bool(true)), "{release}");
+    let release = json(&home, &["--json", "model", "publish", &model, "--release", "1.0.0", "--commit", &source]);
+    assert_eq!((release["commit"].as_str(), &release["changed"]), (Some(source.as_str()), &Value::Bool(true)), "{release}");
     let info = json(&home, &["--json", "model", "info", &model]);
     assert_eq!(info["releases"][0]["lanes"][0]["checkpoint"], format!("{model}#{source}"), "{info}");
 
@@ -224,26 +223,23 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     let pinned = format!("{model}@1.0.0/f32");
     let run = completed(&home, &cozy(&home, None, &["--json", "model", "quantize", &pinned, "--fp8", "--package", &package, "--on", "m1"]));
     println!("quantize run: {run}");
-    let fp8 = run["result"]["manifest"]["digest"].as_str().unwrap_or_else(|| panic!("no checkpoint in {run}")).to_owned();
+    let written = run["output"].as_array().into_iter().flatten().find(|item| item["name"] == "fp8");
+    let fp8 = written.and_then(|item| item["checkpoint"]["revision"].as_str()).unwrap_or_else(|| panic!("no tree in {run}")).to_owned();
 
     // A person sees the checkpoint the machine wrote and how to publish it.
     let human = cozy(&home, None, &["model", "quantize", &pinned, "--fp8", "--package", &package, "--on", "m1"]);
     assert_eq!(human.code, 0, "{human:?}");
-    assert!(human.stdout.contains(&format!("{model}#{fp8}")), "{human:?}");
-    let next = format!("cozy model publish {model} --release 1.0.0 --lane fp8={fp8}");
+    assert!(human.stdout.contains(&format!("{model}@{fp8}")), "{human:?}");
+    let next = format!("cozy model publish {model} --release 1.0.0 --commit {fp8}");
     assert!(human.stdout.contains(&next), "{human:?}");
 
     // The machine holds the package now: quantize finds its quantizer there, and none for int8.
     let none = cozy(&home, None, &["--json", "model", "quantize", &pinned, "--int8", "--on", "m1"]);
     assert_eq!((none.code, none.refusal()["code"].as_str()), (1, Some("model_quantizer_not_found")), "{none:?}");
 
-    let lane = format!("fp8={fp8}");
-    let release = json(&home, &["--json", "model", "publish", &model, "--release", "1.0.0", "--lane", &lane]);
-    assert_eq!(release["lanes"]["fp8"].as_str(), Some(fp8.as_str()), "{release}");
-    let moved = json(&home, &["--json", "model", "retarget", &model, "--release", "1.0.0", "--lane", "fp8", "--to", &source]);
-    assert_eq!(moved["lanes"]["fp8"].as_str(), Some(source.as_str()), "{moved}");
-    let emptied = cozy(&home, None, &["--json", "model", "publish", &model, "--release", "1.0.0", "--remove-lane", "f32", "--remove-lane", "fp8"]);
-    assert_eq!((emptied.code, emptied.refusal()["code"].as_str()), (2, Some("model_release_empty")), "{emptied:?}");
+    // The release moves to the commit that adds the fp8 variant.
+    let moved = json(&home, &["--json", "model", "publish", &model, "--release", "1.0.0", "--commit", &fp8]);
+    assert_eq!(moved["commit"].as_str(), Some(fp8.as_str()), "{moved}");
 
     let yanked = json(&home, &["--json", "model", "yank", &model, "--release", "1.0.0"]);
     assert_eq!(yanked["yanked"], true, "{yanked}");
