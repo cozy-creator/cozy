@@ -132,7 +132,7 @@ impl Client {
             })?;
             let stream = Arc::new(crate::fetch::Stream::new(endpoint.inner, runtime));
             store
-                .streaming_writer(stream, repo_id, &variant, base)
+                .streaming_writer_resumable(stream, repo_id, &variant, base, options.resume)
                 .map_err(from_writer)?
         } else {
             store.writer(base, options.resume).map_err(from_writer)?
@@ -215,10 +215,8 @@ impl Context {
             let header = checkpoint.id();
             // The content-addressed normal pin is durable independently of a resume key,
             // the path's lifetime, and any future overwrite of this header file.
-            self.store.pin(
-                &header.sha256,
-                &crate::store2::Pin::new(vec![header.clone()]),
-            )?;
+            self.store
+                .pin_roots(&header.sha256, std::slice::from_ref(header))?;
             let bytes = self.store.read(header)?;
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)
