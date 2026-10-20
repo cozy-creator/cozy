@@ -909,6 +909,7 @@ async fn every_output_ends_landed_kept_or_lost_and_a_checkpoint_waits_on_nothing
                     repo_id: "local/derived".into(),
                     revision: "sha256:tree".into(),
                     variant: String::new(),
+                    tag: String::new(),
                 }),
                 ..Default::default()
             },

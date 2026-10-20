@@ -86,8 +86,11 @@ impl Endpoint {
         let Some(object) = object else {
             return fail(Kind::NotFound, format!("{repo_id} has no revision {revision}, and {} holds no such object", self.inner.url()));
         };
-        Tree::from_json(&self.inner.document(&object).await.map_err(from_native)?)?;
-        Ok((object, None))
+        let tree = Tree::from_json(&self.inner.document(&object).await.map_err(from_native)?);
+        match tree {
+            Ok(_) => Ok((object, None)),
+            Err(_) => fail(Kind::NotFound, format!("{revision} is not a commit, and no tag of {repo_id} names it")),
+        }
     }
 
     pub async fn update_repo(

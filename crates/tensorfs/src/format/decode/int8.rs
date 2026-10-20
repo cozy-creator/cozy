@@ -1,7 +1,7 @@
-//! `int8.tensorwise`, `int8.rowwise` and `int8.convrot` (spec §6).
+//! `int8.tensorwise`, `int8.rowwise`, `int8.columnwise` and `int8.convrot` (spec §6).
 
 use super::affine::SIGNED_BYTES;
-use super::fp8::{axis_grid, per_axis, AXIS, SCALE};
+use super::fp8::SCALE;
 use super::grid::Grid;
 use super::plan::{Codes, Core, Elems, Post};
 use super::{elem, logical, one, Allowed, Ctx, Dtypes, Param, Part, Plan, Scheme, View};
@@ -9,6 +9,12 @@ use crate::format::Result;
 
 const I8: Dtypes = &["I8"];
 const F32: Dtypes = &["F32"];
+
+/// The rotation every ConvRot scheme names: `H_B` of spec §6, `B = rotation_size`.
+pub(super) const ROTATION: Param = Param {
+    key: "rotation",
+    allowed: Allowed::Text(&["kron_regular_h4"]),
+};
 
 /// Every stored ConvRot uses a power-of-four block, shared by all rotation schemes.
 pub(super) const ROTATION_SIZE: Param = Param {
@@ -31,24 +37,29 @@ pub const TENSORWISE: Scheme = Scheme {
 pub const ROWWISE: Scheme = Scheme {
     name: "int8.rowwise",
     view: View::Matrix,
-    params: &[AXIS],
+    params: &[],
     parts: &[
         Part::req("weight", I8, logical),
-        Part::req("scale", SCALE, per_axis),
+        Part::req("scale", SCALE, |c| Grid::Row.shape(c)),
     ],
-    decode: |c| Ok(scaled(c, axis_grid(c)).into()),
+    decode: |c| Ok(scaled(c, Grid::Row).into()),
+};
+
+pub const COLUMNWISE: Scheme = Scheme {
+    name: "int8.columnwise",
+    view: View::Matrix,
+    params: &[],
+    parts: &[
+        Part::req("weight", I8, logical),
+        Part::req("scale", SCALE, |c| Grid::Col.shape(c)),
+    ],
+    decode: |c| Ok(scaled(c, Grid::Col).into()),
 };
 
 pub const CONVROT: Scheme = Scheme {
     name: "int8.convrot",
     view: View::Matrix,
-    params: &[
-        Param {
-            key: "rotation",
-            allowed: Allowed::Text(&["kron_regular_h4"]),
-        },
-        ROTATION_SIZE,
-    ],
+    params: &[ROTATION, ROTATION_SIZE],
     parts: &[
         Part::req("weight", I8, logical),
         Part::req("scale", SCALE, |c| Grid::Row.shape(c)),

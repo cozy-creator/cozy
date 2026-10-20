@@ -705,9 +705,9 @@ mod tests {
         let correction = [cols / group, rows];
         let typed = [
             ("weight", Dtype::I8, weight.as_slice()),
-            ("weight_s_rel", Dtype::F32, relative.as_slice()),
-            ("weight_s_channel", Dtype::F32, channel.as_slice()),
-            ("weight_correction", Dtype::BF16, correction.as_slice()),
+            ("group_scale", Dtype::F32, relative.as_slice()),
+            ("scale", Dtype::F32, channel.as_slice()),
+            ("correction", Dtype::BF16, correction.as_slice()),
         ];
         let metadata: Vec<_> = typed
             .iter()
@@ -718,13 +718,7 @@ mod tests {
                 len: dtype.byte_len(shape).unwrap() as usize,
             })
             .collect();
-        let encoding = Encoding {
-            scheme: "comfy.asym_w4a8_int8".into(),
-            params: BTreeMap::from([
-                ("group_size".into(), group.into()),
-                ("rotation_size".into(), 256u64.into()),
-            ]),
-        };
+        let encoding = Encoding::comfy_asym_w4a8_int8(group, 256);
         check(&encoding, &Dtype::BF16, &shape, &metadata).unwrap();
         decode::planned_sources(
             &Dtype::BF16,

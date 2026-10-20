@@ -45,9 +45,12 @@ mod comfy;
 pub static SCHEMES: &[&Scheme] = &[
     &fp8::TENSORWISE,
     &fp8::ROWWISE,
+    &fp8::COLUMNWISE,
     &int8::TENSORWISE,
     &int8::ROWWISE,
+    &int8::COLUMNWISE,
     &int8::CONVROT,
+    &comfy::INT4_CONVROT,
     &mxfp8::MXFP8,
     &nvfp4::NVFP4,
     // fp8.blockwise, mxfp4
@@ -89,7 +92,6 @@ pub static SCHEMES: &[&Scheme] = &[
     // comfy.*
     &comfy::ASYM_W4A8_INT8,
     &comfy::W6A8_INT8,
-    &comfy::CONVROT_W4A4,
 ];
 
 /// A scheme: its params, its parts and its decode, as spec §6 lists them.

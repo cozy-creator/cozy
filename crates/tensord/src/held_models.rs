@@ -18,8 +18,9 @@ pub struct Listing {
     pub bytes: u64,
 }
 
-/// A Hub checkpoint this machine pulled: `lane` of `tree`, `repository`'s release `release`
-/// (empty: the owner's tree by hash). The store's ref of the repository records it.
+/// A Hub checkpoint this machine pulled: `lane` of `tree`, `repository`'s tag `release` (empty:
+/// a commit or header by hash). The store's ref of the repository records it as a tag: `release`,
+/// else the commit's hex.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pulled {
     pub repository: String,
@@ -32,17 +33,16 @@ impl Pulled {
     /// Names the pull in the store: `repository`'s ref, a cache TensorFS may expire. The tree
     /// must be here. One the ref already names writes nothing.
     pub fn record(&self, store: &Store) -> io::Result<()> {
-        let release = (!self.release.is_empty()).then_some(self.release.as_str());
-        let held = store.get_ref(&self.repository).map_err(storage::io_error)?;
-        let names = |repo: &tensorfs::format::Repo| match release {
-            Some(release) => repo.release(Some(release)).is_some_and(|r| r.tree == self.tree),
-            None => repo.roots().any(|tree| *tree == self.tree),
+        let tag = match self.release.is_empty() {
+            true => &self.tree.sha256,
+            false => &self.release,
         };
-        if held.as_ref().is_some_and(names) {
+        let held = store.get_ref(&self.repository).map_err(storage::io_error)?;
+        if held.as_ref().and_then(|repo| repo.tag(tag)).is_some_and(|t| t.commit == self.tree) {
             return Ok(());
         }
         store
-            .update_ref(&self.repository, |old| Some(tensorfs::fetch::with_tree(old, &self.repository, &self.tree, release)))
+            .update_ref(&self.repository, |old| Some(tensorfs::fetch::with_tag(old, &self.repository, tag, &self.tree)))
             .map(drop)
             .map_err(storage::io_error)
     }
@@ -53,8 +53,7 @@ impl Pulled {
             if repo.name.starts_with("local/") {
                 continue;
             }
-            let releases = repo.releases.iter().map(|r| (r.version.as_str(), &r.tree));
-            for (release, tree) in releases.chain(repo.checkpoints.iter().map(|tree| ("", tree))) {
+            for (release, tree) in tags(&repo) {
                 let Ok(parsed) = store.tree(tree) else {
                     continue;
                 };
@@ -67,6 +66,11 @@ impl Pulled {
         }
         Ok(None)
     }
+}
+
+/// Each tag of `repo` and its commit; a tag named by its commit (a pull by hash) has no name.
+fn tags(repo: &tensorfs::format::Repo) -> impl Iterator<Item = (&str, &ObjectRef)> {
+    repo.tags.iter().map(|t| (if t.name == t.commit.sha256 { "" } else { t.name.as_str() }, &t.commit))
 }
 
 /// Each model's rows: repository, release, lane, header.
@@ -105,8 +109,7 @@ fn seen(store: &Store) -> std::io::Result<Seen> {
     let mut seen = Seen::new();
     for repo in store.refs().map_err(storage::io_error)? {
         let local = repo.name.starts_with("local/");
-        let releases = repo.releases.iter().map(|r| (r.version.as_str(), &r.tree));
-        for (release, tree) in releases.chain(repo.checkpoints.iter().map(|tree| ("", tree))) {
+        for (release, tree) in tags(&repo) {
             let Ok(tree) = store.tree(tree) else {
                 continue;
             };
@@ -164,7 +167,7 @@ pub fn fixture(root: &Path) -> std::io::Result<()> {
     let store = storage::open(root)?;
     let model = |key: &str, tensor: &[u8]| -> std::io::Result<ObjectRef> {
         let mut writer = store.writer(None, Some(key)).map_err(storage::io_error)?;
-        let mut unet = writer.component("unet", "", Default::default(), None).map_err(storage::io_error)?;
+        let mut unet = writer.component("unet", Default::default(), Default::default(), None).map_err(storage::io_error)?;
         unet.asset("tokenizer.json", &[1; 1000]).map_err(storage::io_error)?;
         let shape = [tensor.len() as u64];
         unet.put("w", &tensorfs::format::Dtype::U8, &shape, Data::Plain(Source::Read(&mut &tensor[..]))).map_err(storage::io_error)?;

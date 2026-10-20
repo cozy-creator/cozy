@@ -39,7 +39,7 @@ fn import(case: &str, store: &Path) -> tensorfs::err::Result<Checkpoint> {
     let req = Request {
         sources: &[fixtures().join(case).display().to_string()],
         converter: None,
-        variant: None,
+        source_variant: None,
         access: &access,
         tmp: &tmp,
         progress: &|_, _, _| {},
@@ -430,7 +430,7 @@ fn unproven_or_undeclared_layouts_are_refused() {
         let req = Request {
             sources: &[source],
             converter: None,
-            variant: None,
+            source_variant: None,
             access: &access,
             tmp: &tmp,
             progress: &|_, _, _| {},

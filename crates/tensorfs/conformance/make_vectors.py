@@ -34,10 +34,10 @@ def digest(label: str) -> dict:
 
 
 ENCODINGS = [
-    ["fp8.rowwise", {"axis": 0}],
+    ["fp8.rowwise", {}],
     ["fp8.tensorwise", {}],
     ["int8.convrot", {"rotation": "kron_regular_h4", "rotation_size": 256}],
-    ["int8.rowwise", {"axis": 0}],
+    ["int8.rowwise", {}],
     ["mxfp8", {"block_size": 32, "scale_layout": "row_major"}],
     ["nvfp4", {"block_size": 16, "global_scale": "multiply", "nibble_order": "low_first",
                "scale_layout": "row_major"}],
@@ -49,11 +49,11 @@ def part(role, dtype, shape, chunk, offset, length):
     return [role, dtype, shape, [chunk, offset, length]]
 
 
-PIPELINE = ["diffusers.FluxPipeline", {
+PIPELINE = [["diffusers", "0.30.0", "FluxPipeline"], {
     "_class_name": "FluxPipeline", "_diffusers_version": "0.30.0", "scheduler": [None, None],
     "tokenizer": ["transformers", "CLIPTokenizer"], "transformer": ["diffusers", "FluxTransformer2DModel"],
     "vae": ["diffusers", "AutoencoderKL"]}]
-TOKENIZER = ["tokenizer", "transformers.CLIPTokenizer",
+TOKENIZER = ["tokenizer", ["transformers", "4.44.0", "CLIPTokenizer"],
              {"clean_up_tokenization_spaces": False, "do_lower_case": True, "model_max_length": 77,
               "pad_token": "<|endoftext|>"},
              [],
@@ -67,7 +67,7 @@ BASIC = [
     ENCODINGS,
     PIPELINE,
     [
-        ["transformer", "diffusers.FluxTransformer2DModel",
+        ["transformer", ["diffusers", "0.30.0", "FluxTransformer2DModel"],
          {"_class_name": "FluxTransformer2DModel", "axes_dims_rope": [16, 56, 56], "eps": 1e-06,
           "guidance_embeds": True, "out_channels": None, "patch_size": 1, "ratio": 100000.0, "theta": 10000.0}, [
             ["blocks.0.attn.to_q.weight", "BF16", [64, 64], 1, [
@@ -89,7 +89,7 @@ BASIC = [
             ["blocks.0.proj.weight", "BF16", [8, 64], 7, [
                 part("weight", "I8", [8, 64], 1, 8192, 512), part("scale", "F32", [], 1, 12288, 4)]],
         ], {}],
-        ["vae", "diffusers.AutoencoderKL",
+        ["vae", ["diffusers", "0.30.0", "AutoencoderKL"],
          {"_class_name": "AutoencoderKL", "force_upcast": True, "latents_mean": None, "scaling_factor": 0.3611,
           "shift_factor": 0.1159},
          [["decoder.conv_in.weight", "F16", [4, 4, 3, 3], 0, [2, 0, 288]]], {}],
@@ -99,13 +99,16 @@ BASIC = [
 ]
 
 
+UNKNOWN = ["", "", ""]
+
+
 def plain(key, dtype, shape, chunk, offset, length):
     return [key, dtype, shape, 0, [chunk, offset, length]]
 
 
 def one(tensors, chunks, encodings=(), metadata=None):
     """No pipeline; one component of unknown class with no config."""
-    return [TAG, chunks, list(encodings), [], [["unet", "", {}, tensors, {}]], metadata or {}]
+    return [TAG, chunks, list(encodings), [], [["unet", UNKNOWN, {}, tensors, {}]], metadata or {}]
 
 
 A = plain("a.weight", "F32", [2], 0, 0, 8)
@@ -148,8 +151,9 @@ CONFIG = {
 GREEN = {
     "basic": BASIC,
     "empty": [TAG, [], [], [], [], {}],
-    "configs": [TAG, [], [], ["", CONFIG],
-                [["scheduler", "diffusers.EulerDiscreteScheduler", CONFIG, [], {}, "scheduler_config.json"]], {}],
+    "configs": [TAG, [], [], [UNKNOWN, CONFIG],
+                [["scheduler", ["diffusers", "0.30.0", "EulerDiscreteScheduler"], CONFIG, [], {},
+                  "scheduler_config.json"]], {}],
     "order-a": one([A, B], [[digest("order"), 4104]]),
     "order-b": one([B, A], [[digest("order"), 4104]]),
     "span": one([plain("x", "U8", [10000], 0, 4096, 10000)],
@@ -194,6 +198,7 @@ Q = (*TENSORS, 0)  # its first tensor
 NORM = (*TENSORS, 6)
 VAE = (4, 1)
 ASSETS = (4, 2, 4)  # the tokenizer's
+GREEN["class-unversioned"] = edit((4, 2, 1, 1), "")  # a known library whose version nothing records
 
 
 def swap_encodings():
@@ -257,7 +262,7 @@ def reds() -> dict[str, bytes]:
         "short-root": encode(BASIC[:4]),
         "float-later-field": encode([*BASIC, 1.5]),
         "float-asset-length": encode(edit((*ASSETS, "vocab.json", 1), 1059962.0)),
-        "null-params": encode(edit((2, 0, 1, "axis"), None)),
+        "null-params": encode(edit((2, 2, 1, "rotation"), None)),
         "null-class": encode(edit((*VAE, 1), None)),
         "nan": swap(good, b"\xf9\x70\xe2", b"\xf9\x7e\x00"),
         "infinity": swap(good, b"\xf9\x70\xe2", b"\xf9\x7c\x00"),
@@ -283,7 +288,7 @@ def reds() -> dict[str, bytes]:
         "past-chunks": encode(edit((*VAE, 3, 0, 4), [2, 0, 576])),
         "location-short": encode(edit((*NORM, 4), [1, 4096])),
         "encoding-index": encode(edit((*Q, 3), 8)),
-        "encoding-unused": encode(edit((2, 7), ["fp8.rowwise", {"axis": 1}])),
+        "encoding-unused": encode(edit((2, 7), ["fp8.columnwise", {}])),
         "encoding-repeated": encode(edit((2, 6), ENCODINGS[0])),
         "encoding-first-use": encode(edit((*Q, 3), 2)),
         "scheme-empty": encode(edit((2, 0, 0), "")),
@@ -295,6 +300,13 @@ def reds() -> dict[str, bytes]:
         "pipeline-config-array": encode(edit((3, 1), [])),
         "component-short": encode(edit((*VAE, 4), DELETE)),
         "component-class-int": encode(edit((*VAE, 1), 7)),
+        "class-text": encode(edit((*VAE, 1), "diffusers.AutoencoderKL")),
+        "class-short": encode(edit((*VAE, 1), ["diffusers", "AutoencoderKL"])),
+        "class-long": encode(edit((*VAE, 1), ["diffusers", "0.30.0", "AutoencoderKL", ""])),
+        "class-name-int": encode(edit((*VAE, 1, 2), 7)),
+        "class-no-library": encode(edit((*VAE, 1, 0), "")),
+        "class-version-only": encode(edit((*VAE, 1), ["", "0.30.0", ""])),
+        "pipeline-class-no-library": encode(edit((3, 0, 0), "")),
         "config-file-default": encode(edit((4, 2, 5), "config.json")),
         "config-file-int": encode(edit((4, 2, 5), 7)),
         "config-file-dotdot": encode(edit((4, 2, 5), "../tokenizer_config.json")),
@@ -426,7 +438,29 @@ def resolution() -> dict:
         {"why": "a tag name is exact, not a version match", "revision": "1.9.0"},
         {"why": "no such tag", "revision": "nope"},
     ]
-    return {"repo": doc, "trees": [json.loads(t) for t in trees], "cases": cases}
+    # The unversioned default alone, over tag lists: finals before pre-releases, then PEP 440 order.
+    def default(why, tags, expect=None):
+        out = {"why": why, "repo": repo(*(tag(name, **flags) for name, flags in tags))}
+        return {**out, "default": expect} if expect else out
+    public, yanked = {"public": True}, {"public": True, "yanked": True}
+    defaults = [
+        default("a final beats a newer pre-release", [("1.0", public), ("2.0rc1", public)], "1.0"),
+        default("a final beats a newer dev release", [("1.0", public), ("1.1.dev1", public)], "1.0"),
+        default("a post-release is final", [("1.0", public), ("1.0.post1", public)], "1.0.post1"),
+        default("a post-release's dev release is a pre-release", [("1.0", public), ("1.0.post1.dev1", public)], "1.0"),
+        default("only pre-releases: the highest", [("1.0a1", public), ("1.0rc1", public), ("1.0b2", public),
+                                                    ("0.9.dev3", public)], "1.0rc1"),
+        default("equal versions: the later created", [("1.0", public), ("1.0.0", public)], "1.0.0"),
+        default("equal versions, the other way round", [("1.0.0", public), ("1.0", public)], "1.0"),
+        default("a yanked final falls back to an older final, not a newer pre-release",
+                [("1.0", public), ("2.0", yanked), ("2.1rc1", public)], "1.0"),
+        default("a local version is final and orders after its public one", [("1.0+local.1", public), ("1.0", public)],
+                "1.0+local.1"),
+        default("an epoch outranks a larger release", [("2!0.1", public), ("10.0", public)], "2!0.1"),
+        default("private tags are not candidates", [("1.0", public), ("2.0", {})], "1.0"),
+        default("no public, non-yanked tag: none", [("main", {}), ("1.0", yanked)]),
+    ]
+    return {"repo": doc, "trees": [json.loads(t) for t in trees], "cases": cases, "defaults": defaults}
 
 
 def main():
@@ -438,11 +472,12 @@ def main():
             (verdict / f"repo-{name}.json").write_bytes(canonical(doc))
     (HERE / "../spec/examples/repo-basic.json").write_bytes(canonical(REPO_BASIC))
     doc = resolution()
-    lines = ",\n".join(canonical(c).decode() for c in doc["cases"])
+    rows = lambda key: ",\n".join(canonical(c).decode() for c in doc[key])  # noqa: E731
     (HERE / "vectors" / "resolve.json").write_text(
-        '{"repo":' + canonical(doc["repo"]).decode() + ',\n"trees":[\n'
-        + ",\n".join(canonical(t).decode() for t in doc["trees"]) + '],\n"cases":[\n' + lines + "\n]}\n")
-    print(f"{len(REPOS_GREEN)} green and {len(REPOS_RED)} red repo vectors, {len(doc['cases'])} resolutions")
+        '{"repo":' + canonical(doc["repo"]).decode() + ',\n"trees":[\n' + rows("trees") + '],\n"cases":[\n'
+        + rows("cases") + '],\n"defaults":[\n' + rows("defaults") + "\n]}\n")
+    print(f"{len(REPOS_GREEN)} green and {len(REPOS_RED)} red repo vectors, {len(doc['cases'])} resolutions, "
+          f"{len(doc['defaults'])} defaults")
     for path in [*green.glob("header-*"), *red.glob("header-*")]:
         if not path.name.startswith("header-pre-cut"):
             path.unlink()

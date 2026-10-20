@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::failure::{fail, Failure, Kind, Result};
-use crate::format::{Config, Dtype, Encoding, ObjectRef, Tree, Value};
+use crate::format::{ClassRef, Config, Dtype, Encoding, ObjectRef, Tree, Value};
 use crate::store::Store;
 use crate::writer::{self as native, Data, Source};
 
@@ -250,7 +250,7 @@ impl Writer {
         }
     }
 
-    pub fn pipeline(&mut self, class: &str, config: Config) -> Result<()> {
+    pub fn pipeline(&mut self, class: ClassRef, config: Config) -> Result<()> {
         self.with(|raw| {
             raw.pipeline(class, config);
             Ok(())
@@ -261,7 +261,7 @@ impl Writer {
     pub fn component(
         &mut self,
         name: &str,
-        class: &str,
+        class: ClassRef,
         config: Config,
         config_file: Option<&str>,
     ) -> Result<ComponentWriter<'_>> {

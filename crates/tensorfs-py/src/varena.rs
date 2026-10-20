@@ -721,6 +721,11 @@ impl PyLedger {
         self.0.peak(key)
     }
 
+    /// Every request peak recorded here, `(key, bytes)`.
+    fn peaks(&self) -> Vec<(String, u64)> {
+        self.0.peaks()
+    }
+
     fn set_peak(&self, py: Python<'_>, key: &str, nbytes: u64) -> PyResult<()> {
         self.0.set_peak(key, nbytes).or_ledger(py)
     }

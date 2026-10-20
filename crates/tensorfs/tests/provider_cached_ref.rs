@@ -11,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tensorfs::format::ClassRef;
 use tensorfs::format::{Dtype, ObjectRef, Repo};
 use tensorfs::{
     Client, Config, Download, Endpoint, Failure, Format, Kind, Open, Request, TokenProvider,
@@ -194,14 +195,14 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
     .unwrap();
     let mut writer = producer.writer(WriterOptions::default()).unwrap();
     writer
-        .component("model", "test.Model", Default::default(), None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut &WEIGHT[..])
         .unwrap();
     let checkpoint = writer.commit().await.unwrap();
     let folder = scratch.0.join("portable");
     checkpoint
-        .materialize(&folder, Format::Cozytensors, None)
+        .materialize(&folder, Format::Cozytensors, false)
         .await
         .unwrap();
     let tree = producer

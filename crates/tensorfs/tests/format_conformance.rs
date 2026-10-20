@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde_json::Value as Json;
 use tensorfs::format::layout::{self, Item};
 use tensorfs::format::{
-    repo_key, Body, Component, Config, Dtype, Encoding, Error, Header, Location, ObjectRef, Part,
-    Pipeline, Repo, Resolution, Tag, Tensor, Tree, HEADER_FORMAT,
+    newest, newest_by, repo_key, Body, ClassRef, Component, Config, Dtype, Encoding, Error, Header,
+    Location, ObjectRef, Part, Pipeline, Repo, Resolution, Tag, Tensor, Tree, HEADER_FORMAT,
 };
 
 #[derive(Deserialize)]
@@ -326,6 +326,14 @@ struct Resolutions {
     repo: Json,
     trees: Vec<Json>,
     cases: Vec<ResolveCase>,
+    defaults: Vec<DefaultCase>,
+}
+
+#[derive(Deserialize)]
+struct DefaultCase {
+    why: String,
+    repo: Json,
+    default: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -348,6 +356,14 @@ fn revisions_resolve_to_commits() {
             (ObjectRef::of(&tree.to_json().unwrap()), tree)
         })
         .collect();
+    for case in doc.defaults {
+        let repo = Repo::from_json(&serde_json::to_vec(&case.repo).unwrap()).unwrap();
+        assert_eq!(newest(&repo.tags).map(|t| &t.name), case.default.as_ref(), "{}", case.why);
+        assert_eq!(repo.default_tag(), newest(&repo.tags));
+        // The string core over plain rows, filtered by the caller.
+        let rows = repo.tags.iter().filter(|t| t.public && !t.yanked).map(|t| t.name.clone());
+        assert_eq!(newest_by(rows, |v| v.as_str()).as_ref(), case.default.as_ref(), "{}", case.why);
+    }
     for case in doc.cases {
         let found = repo.resolve(case.revision.as_deref()).map(|r| r.find(|c| Ok::<_, ()>(trees[c].clone())).unwrap());
         let got = found.flatten().map(|(tag, variant)| (tag.commit.clone(), variant));
@@ -397,6 +413,10 @@ fn from_projection(p: &Json) -> (Header, bool) {
     let list = |v: &Json| v.as_array().unwrap().clone();
     let uint = |v: &Json| v.as_u64().unwrap();
     let text = |v: &Json| v.as_str().unwrap().to_owned();
+    let class = |v: &Json| match list(v).as_slice() {
+        [library, version, name] => ClassRef { library: text(library), version: text(version), name: text(name) },
+        _ => panic!("a class is [library, version, name]"),
+    };
     let config = |v: &Json| serde_json::from_value::<Config>(v.clone()).unwrap();
     let root = list(p);
     let mut later = root.len() > 6 || root[0] != HEADER_FORMAT;
@@ -420,7 +440,7 @@ fn from_projection(p: &Json) -> (Header, bool) {
     let pipeline = list(&root[3]);
     later |= pipeline.len() > 2;
     let pipeline = (!pipeline.is_empty()).then(|| Pipeline {
-        class: text(&pipeline[0]),
+        class: class(&pipeline[0]),
         config: config(&pipeline[1]),
     });
     let mut encodings = Vec::new();
@@ -483,7 +503,7 @@ fn from_projection(p: &Json) -> (Header, bool) {
         }
         Component {
             name: text(&c[0]),
-            class: text(&c[1]),
+            class: class(&c[1]),
             config: config(&c[2]),
             tensors,
             assets,

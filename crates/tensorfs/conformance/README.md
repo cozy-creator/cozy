@@ -12,13 +12,13 @@ For anyone implementing [cozytensors/1](../spec/cozytensors.md).
 | `vectors/green/header-*.cbor` | Headers a reader must accept, each with its projection `header-*.json`: the CBOR tree as JSON, byte strings as `{"hex": ...}`. `header-basic` holds a pipeline and components with classes, configs (floats, `null`), assets and a `config_file`; `header-configs` every float width. |
 | `vectors/red/header-*.cbor` | Headers a reader must refuse: twins of `header-basic` in bytes other than its one encoding (non-preferred heads, indefinite lengths, unordered keys, encodings not in first-use order, floats wider than needed), forbidden items (floats and `null` outside configs), bad tags and structure. `header-pre-cut*` (real headers of the two layouts before the pipeline, and the provisional JSON) must be refused as pre-cut. |
 | `vectors/{green,red}/{tree,repo}-*.json` | Trees and repos to accept or refuse (`make_vectors.py` writes the repos). |
-| `vectors/resolve.json` | A repo, its commits' trees, and revisions each resolved to a commit (and, for a header digest, its variant) or to nothing (spec §7). |
+| `vectors/resolve.json` | A repo, its commits' trees, and revisions each resolved to a commit (and, for a header digest, its variant) or to nothing; and tag lists with their unversioned default: finals before pre-releases, then PEP 440 order, the later-created of equal versions (spec §7). |
 | `reader.py` | An independent reader and header encoder (Python, numpy, cbor2, packaging for PEP 440); its decoders are `schemes/`, one module per family, registered in `schemes/__init__.py`. |
 | `make_vectors.py` | Writes the header vectors from the projections and defects it lists, the repo vectors and `resolve.json`, and checks and normalizes every `cases/<family>.json`. |
 | `mine/` | Producer miners: `mine/cores.py` writes `cores.json`; a family's miner writes its cases (`mine/gguf.py`: ggml's own C, fetched at llama.cpp ff5a233 and built here). |
 
 A conforming implementation:
-- resolves every `resolve.json` revision to its commit;
+- resolves every `resolve.json` revision to its commit, and each tag list to its default;
 - reads the store, verifies every object, and decodes every case to its expected bytes or refuses it with its code;
 - decodes every `cores.json` case to its expected values;
 - reads every green header as its projection, and as a writer encodes each projection to the green bytes (the ones

@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from ._ext import (
     Array,
     Checkpoint,
+    ClassRef,
     Component,
     ConflictError,
     DecodeError,
@@ -36,13 +37,15 @@ from ._ext import (
     __version__,
 )
 from . import raw
-from .api import ComponentWriter, Endpoint, Writer, configure, convert_to_cozytensors, download_file, open, materialize, upload_folder
+from .api import CheckpointFile, ComponentWriter, Endpoint, Writer, configure, convert_to_cozytensors, download_file, open, materialize, upload_folder
 
 Mapping.register(Tensors)
 
 __all__ = [
     "Array",
     "Checkpoint",
+    "CheckpointFile",
+    "ClassRef",
     "Component",
     "ConflictError",
     "ComponentWriter",

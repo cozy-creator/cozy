@@ -19,6 +19,9 @@ class TableInput(msgspec.Struct):
     size: int = 64
     hold: str = ""
     count: bool = False
+    #: A file under TENSORFS_HOME: written with `.reached` once committed, then awaited before
+    #: the adopt (and its upload), so a test acts in the middle of the call.
+    gate: str = ""
 
 
 async def table(ctx: Context, payload: TableInput, tel: Telemetry) -> ModelArtifact:
@@ -34,6 +37,12 @@ async def table(ctx: Context, payload: TableInput, tel: Telemetry) -> ModelArtif
         output.put("model", "table", "F32", [payload.size], bytes(range(256)) * (payload.size // 64))
         await hold("checkpoint")  # TensorFS retains the keyed Writer's resumable state
     await hold("commit")
+    if payload.gate:
+        gate = Path(os.environ["TENSORFS_HOME"]) / payload.gate
+        gate.with_suffix(".reached").touch()
+        while not gate.exists():
+            ctx.raise_if_cancelled()
+            await asyncio.sleep(0.01)
     result = ctx.adopt_model(output)  # Runtime commits, then reports a checkpoint reference
     await hold("adopt")
     return result

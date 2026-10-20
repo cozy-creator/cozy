@@ -427,7 +427,7 @@ impl<'t> Migrator<'t> {
             }
         }
         let tensored: Vec<String> = tensors.iter().map(|(name, _)| name.clone()).collect();
-        let l = layout(bytes.clone(), &tensored)?;
+        let l = layout(bytes.clone(), &tensored, &Default::default())?;
         let mut keep = |b: Vec<u8>| add(objects, b);
         let components = (l.components.into_iter())
             .map(|f| Component {

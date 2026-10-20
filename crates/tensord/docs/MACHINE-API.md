@@ -47,9 +47,11 @@ it and Runtime gets it with each request. Zero: the lane rule (`precision.rs`, t
   from the CLI's signed-in session. Calcifer also gives each machine it sent one every bearer
   the session mints after, at the session's own refresh point (`PUT /v1/bearer`). The machine
   keeps the newest per signer and Hub, in memory only, and reads models through TensorFS's
-  distribution `Endpoint` under it: runs, warm-set members, prefetches and calls alike. It
-  presents it only to that Hub's origin; its scope is the owner's account. A refused bearer ends
-  the run `hub_credential_refused`, naming its expiry. If the machine restarts before
+  distribution `Endpoint` under it: runs, warm-set members, prefetches and calls alike. Each
+  executor given it on a Load or Invoke hears of every newer one (`bearer`, see
+  [DEVICE-EXECUTOR.md](DEVICE-EXECUTOR.md)), so a call that outlives its bearer still uploads.
+  It presents it only to that Hub's origin; its scope is the owner's account. A refused bearer
+  ends the run `hub_credential_refused`, naming its expiry. If the machine restarts before
   preparation completes, the run ends FAILED with a typed reason; started work is never re-run.
 - **Names** (th-245): the machine resolves them at the run's Hub. A release (`org/name`, its
   release or none for the newest) installs from the card and locked requirements it reads there

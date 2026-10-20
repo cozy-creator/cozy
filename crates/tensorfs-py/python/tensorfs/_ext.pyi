@@ -7,6 +7,8 @@ from types import ModuleType
 from typing import Any, Protocol, TypeVar, overload
 from typing_extensions import Buffer
 
+from .api import CheckpointFile
+
 __version__: str
 STORE_FORMAT: int
 
@@ -156,12 +158,26 @@ class Tensors(Mapping[str, TensorMetadata]):
         one stored part (`role`), or with `decode=True` an encoded tensor's logical bytes. An
         encoded tensor with neither raises `InvalidError` naming its roles."""
 
+class ClassRef:
+    """A class as `(library, version, name)`, for any implementation and never an import path:
+    `ClassRef("diffusers", "0.35.1", "SD3Transformer2DModel")`. `ClassRef("", "", "")` is an
+    unknown model; `version` is `""` when nothing records it. A component's tensors are that
+    class's `state_dict` at that version. Iterates as the 3-tuple; equal and hashable by value."""
+
+    def __init__(self, library: str, version: str, name: str) -> None: ...
+    @property
+    def library(self) -> str: ...
+    @property
+    def version(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    def __iter__(self) -> Iterator[str]: ...
+
 class Pipeline:
     """What `model_index.json` held."""
 
     @property
-    def cls(self) -> str:
-        """`diffusers.<Class>`, `""` when unknown."""
+    def cls(self) -> ClassRef: ...
     @property
     def config(self) -> dict[str, Any]: ...
 
@@ -171,8 +187,7 @@ class Component:
     @property
     def name(self) -> str: ...
     @property
-    def cls(self) -> str:
-        """`<library>.<Class>`, `""` when unknown."""
+    def cls(self) -> ClassRef: ...
     @property
     def config(self) -> dict[str, Any]: ...
     @property
@@ -210,7 +225,8 @@ class Checkpoint:
     @property
     def repo_id(self) -> str | None: ...
     @property
-    def revision(self) -> str | None: ...
+    def revision(self) -> str | None:
+        """The tag this checkpoint was resolved through, when known."""
     @property
     def pipeline(self) -> Pipeline | None: ...
     @property
@@ -221,10 +237,21 @@ class Checkpoint:
         """The header's chunk objects in order: `(sha256, length)`."""
     @property
     def metadata(self) -> dict[str, Any]: ...
+    def open_file(self) -> CheckpointFile:
+        """The checkpoint as one read-only, seekable file: its header, then its chunks and assets
+        in header order at 4 KiB-aligned offsets, assembled from the store on demand; nothing is
+        written."""
     def missing(self, components: Sequence[str] | None = None) -> list[tuple[str, int]]:
         """The chunks and assets of `components` (all when None) not here."""
     def download(self, components: Sequence[str] | None = None, *, priority: int = 0,
               progress: Callable[[str, int, int], object] | None = None) -> None: ...
+
+class _CheckpointFile:
+    """The native half of `CheckpointFile`."""
+    def readinto(self, buffer: Buffer) -> int: ...
+    def seek(self, offset: int, whence: int = 0) -> int: ...
+    def tell(self) -> int: ...
+    def close(self) -> None: ...
 
 class ComponentWriter:
     @property
@@ -254,9 +281,9 @@ class Writer:
                  base: Checkpoint | None = None, resume: str | None = None,
                  cache_dir: StrPath | None = None, repo_id: str | None = None, revision: str | None = None,
                  endpoint: str | None = None, token: _Token | None = None, ca_der: bytes | None = None) -> None: ...
-    def pipeline(self, cls: str, config: Mapping[str, Any]) -> None: ...
+    def pipeline(self, cls: ClassRef | tuple[str, str, str], config: Mapping[str, Any]) -> None: ...
     def component(
-        self, name: str, cls: str = "", config: Mapping[str, Any] | None = None,
+        self, name: str, cls: ClassRef | tuple[str, str, str] | None = None, config: Mapping[str, Any] | None = None,
         config_file: str | None = None,
     ) -> ComponentWriter:
         """Declares a component (again: class and config change, tensors stay)."""
@@ -280,7 +307,7 @@ class _Client:
     def upload_folder(self, folder_path: StrPath, repo_id: str,
                       revision: str | None = None) -> str: ...
     def convert_to_cozytensors(self, source: str | Sequence[str], *, converter: str | None = None,
-                variant: str | None = None,
+                source_variant: str | None = None,
                 progress: Callable[[str, int, int], object] | None = None) -> Checkpoint: ...
 
 
@@ -299,4 +326,4 @@ class Endpoint:
 _Token = str | TokenProvider | Callable[[str, str, Mapping[str, str], str | None], Mapping[str, str]]
 
 def _materialize(checkpoint: Checkpoint, directory: StrPath, *, format: str = "cozytensors",
-                 dequantize: str | None = None) -> str: ...
+                 decode: bool = False) -> str: ...

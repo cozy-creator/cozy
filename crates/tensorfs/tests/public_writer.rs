@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tensorfs::format::ClassRef;
 use tensorfs::format::{Body, Component, Dtype, Header, Location, ObjectRef, Tensor};
 use tensorfs::{
     Client, Config, Download, Format, Kind, Open, ReadInto, Ref, Selection, WriterOptions,
@@ -51,7 +52,7 @@ fn fixture(root: &Path) -> PathBuf {
         None,
         vec![Component {
             name: "model".into(),
-            class: "transformers.TestModel".into(),
+            class: ClassRef::new("transformers", "4.57.0", "TestModel"),
             config: serde_json::from_str(r#"{"width":4,"optional":null}"#).unwrap(),
             tensors: vec![Tensor {
                 key: "w".into(),
@@ -132,7 +133,7 @@ async fn public_export_keeps_plain_folder_repository_bytes_without_admitting_pay
     checkpoint.download(&Download::default()).await.unwrap();
     let destination = scratch.0.join("export");
     let path = checkpoint
-        .materialize(&destination, Format::Safetensors, None)
+        .materialize(&destination, Format::Safetensors, false)
         .await
         .unwrap();
     assert_eq!(path, destination);
@@ -194,7 +195,7 @@ async fn public_export_requires_selected_repo_bytes_and_owns_them_after_client_d
     drop(reader);
     let destination = scratch.0.join("export");
     checkpoint
-        .materialize(&destination, Format::Safetensors, None)
+        .materialize(&destination, Format::Safetensors, false)
         .await
         .unwrap();
     check_export(&destination);
@@ -237,10 +238,10 @@ async fn same_header_repository_trees_keep_distinct_folders_through_public_uploa
     b.download(&Download::default()).await.unwrap();
     let a_folder = scratch.0.join("portable-first");
     let b_folder = scratch.0.join("portable-second");
-    a.materialize(&a_folder, Format::Cozytensors, None)
+    a.materialize(&a_folder, Format::Cozytensors, false)
         .await
         .unwrap();
-    b.materialize(&b_folder, Format::Cozytensors, None)
+    b.materialize(&b_folder, Format::Cozytensors, false)
         .await
         .unwrap();
     assert_eq!(fs::read(a_folder.join("README.bin")).unwrap(), README);
@@ -270,7 +271,7 @@ async fn same_header_repository_trees_keep_distinct_folders_through_public_uploa
     drop(b);
     let destination = scratch.0.join("export-roundtrip");
     roundtrip
-        .materialize(&destination, Format::Safetensors, None)
+        .materialize(&destination, Format::Safetensors, false)
         .await
         .unwrap();
     check_export(&destination);
@@ -288,7 +289,7 @@ async fn public_writer_resumes_reopens_components_and_keeps_encoded_bytes_and_or
         })
         .unwrap();
     first
-        .component("model", "test.Model", config, None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), config, None)
         .unwrap()
         .put("first", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -304,7 +305,7 @@ async fn public_writer_resumes_reopens_components_and_keeps_encoded_bytes_and_or
     writer
         .component(
             "model",
-            "test.Model",
+            ClassRef::new("test", "1.0", "Model"),
             serde_json::from_str(r#"{"width":8}"#).unwrap(),
             None,
         )
@@ -422,7 +423,7 @@ async fn read_into_decodes_an_encoded_tensor_only_when_asked() {
         tensorfs::raw::PartData { role: "scale".into(), dtype: Dtype::F32, shape: vec![1], data: &mut scale },
     ];
     writer
-        .component("model", "test.Model", Default::default(), None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
         .unwrap()
         .put_encoded("q", Dtype::F32, &[4], encoding, parts)
         .unwrap();
@@ -457,7 +458,7 @@ async fn save(client: &Client, dest: &Path, weight: &[u8]) -> (ObjectRef, Vec<Ob
         })
         .unwrap();
     writer
-        .component("model", "test.Model", Default::default(), None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[weight.len() as u64], &mut &weight[..])
         .unwrap();
@@ -546,7 +547,7 @@ async fn failed_file_publication_still_exposes_the_committed_local_checkpoint() 
         })
         .unwrap();
     writer
-        .component("model", "test.Model", Default::default(), None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -587,11 +588,11 @@ async fn portable_export_preflights_full_closure_and_atomically_replaces_shared_
     )
     .unwrap();
     checkpoint
-        .materialize(&portable, Format::Cozytensors, None)
+        .materialize(&portable, Format::Cozytensors, false)
         .await
         .unwrap();
     checkpoint
-        .materialize(&folder, Format::Cozytensors, None)
+        .materialize(&folder, Format::Cozytensors, false)
         .await
         .unwrap();
     assert_eq!(fs::read(folder.join("README.bin")).unwrap(), README);
@@ -630,7 +631,7 @@ async fn portable_export_preflights_full_closure_and_atomically_replaces_shared_
     let incomplete = scratch.0.join("refused");
     assert_eq!(
         reopened
-            .materialize(&incomplete, Format::Cozytensors, None)
+            .materialize(&incomplete, Format::Cozytensors, false)
             .await
             .unwrap_err()
             .kind,
@@ -639,7 +640,7 @@ async fn portable_export_preflights_full_closure_and_atomically_replaces_shared_
     assert!(!incomplete.join("model.cozytensors").exists());
     assert_eq!(
         reopened
-            .materialize(&incomplete, Format::Cozytensors, Some(Dtype::F32))
+            .materialize(&incomplete, Format::Cozytensors, true)
             .await
             .unwrap_err()
             .kind,
@@ -710,7 +711,7 @@ async fn literal_header_fetches_selected_missing_payload_online_but_not_offline_
     online.download(&Download::default()).await.unwrap();
     let output = scratch.0.join("literal-portable");
     online
-        .materialize(&output, Format::Cozytensors, None)
+        .materialize(&output, Format::Cozytensors, false)
         .await
         .unwrap();
     assert!(!output.join("README.bin").exists());
@@ -718,6 +719,34 @@ async fn literal_header_fetches_selected_missing_payload_online_but_not_offline_
         online.component("model").unwrap().read_decoded("w").unwrap(),
         WEIGHT
     );
+}
+
+/// What publishing names resolves to a commit: a tag, a header, or a commit no tag names.
+#[tokio::test(flavor = "current_thread")]
+async fn endpoint_commit_resolves_a_tag_a_header_and_an_untagged_commit() {
+    let scratch = Scratch::new();
+    let endpoint = scratch.0.join("endpoint");
+    let client = client(&scratch.0.join("cache"), &endpoint);
+    let mut commits = Vec::new();
+    for weight in [b"aaaa", b"bbbb"] {
+        let options = WriterOptions { repo_id: Some("acme/commits"), revision: Some("draft"), ..WriterOptions::default() };
+        let mut writer = client.writer(options).unwrap();
+        (writer.component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None).unwrap())
+            .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(weight))
+            .unwrap();
+        let checkpoint = writer.commit().await.unwrap();
+        commits.push((checkpoint.tree().unwrap().clone(), checkpoint.id().clone()));
+    }
+    let remote = tensorfs::Endpoint::new(endpoint.to_str().unwrap(), None).unwrap();
+    let ((old, old_header), (new, header)) = (&commits[0], &commits[1]);
+    let draft = Some("draft".to_owned());
+    assert_eq!(remote.commit("acme/commits", "draft").await.unwrap(), (new.clone(), draft.clone()));
+    assert_eq!(remote.commit("acme/commits", &new.id()).await.unwrap(), (new.clone(), draft.clone()));
+    assert_eq!(remote.commit("acme/commits", &header.id()).await.unwrap(), (new.clone(), draft), "a header");
+    assert_eq!(remote.commit("acme/commits", &old.id()).await.unwrap(), (old.clone(), None), "the tag moved on");
+    for absent in [old_header.id(), "nope".to_owned(), ObjectRef::of(b"absent").id()] {
+        assert_eq!(remote.commit("acme/commits", &absent).await.unwrap_err().kind, Kind::NotFound, "{absent}");
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -729,11 +758,12 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
     let mut writer = client
         .writer(WriterOptions {
             repo_id: Some("acme/streamed"),
+            revision: Some("run-42"),
             ..WriterOptions::default()
         })
         .unwrap();
     writer
-        .component("model", "test.Model", Default::default(), None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
         .unwrap()
         .asset("tokenizer.json", ASSET)
         .unwrap();
@@ -759,7 +789,17 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
         .unwrap();
     let checkpoint = writer.commit().await.unwrap();
     let tree = checkpoint.tree().unwrap().clone();
+    let doc = fs::read(endpoint.join(tensorfs::format::repo_key("acme/streamed"))).unwrap();
+    let tags: Vec<(String, ObjectRef, bool)> = (tensorfs::format::Repo::from_json(&doc).unwrap().tags.into_iter())
+        .map(|t| (t.name, t.commit, t.public))
+        .collect();
+    assert_eq!(tags, [("run-42".to_owned(), tree.clone(), false)], "the commit is a private tag");
     let reader = self::client(&scratch.0.join("reader"), &endpoint);
+    let pinned = reader
+        .open(&format!("acme/streamed@{}", checkpoint.id().id()), &Open::default())
+        .await
+        .unwrap();
+    assert_eq!((pinned.tree(), pinned.id()), (Some(&tree), checkpoint.id()), "a header digest resolves to its commit");
     let remote = reader
         .open(&format!("acme/streamed@{}", tree.id()), &Open::default())
         .await
@@ -779,7 +819,7 @@ async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_fa
         })
         .unwrap();
     failed
-        .component("model", "test.Model", Default::default(), None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();
@@ -856,7 +896,7 @@ async fn writer_provider_error_keeps_the_exact_family_and_detail_including_empty
                 })
                 .unwrap();
             writer
-                .component("model", "test.Model", Default::default(), None)
+                .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
                 .unwrap()
                 .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
                 .unwrap();
@@ -943,7 +983,7 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
     let child = checkpoint.component("model").unwrap().clone();
     let portable = scratch.0.join("converted-portable");
     checkpoint
-        .materialize(&portable, Format::Cozytensors, None)
+        .materialize(&portable, Format::Cozytensors, false)
         .await
         .unwrap();
     assert_eq!(fs::read(portable.join("README.md")).unwrap(), README);
@@ -966,7 +1006,7 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
     drop(client);
     let result = scratch.0.join("converted-hf");
     reopened
-        .materialize(&result, Format::Safetensors, None)
+        .materialize(&result, Format::Safetensors, false)
         .await
         .unwrap();
     check_export_readme(&result, "README.md");
@@ -1198,7 +1238,7 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
     let bad_chunk = scratch.0.join("bad-chunk-export");
     assert_eq!(
         plain
-            .materialize(&bad_chunk, Format::Cozytensors, None)
+            .materialize(&bad_chunk, Format::Cozytensors, false)
             .await
             .unwrap_err()
             .kind,
@@ -1217,7 +1257,7 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
     );
     fs::write(&chunk, WEIGHT).unwrap();
     plain
-        .materialize(&bad_chunk, Format::Cozytensors, None)
+        .materialize(&bad_chunk, Format::Cozytensors, false)
         .await
         .unwrap();
     let tree = producer
@@ -1236,7 +1276,7 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
     let bad_repo = scratch.0.join("bad-repo-export");
     assert_eq!(
         managed
-            .materialize(&bad_repo, Format::Cozytensors, None)
+            .materialize(&bad_repo, Format::Cozytensors, false)
             .await
             .unwrap_err()
             .kind,
@@ -1246,7 +1286,7 @@ async fn native_export_refuses_same_length_corrupt_chunks_and_known_repository_o
     assert!(!bad_repo.join("README.bin").exists());
     platform::durable::replace(&readme, README, 0o444).unwrap();
     managed
-        .materialize(&bad_repo, Format::Cozytensors, None)
+        .materialize(&bad_repo, Format::Cozytensors, false)
         .await
         .unwrap();
     assert_eq!(fs::read(bad_repo.join("README.bin")).unwrap(), README);
@@ -1273,7 +1313,7 @@ async fn streaming_writer_resumes_its_keyed_journal_after_drop_then_publishes_th
     interrupted
         .component(
             "model",
-            "test.Model",
+            ClassRef::new("test", "1.0", "Model"),
             serde_json::from_str(r#"{"width":4}"#).unwrap(),
             None,
         )
@@ -1301,7 +1341,7 @@ async fn streaming_writer_resumes_its_keyed_journal_after_drop_then_publishes_th
     resumed
         .component(
             "model",
-            "test.Model",
+            ClassRef::new("test", "1.0", "Model"),
             serde_json::from_str(r#"{"width":4}"#).unwrap(),
             None,
         )
@@ -1375,7 +1415,7 @@ async fn a_header_file_written_inside_a_snapshot_folder_keeps_that_folder() {
         })
         .unwrap();
     writer
-        .component("model", "test.Model", Default::default(), None)
+        .component("model", ClassRef::new("test", "1.0", "Model"), Default::default(), None)
         .unwrap()
         .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
         .unwrap();

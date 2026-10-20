@@ -7,6 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
+use tensorfs::format::ClassRef;
 use tensorfs::format::Dtype;
 use tensorfs::store::Store;
 use tensorfs::{Client, Config, Format, WriterOptions};
@@ -27,17 +28,17 @@ async fn a_written_config_file_name_survives_materialize_export_files_and_rewrit
     let config = serde_json::from_value(scheduler.clone()).unwrap();
 
     let mut writer = client.writer(WriterOptions::default()).unwrap();
-    writer.component("scheduler", "diffusers.EulerDiscreteScheduler", config, Some("scheduler_config.json")).unwrap();
+    writer.component("scheduler", ClassRef::new("diffusers", "0.35.1", "EulerDiscreteScheduler"), config, Some("scheduler_config.json")).unwrap();
     let tokenizer = serde_json::from_value(json!({"model_max_length": 77})).unwrap();
-    writer.component("tokenizer", "transformers.CLIPTokenizer", tokenizer, Some("tokenizer_config.json")).unwrap();
+    writer.component("tokenizer", ClassRef::new("transformers", "4.57.0", "CLIPTokenizer"), tokenizer, Some("tokenizer_config.json")).unwrap();
     let sample = serde_json::from_value(json!({"sample_size": 8})).unwrap();
-    let mut unet = writer.component("unet", "diffusers.UNet2DConditionModel", sample, None).unwrap();
+    let mut unet = writer.component("unet", ClassRef::new("diffusers", "0.35.1", "UNet2DConditionModel"), sample, None).unwrap();
     unet.put("w", Dtype::U8, &[4], &mut &[1u8, 2, 3, 4][..]).unwrap();
     let saved = writer.commit().await.unwrap();
     assert_eq!(saved.component("scheduler").unwrap().config_file(), "scheduler_config.json");
     assert_eq!(saved.component("unet").unwrap().config_file(), "config.json");
 
-    let folder = saved.materialize(&dir.0.join("st"), Format::Safetensors, None).await.unwrap();
+    let folder = saved.materialize(&dir.0.join("st"), Format::Safetensors, false).await.unwrap();
     let rendered: Value = serde_json::from_slice(&fs::read(folder.join("scheduler/scheduler_config.json")).unwrap()).unwrap();
     assert_eq!(rendered, scheduler);
     assert!(!folder.join("scheduler/config.json").exists());
@@ -50,7 +51,7 @@ async fn a_written_config_file_name_survives_materialize_export_files_and_rewrit
     // A rewrite keeps both a redeclared and an inherited component's config file name.
     let mut rewrite = client.writer(WriterOptions { base: Some(&saved), ..WriterOptions::default() }).unwrap();
     let linear = serde_json::from_value(json!({"beta_schedule": "linear"})).unwrap();
-    rewrite.component("scheduler", "diffusers.EulerDiscreteScheduler", linear, None).unwrap();
+    rewrite.component("scheduler", ClassRef::new("diffusers", "0.35.1", "EulerDiscreteScheduler"), linear, None).unwrap();
     let rewritten = rewrite.commit().await.unwrap();
     let scheduler = rewritten.component("scheduler").unwrap();
     assert_eq!((scheduler.config_file(), scheduler.config()["beta_schedule"].as_str()), ("scheduler_config.json", Some("linear")));
@@ -65,7 +66,7 @@ async fn export_files_without_a_directory_renders_a_cache_folder_that_expires() 
     let client = Client::new(Config { cache_dir: cache.clone(), ..Config::from_env() }).unwrap();
     let mut writer = client.writer(WriterOptions::default()).unwrap();
     let config = serde_json::from_value(json!({"model_max_length": 77})).unwrap();
-    let mut tokenizer = writer.component("tokenizer", "transformers.CLIPTokenizer", config, Some("tokenizer_config.json")).unwrap();
+    let mut tokenizer = writer.component("tokenizer", ClassRef::new("transformers", "4.57.0", "CLIPTokenizer"), config, Some("tokenizer_config.json")).unwrap();
     tokenizer.asset("vocab.json", br#"{"a":0}"#).unwrap();
     let saved = writer.commit().await.unwrap();
     let component = saved.component("tokenizer").unwrap();

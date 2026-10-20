@@ -834,6 +834,7 @@ mod tests {
     fn checkpoint_references_reach_the_run_log_without_fabricated_byte_metadata() {
         let checkpoint = v1::CheckpointRef {
             repo_id: "owner/model".into(), revision: format!("sha256:{}", "b".repeat(64)), variant: "bf16".into(),
+            tag: format!("replay-{}", "c".repeat(64)),
         };
         let mut log = Log::default();
         let event = log.event(domain::MachineExecutionEvent {

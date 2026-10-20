@@ -300,7 +300,7 @@ class Fixture:
                     offset += p["length"]
                 header = canonical(meta)
                 header += b" " * (-len(header) % 8)
-                target = writer.component(component, cls="", config={})
+                target = writer.component(component, cls=("", "", ""), config={})
                 with path.open("xb") as stream:
                     stream.write(len(header).to_bytes(8, "little") + header)
                     for p in parts:

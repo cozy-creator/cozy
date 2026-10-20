@@ -19,8 +19,8 @@
 //!   from the export must equal upstream's exactly. Construction order stays in the checkpoint.
 //! - An encoded tensor `x.weight` keeps its parts: `x.weight` (the `weight` part),
 //!   `x.weight_scale`, `x.weight_scale_2`, `x.input_scale`, and `__metadata__`'s
-//!   `cozytensors.encodings` names each one's scheme and params. With `dequantize`, it is decoded
-//!   into that dtype instead.
+//!   `cozytensors.encodings` names each one's scheme and params. With `decode`, it is decoded
+//!   into its logical dtype instead.
 
 mod gguf;
 
@@ -36,8 +36,7 @@ use serde_json::{json, Map, Value as Json};
 
 use crate::failure::{fail, Kind, Result};
 use crate::format::{
-    decode, variant_of, Body, Component, Config, ConfigValue, Dtype, Location, ObjectRef,
-    PartBytes, Value,
+    variant_of, Body, Component, Config, ConfigValue, Dtype, Location, ObjectRef, Value,
 };
 use crate::import::{FILE_METADATA, PIPELINE_FILE, ROOT_COMPONENT};
 use crate::store::Checkpoint;
@@ -95,7 +94,7 @@ pub(crate) fn cozytensors(
 /// Where one safetensors tensor's bytes come from.
 enum Bytes<'a> {
     Stored(Location),
-    Decoded { key: &'a str, dtype: Dtype },
+    Decoded(&'a str),
 }
 
 struct Entry<'a> {
@@ -119,21 +118,14 @@ fn part_name(key: &str, role: &str) -> String {
 }
 
 /// Writes `ck` into `dir` as a Diffusers/Transformers folder, with the repo files `repo` (path →
-/// local file; a tree's files other than its variants); the paths written, relative.
+/// local file; a tree's files other than its variants); the paths written, relative. `decode`
+/// writes each encoded tensor in its logical dtype.
 pub fn safetensors(
     ck: &Checkpoint,
     repo: &BTreeMap<String, PathBuf>,
     dir: &Path,
-    dequantize: Option<&Dtype>,
+    decode: bool,
 ) -> Result<Vec<String>> {
-    if let Some(dtype) = dequantize {
-        if !matches!(dtype, Dtype::F32 | Dtype::BF16 | Dtype::F16) {
-            return fail(
-                Kind::Invalid,
-                format!("dequantize to {dtype}: one of F32, BF16, F16"),
-            );
-        }
-    }
     let header = ck.header();
     let file_metadata = match header.metadata.get(FILE_METADATA) {
         Some(Value::Map(m)) => m.clone(),
@@ -174,7 +166,7 @@ pub fn safetensors(
         let mut encodings = Map::new();
         for t in &c.tensors {
             let key = &t.key;
-            match (&t.body, dequantize) {
+            match (&t.body, decode) {
                 (Body::Data(at), _) => entries.push(Entry {
                     name: key.clone(),
                     dtype: t.dtype.clone(),
@@ -182,8 +174,8 @@ pub fn safetensors(
                     length: at.length,
                     bytes: Bytes::Stored(*at),
                 }),
-                (Body::Encoded { .. }, Some(dtype)) => {
-                    let Some(length) = dtype.byte_len(&t.shape) else {
+                (Body::Encoded { .. }, true) => {
+                    let Some(length) = t.dtype.byte_len(&t.shape) else {
                         return fail(
                             Kind::Invalid,
                             format!("{component}/{key}: {:?} overflows", t.shape),
@@ -191,16 +183,13 @@ pub fn safetensors(
                     };
                     entries.push(Entry {
                         name: key.clone(),
-                        dtype: dtype.clone(),
+                        dtype: t.dtype.clone(),
                         shape: t.shape.clone(),
                         length,
-                        bytes: Bytes::Decoded {
-                            key,
-                            dtype: dtype.clone(),
-                        },
+                        bytes: Bytes::Decoded(key),
                     })
                 }
-                (Body::Encoded { encoding, parts }, None) => {
+                (Body::Encoded { encoding, parts }, false) => {
                     let names: Map<String, Json> = parts
                         .iter()
                         .map(|p| (p.role.clone(), Json::from(part_name(key, &p.role))))
@@ -296,7 +285,7 @@ pub fn safetensors(
 
 /// `diffusion_pytorch_model` for a Diffusers component, `model` for any other.
 fn weights_name(c: &Component) -> String {
-    match c.class.starts_with("diffusers.") || c.config.contains_key("_diffusers_version") {
+    match c.class.library == "diffusers" || c.config.contains_key("_diffusers_version") {
         true => "diffusion_pytorch_model",
         false => "model",
     }
@@ -505,9 +494,7 @@ fn write_file(
         for e in entries {
             match &e.bytes {
                 Bytes::Stored(at) => stored(ck, at, &mut out)?,
-                Bytes::Decoded { key, dtype } => {
-                    out.write_all(&decode_as(ck, component, key, dtype)?)?
-                }
+                Bytes::Decoded(key) => out.write_all(&ck.read(component, key)?)?,
             }
         }
         out.flush()?;
@@ -537,34 +524,6 @@ fn stored(ck: &Checkpoint, at: &Location, out: &mut impl Write) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// An encoded tensor decoded into `dtype` (rounded once, from the scheme's f32 values).
-fn decode_as(ck: &Checkpoint, component: &str, key: &str, dtype: &Dtype) -> Result<Vec<u8>> {
-    let t = ck.tensor(component, key)?;
-    let Body::Encoded { encoding, parts } = &t.body else {
-        unreachable!("only encoded tensors are decoded")
-    };
-    let bytes = parts
-        .iter()
-        .map(|p| {
-            let mut buf = vec![0; p.length as usize];
-            ck.bytes_into(&p.at(), &mut buf).map(|()| buf)
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let views = parts
-        .iter()
-        .zip(&bytes)
-        .map(|(p, b)| {
-            let view = PartBytes {
-                dtype: &p.dtype,
-                shape: &p.shape,
-                bytes: b,
-            };
-            (p.role.as_str(), view)
-        })
-        .collect();
-    Ok(decode(dtype, &t.shape, encoding, &views)?)
 }
 
 pub(crate) fn io(path: &Path, e: std::io::Error) -> crate::failure::Failure {

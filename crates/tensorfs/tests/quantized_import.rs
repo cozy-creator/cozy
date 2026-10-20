@@ -100,7 +100,7 @@ fn import(store: &Store, source: &Path) -> tensorfs::err::Result<Checkpoint> {
     let req = Request {
         sources: &[source.display().to_string()],
         converter: None,
-        variant: None,
+        source_variant: None,
         access: &access,
         tmp: &tmp,
         progress: &|_, _, _| {},
@@ -527,7 +527,7 @@ fn comfy_fp8_tensorwise_rowwise_and_legacy() {
             },
             Want {
                 key: "attn.to_k.weight",
-                encoding: r#"fp8.rowwise {axis: 0}"#,
+                encoding: r#"fp8.rowwise {}"#,
                 parts: &[
                     ("weight", "F8_E4M3", &[32, 64], "weight"),
                     ("scale", "F32", &[32, 1], "weight_scale"),
@@ -574,7 +574,7 @@ fn comfy_int8_tensorwise_rowwise_and_convrot() {
             },
             Want {
                 key: "ff.gate.weight",
-                encoding: r#"int8.rowwise {axis: 0}"#,
+                encoding: r#"int8.rowwise {}"#,
                 parts: &[
                     ("weight", "I8", &[32, 64], "weight"),
                     ("scale", "F32", &[32, 1], "weight_scale"),
@@ -727,16 +727,16 @@ fn every_carrier_names_a_complete_encoding() {
             ("mxfp8", Producer::Comfy) => Encoding::mxfp8(Cublas128x4),
             ("mxfp8", _) => Encoding::mxfp8(RowMajor),
             ("fp8.tensorwise", _) => Encoding::fp8_tensorwise(),
-            ("fp8.rowwise", _) => Encoding::fp8_rowwise(0),
+            ("fp8.rowwise", _) => Encoding::fp8_rowwise(),
             ("int8.tensorwise", _) => Encoding::int8_tensorwise(),
-            ("int8.rowwise", _) => Encoding::int8_rowwise(0),
+            ("int8.rowwise", _) => Encoding::int8_rowwise(),
             ("int8.convrot", _) => Encoding::int8_convrot(256),
             ("fp8.blockwise", _) => Encoding::fp8_blockwise(128, 128),
             ("mxfp4", Producer::GptOss) => Encoding::mxfp4(true),
             ("mxfp4", _) => Encoding::mxfp4(false),
             ("comfy.asym_w4a8_int8", _) => Encoding::comfy_asym_w4a8_int8(16, 256),
             ("comfy.w6a8_int8", _) => Encoding::comfy_w6a8_int8(16, 256),
-            ("comfy.convrot_w4a4", _) => Encoding::comfy_convrot_w4a4(256),
+            ("int4.convrot", _) => Encoding::int4_convrot(256),
             other => panic!("{other:?}"),
         };
         let mut encoding = c.encoding.clone();
@@ -776,7 +776,7 @@ fn tfs_inspect_shows_comfy_nvfp4_at_a_glance() {
         "local/comfy-nvfp4@1",
     ]);
     let doc: serde_json::Value =
-        serde_json::from_str(tfs(&["--json", "inspect", "local/comfy-nvfp4"]).trim()).unwrap();
+        serde_json::from_str(tfs(&["--json", "inspect", "local/comfy-nvfp4@1"]).trim()).unwrap();
     let tensors = doc["components"][0]["tensors"].as_array().unwrap();
     let qkv = tensors
         .iter()
@@ -786,7 +786,7 @@ fn tfs_inspect_shows_comfy_nvfp4_at_a_glance() {
         qkv,
         &serde_json::json!({"key": "blocks.0.attn.qkv.weight", "dtype": "BF16", "shape": [144, 80], "encoding": NVFP4_COMFY})
     );
-    let human = tfs(&["inspect", "local/comfy-nvfp4"]);
+    let human = tfs(&["inspect", "local/comfy-nvfp4@1"]);
     assert!(
         human.contains(&format!("    2 × {NVFP4_COMFY}\n")),
         "{human}"
@@ -1128,13 +1128,13 @@ fn real_int_checkpoints_import_and_decode() {
         (
             "real-ct-int8-channel",
             "BF16",
-            r#"int8.rowwise {axis: 0}"#,
+            r#"int8.rowwise {}"#,
             0.02,
         ),
         (
             "real-ct-fp8-channel",
             "BF16",
-            r#"fp8.rowwise {axis: 0}"#,
+            r#"fp8.rowwise {}"#,
             0.03,
         ),
     ];
@@ -1400,9 +1400,9 @@ fn real_bytes_from_comfyui_and_modelopt() {
     assert_eq!(e.code, Code::AMBIGUOUS_CLASSIFICATION, "{}", e.detail);
 }
 
-const W4A8: &str = "comfy.asym_w4a8_int8 {group_size: 16, rotation_size: 256}";
-const W6A8: &str = "comfy.w6a8_int8 {group_size: 32, rotation_size: 256}";
-const W4A4: &str = "comfy.convrot_w4a4 {rotation_size: 256}";
+const W4A8: &str = r#"comfy.asym_w4a8_int8 {group_size: 16, rotation: "kron_regular_h4", rotation_size: 256}"#;
+const W6A8: &str = r#"comfy.w6a8_int8 {group_size: 32, rotation: "kron_regular_h4", rotation_size: 256}"#;
+const W4A4: &str = r#"int4.convrot {rotation: "kron_regular_h4", rotation_size: 256}"#;
 
 /// xs-049 U7's real bytes (`comfy-provenance.json`: 64 rows × 512 columns of MiniMax-H3 linears,
 /// with Comfy-Org's bf16 weights): each ComfyUI integer format imports at its marker's params and
@@ -1417,9 +1417,9 @@ fn comfy_w4a8_w6a8_w4a4_from_real_files() {
             encoding: W4A8,
             parts: &[
                 ("weight", "I8", &[64, 256], "weight"),
-                ("weight_s_rel", "F8_E4M3", &[64, 32], "weight_s_rel"),
-                ("weight_s_channel", "F32", &[64], "weight_s_channel"),
-                ("weight_codebook", "F32", &[16], "weight_codebook"),
+                ("group_scale", "F8_E4M3", &[64, 32], "weight_s_rel"),
+                ("scale", "F32", &[64], "weight_s_channel"),
+                ("codebook", "F32", &[16], "weight_codebook"),
             ],
             meets: Meets::Exactly,
             error: 0.08,
@@ -1432,8 +1432,8 @@ fn comfy_w4a8_w6a8_w4a4_from_real_files() {
             encoding: W6A8,
             parts: &[
                 ("weight", "I8", &[64, 384], "weight"),
-                ("weight_s_rel", "F8_E4M3", &[64, 16], "weight_s_rel"),
-                ("weight_s_channel", "F32", &[64], "weight_s_channel"),
+                ("group_scale", "F8_E4M3", &[64, 16], "weight_s_rel"),
+                ("scale", "F32", &[64], "weight_s_channel"),
             ],
             meets: Meets::Exactly,
             error: 0.03,
@@ -1446,7 +1446,7 @@ fn comfy_w4a8_w6a8_w4a4_from_real_files() {
             encoding: W4A4,
             parts: &[
                 ("weight", "I8", &[64, 256], "weight"),
-                ("weight_scale", "F32", &[64], "weight_scale"),
+                ("scale", "F32", &[64], "weight_scale"),
             ],
             meets: Meets::Exactly,
             error: 0.25,

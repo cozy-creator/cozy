@@ -43,7 +43,7 @@ MiB = 1 << 20
 
 def write(root: Path) -> tensorfs.Checkpoint:
     w = tensorfs.Writer(cache_dir=root)
-    model, blocks = (w.component(name, cls="test.Model", config={}) for name in ("model", "blocks"))
+    model, blocks = (w.component(name, cls=("test", "1.0", "Model"), config={}) for name in ("model", "blocks"))
     g = torch.Generator().manual_seed(7)
     for i in range(LAYERS):
         model.put(f"layers.{i}.weight", (torch.randn(DIM, DIM, generator=g) / DIM**0.5).half().numpy(), dtype="F16", shape=[DIM, DIM])
