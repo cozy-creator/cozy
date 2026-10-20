@@ -22,11 +22,12 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import weakref
 from pathlib import Path
 from urllib.parse import urlsplit
 
-CASES = ("last-weightset", "callback-close", "last-pin", "last-consumer", "pending-consumer-b")
+CASES = ("last-weightset", "callback-close", "last-pin", "last-consumer", "pending-consumer-b", "pending-ptds-consumer")
 WAIT = 12
 AUTH = "r2-source-proof"
 DATA = bytes(range(256)) * 256
@@ -367,6 +368,130 @@ def run_case(case):
                     ticker.join(2)
             assert not ticker.is_alive(), "the owned heartbeat did not stop"
             assert bytes(copied.cpu().tolist()) == DATA, "consumer B read released or reused pages"
+            consumer_proof.update(copied_bytes=len(DATA), copied_sha256=hashlib.sha256(DATA).hexdigest())
+            del copied
+        elif case == "pending-ptds-consumer":
+            # Equal raw PTDS handles on distinct live OS threads denote different streams.
+            # Transfer ownership through a holder, never Thread args/a captured WeightSet.
+            handoff = [weights]
+            del weights
+            bound, release_bind = threading.Event(), threading.Event()
+            bind_proof, bind_errors = {}, []
+
+            def bind_ptds():
+                source = item = bind_stream = None
+                try:
+                    bind_stream = torch.cuda.ExternalStream(2, device=0)
+                    assert bind_stream.cuda_stream == 2, "Torch did not preserve PTDS handle 2"
+                    with torch.cuda.stream(bind_stream):
+                        assert torch.cuda.current_stream(0).cuda_stream == 2
+                        source = handoff.pop()
+                        item = source.bind(0, 2)
+                        # This fixture proves final release, not pending fill readiness.
+                        bind_stream.synchronize()
+                        source.close()
+                        del source
+                        handoff.append(item)
+                        del item
+                    bind_proof.update(thread=threading.get_ident(), stream=2,
+                                      source_handles_released=True)
+                    bound.set()
+                    assert release_bind.wait(WAIT), "the PTDS consumer never released bind thread A"
+                except BaseException:
+                    bind_errors.append(traceback.format_exc())
+                finally:
+                    try:
+                        if bind_stream is not None:
+                            bind_stream.synchronize()
+                    except BaseException:
+                        bind_errors.append(traceback.format_exc())
+                    source = item = None
+                    bound.set()
+
+            binder = threading.Thread(target=bind_ptds, daemon=True)
+            binder.start()
+            consumer = ticker = None
+            stop = threading.Event()
+            try:
+                assert bound.wait(WAIT), "PTDS bind thread A never handed over its Pin"
+                assert not bind_errors, bind_errors
+                assert binder.is_alive() and bind_proof["source_handles_released"]
+                assert bind_proof["thread"] != threading.get_ident()
+                pin = handoff.pop()
+                assert not handoff, "the handoff still retains a source owner"
+                consumer = torch.cuda.ExternalStream(2, device=0)
+                assert consumer.cuda_stream == 2, "Torch substituted another stream for PTDS B"
+                with torch.cuda.stream(consumer):
+                    assert torch.cuda.current_stream(0).cuda_stream == 2
+                    tensor = torch.from_dlpack(pin)
+                    assert tensor.is_cuda and tensor.device.index == 0
+                    assert tensor.dtype == torch.uint8 and tensor.numel() == len(DATA)
+                    assert tensor.data_ptr() == pin.ptr
+                    copied = torch.empty_like(tensor)
+                    assert copied.data_ptr() != tensor.data_ptr()
+                held_free = gpu.stats().driver_free
+                foreign = weakref.ref(tensor)
+                heartbeat = [0]
+
+                def beat_ptds():
+                    while not stop.wait(0.001):
+                        heartbeat[0] += 1
+
+                ticker = threading.Thread(target=beat_ptds, daemon=True)
+                ticker.start()
+                end = torch.cuda.Event()
+                with torch.cuda.stream(consumer):
+                    torch.cuda._sleep(2_000_000_000)
+                    copied.copy_(tensor, non_blocking=True)
+                    end.record()
+                assert not end.query(), "PTDS consumer B needs actual pending work"
+                del provider, pin
+                ticks, started = heartbeat[0], time.monotonic()
+                del tensor
+                elapsed = time.monotonic() - started
+                gc.collect()
+                assert foreign() is None, "a Python tensor masks PTDS final release"
+                # Observe only Python owners and the event until B has been rescued.
+                # Stats/trim/recovery or host reads here could synchronize the context.
+                time.sleep(0.1)
+                assert not end.query(), "PTDS B finished before the retention observation"
+                assert binder.is_alive(), "bind thread A exited before the PTDS observation"
+                assert alive() is not None, "pending PTDS B lost its source/provider"
+                assert elapsed < 0.25, "PTDS final consumer release waited for CUDA"
+                assert heartbeat[0] - ticks >= 3, "PTDS release stopped Python's heartbeat"
+                consumer_proof = {
+                    "scope": "final-release-custody",
+                    "bind_stream": bind_proof["stream"],
+                    "consumer_stream": consumer.cuda_stream,
+                    "bind_thread": bind_proof["thread"],
+                    "consumer_thread": threading.get_ident(),
+                    "distinct_threads": True,
+                    "bind_thread_alive_while_pending": True,
+                    "bind_thread_source_handles_released": True,
+                    "ptds": True,
+                    "fill_ready_before_consume": True,
+                    "pending_readiness_device_proof": False,
+                    "pending_after_drop": True,
+                    "source_retained_while_pending": True,
+                    "foreign_python_owner_collected": True,
+                    "drop_seconds": elapsed,
+                    "heartbeat_ticks": heartbeat[0] - ticks,
+                }
+            finally:
+                try:
+                    # PTDS must be rescued on this owning OS thread, not the deleter's.
+                    if consumer is not None:
+                        consumer.synchronize()
+                finally:
+                    release_bind.set()
+                    binder.join(WAIT)
+                    stop.set()
+                    if ticker is not None:
+                        ticker.join(2)
+            assert not binder.is_alive(), "the owned PTDS bind thread did not stop"
+            assert not bind_errors, bind_errors
+            assert ticker is not None and not ticker.is_alive()
+            assert bytes(copied.cpu().tolist()) == DATA, "PTDS B read released or reused pages"
             consumer_proof.update(copied_bytes=len(DATA), copied_sha256=hashlib.sha256(DATA).hexdigest())
             del copied
         else:
