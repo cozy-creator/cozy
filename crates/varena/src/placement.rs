@@ -1736,3 +1736,164 @@ fn spread_rank(index: usize, count: usize) -> u32 {
     let bits = (usize::BITS - count.saturating_sub(1).leading_zeros()).clamp(1, 32);
     (index as u32).reverse_bits() >> (32 - bits)
 }
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+    use std::ffi::c_void;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    use tensorfs::io::cuda;
+    use tensorfs::io::source::{Item, ItemSource};
+
+    struct ConsumerGate {
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    unsafe extern "C" fn hold_consumer(pointer: *mut c_void) {
+        // CUDA owns this box until it invokes the callback exactly once. No CUDA
+        // calls are allowed here; the channel only keeps its stream unfinished.
+        let gate = unsafe { Box::from_raw(pointer.cast::<ConsumerGate>()) };
+        let _ = gate.started.send(());
+        let _ = gate.release.recv();
+    }
+
+    struct ReleaseGate(Option<mpsc::Sender<()>>);
+    impl Drop for ReleaseGate {
+        fn drop(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    fn observe(ledger: &Ledger, description: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if ready() {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "{description}");
+            let mut poll = libc::pollfd {
+                fd: ledger.events().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut poll, 1, remaining.as_millis() as i32) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            assert!(result > 0, "{description}");
+            let mut count = 0_u64;
+            let read = unsafe {
+                libc::read(
+                    ledger.events().as_raw_fd(),
+                    (&mut count as *mut u64).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            assert_eq!(read, 8, "read ledger event");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn idle_worker_retires_after_pending_consumer_finishes() {
+        let probe = Gpu::open(0).expect("real CUDA device");
+        let ledger = Ledger::create(
+            &probe.uuid().expect("GPU UUID"),
+            probe.capacity().expect("capacity"),
+        )
+        .expect("observer ledger");
+        let grant = ledger.grant_unbound().expect("unbound rank grant");
+        drop(probe);
+        let placement = Placement::open(0, Some((grant.table, grant.events, grant.channel)))
+            .expect("real placement");
+        let consumer = cuda::Stream::new(0).expect("consumer stream");
+        let length = crate::layout::REGION_ALIGN;
+        let layout = Layout {
+            parts: vec![],
+            regions: vec![crate::layout::Region {
+                offset: 0,
+                nbytes: length,
+                span: length,
+                items: vec![Item {
+                    offset: 0,
+                    len: length,
+                    source: ItemSource::Inline(vec![7; length as usize]),
+                    part_end: true,
+                }],
+            }],
+            nbytes: length,
+            digest: "idle-retirement-test".into(),
+            names: vec![],
+        };
+        let pages = placement
+            .register(
+                1,
+                "idle-retirement".into(),
+                [7; 32],
+                &layout,
+                Arc::new(Source::files(vec![], false, 0)),
+                None,
+            )
+            .expect("register");
+        let page = *pages.first().expect("one real page");
+        placement
+            .begin(1, vec![vec![1]], "idle-retirement".into(), "".into())
+            .expect("request");
+        let pin = placement
+            .bind(1, page, consumer.raw())
+            .expect("fill and bind");
+        let (started, waiting) = mpsc::channel();
+        let (release, finish) = mpsc::channel();
+        let gate = ReleaseGate(Some(release));
+        let callback = Box::into_raw(Box::new(ConsumerGate {
+            started,
+            release: finish,
+        }));
+        let (_, context) = cuda::primary_context(0).expect("context");
+        let _context = cuda::CtxGuard::enter(context).expect("enter context");
+        let result = unsafe {
+            (cuda::driver().expect("driver").launch_host_func)(
+                consumer.raw() as cuda::CUstream,
+                hold_consumer,
+                callback.cast(),
+            )
+        };
+        if result != cuda::SUCCESS {
+            drop(unsafe { Box::from_raw(callback) });
+        }
+        cuda::check("cuLaunchHostFunc", result).expect("gate consumer");
+        waiting
+            .recv_timeout(Duration::from_secs(10))
+            .expect("consumer is pending");
+        placement.close_model(1).expect("unregister pinned model");
+        drop(pin);
+        // Observe only the coordinator's already-published snapshot. Calling
+        // Gpu::poll/facts or Placement::resident here would hide the regression.
+        observe(&ledger, "worker did not dequeue the last pin", || {
+            placement
+                .inner
+                .lock()
+                .table
+                .page(page)
+                .is_some_and(|row| row.pins == 0 && row.filling && row.mapped())
+        });
+        drop(gate);
+        observe(&ledger, "idle worker did not retire completed page", || {
+            placement.inner.lock().table.page(page).is_none()
+                && ledger
+                    .status()
+                    .expect("published rows")
+                    .rows
+                    .iter()
+                    .filter(|row| row.pid == std::process::id())
+                    .all(|row| row.snapshot.classes.iter().all(|bytes| *bytes == 0))
+        });
+        placement.end(1).expect("end request");
+        placement.close().expect("close placement");
+    }
+}
