@@ -142,12 +142,14 @@ fn matches(pattern: &str, name: &str) -> bool {
     rest.ends_with(last)
 }
 
-/// Whether `path` is under `entry`: a folder's files, or a top-level file named by it.
+/// Whether `path` is under `entry`: a folder's files (`tokenizer/`), that one file
+/// (`unet/config.json`), or a top-level file it begins (`README`).
 fn under(entry: &str, path: &str) -> bool {
-    let path = path.to_ascii_lowercase();
-    match entry.ends_with('/') {
-        true => path.starts_with(&entry.to_ascii_lowercase()),
-        false => !path.contains('/') && path.starts_with(&entry.to_ascii_lowercase()),
+    let (entry, path) = (entry.to_ascii_lowercase(), path.to_ascii_lowercase());
+    match (entry.ends_with('/'), entry.contains('/')) {
+        (true, _) => path.starts_with(&entry),
+        (false, true) => path == entry,
+        (false, false) => !path.contains('/') && path.starts_with(&entry),
     }
 }
 

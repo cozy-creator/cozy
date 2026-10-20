@@ -19,7 +19,7 @@ use tensorfs::store2::Store;
 const SDXL: &str = "hf://hf-internal-testing/tiny-sdxl-pipe@20594cbc343cfcfe447af5c87cdaf6c436b453f2";
 const GPT2: &str = "hf://hf-internal-testing/tiny-random-gpt2@71034c5d8bde858ff824298bdedc65515b97d2b9";
 const TABLE: &[Upstream] = &[
-    Upstream { models: &["acme/tiny"], from: SDXL, files: &["model_index.json", "tokenizer/", "tokenizer_2/", "README"], source: None, note: "test" },
+    Upstream { models: &["acme/tiny"], from: SDXL, files: &["model_index.json", "tokenizer/", "tokenizer_2/", "unet/config.json", "README"], source: None, note: "test" },
     Upstream { models: &["acme/gpt2"], from: GPT2, files: &["special_tokens_map.json", "README"], source: None, note: "test" },
     Upstream { models: &["acme/wrapped"], from: "", files: &[], source: Some("civitai://1"), note: "" },
 ];
@@ -246,6 +246,7 @@ fn partial_tokenizer_keeps_existing_files_and_fills_missing_files() {
     let mut manifest: Json = serde_json::from_slice(&blob(&fixture, FULL)).unwrap();
     let missing = "tokenizer/vocab.json";
     let expected: ObjectRef = serde_json::from_value(manifest["files"].as_object_mut().unwrap().remove(missing).unwrap()).unwrap();
+    let config: ObjectRef = serde_json::from_value(manifest["files"].as_object_mut().unwrap().remove("unet/config.json").unwrap()).unwrap();
     assert!(manifest["files"].get("tokenizer/tokenizer_config.json").is_some());
     let bytes = serde_json::to_vec(&manifest).unwrap();
     let object = ObjectRef::of(&bytes);
@@ -261,7 +262,8 @@ fn partial_tokenizer_keeps_existing_files_and_fills_missing_files() {
     let tree = Tree::from_json(&read(&migrated.repo.releases[0].tree)).unwrap();
     let header = Header::from_cbor(&read(tree.variant(Some("full")).unwrap().1)).unwrap();
     assert_eq!(header.component("tokenizer").unwrap().assets["vocab.json"], expected);
-    assert_eq!(filled(&header).unwrap().1, BTreeSet::from([missing.to_owned()]));
+    assert_eq!(filled(&header).unwrap().1, BTreeSet::from([missing.to_owned(), "unet/config.json".to_owned()]));
+    assert_eq!(header.component("unet").unwrap().config, parse(&std::fs::read(dir.join(config.key())).unwrap()));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
