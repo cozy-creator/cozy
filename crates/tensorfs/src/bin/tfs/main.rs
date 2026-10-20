@@ -122,6 +122,12 @@ fn main() -> ExitCode {
         println!("{}", usage(topic));
         return ExitCode::SUCCESS;
     }
+    // Before the store opens, so a typo never depends on its state.
+    let Some(verb) = verb.filter(|v| known(v)) else {
+        let why = verb.map_or("no verb".to_owned(), |v| format!("unknown verb {v:?}"));
+        eprintln!("tfs: {why}\n{}", usage(None));
+        return ExitCode::from(2);
+    };
     let json = args.on("json");
     let ran = fetch::runtime().map_err(Failure::from).and_then(|rt| rt.block_on(run(&args)));
     match ran {
@@ -130,12 +136,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(None) => {
-            let why = match verb {
-                None => "no verb".to_owned(),
-                Some(v) if known(v) => format!("{v}: wrong arguments"),
-                Some(v) => format!("unknown verb {v:?}"),
-            };
-            eprintln!("tfs: {why}\n{}", usage(verb));
+            eprintln!("tfs: {verb}: wrong arguments\n{}", usage(Some(verb)));
             ExitCode::from(2)
         }
         Err(f) => {

@@ -4,7 +4,9 @@
 use std::process::{Command, Output};
 
 fn tfs(args: &[&str]) -> (Option<i32>, String, String) {
-    let home = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("tfs-help");
+    // Its own store: a cached target directory can hold one an older build wrote.
+    let home = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tfs-help-{}", std::process::id()));
     let Output {
         status,
         stdout,
