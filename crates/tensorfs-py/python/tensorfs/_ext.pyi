@@ -280,7 +280,7 @@ class _Client:
     def upload_folder(self, folder_path: StrPath, repo_id: str,
                       revision: str | None = None) -> str: ...
     def convert_to_cozytensors(self, source: str | Sequence[str], *, converter: str | None = None,
-                variant: str | None = None,
+                source_variant: str | None = None,
                 progress: Callable[[str, int, int], object] | None = None) -> Checkpoint: ...
 
 
@@ -298,4 +298,4 @@ class Endpoint:
 _Token = str | TokenProvider | Callable[[str, str, Mapping[str, str], str | None], Mapping[str, str]]
 
 def _materialize(checkpoint: Checkpoint, directory: StrPath, *, format: str = "cozytensors",
-                 dequantize: str | None = None) -> str: ...
+                 decode: bool = False) -> str: ...

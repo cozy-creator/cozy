@@ -37,7 +37,7 @@ async fn a_written_config_file_name_survives_materialize_export_files_and_rewrit
     assert_eq!(saved.component("scheduler").unwrap().config_file(), "scheduler_config.json");
     assert_eq!(saved.component("unet").unwrap().config_file(), "config.json");
 
-    let folder = saved.materialize(&dir.0.join("st"), Format::Safetensors, None).await.unwrap();
+    let folder = saved.materialize(&dir.0.join("st"), Format::Safetensors, false).await.unwrap();
     let rendered: Value = serde_json::from_slice(&fs::read(folder.join("scheduler/scheduler_config.json")).unwrap()).unwrap();
     assert_eq!(rendered, scheduler);
     assert!(!folder.join("scheduler/config.json").exists());

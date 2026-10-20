@@ -36,15 +36,11 @@ def open(name_or_path, *, revision=None, variant=None, endpoint=None, local_file
     )
 
 
-def materialize(source: str | _ext.Checkpoint, *, local_dir=None, format="cozytensors", dequantize=None, revision=None, variant=None, components=None, cache_dir=None, local_files_only=False, token=None, endpoint=None) -> str:
+def materialize(source: str | _ext.Checkpoint, *, local_dir=None, format="cozytensors", decode=False, revision=None, variant=None, components=None, cache_dir=None, local_files_only=False, token=None, endpoint=None) -> str:
     if format not in {"cozytensors", "safetensors"}:
         raise ValueError("format must be cozytensors or safetensors")
-    if format == "cozytensors" and dequantize is not None:
-        raise ValueError("dequantize requires format='safetensors'")
-    if dequantize is not None:
-        if not isinstance(dequantize, str) or dequantize.upper() not in {"F32", "BF16", "F16"}:
-            raise _ext.InvalidError("dequantize must be F32, BF16 or F16")
-        dequantize = dequantize.upper()
+    if format == "cozytensors" and decode:
+        raise ValueError("decode requires format='safetensors'")
     if isinstance(source, _ext.Checkpoint):
         if components is not None:
             raise ValueError("components selection requires a repository source in cozytensors format")
@@ -53,7 +49,7 @@ def materialize(source: str | _ext.Checkpoint, *, local_dir=None, format="cozyte
         if local_files_only or any(value is not None for value in
                                    (revision, variant, cache_dir, token, endpoint)):
             raise ValueError("repository and client options do not apply to a checkpoint")
-        return str(_ext._materialize(source, local_dir, format=format, dequantize=dequantize))
+        return str(_ext._materialize(source, local_dir, format=format, decode=decode))
     if not isinstance(source, str):
         raise TypeError("source must be a repository reference or Checkpoint")
     if format == "cozytensors":
@@ -69,7 +65,7 @@ def materialize(source: str | _ext.Checkpoint, *, local_dir=None, format="cozyte
         source, revision=revision, variant=variant, local_files_only=local_files_only,
     )
     try:
-        return str(_ext._materialize(checkpoint, local_dir, format=format, dequantize=dequantize))
+        return str(_ext._materialize(checkpoint, local_dir, format=format, decode=decode))
     finally:
         checkpoint.close()
 
@@ -84,9 +80,9 @@ def upload_folder(*, repo_id: str, folder_path, revision=None, token=None, endpo
     return _client(cache_dir, endpoint, token).upload_folder(Path(folder_path), repo_id, revision)
 
 
-def convert_to_cozytensors(source: str | Sequence[str], *, converter=None, variant=None, cache_dir=None, token=None, progress=None):
+def convert_to_cozytensors(source: str | Sequence[str], *, converter=None, source_variant=None, cache_dir=None, token=None, progress=None):
     return _client(cache_dir, token=token, configured_token=False).convert_to_cozytensors(
-        source, converter=converter, variant=variant, progress=progress,
+        source, converter=converter, source_variant=source_variant, progress=progress,
     )
 
 
