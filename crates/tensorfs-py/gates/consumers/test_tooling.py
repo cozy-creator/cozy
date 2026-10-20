@@ -23,6 +23,8 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[3]
 PROOF_SOURCE = '25a1d2f6bfbf07e84f06a110b30083b9fb5a45f2'
 PROVIDER_SOURCE = '7778b76d3e8eb0e9140cbf5fdca7eb487224cfd6'
+KERNEL_SOURCE = 'bceb259ac8f4229ea37ef512618d485880680662'
+COMBINED_SOURCE = 'def5e7a31c91ce1349c247439e802bf5163d1d8f'
 UUID = 'GPU-12345678-1234-1234-1234-123456789abc'
 
 
@@ -79,6 +81,10 @@ class Contract(unittest.TestCase):
         self.args.include_native_io = native
         if native:
             self.args.proof_source = self.args.native_source = PROVIDER_SOURCE
+        if kernel:
+            self.args.proof_source = self.args.native_source = KERNEL_SOURCE
+        if kernel and native:
+            self.args.proof_source = self.args.native_source = COMBINED_SOURCE
         sidecar = make_payload.generate(self.args)
         expected = validate.read(sidecar)
         spec = dict(expected)
@@ -170,7 +176,10 @@ class Contract(unittest.TestCase):
                 child.update(torch_present=False, triton_present=False, torch_loaded=False, triton_loaded=False)
                 cases = make_payload.kernel_cases(files)
                 value = {'schema': make_payload.KERNEL_SCHEMA, 'device': {'type': 'cuda', 'ordinal': 0},
-                         'counts': {'full': 209, 'windows': 209, 'total': 418, 'cases': 209, 'schemes': 39},
+                         'counts': {'full': 227, 'odd_windows': 227, 'partition_windows': 77,
+                                    'windows': 304, 'total': 531, 'cases': 227, 'schemes': 42},
+                         'partition_windows': {'nonzero-element': 18, 'group': 15, 'rotation': 7,
+                                               'row': 18, 'matrix': 1, 'near-end-partial': 18},
                          'schemes': sorted({c['scheme'] for c in cases}), 'cases': cases,
                          'corpus_sha256': make_payload.KERNEL_CORPUS,
                          'routing': {'prepared': 'Kernel', 'host_only_exclusions': []},
@@ -354,11 +363,12 @@ class Contract(unittest.TestCase):
         root, expected, run, machine, launch = self.fixture(kernel=True)
         self.assertTrue(validate.validate(root, expected, run, machine, launch, require_kernel=True)['ok'])
         value = validate.read(root / 'reports/kernel.json')
-        for cases in [[], [value['cases'][0]] * 209,
+        for cases in [[], [value['cases'][0]] * 227,
                       [{**value['cases'][0], 'full_passed': False}, *value['cases'][1:]],
                       [{**value['cases'][0], 'window': {'offset': 1, 'length': 13, 'passed': False}}, *value['cases'][1:]]]:
             self.result(root, 'kernel', {**value, 'cases': cases})
             self.inventory(root)
+            self.bind(root, run)
             with self.assertRaises(ValueError):
                 validate.validate(root, expected, run, machine, launch, require_kernel=True)
 
@@ -369,13 +379,14 @@ class Contract(unittest.TestCase):
     def test_kernel_json_counts_ordinals_and_flags_keep_their_types(self):
         root, expected, run, machine, launch = self.fixture(kernel=True)
         original = validate.read(root / 'reports/kernel.json')
-        mutations = [dict(counts={**original['counts'], 'full': 209.0}),
+        mutations = [dict(counts={**original['counts'], 'full': 227.0}),
                      dict(device={'type': 'cuda', 'ordinal': False}),
                      dict(runtime={**original['runtime'], 'torch_installed': 0}),
                      dict(routing={'prepared': 'Host', 'host_only_exclusions': []})]
         for change in mutations:
             self.result(root, 'kernel', {**original, **change})
             self.inventory(root)
+            self.bind(root, run)
             with self.assertRaises(ValueError):
                 validate.validate(root, expected, run, machine, launch, require_kernel=True)
 
@@ -389,15 +400,97 @@ class Contract(unittest.TestCase):
             make_payload.generate(self.args)
 
     def test_current_source_and_split_crate_layout_are_frozen(self):
-        # Kernel25 remains a separate historical contract; the new provider source
-        # carries U7 kernels that this focused seven-case change does not qualify.
         root, expected, run, machine, launch = self.fixture(kernel=True)
-        self.assertEqual(expected['proof_source'], PROOF_SOURCE)
+        self.assertEqual(expected['proof_source'], KERNEL_SOURCE)
         script = root / 'source' / make_payload.KERNEL_FILE
         self.assertTrue((script.parents[2] / 'tensorfs/conformance/vectors/cases').is_dir())
         self.assertNotIn('read_all(', script.read_text())
         self.assertEqual(expected['kernel']['sha256'], validate.sha(script))
         self.assertTrue(validate.validate(root, expected, run, machine, launch)['ok'])
+
+    def test_current_kernel_corpus_boundaries_are_frozen(self):
+        root, expected, run, machine, launch = self.fixture(kernel=True)
+        value = validate.read(root / 'reports/kernel.json')
+        self.assertEqual(expected['kernel']['corpus_sha256'],
+                         'fa2f92b926ba1f0e1195027eaf4066ae0d72c20ca4119584ca8547d5e91167b1')
+        self.assertEqual(expected['kernel']['sha256'],
+                         '4ddbd5d6c24f59c38c48e710d4657612a3978c7f3eaa160a8db253b5264afd08')
+        self.assertEqual(value['counts'], {'full': 227, 'odd_windows': 227, 'partition_windows': 77,
+                                          'windows': 304, 'total': 531, 'cases': 227, 'schemes': 42})
+        actual = {}
+        for row in value['cases']:
+            for window in row.get('partition_windows', []):
+                actual[window['kind']] = actual.get(window['kind'], 0) + 1
+                self.assertEqual(window['length'], 13)
+                self.assertTrue(window['passed'])
+        self.assertEqual(actual, {'nonzero-element': 18, 'group': 15, 'rotation': 7,
+                                  'row': 18, 'matrix': 1, 'near-end-partial': 18})
+        self.assertTrue(validate.validate(root, expected, run, machine, launch, require_kernel=True)['ok'])
+
+    def test_combined_future_modes_use_one_actual_source_snapshot(self):
+        root, expected, run, machine, launch = self.fixture(kernel=True, native=True)
+        self.assertEqual(expected['proof_source'], COMBINED_SOURCE)
+        self.assertEqual(expected['kernel']['source'], COMBINED_SOURCE)
+        self.assertEqual(expected['native_io']['source'], COMBINED_SOURCE)
+        self.assertEqual(expected['requested'], native_io.ALL)
+        self.assertTrue(validate.validate(root, expected, run, machine, launch, require_kernel=True)['ok'])
+
+    def test_frozen_matrix_and_rotation_boundaries_have_independent_offsets(self):
+        root, *_ = self.fixture(kernel=True)
+        cases = validate.read(root / 'reports/kernel.json')['cases']
+        matrix = next(row for row in cases if row['case'].endswith('/w4a8-experts-bf16'))
+        rotation = next(row for row in cases if row['case'].endswith('/w4a4-f32'))
+        # Hand-calculated from the frozen [2,4,256] BF16 and [4,256] F32 geometry.
+        self.assertEqual([(w['kind'], w['offset']) for w in matrix['partition_windows']],
+                         [('nonzero-element', 7), ('group', 31), ('row', 511),
+                          ('matrix', 2047), ('near-end-partial', 4083)])
+        self.assertEqual([(w['kind'], w['offset']) for w in rotation['partition_windows']],
+                         [('nonzero-element', 13), ('rotation', 253), ('row', 1021),
+                          ('near-end-partial', 4083)])
+
+    def test_wrong_or_missing_kernel_boundary_cannot_hide_behind_good_totals(self):
+        root, expected, run, machine, launch = self.fixture(kernel=True)
+        original = validate.read(root / 'reports/kernel.json')
+        index = next(i for i, row in enumerate(original['cases']) if row.get('partition_windows'))
+        shifted = original['cases'][index]['partition_windows'][0]['offset'] + 1
+        for field, value in [('kind', 'wrong'), ('offset', shifted), ('length', 12), ('passed', False), ('offset', True)]:
+            with self.subTest(field=field, value=value):
+                changed = copy.deepcopy(original)
+                changed['cases'][index]['partition_windows'][0][field] = value
+                self.result(root, 'kernel', changed)
+                self.inventory(root)
+                self.bind(root, run)
+                with self.assertRaisesRegex(ValueError, 'kernel missing/duplicate'):
+                    validate.validate(root, expected, run, machine, launch, require_kernel=True)
+        for remove in ('one', 'all', 'duplicate'):
+            changed = copy.deepcopy(original)
+            windows = changed['cases'][index]['partition_windows']
+            if remove == 'one':
+                windows.pop()
+            elif remove == 'all':
+                del changed['cases'][index]['partition_windows']
+            else:
+                windows.append(copy.deepcopy(windows[0]))
+            self.result(root, 'kernel', changed)
+            self.inventory(root)
+            self.bind(root, run)
+            with self.assertRaisesRegex(ValueError, 'kernel missing/duplicate'):
+                validate.validate(root, expected, run, machine, launch, require_kernel=True)
+
+    def test_kernel_old_counts_hash_ordinal_and_boundary_totals_are_refused(self):
+        root, expected, run, machine, launch = self.fixture(kernel=True)
+        original = validate.read(root / 'reports/kernel.json')
+        changes = [{'counts': {'full': 209, 'windows': 209, 'total': 418, 'cases': 209, 'schemes': 39}},
+                   {'device': {'type': 'cuda', 'ordinal': 1}},
+                   {'corpus_sha256': '92a0f4f01f4490c2f7f8c391e5eb600f5e5b33d647eed48d91ff7c21e7af57d4'},
+                   {'partition_windows': {**original['partition_windows'], 'group': 14}}]
+        for change in changes:
+            with self.subTest(change=change):
+                self.result(root, 'kernel', {**original, **change})
+                self.inventory(root)
+                self.bind(root, run)
+                with self.assertRaisesRegex(ValueError, 'kernel (CPU/wrong|missing/duplicate)'):
+                    validate.validate(root, expected, run, machine, launch, require_kernel=True)
 
     def test_missing_mode_requirements_bundle_and_source_fail_before_writing(self):
         self.args.require_native_mode = ['future-ab']

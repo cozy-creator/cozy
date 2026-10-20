@@ -9,7 +9,8 @@ import re
 import tarfile
 
 from make_payload import (COMFY, CONSUMERS, PRE_GPU, SCRIPT_ROOT, RUNTIME_TAG, RUNTIME_KERNELS,
-                          KERNEL_CORPUS, KERNEL_SCHEMA, KERNEL_FILE, kernel_cases)
+                          KERNEL_CORPUS, KERNEL_SCHEMA, KERNEL_FILE, KERNEL_COUNTS, KERNEL_PARTITIONS,
+                          kernel_cases)
 import native_io
 from owned_child import CONSUMER_SECONDS, KERNEL_SECONDS, SETUP_SECONDS
 
@@ -303,8 +304,11 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
             schemes = sorted({c['scheme'] for c in expected_cases})
             require(contract.get('cases') == [c['case'] for c in expected_cases] and contract.get('schemes') == schemes,
                     'kernel requested case set differs')
+            require(exact(contract.get('counts'), KERNEL_COUNTS) and
+                    exact(contract.get('partition_windows'), KERNEL_PARTITIONS), 'kernel requested boundary counts differ')
             require(value.get('schema') == KERNEL_SCHEMA and exact(value.get('device'), {'type': 'cuda', 'ordinal': 0}), 'kernel CPU/wrong CUDA ordinal')
-            require(exact(value.get('counts'), {'full': 209, 'windows': 209, 'total': 418, 'cases': 209, 'schemes': 39}) and
+            require(exact(value.get('counts'), KERNEL_COUNTS) and
+                    exact(value.get('partition_windows'), KERNEL_PARTITIONS) and
                     value.get('schemes') == schemes and value.get('corpus_sha256') == KERNEL_CORPUS and
                     exact(value.get('cases'), expected_cases), 'kernel missing/duplicate/skipped/non-bit-exact case')
             require(value.get('routing') == {'prepared': 'Kernel', 'host_only_exclusions': []}, 'kernel host fallback')
