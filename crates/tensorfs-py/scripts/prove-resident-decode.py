@@ -7,11 +7,16 @@ No Torch, CUDA, model download, network or mocked decoder is involved.
 
 from __future__ import annotations
 
+import argparse
+import base64
+import copy
 import ctypes as C
 import gc
 import hashlib
 import importlib.util
 import json
+import math
+import struct
 import sys
 from pathlib import Path
 
@@ -38,7 +43,7 @@ def refuses(kind, action):
     raise AssertionError(f"expected {kind.__name__}")
 
 
-def main():
+def cpu_main():
     assert "torch" not in sys.modules, "the CPU proof imported Torch"
     helper, helper_path = fixture()
     passed = []
@@ -275,5 +280,328 @@ def main():
     )
 
 
+def gpu_main(vectors):
+    """Opt-in device proof; the default CPU path never imports this framework."""
+    import torch
+
+    assert torch.cuda.is_available() and torch.cuda.device_count() == 1
+    helper, _helper_path = fixture()
+    corpus = vectors.read_bytes()
+    assert hashlib.sha256(corpus).hexdigest() == (
+        "56758d0c82b7b0d173d8db25cd5362ad9db348839e5f4e22ce664784c0e56043"
+    )
+    cases = json.loads(corpus)["cases"]
+    positive = [row for row in cases if not row.get("refuse")]
+    negative = [row for row in cases if row.get("refuse")]
+    assert len(positive) == 18 and len(negative) == 14
+    dtype = {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16}
+
+    # The extra F16 operand has exactly the same real values as its frozen BF16
+    # correction. Its independent expected logical bytes remain unchanged.
+    variant = copy.deepcopy(
+        next(
+            row
+            for row in positive
+            if any(
+                p["role"] == "weight_correction" and p["dtype"] == "BF16"
+                for p in row["parts"]
+            )
+        )
+    )
+    correction = next(p for p in variant["parts"] if p["role"] == "weight_correction")
+    values = [
+        struct.unpack("<f", struct.pack("<I", word[0] << 16))[0]
+        for word in struct.iter_unpack("<H", base64.b64decode(correction["bits"]))
+    ]
+    narrowed = [struct.pack("<e", value) for value in values]
+    assert all(
+        math.isfinite(value) and struct.unpack("<e", bits)[0] == value
+        for value, bits in zip(values, narrowed, strict=True)
+    )
+    correction.update(dtype="F16", bits=base64.b64encode(b"".join(narrowed)).decode())
+    variant["key"] += "-exact-f16-correction"
+    positive.append(variant)
+
+    class Export:
+        """A real Torch producer that honors its supplied consumer stream."""
+
+        def __init__(self, value, stream=None):
+            self.value = value
+            self.stream = stream
+            self.capsules = []
+
+        def __dlpack_device__(self):
+            return self.value.__dlpack_device__()
+
+        def __dlpack__(self, *, stream=None):
+            if self.stream is None:
+                capsule = self.value.__dlpack__(stream=stream)
+            else:
+                with torch.cuda.stream(self.stream):
+                    capsule = self.value.__dlpack__(stream=stream)
+            self.capsules.append(capsule)
+            return capsule
+
+    class UsedAlias:
+        def __init__(self, capsule, device):
+            self.capsule = capsule
+            self.device = device
+
+        def __dlpack_device__(self):
+            return self.device
+
+        def __dlpack__(self, *, stream=None):
+            # A supplied stream cannot make this consumed real capsule's stale
+            # managed pointer legal to inspect again.
+            return self.capsule
+
+    def operands(row):
+        # POD byte carriers deliberately keep stored format metadata separate.
+        held = {}
+        for part in row["parts"]:
+            value = torch.frombuffer(
+                bytearray(base64.b64decode(part["bits"])), dtype=torch.uint8
+            )
+            held[part["role"]] = (
+                part["dtype"],
+                part["shape"],
+                Export(value.to("cuda")),
+            )
+        return held
+
+    def invoke(row, parts, out):
+        raw.decode_into(
+            row["encoding"]["scheme"],
+            parts,
+            out,
+            dtype=row["dtype"],
+            shape=row["shape"],
+            params=row["encoding"]["params"],
+        )
+
+    def bytes_of(value):
+        return value.view(torch.uint8).cpu().numpy().tobytes()
+
+    def claimed(parts, out):
+        exported = [value[2] for value in parts.values()] + [out]
+        assert all(len(value.capsules) == 1 for value in exported)
+        assert all(
+            helper._name(id(value.capsules[0])) == helper._used for value in exported
+        )
+
+    def stream_control(row):
+        source, previous = torch.cuda.Stream(), torch.cuda.Stream()
+        assert source.cuda_stream != previous.cuda_stream
+        ready = operands(row)
+        parts = {
+            role: (kind, shape, Export(torch.empty_like(value.value), source))
+            for role, (kind, shape, value) in ready.items()
+        }
+        out = Export(
+            torch.empty(row["shape"], dtype=dtype[row["dtype"]], device="cuda"),
+            previous,
+        )
+        torch.cuda.synchronize()
+        produced, prior = torch.cuda.Event(), torch.cuda.Event()
+        try:
+            with torch.cuda.stream(source):
+                torch.cuda._sleep(1_000_000_000)
+                for role, (_, _, value) in parts.items():
+                    value.value.copy_(ready[role][2].value)
+                produced.record()
+            with torch.cuda.stream(previous):
+                torch.cuda._sleep(1_000_000_000)
+                out.value.fill_(99)
+                prior.record()
+            assert not produced.query() and not prior.query()
+            invoke(row, parts, out)
+            # These checks happen AT RETURN, before rescue synchronization or a
+            # tensor read could mask a missing producer/output ordering contract.
+            assert produced.query() and prior.query()
+            claimed(parts, out)
+            assert bytes_of(out.value) == base64.b64decode(row["expect"])
+            return {
+                "producer_pending_before": True,
+                "output_pending_before": True,
+                "producer_complete_at_return": True,
+                "output_complete_at_return": True,
+                "source_stream": source.cuda_stream,
+                "output_stream": previous.cuda_stream,
+            }
+        finally:
+            source.synchronize()
+            previous.synchronize()
+
+    records, metadata_casts = [], set()
+    for row in positive:
+        parts = operands(row)
+        out = Export(
+            torch.empty(row["shape"], dtype=dtype[row["dtype"]], device="cuda")
+        )
+        invoke(row, parts, out)
+        claimed(parts, out)
+        assert bytes_of(out.value) == base64.b64decode(row["expect"]), row["key"]
+        metadata_casts.update(p["dtype"] for p in row["parts"] if p["role"] != "weight")
+        records.append(
+            {
+                "key": row["key"],
+                "result": "passed",
+                "kind": "golden",
+                "bytes": out.value.numel() * out.value.element_size(),
+            }
+        )
+    assert len(records) == 19 and {"F8_E4M3", "BF16", "F16"} <= metadata_casts
+    ordering = stream_control(positive[0])
+
+    for row in negative:
+        parts = operands(row)
+        out = Export(
+            torch.full(row["shape"], 99, dtype=dtype[row["dtype"]], device="cuda")
+        )
+        before = bytes_of(out.value)
+        refuses(
+            tensorfs.DecodeError,
+            lambda row=row, parts=parts, out=out: invoke(row, parts, out),
+        )
+        value_error = row["key"] == "s-rel-nan"
+        if value_error:
+            claimed(parts, out)
+            first = next(iter(parts))
+            kind, shape, producer = parts[first]
+            alias = UsedAlias(producer.capsules[0], producer.__dlpack_device__())
+            retry = {**parts, first: (kind, shape, alias)}
+            fresh = torch.empty(row["shape"], dtype=dtype[row["dtype"]], device="cuda")
+            refuses(
+                tensorfs.InvalidError,
+                lambda row=row, retry=retry, fresh=fresh: invoke(row, retry, fresh),
+            )
+        else:
+            assert not out.capsules and all(not p[2].capsules for p in parts.values())
+            assert bytes_of(out.value) == before
+        records.append(
+            {
+                "key": row["key"],
+                "result": "passed",
+                "kind": "expected-refusal",
+                "family": "decode",
+                "value_error_output_unspecified": value_error,
+            }
+        )
+
+    # A zero logical destination may still have a real, pending optional codebook.
+    # Bindings cleanup is asynchronous: checking the event right at RETURN proves
+    # Core's success contract, not eventual cleanup of an early return.
+    source, previous = torch.cuda.Stream(), torch.cuda.Stream()
+    codebook = torch.empty(16, dtype=torch.float32, device="cuda")
+    ready = torch.arange(16, dtype=torch.float32, device="cuda")
+    marker = torch.zeros(1, dtype=torch.uint8, device="cuda")
+    parts = {
+        "weight": (
+            "I8",
+            [0, 128],
+            Export(torch.empty((0, 128), dtype=torch.int8, device="cuda")),
+        ),
+        "weight_s_rel": (
+            "F32",
+            [0, 16],
+            Export(torch.empty((0, 16), dtype=torch.float32, device="cuda")),
+        ),
+        "weight_s_channel": (
+            "F32",
+            [0],
+            Export(torch.empty(0, dtype=torch.float32, device="cuda")),
+        ),
+        "weight_codebook": ("F32", [16], Export(codebook, source)),
+    }
+    out = Export(torch.empty((0, 256), dtype=torch.float32, device="cuda"), previous)
+    produced, prior = torch.cuda.Event(), torch.cuda.Event()
+    torch.cuda.synchronize()
+    try:
+        with torch.cuda.stream(source):
+            torch.cuda._sleep(1_000_000_000)
+            codebook.copy_(ready)
+            produced.record()
+        with torch.cuda.stream(previous):
+            torch.cuda._sleep(1_000_000_000)
+            marker.fill_(7)
+            prior.record()
+        assert not produced.query() and not prior.query()
+        raw.decode_into(
+            "comfy.asym_w4a8_int8",
+            parts,
+            out,
+            dtype="F32",
+            shape=[0, 256],
+            params={"group_size": 16, "rotation_size": 256},
+        )
+        assert produced.query() and prior.query(), (
+            "zero decode returned before its producers"
+        )
+        claimed(parts, out)
+        assert bytes_of(codebook) == struct.pack("<16f", *range(16))
+        assert marker.item() == 7 and bytes_of(out.value) == b""
+        records.append(
+            {
+                "key": "zero-output-pending-codebook",
+                "result": "passed",
+                "kind": "completion-control",
+                "producer_complete_at_return": True,
+                "output_complete_at_return": True,
+                "codebook_sha256": hashlib.sha256(bytes_of(codebook)).hexdigest(),
+            }
+        )
+    finally:
+        source.synchronize()
+        previous.synchronize()
+    assert len(records) == 34 and len({row["key"] for row in records}) == 34
+    print(
+        json.dumps(
+            {
+                "mode": "gpu",
+                "passed": 34,
+                "failed": 0,
+                "skipped": 0,
+                "original_positive": 18,
+                "derived_f16_positive": 1,
+                "expected_refusal": 14,
+                "completion_control": 1,
+                "cases": records,
+                "stream_control": ordering,
+                "metadata_cast_dtypes": sorted(metadata_casts),
+                "corpus_sha256": hashlib.sha256(corpus).hexdigest(),
+                "tensorfs_version": tensorfs.__version__,
+                "torch_version": torch.__version__,
+                "device_count": torch.cuda.device_count(),
+                "gpu_uuid": str(torch.cuda.get_device_properties(0).uuid),
+                "native_sha256": hashlib.sha256(
+                    Path(_ext.__file__).read_bytes()
+                ).hexdigest(),
+                "script_sha256": hashlib.sha256(
+                    Path(__file__).read_bytes()
+                ).hexdigest(),
+                "scope": "resident GPU decode corpus/refusals and checked producer/output ordering; no full model or unknown CUDA-fault injection",
+            },
+            sort_keys=True,
+        )
+    )
+
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="explicit opt-in; requires one allocated CUDA device",
+    )
+    parser.add_argument(
+        "--vectors",
+        type=Path,
+        help="exact unchanged Comfy conformance JSON, required with --gpu",
+    )
+    args = parser.parse_args()
+    if args.gpu:
+        if args.vectors is None:
+            parser.error("--gpu requires --vectors")
+        gpu_main(args.vectors)
+    else:
+        cpu_main()
