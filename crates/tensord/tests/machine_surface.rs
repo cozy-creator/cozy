@@ -1099,6 +1099,71 @@ mod v1_api {
         let _ = fs::remove_dir_all(tools);
     }
 
+    /// A long call's upload outlives the bearer its request carried: the owner's newer bearer,
+    /// pushed mid-call (`PUT /v1/bearer`), reaches its executor (`cmd: bearer`), and the stale
+    /// one is revoked at the Hub before the call uploads its weights output there.
+    #[tokio::test]
+    async fn a_calls_upload_presents_the_bearer_pushed_mid_call() {
+        let source = std::env::temp_dir().join(format!("cm-upload-{}", uuid::Uuid::new_v4()));
+        let store = tensorfs::store::Store::open(&source).unwrap();
+        let model = names_hub::Model {
+            repository: "acme/base".into(),
+            release: "1.0.0".into(),
+            lane: "bf16".into(),
+            header: names_hub::checkpoint(&store, &[1; 8192]),
+        };
+        let (origin, heard) = names_hub::serve(&store, model, None);
+        names_hub::admit(&origin, &["first"]);
+        let (machine, tools) = installing_machine().await;
+        let client = client(&machine);
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let manifest = write_package(&client, &all, "cpu_weights", "local/tensord-cpu-weights").await;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let bearer = |token: &str, expires_unix_ms| v1::TensorFSOptions {
+            endpoint: origin.clone(),
+            token: token.into(),
+            expires_unix_ms,
+            ..Default::default()
+        };
+        let job = v1::RunSpec {
+            kind: v1::RunKind::Call,
+            source: Some(v1::Source::Local(v1::LocalSource { manifest })),
+            entrypoint: "table".into(),
+            payload: v1::Json::parse(r#"{"size":64,"gate":"bearer-gate"}"#).ok(),
+            weights_destination: "acme/derived".into(),
+            hub: Some(v1::HubAccess { origin: origin.clone(), ..Default::default() }),
+            tensorfs: Some(bearer("first", now + 3_600_000)),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+        let running = tokio::spawn({
+            let (client, all) = (client.clone(), all.clone());
+            async move { settle(&client, &all, "upload-mid-call", job).await }
+        });
+        // The call has written its output and waits before uploading it.
+        let gate = machine.store().join("bearer-gate");
+        // Test harness bound on a call that never gets there; the product has no such limit.
+        let until = Instant::now() + Duration::from_secs(300);
+        while !gate.with_extension("reached").exists() {
+            assert!(Instant::now() < until && !running.is_finished(), "the call never reached its gate");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The newer bearer is valid before the old one is revoked, as a refreshed one is.
+        names_hub::admit(&origin, &["first", "second"]);
+        by(&client, &all).bearer(&bearer("second", now + 7_200_000)).await.unwrap();
+        names_hub::admit(&origin, &["second"]);
+        let revoked = heard.lock().unwrap().len();
+        fs::write(&gate, b"").unwrap();
+        let done = running.await.unwrap();
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let written = done.outputs.iter().find(|p| p.output == "model").and_then(|p| p.checkpoint.clone());
+        assert_eq!(written.map(|c| c.repo_id), Some("acme/derived".to_string()), "{done:?}");
+        let after: Vec<String> = heard.lock().unwrap()[revoked..].to_vec();
+        assert!(after.iter().any(|asked| asked.starts_with("PUT /refs/acme/derived.json") && asked.ends_with("+credential")), "{after:?}");
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(tools);
+    }
+
     /// A deviceless function (`accelerator=False`) runs on a pooled executor: its second call
     /// is served by the executor of its first, which paid the imports once.
     #[tokio::test]
@@ -1743,6 +1808,91 @@ mod v1_api {
         assert!(asked.iter().any(|heard| *heard == format!("GET /{} +credential", tree.key())), "{asked:?}");
         assert!(asked.iter().any(|heard| heard.starts_with("GET /o/")), "{asked:?}");
         assert!(asked.iter().all(|heard| !heard.starts_with("GET /o/") || !heard.ends_with("+credential")), "{asked:?}");
+        let _ = fs::remove_dir_all(source);
+    }
+
+    /// A run keeps reading its owner's checkpoints after its request's bearer is revoked: the newer
+    /// bearer pushed since (`PUT /v1/bearer`) is presented instead. A refused bearer with none newer
+    /// fails the read, naming when it expired.
+    #[tokio::test]
+    async fn a_pushed_bearer_outlives_the_requests_revoked_one() {
+        let source = std::env::temp_dir().join(format!("cm-bearer-{}", uuid::Uuid::new_v4()));
+        let store = tensorfs::store::Store::open(&source).unwrap();
+        let model = |repository: &str, weight: u8| names_hub::Model {
+            repository: repository.into(),
+            release: String::new(),
+            lane: "bf16".into(),
+            header: names_hub::checkpoint(&store, &[weight; 8192]),
+        };
+        let names = ["acme/first", "acme/second", "acme/third"];
+        let models = vec![model(names[0], 1), model(names[1], 2), model(names[2], 3)];
+        let trees = names_hub::trees(&store, &models);
+        // Storage answers each object after 2 s: the first model is still downloading when the
+        // bearer moves, and the run reads the second only after.
+        let (origin, heard) = names_hub::paced_models(&store, models, Duration::from_secs(2));
+        let machine = Machine::start().await;
+        let client = client(&machine);
+        let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let bearer = |token: &str, expires_unix_ms| v1::TensorFSOptions {
+            endpoint: origin.clone(),
+            token: token.into(),
+            expires_unix_ms,
+            ..Default::default()
+        };
+        let spec = |given: v1::TensorFSOptions, read: &[usize]| v1::RunSpec {
+            kind: v1::RunKind::Warm,
+            models: read.iter().map(|&at| v1::ModelChoice {
+                parameter: names[at].into(),
+                repository: names[at].into(),
+                manifest: trees[at].id(),
+                ..Default::default()
+            }).collect(),
+            hub: Some(v1::HubAccess { origin: origin.clone(), ..Default::default() }),
+            tensorfs: Some(given),
+            owner: "alice".into(),
+            ..Default::default()
+        };
+
+        names_hub::admit(&origin, &["first"]);
+        let stale = settle(&client, &all, "bearer-stale", spec(bearer("stale", 1_760_000_000_000), &[0])).await;
+        let reason = stale.reason.unwrap();
+        assert_eq!(reason.code, "hub_credential_refused");
+        assert!(reason.message.contains("the owner's bearer expired at 2025-10-09T08:53:20Z"), "{reason:?}");
+        let refused = by(&client, &all).bearer(&bearer("", now)).await.err().unwrap();
+        assert_eq!(refused.code(), Some("invalid_bearer"));
+        heard.lock().unwrap().clear();
+
+        let running = tokio::spawn({
+            let (client, all, spec) = (client.clone(), all.clone(), spec(bearer("first", now + 3_600_000), &[0, 1]));
+            async move { settle(&client, &all, "bearer-pushed", spec).await }
+        });
+        let first = format!("/{} +credential", trees[0].key());
+        // Test harness bound on a wedged download; the product has no such limit.
+        let until = Instant::now() + Duration::from_secs(60);
+        while !heard.lock().unwrap().iter().any(|asked| asked.ends_with(&first)) {
+            assert!(Instant::now() < until, "the run never read its first model");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The newer bearer is valid before the old one is revoked, as a refreshed one is.
+        names_hub::admit(&origin, &["first", "second"]);
+        by(&client, &all).bearer(&bearer("second", now + 7_200_000)).await.unwrap();
+        names_hub::admit(&origin, &["second"]);
+        let revoked = heard.lock().unwrap().len();
+        let done = running.await.unwrap();
+        assert_eq!(done.status, "succeeded", "{done:?}");
+        let after: Vec<String> = heard.lock().unwrap()[revoked..].to_vec();
+        let second = format!("/{} +credential", trees[1].key());
+        assert!(after.iter().any(|asked| asked.ends_with(&second)), "{after:?}");
+        assert!(after.iter().all(|asked| !asked.ends_with("+refused")), "{after:?}");
+
+        // A bearer that expires earlier never replaces the newest; once that is revoked too, a
+        // read fails naming when it expires.
+        names_hub::admit(&origin, &[]);
+        let done = settle(&client, &all, "bearer-revoked", spec(bearer("first", now + 3_600_000), &[2])).await;
+        let reason = done.reason.unwrap();
+        assert_eq!(reason.code, "hub_credential_refused", "{reason:?}");
+        assert!(reason.message.contains("the Hub refused the owner's bearer, which expires at"), "{reason:?}");
         let _ = fs::remove_dir_all(source);
     }
 

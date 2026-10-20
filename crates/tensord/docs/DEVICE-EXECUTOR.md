@@ -50,10 +50,18 @@ allocations, but that executor still needs its own model objects and CUDA contex
 - 4-byte big-endian length + JSON, any size. `seam::MAX_FRAME` (256 MiB, as Runtime's
   `seam.MAX_FRAME`) refuses only a corrupt or hostile prefix. Bulk data goes through the spool.
 - Any outgoing object key named `token`, `credential`, `authorization`, `secret` or `jwt` is
-  refused. Credentials cannot cross the seam.
+  refused, except `tensorfs.token` on `load`, `invoke` and `bearer`: the request's owner bearer.
 - Commands (`cmd`): `hello`, `start`, `load`, `activate`, `prepare_request`, `invoke`, `budget`,
   `unload`, `probe`, `shutdown`. The usual sequence is
   Hello -> Start -> Load -> Activate -> PrepareRequest -> Invoke.
+- `bearer` (`{"cmd":"bearer","actor","tensorfs":{"endpoint","token","expires_unix_ms"}}`) goes
+  outside any exchange, at any time (a `Line`, under the lock every write takes), and is
+  answered by nothing. TensorD sends it to each executor a Load or Invoke gave that signer's
+  token for that endpoint (the same string), whenever `hub::Bearer` holds a newer one. The
+  Runtime routes it as it reads it, like a cancel, and keeps per signer and endpoint the token
+  that expires latest (0: unknown, replaces); a call's TensorFS provider presents it per request
+  and asks once more after a 401 for a token replaced in flight. Load and Invoke name `actor`.
+  A Runtime without the handler answers `reply: bearer`, which TensorD ignores.
 - While waiting for a reply, `event=progress` frames go to `Services::progress`. `event=request`
   frames (optionally with an `SCM_RIGHTS` fd) go to `Services::request`. The reply must name the
   command, otherwise it is an error. Unknown events and fields are ignored.

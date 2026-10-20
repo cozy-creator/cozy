@@ -1,11 +1,18 @@
 //! Hub access (th-245). A run reads its Hub's package catalog anonymously, and its models through
-//! TensorFS's distribution `Endpoint` (`origin`) under the ordinary owner bearer its request
-//! carries, or anonymously without one.
+//! TensorFS's distribution `Endpoint` (`origin`) under its owner's newest ordinary bearer when its
+//! request carried one, or anonymously without one.
 use base64::Engine as _;
 use hub_client::Credential;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use crate::device_executor::{DeviceCommand, Line};
+use protocol::machine::TensorFSOptions;
+use tensorfs::{
+    err::{refuse, Code},
+    fetch::token::{HeaderMap, Request, TokenProvider},
+};
 
 pub use hub_client::types;
 
@@ -148,30 +155,118 @@ fn pooled(pool: &Pool, ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal
     Ok(client)
 }
 
-/// Where a run reads a Hub, and the ordinary owner bearer its request carries there, if any:
-/// in memory only, gone with the request. Without one, reads are anonymous (released content).
+/// One signer's newest ordinary bearer at one Hub: every read under its owner's access presents
+/// the one held when it is sent, and each executor given it for a request hears of each newer
+/// one (`DeviceCommand::Bearer`). In memory only, for the life of the process.
+pub struct Bearer {
+    actor: String,
+    held: Mutex<(String, i64)>,
+    /// The executors given it, each with the endpoint its requests named.
+    lines: Mutex<Vec<(Line, String)>>,
+}
+
+impl Bearer {
+    /// `actor`'s at `origin`, offered `token` (until `expires_unix_ms`; 0: unknown), which it
+    /// keeps unless the one it holds expires later. None without a token or a Hub origin.
+    pub fn offer(actor: &str, origin: &str, token: &str, expires_unix_ms: i64) -> Option<Arc<Bearer>> {
+        static HELD: Mutex<BTreeMap<(String, String), Arc<Bearer>>> = Mutex::new(BTreeMap::new());
+        let key = (actor.to_string(), origin_key(origin).filter(|_| !token.is_empty())?);
+        let bearer = HELD.lock().unwrap().entry(key).or_insert_with(|| Arc::new(Bearer {
+            actor: actor.into(), held: Mutex::default(), lines: Mutex::default(),
+        })).clone();
+        let mut held = bearer.held.lock().unwrap();
+        let newer = (expires_unix_ms == 0 || expires_unix_ms >= held.1) && held.0 != token;
+        if newer {
+            *held = (token.to_string(), expires_unix_ms);
+        }
+        drop(held);
+        if newer {
+            bearer.forward();
+        }
+        Some(bearer)
+    }
+
+    /// The token held now, and when it expires.
+    pub fn held(&self) -> (String, i64) {
+        self.held.lock().unwrap().clone()
+    }
+
+    /// The token held now for a request `line`'s executor serves at `endpoint`, which hears of
+    /// each newer one from now on.
+    pub fn given(&self, line: Line, endpoint: &str) -> (String, i64) {
+        let mut lines = self.lines.lock().unwrap();
+        if !lines.iter().any(|(given, at)| given.same(&line) && at == endpoint) {
+            lines.push((line, endpoint.to_string()));
+        }
+        self.held()
+    }
+
+    /// Each executor given it hears of the token held now; a gone one is forgotten.
+    fn forward(&self) {
+        let (token, expires_unix_ms) = self.held();
+        self.lines.lock().unwrap().retain(|(line, endpoint)| {
+            line.send(&DeviceCommand::Bearer {
+                actor: self.actor.clone(),
+                tensorfs: TensorFSOptions { endpoint: endpoint.clone(), token: token.clone(), expires_unix_ms, ..Default::default() },
+            })
+        });
+    }
+}
+
+/// `unix_ms` as UTC, to the second.
+fn utc(unix_ms: i64) -> String {
+    match time::OffsetDateTime::from_unix_timestamp(unix_ms / 1000) {
+        Ok(t) => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", t.year(), t.month() as u8, t.day(), t.hour(), t.minute(), t.second()),
+        Err(_) => format!("unix {unix_ms} ms"),
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenProvider for Bearer {
+    async fn headers(&self, _: &Request<'_>) -> tensorfs::err::Result<Vec<(String, String)>> {
+        Ok(vec![("authorization".into(), format!("Bearer {}", self.held().0))])
+    }
+
+    /// A refused bearer that a newer one replaced since is asked once more with that; the newest
+    /// refused fails the read, naming when it expires.
+    fn retry(&self, sent: &Request<'_>, status: u16, _: &HeaderMap) -> tensorfs::err::Result<bool> {
+        if status != 401 {
+            return Ok(false);
+        }
+        let (token, expires) = self.held();
+        let presented = format!("Bearer {token}");
+        if !sent.headers.iter().any(|(name, value)| name.eq_ignore_ascii_case("authorization") && *value == presented) {
+            return Ok(true);
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+        refuse(Code::CREDENTIAL_REQUIRED, match expires {
+            0 => "the Hub refused the owner's bearer".to_string(),
+            at if at <= now => format!("the owner's bearer expired at {}", utc(at)),
+            at => format!("the Hub refused the owner's bearer, which expires at {}", utc(at)),
+        })
+    }
+}
+
+/// Where a run reads a Hub, and its owner's bearer there when its request carried one.
 #[derive(Clone)]
 pub struct Source {
     pub origin: String,
     pub ca_der: Option<Vec<u8>>,
-    pub token: Option<String>,
+    pub bearer: Option<Arc<Bearer>>,
 }
 
 impl Source {
-    pub fn new(origin: &str, ca_der: Option<Vec<u8>>, token: Option<String>) -> Result<Self, Refusal> {
+    pub fn new(origin: &str, ca_der: Option<Vec<u8>>, bearer: Option<Arc<Bearer>>) -> Result<Self, Refusal> {
         if !valid_origin(origin) {
             return Err(Refusal(format!("{origin} is not an HTTPS origin")));
         }
-        Ok(Self {
-            origin: origin.trim_end_matches('/').to_string(),
-            ca_der,
-            token: token.filter(|token| !token.is_empty()),
-        })
+        Ok(Self { origin: origin.trim_end_matches('/').to_string(), ca_der, bearer })
     }
 
-    /// The same Hub without the request's bearer: what outlives the request.
-    pub fn anonymous(&self) -> Self {
-        Self { token: None, ..self.clone() }
+    /// Its bearer, for `endpoint` only when that is this Hub.
+    pub fn bearer_at(&self, endpoint: &str) -> Option<Arc<Bearer>> {
+        let here = origin_key(endpoint).is_some_and(|key| origin_key(&self.origin) == Some(key));
+        self.bearer.clone().filter(|_| here)
     }
 }
 
@@ -226,14 +321,23 @@ impl Catalog {
 mod tests {
     use super::*;
 
+    /// One bearer per signer and Hub: the one that expires latest, never shown in a Source.
     #[test]
-    fn a_source_carries_a_bearer_only_while_its_request_does() {
-        let source = Source::new("https://hub.example/", None, Some("owner".into())).unwrap();
-        assert_eq!((source.origin.as_str(), source.token.as_deref()), ("https://hub.example", Some("owner")));
-        assert_eq!(source.anonymous().token, None);
-        assert_eq!(Source::new("https://hub.example", None, Some(String::new())).unwrap().token, None);
-        assert!(!format!("{source:?}").contains("owner"));
+    fn a_signer_keeps_its_newest_bearer_per_hub() {
+        let offer = |actor, origin, token, expires| Bearer::offer(actor, origin, token, expires).map(|b| b.held());
+        assert_eq!(offer("a", "https://hub.example/", "first", 2), Some(("first".into(), 2)));
+        assert_eq!(offer("a", "HTTPS://hub.example:443", "older", 1), Some(("first".into(), 2)));
+        assert_eq!(offer("a", "https://hub.example", "newer", 3), Some(("newer".into(), 3)));
+        assert_eq!(offer("b", "https://hub.example", "other", 1), Some(("other".into(), 1)));
+        assert_eq!(offer("a", "https://hub.example", "", 4), None);
+        let bearer = Bearer::offer("a", "https://hub.example", "newer", 3);
+        let source = Source::new("https://hub.example/", None, bearer).unwrap();
+        assert_eq!(source.origin, "https://hub.example");
+        assert!(source.bearer_at("https://hub.example:443").is_some());
+        assert!(source.bearer_at("https://other.example").is_none());
+        assert!(!format!("{source:?}").contains("newer"));
         assert!(Source::new("http://hub.example", None, None).is_err());
+        assert_eq!(utc(1_792_480_500_000), "2026-10-20T07:15:00Z");
     }
 
     #[test]

@@ -1,12 +1,12 @@
 //! A model at a Hub: TensorFS's distribution `Endpoint` at the Hub's origin, presenting the
-//! request's ordinary owner bearer when it carries one (the owner's unreleased trees), else
-//! anonymous (released content). A release names a tree; a lane is a variant in it. Every Hub
+//! owner's newest ordinary bearer when the request carried one (the owner's unreleased trees),
+//! else anonymous (released content). A release names a tree; a lane is a variant in it. Every Hub
 //! call runs on the fetch runtime.
 use std::sync::Arc;
 
 use tensorfs::{
     err::{refuse, Code, Result},
-    fetch::{bearer, release_of, Endpoint},
+    fetch::{release_of, Endpoint, TokenProvider},
     format::ObjectRef,
 };
 
@@ -19,8 +19,8 @@ fn endpoint(machine: &Machine, source: &hub::Source) -> Result<(Endpoint, Key)> 
     let trust = source.ca_der.as_deref().map(|der| Arc::new(hub::pem(der).into_bytes()));
     let local = hub::origin_key(&source.origin).is_some_and(|key| loopback(&key));
     let client = machine.client(trust.as_ref(), local)?;
-    let endpoint = match &source.token {
-        Some(token) => Endpoint::new(&client, &source.origin, Some(bearer(token.clone())))?,
+    let endpoint = match &source.bearer {
+        Some(bearer) => Endpoint::new(&client, &source.origin, Some(bearer.clone() as Arc<dyn TokenProvider>))?,
         None => Endpoint::new(&client, &source.origin, None)?.anonymous(),
     };
     Ok((endpoint, (trust, local)))

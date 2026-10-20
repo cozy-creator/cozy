@@ -1593,8 +1593,8 @@ fn make_source(
 fn refused(code: &'static str, refusal: tensorfs::err::Refusal) -> Failure {
     match refusal.code {
         tensorfs::err::Code::CAPACITY_EXHAUSTED => ("machine_disk_full", refusal.to_string()),
-        // The request's bearer was refused (expired, revoked); without one a private object is absent.
-        tensorfs::err::Code::CREDENTIAL_REQUIRED => ("hub_credential_refused", refusal.to_string()),
+        // The owner's bearer was refused (expired, revoked); without one a private object is absent.
+        tensorfs::err::Code::CREDENTIAL_REQUIRED => ("hub_credential_refused", refusal.detail),
         _ => (code, refusal.to_string()),
     }
 }

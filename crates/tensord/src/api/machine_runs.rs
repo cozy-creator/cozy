@@ -484,25 +484,27 @@ impl Log {
 }
 
 /// Accepts a run, or answers the one a re-sent spec already names (false). The run reads its
-/// Hub's public content anonymously, and private content under its request's bearer.
+/// Hub's public content anonymously, and private content under its owner's newest bearer, which
+/// a re-sent spec's renews too.
 fn accept(runs: &Arc<crate::runs::Runs>, actor: &str, id: &str, spec: crate::runs::Spec, hub: Option<v1::HubAccess>) -> Result<bool, Error> {
+    let spec = reach(actor, spec, hub)?;
     if runs.existing(actor, id, &spec.digest)?.is_some() {
         return Ok(false);
     }
-    runs.submit(actor, id, reach(spec, hub)?)?;
+    runs.submit(actor, id, spec)?;
     Ok(true)
 }
 
-/// `spec` reading `hub`, under the ordinary bearer its TensorFS options carry for that origin
-/// (a token goes only to the origin it was given for).
-fn reach(mut spec: crate::runs::Spec, hub: Option<v1::HubAccess>) -> Result<crate::runs::Spec, Error> {
+/// `spec` reading `hub`, under `actor`'s newest bearer there when its TensorFS options carry one
+/// for that origin (a token goes only to the origin it was given for).
+fn reach(actor: &str, mut spec: crate::runs::Spec, hub: Option<v1::HubAccess>) -> Result<crate::runs::Spec, Error> {
     if let Some(hub) = hub {
         let origin = crate::hub::origin_key(&hub.origin);
-        let token = (spec.tensorfs.as_ref())
+        let bearer = (spec.tensorfs.as_ref())
             .filter(|options| origin.is_some() && crate::hub::origin_key(&options.endpoint) == origin)
-            .map(|options| options.token.clone());
+            .and_then(|options| crate::hub::Bearer::offer(actor, &hub.origin, &options.token, options.expires_unix_ms));
         let ca = Some(hub.ca_der).filter(|der| !der.is_empty());
-        let source = crate::hub::Source::new(&hub.origin, ca, token).map_err(|e| refused("hub_access_invalid", &e.0))?;
+        let source = crate::hub::Source::new(&hub.origin, ca, bearer).map_err(|e| refused("hub_access_invalid", &e.0))?;
         spec.hub = Some(source);
     }
     Ok(spec)
@@ -515,7 +517,7 @@ pub(crate) fn resume(runs: &Arc<crate::runs::Runs>) -> std::io::Result<()> {
         let spec = serde_json::from_slice(&sent)
             .map_err(|e| refused("preparation_interrupted", format!("its kept spec is unreadable: {e}")))
             .and_then(spec_of)
-            .and_then(|(spec, hub)| reach(spec, hub));
+            .and_then(|(spec, hub)| reach(&actor, spec, hub));
         let failure = match spec {
             Ok(spec) => {
                 runs.prepare_later(&actor, &run, spec)?;
@@ -729,6 +731,7 @@ mod tests {
             endpoint: "https://tensorfs.example.test/".into(),
             token: "ordinary-supplied-token".into(),
             ca_der: vec![1, 2, 3],
+            ..Default::default()
         });
         assert!(!format!("{sent:?}").contains("ordinary-supplied-token"));
         let first = spec_of(sent.clone()).unwrap().0;
@@ -752,6 +755,7 @@ mod tests {
             endpoint: "https://hub.example.test".into(),
             token: "ordinary-first".into(),
             ca_der: vec![2],
+            ..Default::default()
         });
         let forwarded = spec_of(resent.clone()).unwrap().0;
         assert_eq!(forwarded.digest, old);
@@ -760,6 +764,7 @@ mod tests {
             endpoint: "https://hub.example.test/".into(),
             token: "ordinary-replacement".into(),
             ca_der: vec![3],
+            ..Default::default()
         });
         let rotated = spec_of(resent.clone()).unwrap().0;
         assert_eq!(rotated.digest, old);
@@ -812,6 +817,7 @@ mod tests {
             endpoint: "https://hub.example.test".into(),
             token: "ordinary-replacement".into(),
             ca_der: vec![4],
+            ..Default::default()
         });
         let replayed = runs
             .submit("alice", "lost-ack", spec_of(resent.clone()).unwrap().0)
@@ -861,7 +867,7 @@ mod tests {
             let mut sent = authored();
             sent.tensorfs = Some(v1::TensorFSOptions { endpoint: endpoint.into(), token: "owner".into(), ..Default::default() });
             let (spec, hub) = spec_of(sent).unwrap();
-            reach(spec, hub).unwrap().hub.unwrap().token
+            reach("origin-test", spec, hub).unwrap().hub.unwrap().bearer.map(|bearer| bearer.held().0)
         };
         assert_eq!(read("https://HUB.example.test:443"), Some("owner".into()));
         assert_eq!(read("https://other.example.test"), None);

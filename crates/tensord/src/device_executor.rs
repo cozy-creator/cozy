@@ -195,6 +195,9 @@ pub enum DeviceCommand {
     Load {
         #[serde(skip_serializing_if = "Option::is_none")]
         tensorfs: Option<protocol::machine::TensorFSOptions>,
+        /// The request's signer: the Runtime keeps its bearer per signer and endpoint.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        actor: String,
         construction: String,
         devices: String,
         sequence_parallel_degree: u32,
@@ -311,6 +314,12 @@ pub enum DeviceCommand {
         root: PathBuf,
         environment: BTreeMap<String, String>,
     },
+    /// `actor`'s newest bearer at `tensorfs.endpoint`, sent outside any exchange (`Line`) and
+    /// answered by nothing: the executor's reads and uploads there present it from now on.
+    Bearer {
+        actor: String,
+        tensorfs: protocol::machine::TensorFSOptions,
+    },
 }
 
 /// One constructed model slot of a session: its checkpoint and the components it uses.
@@ -361,6 +370,7 @@ impl DeviceCommand {
             Self::Unload { .. } => "unload",
             Self::Probe { .. } => "probe",
             Self::Fork { .. } => "fork",
+            Self::Bearer { .. } => "bearer",
         }
     }
 }
@@ -850,7 +860,9 @@ pub struct DeviceExecutor {
     /// Forked from an import-only executor (`fork/1`), which is its parent and reaps it.
     forked: bool,
     exact: Exact,
+    /// Read here; written only through `writer`, which a `Line` shares.
     stream: LocalStream,
+    writer: Arc<Mutex<LocalStream>>,
     pub birth: Birth,
     pub hello: Hello,
     /// Sampling resolution of the wedge rule. Tests shorten it; nothing else changes it.
@@ -872,6 +884,24 @@ pub struct DeviceExecutor {
     /// Where its stderr stood when the request it serves began.
     log_from: u64,
     memo: Option<Arc<crate::memo::Memo>>,
+}
+
+/// The executor's seam for frames sent outside any command's exchange, under the lock every
+/// command and answer is written with. Gone with the executor.
+#[derive(Clone)]
+pub struct Line(std::sync::Weak<Mutex<LocalStream>>);
+impl Line {
+    /// Sends `command`, answered by nothing; false once the executor is gone.
+    pub fn send(&self, command: &DeviceCommand) -> bool {
+        let Some(writer) = self.0.upgrade() else {
+            return false;
+        };
+        let mut stream = writer.lock().unwrap();
+        write_command(&mut stream, command, &Group::default(), false).is_ok()
+    }
+    pub fn same(&self, other: &Line) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
 }
 
 /// Cooperative first: the executor stops at its next safe point. The running invocation's
@@ -1662,6 +1692,7 @@ impl DeviceExecutor {
             child: None,
             forked: unready.child.is_none(),
             exact,
+            writer: Arc::new(Mutex::new(stream.try_clone()?)),
             stream,
             birth,
             hello: Hello::default(),
@@ -1725,6 +1756,9 @@ impl DeviceExecutor {
     /// much as its triage bundle keeps.
     pub fn stderr_tail(&self) -> String {
         crate::process::tail_from(&self.root.join("stderr.log"), self.log_from, crate::triage::MAX_STDERR)
+    }
+    pub fn line(&self) -> Line {
+        Line(Arc::downgrade(&self.writer))
     }
     pub fn cancellation(&self) -> Cancellation {
         Cancellation {
@@ -1818,10 +1852,15 @@ impl DeviceExecutor {
         services: &mut impl Services,
         watch: &Watch,
     ) -> io::Result<Frame> {
-        write_command(&mut self.stream, command, group, self.memo.is_some())?;
-        for grant in grants {
-            for fd in [&grant.table, &grant.events, &grant.channel] {
-                platform::handles::send_fd(&self.stream, fd)?;
+        {
+            // The command and every grant are one wire unit: a refreshed bearer must
+            // never land between a command and its SCM_RIGHTS descriptors.
+            let mut writer = self.writer.lock().unwrap();
+            write_command(&mut writer, command, group, self.memo.is_some())?;
+            for grant in grants {
+                for fd in [&grant.table, &grant.events, &grant.channel] {
+                    platform::handles::send_fd(&writer, fd)?;
+                }
             }
         }
         loop {
@@ -1832,14 +1871,14 @@ impl DeviceExecutor {
             watch.frame();
             match frame.event {
                 Some(Event::Request) if !frame.malformed.is_empty() => {
-                    refuse_malformed(&mut self.stream, &frame)?
+                    refuse_malformed(&mut self.writer.lock().unwrap(), &frame)?
                 }
                 Some(Event::Progress) if !frame.malformed.is_empty() => (),
                 Some(Event::Progress) => services.progress(&frame),
                 Some(Event::Request) if frame.descriptors > 0 => {
                     if frame.descriptors > MAX_REQUEST_FDS { return Err(io::Error::other("request names too many descriptors")); }
                     for _ in 0..frame.descriptors { drop(platform::handles::recv_fd(&self.stream)?); }
-                    write_frame(&mut self.stream, &Answer::refused(frame.seq,"unsupported_descriptors","this operation does not accept multiple descriptors"))?;
+                    write_frame(&mut self.writer.lock().unwrap(), &Answer::refused(frame.seq,"unsupported_descriptors","this operation does not accept multiple descriptors"))?;
                 }
                 Some(Event::Request)
                     if matches!(frame.kind, Kind::StageMemoLookup | Kind::StageMemoStore) =>
@@ -1851,7 +1890,7 @@ impl DeviceExecutor {
                         _ => Answer::unavailable(frame.seq),
                     };
                     watch.serving(false);
-                    write_frame(&mut self.stream, &answer)?;
+                    write_frame(&mut self.writer.lock().unwrap(), &answer)?;
                 }
                 Some(Event::Request) => {
                     // The machine's own answer time is not the executor's stillness.
@@ -1862,6 +1901,8 @@ impl DeviceExecutor {
                 }
                 Some(Event::Unknown) => (),
                 None if frame.reply == command.name() => return Ok(frame),
+                // A Runtime without the `bearer` handler refuses it as a command.
+                None if frame.reply == "bearer" => (),
                 None => return Err(io::Error::other("out-of-order stock executor reply")),
             }
         }
@@ -1877,9 +1918,10 @@ impl DeviceExecutor {
         answer.event = "answer";
         answer.seq = frame.seq;
         answer.descriptor = descriptor.is_some();
-        write_frame(&mut self.stream, &answer)?;
+        let mut writer = self.writer.lock().unwrap();
+        write_frame(&mut writer, &answer)?;
         if let Some(descriptor) = descriptor {
-            platform::handles::send_fd(&self.stream, &descriptor)?;
+            platform::handles::send_fd(&writer, &descriptor)?;
         }
         Ok(())
     }
@@ -2085,7 +2127,8 @@ fn write_command(stream: &mut LocalStream, command: &DeviceCommand, group: &Grou
     // Only this typed field may carry supplied access. Validate everything else; the original
     // wire bytes above still contain the token, and arbitrary JSON never grants this exception.
     if let (true, Some(options)) = (
-        matches!(command, DeviceCommand::Load { tensorfs: Some(_), .. } | DeviceCommand::Invoke { tensorfs: Some(_), .. }),
+        matches!(command, DeviceCommand::Load { tensorfs: Some(_), .. } | DeviceCommand::Invoke { tensorfs: Some(_), .. }
+            | DeviceCommand::Bearer { .. }),
         value.get_mut("tensorfs").and_then(Value::as_object_mut),
     ) {
         options.remove("token");
@@ -2183,13 +2226,13 @@ mod codec_tests {
     fn ordinary_options() -> protocol::machine::TensorFSOptions {
         protocol::machine::TensorFSOptions {
             endpoint: "https://ordinary.example.test".into(), token: "supplied-test-bearer".into(),
-            ca_der: vec![1, 2, 3],
+            ca_der: vec![1, 2, 3], ..Default::default()
         }
     }
 
     fn ordinary_load() -> DeviceCommand {
         DeviceCommand::Load {
-            tensorfs: Some(ordinary_options()), construction: "construction".into(), devices: String::new(),
+            tensorfs: Some(ordinary_options()), actor: String::new(), construction: "construction".into(), devices: String::new(),
             sequence_parallel_degree: 1, binding: Box::default(), budgets: Budgets::default(), models: vec![],
             authorized_device_limit_bytes: None, attention_pin: String::new(),
             pinned_bytes: None, device_weights: false, cap_bytes: None,
@@ -2219,7 +2262,8 @@ mod codec_tests {
     #[test]
     fn ordinary_tensorfs_tokens_cross_the_actual_typed_command_writer_unchanged() {
         let group = Group { rank_caps: vec![17], ..Default::default() };
-        for command in [ordinary_load(), ordinary_invoke()] {
+        let bearer = DeviceCommand::Bearer { actor: "signer".into(), tensorfs: ordinary_options() };
+        for command in [ordinary_load(), ordinary_invoke(), bearer] {
             let mut expected = serde_json::to_value(&command).unwrap();
             expected.as_object_mut().unwrap().extend(serde_json::to_value(&group).unwrap().as_object().unwrap().clone());
             let (mut machine, mut runtime) = platform::ipc::pair().unwrap();
