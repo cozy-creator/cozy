@@ -9,7 +9,7 @@ objects are as in [cozytensors.md](cozytensors.md). The key words are as in RFC 
 An endpoint is a base URL `B`. It has two resources, and nothing lists either:
 
 ```text
-B/refs/<org>/<name>.json        the repo document (tensorfs.repo/1)
+B/refs/<org>/<name>.json        the repo document (cozytensors.repo/1)
 B/blobs/<aa>/<bb>/<sha256>      an object: a tree, a cozytensors header, a chunk, an asset or a repo file
 ```
 
@@ -72,10 +72,9 @@ PUT  B/refs/<org>/<name>.json   If-Match: <etag> | If-None-Match: *
   that gets `412` reads it again: when it equals what was sent, the write succeeded.
 - A model is deleted by a document with no releases and no checkpoints. There is no DELETE.
 - A server checks:
-  - the body is a canonical `tensorfs.repo/1` document (cozytensors.md §9) whose `name` folds to the path;
+  - the body is a canonical `cozytensors.repo/1` document (cozytensors.md §9) whose `name` folds to the path;
   - every tree it cites has its closure present and readable by the writer, else `409 closure_incomplete` with up to
     1,000 missing digests in `detail.missing`;
-  - a release that changed has `revision` = old + 1, an unchanged one keeps it, and a new one starts at 0;
   - anything else is the server's policy: `409 policy`, `detail.reason` naming the server's own code.
 
 ## 5. Authorization

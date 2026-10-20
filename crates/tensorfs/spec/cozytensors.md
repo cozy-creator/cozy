@@ -20,7 +20,8 @@ Everything required to locate and decode a tensor is in its header and this spec
 depend on a repository name, release label, filename, Python package or particular model engine.
 
 The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119. §1–§8 define meaning; §9 defines the byte encoding
-of documents; §10 is informative writer guidance. Appendix A holds the schemes' fixed tables.
+of documents; §10 is informative writer guidance; §11 defines a checkpoint's logical file. Appendix A holds the
+schemes' fixed tables.
 
 ## 1. Objects
 
@@ -48,9 +49,9 @@ spelling. A reader also accepts `<kind>/1.<minor>`, the minor one or more decima
 
 | Document | `format` kind | Encoding (§9) | Usual name |
 |---|---|---|---|
-| tree | `tensorfs.tree` | JSON object | an object, cited by a repo |
+| tree | `cozytensors.tree` | JSON object | an object, cited by a repo |
 | header | `cozytensors` | CBOR array | the tree file `model.<variant>.cozytensors` |
-| repo | `tensorfs.repo` | JSON object | `refs/<org>/<name>.json` |
+| repo | `cozytensors.repo` | JSON object | `refs/<org>/<name>.json` |
 
 The schemas describe structure; they do not replace the rules below for canonical encoding, duplicate keys,
 value domains, arithmetic bounds and reference closure.
@@ -69,7 +70,7 @@ or more segments joined by `/`.
 ## 3. Tree
 
 ```
-{format: "tensorfs.tree/1", files: {path: object-ref}}
+{format: "cozytensors.tree/1", files: {path: object-ref}}
 ```
 
 - Every key of `files` MUST be a path whose first segment is not `chunks` (a plain folder's chunk directory).
@@ -229,11 +230,9 @@ is `producer.type` with the producer's type name verbatim (`gguf.q4_k`, `gptq.in
 `bnb.nf4`), and a vendor-neutral standard keeps its bare name (`mxfp4`, `mxfp8`, `nvfp4`).
 
 **Params** are snake_case keys in the producer's vocabulary (`axis`, `block_size`, `rotation`, `rotation_size`,
-`global_scale`, `nibble_order`, `scale_layout`, `scale_dtype`). Every param the decode reads is required and none has a
-default, so the encoding shows the whole recipe. Only schemes whose parameter lists include `scale_dtype` carry
-that parameter: `F32`, `BF16` or `F16` (and `F8_E8M0` for `fp8.blockwise`), as specified by that scheme. Where a
-parameter repeats a part's dtype, a reader MUST refuse a mismatch. Otherwise the scheme's allowed part dtypes
-apply directly; readers MUST NOT require an undeclared `scale_dtype` parameter.
+`global_scale`, `nibble_order`, `scale_layout`). Every param the decode reads is required and none has a default, so
+the encoding shows the whole recipe. A param never repeats a part's dtype: each part carries its own (§4), the
+scheme lists the dtypes it allows, and the part's dtype is the one the decode reads.
 
 **Four rules** bring any format in without new grammar:
 1. *Keep the producer's bytes.* Parts are the producer's packed bytes (int words, nibbles, block structs, swizzled
@@ -333,16 +332,16 @@ the framework's key and shape. `mxfp4` has the param.
 
 ### `fp8.tensorwise`
 
-- Params: `scale_dtype`.
-- Parts: `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `scale_dtype`, one element. `input_scale`
-  (optional).
+- Params: none.
+- Parts: `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F32`, `BF16` or `F16`, one element.
+  `input_scale` (optional).
 - Decode, any shape: `round_L(weight × scale)`.
 
 ### `fp8.rowwise`
 
-- Params: `axis`: `0` or `1`; `scale_dtype`.
-- Parts: `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `scale_dtype`, on the row grid (`axis: 0`) or
-  the column grid (`axis: 1`).
+- Params: `axis`: `0` or `1`.
+- Parts: `weight`: `F8_E4M3` or `F8_E5M2`, the logical shape. `scale`: `F32`, `BF16` or `F16`, on the row grid
+  (`axis: 0`) or the column grid (`axis: 1`).
 - Decode: `round_L(weight[i, j] × s(i, j))`.
 
 ### `int8.tensorwise`
@@ -355,9 +354,9 @@ the framework's key and shape. `mxfp4` has the param.
 
 ### `int8.convrot`
 
-- Params: `rotation: "kron_regular_h4"`; `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8` (256 in practice);
-  `scale_dtype`.
-- Parts: `weight`: `I8`, the logical shape; `C` MUST be a multiple of `B`. `scale`: `scale_dtype`, on the row grid.
+- Params: `rotation: "kron_regular_h4"`; `rotation_size: B`, `B = 4^k`, `1 ≤ k ≤ 8` (256 in practice).
+- Parts: `weight`: `I8`, the logical shape; `C` MUST be a multiple of `B`. `scale`: `F32`, `BF16` or `F16`, on the row
+  grid.
 - Decode: `value[i, gB + j] = round_L((y[i, g, j] × scale[i]) × 2^−k)`, with
   `y[i, g, ·] = weight[i, gB : gB + B] · H_B`.
 
@@ -382,12 +381,11 @@ may be short).
 NVIDIA's NVFP4: an E2M1 element per weight, an E4M3 scale per 16 consecutive elements of a row, a global scale per
 matrix, and optionally AWQ's per-column factor.
 - Params: `block_size: 16`; `global_scale`: `multiply` or `divide`; `nibble_order`: `low_first` or `high_first`;
-  `scale_layout`: `row_major` or `cublas_128x4`; `pre_quant_scale_dtype`: `F32`, `BF16` or `F16`, present exactly
-  when the `pre_quant_scale` part is.
+  `scale_layout`: `row_major` or `cublas_128x4`.
 - Parts: `weight`: `F4`, the logical shape, `C` a multiple of 16; its bytes are 4-bit codes packed `word`-fill in `U8`
   words along the last axis, `nibble_order` being the order (`low_first` is §5's `F4` packing). `scale`: `F8_E4M3` on
   row blocks of 16, stored `scale_layout`. `scale_2`: `F32`, one element, or `M` elements, one per matrix of the
-  logical shape `[…stack, N, C]` (`M = R/N`; any shape). `pre_quant_scale` (optional): `pre_quant_scale_dtype` on the
+  logical shape `[…stack, N, C]` (`M = R/N`; any shape). `pre_quant_scale` (optional): `F32`, `BF16` or `F16` on the
   column grid. `input_scale` (optional): one element or `M`.
 - Decode, with `T` the 16 E2M1 values (§5), `g` the element of `scale_2` for row `i` (its only one, or element
   `⌊i/N⌋`) and `p` the factor `pre_quant_scale[j]`: `multiply`: `round_L(((T[q] × s(i, j)) × g) × p)`; `divide`:
@@ -414,9 +412,9 @@ export (`[E, C/2, N]`, blocks along the second-to-last axis) is not this scheme.
 
 FP8 elements and one scale per tile of each matrix (DeepSeek-V3 and later, Qwen3-FP8, Kimi-K2, MiniMax-M2, GLM-5-FP8;
 compressed-tensors' block strategy).
-- Params: `block_size: [Bᵣ, B_c]`, two positive integers (`[128, 128]` in practice); `scale_dtype`: `F32`, `BF16`,
-  `F16` or `F8_E8M0`, as the producer stored the scale.
-- Parts: `weight`: `F8_E4M3`, the logical shape. `scale`: `scale_dtype`, on tiles of `Bᵣ × B_c`.
+- Params: `block_size: [Bᵣ, B_c]`, two positive integers (`[128, 128]` in practice).
+- Parts: `weight`: `F8_E4M3`, the logical shape. `scale`: `F32`, `BF16`, `F16` or `F8_E8M0`, as the producer stored
+  it, on tiles of `Bᵣ × B_c`.
 - Decode: `round_L(weight[i, j] × s(i, j))`.
 
 The scale multiplies. DeepSeek's and transformers' `weight_scale_inv` (the inverse of the factor the weight was
@@ -632,15 +630,15 @@ or source-tree layout.
 ## 7. Repo, store and origin
 
 ```
-{format: "tensorfs.repo/1", name: "<org>/<name>",
- releases: [{version, tree: object-ref, yanked?, revision?}], checkpoints?: [object-ref]}
+{format: "cozytensors.repo/1", name: "<org>/<name>",
+ releases: [{version, tree: object-ref, yanked?}], checkpoints?: [object-ref]}
 ```
 
 - `name` is two segments. Versions MUST be non-empty and unique. Each release names a tree (§3); its variants are
   the tree's files. Releases are listed in publication order, newest last.
-- `yanked` (boolean, default `false`) withdraws a release from unversioned lookups. `revision` (non-negative integer,
-  default 0) is the release's expected-revision counter: every change to the release increments it, and a writer
-  that changes a release conditions the change on the revision it read.
+- `yanked` (boolean, default `false`) withdraws a release from unversioned lookups. A release carries no edit
+  counter: a writer conditions a change on the whole document it read (its ETag, [distribution.md](distribution.md)
+  §4).
 - `checkpoints` (default empty) lists trees uploaded but not yet in any release.
 - **Resolution.** An unversioned lookup takes the newest release that is not yanked; an explicit version takes that
   release, yanked or not (a reader MAY warn). The variant is then looked up in that release's tree. Without an
@@ -711,7 +709,7 @@ wrong JSON type. Whitespace between tokens is allowed. A writer MUST produce the
 - strings with `"` and `\` escaped as `\"` and `\\`, the controls U+0008, U+0009, U+000A, U+000C and U+000D as `\b`,
   `\t`, `\n`, `\f`, `\r`, other controls below U+0020 as `\u00XX` (lowercase hex), and every other character as its
   UTF-8 bytes (Python: `json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`);
-- optional fields at their default omitted: empty `checkpoints`, `yanked: false`, `revision: 0`.
+- optional fields at their default omitted: empty `checkpoints`, `yanked: false`.
 
 ## 10. Chunks (informative)
 
@@ -740,6 +738,20 @@ construction order. A reference can be applied structurally:
   `#`), merged over every instance of that parent; indices ascend;
 - a child the reference does not hold, or every key of a class without a reference, keeps the source's data order
   after the known children, and is reported.
+
+## 11. Logical file
+
+A `.cozytensors` file holds only its header (§4); nothing packs a checkpoint into one stored file. A checkpoint's
+**logical file** is all of its bytes as one read-only byte string, for a consumer that wants a single file. A reader
+assembles it from the objects on demand:
+
+- offset 0: the header's bytes;
+- then each object of `chunks` in order, then every component's assets (components in header order, each
+  component's in its asset map's encoded key order, §9), each object starting at the next multiple of 4096 after the
+  previous one ends; an object cited twice appears twice;
+- gaps are zero bytes, and the file ends where its last object ends.
+
+The layout depends only on the header, so every object's offset follows from it.
 
 ## Appendix A. Fixed tables
 
