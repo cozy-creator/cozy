@@ -14,8 +14,138 @@ use tensorfs::{Checkpoint, Failure, Kind};
 
 use crate::store::{
     defer_failed_cuda, invalid, metadata, raise, Aligned, ArrayBuffer, CheckpointAccess,
-    DeviceArray, FetchTensor, OrRaise, PyArray,
+    DeviceArray, Dlpack, FetchTensor, MappedArray, OrRaise, PyArray,
 };
+
+/// Private constructor: only the admitted Plane bridge supplies a host-reservation owner.
+pub(crate) fn mapped_output(
+    py: Python<'_>, device: i32, shape: Vec<u64>, dtype: Dtype, stream: usize,
+    reservation: Arc<dyn Send + Sync>,
+) -> PyResult<Option<PyArray>> {
+    if !matches!(&dtype, Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64) {
+        return Ok(None);
+    }
+    let len = dtype.byte_len(&shape).and_then(|len| usize::try_from(len).ok())
+        .ok_or_else(|| invalid(py, "mapped output shape exceeds address space"))?;
+    let result = py.detach(|| tensorfs::io::MappedBuffer::new(device, len, stream, reservation));
+    match result {
+        Ok(Some(buffer)) => Ok(Some(PyArray {
+            buf: ArrayBuffer::Mapped(MappedArray::new(buffer)), dtype, shape,
+        })),
+        Ok(None) | Err(tensorfs::io::cuda::Error::CudaUnavailable(_)) => Ok(None),
+        Err(error) => Err(raise(py, error.into())),
+    }
+}
+
+/// Scatter a producer's exact band through the shared read engine. Only descriptor planning
+/// lives here; CUDA copies, producer stream handoff and transferred lifetimes stay shared.
+pub(crate) fn write_band(
+    py: Python<'_>, output: &PyArray, data: &Bound<'_, PyAny>, axis: usize, offset: u64, stream: usize,
+) -> PyResult<()> {
+    let ArrayBuffer::Mapped(buffer) = &output.buf else {
+        return Err(raise(py, Failure { kind: Kind::Unsupported,
+            detail: "band writes require admitted mapped host storage".into() }));
+    };
+    if py.detach(|| buffer.is_capturing(stream)).or_raise(py)? {
+        return Err(raise(py, Failure { kind: Kind::Unsupported,
+            detail: "mapped host band writes during CUDA capture are unsupported".into() }));
+    }
+    let mut source = Dlpack::strided(py, data)?;
+    if source.device != (2, buffer.device()) || source.dtype != output.dtype {
+        return Err(invalid(py, "band source must have the output's CUDA device and dtype"));
+    }
+    if axis >= output.shape.len() || source.shape.len() != output.shape.len()
+        || source.shape.iter().zip(&output.shape).enumerate()
+            .any(|(i, (a, b))| i != axis && a != b)
+        || offset.checked_add(source.shape[axis]).is_none_or(|end| end > output.shape[axis])
+    {
+        return Err(invalid(py, "band shape or offset exceeds the mapped output"));
+    }
+    let width = output.dtype.byte_len(&[1])
+        .ok_or_else(|| invalid(py, "band dtype has no byte width"))?;
+    let mut destination_strides = vec![1u64; output.shape.len()];
+    let mut stride = 1u64;
+    for i in (0..output.shape.len()).rev() {
+        destination_strides[i] = stride;
+        stride = stride.checked_mul(output.shape[i])
+            .ok_or_else(|| invalid(py, "band output strides overflow"))?;
+    }
+    let mut run = 1u64;
+    let mut split = source.shape.len();
+    for i in (0..source.shape.len()).rev() {
+        if source.shape[i] > 1 && (source.strides[i] != run || destination_strides[i] != run) {
+            break;
+        }
+        run = run.checked_mul(source.shape[i])
+            .ok_or_else(|| invalid(py, "band run overflows"))?;
+        split = i;
+    }
+    let count = source.shape[..split].iter().try_fold(1u64, |n, dim| n.checked_mul(*dim))
+        .ok_or_else(|| invalid(py, "band scatter count overflows"))?;
+    let run_bytes = run.checked_mul(width).and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| invalid(py, "band run exceeds address space"))?;
+    let mut unproven = false;
+    let result = py.detach(|| -> Result<(), Failure> {
+        use tensorfs::io::{self, Copy, ReadOpts, Src};
+        let _access = buffer.access.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(stream) = source.stream() {
+            if buffer.is_capturing(stream.raw())? {
+                return Err(Failure { kind: Kind::Unsupported,
+                    detail: "mapped host band writes during CUDA capture are unsupported".into() });
+            }
+        }
+        if let Err(error) = buffer.synchronize() {
+            unproven = true;
+            return Err(error.into());
+        }
+        if source.len == 0 { return Ok(()); }
+        let options = ReadOpts::default();
+        // Bound descriptor storage by the existing engine's concurrency; a strided band
+        // never builds an output-sized metadata allocation or a second device tensor.
+        let batch = options.threads.max(1);
+        let mut copies = Vec::with_capacity(batch);
+        for row in 0..count {
+            let mut remaining = row;
+            let mut src = 0u64;
+            let mut dst = offset * destination_strides[axis];
+            for i in (0..split).rev() {
+                let coordinate = remaining % source.shape[i];
+                remaining /= source.shape[i];
+                src += coordinate * source.strides[i];
+                dst += coordinate * destination_strides[i];
+            }
+            copies.push(Copy {
+                src: Src::Device {
+                    device: buffer.device(), ptr: (source.address as u64) + src * width,
+                    stream: source.stream().map_or(0, |stream| stream.raw()),
+                },
+                dst: Dst::Host {
+                    ptr: buffer.host_ptr().wrapping_add((dst * width) as usize), len: run_bytes,
+                },
+            });
+            if copies.len() == batch {
+                if let Err(error) = unsafe { io::read(&copies, &options) } {
+                    unproven = true;
+                    return Err(error.source.into());
+                }
+                copies.clear();
+            }
+        }
+        if !copies.is_empty() {
+            if let Err(error) = unsafe { io::read(&copies, &options) } {
+                unproven = true;
+                return Err(error.source.into());
+            }
+        }
+        Ok(())
+    });
+    if unproven {
+        source.record_cuda_error();
+        defer_failed_cuda(buffer.device(), Arc::clone(buffer));
+    }
+    let finished = py.detach(|| source.finish()).or_raise(py);
+    result.or_raise(py).and(finished)
+}
 
 /// A component's tensors: a mapping of key to `TensorMetadata`, with the reads.
 #[pyclass(name = "Tensors", module = "tensorfs", frozen, mapping)]

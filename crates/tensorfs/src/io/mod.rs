@@ -18,7 +18,7 @@ pub mod source;
 #[cfg(feature = "store")]
 pub(crate) mod view;
 
-pub use device::DeviceBuffer;
+pub use device::{DeviceBuffer, MappedBuffer};
 pub use plan::Target;
 pub use probe::{ceiling, disk, Ceiling};
 #[cfg(feature = "store")]

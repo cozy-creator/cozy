@@ -102,6 +102,9 @@ class Array:
     @property
     def nbytes(self) -> int: ...
     def tobytes(self) -> bytes: ...
+    def _write_band(self, source: object, axis: int, offset: int, *, stream: int) -> None:
+        """Copy an exact CUDA band into admitted mapped host output storage."""
+        ...
     def __dlpack__(
         self,
         *,
