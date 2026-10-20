@@ -218,9 +218,9 @@ An encoded tensor cites an **encoding** `[scheme, params]`. With this section th
 the logical tensor; no decode depends on anything outside the header, its chunks and this spec.
 
 **Names** are `family.variant` in lowercase, in the words of the ecosystem that made the format: generic scaled
-formats are `element.granularity` (`fp8.tensorwise`, `int8.rowwise`, `fp8.blockwise`), a producer's own format
-is `producer.type` with the producer's type name verbatim (`gguf.q4_k`, `gptq.int4`, `awq.int4`, `ct.int4`,
-`bnb.nf4`), and a vendor-neutral standard keeps its bare name (`mxfp4`, `mxfp8`, `nvfp4`).
+formats are `element.granularity` (`fp8.tensorwise`, `int8.rowwise`, `fp8.blockwise`), a producer's own format is
+`producer.type` with the producer's type name verbatim (`gguf.q4_k`, `gptq.int4`, `awq.int4`, `ct.int4`, `bnb.nf4`,
+`comfy.asym_w4a8_int8`), and a vendor-neutral standard keeps its bare name (`mxfp4`, `mxfp8`, `nvfp4`).
 
 **Params** are snake_case keys in the producer's vocabulary (`axis`, `block_size`, `rotation`, `rotation_size`,
 `global_scale`, `nibble_order`, `scale_layout`, `scale_dtype`). Every param the decode reads is required and none has a
@@ -569,6 +569,60 @@ LLM.int8() weights (Transformers' `load_in_8bit`), one absmax per output row.
 
 <!-- comfy.* -->
 
+### `comfy.asym_w4a8_int8`
+
+ComfyUI's W4A8 (comfy-kitchen's `AsymW4A8Int8Layout` at 4 bits): ConvRot-rotated weights as 4-bit codes, a scale per
+group of `group_size` columns relative to a scale per row. Each code becomes an int8 value, and each row of those is
+scaled and rotated back.
+- Params: `group_size`: 4, 8 or a multiple of 16; `rotation_size`: `B = 4^k`, `1 ≤ k ≤ 8`. `C` MUST be a multiple
+  of both.
+- Parts, with ComfyUI's suffixes:
+  - `weight`: `I8` `[lead…, C/2]`, the codes `q` packed `word`-fill, `low_first`, unsigned, in `U8` words along the
+    last axis (the even column in the low nibble).
+  - `weight_s_rel`: `F8_E4M3` or `F32` on row blocks of `group_size`, `row_major`.
+  - `weight_s_channel`: `F32` on the row grid.
+  - `weight_codebook` (optional): `F32`, 16 elements, the level of each code.
+  - `weight_correction` (optional): `F32`, `BF16` or `F16` on row blocks of `group_size`, `transposed` (`[C/g, R]`).
+- Decode. A code's level is `v = weight_codebook[q]`, or `q − 8` without a codebook. Its int8 value is
+  `q8 = clamp(round(v × s_rel(i, j)), −127, 127)`, rounded to nearest, ties to even; a NaN refuses the decode. Each
+  block of `B` columns is rotated back as in `int8.convrot`, with `y[i, g, ·] = q8[i, gB : gB + B] · H_B`:
+  `value[i, gB + j] = round_L((y[i, g, j] × s_channel[i]) × 2^−k)`. With a correction it is
+  `round_L(((y[i, g, j] × s_channel[i]) + z[i, g, j]) × 2^−k)`, where `z[i, g, j] = Σ_b c(i, b) × M_b[j]` over the
+  row blocks `b` of `group_size` that meet columns `gB … gB + B − 1`, in ascending order, left to right, and
+  `M_b[j] = Σ_{gB + j' ∈ b} H_B[j', j]` (an integer).
+
+The rotated weight is `q8 × s_channel[i] + c(i, b)`. The correction is constant over a group, so `z` is its rotation,
+and `y` stays exact.
+
+### `comfy.w6a8_int8`
+
+ComfyUI's W6A8 (the same layout at 6 bits): uniform 6-bit codes and no codebook.
+- Params: `group_size`: a multiple of 16; `rotation_size` as for `comfy.asym_w4a8_int8`.
+- Parts: `weight`: `I8` `[lead…, 3C/4]`. Each row is `C/2` bytes of each code's low 4 bits, packed as
+  `comfy.asym_w4a8_int8`'s codes, then `C/4` bytes of its high 2 bits, `word`-fill, `low_first` (column `t` at bits
+  `2(t mod 4)` of byte `⌊t/4⌋`); the code is `c = lo + 16·hi`. `weight_s_rel` and `weight_s_channel` as for
+  `comfy.asym_w4a8_int8`.
+- Decode: as `comfy.asym_w4a8_int8`, with `v = c − 32` and no correction.
+
+### `comfy.convrot_w4a4`
+
+ComfyUI's W4A4 (comfy-kitchen's `TensorCoreConvRotW4A4Layout`): ConvRot-rotated weights as signed int4 codes, one
+scale per row.
+- Params: `rotation_size` as above; `C` MUST be a multiple of `B`.
+- Parts: `weight`: `I8` `[lead…, C/2]`, 4-bit two's complement codes packed `word`-fill, `low_first` in `U8` words.
+  `weight_scale`: `F32` on the row grid.
+- Decode: as `int8.convrot`, with these codes and `weight_scale` as `scale`.
+
+Kitchen's quantizer writes one scale per row; ComfyUI's marker `quant_group_size: 64` names its int4 kernel's tile,
+so it is no param. The marker's `linear_dtype` (`int4` or `int8`) sets how activations are quantized; it never
+changes the weight.
+
+**For all three.** Kitchen dequantizes in `L`: it rounds the rotated weight to `L` and rotates it back with a matmul
+in `L`. At `BF16` its result is about 2.5·10^−3 (relative L2) from this decode. Kitchen's `mma_packed` layout
+interleaves codes and scales for its GEMV kernel. It is resident only, never saved, and not an encoding. TensorFS's
+closed-form encoders are kitchen's eager quantizers, bit for bit. Kitchen quantizes the rotated weight after rounding
+it to `L`, so they do the same.
+
 ### Plain tensors
 
 A plain tensor's bytes are its value; reading it is a copy, whatever its dtype.
@@ -636,8 +690,8 @@ reinterpreting future same-major documents. Readers identify and refuse them as 
 
 Minors: 1.1 adds `nvfp4`'s `pre_quant_scale` and a `scale_2` per matrix, and tiles each matrix of a stack on its own
 in `cublas_128x4` (before any stacked file was written); the schemes `fp8.blockwise`, `mxfp4`, `gguf.*`, `gptq.int2`,
-`gptq.int3`, `gptq.int4`, `gptq.int8`, `awq.int4`, `ct.int1` … `ct.int8`, `bnb.nf4`, `bnb.fp4` and `bnb.int8`; and the
-`tiles` grid and transposed storage.
+`gptq.int3`, `gptq.int4`, `gptq.int8`, `awq.int4`, `ct.int1` … `ct.int8`, `bnb.nf4`, `bnb.fp4`, `bnb.int8` and
+`comfy.*`; and the `tiles` grid and transposed storage.
 
 ## 9. Encoding
 

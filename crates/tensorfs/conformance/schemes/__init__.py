@@ -26,6 +26,7 @@ from . import ct
 from . import bnb
 
 # comfy
+from . import comfy
 
 from .base import Ctx, PartDtype, Refused
 
@@ -50,6 +51,7 @@ FAMILIES = (
     bnb,
 
     # comfy
+    comfy,
 )
 SCHEMES = {s.name: s for family in FAMILIES for s in family.SCHEMES}
 

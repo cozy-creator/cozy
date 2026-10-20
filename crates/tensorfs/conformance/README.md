@@ -79,3 +79,9 @@ w4a16 checkpoints read by HTTP range. A case with `pack` holds the codes and zer
 bitsandbytes' own dequantize as the expected bytes, plus rows of unsloth's and lllyasviel's nf4 checkpoints read by HTTP
 range at pinned revisions. bitsandbytes' fallback for an odd last extent reads FP4 code 8 as +0 where its kernels (and
 the spec) read −0; the odd-extent FP4 cases hold no code 8.
+
+**comfy.** `mine/comfy.py` runs comfy-kitchen 0.2.39's eager quantizers (PyTorch 2.14.1 CPU) and range-reads rows of
+real ComfyUI files (AX1Y2JP W4A8, Comfy-Org W6A8, Merserk W4A4 of MiniMax-H3). Expected bytes are the spec's decode;
+kitchen's own dequantize is within 2.5·10^−3 relative at `BF16` (it rotates back in `L`) and f32 rounding at `F32`.
+Cases kitchen quantized with its defaults carry `source`; those with other options carry `kitchen` (source and
+options), which `tests/encode_comfy.rs` reproduces.

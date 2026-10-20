@@ -1,11 +1,12 @@
 # Architecture
 
 TensorD (executable `tensord`) is the persistent Rust daemon that owns the API, execution journal,
-node scheduling, memory budgets and executor supervision. Package code runs in Python
-executors (cozy-runtime) inside each package environment. TensorFS is a library embedded in
-TensorD and used inside Runtime; it is not a separate daemon. TensorD has no CUDA context:
-executors own device contexts and operations. NVML is read on each configured GPU's sampler
-thread (`memory`).
+node scheduling and executor supervision. Package code runs in Python executors (cozy-runtime)
+inside each package environment. TensorFS is a library embedded in TensorD and used inside
+Runtime; it is not a separate daemon. TensorD has no CUDA context: executors own device
+contexts and operations, and varena in each executor decides its GPU bytes through one ledger
+per GPU that TensorD creates (`memory`, design memory-varena). NVML is read on each GPU's
+ledger watch thread.
 
 Model loading spans storage, shared CPU buffers and executor GPU memory:
 
@@ -13,20 +14,19 @@ Model loading spans storage, shared CPU buffers and executor GPU memory:
 | --- | --- | --- |
 | Stored weight bytes and metadata | Use TensorFS to acquire/retain manifests, headers, assets and tensor objects; bind available data to the selected model components | Request the selected header/assets, inspect tensor layouts, and construct Python/PyTorch models |
 | Shared CPU weight buffers | Fill and retain sealed layouts or streaming windows through TensorFS; coordinate host budgets and release unused buffers | Adopt granted layouts and descriptors through its TensorFS weight plane; read ready regions and manage its pinned staging within the host budget |
-| GPU-resident tensor storage | Coordinate device budgets and eviction; retain eligible executor-exported allocation handles and their leases | Allocate, transfer, map and unmap through TensorFS's plane/device APIs in the executor's CUDA context; attach those tensors to the model |
+| GPU-resident tensor storage | Create each GPU's ledger; admit executor starts, reap exited rows, end stalled ones | Varena maps, evicts and asks other rows for room; Runtime binds those pages to the model |
 
-Runtime reports each rank's needs and measured use. TensorD decides budgets and eviction
-across workloads; Runtime and its TensorFS weight plane perform the concrete device operations
-within those grants. A model source carries access to selected weight bytes, metadata and assets, not
-just a repository name. A host-buffer fill does not construct a PyTorch model, and retaining a
-GPU handle does not create a CUDA context in TensorD.
+Each executor's row in its GPU's ledger states what it holds; asks between rows make room.
+TensorD's own row holds what no row explains. A model source carries access to selected weight
+bytes, metadata and assets, not just a repository name. A host-buffer fill does not construct a
+PyTorch model.
 
 TensorFS `Store::ensure_owned` retains the store claim through live handles and read leases,
 coordinates GC pins and excludes outside collectors. Cooperating ordinary processes can
 still share its store for reads and writes. Its
 [TensorFS storage guide](../../tensorfs/README.md#storage-and-ownership)
-describes storage and retention. TensorD retains the node-specific sealed memfd cache, host
-tiers, GPU-region custody and peer/process leases. [Recovery](RECOVERY.md) distinguishes
+describes storage and retention. TensorD retains the node-specific sealed memfd cache and
+peer/process leases. [Recovery](RECOVERY.md) distinguishes
 executor replacement, daemon restart and software activation guarantees.
 
 Plan of record and workstream IDs (A–F):
@@ -44,8 +44,8 @@ Calcifer ──HTTPS (Cozy-Cap)──> api::http ─> machine_api::NativeBackend
                           gpu_service::Pool ─> device_executor::DeviceExecutor
                             (retained executors per plan: deviceless, one GPU or a group,
                              via the Runtime trampoline)
-                            memory::GpuMemory: admission, process caps, eviction, floor
-                            answers budget-cell, device-room, model-source and sealed-tier requests
+                            memory::GpuLedger: per-GPU ledger + eventfd, fits, reaps, stalls
+                            answers model-source, read-grant and deposit requests
                           calls::Calls: child calls and each attempt's weights grant
 ```
 
@@ -57,9 +57,9 @@ pool places it on. Progress, outputs and terminal state are written
 by `Engine`; outputs are kept in native custody until the client acknowledges collection.
 
 Tenancy: a pod has one owner, a package one publisher, and many users submit. A GPU plan (and so
-its executor and its memory-policy tenant) is the package's generation, entrypoint, bound models
-and group, never the submitter: every submitter of a construction is served by one executor, one
-request at a time. Degree 2 holdings are per GPU and layout, shared by every executor on the pod.
+its executor and its ledger rows) is the package's generation, entrypoint, bound models and
+group, never the submitter: every submitter of a construction is served by one executor, one
+request at a time. Host-cache layouts are shared by every executor on the pod; GPU pages never are.
 What belongs to a submitter is in the journal and the API: installations, preparations, runs,
 inputs, outputs, triage and controls are read by actor; a run's spool lives only for its call,
 and a failure quotes only the stderr its own request wrote.
@@ -105,7 +105,8 @@ code is still not sandboxed.
 | `execution.rs` | Acceptance, attempt supervision, cancellation, progress coalescing, output custody, reconcile | `Engine` | E |
 | `journal.rs` | SQLite journal: executions, installations, preparations, receipts, process births | `Journal`, `Execution`, `State`, `ProcessBirth` | E |
 | `gpu_service.rs` | Executor pool (degree 0, 1 or n): published package/model mapping, executor retention, request callbacks; GPU groups (a degree-K plan on the first K GPUs, one memory decision per GPU), one call slot per GPU and one-GPU replicas and multi-slot plans | `Pool`, `GpuConfig`, `Plan`, `PlanSlot`, `PlanSource`, `ModelGrant` | B2 (admission, grants), E (spawn/fencing), D1 (published mapping), I (groups, slots) |
-| `memory/` | Per-GPU ledger and decisions (`policy`), NVML sampler thread (`nvml`), floor watchdog, per-host pinned budgets (`host`) | `GpuMemory`, `policy::Gpu`, `Step`, `Decision` | B2 |
+| `memory/` | Each GPU's varena ledger and eventfd, TensorD's row in it, `fits`, reaps, stalls and freed wakes on an NVML watch thread (`gpu`); a call's memory measurements (`call`) | `GpuLedger`, `CallMemory` | xs-046 B4 |
+| `deposits.rs` | Sealed host layouts executors deposit, granted to the next executor of the same weights | `Deposits` | xs-046 B4 |
 | `device_executor.rs` | Typed control seam to the Runtime device executor, per-request output encoding | `DeviceExecutor`, `ExecutorConfig`, `DeviceCommand`, `Frame`, `Answer` | E |
 | `launch_identity.rs` | Runtime trampoline command, the executor environment seal, optional UID/GID | `LaunchIdentity`, `Seal`, `trampoline` | E |
 | `process.rs` | Exact process births, kill (scope and group), the progress meter and watch (leader plus process-group members), reaping (`reap_group`) | `Exact`, `Pace`, `Watching`, `Reaped` | E, I |
@@ -114,10 +115,7 @@ code is still not sandboxed.
 | `child_launcher.rs` | Pool-owned spawn thread (PDEATHSIG follows the creating thread) | `ChildLauncher` | E |
 | `os.rs` | memfd, seals, peer credentials (`SO_PEERPIDFD`, `pidfd_open` fallback), pidfd exit | — | E |
 | `protocol.rs` | Length-prefixed frames of the executor seam | `read_body`, `write_body` | E |
-| `host_tier.rs` | Degree 1 host tier: machine-filled sealed layouts, adopted read-only, sized by live headroom; a region's absent objects are fetched (Now) and copied as they land | `HostTier`, `HostGrant`, `TierLimit`, `HostTierFacts` | B1 |
-| `host_memory.rs` | Live host headroom (cgroup v1/v2 path, `MemAvailable`) | `HostMemory` | B1 |
 | `model_sources.rs` | Selected model headers/assets as verified bytes and sealed read-only descriptors; component byte facts for planning | `ModelSources`, `SelectedManifest` | B1 |
-| `resident_custody.rs` | Degree 2: executor-exported GPU regions kept as driver fds (no CUDA), leases, revocation | `ResidentCustody`, `HoldingKey`, `SharedRegion` | C |
 | `boundary_json.rs` | Strict JSON parse (no duplicate keys) for boundary records | — | D1 |
 
 
@@ -132,7 +130,6 @@ code is still not sandboxed.
 
 | Path | Use | Owner |
 |---|---|---|
-| `src/bin/degree2-pilot.rs` | Degree 2 on a rental: stock executors share GPU weights through `ResidentCustody` (replacement, count-once, revoke, output equality) | C |
 | `src/bin/model-source-check.rs`, `scripts/check-model-source-descriptor.py` | Check a selected snapshot's sources | B1 |
 | `src/bin/install-capture.rs` | Run the installer path on a captured archive (used by Python tests) | D1 |
 | `scripts/gate/` | Matched ComfyUI vs TensorD gate through ordinary `cozy run` | F |
@@ -173,8 +170,7 @@ metadata transitions are coordinated with cancellation.
 - [Package bridge](PACKAGE-BRIDGE.md): generation description and install.
 - [Device executor](DEVICE-EXECUTOR.md): executor launch and control seam.
 - [GPU service](GPU-SERVICE.md): GPU pool, config, launch identity.
-- [Host tier](HOST-TIER.md), [model sources](MODEL-SOURCES.md): Degree 1.
-- [Resident custody](RESIDENT-CUSTODY.md): Degree 2 foundation.
+- [Model sources](MODEL-SOURCES.md): Degree 1.
 - [Matched gate](../scripts/gate/README.md): ComfyUI vs TensorD, ordinary CLI.
 
 ## Build and test
