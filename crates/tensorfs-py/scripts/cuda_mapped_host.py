@@ -3,6 +3,7 @@
 import gc
 import json
 
+import tensorfs
 import torch
 from tensorfs.varena.torch import Memory
 
@@ -19,6 +20,21 @@ def allocate(shape, dtype):
     array = memory.native.mapped_output(shape, dtype, torch.cuda.current_stream(device).cuda_stream)
     assert array is not None, "assigned device/admission must support this small mapped output"
     return array
+
+
+class ObservedProducer:
+    """Forward the real Torch capsule; observe whether a rejected write exported it."""
+
+    def __init__(self, tensor):
+        self.tensor = tensor
+        self.exports = 0
+
+    def __dlpack_device__(self):
+        return self.tensor.__dlpack_device__()
+
+    def __dlpack__(self, **kwargs):
+        self.exports += 1
+        return self.tensor.__dlpack__(**kwargs)
 
 
 closed = False
@@ -65,10 +81,26 @@ try:
         side.synchronize()
         assert torch.equal(observed.cpu(), torch.full((24,), 4.0))
 
+        refused_array = allocate((4, 4), "F32")
+        refused_tensor = torch.from_dlpack(refused_array)
+        producer = ObservedProducer(torch.ones((4, 4), device=device))
         graph = torch.cuda.CUDAGraph()
+        rejected = False
         with torch.cuda.graph(graph):
             declined = memory.native.mapped_output((4, 4), "F32", torch.cuda.current_stream(device).cuda_stream)
+            try:
+                refused_array._write_band(producer, axis=0, offset=0,
+                                          stream=torch.cuda.current_stream(device).cuda_stream)
+            except tensorfs.UnsupportedError:
+                rejected = True
         assert declined is None, "mapped allocation must refuse the actual capturing stream"
+        assert rejected and producer.exports == 0, "a refused write exported a CUDA producer"
+        assert torch.equal(refused_tensor.cpu(), torch.zeros((4, 4)))
+        refused_array._write_band(producer, axis=0, offset=0,
+                                  stream=torch.cuda.current_stream(device).cuda_stream)
+        assert producer.exports == 1 and torch.equal(refused_tensor.cpu(), torch.ones((4, 4)))
+        del refused_tensor, refused_array, producer
+        gc.collect()
         survivor_array = allocate((4, 4), "F32")
         survivor = torch.from_dlpack(survivor_array)
         survivor.fill_(9)
@@ -80,7 +112,7 @@ try:
     gc.collect()
     torch.cuda.synchronize(device)
     assert request.stats is not None and not request.cleanup_errors
-    print("PASS mapped host CUDA arithmetic, cuDNN, strided bands, D2H and side-stream aliases")
+    print("PASS mapped host CUDA arithmetic, cuDNN, strided bands, D2H, capture refusal and aliases")
     print(json.dumps({"gpu": str(torch.cuda.get_device_properties(device).uuid), "largest_mapped_payload_bytes": 512, "leftover": request.stats.leftover}))
 finally:
     if not closed:
