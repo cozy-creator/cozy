@@ -11,6 +11,8 @@ tensorfs.workspace = true
 libc.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+parking_lot = "0.12"
+crossbeam-queue = "0.3"
 
 [features]
 # Store-backed sources (checkpoints and fills from a TensorFS store). Without it: sealed host
