@@ -402,6 +402,7 @@ impl Placement {
             sharing_limit: None,
             resident_steps: BTreeSet::new(),
             joint_steps: BTreeSet::new(),
+            model_positions: BTreeMap::new(),
             can_cut: true,
             can_lower: true,
             reclaim_round: 0,
@@ -456,9 +457,10 @@ impl Placement {
             page.uses.retain(|usage| usage.request != id);
         }
         for (step, (models, passes)) in groups.iter().enumerate() {
-            let mut order = 0_u32;
+            let mut orders = BTreeMap::<ModelId, u32>::new();
             for _ in 0..*passes {
                 for model in models {
+                    let order = orders.entry(*model).or_default();
                     let pages = inner
                         .models
                         .get(model)
@@ -476,10 +478,10 @@ impl Placement {
                             request: id,
                             position: Position {
                                 step: u32::try_from(step).map_err(|_| invalid("too many steps"))?,
-                                order,
+                                order: *order,
                             },
                         });
-                        order = order
+                        *order = order
                             .checked_add(1)
                             .ok_or_else(|| invalid("plan is too long"))?;
                     }
@@ -506,6 +508,7 @@ impl Placement {
             .map(|(step, _)| step as u32)
             .collect();
         facts.position = Position { step: 0, order: 0 };
+        facts.model_positions.clear();
         facts.starved = false;
         let request = inner
             .requests
@@ -557,6 +560,7 @@ impl Placement {
             .find(|row| row.id == request)
             .ok_or_else(|| invalid("request facts absent"))?;
         facts.position = Position { step, order: 0 };
+        facts.model_positions.clear();
         facts.working_sets.resize(step as usize + 1, None);
         facts.starved = false;
         Ok(())
@@ -600,6 +604,7 @@ impl Placement {
                             step: next,
                             order: 0,
                         };
+                        facts.model_positions.clear();
                         facts.starved = false;
                     }
                 }
