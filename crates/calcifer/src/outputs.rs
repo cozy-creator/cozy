@@ -22,7 +22,7 @@ use axum::{
     response::Response,
 };
 use protocol::{
-    calcifer::{CHECKPOINT, Event, MachineState},
+    calcifer::{Event, MachineState},
     error::Kind,
     ids::{Digest, RunId},
     machine::{
@@ -462,15 +462,6 @@ pub async fn serve(
     if item.media_type == TREE {
         let message = format!("output {name} of run {number} is a folder: open it on disk");
         return Err(api::refuse(Kind::Conflict, "output_is_a_tree", message));
-    }
-    if item.media_type == CHECKPOINT {
-        let machine = row.machine.as_deref().unwrap_or("its machine");
-        let message = format!(
-            "output {name} of run {number} is a checkpoint: it stays on {machine}, not this computer"
-        );
-        let refusal = api::refuse(Kind::Conflict, "output_is_a_checkpoint", message);
-        let next = format!("cozy run upload {number}#{name} <org/model>");
-        return Err(Refusal(refusal.0.next(next)));
     }
     let (Some(mut file), Some(rev)) = (file, item.exported_rev) else {
         if let Some(reason) = item.export_error {
