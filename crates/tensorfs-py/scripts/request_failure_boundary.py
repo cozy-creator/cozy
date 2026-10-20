@@ -89,6 +89,8 @@ class Room:
         return before
 
     def _uncached_bytes(self) -> int:
+        if "stats" in self.errors:
+            self.stage("stats")
         return 0
 
     def _plan(self, _: object) -> tuple:
@@ -206,6 +208,41 @@ class RequestFailure(unittest.TestCase):
             room.errors.update(gc=RuntimeError("gc failed"), end=RuntimeError("end failed"))
         self.assertEqual([str(error) for error in request.cleanup_errors], ["gc failed", "end failed"])
         self.assertEqual(room.events[-3:], ["trim", "measure", "end"])
+        self.assertIsNone(request.stats)
+        self.assert_closed(room)
+
+    def test_post_end_stats_fault_preserves_returned_and_escaping_failures(self) -> None:
+        for escaping in (False, True):
+            with self.subTest(escaping=escaping):
+                room = Room()
+                original = ValueError("payload failed")
+                failure = RuntimeError("stats unavailable")
+                try:
+                    with room.request("failed") as request:
+                        room.errors["stats"] = failure
+                        if escaping:
+                            raise original
+                        request.mark_failed()
+                except ValueError as caught:
+                    self.assertTrue(escaping)
+                    self.assertIs(caught, original)
+                    self.assertEqual(caught.__notes__, ["request cleanup failed: stats unavailable"])
+                else:
+                    self.assertFalse(escaping)
+                self.assertIsNone(request.stats)
+                self.assertEqual(request.cleanup_errors, (failure,))
+                self.assertIsNone(failure.__traceback__)
+                self.assertIsNone(failure.__context__)
+                self.assertEqual(room.events.count("end"), 1)
+                self.assert_closed(room)
+
+    def test_successful_scope_raises_post_end_stats_fault(self) -> None:
+        room = Room()
+        failure = RuntimeError("stats unavailable")
+        with self.assertRaises(RuntimeError) as caught, room.request("ok") as request:
+            room.errors["stats"] = failure
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(room.events.count("end"), 1)
         self.assertIsNone(request.stats)
         self.assert_closed(room)
 

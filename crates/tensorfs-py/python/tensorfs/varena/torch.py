@@ -1122,53 +1122,56 @@ class Memory:
                 )
             )
             if raw is not None:
-                trace = tuple(
-                    {
-                        **event,
-                        "request": id,
-                        "model": self._names.get(event.get("model"), ""),
-                        "gpu": self.gpu,
-                    }
-                    for event in raw["events"]
-                )
-                copied = sum(row["stats"]["bytes"] for row in raw["copies"])
-                # Persistent graph/KV caches have a live reclaim owner. Compare the
-                # uncached amount at both ends so shrinking an old cache cannot hide
-                # newly retained package tensors.
-                leftover = max(self._uncached_bytes() - request.start, 0)
-                request.stats = RequestStats(
-                    id,
-                    tuple(request.steps),
-                    tuple(
-                        Eviction(
-                            str(event["model"] or ""),
-                            self.gpu,
-                            {
-                                "free": 0,
-                                "orphan": 1,
-                                "speculative": 2,
-                                "unused": 3,
-                                "declared": 4,
-                                "working": 5,
-                                "pinned": 6,
-                            }[str(event["class"])],
-                            str(event["reason"]),
-                            int(event["bytes"]),
-                        )
-                        for event in trace
-                        if event["kind"] == "evict"
-                    ),
-                    ((self.gpu, leftover),) if self.cuda else (),
-                    copied,
-                    self.memo.retries,
-                    (),
-                    request.declared,
-                    tuple(_copy(row) for row in raw["io"]),
-                    trace,
-                    ({**raw["proof"], "gpu": self.gpu, "request": id},)
-                    if "proof" in raw
-                    else (),
-                )
+                def collect(data: dict[str, Any]) -> RequestStats:
+                    trace = tuple(
+                        {
+                            **event,
+                            "request": id,
+                            "model": self._names.get(event.get("model"), ""),
+                            "gpu": self.gpu,
+                        }
+                        for event in data["events"]
+                    )
+                    copied = sum(row["stats"]["bytes"] for row in data["copies"])
+                    # Persistent graph/KV caches have a live reclaim owner. Compare the
+                    # uncached amount at both ends so shrinking an old cache cannot hide
+                    # newly retained package tensors.
+                    leftover = max(self._uncached_bytes() - request.start, 0)
+                    return RequestStats(
+                        id,
+                        tuple(request.steps),
+                        tuple(
+                            Eviction(
+                                str(event["model"] or ""),
+                                self.gpu,
+                                {
+                                    "free": 0,
+                                    "orphan": 1,
+                                    "speculative": 2,
+                                    "unused": 3,
+                                    "declared": 4,
+                                    "working": 5,
+                                    "pinned": 6,
+                                }[str(event["class"])],
+                                str(event["reason"]),
+                                int(event["bytes"]),
+                            )
+                            for event in trace
+                            if event["kind"] == "evict"
+                        ),
+                        ((self.gpu, leftover),) if self.cuda else (),
+                        copied,
+                        self.memo.retries,
+                        (),
+                        request.declared,
+                        tuple(_copy(row) for row in data["io"]),
+                        trace,
+                        ({**data["proof"], "gpu": self.gpu, "request": id},)
+                        if "proof" in data
+                        else (),
+                    )
+
+                request.stats = cleanup(lambda: collect(raw))
 
             if request.cleanup_errors:
                 if not request._failed:
