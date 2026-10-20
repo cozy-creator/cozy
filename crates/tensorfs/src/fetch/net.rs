@@ -49,6 +49,20 @@ pub(crate) enum GetError {
     Exchange(Refusal),
 }
 
+impl GetError {
+    pub(crate) fn refusal(self) -> Refusal {
+        match self {
+            Self::Provider(refusal) | Self::Exchange(refusal) => refusal,
+        }
+    }
+}
+
+impl From<Refusal> for GetError {
+    fn from(refusal: Refusal) -> Self {
+        Self::Exchange(refusal)
+    }
+}
+
 impl Answer {
     pub fn status(&self) -> u16 {
         self.response.status().as_u16()

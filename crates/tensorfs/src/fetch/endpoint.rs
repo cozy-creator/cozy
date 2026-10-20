@@ -25,7 +25,7 @@ use futures::StreamExt;
 use hyper::Uri;
 use serde_json::Value;
 
-use super::net::{join, same_origin, Body, Client, HeaderMap};
+use super::net::{join, same_origin, Body, Client, GetError, HeaderMap};
 use super::origin::{release_of, Location, Origin};
 use super::policy::is_loopback_origin;
 use super::token::{default_for, s3_base, Request, TokenProvider};
@@ -151,7 +151,12 @@ impl Endpoint {
 
     /// The repo document `name` and its ETag; `None` when there is none.
     pub async fn repo(&self, name: &str) -> Result<Option<(Repo, String)>> {
-        Ok(match self.repo_since(name, None).await? {
+        self.repo_attempt(name).await.map_err(GetError::refusal)
+    }
+
+    /// Preserve credential callback origin until the caller's cache fallback decision.
+    pub(crate) async fn repo_attempt(&self, name: &str) -> std::result::Result<Option<(Repo, String)>, GetError> {
+        Ok(match self.repo_since_attempt(name, None).await? {
             Fresh::Doc(repo, etag) => Some((repo, etag)),
             _ => None,
         })
@@ -159,7 +164,11 @@ impl Endpoint {
 
     /// The repo document `name`, or `Unchanged` while it still has ETag `etag`.
     pub async fn repo_since(&self, name: &str, etag: Option<&str>) -> Result<Fresh> {
-        let (bytes, etag) = match self.repo_bytes(name, etag).await? {
+        self.repo_since_attempt(name, etag).await.map_err(GetError::refusal)
+    }
+
+    async fn repo_since_attempt(&self, name: &str, etag: Option<&str>) -> std::result::Result<Fresh, GetError> {
+        let (bytes, etag) = match self.repo_bytes_attempt(name, etag).await? {
             Fresh::Doc(bytes, etag) => (bytes, etag),
             Fresh::Unchanged => return Ok(Fresh::Unchanged),
             Fresh::Absent => return Ok(Fresh::Absent),
@@ -168,12 +177,16 @@ impl Endpoint {
         let repo = Repo::from_json(&bytes).map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: format!("{what}: {e}") })?;
         match repo.name.eq_ignore_ascii_case(name) {
             true => Ok(Fresh::Doc(repo, etag)),
-            false => refuse(Code::UNKNOWN_FORMAT, format!("{what} names {:?}", repo.name)),
+            false => refuse(Code::UNKNOWN_FORMAT, format!("{what} names {:?}", repo.name)).map_err(GetError::Exchange),
         }
     }
 
     /// The repo document `name` as its bytes, unparsed, or `Unchanged` while it has ETag `etag`.
     pub async fn repo_bytes(&self, name: &str, etag: Option<&str>) -> Result<Fresh<Vec<u8>>> {
+        self.repo_bytes_attempt(name, etag).await.map_err(GetError::refusal)
+    }
+
+    async fn repo_bytes_attempt(&self, name: &str, etag: Option<&str>) -> std::result::Result<Fresh<Vec<u8>>, GetError> {
         check_repo_name(name)?;
         let key = repo_key(name);
         let (bytes, tag) = match &self.at {
@@ -183,12 +196,12 @@ impl Endpoint {
                     (bytes, tag)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Fresh::Absent),
-                Err(e) => return Err(crate::err::classify_io(root.join(&key).display().to_string(), e)),
+                Err(e) => return Err(crate::err::classify_io(root.join(&key).display().to_string(), e).into()),
             },
             At::Http(base) => {
                 let url = repo_url(base, &key);
                 let headers = etag.map(|e| ("if-none-match".to_owned(), e.to_owned())).into_iter().collect();
-                let reply = self.exchange(Ask { method: "GET", url: &url, headers, body: None, payload: None, auth: true }).await?;
+                let reply = self.exchange_attempt(Ask { method: "GET", url: &url, headers, body: None, payload: None, auth: true }).await?;
                 match reply.status {
                     200 => {
                         let tag = reply.header("etag").map_or_else(|| etag_of(&reply.body), str::to_owned);
@@ -196,7 +209,7 @@ impl Endpoint {
                     }
                     304 => return Ok(Fresh::Unchanged),
                     404 | 410 => return Ok(Fresh::Absent),
-                    _ => return Err(refusal(&reply, "GET")),
+                    _ => return Err(refusal(&reply, "GET").into()),
                 }
             }
         };
@@ -404,6 +417,10 @@ impl Endpoint {
     /// One exchange, its answer read whole. Weather is asked again until nothing has moved for
     /// the stall rule; the provider may ask once more (a nonce, a refresh).
     async fn exchange(&self, ask: Ask<'_>) -> Result<Reply> {
+        self.exchange_attempt(ask).await.map_err(GetError::refusal)
+    }
+
+    async fn exchange_attempt(&self, ask: Ask<'_>) -> std::result::Result<Reply, GetError> {
         let (mut still, mut wait, mut asked_again) = (Instant::now(), TICK, false);
         let mut stated_most = Duration::ZERO;
         loop {
@@ -412,7 +429,7 @@ impl Endpoint {
             let authorized = match ask.auth {
                 true => self.watched(self.authorize(ask.method, ask.url, &ask.headers, ask.payload), &moved).await,
                 false => Ok(vec![]),
-            }?;
+            }.map_err(GetError::Provider)?;
             // A provider's failure is the caller's verdict, not failed network traffic.
             headers.extend(authorized);
             let body = match ask.body {
@@ -433,7 +450,7 @@ impl Endpoint {
                     self.slowest.fetch_max(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let sent = Request { method: ask.method, url: ask.url, headers: &headers, payload: ask.payload };
                     let again = match (ask.auth, &self.token) {
-                        (true, Some(token)) => token.retry(&sent, reply.status, &reply.headers)?,
+                        (true, Some(token)) => token.retry(&sent, reply.status, &reply.headers).map_err(GetError::Provider)?,
                         _ => false,
                     };
                     if again && !asked_again {
@@ -447,7 +464,7 @@ impl Endpoint {
                     (format!("{} {}: {}", ask.method, ask.url, reply.status), stated)
                 }
                 Err(e) if matches!(e.code, Code::TRANSFER_FAILED | Code::FD_HEADROOM | Code::STALLED) => (e.detail, None),
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             };
             if progressed {
                 still = Instant::now();
@@ -455,7 +472,7 @@ impl Endpoint {
             stated_most = stated_most.max(stated.unwrap_or_default());
             let patience = self.patience().max(stated_most * 2);
             if still.elapsed() > patience {
-                return refuse(Code::HUB_UNREACHABLE, format!("{why}; nothing moved for {:.0} s", still.elapsed().as_secs_f64()));
+                return refuse(Code::HUB_UNREACHABLE, format!("{why}; nothing moved for {:.0} s", still.elapsed().as_secs_f64())).map_err(GetError::Exchange);
             }
             tracing::debug!(%why, "asked again");
             tokio::time::sleep(stated.unwrap_or(wait)).await;

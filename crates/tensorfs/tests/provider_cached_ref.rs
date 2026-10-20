@@ -145,20 +145,31 @@ fn serve(mut stream: TcpStream, root: &Path, requests: &AtomicUsize) {
 
 const DETAIL: &str = "literal supplied provider network refusal";
 struct Provider {
-    fail: AtomicBool,
+    fail: AtomicUsize,
     calls: AtomicUsize,
 }
 #[async_trait]
 impl TokenProvider for Provider {
     async fn headers(&self, _: &Request<'_>) -> tensorfs::Result<Vec<(String, String)>> {
         self.calls.fetch_add(1, Ordering::AcqRel);
-        if self.fail.load(Ordering::Acquire) {
+        if self.fail.load(Ordering::Acquire) == 1 {
             Err(Failure {
                 kind: Kind::Network,
                 detail: DETAIL.into(),
             })
         } else {
             Ok(Vec::new())
+        }
+    }
+
+    fn retry(&self, _: &Request<'_>, _: u16, _: &tensorfs::HeaderMap) -> tensorfs::Result<bool> {
+        if self.fail.load(Ordering::Acquire) == 2 {
+            Err(Failure {
+                kind: Kind::Network,
+                detail: DETAIL.into(),
+            })
+        } else {
+            Ok(false)
         }
     }
 }
@@ -197,7 +208,7 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
     let http = Http::new(origin);
     let cache = scratch.0.join("reader");
     let provider = Arc::new(Provider {
-        fail: AtomicBool::new(false),
+        fail: AtomicUsize::new(0),
         calls: AtomicUsize::new(0),
     });
     let mut options = config(&cache, &http.url);
@@ -224,7 +235,6 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
     assert_eq!(repo.release(None).unwrap().tree, tree);
     drop(warm);
 
-    provider.fail.store(true, Ordering::Release);
     // Independent ordinary anonymous read proves the endpoint is still healthy. This does
     // not invoke the supplied provider or preflight the operation under test.
     let endpoint = Endpoint::new(&http.url, None).unwrap();
@@ -235,27 +245,30 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
             .unwrap()
             .is_some()
     );
-    let (calls, requests) = (
-        provider.calls.load(Ordering::Acquire),
-        http.requests.load(Ordering::Acquire),
-    );
-    let result = tokio::time::timeout(
-        Duration::from_secs(2),
-        client.open("acme/provider", &Open::default()),
-    )
-    .await
-    .expect("supplied refusal retried as transport weather");
-    assert_eq!(
-        provider.calls.load(Ordering::Acquire),
-        calls + 1,
-        "provider error was replayed"
-    );
-    assert_eq!(
-        http.requests.load(Ordering::Acquire),
-        requests,
-        "provider refusal still sent an HTTP request"
-    );
-    let error =
-        result.expect_err("supplied Network failure was swallowed into cached repository success");
-    assert_eq!((error.kind, error.detail.as_str()), (Kind::Network, DETAIL));
+    for phase in [1, 2] {
+        provider.fail.store(phase, Ordering::Release);
+        let (calls, requests) = (
+            provider.calls.load(Ordering::Acquire),
+            http.requests.load(Ordering::Acquire),
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.open("acme/provider", &Open::default()),
+        )
+        .await
+        .expect("supplied refusal retried as transport weather");
+        assert_eq!(
+            provider.calls.load(Ordering::Acquire),
+            calls + 1,
+            "provider error was replayed"
+        );
+        assert_eq!(
+            http.requests.load(Ordering::Acquire),
+            requests + usize::from(phase == 2),
+            "provider failure sent an unexpected HTTP request"
+        );
+        let error = result
+            .expect_err("supplied Network failure was swallowed into cached repository success");
+        assert_eq!((error.kind, error.detail.as_str()), (Kind::Network, DETAIL));
+    }
 }

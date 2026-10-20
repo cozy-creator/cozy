@@ -195,11 +195,13 @@ impl Remote {
         } else {
             &self.endpoint
         };
-        let repo = match endpoint.repo(&reference.repo_id).await {
+        let repo = match endpoint.inner.repo_attempt(&reference.repo_id).await {
             Ok(Some((repo, _))) => repo,
             Ok(None) => return fail(Kind::NotFound, format!("no repo {}", reference.repo_id)),
             Err(error) => {
-                if error.kind == Kind::Network {
+                let transport = matches!(&error, fetch::GetError::Exchange(_));
+                let error = from_native(error.refusal());
+                if transport && error.kind == Kind::Network {
                     if let Some(found) = cached()? {
                         if self.store.reuse(&found.0)? {
                             return Ok(found);
