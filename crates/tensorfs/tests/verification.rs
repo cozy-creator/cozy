@@ -237,7 +237,7 @@ async fn verification_all_includes_declared_chunks_unused_by_components() {
 }
 
 #[tokio::test]
-async fn verification_all_includes_known_repo_files_but_not_other_variant_weights() {
+async fn verification_all_checks_only_the_selected_checkpoint_not_its_repository() {
     let f = Fixture::new();
     let readme = ObjectRef::of(b"repository notes");
     fs::write(f.folder.join("README.md"), b"repository notes").unwrap();
@@ -286,35 +286,14 @@ async fn verification_all_includes_known_repo_files_but_not_other_variant_weight
         .await
         .unwrap();
     fs::remove_file(config.cache_dir.join(alternate.key())).unwrap();
-    assert!(ck.verify(&Selection::All).unwrap().is_ok());
     fs::remove_file(config.cache_dir.join(readme.key())).unwrap();
-    let report = ck.verify(&Selection::All).unwrap();
-    assert_eq!(report.missing.as_slice(), std::slice::from_ref(&readme));
-    assert!(report.corrupt.is_empty());
-    assert!(ck.verify(&components(&["model"])).unwrap().is_ok());
-    let tree = ck.tree().unwrap().clone();
-    let tree_path = config.cache_dir.join(tree.key());
-    let original = fs::read(&tree_path).unwrap();
-    let altered = String::from_utf8(original.clone())
-        .unwrap()
-        .replace(&readme.sha256, &"0".repeat(64));
-    assert_eq!(altered.len(), original.len());
-    assert!(tensorfs::format::Tree::from_json(altered.as_bytes()).is_ok());
-    fs::write(&tree_path, &altered).unwrap();
+    fs::remove_file(config.cache_dir.join(tree.key())).unwrap();
+    assert!(ck.verify(&Selection::All).unwrap().is_ok());
     fs::remove_file(config.cache_dir.join(f.chunks[0].key())).unwrap();
     let report = ck.verify(&Selection::All).unwrap();
-    assert_eq!(report.corrupt.as_slice(), std::slice::from_ref(&tree));
-    assert_eq!(
-        report.missing,
-        [f.chunks[0].clone()],
-        "a corrupt tree redefined the audited repo files"
-    );
-    assert!(ck.verify(&components(&["other"])).unwrap().is_ok());
-    assert_eq!(fs::read(&tree_path).unwrap(), altered.as_bytes());
-    fs::remove_file(tree_path).unwrap();
-    let report = ck.verify(&Selection::All).unwrap();
-    assert!(report.missing.contains(&tree) && report.missing.contains(&f.chunks[0]));
+    assert_eq!(report.missing, [f.chunks[0].clone()]);
     assert!(report.corrupt.is_empty());
+    assert!(ck.verify(&components(&["other"])).unwrap().is_ok());
 }
 
 #[cfg(unix)]

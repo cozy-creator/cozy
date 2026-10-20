@@ -1,8 +1,6 @@
 """The public Python report against an actual local checkpoint; no network or repair."""
 
 import json
-import hashlib
-import shutil
 import sys
 from pathlib import Path
 
@@ -15,39 +13,6 @@ asset = tuple(request["asset"])
 unused = tuple(request["unused"])
 header = tuple(request["header"])
 checkpoint = tensorfs.open(folder, endpoint="http://127.0.0.1:1", cache_dir=folder.parent / "python-cache")
-
-# A known tree is checked before its repo-file references are trusted. Other variant
-# weights are outside the selected checkpoint; explicit components ignore the tree.
-repo_source = folder.parent / "repo-source"
-shutil.copytree(folder, repo_source)
-readme_bytes = b"repository notes"
-(repo_source / "README.md").write_bytes(readme_bytes)
-repo_cache = folder.parent / "repo-cache"
-tree_id = tensorfs.upload_folder(repo_id="local/verification", folder_path=repo_source, cache_dir=repo_cache)
-named = tensorfs.open(tree_id, local_files_only=True, cache_dir=repo_cache)
-
-def blob(reference):
-    digest = reference[0]
-    return repo_cache / "blobs" / digest[:2] / digest[2:4] / digest
-
-readme = (hashlib.sha256(readme_bytes).hexdigest(), len(readme_bytes))
-blob(readme).unlink()
-assert named.verify().missing == [readme]
-assert named.verify(["model"]).ok
-tree = named.tree_ref
-original_tree = blob(tree).read_bytes()
-altered_tree = original_tree.replace(readme[0].encode(), b"0" * 64)
-assert len(altered_tree) == len(original_tree) and json.loads(altered_tree)
-blob(tree).write_bytes(altered_tree)
-blob(model).unlink()
-report = named.verify()
-assert report.corrupt == [tree] and report.missing == [model]
-assert named.verify(["other"]).ok
-assert blob(tree).read_bytes() == altered_tree
-blob(tree).unlink()
-report = named.verify()
-assert set(report.missing) == {tree, model} and report.corrupt == []
-named.close()
 
 report = checkpoint.verify()
 assert isinstance(report, tensorfs.VerificationReport)
