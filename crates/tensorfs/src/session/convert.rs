@@ -200,7 +200,17 @@ impl Client {
             let extra = std::iter::once(tree.clone())
                 .chain(writer.repo_files().values().cloned())
                 .collect();
-            Checkpoint::managed(raw, None, Some(tree), None, extra, store, Some(variant))
+            let checkpoint = Checkpoint::managed(
+                raw,
+                None,
+                Some(tree.clone()),
+                None,
+                extra,
+                store.clone(),
+                Some(variant),
+            )?;
+            store.cache_touch(&tree)?;
+            Ok(checkpoint)
         })
         .await
     }

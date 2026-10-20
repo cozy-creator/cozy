@@ -199,15 +199,25 @@ impl Context {
         let extra = std::iter::once(tree.clone())
             .chain(files.values().cloned())
             .collect();
-        Checkpoint::managed(
+        let checkpoint = Checkpoint::managed(
             raw,
             named,
-            Some(tree),
+            Some(tree.clone()),
             None,
             extra,
             self.store.clone(),
             Some(self.variant.clone()),
-        )
+        )?;
+        // The generated public tree has its own cache lifetime, independent of the header
+        // and the native owner's flat repository-file root.
+        self.store.cache_touch(&tree)?;
+        if self.repo_id.is_some() && published.is_none() {
+            // A failed upload is a durable, retryable local result after every live handle
+            // drops. Its normal tree pin retains header, payload and repository bytes.
+            self.store
+                .pin_roots(&tree.sha256, std::slice::from_ref(&tree))?;
+        }
+        Ok(checkpoint)
     }
 
     fn publish_file(&self, checkpoint: &Checkpoint) -> Result<()> {
