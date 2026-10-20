@@ -1,4 +1,5 @@
 //! Run only on an explicitly rented GPU. This is the real driver/read engine, not a simulator.
+#![cfg(target_os = "linux")]
 use std::{fs::OpenOptions, io::Write, sync::Arc};
 use tensorfs::io::source::{Item, ItemSource, Source};
 use tensorfs::{
@@ -412,4 +413,207 @@ fn read_only_fault_is_contained_in_its_process() {
         "replacement must run on the same physical GPU"
     );
     println!("PASS read-only VMM protection and healthy replacement {healthy}");
+}
+
+struct Pressure(Vec<u64>);
+impl Drop for Pressure {
+    fn drop(&mut self) {
+        if let Ok(driver) = io::cuda::driver() {
+            for pointer in self.0.drain(..) {
+                unsafe {
+                    (driver.mem_free)(pointer);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "helper invoked only by cuda_oom_is_recovered_in_process"]
+fn oom_recovery_child() {
+    assert_eq!(std::env::var("VARENA_GPU_HELPER").as_deref(), Ok("oom"));
+    let uuid = one_device();
+    let (gpu, data) = test_page();
+    let (device, context) = io::cuda::primary_context(0).expect("OOM context");
+    let guard = io::cuda::CtxGuard::enter(context).expect("enter OOM context");
+    let driver = io::cuda::driver().expect("driver");
+    let mut pressure = Pressure(Vec::new());
+    let mut free = 0;
+    let mut total = 0;
+    for _ in 0..64 {
+        io::cuda::check("cuMemGetInfo", unsafe {
+            (driver.mem_get_info)(&mut free, &mut total)
+        })
+        .expect("measured free VRAM");
+        if free < data.len() {
+            break;
+        }
+        let mut requested = free.saturating_sub(256 << 10);
+        let mut allocated = false;
+        for _ in 0..16 {
+            if requested < 256 << 10 {
+                break;
+            }
+            let mut pointer = 0;
+            let code = unsafe { (driver.mem_alloc)(&mut pointer, requested) };
+            if code == io::cuda::SUCCESS {
+                pressure.0.push(pointer);
+                allocated = true;
+                break;
+            }
+            assert_eq!(
+                code,
+                io::cuda::ERROR_OUT_OF_MEMORY,
+                "unexpected pressure allocation error"
+            );
+            requested /= 2;
+        }
+        if !allocated {
+            break;
+        }
+    }
+    io::cuda::check("cuMemGetInfo", unsafe {
+        (driver.mem_get_info)(&mut free, &mut total)
+    })
+    .expect("remaining VRAM");
+    let error = gpu
+        .fill(1)
+        .expect_err("real allocation pressure must exhaust the VMM page fill");
+    assert!(error.is_oom(), "expected real CUDA OOM, got {error}");
+    assert!(!error.is_sticky(), "CUDA OOM must remain recoverable");
+    drop(pressure);
+    drop(guard);
+    io::cuda::check("cuDevicePrimaryCtxRelease", unsafe {
+        (driver.primary_ctx_release)(device)
+    })
+    .expect("release OOM helper context");
+    gpu.recover().expect("OOM recovery in the same process");
+    gpu.fill_from_ram(1, &data)
+        .expect("refill after releasing pressure");
+    let pin = gpu.bind(1, 0).expect("recovered read");
+    assert_eq!(bytes(&pin), data);
+    drop(pin);
+    synchronize();
+    gpu.poll().expect("release recovered pin");
+    synchronize();
+    assert!(gpu.unregister(1).expect("OOM recovery leaves no page"));
+    assert!(gpu.facts().expect("closed state").is_empty());
+    println!("PASS real CUDA OOM recovery {uuid} free_at_failure={free} total={total}");
+}
+
+#[test]
+#[ignore = "requires an owned rental; never run on the local GPU"]
+fn cuda_oom_is_recovered_in_process() {
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "oom_recovery_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("VARENA_GPU_HELPER", "oom")
+        .output()
+        .expect("start OOM helper");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    print!("{stdout}{stderr}");
+    assert!(output.status.success(), "OOM recovery child failed");
+    assert!(
+        stdout.contains("PASS real CUDA OOM recovery "),
+        "missing actual OOM result"
+    );
+}
+
+#[test]
+#[ignore = "helper invoked only by killed_owner_keeps_read_only_pages"]
+fn custody_holder_child() {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    assert_eq!(std::env::var("VARENA_GPU_HELPER").as_deref(), Ok("holder"));
+    let uuid = one_device();
+    let mut control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(0) };
+    let (gpu, _) = test_page();
+    gpu.fill(1).expect("holder fills read-only page");
+    let (spans, container) = gpu.export(1).expect("holder exports queued page handles");
+    control
+        .write_all(&(spans.len() as u32).to_le_bytes())
+        .expect("write chunk count");
+    for span in spans {
+        control
+            .write_all(&span.to_le_bytes())
+            .expect("write chunk span");
+    }
+    platform::handles::send_fd(&control, &container).expect("send owned container");
+    println!("HOLDER {uuid}");
+    std::io::stdout().flush().expect("holder identity");
+    control
+        .read_exact(&mut [0])
+        .expect("holder waits until parent kills it");
+    panic!("holder must be killed, never asked to exit cleanly");
+}
+
+#[test]
+#[ignore = "requires an owned rental; never run on the local GPU"]
+fn killed_owner_keeps_read_only_pages() {
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::{net::UnixStream, process::ExitStatusExt};
+    use std::process::Stdio;
+    let (mut control, receiver) = UnixStream::pair().expect("custody control pair");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "custody_holder_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("VARENA_GPU_HELPER", "holder")
+        .stdin(Stdio::from(OwnedFd::from(receiver)))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start holder");
+    let mut count = [0; 4];
+    control.read_exact(&mut count).expect("holder chunk count");
+    let count = u32::from_le_bytes(count);
+    assert!((1..=4096).contains(&count), "bounded nonempty export");
+    let mut spans = Vec::new();
+    for _ in 0..count {
+        let mut span = [0; 8];
+        control.read_exact(&mut span).expect("holder span");
+        spans.push(u64::from_le_bytes(span));
+    }
+    let container = platform::handles::recv_fd(&control).expect("retained page container");
+    child.kill().expect("SIGKILL holder");
+    let output = child.wait_with_output().expect("reap killed holder");
+    assert_eq!(
+        output.status.signal(),
+        Some(9),
+        "holder must actually die from SIGKILL"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let holder = stdout
+        .lines()
+        .find_map(|line| line.split_once("HOLDER ").map(|(_, uuid)| uuid.to_owned()))
+        .expect("holder physical GPU");
+    let (gpu, data) = test_page();
+    assert_eq!(gpu.uuid().expect("replacement GPU"), holder);
+    io::metrics::take();
+    assert!(gpu
+        .import(1, "slim-gpu-owned-view-test", &spans, container)
+        .expect("import after SIGKILL"));
+    assert!(
+        io::metrics::take().is_empty(),
+        "import must not refill the source"
+    );
+    let pin = gpu.bind(1, 0).expect("imported page");
+    assert_eq!(bytes(&pin), data);
+    drop(pin);
+    synchronize();
+    gpu.poll().expect("release imported view");
+    synchronize();
+    assert!(gpu.unregister(1).expect("release killed-owner page"));
+    println!("PASS SIGKILL read-only page custody {holder}");
 }
