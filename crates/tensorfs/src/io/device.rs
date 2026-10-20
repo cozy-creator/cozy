@@ -568,9 +568,10 @@ impl Engine {
             let next = AtomicUsize::new(0);
             let stopped = AtomicBool::new(false);
             let error = Mutex::new(None);
-            let readers = opts.threads.clamp(1, READERS).min(jobs.len());
-            if self.free().len() < readers * RING {
-                let lost = io::Error::other("staging is still retained by a failed copy");
+            // A failed copy's slots stay retained until checked completion: read with the rest.
+            let readers = opts.threads.clamp(1, READERS).min(jobs.len()).min(self.free().len() / RING);
+            if readers == 0 && !jobs.is_empty() {
+                let lost = io::Error::other("all staging is still retained by failed copies");
                 return Err(Error {
                     copy: first,
                     source: lost,
