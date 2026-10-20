@@ -364,6 +364,9 @@ pub enum DeviceCommand {
     },
     Unload {
         construction: String,
+        /// With an empty construction, forget only this request's access and keep warm models.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     Probe {
         collect: bool,
@@ -2361,6 +2364,26 @@ mod codec_tests {
         assert_eq!(frame.issued_token.as_ref().unwrap().0, "private-issued-token");
         assert!(!format!("{frame:?}").contains("private-issued-token"));
         assert!(frame.resolved.is_empty());
+    }
+
+    #[test]
+    fn metadata_request_cleanup_uses_unload_without_unloading_constructions() {
+        let (mut machine, mut runtime) = platform::ipc::pair().unwrap();
+        for _ in 0..2 {
+            write_command(&mut machine, &DeviceCommand::Unload {
+                construction: String::new(), request_id: Some("request-1".into()),
+            }, &Group::default(), false).unwrap();
+            let bytes = seam::read_body(&mut runtime).unwrap().unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value, serde_json::json!({"cmd":"unload", "construction":"", "request_id":"request-1"}));
+        }
+        write_command(&mut machine, &DeviceCommand::Unload {
+            construction: "warm-model".into(), request_id: None,
+        }, &Group::default(), false).unwrap();
+        let bytes = seam::read_body(&mut runtime).unwrap().unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get("request_id").is_none());
+        assert_eq!(value["construction"], "warm-model");
     }
 
     fn ordinary_options() -> protocol::machine::TensorFSOptions {

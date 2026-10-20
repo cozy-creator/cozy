@@ -2499,7 +2499,7 @@ impl Pool {
                 scope.spawn(move || {
                     while !finished.is_cancelled() {
                         if stop.is_cancelled() { let _ = cancellation.cancel(id); break; }
-                        std::thread::sleep(Duration::from_millis(50));
+                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                 });
             }
@@ -2781,7 +2781,20 @@ impl Pool {
         let error = {
             let mut session = session;
             let fetch = calls.map(|calls| engine.get(id).map(|record| calls.fetch(&record))).transpose()?;
-            match self.call(engine, id, &held, plan, &load_caps, &mut session, false, calls, fetch) {
+            let request_access = calls.and_then(|calls| calls.hub_access(id)).is_some();
+            let mut result = self.call(engine, id, &held, plan, &load_caps, &mut session, false, calls, fetch);
+            // This also runs when PrepareRequest cancels or refuses after Load, before
+            // Invoke. Keep the original outcome; request cleanup never unloads warm models.
+            if request_access {
+                let cleaned = session.executor.command(&DeviceCommand::Unload {
+                    construction: String::new(), request_id: Some(id.into()),
+                }, &mut device_executor::Baseline);
+                if !cleaned.is_ok_and(|reply| reply.ok) {
+                    tracing::warn!(run = id, "request access cleanup did not complete");
+                    if matches!(result, Ok(true)) { result = Ok(false); }
+                }
+            }
+            match result {
                 Ok(true) => {
                     self.keep_idle(session);
                     return Ok(());

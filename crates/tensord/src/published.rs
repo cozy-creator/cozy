@@ -781,7 +781,7 @@ impl Publisher {
     fn worker_download(&self, source: &hub::Source, named: Named, lanes: &[&str], stop: Option<&Stop>,
         report: &(dyn Fn(u64, u64) + Sync),
     ) -> Result<(Named, (u64, u64)), Refused> {
-        let (client, endpoint) = source.worker_endpoint().map_err(|e| Refused::from(("model_download_failed", e.0)))?;
+        let (client, endpoint) = source.worker_endpoint().map_err(|e| Refused { code: "model_download_failed", message: e.0 })?;
         self.endpoint_download(client, endpoint, named, lanes, stop, report)
     }
 
@@ -789,7 +789,7 @@ impl Publisher {
         lanes: &[&str], stop: Option<&Stop>, report: &(dyn Fn(u64, u64) + Sync),
     ) -> Result<(Named, (u64, u64)), Refused> {
         use tensorfs::fetch::{bearer, Client, Endpoint, SourcePolicy};
-        let failed = |e: tensorfs::err::Refusal| Refused::from(("model_download_failed", e.to_string()));
+        let failed = |e: tensorfs::err::Refusal| Refused { code: "model_download_failed", message: e.to_string() };
         let policy = SourcePolicy { any_host: true, allow_local: true, max_redirects: 5, ..Default::default() };
         let client = if options.ca_der.is_empty() { Client::new(policy) }
             else { Client::with_roots(policy, hub::pem(&options.ca_der).as_bytes()).map_err(failed)? };
@@ -848,9 +848,9 @@ impl Publisher {
             let mut tick = tokio::time::interval(Duration::from_millis(250));
             loop {
                 tokio::select! {
-                    result = &mut work => break result.map_err(|e| Refused::from(("model_download_failed", e.to_string()))),
+                    result = &mut work => break result.map_err(|e| Refused { code: "model_download_failed", message: e.to_string() }),
                     _ = tick.tick() => {
-                        if stop.is_some_and(Stop::is_cancelled) { break Err(Refused::from(canceled())); }
+                        if stop.is_some_and(Stop::is_cancelled) { let (code, message) = canceled(); break Err(Refused { code, message }); }
                         report(progress.held.load(std::sync::atomic::Ordering::Relaxed), progress.total.load(std::sync::atomic::Ordering::Relaxed));
                     }
                 }
