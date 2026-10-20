@@ -849,7 +849,10 @@ impl Ledger {
     pub fn fits(&self, package: &str, shape: &str) -> Result<bool> {
         self.reap_dead()?;
         let rows = self.table.rows()?;
-        self.admission_releases.lock().retain(|owner, _| {
+        // Keep the release stamp and its pending-generation publication atomic
+        // to other admission checks. This gate never waits for owner callbacks.
+        let mut attempted = self.admission_releases.lock();
+        attempted.retain(|owner, _| {
             rows.iter()
                 .any(|row| row.owner == *owner && row.state == State::Live)
         });
@@ -902,7 +905,6 @@ impl Ledger {
             // idle graph can keep those same weights pinned, so ask its owner to
             // drop discretionary cache refs before retrying this conservative sum.
             let release: Vec<_> = {
-                let mut attempted = self.admission_releases.lock();
                 rows.iter()
                     .filter(|row| {
                         row.snapshot.requests.is_empty()
@@ -919,7 +921,6 @@ impl Ledger {
                     })
                     .collect()
             };
-            // No admission mutex is held across descriptor/claim inspection.
             for owner in release {
                 releasing = true;
                 match self.release_idle_caches(owner) {
