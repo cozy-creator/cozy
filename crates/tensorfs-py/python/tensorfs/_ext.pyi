@@ -210,7 +210,8 @@ class Checkpoint:
     @property
     def repo_id(self) -> str | None: ...
     @property
-    def revision(self) -> str | None: ...
+    def revision(self) -> str | None:
+        """The tag this checkpoint was resolved through, when known."""
     @property
     def pipeline(self) -> Pipeline | None: ...
     @property
