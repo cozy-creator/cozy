@@ -33,6 +33,51 @@ jobs:
         with:
           name: transcript-${{ matrix.os }}
           path: transcript.md
+  candidate:
+    # A release run's own artifacts (its smoke-mirror), served as release-smoke serves them: the
+    # walkthrough, upgrade from the public 0.10.1 and uninstall, before the release is published.
+    if: contains(github.event.head_commit.message, '[candidate]')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04 }
+          - { os: ubuntu-24.04-arm }
+          - { os: macos-15 }
+          - { os: macos-15-intel }
+          - { os: windows-2025, ps: powershell }
+          - { os: windows-11-arm, ps: pwsh }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github
+      - id: run
+        run: echo "id=$(cat .github/candidate-run)" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v8
+        with:
+          name: smoke-mirror
+          path: mirror
+          run-id: ${{ steps.run.outputs.id }}
+          github-token: ${{ github.token }}
+      - run: |
+          python=python3; [ "$RUNNER_OS" != Windows ] || python=python
+          $python -m http.server 8123 --bind 127.0.0.1 --directory mirror > /dev/null 2>&1 &
+          export COZY_DOWNLOAD_URL=http://127.0.0.1:8123
+          until curl -sf "$COZY_DOWNLOAD_URL/dist-manifest.json" > /dev/null; do sleep 1; done
+          bash .github/consumer-probe.sh ${{ matrix.os }} ${{ matrix.ps }}
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: candidate-${{ matrix.os }}
+          path: transcript.md
   master:
     if: contains(github.event.head_commit.message, '[master]')
     strategy:
