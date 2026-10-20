@@ -1281,6 +1281,18 @@ struct HostState {
     clock: u64,
     claims: BTreeMap<u64, Option<u64>>,
 }
+impl HostState {
+    fn can_warm(&self, available: i64, bytes: u64) -> bool {
+        let Some(claimed) = self
+            .claims
+            .values()
+            .try_fold(0_u64, |sum, need| need.map(|need| sum.saturating_add(need)))
+        else {
+            return false;
+        };
+        u64::try_from(available).is_ok_and(|available| available >= bytes.saturating_add(claimed))
+    }
+}
 impl Default for HostCache {
     fn default() -> Self {
         Self {
@@ -1293,15 +1305,31 @@ impl Default for HostCache {
 }
 impl HostCache {
     fn can_warm(&self, available: i64, bytes: u64) -> bool {
+        self.state.lock().can_warm(available, bytes)
+    }
+    fn begin_fill(
+        &self,
+        layout: [u8; 32],
+        identity: u64,
+        index: usize,
+        ram: &Arc<Ram>,
+        available: i64,
+    ) -> bool {
         let state = self.state.lock();
-        let Some(claimed) = state
-            .claims
-            .values()
-            .try_fold(0_u64, |sum, need| need.map(|need| sum.saturating_add(need)))
-        else {
+        if !state.can_warm(available, ram.len as u64) || ram.cancelled.load(Acquire) {
             return false;
-        };
-        u64::try_from(available).is_ok_and(|available| available >= bytes.saturating_add(claimed))
+        }
+        let current = state
+            .ram
+            .get(&layout)
+            .filter(|held| held.identity == identity)
+            .and_then(|held| held.slots.get(index))
+            .and_then(|slot| slot.buffer.as_ref())
+            .is_some_and(|current| Arc::ptr_eq(current, ram));
+        if current {
+            ram.filling.store(true, Release);
+        }
+        current
     }
     fn check_process(&self) -> Result<()> {
         if self.process != std::process::id() {
@@ -1396,13 +1424,13 @@ struct RamFill {
 }
 impl Drop for RamFill {
     fn drop(&mut self) {
-        self.ram.filling.store(false, Release);
-        self.ram.pending.store(false, Release);
         let room = self
             .host
             .can_warm(platform::contain::host_memory::read().available, 0);
         let observers = {
             let mut state = self.host.state.lock();
+            self.ram.filling.store(false, Release);
+            self.ram.pending.store(false, Release);
             state.clock = state.clock.saturating_add(1);
             let generation = state.clock;
             let observers = state
@@ -1563,13 +1591,9 @@ fn register_ram(
                     identity,
                 };
                 let available = platform::contain::host_memory::read().available;
-                if permit.is_none()
-                    || ram.cancelled.load(Acquire)
-                    || !host.can_warm(available, ram.len as u64)
-                {
+                if permit.is_none() || !host.begin_fill(layout, identity, index, &ram, available) {
                     continue;
                 }
-                ram.filling.store(true, Release);
                 // SAFETY: this worker exclusively writes this independent region mapping.
                 let result = unsafe {
                     source.read_items(
