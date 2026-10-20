@@ -110,7 +110,7 @@ fn packed(c: &Ctx, bits: usize, group: bool) -> Result<Shape> {
 }
 
 /// `weight_s_rel`: row blocks of `group_size`, row-major.
-fn groups(c: &Ctx) -> Grid<'static> {
+fn groups(c: &Ctx) -> Grid {
     Grid::Blocks {
         size: c.uint("group_size"),
         layout: ScaleLayout::RowMajor,
@@ -119,7 +119,7 @@ fn groups(c: &Ctx) -> Grid<'static> {
 }
 
 /// `weight_correction`: row blocks of `group_size`, transposed (`[C/g, R]`).
-fn correction(c: &Ctx) -> Grid<'static> {
+fn correction(c: &Ctx) -> Grid {
     Grid::Blocks {
         size: c.uint("group_size"),
         layout: ScaleLayout::Transposed,
