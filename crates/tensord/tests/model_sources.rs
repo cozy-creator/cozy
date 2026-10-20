@@ -19,9 +19,9 @@ fn fixture() -> (std::path::PathBuf, String, Vec<u8>, ObjectRef, ObjectRef) {
     let mut writer = store.writer(None, Some("fixture")).unwrap();
     for (component, bytes) in [("allowed", &data), ("denied", &other)] {
         let shape = [bytes.len() as u64];
-        writer.put(component, "weight", &Dtype::U8, &shape, Data::Plain(Source::Read(&mut bytes.as_slice()))).unwrap();
+        writer.get(component).put("weight", &Dtype::U8, &shape, Data::Plain(Source::Read(&mut bytes.as_slice()))).unwrap();
     }
-    writer.file("tokenizer/vocab.json", b"static tokenizer asset").unwrap();
+    writer.get("allowed").asset("vocab.json", b"static tokenizer asset").unwrap();
     let manifest = writer.commit().unwrap();
     (root, manifest.id(), data.clone(), ObjectRef::of(&data), ObjectRef::of(&other))
 }
@@ -60,8 +60,9 @@ fn frame(manifest: &str, name: &str) -> tensord::device_executor::Frame {
     .unwrap()
 }
 
-/// What `model_source` hands an executor: the header, the manifest (the file list) and each
-/// asset, verified, in a sealed read-only memfd with its digest; nothing outside the selection.
+/// What `model_source` hands an executor: the header and each component asset
+/// (`<component>/<name>`) in a sealed read-only memfd with its digest; nothing outside the
+/// selection.
 #[test]
 fn the_selection_serves_its_header_and_assets_sealed_and_nothing_else() {
     let (root, manifest, _, _, _) = fixture();
@@ -70,17 +71,7 @@ fn the_selection_serves_its_header_and_assets_sealed_and_nothing_else() {
         components: vec!["allowed".into()],
     };
     let sources = ModelSources::open(&root, std::slice::from_ref(&selected)).unwrap();
-    let listing = tensorfs::store2::Store::open(&root).unwrap().read(&tensorfs::format::ObjectRef {
-        sha256: manifest.trim_start_matches("sha256:").into(),
-        length: sources.authorized(&manifest).unwrap().id().length,
-    });
-    let listing = listing.unwrap();
-    assert!(tensorfs::format::Manifest::from_json(&listing).unwrap().files.contains_key("tokenizer/vocab.json"));
-    for (name, want) in [
-        ("", None),
-        (tensord::model_sources::LISTING, Some(listing.as_slice())),
-        ("tokenizer/vocab.json", Some(&b"static tokenizer asset"[..])),
-    ] {
+    for (name, want) in [("", None), ("allowed/vocab.json", Some(&b"static tokenizer asset"[..]))] {
         let (answer, file) = sources.serve(&frame(&manifest, name)).unwrap();
         let mut got = vec![0; answer.length as usize];
         file.read_exact_at(&mut got, 0).unwrap();

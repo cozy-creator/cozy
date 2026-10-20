@@ -36,9 +36,9 @@ pub fn stranger() -> String {
 }
 
 impl Tensord {
-    /// Its store's root.
+    /// Its store's root: the shared TensorFS cache of its home.
     pub fn store(&self) -> std::path::PathBuf {
-        self.root.path().join("machine/var/lib/tensorfs")
+        self.root.path().join(".cache/tensorfs")
     }
 
     /// Starts a machine that admits the controllers holding `keys` (base64url Ed25519 public keys).
@@ -96,6 +96,7 @@ impl Tensord {
             .env_remove("COZY_TEST_TENSORD")
             // A home of its own: this computer's keys and config are not the test machine's.
             .env("HOME", self.root.path())
+            .env_remove("TENSORFS_HOME")
             .env("COZY_MACHINE_ROOT", &root)
             .env("COZY_LISTEN_HOST", "127.0.0.1")
             .env("COZY_WORKER_ID", "cli-test")
