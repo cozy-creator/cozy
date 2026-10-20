@@ -3,6 +3,8 @@
 //! queued run, and keeps its runs through a restart (xs-047).
 #[path = "common/child.rs"]
 mod child;
+#[path = "common/named_runtime.rs"]
+mod named_runtime;
 use child::BareEnv;
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 use std::{
@@ -31,6 +33,7 @@ fn boot(home: &Path) -> (Machine, Client) {
     std::fs::create_dir_all(&keys).unwrap();
     let owner = SigningKey::from_bytes(&[5; 32]);
     std::fs::write(keys.join("owner.pem"), owner.to_pkcs8_pem(Default::default()).unwrap().as_bytes()).unwrap();
+    named_runtime::image(&home.join(".cozy/machine"));
     let mut machine = Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
             .arg("--persistent")

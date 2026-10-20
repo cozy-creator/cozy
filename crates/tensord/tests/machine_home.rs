@@ -4,6 +4,8 @@
 //! uv (the pinned one is fetched), and a restart keeps the port.
 #[path = "common/child.rs"]
 mod child;
+#[path = "common/named_runtime.rs"]
+mod named_runtime;
 use child::BareEnv;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
@@ -27,6 +29,7 @@ impl Drop for Machine {
 }
 
 fn boot(home: &Path) -> Machine {
+    named_runtime::image(&home.join(".cozy/machine"));
     Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
             .arg("--persistent")
