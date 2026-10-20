@@ -77,6 +77,12 @@ jobs:
           sparse-checkout-cone-mode: false
       - id: sha
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # Only older refs carry the OAuth Go harness; newer refs removed it.
+      - uses: actions/setup-go@v6
+        if: inputs.test != '' && hashFiles('crates/tensord/tests/hub-oauth/go.mod') != ''
+        with:
+          go-version-file: crates/tensord/tests/hub-oauth/go.mod
+          cache-dependency-path: crates/tensord/tests/hub-oauth/go.sum
       - uses: astral-sh/setup-uv@v6
         if: inputs.test != '' || inputs.runtime_ref != '' || inputs.tensorfs_run != '' || contains(inputs.build, 'tensorfs') || contains(inputs.build, 'kernels')
       # The Rust workspace: rust-toolchain.toml's toolchain installs on first use. target/manylinux
