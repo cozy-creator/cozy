@@ -220,7 +220,7 @@ class RequestStats:
     id: str
     steps: tuple[Step, ...]
     evictions: tuple[Eviction, ...]
-    #: torch bytes still allocated at its end beyond its start, by GPU (§5.7)
+    #: Torch growth outside declared reclaimable caches, by GPU (§5.7).
     leftover: tuple[tuple[int, int], ...]
     #: weight bytes copied while it ran, home or through slots
     copied: int
@@ -580,6 +580,12 @@ class Memory:
         before = torch.cuda.memory_reserved(self.gpu)
         torch.cuda.empty_cache()
         return max(before - torch.cuda.memory_reserved(self.gpu), 0)
+
+    def _uncached_bytes(self) -> int:
+        if not self.cuda:
+            return 0
+        cached = sum(cache.nbytes for cache in tuple(self.caches) if not cache.closed)
+        return max(torch.cuda.memory_allocated(self.gpu) - cached, 0)
 
     def _measure(self) -> None:
         if self.native is None:
@@ -1044,7 +1050,7 @@ class Memory:
             id,
             next(self._ids),
             self,
-            torch.cuda.memory_allocated(self.gpu) if self.cuda else 0,
+            self._uncached_bytes(),
         )
         request.reads = {
             model.name: (0, 0, model.binding_ns) for model in self.models.values()
@@ -1086,11 +1092,10 @@ class Memory:
                 for event in raw["events"]
             )
             copied = sum(row["stats"]["bytes"] for row in raw["copies"])
-            leftover = (
-                max(torch.cuda.memory_allocated(self.gpu) - request.start, 0)
-                if self.cuda
-                else 0
-            )
+            # Persistent graph/KV caches have a live reclaim owner. Compare the
+            # uncached amount at both ends so shrinking an old cache cannot hide
+            # newly retained package tensors.
+            leftover = max(self._uncached_bytes() - request.start, 0)
             request.stats = RequestStats(
                 id,
                 tuple(request.steps),
