@@ -77,9 +77,9 @@ jobs:
           sparse-checkout-cone-mode: false
       - id: sha
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      # TensorD's OAuth tests build their Go harness (crates/tensord/tests/hub-oauth).
+      # Only older refs carry the OAuth Go harness; newer refs removed it.
       - uses: actions/setup-go@v6
-        if: inputs.test != ''
+        if: inputs.test != '' && hashFiles('crates/tensord/tests/hub-oauth/go.mod') != ''
         with:
           go-version-file: crates/tensord/tests/hub-oauth/go.mod
           cache-dependency-path: crates/tensord/tests/hub-oauth/go.sum

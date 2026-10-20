@@ -1212,17 +1212,27 @@ impl Write for HashWriter<'_> {
     }
 }
 
+/// A registered image frame's pixel layout: its `mode` fact, RGB when an older SDK sent none.
+fn layout(frame: &HostFrame) -> Option<(u64, png::ColorType, image_webp::ColorType)> {
+    match frame.facts.get("mode").map(Value::as_str) {
+        None | Some(Some("RGB")) => Some((3, png::ColorType::Rgb, image_webp::ColorType::Rgb8)),
+        Some(Some("RGBA")) => Some((4, png::ColorType::Rgba, image_webp::ColorType::Rgba8)),
+        _ => None,
+    }
+}
+
 /// Encodes registered PNG/WebP frames in this process exactly as the SDK's post thread
-/// does (lossless RGB; PNG at zlib's fastest level, WebP lossless) and binds every output
-/// to its spool file. None when a frame needs a codec only the SDK has.
+/// does (lossless RGB or RGBA; PNG at zlib's fastest level, WebP lossless) and binds every
+/// output to its spool file. None when a frame needs a codec or layout only the SDK has.
 fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBinding>>> {
-    if reply
+    let Some(layouts) = reply
         .frames
         .iter()
-        .any(|f| !matches!(f.codec.as_str(), "png" | "webp"))
-    {
+        .map(|f| matches!(f.codec.as_str(), "png" | "webp").then_some(f).and_then(layout))
+        .collect::<Option<Vec<_>>>()
+    else {
         return Ok(None);
-    }
+    };
     let invalid = |detail: &str| io::Error::new(io::ErrorKind::InvalidData, detail.to_string());
     let blob = |reference: &str| -> io::Result<String> {
         // A file a child returned, which this run hands on as its own (`jobs::grant`).
@@ -1245,7 +1255,7 @@ fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBind
         }
     };
     let mut media = BTreeMap::new();
-    for frame in &reply.frames {
+    for (frame, (channels, png_color, webp_color)) in reply.frames.iter().zip(layouts) {
         let mut raw = Vec::new();
         open_artifact(spool, Path::new(&frame.raw))?.read_to_end(&mut raw)?;
         let dimension = |name: &str| {
@@ -1260,14 +1270,14 @@ fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBind
             return Err(invalid("registered frame has no dimensions"));
         };
         if raw.len() as u64 != frame.raw_bytes
-            || raw.len() as u64 != width as u64 * height as u64 * 3
+            || raw.len() as u64 != width as u64 * height as u64 * channels
         {
             return Err(invalid("registered raw frame length changed"));
         }
         let mut encoded = Vec::new();
         if frame.codec == "png" {
             let mut encoder = png::Encoder::new(&mut encoded, width, height);
-            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_color(png_color);
             encoder.set_depth(png::BitDepth::Eight);
             encoder.set_compression(png::Compression::Fast);
             encoder
@@ -1276,7 +1286,7 @@ fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBind
                 .map_err(io::Error::other)?;
         } else {
             image_webp::WebPEncoder::new(&mut encoded)
-                .encode(&raw, width, height, image_webp::ColorType::Rgb8)
+                .encode(&raw, width, height, webp_color)
                 .map_err(io::Error::other)?;
         }
         let name = blob(&frame.handle)?;
@@ -2193,6 +2203,51 @@ mod codec_tests {
         let next = read_frame(&mut machine).unwrap().unwrap();
         assert!(next.malformed.is_empty());
         assert_eq!((next.kind, next.seq, next.length), (Kind::ReadGrant, 10, 5));
+    }
+
+    /// An RGBA frame (Qwen-Image 2.1's transparent output) encodes natively with its alpha
+    /// exact, beside an RGB frame from an SDK that names no mode; a layout this encoder does
+    /// not know goes to the SDK's.
+    #[test]
+    fn an_rgba_frame_keeps_its_alpha() {
+        let spool = tempfile::tempdir().unwrap();
+        let rgba: Vec<u8> = vec![255, 0, 0, 255, 0, 255, 0, 0, 0, 0, 255, 128, 9, 8, 7, 0];
+        let frame = |index: usize, codec: &str, mode: Option<&str>, raw: &[u8]| {
+            fs::write(spool.path().join(format!("image-{index}.raw")), raw).unwrap();
+            let mut facts = BTreeMap::from([("width".into(), 2.into()), ("height".into(), 2.into())]);
+            if let Some(mode) = mode {
+                facts.insert("mode".into(), mode.into());
+            }
+            let output = Output { output_id: format!("out-{index}"), asset_ref: format!("asset/image/{index}"),
+                kind: "image".into(), media_type: String::new(), size_bytes: None };
+            let frame = HostFrame { handle: format!("asset/image/{index}"), codec: codec.into(),
+                raw: format!("image-{index}.raw"), raw_bytes: raw.len() as u64, media_type: String::new(), facts };
+            (frame, output)
+        };
+        let frames = [frame(1, "png", Some("RGBA"), &rgba), frame(2, "webp", Some("RGBA"), &rgba),
+            frame(3, "png", None, &rgba[..12])];
+        let reply = Frame { frames: frames.iter().map(|f| f.0.clone()).collect(),
+            outputs: frames.iter().map(|f| f.1.clone()).collect(), ..Default::default() };
+        let bindings = encode_native(spool.path(), &reply).unwrap().unwrap();
+        assert_eq!(bindings.iter().map(|b| b.media_type.as_str()).collect::<Vec<_>>(),
+            ["image/png", "image/webp", "image/png"]);
+        let png = |name: &str| {
+            let mut reader = png::Decoder::new(io::Cursor::new(fs::read(spool.path().join(name)).unwrap()))
+                .read_info().unwrap();
+            let mut pixels = vec![0; reader.output_buffer_size()];
+            let info = reader.next_frame(&mut pixels).unwrap();
+            (info.color_type, pixels[..info.buffer_size()].to_vec())
+        };
+        assert_eq!(png("image-1"), (png::ColorType::Rgba, rgba.clone()));
+        assert_eq!(png("image-3"), (png::ColorType::Rgb, rgba[..12].to_vec()));
+        let mut webp = image_webp::WebPDecoder::new(io::Cursor::new(fs::read(spool.path().join("image-2")).unwrap()))
+            .unwrap();
+        assert!(webp.has_alpha());
+        let mut pixels = vec![0; webp.output_buffer_size().unwrap()];
+        webp.read_image(&mut pixels).unwrap();
+        assert_eq!(pixels, rgba);
+        let unknown = Frame { frames: vec![frame(4, "png", Some("CMYK"), &rgba).0], ..Default::default() };
+        assert!(encode_native(spool.path(), &unknown).unwrap().is_none());
     }
 
     fn pid(codec: &Codec) -> Option<u32> {
