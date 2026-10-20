@@ -519,7 +519,13 @@ async fn thin_folder_and_offline_opens_fetch_only_selected_local_mirror_objects(
     options.token = Some(Arc::new(Denied));
     let client = Client::new(options).unwrap();
     let checkpoint = client
-        .open(thin.to_str().unwrap(), &Open::default())
+        .open(
+            thin.to_str().unwrap(),
+            &Open {
+                local_files_only: true,
+                ..Open::default()
+            },
+        )
         .await
         .unwrap();
     let progress = Mutex::new(Vec::new());
@@ -801,4 +807,132 @@ async fn supplied_provider_error_and_local_unreleased_semantics_are_public() {
         checkpoint.component("other").unwrap().read("v").unwrap(),
         b"QRSTUVWX"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_names_match_the_generic_format_with_unicode_reserved_characters_and_hidden_names() {
+    let scratch = Scratch::new();
+    let data = fixture(&scratch.0);
+    let origin = scratch.0.join("origin");
+    let client = Client::new(config(&scratch.0.join("cache"), origin.to_str().unwrap())).unwrap();
+    let endpoint = Endpoint::new(origin.to_str().unwrap(), None).unwrap();
+    for name in ["AcMe Space/MoDEL%?#É", "Org%2F/.Hidden", "組/名"] {
+        let mut reference: Ref = name.parse().unwrap();
+        assert_eq!(reference.repo_id, name);
+        reference.revision = Some("1".into());
+        let tree = client
+            .upload_folder(&reference, &data.folder, None)
+            .await
+            .unwrap();
+        let (repo, _) = endpoint.repo(name).await.unwrap().unwrap();
+        assert_eq!(repo.release(Some("1")).unwrap().tree, tree);
+        let checkpoint = client
+            .open(
+                name,
+                &Open {
+                    revision: Some("1".into()),
+                    ..Open::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(checkpoint.id(), &data.header);
+        checkpoint.fetch(&Fetch::default()).await.unwrap();
+        assert_eq!(
+            checkpoint.component("model").unwrap().read("w").unwrap(),
+            b"abcdefghijklmnop"
+        );
+    }
+    for invalid in ["./model", "org/..", "org/a\\b", "org/a\0b", "org/a/b"] {
+        assert_eq!(invalid.parse::<Ref>().unwrap_err().kind, Kind::Invalid);
+    }
+    // '@' belongs to the shorthand grammar. A literal '@' identity remains expressible by
+    // the ordinary typed Ref and Endpoint doors without a second parser.
+    let typed = Ref {
+        repo_id: "org/literal@name".into(),
+        revision: Some("1".into()),
+        variant: None,
+        endpoint: None,
+    };
+    let tree = client
+        .upload_folder(&typed, &data.folder, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        endpoint
+            .repo(&typed.repo_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .release(Some("1"))
+            .unwrap()
+            .tree,
+        tree
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn advanced_exact_object_fetch_does_not_widen_the_window_and_uses_the_existing_engine() {
+    let scratch = Scratch::new();
+    let data = fixture(&scratch.0);
+    let origin = scratch.0.join("origin");
+    let producer = Client::new(config(
+        &scratch.0.join("source-cache"),
+        origin.to_str().unwrap(),
+    ))
+    .unwrap();
+    let tree = producer
+        .upload_folder(&"acme/exact".parse().unwrap(), &data.folder, None)
+        .await
+        .unwrap();
+    let cache = scratch.0.join("reader-cache");
+    let reader = Client::new(config(&cache, origin.to_str().unwrap())).unwrap();
+    let checkpoint = reader.open(&tree.id(), &Open::default()).await.unwrap();
+    assert_eq!(
+        tensorfs::raw::fetch_objects(
+            &checkpoint,
+            &[ObjectRef::of(b"unrelated")],
+            &Fetch::default()
+        )
+        .await
+        .unwrap_err()
+        .kind,
+        Kind::Invalid
+    );
+    let wrong_length = ObjectRef {
+        length: data.chunks[0].length + 1,
+        ..data.chunks[0].clone()
+    };
+    assert_eq!(
+        tensorfs::raw::fetch_objects(&checkpoint, &[wrong_length], &Fetch::default())
+            .await
+            .unwrap_err()
+            .kind,
+        Kind::Invalid
+    );
+    tensorfs::raw::fetch_objects(&checkpoint, &data.chunks[..1], &Fetch::default())
+        .await
+        .unwrap();
+    assert!(cache.join(data.chunks[0].key()).exists());
+    assert!(!cache.join(data.chunks[1].key()).exists());
+    assert!(!cache.join(data.chunks[2].key()).exists());
+    assert!(!cache.join(data.asset.key()).exists());
+    let mut bytes = [0; 4];
+    let target = tensorfs::io::Target {
+        component: "model",
+        key: "w",
+        role: "",
+        offset: 2,
+        dst: tensorfs::io::Dst::Host {
+            ptr: bytes.as_mut_ptr(),
+            len: bytes.len(),
+        },
+    };
+    // SAFETY: bytes is exclusively borrowed and remains valid until the synchronous engine returns.
+    unsafe {
+        tensorfs::raw::read_into(&checkpoint, &[target], &tensorfs::io::ReadOpts::default())
+            .unwrap();
+    }
+    assert_eq!(&bytes, b"cdef");
 }

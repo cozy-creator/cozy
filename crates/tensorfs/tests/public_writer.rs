@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tensorfs::format::{Body, Component, Dtype, Header, Location, ObjectRef, Tensor};
-use tensorfs::{export, Client, Config, Fetch, Format, Kind, Open, Ref, Selection};
+use tensorfs::{export, Client, Config, Fetch, Format, Kind, Open, Ref, Selection, WriterOptions};
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -138,12 +138,15 @@ async fn public_export_requires_selected_repo_bytes_and_owns_them_after_client_d
     let endpoint = scratch.0.join("endpoint");
     let writer = client(&scratch.0.join("source-cache"), &endpoint);
     let reference: Ref = "acme/tiny".parse().unwrap();
-    writer
+    let tree = writer
         .upload_folder(&reference, &folder, None)
         .await
         .unwrap();
     let reader = client(&scratch.0.join("reader-cache"), &endpoint);
-    let checkpoint = reader.open("acme/tiny", &Open::default()).await.unwrap();
+    let checkpoint = reader
+        .open(&format!("acme/tiny@{}", tree.id()), &Open::default())
+        .await
+        .unwrap();
     let destination = scratch.0.join("export");
     assert_eq!(
         export(&checkpoint, &destination, Format::Safetensors, None)
@@ -202,32 +205,34 @@ async fn same_header_repository_trees_keep_distinct_folders_through_public_uploa
     fs::write(second.join("README.bin"), second_readme).unwrap();
     let endpoint = scratch.0.join("endpoint");
     let source = client(&scratch.0.join("source-cache"), &endpoint);
-    source
+    let first_tree = source
         .upload_folder(&"acme/first".parse().unwrap(), &first, None)
         .await
         .unwrap();
-    source
+    let second_tree = source
         .upload_folder(&"acme/second".parse().unwrap(), &second, None)
         .await
         .unwrap();
     let reader = client(&scratch.0.join("reader-cache"), &endpoint);
-    let a = reader.open("acme/first", &Open::default()).await.unwrap();
-    let b = reader.open("acme/second", &Open::default()).await.unwrap();
+    let a = reader
+        .open(&format!("acme/first@{}", first_tree.id()), &Open::default())
+        .await
+        .unwrap();
+    let b = reader
+        .open(
+            &format!("acme/second@{}", second_tree.id()),
+            &Open::default(),
+        )
+        .await
+        .unwrap();
     assert_eq!(a.id(), b.id());
     assert_ne!(a.tree(), b.tree());
     a.fetch(&Fetch::default()).await.unwrap();
     b.fetch(&Fetch::default()).await.unwrap();
-    let a_folder = a.folder().unwrap();
-    let b_folder = b.folder().unwrap();
-    assert_ne!(a_folder, b_folder, "same-header repository files collided");
-    assert_eq!(
-        a_folder.file_name().unwrap(),
-        a.tree().unwrap().sha256.as_str()
-    );
-    assert_eq!(
-        b_folder.file_name().unwrap(),
-        b.tree().unwrap().sha256.as_str()
-    );
+    let a_folder = scratch.0.join("portable-first");
+    let b_folder = scratch.0.join("portable-second");
+    export(&a, &a_folder, Format::Cozytensors, None).unwrap();
+    export(&b, &b_folder, Format::Cozytensors, None).unwrap();
     assert_eq!(fs::read(a_folder.join("README.bin")).unwrap(), README);
     assert_eq!(
         fs::read(b_folder.join("README.bin")).unwrap(),
@@ -242,7 +247,7 @@ async fn same_header_repository_trees_keep_distinct_folders_through_public_uploa
     );
     let roundtrip = reader
         .open(
-            "local/roundtrip",
+            &format!("local/roundtrip@{}", first_tree.id()),
             &Open {
                 local_files_only: true,
                 ..Open::default()
@@ -256,4 +261,524 @@ async fn same_header_repository_trees_keep_distinct_folders_through_public_uploa
     let destination = scratch.0.join("export-roundtrip");
     export(&roundtrip, &destination, Format::Safetensors, None).unwrap();
     check_export(&destination);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_writer_resumes_reopens_components_and_keeps_encoded_bytes_and_order() {
+    let scratch = Scratch::new();
+    let client = client(&scratch.0.join("cache"), &scratch.0.join("endpoint"));
+    let config = serde_json::from_str(r#"{"width":4}"#).unwrap();
+    let mut first = client
+        .writer(WriterOptions {
+            resume: Some("tiny-resume"),
+            ..WriterOptions::default()
+        })
+        .unwrap();
+    first
+        .component("model", "test.Model", config)
+        .unwrap()
+        .put("first", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
+        .unwrap();
+    drop(first);
+    let mut writer = client
+        .writer(WriterOptions {
+            resume: Some("tiny-resume"),
+            ..WriterOptions::default()
+        })
+        .unwrap();
+    assert!(writer.has("model", "first").unwrap());
+    // A resumed producer declares its logical metadata; reopening a declared handle never resets it.
+    writer
+        .component(
+            "model",
+            "test.Model",
+            serde_json::from_str(r#"{"width":8}"#).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        writer.component_writer("undeclared").err().unwrap().kind,
+        Kind::NotFound
+    );
+    let mut a: &[u8] = &[5, 6, 7, 8];
+    let mut b: &[u8] = &[9, 10, 11, 12];
+    {
+        let mut component = writer.component_writer("model").unwrap();
+        component
+            .put_encoded(
+                "packed",
+                Dtype::F32,
+                &[2],
+                tensorfs::format::Encoding {
+                    scheme: "acme-q".into(),
+                    params: Default::default(),
+                },
+                vec![
+                    tensorfs::raw::PartData {
+                        role: "weight".into(),
+                        dtype: Dtype::U8,
+                        shape: vec![4],
+                        data: &mut a,
+                    },
+                    tensorfs::raw::PartData {
+                        role: "scale".into(),
+                        dtype: Dtype::U8,
+                        shape: vec![4],
+                        data: &mut b,
+                    },
+                ],
+            )
+            .unwrap();
+        component.asset("tokenizer.json", ASSET).unwrap();
+        component.order(&["packed".into(), "first".into()]).unwrap();
+    }
+    let checkpoint = writer.commit().await.unwrap();
+    assert_eq!(writer.committed().unwrap().id(), checkpoint.id());
+    assert_eq!(
+        checkpoint
+            .header()
+            .components()
+            .iter()
+            .find(|c| c.name == "model")
+            .unwrap()
+            .tensors
+            .iter()
+            .map(|t| t.key.as_str())
+            .collect::<Vec<_>>(),
+        ["packed", "first"]
+    );
+    assert_eq!(checkpoint.component("model").unwrap().config()["width"], 8);
+    let mut derived = client
+        .writer(WriterOptions {
+            base: Some(&checkpoint),
+            ..WriterOptions::default()
+        })
+        .unwrap();
+    derived
+        .component_writer("model")
+        .unwrap()
+        .copy(
+            "first",
+            checkpoint.component("model").unwrap(),
+            Some("copied"),
+        )
+        .unwrap();
+    let copied = derived.commit().await.unwrap();
+    let child = copied.component("model").unwrap().clone();
+    drop(derived);
+    drop(copied);
+    drop(checkpoint);
+    drop(writer);
+    drop(client);
+    assert_eq!(child.read("copied").unwrap(), WEIGHT);
+    assert_eq!(child.asset("tokenizer.json").unwrap(), ASSET);
+    let mut bytes = [0; 4];
+    child
+        .read_part_into("packed", "scale", 0, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, [9, 10, 11, 12]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn file_writer_publishes_only_exact_header_and_keeps_content_after_drop_move_and_gc() {
+    let scratch = Scratch::new();
+    let cache = scratch.0.join("cache");
+    let client = client(&cache, &scratch.0.join("endpoint"));
+    let dest = scratch
+        .0
+        .join("published")
+        .join("arbitrary-name.cozytensors");
+    assert_eq!(
+        client
+            .writer(WriterOptions {
+                dest: Some(&dest),
+                variant: Some("bf16"),
+                ..WriterOptions::default()
+            })
+            .err()
+            .unwrap()
+            .kind,
+        Kind::Invalid
+    );
+    let mut first = client
+        .writer(WriterOptions {
+            dest: Some(&dest),
+            resume: Some("reused-key"),
+            ..WriterOptions::default()
+        })
+        .unwrap();
+    first
+        .component("model", "test.Model", Default::default())
+        .unwrap()
+        .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
+        .unwrap();
+    assert!(!dest.exists(), "header was published before commit");
+    let old = first.commit().await.unwrap();
+    let original_header = fs::read(&dest).unwrap();
+    assert_eq!(ObjectRef::of(&original_header), *old.id());
+    assert!(!dest.parent().unwrap().join("chunks").exists());
+    assert_eq!(fs::read_dir(dest.parent().unwrap()).unwrap().count(), 1);
+    let pin: serde_json::Value = serde_json::from_slice(
+        &fs::read(cache.join("pins").join(format!("{}.json", old.id().sha256))).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        pin.get("owner").is_none(),
+        "a persistent header got a disposable cache pin"
+    );
+    let mut next = client
+        .writer(WriterOptions {
+            dest: Some(&dest),
+            resume: Some("reused-key"),
+            ..WriterOptions::default()
+        })
+        .unwrap();
+    let replacement = [2, 4, 6, 8];
+    next.component("model", "test.Model", Default::default())
+        .unwrap()
+        .put("w", Dtype::U8, &[4], &mut &replacement[..])
+        .unwrap();
+    let new = next.commit().await.unwrap();
+    assert_ne!(new.id(), old.id());
+    assert_eq!(
+        fs::read(&dest).unwrap().len(),
+        original_header.len(),
+        "fixture must exercise same-length replacement"
+    );
+    assert_eq!(old.component("model").unwrap().read("w").unwrap(), WEIGHT);
+    let old_id = old.id().clone();
+    let new_id = new.id().clone();
+    let moved = scratch.0.join("moved-header.cozytensors");
+    fs::rename(&dest, &moved).unwrap();
+    drop(first);
+    drop(next);
+    drop(old);
+    drop(new);
+    drop(client);
+    // Operator maintenance is used solely to exercise the real collector, not to create output.
+    let operator = tensorfs::store2::Store::open(&cache)
+        .unwrap()
+        .with_grace(std::time::Duration::ZERO);
+    let disposable = operator
+        .put_bytes(b"unreferenced positive eviction control")
+        .unwrap();
+    operator.collect(0, std::time::Duration::ZERO).unwrap();
+    assert!(
+        !cache.join(disposable.key()).exists(),
+        "collector positive control did not run"
+    );
+    assert!(cache.join(old_id.key()).exists() && cache.join(new_id.key()).exists());
+    drop(operator);
+    let reopened = self::client(&cache, &scratch.0.join("endpoint"))
+        .open(
+            moved.to_str().unwrap(),
+            &Open {
+                local_files_only: true,
+                ..Open::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopened.id(), &new_id);
+    assert_eq!(
+        reopened.component("model").unwrap().read("w").unwrap(),
+        replacement
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_file_publication_still_exposes_the_committed_local_checkpoint() {
+    let scratch = Scratch::new();
+    let client = client(&scratch.0.join("cache"), &scratch.0.join("endpoint"));
+    let dest = scratch.0.join("a-directory");
+    fs::create_dir(&dest).unwrap();
+    let mut writer = client
+        .writer(WriterOptions {
+            dest: Some(&dest),
+            ..WriterOptions::default()
+        })
+        .unwrap();
+    writer
+        .component("model", "test.Model", Default::default())
+        .unwrap()
+        .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
+        .unwrap();
+    assert_eq!(writer.commit().await.unwrap_err().kind, Kind::Io);
+    let retained = writer
+        .committed()
+        .expect("sealed local result lost on file publication failure");
+    drop(writer);
+    drop(client);
+    assert_eq!(
+        retained.component("model").unwrap().read("w").unwrap(),
+        WEIGHT
+    );
+    assert!(dest.is_dir());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn portable_export_preflights_full_closure_and_atomically_replaces_shared_inodes() {
+    let scratch = Scratch::new();
+    let folder = fixture(&scratch.0);
+    let client = client(&scratch.0.join("cache"), &scratch.0.join("endpoint"));
+    let checkpoint = client
+        .open(folder.to_str().unwrap(), &Open::default())
+        .await
+        .unwrap();
+    let header = fs::read(folder.join("model.cozytensors")).unwrap();
+    let portable = scratch.0.join("portable");
+    fs::create_dir_all(portable.join("chunks")).unwrap();
+    fs::hard_link(folder.join("README.bin"), portable.join("README.bin")).unwrap();
+    fs::hard_link(
+        folder.join("chunks").join(&ObjectRef::of(WEIGHT).sha256),
+        portable.join("chunks").join(&ObjectRef::of(WEIGHT).sha256),
+    )
+    .unwrap();
+    fs::hard_link(
+        folder.join("model.cozytensors"),
+        portable.join("model.cozytensors"),
+    )
+    .unwrap();
+    export(&checkpoint, &portable, Format::Cozytensors, None).unwrap();
+    export(&checkpoint, &folder, Format::Cozytensors, None).unwrap();
+    assert_eq!(fs::read(folder.join("README.bin")).unwrap(), README);
+    assert_eq!(
+        fs::read(folder.join("chunks").join(&ObjectRef::of(WEIGHT).sha256)).unwrap(),
+        WEIGHT
+    );
+    assert_eq!(
+        fs::read(portable.join("model.cozytensors")).unwrap(),
+        header
+    );
+    drop(checkpoint);
+    drop(client);
+    let reopened = self::client(&scratch.0.join("empty-cache"), &scratch.0.join("endpoint"))
+        .open(portable.to_str().unwrap(), &Open::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.component("model").unwrap().read("w").unwrap(),
+        WEIGHT
+    );
+    assert_eq!(
+        reopened
+            .component("model")
+            .unwrap()
+            .asset("tokenizer.json")
+            .unwrap(),
+        ASSET
+    );
+    assert!(!scratch
+        .0
+        .join("empty-cache")
+        .join(ObjectRef::of(WEIGHT).key())
+        .exists());
+    fs::remove_file(portable.join("chunks").join(&ObjectRef::of(WEIGHT).sha256)).unwrap();
+    let incomplete = scratch.0.join("refused");
+    assert_eq!(
+        export(&reopened, &incomplete, Format::Cozytensors, None)
+            .unwrap_err()
+            .kind,
+        Kind::NotFound
+    );
+    assert!(!incomplete.join("model.cozytensors").exists());
+    assert_eq!(
+        export(
+            &reopened,
+            &incomplete,
+            Format::Cozytensors,
+            Some(&Dtype::F32)
+        )
+        .unwrap_err()
+        .kind,
+        Kind::Invalid
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn literal_header_fetches_selected_missing_payload_online_but_not_offline_or_neighbor_repo_files(
+) {
+    let scratch = Scratch::new();
+    let folder = fixture(&scratch.0);
+    let endpoint = scratch.0.join("endpoint");
+    let producer = client(&scratch.0.join("source-cache"), &endpoint);
+    producer
+        .upload_folder(&"acme/source".parse().unwrap(), &folder, None)
+        .await
+        .unwrap();
+    let header = scratch.0.join("only-header.cozytensors");
+    fs::copy(folder.join("model.cozytensors"), &header).unwrap();
+    fs::write(
+        scratch.0.join("README.bin"),
+        b"neighbor must not be inferred",
+    )
+    .unwrap();
+    let offline = client(&scratch.0.join("offline-cache"), &endpoint)
+        .open(
+            header.to_str().unwrap(),
+            &Open {
+                local_files_only: true,
+                ..Open::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        offline.fetch(&Fetch::default()).await.unwrap_err().kind,
+        Kind::NotFound
+    );
+    let cache = scratch.0.join("online-cache");
+    let online = client(&cache, &endpoint)
+        .open(header.to_str().unwrap(), &Open::default())
+        .await
+        .unwrap();
+    online
+        .fetch(&Fetch {
+            selection: Selection::Assets {
+                component: "model".into(),
+                names: None,
+            },
+            ..Fetch::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        online
+            .component("model")
+            .unwrap()
+            .asset("tokenizer.json")
+            .unwrap(),
+        ASSET
+    );
+    assert!(!cache.join(ObjectRef::of(WEIGHT).key()).exists());
+    online.fetch(&Fetch::default()).await.unwrap();
+    let output = scratch.0.join("literal-portable");
+    export(&online, &output, Format::Cozytensors, None).unwrap();
+    assert!(!output.join("README.bin").exists());
+    assert_eq!(
+        online.component("model").unwrap().read("w").unwrap(),
+        WEIGHT
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_streaming_writer_uploads_sealed_asset_before_commit_and_keeps_failed_local_result()
+{
+    let scratch = Scratch::new();
+    let endpoint = scratch.0.join("endpoint");
+    let client = client(&scratch.0.join("cache"), &endpoint);
+    let mut writer = client
+        .writer(WriterOptions {
+            repo_id: Some("acme/streamed"),
+            ..WriterOptions::default()
+        })
+        .unwrap();
+    writer
+        .component("model", "test.Model", Default::default())
+        .unwrap()
+        .asset("tokenizer.json", ASSET)
+        .unwrap();
+    let uploaded = endpoint.join(ObjectRef::of(ASSET).key());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !uploaded.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fs::read(&uploaded).unwrap(), ASSET);
+    assert!(
+        !endpoint
+            .join(tensorfs::format::repo_key("acme/streamed"))
+            .exists(),
+        "repo was published before commit"
+    );
+    writer
+        .component_writer("model")
+        .unwrap()
+        .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
+        .unwrap();
+    let checkpoint = writer.commit().await.unwrap();
+    let tree = checkpoint.tree().unwrap().clone();
+    let reader = self::client(&scratch.0.join("reader"), &endpoint);
+    let remote = reader
+        .open(&format!("acme/streamed@{}", tree.id()), &Open::default())
+        .await
+        .unwrap();
+    remote.fetch(&Fetch::default()).await.unwrap();
+    assert_eq!(
+        remote.component("model").unwrap().read("w").unwrap(),
+        WEIGHT
+    );
+    let broken = scratch.0.join("not-a-directory");
+    fs::write(&broken, b"broken endpoint").unwrap();
+    let bad = self::client(&scratch.0.join("failed-cache"), &broken);
+    let mut failed = bad
+        .writer(WriterOptions {
+            repo_id: Some("acme/failed"),
+            ..WriterOptions::default()
+        })
+        .unwrap();
+    failed
+        .component("model", "test.Model", Default::default())
+        .unwrap()
+        .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
+        .unwrap();
+    assert!(failed.commit().await.is_err());
+    let local = failed
+        .committed()
+        .expect("stream failure lost sealed local checkpoint");
+    failed.abandon().unwrap();
+    drop(bad);
+    assert_eq!(local.component("model").unwrap().read("w").unwrap(), WEIGHT);
+}
+
+struct WriterRefusal(tensorfs::Failure);
+#[async_trait::async_trait]
+impl tensorfs::TokenProvider for WriterRefusal {
+    async fn headers(
+        &self,
+        _request: &tensorfs::Request<'_>,
+    ) -> tensorfs::Result<Vec<(String, String)>> {
+        Err(self.0.clone())
+    }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn writer_provider_error_keeps_the_exact_family_and_detail_including_empty_and_literal_prefix(
+) {
+    let scratch = Scratch::new();
+    for kind in [Kind::Denied, Kind::Conflict, Kind::Invalid] {
+        for detail in ["", "CREDENTIAL_REQUIRED: literal caller detail"] {
+            let mut config = Config::from_env();
+            config.cache_dir = scratch
+                .0
+                .join(format!("cache-{}-{}", kind.code(), detail.len()));
+            config.endpoint = "http://127.0.0.1:1".into();
+            config.mirror = None;
+            config.token = Some(std::sync::Arc::new(WriterRefusal(tensorfs::Failure {
+                kind,
+                detail: detail.into(),
+            })));
+            let client = Client::new(config).unwrap();
+            let mut writer = client
+                .writer(WriterOptions {
+                    repo_id: Some("acme/refusal"),
+                    ..WriterOptions::default()
+                })
+                .unwrap();
+            writer
+                .component("model", "test.Model", Default::default())
+                .unwrap()
+                .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
+                .unwrap();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), writer.commit())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.detail, detail);
+            let local = writer.committed().unwrap();
+            writer.abandon().unwrap();
+            assert_eq!(local.component("model").unwrap().read("w").unwrap(), WEIGHT);
+        }
+    }
 }

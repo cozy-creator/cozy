@@ -105,10 +105,14 @@ pub mod raw;
 /// The public session API; networking uses the caller's async runtime.
 #[cfg(feature = "store")]
 mod session;
+/// Advanced interop shared by language bindings and placement integrations.
+#[cfg(feature = "store")]
+pub mod raw;
 #[cfg(feature = "store")]
 pub use session::{
-    bearer, export, Checkpoint, Client, Component, ComponentWriter, Config, DPoP, Endpoint,
-    Fetch, Fetched, Format, HeaderMap, JwtBearer, Open, Progress, Ref, Request, Selection,
+    bearer, export, Checkpoint, Client, Component, ComponentWriter, Config, Convert,
+    ConvertProgress, DPoP, Endpoint, Fetch, Fetched, Format, HeaderMap, JwtBearer, Open,
+    Progress, Ref, Request, Selection,
     TokenProvider, Writer, WriterOptions,
 };
 
