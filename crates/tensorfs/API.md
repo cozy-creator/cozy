@@ -97,7 +97,7 @@ exact remote tree.
 | `open(name_or_path, &Open)` | Open metadata, optionally waiting for all checkpoint data with `lazy: false`; returns `Result<Checkpoint>`. |
 | `materialize(&Ref, &Download, local_dir, local_files_only)` | Make selected repository content available as a normal folder; returns `Result<PathBuf>`. |
 | `download_file(&Ref, filename, local_dir, local_files_only)` | Fetch one repository file; returns `Result<PathBuf>`. |
-| `upload_folder(&Ref, folder, progress)` | Publish the folder; returns `Result<ObjectRef>`. |
+| `upload_folder(&Ref, folder, progress)` | Upload the folder as a commit and move the private tag `Ref.revision` (default `main`) to it; returns the commit, `Result<ObjectRef>`. |
 | `convert_to_cozytensors(&[String], &Convert)` | Convert pinned sources; returns `Result<Checkpoint>`. |
 | `writer(WriterOptions)` | Begin a write; returns `Result<Writer>`. |
 
@@ -111,9 +111,9 @@ let folder = client.materialize(&model, &Download::default(), None, false).await
 println!("downloaded to {}", folder.display());
 
 saved.materialize(Path::new("./portable"), Format::Cozytensors, false).await?;
-let destination: Ref = "me/output".parse()?;
-let tree = client.upload_folder(&destination, Path::new("./portable"), None).await?;
-println!("published {}", tree.id());
+let destination: Ref = "me/output@draft".parse()?;
+let commit = client.upload_folder(&destination, Path::new("./portable"), None).await?;
+println!("me/output@draft is {}", commit.id());
 ```
 
 Checkpoint materialization includes that checkpoint and any known repository files.
@@ -161,7 +161,7 @@ below; normal model consumers do not need it.
 
 `Progress` is a borrowed `Fn(u64, u64) -> Result<()> + Sync` (held bytes, total bytes).
 `ConvertProgress` additionally receives a stage string. A callback can stop remaining work
-by returning an error. The final `upload_folder` progress callback runs after publication:
+by returning an error. The final `upload_folder` progress callback runs after the tag moved:
 its error is returned to the caller but does not undo the repository update. Configured
 providers supply ordinary credentials; construction does not create a separate
 worker-permission mechanism.

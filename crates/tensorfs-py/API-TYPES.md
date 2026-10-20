@@ -54,7 +54,7 @@ def open(name_or_path: StrPath, *, revision: str | None=None, variant: str | Non
 def materialize(source: str | Checkpoint, *, revision: str | None=None, variant: str | None=None, components: Sequence[str] | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, format: str='cozytensors', decode: bool=False) -> str:
     ...
 
-def upload_folder(*, repo_id: str, folder_path: StrPath, revision: str | None=None, token: Token | None=None, endpoint: str | None=None, cache_dir: StrPath | None=None) -> str:
+def upload_folder(*, repo_id: str, folder_path: StrPath, revision: str='main', token: Token | None=None, endpoint: str | None=None, cache_dir: StrPath | None=None) -> str:
     ...
 
 class Error(Exception):
@@ -379,6 +379,9 @@ class Endpoint:
     def update_repo(self, repo_id: str, change: Callable[[dict[str, object] | None], dict[str, object] | None]) -> dict[str, object]:
         ...
 
+    def commit(self, repo_id: str, revision: str) -> tuple[str, str | None]:
+        """A revision (tag, commit or variant header) to its commit id, and the tag it went through."""
+
 class ComponentWriter:
 
     def put(self, key: str, data: Buffer | DLPack, *, dtype: str | None=None, shape: Sequence[int] | None=None) -> None:
@@ -403,11 +406,12 @@ class Writer:
     metadata: dict[str, object]
     local_checkpoint: Checkpoint | None
 
-    def __init__(self, dest: StrPath | None=None, *, variant: str | None=None, base: Checkpoint | None=None, resume: str | None=None, repo_id: str | None=None, endpoint: str | None=None, token: Token | None=None, cache_dir: StrPath | None=None) -> None:
+    def __init__(self, dest: StrPath | None=None, *, variant: str | None=None, base: Checkpoint | None=None, resume: str | None=None, repo_id: str | None=None, revision: str | None=None, endpoint: str | None=None, token: Token | None=None, cache_dir: StrPath | None=None) -> None:
         """Write an exact header-file path, or only the shared store when dest=None.
 
         The file is a handle into the shared local store that roots its data while it holds
-        this header; `materialize` makes the portable copy. `variant` names
+        this header; `materialize` makes the portable copy. With `repo_id`, commit makes a commit
+        and moves the private tag `revision` (default `main`) to it. `variant` names
         `model.<variant>.cozytensors` in a `repo_id` upload and is refused without `repo_id`.
         """
 

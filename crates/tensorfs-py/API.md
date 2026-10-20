@@ -32,7 +32,8 @@ weight = checkpoint.components["unet"].tensors.read("conv_in.weight")
 In these examples `me/model` stands for a repository you can read, with `bf16` and `int8` variants.
 
 `open` returns a `Checkpoint`. By default (`lazy=True`), it loads metadata; reading
-tensors then downloads the objects those tensors need. `revision` selects a release or immutable reference;
+tensors then downloads the objects those tensors need. `revision` names a tag, a commit (`sha256:<tree>`) or a
+variant header (`sha256:<header>`), resolved once at open; without one, the newest public final release;
 `variant` selects a representation such as `bf16` or `int8`. Without a variant, a
 single-variant tree is unambiguous; a multi-variant tree requires a choice. No separate
 download call is required. The same `open` accepts a local `.cozytensors` header or an
@@ -264,9 +265,9 @@ Additional checkpoint properties and operations:
 | Attribute or call | Meaning |
 |---|---|
 | `id` | Header identity, a `sha256:…` string. |
-| `tree` | Repository-tree identity, a `sha256:…` string, when known. |
+| `tree` | Commit identity (the repository tree), a `sha256:…` string, when known. |
 | `repo_id` | Repository name, when known. |
-| `revision` | Release label, when known. |
+| `revision` | Tag name, when opened through one. |
 | `variant` | Selected repository variant, when known. A standalone header does not store this label. |
 | `pipeline`, `components` | Pipeline description and ordered component mapping. |
 | `metadata` | Loading/provenance metadata. |

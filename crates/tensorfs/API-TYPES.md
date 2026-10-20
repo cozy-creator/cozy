@@ -87,9 +87,10 @@ impl Client {
         &self, reference: &Ref, filename: &str,
         local_dir: Option<&Path>, local_files_only: bool,
     ) -> Result<PathBuf>;
+    // Uploads the folder as a commit and moves the private tag reference.revision (default "main").
     pub async fn upload_folder(&self, reference: &Ref, folder: &Path,
         progress: Option<&Progress<'_>>) -> Result<ObjectRef>;
-    // The final progress callback runs after publication; its error cannot undo that update.
+    // The final progress callback runs after the tag moved; its error cannot undo that update.
 }
 // Python components= maps to Selection::Components. Asset selection does not fetch tensor chunks.
 
@@ -167,6 +168,8 @@ impl Endpoint {
         &self, repo_id: &str,
         change: impl FnMut(Option<Repo>) -> Result<Option<Repo>>,
     ) -> Result<Repo>;
+    // A revision (tag, commit or variant header) to its commit, and the tag it went through.
+    pub async fn commit(&self, repo_id: &str, revision: &str) -> Result<(ObjectRef, Option<String>)>;
 }
 // Endpoint("local") resolves default cache root; with_config supplies explicit
 // cache_dir/CA/provider. No callback changes a different repo or bypasses native CAS.
@@ -213,7 +216,7 @@ pub struct WriterOptions<'a> {
     // dest and repo_id exclude each other; variant needs repo_id.
     pub dest: Option<&'a Path>, pub variant: Option<&'a str>,
     pub base: Option<&'a Checkpoint>, pub resume: Option<&'a str>,
-    pub repo_id: Option<&'a str>, pub endpoint: Option<&'a str>,
+    pub repo_id: Option<&'a str>, pub revision: Option<&'a str>, pub endpoint: Option<&'a str>,
     pub token: Option<Arc<dyn TokenProvider>>,
 }
 pub struct Writer { /* owned local and optional remote write state */ }
