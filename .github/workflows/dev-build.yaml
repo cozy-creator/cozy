@@ -51,6 +51,10 @@ on:
         description: Existing dev-build run whose retained proof artifacts the targeted tests inspect or package
         type: string
         default: ''
+      testbins_extra_run:
+        description: Optional second dev-build run whose retained proof artifacts tests inspect in a separate directory
+        type: string
+        default: ''
       tensorhub_ref:
         description: Optional Tensorhub source to check out at .tensorhub for targeted live tests
         type: string
@@ -324,6 +328,16 @@ jobs:
           path: ${{ runner.temp }}/proof-artifacts
       - if: inputs.testbins_run != ''
         run: echo "COZY_TEST_PROOF_ARTIFACTS=$RUNNER_TEMP/proof-artifacts" >> "$GITHUB_ENV"
+      - if: inputs.testbins_extra_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.testbins_extra_run }}
+          pattern: dev-testbins-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/proof-extra-artifacts
+      - if: inputs.testbins_extra_run != ''
+        run: echo "COZY_TEST_EXTRA_PROOF_ARTIFACTS=$RUNNER_TEMP/proof-extra-artifacts" >> "$GITHUB_ENV"
       # The machine's executor containment needs a delegated cgroup subtree.
       - if: inputs.test != ''
         env:
@@ -331,7 +345,7 @@ jobs:
           AUTHKIT_TEST_DATABASE_URL: postgres://postgres:ci-only@127.0.0.1:5432/postgres?sslmode=disable
         run: |
           locations=()
-          for name in AUTHKIT_TEST_DATABASE_URL TENSORFS_TEST_PYTHON COZY_TEST_RUNTIME_WHEEL COZY_TEST_TENSORFS_WHEEL COZY_TEST_DEV_BINARY COZY_TEST_PROOF_ARTIFACTS; do
+          for name in AUTHKIT_TEST_DATABASE_URL TENSORFS_TEST_PYTHON COZY_TEST_RUNTIME_WHEEL COZY_TEST_TENSORFS_WHEEL COZY_TEST_DEV_BINARY COZY_TEST_PROOF_ARTIFACTS COZY_TEST_EXTRA_PROOF_ARTIFACTS; do
             [ -z "${!name:-}" ] || locations+=("--setenv=$name=${!name}")
           done
           sudo systemd-run --wait --pipe --collect \
