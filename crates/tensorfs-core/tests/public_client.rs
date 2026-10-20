@@ -294,6 +294,20 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
     assert!(!http.fetched(&data.chunks[0]) && !http.fetched(&data.chunks[2]));
     assert_eq!(checkpoint.components().len(), 3);
 
+    let support = scratch.0.join("support-files");
+    assert_eq!(
+        checkpoint
+            .component("tokenizer")
+            .unwrap()
+            .export_files(&support)
+            .unwrap_err()
+            .kind,
+        Kind::NotFound
+    );
+    assert!(
+        !support.exists(),
+        "unfetched support-file export created output"
+    );
     checkpoint
         .fetch(&Fetch {
             selection: Selection::Assets {
@@ -306,9 +320,29 @@ async fn actual_public_client_selects_fetches_and_retains_children() {
         .unwrap();
     let tokenizer = checkpoint.component("tokenizer").unwrap().clone();
     assert_eq!(
-        fs::read(tokenizer.folder().unwrap().join("tokenizer.json")).unwrap(),
+        fs::read(
+            tokenizer
+                .export_files(&support)
+                .unwrap()
+                .join("tokenizer.json")
+        )
+        .unwrap(),
         tokenizer.asset("tokenizer.json").unwrap()
     );
+    let support_names: BTreeMap<_, _> = fs::read_dir(&support)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (e.file_name(), e.metadata().unwrap().len())
+        })
+        .collect();
+    assert_eq!(
+        support_names.len(),
+        2,
+        "support export must contain only config and the asset"
+    );
+    assert!(support.join("config.json").is_file());
+    assert!(!support.join("chunks").exists());
     assert!(http.fetched(&data.asset));
     assert!(!http.fetched(&data.chunks[0]) && !http.fetched(&data.chunks[2]));
 
