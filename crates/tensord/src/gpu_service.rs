@@ -1984,19 +1984,38 @@ impl Pool {
     fn fits(&self, plan: &str, device: usize) -> bool {
         self.devices[device].memory.fits(plan, Vec::new)
     }
-    fn watch_memory(&self, engine: &Arc<Engine>) {
+    fn watch_memory(self: &Arc<Self>, engine: &Arc<Engine>) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else { return; };
         let mut watchers = self.memory_watchers.lock().unwrap();
         if !watchers.is_empty() { return; }
         for device in &self.devices {
             let Ok(source) = device.memory.placement().and_then(|m| m.event_source()) else { continue; };
-            let engine = Arc::downgrade(engine);
+            let ledger = device.memory.placement().ok().map(|m| m.ledger().clone());
+            let (engine, pool) = (Arc::downgrade(engine), Arc::downgrade(self));
             watchers.push(runtime.spawn(async move {
                 while crate::memory::slim::Memory::changed(&source).await.is_ok() {
-                    let Some(engine) = engine.upgrade() else { break; };
+                    let (Some(engine), Some(pool)) = (engine.upgrade(), pool.upgrade()) else { break; };
+                    if let Some(ledger) = &ledger {
+                        if let Ok(stalled) = ledger.stalled() {
+                            for pid in stalled { pool.end_stalled(pid); }
+                        }
+                    }
                     engine.notify_activity();
                 }
             }));
+        }
+    }
+    fn end_stalled(&self, pid: u32) {
+        let birth = self.accounting.lock().unwrap().values()
+            .filter_map(|owner| owner.birth.as_ref()).find(|birth| birth.pid == pid).cloned();
+        if let Some(birth) = birth {
+            match platform::process::Exact::open(&birth) {
+                Ok(Some(process)) => {
+                    if let Err(error) = process.kill() { tracing::warn!(%error, pid, "stalled memory owner could not end"); }
+                }
+                Ok(None) => (),
+                Err(error) => tracing::warn!(%error, pid, "stalled memory owner changed"),
+            }
         }
     }
     /// Where `plan` runs now, with its GPUs' call slots: inside its root's `lane` when it has
