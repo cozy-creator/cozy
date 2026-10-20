@@ -54,9 +54,11 @@ pub struct Event {
 #[derive(Clone, Debug)]
 pub struct Copy {
     pub request: RequestId,
+    pub model: ModelId,
     pub page: PageId,
     pub tier: Tier,
     pub speculative: bool,
+    pub streamed: bool,
     pub stats: ReadStats,
 }
 
@@ -774,6 +776,15 @@ impl Placement {
         Ok(stats)
     }
 
+    pub fn stats(&self, request: RequestId) -> Result<Stats> {
+        self.inner
+            .lock()
+            .requests
+            .get(&request)
+            .map(|run| run.stats.clone())
+            .ok_or_else(|| invalid("unknown request"))
+    }
+
     pub fn relief(&self, request: RequestId, need: u64, lower: bool) -> Result<Relief> {
         self.gpu.recover()?;
         self.refresh()?;
@@ -1429,7 +1440,7 @@ impl Placement {
                 row.attempted.insert(step);
             }
         }
-        let (transform, key) = {
+        let (model, transform, key, streamed) = {
             let inner = self.inner.lock();
             let model = inner
                 .table
@@ -1446,11 +1457,16 @@ impl Placement {
                 .position(|id| *id == page)
                 .ok_or_else(|| invalid("page not in model"))?;
             (
+                model,
                 data.transform.clone(),
                 PageKey {
                     fingerprint: data.fingerprint,
                     page: index as u64,
                 },
+                inner
+                    .table
+                    .page(page)
+                    .is_some_and(|row| row.lowered.contains(&request)),
             )
         };
         let apply = |pin| transform.as_ref().map_or(Ok(()), |fill| fill(page, pin));
@@ -1477,9 +1493,11 @@ impl Placement {
         if let Some(run) = inner.requests.get_mut(&request) {
             run.stats.copies.push(Copy {
                 request,
+                model,
                 page,
                 tier: actual,
                 speculative: speculative.is_some(),
+                streamed,
                 stats,
             });
         }
