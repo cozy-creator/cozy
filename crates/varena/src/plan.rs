@@ -1367,6 +1367,41 @@ mod tests {
     }
 
     #[test]
+    fn lower_keeps_home_that_fits_the_allocation_and_streaming_ring() {
+        const MIB: u64 = 1 << 20;
+        let mut run = request(1);
+        run.working_sets = vec![Some(200 * MIB)];
+        let mut pages: Vec<_> = (1..=6)
+            .map(|id| {
+                let mut page = page(id, 100 * MIB);
+                page.uses = vec![usage(1, 0)];
+                page
+            })
+            .collect();
+        let mut context = page(7, 100 * MIB);
+        context.model = None;
+        context.kind = Kind::Context;
+        let mut scratch = page(8, 200 * MIB);
+        scratch.model = None;
+        scratch.kind = Kind::Scratch(1);
+        pages.extend([context, scratch]);
+        let table = Table {
+            capacity: 1400 * MIB,
+            pages,
+            rows: vec![Row { id: 1, alive: true, reaping: false }],
+            requests: vec![run],
+            ..Default::default()
+        };
+        let actions = decide(&table, Trigger::Lower { request: 1, need: 600 * MIB });
+        // 100 context + 200 live activation + 200 home + 300 ring +
+        // (536 allocation + 64 slack) = 1400 MiB. Four whole-page drops fit;
+        // freeing the allocation's full 600 MiB would discard two useful pages.
+        assert_eq!(actions.iter().filter(|a| matches!(a, Action::DropHome { .. })).count(), 4);
+        assert!(!actions.iter().any(|a| matches!(a, Action::Exhausted { .. })));
+        assert!(!actions.contains(&Action::Unmap(7)) && !actions.contains(&Action::Unmap(8)));
+    }
+
+    #[test]
     fn repeated_binds_cannot_select_a_later_declared_step() {
         let mut run = request(1);
         run.position.step = 1;
