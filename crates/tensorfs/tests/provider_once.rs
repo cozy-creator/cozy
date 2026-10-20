@@ -19,8 +19,10 @@ use tensorfs::{Client, Config, DPoP, JwtBearer, Kind, Open, Request, TokenProvid
 
 fn point() -> Vec<u8> {
     fn bytes(hex: &str) -> Vec<u8> {
-        hex.as_bytes()
-            .chunks_exact(2)
+        let (pairs, rest) = hex.as_bytes().as_chunks::<2>();
+        assert!(rest.is_empty());
+        pairs
+            .iter()
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
     }
