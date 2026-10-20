@@ -1716,19 +1716,18 @@ impl Pool {
     pub fn plan(&self, preparation: &Preparation) -> io::Result<Plan> {
         Plan::of(preparation)
     }
-    /// A slot's checkpoint this machine's store holds, by its exact manifest.
+    /// A slot's checkpoint this machine's store holds, by its header or its tree.
     fn held_grant(&self, package: &str, path: &str, reference: &crate::api::domain::Ref) -> io::Result<ModelGrant> {
         let sha = tensorfs::sha256::hex(&reference.digest);
         let absent = |why: String| io::Error::new(io::ErrorKind::NotFound, format!("checkpoint_absent: {path} names sha256:{sha}: {why}"));
-        let object = tensorfs::format::ObjectRef { sha256: sha.clone(), length: reference.length };
-        let checkpoint = self.store.checkpoint(&object).map_err(|e| absent(e.to_string()))?;
+        let checkpoint = crate::storage::checkpoint(&self.store, &sha).map_err(|e| absent(e.to_string()))?;
         Ok(ModelGrant {
             package: package.into(),
             slot: path.into(),
             repository: String::new(),
             release: String::new(),
             lane: String::new(),
-            manifest: format!("sha256:{sha}"),
+            manifest: checkpoint.id().id(),
             components: checkpoint.header().components().iter().map(|c| c.name.clone()).collect(),
         })
     }
@@ -2480,6 +2479,7 @@ impl Pool {
         )?;
         // A group's NCCL seal (NVLS off, peer memory only over NVLink).
         seal.group = degree > 1;
+        seal.tensorfs_home = Some(self.store.root().to_path_buf());
         seal.threads = self.config.threads;
         Ok(ExecutorConfig {
             python: held.record.python.clone(),
@@ -3005,7 +3005,7 @@ impl Pool {
         };
         let _spool = crate::execution::Spool(spool.clone());
         let inputs = stage_inputs(
-            &self.store,
+            &engine.cas(),
             self.config.identity,
             &spool,
             &record.invocation.inputs,
@@ -3428,7 +3428,7 @@ pub(crate) struct Staged {
 }
 
 pub(crate) fn stage_inputs(
-    store: &Store,
+    cas: &crate::cas::Cas,
     identity: Option<crate::launch_identity::LaunchIdentity>,
     spool: &Path,
     inputs: &[crate::journal::InputFile],
@@ -3457,14 +3457,14 @@ pub(crate) fn stage_inputs(
             .collect();
         let local = directory.join(format!("{position:03}-{field}"));
         if input.media_type == TREE_MEDIA {
-            let manifest = held_bytes(store, &input.digest, input.length)?;
-            materialize_tree(store, identity, &manifest, &local)?;
+            let manifest = held_bytes(cas, &input.digest, input.length)?;
+            materialize_tree(cas, identity, &manifest, &local)?;
             // A payload names a tree by its field's ref or by its manifest digest.
             staged.trees.insert(input.digest.clone(), (local.clone(), input.digest.clone()));
             staged.trees.insert(input.input_id.clone(), (local, input.digest.clone()));
             continue;
         }
-        copy_held(store, identity, &input.digest, input.length, &local)?;
+        copy_held(cas, identity, &input.digest, input.length, &local)?;
         staged.inputs.insert(
             input.input_id.clone(),
             serde_json::json!({"local":local,"media_type":input.media_type,"digest":input.digest,"length":input.length,"order":input.order,"file_state":null}),
@@ -3478,14 +3478,14 @@ pub(crate) fn stage_inputs(
 
 /// One held object copied read-only to `local`, exactly `length` bytes.
 fn copy_held(
-    store: &Store,
+    cas: &crate::cas::Cas,
     identity: Option<crate::launch_identity::LaunchIdentity>,
     digest: &str,
     length: u64,
     local: &Path,
 ) -> io::Result<()> {
     let object = tensorfs::format::ObjectRef { sha256: digest.trim_start_matches("sha256:").into(), length };
-    let mut source = store.file(&object).map_err(crate::storage::io_error)?;
+    let mut source = cas.file(&object)?;
     let mut copy = platform::durable::Mode::mode(
         fs::OpenOptions::new().write(true).create_new(true),
         0o444,
@@ -3504,14 +3504,14 @@ fn copy_held(
     Ok(())
 }
 
-fn held_bytes(store: &Store, digest: &str, length: u64) -> io::Result<Vec<u8>> {
+fn held_bytes(cas: &crate::cas::Cas, digest: &str, length: u64) -> io::Result<Vec<u8>> {
     let object = tensorfs::format::ObjectRef { sha256: digest.trim_start_matches("sha256:").into(), length };
-    store.read(&object).map_err(crate::storage::io_error)
+    cas.read(&object)
 }
 
 /// A tree manifest's files under `root`: each a relative path below it, each a held object.
 fn materialize_tree(
-    store: &Store,
+    cas: &crate::cas::Cas,
     identity: Option<crate::launch_identity::LaunchIdentity>,
     manifest: &[u8],
     root: &Path,
@@ -3530,7 +3530,7 @@ fn materialize_tree(
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        copy_held(store, identity, &format!("sha256:{sha}"), length, &target)?;
+        copy_held(cas, identity, &format!("sha256:{sha}"), length, &target)?;
     }
     if let Some(identity) = identity {
         for entry in walk_dirs(root)? {
