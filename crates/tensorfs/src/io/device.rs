@@ -420,10 +420,7 @@ impl Engine {
             for mut slot in owner.slots.drain(..) {
                 slot.pending = false;
                 slot.recorded = false;
-                self.free
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(slot);
+                self.free().push(slot);
             }
             // The remaining event/stream/allocation owners drop only after checked completion.
             drop(owner);
@@ -452,17 +449,16 @@ impl Engine {
         let released = checked_take(&mut held, |r| self.checked_release(r, false))?;
         drop(held);
         // All previous engine work is now complete, including slots already returned to the free list.
-        for slot in self
-            .free
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter_mut()
-        {
+        for slot in self.free().iter_mut() {
             slot.pending = false;
             slot.recorded = false;
         }
         self.released(released);
         Ok(())
+    }
+
+    fn free(&self) -> std::sync::MutexGuard<'_, Vec<Slot>> {
+        self.free.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn hold_slot(&self, slot: Slot) {
@@ -572,13 +568,8 @@ impl Engine {
             let next = AtomicUsize::new(0);
             let stopped = AtomicBool::new(false);
             let error = Mutex::new(None);
-            let free = self.free.lock().unwrap_or_else(|e| e.into_inner()).len();
-            let readers = opts
-                .threads
-                .clamp(1, READERS)
-                .min(jobs.len())
-                .min(free / RING);
-            if readers == 0 && !jobs.is_empty() {
+            let readers = opts.threads.clamp(1, READERS).min(jobs.len());
+            if self.free().len() < readers * RING {
                 let lost = io::Error::other("staging is still retained by a failed copy");
                 return Err(Error {
                     copy: first,
@@ -588,7 +579,7 @@ impl Engine {
             let work = || {
                 self.near.enter();
                 let mut ring = {
-                    let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut free = self.free();
                     let at = free.len() - RING;
                     free.split_off(at)
                 };
@@ -608,11 +599,7 @@ impl Engine {
                 for slot in ring {
                     match stopped.load(Relaxed) {
                         true => self.hold_slot(slot),
-                        false => self
-                            .free
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(slot),
+                        false => self.free().push(slot),
                     }
                 }
             };
