@@ -36,11 +36,11 @@ enum Verb {
     Upload(Upload),
     /// Write a model's int8, fp8 or nvfp4 lane with the package that serves it.
     Quantize(Quantize),
-    /// Set or remove a release's lanes.
+    /// Release one of the model's checkpoints (a tree) under a new release.
     Publish(Publish),
-    /// Point one existing release lane at another checkpoint.
+    /// Point a release at a tree that keeps every file of its own and adds variants.
     Retarget(Retarget),
-    /// Yank a release.
+    /// Yank a release: only its exact version resolves it, and it is never undone.
     Yank(Yank),
     /// Delete a model whose releases are yanked, or one unreleased checkpoint.
     Delete(Delete),
@@ -147,30 +147,24 @@ pub(crate) struct Quantize {
 pub(crate) struct Publish {
     /// org/name.
     model: String,
-    /// The release label.
+    /// The new release's label.
     #[arg(long)]
     release: String,
-    /// Set a lane: name=sha256:<checkpoint>; repeatable.
-    #[arg(long = "lane", value_name = "NAME=CHECKPOINT")]
-    lanes: Vec<String>,
-    /// Remove a lane by name; repeatable.
-    #[arg(long = "remove-lane", value_name = "NAME")]
-    remove: Vec<String>,
+    /// The checkpoint it names: a tree (sha256:<hex>) the model holds.
+    #[arg(long, value_name = "CHECKPOINT")]
+    tree: String,
 }
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct Retarget {
     /// org/name.
     model: String,
-    /// The release label.
+    /// The release to move.
     #[arg(long)]
     release: String,
-    /// The existing lane to move.
-    #[arg(long)]
-    lane: String,
-    /// The checkpoint (sha256:<hex>) it points at next.
+    /// The checkpoint it names next: a tree (sha256:<hex>) the model holds.
     #[arg(long, value_name = "CHECKPOINT")]
-    to: String,
+    tree: String,
 }
 
 #[derive(clap::Args, Debug)]

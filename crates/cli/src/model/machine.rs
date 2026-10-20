@@ -136,7 +136,7 @@ fn made(ctx: &Context, run: &Run) {
     if let (Some(destination), Some(checkpoint)) = (destination, checkpoint)
         && !destination.starts_with("local/")
     {
-        output::next(ctx, &[&format!("cozy model publish {destination} --release <release> --lane <lane>={checkpoint}")]);
+        output::next(ctx, &[&format!("cozy model publish {destination} --release <release> --tree {checkpoint}")]);
     }
 }
 
