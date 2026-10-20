@@ -37,8 +37,13 @@ fn a_package_lists_its_functions_and_describes_each() {
         .map(|f| f["function"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["generate", "fp8", "int8"]);
+    let conversion = |i: usize| listed["functions"][i]["conversion"].as_bool();
+    assert_eq!((conversion(0), conversion(1)), (Some(false), Some(true)));
     let human = home.cozy(["run", "fidika/sdxl@2.10.0"]);
     assert_eq!(human.code, 0, "{human:?}");
+    // The table holds what a run uses; the quantizers are named once, for model authors.
+    assert!(human.stdout.contains("for model authors: fp8, int8 (conversions)"), "{human:?}");
+    assert!(!human.stdout.lines().any(|l| l.starts_with("fp8") || l.starts_with("int8")), "{human:?}");
     assert!(
         human
             .stdout
@@ -196,7 +201,7 @@ fn the_grammar_refuses_what_it_cannot_run() {
     let cpu = home.cozy(["run", "fidika/sdxl/generate", "--gpus", "0", "--json"]);
     let message = cpu.refusal()["message"].to_string();
     assert!(
-        cpu.code == 2 && message.contains("accelerator=False") && message.contains("--on new:cpu"),
+        cpu.code == 2 && message.contains("needs no GPU") && message.contains("--on new:cpu"),
         "{cpu:?}"
     );
 }

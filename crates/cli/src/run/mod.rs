@@ -411,8 +411,8 @@ fn terms(ctx: &Context, args: &RunArgs) -> Result<Terms, Error> {
 fn gpu_count(text: &str) -> Result<u32, String> {
     match text.parse::<u32>() {
         Ok(0) => Err(
-            "a run uses the CPU when its function declares accelerator=False or its \
-             machine has no GPU: `--on new:cpu` rents a machine with none"
+            "a function that needs no GPU runs on the CPU by itself, as does every run on a \
+             machine without one: `--on new:cpu` rents a machine with none"
                 .into(),
         ),
         Ok(n) => Ok(n),
@@ -615,26 +615,33 @@ fn functions_of(
     interface: &Interface,
 ) {
     let public = interface.public();
-    let runs_on = |name: &str| {
-        let cpu = interface
-            .callables
-            .iter()
-            .any(|c| c.name == name && c.accelerator == Some(false));
-        if cpu { "CPU" } else { "GPU" }
+    let callable = |name: &str| interface.callables.iter().find(|c| c.name == name);
+    let runs_on = |name: &str| match callable(name).is_some_and(|c| c.accelerator == Some(false)) {
+        true => "CPU",
+        false => "GPU",
     };
+    let conversion = |name: &&str| callable(name).is_some_and(Callable::is_conversion);
     if ctx.json {
-        let rows: Vec<_> = public
-            .iter()
-            .map(|name| serde_json::json!({"function": name, "runs_on": runs_on(name)}))
+        let rows: Vec<_> = (public.iter())
+            .map(|name| serde_json::json!({"function": name, "runs_on": runs_on(name), "conversion": conversion(name)}))
             .collect();
         output::json(&serde_json::json!({
             "package": package, "release": release, "release_from": from, "functions": rows,
         }));
         return;
     }
+    // Conversions write model lanes: model authors' work, named below the functions a run uses.
+    let (conversions, public): (Vec<&str>, Vec<&str>) = public.iter().copied().partition(conversion);
+    let public = match public.is_empty() {
+        true => conversions.clone(),
+        false => public,
+    };
     let mut table = output::Table::new(ctx, ["FUNCTION", "RUNS ON"]);
     for name in &public {
         table = table.row([*name, runs_on(name)]);
+    }
+    if public != conversions && !conversions.is_empty() {
+        table = table.note(format!("for model authors: {} (conversions)", conversions.join(", ")));
     }
     let from = from.map(|from| format!(" ({from})")).unwrap_or_default();
     table.note(format!("{package} {release}{from}")).print();
