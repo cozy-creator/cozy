@@ -116,7 +116,15 @@ An unknown name raises `KeyError`.
 All forms accept `device="cpu"` (the default), `device="cuda"` or `device="cuda:N"`,
 and the same `decode` option.
 
-A decoded value is an `Array`, with `dtype`, `shape`, `nbytes` and `tobytes()`. To hand an
+A decoded value is an `Array`, with `dtype`, `shape`, `nbytes` and `tobytes()`.
+`decode=True` is the default: quantized weights are unpacked into the tensor's declared
+logical dtype (`TensorMetadata.dtype`), such as BF16, F16 or F32; BF16 is not forced.
+Plain tensors keep their dtype. The default destination is CPU; `device="cuda:0"` requests
+a GPU array. Supported GPU decoders unpack there; schemes with a host-only decoder use
+the CPU fallback. `decode=False` preserves the encoded representation for a consumer
+with a compatible compute kernel.
+
+To hand an
 array to a framework, use DLPack:
 
 ```python
