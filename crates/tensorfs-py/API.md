@@ -124,8 +124,13 @@ a GPU array. Supported GPU decoders unpack there; schemes with a host-only decod
 the CPU fallback. `decode=False` preserves the encoded representation for a consumer
 with a compatible compute kernel.
 
-To hand an
-array to a framework, use DLPack:
+Decode when the model's compute code needs ordinary floating-point weights. For example,
+a standard PyTorch layer can consume a decoded BF16 array, but cannot directly consume
+int8 weights together with scales and rotation parameters. A matching quantized compute
+kernel can use those encoded arrays directly. Decoding provides compatibility at the
+cost of an unpacking step and a larger weight allocation.
+
+To hand an array to a framework, use DLPack:
 
 ```python
 import torch
@@ -143,6 +148,9 @@ The returned arrays and their framework consumers retain the storage they need.
 value = unet.tensors.read("some_quantized.weight", decode=False)
 print(value.scheme, value.params)
 print(value.parts.keys())
+
+# GPU placement does not require decoding:
+gpu_value = unet.tensors.read("some_quantized.weight", device="cuda:0", decode=False)
 ```
 
 `Encoding` describes how the stored arrays reconstruct the logical tensor: a scheme
@@ -157,6 +165,8 @@ TensorFS handles the underlying chunk locations and byte offsets.
 For an encoded tensor, `decode=False` returns `Encoded`: the loaded `scheme`, `params`,
 and a role-to-`Array` mapping named `parts`. For a plain tensor it still returns `Array`.
 A consumer of encoded weights must understand that scheme and its parameters.
+`device` chooses where the arrays live; `decode` chooses their representation. Our
+Runtime keeps supported quantized weights encoded for its matching compute kernels.
 
 ### Read into an existing allocation
 
