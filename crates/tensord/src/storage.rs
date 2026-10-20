@@ -18,7 +18,7 @@ use tensorfs::format::{ObjectRef, Tree};
 /// Opens (or creates) the machine store at `root`; one in an older format is refused (its
 /// models pull again into a new one).
 pub fn open(root: &Path) -> io::Result<Arc<Store>> {
-    Store::open(root).map(|store| Arc::new(store.with_cache())).map_err(io_error)
+    Store::open(root).map(Arc::new).map_err(io_error)
 }
 
 /// The machine's claim on its store: `owner.lock` at the store's real path, held exclusively
