@@ -7,9 +7,6 @@ long as any tensor made from it. Eviction unmaps only unpinned pages whose fill 
 events completed. Copies run on varena's own stream; the bind stream waits on an event and the
 host never syncs. `Host` is the CPU core: the same sets, as host memory, and it never loads
 libcuda.
-
-`scripts/stub_conform.py` holds this stub against the compiled `tensorfs._ext.varena`, name for
-name and parameter for parameter.
 """
 
 from collections.abc import Sequence
