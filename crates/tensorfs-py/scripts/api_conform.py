@@ -11,9 +11,9 @@ import tensorfs
 from tensorfs import _ext, raw, varena
 
 assert not hasattr(tensorfs, "Store"), "the cache implementation leaked into the public API"
-for name in ("materialize", "download_file"):
+for name in ("materialize", "download_file", "convert_to_cozytensors"):
     assert name in tensorfs.__all__ and callable(getattr(tensorfs, name)), name
-for obsolete in ("snapshot_download", "hub_download", "download"):
+for obsolete in ("snapshot_download", "hub_download", "download", "convert"):
     assert not hasattr(tensorfs, obsolete) and not hasattr(tensorfs.api, obsolete), obsolete
 for obsolete in ("Closure", "ReadPlan", "parse_header", "plan", "regions", "Info", "Part"):
     assert not hasattr(tensorfs, obsolete) and not hasattr(_ext, obsolete), obsolete

@@ -53,8 +53,8 @@ def upload_folder(*, repo_id: str, folder_path, revision=None, token=None, endpo
     return _client(cache_dir, endpoint, token, ca_der).upload_folder(Path(folder_path), repo_id, revision)
 
 
-def convert(source: str | Sequence[str], *, converter=None, variant=None, cache_dir=None, token=None, progress=None):
-    return _client(cache_dir, token=token, configured_token=False).convert(
+def convert_to_cozytensors(source: str | Sequence[str], *, converter=None, variant=None, cache_dir=None, token=None, progress=None):
+    return _client(cache_dir, token=token, configured_token=False).convert_to_cozytensors(
         source, converter=converter, variant=variant, progress=progress,
     )
 

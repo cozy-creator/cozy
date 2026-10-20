@@ -334,7 +334,7 @@ impl PyClient {
     }
 
     #[pyo3(signature = (source, *, converter = None, variant = None, progress = None))]
-    fn convert(
+    fn convert_to_cozytensors(
         &self,
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
@@ -366,7 +366,7 @@ impl PyClient {
                 .as_ref()
                 .map(|_| &notify as &tensorfs::ConvertProgress<'_>),
         };
-        let result = py.detach(|| bridge(self.client.convert(&sources, &options)));
+        let result = py.detach(|| bridge(self.client.convert_to_cozytensors(&sources, &options)));
         if let Some(error) = callback_error
             .into_inner()
             .unwrap_or_else(|e| e.into_inner())

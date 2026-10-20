@@ -171,7 +171,7 @@ def main() -> None:
 
     # 2. The Python API.
     tfs.configure(cache_dir=work / "c")
-    m = tfs.convert(f"hf://{REPO}")
+    m = tfs.convert_to_cozytensors(f"hf://{REPO}")
     folder = tfs.materialize(m.tree, local_files_only=True)
     tfs.upload_folder(repo_id=NAME, revision="1", folder_path=folder)
     assert m.id == f"sha256:{imported['header']['sha256']}", "imports are deterministic"
