@@ -297,6 +297,16 @@ async fn explicit_export_fetches_known_repo_files_and_never_omits_refused_files(
         );
         assert_eq!(server.repo_requests(), 0);
         assert!(!invalid.exists());
+        let requests_before = server.requests.lock().unwrap().len();
+        let invalid = scratch.0.join("invalid-safetensors");
+        let error = checkpoint
+            .materialize(&invalid, Format::Safetensors, Some(Dtype::I8))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, Kind::Invalid);
+        assert_eq!(error.detail, "dequantize to I8: one of F32, BF16, F16");
+        assert_eq!(server.requests.lock().unwrap().len(), requests_before);
+        assert!(!invalid.exists());
 
         let destination = scratch.0.join("export");
         let result = checkpoint
