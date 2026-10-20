@@ -98,6 +98,9 @@ pub mod unsynced;
 pub mod vectors;
 #[cfg(feature = "store")]
 pub mod writer;
+/// Advanced engine and synchronous-language integration.
+#[cfg(feature = "store")]
+pub mod raw;
 
 /// The public session API; networking uses the caller's async runtime.
 #[cfg(feature = "store")]
