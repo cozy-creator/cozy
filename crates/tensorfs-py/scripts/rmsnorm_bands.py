@@ -33,7 +33,8 @@ def upstream_class(filename: str, name: str):
     parsed = ast.parse(path.read_text())
     definition = next(node for node in parsed.body if isinstance(node, ast.ClassDef) and node.name == name)
     namespace = {"__name__": f"diffusers.models.autoencoders.{filename}", "torch": torch, "nn": nn, "F": F}
-    exec(compile(ast.Module([definition], type_ignores=[]), str(path), "exec"), namespace)
+    # The pinned installed ClassDef has the same trust boundary as importing its module.
+    exec(compile(ast.Module([definition], type_ignores=[]), str(path), "exec"), namespace)  # noqa: S102
     return namespace[name]
 
 
