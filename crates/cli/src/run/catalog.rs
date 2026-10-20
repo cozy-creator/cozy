@@ -7,8 +7,6 @@ use platform::{durable, paths::Home};
 use protocol::config::Hub;
 use protocol::error::{Error, Kind};
 use hub_client::types;
-use progenitor_client::{ClientHooks as _, ClientInfo as _, OperationInfo};
-use reqwest::{StatusCode, header};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -90,49 +88,18 @@ pub async fn latest(ctx: &Context, hub: &Hub, package: &str) -> Result<String, E
         .ok()
         .and_then(|raw| serde_json::from_slice(&raw).ok());
     let client = ctx.hub_client(hub)?;
-    let info = OperationInfo {
-        operation_id: "get_package",
-    };
-    let url = format!("{}/v1/packages/{org}/{name}", client.baseurl());
-    let mut request = client
-        .client()
-        .get(url)
-        .header(header::ACCEPT, "application/json")
-        .header("api-version", hub_client::Client::api_version());
-    if let Some(kept) = &kept {
-        request = request.header(header::IF_NONE_MATCH, &kept.etag);
-    }
-    let mut request = request
-        .build()
-        .map_err(|e| hub_error(hub_client::Error::Call(e.to_string())))?;
-    client
-        .pre::<()>(&mut request, &info)
-        .await
-        .map_err(hub_error)?;
     let answer = client
-        .exec(request, &info)
+        .package_if_changed(org, name, kept.as_ref().map(|kept| kept.etag.as_str()))
         .await
-        .map_err(|e| hub_error(hub_client::Error::Call(e.to_string())))?;
-    let status = answer.status();
-    if status == StatusCode::NOT_MODIFIED
-        && let Some(kept) = kept
-    {
-        return Ok(kept.release);
-    }
-    let etag = answer
-        .headers()
-        .get(header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let body = answer
-        .bytes()
-        .await
-        .map_err(|e| hub_error(hub_client::Error::Call(e.to_string())))?;
-    if !status.is_success() {
-        return Err(absent(refusal(status.as_u16(), &body), package));
-    }
-    let card: types::PackageCard = serde_json::from_slice(&body)
-        .map_err(|e| hub_error(hub_client::Error::Answer(e.to_string())))?;
+        .map_err(|e| absent(hub_error(e), package))?;
+    let (card, etag) = match (answer, kept) {
+        (Some(answer), _) => answer,
+        (None, Some(kept)) => return Ok(kept.release),
+        (None, None) => {
+            let unasked = hub_client::Error::Answer("304 to a read that kept no ETag".into());
+            return Err(hub_error(unasked));
+        }
+    };
     let release = card.package.latest_release.ok_or_else(|| {
         Error::new(
             Kind::NotFound,
@@ -163,22 +130,6 @@ pub async fn latest(ctx: &Context, hub: &Hub, package: &str) -> Result<String, E
 struct Latest {
     release: String,
     etag: String,
-}
-
-/// A Hub refusal's typed envelope, else the status alone.
-fn refusal(status: u16, body: &[u8]) -> Error {
-    let doc: Value = serde_json::from_slice(body).unwrap_or_default();
-    let field = |name: &str| doc["error"][name].as_str().unwrap_or_default().to_owned();
-    let code = match field("code") {
-        code if code.is_empty() => format!("http_{status}"),
-        code => code,
-    };
-    hub_error(hub_client::Error::Hub {
-        status,
-        code,
-        message: field("message"),
-        remedy: field("remedy"),
-    })
 }
 
 /// The Hub's 404 names what it lacks, and where to look.
