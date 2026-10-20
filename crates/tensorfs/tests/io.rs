@@ -435,6 +435,57 @@ fn many_destinations_at_once_from_a_writers_folder() {
     assert_eq!(io::ceiling(Some(0), &scratch.0).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
 }
 
+/// What `Tensors.read` does with many tensors: every range in one allocation at its `pack`
+/// offset, in one engine call, cold and warm. Each range lands whole; the padding stays untouched;
+/// on the page grid, cold ranges land in place.
+#[test]
+fn packed_ranges_share_one_allocation_in_one_call() {
+    assert_eq!(io::pack([], 256), Some((vec![], 0)));
+    assert_eq!(io::pack([3, 0, 256, 1, 0], 256), Some((vec![0, 256, 256, 512, 768], 768)));
+    assert_eq!(io::pack([3, 4097], 4096), Some((vec![0, 4096], 8193)));
+    assert_eq!(io::pack([usize::MAX - 100, 1], 256), None);
+    let scratch = Scratch::new("packed");
+    let ck = written(&scratch.0, 400);
+    let Body::Data(big) = ck.tensor("unet", "big").unwrap().body else { unreachable!() };
+    let all = ranges(&ck);
+    for (align, cold) in [(io::DEVICE_ALIGN, true), (io::DEVICE_ALIGN, false), (4096, true)] {
+        let (at, len) = io::pack(all.iter().map(|r| r.3.length as usize), align).unwrap();
+        for (i, (&a, r)) in at.iter().zip(&all).enumerate() {
+            let end = if i == 0 { 0 } else { at[i - 1] + all[i - 1].3.length as usize };
+            assert!(a % align == 0 && a >= end && a < end + align, "{}/{}#{}", r.0, r.1, r.2);
+        }
+        assert_eq!(len, at.last().unwrap() + all.last().unwrap().3.length as usize);
+        if cold {
+            evict(&ck);
+        }
+        let mut slab = Buf::new(len, 0);
+        let base = slab.mem[slab.at..].as_mut_ptr();
+        let targets: Vec<Target> = (all.iter().zip(&at))
+            .map(|((c, k, role, l), &a)| Target {
+                component: c,
+                key: k,
+                role,
+                offset: 0,
+                dst: Dst::Host { ptr: base.wrapping_add(a), len: l.length as usize },
+            })
+            .collect();
+        // SAFETY: disjoint ranges of one live buffer.
+        let stats = unsafe { ck.read_into(&targets, &ReadOpts::default()) }.unwrap();
+        assert_eq!(stats.bytes, all.iter().map(|r| r.3.length).sum::<u64>());
+        if align == 4096 && direct_ok(&ck) {
+            assert!(stats.direct - stats.bounced > big.length - MIB as u64, "big lands in place: {stats:?}");
+        }
+        let bytes = slab.bytes();
+        let mut end = 0;
+        for ((c, k, role, l), &a) in all.iter().zip(&at) {
+            assert!(bytes[end..a].iter().all(|&b| b == 0xA5), "padding before {c}/{k}#{role}");
+            end = a + l.length as usize;
+            let want = if role.is_empty() { ck.read(c, k).unwrap() } else { stored(&ck, l) };
+            assert!(bytes[a..end] == want, "{c}/{k}#{role} cold {cold}");
+        }
+    }
+}
+
 /// Host reads, by tensor or by stored location, go through the engine and log a disk run. A run
 /// the page cache served is unmeasured; a cold one that beats the kept ceiling raises it.
 #[test]

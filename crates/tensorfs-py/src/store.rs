@@ -1038,51 +1038,76 @@ pub(crate) fn defer_failed_cuda<T: Send + 'static>(device: i32, owner: T) {
     });
 }
 
+/// An allocation that one read call's Arrays share.
 #[derive(Clone)]
-pub(crate) enum ArrayBuffer {
+pub(crate) enum Owner {
     Host(Arc<Aligned>),
     Device(Arc<DeviceArray>),
 }
 
-impl ArrayBuffer {
-    pub(crate) fn len(&self) -> usize {
+impl Owner {
+    fn len(&self) -> usize {
         match self {
             Self::Host(b) => b.len,
             Self::Device(b) => b.len(),
         }
     }
+}
+
+/// An Array's bytes: `len` from `at` of its allocation. Every view and exported DLPack capsule
+/// holds the allocation; the last one dropped frees it.
+#[derive(Clone)]
+pub(crate) struct ArrayBuffer {
+    owner: Owner,
+    at: usize,
+    len: usize,
+}
+
+impl ArrayBuffer {
+    pub(crate) fn view(owner: &Owner, at: usize, len: usize) -> Self {
+        assert!(at + len <= owner.len(), "a view outside its allocation");
+        let owner = owner.clone();
+        Self { owner, at, len }
+    }
+    pub(crate) fn whole(owner: Owner) -> Self {
+        let len = owner.len();
+        Self { owner, at: 0, len }
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
     pub(crate) fn host(&self) -> Option<&[u8]> {
-        match self {
-            Self::Host(b) => Some(b.bytes()),
-            Self::Device(_) => None,
+        match &self.owner {
+            Owner::Host(b) => Some(&b.bytes()[self.at..self.at + self.len]),
+            Owner::Device(_) => None,
         }
     }
     fn ptr(&self) -> *mut c_void {
-        match self {
-            Self::Host(b) => b.ptr() as _,
-            Self::Device(b) => b.ptr() as usize as _,
+        match &self.owner {
+            Owner::Host(b) => b.ptr().wrapping_add(self.at) as _,
+            Owner::Device(b) => (b.ptr() + self.at as u64) as usize as _,
         }
     }
     fn device(&self) -> (i32, i32) {
-        match self {
-            Self::Host(_) => (KDL_CPU, 0),
-            Self::Device(b) => (KDL_CUDA, b.device()),
+        match &self.owner {
+            Owner::Host(_) => (KDL_CPU, 0),
+            Owner::Device(b) => (KDL_CUDA, b.device()),
         }
     }
     fn duplicate(&self) -> Result<Self, Failure> {
         use tensorfs::io::{self, Copy, Dst, ReadOpts, Src};
-        Ok(match self {
-            Self::Host(b) => {
-                let mut copy = Aligned::new(b.len);
-                copy.bytes_mut().copy_from_slice(b.bytes());
-                Self::Host(Arc::new(copy))
+        Ok(match &self.owner {
+            Owner::Host(_) => {
+                let mut copy = Aligned::new(self.len);
+                copy.bytes_mut().copy_from_slice(self.host().expect("host bytes"));
+                Self::whole(Owner::Host(Arc::new(copy)))
             }
-            Self::Device(b) => {
-                let copy = io::DeviceBuffer::new(b.device(), b.len())?;
+            Owner::Device(b) => {
+                let copy = io::DeviceBuffer::new(b.device(), self.len)?;
                 let request = Copy {
                     src: Src::Device {
                         device: b.device(),
-                        ptr: b.ptr(),
+                        ptr: b.ptr() + self.at as u64,
                         stream: 0,
                     },
                     dst: Dst::Device {
@@ -1097,7 +1122,7 @@ impl ArrayBuffer {
                     defer_failed_cuda(b.device(), (Arc::clone(b), copy));
                     return Err(error.source.into());
                 }
-                Self::Device(DeviceArray::new(copy))
+                Self::whole(Owner::Device(DeviceArray::new(copy)))
             }
         })
     }
@@ -1221,17 +1246,17 @@ impl PyArray {
         if let Some(bytes) = self.buf.host() {
             return Ok(PyBytes::new(py, bytes));
         }
-        let ArrayBuffer::Device(buffer) = &self.buf else {
+        let Owner::Device(buffer) = &self.buf.owner else {
             unreachable!()
         };
         let bytes = py
             .detach(|| -> Result<Vec<u8>, Failure> {
                 use tensorfs::io::{self, Copy, Dst, ReadOpts, Src};
-                let mut bytes = vec![0; buffer.len()];
+                let mut bytes = vec![0; self.buf.len];
                 let request = Copy {
                     src: Src::Device {
                         device: buffer.device(),
-                        ptr: buffer.ptr(),
+                        ptr: buffer.ptr() + self.buf.at as u64,
                         stream: 0,
                     },
                     dst: Dst::host(&mut bytes),

@@ -8,13 +8,13 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyIterator, PyString, PyTuple};
-use tensorfs::format::{decode, Body, Dtype, Encoding, PartBytes};
-use tensorfs::io::{DeviceBuffer, Dst, ReadOpts, Target};
+use tensorfs::format::{decode, layout, Body, Dtype, Encoding, PartBytes};
+use tensorfs::io::{pack, DeviceBuffer, Dst, ReadOpts, Target, DEVICE_ALIGN};
 use tensorfs::{Checkpoint, Failure, Kind};
 
 use crate::store::{
     defer_failed_cuda, invalid, metadata, raise, Aligned, ArrayBuffer, CheckpointAccess,
-    DeviceArray, FetchTensor, OrRaise, PyArray,
+    DeviceArray, FetchTensor, OrRaise, Owner, PyArray,
 };
 
 /// A component's tensors: a mapping of key to `TensorMetadata`, with the reads.
@@ -38,12 +38,10 @@ pub struct PyEncoded {
 
 /// One stored range a read fills: a plain tensor's data (role `""`) or one part.
 struct Want {
-    key: usize,
     role: String,
     dtype: Dtype,
     shape: Vec<u64>,
-    buf: Aligned,
-    device: Option<Arc<DeviceArray>>,
+    buf: ArrayBuffer,
 }
 
 impl PyTensors {
@@ -216,11 +214,22 @@ impl PyTensors {
             .as_ref()
             .unwrap()
             .fetch_tensors(py, &self.component, &reads)?;
-        let mut wants = Vec::new();
-        for (i, key) in keys.iter().enumerate() {
+        // What the caller gets goes to one allocation on `device` (or host); the parts a
+        // decode=True read decodes go to one host allocation of their own.
+        struct Range<'a> {
+            key: usize,
+            role: &'a str,
+            dtype: &'a Dtype,
+            shape: &'a [u64],
+            len: usize,
+            out: bool,
+            at: usize,
+        }
+        let mut ranges = Vec::new();
+        for (key, name) in keys.iter().enumerate() {
             let t = ck
                 .header()
-                .tensor(&self.component, key)
+                .tensor(&self.component, name)
                 .ok_or_else(|| invalid(py, "no such tensor"))?;
             let parts: Vec<(&str, &Dtype, &[u64], u64)> = match &t.body {
                 Body::Data(at) => vec![("", &t.dtype, &t.shape, at.length)],
@@ -230,63 +239,81 @@ impl PyTensors {
                     .collect(),
             };
             for (role, dtype, shape, length) in parts {
-                let length = usize::try_from(length)
+                let len = usize::try_from(length)
                     .map_err(|_| invalid(py, "stored tensor exceeds address space"))?;
-                let direct = device.filter(|_| !decode_ || matches!(t.body, Body::Data(_)));
-                let gpu = direct
-                    .map(|device| {
-                        py.detach(|| DeviceBuffer::new(device, length).map(DeviceArray::new))
-                            .or_raise(py)
-                    })
-                    .transpose()?;
-                let buf = Aligned::new(if gpu.is_some() { 0 } else { length });
-                wants.push(Want {
-                    key: i,
-                    role: role.to_owned(),
-                    dtype: dtype.clone(),
-                    shape: shape.to_vec(),
-                    buf,
-                    device: gpu,
+                ranges.push(Range {
+                    key,
+                    role,
+                    dtype,
+                    shape,
+                    len,
+                    out: !decode_ || matches!(t.body, Body::Data(_)),
+                    at: 0,
                 });
             }
         }
-        let targets: Vec<Target> = (wants.iter_mut())
-            .map(|w| Target {
+        // Host ranges keep the chunks' page grid, so a cold O_DIRECT read lands in place.
+        let mut place = |out: bool, align: usize| {
+            let mut picked: Vec<_> = ranges.iter_mut().filter(|r| r.out == out).collect();
+            let (at, len) = pack(picked.iter().map(|r| r.len), align)
+                .ok_or_else(|| invalid(py, "a read exceeds the address space"))?;
+            picked.iter_mut().zip(at).for_each(|(r, at)| r.at = at);
+            PyResult::Ok(len)
+        };
+        let page = layout::ALIGN as usize;
+        let out_len = place(true, if device.is_some() { DEVICE_ALIGN } else { page })?;
+        let in_len = place(false, page)?;
+        let alloc = |d| py.detach(|| DeviceBuffer::new(d, out_len).map(DeviceArray::new));
+        let gpu = device.map(alloc).transpose().or_raise(py)?;
+        let mut host = Aligned::new(if gpu.is_some() { 0 } else { out_len });
+        let mut inputs = Aligned::new(in_len);
+        let (host_ptr, inputs_ptr) = (host.as_mut_ptr(), inputs.as_mut_ptr());
+        let targets: Vec<Target> = (ranges.iter())
+            .map(|r| Target {
                 component: &self.component,
-                key: &keys[w.key],
-                role: &w.role,
+                key: &keys[r.key],
+                role: r.role,
                 offset: 0,
-                dst: if let Some(gpu) = &w.device {
-                    Dst::Device {
+                dst: match (&gpu, r.out) {
+                    (Some(gpu), true) => Dst::Device {
                         device: gpu.device(),
-                        ptr: gpu.ptr(),
-                        len: gpu.len(),
+                        ptr: gpu.ptr() + r.at as u64,
+                        len: r.len,
                         stream: 0,
-                    }
-                } else {
-                    Dst::Host {
-                        ptr: w.buf.as_mut_ptr(),
-                        len: w.buf.len,
-                    }
+                    },
+                    (None, true) => Dst::Host {
+                        ptr: host_ptr.wrapping_add(r.at),
+                        len: r.len,
+                    },
+                    (_, false) => Dst::Host {
+                        ptr: inputs_ptr.wrapping_add(r.at),
+                        len: r.len,
+                    },
                 },
             })
             .collect();
-        // SAFETY: each destination is its own buffer, held until the read returns.
+        // SAFETY: the destinations are disjoint ranges of buffers held until the read returns.
         let result =
             py.detach(|| unsafe { tensorfs::raw::read_into(ck, &targets, &ReadOpts::default()) });
-        drop(targets);
         if let Err(error) = result {
-            if let Some(device) = wants
-                .iter()
-                .find_map(|want| want.device.as_ref().map(|buffer| buffer.device()))
-            {
-                defer_failed_cuda(device, wants);
+            if let Some(gpu) = gpu {
+                defer_failed_cuda(gpu.device(), gpu);
             }
             return Err(raise(py, error));
         }
+        let output = match gpu {
+            Some(gpu) => Owner::Device(gpu),
+            None => Owner::Host(Arc::new(host)),
+        };
+        let inputs = Owner::Host(Arc::new(inputs));
         let mut by_key: Vec<Vec<Want>> = keys.iter().map(|_| Vec::new()).collect();
-        for w in wants {
-            by_key[w.key].push(w);
+        for r in ranges {
+            by_key[r.key].push(Want {
+                role: r.role.to_owned(),
+                dtype: r.dtype.clone(),
+                shape: r.shape.to_vec(),
+                buf: ArrayBuffer::view(if r.out { &output } else { &inputs }, r.at, r.len),
+            });
         }
         Ok(by_key)
     }
@@ -302,10 +329,7 @@ impl PyTensors {
         let ck = self.checkpoint(py)?;
         let by_key = self.stored(py, keys, decode_, device)?;
         let array = |w: Want| PyArray {
-            buf: match w.device {
-                Some(device) => ArrayBuffer::Device(device),
-                None => ArrayBuffer::Host(Arc::new(w.buf)),
-            },
+            buf: w.buf,
             dtype: w.dtype,
             shape: w.shape,
         };
@@ -347,7 +371,7 @@ impl PyTensors {
                         Bound::new(
                             py,
                             PyArray {
-                                buf: ArrayBuffer::Device(buffer),
+                                buf: ArrayBuffer::whole(Owner::Device(buffer)),
                                 dtype: t.dtype.clone(),
                                 shape: t.shape.clone(),
                             },
@@ -362,7 +386,7 @@ impl PyTensors {
                 let mut buf = Aligned::new(bytes.len());
                 buf.bytes_mut().copy_from_slice(&bytes);
                 let a = PyArray {
-                    buf: ArrayBuffer::Host(Arc::new(buf)),
+                    buf: ArrayBuffer::whole(Owner::Host(Arc::new(buf))),
                     dtype: t.dtype.clone(),
                     shape: t.shape.clone(),
                 };
@@ -403,7 +427,7 @@ fn views(parts: &[Want]) -> BTreeMap<&str, PartBytes<'_>> {
                 PartBytes {
                     dtype: &w.dtype,
                     shape: &w.shape,
-                    bytes: w.buf.bytes(),
+                    bytes: w.buf.host().expect("decode parts on host"),
                 },
             )
         })
