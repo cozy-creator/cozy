@@ -28,10 +28,14 @@ impl Fixture {
         ));
         let folder = root.join("source");
         fs::create_dir_all(folder.join("chunks")).unwrap();
-        let chunks: Vec<_> = [b"abcdefgh", b"ijklmnop"]
+        let alignment = tensorfs::format::layout::ALIGN as usize;
+        let mut shared_chunk = vec![0; alignment * 2];
+        shared_chunk[..4].copy_from_slice(b"abcd");
+        shared_chunk[alignment..alignment + 4].copy_from_slice(b"wxyz");
+        let chunks: Vec<_> = [shared_chunk, b"ijklmnop".to_vec()]
             .iter()
             .map(|bytes| {
-                let object = ObjectRef::of(*bytes);
+                let object = ObjectRef::of(bytes);
                 fs::write(folder.join("chunks").join(&object.sha256), bytes).unwrap();
                 object
             })
@@ -64,7 +68,7 @@ impl Fixture {
             None,
             vec![
                 component("model", 0, 0, 4),
-                component("shared", 0, 4, 4),
+                component("shared", 0, alignment as u64, 4),
                 component("other", 1, 0, 8),
             ],
             BTreeMap::new(),
@@ -160,7 +164,9 @@ async fn verification_includes_selected_assets_and_classifies_wrong_lengths_as_c
 async fn verification_hashes_the_entire_shared_chunk_for_a_selected_tensor_range() {
     let f = Fixture::new();
     let ck = f.open().await;
-    fs::write(f.object(&f.chunks[0]), b"abcdBAD!").unwrap();
+    let mut bytes = fs::read(f.object(&f.chunks[0])).unwrap();
+    bytes[tensorfs::format::layout::ALIGN as usize] ^= 1;
+    fs::write(f.object(&f.chunks[0]), bytes).unwrap();
     let report = ck
         .verify(&Selection::Part {
             component: "model".into(),
