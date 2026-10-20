@@ -350,7 +350,7 @@ def coarser(shape: Shape) -> None:
     for key, (total, _, _) in shape.scopes.items():
         size = min(memo.sizes.get(key, total), total)
         if size < total:
-            pieces = 1 if shape.whole >= 0 else -(-total // size) // 2
+            pieces = 1 if shape.whole >= 0 else (-(-total // size) + 1) // 2
             memo.sizes[key] = -(-total // max(pieces, 1))
     shape.peak, shape.cuts = -1, {}
 
@@ -975,12 +975,24 @@ def install(module: nn.Module) -> int:
         kind = next((k for k in kinds if k in _FFN), None)
         if kind is not None and "_varena_ffn" not in vars(sub):
             # a quantized lane's linears are encoded leaves: any module naming out_features counts
-            width = sum(int(getattr(m, "out_features", 0) or 0) for m in sub.modules())
+            width = _width([m for m in sub.modules() if getattr(m, "out_features", 0)])
             own = vars(sub).get("forward")
             sub.forward = _ffn(kind, width, own or current(sub))  # type: ignore[method-assign]
             vars(sub)["_varena_ffn"] = True
             count += 1
     return count
+
+
+def _width(linears: list[nn.Module]) -> int:
+    """Elements per token an FFN holds at once beyond its result, which pieces stop holding at
+    once: its first projection's output and its last linear's input (the activation), less the
+    last linear's output, which a cut assembles whole anyway."""
+    if not linears:
+        return 0
+    first, last = linears[0], linears[-1]
+    if first is last:
+        return int(first.out_features)
+    return int(first.out_features) + int(last.in_features) - int(last.out_features)
 
 
 def current(module: nn.Module) -> Callable[..., object]:

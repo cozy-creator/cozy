@@ -767,12 +767,14 @@ class Memory:
             want = {b for b in model.home if _resident(model, b)}
         else:
             spare = self.core.stats()  # type: ignore[union-attr]
-            room = self.available() + spare.idle + spare.slot_bytes
-            room += _set(model)[0] - model.common.nbytes
+            terms = {"free": self.available(), "idle": spare.idle, "slots": spare.slot_bytes}
+            terms["own"] = _set(model)[0] - model.common.nbytes
             if repeating:  # and what idle tenants give back on an ask
                 keep = self._keep(model)
                 cold = (m for m in self.models.values() if self._victim(m))
-                room += sum(_set(m)[0] for m in cold if self._keep(m) < keep) + self._others()
+                terms["cold"] = sum(_set(m)[0] for m in cold if self._keep(m) < keep)
+                terms["others"] = self._others()
+            room = sum(terms.values())
             sizes = _sizes(model)
             shape, whole = model.track.shape, sum(sizes)
             need = cuts.relaxing(shape, model.reserve)  # a cut no lower than whole goes for good
@@ -786,8 +788,15 @@ class Memory:
                 model.reserve = need
             room -= model.reserve
             fits = whole <= room
-            if not fits and repeating and cuts.planned(shape, whole - room):
-                model.reserve, fits = model.reserve - (whole - room), True
+            if not fits and repeating:
+                cut = cuts.planned(shape, whole - room)
+                ffn = sum(v * shape.scopes[k][0] for k, v in shape.units.items()) if shape else 0
+                mapped, context = spare.mapped, self.context  # what the room leaves out
+                self.noted(4, f"{model.component} short {whole - room} B of resident, "
+                           f"{'cut' if cut else 'uncut'}: {terms} reserve {model.reserve} "
+                           f"ffn {ffn} mapped {mapped} context {context}", 0)
+                if cut:
+                    model.reserve, fits = model.reserve - (whole - room), True
             want = set(model.order if fits else _spread(model.order, sizes, room - 2 * max(sizes)))
         if self.active:
             want &= model.home
@@ -1162,6 +1171,7 @@ class Memory:
         if self.plans and self._free() < target:
             for m in [m for m in self.models.values() if not (m.flight or m.held or m.host)]:
                 if self._distance(m) == 0 and self._free() < target:
+                    self._landed(m)
                     freed += self._evict(m, why, 4, target - self._free())
         return freed > 0
 

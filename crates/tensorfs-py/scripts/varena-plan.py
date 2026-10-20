@@ -8,7 +8,7 @@ region bytes as `varena.Gpu` does (home pages, three scratch slots, copies that 
 kernel's first launch takes device bytes outside torch (lazy module loading, run 11952).
 
 H3 ref2va_turbo 5 s runs with its declared plan, cold then warm, at the sizes of runs
-11951-11955 on 2x RTX 4090: 24 GiB on one GPU; an 8 GiB limit on the 24 GiB card with a gone
+11951-11955 and 12122 on RTX 4090s: 24 GiB on one GPU; an 8 GiB limit on the 24 GiB card with a gone
 executor's kept pages over the limit (11955). 8 GiB at 2 GPUs is one such memory per GPU.
 
 Each request must complete, and: no restore evicts a page with a declared use; no prefetch
@@ -41,13 +41,18 @@ MIB, GIB = 1 << 20, 1 << 30
 PLAN = [["text_encoder"], ["audio_vae", "vae"], ["ref2va_turbo", "transformer_ref"], ["audio_vae"], ["vae"]]
 #: component: (common bytes, block bytes, blocks, activation bytes per block)
 SIZES = {
-    "text_encoder": (98 * MIB, 116 * MIB, 30, 191_000_000),
+    "text_encoder": (98 * MIB, 254 * MIB, 30, 281_000_000),
     "audio_vae": (610_271_232, 0, 0, 0),
     "vae": (128 * MIB, 98 * MIB, 54, 0),
-    "transformer_ref": (700 * MIB, 406_847_488, 50, int(2.7 * GIB)),
+    "transformer_ref": (700 * MIB, 406_847_488, 50, 1_700_000_000),
     "ref2va_turbo": (700 * MIB, 0, 0, 0),
 }
 VAE_ENCODER, VAE_ACT = 18, (int(0.6 * GIB), int(1.3 * GIB))
+#: torch bytes a request holds across its steps (12122: 0.93 GB as the DiT's passes start)
+STATE = 930_000_000
+#: the DiT's FFN as H3's (bf16, as float32 elements): projection 2 x 14336, activation 14336,
+#: output 5376 wide; with the rest of the block, a 5.14 GB peak (12122)
+DIT_FFN = (14336, 7168, 2688)
 PASSES = {"transformer_ref": 8}
 LAUNCH = 48 * MIB  # a kernel's first launch: its module's device bytes
 results: list[bool] = []
@@ -344,14 +349,40 @@ LIB.define("alloc(int n, *, Device device) -> Tensor")
 LIB.impl("alloc", lambda n, device: CARD.malloc(n) or torch.empty(0), "CompositeExplicitAutograd")
 
 
+class FeedForward(nn.Module):
+    """Stands for diffusers' FeedForward, which `cuts.install` cuts by tokens."""
+
+
+FeedForward.__module__ = "diffusers.models.attention"
+
+
+class FFN(FeedForward):
+    """An FFN that holds its projection's output and its activation at once, per token."""
+
+    def __init__(self, proj: int, inner: int, out: int) -> None:
+        super().__init__()
+        self.proj, self.out = nn.Module(), nn.Module()
+        self.proj.out_features, self.out.in_features, self.out.out_features = proj, inner, out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        width = self.proj.out_features + self.out.in_features
+        n = width * x.element_size() * (x.numel() // x.shape[-1])
+        torch.ops.varenaplan.alloc(n, device=torch.device("cuda", 0))
+        CARD.allocated -= n
+        return x
+
+
 class Block(nn.Module):
     def __init__(self, act: int, kernel: str) -> None:
         super().__init__()
         self.act, self.kernel = act, kernel
+        self.ff = FFN(*DIT_FFN) if kernel == "transformer_ref" else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         CARD.launch(self.kernel)
         torch.ops.varenaplan.alloc(self.act, device=torch.device("cuda", 0))
+        if self.ff is not None:
+            x = self.ff(x)
         CARD.allocated -= self.act
         return x
 
@@ -431,13 +462,19 @@ def h3(mem: vt.Memory, models: dict[str, vt.Model], rid: str, tokens: int = 4096
     request = None
     try:
         with mem.request(rid, plan=PLAN) as request:
-            m["text_encoder"](x(tokens))
-            m["audio_vae"](x(16))
-            m["vae"](x(1024), slice(0, VAE_ENCODER))
-            for _ in range(8):
-                m["transformer_ref"](x(40_000))
-            m["audio_vae"](x(32))
-            m["vae"](x(2048), slice(VAE_ENCODER, None))
+            # its inputs, embeddings and latents, held until it ends: room from the first step's
+            # weights still landing
+            torch.ops.varenaplan.alloc(STATE, device=torch.device("cuda", 0))
+            try:
+                m["text_encoder"](x(tokens))
+                m["audio_vae"](x(16))
+                m["vae"](x(1024), slice(0, VAE_ENCODER))
+                for _ in range(8):
+                    m["transformer_ref"](x(40_000))
+                m["audio_vae"](x(32))
+                m["vae"](x(2048), slice(VAE_ENCODER, None))
+            finally:
+                CARD.allocated -= STATE
     finally:
         gc.collect()
     return request.stats
