@@ -1079,12 +1079,14 @@ class Memory:
             gc.collect()
             # Admission reads the published row before another forward can
             # refresh it. Do not leave a completed step's activation peak pinned.
-            self._measure()
-            raw: dict[str, Any] = (
-                self.native.end(request.native_id)
-                if self.native is not None
-                else {"events": [], "copies": [], "io": [], "peak": 0}
-            )
+            try:
+                self._measure()
+            finally:
+                raw: dict[str, Any] = (
+                    self.native.end(request.native_id)
+                    if self.native is not None
+                    else {"events": [], "copies": [], "io": [], "peak": 0}
+                )
             trace = tuple(
                 {
                     **event,

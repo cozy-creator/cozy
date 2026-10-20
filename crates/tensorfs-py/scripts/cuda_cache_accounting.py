@@ -58,6 +58,33 @@ try:
             "completed scope left released activations charged as pinned scratch"
         )
     del retained, another
+
+    class MeasurementFailed(RuntimeError):
+        pass
+
+    def refuse_measurement() -> None:
+        raise MeasurementFailed("cleanup measurement refused")
+
+    previous = memory.measure
+    try:
+        with memory.request("measurement-failure") as failed:
+            memory.measure = refuse_measurement
+    except MeasurementFailed:
+        pass
+    else:
+        raise AssertionError("measurement failure was hidden")
+    finally:
+        memory.measure = previous
+    assert memory.native is not None
+    try:
+        memory.native.stats(failed.native_id)
+    except Exception as error:
+        assert "unknown request" in str(error)
+    else:
+        raise AssertionError("failed cleanup retained an active native request")
+    with memory.request("healthy-after-measurement-failure") as healthy:
+        pass
+    assert healthy.stats is not None and healthy.stats.leftover == ((0, 0),)
 finally:
     owned.clear()
     cache.close()
