@@ -549,7 +549,7 @@ write that checkpoint, or a repository name to reproduce repository content:
 ```python
 folder = tensorfs.materialize(saved, local_dir="./portable")
 st_folder = tensorfs.materialize(
-    saved, local_dir="./safetensors-model", format="safetensors", dequantize="BF16"
+    saved, local_dir="./safetensors-model", format="safetensors", decode=True
 )
 repo_folder = tensorfs.materialize("me/model", revision="1.0", local_dir="./repo")
 ```
@@ -557,9 +557,9 @@ repo_folder = tensorfs.materialize("me/model", revision="1.0", local_dir="./repo
 The default `format="cozytensors"` writes a native portable folder: `model.cozytensors`
 (or its named variant) plus `chunks/`, retaining the same header bytes and content hashes.
 `format="safetensors"` writes Safetensors weights with ordinary configuration and supporting
-files. It can retain supported encoded representations, or use `dequantize="BF16"`, for
-example, to write ordinary floating-point weights. Native cozytensors materialization
-preserves encodings and rejects `dequantize`.
+files. It retains supported encoded representations, or with `decode=True` writes each
+tensor in its logical dtype. Native cozytensors materialization preserves encodings and rejects
+`decode=True`.
 
 Materialization fetches required missing objects or fails; it does not silently create an
 incomplete output. A checkpoint produces its own data and any known repository files.

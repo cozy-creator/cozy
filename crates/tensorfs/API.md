@@ -76,7 +76,7 @@ store keeps them while that file exists and holds this header; opening a header 
 holds its data the same way, so a moved or copied file is held once it is opened. Otherwise
 local copies expire 7 days after their last use, least recently used first when the disk runs
 low. Open checkpoints keep their bytes in the meantime. To copy a checkpoint to another machine,
-write the portable form with `saved.materialize(dir, Format::Cozytensors, None)`.
+write the portable form with `saved.materialize(dir, Format::Cozytensors, false)`.
 
 `dest` is the exact filename; TensorFS does not append a variant or create a directory.
 `dest` and `repo_id` exclude each other. `variant` names `model.<variant>.cozytensors` in a
@@ -110,7 +110,7 @@ let model: Ref = "me/model@1.0/bf16".parse()?;
 let folder = client.materialize(&model, &Download::default(), None, false).await?;
 println!("downloaded to {}", folder.display());
 
-saved.materialize(Path::new("./portable"), Format::Cozytensors, None).await?;
+saved.materialize(Path::new("./portable"), Format::Cozytensors, false).await?;
 let destination: Ref = "me/output".parse()?;
 let tree = client.upload_folder(&destination, Path::new("./portable"), None).await?;
 println!("published {}", tree.id());
@@ -122,13 +122,12 @@ variant is selected. A standalone header cannot supply unknown repository files 
 metadata.
 
 All operations involving network/source resolution above are async except construction and
-`writer`. `checkpoint.materialize(directory, format, dequantize).await` returns
+`writer`. `checkpoint.materialize(directory, format, decode).await` returns
 `Result<PathBuf>`; choose `Format::Safetensors` or `Format::Cozytensors`. It first makes
 the required checkpoint data and known repository files available, then writes the folder.
-Missing or denied source objects fail the operation.
-`Format::Cozytensors` requires `None` for `dequantize`; `Format::Safetensors` accepts
-`Some(Dtype::F32)`, `Some(Dtype::BF16)` or `Some(Dtype::F16)`, or `None`.
-Other combinations return `Invalid` before source preparation.
+Missing or denied source objects fail the operation. `decode: true` writes each encoded tensor
+in its logical dtype and needs `Format::Safetensors`; `false` keeps the stored encoding.
+`Format::Cozytensors` with `decode: true` returns `Invalid` before source preparation.
 
 A `Writer` also has `pipeline(class, config)`, `component(name, class, config, config_file)`
 (`config_file` names the file the config exports as, such as `scheduler_config.json`; `None`
@@ -187,7 +186,8 @@ worker-permission mechanism.
 | `source(direct_io)` | An `io::source::Source` over the chunks for the read engine; absent chunks are fetched on the process runtime. |
 | `missing(&Selection)` | `Result<Vec<ObjectRef>>`. |
 | `download(&Download).await` | `Result<Fetched>`. |
-| `materialize(directory, Format, dequantize).await` | `Result<PathBuf>` for the complete checkpoint folder. |
+| `materialize(directory, Format, decode).await` | `Result<PathBuf>` for the complete checkpoint folder. |
+| `open_file()` | `Result<CheckpointFile>`: the checkpoint as one read-only, seekable file (`Read + Seek`, `len()`): its header, then its chunks and assets in header order at 4 KiB-aligned offsets (spec §11), assembled from the store on demand; nothing is written. It holds what it may read until dropped, and fetches what it lacks when the checkpoint may fetch, so read it outside an async context. |
 
 `download` completes when the selected chunks and supporting files are verified and locally
 available; the open checkpoint retains them. `missing` is optional availability inspection.

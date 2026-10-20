@@ -114,10 +114,16 @@ impl Checkpoint {
     pub fn component(&self, name: &str) -> Result<&Component>;
     pub fn missing(&self, selection: &Selection) -> Result<Vec<ObjectRef>>;
     pub async fn download(&self, want: &Download<'_>) -> Result<Fetched>;
-    // Cozytensors requires None; Safetensors accepts F32/BF16/F16 when Some.
-    // Other dequantize arguments return Invalid before source preparation.
-    pub async fn materialize(&self, dir: &Path, format: Format,
-        dequantize: Option<Dtype>) -> Result<PathBuf>;
+    // decode writes logical-dtype weights and needs Safetensors; Cozytensors with decode is Invalid.
+    pub async fn materialize(&self, dir: &Path, format: Format, decode: bool) -> Result<PathBuf>;
+    // Header, then chunks and assets in header order at 4 KiB-aligned offsets (spec §11).
+    pub fn open_file(&self) -> Result<CheckpointFile>;
+}
+// Read + Seek over the logical file; holds what it may read until dropped.
+pub struct CheckpointFile;
+impl CheckpointFile {
+    pub fn len(&self) -> u64;
+    pub fn is_empty(&self) -> bool;
 }
 // Open.lazy=false downloads this checkpoint's data before returning.
 // Synchronous chunk/read/asset/folder operations use bytes made available by download().
@@ -192,7 +198,8 @@ pub fn bearer(token: impl Into<String>) -> Arc<dyn TokenProvider>;
 #[derive(Default)]
 pub struct Convert<'a> {
     pub converter: Option<&'a str>,
-    pub variant: Option<&'a str>,
+    // The source's Diffusers weights variant (`fp16`), when a folder has several.
+    pub source_variant: Option<&'a str>,
     pub progress: Option<&'a ConvertProgress<'a>>,
 }
 impl Client {
