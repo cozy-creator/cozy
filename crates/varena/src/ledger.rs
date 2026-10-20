@@ -417,6 +417,11 @@ impl Ledger {
                 ));
             }
             table.shared().header.capacity.store(capacity, Release);
+            // Cuts and resident targets were measured under the old limit.
+            // The first request under the new cap must establish its own peak.
+            for peak in &table.shared().peaks {
+                peak.state.store(0, Release);
+            }
             table.changed();
         }
         shm::region_lock(
