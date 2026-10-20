@@ -5151,17 +5151,18 @@ mod tests {
             let key = [reservation as u8; 32];
             ledger.cache_ram(key, Arc::new(tensorfs::io::source::Source::files(vec![], false, 0)),
                 vec![varena::ledger::RamRegion { offset: 0, len: 4 << 20, items: vec![] }]).unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 while ledger.ram_status(key).is_some_and(|status| status.filling) {
                     crate::memory::slim::Memory::changed(&events).await.unwrap();
                 }
             }).await.unwrap();
             assert_eq!(ledger.ram_status(key).unwrap().ready, vec![true]);
             if measured {
-                let available = u64::try_from(platform::contain::host_memory::read().available).unwrap();
-                pool.devices[0].memory.with(|gpu| gpu.learned.plans.entry("host-demand".into()).or_default().host_bytes = available + (1 << 20));
+                pool.devices[0].memory.with(|gpu| gpu.learned.plans.entry("host-demand".into()).or_default().host_bytes = u64::MAX);
             }
-            assert!(pool.host_room("host-demand", 0, 1, false, reservation));
+            assert_eq!(pool.host_room("host-demand", 0, 1, false, reservation), !measured);
+            assert_eq!(pool.admitted.lock().unwrap().get(&session_key("host-demand", 0)).unwrap().reservation, reservation,
+                "demand is admitted even when its host peak exceeds available room");
             assert!(ledger.ram_status(key).is_none(), "admission retained optional RAM before a large/unknown allocation");
             pool.clear_unborn("host-demand", 0, 1, reservation);
         }
