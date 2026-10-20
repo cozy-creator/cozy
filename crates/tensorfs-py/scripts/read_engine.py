@@ -16,6 +16,7 @@ from collections.abc import Mapping
 import numpy as np
 
 import tensorfs as tfs
+from tensorfs import raw as raw_format
 
 
 class HostReads(unittest.TestCase):
@@ -54,17 +55,22 @@ class HostReads(unittest.TestCase):
         self.assertEqual(len(tensors.values()), 5)
         self.assertEqual(len(tensors.items()), 5)
         self.assertEqual(tensors["plain"].shape, (3, 4))
+        self.assertIsInstance(tensors["plain"], tfs.TensorMetadata)
+        self.assertFalse(hasattr(tensors["plain"], "parts"))
+        self.assertFalse(hasattr(tensors, "read_all"))
+        self.assertFalse(hasattr(tfs, "Info"))
+        self.assertFalse(hasattr(tfs, "Part"))
         self.assertIsNone(tensors.get("absent"))
         marker = object()
         self.assertIs(tensors.get("absent", marker), marker)
         with self.assertRaises(KeyError):
             tensors["absent"]
-        arrays = tensors.read_all(["empty", "plain"])
+        arrays = tensors.read(["empty", "plain", "empty"])
         self.assertEqual(list(arrays), ["empty", "plain"])
         self.assertEqual(arrays["empty"].tobytes(), b"")
         self.assertEqual(arrays["plain"].tobytes(), self.plain.tobytes())
-        self.assertEqual(list(tensors.read_all([], decode=False)), [])
-        self.assertEqual(list(tensors.read_all(decode=False)), list(tensors))
+        self.assertEqual(list(tensors.read([], decode=False)), [])
+        self.assertEqual(list(tensors.read(decode=False)), list(tensors))
 
     def test_dlpack_consumers_hold_the_array_storage(self) -> None:
         array = self.tensors.read("plain")
@@ -137,7 +143,7 @@ class HostReads(unittest.TestCase):
             self.tensors.read_into("quantized", bytearray(1), role="")
         for device in ["gpu", "cuda:-1", "cuda:nope"]:
             with self.assertRaises(tfs.InvalidError):
-                self.tensors.read_all(device=device)
+                self.tensors.read(device=device)
 
     def test_real_endpoint_fetches_only_chunks_touched_by_the_read(self) -> None:
         root = pathlib.Path(self.tmp.name)
@@ -146,7 +152,11 @@ class HostReads(unittest.TestCase):
                           endpoint=endpoint, cache_dir=root / "upload")
         remote = tfs.open("acme/reads", revision="one", endpoint=endpoint, cache_dir=root / "reader")
         before = set(remote.missing())
-        part = remote.components["model"].tensors["big"].parts[""]
+        self.assertEqual(remote.components["model"].tensors.read([]), {})
+        with self.assertRaises(KeyError):
+            remote.components["model"].tensors.read(["plain", "absent"])
+        self.assertEqual(set(remote.missing()), before)
+        part = raw_format.parts(remote, "model", "big")[""]
         chunk = remote.chunks[part.chunk]
         self.assertIn(chunk, before)
         out = bytearray(17)
@@ -158,8 +168,11 @@ class HostReads(unittest.TestCase):
         header = next((pathlib.Path(self.tmp.name) / "store").rglob(self.ck.id.removeprefix("sha256:")))
         parsed = tfs.Checkpoint.parse(header.read_bytes())
         tensors = parsed.components["model"].tensors
+        self.assertEqual(tensors.read([]), {})
+        with self.assertRaises(KeyError):
+            tensors.read(["plain", "absent"])
         self.assertEqual(list(tensors), list(self.tensors))
-        for call in [lambda: tensors.read("plain"), lambda: tensors.read_all(),
+        for call in [lambda: tensors.read("plain"), lambda: tensors.read(),
                      lambda: tensors.read_into("plain", bytearray(4))]:
             with self.assertRaises(tfs.UnsupportedError):
                 call()

@@ -146,7 +146,8 @@ pub fn convert_folder(req: &Request, dir: &Path) -> Result<ObjectRef> {
             encoding: Option<&Encoding>,
             parts: Vec<Part>,
         ) -> Result<()> {
-            self.writer().put(component, key, dtype, shape, encoding, parts)
+            self.writer()
+                .put(component, key, dtype, shape, encoding, parts)
         }
         fn commit(&mut self, metadata: Metadata) -> Result<()> {
             Sink::commit(self.writer(), metadata)
@@ -154,7 +155,11 @@ pub fn convert_folder(req: &Request, dir: &Path) -> Result<ObjectRef> {
     }
     let mut folder = Folder(dir, None);
     convert(req, &mut folder)?;
-    Ok(folder.writer().committed().expect("a convert commits").clone())
+    Ok(folder
+        .writer()
+        .committed()
+        .expect("a convert commits")
+        .clone())
 }
 
 /// What a component's folder held besides weights.
@@ -229,12 +234,18 @@ impl Imported {
             _ => Value::List(l),
         };
         let mut out = Metadata::new();
-        out.insert(SOURCE.into(), one(self.sources.iter().map(|s| text(s)).collect()));
+        out.insert(
+            SOURCE.into(),
+            one(self.sources.iter().map(|s| text(s)).collect()),
+        );
         let filled = (self.filled.iter()).map(|(from, files)| {
             Value::Map(BTreeMap::from([
                 ("from".to_owned(), text(from)),
                 ("files".to_owned(), texts(files)),
-                ("note".to_owned(), text("run data the source lacks, from a pinned reference")),
+                (
+                    "note".to_owned(),
+                    text("run data the source lacks, from a pinned reference"),
+                ),
             ]))
         });
         if !self.filled.is_empty() {
@@ -261,15 +272,13 @@ pub struct Request<'a> {
     /// The store's tmp directory.
     pub tmp: &'a Path,
     pub progress: &'a (dyn Fn(&str, u64, u64) + Sync),
-    /// Asked between members and tensors: true ends the import (it resumes from there).
+    /// Asked before members/tensors and while network work is pending. True stops before
+    /// finalization begins; an already-started commit cannot be undone.
     pub stop: Option<&'a (dyn Fn() -> bool + Sync)>,
 }
 
 fn stopped(req: &Request) -> Result<()> {
-    match req.stop.is_some_and(|stop| stop()) {
-        true => refuse(Code::TRANSFER_FAILED, "the import was stopped"),
-        false => Ok(()),
-    }
+    remote::Scope::new(req.access, req.stop).check()
 }
 
 fn digest(parts: &[&str]) -> String {
@@ -280,21 +289,22 @@ fn digest(parts: &[&str]) -> String {
 fn land(
     members: &[remote::Member],
     area: &Path,
-    access: &Access,
-    progress: &(dyn Fn(&str, u64, u64) + Sync),
+    req: &Request<'_>,
 ) -> Result<Vec<(String, PathBuf)>> {
+    let access = remote::Scope::new(req.access, req.stop);
+    let progress = req.progress;
     let total = members.iter().filter_map(|m| m.length).sum();
     let mut done = 0;
     let mut out = Vec::new();
     for m in members {
+        access.check()?;
         progress("downloading", done, total);
-        out.push((
-            m.path.clone(),
-            remote::land(m, &area.join(&m.path), access)?,
-        ));
+        access.check()?;
+        out.push((m.path.clone(), access.land(m, &area.join(&m.path))?));
         done += m.length.unwrap_or(0);
     }
     progress("downloading", done, total);
+    access.check()?;
     Ok(out)
 }
 
@@ -327,7 +337,7 @@ fn fill(
     files: &mut BTreeMap<String, Vec<u8>>,
 ) -> Result<Vec<String>> {
     let mut added = Vec::new();
-    for (path, local) in land(docs, area, req.access, req.progress)? {
+    for (path, local) in land(docs, area, req)? {
         let path = join(into, &path);
         if !files.contains_key(&path) {
             let bytes = std::fs::read(&local)
@@ -349,9 +359,9 @@ fn gguf_documents(
     area: &Path,
     files: &mut BTreeMap<String, Vec<u8>>,
 ) -> Result<(String, Vec<String>)> {
-    let listing = remote::list(&remote::parse(reference)?, req.access)?;
+    let listing = remote::Scope::new(req.access, req.stop).list(&remote::parse(reference)?)?;
     let pin = listing.pinned.clone();
-    let read = |m: &remote::Member| remote::read_small(m, req.access);
+    let read = |m: &remote::Member| remote::Scope::new(req.access, req.stop).read_small(m);
     let docs: Vec<remote::Member> = remote::select(listing, None, remote::Files::Configs, &read)?
         .into_iter()
         .filter(|m| !remote::weights(&m.path) && folder(&m.path).is_empty())
@@ -401,9 +411,10 @@ fn documents(
     for t in &recognized.tables {
         let table = &tables[*t];
         if let Some(reference) = &table.reference {
-            let listing = remote::list(&remote::parse(reference)?, req.access)?;
+            let listing =
+                remote::Scope::new(req.access, req.stop).list(&remote::parse(reference)?)?;
             let pin = listing.pinned.clone();
-            let read = |m: &remote::Member| remote::read_small(m, req.access);
+            let read = |m: &remote::Member| remote::Scope::new(req.access, req.stop).read_small(m);
             let selected = remote::select(listing, None, remote::Files::Configs, &read)?;
             let weighted: Vec<&str> = selected
                 .iter()
@@ -455,9 +466,10 @@ pub fn layout(mut files: BTreeMap<String, Vec<u8>>, tensored: &[String]) -> Resu
         .flat_map(|p| &p.config)
         .filter(|(name, _)| !name.starts_with('_'))
         .filter_map(|(name, row)| match row.as_array()?.as_slice() {
-            [library, class, ..] => {
-                Some((name.clone(), format!("{}.{}", library.as_str()?, class.as_str()?)))
-            }
+            [library, class, ..] => Some((
+                name.clone(),
+                format!("{}.{}", library.as_str()?, class.as_str()?),
+            )),
             _ => None,
         })
         .collect();
@@ -471,7 +483,11 @@ pub fn layout(mut files: BTreeMap<String, Vec<u8>>, tensored: &[String]) -> Resu
     }
     let mut components = Vec::new();
     for name in names {
-        let at = if root && name == ROOT_COMPONENT { "" } else { name.as_str() };
+        let at = if root && name == ROOT_COMPONENT {
+            ""
+        } else {
+            name.as_str()
+        };
         let inside = |p: &str| match at {
             "" => Some(p.to_owned()).filter(|p| !p.contains('/')),
             f => (p.strip_prefix(f)?.strip_prefix('/')).map(str::to_owned),
@@ -512,7 +528,9 @@ pub fn layout(mut files: BTreeMap<String, Vec<u8>>, tensored: &[String]) -> Resu
 
 /// The variant a model is written as: its main dtype or scheme by stored bytes (`bf16`,
 /// `fp8.rowwise`), `files` when it has no tensors.
-pub fn main_variant<'a>(tensors: impl Iterator<Item = (&'a Dtype, Option<&'a Encoding>, u64)>) -> String {
+pub fn main_variant<'a>(
+    tensors: impl Iterator<Item = (&'a Dtype, Option<&'a Encoding>, u64)>,
+) -> String {
     let mut bytes: BTreeMap<String, u64> = BTreeMap::new();
     for (dtype, encoding, n) in tensors {
         let name = encoding.map_or_else(|| dtype.name().to_ascii_lowercase(), |e| e.scheme.clone());
@@ -555,13 +573,15 @@ fn class_of(file: &str, config: &Config) -> String {
 
 pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     let progress = req.progress;
+    stopped(req)?;
     progress("resolving", 0, 0);
+    stopped(req)?;
     let mut pinned = Vec::new();
     let mut members: Vec<remote::Member> = Vec::new();
     for raw in req.sources {
-        let listing = remote::list(&remote::parse(raw)?, req.access)?;
+        let listing = remote::Scope::new(req.access, req.stop).list(&remote::parse(raw)?)?;
         pinned.push(listing.pinned.clone());
-        let read = |m: &remote::Member| remote::read_small(m, req.access);
+        let read = |m: &remote::Member| remote::Scope::new(req.access, req.stop).read_small(m);
         for m in remote::select(listing, req.variant, remote::Files::All, &read)? {
             if members.iter().any(|o| o.path == m.path) {
                 return refuse(
@@ -587,7 +607,7 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
             crate::err::classify_io("lock the import area", std::io::Error::other(e.to_string()))
         })?;
     stopped(req)?;
-    let landed = land(&members, &area.join("source"), req.access, progress)?;
+    let landed = land(&members, &area.join("source"), req)?;
     stopped(req)?;
     let mut set = source::SourceSet::scan(&landed)?;
     carriers::fold(&mut set)?;
@@ -651,10 +671,21 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
         parts.map(|(d, s)| d.byte_len(s).unwrap_or(0)).sum()
     };
     let stored = (planned.iter())
-        .map(|p| (&p.dtype, p.encoding.as_ref(), sizes(&mut p.parts.iter().map(|q| (&q.dtype, &q.shape[..])))))
+        .map(|p| {
+            (
+                &p.dtype,
+                p.encoding.as_ref(),
+                sizes(&mut p.parts.iter().map(|q| (&q.dtype, &q.shape[..]))),
+            )
+        })
         .chain(ggufs_planned.iter().flat_map(|g| &g.2.tensors).map(|o| {
-            (&o.dtype, o.encoding.as_ref(), sizes(&mut o.parts.iter().map(|q| (&q.dtype, &q.shape[..]))))
+            (
+                &o.dtype,
+                o.encoding.as_ref(),
+                sizes(&mut o.parts.iter().map(|q| (&q.dtype, &q.shape[..]))),
+            )
         }));
+    stopped(req)?;
     sink.begin(&main_variant(stored), &layout(files, &tensored)?)?;
     let opened: Vec<File> = set
         .files
@@ -668,6 +699,7 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
     for (n, p) in planned.iter().enumerate() {
         stopped(req)?;
         progress("converting", n as u64, total);
+        stopped(req)?;
         let what = format!("{}/{}", p.component, p.key);
         let mut readers = (p.parts.iter())
             .map(|part| {
@@ -682,6 +714,7 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
                 data: reader,
             })
             .collect();
+        stopped(req)?;
         sink.put(
             &p.component,
             &p.key,
@@ -706,13 +739,19 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
                 })
                 .collect();
             let encoding = o.encoding.as_ref();
+            stopped(req)?;
             sink.put(component, &o.key, &o.dtype, &o.shape, encoding, parts)?;
         }
     }
     let mut file_metadata: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let named = (recognized.claims.iter())
         .map(|c| (c.name.clone(), c.group))
-        .chain(recognized.unclaimed.iter().map(|g| (identity(&set.groups[*g]), *g)));
+        .chain(
+            recognized
+                .unclaimed
+                .iter()
+                .map(|g| (identity(&set.groups[*g]), *g)),
+        );
     for (component, g) in named {
         let kept = (set.groups[g].metadata.iter())
             .filter(|(k, _)| !DECLARATIONS.contains(&k.as_str()))
@@ -727,6 +766,9 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
         filled,
         file_metadata,
     };
+    // This is the final cooperative cancellation boundary. Once this call starts, a
+    // dropped future cannot promise to undo the writer's atomic finalization.
+    stopped(req)?;
     sink.commit(imported.metadata())?;
     drop(opened);
     match std::fs::remove_dir_all(&area) {

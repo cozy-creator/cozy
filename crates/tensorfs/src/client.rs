@@ -66,6 +66,8 @@ pub struct ImportOptions<'a> {
     pub converter: Option<&'a str>,
     pub variant: Option<&'a str>,
     pub progress: &'a (dyn Fn(&str, u64, u64) + Sync),
+    /// Cooperative cancellation before finalization/publication begins.
+    pub stop: Option<&'a (dyn Fn() -> bool + Sync)>,
 }
 
 /// Provider credentials from `HF_TOKEN` and `CIVITAI_TOKEN`.
@@ -238,10 +240,13 @@ impl Store {
             access: &access,
             tmp: &self.root().join("tmp"),
             progress: opts.progress,
-            stop: None,
+            stop: opts.stop,
         };
         let key = format!("import.{}", name.replace('/', ".").to_ascii_lowercase());
         let (header, files) = self.import(&req, Some(&key))?;
+        if opts.stop.is_some_and(|stop| stop()) {
+            return fail(Kind::Network, "the import was stopped before tree/ref publication");
+        }
         let named = self.set_variant(&name, IMPORT_RELEASE, None, &header, &files)?;
         self.unpin(&key)?;
         Ok(named)

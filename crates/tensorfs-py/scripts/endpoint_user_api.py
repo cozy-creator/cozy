@@ -44,7 +44,7 @@ assert any(method == "PUT" and isinstance(payload, str) and len(payload) == 64 f
 reader = tensorfs.open(request["model"], revision=published.tree, variant="f32",
                        endpoint=request["endpoint"], token=request["token"], ca_der=ca, cache_dir=cache / "reader")
 assert reader.missing(), "opening metadata fetched data"
-assert (Path(reader.components["model"].path) / "tokenizer.json").read_bytes() == b"{}"
+assert reader.components["model"].asset("tokenizer.json") == b"{}"
 assert reader.missing(), "a component path fetched its weights"
 progress = []
 reader.fetch(progress=lambda stage, held, total: progress.append((stage, held, total)))

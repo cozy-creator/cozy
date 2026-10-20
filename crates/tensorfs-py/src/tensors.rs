@@ -1,4 +1,4 @@
-//! `Component.tensors`: `key -> Info` in construction order, read through TensorFS's read engine
+//! `Component.tensors`: `key -> TensorMetadata` in construction order, read through TensorFS's read engine
 //! (`tensorfs::io`) with the GIL released.
 
 use std::collections::BTreeMap;
@@ -7,7 +7,7 @@ use std::sync::Arc;
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyIterator};
+use pyo3::types::{PyDict, PyIterator, PyString};
 use tensorfs::failure::{Failure, Kind};
 use tensorfs::format::{decode, Body, Dtype, Encoding, PartBytes};
 use tensorfs::io::{DeviceBuffer, Dst, ReadOpts, Target};
@@ -18,7 +18,7 @@ use crate::store::{
     OrRaise, PyArray,
 };
 
-/// A component's tensors: a mapping of key to `Info`, with the reads.
+/// A component's tensors: a mapping of key to `TensorMetadata`, with the reads.
 #[pyclass(name = "Tensors", module = "tensorfs", frozen, mapping)]
 pub struct PyTensors {
     component: String,
@@ -404,45 +404,45 @@ impl PyTensors {
         format!("Tensors({}, {} tensors)", self.component, self.__len__(py))
     }
 
-    /// One tensor on the CPU: an `Array` (decoded), or `Encoded` with `decode=False`.
-    #[pyo3(signature = (key, *, decode = true))]
-    fn read<'py>(&self, py: Python<'py>, key: String, decode: bool) -> PyResult<Bound<'py, PyAny>> {
-        Ok(self.load(py, &[key], decode, None)?.remove(0))
-    }
-
-    /// `keys` (all when None, in construction order) read at once: `{key: Array | Encoded}`.
+    /// Read one tensor, a chosen sequence, or all tensors in construction order.
     #[pyo3(signature = (keys = None, *, device = "cpu", decode = true))]
-    fn read_all<'py>(
+    fn read<'py>(
         &self,
         py: Python<'py>,
-        keys: Option<Vec<String>>,
+        keys: Option<&Bound<'py, PyAny>>,
         device: &str,
         decode: bool,
-    ) -> PyResult<Bound<'py, PyDict>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let device = match device {
             "cpu" => None,
             "cuda" => Some(0),
-            text => Some(
-                text.strip_prefix("cuda:")
-                    .and_then(|n| n.parse::<i32>().ok())
-                    .filter(|n| *n >= 0)
-                    .ok_or_else(|| {
-                        invalid(
-                            py,
-                            format!("device {text:?}: expected cpu, cuda, or cuda:N"),
-                        )
-                    })?,
-            ),
+            text => Some(text.strip_prefix("cuda:")
+                .and_then(|n| n.parse::<i32>().ok()).filter(|n| *n >= 0)
+                .ok_or_else(|| invalid(py, format!("device {text:?}: expected cpu, cuda, or cuda:N")))?),
         };
-        let keys = match keys {
-            Some(keys) => keys,
+        let single = keys.is_some_and(|keys| keys.is_instance_of::<PyString>());
+        let mut keys = match keys {
+            Some(keys) if single => vec![keys.extract::<String>()?],
+            Some(keys) => keys.extract::<Vec<String>>()?,
             None => self.infos.bind(py).keys().extract()?,
         };
-        let out = PyDict::new(py);
-        for (key, value) in keys.iter().zip(self.load(py, &keys, decode, device)?) {
-            out.set_item(key, value)?;
+        let mut seen = std::collections::HashSet::new();
+        keys.retain(|key| seen.insert(key.clone()));
+        for key in &keys {
+            if !self.infos.bind(py).contains(key)? {
+                return Err(PyKeyError::new_err(key.clone()));
+            }
         }
-        Ok(out)
+        if single {
+            return Ok(self.load(py, &keys, decode, device)?.remove(0));
+        }
+        let out = PyDict::new(py);
+        if !keys.is_empty() {
+            for (key, value) in keys.iter().zip(self.load(py, &keys, decode, device)?) {
+                out.set_item(key, value)?;
+            }
+        }
+        Ok(out.into_any())
     }
 
     /// `len(out)` bytes of `key` from `offset` into the writable buffer `out`: its stored data,

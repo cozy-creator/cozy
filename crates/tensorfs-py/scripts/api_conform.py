@@ -8,10 +8,10 @@ from tempfile import TemporaryDirectory
 import numpy as np
 
 import tensorfs
-from tensorfs import _ext, varena
+from tensorfs import _ext, raw, varena
 
 assert not hasattr(tensorfs, "Store"), "the cache implementation leaked into the public API"
-for obsolete in ("Closure", "ReadPlan", "parse_header", "plan", "regions"):
+for obsolete in ("Closure", "ReadPlan", "parse_header", "plan", "regions", "Info", "Part"):
     assert not hasattr(tensorfs, obsolete) and not hasattr(_ext, obsolete), obsolete
 assert importlib.util.find_spec("tensorfs.records") is None, "the legacy projection remains importable"
 assert varena.regions is _ext.varena.regions
@@ -36,8 +36,15 @@ with TemporaryDirectory() as temp:
     assert tensorfs.open(root / "folder/model.f32.cozytensors").id == ck.id
     assert np.array_equal(np.from_dlpack(ck.components["model"].tensors.read("weight")), values)
     component = ck.components["model"]
-    assert json.loads((Path(component.path) / "config.json").read_text()) == {"width": 6}
-    assert (Path(component.path) / "tokenizer.json").read_bytes() == b"{}"
+    assert component.config == {"width": 6} and component.asset("tokenizer.json") == b"{}"
+    assert not hasattr(component, "path") and not hasattr(component, "config_file")
+    assert isinstance(component.tensors["weight"], tensorfs.TensorMetadata)
+    assert not hasattr(component.tensors["weight"], "parts") and not hasattr(component.tensors, "read_all")
+    assert raw.parts(ck, "model", "weight")[""].length == values.nbytes
+    support = Path(component.export_files(root / "support"))
+    assert sorted(p.name for p in support.iterdir()) == ["config.json", "tokenizer.json"]
+    assert json.loads((support / "config.json").read_text()) == component.config
+    assert (support / "tokenizer.json").read_bytes() == b"{}"
     tree = tensorfs.upload_folder(repo_id="local/example", revision="draft", folder_path=ck.path)
     named = tensorfs.open("local/example", revision="draft", variant="f32", local_files_only=True)
     assert named.id == ck.id and named.tree == tree
@@ -61,8 +68,9 @@ with TemporaryDirectory() as temp:
     assert metadata.missing(), "opening metadata fetched the closure"
     assert varena.regions(metadata, only=["model/weight"]) == [["model/weight"]]
     assert metadata.missing(), "region planning fetched payload bytes"
-    assert (Path(metadata.components["model"].path) / "tokenizer.json").read_bytes() == b"{}"
-    assert metadata.missing(["model"]), "rendering a component path fetched its tensors"
+    exported = Path(metadata.components["model"].export_files(root / "remote-support"))
+    assert (exported / "tokenizer.json").read_bytes() == b"{}"
+    assert metadata.missing(["model"]), "exporting support files fetched its tensors"
     only = tensorfs.snapshot_download("acme/example", revision="1", variant="f32", components=["model"], endpoint=origin, cache_dir=remote_cache)
     assert not (Path(only) / "model.f16.cozytensors").exists()
     selected = tensorfs.open(only, cache_dir=remote_cache)

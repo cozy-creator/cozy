@@ -2,8 +2,8 @@
 
     ck = tensorfs.open("acme/sdxl", revision="1.0", variant="int8")
     unet = ck.components["unet"]
-    tensors = unet.tensors.read_all(device="cpu")
-    tokenizer_path = ck.components["tokenizer"].path
+    tensors = unet.tensors.read(device="cpu")
+    tokenizer_config = ck.components["tokenizer"].config
 
 Arrays cross to NumPy, PyTorch, JAX or CuPy through DLPack. TensorFS never imports a framework.
 """
@@ -23,12 +23,11 @@ from ._ext import (
     Encoding,
     Error,
     FormatError,
-    Info,
+    TensorMetadata,
     IntegrityError,
     InvalidError,
     NetworkError,
     NotFoundError,
-    Part,
     Pipeline,
     StorageError,
     Tensors,
@@ -36,6 +35,7 @@ from ._ext import (
     UnsupportedError,
     __version__,
 )
+from . import raw
 from .api import ComponentWriter, Endpoint, Writer, configure, convert, export, hub_download, open, resolve_source, snapshot_download, upload_folder
 
 Mapping.register(Tensors)
@@ -55,12 +55,11 @@ __all__ = [
     "Encoding",
     "Error",
     "FormatError",
-    "Info",
+    "TensorMetadata",
     "IntegrityError",
     "InvalidError",
     "NetworkError",
     "NotFoundError",
-    "Part",
     "Pipeline",
     "StorageError",
     "Tensors",

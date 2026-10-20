@@ -31,6 +31,7 @@ from diffusers import StableDiffusionXLPipeline
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
 import tensorfs as tfs
+from tensorfs import raw as _raw
 from tensorfs import varena
 
 REPO = "hf-internal-testing/tiny-sdxl-pipe"
@@ -181,7 +182,7 @@ def main() -> None:
     for component in ("unet", "vae", "text_encoder", "text_encoder_2"):
         want = getattr(upstream, component).state_dict()
         for key, info in ck.components[component].tensors.items():
-            assert info.encoding is None and list(info.parts) == [""], (key, info)
+            assert info.encoding is None and not hasattr(info, "parts"), (key, info)
             got = torch.from_dlpack(ck.components[component].tensors.read(key))
             assert tuple(got.shape) == info.shape and got.dtype == DTYPES[info.dtype], (key, got.dtype, info)
             if key in want:
@@ -209,7 +210,7 @@ def main() -> None:
 
     w = tfs.Writer(base=m)
     config = {"scale": 0.18215, "eps": 1e-05, "act": None, "blocks": [1, 2.5], "name": "x"}
-    extra = w.component("extra", cls="diffusers.Extra", config=config, config_file="extra_config.json")
+    extra = w.component("extra", cls="diffusers.Extra", config=config)
     extra.put("x.weight", np.arange(4, dtype=np.float32).reshape(2, 2))
     parts = {"weight": ("F8_E4M3", [2, 16], bytes([0x38]) * 32), "scale": ("F32", [2], np.array([0.5, 2.0], dtype=np.float32))}
     extra.put_encoded("q.weight", dtype="F32", shape=[2, 16], scheme="fp8.rowwise", parts=parts, params={"axis": 0, "scale_dtype": "F32"})
@@ -218,10 +219,10 @@ def main() -> None:
     ck3 = w.commit()
     assert ck3.components["unet"].tensors.keys() == ck.components["unet"].tensors.keys(), "the base carries over"
     e = ck3.components["extra"]
-    assert (e.cls, e.config, e.config_file) == ("diffusers.Extra", config, "extra_config.json"), (e.cls, e.config)
+    assert (e.cls, e.config) == ("diffusers.Extra", config), (e.cls, e.config)
     assert e.assets["vocab.txt"][1] == 4 and e.asset("vocab.txt") == b"a\nb\n"
     q = ck3.components["extra"].tensors["q.weight"]
-    assert q.encoding is not None and q.encoding.scheme == "fp8.rowwise" and set(q.parts) == {"weight", "scale"}
+    assert q.encoding is not None and q.encoding.scheme == "fp8.rowwise" and set(_raw.parts(ck3, "extra", "q.weight")) == {"weight", "scale"}
     assert str(q.encoding) == 'fp8.rowwise {axis: 0, scale_dtype: "F32"}', q.encoding
     assert torch.equal(torch.from_dlpack(ck3.components["extra"].tensors.read("q.weight")), torch.tensor([[0.5] * 16, [2.0] * 16]))
     try:
@@ -237,7 +238,7 @@ def main() -> None:
     assert (parsed.pipeline is None) == (ck3.pipeline is None)
     for name, c in ck3.components.items():
         p = parsed.components[name]
-        assert (p.cls, p.config, p.config_file, p.assets) == (c.cls, c.config, c.config_file, c.assets), name
+        assert (p.cls, p.config, p.assets) == (c.cls, c.config, c.assets), name
     try:
         parsed.components["extra"].asset("vocab.txt")
         raise AssertionError("a parsed header has no assets here")

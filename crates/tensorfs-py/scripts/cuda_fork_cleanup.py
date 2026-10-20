@@ -61,10 +61,10 @@ def child():
             component.put("value", pattern, dtype="U8", shape=[size])
             checkpoint = writer.commit()
             tensors = checkpoint.components["model"].tensors
-            warm = tensors.read_all(["warm"], device="cuda:0")["warm"]
+            warm = tensors.read(["warm"], device="cuda:0")["warm"]
             assert warm.tobytes() == b"w"
             before = free_bytes()
-            array = tensors.read_all(["value"], device="cuda:0")["value"]
+            array = tensors.read(["value"], device="cuda:0")["value"]
             assert array.tobytes() == pattern
             allocated = free_bytes()
             assert before - allocated >= size, "the oracle did not observe the native allocation"
