@@ -20,7 +20,8 @@ use serde_json::{json, Value as Json};
 
 use crate::failure::{fail, Failure, Kind, Result};
 use crate::fetch::{self, Client, Endpoint, Fetcher, Fresh, Origin, Payload, SourcePolicy, Want};
-use crate::format::{Component, Config, Header, Metadata, ObjectRef, Release, Repo, Tensor, Tree, Value, HEADER_PATH};
+use crate::format::decode::{check_metadata, PartMetadata};
+use crate::format::{Body, Component, Config, Header, Metadata, ObjectRef, Release, Repo, Tensor, Tree, Value, HEADER_PATH, TREE_FORMAT};
 use crate::import::{layout, remote};
 use crate::store::Store;
 
@@ -228,7 +229,7 @@ impl<'t> Migrator<'t> {
     /// The repo document `doc` in D10, its old objects read by `read`. A release that names a
     /// tree, and a checkpoint that is one, stay as they are; each release of lanes becomes one
     /// tree (`model.<lane>.cozytensors` each, repo files merged, the first lane's kept where
-    /// they differ) at its next revision, yanked or not; each other old checkpoint a tree of
+    /// they differ), yanked or not; each other old checkpoint a tree of
     /// its own (`model.cozytensors`).
     pub fn repo(&mut self, doc: &[u8], read: Read) -> Result<Migrated> {
         let old: OldRepo = serde_json::from_slice(doc).map_err(|e| invalid(format!("repo document: {e}")))?;
@@ -272,7 +273,7 @@ impl<'t> Migrator<'t> {
         let (mut checkpoints, mut unreleased) = (Vec::new(), Vec::new());
         for c in old.checkpoints.iter().filter(|c| !cited.contains(c)) {
             let doc: Json = serde_json::from_slice(&read(c)?).map_err(|e| invalid(format!("{}: {e}", c.id())))?;
-            if doc["format"].as_str().is_some_and(|f| f.starts_with("tensorfs.tree/")) {
+            if doc["format"] == TREE_FORMAT {
                 checkpoints.push(c.clone());
                 continue;
             }
@@ -325,7 +326,11 @@ impl<'t> Migrator<'t> {
                 for (path, object) in &files {
                     bytes.insert(path.clone(), read(object)?);
                 }
-                let tensors = old.components().iter().map(|c| (c.name.clone(), c.tensors.clone())).collect();
+                let mut tensors = Vec::new();
+                for c in old.components() {
+                    let ts = c.tensors.iter().cloned().map(|t| part_dtypes(&c.name, t)).collect::<Result<_>>()?;
+                    tensors.push((c.name.clone(), ts));
+                }
                 (old.chunks.clone(), tensors, old.metadata.clone(), bytes, None)
             }
         };
@@ -504,6 +509,27 @@ fn check(chunks: &[ObjectRef], tensors: &[(String, Vec<Tensor>)], new: &Header, 
         }
     }
     Ok(())
+}
+
+/// 0.12's encodings named their scales' dtypes; D10 takes each from its part (owner,
+/// 2026-10-20), and its decoder refuses the params. Each goes once it agrees with its part.
+const DTYPE_PARAMS: [(&str, &str); 2] = [("scale_dtype", "scale"), ("pre_quant_scale_dtype", "pre_quant_scale")];
+
+fn part_dtypes(component: &str, mut t: Tensor) -> Result<Tensor> {
+    let Body::Encoded { encoding, parts } = &mut t.body else { return Ok(t) };
+    let what = format!("{component}/{}", t.key);
+    for (param, role) in DTYPE_PARAMS {
+        let Some(named) = encoding.params.remove(param) else { continue };
+        let part = parts.iter().find(|p| p.role == role).map(|p| p.dtype.name());
+        if named.as_str() != part {
+            return fail(Kind::Invalid, format!("{what}: {param} {named:?} is not its {role} part's dtype {part:?}"));
+        }
+    }
+    let meta: Vec<PartMetadata> = (parts.iter())
+        .map(|p| PartMetadata { role: &p.role, dtype: &p.dtype, shape: &p.shape, len: p.length as usize })
+        .collect();
+    check_metadata(&t.dtype, &t.shape, encoding, &meta).map_err(|e| invalid(format!("{what}: {encoding}: {e}")))?;
+    Ok(t)
 }
 
 /// A five-field header in D10's layout, every byte kept: no pipeline, each component
