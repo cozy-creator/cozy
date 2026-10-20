@@ -41,7 +41,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # One version everywhere; a publish runs on that version's tag; a store format or claim protocol
+  # One version everywhere; a publish runs on that version's tag; a store format
   # unlike the newest published wheel's needs a newer minor (format_contract.py).
   gate:
     runs-on: ubuntu-24.04
