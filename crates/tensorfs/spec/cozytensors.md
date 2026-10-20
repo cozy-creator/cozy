@@ -645,7 +645,8 @@ A repo is a set of **commits** and the **tags** that point at them, as in git:
 - Any change is a new document: a writer conditions it on the whole document it read (its ETag, distribution.md §4).
   Nothing in it counts edits.
 - **Resolution** of a `revision`, once, to a commit:
-  - none: the public, non-yanked tag with the highest version (PEP 440 ordering);
+  - none: among public, non-yanked tags, the highest final version in PEP 440 order; a pre-release (`a`, `b`,
+    `rc`, `.dev`) only when no final version exists;
   - `sha256:<hex>`: the tag commit with that digest; else a variant header with that digest, at the commit that cites
     it (the default's if it does, else the last-created tag's whose commit does); else not found;
   - otherwise the tag of that name, yanked or not (a reader MAY warn); else not found.
