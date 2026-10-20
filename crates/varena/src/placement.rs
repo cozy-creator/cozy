@@ -2954,6 +2954,7 @@ mod gpu_tests {
                 drop(pin);
             }
             placement.gpu.wait_pending().unwrap();
+            placement.leave(1, 0).expect("completed model forward");
         };
         forward(1);
         forward(3);
