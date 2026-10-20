@@ -10,9 +10,9 @@ use super::plan::{Codes as PlanCodes, Core, Elems, Plan, Post, RequantCodes, Req
 use super::{elem, Allowed, Ctx, Dtypes, Param, Part, Scheme, Shape, View};
 use crate::format::{Result, Value};
 
-const I8: Dtypes = Dtypes::Of(&["I8"]);
-const F32: Dtypes = Dtypes::Of(&["F32"]);
-const S_REL: Dtypes = Dtypes::Of(&["F8_E4M3", "F32"]);
+const I8: Dtypes = &["I8"];
+const F32: Dtypes = &["F32"];
+const S_REL: Dtypes = &["F8_E4M3", "F32"];
 
 pub static ASYM_W4A8_INT8: Scheme = Scheme {
     name: "comfy.asym_w4a8_int8",
@@ -31,7 +31,7 @@ pub static ASYM_W4A8_INT8: Scheme = Scheme {
         Part::opt("weight_codebook", F32, |_| Ok(Shape::Count(16))),
         Part::opt(
             "weight_correction",
-            Dtypes::Of(&["F32", "BF16", "F16"]),
+            &["F32", "BF16", "F16"],
             |c| correction(c).shape(c),
         ),
     ],

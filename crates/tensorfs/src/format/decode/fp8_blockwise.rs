@@ -4,7 +4,7 @@
 
 use super::grid::Grid;
 use super::plan::Codes;
-use super::{logical, Allowed, Ctx, Dtypes, Param, Part, Scheme, View};
+use super::{logical, Allowed, Ctx, Param, Part, Scheme, View};
 use crate::format::Value;
 
 pub const BLOCKWISE: Scheme = Scheme {
@@ -15,14 +15,10 @@ pub const BLOCKWISE: Scheme = Scheme {
             key: "block_size",
             allowed: Allowed::Check(block_size, "[rows, cols], each a positive integer"),
         },
-        Param {
-            key: "scale_dtype",
-            allowed: Allowed::Text(&["F32", "BF16", "F16", "F8_E8M0"]),
-        },
     ],
     parts: &[
-        Part::req("weight", Dtypes::Of(&["F8_E4M3"]), logical),
-        Part::req("scale", Dtypes::Param("scale_dtype"), |c| tiles(c).shape(c)),
+        Part::req("weight", &["F8_E4M3"], logical),
+        Part::req("scale", &["F32", "BF16", "F16", "F8_E8M0"], |c| tiles(c).shape(c)),
     ],
     decode: |c| Ok(Codes::elements(c.part("weight"), c.part("scale"), tiles(c)).into()),
 };

@@ -19,7 +19,7 @@ faults = ["store"]
 
 [dependencies]
 base64.workspace = true
-# The A11 header migration reads upstream config wrappers.
+# The A11 header migration's Cozy config wrappers (src/migrate/d10.rs); goes with it.
 flate2.workspace = true
 platform.workspace = true
 libloading.workspace = true

@@ -60,7 +60,7 @@ def main() -> int:
         mode = ""
     ours = source()
     version, theirs = speaks(str(pathlib.Path(wheel).resolve())) if wheel else published()
-    said = lambda ints: "no store format" if ints is None else f"store format {ints[0]}"
+    said = lambda ints: "nothing" if ints is None else f"store format {ints[0]}"
     if mode == "binary":
         if theirs != ours:
             which = f"the wheel {wheel}" if wheel else "the newest on PyPI"

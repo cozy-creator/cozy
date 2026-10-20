@@ -2,7 +2,7 @@
 use std::{path::PathBuf, process::ExitCode};
 
 use protocol::{
-    calcifer::{On, Run, SubmitRun},
+    calcifer::{On, Run, StagedInput, SubmitRun},
     config::Hub,
     error::{Error, Kind},
 };
@@ -22,7 +22,7 @@ mod follow;
 pub(crate) mod interface;
 mod list;
 pub(crate) mod live;
-mod local;
+pub(crate) mod local;
 mod play;
 mod show;
 mod spec;
@@ -332,7 +332,8 @@ pub(crate) async fn call(
     invoke(ctx, package, function, &resolved.card, args).await
 }
 
-/// Binds the run's inputs to `card`, submits it pinned to `card`'s release, and follows it.
+/// Binds the run's inputs to `function` of `card`, submits it pinned to `card`'s release, and
+/// follows it.
 async fn invoke(
     ctx: &Context,
     package: &str,
@@ -340,49 +341,73 @@ async fn invoke(
     card: &Card,
     args: RunArgs,
 ) -> Result<Run, Error> {
-    let hub = ctx.hub()?;
-    let terms = terms(ctx, &args)?;
-    let bits = bits(&args);
     let on = args.placement.on();
     let source = spec::Source::Release(Some(&card.release));
-    if let Some(level) = args.warm {
-        if args.gpus.is_some() {
-            return Err(Error::new(
-                Kind::Usage,
-                "warm_gpus",
-                "--gpus applies to a run, not to --warm",
-            ));
-        }
-        let callable = callable(package, &card.interface, function)?;
-        let models = bind::warm_choices(callable, &terms)?;
-        let call = spec::Call {
-            package,
-            source,
-            callable,
-            gpus: 0,
-            bits,
-            attention_kernel: "",
-        };
-        let submission = call.submission(on, &hub.origin, &call.warm(level, &models)?, None, None);
-        return send(ctx, submission, &terms.key, args.detach).await;
-    }
-    let (target, bound) = bind(package, card, function, &terms)?;
-    if let Some(warning) = bound.warning(&target) {
-        output::warn(&warning);
-    }
-    let callable = callable(package, &card.interface, function)?;
-    let gpus = args.gpus.unwrap_or(0);
-    let call = spec::Call {
+    let release = Some(card.release.as_str());
+    let code = Code {
         package,
+        interface: &card.interface,
+        release,
         source,
+        files: &[],
+    };
+    call_code(ctx, code, function, on, args).await
+}
+
+/// What a run calls: a published release, or local code its machine installed.
+struct Code<'a> {
+    package: &'a str,
+    interface: &'a Interface,
+    /// The release its inputs bind against; none for local code.
+    release: Option<&'a str>,
+    source: spec::Source<'a>,
+    /// Files sent with the call (local code's).
+    files: &'a [StagedInput],
+}
+
+/// Binds the run's inputs to `function` of `code` (a warm run, its model choices only), submits
+/// it `on` its machine, and follows it.
+async fn call_code(
+    ctx: &Context,
+    code: Code<'_>,
+    function: &str,
+    on: On,
+    args: RunArgs,
+) -> Result<Run, Error> {
+    let hub = ctx.hub()?;
+    let terms = terms(ctx, &args)?;
+    let callable = callable(code.package, code.interface, function)?;
+    let call = spec::Call {
+        package: code.package,
+        source: code.source,
         callable,
-        gpus,
-        bits,
+        gpus: args.gpus.unwrap_or(0),
+        bits: bits(&args),
         attention_kernel: args.attention_kernel.as_deref().unwrap_or_default(),
     };
-    let out = args.out.map(|dir| terms.cwd.join(dir));
-    gpuless(ctx, &on, callable, &target, bits).await;
-    let submission = call.submission(on, &hub.origin, &call.spec(&bound)?, Some(&bound), out);
+    let (spec, bound, out) = match args.warm {
+        Some(_) if args.gpus.is_some() => {
+            let why = "--gpus applies to a run, not to --warm";
+            return Err(Error::new(Kind::Usage, "warm_gpus", why));
+        }
+        Some(level) => (
+            call.warm(level, &bind::warm_choices(callable, &terms)?)?,
+            None,
+            None,
+        ),
+        None => {
+            let target = format!("{}/{}", code.package, callable.name);
+            let bound = bind::bind(&target, code.release, callable, &terms)?;
+            if let Some(warning) = bound.warning(&target) {
+                output::warn(&warning);
+            }
+            gpuless(ctx, &on, callable, &target, call.bits).await;
+            let out = args.out.as_ref().map(|dir| terms.cwd.join(dir));
+            (call.spec(&bound)?, Some(bound), out)
+        }
+    };
+    let mut submission = call.submission(on, &hub.origin, &spec, bound.as_ref(), out);
+    submission.inputs.extend(code.files.iter().cloned());
     send(ctx, submission, &terms.key, args.detach).await
 }
 
@@ -411,8 +436,8 @@ fn terms(ctx: &Context, args: &RunArgs) -> Result<Terms, Error> {
 fn gpu_count(text: &str) -> Result<u32, String> {
     match text.parse::<u32>() {
         Ok(0) => Err(
-            "a run uses the CPU when its function declares accelerator=False or its \
-             machine has no GPU: `--on new:cpu` rents a machine with none"
+            "a function that needs no GPU runs on the CPU by itself, as does every run on a \
+             machine without one: `--on new:cpu` rents a machine with none"
                 .into(),
         ),
         Ok(n) => Ok(n),
@@ -487,19 +512,6 @@ pub(crate) async fn gpuless(ctx: &Context, on: &On, callable: &Callable, target:
             said.join(", and ")
         ));
     }
-}
-
-/// Binds `terms` to `function` of `card`, against its release.
-fn bind(
-    package: &str,
-    card: &Card,
-    function: &str,
-    terms: &Terms,
-) -> Result<(String, bind::Bound), Error> {
-    let callable = callable(package, &card.interface, function)?;
-    let target = format!("{package}/{}", callable.name);
-    let bound = bind::bind(&target, Some(&card.release), callable, terms)?;
-    Ok((target, bound))
 }
 
 /// The function `asked` names: exact, else the one name equal with `-` as `_`.
@@ -615,26 +627,33 @@ fn functions_of(
     interface: &Interface,
 ) {
     let public = interface.public();
-    let runs_on = |name: &str| {
-        let cpu = interface
-            .callables
-            .iter()
-            .any(|c| c.name == name && c.accelerator == Some(false));
-        if cpu { "CPU" } else { "GPU" }
+    let callable = |name: &str| interface.callables.iter().find(|c| c.name == name);
+    let runs_on = |name: &str| match callable(name).is_some_and(|c| c.accelerator == Some(false)) {
+        true => "CPU",
+        false => "GPU",
     };
+    let conversion = |name: &&str| callable(name).is_some_and(Callable::is_conversion);
     if ctx.json {
-        let rows: Vec<_> = public
-            .iter()
-            .map(|name| serde_json::json!({"function": name, "runs_on": runs_on(name)}))
+        let rows: Vec<_> = (public.iter())
+            .map(|name| serde_json::json!({"function": name, "runs_on": runs_on(name), "conversion": conversion(name)}))
             .collect();
         output::json(&serde_json::json!({
             "package": package, "release": release, "release_from": from, "functions": rows,
         }));
         return;
     }
+    // Conversions write model lanes: model authors' work, named below the functions a run uses.
+    let (conversions, public): (Vec<&str>, Vec<&str>) = public.iter().copied().partition(conversion);
+    let public = match public.is_empty() {
+        true => conversions.clone(),
+        false => public,
+    };
     let mut table = output::Table::new(ctx, ["FUNCTION", "RUNS ON"]);
     for name in &public {
         table = table.row([*name, runs_on(name)]);
+    }
+    if public != conversions && !conversions.is_empty() {
+        table = table.note(format!("for model authors: {} (conversions)", conversions.join(", ")));
     }
     let from = from.map(|from| format!(" ({from})")).unwrap_or_default();
     table.note(format!("{package} {release}{from}")).print();

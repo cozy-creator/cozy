@@ -6,7 +6,7 @@ use super::affine::{Codes, Fill, Order, Packing};
 use super::gptq::{bits, ints, I32};
 use super::grid::{Grid, ScaleLayout};
 use super::plan::{self, Elems, Term};
-use super::{Allowed, Ctx, Dtypes, Param, Part, Plan, Scheme, Shape, View};
+use super::{Allowed, Ctx, Param, Part, Plan, Scheme, Shape, View};
 use crate::format::{Dtype, Result};
 
 pub const INT1: Scheme = scheme("ct.int1");
@@ -51,7 +51,7 @@ const PARTS: &[Part] = &[
     Part::req("weight_packed", I32, |c| {
         packing(c, 1).shape(c.lead(), c.rows, c.cols)
     }),
-    Part::req("weight_scale", Dtypes::Of(&["F32", "BF16", "F16"]), |c| {
+    Part::req("weight_scale", &["F32", "BF16", "F16"], |c| {
         blocks(c, None).shape(c)
     }),
     Part::opt("weight_zero_point", I32, |c| {
@@ -60,7 +60,7 @@ const PARTS: &[Part] = &[
         };
         Ok(Shape::Exact([matrices_lead(c), &one[..]].concat()))
     }),
-    Part::req("weight_shape", Dtypes::Of(&["I32", "I64"]), |c| {
+    Part::req("weight_shape", &["I32", "I64"], |c| {
         Ok(Shape::Exact(vec![c.shape.len() as u64]))
     }),
     Part::opt("weight_g_idx", I32, |c| {

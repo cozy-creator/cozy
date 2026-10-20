@@ -38,6 +38,7 @@ pub struct MemoryStep {
     pub streamed: u64,
     pub stall_ns: u64,
     pub activations: i64,
+    pub allocated: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -245,7 +246,7 @@ mod tests {
             "steps": {"dit": [4096, 4096]},
             "rows": [{"model": "dit", "gpu": 0, "step": 1, "home": 4096,
                 "resident": 4096, "paged_in": 4096, "streamed": 0,
-                "stall_ns": 25, "activations": 2048}],
+                "stall_ns": 25, "activations": 2048, "allocated": 4096}],
             "evictions": [{"model": "vae", "gpu": 0, "rung": 0,
                 "reason": "orphan", "nbytes": 4096}],
             "peaks": [{"model": "dit", "shape": "64x64", "peak": 2048, "cuts": []}],

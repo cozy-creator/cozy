@@ -149,6 +149,12 @@ pub fn try_claim(file: &std::fs::File) -> Result<bool> {
     sys::try_claim(file)
 }
 
+/// The shared side of [`try_claim`], waiting: `file` stays writable through this handle, and
+/// `try_claim` (or a whole-file `try_lock`) elsewhere sees it held.
+pub fn share(file: &std::fs::File) -> Result<()> {
+    sys::share(file)
+}
+
 /// Other processes holding a write lock on any byte of `path`; empty when `path` is absent.
 pub fn posix_writers(path: &Path) -> Result<Vec<u32>> {
     sys::posix_writers(path)
@@ -165,6 +171,10 @@ mod sys {
     use std::{io, mem};
 
     static PROBES: OnceLock<Mutex<HashMap<FileId, File>>> = OnceLock::new();
+
+    pub(super) fn share(file: &File) -> Result<()> {
+        Ok(file.lock_shared()?)
+    }
 
     pub(super) fn try_claim(file: &File) -> Result<bool> {
         match file.try_lock() {
@@ -263,20 +273,30 @@ mod sys {
         CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject,
     };
 
-    pub(super) fn try_claim(file: &std::fs::File) -> Result<bool> {
+    /// Locks the byte at 2^63 - 2, which no file reaches, so the lock bars no I/O on data.
+    fn lock_far(file: &std::fs::File, flags: u32) -> bool {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
-        use windows_sys::Win32::Storage::FileSystem::{
-            LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
-        };
+        use windows_sys::Win32::Storage::FileSystem::LockFileEx;
         use windows_sys::Win32::System::IO::OVERLAPPED;
-        // SAFETY: plain-old-data; the byte at 2^63 - 2, which no file reaches.
+        // SAFETY: plain-old-data.
         let mut at: OVERLAPPED = unsafe { std::mem::zeroed() };
         at.Anonymous.Anonymous.Offset = u32::MAX - 1;
         at.Anonymous.Anonymous.OffsetHigh = i32::MAX as u32;
         // SAFETY: a handle this File owns and an OVERLAPPED that outlives the call.
-        let flags = LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY;
-        if unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut at) } != 0 {
+        unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut at) != 0 }
+    }
+
+    pub(super) fn share(file: &std::fs::File) -> Result<()> {
+        match lock_far(file, 0) {
+            true => Ok(()),
+            false => Err(io::Error::last_os_error().into()),
+        }
+    }
+
+    pub(super) fn try_claim(file: &std::fs::File) -> Result<bool> {
+        use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+        use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
+        if lock_far(file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY) {
             return Ok(true);
         }
         let error = io::Error::last_os_error();

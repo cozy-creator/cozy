@@ -177,8 +177,6 @@ struct OldRelease {
     tree: Option<ObjectRef>,
     #[serde(default)]
     yanked: bool,
-    #[serde(default)]
-    revision: u64,
 }
 
 #[derive(Deserialize)]
@@ -230,8 +228,8 @@ impl<'t> Migrator<'t> {
     /// The repo document `doc` in D10, its old objects read by `read`. A release that names a
     /// tree, and a checkpoint that is one, stay as they are; each release of lanes becomes one
     /// tree (`model.<lane>.cozytensors` each, repo files merged, the first lane's kept where
-    /// they differ) at its next revision, yanked or not; each other old checkpoint a tree of
-    /// its own (`model.cozytensors`).
+    /// they differ), yanked or not; each other old checkpoint a tree of its own
+    /// (`model.cozytensors`).
     pub fn repo(&mut self, doc: &[u8], read: Read) -> Result<Migrated> {
         let old: OldRepo = serde_json::from_slice(doc).map_err(|e| invalid(format!("repo document: {e}")))?;
         let upstream = self.table.iter().find(|u| u.models.iter().any(|p| matches(p, &old.name)));
@@ -242,7 +240,7 @@ impl<'t> Migrator<'t> {
         for r in &old.releases {
             let named = match (&r.tree, &r.lanes) {
                 (Some(tree), _) => {
-                    releases.push(Release { version: r.version.clone(), tree: tree.clone(), yanked: r.yanked, revision: r.revision });
+                    releases.push(Release { version: r.version.clone(), tree: tree.clone(), yanked: r.yanked });
                     continue;
                 }
                 (None, Some(named)) => named,
@@ -265,16 +263,16 @@ impl<'t> Migrator<'t> {
                 }
                 report.insert(name.clone(), lane.report.clone());
             }
-            let release = Release { version: r.version.clone(), tree: put(&mut objects, &tree)?, yanked: r.yanked, revision: r.revision + 1 };
+            let release = Release { version: r.version.clone(), tree: put(&mut objects, &tree)?, yanked: r.yanked };
             reports.push(json!({"version": release.version, "tree": release.tree.id(), "yanked": release.yanked,
-                "revision": release.revision, "lanes": report, "conflicts": conflicts}));
+                "lanes": report, "conflicts": conflicts}));
             releases.push(release);
         }
         let cited: Vec<&ObjectRef> = old.releases.iter().flat_map(|r| r.lanes.iter().flat_map(|l| l.values())).collect();
         let (mut checkpoints, mut unreleased) = (Vec::new(), Vec::new());
         for c in old.checkpoints.iter().filter(|c| !cited.contains(c)) {
             let doc: Json = serde_json::from_slice(&read(c)?).map_err(|e| invalid(format!("{}: {e}", c.id())))?;
-            if doc["format"].as_str().is_some_and(|f| f.starts_with("tensorfs.tree/")) {
+            if doc["format"].as_str().is_some_and(|f| f.starts_with("cozytensors.tree/")) {
                 checkpoints.push(c.clone());
                 continue;
             }

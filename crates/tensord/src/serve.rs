@@ -352,8 +352,9 @@ fn run_machine(config: config::Config, mut ready: crate::machine::supervise::Rea
         }
         // The persistent machine setting wins over an older GPU-settings file.
         config["gpu_memory_limit"] = serde_json::json!(gpu_memory_limit);
-        let config: crate::gpu_service::GpuConfig =
-            serde_json::from_value(config).map_err(io::Error::other)?;
+        let config = serde_json::from_value::<crate::gpu_service::GpuConfig>(config)
+            .map_err(io::Error::other)?
+            .checked()?;
         let store = store.clone();
         service.configure_pool_on(crate::gpu_service::Pool::new(
             &engine.join("gpu"),

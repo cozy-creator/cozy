@@ -317,14 +317,6 @@ class Checkpoint:
         """`sha256:<hex>` of the header."""
 
     @property
-    def header_ref(self) -> tuple[str, int]:
-        ...
-
-    @property
-    def tree_ref(self) -> tuple[str, int] | None:
-        ...
-
-    @property
     def tree(self) -> str | None:
         ...
 

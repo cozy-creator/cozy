@@ -42,6 +42,14 @@ pub enum Error {
     Key(String),
 }
 
+impl Error {
+    /// The Hub refused the request itself, so asking again gets the same answer. A timeout
+    /// (408), rate limit (429), server failure (5xx) or no answer at all is worth asking again.
+    pub fn refused(&self) -> bool {
+        matches!(self, Self::Hub { status, .. } if *status < 500 && !matches!(status, 408 | 429))
+    }
+}
+
 impl<E: serde::Serialize + std::fmt::Debug> From<progenitor_client::Error<E>> for Error {
     fn from(error: progenitor_client::Error<E>) -> Self {
         if let progenitor_client::Error::ErrorResponse(answer) = &error {

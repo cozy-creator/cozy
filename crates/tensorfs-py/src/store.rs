@@ -326,13 +326,13 @@ impl PyClient {
             .or_raise(py)
     }
 
-    #[pyo3(signature = (source, *, converter = None, variant = None, progress = None))]
+    #[pyo3(signature = (source, *, converter = None, source_variant = None, progress = None))]
     fn convert_to_cozytensors(
         &self,
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
         converter: Option<String>,
-        variant: Option<String>,
+        source_variant: Option<String>,
         progress: Option<Py<PyAny>>,
     ) -> PyResult<PyCheckpoint> {
         let sources: Vec<String> = source
@@ -354,7 +354,7 @@ impl PyClient {
         };
         let options = Convert {
             converter: converter.as_deref(),
-            variant: variant.as_deref(),
+            source_variant: source_variant.as_deref(),
             progress: progress
                 .as_ref()
                 .map(|_| &notify as &tensorfs::ConvertProgress<'_>),
@@ -372,13 +372,13 @@ impl PyClient {
 }
 
 #[pyfunction]
-#[pyo3(signature = (checkpoint, directory, *, format = "cozytensors", dequantize = None))]
+#[pyo3(signature = (checkpoint, directory, *, format = "cozytensors", decode = false))]
 fn _materialize(
     py: Python<'_>,
     checkpoint: &PyCheckpoint,
     directory: PathBuf,
     format: &str,
-    dequantize: Option<String>,
+    decode: bool,
 ) -> PyResult<PathBuf> {
     let checkpoint = checkpoint.core(py)?;
     let format = match format {
@@ -386,8 +386,7 @@ fn _materialize(
         "cozytensors" => Format::Cozytensors,
         _ => return Err(invalid(py, "format must be safetensors or cozytensors")),
     };
-    let dtype = dequantize.map(|d| Dtype::parse(&d.to_ascii_uppercase()));
-    py.detach(move || block_on(checkpoint.materialize(&directory, format, dtype)))
+    py.detach(move || block_on(checkpoint.materialize(&directory, format, decode)))
         .or_raise(py)
 }
 
@@ -866,6 +865,13 @@ impl PyCheckpoint {
         }
         let components = state.components.get_or_insert_with(|| out.unbind());
         Ok(components.clone_ref(py))
+    }
+
+    /// The checkpoint as one read-only, seekable file: its header, then its chunks and assets in
+    /// header order at 4 KiB-aligned offsets, assembled from the store on demand; nothing is
+    /// written.
+    fn open_file<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::file::open(py, self.core(py)?)
     }
 
     /// The header's chunks, in order: `(sha256, length)`.
@@ -2112,6 +2118,7 @@ pub fn install(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::verification::PyVerificationReport>()?;
     m.add_class::<PyClient>()?;
     m.add_class::<PyCheckpoint>()?;
+    m.add_class::<crate::file::PyCheckpointFile>()?;
     m.add_class::<PyPipeline>()?;
     m.add_class::<PyComponent>()?;
     m.add_class::<PyComponentWriter>()?;

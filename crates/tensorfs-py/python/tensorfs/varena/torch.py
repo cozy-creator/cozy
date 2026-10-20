@@ -6,6 +6,7 @@ This module describes blocks, binds views while they run, and delegates exact OO
 
 from __future__ import annotations
 
+import builtins
 import gc
 import hashlib
 import itertools
@@ -119,7 +120,7 @@ class _MappedOutput:
 
 
 #: `bind(key, parts)`: a stored tensor's part views -> the module tensors they become, by name.
-type Bind = Callable[[str, Mapping[str, Tensor]], Mapping[str, Tensor]]
+Bind: TypeAlias = Callable[[str, Mapping[str, Tensor]], Mapping[str, Tensor]]
 
 
 class Fill(Protocol):
@@ -167,6 +168,7 @@ class Step:
     streamed: int
     stall_ns: int
     activations: int
+    allocated: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -713,7 +715,7 @@ class Memory:
             try:
                 model.close()
             except BaseException as cleanup_error:
-                error.add_note(f"registration cleanup failed: {cleanup_error}")
+                _add_note(error, f"registration cleanup failed: {cleanup_error}")
                 raise error from cleanup_error
             finally:
                 for site, value in originals.values():
@@ -1045,6 +1047,7 @@ class Memory:
                 streamed - prior[1],
                 model.binding_ns - prior[2],
                 peak,
+                model.base,
             )
         )
         request.passes[model.name] = step + 1
@@ -1117,7 +1120,7 @@ class Memory:
                     pending = [error]
                     while pending:
                         current = pending.pop()
-                        if isinstance(current, BaseExceptionGroup):
+                        if isinstance(current, getattr(builtins, "BaseExceptionGroup", ())):
                             pending.extend(current.exceptions)
                         current.__traceback__ = None
                         current.__cause__ = None
@@ -1197,17 +1200,17 @@ class Memory:
                 if not request._failed:
                     failure = request.cleanup_errors[0]
                     for error in request.cleanup_errors[1:]:
-                        failure.add_note(f"request cleanup also failed: {error}")
+                        _add_note(failure, f"request cleanup also failed: {error}")
                     request.cleanup_errors = ()
                     try:
                         raise failure
                     finally:
                         failure = None
-                original = sys.exception()
+                original = sys.exc_info()[1]
                 try:
                     if original is not None:
                         for error in request.cleanup_errors:
-                            original.add_note(f"request cleanup failed: {error}")
+                            _add_note(original, f"request cleanup failed: {error}")
                 finally:
                     # The original traceback includes this generator frame.
                     # Never leave a local reference completing an exception cycle.
@@ -1494,6 +1497,15 @@ def _unbind(block: Block) -> None:
     block.written.clear()
     block.pins.clear()
     block.stream = None
+
+
+def _add_note(error: BaseException, text: str) -> None:
+    """Keep cleanup diagnostics on the original error on every supported Python."""
+    add = getattr(error, "add_note", None)
+    if add is not None:
+        add(text)
+    else:  # Python 3.10 has exception dictionaries but predates PEP 678.
+        setattr(error, "__notes__", [*getattr(error, "__notes__", ()), text])
 
 
 def _clear_frames(exc: BaseException | None) -> None:

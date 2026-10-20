@@ -165,10 +165,10 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
         (tree, headers)
     };
 
-    // A release of lanes is one tree at its next revision, yanked or not.
+    // A release of lanes is one tree, yanked or not.
     let tiny = &repos["acme/tiny"];
-    let releases: Vec<(&str, bool, u64)> = tiny.releases.iter().map(|r| (r.version.as_str(), r.yanked, r.revision)).collect();
-    assert_eq!(releases, [("0.9.0", true, 3), ("1.0.0", false, 4), ("1.1.0", false, 2)]);
+    let releases: Vec<(&str, bool)> = tiny.releases.iter().map(|r| (r.version.as_str(), r.yanked)).collect();
+    assert_eq!(releases, [("0.9.0", true), ("1.0.0", false), ("1.1.0", false)]);
     assert!(tiny.checkpoints.is_empty(), "every old checkpoint is in a release");
     let (tree, headers) = variants(&tiny.releases[1].tree);
     assert_eq!(headers.keys().collect::<Vec<_>>(), ["ft", "full"]);
@@ -214,7 +214,7 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
 
     // local/ models: their own lanes, no upstream, the old pinned source kept.
     let local = &repos["local/tiny-sdxl"];
-    assert_eq!((local.releases[0].version.as_str(), local.releases[0].revision), ("1", 1));
+    assert_eq!(local.releases[0].version, "1");
     let (tree, headers) = variants(&local.releases[0].tree);
     let h = same(&fixture, &store, FULL, &headers["f32"], &tree);
     assert_eq!(h.metadata.get("source"), Some(&Value::Str(SDXL.into())));
