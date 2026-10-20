@@ -116,10 +116,7 @@ impl FromStr for Ref {
 }
 
 fn segment(s: &str) -> bool {
-    !s.is_empty()
-        && !s.starts_with('.')
-        && s.bytes()
-            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+    !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0'])
 }
 
 fn is_digest(s: &str) -> bool {
@@ -201,11 +198,12 @@ impl Client {
             )?;
             let source = remote::Remote {
                 store: self.store.clone(),
-                endpoint: Endpoint::with_config("local", &self.config)?,
+                endpoint: Endpoint::with_config(
+                    options.endpoint.as_deref().unwrap_or(&self.config.endpoint),
+                    &self.config,
+                )?,
                 mirror: self.config.mirror.clone(),
-                // A plain folder may fill missing objects from the configured
-                // mounted mirror, but never falls through to a remote endpoint.
-                offline: true,
+                offline: options.local_files_only,
             };
             return Checkpoint::local(raw, source, &path);
         }
@@ -325,6 +323,7 @@ fn io_failure(context: impl fmt::Display, error: std::io::Error) -> Failure {
 #[derive(Clone, Copy, Debug)]
 pub enum Format {
     Safetensors,
+    Cozytensors,
 }
 
 pub fn export(
@@ -335,5 +334,14 @@ pub fn export(
 ) -> Result<Vec<String>> {
     match format {
         Format::Safetensors => checkpoint.export_to(dir, dequantize.as_ref()),
+        Format::Cozytensors => {
+            if dequantize.is_some() {
+                return fail(
+                    Kind::Invalid,
+                    "native cozytensors export preserves encoded bytes; dequantize is unsupported",
+                );
+            }
+            checkpoint.export_cozytensors(dir)
+        }
     }
 }

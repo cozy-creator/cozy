@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -42,6 +43,7 @@ struct State {
     native: Option<native::Writer>,
     committing: bool,
     committed: Option<Checkpoint>,
+    declared: BTreeSet<String>,
 }
 
 /// The native writer owns all progress roots. The finalizer retains them until its flush ends.
@@ -72,15 +74,24 @@ impl Client {
         if options.dest.is_some() && options.repo_id.is_some() {
             return fail(
                 Kind::Invalid,
-                "a Writer names a folder or an endpoint repository",
+                "a Writer names a header file or an endpoint repository",
             );
+        }
+        if options.dest.is_some() && options.variant.is_some() {
+            return fail(Kind::Invalid, "a literal header file has no variant label");
         }
         let variant = options.variant.unwrap_or("").to_owned();
         crate::format::check_file(&crate::format::variant_path(&variant))?;
-        let store = match (options.dest, options.base) {
-            (Some(_), Some(base)) => base.storage().clone(),
-            _ => self.store.clone(),
-        };
+        let store = self.store.clone();
+        let declared = options
+            .base
+            .map(|base| {
+                base.components()
+                    .iter()
+                    .map(|c| c.name().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
         let base = options.base.map(Checkpoint::stored);
         let dest = options
             .dest
@@ -88,11 +99,7 @@ impl Client {
             .transpose()
             .map_err(|e| super::io_failure("writer destination", e))?;
         let mut destination_endpoint = None;
-        let raw = if let Some(dest) = &dest {
-            store.cache_preserve_snapshot(dest)?;
-            native::Writer::folder(dest, &variant, base, options.resume.is_some())
-                .map_err(from_writer)?
-        } else if let Some(repo_id) = options.repo_id {
+        let raw = if let Some(repo_id) = options.repo_id {
             let reference: Ref = repo_id.parse()?;
             if reference.repo_id.starts_with("sha256:")
                 || reference.revision.is_some()
@@ -135,6 +142,7 @@ impl Client {
                 native: Some(raw),
                 committing: false,
                 committed: None,
+                declared,
             })),
             context: Context {
                 store,
@@ -154,29 +162,6 @@ impl Context {
         files: &std::collections::BTreeMap<String, ObjectRef>,
         published: Option<&ObjectRef>,
     ) -> Result<Checkpoint> {
-        if let Some(dest) = &self.dest {
-            let path = dest
-                .canonicalize()
-                .map_err(|e| super::io_failure(dest.display(), e))?;
-            let raw =
-                crate::store2::Checkpoint::folder(&path, Some(&self.variant), Some(&self.store))?;
-            return Checkpoint::local(
-                raw,
-                super::remote::Remote {
-                    store: self.store.clone(),
-                    endpoint: Endpoint::with_config(
-                        "local",
-                        &super::Config {
-                            cache_dir: self.store.root().to_path_buf(),
-                            ..super::Config::from_env()
-                        },
-                    )?,
-                    mirror: None,
-                    offline: true,
-                },
-                &path,
-            );
-        }
         // First acquire the native header owner, then build its repository context.
         let raw = self.store.checkpoint(header)?;
         let mut parsed = Tree {
@@ -210,6 +195,26 @@ impl Context {
             self.store.clone(),
             Some(self.variant.clone()),
         )
+    }
+
+    fn publish_file(&self, checkpoint: &Checkpoint) -> Result<()> {
+        if let Some(dest) = &self.dest {
+            let header = checkpoint.id();
+            // The content-addressed normal pin is durable independently of a resume key,
+            // the path's lifetime, and any future overwrite of this header file.
+            self.store.pin(
+                &header.sha256,
+                &crate::store2::Pin::new(vec![header.clone()]),
+            )?;
+            let bytes = self.store.read(header)?;
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| super::io_failure(parent.display(), e))?;
+            }
+            platform::durable::replace(dest, &bytes, 0o644)
+                .map_err(|e| super::io_failure(dest.display(), e.into()))?;
+        }
+        Ok(())
     }
 }
 
@@ -246,6 +251,27 @@ impl Writer {
                 .map(drop)
                 .map_err(from_writer)
         })?;
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .declared
+            .insert(name.to_owned());
+        Ok(ComponentWriter {
+            writer: self,
+            name: name.to_owned(),
+        })
+    }
+    /// Reopen a declared logical component without changing its class or config.
+    pub fn component_writer(&mut self, name: &str) -> Result<ComponentWriter<'_>> {
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.native.is_none() {
+                return fail(Kind::Conflict, "the Writer is committing or already closed");
+            }
+            if !state.declared.contains(name) {
+                return fail(Kind::NotFound, format!("no declared component {name:?}"));
+            }
+        }
         Ok(ComponentWriter {
             writer: self,
             name: name.to_owned(),
@@ -298,6 +324,10 @@ impl Writer {
                 .committed()
                 .map(|header| context.checkpoint(header, raw.repo_files(), raw.published()))
                 .transpose();
+            let publication = match (&result, &local) {
+                (Ok(_), Ok(Some(checkpoint))) => context.publish_file(checkpoint),
+                _ => Ok(()),
+            };
             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
             state.committing = false;
             if let Ok(Some(checkpoint)) = &local {
@@ -307,6 +337,7 @@ impl Writer {
                 state.native = Some(raw);
             }
             result?;
+            publication?;
             local?.ok_or_else(|| Failure {
                 kind: Kind::Integrity,
                 detail: "Writer sealed no local checkpoint".into(),
