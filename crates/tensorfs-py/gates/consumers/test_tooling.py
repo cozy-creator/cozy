@@ -507,6 +507,26 @@ class Contract(unittest.TestCase):
 
 
 class OwnedChild(unittest.TestCase):
+    def test_tree_document_orders_full_paths_before_prefix_components(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            paths = ['source/crates/tensorfs/z.py', 'source/crates/tensorfs-py/a.py',
+                     'source/crates/tensorfs0/a.py']
+            for path in paths:
+                file = root / path
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_bytes(b'x')
+            expected = {'entries': [
+                {'blob': {'length': 1, 'sha256': '2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881'},
+                 'kind': 'file', 'path': 'source/crates/tensorfs-py/a.py'},
+                {'blob': {'length': 1, 'sha256': '2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881'},
+                 'kind': 'file', 'path': 'source/crates/tensorfs/z.py'},
+                {'blob': {'length': 1, 'sha256': '2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881'},
+                 'kind': 'file', 'path': 'source/crates/tensorfs0/a.py'},
+            ]}
+            self.assertEqual(validate.tree_document(root),
+                             json.dumps(expected, sort_keys=True, separators=(',', ':')).encode())
+
     def test_worker_directories_preserve_existing_comfy_checkout(self):
         # Execute the worker's actual directory setup, without importing Runtime/Torch.
         tree = ast.parse((HERE / 'worker.py').read_text())
