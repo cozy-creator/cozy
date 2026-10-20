@@ -8,10 +8,9 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyIterator, PyString};
-use tensorfs::failure::{Failure, Kind};
 use tensorfs::format::{decode, Body, Dtype, Encoding, PartBytes};
 use tensorfs::io::{DeviceBuffer, Dst, ReadOpts, Target};
-use tensorfs::Checkpoint;
+use tensorfs::{Checkpoint, Failure, Kind};
 
 use crate::store::{
     invalid, metadata, raise, Aligned, ArrayBuffer, CheckpointAccess, DeviceArray, FetchTensor,
@@ -355,7 +354,7 @@ fn decoded(
     shape: &[u64],
     encoding: &Encoding,
     parts: &[Want],
-) -> Result<Vec<u8>, Error> {
+) -> tensorfs::Result<Vec<u8>> {
     Ok(decode(dtype, shape, encoding, &views(parts))?)
 }
 

@@ -1,7 +1,6 @@
 //! `tensorfs`: the store, checkpoints, the component writer and the error families, typed in
 //! `_ext.pyi`. Marshal only: every call that moves bytes runs detached from the GIL.
 
-use std::collections::BTreeMap;
 use std::ffi::{c_void, CStr};
 use std::future::Future;
 use std::ops::Range;
@@ -12,12 +11,12 @@ use pyo3::buffer::PyBuffer;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
-use tensorfs::failure::{Failure, Kind};
 use tensorfs::format::{
     Body, Config, ConfigValue, Dtype, Encoding, Header, Metadata, ObjectRef, Tensor, Value,
 };
 use tensorfs::{
-    Checkpoint, Client, Convert, Fetch, Format, Open, Ref, Selection, Writer, WriterOptions,
+    Checkpoint, Client, Convert, Failure, Fetch, Format, Kind, Open, Ref, Selection, Writer,
+    WriterOptions,
 };
 
 pub(crate) use crate::errors::raise;
