@@ -242,7 +242,7 @@ impl Mapping {
     }
 
     /// Release while retaining all owners on an error. The caller may retry after drain.
-    fn release(&mut self) -> Result<()> {
+    fn release(&mut self, discard_custody: bool) -> Result<()> {
         let device = self.range.device.clone();
         let _context = device.enter()?;
         if self.bytes != 0 {
@@ -253,7 +253,7 @@ impl Mapping {
             call!("cuMemRelease", mem_release(chunk.handle))?;
             self.chunks.pop();
         }
-        if let Some(container) = self.kept.take() {
+        if let Some(container) = self.kept.take().filter(|_| discard_custody) {
             // Nonblocking: a new executor may already have consumed this queued handle.
             let _ = container.set_nonblocking(true);
             while platform::handles::recv_fd(&container).is_ok() {}
@@ -276,7 +276,7 @@ impl Drop for Mapping {
             .and_then(|_context| call!("cuCtxSynchronize", ctx_synchronize()))
             .is_ok();
         if safe {
-            let _ = self.release();
+            let _ = self.release(false);
         }
         if self.bytes != 0 || !self.chunks.is_empty() {
             std::mem::forget(self.range.clone());
@@ -575,14 +575,14 @@ impl Gpu {
                 if !mapping.idle()? {
                     return Ok(false);
                 }
-                mapping.release()?;
+                mapping.release(true)?;
                 *state = State::Empty;
                 Ok(true)
             }
             State::Failed(mapping, _) => {
                 io::drain(self.device.ordinal)?;
                 self.device.stream.drain()?;
-                mapping.release()?;
+                mapping.release(true)?;
                 *state = State::Empty;
                 Ok(true)
             }
@@ -722,7 +722,7 @@ impl Gpu {
         for page in pages {
             let mut state = page.state.lock();
             if let State::Failed(mapping, _) = &mut *state {
-                mapping.release()?;
+                mapping.release(true)?;
                 *state = State::Empty;
             }
         }
