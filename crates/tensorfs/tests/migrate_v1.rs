@@ -153,6 +153,7 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
                         assert_eq!(config(&d10(c)), Some(as_config(per)), "{}: {c}", lane.name);
                     }
                 }
+                "model" if ck.components().len() == 1 => assert_eq!(Some(ck.components()[0].config().clone()), Some(as_config(v1)), "{}", lane.name),
                 "model" => assert_eq!(config("model"), Some(as_config(v1)), "{}", lane.name),
                 c if ck.component(&d10(c)).is_ok() => assert_eq!(config(&d10(c)), Some(as_config(v1)), "{}: {c}", lane.name),
                 _ => {}
