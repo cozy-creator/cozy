@@ -55,6 +55,7 @@ class Rungs(Protocol):
     def lower(self, device: torch.device, need: int) -> bool: ...
     def available(self, device: torch.device) -> int: ...
     def exhausted(self, device: torch.device, need: int, op: str) -> Exception: ...
+    def hosted(self, nbytes: int, op: str) -> None: ...
 
 
 class _NoRungs:
@@ -70,6 +71,9 @@ class _NoRungs:
 
     def exhausted(self, device: torch.device, need: int, op: str) -> Exception:
         return torch.OutOfMemoryError(f"{op} needs {need} B more on {device}")
+
+    def hosted(self, nbytes: int, op: str) -> None:
+        pass
 
 
 class Finer(Exception):
@@ -687,6 +691,7 @@ def _hosted(func: OpOverload, args: Args, kwargs: Kwargs, device: torch.device) 
             result.copy_(args[0])
         else:
             out(*args, **kwargs, out=result)
+    _served.rungs.hosted(nbytes, str(func))
     return result
 
 

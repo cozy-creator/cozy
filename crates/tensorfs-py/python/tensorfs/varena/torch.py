@@ -1109,6 +1109,11 @@ class Memory:
     def exhausted(self, device: torch.device, need: int, op: str) -> Exception:
         return self._exhausted(need, op)
 
+    def hosted(self, nbytes: int, op: str) -> None:
+        """Rung 5 put `op`'s result in host memory: the request's evictions say so."""
+        for request in self._requests():
+            request.evictions.append(Eviction("", self.gpu, 5, f"hosted {op}", nbytes))
+
     def _idle(self) -> int:
         """Rung 1: torch's slack and the core's idle chunks."""
         reserved = torch.cuda.memory_reserved(self.gpu)
