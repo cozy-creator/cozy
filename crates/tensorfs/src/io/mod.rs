@@ -132,6 +132,24 @@ impl Dst {
     }
 }
 
+/// Device regions' alignment in [`pack`]: DLPack's data alignment and `cuMemAlloc`'s, enough
+/// for every dtype and vector load.
+pub const DEVICE_ALIGN: usize = 256;
+
+/// Regions of `lens` packed in order into one allocation, each at the next multiple of
+/// `align`: their offsets and the allocation's length. `None` on overflow.
+pub fn pack(lens: impl IntoIterator<Item = usize>, align: usize) -> Option<(Vec<usize>, usize)> {
+    let mut end = 0usize;
+    let offsets = (lens.into_iter())
+        .map(|len| {
+            let at = end.checked_next_multiple_of(align)?;
+            end = at.checked_add(len)?;
+            Some(at)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((offsets, end))
+}
+
 #[derive(Clone, Debug)]
 pub struct ReadOpts {
     /// Reads in flight at once.
