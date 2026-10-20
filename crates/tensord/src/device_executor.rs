@@ -124,6 +124,7 @@ impl Default for Binding {
             store: String::new(),
             snapshot: String::new(),
             release: String::new(),
+            variant: String::new(),
             development: false,
             custody: "canonical".into(),
             objective: String::new(),
@@ -632,7 +633,6 @@ pub struct Frame {
     pub holding_bytes: Option<i64>,
     pub facts: Option<LoadFacts>,
     pub plane: Option<PlaneFacts>,
-    pub memory: Option<crate::memory::call::RequestMemory>,
     /// `map`: the device bytes the construction's weights hold after it, and whether that
     /// is every weight.
     pub mapped_bytes: Option<u64>,
