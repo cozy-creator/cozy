@@ -411,10 +411,12 @@ def main() -> int:
     if not hatches:
         compare(runtime, declared, "", faults)
     faults.extend(check_errors_reexports(_ext))
-    # A compiled submodule (`_ext.varena`) is typed by the stub of the facade module that
-    # re-exports it (`varena.pyi`), and is held to it the same way.
+    # A compiled submodule (`_ext.varena`) is typed by the stub of the facade module or package
+    # that re-exports it (`varena.pyi` or `varena/__init__.pyi`), and is held to it the same way.
     for name in sorted(n for n in runtime if isinstance(getattr(_ext, n), types.ModuleType)):
         sub_path = stub_path.with_name(f"{name}.pyi")
+        if not sub_path.exists():
+            sub_path = stub_path.with_name(name) / "__init__.pyi"
         if not sub_path.exists():
             faults.append(f"{name}: the extension exports this submodule and {sub_path.name} is absent")
             continue

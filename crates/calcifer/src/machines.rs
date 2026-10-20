@@ -1047,6 +1047,7 @@ fn status(frame: &v1::StatusFrame, hubs: &Hubs) -> MachineStatus {
                 driver: gpu.driver.clone(),
                 family: Some(gpu.family.clone()).filter(|f| !f.is_empty()),
                 memory_class: Some(gpu.memory_class.clone()).filter(|c| !c.is_empty()),
+                memory_limit_bytes: gpu.memory_limit_bytes,
             })
             .collect(),
         driver_floor: frame.driver_floor.clone(),

@@ -61,6 +61,8 @@ pub struct Layout {
     /// Identity of the layout: two layouts with the same digest place the same bytes at the
     /// same offsets. Guards adoption of a host memfd written by another process.
     pub digest: String,
+    /// The `regions` it was built from; a sealed host layout carries them (`host::sealed_regions`).
+    pub names: Vec<Vec<String>>,
 }
 
 fn tensor_of(what: &str) -> &str {
@@ -163,6 +165,7 @@ impl Layout {
             regions: out_regions,
             nbytes: at,
             digest: tensorfs::sha256::hex_digest(ident.as_bytes()),
+            names: regions.to_vec(),
         })
     }
 

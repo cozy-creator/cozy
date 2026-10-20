@@ -894,9 +894,10 @@ mod v1_api {
     /// named. Kept in `tools`.
     fn describing_python(tools: &Path) -> PathBuf {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let Some(runtime) = std::env::var_os("COZY_TEST_RUNTIME_WHEEL") else {
+        let pair = named_runtime::pair();
+        if pair.is_empty() {
             return installing_args(tools)[1].clone().into();
-        };
+        }
         let env = tools.join("describing");
         let uv = |args: &[&std::ffi::OsStr]| {
             assert!(Command::new("uv").current_dir(repo).args(args).status().unwrap().success(), "uv {args:?}");
@@ -909,8 +910,10 @@ mod v1_api {
             "--no-hashes".as_ref(), "-o".as_ref(), requirements.as_os_str()]);
         let python = env.join("bin/python");
         uv(&["pip".as_ref(), "install".as_ref(), "--python".as_ref(), python.as_os_str(), "-r".as_ref(), requirements.as_os_str()]);
-        uv(&["pip".as_ref(), "install".as_ref(), "--python".as_ref(), python.as_os_str(), runtime.as_os_str(),
-            "-e".as_ref(), repo.as_os_str()]);
+        let mut install = vec!["pip".as_ref(), "install".as_ref(), "--python".as_ref(), python.as_os_str()];
+        install.extend(pair.iter().map(|wheel| wheel.as_os_str()));
+        install.extend(["-e".as_ref(), repo.as_os_str()]);
+        uv(&install);
         python
     }
 
@@ -1135,7 +1138,8 @@ mod v1_api {
         let all = cap(Grant { action: MACHINE.into(), ..Default::default() });
         let manifest = write_package(&client, &all, "cpu_memo", "local/tensord-cpu-memo").await;
         let mut served = vec![];
-        for id in ["process-1", "process-2"] {
+        for ordinal in 1..=16 {
+            let id = format!("process-{ordinal}");
             let spec = v1::RunSpec {
                 kind: v1::RunKind::Call,
                 source: Some(v1::Source::Local(v1::LocalSource { manifest: manifest.clone() })),
@@ -1144,14 +1148,16 @@ mod v1_api {
                 owner: "alice".into(),
                 ..Default::default()
             };
-            let request = RunRequest { id: id.into(), after: 0, spec: Some(spec) };
+            let request = RunRequest { id, after: 0, spec: Some(spec) };
             let done = outcome(&collect(run_events(&client, &all, request).await.unwrap()).await.unwrap());
             assert_eq!(done.status, "succeeded", "{done:?}");
             let result: serde_json::Value = json(&done.result);
             served.push((result["pid"].as_u64().unwrap(), result["served"].as_u64().unwrap()));
         }
-        assert_eq!(served[0].0, served[1].0, "one executor served both calls: {served:?}");
-        assert_eq!((served[0].1, served[1].1), (1, 2));
+        for (ordinal, (pid, count)) in served.iter().enumerate() {
+            assert_eq!(*pid, served[0].0, "one executor served every sequential call: {served:?}");
+            assert_eq!(*count, ordinal as u64 + 1, "{served:?}");
+        }
         let _ = fs::remove_dir_all(tools);
     }
 
@@ -1370,8 +1376,9 @@ mod v1_api {
     }
 
     /// An idle tenant gives its GPU to a request that needs it: an older release kept warm
-    /// beside a newer one (both installed) is evicted on demand, and the newer release's
-    /// request gets a budget for all its weights, its next one paging nothing. Klein bench
+    /// beside a newer one (both installed) is asked for its cold weights through the ledger,
+    /// and the newer release's request holds all its weights resident, its next one paging
+    /// nothing. Klein bench
     /// (runs 7772, 7779): 0.1.0's idle executor kept its VRAM, and 0.2.0's executor got a
     /// 0.4 GiB budget and paged 18.6 GiB on every request. The weights take 45% of the card:
     /// one release's fit, two do not.
@@ -1443,16 +1450,17 @@ mod v1_api {
             .filter(|e| e.package == format!("acme/{}", FIXTURE.1)).map(|e| e.release).collect();
         assert_eq!(releases, ["0.1.0", "0.2.0"]);
 
-        // 0.2.0's request takes the idle tenant's room: every weight resident, nothing paged
-        // out; its next request pages nothing in.
+        // 0.2.0's request takes the idle tenant's room: every weight resident, nothing streamed
+        // through slots; its next request pages nothing in.
         for (id, first) in [("new-1", true), ("new-2", false)] {
             let done = settle(&client, &all, id, spec(v1::RunKind::Call, "0.2.0", "resident")).await;
             assert_eq!(done.status, "succeeded", "{done:?}");
             let memory = memory(&done);
-            assert!(memory["budget_bytes"].as_u64() >= memory["weights_bytes"].as_u64(), "{id}: {memory}");
-            assert_eq!(memory["paged_out_bytes"].as_u64().unwrap_or(0), 0, "{id}: {memory}");
-            if !first {
-                assert_eq!(memory["paged_in_bytes"].as_u64().unwrap_or(0), 0, "{id}: {memory}");
+            let steps = memory["steps"].as_array().cloned().unwrap_or_default();
+            assert!(!steps.is_empty(), "{id}: {memory}");
+            for step in &steps {
+                assert_eq!(step["streamed"].as_u64().unwrap_or(0), 0, "{id}: {memory}");
+                assert!(first || step["paged_in"].as_u64().unwrap_or(0) == 0, "{id}: {memory}");
             }
         }
         let _ = fs::remove_dir_all(source);
@@ -3654,6 +3662,18 @@ mod v1_api {
             format!("{:?}", failed.reason).contains("cannot be rendered"),
             "{failed:?}"
         );
+        // Its whole traceback reaches the job's own log, which `cozy run show` prints.
+        let log: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                v1::Event::Log(line) => Some(line.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let failed_call = |l: &&str| l.contains("failed: unhandled_exception") && l.contains("cannot be rendered");
+        assert!(log.iter().any(failed_call), "{log:?}");
+        assert!(log.iter().any(|l| l.contains("in render_segment")), "{log:?}");
+        assert!(log.iter().any(|l| l.contains("ValueError: segment 1 cannot be rendered")), "{log:?}");
         // No third segment ran.
         match run_events(&client, &all, watch("broken/2")).await {
             Err(_) => {}
