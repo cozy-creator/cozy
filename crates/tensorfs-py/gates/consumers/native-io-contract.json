@@ -15,9 +15,9 @@
       "helper_files": [],
       "profile": "torch",
       "argv": ["--timeout", "45"],
-      "timeout_s": 300,
+      "timeout_s": 360,
       "case_timeout_s": 45,
-      "cases": ["last-weightset", "callback-close", "last-pin", "last-consumer", "pending-consumer-b", "pending-ptds-consumer"]
+      "cases": ["last-weightset", "callback-close", "last-pin", "last-consumer", "pending-consumer-b", "pending-ptds-consumer", "pending-legacy-consumer"]
     },
     {
       "id": "fork-cleanup",
