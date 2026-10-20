@@ -325,7 +325,16 @@ pub fn planned<R>(
     let Some(scheme) = SCHEMES.iter().find(|s| s.name == name) else {
         return Err(Error::UnknownScheme(name.into()));
     };
-    run(scheme, dtype, shape, &encoding.params, parts, None, read, f).map_err(|e| match e {
+    run(
+        scheme,
+        (dtype, shape),
+        &encoding.params,
+        parts,
+        None,
+        read,
+        f,
+    )
+    .map_err(|e| match e {
         Error::Decode(detail) => Error::Decode(format!("{name}: {detail}")),
         e => e,
     })
@@ -341,6 +350,7 @@ pub fn check_metadata(
     inputs(dtype, shape, encoding, parts, false, |_, _| Ok(()))
 }
 
+#[cfg(feature = "store")]
 pub(crate) fn supports_sources(encoding: &Encoding) -> bool {
     SCHEMES
         .iter()
@@ -348,6 +358,7 @@ pub(crate) fn supports_sources(encoding: &Encoding) -> bool {
 }
 
 /// Plan external sources with the SAME U7 Scheme::decode functions used by Host reads.
+#[cfg(feature = "store")]
 pub(crate) fn planned_sources<R>(
     dtype: &Dtype,
     shape: &[u64],
@@ -399,8 +410,7 @@ fn inputs<R>(
     }
     run(
         scheme,
-        dtype,
-        shape,
+        (dtype, shape),
         &encoding.params,
         &metadata,
         Some(&slots),
@@ -415,14 +425,14 @@ fn inputs<R>(
 
 fn run<R>(
     scheme: &'static Scheme,
-    dtype: &Dtype,
-    shape: &[u64],
+    logical: (&Dtype, &[u64]),
     params: &BTreeMap<String, Value>,
     parts: &BTreeMap<&str, PartBytes>,
     slots: Option<&Slots>,
     read: bool,
     f: impl FnOnce(Plan, Geometry) -> Result<R>,
 ) -> Result<R> {
+    let (dtype, shape) = logical;
     let fail = Error::Decode;
     for role in parts.keys() {
         if !scheme.parts.iter().any(|p| p.role == *role) {
