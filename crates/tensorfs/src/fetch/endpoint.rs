@@ -26,7 +26,7 @@ use hyper::Uri;
 use serde_json::Value;
 
 use super::net::{join, same_origin, Body, Client, HeaderMap};
-use super::origin::{release_of, split_name, Location, Origin};
+use super::origin::{release_of, Location, Origin};
 use super::policy::is_loopback_origin;
 use super::token::{default_for, s3_base, Request, TokenProvider};
 use crate::err::{refuse, Code, Refusal, Result};
@@ -174,7 +174,7 @@ impl Endpoint {
 
     /// The repo document `name` as its bytes, unparsed, or `Unchanged` while it has ETag `etag`.
     pub async fn repo_bytes(&self, name: &str, etag: Option<&str>) -> Result<Fresh<Vec<u8>>> {
-        split_name(name)?;
+        check_repo_name(name)?;
         let key = repo_key(name);
         let (bytes, tag) = match &self.at {
             At::Dir(root, _) => match fs::read(root.join(&key)) {
@@ -186,7 +186,7 @@ impl Endpoint {
                 Err(e) => return Err(crate::err::classify_io(root.join(&key).display().to_string(), e)),
             },
             At::Http(base) => {
-                let url = format!("{base}/{key}");
+                let url = repo_url(base, &key);
                 let headers = etag.map(|e| ("if-none-match".to_owned(), e.to_owned())).into_iter().collect();
                 let reply = self.exchange(Ask { method: "GET", url: &url, headers, body: None, payload: None, auth: true }).await?;
                 match reply.status {
@@ -209,7 +209,7 @@ impl Endpoint {
     /// Writes `bytes` as the repo document `name` while it still has ETag `etag` (`None`: while
     /// there is none); false when it has changed (`412`). A server checks the bytes.
     pub async fn put_repo_bytes(&self, name: &str, bytes: Vec<u8>, etag: Option<&str>) -> Result<bool> {
-        split_name(name)?;
+        check_repo_name(name)?;
         let key = repo_key(name);
         let base = match &self.at {
             At::Http(base) => base,
@@ -219,7 +219,7 @@ impl Endpoint {
                 return put.await.map_err(|e| Refusal { code: Code::IO_FAILED, detail: e.to_string() })?;
             }
         };
-        let url = format!("{base}/{key}");
+        let url = repo_url(base, &key);
         let precondition = match etag {
             Some(etag) => ("if-match".to_owned(), etag.to_owned()),
             None => ("if-none-match".to_owned(), "*".to_owned()),
@@ -757,6 +757,33 @@ impl Stream {
         self.runtime.block_on(named)?;
         Ok(tree)
     }
+}
+
+// Generic endpoints use format segments, independent of a Hub's catalog name policy.
+fn check_repo_name(name: &str) -> Result<()> {
+    let segment = |s: &str| !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0']);
+    match name.split_once('/') {
+        Some((org, name)) if segment(org) && segment(name) => Ok(()),
+        _ => refuse(Code::KEY_GRAMMAR, format!("{name:?} is not <org>/<name>")),
+    }
+}
+
+// repo_key has already folded ASCII case. Escape its segments for HTTP only; on disk the
+// same key stays raw. Keeping only the separators and URI-unreserved bytes avoids interpreting
+// literal percent signs, query/fragment delimiters or UTF-8 bytes as URL structure.
+fn repo_url(base: &str, key: &str) -> String {
+    const HEX: &[u8] = b"0123456789ABCDEF";
+    let mut url = format!("{base}/");
+    for byte in key.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
+            url.push(char::from(byte));
+        } else {
+            url.push('%');
+            url.push(char::from(HEX[usize::from(byte >> 4)]));
+            url.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    url
 }
 
 /// The ETag a directory (or a server that sends none) gives a document: `"sha256:<hex>"`.
