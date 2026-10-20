@@ -67,9 +67,12 @@ try:
         array._write_band(torch.ones_like(tensor), axis=2, offset=0, stream=torch.cuda.current_stream(device).cuda_stream)
         assert torch.backends.cudnn.is_available()
         weights = torch.ones((3, 2, 3, 3), device=device)
-        with torch.no_grad(), torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True):
-            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
-                convolution = torch.nn.functional.conv2d(tensor, weights)
+        with (
+            torch.no_grad(),
+            torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=True),
+            torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile,
+        ):
+            convolution = torch.nn.functional.conv2d(tensor, weights)
         assert any("cudnn_convolution" in event.key for event in profile.key_averages()), "cuDNN was not executed"
         assert torch.equal(convolution.cpu(), torch.full((1, 3, 6, 6), 18.0))
         # The ordinary consumer boundary must work on the CUDA-typed host-backed result.
