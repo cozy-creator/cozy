@@ -771,18 +771,26 @@ class Memory:
             model.flight += 1
             if model.flight != 1:
                 return
-            self._fresh(model)
-            self._measure()
-            assert self.native is not None
-            self.native.enter(self._current().native_id, model.ws.id)
-            model.base = torch.cuda.memory_allocated(self.gpu)
-            torch.cuda.reset_peak_memory_stats(self.gpu)
-            model.aloft = True
-            self._enter(model.common, record=False)
+            try:
+                self._fresh(model)
+                self._measure()
+                assert self.native is not None
+                self.native.enter(self._current().native_id, model.ws.id)
+                model.base = torch.cuda.memory_allocated(self.gpu)
+                torch.cuda.reset_peak_memory_stats(self.gpu)
+                model.aloft = True
+                self._enter(model.common, record=False)
+            except BaseException:
+                model.flight -= 1
+                model.aloft = False
+                _unbind(model.common)
+                raise
 
     def _land(self, model: Model) -> None:
         with self.lock:
-            model.flight = max(model.flight - 1, 0)
+            if not model.flight:
+                return
+            model.flight -= 1
             if model.flight:
                 return
             if model.aloft:
