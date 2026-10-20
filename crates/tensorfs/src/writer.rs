@@ -255,13 +255,15 @@ impl Store {
     /// tree of it (with its repo files) to repo `name`'s checkpoints there. The local checkpoint
     /// commits first and remains available when the upload fails.
     pub fn streaming_writer(&self, stream: Arc<Stream>, name: &str, variant: &str, base: Option<&Checkpoint>) -> Result<Writer> {
-        let writers = self.root().join("tmp").join("writers");
-        sweep_anonymous(&writers)?;
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = writers.join(format!("{ANONYMOUS}{}-s{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        self.streaming_writer_resumable(stream, name, variant, base, None)
+    }
+
+    pub(crate) fn streaming_writer_resumable(&self, stream: Arc<Stream>, name: &str, variant: &str, base: Option<&Checkpoint>, key: Option<&str>) -> Result<Writer> {
         format::check_file(&variant_path(variant))?;
-        let dest = Dest::Endpoint { store: self.clone(), stream, name: name.to_owned(), variant: variant.to_owned() };
-        Writer::open(dest, dir, None, base)
+        // Reuse the existing keyed journal, kernel fence, replay and retention machinery.
+        let mut writer = self.writer(base, key)?;
+        writer.dest = Dest::Endpoint { store: self.clone(), stream, name: name.to_owned(), variant: variant.to_owned() };
+        Ok(writer)
     }
 
     /// Removes the directories of writers no process holds and nothing touched for `older_than`
@@ -615,9 +617,11 @@ impl Writer {
             Dest::Store(store) => {
                 let id = self.admit_header(store, &header)?;
                 if !store.cache_writer(&id, &self.repo)? {
-                    let pin = self.key.clone().unwrap_or_else(|| id.sha256.clone());
-                    let roots = std::iter::once(id.clone()).chain(self.repo.values().cloned()).collect();
-                    store.pin(&pin, &Pin::new(roots))?;
+                    let roots: Vec<ObjectRef> = std::iter::once(id.clone()).chain(self.repo.values().cloned()).collect();
+                    match &self.key {
+                        Some(key) => store.pin(key, &Pin::new(roots))?,
+                        None => store.pin_roots(&id.sha256, &roots)?,
+                    }
                 }
                 fault::point("writer.pinned");
                 id
@@ -631,8 +635,8 @@ impl Writer {
             Dest::Endpoint { store, stream, name, variant } => {
                 let id = self.admit_header(store, &header)?;
                 if !store.cache_writer(&id, &self.repo)? {
-                    let roots = std::iter::once(id.clone()).chain(self.repo.values().cloned()).collect();
-                    store.pin(&id.sha256, &Pin::new(roots))?;
+                    let roots: Vec<ObjectRef> = std::iter::once(id.clone()).chain(self.repo.values().cloned()).collect();
+                    store.pin_roots(&id.sha256, &roots)?;
                 }
                 self.committed = Some(id.clone());
                 self.published = Some(stream.commit(name, variant, header, &self.repo).map_err(sent)?);
