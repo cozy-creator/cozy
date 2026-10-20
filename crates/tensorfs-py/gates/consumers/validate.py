@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import tarfile
 
-from make_payload import (COMFY, CONSUMERS, PRE_GPU, SCRIPT_ROOT,
+from make_payload import (COMFY, CONSUMERS, PRE_GPU, SCRIPT_ROOT, RUNTIME_TAG, RUNTIME_KERNELS,
                           KERNEL_CORPUS, KERNEL_SCHEMA, KERNEL_FILE, kernel_cases)
 import native_io
 from owned_child import CONSUMER_SECONDS, KERNEL_SECONDS, SETUP_SECONDS
@@ -104,6 +104,7 @@ def consumer(name, value, spec, device):
     require(value.get('tensorfs') == spec['native']['version'], f'{name}: installed native version differs')
     require(value.get('script_sha256') == expected['sha256'], f'{name}: consumer source differs')
     require(isinstance(value.get('torch_cuda'), str) and bool(value['torch_cuda']) and '+cpu' not in value.get('torch', ''), f'{name}: CPU Torch')
+    require(value.get('torch') == spec['dependencies']['versions']['torch'], f'{name}: Torch build differs')
     for key in ('assigned_without_copy', 'survives_checkpoint_close', 'reference_computed_before_write', 'producer_released_before_forward'):
         require(value.get(key) is True, f'{name}: missing {key} assertion')
     require(not value.get('skipped') and not value.get('skip'), f'{name}: consumer skipped')
@@ -172,6 +173,8 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
         require(re.fullmatch('[0-9a-f]{40}', spec[name].get('source', '')) is not None and
                 re.fullmatch('[0-9a-f]{64}', spec[name].get('sha256', '')) is not None, f'{name}: malformed artifact/source hash')
     require(spec['native']['source'] not in PRE_GPU, 'known pre-GPU/fork-fix source')
+    require(spec['runtime'].get('tag') == RUNTIME_TAG and set(spec['runtime'].get('kernel_sha256', {})) == RUNTIME_KERNELS,
+            'Runtime native kernel artifact preflight missing')
     require(spec.get('proof_source') == spec['native']['source'], 'proof source differs from wheel producer')
     requested = spec.get('requested')
     require(isinstance(requested, list) and requested[:2] == ['diffusers', 'comfy'] and
@@ -226,12 +229,13 @@ def validate(root, expected, run, machine, launch, require_kernel=False):
     require(isinstance(identity.get('context_device'), str) and bool(identity['context_device']) and
             identity.get('python_optimize') == 0, 'missing public Context/optimized Python')
     require(identity.get('runtime_source') == spec['runtime']['source'] and identity.get('runtime') == spec['runtime']['version'], 'live Runtime differs')
+    require(identity.get('runtime_kernel_sha256') == spec['runtime']['kernel_sha256'], 'live Runtime native kernel hashes differ')
     require(identity.get('native_sha256') == spec['native']['sha256'], 'native input differs')
     require(identity.get('comfy_bundle_sha256') == spec['comfy_bundle']['sha256'], 'Comfy input differs')
     versions = identity.get('dependencies', {})
     for name, expected_version in spec['dependencies']['versions'].items():
         actual_version = versions.get(name, '')
-        require(actual_version == expected_version or ('+' not in expected_version and actual_version.split('+')[0] == expected_version),
+        require(actual_version == expected_version,
                 'installed dependency differs: ' + name)
     require(identity.get('outer_torch_present') is True, 'outer Runtime lacks Torch identity path')
     require(identity.get('triton_interpret') in ('', '0'), 'interpreter fallback')

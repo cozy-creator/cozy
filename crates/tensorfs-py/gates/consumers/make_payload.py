@@ -26,6 +26,8 @@ KERNEL_CORPUS = '92a0f4f01f4490c2f7f8c391e5eb600f5e5b33d647eed48d91ff7c21e7af57d
 KERNEL_SCHEMA = 'tensorfs.cuda-kernel-conformance/1'
 KERNEL_FILE = 'crates/tensorfs-py/scripts/cuda_kernel_conform.py'
 KERNEL_CASES = 'crates/tensorfs/conformance/vectors/cases/'
+RUNTIME_TAG = 'cp312-abi3-manylinux_2_28_x86_64'
+RUNTIME_KERNELS = {f'cozy_runtime/_kernels/{name}.abi3.so' for name in ('_gemm', '_norm', '_fa3')}
 
 
 def git(repo, *args):
@@ -89,6 +91,8 @@ def requirements(path):
               'tqdm', 'psutil', 'pyyaml', 'packaging', 'comfy-kitchen', 'comfy-aimdo'}
     if not needed <= versions.keys():
         raise ValueError('requirements missing consumer dependency pins')
+    if re.search(r'\+cu[0-9]+$', versions['torch']) is None:
+        raise ValueError('Torch requires its exact CUDA build tag in the dependency freeze')
     return {'sha256': digest(raw), 'requirements': values, 'versions': versions}, raw
 
 
@@ -111,6 +115,7 @@ def wheel(path, name, expected, source):
         raise ValueError(f"{name} wheel hash differs from the explicit freeze")
     with zipfile.ZipFile(path) as archive:
         extension = None
+        runtime_kernels = None
         metadata = [p for p in archive.namelist() if p.endswith('.dist-info/METADATA')]
         if len(metadata) != 1:
             raise ValueError("wheel must contain exactly one METADATA")
@@ -125,6 +130,17 @@ def wheel(path, name, expected, source):
                        and any(isinstance(t, ast.Name) and t.id == 'COMMIT' for t in n.targets)]
             if commits != [source]:
                 raise ValueError("Runtime wheel COMMIT differs from the explicit source pin")
+            # Runtime9b1 scripts/verify-wheels.py: x86_64 Linux native wheel,
+            # three exact kernel modules. Presence is artifact preflight, not GPU proof.
+            wheel_info = Parser().parsestr(archive.read(metadata[0].removesuffix('METADATA') + 'WHEEL').decode())
+            if (wheel_info['Root-Is-Purelib'] != 'false' or wheel_info.get_all('Tag') != [RUNTIME_TAG]
+                    or path.name != f"cozy_runtime-{fields['Version']}-{RUNTIME_TAG}.whl"):
+                raise ValueError('GPU proof requires the non-pure Linux x86_64 Runtime wheel')
+            modules = {name for name in archive.namelist() if name.startswith('cozy_runtime/_kernels/')
+                       and name.endswith(('.so', '.pyd'))}
+            if modules != RUNTIME_KERNELS:
+                raise ValueError('Runtime native kernel module set differs')
+            runtime_kernels = {name: digest(archive.read(name)) for name in sorted(modules)}
         else:
             extensions = [p for p in archive.namelist() if p.startswith('tensorfs/_ext') and p.endswith(('.so', '.pyd'))]
             if len(extensions) != 1:
@@ -135,6 +151,8 @@ def wheel(path, name, expected, source):
     if extension:
         result['extension_sha256'] = extension
         result['extension_file'] = extensions[0]
+    if runtime_kernels is not None:
+        result.update(tag=RUNTIME_TAG, kernel_sha256=runtime_kernels)
     return result
 
 

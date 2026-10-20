@@ -77,11 +77,15 @@ def main(ctx: Context, *, native_wheel: Annotated[FileAsset, AssetBound(max_byte
         from cozy_runtime._build_provenance import COMMIT
         identity.update(runtime_source=COMMIT, runtime=importlib.metadata.version('cozy-runtime'))
         assert COMMIT == SPEC['runtime']['source'] and identity['runtime'] == SPEC['runtime']['version'], 'wrong live candidate Runtime'
+        runtime_parent = Path(importlib.util.find_spec('cozy_runtime').origin).parent.parent
+        identity['runtime_kernel_sha256'] = {name: digest((runtime_parent / name).read_bytes())
+                                             for name in SPEC['runtime']['kernel_sha256']}
+        assert identity['runtime_kernel_sha256'] == SPEC['runtime']['kernel_sha256'], 'wrong live Runtime native kernels'
         assert SPEC['proof_source'] == SPEC['native']['source'], 'proof/native source mismatch'
         identity['dependencies'] = {name: importlib.metadata.version(name) for name in SPEC['dependencies']['versions']}
         for name, expected in SPEC['dependencies']['versions'].items():
             actual = identity['dependencies'][name]
-            assert actual == expected or ('+' not in expected and actual.split('+')[0] == expected), 'installed dependency differs: ' + name
+            assert actual == expected, 'installed dependency differs: ' + name
         raw = native_wheel.read_bytes()
         assert digest(raw) == SPEC['native']['sha256'] and len(raw) == SPEC['native']['bytes'], 'wrong native FileAsset'
         wheel = work / SPEC['native']['file']

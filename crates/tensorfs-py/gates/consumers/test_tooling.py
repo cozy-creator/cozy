@@ -42,10 +42,10 @@ class Contract(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.native = self.root / 'tensorfs-0.11.0-cp312-abi3-linux_x86_64.whl'
-        self.runtime = self.root / 'cozy_runtime-0.28.2-py3-none-any.whl'
+        self.runtime = self.root / f'cozy_runtime-0.28.2-{make_payload.RUNTIME_TAG}.whl'
         self.requirements = self.root / 'requirements.txt'
         self.requirements.write_text('\n'.join([
-            'torch==2.14.0', 'diffusers==0.40.0', 'numpy==2.3.0', 'einops==0.8.0',
+            'torch==2.14.0+cu130', 'diffusers==0.40.0', 'numpy==2.3.0', 'einops==0.8.0',
             'safetensors==0.8.0', 'Pillow==12.0.0', 'scipy==1.16.0', 'tqdm==4.67.0',
             'psutil==7.0.0', 'pyyaml==6.0.0', 'packaging==25.0',
             'comfy-kitchen==0.2.39', 'comfy-aimdo==0.5.6']) + '\n')
@@ -60,6 +60,10 @@ class Contract(unittest.TestCase):
                     archive.writestr('tensorfs/_ext.abi3.so', b'unit-fixture-not-a-native-binary')
                 else:
                     archive.writestr('cozy_runtime/_build_provenance.py', 'COMMIT = ' + repr('3' * 40))
+                    archive.writestr('cozy_runtime-0.28.2.dist-info/WHEEL',
+                                     'Root-Is-Purelib: false\nTag: ' + make_payload.RUNTIME_TAG + '\n')
+                    for module in sorted(make_payload.RUNTIME_KERNELS):
+                        archive.writestr(module, b'synthetic module bytes, not a native binary: ' + module.encode())
         self.args = argparse.Namespace(creator_repo=REPO, proof_source=PROOF_SOURCE,
                                       native_wheel=self.native, native_source=PROOF_SOURCE,
                                       native_sha256=validate.sha(self.native), runtime_wheel=self.runtime,
@@ -101,6 +105,7 @@ class Contract(unittest.TestCase):
         identity = {'ok': True, 'request_id': '987', 'context_device': 'cuda:0', 'python_optimize': 0,
                     'cuda_visible_devices': '0', 'triton_interpret': '', 'runtime_source': '3' * 40,
                     'runtime': '0.28.2', 'native_sha256': spec['native']['sha256'],
+                    'runtime_kernel_sha256': spec['runtime']['kernel_sha256'],
                     'comfy_archive_sha256': validate.sha(root / 'source/comfy-upstream.tar'), 'operations': operations,
                     'comfy_bundle_sha256': spec['comfy_bundle']['sha256'],
                     'dependencies': spec['dependencies']['versions'],
@@ -115,7 +120,7 @@ class Contract(unittest.TestCase):
                 observed = {'executable': executable, 'python_optimize': 0, 'no_user_site': 1,
                             'cuda_visible_devices': '0', 'cublas_workspace_config': ':4096:8',
                             'profile': row['profile'], 'installed_native_extension_sha256': spec['native']['extension_sha256'],
-                            'torch': None if clean else '2.14.0', 'triton': None, 'numpy': None if clean else '2.3.0'}
+                            'torch': None if clean else '2.14.0+cu130', 'triton': None, 'numpy': None if clean else '2.3.0'}
                 write(root / f'reports/{name}-environment.json', observed)
                 if name == 'read-engine':
                     stdout = native_io.READ_MARKER + '\n'
@@ -392,6 +397,48 @@ class Contract(unittest.TestCase):
         self.args.comfy_sha256 = '0' * 64
         with self.assertRaisesRegex(ValueError, 'Comfy bundle hash'):
             make_payload.generate(self.args)
+
+    def test_runtime_pure_wheel_or_missing_kernel_is_rejected(self):
+        with zipfile.ZipFile(self.runtime) as source:
+            original = {name: source.read(name) for name in source.namelist()}
+        for pure in (True, False):
+            files = dict(original)
+            if pure:
+                files['cozy_runtime-0.28.2.dist-info/WHEEL'] = b'Root-Is-Purelib: true\nTag: py3-none-any\n'
+            else:
+                del files['cozy_runtime/_kernels/_fa3.abi3.so']
+            with zipfile.ZipFile(self.runtime, 'w') as target:
+                for name, raw in files.items():
+                    target.writestr(name, raw)
+            self.args.runtime_sha256 = validate.sha(self.runtime)
+            with self.assertRaisesRegex(ValueError, 'non-pure Linux|kernel module set'):
+                make_payload.generate(self.args)
+        self.assertFalse(self.args.output.exists())
+
+    def test_torch_build_tag_is_required_and_exact(self):
+        self.requirements.write_text(self.requirements.read_text().replace('torch==2.14.0+cu130', 'torch==2.14.0'))
+        with self.assertRaisesRegex(ValueError, 'exact CUDA build tag'):
+            make_payload.generate(self.args)
+        self.requirements.write_text(self.requirements.read_text().replace('torch==2.14.0', 'torch==2.14.0+cu130'))
+        root, expected, run, machine, launch = self.fixture()
+        original = validate.read(root / 'identity.json')
+        for version in ('2.14.0+cpu', '2.14.0+cu129', '2.14.0'):
+            changed = copy.deepcopy(original)
+            changed['dependencies']['torch'] = version
+            write(root / 'identity.json', changed)
+            self.inventory(root)
+            with self.assertRaisesRegex(ValueError, 'installed dependency differs: torch'):
+                validate.validate(root, expected, run, machine, launch)
+
+    def test_installed_runtime_kernel_hashes_must_match(self):
+        root, expected, run, machine, launch = self.fixture()
+        self.assertEqual(set(expected['runtime']['kernel_sha256']), make_payload.RUNTIME_KERNELS)
+        identity = validate.read(root / 'identity.json')
+        identity['runtime_kernel_sha256']['cozy_runtime/_kernels/_gemm.abi3.so'] = '0' * 64
+        write(root / 'identity.json', identity)
+        self.inventory(root)
+        with self.assertRaisesRegex(ValueError, 'Runtime native kernel hashes'):
+            validate.validate(root, expected, run, machine, launch)
 
 
 class OwnedChild(unittest.TestCase):
