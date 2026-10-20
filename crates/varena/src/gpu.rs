@@ -336,6 +336,28 @@ pub(crate) struct Pending {
     fill_generation: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FillPhase {
+    Allocate,
+    Read,
+    Transform,
+    Finish,
+}
+impl FillPhase {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Allocate => "allocate",
+            Self::Read => "read",
+            Self::Transform => "transform",
+            Self::Finish => "finish",
+        }
+    }
+}
+pub(crate) struct FillAttempt {
+    pub result: Result<ReadStats>,
+    pub phase: FillPhase,
+}
+
 /// Actual mapping readiness, without turning a transient state into INVALID.
 pub(crate) enum BindState {
     Ready { pin: Pin, pins: usize },
@@ -501,13 +523,14 @@ impl Gpu {
 
     /// Called on an I/O worker, outside the policy lock. A concurrent bind sees Filling.
     pub fn fill(self: &Arc<Self>, id: PageId) -> Result<ReadStats> {
-        self.fill_bytes(id, None, None, |_| Ok(()))
+        self.fill_attempt_bytes(id, None, None, |_| Ok(())).result
     }
 
     /// The RAM-tier lease must remain alive for this call. TensorFS still performs
     /// the transfer; the mechanism only selects a ready source and its destination.
     pub fn fill_from_ram(self: &Arc<Self>, id: PageId, bytes: &[u8]) -> Result<ReadStats> {
-        self.fill_bytes(id, Some(bytes), None, |_| Ok(()))
+        self.fill_attempt_bytes(id, Some(bytes), None, |_| Ok(()))
+            .result
     }
 
     /// A declared page-in transform runs only on a new, private writable mapping.
@@ -518,7 +541,7 @@ impl Gpu {
         id: PageId,
         transform: impl FnOnce(FillPin) -> Result<()>,
     ) -> Result<ReadStats> {
-        self.fill_bytes(id, None, None, transform)
+        self.fill_attempt_bytes(id, None, None, transform).result
     }
 
     pub fn fill_from_ram_with(
@@ -527,7 +550,8 @@ impl Gpu {
         bytes: &[u8],
         transform: impl FnOnce(FillPin) -> Result<()>,
     ) -> Result<ReadStats> {
-        self.fill_bytes(id, Some(bytes), None, transform)
+        self.fill_attempt_bytes(id, Some(bytes), None, transform)
+            .result
     }
 
     /// Retain a direct host source through failed CUDA work. The page's complete
@@ -538,12 +562,43 @@ impl Gpu {
         source: Arc<T>,
         transform: impl FnOnce(FillPin) -> Result<()>,
     ) -> Result<ReadStats> {
-        self.fill_bytes(
+        self.fill_attempt_bytes(
             id,
             Some(source.as_ref().as_ref()),
             Some(source.clone()),
             transform,
         )
+        .result
+    }
+
+    /// Placement observes the actual failure phase without changing the public
+    /// fill result or guessing from an absent completed-copy metric.
+    pub(crate) fn fill_attempt_with<T: AsRef<[u8]> + Send + Sync + 'static>(
+        self: &Arc<Self>,
+        id: PageId,
+        source: Option<Arc<T>>,
+        transform: impl FnOnce(FillPin) -> Result<()>,
+    ) -> FillAttempt {
+        self.fill_attempt_bytes(
+            id,
+            source.as_ref().map(|source| source.as_ref().as_ref()),
+            source
+                .as_ref()
+                .map(|source| source.clone() as Arc<dyn Send + Sync>),
+            transform,
+        )
+    }
+
+    fn fill_attempt_bytes(
+        self: &Arc<Self>,
+        id: PageId,
+        ram: Option<&[u8]>,
+        host_owner: Option<Arc<dyn Send + Sync>>,
+        transform: impl FnOnce(FillPin) -> Result<()>,
+    ) -> FillAttempt {
+        let mut phase = FillPhase::Allocate;
+        let result = self.fill_bytes(id, ram, host_owner, &mut phase, transform);
+        FillAttempt { result, phase }
     }
 
     fn fill_bytes(
@@ -551,6 +606,7 @@ impl Gpu {
         id: PageId,
         ram: Option<&[u8]>,
         host_owner: Option<Arc<dyn Send + Sync>>,
+        phase: &mut FillPhase,
         transform: impl FnOnce(FillPin) -> Result<()>,
     ) -> Result<ReadStats> {
         let page = self.page(id)?;
@@ -586,6 +642,7 @@ impl Gpu {
             }
         };
         let result: Result<ReadStats> = catch_unwind(AssertUnwindSafe(|| {
+            *phase = FillPhase::Read;
             let destination = Dst::Device {
                 device: self.device.ordinal,
                 ptr: mapping.ptr(),
@@ -613,6 +670,7 @@ impl Gpu {
                     )
                 }?,
             };
+            *phase = FillPhase::Transform;
             page.write_pins.fetch_add(1, Ordering::AcqRel);
             transform(FillPin {
                 gpu: self.clone(),
@@ -622,6 +680,7 @@ impl Gpu {
                 stream: self.device.stream.raw(),
                 streams: Mutex::new(BTreeSet::from([self.device.stream.raw()])),
             })?;
+            *phase = FillPhase::Finish;
             self.poll()?;
             if page.write_pins.load(Ordering::Acquire) != 0 {
                 return Err(Error::Internal(
