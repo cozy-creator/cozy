@@ -59,7 +59,7 @@ def tree_document(root):
     """
     entries = [{'blob': {'length': p.stat().st_size, 'sha256': sha(p)}, 'kind': 'file',
                 'path': p.relative_to(root).as_posix()}
-               for p in sorted(Path(root).rglob('*')) if p.is_file()]
+               for p in sorted(Path(root).rglob('*'), key=lambda p: p.relative_to(root).as_posix()) if p.is_file()]
     return json.dumps({'entries': entries}, ensure_ascii=False, sort_keys=True,
                       separators=(',', ':')).encode()
 
