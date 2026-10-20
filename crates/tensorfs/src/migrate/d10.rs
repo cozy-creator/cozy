@@ -163,8 +163,20 @@ fn under(entry: &str, path: &str) -> bool {
 }
 
 /// Releases that become private tags (a public tag is a PEP 440 version): model and version, by
-/// ruling (2026-10-20: an audit artifact). Any other release not a version refuses its repo.
-pub const PRIVATE: &[(&str, &str)] = &[("fidika/minimax-h3-turbo-lora", "1.0.0-audit.1")];
+/// ruling (2026-10-20: audit, proof and recovery artifacts, production's and 8819's). Any other
+/// release not a version refuses its repo.
+pub const PRIVATE: &[(&str, &str)] = &[
+    ("fidika/minimax-h3-turbo-lora", "1.0.0-audit.1"),
+    ("paul/cache-persistence-proof", "0.0.1-cacheproof.20260924"),
+    ("paul/cozy-mixed-input-proof", "0.0.0-rental-audit.20260913"),
+    ("paul/creator-output-b93c35ccecf8c183", "0.0.0-recovery-source-config.20260906"),
+    ("paul/creator-output-b93c35ccecf8c183", "0.0.0-recovery-source.20260906"),
+    ("paul/d1-g5r32-sdxl", "0.0.1-d1"),
+    ("paul/d1-gate5-sdxl", "0.0.1-d1"),
+    ("paul/d1-gate5c-sdxl", "0.0.1-d1"),
+    ("paul/minimax-h3", "1.0.0-h3-audit.1"),
+    ("paul/minimax-h3-turbo-lora", "1.0.0-audit.1"),
+];
 
 /// A repo document before D10, whatever wrote it: 0.12's `releases` of lanes and `checkpoints`
 /// (U11), or `tags` (the Hub's view of a v1 model: a release's `lanes`, an unreleased
