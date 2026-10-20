@@ -197,6 +197,12 @@ impl Mapping {
                     size = device.granularity;
                     continue;
                 }
+                if code == cuda::ERROR_OUT_OF_MEMORY {
+                    return Err(Error::DeviceFull {
+                        need: bytes,
+                        deficit: remaining,
+                    });
+                }
                 cuda::check("cuMemCreate", code)?;
             }
             if let Err(error) = call!(
@@ -679,25 +685,27 @@ impl Gpu {
                 return Ok(false);
             };
             let mut handle = 0;
-            if call!(
+            if let Err(error) = call!(
                 "cuMemImportFromShareableHandle",
                 mem_import(
                     &mut handle,
                     fd.as_raw_fd() as usize as *mut c_void,
                     cuda::MEM_HANDLE_TYPE_POSIX_FD
                 )
-            )
-            .is_err()
-            {
+            ) {
+                if error.is_sticky() {
+                    return Err(error);
+                }
                 return Ok(false);
             }
-            if call!(
+            if let Err(error) = call!(
                 "cuMemMap",
                 mem_map(mapping.ptr() + mapping.bytes, *bytes as usize, 0, handle, 0)
-            )
-            .is_err()
-            {
+            ) {
                 let _ = call!("cuMemRelease", mem_release(handle));
+                if error.is_sticky() {
+                    return Err(error);
+                }
                 return Ok(false);
             }
             mapping.chunks.push(Chunk {
