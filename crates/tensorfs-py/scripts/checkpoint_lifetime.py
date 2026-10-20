@@ -147,10 +147,27 @@ with tempfile.TemporaryDirectory() as temp:
         else:
             raise AssertionError("materialization accepted a file as its destination directory")
         assert provider.calls > 0 and failures[0].__traceback__ is not None
-        del provider
+        traceback = failures[0].__traceback__
+        temporary = None
+        while traceback is not None:
+            frame = traceback.tb_frame
+            if frame.f_globals.get("__name__") == "tensorfs.api" and frame.f_code.co_name == "materialize":
+                temporary = frame.f_locals.get("checkpoint")
+                break
+            traceback = traceback.tb_next
+        assert isinstance(temporary, tensorfs.Checkpoint), "failure lost its temporary checkpoint frame"
+        try:
+            temporary.download()
+        except tensorfs.InvalidError:
+            pass
+        else:
+            raise AssertionError("failed materialization left its temporary checkpoint open")
+        # The traceback also holds the explicit token argument; release it before
+        # observing the provider's finalizer.
+        del traceback, frame, temporary, failures, provider
         gc.collect()
         assert released.wait(10), "failed materialization did not close its temporary checkpoint"
-        assert alive() is None, "a retained traceback kept temporary checkpoint access alive"
+        assert alive() is None, "failed materialization retained temporary checkpoint access"
 
     with tensorfs.open(root / "source", cache_dir=root / "isolated") as checkpoint:
         assert checkpoint.__enter__() is checkpoint
