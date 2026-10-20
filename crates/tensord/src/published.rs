@@ -693,7 +693,7 @@ impl Publisher {
             None => access.snapshot(),
         };
         // This precedes failure handling, cancellation and any use of returned metadata.
-        service.engine.with_journal(|j| j.complete_metadata(&request.run, &next, reply.ok)).map_err(io_failure)?;
+        service.engine.with_journal(|j| j.complete_metadata(&request.run, &next)).map_err(io_failure)?;
         access.restore(next);
         if !reply.ok {
             let code = match reply.code.as_str() {
@@ -711,6 +711,7 @@ impl Publisher {
         let resolved = reply.resolved.into_iter().next().unwrap();
         self.validate_metadata(&wanted, &resolved)?;
         service.engine.with_journal(|j| j.bind_named(&key, &request.catalog_revision, &serde_json::to_string(&resolved).unwrap())).map_err(io_failure)?;
+        service.engine.with_journal(|j| j.metadata_ready(&request.run)).map_err(io_failure)?;
         Ok(resolved_named(resolved, named))
     }
 

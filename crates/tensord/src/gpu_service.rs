@@ -2782,7 +2782,7 @@ impl Pool {
             let mut session = session;
             let fetch = calls.map(|calls| engine.get(id).map(|record| calls.fetch(&record))).transpose()?;
             let request_access = calls.and_then(|calls| calls.hub_access(id)).is_some();
-            let mut result = self.call(engine, id, &held, plan, &load_caps, &mut session, false, calls, fetch);
+            let result = self.call(engine, id, &held, plan, &load_caps, &mut session, false, calls, fetch);
             // This also runs when PrepareRequest cancels or refuses after Load, before
             // Invoke. Keep the original outcome; request cleanup never unloads warm models.
             if request_access {
@@ -2791,7 +2791,12 @@ impl Pool {
                 }, &mut device_executor::Baseline);
                 if !cleaned.is_ok_and(|reply| reply.ok) {
                     tracing::warn!(run = id, "request access cleanup did not complete");
-                    if matches!(result, Ok(true)) { result = Ok(false); }
+                    if matches!(result, Ok(true)) {
+                        if session.executor.terminate().is_err() {
+                            tracing::warn!(run = id, "request executor retirement did not complete");
+                        }
+                        return Ok(());
+                    }
                 }
             }
             match result {

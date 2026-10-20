@@ -1504,16 +1504,23 @@ impl Journal {
     }
 
     /// Keep the token on both success and failure before examining the helper's result.
-    /// A failed reply remains non-replayable if the parent dies before recording its failure.
-    pub(crate) fn complete_metadata(&mut self, id: &str, access: &protocol::machine::HubAccess, successful: bool) -> io::Result<()> {
+    /// The handoff stays non-replayable until validated metadata or a terminal outcome is kept.
+    pub(crate) fn complete_metadata(&mut self, id: &str, access: &protocol::machine::HubAccess) -> io::Result<()> {
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db_error)?;
         let spec: Vec<u8> = tx.query_row("SELECT spec FROM run_specs WHERE execution=?1", [id], |r| r.get(0)).map_err(db_error)?;
         let mut spec: protocol::machine::RunSpec = serde_json::from_slice(&spec).map_err(db_error)?;
         spec.hub = Some(access.clone());
         let changed = tx.execute("UPDATE run_specs SET spec=?1 WHERE execution=?2", params![serde_json::to_vec(&spec).map_err(db_error)?, id]).map_err(db_error)?;
-        let settled = tx.execute("UPDATE run_metadata SET pending=?1 WHERE execution=?2 AND pending=1", params![if successful { 0 } else { 2 }, id]).map_err(db_error)?;
+        let settled = tx.execute("UPDATE run_metadata SET pending=2 WHERE execution=?1 AND pending=1", [id]).map_err(db_error)?;
         if changed != 1 || settled != 1 { return Err(io::Error::other("metadata handoff lost its durable run reservation")); }
         tx.commit().map_err(db_error)
+    }
+
+    /// Only validated, durably pinned metadata may be resolved again after a restart.
+    pub(crate) fn metadata_ready(&mut self, id: &str) -> io::Result<()> {
+        let changed = self.connection.execute("UPDATE run_metadata SET pending=0 WHERE execution=?1 AND pending=2", [id]).map_err(db_error)?;
+        if changed != 1 { return Err(io::Error::other("metadata validation lost its handoff reservation")); }
+        Ok(())
     }
 
     /// A run a restart would end: one started, or one waiting with no spec to prepare again from.
@@ -2533,7 +2540,7 @@ mod failure_message_tests {
         journal.begin_metadata(&run.id).unwrap();
         assert!(journal.begin_metadata(&run.id).is_err(), "one active trader per request");
         let access = protocol::machine::HubAccess { origin: "https://hub.example".into(), issued_token: Some("kept-token".into()), ..Default::default() };
-        journal.complete_metadata(&run.id, &access, false).unwrap();
+        journal.complete_metadata(&run.id, &access).unwrap();
         drop(journal);
         let mut journal = Journal::open(&path).unwrap();
         assert!(journal.metadata_pending(&run.id).unwrap(), "failed handoffs cannot be replayed after restart");
@@ -2541,7 +2548,7 @@ mod failure_message_tests {
         let kept: protocol::machine::RunSpec = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(kept.hub.unwrap().issued_token.as_deref(), Some("kept-token"));
         assert!(journal.begin_metadata(&run.id).is_err());
-        assert!(journal.complete_metadata("missing", &access, true).is_err());
+        assert!(journal.complete_metadata("missing", &access).is_err());
     }
 
     #[test]
@@ -2554,7 +2561,9 @@ mod failure_message_tests {
         let spec = serde_json::to_vec(&protocol::machine::RunSpec::default()).unwrap();
         let (run, _) = journal.accept_run_objects("actor", "kept", "digest", Invocation::default(), &[], &spec).unwrap();
         journal.begin_metadata(&run.id).unwrap();
-        journal.complete_metadata(&run.id, &protocol::machine::HubAccess::default(), true).unwrap();
+        journal.complete_metadata(&run.id, &protocol::machine::HubAccess::default()).unwrap();
+        assert!(journal.metadata_pending(&run.id).unwrap());
+        journal.metadata_ready(&run.id).unwrap();
         assert!(!journal.metadata_pending(&run.id).unwrap());
         journal.begin_metadata(&run.id).unwrap();
         assert!(journal.metadata_pending(&run.id).unwrap());

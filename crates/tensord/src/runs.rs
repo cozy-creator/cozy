@@ -371,7 +371,9 @@ impl Runs {
         self.service.engine.with_journal(|j| j.begin_metadata(id))?;
         let result = self.warm_models_inner(actor, id, spec, observe, stoppable);
         let next = access.snapshot_issued().map_err(|e| refused("worker_credential_failed", e.0))?;
-        self.service.engine.with_journal(|j| j.complete_metadata(id, &next, result.is_ok()))?;
+        // A code-less transfer may already have published. Until its terminal outcome is
+        // recorded, a restart must not re-resolve a mutable source and repeat that transfer.
+        self.service.engine.with_journal(|j| j.complete_metadata(id, &next))?;
         access.restore(next);
         result
     }
