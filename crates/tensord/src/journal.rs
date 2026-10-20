@@ -311,6 +311,9 @@ pub struct Execution {
     #[serde(default)]
     pub executor: Option<ExecutorFacts>,
     pub result: Option<ResultRecord>,
+    /// Private durable custody, withheld from the public result until idle or exact exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_completion: Option<PendingCompletion>,
     pub failure: Option<String>,
     #[serde(default, skip_serializing_if = "CallMemo::is_empty")]
     pub memo: CallMemo,
@@ -363,14 +366,6 @@ pub struct StoredProduct {
     pub sequence: u64,
     pub at_ms: u64,
     pub product: Vec<u8>,
-}
-
-/// Ownership association only; TensorFS remains the transaction/progress/custody journal.
-#[derive(Clone, Debug)]
-pub struct DerivedOutputBinding {
-    pub execution: String,
-    pub transaction: String,
-    pub slot: String,
 }
 
 /// Coalesced observation; persisted only as part of an authoritative transition.
@@ -502,8 +497,6 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS held_memo_objects(actor TEXT NOT NULL,computation TEXT NOT NULL,sha256 TEXT NOT NULL,PRIMARY KEY(actor,computation,sha256));
             CREATE INDEX IF NOT EXISTS held_memo_objects_digest ON held_memo_objects(sha256);
             DROP TABLE IF EXISTS checkpoints;
-            CREATE TABLE IF NOT EXISTS derived_output_bindings(transaction_id TEXT PRIMARY KEY,execution INTEGER NOT NULL REFERENCES executions(id),slot TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS derived_output_execution ON derived_output_bindings(execution);
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_request ON executions(actor,request_id) WHERE actor IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS executions_actor_submission ON executions(actor,submission_id) WHERE actor IS NOT NULL;
             CREATE INDEX IF NOT EXISTS executions_actor_order ON executions(actor,id) WHERE actor IS NOT NULL; COMMIT;").map_err(db_error)?;
@@ -1621,6 +1614,7 @@ fn insert(
         executed_ms: 0,
         executor: None,
         result: None,
+        pending_completion: None,
         failure: None,
         memo: CallMemo::default(),
     };
@@ -1768,83 +1762,6 @@ impl Journal {
             .map_err(db_error)
     }
 
-    /// Record ownership before native begin, serialized with cancellation/attempt changes.
-    pub fn bind_derived_output(
-        &mut self,
-        execution: &str,
-        attempt: u32,
-        transaction: &str,
-        slot: &str,
-    ) -> io::Result<()> {
-        crate::storage::check_digest("derived transaction", transaction, true)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_error)?;
-        let raw: String = tx
-            .query_row(
-                "SELECT record FROM executions WHERE id=?1",
-                [execution],
-                |row| row.get(0),
-            )
-            .map_err(db_error)?;
-        let record: Execution = serde_json::from_str(&raw).map_err(db_error)?;
-        if record.state != State::Running
-            || record.attempt != attempt
-            || record.cancel_actor.is_some()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "native output attempt is no longer current",
-            ));
-        }
-        // A derivation replays for any run of the same code and inputs: an ended run's
-        // transaction passes to this one; a running one's stays its own.
-        let previous: Option<(String, String, String)> = tx.query_row("SELECT CAST(b.execution AS TEXT),b.slot,e.state FROM derived_output_bindings b JOIN executions e ON e.id=b.execution WHERE b.transaction_id=?1",[transaction],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(db_error)?;
-        if previous.as_ref().is_some_and(|(run, output, state)| {
-            (run != execution || output != slot) && !matches!(state.as_str(), "completed" | "failed" | "canceled")
-        }) {
-            return Err(db_error(
-                "native output belongs to another unfinished execution or slot",
-            ));
-        }
-        tx.execute("INSERT INTO derived_output_bindings(transaction_id,execution,slot) VALUES(?1,?2,?3) ON CONFLICT(transaction_id) DO UPDATE SET execution=excluded.execution,slot=excluded.slot",params![transaction,execution,slot]).map_err(db_error)?;
-        tx.commit().map_err(db_error)
-    }
-
-    /// Explicitly canceled runs retain bindings until native cleanup has completed.
-    pub fn canceled_derived_outputs(&self) -> io::Result<Vec<DerivedOutputBinding>> {
-        let mut statement = self.connection.prepare("SELECT CAST(b.execution AS TEXT),b.transaction_id,b.slot FROM derived_output_bindings b JOIN executions e ON e.id=b.execution WHERE json_extract(e.record,'$.cancel_actor') IS NOT NULL ORDER BY b.execution,b.transaction_id").map_err(db_error)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok(DerivedOutputBinding {
-                    execution: row.get(0)?,
-                    transaction: row.get(1)?,
-                    slot: row.get(2)?,
-                })
-            })
-            .map_err(db_error)?;
-        rows.map(|row| row.map_err(db_error)).collect()
-    }
-
-    pub fn derived_outputs(&self, execution: &str) -> io::Result<Vec<DerivedOutputBinding>> {
-        let mut statement=self.connection.prepare("SELECT CAST(execution AS TEXT),transaction_id,slot FROM derived_output_bindings WHERE execution=?1 ORDER BY transaction_id").map_err(db_error)?;
-        let rows = statement
-            .query_map([execution], |row| {
-                Ok(DerivedOutputBinding {
-                    execution: row.get(0)?,
-                    transaction: row.get(1)?,
-                    slot: row.get(2)?,
-                })
-            })
-            .map_err(db_error)?;
-        rows.map(|row| row.map_err(db_error)).collect()
-    }
-
-    pub fn release_derived_output_binding(&self, binding: &DerivedOutputBinding) -> io::Result<()> {
-        self.connection.execute("DELETE FROM derived_output_bindings WHERE execution=?1 AND transaction_id=?2 AND slot=?3",params![binding.execution,binding.transaction,binding.slot]).map_err(db_error)?;
-        Ok(())
-    }
     /// Every run not completed, failed or canceled: unknown states too. A row
     /// that does not decode is an error here, where a missed run is a model evicted.
     pub fn unfinished(&self) -> io::Result<Vec<Execution>> {
@@ -2257,9 +2174,9 @@ impl Journal {
     /// termination.
     pub fn requeue_unstarted(&mut self, id: &str) -> io::Result<Execution> {
         self.update(id, |record| {
-            if record.state != State::Starting {
+            if record.state != State::Starting || record.pending_completion.is_some() {
                 return Err(db_error(
-                    "only a never-authorized attempt may return to queued",
+                    "only a never-authorized attempt without an outcome may return to queued",
                 ));
             }
             record.process = None;
@@ -2297,8 +2214,8 @@ impl Journal {
     /// stays claimed, back to awaiting its first executor.
     pub fn redeliver(&mut self, id: &str) -> io::Result<Execution> {
         self.update(id, |record| {
-            if !matches!(record.state, State::Starting | State::Running) {
-                return Err(db_error("only an active attempt is redelivered"));
+            if !matches!(record.state, State::Starting | State::Running) || record.pending_completion.is_some() {
+                return Err(db_error("only an active attempt without an outcome is redelivered"));
             }
             record.process = None;
             record.executor = None;
@@ -2403,6 +2320,26 @@ impl Journal {
             .map(readable)
     }
 
+    /// Hold a known outcome in the existing record, without releasing its reservation.
+    pub(crate) fn defer_completion(
+        &mut self, id: &str, outcome: Outcome, processes: Vec<Birth>,
+        progress: Option<&ProgressSnapshot>,
+    ) -> io::Result<Execution> {
+        self.update_observed(id, progress, |record| {
+            if record.state.terminal() || record.pending_completion.is_some() {
+                return Ok(false);
+            }
+            if !matches!(record.state, State::Starting | State::Running) {
+                return Err(db_error("only an active attempt can hold an outcome"));
+            }
+            if record.process.as_ref().is_none_or(|birth| !processes.contains(birth)) {
+                return Err(db_error("a held outcome must name its exact executor birth"));
+            }
+            record.pending_completion = Some(PendingCompletion { outcome, processes });
+            Ok(true)
+        })
+    }
+
     /// Caller must prove process termination and durable artifact custody first.
     pub fn finish(&mut self, id: &str, outcome: Outcome) -> io::Result<Execution> {
         self.finish_observed(id, outcome, None, None)
@@ -2443,6 +2380,7 @@ impl Journal {
                     record.state = State::Canceled;
                 }
             }
+            record.pending_completion = None;
             record.finished_at_ms = timestamp().max(0) as u64;
             Ok(true)
         }, hold)
@@ -2522,10 +2460,29 @@ impl std::fmt::Display for Failure {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Outcome {
     Completed(ResultRecord),
     Failed(Failure),
     Canceled,
+}
+
+/// Exact process identities retained with a known result, including observed followers.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct PendingCompletion {
+    pub outcome: Outcome,
+    pub processes: Vec<Birth>,
+}
+impl PendingCompletion {
+    pub fn exited(&self) -> io::Result<bool> {
+        // The captured members outlive their leader; its numeric process group may be reused.
+        for birth in &self.processes {
+            if !birth.ended()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 fn validate_scope(actor: &str, request_id: &str, submission_id: &str) -> io::Result<()> {

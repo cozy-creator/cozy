@@ -95,7 +95,7 @@ async def requantize(ctx: Context, payload: Requantize) -> Requantized:
     """The Runtime's own quantize operation, called on another package's model."""
     source = await produce()
     result = await quantize(source=source, plan=QuantizationPlan(components=("body",)), encoding=payload.encoding)
-    return Requantized(source.manifest.digest, result.manifest.digest)
+    return Requantized(source.checkpoint, result.checkpoint)
 
 
 app.entrypoint(requantize, accelerator=False)
