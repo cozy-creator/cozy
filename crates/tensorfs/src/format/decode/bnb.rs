@@ -2,10 +2,10 @@
 //! tensor in blocks scaled by their absmax (itself 8-bit codes with `double_quant`), and LLM.int8()
 //! rows.
 
-use super::affine::{BYTES, Codes, Fill, Order, Packing, SIGNED_BYTES};
+use super::affine::{Codes, Fill, Order, Packing, BYTES, SIGNED_BYTES};
 use super::grid::{Grid, ScaleLayout};
 use super::plan::{self, Elems, Post};
-use super::{Allowed, Ctx, Dtypes, Param, Part, Plan, Scheme, Shape, View, logical, one};
+use super::{logical, one, Allowed, Ctx, Dtypes, Param, Part, Plan, Scheme, Shape, View};
 use crate::format::{Dtype, Result};
 
 /// Appendix A.3: NF4.

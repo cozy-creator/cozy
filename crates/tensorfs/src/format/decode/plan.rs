@@ -4,9 +4,9 @@
 
 use std::borrow::Cow;
 
-use super::affine::{BYTES, Packing};
+use super::affine::{Packing, BYTES};
 use super::grid::Grid;
-use super::{PartBytes, blocks, elem};
+use super::{blocks, elem, PartBytes};
 use crate::format::{Dtype, Error, Result};
 
 /// `core` over the `[R, C]` view, then each value `× post`.

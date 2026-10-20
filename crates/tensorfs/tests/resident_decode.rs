@@ -2,12 +2,12 @@
 
 use base64::Engine;
 use serde::Deserialize;
-use tensorfs::Kind;
-use tensorfs::format::{Dtype, Encoding, decode::PartMetadata};
+use tensorfs::format::{decode::PartMetadata, Dtype, Encoding};
 use tensorfs::io::{
-    Dst, Src,
     decode::{self, Output, Part},
+    Dst, Src,
 };
+use tensorfs::Kind;
 
 #[derive(Deserialize)]
 struct Cases {
