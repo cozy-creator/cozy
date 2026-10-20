@@ -1118,6 +1118,29 @@ impl Drop for DeviceArray {
     }
 }
 
+/// An unsuccessful CUDA operation may still reference these actual allocations. Cleanup
+/// runs after caller locks have ended; the shared engine owns the completion proof.
+struct FailedCuda<T> {
+    device: i32,
+    owner: Option<T>,
+}
+
+impl<T> Drop for FailedCuda<T> {
+    fn drop(&mut self) {
+        if tensorfs::io::drain(self.device).is_err() {
+            // Keep every allocation if the engine cannot prove all work has stopped.
+            std::mem::forget(self.owner.take());
+        }
+    }
+}
+
+pub(crate) fn defer_failed_cuda<T: Send + 'static>(device: i32, owner: T) {
+    crate::cleanup::defer(FailedCuda {
+        device,
+        owner: Some(owner),
+    });
+}
+
 #[derive(Clone)]
 pub(crate) enum ArrayBuffer {
     Host(Arc<Aligned>),
@@ -1173,8 +1196,10 @@ impl ArrayBuffer {
                     },
                 };
                 // SAFETY: both allocations remain held until the copy completes.
-                unsafe { io::read(&[request], &ReadOpts::default()) }
-                    .map_err(|e| Failure::from(e.source))?;
+                if let Err(error) = unsafe { io::read(&[request], &ReadOpts::default()) } {
+                    defer_failed_cuda(b.device(), (Arc::clone(b), copy));
+                    return Err(error.source.into());
+                }
                 Self::Device(DeviceArray::new(copy))
             }
         })
@@ -1314,8 +1339,10 @@ impl PyArray {
                     },
                     dst: Dst::host(&mut bytes),
                 };
-                unsafe { io::read(&[request], &ReadOpts::default()) }
-                    .map_err(|e| Failure::from(e.source))?;
+                if let Err(error) = unsafe { io::read(&[request], &ReadOpts::default()) } {
+                    defer_failed_cuda(buffer.device(), (Arc::clone(buffer), bytes));
+                    return Err(error.source.into());
+                }
                 Ok(bytes)
             })
             .or_raise(py)?;
@@ -1436,6 +1463,7 @@ struct DlpackRelease {
     producer: Option<Py<PyAny>>,
     capsule: Option<Py<PyAny>>,
     managed: Option<usize>,
+    engine_error: bool,
     quiescent: bool,
 }
 
@@ -1454,7 +1482,12 @@ impl DlpackRelease {
             return Ok(());
         }
         if let Some(stream) = &self.stream {
-            if let Err(error) = stream.drain() {
+            let checked = if self.engine_error {
+                tensorfs::io::drain(stream.device()).and_then(|_| stream.drain())
+            } else {
+                stream.drain()
+            };
+            if let Err(error) = checked {
                 self.retain();
                 return Err(error.into());
             }
@@ -1495,10 +1528,11 @@ impl Drop for DlpackRelease {
 struct DlpackLifetime(Option<DlpackRelease>);
 
 impl DlpackLifetime {
-    fn retain_uncertain(&mut self) {
-        // An engine error does not currently prove its other copy streams stopped.
-        // Keep the actual stream and producer owners, not merely the raw pointer.
-        std::mem::forget(self.0.take());
+    fn record_cuda_error(&mut self) {
+        if let Some(release) = &mut self.0 {
+            release.engine_error = true;
+            release.quiescent = false;
+        }
     }
 
     fn finish(&mut self) -> tensorfs::Result<()> {
@@ -1560,6 +1594,7 @@ impl Dlpack {
             producer: Some(data.clone().unbind()),
             capsule: None,
             managed: None,
+            engine_error: false,
             quiescent: false,
         }));
         let exported = if let Some(stream) = &lifetime.0.as_ref().unwrap().stream {
@@ -1680,9 +1715,9 @@ impl Dlpack {
             .and_then(|release| release.stream.as_ref())
     }
 
-    pub(crate) fn retain_after_cuda_error(&mut self) {
+    pub(crate) fn record_cuda_error(&mut self) {
         if self.device.0 == KDL_CUDA {
-            self.lifetime.retain_uncertain();
+            self.lifetime.record_cuda_error();
         }
     }
 
