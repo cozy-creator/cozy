@@ -209,6 +209,10 @@ These representations are not serialization formats.
 
 ### Write a model folder
 
+`Writer` writes the cozytensors format. To create Safetensors files, first commit the
+checkpoint and then use `tensorfs.export(..., format="safetensors")`. The export writes
+weight files plus the separate configuration and supporting files required by that layout.
+
 ```python
 from array import array
 import tensorfs
