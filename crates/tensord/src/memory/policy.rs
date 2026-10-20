@@ -78,7 +78,7 @@ impl Gpu {
     pub fn facts(&self, key: &str) -> Facts {
         self.facts.get(key).copied().unwrap_or_default()
     }
-    pub fn starting(&mut self, key: &str, _: u64) {
+    pub fn starting(&mut self, key: &str) {
         self.clock = self.clock.saturating_add(1);
         self.tenants.insert(
             key.into(),
@@ -89,9 +89,6 @@ impl Gpu {
                 mapped: false,
             },
         );
-    }
-    pub fn spawn_need(&self, _: &str) -> u64 {
-        0
     }
     pub fn spawned(&mut self, key: &str, pid: u32) {
         if let Some(t) = self.tenants.get_mut(key) {
