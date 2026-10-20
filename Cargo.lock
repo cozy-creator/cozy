@@ -4211,6 +4211,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "fuser",
  "futures",
  "http-body-util",
