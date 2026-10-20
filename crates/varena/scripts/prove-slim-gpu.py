@@ -28,16 +28,28 @@ CASES = {
 }
 
 
-def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)], out: Outputs) -> Tree:
+PLACEMENT_CASES = {
+    "placement::gpu_tests::idle_worker_retires_after_pending_consumer_finishes":
+        "PASS idle worker retires after pending consumer",
+}
+
+
+def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)],
+         placement_binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)], out: Outputs) -> Tree:
     root = Path(tempfile.mkdtemp(prefix="varena-slim-gpu-"))
     executable = root / "slim-gpu"
     executable.write_bytes(binary.read_bytes())
     executable.chmod(0o700)
+    placement_executable = root / "slim-placement"
+    placement_executable.write_bytes(placement_binary.read_bytes())
+    placement_executable.chmod(0o700)
     logs = root / "logs"
     logs.mkdir()
     results = []
-    for name, marker in CASES.items():
-        command = [str(executable), "--ignored", "--exact", name, "--nocapture", "--test-threads=1"]
+    cases = [(executable, name, marker) for name, marker in CASES.items()]
+    cases += [(placement_executable, name, marker) for name, marker in PLACEMENT_CASES.items()]
+    for program, name, marker in cases:
+        command = [str(program), "--ignored", "--exact", name, "--nocapture", "--test-threads=1"]
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, start_new_session=True)
         try:
