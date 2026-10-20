@@ -152,6 +152,31 @@ pub struct Reclaim {
     pub complete: bool,
 }
 
+/// Another process publishes aggregate facts; its page identities stay private.
+#[derive(Clone, Debug)]
+pub struct Remote {
+    pub row: RowId,
+    /// These classes exclude the separately reported context.
+    pub classes: [u64; 7],
+    pub context: u64,
+    /// Largest remaining W per request, excluding pinned bytes and context.
+    pub remaining: Vec<Option<u64>>,
+    pub reaping: bool,
+}
+
+impl Remote {
+    fn class(&self, class: Class) -> u64 {
+        self.classes.get(class.as_usize()).copied().unwrap_or(0)
+    }
+    fn reclaimable(&self, ceiling: Class) -> u64 {
+        Class::ALL
+            .into_iter()
+            .zip(self.classes)
+            .filter(|(class, _)| *class <= ceiling)
+            .fold(0_u64, |sum, (_, bytes)| sum.saturating_add(bytes))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Table {
     pub capacity: u64,
@@ -159,6 +184,7 @@ pub struct Table {
     pub rows: Vec<Row>,
     pub requests: Vec<Request>,
     pub reclaims: Vec<Reclaim>,
+    pub remote: Vec<Remote>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -284,12 +310,18 @@ impl Table {
 
     /// No authoritative byte counters are stored beside the page table.
     pub fn bytes_by_class(&self, row: RowId) -> Result<[u64; 7], &'static str> {
+        self.counts(row, false)
+    }
+
+    pub fn published_classes(&self, row: RowId) -> Result<[u64; 7], &'static str> {
+        self.counts(row, true)
+    }
+
+    fn counts(&self, row: RowId, separate_context: bool) -> Result<[u64; 7], &'static str> {
         let mut counts = [0_u64; 7];
-        for page in self
-            .pages
-            .iter()
-            .filter(|page| page.row == row && page.mapped())
-        {
+        for page in self.pages.iter().filter(|page| {
+            page.row == row && page.mapped() && (!separate_context || page.kind != Kind::Context)
+        }) {
             let Some(count) = counts.get_mut(self.class(page).as_usize()) else {
                 return Err("invalid page class");
             };
@@ -301,10 +333,18 @@ impl Table {
     }
 
     fn occupied(&self) -> Option<u64> {
-        self.pages
+        let local = self
+            .pages
             .iter()
             .filter(|page| page.mapped())
-            .try_fold(0_u64, |sum, page| sum.checked_add(page.bytes))
+            .try_fold(0_u64, |sum, page| sum.checked_add(page.bytes))?;
+        self.remote.iter().try_fold(local, |sum, row| {
+            row.classes
+                .iter()
+                .try_fold(sum.checked_add(row.context)?, |sum, bytes| {
+                    sum.checked_add(*bytes)
+                })
+        })
     }
 
     fn reserve(&self) -> Option<u64> {
@@ -319,20 +359,32 @@ impl Table {
     }
 
     fn protected_room(&self) -> Option<u64> {
-        self.pages
+        let local = self
+            .pages
             .iter()
             .filter(|page| !page.mapped() && self.class(page) == Class::Working)
-            .try_fold(self.reserve()?, |bytes, page| bytes.checked_add(page.bytes))
+            .try_fold(self.reserve()?, |bytes, page| bytes.checked_add(page.bytes))?;
+        self.remote.iter().try_fold(local, |sum, row| {
+            let reserve = row
+                .remaining
+                .iter()
+                .try_fold(0_u64, |sum, bytes| sum.checked_add((*bytes)?))?;
+            sum.checked_add(reserve.saturating_sub(row.class(Class::Working)))
+        })
     }
 
     fn valid(&self) -> bool {
         let pages: BTreeSet<_> = self.pages.iter().map(|page| page.id).collect();
         let rows: BTreeSet<_> = self.rows.iter().map(|row| row.id).collect();
         let requests: BTreeSet<_> = self.requests.iter().map(|request| request.id).collect();
+        let remote: BTreeSet<_> = self.remote.iter().map(|row| row.row).collect();
         pages.len() == self.pages.len()
             && rows.len() == self.rows.len()
             && requests.len() == self.requests.len()
             && self.occupied().is_some()
+            && remote.len() == self.remote.len()
+            && remote.is_subset(&rows)
+            && self.pages.iter().all(|page| !remote.contains(&page.row))
             && self.pages.iter().all(|page| rows.contains(&page.row))
             && self
                 .requests
@@ -343,12 +395,17 @@ impl Table {
     /// Admission is conservative: an unmeasured request runs alone, never beside a reaping row.
     /// `peaks` describes the prospective request's total per-step footprint, excluding contexts.
     pub fn fits(&self, peaks: &[Option<u64>]) -> bool {
-        if !self.valid() || peaks.is_empty() || self.rows.iter().any(|row| row.reaping) {
+        if !self.valid()
+            || peaks.is_empty()
+            || self.rows.iter().any(|row| row.reaping)
+            || self.remote.iter().any(|row| row.reaping)
+        {
             return false;
         }
         let unknown = peaks.iter().any(Option::is_none);
         if unknown {
-            return self.requests.is_empty();
+            return self.requests.is_empty()
+                && self.remote.iter().all(|row| row.remaining.is_empty());
         }
         let mut needed = self
             .pages
@@ -357,6 +414,14 @@ impl Table {
                 page.mapped() && (page.kind == Kind::Context || self.class(page) == Class::Pinned)
             })
             .try_fold(0_u64, |sum, page| sum.checked_add(page.bytes));
+        for row in &self.remote {
+            needed = needed
+                .and_then(|sum| sum.checked_add(row.context))
+                .and_then(|sum| sum.checked_add(row.class(Class::Pinned)));
+            for remaining in &row.remaining {
+                needed = needed.and_then(|sum| sum.checked_add((*remaining)?));
+            }
+        }
         for request in &self.requests {
             let Some(start) = usize::try_from(request.position.step).ok() else {
                 return false;
@@ -531,7 +596,7 @@ impl<'a> Planner<'a> {
     }
 
     fn ask(&mut self, request: &Request, need: u64, ceiling: Class) -> bool {
-        let rows: BTreeSet<_> = self
+        let mut rows: BTreeSet<_> = self
             .table
             .pages
             .iter()
@@ -543,6 +608,13 @@ impl<'a> Planner<'a> {
             })
             .map(|page| page.row)
             .collect();
+        rows.extend(
+            self.table
+                .remote
+                .iter()
+                .filter(|row| row.reclaimable(ceiling) != 0)
+                .map(|row| row.row),
+        );
         for row in rows {
             let attempt = self.table.reclaims.iter().find(|attempt| {
                 attempt.step == request.step()
@@ -877,6 +949,7 @@ mod tests {
             ],
             requests: vec![request(1)],
             reclaims: Vec::new(),
+            remote: Vec::new(),
         };
         assert_eq!(
             decide(
@@ -974,6 +1047,28 @@ mod tests {
         table.rows.push(Row {
             id: 2,
             alive: true,
+            reaping: false,
+        });
+        assert_eq!(
+            decide(
+                &table,
+                Trigger::Oom {
+                    request: 1,
+                    need: 10
+                }
+            ),
+            vec![Action::Ask {
+                row: 2,
+                need: 10,
+                ceiling: Class::Unused
+            }]
+        );
+        table.pages.retain(|page| page.row != 2);
+        table.remote.push(Remote {
+            row: 2,
+            classes: [0, 0, 0, 30, 0, 0, 0],
+            context: 0,
+            remaining: vec![],
             reaping: false,
         });
         assert_eq!(
