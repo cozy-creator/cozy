@@ -104,7 +104,7 @@ pub async fn run(
         None => call.spec(&bound)?,
     };
     if args.warm.is_none() {
-        super::gpuless(ctx, &on, callable, &target, call.bits).await;
+        super::gpuless(ctx, &on, &installed.interface, callable, &target, call.bits).await;
     }
     let bound = args.warm.is_none().then_some(&bound);
     let out = args.out.as_ref().map(|dir| terms.cwd.join(dir));
