@@ -226,8 +226,13 @@ def plans() -> None:
         cuts.run(s, ff, (torch.randn(1, 300, 64),), {})
     key = max(shape.units, key=lambda k: shape.units[k] * shape.scopes[k][0])
     unit, total = shape.units[key], shape.scopes[key][0]
-    saved = cuts.planned(shape, unit * (total - total // 4) - 1, 1)
-    check("planning cuts an FFN to the fewest pieces that cover it", saved and memo.sizes[key] == 75)
+    short = unit * (total - total // 4) - 1
+    saved = cuts.planned(shape, short, 1)
+    check(
+        "planning cuts an FFN to the fewest pieces that cover it, saving what was short",
+        saved == short and memo.sizes[key] == 75,
+        (memo.sizes[key], saved),
+    )
     del memo.sizes[key]
     block = unit * total // 8
     saved = cuts.planned(shape, unit * total, block)
