@@ -610,14 +610,14 @@ fn quoted(input: &str) -> String {
 fn functions(ctx: &Context, package: &str, resolved: &Resolved) {
     let from = resolved.from.to_string();
     let card = &resolved.card;
-    functions_of(ctx, package, &card.release, Some(&from), &card.interface);
+    functions_of(ctx, package, (&card.release, card.summary()), Some(&from), &card.interface);
 }
 
 /// A package's public functions, and where each runs.
 fn functions_of(
     ctx: &Context,
     package: &str,
-    release: &str,
+    (release, summary): (&str, &str),
     from: Option<&str>,
     interface: &Interface,
 ) {
@@ -634,7 +634,8 @@ fn functions_of(
             .map(|name| serde_json::json!({"function": name, "runs_on": runs_on(name), "conversion": conversion(name)}))
             .collect();
         output::json(&serde_json::json!({
-            "package": package, "release": release, "release_from": from, "functions": rows,
+            "package": package, "release": release, "release_from": from, "summary": summary,
+            "functions": rows,
         }));
         return;
     }
@@ -652,7 +653,8 @@ fn functions_of(
         table = table.note(format!("for model authors: {} (conversions)", conversions.join(", ")));
     }
     let from = from.map(|from| format!(" ({from})")).unwrap_or_default();
-    table.note(format!("{package} {release}{from}")).print();
+    let summary = (!summary.is_empty()).then(|| format!(": {summary}")).unwrap_or_default();
+    table.note(format!("{package} {release}{from}{summary}")).print();
     let next: Vec<String> = public
         .iter()
         .take(2)

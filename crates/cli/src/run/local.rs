@@ -67,7 +67,7 @@ pub async fn run(
         (None, [only]) if script => (*only).to_owned(),
         (None, _) => {
             super::unnamed(&local.package, None, &installed.interface, &args)?;
-            super::functions_of(ctx, &local.package, "local", None, &installed.interface);
+            super::functions_of(ctx, &local.package, ("local", ""), None, &installed.interface);
             return Ok(ExitCode::SUCCESS);
         }
     };
