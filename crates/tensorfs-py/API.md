@@ -191,7 +191,7 @@ Additional checkpoint properties and operations:
 | `tree`, `tree_ref` | Repository-tree identity in the same two forms, when known. |
 | `name`, `repo_id` | Repository name; `repo_id` is an alias. |
 | `release`, `revision` | Release label, when known; `revision` is an alias. |
-| `variant` | Selected variant. |
+| `variant` | Selected repository variant, when known. A standalone header does not store this label. |
 | `pipeline`, `components` | Pipeline description and ordered component mapping. |
 | `metadata` | Loading/provenance metadata. |
 | `chunks`, `chunk_paths` | Chunk references and their local paths. |
@@ -245,16 +245,27 @@ encodings and references. Store paths, credentials and endpoint URLs stay in con
 not in the file. Moving or copying the file preserves its content identity. Opening it
 uses the configured store and, when needed and allowed, the configured source.
 
+The file identifies one checkpoint, not an enclosing repository tree. It contains the
+component configuration and run data references, but no release label or repository
+README/LICENSE files. Opening a copied header cannot reconstruct that missing repository
+context. Those fields remain available on a checkpoint opened through its repository.
+
 A successful save retains its data as a durable store root before atomically publishing
-the header. Ordinary cache cleanup must not evict that root. Deleting the file removes
-only that handle; releasing the shared data is an explicit store-management operation.
+the header. Ordinary cache cleanup must not evict that root. Deleting or replacing the
+file removes only that handle; releasing its saved data is an explicit store-management
+operation.
 
 `Writer(dest=None, ...)` keeps the checkpoint in the shared store without writing a header
 file. `dest` is a literal file path, not a directory. Its options are:
 
+Leave `variant` unset when `dest` is supplied; that combination is invalid. TensorFS does
+not append or infer a variant label from the filename. For example,
+`Writer("model.f32.cozytensors")` writes that exact filename without assigning a repository
+variant. Tensor dtypes and encodings describe the representation independently.
+
 | Option or member | Use |
 |---|---|
-| `variant` | Optional repository/export label; the tensor encodings describe the stored representation. |
+| `variant` | Optional repository/export label when `dest=None`; invalid with a file destination. |
 | `base` | Start from an existing checkpoint and reuse unchanged data. |
 | `resume` | Resume keyed local write state. |
 | `repo_id`, `endpoint`, `token`, `ca_der` | Stream the new checkpoint to a repository using supplied access. |
@@ -295,6 +306,11 @@ This writes `model.cozytensors` (or its named variant) plus `chunks/`, keeping t
 header bytes and content hashes. It fetches required missing objects or fails; it must not
 silently produce an incomplete portable export. Native export preserves encodings and
 does not accept `dequantize`.
+
+The export contains the selected checkpoint and any known repository files. A checkpoint
+opened from a bare header has no enclosing tree to supply a README, LICENSE or other
+variants. A selected-checkpoint export is not a complete multi-variant tree snapshot;
+use `snapshot_download` when you need to materialize repository content.
 
 ### Compatibility export for legacy file-based libraries
 

@@ -408,7 +408,10 @@ class Writer:
     local_checkpoint: Checkpoint | None
 
     def __init__(self, dest: StrPath | None=None, *, variant: str | None=None, base: Checkpoint | None=None, resume: str | None=None, repo_id: str | None=None, endpoint: str | None=None, token: Token | None=None, cache_dir: StrPath | None=None, ca_der: bytes | None=None) -> None:
-        ...
+        """Write an exact header-file path, or only the shared store when dest=None.
+
+        variant labels repository content and is invalid with a file destination.
+        """
 
     def __enter__(self) -> Writer:
         ...

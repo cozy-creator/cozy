@@ -71,6 +71,16 @@ store before the header is atomically published. Store roots and endpoint config
 not embedded as paths in the file. A native portable export writes a complete folder with
 chunks; ordinary file saving does not.
 
+`dest` is the exact filename; TensorFS does not append a variant or create a directory.
+Leave `variant` unset for a file destination. Variant labels belong to repository trees;
+setting both `dest` and `variant` is invalid. With no destination, the writer retains the
+checkpoint in the shared store and may assign a repository variant.
+
+A standalone header identifies one checkpoint. It does not contain its enclosing tree,
+release label, README or LICENSE. Moving or copying it preserves that checkpoint identity;
+repository context is available only when separately known. Deleting or replacing the
+file does not release its saved data automatically.
+
 The component borrows its writer while being filled. `commit(&mut self)` is async for both
 local and remote writes. After an upload failure, `writer.committed()` can return the strong
 local checkpoint; the operation still returns an error. Successful publication records the
@@ -101,6 +111,10 @@ let destination: Ref = "me/output".parse()?;
 let tree = client.upload_folder(&destination, Path::new("./portable"), None).await?;
 println!("published {}", tree.id());
 ```
+
+Native export includes the selected checkpoint and any known repository files. It is not
+a full multi-variant tree snapshot; use `snapshot_download` for repository materialization.
+Exporting a standalone header cannot recover unknown repository files or release metadata.
 
 All operations involving network/source resolution above are async except construction and
 `writer`. Export uses `tensorfs::export(&checkpoint, directory, Format::Safetensors,

@@ -99,6 +99,11 @@ paths; it MUST NOT silently drop or overwrite either entry. Metadata-only inspec
 
 ## 4. Header
 
+A standalone `.cozytensors` file contains the encoded header bytes described here. Its
+content identity is independent of its filename and the physical location of referenced
+objects. The header does not identify an enclosing tree, repository or release; a variant
+label is supplied by the tree entry that refers to it (§3).
+
 A header is one variant of a model, self-contained: its pipeline, its components (class, config, tensors and run
 data) and the chunks of tensor bytes. It holds only what running, loading or quantizing the model needs or is helped
 by; a README, license, images, docs and code are repo files, never in a header. A header is an array of records, each
