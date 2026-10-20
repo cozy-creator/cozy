@@ -329,8 +329,7 @@ pub fn wanted(header: &Header, components: Option<&[String]>) -> Result<Vec<Obje
 
 /// A runtime for callers without one (a CLI, Python): two threads for sockets and timers.
 pub fn runtime() -> Result<Arc<tokio::runtime::Runtime>> {
-    static RUNTIME: Mutex<Option<Arc<tokio::runtime::Runtime>>> = Mutex::new(None);
-    let mut held = RUNTIME
+    let mut held = runtime_slot()?
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(runtime) = held.as_ref() {
@@ -347,3 +346,12 @@ pub fn runtime() -> Result<Arc<tokio::runtime::Runtime>> {
         })?;
     Ok(Arc::clone(held.insert(Arc::new(runtime))))
 }
+
+fn runtime_slot() -> Result<&'static Mutex<Option<Arc<tokio::runtime::Runtime>>>> {
+    static RUNTIME: Mutex<Option<Arc<tokio::runtime::Runtime>>> = Mutex::new(None);
+    Ok(&RUNTIME)
+}
+
+#[cfg(all(test, unix))]
+#[allow(unsafe_code)]
+mod runtime_fork_tests;
