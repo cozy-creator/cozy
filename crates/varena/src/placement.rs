@@ -1893,7 +1893,7 @@ mod gpu_tests {
                 items: vec![Item {
                     offset: 0,
                     len: length,
-                    source: ItemSource::Inline(vec![7; length as usize]),
+                    source: ItemSource::Inline(vec![7; length as usize].into()),
                     part_end: true,
                 }],
             }],
