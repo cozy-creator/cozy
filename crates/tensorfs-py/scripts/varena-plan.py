@@ -471,7 +471,9 @@ def build(
     return mem, core, models
 
 
-def h3(mem: vt.Memory, models: dict[str, vt.Model], rid: str, tokens: int = 4096) -> vt.RequestStats:
+def h3(
+    mem: vt.Memory, models: dict[str, vt.Model], rid: str, tokens: int = 4096, dit: int = 40_000
+) -> vt.RequestStats:
     """One ref2va_turbo 5 s request: condition, encode the reference, 8 turbo steps, decode."""
     x = lambda n: torch.zeros(n, 8)  # noqa: E731
     m = {k: v.module for k, v in models.items()}
@@ -486,7 +488,7 @@ def h3(mem: vt.Memory, models: dict[str, vt.Model], rid: str, tokens: int = 4096
                 m["audio_vae"](x(16))
                 m["vae"](x(1024), slice(0, VAE_ENCODER))
                 for _ in range(8):
-                    m["transformer_ref"](x(40_000))
+                    m["transformer_ref"](x(dit))
                 m["audio_vae"](x(32))
                 m["vae"](x(2048), slice(VAE_ENCODER, None))
             finally:
@@ -588,7 +590,8 @@ def case(name: str, card: Card, limit: int | None, orphans: int = 0, weights: bo
         label, since, moved, retries = f"{name} {'warm' if warm else 'cold'}", len(core.events), core.moved(), mem.memo.retries
         start = CARD.allocated
         try:
-            stats = h3(mem, models, label)
+            # warm: a prompt of another length, a DiT shape key never run (12163)
+            stats = h3(mem, models, label, dit=40_000 + 8 * warm)
         except Exception as exc:  # noqa: BLE001
             check(f"{label}: completes", False, f"{type(exc).__name__}: {exc}")
             return

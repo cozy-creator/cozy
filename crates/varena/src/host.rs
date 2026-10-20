@@ -348,10 +348,11 @@ impl HostMem {
     }
 
     /// Until region `r` of a sealed layout is Ready: its filler sets the word after the last
-    /// byte lands (or marks it failed). Its filler is this executor's machine, so a filler that
-    /// dies takes the waiter with it; there is no deadline to guess.
+    /// byte lands (or marks it failed). A filler that ends without either (a killed process)
+    /// lets go of its fill lock, and the waiter's error says so; there is no deadline to guess.
     pub fn wait_ready(&self, r: u32) -> Result<()> {
         let mut pause = std::time::Duration::from_micros(20);
+        let mut gone = false;
         loop {
             let w = self.word(r).load(Ordering::Acquire);
             if w & READY != 0 {
@@ -363,6 +364,10 @@ impl HostMem {
             if w & HOLE != 0 {
                 return Err(Error::Invalid(format!("sealed layout region {r} is not staged")));
             }
+            if gone {  // read once more after the lock went: Ready may have landed just before
+                return Err(Error::Invalid(format!("sealed layout region {r}: its filler is gone")));
+            }
+            gone = !filler(self.fd.as_fd(), self.data)?;
             std::thread::sleep(pause);
             pause = (pause * 2).min(std::time::Duration::from_millis(1));
         }
@@ -810,8 +815,42 @@ pub struct OpenFill {
     host: HostMem,
 }
 
+/// Whether the filler of the sealed layout whose state page is at `data` still holds its fill
+/// lock (a write lock over the page's magic, on the filler's own description).
+fn filler(fd: BorrowedFd<'_>, data: usize) -> Result<bool> {
+    shm::written(fd, data, 8).map_err(crate::os("query the fill lock"))
+}
+
+/// Whether the sealed layout behind `fd` is still being filled: its filler, alive, holds the
+/// fill lock. Its holder hands adopters the chunk files too, for a filler that dies.
+pub fn filling(fd: BorrowedFd<'_>) -> Result<bool> {
+    let raw = fd.as_raw_fd();
+    let data = file_size(raw)?.checked_sub(8).and_then(|t| u64_at(raw, t)).and_then(|d| usize::try_from(d).ok());
+    data.map_or(Ok(false), |data| filler(fd, data))
+}
+
+/// Whether every region of the sealed layout behind `fd` is Ready or a hole: none failed, and
+/// none left unfilled by a filler that died. Its holder grants an incomplete one to nobody.
+pub fn complete(fd: BorrowedFd<'_>) -> Result<bool> {
+    let raw = fd.as_raw_fd();
+    let bad = || Error::Invalid("host fd is not a sealed weight-set layout".into());
+    let size = file_size(raw)?;
+    let data = size.checked_sub(8).and_then(|t| u64_at(raw, t)).and_then(|d| usize::try_from(d).ok()).ok_or_else(bad)?;
+    let n = u64_at(raw, data + 8).and_then(|n| usize::try_from(n).ok()).filter(|&n| n < size).ok_or_else(bad)?;
+    let mut words = vec![0u8; 4 * n];
+    if !read_at(raw, &mut words, data + WORDS_OFF) {
+        return Err(bad());
+    }
+    let done = |w: &[u8; 4]| {
+        let w = u32::from_le_bytes(*w);
+        w & FAILED == 0 && w & (READY | HOLE) != 0
+    };
+    Ok(words.as_chunks::<4>().0.iter().all(done))
+}
+
 /// Create `layout`'s memfd (in `reserved` when given: its pages exist, so the copy only maps
-/// them) and seal it now; returns the memfd to hand out and the fill to run. `staged`: the
+/// them) and seal it now; returns the memfd to hand out and the fill to run. The fill holds
+/// the fill lock on its own description until it ends, so adopters see a killed filler. `staged`: the
 /// only regions this layout will hold (the rest are holes until staged); None: every region.
 pub fn open_sealed(name: &str, layout: &Layout, reserved: Option<OwnedFd>, staged: Option<&[u32]>) -> Result<(OwnedFd, OpenFill)> {
     let host = match reserved {
@@ -825,6 +864,7 @@ pub fn open_sealed(name: &str, layout: &Layout, reserved: Option<OwnedFd>, stage
             }
         }
     }
+    ofd_lock(host.fd.as_fd(), host.data, 8, Region::Write, false)?;
     let fd = reopen(host.fd.as_raw_fd())?;
     // Future-write leaves this mapping writable.
     shm::seal(fd.as_fd()).map_err(crate::os("seal host layout"))?;

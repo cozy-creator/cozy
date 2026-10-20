@@ -126,10 +126,19 @@ class Memo:
     banded: set[OpOverload] = field(default_factory=set)  # ops with a band size in force
     whole: set[tuple[object, ...]] = field(default_factory=set)
     shapes: dict[tuple[str, str], Shape] = field(default_factory=dict)
+    #: each model's latest shape: a key it never ran (a prompt of another length) starts from
+    #: its cut scopes and FFN units, so planning can cut before its first pass (12163)
+    latest: dict[str, Shape] = field(default_factory=dict)
     retries: int = 0
 
     def shape(self, model: str, key: str) -> Shape:
-        return self.shapes.setdefault((model, key), Shape(model, key))
+        shape = self.shapes.get((model, key))
+        if shape is None:
+            shape = self.shapes[(model, key)] = Shape(model, key)
+            if (last := self.latest.get(model)) is not None:
+                shape.scopes, shape.units = dict(last.scopes), dict(last.units)
+        self.latest[model] = shape
+        return shape
 
 
 @dataclass(eq=False, slots=True)

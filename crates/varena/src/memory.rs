@@ -857,9 +857,10 @@ impl Inner {
         let start = self.events.record(s, true)?;
         let (region, layout) = (job.region, job.w.layout.region(job.region)?);
         let dst = Dst::Device { device: self.ordinal, ptr: job.dst, len: layout.nbytes as usize, stream: s as usize };
-        match job.w.host.as_ref().filter(|host| !host.hole(region)) {
+        // a region its sealer failed or died filling reads the chunks instead
+        let ready = |host: &&HostMem| !host.hole(region) && host.wait_ready(region).inspect_err(|e| tracing::warn!("varena: {}: {e}", job.w.name)).is_ok();
+        match job.w.host.as_ref().filter(ready) {
             Some(host) if layout.nbytes > 0 => {
-                host.wait_ready(region)?;
                 host.pin_region(region, layout.offset, align_up(layout.nbytes, PART_ALIGN));
                 // SAFETY: source is complete inside the retained host layout; destination is the
                 // placement's exclusive mapped region until this fill is published.
@@ -1658,10 +1659,9 @@ impl HostSet {
         let (w, mut regs) = (&self.weights, lock(&self.regs));
         let reg = w.layout.region(region)?;
         let (buf, bound) = &mut regs[region as usize];
-        let sealed = w.host.as_ref().filter(|h| !h.hole(region));
+        let sealed = w.host.as_ref().filter(|h| !h.hole(region) && h.wait_ready(region).is_ok());
         let (ptr, buf) = match sealed {
             Some(h) => {
-                h.wait_ready(region)?;
                 (h.base() as u64 + reg.offset, None)
             }
             None => {
@@ -1731,7 +1731,15 @@ fn open_checkpoint(ck: &Checkpoint, regions: &[Vec<String>], direct_io: bool) ->
 #[cfg(feature = "store")]
 pub fn seal(ck: &Checkpoint, regions: &[Vec<String>], name: &str, threads: usize) -> Result<OwnedFd> {
     let (layout, source) = open_checkpoint(ck, regions, true)?;
-    crate::host::fill_sealed(name, &layout, &source, threads, &IoTally::default(), None)
+    let (fd, fill) = crate::host::open_sealed(name, &layout, None, None)?;
+    let named = name.to_string();
+    let run = move || {
+        if let Err(e) = fill.run(&layout, &source, threads, &IoTally::default()) {
+            tracing::warn!("varena: sealing {named} failed; its adopters read the chunks: {e}");
+        }
+    };
+    std::thread::Builder::new().name(format!("varena-seal-{name}")).spawn(run).map_err(|e| Error::Io(format!("spawn a seal: {e}")))?;
+    Ok(fd)
 }
 
 /// `fd` in a socket's queue, the sending end closed: whoever holds the other end can take it

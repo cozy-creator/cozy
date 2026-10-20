@@ -2781,6 +2781,7 @@ impl Pool {
         // process (the Runtime refuses a group without constructed models).
         let ranks = if plan.slots.is_empty() { 1 } else { degree.max(1) };
         let lane = self.lane_devices(start, degree)?;
+        let _sealing = Sealing(&self.deposits, id);
         let mut callbacks = Callbacks {
             engine,
             id,
@@ -3725,22 +3726,45 @@ struct Callbacks<'a> {
     /// The checkpoints the call reads and their components: what a missed grant seals.
     selections: Vec<SelectedManifest>,
 }
+/// A call's end: a layout it was sealing and never deposited is nobody's to wait for.
+struct Sealing<'a>(&'a Deposits, &'a str);
+impl Drop for Sealing<'_> {
+    fn drop(&mut self) {
+        self.0.ended(self.1);
+    }
+}
 impl Services for Callbacks<'_> {
     /// A weight set's held bytes: the sealed host layout an executor deposited for its manifest
-    /// and layout, else nothing (TensorD never fills). On a miss the executor seals a host
-    /// layout from the checkpoint: host RAM for its selected bytes is made first.
+    /// and layout (whole, or still filling: a region its filler leaves unfilled reads the
+    /// checkpoint), else nothing, and the Runtime reads the checkpoint through TensorFS (TensorD
+    /// never fills). The first asker of a layout seals it, host RAM for its selected bytes made
+    /// first; another asker meanwhile is told to ask again once that deposit lands.
     fn read_grant(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
         drop(plan);
-        let (mut answer, mut fds) = granted(frame.seq, self.deposits.grant(&frame.manifest, &frame.layout));
-        let held = answer.held;
-        let id = |m: &str| m.trim_start_matches("sha256:").to_string();
-        let selected = self.selections.iter().find(|s| id(&s.manifest) == id(&frame.manifest));
-        if let Some((need, _)) = selected.filter(|_| !held).and_then(|s| selected_bytes(&self.pool.store, &s.manifest, &s.components).ok()) {
-            self.pool.host_room_for(need);
+        let (manifest, layout) = (&frame.manifest, &frame.layout);
+        let (file, filling) = match self.deposits.grant(manifest, layout) {
+            Some((file, filling)) => (Some(file), filling),
+            None if layout.is_empty() => (None, false),
+            None => match self.deposits.seal(manifest, layout, &format!("{}#{}", self.id, frame.rank)) {
+                Ok(()) => (None, false),
+                Err(sealer) => {
+                    let detail = format!("{sealer} is sealing {layout}; ask again once it deposits");
+                    return Ok((Answer::refused(frame.seq, "layout_sealing", &detail), vec![]));
+                }
+            },
+        };
+        if file.is_none() {
+            let id = |m: &str| m.trim_start_matches("sha256:").to_string();
+            let selected = self.selections.iter().find(|s| id(&s.manifest) == id(manifest));
+            if let Some((need, _)) = selected.and_then(|s| selected_bytes(&self.pool.store, &s.manifest, &s.components).ok()) {
+                self.pool.host_room_for(need);
+            }
         }
+        let (mut answer, mut fds) = granted(frame.seq, file);
+        let held = answer.held;
         // GPU pages a gone executor kept of this layout follow its host layout.
         let rank = self.kept.get(frame.rank as usize).copied().flatten();
-        if let Some((fingerprint, pages)) = rank.filter(|_| held).and_then(|(m, _, _)| m.take_kept(&frame.layout)) {
+        if let Some((fingerprint, pages)) = rank.filter(|_| held && !filling).and_then(|(m, _, _)| m.take_kept(&frame.layout)) {
             for (page, fd) in pages {
                 answer.pages.push(page);
                 fds.push(fd);
@@ -3748,7 +3772,7 @@ impl Services for Callbacks<'_> {
             (answer.fingerprint, answer.descriptors) = (fingerprint, fds.len() as u64);
         }
         self.pool.notes.note(serde_json::json!({"event": "read_grant", "manifest": frame.manifest,
-            "layout": frame.layout, "held": held, "pages": answer.pages.len(),
+            "layout": frame.layout, "held": held, "filling": filling, "pages": answer.pages.len(),
             "rank": frame.rank, "pid": rank.map(|(_, pid, _)| pid), "gpu": rank.map(|(_, _, gpu)| gpu)}));
         Ok((answer, fds))
     }
@@ -3810,7 +3834,7 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     /// The `read_grant` answers Runtime's `tests/tensord_peer.py` mirrors, field for field: a
-    /// held layout is one descriptor; without one, nothing follows.
+    /// held layout (whole or still filling) is one descriptor; without one, nothing follows.
     #[test]
     fn a_read_grant_answer_is_the_shape_runtime_reads() {
         let (held, fds) = granted(7, Some(File::open("/dev/null").unwrap()));
