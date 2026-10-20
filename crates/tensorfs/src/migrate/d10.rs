@@ -21,8 +21,8 @@ use serde_json::{json, Value as Json};
 use crate::failure::{fail, Failure, Kind, Result};
 use crate::fetch::{self, Client, Endpoint, Fetcher, Fresh, Origin, Payload, SourcePolicy, Want};
 use crate::format::decode::{check_metadata, PartMetadata};
-use crate::format::{Body, Component, Config, Header, Metadata, ObjectRef, Repo, Tag, Tensor, Tree, Value, HEADER_PATH, TREE_FORMAT};
-use crate::import::{layout, remote};
+use crate::format::{Body, ClassRef, Component, Config, Header, Metadata, ObjectRef, Repo, Tag, Tensor, Tree, Value, HEADER_PATH, TREE_FORMAT};
+use crate::import::{layout, lora, remote, Versions};
 use crate::store::Store;
 
 use super::v1;
@@ -160,6 +160,41 @@ fn under(entry: &str, path: &str) -> bool {
         (false, true) => path == entry,
         (false, false) => !path.contains('/') && path.starts_with(&entry),
     }
+}
+
+/// Components whose configs name no class: the class that implements them, read from the
+/// package or model code that loads them (owner, 2026-10-20). An empty version is the pin's.
+const CLASSES: &[(&[&str], &str, [&str; 3])] = &[
+    (&["*/seedvr2-7b"], "conditioning", ["seedvr2", "0.6.1", "Conditioning"]),
+    (&["*/seedvr2-7b"], "dit", ["seedvr2", "0.6.1", "NaDiT"]),
+    (&["*/seedvr2-7b"], "vae", ["seedvr2", "0.6.1", "VideoAutoencoderKLWrapper"]),
+    (&["*/birefnet"], "model", ["birefnet", "0.4.0", "BiRefNet"]),
+    (&["*/minimax-h3-vsa-gate"], "model", ["minimax_h3", "1.43.2", "GateStack"]),
+    (&["*/flux-3-klein-upsampler", "*/qwen3.5-9b"], "model", ["transformers", "", "Qwen3_5ForConditionalGeneration"]),
+];
+/// LoRA lanes' base models, for their adapter configs.
+const LORA_BASES: &[(&[&str], &str)] = &[(&["*/minimax-h3-*"], H3), (&["paul/d1-*"], SDXL)];
+/// The α a LoRA lane lost that its source states: lightx2v's safetensors metadata `alpha` 8
+/// (`*_8step_v1.0*_bf16`, matched to both lanes by tensor bytes).
+const LORA_ALPHA: &[(&str, u64)] = &[("*/minimax-h3-lightx2v-source", 8)];
+
+/// LoRA components (every key a LoRA factor or `.alpha`) in PEFT's spelling, header only: each
+/// one's modules and ranks.
+fn peft(tensors: &mut [(String, Vec<Tensor>)]) -> BTreeMap<String, Vec<(String, u64)>> {
+    let mut out = BTreeMap::new();
+    for (name, ts) in tensors.iter_mut() {
+        let keys: Option<Vec<String>> = ts.iter().map(|t| lora::peft_key(&t.key)).collect();
+        let Some(keys) = keys.filter(|k| k.iter().any(|k| k.ends_with(".lora_A.weight"))) else { continue };
+        let mut modules = Vec::new();
+        for (t, key) in ts.iter_mut().zip(keys) {
+            if let Some(m) = key.strip_suffix(".lora_A.weight") {
+                modules.push((m.to_owned(), t.shape.first().copied().unwrap_or(0)));
+            }
+            t.key = key;
+        }
+        out.insert(name.clone(), modules);
+    }
+    out
 }
 
 /// Releases that become private tags (a public tag is a PEP 440 version): model and version, by
@@ -308,7 +343,7 @@ impl<'t> Migrator<'t> {
                     let (mut tree, mut report, mut conflicts) = (Tree::default(), serde_json::Map::new(), Vec::new());
                     for (lane_name, manifest) in named {
                         if !lanes.contains_key(manifest) {
-                            let lane = self.lane(manifest, upstream, read, &mut objects)?;
+                            let lane = self.lane(&name, manifest, upstream, read, &mut objects)?;
                             lanes.insert(manifest.clone(), lane);
                         }
                         let lane = &lanes[manifest];
@@ -329,7 +364,7 @@ impl<'t> Migrator<'t> {
                 (None, Some(c)) if tree_at(c)? => c.clone(),
                 (None, Some(c)) => {
                     if !lanes.contains_key(c) {
-                        let lane = self.lane(c, upstream, read, &mut objects)?;
+                        let lane = self.lane(&name, c, upstream, read, &mut objects)?;
                         lanes.insert(c.clone(), lane);
                     }
                     let lane = &lanes[c];
@@ -376,9 +411,9 @@ impl<'t> Migrator<'t> {
 
     /// One old lane: its header in D10 (old tensors, filled run data, configs, assets) and its
     /// repo files; every lane file is checked to have landed in one of them.
-    fn lane(&mut self, manifest: &ObjectRef, upstream: Option<&Upstream>, read: Read, objects: &mut Objects) -> Result<Lane> {
+    fn lane(&mut self, model: &str, manifest: &ObjectRef, upstream: Option<&Upstream>, read: Read, objects: &mut Objects) -> Result<Lane> {
         let raw = read(manifest)?;
-        let (chunks, tensors, mut metadata, mut bytes, v1_report) = match v1::manifest(&raw)? {
+        let (chunks, mut tensors, mut metadata, mut bytes, v1_report) = match v1::manifest(&raw)? {
             Some(m) => {
                 let v = v1::lane(&m, &read(&m.header)?)?;
                 let mut bytes = BTreeMap::new();
@@ -426,8 +461,29 @@ impl<'t> Migrator<'t> {
                 }
             }
         }
+        let adapters = peft(&mut tensors);
         let tensored: Vec<String> = tensors.iter().map(|(name, _)| name.clone()).collect();
-        let l = layout(bytes.clone(), &tensored, &Default::default())?;
+        let reference = match upstream {
+            Some(u) => self.reference(u.from)?,
+            None => Versions::new(),
+        };
+        let mut l = layout(bytes.clone(), &tensored, &reference)?;
+        let mut classed = Vec::new();
+        for f in &mut l.components {
+            if let Some(modules) = adapters.get(&f.name) {
+                let base = LORA_BASES.iter().find(|(m, _)| m.iter().any(|p| matches(p, model))).map(|(_, b)| *b);
+                let alpha = LORA_ALPHA.iter().find(|(p, _)| matches(p, model)).map(|(_, a)| [("lora_alpha".to_owned(), json!(a))].into_iter().collect::<Config>());
+                f.config = lora::adapter_config(modules.iter().cloned(), &BTreeMap::new(), alpha.as_ref(), base);
+                f.config_file = Some(lora::ADAPTER_CONFIG.into());
+            } else if let Some((_, _, [library, version, class])) = (CLASSES.iter())
+                .find(|(m, c, _)| *c == f.name && m.iter().any(|p| matches(p, model)))
+                .filter(|_| f.class.is_unknown())
+            {
+                let version = Some(version.to_string()).filter(|v| !v.is_empty()).or_else(|| reference.get(*library).cloned());
+                f.class = ClassRef::new(library, &version.unwrap_or_default(), class);
+                classed.push(f.name.clone());
+            }
+        }
         let mut keep = |b: Vec<u8>| add(objects, b);
         let components = (l.components.into_iter())
             .map(|f| Component {
@@ -472,6 +528,12 @@ impl<'t> Migrator<'t> {
         if !unwrapped.is_empty() {
             report["unwrapped"] = json!(unwrapped);
         }
+        if !adapters.is_empty() {
+            report["lora"] = json!(adapters.keys().collect::<Vec<_>>());
+        }
+        if !classed.is_empty() {
+            report["classed"] = json!(classed);
+        }
         if let Some(v1) = v1_report {
             report["from_v1"] = v1;
         }
@@ -487,6 +549,33 @@ impl<'t> Migrator<'t> {
         let listing = remote::list(&remote::parse(source)?, &self.access)?;
         self.listings.insert(source.to_owned(), listing.members);
         Ok(())
+    }
+
+    /// The library versions the pinned upstream `from` records (its `model_index.json`, then its
+    /// configs by path): a class's version where the lane's own configs record none.
+    fn reference(&mut self, from: &str) -> Result<Versions> {
+        let mut out = Versions::new();
+        if !from.starts_with("hf://") {
+            return Ok(out);
+        }
+        self.verify(from)?;
+        let mut paths: Vec<String> = (self.listings[from].iter())
+            .map(|m| m.path.clone())
+            .filter(|p| p == "model_index.json" || p.rsplit('/').next() == Some("config.json") && p.matches('/').count() <= 1)
+            .collect();
+        paths.sort_by_key(|p| (p != "model_index.json", p.clone()));
+        for path in paths {
+            for (_, bytes) in self.upstream(from, &path)? {
+                let Ok(Json::Object(doc)) = serde_json::from_slice::<Json>(&bytes) else { continue };
+                for (key, value) in doc {
+                    let library = key.strip_suffix("_version").map(|l| l.trim_start_matches('_').to_owned());
+                    if let (Some(library), Some(version)) = (library.filter(|l| !l.is_empty()), value.as_str()) {
+                        out.entry(library).or_insert_with(|| version.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The files under `entry` at the pinned upstream `from`, by path.
@@ -607,6 +696,16 @@ fn d10_encoding(component: &str, mut t: Tensor) -> Result<Tensor> {
     for (scheme, key, from, to) in RENAMED {
         if encoding.scheme == scheme && encoding.params.get(key).and_then(Value::as_str) == Some(from) {
             encoding.params.insert(key.into(), Value::Str(to.into()));
+        }
+    }
+    // A row's scales are `*.rowwise`, a column's `*.columnwise`: `axis` goes (owner, 2026-10-20).
+    for (rowwise, columnwise) in [("fp8.rowwise", "fp8.columnwise"), ("int8.rowwise", "int8.columnwise")] {
+        if encoding.scheme == rowwise {
+            match encoding.params.remove("axis").map(|a| a.as_u64()) {
+                None | Some(Some(0)) => {}
+                Some(Some(1)) => encoding.scheme = columnwise.into(),
+                Some(axis) => return fail(Kind::Invalid, format!("{what}: {rowwise} axis {axis:?}")),
+            }
         }
     }
     for (param, role) in DTYPE_PARAMS {
