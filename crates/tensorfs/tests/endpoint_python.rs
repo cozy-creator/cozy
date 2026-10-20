@@ -23,6 +23,11 @@ async fn public_python_api_uses_an_ordinary_owner_credential() {
         required("TENSORHUB_LOG"),
         required("TENSORFS_TEST_PYTHON"),
     );
+    let anonymous_endpoint = required("TENSORHUB_ORIGIN");
+    assert!(
+        anonymous_endpoint.starts_with("https://"),
+        "the anonymous endpoint/CA proof requires the fixture's TLS origin"
+    );
     let native_source = required("TENSORFS_TEST_NATIVE_SOURCE_SHA");
     let native_sha256 = required("TENSORFS_TEST_NATIVE_SHA256");
     assert!(
@@ -73,7 +78,8 @@ async fn public_python_api_uses_an_ordinary_owner_credential() {
         .unwrap();
     let scratch = std::env::temp_dir().join(format!("tfs-python-api-{nonce}"));
     let request = json!({
-        "endpoint": reach, "ca": ca, "model": format!("{account}/model"),
+        "endpoint": reach, "anonymous_endpoint": anonymous_endpoint,
+        "ca": ca, "model": format!("{account}/model"),
         "rival_model": format!("{rival_account}/model"), "runtime_model": format!("{account}/runtime"),
         "token": bearer.token, "rival_token": rival_bearer.token, "cache_dir": scratch,
         "creator_source": Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
