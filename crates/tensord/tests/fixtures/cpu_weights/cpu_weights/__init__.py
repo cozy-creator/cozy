@@ -46,7 +46,7 @@ async def convert(
     ctx: Context, payload: TableInput, tel: Telemetry, *, source: Weights[Any]
 ) -> ModelArtifact:
     """The same CPU Writer behind the CLI's existing source/destination conversion syntax."""
-    values = ctx.tensorfs_source(source).components["model"].tensors.read_all()
+    values = ctx.tensorfs_source(source).components["model"].tensors.read()
     assert values["seed"].tobytes() == bytes(4)
     if payload.count:
         # A bounded test observation: a code-less upload must not execute this function again.
