@@ -21,6 +21,10 @@ rec() {
 
 section() { echo; echo "# $1" >> "$T"; echo "##### $1"; }
 
+if [ -n "${DEV_BINARY:-}" ]; then
+  section "Dev build $("$DEV_BINARY" --version)"
+  mkdir -p "$(dirname "$cozy")" && cp "$DEV_BINARY" "$cozy"
+elif true; then
 section "Fresh install, public path"
 if [ $win = 1 ]; then
   rec install 600 $PS -NoProfile -ExecutionPolicy Bypass -c "irm https://tensorhub.com/install.ps1 | iex; 'this session finds: ' + (Get-Command cozy -ErrorAction SilentlyContinue).Source"
@@ -31,6 +35,7 @@ else
   rec "login sh finds cozy" 30 env -i HOME="$HOME" PATH=/usr/bin:/bin sh -lc 'command -v cozy'
   rec "login bash finds cozy" 30 env -i HOME="$HOME" PATH=/usr/bin:/bin bash -lc 'command -v cozy'
   command -v zsh > /dev/null && rec "interactive zsh finds cozy" 30 env -i HOME="$HOME" PATH=/usr/bin:/bin zsh -ic 'command -v cozy'
+fi
 fi
 if [ ! -x "$cozy" ]; then echo "no cozy installed" >> "$T"; exit 0; fi
 
@@ -96,6 +101,7 @@ else
   rec "login shell after" 30 env -i HOME="$HOME" PATH=/usr/bin:/bin sh -lc 'command -v cozy || echo gone'
 fi
 
+[ -n "${DEV_BINARY:-}" ] && exit 0
 section "Upgrade from v0.10.0"
 old=https://github.com/cozy-creator/cozy-creator/releases/download/v0.10.0
 if [ $win = 1 ]; then

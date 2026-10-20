@@ -32,6 +32,29 @@ jobs:
         with:
           name: transcript-${{ matrix.os }}
           path: transcript.md
+  master:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p cozy
+      - run: |
+          exe=; [ "$RUNNER_OS" != Windows ] || exe=.exe
+          cp "target/release/cozy$exe" "$RUNNER_TEMP/cozy$exe"
+          DEV_BINARY="$RUNNER_TEMP/cozy$exe" bash .github/consumer-probe.sh ${{ matrix.os }}
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: master-${{ matrix.os }}
+          path: transcript.md
   distros:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
