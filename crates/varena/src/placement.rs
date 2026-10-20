@@ -1711,9 +1711,9 @@ impl Placement {
                         };
                         drop(operation);
                         let freed = shrink(bytes)?;
-                        let state = {
+                        {
                             let mut inner = self.inner.lock();
-                            inner.caches.get_mut(&page).map(|cache| {
+                            let state = inner.caches.get_mut(&page).map(|cache| {
                                 cache.blocked = freed == 0;
                                 (
                                     cache
@@ -1722,21 +1722,16 @@ impl Placement {
                                         .saturating_add(u32::from(cache.busy)),
                                     cache.resized,
                                 )
-                            })
-                        };
-                        if let Some(page) = self
-                            .inner
-                            .lock()
-                            .table
-                            .pages
-                            .iter_mut()
-                            .find(|row| row.id == page)
-                        {
-                            let (pins, resized) = state.unwrap_or((0, false));
-                            if !resized {
-                                page.bytes = page.bytes.saturating_sub(freed);
+                            });
+                            if let Some(page) =
+                                inner.table.pages.iter_mut().find(|row| row.id == page)
+                            {
+                                let (pins, resized) = state.unwrap_or((0, false));
+                                if !resized {
+                                    page.bytes = page.bytes.saturating_sub(freed);
+                                }
+                                page.pins = pins;
                             }
-                            page.pins = pins;
                         }
                         drop(callback);
                         continue 'decide;
