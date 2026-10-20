@@ -618,7 +618,7 @@ class Memory:
             ws = self.core.adopt(self._name(grant.key), grant.ck, grant.host_fd, files)
             self._share(ws, grant)
             self.adopted[grant.key] = ws
-            room = self._free() if self.cuda else 0
+            room = self._free() - self._headroom() if self.cuda else 0
             for region, span in enumerate(ws.spans):
                 if span > room:
                     break
@@ -665,10 +665,9 @@ class Memory:
             raise Unbound(f"{type(module).__name__}: no weights attached (`Declared.weights`)")
         paths, regions = blocks_of(module), regions_of(module)
         files, host_fd = list(grant.files) or None, grant.host_fd
+        # a fill's model keeps its early copies: they stay fresh until bound, and its pages are
+        # never kept (`Model.kept`), so none it adopted was baked elsewhere
         ws = self.adopted.pop(grant.key, None)
-        if self.cuda and declared.fill is not None and ws is not None:
-            ws.close()
-            ws = None
         if ws is None and host_fd is not None:
             ws = self.core.adopt(self._name(grant.key), grant.ck, host_fd, files)
             if declared.fill is None:
@@ -788,7 +787,9 @@ class Memory:
             held = held and room - model.reserve >= whole
             loose = not held and room - need >= 2 * max(sizes) if need is not None else False
             if need is not None and (need <= model.reserve or loose):
-                shape.whole_only |= need <= model.reserve  # type: ignore[union-attr]
+                # only an FFN cut that measured no lower than whole rules out planning's
+                ruled_out = need <= model.reserve and cuts.ffn_only(shape)
+                shape.whole_only |= ruled_out  # type: ignore[union-attr]
                 cuts.coarser(shape)  # type: ignore[arg-type]
                 model.reserve = need
             room -= model.reserve
@@ -1484,6 +1485,21 @@ class Memory:
         self._publish()
         self._freed()
 
+    def _headroom(self) -> int:
+        """What a load leaves free for the requests after it, since its copies are prefetches
+        that run beside them: the widest peak measured on this GPU (this process's models', or
+        any request's the ledger recorded), and the context a process here has yet to grow
+        (kernel modules, library workspaces, NCCL's buffers, which the driver allocates where
+        no rung reaches): the largest any process here reached, less this one's. Without it a
+        restart's first request found the device full and failed in the driver (D9)."""
+        peak = max((max(m.reserve, m.peak) for m in self.models.values()), default=0)
+        if self.row is None:
+            return peak
+        table = self.row[0]
+        self._outside()
+        grown = max((f.context for f in table.snapshot()), default=0) - self.context
+        return max([peak, *(p for _, p in table.peaks())]) + max(grown, 0)
+
     def _restore(self) -> None:
         """At an explicit load: the watermarks rise. Warm models refill most worth keeping
         first, into free room and then cold pages of this process's models worth less with no
@@ -1493,7 +1509,7 @@ class Memory:
         slots = max(
             (_SLOTS * max(_sizes(m), default=0) for m in models if m.repeats < 2), default=0
         )
-        room = self._free() - max((max(m.reserve, 0) for m in models), default=0) - slots
+        room = self._free() - self._headroom() - slots
         ranked = sorted(models, key=self._keep, reverse=True)
         for i, model in enumerate(ranked):
             if model.level is not Level.GPU:
