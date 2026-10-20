@@ -1081,8 +1081,8 @@ impl Ledger {
         let retained_after = state.retained_bytes();
         drop(state);
         drop(removed); // actually unmap/free this region outside the table lock
-                       // These are charged cache spans, not process RSS. Reader leases and
-                       // in-flight fills were excluded by idle() before choosing this region.
+        // These are charged cache spans, not process RSS. Reader leases and
+        // in-flight fills were excluded by idle() before choosing this region.
         tracing::info!(target: "varena::host", region = index, ready_bytes,
             retained_before, retained_after, eligibility = "unleased_not_filling",
             "released idle RAM cache region");

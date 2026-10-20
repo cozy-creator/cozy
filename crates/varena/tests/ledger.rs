@@ -3,6 +3,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -48,9 +49,6 @@ struct ChildRow {
 }
 impl ChildRow {
     fn spawn(ledger: &Ledger) -> Self {
-        Self::spawn_with_pid(ledger, None)
-    }
-    fn spawn_with_pid(ledger: &Ledger, reported_pid: Option<u32>) -> Self {
         // grant authenticates the row's PID after exec; the PID is not known before spawn.
         let (ours, theirs) = UnixStream::pair().unwrap();
         let inherited = theirs.as_raw_fd();
@@ -76,10 +74,6 @@ impl ChildRow {
                 }
                 Ok(())
             });
-        }
-        cmd.env_remove("VARENA_TEST_REPORTED_PID");
-        if let Some(pid) = reported_pid {
-            cmd.env("VARENA_TEST_REPORTED_PID", pid.to_string());
         }
         let mut process = cmd.spawn().unwrap();
         drop(theirs);
@@ -152,13 +146,8 @@ fn child() {
     let events = platform::handles::recv_fd(&control).unwrap();
     let channel = Channel::new(platform::handles::recv_fd(&control).unwrap());
     let ledger = Ledger::adopt(table.as_fd(), events.as_fd()).unwrap();
-    let pid = std::env::var("VARENA_TEST_REPORTED_PID")
-        .map(|value| value.parse().unwrap())
-        .unwrap_or_else(|_| std::process::id());
-    let row = ledger.claim(pid).unwrap();
-    if pid == std::process::id() {
-        channel.bind(row.owner()).unwrap();
-    }
+    let row = ledger.claim(std::process::id()).unwrap();
+    channel.bind(row.owner()).unwrap();
     println!("@{} {}", row.owner().row, row.owner().generation);
     let mut containers = Vec::new();
     for command in std::io::stdin().lock().lines().map(Result::unwrap) {
@@ -380,13 +369,20 @@ fn admission_collects_an_unknown_owner_that_dies_after_restart() {
 fn live_kernel_claims_survive_restart_and_pid_reuse_even_with_nonexistent_pid_metadata() {
     let fixture = Fixture::new();
     let pid = u32::MAX;
-    let mut old = ChildRow::spawn_with_pid(&fixture.ledger, Some(pid));
+    let mut old = ChildRow::spawn(&fixture.ledger);
     old.kill();
-    fixture.ledger.reap(pid).unwrap();
-    let mut live = ChildRow::spawn_with_pid(&fixture.ledger, Some(pid));
+    fixture.ledger.reap(old.process.id()).unwrap();
+    let mut live = ChildRow::spawn(&fixture.ledger);
     assert_eq!(live.owner.row, old.owner.row);
     assert!(live.owner.generation > old.owner.generation);
     live.call("publish 300");
+    // Change only this uniquely named fixture's PID hint, after its child has
+    // claimed normally. The checked Slot ABI keeps pid at header64 + row576 +8.
+    // The live child's independent OFD must win over misleading PID metadata.
+    let table = std::fs::File::from(fixture.ledger.fd().try_clone_to_owned().unwrap());
+    table
+        .write_all_at(&pid.to_ne_bytes(), 64 + u64::from(live.owner.row) * 576 + 8)
+        .unwrap();
     fixture.ledger.record_peak("package", "shape", 800).unwrap();
     let restarted = Ledger::create(&fixture.name, CAPACITY).unwrap();
     assert_eq!(restarted.status().unwrap().rows[0].state, State::Live);
