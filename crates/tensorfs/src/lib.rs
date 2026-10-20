@@ -43,7 +43,7 @@ mod session;
 #[cfg(feature = "store")]
 pub use session::{
     bearer, Checkpoint, Client, Component, ComponentWriter, Config, Convert, ConvertProgress,
-    Download, Endpoint, Fetched, Format, HeaderMap, Open, Progress, Ref, Request, Selection,
+    Download, Endpoint, Fetched, Format, HeaderMap, Open, Progress, Read, Ref, Request, Selection,
     TokenProvider, Writer, WriterOptions,
 };
 

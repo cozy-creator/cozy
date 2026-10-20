@@ -437,6 +437,16 @@ impl Checkpoint {
     }
 }
 
+/// A tensor as stored: a plain tensor's data, or an encoded tensor's parts by role.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Read {
+    Plain(Vec<u8>),
+    Encoded {
+        encoding: format::Encoding,
+        parts: BTreeMap<String, Vec<u8>>,
+    },
+}
+
 #[derive(Clone)]
 pub struct Component {
     data: Arc<Data>,
@@ -480,44 +490,44 @@ impl Component {
         &self.metadata().assets
     }
 
-    /// Payload bytes must first be made available by async Checkpoint::fetch.
-    pub fn read(&self, key: &str) -> Result<Vec<u8>> {
+    /// A tensor's stored bytes, as Python's `read(decode=False)`: a plain tensor's data, or an
+    /// encoded tensor's parts by role with its encoding. Download the payload first.
+    pub fn read(&self, key: &str) -> Result<Read> {
         let tensor = self.data.raw.tensor(&self.name, key)?;
-        match &tensor.body {
-            Body::Data(at) => {
-                let mut bytes = vec![0; at.length as usize];
-                self.read_part_into(key, "", 0, &mut bytes)?;
-                Ok(bytes)
-            }
-            Body::Encoded { encoding, parts } => {
-                let mut buffers = Vec::with_capacity(parts.len());
-                for part in parts {
-                    let mut bytes = vec![0; part.at().length as usize];
-                    self.read_part_into(key, &part.role, 0, &mut bytes)?;
-                    buffers.push(bytes);
-                }
-                let views = parts
+        let part = |role: &str, length: u64| {
+            let mut bytes = vec![0; length as usize];
+            self.read_part_into(key, role, 0, &mut bytes).map(|()| bytes)
+        };
+        Ok(match &tensor.body {
+            Body::Data(at) => Read::Plain(part("", at.length)?),
+            Body::Encoded { encoding, parts } => Read::Encoded {
+                encoding: encoding.clone(),
+                parts: parts
                     .iter()
-                    .zip(&buffers)
-                    .map(|(part, bytes)| {
-                        (
-                            part.role.as_str(),
-                            PartBytes {
-                                dtype: &part.dtype,
-                                shape: &part.shape,
-                                bytes,
-                            },
-                        )
-                    })
-                    .collect();
-                Ok(format::decode(
-                    &tensor.dtype,
-                    &tensor.shape,
-                    encoding,
-                    &views,
-                )?)
-            }
-        }
+                    .map(|p| Ok((p.role.clone(), part(&p.role, p.at().length)?)))
+                    .collect::<Result<_>>()?,
+            },
+        })
+    }
+
+    /// A tensor's logical bytes in its dtype, as Python's `read(decode=True)`: an encoded
+    /// tensor goes through its scheme's reference decode.
+    pub fn read_decoded(&self, key: &str) -> Result<Vec<u8>> {
+        let tensor = self.data.raw.tensor(&self.name, key)?;
+        let (encoding, parts) = match (self.read(key)?, &tensor.body) {
+            (Read::Plain(bytes), _) => return Ok(bytes),
+            (Read::Encoded { encoding, parts }, Body::Encoded { parts: stored, .. }) => (encoding, (parts, stored)),
+            _ => unreachable!("a read follows the tensor's body"),
+        };
+        let (bytes, stored) = parts;
+        let views = stored
+            .iter()
+            .map(|p| {
+                let view = PartBytes { dtype: &p.dtype, shape: &p.shape, bytes: &bytes[&p.role] };
+                (p.role.as_str(), view)
+            })
+            .collect();
+        Ok(format::decode(&tensor.dtype, &tensor.shape, &encoding, &views)?)
     }
 
     /// This safe borrow is held until the existing synchronous engine returns.

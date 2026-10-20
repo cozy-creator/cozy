@@ -98,7 +98,7 @@ fn native_handle_reader_child() {
             checkpoint
                 .component("model")
                 .unwrap()
-                .read("value")
+                .read_decoded("value")
                 .unwrap(),
             DATA
         );

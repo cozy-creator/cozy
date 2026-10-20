@@ -35,7 +35,7 @@ checkpoint.download(&Download {
 }).await?;
 
 let unet = checkpoint.component("unet")?;
-let bytes = unet.read("conv_in.weight")?;
+let bytes = unet.read_decoded("conv_in.weight")?;
 println!("{} bytes", bytes.len());
 ```
 
@@ -200,7 +200,10 @@ shared chunk hashes that whole object. Other local I/O failures remain
 typed errors rather than being classified as corruption.
 
 A `Component` provides `name()`, `class()`, `config()`, `tensors()` and
-`assets()` metadata views. Its `read(key)` returns decoded `Vec<u8>`;
+`assets()` metadata views. Its `read(key)` returns the tensor as stored, as Python's
+`decode=False`: `Read::Plain(Vec<u8>)`, or `Read::Encoded { encoding, parts }` with each
+stored part's bytes by role. `read_decoded(key)` returns logical bytes in the tensor's dtype,
+as `decode=True`;
 `read_part_into(key, role, offset, &mut [u8])` fills a stored byte range;
 `asset(name)` returns `Vec<u8>`. These direct configuration, file and tensor reads are the
 normal cozytensors integration path. `export_files(directory)` is only a convenience for

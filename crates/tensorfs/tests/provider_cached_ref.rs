@@ -225,7 +225,7 @@ async fn provider_network_error_cannot_become_cached_ref_success() {
     .unwrap()
     .unwrap();
     warm.download(&Download::default()).await.unwrap();
-    assert_eq!(warm.component("model").unwrap().read("w").unwrap(), WEIGHT);
+    assert_eq!(warm.component("model").unwrap().read_decoded("w").unwrap(), WEIGHT);
     assert_eq!(warm.tree(), Some(&tree));
     assert!(
         http.requests.load(Ordering::Acquire) > 0,

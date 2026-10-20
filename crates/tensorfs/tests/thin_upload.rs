@@ -66,7 +66,7 @@ async fn a_thin_folder_uploads_from_the_store_or_what_the_endpoint_holds() {
     let b = client(&dir.0.join("b"), &origin);
     let pulled = b.open("acme/thin@1", &Open { lazy: false, ..Default::default() }).await.unwrap();
     assert_eq!((pulled.id(), pulled.tree()), (saved.id(), Some(&tree)));
-    assert_eq!(pulled.component("model").unwrap().read("w").unwrap(), weight);
+    assert_eq!(pulled.component("model").unwrap().read_decoded("w").unwrap(), weight);
 
     // Store `c` holds none of it; the endpoint does.
     let c = client(&dir.0.join("c"), &origin);

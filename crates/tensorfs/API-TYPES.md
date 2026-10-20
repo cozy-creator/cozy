@@ -132,7 +132,9 @@ impl Component {
     pub fn config(&self) -> &format::Config;
     pub fn tensors(&self) -> &[format::Tensor];
     pub fn assets(&self) -> &BTreeMap<String, ObjectRef>;
-    pub fn read(&self, key: &str) -> Result<Vec<u8>>;
+    // Stored bytes (Python's decode=False); read_decoded is decode=True.
+    pub fn read(&self, key: &str) -> Result<Read>;
+    pub fn read_decoded(&self, key: &str) -> Result<Vec<u8>>;
     pub fn read_part_into(&self, key: &str, role: &str, offset: u64, buf: &mut [u8]) -> Result<()>;
     pub fn asset(&self, name: &str) -> Result<Vec<u8>>;
     pub fn export_files(&self, directory: &Path) -> Result<PathBuf>;
