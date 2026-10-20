@@ -150,9 +150,31 @@ fn child() {
     channel.bind(row.owner()).unwrap();
     println!("@{} {}", row.owner().row, row.owner().generation);
     let mut containers = Vec::new();
+    let mut host_leases: Vec<std::sync::Arc<varena::ledger::HostReservation>> = Vec::new();
     for command in std::io::stdin().lock().lines().map(Result::unwrap) {
         let args: Vec<_> = command.split_whitespace().collect();
         match args[0] {
+            "host_reserve" => {
+                let bytes = args[1].parse().unwrap();
+                let lease = channel.reserve_host(row.owner(), bytes).unwrap();
+                let accepted = lease.is_some();
+                if let Some(lease) = lease {
+                    host_leases.push(lease);
+                }
+                println!("@{accepted}");
+            }
+            "host_commit" => {
+                host_leases.last().unwrap().commit().unwrap();
+                println!("@ok");
+            }
+            "host_alias" => {
+                host_leases.push(host_leases.last().unwrap().clone());
+                println!("@ok");
+            }
+            "host_drop" => {
+                drop(host_leases.pop().unwrap());
+                println!("@ok");
+            }
             "publish" => {
                 let n = args[1].parse().unwrap();
                 row.publish(
@@ -904,6 +926,33 @@ fn pressure_reclaims_one_region_while_another_reader_stays_live_then_refills_the
         .unwrap();
     assert_eq!(&bytes, b"warm");
     drop(live);
+}
+
+#[test]
+fn mapped_host_leases_share_devices_survive_aliases_and_end_with_the_process() {
+    let host = std::sync::Arc::new(varena::ledger::HostCache::default());
+    let first = Fixture::with_host(host.clone());
+    let second = Fixture::with_host(host);
+    let mut a = ChildRow::spawn(&first.ledger);
+    let mut b = ChildRow::spawn(&second.ledger);
+    assert_eq!(a.call("host_reserve 4096"), "true");
+    assert_eq!(first.ledger.status().unwrap().private_host_bytes, 4096);
+    assert_eq!(second.ledger.status().unwrap().private_host_bytes, 4096);
+    assert_eq!(b.call(&format!("host_reserve {}", u64::MAX)), "false");
+    assert_eq!(first.ledger.status().unwrap().private_host_bytes, 4096);
+    assert_eq!(a.call("host_commit"), "ok");
+    assert_eq!(a.call("host_alias"), "ok");
+    assert_eq!(a.call("host_drop"), "ok");
+    assert_eq!(first.ledger.status().unwrap().private_host_bytes, 4096);
+    a.kill();
+    assert_eq!(first.ledger.status().unwrap().private_host_bytes, 0);
+    // A declined admission used a private channel, so the same live owner can
+    // still reserve/release and use its ordinary custody channel afterward.
+    assert_eq!(b.call("host_reserve 4096"), "true");
+    assert_eq!(b.call("host_commit"), "ok");
+    assert_eq!(b.call("host_drop"), "ok");
+    assert_eq!(second.ledger.status().unwrap().private_host_bytes, 0);
+    assert_eq!(b.call("capacity"), CAPACITY.to_string());
 }
 
 #[test]
