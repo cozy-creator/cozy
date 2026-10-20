@@ -40,8 +40,9 @@ cozy run fidika/sdxl/generate prompt='a lighthouse at dusk' seed=7
 ```
 
 The first run installs the package and downloads its model; outputs land in `~/.cozy/outputs`.
-Without an NVIDIA GPU a run says so and uses the CPU, slowly. Packages are built for Linux, so on
-macOS and Windows rent instead.
+Without an NVIDIA GPU a run says so and uses the CPU, slowly. Published packages are built for
+Linux, so on macOS and Windows rent them; your own scripts (`cozy run ./script.py`) run here on any
+of them.
 
 ## Rent a GPU
 
