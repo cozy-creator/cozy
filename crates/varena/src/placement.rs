@@ -89,6 +89,7 @@ struct Cache {
     shrink: Arc<Shrink>,
     active: u32,
     blocked: bool,
+    busy: bool,
 }
 
 struct Inner {
@@ -400,6 +401,7 @@ impl Placement {
             starved: false,
             sharing_limit: None,
             resident_steps: BTreeSet::new(),
+            joint_steps: BTreeSet::new(),
             can_cut: true,
             can_lower: true,
             reclaim_round: 0,
@@ -495,6 +497,12 @@ impl Placement {
             .iter()
             .enumerate()
             .filter(|(_, (_, passes))| *passes >= 2)
+            .map(|(step, _)| step as u32)
+            .collect();
+        facts.joint_steps = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, (models, _))| models.len() > 1)
             .map(|(step, _)| step as u32)
             .collect();
         facts.position = Position { step: 0, order: 0 };
@@ -706,31 +714,7 @@ impl Placement {
         self.event(request, page, "bind", "demand")?;
         {
             let mut inner = self.inner.lock();
-            let current = inner
-                .table
-                .request(request)
-                .ok_or_else(|| invalid("unknown request"))?
-                .position;
-            let next = inner.table.page(page).and_then(|page| {
-                page.uses
-                    .iter()
-                    .filter(|usage| usage.request == request && usage.position >= current)
-                    .map(|usage| usage.position)
-                    .min()
-            });
-            if let Some(next) = next {
-                if let Some(facts) = inner
-                    .table
-                    .requests
-                    .iter_mut()
-                    .find(|row| row.id == request)
-                {
-                    facts.position = Position {
-                        step: next.step,
-                        order: next.order.saturating_add(1),
-                    };
-                }
-            }
+            inner.table.bound(request, page);
             inner.progress = inner.progress.saturating_add(1);
         }
         self.refresh()?;
@@ -950,6 +934,7 @@ impl Placement {
                 shrink,
                 active: 0,
                 blocked: false,
+                busy: false,
             },
         );
         inner.table.pages.push(plan::Page {
@@ -980,7 +965,7 @@ impl Placement {
             .get_mut(&id)
             .ok_or_else(|| invalid("unknown cache"))?;
         cache.blocked = false;
-        let pins = cache.active;
+        let pins = cache.active.saturating_add(u32::from(cache.busy));
         let page = inner
             .table
             .pages
@@ -1009,7 +994,10 @@ impl Placement {
         } else {
             cache.active.saturating_sub(1)
         };
-        let pins = cache.active.saturating_add(u32::from(cache.blocked));
+        let pins = cache
+            .active
+            .saturating_add(u32::from(cache.blocked))
+            .saturating_add(u32::from(cache.busy));
         let page = inner
             .table
             .pages
@@ -1344,6 +1332,22 @@ impl Placement {
                             .table
                             .page(page)
                             .map_or(0, |row| row.bytes);
+                        if let Some(row) = self
+                            .inner
+                            .lock()
+                            .table
+                            .pages
+                            .iter_mut()
+                            .find(|row| row.id == page)
+                        {
+                            row.pins = 1;
+                        }
+                        let mut callback = Callback {
+                            owner: self,
+                            page,
+                            keep_pin: false,
+                        };
+                        drop(operation);
                         let freed = trim(bytes)?;
                         if let Some(row) = self
                             .inner
@@ -1354,29 +1358,43 @@ impl Placement {
                             .find(|row| row.id == page)
                         {
                             row.bytes = row.bytes.saturating_sub(freed);
-                            if freed == 0 {
-                                row.pins = 1;
-                            }
                         }
-                        if freed < bytes {
-                            drop(operation);
-                            continue 'decide;
-                        }
+                        callback.keep_pin = freed == 0;
+                        drop(callback);
+                        continue 'decide;
                     }
                     Action::Shrink { page, bytes } => {
-                        let shrink = self
-                            .inner
-                            .lock()
-                            .caches
-                            .get(&page)
-                            .map(|cache| cache.shrink.clone())
-                            .ok_or_else(|| invalid("cache callback absent"))?;
+                        let shrink = {
+                            let mut inner = self.inner.lock();
+                            let cache = inner
+                                .caches
+                                .get_mut(&page)
+                                .ok_or_else(|| invalid("cache callback absent"))?;
+                            cache.busy = true;
+                            let shrink = cache.shrink.clone();
+                            let pins = cache.active.saturating_add(1);
+                            if let Some(row) =
+                                inner.table.pages.iter_mut().find(|row| row.id == page)
+                            {
+                                row.pins = pins;
+                            }
+                            shrink
+                        };
+                        let callback = Callback {
+                            owner: self,
+                            page,
+                            keep_pin: false,
+                        };
+                        drop(operation);
                         let freed = shrink(bytes)?;
                         let pins = {
                             let mut inner = self.inner.lock();
                             inner.caches.get_mut(&page).map(|cache| {
                                 cache.blocked = freed == 0;
-                                cache.active.saturating_add(u32::from(cache.blocked))
+                                cache
+                                    .active
+                                    .saturating_add(u32::from(cache.blocked))
+                                    .saturating_add(u32::from(cache.busy))
                             })
                         };
                         if let Some(page) = self
@@ -1390,7 +1408,7 @@ impl Placement {
                             page.bytes = page.bytes.saturating_sub(freed);
                             page.pins = pins.unwrap_or(0);
                         }
-                        drop(operation);
+                        drop(callback);
                         continue 'decide;
                     }
                     Action::Starve(step) => {
@@ -1641,6 +1659,33 @@ struct Registration<'a> {
 struct Filling<'a> {
     owner: &'a Placement,
     page: PageId,
+}
+
+struct Callback<'a> {
+    owner: &'a Placement,
+    page: PageId,
+    keep_pin: bool,
+}
+impl Drop for Callback<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.owner.inner.lock();
+        let pins = if let Some(cache) = inner.caches.get_mut(&self.page) {
+            cache.busy = false;
+            cache.active.saturating_add(u32::from(cache.blocked))
+        } else {
+            u32::from(self.keep_pin)
+        };
+        if let Some(page) = inner
+            .table
+            .pages
+            .iter_mut()
+            .find(|page| page.id == self.page)
+        {
+            page.pins = pins;
+        }
+        drop(inner);
+        let _ = self.owner.row.wake();
+    }
 }
 impl Drop for Filling<'_> {
     fn drop(&mut self) {
