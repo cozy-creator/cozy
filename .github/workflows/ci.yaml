@@ -22,9 +22,9 @@ jobs:
     with:
       ref: ${{ github.sha }}
       build: tensorfs
-      # Until Runtime 0.30.0 (tensorfs 0.12) is on PyPI, the newest published Runtime cannot pair with
-      # this TensorFS: tests build the Runtime of the xs-045 tree.
-      runtime_ref: 4a63e5b1fba951ebe287621ce9674f014a19ff0c
+      # Until Runtime0.30.0 is on PyPI, build the exact current-cohort source whose dependency
+      # range accepts this TensorFS0.12 wheel. The public Runtime relock remains a separate gate.
+      runtime_ref: 48820f82761d22804cb6afe5f2375bfa945b3e95
       # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below.
       test: cargo test --workspace --locked --no-fail-fast --exclude cozy --exclude calcifer
 
@@ -33,8 +33,7 @@ jobs:
     uses: ./.github/workflows/owner-day.yml
     secrets: inherit
     with:
-      # cozy master is TensorFS v2: its gate runs against the v2 Hub, tensorhub #1202's head. This line
-      # goes when #1202 lands on tensorhub master.
-      tensorhub_ref: b8e24df5a8e309708c1bf550fe1c4cd3fe9d5b06
+      # U11 current-release Hub and rehearsal harness; switch to master after this source lands.
+      tensorhub_ref: 7654cba98f6f594014fc4bcedc4776d7773e279b
       # The tests' Runtime and TensorFS pair; this line goes when Runtime 0.30.0 and tensorfs 0.12 are on PyPI.
-      runtime_ref: 4a63e5b1fba951ebe287621ce9674f014a19ff0c
+      runtime_ref: 48820f82761d22804cb6afe5f2375bfa945b3e95

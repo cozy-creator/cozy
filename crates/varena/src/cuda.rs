@@ -33,6 +33,9 @@ pub const MEMHOSTREGISTER_READ_ONLY: c_uint = 0x8;
 pub const MEMHOSTALLOC_PORTABLE: c_uint = 0x1;
 
 pub const ATTR_VMM_SUPPORTED: c_int = 102;
+pub const ATTR_PCI_BUS_ID: c_int = 33;
+pub const ATTR_PCI_DEVICE_ID: c_int = 34;
+pub const ATTR_PCI_DOMAIN_ID: c_int = 50;
 pub const ATTR_POSIX_FD_SUPPORTED: c_int = 103;
 
 pub const MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
@@ -70,19 +73,12 @@ pub struct AllocationProp {
 }
 
 impl AllocationProp {
-    /// Pinned device memory on `device`, POSIX-fd exportable when the device supports it.
-    pub fn device(device: CUdevice, exportable: bool) -> Self {
+    /// Pinned device memory on `device`; `handles`: another process may hold it by a POSIX fd.
+    pub fn device(device: CUdevice, handles: u32) -> Self {
         AllocationProp {
             kind: MEM_ALLOCATION_TYPE_PINNED,
-            requested_handle_types: if exportable {
-                MEM_HANDLE_TYPE_POSIX_FD
-            } else {
-                MEM_HANDLE_TYPE_NONE
-            },
-            location: MemLocation {
-                kind: MEM_LOCATION_TYPE_DEVICE,
-                id: device,
-            },
+            requested_handle_types: handles,
+            location: MemLocation { kind: MEM_LOCATION_TYPE_DEVICE, id: device },
             win32_handle_meta_data: std::ptr::null_mut(),
             alloc_flags: AllocFlags::default(),
         }
@@ -109,14 +105,11 @@ pub struct Driver {
     pub primary_ctx_retain: unsafe extern "C" fn(*mut CUcontext, CUdevice) -> CUresult,
     pub ctx_get_current: F<*mut CUcontext>,
     pub ctx_set_current: F<CUcontext>,
-    pub ctx_synchronize: unsafe extern "C" fn() -> CUresult,
     pub mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult,
     pub stream_create: unsafe extern "C" fn(*mut CUstream, c_uint) -> CUresult,
     pub stream_destroy: F<CUstream>,
     pub stream_synchronize: F<CUstream>,
     pub stream_wait_event: unsafe extern "C" fn(CUstream, CUevent, c_uint) -> CUresult,
-    pub launch_host_func:
-        unsafe extern "C" fn(CUstream, unsafe extern "C" fn(*mut c_void), *mut c_void) -> CUresult,
     pub event_create: unsafe extern "C" fn(*mut CUevent, c_uint) -> CUresult,
     pub event_destroy: F<CUevent>,
     pub event_record: unsafe extern "C" fn(CUevent, CUstream) -> CUresult,
@@ -125,15 +118,12 @@ pub struct Driver {
     pub event_elapsed_time: unsafe extern "C" fn(*mut f32, CUevent, CUevent) -> CUresult,
     pub memcpy_htod_async:
         unsafe extern "C" fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult,
-    pub memcpy_dtoh_async:
-        unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize, CUstream) -> CUresult,
-    pub memcpy_dtod_async:
-        unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult,
-    pub memset_d8_async: unsafe extern "C" fn(CUdeviceptr, u8, usize, CUstream) -> CUresult,
     pub mem_host_register: unsafe extern "C" fn(*mut c_void, usize, c_uint) -> CUresult,
     pub mem_host_unregister: F<*mut c_void>,
     pub mem_host_alloc: unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> CUresult,
     pub mem_free_host: F<*mut c_void>,
+    pub mem_alloc: unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult,
+    pub mem_free: F<CUdeviceptr>,
     pub mem_get_allocation_granularity:
         unsafe extern "C" fn(*mut usize, *const AllocationProp, u32) -> CUresult,
     pub mem_address_reserve:
@@ -145,15 +135,8 @@ pub struct Driver {
     pub mem_unmap: unsafe extern "C" fn(CUdeviceptr, usize) -> CUresult,
     pub mem_set_access:
         unsafe extern "C" fn(CUdeviceptr, usize, *const AccessDesc, usize) -> CUresult,
-    /// The driver's own answer to "what is mapped here": the one call that reads residency
-    /// from the driver instead of the plane's books. Every success needs a `mem_release`.
-    pub mem_retain_allocation_handle: unsafe extern "C" fn(*mut Handle, *mut c_void) -> CUresult,
-    /// Device sharing (`Plane::export_device`/`attach_device`). Optional: a driver without
-    /// them still runs every other path.
-    pub mem_export_to_shareable_handle: Option<unsafe extern "C" fn(*mut c_void, Handle, u32, u64) -> CUresult>,
-    pub mem_import_from_shareable_handle: Option<unsafe extern "C" fn(*mut Handle, *mut c_void, u32) -> CUresult>,
-    pub mem_get_allocation_properties: Option<unsafe extern "C" fn(*mut AllocationProp, Handle) -> CUresult>,
-    pub mem_get_access: Option<unsafe extern "C" fn(*mut u64, *const MemLocation, CUdeviceptr) -> CUresult>,
+    pub mem_export: unsafe extern "C" fn(*mut c_void, Handle, u32, u64) -> CUresult,
+    pub mem_import: unsafe extern "C" fn(*mut Handle, *mut c_void, u32) -> CUresult,
 }
 
 // The table is immutable after load and the driver entry points are thread-safe.
@@ -183,13 +166,6 @@ macro_rules! load {
     };
 }
 
-macro_rules! optional {
-    ($lib:expr, $name:literal) => {
-        // SAFETY: as `load!`; an absent symbol is `None`.
-        unsafe { $lib.get::<_>($name) }.ok().map(|f| *f)
-    };
-}
-
 impl Driver {
     fn load() -> Result<Driver> {
         // SAFETY: dlopen of the NVIDIA driver library; no initializer of ours runs.
@@ -206,13 +182,11 @@ impl Driver {
             primary_ctx_retain: load!(lib, b"cuDevicePrimaryCtxRetain"),
             ctx_get_current: load!(lib, b"cuCtxGetCurrent"),
             ctx_set_current: load!(lib, b"cuCtxSetCurrent"),
-            ctx_synchronize: load!(lib, b"cuCtxSynchronize"),
             mem_get_info: load!(lib, b"cuMemGetInfo_v2"),
             stream_create: load!(lib, b"cuStreamCreate"),
             stream_destroy: load!(lib, b"cuStreamDestroy_v2"),
             stream_synchronize: load!(lib, b"cuStreamSynchronize"),
             stream_wait_event: load!(lib, b"cuStreamWaitEvent"),
-            launch_host_func: load!(lib, b"cuLaunchHostFunc"),
             event_create: load!(lib, b"cuEventCreate"),
             event_destroy: load!(lib, b"cuEventDestroy_v2"),
             event_record: load!(lib, b"cuEventRecord"),
@@ -220,13 +194,12 @@ impl Driver {
             event_synchronize: load!(lib, b"cuEventSynchronize"),
             event_elapsed_time: load!(lib, b"cuEventElapsedTime"),
             memcpy_htod_async: load!(lib, b"cuMemcpyHtoDAsync_v2"),
-            memcpy_dtoh_async: load!(lib, b"cuMemcpyDtoHAsync_v2"),
-            memcpy_dtod_async: load!(lib, b"cuMemcpyDtoDAsync_v2"),
-            memset_d8_async: load!(lib, b"cuMemsetD8Async"),
             mem_host_register: load!(lib, b"cuMemHostRegister_v2"),
             mem_host_unregister: load!(lib, b"cuMemHostUnregister"),
             mem_host_alloc: load!(lib, b"cuMemHostAlloc"),
             mem_free_host: load!(lib, b"cuMemFreeHost"),
+            mem_alloc: load!(lib, b"cuMemAlloc_v2"),
+            mem_free: load!(lib, b"cuMemFree_v2"),
             mem_get_allocation_granularity: load!(lib, b"cuMemGetAllocationGranularity"),
             mem_address_reserve: load!(lib, b"cuMemAddressReserve"),
             mem_address_free: load!(lib, b"cuMemAddressFree"),
@@ -235,11 +208,8 @@ impl Driver {
             mem_map: load!(lib, b"cuMemMap"),
             mem_unmap: load!(lib, b"cuMemUnmap"),
             mem_set_access: load!(lib, b"cuMemSetAccess"),
-            mem_retain_allocation_handle: load!(lib, b"cuMemRetainAllocationHandle"),
-            mem_export_to_shareable_handle: optional!(lib, b"cuMemExportToShareableHandle"),
-            mem_import_from_shareable_handle: optional!(lib, b"cuMemImportFromShareableHandle"),
-            mem_get_allocation_properties: optional!(lib, b"cuMemGetAllocationPropertiesFromHandle"),
-            mem_get_access: optional!(lib, b"cuMemGetAccess"),
+            mem_export: load!(lib, b"cuMemExportToShareableHandle"),
+            mem_import: load!(lib, b"cuMemImportFromShareableHandle"),
             _lib: lib,
         };
         // SAFETY: documented as safe to call repeatedly; flags must be 0.
@@ -277,7 +247,7 @@ pub fn check(op: &'static str, rc: CUresult) -> Result<()> {
 
 /// Makes `ctx` current on this thread for the guard's life, then restores the caller's
 /// context. Caller threads belong to someone else (the executor's framework keeps its own
-/// current device), so the plane never leaves a different context bound behind it.
+/// current device), so varena never leaves a different context bound behind it.
 pub struct CtxGuard {
     prev: Option<CUcontext>,
 }
@@ -308,7 +278,7 @@ impl Drop for CtxGuard {
     }
 }
 
-/// A device's PRIMARY context: the one the CUDA runtime uses, so plane pointers, streams and
+/// A device's PRIMARY context: the one the CUDA runtime uses, so varena's pointers, streams and
 /// events are valid in the executor's framework unchanged. Retained for the process's life.
 pub fn primary_context(ordinal: c_int) -> Result<(CUdevice, CUcontext)> {
     let d = driver()?;
