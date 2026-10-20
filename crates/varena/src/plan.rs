@@ -261,6 +261,60 @@ pub enum Action {
 type Distance = (u32, u32);
 
 impl Table {
+    pub fn available(&self) -> u64 {
+        self.occupied()
+            .map_or(0, |bytes| self.capacity.saturating_sub(bytes))
+    }
+
+    pub fn working_set(&self, request: RequestId) -> Option<u64> {
+        let request = self.request(request)?;
+        self.pages
+            .iter()
+            .filter(|page| {
+                self.class(page) == Class::Working
+                    && page.uses.iter().any(|usage| {
+                        usage.request == request.id && usage.position.step == request.position.step
+                    })
+            })
+            .try_fold(request.measured()?, |bytes, page| {
+                bytes.checked_add(page.bytes)
+            })
+    }
+    pub fn speculative_budget(&self, request: RequestId) -> Option<u64> {
+        let request = self.request(request)?;
+        if request.starved {
+            return Some(0);
+        }
+        let reclaim = self
+            .pages
+            .iter()
+            .filter(|page| {
+                page.mapped()
+                    && (self.class(page) == Class::Orphan
+                        || (page.row == request.row
+                            && matches!(self.class(page), Class::Free | Class::Unused)))
+            })
+            .try_fold(0_u64, |sum, page| sum.checked_add(page.bytes))?;
+        let budget = self
+            .capacity
+            .saturating_sub(self.occupied()?.saturating_sub(reclaim))
+            .saturating_sub(self.protected_room()?);
+        let own = self
+            .pages
+            .iter()
+            .filter(|page| {
+                page.mapped()
+                    && page.row == request.row
+                    && !matches!(self.class(page), Class::Free | Class::Unused)
+            })
+            .try_fold(0_u64, |sum, page| sum.checked_add(page.bytes))?;
+        Some(
+            request
+                .sharing_limit
+                .map_or(budget, |limit| budget.min(limit.saturating_sub(own))),
+        )
+    }
+
     pub fn request(&self, id: RequestId) -> Option<&Request> {
         self.requests.iter().find(|request| request.id == id)
     }
@@ -348,14 +402,16 @@ impl Table {
     }
 
     fn reserve(&self) -> Option<u64> {
-        self.requests.iter().try_fold(0_u64, |sum, request| {
-            let scratch = self
-                .pages
-                .iter()
-                .filter(|page| page.mapped() && page.kind == Kind::Scratch(request.id))
-                .try_fold(0_u64, |bytes, page| bytes.checked_add(page.bytes))?;
-            sum.checked_add(request.measured()?.saturating_sub(scratch))
-        })
+        let need = self
+            .requests
+            .iter()
+            .try_fold(0_u64, |sum, request| sum.checked_add(request.measured()?))?;
+        let scratch = self
+            .pages
+            .iter()
+            .filter(|page| page.mapped() && matches!(page.kind, Kind::Scratch(_)))
+            .try_fold(0_u64, |sum, page| sum.checked_add(page.bytes))?;
+        Some(need.saturating_sub(scratch))
     }
 
     fn protected_room(&self) -> Option<u64> {
@@ -392,6 +448,36 @@ impl Table {
                 .all(|request| rows.contains(&request.row))
     }
 
+    /// Largest remaining declared working set, excluding separately charged pins/context.
+    pub fn remaining(&self, id: RequestId) -> Option<u64> {
+        let request = self.request(id)?;
+        let start = usize::try_from(request.position.step).ok()?;
+        let remaining = request.working_sets.get(start..)?;
+        if remaining.is_empty() {
+            return None;
+        }
+        remaining
+            .iter()
+            .enumerate()
+            .try_fold(0_u64, |largest, (offset, extra)| {
+                let step = u32::try_from(start.checked_add(offset)?).ok()?;
+                let weights = self
+                    .pages
+                    .iter()
+                    .filter(|page| {
+                        page.kind == Kind::Weight
+                            && self.class(page) != Class::Pinned
+                            && page.uses.iter().any(|usage| {
+                                usage.request == id
+                                    && usage.position.step == step
+                                    && usage.position >= request.position
+                            })
+                    })
+                    .try_fold(0_u64, |sum, page| sum.checked_add(page.bytes))?;
+                Some(largest.max(weights.checked_add((*extra)?)?))
+            })
+    }
+
     /// Admission is conservative: an unmeasured request runs alone, never beside a reaping row.
     /// `peaks` describes the prospective request's total per-step footprint, excluding contexts.
     pub fn fits(&self, peaks: &[Option<u64>]) -> bool {
@@ -423,37 +509,7 @@ impl Table {
             }
         }
         for request in &self.requests {
-            let Some(start) = usize::try_from(request.position.step).ok() else {
-                return false;
-            };
-            let Some(remaining) = request.working_sets.get(start..) else {
-                return false;
-            };
-            if remaining.is_empty() || remaining.iter().any(Option::is_none) {
-                return false;
-            }
-            let largest =
-                remaining
-                    .iter()
-                    .enumerate()
-                    .try_fold(0_u64, |largest, (offset, extra)| {
-                        let step = u32::try_from(start.checked_add(offset)?).ok()?;
-                        let weights = self
-                            .pages
-                            .iter()
-                            .filter(|page| {
-                                page.kind == Kind::Weight
-                                    && self.class(page) != Class::Pinned
-                                    && page.uses.iter().any(|usage| {
-                                        usage.request == request.id
-                                            && usage.position.step == step
-                                            && usage.position >= request.position
-                                    })
-                            })
-                            .try_fold(0_u64, |sum, page| sum.checked_add(page.bytes))?;
-                        Some(largest.max(weights.checked_add((*extra)?)?))
-                    });
-            needed = needed.and_then(|sum| sum.checked_add(largest?));
+            needed = needed.and_then(|sum| sum.checked_add(self.remaining(request.id)?));
         }
         needed
             .and_then(|sum| sum.checked_add(peaks.iter().flatten().copied().max().unwrap_or(0)))
@@ -640,7 +696,14 @@ impl<'a> Planner<'a> {
 
     fn room(&mut self, request: &Request, need: u64) -> bool {
         self.take(need, |page, class| {
-            class == Class::Orphan || (page.row == request.row && class <= Class::Unused)
+            page.row == request.row && class == Class::Free
+        });
+        self.take(need, |_, class| class == Class::Orphan);
+        if self.free < need && self.ask(request, need, Class::Orphan) {
+            return false;
+        }
+        self.take(need, |page, class| {
+            page.row == request.row && class <= Class::Unused
         });
         if self
             .removed

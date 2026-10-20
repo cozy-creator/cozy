@@ -10,17 +10,14 @@
 #![cfg(unix)]
 
 pub use tensorfs::io::{cuda, metrics as ceiling};
-pub mod faults;
 pub mod gpu;
-pub mod host;
-pub mod io;
 pub mod layout;
 pub mod ledger;
 pub mod plan;
-pub mod memory;
-pub mod window;
+pub mod placement;
 
-pub use memory::{Gpu, GpuStats, Host, HostPinned, HostSet, Pinned, WeightSet};
+pub use gpu::{Gpu, Pin};
+pub use placement::Placement;
 
 use thiserror::Error;
 
