@@ -22,6 +22,8 @@ CASES = {
     "pages_pin_evict_refill_and_survive_clean_owner_exit": "PASS independent pages, pin protection, RAM refill and kept-page import",
     "escaped_writable_view_retains_pages_and_recovers": "PASS escaped writable retention and same-process recovery",
     "read_only_fault_is_contained_in_its_process": "PASS read-only VMM protection and healthy replacement",
+    "cuda_oom_is_recovered_in_process": "PASS real CUDA OOM recovery",
+    "killed_owner_keeps_read_only_pages": "PASS SIGKILL read-only page custody",
 }
 
 
