@@ -1,7 +1,7 @@
 //! One-off exact H3 staging client. Install as a Cargo example in Product25 only.
 //! The default resolves and presigns metadata; only --download permits object GETs.
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -229,24 +229,74 @@ async fn preflight(
     Ok(Arc::new(origin))
 }
 
+fn ownership_marker(header: &ObjectRef) -> String {
+    // Product25 allows .format* beside an uninitialized Store's standard directories.
+    // An empty exclusive marker encodes every identity in its name, so there is no
+    // partially written JSON state to repair after a crash.
+    format!(
+        ".format-{}-{PRODUCT}-{}-{}",
+        OWNER.replace('/', "-"),
+        header.sha256,
+        header.length
+    )
+}
+
+fn claim_owned_target(root: &Path, header: &ObjectRef) -> Result<()> {
+    match fs::create_dir(root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(problem("ownership", "CREATE_DIRECTORY_FAILED")),
+    }
+    if !fs::symlink_metadata(root)
+        .map_err(|_| problem("ownership", "STAT_FAILED"))?
+        .is_dir()
+    {
+        return Err(problem("ownership", "NOT_A_DIRECTORY"));
+    }
+    let marker = root.join(ownership_marker(header));
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.is_file() && metadata.len() == 0 => return Ok(()),
+        Ok(_) => return Err(problem("ownership", "INVALID_MARKER")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(problem("ownership", "MARKER_READ_FAILED")),
+    }
+    // Refuse before creating even the marker when this is somebody else's directory.
+    let mut entries = fs::read_dir(root).map_err(|_| problem("ownership", "LIST_FAILED"))?;
+    if entries.next().is_some() {
+        return Err(problem("ownership", "UNOWNED_NONEMPTY_DIRECTORY"));
+    }
+    let marker = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+        .map_err(|_| problem("ownership", "EXCLUSIVE_MARKER_FAILED"))?;
+    marker
+        .sync_all()
+        .map_err(|_| problem("ownership", "MARKER_SYNC_FAILED"))?;
+    File::open(root)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|_| problem("ownership", "DIRECTORY_SYNC_FAILED"))?;
+    Ok(())
+}
+
+fn open_owned_store(root: &Path, header: &ObjectRef) -> Result<Store> {
+    // A completed marker survives a crash before Store initialization or pin creation.
+    claim_owned_target(root, header)?;
+    Store::open(root).map_err(|e| problem("store", e.code()))
+}
+
 fn pin_store(plan: &Plan) -> Result<Arc<Store>> {
-    let empty = match fs::read_dir(&plan.cache) {
-        Ok(mut entries) => entries.next().is_none(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-        Err(_) => return Err(problem("store", "LIST_FAILED")),
-    };
-    let store = Store::open(&plan.cache).map_err(|e| problem("store", e.code()))?;
+    let store = open_owned_store(&plan.cache, &header_ref())?;
     let old = store
         .get_pin(PIN_ID)
         .map_err(|e| problem("store", e.code()))?;
     let mut pin = Pin::new(vec![header_ref()]);
     pin.owner = Some(OWNER.into());
-    if (!empty && old.is_none())
-        || old
-            .as_ref()
-            .is_some_and(|old| old.owner != pin.owner || old.roots != pin.roots)
+    if old
+        .as_ref()
+        .is_some_and(|old| old.owner != pin.owner || old.roots != pin.roots)
     {
-        return Err(problem("store", "NOT_OWNED_STAGE_STORE"));
+        return Err(problem("store", "WRONG_EXISTING_PIN"));
     }
     store
         .put(plan.header_bytes.as_slice(), Some(&header_ref()))
@@ -508,5 +558,70 @@ mod tests {
         assert_eq!(store.get_pin(PIN_ID).unwrap(), Some(pin));
         assert!(store.closure(&admitted).unwrap().contains(&chunk));
         assert!(!store.path(&chunk).unwrap().exists());
+    }
+
+    #[test]
+    fn foreign_nonempty_directory_is_refused_without_any_new_file() {
+        let root = common::temporary("h3-foreign-target");
+        fs::create_dir(root.join("blobs")).unwrap();
+        let sentinel = root.join("blobs/foreign");
+        fs::write(&sentinel, b"preserve this existing data").unwrap();
+        let error = open_owned_store(&root, &header_ref()).unwrap_err();
+        assert_eq!(error.code, "UNOWNED_NONEMPTY_DIRECTORY");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve this existing data");
+        let entries: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, [std::ffi::OsString::from("blobs")]);
+        assert!(!root.join("format").exists());
+        assert!(!root.join(ownership_marker(&header_ref())).exists());
+    }
+
+    #[test]
+    fn exact_owned_target_resumes_after_marker_store_and_pin_steps() {
+        let root = common::temporary("h3-owned-resume");
+        let bytes = Header::default().to_cbor().unwrap();
+        let header = ObjectRef::of(&bytes);
+        // Crash after the exclusive marker, before Store initialization.
+        claim_owned_target(&root, &header).unwrap();
+        assert!(!root.join("format").exists());
+        let store = open_owned_store(&root, &header).unwrap();
+        assert!(store.get_pin(PIN_ID).unwrap().is_none());
+        drop(store);
+        // Crash after Store initialization, before header or pin creation.
+        let store = open_owned_store(&root, &header).unwrap();
+        store.put(bytes.as_slice(), Some(&header)).unwrap();
+        drop(store);
+        let store = open_owned_store(&root, &header).unwrap();
+        let mut pin = Pin::new(vec![header.clone()]);
+        pin.owner = Some(OWNER.into());
+        store.pin(PIN_ID, &pin).unwrap();
+        drop(store);
+        // A completed run remains the same owned Store and pin on resume.
+        let store = open_owned_store(&root, &header).unwrap();
+        assert_eq!(store.read(&header).unwrap(), bytes);
+        assert_eq!(store.get_pin(PIN_ID).unwrap(), Some(pin));
+    }
+
+    #[test]
+    fn marker_for_different_owner_product_or_header_is_refused_without_initialization() {
+        let other = ObjectRef::of(b"other header");
+        for name in [
+            ownership_marker(&other),
+            ownership_marker(&header_ref()).replace(PRODUCT, &"0".repeat(40)),
+            ownership_marker(&header_ref()).replace(&OWNER.replace('/', "-"), "another-owner"),
+        ] {
+            let root = common::temporary("h3-wrong-marker");
+            File::create(root.join(&name)).unwrap();
+            let error = open_owned_store(&root, &header_ref()).unwrap_err();
+            assert_eq!(error.code, "UNOWNED_NONEMPTY_DIRECTORY");
+            assert!(!root.join("format").exists());
+            let entries: Vec<_> = fs::read_dir(&root)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(entries, [std::ffi::OsString::from(name)]);
+        }
     }
 }

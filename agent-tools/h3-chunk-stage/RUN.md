@@ -10,7 +10,7 @@ In a fresh hosted checkout at Product25, fetch the reviewed client commit withou
 bash agent-tools/h3-chunk-stage/check-hosted.sh
 ```
 
-This runs four metadata/contract tests and compiles the Rust example. It neither builds a TensorFS wheel/AOT catalog nor invokes the client against the real Hub. Its loopback test uses the existing old-manifest Hub fixture and asserts zero object GETs. A local metadata-only test checks that an unchanged header pin can retain yet-absent chunks without reading them.
+This runs seven metadata/contract tests and compiles the Rust example. It neither builds a TensorFS wheel/AOT catalog nor invokes the client against the real Hub. Its loopback test uses the existing old-manifest Hub fixture and asserts zero object GETs. Local metadata tests check a header pin with absent chunks, refusal of a foreign nonempty directory without any new file, exact owned resume after marker/Store/pin steps, and refusal of another owner/product/header's marker.
 
 After the metadata bundle and binary reach the benchmark host, use the existing `h3-current-source.json` contract with absolute local header/cache paths. The cache must be independent of the metadata store. The source-controlled program fixes Hub/model/release/lane and verifies header identity, all five components, 3,858 tensors, 4,834 stored parts, and byte totals before any network request.
 
@@ -22,6 +22,8 @@ target/debug/examples/h3_chunk_stage /absolute/path/h3-current-source.json > met
 target/debug/examples/h3_chunk_stage /absolute/path/h3-current-source.json --download > staging-receipt.json
 ```
 
-The download creates a named owned pin for an identical admitted copy of the local header before receiving chunks. An empty destination or a previous matching owned stage store is accepted. The source metadata store, refs, and local header remain unchanged. It retains partial admitted bytes for a later explicit retry. After the existing Fetcher settles, it syncs and calls the read-only `verify_selected(None)` over header/chunks/component assets. Missing, corrupt, transfer, or sync failure exits nonzero; signed URLs are never included in its receipt. README/LICENSE are repository files and are outside checkpoint verification.
+Before opening a Store, the download exclusively creates an empty ownership marker in an empty destination or verifies the previous exact marker. Its name encodes the owner/version, Product25 commit, and full header hash/length. A zero-byte `create_new` avoids partially written marker content; a crash before Store initialization or pin creation can resume from that same marker. An unowned nonempty directory is refused without creating any file. The marker uses the `.format-` prefix explicitly accepted during Product25 Store initialization.
+
+The download then creates a named owned pin for an identical admitted copy of the local header before receiving chunks. The source metadata store, refs, and local header remain unchanged. It retains partial admitted bytes for a later explicit retry. After the existing Fetcher settles, it syncs and calls the read-only `verify_selected(None)` over header/chunks/component assets. Missing, corrupt, transfer, or sync failure exits nonzero; signed URLs are never included in its receipt. README/LICENSE are repository files and are outside checkpoint verification.
 
 Use an existing parent process deadline and stop policy. This client does not start a detached process, new retry policy, or GPU work. A successful receipt proves staged bytes only; it does not prove H3 load timings, decoding, VRAM capacity, or GPU performance. Run the separately reviewed H3 benchmark only after `status=staged_verified` and matching byte/provenance checks.
