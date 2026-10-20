@@ -174,6 +174,7 @@ struct Cache {
     active: u32,
     blocked: bool,
     busy: bool,
+    resized: bool,
 }
 
 struct Inner {
@@ -1188,6 +1189,7 @@ impl Placement {
                 active: 0,
                 blocked: false,
                 busy: false,
+                resized: false,
             },
         );
         inner.table.pages.push(plan::Page {
@@ -1218,6 +1220,7 @@ impl Placement {
             .get_mut(&id)
             .ok_or_else(|| invalid("unknown cache"))?;
         cache.blocked = false;
+        cache.resized |= cache.busy;
         let pins = cache.active.saturating_add(u32::from(cache.busy));
         let page = inner
             .table
@@ -1691,6 +1694,7 @@ impl Placement {
                                 .get_mut(&page)
                                 .ok_or_else(|| invalid("cache callback absent"))?;
                             cache.busy = true;
+                            cache.resized = false;
                             let shrink = cache.shrink.clone();
                             let pins = cache.active.saturating_add(1);
                             if let Some(row) =
@@ -1707,14 +1711,17 @@ impl Placement {
                         };
                         drop(operation);
                         let freed = shrink(bytes)?;
-                        let pins = {
+                        let state = {
                             let mut inner = self.inner.lock();
                             inner.caches.get_mut(&page).map(|cache| {
                                 cache.blocked = freed == 0;
-                                cache
-                                    .active
-                                    .saturating_add(u32::from(cache.blocked))
-                                    .saturating_add(u32::from(cache.busy))
+                                (
+                                    cache
+                                        .active
+                                        .saturating_add(u32::from(cache.blocked))
+                                        .saturating_add(u32::from(cache.busy)),
+                                    cache.resized,
+                                )
                             })
                         };
                         if let Some(page) = self
@@ -1725,8 +1732,11 @@ impl Placement {
                             .iter_mut()
                             .find(|row| row.id == page)
                         {
-                            page.bytes = page.bytes.saturating_sub(freed);
-                            page.pins = pins.unwrap_or(0);
+                            let (pins, resized) = state.unwrap_or((0, false));
+                            if !resized {
+                                page.bytes = page.bytes.saturating_sub(freed);
+                            }
+                            page.pins = pins;
                         }
                         drop(callback);
                         continue 'decide;

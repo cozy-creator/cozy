@@ -427,10 +427,15 @@ class Cache:
         self.memory, self.owner, self.shrink = memory, owner, shrink
         self.holds: set[Hold] = set()
         self._nbytes = 0
+        self._size_version = 0
 
         def reclaim(need: int) -> int:
+            version = self._size_version
             try:
-                return shrink(need)
+                freed = shrink(need)
+                if self._size_version == version:
+                    self.nbytes = max(self.nbytes - freed, 0)
+                return freed
             finally:
                 # A callback can also release allocator slack (e.g. a graph's
                 # private pool). Publish the actual allocator before retrying.
@@ -446,6 +451,7 @@ class Cache:
     @nbytes.setter
     def nbytes(self, value: int) -> None:
         self._nbytes = value
+        self._size_version += 1
         if self.memory.native is not None:
             self.memory.native.cache_bytes(self.id, value)
 
