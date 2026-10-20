@@ -121,6 +121,8 @@ pub struct Request {
     pub sharing_limit: Option<u64>,
     /// Multi-pass steps whose unpinned pages should stay resident if they fit.
     pub resident_steps: BTreeSet<u32>,
+    /// Members of these steps are needed together, with no order between models.
+    pub joint_steps: BTreeSet<u32>,
     pub can_cut: bool,
     pub can_lower: bool,
     /// Increment after a completed demand so a later demand can ask rows again.
@@ -358,6 +360,31 @@ impl Table {
 
     pub fn page(&self, id: PageId) -> Option<&Page> {
         self.pages.iter().find(|page| page.id == id)
+    }
+
+    pub fn bound(&mut self, request: RequestId, page: PageId) {
+        let Some(current) = self.request(request).map(|row| row.position) else {
+            return;
+        };
+        let next = self.page(page).and_then(|page| {
+            page.uses
+                .iter()
+                .filter(|usage| usage.request == request && usage.position >= current)
+                .map(|usage| usage.position)
+                .min()
+        });
+        if let (Some(next), Some(row)) =
+            (next, self.requests.iter_mut().find(|row| row.id == request))
+        {
+            row.position = Position {
+                step: next.step,
+                order: if row.joint_steps.contains(&next.step) {
+                    0
+                } else {
+                    next.order.saturating_add(1)
+                },
+            };
+        }
     }
 
     fn next_use(&self, page: &Page) -> Option<Distance> {
@@ -1171,6 +1198,7 @@ mod tests {
             starved: false,
             sharing_limit: None,
             resident_steps: BTreeSet::new(),
+            joint_steps: BTreeSet::new(),
             can_cut: false,
             can_lower: false,
             reclaim_round: 0,
@@ -1438,6 +1466,38 @@ mod tests {
             ),
             Vec::new()
         );
+        let mut joint = request(1);
+        joint.joint_steps.insert(0);
+        let mut a = page(1, 10);
+        a.uses.push(usage(1, 0));
+        let mut b = page(2, 10);
+        b.model = Some(2);
+        b.uses.push(Use {
+            request: 1,
+            position: Position { step: 0, order: 1 },
+        });
+        let mut group = Table {
+            capacity: 100,
+            pages: vec![a, b],
+            requests: vec![joint],
+            rows: vec![Row {
+                id: 1,
+                alive: true,
+                reaping: false,
+            }],
+            ..Default::default()
+        };
+        // Joint members may bind B before A; neither model is an earlier ordered step.
+        group.bound(1, 2);
+        assert!(group
+            .pages
+            .iter()
+            .all(|page| group.class(page) == Class::Working));
+        group.bound(1, 1);
+        assert!(group
+            .pages
+            .iter()
+            .all(|page| group.class(page) == Class::Working));
     }
 }
 

@@ -328,6 +328,7 @@ class Block:
     regions: list[int] = field(default_factory=list)
     tensors: dict[str, dict[str, _PartAt]] = field(default_factory=dict)
     count: int = 0
+    binding: bool = False
     stream: torch.cuda.Stream | None = None
     pins: list[Tensor] = field(default_factory=list)
     written: list[tuple[_Site, Tensor | None]] = field(default_factory=list)
@@ -368,6 +369,8 @@ class Model:
         self.handles: list[RemovableHandle] = []
         self.ws: WeightSet
         self.flight, self.aloft, self.held = 0, False, 0
+        self.starting = False
+        self.peak = 0
         self.steps, self.base = 0, 0
         self.binding_ns = 0
         self.closed = False
@@ -524,6 +527,8 @@ class Memory:
         self.active: dict[Request, None] = {}
         self.local = threading.local()
         self.lock = threading.RLock()
+        self.changed = threading.Condition(self.lock)
+        self.loading: set[nn.Module] = set()
         self._ids = itertools.count(1)
         self._names: dict[int, str] = {}
         self.context = 0
@@ -581,79 +586,97 @@ class Memory:
         ck: tensorfs.Checkpoint | None = None,
         component: str | None = None,
     ) -> Model:
-        with self.lock:
-            model = self.by_module.get(module)
-            if model is not None:
-                if self.native is not None:
-                    self.native.load(model.ws.id, Level(level).value)
-                return model
+        with self.changed:
+            while module in self.loading:
+                self.changed.wait()
+            self.loading.add(module)
+        try:
+            return self._load(module, level, ck=ck, component=component)
+        finally:
+            with self.changed:
+                self.loading.remove(module)
+                self.changed.notify_all()
 
-            original_declaration = vars(module).get("_varena")
-            declared = _declared(module)
-            if ck is not None:
-                component = component or next(iter(ck.components))
-                declared = Declared(
-                    Source(ck, component, str(ck.id)),
-                    declared.blocks,
-                    declared.state,
-                    declared.fill,
-                    declared.bind,
-                )
-                vars(module)["_varena"] = declared
-            model = Model(self, module, declared)
-            model.name = f"{model.source.key}:{next(self._ids)}"
-            originals = {
-                (id(site.table), site.attr): (site, site.table[site.attr])
-                for sites in model.sites.values()
-                for site in sites
-            }
-            forwards = [
-                (sub, vars(sub).get("forward"), vars(sub).get("_varena_ffn"))
-                for sub in module.modules()
-            ]
-            try:
-                if self.native is None:
-                    self._load_host(model)
-                else:
-                    self._register(model)
-                    paths = blocks_of(module)
-                    _layout(model, f"{model.component}/", paths, regions_of(module))
-                    _install(model)
-                    for block in model.blocks:
-                        block.site = cuts.Site(
-                            (model.name, block.index),
-                            self.device,
-                            model.track,
-                            block.module,
-                            module,
-                            declared.state,
-                        )
-                        _hook(block)
-                    cuts.install(module)
-                    _fly(model)
-                    self.native.load(model.ws.id, Level(level).value)
-            except BaseException as error:
-                try:
-                    model.close()
-                except BaseException as cleanup_error:
-                    error.add_note(f"registration cleanup failed: {cleanup_error}")
-                    raise error from cleanup_error
-                finally:
-                    for site, value in originals.values():
-                        site.table[site.attr] = value
-                    for sub, forward, cut in forwards:
-                        for key, value in (("forward", forward), ("_varena_ffn", cut)):
-                            if value is None:
-                                vars(sub).pop(key, None)
-                            else:
-                                vars(sub)[key] = value
-                    if original_declaration is None:
-                        vars(module).pop("_varena", None)
-                    else:
-                        vars(module)["_varena"] = original_declaration
-                raise
-            self.models[model.name], self.by_module[module] = model, model
+    def _load(
+        self,
+        module: nn.Module,
+        level: Level | str,
+        *,
+        ck: tensorfs.Checkpoint | None,
+        component: str | None,
+    ) -> Model:
+        model = self.by_module.get(module)
+        if model is not None:
+            if self.native is not None:
+                self.native.load(model.ws.id, Level(level).value)
             return model
+
+        original_declaration = vars(module).get("_varena")
+        declared = _declared(module)
+        if ck is not None:
+            component = component or next(iter(ck.components))
+            declared = Declared(
+                Source(ck, component, str(ck.id)),
+                declared.blocks,
+                declared.state,
+                declared.fill,
+                declared.bind,
+            )
+            vars(module)["_varena"] = declared
+        model = Model(self, module, declared)
+        model.name = f"{model.source.key}:{next(self._ids)}"
+        originals = {
+            (id(site.table), site.attr): (site, site.table[site.attr])
+            for sites in model.sites.values()
+            for site in sites
+        }
+        forwards = [
+            (sub, vars(sub).get("forward"), vars(sub).get("_varena_ffn"))
+            for sub in module.modules()
+        ]
+        try:
+            if self.native is None:
+                self._load_host(model)
+            else:
+                self._register(model)
+                paths = blocks_of(module)
+                _layout(model, f"{model.component}/", paths, regions_of(module))
+                _install(model)
+                for block in model.blocks:
+                    block.site = cuts.Site(
+                        (model.name, block.index),
+                        self.device,
+                        model.track,
+                        block.module,
+                        module,
+                        declared.state,
+                    )
+                    _hook(block)
+                cuts.install(module)
+                _fly(model)
+                self.native.load(model.ws.id, Level(level).value)
+        except BaseException as error:
+            try:
+                model.close()
+            except BaseException as cleanup_error:
+                error.add_note(f"registration cleanup failed: {cleanup_error}")
+                raise error from cleanup_error
+            finally:
+                for site, value in originals.values():
+                    site.table[site.attr] = value
+                for sub, forward, cut in forwards:
+                    for key, value in (("forward", forward), ("_varena_ffn", cut)):
+                        if value is None:
+                            vars(sub).pop(key, None)
+                        else:
+                            vars(sub)[key] = value
+                if original_declaration is None:
+                    vars(module).pop("_varena", None)
+                else:
+                    vars(module)["_varena"] = original_declaration
+            raise
+        self.models[model.name], self.by_module[module] = model, model
+        return model
 
     def _register(self, model: Model) -> None:
         assert self.native is not None
@@ -763,40 +786,65 @@ class Memory:
             old = model.ws.id
             self._register(model)
             self.native.close_model(old)
-            for request in self.active:
+            for request in tuple(self.active):
                 request.plan(request.raw_plan)
 
     def _start(self, model: Model) -> None:
-        with self.lock:
+        with self.changed:
+            while model.starting:
+                self.changed.wait()
             model.flight += 1
             if model.flight != 1:
                 return
-            try:
-                self._fresh(model)
-                self._measure()
-                assert self.native is not None
-                self.native.enter(self._current().native_id, model.ws.id)
+            model.starting = True
+        try:
+            self._fresh(model)
+            self._measure()
+            assert self.native is not None
+            self.native.enter(self._current().native_id, model.ws.id)
+            with self.lock:
+                self._capture_peaks()
                 model.base = torch.cuda.memory_allocated(self.gpu)
+                model.peak = 0
                 torch.cuda.reset_peak_memory_stats(self.gpu)
                 model.aloft = True
-                self._enter(model.common, record=False)
-            except BaseException:
+            self._enter(model.common, record=False)
+        except BaseException:
+            with self.lock:
                 model.flight -= 1
                 model.aloft = False
                 _unbind(model.common)
-                raise
+            raise
+        finally:
+            with self.changed:
+                model.starting = False
+                self.changed.notify_all()
+
+    def _capture_peaks(self) -> None:
+        """Preserve every active model's measured peak before a nested start resets CUDA."""
+        peak = torch.cuda.max_memory_allocated(self.gpu)
+        for model in self.models.values():
+            if model.aloft:
+                model.peak = max(model.peak, peak - model.base)
 
     def _land(self, model: Model) -> None:
-        with self.lock:
+        with self.changed:
             if not model.flight:
                 return
             model.flight -= 1
             if model.flight:
                 return
-            if model.aloft:
-                model.aloft = False
+            self._capture_peaks()
+            aloft, model.aloft = model.aloft, False
+            model.starting = True
+        try:
+            if aloft:
                 self._exit(model.common)
             self._step(model)
+        finally:
+            with self.changed:
+                model.starting = False
+                self.changed.notify_all()
 
     def _enter(
         self,
@@ -807,24 +855,54 @@ class Memory:
     ) -> None:
         del wait
         stream = torch.cuda.current_stream(self.device)
-        with self.lock, _disable_current_modes():
-            if block.count == 0:
-                self._bind(block, stream)
+        with self.changed:
+            while block.binding:
+                self.changed.wait()
+            bind = block.count == 0
+            block.binding = bind
+            held_stream = block.stream
+            acquired = not bind
+            if acquired:
+                block.count += 1
+        try:
+            if bind:
+                with _disable_current_modes():
+                    self._bind(block, stream)
             elif (
-                stream != block.stream and not torch.cuda.is_current_stream_capturing()
+                stream != held_stream and not torch.cuda.is_current_stream_capturing()
             ):
-                stream.wait_stream(block.stream)
-            block.count += 1
-            if record and block.index >= 0:
-                shape = block.model.track.shape = self.memo.shape(
-                    block.model.name, cuts.shape_of(*call)
-                )
-                if shape.peak >= 0 and self.native is not None:
-                    self.native.leave(self._current().native_id, shape.peak)
+                stream.wait_stream(held_stream)
+            with self.changed:
+                if bind:
+                    block.count += 1
+                    acquired = True
+                peak = None
+                if record and block.index >= 0:
+                    shape = block.model.track.shape = self.memo.shape(
+                        block.model.name, cuts.shape_of(*call)
+                    )
+                    if shape.peak >= 0:
+                        peak = shape.peak
+            if peak is not None and self.native is not None:
+                self.native.leave(self._current().native_id, peak)
+        except BaseException:
+            if acquired:
+                with self.changed:
+                    block.count -= 1
+                    if not block.count:
+                        _unbind(block)
+            raise
+        finally:
+            if bind:
+                with self.changed:
+                    block.binding = False
+                    self.changed.notify_all()
 
     def _exit(self, block: Block) -> None:
         stream = torch.cuda.current_stream(self.device)
-        with self.lock, _disable_current_modes():
+        with self.changed, _disable_current_modes():
+            while block.binding:
+                self.changed.wait()
             if (
                 block.stream not in (None, stream)
                 and not torch.cuda.is_current_stream_capturing()
@@ -870,7 +948,7 @@ class Memory:
         if self.native is None:
             return
         request = self._current()
-        peak = max(torch.cuda.max_memory_allocated(self.gpu) - model.base, 0)
+        peak = model.peak
         self.native.leave(request.native_id, peak)
         cuts.peaked(model.track, peak)
         raw = self.native.stats(request.native_id)
