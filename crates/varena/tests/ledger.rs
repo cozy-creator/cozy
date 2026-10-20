@@ -390,7 +390,25 @@ fn ram_service_fills_through_tensorfs_and_retains_a_readers_layout() {
     assert_eq!(data, "datadata");
     assert!(!fixture.ledger.release_ram(layout));
     drop(view);
-    assert!(fixture.ledger.release_ram(layout));
+    // Region readiness can precede completion of the final fill bookkeeping.
+    // A busy return is followed by the ledger's completion wake, not a timer poll.
+    while !fixture.ledger.release_ram(layout) {
+        let mut pending = libc::pollfd {
+            fd: fixture.ledger.events().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut pending, 1, 3000) },
+            1,
+            "fill did not finish"
+        );
+        let mut word = [0u8; 8];
+        assert_eq!(
+            unsafe { libc::read(pending.fd, word.as_mut_ptr().cast(), word.len()) },
+            8
+        );
+    }
 }
 
 #[test]
