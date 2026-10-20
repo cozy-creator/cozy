@@ -731,7 +731,7 @@ def _contiguous(func: OpOverload, args: Args, kwargs: Kwargs) -> _Plan | None:
     a = _arguments(func, args, kwargs)
     x = a.get("self")
     if (not isinstance(x, Tensor) or x.layout is not torch.strided
-            or torch.is_grad_enabled() or x.is_contiguous()
+            or torch.is_grad_enabled() or _capturing() or x.is_contiguous()
             or a.get("memory_format") is not torch.contiguous_format):
         return None
     axes = [i for i, size in enumerate(x.shape) if size > 1]

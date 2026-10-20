@@ -132,9 +132,9 @@ def cpu(cuts):
         torch.testing.assert_close(decoded, expected_decode, rtol=0, atol=0)
         assert decoded.stride() == expected_decode.stride()
         # A real sliced/offset source, and later-axis bands when one leading row is too large.
-        raw = torch.arange(4 * 7 * 9, dtype=dtype).reshape(4, 7, 9)
+        raw = torch.arange(4 * 17 * 9, dtype=dtype).reshape(4, 17, 9)
         sliced = raw[1:, 1::2, ::2].transpose(0, 2)
-        _, alternate = check(cuts, sliced, sliced.contiguous(), room=2 * sliced.element_size() * 12)
+        _, alternate = check(cuts, sliced, sliced.contiguous(), room=2 * sliced.element_size() * 20)
         assert alternate.outputs[0].writes[0][0] != 0
         same = torch.arange(24, dtype=dtype).reshape(2, 3, 4)
         with torch.no_grad(), cuts.caught():
