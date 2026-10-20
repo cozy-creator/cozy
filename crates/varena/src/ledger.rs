@@ -794,6 +794,29 @@ impl Ledger {
         }
         idle
     }
+    /// On real host pressure, release the oldest completed RAM layout with no live view.
+    /// No GPU pages or running-request buffers are considered here.
+    pub fn release_unused_ram(&self) -> bool {
+        let mut custody = self.custody.lock();
+        let victim = custody
+            .ram
+            .iter_mut()
+            .filter_map(|(key, held)| {
+                held.readers
+                    .retain(|reader| !platform::handles::hung_up(reader));
+                (held.readers.is_empty() && !held.layout.filling.load(Acquire))
+                    .then_some((*key, held.used))
+            })
+            .min_by_key(|(_, used)| *used)
+            .map(|(key, _)| key);
+        if let Some(key) = victim {
+            custody.ram.remove(&key);
+            self.table.changed();
+            true
+        } else {
+            false
+        }
+    }
     pub fn drop_kept(&self) {
         self.custody.lock().pages.clear();
         self.table.changed();
@@ -971,6 +994,40 @@ impl Ram {
                 .offset
                 .checked_add(region.len)
                 .ok_or_else(|| Error::Invalid("RAM region overflow".into()))?;
+            let mut intervals = Vec::new();
+            for item in &region.items {
+                let item_end = item
+                    .offset
+                    .checked_add(item.len)
+                    .ok_or_else(|| Error::Invalid("RAM item overflow".into()))?;
+                if item.offset < region.offset || item_end > end {
+                    return Err(Error::Invalid("RAM item exceeds its region".into()));
+                }
+                match &item.source {
+                    ItemSource::Object(range)
+                        if range.len != item.len
+                            || range
+                                .off
+                                .checked_add(range.len)
+                                .is_none_or(|n| n > range.obj.length) =>
+                    {
+                        return Err(Error::Invalid("RAM object range exceeds source".into()))
+                    }
+                    ItemSource::Inline(bytes) if bytes.len() as u64 != item.len => {
+                        return Err(Error::Invalid("RAM inline length differs".into()))
+                    }
+                    _ => (),
+                }
+                intervals.push((item.offset, item_end));
+            }
+            intervals.sort_unstable();
+            let mut previous = region.offset;
+            for (start, finish) in intervals {
+                if start < previous {
+                    return Err(Error::Invalid("RAM items overlap".into()));
+                }
+                previous = finish;
+            }
         }
         let len =
             usize::try_from(end).map_err(|_| Error::Invalid("RAM layout too large".into()))?;
@@ -1017,11 +1074,13 @@ impl Drop for Ram {
 struct RamHeld {
     layout: Arc<Ram>,
     readers: Vec<UnixStream>,
+    used: u64,
 }
 #[derive(Default)]
 struct Custody {
     pages: BTreeMap<PageKey, Kept>,
     ram: BTreeMap<[u8; 32], RamHeld>,
+    clock: u64,
 }
 impl Custody {
     fn orphan(&mut self, owner: Owner) {
@@ -1090,11 +1149,14 @@ fn register_ram(
             table.changed();
         })
         .map_err(|e| io("start RAM fill", e))?;
+    custody.clock = custody.clock.saturating_add(1);
+    let used = custody.clock;
     custody.ram.insert(
         layout,
         RamHeld {
             layout: ram,
             readers: Vec::new(),
+            used,
         },
     );
     Ok(true)
@@ -1252,6 +1314,8 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                 }
                 Some(4) => {
                     let mut held = custody.lock();
+                    held.clock = held.clock.saturating_add(1);
+                    let used = held.clock;
                     let ready = held.ram.get_mut(&key.fingerprint).and_then(|ram| {
                         let index = usize::try_from(key.page).ok()?;
                         let region = ram.layout.regions.get(index)?;
@@ -1263,6 +1327,7 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                             .then_some((ram, offset, len))
                     });
                     if let Some((ram, offset, len)) = ready {
+                        ram.used = used;
                         let (ours, theirs) =
                             UnixStream::pair().map_err(|e| io("create RAM reader lease", e))?;
                         let file = shm::reopen(ram.layout.file.as_fd(), false)
@@ -1672,6 +1737,20 @@ impl Channel {
     ) -> Result<bool> {
         if files.len() > 4096 || regions.len() > MAX_RAM_ITEMS {
             return Err(Error::Invalid("RAM registration is too large".into()));
+        }
+        let canonical = |object: &ObjectRef| {
+            object.sha256.len() == 64
+                && object
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        };
+        if files.iter().any(|(object, _)| !canonical(object))
+            || regions.iter().flat_map(|r| &r.items).any(
+                |item| matches!(&item.source,ItemSource::Object(range) if !canonical(&range.obj)),
+            )
+        {
+            return Err(Error::Invalid("noncanonical RAM source hash".into()));
         }
         let (mut items, mut inline) = (0usize, 0usize);
         for region in regions {

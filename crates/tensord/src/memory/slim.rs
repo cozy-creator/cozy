@@ -3,7 +3,8 @@
 
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
-use varena::ledger::{Grant, Ledger, Status};
+pub use varena::ledger::Grant;
+use varena::ledger::{Ledger, Status};
 
 pub struct Memory(Arc<Ledger>);
 impl Memory {
@@ -31,6 +32,12 @@ impl Memory {
     }
     pub fn events(&self) -> BorrowedFd<'_> {
         self.0.events()
+    }
+    pub fn release_unused_ram(&self) -> bool {
+        self.0.release_unused_ram()
+    }
+    pub fn capacity(&self) -> u64 {
+        self.0.capacity()
     }
     pub fn ledger(&self) -> &Arc<Ledger> {
         &self.0
