@@ -36,6 +36,23 @@ type Band = Callable[[int, int], Tensor]
 type Rule = Callable[[OpOverload, Args, Kwargs], _Plan | None]
 type Attention = Callable[[Tensor, Tensor, Tensor, Tensor | None], Tensor]
 
+
+class Output(Protocol):
+    """A fresh exact result and its checked band writer; aliases retain its storage owner."""
+
+    @property
+    def tensor(self) -> Tensor: ...
+
+    def write_band(self, source: Tensor, axis: int, offset: int) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _DeviceOutput:
+    tensor: Tensor
+
+    def write_band(self, source: Tensor, axis: int, offset: int) -> None:
+        self.tensor.narrow(axis, offset, source.shape[axis]).copy_(source)
+
 #: Free bytes a retry asks beyond the failed allocation: the allocator's rounding, a workspace.
 SLACK = 64 << 20
 _ALLOCATE = re.compile(r"Tried to allocate ([\d.]+) (B|KiB|MiB|GiB|TiB)")
@@ -53,6 +70,7 @@ class Rungs(Protocol):
     def free(self, device: torch.device, need: int) -> bool: ...
     def lower(self, device: torch.device, need: int) -> bool: ...
     def available(self, device: torch.device) -> int: ...
+    def mapped_output(self, like: Tensor, device: torch.device) -> Output | None: ...
     def exhausted(self, device: torch.device, need: int, op: str) -> Exception: ...
 
 
@@ -66,6 +84,9 @@ class _NoRungs:
 
     def available(self, device: torch.device) -> int:
         return 0
+
+    def mapped_output(self, like: Tensor, device: torch.device) -> Output | None:
+        return None
 
     def exhausted(self, device: torch.device, need: int, op: str) -> Exception:
         return torch.OutOfMemoryError(f"{op} needs {need} B more on {device}")
@@ -232,10 +253,12 @@ def _settle[T](
     key: tuple[object, ...] | None = None,
     again: bool | None = None,
     before: Callable[[int], T | None] | None = None,
+    fallback: Callable[[], T | None] | None = None,
 ) -> tuple[int, T]:
     """`run(size)` until it fits, each try strictly smaller: room made (rungs 1-2), each `shrink`
     down to `finest`, the first and the finest size tried again with room made, `before` (an
-    op's cut) once, then rung 4, else `exhausted`. With `key` it is a call that cuts itself:
+    op's cut) once, then rung 4 and an optional fresh-output fallback, else `exhausted`.
+    With `key` it is a call that cuts itself:
     up front at the memo's size, finer when an op inside asks (`Finer`), past `finest` its
     failure its caller's, and the size that fit remembered."""
     memo, rungs, total = _served.memo, _served.rungs, size
@@ -274,6 +297,8 @@ def _settle[T](
             elif before is not None and (out := before(need)) is not None:
                 break
             elif not rungs.lower(device, need + SLACK):
+                if fallback is not None and (out := fallback()) is not None:
+                    break
                 raise rungs.exhausted(device, need, name)
             else:
                 before = None
@@ -525,7 +550,7 @@ class Layer(TorchDispatchMode):
             size = min(height // 2, fits or height // 2)
         size, name = max(align, size // align * align), f"{func.overloadpacket.__name__} rows"
         halve = functools.partial(_halve, align)
-        out = _settle(lambda _: _empty(plan.out, device), align, align, halve, device, name)[1]
+        out = _output(plan.out, device, name)
         if plan.gather is not None:
             size = _settle(plan.gather, size, align, halve, device, name)[0]
         at = 0
@@ -537,12 +562,12 @@ class Layer(TorchDispatchMode):
         _served.memo.banded.add(func)
         self.banded += 1
         _note(name, size)
-        return out if plan.finish is None else plan.finish(out)
+        return out.tensor if plan.finish is None else plan.finish(out.tensor)
 
 
-def _band(plan: _Plan, out: Tensor, at: int, height: int, rows: int) -> None:
+def _band(plan: _Plan, out: Output, at: int, height: int, rows: int) -> None:
     stop = min(at + rows, height)
-    out.narrow(plan.axis, at, stop - at).copy_(plan.band(at, stop))
+    out.write_band(plan.band(at, stop), plan.axis, at)
 
 
 def _storage(t: Tensor) -> int:
@@ -652,6 +677,29 @@ def _meta(func: OpOverload, args: Args, kwargs: Kwargs) -> list[Tensor]:
 
 def _empty(like: Tensor, device: torch.device) -> Tensor:
     return torch.empty_strided(like.shape, like.stride(), dtype=like.dtype, device=device)
+
+
+def _output(like: Tensor, device: torch.device, name: str) -> Output:
+    """Prefer device storage through every relief rung, then an admitted host destination."""
+    def allocate(_: int) -> Output:
+        # This allocation owns its exhaustion/fallback. The surrounding dispatch
+        # layer must not turn its OOM into Exhausted before this ladder sees it.
+        layer = _local.layer
+        pop = layer is not None and _get_current_dispatch_mode() is layer
+        with _pop_mode_temporarily() if pop else nullcontext():
+            return _DeviceOutput(_empty(like, device))
+
+    def finer(need: int) -> None:
+        scope = next((scope for scope in reversed(_local.scopes) if scope.finer), None)
+        if scope is not None:
+            raise Finer(scope, need)
+
+    def mapped() -> Output | None:
+        if not like.is_contiguous() or _capturing():
+            return None
+        return _served.rungs.mapped_output(like, device)
+
+    return _settle(allocate, 1, 1, int, device, name, before=finer, fallback=mapped)[1]
 
 
 def _rows(x: Tensor, axis: int, first: int, last: int, value: float = 0.0) -> Tensor:
@@ -863,19 +911,21 @@ def _rms(
 def _rms_bands(forward: Callable[..., object], x: Tensor, axis: int, rows: int) -> object:
     if rows >= x.shape[axis]:
         return forward(x)
-    out: Tensor | None = None
+    out: Output | None = None
     for at in range(0, int(x.shape[axis]), rows):
         length = min(rows, int(x.shape[axis]) - at)
         part = forward(x.narrow(axis, at, length))
         expected = (*x.shape[:axis], length, *x.shape[axis + 1 :])
         if not isinstance(part, Tensor) or part.shape != expected:
             raise _Whole()
-        out = part.new_empty(tuple(x.shape)) if out is None else out
-        if part.dtype != out.dtype or part.device != out.device:
+        if out is None:
+            like = torch.empty(tuple(x.shape), dtype=part.dtype, device="meta")
+            out = _output(like, part.device, "RMS norm result")
+        if part.dtype != out.tensor.dtype or part.device != out.tensor.device:
             raise _Whole()
-        out.narrow(axis, at, length).copy_(part)
+        out.write_band(part, axis, at)
     assert out is not None
-    return out
+    return out.tensor
 
 
 def _ffn(kind: str, width: int, forward: Callable[..., object]) -> Callable[..., object]:

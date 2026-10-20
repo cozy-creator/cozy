@@ -104,6 +104,19 @@ class Unbound(Exception):
     """An op on a placeholder that binds to nothing."""
 
 
+class _BandWriter(Protocol):
+    def _write_band(self, source: Tensor, axis: int, offset: int) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _MappedOutput:
+    tensor: Tensor
+    array: _BandWriter
+
+    def write_band(self, source: Tensor, axis: int, offset: int) -> None:
+        self.array._write_band(source, axis, offset)
+
+
 #: `bind(key, parts)`: a stored tensor's part views -> the module tensors they become, by name.
 type Bind = Callable[[str, Mapping[str, Tensor]], Mapping[str, Tensor]]
 
@@ -1225,6 +1238,24 @@ class Memory:
             if self.native is not None and device in (None, self.device)
             else 0
         )
+
+    def mapped_output(self, like: Tensor, device: torch.device) -> cuts.Output | None:
+        """A fresh cut result; the native owner admits host bytes and outlives every alias."""
+        capturing = torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()
+        if (self.native is None or device != self.device or torch.is_grad_enabled()
+                or capturing or like.layout is not torch.strided or not like.is_contiguous()):
+            return None
+        dtype = next((name for name in ("F16", "BF16", "F32", "F64") if DTYPES[name] == like.dtype), None)
+        if dtype is None:
+            return None
+        stream = torch.cuda.current_stream(device).cuda_stream
+        array = self.native.mapped_output(tuple(like.shape), dtype, stream)
+        if array is None:
+            return None
+        tensor = torch.from_dlpack(array)
+        if tensor.shape != like.shape or tensor.dtype != like.dtype or tensor.device != device:
+            raise RuntimeError("mapped output disagrees with its admitted shape, dtype or device")
+        return _MappedOutput(tensor, array)
 
     def exhausted(self, device: torch.device, need: int, op: str) -> Exhausted:
         peaks = tuple(
