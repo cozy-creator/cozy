@@ -1,4 +1,4 @@
-"""Existing public Tree/physical binding rules, copied unchanged from consumer validator1a221."""
+"""Public Tree/physical binding rules, using the wire format's full-path ordering."""
 import hashlib
 import json
 import math
@@ -33,7 +33,8 @@ def tree_document(root):
     """
     entries = [{'blob': {'length': p.stat().st_size, 'sha256': sha(p)}, 'kind': 'file',
                 'path': p.relative_to(root).as_posix()}
-               for p in sorted(Path(root).rglob('*')) if p.is_file()]
+               for p in Path(root).rglob('*') if p.is_file()]
+    entries.sort(key=lambda entry: entry['path'])
     return json.dumps({'entries': entries}, ensure_ascii=False, sort_keys=True,
                       separators=(',', ':')).encode()
 

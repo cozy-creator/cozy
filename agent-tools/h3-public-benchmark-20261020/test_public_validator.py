@@ -82,6 +82,16 @@ def fixture(root):
 
 
 class PublicValidator(unittest.TestCase):
+    def test_tree_document_orders_full_relative_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a").mkdir()
+            (root / "a" / "value.json").write_text("nested")
+            (root / "a.json").write_text("flat")
+            entries = json.loads(tree_document(root))["entries"]
+            self.assertEqual([entry["path"] for entry in entries],
+                             ["a.json", "a/value.json"])
+
     def test_complete_slower_bound_tree_is_valid(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); spec, run, machine, launch, anchor = fixture(root)
