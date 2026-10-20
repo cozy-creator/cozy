@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tensorfs::read::{ObjectRange, ReadPlan, Source};
+use tensorfs::read::{ReadPlan, Source};
 
 use crate::{Error, Result};
 
@@ -18,21 +18,7 @@ pub fn align_up(x: u64, a: u64) -> u64 {
     x.div_ceil(a) * a
 }
 
-/// Where one run of source bytes lands in the layout.
-#[derive(Debug, Clone)]
-pub struct Item {
-    pub offset: u64,
-    pub len: u64,
-    pub source: ItemSource,
-    /// The last item of its part: bytes up to the next `PART_ALIGN` boundary are padding.
-    pub part_end: bool,
-}
-
-#[derive(Debug, Clone)]
-pub enum ItemSource {
-    Object(ObjectRange),
-    Inline(std::sync::Arc<[u8]>),
-}
+pub use tensorfs::io::source::{Item, ItemSource};
 
 #[derive(Debug, Clone)]
 pub struct Part {
@@ -61,6 +47,8 @@ pub struct Layout {
     /// Identity of the layout: two layouts with the same digest place the same bytes at the
     /// same offsets. Guards adoption of a host memfd written by another process.
     pub digest: String,
+    /// The `regions` it was built from; a sealed host layout carries them (`host::sealed_regions`).
+    pub names: Vec<Vec<String>>,
 }
 
 fn tensor_of(what: &str) -> &str {
@@ -163,6 +151,7 @@ impl Layout {
             regions: out_regions,
             nbytes: at,
             digest: tensorfs::sha256::hex_digest(ident.as_bytes()),
+            names: regions.to_vec(),
         })
     }
 

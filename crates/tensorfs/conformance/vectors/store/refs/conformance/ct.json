@@ -1,1 +1,1 @@
-{"format":"tensorfs.repo/1","name":"Conformance/ct","releases":[{"lanes":{"all":{"length":253,"sha256":"4b98dbb66a410e5623c9931f5c164105b6916d1e5a3357fde8b0294a3cb03541"}},"version":"1"}]}
+{"format":"tensorfs.repo/1","name":"Conformance/ct","releases":[{"tree":{"length":253,"sha256":"3b8c8aa5acaa5eda6a11dc88b3483e689463fec435b06a0c26e9a95efc2ef589"},"version":"1"}]}
