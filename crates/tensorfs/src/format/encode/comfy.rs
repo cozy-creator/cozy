@@ -1,5 +1,5 @@
-//! `comfy.*` encoders: comfy-kitchen 0.2.39's eager quantizers (`quantize_w4a8_int8_weight`,
-//! `quantize_convrot_w4a4_weight`), bit for bit with PyTorch 2.14's CPU kernels on one thread.
+//! `comfy.*` and `int4.convrot` encoders: comfy-kitchen 0.2.39's eager quantizers
+//! (`quantize_w4a8_int8_weight`, `quantize_convrot_w4a4_weight`), bit for bit with PyTorch 2.14's CPU kernels on one thread.
 //! Kitchen rotates in the weight's dtype `L`, so the rotated weight is rounded to `L` before it is
 //! quantized; the rotation is computed in f32 and agrees with kitchen's matmul whenever that sum is
 //! exact (always for bf16 weights of ordinary range). The W4A8 codebook is kitchen's frozen
@@ -24,45 +24,46 @@ pub const W6A8_INT8: Encoder = Encoder {
     pack: None,
 };
 
-pub const CONVROT_W4A4: Encoder = Encoder {
-    scheme: "comfy.convrot_w4a4",
+pub const INT4_CONVROT: Encoder = Encoder {
+    scheme: "int4.convrot",
     quantize: Some(|i| quantize_with(i, &Kitchen::default())),
     pack: None,
 };
 
 impl Encoding {
     pub fn comfy_asym_w4a8_int8(group_size: u64, rotation_size: u64) -> Encoding {
-        let p = [
-            ("group_size", group_size.into()),
-            ("rotation_size", rotation_size.into()),
-        ];
-        encoding("comfy.asym_w4a8_int8", &p)
+        encoding("comfy.asym_w4a8_int8", &grouped_params(group_size, rotation_size))
     }
     pub fn comfy_w6a8_int8(group_size: u64, rotation_size: u64) -> Encoding {
+        encoding("comfy.w6a8_int8", &grouped_params(group_size, rotation_size))
+    }
+    pub fn int4_convrot(rotation_size: u64) -> Encoding {
         let p = [
-            ("group_size", group_size.into()),
+            ("rotation", "kron_regular_h4".into()),
             ("rotation_size", rotation_size.into()),
         ];
-        encoding("comfy.w6a8_int8", &p)
+        encoding("int4.convrot", &p)
     }
-    pub fn comfy_convrot_w4a4(rotation_size: u64) -> Encoding {
-        encoding(
-            "comfy.convrot_w4a4",
-            &[("rotation_size", rotation_size.into())],
-        )
-    }
+}
+
+fn grouped_params(group_size: u64, rotation_size: u64) -> [(&'static str, Value); 3] {
+    [
+        ("group_size", group_size.into()),
+        ("rotation", "kron_regular_h4".into()),
+        ("rotation_size", rotation_size.into()),
+    ]
 }
 
 /// Kitchen's quantizer options beside the encoding's params; `default()` is what ComfyUI
 /// writes (a codebook, symmetric, `F8_E4M3` group scales, W6A8's scale search).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Kitchen {
-    /// 4-bit: a Lloyd-Max codebook (`weight_codebook`); else uniform `q − 8`.
+    /// 4-bit: a Lloyd-Max codebook (`codebook`); else uniform `q − 8`.
     pub codebook: bool,
-    /// 4-bit: `false` is kitchen's asymmetric min/max grid with a `weight_correction`.
+    /// 4-bit: `false` is kitchen's asymmetric min/max grid with a `correction`.
     /// W6A8 refuses `false`, because that format has no correction part.
     pub symmetric: bool,
-    /// `weight_s_rel` in `F32` rather than `F8_E4M3`.
+    /// `group_scale` in `F32` rather than `F8_E4M3`.
     pub f32_scales: bool,
     /// 6-bit: the grid-aware group-scale search (kitchen's requantize skips it).
     pub scale_search: bool,
@@ -86,13 +87,13 @@ const LUT: [f32; 16] = [
 ];
 
 /// The parts of `input.encoding` from its values with kitchen's `options` (ignored by
-/// `comfy.convrot_w4a4`, which has none).
+/// `int4.convrot`, which has none).
 pub fn quantize_with(input: &Input, options: &Kitchen) -> Result<Vec<OwnedPart>> {
     let scheme = input.encoding.scheme.as_str();
     let fail = |d: String| Error::Encode(format!("{scheme}: {d}"));
     if !matches!(
         scheme,
-        "comfy.asym_w4a8_int8" | "comfy.w6a8_int8" | "comfy.convrot_w4a4"
+        "comfy.asym_w4a8_int8" | "comfy.w6a8_int8" | "int4.convrot"
     ) {
         return Err(Error::UnknownScheme(scheme.into()));
     }
@@ -155,8 +156,8 @@ pub fn quantize_with(input: &Input, options: &Kitchen) -> Result<Vec<OwnedPart>>
         return Err(fail(format!("{k} columns are not whole blocks of {b}")));
     }
     let group = match scheme {
-        "comfy.convrot_w4a4" if k.is_multiple_of(64) => None,
-        "comfy.convrot_w4a4" => {
+        "int4.convrot" if k.is_multiple_of(64) => None,
+        "int4.convrot" => {
             return Err(fail(format!("{k} columns are not whole groups of 64")))
         }
         _ => {
@@ -298,12 +299,7 @@ fn w4a4(w: &Weight, x: &[f32]) -> Vec<OwnedPart> {
             packed_shape(w, 4),
             pack(&codes, w.k, 4),
         ),
-        part(
-            "weight_scale",
-            Dtype::F32,
-            w.lead.clone(),
-            f32_bytes(&scales),
-        ),
+        part("scale", Dtype::F32, w.lead.clone(), f32_bytes(&scales)),
     ]
 }
 
@@ -432,26 +428,21 @@ fn grouped(w: &Weight, x: &[f32], g: usize, bits: usize, o: &Kitchen) -> Vec<Own
             pack(&q, k, bits),
         ),
         match o.f32_scales {
-            true => part("weight_s_rel", Dtype::F32, rel_shape, f32_bytes(&s_rel)),
+            true => part("group_scale", Dtype::F32, rel_shape, f32_bytes(&s_rel)),
             false => {
                 let b = s_rel.iter().map(|v| elem::e4m3(*v)).collect();
-                part("weight_s_rel", Dtype::F8_E4M3, rel_shape, b)
+                part("group_scale", Dtype::F8_E4M3, rel_shape, b)
             }
         },
-        part(
-            "weight_s_channel",
-            Dtype::F32,
-            w.lead.clone(),
-            f32_bytes(&s_ch),
-        ),
+        part("scale", Dtype::F32, w.lead.clone(), f32_bytes(&s_ch)),
     ];
     if let Some(cb) = &codebook {
-        parts.push(part("weight_codebook", Dtype::F32, vec![16], f32_bytes(cb)));
+        parts.push(part("codebook", Dtype::F32, vec![16], f32_bytes(cb)));
     }
     if !o.symmetric {
         let shape = vec![groups as u64, n as u64];
         parts.push(part(
-            "weight_correction",
+            "correction",
             w.dtype.clone(),
             shape,
             l_bytes(&w.dtype, &corr),

@@ -95,6 +95,7 @@ fn empty_u7_tensors_do_not_overflow_large_packed_column_metadata() {
             scheme: scheme.into(),
             params: BTreeMap::from([
                 ("group_size".into(), 16u64.into()),
+                ("rotation".into(), "kron_regular_h4".into()),
                 ("rotation_size".into(), 256u64.into()),
             ]),
         };
@@ -108,7 +109,7 @@ fn empty_u7_tensors_do_not_overflow_large_packed_column_metadata() {
                 },
             ),
             (
-                "weight_s_rel",
+                "group_scale",
                 PartBytes {
                     dtype: &Dtype::F32,
                     shape: &groups,
@@ -116,7 +117,7 @@ fn empty_u7_tensors_do_not_overflow_large_packed_column_metadata() {
                 },
             ),
             (
-                "weight_s_channel",
+                "scale",
                 PartBytes {
                     dtype: &Dtype::F32,
                     shape: &rows,
