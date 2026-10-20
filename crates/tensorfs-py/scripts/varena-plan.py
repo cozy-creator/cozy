@@ -379,11 +379,11 @@ class Checkpoint:
     """What `regions_of` reads of a checkpoint: each component's tensor keys in header order."""
 
     def __init__(self) -> None:
-        self.tensors, self.span = {}, {}
-        self.manifest = SimpleNamespace(sha256="0" * 64)
+        self.components, self.span = {}, {}
+        self.id = "sha256:" + "0" * 64
         for name, (common, block, n, _) in SIZES.items():
             keys = ["common.weight", *(f"blocks.{i}.weight" for i in range(n))]
-            self.tensors[name] = dict.fromkeys(keys)
+            self.components[name] = SimpleNamespace(tensors=dict.fromkeys(keys))
             for key in keys:
                 self.span[f"{name}/{key}"] = common if key == "common.weight" else block
 

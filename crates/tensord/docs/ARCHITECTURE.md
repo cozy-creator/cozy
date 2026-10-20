@@ -114,7 +114,6 @@ code is still not sandboxed.
 | `child_launcher.rs` | Pool-owned spawn thread (PDEATHSIG follows the creating thread) | `ChildLauncher` | E |
 | `os.rs` | memfd, seals, peer credentials (`SO_PEERPIDFD`, `pidfd_open` fallback), pidfd exit | — | E |
 | `protocol.rs` | Length-prefixed frames of the executor seam | `read_body`, `write_body` | E |
-| `model_sources.rs` | Selected model headers/assets as verified bytes and sealed read-only descriptors; component byte facts for planning | `ModelSources`, `SelectedManifest` | B1 |
 | `boundary_json.rs` | Strict JSON parse (no duplicate keys) for boundary records | — | D1 |
 
 
@@ -152,7 +151,6 @@ the checkpoint reference Runtime reports; failed uploads leave Runtime's local c
 - [Package bridge](PACKAGE-BRIDGE.md): generation description and install.
 - [Device executor](DEVICE-EXECUTOR.md): executor launch and control seam.
 - [GPU service](GPU-SERVICE.md): GPU pool, config, launch identity.
-- [Model sources](MODEL-SOURCES.md): Degree 1.
 - [Matched gate](../scripts/gate/README.md): ComfyUI vs TensorD, ordinary CLI.
 
 ## Build and test

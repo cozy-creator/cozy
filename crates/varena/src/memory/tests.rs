@@ -11,7 +11,7 @@ fn error(what: &str) -> Error {
 fn weights_with_host(with_host: bool) -> (Arc<Weights>, i32) {
     let file = std::fs::File::open("/dev/null").unwrap();
     let fd = file.as_raw_fd();
-    let source = Source::files(vec![(tensorfs::ids::ObjectRef::of(&[]), file)], false, 0);
+    let source = Source::files(vec![(tensorfs::format::ObjectRef::of(&[]), file)], false, 0);
     let layout = Layout {
         parts: vec![],
         regions: vec![crate::layout::Region {

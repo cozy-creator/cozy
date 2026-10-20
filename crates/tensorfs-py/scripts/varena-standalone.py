@@ -3,7 +3,7 @@
 
 A tiny `UNet2DConditionModel` is written into a TensorFS store; the same model built on meta is
 loaded through `Memory.load(model, ck=...)` (its blocks from `_no_split_modules`, its bytes from
-the store's chunk files) and run under `with mem.request(...)`, then compared with the plain
+its chunks, read by TensorFS) and run under `with mem.request(...)`, then compared with the plain
 model. Again with `limit` leaving room for common and half its blocks: on a GPU it streams.
 
     python scripts/varena-standalone.py
@@ -73,12 +73,12 @@ def main() -> int:
     torch.backends.cudnn.allow_tf32 = False  # TF32 convolutions differ by cuDNN algorithm
     torch.manual_seed(0)
     plain = UNet2DConditionModel(**CONFIG).eval()
-    store = tensorfs.Store(str(Path(tempfile.mkdtemp(prefix="varena-standalone-")) / "store"))
-    w = store.writer()
+    w = tensorfs.Writer(cache_dir=Path(tempfile.mkdtemp(prefix="varena-standalone-")) / "store")
+    unet = w.component("unet", cls="diffusers.UNet2DConditionModel", config=CONFIG)
     for key, t in plain.state_dict().items():
         t = t.detach().contiguous()
-        w.put("unet", key, "F32", list(t.shape), t.view(torch.uint8).numpy())
-    ck = store.checkpoint(w.commit())
+        unet.put(key, "F32", list(t.shape), t.view(torch.uint8).numpy())
+    ck = w.commit()
     x, text = (torch.randn(*s, generator=torch.Generator().manual_seed(1)) for s in ((1, 4, 8, 8), (1, 5, 768)))
     plain.to(device)
     with torch.no_grad():

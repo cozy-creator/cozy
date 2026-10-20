@@ -60,10 +60,8 @@ it holds, making room in other executors through the GPU's ledger (design memory
   frames (optionally with an `SCM_RIGHTS` fd) go to `Services::request`. The reply must name the
   command, otherwise it is an error. Unknown events and fields are ignored.
 - `Baseline` services answer every request `capability_unavailable`.
-- A successful `model_source_read` answer must pass a read-only regular-file fd of the declared length.
 - `read_grant {manifest, layout}`: the answer names its `descriptors` and the fds follow it: a
-  deposited sealed host layout (`held`), or the weight set's chunk files sorted by digest
-  (`objects_sha256`). They go to `Services::read_grant`. `deposit {manifest, layout}` carries one
+  deposited sealed host layout (`held`), else none. They go to `Services::read_grant`. `deposit {manifest, layout}` carries one
   memfd (`descriptor`): a sealed layout the executor filled.
 
 ## Capabilities

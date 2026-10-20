@@ -139,13 +139,13 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   nonterminal.
 
 Executor requests:
-- `read_grant {manifest, layout}`: a weight set's bytes. The sealed host layout an executor
-  deposited for that manifest and layout (one fd, `held`); else every chunk file of its selected
-  components, sorted by digest, with `objects_sha256` (`descriptors` fds). TensorD never fills.
+- `read_grant {manifest, layout}`: the sealed host layout an executor deposited for that manifest
+  and layout (one fd, `held`); else nothing, and the Runtime reads the checkpoint through
+  TensorFS. TensorD never fills.
 - `deposit {manifest, layout}` + the memfd: a layout varena sealed in the executor, kept as an
   opaque handle (`deposits.rs`) for the next executor of the same weights (D9's refill path);
   under host pressure the least recently granted goes first.
-- `model_source` goes to `ModelSources` for selected headers/assets in sealed descriptors.
+- `checkpoint_item` records a weights output's TensorFS reference, which the Runtime committed.
 - `publish` (`Outputs.publish`) goes to `products.rs`: the spool file is retained as a native
   one-file tree bound to the run's actor, then journaled as a `product` (list outputs APPEND,
   single outputs SET; re-publishing identical SET bytes is a no-op). Answers `Published`.

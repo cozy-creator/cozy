@@ -1124,7 +1124,7 @@ impl Drop for Inner {
             self.retain_resources();
             return;
         }
-        let Ok(d) = crate::faults::hit("inner-drop-driver").and_then(|_| cuda::driver()) else { self.retain_resources(); return };
+        let Ok(d) = crate::faults::hit("inner-drop-driver").and_then(|_| cuda::driver().map_err(Error::from)) else { self.retain_resources(); return };
         let Ok(_c) = CtxGuard::enter(self.ctx) else { self.retain_resources(); return };
         // SAFETY: our live stream in its current context. Drop cannot use the fallible macro.
         if self.check().is_err() || cuda::check("cuStreamSynchronize", unsafe { (d.stream_synchronize)(self.copy) }).is_err() {
@@ -1441,7 +1441,7 @@ impl Drop for WeightSet {
         if g.check().is_err() {
             return;
         }
-        let _c = match crate::faults::hit("set-drop-context").and_then(|_| CtxGuard::enter(g.ctx)) {
+        let _c = match crate::faults::hit("set-drop-context").and_then(|_| CtxGuard::enter(g.ctx).map_err(Error::from)) {
             Ok(c) => c,
             Err(e) => { g.poison(e); return; }
         };
@@ -1593,7 +1593,7 @@ impl Drop for Pinned {
             return;
         }
         self.finish_streams(|stream| {
-            let _c = crate::faults::hit("pin-release-context").and_then(|_| CtxGuard::enter(g.ctx))?;
+            let _c = crate::faults::hit("pin-release-context").and_then(|_| CtxGuard::enter(g.ctx).map_err(Error::from))?;
             crate::faults::hit("pin-release")?;
             g.events.record(stream as CUstream, false)
         }, |stream| {

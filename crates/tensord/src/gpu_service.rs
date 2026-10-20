@@ -18,7 +18,6 @@ use crate::{
     },
     launch_identity::Seal,
     memory::{GpuLedger, MemoryConfig},
-    model_sources::{ModelSources, SelectedManifest},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -273,6 +272,26 @@ impl Plan {
     }
 }
 
+/// `components` of the checkpoint `manifest`: their encoded bytes, and its header's length.
+fn selected_bytes(store: &Store, manifest: &str, components: &[String]) -> io::Result<(u64, u64)> {
+    let checkpoint = crate::storage::checkpoint(store, manifest)?;
+    let mut encoded = 0;
+    for name in components {
+        let component = checkpoint.header().component(name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::PermissionDenied, format!("selected component {name} is absent"))
+        })?;
+        encoded += (component.tensors.iter()).flat_map(|t| t.locations().into_iter().map(|(_, at)| at.length)).sum::<u64>();
+    }
+    Ok((encoded, checkpoint.id().length))
+}
+
+/// A checkpoint a plan reads, and the components of it its slots read.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SelectedManifest {
+    pub manifest: String,
+    pub components: Vec<String>,
+}
+
 /// `slots`' checkpoints, one row per manifest with every component a slot of it reads.
 fn merged<'a>(slots: impl IntoIterator<Item = &'a PlanSlot>) -> Vec<SelectedManifest> {
     let mut rows: Vec<SelectedManifest> = vec![];
@@ -415,8 +434,6 @@ struct Session {
     executor: DeviceExecutor,
     /// When it last came back idle: idle executors end least recently used first.
     used: Instant,
-    /// Its selected models' headers and assets, served on `model_source`.
-    sources: Arc<ModelSources>,
     /// This executor in the host tier and the layouts it may adopt.
     launch: Launch,
     /// It has served a call: its next one is not its first.
@@ -1407,9 +1424,6 @@ impl Pool {
             self.retire_returned(&plan, start, width, &[birth]);
         }
     }
-    pub fn source_facts(&self, selections: &[SelectedManifest]) -> io::Result<ModelSources> {
-        ModelSources::open_shared(self.store.clone(), selections)
-    }
     pub fn published_installation(
         &self,
         service: &crate::service::Service,
@@ -1636,11 +1650,7 @@ impl Pool {
                     format!("declared components of {path} exceed authorized cached model scope"),
                 ));
             }
-            let sources = self.source_facts(&[SelectedManifest {
-                manifest: grant.manifest.clone(),
-                components: components.clone(),
-            }])?;
-            let (_, selected_encoded_bytes, length) = sources.selected_facts(&grant.manifest)?;
+            let (selected_encoded_bytes, length) = selected_bytes(&self.store, &grant.manifest, &components)?;
             if chosen
                 .and_then(|c| c.manifest.as_ref())
                 .is_some_and(|r| r.length != 0 && r.length != length)
@@ -2599,7 +2609,7 @@ impl Pool {
         let fresh = plan.clone();
         let error = {
             let mut session = session;
-            let fetch = calls.map(|calls| engine.get(id).map(|record| calls.fetch(&record, &plan))).transpose()?;
+            let fetch = calls.map(|calls| engine.get(id).map(|record| calls.fetch(&record))).transpose()?;
             match self.call(engine, id, &held, plan, &mut session, false, calls, fetch) {
                 Ok(reusable) => {
                     // A caller can submit again as soon as finish publishes. Its predecessor
@@ -2723,7 +2733,6 @@ impl Pool {
             serving: self.serving.clone(),
             id,
         });
-        let sources = Arc::new(ModelSources::open_shared(self.store.clone(), &selections)?);
         Ok(Session {
             plan: plan.construction.clone(),
             start,
@@ -2734,7 +2743,6 @@ impl Pool {
             loaded: false,
             executor,
             used: Instant::now(),
-            sources,
             launch,
             invoked: false,
         })
@@ -2752,7 +2760,7 @@ impl Pool {
         session: &mut Session,
         load_only: bool,
         calls: Option<&Arc<crate::calls::Calls>>,
-        fetch: Option<Arc<crate::access::Fetch>>,
+        _fetch: Option<Arc<crate::access::Fetch>>,
     ) -> io::Result<bool> {
         let (start, degree) = (session.start, plan.degree);
         let construction = plan.construction.clone();
@@ -2771,14 +2779,10 @@ impl Pool {
             id,
             completed: 0,
             deposits: &self.deposits,
-            sources: &session.sources,
+            generation: &held.record,
             pool: self,
-            store: &self.store,
             spool: None,
             caller: None,
-            weights: None,
-            fetch: fetch.as_ref(),
-            raw: &plan.sources,
             kept: gpus.iter().enumerate().map(|(rank, d)| {
                 let pid = if rank == 0 { Some(session.executor.birth.pid) } else { session.followers.get(rank - 1).map(|f| f.birth().pid) };
                 d.memory.as_ref().zip(pid).map(|(memory, pid)| (memory, pid, d.entry.as_str()))
@@ -2849,6 +2853,7 @@ impl Pool {
             let load = match plan.slots.first() {
                 // A call that constructs nothing: its weightless construction.
                 None => DeviceCommand::Load {
+                    tensorfs: calls.and_then(|calls| calls.tensorfs(id)),
                     construction: construction.clone(),
                     devices: lane.clone(),
                     sequence_parallel_degree: ranks,
@@ -2875,6 +2880,7 @@ impl Pool {
                         _ => plan.slots.iter().map(load).collect(),
                     };
                     DeviceCommand::Load {
+                        tensorfs: calls.and_then(|calls| calls.tensorfs(id)),
                         construction: construction.clone(),
                         devices: lane.clone(),
                         sequence_parallel_degree: ranks,
@@ -3003,17 +3009,24 @@ impl Pool {
         let interface = session.executor.root_path().join("package-interface.json");
         let caller = calls.map(|calls| calls.caller(&record, held, document, &interface, &spool).0);
         callbacks.caller = caller.as_ref();
-        let grant = match (calls, &fetch) {
-            (Some(calls), Some(fetch)) => calls.grant(engine, &record, &plan, document, &spool, fetch)?,
-            _ => None,
-        };
-        callbacks.weights = calls.zip(grant.as_ref()).map(|(calls, grant)| (calls.weights(), grant));
+        let entry = document["entrypoints"].as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == plan.entrypoint))
+            .cloned().unwrap_or_default();
+        let weights = entry["weights_outputs"].as_array().into_iter().flatten()
+            .filter_map(|row| Some((row["output_id"].as_str()?.to_owned(), row["max_bytes"].as_u64()?)))
+            .collect();
+        let operation = crate::call_memo::operation(&held.record, &record.invocation.module, &entry["invocable"])
+            .unwrap_or_default();
         session.executor.waits = caller.as_ref().map(|caller| caller.waits(engine));
         let invoked = Instant::now();
         let first = !session.invoked;
         session.invoked = true;
         let reply = session.executor.command(
             &DeviceCommand::Invoke {
+                tensorfs: calls.and_then(|calls| calls.tensorfs(id)).map(Box::new),
+                destination: calls.map(|calls| calls.destination(id)).unwrap_or_default(),
+                actor: record.submission.as_ref().map(|submission| submission.actor.clone()).unwrap_or_default(),
+                operation,
                 max_output_bytes: crate::output_capacity::for_callable(document, "entrypoints", &plan.entrypoint)?,
                 request_id: id.into(),
                 construction: construction.clone(),
@@ -3025,7 +3038,7 @@ impl Pool {
                 inputs: inputs.inputs,
                 trees: inputs.trees,
                 sources: plan.sources.iter().map(|s| (s.parameter.clone(), s.manifest.clone())).collect(),
-                weights: grant.as_ref().map(|grant| grant.outputs.clone()).unwrap_or_default(),
+                weights,
             },
             &mut callbacks,
         );
@@ -3677,50 +3690,14 @@ fn constructions(plan: &Plan) -> Vec<Construction> {
     plan.slots.iter().map(slot).collect()
 }
 
-/// A call's `fetch_channel` answers: a fresh channel over its checkpoints held in part.
-struct Ahead<'a>(Option<&'a crate::access::Fetch>);
-impl Services for Ahead<'_> {
-    fn request(&mut self, frame: &Frame, descriptor: Option<File>) -> io::Result<(Answer, Option<File>)> {
-        drop(descriptor);
-        let mut answer = Answer::unavailable(frame.seq);
-        let (Kind::FetchChannel, Some(fetch)) = (frame.kind, self.0) else {
-            return Ok((answer, None));
-        };
-        Ok(match fetch.channel() {
-            Ok(channel) => {
-                (answer.ok, answer.descriptor) = (true, true);
-                answer.code.clear();
-                answer.detail.clear();
-                (answer, Some(channel))
-            }
-            Err(error) => {
-                answer.code = "fetch_channel_refused".into();
-                answer.detail = error.to_string();
-                (answer, None)
-            }
-        })
-    }
-}
-
-/// A `read_grant`'s answer, the descriptors counted in `descriptors` and following it: `held`,
-/// the one layout deposited for it; else the chunk files `objects_sha256` names. Runtime's
+/// A `read_grant`'s answer: `held`, the one layout deposited for it, its fd following; else
+/// nothing (the Runtime reads the checkpoint through TensorFS). Runtime's
 /// `tests/tensord_peer.py` (`answer_read_grants`) sends this very shape.
-fn granted(seq: u64, held: bool, files: io::Result<(Vec<File>, String)>) -> (Answer, Vec<File>) {
-    let mut answer = Answer::unavailable(seq);
-    match files {
-        Ok((files, objects_sha256)) => {
-            (answer.ok, answer.held, answer.descriptors) = (true, held, files.len() as u64);
-            answer.objects_sha256 = objects_sha256;
-            answer.code.clear();
-            answer.detail.clear();
-            (answer, files)
-        }
-        Err(error) => {
-            answer.code = "read_grant_refused".into();
-            answer.detail = error.to_string();
-            (answer, Vec::new())
-        }
-    }
+fn granted(seq: u64, layout: Option<File>) -> (Answer, Vec<File>) {
+    let mut answer = Answer::ok(seq);
+    let files: Vec<File> = layout.into_iter().collect();
+    (answer.held, answer.descriptors) = (!files.is_empty(), files.len() as u64);
+    (answer, files)
 }
 
 struct Callbacks<'a> {
@@ -3728,43 +3705,23 @@ struct Callbacks<'a> {
     id: &'a str,
     completed: u64,
     deposits: &'a Deposits,
-    sources: &'a Arc<ModelSources>,
+    /// The environment the executor runs: its App's declarations name the products it publishes.
+    generation: &'a crate::catalog::Generation,
     pool: &'a Pool,
-    store: &'a Store,
     /// The invoking request's spool, where its published assets' bytes are.
     spool: Option<PathBuf>,
     /// The invoking request as a caller: its child-call frames.
     caller: Option<&'a crate::calls::Caller>,
-    /// Its weights broker and grant: its `Weights[M]` sources and weights outputs.
-    weights: Option<(&'a crate::weights::Weights, &'a crate::weights::Grant)>,
-    /// The call's fetches: its readers wait on them, and its executor asks for channels.
-    fetch: Option<&'a Arc<crate::access::Fetch>>,
-    /// Its `Weights[M]` sources, whose headers and assets `model_source` answers too.
-    raw: &'a [crate::gpu_service::PlanSource],
     /// Each rank's GPU ledger, corresponding executor process and physical lane entry.
     kept: Vec<Option<(&'a GpuLedger, u32, &'a str)>>,
 }
-impl Callbacks<'_> {
-    /// The weight set's chunk files, once its objects landed, and their digest in `answer`.
-    fn chunks(&self, manifest: &str) -> io::Result<(Vec<File>, String)> {
-        let objects = self.sources.chunks(manifest)?;
-        if let Some(fetch) = self.fetch {
-            fetch.wait(manifest, &objects)?;
-        }
-        Ok((self.sources.files(&objects)?, crate::deposits::objects_digest(&objects)))
-    }
-}
 impl Services for Callbacks<'_> {
-    /// A weight set's bytes: the sealed host layout an executor deposited for its manifest and
-    /// layout, else every chunk file of its selected components (TensorD never fills).
+    /// A weight set's held bytes: the sealed host layout an executor deposited for its manifest
+    /// and layout, else nothing (TensorD never fills).
     fn read_grant(&mut self, frame: &Frame, plan: Option<File>) -> io::Result<(Answer, Vec<File>)> {
         drop(plan);
-        let (held, files) = match self.deposits.grant(&frame.manifest, &frame.layout) {
-            Some(layout) => (true, Ok((vec![layout], String::new()))),
-            None => (false, self.chunks(&frame.manifest)),
-        };
-        let nfiles = files.as_ref().map_or(0, |(f, _)| f.len());
-        let (mut answer, mut fds) = granted(frame.seq, held, files);
+        let (mut answer, mut fds) = granted(frame.seq, self.deposits.grant(&frame.manifest, &frame.layout));
+        let held = answer.held;
         // GPU pages a gone executor kept of this layout follow its host layout.
         let rank = self.kept.get(frame.rank as usize).copied().flatten();
         if let Some((fingerprint, pages)) = rank.filter(|_| held).and_then(|(m, _, _)| m.take_kept(&frame.layout)) {
@@ -3775,7 +3732,7 @@ impl Services for Callbacks<'_> {
             (answer.fingerprint, answer.descriptors) = (fingerprint, fds.len() as u64);
         }
         self.pool.notes.note(serde_json::json!({"event": "read_grant", "manifest": frame.manifest,
-            "layout": frame.layout, "held": held, "files": nfiles, "pages": answer.pages.len(),
+            "layout": frame.layout, "held": held, "pages": answer.pages.len(),
             "rank": frame.rank, "pid": rank.map(|(_, pid, _)| pid), "gpu": rank.map(|(_, _, gpu)| gpu)}));
         Ok((answer, fds))
     }
@@ -3798,9 +3755,6 @@ impl Services for Callbacks<'_> {
         frame: &Frame,
         descriptor: Option<File>,
     ) -> io::Result<(Answer, Option<File>)> {
-        if frame.kind == Kind::FetchChannel {
-            return Ahead(self.fetch.map(|fetch| &**fetch)).request(frame, descriptor);
-        }
         if frame.kind == Kind::Deposit {
             // A layout varena sealed in the executor, kept for the next executor of its weights.
             let layout = descriptor.ok_or_else(|| io::Error::other("a deposit omitted its layout"))?;
@@ -3812,53 +3766,17 @@ impl Services for Callbacks<'_> {
                 Err(error) => (Answer::refused(frame.seq, "deposit_refused", error.to_string()), None),
             });
         }
-        if frame.kind == Kind::ModelSource {
-            drop(descriptor);
-            // A refusal is an answer: that executor fails its load with the reason.
-            // A `Weights[M]` source's header and assets too, for Runtime to plan its reads.
-            let id = |m: &str| m.trim_start_matches("sha256:").to_string();
-            let served = match self.raw.iter().any(|s| id(&s.manifest) == id(&frame.manifest)) {
-                true => {
-                    let selected = [SelectedManifest { manifest: frame.manifest.clone(), components: vec![] }];
-                    ModelSources::open_shared(self.pool.store.clone(), &selected).and_then(|raw| raw.serve(frame))
-                }
-                false => self.sources.serve(frame),
-            };
-            return Ok(match served {
-                Ok((answer, file)) => (answer, Some(file)),
-                Err(error) => {
-                    let mut answer = Answer::unavailable(frame.seq);
-                    answer.code = "model_source_refused".into();
-                    answer.detail = error.to_string();
-                    (answer, None)
-                }
-            });
-        }
         if frame.kind == Kind::Publish {
             drop(descriptor);
             let answer = match &self.spool {
-                Some(spool) => {
-                    crate::products::publish(self.store, self.engine, self.id, spool, frame)
-                }
+                Some(spool) => crate::products::publish(self.engine, self.generation, self.id, spool, frame),
                 None => Answer::unavailable(frame.seq),
             };
             return Ok((answer, None));
         }
-        if frame.kind == Kind::WeightsWriter {
+        if frame.kind == Kind::CheckpointItem {
             drop(descriptor);
-            let Some((weights, grant)) = self.weights else {
-                return Ok((Answer::unavailable(frame.seq), None));
-            };
-            let (mut answer, channel, adopted) = weights.answer(grant, frame);
-            for upload in grant.take_uploads() {
-                crate::calls::record_upload(self.engine, self.id, &upload);
-            }
-            if let Some(adopted) = adopted {
-                if let Err(error) = crate::products::record_manifest(self.engine, self.id, &adopted.output, &adopted.manifest) {
-                    answer = Answer::refused(frame.seq, "publish_refused", error.to_string());
-                }
-            }
-            return Ok((answer, channel));
+            return Ok((crate::products::checkpoint(self.engine, self.generation, self.id, frame), None));
         }
         drop(descriptor);
         match self.caller {
@@ -3876,21 +3794,17 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     /// The `read_grant` answers Runtime's `tests/tensord_peer.py` mirrors, field for field: a
-    /// held layout is one descriptor and no list; chunk files come with their list's digest.
+    /// held layout is one descriptor; without one, nothing follows.
     #[test]
     fn a_read_grant_answer_is_the_shape_runtime_reads() {
-        let file = || File::open("/dev/null").unwrap();
-        let (held, fds) = granted(7, true, Ok((vec![file()], String::new())));
+        let (held, fds) = granted(7, Some(File::open("/dev/null").unwrap()));
         assert_eq!(fds.len(), 1);
         assert_eq!(serde_json::to_value(&held).unwrap(), json!({"event": "answer", "seq": 7, "ok": true,
             "code": "", "detail": "", "held": true, "sha256": "", "length": 0, "descriptors": 1}));
-        let (chunks, fds) = granted(8, false, Ok((vec![file(), file()], "ab".repeat(32))));
-        assert_eq!(fds.len(), 2);
-        assert_eq!(serde_json::to_value(&chunks).unwrap(), json!({"event": "answer", "seq": 8, "ok": true,
-            "code": "", "detail": "", "held": false, "sha256": "", "length": 0, "descriptors": 2,
-            "objects_sha256": "ab".repeat(32)}));
-        let (refused, fds) = granted(9, false, Err(io::Error::other("outside selection")));
-        assert!(fds.is_empty() && !refused.ok && refused.code == "read_grant_refused");
+        let (missed, fds) = granted(8, None);
+        assert!(fds.is_empty());
+        assert_eq!(serde_json::to_value(&missed).unwrap(), json!({"event": "answer", "seq": 8, "ok": true,
+            "code": "", "detail": "", "held": false, "sha256": "", "length": 0}));
     }
 
     /// Runs 5313/5318/5319 ended `executor_poisoned: ; the executor did not settle quiescent

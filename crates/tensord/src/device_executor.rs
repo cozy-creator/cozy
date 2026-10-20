@@ -168,6 +168,8 @@ pub enum DeviceCommand {
     },
     Load {
         construction: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tensorfs: Option<protocol::machine::TensorFSOptions>,
         devices: String,
         sequence_parallel_degree: u32,
         binding: Box<Binding>,
@@ -197,6 +199,8 @@ pub enum DeviceCommand {
         input_metadata: BTreeMap<String, Value>,
     },
     Invoke {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tensorfs: Option<Box<protocol::machine::TensorFSOptions>>,
         /// Retained asset capacity derived from the actual installed result schema.
         max_output_bytes: u64,
         request_id: String,
@@ -214,12 +218,19 @@ pub enum DeviceCommand {
         /// Input trees by reference: (read-only directory, manifest digest).
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         trees: BTreeMap<String, (PathBuf, String)>,
-        /// Each `Weights[M]` parameter's checkpoint (`sha256:<hex>`), read through `weights_writer`.
+        /// Each `Weights[M]` parameter's checkpoint (`sha256:<hex>`, its header), which the
+        /// Runtime opens from the store itself.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         sources: BTreeMap<String, String>,
-        /// The weights outputs this attempt may write: output id to its byte bound.
+        /// Declared outputs and bounds, enforced by Runtime's public Writer.
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         weights: BTreeMap<String, u64>,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        destination: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        actor: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        operation: String,
     },
     /// Warming: the loaded construction's models are loaded at `level` (`gpu` or `ram`, varena
     /// filling them), nothing run.
@@ -304,14 +315,15 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
-    ModelSource,
-    /// One weight set's bytes: its sealed host layout, or its chunk files.
+    /// One weight set's held bytes: the sealed host layout deposited for it, else nothing.
     ReadGrant,
     /// A sealed host layout the executor filled, for the next executor of its weights.
     Deposit,
     /// GPU pages of weight regions the executor kept, held past its end (`descriptors` follow).
     KeepPages,
     Publish,
+    /// A weights output's TensorFS reference, which Runtime committed or uploaded.
+    CheckpointItem,
     StageMemoLookup,
     StageMemoStore,
     Progress,
@@ -323,10 +335,6 @@ pub enum Kind {
     ChildEvents,
     GpuRelease,
     ModelPrefetch,
-    /// An attempt's weights: one source read, one output written, or an output adopted.
-    WeightsWriter,
-    /// A fresh channel over the call's checkpoints held in part (`access::Fetch::channel`).
-    FetchChannel,
     /// A `progress` event carrying a retained `log` observation (`Telemetry.log`).
     Log,
     #[default]
@@ -516,10 +524,10 @@ pub struct Frame {
     pub numerics: String,
     pub local: String,
     pub cost_ms: f64,
-    /// `weights_writer`: `source`, `output` or `adopt`, its output and its transaction.
-    pub operation: String,
-    pub output_slot: String,
-    pub transaction: String,
+    /// `checkpoint_item`: the immutable TensorFS reference Runtime committed or uploaded.
+    pub repo_id: String,
+    pub revision: String,
+    pub variant: String,
 }
 
 impl Frame {
@@ -598,17 +606,6 @@ pub struct Answer {
     /// A failed child call's raising traceback, whole (its triage's).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub traceback: String,
-    /// `Opened` (a weights output) and `Adopted`: its transaction, run and manifest.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub transaction: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub request_id: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub manifest: String,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub manifest_length: u64,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub receipt_digest: String,
     /// A memo hit: the entry's verified copy in the run's spool, and what producing it cost.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub local: String,
@@ -622,11 +619,6 @@ pub struct Answer {
     pub stored: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub reason: String,
-    /// `read_grant` without a sealed layout: the SHA-256 of the chunk objects whose fds
-    /// follow, sorted by digest (`deposits::objects_digest`), in place of the list (SDXL's
-    /// UNet: about 1,700 objects).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub objects_sha256: String,
     /// A held `read_grant`: GPU pages kept for it, whose fds follow the layout's.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub fingerprint: String,
@@ -657,17 +649,11 @@ impl Answer {
             byte_grants: Vec::new(),
             progress: None,
             traceback: String::new(),
-            transaction: String::new(),
-            request_id: String::new(),
-            manifest: String::new(),
-            manifest_length: 0,
-            receipt_digest: String::new(),
             local: String::new(),
             cost_ms: 0.0,
             disputed: false,
             stored: false,
             reason: String::new(),
-            objects_sha256: String::new(),
             fingerprint: String::new(),
             pages: Vec::new(),
         }
@@ -1669,7 +1655,17 @@ impl DeviceExecutor {
             value["memo"] =
                 serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
         }
-        write_frame(&mut self.stream, &value)?;
+        let bytes = serde_json::to_vec(&value)?;
+        // Only the typed TensorFS options may carry supplied access: the wire bytes keep the
+        // token, every other field is scanned.
+        if let (true, Some(options)) = (
+            matches!(command, DeviceCommand::Load { tensorfs: Some(_), .. } | DeviceCommand::Invoke { tensorfs: Some(_), .. }),
+            value.get_mut("tensorfs").and_then(Value::as_object_mut),
+        ) {
+            options.remove("token");
+        }
+        scan(&value)?;
+        seam::write_body(&mut self.stream, &bytes)?;
         for fd in fds {
             platform::handles::send_fd(&self.stream, fd)?;
         }

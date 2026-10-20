@@ -141,15 +141,15 @@ class Net(nn.Module):
 
 
 def build(root: Path, dim: int, blocks: int) -> tuple[tensorfs.Checkpoint, dict[str, torch.Tensor]]:
-    """The model's weights in a v2 store, in construction order; and the tensors."""
+    """The model's weights in a store, in construction order; and the tensors."""
     torch.manual_seed(0)
     reference = Net(dim, blocks)
     tensors = {k: v.detach().contiguous() for k, v in reference.state_dict().items()}
-    store = tensorfs.Store(root)
-    w = store.writer()
+    w = tensorfs.Writer(cache_dir=root)
+    net = w.component("net", cls="test.Net", config={})
     for key, t in tensors.items():
-        w.put("net", key, "BF16", list(t.shape), t.view(torch.uint8).numpy().tobytes())
-    return store.checkpoint(w.commit()), tensors
+        net.put(key, "BF16", list(t.shape), t.view(torch.uint8).numpy().tobytes())
+    return w.commit(), tensors
 
 
 def meta(dim: int, blocks: int) -> Net:
@@ -614,12 +614,12 @@ def relaxes(root: Path, dev: torch.device) -> None:
     dim, count, tokens = 4096, 16, 4096
     torch.manual_seed(0)
     plain = WideNet(dim, count).bfloat16()
-    store = tensorfs.Store(root / "wide")
-    w = store.writer()
+    w = tensorfs.Writer(cache_dir=root / "wide")
+    wide = w.component("wide", cls="test.WideNet", config={})
     for key, t in plain.state_dict().items():
         t = t.detach().contiguous()
-        w.put("wide", key, "BF16", list(t.shape), t.view(torch.uint8).numpy().tobytes())
-    ck = store.checkpoint(w.commit())
+        wide.put(key, "BF16", list(t.shape), t.view(torch.uint8).numpy().tobytes())
+    ck = w.commit()
     weights = sum(t.numel() * t.element_size() for t in plain.state_dict().values())
     coarse = tokens * dim * Wide.WIDE * 2  # the temporary of one uncut window
     x = torch.randn(tokens, dim, generator=torch.Generator().manual_seed(3)).bfloat16().to(dev)
