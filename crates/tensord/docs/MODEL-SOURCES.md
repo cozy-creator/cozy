@@ -7,8 +7,8 @@ authorize a request.
 
 `model_sources.rs` (`ModelSources`) reads verified headers and header-declared assets through
 TensorFS. `GpuPool` answers executor `model_source` requests with those bytes in sealed
-read-only descriptors. Tensor payloads reach Runtime through the shared CPU layouts,
-streaming windows or granted object descriptors described in [Host tier](HOST-TIER.md).
+read-only descriptors. Tensor payloads reach Runtime through `read_grant`: a host layout an
+executor deposited, else the selected components' chunk files (`chunks`, `files`).
 TensorFS runs as a library in TensorD and in Runtime; these requests do not address a
 separate TensorFS daemon.
 
@@ -18,7 +18,7 @@ separate TensorFS daemon.
 and the requested components. TensorFS's read plan calculates their encoded source bytes.
 `selected_facts(manifest)` returns the component names, encoded byte count and manifest length;
 the byte count is neither prepared CPU-buffer residency nor a prediction of GPU memory use.
-`authorized_header(manifest)` supplies the header used to validate host-tier requests.
+`authorized(manifest)` supplies the selected checkpoint.
 
 `source(manifest, name)` returns the verified header when `name` is empty, or the named
 header-declared asset. Assets are read through a TensorFS lease over their own objects.
@@ -38,5 +38,5 @@ budgets. Descriptor and buffer lifetimes are separate from the request that supp
 ## Known gaps
 
 - Cooperative same-user contract, not a sandbox.
-- Host-tier object descriptors/read leases can reach the hard fd limit; see [Host tier](HOST-TIER.md).
+- A `read_grant` of chunk files sends one descriptor per chunk.
 - Assets are buffered whole in memory.
