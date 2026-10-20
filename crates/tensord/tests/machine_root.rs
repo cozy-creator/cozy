@@ -189,7 +189,7 @@ async fn the_named_store_is_the_machines_store() {
         let store = storage::open(&named).unwrap();
         store.put_bytes(&kept).unwrap();
         let tree = store.put_tree(&tensorfs::format::Tree { files: [("weights.bin".to_string(), object.clone())].into() }).unwrap();
-        store.update_ref("local/box", |old| Some(tensorfs::fetch::with_tree(old, "local/box", &tree, Some("v1")))).unwrap();
+        store.update_ref("local/box", |old| Some(tensorfs::fetch::with_tag(old, "local/box", "v1", &tree))).unwrap();
         store.path(&object).unwrap()
     };
     let inode = FileId::at(&blob).unwrap();
