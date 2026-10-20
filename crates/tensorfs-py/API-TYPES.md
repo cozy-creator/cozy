@@ -51,9 +51,6 @@ def export(src: Checkpoint, dir: StrPath, *, format: str='safetensors', dequanti
 def download_file(repo_id: str, filename: str, *, revision: str | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, ca_der: bytes | None=None) -> str:
     ...
 
-def resolve_source(source: str, *, token: Token | None=None) -> str:
-    ...
-
 def open(name_or_path: StrPath, *, revision: str | None=None, variant: str | None=None, endpoint: str | None=None, local_files_only: bool=False, cache_dir: StrPath | None=None, token: Token | None=None, ca_der: bytes | None=None, lazy: bool=True) -> Checkpoint:
     ...
 

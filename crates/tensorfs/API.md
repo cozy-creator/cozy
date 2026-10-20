@@ -99,7 +99,6 @@ exact remote tree.
 | `download_file(&Ref, filename, local_dir, local_files_only)` | Fetch one repository file; returns `Result<PathBuf>`. |
 | `upload_folder(&Ref, folder, progress)` | Publish the folder; returns `Result<ObjectRef>`. |
 | `convert_to_cozytensors(&[String], &Convert)` | Convert pinned sources; returns `Result<Checkpoint>`. |
-| `resolve_source(source)` | Resolve an upstream source; returns `Result<String>`. |
 | `writer(WriterOptions)` | Begin a write; returns `Result<Writer>`. |
 
 For example, parse a repository reference and use the returned folder or tree:
