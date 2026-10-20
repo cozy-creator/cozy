@@ -30,9 +30,17 @@ pub struct Pulled {
 
 impl Pulled {
     /// Names the pull in the store: `repository`'s ref, a cache TensorFS may expire. The tree
-    /// must be here.
+    /// must be here. One the ref already names writes nothing.
     pub fn record(&self, store: &Store) -> io::Result<()> {
         let release = (!self.release.is_empty()).then_some(self.release.as_str());
+        let held = store.get_ref(&self.repository).map_err(storage::io_error)?;
+        let names = |repo: &tensorfs::format::Repo| match release {
+            Some(release) => repo.release(Some(release)).is_some_and(|r| r.tree == self.tree),
+            None => repo.roots().any(|tree| *tree == self.tree),
+        };
+        if held.as_ref().is_some_and(names) {
+            return Ok(());
+        }
         let named = store
             .update_ref(&self.repository, |old| Some(tensorfs::fetch::with_tree(old, &self.repository, &self.tree, release)))
             .map_err(storage::io_error)?;
