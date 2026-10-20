@@ -440,7 +440,20 @@ impl Gpu {
 
     /// Called on an I/O worker, outside the policy lock. A concurrent bind sees Filling.
     pub fn fill(&self, id: PageId) -> Result<ReadStats> {
+        self.fill_bytes(id, None)
+    }
+
+    /// The RAM-tier lease must remain alive for this call. TensorFS still performs
+    /// the transfer; the mechanism only selects a ready source and its destination.
+    pub fn fill_from_ram(&self, id: PageId, bytes: &[u8]) -> Result<ReadStats> {
+        self.fill_bytes(id, Some(bytes))
+    }
+
+    fn fill_bytes(&self, id: PageId, ram: Option<&[u8]>) -> Result<ReadStats> {
         let page = self.page(id)?;
+        if ram.is_some_and(|bytes| bytes.len() as u64 != page.bytes) {
+            return Err(invalid("RAM region size differs from the mapped page"));
+        }
         {
             let mut state = page.state.lock();
             if !matches!(*state, State::Empty) {
@@ -455,22 +468,34 @@ impl Gpu {
                 return Err(error);
             }
         };
-        let result = (|| {
-            let stats = unsafe {
-                page.source.read_items(
-                    &page.items,
-                    page.origin,
-                    Dst::Device {
-                        device: self.device.ordinal,
-                        ptr: mapping.ptr(),
-                        len: page.bytes as usize,
-                        stream: self.device.stream.raw(),
-                    },
-                    2,
-                    Mode::Cache,
-                    &IoTally::default(),
-                )
-            }?;
+        let result: Result<ReadStats> = (|| {
+            let destination = Dst::Device {
+                device: self.device.ordinal,
+                ptr: mapping.ptr(),
+                len: page.bytes as usize,
+                stream: self.device.stream.raw(),
+            };
+            let stats = match ram {
+                Some(bytes) => unsafe {
+                    io::read(
+                        &[io::Copy {
+                            src: io::Src::Host(bytes.as_ptr()),
+                            dst: destination,
+                        }],
+                        &io::ReadOpts::default(),
+                    )
+                }?,
+                None => unsafe {
+                    page.source.read_items(
+                        &page.items,
+                        page.origin,
+                        destination,
+                        2,
+                        Mode::Cache,
+                        &IoTally::default(),
+                    )
+                }?,
+            };
             let _context = self.device.enter()?;
             self.device.access(mapping.ptr(), mapping.bytes, true)?;
             mapping.ready = Some(Event::record(&self.device, self.device.stream.raw())?);
@@ -520,8 +545,17 @@ impl Gpu {
         while let Some(release) = self.releases.pop() {
             let mut state = release.page.state.lock();
             if let State::Ready(mapping) = &mut *state {
-                for stream in release.streams {
-                    mapping.releases.push(Event::record(&self.device, stream)?);
+                for stream in &release.streams {
+                    match Event::record(&self.device, *stream) {
+                        Ok(event) => mapping.releases.push(event),
+                        Err(error) => {
+                            drop(state);
+                            // Keep the pin and all stream identities if recording fails.
+                            // A later recovery retries; no page becomes evictable early.
+                            self.releases.push(release);
+                            return Err(error);
+                        }
+                    }
                 }
                 mapping.pins = mapping.pins.saturating_sub(1);
             }
@@ -547,7 +581,7 @@ impl Gpu {
             }
             State::Failed(mapping, _) => {
                 io::drain(self.device.ordinal)?;
-                self.device.stream.synchronize()?;
+                self.device.stream.drain()?;
                 mapping.release()?;
                 *state = State::Empty;
                 Ok(true)
@@ -682,7 +716,7 @@ impl Gpu {
     /// A sticky CUDA failure is returned; the Runtime then replaces the executor.
     pub fn recover(&self) -> Result<()> {
         io::drain(self.device.ordinal)?;
-        self.device.stream.synchronize()?;
+        self.device.stream.drain()?;
         self.poll()?;
         let pages: Vec<_> = self.pages.lock().values().cloned().collect();
         for page in pages {
@@ -713,6 +747,22 @@ impl Gpu {
 
     pub fn fingerprint(&self, id: PageId) -> Result<String> {
         Ok(self.page(id)?.fingerprint.clone())
+    }
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        let safe = io::drain(self.device.ordinal).is_ok() && self.device.stream.drain().is_ok();
+        if !safe {
+            // An unfinished engine read may still borrow source descriptors and host
+            // mappings. Keep the complete owner graph alive until process teardown.
+            for (_, page) in std::mem::take(self.pages.get_mut()) {
+                std::mem::forget(page);
+            }
+            while let Some(release) = self.releases.pop() {
+                std::mem::forget(release);
+            }
+        }
     }
 }
 
