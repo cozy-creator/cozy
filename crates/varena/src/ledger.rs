@@ -578,6 +578,7 @@ impl Ledger {
             .lock()
             .pages
             .iter()
+            .filter(|(_, page)| queued(page))
             .map(|(key, page)| (*key, sum(page.spans.iter().copied())))
             .collect();
         Ok(Status {
@@ -1054,6 +1055,14 @@ impl Custody {
     }
 }
 
+fn queued(page: &Kept) -> bool {
+    let mut bytes = 0i32;
+    // SAFETY: FIONREAD writes one integer and never consumes SCM_RIGHTS. Each chunk is
+    // queued as the platform's one-byte descriptor frame. A partial drain is not a page.
+    (unsafe { libc::ioctl(page.container.as_raw_fd(), libc::FIONREAD, &mut bytes) }) == 0
+        && usize::try_from(bytes).ok() == Some(page.spans.len())
+}
+
 fn orphan(table: &Table, page: &Kept) -> bool {
     page.owner.is_none_or(|owner| match table.slot(owner) {
         Err(Error::Closed(_)) => true,
@@ -1140,7 +1149,8 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                         .map_err(crate::os("receive kept container"))?;
                     let mut held = custody.lock();
                     let replace = held.pages.get(&key).is_none_or(|p| {
-                        p.owner == Some(owner)
+                        !queued(p)
+                            || p.owner == Some(owner)
                             || p.owner
                                 .is_none_or(|o| !table.alive(o.row as usize).unwrap_or(true))
                     });
@@ -1260,7 +1270,7 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                     let pages: Vec<_> = held
                         .pages
                         .iter()
-                        .filter(|(_, page)| orphan(&table, page))
+                        .filter(|(_, page)| orphan(&table, page) && queued(page))
                         .map(|(key, page)| (*key, sum(page.spans.iter().copied())))
                         .collect();
                     stream
