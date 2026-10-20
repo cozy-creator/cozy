@@ -27,7 +27,7 @@ from torch.utils.hooks import RemovableHandle
 import tensorfs
 
 from . import Copy as CopyRun
-from . import Plane, WeightSet, copies, cuts
+from . import Plane, VarenaError, WeightSet, copies, cuts
 
 #: TensorFS dtype names; an `F4` part is u8 pairs.
 DTYPES: dict[str, torch.dtype] = {
@@ -575,7 +575,7 @@ class Memory:
             if ck is not None:
                 component = component or next(iter(ck.components))
                 declared = Declared(
-                    Source(ck, component, str(ck.header_ref)),
+                    Source(ck, component, str(ck.id)),
                     declared.blocks,
                     declared.state,
                     declared.fill,
@@ -786,12 +786,7 @@ class Memory:
         views: dict[str, dict[str, Tensor]] = {}
         try:
             for region in block.regions:
-                pinned = self.native.bind(
-                    self._current().native_id,
-                    block.model.ws.id,
-                    region,
-                    stream.cuda_stream,
-                )
+                pinned = self._pin(block.model, region, stream.cuda_stream)
                 base = torch.from_dlpack(pinned)
                 block.pins.append(base)
                 views.update(block.parts(region, base))
@@ -799,6 +794,19 @@ class Memory:
         except BaseException:
             _unbind(block)
             raise
+
+    def _pin(self, model: Model, region: int, stream: int) -> Any:
+        assert self.native is not None
+        try:
+            return self.native.bind(
+                self._current().native_id, model.ws.id, region, stream
+            )
+        except VarenaError as error:
+            if error.code != "DEVICE_FULL":
+                raise
+            raise self.exhausted(
+                self.device, int(getattr(error, "deficit", 0)), f"bind {model.name}"
+            ) from error
 
     def _step(self, model: Model) -> None:
         if self.native is None:
