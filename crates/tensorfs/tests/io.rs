@@ -228,11 +228,16 @@ fn stored(ck: &Checkpoint, at: &Location) -> Vec<u8> {
 /// Reads every range of `ck` in one engine call into `skew`ed destinations and checks each
 /// against `read` (plain) or the part's stored bytes.
 fn read_everything(ck: &Checkpoint, skew: usize, opts: &ReadOpts) -> ReadStats {
+    read_everything_after(ck, skew, opts, || {})
+}
+
+fn read_everything_after(ck: &Checkpoint, skew: usize, opts: &ReadOpts, prepared: impl FnOnce()) -> ReadStats {
     let all = ranges(ck);
     let mut bufs: Vec<Buf> = all.iter().map(|r| Buf::new(r.3.length as usize, skew)).collect();
     let targets: Vec<Target> = (all.iter().zip(&mut bufs))
         .map(|((c, k, role, _), b)| Target { component: c, key: k, role, offset: 0, dst: b.dst() })
         .collect();
+    prepared();
     // SAFETY: each destination is its own live buffer.
     let stats = unsafe { ck.read_into(&targets, opts) }.unwrap();
     for ((c, k, role, at), b) in all.iter().zip(&bufs) {
@@ -251,10 +256,13 @@ fn sweep(ck: &Checkpoint, what: &str) {
         for skew in [0, 1, 4095] {
             evict(ck);
             let cold = read_everything(ck, skew, &opts);
-            // The engine reads past the page cache, so a buffered read warms it.
-            read_everything(ck, skew, &buffered);
-            let evicted = evicted_pages(ck);
-            let warm = read_everything(ck, skew, &opts);
+            let mut evicted = 0;
+            let warm = read_everything_after(ck, skew, &opts, || {
+                // Allocate and touch the warm destinations before warming and observing
+                // the source cache: destination allocation can reclaim file pages too.
+                read_everything(ck, skew, &buffered);
+                evicted = evicted_pages(ck);
+            });
             println!("{what} skew {skew} {opts:?}\n  cold {cold:?}\n  warm {warm:?}");
             if opts.direct && direct_ok(ck) {
                 assert!(cold.direct > 0, "a cold read goes O_DIRECT: {cold:?}");
