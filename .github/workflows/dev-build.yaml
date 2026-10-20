@@ -35,6 +35,14 @@ on:
         description: cozy-runtime branch, tag or SHA whose wheel tests get as COZY_TEST_RUNTIME_WHEEL; empty for the newest published
         type: string
         default: ''
+      runtime_run:
+        description: Existing cozy-runtime native assembly run; requires full runtime_ref and runtime_sha256
+        type: string
+        default: ''
+      runtime_sha256:
+        description: Expected native Runtime wheel SHA256 when runtime_run is supplied
+        type: string
+        default: ''
       runtime_download:
         description: Download the published Runtime wheel for tests when runtime_ref is empty
         type: boolean
@@ -220,6 +228,16 @@ jobs:
           uv pip install --python "$RUNNER_TEMP/tensorfs/bin/python" "$wheel"
           echo "TENSORFS_TEST_PYTHON=$RUNNER_TEMP/tensorfs/bin/python" >> "$GITHUB_ENV"
           echo "COZY_TEST_TENSORFS_WHEEL=$wheel" >> "$GITHUB_ENV"
+      - name: Validate native Runtime artifact selection
+        if: inputs.runtime_run != '' || inputs.runtime_sha256 != ''
+        env:
+          NATIVE_RUNTIME_RUN: ${{ inputs.runtime_run }}
+          NATIVE_RUNTIME_REF: ${{ inputs.runtime_ref }}
+          NATIVE_RUNTIME_SHA256: ${{ inputs.runtime_sha256 }}
+        run: |
+          [[ "$NATIVE_RUNTIME_RUN" =~ ^[0-9]+$ ]]
+          [[ "$NATIVE_RUNTIME_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$NATIVE_RUNTIME_SHA256" =~ ^[0-9a-f]{64}$ ]]
       - if: inputs.runtime_ref != ''
         uses: actions/checkout@v5
         with:
@@ -232,7 +250,68 @@ jobs:
       - if: inputs.runtime_ref != ''
         run: |
           python3 .runtime/scripts/stamp-build-provenance.py "$(git -C .runtime rev-parse HEAD)"
+      - if: inputs.runtime_ref != '' && inputs.runtime_run == ''
+        run: |
           uv build --wheel --out-dir "$RUNNER_TEMP/runtime" .runtime
+      - name: Download the selected native Runtime wheel
+        if: inputs.runtime_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          repository: cozy-creator/cozy-runtime
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.runtime_run }}
+          name: cozy-runtime-${{ inputs.runtime_ref }}
+          path: ${{ runner.temp }}/runtime-artifact
+      - name: Verify native Runtime source and bytes
+        if: inputs.runtime_run != ''
+        env:
+          NATIVE_RUNTIME_REF: ${{ inputs.runtime_ref }}
+          NATIVE_RUNTIME_SHA256: ${{ inputs.runtime_sha256 }}
+        run: |
+          python3 - <<'PY'
+          import ast
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import shutil
+          import zipfile
+          from email.parser import BytesParser
+
+          temporary = pathlib.Path(os.environ["RUNNER_TEMP"])
+          wheels = [path for path in (temporary / "runtime-artifact").glob("cozy_runtime-*.whl")
+                    if hashlib.file_digest(path.open("rb"), "sha256").hexdigest() == os.environ["NATIVE_RUNTIME_SHA256"]]
+          assert len(wheels) == 1, "expected one Runtime wheel matching the selected hash"
+          wheel = wheels[0]
+          digest = hashlib.file_digest(wheel.open("rb"), "sha256").hexdigest()
+          assert digest == os.environ["NATIVE_RUNTIME_SHA256"], "Runtime wheel hash mismatch"
+          with zipfile.ZipFile(wheel) as archive:
+              source = ast.parse(archive.read("cozy_runtime/_build_provenance.py"))
+              commits = [ast.literal_eval(node.value) for node in source.body
+                         if isinstance(node, ast.Assign)
+                         and any(isinstance(target, ast.Name) and target.id == "COMMIT" for target in node.targets)]
+              assert commits == [os.environ["NATIVE_RUNTIME_REF"]], "Runtime source mismatch"
+              metadata = [name for name in archive.namelist() if name.endswith(".dist-info/WHEEL")]
+              assert len(metadata) == 1
+              tags = BytesParser().parsebytes(archive.read(metadata[0]))
+              assert tags["Root-Is-Purelib"] == "false"
+              assert tags.get_all("Tag") == ["cp312-abi3-manylinux_2_28_x86_64"], "Runtime ABI/platform tag mismatch"
+              documents = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+              assert len(documents) == 1
+              distribution = BytesParser().parsebytes(archive.read(documents[0]))
+              assert distribution["Name"].replace("_", "-") == "cozy-runtime"
+              expected_name = f"cozy_runtime-{distribution['Version']}-cp312-abi3-manylinux_2_28_x86_64.whl"
+              assert wheel.name == expected_name, "Runtime wheel filename mismatch"
+              modules = [f"cozy_runtime/_kernels/{name}.abi3.so" for name in ("_gemm", "_norm", "_fa3")]
+              for name in modules:
+                  image = archive.read(name)
+                  assert image.startswith(b"\x7fELF\x02\x01") and image[18:20] == b"\x3e\x00", "Runtime module is not an x86_64 ELF"
+          selected = temporary / "runtime"
+          selected.mkdir(exist_ok=True)
+          assert not list(selected.glob("*.whl")), "Runtime selection was already populated"
+          shutil.copyfile(wheel, selected / wheel.name)
+          print(json.dumps({"runtime_source": commits[0], "wheel_sha256": digest, "native_modules": modules}))
+          PY
       # Without runtime_ref, the Runtime machines install today: the newest published wheel.
       - if: inputs.test != '' && inputs.runtime_ref == '' && inputs.runtime_download
         run: |
