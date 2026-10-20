@@ -174,6 +174,29 @@ def ffn_cut() -> None:
         )
 
 
+def relax() -> None:
+    """Planning relaxes a cut (`cuts.coarser`): twice its size a step, back to whole, its peak
+    to be measured again; then nothing is left to relax."""
+    torch.manual_seed(0)
+    x = torch.randn(2, 300, 64)
+    ff = FeedForward(64, mult=4, activation_fn="gelu").eval()
+    whole, largest = measured(functools.partial(ff, x))
+    cuts.install(ff)
+    memo, card, room = fresh(largest // 3)
+    s = site("relax")
+    shape = s.track.shape = memo.shape("relax", "x")
+    with card, torch.no_grad():
+        out = cuts.run(s, ff, (x,), {})
+    cut = {k: v for k, v in memo.sizes.items() if k[0] == "ffn"}
+    shape.peak, steps = 1, 0
+    while cuts.coarser(shape):
+        steps += 1
+    relaxed = all(memo.sizes[k] >= shape.scopes[k][0] for k in cut)  # each scope's whole
+    check("a cut relaxes back to whole", same(out, whole) and cut and relaxed, (cut, memo.sizes))
+    doubled = all(memo.sizes[k] <= 2 * v for k, v in cut.items())
+    check("relaxing doubles at most; the peak waits", steps and doubled and shape.peak == -1, steps)
+
+
 class FusedSwiGLU(SwiGLU):
     """A package's fused SwiGLU (H3's glue): its own forward, diffusers' class underneath."""
 
@@ -579,7 +602,7 @@ def lattice() -> None:
 
 
 def main() -> int:
-    for test in (ffn_cut, fused_ffn, attention_cut, bands, vae_decode, block_catch, lattice):
+    for test in (ffn_cut, relax, fused_ffn, attention_cut, bands, vae_decode, block_catch, lattice):
         test()
     print(f"{sum(results)}/{len(results)} passed", flush=True)
     return 0 if all(results) else 1
