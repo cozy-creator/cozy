@@ -18,7 +18,8 @@ Windows (PowerShell):
 irm https://tensorhub.com/install.ps1 | iex
 ```
 
-Both put `cozy` in `~/.cozy/bin`; `cozy update` moves to the newest release.
+Both put `cozy` in `~/.cozy/bin` and on your PATH for new terminals: open a new one, or run the line
+the installer prints. `cozy update` moves to the newest release.
 
 ## Use
 
@@ -28,6 +29,9 @@ cozy run fidika/sdxl/generate prompt='a lighthouse at dusk' seed=7
 cozy machine rent            # what is for rent; then cozy machine rent <sku>
 cozy model search sdxl
 ```
+
+`cozy login` signs you up on first use, with a code it emails. Without an NVIDIA GPU here (a Mac,
+say), add `--on new` to run on a rented one. Outputs land in `~/.cozy/outputs`.
 
 `cozy --help` and `cozy <verb> --help` are the reference.
 
