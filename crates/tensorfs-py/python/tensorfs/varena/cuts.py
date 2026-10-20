@@ -90,11 +90,13 @@ class _Whole(Exception):
 
 @dataclass(slots=True)
 class Shape:
-    """A model's passes at one shape key: the latest activation peak, the cuts in force."""
+    """A model's passes at one shape key: the latest activation peak, the cuts in force, and
+    the peak of its latest pass that ran uncut (-1: none did)."""
 
     model: str
     shape: str
     peak: int = -1
+    whole: int = -1
     cuts: dict[str, int] = field(default_factory=dict)
     #: the cuts its passes ran: key -> (total, finest, shrink), what `coarser` relaxes
     scopes: dict[tuple[object, ...], tuple[int, int, Callable[[int], int]]] = field(
@@ -184,6 +186,13 @@ def shape_of(args: Args, kwargs: Kwargs) -> str:
 def peaked(track: Track, nbytes: int) -> None:
     if track.shape is not None:
         track.shape.peak = nbytes
+        if not _cut(track.shape):
+            track.shape.whole = nbytes
+
+
+def _cut(shape: Shape) -> bool:
+    memo = _served.memo
+    return any(memo.sizes.get(k, t) < t for k, (t, _, _) in shape.scopes.items())
 
 
 def _note(name: str, size: int) -> None:
@@ -293,20 +302,23 @@ def _settle[T](
     return size, out
 
 
-def coarser(shape: Shape | None) -> bool:
-    """Relaxation (the planner's): every cut a shape's passes ran goes one step back toward
-    whole, twice its size, and its peak waits to be measured again. False when none is cut."""
-    if shape is None:
-        return False
-    memo, moved = _served.memo, False
+def relaxing(shape: Shape | None, peak: int) -> int | None:
+    """What a pass of `shape` needs with its cuts relaxed (`coarser`): its peak measured uncut,
+    when one was, else twice `peak` (one step at most doubles it); None when none is cut."""
+    if shape is None or not _cut(shape):
+        return None
+    return shape.whole if shape.whole >= 0 else 2 * peak
+
+
+def coarser(shape: Shape) -> None:
+    """Relaxation (the planner's): a shape's cuts go back to whole when it ran uncut before,
+    else one step toward it (twice their size); its peak waits to be measured again."""
+    memo = _served.memo
     for key, (total, _, _) in shape.scopes.items():
         size = min(memo.sizes.get(key, total), total)
         if size < total:
-            memo.sizes[key] = min(total, 2 * size)
-            moved = True
-    if moved:
-        shape.peak, shape.cuts = -1, {}
-    return moved
+            memo.sizes[key] = total if shape.whole >= 0 else min(total, 2 * size)
+    shape.peak, shape.cuts = -1, {}
 
 
 def _halve(align: int, size: int) -> int:

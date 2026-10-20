@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// One pass of a model: bytes at home and resident, copied home and streamed through slots,
-/// the GPU-timed prefetch stall, and torch's allocated peak above the pass's start.
+/// the GPU-timed prefetch stall, torch's allocated peak above the pass's start, and torch's
+/// allocated bytes at that start (a leak shows as their growth).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Step {
@@ -19,6 +20,7 @@ pub struct Step {
     pub streamed: u64,
     pub stall_ns: u64,
     pub activations: u64,
+    pub allocated: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
