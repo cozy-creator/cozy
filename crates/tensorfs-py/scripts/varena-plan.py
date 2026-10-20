@@ -263,7 +263,7 @@ class Core:
     def serve(self, row: object) -> None:
         pass
 
-    def register(self, name: str, ck: object, regions: list[list[str]], host_fd: object, files: object) -> Set:
+    def register(self, name: str, ck: object, regions: list[list[str]], host_fd: object) -> Set:
         ws = Set(self, name, regions, [ck.span[n[0]] for n in regions])
         self.sets.append(ws)
         return ws
