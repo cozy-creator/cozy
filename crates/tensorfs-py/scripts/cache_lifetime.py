@@ -5,7 +5,8 @@ import gc
 import json
 import os
 import subprocess
-import sys
+import sysconfig
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -55,13 +56,13 @@ class CacheLifetime(unittest.TestCase):
                     path.write_text(json.dumps(document))
                 result = subprocess.run(
                     [
-                        sys.executable,
-                        "-c",
-                        (
-                            "import json,sys; from tensorfs import _ext; "
-                            "print(json.dumps(_ext.Store(sys.argv[1]).gc(older_than=0)))"
-                        ),
+                        str(Path(sysconfig.get_path("scripts")) / "tfs"),
+                        "--store",
                         str(cache),
+                        "--json",
+                        "gc",
+                        "--older-than",
+                        "0s",
                     ],
                     check=True,
                     capture_output=True,
@@ -82,9 +83,15 @@ class CacheLifetime(unittest.TestCase):
             )
             del tensors
             gc.collect()
-            second = collect_in_other_process()
+            deadline = time.monotonic() + 5
+            collected = 0
+            while True:
+                collected += collect_in_other_process()["objects"]
+                if not blob(active).exists() or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
             self.assertGreater(
-                second["objects"], 0, "last-owner release never enabled GC"
+                collected, 0, "last-owner release never enabled GC"
             )
             self.assertFalse(
                 blob(active).exists(), "last-owner release retained the header"

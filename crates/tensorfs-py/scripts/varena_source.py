@@ -14,8 +14,12 @@ from tensorfs import varena
 
 
 class Provider:
-    def __init__(self):
+    def __init__(self, released):
         self.calls = 0
+        self.released = released
+
+    def __del__(self):
+        self.released.set()
 
     def headers(self, method, url, headers, payload):
         self.calls += 1
@@ -24,8 +28,12 @@ class Provider:
 
 with tempfile.TemporaryDirectory() as temp:
     root = pathlib.Path(temp)
-    with tensorfs.Writer(root / "source", cache_dir=root / "writer") as writer:
+    header = root / "model.cozytensors"
+    with tensorfs.Writer(header, cache_dir=root / "writer") as writer:
         writer.component("model", cls="test.Model", config={}).put("weight", b"data", dtype="U8", shape=[4])
+    assert header.is_file() and not (root / "chunks").exists()
+    with writer.commit() as checkpoint:
+        tensorfs.materialize(checkpoint, local_dir=root / "source", format="cozytensors")
     tensorfs.upload_folder(repo_id="acme/placement", revision="one", folder_path=root / "source",
                            endpoint=(root / "origin").as_uri(), cache_dir=root / "upload")
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(root / "origin"))
@@ -33,7 +41,8 @@ with tempfile.TemporaryDirectory() as temp:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        provider = Provider()
+        released = threading.Event()
+        provider = Provider(released)
         alive = weakref.ref(provider)
         checkpoint = tensorfs.open("acme/placement", revision="one", endpoint=f"http://127.0.0.1:{server.server_port}",
                                    token=provider, cache_dir=root / "reader")
@@ -57,6 +66,7 @@ with tempfile.TemporaryDirectory() as temp:
         assert ctypes.string_at(pin.ptr + part.offset, part.nbytes) == b"data"
         del pin, part
         gc.collect()
+        assert released.wait(5), "last placement owner did not release its provider"
         assert alive() is None, "last released placement retained its provider"
     finally:
         server.shutdown()
