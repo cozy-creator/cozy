@@ -253,8 +253,10 @@ fn sweep(ck: &Checkpoint, what: &str) {
             let cold = read_everything(ck, skew, &opts);
             // The engine reads past the page cache, so a buffered read warms it.
             read_everything(ck, skew, &buffered);
-            let evicted = evicted_pages(ck);
             let warm = read_everything(ck, skew, &opts);
+            // Counted after: a page the host evicts during the warm read stays out (O_DIRECT
+            // does not fill the cache), so this covers every page that read found missing.
+            let evicted = evicted_pages(ck);
             println!("{what} skew {skew} {opts:?}\n  cold {cold:?}\n  warm {warm:?}");
             if opts.direct && direct_ok(ck) {
                 assert!(cold.direct > 0, "a cold read goes O_DIRECT: {cold:?}");
