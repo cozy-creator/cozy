@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 
-use crate::failure::{Failure, Result};
+use crate::failure::{fail, Failure, Kind, Result};
 use crate::fetch::{self, Client as Transport, SourcePolicy};
-use crate::format::Repo;
+use crate::format::{ObjectRef, Repo, Tree};
 
 use super::provider::from_native;
 use super::{Config, TokenProvider};
@@ -69,6 +69,28 @@ impl Endpoint {
 
     pub async fn repo(&self, repo_id: &str) -> Result<Option<(Repo, String)>> {
         self.inner.repo(repo_id).await.map_err(from_native)
+    }
+
+    /// `revision` of `repo_id` as a commit, without opening a variant or filling a cache: a tag,
+    /// a tag's commit or a header's commit (spec §7), else (`sha256:<hex>`) a commit the endpoint
+    /// holds that no tag names. The tag it resolved through, if any.
+    pub async fn commit(&self, repo_id: &str, revision: &str) -> Result<(ObjectRef, Option<String>)> {
+        let repo = self.repo(repo_id).await?.map_or_else(|| Repo::new(repo_id), |(repo, _)| repo);
+        let tree = async |commit: &ObjectRef| -> Result<Tree> { Ok(Tree::from_json(&self.inner.document(commit).await.map_err(from_native)?)?) };
+        match fetch::resolve(&repo, Some(revision), tree).await {
+            Ok((tag, _)) => return Ok((tag.commit, Some(tag.name))),
+            Err(e) if e.kind == Kind::NotFound && revision.starts_with("sha256:") => {}
+            Err(e) => return Err(e),
+        }
+        let object = self.inner.object(revision).await.map_err(from_native)?;
+        let Some(object) = object else {
+            return fail(Kind::NotFound, format!("{repo_id} has no revision {revision}, and {} holds no such object", self.inner.url()));
+        };
+        let tree = Tree::from_json(&self.inner.document(&object).await.map_err(from_native)?);
+        match tree {
+            Ok(_) => Ok((object, None)),
+            Err(_) => fail(Kind::NotFound, format!("{revision} is not a commit, and no tag of {repo_id} names it")),
+        }
     }
 
     pub async fn update_repo(

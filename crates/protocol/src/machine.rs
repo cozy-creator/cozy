@@ -524,13 +524,15 @@ pub struct Progress {
     pub stage_fraction: Option<f64>,
 }
 
-/// A checkpoint stored by Runtime. `revision` names its immutable TensorFS tree.
+/// A checkpoint stored by Runtime. `revision` names its commit (`sha256:<tree>`); `tag` the
+/// tag the Runtime moved to it (empty: none).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct CheckpointRef {
     pub repo_id: String,
     pub revision: String,
     pub variant: String,
+    pub tag: String,
 }
 
 /// One revision of an output: a single output is replaced by each, a list output grows. Byte

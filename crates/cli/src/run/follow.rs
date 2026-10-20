@@ -704,6 +704,7 @@ mod tests {
             repo_id: "local/derived".into(),
             revision: "sha256:tree".into(),
             variant: String::new(),
+            tag: String::new(),
         });
         assert!(!owed(&run));
         assert_eq!(

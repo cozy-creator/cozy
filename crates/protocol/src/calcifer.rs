@@ -947,6 +947,7 @@ mod tests {
             repo_id: "local/derived".into(),
             revision: "sha256:tree".into(),
             variant: String::new(),
+            tag: format!("replay-{}", "c".repeat(64)),
         });
         assert_eq!(
             serde_json::from_value::<OutputItem>(serde_json::to_value(&item).unwrap()).unwrap(),

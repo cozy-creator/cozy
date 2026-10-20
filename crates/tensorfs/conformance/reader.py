@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""An independent cozytensors/1 reader and header encoder, written from the spec: Python, numpy and cbor2.
+"""An independent cozytensors/1 reader and header encoder, written from the spec: Python, numpy, cbor2
+and packaging (PEP 440).
 Scheme decoders are in schemes/, one module per family.
 
     python reader.py <vectors-dir>     run the conformance vectors (exit 1 on any failure)
@@ -23,6 +24,7 @@ from pathlib import Path
 import cbor2
 
 import numpy as np
+from packaging.version import InvalidVersion, Version
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # schemes/, also under python -I
 from schemes import affine, blocks, decode, grid, table  # noqa: E402
@@ -145,27 +147,70 @@ def variant_path(variant: str) -> str:
 
 
 def parse_repo(data: bytes) -> dict:
+    """A repo's tags in creation order, each naming a commit (a tree)."""
     doc = load(data, REPO)
     name = field(doc, "name", str)
     org, _, rest = name.partition("/")
     need(segment(org) and segment(rest), f"bad repo name {name!r}")
-    releases, seen = [], set()
-    for r in field(doc, "releases", list):
-        need(isinstance(r, dict), "a release is not an object")
-        version = field(r, "version", str)
-        need(version != "" and version not in seen, f"empty or repeated version {version!r}")
-        seen.add(version)
-        releases.append({"version": version, "tree": object_ref(field(r, "tree", dict)),
-                         "yanked": field(r, "yanked", bool, optional=True)})
-    checkpoints = [object_ref(c) for c in field(doc, "checkpoints", list, optional=True)]
-    return {"name": name, "releases": releases, "checkpoints": checkpoints}
+    tags, seen = [], set()
+    for t in field(doc, "tags", list):
+        need(isinstance(t, dict), "a tag is not an object")
+        tag = field(t, "name", str)
+        need(segment(tag) and not tag.startswith("sha256:") and tag not in seen, f"bad or repeated tag {tag!r}")
+        seen.add(tag)
+        public = field(t, "public", bool, optional=True)
+        need(not public or version(tag) is not None, f"public tag {tag!r} is not a PEP 440 version")
+        tags.append({"name": tag, "commit": object_ref(field(t, "commit", dict)), "public": public,
+                     "yanked": field(t, "yanked", bool, optional=True)})
+    return {"name": name, "tags": tags}
 
 
-def release(repo: dict, version: str | None) -> dict:
-    """`version`, yanked or not; with None, the newest release that is not yanked."""
-    if version is None:
-        return next(r for r in reversed(repo["releases"]) if not r["yanked"])
-    return next(r for r in repo["releases"] if r["version"] == version)
+def version(name: str) -> Version | None:
+    try:
+        return Version(name)
+    except InvalidVersion:
+        return None
+
+
+def default_tag(repo: dict) -> dict | None:
+    """Of the public, non-yanked tags, the highest final version, else the highest pre-release
+    (a, b, rc, .dev); of equal versions, the last created."""
+    best, key = None, None
+    for t in repo["tags"]:
+        v = version(t["name"]) if t["public"] and not t["yanked"] else None
+        if v is not None and (best is None or (not v.is_prerelease, v) >= key):
+            best, key = t, (not v.is_prerelease, v)
+    return best
+
+
+def resolve(repo: dict, revision: str | None, tree) -> tuple[dict, str | None] | None:
+    """`revision` to (commit, the variant a header digest names) or None (spec §7). `tree(commit)`
+    reads a commit's parsed tree, only for a header digest."""
+    if revision is None:
+        t = default_tag(repo)
+        return (t["commit"], None) if t else None
+    if not revision.startswith("sha256:"):
+        t = next((t for t in repo["tags"] if t["name"] == revision), None)
+        return (t["commit"], None) if t else None
+    sha = revision.removeprefix("sha256:")
+    first = default_tag(repo)
+    order = ([first] if first else []) + repo["tags"][::-1]
+    for t in order:
+        if t["commit"]["sha256"] == sha:
+            return t["commit"], None
+    for t in order:
+        for p, r in tree(t["commit"])["files"].items():
+            if r["sha256"] == sha and variant_of(p) is not None:
+                return t["commit"], variant_of(p)
+    return None
+
+
+def variant_of(p: str) -> str | None:
+    if p == "model.cozytensors":
+        return ""
+    if p.startswith("model.") and p.endswith(".cozytensors") and "/" not in p and len(p) > 18:
+        return p[6:-12]
+    return None
 
 
 # ---------------------------------------------------------------- the CBOR header
@@ -381,9 +426,10 @@ class Store:
             raise invalid(f"object {sha} does not match its ref")
         return data
 
-    def checkpoint(self, name: str, version: str | None = None, variant: str = ""):
+    def checkpoint(self, name: str, revision: str | None = None, variant: str = ""):
         repo = parse_repo((self.root / repo_key(name)).read_bytes())
-        tree = parse_tree(self.blob(release(repo, version)["tree"]))
+        commit, _ = resolve(repo, revision, lambda c: parse_tree(self.blob(c)))
+        tree = parse_tree(self.blob(commit))
         return tree, parse_header(self.blob(tree["files"][variant_path(variant)]))
 
 
@@ -440,11 +486,29 @@ def check(vectors: Path) -> int:
             if not ok:
                 failures.append(f"{family}:{lane}: header order differs from {path.name}")
     # Core's release 2 is yanked and swaps its variants: only an explicit version reaches it.
-    _, yanked = store.checkpoint("Conformance/core", version="2", variant="all")
+    _, yanked = store.checkpoint("Conformance/core", revision="2", variant="all")
     ok = list(yanked["components"]) == ["spans"]
     passed += ok
     if not ok:
         failures.append("an explicit yanked version")
+    doc = json.loads((vectors / "resolve.json").read_text())
+    repo = parse_repo(json.dumps(doc["repo"]).encode())
+    trees = {}
+    for t in doc["trees"]:
+        data = json.dumps(t, sort_keys=True, separators=(",", ":")).encode()
+        trees[hashlib.sha256(data).hexdigest()] = parse_tree(data)
+    for case in doc["defaults"]:
+        t = default_tag(parse_repo(json.dumps(case["repo"]).encode()))
+        ok = (t and t["name"]) == case.get("default")
+        passed += ok
+        if not ok:
+            failures.append(f"default: {case['why']}")
+    for case in doc["cases"]:
+        got = resolve(repo, case.get("revision"), lambda c: trees[c["sha256"]])
+        ok = got == ((case["commit"], case.get("variant")) if "commit" in case else None)
+        passed += ok
+        if not ok:
+            failures.append(f"resolve: {case['why']}")
     core_failures = check_cores(vectors / "cores.json")
     failures += core_failures
     passed += len(json.loads((vectors / "cores.json").read_text())["cases"]) - len(core_failures)

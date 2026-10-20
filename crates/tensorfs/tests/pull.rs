@@ -131,7 +131,7 @@ async fn a_pull_from_python_http_server_is_bit_identical() {
         .pull(&origin, "acme/tiny", Some("9.9"), Some("int8"), &all())
         .await
         .unwrap_err();
-    assert_eq!(refused.code, Code::RELEASE_ABSENT, "{refused}");
+    assert_eq!(refused.code, Code::REVISION_ABSENT, "{refused}");
     let refused = fetcher
         .pull(&origin, "acme/absent", None, Some("int8"), &all())
         .await

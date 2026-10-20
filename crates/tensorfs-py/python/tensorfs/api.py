@@ -77,7 +77,7 @@ def download_file(repo_id: str, filename: str, *, revision=None, cache_dir=None,
     ))
 
 
-def upload_folder(*, repo_id: str, folder_path, revision=None, token=None, endpoint=None, cache_dir=None) -> str:
+def upload_folder(*, repo_id: str, folder_path, revision="main", token=None, endpoint=None, cache_dir=None) -> str:
     return _client(cache_dir, endpoint, token).upload_folder(Path(folder_path), repo_id, revision)
 
 
@@ -122,6 +122,9 @@ class Endpoint:
     def repo(self, repo_id):
         return self._native.repo(repo_id)
 
+    def commit(self, repo_id, revision):
+        return self._native.commit(repo_id, revision)
+
     def update_repo(self, repo_id, change):
         return self._native.update_repo(repo_id, change)
 
@@ -150,8 +153,8 @@ class ComponentWriter:
 
 
 class Writer:
-    def __init__(self, dest=None, *, variant=None, base=None, resume=None, repo_id=None, endpoint=None, token=None, cache_dir=None):
-        self._native = _ext.Writer(dest, variant=variant, base=base, resume=resume, cache_dir=_cache(cache_dir), repo_id=repo_id, endpoint=_endpoint(endpoint), token=token if token is not None else _settings.get("token"), ca_der=_settings.get("ca_der"))
+    def __init__(self, dest=None, *, variant=None, base=None, resume=None, repo_id=None, revision=None, endpoint=None, token=None, cache_dir=None):
+        self._native = _ext.Writer(dest, variant=variant, base=base, resume=resume, cache_dir=_cache(cache_dir), repo_id=repo_id, revision=revision, endpoint=_endpoint(endpoint), token=token if token is not None else _settings.get("token"), ca_der=_settings.get("ca_der"))
         self._resume = resume
         self._committed = None
         self.local_checkpoint = None
