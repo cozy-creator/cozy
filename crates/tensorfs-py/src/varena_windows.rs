@@ -40,8 +40,8 @@ macro_rules! unconstructible {
 }
 
 unconstructible!(Gpu = "Gpu", Host = "Host", WeightSet = "WeightSet", Pinned = "Pinned", Part = "Part",
-    Counters = "Counters", SetStats = "SetStats", GpuStats = "GpuStats", Copy = "Copy", Row = "Row", Victim = "Victim",
-    Admit = "Admit", RowFacts = "RowFacts");
+    Counters = "Counters", SetStats = "SetStats", GpuStats = "GpuStats", Copy = "Copy", Ceiling = "Ceiling", Row = "Row",
+    Victim = "Victim", Admit = "Admit", RowFacts = "RowFacts");
 
 #[pyclass(name = "Ledger", module = "tensorfs.varena", frozen)]
 struct Ledger;
@@ -71,7 +71,7 @@ macro_rules! refused {
     )*};
 }
 
-refused!(hold_tier, release_tier, seal);
+refused!(hold_tier, release_tier, seal, ceiling);
 
 /// No GPU tier, so no weight copies to report.
 #[pyfunction]
@@ -91,6 +91,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SetStats>()?;
     m.add_class::<GpuStats>()?;
     m.add_class::<Copy>()?;
+    m.add_class::<Ceiling>()?;
     m.add_class::<Ledger>()?;
     m.add_class::<Row>()?;
     m.add_class::<Victim>()?;
@@ -100,6 +101,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(release_tier, &m)?)?;
     m.add_function(wrap_pyfunction!(seal, &m)?)?;
     m.add_function(wrap_pyfunction!(copies, &m)?)?;
+    m.add_function(wrap_pyfunction!(ceiling, &m)?)?;
     #[cfg(feature = "store")]
     m.add_function(wrap_pyfunction!(crate::store::regions, &m)?)?;
     macro_rules! add_errors {

@@ -404,7 +404,8 @@ pub struct Member {
     pub level: Level,
     /// Why it holds less than `level`, from the last pass over the set.
     held_back: Mutex<&'static str>,
-    /// Its weights' fetches, under the warm run's access, for as long as it is in the set.
+    /// Its weights' fetches for as long as it is in the set: started under the warm run's
+    /// access, anonymous after it.
     fetch: Option<Arc<crate::access::Fetch>>,
 }
 impl Member {

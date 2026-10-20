@@ -41,13 +41,10 @@ impl Pulled {
         if held.as_ref().is_some_and(names) {
             return Ok(());
         }
-        let named = store
+        store
             .update_ref(&self.repository, |old| Some(tensorfs::fetch::with_tree(old, &self.repository, &self.tree, release)))
-            .map_err(storage::io_error)?;
-        match named {
-            Some(repo) => store.cache_ref(&repo).map_err(storage::io_error),
-            None => Ok(()),
-        }
+            .map(drop)
+            .map_err(storage::io_error)
     }
 
     /// The Hub checkpoint `header` is, as this machine pulled it; None for one never pulled.

@@ -30,7 +30,7 @@ fn prefetch_choices_cross_the_native_handler_and_keep_callee_authority() {
         publisher: None,
         local: None,
         own_hub: None,
-        leaf: None,
+       
         contexts: Default::default(),
     });
     let broker = Calls::configure(&service, crate::origin::Machine::new(store, None).unwrap(), Some(&runs)).unwrap();

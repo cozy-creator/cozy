@@ -177,27 +177,28 @@ pub(crate) struct Named {
 }
 
 impl Named {
-    /// The tree the Hub names it in: the first of `asked` its release publishes (an empty
-    /// lane: its only one). TensorFS's closure client names one lane, so it is one anonymous
-    /// closure call per lane until one answers.
-    fn at_hub(mut self, machine: &Machine, source: &hub::Source, asked: &[String]) -> Result<Self, Failure> {
-        let resolved = origin::resolve_named(machine, source, &self.repository, &self.release, asked)
+    /// Its release's tree at the Hub (no release: the newest not yanked).
+    fn at_hub(mut self, machine: &Machine, source: &hub::Source) -> Result<Self, Failure> {
+        let (release, tree) = origin::release(machine, source, &self.repository, &self.release)
             .map_err(|e| refused("model_resolution_failed", e))?;
-        (self.release, self.lane, self.tree) = (resolved.release, resolved.variant, Some(resolved.tree));
+        (self.release, self.tree) = (release, Some(tree));
         Ok(self)
     }
 
-    /// Its lane's header in its tree (the tree's only variant for no lane), the tree document
-    /// landed here.
-    fn landed(mut self, machine: &Machine, source: &hub::Source) -> Result<Self, Failure> {
-        let tree = self.tree()?.clone();
-        let (remote, catalog) = origin::remote(machine, source, &self.repository, &self.release, &self.lane, &tree)?;
-        let lane = (!self.lane.is_empty()).then_some(self.lane.as_str());
-        let (lane, header) = machine.variant(&remote, &tree, lane, &Stop::default()).map_err(|e| {
-            let (code, message) = refused("model_resolution_failed", e);
-            catalog.reason(code, message)
-        })?;
-        (self.lane, self.header) = (lane, Some(header));
+    /// Its header in its tree: the first of `lanes` the tree has (an empty lane: its only one),
+    /// the tree document landed here.
+    fn landed(mut self, machine: &Machine, source: &hub::Source, lanes: &[String]) -> Result<Self, Failure> {
+        let failed = |e| refused("model_resolution_failed", e);
+        let remote = origin::remote(machine, source).map_err(failed)?;
+        let tree = machine.tree(&remote, self.tree()?, &Stop::default()).map_err(failed)?;
+        let mut chosen = Err(unresolved(&self));
+        for lane in lanes {
+            chosen = tensorfs::fetch::variant_of_tree(&tree, (!lane.is_empty()).then_some(lane.as_str())).map_err(failed);
+            if chosen.is_ok() {
+                break;
+            }
+        }
+        (self.lane, self.header) = chosen.map(|(lane, header)| (lane, Some(header)))?;
         Ok(self)
     }
 
@@ -542,14 +543,11 @@ impl Publisher {
     fn pull(&self, source: &hub::Source, named: &Named, components: Option<&[String]>, stop: Option<&Stop>,
         bytes: &(dyn Fn(u64, u64) + Sync)) -> Result<(u64, u64), Failure> {
         let (tree, header) = (named.tree()?, named.header()?);
-        let (remote, catalog) = origin::remote(&self.machine, source, &named.repository, &named.release, &named.lane, tree)?;
+        let remote = origin::remote(&self.machine, source).map_err(|e| refused("model_download_failed", e))?;
         let stop = stop.cloned().unwrap_or_default();
         let failed = |e: Refusal| match stop.is_cancelled() {
             true => canceled(),
-            false => {
-                let (code, message) = refused("model_download_failed", e);
-                catalog.reason(code, message)
-            }
+            false => refused("model_download_failed", e),
         };
         let (started, subject) = (Instant::now(), format!("{}@{} {}", named.repository, named.release, named.lane));
         let logged = |pulled: &tensorfs::fetch::Pulled| {
@@ -615,9 +613,9 @@ impl Publisher {
         Ok(())
     }
 
-    /// The checkpoint `named` is: a tree by hash as given, a name as the Hub answers it in its
-    /// lane, else in the first of `lanes` its release publishes, else in its only lane; then its
-    /// lane's header there. Journaled per catalog revision so a warm run, across restarts too,
+    /// The checkpoint `named` is: a tree by hash as given, a name as its release's tree at the
+    /// Hub; then the header there of its lane, else of the first of `lanes` the tree has, else of
+    /// its only lane. Journaled per catalog revision so a warm run, across restarts too,
     /// asks the Hub nothing (th-245).
     pub(crate) fn resolve(&self, service: &Service, source: &hub::Source, named: Named, lanes: &[&str], revision: &str) -> Result<Named, Failure> {
         if named.tree.is_some() {
@@ -633,7 +631,7 @@ impl Publisher {
         if let Some((release, lane, tree, header)) = held.and_then(|held| serde_json::from_str(&held).ok()) {
             return Ok(Named { release, lane, tree: Some(tree), header: Some(header), ..named });
         }
-        let resolved = named.at_hub(&self.machine, source, &asked)?.landed(&self.machine, source)?;
+        let resolved = named.at_hub(&self.machine, source)?.landed(&self.machine, source, &asked)?;
         let answer = json!([resolved.release, resolved.lane, resolved.tree, resolved.header]).to_string();
         service.engine.with_journal(|j| j.bind_named(&name, revision, &answer)).map_err(io_failure)?;
         Ok(resolved)
@@ -1586,6 +1584,8 @@ fn make_source(
 fn refused(code: &'static str, refusal: tensorfs::err::Refusal) -> Failure {
     match refusal.code {
         tensorfs::err::Code::CAPACITY_EXHAUSTED => ("machine_disk_full", refusal.to_string()),
+        // The request's bearer was refused (expired, revoked); without one a private object is absent.
+        tensorfs::err::Code::CREDENTIAL_REQUIRED => ("hub_credential_refused", refusal.to_string()),
         _ => (code, refusal.to_string()),
     }
 }
@@ -1707,8 +1707,8 @@ fn newest_key(request: &Request) -> String {
 }
 
 /// A tree named by its hash, with what a hash alone does not say: its length (the Hub's) and its
-/// lane's header, read once under the run's access (the owner's capability for a private one)
-/// and kept, since a hash never names other bytes.
+/// lane's header, read once under the run's access (its request's bearer for the owner's) and
+/// kept, since a hash never names other bytes.
 fn measured(machine: &Machine, service: &Service, source: &hub::Source, mut named: Named) -> Result<Named, Failure> {
     if named.header.is_some() {
         return Ok(named);
@@ -1720,9 +1720,11 @@ fn measured(machine: &Machine, service: &Service, source: &hub::Source, mut name
         return Ok(Named { tree: Some(tree), lane, header: Some(header), ..named });
     }
     if tree.length == 0 {
-        named.tree = Some(origin::resolve_hash(machine, source, &named.repository, &named.lane, &tree.sha256)?);
+        let object = origin::object(machine, source, &tree.sha256).map_err(|e| refused("model_resolution_failed", e))?;
+        named.tree = Some(object);
     }
-    let named = named.landed(machine, source)?;
+    let lane = named.lane.clone();
+    let named = named.landed(machine, source, &[lane])?;
     let answer = json!([named.tree, named.lane, named.header]).to_string();
     service.engine.with_journal(|j| j.bind_named(&key, "", &answer)).map_err(io_failure)?;
     Ok(named)
@@ -2201,7 +2203,7 @@ pub(crate) mod tests {
     /// here), with the stages a person saw.
     fn generate_after(publisher: &Publisher, generations: &Path, identity: &str, card: &Card,
         earlier: Option<&crate::catalog::Generation>) -> Result<(crate::catalog::Generation, Vec<String>), Failure> {
-        let source = hub::Source::new("http://127.0.0.1:9", None, vec![], None).unwrap();
+        let source = hub::Source::new("http://127.0.0.1:9", None, None).unwrap();
         let locked = read_lock(&card.pyproject, &card.lock, &source)?;
         let before: Option<BTreeMap<String, String>> =
             earlier.map(|e| e.dependencies.iter().map(|d| (d.name.clone(), d.version.clone())).collect());
@@ -2251,7 +2253,7 @@ pub(crate) mod tests {
         let bad = sha256::hex_digest(b"other bytes");
         let asks = Arc::new(Mutex::new(vec![]));
         let origin = file_door(HashMap::from([("acme_pkg-1.0-py3-none-any.whl".to_string(), bytes)]), asks.clone(), None);
-        let source = hub::Source::new(&origin, None, vec![], None).unwrap();
+        let source = hub::Source::new(&origin, None, None).unwrap();
         let store = crate::storage::open(&root.join("tensorfs")).unwrap();
         let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), crate::origin::Machine::new(store, None).unwrap()).unwrap();
         let door = |file: &str| format!("{origin}/v1/index/acme/{file}");
@@ -2324,7 +2326,7 @@ pub(crate) mod tests {
     #[test]
     fn an_absent_package_is_named() {
         let origin = file_door(HashMap::new(), Arc::new(Mutex::new(vec![])), None);
-        let catalog = Catalog::new(&hub::Source::new(&origin, None, vec![], None).unwrap()).unwrap();
+        let catalog = Catalog::new(&hub::Source::new(&origin, None, None).unwrap()).unwrap();
         let (code, message) = newest_release(&catalog, "acme", "nope").unwrap_err();
         assert_eq!(code, "package_absent");
         assert!(message.starts_with("acme/nope is not published at http://127.0.0.1:"), "{message}");
@@ -2569,7 +2571,7 @@ pub(crate) mod tests {
     fn an_explicit_gpu_count_and_bits_have_their_own_preparation_cache_key() {
         let mut request = Request {
             run: String::new(),
-            source: hub::Source::new("https://hub.example", None, vec![], None).unwrap(),
+            source: hub::Source::new("https://hub.example", None, None).unwrap(),
             package: "org/package".into(), release: "1".into(), installed: None,
             owner: "org".into(), catalog_revision: String::new(), providers: Providers::default(),
             entrypoint: "render".into(), choices: vec![], gpus: 0, bits: 0, imports: true,
@@ -2724,7 +2726,7 @@ pub(crate) mod tests {
             let (origin, heard) = names_hub::paced(&self.source, model, None, Duration::from_millis(pace));
             let named = Named { repository: repository.into(), release: "1.0.0".into(), lane: "bf16".into(),
                 tree: Some(tree), header: Some(header.clone()) };
-            (hub::Source::new(&origin, None, vec!["localhost".into()], None).unwrap(), named, heard)
+            (hub::Source::new(&origin, None, None).unwrap(), named, heard)
         }
     }
 
@@ -2732,8 +2734,9 @@ pub(crate) mod tests {
         heard.lock().unwrap().iter().filter(|h| h.starts_with(asked)).count()
     }
 
-    /// A checkpoint a run chose lands as its header and its tree alone: one closure, the two
-    /// objects, and the store's ref naming the pull. Resolved again, it asks the Hub nothing.
+    /// A checkpoint a run chose lands as its header and its tree alone: the two objects, each
+    /// redirected to storage, and the store's ref naming the pull. Resolved again, it asks the
+    /// Hub nothing.
     #[test]
     fn a_chosen_checkpoint_lands_as_its_header_alone() {
         let bench = Bench::new();
@@ -2743,7 +2746,7 @@ pub(crate) mod tests {
         bench.publisher.structure(&hub, std::slice::from_ref(&named), &job).unwrap();
         let store = bench.publisher.store();
         assert_eq!(count(&heard, "GET /o/"), 2, "the header and its tree: {heard:?}");
-        assert_eq!(count(&heard, "POST /v1/tensorfs/closure"), 1);
+        assert_eq!(count(&heard, "GET /blobs/"), 2, "{heard:?}");
         assert!(!crate::access::whole(store, &manifest.id(), &[]));
         let pulled = Pulled { repository: "acme/source".into(), release: "1.0.0".into(), lane: "bf16".into(), tree: named.tree.clone().unwrap() };
         assert_eq!(Pulled::of(store, &manifest).unwrap(), Some(pulled));
@@ -2963,7 +2966,7 @@ pub(crate) mod tests {
             let lora = [("proj.lora_A.weight", vec![2, 3], f32s(6, 0.25)), ("proj.lora_B.weight", vec![4, 2], f32s(8, 0.75))];
             models.push(model("acme/lora", "bf16", tensors(&source, "lora", "adapter", &lora)));
             let (origin, heard) = names_hub::models(&source, models);
-            let hub = hub::Source::new(&origin, None, vec!["localhost".into()], None).unwrap();
+            let hub = hub::Source::new(&origin, None, None).unwrap();
             Self { root, service, publisher, installation, hub, heard, lanes }
         }
 
@@ -2986,9 +2989,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// The lanes closure reads named (resolving, then landing what resolved).
-    fn closed(asked: &[String]) -> std::collections::BTreeSet<&str> {
-        asked.iter().filter_map(|heard| heard.strip_prefix("POST /v1/tensorfs/closure acme/model@1.0.0 ")).collect()
+    impl Machine {
+        /// The lanes of `acme/model` whose checkpoint the Hub served.
+        fn landed(&self, asked: &[String]) -> std::collections::BTreeSet<&str> {
+            let lane = |sha: &str| self.lanes.get(&format!("sha256:{sha}")).map(String::as_str);
+            asked.iter().filter_map(|heard| heard.strip_prefix("GET /o/")).filter_map(lane).collect()
+        }
     }
 
     impl Drop for Machine {
@@ -3099,8 +3105,9 @@ pub(crate) mod tests {
 
     const GIB: u64 = 1 << 30;
 
-    /// A compute slot takes its row's 8-bit lane and a `min_bits=4` decode slot `nvfp4`, each
-    /// one closure read; a warm run asks the Hub nothing; `--bits=16` is another resolution.
+    /// A compute slot takes its row's 8-bit lane and a `min_bits=4` decode slot `nvfp4`, only
+    /// those lanes' checkpoints read; a warm run asks the Hub nothing; `--bits=16` is another
+    /// resolution.
     #[test]
     fn each_slot_takes_its_rows_lane_and_a_warm_run_asks_the_hub_nothing() {
         let slots = json!([
@@ -3110,7 +3117,7 @@ pub(crate) mod tests {
         let hopper = Machine::new("acme/pkg", &[("9.0", 80 * GIB)], slots.clone(), &["bf16", "fp8", "int8", "nvfp4"]);
         let (lanes, warnings, asked) = hopper.run(0);
         assert_eq!((lanes, warnings), (vec!["int8".to_string(), "nvfp4".into()], vec![]));
-        assert_eq!(closed(&asked), std::collections::BTreeSet::from(["int8", "nvfp4"]), "no lane past the first published one");
+        assert_eq!(hopper.landed(&asked), std::collections::BTreeSet::from(["int8", "nvfp4"]), "no lane past the first published one");
         let (lanes, _, asked) = hopper.run(0);
         assert_eq!((lanes, asked), (vec!["int8".to_string(), "nvfp4".into()], vec![]), "a warm run asks the Hub nothing");
         let (lanes, warnings, _) = hopper.run(16);
@@ -3143,7 +3150,7 @@ pub(crate) mod tests {
         let warned = ["precision 4: acme/model@1.0.0 has no nvfp4 lane for sm89; served int8".to_string()];
         let (lanes, warnings, asked) = ada.run(4);
         assert_eq!((lanes, warnings), (vec!["int8".to_string()], warned.to_vec()));
-        assert_eq!(closed(&asked), std::collections::BTreeSet::from(["int8", "nvfp4"]));
+        assert_eq!(ada.landed(&asked), std::collections::BTreeSet::from(["int8"]));
         let (_, warnings, asked) = ada.run(4);
         assert_eq!((warnings, asked), (warned.to_vec(), vec![]), "a warm run warns again and asks nothing");
         let declines = json!([{"path": "render.models.model", "class": "M", "default": "model@1.0.0", "encoded_leaves": "refuse"}]);
@@ -3173,8 +3180,8 @@ pub(crate) mod tests {
         let lora = domain::ModelChoice { parameter: "model".into(), adapters: vec![adapter], ..Default::default() };
         let plan = hopper.prepare(0, vec![lora]).plan.unwrap();
         let asked = std::mem::take(&mut *hopper.heard.lock().unwrap());
-        assert_eq!(closed(&asked), std::collections::BTreeSet::from(["int8"]));
-        assert!(asked.iter().any(|heard| heard == "POST /v1/tensorfs/closure acme/lora@1.0.0 "), "{asked:?}");
+        assert_eq!(hopper.landed(&asked), std::collections::BTreeSet::from(["int8"]));
+        assert!(asked.iter().any(|heard| heard == "GET /refs/acme/lora.json"), "{asked:?}");
         assert!(plan.slots[0].binding.model.starts_with("view-"), "{:?}", plan.slots[0].binding);
     }
 

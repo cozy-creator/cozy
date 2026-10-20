@@ -247,6 +247,7 @@ def test_costs(ck, rs, host_fd, stream, facts):
 
 
 def test_ceiling(ck, rs, host_fd, stream, facts):
+    varena.ceiling(device=0)  # reads never measure: the H2D ceiling is measured first
     gpu = varena.Gpu(0)
     ws = gpu.register("ceiling", ck, rs, host_fd)
     varena.copies()
