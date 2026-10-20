@@ -7,6 +7,7 @@ name: owner-day
 #   gh workflow run owner-day.yml -R cozy-creator/cozy-creator --ref <branch> [-f tensorhub_ref=<ref>] [-f runtime_ref=<ref>]
 # With runtime_ref, the test machines install that Runtime and this commit's TensorFS wheel
 # (COZY_TEST_RUNTIME_WHEEL, COZY_TEST_TENSORFS_WHEEL) instead of the published pair.
+# Supplying both native artifact runs reuses their verified wheels; no CUDA rebuild.
 on:
   workflow_dispatch:
     inputs:
@@ -16,6 +17,30 @@ on:
         default: master
       runtime_ref:
         description: cozy-runtime ref built for the machines, with this commit's TensorFS wheel; empty for the published pair
+        type: string
+        default: ''
+      cozy_ref:
+        description: Full product SHA to test; empty uses the workflow commit
+        type: string
+        default: ''
+      tensorfs_run:
+        description: Existing native TensorFS build run; requires the complete artifact pair
+        type: string
+        default: ''
+      tensorfs_source:
+        description: Full TensorFS producer SHA; must equal the product SHA being tested
+        type: string
+        default: ''
+      tensorfs_sha256:
+        description: Exact TensorFS wheel SHA256
+        type: string
+        default: ''
+      runtime_run:
+        description: Existing native Runtime assembly run; requires full runtime_ref and both wheel hashes
+        type: string
+        default: ''
+      runtime_sha256:
+        description: Exact native Runtime wheel SHA256
         type: string
         default: ''
   workflow_call:
@@ -29,8 +54,27 @@ on:
       runtime_ref:
         type: string
         default: ''
+      cozy_ref:
+        type: string
+        default: ''
+      tensorfs_run:
+        type: string
+        default: ''
+      tensorfs_source:
+        type: string
+        default: ''
+      tensorfs_sha256:
+        type: string
+        default: ''
+      runtime_run:
+        type: string
+        default: ''
+      runtime_sha256:
+        type: string
+        default: ''
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -51,6 +95,51 @@ jobs:
       CGO_ENABLED: '0'
       GOFLAGS: -trimpath
     steps:
+      - name: Validate source and optional native pair
+        id: selection
+        env:
+          PRODUCT_REF: ${{ inputs.cozy_ref || github.sha }}
+          WORKFLOW_REF: ${{ github.sha }}
+          RELEASE_PLAN: ${{ inputs.plan }}
+          HUB_REF: ${{ inputs.tensorhub_ref }}
+          TENSORFS_RUN: ${{ inputs.tensorfs_run }}
+          TENSORFS_SOURCE: ${{ inputs.tensorfs_source }}
+          TENSORFS_SHA256: ${{ inputs.tensorfs_sha256 }}
+          RUNTIME_RUN: ${{ inputs.runtime_run }}
+          RUNTIME_REF: ${{ inputs.runtime_ref }}
+          RUNTIME_SHA256: ${{ inputs.runtime_sha256 }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+
+          def full(name, length):
+              return re.fullmatch(f"[0-9a-f]{{{length}}}", os.environ[name]) is not None
+
+          require(full("PRODUCT_REF", 40), "cozy_ref must be a full source SHA")
+          if os.environ["RELEASE_PLAN"]:
+              require(os.environ["PRODUCT_REF"] == os.environ["WORKFLOW_REF"],
+                      "a release plan must test its own workflow/product commit")
+          names = ("TENSORFS_RUN", "TENSORFS_SOURCE", "TENSORFS_SHA256", "RUNTIME_RUN", "RUNTIME_SHA256")
+          reuse = any(os.environ[name] for name in names)
+          if reuse:
+              require(all(os.environ[name] for name in names), "native reuse requires both complete artifact selections")
+              for name in ("TENSORFS_RUN", "RUNTIME_RUN"):
+                  require(re.fullmatch("[1-9][0-9]*", os.environ[name]) is not None, name + " must be a run ID")
+              for name, length in (("TENSORFS_SOURCE", 40), ("RUNTIME_REF", 40), ("HUB_REF", 40),
+                                   ("TENSORFS_SHA256", 64), ("RUNTIME_SHA256", 64)):
+                  require(full(name, length), name + " must be a full immutable source/hash")
+              require(os.environ["TENSORFS_SOURCE"] == os.environ["PRODUCT_REF"],
+                      "TensorFS artifact source must match the product under test")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"reuse={str(reuse).lower()}\ncozy_ref={os.environ['PRODUCT_REF']}\n")
+          print(json.dumps({"product_source": os.environ["PRODUCT_REF"], "reuse_native_pair": reuse}))
+          PY
       - uses: actions/checkout@v5
         with:
           repository: cozy-creator/tensorhub-v2
@@ -68,11 +157,12 @@ jobs:
         run: uv sync --project tools/evaluator --locked --no-dev --group proof
       # The cozy workspace's test build fills most of the runner's disk.
       - run: sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /opt/ghc && df -h /
-      - if: inputs.runtime_ref != ''
+      - if: inputs.runtime_ref != '' && steps.selection.outputs.reuse != 'true'
         uses: actions/checkout@v5
         with:
           path: .cozy-src
-      - if: inputs.runtime_ref != ''
+          ref: ${{ steps.selection.outputs.cozy_ref }}
+      - if: inputs.runtime_ref != '' && steps.selection.outputs.reuse != 'true'
         uses: actions/checkout@v5
         with:
           repository: cozy-creator/cozy-runtime
@@ -81,7 +171,7 @@ jobs:
           path: .runtime
       # The wheel carries `tfs`, built first into its scripts directory, as the release does.
       - name: Runtime and TensorFS wheels
-        if: inputs.runtime_ref != ''
+        if: inputs.runtime_ref != '' && steps.selection.outputs.reuse != 'true'
         run: |
           uv run --no-project python .runtime/scripts/stamp-build-provenance.py "$(git -C .runtime rev-parse HEAD)"
           uv build --wheel --out-dir "$RUNNER_TEMP/runtime" .runtime
@@ -91,6 +181,90 @@ jobs:
           (cd .cozy-src/crates/tensorfs-py && uvx maturin@1.15.0 build --release --out "$RUNNER_TEMP/tensorfs")
           echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$RUNNER_TEMP"/tensorfs/tensorfs-*.whl)" >> "$GITHUB_ENV"
           rm -rf .cozy-src/target
+      - name: Download selected TensorFS wheel
+        if: steps.selection.outputs.reuse == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.tensorfs_run }}
+          name: tensorfs-wheel-${{ inputs.tensorfs_source }}
+          path: ${{ runner.temp }}/owner-day-native/tensorfs
+      - name: Download selected native Runtime wheel
+        if: steps.selection.outputs.reuse == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          repository: cozy-creator/cozy-runtime
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.runtime_run }}
+          name: cozy-runtime-${{ inputs.runtime_ref }}
+          path: ${{ runner.temp }}/owner-day-native/runtime
+      - name: Verify native pair before the full suite
+        if: steps.selection.outputs.reuse == 'true'
+        env:
+          TENSORFS_SOURCE: ${{ inputs.tensorfs_source }}
+          TENSORFS_SHA256: ${{ inputs.tensorfs_sha256 }}
+          RUNTIME_REF: ${{ inputs.runtime_ref }}
+          RUNTIME_SHA256: ${{ inputs.runtime_sha256 }}
+        run: |
+          python3 - <<'PY'
+          import ast
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import zipfile
+          from email.parser import BytesParser
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "owner-day-native"
+          selected = {}
+          evidence = {}
+          for name, directory, digest_name in (("tensorfs", "tensorfs", "TENSORFS_SHA256"),
+                                               ("cozy-runtime", "runtime", "RUNTIME_SHA256")):
+              wheels = list((root / directory).rglob("*.whl"))
+              assert len(wheels) == 1, f"expected one {name} wheel, found {len(wheels)}"
+              wheel = wheels[0].resolve()
+              digest = hashlib.file_digest(wheel.open("rb"), "sha256").hexdigest()
+              assert digest == os.environ[digest_name], f"{name} wheel hash mismatch"
+              with zipfile.ZipFile(wheel) as archive:
+                  metadata = [p for p in archive.namelist() if p.endswith(".dist-info/METADATA")]
+                  wheel_info = [p for p in archive.namelist() if p.endswith(".dist-info/WHEEL")]
+                  assert len(metadata) == len(wheel_info) == 1, "ambiguous wheel metadata"
+                  distribution = BytesParser().parsebytes(archive.read(metadata[0]))
+                  assert distribution["Name"].lower().replace("_", "-") == name
+                  tags = BytesParser().parsebytes(archive.read(wheel_info[0]))
+                  assert tags["Root-Is-Purelib"] == "false", "a native wheel is required"
+                  if name == "cozy-runtime":
+                      assert tags.get_all("Tag") == ["cp312-abi3-manylinux_2_28_x86_64"]
+                      assert wheel.name == f"cozy_runtime-{distribution['Version']}-cp312-abi3-manylinux_2_28_x86_64.whl"
+                      tree = ast.parse(archive.read("cozy_runtime/_build_provenance.py"))
+                      commits = [ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
+                                 and any(isinstance(target, ast.Name) and target.id == "COMMIT" for target in node.targets)]
+                      assert commits == [os.environ["RUNTIME_REF"]], "Runtime source mismatch"
+                      modules = {p for p in archive.namelist() if p.startswith("cozy_runtime/_kernels/")
+                                 and p.endswith((".so", ".pyd"))}
+                      assert modules == {f"cozy_runtime/_kernels/{part}.abi3.so" for part in ("_gemm", "_norm", "_fa3")}
+                  else:
+                      assert set(tags.get_all("Tag") or []) == {
+                          "cp312-abi3-manylinux_2_17_x86_64", "cp312-abi3-manylinux2014_x86_64"}
+                      modules = {p for p in archive.namelist() if p.startswith("tensorfs/_ext")
+                                 and p.endswith((".so", ".pyd"))}
+                      assert len(modules) == 1, "expected one TensorFS native extension"
+                  module_hashes = {}
+                  for module in sorted(modules):
+                      image = archive.read(module)
+                      assert image.startswith(b"\x7fELF\x02\x01") and image[18:20] == b"\x3e\x00", "expected x86_64 ELF"
+                      module_hashes[module] = hashlib.sha256(image).hexdigest()
+              selected[name] = str(wheel)
+              evidence[name] = {"wheel": wheel.name, "sha256": digest, "version": distribution["Version"],
+                                "source": os.environ["RUNTIME_REF" if name == "cozy-runtime" else "TENSORFS_SOURCE"],
+                                "native_modules": module_hashes}
+          # TensorFS source is bound by the selected artifact name and approved wheel hash;
+          # unlike Runtime, its extension does not embed a source commit.
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"COZY_TEST_RUNTIME_WHEEL={selected['cozy-runtime']}\n")
+              output.write(f"COZY_TEST_TENSORFS_WHEEL={selected['tensorfs']}\n")
+          print(json.dumps(evidence, sort_keys=True))
+          PY
       - if: inputs.plan != ''
         uses: actions/download-artifact@v8
         with:
@@ -120,7 +294,7 @@ jobs:
           COZY_TEST_SHAPED_BPS: '325000'
           COZY_TEST_TFS: ${{ github.workspace }}/tools/evaluator/.venv/bin/tfs
           COZY_TEST_EVAL: ${{ github.workspace }}/tools/evaluator/.venv/bin/cozy-eval
-          SHA: ${{ github.sha }}
+          SHA: ${{ steps.selection.outputs.cozy_ref }}
         run: >-
           scripts/live-hub-client.sh "$SHA" -p cozy --no-fail-fast
           --test owner_day --test run_hub --test run_release --test run_local --test package_publish
