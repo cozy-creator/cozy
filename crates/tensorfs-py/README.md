@@ -76,10 +76,11 @@ print(unet.cls, info.dtype, info.shape, value.nbytes)
 ```
 
 `read` accepts one name, a list of names, or no selection for the whole component.
-It preserves the stored representation by default: plain tensors return DLPack arrays,
+It preserves the stored representation by default: plain tensors return TensorFS `Array` objects,
 and quantized tensors return their encoded arrays and parameters. Use `decode=True`, as
 above, when the consumer needs ordinary floating-point weights. Frameworks wrap arrays
-through their DLPack entry point. `component.config` is structured JSON, `component.asset(name)` reads an asset,
+through their DLPack entry point. DLPack is the memory-sharing protocol, not a separate
+array library to install. `component.config` is structured JSON, `component.asset(name)` reads an asset,
 and explicit `component.export_files(directory)` is only a compatibility convenience for legacy path-only loaders.
 
 ## Checkpoints and repositories

@@ -134,7 +134,10 @@ int8 weights together with scales and rotation parameters. A matching quantized 
 kernel can use those encoded arrays directly. Decoding provides compatibility at the
 cost of an unpacking step and a larger weight allocation.
 
-To hand an array to a framework, use DLPack:
+`Array` is TensorFS's own array object. It implements DLPack, a standard protocol for
+sharing tensor memory between libraries, rather than a separate Python array library.
+Frameworks such as PyTorch can wrap a compatible array's existing memory without copying.
+For example:
 
 ```python
 import torch
@@ -349,7 +352,7 @@ A `ComponentWriter` supports:
 
 | Call | Use |
 |---|---|
-| `put(key, data, dtype=None, shape=None)` | Write plain values from a buffer or DLPack array. |
+| `put(key, data, dtype=None, shape=None)` | Write plain values from a buffer or an array implementing DLPack, such as a Torch tensor. |
 | `put_encoded(key, dtype=..., shape=..., scheme=..., params=..., parts=...)` | Preserve encoded data; each part is `role: (dtype, shape, buffer)`. |
 | `copy(key, source_component, as_key=None)` | Reuse source key `key`, optionally renaming its destination. |
 | `asset(name, data)` | Write a supporting file. |
