@@ -108,12 +108,13 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
         assert_eq!(new, pack, "{}", lane.name);
         assert_eq!(v1["inline_parts"].as_u64().unwrap() > 0, !pack.is_empty(), "{}", lane.name);
 
-        // Every tensor whose chunks the fixture holds reads back exactly the selected v1 bytes.
+        // Every tensor whose chunks the endpoint holds (the fixture's objects and the pack) reads
+        // back exactly the selected v1 bytes.
         let mut found = BTreeSet::new();
         for component in ck.components() {
             for tensor in component.tensors() {
                 let here = tensor.locations().iter().all(|(_, at)| {
-                    ck.header().spans(at).iter().all(|s| fixture.join(&ck.chunks()[s.chunk].sha256).exists())
+                    ck.header().spans(at).iter().all(|s| root.join(ck.chunks()[s.chunk].key()).exists())
                 });
                 if !here || tensor.locations().iter().all(|(_, at)| at.length == 0) {
                     if lane.tensors.contains(&format!("{}/{}", component.name(), tensor.key)) {
