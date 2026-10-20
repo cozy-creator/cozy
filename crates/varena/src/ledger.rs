@@ -978,6 +978,16 @@ impl Ledger {
         self.host.check_process().ok()?;
         ram_status(&self.host.state.lock(), layout)
     }
+    /// Shared native allocations not yet reflected in live host memory. Executor
+    /// forecasts are counted by TensorD; committed buffers are already physical.
+    pub fn pending_host_bytes(&self) -> Result<u64> {
+        self.host.check_process()?;
+        let mut state = self.host.state.lock();
+        state.prune_private();
+        state
+            .pending_host()
+            .ok_or_else(|| Error::Invalid("pending host bytes overflow".into()))
+    }
     /// Tell the cache about a starting executor before admitting it. Unknown peaks
     /// suppress optional warming and shed every idle/queued region; measured peaks
     /// shed only until their room is available. The caller always admits demand.
@@ -1562,7 +1572,7 @@ impl HostCache {
             let mut state = self.state.lock();
             state.prune_private();
             // Couple this live proc/cgroup metadata reading with pending claims.
-            // No allocation, page I/O, CUDA or descriptor exchange holds this lock.
+            // No array allocation, page I/O, CUDA or descriptor exchange holds this lock.
             let broker_room = platform::contain::host_memory::read().available;
             if broker_room < 0 {
                 return Ok(HostAdmission::Refused);
@@ -2671,7 +2681,9 @@ mod admission_tests {
         assert_eq!(next.owner().row, old.row);
         assert!(next.owner().generation > old.generation);
         assert_eq!(fixture.ledger.status().unwrap().private_host_bytes, 4096);
+        assert_eq!(fixture.ledger.pending_host_bytes().unwrap(), 4096);
         guard.commit().unwrap();
+        assert_eq!(fixture.ledger.pending_host_bytes().unwrap(), 0);
         assert_eq!(fixture.ledger.status().unwrap().private_host_bytes, 4096);
         drop(guard);
         assert_eq!(fixture.ledger.status().unwrap().private_host_bytes, 0);

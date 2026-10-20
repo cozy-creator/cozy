@@ -52,6 +52,9 @@ impl Memory {
     pub fn finish_host(&self, reservation: u64) {
         self.0.finish_host(reservation);
     }
+    pub fn pending_host_bytes(&self) -> varena::Result<u64> {
+        self.0.pending_host_bytes()
+    }
     pub fn capacity(&self) -> u64 {
         self.0.capacity()
     }

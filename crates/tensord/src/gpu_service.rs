@@ -3423,6 +3423,14 @@ impl Pool {
     }
 
 
+    /// Charge pending native allocations once across the shared host cache. Its
+    /// committed buffers already reduce `available`; executor forecasts are in `others`.
+    fn unreserved_host_room(&self, start: usize, available: Option<u64>, others: u64) -> Option<u64> {
+        let pending = self.devices[start].memory.placement()
+            .map_or(0, |memory| memory.pending_host_bytes().unwrap_or(u64::MAX));
+        available.map(|room| room.saturating_sub(others).saturating_sub(pending))
+    }
+
     /// Before a spawn: the host has room for the executor's private bytes as measured in
     /// earlier runs, or gives it back in order: import-only parents with no live child, then
     /// idle executors, least recently used first.
@@ -3456,7 +3464,7 @@ impl Pool {
             let key = session_key(plan, start);
             let mut admitted = self.admitted.lock().unwrap();
             let others: u64 = admitted.iter().filter(|(k, _)| **k != key).map(|(_, admission)| admission.bytes).sum();
-            let available = available.map(|available| available.saturating_sub(others));
+            let available = self.unreserved_host_room(start, available, others);
             if available.is_none_or(|available| available >= need) {
                 let previous = admitted.insert(key, Admission { bytes: need, reservation, birth: None });
                 if let Some(previous) = previous.filter(|previous| previous.reservation != reservation) { self.finish_host_cache(previous.reservation); }
@@ -5193,6 +5201,33 @@ mod tests {
         assert!(pool.host_room("image", 1, 1, false, 2));
         pool.admitted.lock().unwrap().clear();
 
+        pool.stop().unwrap();
+        crate::scratch::remove(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_room_counts_pending_mapped_bytes_once_and_not_after_commit() {
+        let (root, pool, _engine) = pool_of(2);
+        let ledger = pool.devices[0].memory.placement().unwrap().ledger();
+        let row = ledger.claim(std::process::id()).unwrap();
+        let channel = varena::ledger::Channel::new(ledger.grant(std::process::id()).unwrap().channel);
+        let allocation = channel.reserve_host(row.owner(), 4096).unwrap().unwrap();
+        // A real IPC reservation is shared by both GPUs. Use an observed-room
+        // input rather than allocating/pressuring the CI host to force admission.
+        ledger.prepare_host(1, Some(1024));
+        for gpu in 0..2 {
+            assert_eq!(pool.unreserved_host_room(gpu, Some(8192), 1024), Some(3072));
+            assert_eq!(pool.unreserved_host_room(gpu, None, 1024), None);
+        }
+        allocation.commit().unwrap();
+        // The allocator has physically spent 4096: a new room reading is 4096
+        // lower. Do not subtract that committed span or the forecast a second time.
+        assert_eq!(pool.unreserved_host_room(1, Some(4096), 1024), Some(3072));
+        assert_eq!(ledger.status().unwrap().private_host_bytes, 4096);
+        drop(allocation);
+        ledger.finish_host(1);
+        drop(row);
         pool.stop().unwrap();
         crate::scratch::remove(&root);
     }

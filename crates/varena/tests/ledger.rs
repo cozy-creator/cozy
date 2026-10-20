@@ -938,9 +938,11 @@ fn mapped_host_leases_share_devices_survive_aliases_and_end_with_the_process() {
     assert_eq!(a.call("host_reserve 4096"), "true");
     assert_eq!(first.ledger.status().unwrap().private_host_bytes, 4096);
     assert_eq!(second.ledger.status().unwrap().private_host_bytes, 4096);
+    assert_eq!(second.ledger.pending_host_bytes().unwrap(), 4096);
     assert_eq!(b.call(&format!("host_reserve {}", u64::MAX)), "false");
     assert_eq!(first.ledger.status().unwrap().private_host_bytes, 4096);
     assert_eq!(a.call("host_commit"), "ok");
+    assert_eq!(second.ledger.pending_host_bytes().unwrap(), 0);
     assert_eq!(a.call("host_alias"), "ok");
     assert_eq!(a.call("host_drop"), "ok");
     assert_eq!(first.ledger.status().unwrap().private_host_bytes, 4096);
