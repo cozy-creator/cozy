@@ -266,7 +266,14 @@ impl Drop for DecodeHold {
             let mut buffers = std::mem::take(&mut self.inputs);
             buffers.append(&mut self.scratch);
             buffers.extend(self.output.take());
-            super::device::retain_decode(self.stream.take(), buffers);
+            // An external output has no owned allocation until its first argument upload.
+            // No private work can precede that registration: casts register their output
+            // scratch before launch, and every decode kernel needs the owned slots buffer.
+            // Early catalog/context/producer errors therefore have nothing to quarantine.
+            // The caller still retains external owners when a producer drain failed.
+            if !buffers.is_empty() {
+                super::device::retain_decode(self.stream.take(), buffers);
+            }
         }
     }
 }
@@ -650,6 +657,19 @@ fn execute_into(
 mod tests {
     use super::*;
     use crate::format::decode::plan::{Elems, Post};
+
+    #[test]
+    fn external_output_refusal_before_owned_inputs_does_not_panic_in_cleanup() {
+        // An early missing-catalog/producer error used to call retain_decode(empty),
+        // replacing the typed refusal with its "decode retains its output" panic.
+        drop(DecodeHold {
+            output: None,
+            inputs: Vec::new(),
+            scratch: Vec::new(),
+            stream: None,
+            complete: false,
+        });
+    }
 
     #[test]
     fn host_values_and_metadata_only_sentinel_never_expand_or_upload_for_gpu_decode() {
