@@ -46,10 +46,11 @@ def serve(folder):
 
 with tempfile.TemporaryDirectory() as temp:
     root = pathlib.Path(temp)
-    with tensorfs.Writer(root / "source", cache_dir=root / "writer") as writer:
+    with tensorfs.Writer(cache_dir=root / "writer") as writer:
         component = writer.component("model", cls="test.Model", config={"size": 4})
         component.put("weight", b"data", dtype="U8", shape=[4])
         component.asset("vocab.txt", b"a\nb\n")
+    tensorfs.export(writer.commit(), root / "source", format="cozytensors")
     endpoint = (root / "origin").as_uri()
     tensorfs.upload_folder(repo_id="acme/lifetime", revision="one", folder_path=root / "source",
                            endpoint=endpoint, cache_dir=root / "upload")
@@ -65,7 +66,6 @@ with tempfile.TemporaryDirectory() as temp:
         del provider, checkpoint, components
         gc.collect()
         assert alive() is not None, "a live component lost its request provider"
-        assert component.asset("vocab.txt") == b"a\nb\n"
         assert component.asset("vocab.txt") == b"a\nb\n"
         assert tensors.read("weight").tobytes() == b"data"
         with tensorfs.Writer(root / "copy", cache_dir=root / "copy-cache") as copy:
