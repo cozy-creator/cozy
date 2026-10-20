@@ -11,6 +11,7 @@ from pathlib import Path
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 from typing import Annotated
@@ -34,13 +35,21 @@ def main(*, binary: Annotated[FileAsset, AssetBound(max_bytes=67108864)], out: O
     results = []
     for name, marker in CASES.items():
         command = [str(executable), "--ignored", "--exact", name, "--nocapture", "--test-threads=1"]
-        done = subprocess.run(command, capture_output=True, text=True, timeout=180)
-        text = done.stdout + done.stderr
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, start_new_session=True)
+        try:
+            stdout, stderr = process.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+            print(stdout + stderr, flush=True)
+            raise RuntimeError(f"Native GPU case {name} exceeded its test-harness bound") from None
+        text = stdout + stderr
         (logs / f"{name}.log").write_text(text)
         print(text, flush=True)
         summary = re.findall(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored", text)
-        if done.returncode or marker not in text or not summary or summary[-1] != ("1", "0", "0"):
-            raise RuntimeError(f"Native GPU case {name} failed (exit {done.returncode})")
+        if process.returncode or marker not in text or not summary or summary[-1] != ("1", "0", "0"):
+            raise RuntimeError(f"Native GPU case {name} failed (exit {process.returncode})")
         results.append(name)
     (logs / "result.json").write_text(json.dumps({"passed": results, "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}, indent=2))
     return out.save_tree(logs)
