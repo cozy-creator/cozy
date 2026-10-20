@@ -719,7 +719,7 @@ mod tests {
         let digest = spec_of(original.clone()).unwrap().0.digest;
         let mut resent = original.clone();
         resent.payload = v1::Json::parse(r#"{"nested":{"a":1,"b":2},"seed":9007199254740993}"#).ok();
-        resent.hub = Some(v1::HubAccess { key: String::new(), issued_token: None,
+        resent.hub = Some(v1::HubAccess { key: "replacement-request-key".into(), issued_token: Some("replacement-issued-token".into()),
             origin: "https://hub.example.test".into(), capability: String::new(), token_endpoint: String::new(),
             ca_der: vec![2], object_hosts: vec!["objects-2.example.test".into()],
         });
