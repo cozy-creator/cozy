@@ -419,8 +419,8 @@ impl Gpu {
         let g = self.device.granularity;
         if !Arc::ptr_eq(&range.device, &self.device)
             || bytes == 0
-            || offset % g != 0
-            || bytes % g != 0
+            || !offset.is_multiple_of(g)
+            || !bytes.is_multiple_of(g)
             || offset
                 .checked_add(bytes)
                 .is_none_or(|end| end > range.bytes)
@@ -773,7 +773,7 @@ impl Gpu {
         if spans.is_empty()
             || spans
                 .iter()
-                .any(|n| *n == 0 || *n % self.device.granularity != 0)
+                .any(|n| *n == 0 || !n.is_multiple_of(self.device.granularity))
             || spans.iter().try_fold(0u64, |sum, n| sum.checked_add(*n)) != Some(page.bytes)
         {
             return Ok(false);
