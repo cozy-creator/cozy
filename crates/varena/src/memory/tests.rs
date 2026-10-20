@@ -4,6 +4,9 @@
 
 use super::*;
 
+#[cfg(all(feature = "faults", target_os = "linux"))]
+mod gpu;
+
 fn error(what: &str) -> Error {
     Error::Io(what.into())
 }

@@ -959,6 +959,8 @@ impl Inner {
                 run.pin_ns += t.elapsed().as_nanos() as u64;
                 if pinned {
                     call!("cuMemcpyHtoDAsync", memcpy_htod_async(job.dst, p as *const c_void, n as usize, s))?;
+                    #[cfg(all(test, feature = "faults"))]
+                    crate::faults::phases::reached("direct-enqueued");
                 } else {
                     self.staged(job, Some(p as usize))?;
                     run.staged += n;
@@ -1025,6 +1027,8 @@ impl Inner {
             let _c = CtxGuard::enter(self.ctx)?;
             unfenced = true;
             call!("cuMemcpyHtoDAsync", memcpy_htod_async(dst + at, buf.ptr as *const c_void, len as usize, self.copy))?;
+            #[cfg(all(test, feature = "faults"))]
+            crate::faults::phases::reached("staging-enqueued");
             crate::faults::hit("staging-record")?;
             buf.last = Some(self.events.record(self.copy, false)?);
             unfenced = false;
@@ -1605,6 +1609,8 @@ impl Drop for WeightSet {
         };
         // Leave the source and mappings in State until every copy and consumer fence is proven.
         let Some((fills, releases)) = g.lock().close_fences(self.id) else { return };
+        #[cfg(all(test, feature = "faults"))]
+        crate::faults::phases::reached("set-close-fences");
         for fill in fills {
             let completed = match fill.completion() {
                 Filled::Ready(ev) => ev.sync(),
@@ -1692,6 +1698,8 @@ impl Pinned {
 
 impl Drop for Pinned {
     fn drop(&mut self) {
+        #[cfg(all(test, feature = "faults"))]
+        crate::faults::phases::reached("pin-drop");
         let g = &self.ws.gpu.inner;
         if let Err(e) = g.check() {
             g.retain_pin(&self.ws, e);
