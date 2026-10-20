@@ -282,7 +282,7 @@ jobs:
           path: wheels
       - run: |
           uv venv --python 3.12 "$RUNNER_TEMP/docs"
-          UV_TORCH_BACKEND=cpu uv pip install --python "$RUNNER_TEMP/docs/bin/python" wheels/*-abi3-*.whl torch numpy
+          UV_TORCH_BACKEND=cpu uv pip install --python "$RUNNER_TEMP/docs/bin/python" wheels/*-abi3-*.whl torch numpy transformers
           "$RUNNER_TEMP/docs/bin/python" crates/tensorfs-py/scripts/docs_examples.py --wheels wheels \
             crates/tensorfs-py/README.md crates/tensorfs-py/API.md crates/tensorfs/API.md
 
