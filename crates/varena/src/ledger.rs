@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use platform::shm::{self, Region, RESIZE_SEALS};
 
-use crate::{Error, Result};
+use crate::{lock, Error, Result};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"vledger3");
 pub const ROWS: u32 = 64;
@@ -420,7 +420,7 @@ impl Row {
     }
 
     fn write(&self, at: usize, part: &[u64]) {
-        let mut words = self.words.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut words = lock(&self.words);
         words[at..at + part.len()].copy_from_slice(part);
         let s = self.t.slot(self.slot);
         latch_write(&s.seq, &s.latch, &words);
@@ -469,11 +469,12 @@ impl Row {
     }
 
     /// Answers asks on a thread of its own with `answer(want) -> freed`; each answer is progress,
-    /// so a process busy in one long kernel is never stalled.
+    /// so a process busy in one long kernel is never stalled. A panicking answer frees nothing.
     pub fn serve(self: &Arc<Self>, answer: impl Fn(u64) -> u64 + Send + 'static) -> Result<std::thread::JoinHandle<()>> {
         let row = self.clone();
         let serve = move || loop {
-            row.ack(answer(row.wait_want()));
+            let want = row.wait_want();
+            row.ack(crate::caught(|| Ok(answer(want))).unwrap_or(0));
         };
         std::thread::Builder::new().name("varena-ask".into()).spawn(serve).map_err(|e| Error::Io(format!("spawn the ask thread: {e}")))
     }
@@ -655,7 +656,7 @@ impl Ledger {
     /// Asked rows whose progress has not moved since this handle's last look.
     pub fn stalled(&self) -> Result<Vec<u32>> {
         let rows = self.snapshot()?;
-        let mut looks = self.looks.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut looks = lock(&self.looks);
         let asked: Vec<&RowFacts> = rows.iter().filter(|r| r.state == State::Live && r.want > 0).collect();
         let stalled = asked.iter().filter(|r| looks.get(&(r.slot, r.gen)) == Some(&r.progress)).map(|r| r.pid).collect();
         *looks = asked.iter().map(|r| ((r.slot, r.gen), r.progress)).collect();
@@ -719,7 +720,7 @@ impl Ledger {
     /// Names the key a request's peak is recorded under (TensorD's write, before it runs).
     pub fn dispatch(&self, request_id: &str, key: &str) -> Result<()> {
         let (id, key) = (packed::<ID>("request id", request_id)?, packed::<KEY>("peak key", key)?);
-        let _one = self.dispatching.lock().unwrap_or_else(PoisonError::into_inner);
+        let _one = lock(&self.dispatching);
         self.clear(&id);
         let free = self.t.dispatch().iter().find(|s| s.state.load(Acquire) & 1 == 0);
         let slot = free.ok_or_else(|| Error::Invalid(format!("ledger dispatch table is full: {DISPATCH} requests")))?;
@@ -733,7 +734,7 @@ impl Ledger {
 
     /// The request's entry goes (TensorD's write, once it ended).
     pub fn undispatch(&self, request_id: &str) {
-        let _one = self.dispatching.lock().unwrap_or_else(PoisonError::into_inner);
+        let _one = lock(&self.dispatching);
         if let Some(id) = pack(request_id) {
             self.clear(&id);
         }

@@ -12,7 +12,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(feature = "store")]
 use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -26,7 +26,7 @@ use crate::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUevent, CUstream
 use crate::host::HostMem;
 use crate::io::{IoTally, Mode, Readers, Source};
 use crate::layout::{align_up, Item, ItemSource, Layout, PART_ALIGN, REGION_ALIGN};
-use crate::{Error, Result};
+use crate::{lock, Error, Result};
 
 #[cfg(test)]
 mod tests;
@@ -80,7 +80,7 @@ impl Ev {
 
 impl Drop for Ev {
     fn drop(&mut self) {
-        self.pool.free.lock().unwrap()[self.timing as usize].push(self.raw);
+        lock(&self.pool.free)[self.timing as usize].push(self.raw);
     }
 }
 
@@ -95,7 +95,7 @@ unsafe impl Sync for Events {}
 impl Events {
     /// An event recorded on `stream` now.
     fn record(self: &Arc<Self>, stream: CUstream, timing: bool) -> Result<EvRef> {
-        let raw = match self.free.lock().unwrap()[timing as usize].pop() {
+        let raw = match lock(&self.free)[timing as usize].pop() {
             Some(raw) => raw,
             None => {
                 let _c = CtxGuard::enter(self.ctx)?;
@@ -252,7 +252,7 @@ struct Fill {
 
 impl Fill {
     fn set(&self, r: Filled) {
-        *self.state.lock().unwrap() = Some(r);
+        *lock(&self.state) = Some(r);
         self.cv.notify_all();
     }
 
@@ -265,16 +265,16 @@ impl Fill {
     }
 
     fn completion(&self) -> Filled {
-        self.cv.wait_while(self.state.lock().unwrap(), |s| s.is_none()).unwrap().clone().unwrap()
+        self.cv.wait_while(lock(&self.state), |s| s.is_none()).unwrap_or_else(PoisonError::into_inner).clone().unwrap()
     }
 
     fn busy(&self) -> bool {
-        matches!(&*self.state.lock().unwrap(), None | Some(Filled::Unknown(_)))
+        matches!(&*lock(&self.state), None | Some(Filled::Unknown(_)))
     }
 
     /// Nothing of it is in flight on the device.
     fn landed(&self) -> Result<bool> {
-        match &*self.state.lock().unwrap() {
+        match &*lock(&self.state) {
             Some(Filled::Ready(ready)) => {
                 crate::faults::hit("fill-query")?;
                 ready.done()
@@ -336,7 +336,7 @@ impl Staging {
     }
 
     fn take(&self) -> Result<Buf> {
-        let mut b = self.cv.wait_while(self.buffers.lock().unwrap(), |b| b.free.is_empty() && b.error.is_none()).unwrap();
+        let mut b = self.cv.wait_while(lock(&self.buffers), |b| b.free.is_empty() && b.error.is_none()).unwrap_or_else(PoisonError::into_inner);
         if let Some(e) = &b.error {
             return Err(e.clone());
         }
@@ -344,18 +344,18 @@ impl Staging {
     }
 
     fn put(&self, buf: Buf) {
-        let mut b = self.buffers.lock().unwrap();
+        let mut b = lock(&self.buffers);
         if b.error.is_some() { b.held.push(buf) } else { b.free.push(buf) }
         self.cv.notify_one();
     }
 
     fn fail(&self, error: Error) {
-        self.buffers.lock().unwrap().error.get_or_insert(error);
+        lock(&self.buffers).error.get_or_insert(error);
         self.cv.notify_all();
     }
 
     fn hold(&self, buf: Buf) {
-        self.buffers.lock().unwrap().held.push(buf);
+        lock(&self.buffers).held.push(buf);
     }
 }
 
@@ -398,7 +398,7 @@ impl Mapping {
 
     /// A fill that failed, which nothing pins: it holds no bytes.
     fn dead(&self) -> bool {
-        self.pins == 0 && self.fill.as_ref().is_some_and(|f| matches!(*f.state.lock().unwrap(), Some(Filled::Failed(_))))
+        self.pins == 0 && self.fill.as_ref().is_some_and(|f| matches!(*lock(&f.state), Some(Filled::Failed(_))))
     }
 
     /// A new fill of it, and the releases its copies must wait for.
@@ -645,7 +645,7 @@ impl Gpu {
         let m = inner.clone();
         let mover = std::thread::Builder::new().name(format!("varena-copy-{ordinal}")).spawn(move || m.mover());
         let gpu = Arc::new(Gpu { inner: inner.clone(), mover: Some(mover.map_err(|e| Error::Io(format!("spawn copy thread: {e}")))?) });
-        *inner.owner.lock().unwrap() = Arc::downgrade(&gpu);
+        *lock(&inner.owner) = Arc::downgrade(&gpu);
         Ok(gpu)
     }
 
@@ -778,7 +778,7 @@ impl Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
-        self.inner.jobs.0.lock().unwrap().stop = true;
+        lock(&self.inner.jobs.0).stop = true;
         self.inner.jobs.1.notify_all();
         if let Some(t) = self.mover.take() {
             let _ = t.join();
@@ -792,17 +792,17 @@ impl Inner {
     }
 
     fn check(&self) -> Result<()> {
-        self.custody.lock().unwrap().error.clone().map_or(Ok(()), Err)
+        lock(&self.custody).error.clone().map_or(Ok(()), Err)
     }
 
     /// One retained owner graph per failed GPU, not one leak per later accessor.
     fn poison(&self, error: Error) -> Error {
         let (error, first) = {
-            let mut c = self.custody.lock().unwrap();
+            let mut c = lock(&self.custody);
             let first = c.error.is_none();
             if first {
                 c.error = Some(error);
-                c.gpu = self.owner.lock().unwrap().upgrade();
+                c.gpu = lock(&self.owner).upgrade();
             }
             (c.error.as_ref().unwrap().clone(), first)
         };
@@ -815,11 +815,11 @@ impl Inner {
 
     fn retain_pin(&self, ws: &Arc<WeightSet>, error: Error) {
         self.poison(error);
-        self.custody.lock().unwrap().pins.entry(ws.id).or_insert_with(|| ws.clone());
+        lock(&self.custody).pins.entry(ws.id).or_insert_with(|| ws.clone());
     }
 
     fn retain_waits(&self, waits: &[EvRef]) {
-        let mut c = self.custody.lock().unwrap();
+        let mut c = lock(&self.custody);
         for ev in waits {
             if !c.releases.iter().any(|held| Arc::ptr_eq(held, ev)) {
                 c.releases.push(ev.clone());
@@ -828,7 +828,7 @@ impl Inner {
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.st.lock().unwrap()
+        lock(&self.st)
     }
 
     /// `f` on the books, with our context current.
@@ -841,14 +841,14 @@ impl Inner {
     }
 
     fn submit(&self, job: Job, urgent: bool) {
-        let mut j = self.jobs.0.lock().unwrap();
+        let mut j = lock(&self.jobs.0);
         if urgent { j.q.push_front(job) } else { j.q.push_back(job) }
         self.jobs.1.notify_all();
     }
 
     /// A queued fill someone now waits for goes first.
     fn hurry(&self, fill: &Arc<Fill>) {
-        let mut j = self.jobs.0.lock().unwrap();
+        let mut j = lock(&self.jobs.0);
         if let Some(i) = j.q.iter().position(|job| Arc::ptr_eq(&job.fill, fill)) {
             let job = j.q.remove(i).unwrap();
             j.q.push_front(job);
@@ -863,24 +863,25 @@ impl Inner {
         }
         let mut run: Option<Run> = None;
         loop {
-            let j = self.jobs.0.lock().unwrap();
+            let j = lock(&self.jobs.0);
             if j.q.is_empty() && run.is_some() {
                 drop(j);
                 run = self.land(run.take().unwrap());
                 continue;
             }
-            let job = match self.jobs.1.wait_while(j, |j| j.q.is_empty() && !j.stop).unwrap().q.pop_front() {
+            let job = match self.jobs.1.wait_while(j, |j| j.q.is_empty() && !j.stop).unwrap_or_else(PoisonError::into_inner).q.pop_front() {
                 Some(job) => job,
                 None => return,
             };
             let r = run.get_or_insert_with(|| Run { t0: Some(Instant::now()), ..Default::default() });
-            let filled = self.check().and_then(|_| self.run(&job, r)).map(|(a, b)| {
+            // A panic is this job's failure, never the thread's end.
+            let filled = crate::caught(|| self.check().and_then(|_| self.run(&job, r)).map(|(a, b)| {
                 r.copies.push((a.clone(), b.clone()));
                 let mut st = self.lock();
                 let step = st.steps;
                 st.timings.push(Timing { set: job.set, step, field: |c| &mut c.copy_ns, a, b: b.clone() });
                 b
-            });
+            }));
             let filled = match filled {
                 Ok(ready) => Filled::Ready(ready),
                 Err(e) => self.drained(e),
@@ -904,7 +905,7 @@ impl Inner {
                 return None;
             }
         }
-        if !self.jobs.0.lock().unwrap().q.is_empty() {
+        if !lock(&self.jobs.0).q.is_empty() {
             return Some(r);
         }
         if r.bytes > 0 {
@@ -1510,7 +1511,7 @@ impl WeightSet {
                 if !ready {
                     continue;
                 }
-                let filled = m.fill.as_ref().and_then(|f| f.state.lock().unwrap().clone());
+                let filled = m.fill.as_ref().and_then(|f| lock(&f.state).clone());
                 let landed = match filled {
                     Some(Filled::Ready(ev)) => ev.done()?,
                     _ => false,
@@ -1735,7 +1736,7 @@ impl Pinned {
         g.check()?;
         // Serialize admission through its wait. Completion of the fill does not complete a
         // consumer's later work, so even the ready fast path must retain its stream.
-        let mut consumers = self.consumers.lock().unwrap();
+        let mut consumers = lock(&self.consumers);
         g.check()?;
         let stream = ConsumerStream::current(stream);
         if !consumers.contains(&stream) {
@@ -1748,7 +1749,7 @@ impl Pinned {
     }
 
     fn finish_streams(&self, mut record: impl FnMut(u64) -> Result<EvRef>, mut drain: impl FnMut(u64) -> Result<()>) {
-        let streams = self.consumers.lock().unwrap().clone();
+        let streams = lock(&self.consumers).clone();
         let mut events = vec![];
         let failed = streams.iter().try_for_each(|&stream| stream.here().and_then(|_| record(stream.raw)).map(|ev| events.push(ev))).err();
         self.ws.finish_pin(self.at, self.region, events, failed, || {
@@ -1807,7 +1808,7 @@ impl Host {
 
 impl HostSet {
     pub fn bind(self: &Arc<Self>, region: u32) -> Result<HostPinned> {
-        let (w, mut regs) = (&self.weights, self.regs.lock().unwrap());
+        let (w, mut regs) = (&self.weights, lock(&self.regs));
         let reg = w.layout.region(region)?;
         let (buf, bound) = &mut regs[region as usize];
         let sealed = w.host.as_ref().filter(|h| !h.hole(region));

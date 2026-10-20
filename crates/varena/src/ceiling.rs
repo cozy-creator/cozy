@@ -16,7 +16,7 @@ use std::time::Instant;
 use platform::durable;
 
 use crate::cuda::{self, CUstream};
-use crate::Result;
+use crate::{lock, Result};
 
 const H2D_PROBE: usize = 128 << 20;
 const DISK_PROBE: u64 = 1 << 30;
@@ -50,7 +50,7 @@ pub struct Copy {
 static LOG: Mutex<Vec<Copy>> = Mutex::new(Vec::new());
 
 pub(crate) fn record(c: Copy) {
-    let mut log = LOG.lock().unwrap();
+    let mut log = lock(&LOG);
     if log.len() >= LOG_KEEP {
         log.remove(0);
     }
@@ -59,7 +59,7 @@ pub(crate) fn record(c: Copy) {
 
 /// Every copy run since the last call.
 pub fn take() -> Vec<Copy> {
-    std::mem::take(&mut LOG.lock().unwrap())
+    std::mem::take(&mut lock(&LOG))
 }
 
 fn path() -> Option<PathBuf> {

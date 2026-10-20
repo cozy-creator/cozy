@@ -36,7 +36,7 @@ use crate::ceiling::Copy;
 use crate::cuda;
 use crate::io::{IoTally, Mode, Source};
 use crate::layout::{ItemSource, Layout, PART_ALIGN};
-use crate::{Error, Result};
+use crate::{lock, Error, Result};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"TFSPLN03");
 const MAGIC_WINDOW: u64 = u64::from_le_bytes(*b"TFSWIN01");
@@ -551,7 +551,7 @@ impl HostMem {
     }
 
     fn read_begin(&self, r: u32) -> Result<()> {
-        let mut readers = self.readers.lock().unwrap();
+        let mut readers = lock(&self.readers);
         let n = readers.entry(r).or_insert(0);
         if *n == 0 {
             self.lock(r, Region::Read, true)?;
@@ -561,7 +561,7 @@ impl HostMem {
     }
 
     fn read_end(&self, r: u32) {
-        let mut readers = self.readers.lock().unwrap();
+        let mut readers = lock(&self.readers);
         if let Some(n) = readers.get_mut(&r) {
             *n -= 1;
             if *n == 0 {
@@ -784,7 +784,7 @@ impl HostMem {
         let mut ctx: cuda::CUcontext = std::ptr::null_mut();
         // SAFETY: out-param.
         unsafe { (d.ctx_get_current)(&mut ctx) };
-        self.registered.lock().unwrap().push((off, ctx as usize));
+        lock(&self.registered).push((off, ctx as usize));
         Ok(())
     }
 
@@ -798,7 +798,7 @@ impl HostMem {
     /// region whose bytes exist (Ready). The caller binds a context first.
     pub fn pin_region(&self, r: u32, off: u64, len: u64) -> bool {
         let state = &self.pinned[r as usize];
-        let _g = self.pinning.lock().unwrap();
+        let _g = lock(&self.pinning);
         match state.load(Ordering::Acquire) {
             PIN_YES => true,
             PIN_REFUSED => false,
@@ -826,7 +826,7 @@ impl HostMem {
     /// Unlock region `r` before its RAM is punched; a refill locks it again. The caller binds a
     /// context first.
     pub fn unpin_region(&self, r: u32, off: u64) -> Result<()> {
-        let _g = self.pinning.lock().unwrap();
+        let _g = lock(&self.pinning);
         if self.pinned[r as usize].swap(PIN_NONE, Ordering::AcqRel) == PIN_YES {
             self.unregister(off)?;
         }
@@ -835,8 +835,8 @@ impl HostMem {
 
     /// Unlock every region this process locked (a plane closing, while its context lives).
     pub fn unpin_all(&self) -> Result<()> {
-        let _g = self.pinning.lock().unwrap();
-        let offsets: Vec<u64> = self.registered.lock().unwrap().iter().map(|r| r.0).collect();
+        let _g = lock(&self.pinning);
+        let offsets: Vec<u64> = lock(&self.registered).iter().map(|r| r.0).collect();
         for off in offsets {
             self.unregister(off)?;
         }
@@ -852,7 +852,7 @@ impl HostMem {
         cuda::check("cuMemHostUnregister", unsafe {
             (d.mem_host_unregister)(self.ptr.add(off as usize) as *mut libc::c_void)
         })?;
-        self.registered.lock().unwrap().retain(|r| r.0 != off);
+        lock(&self.registered).retain(|r| r.0 != off);
         Ok(())
     }
 }
@@ -1021,7 +1021,7 @@ impl OpenFill {
                     // keeps items disjoint inside the live mapping.
                     let dst = unsafe { host.base().add(it.offset as usize) };
                     if let Err(e) = unsafe { source.read_item(it, dst, mode, tally) } {
-                        failed.lock().unwrap().get_or_insert(e);
+                        lock(&failed).get_or_insert(e);
                         next.store(items.len(), Ordering::Relaxed);
                         return;
                     }

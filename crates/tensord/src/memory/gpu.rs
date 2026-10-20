@@ -56,7 +56,7 @@ struct Inner {
 /// GPU pages an executor kept of one layout, so its crash or restart leaves them on the GPU.
 /// While `pid` lives each fd is a container (a socket whose queue holds the pages' fd) that it
 /// drains itself when it unmaps them; once it is gone the fds are taken out, and are TensorD's:
-/// counted in its row as kept, handed to the next executor of the layout, closed on an ask.
+/// counted in its row as idle, handed to the next executor of the layout, closed on an ask.
 struct Holding {
     fingerprint: String,
     pid: u32,
@@ -304,7 +304,7 @@ impl GpuLedger {
         Some((held.fingerprint, pages.collect()))
     }
 
-    /// A GPU fault: no kept page is trusted any more.
+    /// A GPU fault or a failed request: no kept page is trusted any more.
     pub fn forget_kept(&self) {
         let dropped = std::mem::take(&mut *self.inner.kept.lock().unwrap()).len();
         self.inner.publish();
@@ -385,10 +385,10 @@ impl Inner {
         }).sum()
     }
 
-    /// TensorD's row: its context, and its kept pages as warm weights an ask takes last.
+    /// TensorD's row: its context, and its kept pages as idle bytes no process uses, which an ask
+    /// takes before anyone's cold weights.
     fn publish(&self) {
-        let kept = self.kept_bytes();
-        self.own.publish(&Facts { context: self.context.load(Ordering::Acquire), resident: kept, cold: kept, kept, ..Facts::default() });
+        self.own.publish(&Facts { context: self.context.load(Ordering::Acquire), idle: self.kept_bytes(), ..Facts::default() });
     }
 
     /// An ask of TensorD's row: kept pages close, least recently kept layout first.

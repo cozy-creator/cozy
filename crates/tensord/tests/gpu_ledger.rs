@@ -431,8 +431,9 @@ fn each_rank_of_a_group_holds_its_own_gpus_row() {
 }
 
 /// Kept GPU pages (B8): while their executor lives they are its own; once it is gone they are
-/// TensorD's, counted in its row as kept, handed whole to the next executor of the layout, and
-/// closed when another row asks for room. Memfds in containers stand in for the VMM fds.
+/// TensorD's, counted in its row as idle, handed whole to the next executor of the layout, and
+/// closed when another row asks for room, before any process's cold weights. Memfds in
+/// containers stand in for the VMM fds.
 #[test]
 fn kept_pages_outlive_their_executor_and_go_on_an_ask() {
     let ledger = GpuLedger::start("GPU-kept", false, 0, Some(8 * GIB), None, Liveness::default(), MemoryLog::default()).unwrap().unwrap();
@@ -446,7 +447,7 @@ fn kept_pages_outlive_their_executor_and_go_on_an_ask() {
     let kept = |l: &GpuLedger| {
         l.now();
         let rows = l.status().unwrap().rows;
-        rows.iter().find(|r| r.pid == std::process::id()).unwrap().facts.kept
+        rows.iter().find(|r| r.pid == std::process::id()).unwrap().facts.idle
     };
     let mut executor = Command::new("sleep").arg("1000").spawn().unwrap();
     ledger.keep("layout-a", "fp-a", executor.id(), vec![page(0, "zero"), page(1, "one")]);
@@ -464,6 +465,9 @@ fn kept_pages_outlive_their_executor_and_go_on_an_ask() {
     };
     assert_eq!((fingerprint.as_str(), pages.iter().map(|(p, f)| (p.region, read(f))).collect::<Vec<_>>()), ("fp-a", vec![(0, "zero".into()), (1, "one".into())]));
     assert_eq!(kept(&ledger), GIB);
+    let dir = tempfile::tempdir().unwrap();
+    let mut cold = Tenant::start(&ledger, dir.path(), "answer");
+    cold.call(&format!("publish 0 {} {} 0", 2 * GIB, 2 * GIB));
     let [table, events] = ledger.grant().unwrap();
     let asker = Ledger::adopt(table.as_fd(), Some(events.as_fd())).unwrap();
     let victims = asker.ask(None, GIB).unwrap();

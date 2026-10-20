@@ -23,6 +23,8 @@ pub mod window;
 
 pub use memory::{Gpu, GpuStats, Host, HostPinned, HostSet, Pinned, WeightSet};
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use thiserror::Error;
 
 #[derive(Debug, Clone, Error)]
@@ -50,6 +52,9 @@ pub enum Error {
     /// This OS has no such mechanism (the host tier off Linux).
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// A Rust panic inside varena, caught at its boundary ([`caught`]).
+    #[error("varena panicked: {0}")]
+    Panic(String),
 }
 
 /// An OS seam's failure, named by what was attempted.
@@ -75,8 +80,22 @@ impl Error {
             Error::Source(_) => "SOURCE",
             Error::Closed(_) => "CLOSED",
             Error::Unsupported(_) => "UNSUPPORTED",
+            Error::Panic(_) => "PANIC",
         }
     }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// `f`, a panic in it returned as [`Error::Panic`] instead of unwinding into the caller.
+pub fn caught<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|p| {
+        let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned());
+        Err(Error::Panic(msg.unwrap_or_default()))
+    })
+}
+
+/// `m`'s guard though a holder panicked: one panic never makes the state unusable.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}

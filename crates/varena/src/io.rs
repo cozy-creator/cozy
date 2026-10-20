@@ -11,7 +11,7 @@ use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "store")]
 use std::sync::RwLock;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 use tensorfs::ids::ObjectRef;
@@ -20,7 +20,7 @@ use platform::durable;
 use tensorfs::{meta::Meta, read::ReadLease, store::Store};
 
 use crate::layout::{Item, ItemSource, PART_ALIGN};
-use crate::{Error, Result};
+use crate::{lock, Error, Result};
 
 #[derive(Debug, Default)]
 pub struct IoTally {
@@ -122,7 +122,7 @@ impl Source {
     /// Close one object's working descriptors; the next read of it reopens them (through the
     /// store, or from the file handed over, which stays).
     pub fn close_object(&self, sha256: &str) {
-        self.fds.lock().unwrap().remove(sha256);
+        lock(&self.fds).remove(sha256);
     }
 
     /// Whether the page cache holds every byte of `obj` (one check for all its items).
@@ -139,16 +139,16 @@ impl Source {
 
     /// End the TensorFS lease. Runs when the last weight set and handle drop the source.
     fn release(&self) -> Result<()> {
-        self.fds.lock().unwrap().clear();
+        lock(&self.fds).clear();
         #[cfg(feature = "store")]
-        if let Some(l) = self.lease.write().unwrap().take() {
+        if let Some(l) = self.lease.write().unwrap_or_else(PoisonError::into_inner).take() {
             l.release(self.meta.as_ref().ok_or_else(|| Error::Closed("a store lease without its store".into()))?)?;
         }
         Ok(())
     }
 
     fn fds(&self, obj: &ObjectRef, tally: &IoTally) -> Result<Arc<Fds>> {
-        if let Some(f) = self.fds.lock().unwrap().get(&obj.sha256) {
+        if let Some(f) = lock(&self.fds).get(&obj.sha256) {
             return Ok(f.clone());
         }
         #[cfg(feature = "store")]
@@ -163,7 +163,7 @@ impl Source {
                 )));
             }
             let f = Arc::new(Fds::of(vf.into_file(), self.direct_io, tally));
-            self.fds.lock().unwrap().insert(obj.sha256.clone(), f.clone());
+            lock(&self.fds).insert(obj.sha256.clone(), f.clone());
             return Ok(f);
         }
         let handed = self.handed.as_ref().and_then(|h| h.get(&obj.sha256));
@@ -172,7 +172,7 @@ impl Source {
         };
         let file = file.try_clone().map_err(|e| Error::Io(format!("{}: {e}", obj.sha256)))?;
         let f = Arc::new(Fds::of(file, self.direct_io, tally));
-        self.fds.lock().unwrap().insert(obj.sha256.clone(), f.clone());
+        lock(&self.fds).insert(obj.sha256.clone(), f.clone());
         Ok(f)
     }
 
@@ -195,7 +195,7 @@ impl Source {
             ItemSource::Object(o) => o,
         };
         #[cfg(feature = "store")]
-        let guard = self.lease.read().unwrap();
+        let guard = self.lease.read().unwrap_or_else(PoisonError::into_inner);
         #[cfg(feature = "store")]
         if let Some(lease) = guard.as_ref() {
             lease.covers(o)?;
@@ -287,7 +287,7 @@ pub struct Readers {
 impl Readers {
     /// The pool's threads: how many pieces of one job can run at once.
     pub fn threads(&self) -> usize {
-        self.threads.lock().unwrap().len().max(1)
+        lock(&self.threads).len().max(1)
     }
 
     pub fn new(n: usize) -> Readers {
@@ -299,7 +299,7 @@ impl Readers {
                     .name(format!("tfs-plane-read-{i}"))
                     .spawn(move || loop {
                         let job = {
-                            let mut g = q.0.lock().unwrap();
+                            let mut g = lock(&q.0);
                             loop {
                                 if let Some(j) = g.urgent.pop_front().or_else(|| g.background.pop_front()) {
                                     break j;
@@ -307,10 +307,14 @@ impl Readers {
                                 if g.stop {
                                     return;
                                 }
-                                g = q.1.wait(g).unwrap();
+                                g = q.1.wait(g).unwrap_or_else(PoisonError::into_inner);
                             }
                         };
-                        job();
+                        // A panicking job drops its sender, so its waiter sees an error.
+                        let _ = crate::caught(|| {
+                            job();
+                            Ok(())
+                        });
                     })
                     .expect("spawn reader")
             })
@@ -322,7 +326,7 @@ impl Readers {
     }
 
     pub fn submit(&self, urgent: bool, job: impl FnOnce() + Send + 'static) {
-        let mut g = self.q.0.lock().unwrap();
+        let mut g = lock(&self.q.0);
         if urgent { &mut g.urgent } else { &mut g.background }.push_back(Box::new(job));
         drop(g);
         self.q.1.notify_one();
@@ -331,14 +335,14 @@ impl Readers {
     /// Let the threads exit once the queue is empty; waits for nothing (the caller may be one
     /// of them).
     pub fn stop(&self) {
-        self.q.0.lock().unwrap().stop = true;
+        lock(&self.q.0).stop = true;
         self.q.1.notify_all();
     }
 
     /// Finish queued jobs, then stop the threads.
     pub fn shutdown(&self) {
         self.stop();
-        for t in self.threads.lock().unwrap().drain(..) {
+        for t in lock(&self.threads).drain(..) {
             let _ = t.join();
         }
     }
@@ -368,7 +372,7 @@ impl Batch {
 
     pub fn finish(&self, r: Result<()>) {
         if let Err(e) = r {
-            self.err.lock().unwrap().get_or_insert(e);
+            lock(&self.err).get_or_insert(e);
         }
         if self.left.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.fire();
@@ -376,11 +380,11 @@ impl Batch {
     }
 
     fn fire(&self) {
-        let r = match self.err.lock().unwrap().take() {
+        let r = match lock(&self.err).take() {
             Some(e) => Err(e),
             None => Ok(()),
         };
-        if let Some(f) = self.done.lock().unwrap().take() {
+        if let Some(f) = lock(&self.done).take() {
             f(r);
         }
     }

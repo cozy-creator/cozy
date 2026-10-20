@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::host::{self, HostMem};
 use crate::io::{IoTally, Mode, Source};
 use crate::layout::Layout;
-use crate::{Error, Result};
+use crate::{lock, Error, Result};
 
 /// The machine's side of a streamed layout: its writable mapping and the staging loop.
 pub struct OpenWindow {
@@ -145,7 +145,7 @@ impl OpenWindow {
                     // SAFETY: each item's range (and its padding) lies inside slot `s`, which is
                     // this thread's alone until its word is published; items are disjoint.
                     if let Err(e) = unsafe { source.read_item(it, dst, Mode::Cache, tally) } {
-                        failed.lock().unwrap().get_or_insert(e);
+                        lock(&failed).get_or_insert(e);
                         next.store(region.items.len(), Ordering::Relaxed);
                         return;
                     }

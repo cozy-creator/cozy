@@ -3055,6 +3055,10 @@ impl Pool {
             .outcome
             .as_ref()
             .ok_or_else(|| io::Error::other("device outcome absent"))?;
+        // Nothing a run that did not succeed kept outlives it.
+        if outcome.terminal != "succeeded" {
+            gpus.iter().filter_map(|d| d.memory.as_ref()).for_each(GpuLedger::forget_kept);
+        }
         match outcome.terminal.as_str() {
             "succeeded" => {
                 let result = (|| {

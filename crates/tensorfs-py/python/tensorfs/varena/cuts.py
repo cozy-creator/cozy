@@ -309,7 +309,9 @@ def _halve(align: int, size: int) -> int:
 
 def run(site: Site, forward: Callable[..., object], args: Args, kwargs: Kwargs) -> object:
     """A block's forward, its weights bound (`torch._hook`): observed under the layer on its
-    first run, then bare when that showed it may run again, else under the layer."""
+    first run, then bare when that showed it may run again, else under the layer. A first run
+    out of memory outside any op (a kernel's launch) that changed nothing yet runs once more
+    with room made and its default generators put back."""
     memo, local = _served.memo, _local
     outer, local.site = local.site, site
     try:
@@ -320,8 +322,20 @@ def run(site: Site, forward: Callable[..., object], args: Args, kwargs: Kwargs) 
             if facts is not None:
                 return forward(*args, **kwargs)
             journal, before, banded = _Journal(), _attributes(site.block), layer.banded
+            states = [(g, g.get_state()) for g in _defaults()]
             layer.journals.append(journal)
             try:
+                out = forward(*args, **kwargs)
+            except Exception as exc:  # out of memory where no op shows it (a kernel's launch)
+                need, drawn = short(exc, True), {id(g) for g, _ in states}
+                changed = journal.wrote or set(journal.generators) - drawn
+                if need is None or _capturing() or changed or before != _attributes(site.block):
+                    raise
+                _clear(exc)
+                memo.retries += 1
+                for generator, state in states:
+                    generator.set_state(state)
+                _served.rungs.free(site.device, need + SLACK)
                 out = forward(*args, **kwargs)
             finally:
                 layer.journals.remove(journal)
@@ -572,6 +586,12 @@ def _device(args: Args, kwargs: Kwargs) -> torch.device | None:
     for t in _tensors((args, kwargs)):
         return t.device
     return None
+
+
+def _defaults() -> list[torch.Generator]:
+    """The default generators: the CPU's, and each GPU's once CUDA is up."""
+    cuda = torch.cuda.default_generators if torch.cuda.is_initialized() else ()
+    return [torch.default_generator, *cuda]
 
 
 def _generators(func: OpOverload, args: Args, kwargs: Kwargs) -> list[torch.Generator]:

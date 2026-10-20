@@ -994,3 +994,49 @@ fn an_emptied_idle_size_leaves_the_map_so_the_largest_entry_holds_a_chunk() {
     let (&size, handles) = st.idle.last_key_value().unwrap();
     assert_eq!((size, handles.as_slice(), st.idle_bytes()), (REGION_ALIGN, &[2][..], REGION_ALIGN));
 }
+
+/// Run 11951: a panic holding the books (`keep_idle`) poisoned them, and every later op panicked.
+#[test]
+fn a_panic_holding_the_books_is_a_typed_error_and_the_next_op_works() {
+    let f = Fixture::new();
+    let g = &f.gpu.inner;
+    let r = crate::caught(|| -> Result<()> {
+        let _st = g.lock();
+        panic!("keep_idle")
+    });
+    assert!(matches!(&r, Err(Error::Panic(m)) if m == "keep_idle"), "{r:?}");
+    assert!(g.st.is_poisoned());
+    let r = crate::caught(|| -> Result<()> { panic!("region {}", 7) });
+    assert!(matches!(&r, Err(e @ Error::Panic(m)) if m == "region 7" && e.code() == "PANIC"), "{r:?}");
+    f.ws().warm(false);
+    f.gpu.step();
+    let st = g.lock();
+    assert!(!st.sets[0].as_ref().unwrap().warm && st.steps == 1);
+}
+
+#[test]
+fn a_panicking_read_leaves_the_reader_serving() {
+    let readers = Readers::new(1);
+    let (tx, rx) = mpsc::channel();
+    readers.submit(true, || panic!("read"));
+    readers.submit(true, move || tx.send(()).unwrap());
+    rx.recv().unwrap();
+    readers.shutdown();
+}
+
+#[test]
+fn a_panicking_ask_answer_frees_nothing_and_the_ask_thread_answers_on() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let (ledger, _fd) = crate::ledger::Ledger::create("GPU-panic", 8 << 30).unwrap();
+    let row = Arc::new(ledger.claim(std::process::id()).unwrap());
+    row.publish(&crate::ledger::Facts { idle: 4 << 30, last_use: 1, ..Default::default() });
+    let answers = Arc::new(AtomicUsize::new(0));
+    let n = answers.clone();
+    row.serve(move |want| if n.fetch_add(1, SeqCst) == 0 { panic!("give") } else { want }).unwrap();
+    for _ in 0..2 {
+        for v in ledger.ask(None, 1 << 30).unwrap() {
+            ledger.wait(&v).unwrap();
+        }
+    }
+    assert_eq!(answers.load(SeqCst), 2);
+}
