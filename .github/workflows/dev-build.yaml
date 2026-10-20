@@ -35,6 +35,14 @@ on:
         description: cozy-runtime branch, tag or SHA whose wheel tests get as COZY_TEST_RUNTIME_WHEEL; empty for the newest published
         type: string
         default: ''
+      runtime_run:
+        description: Existing cozy-runtime native assembly run; requires full runtime_ref and runtime_sha256
+        type: string
+        default: ''
+      runtime_sha256:
+        description: Expected native Runtime wheel SHA256 when runtime_run is supplied
+        type: string
+        default: ''
       runner:
         description: Runner label
         type: string
@@ -166,6 +174,16 @@ jobs:
           uv pip install --python "$RUNNER_TEMP/tensorfs/bin/python" crates/tensorfs-py/dist/*.whl
           echo "TENSORFS_TEST_PYTHON=$RUNNER_TEMP/tensorfs/bin/python" >> "$GITHUB_ENV"
           echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$PWD"/crates/tensorfs-py/dist/tensorfs-*.whl)" >> "$GITHUB_ENV"
+      - name: Validate native Runtime artifact selection
+        if: inputs.runtime_run != ''
+        env:
+          NATIVE_RUNTIME_RUN: ${{ inputs.runtime_run }}
+          NATIVE_RUNTIME_REF: ${{ inputs.runtime_ref }}
+          NATIVE_RUNTIME_SHA256: ${{ inputs.runtime_sha256 }}
+        run: |
+          [[ "$NATIVE_RUNTIME_RUN" =~ ^[0-9]+$ ]]
+          [[ "$NATIVE_RUNTIME_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$NATIVE_RUNTIME_SHA256" =~ ^[0-9a-f]{64}$ ]]
       - if: inputs.runtime_ref != ''
         uses: actions/checkout@v5
         with:
@@ -178,7 +196,51 @@ jobs:
       - if: inputs.runtime_ref != ''
         run: |
           python3 .runtime/scripts/stamp-build-provenance.py "$(git -C .runtime rev-parse HEAD)"
+      - if: inputs.runtime_ref != '' && inputs.runtime_run == ''
+        run: |
           uv build --wheel --out-dir "$RUNNER_TEMP/runtime" .runtime
+      - name: Download the selected native Runtime wheel
+        if: inputs.runtime_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          repository: cozy-creator/cozy-runtime
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.runtime_run }}
+          name: cozy-runtime-${{ inputs.runtime_ref }}
+          path: ${{ runner.temp }}/runtime
+      - name: Verify native Runtime source and bytes
+        if: inputs.runtime_run != ''
+        env:
+          NATIVE_RUNTIME_REF: ${{ inputs.runtime_ref }}
+          NATIVE_RUNTIME_SHA256: ${{ inputs.runtime_sha256 }}
+        run: |
+          python3 - <<'PY'
+          import ast
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import zipfile
+          from email.parser import BytesParser
+
+          wheels = list((pathlib.Path(os.environ["RUNNER_TEMP"]) / "runtime").glob("cozy_runtime-*.whl"))
+          assert len(wheels) == 1, "expected one selected Runtime wheel"
+          wheel = wheels[0]
+          digest = hashlib.file_digest(wheel.open("rb"), "sha256").hexdigest()
+          assert digest == os.environ["NATIVE_RUNTIME_SHA256"], "Runtime wheel hash mismatch"
+          with zipfile.ZipFile(wheel) as archive:
+              source = ast.parse(archive.read("cozy_runtime/_build_provenance.py"))
+              commits = [ast.literal_eval(node.value) for node in source.body
+                         if isinstance(node, ast.Assign)
+                         and any(isinstance(target, ast.Name) and target.id == "COMMIT" for target in node.targets)]
+              assert commits == [os.environ["NATIVE_RUNTIME_REF"]], "Runtime source mismatch"
+              metadata = [name for name in archive.namelist() if name.endswith(".dist-info/WHEEL")]
+              assert len(metadata) == 1
+              assert BytesParser().parsebytes(archive.read(metadata[0]))["Root-Is-Purelib"] == "false"
+              modules = [f"cozy_runtime/_kernels/{name}.abi3.so" for name in ("_gemm", "_norm", "_fa3")]
+              assert all(archive.read(name).startswith(b"\x7fELF") for name in modules), "missing native Runtime modules"
+          print(json.dumps({"runtime_source": commits[0], "wheel_sha256": digest, "native_modules": modules}))
+          PY
       # Without runtime_ref, the Runtime machines install today: the newest published wheel.
       - if: inputs.test != '' && inputs.runtime_ref == ''
         run: |
@@ -203,3 +265,11 @@ jobs:
             --setenv="GOCACHE=$(go env GOCACHE)" --setenv="GOMODCACHE=$(go env GOMODCACHE)" \
             --setenv=CARGO_TERM_COLOR=never --setenv=GITHUB_ACTIONS=true "${locations[@]}" \
             bash -euo pipefail -c "$TEST"
+      - name: Retain targeted proof executables
+        if: always() && hashFiles('dist/testbins/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-testbins-${{ steps.sha.outputs.sha }}
+          path: dist/testbins/**
+          if-no-files-found: error
+          retention-days: 7
