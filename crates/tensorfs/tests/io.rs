@@ -219,10 +219,12 @@ fn read_everything(ck: &Checkpoint, skew: usize, opts: &ReadOpts) -> ReadStats {
 fn sweep(ck: &Checkpoint, what: &str) {
     let small = ReadOpts { threads: 3, request: 64 << 10, ..ReadOpts::default() };
     let buffered = ReadOpts { direct: false, ..ReadOpts::default() };
-    for opts in [ReadOpts::default(), small, buffered] {
+    for opts in [ReadOpts::default(), small, buffered.clone()] {
         for skew in [0, 1, 4095] {
             evict(ck);
             let cold = read_everything(ck, skew, &opts);
+            // The engine reads past the page cache, so a buffered read warms it.
+            read_everything(ck, skew, &buffered);
             let warm = read_everything(ck, skew, &opts);
             println!("{what} skew {skew} {opts:?}\n  cold {cold:?}\n  warm {warm:?}");
             if opts.direct && direct_ok(ck) {
@@ -400,6 +402,19 @@ fn many_destinations_at_once_from_a_writers_folder() {
     assert!(gbps > 0.0 && direct == direct_ok(&ck));
     assert!(io::ceiling(None, &scratch.0).unwrap().disk_gbps > 0.0);
     assert_eq!(io::ceiling(Some(0), &scratch.0).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+}
+
+/// Host reads, by tensor or by stored location, go through the engine and log a disk run.
+#[test]
+fn host_reads_run_through_the_engine_and_log_a_disk_run() {
+    let scratch = Scratch::new("logged");
+    let ck = written(&scratch.0, 4);
+    let Body::Data(big) = ck.tensor("unet", "big").unwrap().body else { unreachable!() };
+    io::metrics::take();
+    assert_eq!(ck.read("unet", "big").unwrap(), noise(9, big.length as usize));
+    let runs = io::metrics::take();
+    let run = runs.iter().find(|c| c.kind == "disk" && c.bytes == big.length);
+    assert!(run.is_some_and(|c| c.gpu == -1 && c.ns > 0), "{runs:?}");
 }
 
 /// Host read GB/s on this machine against `cat` and `dd iflag=direct` over the same chunk files

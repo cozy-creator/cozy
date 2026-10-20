@@ -1,27 +1,17 @@
-//! What TensorFS copies are measured against: a GPU's pinned host→device bandwidth
-//! (best of 1, 2 and 4 streams) and PCIe link, and a store volume's O_DIRECT sequential read.
-//! Each ceiling is measured once per machine and kept in `~/.cache/tensorfs/ceilings`, keyed by
-//! GPU UUID and driver or by the volume's device. Every copy run lands in one log (`take`).
+//! What TensorFS copies are measured against: a GPU's pinned host→device bandwidth (best of 1,
+//! 2 and 4 streams) and PCIe link, and a volume's O_DIRECT read (`probe`). Ceilings are kept per
+//! boot (`probe::keep`), the GPU's by UUID and driver. Every copy run lands in one log (`take`).
 
 use std::ffi::c_void;
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::fs::File;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use platform::durable;
-
-use super::cuda;
+use super::{cuda, probe};
 use cuda::Result;
 
 const H2D_PROBE: usize = 128 << 20;
-const DISK_PROBE: u64 = 1 << 30;
-const DISK_BLOCK: usize = 8 << 20;
-const DISK_THREADS: usize = 8;
 const LOG_KEEP: usize = 256;
 
 /// One run of copies: a GPU's copy stream busy from its first job to its last landing
@@ -62,25 +52,24 @@ pub fn take() -> Vec<Copy> {
     std::mem::take(&mut LOG.lock().unwrap())
 }
 
-fn path() -> Option<PathBuf> {
-    Some(platform::paths::login_home()?.join(".cache/tensorfs/ceilings"))
+/// A run of host reads from `files`, logged against its volume's kept ceiling. A run past the
+/// page cache of at least a probe's worth that beat that ceiling raises it: the volume reached it.
+pub(crate) fn disk_run(files: &[&File], bytes: u64, ns: u64, direct: u64, cached: u64) {
+    let Some(volume) = files.first().and_then(|f| f.metadata().ok()).map(|m| volume(m.dev())) else {
+        return;
+    };
+    if direct >= probe::KEEP && cached == 0 {
+        probe::disk_keep(volume, (direct as f64 / ns.max(1) as f64, true));
+    }
+    let ceiling = probe::disk_known(volume).map_or(0.0, |(gbps, _)| gbps);
+    record(Copy { kind: "disk", gpu: -1, bytes, ns, cached, ceiling, ..Default::default() });
 }
 
-fn cached(key: &str) -> Option<Vec<f64>> {
-    let text = std::fs::read_to_string(path()?).ok()?;
-    let line = text
-        .lines()
-        .rev()
-        .find_map(|l| l.strip_prefix(key)?.strip_prefix('\t'))?;
-    line.split('\t').map(|v| v.parse().ok()).collect()
-}
-
-fn keep(key: &str, values: &[f64]) {
-    let Some(p) = path() else { return };
-    let line: String = values.iter().map(|v| format!("\t{v}")).collect();
-    let _ = std::fs::create_dir_all(p.parent().unwrap());
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(p) {
-        let _ = f.write_all(format!("{key}{line}\n").as_bytes());
+/// A `st_dev` as `durable::device` names its volume.
+fn volume(dev: u64) -> u64 {
+    match cfg!(target_os = "linux") {
+        true => u64::from(libc::major(dev)) << 32 | u64::from(libc::minor(dev)),
+        false => dev,
     }
 }
 
@@ -145,13 +134,13 @@ pub fn h2d(device: i32) -> Option<(f64, u32)> {
     let _c = cuda::CtxGuard::enter(ctx).ok()?;
     let driver = std::fs::read_to_string("/sys/module/nvidia/version").unwrap_or_default();
     let key = format!("h2d {} {}", cuda::uuid(dev).ok()?, driver.trim());
-    if let Some(&[gbps, streams]) = cached(&key).as_deref() {
+    if let Some(&[gbps, streams]) = probe::known(&key).as_deref() {
         return Some((gbps, streams as u32));
     }
     let (gbps, streams) = measure_h2d(device, ctx, retained)
         .inspect_err(|e| tracing::warn!("tensorfs: no H2D ceiling: {e}"))
         .ok()?;
-    keep(&key, &[gbps, streams as f64]);
+    probe::keep(&key, &[gbps, streams as f64]);
     Some((gbps, streams))
 }
 
@@ -262,67 +251,4 @@ fn measure_h2d(device: i32, ctx: cuda::CUcontext, retained: PrimaryContext) -> R
         }
     }
     Ok(best)
-}
-
-/// The O_DIRECT sequential read GB/s of the volume holding `files`: whole 8 MiB blocks of
-/// them, up to 1 GiB, on 8 threads. Measured once per volume; None where O_DIRECT is refused.
-pub fn disk(files: &[&File]) -> Option<f64> {
-    let key = format!("disk {}", files.first()?.metadata().ok()?.dev());
-    if let Some(&[gbps]) = cached(&key).as_deref() {
-        return Some(gbps);
-    }
-    let direct: Vec<File> = files
-        .iter()
-        .filter_map(|f| durable::open_direct(f).ok().flatten())
-        .collect();
-    let mut blocks = Vec::new();
-    for (i, f) in direct.iter().enumerate() {
-        let len = f.metadata().ok()?.len();
-        let fit = (len / DISK_BLOCK as u64)
-            .min((DISK_PROBE / DISK_BLOCK as u64).saturating_sub(blocks.len() as u64));
-        blocks.extend((0..fit).map(|b| (i, b * DISK_BLOCK as u64)));
-    }
-    if blocks.is_empty() {
-        return None;
-    }
-    let (next, failed) = (AtomicUsize::new(0), AtomicUsize::new(0));
-    let t = Instant::now();
-    std::thread::scope(|s| {
-        for _ in 0..DISK_THREADS.min(blocks.len()) {
-            s.spawn(|| {
-                // SAFETY: a fresh private anonymous mapping, page aligned as O_DIRECT needs.
-                let buf = unsafe {
-                    libc::mmap(
-                        std::ptr::null_mut(),
-                        DISK_BLOCK,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                        -1,
-                        0,
-                    )
-                };
-                if buf == libc::MAP_FAILED {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-                while let Some(&(i, at)) = blocks.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    // SAFETY: an aligned read into our own buffer.
-                    if unsafe {
-                        libc::pread(direct[i].as_raw_fd(), buf, DISK_BLOCK, at as libc::off_t)
-                    } != DISK_BLOCK as isize
-                    {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                // SAFETY: our mapping.
-                unsafe { libc::munmap(buf, DISK_BLOCK) };
-            });
-        }
-    });
-    if failed.into_inner() > 0 {
-        return None;
-    }
-    let gbps = (blocks.len() * DISK_BLOCK) as f64 / t.elapsed().as_nanos() as f64;
-    keep(&key, &[gbps]);
-    Some(gbps)
 }

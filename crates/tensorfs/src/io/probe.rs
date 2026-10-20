@@ -1,6 +1,8 @@
-//! The hardware ceiling copies are measured against (design §13). Here, the disk: a volume's
-//! sequential read rate, measured once per volume and boot, kept in `~/.cache/tensorfs-ceilings`
-//! (tab-separated `key value…` lines; the last for a key wins).
+//! The hardware ceilings copies are measured against (design §13): a volume's O_DIRECT
+//! sequential read rate here, a GPU's pinned H2D rate in `metrics`. Each is kept per boot in
+//! the TensorFS cache (`$TENSORFS_HOME`, else `~/.cache/tensorfs`) at `tmp/ceilings/table`,
+//! tab-separated `key value…` lines; a key's highest first value wins, so a probe taken at a
+//! contended moment, or a copy that ran faster than it, never leaves a ceiling stuck low.
 
 use std::collections::BTreeMap;
 use std::cmp::Reverse;
@@ -18,7 +20,7 @@ use super::host::{read_at, Bounce};
 /// Bytes a probe reads at most.
 const PROBE: u64 = 1 << 30;
 /// Bytes a probe must read for its rate to stand for the volume (and be kept).
-const KEEP: u64 = 256 << 20;
+pub(super) const KEEP: u64 = 256 << 20;
 const BLOCK: usize = 8 << 20;
 const THREADS: usize = 8;
 
@@ -53,17 +55,8 @@ pub fn ceiling(device: Option<i32>, path: &Path) -> io::Result<Ceiling> {
 /// whole blocks, up to 1 GiB, on 8 threads, O_DIRECT where the filesystem allows (else through
 /// the page cache, and `false`). A probe of under 256 MiB is returned, not kept.
 pub fn disk(path: &Path) -> io::Result<(f64, bool)> {
-    static SEEN: Mutex<BTreeMap<u64, (f64, bool)>> = Mutex::new(BTreeMap::new());
     let volume = durable::device(path).map_err(io::Error::other)?;
-    let key = platform::process::boot_id()
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|boot| format!("disk {boot} {volume}"));
-    if let Some(&seen) = SEEN.lock().unwrap().get(&volume) {
-        return Ok(seen);
-    }
-    if let Some(seen) = key.as_deref().and_then(kept) {
-        SEEN.lock().unwrap().insert(volume, seen);
+    if let Some(seen) = disk_known(volume) {
         return Ok(seen);
     }
     let mut found = Vec::new();
@@ -127,46 +120,74 @@ pub fn disk(path: &Path) -> io::Result<(f64, bool)> {
         direct,
     );
     if read >= KEEP {
-        SEEN.lock().unwrap().insert(volume, seen);
-        if let Some(key) = key {
-            keep(&key, seen);
-        }
+        disk_keep(volume, seen);
     }
     Ok(seen)
 }
 
-fn ceilings() -> Option<PathBuf> {
-    Some(platform::paths::login_home()?.join(".cache/tensorfs-ceilings"))
+/// The kept ceiling of volume `volume` this boot: GB/s and whether it was O_DIRECT.
+pub(crate) fn disk_known(volume: u64) -> Option<(f64, bool)> {
+    match known(&format!("disk {volume}"))?.as_slice() {
+        &[rate, direct] if direct == 0.0 || direct == 1.0 => Some((rate, direct == 1.0)),
+        _ => None,
+    }
 }
 
-fn kept(key: &str) -> Option<(f64, bool)> {
-    let text = fs::read_to_string(ceilings()?).ok()?;
-    saved(&text, key)
+/// Keeps `seen` for volume `volume`, unless a higher rate is kept already.
+pub(crate) fn disk_keep(volume: u64, (rate, direct): (f64, bool)) {
+    keep(&format!("disk {volume}"), &[rate, f64::from(u8::from(direct))]);
 }
 
-fn saved(text: &str, key: &str) -> Option<(f64, bool)> {
-    let line = text
-        .lines()
-        .rev()
-        .find_map(|l| l.strip_prefix(key)?.strip_prefix('\t'))?;
-    let (rate, direct) = line.split_once('\t')?;
-    let rate: f64 = rate.parse().ok()?;
-    let direct = match direct {
-        "0" => false,
-        "1" => true,
-        _ => return None,
-    };
-    (rate.is_finite() && rate > 0.0).then_some((rate, direct))
+/// The kept values of `key` this boot: the line with the highest first value.
+pub(crate) fn known(key: &str) -> Option<Vec<f64>> {
+    let key = format!("{} {key}", boot()?);
+    if let Some(seen) = MEMO.lock().unwrap().get(&key) {
+        return Some(seen.clone());
+    }
+    let seen = saved(&fs::read_to_string(table()?).ok()?, &key)?;
+    MEMO.lock().unwrap().insert(key, seen.clone());
+    Some(seen)
 }
 
-fn keep(key: &str, (rate, direct): (f64, bool)) {
-    let Some(path) = ceilings() else { return };
-    let _ = fs::create_dir_all(path.parent().unwrap());
+/// Keeps `values` for `key` this boot, when its first value beats the one kept.
+pub(crate) fn keep(key: &str, values: &[f64]) {
+    let first = values.first().copied().unwrap_or(0.0);
+    if !(first.is_finite() && first > 0.0) || known(key).is_some_and(|k| k[0] >= first) {
+        return;
+    }
+    let Some((boot, path)) = boot().zip(table()) else { return };
+    let key = format!("{boot} {key}");
+    MEMO.lock().unwrap().insert(key.clone(), values.to_vec());
+    let line: String = values.iter().map(|v| format!("\t{v}")).collect();
+    let _ = fs::create_dir_all(path.parent().expect("the table has a directory"));
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
         if f.lock().is_ok() {
-            let _ = f.write_all(format!("{key}\t{rate}\t{}\n", u8::from(direct)).as_bytes());
+            let _ = f.write_all(format!("{key}{line}\n").as_bytes());
         }
     }
+}
+
+static MEMO: Mutex<BTreeMap<String, Vec<f64>>> = Mutex::new(BTreeMap::new());
+
+fn boot() -> Option<String> {
+    platform::process::boot_id().ok().filter(|s| !s.is_empty())
+}
+
+/// `tmp/ceilings/table` in the TensorFS cache. A directory in `tmp/` is its maker's: GC leaves it.
+fn table() -> Option<PathBuf> {
+    let home = match std::env::var_os("TENSORFS_HOME").filter(|h| !h.is_empty()) {
+        Some(home) => PathBuf::from(home),
+        None => platform::paths::login_home()?.join(".cache").join("tensorfs"),
+    };
+    Some(home.join("tmp").join("ceilings").join("table"))
+}
+
+/// The values of `key`'s line with the highest positive, finite first value.
+fn saved(text: &str, key: &str) -> Option<Vec<f64>> {
+    let lines = text.lines().filter_map(|l| l.strip_prefix(key)?.strip_prefix('\t'));
+    let values = lines.filter_map(|l| l.split('\t').map(|v| v.parse::<f64>().ok()).collect::<Option<Vec<f64>>>());
+    let valid = values.filter(|v| v.first().is_some_and(|f| f.is_finite() && *f > 0.0));
+    valid.max_by(|a, b| a[0].total_cmp(&b[0]))
 }
 
 fn files(path: &Path, volume: u64, out: &mut Vec<(u64, PathBuf)>) -> io::Result<()> {
@@ -194,19 +215,12 @@ mod tests {
     use super::saved;
 
     #[test]
-    fn persisted_rates_are_positive_finite_and_match_the_exact_volume_and_boot() {
-        let key = "disk boot-a 42";
-        assert_eq!(
-            saved("disk boot-a 420\t99\t1\ndisk boot-b 42\t88\t1\n", key),
-            None
-        );
-        assert_eq!(
-            saved("disk boot-a 42\t2.5\t0\ndisk boot-a 42\t3.25\t1\n", key),
-            Some((3.25, true))
-        );
-        for value in [
-            "NaN\t1", "inf\t1", "0\t1", "-1\t1", "2\t3", "2\t1\t9", "no rate",
-        ] {
+    fn a_kept_ceiling_is_the_highest_positive_rate_for_the_exact_key() {
+        let key = "boot-a disk 42";
+        assert_eq!(saved("boot-a disk 420\t99\t1\nboot-b disk 42\t88\t1\n", key), None);
+        let text = "boot-a disk 42\t3.25\t1\nboot-a disk 42\t0.58\t1\nboot-a disk 42\t2.5\t0\n";
+        assert_eq!(saved(text, key), Some(vec![3.25, 1.0]));
+        for value in ["NaN\t1", "inf\t1", "0\t1", "-1\t1", "no rate"] {
             assert_eq!(saved(&format!("{key}\t{value}\n"), key), None, "{value}");
         }
     }

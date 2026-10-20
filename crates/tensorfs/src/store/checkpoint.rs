@@ -4,13 +4,14 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{fail, invalid, Error, Result, Store};
 use super::retention::{self, DirectoryGuard, Retention};
 use crate::format::layout::ALIGN;
+use crate::io::{Copy, Dst, ReadOpts, Src};
 use crate::format::{
     self, decode, variant_of, variant_path, Body, Component, Header, Location, ObjectRef,
     PartBytes, Pipeline, Tensor, Tree, CHUNKS_DIR,
@@ -382,16 +383,19 @@ impl Checkpoint {
             ))
             .into());
         }
-        let mut filled = 0;
-        for span in self.header.spans(at) {
-            let mut file = self.chunk(span.chunk)?;
-            let piece = &mut buf[filled..filled + span.length as usize];
-            file.seek(SeekFrom::Start(span.start))
-                .and_then(|_| file.read_exact(piece))
-                .map_err(|e| fail("read", self.chunk_path(span.chunk))(e))?;
-            filled += span.length as usize;
+        let spans = self.header.spans(at);
+        let files = spans.iter().map(|s| self.chunk(s.chunk)).collect::<Result<Vec<_>>>()?;
+        let (mut copies, mut filled) = (Vec::with_capacity(spans.len()), 0);
+        for (span, file) in spans.iter().zip(&files) {
+            let len = span.length as usize;
+            let dst = Dst::Host { ptr: buf[filled..filled + len].as_mut_ptr(), len };
+            copies.push(Copy { src: Src::File(file, span.start), dst });
+            filled += len;
         }
-        Ok(())
+        // SAFETY: the destinations are disjoint ranges of `buf`, borrowed until the read returns.
+        #[allow(unsafe_code)]
+        let read = unsafe { crate::io::read(&copies, &ReadOpts::default()) };
+        read.map(drop).map_err(|e| fail("read", self.chunk_path(spans[e.copy].chunk))(e.source))
     }
 
     /// A tensor's logical bytes, in its dtype: encoded parts go through the reference decode.
