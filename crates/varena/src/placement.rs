@@ -207,6 +207,43 @@ struct Cache {
     resized: bool,
 }
 
+/// Suppress a zero-progress allocator trim only until its facts or request
+/// boundary change. An actual callback pin survives every such rearm.
+#[derive(Default)]
+struct SlackTrim {
+    busy: bool,
+    changed: bool,
+    blocked: bool,
+    published: bool,
+}
+impl SlackTrim {
+    fn publish(&mut self, changed: bool) {
+        self.published |= self.busy;
+        if changed {
+            self.rearm();
+        }
+    }
+    fn rearm(&mut self) {
+        self.blocked = false;
+        self.changed |= self.busy;
+    }
+    fn begin(&mut self) {
+        debug_assert!(!self.busy);
+        self.busy = true;
+        self.changed = false;
+        self.published = false;
+    }
+    fn finish(&mut self, no_progress: bool) {
+        self.busy = false;
+        self.blocked = no_progress && !self.changed;
+        self.changed = false;
+        self.published = false;
+    }
+    fn pins(&self) -> u32 {
+        u32::from(self.busy || self.blocked)
+    }
+}
+
 struct Inner {
     table: plan::Table,
     models: BTreeMap<ModelId, Model>,
@@ -218,6 +255,23 @@ struct Inner {
     next_page: PageId,
     progress: u64,
     trim: Option<Arc<Shrink>>,
+    slack_trim: SlackTrim,
+}
+impl Inner {
+    fn rearm_slack(&mut self) {
+        self.slack_trim.rearm();
+        self.sync_slack_pin();
+    }
+    fn sync_slack_pin(&mut self) {
+        if let Some(page) = self
+            .table
+            .pages
+            .iter_mut()
+            .find(|page| page.kind == Kind::Slack)
+        {
+            page.pins = self.slack_trim.pins();
+        }
+    }
 }
 
 impl TransferProof {
@@ -321,6 +375,7 @@ impl Placement {
                 next_page: 1,
                 progress: 0,
                 trim: None,
+                slack_trim: SlackTrim::default(),
             }),
             operations: Mutex::new(()),
             changed: Condvar::new(),
@@ -738,6 +793,9 @@ impl Placement {
             Self::remove_request(&mut inner, id);
             return Err(error);
         }
+        // A new request gets one opportunity to trim blocks whose asynchronous
+        // consumers finished without changing allocator byte counters.
+        inner.rearm_slack();
         Self::event_locked(&mut inner, id, 0, "begin", "request")?;
         drop(inner);
         let mut rollback = Beginning {
@@ -1214,6 +1272,11 @@ impl Placement {
         let stats = Self::remove_request(&mut inner, request)
             .ok_or_else(|| invalid("unknown request"))?
             .stats;
+        if inner.requests.is_empty() {
+            // Admission runs before the next Begin. Do not leave an idle owner
+            // with a zero-trim suppression pin that no request can refresh.
+            inner.rearm_slack();
+        }
         drop(inner);
         self.refresh()?;
         recovered?;
@@ -1439,6 +1502,7 @@ impl Placement {
 
     pub fn allocator(&self, context: u64, allocated: u64, reserved: u64) -> Result<()> {
         let mut inner = self.inner.lock();
+        let mut changed = false;
         let cached: u64 = inner
             .table
             .pages
@@ -1452,8 +1516,10 @@ impl Placement {
             (Kind::Slack, reserved.saturating_sub(allocated)),
         ] {
             if let Some(page) = inner.table.pages.iter_mut().find(|page| page.kind == kind) {
+                changed |= page.bytes != bytes;
                 page.bytes = bytes;
             } else {
+                changed = true;
                 let id = inner.next_page;
                 inner.next_page = id
                     .checked_add(1)
@@ -1477,6 +1543,14 @@ impl Placement {
                     lowered: BTreeSet::new(),
                 });
             }
+        }
+        inner.slack_trim.publish(changed);
+        if changed {
+            inner.sync_slack_pin();
+        }
+        drop(inner);
+        if changed {
+            self.row.wake()?;
         }
         Ok(())
     }
@@ -1779,42 +1853,41 @@ impl Placement {
                         }
                     }
                     Action::Trim(page) => {
-                        let trim =
-                            self.inner.lock().trim.clone().ok_or_else(|| {
+                        let (trim, bytes) = {
+                            let mut inner = self.inner.lock();
+                            let trim = inner.trim.clone().ok_or_else(|| {
                                 invalid("allocator trim callback was not registered")
                             })?;
-                        let bytes = self
-                            .inner
-                            .lock()
-                            .table
-                            .page(page)
-                            .map_or(0, |row| row.bytes);
-                        if let Some(row) = self
-                            .inner
-                            .lock()
-                            .table
-                            .pages
-                            .iter_mut()
-                            .find(|row| row.id == page)
-                        {
-                            row.pins = 1;
-                        }
+                            let bytes = inner.table.page(page).map_or(0, |row| row.bytes);
+                            inner.slack_trim.begin();
+                            let pins = inner.slack_trim.pins();
+                            if let Some(row) =
+                                inner.table.pages.iter_mut().find(|row| row.id == page)
+                            {
+                                row.pins = pins;
+                            }
+                            (trim, bytes)
+                        };
                         let mut callback = Callback {
                             owner: self,
                             page,
                             keep_pin: false,
+                            trim: true,
                         };
                         drop(operation);
                         let freed = trim(bytes)?;
-                        if let Some(row) = self
-                            .inner
-                            .lock()
-                            .table
-                            .pages
-                            .iter_mut()
-                            .find(|row| row.id == page)
                         {
-                            row.bytes = row.bytes.saturating_sub(freed);
+                            let mut inner = self.inner.lock();
+                            // An allocator publication is authoritative, including
+                            // a partial trim already reflected in reserved bytes.
+                            // Only callbacks without a publication use delta accounting.
+                            if !inner.slack_trim.published {
+                                if let Some(row) =
+                                    inner.table.pages.iter_mut().find(|row| row.id == page)
+                                {
+                                    row.bytes = row.bytes.saturating_sub(freed);
+                                }
+                            }
                         }
                         callback.keep_pin = freed == 0;
                         drop(callback);
@@ -1842,6 +1915,7 @@ impl Placement {
                             owner: self,
                             page,
                             keep_pin: false,
+                            trim: false,
                         };
                         drop(operation);
                         let freed = shrink(bytes)?;
@@ -2179,11 +2253,17 @@ struct Callback<'a> {
     owner: &'a Placement,
     page: PageId,
     keep_pin: bool,
+    trim: bool,
 }
 impl Drop for Callback<'_> {
     fn drop(&mut self) {
         let mut inner = self.owner.inner.lock();
-        let pins = if let Some(cache) = inner.caches.get_mut(&self.page) {
+        let pins = if self.trim {
+            // Measurements may have changed while the callback ran outside the
+            // gate. Its old zero result must not suppress those newer facts.
+            inner.slack_trim.finish(self.keep_pin);
+            inner.slack_trim.pins()
+        } else if let Some(cache) = inner.caches.get_mut(&self.page) {
             cache.busy = false;
             cache.active.saturating_add(u32::from(cache.blocked))
         } else {
@@ -2318,6 +2398,47 @@ mod gpu_tests {
     use std::time::{Duration, Instant};
     use tensorfs::io::cuda;
     use tensorfs::io::source::{Item, ItemSource};
+
+    #[test]
+    fn zero_trim_suppression_ends_only_at_a_new_opportunity() {
+        let mut trim = SlackTrim::default();
+        trim.begin();
+        trim.finish(true);
+        assert_eq!(trim.pins(), 1, "unchanged zero-progress facts stay blocked");
+        trim.rearm();
+        assert_eq!(trim.pins(), 0);
+        trim.begin();
+        trim.finish(true);
+        assert_eq!(trim.pins(), 1, "one rearm must not enable a retry loop");
+        trim.rearm();
+        trim.begin();
+        trim.finish(false);
+        assert_eq!(trim.pins(), 0);
+    }
+
+    #[test]
+    fn rearmed_facts_keep_the_callback_pin_and_outlive_its_zero_result() {
+        let mut trim = SlackTrim::default();
+        trim.begin();
+        trim.publish(false);
+        assert!(trim.published);
+        trim.finish(true);
+        assert_eq!(trim.pins(), 1, "unchanged publication is not progress");
+        trim.rearm();
+        trim.begin();
+        trim.publish(true);
+        trim.rearm();
+        assert_eq!(trim.pins(), 1, "a running callback still owns its pin");
+        trim.finish(true);
+        assert_eq!(
+            trim.pins(),
+            0,
+            "the old zero result cannot block newer facts"
+        );
+        trim.begin();
+        trim.finish(true);
+        assert_eq!(trim.pins(), 1, "unchanged facts still stop another retry");
+    }
 
     #[test]
     fn bind_retry_requires_increasing_room_after_checked_recovery() {
@@ -2576,6 +2697,144 @@ mod gpu_tests {
         );
         placement.close_cache(cache);
         placement.close_cache(created.lock().take().expect("callback-created cache"));
+
+        // Exercise allocator slack with actual CUDA allocations, not synthetic
+        // resident bytes. A live 4MiB owner later joins the idle 12MiB cache.
+        let live = tensorfs::io::DeviceBuffer::new(0, 4 << 20).unwrap();
+        let idle = Arc::new(Mutex::new(vec![tensorfs::io::DeviceBuffer::new(
+            0,
+            12 << 20,
+        )
+        .unwrap()]));
+        let attempts = Arc::new(AtomicU64::new(0));
+        let (entered, waiting) = mpsc::channel();
+        let (release, finish) = mpsc::channel();
+        let finish = Arc::new(Mutex::new(finish));
+        let release = ReleaseGate(Some(release));
+        let (buffers, calls) = (idle.clone(), attempts.clone());
+        let weak = Arc::downgrade(&placement);
+        placement.trim_with(Arc::new(move |_| {
+            match calls.fetch_add(1, Ordering::AcqRel) {
+                0 => {
+                    entered.send(()).unwrap();
+                    finish.lock().recv().unwrap();
+                    Ok(0) // This trim observed the old, still-busy allocation state.
+                }
+                1 => {
+                    let (retired, remaining) = {
+                        let mut buffers = buffers.lock();
+                        let retired = buffers.remove(0);
+                        let remaining = buffers.iter().map(|buffer| buffer.len() as u64).sum();
+                        (retired, remaining)
+                    };
+                    let freed = retired.len() as u64;
+                    drop(retired);
+                    // A real partial free can be measured before the callback
+                    // returns. The published remainder must not be subtracted twice.
+                    weak.upgrade().unwrap().allocator(0, 0, remaining)?;
+                    Ok(freed)
+                }
+                2 => {
+                    let buffers = std::mem::take(&mut *buffers.lock());
+                    let freed = buffers.iter().map(|buffer| buffer.len() as u64).sum();
+                    drop(buffers); // Actual CUDA frees precede the freed-byte report.
+                    Ok(freed)
+                }
+                _ => Err(invalid(
+                    "zero-progress slack trim retried without new facts",
+                )),
+            }
+        }));
+        placement.allocator(0, 4 << 20, 16 << 20).unwrap();
+        placement
+            .begin(3, vec![vec![1]], "warm-admission".into(), "shape".into())
+            .unwrap();
+        let pin = placement.bind(3, pages[0], 0).unwrap();
+        let trimming = placement.clone();
+        let worker = std::thread::spawn(move || trimming.relief(3, 1, false));
+        waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+        placement.allocator(0, 4 << 20, 16 << 20).unwrap();
+        // This is the actual owner transition: the former live allocation now
+        // belongs to the idle cache. Publish it while the old trim is in flight.
+        idle.lock().push(live);
+        placement.allocator(0, 0, 16 << 20).unwrap();
+        {
+            let inner = placement.inner.lock();
+            let slack = inner
+                .table
+                .pages
+                .iter()
+                .find(|page| page.kind == Kind::Slack)
+                .unwrap();
+            assert_eq!(slack.bytes, 16 << 20);
+            assert_eq!(
+                slack.pins, 1,
+                "new facts must not release an active trim pin"
+            );
+            assert!(
+                inner.table.page(pages[0]).unwrap().pins > 0,
+                "a real CUDA view must remain pinned"
+            );
+        }
+        drop(release);
+        assert_eq!(
+            worker.join().unwrap().unwrap(),
+            Relief::Complete,
+            "a stale zero trim suppressed the now-idle CUDA allocations"
+        );
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+        assert_eq!(idle.lock().len(), 1);
+        assert_eq!(
+            placement.available().unwrap(),
+            capacity - weight - (4 << 20),
+            "partial trim bytes were subtracted again after their publication"
+        );
+        assert_eq!(
+            placement.relief(3, 9 << 20, false).unwrap(),
+            Relief::Complete
+        );
+        assert_eq!(attempts.load(Ordering::Acquire), 3);
+        assert!(idle.lock().is_empty());
+        assert_eq!(
+            placement.available().unwrap(),
+            capacity - weight,
+            "unchanged-facts callback must retain ordinary freed-byte accounting"
+        );
+        assert_eq!(
+            placement.resident().unwrap()[0].1,
+            weight,
+            "slack reclaim must keep the real warm weight mapping"
+        );
+        drop(pin);
+        placement.gpu.wait_pending().unwrap();
+        placement.leave(3, 0).unwrap();
+        placement.end(3).unwrap();
+        assert!(
+            ledger.fits("warm-admission", "shape").unwrap(),
+            "allocator slack must not block its owner's next admission"
+        );
+        placement
+            .begin(4, vec![vec![1]], "warm-admission".into(), "shape".into())
+            .unwrap();
+        let pin = placement.bind(4, pages[0], 0).unwrap();
+        unsafe {
+            tensorfs::io::read(
+                &[tensorfs::io::Copy {
+                    src: tensorfs::io::Src::Device {
+                        device: 0,
+                        ptr: pin.ptr,
+                        stream: 0,
+                    },
+                    dst: tensorfs::io::Dst::host(&mut bytes),
+                }],
+                &tensorfs::io::ReadOpts::default(),
+            )
+        }
+        .unwrap();
+        assert_eq!(bytes, [7; 32]);
+        drop(pin);
+        placement.leave(4, 0).unwrap();
+        assert!(placement.end(4).unwrap().copies.is_empty());
         placement.close().unwrap();
         println!(
             "PASS idle cache pins release before warm admission without weight eviction {uuid}"
