@@ -1179,7 +1179,7 @@ fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
                 return Err(invalid("its reference names no spool directory"));
             };
             let directory = format!("tree-{n}");
-            let mut entries = vec![];
+            let mut files = std::collections::BTreeMap::new();
             let mut pending = vec![std::path::PathBuf::new()];
             while let Some(relative) = pending.pop() {
                 for entry in fs::read_dir(spool.join(&directory).join(&relative))? {
@@ -1198,15 +1198,13 @@ fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
                         _ => (),
                     }
                     let path = path.to_str().ok_or_else(|| invalid("a path is not UTF-8"))?;
-                    entries.push(serde_json::json!({"kind": "file", "path": path,
-                        "blob": {"sha256": sha, "length": length}}));
+                    files.insert(path.to_owned(), tensorfs::format::ObjectRef { sha256: sha, length });
                 }
             }
-            if entries.is_empty() {
+            if files.is_empty() {
                 return Err(invalid("it holds no file"));
             }
-            entries.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
-            let manifest = crate::boundary_json::exact(&serde_json::json!({"entries": entries}));
+            let manifest = crate::trees::document(&files);
             let name = format!("{directory}-manifest");
             fs::write(spool.join(&name), manifest)?;
             name
@@ -1214,15 +1212,14 @@ fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
     };
     let mut bytes = Vec::new();
     open_artifact(spool, Path::new(&name))?.read_to_end(&mut bytes)?;
-    let manifest: Value = serde_json::from_slice(&bytes).map_err(|_| invalid("its manifest is not JSON"))?;
+    let files = crate::trees::parse(&bytes).map_err(|e| invalid(&e.to_string()))?;
     let mut content = 0;
-    for entry in manifest["entries"].as_array().ok_or_else(|| invalid("no entries"))? {
-        let member = format!("sha256-{}", entry["blob"]["sha256"].as_str().unwrap_or_default());
-        let length = open_artifact(spool, Path::new(&member))?.metadata()?.len();
-        if length != entry["blob"]["length"].as_u64().unwrap_or(u64::MAX) {
+    for object in files.values() {
+        let member = format!("sha256-{}", object.sha256);
+        if open_artifact(spool, Path::new(&member))?.metadata()?.len() != object.length {
             return Err(invalid("a member differs from its manifest"));
         }
-        content += entry["blob"]["length"].as_u64().unwrap_or_default();
+        content += object.length;
     }
     if output.size_bytes.is_some_and(|size| size != content) {
         return Err(invalid("its files differ from the size the SDK reported"));

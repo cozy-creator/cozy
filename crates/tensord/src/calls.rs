@@ -835,17 +835,10 @@ fn receive(
         if binding.media_type == crate::gpu_service::TREE_MEDIA {
             // A tree: its manifest's members materialized as the directory the parent reads.
             let tree = directory.join(format!("{}-tree-{}", grants.len(), artifact.sha256));
-            let manifest: Value = serde_json::from_slice(&fs::read(&local)?).map_err(io::Error::other)?;
             let mut content = 0;
-            for entry in manifest["entries"].as_array().into_iter().flatten() {
-                let (Some(path), Some(sha), Some(length)) = (entry["path"].as_str(),
-                    entry["blob"]["sha256"].as_str(), entry["blob"]["length"].as_u64()) else {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "child tree manifest has an invalid entry"));
-                };
-                let relative = Path::new(path);
-                if !relative.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "child tree member leaves its tree"));
-                }
+            for (path, object) in crate::trees::parse(&fs::read(&local)?)? {
+                let (sha, length) = (object.sha256.as_str(), object.length);
+                let relative = Path::new(&path);
                 let member = result.artifacts.iter().find(|a| a.sha256 == sha && a.length == length)
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "child tree member is not held"))?;
                 let target = tree.join(relative);

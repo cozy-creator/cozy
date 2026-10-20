@@ -3,7 +3,12 @@
 //! {"sha256", "length"}}]}`, keys sorted, entries by path); its receipt is the document itself.
 //! One hold in the run objects' store (`cas`), `tree-<owner>`, keeps the document and every
 //! file until the owner releases it.
-use std::{collections::BTreeMap, fs::File, io, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io,
+    path::{Component, Path},
+};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -32,7 +37,7 @@ pub fn document(files: &BTreeMap<String, ObjectRef>) -> Vec<u8> {
     crate::boundary_json::exact(&json!({ "entries": entries }))
 }
 
-/// A tree document's files, by path: ordinary files only, each path once.
+/// A tree document's files, by path: ordinary files only, each path once and inside the tree.
 pub fn parse(bytes: &[u8]) -> io::Result<BTreeMap<String, ObjectRef>> {
     #[derive(Deserialize)]
     struct Document {
@@ -50,6 +55,10 @@ pub fn parse(bytes: &[u8]) -> io::Result<BTreeMap<String, ObjectRef>> {
     for entry in document.entries {
         if entry.kind != "file" {
             return Err(invalid(format!("a tree holds files, not {:?}", entry.kind)));
+        }
+        let inside = Path::new(&entry.path).components().all(|c| matches!(c, Component::Normal(_)));
+        if !inside || entry.path.is_empty() || entry.path.contains(['\\', '\0']) {
+            return Err(invalid(format!("tree path {:?} leaves its tree", entry.path)));
         }
         if files.insert(entry.path.clone(), entry.blob).is_some() {
             return Err(invalid(format!("a tree names {} twice", entry.path)));
