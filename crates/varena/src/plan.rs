@@ -256,6 +256,8 @@ pub enum Trigger {
         request: RequestId,
         /// Upcoming allocation room, in addition to the activation and streaming reserves.
         allocation: u64,
+        /// Occupied bytes when this operation started, fixed across waits and re-decisions.
+        reclaim_from: u64,
         /// Minimum newly reclaimed mapped bytes; a real OOM must not succeed as a no-op.
         reclaim: u64,
     },
@@ -497,7 +499,7 @@ impl Table {
         Ok(counts)
     }
 
-    fn occupied(&self) -> Option<u64> {
+    pub(crate) fn occupied(&self) -> Option<u64> {
         let local = self
             .pages
             .iter()
@@ -719,8 +721,9 @@ pub fn decide(table: &Table, trigger: Trigger) -> Vec<Action> {
         Trigger::Lower {
             request,
             allocation,
+            reclaim_from,
             reclaim,
-        } => lower(table, request, allocation, reclaim),
+        } => lower(table, request, allocation, reclaim_from, reclaim),
         Trigger::Oom { request, need } => demand(table, request, need, None),
         Trigger::Bind { request, page } => {
             let Some(item) = table.page(page) else {
@@ -1018,7 +1021,13 @@ fn current(page: &Page, request: &Request) -> bool {
     })
 }
 
-fn lower(table: &Table, id: RequestId, allocation: u64, reclaim: u64) -> Vec<Action> {
+fn lower(
+    table: &Table,
+    id: RequestId,
+    allocation: u64,
+    reclaim_from: u64,
+    reclaim: u64,
+) -> Vec<Action> {
     let Some(request) = table.request(id) else {
         return vec![Action::Invalid("unknown request")];
     };
@@ -1074,11 +1083,10 @@ fn lower(table: &Table, id: RequestId, allocation: u64, reclaim: u64) -> Vec<Act
     };
     let budget = table.capacity.saturating_sub(fixed).saturating_sub(target);
     let mut plan = Planner::new(table);
-    let before = plan.allocated;
     for page in pages {
         if home <= budget
             && plan.shortfall(target) == 0
-            && before.saturating_sub(plan.allocated) >= reclaim
+            && reclaim_from.saturating_sub(plan.allocated) >= reclaim
         {
             break;
         }
@@ -1091,7 +1099,7 @@ fn lower(table: &Table, id: RequestId, allocation: u64, reclaim: u64) -> Vec<Act
             plan.evict(page);
         }
     }
-    let unreclaimed = reclaim.saturating_sub(before.saturating_sub(plan.allocated));
+    let unreclaimed = reclaim.saturating_sub(reclaim_from.saturating_sub(plan.allocated));
     let shortfall = if unreclaimed != 0 {
         unreclaimed
     } else {
@@ -1419,6 +1427,7 @@ mod tests {
             Trigger::Lower {
                 request: 1,
                 allocation: 600 * MIB,
+                reclaim_from: table.occupied().unwrap(),
                 reclaim: 1,
             },
         );
@@ -1446,6 +1455,7 @@ mod tests {
             Trigger::Lower {
                 request: 1,
                 allocation: 600 * MIB,
+                reclaim_from: table.occupied().unwrap(),
                 reclaim: 1,
             },
         );
@@ -1476,6 +1486,7 @@ mod tests {
         let lower = Trigger::Lower {
             request: 1,
             allocation: 10,
+            reclaim_from: table.occupied().unwrap(),
             reclaim: 1,
         };
         assert_eq!(
@@ -1491,7 +1502,15 @@ mod tests {
         table.pages[0].lowered.insert(1);
         table.pages[0].tier = Tier::Disk;
         assert_eq!(
-            decide(&table, lower),
+            decide(
+                &table,
+                Trigger::Lower {
+                    request: 1,
+                    allocation: 10,
+                    reclaim_from: table.occupied().unwrap(),
+                    reclaim: 1,
+                }
+            ),
             vec![Action::Exhausted {
                 request: 1,
                 need: 1
@@ -1519,6 +1538,7 @@ mod tests {
         let lower = Trigger::Lower {
             request: 1,
             allocation: 10,
+            reclaim_from: table.occupied().unwrap(),
             reclaim: 1,
         };
         assert_eq!(
@@ -1734,6 +1754,7 @@ mod tests {
                 Trigger::Lower {
                     request: 1,
                     allocation: 0,
+                    reclaim_from: table.occupied().unwrap(),
                     reclaim: 10,
                 }
             ),
@@ -1814,6 +1835,7 @@ mod tests {
                 Trigger::Lower {
                     request: 1,
                     allocation: 0,
+                    reclaim_from: lowered.occupied().unwrap(),
                     reclaim: 10,
                 }
             ),

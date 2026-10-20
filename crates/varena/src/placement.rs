@@ -1055,6 +1055,9 @@ impl Placement {
                     }
                 }
                 Relief::Lower(short) => {
+                    self.refresh()?;
+                    let reclaim_from = self.inner.lock().table.occupied()
+                        .ok_or_else(|| invalid("occupied bytes overflow"))?;
                     if !matches!(
                         self.drive(
                             request,
@@ -1062,6 +1065,7 @@ impl Placement {
                                 request,
                                 // The prospective ring already covers this weight page.
                                 allocation: 0,
+                                reclaim_from,
                                 reclaim: short,
                             }
                         )?,
@@ -1257,22 +1261,20 @@ impl Placement {
     pub fn relief(&self, request: RequestId, need: u64, lower: bool) -> Result<Relief> {
         self.gpu.recover()?;
         self.refresh()?;
-        if let Some(facts) = self
-            .inner
-            .lock()
-            .table
-            .requests
-            .iter_mut()
-            .find(|row| row.id == request)
-        {
-            facts.can_cut = !lower;
-        }
+        let reclaim_from = {
+            let mut inner = self.inner.lock();
+            if let Some(facts) = inner.table.requests.iter_mut().find(|row| row.id == request) {
+                facts.can_cut = !lower;
+            }
+            inner.table.occupied().ok_or_else(|| invalid("occupied bytes overflow"))?
+        };
         self.drive(
             request,
             if lower {
                 Trigger::Lower {
                     request,
                     allocation: need,
+                    reclaim_from,
                     // At least one real mapped page must leave after a failed
                     // allocation, even if the logical estimate says it fits.
                     reclaim: 1,
