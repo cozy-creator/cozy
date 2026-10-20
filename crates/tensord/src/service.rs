@@ -141,7 +141,11 @@ impl Service {
                     .unwrap()
                     .insert(record.id.clone(), held.retention());
             }
-            if let Some(birth) = record.process {
+            if let Some(pending) = record.pending_completion {
+                for birth in pending.processes {
+                    service.engine.end_orphan(birth)?;
+                }
+            } else if let Some(birth) = record.process {
                 service.engine.end_orphan(birth)?;
             }
         }

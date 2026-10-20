@@ -311,6 +311,9 @@ pub struct Execution {
     #[serde(default)]
     pub executor: Option<ExecutorFacts>,
     pub result: Option<ResultRecord>,
+    /// Private durable custody, withheld from the public result until idle or exact exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_completion: Option<PendingCompletion>,
     pub failure: Option<String>,
     #[serde(default, skip_serializing_if = "CallMemo::is_empty")]
     pub memo: CallMemo,
@@ -1611,6 +1614,7 @@ fn insert(
         executed_ms: 0,
         executor: None,
         result: None,
+        pending_completion: None,
         failure: None,
         memo: CallMemo::default(),
     };
@@ -2170,9 +2174,9 @@ impl Journal {
     /// termination.
     pub fn requeue_unstarted(&mut self, id: &str) -> io::Result<Execution> {
         self.update(id, |record| {
-            if record.state != State::Starting {
+            if record.state != State::Starting || record.pending_completion.is_some() {
                 return Err(db_error(
-                    "only a never-authorized attempt may return to queued",
+                    "only a never-authorized attempt without an outcome may return to queued",
                 ));
             }
             record.process = None;
@@ -2210,8 +2214,8 @@ impl Journal {
     /// stays claimed, back to awaiting its first executor.
     pub fn redeliver(&mut self, id: &str) -> io::Result<Execution> {
         self.update(id, |record| {
-            if !matches!(record.state, State::Starting | State::Running) {
-                return Err(db_error("only an active attempt is redelivered"));
+            if !matches!(record.state, State::Starting | State::Running) || record.pending_completion.is_some() {
+                return Err(db_error("only an active attempt without an outcome is redelivered"));
             }
             record.process = None;
             record.executor = None;
@@ -2316,6 +2320,26 @@ impl Journal {
             .map(readable)
     }
 
+    /// Hold a known outcome in the existing record, without releasing its reservation.
+    pub(crate) fn defer_completion(
+        &mut self, id: &str, outcome: Outcome, processes: Vec<Birth>,
+        progress: Option<&ProgressSnapshot>,
+    ) -> io::Result<Execution> {
+        self.update_observed(id, progress, |record| {
+            if record.state.terminal() || record.pending_completion.is_some() {
+                return Ok(false);
+            }
+            if !matches!(record.state, State::Starting | State::Running) {
+                return Err(db_error("only an active attempt can hold an outcome"));
+            }
+            if record.process.as_ref().is_none_or(|birth| !processes.contains(birth)) {
+                return Err(db_error("a held outcome must name its exact executor birth"));
+            }
+            record.pending_completion = Some(PendingCompletion { outcome, processes });
+            Ok(true)
+        })
+    }
+
     /// Caller must prove process termination and durable artifact custody first.
     pub fn finish(&mut self, id: &str, outcome: Outcome) -> io::Result<Execution> {
         self.finish_observed(id, outcome, None, None)
@@ -2356,6 +2380,7 @@ impl Journal {
                     record.state = State::Canceled;
                 }
             }
+            record.pending_completion = None;
             record.finished_at_ms = timestamp().max(0) as u64;
             Ok(true)
         }, hold)
@@ -2435,10 +2460,29 @@ impl std::fmt::Display for Failure {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Outcome {
     Completed(ResultRecord),
     Failed(Failure),
     Canceled,
+}
+
+/// Exact process identities retained with a known result, including observed followers.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct PendingCompletion {
+    pub outcome: Outcome,
+    pub processes: Vec<Birth>,
+}
+impl PendingCompletion {
+    pub fn exited(&self) -> io::Result<bool> {
+        // The captured members outlive their leader; its numeric process group may be reused.
+        for birth in &self.processes {
+            if !birth.ended()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 fn validate_scope(actor: &str, request_id: &str, submission_id: &str) -> io::Result<()> {
