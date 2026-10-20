@@ -1048,7 +1048,21 @@ impl Drop for Gpu {
                     call!("cuCtxSynchronize", ctx_synchronize())
                 })
                 .is_ok();
-        if !safe {
+        if safe {
+            // An explicit model close retires its pages even if a tensor outlives
+            // the coordinator. Last-pin teardown must revoke their queued custody;
+            // only unretired pages are intentionally kept for a replacement owner.
+            for page in self.pages.get_mut().values() {
+                if page.retired.load(Ordering::Acquire) {
+                    match &mut *page.state.lock() {
+                        State::Ready(mapping) | State::Failed(mapping, _) => {
+                            let _ = mapping.release(true);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
             // An unfinished engine read may still borrow source descriptors and host
             // mappings. Keep the complete owner graph alive until process teardown.
             for (_, page) in std::mem::take(self.pages.get_mut()) {
