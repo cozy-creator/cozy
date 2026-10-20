@@ -319,6 +319,7 @@ struct Page {
     retired: AtomicBool,
     write_pins: AtomicUsize,
     write_events: Mutex<Vec<Event>>,
+    host_sources: Mutex<Vec<Arc<dyn Send + Sync>>>,
 }
 
 struct Release {
@@ -469,6 +470,7 @@ impl Gpu {
                 retired: AtomicBool::new(false),
                 write_pins: AtomicUsize::new(0),
                 write_events: Mutex::new(Vec::new()),
+                host_sources: Mutex::new(Vec::new()),
             }),
         );
         Ok(())
@@ -511,6 +513,23 @@ impl Gpu {
         transform: impl FnOnce(FillPin) -> Result<()>,
     ) -> Result<ReadStats> {
         self.fill_bytes(id, Some(bytes), transform)
+    }
+
+    /// Retain a direct host source through failed CUDA work. The page's complete
+    /// owner graph survives until checked recovery, including last-owner teardown.
+    pub fn fill_from_ram_owned_with<T: AsRef<[u8]> + Send + Sync + 'static>(
+        self: &Arc<Self>,
+        id: PageId,
+        source: Arc<T>,
+        transform: impl FnOnce(FillPin) -> Result<()>,
+    ) -> Result<ReadStats> {
+        let page = self.page(id)?;
+        page.host_sources.lock().push(source.clone());
+        let result = self.fill_bytes(id, Some(source.as_ref().as_ref()), transform);
+        if result.is_ok() {
+            page.host_sources.lock().clear();
+        }
+        result
     }
 
     fn fill_bytes(
@@ -728,6 +747,7 @@ impl Gpu {
                     events.clear();
                     mapping.release(true)?;
                     *state = State::Empty;
+                    page.host_sources.lock().clear();
                     changed = true;
                 }
             }
@@ -828,6 +848,7 @@ impl Gpu {
                 }
                 mapping.release(true)?;
                 *state = State::Empty;
+                page.host_sources.lock().clear();
                 Ok(true)
             }
             State::Failed(mapping, _) => {
@@ -1003,6 +1024,7 @@ impl Gpu {
                 events.clear();
                 mapping.release(true)?;
                 *state = State::Empty;
+                page.host_sources.lock().clear();
             }
         }
         Ok(())

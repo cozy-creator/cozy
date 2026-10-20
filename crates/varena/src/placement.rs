@@ -1796,7 +1796,8 @@ impl Placement {
             });
         let actual = if ram.is_some() { Tier::Ram } else { Tier::Disk };
         let stats = if let Some(ram) = ram {
-            self.gpu.fill_from_ram_with(page, ram.bytes(), apply)?
+            self.gpu
+                .fill_from_ram_owned_with(page, Arc::new(ram), apply)?
         } else {
             self.gpu.fill_with(page, apply)?
         };
@@ -1969,6 +1970,11 @@ impl Drop for Ram {
         }
     }
 }
+impl AsRef<[u8]> for Ram {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes()
+    }
+}
 
 fn invalid(message: &str) -> Error {
     Error::Invalid(message.to_owned())
@@ -2047,6 +2053,41 @@ mod gpu_tests {
             };
             assert_eq!(read, 8, "read ledger event");
         }
+    }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn failed_direct_ram_fill_retains_its_source_until_checked_recovery() {
+        let gpu = Gpu::open(0).expect("real CUDA device");
+        let bytes = crate::layout::REGION_ALIGN;
+        let range = gpu.reserve(bytes).expect("page reservation");
+        gpu.register(
+            1,
+            range,
+            0,
+            bytes,
+            Arc::new(Source::files(vec![], false, 0)),
+            vec![],
+            0,
+            "owned-ram-error".into(),
+        )
+        .expect("page");
+        let source = Arc::new(vec![7_u8; bytes as usize]);
+        let lifetime = Arc::downgrade(&source);
+        let error = gpu.fill_from_ram_owned_with(1, source.clone(), |_| {
+            Err(Error::Invalid("injected transform failure".into()))
+        });
+        assert!(error.is_err());
+        drop(source);
+        assert!(
+            lifetime.upgrade().is_some(),
+            "failed direct I/O released its host owner"
+        );
+        gpu.recover().expect("checked CUDA recovery");
+        assert!(
+            lifetime.upgrade().is_none(),
+            "checked recovery retained a completed source"
+        );
     }
 
     #[test]
