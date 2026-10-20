@@ -890,6 +890,7 @@ impl Ledger {
                     ram.cancelled.store(true, Release);
                 }
             }
+            self.host.wake_warm();
             notify_owners(held.observers);
             self.table.changed();
             true
@@ -939,6 +940,7 @@ impl Ledger {
         }
         drop(state);
         drop(removed); // actually unmap/free this region outside the table lock
+        self.host.wake_warm();
         notify_owners(observers);
         self.table.changed();
         true
@@ -1304,6 +1306,10 @@ impl Default for HostCache {
     }
 }
 impl HostCache {
+    fn wake_warm(&self) {
+        let _active = self.warming.lock();
+        self.next_warm.notify_all();
+    }
     fn can_warm(&self, available: i64, bytes: u64) -> bool {
         self.state.lock().can_warm(available, bytes)
     }
@@ -1514,7 +1520,7 @@ fn register_ram(
             Ram::new(region).map(|ram| (index, Arc::new(ram)))
         })
         .collect::<Result<Vec<_>>>()?;
-    let (identity, work) = {
+    let (identity, work, retired) = {
         let mut state = host.state.lock();
         if !state.ram.contains_key(&layout) {
             state.clock = state
@@ -1561,14 +1567,18 @@ fn register_ram(
             );
         }
         let mut work = Vec::new();
+        let mut retired = Vec::new();
         for (index, ram) in created {
             if let Some(slot) = held.slots.get_mut(index).filter(|slot| slot.missing()) {
-                slot.buffer = Some(ram.clone());
+                if let Some(old) = slot.buffer.replace(ram.clone()) {
+                    retired.push(old);
+                }
                 work.push((index, ram));
             }
         }
-        (held.identity, work)
+        (held.identity, work, retired)
     };
+    drop(retired);
     if work.is_empty() {
         return Ok(false);
     }
@@ -1959,16 +1969,20 @@ fn serve(
                         ram.prune();
                         ram.observers.is_empty()
                     });
-                    if remove {
-                        if let Some(ram) = held.ram.remove(&key.fingerprint) {
-                            for slot in &ram.slots {
-                                if let Some(buffer) = &slot.buffer {
-                                    buffer.cancelled.store(true, Release);
-                                }
+                    let removed = if remove {
+                        held.ram.remove(&key.fingerprint)
+                    } else {
+                        None
+                    };
+                    drop(held);
+                    if let Some(ram) = removed {
+                        for slot in &ram.slots {
+                            if let Some(buffer) = &slot.buffer {
+                                buffer.cancelled.store(true, Release);
                             }
                         }
                     }
-                    drop(held);
+                    host.wake_warm();
                     stream
                         .write_all(&[1])
                         .map_err(|e| io("ack RAM unsubscribe", e))?;
