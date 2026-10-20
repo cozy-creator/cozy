@@ -1144,16 +1144,18 @@ class Memory:
     def free(self, device: torch.device, need: int) -> bool:
         if self.native is None or device != self.device:
             return False
-        return (
-            self.native.relief(self._current().native_id, need, False)[0] == "complete"
-        )
+        outcome = self.native.relief(self._current().native_id, need, False)
+        # Relief may release another owner's pages or allocator slack. The next
+        # allocation must see that room in Torch's ceiling too, even after a cut.
+        self._measure()
+        return outcome[0] == "complete"
 
     def lower(self, device: torch.device, need: int) -> bool:
         if self.native is None or device != self.device:
             return False
-        return (
-            self.native.relief(self._current().native_id, need, True)[0] == "complete"
-        )
+        outcome = self.native.relief(self._current().native_id, need, True)
+        self._measure()
+        return outcome[0] == "complete"
 
     def available(self, device: torch.device | None = None) -> int:
         return (

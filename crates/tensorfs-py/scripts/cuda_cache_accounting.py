@@ -3,6 +3,7 @@
 import torch
 from tensorfs.varena import VarenaError
 from tensorfs.varena.torch import Memory
+from torch.utils._python_dispatch import _disable_current_modes
 
 assert torch.cuda.device_count() == 1
 device = torch.device("cuda", 0)
@@ -86,6 +87,35 @@ try:
     with memory.request("healthy-after-measurement-failure") as healthy:
         pass
     assert healthy.stats is not None and healthy.stats.leftover == ((0, 0),)
+
+    # A changed available budget must reach the real caching allocator before
+    # retrying the same allocation. Disable dispatch recovery only for the two
+    # allocations so it cannot hide whether free() refreshed the actual limit.
+    original_limit = memory.limit_bytes
+    try:
+        with memory.request("allocator-budget-after-relief") as sixth:
+            torch.cuda.empty_cache()
+            allocated = torch.cuda.memory_allocated(device)
+            memory.limit_bytes = allocated + (64 << 20)
+            memory._measure()
+            with _disable_current_modes():
+                try:
+                    torch.empty(80 << 20, dtype=torch.uint8, device=device)
+                except torch.OutOfMemoryError:
+                    pass
+                else:
+                    raise AssertionError("the actual 64 MiB allocator limit was not enforced")
+            memory.limit_bytes = allocated + (128 << 20)
+            assert memory.free(device, 80 << 20)
+            with _disable_current_modes():
+                recovered = torch.empty(80 << 20, dtype=torch.uint8, device=device)
+                recovered.fill_(7)
+                assert recovered[-1].item() == 7
+                del recovered
+        assert sixth.stats is not None and sixth.stats.leftover == ((0, 0),)
+    finally:
+        memory.limit_bytes = original_limit
+        memory._measure()
 finally:
     owned.clear()
     cache.close()
