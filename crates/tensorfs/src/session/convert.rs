@@ -194,7 +194,7 @@ impl Client {
                 store.clone(),
                 Some(variant),
             )?;
-            store.cache_touch(&tree)?;
+            store.used(&tree.sha256, std::iter::once(&tree).chain(writer.repo_files().values()))?;
             Ok(checkpoint)
         })
         .await

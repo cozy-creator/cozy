@@ -66,8 +66,9 @@ pub unsafe fn read_into(
     unsafe { checkpoint.read_into_raw(targets, options) }
 }
 
-/// Run `future` to completion on the process-owned driver, for synchronous language bindings.
-/// Merely importing a binding does not call this or start native workers.
+// For the Python binding only: runs `future` on the process-owned driver. Importing the
+// binding neither calls it nor starts native workers.
+#[doc(hidden)]
 pub fn block_on<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
     runtime()?.block_on(future)
 }
