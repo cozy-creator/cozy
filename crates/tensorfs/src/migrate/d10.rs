@@ -5,7 +5,7 @@
 //! ([`UPSTREAMS`], owner Decision 1) and is recorded in the header's `filled`; every lane records
 //! its `source`, `unknown` when nobody did. Deleted once it has run.
 
-use std::collections::{btree_map::Entry, BTreeMap, HashMap};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read as _;
 use std::path::Path;
@@ -21,7 +21,7 @@ use serde_json::{json, Value as Json};
 use crate::failure::{fail, Failure, Kind, Result};
 use crate::fetch::{self, Client, Endpoint, Fetcher, Fresh, Origin, Payload, SourcePolicy, Want};
 use crate::format::decode::{check_metadata, PartMetadata};
-use crate::format::{Body, Component, Config, Header, Metadata, ObjectRef, Release, Repo, Tensor, Tree, Value, HEADER_PATH, TREE_FORMAT};
+use crate::format::{Body, Component, Config, Header, Metadata, ObjectRef, Repo, Tag, Tensor, Tree, Value, HEADER_PATH, TREE_FORMAT};
 use crate::import::{layout, remote};
 use crate::store::Store;
 
@@ -162,6 +162,13 @@ fn under(entry: &str, path: &str) -> bool {
     }
 }
 
+/// Releases that become private tags (a public tag is a PEP 440 version): model and version, by
+/// ruling (2026-10-20: an audit artifact). Any other release not a version refuses its repo.
+pub const PRIVATE: &[(&str, &str)] = &[("fidika/minimax-h3-turbo-lora", "1.0.0-audit.1")];
+
+/// A repo document before D10, whatever wrote it: 0.12's `releases` of lanes and `checkpoints`
+/// (U11), or `tags` (the Hub's view of a v1 model: a release's `lanes`, an unreleased
+/// checkpoint's v1 manifest as its `commit`; or a D10 document).
 #[derive(Deserialize)]
 struct OldRepo {
     name: String,
@@ -169,6 +176,8 @@ struct OldRepo {
     releases: Vec<OldRelease>,
     #[serde(default)]
     checkpoints: Vec<ObjectRef>,
+    #[serde(default)]
+    tags: Vec<OldTag>,
 }
 
 #[derive(Deserialize)]
@@ -178,6 +187,36 @@ struct OldRelease {
     tree: Option<ObjectRef>,
     #[serde(default)]
     yanked: bool,
+}
+
+/// A tag, or what becomes one: a 0.12 checkpoint has no name until A11 gives it one.
+#[derive(Deserialize)]
+struct OldTag {
+    name: Option<String>,
+    lanes: Option<BTreeMap<String, ObjectRef>>,
+    commit: Option<ObjectRef>,
+    #[serde(default)]
+    public: bool,
+    #[serde(default)]
+    yanked: bool,
+}
+
+impl OldRepo {
+    /// In order: releases (public), the checkpoints no release cites (private), then tags.
+    fn tags(self) -> Vec<OldTag> {
+        let cited: Vec<ObjectRef> = self.releases.iter().flat_map(|r| r.lanes.iter().flat_map(|l| l.values().cloned())).collect();
+        let releases = self.releases.into_iter().map(|r| OldTag { name: Some(r.version), lanes: r.lanes, commit: r.tree, public: true, yanked: r.yanked });
+        let checkpoints = (self.checkpoints.into_iter().filter(|c| !cited.contains(c)))
+            .map(|c| OldTag { name: None, lanes: None, commit: Some(c), public: false, yanked: false });
+        releases.chain(checkpoints).chain(self.tags).collect()
+    }
+
+    /// Every old object a tag names: lanes' manifests, commits (trees or old manifests).
+    fn roots(&self) -> Vec<ObjectRef> {
+        let releases = self.releases.iter().flat_map(|r| r.lanes.iter().flat_map(|l| l.values()).chain(&r.tree));
+        let tags = self.tags.iter().flat_map(|t| t.lanes.iter().flat_map(|l| l.values()).chain(&t.commit));
+        releases.chain(&self.checkpoints).chain(tags).cloned().collect()
+    }
 }
 
 #[derive(Deserialize)]
@@ -226,69 +265,100 @@ impl<'t> Migrator<'t> {
         Migrator { access, table, listings: HashMap::new(), fetched: HashMap::new() }
     }
 
-    /// The repo document `doc` in D10, its old objects read by `read`. A release that names a
-    /// tree, and a checkpoint that is one, stay as they are; each release of lanes becomes one
-    /// tree (`model.<lane>.cozytensors` each, repo files merged, the first lane's kept where
-    /// they differ), yanked or not; each other old checkpoint a tree of its own
-    /// (`model.cozytensors`).
+    /// The repo document `doc` in D10, its old objects read by `read`: each release a public tag,
+    /// each checkpoint a private one. A tag naming a tree stays as it is; a release of lanes
+    /// becomes one tree (`model.<lane>.cozytensors` each, repo files merged, the first lane's
+    /// kept where they differ), yanked or not; an old checkpoint a tree of its own
+    /// (`model.cozytensors`), named `v1-`/`v2-` and its manifest's first 12 hex (16 where two
+    /// share 12), the name the Hub's view of a v1 model gives it.
     pub fn repo(&mut self, doc: &[u8], read: Read) -> Result<Migrated> {
         let old: OldRepo = serde_json::from_slice(doc).map_err(|e| invalid(format!("repo document: {e}")))?;
-        let upstream = self.table.iter().find(|u| u.models.iter().any(|p| matches(p, &old.name)));
+        let name = old.name.clone();
+        let upstream = self.table.iter().find(|u| u.models.iter().any(|p| matches(p, &name)));
+        let tree_at = |o: &ObjectRef| -> Result<bool> { Ok(serde_json::from_slice::<Json>(&read(o)?).is_ok_and(|d| d["format"] == TREE_FORMAT)) };
+        let tags = old.tags();
+        // The old checkpoints to name: private, and not yet trees.
+        let mut unnamed = BTreeSet::new();
+        for c in tags.iter().filter(|t| !t.public && t.lanes.is_none()).filter_map(|t| t.commit.as_ref()) {
+            if !tree_at(c)? {
+                unnamed.insert(c.sha256.clone());
+            }
+        }
+        let width = |sha256: &str| if unnamed.iter().filter(|o| o[..12] == sha256[..12]).count() > 1 { 16 } else { 12 };
         let mut objects = Objects::new();
         let mut lanes: HashMap<ObjectRef, Lane> = HashMap::new();
         let put = |objects: &mut Objects, tree: &Tree| -> Result<ObjectRef> { Ok(add(objects, tree.to_json()?)) };
-        let (mut releases, mut reports) = (Vec::new(), Vec::new());
-        for r in &old.releases {
-            let named = match (&r.tree, &r.lanes) {
-                (Some(tree), _) => {
-                    releases.push(Release { version: r.version.clone(), tree: tree.clone(), yanked: r.yanked });
-                    continue;
-                }
-                (None, Some(named)) => named,
-                (None, None) => return fail(Kind::Invalid, format!("release {} names no lanes or tree", r.version)),
-            };
-            let (mut tree, mut report, mut conflicts) = (Tree::default(), serde_json::Map::new(), Vec::new());
-            for (name, manifest) in named {
-                if !lanes.contains_key(manifest) {
-                    let lane = self.lane(manifest, upstream, read, &mut objects)?;
-                    lanes.insert(manifest.clone(), lane);
-                }
-                let lane = &lanes[manifest];
-                tree.set_variant(name, lane.header.clone());
-                for (path, file) in &lane.files {
-                    match tree.files.get(path) {
-                        Some(kept) if kept != file => conflicts.push(json!({"path": path, "dropped": name, "object": file.id()})),
-                        Some(_) => {}
-                        None => drop(tree.files.insert(path.clone(), file.clone())),
+        let (mut repo, mut released, mut unreleased, mut private) = (Repo::new(&name), Vec::new(), Vec::new(), Vec::new());
+        for t in tags {
+            let what = t.name.clone().unwrap_or_default();
+            let commit = match (&t.lanes, &t.commit) {
+                (Some(named), _) => {
+                    let (mut tree, mut report, mut conflicts) = (Tree::default(), serde_json::Map::new(), Vec::new());
+                    for (lane_name, manifest) in named {
+                        if !lanes.contains_key(manifest) {
+                            let lane = self.lane(manifest, upstream, read, &mut objects)?;
+                            lanes.insert(manifest.clone(), lane);
+                        }
+                        let lane = &lanes[manifest];
+                        tree.set_variant(lane_name, lane.header.clone());
+                        for (path, file) in &lane.files {
+                            match tree.files.get(path) {
+                                Some(kept) if kept != file => conflicts.push(json!({"path": path, "dropped": lane_name, "object": file.id()})),
+                                Some(_) => {}
+                                None => drop(tree.files.insert(path.clone(), file.clone())),
+                            }
+                        }
+                        report.insert(lane_name.clone(), lane.report.clone());
                     }
+                    let at = put(&mut objects, &tree)?;
+                    released.push(json!({"version": what, "tree": at.id(), "yanked": t.yanked, "lanes": report, "conflicts": conflicts}));
+                    at
                 }
-                report.insert(name.clone(), lane.report.clone());
+                (None, Some(c)) if tree_at(c)? => c.clone(),
+                (None, Some(c)) => {
+                    if !lanes.contains_key(c) {
+                        let lane = self.lane(c, upstream, read, &mut objects)?;
+                        lanes.insert(c.clone(), lane);
+                    }
+                    let lane = &lanes[c];
+                    let mut tree = Tree { files: lane.files.clone() };
+                    tree.set_variant("", lane.header.clone());
+                    let at = put(&mut objects, &tree)?;
+                    unreleased.push(json!({"old": c.id(), "tree": at.id(), "lane": lane.report}));
+                    at
+                }
+                (None, None) => return fail(Kind::Invalid, format!("{name}: tag {what:?} names no lanes or commit")),
+            };
+            let public = t.public && !PRIVATE.contains(&(name.as_str(), what.as_str()));
+            if public != t.public {
+                private.push(json!(what));
             }
-            let release = Release { version: r.version.clone(), tree: put(&mut objects, &tree)?, yanked: r.yanked };
-            reports.push(json!({"version": release.version, "tree": release.tree.id(), "yanked": release.yanked,
-                "lanes": report, "conflicts": conflicts}));
-            releases.push(release);
+            let tag = match (t.name, &t.commit) {
+                (Some(n), _) if t.public => n,
+                (n, Some(c)) if unnamed.contains(&c.sha256) => {
+                    let kind = if v1::manifest(&read(c)?)?.is_some() { "v1" } else { "v2" };
+                    let derived = format!("{kind}-{}", &c.sha256[..width(&c.sha256)]);
+                    if n.as_ref().is_some_and(|n| *n != derived) {
+                        return fail(Kind::Invalid, format!("{name}: checkpoint {} is tagged {n:?}, A11 names it {derived}", c.id()));
+                    }
+                    if let Some(r) = unreleased.last_mut() {
+                        r["name"] = json!(derived);
+                    }
+                    derived
+                }
+                (Some(n), _) => n,
+                (None, _) => return fail(Kind::Invalid, format!("{name}: an unnamed tag")),
+            };
+            if repo.tag(&tag).is_some() {
+                return fail(Kind::Invalid, format!("{name}: two tags named {tag}"));
+            }
+            repo.tags.push(Tag { name: tag, commit, public, yanked: t.yanked });
         }
-        let cited: Vec<&ObjectRef> = old.releases.iter().flat_map(|r| r.lanes.iter().flat_map(|l| l.values())).collect();
-        let (mut checkpoints, mut unreleased) = (Vec::new(), Vec::new());
-        for c in old.checkpoints.iter().filter(|c| !cited.contains(c)) {
-            let doc: Json = serde_json::from_slice(&read(c)?).map_err(|e| invalid(format!("{}: {e}", c.id())))?;
-            if doc["format"] == TREE_FORMAT {
-                checkpoints.push(c.clone());
-                continue;
-            }
-            let lane = self.lane(c, upstream, read, &mut objects)?;
-            let mut tree = Tree { files: lane.files.clone() };
-            tree.set_variant("", lane.header.clone());
-            let at = put(&mut objects, &tree)?;
-            unreleased.push(json!({"old": c.id(), "tree": at.id(), "lane": lane.report}));
-            // Old checkpoints differing only in metadata D10 drops become one tree, named once.
-            if !checkpoints.contains(&at) {
-                checkpoints.push(at);
-            }
+        repo.to_json().map_err(|e| invalid(format!("{name}: {e}")))?;
+        let mut report = json!({"model": name, "upstream": upstream.map(|u| u.from), "releases": released, "checkpoints": unreleased});
+        if !private.is_empty() {
+            report["made_private"] = json!(private);
         }
-        let repo = Repo { name: old.name.clone(), releases, checkpoints };
-        let report = json!({"model": old.name, "upstream": upstream.map(|u| u.from), "releases": reports, "checkpoints": unreleased});
         Ok(Migrated { repo, objects, report })
     }
 
@@ -621,8 +691,7 @@ pub fn migrate(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &
 /// The manifests and checkpoints `doc` names, then each manifest's header and files.
 async fn old_objects(endpoint: &Arc<Endpoint>, client: &Client, scratch: &Store, doc: &[u8]) -> Result<()> {
     let old: OldRepo = serde_json::from_slice(doc).map_err(|e| invalid(format!("repo document: {e}")))?;
-    let lanes = old.releases.iter().flat_map(|r| r.lanes.iter().flat_map(|l| l.values()));
-    let roots: Vec<ObjectRef> = lanes.chain(&old.checkpoints).cloned().collect();
+    let roots = old.roots();
     let (origin, want): (Arc<dyn Origin>, Want) = (endpoint.clone(), Want::default());
     let fetcher = Fetcher::new(Arc::new(scratch.clone()), client.clone(), None, fetch::Config::default());
     fetcher.objects(&origin, &roots, &want).await?;

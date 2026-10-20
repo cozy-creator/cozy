@@ -165,12 +165,12 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
         (tree, headers)
     };
 
-    // A release of lanes is one tree, yanked or not.
+    // A release of lanes is a public tag of one tree, yanked or not; every old checkpoint is in
+    // a release, so no private tag.
     let tiny = &repos["acme/tiny"];
-    let releases: Vec<(&str, bool)> = tiny.releases.iter().map(|r| (r.version.as_str(), r.yanked)).collect();
-    assert_eq!(releases, [("0.9.0", true), ("1.0.0", false), ("1.1.0", false)]);
-    assert!(tiny.checkpoints.is_empty(), "every old checkpoint is in a release");
-    let (tree, headers) = variants(&tiny.releases[1].tree);
+    let tags: Vec<(&str, bool, bool)> = tiny.tags.iter().map(|t| (t.name.as_str(), t.public, t.yanked)).collect();
+    assert_eq!(tags, [("0.9.0", true, true), ("1.0.0", true, false), ("1.1.0", true, false)]);
+    let (tree, headers) = variants(&tiny.tags[1].commit);
     assert_eq!(headers.keys().collect::<Vec<_>>(), ["ft", "full"]);
     let full = same(&fixture, &store, FULL, &headers["full"], &tree);
     let ft = same(&fixture, &store, FT, &headers["ft"], &tree);
@@ -195,16 +195,20 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
     assert!(full.metadata.contains_key("safetensors_metadata"));
 
     // 1.1.0's lanes disagree on README.md: the first lane's stays, and the report says so.
-    let (tree, _) = variants(&tiny.releases[2].tree);
+    let (tree, _) = variants(&tiny.tags[2].commit);
     assert_eq!(tree.files["README.md"], full_files["README.md"]);
     let conflicts = report["repos"].as_array().unwrap().iter().find(|r| r["model"] == "acme/tiny").unwrap()["releases"][2]["conflicts"].clone();
     assert_eq!(conflicts[0]["path"], "README.md");
     assert_eq!(conflicts[0]["dropped"], "b");
 
-    // An unreleased checkpoint is a tree of its own; the root component takes the filled file.
+    // An unreleased checkpoint is a tree of its own, a private tag named by its 0.12 manifest; the
+    // root component takes the filled file.
     let gpt2 = &repos["acme/gpt2"];
-    assert!(gpt2.releases.is_empty());
-    let (tree, headers) = variants(&gpt2.checkpoints[0]);
+    let old: Json = serde_json::from_slice(&std::fs::read(fixture.join("refs/acme/gpt2.json")).unwrap()).unwrap();
+    let old = old["checkpoints"][0]["sha256"].as_str().unwrap();
+    assert_eq!(gpt2.tags.len(), 1);
+    assert_eq!((gpt2.tags[0].name.clone(), gpt2.tags[0].public), (format!("v2-{}", &old[..12]), false));
+    let (tree, headers) = variants(&gpt2.tags[0].commit);
     assert_eq!(headers.keys().collect::<Vec<_>>(), [""]);
     let (gpt2_files, _) = manifest(&fixture, GPT2_FULL);
     let h = Header::from_cbor(&store.read(&headers[""]).unwrap()).unwrap();
@@ -214,13 +218,13 @@ fn a_store_from_0_12_moves_to_d10_in_place() {
 
     // local/ models: their own lanes, no upstream, the old pinned source kept.
     let local = &repos["local/tiny-sdxl"];
-    assert_eq!(local.releases[0].version, "1");
-    let (tree, headers) = variants(&local.releases[0].tree);
+    assert_eq!((local.tags[0].name.as_str(), local.tags[0].public), ("1", true));
+    let (tree, headers) = variants(&local.tags[0].commit);
     let h = same(&fixture, &store, FULL, &headers["f32"], &tree);
     assert_eq!(h.metadata.get("source"), Some(&Value::Str(SDXL.into())));
     assert_eq!(filled(&h), None);
     let local = &repos["local/tiny-gpt2"];
-    let (tree, headers) = variants(&local.releases[0].tree);
+    let (tree, headers) = variants(&local.tags[0].commit);
     let h = same(&fixture, &store, GPT2_FULL, &headers["f32"], &tree);
     assert_eq!(h.component("model").unwrap().config["model_type"], "gpt2");
 
@@ -262,7 +266,7 @@ fn partial_tokenizer_keeps_existing_files_and_fills_missing_files() {
     let mut migrator = Migrator::new(Access::from_env(), TABLE);
     let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
     let read = |o: &ObjectRef| migrated.objects.iter().find(|(at, _)| at == o).unwrap().1.clone();
-    let tree = Tree::from_json(&read(&migrated.repo.releases[0].tree)).unwrap();
+    let tree = Tree::from_json(&read(&migrated.repo.tags[0].commit)).unwrap();
     let header = Header::from_cbor(&read(tree.variant(Some("full")).unwrap().1)).unwrap();
     assert_eq!(header.component("tokenizer").unwrap().assets["vocab.json"], expected);
     assert_eq!(filled(&header).unwrap().1, BTreeSet::from([missing.to_owned(), "unet/config.json".to_owned()]));
@@ -307,7 +311,7 @@ fn migrate_lane(dir: &Path, name: &str, files: BTreeMap<String, ObjectRef>) -> (
     let mut migrator = Migrator::new(Access::from_env(), TABLE);
     let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
     let read = |o: &ObjectRef| migrated.objects.iter().find(|(at, _)| at == o).unwrap().1.clone();
-    let tree = Tree::from_json(&read(&migrated.repo.releases[0].tree)).unwrap();
+    let tree = Tree::from_json(&read(&migrated.repo.tags[0].commit)).unwrap();
     let header = Header::from_cbor(&read(tree.variant(Some("lane")).unwrap().1)).unwrap();
     (header, tree, migrated.report["releases"][0]["lanes"]["lane"].clone())
 }
@@ -403,7 +407,7 @@ fn a_claimed_source_that_does_not_verify_is_refused() {
 }
 
 #[test]
-fn checkpoints_differing_only_in_dropped_metadata_become_one_tree() {
+fn checkpoints_differing_only_in_dropped_metadata_share_one_tree() {
     let dir = scratch("same-tree");
     let files = lane_files(&dir, GPT2_FULL);
     let old = blob(&dir, &files["model.cozytensors"].sha256);
@@ -426,7 +430,32 @@ fn checkpoints_differing_only_in_dropped_metadata_become_one_tree() {
     let doc = serde_json::to_vec(&json!({"name": "acme/gpt2", "releases": [], "checkpoints": manifests})).unwrap();
     let mut migrator = Migrator::new(Access::from_env(), TABLE);
     let migrated = migrator.repo(&doc, &|o| Ok(std::fs::read(dir.join(o.key()))?)).unwrap();
-    assert_eq!(migrated.repo.checkpoints.len(), 1);
+    // One tree, each old checkpoint's private tag naming it.
+    let commit = &migrated.repo.tags[0].commit;
+    let tags: Vec<(&str, &ObjectRef, bool)> = migrated.repo.tags.iter().map(|t| (t.name.as_str(), &t.commit, t.public)).collect();
+    let names: Vec<String> = manifests.iter().map(|m| format!("v2-{}", &m.sha256[..12])).collect();
+    assert_eq!(tags, [(names[0].as_str(), commit, false), (names[1].as_str(), commit, false)]);
     assert_eq!(migrated.report["checkpoints"].as_array().unwrap().len(), 2);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A release named by no PEP 440 version cannot be a public tag: the one the owner ruled an
+/// audit artifact becomes private, any other refuses its repo.
+#[test]
+fn a_release_that_is_no_version_is_private_by_ruling_or_refused() {
+    let dir = scratch("no-version");
+    let manifest = put(&dir, &serde_json::to_vec(&json!({"format": "tensorfs.manifest/1", "files": lane_files(&dir, GPT2_FULL)})).unwrap());
+    let doc = |name: &str| {
+        let tags = json!([{"name": "1.0.0-audit.1", "lanes": {"f32": manifest}, "public": true, "yanked": true}]);
+        serde_json::to_vec(&json!({"format": "cozytensors.repo/1", "name": name, "tags": tags})).unwrap()
+    };
+    let mut migrator = Migrator::new(Access::from_env(), TABLE);
+    let read = |o: &ObjectRef| Ok(std::fs::read(dir.join(o.key()))?);
+    let ruled = migrator.repo(&doc(d10::PRIVATE[0].0), &read).unwrap();
+    let tag = &ruled.repo.tags[0];
+    assert_eq!((tag.name.as_str(), tag.public, tag.yanked), (d10::PRIVATE[0].1, false, true));
+    assert_eq!(ruled.report["made_private"], json!([d10::PRIVATE[0].1]));
+    let refused = migrator.repo(&doc("acme/audit"), &read).err().unwrap();
+    assert!(refused.detail.contains("PEP 440"), "{}", refused.detail);
     std::fs::remove_dir_all(dir).unwrap();
 }
