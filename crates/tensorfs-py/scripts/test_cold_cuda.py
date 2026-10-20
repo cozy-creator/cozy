@@ -9,7 +9,9 @@ import os
 from pathlib import Path
 import subprocess
 import signal
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -76,7 +78,7 @@ class Diagnostic(unittest.TestCase):
             return {'rc': 0 if stage == 'import' else -11, 'ok': stage == 'import',
                     'reaped': True, 'timed_out': False}
         with patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': '0', 'PYTHONPATH': '/not-used'}), \
-                patch.object(probe, 'run_owned', side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
+                patch.object(probe, 'run_stage', side_effect=fake_run), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(probe.coordinate(self.args), 1)
         self.assertEqual(calls, ['import', 'host-u8'])
         result = json.loads((self.args.out / 'result.json').read_text())
@@ -91,14 +93,14 @@ class Diagnostic(unittest.TestCase):
             stderr.write_bytes(b'')
             return {'rc': None, 'ok': False, 'timed_out': True, 'reaped': False}
         with patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': '0'}), \
-                patch.object(probe, 'run_owned', side_effect=timeout), contextlib.redirect_stdout(io.StringIO()):
+                patch.object(probe, 'run_stage', side_effect=timeout), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(probe.coordinate(self.args), 1)
         row = json.loads((self.args.out / 'result.json').read_text())['stages'][0]
         self.assertTrue(row['timed_out'])
         self.assertIsNone(row['rc'])
         self.assertTrue(row['unparsed_stdout'])
 
-    def test_unreapable_child_has_only_bounded_waits_and_owned_signals(self):
+    def test_unreapable_child_has_only_bounded_waits_and_its_own_pid_signals(self):
         class Stuck:
             pid = 12345
             def wait(self, *, timeout):
@@ -106,18 +108,62 @@ class Diagnostic(unittest.TestCase):
                 raise subprocess.TimeoutExpired('synthetic', timeout)
             def poll(self):
                 return None
+            def terminate(self):
+                signals.append(('TERM', self.pid))
+            def kill(self):
+                signals.append(('KILL', self.pid))
         waits, signals = [], []
         with patch.object(probe.subprocess, 'Popen', return_value=Stuck()) as spawn, \
-                patch.object(probe.os, 'killpg', side_effect=lambda pid, sig: signals.append((pid, sig))), \
-                patch.object(probe.time, 'monotonic', side_effect=range(100)):
-            row = probe.run_owned(['synthetic-child'], self.root / 'stdout', self.root / 'stderr',
+                patch.object(probe.os, 'killpg') as killpg:
+            row = probe.run_stage(['synthetic-child'], self.root / 'stdout', self.root / 'stderr',
                                   timeout=0.1, term_seconds=0.01, kill_seconds=0.2)
-        self.assertEqual(waits, [0.1, 0.2])
-        self.assertEqual([s for _, s in signals if s], [signal.SIGTERM, signal.SIGKILL])
-        self.assertTrue(all(pid == 12345 for pid, _ in signals))
-        self.assertTrue(spawn.call_args.kwargs['start_new_session'])
+        self.assertEqual(waits, [0.1, 0.01, 0.2])
+        self.assertEqual(signals, [('TERM', 12345), ('KILL', 12345)])
+        killpg.assert_not_called()
+        self.assertFalse(spawn.call_args.kwargs['start_new_session'])
+        self.assertEqual(row['pgid'], os.getpgrp())
         self.assertFalse(row['reaped'] or row['ok'])
         self.assertTrue(row['timed_out'])
+
+    def test_outer_group_sigterm_reaches_the_nested_stdlib_child(self):
+        # A real stdlib-only process tree. No TensorFS import or diagnostic stage.
+        leaf = 'import os,time; print(os.getpid(),os.getpgrp(),flush=True); time.sleep(30)'
+        outer = ('import importlib.util; from pathlib import Path; '
+                 f's=importlib.util.spec_from_file_location("probe", {str(SCRIPT)!r}); '
+                 'p=importlib.util.module_from_spec(s); s.loader.exec_module(p); '
+                 f'p.run_stage({[sys.executable, "-u", "-c", leaf]!r}, '
+                 f'Path({str(self.root / "leaf.out")!r}), Path({str(self.root / "leaf.err")!r}), timeout=20)')
+        process = subprocess.Popen([sys.executable, '-c', outer], start_new_session=True,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 3
+            observed = ''
+            while time.monotonic() < deadline:
+                path = self.root / 'leaf.out'
+                observed = path.read_text() if path.exists() else ''
+                if observed.strip():
+                    break
+                time.sleep(0.01)
+            self.assertTrue(observed, 'stdlib child did not start')
+            child, group = map(int, observed.split())
+            self.assertEqual(group, process.pid)
+            self.assertNotEqual(group, os.getpgrp())
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=3)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                stat = Path(f'/proc/{child}/stat')
+                if not stat.exists() or stat.read_text().split(') ', 1)[1].split()[0] == 'Z':
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail('outer SIGTERM left the nested child alive')
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=3)
 
     def test_no_framework_imports_and_no_tensorfs_import_in_parent(self):
         tree = ast.parse(SCRIPT.read_text())

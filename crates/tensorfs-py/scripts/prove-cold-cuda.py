@@ -15,7 +15,6 @@ import json
 import os
 from pathlib import Path
 import re
-import signal
 import subprocess
 import sys
 import tempfile
@@ -38,59 +37,51 @@ def emit(stage, point, **facts):
                      sort_keys=True), flush=True)
 
 
-def run_owned(command, stdout, stderr, *, timeout, env=None, cwd=None,
+def run_stage(command, stdout, stderr, *, timeout, env=None, cwd=None,
               term_seconds=TERM_SECONDS, kill_seconds=KILL_SECONDS):
-    """Existing bounded owned-child pattern, frozen from the public wrapper at80c3.
+    """Bound a fixed leaf stage, retaining the coordinator's outer process group.
 
-    Never signal a caller or preexisting process. An uninterruptible child may
-    remain unreaped: record that failure instead of waiting without a deadline.
+    These four stage bodies start no subprocesses. Inner timeout signals only
+    this newly spawned child PID; the outer owner may cancel the whole inherited
+    group. This is not a generic descendant-process runner. An uninterruptible
+    child remains an explicit unreaped failure rather than an unlimited wait.
     """
     started = time.monotonic()
     with Path(stdout).open('wb') as output, Path(stderr).open('wb') as errors:
         child = subprocess.Popen(command, stdout=output, stderr=errors, env=env, cwd=cwd,
-                                 stdin=subprocess.DEVNULL, start_new_session=True)
-        pgid = child.pid
-
-        def group_alive():
-            try:
-                os.killpg(pgid, 0)
-                return True
-            except ProcessLookupError:
-                return False
-
-        def send(sig):
-            try:
-                os.killpg(pgid, sig)
-            except ProcessLookupError:
-                pass
-
-        timed_out = False
+                                 stdin=subprocess.DEVNULL, start_new_session=False)
+        pgid = os.getpgrp()
+        timed_out, signals = False, []
         try:
-            child.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-        lingering = not timed_out and group_alive()
-        signals = []
-        if timed_out or lingering:
-            send(signal.SIGTERM)
-            signals.append('SIGTERM')
-            deadline = time.monotonic() + term_seconds
-            while time.monotonic() < deadline and group_alive():
-                child.poll()
-                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
-            if group_alive():
-                send(signal.SIGKILL)
-                signals.append('SIGKILL')
-        try:
-            rc = child.wait(timeout=kill_seconds)
+            rc = child.wait(timeout=timeout)
             reaped = True
         except subprocess.TimeoutExpired:
-            rc, reaped = None, False
+            timed_out = True
+            try:
+                child.terminate()
+                signals.append('SIGTERM')
+            except ProcessLookupError:
+                pass
+            try:
+                rc = child.wait(timeout=term_seconds)
+                reaped = True
+            except subprocess.TimeoutExpired:
+                try:
+                    child.kill()
+                    signals.append('SIGKILL')
+                except ProcessLookupError:
+                    pass
+                try:
+                    rc = child.wait(timeout=kill_seconds)
+                    reaped = True
+                except subprocess.TimeoutExpired:
+                    rc, reaped = None, False
     return {'command': list(command), 'pid': child.pid, 'pgid': pgid, 'rc': rc,
             'timeout_s': timeout, 'elapsed_s': time.monotonic() - started,
-            'timed_out': timed_out, 'lingering_descendants': lingering,
+            'timed_out': timed_out, 'lingering_descendants': False,
+            'child_contract': 'fixed-stage-without-subprocesses',
             'signals': signals, 'reaped': reaped,
-            'ok': rc == 0 and reaped and not timed_out and not lingering}
+            'ok': rc == 0 and reaped and not timed_out}
 
 
 def wheel_files(path, digest):
@@ -226,7 +217,7 @@ def coordinate(args):
               'script_sha256': sha(Path(__file__).read_bytes()), 'stages': []}
     for stage in STAGES:
         argv = command(args, stage)
-        process = run_owned(argv, args.out / (stage + '.stdout'), args.out / (stage + '.stderr'),
+        process = run_stage(argv, args.out / (stage + '.stdout'), args.out / (stage + '.stderr'),
                             timeout=args.timeout, env=env)
         records, unparsed = [], []
         for line in (args.out / (stage + '.stdout')).read_text(errors='replace').splitlines():
