@@ -40,7 +40,7 @@ macro_rules! unconstructible {
 }
 
 unconstructible!(PyGpu = "Gpu", PyHost = "Host", PyWeightSet = "WeightSet", PyPinned = "Pinned", PyPart = "Part",
-    PyCounters = "Counters", PySetStats = "SetStats", PyGpuStats = "GpuStats", PyCopy = "Copy", PyLedger = "Ledger",
+    PyCounters = "Counters", PySetStats = "SetStats", PyGpuStats = "GpuStats", PyCopy = "Copy", PyCeiling = "Ceiling", PyLedger = "Ledger",
     PyRow = "Row", PyVictim = "Victim", PyAdmit = "Admit", PyRowFacts = "RowFacts");
 
 macro_rules! refused {
@@ -53,7 +53,7 @@ macro_rules! refused {
     )*};
 }
 
-refused!(copies, hold_tier, release_tier, seal);
+refused!(copies, ceiling, hold_tier, release_tier, seal);
 
 pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
@@ -65,8 +65,8 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
             $(m.add(stringify!($e), py.get_type::<$e>())?;)*
         };
     }
-    add!(PyGpu, PyHost, PyWeightSet, PyPinned, PyPart, PyCounters, PySetStats, PyGpuStats, PyCopy, PyLedger, PyRow, PyVictim, PyAdmit, PyRowFacts;
-        copies, hold_tier, release_tier, seal;
+    add!(PyGpu, PyHost, PyWeightSet, PyPinned, PyPart, PyCounters, PySetStats, PyGpuStats, PyCopy, PyCeiling, PyLedger, PyRow, PyVictim, PyAdmit, PyRowFacts;
+        copies, ceiling, hold_tier, release_tier, seal;
         VarenaError, DeviceFull, CudaError, CudaUnavailable, Invalid, IoError, Closed, Unsupported, LedgerError);
     #[cfg(feature = "store")]
     m.add_function(wrap_pyfunction!(crate::store::regions, &m)?)?;
