@@ -57,6 +57,8 @@ with tempfile.TemporaryDirectory() as temp:
     with serve(root / "origin") as endpoint:
         provider = Provider()
         alive = weakref.ref(provider)
+        released = threading.Event()
+        weakref.finalize(provider, released.set)
         checkpoint = tensorfs.open("acme/lifetime", revision="one", endpoint=endpoint,
                                    token=provider, cache_dir=root / "reader")
         assert provider.calls > 0, "the real HTTP transport did not use the provider"
@@ -77,21 +79,27 @@ with tempfile.TemporaryDirectory() as temp:
         array = tensors.read("weight")
         del tensors
         gc.collect()
+        assert released.wait(10), "deferred final Tensors release did not finish within 10 seconds"
         assert alive() is None, "the dropped checkpoint/components/Tensors retained their request provider"
         assert array.tobytes() == b"data", "Array bytes depend on the checkpoint/provider lifetime"
 
         provider = Provider()
         alive = weakref.ref(provider)
+        released = threading.Event()
+        weakref.finalize(provider, released.set)
         checkpoint = tensorfs.open("acme/lifetime", revision="one", endpoint=endpoint,
                                    token=provider, cache_dir=root / "close-reader")
         assert "model" in checkpoint.components
         del provider
         checkpoint.close()
         gc.collect()
+        assert released.wait(10), "deferred closed-parent release did not finish within 10 seconds"
         assert alive() is None, "a closed parent retained its cached components/provider"
 
         provider = Provider()
         alive = weakref.ref(provider)
+        released = threading.Event()
+        weakref.finalize(provider, released.set)
         checkpoint = tensorfs.open("acme/lifetime", revision="one", endpoint=endpoint,
                                    token=provider, cache_dir=root / "race-reader")
         provider.block = True
@@ -118,6 +126,7 @@ with tempfile.TemporaryDirectory() as temp:
         assert not thread.is_alive() and not errors, errors
         del download, checkpoint
         gc.collect()
+        assert released.wait(10), "deferred completed-call release did not finish within 10 seconds"
         assert alive() is None, "a completed call retained its closed parent's provider"
 
     with tensorfs.open(root / "source", cache_dir=root / "isolated") as checkpoint:
