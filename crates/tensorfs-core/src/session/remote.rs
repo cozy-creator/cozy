@@ -9,6 +9,7 @@ use crate::fetch::{self, Fetcher, ObjectStore, Origin, VolumeOrigin, Want};
 use crate::format::{Header, ObjectRef, Tree};
 use crate::store2::Store;
 
+use super::provider::from_native;
 use super::{io_failure, Checkpoint, Endpoint, Fetch, Fetched, Ref};
 
 #[derive(Clone)]
@@ -28,7 +29,7 @@ impl Remote {
         if let Some(report) = want.progress {
             report(0, total)?;
         }
-        if self.offline {
+        if self.offline && self.mirror.is_none() {
             for object in &objects {
                 if !self.store.reuse(object)? {
                     return fail(Kind::NotFound, format!("{} is not cached", object.id()));
@@ -43,11 +44,18 @@ impl Remote {
             });
         }
         let store: Arc<dyn ObjectStore> = Arc::new(self.store.clone());
-        let origin: Arc<dyn Origin> = self.endpoint.inner.clone();
-        let volume = self
+        let mirror = self
             .mirror
             .as_ref()
             .map(|p| VolumeOrigin::new(p, Duration::from_secs(24 * 60 * 60)));
+        let (origin, volume): (Arc<dyn Origin>, _) = if self.offline {
+            // A configured mirror is a local-files source, not permission to
+            // contact the remote endpoint. Use the existing verified downloader
+            // with a file-only origin and no network fallback.
+            (Arc::new(mirror.expect("offline source has a mirror")), None)
+        } else {
+            (self.endpoint.inner.clone(), mirror)
+        };
         // Constructing/dropping this fetcher scopes cancellation to this operation.
         // All network tasks run on the caller's Tokio runtime, never a nested one.
         let fetcher = Fetcher::new(
@@ -67,7 +75,7 @@ impl Remote {
         let result = loop {
             tokio::select! {
                 biased;
-                result = &mut work => break result?,
+                result = &mut work => break result.map_err(from_native)?,
                 _ = tick.tick(), if want.progress.is_some() => {
                     if let Some(report) = want.progress {
                         report(progress.held.load(Ordering::Relaxed), total)?;
@@ -116,13 +124,30 @@ impl Remote {
                 Err(error) => return Err(io_failure(path.display(), error)),
             }
             if self.offline {
+                if let Some(mirror) = &self.mirror {
+                    let object = ObjectRef {
+                        sha256: hex.to_owned(),
+                        length: 0,
+                    };
+                    let path = mirror.join(object.key());
+                    let metadata = std::fs::metadata(&path)
+                        .map_err(|error| io_failure(path.display(), error))?;
+                    return Ok((
+                        ObjectRef {
+                            length: metadata.len(),
+                            ..object
+                        },
+                        None,
+                    ));
+                }
                 return fail(Kind::NotFound, format!("{digest} is not cached"));
             }
             let object = self
                 .endpoint
                 .inner
                 .object(hex)
-                .await?
+                .await
+                .map_err(from_native)?
                 .ok_or_else(|| Failure {
                     kind: Kind::NotFound,
                     detail: format!("no object {digest}"),
@@ -142,13 +167,35 @@ impl Remote {
                 return Ok(found);
             }
         }
-        if self.offline {
-            return fail(
-                Kind::NotFound,
-                format!("{} is not cached", reference.repo_id),
-            );
-        }
-        let repo = match self.endpoint.repo(&reference.repo_id).await {
+        let local;
+        let endpoint = if self.offline {
+            let Some(mirror) = &self.mirror else {
+                return fail(
+                    Kind::NotFound,
+                    format!("{} is not cached", reference.repo_id),
+                );
+            };
+            // Keep release selection and parsing in the existing endpoint. An
+            // absolute directory cannot be interpreted as an HTTP endpoint, and
+            // carries no provider even if Config supplies one for the Hub.
+            let path =
+                std::path::absolute(mirror).map_err(|error| io_failure(mirror.display(), error))?;
+            let path = path.to_str().ok_or_else(|| Failure {
+                kind: Kind::Invalid,
+                detail: "mirror path is not UTF-8".into(),
+            })?;
+            local = Endpoint {
+                inner: Arc::new(
+                    fetch::Endpoint::new(&self.endpoint.transport, path, None)
+                        .map_err(from_native)?,
+                ),
+                transport: self.endpoint.transport.clone(),
+            };
+            &local
+        } else {
+            &self.endpoint
+        };
+        let repo = match endpoint.repo(&reference.repo_id).await {
             Ok(Some((repo, _))) => repo,
             Ok(None) => return fail(Kind::NotFound, format!("no repo {}", reference.repo_id)),
             Err(error) => {
@@ -162,7 +209,8 @@ impl Remote {
                 return Err(error);
             }
         };
-        let (version, tree) = fetch::release_of(&repo, reference.revision.as_deref())?;
+        let (version, tree) =
+            fetch::release_of(&repo, reference.revision.as_deref()).map_err(from_native)?;
         Ok((tree, Some(version)))
     }
 

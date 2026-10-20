@@ -65,6 +65,17 @@ fn native_error(error: Failure) -> crate::err::Refusal {
     }
 }
 
+/// Keep the public diagnostic verbatim across the private transport adapter.
+/// The shared legacy conversion supplies the family, but its presentation-only
+/// code prefix must not become part of a consumer's original callback detail.
+pub(super) fn from_native(error: crate::err::Refusal) -> Failure {
+    let detail = error.detail.clone();
+    Failure {
+        detail,
+        ..Failure::from(error)
+    }
+}
+
 #[async_trait]
 impl crate::fetch::TokenProvider for NativeProvider {
     async fn headers(
@@ -92,13 +103,19 @@ mod tests {
     #[test]
     fn every_public_provider_error_roundtrips_without_losing_detail() {
         for kind in Kind::ALL {
-            let original = Failure {
-                kind,
-                detail: "provider's exact diagnostic".into(),
-            };
-            let restored = Failure::from(native_error(original.clone()));
-            assert_eq!(restored.kind, original.kind);
-            assert_eq!(restored.detail, original.detail);
+            for detail in [
+                "",
+                "provider's exact diagnostic",
+                "CREDENTIAL_REQUIRED: caller text",
+            ] {
+                let original = Failure {
+                    kind,
+                    detail: detail.into(),
+                };
+                let restored = from_native(native_error(original.clone()));
+                assert_eq!(restored.kind, original.kind);
+                assert_eq!(restored.detail, original.detail);
+            }
         }
     }
 }

@@ -6,6 +6,7 @@ use crate::failure::{Failure, Result};
 use crate::fetch::{self, Client as Transport, SourcePolicy};
 use crate::format::Repo;
 
+use super::provider::from_native;
 use super::{Config, TokenProvider};
 
 /// Generic repository/object protocol. Authentication stays with TokenProvider.
@@ -55,18 +56,19 @@ impl Endpoint {
                     STANDARD.encode(der)
                 )
                 .as_bytes(),
-            )?,
+            )
+            .map_err(from_native)?,
             None => Transport::new(policy),
         };
         let token = config.token.clone().map(|provider| {
             Arc::new(super::provider::NativeProvider(provider)) as Arc<dyn fetch::TokenProvider>
         });
-        let inner = Arc::new(fetch::Endpoint::new(&transport, url, token)?);
+        let inner = Arc::new(fetch::Endpoint::new(&transport, url, token).map_err(from_native)?);
         Ok(Self { inner, transport })
     }
 
     pub async fn repo(&self, repo_id: &str) -> Result<Option<(Repo, String)>> {
-        Ok(self.inner.repo(repo_id).await?)
+        self.inner.repo(repo_id).await.map_err(from_native)
     }
 
     pub async fn update_repo(
@@ -90,7 +92,7 @@ impl Endpoint {
             .await;
         match callback_error {
             Some(error) => Err(error),
-            None => Ok(result?),
+            None => result.map_err(from_native),
         }
     }
 }

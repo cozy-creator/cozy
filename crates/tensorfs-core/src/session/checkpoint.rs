@@ -36,13 +36,9 @@ impl fmt::Debug for Checkpoint {
 }
 
 impl Checkpoint {
-    pub(super) fn local(
-        raw: Stored,
-        named: Option<Ref>,
-        tree: Option<ObjectRef>,
-        store: Store,
-    ) -> Result<Self> {
-        Self::managed(raw, named, tree, None, Vec::new(), store)
+    pub(super) fn local(raw: Stored, source: Remote) -> Result<Self> {
+        let store = source.store.clone();
+        Self::managed(raw, None, None, Some(source), Vec::new(), store)
     }
 
     pub(super) fn managed(
@@ -126,23 +122,44 @@ impl Checkpoint {
 
     pub async fn fetch(&self, want: &Fetch<'_>) -> Result<Fetched> {
         let objects = super::selection::objects(&self.data.raw, &want.selection)?;
-        match &self.data.remote {
-            Some(remote) => remote.fetch(&objects, want).await,
-            None => {
-                let total = objects.iter().map(|o| o.length).sum();
-                for object in &objects {
-                    if !self.data.raw.holds(object)? {
-                        return fail(Kind::NotFound, format!("{} is not present", object.id()));
-                    }
-                }
-                if let Some(report) = want.progress {
-                    report(total, total)?;
-                }
-                Ok(Fetched {
-                    local: total,
-                    ..Fetched::default()
-                })
+        let total = objects.iter().map(|o| o.length).sum();
+        let mut local = 0;
+        let mut missing = Vec::new();
+        for object in objects {
+            if self.data.raw.holds(&object)? {
+                local += object.length;
+            } else {
+                missing.push(object);
             }
+        }
+        if missing.is_empty() {
+            if let Some(report) = want.progress {
+                report(total, total)?;
+            }
+            return Ok(Fetched {
+                local,
+                ..Fetched::default()
+            });
+        }
+        match &self.data.remote {
+            Some(remote) => {
+                let progress = |held, _| match want.progress {
+                    Some(report) => report(local + held, total),
+                    None => Ok(()),
+                };
+                let selected = Fetch {
+                    priority: want.priority,
+                    progress: want.progress.map(|_| &progress as &super::Progress<'_>),
+                    ..Fetch::default()
+                };
+                let mut landed = remote.fetch(&missing, &selected).await?;
+                landed.local += local;
+                Ok(landed)
+            }
+            None => fail(
+                Kind::NotFound,
+                format!("{} is not present", missing[0].id()),
+            ),
         }
     }
 
