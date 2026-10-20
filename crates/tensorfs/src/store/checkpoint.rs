@@ -239,6 +239,36 @@ impl Checkpoint {
         Ok(dir)
     }
 
+    /// Export only a component's config and support files to the caller's directory.
+    /// Missing assets refuse before any directory is created; this never downloads weights.
+    pub fn export_component_files(&self, name: &str, dir: &Path) -> Result<PathBuf> {
+        let component = self.component(name)?;
+        for object in component.assets.values() {
+            if !self.holds(object)? {
+                return Err(Error::Absent(object.sha256.clone()));
+            }
+        }
+        if let Some(store) = self.store() {
+            store.cache_preserve_snapshot(dir)?;
+        }
+        fs::create_dir_all(dir).map_err(fail("create", dir))?;
+        let config = dir.join(component.config_name());
+        if let Some(parent) = config.parent() {
+            fs::create_dir_all(parent).map_err(fail("create", parent))?;
+        }
+        fs::write(&config, crate::export::config_json(&component.config))
+            .map_err(fail("write", &config))?;
+        for name in component.assets.keys() {
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(fail("create", parent))?;
+            }
+            fs::write(&path, self.asset(&component.name, name)?)
+                .map_err(fail("write", &path))?;
+        }
+        Ok(dir.to_path_buf())
+    }
+
     pub fn header(&self) -> &Header {
         &self.header
     }

@@ -104,7 +104,7 @@ pub mod writer;
 mod session;
 #[cfg(feature = "store")]
 pub use session::{
-    bearer, Checkpoint, Client, Component, Config, Endpoint, Fetch, Fetched, HeaderMap, Open,
+    bearer, export, Checkpoint, Client, Component, Config, Endpoint, Fetch, Fetched, Format, HeaderMap, Open,
     Progress, Ref, Request, Selection, TokenProvider,
 };
 
