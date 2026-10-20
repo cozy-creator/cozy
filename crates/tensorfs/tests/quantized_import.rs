@@ -1557,3 +1557,86 @@ fn comfy_int_markers_and_shapes_are_read_or_refused() {
     };
     refusal("real-comfy-w4a4", &group_scales, "not [64] or [64]+[1]");
 }
+
+#[test]
+fn comfy_empty_packed_rows_recover_large_widths_without_overflow() {
+    // These headers contain no weight bytes. Multiplying their physical widths by eight
+    // overflows even though the logical widths and every part's zero byte count fit.
+    let columns = 1u64 << 63;
+    for (format, bits, group) in [
+        ("convrot_w4a4", 4, None),
+        ("asym_w4a8_int8", 4, Some(16)),
+        ("w6a8_int8", 6, Some(32)),
+    ] {
+        let width = if bits == 4 {
+            columns / 2
+        } else {
+            (columns / 4) * 3
+        };
+        let (_dir, ck) = edited("empty-comfy-width", &|t, _, _| {
+            let conf = match group {
+                Some(g) => serde_json::json!({
+                    "format": format, "convrot_groupsize": 256, "group_size": g
+                }),
+                None => serde_json::json!({
+                    "format": format, "convrot_groupsize": 256
+                }),
+            };
+            t.push(marker("proj", conf));
+            t.push(("norm.weight".into(), "BF16".into(), vec![1], vec![0; 2]));
+            t.push(("proj.weight".into(), "I8".into(), vec![0, width], vec![]));
+            match group {
+                None => t.push(("proj.weight_scale".into(), "F32".into(), vec![0], vec![])),
+                Some(g) => {
+                    t.push((
+                        "proj.weight_s_rel".into(),
+                        "F32".into(),
+                        vec![0, columns / g],
+                        vec![],
+                    ));
+                    t.push((
+                        "proj.weight_s_channel".into(),
+                        "F32".into(),
+                        vec![0],
+                        vec![],
+                    ));
+                }
+            }
+        });
+        assert_eq!(
+            ck.tensor("model", "proj.weight").unwrap().shape,
+            [0, columns]
+        );
+    }
+    for (format, width, why) in [
+        ("convrot_w4a4", 1u64 << 63, "packed logical width overflow"),
+        (
+            "w6a8_int8",
+            (1u64 << 62) * 3,
+            "packed logical width overflow",
+        ),
+        ("w6a8_int8", 1u64 << 61, "not 6-bit rows"),
+    ] {
+        let e = refused("invalid-comfy-width", &|t, _, _| {
+            t.push(marker(
+                "proj",
+                serde_json::json!({"format": format, "convrot_groupsize": 256}),
+            ));
+            t.push(("norm.weight".into(), "BF16".into(), vec![1], vec![0; 2]));
+            t.push(("proj.weight".into(), "I8".into(), vec![0, width], vec![]));
+            if format == "convrot_w4a4" {
+                t.push(("proj.weight_scale".into(), "F32".into(), vec![0], vec![]));
+            } else {
+                t.push(("proj.weight_s_rel".into(), "F32".into(), vec![0, 1], vec![]));
+                t.push((
+                    "proj.weight_s_channel".into(),
+                    "F32".into(),
+                    vec![0],
+                    vec![],
+                ));
+            }
+        });
+        assert_eq!(e.code, Code::MISSING_COMPANION_ROLE, "{}", e.detail);
+        assert!(e.detail.contains(why), "{format}: {}", e.detail);
+    }
+}

@@ -9,7 +9,7 @@
 //! group's scale among its stored-dtype neighbours.
 
 use super::{elem, encoding, Encoder, Input, OwnedPart};
-use crate::format::decode::{bf16, f16};
+use crate::format::decode::{bf16, check, f16, SCHEMES};
 use crate::format::{Dtype, Encoding, Error, Result, Value};
 
 pub const ASYM_W4A8_INT8: Encoder = Encoder {
@@ -60,6 +60,7 @@ pub struct Kitchen {
     /// 4-bit: a Lloyd-Max codebook (`weight_codebook`); else uniform `q − 8`.
     pub codebook: bool,
     /// 4-bit: `false` is kitchen's asymmetric min/max grid with a `weight_correction`.
+    /// W6A8 refuses `false`, because that format has no correction part.
     pub symmetric: bool,
     /// `weight_s_rel` in `F32` rather than `F8_E4M3`.
     pub f32_scales: bool,
@@ -89,11 +90,28 @@ const LUT: [f32; 16] = [
 pub fn quantize_with(input: &Input, options: &Kitchen) -> Result<Vec<OwnedPart>> {
     let scheme = input.encoding.scheme.as_str();
     let fail = |d: String| Error::Encode(format!("{scheme}: {d}"));
+    if !matches!(
+        scheme,
+        "comfy.asym_w4a8_int8" | "comfy.w6a8_int8" | "comfy.convrot_w4a4"
+    ) {
+        return Err(Error::UnknownScheme(scheme.into()));
+    }
+    let schema = SCHEMES
+        .iter()
+        .find(|s| s.name == scheme)
+        .ok_or_else(|| Error::UnknownScheme(scheme.into()))?;
+    if let Some(key) = input
+        .encoding
+        .params
+        .keys()
+        .find(|k| !schema.params.iter().any(|p| p.key == *k))
+    {
+        return Err(fail(format!("unknown param {key:?}")));
+    }
     let uint = |key: &str| match input.encoding.params.get(key).and_then(Value::as_u64) {
-        Some(v) => Ok(v as usize),
+        Some(v) => usize::try_from(v).map_err(|_| fail(format!("param {key} is too large"))),
         None => Err(fail(format!("param {key} is missing or not an integer"))),
     };
-    let values = input.values()?;
     let (&[ref lead @ .., c], true) = (input.shape, input.shape.len() >= 2) else {
         return Err(fail(format!(
             "logical shape {:?} is not rank 2 or more",
@@ -106,13 +124,29 @@ pub fn quantize_with(input: &Input, options: &Kitchen) -> Result<Vec<OwnedPart>>
             input.dtype
         )));
     }
+    let want = Dtype::F32
+        .byte_len(input.shape)
+        .ok_or_else(|| fail("values shape overflows its F32 byte count".into()))?;
+    let actual = input
+        .arrays
+        .get("values")
+        .ok_or_else(|| fail("no values".into()))?
+        .bytes
+        .len();
+    if actual as u64 != want {
+        return Err(fail(format!("values have {actual} bytes, not {want}")));
+    }
+    if want == 0 {
+        return Err(fail("empty values cannot be quantized".into()));
+    }
+    let values = input.values()?;
     let b = uint("rotation_size")?;
     if !(4..=65536).contains(&b) || !b.is_power_of_two() || b.trailing_zeros() % 2 == 1 {
         return Err(fail(format!("rotation_size {b} is not a power of 4")));
     }
-    let k = c as usize;
+    let k = usize::try_from(c).map_err(|_| fail("column count is too large".into()))?;
     let w = Weight {
-        rows: values.len() / k.max(1),
+        rows: values.len() / k,
         k,
         lead: lead.to_vec(),
         dtype: input.dtype.clone(),
@@ -120,10 +154,11 @@ pub fn quantize_with(input: &Input, options: &Kitchen) -> Result<Vec<OwnedPart>>
     if !k.is_multiple_of(b) {
         return Err(fail(format!("{k} columns are not whole blocks of {b}")));
     }
-    let rotated = rotate(&values, b, &w.dtype);
-    match scheme {
-        "comfy.convrot_w4a4" if k.is_multiple_of(64) => Ok(w4a4(&w, &rotated)),
-        "comfy.convrot_w4a4" => Err(fail(format!("{k} columns are not whole groups of 64"))),
+    let group = match scheme {
+        "comfy.convrot_w4a4" if k.is_multiple_of(64) => None,
+        "comfy.convrot_w4a4" => {
+            return Err(fail(format!("{k} columns are not whole groups of 64")))
+        }
         _ => {
             let bits = if scheme == "comfy.w6a8_int8" { 6 } else { 4 };
             let g = uint("group_size")?;
@@ -137,9 +172,48 @@ pub fn quantize_with(input: &Input, options: &Kitchen) -> Result<Vec<OwnedPart>>
             if values.len() as u64 >= 1 << 32 {
                 return Err(fail("2^32 or more elements".into()));
             }
-            Ok(grouped(&w, &rotated, g, bits, options))
+            if bits == 6 && !options.symmetric {
+                return Err(fail("W6A8 has no asymmetric correction option".into()));
+            }
+            Some((g, bits))
+        }
+    };
+    let rotated = rotate(&values, b, &w.dtype);
+    if rotated.iter().any(|v| !v.is_finite()) {
+        return Err(fail("rotation is not finite in the logical dtype".into()));
+    }
+    let parts = match group {
+        None => w4a4(&w, &rotated),
+        Some((g, bits)) => grouped(&w, &rotated, g, bits, options),
+    };
+    for p in &parts {
+        if p.dtype.byte_len(&p.shape) != Some(p.bytes.len() as u64) {
+            return Err(fail(format!("part {} has an invalid byte count", p.role)));
+        }
+        if p.dtype != Dtype::I8
+            && crate::format::decode::elem::floats(&p.dtype, &p.bytes)
+                .iter()
+                .any(|v| !v.is_finite())
+        {
+            return Err(fail(format!("part {} is not finite", p.role)));
         }
     }
+    let views = parts
+        .iter()
+        .map(|p| {
+            (
+                p.role.as_str(),
+                super::PartBytes {
+                    dtype: &p.dtype,
+                    shape: &p.shape,
+                    bytes: &p.bytes,
+                },
+            )
+        })
+        .collect();
+    check(input.dtype, input.shape, input.encoding, &views)
+        .map_err(|e| fail(format!("invalid encoded parts: {e}")))?;
+    Ok(parts)
 }
 
 struct Weight {
