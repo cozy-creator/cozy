@@ -427,7 +427,16 @@ class Cache:
         self.memory, self.owner, self.shrink = memory, owner, shrink
         self.holds: set[Hold] = set()
         self._nbytes = 0
-        self.id = memory.native.cache(0, shrink) if memory.native is not None else 0
+
+        def reclaim(need: int) -> int:
+            try:
+                return shrink(need)
+            finally:
+                # A callback can also release allocator slack (e.g. a graph's
+                # private pool). Publish the actual allocator before retrying.
+                memory._measure()
+
+        self.id = memory.native.cache(0, reclaim) if memory.native is not None else 0
         self.closed = False
 
     @property
@@ -483,6 +492,7 @@ class Cache:
         if self.memory.native is not None:
             self.memory.native.close_cache(self.id)
         self.memory.caches.discard(self)
+        self.memory._measure()
 
 
 @dataclass(eq=False, slots=True)
