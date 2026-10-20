@@ -901,7 +901,7 @@ class Memory:
             stack.remove(request)
             self.active.pop(request, None)
             gc.collect()
-            raw = (
+            raw: dict[str, Any] = (
                 self.native.end(request.native_id)
                 if self.native is not None
                 else {"events": [], "copies": [], "peak": 0}
