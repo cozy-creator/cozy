@@ -3,15 +3,18 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use super::cuda::{self, CUcontext, CUevent, CUstream, CtxGuard};
 use super::{host, Copy, Dst, Error, ReadOpts, ReadStats, Src};
 
-const STAGING: usize = 16;
 const PIECE: usize = 2 << 20;
 const READERS: usize = 8;
+/// Slots each reader owns: one fills while the other's copy lands, and both stay in its caches.
+/// A shared pool (LIFO or FIFO) measured 8-20% slower warm H2D.
+const RING: usize = 2;
+const STAGING: usize = READERS * RING;
 const STREAMS: usize = 4;
 
 fn failed(copy: usize, error: cuda::Error) -> Error {
@@ -102,6 +105,9 @@ impl Slot {
     }
 }
 
+// SAFETY: pinned host memory and an event of the engine's context, used only with it entered.
+unsafe impl Send for Slot {}
+
 impl Drop for Slot {
     fn drop(&mut self) {
         if let (Ok(d), Ok(_ctx)) = (cuda::driver(), CtxGuard::enter(self.done.ctx)) {
@@ -115,22 +121,53 @@ impl Drop for Slot {
     }
 }
 
-struct Pool {
-    free: Mutex<Vec<Slot>>,
-    ready: Condvar,
-}
+/// The CPUs of the GPU's own NUMA node that this process may use. Readers run there and staging
+/// is allocated there: on a two-socket EPYC, readers and slots left to the scheduler measured
+/// 64-94% of the H2D ceiling from run to run, kept local 92-94%.
+#[derive(Clone, Copy)]
+struct Near(#[cfg(target_os = "linux")] Option<libc::cpu_set_t>);
 
-impl Pool {
-    fn take(&self) -> Slot {
-        self.ready
-            .wait_while(self.free.lock().unwrap(), |free| free.is_empty())
-            .unwrap()
-            .pop()
-            .unwrap()
+impl Near {
+    #[cfg(target_os = "linux")]
+    fn of(device: i32) -> Near {
+        let list = super::metrics::pci_address(device).and_then(|pci| {
+            std::fs::read_to_string(format!("/sys/bus/pci/devices/{pci}/local_cpulist")).ok()
+        });
+        // SAFETY: plain C structs and calls on this thread's own mask.
+        unsafe {
+            let (mut allowed, mut near): (libc::cpu_set_t, libc::cpu_set_t) =
+                (std::mem::zeroed(), std::mem::zeroed());
+            if list.is_none()
+                || libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut allowed)
+                    != 0
+            {
+                return Near(None);
+            }
+            for range in list.as_deref().unwrap_or_default().trim().split(',') {
+                let (lo, hi) = range.split_once('-').unwrap_or((range, range));
+                let (Ok(lo), Ok(hi)) = (lo.parse::<usize>(), hi.parse::<usize>()) else {
+                    return Near(None);
+                };
+                for cpu in (lo..=hi).filter(|&cpu| {
+                    cpu < libc::CPU_SETSIZE as usize && libc::CPU_ISSET(cpu, &allowed)
+                }) {
+                    libc::CPU_SET(cpu, &mut near);
+                }
+            }
+            Near((libc::CPU_COUNT(&near) > 0).then_some(near))
+        }
     }
-    fn put(&self, slot: Slot) {
-        self.free.lock().unwrap().push(slot);
-        self.ready.notify_one();
+    #[cfg(not(target_os = "linux"))]
+    fn of(_: i32) -> Near {
+        Near()
+    }
+    /// Moves this thread there (TensorFS's own threads only).
+    fn enter(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(set) = &self.0 {
+            // SAFETY: a valid mask for the calling thread.
+            unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), set) };
+        }
     }
 }
 
@@ -139,7 +176,8 @@ struct Engine {
     ctx: CUcontext,
     streams: Vec<cuda::Stream>,
     queues: Vec<Mutex<()>>,
-    pool: Pool,
+    near: Near,
+    free: Mutex<Vec<Slot>>,
     serial: Mutex<()>,
     seen: Mutex<VecDeque<(usize, usize)>>,
     held: Mutex<Vec<Retained>>,
@@ -297,19 +335,28 @@ impl Engine {
             .map(|_| cuda::Stream::new(device))
             .collect::<cuda::Result<_>>()?;
         let ctx = streams[0].context();
-        let _ctx = CtxGuard::enter(ctx)?;
-        let free = (0..STAGING)
-            .map(|_| Slot::new(ctx))
-            .collect::<cuda::Result<_>>()?;
+        let near = Near::of(device);
+        // Pinned pages land on the allocating thread's node.
+        let at = ctx as usize;
+        let free = std::thread::scope(|s| {
+            s.spawn(|| {
+                near.enter();
+                let ctx = at as CUcontext;
+                let _ctx = CtxGuard::enter(ctx)?;
+                (0..STAGING)
+                    .map(|_| Slot::new(ctx))
+                    .collect::<cuda::Result<Vec<_>>>()
+            })
+            .join()
+            .expect("staging allocation does not panic")
+        })?;
         let engine = Arc::new(Engine {
             device,
             ctx,
             streams,
             queues: (0..STREAMS).map(|_| Mutex::new(())).collect(),
-            pool: Pool {
-                free: Mutex::new(free),
-                ready: Condvar::new(),
-            },
+            near,
+            free: Mutex::new(free),
             serial: Mutex::new(()),
             seen: Mutex::new(VecDeque::new()),
             held: Mutex::new(Vec::new()),
@@ -373,7 +420,7 @@ impl Engine {
             for mut slot in owner.slots.drain(..) {
                 slot.pending = false;
                 slot.recorded = false;
-                self.pool.put(slot);
+                self.free().push(slot);
             }
             // The remaining event/stream/allocation owners drop only after checked completion.
             drop(owner);
@@ -401,19 +448,17 @@ impl Engine {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         let released = checked_take(&mut held, |r| self.checked_release(r, false))?;
         drop(held);
-        // All previous engine work is now complete, including slots already returned to pool.
-        for slot in self
-            .pool
-            .free
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter_mut()
-        {
+        // All previous engine work is now complete, including slots already returned to the free list.
+        for slot in self.free().iter_mut() {
             slot.pending = false;
             slot.recorded = false;
         }
         self.released(released);
         Ok(())
+    }
+
+    fn free(&self) -> std::sync::MutexGuard<'_, Vec<Slot>> {
+        self.free.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn hold_slot(&self, slot: Slot) {
@@ -523,21 +568,46 @@ impl Engine {
             let next = AtomicUsize::new(0);
             let stopped = AtomicBool::new(false);
             let error = Mutex::new(None);
+            let readers = opts.threads.clamp(1, READERS).min(jobs.len());
+            if self.free().len() < readers * RING {
+                let lost = io::Error::other("staging is still retained by a failed copy");
+                return Err(Error {
+                    copy: first,
+                    source: lost,
+                });
+            }
             let work = || {
+                self.near.enter();
+                let mut ring = {
+                    let mut free = self.free();
+                    let at = free.len() - RING;
+                    free.split_off(at)
+                };
+                let mut turn = 0;
                 while !stopped.load(Relaxed) {
                     let at = next.fetch_add(1, Relaxed);
                     let Some(job) = jobs.get(at) else { break };
-                    if let Err(failure) = self.piece(job, at % streams, opts, &tally) {
+                    turn += 1;
+                    if let Err(failure) =
+                        self.piece(job, at % streams, opts, &tally, &mut ring[turn % RING])
+                    {
                         error.lock().unwrap().get_or_insert(failure);
                         stopped.store(true, Relaxed);
                     }
                 }
+                // After any failure a slot may still be in flight: kept until checked completion.
+                for slot in ring {
+                    match stopped.load(Relaxed) {
+                        true => self.hold_slot(slot),
+                        false => self.free().push(slot),
+                    }
+                }
             };
+            // Every reader is TensorFS's own thread, so moving it to the GPU's CPUs moves no caller.
             std::thread::scope(|scope| {
-                for _ in 1..opts.threads.clamp(1, READERS).min(jobs.len().max(1)) {
+                for _ in 0..readers {
                     scope.spawn(work);
                 }
-                work();
             });
             let mut busy_ns = 0;
             let mut all_complete = true;
@@ -577,7 +647,14 @@ impl Engine {
         Ok(stats)
     }
 
-    fn piece(&self, job: &Job, lane: usize, opts: &ReadOpts, tally: &Tally) -> Result<(), Error> {
+    fn piece(
+        &self,
+        job: &Job,
+        lane: usize,
+        opts: &ReadOpts,
+        tally: &Tally,
+        slot: &mut Slot,
+    ) -> Result<(), Error> {
         let _ctx = CtxGuard::enter(self.ctx).map_err(|e| failed(job.copy, e))?;
         let d = cuda::driver().map_err(|e| failed(job.copy, e))?;
         let stream = self.streams[lane].raw() as CUstream;
@@ -604,68 +681,59 @@ impl Engine {
             };
             return cuda::check("cuMemcpyAsync", result).map_err(|e| failed(job.copy, e));
         }
-        let mut slot = self.pool.take();
-        let result = (|| {
-            if slot.pending {
-                slot.done.sync().map_err(|e| failed(job.copy, e))?;
-                slot.pending = false;
-            }
-            match job.c.src {
-                Src::File(file, offset) => {
-                    let copy = Copy {
-                        src: Src::File(file, offset + job.at as u64),
-                        dst: Dst::Host {
-                            ptr: slot.ptr,
-                            len: job.len,
-                        },
-                    };
-                    let options = ReadOpts {
-                        threads: 1,
-                        ..opts.clone()
-                    };
-                    let stats = unsafe { host::fill(&[copy], &options) }.map_err(|e| Error {
-                        copy: job.copy,
-                        source: e.source,
-                    })?;
-                    tally.direct.fetch_add(stats.direct, Relaxed);
-                    tally.cached.fetch_add(stats.cached, Relaxed);
-                    tally.bounced.fetch_add(stats.bounced, Relaxed);
-                }
-                Src::Host(ptr) => unsafe {
-                    std::ptr::copy_nonoverlapping(ptr.add(job.at), slot.ptr, job.len)
-                },
-                Src::Device { .. } => {}
-                Src::Zero => unreachable!("zero uses native device memset"),
-            }
-            let _queue = self.queues[lane].lock().unwrap();
-            let rc = match (job.c.src, job.c.dst) {
-                (_, Dst::Device { ptr, .. }) => unsafe {
-                    (d.memcpy_htod_async)(ptr + job.at as u64, slot.ptr.cast(), job.len, stream)
-                },
-                (Src::Device { ptr, .. }, Dst::Host { .. }) => unsafe {
-                    (d.memcpy_dtoh_async)(slot.ptr.cast(), ptr + job.at as u64, job.len, stream)
-                },
-                _ => unreachable!(),
-            };
-            slot.pending = true;
-            slot.recorded = false;
-            cuda::check("cuMemcpyAsync", rc).map_err(|e| failed(job.copy, e))?;
-            slot.done.record(stream).map_err(|e| failed(job.copy, e))?;
-            slot.recorded = true;
-            if let Dst::Host { ptr, .. } = job.c.dst {
-                slot.done.sync().map_err(|e| failed(job.copy, e))?;
-                slot.pending = false;
-                unsafe { std::ptr::copy_nonoverlapping(slot.ptr, ptr.add(job.at), job.len) };
-            }
-            tally.staged.fetch_add(job.len as u64, Relaxed);
-            Ok(())
-        })();
-        if result.is_err() {
-            self.hold_slot(slot);
-        } else {
-            self.pool.put(slot);
+        if slot.pending {
+            slot.done.sync().map_err(|e| failed(job.copy, e))?;
+            slot.pending = false;
         }
-        result
+        match job.c.src {
+            Src::File(file, offset) => {
+                let copy = Copy {
+                    src: Src::File(file, offset + job.at as u64),
+                    dst: Dst::Host {
+                        ptr: slot.ptr,
+                        len: job.len,
+                    },
+                };
+                let options = ReadOpts {
+                    threads: 1,
+                    ..opts.clone()
+                };
+                let stats = unsafe { host::fill(&[copy], &options) }.map_err(|e| Error {
+                    copy: job.copy,
+                    source: e.source,
+                })?;
+                tally.direct.fetch_add(stats.direct, Relaxed);
+                tally.cached.fetch_add(stats.cached, Relaxed);
+                tally.bounced.fetch_add(stats.bounced, Relaxed);
+            }
+            Src::Host(ptr) => unsafe {
+                std::ptr::copy_nonoverlapping(ptr.add(job.at), slot.ptr, job.len)
+            },
+            Src::Device { .. } => {}
+            Src::Zero => unreachable!("zero uses native device memset"),
+        }
+        let _queue = self.queues[lane].lock().unwrap();
+        let rc = match (job.c.src, job.c.dst) {
+            (_, Dst::Device { ptr, .. }) => unsafe {
+                (d.memcpy_htod_async)(ptr + job.at as u64, slot.ptr.cast(), job.len, stream)
+            },
+            (Src::Device { ptr, .. }, Dst::Host { .. }) => unsafe {
+                (d.memcpy_dtoh_async)(slot.ptr.cast(), ptr + job.at as u64, job.len, stream)
+            },
+            _ => unreachable!(),
+        };
+        slot.pending = true;
+        slot.recorded = false;
+        cuda::check("cuMemcpyAsync", rc).map_err(|e| failed(job.copy, e))?;
+        slot.done.record(stream).map_err(|e| failed(job.copy, e))?;
+        slot.recorded = true;
+        if let Dst::Host { ptr, .. } = job.c.dst {
+            slot.done.sync().map_err(|e| failed(job.copy, e))?;
+            slot.pending = false;
+            unsafe { std::ptr::copy_nonoverlapping(slot.ptr, ptr.add(job.at), job.len) };
+        }
+        tally.staged.fetch_add(job.len as u64, Relaxed);
+        Ok(())
     }
 }
 
