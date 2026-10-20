@@ -653,7 +653,10 @@ fn functions_of(
         table = table.note(format!("for model authors: {} (conversions)", conversions.join(", ")));
     }
     let from = from.map(|from| format!(" ({from})")).unwrap_or_default();
-    let summary = (!summary.is_empty()).then(|| format!(": {summary}")).unwrap_or_default();
+    let summary = match summary.is_empty() {
+        true => String::new(),
+        false => format!(": {summary}"),
+    };
     table.note(format!("{package} {release}{from}{summary}")).print();
     let next: Vec<String> = public
         .iter()
