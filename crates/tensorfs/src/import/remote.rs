@@ -38,6 +38,9 @@ pub struct Access {
     pub runtime: Option<tokio::runtime::Handle>,
     /// Owned by the async frontend's drop/callback guard.
     pub cancelled: Option<Arc<AtomicBool>>,
+    /// Wakes a worker driven by a caller Handle even after a current-thread caller stops
+    /// driving I/O. The owned cancel guard sets `cancelled` before notifying waiters.
+    pub cancel_notify: Option<Arc<tokio::sync::Notify>>,
     /// Extra source trust roots supplied by the caller, in DER.
     pub ca_der: Option<Vec<u8>>,
 }
@@ -62,6 +65,7 @@ impl Default for Access {
             token: None,
             runtime: None,
             cancelled: None,
+            cancel_notify: None,
             ca_der: None,
         }
     }
@@ -259,10 +263,18 @@ impl<'a> Scope<'a> {
 
     async fn until<T>(&self, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
         let mut work = std::pin::pin!(work);
+        let idle = tokio::sync::Notify::new();
+        let notify = self.cancel_notify.as_deref().unwrap_or(&idle);
         loop {
+            let wake = notify.notified();
+            let mut wake = std::pin::pin!(wake);
+            // Register before checking the flag: cancel can race the next work poll, and
+            // notify_waiters must wake Handle::block_on without the runtime I/O driver.
+            let _ = wake.as_mut().enable();
             self.check()?;
             tokio::select! {
                 biased;
+                _ = &mut wake => {},
                 answer = &mut work => { self.check()?; return answer; },
                 _ = tokio::time::sleep(Duration::from_millis(25)) => {},
             }

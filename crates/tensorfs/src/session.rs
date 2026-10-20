@@ -4,6 +4,7 @@
 //! component children own their sources and retention, independently of the Client.
 
 mod checkpoint;
+mod convert;
 mod endpoint;
 mod provider;
 mod remote;
@@ -12,6 +13,7 @@ mod writer;
 
 pub use crate::fetch::Landed as Fetched;
 pub use checkpoint::{Checkpoint, Component};
+pub use convert::{Convert, ConvertProgress};
 pub use endpoint::Endpoint;
 pub use provider::{bearer, DPoP, HeaderMap, JwtBearer, Request, TokenProvider};
 pub use writer::{ComponentWriter, PartData, Writer, WriterOptions};
