@@ -859,7 +859,12 @@ class Memory:
                 if pinned.fresh:
                     fresh.update(parts)
             if fresh and model.fill is not None:
-                model.fill(block, fresh)
+                with cuts.own_layer():  # its own allocations are caught at the op, never waiting
+                    self.local.binding = True
+                    try:
+                        model.fill(block, fresh)
+                    finally:
+                        self.local.binding = False
             _write(block, views)
             if self.limit is not None and self._free() < 0:  # mapped past the limit
                 self._make_room(0, f"limit {model.name}", model)
@@ -1078,7 +1083,8 @@ class Memory:
             self._cap()
             if self._free() >= target:  # a retry short of the room is futile: no progress
                 return True
-        return self._wait_room()
+        # a bind's page-in transform holds the lock: it never waits
+        return not getattr(self.local, "binding", False) and self._wait_room()
 
     def _here(self, device: torch.device) -> bool:
         """`device` is this memory's GPU (`cuda` alone is the current one)."""

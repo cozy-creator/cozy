@@ -448,6 +448,18 @@ def caught() -> Iterator[Layer]:
         local.layer = None
 
 
+@contextmanager
+def own_layer() -> Iterator[None]:
+    """Ops caught at the op where this thread's modes are off (a bind's page-in transform):
+    a layer of its own meanwhile."""
+    outer, _local.layer = _local.layer, None
+    try:
+        with caught():
+            yield
+    finally:
+        _local.layer = outer
+
+
 def _kept(root: nn.Module | None, paths: Sequence[str]) -> Callable[[], None]:
     """Declared state as it is now, and how to put it back (lists and dicts by their items)."""
     taken = []

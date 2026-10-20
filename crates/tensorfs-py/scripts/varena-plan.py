@@ -54,6 +54,8 @@ STATE = 930_000_000
 #: output 5376 wide; with the rest of the block, a 5.14 GB peak (12122)
 DIT_FFN = (14336, 7168, 2688)
 PASSES = {"transformer_ref": 8}
+#: a LoRA bake's temporaries as each DiT block's fresh pages arrive (12139: 20 MiB on GPU 1)
+BAKE = 20 * MIB
 LAUNCH = 48 * MIB  # a kernel's first launch: its module's device bytes
 results: list[bool] = []
 
@@ -372,6 +374,18 @@ class FFN(FeedForward):
         return x
 
 
+class Bake:
+    """The turbo LoRA baked into the DiT's fresh pages (`Declared.fill`): its temporaries are
+    allocations inside a bind."""
+
+    def __call__(self, block: object, parts: object) -> None:
+        torch.ops.varenaplan.alloc(BAKE, device=torch.device("cuda", 0))
+        CARD.allocated -= BAKE
+
+    def prepare(self) -> str:
+        return "turbo"
+
+
 class Block(nn.Module):
     def __init__(self, act: int, kernel: str) -> None:
         super().__init__()
@@ -442,7 +456,9 @@ def build(
             for i, block in enumerate(module.blocks):
                 block.act = VAE_ACT[i >= VAE_ENCODER]
         blocks = [f"blocks.{i}" for i in range(n)]
-        vars(module)["_varena"] = vt.Declared(vt.WeightGrant(ck, name, "sha256:" + "0" * 64), blocks)
+        grant = vt.WeightGrant(ck, name, "sha256:" + "0" * 64)
+        fill = Bake() if name == "transformer_ref" else None
+        vars(module)["_varena"] = vt.Declared(grant, blocks, fill=fill)
         models[name] = mem.load(module)
     LORA = models["ref2va_turbo"]
     record = mem._evicted
