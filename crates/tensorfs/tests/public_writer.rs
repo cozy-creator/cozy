@@ -905,17 +905,6 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
     let cache = scratch.0.join("cache");
     let endpoint = scratch.0.join("endpoint");
     let client = client(&cache, &endpoint);
-    assert_eq!(
-        client
-            .resolve_source(source.to_str().unwrap())
-            .await
-            .unwrap(),
-        source.canonicalize().unwrap().display().to_string()
-    );
-    assert!(
-        actual_headers(&cache.join("blobs")).is_empty(),
-        "resolve_source admitted model bytes"
-    );
     let stages = std::sync::Mutex::new(Vec::new());
     let progress = |stage: &str, held, total| {
         stages.lock().unwrap().push((stage.to_owned(), held, total));
@@ -1316,12 +1305,6 @@ fn public_conversion_without_a_tokio_caller_refuses_instead_of_starting_a_runtim
     let sources = [source.to_str().unwrap().to_owned()];
     assert_eq!(
         futures::executor::block_on(client.convert_to_cozytensors(&sources, &tensorfs::Convert::default()))
-            .unwrap_err()
-            .kind,
-        Kind::Unsupported
-    );
-    assert_eq!(
-        futures::executor::block_on(client.resolve_source(&sources[0]))
             .unwrap_err()
             .kind,
         Kind::Unsupported

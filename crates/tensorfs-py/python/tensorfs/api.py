@@ -59,10 +59,6 @@ def convert_to_cozytensors(source: str | Sequence[str], *, converter=None, varia
     )
 
 
-def resolve_source(source: str, *, token=None) -> str:
-    return _client(token=token, configured_token=False).resolve_source(source)
-
-
 def export(src, dir, *, format="safetensors", dequantize=None) -> list[str]:
     if format not in {"safetensors", "cozytensors"}:
         raise ValueError("format must be safetensors or cozytensors")

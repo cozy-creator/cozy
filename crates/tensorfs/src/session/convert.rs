@@ -118,21 +118,6 @@ impl Client {
         })
     }
 
-    /// Resolve metadata only through the existing source parser and importer transport.
-    pub async fn resolve_source(&self, source: &str) -> Result<String> {
-        let control = Arc::new(Control::default());
-        let sources = vec![source.to_owned()];
-        let access = self.import_access(&sources, &control)?;
-        let source = sources.into_iter().next().expect("one source");
-        blocking(control, None, move |_events| {
-            let spec = import::remote::parse(&source).map_err(provider::from_native)?;
-            import::remote::list(&spec, &access)
-                .map(|listing| listing.pinned)
-                .map_err(provider::from_native)
-        })
-        .await
-    }
-
     /// Convert into the managed store with the same native Writer, layouts and byte engine.
     /// Callbacks may refuse until finalization starts; an atomic commit already in progress
     /// cannot be undone by dropping its awaiting future.

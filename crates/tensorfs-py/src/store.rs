@@ -374,10 +374,6 @@ impl PyClient {
         Ok(PyCheckpoint::from_core(result.or_raise(py)?))
     }
 
-    fn resolve_source(&self, py: Python<'_>, source: &str) -> PyResult<String> {
-        py.detach(|| bridge(self.client.resolve_source(source)))
-            .or_raise(py)
-    }
 }
 
 #[pyfunction]

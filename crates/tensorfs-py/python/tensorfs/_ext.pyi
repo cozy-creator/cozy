@@ -272,7 +272,6 @@ class _Client:
     def convert_to_cozytensors(self, source: str | Sequence[str], *, converter: str | None = None,
                 variant: str | None = None,
                 progress: Callable[[str, int, int], object] | None = None) -> Checkpoint: ...
-    def resolve_source(self, source: str) -> str: ...
 
 
 class DPoP:
