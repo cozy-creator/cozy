@@ -682,14 +682,24 @@ def _empty(like: Tensor, device: torch.device) -> Tensor:
 def _output(like: Tensor, device: torch.device, name: str) -> Output:
     """Prefer device storage through every relief rung, then an admitted host destination."""
     def allocate(_: int) -> Output:
-        return _DeviceOutput(_empty(like, device))
+        # This allocation owns its exhaustion/fallback. The surrounding dispatch
+        # layer must not turn its OOM into Exhausted before this ladder sees it.
+        layer = _local.layer
+        pop = layer is not None and _get_current_dispatch_mode() is layer
+        with _pop_mode_temporarily() if pop else nullcontext():
+            return _DeviceOutput(_empty(like, device))
+
+    def finer(need: int) -> None:
+        scope = next((scope for scope in reversed(_local.scopes) if scope.finer), None)
+        if scope is not None:
+            raise Finer(scope, need)
 
     def mapped() -> Output | None:
         if not like.is_contiguous() or _capturing():
             return None
         return _served.rungs.mapped_output(like, device)
 
-    return _settle(allocate, 1, 1, int, device, name, fallback=mapped)[1]
+    return _settle(allocate, 1, 1, int, device, name, before=finer, fallback=mapped)[1]
 
 
 def _rows(x: Tensor, axis: int, first: int, last: int, value: float = 0.0) -> Tensor:
