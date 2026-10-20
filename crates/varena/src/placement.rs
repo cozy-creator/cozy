@@ -392,7 +392,10 @@ impl Placement {
     /// pages that were still protected when the wake was first processed.
     fn settle(&self) -> Result<()> {
         loop {
-            let pending = self.gpu.wait_pending()?;
+            let pending = self.gpu.prepare_pending()?;
+            // Preparation may dequeue a last pin. Publish that release and its
+            // still-pending consumer before waiting, so observers/foregrounds
+            // never need the consumer to finish just to see the new facts.
             self.refresh()?;
             if self.stop.load(Ordering::Acquire) {
                 return Ok(());
@@ -401,7 +404,7 @@ impl Placement {
             for request in requests {
                 self.drive(request, Trigger::PinReleased(request))?;
             }
-            if !pending {
+            if !self.gpu.wait_prepared(pending)? {
                 return Ok(());
             }
         }

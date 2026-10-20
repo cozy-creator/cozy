@@ -167,8 +167,8 @@ struct Mapping {
     offset: u64,
     bytes: u64,
     chunks: Vec<Chunk>,
-    ready: Option<Event>,
-    releases: Vec<Event>,
+    ready: Option<Arc<Event>>,
+    releases: Vec<Arc<Event>>,
     pins: usize,
     kept: Option<UnixStream>,
 }
@@ -326,6 +326,13 @@ struct Release {
     page: Arc<Page>,
     streams: BTreeSet<usize>,
     writable: bool,
+}
+
+/// An independently retained fence, or a fill's progress generation. Its wait
+/// is separate so placement can publish dequeued pin facts before blocking.
+pub(crate) struct Pending {
+    event: Option<Arc<Event>>,
+    fill_generation: Option<u64>,
 }
 
 /// Holds mappings, never chooses victims. The policy invokes fill/unmap with page IDs.
@@ -621,7 +628,10 @@ impl Gpu {
             self.device.stream.drain()?;
             let _context = self.device.enter()?;
             self.device.access(mapping.ptr(), mapping.bytes, true)?;
-            mapping.ready = Some(Event::record(&self.device, self.device.stream.raw())?);
+            mapping.ready = Some(Arc::new(Event::record(
+                &self.device,
+                self.device.stream.raw(),
+            )?));
             Ok(stats)
         }))
         .unwrap_or(Err(Error::Internal("page fill or transform panicked")));
@@ -720,7 +730,7 @@ impl Gpu {
                         continue;
                     }
                     match Event::record(&self.device, *stream) {
-                        Ok(event) => mapping.releases.push(event),
+                        Ok(event) => mapping.releases.push(Arc::new(event)),
                         Err(error) => {
                             drop(state);
                             // Keep the pin and all stream identities if recording fails.
@@ -805,8 +815,12 @@ impl Gpu {
     /// Wait for an actual in-flight fill or CUDA consumer fence. Live pins with
     /// no submitted completion are not guessed at and do not trigger a timer.
     pub fn wait_pending(&self) -> Result<bool> {
+        self.wait_prepared(self.prepare_pending()?)
+    }
+
+    pub(crate) fn prepare_pending(&self) -> Result<Pending> {
         self.poll()?;
-        let mut generation = self.generation.lock();
+        let generation = self.generation.lock();
         let before = *generation;
         let pages: Vec<_> = self.pages.lock().values().cloned().collect();
         let mut filling = false;
@@ -817,19 +831,33 @@ impl Gpu {
                 State::Ready(mapping) => {
                     for event in mapping.ready.iter().chain(&mapping.releases) {
                         if !event.done()? {
-                            let _context = self.device.enter()?;
-                            call!(
-                                "cuEventSynchronize",
-                                event_synchronize(event.raw as cuda::CUevent)
-                            )?;
-                            return Ok(true);
+                            return Ok(Pending {
+                                event: Some(event.clone()),
+                                fill_generation: None,
+                            });
                         }
                     }
                 }
                 _ => {}
             }
         }
-        if filling {
+        Ok(Pending {
+            event: None,
+            fill_generation: filling.then_some(before),
+        })
+    }
+
+    pub(crate) fn wait_prepared(&self, pending: Pending) -> Result<bool> {
+        if let Some(event) = pending.event {
+            // Mapping and generation guards were released by prepare_pending.
+            // The Arc keeps this exact fence alive even if a concurrent poll
+            // retires its mapping after observing completion.
+            event.synchronize()?;
+            return Ok(true);
+        }
+        if let Some(before) = pending.fill_generation {
+            let mut generation = self.generation.lock();
+            // A fill may notify between preparation/publication and this wait.
             while *generation == before {
                 self.changed.wait(&mut generation);
             }
@@ -1006,7 +1034,10 @@ impl Gpu {
             mapping.bytes += bytes;
         }
         self.device.access(mapping.ptr(), mapping.bytes, true)?;
-        mapping.ready = Some(Event::record(&self.device, self.device.stream.raw())?);
+        mapping.ready = Some(Arc::new(Event::record(
+            &self.device,
+            self.device.stream.raw(),
+        )?));
         *state = State::Ready(mapping);
         Ok(true)
     }
