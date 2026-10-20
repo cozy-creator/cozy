@@ -681,6 +681,7 @@ pub struct Frame {
     /// `checkpoint_item`: the immutable TensorFS reference Runtime committed or uploaded.
     pub repo_id: String,
     pub revision: String,
+    pub tag: String,
     pub label: String,
     pub asset_ref: String,
     pub asset_kind: String,

@@ -192,3 +192,180 @@ fn published_functions_run_to_completion_on_a_real_machine() {
         "{shown}"
     );
 }
+
+/// Canonical metadata reaches the real Hub through an ordinary owner's Endpoint. This case
+/// needs no TensorD, worker, catalog, package, or rental; its only objects are this tiny tree.
+#[test]
+fn canonical_tags_round_trip_at_a_real_hub_without_a_machine() {
+    use std::sync::Arc;
+    use tensorfs::{
+        fetch::{
+            Client, Config, Endpoint, Fetcher, Fresh, ObjectStore, Origin, SourcePolicy, Want,
+            bearer, upload_tree, with_tag,
+        },
+        format::{Dtype, Tree},
+        store::Store,
+        writer::{Data, Source},
+    };
+
+    let Some(home) = Home::with_hub() else { return };
+    let account = home.sign_in("canonical-tags@cozy.test");
+    let name = format!("{account}/canonical");
+    let url = std::env::var("TENSORHUB_ORIGIN").unwrap();
+    let ca = std::fs::read(std::env::var("TENSORHUB_CA").unwrap()).unwrap();
+    let client = Client::with_roots(
+        SourcePolicy {
+            any_host: true,
+            allow_local: true,
+            max_redirects: 5,
+            ..Default::default()
+        },
+        &ca,
+    )
+    .unwrap();
+    let owner = Arc::new(Endpoint::new(&client, &url, Some(bearer(home.token()))).unwrap());
+    let anonymous = Arc::new(Endpoint::new(&client, &url, None).unwrap().anonymous());
+    let source = Store::open(home.path().join("canonical-source")).unwrap();
+    let bytes: Vec<u8> = (0..300_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+        .collect();
+    let mut writer = source.writer(None, None).unwrap();
+    let mut model = writer
+        .component("model", "conformance.Fixture", Default::default(), None)
+        .unwrap();
+    model
+        .put(
+            "w",
+            &Dtype::U8,
+            &[bytes.len() as u64],
+            Data::Plain(Source::Read(&mut &bytes[..])),
+        )
+        .unwrap();
+    let header = writer.commit().unwrap();
+    let mut tree = Tree::default();
+    tree.set_variant("int8", header.clone());
+    let first = source.put_tree(&tree).unwrap();
+    tree.files.insert(
+        "README.md".into(),
+        source.put_bytes(b"a second commit").unwrap(),
+    );
+    let second = source.put_tree(&tree).unwrap();
+    let replay = hex::encode(Sha256::digest(b"a stable private replay identity"));
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        upload_tree(&owner, &name, &first, &source, "main")
+            .await
+            .unwrap();
+        let (private, etag) = owner.repo(&name).await.unwrap().unwrap();
+        assert_eq!(private.tags.len(), 1);
+        let main = private.tag("main").unwrap();
+        assert_eq!(main.commit, first);
+        assert!(!main.public && !main.yanked);
+        assert!(
+            anonymous.repo(&name).await.unwrap().is_none(),
+            "private refs stay private"
+        );
+        assert_eq!(
+            owner.repo_since(&name, Some(&etag)).await.unwrap(),
+            Fresh::Unchanged
+        );
+
+        owner
+            .update_repo(&name, |old| Ok(Some(with_tag(old, &name, &replay, &first))))
+            .await
+            .unwrap();
+        let (named, named_etag) = owner.repo(&name).await.unwrap().unwrap();
+        assert_eq!(named.tag(&replay).unwrap().commit, first);
+        assert!(!named.tag(&replay).unwrap().public);
+        owner.update_repo(&name, |old| Ok(old)).await.unwrap();
+        assert_eq!(
+            owner.repo(&name).await.unwrap().unwrap(),
+            (named.clone(), named_etag.clone()),
+            "an unchanged CAS preserves its ETag"
+        );
+        assert!(
+            !owner
+                .put_repo_bytes(&name, private.to_json().unwrap(), Some(&etag))
+                .await
+                .unwrap(),
+            "a stale ETag cannot erase the replay tag"
+        );
+
+        upload_tree(&owner, &name, &second, &source, "1.0")
+            .await
+            .unwrap();
+        owner
+            .update_repo(&name, |old| {
+                let mut repo = old.unwrap();
+                repo.tag_mut("1.0").unwrap().public = true;
+                repo.set_tag("2.0rc1", first.clone());
+                repo.tag_mut("2.0rc1").unwrap().public = true;
+                repo.set_tag("3.0", first.clone());
+                let yanked = repo.tag_mut("3.0").unwrap();
+                yanked.public = true;
+                yanked.yanked = true;
+                Ok(Some(repo))
+            })
+            .await
+            .unwrap();
+        let (public, _) = anonymous.repo(&name).await.unwrap().unwrap();
+        assert!(public.tags.iter().all(|tag| tag.public));
+        assert!(public.tag("main").is_none() && public.tag(&replay).is_none());
+        assert_eq!(
+            public.default_tag().unwrap().name,
+            "1.0",
+            "final versions precede prereleases; yanked tags are excluded"
+        );
+        let (owned, _) = owner.repo(&name).await.unwrap().unwrap();
+        assert_eq!(
+            owned.tag(&replay),
+            named.tag(&replay),
+            "publication preserves private replay identity and flags"
+        );
+
+        let into = Store::open(home.path().join("canonical-pulled")).unwrap();
+        let fetcher = Fetcher::new(
+            Arc::new(into.clone()) as Arc<dyn ObjectStore>,
+            client.clone(),
+            None,
+            Config::default(),
+        );
+        let public_origin: Arc<dyn Origin> = anonymous;
+        for revision in [None, Some(second.id()), Some(header.id())] {
+            let pulled = fetcher
+                .pull(
+                    &public_origin,
+                    &name,
+                    revision.as_deref(),
+                    Some("int8"),
+                    &Want::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(pulled.tree.as_ref(), Some(&second));
+            assert_eq!(pulled.header, header);
+            assert_eq!(pulled.variant, "int8");
+        }
+        fetcher.settled().await;
+        assert_eq!(
+            into.checkpoint(&header)
+                .unwrap()
+                .read("model", "w")
+                .unwrap(),
+            bytes
+        );
+        let owner_origin: Arc<dyn Origin> = owner;
+        let private = fetcher
+            .pull(
+                &owner_origin,
+                &name,
+                Some(&replay),
+                Some("int8"),
+                &Want::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(private.tree, Some(first));
+        assert_eq!(private.header, header);
+    });
+}

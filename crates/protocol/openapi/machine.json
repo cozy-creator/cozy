@@ -946,13 +946,17 @@
       },
       "CheckpointRef": {
         "type": "object",
-        "description": "A checkpoint stored by Runtime. `revision` names its immutable TensorFS tree.",
+        "description": "A checkpoint stored by Runtime. `revision` names its commit (`sha256:<tree>`); `tag` the\ntag the Runtime moved to it (empty: none).",
         "properties": {
           "repo_id": {
             "type": "string",
             "default": ""
           },
           "revision": {
+            "type": "string",
+            "default": ""
+          },
+          "tag": {
             "type": "string",
             "default": ""
           },

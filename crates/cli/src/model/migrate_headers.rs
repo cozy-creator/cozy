@@ -1,6 +1,6 @@
 //! `cozy model migrate-headers`: dev builds only (feature `migrate`, xs-053 A11; deleted once it
 //! has run). Moves models from before D10 onto it, header-only (`tensorfs::migrate::d10`):
-//! each release of lanes becomes one tree of `model.<lane>.cozytensors` at its next revision,
+//! each release of lanes becomes one tree of `model.<lane>.cozytensors` under its version,
 //! yanked releases too, and each other old checkpoint a tree of its own; run data a lane lacked
 //! comes from its family's pinned upstream. Chunks never move: only the headers, trees and small
 //! blobs the Hub lacks are sent, then the repo document is replaced under `If-Match`. Running it

@@ -3,9 +3,9 @@
 //! index and file doors, and its models as the distribution protocol serves them (xs-054): a static
 //! layout TensorFS's own `upload_tree` wrote, `GET /refs/<org>/<name>.json` and `GET`/`HEAD
 //! /blobs/…`, each blob GET redirected to another origin (`/o/<sha>` at `localhost`), as the Hub
-//! redirects to storage. Anonymous callers see releases and their closures; the owner's bearer
-//! ([`OWNER`], or those [`admit`] names) sees unreleased trees too and uploads (`PUT` of blobs
-//! and conditional refs, as TensorFS's `upload_tree` sends them); any other credential is 401.
+//! redirects to storage. Anonymous callers see public tags and their closures; the owner's bearer
+//! ([`OWNER`], or those [`admit`] names) sees private tags too and uploads (`PUT` of blobs
+//! and conditional refs); any other credential is 401.
 //! It records every request.
 #![allow(dead_code)]
 use axum::{
@@ -22,8 +22,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tensorfs::{
-    fetch::{upload_tree, Client, Endpoint, SourcePolicy},
-    format::{ObjectRef, Repo, Tree},
+    fetch::{upload_tree, Client, Endpoint, SourcePolicy, MAIN},
+    format::{repo_key, ObjectRef, Repo, Tree},
     store::Store,
 };
 
@@ -132,8 +132,8 @@ pub fn paced_models(store: &Store, models: Vec<Model>, pace: std::time::Duration
     start(store, models, None, pace)
 }
 
-/// Each model's tree uploaded from `store` into a directory endpoint at `layout`, as a release or
-/// an unreleased checkpoint: the objects anyone may read.
+/// Each model's tree uploaded from `store` into a directory endpoint at `layout`, its release a
+/// public tag, else the owner's `main`: the objects anyone may read.
 fn publish(store: &Store, models: &[Model], layout: &std::path::Path) -> HashSet<String> {
     let trees = trees(store, models);
     let named: BTreeMap<(&str, &str), &ObjectRef> =
@@ -145,11 +145,16 @@ fn publish(store: &Store, models: &[Model], layout: &std::path::Path) -> HashSet
             let client = Client::new(SourcePolicy::default());
             let endpoint = Endpoint::new(&client, &format!("file://{}", layout.display()), None).unwrap();
             for ((repository, release), tree) in &named {
-                let version = (!release.is_empty()).then_some(*release);
-                runtime.block_on(upload_tree(&endpoint, repository, tree, store, version)).unwrap();
-                if version.is_some() {
-                    public.extend(store.closure(tree).unwrap().into_iter().map(|o| o.sha256));
+                let tag = if release.is_empty() { MAIN } else { release };
+                runtime.block_on(upload_tree(&endpoint, repository, tree, store, tag)).unwrap();
+                if release.is_empty() {
+                    continue;
                 }
+                let key = layout.join(repo_key(repository));
+                let mut repo = Repo::from_json(&std::fs::read(&key).unwrap()).unwrap();
+                repo.tags.iter_mut().filter(|t| t.name == *release).for_each(|t| t.public = true);
+                std::fs::write(&key, repo.to_json().unwrap()).unwrap();
+                public.extend(store.closure(tree).unwrap().into_iter().map(|o| o.sha256));
             }
         });
     });
@@ -350,11 +355,11 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
             let Ok(bytes) = std::fs::read(served.layout.join(&p[1..])) else {
                 return absent();
             };
-            // Unreleased trees are the owner's.
+            // Private tags are the owner's.
             let mut repo = Repo::from_json(&bytes).unwrap();
             if !owner {
-                repo.checkpoints.clear();
-                if repo.releases.is_empty() {
+                repo.tags.retain(|t| t.public);
+                if repo.tags.is_empty() {
                     return absent();
                 }
             }
