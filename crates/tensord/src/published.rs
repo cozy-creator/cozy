@@ -22,8 +22,8 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Condvar, Mutex},
-    time::{Duration, Instant},
+    sync::{Arc, Mutex},
+    time::Instant,
 };
 use crate::{
     held_models::Pulled,
@@ -124,17 +124,6 @@ pub struct Prepared {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone)]
-pub enum Progress {
-    Preparing {
-        stage: String,
-        moved: u64,
-        total: u64,
-    },
-    Ready(Arc<Prepared>),
-    Failed(&'static str, String),
-}
-
 pub struct Request {
     /// The run this prepares for: a run waiting on its install is told so by this id.
     pub run: String,
@@ -228,8 +217,8 @@ pub type Observer = Box<dyn Fn(&str, u64, u64) + Send + Sync>;
 
 #[derive(Default)]
 struct Job {
-    progress: Mutex<Progress>,
-    changed: Condvar,
+    /// The stage its byte counts are reported under.
+    stage: Mutex<String>,
     observer: Option<Observer>,
     /// Its run's stop: a cancel ends its downloads and installs.
     stop: Option<Stop>,
@@ -238,24 +227,12 @@ struct Job {
     caller: String,
     waiting: Option<Box<dyn Fn(Option<String>) + Send + Sync>>,
 }
-impl Default for Progress {
-    fn default() -> Self {
-        Progress::Preparing {
-            stage: String::new(),
-            moved: 0,
-            total: 0,
-        }
-    }
-}
 impl Job {
-    fn set(&self, progress: Progress) {
-        if let (Some(observe), Progress::Preparing { stage, moved, total }) =
-            (&self.observer, &progress)
-        {
-            observe(stage, *moved, *total);
+    fn set(&self, stage: String, moved: u64, total: u64) {
+        if let Some(observe) = &self.observer {
+            observe(&stage, moved, total);
         }
-        *self.progress.lock().unwrap() = progress;
-        self.changed.notify_all();
+        *self.stage.lock().unwrap() = stage;
     }
     fn waiting(&self, reason: Option<String>) {
         if let Some(waiting) = &self.waiting {
@@ -263,23 +240,11 @@ impl Job {
         }
     }
     fn stage(&self, stage: String) {
-        self.set(Progress::Preparing {
-            stage,
-            moved: 0,
-            total: 0,
-        });
+        self.set(stage, 0, 0);
     }
     fn bytes(&self, moved: u64, total: u64) {
-        if let Progress::Preparing {
-            stage,
-            moved: m,
-            total: t,
-        } = &mut *self.progress.lock().unwrap()
-        {
-            (*m, *t) = (moved, total);
-            if let Some(observe) = &self.observer {
-                observe(stage, moved, total);
-            }
+        if let Some(observe) = &self.observer {
+            observe(&self.stage.lock().unwrap(), moved, total);
         }
     }
 }
@@ -311,7 +276,6 @@ pub struct Publisher {
     sdk: PackageSdk,
     machine: Arc<Machine>,
     store: Arc<Store>,
-    jobs: Mutex<HashMap<String, Arc<Job>>>,
     /// One maker per source: a second asker waits, then finds it held (runs 5393/5394).
     making: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// The run building each environment identity, which a second run waits for.
@@ -334,79 +298,9 @@ impl Publisher {
             sdk,
             store: machine.store().clone(),
             machine,
-            jobs: Mutex::new(HashMap::new()),
             making: Mutex::new(HashMap::new()),
             building: Mutex::new(HashMap::new()),
         }))
-    }
-
-    /// What one submission's preparation has reached. A held installation and resolution
-    /// answer at once; otherwise preparation runs in the background and this waits for its
-    /// next stage, its end, or a short while, so the client can show progress and ask again.
-    pub fn prepare(
-        self: &Arc<Self>,
-        service: &Arc<Service>,
-        actor: &str,
-        submission: &str,
-        request: Request,
-    ) -> Progress {
-        if let Ok(Some(prepared)) = self.held(service, actor, &request) {
-            return Progress::Ready(Arc::new(prepared));
-        }
-        let key = format!("{actor}\0{submission}");
-        let job = {
-            let mut jobs = self.jobs.lock().unwrap();
-            jobs.entry(key.clone())
-                .or_insert_with(|| {
-                    let job = Arc::new(Job {
-                        progress: Mutex::new(Progress::Preparing {
-                            stage: match &request.installed {
-                                Some(installed) => format!("preparing {}", installed.package),
-                                None => format!("preparing {}@{}", request.package, request.release),
-                            },
-                            moved: 0,
-                            total: 0,
-                        }),
-                        ..Default::default()
-                    });
-                    let (this, service, actor, worker) = (
-                        self.clone(),
-                        service.clone(),
-                        actor.to_string(),
-                        job.clone(),
-                    );
-                    std::thread::spawn(move || {
-                        // An update does not activate while this installs or downloads for a run.
-                        let _preparing = service.preparing();
-                        let result = this.work(&service, &actor, &request, &worker);
-                        worker.set(match result {
-                            Ok(prepared) => Progress::Ready(Arc::new(prepared)),
-                            Err((code, detail)) => Progress::Failed(code, detail),
-                        });
-                    });
-                    job
-                })
-                .clone()
-        };
-        let started = Instant::now();
-        let mut progress = job.progress.lock().unwrap();
-        let first = stage_of(&progress);
-        while matches!(&*progress, Progress::Preparing { .. })
-            && stage_of(&progress) == first
-            && started.elapsed() < Duration::from_secs(20)
-        {
-            progress = job
-                .changed
-                .wait_timeout(progress, Duration::from_secs(2))
-                .unwrap()
-                .0;
-        }
-        let answer = progress.clone();
-        drop(progress);
-        if !matches!(answer, Progress::Preparing { .. }) {
-            self.jobs.lock().unwrap().remove(&key);
-        }
-        answer
     }
 
     /// One run's preparation on the calling thread, reported through `observe`: a held
@@ -457,11 +351,7 @@ impl Publisher {
             ));
         }
         let made = self.make(&choice.source, &choice.profiles, providers, job.stop.as_ref(), &|stage, moved, total| {
-            job.set(Progress::Preparing {
-                stage: format!("{stage} for {path}"),
-                moved,
-                total,
-            })
+            job.set(format!("{stage} for {path}"), moved, total)
         })?;
         Ok(ModelGrant {
             package: installation.package.clone(),
@@ -1639,11 +1529,7 @@ fn apply_adapters(
         } else {
             // A provider-source LoRA (civitai://, hf://) is made here, normalized at ingest.
             let made = publisher.make(&adapter.source, &adapter.profiles, providers, job.stop.as_ref(), &|stage, moved, total| {
-                job.set(Progress::Preparing {
-                    stage: format!("{stage} for an adapter of {}", grant.slot),
-                    moved,
-                    total,
-                })
+                job.set(format!("{stage} for an adapter of {}", grant.slot), moved, total)
             })?;
             made.header.id()
         };
@@ -1809,13 +1695,6 @@ fn newest_release(catalog: &Catalog, org: &str, name: &str) -> Result<String, Fa
     tensorfs::format::newest_by(open, |row| row.release.as_str())
         .map(|row| row.release.clone())
         .ok_or(("release_absent", format!("{org}/{name} has no release that is not yanked")))
-}
-
-fn stage_of(progress: &Progress) -> String {
-    match progress {
-        Progress::Preparing { stage, .. } => stage.clone(),
-        _ => String::new(),
-    }
 }
 
 /// A wheel the run's Hub hosts, downloaded by its digest (`fetch_hub`) and installed from disk.
@@ -2069,6 +1948,7 @@ pub(crate) mod names_hub;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// A wheel with nothing but its metadata: `name` `version`, requiring `requires`.
     fn tiny_wheel(dir: &Path, name: &str, version: &str, requires: &[&str]) -> PathBuf {
