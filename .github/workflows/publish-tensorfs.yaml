@@ -59,15 +59,15 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - run: python3 crates/tensorfs-py/scripts/format_contract.py wheel
 
-  # Release gate (2026-10-01): weights fetched through `ensure` against a real loopback hub and object
-  # store injecting resets, stalls, truncation, 5xx/429, expired URLs and wrong bytes.
+  # Ordinary endpoint upload/download, wrong-byte rejection, callback failures and
+  # cancellation against real stores and loopback HTTP. Pull retry faults run below.
   fetch-faults:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p tensorfs --test fetch_faults -- --test-threads=2
+      - run: cargo test --locked -p tensorfs --test endpoint --test endpoint_callback_errors --test upload_control -- --test-threads=2
 
   # Release gate (run 2322): a real-HTTP hub pull whose first MiBs crawl still finishes at body throughput.
   download-tail:
@@ -76,7 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p tensorfs --lib transport::tests::tail -- --nocapture
+      - run: cargo test --locked -p tensorfs --test pull_tail cold_mibs_finish_at_about_the_body_rate -- --exact --nocapture
 
   # Release gate (xs-045): the v2 fetch path from real loopback origins; its tail (cold MiBs,
   # stalls, failures) finishes at about the body rate, and a uniformly slow fetch restarts none.
