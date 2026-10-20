@@ -1884,14 +1884,17 @@ mod gpu_tests {
         });
         drop(gate);
         observe(&ledger, "idle worker did not retire completed page", || {
+            let status = ledger.status().expect("published rows");
             placement.inner.lock().table.page(page).is_none()
-                && ledger
-                    .status()
-                    .expect("published rows")
+                && status
                     .rows
                     .iter()
-                    .filter(|row| row.pid == std::process::id())
-                    .all(|row| row.snapshot.classes.iter().all(|bytes| *bytes == 0))
+                    .find(|row| row.owner == placement.row.owner())
+                    .is_some_and(|row| row.snapshot.classes.iter().all(|bytes| *bytes == 0))
+                && status
+                    .kept
+                    .iter()
+                    .all(|(key, _)| key.fingerprint != [7; 32])
         });
         placement.end(1).expect("end request");
         placement.close().expect("close placement");
