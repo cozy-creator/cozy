@@ -751,11 +751,13 @@ impl Pool {
                 fs::create_dir_all(&learned)?;
             }
             let physical = config.inventory.iter().find(|gpu|
-                gpu.device_index.to_string() == *entry || gpu.device_uuid == *entry);
-            let placement = physical.filter(|gpu| gpu.memory_bytes > 0)
-                .map(|gpu| crate::memory::slim::Memory::create(
-                    &gpu.device_uuid, gpu.memory_bytes, config.authorized_device_limit_bytes))
-                .transpose().map_err(io::Error::other)?;
+                gpu.device_index.to_string() == *entry || gpu.device_uuid == *entry)
+                .filter(|gpu| gpu.memory_bytes > 0 && !gpu.device_uuid.is_empty())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,
+                    format!("GPU {entry} needs an inventory UUID and a nonzero memory capacity")))?;
+            let placement = Some(crate::memory::slim::Memory::create(
+                &physical.device_uuid, physical.memory_bytes, config.authorized_device_limit_bytes)
+                .map_err(io::Error::other)?);
             devices.push(Device {
                 entry: entry.clone(),
                 memory: GpuMemory::start(entry, &memory, &learned, notes.clone()).with_placement(placement),
@@ -4429,6 +4431,25 @@ mod tests {
         pool.stop().unwrap();
         drop(pool);
         crate::scratch::remove(&root);
+    }
+
+    #[test]
+    fn incomplete_inventory_fails_at_start_instead_of_queueing_forever() {
+        for inventory in [
+            json!([]),
+            json!([{"device_index":0,"device_name":"fixture","device_uuid":"",
+                "driver_version":"fixture","memory_bytes":8u64<<30,"pci_bus_id":"fixture"}]),
+            json!([{"device_index":0,"device_name":"fixture","device_uuid":"GPU-fixture",
+                "driver_version":"fixture","memory_bytes":0,"pci_bus_id":"fixture"}]),
+        ] {
+            let root = std::env::temp_dir().join(format!("missing-inventory-{}", uuid::Uuid::new_v4()));
+            let config: GpuConfig = serde_json::from_value(json!({"devices":"0",
+                "inventory":inventory,"authorized_device_limit_bytes":null,"prespawn":false})).unwrap();
+            let store = crate::storage::open(&root.join("store")).unwrap();
+            let result = Pool::new(&root.join("gpu"), config, store);
+            assert!(matches!(result, Err(ref error) if error.kind() == io::ErrorKind::InvalidInput));
+            crate::scratch::remove(&root);
+        }
     }
 
     /// A CPU scheduler fixture with explicit GPU identities/capacities. This tests queue
