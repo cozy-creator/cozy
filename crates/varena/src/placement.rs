@@ -1877,10 +1877,33 @@ impl Placement {
                         self.event(request, page, "evict", reason)?;
                     }
                     Action::ReleaseKept(page) => {
-                        let key = self.inner.lock().orphaned.get(&page).copied();
-                        if let Some(key) = key {
-                            self.channel.release_orphan(self.row.owner(), key)?;
-                            self.event(request, page, "evict", "orphan")?;
+                        let victim = {
+                            let inner = self.inner.lock();
+                            inner.orphaned.get(&page).copied().zip(
+                                inner.table.page(page).map(|facts| {
+                                    (inner.table.class(facts), facts.bytes, facts.model)
+                                }),
+                            )
+                        };
+                        if let Some((key, facts)) = victim {
+                            let released = self.channel.release_orphan(self.row.owner(), key)?;
+                            // Another owner can take the kept handle before our
+                            // release. Re-read custody in either case, and report
+                            // an eviction only for our acknowledged release.
+                            self.refresh()?;
+                            if released {
+                                Self::event_facts_locked(
+                                    &mut self.inner.lock(),
+                                    request,
+                                    page,
+                                    "evict",
+                                    "orphan",
+                                    facts,
+                                )?;
+                            }
+                            // Later actions must use the actual released bytes,
+                            // not the plan's old orphan snapshot.
+                            continue 'decide;
                         }
                     }
                     Action::Trim(page) => {
@@ -2068,12 +2091,25 @@ impl Placement {
         kind: &'static str,
         reason: &'static str,
     ) -> Result<()> {
-        let (class, bytes, model) = inner
+        let facts = inner
             .table
             .page(page)
             .map_or((Class::Free, 0, None), |facts| {
                 (inner.table.class(facts), facts.bytes, facts.model)
             });
+        Self::event_facts_locked(inner, request, page, kind, reason, facts)
+    }
+
+    /// An acknowledged removal retains its victim identity, while every total
+    /// describes the refreshed table in which that victim is already absent.
+    fn event_facts_locked(
+        inner: &mut Inner,
+        request: RequestId,
+        page: PageId,
+        kind: &'static str,
+        reason: &'static str,
+        (class, bytes, model): (Class, u64, Option<ModelId>),
+    ) -> Result<()> {
         let step = inner
             .table
             .request(request)
@@ -2445,6 +2481,87 @@ mod gpu_tests {
         trim.begin();
         trim.finish(false);
         assert_eq!(trim.pins(), 0);
+    }
+
+    #[test]
+    fn released_orphan_events_keep_victim_bytes_and_use_current_totals() {
+        let mut inner = Inner {
+            table: plan::Table {
+                capacity: 1024,
+                rows: vec![plan::Row {
+                    id: 1,
+                    alive: true,
+                    reaping: false,
+                }],
+                pages: vec![plan::Page {
+                    id: 8,
+                    row: 1,
+                    model: None,
+                    bytes: 128,
+                    tier: Tier::Gpu,
+                    kind: Kind::Weight,
+                    pins: 0,
+                    filling: false,
+                    loaded: false,
+                    last_used: 0,
+                    spread_rank: 0,
+                    uses: vec![],
+                    speculative_for: None,
+                    attempted: BTreeSet::new(),
+                    ram_ready: false,
+                    lowered: BTreeSet::new(),
+                }],
+                ..Default::default()
+            },
+            models: BTreeMap::new(),
+            requests: BTreeMap::from([(
+                9,
+                Request {
+                    steps: vec![],
+                    explicit: true,
+                    package: "orphan-events".into(),
+                    shape: "shape".into(),
+                    stats: Stats::default(),
+                    budgets: BTreeMap::new(),
+                    pass_index: 0,
+                },
+            )]),
+            caches: BTreeMap::new(),
+            orphaned: BTreeMap::new(),
+            retired: BTreeSet::new(),
+            filling: BTreeMap::new(),
+            next_page: 1,
+            progress: 40,
+            trim: None,
+            slack_trim: SlackTrim::default(),
+        };
+        // Custody's acknowledged release and refresh removed the last orphan.
+        // The event still names its original bytes, not an absent-page zero.
+        Placement::event_facts_locked(
+            &mut inner,
+            9,
+            7,
+            "evict",
+            "orphan",
+            (Class::Orphan, 512, None),
+        )
+        .unwrap();
+        Placement::event_locked(&mut inner, 9, 8, "evict", "speculation").unwrap();
+        let events = &inner.requests[&9].stats.events;
+        assert_eq!(
+            (events[0].page, events[0].bytes, events[0].class),
+            (7, 512, Class::Orphan)
+        );
+        assert_eq!(
+            events[0].resident, 128,
+            "live mapped weights must remain counted"
+        );
+        assert_eq!(events[0].orphan_bytes, 0);
+        assert_eq!(
+            events[1].orphan_bytes, 0,
+            "later actions resurrected a released orphan"
+        );
+        assert_eq!((events[0].sequence, events[1].sequence), (40, 41));
     }
 
     #[test]

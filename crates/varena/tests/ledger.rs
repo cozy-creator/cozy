@@ -540,6 +540,47 @@ fn killed_exporter_leaves_one_importable_page_and_live_eviction_leaves_none() {
 }
 
 #[test]
+fn orphan_release_acknowledges_one_winner_and_the_next_snapshot_is_current() {
+    let fixture = Fixture::new();
+    let mut producer = ChildRow::spawn(&fixture.ledger);
+    producer.call("keep");
+    producer.kill();
+    fixture.ledger.reap(producer.process.id()).unwrap();
+    let row = fixture.ledger.claim(std::process::id()).unwrap();
+    let channel = Channel::new(fixture.ledger.grant(std::process::id()).unwrap().channel);
+    assert_eq!(channel.orphans(row.owner()).unwrap(), vec![(KEY, 9)]);
+
+    // Both channels saw the orphan. A stale planner must distinguish its own
+    // acknowledged removal from a release already performed by another actor.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let actors: Vec<_> = (0..2)
+        .map(|_| {
+            let channel = Channel::new(fixture.ledger.grant(std::process::id()).unwrap().channel);
+            let ready = barrier.clone();
+            let owner = row.owner();
+            std::thread::spawn(move || {
+                ready.wait();
+                let released = channel.release_orphan(owner, KEY).unwrap();
+                // This ordered RPC is the same custody refresh placement uses
+                // before it publishes an eviction or takes the next action.
+                assert!(channel.orphans(owner).unwrap().is_empty());
+                released
+            })
+        })
+        .collect();
+    barrier.wait();
+    let mut acknowledgements: Vec<_> = actors
+        .into_iter()
+        .map(|actor| actor.join().unwrap())
+        .collect();
+    acknowledgements.sort();
+    assert_eq!(acknowledgements, vec![false, true]);
+    assert!(fixture.ledger.status().unwrap().kept.is_empty());
+    assert!(!channel.release_orphan(row.owner(), KEY).unwrap());
+    assert!(channel.orphans(row.owner()).unwrap().is_empty());
+}
+
+#[test]
 fn ram_service_fills_through_tensorfs_and_retains_a_readers_layout() {
     use std::sync::Arc;
     use tensorfs::io::{source::Item, ItemSource, ObjectRange};
