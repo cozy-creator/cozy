@@ -87,7 +87,7 @@ pub static ENCODERS: &[&Encoder] = &[
     // comfy.*
     &comfy::ASYM_W4A8_INT8,
     &comfy::W6A8_INT8,
-    &comfy::CONVROT_W4A4,
+    &comfy::INT4_CONVROT,
 ];
 
 /// An encoder: the parts of `input.encoding`, in the scheme's part order.

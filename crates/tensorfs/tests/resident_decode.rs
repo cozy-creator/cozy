@@ -194,13 +194,7 @@ fn zero_logical_output_can_still_have_a_nonempty_codebook_owner() {
     let channel = [0];
     let codebook = [16];
     let table: Vec<_> = (0..16).flat_map(|i| (i as f32).to_le_bytes()).collect();
-    let encoding = Encoding {
-        scheme: "comfy.asym_w4a8_int8".into(),
-        params: std::collections::BTreeMap::from([
-            ("group_size".into(), 16u64.into()),
-            ("rotation_size".into(), 256u64.into()),
-        ]),
-    };
+    let encoding = Encoding::comfy_asym_w4a8_int8(16, 256);
     let parts = [
         Part {
             role: "weight",
@@ -210,21 +204,21 @@ fn zero_logical_output_can_still_have_a_nonempty_codebook_owner() {
             len: 0,
         },
         Part {
-            role: "weight_s_rel",
+            role: "group_scale",
             dtype: &Dtype::F32,
             shape: &relative,
             src: Src::Host(std::ptr::null()),
             len: 0,
         },
         Part {
-            role: "weight_s_channel",
+            role: "scale",
             dtype: &Dtype::F32,
             shape: &channel,
             src: Src::Host(std::ptr::null()),
             len: 0,
         },
         Part {
-            role: "weight_codebook",
+            role: "codebook",
             dtype: &Dtype::F32,
             shape: &codebook,
             src: Src::Host(table.as_ptr()),
