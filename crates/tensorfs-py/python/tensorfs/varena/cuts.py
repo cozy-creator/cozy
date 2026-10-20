@@ -726,6 +726,29 @@ def _nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
 
+def _contiguous(func: OpOverload, args: Args, kwargs: Kwargs) -> _Plan | None:
+    """Copy logical rows to fresh contiguous storage, with only one device band staged."""
+    a = _arguments(func, args, kwargs)
+    x = a.get("self")
+    if (not isinstance(x, Tensor) or x.layout is not torch.strided
+            or torch.is_grad_enabled() or x.is_contiguous()
+            or a.get("memory_format") is not torch.contiguous_format):
+        return None
+    axes = [i for i, size in enumerate(x.shape) if size > 1]
+    if not axes:
+        return None
+    room = _served.rungs.available(x.device)
+    axis = next((i for i in axes if not room or 2 * _nbytes(x) // x.shape[i] <= room),
+                max(axes, key=lambda i: x.shape[i]))
+
+    def band(lo: int, hi: int) -> Tensor:
+        # Prefer contiguous destination bands; with less room a later axis still
+        # coalesces each bounded source instead of copying per permuted element.
+        return func(x.narrow(axis, lo, hi - lo), memory_format=torch.contiguous_format)
+
+    return _plan(_meta(func, args, kwargs), x, axis, band)
+
+
 def _conv(func: OpOverload, args: Args, kwargs: Kwargs) -> _Plan | None:
     """Output rows [a, b) read input rows [a*s - p, (b-1)*s - p + d*(k-1) + 1), zeros past the
     edges."""
@@ -824,6 +847,7 @@ def _group_norm(func: OpOverload, args: Args, kwargs: Kwargs) -> _Plan | None:
 
 _UPSAMPLES = [f"{p}{d}d" for p in ("upsample_nearest", "_upsample_nearest_exact") for d in "123"]
 _SPEC = {
+    _contiguous: "contiguous",
     _conv: "convolution conv1d conv2d conv3d",
     _pad: "constant_pad_nd pad",
     _upsample: " ".join(_UPSAMPLES),
