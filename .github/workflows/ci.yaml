@@ -24,9 +24,10 @@ jobs:
     with:
       ref: ${{ github.sha }}
       build: tensorfs
-      # The Runtime integrator's TensorFS 0.13 tags branch (xs053/runtime-tags, cozy-runtime #1646):
-      # Runtime 0.30 on the hard cut. Source pins distinguish development wheels of one version.
-      runtime_ref: f0f1bb63e6d83eb1d688debc4f1baf1eaea3ca4c
+      # The Runtime integrator's TensorFS 0.13 class-record branch (xs053/runtime-classref,
+      # cozy-runtime #1646): Runtime 0.30 on the hard cut. Source pins distinguish development
+      # wheels of one version.
+      runtime_ref: fb2bb62e65285dbd283a44dd73798b4c712deac2
       # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below. varena's
       # placement under a declared plan runs first, on the wheel with CPU torch.
       test: >-
@@ -51,4 +52,4 @@ jobs:
     with:
       # The 0.13 Hub fixture (tree refs) and the Runtime above, until this interface is released.
       tensorhub_ref: a67f65eb0aee2e1d022dbaa8eba6ae4bd17d8662
-      runtime_ref: f0f1bb63e6d83eb1d688debc4f1baf1eaea3ca4c
+      runtime_ref: fb2bb62e65285dbd283a44dd73798b4c712deac2
