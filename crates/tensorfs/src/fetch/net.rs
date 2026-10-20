@@ -136,13 +136,6 @@ impl Body {
     }
 }
 
-/// A POST's answer, read whole.
-pub(crate) struct Posted {
-    pub status: u16,
-    pub headers: HeaderMap,
-    pub body: Vec<u8>,
-}
-
 /// The client every fetch uses. Cheap to clone: clones share one connection pool.
 #[derive(Clone)]
 pub struct Client {
@@ -310,33 +303,6 @@ impl Client {
             url: url.to_string(),
             response,
             until: None,
-        })
-    }
-
-    /// POST `body` (JSON) to `url`, credentials in `headers`; redirects are not followed. The
-    /// answer is read whole, at most `cap` bytes.
-    pub(crate) async fn post(
-        &self,
-        url: &str,
-        headers: &[(String, String)],
-        body: Vec<u8>,
-        cap: u64,
-    ) -> Result<Posted> {
-        let mut headers = headers.to_vec();
-        headers.push(("content-type".into(), "application/json".into()));
-        let mut answer = (self.send("POST", url, &headers, Some(Body::Bytes(body.into())))).await?;
-        let (status, headers) = (answer.status(), answer.response.headers().clone());
-        let mut body = Vec::new();
-        while let Some(frame) = answer.frame().await? {
-            body.extend_from_slice(&frame);
-            if body.len() as u64 > cap {
-                return refuse(Code::SIZE_CAP, format!("{url}: over {cap} B"));
-            }
-        }
-        Ok(Posted {
-            status,
-            headers,
-            body,
         })
     }
 }

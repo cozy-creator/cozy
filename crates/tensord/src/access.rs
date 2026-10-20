@@ -1,7 +1,7 @@
 //! What a call's weights are prefetched under (one-request-kind §2.7). TensorD chooses each
 //! slot's checkpoint, lands its structure and wants its chunks ahead of the call; the Runtime
-//! reads them through TensorFS. A release is read anonymously, the owner's checkpoint by hash
-//! under the run's capability. Its checkpoints stay open, so the store keeps their bytes, until
+//! reads them through TensorFS, at the run's Hub under its request's bearer when it carries one.
+//! Its checkpoints stay open, so the store keeps their bytes, until
 //! the call ends (or its run is canceled): then what it wanted drops.
 use crate::{
     held_models::Pulled,
@@ -21,15 +21,13 @@ use tensorfs::{
     store::Checkpoint,
 };
 
-/// Where `header`, a checkpoint this machine pulled from `source`'s Hub, comes from: the Hub
-/// names its tree as the store's ref records (`held_models::Pulled`). None for one never
-/// pulled (local).
+/// Where `header`, a checkpoint this machine pulled from a Hub (`held_models::Pulled`), comes
+/// from: `source`'s Hub. None for one never pulled (local).
 pub fn remote(machine: &Machine, source: &hub::Source, header: &ObjectRef) -> io::Result<Option<Remote>> {
-    let Some(pulled) = Pulled::of(machine.store(), header)? else {
+    if Pulled::of(machine.store(), header)?.is_none() {
         return Ok(None);
-    };
-    let found = origin::remote(machine, source, &pulled.repository, &pulled.release, &pulled.lane, &pulled.tree);
-    found.map(|(remote, _)| Some(remote)).map_err(|(_, why)| io::Error::other(why))
+    }
+    origin::remote(machine, source).map(Some).map_err(io::Error::other)
 }
 
 /// The checkpoint `id` (`sha256:<hex>`), its structure here.
@@ -64,7 +62,8 @@ pub fn failed(refusal: Refusal) -> io::Error {
 /// One call's fetches: its checkpoints, where each comes from, and what it wants held.
 pub struct Fetch {
     machine: Arc<Machine>,
-    hub: Option<hub::Source>,
+    /// Where its checkpoints come from; anonymous once its request has ended (`detach`).
+    hub: Mutex<Option<hub::Source>>,
     /// Its schedules' order: the root run's acceptance, or after every run (no run).
     order: u64,
     stop: Stop,
@@ -80,7 +79,7 @@ impl Fetch {
     pub fn new(machine: Arc<Machine>, hub: Option<hub::Source>, order: u64) -> Arc<Self> {
         Arc::new(Self {
             machine,
-            hub,
+            hub: Mutex::new(hub),
             order,
             stop: Stop::default(),
             kept: Mutex::default(),
@@ -95,10 +94,17 @@ impl Fetch {
 
     /// Where the absent objects of `header` come from.
     fn source(&self, header: &ObjectRef) -> io::Result<Option<Remote>> {
-        let Some(hub) = self.hub.as_ref() else {
+        let Some(hub) = self.hub.lock().unwrap().clone() else {
             return Ok(None);
         };
-        remote(&self.machine, hub, header)
+        remote(&self.machine, &hub, header)
+    }
+
+    /// It outlives its request (a warm set's member): what it starts from now on is read
+    /// anonymously, while transfers already started finish under the request's bearer.
+    pub fn detach(&self) {
+        let mut hub = self.hub.lock().unwrap();
+        *hub = hub.as_ref().map(hub::Source::anonymous);
     }
 
     /// `previous` (a run's preparation's fetches) ends with the call.

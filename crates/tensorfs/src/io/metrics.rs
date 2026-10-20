@@ -1,6 +1,7 @@
 //! What TensorFS copies are measured against: a GPU's pinned host→device bandwidth (best of 1,
 //! 2 and 4 streams) and PCIe link, and a volume's O_DIRECT read (`probe`). Ceilings are kept per
-//! boot (`probe::keep`), the GPU's by UUID and driver. Every copy run lands in one log (`take`).
+//! boot (`probe::keep`), the GPU's by UUID and driver. Reads never measure one (`io::ceiling`
+//! does); a run faster than its ceiling raises it. Every copy run lands in one log (`take`).
 
 use std::ffi::c_void;
 use std::fs::File;
@@ -52,17 +53,39 @@ pub fn take() -> Vec<Copy> {
     std::mem::take(&mut LOG.lock().unwrap())
 }
 
-/// A run of host reads from `files`, logged against its volume's kept ceiling. A run past the
-/// page cache of at least a probe's worth that beat that ceiling raises it: the volume reached it.
+/// A run of reads from `files`, logged against its volume's kept ceiling. Only a run the page
+/// cache had no part in measures the volume: one of a probe's size seeds the ceiling, any that
+/// beats it raises it. A run that read cached bytes is logged unmeasured (ceiling 0).
 pub(crate) fn disk_run(files: &[&File], bytes: u64, ns: u64, direct: u64, cached: u64) {
     let Some(volume) = files.first().and_then(|f| f.metadata().ok()).map(|m| volume(m.dev())) else {
         return;
     };
-    if direct >= probe::KEEP && cached == 0 {
-        probe::disk_keep(volume, (direct as f64 / ns.max(1) as f64, true));
+    let rate = direct as f64 / ns.max(1) as f64;
+    let kept = probe::disk_known(volume).map(|(gbps, _)| gbps);
+    let measures = cached == 0 && (direct >= probe::KEEP || kept.is_some_and(|k| rate > k));
+    if measures {
+        probe::disk_keep(volume, (rate, true));
     }
-    let ceiling = probe::disk_known(volume).map_or(0.0, |(gbps, _)| gbps);
+    let ceiling = match (cached, kept) {
+        (0, Some(k)) => k.max(rate),
+        (0, None) if measures => rate,
+        _ => 0.0,
+    };
     record(Copy { kind: "disk", gpu: -1, bytes, ns, cached, ceiling, ..Default::default() });
+}
+
+/// A run of copies to GPU `c.gpu`, logged against its kept H2D ceiling (0 until `io::ceiling`
+/// measures it); a run faster than that ceiling raises it.
+pub(crate) fn h2d_run(mut c: Copy) {
+    let key = h2d_key(c.gpu);
+    if let Some(kept) = key.as_deref().and_then(probe::known) {
+        let rate = c.bytes as f64 / c.ns.max(1) as f64;
+        if rate > kept[0] {
+            probe::keep(key.as_deref().unwrap(), &[rate, kept.get(1).copied().unwrap_or(1.0)]);
+        }
+        c.ceiling = kept[0].max(rate);
+    }
+    record(c);
 }
 
 /// A `st_dev` as `durable::device` names its volume.
@@ -129,22 +152,31 @@ pub fn device_link(device: i32) -> Option<Link> {
     ))
 }
 
-/// Pinned host→device GB/s on CUDA device `device`, and the streams that reached it: measured
-/// once per GPU and driver, on its primary context.
+/// Pinned host→device GB/s on CUDA device `device`, and the streams that reached it: kept this
+/// boot, else measured on its primary context.
 pub fn h2d(device: i32) -> Option<(f64, u32)> {
-    let (dev, ctx) = cuda::primary_context(device).ok()?;
-    let retained = PrimaryContext(dev);
-    let _c = cuda::CtxGuard::enter(ctx).ok()?;
-    let driver = std::fs::read_to_string("/sys/module/nvidia/version").unwrap_or_default();
-    let key = format!("h2d {} {}", cuda::uuid(dev).ok()?, driver.trim());
+    let key = h2d_key(device)?;
     if let Some(&[gbps, streams]) = probe::known(&key).as_deref() {
         return Some((gbps, streams as u32));
     }
+    let (dev, ctx) = cuda::primary_context(device).ok()?;
+    let retained = PrimaryContext(dev);
+    let _c = cuda::CtxGuard::enter(ctx).ok()?;
     let (gbps, streams) = measure_h2d(device, ctx, retained)
         .inspect_err(|e| tracing::warn!("tensorfs: no H2D ceiling: {e}"))
         .ok()?;
     probe::keep(&key, &[gbps, streams as f64]);
     Some((gbps, streams))
+}
+
+/// A GPU's ceiling key: its UUID and the driver.
+fn h2d_key(device: i32) -> Option<String> {
+    let d = cuda::driver().ok()?;
+    let mut dev = 0;
+    // SAFETY: driver out-param; an invalid ordinal returns an error.
+    cuda::check("cuDeviceGet", unsafe { (d.device_get)(&mut dev, device) }).ok()?;
+    let driver = std::fs::read_to_string("/sys/module/nvidia/version").unwrap_or_default();
+    Some(format!("h2d {} {}", cuda::uuid(dev).ok()?, driver.trim()))
 }
 
 struct PrimaryContext(i32);

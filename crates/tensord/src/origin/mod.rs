@@ -3,7 +3,7 @@
 //! GETs, every object verified as the store admits it. TensorD's threads are synchronous; each
 //! call here blocks on the fetch runtime and ends early when its [`Stop`] is cancelled.
 //!
-//! - [`hub`]: TensorFS's `TensorhubOrigin` under the run's Cozy credentials.
+//! - [`hub`]: TensorFS's distribution `Endpoint` at the run's Hub, under its request's bearer.
 mod hub;
 
 use std::{
@@ -17,11 +17,11 @@ use std::{
 use tensorfs::{
     err::{refuse, Code, Refusal, Result},
     fetch::{Client, Config, Fetcher, Landed, Origin, Progress, Pulled, SourcePolicy, VolumeOrigin, Want},
-    format::ObjectRef,
+    format::{ObjectRef, Tree},
     store::Store,
 };
 
-pub use hub::{remote, resolve_hash, resolve_named, Resolved};
+pub use hub::{object, release, remote};
 
 use crate::stop::Stop;
 
@@ -74,7 +74,7 @@ impl Machine {
         &self.store
     }
 
-    /// The client objects of a remote with this trust are fetched over (for an `HttpOrigin`).
+    /// The client objects of a remote with this trust are fetched over (for an `Endpoint`).
     pub fn client(&self, trust: Option<&Arc<Vec<u8>>>, local: bool) -> Result<Client> {
         Ok(self.fetcher(&(trust.cloned(), local))?.client().clone())
     }
@@ -122,17 +122,16 @@ impl Machine {
         answer.recv().unwrap_or_else(|_| refuse(Code::TRANSFER_FAILED, "the fetch runtime ended"))
     }
 
-    /// `variant` of `tree` (its only one when `None`): its name and header, the tree document
-    /// landed here (its repo files are not: nothing on a machine reads them).
-    pub fn variant(&self, remote: &Remote, tree: &ObjectRef, variant: Option<&str>, stop: &Stop) -> Result<(String, ObjectRef)> {
+    /// The tree document `tree`, landed here (its repo files are not: nothing on a machine reads
+    /// them).
+    pub fn tree(&self, remote: &Remote, tree: &ObjectRef, stop: &Stop) -> Result<Tree> {
         let (fetcher, store, origin) = (self.of(remote)?, self.store.clone(), remote.origin.clone());
-        let (tree, variant) = (tree.clone(), variant.map(str::to_owned));
+        let tree = tree.clone();
         self.block(stop, async move {
             fetcher.objects(&origin, std::slice::from_ref(&tree), &Want { priority: priority::NOW, ..Want::default() }).await?;
-            let tree = tokio::task::spawn_blocking(move || store.tree(&tree).map_err(|e| e.refusal()))
+            tokio::task::spawn_blocking(move || store.tree(&tree).map_err(|e| e.refusal()))
                 .await
-                .map_err(|e| Refusal { code: Code::IO_FAILED, detail: e.to_string() })??;
-            tensorfs::fetch::variant_of_tree(&tree, variant.as_deref())
+                .map_err(|e| Refusal { code: Code::IO_FAILED, detail: e.to_string() })?
         })
     }
 

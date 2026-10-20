@@ -282,17 +282,6 @@ impl Store {
             }
         }
     }
-
-    /// Every store follows the one regime. TensorD still calls these two; delete them with it.
-    #[doc(hidden)]
-    pub fn with_cache(self) -> Store {
-        self
-    }
-
-    #[doc(hidden)]
-    pub fn cache_ref(&self, _: &Repo) -> Result<()> {
-        Ok(())
-    }
 }
 
 /// `local/` repos are never evicted.

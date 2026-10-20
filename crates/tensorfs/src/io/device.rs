@@ -720,28 +720,31 @@ pub(super) unsafe fn fill(
     let mut total = ReadStats::default();
     for ((device, kind), copies) in groups {
         let engine = Engine::get(device).map_err(|e| failed(copies[0].0, e))?;
-        #[cfg(unix)]
-        let ceiling = if kind == "h2d" {
-            super::metrics::h2d(device).map_or(0.0, |c| c.0)
-        } else {
-            0.0
-        };
         let start = Instant::now();
         let stats = engine.run(&copies, opts, staged_host)?;
         #[cfg(unix)]
-        super::metrics::record(super::metrics::Copy {
-            kind,
-            gpu: device,
-            bytes: copies.iter().map(|(_, c)| c.dst.len() as u64).sum(),
-            ns: start.elapsed().as_nanos() as u64,
-            ceiling,
-            link: super::metrics::device_link(device)
-                .map_or_else(String::new, |link| link.to_string()),
-            busy_ns: stats.busy_ns,
-            pin_ns: stats.pin_ns,
-            staged: stats.staged,
-            cached: stats.cached,
-        });
+        {
+            let ns = start.elapsed().as_nanos() as u64;
+            let plain: Vec<Copy> = copies.iter().map(|&(_, c)| c).collect();
+            super::disk_run(&plain, &stats, ns);
+            let run = super::metrics::Copy {
+                kind,
+                gpu: device,
+                bytes: copies.iter().map(|(_, c)| c.dst.len() as u64).sum(),
+                ns,
+                link: super::metrics::device_link(device)
+                    .map_or_else(String::new, |link| link.to_string()),
+                busy_ns: stats.busy_ns,
+                pin_ns: stats.pin_ns,
+                staged: stats.staged,
+                cached: stats.cached,
+                ..Default::default()
+            };
+            match kind {
+                "h2d" => super::metrics::h2d_run(run),
+                _ => super::metrics::record(run),
+            }
+        }
         #[cfg(not(unix))]
         let _ = (kind, start);
         total.direct += stats.direct;

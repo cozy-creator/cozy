@@ -102,7 +102,7 @@ impl Fixture {
             publisher: Some(publisher),
             local: None,
             own_hub: None,
-            leaf: None,
+           
             contexts: Default::default(),
         });
         Self {
