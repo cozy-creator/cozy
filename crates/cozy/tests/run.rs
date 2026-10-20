@@ -192,6 +192,13 @@ fn the_grammar_refuses_what_it_cannot_run() {
             "{args:?}: {out:?}"
         );
     }
+    // No GPUs is not a count: the refusal says where a run takes the CPU.
+    let cpu = home.cozy(["run", "fidika/sdxl/generate", "--gpus", "0", "--json"]);
+    let message = cpu.refusal()["message"].to_string();
+    assert!(
+        cpu.code == 2 && message.contains("accelerator=False") && message.contains("--on new:cpu"),
+        "{cpu:?}"
+    );
 }
 
 #[test]

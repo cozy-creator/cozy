@@ -551,7 +551,7 @@ impl LocalSources {
 fn installer_refusal(error: protocol::error::Error) -> Refused {
     let code = match error.code.as_str() {
         crate::published::CANCELED => crate::published::CANCELED,
-        "package_installation_stalled" => "package_installation_stalled",
+        "no_progress" => "no_progress",
         _ => "package_installation_failed",
     };
     refused(code, error.message)

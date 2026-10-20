@@ -315,7 +315,7 @@ fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&Stop>, 
         crate::process::Supervised::Canceled => {
             return Err(Error::conflict(crate::published::CANCELED, "the run was canceled while its package installed"))
         }
-        crate::process::Supervised::Wedged(verdict) => return Err(Error::conflict("package_installation_stalled", verdict)),
+        crate::process::Supervised::Wedged(verdict) => return Err(Error::conflict("no_progress", verdict)),
     };
     let tail = tail.join().unwrap_or_default();
     if !exited.success() {
