@@ -14,10 +14,11 @@ use std::ffi::{c_int, c_void};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crossbeam_queue::SegQueue;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use tensorfs::io::cuda::{self, AccessDesc, AllocationProp, CtxGuard, Handle};
 use tensorfs::io::source::{IoTally, Item, Mode, Source};
 use tensorfs::io::{self, Dst, ReadStats};
@@ -307,6 +308,7 @@ struct Page {
     origin: u64,
     fingerprint: String,
     state: Mutex<State>,
+    retired: AtomicBool,
 }
 
 struct Release {
@@ -319,6 +321,9 @@ pub struct Gpu {
     device: Arc<Device>,
     pages: Mutex<BTreeMap<PageId, Arc<Page>>>,
     releases: SegQueue<Release>,
+    generation: Mutex<u64>,
+    changed: Condvar,
+    wakeup: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Gpu {
@@ -350,6 +355,9 @@ impl Gpu {
                 }),
                 pages: Mutex::new(BTreeMap::new()),
                 releases: SegQueue::new(),
+                generation: Mutex::new(0),
+                changed: Condvar::new(),
+                wakeup: Mutex::new(None),
             })
         })();
         if setup.is_err() {
@@ -415,8 +423,8 @@ impl Gpu {
         let g = self.device.granularity;
         if !Arc::ptr_eq(&range.device, &self.device)
             || bytes == 0
-            || offset % g != 0
-            || bytes % g != 0
+            || !offset.is_multiple_of(g)
+            || !bytes.is_multiple_of(g)
             || offset
                 .checked_add(bytes)
                 .is_none_or(|end| end > range.bytes)
@@ -447,6 +455,7 @@ impl Gpu {
                 origin,
                 fingerprint,
                 state: Mutex::new(State::Empty),
+                retired: AtomicBool::new(false),
             }),
         );
         Ok(())
@@ -503,6 +512,9 @@ impl Gpu {
         }
         {
             let mut state = page.state.lock();
+            if page.retired.load(Ordering::Acquire) {
+                return Err(invalid("page is retired"));
+            }
             if !matches!(*state, State::Empty) {
                 return Err(invalid("page is not empty"));
             }
@@ -516,6 +528,7 @@ impl Gpu {
             Ok(mapping) => mapping,
             Err(error) => {
                 *page.state.lock() = State::Empty;
+                self.notify();
                 return Err(error);
             }
         };
@@ -556,7 +569,7 @@ impl Gpu {
         }))
         .unwrap_or(Err(Error::Internal("page fill or transform panicked")));
         let mut state = page.state.lock();
-        match result {
+        let result = match result {
             Ok(stats) => {
                 *state = State::Ready(mapping);
                 Ok(stats)
@@ -565,13 +578,19 @@ impl Gpu {
                 *state = State::Failed(mapping, error.clone());
                 Err(error)
             }
-        }
+        };
+        drop(state);
+        self.notify();
+        result
     }
 
     pub fn bind(self: &Arc<Self>, id: PageId, stream: usize) -> Result<Pin> {
         self.poll()?;
         let page = self.page(id)?;
         let mut state = page.state.lock();
+        if page.retired.load(Ordering::Acquire) {
+            return Err(invalid("page is retired"));
+        }
         let mapping = match &mut *state {
             State::Ready(mapping) => mapping,
             State::Failed(_, error) => return Err(error.clone()),
@@ -596,10 +615,26 @@ impl Gpu {
 
     /// Apply queued pin releases on a CUDA-capable thread, not in a Python finalizer.
     pub fn poll(&self) -> Result<()> {
+        let mut changed = false;
         while let Some(release) = self.releases.pop() {
             let mut state = release.page.state.lock();
             if let State::Ready(mapping) = &mut *state {
                 for stream in &release.streams {
+                    if *stream == 2 {
+                        // CUDA's per-thread default sentinel cannot be replayed on
+                        // this cleanup thread. A checked context drain covers the
+                        // original thread's work before the pin can be released.
+                        let completion = self
+                            .device
+                            .enter()
+                            .and_then(|_context| call!("cuCtxSynchronize", ctx_synchronize()));
+                        if let Err(error) = completion {
+                            drop(state);
+                            self.releases.push(release);
+                            return Err(error);
+                        }
+                        continue;
+                    }
                     match Event::record(&self.device, *stream) {
                         Ok(event) => mapping.releases.push(event),
                         Err(error) => {
@@ -612,9 +647,93 @@ impl Gpu {
                     }
                 }
                 mapping.pins = mapping.pins.saturating_sub(1);
+                changed = true;
             }
         }
+        let candidates: Vec<_> = self
+            .pages
+            .lock()
+            .iter()
+            .filter(|(_, page)| page.retired.load(Ordering::Acquire))
+            .map(|(id, page)| (*id, page.clone()))
+            .collect();
+        for (id, page) in candidates {
+            let mut state = page.state.lock();
+            let removable = match &mut *state {
+                State::Empty => true,
+                State::Ready(mapping) if mapping.pins == 0 => {
+                    if mapping.idle()? {
+                        mapping.release(true)?;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if removable {
+                *state = State::Empty;
+                self.pages.lock().remove(&id);
+                changed = true;
+            }
+        }
+        if changed {
+            self.notify();
+        }
         Ok(())
+    }
+
+    /// The coordinator installs a nonblocking wake (normally an eventfd write).
+    /// It must capture the coordinator weakly, and never run a decision inline.
+    pub fn set_wakeup(&self, wakeup: Arc<dyn Fn() + Send + Sync>) {
+        *self.wakeup.lock() = Some(wakeup);
+    }
+
+    fn notify(&self) {
+        let mut generation = self.generation.lock();
+        *generation = generation.wrapping_add(1);
+        self.changed.notify_all();
+        drop(generation);
+        let wakeup = self.wakeup.lock().clone();
+        if let Some(wakeup) = wakeup {
+            let _ = catch_unwind(AssertUnwindSafe(|| wakeup()));
+        }
+    }
+
+    /// Wait for an actual in-flight fill or CUDA consumer fence. Live pins with
+    /// no submitted completion are not guessed at and do not trigger a timer.
+    pub fn wait_pending(&self) -> Result<bool> {
+        self.poll()?;
+        let mut generation = self.generation.lock();
+        let before = *generation;
+        let pages: Vec<_> = self.pages.lock().values().cloned().collect();
+        let mut filling = false;
+        for page in pages {
+            let state = page.state.lock();
+            match &*state {
+                State::Filling => filling = true,
+                State::Ready(mapping) => {
+                    for event in mapping.ready.iter().chain(&mapping.releases) {
+                        if !event.done()? {
+                            let _context = self.device.enter()?;
+                            call!(
+                                "cuEventSynchronize",
+                                event_synchronize(event.raw as cuda::CUevent)
+                            )?;
+                            return Ok(true);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if filling {
+            while *generation == before {
+                self.changed.wait(&mut generation);
+            }
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// False means the page remains protected by a fill, view, or consumer event.
@@ -641,6 +760,20 @@ impl Gpu {
                 Ok(true)
             }
         }
+    }
+
+    /// Closing a model prevents new users immediately, but an existing view keeps
+    /// its exact source/address until its last consumer fence finishes.
+    pub fn unregister(&self, id: PageId) -> Result<bool> {
+        let page = self.pages.lock().get(&id).cloned();
+        let Some(page) = page else {
+            return Ok(true);
+        };
+        page.retired.store(true, Ordering::Release);
+        self.poll()?;
+        let done = !self.pages.lock().contains_key(&id);
+        self.notify();
+        Ok(done)
     }
 
     /// Each receiving socket contains one exported allocation. Draining it on unmap
@@ -708,7 +841,7 @@ impl Gpu {
         if spans.is_empty()
             || spans
                 .iter()
-                .any(|n| *n == 0 || *n % self.device.granularity != 0)
+                .any(|n| *n == 0 || !n.is_multiple_of(self.device.granularity))
             || spans.iter().try_fold(0u64, |sum, n| sum.checked_add(*n)) != Some(page.bytes)
         {
             return Ok(false);
@@ -794,12 +927,18 @@ impl Gpu {
     pub fn facts(&self) -> Result<Vec<(PageId, u64, usize, bool)>> {
         self.poll()?;
         let mut facts = Vec::new();
-        for (id, page) in self.pages.lock().iter() {
+        let pages: Vec<_> = self
+            .pages
+            .lock()
+            .iter()
+            .map(|(id, page)| (*id, page.clone()))
+            .collect();
+        for (id, page) in pages {
             facts.push(match &mut *page.state.lock() {
-                State::Empty => (*id, 0, 0, false),
-                State::Filling => (*id, page.bytes, 0, true),
-                State::Ready(mapping) => (*id, mapping.bytes, mapping.pins, !mapping.idle()?),
-                State::Failed(mapping, _) => (*id, mapping.bytes, mapping.pins, true),
+                State::Empty => (id, 0, 0, false),
+                State::Filling => (id, page.bytes, 0, true),
+                State::Ready(mapping) => (id, mapping.bytes, mapping.pins, !mapping.idle()?),
+                State::Failed(mapping, _) => (id, mapping.bytes, mapping.pins, true),
             });
         }
         Ok(facts)
@@ -855,5 +994,6 @@ impl Drop for Pin {
             page: self.page.clone(),
             streams: self.streams.get_mut().clone(),
         });
+        self.gpu.notify();
     }
 }

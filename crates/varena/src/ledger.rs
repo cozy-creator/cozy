@@ -19,9 +19,10 @@ use platform::shm::{self, Region};
 
 use crate::plan::Class;
 use crate::{Error, Result};
+use tensorfs::format::ObjectRef;
 use tensorfs::io::{
     source::{IoTally, Item, Mode, Source},
-    Dst,
+    Dst, ItemSource, ObjectRange,
 };
 
 pub const ROWS: usize = 64;
@@ -294,14 +295,13 @@ impl Table {
                 let context = data.get(CLASSES).copied().unwrap_or(0);
                 let count = data.get(CLASSES + 1).copied().unwrap_or(0) as usize;
                 let requests = data
+                    .get(CLASSES + 2..)
+                    .unwrap_or(&[])
+                    .as_chunks::<2>()
+                    .0
                     .iter()
-                    .skip(CLASSES + 2)
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .chunks_exact(2)
                     .take(count.min(RUNNING))
-                    .filter_map(|r| r.first().zip(r.get(1)))
-                    .map(|(id, bytes)| Running {
+                    .map(|[id, bytes]| Running {
                         id: *id,
                         remaining: (*bytes != u64::MAX).then_some(*bytes),
                     })
@@ -778,48 +778,7 @@ impl Ledger {
         source: Arc<Source>,
         regions: Vec<RamRegion>,
     ) -> Result<bool> {
-        let ram = Arc::new(Ram::new(regions)?);
-        let mut custody = self.custody.lock();
-        if custody.ram.contains_key(&layout) {
-            return Ok(false);
-        }
-        let (fill, table) = (ram.clone(), self.table.clone());
-        std::thread::Builder::new()
-            .name("varena-ram".into())
-            .spawn(move || {
-                for (region, ready) in fill.regions.iter().zip(&fill.ready) {
-                    // SAFETY: validated nonoverlapping ranges in this worker's writable mapping.
-                    let result = unsafe {
-                        source.read_items(
-                            &region.items,
-                            region.offset,
-                            Dst::Host {
-                                ptr: (fill.base + region.offset as usize) as *mut u8,
-                                len: region.len as usize,
-                            },
-                            1,
-                            Mode::Cache,
-                            &IoTally::default(),
-                        )
-                    };
-                    match result {
-                        Ok(_) => {
-                            ready.store(true, Release);
-                            table.changed();
-                        }
-                        Err(error) => tracing::warn!(%error, "RAM region remains on disk"),
-                    }
-                }
-            })
-            .map_err(|e| io("start RAM fill", e))?;
-        custody.ram.insert(
-            layout,
-            RamHeld {
-                layout: ram,
-                readers: Vec::new(),
-            },
-        );
-        Ok(true)
+        register_ram(&self.table, &self.custody, layout, source, regions)
     }
     /// Explicit pressure reclamation: never drops a layout with a live reader lease.
     pub fn release_ram(&self, layout: [u8; 32]) -> bool {
@@ -827,7 +786,7 @@ impl Ledger {
         let idle = custody.ram.get_mut(&layout).is_some_and(|held| {
             held.readers
                 .retain(|reader| !platform::handles::hung_up(reader));
-            held.readers.is_empty()
+            held.readers.is_empty() && !held.layout.filling.load(Acquire)
         });
         if idle {
             custody.ram.remove(&layout);
@@ -869,18 +828,15 @@ impl Row {
         if let Some(dst) = data.get_mut(CLASSES + 1) {
             *dst = snapshot.requests.len() as u64;
         }
-        for (pair, request) in data
-            .iter_mut()
-            .skip(CLASSES + 2)
-            .collect::<Vec<_>>()
-            .chunks_mut(2)
-            .zip(&snapshot.requests)
-        {
-            if let Some(id) = pair.first_mut() {
-                **id = request.id;
-            }
-            if let Some(left) = pair.get_mut(1) {
-                **left = request.remaining.unwrap_or(u64::MAX);
+        if let Some(requests) = data.get_mut(CLASSES + 2..) {
+            for ([id, left], request) in requests
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(&snapshot.requests)
+            {
+                *id = request.id;
+                *left = request.remaining.unwrap_or(u64::MAX);
             }
         }
         let seq = slot.seq.load(Relaxed);
@@ -902,32 +858,50 @@ impl Row {
         self.table.changed();
         Ok(())
     }
-    pub fn wait_ask(&self, stop: &AtomicBool) -> Result<Option<Ask>> {
+    /// Wait for one changed bell. Non-ask wakes let the owner poll completed GPU events
+    /// and pin releases on the same worker; `seen` must persist across calls.
+    pub fn wait_event(&self, seen: &mut u32, stop: &AtomicBool) -> Result<Option<Ask>> {
         let slot = self.table.slot(self.owner)?;
+        if stop.load(Acquire) {
+            return Ok(None);
+        }
+        let current = slot.bell.load(Acquire);
+        if current == *seen {
+            wait(&slot.bell, current);
+        }
+        *seen = slot.bell.load(Acquire);
+        if stop.load(Acquire) {
+            return Ok(None);
+        }
+        for ceiling in Class::ALL {
+            let index = ceiling.as_usize();
+            let (asked, handled) = slot
+                .asked
+                .get(index)
+                .zip(slot.handled.get(index))
+                .ok_or_else(|| Error::Invalid("invalid class ceiling".into()))?;
+            let (sequence, done) = (asked.load(Acquire), handled.load(Acquire));
+            if sequence > done {
+                slot.wakeups.fetch_add(1, Release);
+                self.table.changed();
+                return Ok(Some(Ask {
+                    ceiling,
+                    bytes: sequence - done,
+                    sequence,
+                }));
+            }
+        }
+        Ok(None)
+    }
+    pub fn wait_ask(&self, stop: &AtomicBool) -> Result<Option<Ask>> {
+        let mut seen = 0;
         loop {
-            let before = slot.bell.load(Acquire);
+            if let Some(ask) = self.wait_event(&mut seen, stop)? {
+                return Ok(Some(ask));
+            }
             if stop.load(Acquire) {
                 return Ok(None);
             }
-            for ceiling in Class::ALL {
-                let index = ceiling.as_usize();
-                let (asked, handled) = slot
-                    .asked
-                    .get(index)
-                    .zip(slot.handled.get(index))
-                    .ok_or_else(|| Error::Invalid("invalid class ceiling".into()))?;
-                let (sequence, done) = (asked.load(Acquire), handled.load(Acquire));
-                if sequence > done {
-                    slot.wakeups.fetch_add(1, Release);
-                    self.table.changed();
-                    return Ok(Some(Ask {
-                        ceiling,
-                        bytes: sequence - done,
-                        sequence,
-                    }));
-                }
-            }
-            wait(&slot.bell, before);
         }
     }
     /// Wake a blocked reclaim worker after its close flag changes.
@@ -978,6 +952,7 @@ struct Ram {
     len: usize,
     regions: Vec<RamRegion>,
     ready: Vec<AtomicBool>,
+    filling: AtomicBool,
 }
 // SAFETY: regions are disjoint, one worker writes them, and a region is published only after
 // its TensorFS read finishes. Receivers get read-only file descriptions, never this pointer.
@@ -1024,6 +999,7 @@ impl Ram {
             base: base as usize,
             len,
             ready: regions.iter().map(|_| AtomicBool::new(false)).collect(),
+            filling: AtomicBool::new(true),
             regions,
         };
         shm::seal(ram.file.as_fd()).map_err(crate::os("seal RAM layout"))?;
@@ -1069,6 +1045,59 @@ fn orphan(table: &Table, page: &Kept) -> bool {
         Ok(_) => table.alive(owner.row as usize).is_ok_and(|live| !live),
         Err(_) => false,
     })
+}
+
+fn register_ram(
+    table: &Arc<Table>,
+    custody: &Mutex<Custody>,
+    layout: [u8; 32],
+    source: Arc<Source>,
+    regions: Vec<RamRegion>,
+) -> Result<bool> {
+    let ram = Arc::new(Ram::new(regions)?);
+    let mut custody = custody.lock();
+    if custody.ram.contains_key(&layout) {
+        return Ok(false);
+    }
+    let (fill, table) = (ram.clone(), table.clone());
+    std::thread::Builder::new()
+        .name("varena-ram".into())
+        .spawn(move || {
+            for (region, ready) in fill.regions.iter().zip(&fill.ready) {
+                // SAFETY: validated nonoverlapping ranges in this worker's writable mapping.
+                let result = unsafe {
+                    source.read_items(
+                        &region.items,
+                        region.offset,
+                        Dst::Host {
+                            ptr: (fill.base + region.offset as usize) as *mut u8,
+                            len: region.len as usize,
+                        },
+                        1,
+                        Mode::Cache,
+                        &IoTally::default(),
+                    )
+                };
+                match result {
+                    Ok(_) => {
+                        ready.store(true, Release);
+                        table.changed();
+                    }
+                    Err(error) => tracing::warn!(%error, "RAM region remains on disk"),
+                }
+            }
+            fill.filling.store(false, Release);
+            table.changed();
+        })
+        .map_err(|e| io("start RAM fill", e))?;
+    custody.ram.insert(
+        layout,
+        RamHeld {
+            layout: ram,
+            readers: Vec::new(),
+        },
+    );
+    Ok(true)
 }
 
 /// The grant channel carries only placement custody, never model headers or data bytes.
@@ -1284,6 +1313,46 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                             .map_err(|e| io("send orphan page", e))?;
                     }
                 }
+                Some(7) => {
+                    let objects = (0..count)
+                        .map(|_| read_object(&mut stream))
+                        .collect::<Result<Vec<_>>>()?;
+                    let regions = read_regions(&mut stream)?;
+                    let files = objects
+                        .into_iter()
+                        .map(|object| {
+                            let fd = platform::handles::recv_fd(&stream)
+                                .map_err(crate::os("receive RAM source"))?;
+                            // SAFETY: F_GETFL reads flags from this owned descriptor.
+                            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+                            if flags < 0 {
+                                return Err(last("inspect RAM source"));
+                            }
+                            if flags & libc::O_ACCMODE != libc::O_RDONLY {
+                                return Err(Error::Invalid(
+                                    "RAM source descriptor must be read-only".into(),
+                                ));
+                            }
+                            let file = File::from(fd);
+                            if file.metadata().map_err(|e| io("stat RAM source", e))?.len()
+                                != object.length
+                            {
+                                return Err(Error::Invalid("RAM source length differs".into()));
+                            }
+                            Ok((object, file))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let accepted = register_ram(
+                        &table,
+                        &custody,
+                        key.fingerprint,
+                        Arc::new(Source::files(files, true, 0)),
+                        regions,
+                    )?;
+                    stream
+                        .write_all(&[u8::from(accepted)])
+                        .map_err(|e| io("ack RAM registration", e))?;
+                }
                 _ => return Err(Error::Invalid("unknown custody command".into())),
             }
             table.changed();
@@ -1495,5 +1564,187 @@ impl Channel {
                 ))
             })
             .collect()
+    }
+}
+
+const MAX_RAM_ITEMS: usize = 1 << 20;
+const MAX_INLINE_BYTES: usize = 16 << 20;
+fn read_u64(stream: &mut UnixStream) -> Result<u64> {
+    let mut bytes = [0; 8];
+    stream
+        .read_exact(&mut bytes)
+        .map_err(|e| io("read RAM metadata", e))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+fn read_count(stream: &mut UnixStream, maximum: usize) -> Result<usize> {
+    let value = usize::try_from(read_u64(stream)?)
+        .map_err(|_| Error::Invalid("RAM count overflow".into()))?;
+    if value > maximum {
+        return Err(Error::Invalid("RAM metadata exceeds bounds".into()));
+    }
+    Ok(value)
+}
+fn read_object(stream: &mut UnixStream) -> Result<ObjectRef> {
+    let mut hash = [0; 64];
+    stream
+        .read_exact(&mut hash)
+        .map_err(|e| io("read object hash", e))?;
+    if !hash
+        .iter()
+        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(Error::Invalid("noncanonical object hash".into()));
+    }
+    Ok(ObjectRef {
+        sha256: String::from_utf8_lossy(&hash).into_owned(),
+        length: read_u64(stream)?,
+    })
+}
+fn write_object(stream: &mut UnixStream, object: &ObjectRef) -> Result<()> {
+    if object.sha256.len() != 64
+        || !object
+            .sha256
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(Error::Invalid("noncanonical object hash".into()));
+    }
+    stream
+        .write_all(object.sha256.as_bytes())
+        .and_then(|_| stream.write_all(&object.length.to_le_bytes()))
+        .map_err(|e| io("write RAM object", e))
+}
+fn read_regions(stream: &mut UnixStream) -> Result<Vec<RamRegion>> {
+    let count = read_count(stream, MAX_RAM_ITEMS)?;
+    let (mut left, mut inline) = (MAX_RAM_ITEMS, MAX_INLINE_BYTES);
+    (0..count)
+        .map(|_| {
+            let offset = read_u64(stream)?;
+            let len = read_u64(stream)?;
+            let count = read_count(stream, left)?;
+            left -= count;
+            let items = (0..count)
+                .map(|_| {
+                    let offset = read_u64(stream)?;
+                    let len = read_u64(stream)?;
+                    let mut flags = [0; 2];
+                    stream
+                        .read_exact(&mut flags)
+                        .map_err(|e| io("read RAM item", e))?;
+                    let source = match flags.first().copied() {
+                        Some(0) => ItemSource::Object(ObjectRange {
+                            obj: read_object(stream)?,
+                            off: read_u64(stream)?,
+                            len,
+                        }),
+                        Some(1) => {
+                            let size = read_count(stream, inline)?;
+                            inline -= size;
+                            let mut bytes = vec![0; size];
+                            stream
+                                .read_exact(&mut bytes)
+                                .map_err(|e| io("read inline source", e))?;
+                            ItemSource::Inline(bytes.into())
+                        }
+                        _ => return Err(Error::Invalid("unknown RAM source kind".into())),
+                    };
+                    Ok(Item {
+                        offset,
+                        len,
+                        source,
+                        part_end: flags.get(1) == Some(&1),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(RamRegion { offset, len, items })
+        })
+        .collect()
+}
+impl Channel {
+    /// Supply already verified read-only objects. The server retains every descriptor for
+    /// the asynchronous TensorFS fill; only typed region spans cross this control channel.
+    pub fn cache_ram(
+        &self,
+        owner: Owner,
+        layout: [u8; 32],
+        files: &[(ObjectRef, OwnedFd)],
+        regions: &[RamRegion],
+    ) -> Result<bool> {
+        if files.len() > 4096 || regions.len() > MAX_RAM_ITEMS {
+            return Err(Error::Invalid("RAM registration is too large".into()));
+        }
+        let (mut items, mut inline) = (0usize, 0usize);
+        for region in regions {
+            items = items.saturating_add(region.items.len());
+            for item in &region.items {
+                if let ItemSource::Inline(bytes) = &item.source {
+                    inline = inline.saturating_add(bytes.len());
+                }
+            }
+        }
+        if items > MAX_RAM_ITEMS || inline > MAX_INLINE_BYTES {
+            return Err(Error::Invalid("RAM metadata exceeds bounds".into()));
+        }
+        let mut stream = self.0.lock();
+        Self::header(
+            &mut stream,
+            7,
+            owner,
+            PageKey {
+                fingerprint: layout,
+                page: 0,
+            },
+            files.len(),
+        )?;
+        for (object, _) in files {
+            write_object(&mut stream, object)?;
+        }
+        stream
+            .write_all(&(regions.len() as u64).to_le_bytes())
+            .map_err(|e| io("write RAM regions", e))?;
+        for region in regions {
+            for value in [region.offset, region.len, region.items.len() as u64] {
+                stream
+                    .write_all(&value.to_le_bytes())
+                    .map_err(|e| io("write RAM region", e))?;
+            }
+            for item in &region.items {
+                for value in [item.offset, item.len] {
+                    stream
+                        .write_all(&value.to_le_bytes())
+                        .map_err(|e| io("write RAM item", e))?;
+                }
+                let tag = if matches!(item.source, ItemSource::Object(_)) {
+                    0
+                } else {
+                    1
+                };
+                stream
+                    .write_all(&[tag, u8::from(item.part_end)])
+                    .map_err(|e| io("write RAM item kind", e))?;
+                match &item.source {
+                    ItemSource::Object(range) => {
+                        write_object(&mut stream, &range.obj)?;
+                        stream
+                            .write_all(&range.off.to_le_bytes())
+                            .map_err(|e| io("write object range", e))?;
+                    }
+                    ItemSource::Inline(bytes) => {
+                        stream
+                            .write_all(&(bytes.len() as u64).to_le_bytes())
+                            .and_then(|_| stream.write_all(bytes))
+                            .map_err(|e| io("write inline RAM source", e))?;
+                    }
+                }
+            }
+        }
+        for (_, fd) in files {
+            platform::handles::send_fd(&stream, fd).map_err(crate::os("send RAM source"))?;
+        }
+        let mut accepted = [0];
+        stream
+            .read_exact(&mut accepted)
+            .map_err(|e| io("read RAM registration", e))?;
+        Ok(accepted == [1])
     }
 }

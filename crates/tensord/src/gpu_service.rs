@@ -655,6 +655,14 @@ pub struct Pool {
     // Drop session/resource custody before ending the actual spawning thread.
     launcher: crate::child_launcher::ChildLauncher,
 }
+impl Drop for Pool {
+    fn drop(&mut self) {
+        for watcher in self.memory_watchers.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..) {
+            watcher.abort();
+        }
+    }
+}
+
 struct Admission {
     bytes: u64,
     reservation: u64,
@@ -1055,7 +1063,7 @@ impl Pool {
         let mut owners = self.accounting.lock().unwrap();
         for (index, device) in (start..).zip(self.lane(start, degree).unwrap_or_default()) {
             owners.insert((plan.to_owned(), index), ChargeOwner { reservation, birth: None });
-            device.memory.with(|gpu| gpu.starting(plan, gpu.spawn_need(plan)));
+            device.memory.with(|gpu| gpu.starting(plan));
         }
         if let Some(admission) = self.admitted.lock().unwrap().get_mut(&session_key(plan, start)) {
             admission.reservation = reservation;
@@ -1332,7 +1340,7 @@ impl Pool {
             &DeviceCommand::Map {
                 construction: plan.construction.clone(),
                 cap_bytes: cap,
-                floor_bytes: self.first().floor(),
+                floor_bytes: None,
             },
             &mut device_executor::Baseline,
         );
@@ -3258,13 +3266,6 @@ impl Pool {
             // NVML charges each GPU's own process: rank r drives the group's GPU r.
             self.followed(&session.plan, session.start, &session.executor.birth, &session.followers);
             let (load_cap, load_group) = rank_grant(&load_caps[..load_caps.len().min(ranks as usize)]);
-            // Its pinned budget, applied by the Load before any weight set registers.
-            let plane = !plan.slots.is_empty();
-            let pinned = (degree > 0)
-                .then(|| self.pinned_budgets(&construction, start))
-                .flatten()
-                .and_then(|split| split.get(&session_key(&construction, start)).copied())
-                .map_or(-1, |share| i64::try_from(share).unwrap_or(i64::MAX));
             let load = match plan.slots.first() {
                 // A call that constructs nothing: its weightless construction.
                 None => DeviceCommand::Load {
@@ -3318,7 +3319,7 @@ impl Pool {
                             true => String::new(),
                             false => engine.get(id)?.invocation.attention_kernel,
                         },
-                        pinned_bytes: plane.then_some(pinned),
+                        pinned_bytes: None,
                         device_weights: sharing,
                         cap_bytes: load_cap,
                     }
@@ -3440,9 +3441,6 @@ impl Pool {
         }
         session.sharing = share;
         callbacks.custody = self.custody.as_ref().filter(|_| share);
-        if degree > 0 {
-            self.shed(&construction, start);
-        }
         // A real grant for the whole call: one tenant needs no per-stage turns.
         // A group's cap holds on every GPU of it (each rank caps its own process).
         let caps = self.decide(&construction, start, degree, false)?;
@@ -3497,7 +3495,7 @@ impl Pool {
                 cap_bytes,
                 inputs: inputs.inputs,
                 trees: inputs.trees,
-                floor_bytes: gpu.and_then(GpuMemory::floor),
+                floor_bytes: None,
                 activation_bytes: gpu.map(|gpu| gpu.with(|gpu| gpu.seeds(&construction))).unwrap_or_default(),
                 squeezed_bytes: gpu.map(|gpu| gpu.with(|gpu| gpu.squeezed(&construction))).unwrap_or_default(),
                 device_weights: Some(share),
@@ -3610,11 +3608,7 @@ impl Pool {
         Ok(true)
     }
 
-    /// Degree 2 for `plan`'s executor: GPU weights the machine keeps across executors. It
-    /// keeps every component resident until revoked, and a running call never revokes what
-    /// it reads, so only when the whole construction and its activations fit beside the other
-    /// tenants, as measured here or in an earlier run (unmeasured: Degree 1, where stages
-    /// evict each other). World-one on the first GPU only: a group or a replica shares nothing.
+    /// Page-level custody replaces the retired whole-model sharing path.
     fn degree2(&self, _: &str, _: usize, _: u32) -> io::Result<bool> {
         // The old whole-model custody channel is superseded by page-level grants.
         Ok(false)
@@ -3708,12 +3702,6 @@ impl Pool {
         }
     }
 
-    /// Idle tenants pinning more than their share of the host's pinned total give it back
-    /// (their planes punch the least recently used regions; page cache and disk stay beneath)
-    /// before `plan` runs. An idle executor's pinned tier is optional: a failure is noted.
-    fn shed(&self, _: &str, _: usize) {}
-    fn pinned_budgets(&self, _: &str, _: usize) -> Option<BTreeMap<String, u64>> { None }
-
     /// Followers whose process has ended, as people name their GPUs ("GPU 1's process 3224
     /// ended"); empty while the whole group lives.
     fn lost_followers(&self, start: usize, degree: u32, followers: &[platform::process::Exact]) -> String {
@@ -3729,9 +3717,6 @@ impl Pool {
             .collect::<Vec<_>>()
             .join(", ")
     }
-
-    /// An executor's out-of-memory retry asks for `free_bytes` from the other tenants: idle
-    /// weights leave first, then idle processes; its cap rises into what they gave.
 
 }
 
@@ -4839,70 +4824,27 @@ mod tests {
         assert_eq!(group_degree(&[json!({"path":"e.models.vae"})], 2, 2), 1);
     }
 
-    /// An integrated GPU (GB10) answers NVML's memory info with NotSupported. Its Loads still
-    /// carry a device limit (the host's memory), without which Runtime refuses the executor
-    /// (run 10322). Under a fake `libnvidia-ml.so.1` that answers so, in a child of this test.
-    #[cfg(target_os = "linux")]
     #[test]
-    fn a_gpu_whose_memory_nvml_does_not_support_still_bounds_every_load() {
-        let dir = std::env::temp_dir().join(format!("fake-nvml-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("nvml.c"), FAKE_NVML).unwrap();
-        let built = std::process::Command::new("cc")
-            .args(["-shared", "-fPIC", "-o"]).arg(dir.join("libnvidia-ml.so.1")).arg(dir.join("nvml.c"))
-            .status().unwrap();
-        assert!(built.success());
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "gpu_service::tests::an_integrated_gpus_load_limit_is_the_hosts_memory", "--ignored"])
-            .env("LD_LIBRARY_PATH", &dir)
-            .output().unwrap();
-        let out = String::from_utf8_lossy(&child.stdout);
-        assert!(child.status.success() && out.contains("1 passed"), "{out}{}", String::from_utf8_lossy(&child.stderr));
-        let _ = fs::remove_dir_all(dir);
+    fn inventory_and_owner_limit_bound_every_load_without_loading_cuda() {
+        let (root, pool, _) = pool_of(1);
+        assert_eq!(pool.device_limit(pool.lane(0, 1).unwrap()), Some(8 << 30));
+        pool.stop().unwrap();
+        drop(pool);
+        crate::scratch::remove(&root);
     }
 
-    #[test]
-    #[ignore = "a_gpu_whose_memory_nvml_does_not_support_still_bounds_every_load runs it under its fake NVML"]
-    fn an_integrated_gpus_load_limit_is_the_hosts_memory() {
-        let root = std::env::temp_dir().join(format!("gpu-integrated-{}", uuid::Uuid::new_v4()));
-        let config: GpuConfig = serde_json::from_value(json!({"devices": "0",
-            "authorized_device_limit_bytes": null, "prespawn": false})).unwrap();
-        let store = crate::storage::open(&root.join("store")).unwrap();
-        let pool = Pool::new(&root.join("gpu"), config, store).unwrap();
-        let host = platform::contain::host_memory::total();
-        assert!(host > 0);
-        assert_eq!(pool.device_limit(pool.lane(0, 1).unwrap()), Some(host as u64));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// NVML for one integrated GPU: every call the memory sampler makes, and memory info
-    /// NotSupported (3), as GB10's driver answers.
-    #[cfg(target_os = "linux")]
-    const FAKE_NVML: &str = r#"
-#include <stdio.h>
-static int gpu;
-int nvmlInit_v2(void) { return 0; }
-int nvmlInit_v3(unsigned flags) { return 0; }
-int nvmlShutdown(void) { return 0; }
-int nvmlDeviceGetCount_v2(unsigned *n) { *n = 1; return 0; }
-int nvmlDeviceGetHandleByIndex_v2(unsigned i, void **d) { if (i) return 2; *d = &gpu; return 0; }
-int nvmlDeviceGetHandleByUUID(const char *u, void **d) { *d = &gpu; return 0; }
-int nvmlDeviceGetIndex(void *d, unsigned *i) { *i = 0; return 0; }
-int nvmlDeviceGetUUID(void *d, char *b, unsigned n) { snprintf(b, n, "GPU-integrated-test"); return 0; }
-int nvmlDeviceGetName(void *d, char *b, unsigned n) { snprintf(b, n, "NVIDIA GB10"); return 0; }
-int nvmlSystemGetDriverVersion(char *b, unsigned n) { snprintf(b, n, "595.84"); return 0; }
-int nvmlDeviceGetMemoryInfo(void *d, void *m) { return 3; }
-int nvmlDeviceGetMemoryInfo_v2(void *d, void *m) { return 3; }
-int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
-"#;
-
-    /// A fresh pool over `width` GPUs NVML does not know (this host's own stay untouched):
-    /// every GPU has room.
+    /// A CPU scheduler fixture with explicit GPU identities/capacities. This tests queue
+    /// bookkeeping only and never claims GPU execution or placement qualification.
     fn pool_of(width: usize) -> (PathBuf, Arc<Pool>, Arc<Engine>) {
         let root = std::env::temp_dir().join(format!("gpu-place-{}", uuid::Uuid::new_v4()));
-        let devices: Vec<_> = (0..width).map(|gpu| format!("GPU-test-{gpu}")).collect();
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let devices: Vec<_> = (0..width).map(|gpu| format!("GPU-test-{unique}-{gpu}")).collect();
+        let inventory: Vec<_> = devices.iter().enumerate().map(|(index, uuid)| json!({
+            "device_index":index,"device_name":"scheduler fixture","device_uuid":uuid,
+            "driver_version":"fixture","memory_bytes":8u64<<30,"pci_bus_id":"fixture"
+        })).collect();
         let config: GpuConfig = serde_json::from_value(json!({"devices": devices.join(","),
-            "authorized_device_limit_bytes": null, "prespawn": false})).unwrap();
+            "inventory":inventory,"authorized_device_limit_bytes": null, "prespawn": false})).unwrap();
         let store = crate::storage::open(&root.join("store")).unwrap();
         let pool = Pool::new(&root.join("gpu"), config, store).unwrap();
         let engine = Engine::open(&root.join("execution")).unwrap();
@@ -5268,7 +5210,7 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         let (root, pool, engine) = pool_of(4);
         let (image, film) = (plan("image", 1), plan("film", 2));
         let place = |plan: &Plan, seq: u64, claims: &mut [Option<u64>]| pool.place(&engine, plan, (seq, None), None, claims);
-        let serving = |gpu: usize| pool.devices[gpu].memory.with(|ledger| ledger.starting("image", 0));
+        let serving = |gpu: usize| pool.devices[gpu].memory.with(|ledger| ledger.starting("image"));
         let mut claims = [None; 4];
         let (gpu, first) = place(&image, 1, &mut claims).unwrap();
         assert_eq!(gpu, 0);
@@ -5512,10 +5454,10 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         let mut claims = [None; 2];
         let (gpu, first) = pool.place(&engine, &image, (1, None), None, &mut claims).unwrap();
         assert_eq!(gpu, 0);
-        pool.devices[0].memory.with(|ledger| ledger.starting("image", 0));
+        pool.devices[0].memory.with(|ledger| ledger.starting("image"));
         let (gpu, second) = pool.place(&engine, &image, (2, None), None, &mut claims).unwrap();
         assert_eq!(gpu, 1);
-        pool.devices[1].memory.with(|ledger| ledger.starting("image", 0));
+        pool.devices[1].memory.with(|ledger| ledger.starting("image"));
         assert!(pool.place(&engine, &image, (3, None), None, &mut claims).is_none());
         assert_eq!(claims, [Some(3), Some(3)]);
         drop((first, second));
@@ -5523,10 +5465,10 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         crate::scratch::remove(&root);
     }
 
-    /// Host admission counts executors admitted and not loaded yet; pinned budgets are shared
-    /// over every GPU's executors, a group's once.
+    /// Host admission still counts executors admitted and not loaded yet; GPU placement
+    /// and pinned RAM ownership no longer live in this scheduler.
     #[test]
-    fn host_room_and_pinned_budgets_span_every_gpu() {
+    fn host_room_counts_every_pending_executor() {
         let (root, pool, _engine) = pool_of(4);
         let available = u64::try_from(platform::contain::host_memory::read().available).unwrap();
         let need = available / 10 * 6;
@@ -5542,27 +5484,6 @@ int nvmlDeviceGetDisplayActive(void *d, int *s) { *s = 0; return 0; }
         assert!(pool.host_room("image", 1, 1, false, 2));
         pool.admitted.lock().unwrap().clear();
 
-        let gib = 1u64 << 30;
-        for (index, (tenant, start)) in [("film", 0), ("film", 2), ("image", 0), ("image", 2)].into_iter().enumerate() {
-            let birth = Birth { pid: 1_000_000 + index as u32, boot_id: "placement-only".into(), start_ticks: 0 };
-            pool.leaders.lock().unwrap().insert(birth.pid, (birth, tenant.into(), start));
-        }
-        for (gpu, tenant) in [(0, "film"), (1, "film"), (2, "film"), (3, "film"), (0, "image"), (2, "image")] {
-            pool.devices[gpu].memory.with(|ledger| {
-                ledger.starting(tenant, 0);
-                let facts = Facts { weights: Some(gib), ..Facts::default() };
-                ledger.observe(tenant, facts, None);
-            });
-        }
-        let split = pool.pinned_budgets("image", 2).unwrap();
-        let keys: Vec<_> = split.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["film", "film@2", "image", "image@2"]);
-        let total = u64::try_from(platform::contain::host_memory::read().available).unwrap() / 2;
-        assert!(split.values().sum::<u64>() <= total, "one pinned total");
-        pool.ended("film", 2, 2);
-        let split = pool.pinned_budgets("image", 0).unwrap();
-        let keys: Vec<_> = split.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["film", "image", "image@2"]);
         pool.stop().unwrap();
         crate::scratch::remove(&root);
     }

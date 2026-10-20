@@ -74,6 +74,11 @@ fn pages_pin_evict_refill_and_survive_clean_owner_exit() {
     assert_eq!(bytes(&pin), data);
     assert!(!gpu.unmap(1).expect("pinned page cannot evict"));
     assert!(gpu.unmap(2).expect("other page independently evicts"));
+    let fault = gpu.fill_with(2, |_, _, _| panic!("injected page transform panic"));
+    assert!(matches!(fault, Err(varena::Error::Internal(_))));
+    gpu.recover().expect("failed request recovers in process");
+    gpu.fill_from_ram(2, &data)
+        .expect("next request can refill");
     assert_eq!(bytes(&pin), data);
     drop(pin);
     io::drain(0).expect("device completion");
@@ -130,7 +135,15 @@ fn pages_pin_evict_refill_and_survive_clean_owner_exit() {
             container
         )
         .expect("import"));
-    assert_eq!(bytes(&next.bind(1, 0).expect("imported bind")), data);
+    let retained = next.bind(1, 0).expect("imported bind");
+    assert_eq!(bytes(&retained), data);
+    assert!(!next.unregister(1).expect("close defers a live view"));
+    assert_eq!(bytes(&retained), data);
+    drop(retained);
+    next.wait_pending()
+        .expect("wait for real consumer completion");
+    next.poll().expect("retire the last view");
+    assert!(next.unregister(1).expect("closed model now has no pages"));
     std::fs::remove_file(path).expect("remove source");
     println!("real VMM: independent pages, pin protection, RAM refill and kept-page import passed");
 }
