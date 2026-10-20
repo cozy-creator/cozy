@@ -63,6 +63,17 @@ pub(crate) fn os(what: &'static str) -> impl FnOnce(platform::Error) -> Error {
 }
 
 impl Error {
+    /// CUDA documents these failures as destroying the context or leaving the process
+    /// inconsistent. Allocation pressure and invalid inputs are request failures instead.
+    /// https://docs.nvidia.com/cuda/archive/13.0.3/cuda-driver-api/group__CUDA__TYPES.html
+    pub fn is_sticky(&self) -> bool {
+        matches!(self, Self::Cuda { code: 700 | 702 | 709 | 710 | 714..=719 | 721, .. })
+    }
+
+    pub fn is_oom(&self) -> bool {
+        matches!(self, Self::DeviceFull { .. } | Self::Cuda { code: 2, .. })
+    }
+
     /// The stable machine name of the error class.
     pub fn code(&self) -> &'static str {
         match self {

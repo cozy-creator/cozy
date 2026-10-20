@@ -197,6 +197,12 @@ impl Mapping {
                     size = device.granularity;
                     continue;
                 }
+                if code == cuda::ERROR_OUT_OF_MEMORY {
+                    return Err(Error::DeviceFull {
+                        need: bytes,
+                        deficit: remaining,
+                    });
+                }
                 cuda::check("cuMemCreate", code)?;
             }
             if let Err(error) = call!(
@@ -355,6 +361,21 @@ impl Gpu {
         setup.map(Arc::new)
     }
 
+    pub fn device(&self) -> i32 {
+        self.device.ordinal
+    }
+
+    pub fn uuid(&self) -> Result<String> {
+        Ok(cuda::uuid(self.device.prop.location.id)?)
+    }
+
+    pub fn capacity(&self) -> Result<u64> {
+        let _context = self.device.enter()?;
+        let (mut free, mut total) = (0, 0);
+        call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
+        Ok(total as u64)
+    }
+
     pub fn reserve(&self, bytes: u64) -> Result<Arc<Reservation>> {
         let g = self.device.granularity;
         let bytes = bytes
@@ -440,16 +461,41 @@ impl Gpu {
 
     /// Called on an I/O worker, outside the policy lock. A concurrent bind sees Filling.
     pub fn fill(&self, id: PageId) -> Result<ReadStats> {
-        self.fill_bytes(id, None)
+        self.fill_bytes(id, None, |_, _, _| Ok(()))
     }
 
     /// The RAM-tier lease must remain alive for this call. TensorFS still performs
     /// the transfer; the mechanism only selects a ready source and its destination.
     pub fn fill_from_ram(&self, id: PageId, bytes: &[u8]) -> Result<ReadStats> {
-        self.fill_bytes(id, Some(bytes))
+        self.fill_bytes(id, Some(bytes), |_, _, _| Ok(()))
     }
 
-    fn fill_bytes(&self, id: PageId, ram: Option<&[u8]>) -> Result<ReadStats> {
+    /// A declared page-in transform runs only on a new, private writable mapping.
+    /// It must order GPU work onto the supplied stream; completion is checked before
+    /// the page becomes read-only and may be shared or exported.
+    pub fn fill_with(
+        &self,
+        id: PageId,
+        transform: impl FnOnce(u64, u64, usize) -> Result<()>,
+    ) -> Result<ReadStats> {
+        self.fill_bytes(id, None, transform)
+    }
+
+    pub fn fill_from_ram_with(
+        &self,
+        id: PageId,
+        bytes: &[u8],
+        transform: impl FnOnce(u64, u64, usize) -> Result<()>,
+    ) -> Result<ReadStats> {
+        self.fill_bytes(id, Some(bytes), transform)
+    }
+
+    fn fill_bytes(
+        &self,
+        id: PageId,
+        ram: Option<&[u8]>,
+        transform: impl FnOnce(u64, u64, usize) -> Result<()>,
+    ) -> Result<ReadStats> {
         let page = self.page(id)?;
         if ram.is_some_and(|bytes| bytes.len() as u64 != page.bytes) {
             return Err(invalid("RAM region size differs from the mapped page"));
@@ -496,6 +542,8 @@ impl Gpu {
                     )
                 }?,
             };
+            transform(mapping.ptr(), mapping.bytes, self.device.stream.raw())?;
+            self.device.stream.drain()?;
             let _context = self.device.enter()?;
             self.device.access(mapping.ptr(), mapping.bytes, true)?;
             mapping.ready = Some(Event::record(&self.device, self.device.stream.raw())?);
@@ -604,6 +652,10 @@ impl Gpu {
         }
         if mapping.kept.is_none() {
             let (tx, rx) = UnixStream::pair().map_err(|error| Error::Io(error.to_string()))?;
+            // A highly fragmented page must not block while filling a socket queue
+            // which its custodian cannot receive until this method returns.
+            tx.set_nonblocking(true)
+                .map_err(|error| Error::Io(error.to_string()))?;
             for chunk in &mapping.chunks {
                 let mut raw: c_int = -1;
                 call!(
@@ -679,25 +731,27 @@ impl Gpu {
                 return Ok(false);
             };
             let mut handle = 0;
-            if call!(
+            if let Err(error) = call!(
                 "cuMemImportFromShareableHandle",
                 mem_import(
                     &mut handle,
                     fd.as_raw_fd() as usize as *mut c_void,
                     cuda::MEM_HANDLE_TYPE_POSIX_FD
                 )
-            )
-            .is_err()
-            {
+            ) {
+                if error.is_sticky() {
+                    return Err(error);
+                }
                 return Ok(false);
             }
-            if call!(
+            if let Err(error) = call!(
                 "cuMemMap",
                 mem_map(mapping.ptr() + mapping.bytes, *bytes as usize, 0, handle, 0)
-            )
-            .is_err()
-            {
+            ) {
                 let _ = call!("cuMemRelease", mem_release(handle));
+                if error.is_sticky() {
+                    return Err(error);
+                }
                 return Ok(false);
             }
             mapping.chunks.push(Chunk {
@@ -729,20 +783,20 @@ impl Gpu {
         Ok(())
     }
 
-    /// Derive mechanism facts from mappings; there is no second cached byte counter.
+    /// Derive mechanism facts from mappings; the final flag includes pending consumer
+    /// events, so the planner cannot count such a mapping as immediately reclaimable.
     pub fn facts(&self) -> Result<Vec<(PageId, u64, usize, bool)>> {
         self.poll()?;
-        Ok(self
-            .pages
-            .lock()
-            .iter()
-            .map(|(id, page)| match &*page.state.lock() {
+        let mut facts = Vec::new();
+        for (id, page) in self.pages.lock().iter() {
+            facts.push(match &mut *page.state.lock() {
                 State::Empty => (*id, 0, 0, false),
                 State::Filling => (*id, page.bytes, 0, true),
-                State::Ready(mapping) => (*id, mapping.bytes, mapping.pins, false),
+                State::Ready(mapping) => (*id, mapping.bytes, mapping.pins, !mapping.idle()?),
                 State::Failed(mapping, _) => (*id, mapping.bytes, mapping.pins, true),
-            })
-            .collect())
+            });
+        }
+        Ok(facts)
     }
 
     pub fn fingerprint(&self, id: PageId) -> Result<String> {
