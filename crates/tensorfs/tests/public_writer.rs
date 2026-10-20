@@ -80,7 +80,10 @@ fn client(cache: &Path, endpoint: &Path) -> Client {
     Client::new(config).unwrap()
 }
 fn check_export(folder: &Path) {
-    assert_eq!(fs::read(folder.join("README.bin")).unwrap(), README);
+    check_export_with_readme(folder, "README.bin");
+}
+fn check_export_with_readme(folder: &Path, readme: &str) {
+    assert_eq!(fs::read(folder.join(readme)).unwrap(), README);
     assert_eq!(fs::read(folder.join("tokenizer.json")).unwrap(), ASSET);
     let config: serde_json::Value =
         serde_json::from_slice(&fs::read(folder.join("config.json")).unwrap()).unwrap();
@@ -898,7 +901,8 @@ fn conversion_source(root: &Path) -> PathBuf {
     )
     .unwrap();
     fs::write(folder.join("tokenizer.json"), ASSET).unwrap();
-    fs::write(folder.join("README.bin"), README).unwrap();
+    // .bin is filtered as an alternate weights suffix; this is a repo-file ownership test.
+    fs::write(folder.join("README.dat"), README).unwrap();
     folder
 }
 fn actual_headers(root: &Path) -> Vec<PathBuf> {
@@ -948,7 +952,7 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
         .materialize(&portable, Format::Cozytensors, None)
         .await
         .unwrap();
-    assert_eq!(fs::read(portable.join("README.bin")).unwrap(), README);
+    assert_eq!(fs::read(portable.join("README.dat")).unwrap(), README);
     let tree = client
         .upload_folder(&"local/converted".parse().unwrap(), &portable, None)
         .await
@@ -971,7 +975,7 @@ async fn public_convert_resolves_metadata_then_owns_repo_files_through_portable_
         .materialize(&result, Format::Safetensors, None)
         .await
         .unwrap();
-    check_export(&result);
+    check_export_with_readme(&result, "README.dat");
     drop(reopened);
     assert_eq!(child.read("w").unwrap(), WEIGHT);
     assert_eq!(child.asset("tokenizer.json").unwrap(), ASSET);
