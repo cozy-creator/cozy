@@ -1809,7 +1809,7 @@ impl DeviceExecutor {
         &mut self,
         command: &DeviceCommand,
         group: &Group,
-        grants: Vec<varena::ledger::Grant>,
+        grants: Vec<crate::memory::slim::Grant>,
         services: &mut impl Services,
     ) -> io::Result<Frame> {
         if grants.len() != group.ledgers as usize
@@ -1853,7 +1853,7 @@ impl DeviceExecutor {
         &mut self,
         command: &DeviceCommand,
         group: &Group,
-        grants: &[varena::ledger::Grant],
+        grants: &[crate::memory::slim::Grant],
         services: &mut impl Services,
         watch: &Watch,
     ) -> io::Result<Frame> {
