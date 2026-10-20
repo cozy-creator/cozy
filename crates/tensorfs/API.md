@@ -175,8 +175,9 @@ a separate worker-permission mechanism.
 available; the open checkpoint retains them. `missing` is optional availability inspection.
 Use `verify` for an explicit local audit, not after every fetch: admission already checks
 incoming bytes. Verification always checks the header, then the selected complete objects,
-and never fetches, repairs or deletes data. `Selection::All` also covers known repository
-files; checking a shared chunk hashes that whole object. Other local I/O failures remain
+and never fetches, repairs or deletes data. `Selection::All` covers the checkpoint's
+declared chunks and component assets, not its enclosing repository files; checking a
+shared chunk hashes that whole object. Other local I/O failures remain
 typed errors rather than being classified as corruption.
 
 A `Component` provides `name()`, `class()`, `config()`, `tensors()` and

@@ -1,7 +1,8 @@
 # TensorFS Python API
 
-Import TensorFS, perform an operation, then work with the checkpoint, component or array
-it returns. This guide covers the complete planned Python API by task.
+Open a model and read its tensors. TensorFS fetches missing data into its shared store
+automatically; normal loading does not create a snapshot folder. This guide covers the
+complete planned Python API, with optional filesystem and repository tools kept separate.
 
 This is the **0.13 target**, currently being integrated. The implementation on `master`
 can still expose the preceding interface. The [Rust API](../tensorfs/API.md) and
@@ -27,15 +28,15 @@ uv pip install tensorfs
 import tensorfs
 
 checkpoint = tensorfs.open("me/model", revision="1.0", variant="bf16")
-# The same call accepts a local header file (and portable folders):
-local = tensorfs.open("./model.cozytensors")
-print(list(local.components))
+weight = checkpoint.components["unet"].tensors.read("conv_in.weight")
 ```
 
 `open` returns a `Checkpoint`. It fetches metadata first; reading tensors fetches the
 objects those tensors need. `revision` selects a release or immutable reference;
 `variant` selects a representation such as `bf16` or `int8`. Without a variant, a
-single-variant tree is unambiguous; a multi-variant tree requires a choice.
+single-variant tree is unambiguous; a multi-variant tree requires a choice. No separate
+download call is required. The same `open` accepts a local `.cozytensors` header or an
+explicitly materialized folder; those are optional input forms.
 
 For a private model, pass `token=...`. Other options are `endpoint`, `cache_dir`,
 `local_files_only` and `ca_der` (private CA bytes). `local_files_only=True` forbids network
@@ -223,9 +224,10 @@ downloads, repairs or deletes data; other I/O failures raise the usual typed err
 There is no need to call it after every fetch: incoming data is already verified when
 admitted to the store.
 
-All three methods accept the same component selection. `None` covers every component
-and known repository files; a component list covers those components' complete chunks
-and assets. Verification always includes the header, even with `components=[]`. A chunk
+All three methods accept the same component selection. `None` covers the checkpoint's
+declared chunks and component assets; a component list covers those components' complete
+chunks and assets. They do not materialize a repository folder or fetch README/LICENSE
+files. Verification always includes the header, even with `components=[]`. A chunk
 shared by selected and unselected tensors is checked as one complete stored object.
 
 Additional checkpoint properties and operations:
@@ -359,42 +361,6 @@ A `ComponentWriter` supports:
 | `order(keys)` | Set tensor construction order. |
 | `has(key)` | Check a current/resumed write. |
 
-### Portable cozytensors export
-
-To transfer a complete checkpoint without relying on another machine's store, explicitly
-export the native portable folder:
-
-```python
-files = tensorfs.export(saved, "./portable", format="cozytensors")
-```
-
-This writes `model.cozytensors` (or its named variant) plus `chunks/`, keeping the same
-header bytes and content hashes. It fetches required missing objects or fails; it must not
-silently produce an incomplete portable export. Native export preserves encodings and
-does not accept `dequantize`.
-
-The export contains the selected checkpoint and any known repository files. A checkpoint
-opened from a bare header has no enclosing tree to supply a README, LICENSE or other
-variants. A selected-checkpoint export is not a complete multi-variant tree snapshot;
-use `snapshot_download` when you need to materialize repository content.
-
-### Compatibility export for legacy file-based libraries
-
-Direct TensorFS/cozytensors loading is the normal integration path, including in our
-Runtime. Libraries should consume component configuration, supporting-file bytes and
-tensor arrays directly. Export is a convenience for libraries that still require
-filenames; it is not a required preparation step.
-
-```python
-# Only for a legacy consumer that requires a directory:
-folder = checkpoint.components["tokenizer"].export_files("./tokenizer-files")
-```
-
-`Component.export_files(directory)` explicitly writes configuration and supporting files,
-fetching any missing asset bytes. It returns the directory path and does not export tensor
-weights. Original filenames are preserved internally for compatibility. The full-checkpoint
-`tensorfs.export` operation below also exports weight files when that is needed.
-
 ### Convert an existing model and export ordinary files
 
 ```python
@@ -409,26 +375,6 @@ pinned source reference without performing the conversion.
 
 `export(checkpoint, directory, format="safetensors", dequantize=None)` returns written
 paths. Formats are `"safetensors"` and `"cozytensors"` (native portable folder). Omit `dequantize` to retain supported encoded representations in the export.
-
-### Download files or publish a folder
-
-```python
-folder = tensorfs.snapshot_download("me/model", variant="bf16")
-license_path = tensorfs.hub_download("me/model", "LICENSE")
-tree_id = tensorfs.upload_folder(repo_id="me/model", folder_path="./portable", token=my_token)
-```
-
-`my_token` in the examples is a credential you obtained for your endpoint.
-
-`snapshot_download` returns a folder; options are `revision`, `variant`, `components`,
-`local_dir`, `local_files_only`, `cache_dir`, `endpoint`, `token` and `ca_der`. With no
-variant it downloads all variants. `hub_download` returns one file path and accepts the
-same location/authentication options, without component or variant selection.
-
-`upload_folder` returns the exact published tree id. Its options are `revision`, `token`,
-`endpoint`, `cache_dir` and `ca_der`. Without a revision it appends an unreleased checkpoint;
-it does not create a public release. Repository files such as README and LICENSE are
-ordinary files in the uploaded folder.
 
 ## Python: configuration and advanced operations
 
@@ -472,6 +418,68 @@ provider = tensorfs.DPoP.token(private_jwk_json, access_token)
 checkpoint = tensorfs.open("me/private-model", token=provider)
 ```
 
+### Optional filesystem escape hatches
+
+These operations are for tools that require paths or portable folders. They are not
+steps in the normal `open`/`read` workflow.
+
+#### Portable cozytensors export
+
+To transfer a complete checkpoint without relying on another machine's store, explicitly
+export the native portable folder:
+
+```python
+files = tensorfs.export(saved, "./portable", format="cozytensors")
+```
+
+This writes `model.cozytensors` (or its named variant) plus `chunks/`, keeping the same
+header bytes and content hashes. It fetches required missing objects or fails; it must not
+silently produce an incomplete portable export. Native export preserves encodings and
+does not accept `dequantize`.
+
+The export contains the selected checkpoint and any known repository files. A checkpoint
+opened from a bare header has no enclosing tree to supply a README, LICENSE or other
+variants. A selected-checkpoint export is not a complete multi-variant tree snapshot;
+use `snapshot_download` when you need to materialize repository content.
+
+#### Compatibility export for legacy file-based libraries
+
+Direct TensorFS/cozytensors loading is the normal integration path, including in our
+Runtime. Libraries should consume component configuration, supporting-file bytes and
+tensor arrays directly. Export is a convenience for libraries that still require
+filenames; it is not a required preparation step.
+
+```python
+# Only for a legacy consumer that requires a directory:
+folder = checkpoint.components["tokenizer"].export_files("./tokenizer-files")
+```
+
+`Component.export_files(directory)` explicitly writes configuration and supporting files,
+fetching any missing asset bytes. It returns the directory path and does not export tensor
+weights. Original filenames are preserved internally for compatibility. The full-checkpoint
+`tensorfs.export` operation below also exports weight files when that is needed.
+
+#### Download files or publish a folder
+
+```python
+folder = tensorfs.snapshot_download("me/model", variant="bf16")
+license_path = tensorfs.hub_download("me/model", "LICENSE")
+tree_id = tensorfs.upload_folder(repo_id="me/model", folder_path="./portable", token=my_token)
+```
+
+`my_token` in the examples is a credential you obtained for your endpoint.
+
+`snapshot_download` is an explicit filesystem escape hatch, not the normal loading path.
+It returns a folder; options are `revision`, `variant`, `components`,
+`local_dir`, `local_files_only`, `cache_dir`, `endpoint`, `token` and `ca_der`. With no
+variant it downloads all variants. `hub_download` returns one file path and accepts the
+same location/authentication options, without component or variant selection.
+
+`upload_folder` returns the exact published tree id. Its options are `revision`, `token`,
+`endpoint`, `cache_dir` and `ca_der`. Without a revision it appends an unreleased checkpoint;
+it does not create a public release. Repository files such as README and LICENSE are
+ordinary files in the uploaded folder.
+
 ### Work directly with repository references
 
 ```python
@@ -500,7 +508,7 @@ A conflict can cause the callback to run again, so it must tolerate retries.
 | `upload_folder` | Published tree id |
 
 The returned data types are `Checkpoint`, `Pipeline`, `Component`, `Tensors`,
-`TensorMetadata`, `Encoding`, `Array` and `Encoded`. Writing uses `Writer` and `ComponentWriter`;
+`TensorMetadata`, `Encoding`, `Array`, `Encoded` and `VerificationReport`. Writing uses `Writer` and `ComponentWriter`;
 advanced authorization/reference operations use `DPoP` and `Endpoint`. They are covered
 above. The companion `tensorfs.varena` placement API is separate and is unnecessary for
 ordinary TensorFS or Diffusers/ComfyUI use.
