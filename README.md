@@ -35,6 +35,15 @@ say), add `--on new` to run on a rented one. Outputs land in `~/.cozy/outputs`.
 
 `cozy --help` and `cozy <verb> --help` are the reference.
 
+## Uninstall
+
+```sh
+cozy uninstall        # lists what it removes, with sizes, and asks; --yes skips the question
+```
+
+It stops Calcifer and the machine and removes their services, `~/.cozy`, `~/.config/cozy` and the
+installer's PATH lines. Downloaded models stay unless `--all`.
+
 ## Build
 
 ```sh

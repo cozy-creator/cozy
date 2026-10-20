@@ -251,6 +251,28 @@ pub fn descendants(pid: u32) -> Vec<u32> {
     tree
 }
 
+/// `pid` and every process it started, as handles that outlive their PIDs: what to wait on before
+/// removing their files (Windows refuses to remove a file a process still holds as it exits).
+pub fn tree(pid: u32) -> Vec<Exact> {
+    std::iter::once(pid)
+        .chain(descendants(pid))
+        .filter_map(|pid| Birth::of(pid).ok())
+        .filter_map(|birth| Exact::open(&birth).ok().flatten())
+        .collect()
+}
+
+/// Ends each of `tree` that still runs and waits until it has exited.
+pub fn end_tree(tree: &[Exact]) -> Result<()> {
+    for process in tree {
+        if !process.ended() {
+            // One that exits meanwhile refuses the kill; its wait answers at once.
+            let _ = process.kill();
+        }
+        process.wait()?;
+    }
+    Ok(())
+}
+
 /// Every process in `leader`'s process group born with or after it: a leader's followers. A
 /// group number is not reused while a member lives. Empty on Windows, whose trees are Job Objects.
 pub fn group_members(leader: &Birth) -> Vec<Birth> {
