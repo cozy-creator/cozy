@@ -125,8 +125,12 @@ location  = [chunk_index, offset, length]
 
 - **Pipeline:** what `model_index.json` held, as its class and config; `[]` for a model with no pipeline.
 - **Class:** a descriptive `<library>.<Class>` identifier (`diffusers.StableDiffusionXLPipeline`,
-  `diffusers.UNet2DConditionModel`, `transformers.CLIPTextModel`), or `""` when unknown. Reading this format does not
-  require importing or executing that class.
+  `diffusers.UNet2DConditionModel`, `transformers.CLIPTextModel`), or `""` when unknown. The pipeline's is
+  `diffusers.<_class_name>`. With a pipeline, a component's class is its `model_index.json` entry `[library, Class]`
+  as written (`stable_diffusion.StableDiffusionSafetyChecker`: `stable_diffusion` is a Diffusers pipeline module),
+  and `""` where the entry is `[null, null]` or absent. Without one, it is what the component's config names:
+  Transformers' `architectures[0]`, Diffusers' `_class_name`, or a tokenizer config's `tokenizer_class`. Reading
+  this format does not require importing or executing that class.
 - **Config:** the parsed JSON of the component's config file, as a structured map, never a file. Its values, and
   only those, MAY also be finite floats and `null` (`config-value` is a value, a float or `null`, lists and maps of
   them; §9). A component without a config file has an empty config.

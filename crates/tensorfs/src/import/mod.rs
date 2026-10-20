@@ -446,11 +446,12 @@ fn documents(
 /// order):
 /// - `model_index.json` is the pipeline: class `diffusers.<_class_name>`, config the parsed JSON.
 ///   Each entry `name: [library, Class]` is a component in folder `name`, tensors or not
-///   (schedulers, tokenizers, processors), of class `<library>.<Class>`.
-/// - Without one, a component named [`ROOT_COMPONENT`] owns the root (a Transformers folder).
+///   (schedulers, tokenizers, processors), of class `<library>.<Class>` as written; a component
+///   it names no class for has class `""`.
+/// - Without one, a component named [`ROOT_COMPONENT`] owns the root (a Transformers folder),
+///   and a component's class is its config's ([`class_of`]).
 /// - In a component's folder, the first of [`CONFIGS`] is its config, and the other run files
-///   ([`run_data`]) its assets. Its class is otherwise its config's: `architectures[0]`
-///   (Transformers), `_class_name` (Diffusers), a tokenizer config's `tokenizer_class`.
+///   ([`run_data`]) its assets.
 /// - Every other file is a repo file. A component with no tensors, config or assets is none.
 pub fn layout(mut files: BTreeMap<String, Vec<u8>>, tensored: &[String]) -> Result<Layout> {
     let pipeline = match files.remove(PIPELINE_FILE) {
@@ -500,19 +501,20 @@ pub fn layout(mut files: BTreeMap<String, Vec<u8>>, tensored: &[String]) -> Resu
             .map(|(path, rel)| (rel, files.remove(&path).expect("listed")))
             .collect();
         let file = CONFIGS.iter().find(|c| assets.contains_key(**c));
-        let (config, class) = match file {
-            Some(f) => {
-                let config = parse_config(&join(at, f), &assets.remove(*f).expect("found"))?;
-                let class = class_of(f, &config);
-                (config, class)
-            }
-            None => (Config::new(), String::new()),
+        let config = match file {
+            Some(f) => parse_config(&join(at, f), &assets.remove(*f).expect("found"))?,
+            None => Config::new(),
         };
         if file.is_none() && assets.is_empty() && !tensored.contains(&name) {
             continue;
         }
+        let class = match (&pipeline, file) {
+            (Some(_), _) => listed.get(&name).cloned().unwrap_or_default(),
+            (None, Some(f)) => class_of(f, &config),
+            (None, None) => String::new(),
+        };
         components.push(Folder {
-            class: listed.get(&name).cloned().unwrap_or(class),
+            class,
             name,
             config,
             config_file: file.filter(|f| **f != CONFIG_FILE).map(|f| f.to_string()),
@@ -558,7 +560,9 @@ fn parse_config(path: &str, bytes: &[u8]) -> Result<Config> {
     })
 }
 
-/// `<library>.<Class>` from a component's config file, `""` when it names none.
+/// A component's class without a pipeline, from its config file: Transformers'
+/// `architectures[0]`, Diffusers' `_class_name`, a tokenizer config's `tokenizer_class`; `""`
+/// when it names none.
 fn class_of(file: &str, config: &Config) -> String {
     let text = |key: &str| config.get(key).and_then(ConfigValue::as_str);
     let first = (config.get("architectures").and_then(ConfigValue::as_array))
