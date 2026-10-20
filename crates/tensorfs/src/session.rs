@@ -264,14 +264,22 @@ impl Client {
         source.file(reference, filename, local_dir).await
     }
 
-    /// None revision adds an unreleased tree, for local and remote repositories.
+    /// None revision adds an unreleased tree, for local and remote repositories. The folder may
+    /// be thin (headers and repo files): a chunk or asset it lacks comes from the store, and a
+    /// remote repository refuses only one the endpoint lacks too.
     pub async fn upload_folder(
         &self,
         reference: &Ref,
         folder: &Path,
         progress: Option<&Progress<'_>>,
     ) -> Result<ObjectRef> {
-        let tree = self.store.admit_folder(folder)?;
+        let (tree, absent) = self.store.admit_folder(folder)?;
+        if let (Some(object), true) = (absent.first(), reference.repo_id.starts_with("local/")) {
+            return fail(
+                Kind::NotFound,
+                format!("{}: in neither the folder nor the store", object.id()),
+            );
+        }
         let parsed = self.store.tree(&tree)?;
         let mut objects = vec![tree.clone()];
         objects.extend(parsed.files.values().cloned());

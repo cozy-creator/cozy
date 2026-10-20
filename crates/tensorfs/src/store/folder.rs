@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::Path;
 
-use super::{fail, Error, Result, Store};
+use super::{fail, Result, Store};
 use crate::format::{check_file, variant_of, Header, ObjectRef, Tree, CHUNKS_DIR};
 
 impl Store {
@@ -15,11 +15,12 @@ impl Store {
         self.put_bytes(&tree.to_json()?)
     }
 
-    /// Admits the plain folder `dir`: every object a header cites (from `chunks/`, or already
-    /// here), then the headers and repo files, then the tree, which it returns. Every byte is
-    /// hashed once, here. A cited object in neither place refuses the folder.
-    pub fn admit_folder(&self, dir: &Path) -> Result<ObjectRef> {
-        let mut tree = Tree::default();
+    /// Admits the plain folder `dir`: every object a header cites that `chunks/` has, then the
+    /// headers and repo files, then the tree. Every byte is hashed once, here. Returns the tree
+    /// and the cited objects in neither the folder nor this store (a thin folder whose bytes an
+    /// endpoint may already hold).
+    pub fn admit_folder(&self, dir: &Path) -> Result<(ObjectRef, Vec<ObjectRef>)> {
+        let (mut tree, mut absent) = (Tree::default(), Vec::new());
         for path in files(dir, "")? {
             let at = dir.join(&path);
             if variant_of(&path).is_some() {
@@ -29,11 +30,8 @@ impl Store {
                     match File::open(&chunk) {
                         Ok(file) => drop(self.put(file, Some(object))?),
                         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                            if !self.reuse(object)? {
-                                return Err(Error::Absent(format!(
-                                    "{} (cited by {path}): not in the folder or the store",
-                                    object.sha256
-                                )));
+                            if !self.reuse(object)? && !absent.contains(object) {
+                                absent.push(object.clone());
                             }
                         }
                         Err(e) => return Err(fail("open", &chunk)(e)),
@@ -45,7 +43,7 @@ impl Store {
                 tree.files.insert(path, self.put(file, None)?);
             }
         }
-        self.put_tree(&tree)
+        Ok((self.put_tree(&tree)?, absent))
     }
 
     /// The tree `tree` as a plain folder in `dir`: its repo files, the headers of `variants`

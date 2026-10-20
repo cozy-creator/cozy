@@ -1106,7 +1106,8 @@ fn a_plain_folder_round_trips_through_the_store() {
     assert_eq!(ck.asset("tokenizer", "vocab.txt").unwrap(), vocab);
 
     let store = scratch.store("store");
-    let tree = store.admit_folder(&dir).unwrap();
+    let (tree, absent) = store.admit_folder(&dir).unwrap();
+    assert!(absent.is_empty());
     let files: Vec<String> = store.tree(&tree).unwrap().files.into_keys().collect();
     assert_eq!(files, ["README.md", "model.bf16.cozytensors"]);
     let out = scratch.0.join("out");
@@ -1127,8 +1128,10 @@ fn a_plain_folder_round_trips_through_the_store() {
     assert_eq!(alone.missing(None).unwrap().len(), 3, "big.weight's two objects and the asset are the store's");
     let cached = Checkpoint::folder(&thin, Some("int8"), Some(&store)).unwrap();
     assert!(cached.read("unet", "big.weight").unwrap() == tensors[0].1);
-    assert!(scratch.store("empty").admit_folder(&thin).is_err(), "a thin folder needs its objects somewhere");
-    let thin_tree = store.admit_folder(&thin).unwrap();
+    let (_, absent) = scratch.store("empty").admit_folder(&thin).unwrap();
+    assert_eq!(absent.len(), 3, "big.weight's two objects and the asset are in neither place");
+    let (thin_tree, absent) = store.admit_folder(&thin).unwrap();
+    assert!(absent.is_empty());
     assert!(store.variant(&thin_tree, Some("int8")).unwrap().missing(None).unwrap().is_empty());
 
     let resumed = scratch.0.join("resumed");
