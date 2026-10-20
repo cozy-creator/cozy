@@ -45,7 +45,12 @@ fn holds(pin: &Pin) -> bool {
     let (Some(path), Some(header)) = (&pin.file, pin.roots.first()) else {
         return true;
     };
-    let kept = |e: io::Error| !matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory);
+    let kept = |e: io::Error| {
+        !matches!(
+            e.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+        )
+    };
     match fs::metadata(path) {
         Ok(meta) if !meta.is_file() || meta.len() != header.length => false,
         Ok(_) => fs::read(path).map_or_else(kept, |bytes| ObjectRef::of(&bytes) == *header),
@@ -154,7 +159,10 @@ impl Store {
     /// Roots `header` while the file at `path` (absolute) holds it: one record per path, so
     /// saving another header there replaces it.
     pub(crate) fn pin_file(&self, path: &Path, header: &ObjectRef) -> Result<()> {
-        let id = format!("file-{}", ObjectRef::of(path.as_os_str().as_encoded_bytes()).sha256);
+        let id = format!(
+            "file-{}",
+            ObjectRef::of(path.as_os_str().as_encoded_bytes()).sha256
+        );
         let pin = Pin {
             file: Some(path.to_owned()),
             ..Pin::new(vec![header.clone()])

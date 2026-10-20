@@ -536,9 +536,12 @@ impl Component {
         let tensor = self.data.raw.tensor(&self.name, key)?;
         let (encoding, parts) = match (self.read(key)?, &tensor.body) {
             (Read::Plain(bytes), _) => return Ok(bytes),
-            (Read::Encoded { encoding, parts, .. }, Body::Encoded { parts: stored, .. }) => {
-                (encoding, (parts, stored))
-            }
+            (
+                Read::Encoded {
+                    encoding, parts, ..
+                },
+                Body::Encoded { parts: stored, .. },
+            ) => (encoding, (parts, stored)),
             _ => unreachable!("a read follows the tensor's body"),
         };
         let (bytes, stored) = parts;
@@ -559,30 +562,29 @@ impl Component {
         let tensor = self.data.raw.tensor(&self.name, key)?;
         let role = match (options.role, &tensor.body) {
             (Some(_), _) if options.decode => {
-                return fail(Kind::Invalid, "a role reads one stored part; decode the whole tensor");
+                return fail(
+                    Kind::Invalid,
+                    "role and decode exclude each other: a role reads one stored part",
+                );
             }
             (Some(role), _) => role,
             (None, Body::Data(_)) => "",
             (None, Body::Encoded { parts, .. }) if !options.decode => {
                 let roles: Vec<_> = parts.iter().map(|p| p.role.as_str()).collect();
-                return fail(
-                    Kind::Invalid,
-                    format!("{key} is encoded: read it with decode or one role of {}", roles.join(", ")),
-                );
+                let roles = roles.join(", ");
+                let detail = format!("{key} is encoded: pass decode or a role ({roles})");
+                return fail(Kind::Invalid, detail);
             }
             (None, Body::Encoded { .. }) => {
                 let bytes = self.read_decoded(key)?;
-                let range = usize::try_from(options.offset)
-                    .ok()
-                    .and_then(|start| Some(start..start.checked_add(out.len())?))
-                    .filter(|range| range.end <= bytes.len());
-                let Some(range) = range else {
-                    return fail(
-                        Kind::Invalid,
-                        format!("{key}: {} bytes from {} of {}", out.len(), options.offset, bytes.len()),
-                    );
+                let start = usize::try_from(options.offset).unwrap_or(usize::MAX);
+                let end = start.checked_add(out.len()).unwrap_or(usize::MAX);
+                let Some(window) = bytes.get(start..end) else {
+                    let (len, total) = (out.len(), bytes.len());
+                    let detail = format!("{key}: {len} bytes from {start} of {total}");
+                    return fail(Kind::Invalid, detail);
                 };
-                out.copy_from_slice(&bytes[range]);
+                out.copy_from_slice(window);
                 return Ok(());
             }
         };

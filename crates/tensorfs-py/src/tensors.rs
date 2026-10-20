@@ -88,15 +88,17 @@ impl PyTensors {
             .tensor(&self.component, &key)
             .ok_or_else(|| invalid(py, "no such tensor"))?;
         if role.is_some() && decode_ {
-            return Err(invalid(py, "a role reads one stored part; decode the whole tensor"));
+            return Err(invalid(
+                py,
+                "role and decode exclude each other: a role reads one stored part",
+            ));
         }
         if let (None, Body::Encoded { encoding, parts }) = (role, &t.body) {
             if !decode_ {
                 let roles: Vec<_> = parts.iter().map(|p| p.role.as_str()).collect();
-                return Err(invalid(
-                    py,
-                    format!("{key} is encoded: read it with decode=True or one role= of {}", roles.join(", ")),
-                ));
+                let roles = roles.join(", ");
+                let detail = format!("{key} is encoded: pass decode=True or a role ({roles})");
+                return Err(invalid(py, detail));
             }
             let length = t
                 .dtype
@@ -511,7 +513,8 @@ impl PyTensors {
     ) -> PyResult<()> {
         if out.hasattr("__dlpack__")? {
             let mut held = crate::store::Dlpack::of(py, out, None, None)?;
-            let result = self.fill_target(py, key, role.as_deref(), decode, offset, held.destination());
+            let result =
+                self.fill_target(py, key, role.as_deref(), decode, offset, held.destination());
             if result.is_err() {
                 held.record_cuda_error();
             }

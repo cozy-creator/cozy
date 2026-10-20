@@ -470,8 +470,12 @@ impl PyComponent {
             .as_ref()
             .ok_or_else(|| invalid(py, "a parsed header has no support files here"))?;
         checkpoint.fetch_assets(py, &self.name, None)?;
-        py.detach(|| checkpoint.component(&self.name)?.export_files(directory.as_deref()))
-            .or_raise(py)
+        py.detach(|| {
+            checkpoint
+                .component(&self.name)?
+                .export_files(directory.as_deref())
+        })
+        .or_raise(py)
     }
     /// Asset `name`'s bytes; a parsed header has none.
     fn asset<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyBytes>> {
