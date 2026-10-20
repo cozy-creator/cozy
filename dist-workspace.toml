@@ -5,7 +5,7 @@ members = ["cargo:."]
 cargo-dist-version = "0.33.0"
 # release.yml is dist's output plus hand edits, each marked HAND-EDITED there: the `must_contain` and
 # `tensorfs_run` dispatch inputs and the plan job's first step, which refuses a release missing any
-# must_contain commit, and the global job's step naming the supported platforms in the shell installer.
+# must_contain commit, and the global job's step patching the installers (supported platforms, PowerShell PATH).
 # After `dist generate` (or a dist upgrade), put them back.
 allow-dirty = ["ci"]
 ci = "github"
