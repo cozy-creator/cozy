@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use platform::{
     durable::Mode as _,
-    handles::Owned,
     ipc::{LocalListener, LocalStream},
 };
 use std::{

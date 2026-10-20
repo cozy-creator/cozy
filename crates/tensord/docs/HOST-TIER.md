@@ -82,9 +82,9 @@ read ahead into the page cache while it imports; nothing is allocated before its
   executor keeps them for its weight sets' life (it lifts its own NOFILE limit).
 - No lock across a fill: other asks, and other models' executors, proceed meanwhile; a second ask
   for a layout being filled gets the same layout.
-- Releasing a CPU layout frees its host backing when its holders finish. Evicting GPU mappings
-  is a separate Runtime/device-plane operation requested by TensorD's memory policy; see
-  [resident custody](RESIDENT-CUSTODY.md) for shared GPU handles.
+- The [placement ledger](../../varena/src/ledger.rs) owns RAM layouts and shared GPU handles.
+  It retains each RAM layout while live views hold it; Runtime declares page use and the
+  placement policy chooses evictions. TensorD holds no separate GPU-byte policy.
 - `GpuPool` appends one line per Load to `<state>/gpu/loads.jsonl`: executor load facts and the
   host tier's facts (fills with ms, bytes by read mode and disk reads; hits;
   releases), and the machine's and executor's RSS/PSS.

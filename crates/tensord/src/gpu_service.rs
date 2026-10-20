@@ -730,7 +730,7 @@ impl Pool {
                     .ok_or_else(|| io::Error::other("GPU root has no owned state parent"))?,
             )?;
         }
-        // GPU custody holds one descriptor per chunk.
+        // The placement library retains one descriptor per exported page chunk.
         platform::process::raise_fd_limit();
         let envelope = config.envelope();
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
@@ -1555,25 +1555,6 @@ impl Pool {
         Vec::new()
     }
 
-    /// Idle executors whose channel failed end, and what they held (context, leases) with them:
-    /// another tenant's failure is never the asking call's.
-    fn end_failed(&self, failed: Vec<(String, Birth, io::Error)>) {
-        for (key, birth, error) in failed {
-            let session = {
-                let mut sessions = self.sessions.lock().unwrap();
-                if !sessions.get(&key).is_some_and(|session| owns_birth(&session.executor.birth, &[], &birth)) {
-                    continue;
-                }
-                sessions.remove(&key).unwrap()
-            };
-            tracing::warn!("memory: idle executor {key} failed ({error}); ending it");
-            let (plan, start, degree) = (session.plan.clone(), session.start, session.degree);
-            if let Err(error) = session.executor.terminate() {
-                tracing::warn!("memory: ending idle executor {key}: {error}");
-            }
-            self.ended(&plan, start, degree);
-        }
-    }
     /// Idle executors that exited leave the ledger now: no GPU charges what they held.
     fn reap(&self) {
         let gone: Vec<Session> = {
