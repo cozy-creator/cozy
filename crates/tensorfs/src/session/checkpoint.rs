@@ -579,7 +579,7 @@ impl Component {
             (None, Body::Encoded { .. }) => {
                 let bytes = self.read_decoded(key)?;
                 let start = usize::try_from(options.offset).unwrap_or(usize::MAX);
-                let end = start.checked_add(out.len()).unwrap_or(usize::MAX);
+                let end = start.saturating_add(out.len());
                 let Some(window) = bytes.get(start..end) else {
                     let (len, total) = (out.len(), bytes.len());
                     let detail = format!("{key}: {len} bytes from {start} of {total}");
