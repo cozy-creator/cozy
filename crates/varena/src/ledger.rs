@@ -872,10 +872,13 @@ impl Row {
         self.table.changed();
         Ok(())
     }
-    pub fn wait_ask(&self) -> Result<Ask> {
+    pub fn wait_ask(&self, stop: &AtomicBool) -> Result<Option<Ask>> {
         let slot = self.table.slot(self.owner)?;
         loop {
             let before = slot.bell.load(Acquire);
+            if stop.load(Acquire) {
+                return Ok(None);
+            }
             for ceiling in Class::ALL {
                 let index = ceiling.as_usize();
                 let (asked, handled) = slot
@@ -887,15 +890,22 @@ impl Row {
                 if sequence > done {
                     slot.wakeups.fetch_add(1, Release);
                     self.table.changed();
-                    return Ok(Ask {
+                    return Ok(Some(Ask {
                         ceiling,
                         bytes: sequence - done,
                         sequence,
-                    });
+                    }));
                 }
             }
             wait(&slot.bell, before);
         }
+    }
+    /// Wake a blocked reclaim worker after its close flag changes.
+    pub fn wake(&self) -> Result<()> {
+        let slot = self.table.slot(self.owner)?;
+        slot.bell.fetch_add(1, Release);
+        wake(&slot.bell);
+        Ok(())
     }
     pub fn ack(&self, ask: Ask) -> Result<()> {
         let slot = self.table.slot(self.owner)?;
