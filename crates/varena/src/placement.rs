@@ -513,6 +513,7 @@ impl Placement {
             .ok_or_else(|| invalid("unknown request"))?;
         request.steps = groups.into_iter().map(|(models, _)| models).collect();
         request.explicit = !request.steps.is_empty();
+        request.budgets.clear();
         Ok(())
     }
 
@@ -981,10 +982,14 @@ impl Placement {
         let mut inner = self.inner.lock();
         inner.caches.remove(&id);
         inner.table.pages.retain(|page| page.id != id);
+        self.changed.notify_all();
     }
 
     pub fn cache_active(&self, id: PageId, active: bool) -> Result<()> {
         let mut inner = self.inner.lock();
+        while active && inner.caches.get(&id).is_some_and(|cache| cache.busy) {
+            self.changed.wait(&mut inner);
+        }
         let cache = inner
             .caches
             .get_mut(&id)
@@ -1684,6 +1689,7 @@ impl Drop for Callback<'_> {
             page.pins = pins;
         }
         drop(inner);
+        self.owner.changed.notify_all();
         let _ = self.owner.row.wake();
     }
 }
