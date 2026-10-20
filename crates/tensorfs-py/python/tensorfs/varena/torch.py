@@ -434,17 +434,18 @@ class Cache:
 
     @contextmanager
     def serving(self) -> Iterator[None]:
-        native = self.memory.native
-        if native is not None:
-            native.cache_active(self.id, True)
-            request = self.memory._current()
-            for hold in self.holds:
-                native.retained_bind(request.native_id, hold.model.ws.id)
+        native, active = self.memory.native, False
         try:
+            if native is not None:
+                request = self.memory._current()
+                native.cache_active(self.id, True)
+                active = True
+                for hold in self.holds:
+                    native.retained_bind(request.native_id, hold.model.ws.id)
             with cuts.caught() if self.memory.cuda else nullcontext():
                 yield
         finally:
-            if native is not None and not self.closed:
+            if native is not None and active and not self.closed:
                 native.cache_active(self.id, False)
 
     def hold(self, model: Model) -> Hold:
