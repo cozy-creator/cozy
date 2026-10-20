@@ -12,7 +12,7 @@ fn main() {
         println!("cargo:rustc-cfg=require_aot");
     }
     let source = if catalog.exists() {
-        for name in ["kernels.py", "build.py"] {
+        for name in ["kernels.py", "build.py", "abi.py"] {
             let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
             assert_eq!(
                 fs::read(root.join("../tensorfs-py/kernels").join(name)).unwrap(),
