@@ -1,7 +1,7 @@
 //! TensorD's placement interface. The ledger owns custody and RAM service; TensorD never
 //! opens a CUDA context or reconstructs the executor's eviction order.
 
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use varena::ledger::{Grant, Ledger, Status};
 
@@ -13,6 +13,9 @@ impl Memory {
             limit.map_or(card_bytes, |cap| cap.min(card_bytes)),
         )
         .map(|l| Self(Arc::new(l)))
+    }
+    pub fn grant_unbound(&self) -> varena::Result<Grant> {
+        self.0.grant_unbound()
     }
     pub fn grant(&self, pid: u32) -> varena::Result<Grant> {
         self.0.grant(pid)
