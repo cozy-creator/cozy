@@ -3,6 +3,7 @@
 pub mod call;
 pub mod learned;
 pub mod policy;
+#[cfg_attr(not(unix), path = "slim_off.rs")]
 pub mod slim;
 
 use policy::{Facts, Gpu, Holding, Step};
@@ -71,7 +72,7 @@ impl GpuMemory {
             .ok_or_else(|| std::io::Error::other("GPU inventory is required for placement"))
     }
     pub fn capacity(&self) -> Option<u64> {
-        self.placement.as_ref().map(|m| m.ledger().capacity())
+        self.placement.as_ref().map(|m| m.capacity())
     }
     pub fn with<T>(&self, f: impl FnOnce(&mut Gpu) -> T) -> T {
         f(&mut self

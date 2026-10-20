@@ -876,7 +876,8 @@ impl Pool {
     /// child, an idle deviceless executor, then an idle executor (outside every warm set
     /// first) on a GPU no call holds. Whether anything went back.
     pub fn give_back_one(&self) -> bool {
-        self.end_idle_parent(false) > 0
+        self.devices.iter().any(|device| device.memory.placement().is_ok_and(|memory| memory.release_unused_ram()))
+            || self.end_idle_parent(false) > 0
             || self.end_idle_deviceless(|_| true)
             || self.end_lru_idle("", false, 0..0)
     }
@@ -1992,6 +1993,9 @@ impl Pool {
     fn fits(&self, plan: &str, device: usize) -> bool {
         self.devices[device].memory.fits(plan, Vec::new)
     }
+    #[cfg(not(unix))]
+    fn watch_memory(self: &Arc<Self>, _: &Arc<Engine>) {}
+    #[cfg(unix)]
     fn watch_memory(self: &Arc<Self>, engine: &Arc<Engine>) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else { return; };
         let mut watchers = self.memory_watchers.lock().unwrap();

@@ -14,7 +14,7 @@ use std::ffi::{c_int, c_void};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crossbeam_queue::SegQueue;
@@ -135,6 +135,14 @@ impl Event {
         call!(
             "cuStreamWaitEvent",
             stream_wait_event(stream as cuda::CUstream, self.raw as cuda::CUevent, 0)
+        )
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        let _context = self.device.enter()?;
+        call!(
+            "cuEventSynchronize",
+            event_synchronize(self.raw as cuda::CUevent)
         )
     }
 }
@@ -309,11 +317,14 @@ struct Page {
     fingerprint: String,
     state: Mutex<State>,
     retired: AtomicBool,
+    write_pins: AtomicUsize,
+    write_events: Mutex<Vec<Event>>,
 }
 
 struct Release {
     page: Arc<Page>,
     streams: BTreeSet<usize>,
+    writable: bool,
 }
 
 /// Holds mappings, never chooses victims. The policy invokes fill/unmap with page IDs.
@@ -456,6 +467,8 @@ impl Gpu {
                 fingerprint,
                 state: Mutex::new(State::Empty),
                 retired: AtomicBool::new(false),
+                write_pins: AtomicUsize::new(0),
+                write_events: Mutex::new(Vec::new()),
             }),
         );
         Ok(())
@@ -470,41 +483,41 @@ impl Gpu {
     }
 
     /// Called on an I/O worker, outside the policy lock. A concurrent bind sees Filling.
-    pub fn fill(&self, id: PageId) -> Result<ReadStats> {
-        self.fill_bytes(id, None, |_, _, _| Ok(()))
+    pub fn fill(self: &Arc<Self>, id: PageId) -> Result<ReadStats> {
+        self.fill_bytes(id, None, |_| Ok(()))
     }
 
     /// The RAM-tier lease must remain alive for this call. TensorFS still performs
     /// the transfer; the mechanism only selects a ready source and its destination.
-    pub fn fill_from_ram(&self, id: PageId, bytes: &[u8]) -> Result<ReadStats> {
-        self.fill_bytes(id, Some(bytes), |_, _, _| Ok(()))
+    pub fn fill_from_ram(self: &Arc<Self>, id: PageId, bytes: &[u8]) -> Result<ReadStats> {
+        self.fill_bytes(id, Some(bytes), |_| Ok(()))
     }
 
     /// A declared page-in transform runs only on a new, private writable mapping.
     /// It must order GPU work onto the supplied stream; completion is checked before
     /// the page becomes read-only and may be shared or exported.
     pub fn fill_with(
-        &self,
+        self: &Arc<Self>,
         id: PageId,
-        transform: impl FnOnce(u64, u64, usize) -> Result<()>,
+        transform: impl FnOnce(FillPin) -> Result<()>,
     ) -> Result<ReadStats> {
         self.fill_bytes(id, None, transform)
     }
 
     pub fn fill_from_ram_with(
-        &self,
+        self: &Arc<Self>,
         id: PageId,
         bytes: &[u8],
-        transform: impl FnOnce(u64, u64, usize) -> Result<()>,
+        transform: impl FnOnce(FillPin) -> Result<()>,
     ) -> Result<ReadStats> {
         self.fill_bytes(id, Some(bytes), transform)
     }
 
     fn fill_bytes(
-        &self,
+        self: &Arc<Self>,
         id: PageId,
         ram: Option<&[u8]>,
-        transform: impl FnOnce(u64, u64, usize) -> Result<()>,
+        transform: impl FnOnce(FillPin) -> Result<()>,
     ) -> Result<ReadStats> {
         let page = self.page(id)?;
         if ram.is_some_and(|bytes| bytes.len() as u64 != page.bytes) {
@@ -560,7 +573,26 @@ impl Gpu {
                     )
                 }?,
             };
-            transform(mapping.ptr(), mapping.bytes, self.device.stream.raw())?;
+            page.write_pins.fetch_add(1, Ordering::AcqRel);
+            transform(FillPin {
+                gpu: self.clone(),
+                page: page.clone(),
+                ptr: mapping.ptr(),
+                bytes: mapping.bytes,
+                stream: self.device.stream.raw(),
+                streams: Mutex::new(BTreeSet::from([self.device.stream.raw()])),
+            })?;
+            self.poll()?;
+            if page.write_pins.load(Ordering::Acquire) != 0 {
+                return Err(Error::Internal(
+                    "a page-in transform retained a writable view",
+                ));
+            }
+            let mut events = page.write_events.lock();
+            for event in events.iter() {
+                event.synchronize()?;
+            }
+            events.clear();
             self.device.stream.drain()?;
             let _context = self.device.enter()?;
             self.device.access(mapping.ptr(), mapping.bytes, true)?;
@@ -617,6 +649,32 @@ impl Gpu {
     pub fn poll(&self) -> Result<()> {
         let mut changed = false;
         while let Some(release) = self.releases.pop() {
+            if release.writable {
+                for stream in &release.streams {
+                    if *stream == 2 {
+                        let done = self
+                            .device
+                            .enter()
+                            .and_then(|_context| call!("cuCtxSynchronize", ctx_synchronize()));
+                        if let Err(error) = done {
+                            self.releases.push(release);
+                            return Err(error);
+                        }
+                        continue;
+                    }
+                    let event = Event::record(&self.device, *stream);
+                    match event {
+                        Ok(event) => release.page.write_events.lock().push(event),
+                        Err(error) => {
+                            self.releases.push(release);
+                            return Err(error);
+                        }
+                    }
+                }
+                release.page.write_pins.fetch_sub(1, Ordering::AcqRel);
+                changed = true;
+                continue;
+            }
             let mut state = release.page.state.lock();
             if let State::Ready(mapping) = &mut *state {
                 for stream in &release.streams {
@@ -654,13 +712,30 @@ impl Gpu {
             .pages
             .lock()
             .iter()
-            .filter(|(_, page)| page.retired.load(Ordering::Acquire))
             .map(|(id, page)| (*id, page.clone()))
             .collect();
         for (id, page) in candidates {
             let mut state = page.state.lock();
+            let retired = page.retired.load(Ordering::Acquire);
+            if let State::Failed(mapping, _) = &mut *state {
+                if page.write_pins.load(Ordering::Acquire) == 0 {
+                    io::drain(self.device.ordinal)?;
+                    self.device.stream.drain()?;
+                    let mut events = page.write_events.lock();
+                    for event in events.iter() {
+                        event.synchronize()?;
+                    }
+                    events.clear();
+                    mapping.release(true)?;
+                    *state = State::Empty;
+                    changed = true;
+                }
+            }
+            if !retired {
+                continue;
+            }
             let removable = match &mut *state {
-                State::Empty => true,
+                State::Empty => page.write_pins.load(Ordering::Acquire) == 0,
                 State::Ready(mapping) if mapping.pins == 0 => {
                     if mapping.idle()? {
                         mapping.release(true)?;
@@ -740,6 +815,9 @@ impl Gpu {
     pub fn unmap(&self, id: PageId) -> Result<bool> {
         self.poll()?;
         let page = self.page(id)?;
+        if page.write_pins.load(Ordering::Acquire) != 0 {
+            return Ok(false);
+        }
         let mut state = page.state.lock();
         match &mut *state {
             State::Empty => Ok(true),
@@ -915,6 +993,14 @@ impl Gpu {
         for page in pages {
             let mut state = page.state.lock();
             if let State::Failed(mapping, _) = &mut *state {
+                if page.write_pins.load(Ordering::Acquire) != 0 {
+                    continue;
+                }
+                let mut events = page.write_events.lock();
+                for event in events.iter() {
+                    event.synchronize()?;
+                }
+                events.clear();
                 mapping.release(true)?;
                 *state = State::Empty;
             }
@@ -993,6 +1079,37 @@ impl Drop for Pin {
         self.gpu.releases.push(Release {
             page: self.page.clone(),
             streams: self.streams.get_mut().clone(),
+            writable: false,
+        });
+        self.gpu.notify();
+    }
+}
+
+/// A writable page view exists only during a page-in transform. An escaped view
+/// keeps the allocation and source alive and prevents read-only publication.
+pub struct FillPin {
+    gpu: Arc<Gpu>,
+    page: Arc<Page>,
+    pub ptr: u64,
+    pub bytes: u64,
+    pub stream: usize,
+    streams: Mutex<BTreeSet<usize>>,
+}
+impl FillPin {
+    pub fn device(&self) -> i32 {
+        self.gpu.device()
+    }
+    pub fn wait_on(&self, stream: usize) -> Result<()> {
+        self.streams.lock().insert(stream);
+        Event::record(&self.gpu.device, self.stream)?.wait(stream)
+    }
+}
+impl Drop for FillPin {
+    fn drop(&mut self) {
+        self.gpu.releases.push(Release {
+            page: self.page.clone(),
+            streams: self.streams.get_mut().clone(),
+            writable: true,
         });
         self.gpu.notify();
     }
