@@ -345,13 +345,23 @@ impl Checkpoint {
         let mut allowed = self.wanted(&Selection::All)?;
         allowed.push(self.id().clone());
         allowed.extend(self.data.tree.iter().cloned());
-        let allowed: BTreeMap<_, _> = allowed
-            .into_iter()
-            .map(|o| (o.sha256.clone(), o.length))
-            .collect();
+        let mut allowed: std::collections::BTreeSet<_> = allowed.into_iter().collect();
+        // Explicit context objects are independent of checkpoint-only All. A request for
+        // the tree itself must also work when that metadata needs to be downloaded again.
+        if objects.iter().any(|object| !allowed.contains(object)) {
+            if let Some(tree) = &self.data.tree {
+                allowed.extend(
+                    self.data
+                        .store
+                        .tree(tree)?
+                        .repo_files()
+                        .map(|(_, object)| object.clone()),
+                );
+            }
+        }
         let mut selected = BTreeMap::new();
         for object in objects {
-            if allowed.get(&object.sha256) != Some(&object.length) {
+            if !allowed.contains(object) {
                 return fail(
                     Kind::Invalid,
                     format!("{} is not an exact object of this checkpoint", object.id()),

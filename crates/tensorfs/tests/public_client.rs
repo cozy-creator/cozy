@@ -982,9 +982,22 @@ async fn advanced_exact_object_fetch_does_not_widen_the_window_and_uses_the_exis
         .upload_folder(&"acme/exact".parse().unwrap(), &data.folder, None)
         .await
         .unwrap();
+    let http = Http::new(origin);
     let cache = scratch.0.join("reader-cache");
-    let reader = Client::new(config(&cache, origin.to_str().unwrap())).unwrap();
+    let reader = Client::new(config(&cache, &http.url)).unwrap();
     let checkpoint = reader.open(&tree.id(), &Open::default()).await.unwrap();
+    let readme = fs::read(data.folder.join("README.md")).unwrap();
+    let repo_object = ObjectRef::of(&readme);
+    assert!(!checkpoint
+        .missing(&Selection::All)
+        .unwrap()
+        .contains(&repo_object));
+    assert!(!checkpoint
+        .verify(&Selection::All)
+        .unwrap()
+        .missing
+        .contains(&repo_object));
+    let before_invalid = http.requests.lock().unwrap().len();
     assert_eq!(
         tensorfs::raw::fetch_objects(
             &checkpoint,
@@ -1006,6 +1019,22 @@ async fn advanced_exact_object_fetch_does_not_widen_the_window_and_uses_the_exis
             .unwrap_err()
             .kind,
         Kind::Invalid
+    );
+    let wrong_repo_length = ObjectRef {
+        length: repo_object.length + 1,
+        ..repo_object.clone()
+    };
+    assert_eq!(
+        tensorfs::raw::fetch_objects(&checkpoint, &[wrong_repo_length], &Download::default())
+            .await
+            .unwrap_err()
+            .kind,
+        Kind::Invalid
+    );
+    assert_eq!(
+        http.requests.lock().unwrap().len(),
+        before_invalid,
+        "an invalid exact reference started transport I/O"
     );
     tensorfs::raw::fetch_objects(&checkpoint, &data.chunks[..1], &Download::default())
         .await
@@ -1031,4 +1060,50 @@ async fn advanced_exact_object_fetch_does_not_widen_the_window_and_uses_the_exis
             .unwrap();
     }
     assert_eq!(&bytes, b"cdef");
+    // Only the explicitly named repository object moves; it never widens the tensor window.
+    tensorfs::raw::fetch_objects(
+        &checkpoint,
+        std::slice::from_ref(&repo_object),
+        &Download::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read(cache.join(repo_object.key())).unwrap(), readme);
+    assert!(http.fetched(&repo_object));
+    assert!(!cache.join(data.chunks[1].key()).exists());
+    assert!(!cache.join(data.chunks[2].key()).exists());
+    assert!(!cache.join(data.asset.key()).exists());
+
+    fs::remove_file(cache.join(repo_object.key())).unwrap();
+    checkpoint.download(&Download::default()).await.unwrap();
+    assert!(checkpoint.missing(&Selection::All).unwrap().is_empty());
+    assert!(checkpoint.verify(&Selection::All).unwrap().is_ok());
+    assert!(
+        !cache.join(repo_object.key()).exists(),
+        "checkpoint All downloaded a repository object"
+    );
+
+    // Explicit tree permission survives missing metadata; All and verification ignore it.
+    fs::remove_file(cache.join(tree.key())).unwrap();
+    assert!(checkpoint.missing(&Selection::All).unwrap().is_empty());
+    assert!(checkpoint.verify(&Selection::All).unwrap().is_ok());
+    tensorfs::raw::fetch_objects(
+        &checkpoint,
+        std::slice::from_ref(&tree),
+        &Download::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ObjectRef::of(&fs::read(cache.join(tree.key())).unwrap()),
+        tree
+    );
+    tensorfs::raw::fetch_objects(
+        &checkpoint,
+        std::slice::from_ref(&repo_object),
+        &Download::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read(cache.join(repo_object.key())).unwrap(), readme);
 }
