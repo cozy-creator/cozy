@@ -33,6 +33,36 @@ pub enum Relief {
     Exhausted(u64),
 }
 
+#[derive(Default)]
+struct BindRetry {
+    available: Option<u64>,
+}
+
+impl BindRetry {
+    fn after_oom(&self, available: u64, need: u64) -> Result<u64> {
+        if self.available.is_some_and(|prior| available <= prior) {
+            // A driver OOM disproves the unchanged ledger estimate. Asking for
+            // that same absolute room again is not recovery: reclaim additional
+            // bytes through the ordinary policy, or reach Lower/Exhausted.
+            available
+                .checked_add(need)
+                .ok_or_else(|| invalid("mapping recovery room overflow"))
+        } else {
+            // The first checked recovery, or genuinely increased room, gets one
+            // retry before a further OOM requires additional reclamation.
+            Ok(need)
+        }
+    }
+
+    fn advance(&mut self, available: u64) -> bool {
+        if self.available.is_some_and(|prior| available <= prior) {
+            return false;
+        }
+        self.available = Some(available);
+        true
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Event {
     pub sequence: u64,
@@ -928,7 +958,7 @@ impl Placement {
         if let Some(model) = demand {
             self.enter(request, model)?;
         }
-        let mut previous = None;
+        let mut retry = BindRetry::default();
         loop {
             self.wait_fill(page)?;
             if let Some(row) = self
@@ -946,6 +976,9 @@ impl Placement {
                 Ok(outcome) => outcome,
                 Err(error) if error.is_oom() => {
                     self.gpu.recover()?;
+                    self.refresh()?;
+                    let available = self.inner.lock().table.available();
+                    let need = retry.after_oom(available, need)?;
                     self.drive(request, Trigger::Oom { request, need })?
                 }
                 Err(error) => return Err(error),
@@ -1036,17 +1069,15 @@ impl Placement {
                 }
             }
             self.refresh()?;
-            let facts = {
-                let inner = self.inner.lock();
-                (inner.progress, inner.table.available())
-            };
-            if previous == Some(facts) {
+            let available = self.inner.lock().table.available();
+            // Failed fills emit diagnostics too. Only increasing actual room,
+            // never an event sequence or an oscillating snapshot, permits retry.
+            if !retry.advance(available) {
                 return Err(Error::DeviceFull {
                     need,
                     deficit: need,
                 });
             }
-            previous = Some(facts);
         }
     }
 
@@ -2279,6 +2310,31 @@ mod gpu_tests {
     use tensorfs::io::source::{Item, ItemSource};
 
     #[test]
+    fn bind_retry_requires_increasing_room_after_checked_recovery() {
+        let mut retry = BindRetry::default();
+        assert_eq!(retry.after_oom(100, 20).unwrap(), 20);
+        assert!(retry.advance(100));
+        assert_eq!(retry.after_oom(100, 20).unwrap(), 120);
+        assert!(!retry.advance(100));
+        assert!(!retry.advance(90));
+        assert_eq!(retry.after_oom(90, 20).unwrap(), 110);
+        assert!(!retry.advance(100), "oscillation is not new room");
+        assert_eq!(retry.after_oom(120, 20).unwrap(), 20);
+        assert!(retry.advance(120));
+        assert_eq!(retry.after_oom(120, 20).unwrap(), 140);
+    }
+
+    #[test]
+    fn bind_retry_does_not_wrap_additional_room() {
+        let mut retry = BindRetry::default();
+        assert!(retry.advance(u64::MAX));
+        assert!(matches!(
+            retry.after_oom(u64::MAX, 1),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
     fn content_catalog_counts_payload_separately_from_padding_and_mapping() {
         let layout = Layout {
             parts: vec![],
@@ -2815,6 +2871,143 @@ mod gpu_tests {
         assert!(matches!(gpu.try_pin(1, 0).unwrap(), BindState::Empty));
         gpu.unregister(1).unwrap();
         println!("PASS actual readiness survives concurrent fill and unmap {uuid}");
+    }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn failed_fills_require_real_room_and_recover_in_the_same_placement() {
+        use std::sync::atomic::AtomicUsize;
+
+        let probe = Gpu::open(0).expect("real CUDA device");
+        let uuid = assigned_gpu(&probe);
+        let capacity = 32 << 20;
+        assert!(probe.capacity().unwrap() >= capacity);
+        drop(probe);
+        let name = format!(
+            "bind-oom-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        struct Named(String);
+        impl Drop for Named {
+            fn drop(&mut self) {
+                let uid = unsafe { libc::geteuid() };
+                let _ = std::fs::remove_file(format!("/dev/shm/varena-{}-{uid}", self.0));
+            }
+        }
+        let _named = Named(name.clone());
+        let ledger = Ledger::create(&name, capacity).expect("scoped ledger");
+        let grant = ledger.grant_unbound().expect("rank grant");
+        let placement = Placement::open(0, Some((grant.table, grant.events, grant.channel)))
+            .expect("actual CUDA placement");
+        let layout = Layout {
+            parts: vec![],
+            regions: vec![crate::layout::Region {
+                offset: 0,
+                nbytes: 32,
+                span: crate::layout::REGION_ALIGN,
+                items: vec![Item {
+                    offset: 0,
+                    len: 32,
+                    source: ItemSource::Inline(vec![7; 32].into()),
+                    part_end: true,
+                }],
+            }],
+            nbytes: crate::layout::REGION_ALIGN,
+            digest: "bind-oom".into(),
+            names: vec![],
+        };
+        let source = Arc::new(Source::files(vec![], false, 0));
+        let victim = placement
+            .register(2, "idle".into(), [45; 32], &layout, source.clone(), None)
+            .unwrap()[0];
+        assert_eq!(placement.load(2, Tier::Gpu).unwrap(), Relief::Complete);
+        let failing = Arc::new(AtomicBool::new(true));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let weak = Arc::downgrade(&placement);
+        let fail = failing.clone();
+        let attempted = calls.clone();
+        let target = placement
+            .register(
+                1,
+                "target".into(),
+                [46; 32],
+                &layout,
+                source,
+                Some(Arc::new(move |_, _| {
+                    if !fail.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let attempt = attempted.fetch_add(1, Ordering::AcqRel) + 1;
+                    let placement = weak.upgrade().expect("live placement");
+                    let idle_mapped = placement
+                        .gpu
+                        .facts()?
+                        .iter()
+                        .any(|(id, bytes, _, _)| *id == victim && *bytes != 0);
+                    // The unchanged implementation reaches this sentinel rather
+                    // than hanging the GPU harness: its own failed-fill events
+                    // masquerade as progress, without reclaiming the idle page.
+                    if attempt >= 3 && idle_mapped {
+                        return Err(invalid("failed fill retried without real reclaim"));
+                    }
+                    Err(Error::Cuda {
+                        op: "injected fill allocation",
+                        code: 2,
+                        name: "CUDA_ERROR_OUT_OF_MEMORY".into(),
+                    })
+                })),
+            )
+            .unwrap()[0];
+        placement
+            .begin(1, vec![vec![1]], "bind-oom".into(), "".into())
+            .unwrap();
+        let error = match placement.bind(1, target, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("injected OOM unexpectedly bound"),
+        };
+        assert!(matches!(error, Error::DeviceFull { .. }), "{error}");
+        assert_eq!(calls.load(Ordering::Acquire), 3);
+        assert!(placement
+            .gpu
+            .facts()
+            .unwrap()
+            .iter()
+            .any(|(id, bytes, _, _)| *id == victim && *bytes == 0));
+        let stats = placement.end(1).expect("failed request ends normally");
+        assert_eq!(stats.copies.len(), 3);
+        assert!(placement.inner.lock().requests.is_empty());
+
+        failing.store(false, Ordering::Release);
+        placement
+            .begin(1, vec![vec![1]], "bind-oom".into(), "".into())
+            .expect("same request identity is reusable");
+        let pin = placement.bind(1, target, 0).expect("same-process recovery");
+        let mut bytes = [0_u8; 32];
+        // The actual pin protects the source through this synchronous read.
+        unsafe {
+            tensorfs::io::read(
+                &[tensorfs::io::Copy {
+                    src: tensorfs::io::Src::Device {
+                        device: 0,
+                        ptr: pin.ptr,
+                        stream: 0,
+                    },
+                    dst: tensorfs::io::Dst::host(&mut bytes),
+                }],
+                &tensorfs::io::ReadOpts::default(),
+            )
+        }
+        .expect("recovered content");
+        assert_eq!(bytes, [7; 32]);
+        drop(pin);
+        placement.gpu.wait_pending().unwrap();
+        placement.end(1).unwrap();
+        placement.close().unwrap();
+        println!("PASS failed fills require real room and recover in the same placement {uuid}");
     }
 
     #[test]
