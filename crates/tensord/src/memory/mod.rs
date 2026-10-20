@@ -73,18 +73,6 @@ impl GpuMemory {
     pub fn capacity(&self) -> Option<u64> {
         self.placement.as_ref().map(|m| m.ledger().capacity())
     }
-    pub fn used(&self) -> Option<u64> {
-        self.placement.as_ref()?.status().ok().map(|s| {
-            s.rows
-                .iter()
-                .map(|r| {
-                    r.snapshot
-                        .context
-                        .saturating_add(r.snapshot.classes.iter().copied().sum::<u64>())
-                })
-                .sum()
-        })
-    }
     pub fn with<T>(&self, f: impl FnOnce(&mut Gpu) -> T) -> T {
         f(&mut self
             .records
@@ -108,12 +96,6 @@ impl GpuMemory {
         _: impl FnMut(&Step) -> std::io::Result<bool>,
     ) -> std::io::Result<Option<Option<u64>>> {
         Ok(self.fits(plan, holdings).then(|| self.capacity()))
-    }
-    pub fn floor(&self) -> Option<u64> {
-        None
-    }
-    pub fn fits_resident(&self, _: &str, _: impl Fn() -> Vec<Holding>) -> bool {
-        false
     }
     pub fn learn_holding(&self, plan: &str, id: &str) {
         self.with(|g| {
