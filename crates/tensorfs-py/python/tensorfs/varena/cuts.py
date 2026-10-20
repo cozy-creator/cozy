@@ -11,6 +11,7 @@ state back and runs again under the dispatch layer, which catches other blocks' 
 from __future__ import annotations
 
 import functools
+import gc
 import re
 import threading
 import traceback
@@ -55,7 +56,7 @@ class Rungs(Protocol):
     def lower(self, device: torch.device, need: int) -> bool: ...
     def available(self, device: torch.device) -> int: ...
     def exhausted(self, device: torch.device, need: int, op: str) -> Exception: ...
-    def hosted(self, nbytes: int, op: str) -> None: ...
+    def noted(self, rung: int, why: str, nbytes: int) -> None: ...
 
 
 class _NoRungs:
@@ -72,7 +73,7 @@ class _NoRungs:
     def exhausted(self, device: torch.device, need: int, op: str) -> Exception:
         return torch.OutOfMemoryError(f"{op} needs {need} B more on {device}")
 
-    def hosted(self, nbytes: int, op: str) -> None:
+    def noted(self, rung: int, why: str, nbytes: int) -> None:
         pass
 
 
@@ -580,7 +581,14 @@ class Layer(TorchDispatchMode):
             plan = rule(func, args, kwargs) if rule is not None else None
             return None if plan is None else self._banded(func, plan, key, 0)
 
-        def hosted() -> object:
+        def hosted() -> object:  # rung 5: idle tensors to the host, else the result itself
+            if _spill(device, need + SLACK, (args, kwargs)) >= need + SLACK:
+                try:
+                    return again(0)
+                except Exception as exc:
+                    if short(exc, True) is None:
+                        raise
+                    _clear(exc)
             for generator, state in states:
                 generator.set_state(state)
             return _hosted(func, args, kwargs, device)
@@ -596,7 +604,18 @@ class Layer(TorchDispatchMode):
             size = min(height // 2, fits or height // 2)
         size, name = max(align, size // align * align), f"{func.overloadpacket.__name__} rows"
         halve = functools.partial(_halve, align)
-        out = _settle(lambda _: _empty(plan.out, device), align, align, halve, device, name)[1]
+        def spill() -> Tensor:  # rung 5: idle tensors to the host, else the result itself
+            nbytes = plan.out.numel() * plan.out.element_size() + SLACK
+            if _spill(device, nbytes, (plan.x,)) >= nbytes:
+                try:
+                    return _empty(plan.out, device)
+                except torch.OutOfMemoryError:
+                    pass
+            _served.rungs.noted(5, f"hosted {name}", nbytes - SLACK)
+            return _host_like(plan.out, device)
+
+        empty = functools.partial(_empty, plan.out, device)
+        out = _settle(lambda _: empty(), align, align, halve, device, name, last=spill)[1]
         if plan.gather is not None:
             size = _settle(plan.gather, size, align, halve, device, name)[0]
         at = 0
@@ -723,21 +742,66 @@ def _hosted(func: OpOverload, args: Args, kwargs: Kwargs, device: torch.device) 
     out = getattr(packet, "out", None) if packet not in _COPIES else None
     if device.type != "cuda" or len(made) != 1 or out is None and packet not in _COPIES:
         return None
-    like = made[0]
-    span = 1 + sum((n - 1) * s for n, s in zip(like.shape, like.stride(), strict=True))
-    nbytes = span * like.element_size() if like.numel() else 0
-    host = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-    _HOSTED.append(host)
-    face = {"shape": (nbytes,), "typestr": "|u1", "data": (host.data_ptr(), False), "version": 3}
-    raw = torch.as_tensor(SimpleNamespace(__cuda_array_interface__=face, host=host), device=device)
-    result = raw.view(like.dtype).as_strided(like.shape, like.stride())
+    result = _host_like(made[0], device)
     with _disable_current_modes():
         if out is None:
             result.copy_(args[0])
         else:
             out(*args, **kwargs, out=result)
-    _served.rungs.hosted(nbytes, str(func))
+    _served.rungs.noted(5, f"hosted {func}", result.untyped_storage().nbytes())
     return result
+
+
+def _spill(device: torch.device, need: int, operands: object) -> int:
+    """Rung 5's first part, as 0.27.4 spilled: tensors this process holds in torch's allocator
+    on `device` that the failing op does not read move to page-locked host memory in place,
+    largest first, until `need` bytes went back. Each stays a CUDA tensor, read over the bus
+    from then on, so whatever holds it is unchanged. Returns the bytes moved."""
+    if device.type != "cuda":
+        return 0
+    torch.cuda.synchronize(device)
+    segments = [
+        (s["address"], s["address"] + s["total_size"])
+        for s in torch.cuda.memory_snapshot()
+        if s["device"] == device.index
+    ]
+    read = {t.untyped_storage().data_ptr() for t in _tensors(operands) if t.is_cuda}
+    found: dict[int, torch.UntypedStorage] = {}
+    for value in gc.get_objects():
+        if type(value) not in (Tensor, nn.Parameter) or value.device != device:
+            continue
+        storage = value.untyped_storage()
+        at = storage.data_ptr()
+        if at and at not in read and any(lo <= at < hi for lo, hi in segments):
+            found.setdefault(at, storage)
+    moved = 0
+    for storage in sorted(found.values(), key=lambda st: -st.nbytes()):
+        if moved >= need:
+            break
+        alias = _host(storage.nbytes(), device)
+        alias.copy_(torch.empty(0, dtype=torch.uint8, device=device).set_(storage))
+        storage._swap_data_ptr_(alias.untyped_storage())  # its device bytes go with `alias`
+        moved += storage.nbytes()
+    if moved:
+        _served.rungs.noted(5, "spilled idle tensors to the host", moved)
+    return moved
+
+
+def _host(nbytes: int, device: torch.device) -> Tensor:
+    """A CUDA uint8 tensor of `nbytes` whose bytes are page-locked host memory, which the GPU
+    addresses over the bus; held until the request ends, so no kernel still reading it sees
+    the host allocator hand it out again."""
+    host = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+    _HOSTED.append(host)
+    face = {"shape": (nbytes,), "typestr": "|u1", "data": (host.data_ptr(), False), "version": 3}
+    return torch.as_tensor(SimpleNamespace(__cuda_array_interface__=face, host=host), device=device)
+
+
+def _host_like(like: Tensor, device: torch.device) -> Tensor:
+    """`like`'s shape, strides and dtype over page-locked host memory (`_host`)."""
+    span = 1 + sum((n - 1) * s for n, s in zip(like.shape, like.stride(), strict=True))
+    nbytes = span * like.element_size() if like.numel() else 0
+    return _host(nbytes, device).view(like.dtype).as_strided(like.shape, like.stride())
 
 
 def hosted_end() -> int:
