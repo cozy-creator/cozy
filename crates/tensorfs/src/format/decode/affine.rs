@@ -221,9 +221,9 @@ impl Packing<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::Dtype;
     use crate::format::decode::grid::{Grid, ScaleLayout};
     use crate::format::decode::plan::{self, Core, Elems, Plan, Post, Term};
+    use crate::format::Dtype;
 
     fn packing(bits: u32, word: u32, axis: usize, fill: Fill, order: Order) -> Packing {
         Packing {

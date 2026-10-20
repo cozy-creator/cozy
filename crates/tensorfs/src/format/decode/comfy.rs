@@ -7,7 +7,7 @@ use super::affine::{Codes, Fill, Order, Packing};
 use super::grid::{Grid, ScaleLayout};
 use super::int8::ROTATION_SIZE;
 use super::plan::{Codes as PlanCodes, Core, Elems, Plan, Post, RequantCodes, RequantPacking};
-use super::{Allowed, Ctx, Dtypes, Param, Part, Scheme, Shape, View, elem};
+use super::{elem, Allowed, Ctx, Dtypes, Param, Part, Scheme, Shape, View};
 use crate::format::{Result, Value};
 
 const I8: Dtypes = Dtypes::Of(&["I8"]);

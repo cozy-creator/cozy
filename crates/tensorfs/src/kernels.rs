@@ -4,7 +4,7 @@
 use crate::format::decode::affine::{Codes as CodeType, Fill, Order};
 use crate::format::decode::grid::{Grid, ScaleLayout};
 use crate::format::decode::plan::{Bytes, Core, Elems, Plan, Post, Term};
-use crate::format::decode::{Geometry, round};
+use crate::format::decode::{round, Geometry};
 use crate::format::{Dtype, Error, Result};
 
 pub const FAMILIES: [u32; 6] = [80, 86, 89, 90, 100, 120];

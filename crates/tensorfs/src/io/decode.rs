@@ -1,14 +1,14 @@
 //! Checked format plans executed by the prebuilt catalog through the read engine's driver.
 
 use std::collections::BTreeMap;
-use std::ffi::{CString, c_void};
+use std::ffi::{c_void, CString};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::cuda::{self, CtxGuard};
 use super::{Copy, DeviceBuffer, Dst, ReadOpts, Src};
 use crate::failure::{Failure, Kind, Result};
 use crate::format::decode::plan::{Core, Plan};
-use crate::format::{Dtype, Encoding, PartBytes, decode};
+use crate::format::{decode, Dtype, Encoding, PartBytes};
 use crate::kernels::{self, Binary, Factors, Launch, Prepared};
 
 /// Declared format metadata and an existing contiguous byte span. No store is consulted.
