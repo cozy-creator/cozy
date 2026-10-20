@@ -338,6 +338,12 @@ class Core:
 # ---------------------------------------------------------------------- H3's models
 
 
+#: an op allocating device bytes on the card, as aten ops do: the catch sees it at the op
+LIB = torch.library.Library("varenaplan", "DEF")
+LIB.define("alloc(int n, *, Device device) -> Tensor")
+LIB.impl("alloc", lambda n, device: CARD.malloc(n) or torch.empty(0), "CompositeExplicitAutograd")
+
+
 class Block(nn.Module):
     def __init__(self, act: int, kernel: str) -> None:
         super().__init__()
@@ -345,7 +351,7 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         CARD.launch(self.kernel)
-        CARD.malloc(self.act)
+        torch.ops.varenaplan.alloc(self.act, device=torch.device("cuda", 0))
         CARD.allocated -= self.act
         return x
 
@@ -386,7 +392,9 @@ MEM: vt.Memory
 LORA: vt.Model
 
 
-def build(card: Card, limit: int | None, orphans: int) -> tuple[vt.Memory, Core, dict[str, vt.Model]]:
+def build(
+    card: Card, limit: int | None, orphans: int, weights: bool
+) -> tuple[vt.Memory, Core, dict[str, vt.Model]]:
     global CARD, MEM, LORA
     CARD = card
     vt.Gpu = Core  # the seam: the card's core in place of the driver's
@@ -394,7 +402,7 @@ def build(card: Card, limit: int | None, orphans: int) -> tuple[vt.Memory, Core,
     core = mem.core
     core.memory = mem
     if orphans:
-        kept(mem, card, orphans)
+        kept(mem, card, orphans, weights)
     mem._here_step = lambda: next((p.cursor for p in mem.plans.values() if p.started), -1)
     ck, models = Checkpoint(), {}
     for name, (_, _, n, act) in SIZES.items():
@@ -484,11 +492,13 @@ def settled(case: str, mem: vt.Memory, core: Core, start: int) -> None:
     check(f"{case}: no plan or request left", not mem.plans and not mem.active)
 
 
-def tensord(fd: int, held: int) -> None:
-    """TensorD's row in its own process: a gone executor's kept pages, spare until asked."""
+def tensord(fd: int, held: int, weights: bool) -> None:
+    """Another row in its own process: TensorD's, a gone executor's kept pages (spare), or an
+    idle executor's cold weights; it gives what it is asked."""
     ledger = varena.Ledger.adopt(fd)
     row = ledger.claim()
-    row.publish(idle=held)
+    facts = lambda n: {"resident": n, "cold": n, "kept": n, "last_use": 1} if weights else {"idle": n}  # noqa: E731
+    row.publish(**facts(held))
     print("ready", flush=True)
     while True:
         want = row.wait_want()
@@ -496,14 +506,14 @@ def tensord(fd: int, held: int) -> None:
         print(freed, flush=True)
         sys.stdin.readline()  # the card has them back
         held -= freed
-        row.publish(idle=held)
+        row.publish(**facts(held))
         row.ack(freed)
         ledger.freed()
 
 
-def kept(mem: vt.Memory, card: Card, orphans: int) -> None:
+def kept(mem: vt.Memory, card: Card, orphans: int, weights: bool) -> None:
     fd = mem.row[0].fd
-    args = [sys.executable, __file__, "--tensord", str(fd), str(orphans)]
+    args = [sys.executable, __file__, "--tensord", str(fd), str(orphans), str(int(weights))]
     child = subprocess.Popen(args, pass_fds=[fd], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     atexit.register(child.kill)
     assert child.stdout.readline().strip() == "ready"
@@ -518,8 +528,8 @@ def kept(mem: vt.Memory, card: Card, orphans: int) -> None:
     threading.Thread(target=relay, daemon=True).start()
 
 
-def case(name: str, card: Card, limit: int | None, orphans: int = 0) -> None:
-    mem, core, models = build(card, limit, orphans)
+def case(name: str, card: Card, limit: int | None, orphans: int = 0, weights: bool = False) -> None:
+    mem, core, models = build(card, limit, orphans, weights)
     dit = models["transformer_ref"].ws.name
     for warm in (False, True):
         label, since, moved, retries = f"{name} {'warm' if warm else 'cold'}", len(core.events), core.moved(), mem.memo.retries
@@ -540,7 +550,7 @@ def case(name: str, card: Card, limit: int | None, orphans: int = 0) -> None:
             read = sum(s.paged_in + s.streamed for s in later)
             check(f"{label}: the DiT reads 0 B after its first pass", len(later) == 7 and read == 0, read)
     if orphans:
-        check(f"{name}: kept pages went back on demand ({card.foreign / GIB:.2f} GiB left)", card.foreign < orphans)
+        check(f"{name}: the other row gave bytes back on demand ({card.foreign / GIB:.2f} GiB left)", card.foreign < orphans)
     failure(name, mem, core, models)
 
 
@@ -573,6 +583,7 @@ def main() -> int:
     case("24 GiB", Card(card, GIB // 2), None)
     case("8 GiB", Card(card, GIB // 2), 8 * GIB)
     case("8 GiB beside kept pages", Card(card, GIB // 2), 8 * GIB, orphans=int(8.74 * GIB))
+    case("24 GiB beside an idle executor", Card(card, GIB // 2), None, orphans=18 * GIB, weights=True)
     failed = results.count(False)
     print(f"{len(results) - failed} passed, {failed} failed")
     return 1 if failed else 0
@@ -580,5 +591,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--tensord"]:
-        tensord(int(sys.argv[2]), int(sys.argv[3]))
+        tensord(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4] == "1")
     sys.exit(main())

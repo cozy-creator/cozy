@@ -20,7 +20,9 @@ Runs with any python that has torch and diffusers, and `PYTHONPATH=<worktree>/py
 """
 
 import functools
+import gc
 import sys
+import weakref
 
 import torch
 from diffusers import AutoencoderKL
@@ -195,6 +197,10 @@ def relax() -> None:
     check("a cut relaxes back to whole", same(out, whole) and cut and relaxed, (cut, memo.sizes))
     doubled = all(memo.sizes[k] <= 2 * v for k, v in cut.items())
     check("relaxing doubles at most; the peak waits", steps and doubled and shape.peak == -1, steps)
+    seen = weakref.ref(x)
+    del x
+    gc.collect()
+    check("the memo keeps no cut's input (no leftover)", seen() is None)
 
 
 class FusedSwiGLU(SwiGLU):

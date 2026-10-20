@@ -767,10 +767,10 @@ class Memory:
             spare = self.core.stats()  # type: ignore[union-attr]
             room = self.available() + spare.idle + spare.slot_bytes
             room += _set(model)[0] - model.common.nbytes
-            if repeating:
+            if repeating:  # and what other processes give back on an ask
                 keep = self._keep(model)
                 cold = (m for m in self.models.values() if self._victim(m))
-                room += sum(_set(m)[0] for m in cold if self._keep(m) < keep)
+                room += sum(_set(m)[0] for m in cold if self._keep(m) < keep) + self._others()
             sizes = _sizes(model)
             if room - 2 * model.reserve >= 2 * max(sizes) and cuts.coarser(model.track.shape):
                 model.reserve *= 2
@@ -997,6 +997,14 @@ class Memory:
             table.wait(asked)
         return max(self._free() - before, 0)
 
+    def _others(self) -> int:
+        """What other live rows can give on an ask (§5.6: their cold weights, slack, caches)."""
+        if self.row is None:
+            return 0
+        table, row = self.row
+        live = (f for f in table.snapshot() if f.state == "live" and f.slot != row.id)
+        return sum(f.reclaimable for f in live)
+
     def _landed(self, model: Model) -> None:
         """Demand outranks a prefetch: copies still landing hold pages no eviction may take, so
         they land first (a bind waits on its fill, then lets go)."""
@@ -1037,10 +1045,10 @@ class Memory:
         with self.lock:
             self.starved = True
             target = max(self._free(), 0) + max(need, 1)
-            lowered = self._lower_until(target, "out of memory", None)
-            lowered = self._last(target, "out of memory") or lowered
+            self._lower_until(target, "out of memory", None)
+            self._last(target, "out of memory")
             self._cap()
-            if lowered:
+            if self._free() >= target:  # a retry short of the room is futile: no progress
                 return True
         return self._wait_room()
 
@@ -1384,6 +1392,8 @@ class Memory:
             torch.cuda.synchronize(self.gpu)
             torch._C._cuda_clearCublasWorkspaces()  # cuBLAS keeps one per stream: not the request's
             torch.cuda.empty_cache()
+            if cuts.hosted_end():  # rung 5's page-locked blocks go back to the host
+                torch.accelerator.empty_host_cache()
             tail = torch.cuda.max_memory_allocated(self.gpu) - request.start
             request.peak = max(request.peak, tail)
             leftover = ((self.gpu, max(torch.cuda.memory_allocated(self.gpu) - request.start, 0)),)

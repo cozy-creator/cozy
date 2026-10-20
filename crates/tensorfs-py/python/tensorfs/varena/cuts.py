@@ -17,6 +17,7 @@ import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Protocol
 
 import torch
@@ -230,10 +231,12 @@ def _settle[T](
     key: tuple[object, ...] | None = None,
     again: bool | None = None,
     before: Callable[[int], T | None] | None = None,
+    last: Callable[[], T | None] | None = None,
 ) -> tuple[int, T]:
     """`run(size)` until it fits, each try strictly smaller: room made (rungs 1-2), each `shrink`
     down to `finest`, the first and the finest size tried again with room made, `before` (an
-    op's cut) once, then rung 4, else `exhausted`. With `key` it is a call that cuts itself:
+    op's cut) once, then rung 4 while it makes the room, then `last` (rung 5), else
+    `exhausted`. With `key` it is a call that cuts itself:
     up front at the memo's size, finer when an op inside asks (`Finer`), past `finest` its
     failure its caller's, and the size that fit remembered."""
     memo, rungs, total = _served.memo, _served.rungs, size
@@ -272,6 +275,8 @@ def _settle[T](
             elif before is not None and (out := before(need)) is not None:
                 break
             elif not rungs.lower(device, need + SLACK):
+                if last is not None and (out := last()) is not None:
+                    break
                 raise rungs.exhausted(device, need, name)
             else:
                 before = None
@@ -526,7 +531,12 @@ class Layer(TorchDispatchMode):
             plan = rule(func, args, kwargs) if rule is not None else None
             return None if plan is None else self._banded(func, plan, key, 0)
 
-        return _settle(again, 1, 1, int, device, name, again=False, before=cut)[1]
+        def hosted() -> object:
+            for generator, state in states:
+                generator.set_state(state)
+            return _hosted(func, args, kwargs, device)
+
+        return _settle(again, 1, 1, int, device, name, again=False, before=cut, last=hosted)[1]
 
     def _banded(self, func: OpOverload, plan: _Plan, key: tuple[object, ...], size: int) -> object:
         """The op in bands of `size` rows (0: what the room holds, at most half) into its whole
@@ -650,6 +660,41 @@ def _arguments(func: OpOverload, args: Args, kwargs: Kwargs) -> dict[str, object
             default = a.default_value if a.has_default_value() else None
             named[a.name] = args[i] if i < len(args) else kwargs.get(a.name, default)
     return named
+
+
+#: page-locked host blocks rung 5 put results in, kept until the request ends (`hosted_end`)
+_HOSTED: list[Tensor] = []
+_COPIES = (aten.contiguous, aten.clone, aten._to_copy)
+
+
+def _hosted(func: OpOverload, args: Args, kwargs: Kwargs, device: torch.device) -> object:
+    """Rung 5: the result no cut splits goes to page-locked host memory the GPU addresses over
+    the bus, as 0.27.4 spilled exactly it; None for an op with no `out` form or no one result."""
+    made, packet = _meta(func, args, kwargs), func.overloadpacket
+    out = getattr(packet, "out", None) if packet not in _COPIES else None
+    if device.type != "cuda" or len(made) != 1 or out is None and packet not in _COPIES:
+        return None
+    like = made[0]
+    span = 1 + sum((n - 1) * s for n, s in zip(like.shape, like.stride(), strict=True))
+    nbytes = span * like.element_size() if like.numel() else 0
+    host = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+    _HOSTED.append(host)
+    face = {"shape": (nbytes,), "typestr": "|u1", "data": (host.data_ptr(), False), "version": 3}
+    raw = torch.as_tensor(SimpleNamespace(__cuda_array_interface__=face, host=host), device=device)
+    result = raw.view(like.dtype).as_strided(like.shape, like.stride())
+    with _disable_current_modes():
+        if out is None:
+            result.copy_(args[0])
+        else:
+            out(*args, **kwargs, out=result)
+    return result
+
+
+def hosted_end() -> int:
+    """The request's rung-5 blocks go back (their results' tensors keep theirs); the bytes."""
+    nbytes = sum(h.numel() for h in _HOSTED)
+    _HOSTED.clear()
+    return nbytes
 
 
 def _meta(func: OpOverload, args: Args, kwargs: Kwargs) -> list[Tensor]:
@@ -830,10 +875,10 @@ def _ffn(kind: str, width: int, forward: Callable[..., object]) -> Callable[...,
         tokens, key = x.numel() // max(x.shape[-1], 1), ("ffn", kind, x.shape[-1], width, x.dtype)
         if tokens < 2 or key in _served.memo.whole:
             return forward(x)
-        per_token = max(width, x.shape[-1]) * x.element_size()
+        per_token, device = max(width, x.shape[-1]) * x.element_size(), x.device
 
-        def shrink(size: int) -> int:  # half, or the tokens the room holds
-            return min(size // 2, _served.rungs.available(x.device) // per_token or size)
+        def shrink(size: int) -> int:  # half, or the tokens the room holds; the memo keeps it,
+            return min(size // 2, _served.rungs.available(device) // per_token or size)  # not x
 
         try:
             run = functools.partial(_tokens, forward, x, tokens)
