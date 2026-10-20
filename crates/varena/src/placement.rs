@@ -1359,6 +1359,14 @@ impl Placement {
                 .find(|row| row.id == request)
             {
                 facts.can_cut = !lower;
+                if !lower {
+                    // A new actual OOM may ask the same owner again. An ACK
+                    // within this operation still bounds every re-decision.
+                    facts.reclaim_round = facts
+                        .reclaim_round
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("OOM reclaim round overflow"))?;
+                }
             }
             let occupied = inner
                 .table
@@ -2927,6 +2935,20 @@ mod gpu_tests {
         assert!(
             plan::decide(&table, trigger).is_empty(),
             "credit only the new published byte"
+        );
+        table.requests[0].reclaim_round += 1;
+        let next = Trigger::Oom {
+            request: 1,
+            need: activation_oom_target(table.available(), need).unwrap(),
+        };
+        assert_eq!(
+            plan::decide(&table, next),
+            vec![Action::Ask {
+                row: 2,
+                need: 1,
+                ceiling: Class::Orphan,
+            }],
+            "a fresh OOM must not reuse the previous operation's acknowledgement"
         );
         assert_eq!(table.capacity, 25_153_044_480);
         assert_eq!(table.remote[0].context, 331_350_016);
@@ -4700,6 +4722,25 @@ mod gpu_tests {
             assert!(
                 requester.allocator_budget().unwrap() > budget,
                 "actual remote reclamation did not reach the allocator ceiling"
+            );
+            for remaining in [8 * MIB, 4 * MIB] {
+                assert_eq!(
+                    requester.relief(1, MIB, false).unwrap(),
+                    Relief::Complete,
+                    "a new OOM in the same unchanged request reused an old remote ACK"
+                );
+                assert_eq!(
+                    owner.resident().unwrap()[0].1,
+                    remaining,
+                    "each actual OOM must reclaim one more unpinned CUDA region"
+                );
+            }
+            assert!(
+                matches!(
+                    requester.relief(1, MIB, false).unwrap(),
+                    Relief::Cut(_) | Relief::Lower(_) | Relief::Exhausted(_)
+                ),
+                "a no-progress owner produced Complete or discarded its protected bytes"
             );
             assert_eq!(owner.ledger.capacity(), 24 * MIB);
             let mut bytes = [0_u8; 32];
