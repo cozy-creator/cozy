@@ -24,7 +24,7 @@ Both put `cozy` in `~/.cozy/bin`; `cozy update` moves to the newest release.
 
 ```sh
 cozy login you@example.com
-cozy run fidika/sdxl prompt='a lighthouse at dusk' seed=7
+cozy run fidika/sdxl/generate prompt='a lighthouse at dusk' seed=7
 cozy machine rent            # what is for rent; then cozy machine rent <sku>
 cozy model search sdxl
 ```
