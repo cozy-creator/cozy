@@ -629,12 +629,34 @@ impl Ledger {
         })
     }
     pub fn answered(&self, owner: Owner, ask: Ask) -> Result<bool> {
-        let slot = self.table.slot(owner)?;
+        let slot = match self.table.slot(owner) {
+            Ok(slot) => slot,
+            Err(Error::Closed(_)) => return Ok(true),
+            Err(error) => return Err(error),
+        };
         Ok(slot
             .handled
             .get(ask.ceiling.as_usize())
             .is_some_and(|v| v.load(Acquire) >= ask.sequence)
             || !self.table.alive(owner.row as usize)?)
+    }
+    pub fn wait_answer(&self, owner: Owner, ask: Ask, stop: &AtomicBool) -> Result<bool> {
+        loop {
+            let before = self.table.shared().header.changed.load(Acquire);
+            if stop.load(Acquire) {
+                return Ok(false);
+            }
+            if self.answered(owner, ask)? {
+                return Ok(true);
+            }
+            wait(&self.table.shared().header.changed, before);
+        }
+    }
+    pub fn measured(&self, package: &str, shape: &str) -> Option<u64> {
+        let key = format!("{package}|{shape}");
+        self.peaks()
+            .into_iter()
+            .find_map(|(k, v)| (k == key).then_some(v))
     }
     /// Only a victim's own wakeups count as observations; repeated status reads cannot kill it.
     pub fn stalled(&self) -> Result<Vec<u32>> {
@@ -912,6 +934,7 @@ impl Row {
         let slot = self.table.slot(self.owner)?;
         slot.bell.fetch_add(1, Release);
         wake(&slot.bell);
+        self.table.changed();
         Ok(())
     }
     pub fn ack(&self, ask: Ask) -> Result<()> {
@@ -1029,6 +1052,14 @@ impl Custody {
             page.owner = None;
         }
     }
+}
+
+fn orphan(table: &Table, page: &Kept) -> bool {
+    page.owner.is_none_or(|owner| match table.slot(owner) {
+        Err(Error::Closed(_)) => true,
+        Ok(_) => table.alive(owner.row as usize).is_ok_and(|live| !live),
+        Err(_) => false,
+    })
 }
 
 /// The grant channel carries only placement custody, never model headers or data bytes.
@@ -1211,6 +1242,38 @@ fn serve(mut stream: UnixStream, pid: u32, table: Arc<Table>, custody: Arc<Mutex
                         stream.write_all(&[0]).map_err(|e| io("send RAM miss", e))?;
                     }
                 }
+                Some(5) => {
+                    let mut held = custody.lock();
+                    let released = held
+                        .pages
+                        .get(&key)
+                        .is_some_and(|page| orphan(&table, page));
+                    if released {
+                        held.pages.remove(&key);
+                    }
+                    stream
+                        .write_all(&[u8::from(released)])
+                        .map_err(|e| io("release orphan", e))?;
+                }
+                Some(6) => {
+                    let held = custody.lock();
+                    let pages: Vec<_> = held
+                        .pages
+                        .iter()
+                        .filter(|(_, page)| orphan(&table, page))
+                        .map(|(key, page)| (*key, sum(page.spans.iter().copied())))
+                        .collect();
+                    stream
+                        .write_all(&(pages.len() as u32).to_le_bytes())
+                        .map_err(|e| io("send orphan count", e))?;
+                    for (key, bytes) in pages {
+                        stream
+                            .write_all(&key.fingerprint)
+                            .and_then(|_| stream.write_all(&key.page.to_le_bytes()))
+                            .and_then(|_| stream.write_all(&bytes.to_le_bytes()))
+                            .map_err(|e| io("send orphan page", e))?;
+                    }
+                }
                 _ => return Err(Error::Invalid("unknown custody command".into())),
             }
             table.changed();
@@ -1370,5 +1433,57 @@ impl Channel {
             offset: u64::from_le_bytes(offset),
             len: u64::from_le_bytes(len),
         }))
+    }
+}
+
+impl Channel {
+    pub fn release_orphan(&self, owner: Owner, key: PageKey) -> Result<bool> {
+        let mut stream = self.0.lock();
+        Self::header(&mut stream, 5, owner, key, 0)?;
+        let mut released = [0];
+        stream
+            .read_exact(&mut released)
+            .map_err(|e| io("read orphan release", e))?;
+        Ok(released == [1])
+    }
+    pub fn orphans(&self, owner: Owner) -> Result<Vec<(PageKey, u64)>> {
+        let mut stream = self.0.lock();
+        Self::header(
+            &mut stream,
+            6,
+            owner,
+            PageKey {
+                fingerprint: [0; 32],
+                page: 0,
+            },
+            0,
+        )?;
+        let mut count = [0; 4];
+        stream
+            .read_exact(&mut count)
+            .map_err(|e| io("read orphan count", e))?;
+        let count = u32::from_le_bytes(count);
+        if count > 1_000_000 {
+            return Err(Error::Invalid("too many orphan pages".into()));
+        }
+        (0..count)
+            .map(|_| {
+                let mut fingerprint = [0; 32];
+                let mut page = [0; 8];
+                let mut bytes = [0; 8];
+                stream
+                    .read_exact(&mut fingerprint)
+                    .and_then(|_| stream.read_exact(&mut page))
+                    .and_then(|_| stream.read_exact(&mut bytes))
+                    .map_err(|e| io("read orphan page", e))?;
+                Ok((
+                    PageKey {
+                        fingerprint,
+                        page: u64::from_le_bytes(page),
+                    },
+                    u64::from_le_bytes(bytes),
+                ))
+            })
+            .collect()
     }
 }
