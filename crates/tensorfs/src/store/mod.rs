@@ -4,7 +4,7 @@
 //! snapshots/<name>/, tmp/}`
 //!
 //! - Objects are trees, cozytensors headers, chunks, assets and repo files. A ref names a
-//!   model's releases of trees. A cozytensors is opened by its header ([`Store::checkpoint`]) or
+//!   model's tags of commits (trees). A cozytensors is opened by its header ([`Store::checkpoint`]) or
 //!   a tree's variant ([`Store::variant`]); a plain folder enters by [`Store::admit_folder`] and
 //!   leaves by [`Store::snapshot`].
 //! - One door admits objects ([`Store::admit`], [`Store::put`]): streamed into `tmp/`, hashed,
