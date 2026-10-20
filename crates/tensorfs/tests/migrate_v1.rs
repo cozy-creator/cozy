@@ -24,6 +24,7 @@ struct Lane {
     name: String,
     manifest: ObjectRef,
     parts: BTreeSet<String>,
+    tensors: Vec<String>,
     configs: BTreeMap<String, Json>,
 }
 
@@ -115,6 +116,9 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
                     ck.header().spans(at).iter().all(|s| fixture.join(&ck.chunks()[s.chunk].sha256).exists())
                 });
                 if !here || tensor.locations().iter().all(|(_, at)| at.length == 0) {
+                    if lane.tensors.contains(&format!("{}/{}", component.name(), tensor.key)) {
+                        eprintln!("{}: {}/{} not here: {:?}", lane.name, component.name(), tensor.key, tensor.locations());
+                    }
                     continue;
                 }
                 let want = Selection::Tensors { component: component.name().into(), keys: vec![tensor.key.clone()] };
@@ -125,6 +129,9 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
                 };
                 for bytes in parts {
                     let digest = sha256(&bytes);
+                    if lane.tensors.contains(&format!("{}/{}", component.name(), tensor.key)) && !lane.parts.contains(&digest) {
+                        eprintln!("{}: {}/{} read {} ({} bytes), not a selected v1 part", lane.name, component.name(), tensor.key, digest, bytes.len());
+                    }
                     if lane.parts.contains(&digest) {
                         found.insert(digest);
                     }
