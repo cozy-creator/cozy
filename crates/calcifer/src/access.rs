@@ -322,15 +322,14 @@ pub(crate) fn anonymous_tensorfs(spec: &v1::RunSpec) -> Option<v1::TensorFSOptio
 }
 
 fn hub_denied(origin: &Origin, error: hub_client::Error) -> Denied {
-    match &error {
-        hub_client::Error::Hub { status, .. } if *status < 500 => {
-            let error = hub_refusal(origin, error);
-            Denied::Refused(Reason {
-                code: error.cause.unwrap_or(error.code),
-                message: error.message,
-            })
-        }
-        _ => unreachable(hub_refusal(origin, error).message),
+    let refused = error.refused();
+    let error = hub_refusal(origin, error);
+    match refused {
+        true => Denied::Refused(Reason {
+            code: error.cause.unwrap_or(error.code),
+            message: error.message,
+        }),
+        false => unreachable(error.message),
     }
 }
 
