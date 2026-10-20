@@ -684,13 +684,16 @@ fn a_service_that_exited_starts_again_at_once() {
         ],
         log: Some(dir.join("service.log")),
     };
+    // Asked again until it runs, as the CLI starts Calcifer.
     let ran = || {
         let asked = std::time::Instant::now();
-        services.start(&spec).unwrap();
-        while fs::remove_file(&file).is_err() {
-            thread::sleep(Duration::from_millis(20));
+        loop {
+            services.start(&spec).unwrap();
+            thread::sleep(Duration::from_millis(50));
+            if fs::remove_file(&file).is_ok() {
+                return asked.elapsed();
+            }
         }
-        asked.elapsed()
     };
     ran();
     // It wrote its report just before it exited: let it be gone.
