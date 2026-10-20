@@ -176,6 +176,34 @@ fn evict(ck: &Checkpoint) {
     let _ = ck;
 }
 
+/// Pages of `ck`'s chunk files not in the page cache (a loaded host evicts some).
+#[cfg(target_os = "linux")]
+fn evicted_pages(ck: &Checkpoint) -> u64 {
+    let mut evicted = 0;
+    for i in 0..ck.header().chunks.len() {
+        let f = ck.chunk(i).unwrap();
+        let len = f.metadata().unwrap().len() as usize;
+        if len == 0 {
+            continue;
+        }
+        // SAFETY: a read-only shared mapping of our own file, unmapped below.
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0) };
+        assert_ne!(p, libc::MAP_FAILED);
+        let mut v = vec![0u8; len.div_ceil(4096)];
+        // SAFETY: the vector holds one byte per page of the mapping.
+        assert_eq!(unsafe { libc::mincore(p, len, v.as_mut_ptr()) }, 0);
+        // SAFETY: our mapping.
+        unsafe { libc::munmap(p, len) };
+        evicted += v.iter().filter(|b| **b & 1 == 0).count() as u64;
+    }
+    evicted
+}
+
+#[cfg(not(target_os = "linux"))]
+fn evicted_pages(_: &Checkpoint) -> u64 {
+    0
+}
+
 fn direct_ok(ck: &Checkpoint) -> bool {
     platform::durable::open_direct(&ck.chunk(0).unwrap()).unwrap().is_some()
 }
@@ -225,11 +253,14 @@ fn sweep(ck: &Checkpoint, what: &str) {
             let cold = read_everything(ck, skew, &opts);
             // The engine reads past the page cache, so a buffered read warms it.
             read_everything(ck, skew, &buffered);
+            let evicted = evicted_pages(ck);
             let warm = read_everything(ck, skew, &opts);
             println!("{what} skew {skew} {opts:?}\n  cold {cold:?}\n  warm {warm:?}");
             if opts.direct && direct_ok(ck) {
                 assert!(cold.direct > 0, "a cold read goes O_DIRECT: {cold:?}");
-                assert_eq!(warm.direct, 0, "a warm read stays in the page cache: {warm:?}");
+                // Only a piece with a page the host evicted since the warm-up goes direct.
+                let allowed = evicted * opts.request.max(4096) as u64;
+                assert!(warm.direct <= allowed, "a warm read stays in the page cache ({evicted} pages evicted): {warm:?}");
             } else {
                 assert_eq!(cold.direct, 0);
             }

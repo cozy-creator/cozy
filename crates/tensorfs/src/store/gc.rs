@@ -188,6 +188,8 @@ impl Store {
             }
         }
         self.sweep_tmp(cutoff)?;
+        // The trash exists only during a collection (it holds what a killed one left).
+        let _ = fs::remove_dir(self.root.join("tmp").join("gc"));
         Ok(collected)
     }
 
