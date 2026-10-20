@@ -43,7 +43,10 @@ fn failed(error: PyErr) -> Refusal {
             "conflict" => Code::REPOSITORY_CONFLICT,
             _ => Code::CREDENTIAL_REQUIRED,
         };
-        let detail = value.getattr("detail").and_then(|detail| detail.extract()).unwrap_or_else(|_| error.to_string());
+        let detail = value.getattr("detail").and_then(|detail| detail.extract()).unwrap_or_else(|_| {
+            value.str().map(|text| text.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "the TensorFS token provider failed".into())
+        });
         Refusal { code, detail }
     })
 }
