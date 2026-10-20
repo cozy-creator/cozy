@@ -7,7 +7,6 @@ import tensorfs
 import torch
 from tensorfs.varena.torch import Memory
 
-
 assert torch.cuda.device_count() == 1
 device = torch.device("cuda", 0)
 with torch.cuda.device(device):
