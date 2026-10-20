@@ -1370,15 +1370,23 @@ mod tests {
     fn repeated_binds_cannot_select_a_later_declared_step() {
         let mut run = request(1);
         run.position.step = 1;
+        run.working_sets.resize(5, Some(0));
         run.joint_steps.insert(1);
         let mut vae = page(2, 10);
         vae.model = Some(2);
         vae.uses = vec![usage(1, 1), usage(1, 4)];
         let mut table = Table {
+            capacity: 100,
             requests: vec![run],
             pages: vec![vae],
+            rows: vec![Row {
+                id: 1,
+                alive: true,
+                reaping: false,
+            }],
             ..Default::default()
         };
+        assert!(table.valid());
         table.bound(1, 2);
         for _ in 0..50 {
             table.bound(1, 2);
