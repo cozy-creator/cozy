@@ -1,34 +1,19 @@
-//! varena: memory and transfer mechanisms used in the calling process.
-//! In Cozy, TensorD coordinates machine-wide budgets and retention and uses TensorFS to
-//! prepare shared CPU weight buffers. Runtime constructs models and drives GPU allocation,
-//! copies, mapping and unmapping through the plane/device APIs within those grants.
-//! TensorD can retain exported GPU allocation handles; retaining bytes does not construct
-//! a model or perform its GPU operations. TensorFS is a library on both sides, not a daemon.
+//! GPU placement follows Runtime-declared plans through one decision procedure.
 //!
-//! A plane applies caller-supplied budgets, regions and priorities for fills, prefetch,
-//! eviction and streaming. It does not measure free memory or reorder the caller's schedule.
-//! `tensorfs` supplies verified serialized bytes and metadata and stays CUDA-free.
-//!
-//! The plane is a Unix mechanism: weight sets cross processes as descriptors. Its host tier
-//! (sealed memfds claimed by OFD locks) is Linux-only and answers [`Error::Unsupported`]
-//! elsewhere; a Mac's host tier is the page cache of the store's objects. On Windows the crate
-//! is empty until its tier exists (xs-043 unit WM).
+//! `plan` decides; `placement` applies decisions; `gpu` owns mappings and pins;
+//! `ledger` shares measured facts, wakeups and read-only page custody with TensorD.
+//! TensorFS owns layout interpretation, source custody and every byte transfer.
 #![cfg(unix)]
 
-#[cfg(feature = "store")]
-pub mod checkpoint;
-pub mod cuda;
-pub mod cursor;
-pub mod device;
-pub mod faults;
-pub mod host;
-pub mod io;
+pub use tensorfs::io::{cuda, metrics as ceiling};
+pub mod gpu;
 pub mod layout;
-pub mod plane;
-pub mod window;
+pub mod ledger;
+pub mod plan;
+pub mod placement;
 
-pub use cursor::{Cursor, RingView};
-pub use plane::{Exported, Lease, Plane, PlaneConfig, Stats, Ticket, Tier, Trim, View, WsId};
+pub use gpu::{Gpu, Pin};
+pub use placement::Placement;
 
 use thiserror::Error;
 
@@ -42,40 +27,18 @@ pub enum Error {
     },
     #[error("cuda driver unavailable: {0}")]
     CudaUnavailable(String),
-    #[error("budget exceeded in {pool}: requested {requested} bytes, {available} available")]
-    BudgetExceeded {
-        pool: &'static str,
-        requested: u64,
-        available: u64,
-    },
-    #[error(
-        "shortfall in {pool}: need {need} bytes, {available} free; evicting lower priorities is \
-         not enough, blocked by {blockers:?}"
-    )]
-    Shortfall {
-        pool: &'static str,
-        need: u64,
-        available: u64,
-        blockers: Vec<String>,
-    },
-    #[error("below floor in {pool}: need {need} bytes, the whole budget is {budget}")]
-    BelowFloor { pool: &'static str, need: u64, budget: u64 },
-    #[error("{op} refused: {live} live and {pending} pending lease(s) cover {what}")]
-    LeaseViolation {
-        op: &'static str,
-        live: u64,
-        pending: u64,
-        what: String,
-    },
-    #[error("poisoned: {0}")]
-    Poisoned(String),
+    /// The driver refused to map: `deficit` of the `need` bytes found no device memory.
+    #[error("device full: mapping {need} bytes, {deficit} short")]
+    DeviceFull { need: u64, deficit: u64 },
     #[error("invalid: {0}")]
     Invalid(String),
+    #[error("internal varena failure: {0}")]
+    Internal(&'static str),
     #[error("io: {0}")]
     Io(String),
     #[error("source: {0}")]
-    Source(#[from] tensorfs::err::Refusal),
-    /// What closed: a weight set, a cursor, a copy stream.
+    Source(#[from] tensorfs::failure::Failure),
+    /// What closed: a weight set, a source.
     #[error("closed: {0}")]
     Closed(String),
     /// This OS has no such mechanism (the host tier off Linux).
@@ -95,17 +58,25 @@ pub(crate) fn os(what: &'static str) -> impl FnOnce(platform::Error) -> Error {
 }
 
 impl Error {
+    /// CUDA documents these failures as destroying the context or leaving the process
+    /// inconsistent. Allocation pressure and invalid inputs are request failures instead.
+    /// https://docs.nvidia.com/cuda/archive/13.0.3/cuda-driver-api/group__CUDA__TYPES.html
+    pub fn is_sticky(&self) -> bool {
+        matches!(self, Self::Cuda { code: 700 | 702 | 709 | 710 | 714..=719 | 721, .. })
+    }
+
+    pub fn is_oom(&self) -> bool {
+        matches!(self, Self::DeviceFull { .. } | Self::Cuda { code: 2, .. })
+    }
+
     /// The stable machine name of the error class.
     pub fn code(&self) -> &'static str {
         match self {
             Error::Cuda { .. } => "CUDA",
             Error::CudaUnavailable(_) => "CUDA_UNAVAILABLE",
-            Error::BudgetExceeded { .. } => "BUDGET_EXCEEDED",
-            Error::Shortfall { .. } => "SHORTFALL",
-            Error::BelowFloor { .. } => "BELOW_FLOOR",
-            Error::LeaseViolation { .. } => "LEASE_VIOLATION",
-            Error::Poisoned(_) => "POISONED",
+            Error::DeviceFull { .. } => "DEVICE_FULL",
             Error::Invalid(_) => "INVALID",
+            Error::Internal(_) => "INTERNAL",
             Error::Io(_) => "IO",
             Error::Source(_) => "SOURCE",
             Error::Closed(_) => "CLOSED",
@@ -115,3 +86,32 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<tensorfs::err::Refusal> for Error {
+    fn from(error: tensorfs::err::Refusal) -> Error { Error::Source(error.into()) }
+}
+
+impl From<tensorfs::io::cuda::Error> for Error {
+    fn from(error: tensorfs::io::cuda::Error) -> Error {
+        match error {
+            tensorfs::io::cuda::Error::Cuda { op, code, name } => Error::Cuda { op, code, name },
+            tensorfs::io::cuda::Error::CudaUnavailable(detail) => Error::CudaUnavailable(detail),
+        }
+    }
+}
+impl From<tensorfs::io::Error> for Error {
+    fn from(error: tensorfs::io::Error) -> Error {
+        match error.cuda().cloned() {
+            Some(cuda) => cuda.into(),
+            None => Error::Io(error.to_string()),
+        }
+    }
+}
+impl From<tensorfs::io::source::Error> for Error {
+    fn from(error: tensorfs::io::source::Error) -> Error {
+        match error {
+            tensorfs::io::source::Error::Read(error) => error.into(),
+            tensorfs::io::source::Error::Source(error) => error.into(),
+        }
+    }
+}

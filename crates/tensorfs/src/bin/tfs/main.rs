@@ -1,9 +1,7 @@
-//! tfs: TensorFS v2 on the command line. With `--json` every command prints one JSON document,
-//! a failure as `{"error": {"code", "detail"}}`. The v1 verbs Tensorhub still execs live in
-//! `v1/` until it moves to v2 (xs-045 U11).
+//! `tfs`: the Python verbs on the command line (`convert`, `download`, `upload`, `export`,
+//! `inspect`, `verify`), plus `ceiling`, `conform endpoint`, `dev ckpt` and `version`.
 
 mod dev;
-mod v1;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,56 +10,30 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value as Json};
-use tensorfs::client::{self, ImportOptions, Named};
-use tensorfs::export;
 use tensorfs::failure::{fail, Failure, Kind, Result};
-use tensorfs::format::{Body, Dtype, ObjectRef};
-use tensorfs::migrate::{self, v1 as old};
-use tensorfs::store2::Store;
+use tensorfs::format::{Body, Dtype, ObjectRef, Tree};
+use tensorfs::store::Store;
+use tensorfs::{fetch, Checkpoint, Client, Config, Convert, Download, Format, Open, Ref, Selection};
 
-const USAGE: &str = "usage: tfs [--store <dir>] [--json] <verb> ...
-  import <src>... [--name <org/name>] [--converter <table>] [--variant <variant>]
-      src: a file, a directory, hf://<org>/<repo>[@<rev>][/<path>], civitai://<version>[/<file>], a URL
-  pull [<origin>] <org/name[@release]> [--lane <lane>] [--hub <url>]
-      from Tensorhub (--hub, else https://tensorhub.com; $TENSORFS_HUB_TOKEN reads private
-      checkpoints), or from a static origin's URL or directory
-  export <ref> <dir> --safetensors [--dequantize bf16|f16|f32]
-  export <ref> <dir> --origin
-  export <ref> <dir> --gguf      every GGUF the checkpoint was imported from, rebuilt
+const USAGE: &str = "usage: tfs [--store <dir>] [--endpoint <url>] [--json] <verb>
+  convert <source>... [--converter <c>] [--variant <v>] [--name local/<name>[@revision]]
+  download <ref> [--dir <dir>]
+  upload <folder> <org/name>[@revision]      the token is $TENSORFS_TOKEN
+  export <ref> <dir> [--safetensors [--dequantize bf16|f16|f32] | --gguf]
   inspect <ref>
-  verify [<ref>]
-  gc [--older-than <7d|12h|30m|90s>]
-  dev ckpt [--name <org/name>] [--blocks <n>] [--scale <n>] [--plain] [--no-configs]
-  dev migrate <v1-dir> [<manifest-sha256>|<org/name>]... [--dry-run | --plan]
-      v1-dir: a v1 store (read only) or a directory of a v1 manifest and its objects;
-      --plan: the census, names and new bytes from manifests and headers alone, no store
-  dev headers <hub-url> <dir> <org/name@release/lane>...   a released lane's v1 manifest and header
-<ref> is org/name[@release] (--lane names a lane, else the release's only one) or a manifest
-sha256. The store is --store, else $TENSORFS_HOME, else ~/.tensorfs; it is created when absent.";
+  verify <ref>
+  ceiling [<path>] [--gpu <n>]              measure what reads from <path>'s volume (and to GPU n) reach
+  conform endpoint <url> [--write] [--token-env <VAR>]
+  dev ckpt [--name local/<name>[@revision]] [--blocks <n>] [--scale <n>] [--plain] [--no-configs]
+  version
+<ref> is org/name[@revision][/variant], sha256:<hex>, a .cozytensors file or a folder;
+--variant picks a variant. The store is --store, else $TENSORFS_HOME, else ~/.cache/tensorfs.";
 
-const SWITCHES: &[&str] = &[
-    "json",
-    "safetensors",
-    "origin",
-    "gguf",
-    "plain",
-    "no-configs",
-    "dry-run",
-    "plan",
-];
+const SWITCHES: &[&str] = &["json", "safetensors", "gguf", "plain", "no-configs", "write"];
 const VALUED: &[&str] = &[
-    "store",
-    "hub",
-    "name",
-    "lane",
-    "dequantize",
-    "older-than",
-    "converter",
-    "variant",
-    "blocks",
-    "scale",
+    "store", "endpoint", "name", "dequantize", "converter", "variant", "blocks", "scale",
+    "token-env", "dir", "gpu",
 ];
-const VERBS: &[&str] = &["import", "pull", "export", "inspect", "verify", "dev"];
 
 struct Args {
     pos: Vec<String>,
@@ -97,11 +69,7 @@ impl Args {
     }
 
     fn get(&self, name: &str) -> Option<&str> {
-        self.flags
-            .iter()
-            .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.as_str())
+        self.flags.iter().rev().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
     }
 
     fn on(&self, name: &str) -> bool {
@@ -119,28 +87,8 @@ impl Args {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .init();
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    // The positionals as v2 reads them; `gc headers|plan` and every other verb are v1's.
-    let mut pos = Vec::new();
-    let mut it = argv.iter();
-    while let Some(token) = it.next() {
-        match token.strip_prefix("--") {
-            Some(name) if VALUED.contains(&name) => drop(it.next()),
-            Some(_) => {}
-            None => pos.push(token.as_str()),
-        }
-    }
-    let v2 = match pos.as_slice() {
-        ["gc"] => true,
-        [verb, ..] => VERBS.contains(verb),
-        [] => false,
-    };
-    if !v2 {
-        return v1::main(argv);
-    }
     let args = match Args::parse(&argv) {
         Ok(args) => args,
         Err(why) => {
@@ -149,386 +97,222 @@ fn main() -> ExitCode {
         }
     };
     let json = args.on("json");
-    match run(&args) {
+    let ran = fetch::runtime().map_err(Failure::from).and_then(|rt| rt.block_on(run(&args)));
+    match ran {
         Ok(Some((doc, human))) => {
-            if json {
-                println!("{doc}");
-            } else {
-                println!("{human}");
-            }
+            println!("{}", if json { doc.to_string() } else { human });
             ExitCode::SUCCESS
         }
         Ok(None) => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
         }
-        Err(Failed(f, doc)) => {
-            if json {
-                let mut out = json!({"error": {"code": f.kind.code(), "detail": f.detail}});
-                if let Some(doc) = doc {
-                    out.as_object_mut().expect("an object").extend(doc);
-                }
-                println!("{out}");
-            } else {
-                eprintln!("tfs: {f}");
+        Err(f) => {
+            match json {
+                true => println!("{}", json!({"error": {"code": f.kind.code(), "detail": f.detail}})),
+                false => eprintln!("tfs: {f}"),
             }
             ExitCode::FAILURE
         }
     }
 }
 
-/// A failure, with whatever the command found before it.
-struct Failed(Failure, Option<Map<String, Json>>);
+type Done = Result<Option<(Json, String)>>;
 
-impl From<Failure> for Failed {
-    fn from(f: Failure) -> Failed {
-        Failed(f, None)
-    }
-}
-
-impl From<tensorfs::store2::Error> for Failed {
-    fn from(e: tensorfs::store2::Error) -> Failed {
-        Failed(e.into(), None)
-    }
-}
-
-type Done = std::result::Result<Option<(Json, String)>, Failed>;
-
-fn store_root(args: &Args) -> Result<PathBuf> {
+fn config(args: &Args) -> Result<Config> {
+    let mut config = Config::from_env();
     if let Some(dir) = args.get("store") {
-        return Ok(PathBuf::from(dir));
+        config.cache_dir = PathBuf::from(dir);
     }
-    if let Some(dir) = std::env::var_os("TENSORFS_HOME").filter(|d| !d.is_empty()) {
-        return Ok(PathBuf::from(dir));
+    if let Some(url) = args.get("endpoint") {
+        config.endpoint = url.to_owned();
     }
-    match std::env::var_os("HOME").filter(|d| !d.is_empty()) {
-        Some(home) => Ok(Path::new(&home).join(".tensorfs")),
-        None => fail(
-            Kind::Invalid,
-            "no store: pass --store, or set TENSORFS_HOME or HOME",
-        ),
+    if let Some(token) = std::env::var("TENSORFS_TOKEN").ok().filter(|t| !t.is_empty()) {
+        config.token = Some(tensorfs::bearer(token));
     }
+    Ok(config)
 }
 
 fn object(o: &ObjectRef) -> Json {
     json!({"sha256": o.sha256, "length": o.length})
 }
 
-fn named(n: &Named) -> Map<String, Json> {
-    let doc = json!({"manifest": object(&n.manifest), "name": n.name, "release": n.release, "lane": n.lane});
+fn identity(ck: &Checkpoint) -> Map<String, Json> {
+    let doc = json!({"header": object(ck.id()), "tree": ck.tree().map(object), "variant": ck.variant()});
     doc.as_object().expect("an object").clone()
 }
 
-fn label(n: &Named) -> String {
-    match (&n.name, &n.release, &n.lane) {
-        (Some(name), Some(release), Some(lane)) => {
-            format!("{name}@{release} lane {lane}: sha256:{}", n.manifest.sha256)
-        }
-        _ => format!("sha256:{}", n.manifest.sha256),
-    }
+async fn open(client: &Client, args: &Args, reference: &str) -> Result<Checkpoint> {
+    let options = Open { variant: args.get("variant").map(str::to_owned), ..Open::default() };
+    client.open(reference, &options).await
 }
 
-fn run(args: &Args) -> Done {
+async fn run(args: &Args) -> Done {
     let pos: Vec<&str> = args.pos.iter().map(String::as_str).collect();
-    let lane = args.get("lane");
-    let store = || Store::open(store_root(args)?).map_err(Failure::from);
     match pos.as_slice() {
-        ["import", sources @ ..] if !sources.is_empty() => {
+        ["version"] => return version(args.on("json")).map(Some),
+        ["conform", "endpoint", url] => {
+            return conform(url, args.on("write"), args.get("token-env"), args.on("json")).await
+        }
+        _ => {}
+    }
+    let config = config(args)?;
+    let root = config.cache_dir.clone();
+    let client = Client::new(config)?;
+    match pos.as_slice() {
+        ["convert", sources @ ..] if !sources.is_empty() => {
             let sources: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
             let quiet = args.on("json");
             let last = Mutex::new((String::new(), Instant::now()));
-            let progress = |phase: &str, done: u64, total: u64| {
+            let progress = |stage: &str, done: u64, total: u64| -> Result<()> {
                 let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
-                if quiet || (last.0 == phase && last.1.elapsed() < Duration::from_secs(2)) {
-                    return;
+                if !quiet && (last.0 != stage || last.1.elapsed() >= Duration::from_secs(2)) {
+                    *last = (stage.to_owned(), Instant::now());
+                    eprintln!("{stage} {done}/{total}");
                 }
-                *last = (phase.to_owned(), Instant::now());
-                eprintln!("{phase} {done}/{total}");
+                Ok(())
             };
-            let opts = ImportOptions {
-                name: args.get("name"),
+            let options = Convert {
                 converter: args.get("converter"),
                 variant: args.get("variant"),
-                progress: &progress,
+                progress: Some(&progress),
             };
-            let n = store()?.import_named(&sources, &opts)?;
-            Ok(Some((
-                Json::Object(named(&n)),
-                format!("imported {}", label(&n)),
-            )))
+            let ck = client.convert_to_cozytensors(&sources, &options).await?;
+            if let Some(name) = args.get("name") {
+                let tree = ck.tree().expect("a conversion names its tree").clone();
+                name_locally(&Store::open(&root)?, name, &tree)?;
+            }
+            Ok(Some((Json::Object(identity(&ck)), format!("converted sha256:{}", ck.id().sha256))))
         }
-        ["pull", .., reference] if pos.len() <= 3 => {
-            let token = std::env::var("TENSORFS_HUB_TOKEN").ok().filter(|t| !t.is_empty());
-            let from = match pos.as_slice() {
-                [_, origin, _] => client::PullFrom::Origin(origin),
-                _ => client::PullFrom::Hub {
-                    base: args.get("hub"),
-                    token: token.as_deref(),
-                },
-            };
-            let p = store()?.pull(from, reference, lane)?;
-            let mut doc = named(&p.named);
-            doc.extend([
-                ("objects".into(), p.objects.into()),
-                ("fetched".into(), p.fetched.into()),
-                ("held".into(), p.held.into()),
-            ]);
-            let human = format!(
-                "pulled {} ({} objects, {} bytes fetched, {} held)",
-                label(&p.named),
-                p.objects,
-                p.fetched,
-                p.held
-            );
-            Ok(Some((Json::Object(doc), human)))
+        ["download", reference] => {
+            let reference: Ref = reference.parse()?;
+            let dir = args.get("dir").map(Path::new);
+            let folder = client.materialize(&reference, &Download::default(), dir, false).await?;
+            Ok(Some((json!({"path": folder}), format!("downloaded into {}", folder.display()))))
+        }
+        ["upload", folder, reference] => {
+            let reference: Ref = reference.parse()?;
+            let tree = client.upload_folder(&reference, Path::new(folder), None).await?;
+            Ok(Some((json!({"tree": object(&tree)}), format!("uploaded sha256:{}", tree.sha256))))
         }
         ["export", reference, dir] => {
-            let store = store()?;
-            let n = store.resolve(reference, lane)?;
+            let ck = open(&client, args, reference).await?;
             let dir = Path::new(dir);
-            let files = match (
-                args.on("safetensors"),
-                args.on("origin"),
-                args.on("gguf"),
-                args.get("dequantize"),
-            ) {
-                (true, false, false, dequantize) => {
+            ck.download(&Download::default()).await?;
+            let files: Vec<String> = match (args.on("safetensors"), args.on("gguf"), args.get("dequantize")) {
+                (true, false, dequantize) => {
                     let dtype = dequantize.map(|d| Dtype::parse(&d.to_ascii_uppercase()));
-                    export::safetensors(&store.checkpoint(&n.manifest)?, dir, dtype.as_ref())?
+                    ck.materialize(dir, Format::Safetensors, dtype).await?;
+                    listing(dir)?
                 }
-                (false, true, false, None) => client::export_origin(&store, &n, dir)?,
-                (false, false, true, None) => export::gguf(&store.checkpoint(&n.manifest)?, dir)?,
+                (false, true, None) => tensorfs::export::gguf(&Store::open(&root)?.checkpoint(ck.id())?, dir)?,
+                (false, false, None) => {
+                    ck.materialize(dir, Format::Cozytensors, None).await?;
+                    listing(dir)?
+                }
                 _ => return Ok(None),
             };
-            let human = format!(
-                "exported {} into {}: {} files",
-                label(&n),
-                dir.display(),
-                files.len()
-            );
-            let mut doc = named(&n);
+            let human = format!("exported into {}: {} files", dir.display(), files.len());
+            let mut doc = identity(&ck);
             doc.insert("files".into(), files.into());
             Ok(Some((Json::Object(doc), human)))
         }
-        ["inspect", reference] => inspect(&store()?, reference, lane),
-        ["verify"] => verify(&store()?, None),
-        ["verify", reference] => verify(&store()?, Some((reference, lane))),
-        ["gc"] => {
-            let store = store()?;
-            let collected = match args.get("older-than") {
-                None => store.gc()?,
-                Some(text) => store.collect(u64::MAX, duration(text)?)?,
-            };
-            let doc = json!({"objects": collected.objects, "bytes": collected.bytes, "pins": collected.pins});
-            let human = format!(
-                "collected {} objects, {} bytes; dropped {} pins",
-                collected.objects,
-                collected.bytes,
-                collected.pins.len()
-            );
+        ["inspect", reference] => inspect(&open(&client, args, reference).await?),
+        ["verify", reference] => {
+            let ck = open(&client, args, reference).await?;
+            let report = ck.verify(&Selection::All)?;
+            let ids = |v: &[ObjectRef]| v.iter().map(|o| o.sha256.clone()).collect::<Vec<_>>();
+            let mut doc = identity(&ck);
+            doc.extend([("corrupt".into(), ids(&report.corrupt).into()), ("missing".into(), ids(&report.missing).into())]);
+            match report.is_ok() {
+                true => Ok(Some((Json::Object(doc), "verified".into()))),
+                false => fail(
+                    Kind::Integrity,
+                    format!("{} corrupt and {} missing objects: {}", report.corrupt.len(), report.missing.len(), Json::Object(doc)),
+                ),
+            }
+        }
+        ["ceiling", path @ ..] if path.len() <= 1 => {
+            let path = path.first().map_or(root, PathBuf::from);
+            let gpu = args.get("gpu").map(|_| args.number("gpu", 0)).transpose()?.map(|n| n as i32);
+            let c = tensorfs::io::ceiling(gpu, &path).map_err(|e| Failure {
+                kind: if e.kind() == std::io::ErrorKind::Unsupported { Kind::Unsupported } else { Kind::Io },
+                detail: format!("{}: {e}", path.display()),
+            })?;
+            let doc = json!({"disk_gbps": c.disk_gbps, "disk_direct": c.disk_direct, "h2d_gbps": c.h2d_gbps, "streams": c.streams});
+            let mut human = format!("disk {:.2} GB/s{}", c.disk_gbps, if c.disk_direct { "" } else { " (through the page cache)" });
+            if let Some(h2d) = c.h2d_gbps {
+                human += &format!("\nh2d {h2d:.2} GB/s on {} streams", c.streams.unwrap_or(1));
+            }
             Ok(Some((doc, human)))
         }
         ["dev", "ckpt"] => {
-            let store = store()?;
+            let store = Store::open(&root)?;
             let plain = args.on("plain");
             let scale = args.number("scale", 1)?.max(1);
-            let manifest = dev::ckpt(
-                &store,
-                args.number("blocks", 12)?,
-                scale,
-                plain,
-                !args.on("no-configs"),
-            )?;
-            let name = args.get("name").unwrap_or("dev/ckpt");
-            let n = store.set_lane(
-                name,
-                "1",
-                Some(if plain { "bf16" } else { "mixed" }),
-                &manifest,
-            )?;
-            store.unpin(&manifest.sha256)?;
-            let ck = store.checkpoint(&manifest)?;
-            let mut objects: Vec<ObjectRef> = vec![manifest.clone()];
-            objects.extend(ck.manifest().files.values().cloned());
-            objects.extend(ck.header().chunks.iter().cloned());
-            objects.sort();
-            objects.dedup();
-            let mut doc = named(&n);
-            doc.insert("objects".into(), objects.iter().map(object).collect());
-            let human = format!("wrote {} ({} objects)", label(&n), objects.len());
-            Ok(Some((Json::Object(doc), human)))
+            let header = dev::ckpt(&store, args.number("blocks", 12)?, scale, plain, !args.on("no-configs"))?;
+            let mut tree = Tree::default();
+            tree.set_variant(if plain { "bf16" } else { "mixed" }, header.clone());
+            let tree = store.put_tree(&tree)?;
+            let name = args.get("name").unwrap_or("local/ckpt@1");
+            name_locally(&store, name, &tree)?;
+            let objects = store.closure(&tree)?;
+            let doc = json!({"header": object(&header), "tree": object(&tree), "name": name, "objects": objects.iter().map(object).collect::<Vec<_>>()});
+            Ok(Some((doc, format!("wrote {name}: sha256:{} ({} objects)", header.sha256, objects.len()))))
         }
-        ["dev", "migrate", root, select @ ..] => {
-            let store = match args.on("plan") {
-                true => None,
-                false => Some(store()?),
-            };
-            migrate_v1(store.as_ref(), root, select, args.on("dry-run"))
-        }
-        ["dev", "headers", hub, dir, lanes @ ..] if !lanes.is_empty() => headers(hub, dir, lanes),
         _ => Ok(None),
     }
 }
 
-/// Migrates the v1 checkpoints `select` names (a manifest digest or a repo), or every one the
-/// v1 store's repos name; one report per checkpoint and the totals.
-fn migrate_v1(store: Option<&Store>, root: &str, select: &[&str], dry_run: bool) -> Done {
-    let src = old::Source::new(root);
-    let named = match src.root().join("repos").is_dir() {
-        true => src.lanes()?,
-        false => vec![],
-    };
-    let mut lanes: Vec<old::Lane> = Vec::new();
-    for s in select {
-        let repo = |n: &String| n == s || n.starts_with(&format!("{s}@"));
-        let found: Vec<old::Lane> = match s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            true => match named.iter().find(|l| l.manifest.sha256 == *s) {
-                Some(lane) => vec![lane.clone()],
-                None => vec![old::Lane {
-                    manifest: src.manifest_ref(s)?,
-                    names: vec![],
-                }],
-            },
-            false => named
-                .iter()
-                .filter(|l| l.names.iter().any(repo))
-                .cloned()
-                .collect(),
-        };
-        if found.is_empty() {
-            return Err(Failure {
-                kind: Kind::NotFound,
-                detail: format!("no v1 checkpoint {s}"),
-            }
-            .into());
-        }
-        for lane in found {
-            if !lanes.iter().any(|l| l.manifest == lane.manifest) {
-                lanes.push(lane);
+/// Names `tree` in the local repo `local/<name>[@revision]`: that release, or with none an
+/// unreleased checkpoint.
+fn name_locally(store: &Store, name: &str, tree: &ObjectRef) -> Result<()> {
+    let named: Ref = name.parse()?;
+    if !named.repo_id.starts_with("local/") || named.variant.is_some() {
+        return fail(Kind::Invalid, format!("--name {name:?}: a local name is local/<name>[@revision]"));
+    }
+    let (repo, revision) = (named.repo_id.as_str(), named.revision.as_deref());
+    store.update_ref(repo, |old| Some(fetch::with_tree(old, repo, tree, revision)))?;
+    Ok(())
+}
+
+fn listing(dir: &Path) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(at) = stack.pop() {
+        let entries = fs::read_dir(&at).map_err(|e| Failure { kind: Kind::Io, detail: format!("{}: {e}", at.display()) })?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match path.is_dir() {
+                true => stack.push(path),
+                false => out.push(path.strip_prefix(dir).unwrap_or(&path).to_string_lossy().into_owned()),
             }
         }
     }
-    if select.is_empty() {
-        lanes = named;
-    }
-    let mut reports = Vec::new();
-    for (i, lane) in lanes.iter().enumerate() {
-        eprintln!(
-            "[{}/{}] {} {:?}",
-            i + 1,
-            lanes.len(),
-            lane.manifest.sha256,
-            lane.names
-        );
-        let report = migrate::lane(&src, store, lane, dry_run);
-        if let Some(error) = report.doc.get("error") {
-            eprintln!("  {error}");
-        }
-        reports.push(report);
-    }
-    let totals = migrate::totals(&reports);
-    let human = format!(
-        "{} checkpoints, {} passed; {} new objects, {} new bytes",
-        reports.len(),
-        totals["passed"],
-        totals["new"]["objects"],
-        totals["new"]["bytes"]
-    );
-    let checkpoints: Vec<Json> = reports
-        .iter()
-        .map(|r| Json::Object(r.doc.clone()))
-        .collect();
-    // Each model's refs file from its own rows, once every checkpoint it names has migrated.
-    let mut refs = Vec::new();
-    if let (Some(store), false) = (store, dry_run) {
-        let wanted: Vec<&ObjectRef> = lanes.iter().map(|l| &l.manifest).collect();
-        let repos = match src.root().join("repos").is_dir() {
-            true => src.repos()?,
-            false => vec![],
-        };
-        for repo in repos {
-            let named = repo
-                .releases
-                .iter()
-                .flat_map(|r| r.lanes.iter().map(|l| &l.1));
-            if !named.chain(&repo.checkpoints).any(|m| wanted.contains(&m)) {
-                continue;
-            }
-            refs.push(match migrate::refs(&repo, &reports) {
-                Ok(v2) => {
-                    store.update_ref(&v2.name, |_| Some(v2.clone()))?;
-                    json!({"name": v2.name, "written": true, "releases": v2.releases.len(), "checkpoints": v2.checkpoints.len()})
-                }
-                Err(missing) => json!({"name": repo.name, "written": false, "not_migrated": missing}),
-            });
-        }
-    }
-    let doc = json!({"checkpoints": checkpoints, "refs": refs, "totals": totals});
-    match reports.iter().all(|r| r.pass) {
-        true => Ok(Some((doc, human))),
-        false => Err(Failed(
-            Failure {
-                kind: Kind::Integrity,
-                detail: format!("{human}; some did not migrate"),
-            },
-            doc.as_object().cloned(),
-        )),
-    }
+    out.sort();
+    Ok(out)
 }
 
-/// Each released lane's v1 manifest and header from the Hub at `hub`, into `dir`.
-fn headers(hub: &str, dir: &str, lanes: &[&str]) -> Done {
-    fs::create_dir_all(dir).map_err(|e| Failure {
-        kind: Kind::Io,
-        detail: format!("{dir}: {e}"),
-    })?;
-    let mut docs = Vec::new();
-    for spec in lanes {
-        let Some((refspec, lane)) = spec.rsplit_once('/').filter(|(r, _)| r.contains('@')) else {
-            return Ok(None);
-        };
-        let got = migrate::hub::headers(hub, refspec, lane, Path::new(dir))?;
-        eprintln!("{spec}: {} ({} bytes)", got.manifest.sha256, got.bytes);
-        docs.push(json!({"lane": spec, "release": got.release, "manifest": object(&got.manifest), "bytes": got.bytes}));
-    }
-    let bytes: u64 = docs.iter().filter_map(|d| d["bytes"].as_u64()).sum();
-    let human = format!(
-        "{} lanes, {bytes} bytes of manifests and headers",
-        docs.len()
-    );
-    Ok(Some((json!({"lanes": docs, "bytes": bytes}), human)))
+/// `tfs <version> sha256:<digest of this binary>`: the skew observable callers refuse on.
+fn version(json: bool) -> Result<(Json, String)> {
+    let bytes = std::env::current_exe()
+        .and_then(fs::read)
+        .map_err(|e| Failure { kind: Kind::Io, detail: format!("read this binary: {e}") })?;
+    let digest = tensorfs::sha256::hex_digest(&bytes);
+    let human = format!("tfs {} sha256:{digest}", env!("CARGO_PKG_VERSION"));
+    let doc = json!({"version": env!("CARGO_PKG_VERSION"), "sha256": digest, "store_format": tensorfs::STORE_FORMAT});
+    Ok(match json {
+        true => (doc, String::new()),
+        false => (doc, human),
+    })
 }
 
-/// `7d`, `12h`, `30m`, `90s` or seconds.
-fn duration(text: &str) -> Result<Duration> {
-    let (number, unit) = text.split_at(text.trim_end_matches(char::is_alphabetic).len());
-    let scale = match unit {
-        "" | "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86400,
-        _ => 0,
-    };
-    match number.parse::<u64>() {
-        Ok(n) if scale > 0 => Ok(Duration::from_secs(n * scale)),
-        _ => fail(
-            Kind::Invalid,
-            format!("--older-than {text:?}: a number of s, m, h or d"),
-        ),
-    }
-}
-
-fn inspect(store: &Store, reference: &str, lane: Option<&str>) -> Done {
-    let n = store.resolve(reference, lane)?;
-    let ck = store.checkpoint(&n.manifest)?;
+fn inspect(ck: &Checkpoint) -> Done {
     let header = ck.header();
-    let mut human = vec![label(&n)];
-    // Arrays in header (construction) order.
+    let mut human = vec![format!("sha256:{}", ck.id().sha256)];
     let mut components = Vec::new();
     for c in header.components() {
-        let mut tensors = Vec::new();
-        let mut bytes = 0;
+        let (mut tensors, mut bytes) = (Vec::new(), 0);
         // Each distinct encoding (`plain` for none) and its tensor count, in order of first use.
         let mut encodings: Vec<(String, usize)> = Vec::new();
         for t in &c.tensors {
@@ -550,29 +334,16 @@ fn inspect(store: &Store, reference: &str, lane: Option<&str>) -> Done {
             }
             tensors.push(doc);
         }
-        human.push(format!(
-            "  {}: {} tensors, {bytes} bytes",
-            c.name,
-            c.tensors.len()
-        ));
+        human.push(format!("  {}: {} tensors, {bytes} bytes", c.name, c.tensors.len()));
         human.extend(encodings.iter().map(|(e, n)| format!("    {n} × {e}")));
-        components.push(json!({"name": c.name, "bytes": bytes, "tensors": tensors}));
+        let assets: Map<String, Json> = c.assets.iter().map(|(p, o)| (p.clone(), object(o))).collect();
+        components.push(json!({"name": c.name, "class": c.class, "config": c.config, "assets": assets, "bytes": bytes, "tensors": tensors}));
     }
     let chunk_bytes: u64 = header.chunks.iter().map(|c| c.length).sum();
-    human.push(format!(
-        "  {} chunks, {chunk_bytes} bytes; {} files",
-        header.chunks.len(),
-        ck.manifest().files.len()
-    ));
-    let files: Map<String, Json> = ck
-        .manifest()
-        .files
-        .iter()
-        .map(|(p, o)| (p.clone(), object(o)))
-        .collect();
-    let mut doc = named(&n);
+    human.push(format!("  {} chunks, {chunk_bytes} bytes", header.chunks.len()));
+    let mut doc = identity(ck);
     doc.extend([
-        ("files".into(), Json::Object(files)),
+        ("pipeline".into(), json!(header.pipeline().map(|p| json!({"class": p.class, "config": p.config})))),
         ("chunks".into(), header.chunks.len().into()),
         ("bytes".into(), chunk_bytes.into()),
         ("metadata".into(), json!(header.metadata)),
@@ -581,79 +352,46 @@ fn inspect(store: &Store, reference: &str, lane: Option<&str>) -> Done {
     Ok(Some((Json::Object(doc), human.join("\n"))))
 }
 
-/// Rehashes every object (or a checkpoint's): a corrupt one is removed, to be fetched again.
-fn verify(store: &Store, reference: Option<(&str, Option<&str>)>) -> Done {
-    let objects: Vec<ObjectRef> = match reference {
-        Some((reference, lane)) => {
-            let n = store.resolve(reference, lane)?;
-            let ck = store.checkpoint(&n.manifest)?;
-            let mut all = vec![n.manifest.clone()];
-            all.extend(ck.manifest().files.values().cloned());
-            all.extend(ck.header().chunks.iter().cloned());
-            all.sort();
-            all.dedup();
-            all
-        }
-        None => blobs(store)?,
-    };
-    let (mut corrupt, mut missing, mut bytes) = (Vec::new(), Vec::new(), 0);
-    for o in &objects {
-        if !store.path(o)?.exists() {
-            missing.push(o.sha256.clone());
-        } else if store.verify(o)? {
-            bytes += o.length;
-        } else {
-            corrupt.push(o.sha256.clone());
-        }
-    }
-    let mut doc = Map::new();
-    doc.extend([
-        ("objects".into(), objects.len().into()),
-        ("bytes".into(), bytes.into()),
-        ("corrupt".into(), corrupt.clone().into()),
-        ("missing".into(), missing.clone().into()),
-    ]);
-    if corrupt.is_empty() && missing.is_empty() {
-        let human = format!("verified {} objects, {bytes} bytes", objects.len());
-        return Ok(Some((Json::Object(doc), human)));
-    }
-    let detail = format!(
-        "{} corrupt (removed) and {} missing of {} objects",
-        corrupt.len(),
-        missing.len(),
-        objects.len()
-    );
-    Err(Failed(
-        Failure {
-            kind: Kind::Integrity,
-            detail,
+/// `tfs conform endpoint`: every case, and a failure when a MUST failed.
+async fn conform(url: &str, write: bool, token_env: Option<&str>, json: bool) -> Done {
+    let token = match token_env {
+        Some(var) => match std::env::var(var).ok().filter(|t| !t.is_empty()) {
+            Some(token) => Some(fetch::bearer(token)),
+            None => return fail(Kind::Invalid, format!("${var} is unset")),
         },
-        Some(doc),
-    ))
-}
-
-/// Every object file in the store, at its length on disk.
-fn blobs(store: &Store) -> Result<Vec<ObjectRef>> {
-    let mut out = Vec::new();
-    let list = |dir: &Path| -> Result<Vec<fs::DirEntry>> {
-        match fs::read_dir(dir) {
-            Ok(entries) => Ok(entries.flatten().collect()),
-            Err(e) => fail(Kind::Io, format!("{}: {e}", dir.display())),
-        }
+        None => None,
     };
-    for top in list(&store.root().join("blobs"))? {
-        for shard in list(&top.path())? {
-            for blob in list(&shard.path())? {
-                let sha256 = blob.file_name().to_string_lossy().into_owned();
-                if let Ok(m) = blob.metadata() {
-                    out.push(ObjectRef {
-                        sha256,
-                        length: m.len(),
-                    });
-                }
-            }
-        }
+    let scratch = std::env::temp_dir().join(format!("tfs-conform-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let policy = fetch::SourcePolicy {
+        any_host: true,
+        allow_local: fetch::policy::is_loopback_origin(url),
+        max_redirects: 5,
+        ..Default::default()
+    };
+    let client = fetch::Client::new(policy);
+    let cases = async {
+        let endpoint = std::sync::Arc::new(fetch::Endpoint::new(&client, url, token)?);
+        fetch::conform::endpoint(endpoint, &client, write, &scratch).await
     }
-    out.sort();
-    Ok(out)
+    .await;
+    let _ = fs::remove_dir_all(&scratch);
+    let cases = cases.map_err(Failure::from)?;
+    let mark = |c: &fetch::conform::Case| match (c.ok, c.must) {
+        (None, _) => "n/a ",
+        (Some(true), _) => "pass",
+        (Some(false), true) => "FAIL",
+        (Some(false), false) => "warn",
+    };
+    let human: Vec<String> = cases.iter().map(|c| format!("{}  {}  {}", mark(c), c.name, c.detail).trim_end().to_owned()).collect();
+    let docs: Vec<Json> = cases.iter().map(|c| json!({"case": c.name, "must": c.must, "ok": c.ok, "detail": c.detail})).collect();
+    let failed = cases.iter().filter(|c| c.must && c.ok == Some(false)).count();
+    let doc = json!({"endpoint": url, "cases": docs, "failed": failed});
+    if failed == 0 {
+        return Ok(Some((doc, human.join("\n"))));
+    }
+    if !json {
+        eprintln!("{}", human.join("\n"));
+    }
+    fail(Kind::Invalid, format!("{url}: {failed} MUST case(s) failed: {doc}"))
 }

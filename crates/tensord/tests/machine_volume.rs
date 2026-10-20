@@ -3,8 +3,6 @@
 //! the volume, as its run's record says; a machine without the variable downloads from the Hub.
 #![cfg(target_os = "linux")]
 mod common;
-#[path = "common/hub_oauth.rs"]
-mod hub_oauth;
 #[path = "common/names_hub.rs"]
 mod names_hub;
 
@@ -82,7 +80,7 @@ async fn download(client: &Client, id: &str, hub: &str) -> serde_json::Value {
             lane: "bf16".into(),
             ..Default::default()
         }],
-        hub: Some(v1::HubAccess { origin: hub.into(), object_hosts: vec!["localhost".into()], ..Default::default() }),
+        hub: Some(v1::HubAccess { origin: hub.into(), ..Default::default() }),
         catalog_revision: "r1".into(),
         owner: "alice".into(),
         ..Default::default()
@@ -103,14 +101,14 @@ fn on_volume(cache: &Path) -> usize {
 #[tokio::test]
 async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
     let source = std::env::temp_dir().join(format!("tensord-volume-source-{}", uuid::Uuid::new_v4()));
-    let store = tensorfs::store2::Store::open(&source).unwrap();
-    let manifest = hub_oauth::checkpoint(&store, &vec![5; 1 << 20]);
+    let store = tensorfs::store::Store::open(&source).unwrap();
+    let manifest = names_hub::checkpoint(&store, &vec![5; 1 << 20]);
     let objects = store.closure(&manifest).unwrap().len();
     let model = names_hub::Model {
         repository: "acme/model".into(),
         release: "1.0.0".into(),
         lane: "bf16".into(),
-        manifest,
+        header: manifest,
     };
     let (hub, heard) = names_hub::serve(&store, model, Vec::<names_hub::Package>::new());
     // A mount point, as the Hub's: a tmpfs directory named from a disk directory.
@@ -136,7 +134,7 @@ async fn a_second_machine_downloads_from_the_volume_the_first_filled() {
     let second = download(&client, "volume-b", &hub).await;
     assert_eq!((&second["bytes"]["hub"], &second["bytes"]["volume"]), (&0.into(), &total.into()), "{second}");
     let asked = std::mem::take(&mut *heard.lock().unwrap());
-    assert!(asked.iter().all(|heard| heard.starts_with("POST /v1/tensorfs/closure")), "{asked:?}");
+    assert_eq!(asked, ["GET /refs/acme/model.json"], "only the name is the Hub's");
     drop(b);
 
     // No variable, no volume: the Hub, as before.

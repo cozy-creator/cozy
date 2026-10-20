@@ -69,10 +69,11 @@ pub struct Spec {
     pub gpus: u32,
     /// The run's weight precision (16, 8 or 4); 0 lets the lane rule choose each slot's.
     pub bits: u32,
-    /// The Hub the run reads and publishes to, under this machine's authority there.
+    /// The Hub the run reads, under its request's bearer there (memory only).
     pub hub: Option<hub::Source>,
     /// Provider tokens for source models, held in memory only.
     pub providers: Providers,
+    pub tensorfs: Option<protocol::machine::TensorFSOptions>,
     /// `org/name`: the requester's repository for the run's weights outputs, or where a
     /// model-only warm run puts the source model it made.
     pub weights_destination: String,
@@ -93,10 +94,8 @@ pub struct Runs {
     pub objects: Arc<Objects>,
     pub publisher: Option<Arc<Publisher>>,
     pub local: Option<Arc<LocalSources>>,
-    /// On a rental: its own Hub, where a run that names none reads.
+    /// On a rental: its own Hub, where a run that names none reads anonymously.
     pub own_hub: Option<hub::Source>,
-    /// This machine's TLS leaf key: it trades a run's capability for its token.
-    pub leaf: Option<Arc<hub::Leaf>>,
     /// Unfinished runs' preparation: their children prepare with it, and their weights are
     /// fetched and published with its access. Tokens live only here.
     pub contexts: Mutex<HashMap<String, RunContext>>,
@@ -109,14 +108,15 @@ pub struct RunContext {
     pub(crate) installation: String,
     pub(crate) hub: Option<hub::Source>,
     pub(crate) providers: Providers,
+    pub(crate) tensorfs: Option<protocol::machine::TensorFSOptions>,
+    pub(crate) weights_destination: String,
     pub(crate) owner: String,
     pub(crate) catalog_revision: String,
     pub(crate) attention_kernel: String,
     pub(crate) gpus: u32,
     pub(crate) bits: u32,
     pub(crate) models: Vec<domain::ModelChoice>,
-    pub(crate) weights_destination: String,
-    /// What its weights come under before its call's executor asks (`Fetch::ahead`).
+    /// What its weights come under before its call's executor reads them (`Fetch::ahead`).
     pub(crate) ahead: Option<Arc<crate::access::Fetch>>,
 }
 
@@ -189,6 +189,27 @@ fn refused(code: &'static str, message: impl Into<String>) -> Refused {
     }
 }
 
+/// A named tree already held for an upload. Empty-repository choices retain their legacy
+/// header meaning; local trees never fall back to a remote repository or its newest release.
+fn held_tree(store: &crate::storage::Store, choice: &domain::ModelChoice) -> Result<Option<crate::published::Named>, Refused> {
+    let Some(manifest) = choice.manifest.as_ref().filter(|_| !choice.repository.is_empty()) else {
+        return Ok(None);
+    };
+    let id = tensorfs::sha256::hex(&manifest.digest);
+    let tree = match crate::storage::held(store, &id) {
+        Ok(tree) => tree,
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !choice.repository.starts_with("local/") => return Ok(None),
+        Err(error) => return Err(refused("checkpoint_absent", format!("held tree sha256:{id}: {error}"))),
+    };
+    let parsed = store.tree(&tree).map_err(|error| refused("checkpoint_invalid", error.to_string()))?;
+    let (lane, header) = tensorfs::fetch::variant_of_tree(&parsed, (!choice.lane.is_empty()).then_some(choice.lane.as_str()))
+        .map_err(|error| refused("checkpoint_variant_absent", error.to_string()))?;
+    Ok(Some(crate::published::Named {
+        repository: choice.repository.clone(), release: choice.release.clone(), lane,
+        tree: Some(tree), header: Some(header),
+    }))
+}
+
 impl Runs {
     /// The run this id already names, if its spec is `digest`; another spec is a conflict.
     pub(crate) fn existing(&self, actor: &str, id: &str, digest: &str) -> Result<Option<Execution>, Refused> {
@@ -213,7 +234,7 @@ impl Runs {
                 "the payload is a JSON object of the function's parameters",
             ));
         }
-        // Pin release stays out from validation through acceptance.
+        // Object sweeps stay out from validation through acceptance.
         let custody = self.objects.guard();
         let mut references = Vec::new();
         let unwritten = |input: &str| refused("input_unwritten", format!("input {input} was not written to this machine"));
@@ -334,11 +355,9 @@ impl Runs {
     /// Hub checkpoint downloaded, a provider source or a written file (`object://`) made, a
     /// checkpoint this machine holds (a run's weights output, a `local/` alias) found. With a
     /// weights destination the one choice is put there: a `local/` alias held by name, or a
-    /// Hub repository under the run's capability.
+    /// repository at the run's TensorFS endpoint.
     fn warm_models(
         &self,
-        actor: &str,
-        id: &str,
         spec: &Spec,
         observe: &(dyn Fn(&str, u64, u64) + Sync),
         stoppable: &Stoppable,
@@ -348,10 +367,13 @@ impl Runs {
         if !destination.is_empty() && spec.models.len() != 1 {
             return Err(refused("invalid_request", "a weights destination takes one model"));
         }
-        #[cfg(feature = "migrate")]
-        if let (Some(store), Some(publisher)) = (crate::migrate::local_store(&spec.models), &self.publisher) {
-            return crate::migrate::local(publisher, store, observe);
-        }
+        // An upload goes to the run's TensorFS endpoint; TensorD publishes nothing itself.
+        let upload = match (destination.is_empty() || destination.starts_with("local/"), &spec.tensorfs) {
+            (true, _) => None,
+            (false, Some(options)) => Some(options),
+            (false, None) => return Err(refused("upload_endpoint_absent",
+                format!("uploading to {destination} takes the run's TensorFS endpoint (`tensorfs` options), and it carries none"))),
+        };
         if spec.models.is_empty() {
             return Ok(vec![]);
         }
@@ -366,39 +388,39 @@ impl Runs {
         };
         let mut models = vec![];
         for choice in &spec.models {
-            #[cfg(feature = "migrate")]
-            let migrated = match crate::migrate::marked(choice) {
-                true => Some(crate::migrate::checkpoint(publisher, hub_access()?, choice, stop, observe)?),
-                false => None,
-            };
-            #[cfg(not(feature = "migrate"))]
-            let migrated: Option<(ObjectRef, Value)> = None;
-            let (manifest, mut row) = if let Some(made) = migrated {
-                made
-            } else if !choice.source.is_empty() {
+            // Each model's header, and the tree that names it when one does.
+            let (header, tree, mut row) = if !choice.source.is_empty() {
                 let made = publisher.make_source(&choice.source, &choice.profiles, &spec.providers, stop, observe)?;
                 let row = json!({"parameter": choice.parameter, "source": choice.source,
                     "resolved": made.resolved, "profiles": made.profiles,
-                    "repository": made.repository, "manifest": made.manifest.id()});
-                (made.manifest, row)
+                    "repository": made.repository, "checkpoint": made.header.id()});
+                let tree = crate::storage::local(publisher.store(), &made.repository, None, None)?.map(|local| local.tree);
+                (made.header, tree, row)
             } else if let (Some(name), None) = (choice.repository.strip_prefix("local/"), &choice.manifest) {
                 // A local alias: the model this machine's store holds under that name.
-                let manifest = crate::storage::local(publisher.store(), name)
+                let local = crate::storage::local(publisher.store(), &choice.repository, None, None)
                     .map_err(|e| refused("checkpoint_absent", e.to_string()))?
+                    .filter(|local| crate::storage::present(publisher.store(), &local.header))
                     .ok_or_else(|| refused("checkpoint_absent", format!("this machine holds no local/{name}")))?;
                 let row = json!({"parameter": choice.parameter,
-                    "repository": choice.repository, "manifest": manifest.id()});
-                (manifest, row)
+                    "repository": choice.repository, "checkpoint": local.header.id()});
+                (local.header, Some(local.tree), row)
             } else if choice.repository.is_empty() {
-                // A checkpoint this machine already holds (a run's output).
-                let manifest = choice.manifest.as_ref().ok_or_else(|| {
+                // A checkpoint this machine already holds (a run's output), by its header.
+                let header = choice.manifest.as_ref().ok_or_else(|| {
                     refused("invalid_request", format!("model choice {:?} names no model", choice.parameter))
                 })?;
-                let sha256 = tensorfs::sha256::hex(&manifest.digest);
+                let sha256 = tensorfs::sha256::hex(&header.digest);
                 let held = crate::storage::held(publisher.store(), &sha256)
                     .map_err(|_| refused("checkpoint_absent", format!("this machine holds no checkpoint sha256:{sha256}")))?;
-                let row = json!({"parameter": choice.parameter, "manifest": format!("sha256:{sha256}")});
-                (held, row)
+                let row = json!({"parameter": choice.parameter, "checkpoint": format!("sha256:{sha256}")});
+                (held, None, row)
+            } else if let Some(named) = if destination.is_empty() { None } else { held_tree(publisher.store(), choice)? } {
+                let header = named.header().map_err(|(code, message)| refused(code, message))?.clone();
+                let tree = named.tree().map_err(|(code, message)| refused(code, message))?.clone();
+                let row = json!({"parameter": choice.parameter, "repository": named.repository,
+                    "lane": named.lane, "tree": tree.id(), "checkpoint": header.id()});
+                (header, Some(tree), row)
             } else {
                 // A Hub checkpoint by name, or the owner's by hash; no lane is the one this
                 // machine's GPUs would run at the run's bits (`precision`).
@@ -411,49 +433,48 @@ impl Runs {
                 let (named, (hub, volume)) = publisher.download(&self.service, hub_access()?, named, &lanes, &spec.catalog_revision, stop, &|done, total| {
                     observe(&stage, done, total)
                 })?;
-                let held = crate::storage::held(publisher.store(), &named.manifest)?;
+                let header = named.header().map_err(|(code, message)| refused(code, message))?.clone();
+                let tree = named.tree.as_ref().map(ObjectRef::id);
                 let row = json!({"parameter": choice.parameter, "repository": named.repository,
-                    "release": named.release, "lane": named.lane, "manifest": named.manifest,
+                    "release": named.release, "lane": named.lane, "tree": tree, "checkpoint": header.id(),
                     "bytes": {"hub": hub, "volume": volume}});
-                (held, row)
+                (header, None, row)
             };
             if let Some(name) = destination.strip_prefix("local/") {
                 // A local alias (`cozy model download … local/name`): the model, held by name.
-                crate::storage::set_local(publisher.store(), name, &manifest)
+                crate::storage::set_local(publisher.store(), name, &header, &Default::default())
                     .map_err(|e| refused("local_alias_refused", e.to_string()))?;
-                row["published"] = json!({"destination": destination, "checkpoint": manifest.id(), "converged": false});
-            } else if !destination.is_empty() {
-                let publishing = hub::Catalog::for_op(
-                    hub_access()?,
-                    hub::Op::Publish { model: destination },
-                )
-                .map_err(|(code, message)| refused(code, message))?;
-                let operation = format!(
-                    "upload-{}",
-                    &tensorfs::sha256::hex_digest(format!("{actor}\0{id}").as_bytes())[..40]
-                );
+                row["published"] = json!({"destination": destination, "checkpoint": header.id(), "converged": false});
+            } else if let Some(options) = upload {
+                use tensorfs::fetch::{bearer, upload_tree_with, Client, Endpoint, SourcePolicy, UploadControl};
+                // A tree goes up: the model's own, else one naming its header alone.
+                let tree = match tree {
+                    Some(tree) => tree,
+                    None => crate::storage::tree_of(publisher.store(), &header)?,
+                };
                 let stage = format!("uploading to {destination}");
-                // A cancel stops the push; only finalizing, which publishes, cannot be taken back.
-                let published = publishing.publish(&crate::origin::Publication {
-                    store: publisher.store(),
-                    destination,
-                    manifest: &manifest,
-                    operation: &operation,
+                let policy = SourcePolicy { any_host: true, allow_local: true, max_redirects: 8, ..Default::default() };
+                let client = match options.ca_der.is_empty() {
+                    true => Ok(Client::new(policy)),
+                    false => Client::with_roots(policy, hub::pem(&options.ca_der).as_bytes()),
+                }.map_err(|error| refused("upload_failed", error.to_string()))?;
+                let token = (!options.token.is_empty()).then(|| bearer(options.token.clone()));
+                let mut endpoint = Endpoint::new(&client, &options.endpoint, token)
+                    .map_err(|error| refused("upload_failed", error.to_string()))?;
+                if options.token.is_empty() {
+                    endpoint = endpoint.anonymous();
+                }
+                let runtime = tensorfs::fetch::runtime().map_err(|error| refused("upload_failed", error.to_string()))?;
+                let uploaded = runtime.block_on(upload_tree_with(&endpoint, destination, &tree, publisher.store(), None, &UploadControl {
+                    cancelled: &|| stoppable.stop.is_cancelled(),
                     progress: &|done, total| observe(&stage, done, total),
-                    streams: 8,
-                    stop,
                     commit: &|| stoppable.commit(),
-                })
-                .map_err(|e| match stoppable.stop.is_cancelled() {
-                    true => refused(crate::published::CANCELED,
-                        "the run was canceled while it uploaded: nothing was published, and the Hub keeps what landed for an upload asked again"),
-                    false => {
-                        let (code, message) = publishing.reason("weights_publication_failed", e);
-                        refused(code, message)
-                    }
+                })).map_err(|error| match stoppable.stop.is_cancelled() {
+                    true => refused(crate::published::CANCELED, "the upload was canceled before its ref update; admitted objects remain available"),
+                    false => refused("upload_failed", error.to_string()),
                 })?;
-                row["published"] = json!({"destination": destination,
-                    "checkpoint": published.checkpoint, "converged": published.converged});
+                row["published"] = json!({"destination": destination, "tree": tree.id(),
+                    "checkpoint": header.id(), "converged": uploaded.converged});
             }
             models.push(row);
         }
@@ -494,7 +515,7 @@ impl Runs {
             return self.warm_set(actor, id, &spec, items, &observe, stoppable);
         }
         if let Source::Models = spec.source {
-            let models = self.warm_models(actor, id, &spec, &*observe, stoppable)?;
+            let models = self.warm_models(&spec, &*observe, stoppable)?;
             return warm_result(json!({}), models);
         }
         // A warm run naming no entrypoint installs its code, then makes its choices present.
@@ -568,7 +589,7 @@ impl Runs {
         if let (false, Some(gpu)) = (spec.warm, self.service.gpu()) {
             ahead = plan.as_ref().zip(self.publisher.as_ref()).map(|(plan, publisher)| {
                 let order = self.service.engine.get(id).map_or(u64::MAX, |record| record.root_seq());
-                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), plan.manifests(), order);
+                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), order);
                 if let Err(error) = fetch.ahead(&plan.upfront()) {
                     tracing::warn!("run {id}: its weights' early fetch: {error}");
                 }
@@ -616,13 +637,13 @@ impl Runs {
         }
         if spec.warm {
             let models = match install_only {
-                true => self.warm_models(actor, id, &spec, &*observe, stoppable)?,
+                true => self.warm_models(&spec, &*observe, stoppable)?,
                 false => vec![],
             };
             // A function's warm run ends holding what its constructions read (`downloaded`).
             let mut moved = (0, 0);
             if let (Some(plan), Some(publisher)) = (&plan, &self.publisher) {
-                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), plan.manifests(), u64::MAX);
+                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), u64::MAX);
                 let report = |done, total| observe("downloading its weights", done, total);
                 moved = fetch.download(&plan.upfront(), &stoppable.stop, &report).map_err(|e| match stoppable.stop.is_cancelled() {
                     true => refused(crate::published::CANCELED, "the run was canceled while it downloaded"),
@@ -679,13 +700,14 @@ impl Runs {
                 installation: installation.alias.clone(),
                 hub,
                 providers: spec.providers.clone(),
+                tensorfs: spec.tensorfs.clone(),
+                weights_destination: spec.weights_destination.clone(),
                 owner: spec.owner.clone(),
                 catalog_revision: spec.catalog_revision.clone(),
                 attention_kernel: spec.attention_kernel.clone(),
                 gpus: spec.gpus,
                 bits: spec.bits,
                 models: spec.models.clone(),
-                weights_destination: spec.weights_destination.clone(),
                 ahead,
             };
             self.contexts.lock().unwrap().insert(id.into(), context);
@@ -728,7 +750,7 @@ impl Runs {
         stoppable: &Stoppable,
     ) -> Result<Option<ResultRecord>, Refused> {
         let hub = spec.hub.clone().or_else(|| self.own_hub.clone());
-        let (mut members, mut kept, mut rows) = (vec![], vec![], vec![]);
+        let (mut members, mut kept, mut rows, mut fetches) = (vec![], vec![], vec![], vec![]);
         for item in items {
             let (held, release) = match &item.source {
                 Source::Installation(alias) => {
@@ -800,9 +822,10 @@ impl Runs {
                 .map_err(io::Error::other)?);
                 let held = self.service.catalog.resolve(&installation.generation)?;
                 // A member's weights come under the warm run's access, after every run's.
-                let fetch = self.publisher.as_ref().zip(plan.as_ref()).map(|(publisher, plan)| {
-                    crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), plan.manifests(), u64::MAX)
+                let fetch = self.publisher.as_ref().filter(|_| plan.is_some()).map(|publisher| {
+                    crate::access::Fetch::new(publisher.machine().clone(), hub.clone(), u64::MAX)
                 });
+                fetches.extend(fetch.clone());
                 members.push(Member::new(held, plan, item.level, fetch));
             }
         }
@@ -818,6 +841,8 @@ impl Runs {
             }
             None => members.iter().map(|member| without_gpus(member.level)).collect(),
         };
+        // The set outlives this run: past its first pass, its members read anonymously.
+        fetches.iter().for_each(|fetch| fetch.detach());
         // An item's level is its lowest member's, and why that one is held back.
         let mut holds = holds.into_iter();
         let rows: Vec<Value> = rows
@@ -1076,6 +1101,7 @@ impl Runs {
             bits: context.bits,
             hub: context.hub,
             providers: context.providers,
+            tensorfs: context.tensorfs,
             weights_destination: String::new(),
             owner: context.owner,
             catalog_revision: context.catalog_revision,
@@ -1133,7 +1159,7 @@ impl Runs {
                             // Its weights come after its root's own, under the child's access.
                             let hub = spec.hub.clone().or_else(|| runs.own_hub.clone());
                             if let Some(publisher) = &runs.publisher {
-                                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub, plan.manifests(), root);
+                                let fetch = crate::access::Fetch::new(publisher.machine().clone(), hub, root);
                                 gpu.prefetch(&runs.service.engine, held, plan, (root, family.clone()), owner.clone(), fetch)
                             }
                         }
@@ -1152,19 +1178,17 @@ impl Runs {
         Ok(())
     }
 
-    /// Where a run's weights outputs go: the requester's repository, under its capability.
-    pub fn destination(&self, id: &str) -> io::Result<Option<crate::weights::Destination>> {
-        let repository = self.contexts.lock().unwrap().get(id).map(|c| c.weights_destination.clone()).unwrap_or_default();
-        match (repository.is_empty(), self.hub(id)) {
-            (true, _) => Ok(None),
-            (false, Some(hub)) => Ok(Some(crate::weights::Destination { repository, hub })),
-            (false, None) => Err(io::Error::other("a weights destination needs the run's Hub access, and the run has none")),
-        }
-    }
-
     /// The fetches a run's preparation started, for its call to end once its executor asks.
     pub fn ahead(&self, id: &str) -> Option<Arc<crate::access::Fetch>> {
         self.contexts.lock().unwrap().get_mut(id).and_then(|context| context.ahead.take())
+    }
+
+    pub(crate) fn tensorfs(&self, id: &str) -> Option<protocol::machine::TensorFSOptions> {
+        self.contexts.lock().unwrap().get(id).and_then(|context| context.tensorfs.clone())
+    }
+
+    pub(crate) fn destination(&self, id: &str) -> String {
+        self.contexts.lock().unwrap().get(id).map(|context| context.weights_destination.clone()).unwrap_or_default()
     }
 
     /// The Hub a run reads and writes: its own access, else the machine's.
@@ -1219,52 +1243,6 @@ mod tests {
     use std::{fs, path::Path, process::Command, time::Duration};
     use tensorfs::sha256;
 
-    /// The store keeps every checkpoint an unfinished run's plan reads (its raw sources too);
-    /// a plan that cannot be read stops store GC for that pass.
-    #[test]
-    fn unfinished_runs_keep_their_checkpoints_and_an_unreadable_plan_stops_store_gc_for_a_pass() {
-        let root = std::env::temp_dir().join(format!("cm-keep-list-{}", uuid::Uuid::new_v4()));
-        let service = Service::open(&root.join("state"), &root.join("generations"), 1).unwrap();
-        let store = crate::storage::open(&root.join("store")).unwrap();
-        let publisher = Publisher::new(&root.join("published"), Default::default(), crate::origin::Machine::new(store.clone(), None).unwrap()).unwrap();
-        service.configure_publisher(publisher.clone());
-        drop(store);
-        service.engine.bind_installation(Installation {
-            actor: "alice".into(), alias: "installed".into(), generation: "g".into(),
-            package: "audit/derive".into(), release: "1".into(), interface: b"{}".to_vec(), hub: String::new(),
-        }).unwrap();
-        let kept = |model: &str| format!("sha256:{}", model.repeat(64));
-        let run = |name: &str, model: &str| {
-            let plan = crate::gpu_service::Plan {
-                id: format!("plan-{model}"), construction: "c".into(), installation: "installed".into(),
-                generation: "g".into(), entrypoint: "derive".into(), slots: vec![], degree: 0,
-                sources: vec![crate::gpu_service::PlanSource { parameter: "source".into(), manifest: kept(model),
-                    length: 1, repository: String::new(), release: String::new(), lane: String::new() }],
-            };
-            service.engine.bind_preparation(Preparation { actor: "alice".into(), id: plan.id.clone(),
-                installation: "installed".into(), document: serde_json::to_vec(&plan).unwrap() }).unwrap();
-            let invocation = crate::journal::Invocation { package: "audit/derive".into(), input: json!({}), ..Default::default() };
-            let (run, _) = service.engine.accept_run("alice", name, name, invocation.clone()).unwrap();
-            service.engine.bind_prepared(&run.id, invocation, &plan.id, Default::default(), None).unwrap();
-            run.id
-        };
-        let (queued, unknown, ended) = (run("queued", "a"), run("unknown", "b"), run("ended", "c"));
-        // A state a newer machine wrote is unfinished to this one.
-        let journal = rusqlite::Connection::open(root.join("state/execution/executions.sqlite3")).unwrap();
-        journal.execute("UPDATE executions SET state='future-state' WHERE id=?1", [&unknown]).unwrap();
-        service.engine.cancel(&ended, "alice").unwrap();
-        assert_eq!(publisher.caches(&service).unwrap().keep, [kept("a"), kept("b")]);
-        // An unreadable plan is no list at all, for this pass only.
-        let plan = journal.query_row("SELECT record FROM preparations WHERE id='plan-a'", [], |row| row.get::<_, String>(0)).unwrap();
-        journal.execute("UPDATE preparations SET record='not a plan' WHERE id='plan-a'", []).unwrap();
-        assert!(publisher.caches(&service).is_err());
-        assert_eq!(service.reclaim(), crate::reclaim::Swept::default());
-        journal.execute("UPDATE preparations SET record=?1 WHERE id='plan-a'", [plan]).unwrap();
-        assert_eq!(publisher.caches(&service).unwrap().keep, [kept("a"), kept("b")]);
-        drop(queued);
-        crate::scratch::remove(&root);
-    }
-
     fn write(objects: &Objects, actor: &str, bytes: &[u8]) -> (String, u64) {
         let digest = format!("sha256:{}", sha256::hex_digest(bytes));
         objects.write(actor, &digest, bytes).unwrap();
@@ -1298,6 +1276,7 @@ mod tests {
             bits: 0,
             hub: None,
             providers: Default::default(),
+            tensorfs: None,
             weights_destination: String::new(),
             owner: "alice".into(),
             catalog_revision: String::new(),
@@ -1318,9 +1297,9 @@ mod tests {
                 "models": [{"path": "generate.models.model", "class": "M", "default": "model@1.0.0"}]}]);
         let machine = crate::published::tests::Machine::with("acme/pkg", &[("8.9", 24 << 30)], entrypoints, &["bf16"]);
         let store = machine.publisher.store().clone();
-        let objects = Arc::new(Objects::new(&machine.root.join("writes"), store.clone(), machine.service.engine.clone()).unwrap());
+        let objects = Arc::new(Objects::new(&machine.root.join("writes"), machine.service.engine.clone()).unwrap());
         let runs = Runs { service: machine.service.clone(), objects, publisher: Some(machine.publisher.clone()), local: None,
-            own_hub: None, leaf: None, contexts: Default::default() };
+            own_hub: None, contexts: Default::default() };
         let mut warm = spec(Source::Models, true, "set");
         (warm.hub, warm.owner, warm.catalog_revision) = (Some(machine.hub.clone()), "acme".into(), "r1".into());
         warm.set = Some(vec![SetItem {
@@ -1361,10 +1340,9 @@ mod tests {
             interface:serde_json::to_vec(&interface).unwrap(),
             hub: String::new(),
         }).unwrap();
-        let store = crate::storage::open(&root.join("store")).unwrap();
-        let objects = Arc::new(Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
+        let objects = Arc::new(Objects::new(&root.join("writes"), service.engine.clone()).unwrap());
         let runs = Runs { service: service.clone(), objects, publisher: None, local: None,
-            own_hub: None, leaf: None, contexts: Default::default() };
+            own_hub: None, contexts: Default::default() };
         let root_call = spec(Source::Installation("installed".into()), true, "root");
         let refused = runs.prepare("alice", "root", root_call, &runs.service.engine.stoppable("root")).err().unwrap();
         assert_eq!(refused.code, "callable_internal");
@@ -1530,7 +1508,20 @@ mod tests {
         let service = Service::open(&state, &root.join("generations"), 1).unwrap();
         let store = crate::storage::open(&state.join("tensorfs")).unwrap();
         let objects =
-            Arc::new(Objects::new(&root.join("writes"), store.clone(), service.engine.clone()).unwrap());
+            Arc::new(Objects::new(&root.join("writes"), service.engine.clone()).unwrap());
+        // The local-source tests use the same named SDK pair as the other machine fixtures.
+        // An empty SDK otherwise installs the published Runtime, even in a candidate-pair job.
+        let named = ["COZY_TEST_RUNTIME_WHEEL", "COZY_TEST_TENSORFS_WHEEL"]
+            .map(|name| std::env::var_os(name).map(std::path::PathBuf::from));
+        let (sdk, runtime_build) = match named {
+            [Some(runtime), Some(tensorfs)] => {
+                let version = runtime.file_name().unwrap().to_string_lossy()
+                    .split('-').nth(1).unwrap().to_string();
+                (vec![runtime, tensorfs], version)
+            }
+            [None, None] => (vec![], String::new()),
+            _ => panic!("local-source fixture needs both named Runtime and TensorFS wheels"),
+        };
         let local = LocalSources::new(
             objects.clone(),
             InstallerConfig {
@@ -1540,12 +1531,11 @@ mod tests {
                 generations: root.join("generations"),
                 client_wheel: client,
                 staging_root: root.join("staging"),
-                sdk: vec![],
+                sdk,
                 uv: "uv".into(),
                 seed_cache: None,
-                runtime_build: String::new(),
+                runtime_build,
             },
-            store.clone(),
         );
         let runs = Arc::new(Runs {
             service: service.clone(),
@@ -1553,7 +1543,7 @@ mod tests {
             publisher: None,
             local: Some(Arc::new(local)),
             own_hub: None,
-            leaf: None,
+           
             contexts: Default::default(),
         });
         let config = crate::gpu_service::GpuConfig::deviceless(&root.join("home")).unwrap();
@@ -1740,10 +1730,9 @@ mod tests {
             "callees":[{"distribution":"callee","package":"second/callee","version":"2.0.0",
                 "application":"callee:app","interface":callee}]
         }).to_string()).unwrap();
-        let store = crate::storage::open(&root.join("store")).unwrap();
-        let objects = Arc::new(Objects::new(&root.join("writes"), store, service.engine.clone()).unwrap());
+        let objects = Arc::new(Objects::new(&root.join("writes"), service.engine.clone()).unwrap());
         let runs = Runs { service: service.clone(), objects, publisher: None, local: None,
-            own_hub: None, leaf: None, contexts: Default::default() };
+            own_hub: None, contexts: Default::default() };
         let installed = service.engine.bind_installation(Installation {
             actor:"alice".into(),alias:"caller".into(),generation:generation.clone(),
             package:"first/caller".into(),release:"1.0.0".into(),interface:serde_json::to_vec(&caller).unwrap(),
@@ -1760,7 +1749,7 @@ mod tests {
         assert_eq!(projected.record.interface, callee);
         assert_eq!(service.catalog.resolve(&generation).unwrap().record.interface, caller);
 
-        let source = hub::Source::new("https://hub.example", None, vec![], None).unwrap();
+        let source = hub::Source::new("https://hub.example", None, None).unwrap();
         runs.contexts.lock().unwrap().insert("7".into(), RunContext {
             installation:"caller".into(),hub:Some(source),owner:"alice".into(),gpus:2,bits:4,
             models:vec![

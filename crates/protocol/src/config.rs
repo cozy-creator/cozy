@@ -85,7 +85,8 @@ pub struct MachineConfig {
     pub port: Option<u16>,
     /// The WebRTC player's port, kept across restarts the same way.
     pub webrtc_port: Option<u16>,
-    /// The TensorFS store it fills; absent: `var/lib/tensorfs` under its root.
+    /// The TensorFS store it fills; absent: a pod's `var/lib/tensorfs` under its root, this
+    /// computer's shared TensorFS cache (`TENSORFS_HOME`, else `~/.cache/tensorfs`).
     pub store: Option<PathBuf>,
     /// How long a rental stays with no job before it releases itself; absent: 15 minutes
     /// (shorter only in tests).

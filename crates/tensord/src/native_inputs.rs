@@ -1,4 +1,4 @@
-//! Native input custody over released TensorFS and the service's sole journal.
+//! Native input custody in the run objects' store (`cas`) and the service's sole journal.
 use crate::api::{auth::VerifiedActor, backend::InputTreeReceiver, domain};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use crate::{storage::{self, Store}, trees};
+use crate::{cas::Cas, trees};
 use tensorfs::{
     format::ObjectRef,
     sha256,
@@ -51,7 +51,7 @@ struct Partial {
     received: u64,
 }
 pub struct SourceIntake {
-    store: Arc<Store>,
+    cas: Cas,
     journal: Arc<dyn IntakeJournal>,
     state: IntakeState,
     manifest: BTreeMap<String, ObjectRef>,
@@ -67,7 +67,7 @@ impl Drop for SourceIntake {
 
 impl SourceIntake {
     pub fn begin(
-        store: Arc<Store>,
+        cas: Cas,
         journal: Arc<dyn IntakeJournal>,
         staging: &Path,
         workspace: &str,
@@ -154,7 +154,7 @@ impl SourceIntake {
         fs::create_dir(&directory).map_err(database)?;
         platform::durable::set_mode(&directory, 0o700).map_err(|error| database(error.into()))?;
         Ok(Box::new(Self {
-            store,
+            cas,
             journal,
             state,
             manifest,
@@ -164,10 +164,10 @@ impl SourceIntake {
         }))
     }
     fn result(&self, released: bool) -> Result<domain::NativeByteRetentionResult, Error> {
-        let tree = trees::read(&self.store, &self.state.spec.retention_id).map_err(native)?;
+        let tree = trees::read(&self.cas, &self.state.spec.retention_id).map_err(native)?;
         let source = match tree {
             Some(tree) => Some(domain::NativeByteTreeRef {
-                producer_root_id: tree.pin,
+                producer_root_id: tree.hold,
                 receipt_digest: decode_hex(&tree.manifest.sha256)?,
                 manifest: Some(domain::Ref {
                     digest: decode_hex(&tree.manifest.sha256)?,
@@ -184,7 +184,7 @@ impl SourceIntake {
         })
     }
     fn release_native(&self) -> Result<(), Error> {
-        trees::release(&self.store, &self.state.spec.retention_id).map_err(native)?;
+        trees::release(&self.cas, &self.state.spec.retention_id).map_err(native)?;
         Ok(())
     }
 }
@@ -257,7 +257,7 @@ impl InputTreeReceiver for SourceIntake {
             return Ok(result);
         }
         for reference in self.objects.values() {
-            if self.store.reuse(reference).map_err(|e| native(storage::io_error(e)))? {
+            if self.cas.reuse(reference).map_err(native)? {
                 continue;
             }
             let partial = self
@@ -277,10 +277,10 @@ impl InputTreeReceiver for SourceIntake {
                 (path.clone(), local, file.clone())
             })
             .collect();
-        trees::admit(&self.store, &files).map_err(native)?;
+        trees::admit(&self.cas, &files).map_err(native)?;
         // The tree is the client's own manifest, whose digest the run names.
-        let manifest = self.store.put_bytes(&self.state.spec.manifest_canonical_bytes).map_err(|e| native(storage::io_error(e)))?;
-        trees::hold(&self.store, &self.state.spec.retention_id, manifest, &self.manifest).map_err(native)?;
+        let manifest = self.cas.put_bytes(&self.state.spec.manifest_canonical_bytes).map_err(native)?;
+        trees::hold(&self.cas, &self.state.spec.retention_id, manifest, &self.manifest).map_err(native)?;
         let result = self.result(false)?;
         let committed = self
             .journal

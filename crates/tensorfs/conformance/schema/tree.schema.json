@@ -1,0 +1,49 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://github.com/cozy-creator/cozy-creator/crates/tensorfs/conformance/schema/tree.schema.json",
+ "title": "tensorfs.tree/1",
+ "description": "Structure only; byte-length, bounds and duplicate-key rules are in spec/cozytensors.md. Unknown fields are allowed. Each model.<variant>.cozytensors (model.cozytensors unnamed) is a variant's header; every other file is a repo file.",
+ "type": "object",
+ "required": [
+  "format",
+  "files"
+ ],
+ "properties": {
+  "format": {
+   "type": "string",
+   "pattern": "^tensorfs\\.tree/1(\\.[0-9]+)?$"
+  },
+  "files": {
+   "type": "object",
+   "propertyNames": {
+    "pattern": "^(?!chunks(/|$))(?!\\.\\.?(/|$))(?!.*/\\.\\.?(/|$))[^/\\\\\\u0000]+(/[^/\\\\\\u0000]+)*$"
+   },
+   "additionalProperties": {
+    "$ref": "#/$defs/objectRef"
+   }
+  }
+ },
+ "$defs": {
+  "u64": {
+   "type": "integer",
+   "minimum": 0,
+   "maximum": 18446744073709551615
+  },
+  "objectRef": {
+   "type": "object",
+   "required": [
+    "sha256",
+    "length"
+   ],
+   "properties": {
+    "sha256": {
+     "type": "string",
+     "pattern": "^[0-9a-f]{64}$"
+    },
+    "length": {
+     "$ref": "#/$defs/u64"
+    }
+   }
+  }
+ }
+}

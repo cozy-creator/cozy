@@ -86,6 +86,7 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
             constructions: Vec::new(),
         },
         DeviceCommand::Load {
+            tensorfs: None,
             construction: "lifecycle".into(),
             devices: String::new(),
             sequence_parallel_degree: 1,
@@ -100,9 +101,6 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
             attention_pin: String::new(),
             device_weights: false,
             cap_bytes: None,
-            sealed_tiers: false,
-            model_sources: false,
-            staged_tiers: false,
             pinned_bytes: None,
         },
         DeviceCommand::Activate {
@@ -139,6 +137,11 @@ fn invoke(
     assert!(prepared.ok, "{prepared:?}");
     executor.command(
         &DeviceCommand::Invoke {
+            tensorfs: None,
+            weights: Default::default(),
+            destination: String::new(),
+            actor: String::new(),
+            operation: String::new(),
             max_output_bytes: tensord::output_capacity::DEFAULT_BYTES,
             request_id: id.into(),
             construction: "lifecycle".into(),
@@ -155,7 +158,6 @@ fn invoke(
             squeezed_bytes: Default::default(),
             device_weights: None,
             sources: Default::default(),
-            weights: Default::default(),
         },
         &mut Baseline,
     )
@@ -493,6 +495,7 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
             constructions: Vec::new(),
         },
         DeviceCommand::Load {
+            tensorfs: None,
             construction: "lifecycle".into(),
             devices: String::new(),
             sequence_parallel_degree: 1,
@@ -507,9 +510,6 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
             attention_pin: String::new(),
             device_weights: false,
             cap_bytes: None,
-            sealed_tiers: false,
-            model_sources: false,
-            staged_tiers: false,
             pinned_bytes: None,
         },
         DeviceCommand::Activate {
@@ -546,6 +546,11 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
     let reply = executor
         .command(
             &DeviceCommand::Invoke {
+                tensorfs: None,
+                weights: Default::default(),
+                destination: String::new(),
+                actor: String::new(),
+                operation: String::new(),
                 max_output_bytes: tensord::output_capacity::DEFAULT_BYTES,
                 request_id: "probe".into(),
                 construction: "lifecycle".into(),
@@ -562,7 +567,6 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
                 squeezed_bytes: Default::default(),
                 device_weights: None,
                 sources: Default::default(),
-                weights: Default::default(),
             },
             &mut Baseline,
         )

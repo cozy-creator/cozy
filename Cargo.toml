@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.2"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
@@ -107,7 +107,6 @@ utoipa = { version = "6.0.0", default-features = false, features = ["macros"] }
 vt100 = "0.16.2"
 webpki-roots = "1"
 windows-sys = "0.61"
-x509-cert = { version = "0.2.5", default-features = false }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [profile.release]

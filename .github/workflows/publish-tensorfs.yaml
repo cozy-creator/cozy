@@ -25,7 +25,23 @@ permissions:
   contents: read
 
 jobs:
-  # One version everywhere; a publish runs on that version's tag; a store format or claim protocol
+  kernels:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: uv run --no-project --python 3.12 --with triton==3.8.0 python crates/tensorfs-py/kernels/build.py
+      - run: TENSORFS_REQUIRE_AOT=1 cargo test -p tensorfs --test kernel_plan -- --include-ignored --test-threads=2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tensorfs-kernels-${{ github.sha }}
+          path: crates/tensorfs/kernels/aot/
+          if-no-files-found: error
+          retention-days: 7
+
+  # One version everywhere; a publish runs on that version's tag; a store format
   # unlike the newest published wheel's needs a newer minor (format_contract.py).
   gate:
     runs-on: ubuntu-24.04
@@ -43,15 +59,15 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - run: python3 crates/tensorfs-py/scripts/format_contract.py wheel
 
-  # Release gate (2026-10-01): weights fetched through `ensure` against a real loopback hub and object
-  # store injecting resets, stalls, truncation, 5xx/429, expired URLs and wrong bytes.
+  # Ordinary endpoint upload/download, wrong-byte rejection, callback failures and
+  # cancellation against real stores and loopback HTTP. Pull retry faults run below.
   fetch-faults:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p tensorfs --test fetch_faults -- --test-threads=2
+      - run: cargo test --locked -p tensorfs --test endpoint --test endpoint_callback_errors --test upload_control -- --test-threads=2
 
   # Release gate (run 2322): a real-HTTP hub pull whose first MiBs crawl still finishes at body throughput.
   download-tail:
@@ -60,7 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -p tensorfs --lib transport::tests::tail -- --nocapture
+      - run: cargo test --locked -p tensorfs --test pull_tail cold_mibs_finish_at_about_the_body_rate -- --exact --nocapture
 
   # Release gate (xs-045): the v2 fetch path from real loopback origins; its tail (cold MiBs,
   # stalls, failures) finishes at about the body rate, and a uniformly slow fetch restarts none.
@@ -110,6 +126,7 @@ jobs:
       - run: crates/tensorfs-py/scripts/e2e.sh wheel/*.whl "$RUNNER_TEMP/e2e"
 
   wheel:
+    needs: kernels
     name: wheel ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     # Hang bound, not a work budget.
@@ -124,12 +141,17 @@ jobs:
           - { name: windows-x86_64, os: windows-2025, target: x86_64-pc-windows-msvc }
     env:
       CARGO_BUILD_JOBS: "4"
+      TENSORFS_REQUIRE_AOT: ${{ startsWith(matrix.name, 'macos') && '0' || '1' }}
     defaults:
       run:
         shell: bash
         working-directory: crates/tensorfs-py
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: tensorfs-kernels-${{ github.sha }}
+          path: crates/tensorfs/kernels/aot/
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -144,7 +166,8 @@ jobs:
           working-directory: crates/tensorfs-py
           target: ${{ matrix.target }}
           args: --release --locked --out dist
-          manylinux: auto
+          manylinux: '2_28'
+          docker-options: -e TENSORFS_REQUIRE_AOT=1
           before-script-linux: |
             cargo build --release --locked -p tensorfs --bin tfs
             install -D -m 755 ../../target/release/tfs wheel-data/scripts/tfs
@@ -162,6 +185,7 @@ jobs:
       - name: Smoke (the installed module and CLI)
         run: |
           python -m pip install dist/*.whl
+          python scripts/kernel_conform.py
           cd "$RUNNER_TEMP"
           python -c 'import tensorfs, tensorfs.varena; print(tensorfs.__version__)'
           tfs version

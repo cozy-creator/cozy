@@ -10,9 +10,9 @@ use std::time::Duration;
 use pull_support::*;
 use tensorfs::err::Code;
 use tensorfs::fetch::{
-    Config, Fetcher, HttpOrigin, ObjectStore, Origin, Progress, VolumeOrigin, Want,
+    Config, Fetcher, Endpoint, ObjectStore, Origin, Progress, VolumeOrigin, Want,
 };
-use tensorfs::store2::Store;
+use tensorfs::store::Store;
 
 const SAMPLE: Duration = Duration::from_millis(10);
 
@@ -33,7 +33,7 @@ fn fetcher(store: &Arc<Store>, volume: Option<VolumeOrigin>) -> Fetcher {
 }
 
 fn http(base: &str) -> Arc<dyn Origin> {
-    Arc::new(HttpOrigin::new(&client(), base).unwrap())
+    Arc::new(Endpoint::new(&client(), base, None).unwrap().anonymous())
 }
 
 fn all() -> Want<'static> {
@@ -70,7 +70,8 @@ async fn a_pull_from_python_http_server_is_bit_identical() {
         .pull(&origin, "acme/tiny", Some("1.0"), Some("int8"), &want)
         .await
         .unwrap();
-    assert_eq!(pulled.manifest, model.manifest);
+    assert_eq!((pulled.tree.as_ref(), &pulled.header), (Some(&model.tree), &model.header));
+    assert_eq!(pulled.variant, "int8");
     assert_eq!(pulled.landed.origin, model.bytes());
     assert_eq!(
         progress.held.load(std::sync::atomic::Ordering::Relaxed),
@@ -119,7 +120,8 @@ async fn a_pull_from_python_http_server_is_bit_identical() {
     let unet: BTreeSet<_> = model.chunks["unet"].iter().cloned().collect();
     assert!(held.is_disjoint(&unet), "a vae pull fetched unet chunks");
     assert!(model.chunks["vae"].iter().all(|c| held.contains(c)));
-    assert_eq!(held.len() + unet.len(), model.objects.len());
+    assert!(model.assets.iter().all(|a| !held.contains(a)), "nor the tokenizer's asset");
+    assert_eq!(held.len() + unet.len() + model.assets.len(), model.objects.len());
     assert_eq!(
         partial.landed.origin,
         held.iter().map(|o| o.length).sum::<u64>()
@@ -285,7 +287,7 @@ async fn https_trusts_a_private_ca_only_when_named() {
         None,
         config(),
     );
-    let origin: Arc<dyn Origin> = Arc::new(HttpOrigin::new(&trusting, &server.base).unwrap());
+    let origin: Arc<dyn Origin> = Arc::new(Endpoint::new(&trusting, &server.base, None).unwrap().anonymous());
     let pulled = fetcher
         .pull(&origin, "acme/tls", None, Some("int8"), &all())
         .await
@@ -294,7 +296,7 @@ async fn https_trusts_a_private_ca_only_when_named() {
     assert_eq!(blobs(&root), blobs(&origin_dir));
 
     let webpki = tensorfs::fetch::Client::new(policy);
-    let untrusting: Arc<dyn Origin> = Arc::new(HttpOrigin::new(&webpki, &server.base).unwrap());
+    let untrusting: Arc<dyn Origin> = Arc::new(Endpoint::new(&webpki, &server.base, None).unwrap().anonymous());
     let refused = fetcher
         .pull(&untrusting, "acme/tls", None, Some("int8"), &all())
         .await
@@ -322,9 +324,8 @@ async fn a_private_origin_writes_nothing_to_the_volume() {
         }),
     );
     let origin: Arc<dyn Origin> = Arc::new(
-        HttpOrigin::new(&client(), &server.base)
-            .unwrap()
-            .bearer("s3cret"),
+        Endpoint::new(&client(), &server.base, Some(tensorfs::fetch::bearer("s3cret")))
+            .unwrap(),
     );
     let (volume_dir, root) = (temporary("private-volume"), temporary("private-store"));
     let fetcher = fetcher(
@@ -364,7 +365,7 @@ async fn a_hung_volume_is_left_alone_until_it_answers() {
     let server = Server::serve(&origin_dir, plain());
     let origin = http(&server.base);
     let volume_dir = temporary("hung-volume");
-    let fifo = volume_dir.join(model.manifest.key());
+    let fifo = volume_dir.join(model.tree.key());
     std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
     assert!(std::process::Command::new("mkfifo")
         .arg(&fifo)
