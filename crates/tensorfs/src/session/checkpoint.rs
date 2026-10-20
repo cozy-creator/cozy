@@ -341,8 +341,12 @@ impl Checkpoint {
         self.data.tree.as_ref()
     }
 
-    pub fn verify(&self) -> Result<Vec<ObjectRef>> {
-        Ok(self.data.raw.verify()?)
+    /// Inspect the header and selected full chunk/asset objects without fetching or
+    /// changing data. All also includes known repository files, not other variants.
+    pub fn verify(&self, selection: &Selection) -> Result<crate::VerificationReport> {
+        let objects = super::selection::objects(&self.data.raw, selection)?;
+        let tree = self.data.tree.as_ref().filter(|_| matches!(selection, Selection::All));
+        crate::verification::verify(&self.data.raw, objects, tree)
     }
 
     /// The same placement/byte-engine view, retaining this source without a cycle.

@@ -98,6 +98,10 @@ pub mod unsynced;
 pub mod vectors;
 #[cfg(feature = "store")]
 pub mod writer;
+#[cfg(feature = "store")]
+mod verification;
+#[cfg(feature = "store")]
+pub use verification::VerificationReport;
 /// Advanced engine and synchronous-language integration.
 #[cfg(feature = "store")]
 pub mod raw;

@@ -13,6 +13,8 @@ mod tensors;
 mod credentials;
 #[cfg(feature = "store")]
 mod dlpack_source;
+#[cfg(feature = "store")]
+mod verification;
 
 use pyo3::prelude::*;
 
