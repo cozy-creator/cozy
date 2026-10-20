@@ -49,9 +49,23 @@ fn write(path: &Path, doc: &Value) -> Result<(), Error> {
     std::fs::write(path, serde_json::to_vec_pretty(doc).expect("JSON")).map_err(io)
 }
 
+/// The provider credentials the cozy config holds (`huggingface_token`, `civitai_token`, or
+/// their env names): pins of gated repos list and read through them.
+fn access(ctx: &Context) -> tensorfs::import::Access {
+    let bearer = |secret: &Option<protocol::config::Secret>| {
+        secret.as_ref().map_or_else(String::new, |s| format!("bearer {}", s.expose().trim()))
+    };
+    tensorfs::import::Access {
+        huggingface_token: bearer(&ctx.config.huggingface_token),
+        civitai_token: bearer(&ctx.config.civitai_token),
+        ..tensorfs::import::Access::default()
+    }
+}
+
 pub(crate) async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
+    let access = access(ctx);
     if let Some(store) = args.local {
-        let report = blocking(move || d10::store(&store, &mut Migrator::new(tensorfs::import::Access::from_env(), UPSTREAMS))).await?;
+        let report = blocking(move || d10::store(&store, &mut Migrator::new(access, UPSTREAMS))).await?;
         write(&args.audit.join("local.json"), &report)?;
         output::json(&report);
         return Ok(ExitCode::SUCCESS);
@@ -64,13 +78,14 @@ pub(crate) async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         let (token, origin, name) = (session.bearer(&client).await.map_err(hub_error)?, hub.origin.to_string(), model.clone());
         let file = |kind: &str| args.audit.join(format!("{}.{kind}json", model.replace('/', "__")));
         let before = file("before.");
+        let access = access.clone();
         let done = blocking(move || {
             let local = is_loopback_origin(&origin);
             let http = Client::new(SourcePolicy { any_host: true, allow_local: local, max_redirects: 5, ..Default::default() });
             let endpoint = Arc::new(Endpoint::new(&http, &origin, Some(bearer(token)))?);
             let scratch = tempfile::tempdir()?;
             let store = Store::open(scratch.path())?;
-            let done = d10::migrate(&endpoint, &http, &name, &store, &mut Migrator::new(tensorfs::import::Access::from_env(), UPSTREAMS))?;
+            let done = d10::migrate(&endpoint, &http, &name, &store, &mut Migrator::new(access, UPSTREAMS))?;
             Ok((done.report, done.before))
         });
         let report = match done.await {
