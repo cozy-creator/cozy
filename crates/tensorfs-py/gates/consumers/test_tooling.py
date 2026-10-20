@@ -507,6 +507,44 @@ class Contract(unittest.TestCase):
 
 
 class OwnedChild(unittest.TestCase):
+    def test_worker_directories_preserve_existing_comfy_checkout(self):
+        # Execute the worker's actual directory setup, without importing Runtime/Torch.
+        tree = ast.parse((HERE / 'worker.py').read_text())
+        loop = next(n for n in ast.walk(tree) if isinstance(n, ast.For) and
+                    ast.unparse(n.iter) == "SPEC['requested']")
+        setup = [n for n in loop.body if
+                 (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'directory' for t in n.targets)) or
+                 (isinstance(n, ast.Expr) and isinstance(n.value, ast.Call) and
+                  isinstance(n.value.func, ast.Attribute) and isinstance(n.value.func.value, ast.Name) and
+                  n.value.func.value.id == 'directory' and n.value.func.attr == 'mkdir')]
+        self.assertEqual(len(setup), 2)
+        code = compile(ast.Module(body=setup, type_ignores=[]), 'worker-directory-setup', 'exec')
+        with tempfile.TemporaryDirectory() as folder:
+            work = Path(folder)
+            checkout = work / 'comfy'
+            checkout.mkdir()
+            make_payload.git(checkout, 'init', '--quiet')
+            model = checkout / 'model.py'
+            original = b'# retained upstream source\n'
+            model.write_bytes(original)
+            make_payload.git(checkout, 'add', 'model.py')
+            model.unlink()
+            make_payload.git(checkout, 'checkout-index', '--all')
+            directories = []
+            for name in native_io.ALL:
+                scope = {'work': work, 'name': name}
+                exec(code, scope)
+                directory = scope['directory']
+                self.assertTrue(directory.is_dir())
+                self.assertNotEqual(directory, checkout)
+                (directory / 'model.py').write_text(name)
+                directories.append(directory)
+            self.assertEqual(len(set(directories)), len(native_io.ALL))
+            self.assertEqual([p.joinpath('model.py').read_text() for p in directories], native_io.ALL)
+            self.assertEqual(model.read_bytes(), original)
+            self.assertTrue((checkout / '.git').is_dir())
+            make_payload.git(checkout, 'diff', '--exit-code')
+
     def test_success_keeps_complete_stdout_and_stderr(self):
         with tempfile.TemporaryDirectory() as folder:
             out, err = Path(folder) / 'out', Path(folder) / 'err'

@@ -109,8 +109,8 @@ def main(ctx: Context, *, native_wheel: Annotated[FileAsset, AssetBound(max_byte
         for name in SPEC['requested']:
             native_case = name in native['IDS']
             clean = name in ('kernel', 'fork-cleanup')
-            directory = work / name
-            directory.mkdir()
+            directory = work / 'consumers' / name
+            directory.mkdir(parents=True)
             venv.EnvBuilder(with_pip=False).create(directory / 'venv')
             py = directory / 'venv/bin/python'
             purelib = Path(setup(f'{name}-purelib', [str(py), '-c', 'import sysconfig; print(sysconfig.get_paths()["purelib"])'], env).decode().strip())
