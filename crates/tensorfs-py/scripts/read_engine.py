@@ -136,13 +136,16 @@ class HostReads(unittest.TestCase):
         for out in [b"readonly", memoryview(bytearray(20))[::2]]:
             with self.assertRaises(tfs.InvalidError):
                 self.tensors.read_into("plain", out)
-        for kwargs in [{"offset": 48}, {"offset": 49}, {"offset": 2**64 - 1}, {"role": "nope"}]:
+        for kwargs in [{"offset": 48}, {"offset": 49}, {"offset": 2**64 - 1}]:
             out = bytearray(b"unchanged")
             with self.assertRaises(tfs.InvalidError):
                 self.tensors.read_into("plain", out, **kwargs)
             self.assertEqual(out, b"unchanged")
-        with self.assertRaises(tfs.InvalidError):
-            self.tensors.read_into("quantized", bytearray(1), role="")
+        for key, role in [("plain", "nope"), ("quantized", "")]:
+            out = bytearray(b"unchanged")
+            with self.assertRaises(tfs.NotFoundError):
+                self.tensors.read_into(key, out, role=role)
+            self.assertEqual(out, b"unchanged")
         for device in ["gpu", "cuda:-1", "cuda:nope"]:
             with self.assertRaises(tfs.InvalidError):
                 self.tensors.read(device=device)
