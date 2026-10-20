@@ -2,9 +2,28 @@
 
 TensorFS (Tensor Filesystem) is a library written in Rust, with python bindings, for downloading, storing, and loading tensors into memory efficiently. It uses an alternative storage-format we call `cozytensors`, designed to address safetensors' shortcomings.
 
-### Problem 1: Safetensors is not self-describing
+### Problem 1: Safetensors is Not Self-Describing
 
-Safetensors describes arrays: their names, dtypes, shapes and byte offsets. It does not
+Safetensors' header gives a list of keys, their names, dtypes, shapes, and where to find them in the file using byte offsets, but does not describe how those bytes form a quantized tensor.
+
+For example, all the bytes can reach GPU memory intact, with valid dtypes and shapes, and still be interpreted incorrectly:
+
+- **Scaling the wrong axis.** Suppose an INT8 matrix is `[[10, 20], [30, 40]]` and its
+  scales are `[0.1, 0.2]`. Scaling each row gives weights `[[1, 2], [6, 8]]`; scaling each
+  column gives `[[1, 4], [3, 8]]`. Both are valid 2×2 matrices. With input `[1, 1]`, they
+  produce `[3, 14]` and `[5, 11]` respectively. Nothing about reading the file detects
+  that the second result is wrong.
+- **Unpacking in the wrong order.** For simple 4-bit integer weights, the byte `0x21`
+  can represent `[1, 2]` when the low four bits come first, or `[2, 1]` when the high four
+  bits come first. A reader that assumes the wrong order still loads valid numbers, but
+  assigns them to the wrong input channels. With input `[1, 10]`, the dot product becomes
+  `12` instead of `21`.
+
+The file is readable in both cases. Across a model, these mistakes can turn otherwise
+successful inference into nonsense. What is missing is the agreed meaning of its arrays:
+the scale axis, packing order and other encoding rules.
+
+It does not
 standardize how those arrays form a quantized tensor. An INT8 weight and a scale array do not
 tell a reader which axis to scale, how values were packed, or whether a rotation must be
 undone. Its optional metadata can carry conventions, but the reader must already understand
