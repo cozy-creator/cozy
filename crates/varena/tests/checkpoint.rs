@@ -227,7 +227,12 @@ fn a_window_gets_the_regions_the_full_call_gives_its_tensors() {
 fn a_seal_logs_its_disk_copy() {
     let fx = Fixture::new("logged");
     let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
-    memory::seal(&fx.ck, &rs, "logged", 2, None).unwrap();
+    let fd = memory::seal(&fx.ck, &rs, "logged", 2, None).unwrap();
+    // the seal returns as it opens the layout; its fill runs on its own and logs as it ends
+    while varena::host::filling(std::os::fd::AsFd::as_fd(&fd)).unwrap() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(varena::host::complete(std::os::fd::AsFd::as_fd(&fd)).unwrap());
     let all: u64 = TENSORS.iter().map(|t| t.2 as u64).sum();
     let copies = varena::ceiling::take();
     assert!(copies.iter().any(|c| c.kind == "disk" && c.bytes == all && c.ns > 0), "{copies:?}");
