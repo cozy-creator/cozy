@@ -188,14 +188,12 @@ impl Context {
                 "published tree differs from the locally committed tree",
             );
         }
-        let named = published
-            .and(self.repo_id.as_ref())
-            .map(|name| Ref {
-                repo_id: name.clone(),
-                revision: None,
-                variant: Some(self.variant.clone()),
-                endpoint: self.endpoint.clone(),
-            });
+        let named = published.and(self.repo_id.as_ref()).map(|name| Ref {
+            repo_id: name.clone(),
+            revision: None,
+            variant: Some(self.variant.clone()),
+            endpoint: self.endpoint.clone(),
+        });
         let extra = std::iter::once(tree.clone())
             .chain(files.values().cloned())
             .collect();
@@ -222,6 +220,7 @@ impl Context {
 
     fn publish_file(&self, checkpoint: &Checkpoint) -> Result<()> {
         if let Some(dest) = &self.dest {
+            self.store.cache_preserve_snapshot(dest)?;
             let header = checkpoint.id();
             // The content-addressed normal pin is durable independently of a resume key,
             // the path's lifetime, and any future overwrite of this header file.

@@ -1328,3 +1328,80 @@ fn public_conversion_without_a_tokio_caller_refuses_instead_of_starting_a_runtim
     );
     assert!(actual_headers(&cache.join("blobs")).is_empty());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn literal_writer_inside_classified_snapshot_preserves_the_callers_header_from_ttl_prune() {
+    let scratch = Scratch::new();
+    let cache = scratch.0.join("cache");
+    let client = client(&cache, &scratch.0.join("endpoint"));
+    let operator = tensorfs::store2::Store::open(&cache).unwrap().with_cache();
+    let chosen = ObjectRef::of(b"caller chooses an internally classified snapshot root").sha256;
+    let control = ObjectRef::of(b"expired internal snapshot positive control").sha256;
+    for digest in [&chosen, &control] {
+        let folder = cache.join("snapshots").join(digest);
+        operator.cache_snapshot(&folder).unwrap();
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("old-cached-file"), b"cache fixture").unwrap();
+    }
+    let dest = cache
+        .join("snapshots")
+        .join(&chosen)
+        .join("literal.cozytensors");
+    let mut writer = client
+        .writer(WriterOptions {
+            dest: Some(&dest),
+            ..Default::default()
+        })
+        .unwrap();
+    writer
+        .component("model", "test.Model", Default::default())
+        .unwrap()
+        .put("w", Dtype::U8, &[4], &mut std::io::Cursor::new(WEIGHT))
+        .unwrap();
+    let checkpoint = writer.commit().await.unwrap();
+    let chosen_record = cache
+        .join("tmp/cache/snapshots")
+        .join(format!("snapshots-{chosen}.json"));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&chosen_record).unwrap()).unwrap()
+            ["owned"],
+        true
+    );
+    drop(checkpoint);
+    drop(writer);
+    drop(client);
+    for digest in [&chosen, &control] {
+        let record = cache
+            .join("tmp/cache/snapshots")
+            .join(format!("snapshots-{digest}.json"));
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        value["last_use"] = 0.into();
+        fs::write(record, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    fs::write(cache.join("tmp/cache/sweep.json"), br#"{"last_use":0}"#).unwrap();
+    operator.cache_maintain(0).unwrap();
+    assert!(
+        !cache.join("snapshots").join(control).exists(),
+        "TTL prune positive control did not run"
+    );
+    assert!(
+        dest.exists(),
+        "TTL pruned an explicitly chosen literal header"
+    );
+    drop(operator);
+    let reopened = self::client(&cache, &scratch.0.join("endpoint"))
+        .open(
+            dest.to_str().unwrap(),
+            &Open {
+                local_files_only: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.component("model").unwrap().read("w").unwrap(),
+        WEIGHT
+    );
+}
