@@ -632,6 +632,16 @@ fn stats(py: Python<'_>, value: Stats) -> PyResult<Py<PyDict>> {
         item.set_item("resident", e.resident)?;
         item.set_item("orphan_bytes", e.orphan_bytes)?;
         item.set_item("speculative_budget", e.speculative_budget)?;
+        if let Some(fill) = e.fill {
+            let outcome = PyDict::new(py);
+            outcome.set_item("phase", fill.phase)?;
+            outcome.set_item("outcome", fill.outcome)?;
+            outcome.set_item("error", fill.error)?;
+            outcome.set_item("io_runs", fill.io_runs)?;
+            item.set_item("fill", outcome)?;
+        } else {
+            item.set_item("fill", py.None())?;
+        }
         events.push(item.unbind());
     }
     for c in value.copies {

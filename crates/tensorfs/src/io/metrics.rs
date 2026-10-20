@@ -42,8 +42,12 @@ pub struct Copy {
 
 static LOG: Mutex<Vec<Copy>> = Mutex::new(Vec::new());
 
+struct Capture {
+    rows: Vec<Copy>,
+    direct: bool,
+}
 thread_local! {
-    static CAPTURES: RefCell<Vec<Vec<Copy>>> = const { RefCell::new(Vec::new()) };
+    static CAPTURES: RefCell<Vec<Capture>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Collect the copies made synchronously by `operation` on this thread. TensorFS records a
@@ -51,6 +55,16 @@ thread_local! {
 /// cannot consume each other's records. Nested captures are included in their outer capture;
 /// a panic discards only its unfinished capture and restores the enclosing scope.
 pub fn capture<T>(operation: impl FnOnce() -> T) -> (T, Vec<Copy>) {
+    capture_with(operation, false)
+}
+
+/// Copies directly owned by this operation. A nested direct capture owns its
+/// own copies; ordinary inclusive captures still observe all nested traffic.
+pub fn capture_direct<T>(operation: impl FnOnce() -> T) -> (T, Vec<Copy>) {
+    capture_with(operation, true)
+}
+
+fn capture_with<T>(operation: impl FnOnce() -> T, direct: bool) -> (T, Vec<Copy>) {
     struct Scope;
     impl Drop for Scope {
         fn drop(&mut self) {
@@ -60,14 +74,19 @@ pub fn capture<T>(operation: impl FnOnce() -> T) -> (T, Vec<Copy>) {
         }
     }
 
-    CAPTURES.with(|captures| captures.borrow_mut().push(Vec::new()));
+    CAPTURES.with(|captures| {
+        captures.borrow_mut().push(Capture {
+            rows: Vec::new(),
+            direct,
+        })
+    });
     let scope = Scope;
     let result = operation();
     let copies = CAPTURES.with(|captures| {
         captures
             .borrow_mut()
             .last_mut()
-            .map(std::mem::take)
+            .map(|capture| std::mem::take(&mut capture.rows))
             .unwrap_or_default()
     });
     drop(scope);
@@ -77,8 +96,11 @@ pub fn capture<T>(operation: impl FnOnce() -> T) -> (T, Vec<Copy>) {
 pub(crate) fn record(c: Copy) {
     let captured = CAPTURES.with(|captures| {
         let mut captures = captures.borrow_mut();
-        for rows in captures.iter_mut() {
-            rows.push(c.clone());
+        let owner = captures.iter().rposition(|capture| capture.direct);
+        for (index, capture) in captures.iter_mut().enumerate() {
+            if !capture.direct || Some(index) == owner {
+                capture.rows.push(c.clone());
+            }
         }
         !captures.is_empty()
     });
@@ -360,7 +382,7 @@ fn measure_h2d(device: i32, ctx: cuda::CUcontext, retained: PrimaryContext) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{capture, record, Copy};
+    use super::{capture, capture_direct, record, Copy};
 
     fn sample(bytes: u64) {
         record(Copy {
@@ -403,6 +425,61 @@ mod tests {
         });
         assert_eq!(result, Err("transform failed after I/O"));
         assert_eq!(rows.iter().map(|row| row.bytes).collect::<Vec<_>>(), [17]);
+    }
+
+    #[test]
+    fn nested_direct_owners_count_each_copy_once_without_changing_inclusive_scopes() {
+        let (_, all) = capture(|| {
+            let (_, parent) = capture_direct(|| {
+                sample(1);
+                let (_, observed) = capture(|| {
+                    sample(2);
+                    let (_, child) = capture_direct(|| sample(3));
+                    assert_eq!(child.iter().map(|copy| copy.bytes).collect::<Vec<_>>(), [3]);
+                    sample(4);
+                });
+                assert_eq!(
+                    observed.iter().map(|copy| copy.bytes).collect::<Vec<_>>(),
+                    [2, 3, 4]
+                );
+                sample(5);
+            });
+            assert_eq!(
+                parent.iter().map(|copy| copy.bytes).collect::<Vec<_>>(),
+                [1, 2, 4, 5]
+            );
+        });
+        assert_eq!(
+            all.iter().map(|copy| copy.bytes).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn unwinding_a_direct_capture_restores_its_parent_owner() {
+        let (_, all) = capture(|| {
+            let (_, parent) = capture_direct(|| {
+                sample(1);
+                let failed = std::panic::catch_unwind(|| {
+                    capture_direct(|| {
+                        sample(2);
+                        panic!("child operation failed");
+                    });
+                });
+                assert!(failed.is_err());
+                sample(3);
+            });
+            assert_eq!(
+                parent.iter().map(|copy| copy.bytes).collect::<Vec<_>>(),
+                [1, 3]
+            );
+        });
+        assert_eq!(
+            all.iter().map(|copy| copy.bytes).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        let (_, fresh) = capture_direct(|| sample(4));
+        assert_eq!(fresh.iter().map(|copy| copy.bytes).collect::<Vec<_>>(), [4]);
     }
 
     #[test]

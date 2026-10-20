@@ -14,7 +14,7 @@ use parking_lot::{Condvar, Mutex};
 use tensorfs::io::source::Source;
 use tensorfs::io::ReadStats;
 
-use crate::gpu::{BindState, FillPin, Gpu, Pin};
+use crate::gpu::{BindState, FillAttempt, FillPhase, FillPin, Gpu, Pin};
 use crate::layout::Layout;
 use crate::ledger::{self, Channel, Ledger, PageKey};
 use crate::plan::{
@@ -80,6 +80,15 @@ pub struct Event {
     pub resident: u64,
     pub orphan_bytes: u64,
     pub speculative_budget: Option<u64>,
+    pub fill: Option<FillResult>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FillResult {
+    pub phase: &'static str,
+    pub outcome: &'static str,
+    pub error: Option<String>,
+    pub io_runs: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -2146,6 +2155,7 @@ impl Placement {
                 .get(&request)
                 .and_then(|run| run.budgets.get(&step))
                 .copied(),
+            fill: None,
         };
         if let Some(run) = inner.requests.get_mut(&request) {
             if kind == "bind" && !run.stats.proof.knows(page) {
@@ -2157,6 +2167,53 @@ impl Placement {
         Ok(())
     }
 
+    fn fill_result_locked(
+        inner: &mut Inner,
+        request: RequestId,
+        sequence: u64,
+        phase: FillPhase,
+        error: Option<&Error>,
+        io: &[tensorfs::io::metrics::Copy],
+    ) {
+        let Some(run) = inner.requests.get_mut(&request) else {
+            return;
+        };
+        // An empty metric alone cannot disprove partial I/O. Only the mechanism's
+        // allocation phase proves this attempt never entered the source engine.
+        let refused =
+            phase == FillPhase::Allocate && error.is_some_and(Error::is_oom) && io.is_empty();
+        if error.is_some() && !refused {
+            run.stats.proof.invalidate("fill-failed");
+        }
+        let Some(event) = run
+            .stats
+            .events
+            .iter_mut()
+            .find(|event| event.sequence == sequence)
+        else {
+            run.stats.proof.invalidate("missing-fill-attempt");
+            return;
+        };
+        if refused {
+            event.kind = "fill-refused";
+        }
+        event.fill = Some(FillResult {
+            phase: phase.name(),
+            outcome: if refused {
+                "refused"
+            } else if error.is_some() {
+                "failed"
+            } else {
+                "complete"
+            },
+            error: error.map(|error| match error {
+                Error::Cuda { code, .. } => format!("CUDA:{code}"),
+                _ => error.code().to_owned(),
+            }),
+            io_runs: io.len(),
+        });
+    }
+
     fn fill(
         &self,
         request: RequestId,
@@ -2164,16 +2221,22 @@ impl Placement {
         _from: Tier,
         speculative: Option<Step>,
     ) -> Result<()> {
-        self.event(
-            request,
-            page,
-            "fill",
-            if speculative.is_some() {
-                "speculation"
-            } else {
-                "demand"
-            },
-        )?;
+        let sequence = {
+            let mut inner = self.inner.lock();
+            let sequence = inner.progress;
+            Self::event_locked(
+                &mut inner,
+                request,
+                page,
+                "fill",
+                if speculative.is_some() {
+                    "speculation"
+                } else {
+                    "demand"
+                },
+            )?;
+            sequence
+        };
         if let Some(step) = speculative {
             if let Some(row) = self
                 .inner
@@ -2226,13 +2289,8 @@ impl Placement {
                 }
             });
         let actual = if ram.is_some() { Tier::Ram } else { Tier::Disk };
-        let (result, io) = tensorfs::io::metrics::capture(|| {
-            if let Some(ram) = ram {
-                self.gpu
-                    .fill_from_ram_owned_with(page, Arc::new(ram), apply)
-            } else {
-                self.gpu.fill_with(page, apply)
-            }
+        let (FillAttempt { result, phase }, io) = tensorfs::io::metrics::capture_direct(|| {
+            self.gpu.fill_attempt_with(page, ram.map(Arc::new), apply)
         });
         // Record before propagating the error: a transform may fail after real copies
         // completed, and a retry must not erase their traffic.
@@ -2242,15 +2300,21 @@ impl Placement {
             .filter(|copy| copy.kind == "h2d")
             .map(|copy| copy.bytes)
             .sum();
-        if let Some(run) = self.inner.lock().requests.get_mut(&request) {
+        let mut inner = self.inner.lock();
+        Self::fill_result_locked(
+            &mut inner,
+            request,
+            sequence,
+            phase,
+            result.as_ref().err(),
+            &io,
+        );
+        if let Some(run) = inner.requests.get_mut(&request) {
             if result
                 .as_ref()
                 .is_ok_and(|reported| stats.bytes < reported.bytes)
             {
                 run.stats.proof.invalidate("missing-fill-copy-records");
-            }
-            if result.is_err() {
-                run.stats.proof.invalidate("fill-failed");
             }
             run.stats.copies.push(Copy {
                 request,
@@ -2263,6 +2327,7 @@ impl Placement {
                 io,
             });
         }
+        drop(inner);
         result?;
         let (spans, container) = self.gpu.export(page)?;
         self.channel
@@ -2483,9 +2548,8 @@ mod gpu_tests {
         assert_eq!(trim.pins(), 0);
     }
 
-    #[test]
-    fn released_orphan_events_keep_victim_bytes_and_use_current_totals() {
-        let mut inner = Inner {
+    fn event_test_inner() -> Inner {
+        Inner {
             table: plan::Table {
                 capacity: 1024,
                 rows: vec![plan::Row {
@@ -2534,7 +2598,12 @@ mod gpu_tests {
             progress: 40,
             trim: None,
             slack_trim: SlackTrim::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn released_orphan_events_keep_victim_bytes_and_use_current_totals() {
+        let mut inner = event_test_inner();
         // Custody's acknowledged release and refresh removed the last orphan.
         // The event still names its original bytes, not an absent-page zero.
         Placement::event_facts_locked(
@@ -2562,6 +2631,168 @@ mod gpu_tests {
             "later actions resurrected a released orphan"
         );
         assert_eq!((events[0].sequence, events[1].sequence), (40, 41));
+    }
+
+    #[test]
+    fn only_proven_pre_io_oom_is_neutral_and_outcomes_follow_exact_attempts() {
+        let oom = Error::Cuda {
+            op: "allocation",
+            code: 2,
+            name: "CUDA_ERROR_OUT_OF_MEMORY".into(),
+        };
+        let mut inner = event_test_inner();
+        inner.requests.get_mut(&9).unwrap().stats.proof.complete = true;
+        Placement::event_locked(&mut inner, 9, 8, "fill", "demand").unwrap();
+        Placement::event_locked(&mut inner, 9, 8, "fill", "demand").unwrap();
+        Placement::fill_result_locked(&mut inner, 9, 40, FillPhase::Allocate, Some(&oom), &[]);
+        let stats = &inner.requests[&9].stats;
+        assert!(stats.proof.complete);
+        assert_eq!(stats.events[0].kind, "fill-refused");
+        assert_eq!(
+            stats.events[0].fill.as_ref().unwrap().error.as_deref(),
+            Some("CUDA:2")
+        );
+        assert!(
+            stats.events[1].fill.is_none(),
+            "another same-page attempt was overwritten"
+        );
+        Placement::fill_result_locked(&mut inner, 9, 41, FillPhase::Transform, Some(&oom), &[]);
+        assert_eq!(inner.requests[&9].stats.proof.invalid, ["fill-failed"]);
+        assert_eq!(inner.requests[&9].stats.events[1].kind, "fill");
+        for (phase, error, io) in [
+            (FillPhase::Read, oom.clone(), vec![]),
+            (
+                FillPhase::Allocate,
+                oom.clone(),
+                vec![tensorfs::io::metrics::Copy::default()],
+            ),
+            (FillPhase::Allocate, invalid("bad input"), vec![]),
+        ] {
+            let mut inner = event_test_inner();
+            inner.requests.get_mut(&9).unwrap().stats.proof.complete = true;
+            Placement::event_locked(&mut inner, 9, 8, "fill", "demand").unwrap();
+            Placement::fill_result_locked(&mut inner, 9, 40, phase, Some(&error), &io);
+            assert!(!inner.requests[&9].stats.proof.complete);
+            assert_eq!(inner.requests[&9].stats.events[0].kind, "fill");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn allocation_oom_records_zero_io_before_the_source_is_entered() {
+        use std::sync::atomic::AtomicUsize;
+        let gpu = Gpu::open(0).unwrap();
+        let uuid = assigned_gpu(&gpu);
+        let span = crate::layout::align_up(
+            gpu.capacity().unwrap() + crate::layout::REGION_ALIGN,
+            crate::layout::REGION_ALIGN,
+        );
+        let source = Arc::new(Source::files(vec![], false, 0));
+        // This poison source fails if entered. First make a real VMM allocation
+        // larger than CUDA's physical capacity: no tensor payload is allocated.
+        let items = vec![Item {
+            offset: 0,
+            len: 1,
+            part_end: true,
+            source: ItemSource::Object(tensorfs::io::ObjectRange {
+                obj: tensorfs::format::ObjectRef {
+                    sha256: "a".repeat(64),
+                    length: 1,
+                },
+                off: 0,
+                len: 1,
+            }),
+        }];
+        gpu.register(
+            1,
+            gpu.reserve(span).unwrap(),
+            0,
+            span,
+            source.clone(),
+            items.clone(),
+            0,
+            "oom-before-source".into(),
+        )
+        .unwrap();
+        let called = AtomicUsize::new(0);
+        let (attempt, io) = tensorfs::io::metrics::capture_direct(|| {
+            gpu.fill_attempt_with::<Vec<u8>>(1, None, |_| {
+                called.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+        });
+        assert!(attempt.result.unwrap_err().is_oom());
+        assert_eq!(attempt.phase, FillPhase::Allocate);
+        assert!(io.is_empty());
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        assert_eq!(gpu.facts().unwrap()[0].1, 0);
+        assert!(gpu.unregister(1).unwrap());
+
+        let small = crate::layout::REGION_ALIGN;
+        gpu.register(
+            2,
+            gpu.reserve(small).unwrap(),
+            0,
+            small,
+            source.clone(),
+            items,
+            0,
+            "source-guard".into(),
+        )
+        .unwrap();
+        let attempt = gpu.fill_attempt_with::<Vec<u8>>(2, None, |_| {
+            called.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        assert_eq!(attempt.phase, FillPhase::Read);
+        assert!(
+            matches!(attempt.result, Err(Error::Source(_))),
+            "the same poison source must refuse once entered"
+        );
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        gpu.recover().unwrap();
+        assert!(gpu.unregister(2).unwrap());
+
+        gpu.register(
+            3,
+            gpu.reserve(small).unwrap(),
+            0,
+            small,
+            source,
+            vec![Item {
+                offset: 0,
+                len: 1,
+                part_end: true,
+                source: ItemSource::Inline(vec![7].into()),
+            }],
+            0,
+            "after-oom".into(),
+        )
+        .unwrap();
+        let attempt = gpu.fill_attempt_with::<Vec<u8>>(3, None, |_| Ok(()));
+        assert_eq!(attempt.phase, FillPhase::Finish);
+        attempt.result.unwrap();
+        let pin = gpu.bind(3, 0).unwrap();
+        let mut bytes = [0_u8; 1];
+        unsafe {
+            tensorfs::io::read(
+                &[tensorfs::io::Copy {
+                    src: tensorfs::io::Src::Device {
+                        device: 0,
+                        ptr: pin.ptr,
+                        stream: 0,
+                    },
+                    dst: tensorfs::io::Dst::host(&mut bytes),
+                }],
+                &tensorfs::io::ReadOpts::default(),
+            )
+        }
+        .unwrap();
+        assert_eq!(bytes, [7]);
+        drop(pin);
+        gpu.wait_pending().unwrap();
+        assert!(gpu.unregister(3).unwrap());
+        println!("PASS allocation OOM records zero I/O before source entry {uuid}");
     }
 
     #[test]
