@@ -33,6 +33,9 @@ impl Memory {
     pub fn events(&self) -> BorrowedFd<'_> {
         self.0.events()
     }
+    pub fn release_unused_ram(&self) -> bool {
+        self.0.release_unused_ram()
+    }
     pub fn capacity(&self) -> u64 {
         self.0.capacity()
     }
