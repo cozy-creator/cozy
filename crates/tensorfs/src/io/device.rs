@@ -23,6 +23,31 @@ struct Lab {
     depth: usize,
     populate: bool,
     trace: bool,
+    own: usize,
+    affinity: bool,
+}
+
+fn local_cpus(device: i32) -> Option<libc::cpu_set_t> {
+    let d = cuda::driver().ok()?;
+    let mut dev = 0;
+    cuda::check("cuDeviceGet", unsafe { (d.device_get)(&mut dev, device) }).ok()?;
+    let a = |x| cuda::attribute(dev, x).ok();
+    let pci = format!("{:04x}:{:02x}:{:02x}.0", a(cuda::ATTR_PCI_DOMAIN_ID)?, a(cuda::ATTR_PCI_BUS_ID)?, a(cuda::ATTR_PCI_DEVICE_ID)?);
+    let list = std::fs::read_to_string(format!("/sys/bus/pci/devices/{pci}/local_cpulist")).ok()?;
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for part in list.trim().split(',') {
+        let (lo, hi) = part.split_once('-').unwrap_or((part, part));
+        for cpu in lo.parse::<usize>().ok()?..=hi.parse::<usize>().ok()? {
+            unsafe { libc::CPU_SET(cpu, &mut set) };
+        }
+    }
+    Some(set)
+}
+
+fn pin_here(device: i32) {
+    if let Some(set) = local_cpus(device) {
+        unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+    }
 }
 
 fn lab() -> &'static Lab {
@@ -36,11 +61,13 @@ fn lab() -> &'static Lab {
             staging: n("TFS_LAB_STAGING", 16),
             piece: n("TFS_LAB_PIECE", 2 << 20),
             streams: n("TFS_LAB_STREAMS", 0),
-            check: match s("TFS_LAB_CHECK").as_str() { "off" => 1, "copy" => 2, _ => 0 },
+            check: match s("TFS_LAB_CHECK").as_str() { "off" => 1, "copy" => 2, "lazy" => 3, _ => 0 },
             register: n("TFS_LAB_REGISTER", 0),
             depth: n("TFS_LAB_DEPTH", 2),
             populate: s("TFS_LAB_POPULATE") == "1",
             trace: s("TFS_LAB_TRACE") == "1",
+            own: n("TFS_LAB_OWN", 0),
+            affinity: s("TFS_LAB_AFFINITY") == "1",
         }
     })
 }
@@ -159,6 +186,8 @@ impl Slot {
         })
     }
 }
+
+unsafe impl Send for Slot {}
 
 impl Drop for Slot {
     fn drop(&mut self) {
@@ -356,9 +385,22 @@ impl Engine {
             .collect::<cuda::Result<_>>()?;
         let ctx = streams[0].context();
         let _ctx = CtxGuard::enter(ctx)?;
-        let free = (0..lab().staging)
-            .map(|_| Slot::new(ctx))
-            .collect::<cuda::Result<_>>()?;
+        let staging = if lab().own > 0 { lab().own * lab().readers } else { lab().staging };
+        let free = if lab().affinity {
+            let ctx_addr = ctx as usize;
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    pin_here(device);
+                    let ctx = ctx_addr as CUcontext;
+                    let _ctx = CtxGuard::enter(ctx)?;
+                    (0..staging).map(|_| Slot::new(ctx)).collect::<cuda::Result<VecDeque<_>>>()
+                })
+                .join()
+                .unwrap()
+            })?
+        } else {
+            (0..staging).map(|_| Slot::new(ctx)).collect::<cuda::Result<_>>()?
+        };
         let engine = Arc::new(Engine {
             device,
             ctx,
@@ -510,7 +552,7 @@ impl Engine {
             let owners = hold.owners.as_mut().expect("run owners live");
             let mut jobs = Vec::new();
             let tally = Tally::default();
-            for &(copy, c) in copies {
+            for (jobs_ci, &(copy, c)) in copies.iter().enumerate() {
                 if let Src::Device { device, stream, .. } = c.src {
                     let source = Engine::get(device).map_err(|e| failed(copy, e))?;
                     owners
@@ -574,6 +616,7 @@ impl Engine {
                 for at in (0..c.dst.len()).step_by(step.max(1)) {
                     jobs.push(Job {
                         copy,
+                        ci: jobs_ci,
                         c,
                         at,
                         len: step.min(c.dst.len() - at),
@@ -598,15 +641,34 @@ impl Engine {
             let next = AtomicUsize::new(0);
             let stopped = AtomicBool::new(false);
             let error = Mutex::new(None);
+            let warm: Vec<OnceLock<bool>> = copies.iter().map(|_| OnceLock::new()).collect();
+            let own = lab().own;
             let work = || {
+                if lab().affinity {
+                    pin_here(self.device);
+                }
+                let _ctx = CtxGuard::enter(self.ctx);
                 let mut out = VecDeque::new();
+                let mut mine: Vec<Slot> = (0..own).map(|_| self.pool.take()).collect();
+                let mut n = 0;
+                let mut bad = false;
                 while !stopped.load(Relaxed) {
                     let at = next.fetch_add(1, Relaxed);
                     let Some(job) = jobs.get(at) else { break };
-                    if let Err(failure) = self.piece(job, at % streams, opts, &tally, &lt, &mut out) {
+                    let r = if own > 0 && !job.direct && !job.register {
+                        n += 1;
+                        self.stage(job, at % streams, opts, &tally, &lt, &warm, &mut mine[n % own])
+                    } else {
+                        self.piece(job, at % streams, opts, &tally, &lt, &mut out, &warm)
+                    };
+                    if let Err(failure) = r {
+                        bad = true;
                         error.lock().unwrap().get_or_insert(failure);
                         stopped.store(true, Relaxed);
                     }
+                }
+                for slot in mine {
+                    if bad { self.hold_slot(slot) } else { self.pool.put(slot) }
                 }
                 for r in out {
                     if let Err(e) = unreg(r, &lt) {
@@ -615,10 +677,16 @@ impl Engine {
                 }
             };
             std::thread::scope(|scope| {
-                for _ in 1..lab().readers.max(1).min(jobs.len().max(1)) {
-                    scope.spawn(work);
+                if own > 0 || lab().affinity {
+                    for _ in 0..lab().readers.max(1) {
+                        scope.spawn(work);
+                    }
+                } else {
+                    for _ in 1..lab().readers.max(1).min(jobs.len().max(1)) {
+                        scope.spawn(work);
+                    }
+                    work();
                 }
-                work();
             });
             let mut busy_ns = 0;
             let mut all_complete = true;
@@ -675,6 +743,7 @@ impl Engine {
         tally: &Tally,
         lt: &LabTally,
         out: &mut VecDeque<Reg>,
+        warm: &[OnceLock<bool>],
     ) -> Result<(), Error> {
         let _ctx = CtxGuard::enter(self.ctx).map_err(|e| failed(job.copy, e))?;
         let d = cuda::driver().map_err(|e| failed(job.copy, e))?;
@@ -745,6 +814,28 @@ impl Engine {
             return cuda::check("cuMemcpyAsync", result).map_err(|e| failed(job.copy, e));
         }
         let mut slot = self.pool.take();
+        let result = self.stage(job, lane, opts, tally, lt, warm, &mut slot);
+        if result.is_err() {
+            self.hold_slot(slot);
+        } else {
+            self.pool.put(slot);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage(
+        &self,
+        job: &Job,
+        lane: usize,
+        opts: &ReadOpts,
+        tally: &Tally,
+        lt: &LabTally,
+        warm: &[OnceLock<bool>],
+        slot: &mut Slot,
+    ) -> Result<(), Error> {
+        let d = cuda::driver().map_err(|e| failed(job.copy, e))?;
+        let stream = self.streams[lane].raw() as CUstream;
         let result = (|| {
             if slot.pending {
                 let s = Instant::now();
@@ -762,9 +853,19 @@ impl Engine {
                             len: job.len,
                         },
                     };
+                    let mut io_direct = job.io_direct;
+                    if lab().check == 3 && io_direct {
+                        let w = *warm[job.ci].get_or_init(|| {
+                            let s = Instant::now();
+                            let w = platform::durable::cached(file, offset, job.c.dst.len() as u64).unwrap_or(false);
+                            lt.check_ns.fetch_add(s.elapsed().as_nanos() as u64, Relaxed);
+                            w
+                        });
+                        io_direct = !w;
+                    }
                     let options = ReadOpts {
                         threads: 1,
-                        direct: job.io_direct,
+                        direct: io_direct,
                         ..opts.clone()
                     };
                     let stats = unsafe { host::fill(&[copy], &options) }.map_err(|e| Error {
@@ -807,17 +908,13 @@ impl Engine {
             tally.staged.fetch_add(job.len as u64, Relaxed);
             Ok(())
         })();
-        if result.is_err() {
-            self.hold_slot(slot);
-        } else {
-            self.pool.put(slot);
-        }
         result
     }
 }
 
 struct Job<'a> {
     copy: usize,
+    ci: usize,
     c: Copy<'a>,
     at: usize,
     len: usize,
