@@ -421,6 +421,20 @@ const KDL_CUDA: i32 = 2;
 const KDL_UINT: u8 = 1;
 const DLTENSOR: &CStr = c"dltensor";
 
+fn dlpack_stream(device: i32, stream: Option<i64>) -> Result<Option<u64>, &'static str> {
+    // Array API __dlpack__: CUDA None means legacy stream 1, 2 is per-thread, and
+    // 0 is ambiguous. A no-sync sentinel cannot establish this pin's consumer lifetime.
+    // https://data-apis.org/array-api/latest/API_specification/generated/array_api.array.__dlpack__.html
+    match (device, stream) {
+        (KDL_CPU, None) => Ok(None),
+        (KDL_CPU, Some(_)) => Err("a CPU bound region accepts only stream=None"),
+        (KDL_CUDA, None) => Ok(Some(1)),
+        (KDL_CUDA, Some(s)) if s > 0 => Ok(Some(s as u64)),
+        (KDL_CUDA, Some(_)) => Err("a CUDA bound region requires a positive consumer stream; 0 and no-sync sentinels are unsupported"),
+        _ => Err("the bound region has no supported DLPack device"),
+    }
+}
+
 #[repr(C)]
 struct DLDevice {
     device_type: i32,
@@ -489,8 +503,9 @@ impl PyPinned {
         if dl_device.is_some_and(|d| d != self.dl) {
             return Err(PyBufferError::new_err(format!("a bound region lives on {:?}", self.dl)));
         }
-        if let (Some(p), Some(s)) = (&self.pin.gpu, stream.filter(|&s| s > 0)) {
-            py.detach(|| p.wait_on(s as u64)).or_raise(py)?;
+        let stream = dlpack_stream(self.dl.0, stream).map_err(PyBufferError::new_err)?;
+        if let (Some(p), Some(s)) = (&self.pin.gpu, stream) {
+            py.detach(|| p.wait_on(s)).or_raise(py)?;
         }
         let held = Box::into_raw(Box::new(Held { dims: [self.nbytes as i64, 1], _pin: self.pin.clone() }));
         // SAFETY: `held` is live until the deleter runs.
@@ -511,6 +526,34 @@ impl PyPinned {
 
     fn __dlpack_device__(&self) -> (i32, i32) {
         self.dl
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::{dlpack_stream, KDL_CPU, KDL_CUDA};
+
+    #[test]
+    fn cuda_none_and_positive_consumers_have_explicit_streams() {
+        assert_eq!(dlpack_stream(KDL_CUDA, None), Ok(Some(1)));
+        for stream in [1, 2, 99, i64::MAX] {
+            assert_eq!(dlpack_stream(KDL_CUDA, Some(stream)), Ok(Some(stream as u64)));
+        }
+    }
+
+    #[test]
+    fn cuda_ambiguous_and_no_sync_consumers_are_refused() {
+        for stream in [0, -1, -2, i64::MIN] {
+            assert!(dlpack_stream(KDL_CUDA, Some(stream)).is_err());
+        }
+    }
+
+    #[test]
+    fn cpu_accepts_only_no_stream() {
+        assert_eq!(dlpack_stream(KDL_CPU, None), Ok(None));
+        for stream in [0, 1, 2, 99, -1] {
+            assert!(dlpack_stream(KDL_CPU, Some(stream)).is_err());
+        }
     }
 }
 

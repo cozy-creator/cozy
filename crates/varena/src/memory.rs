@@ -1423,7 +1423,8 @@ impl WeightSet {
             self.release(at, region, None);
             return Err(e);
         }
-        Ok(Pinned { ws: self.clone(), at, region, ptr, nbytes, fresh, writable, stream, ready })
+        let stream = ConsumerStream::current(stream);
+        Ok(Pinned { ws: self.clone(), at, region, ptr, nbytes, fresh, writable, stream, consumers: Mutex::new(vec![stream]), ready })
     }
 
     /// Start filling region `r` ahead of its bind: at home, or into a free slot. Never waits.
@@ -1559,6 +1560,10 @@ impl WeightSet {
     }
 
     fn release(&self, at: At, region: u32, ev: Option<EvRef>) {
+        self.release_events(at, region, ev.into_iter().collect());
+    }
+
+    fn release_events(&self, at: At, region: u32, events: Vec<EvRef>) {
         let mut st = self.gpu.inner.lock();
         let m = match at {
             At::Home => match st.reg(self.id, region) {
@@ -1568,19 +1573,23 @@ impl WeightSet {
             At::Slot(i) => &mut st.slot(i).m,
         };
         m.pins -= 1;
-        if let Some(e) = ev {
+        if !events.is_empty() {
             let _ = passed(&mut m.released);
-            m.released.push(e);
+            m.released.extend(events);
         }
     }
 
-    fn finish_pin(self: &Arc<Self>, at: At, region: u32, recorded: Result<EvRef>, drain: impl FnOnce() -> Result<()>) {
-        match recorded {
-            Ok(e) => self.release(at, region, Some(e)),
-            Err(record) => match drain() {
-                Ok(()) => self.release(at, region, None),
-                Err(e) => self.gpu.inner.retain_pin(self, Error::Io(format!("release event failed: {record}; consumer completion is unknown: {e}"))),
-            },
+    fn finish_pin(self: &Arc<Self>, at: At, region: u32, events: Vec<EvRef>, failed: Option<Error>, drain: impl FnOnce() -> Result<()>) {
+        if let Some(record) = failed {
+            if let Err(e) = drain() {
+                // Successful partial records remain owned until every consumer is fenced.
+                self.gpu.inner.retain_waits(&events);
+                self.gpu.inner.retain_pin(self, Error::Io(format!("release event failed: {record}; consumer completion is unknown: {e}")));
+                return;
+            }
+            self.release(at, region, None);
+        } else {
+            self.release_events(at, region, events);
         }
     }
 
@@ -1655,7 +1664,27 @@ enum At {
     Slot(usize),
 }
 
-/// A bound region: its pages stay mapped while it lives; dropping it records a release event.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ConsumerStream {
+    raw: u64,
+    /// CUDA's per-thread default handle means a different stream on another host thread.
+    origin: Option<std::thread::ThreadId>,
+}
+
+impl ConsumerStream {
+    fn current(raw: u64) -> Self {
+        Self { raw, origin: (raw == 2).then(|| std::thread::current().id()) }
+    }
+
+    fn here(self) -> Result<()> {
+        if self.origin.is_some_and(|origin| origin != std::thread::current().id()) {
+            return Err(Error::Io("per-thread consumer stream completion is unknown on another host thread".into()));
+        }
+        Ok(())
+    }
+}
+
+/// A bound region: its pages stay mapped while it lives; dropping it fences every admitted stream.
 pub struct Pinned {
     ws: Arc<WeightSet>,
     at: At,
@@ -1665,7 +1694,8 @@ pub struct Pinned {
     /// This bind is the first since a copy put the bytes there.
     pub fresh: bool,
     pub writable: bool,
-    stream: u64,
+    stream: ConsumerStream,
+    consumers: Mutex<Vec<ConsumerStream>>,
     ready: EvRef,
 }
 
@@ -1680,13 +1710,45 @@ impl Pinned {
 
     /// Make `stream` wait for the bytes too (a consumer other than the bind stream).
     pub fn wait_on(&self, stream: u64) -> Result<()> {
-        self.ws.gpu.inner.check()?;
-        if stream == self.stream || self.ready.done()? {
-            return Ok(());
+        self.admit_stream(stream, || {
+            let _c = CtxGuard::enter(self.ws.gpu.inner.ctx)?;
+            self.ready.done()
+        }, || {
+            let _c = CtxGuard::enter(self.ws.gpu.inner.ctx)?;
+            wait_in(stream as CUstream, &self.ready)
+        })
+    }
+
+    fn admit_stream(&self, stream: u64, ready: impl FnOnce() -> Result<bool>, wait: impl FnOnce() -> Result<()>) -> Result<()> {
+        let g = &self.ws.gpu.inner;
+        g.check()?;
+        // Serialize admission through its wait. Completion of the fill does not complete a
+        // consumer's later work, so even the ready fast path must retain its stream.
+        let mut consumers = self.consumers.lock().unwrap();
+        g.check()?;
+        let stream = ConsumerStream::current(stream);
+        if !consumers.contains(&stream) {
+            consumers.push(stream);
         }
-        let _c = CtxGuard::enter(self.ws.gpu.inner.ctx)?;
-        wait_in(stream as CUstream, &self.ready)?;
-        self.ws.gpu.inner.check()
+        if stream != self.stream && !ready()? {
+            wait()?;
+        }
+        g.check()
+    }
+
+    fn finish_streams(&self, mut record: impl FnMut(u64) -> Result<EvRef>, mut drain: impl FnMut(u64) -> Result<()>) {
+        let streams = self.consumers.lock().unwrap().clone();
+        let mut events = vec![];
+        let failed = streams.iter().try_for_each(|&stream| stream.here().and_then(|_| record(stream.raw)).map(|ev| events.push(ev))).err();
+        self.ws.finish_pin(self.at, self.region, events, failed, || {
+            let mut failed = None;
+            for stream in streams {
+                if let Err(e) = stream.here().and_then(|_| drain(stream.raw)) {
+                    failed.get_or_insert(e);
+                }
+            }
+            failed.map_or(Ok(()), Err)
+        });
     }
 }
 
@@ -1697,14 +1759,14 @@ impl Drop for Pinned {
             g.retain_pin(&self.ws, e);
             return;
         }
-        let recorded = crate::faults::hit("pin-release-context").and_then(|_| CtxGuard::enter(g.ctx)).and_then(|_c| {
+        self.finish_streams(|stream| {
+            let _c = crate::faults::hit("pin-release-context").and_then(|_| CtxGuard::enter(g.ctx))?;
             crate::faults::hit("pin-release")?;
-            g.events.record(self.stream as CUstream, false)
-        });
-        self.ws.finish_pin(self.at, self.region, recorded, || {
+            g.events.record(stream as CUstream, false)
+        }, |stream| {
             crate::faults::hit("pin-release-drain")?;
             let _c = CtxGuard::enter(g.ctx)?;
-            call!("cuStreamSynchronize", stream_synchronize(self.stream as CUstream))
+            call!("cuStreamSynchronize", stream_synchronize(stream as CUstream))
         });
     }
 }

@@ -388,9 +388,13 @@ fn failed_final_pin_retains_actual_weight_set_gpu_and_source_once() {
     let weak_ws = Arc::downgrade(&ws);
     let weak_gpu = Arc::downgrade(&f.gpu);
     for _ in 0..3 {
-        ws.finish_pin(At::Home, 0, Err(error("release record failed")), || {
-            Err(error("consumer drain failed"))
-        });
+        ws.finish_pin(
+            At::Home,
+            0,
+            vec![],
+            Some(error("release record failed")),
+            || Err(error("consumer drain failed")),
+        );
     }
     assert_eq!(f.gpu.inner.custody.lock().unwrap().pins.len(), 1);
     assert_eq!(
@@ -416,8 +420,13 @@ fn failed_final_pin_retains_actual_weight_set_gpu_and_source_once() {
 #[test]
 fn failed_release_record_with_confirmed_consumer_drain_releases_the_pin() {
     let f = Fixture::new();
-    f.ws()
-        .finish_pin(At::Home, 0, Err(error("release record failed")), || Ok(()));
+    f.ws().finish_pin(
+        At::Home,
+        0,
+        vec![],
+        Some(error("release record failed")),
+        || Ok(()),
+    );
     assert_eq!(
         f.gpu
             .inner
@@ -450,7 +459,8 @@ fn a_retained_pin_refuses_even_a_same_stream_wait_after_poison() {
         nbytes: 0,
         fresh: false,
         writable: true,
-        stream: 7,
+        stream: ConsumerStream::current(7),
+        consumers: Mutex::new(vec![ConsumerStream::current(7)]),
         ready,
     };
     f.gpu.inner.poison(error("completion unknown"));
@@ -477,7 +487,8 @@ fn final_pinned_drop_keeps_the_last_weight_set_arc_after_context_and_drain_failu
         nbytes: 0,
         fresh: false,
         writable: true,
-        stream: 0,
+        stream: ConsumerStream::current(0),
+        consumers: Mutex::new(vec![ConsumerStream::current(0)]),
         ready,
     };
     crate::faults::arm("pin-release-context", 1);
@@ -550,4 +561,425 @@ fn failed_unregister_retains_the_actual_host_mapping_and_source() {
         unsafe { libc::mincore(base.cast(), PART_ALIGN as usize, &mut resident) },
         0
     );
+}
+
+fn consumer_pin(f: &Fixture) -> Pinned {
+    Pinned {
+        ws: f.ws().clone(),
+        at: At::Home,
+        region: 0,
+        ptr: 0,
+        nbytes: 0,
+        fresh: false,
+        writable: true,
+        stream: ConsumerStream::current(7),
+        consumers: Mutex::new(vec![ConsumerStream::current(7)]),
+        ready: inert_event(f),
+    }
+}
+
+fn inert_event(f: &Fixture) -> EvRef {
+    Arc::new(Ev {
+        raw: std::ptr::null_mut(),
+        timing: false,
+        pool: f.gpu.inner.events.clone(),
+    })
+}
+
+#[test]
+fn completed_fill_still_admits_and_deduplicates_secondary_consumers() {
+    let f = Fixture::new();
+    let pin = consumer_pin(&f);
+    for stream in [7, 8, 8, 9, 7, 9] {
+        pin.admit_stream(
+            stream,
+            || Ok(true),
+            || panic!("completed fill needs no wait"),
+        )
+        .unwrap();
+    }
+    assert_eq!(consumer_ids(&pin), [7, 8, 9]);
+    drop(f); // Poison inert handles before the real Pinned destructor.
+    drop(pin);
+}
+
+#[test]
+fn unfinished_fill_admission_waits_before_returning_the_consumer() {
+    let f = Fixture::new();
+    let pin = consumer_pin(&f);
+    let mut waited = false;
+    pin.admit_stream(
+        8,
+        || Ok(false),
+        || {
+            waited = true;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(waited);
+    assert_eq!(consumer_ids(&pin), [7, 8]);
+    drop(f);
+    drop(pin);
+}
+
+#[test]
+fn failed_readiness_query_or_wait_keeps_candidate_consumers_for_final_fencing() {
+    let f = Fixture::new();
+    let pin = consumer_pin(&f);
+    assert!(pin
+        .admit_stream(8, || Err(error("query unknown")), || panic!("query failed"))
+        .is_err());
+    assert!(pin
+        .admit_stream(9, || Ok(false), || Err(error("wait enqueue unknown")))
+        .is_err());
+    assert_eq!(consumer_ids(&pin), [7, 8, 9]);
+    f.gpu.inner.poison(error("completion unknown"));
+    assert!(pin
+        .admit_stream(10, || panic!("poisoned"), || panic!("poisoned"))
+        .is_err());
+    assert_eq!(consumer_ids(&pin), [7, 8, 9]);
+    drop(f);
+    drop(pin);
+}
+
+#[test]
+fn all_consumer_release_events_transfer_before_exactly_one_pin_decrement() {
+    let f = Fixture::new();
+    let pin = consumer_pin(&f);
+    for stream in [8, 9] {
+        pin.admit_stream(stream, || Ok(true), || unreachable!())
+            .unwrap();
+    }
+    let mut recorded = vec![];
+    pin.finish_streams(
+        |stream| {
+            recorded.push(stream);
+            Ok(inert_event(&f))
+        },
+        |_| panic!("all recorded"),
+    );
+    assert_eq!(recorded, [7, 8, 9]);
+    let mut st = f.gpu.inner.lock();
+    let map = st.reg(0, 0).unwrap().map.as_ref().unwrap();
+    assert_eq!(map.pins, 0);
+    assert_eq!(map.released.len(), 3);
+    drop(st);
+    assert!(f.gpu.inner.check().is_ok());
+    drop(f);
+    drop(pin);
+}
+
+#[test]
+fn partial_records_and_mixed_drains_retain_actual_events_and_last_owners() {
+    let mut f = Fixture::new();
+    let pin = consumer_pin(&f);
+    for stream in [8, 9] {
+        pin.admit_stream(stream, || Ok(true), || unreachable!())
+            .unwrap();
+    }
+    let event = inert_event(&f);
+    let held_event = Arc::downgrade(&event);
+    let mut recorded = vec![];
+    let mut drained = vec![];
+    pin.finish_streams(
+        |stream| {
+            recorded.push(stream);
+            if stream == 7 {
+                Ok(event.clone())
+            } else {
+                Err(error("record failed"))
+            }
+        },
+        |stream| {
+            drained.push(stream);
+            if stream == 8 {
+                Err(error("secondary consumer unknown"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    drop(event);
+    assert_eq!(recorded, [7, 8]);
+    assert_eq!(drained, [7, 8, 9]);
+    assert!(held_event.upgrade().is_some());
+    assert_eq!(f.gpu.inner.custody.lock().unwrap().releases.len(), 1);
+    assert_eq!(f.gpu.inner.custody.lock().unwrap().pins.len(), 1);
+    assert_eq!(
+        f.gpu
+            .inner
+            .lock()
+            .reg(0, 0)
+            .unwrap()
+            .map
+            .as_ref()
+            .unwrap()
+            .pins,
+        1
+    );
+    let ws = f.ws.take().unwrap();
+    let held_ws = Arc::downgrade(&ws);
+    let held_gpu = Arc::downgrade(&f.gpu);
+    let held_source = Arc::downgrade(&ws.weights);
+    let fd = f.fd;
+    drop(ws);
+    drop(pin); // The actual destructor observes poison and keeps its owner, without CUDA.
+    drop(f);
+    assert!(held_ws.upgrade().is_some() && held_gpu.upgrade().is_some());
+    assert!(held_source.upgrade().is_some() && held_event.upgrade().is_some());
+    assert!(fd_is_open(fd));
+}
+
+#[test]
+fn first_record_failure_still_checks_every_consumer_drain() {
+    let f = Fixture::new();
+    let pin = consumer_pin(&f);
+    pin.admit_stream(8, || Ok(true), || unreachable!()).unwrap();
+    pin.admit_stream(9, || Ok(true), || unreachable!()).unwrap();
+    let mut drained = vec![];
+    pin.finish_streams(
+        |_| Err(error("context or first record failed")),
+        |stream| {
+            drained.push(stream);
+            if stream != 8 {
+                Err(error("drain failed"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert_eq!(drained, [7, 8, 9]);
+    assert_eq!(
+        f.gpu
+            .inner
+            .lock()
+            .reg(0, 0)
+            .unwrap()
+            .map
+            .as_ref()
+            .unwrap()
+            .pins,
+        1
+    );
+    assert!(f.gpu.inner.custody.lock().unwrap().releases.is_empty());
+    assert_eq!(f.gpu.inner.custody.lock().unwrap().pins.len(), 1);
+    drop(f);
+    drop(pin);
+}
+
+#[test]
+fn partial_record_failure_with_all_drains_confirmed_releases_once_without_poison() {
+    let f = Fixture::new();
+    let pin = consumer_pin(&f);
+    pin.admit_stream(8, || Ok(true), || unreachable!()).unwrap();
+    let event = inert_event(&f);
+    let held_event = Arc::downgrade(&event);
+    let mut drained = vec![];
+    pin.finish_streams(
+        |stream| {
+            if stream == 7 {
+                Ok(event.clone())
+            } else {
+                Err(error("secondary record failed"))
+            }
+        },
+        |stream| {
+            drained.push(stream);
+            Ok(())
+        },
+    );
+    drop(event);
+    assert_eq!(drained, [7, 8]);
+    assert!(held_event.upgrade().is_none());
+    assert!(f.gpu.inner.check().is_ok());
+    assert!(f.gpu.inner.custody.lock().unwrap().pins.is_empty());
+    assert_eq!(
+        f.gpu
+            .inner
+            .lock()
+            .reg(0, 0)
+            .unwrap()
+            .map
+            .as_ref()
+            .unwrap()
+            .pins,
+        0
+    );
+    drop(f);
+    drop(pin);
+}
+
+fn consumer_ids(pin: &Pinned) -> Vec<u64> {
+    pin.consumers
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|stream| stream.raw)
+        .collect()
+}
+
+#[test]
+fn same_thread_default_consumer_is_fenced_normally() {
+    let f = Fixture::new();
+    let pin = consumer_pin(&f);
+    pin.admit_stream(2, || Ok(true), || unreachable!()).unwrap();
+    pin.admit_stream(2, || Ok(true), || unreachable!()).unwrap();
+    assert_eq!(consumer_ids(&pin), [7, 2]);
+    let mut recorded = vec![];
+    pin.finish_streams(
+        |stream| {
+            recorded.push(stream);
+            Ok(inert_event(&f))
+        },
+        |_| panic!("all records known"),
+    );
+    assert_eq!(recorded, [7, 2]);
+    assert_eq!(
+        f.gpu
+            .inner
+            .lock()
+            .reg(0, 0)
+            .unwrap()
+            .map
+            .as_ref()
+            .unwrap()
+            .pins,
+        0
+    );
+    assert!(f.gpu.inner.check().is_ok());
+    drop(f);
+    drop(pin);
+}
+
+#[test]
+fn cross_thread_default_consumer_keeps_owners_without_fencing_the_wrong_stream() {
+    let mut f = Fixture::new();
+    let mut pin = consumer_pin(&f);
+    pin.stream = ConsumerStream::current(2);
+    *pin.consumers.lock().unwrap() = vec![pin.stream];
+    pin.admit_stream(2, || panic!("same bind identity"), || unreachable!())
+        .unwrap();
+    let pin = Arc::new(pin);
+    let other = pin.clone();
+    std::thread::spawn(move || {
+        let mut waited = false;
+        other
+            .admit_stream(
+                2,
+                || Ok(false),
+                || {
+                    waited = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(
+            waited,
+            "per-thread default on another thread is not the bind identity"
+        );
+        other
+            .admit_stream(2, || Ok(true), || unreachable!())
+            .unwrap();
+    })
+    .join()
+    .unwrap();
+    assert_eq!(consumer_ids(&pin), [2, 2]);
+    let event = inert_event(&f);
+    let held_event = Arc::downgrade(&event);
+    let mut recorded = vec![];
+    let mut drained = vec![];
+    pin.finish_streams(
+        |stream| {
+            recorded.push(stream);
+            Ok(event.clone())
+        },
+        |stream| {
+            drained.push(stream);
+            Ok(())
+        },
+    );
+    assert_eq!(
+        recorded,
+        [2],
+        "record callback must not see the other thread's sentinel"
+    );
+    assert_eq!(
+        drained,
+        [2],
+        "drain callback must not see the other thread's sentinel"
+    );
+    drop(event);
+    let ws = f.ws.take().unwrap();
+    let held_ws = Arc::downgrade(&ws);
+    let held_gpu = Arc::downgrade(&f.gpu);
+    let held_source = Arc::downgrade(&ws.weights);
+    let fd = f.fd;
+    assert_eq!(
+        f.gpu
+            .inner
+            .lock()
+            .reg(0, 0)
+            .unwrap()
+            .map
+            .as_ref()
+            .unwrap()
+            .pins,
+        1
+    );
+    drop(ws);
+    drop(pin); // Real final Drop follows the existing poisoned owner-retention path.
+    drop(f);
+    assert!(held_ws.upgrade().is_some() && held_gpu.upgrade().is_some());
+    assert!(held_source.upgrade().is_some() && held_event.upgrade().is_some());
+    assert!(fd_is_open(fd));
+}
+
+#[test]
+fn final_drop_on_another_thread_retains_per_thread_default_owners_without_cuda() {
+    let mut f = Fixture::new();
+    let ws = f.ws.take().unwrap();
+    let held_ws = Arc::downgrade(&ws);
+    let held_source = Arc::downgrade(&ws.weights);
+    let held_gpu = Arc::downgrade(&f.gpu);
+    let fd = f.fd;
+    let pin = std::thread::spawn(move || {
+        let stream = ConsumerStream::current(2);
+        let ready = Arc::new(Ev {
+            raw: std::ptr::null_mut(),
+            timing: false,
+            pool: ws.gpu.inner.events.clone(),
+        });
+        Pinned {
+            ws,
+            at: At::Home,
+            region: 0,
+            ptr: 0,
+            nbytes: 0,
+            fresh: false,
+            writable: true,
+            stream,
+            consumers: Mutex::new(vec![stream]),
+            ready,
+        }
+    })
+    .join()
+    .unwrap();
+    drop(pin); // Identity refusal occurs before either real CUDA callback can be invoked.
+    assert_eq!(f.gpu.inner.custody.lock().unwrap().pins.len(), 1);
+    assert_eq!(
+        f.gpu
+            .inner
+            .lock()
+            .reg(0, 0)
+            .unwrap()
+            .map
+            .as_ref()
+            .unwrap()
+            .pins,
+        1
+    );
+    drop(f);
+    assert!(held_ws.upgrade().is_some() && held_gpu.upgrade().is_some());
+    assert!(held_source.upgrade().is_some() && fd_is_open(fd));
 }

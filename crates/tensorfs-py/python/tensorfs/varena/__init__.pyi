@@ -148,8 +148,9 @@ class GpuStats:
 
 class Pinned:
     """A bound region: `nbytes` uint8 at `ptr`. Through `torch.from_dlpack(pinned)`, every view
-    of the tensor holds the pin. When the last one dies, the pin is released with an event on
-    the bind stream."""
+    of the tensor holds the pin. When the last one dies, release fences cover the bind stream
+    and every consumer stream admitted through __dlpack__. A per-thread default consumer
+    whose completion cannot be proved on its original thread keeps the actual pin owners."""
 
     @property
     def region(self) -> int: ...
