@@ -229,8 +229,8 @@ impl<'t> Migrator<'t> {
     /// The repo document `doc` in D10, its old objects read by `read`. A release that names a
     /// tree, and a checkpoint that is one, stay as they are; each release of lanes becomes one
     /// tree (`model.<lane>.cozytensors` each, repo files merged, the first lane's kept where
-    /// they differ), yanked or not; each other old checkpoint a tree of
-    /// its own (`model.cozytensors`).
+    /// they differ), yanked or not; each other old checkpoint a tree of its own
+    /// (`model.cozytensors`).
     pub fn repo(&mut self, doc: &[u8], read: Read) -> Result<Migrated> {
         let old: OldRepo = serde_json::from_slice(doc).map_err(|e| invalid(format!("repo document: {e}")))?;
         let upstream = self.table.iter().find(|u| u.models.iter().any(|p| matches(p, &old.name)));

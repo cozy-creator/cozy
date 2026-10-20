@@ -13,18 +13,18 @@ fn tree_and_repo_reject_null_in_ignored_fields() {
         json!([null]),
         json!({"nested": [{"value": null}]}),
     ] {
-        let tree = json!({"format": "tensorfs.tree/1", "files": {}, "future": value});
+        let tree = json!({"format": "cozytensors.tree/1", "files": {}, "future": value});
         let err = Tree::from_json(&serde_json::to_vec(&tree).unwrap()).unwrap_err();
         assert_eq!(err.code(), "invalid", "{tree}: {err}");
         let repo = json!({
-            "format": "tensorfs.repo/1", "name": "acme/model", "releases": [], "future": value,
+            "format": "cozytensors.repo/1", "name": "acme/model", "releases": [], "future": value,
         });
         let err = Repo::from_json(&serde_json::to_vec(&repo).unwrap()).unwrap_err();
         assert_eq!(err.code(), "invalid", "{repo}: {err}");
     }
     // An extension nested inside a known record still participates in the strict walk.
     let mut repo = json!({
-        "format": "tensorfs.repo/1", "name": "acme/model",
+        "format": "cozytensors.repo/1", "name": "acme/model",
         "releases": [{"version": "1", "tree": ObjectRef::of(b"tree"), "future": {"value": null}}],
     });
     assert_eq!(

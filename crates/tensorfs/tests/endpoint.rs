@@ -132,7 +132,7 @@ async fn a_tree_goes_up_to_a_directory_and_down_over_http() {
     let unreleased = upload_tree(&endpoint, "acme/tiny", &notes, &source, None).await.unwrap().repo;
     assert_eq!((unreleased.checkpoints, unreleased.releases), (vec![notes.clone()], up.repo.releases.clone()));
     let moved = upload_tree(&endpoint, "acme/tiny", &notes, &source, Some("1.0")).await.unwrap().repo;
-    assert_eq!((moved.release(Some("1.0")).unwrap().revision, moved.checkpoints.len()), (1, 0), "a changed release counts");
+    assert_eq!((&moved.release(Some("1.0")).unwrap().tree, moved.checkpoints.len()), (&notes, 0), "the release moves");
     endpoint.update_repo("acme/tiny", |_| Ok(Some(up.repo.clone()))).await.unwrap();
 
     let (_, etag) = endpoint.repo("acme/tiny").await.unwrap().unwrap();
