@@ -25,7 +25,7 @@ jobs:
       ref: ${{ github.sha }}
       build: tensorfs
       # Build the matching ordinary TensorFS 0.13 / Runtime 0.30 candidate until publication.
-      runtime_ref: 1d2fdc91ca615e01479f6a0cd414e1bf2e288586
+      runtime_ref: 53b795bc820644e1446d725abf5837f506eca1b7
       # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below.
       test: |
         python3 scripts/cargo-test-binaries.py --self-test && python3 scripts/cargo-test-binaries.py
@@ -60,4 +60,4 @@ jobs:
       # The canonical commits/tags Hub fixture; production pins are independent.
       tensorhub_ref: 7a4f3eab9b6bac735f5397445024f8dedab7c138
       # Use this Runtime and TensorFS pair until both releases are published.
-      runtime_ref: 1d2fdc91ca615e01479f6a0cd414e1bf2e288586
+      runtime_ref: 53b795bc820644e1446d725abf5837f506eca1b7
