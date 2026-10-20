@@ -78,6 +78,7 @@ struct Model {
 
 struct Request {
     steps: Vec<Vec<ModelId>>,
+    explicit: bool,
     package: String,
     shape: String,
     stats: Stats,
@@ -386,6 +387,7 @@ impl Placement {
             id,
             Request {
                 steps: vec![],
+                explicit: false,
                 package,
                 shape,
                 stats: Stats::default(),
@@ -481,12 +483,67 @@ impl Placement {
             .get_mut(&id)
             .ok_or_else(|| invalid("unknown request"))?;
         request.steps = groups.into_iter().map(|(models, _)| models).collect();
+        request.explicit = !request.steps.is_empty();
+        Ok(())
+    }
+
+    /// No plan means demand-only operation. Record just the model actually entered;
+    /// there is no future use to prefetch and earlier models become reclaimable.
+    fn demand_step(inner: &mut Inner, request: RequestId, model: ModelId) -> Result<()> {
+        let pages = inner
+            .models
+            .get(&model)
+            .ok_or_else(|| invalid("unknown model"))?
+            .pages
+            .clone();
+        let run = inner
+            .requests
+            .get_mut(&request)
+            .ok_or_else(|| invalid("unknown request"))?;
+        let step = u32::try_from(run.steps.len()).map_err(|_| invalid("too many steps"))?;
+        run.steps.push(vec![model]);
+        for page in &mut inner.table.pages {
+            page.uses.retain(|usage| usage.request != request);
+        }
+        for (order, id) in pages.into_iter().enumerate() {
+            let page = inner
+                .table
+                .pages
+                .iter_mut()
+                .find(|page| page.id == id)
+                .ok_or_else(|| invalid("model page absent"))?;
+            page.uses.push(plan::Use {
+                request,
+                position: Position {
+                    step,
+                    order: u32::try_from(order).map_err(|_| invalid("too many pages"))?,
+                },
+            });
+        }
+        let facts = inner
+            .table
+            .requests
+            .iter_mut()
+            .find(|row| row.id == request)
+            .ok_or_else(|| invalid("request facts absent"))?;
+        facts.position = Position { step, order: 0 };
+        facts.working_sets.resize(step as usize + 1, None);
+        facts.starved = false;
         Ok(())
     }
 
     pub fn enter(&self, request: RequestId, model: ModelId) -> Result<Relief> {
+        let demand;
         {
             let mut inner = self.inner.lock();
+            demand = !inner
+                .requests
+                .get(&request)
+                .ok_or_else(|| invalid("unknown request"))?
+                .explicit;
+            if demand {
+                Self::demand_step(&mut inner, request, model)?;
+            }
             let from = inner
                 .table
                 .request(request)
@@ -516,7 +573,12 @@ impl Placement {
                         facts.starved = false;
                     }
                 }
+            } else {
+                return Err(invalid("model is absent from the remaining plan"));
             }
+        }
+        if demand {
+            self.hydrate(request)?;
         }
         let result = self.drive(request, Trigger::StepStart(request))?;
         self.capture_budget(request);
@@ -524,13 +586,32 @@ impl Placement {
     }
 
     pub fn bind(&self, request: RequestId, page: PageId, stream: usize) -> Result<Pin> {
-        let need = self
-            .inner
-            .lock()
-            .table
-            .page(page)
-            .ok_or_else(|| invalid("unknown page"))?
-            .bytes;
+        let (need, demand) = {
+            let inner = self.inner.lock();
+            let page = inner
+                .table
+                .page(page)
+                .ok_or_else(|| invalid("unknown page"))?;
+            let model = page.model.ok_or_else(|| invalid("page has no model"))?;
+            let run = inner
+                .requests
+                .get(&request)
+                .ok_or_else(|| invalid("unknown request"))?;
+            let step = inner
+                .table
+                .request(request)
+                .ok_or_else(|| invalid("request facts absent"))?
+                .position
+                .step;
+            let active = run
+                .steps
+                .get(step as usize)
+                .is_some_and(|models| models.contains(&model));
+            (page.bytes, (!run.explicit && !active).then_some(model))
+        };
+        if let Some(model) = demand {
+            self.enter(request, model)?;
+        }
         let mut previous = None;
         let pin = loop {
             self.wait_fill(page)?;
@@ -1179,13 +1260,16 @@ impl Placement {
                 match action {
                     Action::DropHome { request, page } => {
                         self.event(request, page, "lower", "lower")?;
-                        if let Some(page) = self
-                            .inner
-                            .lock()
+                        let mut inner = self.inner.lock();
+                        if let Some(active) = inner
                             .table
-                            .pages
+                            .requests
                             .iter_mut()
-                            .find(|row| row.id == page)
+                            .find(|row| row.id == request)
+                        {
+                            active.starved = true;
+                        }
+                        if let Some(page) = inner.table.pages.iter_mut().find(|row| row.id == page)
                         {
                             page.lowered.insert(request);
                             page.speculative_for = None;

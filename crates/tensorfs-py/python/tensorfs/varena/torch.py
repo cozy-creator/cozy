@@ -389,17 +389,18 @@ class Model:
         if self.closed:
             return
         self.closed = True
-        for handle in self.handles:
-            handle.remove()
-        for block in (self.common, *self.blocks):
-            _unhook(block)
-            _unbind(block)
-        try:
-            if self.memory.native is not None:
-                self.memory.native.close_model(self.ws.id)
-        finally:
-            self.memory.models.pop(self.name, None)
-            self.memory.by_module.pop(self.module, None)
+        with ExitStack() as cleanup:
+            cleanup.callback(self.memory.models.pop, self.name, None)
+            cleanup.callback(self.memory.by_module.pop, self.module, None)
+            weights = getattr(self, "ws", None)
+            if self.memory.native is not None and weights is not None:
+                cleanup.callback(self.memory._names.pop, weights.id, None)
+                cleanup.callback(self.memory.native.close_model, weights.id)
+            for block in (self.common, *self.blocks):
+                cleanup.callback(_unbind, block)
+                cleanup.callback(_unhook, block)
+            for handle in self.handles:
+                cleanup.callback(handle.remove)
 
 
 class Hold:
@@ -580,8 +581,14 @@ class Memory:
         ck: tensorfs.Checkpoint | None = None,
         component: str | None = None,
     ) -> Model:
-        model = self.by_module.get(module)
-        if model is None:
+        with self.lock:
+            model = self.by_module.get(module)
+            if model is not None:
+                if self.native is not None:
+                    self.native.load(model.ws.id, Level(level).value)
+                return model
+
+            original_declaration = vars(module).get("_varena")
             declared = _declared(module)
             if ck is not None:
                 component = component or next(iter(ck.components))
@@ -595,29 +602,58 @@ class Memory:
                 vars(module)["_varena"] = declared
             model = Model(self, module, declared)
             model.name = f"{model.source.key}:{next(self._ids)}"
+            originals = {
+                (id(site.table), site.attr): (site, site.table[site.attr])
+                for sites in model.sites.values()
+                for site in sites
+            }
+            forwards = [
+                (sub, vars(sub).get("forward"), vars(sub).get("_varena_ffn"))
+                for sub in module.modules()
+            ]
+            try:
+                if self.native is None:
+                    self._load_host(model)
+                else:
+                    self._register(model)
+                    paths = blocks_of(module)
+                    _layout(model, f"{model.component}/", paths, regions_of(module))
+                    _install(model)
+                    for block in model.blocks:
+                        block.site = cuts.Site(
+                            (model.name, block.index),
+                            self.device,
+                            model.track,
+                            block.module,
+                            module,
+                            declared.state,
+                        )
+                        _hook(block)
+                    cuts.install(module)
+                    _fly(model)
+                    self.native.load(model.ws.id, Level(level).value)
+            except BaseException as error:
+                try:
+                    model.close()
+                except BaseException as cleanup_error:
+                    error.add_note(f"registration cleanup failed: {cleanup_error}")
+                    raise error from cleanup_error
+                finally:
+                    for site, value in originals.values():
+                        site.table[site.attr] = value
+                    for sub, forward, cut in forwards:
+                        for key, value in (("forward", forward), ("_varena_ffn", cut)):
+                            if value is None:
+                                vars(sub).pop(key, None)
+                            else:
+                                vars(sub)[key] = value
+                    if original_declaration is None:
+                        vars(module).pop("_varena", None)
+                    else:
+                        vars(module)["_varena"] = original_declaration
+                raise
             self.models[model.name], self.by_module[module] = model, model
-            if self.native is None:
-                self._load_host(model)
-            else:
-                self._register(model)
-                paths = blocks_of(module)
-                _layout(model, f"{model.component}/", paths, regions_of(module))
-                _install(model)
-                for block in model.blocks:
-                    block.site = cuts.Site(
-                        (model.name, block.index),
-                        self.device,
-                        model.track,
-                        block.module,
-                        module,
-                        declared.state,
-                    )
-                    _hook(block)
-                cuts.install(module)
-                _fly(model)
-        if self.native is not None:
-            self.native.load(model.ws.id, Level(level).value)
-        return model
+            return model
 
     def _register(self, model: Model) -> None:
         assert self.native is not None
