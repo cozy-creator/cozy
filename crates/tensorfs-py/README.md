@@ -98,8 +98,10 @@ repo → release → tree
 
 A release names a `tensorfs.tree/1` tree. `variant=` selects a cozytensors file; `open` requires an explicit variant
 when there is more than one. `revision="sha256:…"` can select an unpublished tree or header. Opening downloads
-metadata; each tensor read fetches only the objects it needs. `snapshot_download` returns a plain folder, including
-all variants by default, while `hub_download` returns one repository file.
+metadata by default; each tensor read fetches only the objects it needs. Set `lazy=False` to wait for the whole
+checkpoint in the shared store, or call `checkpoint.download(components=["unet"])` to preload a selection.
+`materialize` returns a plain folder, including all variants by default, while `download_file` returns one
+repository file. These folder/file operations are optional compatibility tools.
 
 ## Convert, write and share
 

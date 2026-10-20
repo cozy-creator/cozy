@@ -39,13 +39,14 @@ impl FromStr for Ref {
 // <org>/<name>[@revision[/variant]], and sha256:<64 lowercase hex>.
 // Client.open checks an existing folder/.cozytensors path before parsing a Ref.
 
-#[derive(Default)]
 pub struct Open {
     pub revision: Option<String>,
     pub variant: Option<String>,
     pub endpoint: Option<String>,
     pub local_files_only: bool,
+    pub lazy: bool,
 }
+impl Default for Open { fn default() -> Self; } // lazy=true, local_files_only=false
 pub type Progress<'a> = dyn Fn(u64, u64) -> Result<()> + Sync + 'a;
 pub type ConvertProgress<'a> = dyn Fn(&str, u64, u64) -> Result<()> + Sync + 'a;
 
@@ -58,11 +59,11 @@ pub enum Selection {
     Assets { component: String, names: Option<Vec<String>> },
 }
 #[derive(Default)]
-pub struct Fetch<'a> {
+pub struct Download<'a> {
     pub selection: Selection,
     pub priority: u64,
     pub progress: Option<&'a Progress<'a>>,
-    // Callback arguments: held bytes, total bytes. Error cancels this fetch.
+    // Callback arguments: held bytes, total bytes. Error cancels this download.
 }
 pub struct Fetched { pub local: u64, pub volume: u64, pub origin: u64 }
 #[derive(Clone, Debug, Default)]
@@ -79,11 +80,11 @@ pub struct Client { /* private store/config */ }
 impl Client {
     pub fn new(config: Config) -> Result<Client>;
     pub async fn open(&self, name_or_path: &str, options: &Open) -> Result<Checkpoint>;
-    pub async fn snapshot_download(
-        &self, reference: &Ref, want: &Fetch<'_>,
+    pub async fn materialize(
+        &self, reference: &Ref, want: &Download<'_>,
         local_dir: Option<&Path>, local_files_only: bool,
     ) -> Result<PathBuf>;
-    pub async fn hub_download(
+    pub async fn download_file(
         &self, reference: &Ref, filename: &str,
         local_dir: Option<&Path>, local_files_only: bool,
     ) -> Result<PathBuf>;
@@ -108,9 +109,10 @@ impl Checkpoint {
     pub fn component(&self, name: &str) -> Result<&Component>;
     pub fn chunk(&self, index: usize) -> Result<File>;
     pub fn missing(&self, selection: &Selection) -> Result<Vec<ObjectRef>>;
-    pub async fn fetch(&self, want: &Fetch<'_>) -> Result<Fetched>;
+    pub async fn download(&self, want: &Download<'_>) -> Result<Fetched>;
 }
-// Synchronous chunk/read/asset/folder operations use bytes made available by fetch().
+// Open.lazy=false downloads this checkpoint's data before returning.
+// Synchronous chunk/read/asset/folder operations use bytes made available by download().
 // view() retains its source and availability state for the byte engine.
 
 #[derive(Clone)]
@@ -225,7 +227,7 @@ impl ComponentWriter<'_> {
     pub fn has(&self, key: &str) -> Result<bool>;
 }
 pub enum Format { Safetensors, Cozytensors }
-pub fn export(checkpoint: &Checkpoint, dir: &Path, format: Format,
+pub async fn export(checkpoint: &Checkpoint, dir: &Path, format: Format,
     dequantize: Option<Dtype>) -> Result<Vec<String>>;
 ```
 

@@ -31,12 +31,22 @@ checkpoint = tensorfs.open("me/model", revision="1.0", variant="bf16")
 weight = checkpoint.components["unet"].tensors.read("conv_in.weight")
 ```
 
-`open` returns a `Checkpoint`. It fetches metadata first; reading tensors fetches the
-objects those tensors need. `revision` selects a release or immutable reference;
+`open` returns a `Checkpoint`. By default (`lazy=True`), it loads metadata; reading
+tensors then downloads the objects those tensors need. `revision` selects a release or immutable reference;
 `variant` selects a representation such as `bf16` or `int8`. Without a variant, a
 single-variant tree is unambiguous; a multi-variant tree requires a choice. No separate
 download call is required. The same `open` accepts a local `.cozytensors` header or an
 explicitly materialized folder; those are optional input forms.
+
+To download the complete checkpoint into the shared store before continuing:
+
+```python
+checkpoint = tensorfs.open("me/model", lazy=False)
+```
+
+This waits for all declared chunks and component assets. It does not create a folder,
+unpack quantized weights or place them on a GPU. To preload only selected components,
+open lazily and call `checkpoint.download(components=["unet"])`.
 
 For a private model, pass `token=...`. Other options are `endpoint`, `cache_dir`,
 `local_files_only` and `ca_der` (private CA bytes). `local_files_only=True` forbids network
@@ -194,19 +204,19 @@ The destination determines the number of bytes copied. `offset` is a byte offset
 `role` selects an encoded part. Without a role, encoded weights are decoded. This call
 does not convert to the destination's dtype; provide the appropriate size and representation.
 
-### Prefetch, verify and manage a checkpoint
+### Download, verify and manage a checkpoint
 
 ```python
 def on_progress(stage, completed, total):
     print(f"{stage}: {completed}/{total}")
 
-checkpoint.fetch(components=["unet"], priority=0, progress=on_progress)
+checkpoint.download(components=["unet"], priority=0, progress=on_progress)
 ```
 
-`fetch` returns when all requested chunks and supporting files are verified and locally
+`download` returns when all requested chunks and supporting files are verified and locally
 available, or raises an error. The open checkpoint retains them. Closing its last handle
 allows ordinary cache policy to apply again; saving a checkpoint uses durable retention.
-Progress callbacks receive `(stage, completed, total)`; fetch counts are locally available
+Progress callbacks receive `(stage, completed, total)`; download counts are locally available
 bytes out of requested bytes, while conversion counts are tensors.
 
 For optional availability inspection or an explicit integrity audit:
@@ -221,7 +231,7 @@ print(report.ok, report.missing, report.corrupt)
 and hashes local objects, returning a `VerificationReport` with separate `missing` and
 `corrupt` object-reference lists. `ok` is true when both are empty. Verification never
 downloads, repairs or deletes data; other I/O failures raise the usual typed error.
-There is no need to call it after every fetch: incoming data is already verified when
+There is no need to call it after every download: incoming data is already verified when
 admitted to the store.
 
 All three methods accept the same component selection. `None` covers the checkpoint's
@@ -250,6 +260,22 @@ Use `with tensorfs.open(...) as checkpoint:` for automatic close. `Array` implem
 `__dlpack__` and `__dlpack_device__`, including stream/device/copy negotiation. Objects
 provide normal debug representations (`repr`); an `Encoding` also has a string form.
 These representations are not serialization formats.
+
+### Use TensorFS inside an async application
+
+The Python API is synchronous: `open`, `download` and `read` wait for their results.
+The native engine can still overlap work internally. In an asyncio application, move
+the blocking call to a worker thread so the event loop remains responsive:
+
+```python
+import asyncio
+
+async def load_model():
+    return await asyncio.to_thread(tensorfs.open, "me/model", lazy=False)
+```
+
+The same pattern works for `checkpoint.download` and tensor reads. Cancelling the
+await does not automatically stop an operation already running in the worker thread.
 
 ### Advanced: inspect stored ranges
 
@@ -440,7 +466,7 @@ does not accept `dequantize`.
 The export contains the selected checkpoint and any known repository files. A checkpoint
 opened from a bare header has no enclosing tree to supply a README, LICENSE or other
 variants. A selected-checkpoint export is not a complete multi-variant tree snapshot;
-use `snapshot_download` when you need to materialize repository content.
+use `materialize` when you need to materialize repository content.
 
 #### Compatibility export for legacy file-based libraries
 
@@ -462,17 +488,17 @@ weights. Original filenames are preserved internally for compatibility. The full
 #### Download files or publish a folder
 
 ```python
-folder = tensorfs.snapshot_download("me/model", variant="bf16")
-license_path = tensorfs.hub_download("me/model", "LICENSE")
+folder = tensorfs.materialize("me/model", variant="bf16")
+license_path = tensorfs.download_file("me/model", "LICENSE")
 tree_id = tensorfs.upload_folder(repo_id="me/model", folder_path="./portable", token=my_token)
 ```
 
 `my_token` in the examples is a credential you obtained for your endpoint.
 
-`snapshot_download` is an explicit filesystem escape hatch, not the normal loading path.
+`materialize` is an explicit filesystem escape hatch, not the normal loading path.
 It returns a folder; options are `revision`, `variant`, `components`,
 `local_dir`, `local_files_only`, `cache_dir`, `endpoint`, `token` and `ca_der`. With no
-variant it downloads all variants. `hub_download` returns one file path and accepts the
+variant it downloads all variants. `download_file` returns one file path and accepts the
 same location/authentication options, without component or variant selection.
 
 `upload_folder` returns the exact published tree id. Its options are `revision`, `token`,
@@ -499,13 +525,20 @@ A conflict can cause the callback to run again, so it must tolerate retries.
 | Entry point | Returns |
 |---|---|
 | `configure` | `None` |
-| `open` | `Checkpoint` |
+| `open` | `Checkpoint`; `lazy=True` loads metadata, `lazy=False` waits for all checkpoint data locally |
 | `convert` | `Checkpoint` |
 | `resolve_source` | Pinned source string |
 | `export` | List of written paths |
-| `snapshot_download` | Local folder path |
-| `hub_download` | Local file path |
+| `materialize` | Local folder path |
+| `download_file` | Local file path |
 | `upload_folder` | Published tree id |
+
+Normal loading uses `open` followed by component tensor reads. Use
+`checkpoint.download(components=...)` to preload data into the shared store;
+`checkpoint.missing(components=...)` inspects availability, and
+`checkpoint.verify(components=...)` returns a `VerificationReport` for an explicit local
+integrity audit. `materialize` and `download_file` are optional filesystem conveniences.
+All of these Python calls are synchronous.
 
 The returned data types are `Checkpoint`, `Pipeline`, `Component`, `Tensors`,
 `TensorMetadata`, `Encoding`, `Array`, `Encoded` and `VerificationReport`. Writing uses `Writer` and `ComponentWriter`;
