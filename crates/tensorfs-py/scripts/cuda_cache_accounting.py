@@ -1,6 +1,7 @@
 """Actual CUDA allocations must distinguish managed caches from retained package data."""
 
 import torch
+from tensorfs.varena import VarenaError
 from tensorfs.varena.torch import Memory
 
 assert torch.cuda.device_count() == 1
@@ -78,7 +79,7 @@ try:
     assert memory.native is not None
     try:
         memory.native.stats(failed.native_id)
-    except Exception as error:
+    except VarenaError as error:
         assert "unknown request" in str(error)
     else:
         raise AssertionError("failed cleanup retained an active native request")
