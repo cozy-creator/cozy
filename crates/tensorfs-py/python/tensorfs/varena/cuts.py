@@ -4,8 +4,9 @@ An op out of device memory runs again, each try strictly smaller (no timers; fre
 progress): rungs 1-2, the innermost cut around it finer, its own bands, rung 4, else `exhausted`.
 Cuts are exact and keep results on the device; the size that fit is remembered per shape key
 (the memo) and applied up front after. A block whose first run wrote no tensor that existed before
-it and changed none of its attributes runs bare; out of memory it gets its generators and declared
-state back and runs again under the dispatch layer, which catches other blocks' ops at the op.
+it, joined no collective and changed none of its attributes runs bare; out of memory it gets its
+generators and declared state back and runs again under the dispatch layer, which catches other
+blocks' ops at the op.
 """
 
 from __future__ import annotations
@@ -44,6 +45,8 @@ _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40
 #: diffusers' token-wise feed-forwards and the activation projections inside them
 _FFN = frozenset({"FeedForward", "GELU", "GEGLU", "SwiGLU", "ApproximateGELU", "LinearActivation"})
 _PLAIN = (int, float, bool, str, bytes, type(None))
+#: ops another GPU waits on: a block that runs one never runs again on this GPU alone
+_COLLECTIVES = frozenset({"c10d", "_c10d_functional", "_c10d_functional_autograd"})
 _MISSING = object()
 
 
@@ -529,8 +532,8 @@ def _trait(func: OpOverload) -> Trait:
 
 @dataclass(eq=False, slots=True)
 class _Journal:
-    """A block's first run: the storages its ops made, whether one wrote into any other, and
-    the generators its seeded ops drew from."""
+    """A block's first run: the storages its ops made, whether one wrote into any other or
+    joined a collective, and the generators its seeded ops drew from."""
 
     made: set[int] = field(default_factory=set)
     wrote: bool = False
@@ -538,6 +541,7 @@ class _Journal:
 
     def before(self, func: OpOverload, args: Args, kwargs: Kwargs) -> None:
         writes, seeded, _, _ = _trait(func)
+        self.wrote |= func.namespace in _COLLECTIVES
         if writes and not self.wrote:
             written = [args[i] if i < len(args) else kwargs.get(n) for i, n in writes]
             self.wrote = any(p and p not in self.made for p in map(_storage, _tensors(written)))
