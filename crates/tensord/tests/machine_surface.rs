@@ -1189,10 +1189,27 @@ mod v1_api {
             let result: serde_json::Value = json(&done.result);
             served.push((result["pid"].as_u64().unwrap(), result["served"].as_u64().unwrap()));
         }
+        // An idle deviceless executor goes back to the host only under host memory pressure
+        // (shared mode, a stall anywhere on the host), and the machine logs each such give-back.
+        // A busy test host can stall, so a call may start a new executor only after one.
+        let gave = walkdir(&machine.root)
+            .into_iter()
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("memory.log")))
+            .filter_map(|p| fs::read_to_string(p).ok())
+            .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
+            .filter(|line| line.contains("\"event\":\"host_pressure\"") && line.contains("\"gave\":true"))
+            .count();
+        let mut switches = 0;
         for (ordinal, (pid, count)) in served.iter().enumerate() {
-            assert_eq!(*pid, served[0].0, "one executor served every sequential call: {served:?}");
-            assert_eq!(*count, ordinal as u64 + 1, "{served:?}");
+            match ordinal > 0 && *pid != served[ordinal - 1].0 {
+                true => {
+                    switches += 1;
+                    assert_eq!(*count, 1, "a new executor starts its own count: {served:?}");
+                }
+                false => assert_eq!(*count, served.get(ordinal.wrapping_sub(1)).map_or(1, |p| p.1 + 1), "{served:?}"),
+            }
         }
+        assert!(switches <= gave, "{switches} executor switches but {gave} host-pressure give-backs: {served:?}");
         let _ = fs::remove_dir_all(tools);
     }
 
@@ -1492,11 +1509,11 @@ mod v1_api {
             let done = settle(&client, &all, id, spec(v1::RunKind::Call, "0.2.0", "resident")).await;
             assert_eq!(done.status, "succeeded", "{done:?}");
             let memory = memory(&done);
-            let steps = memory["steps"].as_array().cloned().unwrap_or_default();
+            let steps = memory["stats"]["rows"].as_array().expect("measured request rows");
             assert!(!steps.is_empty(), "{id}: {memory}");
-            for step in &steps {
-                assert_eq!(step["streamed"].as_u64().unwrap_or(0), 0, "{id}: {memory}");
-                assert!(first || step["paged_in"].as_u64().unwrap_or(0) == 0, "{id}: {memory}");
+            for step in steps {
+                assert_eq!(step["streamed"].as_u64().expect("measured streamed bytes"), 0, "{id}: {memory}");
+                assert!(first || step["paged_in"].as_u64().expect("measured paged-in bytes") == 0, "{id}: {memory}");
             }
         }
         let _ = fs::remove_dir_all(source);

@@ -6,7 +6,7 @@
 use platform::process::Exact;
 use tensord::{
     device_executor::{
-        Baseline, Binding, DeviceCommand, DeviceExecutor, EndedBeforeStart,
+        Baseline, Binding, Budgets, DeviceCommand, DeviceExecutor, EndedBeforeStart,
         ExecutorConfig, Frame,
     },
     launch_identity::Seal,
@@ -85,8 +85,6 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
             import_only: false,
             call_interfaces: vec![],
             constructions: Vec::new(),
-            ledgers: 0,
-            memory_mode: tensord::device_executor::MemoryMode::Shared,
         },
         DeviceCommand::Load {
             tensorfs: None,
@@ -99,8 +97,13 @@ fn launch(generation: &Generation, hold: &File) -> (DeviceExecutor, PathBuf, Sea
                 package_interface: interface.display().to_string(),
                 ..Binding::default()
             }),
+            budgets: Budgets::default(),
             models: Vec::new(),
+            authorized_device_limit_bytes: None,
             attention_pin: String::new(),
+            device_weights: false,
+            cap_bytes: None,
+            pinned_bytes: None,
         },
         DeviceCommand::Activate {
             construction: "lifecycle".into(),
@@ -149,8 +152,13 @@ fn invoke(
             deadline_s: None,
             attention_kernel: String::new(),
             bits: 0,
+            cap_bytes: None,
             inputs: Default::default(),
             trees: Default::default(),
+            floor_bytes: None,
+            activation_bytes: Default::default(),
+            squeezed_bytes: Default::default(),
+            device_weights: None,
             sources: Default::default(),
         },
         &mut Baseline,
@@ -488,8 +496,6 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
             import_only: false,
             call_interfaces: vec![],
             constructions: Vec::new(),
-            ledgers: 0,
-            memory_mode: tensord::device_executor::MemoryMode::Shared,
         },
         DeviceCommand::Load {
             tensorfs: None,
@@ -502,8 +508,13 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
                 package_interface: interface.display().to_string(),
                 ..Binding::default()
             }),
+            budgets: Budgets::default(),
             models: Vec::new(),
+            authorized_device_limit_bytes: None,
             attention_pin: String::new(),
+            device_weights: false,
+            cap_bytes: None,
+            pinned_bytes: None,
         },
         DeviceCommand::Activate {
             construction: "lifecycle".into(),
@@ -554,6 +565,11 @@ fn foreign_identity_executor_is_contained_and_keeps_its_hold_and_caches() {
                 deadline_s: None,
                 attention_kernel: String::new(),
                 bits: 0,
+                cap_bytes: None,
+                floor_bytes: None,
+                activation_bytes: Default::default(),
+                squeezed_bytes: Default::default(),
+                device_weights: None,
                 sources: Default::default(),
             },
             &mut Baseline,
