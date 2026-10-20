@@ -305,6 +305,23 @@ impl Runs {
         let thread = std::thread::Builder::new().name(format!("prepare-{run}"));
         thread.spawn(move || {
             let stoppable = this.service.engine.stoppable(&run);
+            // Nothing moving past its learned patience fails it `no_progress`, at once: a fetch
+            // stuck in a read may never return to fail it, and its rental must start idling.
+            let (done, finished) = std::sync::mpsc::channel::<()>();
+            let (engine, judged, stop) = (this.service.engine.clone(), run.clone(), stoppable.stop.clone());
+            let judge = std::thread::Builder::new().name(format!("judge-{run}")).spawn(move || {
+                let waits = || engine.get(&judged).is_ok_and(|record| record.waiting.is_some());
+                if let Some(verdict) = crate::process::judge_preparation(&stop, &finished, waits) {
+                    let failure = Failure::machine("no_progress", verdict);
+                    if let Err(error) = engine.end_preparation(&judged, Outcome::Failed(failure)) {
+                        tracing::warn!("run {judged}: its stalled preparation did not end: {error}");
+                    }
+                    stop.cancel();
+                }
+            });
+            if let Err(error) = judge {
+                tracing::warn!("run {run}: its preparation is not judged: {error}");
+            }
             // A panic (a thread the container's task cap refused) ends the run FAILED: no
             // preparation outlives the thread that would end it.
             let prepared = std::panic::AssertUnwindSafe(|| this.prepare(&actor, &run, spec, &stoppable));
@@ -313,6 +330,7 @@ impl Runs {
                     .or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()));
                 Err(refused("preparation_failed", text.unwrap_or_else(|| "the preparation panicked".into())))
             });
+            drop(done);
             let ended = match outcome {
                 Ok(None) => Ok(()),
                 Ok(Some(result)) => this.service.engine.end_preparation(&run, Outcome::Completed(result)).map(drop),
@@ -463,11 +481,12 @@ impl Runs {
     /// The run's code and models made ready: Ok(None) once it is dispatchable, Ok(Some) for a
     /// warm run's result.
     fn prepare(&self, actor: &str, id: &str, spec: Spec, stoppable: &Stoppable) -> Result<Option<ResultRecord>, Refused> {
-        let engine = self.service.engine.clone();
+        let (engine, stop) = (self.service.engine.clone(), stoppable.stop.clone());
         let run = id.to_string();
         // Byte counts arrive per chunk: a new stage shows at once, bytes at most 4 times a second.
         let last = std::sync::Mutex::new((String::new(), std::time::Instant::now()));
         let observe = Arc::new(move |stage: &str, done: u64, total: u64| {
+            stop.moved();
             let mut last = last.lock().unwrap();
             if last.0 == stage && last.1.elapsed() < std::time::Duration::from_millis(250) && done < total {
                 return;
@@ -1647,7 +1666,7 @@ mod tests {
         let failed = settled(&runs.service.engine, &accepted.id);
         assert_eq!(failed.state, State::Failed);
         let failure = failed.failure.unwrap();
-        assert!(failure.contains("package_installation_stalled") && failure.contains("no measurable progress"), "{failure}");
+        assert!(failure.contains("no_progress") && failure.contains("no measurable progress"), "{failure}");
         assert!(gone(backend));
         let _ = fs::remove_dir_all(root);
     }
