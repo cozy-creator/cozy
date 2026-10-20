@@ -184,11 +184,13 @@ enum Dest {
         variant: String,
         cache: Option<Store>,
     },
-    /// Objects sent as they seal; at commit the header and tree, a checkpoint of repo `name`.
+    /// Objects sent as they seal; at commit the header and tree, a commit of repo `name` that
+    /// tag `tag` moves to.
     Endpoint {
         store: Store,
         stream: Arc<Stream>,
         name: String,
+        tag: String,
         variant: String,
     },
 }
@@ -249,18 +251,21 @@ impl Store {
         Writer::open(Dest::Store(self.clone()), writers.join(name), key, base)
     }
 
-    /// A writer of `variant` whose objects go to `stream` as they seal and whose commit adds a
-    /// tree of it (with its repo files) to repo `name`'s checkpoints there. The local checkpoint
-    /// commits first and remains available when the upload fails.
-    pub fn streaming_writer(&self, stream: Arc<Stream>, name: &str, variant: &str, base: Option<&Checkpoint>) -> Result<Writer> {
-        self.streaming_writer_resumable(stream, name, variant, base, None)
+    /// A writer of `variant` whose objects go to `stream` as they seal and whose commit makes a
+    /// tree of it (with its repo files) a commit of repo `name` there, moving tag `tag` to it.
+    /// The local checkpoint commits first and remains available when the upload fails.
+    pub fn streaming_writer(&self, stream: Arc<Stream>, name: &str, tag: &str, variant: &str, base: Option<&Checkpoint>) -> Result<Writer> {
+        self.streaming_writer_resumable(stream, name, tag, variant, base, None)
     }
 
-    pub(crate) fn streaming_writer_resumable(&self, stream: Arc<Stream>, name: &str, variant: &str, base: Option<&Checkpoint>, key: Option<&str>) -> Result<Writer> {
+    pub(crate) fn streaming_writer_resumable(&self, stream: Arc<Stream>, name: &str, tag: &str, variant: &str, base: Option<&Checkpoint>, key: Option<&str>) -> Result<Writer> {
         format::check_file(&variant_path(variant))?;
+        if !format::tag_name(tag) {
+            return Err(bad(format!("{tag:?} is not a tag name")));
+        }
         // Reuse the existing keyed journal, kernel fence, replay and retention machinery.
         let mut writer = self.writer(base, key)?;
-        writer.dest = Dest::Endpoint { store: self.clone(), stream, name: name.to_owned(), variant: variant.to_owned() };
+        writer.dest = Dest::Endpoint { store: self.clone(), stream, name: name.to_owned(), tag: tag.to_owned(), variant: variant.to_owned() };
         Ok(writer)
     }
 
@@ -602,11 +607,11 @@ impl Writer {
                 durable::replace(&at, &header, 0o644).map_err(|e| fail("write", &at)(e.into()))?;
                 ObjectRef::of(&header)
             }
-            Dest::Endpoint { store, stream, name, variant } => {
+            Dest::Endpoint { store, stream, name, tag, variant } => {
                 let id = self.admit_header(store, &header)?;
                 store.used(&id.sha256, std::iter::once(&id).chain(&objects).chain(self.repo.values()))?;
                 self.committed = Some(id.clone());
-                self.published = Some(stream.commit(name, variant, header, &self.repo).map_err(sent)?);
+                self.published = Some(stream.commit(name, tag, variant, header, &self.repo).map_err(sent)?);
                 id
             }
         };

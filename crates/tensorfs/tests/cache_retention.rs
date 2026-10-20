@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tensorfs::format::{
-    Body, Component, Dtype, Header, Location, ObjectRef, Release, Repo, Tensor, Tree,
+    Body, Component, Dtype, Header, Location, ObjectRef, Repo, Tag, Tensor, Tree,
 };
 use tensorfs::io::{
     source::{IoTally, Item, ItemSource, Mode, Source},
@@ -125,12 +125,12 @@ fn fixture(scratch: &Scratch) -> Fixture {
         .update_ref("local/keep", |_| {
             Some(Repo {
                 name: "local/keep".into(),
-                releases: vec![Release {
-                    version: "1.0".into(),
-                    tree: local_tree,
+                tags: vec![Tag {
+                    name: "1.0".into(),
+                    commit: local_tree,
+                    public: true,
                     yanked: false,
                 }],
-                ..Default::default()
             })
         })
         .unwrap();
@@ -570,6 +570,7 @@ fn writer_results_expire_but_local_replays_remain() {
                     .streaming_writer(
                         Arc::new(Stream::new(endpoint, runtime.handle().clone())),
                         "acme/result",
+                        &format!("run-{i}"),
                         "",
                         None,
                     )
@@ -627,9 +628,9 @@ fn writer_results_expire_but_local_replays_remain() {
         if mode == "streamed" {
             let remote = Store::open(scratch.0.join("remote")).unwrap();
             let repo = remote.get_ref("acme/result").unwrap().unwrap();
-            assert_eq!(repo.checkpoints.len(), 2);
-            for tree in repo.checkpoints {
-                for object in remote.closure(&tree).unwrap() {
+            assert_eq!(repo.tags.len(), 2);
+            for tag in repo.tags {
+                for object in remote.closure(&tag.commit).unwrap() {
                     assert!(remote.verify(&object).unwrap());
                 }
             }
@@ -655,18 +656,18 @@ fn writer_results_expire_but_local_replays_remain() {
     raw.update_ref("local/derived", |_| {
         Some(Repo {
             name: "local/derived".into(),
-            releases: vec![Release {
-                version: "replay-key".into(),
-                tree: root,
+            tags: vec![Tag {
+                name: "replay-key".into(),
+                commit: root,
+                public: false,
                 yanked: false,
             }],
-            ..Default::default()
         })
     })
     .unwrap();
     expire(&raw);
     let repo = raw.get_ref("local/derived").unwrap().unwrap();
-    let ck = raw.variant(&repo.releases[0].tree, None).unwrap();
+    let ck = raw.variant(&repo.tags[0].commit, None).unwrap();
     assert_eq!(ck.read("c", "weight").unwrap(), b"saved");
 }
 
@@ -690,6 +691,7 @@ fn failed_stream_retains_local_bytes_until_the_last_holder() {
         .streaming_writer(
             Arc::new(Stream::new(endpoint, runtime.handle().clone())),
             "acme/failed",
+            "main",
             "",
             None,
         )

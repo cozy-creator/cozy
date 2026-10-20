@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tensorfs::format::{
-    variant_of, Body, Component, Dtype, Header, Location, ObjectRef, Release, Repo, Tensor, Tree,
+    variant_of, Body, Component, Dtype, Header, Location, ObjectRef, Repo, Tag, Tensor, Tree,
 };
 use tensorfs::store::{fault, Durability, Store};
 
@@ -92,12 +92,12 @@ fn checkpoint(store: &Store, chunks: &[Vec<u8>], files: &[(&str, Vec<u8>)]) -> O
 fn repo(name: &str, tree: ObjectRef) -> Repo {
     Repo {
         name: name.into(),
-        releases: vec![Release {
-            version: "1.0".into(),
-            tree,
+        tags: vec![Tag {
+            name: "1.0".into(),
+            commit: tree,
+            public: true,
             yanked: false,
         }],
-        ..Default::default()
     }
 }
 
@@ -121,7 +121,7 @@ fn closure(store: &Store, root: &ObjectRef) -> BTreeSet<ObjectRef> {
 /// Everything a `local/` ref reaches.
 fn live(store: &Store) -> BTreeSet<ObjectRef> {
     let local = store.refs().unwrap().into_iter().filter(|r| r.name.starts_with("local/"));
-    let roots: Vec<ObjectRef> = local.flat_map(|r| r.releases).map(|r| r.tree).collect();
+    let roots: Vec<ObjectRef> = local.flat_map(|r| r.tags).map(|t| t.commit).collect();
     roots.iter().flat_map(|root| closure(store, root)).collect()
 }
 
@@ -281,7 +281,7 @@ fn child() {
                 .map(|o| store.put_bytes(o).unwrap())
                 .collect();
             name_locally(&store, "local/a", &roots);
-            let tree = store.get_ref("local/a").unwrap().unwrap().releases[0].tree.clone();
+            let tree = store.get_ref("local/a").unwrap().unwrap().tags[0].commit.clone();
             store.update_ref("local/b", |_| Some(repo("local/b", tree))).unwrap();
         }
     }
@@ -435,8 +435,8 @@ fn kill_during_a_record_commit_keeps_the_old_record_or_the_new() {
     );
 
     let lane = |store: &Store| {
-        store.get_ref("LOCAL/Model").unwrap().unwrap().releases[0]
-            .tree
+        store.get_ref("LOCAL/Model").unwrap().unwrap().tags[0]
+            .commit
             .clone()
     };
     let job = Job::Ref("local/model".into(), second.clone());
@@ -634,7 +634,7 @@ fn a_writer_racing_a_collector_loses_nothing_young_or_rooted() {
     check(&store);
     for i in 0..rounds {
         let named = store.get_ref(&format!("local/w-{i}")).unwrap().unwrap();
-        let files = store.tree(&named.releases[0].tree).unwrap().files;
+        let files = store.tree(&named.tags[0].commit).unwrap().files;
         assert_eq!(files["1.bin"], reused[i % 20]);
         for object in files.values() {
             assert!(store.verify(object).unwrap(), "rooted object lost");
