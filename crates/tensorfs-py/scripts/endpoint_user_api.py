@@ -319,7 +319,7 @@ assert runtime_read.id == runtime_retained.id
 assert runtime_read.components["model"].tensors.read("weight").tobytes() == b"runtime-retained"
 
 entered, release, inspecting = threading.Event(), threading.Event(), threading.Event()
-failures = []
+failures, committed, inspections = [], [], []
 
 
 class BlockingOwner(Credential):
@@ -337,19 +337,34 @@ component.put("threaded", b"two threads", dtype="U8", shape=[11])
 
 def commit():
     try:
-        streaming.commit()
+        committed.append(streaming.commit())
     except BaseException as error:
-        failures.append(error)
+        failures.append(("commit", error))
 
 
 def inspect_and_abandon():
     inspecting.set()
+    for name, operation in (("writer.has", lambda: streaming.has("model", "threaded")),
+                            ("component.has", lambda: component.has("threaded"))):
+        try:
+            assert operation() is True, "the live writer lost its tensor"
+            inspections.append({"operation": name, "state": "live"})
+        except tensorfs.InvalidError as error:
+            # A read blocked behind commit can observe its completed/closed state.
+            # No other InvalidError, ConflictError or unexpected failure is accepted.
+            if (type(error) is tensorfs.InvalidError and error.code == tensorfs.InvalidError.code
+                    and error.detail == "the writer has committed or been abandoned"):
+                inspections.append({"operation": name, "state": "closed"})
+            else:
+                failures.append((name, error))
+        except BaseException as error:
+            failures.append((name, error))
+    # Exercise abandon even when either inspection correctly observes a closed writer.
     try:
-        streaming.has("model", "threaded")
-        component.has("threaded")
-        streaming.abandon()
+        assert streaming.abandon() is None
+        inspections.append({"operation": "abandon", "state": "completed"})
     except BaseException as error:
-        failures.append(error)
+        failures.append(("abandon", error))
 
 
 committer = threading.Thread(target=commit)
@@ -364,6 +379,19 @@ committer.join(20)
 inspector.join(20)
 assert not committer.is_alive() and not inspector.is_alive(), "writer and token callback deadlocked"
 assert not failures, failures
+assert [row["operation"] for row in inspections] == ["writer.has", "component.has", "abandon"]
+assert len(committed) == 1, "the commit thread did not return a checkpoint"
+threaded = committed[0]
+assert threaded.tree is not None and threaded.tree_ref is not None
+assert streaming.commit() is threaded, "the public writer lost its committed result"
+assert threaded.components["model"].tensors.read("threaded").tobytes() == b"two threads"
+threaded_owner = owner_endpoint.repo(request["model"])
+assert threaded_owner is not None
+assert any(tree["sha256"] == threaded.tree_ref[0] for tree in threaded_owner[0]["checkpoints"])
+with tensorfs.open(request["model"], revision=threaded.tree, variant="f32",
+                   **{**options, "cache_dir": cache / "threaded-reader"}) as threaded_remote:
+    assert threaded_remote.id == threaded.id
+    assert threaded_remote.components["model"].tensors.read("threaded").tobytes() == b"two threads"
 print(json.dumps({
     "native": native_provenance,
     "runtime": runtime_provenance,
@@ -373,4 +401,6 @@ print(json.dumps({
                         "denial_family": runtime_denial_family},
     "cold_anonymous_read": cold_anonymous_read,
     "failure_families_and_writer_threads": True,
+    "writer_threads": {"inspections": inspections, "header": threaded.id, "tree": threaded.tree,
+                       "commit_succeeded": True, "local_bytes": True, "remote_readback": True},
 }, sort_keys=True))
