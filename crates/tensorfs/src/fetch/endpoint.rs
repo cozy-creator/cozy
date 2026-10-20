@@ -4,9 +4,11 @@
 //! - **Reads.** The repo document with its ETag (conditional GET); objects as Fetcher locations,
 //!   whose redirects the client follows without credentials across origins.
 //! - **Uploads.** Per object HEAD → PUT (to the HEAD's `Location`, else here) → HEAD; `412` means
-//!   present. [`upload_tree`] sends chunks, assets and repo files, then headers, then the tree.
-//! - **Publish.** [`Endpoint::update_repo`] PUTs the whole document under `If-Match` or
-//!   `If-None-Match: *` and, on `412`, reads it again and re-applies the change.
+//!   present. [`upload_tree`] sends chunks, assets and repo files, then headers, then the tree
+//!   (the commit), then moves a tag to it.
+//! - **Refs.** [`Endpoint::update_repo`] PUTs the whole document under `If-Match` or
+//!   `If-None-Match: *` and, on `412`, reads it again and re-applies the change, a bounded number
+//!   of times.
 //! - **A directory** writes through a store over it: objects verified, temp and rename; refs under
 //!   the store's record lock, read and replaced inside it.
 //! - **Weather** (transport failures, 408/425/429/5xx) is asked again at `Retry-After` or a
@@ -27,7 +29,7 @@ use super::net::Uri;
 use serde_json::Value;
 
 use super::net::{join, same_origin, Body, Client, GetError, HeaderMap};
-use super::origin::{release_of, Location, Origin};
+use super::origin::{Location, Origin};
 use super::policy::is_loopback_origin;
 use super::token::{default_for, s3_base, Request, TokenProvider};
 use crate::err::{refuse, Code, Refusal, Result};
@@ -35,6 +37,11 @@ use crate::format::{repo_key, Header, ObjectRef, Repo, Tree};
 use crate::sha256::{digest, hex, hex_digest};
 use crate::store::Store;
 
+/// The tag an upload moves when none is named.
+pub const MAIN: &str = "main";
+/// Conditional writes of one repo document lost to other writers before refusing: each loss is
+/// another writer's progress, so only a crowd this large outlasts it.
+const REPO_WRITES: usize = 64;
 /// The most bytes a repo document may have.
 const REPO_BYTES: usize = 16 << 20;
 /// The Fetcher's tick, and its floor for stillness (120 ticks): nothing moving for less is no
@@ -253,15 +260,15 @@ impl Endpoint {
     }
 
     /// Changes the repo document `name` to what `change` makes of it (`None`: a document with
-    /// no releases and no checkpoints, which deletes the model): a conditional write, with
-    /// `change` applied again to the document as it is whenever another writer won.
+    /// no tags, which deletes the model): a conditional write, with `change` applied again to
+    /// the document as it is whenever another writer won, up to [`REPO_WRITES`] times.
     pub async fn update_repo(
         &self,
         name: &str,
         mut change: impl FnMut(Option<Repo>) -> Result<Option<Repo>>,
     ) -> Result<Repo> {
         let mut sent: Option<Repo> = None;
-        loop {
+        for _ in 0..REPO_WRITES {
             let (old, etag) = match self.repo(name).await? {
                 Some((repo, etag)) => (Some(repo), Some(etag)),
                 None => (None, None),
@@ -274,8 +281,7 @@ impl Endpoint {
             if !new.name.eq_ignore_ascii_case(name) {
                 return refuse(Code::KEY_GRAMMAR, format!("repo {:?} cannot be {name}", new.name));
             }
-            let empty = new.releases.is_empty() && new.checkpoints.is_empty();
-            if old.as_ref() == Some(&new) || (old.is_none() && empty) {
+            if old.as_ref() == Some(&new) || (old.is_none() && new.tags.is_empty()) {
                 return Ok(new);
             }
             let bytes = new.to_json().map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() })?;
@@ -284,6 +290,7 @@ impl Endpoint {
             }
             sent = Some(new);
         }
+        refuse(Code::REPOSITORY_CONFLICT, format!("{name}: {REPO_WRITES} conditional writes lost to other writers"))
     }
 
     /// An object named by digest, including its length, or `None` when absent or unreadable.
@@ -311,6 +318,45 @@ impl Endpoint {
             }
         };
         Ok(Some(object))
+    }
+
+    /// A small object (a tree) read whole, following redirects, and verified.
+    pub async fn document(&self, object: &ObjectRef) -> Result<Vec<u8>> {
+        if object.length > REPO_BYTES as u64 {
+            return refuse(Code::SIZE_CAP, format!("{}: {} B is not a document", object.id(), object.length));
+        }
+        let bytes = match &self.at {
+            At::Dir(root, _) => {
+                let path = root.join(object.key());
+                fs::read(&path).map_err(|e| crate::err::classify_io(path.display().to_string(), e))?
+            }
+            At::Http(base) => {
+                let url = format!("{base}/{}", object.key());
+                let moved = AtomicU64::new(0);
+                let get = async {
+                    let mut answer = self.client.get_authorized(&url, &[], self.token.as_deref()).await?;
+                    match answer.status() {
+                        200 => {}
+                        404 | 410 => return refuse(Code::OBJECT_ABSENT, format!("GET {url}: {}", answer.status())),
+                        status => return refuse(Code::HUB_REFUSED, format!("GET {url}: {status}")),
+                    }
+                    let mut body = Vec::new();
+                    while let Some(frame) = answer.frame().await? {
+                        moved.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                        body.extend_from_slice(&frame);
+                        if body.len() as u64 > object.length {
+                            break;
+                        }
+                    }
+                    Ok(body)
+                };
+                self.watched(get, &moved).await?
+            }
+        };
+        match ObjectRef::of(&bytes) == *object {
+            true => Ok(bytes),
+            false => refuse(Code::OBJECT_ID_MISMATCH, format!("{} does not match its bytes", object.id())),
+        }
     }
 
     /// Whether the endpoint holds `object`.
@@ -518,9 +564,9 @@ impl Endpoint {
 
 #[async_trait]
 impl Origin for Endpoint {
-    async fn resolve(&self, name: &str, release: Option<&str>, _: Option<&str>) -> Result<ObjectRef> {
+    async fn repo_of(&self, name: &str) -> Result<Repo> {
         match self.repo(name).await? {
-            Some((repo, _)) => Ok(release_of(&repo, release)?.1),
+            Some((repo, _)) => Ok(repo),
             None => refuse(Code::REF_NOT_FOUND, format!("no repo {name} at {}", self.url)),
         }
     }
@@ -547,26 +593,19 @@ impl Origin for Endpoint {
     }
 }
 
-/// `repo` (`name`'s, when there is none) naming `tree`: as release `version`, or with none among
-/// the unreleased checkpoints.
-pub fn with_tree(repo: Option<Repo>, name: &str, tree: &ObjectRef, version: Option<&str>) -> Repo {
+/// `repo` (`name`'s, when there is none) with tag `tag` moved to `commit`: an existing tag keeps
+/// its place and flags, a new one is private and last.
+pub fn with_tag(repo: Option<Repo>, name: &str, tag: &str, commit: &ObjectRef) -> Repo {
     let mut repo = repo.unwrap_or_else(|| Repo::new(name));
-    match version {
-        Some(version) => {
-            repo.set_release(version, tree.clone());
-            repo.checkpoints.retain(|c| c != tree);
-        }
-        None if repo.roots().any(|r| r == tree) => {}
-        None => repo.checkpoints.push(tree.clone()),
-    }
+    repo.set_tag(tag, commit.clone());
     repo
 }
 
 /// Sends what `endpoint` lacks of `tree`'s closure in `store` (chunks, assets and repo files,
-/// then headers, then the tree), then names it in repo `name`: as release `version`, or with
-/// none as an unreleased checkpoint.
-pub async fn upload_tree(endpoint: &Endpoint, name: &str, tree: &ObjectRef, store: &Store, version: Option<&str>) -> Result<Uploaded> {
-    upload_tree_with(endpoint, name, tree, store, version, &UploadControl {
+/// then headers, then the tree), then moves tag `tag` of repo `name` to it: the tree is the
+/// commit.
+pub async fn upload_tree(endpoint: &Endpoint, name: &str, tree: &ObjectRef, store: &Store, tag: &str) -> Result<Uploaded> {
+    upload_tree_with(endpoint, name, tree, store, tag, &UploadControl {
         cancelled: &|| false,
         progress: &|_, _| {},
         commit: &|| true,
@@ -584,7 +623,10 @@ pub struct UploadControl<'a> {
 }
 
 /// [`upload_tree`] with cancellation before the ref update, progress, and a final commit gate.
-pub async fn upload_tree_with(endpoint: &Endpoint, name: &str, tree: &ObjectRef, store: &Store, version: Option<&str>, control: &UploadControl<'_>) -> Result<Uploaded> {
+pub async fn upload_tree_with(endpoint: &Endpoint, name: &str, tree: &ObjectRef, store: &Store, tag: &str, control: &UploadControl<'_>) -> Result<Uploaded> {
+    if !crate::format::tag_name(tag) {
+        return refuse(Code::KEY_GRAMMAR, format!("{tag:?} is not a tag name"));
+    }
     let stopped = || Refusal { code: Code::TRANSFER_FAILED, detail: "upload stopped before its ref update; admitted objects remain available".into() };
     if (control.cancelled)() {
         return Err(stopped());
@@ -639,7 +681,7 @@ pub async fn upload_tree_with(endpoint: &Endpoint, name: &str, tree: &ObjectRef,
     }
     let mut converged = false;
     let repo = endpoint.update_repo(name, |old| {
-        let new = with_tree(old.clone(), name, tree, version);
+        let new = with_tag(old.clone(), name, tag, tree);
         converged = old.as_ref() == Some(&new);
         Ok(Some(new))
     }).await?;
@@ -669,7 +711,7 @@ fn put_dir(root: &Path, key: &str, bytes: &[u8], etag: Option<&str>) -> Result<b
 
 /// A writer's objects on their way to an endpoint (`Writer(repo_id=…)`): each is sent (HEAD →
 /// PUT → HEAD) as soon as it is sealed while the writer goes on, at most [`IN_FLIGHT`] at once;
-/// at commit the header, then the tree, then the repo's new checkpoint.
+/// at commit the header, then the tree (the commit), then the tag moved to it.
 /// File-backed objects queue without blocking the caller's runtime. Byte-backed puts and
 /// finalization block, so the finalizer runs outside the runtime that sends.
 pub struct Stream {
@@ -765,8 +807,8 @@ impl Stream {
     }
 
     /// A writer's commit: its `header` as `variant` of a tree with `files`, each sent after
-    /// what it cites, then the tree added to repo `name`'s checkpoints. The exact tree's ref.
-    pub fn commit(&self, name: &str, variant: &str, header: Vec<u8>, files: &BTreeMap<String, ObjectRef>) -> Result<ObjectRef> {
+    /// what it cites, then tag `tag` of repo `name` moved to the tree. The tree's ref.
+    pub fn commit(&self, name: &str, tag: &str, variant: &str, header: Vec<u8>, files: &BTreeMap<String, ObjectRef>) -> Result<ObjectRef> {
         self.flush()?;
         let header = self.put(header)?;
         self.flush()?;
@@ -774,7 +816,7 @@ impl Stream {
         tree.set_variant(variant, header.clone());
         let tree = self.put(tree.to_json().map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() })?)?;
         self.flush()?;
-        let named = self.endpoint.update_repo(name, |old| Ok(Some(with_tree(old, name, &tree, None))));
+        let named = self.endpoint.update_repo(name, |old| Ok(Some(with_tag(old, name, tag, &tree))));
         self.runtime.block_on(named)?;
         Ok(tree)
     }

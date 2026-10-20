@@ -21,10 +21,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub use endpoint::{upload_tree, upload_tree_with, with_tree, Endpoint, Fresh, Payload, Stream, UploadControl, Uploaded};
+pub use endpoint::{upload_tree, upload_tree_with, with_tag, Endpoint, Fresh, Payload, Stream, UploadControl, Uploaded, MAIN};
 pub use net::Client;
 pub(crate) use net::GetError;
-pub use origin::{choose, release_of, variant_of_tree, Chosen, Location, Origin};
+pub use origin::{choose, pick_variant, resolve, variant_of_tree, Chosen, Location, Origin};
 pub use policy::SourcePolicy;
 pub use token::{bearer, SigV4, TokenProvider};
 pub use volume::VolumeOrigin;
@@ -192,17 +192,22 @@ impl Fetcher {
         self.shared.settled().await
     }
 
-    /// `name` at `release` and `variant` from `origin`, the components `want` selects.
+    /// `name` at `revision` (spec §7) and `variant` from `origin`, the components `want` selects.
     pub async fn pull(
         &self,
         origin: &Arc<dyn Origin>,
         name: &str,
-        release: Option<&str>,
+        revision: Option<&str>,
         variant: Option<&str>,
         want: &Want<'_>,
     ) -> Result<Pulled> {
-        let tree = origin.resolve(name, release, variant).await?;
-        self.pull_tree(origin, &tree, variant, want).await
+        let repo = origin.repo_of(name).await?;
+        let chosen = choose(&repo, revision, variant, async |commit: &ObjectRef| {
+            self.objects(origin, std::slice::from_ref(commit), want).await?;
+            Tree::from_json(&self.read(commit).await?).map_err(|e| invalid(commit, e))
+        })
+        .await?;
+        self.pull_tree(origin, &chosen.tag.commit, Some(&chosen.variant), want).await
     }
 
     /// The tree `tree`: its repo files, and its `variant` (its only one when `None`) with the
