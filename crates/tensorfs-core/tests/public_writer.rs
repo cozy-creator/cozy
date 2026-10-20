@@ -190,3 +190,70 @@ async fn public_export_requires_selected_repo_bytes_and_owns_them_after_client_d
     export(&checkpoint, &destination, Format::Safetensors, None).unwrap();
     check_export(&destination);
 }
+
+#[tokio::test]
+async fn same_header_repository_trees_keep_distinct_folders_through_public_upload_and_export() {
+    let scratch = Scratch::new();
+    fs::create_dir_all(scratch.0.join("first")).unwrap();
+    fs::create_dir_all(scratch.0.join("second")).unwrap();
+    let first = fixture(&scratch.0.join("first"));
+    let second = fixture(&scratch.0.join("second"));
+    let second_readme = b"\x85another repository using exactly the same weights";
+    fs::write(second.join("README.bin"), second_readme).unwrap();
+    let endpoint = scratch.0.join("endpoint");
+    let source = client(&scratch.0.join("source-cache"), &endpoint);
+    source
+        .upload_folder(&"acme/first".parse().unwrap(), &first, None)
+        .await
+        .unwrap();
+    source
+        .upload_folder(&"acme/second".parse().unwrap(), &second, None)
+        .await
+        .unwrap();
+    let reader = client(&scratch.0.join("reader-cache"), &endpoint);
+    let a = reader.open("acme/first", &Open::default()).await.unwrap();
+    let b = reader.open("acme/second", &Open::default()).await.unwrap();
+    assert_eq!(a.id(), b.id());
+    assert_ne!(a.tree(), b.tree());
+    a.fetch(&Fetch::default()).await.unwrap();
+    b.fetch(&Fetch::default()).await.unwrap();
+    let a_folder = a.folder().unwrap();
+    let b_folder = b.folder().unwrap();
+    assert_ne!(a_folder, b_folder, "same-header repository files collided");
+    assert_eq!(
+        a_folder.file_name().unwrap(),
+        a.tree().unwrap().sha256.as_str()
+    );
+    assert_eq!(
+        b_folder.file_name().unwrap(),
+        b.tree().unwrap().sha256.as_str()
+    );
+    assert_eq!(fs::read(a_folder.join("README.bin")).unwrap(), README);
+    assert_eq!(
+        fs::read(b_folder.join("README.bin")).unwrap(),
+        second_readme
+    );
+    assert_eq!(
+        reader
+            .upload_folder(&"local/roundtrip".parse().unwrap(), &a_folder, None)
+            .await
+            .unwrap(),
+        *a.tree().unwrap()
+    );
+    let roundtrip = reader
+        .open(
+            "local/roundtrip",
+            &Open {
+                local_files_only: true,
+                ..Open::default()
+            },
+        )
+        .await
+        .unwrap();
+    drop(reader);
+    drop(a);
+    drop(b);
+    let destination = scratch.0.join("export-roundtrip");
+    export(&roundtrip, &destination, Format::Safetensors, None).unwrap();
+    check_export(&destination);
+}

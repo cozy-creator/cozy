@@ -189,8 +189,11 @@ impl Client {
     pub async fn open(&self, name_or_path: &str, options: &Open) -> Result<Checkpoint> {
         let path = Path::new(name_or_path);
         if path.exists() {
+            let path = path
+                .canonicalize()
+                .map_err(|e| io_failure(path.display(), e))?;
             let raw = crate::store2::Checkpoint::folder(
-                path,
+                &path,
                 options.variant.as_deref(),
                 Some(&self.store),
             )?;
@@ -202,7 +205,7 @@ impl Client {
                 // mounted mirror, but never falls through to a remote endpoint.
                 offline: true,
             };
-            return Checkpoint::local(raw, source, path);
+            return Checkpoint::local(raw, source, &path);
         }
         let mut reference: Ref = name_or_path.parse()?;
         if let Some(revision) = &options.revision {

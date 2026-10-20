@@ -267,6 +267,7 @@ impl Remote {
         if let Some(tree) = &tree {
             extra.push(tree.clone());
         }
+        let variant = reference.variant.clone();
         let named = (!reference.repo_id.starts_with("sha256:")).then_some(reference);
         Checkpoint::managed(
             raw,
@@ -275,6 +276,7 @@ impl Remote {
             Some(self.clone()),
             extra,
             self.store.clone(),
+            variant,
         )
     }
 

@@ -11,13 +11,20 @@ use crate::store2::{CacheGuard, Checkpoint as Stored, Store};
 
 use super::{remote::Remote, Fetch, Fetched, Ref, Selection};
 
+struct LocalRepo {
+    root: PathBuf,
+    header: Option<PathBuf>,
+}
+
 struct Data {
     raw: Stored,
     named: Option<Ref>,
     tree: Option<ObjectRef>,
     remote: Option<Remote>,
     store: Store,
-    local_repo: Option<PathBuf>,
+    local_repo: Option<LocalRepo>,
+    variant: Option<String>,
+    _folder: Option<CacheGuard>,
     _extra: CacheGuard,
 }
 
@@ -39,12 +46,15 @@ impl fmt::Debug for Checkpoint {
 
 impl Checkpoint {
     pub(super) fn local(raw: Stored, source: Remote, path: &Path) -> Result<Self> {
-        let local_repo = if path.is_file() {
-            path.parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        } else {
-            path.to_path_buf()
+        let local_repo = LocalRepo {
+            root: if path.is_file() {
+                path.parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
+            } else {
+                path.to_path_buf()
+            },
+            header: path.is_file().then(|| path.to_path_buf()),
         };
         let store = source.store.clone();
         let data = Data {
@@ -55,6 +65,8 @@ impl Checkpoint {
             _extra: store.cache_hold(&[])?,
             store,
             local_repo: Some(local_repo),
+            variant: None,
+            _folder: None,
         };
         Ok(Self::from_data(data))
     }
@@ -66,13 +78,22 @@ impl Checkpoint {
         remote: Option<Remote>,
         extra: Vec<ObjectRef>,
         store: Store,
+        variant: Option<String>,
     ) -> Result<Self> {
+        let extra = store.cache_hold(&extra)?;
+        // Immutable owned directory fencing is acquired before this tree-key path exists.
+        let folder = tree
+            .as_ref()
+            .map(|tree| store.cache_directory(&store.root().join("snapshots").join(&tree.sha256)))
+            .transpose()?;
         Ok(Self::from_data(Data {
             raw,
             named,
             tree,
             remote,
-            _extra: store.cache_hold(&extra)?,
+            _extra: extra,
+            _folder: folder,
+            variant,
             store,
             local_repo: None,
         }))
@@ -229,18 +250,47 @@ impl Checkpoint {
                 repo.insert(path.to_owned(), self.data.store.path(object)?);
             }
         } else if let Some(folder) = &self.data.local_repo {
-            local_repo_files(folder, folder, &mut repo)?;
+            local_repo_files(folder, &folder.root, &mut repo)?;
         }
         self.data.store.cache_preserve_snapshot(dir)?;
         crate::export::safetensors(&self.data.raw, &repo, dir, dequantize)
     }
 
     pub fn folder(&self) -> Result<PathBuf> {
-        let variant = self
-            .named()
-            .and_then(|r| r.variant.as_deref())
-            .unwrap_or("");
-        Ok(self.data.raw.path_for(variant)?)
+        if let Some(local) = &self.data.local_repo {
+            return Ok(local.root.clone());
+        }
+        if let Some(tree) = &self.data.tree {
+            if let Some(missing) = self.missing(&Selection::All)?.first() {
+                return fail(
+                    Kind::NotFound,
+                    format!(
+                        "{} is not present; fetch it asynchronously first",
+                        missing.id()
+                    ),
+                );
+            }
+            let parsed = self.data.store.tree(tree)?;
+            let variant = match self.data.variant.as_deref() {
+                Some(variant) => variant.to_owned(),
+                None => parsed
+                    .variants()
+                    .find(|(_, header)| *header == self.id())
+                    .map(|(variant, _)| variant.to_owned())
+                    .ok_or_else(|| crate::failure::Failure {
+                        kind: Kind::Integrity,
+                        detail: "checkpoint header is not a variant of its source tree".into(),
+                    })?,
+            };
+            let dir = self.data.store.root().join("snapshots").join(&tree.sha256);
+            self.data.store.snapshot(tree, &dir, Some(&[variant]))?;
+            self.data.store.cache_snapshot(&dir)?;
+            return Ok(dir);
+        }
+        Ok(self
+            .data
+            .raw
+            .path_for(self.data.variant.as_deref().unwrap_or(""))?)
     }
 
     pub fn tree(&self) -> Option<&ObjectRef> {
@@ -384,21 +434,28 @@ impl Component {
 
 // A plain D10 folder stores repository files outside chunks/ and variant headers. Keep paths
 // until export, rather than admitting every payload during metadata-only Client::open.
-fn local_repo_files(root: &Path, folder: &Path, out: &mut BTreeMap<String, PathBuf>) -> Result<()> {
+fn local_repo_files(
+    source: &LocalRepo,
+    folder: &Path,
+    out: &mut BTreeMap<String, PathBuf>,
+) -> Result<()> {
     for entry in fs::read_dir(folder).map_err(|e| super::io_failure(folder.display(), e))? {
         let entry = entry.map_err(|e| super::io_failure(folder.display(), e))?;
-        if folder == root && entry.file_name() == format::CHUNKS_DIR {
+        if folder == source.root && entry.file_name() == format::CHUNKS_DIR {
             continue;
         }
         let path = entry.path();
+        if source.header.as_ref() == Some(&path) {
+            continue;
+        }
         let kind = entry
             .file_type()
             .map_err(|e| super::io_failure(path.display(), e))?;
         if kind.is_dir() {
-            local_repo_files(root, &path, out)?;
+            local_repo_files(source, &path, out)?;
         } else if kind.is_file() {
             let name = path
-                .strip_prefix(root)
+                .strip_prefix(&source.root)
                 .expect("walk remains under its root")
                 .to_str()
                 .ok_or_else(|| crate::failure::Failure {
