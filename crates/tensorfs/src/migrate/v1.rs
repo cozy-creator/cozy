@@ -1,8 +1,9 @@
 //! The last cozytensors/1 (v1) reader, for A11 alone and deleted with it (owner, 2026-10-20: no
 //! public 0.12, so production's v1 lanes go straight to D10). A v1 lane becomes D10 tensors
 //! citing its bytes where they already are: a part's objects (one per 64 MiB) become consecutive
-//! chunks, and an inline part a range of the v1 header object, itself a blob. Nothing is
-//! repacked. Names and construction order follow U12's rules (D4); specs map to D10 schemes.
+//! chunks. Inline parts, tiny and at unaligned header offsets, which D10 cannot cite, are copied
+//! byte for byte into one pack per lane, each at a 4 KiB boundary: the lane's only new chunk.
+//! Names and construction order follow U12's rules (D4); specs map to D10 schemes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -10,6 +11,7 @@ use serde_json::{json, Value as Json};
 
 use crate::failure::{fail, Kind, Result};
 use crate::format::decode::{check_metadata, PartMetadata};
+use crate::format::layout::ALIGN;
 use crate::format::{Body, Dtype, Encoding, GlobalScale, Location, NibbleOrder, ObjectRef, Part, ScaleLayout, Tensor};
 use crate::import::{constructor_order, order, tables};
 use crate::sha256::hex_digest;
@@ -21,9 +23,10 @@ pub struct Manifest {
 }
 
 /// A v1 lane in D10's terms: chunks, and components of tensors (renamed, in construction
-/// order); its files by D10 path; and what changed.
+/// order); its files by D10 path; the inline parts' pack, when it has any; and what changed.
 pub struct Lane {
     pub chunks: Vec<ObjectRef>,
+    pub pack: Option<(ObjectRef, Vec<u8>)>,
     pub components: Vec<(String, Vec<Tensor>)>,
     pub files: BTreeMap<String, File>,
     pub report: Json,
@@ -296,20 +299,32 @@ pub fn lane(m: &Manifest, raw: &[u8]) -> Result<Lane> {
     let files = files(m, &h, &mut names)?;
     let order = ordering(&h, &names);
     let (mut chunks, mut runs): (Vec<ObjectRef>, HashMap<Vec<ObjectRef>, u64>) = (Vec::new(), HashMap::new());
+    let (mut pack, mut pack_at): (Vec<u8>, Option<u64>) = (Vec::new(), None);
     let mut place = |body: &V1Body| -> Location {
-        let (objects, offset, length) = match body {
-            V1Body::Inline { offset, length } => (vec![m.header.clone()], *offset, *length),
-            V1Body::Objects(objects) => (objects.clone(), 0, objects.iter().map(|o| o.length).sum()),
-        };
-        if length == 0 {
-            return Location::default();
+        match body {
+            V1Body::Inline { length: 0, .. } => Location::default(),
+            V1Body::Inline { offset, length } => {
+                let chunk = *pack_at.get_or_insert_with(|| {
+                    chunks.push(ObjectRef { sha256: String::new(), length: 0 });
+                    chunks.len() as u64 - 1
+                });
+                pack.resize(pack.len().next_multiple_of(ALIGN as usize), 0);
+                let at = pack.len() as u64;
+                pack.extend_from_slice(&raw[*offset as usize..(offset + length) as usize]);
+                Location { chunk, offset: at, length: *length }
+            }
+            V1Body::Objects(objects) => {
+                let length = objects.iter().map(|o| o.length).sum();
+                if length == 0 {
+                    return Location::default();
+                }
+                let chunk = *runs.entry(objects.clone()).or_insert_with(|| {
+                    chunks.extend(objects.iter().cloned());
+                    (chunks.len() - objects.len()) as u64
+                });
+                Location { chunk, offset: 0, length }
+            }
         }
-        let chunk = *runs.entry(objects.clone()).or_insert_with(|| {
-            let start = chunks.len() as u64;
-            chunks.extend(objects);
-            start
-        });
-        Location { chunk, offset, length }
     };
     let (mut components, mut schemes): (Vec<(String, Vec<Tensor>)>, BTreeMap<&str, u64>) = (Vec::new(), BTreeMap::new());
     for (c, i) in order {
@@ -349,9 +364,14 @@ pub fn lane(m: &Manifest, raw: &[u8]) -> Result<Lane> {
     let inline = (h.components.iter().flat_map(|c| &c.1).flat_map(|t| &t.parts))
         .filter(|p| matches!(p.body, V1Body::Inline { .. }))
         .count();
+    let pack = pack_at.map(|i| {
+        let at = ObjectRef::of(&pack);
+        chunks[i as usize] = at.clone();
+        (at, pack)
+    });
     let report = json!({"v1": {"header": m.header.id(), "schemes": schemes, "inline_parts": inline,
-        "chunks": chunks.len()}, "renames": names.report()});
-    Ok(Lane { chunks, components, files, report })
+        "pack": pack.as_ref().map(|(at, _)| at.id()), "pack_bytes": pack.as_ref().map_or(0, |(at, _)| at.length), "chunks": chunks.len()}, "renames": names.report()});
+    Ok(Lane { chunks, pack, components, files, report })
 }
 
 fn invalid(detail: String) -> crate::failure::Failure {

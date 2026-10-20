@@ -305,6 +305,9 @@ impl<'t> Migrator<'t> {
                     };
                     bytes.insert(path, b);
                 }
+                if let Some((_, pack)) = v.pack {
+                    add(objects, pack);
+                }
                 (v.chunks, v.components, Metadata::new(), bytes, Some(v.report))
             }
             None => {
