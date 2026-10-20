@@ -917,7 +917,7 @@ impl Placement {
                     .models
                     .get(&model)
                     .map_or("<unknown>", |data| data.name.as_str());
-                return Err(invalid(format!(
+                return Err(Error::Invalid(format!(
                     "model is absent from the remaining plan (request {request}, model {model} [{name}], current step {from})"
                 )));
             }
