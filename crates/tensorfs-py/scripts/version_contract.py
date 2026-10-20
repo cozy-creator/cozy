@@ -23,8 +23,8 @@ PACKAGE = "tensorfs"
 # abi3 is forward compatible by construction: a cp312-abi3 wheel loads on 3.12 and every
 # later CPython. The floor is real; there is no ceiling to assert.
 PYTHON_SPEC = ">=3.12"
-CURRENT_CARGO_VERSION = "0.11.0"
-CURRENT_PYTHON_VERSION = "0.11.0"
+CURRENT_CARGO_VERSION = "0.13.0"
+CURRENT_PYTHON_VERSION = "0.13.0"
 
 
 def _toml(path: pathlib.Path) -> dict[str, object]:
