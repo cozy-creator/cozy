@@ -647,9 +647,9 @@ impl Gpu {
         let State::Ready(mapping) = &mut *state else {
             return Err(invalid("page is not ready"));
         };
-        if !mapping.idle()? {
-            return Err(invalid("page is busy"));
-        }
+        // Ready pages are immutable. Retaining their allocation does not revoke
+        // a view or disturb a consumer stream, so publish custody before first use.
+        // This also preserves weights if the executor dies during that first use.
         if mapping.kept.is_none() {
             let (tx, rx) = UnixStream::pair().map_err(|error| Error::Io(error.to_string()))?;
             // A highly fragmented page must not block while filling a socket queue
