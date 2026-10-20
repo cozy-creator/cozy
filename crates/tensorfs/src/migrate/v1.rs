@@ -416,7 +416,10 @@ fn files(m: &Manifest, h: &Header, names: &mut Names) -> Result<BTreeMap<String,
     let add = |out: &mut BTreeMap<String, File>, path: String, file: File| match out.get(&path) {
         Some(File::Object(a)) if matches!(&file, File::Object(b) if a == b) => Ok(()),
         Some(_) => bad(format!("two v1 files land at {path}")),
-        None => Ok(drop(out.insert(path, file))),
+        None => {
+            out.insert(path, file);
+            Ok(())
+        }
     };
     for (path, object) in &m.files {
         add(&mut out, path.clone(), File::Object(object.clone()))?;
@@ -535,8 +538,11 @@ fn canonical_component(component: &str, keys: &[&str]) -> Option<String> {
     }
 }
 
+/// A table's name, the `(v1 key, D10 key)` renames and the keys it drops.
+type Fit = (String, Vec<(String, String)>, Vec<String>);
+
 /// The table, renames and drops that make `keys` a table component's canonical keys.
-fn table_keys(component: &str, keys: &[&str]) -> Option<(String, Vec<(String, String)>, Vec<String>)> {
+fn table_keys(component: &str, keys: &[&str]) -> Option<Fit> {
     for t in tables().iter().filter(|t| t.lora.is_none()) {
         for c in t.components.iter().filter(|c| c.name == component || c.folders.values().any(|f| f == component)) {
             let targets: BTreeSet<&str> = c.rows.iter().map(|r| r.target.as_str()).collect();
