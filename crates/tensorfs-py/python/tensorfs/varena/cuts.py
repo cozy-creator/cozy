@@ -755,6 +755,8 @@ def _contiguous(func: OpOverload, args: Args, kwargs: Kwargs) -> _Plan | None:
 
 def _silu(func: OpOverload, args: Args, kwargs: Kwargs) -> _Plan | None:
     """Native inference SiLU in exact logical bands; its full result may be mapped."""
+    if func is not aten.silu.default:
+        return None
     x = _arguments(func, args, kwargs).get("self")
     if (not isinstance(x, Tensor) or x.layout is not torch.strided
             or torch.is_grad_enabled() or _capturing()):

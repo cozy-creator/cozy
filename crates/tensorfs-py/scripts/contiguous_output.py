@@ -146,6 +146,18 @@ def silu_cpu(cuts):
             assert bound.refused and len(room.outputs) == 1 and len(room.outputs[0].writes) > 1
         with torch.no_grad():
             assert cuts._silu(op, (raw.transpose(1, 2),), {}) is None
+            destination = torch.empty_like(raw)
+            assert cuts._silu(torch.ops.aten.silu.out, (raw,), {"out": destination}) is None
+            with cuts.caught():
+                assert torch.ops.aten.silu.out(raw, out=destination) is destination
+            torch.testing.assert_close(destination, op(raw), rtol=0, atol=0)
+            inplace = raw.clone()
+            pointer = inplace.data_ptr()
+            assert cuts._silu(torch.ops.aten.silu_.default, (inplace,), {}) is None
+            with cuts.caught():
+                assert torch.ops.aten.silu_.default(inplace) is inplace
+            assert inplace.data_ptr() == pointer
+            torch.testing.assert_close(inplace, op(raw), rtol=0, atol=0)
         assert cuts._silu(op, (raw,), {}) is None, "autograd mode must keep the original op"
         train = raw.clone().requires_grad_()
         reference = train.detach().clone().requires_grad_()
@@ -282,6 +294,18 @@ def cuda():
                 expected = torch.ops.aten.silu.default(activation_source.narrow(1, at, 1))
                 assert torch.equal(activated.narrow(1, at, 1), expected)
                 del expected
+            destination = torch.empty(0, device=device)
+            assert cuts._silu(torch.ops.aten.silu.out, (activation_source,), {"out": destination}) is None
+            before_outputs = len(activation_room.outputs)
+            try:
+                with cuts.caught():
+                    torch.ops.aten.silu.out(activation_source, out=destination)
+            except torch.OutOfMemoryError:
+                pass
+            else:
+                raise AssertionError("the mutating out overload bypassed its real allocator quota")
+            assert len(activation_room.outputs) == before_outputs, "out= acquired replacement storage"
+            del destination
             del activated, activation_source, host_input
             activation_room.outputs.clear()
             gc.collect()
