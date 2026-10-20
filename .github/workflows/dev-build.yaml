@@ -43,6 +43,10 @@ on:
         description: Expected native Runtime wheel SHA256 when runtime_run is supplied
         type: string
         default: ''
+      runtime_download:
+        description: Download the published Runtime wheel for tests when runtime_ref is empty
+        type: boolean
+        default: true
       tensorfs_run:
         description: Existing dev-build run whose TensorFS wheel the targeted tests install
         type: string
@@ -304,11 +308,11 @@ jobs:
           print(json.dumps({"runtime_source": commits[0], "wheel_sha256": digest, "native_modules": modules}))
           PY
       # Without runtime_ref, the Runtime machines install today: the newest published wheel.
-      - if: inputs.test != '' && inputs.runtime_ref == ''
+      - if: inputs.test != '' && inputs.runtime_ref == '' && inputs.runtime_download
         run: |
           uvx --from pip pip download --quiet --no-deps --only-binary :all: --python-version 3.12 \
             --platform manylinux_2_28_x86_64 --dest "$RUNNER_TEMP/runtime" cozy-runtime
-      - if: inputs.test != '' || inputs.runtime_ref != ''
+      - if: inputs.runtime_ref != '' || (inputs.test != '' && inputs.runtime_download)
         run: echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
       - if: inputs.tensorhub_ref != ''
         uses: actions/checkout@v5
