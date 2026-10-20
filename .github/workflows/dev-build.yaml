@@ -172,7 +172,9 @@ jobs:
         with:
           maturin-version: v1.15.0
           target: x86_64
-          manylinux: auto
+          # Match cozy and the cached build scripts' glibc floor. Auto may select
+          # manylinux2014, which cannot execute the shared manylinux_2_28 cache.
+          manylinux: '2_28'
           working-directory: crates/tensorfs-py
           args: --release --locked --target-dir ../../target/manylinux --out dist
           docker-options: -e TENSORFS_REQUIRE_AOT=1

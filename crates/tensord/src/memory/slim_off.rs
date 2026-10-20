@@ -11,7 +11,7 @@ pub struct Grant {
 }
 pub struct Memory;
 #[derive(Default)]
-pub struct HostCache;
+pub struct HostCache {}
 fn unsupported<T>() -> io::Result<T> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,

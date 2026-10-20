@@ -166,7 +166,7 @@ jobs:
           working-directory: crates/tensorfs-py
           target: ${{ matrix.target }}
           args: --release --locked --out dist
-          manylinux: auto
+          manylinux: '2_28'
           docker-options: -e TENSORFS_REQUIRE_AOT=1
           before-script-linux: |
             cargo build --release --locked -p tensorfs --bin tfs
