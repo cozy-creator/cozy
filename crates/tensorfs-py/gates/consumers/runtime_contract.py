@@ -6,10 +6,11 @@ from pathlib import Path
 import sys
 import tempfile
 import time
+from typing import get_args
 
 import msgspec
 
-from cozy_runtime.author import App, Invocation, Outputs, Tree, attempt, describe, script_app
+from cozy_runtime.author import App, FileAsset, Invocation, Outputs, Tree, attempt, describe, script_app
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.executor import _serialize_result
 
@@ -36,8 +37,8 @@ def main():
         surfaces = describe(app)
         assert len(surfaces) == 1 and surfaces[0].name == 'main' and surfaces[0].accelerator
         fields = msgspec.structs.fields(surfaces[0].payload_type)
-        assert [f.name for f in fields] == ['native_wheel']
-        assert fields[0].type.__name__ == 'FileAsset'
+        assert [f.name for f in fields] == ['native_wheel', 'comfy_bundle']
+        assert all(get_args(f.type)[0] is FileAsset for f in fields)
     finally:
         test.doCleanups()
     with tempfile.TemporaryDirectory() as folder:

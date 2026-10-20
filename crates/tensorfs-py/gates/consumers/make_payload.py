@@ -12,22 +12,22 @@ from pathlib import Path
 import re
 import subprocess
 import zipfile
+import native_io
 
 HERE = Path(__file__).resolve().parent
 COMFY = "35f6d4f8bdefe6eea17bfc4631bba8c7f5a66360"
 CONSUMERS = {
-    "diffusers": ("05dc128f291878eccea757aa9c1c5db230071bd9", "prove-diffusers-unet-cpu.py",
-                  "100aa089ea0394837faf048c5979ace39b5357319a60f01484f7674b700eceb8", 208, 802576),
-    "comfy": ("868c4e9635c2e522ba80077307be3b8054791584", "prove-comfy-unet.py",
-              "7b0c10a859d553674cd55a3259999a92bd8476982bb979e494060b70068b6dfb", 130, 2893456),
+    "diffusers": ("prove-diffusers-unet-cpu.py", 208, 802576),
+    "comfy": ("prove-comfy-unet.py", 130, 2893456),
 }
 PRE_GPU = {"88a49ac8e634035301a3314088a856d214e55db8", "f0601a0d5323cd4ed3da829072ab9d6ca61d7748"}
-KERNEL_SOURCE = 'f8245484c34e45ece257715569468ced526c94fd'
-KERNEL_SCRIPT = '7660d1cd97c95ca460e8f4bc884c01ee1f68b8adf8db8d755adda8fe8e053475'
+SCRIPT_ROOT = 'crates/tensorfs-py/scripts/'
 KERNEL_CORPUS = '92a0f4f01f4490c2f7f8c391e5eb600f5e5b33d647eed48d91ff7c21e7af57d4'
 KERNEL_SCHEMA = 'tensorfs.cuda-kernel-conformance/1'
-KERNEL_FILE = 'kernel/scripts/cuda_kernel_conform.py'
-KERNEL_CASES = 'kernel/conformance/vectors/cases/'
+KERNEL_FILE = 'crates/tensorfs-py/scripts/cuda_kernel_conform.py'
+KERNEL_CASES = 'crates/tensorfs/conformance/vectors/cases/'
+RUNTIME_TAG = 'cp312-abi3-manylinux_2_28_x86_64'
+RUNTIME_KERNELS = {f'cozy_runtime/_kernels/{name}.abi3.so' for name in ('_gemm', '_norm', '_fa3')}
 
 
 def git(repo, *args):
@@ -65,12 +65,57 @@ def pin(value, width):
     return value
 
 
+def source_file(repo, source, name):
+    path = SCRIPT_ROOT + name
+    raw = git(repo, 'show', f'{source}:{path}')
+    native_io.check_source(name, raw.decode())
+    return path, raw
+
+
+def requirements(path):
+    raw = path.read_bytes()
+    values, versions = [], {}
+    for line in raw.decode().splitlines():
+        value = line.strip()
+        if not value or value.startswith('#'):
+            continue
+        match = re.fullmatch(r'([A-Za-z0-9][A-Za-z0-9_.-]*)==([A-Za-z0-9!+_.-]+)', value)
+        if match is None:
+            raise ValueError('requirements must contain exact name==version pins only')
+        name = match[1].lower().replace('_', '-')
+        if name in versions or name in {'tensorfs', 'cozy-runtime'}:
+            raise ValueError('duplicate or artifact-owned dependency in requirements')
+        values.append(value)
+        versions[name] = match[2]
+    needed = {'torch', 'diffusers', 'numpy', 'einops', 'safetensors', 'pillow', 'scipy',
+              'tqdm', 'psutil', 'pyyaml', 'packaging', 'comfy-kitchen', 'comfy-aimdo'}
+    if not needed <= versions.keys():
+        raise ValueError('requirements missing consumer dependency pins')
+    if re.search(r'\+cu[0-9]+$', versions['torch']) is None:
+        raise ValueError('Torch requires its exact CUDA build tag in the dependency freeze')
+    return {'sha256': digest(raw), 'requirements': values, 'versions': versions}, raw
+
+
+def comfy_bundle(path, expected):
+    raw = path.read_bytes()
+    if digest(raw) != pin(expected, 64):
+        raise ValueError('Comfy bundle hash differs from the explicit freeze')
+    header = raw.split(b'\n\n', 1)[0].decode()
+    if not header.startswith(('# v2 git bundle\n', '# v3 git bundle\n')) or not any(
+            line.startswith(COMFY + ' ') for line in header.splitlines()):
+        raise ValueError('Comfy bundle must name the exact upstream commit')
+    if any(line.startswith('-') for line in header.splitlines()):
+        raise ValueError('Comfy bundle requires unavailable prerequisite commits')
+    return {'file': path.name, 'bytes': len(raw), 'sha256': expected, 'source': COMFY}
+
+
 def wheel(path, name, expected, source):
     data = path.read_bytes()
     if digest(data) != pin(expected, 64):
         raise ValueError(f"{name} wheel hash differs from the explicit freeze")
     with zipfile.ZipFile(path) as archive:
         extension = None
+        runtime_kernels = None
         metadata = [p for p in archive.namelist() if p.endswith('.dist-info/METADATA')]
         if len(metadata) != 1:
             raise ValueError("wheel must contain exactly one METADATA")
@@ -85,6 +130,17 @@ def wheel(path, name, expected, source):
                        and any(isinstance(t, ast.Name) and t.id == 'COMMIT' for t in n.targets)]
             if commits != [source]:
                 raise ValueError("Runtime wheel COMMIT differs from the explicit source pin")
+            # Runtime9b1 scripts/verify-wheels.py: x86_64 Linux native wheel,
+            # three exact kernel modules. Presence is artifact preflight, not GPU proof.
+            wheel_info = Parser().parsestr(archive.read(metadata[0].removesuffix('METADATA') + 'WHEEL').decode())
+            if (wheel_info['Root-Is-Purelib'] != 'false' or wheel_info.get_all('Tag') != [RUNTIME_TAG]
+                    or path.name != f"cozy_runtime-{fields['Version']}-{RUNTIME_TAG}.whl"):
+                raise ValueError('GPU proof requires the non-pure Linux x86_64 Runtime wheel')
+            modules = {name for name in archive.namelist() if name.startswith('cozy_runtime/_kernels/')
+                       and name.endswith(('.so', '.pyd'))}
+            if modules != RUNTIME_KERNELS:
+                raise ValueError('Runtime native kernel module set differs')
+            runtime_kernels = {name: digest(archive.read(name)) for name in sorted(modules)}
         else:
             extensions = [p for p in archive.namelist() if p.startswith('tensorfs/_ext') and p.endswith(('.so', '.pyd'))]
             if len(extensions) != 1:
@@ -94,50 +150,80 @@ def wheel(path, name, expected, source):
               'version': fields['Version'], 'requires_python': fields['Requires-Python']}
     if extension:
         result['extension_sha256'] = extension
+        result['extension_file'] = extensions[0]
+    if runtime_kernels is not None:
+        result.update(tag=RUNTIME_TAG, kernel_sha256=runtime_kernels)
     return result
 
 
 def generate(args):
+    proof_source = pin(args.proof_source, 40)
+    if proof_source != args.native_source:
+        raise ValueError('proof source must equal the native wheel producer source')
     if args.native_source in PRE_GPU:
         raise ValueError("this known pre-GPU/fork-fix native source cannot qualify the final GPU proof")
     native = wheel(args.native_wheel, 'tensorfs', args.native_sha256, args.native_source)
     runtime = wheel(args.runtime_wheel, 'cozy-runtime', args.runtime_sha256, args.runtime_source)
     if native['requires_python'] != runtime['requires_python']:
         raise ValueError("review the candidate wheels' different Requires-Python constraints")
+    dependencies, dependency_bytes = requirements(args.requirements)
+    upstream = comfy_bundle(args.comfy_bundle, args.comfy_sha256)
     files, consumers = {}, {}
-    for name, (ref, filename, expected, count, size) in CONSUMERS.items():
-        data = git(args.creator_repo, 'show', f'{ref}:crates/tensorfs/scripts/{filename}')
-        if digest(data) != expected:
-            raise ValueError(f"frozen {name} source differs")
+    for name, (filename, count, size) in CONSUMERS.items():
+        path, data = source_file(args.creator_repo, proof_source, filename)
         files[filename] = data.decode()
-        consumers[name] = {'source': ref, 'file': filename, 'sha256': expected, 'tensors': count, 'bytes': size}
+        consumers[name] = {'source': proof_source, 'path': path, 'file': filename,
+                           'sha256': digest(data), 'tensors': count, 'bytes': size}
     files['child.py'] = (HERE / 'child.py').read_text()
     files['owned_child.py'] = (HERE / 'owned_child.py').read_text()
+    files['native_io.py'] = (HERE / 'native_io.py').read_text()
+    files['requirements.txt'] = dependency_bytes.decode()
     spec = {'schema': 1, 'requested': ['diffusers', 'comfy'], 'unrequested': ['kernel'],
             'native': native, 'runtime': runtime, 'consumers': consumers, 'comfy_source': COMFY,
+            'proof_source': proof_source, 'dependencies': dependencies, 'comfy_bundle': upstream,
             'gpu_count': 1, 'device': 'cuda:0', 'cublas_workspace_config': ':4096:8'}
     if args.include_kernel:
-        data = git(args.creator_repo, 'show', f'{KERNEL_SOURCE}:crates/tensorfs/scripts/cuda_kernel_conform.py')
-        if digest(data) != KERNEL_SCRIPT:
-            raise ValueError('frozen kernel script hash differs')
+        _, data = source_file(args.creator_repo, proof_source, 'cuda_kernel_conform.py')
         files[KERNEL_FILE] = data.decode()
         prefix = 'crates/tensorfs/conformance/vectors/cases/'
-        paths = git(args.creator_repo, 'ls-tree', '-r', '--name-only', KERNEL_SOURCE, prefix).decode().splitlines()
+        paths = git(args.creator_repo, 'ls-tree', '-r', '--name-only', proof_source, prefix).decode().splitlines()
         for path in paths:
             if not path.endswith('.json'):
                 raise ValueError('unexpected file in frozen kernel corpus')
-            files[KERNEL_CASES + Path(path).name] = git(args.creator_repo, 'show', f'{KERNEL_SOURCE}:{path}').decode()
+            files[path] = git(args.creator_repo, 'show', f'{proof_source}:{path}').decode()
         rows = kernel_cases(files)
-        spec['kernel'] = {'source': KERNEL_SOURCE, 'sha256': KERNEL_SCRIPT, 'file': KERNEL_FILE,
+        spec['kernel'] = {'source': proof_source, 'sha256': digest(data), 'file': KERNEL_FILE,
                           'schema': KERNEL_SCHEMA, 'corpus_sha256': KERNEL_CORPUS,
                           'cases': [r['case'] for r in rows], 'schemes': sorted({r['scheme'] for r in rows}),
                           'argv': ['--device', '0']}
         spec['requested'].append('kernel')
-        spec['unrequested'] = []
+    raw_contract = (HERE / 'native-io-contract.json').read_bytes()
+    contract = native_io.contract(raw_contract)
+    required_modes = getattr(args, 'require_native_mode', [])
+    if any(mode not in native_io.IDS for mode in required_modes):
+        raise ValueError('required native mode absent from the owner-approved source/command inventory')
+    if required_modes and not args.include_native_io:
+        raise ValueError('required native modes need --include-native-io')
+    if args.include_native_io:
+        files['native/contract.json'] = raw_contract.decode()
+        commands = []
+        for row in contract['commands']:
+            copied = dict(row)
+            frozen = []
+            for filename in [row['file'], *row['helper_files']]:
+                path, raw = source_file(args.creator_repo, proof_source, filename)
+                if filename == row['file']:
+                    native_io.check_source(row['id'], raw.decode())
+                files[path] = raw.decode()
+                frozen.append({'path': path, 'sha256': digest(raw), 'bytes': len(raw)})
+            copied.update(file=frozen[0]['path'], helper_files=frozen[1:], sources=frozen)
+            commands.append(copied)
+        spec['native_io'] = {'source': proof_source, 'contract_sha256': digest(raw_contract), 'commands': commands}
+        spec['requested'].extend(native_io.IDS)
+    spec['pending'] = contract['pending']
+    spec['unrequested'] = [name for name in native_io.ALL if name not in spec['requested']]
     spec['sources'] = {name: digest(text.encode()) for name, text in files.items()}
-    dependencies = [f"cozy-runtime=={runtime['version']}", f"tensorfs=={native['version']}",
-                    'torch==2.14.0', 'diffusers==0.40.0', 'numpy', 'einops', 'safetensors', 'Pillow',
-                    'scipy', 'tqdm', 'psutil', 'pyyaml', 'packaging', 'comfy-kitchen==0.2.39', 'comfy-aimdo==0.5.6']
+    dependency_pins = [f"cozy-runtime=={runtime['version']}", f"tensorfs=={native['version']}", *dependencies['requirements']]
     output = args.output.resolve()
     sidecar = output.with_suffix('.manifest.json')
     if output.exists() or sidecar.exists():
@@ -145,10 +231,11 @@ def generate(args):
     paths = {name: os.path.relpath(path.resolve(), output.parent)
              for name, path in [('cozy-runtime', args.runtime_wheel), ('tensorfs', args.native_wheel)]}
     header = '# /// script\n# requires-python = ' + json.dumps(runtime['requires_python']) + '\n'
-    header += '# dependencies = ' + json.dumps(dependencies) + '\n# [tool.uv.sources]\n'
+    header += '# dependencies = ' + json.dumps(dependency_pins) + '\n# [tool.uv.sources]\n'
     header += ''.join(f'# {name} = {{ path = {json.dumps(path)} }}\n' for name, path in paths.items())
     header += '# ///\n'
-    payload = header + '\nSPEC = ' + repr(spec) + '\nFILES = ' + repr(files) + '\n\n' + (HERE / 'worker.py').read_text()
+    worker = (HERE / 'worker.py').read_text().replace('NATIVE_ASSET_BYTES', str(native['bytes'])).replace('COMFY_ASSET_BYTES', str(upstream['bytes']))
+    payload = header + '\nSPEC = ' + repr(spec) + '\nFILES = ' + repr(files) + '\n\n' + worker
     ast.parse(payload)
     if len(payload.encode()) > 32 << 20:
         raise ValueError("payload exceeds the existing public script source bound")
@@ -161,12 +248,18 @@ def generate(args):
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--creator-repo', type=Path, required=True)
+    p.add_argument('--proof-source', required=True, help='full exact source SHA, equal to the native wheel producer')
     p.add_argument('--native-wheel', type=Path, required=True)
     p.add_argument('--native-source', required=True)
     p.add_argument('--native-sha256', required=True)
     p.add_argument('--runtime-wheel', type=Path, required=True)
     p.add_argument('--runtime-source', required=True)
     p.add_argument('--runtime-sha256', required=True)
+    p.add_argument('--requirements', type=Path, required=True, help='reviewed exact name==version dependency pins')
+    p.add_argument('--comfy-bundle', type=Path, required=True, help='self-contained local Git bundle at the fixed upstream commit')
+    p.add_argument('--comfy-sha256', required=True)
     p.add_argument('--output', type=Path, required=True)
-    p.add_argument('--include-kernel', action='store_true', help='include the frozen f824 clean-child 209-case kernel proof')
+    p.add_argument('--include-kernel', action='store_true', help='include the source-matched clean-child kernel proof')
+    p.add_argument('--include-native-io', action='store_true', help='include source-matched read/provider/fork proofs')
+    p.add_argument('--require-native-mode', action='append', default=[], help='fail if this owner-approved mode is absent')
     print(generate(p.parse_args()))

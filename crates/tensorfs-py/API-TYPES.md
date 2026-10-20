@@ -4,8 +4,9 @@ Temporary review copy of the planned TensorFS 0.13 declarations. Implementation 
 separate; this is not a claim that every declaration is available on current master.
 For normal development, use the [Python usage guide](API.md).
 
-`TensorMetadata` describes the logical tensor. Physical storage descriptors are internal;
-encoded reads expose named `Array` values without chunk locations or byte offsets.
+`TensorMetadata` describes the logical tensor. Ordinary encoded reads expose named
+`Array` values without physical locations; `tensorfs.raw` provides an advanced inspection
+surface for storage integrations.
 
 The provider/DLPack protocols describe accepted inputs and are not additional package exports.
 
@@ -41,22 +42,16 @@ class DLPack(Protocol):
 def configure(*, endpoint: str | None=None, cache_dir: StrPath | None=None, token: Token | None=None) -> None:
     ...
 
-def convert(source: str | Sequence[str], *, converter: str | None=None, variant: str | None=None, cache_dir: StrPath | None=None, token: Token | None=None, progress: Callable[[str, int, int], object] | None=None) -> Checkpoint:
+def convert_to_cozytensors(source: str | Sequence[str], *, converter: str | None=None, variant: str | None=None, cache_dir: StrPath | None=None, token: Token | None=None, progress: Callable[[str, int, int], object] | None=None) -> Checkpoint:
     ...
 
-def export(src: Checkpoint, dir: StrPath, *, format: str='safetensors', dequantize: str | None=None) -> list[str]:
+def download_file(repo_id: str, filename: str, *, revision: str | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, ca_der: bytes | None=None) -> str:
     ...
 
-def hub_download(repo_id: str, filename: str, *, revision: str | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, ca_der: bytes | None=None) -> str:
+def open(name_or_path: StrPath, *, revision: str | None=None, variant: str | None=None, endpoint: str | None=None, local_files_only: bool=False, cache_dir: StrPath | None=None, token: Token | None=None, ca_der: bytes | None=None, lazy: bool=True) -> Checkpoint:
     ...
 
-def resolve_source(source: str, *, token: Token | None=None) -> str:
-    ...
-
-def open(name_or_path: StrPath, *, revision: str | None=None, variant: str | None=None, endpoint: str | None=None, local_files_only: bool=False, cache_dir: StrPath | None=None, token: Token | None=None, ca_der: bytes | None=None) -> Checkpoint:
-    ...
-
-def snapshot_download(repo_id: str, *, revision: str | None=None, variant: str | None=None, components: Sequence[str] | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, ca_der: bytes | None=None) -> str:
+def materialize(source: str | Checkpoint, *, revision: str | None=None, variant: str | None=None, components: Sequence[str] | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, ca_der: bytes | None=None, format: str='cozytensors', dequantize: str | None=None) -> str:
     ...
 
 def upload_folder(*, repo_id: str, folder_path: StrPath, revision: str | None=None, token: Token | None=None, endpoint: str | None=None, cache_dir: StrPath | None=None, ca_der: bytes | None=None) -> str:
@@ -216,10 +211,12 @@ class Tensors(Mapping[str, TensorMetadata]):
     def get(self, key: str, default: _T) -> TensorMetadata | _T:
         ...
 
-    def read(self, key: str, *, decode: bool=True) -> Array | Encoded:
+    @overload
+    def read(self, keys: str, *, device: str = "cpu", decode: bool = False) -> Array | Encoded:
         ...
 
-    def read_all(self, keys: Sequence[str] | None=None, *, device: str='cpu', decode: bool=True) -> dict[str, Array | Encoded]:
+    @overload
+    def read(self, keys: Sequence[str] | None = None, *, device: str = "cpu", decode: bool = False) -> dict[str, Array | Encoded]:
         ...
 
     def read_into(self, key: str, out: object, *, role: str | None=None, offset: int=0) -> None:
@@ -272,6 +269,19 @@ class Component:
     def __repr__(self) -> str:
         ...
 
+class VerificationReport:
+    @property
+    def missing(self) -> list[tuple[str, int]]:
+        """Absent local objects, as (sha256_hex, byte_length)."""
+
+    @property
+    def corrupt(self) -> list[tuple[str, int]]:
+        """Local objects whose stored length or digest is wrong."""
+
+    @property
+    def ok(self) -> bool:
+        """True when both collections are empty."""
+
 class Checkpoint:
     """One cozytensors read from a store, or only its header (`parse`)."""
 
@@ -284,8 +294,8 @@ class Checkpoint:
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         ...
 
-    def verify(self) -> list[tuple[str, int]]:
-        """Hash locally available header, chunks and assets; report missing or corrupt objects."""
+    def verify(self, components: Sequence[str] | None=None) -> VerificationReport:
+        """Audit the header and selected local data; never fetch, repair or delete objects."""
 
     def open_chunk(self, index: int) -> int:
         """A new read-only OS descriptor owned and closed by the caller."""
@@ -293,7 +303,7 @@ class Checkpoint:
     @staticmethod
     def parse(header: bytes) -> Checkpoint:
         """A `cozytensors/1` header's pipeline, components and metadata, with no store: component reads,
-        `missing`, `chunk_paths` and `Component.asset` refuse (`UnsupportedError`)."""
+        `missing` and `Component.asset` refuse (`UnsupportedError`)."""
 
     @property
     def id(self) -> str | None:
@@ -332,10 +342,6 @@ class Checkpoint:
         ...
 
     @property
-    def path(self) -> str:
-        ...
-
-    @property
     def pipeline(self) -> Pipeline | None:
         ...
 
@@ -348,17 +354,13 @@ class Checkpoint:
         """The header's chunk objects in order: `(sha256, length)`."""
 
     @property
-    def chunk_paths(self) -> list[str]:
-        """Each chunk's file in the store, in header order; a parsed header raises."""
-
-    @property
     def metadata(self) -> dict[str, Any]:
         ...
 
     def missing(self, components: Sequence[str] | None=None) -> list[tuple[str, int]]:
         """The chunks and assets of `components` (all when None) not here."""
 
-    def fetch(self, components: Sequence[str] | None=None, *, priority: int=0, progress: Callable[[str, int, int], object] | None=None) -> None:
+    def download(self, components: Sequence[str] | None=None, *, priority: int=0, progress: Callable[[str, int, int], object] | None=None) -> None:
         ...
 
 class DPoP:
@@ -410,7 +412,10 @@ class Writer:
     local_checkpoint: Checkpoint | None
 
     def __init__(self, dest: StrPath | None=None, *, variant: str | None=None, base: Checkpoint | None=None, resume: str | None=None, repo_id: str | None=None, endpoint: str | None=None, token: Token | None=None, cache_dir: StrPath | None=None, ca_der: bytes | None=None) -> None:
-        ...
+        """Write an exact header-file path, or only the shared store when dest=None.
+
+        variant labels repository content and is invalid with a file destination.
+        """
 
     def __enter__(self) -> Writer:
         ...
@@ -432,4 +437,27 @@ class Writer:
 
     def has(self, component: str, key: str) -> bool:
         ...
+```
+
+## `tensorfs.raw` — advanced physical inspection
+
+These declarations belong to `tensorfs.raw`, not the root package.
+
+```python
+from tensorfs import Checkpoint
+
+class Part:
+    @property
+    def dtype(self) -> str: ...
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+    @property
+    def chunk(self) -> int: ...
+    @property
+    def offset(self) -> int: ...
+    @property
+    def length(self) -> int: ...
+
+def parts(checkpoint: Checkpoint, component: str, key: str) -> dict[str, Part]:
+    """Inspect stored ranges without fetching bytes; plain tensors use role ''."""
 ```

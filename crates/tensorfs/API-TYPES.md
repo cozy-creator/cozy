@@ -39,13 +39,14 @@ impl FromStr for Ref {
 // <org>/<name>[@revision[/variant]], and sha256:<64 lowercase hex>.
 // Client.open checks an existing folder/.cozytensors path before parsing a Ref.
 
-#[derive(Default)]
 pub struct Open {
     pub revision: Option<String>,
     pub variant: Option<String>,
     pub endpoint: Option<String>,
     pub local_files_only: bool,
+    pub lazy: bool,
 }
+impl Default for Open { fn default() -> Self; } // lazy=true, local_files_only=false
 pub type Progress<'a> = dyn Fn(u64, u64) -> Result<()> + Sync + 'a;
 pub type ConvertProgress<'a> = dyn Fn(&str, u64, u64) -> Result<()> + Sync + 'a;
 
@@ -58,29 +59,38 @@ pub enum Selection {
     Assets { component: String, names: Option<Vec<String>> },
 }
 #[derive(Default)]
-pub struct Fetch<'a> {
+pub struct Download<'a> {
     pub selection: Selection,
     pub priority: u64,
     pub progress: Option<&'a Progress<'a>>,
-    // Callback arguments: held bytes, total bytes. Error cancels this fetch.
+    // Callback arguments: held bytes, total bytes. Error cancels this download.
 }
 pub struct Fetched { pub local: u64, pub volume: u64, pub origin: u64 }
+#[derive(Clone, Debug, Default)]
+pub struct VerificationReport {
+    pub missing: Vec<ObjectRef>,
+    pub corrupt: Vec<ObjectRef>,
+}
+impl VerificationReport {
+    pub fn is_ok(&self) -> bool;
+}
 
 #[derive(Clone)]
 pub struct Client { /* private store/config */ }
 impl Client {
     pub fn new(config: Config) -> Result<Client>;
     pub async fn open(&self, name_or_path: &str, options: &Open) -> Result<Checkpoint>;
-    pub async fn snapshot_download(
-        &self, reference: &Ref, want: &Fetch<'_>,
+    pub async fn materialize(
+        &self, reference: &Ref, want: &Download<'_>,
         local_dir: Option<&Path>, local_files_only: bool,
     ) -> Result<PathBuf>;
-    pub async fn hub_download(
+    pub async fn download_file(
         &self, reference: &Ref, filename: &str,
         local_dir: Option<&Path>, local_files_only: bool,
     ) -> Result<PathBuf>;
     pub async fn upload_folder(&self, reference: &Ref, folder: &Path,
         progress: Option<&Progress<'_>>) -> Result<ObjectRef>;
+    // The final progress callback runs after publication; its error cannot undo that update.
 }
 // Python components= maps to Selection::Components. Asset selection does not fetch tensor chunks.
 
@@ -91,8 +101,9 @@ impl Checkpoint {
     pub fn header(&self) -> &format::Header;
     pub fn metadata(&self) -> &Metadata;
     pub fn chunks(&self) -> &[ObjectRef];
+    pub fn variant(&self) -> Option<&str>;
     pub fn tree(&self) -> Option<&ObjectRef>;
-    pub fn verify(&self) -> Result<Vec<ObjectRef>>;
+    pub fn verify(&self, selection: &Selection) -> Result<VerificationReport>;
     pub fn view(&self) -> io::view::View;
     pub fn named(&self) -> Option<&Ref>;
     pub fn pipeline(&self) -> Option<&format::Pipeline>;
@@ -100,10 +111,14 @@ impl Checkpoint {
     pub fn component(&self, name: &str) -> Result<&Component>;
     pub fn chunk(&self, index: usize) -> Result<File>;
     pub fn missing(&self, selection: &Selection) -> Result<Vec<ObjectRef>>;
-    pub async fn fetch(&self, want: &Fetch<'_>) -> Result<Fetched>;
-    pub fn folder(&self) -> Result<PathBuf>;
+    pub async fn download(&self, want: &Download<'_>) -> Result<Fetched>;
+    // Cozytensors requires None; Safetensors accepts F32/BF16/F16 when Some.
+    // Other dequantize arguments return Invalid before source preparation.
+    pub async fn materialize(&self, dir: &Path, format: Format,
+        dequantize: Option<Dtype>) -> Result<PathBuf>;
 }
-// Synchronous chunk/read/asset/folder operations use bytes made available by fetch().
+// Open.lazy=false downloads this checkpoint's data before returning.
+// Synchronous chunk/read/asset/folder operations use bytes made available by download().
 // view() retains its source and availability state for the byte engine.
 
 #[derive(Clone)]
@@ -154,6 +169,22 @@ pub trait TokenProvider: Send + Sync {
         -> Result<bool> { Ok(false) }
 }
 pub fn bearer(token: impl Into<String>) -> Arc<dyn TokenProvider>;
+
+pub struct JwtBearer {
+    pub token_endpoint: String,
+    pub client_id: String,
+    pub resource: String,
+    pub claims: serde_json::Map<String, serde_json::Value>,
+}
+#[derive(Clone)]
+pub struct DPoP { /* shared native token state */ }
+impl DPoP {
+    pub fn grant(config: &Config, key: &str, grant: JwtBearer) -> Result<Self>;
+    pub fn token(key: &str, access_token: &str, resource: Option<&str>,
+        endpoint: Option<&str>) -> Result<Self>;
+    pub async fn issued_token(&self) -> Option<String>;
+}
+// DPoP implements TokenProvider. key is a private P-256 JWK.
 ```
 
 ## Conversion, writers and export
@@ -167,12 +198,13 @@ pub struct Convert<'a> {
     pub progress: Option<&'a ConvertProgress<'a>>,
 }
 impl Client {
-    pub async fn convert(&self, sources: &[String], options: &Convert<'_>) -> Result<Checkpoint>;
-    pub async fn resolve_source(&self, source: &str) -> Result<String>;
+    pub async fn convert_to_cozytensors(&self, sources: &[String], options: &Convert<'_>) -> Result<Checkpoint>;
     pub fn writer(&self, options: WriterOptions<'_>) -> Result<Writer>;
 }
 #[derive(Default)]
 pub struct WriterOptions<'a> {
+    // Exact header-file path, or None for a checkpoint in the shared store.
+    // A file destination cannot be combined with variant or repo_id.
     pub dest: Option<&'a Path>, pub variant: Option<&'a str>,
     pub base: Option<&'a Checkpoint>, pub resume: Option<&'a str>,
     pub repo_id: Option<&'a str>, pub endpoint: Option<&'a str>,
@@ -183,6 +215,8 @@ impl Writer {
     pub fn pipeline(&mut self, class: &str, config: format::Config) -> Result<()>;
     pub fn component(&mut self, name: &str, class: &str,
         config: format::Config) -> Result<ComponentWriter<'_>>;
+    // Reopen a declared component without changing its class or config.
+    pub fn component_writer(&mut self, name: &str) -> Result<ComponentWriter<'_>>;
     pub fn set_metadata(&mut self, key: &str, value: Value) -> Result<()>;
     pub fn has(&self, component: &str, key: &str) -> Result<bool>;
     pub async fn commit(&mut self) -> Result<Checkpoint>;
@@ -199,9 +233,7 @@ impl ComponentWriter<'_> {
     pub fn order(&mut self, keys: &[String]) -> Result<()>;
     pub fn has(&self, key: &str) -> Result<bool>;
 }
-pub enum Format { Safetensors }
-pub fn export(checkpoint: &Checkpoint, dir: &Path, format: Format,
-    dequantize: Option<Dtype>) -> Result<Vec<String>>;
+pub enum Format { Safetensors, Cozytensors }
 ```
 
 ## Low-level streaming input

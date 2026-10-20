@@ -19,6 +19,7 @@ identity = {'mode': mode, 'python_optimize': sys.flags.optimize,
             'cublas_workspace_config': os.environ.get('CUBLAS_WORKSPACE_CONFIG'),
             'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES')}
 try:
+    assert mode in ('kernel', 'diffusers', 'comfy'), 'native I/O proofs require a fresh direct-script process'
     assert sys.flags.optimize == 0, 'optimized Python disables proof assertions'
     assert identity['triton_interpret'] in ('', '0'), 'interpreter fallback is forbidden'
     assert identity['cublas_workspace_config'] == ':4096:8', 'deterministic matmul environment must precede CUDA init'
@@ -51,6 +52,7 @@ try:
         # The real Torch UUID joined to NVML and the public execution row is authoritative.
         assert visible.isdecimal() or uuid(visible) == uuid(row[1]), 'sealed UUID visibility differs from physical GPU'
     identity['ok'] = True
+    sys.path.insert(0, str(Path(script).resolve().parent))
     sys.argv = [script, *argv]
     try:
         runpy.run_path(script, run_name='__main__')
