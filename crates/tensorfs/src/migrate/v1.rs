@@ -419,7 +419,7 @@ fn files(m: &Manifest, h: &Header, names: &mut Names) -> Result<BTreeMap<String,
                 });
                 if let Some(map) = per_component {
                     for (c, config) in map {
-                        let split = serde_json_canonicalizer::to_vec(config).or_else(|e| bad(e.to_string()))?;
+                        let split = serde_json::to_vec(config).or_else(|e| bad(e.to_string()))?;
                         add(&mut out, format!("{}/config.json", names.component(c)), File::Bytes(split))?;
                     }
                     names.rules.push("config model: one config.json per component".into());
