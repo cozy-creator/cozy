@@ -347,9 +347,74 @@ pub fn runtime() -> Result<Arc<tokio::runtime::Runtime>> {
     Ok(Arc::clone(held.insert(Arc::new(runtime))))
 }
 
-fn runtime_slot() -> Result<&'static Mutex<Option<Arc<tokio::runtime::Runtime>>>> {
-    static RUNTIME: Mutex<Option<Arc<tokio::runtime::Runtime>>> = Mutex::new(None);
+type RuntimeSlot = Mutex<Option<Arc<tokio::runtime::Runtime>>>;
+
+#[cfg(not(unix))]
+fn runtime_slot() -> Result<&'static RuntimeSlot> {
+    static RUNTIME: RuntimeSlot = Mutex::new(None);
     Ok(&RUNTIME)
+}
+
+#[cfg(unix)]
+fn runtime_slot() -> Result<&'static RuntimeSlot> {
+    process_runtime::slot()
+}
+
+/// The POSIX process boundary for the lazy network runtime. An inherited Tokio runtime
+/// has no workers in a fork child, and its mutex may be owned by a vanished parent thread.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+mod process_runtime {
+    use super::{Code, Refusal, Result, RuntimeSlot};
+    use std::ptr;
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+
+    static SLOT: AtomicPtr<RuntimeSlot> = AtomicPtr::new(ptr::null_mut());
+    static REGISTERED: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn after_fork() {
+        // Only an atomic store: no allocation, lock, refcount change or destructor is
+        // permitted here. Deliberately abandon the inherited holder in this child.
+        SLOT.store(ptr::null_mut(), Ordering::Release);
+    }
+
+    pub(super) fn slot() -> Result<&'static RuntimeSlot> {
+        if !REGISTERED.load(Ordering::Acquire) {
+            // SAFETY: after_fork has a static C ABI and touches only the lock-free pointer.
+            // Register before publishing a holder. There is deliberately no "initializing"
+            // state or Once lock for a concurrent fork to inherit. Racing first callers may
+            // register the same idempotent callback; every registration completes before use.
+            let error = unsafe { libc::pthread_atfork(None, None, Some(after_fork)) };
+            if error != 0 {
+                return Err(Refusal {
+                    code: Code::TRANSFER_FAILED,
+                    detail: format!("the fetch runtime fork hook could not register: {}", std::io::Error::from_raw_os_error(error)),
+                });
+            }
+            REGISTERED.store(true, Ordering::Release);
+        }
+        // The registered handler itself is inherited, so REGISTERED stays true in children.
+        // Resetting the pointer on every fork also covers descendant forks and PID reuse;
+        // no process identity comparison can mistake an ancestor's holder for a live one.
+        let mut slot = SLOT.load(Ordering::Acquire);
+        if slot.is_null() {
+            let candidate: *mut RuntimeSlot = Box::into_raw(Box::new(RuntimeSlot::new(None)));
+            slot = match SLOT.compare_exchange(ptr::null_mut(), candidate, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => candidate,
+                Err(published) => {
+                    // SAFETY: a losing candidate was never published and contains no runtime.
+                    // Its allocation belongs only to this thread in the current process.
+                    unsafe { drop(Box::from_raw(candidate)); }
+                    published
+                }
+            };
+        }
+        // SAFETY: published holders are never freed. Threads in this process share its
+        // mutex; a fork child clears SLOT before returning to callers and never locks or
+        // drops the inherited holder. Keeping its Arc also prevents an inherited temporary
+        // Arc from being the last owner and dropping the parent-created Tokio runtime.
+        Ok(unsafe { &*slot })
+    }
 }
 
 #[cfg(all(test, unix))]
