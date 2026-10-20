@@ -1,21 +1,16 @@
 //! Existing Runtime device-executor control seam. Models and codecs remain in Python SDK.
+use platform::process::{Birth, Exact};
 use crate::{
     execution::open_artifact,
     launch_identity::{LaunchIdentity, Seal},
-    process::{Liveness, Meter, Watch, Watching, reap_group, tail},
+    process::{reap_group, tail, Liveness, Meter, Watch, Watching},
     seam,
-};
-use platform::process::{Birth, Exact};
-use platform::{
-    durable::Mode as _,
-    ipc::{LocalListener, LocalStream},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[cfg(unix)]
-use std::os::{
-    fd::AsRawFd,
-    unix::process::{CommandExt, ExitStatusExt},
+use platform::{
+    durable::Mode as _,
+    ipc::{LocalListener, LocalStream},
 };
 use std::{
     collections::BTreeMap,
@@ -25,6 +20,11 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
+};
+#[cfg(unix)]
+use std::os::{
+    fd::AsRawFd,
+    unix::process::{CommandExt, ExitStatusExt},
 };
 
 /// Bound descriptor counts even for a malformed or unsupported request.
@@ -832,6 +832,7 @@ pub trait Services {
         drop(descriptor);
         Ok((Answer::unavailable(frame.seq), None))
     }
+
 }
 
 pub struct Baseline;
@@ -1195,23 +1196,14 @@ pub fn adjustments(id: &str, reply: &Frame) -> Vec<crate::journal::Adjustment> {
         }
     };
     if rows.len() > MAX_ADJUSTMENTS {
-        tracing::warn!(
-            "run {id}: {} adjustment rows; the first {MAX_ADJUSTMENTS} are kept",
-            rows.len()
-        );
+        tracing::warn!("run {id}: {} adjustment rows; the first {MAX_ADJUSTMENTS} are kept", rows.len());
     }
     let clip = |text: &mut String| *text = crate::triage::ends(text, MAX_ADJUSTMENT_TEXT);
     rows.iter()
         .take(MAX_ADJUSTMENTS)
         .filter_map(|row| match crate::journal::Adjustment::deserialize(row) {
             Ok(mut row) => {
-                for text in [
-                    &mut row.field,
-                    &mut row.requested,
-                    &mut row.applied,
-                    &mut row.reason,
-                    &mut row.source,
-                ] {
+                for text in [&mut row.field, &mut row.requested, &mut row.applied, &mut row.reason, &mut row.source] {
                     clip(text);
                 }
                 Some(row)
@@ -1233,11 +1225,8 @@ pub fn postprocess(
     let result = read_result(spool, reply)?;
     // A tree is held as its manifest and member files; the encoders bind every other output.
     // Custody (`Engine::managed_result`) reads each bound file once, hashing as it copies.
-    let (trees, files): (Vec<_>, Vec<_>) = reply
-        .outputs
-        .iter()
-        .cloned()
-        .partition(|o| o.kind == "tree");
+    let (trees, files): (Vec<_>, Vec<_>) =
+        reply.outputs.iter().cloned().partition(|o| o.kind == "tree");
     let reply = &Frame {
         outputs: files,
         ..reply.clone()
@@ -1256,8 +1245,7 @@ pub fn postprocess(
 /// which the output binds to. A tree forwarded from a child (`sha256:<manifest>`) is already
 /// both.
 fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
-    let invalid =
-        |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("output tree: {why}"));
+    let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("output tree: {why}"));
     let hash = |path: &Path| -> io::Result<(String, u64)> {
         let mut file = open_artifact(spool, path)?;
         let mut hash = tensorfs::sha256::Sha256::new();
@@ -1284,21 +1272,15 @@ fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
                         pending.push(path);
                         continue;
                     } else if !kind.is_file() {
-                        return Err(invalid(
-                            "it holds something other than files and directories",
-                        ));
+                        return Err(invalid("it holds something other than files and directories"));
                     }
                     let member = Path::new(&directory).join(&path);
                     let (sha, length) = hash(&member)?;
                     match fs::hard_link(spool.join(&member), spool.join(format!("sha256-{sha}"))) {
-                        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
-                            return Err(error);
-                        }
+                        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
                         _ => (),
                     }
-                    let path = path
-                        .to_str()
-                        .ok_or_else(|| invalid("a path is not UTF-8"))?;
+                    let path = path.to_str().ok_or_else(|| invalid("a path is not UTF-8"))?;
                     entries.push(serde_json::json!({"kind": "file", "path": path,
                         "blob": {"sha256": sha, "length": length}}));
                 }
@@ -1315,17 +1297,10 @@ fn tree_binding(spool: &Path, output: &Output) -> io::Result<AssetBinding> {
     };
     let mut bytes = Vec::new();
     open_artifact(spool, Path::new(&name))?.read_to_end(&mut bytes)?;
-    let manifest: Value =
-        serde_json::from_slice(&bytes).map_err(|_| invalid("its manifest is not JSON"))?;
+    let manifest: Value = serde_json::from_slice(&bytes).map_err(|_| invalid("its manifest is not JSON"))?;
     let mut content = 0;
-    for entry in manifest["entries"]
-        .as_array()
-        .ok_or_else(|| invalid("no entries"))?
-    {
-        let member = format!(
-            "sha256-{}",
-            entry["blob"]["sha256"].as_str().unwrap_or_default()
-        );
+    for entry in manifest["entries"].as_array().ok_or_else(|| invalid("no entries"))? {
+        let member = format!("sha256-{}", entry["blob"]["sha256"].as_str().unwrap_or_default());
         let length = open_artifact(spool, Path::new(&member))?.metadata()?.len();
         if length != entry["blob"]["length"].as_u64().unwrap_or(u64::MAX) {
             return Err(invalid("a member differs from its manifest"));
@@ -1370,10 +1345,9 @@ fn encode_native(spool: &Path, reply: &Frame) -> io::Result<Option<Vec<AssetBind
     let invalid = |detail: &str| io::Error::new(io::ErrorKind::InvalidData, detail.to_string());
     let blob = |reference: &str| -> io::Result<String> {
         // A file a child returned, which this run hands on as its own (`jobs::grant`).
-        if let Some(hex) = reference
-            .strip_prefix("sha256:")
-            .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
-        {
+        if let Some(hex) = reference.strip_prefix("sha256:").filter(|h| {
+            h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
+        }) {
             return Ok(format!("sha256-{hex}"));
         }
         let tail: Vec<_> = reference.rsplitn(3, '/').collect();
@@ -1505,14 +1479,8 @@ impl DeviceExecutor {
             .arg(&config.root)
             .env_clear()
             .envs(&environment)
-            .envs(
-                scope
-                    .as_deref()
-                    .and_then(platform::contain::Scope::environment),
-            )
-            .envs(crate::launch_identity::interpreter_environment(
-                &config.python,
-            )?)
+            .envs(scope.as_deref().and_then(platform::contain::Scope::environment))
+            .envs(crate::launch_identity::interpreter_environment(&config.python)?)
             .stdin(Stdio::null())
             .stdout(File::create(config.root.join("stdout.log"))?)
             .stderr(File::create(config.root.join("stderr.log"))?);
@@ -1562,10 +1530,7 @@ impl DeviceExecutor {
         let (listener, environment) = endpoint(&config)?;
         let scope = scope(&config)?;
         let mut forked = environment.clone();
-        if let Some((name, token)) = scope
-            .as_deref()
-            .and_then(platform::contain::Scope::environment)
-        {
+        if let Some((name, token)) = scope.as_deref().and_then(platform::contain::Scope::environment) {
             forked.insert(name.into(), token.into());
         }
         let reply = self.command(
@@ -1582,10 +1547,7 @@ impl DeviceExecutor {
                 drop(listener);
                 fs::remove_file(&config.socket)?;
                 // A child the parent made before its channel failed carries the token too.
-                if let Err(error) = scope
-                    .as_deref()
-                    .map_or(Ok(0), platform::contain::Scope::end)
-                {
+                if let Err(error) = scope.as_deref().map_or(Ok(0), platform::contain::Scope::end) {
                     tracing::warn!("refused fork's scope not ended: {error}");
                 }
                 return Ok(match refused {
@@ -1669,7 +1631,9 @@ impl DeviceExecutor {
         let expected_gid = config
             .identity
             .map_or_else(crate::launch_identity::egid, |identity| identity.gid);
-        if credential.pid != pid || credential.uid != expected_uid || credential.gid != expected_gid
+        if credential.pid != pid
+            || credential.uid != expected_uid
+            || credential.gid != expected_gid
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1743,11 +1707,7 @@ impl DeviceExecutor {
     /// The end of the stderr of the request it serves (its whole life before the first), as
     /// much as its triage bundle keeps.
     pub fn stderr_tail(&self) -> String {
-        crate::process::tail_from(
-            &self.root.join("stderr.log"),
-            self.log_from,
-            crate::triage::MAX_STDERR,
-        )
+        crate::process::tail_from(&self.root.join("stderr.log"), self.log_from, crate::triage::MAX_STDERR)
     }
     pub fn cancellation(&self) -> Cancellation {
         Cancellation {
@@ -1799,10 +1759,8 @@ impl DeviceExecutor {
         if grants.len() != group.ledgers as usize
             || (!grants.is_empty() && !matches!(command, DeviceCommand::Start { .. }))
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "placement grants require a matching Start ledger count",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "placement grants require a matching Start ledger count"));
         }
         let meter = match (command, &self.activity) {
             (DeviceCommand::Invoke { .. }, Some(_)) => Meter::Work,
@@ -1850,12 +1808,10 @@ impl DeviceExecutor {
             }
         }
         loop {
-            let frame = read_frame(&mut self.stream)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "stock executor EOF before reply",
-                )
-            })?;
+            let frame = read_frame(&mut self.stream)?
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "stock executor EOF before reply")
+                })?;
             watch.frame();
             match frame.event {
                 Some(Event::Request) if !frame.malformed.is_empty() => {
@@ -1864,20 +1820,9 @@ impl DeviceExecutor {
                 Some(Event::Progress) if !frame.malformed.is_empty() => (),
                 Some(Event::Progress) => services.progress(&frame),
                 Some(Event::Request) if frame.descriptors > 0 => {
-                    if frame.descriptors > MAX_REQUEST_FDS {
-                        return Err(io::Error::other("request names too many descriptors"));
-                    }
-                    for _ in 0..frame.descriptors {
-                        drop(platform::handles::recv_fd(&self.stream)?);
-                    }
-                    write_frame(
-                        &mut self.stream,
-                        &Answer::refused(
-                            frame.seq,
-                            "unsupported_descriptors",
-                            "this operation does not accept multiple descriptors",
-                        ),
-                    )?;
+                    if frame.descriptors > MAX_REQUEST_FDS { return Err(io::Error::other("request names too many descriptors")); }
+                    for _ in 0..frame.descriptors { drop(platform::handles::recv_fd(&self.stream)?); }
+                    write_frame(&mut self.stream, &Answer::refused(frame.seq,"unsupported_descriptors","this operation does not accept multiple descriptors"))?;
                 }
                 Some(Event::Request)
                     if matches!(frame.kind, Kind::StageMemoLookup | Kind::StageMemoStore) =>
@@ -2102,44 +2047,28 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-fn write_frame(stream: &mut LocalStream, value: &impl Serialize) -> io::Result<()> {
+fn write_frame(
+    stream: &mut LocalStream,
+    value: &impl Serialize,
+) -> io::Result<()> {
     let value = serde_json::to_value(value)?;
     scan(&value)?;
     seam::write_body(stream, &serde_json::to_vec(&value)?)
 }
 
-fn write_command(
-    stream: &mut LocalStream,
-    command: &DeviceCommand,
-    group: &Group,
-    memo: bool,
-) -> io::Result<()> {
+fn write_command(stream: &mut LocalStream, command: &DeviceCommand, group: &Group, memo: bool) -> io::Result<()> {
     let mut value = serde_json::to_value(command)?;
-    if let (false, Some(object), Value::Object(extra)) = (
-        group.is_empty(),
-        value.as_object_mut(),
-        serde_json::to_value(group)?,
-    ) {
+    if let (false, Some(object), Value::Object(extra)) = (group.is_empty(), value.as_object_mut(), serde_json::to_value(group)?) {
         object.extend(extra);
     }
     if matches!(command, DeviceCommand::Start { .. }) && memo {
-        value["memo"] =
-            serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
+        value["memo"] = serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
     }
     let bytes = serde_json::to_vec(&value)?;
     // Only this typed field may carry supplied access. Validate everything else; the original
     // wire bytes above still contain the token, and arbitrary JSON never grants this exception.
     if let (true, Some(options)) = (
-        matches!(
-            command,
-            DeviceCommand::Load {
-                tensorfs: Some(_),
-                ..
-            } | DeviceCommand::Invoke {
-                tensorfs: Some(_),
-                ..
-            }
-        ),
+        matches!(command, DeviceCommand::Load { tensorfs: Some(_), .. } | DeviceCommand::Invoke { tensorfs: Some(_), .. }),
         value.get_mut("tensorfs").and_then(Value::as_object_mut),
     ) {
         options.remove("token");
@@ -2149,9 +2078,7 @@ fn write_command(
 }
 /// SDK control framing shared with the CPU source-qualification receiver.
 pub fn read_frame(stream: &mut LocalStream) -> io::Result<Option<Frame>> {
-    seam::read_body(stream)?
-        .map(|bytes| decode_frame(&bytes))
-        .transpose()
+    seam::read_body(stream)?.map(|bytes| decode_frame(&bytes)).transpose()
 }
 
 /// Every field of a frame is optional, and the Runtime spells an absent one as null as often as
@@ -2166,14 +2093,8 @@ fn decode_frame(bytes: &[u8]) -> io::Result<Frame> {
         _ => None,
     };
     let seq = fields.get("seq").and_then(Value::as_u64);
-    let descriptor = fields
-        .get("descriptor")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let descriptors = fields
-        .get("descriptors")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let descriptor = fields.get("descriptor").and_then(Value::as_bool).unwrap_or(false);
+    let descriptors = fields.get("descriptors").and_then(Value::as_u64).unwrap_or(0);
     serde_json::from_value(Value::Object(fields)).or_else(|error| match (event, seq) {
         (Some(Event::Request), Some(seq)) => Ok(Frame {
             event,
@@ -2194,11 +2115,12 @@ fn decode_frame(bytes: &[u8]) -> io::Result<Frame> {
 
 /// A request this machine cannot decode is refused alone, under its own sequence number,
 /// after the fds it announced are taken off the socket: the executor's call goes on.
-fn refuse_malformed(stream: &mut LocalStream, frame: &Frame) -> io::Result<()> {
+fn refuse_malformed(
+    stream: &mut LocalStream,
+    frame: &Frame,
+) -> io::Result<()> {
     if frame.descriptors > MAX_REQUEST_FDS {
-        return Err(io::Error::other(
-            "a malformed request names too many descriptors",
-        ));
+        return Err(io::Error::other("a malformed request names too many descriptors"));
     }
     for _ in 0..u32::from(frame.descriptor) + frame.descriptors {
         drop(platform::handles::recv_fd(stream)?);
@@ -2206,7 +2128,10 @@ fn refuse_malformed(stream: &mut LocalStream, frame: &Frame) -> io::Result<()> {
     let answer = Answer::refused(frame.seq, "malformed_request", frame.malformed.clone());
     write_frame(stream, &answer)
 }
-pub fn write_answer(stream: &mut LocalStream, answer: &Answer) -> io::Result<()> {
+pub fn write_answer(
+    stream: &mut LocalStream,
+    answer: &Answer,
+) -> io::Result<()> {
     write_frame(stream, answer)
 }
 fn scan(value: &Value) -> io::Result<()> {
@@ -2240,52 +2165,27 @@ mod codec_tests {
 
     fn ordinary_options() -> protocol::machine::TensorFSOptions {
         protocol::machine::TensorFSOptions {
-            endpoint: "https://ordinary.example.test".into(),
-            token: "supplied-test-bearer".into(),
+            endpoint: "https://ordinary.example.test".into(), token: "supplied-test-bearer".into(),
             ca_der: vec![1, 2, 3],
         }
     }
 
     fn ordinary_load() -> DeviceCommand {
         DeviceCommand::Load {
-            tensorfs: Some(ordinary_options()),
-            construction: "construction".into(),
-            devices: String::new(),
-            sequence_parallel_degree: 1,
-            binding: Box::default(),
-            budgets: Budgets::default(),
-            models: vec![],
-            authorized_device_limit_bytes: None,
-            attention_pin: String::new(),
-            pinned_bytes: None,
-            device_weights: false,
-            cap_bytes: None,
+            tensorfs: Some(ordinary_options()), construction: "construction".into(), devices: String::new(),
+            sequence_parallel_degree: 1, binding: Box::default(), budgets: Budgets::default(), models: vec![],
+            authorized_device_limit_bytes: None, attention_pin: String::new(),
+            pinned_bytes: None, device_weights: false, cap_bytes: None,
         }
     }
 
     fn ordinary_invoke() -> DeviceCommand {
         DeviceCommand::Invoke {
-            tensorfs: Some(Box::new(ordinary_options())),
-            max_output_bytes: 1024,
-            request_id: "request".into(),
-            construction: "construction".into(),
-            entrypoint: "write".into(),
-            spool: PathBuf::from("spool"),
-            deadline_s: None,
-            attention_kernel: String::new(),
-            bits: 0,
-            cap_bytes: None,
-            inputs: BTreeMap::new(),
-            trees: BTreeMap::new(),
-            floor_bytes: None,
-            activation_bytes: BTreeMap::new(),
-            squeezed_bytes: BTreeMap::new(),
-            device_weights: None,
-            sources: BTreeMap::new(),
-            weights: BTreeMap::new(),
-            destination: "owner/model".into(),
-            actor: "actor".into(),
-            operation: "operation".into(),
+            tensorfs: Some(Box::new(ordinary_options())), max_output_bytes: 1024, request_id: "request".into(),
+            construction: "construction".into(), entrypoint: "write".into(), spool: PathBuf::from("spool"), deadline_s: None,
+            attention_kernel: String::new(), bits: 0, cap_bytes: None, inputs: BTreeMap::new(), trees: BTreeMap::new(),
+            floor_bytes: None, activation_bytes: BTreeMap::new(), squeezed_bytes: BTreeMap::new(), device_weights: None,
+            sources: BTreeMap::new(), weights: BTreeMap::new(), destination: "owner/model".into(), actor: "actor".into(), operation: "operation".into(),
         }
     }
 
@@ -2294,55 +2194,28 @@ mod codec_tests {
         let error = write(&mut machine).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(!error.to_string().contains("supplied-test-bearer"));
-        write_command(
-            &mut machine,
-            &DeviceCommand::Hello,
-            &Group::default(),
-            false,
-        )
-        .unwrap();
+        write_command(&mut machine, &DeviceCommand::Hello, &Group::default(), false).unwrap();
         let bytes = seam::read_body(&mut runtime).unwrap().unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&bytes).unwrap(),
-            serde_json::json!({"cmd": "hello"})
-        );
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), serde_json::json!({"cmd": "hello"}));
     }
 
     #[test]
     fn ordinary_tensorfs_tokens_cross_the_actual_typed_command_writer_unchanged() {
-        let group = Group {
-            rank_caps: vec![17],
-            ..Default::default()
-        };
+        let group = Group { rank_caps: vec![17], ..Default::default() };
         for command in [ordinary_load(), ordinary_invoke()] {
             let mut expected = serde_json::to_value(&command).unwrap();
-            expected.as_object_mut().unwrap().extend(
-                serde_json::to_value(&group)
-                    .unwrap()
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            );
+            expected.as_object_mut().unwrap().extend(serde_json::to_value(&group).unwrap().as_object().unwrap().clone());
             let (mut machine, mut runtime) = platform::ipc::pair().unwrap();
             write_command(&mut machine, &command, &group, false).unwrap();
             let bytes = seam::read_body(&mut runtime).unwrap().unwrap();
             let received: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(
-                received, expected,
-                "the framing writer must not redact supplied access"
-            );
+            assert_eq!(received, expected, "the framing writer must not redact supplied access");
             assert_eq!(received["tensorfs"]["token"], "supplied-test-bearer");
             assert!(!format!("{command:?}").contains("supplied-test-bearer"));
         }
-        let start = DeviceCommand::Start {
-            devices: String::new(),
-            application: "module:app".into(),
-            package_interface: PathBuf::from("interface.json"),
-            sequence_parallel_degree: 1,
-            import_only: true,
-            call_interfaces: vec![],
-            constructions: vec![],
-        };
+        let start = DeviceCommand::Start { devices: String::new(), application: "module:app".into(),
+            package_interface: PathBuf::from("interface.json"), sequence_parallel_degree: 1,
+            import_only: true, call_interfaces: vec![], constructions: vec![] };
         let (mut machine, mut runtime) = platform::ipc::pair().unwrap();
         write_command(&mut machine, &start, &group, true).unwrap();
         let bytes = seam::read_body(&mut runtime).unwrap().unwrap();
@@ -2356,68 +2229,40 @@ mod codec_tests {
         for name in ["token", "Credential", "authorization", "SECRET", "jwt"] {
             let mut command = ordinary_invoke();
             if let DeviceCommand::Invoke { inputs, .. } = &mut command {
-                let forbidden = Value::Object(serde_json::Map::from_iter([(
-                    name.into(),
-                    "forbidden".into(),
-                )]));
+                let forbidden = Value::Object(serde_json::Map::from_iter([(name.into(), "forbidden".into())]));
                 inputs.insert("config".into(), serde_json::json!({"nested": [forbidden]}));
             }
-            rejected_without_a_partial_frame(|stream| {
-                write_command(stream, &command, &Group::default(), false)
-            });
+            rejected_without_a_partial_frame(|stream| write_command(stream, &command, &Group::default(), false));
         }
         let mut command = ordinary_invoke();
         if let DeviceCommand::Invoke { inputs, .. } = &mut command {
-            inputs.insert(
-                "payload".into(),
-                serde_json::json!({"cmd": "load", "tensorfs": {"token": "forbidden"}}),
-            );
+            inputs.insert("payload".into(), serde_json::json!({"cmd": "load", "tensorfs": {"token": "forbidden"}}));
         }
-        rejected_without_a_partial_frame(|stream| {
-            write_command(stream, &command, &Group::default(), false)
-        });
+        rejected_without_a_partial_frame(|stream| write_command(stream, &command, &Group::default(), false));
         let mut load = ordinary_load();
         if let DeviceCommand::Load { binding, .. } = &mut load {
             binding.snapshots.insert("token".into(), "forbidden".into());
         }
-        rejected_without_a_partial_frame(|stream| {
-            write_command(stream, &load, &Group::default(), false)
-        });
+        rejected_without_a_partial_frame(|stream| write_command(stream, &load, &Group::default(), false));
     }
 
     #[test]
     fn ordinary_tensorfs_access_is_not_authorized_by_other_commands_json_or_answers() {
-        let command = DeviceCommand::PrepareRequest {
-            request_id: "request".into(),
-            construction: "construction".into(),
-            entrypoint: "write".into(),
-            payload: serde_json::json!({"tensorfs": {"token": "forbidden"}}),
-            attention_kernel: String::new(),
-            bits: 0,
-            input_metadata: BTreeMap::new(),
-        };
-        rejected_without_a_partial_frame(|stream| {
-            write_command(stream, &command, &Group::default(), false)
-        });
-        let fork = DeviceCommand::Fork {
-            socket: PathBuf::from("socket"),
-            root: PathBuf::from("root"),
-            environment: BTreeMap::from([("token".into(), "forbidden".into())]),
-        };
-        rejected_without_a_partial_frame(|stream| {
-            write_command(stream, &fork, &Group::default(), false)
-        });
+        let command = DeviceCommand::PrepareRequest { request_id: "request".into(), construction: "construction".into(),
+            entrypoint: "write".into(), payload: serde_json::json!({"tensorfs": {"token": "forbidden"}}),
+            attention_kernel: String::new(), bits: 0, input_metadata: BTreeMap::new() };
+        rejected_without_a_partial_frame(|stream| write_command(stream, &command, &Group::default(), false));
+        let fork = DeviceCommand::Fork { socket: PathBuf::from("socket"), root: PathBuf::from("root"),
+            environment: BTreeMap::from([("token".into(), "forbidden".into())]) };
+        rejected_without_a_partial_frame(|stream| write_command(stream, &fork, &Group::default(), false));
         for discriminator in ["cmd", "command", "reply"] {
             let forged = Value::Object(serde_json::Map::from_iter([
-                (discriminator.into(), "load".into()),
-                ("tensorfs".into(), serde_json::json!({"token": "forbidden"})),
-            ]));
+                (discriminator.into(), "load".into()), ("tensorfs".into(), serde_json::json!({"token": "forbidden"}))]));
             rejected_without_a_partial_frame(|stream| write_frame(stream, &forged));
         }
         rejected_without_a_partial_frame(|stream| write_frame(stream, &ordinary_load()));
         let mut answer = Answer::ok(7);
-        answer.progress =
-            Some(serde_json::json!({"reply": "invoke", "tensorfs": {"token": "forbidden"}}));
+        answer.progress = Some(serde_json::json!({"reply": "invoke", "tensorfs": {"token": "forbidden"}}));
         rejected_without_a_partial_frame(|stream| write_answer(stream, &answer));
     }
 
@@ -2433,25 +2278,17 @@ mod codec_tests {
         let reply: Frame = serde_json::from_value(serde_json::json!({"ok": true, "quiescent": true,
             "outcome": {"terminal": "succeeded"}, "result_ref": {"digest": digest, "length": bytes.len()}}))
         .unwrap();
-        assert_eq!(
-            read_result(spool.path(), &reply).unwrap()["predictions"][2],
-            1
-        );
+        assert_eq!(read_result(spool.path(), &reply).unwrap()["predictions"][2], 1);
         fs::write(spool.path().join(RESULT_DOCUMENT), b"mutated").unwrap();
-        assert_eq!(
-            read_result(spool.path(), &reply).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
+        assert_eq!(read_result(spool.path(), &reply).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     /// An invoke reply's adjustment rows are advisory: each malformed one is skipped and the
     /// reply, the run and the other rows stand, in the executor's order, each text bounded.
     #[test]
     fn a_malformed_adjustment_row_is_skipped_and_the_reply_stands() {
-        let row = |kind: &str, field: &str| {
-            serde_json::json!({"field": field, "kind": kind,
-            "requested": "21.4", "applied": "15", "reason": "video truncated to 15 s", "source": "policy"})
-        };
+        let row = |kind: &str, field: &str| serde_json::json!({"field": field, "kind": kind,
+            "requested": "21.4", "applied": "15", "reason": "video truncated to 15 s", "source": "policy"});
         let long = "x".repeat(4096);
         let reply = serde_json::json!({"reply": "invoke", "ok": true, "adjustments": [
             row("adjusted", "assets.2.asset"),
@@ -2467,31 +2304,14 @@ mod codec_tests {
         assert!(frame.ok && frame.reply == "invoke");
         let kept = adjustments("run-1", &frame);
         assert_eq!(kept.len(), 2, "{kept:?}");
-        assert_eq!(
-            kept[0],
-            serde_json::from_value(row("adjusted", "assets.2.asset")).unwrap()
-        );
-        assert_eq!(
-            (kept[1].kind, kept[1].field.chars().count()),
-            (crate::journal::AdjustmentKind::Warn, MAX_ADJUSTMENT_TEXT)
-        );
+        assert_eq!(kept[0], serde_json::from_value(row("adjusted", "assets.2.asset")).unwrap());
+        assert_eq!((kept[1].kind, kept[1].field.chars().count()), (crate::journal::AdjustmentKind::Warn, MAX_ADJUSTMENT_TEXT));
 
-        let rows: Vec<_> = (0..MAX_ADJUSTMENTS + 3)
-            .map(|i| row("clamp", &format!("f{i}")))
-            .collect();
-        let many = Frame {
-            adjustments: rows.into(),
-            ..Default::default()
-        };
+        let rows: Vec<_> = (0..MAX_ADJUSTMENTS + 3).map(|i| row("clamp", &format!("f{i}"))).collect();
+        let many = Frame { adjustments: rows.into(), ..Default::default() };
         assert_eq!(adjustments("run-2", &many).len(), MAX_ADJUSTMENTS);
-        let none = Frame {
-            adjustments: serde_json::json!({"steps": 30}),
-            ..Default::default()
-        };
-        assert!(
-            adjustments("run-3", &none).is_empty()
-                && adjustments("run-4", &Frame::default()).is_empty()
-        );
+        let none = Frame { adjustments: serde_json::json!({"steps": 30}), ..Default::default() };
+        assert!(adjustments("run-3", &none).is_empty() && adjustments("run-4", &Frame::default()).is_empty());
     }
 
     /// A null in any optional field reads as its absence: a string, a flattened hello field,
@@ -2506,20 +2326,11 @@ mod codec_tests {
         }))
         .unwrap();
         let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
-        runtime
-            .write_all(&(body.len() as u32).to_be_bytes())
-            .unwrap();
+        runtime.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
         runtime.write_all(&body).unwrap();
         let frame = read_frame(&mut machine).unwrap().unwrap();
-        assert_eq!(
-            (frame.kind, frame.seq, frame.output.as_str()),
-            (Kind::Publish, 4, "image")
-        );
-        assert!(
-            frame.label.is_empty()
-                && frame.code.is_empty()
-                && frame.hello.runtime_version.is_empty()
-        );
+        assert_eq!((frame.kind, frame.seq, frame.output.as_str()), (Kind::Publish, 4, "image"));
+        assert!(frame.label.is_empty() && frame.code.is_empty() && frame.hello.runtime_version.is_empty());
         assert!(frame.call_request.is_none() && frame.size_bytes == 0 && frame.parts.is_empty());
     }
 
@@ -2528,22 +2339,17 @@ mod codec_tests {
     /// over `MAX_FRAME` is refused, before any body byte is read.
     #[test]
     fn a_frame_over_64_kib_crosses_and_a_lying_prefix_is_refused() {
-        let keys: Vec<String> = (0..20_000)
-            .map(|i| format!("model.visual.blocks.{i}.attn.qkv.weight"))
-            .collect();
+        let keys: Vec<String> = (0..20_000).map(|i| format!("model.visual.blocks.{i}.attn.qkv.weight")).collect();
         let reply = serde_json::json!({"reply": "load", "ok": true,
             "facts": {"ignored_extra_keys": keys, "filled_bytes": 7}});
         assert!(serde_json::to_vec(&reply).unwrap().len() > 512 << 10);
         let (mut runtime, mut machine) = platform::ipc::pair().unwrap();
-        let writer =
-            std::thread::spawn(move || write_frame(&mut runtime, &reply).map(|()| runtime));
+        let writer = std::thread::spawn(move || write_frame(&mut runtime, &reply).map(|()| runtime));
         let frame = read_frame(&mut machine).unwrap().unwrap();
         let mut runtime = writer.join().unwrap().unwrap();
         assert!(frame.ok && frame.reply == "load");
         assert_eq!(frame.facts.unwrap().filled_bytes, Some(7));
-        runtime
-            .write_all(&(seam::MAX_FRAME as u32 + 1).to_be_bytes())
-            .unwrap();
+        runtime.write_all(&(seam::MAX_FRAME as u32 + 1).to_be_bytes()).unwrap();
         let refused = read_frame(&mut machine).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{refused}");
     }
@@ -2557,24 +2363,13 @@ mod codec_tests {
         let malformed = serde_json::json!({"event": "request", "kind": "device_room", "seq": 9,
             "free_bytes": -23068672, "holding_bytes": 1, "descriptor": true});
         write_frame(&mut runtime, &malformed).unwrap();
-        platform::handles::send_fd(
-            &runtime,
-            &File::open(std::env::current_exe().unwrap()).unwrap(),
-        )
-        .unwrap();
+        platform::handles::send_fd(&runtime, &File::open(std::env::current_exe().unwrap()).unwrap()).unwrap();
         let frame = read_frame(&mut machine).unwrap().unwrap();
         assert_eq!((frame.event, frame.seq), (Some(Event::Request), 9));
-        assert!(
-            frame.malformed.contains("expected u64"),
-            "{}",
-            frame.malformed
-        );
+        assert!(frame.malformed.contains("expected u64"), "{}", frame.malformed);
         refuse_malformed(&mut machine, &frame).unwrap();
         let answer = read_frame(&mut runtime).unwrap().unwrap();
-        assert_eq!(
-            (answer.seq, answer.ok, answer.code.as_str()),
-            (9, false, "malformed_request")
-        );
+        assert_eq!((answer.seq, answer.ok, answer.code.as_str()), (9, false, "malformed_request"));
         let progress = serde_json::json!({"event": "progress", "stage": "x", "position": -1});
         write_frame(&mut runtime, &progress).unwrap();
         let dropped = read_frame(&mut machine).unwrap().unwrap();
@@ -2584,10 +2379,7 @@ mod codec_tests {
         write_frame(&mut runtime, &fine).unwrap();
         let next = read_frame(&mut machine).unwrap().unwrap();
         assert!(next.malformed.is_empty());
-        assert_eq!(
-            (next.kind, next.seq, next.free_bytes),
-            (Kind::DeviceRoom, 10, 5)
-        );
+        assert_eq!((next.kind, next.seq, next.free_bytes), (Kind::DeviceRoom, 10, 5));
     }
 
     #[test]
