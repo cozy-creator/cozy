@@ -10,6 +10,8 @@ mod catalog;
 mod machine;
 #[cfg(feature = "migrate")]
 mod migrate;
+#[cfg(feature = "migrate")]
+mod migrate_headers;
 mod quantize;
 pub(crate) mod refs;
 mod releases;
@@ -48,6 +50,10 @@ enum Verb {
     #[cfg(feature = "migrate")]
     #[command(hide = true)]
     Migrate(migrate::Args),
+    /// Dev builds only: move models from before D10 onto it, header-only.
+    #[cfg(feature = "migrate")]
+    #[command(hide = true)]
+    MigrateHeaders(migrate_headers::Args),
 }
 
 #[derive(clap::Args, Debug)]
@@ -206,5 +212,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Verb::Quantize(args) => quantize::quantize(ctx, args).await,
         #[cfg(feature = "migrate")]
         Verb::Migrate(args) => migrate::exec(ctx, args).await,
+        #[cfg(feature = "migrate")]
+        Verb::MigrateHeaders(args) => migrate_headers::exec(ctx, args).await,
     }
 }
