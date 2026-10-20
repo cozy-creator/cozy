@@ -143,7 +143,7 @@ row_scales = scales.squeeze(1)
 # weights_i8 and row_scales are ready for a matching rowwise-INT8 kernel.
 ```
 
-This target representation is `int8.rowwise` with `axis=0` and `scale_dtype="F32"`.
+This target representation is `int8.rowwise` with `axis=0` and an `F32` `scale` part.
 TensorFS handles the source encoding; the target quantizer above is ordinary PyTorch code.
 TensorFS has no re-encoding call: `ComponentWriter.put_encoded(...)` stores already-encoded arrays.
 Prepare this once when loading, rather than on every forward pass. Re-quantizing can add error;
@@ -321,7 +321,7 @@ repo → release → tree
                   └─ README.md, LICENSE, …
 ```
 
-A release names a `tensorfs.tree/1` tree. `variant=` selects a cozytensors file; `open` requires an explicit variant
+A release names a `cozytensors.tree/1` tree. `variant=` selects a cozytensors file; `open` requires an explicit variant
 when there is more than one. `revision="sha256:…"` can select an unpublished tree or header. Opening downloads
 metadata by default; each tensor read fetches only the objects it needs. Set `lazy=False` to wait for the whole
 checkpoint in the shared store, or call `checkpoint.download(components=["unet"])` to preload a selection.

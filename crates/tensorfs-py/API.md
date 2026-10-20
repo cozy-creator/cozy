@@ -362,7 +362,7 @@ raw.decode_into(
     memoryview(out),
     dtype="F32",
     shape=[2, 4],
-    params={"axis": 0, "scale_dtype": "F32"},
+    params={"axis": 0},
 )
 ```
 
