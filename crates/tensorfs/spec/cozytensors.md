@@ -8,11 +8,11 @@ without TensorFS, Cozy or Tensorhub. Library APIs, cache policy and GPU executio
 
 cozytensors/1 describes model weights as immutable, content-addressed objects. One **header** describes one model
 variant: its pipeline, components, plain or encoded tensors, and the chunks and assets those components use.
-A **tree** groups variant headers with shared repository files such as README and LICENSE. A **repo** document
-is the mutable index of releases and unreleased trees.
+A **tree** groups variant headers with shared repository files such as README and LICENSE; it is a repo's commit. A
+**repo** document is the mutable list of tags naming commits: public tags are releases, private ones the owner's.
 
 ```text
-repo -> release or unreleased tree -> variant header -> tensor chunks and component assets
+repo -> tag -> commit (tree) -> variant header -> tensor chunks and component assets
                                   -> shared repository files
 ```
 
@@ -20,7 +20,8 @@ Everything required to locate and decode a tensor is in its header and this spec
 depend on a repository name, release label, filename, Python package or particular model engine.
 
 The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119. §1–§8 define meaning; §9 defines the byte encoding
-of documents; §10 is informative writer guidance. Appendix A holds the schemes' fixed tables.
+of documents; §10 is informative writer guidance; §11 defines a checkpoint's logical file. Appendix A holds the
+schemes' fixed tables.
 
 ## 1. Objects
 
@@ -48,9 +49,9 @@ spelling. A reader also accepts `<kind>/1.<minor>`, the minor one or more decima
 
 | Document | `format` kind | Encoding (§9) | Usual name |
 |---|---|---|---|
-| tree | `tensorfs.tree` | JSON object | an object, cited by a repo |
+| tree | `cozytensors.tree` | JSON object | an object, cited by a repo |
 | header | `cozytensors` | CBOR array | the tree file `model.<variant>.cozytensors` |
-| repo | `tensorfs.repo` | JSON object | `refs/<org>/<name>.json` |
+| repo | `cozytensors.repo` | JSON object | `refs/<org>/<name>.json` |
 
 The schemas describe structure; they do not replace the rules below for canonical encoding, duplicate keys,
 value domains, arithmetic bounds and reference closure.
@@ -69,7 +70,7 @@ or more segments joined by `/`.
 ## 3. Tree
 
 ```
-{format: "tensorfs.tree/1", files: {path: object-ref}}
+{format: "cozytensors.tree/1", files: {path: object-ref}}
 ```
 
 - Every key of `files` MUST be a path whose first segment is not `chunks` (a plain folder's chunk directory).
@@ -649,28 +650,39 @@ or source-tree layout.
 ## 7. Repo, store and origin
 
 ```
-{format: "tensorfs.repo/1", name: "<org>/<name>",
- releases: [{version, tree: object-ref, yanked?, revision?}], checkpoints?: [object-ref]}
+{format: "cozytensors.repo/1", name: "<org>/<name>",
+ tags: [{name, commit: object-ref, public?, yanked?}]}
 ```
 
-- `name` is two segments. Versions MUST be non-empty and unique. Each release names a tree (§3); its variants are
-  the tree's files. Releases are listed in publication order, newest last.
-- `yanked` (boolean, default `false`) withdraws a release from unversioned lookups. `revision` (non-negative integer,
-  default 0) is the release's expected-revision counter: every change to the release increments it, and a writer
-  that changes a release conditions the change on the revision it read.
-- `checkpoints` (default empty) lists trees uploaded but not yet in any release.
-- **Resolution.** An unversioned lookup takes the newest release that is not yanked; an explicit version takes that
-  release, yanked or not (a reader MAY warn). The variant is then looked up in that release's tree. Without an
-  explicit variant, exactly one variant is selected automatically; zero gives no variant and more than one
-  requires an explicit choice. The unnamed variant has no implicit priority over other variants.
-- **Roots.** Every release's tree, yanked included, and every checkpoint are referenced roots of this repo document.
-  Keeping a complete copy of the repo requires keeping their closures. Local cache eviction policy is not part
-  of the document format.
+A repo is a set of **commits** and the **tags** that point at them, as in git:
+
+- A **commit** is an immutable repo state: a tree (§3). Its id is the tree's object ref. Every upload makes one.
+- A **tag** is a movable name for a commit. `tags` lists them in creation order: moving a tag keeps its place, a new
+  one is appended, a deleted one is removed. Names MUST be unique segments (§2) that do not start with `sha256:`.
+- `public` (boolean, default `false`): a public tag is a release, and its name MUST be a version (PEP 440). A private
+  tag is the owner's: a server serves it only to readers who may write the repo (distribution.md §4).
+- `yanked` (boolean, default `false`) withdraws a tag from unversioned lookups.
+- Any change is a new document: a writer conditions it on the whole document it read (its ETag, distribution.md §4).
+  Nothing in it counts edits.
+- **Resolution** of a `revision`, once, to a commit:
+  - none: among public, non-yanked tags, the highest final version in PEP 440 order; a pre-release (`a`, `b`,
+    `rc`, `.dev`) only when no final version exists; of equal versions (`1.0`, `1.0.0`), the later-created tag;
+  - `sha256:<hex>`: the tag commit with that digest; else a variant header with that digest, at the commit that cites
+    it (the default's if it does, else the last-created tag's whose commit does); else not found;
+  - otherwise the tag of that name, yanked or not (a reader MAY warn); else not found.
+
+  The variant is then looked up in that commit's tree. Without an explicit variant, exactly one variant is selected
+  automatically; zero gives no variant and more than one requires an explicit choice. The unnamed variant has no
+  implicit priority over other variants. A commit id and a header digest name immutable content; a tag moves,
+  and a commit no tag names is collected (below).
+- **Roots.** The tags' commits, yanked or private included, are this repo's referenced roots; nothing else is. Keeping
+  a complete copy of the repo requires keeping their closures. Local cache eviction policy is not part of the
+  document format.
 - Repo names are case-insensitive: `Acme/SDXL` and `acme/sdxl` are one repo. Keys and paths use the name with ASCII
   `A`–`Z` lowered (`refs/acme/sdxl.json`); the document's `name` keeps the writer's spelling.
 - A **store** or **static origin** is a directory, bucket or HTTP prefix holding `refs/<org>/<name>.json` and
-  `blobs/…` (§1). A reader resolves name → release → tree → variant header → chunks and assets, verifying every object
-  where it enters.
+  `blobs/…` (§1). A reader resolves name → tag → commit (tree) → variant header → chunks and assets, verifying every
+  object where it enters.
 - Reading and publishing at an endpoint over HTTP, S3 or a directory: [distribution.md](distribution.md).
 
 **Closure.** A cozytensors' closure is its header's closure (§4): the header and every object it cites, its `chunks`
@@ -728,7 +740,7 @@ wrong JSON type. Whitespace between tokens is allowed. A writer MUST produce the
 - strings with `"` and `\` escaped as `\"` and `\\`, the controls U+0008, U+0009, U+000A, U+000C and U+000D as `\b`,
   `\t`, `\n`, `\f`, `\r`, other controls below U+0020 as `\u00XX` (lowercase hex), and every other character as its
   UTF-8 bytes (Python: `json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`);
-- optional fields at their default omitted: empty `checkpoints`, `yanked: false`, `revision: 0`.
+- optional fields at their default omitted: `public: false`, `yanked: false`; `tags` is always written.
 
 ## 10. Chunks (informative)
 
@@ -757,6 +769,20 @@ construction order. A reference can be applied structurally:
   `#`), merged over every instance of that parent; indices ascend;
 - a child the reference does not hold, or every key of a class without a reference, keeps the source's data order
   after the known children, and is reported.
+
+## 11. Logical file
+
+A `.cozytensors` file holds only its header (§4); nothing packs a checkpoint into one stored file. A checkpoint's
+**logical file** is all of its bytes as one read-only byte string, for a consumer that wants a single file. A reader
+assembles it from the objects on demand:
+
+- offset 0: the header's bytes;
+- then each object of `chunks` in order, then every component's assets (components in header order, each
+  component's in its asset map's encoded key order, §9), each object starting at the next multiple of 4096 after the
+  previous one ends; an object cited twice appears twice;
+- gaps are zero bytes, and the file ends where its last object ends.
+
+The layout depends only on the header, so every object's offset follows from it.
 
 ## Appendix A. Fixed tables
 
