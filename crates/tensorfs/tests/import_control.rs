@@ -467,33 +467,40 @@ fn cancellation_after_progress_stops_before_tensor_write() {
     assert!(writer.committed().is_none());
 }
 
+struct CancelWriter<'a> {
+    writer: &'a mut tensorfs::writer::Writer,
+    stop: &'a AtomicBool,
+    during_commit: bool,
+}
+impl import::Sink for CancelWriter<'_> {
+    fn begin(&mut self, variant: &str, layout: &import::Layout) -> Result<()> {
+        import::Sink::begin(self.writer, variant, layout)
+    }
+    fn put(
+        &mut self,
+        component: &str,
+        key: &str,
+        dtype: &tensorfs::format::Dtype,
+        shape: &[u64],
+        encoding: Option<&tensorfs::format::Encoding>,
+        parts: Vec<import::Part<'_>>,
+    ) -> Result<()> {
+        import::Sink::put(self.writer, component, key, dtype, shape, encoding, parts)?;
+        if !self.during_commit {
+            self.stop.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+    fn commit(&mut self, metadata: tensorfs::format::Metadata) -> Result<()> {
+        if self.during_commit {
+            self.stop.store(true, Ordering::Release);
+        }
+        import::Sink::commit(self.writer, metadata)
+    }
+}
+
 #[test]
 fn stop_after_real_tensor_write_prevents_final_commit() {
-    struct StopAfterPut<'a> {
-        writer: &'a mut tensorfs::writer::Writer,
-        stop: &'a AtomicBool,
-    }
-    impl import::Sink for StopAfterPut<'_> {
-        fn begin(&mut self, variant: &str, layout: &import::Layout) -> Result<()> {
-            import::Sink::begin(self.writer, variant, layout)
-        }
-        fn put(
-            &mut self,
-            component: &str,
-            key: &str,
-            dtype: &tensorfs::format::Dtype,
-            shape: &[u64],
-            encoding: Option<&tensorfs::format::Encoding>,
-            parts: Vec<import::Part<'_>>,
-        ) -> Result<()> {
-            import::Sink::put(self.writer, component, key, dtype, shape, encoding, parts)?;
-            self.stop.store(true, Ordering::Release);
-            Ok(())
-        }
-        fn commit(&mut self, metadata: tensorfs::format::Metadata) -> Result<()> {
-            import::Sink::commit(self.writer, metadata)
-        }
-    }
     let scratch = Scratch::new();
     let file = scratch.0.join("model.safetensors");
     fs::write(&file, safetensors()).unwrap();
@@ -514,9 +521,10 @@ fn stop_after_real_tensor_write_prevents_final_commit() {
             progress: &|_, _, _| {},
             stop: Some(&stopping),
         },
-        &mut StopAfterPut {
+        &mut CancelWriter {
             writer: &mut writer,
             stop: &stop,
+            during_commit: false,
         },
     )
     .unwrap_err();
@@ -532,7 +540,7 @@ fn stop_after_real_tensor_write_prevents_final_commit() {
 }
 
 #[test]
-fn late_stop_cannot_undo_header_finalization_but_prevents_tree_and_ref_publication() {
+fn final_progress_stop_prevents_header_tree_and_ref_publication() {
     let scratch = Scratch::new();
     let file = scratch.0.join("model.safetensors");
     fs::write(&file, safetensors()).unwrap();
@@ -560,9 +568,51 @@ fn late_stop_cannot_undo_header_finalization_but_prevents_tree_and_ref_publicati
     assert_eq!(error.kind, tensorfs::Kind::Network);
     assert!(store.get_ref("local/no-ref").unwrap().is_none());
     assert!(
-        store.get_pin("import.local.no-ref").unwrap().is_some(),
-        "already committed resume output was incorrectly claimed undone"
+        store.get_pin("import.local.no-ref").unwrap().is_none(),
+        "final progress cancellation committed a header"
     );
+}
+
+#[test]
+fn stop_after_finalization_begins_cannot_undo_committed_header() {
+    let scratch = Scratch::new();
+    let file = scratch.0.join("model.safetensors");
+    fs::write(&file, safetensors()).unwrap();
+    let sources = vec![file.to_str().unwrap().to_owned()];
+    let store = Store::open(scratch.0.join("store")).unwrap();
+    let mut writer = store.writer(None, None).unwrap();
+    let stop = AtomicBool::new(false);
+    let stopping = || stop.load(Ordering::Acquire);
+    let progress = |_: &str, _, _| {
+        assert!(
+            !stop.load(Ordering::Acquire),
+            "callback ran after finalization began"
+        );
+    };
+    let access = Access::default();
+    let tmp = store.root().join("tmp");
+    import::convert(
+        &Request {
+            sources: &sources,
+            converter: None,
+            variant: None,
+            access: &access,
+            tmp: &tmp,
+            progress: &progress,
+            stop: Some(&stopping),
+        },
+        &mut CancelWriter {
+            writer: &mut writer,
+            stop: &stop,
+            during_commit: true,
+        },
+    )
+    .unwrap();
+    assert!(stop.load(Ordering::Acquire));
+    let ck = store
+        .checkpoint(writer.committed().expect("finalization did not finish"))
+        .unwrap();
+    assert_eq!(ck.read("model", "weight").unwrap(), DATA);
 }
 
 #[test]
