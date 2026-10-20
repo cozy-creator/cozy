@@ -142,6 +142,10 @@ def main(ctx: Context, *, native_wheel: Annotated[FileAsset, AssetBound(max_byte
                 script = receipts / 'source' / SPEC['kernel']['file']
                 extra = SPEC['kernel']['argv']
                 marker = SPEC['kernel']['schema']
+            elif name == native['RESIDENT']:
+                row = SPEC['resident_decode']
+                script = receipts / 'source' / row['file']
+                extra = ['--gpu', '--vectors', str(receipts / 'source' / row['vectors_file'])]
             else:
                 script = receipts / 'source' / SPEC['consumers'][name]['file']
                 extra = ['--device', 'cuda:0', '--native-source', SPEC['native']['source'], '--wheel', str(wheel),
@@ -162,6 +166,10 @@ def main(ctx: Context, *, native_wheel: Annotated[FileAsset, AssetBound(max_byte
                 if native_case:
                     gpu = json.loads((receipts / 'reports/diffusers-identity.json').read_text())['gpu_uuid']
                     result = native['parse'](name, stdout, SPEC['native'], gpu)
+                elif name == native['RESIDENT']:
+                    gpu = json.loads((receipts / f'reports/{name}-identity.json').read_text())['gpu_uuid']
+                    result = native['parse_resident'](stdout, SPEC['resident_decode'], SPEC['native'],
+                                                      SPEC['dependencies']['versions']['torch'], gpu)
                 else:
                     result = report(stdout, marker)
                 (receipts / f'reports/{name}.json').write_text(json.dumps(result, indent=2) + '\n')

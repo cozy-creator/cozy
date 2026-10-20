@@ -19,7 +19,7 @@ identity = {'mode': mode, 'python_optimize': sys.flags.optimize,
             'cublas_workspace_config': os.environ.get('CUBLAS_WORKSPACE_CONFIG'),
             'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES')}
 try:
-    assert mode in ('kernel', 'diffusers', 'comfy'), 'native I/O proofs require a fresh direct-script process'
+    assert mode in ('kernel', 'diffusers', 'comfy', 'resident-decode'), 'native I/O proofs require a fresh direct-script process'
     assert sys.flags.optimize == 0, 'optimized Python disables proof assertions'
     assert identity['triton_interpret'] in ('', '0'), 'interpreter fallback is forbidden'
     assert identity['cublas_workspace_config'] == ':4096:8', 'deterministic matmul environment must precede CUDA init'

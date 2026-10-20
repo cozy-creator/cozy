@@ -1,6 +1,7 @@
 """Stdlib proof-contract tests. Synthetic GPU-shaped records are NOT device evidence."""
 import argparse
 import ast
+import base64
 import copy
 import hashlib
 import io
@@ -26,6 +27,38 @@ PROVIDER_SOURCE = '7778b76d3e8eb0e9140cbf5fdca7eb487224cfd6'
 KERNEL_SOURCE = 'bceb259ac8f4229ea37ef512618d485880680662'
 COMBINED_SOURCE = 'def5e7a31c91ce1349c247439e802bf5163d1d8f'
 UUID = 'GPU-12345678-1234-1234-1234-123456789abc'
+RESIDENT_SOURCE = 'def5e7a31c91ce1349c247439e802bf5163d1d8f'
+
+
+def resident_report(files, native):
+    """Synthetic receipt from corpus metadata; never import or run the subject."""
+    corpus = json.loads(files['crates/tensorfs/conformance/vectors/cases/comfy.json'])['cases']
+    positive = [r for r in corpus if not r.get('refuse')]
+    derived = dict(next(r for r in positive if r['key'] == 'w4a8-correction-g48-bf16'))
+    derived['key'] += '-exact-f16-correction'
+    records = [{'key': r['key'], 'result': 'passed', 'kind': 'golden',
+                'bytes': len(base64.b64decode(r['expect']))} for r in [*positive, derived]]
+    records += [{'key': r['key'], 'result': 'passed', 'kind': 'expected-refusal', 'family': 'decode',
+                 'value_error_output_unspecified': r['key'] == 's-rel-nan'} for r in corpus if r.get('refuse')]
+    records.append({'key': 'zero-output-pending-codebook', 'result': 'passed', 'kind': 'completion-control',
+                    'producer_complete_at_return': True, 'output_complete_at_return': True,
+                    'codebook_sha256': '58dda328598e2f7fe472621bfc54935aaa354d1a6ebcaf9562cd743fd575eb19'})
+    return {'mode': 'gpu', 'passed': 34, 'failed': 0, 'skipped': 0, 'original_positive': 18,
+            'derived_f16_positive': 1, 'expected_refusal': 14, 'completion_control': 1, 'raw_calls': 41,
+            'cases': records, 'metadata_cast_dtypes': ['BF16', 'F16', 'F32', 'F8_E4M3'],
+            'stream_control': {'producer_pending_before': True, 'output_pending_before': True,
+                               'producer_complete_at_return': True, 'output_complete_at_return': True,
+                               'source_stream': 123456, 'output_stream': 654321},
+            'storage_controls': {'byte_offset': 8, 'managed_deletions': 3, 'cuda_managed_deletions': 1,
+                                 'mixed_cpu_managed_deletions': 2, 'actual_cuda_owner_released': True,
+                                 'used_alias_refused': True, 'overlap_family': 'invalid',
+                                 'overlap_output_unchanged': True, 'mixed_host_cuda_family': 'unsupported',
+                                 'mixed_cuda_host_family': 'unsupported', 'mixed_outputs_unchanged': True},
+            'corpus_sha256': '56758d0c82b7b0d173d8db25cd5362ad9db348839e5f4e22ce664784c0e56043',
+            'tensorfs_version': native['version'], 'torch_version': '2.14.0+cu130', 'device_count': 1,
+            'gpu_uuid': UUID, 'native_sha256': native['extension_sha256'],
+            'script_sha256': '2e46411b9d17c2fac6ddbf226e7a0edb9750c8ebc2033fc5ddaf5aca0b0c86f7',
+            'scope': 'resident GPU decode corpus/refusals and checked producer/output ordering; no full model or unknown CUDA-fault injection'}
 
 
 def write(path, value):
@@ -75,7 +108,7 @@ class Contract(unittest.TestCase):
                                       require_native_mode=[], requirements=self.requirements,
                                       comfy_bundle=self.bundle, comfy_sha256=validate.sha(self.bundle))
 
-    def fixture(self, kernel=False, native=False):
+    def fixture(self, kernel=False, native=False, resident=False):
         if kernel:
             self.args.include_kernel = True
         self.args.include_native_io = native
@@ -85,6 +118,9 @@ class Contract(unittest.TestCase):
             self.args.proof_source = self.args.native_source = KERNEL_SOURCE
         if kernel and native:
             self.args.proof_source = self.args.native_source = COMBINED_SOURCE
+        self.args.include_resident_decode = resident
+        if resident:
+            self.args.proof_source = self.args.native_source = RESIDENT_SOURCE
         sidecar = make_payload.generate(self.args)
         expected = validate.read(sidecar)
         spec = dict(expected)
@@ -185,6 +221,8 @@ class Contract(unittest.TestCase):
                          'routing': {'prepared': 'Kernel', 'host_only_exclusions': []},
                          'runtime': {'torch_installed': False, 'triton_installed': False,
                                      'torch_imported': False, 'triton_imported': False}}
+            elif name == native_io.RESIDENT:
+                value = resident_report(files, spec['native'])
             else:
                 value = validate.read(HERE / 'fixtures' / f'{name}-cpu.json')['evidence']
                 value.update(proof=f'public-tensorfs-{name}-unet-cuda', device='cuda:0', gpu_origin_writer=True,
@@ -193,7 +231,13 @@ class Contract(unittest.TestCase):
                              script_sha256=spec['consumers'][name]['sha256'])
             write(root / f'reports/{name}-identity.json', child)
             self.result(root, name, value)
-            parts.append({'name': name, **completed(KERNEL_SECONDS if name == 'kernel' else CONSUMER_SECONDS)})
+            part = {'name': name, **completed(KERNEL_SECONDS if name == 'kernel' else CONSUMER_SECONDS)}
+            if name == native_io.RESIDENT:
+                part['command'] = ['/fixture/python', '/fixture/source/child.py',
+                                   '/fixture/reports/resident-decode-identity.json', name,
+                                   '/fixture/source/' + expected['resident_decode']['file'], '--gpu', '--vectors',
+                                   '/fixture/source/' + expected['resident_decode']['vectors_file']]
+            parts.append(part)
         write(root / 'verdict.json', {'ok': True, 'requested': spec['requested'], 'unrequested': spec['unrequested'], 'parts': parts})
         self.inventory(root)
         run = {'id': 'run-' + '1' * 24, 'number': 12, 'status': 'completed', 'machine': 'fixture-machine', 'measurements': {'execution': {'degree': 1,
@@ -432,7 +476,7 @@ class Contract(unittest.TestCase):
         self.assertEqual(expected['proof_source'], COMBINED_SOURCE)
         self.assertEqual(expected['kernel']['source'], COMBINED_SOURCE)
         self.assertEqual(expected['native_io']['source'], COMBINED_SOURCE)
-        self.assertEqual(expected['requested'], native_io.ALL)
+        self.assertEqual(expected['requested'], [name for name in native_io.ALL if name != native_io.RESIDENT])
         self.assertTrue(validate.validate(root, expected, run, machine, launch, require_kernel=True)['ok'])
 
     def test_frozen_matrix_and_rotation_boundaries_have_independent_offsets(self):
@@ -652,6 +696,127 @@ class Contract(unittest.TestCase):
             PROOF_SOURCE + ':crates/tensorfs-py/scripts/cuda_varena_source.py').decode()
         with self.assertRaisesRegex(ValueError, 'provider mode inventory differs'):
             native_io.check_source('provider-cleanup', source)
+
+    def test_resident_def5_source_layout_contract_and_all_modes(self):
+        root, expected, run, machine, launch = self.fixture(kernel=True, native=True, resident=True)
+        self.assertEqual(expected['proof_source'], RESIDENT_SOURCE)
+        self.assertEqual(expected['requested'], native_io.ALL)
+        contract = expected['resident_decode']
+        self.assertEqual(contract['timeout_s'], 180)
+        self.assertEqual(contract['argv'], ['--gpu', '--vectors', contract['vectors_file']])
+        self.assertEqual(contract['counts']['raw_calls'], 41)
+        self.assertEqual(len(contract['cases']), 34)
+        self.assertEqual(len(contract['goldens']), 19)
+        self.assertEqual({r['dtype'] for r in contract['goldens']}, {'F32', 'F16', 'BF16'})
+        self.assertEqual(contract['goldens'][7]['sha256'], contract['goldens'][-1]['sha256'])
+        self.assertEqual(Path(contract['file']).parent, Path(contract['helper_file']).parent)
+        for path, digest in native_io.RESIDENT_FILES.items():
+            self.assertEqual(validate.sha(root / 'source' / path), digest)
+        self.assertTrue(validate.validate(root, expected, run, machine, launch,
+                                          require_kernel=True, require_resident=True)['ok'])
+
+    def test_resident_is_optional_and_must_be_requested_for_acceptance(self):
+        with self.assertRaisesRegex(ValueError, 'resident proof was not requested'):
+            validate.validate(*self.fixture(), require_resident=True)
+
+    def test_resident_counts_rows_and_identity_keep_exact_types(self):
+        root, expected, *_ = self.fixture(resident=True)
+        value = validate.read(root / 'reports/resident-decode.json')
+        contract, native = expected['resident_decode'], expected['native']
+        changes = [{'mode': 'cpu'}, {'passed': 14}, {'passed': 34.0}, {'failed': False},
+                   {'skipped': True}, {'raw_calls': 39}, {'raw_calls': 40}, {'device_count': True},
+                   {'device_count': 2}, {'tensorfs_version': 'old'}, {'torch_version': '2.14.0'},
+                   {'native_sha256': '0' * 64}, {'script_sha256': '0' * 64},
+                   {'corpus_sha256': '0' * 64}, {'gpu_uuid': 'GPU-' + '0' * 32},
+                   {'metadata_cast_dtypes': ['F32']}, {'unknown': True}]
+        for change in changes:
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                native_io.parse_resident(json.dumps({**value, **change}), contract, native, '2.14.0+cu130', UUID)
+        mutations = [('missing', lambda rows: rows.pop()),
+                     ('duplicate', lambda rows: rows.append(dict(rows[0]))),
+                     ('key', lambda rows: rows[0].update(key='other')),
+                     ('kind', lambda rows: rows[0].update(kind='skipped')),
+                     ('length', lambda rows: rows[0].update(bytes=4095)),
+                     ('length-type', lambda rows: rows[0].update(bytes=4096.0)),
+                     ('refusal', lambda rows: rows[19].update(family='invalid')),
+                     ('value-error', lambda rows: next(r for r in rows if r['key'] == 's-rel-nan').update(value_error_output_unspecified=False)),
+                     ('completion', lambda rows: rows[-1].update(producer_complete_at_return=False)),
+                     ('codebook', lambda rows: rows[-1].update(codebook_sha256='0' * 64))]
+        for label, mutate in mutations:
+            changed = copy.deepcopy(value)
+            mutate(changed['cases'])
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                native_io.parse_resident(json.dumps(changed), contract, native, '2.14.0+cu130', UUID)
+
+    def test_resident_completion_ownership_and_mixed_device_cannot_be_omitted(self):
+        root, expected, *_ = self.fixture(resident=True)
+        value = validate.read(root / 'reports/resident-decode.json')
+        changes = [('stream_control', key, False) for key in ('producer_pending_before', 'output_pending_before',
+                   'producer_complete_at_return', 'output_complete_at_return')]
+        changes += [('stream_control', 'source_stream', v) for v in (True, 1, 2, 654321)]
+        changes += [('stream_control', 'output_stream', 123456.0)]
+        changes += [('storage_controls', key, replacement) for key, replacement in [
+            ('byte_offset', 0), ('managed_deletions', 2), ('cuda_managed_deletions', True),
+            ('mixed_cpu_managed_deletions', 0), ('actual_cuda_owner_released', False),
+            ('used_alias_refused', False), ('overlap_family', 'decode'), ('overlap_output_unchanged', False),
+            ('mixed_host_cuda_family', 'invalid'), ('mixed_cuda_host_family', 'invalid'),
+            ('mixed_outputs_unchanged', False)]]
+        for group, key, replacement in changes:
+            changed = copy.deepcopy(value)
+            changed[group][key] = replacement
+            with self.subTest(group=group, key=key, replacement=replacement), self.assertRaises(ValueError):
+                native_io.parse_resident(json.dumps(changed), expected['resident_decode'], expected['native'], '2.14.0+cu130', UUID)
+        for group in ('stream_control', 'storage_controls'):
+            changed = copy.deepcopy(value)
+            changed.pop(group)
+            with self.subTest(missing=group), self.assertRaises(ValueError):
+                native_io.parse_resident(json.dumps(changed), expected['resident_decode'], expected['native'], '2.14.0+cu130', UUID)
+
+    def test_resident_stdout_rejects_duplicate_nonfinite_and_extra_records(self):
+        root, expected, *_ = self.fixture(resident=True)
+        raw = (root / 'logs/resident-decode.stdout').read_text()
+        for text in ('', 'null', '{"mode":"cpu","passed":14}', raw + raw, 'ignored\n' + raw,
+                     raw.replace('"raw_calls": 41', '"raw_calls": NaN'),
+                     raw.replace('"mode": "gpu"', '"mode": "cpu", "mode": "gpu"')):
+            with self.subTest(text=text[:60]), self.assertRaises(ValueError):
+                native_io.parse_resident(text, expected['resident_decode'], expected['native'], '2.14.0+cu130', UUID)
+
+    def test_resident_source_drift_refused_before_payload_output(self):
+        root, expected, *_ = self.fixture(resident=True)
+        files = {p: (root / 'source' / p).read_text() for p in native_io.RESIDENT_FILES}
+        for path in files:
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'resident source/corpus differs'):
+                native_io.resident_contract({**files, path: files[path] + '\n'})
+        self.args.output = self.root / 'second-payload.py'
+        self.args.proof_source = self.args.native_source = PROVIDER_SOURCE
+        with self.assertRaisesRegex(ValueError, 'resident source/corpus unavailable'):
+            make_payload.generate(self.args)
+        self.assertFalse(self.args.output.exists())
+
+    def test_resident_real_stdout_and_invocation_required_after_tree_rebind(self):
+        root, expected, run, machine, launch = self.fixture(resident=True)
+        original = validate.read(root / 'reports/resident-decode.json')
+        changed = {**original, 'raw_calls': 39}
+        self.result(root, native_io.RESIDENT, changed)
+        self.inventory(root)
+        self.bind(root, run)
+        with self.assertRaisesRegex(ValueError, 'resident counts/cases/artifact differ'):
+            validate.validate(root, expected, run, machine, launch)
+        self.result(root, native_io.RESIDENT, original)
+        verdict = validate.read(root / 'verdict.json')
+        part = next(p for p in verdict['parts'] if p['name'] == native_io.RESIDENT)
+        correct = copy.deepcopy(part)
+        changes = [{'command': [*part['command'][:5], '--cpu', *part['command'][6:]]},
+                   {'command': [*part['command'][:-1], '/other/comfy.json']},
+                   {'timed_out': True}, {'rc': 1}, {'reaped': False}, {'lingering_descendants': True}]
+        for change in changes:
+            part.clear()
+            part.update({**correct, **change})
+            write(root / 'verdict.json', verdict)
+            self.inventory(root)
+            self.bind(root, run)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                validate.validate(root, expected, run, machine, launch)
 
 
 class OwnedChild(unittest.TestCase):

@@ -3,14 +3,23 @@
 These validate emitted evidence only. They import no framework and execute no proof.
 """
 import ast
+import base64
 import hashlib
 import json
 import math
 from pathlib import PurePosixPath
 import re
+import struct
 
 IDS = ['read-engine', 'provider-cleanup', 'fork-cleanup']
-ALL = ['diffusers', 'comfy', 'kernel', *IDS]
+RESIDENT = 'resident-decode'
+ALL = ['diffusers', 'comfy', 'kernel', *IDS, RESIDENT]
+RESIDENT_FILES = {
+    'crates/tensorfs-py/scripts/prove-resident-decode.py': '2e46411b9d17c2fac6ddbf226e7a0edb9750c8ebc2033fc5ddaf5aca0b0c86f7',
+    'crates/tensorfs-py/scripts/prove-dlpack-owner.py': '29f1e043be520010ddfd1a6981c5f786563688df241ad2e8fe19e5c4cf4a06a0',
+    'crates/tensorfs/conformance/vectors/cases/comfy.json': '56758d0c82b7b0d173d8db25cd5362ad9db348839e5f4e22ce664784c0e56043',
+}
+RESIDENT_TIMEOUT = 180
 CASES = ['last-weightset', 'callback-close', 'last-pin', 'last-consumer', 'pending-consumer-b',
          'pending-ptds-consumer', 'pending-legacy-consumer']
 READ_MARKER = 'CUDA arrays: chunk-spanning reads, prebuilt decode, raw parts, DLPack sharing/copy and retained consumers passed'
@@ -25,6 +34,99 @@ def require(ok, message):
 
 def sha(raw):
     return hashlib.sha256(raw).hexdigest()
+
+
+def strict_json(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            require(key not in result, 'duplicate JSON key: ' + key)
+            result[key] = value
+        return result
+    def invalid(value):
+        raise ValueError('nonfinite JSON number: ' + value)
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=invalid)
+
+
+def exact(value, expected):
+    if type(value) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return value.keys() == expected.keys() and all(exact(value[k], v) for k, v in expected.items())
+    if isinstance(expected, list):
+        return len(value) == len(expected) and all(exact(v, e) for v, e in zip(value, expected))
+    return value == expected
+
+
+def resident_contract(files):
+    """Independent expected rows from def5's frozen corpus, never the subject code."""
+    for path, expected in RESIDENT_FILES.items():
+        require(path in files and sha(files[path].encode()) == expected,
+                'resident source/corpus differs: ' + path)
+    script, helper, vectors = RESIDENT_FILES
+    cases = strict_json(files[vectors])['cases']
+    positive = [r for r in cases if not r.get('refuse')]
+    negative = [r for r in cases if r.get('refuse')]
+    require(len(positive) == 18 and len(negative) == 14, 'resident corpus inventory differs')
+    # The subject adds this exact F16 carrier variant without changing logical output.
+    original = next(r for r in positive if any(p['role'] == 'weight_correction' and
+                                               p['dtype'] == 'BF16' for p in r['parts']))
+    correction = next(p for p in original['parts'] if p['role'] == 'weight_correction')
+    values = [struct.unpack('<f', struct.pack('<I', word[0] << 16))[0]
+              for word in struct.iter_unpack('<H', base64.b64decode(correction['bits'], validate=True))]
+    require(all(math.isfinite(v) and struct.unpack('<e', struct.pack('<e', v))[0] == v for v in values),
+            'resident correction cannot be narrowed exactly')
+    derived = {**original, 'key': original['key'] + '-exact-f16-correction'}
+    rows, goldens = [], []
+    for row in [*positive, derived]:
+        raw = base64.b64decode(row['expect'], validate=True)
+        require(len(raw) == math.prod(row['shape']) * {'F32': 4, 'BF16': 2, 'F16': 2}[row['dtype']],
+                'resident golden length differs')
+        rows.append({'key': row['key'], 'result': 'passed', 'kind': 'golden', 'bytes': len(raw)})
+        goldens.append({'key': row['key'], 'dtype': row['dtype'], 'shape': row['shape'], 'sha256': sha(raw)})
+    rows.extend({'key': row['key'], 'result': 'passed', 'kind': 'expected-refusal', 'family': 'decode',
+                 'value_error_output_unspecified': row['key'] == 's-rel-nan'} for row in negative)
+    rows.append({'key': 'zero-output-pending-codebook', 'result': 'passed', 'kind': 'completion-control',
+                 'producer_complete_at_return': True, 'output_complete_at_return': True,
+                 'codebook_sha256': sha(struct.pack('<16f', *range(16)))})
+    require(len(rows) == len({r['key'] for r in rows}) == 34, 'resident duplicate/missing case')
+    return {'file': script, 'helper_file': helper, 'vectors_file': vectors,
+            'argv': ['--gpu', '--vectors', vectors], 'timeout_s': RESIDENT_TIMEOUT,
+            'sources': dict(RESIDENT_FILES), 'cases': rows, 'goldens': goldens,
+            'counts': {'passed': 34, 'failed': 0, 'skipped': 0, 'original_positive': 18,
+                       'derived_f16_positive': 1, 'expected_refusal': 14, 'completion_control': 1, 'raw_calls': 41}}
+
+
+def parse_resident(stdout, contract, native, torch_version, gpu_uuid):
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    require(len(lines) == 1, 'resident missing/duplicate/extra stdout record')
+    value = strict_json(lines[0])
+    require(isinstance(value, dict), 'resident output is not an object')
+    expected = {'mode': 'gpu', **contract['counts'], 'cases': contract['cases'],
+                'metadata_cast_dtypes': ['BF16', 'F16', 'F32', 'F8_E4M3'],
+                'corpus_sha256': RESIDENT_FILES[contract['vectors_file']],
+                'tensorfs_version': native['version'], 'torch_version': torch_version,
+                'device_count': 1, 'native_sha256': native['extension_sha256'],
+                'script_sha256': RESIDENT_FILES[contract['file']],
+                'scope': 'resident GPU decode corpus/refusals and checked producer/output ordering; no full model or unknown CUDA-fault injection'}
+    require(value.keys() == expected.keys() | {'stream_control', 'storage_controls', 'gpu_uuid'},
+            'resident field inventory differs')
+    require(all(exact(value[k], v) for k, v in expected.items()), 'resident counts/cases/artifact differ')
+    require(uuid(value['gpu_uuid']) == uuid(gpu_uuid), 'resident physical GPU UUID differs')
+    stream = value['stream_control']
+    flags = {k: True for k in ('producer_pending_before', 'output_pending_before',
+                               'producer_complete_at_return', 'output_complete_at_return')}
+    require(isinstance(stream, dict) and stream.keys() == flags.keys() | {'source_stream', 'output_stream'}
+            and all(stream[k] is v for k, v in flags.items())
+            and all(type(stream[k]) is int and stream[k] > 2 for k in ('source_stream', 'output_stream'))
+            and stream['source_stream'] != stream['output_stream'], 'resident stream completion differs')
+    storage = {'byte_offset': 8, 'managed_deletions': 3, 'cuda_managed_deletions': 1,
+               'mixed_cpu_managed_deletions': 2, 'actual_cuda_owner_released': True,
+               'used_alias_refused': True, 'overlap_family': 'invalid', 'overlap_output_unchanged': True,
+               'mixed_host_cuda_family': 'unsupported', 'mixed_cuda_host_family': 'unsupported',
+               'mixed_outputs_unchanged': True}
+    require(exact(value['storage_controls'], storage), 'resident ownership/mixed-device evidence differs')
+    return value
 
 
 def contract(raw):
