@@ -114,6 +114,11 @@ impl Bearer {
     fn live(&self) -> bool {
         self.expires > now() + MARGIN
     }
+
+    /// When the session mints the next one (Unix seconds).
+    pub fn refresh_at(&self) -> u64 {
+        self.expires.saturating_sub(MARGIN)
+    }
 }
 
 /// One user signed in by a device key: a Bearer kept in memory and, if given a path, beside
@@ -138,11 +143,11 @@ impl UserSession {
     }
 
     /// A live Bearer: held, kept, or from a fresh login at `hub`.
-    pub async fn bearer(&self, hub: &Client) -> Result<String, Error> {
+    pub async fn bearer(&self, hub: &Client) -> Result<Bearer, Error> {
         let mut held = self.bearer.lock().await;
         let ours = |b: &Bearer| b.live() && b.device_key_id == self.key.id;
         if let Some(bearer) = held.as_ref().filter(|b| ours(b)) {
-            return Ok(bearer.token.clone());
+            return Ok(bearer.clone());
         }
         let kept = self
             .cache
@@ -165,9 +170,8 @@ impl UserSession {
                 bearer
             }
         };
-        let token = bearer.token.clone();
-        *held = Some(bearer);
-        Ok(token)
+        *held = Some(bearer.clone());
+        Ok(bearer)
     }
 
     /// The Hub refused `token`: the next request logs in again.

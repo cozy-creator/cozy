@@ -2209,7 +2209,7 @@ mod codec_tests {
     fn ordinary_options() -> protocol::machine::TensorFSOptions {
         protocol::machine::TensorFSOptions {
             endpoint: "https://ordinary.example.test".into(), token: "supplied-test-bearer".into(),
-            ca_der: vec![1, 2, 3],
+            ca_der: vec![1, 2, 3], ..Default::default()
         }
     }
 
