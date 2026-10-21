@@ -15,7 +15,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{json, Value as Json};
 use tensorfs::fetch::{Client as FetchClient, Endpoint, SourcePolicy};
-use tensorfs::format::{Body, Config, ObjectRef, Repo, Value};
+use tensorfs::format::{Body, ClassRef, Config, ObjectRef, Repo, Value};
 use tensorfs::import::Access;
 use tensorfs::migrate::d10::{self, Migrator, UNKNOWN, UPSTREAMS};
 use tensorfs::store::Store;
@@ -30,6 +30,11 @@ struct Lane {
     configs: BTreeMap<String, Json>,
     /// By D10 `component/key`.
     tensors: BTreeMap<String, Want>,
+    /// Each component's class, `[library, version, name]`, where its own config states it.
+    classes: BTreeMap<String, [String; 3]>,
+    /// A LoRA component's PEFT adapter config.
+    #[serde(default)]
+    adapters: BTreeMap<String, Json>,
 }
 
 #[derive(Deserialize)]
@@ -56,7 +61,8 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
     let lanes: Vec<Lane> = serde_json::from_slice(&fs::read(fixture.join("lanes.json")).unwrap()).unwrap();
     let dir = Scratch(Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("migrate-v1-{}", std::process::id())));
     let _ = fs::remove_dir_all(&dir.0);
-    // The endpoint: a store holding every fixture object, and each lane as an unreleased checkpoint.
+    // The endpoint: a store holding every fixture object, and each lane as an unreleased
+    // checkpoint, as the Hub shows a v1 model: a private tag whose commit is the v1 manifest.
     let root = dir.0.join("endpoint");
     Store::open(&root).unwrap();
     for entry in fs::read_dir(&fixture).unwrap() {
@@ -71,7 +77,8 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
     for lane in &lanes {
         let at = root.join(format!("refs/{}.json", lane.name));
         fs::create_dir_all(at.parent().unwrap()).unwrap();
-        let doc = json!({"format": "tensorfs.repo/1", "name": lane.name, "releases": [], "checkpoints": [lane.manifest]});
+        let tag = format!("v1-{}", &lane.manifest.sha256[..12]);
+        let doc = json!({"format": "cozytensors.repo/1", "name": lane.name, "tags": [{"name": tag, "commit": lane.manifest}]});
         fs::write(at, serde_json::to_vec(&doc).unwrap()).unwrap();
     }
 
@@ -90,16 +97,31 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
     let fetch = FetchClient::new(SourcePolicy::default());
     let endpoint = Arc::new(Endpoint::new(&fetch, &root.to_string_lossy(), None).unwrap());
     let mut migrator = Migrator::new(Access::from_env(), UPSTREAMS);
+    // A dry run sends nothing and plans the document the run then writes.
+    let refs = |name: &str| fs::read(root.join(format!("refs/{name}.json"))).unwrap();
+    let mut planned = BTreeMap::new();
+    for lane in &lanes {
+        let scratch = Store::open(dir.0.join("plan").join(lane.name.replace('/', "__"))).unwrap();
+        let before = refs(&lane.name);
+        let plan = d10::plan(&endpoint, &fetch, &lane.name, &scratch, &mut migrator).unwrap();
+        assert!(plan.report["would_offer"]["objects"].as_u64().unwrap() > 0, "{}", lane.name);
+        assert_eq!((refs(&lane.name), &plan.before), (before.clone(), &before), "{}", lane.name);
+        planned.insert(lane.name.clone(), plan.after);
+    }
+    assert_eq!(blobs(&root), held, "a dry run sent an object");
     let mut trees = BTreeMap::new();
     for lane in &lanes {
         let scratch = Store::open(dir.0.join("scratch").join(lane.name.replace('/', "__"))).unwrap();
         let done = d10::migrate(&endpoint, &fetch, &lane.name, &scratch, &mut migrator).unwrap();
         println!("{:#}", done.report);
+        assert_eq!((refs(&lane.name), &done.after), (planned[&lane.name].clone(), &planned[&lane.name]), "{}", lane.name);
         let report = &done.report["checkpoints"][0];
         assert_eq!(report["old"], lane.manifest.id().as_str());
         let repo = Repo::from_json(&fs::read(root.join(format!("refs/{}.json", lane.name))).unwrap()).unwrap();
         assert_eq!(repo.tags.len(), 1);
-        trees.insert(lane.name.clone(), (repo.tags[0].commit.clone(), report.clone()));
+        let tag = &repo.tags[0];
+        assert_eq!((tag.name.clone(), tag.public), (format!("v1-{}", &lane.manifest.sha256[..12]), false));
+        trees.insert(lane.name.clone(), (tag.commit.clone(), report.clone()));
     }
 
     let uploaded: BTreeSet<String> = blobs(&root).difference(&held).cloned().collect();
@@ -165,9 +187,21 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
             }
         }
 
+        // Classes: the library, version and name the lane's configs state; a LoRA's adapter config
+        // is PEFT's.
+        for (c, [library, version, name]) in &lane.classes {
+            assert_eq!(ck.component(c).unwrap().cls(), &ClassRef::new(library, version, name), "{}: {c}", lane.name);
+        }
+        for (c, adapter) in &lane.adapters {
+            let component = ck.component(c).unwrap();
+            assert_eq!((component.config(), component.config_file()), (&as_config(adapter), "adapter_config.json"), "{}: {c}", lane.name);
+        }
+
         // Sources: the table's row where one names the model, else `unknown`, never filled.
         let source = ck.metadata().get("source").cloned();
-        if lane.name == "paul/d1-gate5-sdxl-b" {
+        if lane.name == "acme/minimax-h3-lightx2v-source" {
+            assert!(source.as_ref().and_then(Value::as_str).is_some_and(|s| s.starts_with("hf://lightx2v/")), "{source:?}");
+        } else if lane.name == "paul/d1-gate5-sdxl-b" {
             assert_eq!(source, Some(Value::Str(UPSTREAMS[0].from.into())));
             assert_eq!(ck.pipeline().unwrap().class.name, "StableDiffusionXLPipeline");
             assert!(ck.component("tokenizer").is_ok() && ck.component("tokenizer_2").is_ok());

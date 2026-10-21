@@ -1,6 +1,28 @@
 [
  {
   "chunks": 19,
+  "classes": {
+   "text_encoder": [
+    "transformers",
+    "4.32.0.dev0",
+    "CLIPTextModel"
+   ],
+   "text_encoder_2": [
+    "transformers",
+    "4.32.0.dev0",
+    "CLIPTextModelWithProjection"
+   ],
+   "unet": [
+    "diffusers",
+    "0.19.0.dev0",
+    "UNet2DConditionModel"
+   ],
+   "vae": [
+    "diffusers",
+    "0.20.0.dev0",
+    "AutoencoderKL"
+   ]
+  },
   "configs": {
    "scheduler": {
     "_class_name": "EulerDiscreteScheduler",
@@ -262,6 +284,18 @@
  },
  {
   "chunks": 8,
+  "classes": {
+   "text_encoder": [
+    "transformers",
+    "4.32.0.dev0",
+    "CLIPTextModel"
+   ],
+   "unet": [
+    "diffusers",
+    "0.19.0.dev0",
+    "UNet2DConditionModel"
+   ]
+  },
   "configs": {
    "scheduler": {
     "_class_name": "EulerDiscreteScheduler",
@@ -414,6 +448,33 @@
  },
  {
   "chunks": 47,
+  "classes": {
+   "audio_vae": [
+    "diffusers",
+    "0.36.0.dev0",
+    "AutoencoderKLMiniMaxH3Audio"
+   ],
+   "text_encoder": [
+    "transformers",
+    "4.57.0.dev0",
+    "Qwen3VLForConditionalGeneration"
+   ],
+   "transformer": [
+    "diffusers",
+    "0.36.0.dev0",
+    "MiniMaxH3Transformer3DModel"
+   ],
+   "transformer_ref": [
+    "diffusers",
+    "0.36.0.dev0",
+    "MiniMaxH3Transformer3DModel"
+   ],
+   "vae": [
+    "diffusers",
+    "0.36.0.dev0",
+    "AutoencoderKLMiniMaxH3"
+   ]
+  },
   "configs": {
    "model": {
     "audio_vae": {
@@ -996,7 +1057,68 @@
   }
  },
  {
+  "adapters": {
+   "model": {
+    "base_model_name_or_path": "hf://MiniMaxAI/MiniMax-H3@42ed227ee7df40d41602854ae760620d6eb651fe",
+    "lora_alpha": 8,
+    "peft_type": "LORA",
+    "r": 4,
+    "target_modules": [
+     "token_refiner.refiner_blocks.0.attn.to_k",
+     "token_refiner.refiner_blocks.0.attn.to_out.0"
+    ]
+   }
+  },
+  "chunks": 4,
+  "classes": {
+   "model": [
+    "",
+    "",
+    ""
+   ]
+  },
+  "configs": {
+   "normalization": {
+    "converter": "identity/1",
+    "dialect": "safetensors",
+    "state": "raw"
+   }
+  },
+  "manifest": {
+   "length": 161,
+   "sha256": "8699ab641faaff0d4123db84579eea6e8ebbb71a218975a8d3778c57a568baaa"
+  },
+  "name": "acme/minimax-h3-lightx2v-source",
+  "tensors": {
+   "model/token_refiner.refiner_blocks.0.attn.to_k.lora_A.weight": {
+    "read": {
+     "data": "603b74af8e8b9c43cfd62fa4d8f8591645f7cfbd12599e0b1d1e4dda7ed8da18"
+    },
+    "scheme": null
+   },
+   "model/token_refiner.refiner_blocks.0.attn.to_k.lora_B.weight": {
+    "read": null,
+    "scheme": null
+   },
+   "model/token_refiner.refiner_blocks.0.attn.to_out.0.lora_A.weight": {
+    "read": null,
+    "scheme": null
+   },
+   "model/token_refiner.refiner_blocks.0.attn.to_out.0.lora_B.weight": {
+    "read": null,
+    "scheme": null
+   }
+  }
+ },
+ {
   "chunks": 1,
+  "classes": {
+   "model": [
+    "",
+    "",
+    ""
+   ]
+  },
   "configs": {
    "normalization": {
     "converter": "identity/1",
@@ -1020,6 +1142,13 @@
  },
  {
   "chunks": 1,
+  "classes": {
+   "model": [
+    "",
+    "",
+    ""
+   ]
+  },
   "configs": {},
   "manifest": {
    "length": 161,
@@ -1037,6 +1166,13 @@
  },
  {
   "chunks": 5,
+  "classes": {
+   "dit": [
+    "",
+    "",
+    ""
+   ]
+  },
   "configs": {
    "model": {
     "fixture": "h3-cp-producer-lifecycle/1",

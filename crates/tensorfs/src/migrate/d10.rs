@@ -5,7 +5,7 @@
 //! ([`UPSTREAMS`], owner Decision 1) and is recorded in the header's `filled`; every lane records
 //! its `source`, `unknown` when nobody did. Deleted once it has run.
 
-use std::collections::{btree_map::Entry, BTreeMap, HashMap};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read as _;
 use std::path::Path;
@@ -20,8 +20,9 @@ use serde_json::{json, Value as Json};
 
 use crate::failure::{fail, Failure, Kind, Result};
 use crate::fetch::{self, Client, Endpoint, Fetcher, Fresh, Origin, Payload, SourcePolicy, Want};
-use crate::format::{Component, Config, Header, Metadata, ObjectRef, Repo, Tag, Tensor, Tree, Value, HEADER_PATH};
-use crate::import::{layout, remote};
+use crate::format::decode::{check_metadata, PartMetadata};
+use crate::format::{Body, ClassRef, Component, Config, Header, Metadata, ObjectRef, Repo, Tag, Tensor, Tree, Value, HEADER_PATH, TREE_FORMAT};
+use crate::import::{layout, lora, remote, Versions};
 use crate::store::Store;
 
 use super::v1;
@@ -161,6 +162,60 @@ fn under(entry: &str, path: &str) -> bool {
     }
 }
 
+/// Components whose configs name no class: the class that implements them, read from the
+/// package or model code that loads them (owner, 2026-10-20). An empty version is the pin's.
+const CLASSES: &[(&[&str], &str, [&str; 3])] = &[
+    (&["*/seedvr2-7b"], "conditioning", ["seedvr2", "0.6.1", "Conditioning"]),
+    (&["*/seedvr2-7b"], "dit", ["seedvr2", "0.6.1", "NaDiT"]),
+    (&["*/seedvr2-7b"], "vae", ["seedvr2", "0.6.1", "VideoAutoencoderKLWrapper"]),
+    (&["*/birefnet"], "model", ["birefnet", "0.4.0", "BiRefNet"]),
+    (&["*/minimax-h3-vsa-gate"], "model", ["minimax_h3", "1.43.2", "GateStack"]),
+    (&["*/flux-3-klein-upsampler", "*/qwen3.5-9b"], "model", ["transformers", "", "Qwen3_5ForConditionalGeneration"]),
+];
+/// LoRA lanes' base models, for their adapter configs.
+const LORA_BASES: &[(&[&str], &str)] = &[(&["*/minimax-h3-*"], H3), (&["paul/d1-*"], SDXL)];
+/// The α a LoRA lane lost that its source states: lightx2v's safetensors metadata `alpha` 8
+/// (`*_8step_v1.0*_bf16`, matched to both lanes by tensor bytes).
+const LORA_ALPHA: &[(&str, u64)] = &[("*/minimax-h3-lightx2v-source", 8)];
+
+/// LoRA components (every key a LoRA factor or `.alpha`) in PEFT's spelling, header only: each
+/// one's modules and ranks.
+fn peft(tensors: &mut [(String, Vec<Tensor>)]) -> BTreeMap<String, Vec<(String, u64)>> {
+    let mut out = BTreeMap::new();
+    for (name, ts) in tensors.iter_mut() {
+        let keys: Option<Vec<String>> = ts.iter().map(|t| lora::peft_key(&t.key)).collect();
+        let Some(keys) = keys.filter(|k| k.iter().any(|k| k.ends_with(".lora_A.weight"))) else { continue };
+        let mut modules = Vec::new();
+        for (t, key) in ts.iter_mut().zip(keys) {
+            if let Some(m) = key.strip_suffix(".lora_A.weight") {
+                modules.push((m.to_owned(), t.shape.first().copied().unwrap_or(0)));
+            }
+            t.key = key;
+        }
+        out.insert(name.clone(), modules);
+    }
+    out
+}
+
+/// Releases that become private tags (a public tag is a PEP 440 version): model and version, by
+/// ruling (2026-10-20: audit, proof and recovery artifacts, production's and 8819's). Any other
+/// release not a version refuses its repo.
+pub const PRIVATE: &[(&str, &str)] = &[
+    ("fidika/minimax-h3-turbo-lora", "1.0.0-audit.1"),
+    ("paul/cache-persistence-proof", "0.0.1-cacheproof.20260924"),
+    ("paul/cozy-mixed-input-proof", "0.0.0-rental-audit.20260913"),
+    ("paul/creator-output-b93c35ccecf8c183", "0.0.0-recovery-source-config.20260906"),
+    ("paul/creator-output-b93c35ccecf8c183", "0.0.0-recovery-source.20260906"),
+    ("paul/d1-g5r32-sdxl", "0.0.1-d1"),
+    ("paul/d1-gate5-sdxl", "0.0.1-d1"),
+    ("paul/d1-gate5c-sdxl", "0.0.1-d1"),
+    ("paul/minimax-h3", "1.0.0-h3-audit.1"),
+    ("paul/minimax-h3-turbo-lora", "1.0.0-audit.1"),
+];
+
+/// A repo document before D10, whatever wrote it: 0.12's `releases` of lanes and `checkpoints`
+/// (U11), or `tags` (the Hub's view of a v1 model: a release's `lanes`, an unreleased
+/// checkpoint's v1 manifest as its `commit`; or a D10 document).
 #[derive(Deserialize)]
 struct OldRepo {
     name: String,
@@ -168,6 +223,8 @@ struct OldRepo {
     releases: Vec<OldRelease>,
     #[serde(default)]
     checkpoints: Vec<ObjectRef>,
+    #[serde(default)]
+    tags: Vec<OldTag>,
 }
 
 #[derive(Deserialize)]
@@ -177,6 +234,36 @@ struct OldRelease {
     tree: Option<ObjectRef>,
     #[serde(default)]
     yanked: bool,
+}
+
+/// A tag, or what becomes one: a 0.12 checkpoint has no name until A11 gives it one.
+#[derive(Deserialize)]
+struct OldTag {
+    name: Option<String>,
+    lanes: Option<BTreeMap<String, ObjectRef>>,
+    commit: Option<ObjectRef>,
+    #[serde(default)]
+    public: bool,
+    #[serde(default)]
+    yanked: bool,
+}
+
+impl OldRepo {
+    /// In order: releases (public), the checkpoints no release cites (private), then tags.
+    fn tags(self) -> Vec<OldTag> {
+        let cited: Vec<ObjectRef> = self.releases.iter().flat_map(|r| r.lanes.iter().flat_map(|l| l.values().cloned())).collect();
+        let releases = self.releases.into_iter().map(|r| OldTag { name: Some(r.version), lanes: r.lanes, commit: r.tree, public: true, yanked: r.yanked });
+        let checkpoints = (self.checkpoints.into_iter().filter(|c| !cited.contains(c)))
+            .map(|c| OldTag { name: None, lanes: None, commit: Some(c), public: false, yanked: false });
+        releases.chain(checkpoints).chain(self.tags).collect()
+    }
+
+    /// Every old object a tag names: lanes' manifests, commits (trees or old manifests).
+    fn roots(&self) -> Vec<ObjectRef> {
+        let releases = self.releases.iter().flat_map(|r| r.lanes.iter().flat_map(|l| l.values()).chain(&r.tree));
+        let tags = self.tags.iter().flat_map(|t| t.lanes.iter().flat_map(|l| l.values()).chain(&t.commit));
+        releases.chain(&self.checkpoints).chain(tags).cloned().collect()
+    }
 }
 
 #[derive(Deserialize)]
@@ -225,79 +312,108 @@ impl<'t> Migrator<'t> {
         Migrator { access, table, listings: HashMap::new(), fetched: HashMap::new() }
     }
 
-    /// The repo document `doc` in D10, its old objects read by `read`. A release that names a
-    /// tree, and a checkpoint that is one, stay as they are; each release of lanes becomes one
-    /// tree (`model.<lane>.cozytensors` each, repo files merged, the first lane's kept where
-    /// they differ), yanked or not; each other old checkpoint a tree of its own
-    /// (`model.cozytensors`).
+    /// The repo document `doc` in D10, its old objects read by `read`: each release a public tag,
+    /// each checkpoint a private one. A tag naming a tree stays as it is; a release of lanes
+    /// becomes one tree (`model.<lane>.cozytensors` each, repo files merged, the first lane's
+    /// kept where they differ), yanked or not; an old checkpoint a tree of its own
+    /// (`model.cozytensors`), named `v1-`/`v2-` and its manifest's first 12 hex (16 where two
+    /// share 12), the name the Hub's view of a v1 model gives it.
     pub fn repo(&mut self, doc: &[u8], read: Read) -> Result<Migrated> {
         let old: OldRepo = serde_json::from_slice(doc).map_err(|e| invalid(format!("repo document: {e}")))?;
-        let upstream = self.table.iter().find(|u| u.models.iter().any(|p| matches(p, &old.name)));
+        let name = old.name.clone();
+        let upstream = self.table.iter().find(|u| u.models.iter().any(|p| matches(p, &name)));
+        let tree_at = |o: &ObjectRef| -> Result<bool> { Ok(serde_json::from_slice::<Json>(&read(o)?).is_ok_and(|d| d["format"] == TREE_FORMAT)) };
+        let tags = old.tags();
+        // The old checkpoints to name: private, and not yet trees.
+        let mut unnamed = BTreeSet::new();
+        for c in tags.iter().filter(|t| !t.public && t.lanes.is_none()).filter_map(|t| t.commit.as_ref()) {
+            if !tree_at(c)? {
+                unnamed.insert(c.sha256.clone());
+            }
+        }
+        let width = |sha256: &str| if unnamed.iter().filter(|o| o[..12] == sha256[..12]).count() > 1 { 16 } else { 12 };
         let mut objects = Objects::new();
         let mut lanes: HashMap<ObjectRef, Lane> = HashMap::new();
         let put = |objects: &mut Objects, tree: &Tree| -> Result<ObjectRef> { Ok(add(objects, tree.to_json()?)) };
-        let (mut releases, mut reports) = (Vec::new(), Vec::new());
-        for r in &old.releases {
-            let named = match (&r.tree, &r.lanes) {
-                (Some(tree), _) => {
-                    releases.push(release(&r.version, tree.clone(), r.yanked));
-                    continue;
-                }
-                (None, Some(named)) => named,
-                (None, None) => return fail(Kind::Invalid, format!("release {} names no lanes or tree", r.version)),
-            };
-            let (mut tree, mut report, mut conflicts) = (Tree::default(), serde_json::Map::new(), Vec::new());
-            for (name, manifest) in named {
-                if !lanes.contains_key(manifest) {
-                    let lane = self.lane(manifest, upstream, read, &mut objects)?;
-                    lanes.insert(manifest.clone(), lane);
-                }
-                let lane = &lanes[manifest];
-                tree.set_variant(name, lane.header.clone());
-                for (path, file) in &lane.files {
-                    match tree.files.get(path) {
-                        Some(kept) if kept != file => conflicts.push(json!({"path": path, "dropped": name, "object": file.id()})),
-                        Some(_) => {}
-                        None => drop(tree.files.insert(path.clone(), file.clone())),
+        let (mut repo, mut released, mut unreleased, mut private) = (Repo::new(&name), Vec::new(), Vec::new(), Vec::new());
+        for t in tags {
+            let what = t.name.clone().unwrap_or_default();
+            let commit = match (&t.lanes, &t.commit) {
+                (Some(named), _) => {
+                    let (mut tree, mut report, mut conflicts) = (Tree::default(), serde_json::Map::new(), Vec::new());
+                    for (lane_name, manifest) in named {
+                        if !lanes.contains_key(manifest) {
+                            let lane = self.lane(&name, manifest, upstream, read, &mut objects)?;
+                            lanes.insert(manifest.clone(), lane);
+                        }
+                        let lane = &lanes[manifest];
+                        tree.set_variant(lane_name, lane.header.clone());
+                        for (path, file) in &lane.files {
+                            match tree.files.get(path) {
+                                Some(kept) if kept != file => conflicts.push(json!({"path": path, "dropped": lane_name, "object": file.id()})),
+                                Some(_) => {}
+                                None => drop(tree.files.insert(path.clone(), file.clone())),
+                            }
+                        }
+                        report.insert(lane_name.clone(), lane.report.clone());
                     }
+                    let at = put(&mut objects, &tree)?;
+                    released.push(json!({"version": what, "tree": at.id(), "yanked": t.yanked, "lanes": report, "conflicts": conflicts}));
+                    at
                 }
-                report.insert(name.clone(), lane.report.clone());
+                (None, Some(c)) if tree_at(c)? => c.clone(),
+                (None, Some(c)) => {
+                    if !lanes.contains_key(c) {
+                        let lane = self.lane(&name, c, upstream, read, &mut objects)?;
+                        lanes.insert(c.clone(), lane);
+                    }
+                    let lane = &lanes[c];
+                    let mut tree = Tree { files: lane.files.clone() };
+                    tree.set_variant("", lane.header.clone());
+                    let at = put(&mut objects, &tree)?;
+                    unreleased.push(json!({"old": c.id(), "tree": at.id(), "lane": lane.report}));
+                    at
+                }
+                (None, None) => return fail(Kind::Invalid, format!("{name}: tag {what:?} names no lanes or commit")),
+            };
+            let public = t.public && !PRIVATE.contains(&(name.as_str(), what.as_str()));
+            if public != t.public {
+                private.push(json!(what));
             }
-            let release = release(&r.version, put(&mut objects, &tree)?, r.yanked);
-            reports.push(json!({"version": release.name, "tree": release.commit.id(), "yanked": release.yanked,
-                "lanes": report, "conflicts": conflicts}));
-            releases.push(release);
+            let tag = match (t.name, &t.commit) {
+                (Some(n), _) if t.public => n,
+                (n, Some(c)) if unnamed.contains(&c.sha256) => {
+                    let kind = if v1::manifest(&read(c)?)?.is_some() { "v1" } else { "v2" };
+                    let derived = format!("{kind}-{}", &c.sha256[..width(&c.sha256)]);
+                    if n.as_ref().is_some_and(|n| *n != derived) {
+                        return fail(Kind::Invalid, format!("{name}: checkpoint {} is tagged {n:?}, A11 names it {derived}", c.id()));
+                    }
+                    if let Some(r) = unreleased.last_mut() {
+                        r["name"] = json!(derived);
+                    }
+                    derived
+                }
+                (Some(n), _) => n,
+                (None, _) => return fail(Kind::Invalid, format!("{name}: an unnamed tag")),
+            };
+            if repo.tag(&tag).is_some() {
+                return fail(Kind::Invalid, format!("{name}: two tags named {tag}"));
+            }
+            repo.tags.push(Tag { name: tag, commit, public, yanked: t.yanked });
         }
-        let cited: Vec<&ObjectRef> = old.releases.iter().flat_map(|r| r.lanes.iter().flat_map(|l| l.values())).collect();
-        let (mut checkpoints, mut unreleased) = (Vec::new(), Vec::new());
-        for c in old.checkpoints.iter().filter(|c| !cited.contains(c)) {
-            let doc: Json = serde_json::from_slice(&read(c)?).map_err(|e| invalid(format!("{}: {e}", c.id())))?;
-            if doc["format"].as_str().is_some_and(|f| f.starts_with("cozytensors.tree/")) {
-                checkpoints.push(c.clone());
-                continue;
-            }
-            let lane = self.lane(c, upstream, read, &mut objects)?;
-            let mut tree = Tree { files: lane.files.clone() };
-            tree.set_variant("", lane.header.clone());
-            let at = put(&mut objects, &tree)?;
-            unreleased.push(json!({"old": c.id(), "tree": at.id(), "lane": lane.report}));
-            // Old checkpoints differing only in metadata D10 drops become one tree, named once.
-            if !checkpoints.contains(&at) {
-                checkpoints.push(at);
-            }
+        repo.to_json().map_err(|e| invalid(format!("{name}: {e}")))?;
+        let mut report = json!({"model": name, "upstream": upstream.map(|u| u.from), "releases": released, "checkpoints": unreleased});
+        if !private.is_empty() {
+            report["made_private"] = json!(private);
         }
-        // An unreleased checkpoint keeps a private tag, its commit's hex, or it would be collected.
-        let private = checkpoints.into_iter().map(|c| Tag { name: c.sha256.clone(), commit: c, public: false, yanked: false });
-        let repo = Repo { name: old.name.clone(), tags: releases.into_iter().chain(private).collect() };
-        let report = json!({"model": old.name, "upstream": upstream.map(|u| u.from), "releases": reports, "checkpoints": unreleased});
         Ok(Migrated { repo, objects, report })
     }
 
     /// One old lane: its header in D10 (old tensors, filled run data, configs, assets) and its
     /// repo files; every lane file is checked to have landed in one of them.
-    fn lane(&mut self, manifest: &ObjectRef, upstream: Option<&Upstream>, read: Read, objects: &mut Objects) -> Result<Lane> {
+    fn lane(&mut self, model: &str, manifest: &ObjectRef, upstream: Option<&Upstream>, read: Read, objects: &mut Objects) -> Result<Lane> {
         let raw = read(manifest)?;
-        let (chunks, tensors, mut metadata, mut bytes, v1_report) = match v1::manifest(&raw)? {
+        let (chunks, mut tensors, mut metadata, mut bytes, v1_report) = match v1::manifest(&raw)? {
             Some(m) => {
                 let v = v1::lane(&m, &read(&m.header)?)?;
                 let mut bytes = BTreeMap::new();
@@ -327,7 +443,11 @@ impl<'t> Migrator<'t> {
                 for (path, object) in &files {
                     bytes.insert(path.clone(), read(object)?);
                 }
-                let tensors = old.components().iter().map(|c| (c.name.clone(), c.tensors.clone())).collect();
+                let mut tensors = Vec::new();
+                for c in old.components() {
+                    let ts = c.tensors.iter().cloned().map(|t| d10_encoding(&c.name, t)).collect::<Result<_>>()?;
+                    tensors.push((c.name.clone(), ts));
+                }
                 (old.chunks.clone(), tensors, old.metadata.clone(), bytes, None)
             }
         };
@@ -341,8 +461,29 @@ impl<'t> Migrator<'t> {
                 }
             }
         }
+        let adapters = peft(&mut tensors);
         let tensored: Vec<String> = tensors.iter().map(|(name, _)| name.clone()).collect();
-        let l = layout(bytes.clone(), &tensored, &Default::default())?;
+        let reference = match upstream {
+            Some(u) => self.reference(u.from)?,
+            None => Versions::new(),
+        };
+        let mut l = layout(bytes.clone(), &tensored, &reference)?;
+        let mut classed = Vec::new();
+        for f in &mut l.components {
+            if let Some(modules) = adapters.get(&f.name) {
+                let base = LORA_BASES.iter().find(|(m, _)| m.iter().any(|p| matches(p, model))).map(|(_, b)| *b);
+                let alpha = LORA_ALPHA.iter().find(|(p, _)| matches(p, model)).map(|(_, a)| [("lora_alpha".to_owned(), json!(a))].into_iter().collect::<Config>());
+                f.config = lora::adapter_config(modules.iter().cloned(), &BTreeMap::new(), alpha.as_ref(), base);
+                f.config_file = Some(lora::ADAPTER_CONFIG.into());
+            } else if let Some((_, _, [library, version, class])) = (CLASSES.iter())
+                .find(|(m, c, _)| *c == f.name && m.iter().any(|p| matches(p, model)))
+                .filter(|_| f.class.is_unknown())
+            {
+                let version = Some(version.to_string()).filter(|v| !v.is_empty()).or_else(|| reference.get(*library).cloned());
+                f.class = ClassRef::new(library, &version.unwrap_or_default(), class);
+                classed.push(f.name.clone());
+            }
+        }
         let mut keep = |b: Vec<u8>| add(objects, b);
         let components = (l.components.into_iter())
             .map(|f| Component {
@@ -380,12 +521,22 @@ impl<'t> Migrator<'t> {
         let cbor = new.to_cbor()?;
         check(&chunks, &tensors, &new, &cbor, &bytes, &repo_files)?;
         let at = add(objects, cbor);
-        let mut report = json!({"old": manifest.id(), "header": at.id()});
+        let classes: serde_json::Map<String, Json> = (new.components().iter())
+            .filter(|c| !c.tensors.is_empty())
+            .map(|c| (c.name.clone(), json!([c.class.library, c.class.version, c.class.name])))
+            .collect();
+        let mut report = json!({"old": manifest.id(), "header": at.id(), "classes": classes});
         if !filled.is_empty() {
             report["filled"] = json!(filled);
         }
         if !unwrapped.is_empty() {
             report["unwrapped"] = json!(unwrapped);
+        }
+        if !adapters.is_empty() {
+            report["lora"] = json!(adapters.keys().collect::<Vec<_>>());
+        }
+        if !classed.is_empty() {
+            report["classed"] = json!(classed);
         }
         if let Some(v1) = v1_report {
             report["from_v1"] = v1;
@@ -402,6 +553,33 @@ impl<'t> Migrator<'t> {
         let listing = remote::list(&remote::parse(source)?, &self.access)?;
         self.listings.insert(source.to_owned(), listing.members);
         Ok(())
+    }
+
+    /// The library versions the pinned upstream `from` records (its `model_index.json`, then its
+    /// configs by path): a class's version where the lane's own configs record none.
+    fn reference(&mut self, from: &str) -> Result<Versions> {
+        let mut out = Versions::new();
+        if !from.starts_with("hf://") {
+            return Ok(out);
+        }
+        self.verify(from)?;
+        let mut paths: Vec<String> = (self.listings[from].iter())
+            .map(|m| m.path.clone())
+            .filter(|p| p == "model_index.json" || p.rsplit('/').next() == Some("config.json") && p.matches('/').count() <= 1)
+            .collect();
+        paths.sort_by_key(|p| (p != "model_index.json", p.clone()));
+        for path in paths {
+            for (_, bytes) in self.upstream(from, &path)? {
+                let Ok(Json::Object(doc)) = serde_json::from_slice::<Json>(&bytes) else { continue };
+                for (key, value) in doc {
+                    let library = key.strip_suffix("_version").map(|l| l.trim_start_matches('_').to_owned());
+                    if let (Some(library), Some(version)) = (library.filter(|l| !l.is_empty()), value.as_str()) {
+                        out.entry(library).or_insert_with(|| version.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The files under `entry` at the pinned upstream `from`, by path.
@@ -508,8 +686,48 @@ fn check(chunks: &[ObjectRef], tensors: &[(String, Vec<Tensor>)], new: &Header, 
     Ok(())
 }
 
+/// 0.12's encodings named their scales' dtypes; D10 takes each from its part (owner,
+/// 2026-10-20), and its decoder refuses the params. Each goes once it agrees with its part.
+const DTYPE_PARAMS: [(&str, &str); 2] = [("scale_dtype", "scale"), ("pre_quant_scale_dtype", "pre_quant_scale")];
+/// 0.12 param values D10 renamed, the bytes' meaning unchanged: ConvRot's rotation was always the
+/// Kronecker power of the regular H4, misnamed "hadamard" (3253cbd2e).
+const RENAMED: [(&str, &str, &str, &str); 1] = [("int8.convrot", "rotation", "hadamard", "kron_regular_h4")];
+
+/// A 0.12 tensor's encoding in D10's terms, checked by D10's decoder.
+fn d10_encoding(component: &str, mut t: Tensor) -> Result<Tensor> {
+    let Body::Encoded { encoding, parts } = &mut t.body else { return Ok(t) };
+    let what = format!("{component}/{}", t.key);
+    for (scheme, key, from, to) in RENAMED {
+        if encoding.scheme == scheme && encoding.params.get(key).and_then(Value::as_str) == Some(from) {
+            encoding.params.insert(key.into(), Value::Str(to.into()));
+        }
+    }
+    // A row's scales are `*.rowwise`, a column's `*.columnwise`: `axis` goes (owner, 2026-10-20).
+    for (rowwise, columnwise) in [("fp8.rowwise", "fp8.columnwise"), ("int8.rowwise", "int8.columnwise")] {
+        if encoding.scheme == rowwise {
+            match encoding.params.remove("axis").map(|a| a.as_u64()) {
+                None | Some(Some(0)) => {}
+                Some(Some(1)) => encoding.scheme = columnwise.into(),
+                Some(axis) => return fail(Kind::Invalid, format!("{what}: {rowwise} axis {axis:?}")),
+            }
+        }
+    }
+    for (param, role) in DTYPE_PARAMS {
+        let Some(named) = encoding.params.remove(param) else { continue };
+        let part = parts.iter().find(|p| p.role == role).map(|p| p.dtype.name());
+        if named.as_str() != part {
+            return fail(Kind::Invalid, format!("{what}: {param} {named:?} is not its {role} part's dtype {part:?}"));
+        }
+    }
+    let meta: Vec<PartMetadata> = (parts.iter())
+        .map(|p| PartMetadata { role: &p.role, dtype: &p.dtype, shape: &p.shape, len: p.length as usize })
+        .collect();
+    check_metadata(&t.dtype, &t.shape, encoding, &meta).map_err(|e| invalid(format!("{what}: {encoding}: {e}")))?;
+    Ok(t)
+}
+
 /// A five-field header in D10's layout, every byte kept: no pipeline, each component
-/// `[name, "", {}, tensors, {}]`. D10's reader then reads it.
+/// `[name, ["", "", ""], {}, tensors, {}]` (the unknown class). D10's reader then reads it.
 fn upgrade(old: &[u8]) -> Result<Header> {
     let bad = |e: minicbor::decode::Error| invalid(format!("old header: {e}"));
     let mut d = Decoder::new(old);
@@ -535,7 +753,7 @@ fn upgrade(old: &[u8]) -> Result<Header> {
         }
         out.push(0x85);
         copy(&mut d, &mut out)?;
-        out.extend([0x60, 0xa0]);
+        out.extend([0x83, 0x60, 0x60, 0x60, 0xa0]);
         copy(&mut d, &mut out)?;
         out.push(0xa0);
     }
@@ -558,11 +776,34 @@ fn array(out: &mut Vec<u8>, n: u64) {
     }
 }
 
-/// What [`migrate`] did, and the repo document as it first read it: the rollback is that
-/// document put back in the endpoint's storage (a D10 Hub refuses a release going back to lanes).
+/// What [`migrate`] did, the repo document as it first read it (the rollback puts it back in the
+/// endpoint's storage, or deletes a v1 repo's) and the D10 document.
 pub struct Done {
     pub report: Json,
     pub before: Vec<u8>,
+    pub after: Vec<u8>,
+}
+
+/// The repo document as read, its ETag, and the D10 repo it becomes.
+fn convert(rt: &tokio::runtime::Runtime, endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &Store, migrator: &mut Migrator) -> Result<(Vec<u8>, String, Migrated)> {
+    let Fresh::Doc(doc, etag) = rt.block_on(endpoint.repo_bytes(name, None))? else {
+        return fail(Kind::NotFound, format!("no repo {name} at {}", endpoint.url()));
+    };
+    rt.block_on(old_objects(endpoint, client, scratch, &doc))?;
+    let m = migrator.repo(&doc, &|o| Ok(scratch.read(o)?))?;
+    Ok((doc, etag, m))
+}
+
+/// What [`migrate`] would do to repo `name`, sending nothing: the D10 document and the objects
+/// it would offer the endpoint (those the endpoint holds are skipped there).
+pub fn plan(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &Store, migrator: &mut Migrator) -> Result<Done> {
+    let rt = fetch::runtime()?;
+    let (doc, _, mut m) = convert(&rt, endpoint, client, name, scratch, migrator)?;
+    let after = m.repo.to_json()?;
+    if after != doc {
+        m.report["would_offer"] = json!({"objects": m.objects.len(), "bytes": m.objects.iter().map(|(o, _)| o.length).sum::<u64>()});
+    }
+    Ok(Done { report: m.report, before: doc, after })
 }
 
 /// Repo `name` at `endpoint` in D10: the old objects it cites fetched into `scratch` over
@@ -572,23 +813,19 @@ pub fn migrate(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &
     let rt = fetch::runtime()?;
     let (mut first, mut refused) = (None, 0);
     loop {
-        let Fresh::Doc(doc, etag) = rt.block_on(endpoint.repo_bytes(name, None))? else {
-            return fail(Kind::NotFound, format!("no repo {name} at {}", endpoint.url()));
-        };
+        let (doc, etag, mut m) = convert(&rt, endpoint, client, name, scratch, migrator)?;
         let before = first.get_or_insert_with(|| doc.clone()).clone();
-        rt.block_on(old_objects(endpoint, client, scratch, &doc))?;
-        let mut m = migrator.repo(&doc, &|o| Ok(scratch.read(o)?))?;
         if refused > 0 {
             m.report["refused_puts"] = json!(refused);
         }
-        let bytes = m.repo.to_json()?;
-        if bytes == doc {
-            return Ok(Done { report: m.report, before });
+        let after = m.repo.to_json()?;
+        if after == doc {
+            return Ok(Done { report: m.report, before, after });
         }
         let sent = rt.block_on(upload(endpoint, &m.objects))?;
-        if rt.block_on(endpoint.put_repo_bytes(name, bytes, Some(&etag)))? {
+        if rt.block_on(endpoint.put_repo_bytes(name, after.clone(), Some(&etag)))? {
             m.report["sent"] = json!({"objects": sent.0, "bytes": sent.1});
-            return Ok(Done { report: m.report, before });
+            return Ok(Done { report: m.report, before, after });
         }
         refused += 1;
     }
@@ -597,8 +834,7 @@ pub fn migrate(endpoint: &Arc<Endpoint>, client: &Client, name: &str, scratch: &
 /// The manifests and checkpoints `doc` names, then each manifest's header and files.
 async fn old_objects(endpoint: &Arc<Endpoint>, client: &Client, scratch: &Store, doc: &[u8]) -> Result<()> {
     let old: OldRepo = serde_json::from_slice(doc).map_err(|e| invalid(format!("repo document: {e}")))?;
-    let lanes = old.releases.iter().flat_map(|r| r.lanes.iter().flat_map(|l| l.values()));
-    let roots: Vec<ObjectRef> = lanes.chain(&old.checkpoints).cloned().collect();
+    let roots = old.roots();
     let (origin, want): (Arc<dyn Origin>, Want) = (endpoint.clone(), Want::default());
     let fetcher = Fetcher::new(Arc::new(scratch.clone()), client.clone(), None, fetch::Config::default());
     fetcher.objects(&origin, &roots, &want).await?;
@@ -662,9 +898,4 @@ pub fn store(root: &Path, migrator: &mut Migrator) -> Result<Json> {
         }
     }
     Ok(json!({"store": root, "repos": repos, "pins_dropped": dropped}))
-}
-
-/// An old release: a public tag named by its version.
-fn release(version: &str, commit: ObjectRef, yanked: bool) -> Tag {
-    Tag { name: version.to_owned(), commit, public: true, yanked }
 }
