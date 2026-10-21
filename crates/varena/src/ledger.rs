@@ -599,16 +599,16 @@ pub(crate) fn record_peak(shared: &Shared, key: &str, bytes: u64) -> Result<()> 
     })
 }
 
-/// Merges a pass's room into `room/<key>`, field by field the larger; returns the merged room.
-pub(crate) fn record_room(shared: &Shared, key: &str, room: &Room) -> Result<Room> {
-    let mut merged = room.clone();
-    shared.merge(&format!("room/{key}"), |old| {
-        if let Some(known) = old.and_then(|v| serde_json::from_slice::<Room>(v).ok()) {
-            merged = known.max(room);
-        }
-        serde_json::to_vec(&merged).ok()
-    })?;
-    Ok(merged)
+/// A pass's room at `room/<key>`: the latest measurement replaces what was there (a room comes
+/// down when a pass measures less).
+pub(crate) fn record_room(shared: &Shared, key: &str, room: &Room) -> Result<()> {
+    shared.put(&format!("room/{key}"), Some(&os::encode(room)?))
+}
+
+/// Writes `key` only where the table has nothing newer (a restore: what this run measured
+/// wins over what an earlier one saved).
+fn restore_fact(shared: &Shared, key: &str, value: Vec<u8>) -> Result<()> {
+    shared.merge(key, |old| Some(old.map_or(value, <[u8]>::to_vec)))
 }
 
 fn ask_name(gpu: &str, id: u64) -> String {
@@ -941,11 +941,6 @@ impl Room {
         self.start + self.bytes()
     }
 
-    /// Each field's larger, and the newer sites when they were measured.
-    pub fn max(&self, newer: &Room) -> Room {
-        let sites = if newer.sites.is_empty() { self.sites.clone() } else { newer.sites.clone() };
-        Room { entry: self.entry.clone(), shape: self.shape.clone(), cuts: self.cuts.clone(), start: self.start.max(newer.start), delta: self.delta.max(newer.delta), slack: self.slack.max(newer.slack), context: self.context.max(newer.context), sites }
-    }
 }
 
 /// TensorD's handle on one GPU's table.
@@ -1066,13 +1061,13 @@ impl Ledger {
         out
     }
 
-    /// Peaks persisted earlier on this machine, for this GPU model, merged in (the larger of
-    /// each field stays): restoring what was saved changes nothing.
+    /// Peaks persisted earlier on this machine, for this GPU model, by recency: a key the table
+    /// already measured keeps its newer value; restoring what was saved changes nothing.
     pub fn restore(&self, peaks: &[Peak]) -> Result<()> {
         for p in peaks {
             match p {
-                Peak::Request { key, bytes } => record_peak(&self.shared, key, *bytes)?,
-                Peak::Pass { key, room } => drop(record_room(&self.shared, key, room)?),
+                Peak::Request { key, bytes } => restore_fact(&self.shared, &format!("peak/{key}"), bytes.to_le_bytes().to_vec())?,
+                Peak::Pass { key, room } => restore_fact(&self.shared, &format!("room/{key}"), os::encode(room)?)?,
             }
         }
         Ok(())

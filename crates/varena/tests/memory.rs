@@ -352,3 +352,32 @@ fn a_site_outside_any_pass_has_the_requests_memo() {
     assert!(matches!(next, Next::Park(_) | Next::Exhausted(_)), "at its finest the next rung: {next:?}");
     assert_eq!(r.cut(None, "split"), 2);
 }
+
+/// Review 3, N7: a room is the latest completed measurement (it comes down when a pass needs
+/// less); an OOM at a measured room records what it needed at once; a restore never overrides
+/// what this run measured.
+#[test]
+fn the_latest_measured_room_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ledger, mem, g) = open("latest", 64 * MB);
+    let id = mem.load(set(dir.path(), "l", 1, &g.uuid), Level::Ram).unwrap();
+    let pages = REGION_ALIGN;
+    room(&mem, id, "l", "1x8", pages, Some(8 * MB));
+    assert_eq!(room(&mem, id, "l", "1x8", pages, Some(4 * MB)), 8 * MB);
+    assert_eq!(room(&mem, id, "l", "1x8", pages, None), 4 * MB, "came down");
+    let r = mem.request("oom", plan("l")).unwrap();
+    let pass = r.pass(id, "fwd", "1x8", Torch::default()).unwrap();
+    r.oom(Some(id), Some(6 * MB), None, Torch::default());
+    drop(pass);
+    drop(r);
+    assert_eq!(room(&mem, id, "l", "1x8", pages, None), 6 * MB, "the room the OOM needed");
+    let saved = ledger.peaks().into_iter().find_map(|p| match p {
+        varena::Peak::Pass { key, mut room } if room.shape == "1x8" => {
+            room.delta = 16 * MB;
+            Some(varena::Peak::Pass { key, room })
+        }
+        _ => None,
+    });
+    ledger.restore(&[saved.unwrap()]).unwrap();
+    assert_eq!(room(&mem, id, "l", "1x8", pages, None), 6 * MB, "this run's measurement is newer");
+}
