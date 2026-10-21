@@ -273,12 +273,43 @@ def cpu(cuts):
     add_cpu(cuts)
 
 
+def measured_quota(device, total, name):
+    """Twelve MiB beyond existing allocator residency, not live tensor bytes.
+
+    A live cuBLAS workspace can split a larger segment: its inactive remainder
+    cannot be returned by empty_cache or reused on our other stream. That
+    hardware-dependent baseline must not consume the staging allowance.
+    """
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    allocated = torch.cuda.memory_allocated(device)
+    reserved = torch.cuda.memory_reserved(device)
+    allowance = 12 << 20
+    allowed = reserved + allowance
+    torch.cuda.set_per_process_memory_fraction(allowed / total, device)
+    assert round(torch.cuda.get_per_process_memory_fraction(device) * total) == allowed
+    torch.cuda.reset_peak_memory_stats(device)
+    return {"phase": name, "allocated_baseline": allocated, "reserved_baseline": reserved,
+            "allowance": allowance, "allowed": allowed}
+
+
+def quota_peaks(device, quota):
+    torch.cuda.synchronize(device)
+    total = torch.cuda.get_device_properties(device).total_memory
+    assert round(torch.cuda.get_per_process_memory_fraction(device) * total) == quota["allowed"], quota
+    allocated = torch.cuda.max_memory_allocated(device) - quota["allocated_baseline"]
+    reserved = torch.cuda.max_memory_reserved(device) - quota["reserved_baseline"]
+    observed = {**quota, "peak_allocated_delta": allocated, "peak_reserved_delta": reserved}
+    assert 0 <= allocated <= quota["allowance"], observed
+    assert 0 <= reserved <= quota["allowance"], observed
+    return observed
+
+
 def add_cuda(memory, device, side, total):
     from tensorfs.varena import cuts
 
     op = torch.ops.aten.add.Tensor
-    torch.cuda.set_per_process_memory_fraction(
-        (torch.cuda.memory_allocated(device) + (12 << 20)) / total, device)
+    quota = measured_quota(device, total, "add")
     like = torch.empty((1, 32, 128, 2048), dtype=torch.float32, device="meta")
     left_host, right_host = memory.mapped_output(like, device), memory.mapped_output(like, device)
     assert left_host is not None and right_host is not None
@@ -339,7 +370,7 @@ def add_cuda(memory, device, side, total):
     side.synchronize()
     torch.testing.assert_close(observed, op(expected_alias, expected_alias, alpha=-0.5), rtol=0, atol=0)
     del alias, observed, expected_alias
-    return max(row[3] for row in writes)
+    return max(row[3] for row in writes), quota_peaks(device, quota)
 
 
 def cuda():
@@ -356,16 +387,14 @@ def cuda():
     side = torch.cuda.Stream(device=device)
     try:
         with memory.request("contiguous-mapped-output") as request, torch.inference_mode():
-            # 32MiB source; a real allocator quota fits input plus bounded staging,
+            # 32MiB source; a real quota above existing reserved memory fits bounded staging,
             # but cannot hold another complete result. No physical hog/ledger cap mutation.
             raw = torch.arange(1 << 23, dtype=torch.float32, device=device).reshape(1, 32, 2, 2, 2, 1, 128, 256)
             source = raw.permute(0, 1, 5, 2, 6, 3, 7, 4)
             del raw
             pointer = weakref.ref(source)
             torch.cuda.synchronize(device)
-            allocated = torch.cuda.memory_allocated(device)
-            quota = allocated + (12 << 20)
-            torch.cuda.set_per_process_memory_fraction(quota / total, device)
+            quota = measured_quota(device, total, "contiguous")
             authority = Room(memory, room=8 << 20)
             cuts.serve(cuts.Memo(), authority)
             defaults = default_formats(cuts, source)
@@ -393,12 +422,12 @@ def cuda():
             side.synchronize()
             assert torch.equal(observed - 1, alias)
             del alias, observed
+            quota_observations = [quota_peaks(device, quota)]
             torch.cuda.set_per_process_memory_fraction(fraction, device)
 
             # The real decode now feeds native SiLU a mapped contiguous result.
             # Build that input through the admitted writer in bounded GPU bands too.
-            torch.cuda.set_per_process_memory_fraction(
-                (torch.cuda.memory_allocated(device) + (12 << 20)) / total, device)
+            quota = measured_quota(device, total, "silu")
             like = torch.empty((1, 32, 128, 2048), dtype=torch.float32, device="meta")
             host_input = memory.mapped_output(like, device)
             assert host_input is not None
@@ -440,8 +469,10 @@ def cuda():
             activation_room.outputs.clear()
             gc.collect()
             assert activation_pointer() is None, "activation memo retained its mapped input"
+            quota_observations.append(quota_peaks(device, quota))
             torch.cuda.set_per_process_memory_fraction(fraction, device)
-            add_largest = add_cuda(memory, device, side, total)
+            add_largest, add_quota = add_cuda(memory, device, side, total)
+            quota_observations.append(add_quota)
             torch.cuda.set_per_process_memory_fraction(fraction, device)
         assert request.stats is not None and not request.cleanup_errors
         assert request.stats.leftover == ((0, 0),)
@@ -453,6 +484,7 @@ def cuda():
                           "omitted_memory_format": defaults,
                           "silu_largest_band_bytes": max(row[3] for row in activation_writes),
                           "add_largest_band_bytes": add_largest,
+                          "quotas": quota_observations,
                           "leftover": request.stats.leftover, "scope": "isolated cut/output; not native relief policy"}))
     finally:
         torch.cuda.set_per_process_memory_fraction(fraction, device)
