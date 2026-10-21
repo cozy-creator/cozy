@@ -2950,8 +2950,10 @@ pub(crate) mod tests {
             let store = crate::storage::open(&root.join("store")).unwrap();
             let machine = crate::origin::Machine::new(store.clone(), None).unwrap();
             let publisher = Publisher::new(&root.join("published"), PackageSdk::default(), machine).unwrap();
+            // Each test's GPUs are its own: their ledgers are named by UUID, machine-wide.
+            let tag = root.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
             let inventory: Vec<Value> = gpus.iter().enumerate().map(|(at, (cc, memory))| json!({"device_index": at,
-                "device_name": "GPU", "device_uuid": format!("GPU-{at}"), "driver_version": "1", "memory_bytes": memory,
+                "device_name": "GPU", "device_uuid": format!("GPU-{at}-{tag}"), "driver_version": "1", "memory_bytes": memory,
                 "pci_bus_id": format!("{at}"), "compute_cap": cc})).collect();
             let devices: Vec<String> = (0..gpus.len()).map(|at| at.to_string()).collect();
             let config = json!({"devices": devices.join(","), "inventory": inventory, "prespawn": false});
