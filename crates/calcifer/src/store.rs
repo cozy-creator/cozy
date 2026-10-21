@@ -117,7 +117,7 @@ pub enum StoreError {
     #[error("Calcifer's store: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error(
-        "Calcifer's store is at version {0}: this cozy reads versions 5 and 6, the stores of cozy 0.9.4 on"
+        "Calcifer's store is at version {0}: this cozy reads versions 5 through 7"
     )]
     Version(i64),
     #[error("idempotency key {0:?} already names another submission")]
