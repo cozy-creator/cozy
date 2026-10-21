@@ -100,22 +100,18 @@ pub struct HostBackend {
 #[derive(Default)]
 struct Pages {
     next: u64,
-    /// id → (handle, bytes it counts against the limit (0 for an imported page), its bytes).
-    live: HashMap<u64, (Owned, u64, u64)>,
+    /// id → (handle, bytes it counts against the limit: 0 for an imported page).
+    live: HashMap<u64, (Owned, u64)>,
 }
 
 impl Pages {
     fn created(&self) -> u64 {
-        self.live.values().map(|(_, n, _)| n).sum()
-    }
-
-    fn held(&self) -> u64 {
-        self.live.values().map(|(.., len)| len).sum()
+        self.live.values().map(|(_, n)| n).sum()
     }
 
     fn insert(&mut self, handle: Owned, counted: u64, len: u64) -> Physical {
         self.next += 1;
-        self.live.insert(self.next, (handle, counted, len));
+        self.live.insert(self.next, (handle, counted));
         Physical { id: self.next, len }
     }
 }
@@ -153,9 +149,9 @@ mod host {
             Ok(self.limit.saturating_sub(self.pages.lock().created()))
         }
 
-        /// Its pages are all it holds: the context is 0.
+        /// The pages it created, as NVML charges a process: an imported page is its exporter's.
         fn process_used(&self) -> Result<u64> {
-            Ok(self.pages.lock().held())
+            Ok(self.pages.lock().created())
         }
 
         fn granularity(&self) -> u64 {
@@ -296,7 +292,7 @@ mod host {
             Ok(self.limit.saturating_sub(self.pages.lock().created()))
         }
         fn process_used(&self) -> Result<u64> {
-            Ok(self.pages.lock().held())
+            Ok(self.pages.lock().created())
         }
         /// VirtualAlloc's allocation granularity.
         fn granularity(&self) -> u64 {

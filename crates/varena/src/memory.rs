@@ -459,7 +459,8 @@ impl Memory {
                 let (weak, jobs) = (Arc::downgrade(&inner), inner.jobs.clone());
                 std::thread::Builder::new().name("varena-fill".into()).spawn(move || fill_loop(&jobs, &weak)).map_err(|e| Error::io("spawn fill", e))?;
             }
-            let (weak, stop) = (Arc::downgrade(&inner), inner.stop.clone());
+            // The row is the Memory's alone: it goes (publishing zeros) the moment the Memory does.
+            let (weak, stop, row) = (Arc::downgrade(&inner), inner.stop.clone(), Arc::downgrade(&row));
             std::thread::Builder::new().name("varena-ask".into()).spawn(move || ask_loop(listener, &row, &weak, &stop)).map_err(|e| Error::io("spawn ask", e))?;
             let (weak, wanted) = (Arc::downgrade(&inner), inner.wanted.clone());
             std::thread::Builder::new().name("varena-trim".into()).spawn(move || trim_loop(&wanted, &weak)).map_err(|e| Error::io("spawn trim", e))?;
@@ -1871,12 +1872,12 @@ fn fill_loop(jobs: &(Mutex<Jobs>, Condvar), inner: &Weak<Inner>) {
     }
 }
 
-fn ask_loop(listener: crate::os::Listener, row: &Row, inner: &Weak<Inner>, stop: &AtomicBool) {
+fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>, stop: &AtomicBool) {
     for stream in crate::os::incoming(listener) {
         if stop.load(Ordering::Acquire) {
             return;
         }
-        let Some(me) = inner.upgrade() else { return };
+        let (Some(me), Some(row)) = (inner.upgrade(), row.upgrade()) else { return };
         // Never dies: a failed or panicking answer frees nothing, and the next ask is served.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| row.serve(&stream, |ceiling, bytes| me.answer(ceiling, bytes))));
     }

@@ -116,8 +116,8 @@ fn a_late_dropped_pass_leaves_the_next_one() {
     drop(second);
 }
 
-/// Review 1, finding 3: a Memory that served custody, once dropped, leaves no row publishing its
-/// bytes: custody's row is its own and holds only orphans.
+/// Review 1, finding 3: a Memory that served custody leaves no row behind once dropped:
+/// custody's row is its own and publishes only orphans.
 #[test]
 fn a_dropped_custody_holder_leaves_no_zombie_row() {
     let dir = tempfile::tempdir().unwrap();
@@ -125,13 +125,30 @@ fn a_dropped_custody_holder_leaves_no_zombie_row() {
     let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(g.memory))).unwrap();
     mem.load(set(dir.path(), "z", 2, &g.uuid), Level::Gpu).unwrap();
     let ledger = varena::Ledger::create(&g, None).unwrap();
-    let held = |l: &varena::Ledger| l.status().rows.iter().map(|r| r.classes.iter().sum::<u64>()).sum::<u64>();
+    let held = |l: &varena::Ledger| l.status().rows.iter().map(|r| r.classes.iter().enumerate().filter(|(c, _)| *c != 1).map(|(_, b)| b).sum::<u64>()).sum::<u64>();
     assert_eq!(held(&ledger), 4 * MB);
     drop(mem);
-    // Its kept pages are orphans now (class O on custody's row); nothing else is published.
-    let rows = ledger.status().rows;
-    assert!(rows.iter().all(|r| r.classes.iter().enumerate().all(|(c, b)| c == 1 || *b == 0)), "{rows:?}");
-    assert_eq!(rows.iter().map(|r| r.classes[1]).sum::<u64>(), 4 * MB, "S5: class O shows the orphans");
+    assert_eq!(held(&ledger), 0, "{:?}", ledger.status().rows);
+}
+
+/// S5: after its holder ends, its kept pages show as class O on custody's row.
+#[test]
+fn orphans_show_as_class_o() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ledger, mem, g) = open("orphans", 16 * MB);
+    mem.load(set(dir.path(), "o", 2, &g.uuid), Level::Gpu).unwrap();
+    drop(mem);
+    // The custody service sees the connection end on its own thread; it rings the ledger.
+    let fd = std::os::fd::AsRawFd::as_raw_fd(ledger.events());
+    while ledger.status().rows.iter().map(|r| r.classes[1]).sum::<u64>() < 4 * MB {
+        let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let mut event = [0u8; 8];
+        // SAFETY: one live descriptor waited on with no timeout, then its counter read.
+        unsafe {
+            libc::poll(&mut poll, 1, -1);
+            libc::read(fd, event.as_mut_ptr().cast(), 8);
+        }
+    }
 }
 
 /// S5: `fits(package, "")` means the package's widest measured shape.
