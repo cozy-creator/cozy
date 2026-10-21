@@ -1089,7 +1089,8 @@ fn blocked<'s, T: Send + 's>(t: &'s std::thread::Scope<'s, '_>, f: impl FnOnce()
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let finished = done.clone();
     let handle = t.spawn(move || {
-        sent.send(unsafe { libc::gettid() }).unwrap();
+        // The syscall: glibc 2.28 (manylinux_2_28) has no gettid wrapper.
+        sent.send(unsafe { libc::syscall(libc::SYS_gettid) }).unwrap();
         let out = f();
         finished.store(true, std::sync::atomic::Ordering::Release);
         out
