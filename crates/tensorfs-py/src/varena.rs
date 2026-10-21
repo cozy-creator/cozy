@@ -209,14 +209,6 @@ impl From<varena::Stats> for PyStats {
     }
 }
 
-#[pymethods]
-impl PyStats {
-    /// The record as JSON, field for field (what a Runtime relays).
-    fn json(&self) -> PyResult<String> {
-        serde_json::to_string(&self.raw).map_err(|e| VarenaError::new_err(e.to_string()))
-    }
-}
-
 /// What turns a page's stored bytes into its weights (varena's `Fill`).
 #[pyclass(name = "Fill", module = "tensorfs.varena", frozen)]
 pub enum PyFill {
