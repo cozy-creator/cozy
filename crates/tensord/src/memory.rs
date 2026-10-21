@@ -1,10 +1,9 @@
 //! TensorD on varena's ledger (design varena-slim §2–§4). Each envelope GPU the inventory names
 //! has a [`Ledger`] (capacity min(card, `gpu_memory_limit`)): an executor is granted it at spawn,
-//! its row is reaped once its exit is proven, and admission is its `fits` (`admit`: a group on
-//! all of its GPUs or none). TensorD holds no byte count and decides no eviction: kept-page
-//! custody runs inside the ledger and the RAM tier ([`Tier`]) in this process. One thread blocks
-//! on every ledger's events; on each wake the dispatch queue asks again, the rows the ledger names
-//! stalled end, and changed peaks are saved.
+//! its row is reaped once its exit is proven, and admission is [`admit`] (`Ledger::admit`: a
+//! group on all of its GPUs or none, waiting while refused). TensorD holds no byte count and
+//! decides no eviction: kept-page custody runs inside the ledger and the RAM tier ([`Tier`]) in
+//! this process. One thread blocks on every ledger's events and the tier's host-short event.
 use crate::{execution::Engine, machine::receipt};
 use platform::contain::host_pressure::{self, HostMode};
 use std::{
@@ -19,13 +18,10 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
-use varena::{GpuId, Ledger, Peak, Pressure, Status, Tier};
+use varena::{ledger::Mode, GpuId, Ledger, Peak, Pressure, Tier};
 
 /// Past this the memory log rotates to `memory.log.1`, so it holds at most twice this.
 const ROTATE_BYTES: u64 = 4 << 20;
-
-/// A row's classes in `RowStatus::classes` order (F, O, S, N, D, W, P): from S on, pages it maps.
-const MAPPED: usize = 2;
 
 /// One envelope GPU's ledger, and the GPU model its peaks are kept under.
 pub struct Gpu {
@@ -48,8 +44,8 @@ impl Gpu {
             }
         };
         let mode = match mode {
-            HostMode::Shared => varena::ledger::Mode::Shared,
-            HostMode::Dedicated => varena::ledger::Mode::Dedicated,
+            HostMode::Shared => Mode::Shared,
+            HostMode::Dedicated => Mode::Dedicated,
         };
         if let Err(error) = ledger.set_mode(mode) {
             tracing::warn!("memory: GPU {entry} stays shared: {error}");
@@ -57,23 +53,6 @@ impl Gpu {
         peaks.restore(&id.model, &ledger);
         log.note(serde_json::json!({"event": "ledger", "gpu": entry, "card": id.memory, "capacity": ledger.status().capacity}));
         Some(Gpu { ledger, model: id.model })
-    }
-
-    /// A request runs here now, by any process's row, or is dispatched to one.
-    pub fn running(&self) -> bool {
-        let status = self.ledger.status();
-        !status.dispatched.is_empty() || status.rows.iter().any(|r| r.live && (r.remaining > 0 || r.unmeasured > 0))
-    }
-
-    /// `pid`'s live row maps weights here.
-    pub fn maps(&self, pid: u32) -> bool {
-        let status = self.ledger.status();
-        status.rows.iter().any(|r| r.pid == pid && r.live && r.classes.iter().skip(MAPPED).any(|bytes| *bytes > 0))
-    }
-
-    /// The table at a glance, for the memory log.
-    pub fn status(&self) -> Status {
-        self.ledger.status()
     }
 }
 
@@ -100,8 +79,8 @@ pub fn admit(engine: &Engine, ledgers: &[&Ledger], id: &str, package: &str, shap
     }
 }
 
-/// A child call on its family's own lane: admitted under its family's admission, with no
-/// `fits` (its parent is blocked on it), and dispatched under its own key so its peak is recorded.
+/// A child call on its family's lane: admitted under its family's admission, with no `fits`
+/// (its parent is blocked on it), and dispatched under its own key so its peak is recorded.
 /// Should the two compute at once, varena's demand in the executors makes the room.
 pub fn dispatch(ledgers: &[&Ledger], id: &str, package: &str, shape: &str) {
     if let Err(error) = ledgers.iter().try_for_each(|ledger| ledger.dispatch(id, package, shape)) {
@@ -109,12 +88,13 @@ pub fn dispatch(ledgers: &[&Ledger], id: &str, package: &str, shape: &str) {
     }
 }
 
-/// Measured peaks, persisted per GPU model as `<dir>/<model>.json`. A key names its package
-/// release (`<construction>|<shape>`, or a set's `<package>@<release>/<component>|…`), so one
-/// file holds every release's; a key measured on several GPUs of the model keeps its largest.
+/// Measured peaks, persisted per GPU model as `<dir>/<model>.json`: varena's records, kept and
+/// restored whole. A key names its package release (`<construction>|<shape>`, or a set's
+/// `<package>@<release>/<component>|…`), so one file holds every release's. Each GPU of the
+/// model contributes its records; a key two of them measured is merged by the ledger's restore.
 pub struct Peaks {
     dir: PathBuf,
-    saved: Mutex<BTreeMap<String, BTreeMap<String, Peak>>>,
+    saved: Mutex<BTreeMap<String, Vec<Peak>>>,
 }
 
 impl Peaks {
@@ -131,44 +111,80 @@ impl Peaks {
         let mut saved = self.saved.lock().unwrap();
         let held = saved.entry(model.into()).or_insert_with(|| {
             let read = fs::read(self.path(model)).ok().and_then(|bytes| serde_json::from_slice::<Vec<Peak>>(&bytes).ok());
-            read.unwrap_or_default().into_iter().map(|peak| (peak.key.clone(), peak)).collect()
+            read.unwrap_or_default()
         });
-        if let Err(error) = ledger.restore(&held.values().cloned().collect::<Vec<_>>()) {
+        if let Err(error) = ledger.restore(held) {
             tracing::warn!("memory: {model}'s peaks not restored: {error}");
         }
     }
 
-    /// Saves what `ledgers` (all of `model`) measured, when it changed.
+    /// Saves what `ledgers` (every GPU of `model`, each holding what was restored into it) now
+    /// hold, when it changed.
     pub fn save<'a>(&self, model: &str, ledgers: impl Iterator<Item = &'a Ledger>) {
         let mut saved = self.saved.lock().unwrap();
-        let held = saved.entry(model.into()).or_default();
-        let mut changed = false;
+        let mut held: Vec<Peak> = vec![];
         for peak in ledgers.flat_map(Ledger::peaks) {
-            if held.get(&peak.key).is_none_or(|kept| kept.bytes < peak.bytes) {
-                held.insert(peak.key.clone(), peak);
-                changed = true;
+            if !held.contains(&peak) {
+                held.push(peak);
             }
         }
-        if !changed {
+        if saved.get(model).is_some_and(|before| before.len() == held.len() && held.iter().all(|peak| before.contains(peak))) {
             return;
         }
-        let written = fs::create_dir_all(&self.dir).map_err(platform::Error::from).and_then(|()| {
-            let peaks: Vec<&Peak> = held.values().collect();
-            platform::durable::replace(&self.path(model), &serde_json::to_vec(&peaks).unwrap_or_default(), 0o600)
-        });
-        if let Err(error) = written {
-            tracing::warn!("memory: {model}'s peaks not saved: {error}");
+        let written = fs::create_dir_all(&self.dir)
+            .map_err(platform::Error::from)
+            .and_then(|()| platform::durable::replace(&self.path(model), &serde_json::to_vec(&held).unwrap_or_default(), 0o600));
+        match written {
+            Ok(()) => drop(saved.insert(model.into(), held)),
+            Err(error) => tracing::warn!("memory: {model}'s peaks not saved: {error}"),
         }
     }
 }
 
-/// Blocks on every ledger's events (its own copies of them) until the returned end drops;
-/// `wake` runs once per wake. It never times out: a ledger signals each change.
-pub fn react(ledgers: &[&Ledger], wake: impl Fn() + Send + 'static) -> io::Result<UnixStream> {
-    let events: Vec<OwnedFd> = ledgers.iter().map(|ledger| ledger.events().try_clone()).collect::<io::Result<_>>()?;
+/// What woke the events thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Woke {
+    /// A ledger: room freed, a row died, a peak was recorded.
+    Ledger,
+    /// The RAM tier gave back all it may and the host is still short.
+    HostShort,
+}
+
+/// A source the events thread waits on: a ledger's events, or the RAM tier's host-short event.
+pub enum Source {
+    Ledger(Arc<Gpu>),
+    Tier(Arc<Tier>),
+}
+
+impl Source {
+    fn fd(&self) -> &OwnedFd {
+        match self {
+            Source::Ledger(gpu) => gpu.ledger.events(),
+            Source::Tier(tier) => tier.short(),
+        }
+    }
+
+    /// Clears what it signalled (a ready event: no wait).
+    fn clear(&self) -> Woke {
+        match self {
+            Source::Ledger(gpu) => {
+                gpu.ledger.clear_events();
+                Woke::Ledger
+            }
+            Source::Tier(tier) => {
+                let _ = tier.await_short();
+                Woke::HostShort
+            }
+        }
+    }
+}
+
+/// Blocks on every source until the returned end drops; `wake` runs once per wake with what
+/// woke it. It never times out.
+pub fn react(sources: Vec<Source>, wake: impl Fn(Woke) + Send + 'static) -> io::Result<UnixStream> {
     let (held, end) = UnixStream::pair()?;
     std::thread::Builder::new().name("memory-events".into()).spawn(move || {
-        let watched = std::iter::once(end.as_raw_fd()).chain(events.iter().map(AsRawFd::as_raw_fd));
+        let watched = std::iter::once(end.as_raw_fd()).chain(sources.iter().map(|source| source.fd().as_raw_fd()));
         let mut fds: Vec<libc::pollfd> = watched.map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
         loop {
             // SAFETY: poll on descriptors this thread owns; no timeout.
@@ -178,40 +194,36 @@ pub fn react(ledgers: &[&Ledger], wake: impl Fn() + Send + 'static) -> io::Resul
                 }
                 return tracing::warn!("memory: events: {}", io::Error::last_os_error());
             }
-            let (pool, ledgers) = fds.split_at_mut(1);
+            let (pool, events) = fds.split_at_mut(1);
             if pool.iter().any(|fd| fd.revents != 0) {
                 return;
             }
-            for fd in ledgers.iter_mut().filter(|fd| fd.revents != 0) {
+            let mut woke = vec![];
+            for (fd, source) in events.iter_mut().zip(&sources).filter(|(fd, _)| fd.revents != 0) {
                 if fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
                     fd.fd = -1; // closed or failed: poll skips it from now on
                     continue;
                 }
-                let mut count = [0u8; 8];
-                // SAFETY: a nonblocking read into a local buffer (it clears the event; another
-                // reader may have cleared it first).
-                unsafe { libc::read(fd.fd, count.as_mut_ptr().cast(), count.len()) };
+                let what = source.clear();
+                if !woke.contains(&what) {
+                    woke.push(what);
+                }
             }
-            wake();
+            woke.into_iter().for_each(&wake);
         }
     })?;
     Ok(held)
 }
 
 /// The machine's RAM tier, served from this process while it lives: on the host's pressure
-/// trigger, else (no trigger here) at its headroom check at every host decision.
-pub struct HostTier {
-    _tier: Option<Tier>,
-}
-
-impl HostTier {
-    pub fn serve(mode: HostMode) -> Self {
-        let pressure = host_pressure::Pressure::arm(mode).map(Pressure::Host).unwrap_or_else(|error| {
-            tracing::warn!("memory: no host pressure trigger ({error}); the RAM tier gives way at its headroom checks");
-            Pressure::Headroom
-        });
-        Self { _tier: Tier::serve(pressure).map_err(|error| tracing::warn!("memory: no RAM tier: {error}")).ok().flatten() }
-    }
+/// trigger, else (no trigger here) at its headroom check at every host decision. None when
+/// another participant serves it.
+pub fn serve_tier(mode: HostMode) -> Option<Arc<Tier>> {
+    let pressure = host_pressure::Pressure::arm(mode).map(Pressure::Host).unwrap_or_else(|error| {
+        tracing::warn!("memory: no host pressure trigger ({error}); the RAM tier gives way at its headroom checks");
+        Pressure::Headroom
+    });
+    Tier::serve(pressure).map_err(|error| tracing::warn!("memory: no RAM tier: {error}")).ok().flatten().map(Arc::new)
 }
 
 fn now_ms() -> u128 {
