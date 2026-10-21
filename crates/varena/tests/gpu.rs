@@ -585,11 +585,11 @@ fn a_registered_host_range_fills_directly_every_time() {
     read("unregistered 1");
     let (again, ..) = read("unregistered 2");
     read("unregistered 3");
-    // SAFETY: `data` stays mapped until it is unregistered below.
-    unsafe { b.register_host(data.as_ptr(), len) }.unwrap();
+    // `data` stays mapped until it is unregistered below.
+    b.register_host(data.as_ptr() as u64, len).unwrap();
     let first = read("registered 1");
     let second = read("registered 2");
-    b.unregister_host(data.as_ptr()).unwrap();
+    b.unregister_host(data.as_ptr() as u64).unwrap();
     assert_eq!(bytes(va.base, len, 0), data);
     b.unmap(va, 0, len).unwrap();
     b.destroy(page);
