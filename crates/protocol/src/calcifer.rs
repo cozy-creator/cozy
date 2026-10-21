@@ -216,6 +216,10 @@ pub struct OutputItem {
     pub export_error: Option<String>,
 }
 
+/// A rental's reason when every machine it could buy cost more than its quote: nothing was billed,
+/// and only a new quote rents.
+pub const QUOTE_EXCEEDED: &str = "placement.quote_exceeded";
+
 /// A weights output's media type: its bytes are a checkpoint's manifest.
 pub const CHECKPOINT: &str = "application/vnd.cozy.model-manifest";
 
@@ -447,7 +451,7 @@ pub struct Machine {
     /// The sha256 of its pinned TLS leaf: what `cozy machine add … --fingerprint` takes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<Digest>,
-    /// Why it ended.
+    /// Why it ended: [`QUOTE_EXCEEDED`] for a rental the market priced out before it was bought.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// The Hub's word, for a rental.

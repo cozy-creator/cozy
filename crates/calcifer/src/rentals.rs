@@ -13,8 +13,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use platform::paths::Home;
 use protocol::{
     calcifer::{
-        Agreed, Ended, HubListing, HubProblem, Machine, MachineKind, MachineState, On, Quote,
-        Reason, Rental, Rented, RunQuote, SubmitRun, Warning,
+        Agreed, Ended, HubListing, HubProblem, Machine, MachineKind, MachineState, On,
+        QUOTE_EXCEEDED, Quote, Reason, Rental, Rented, RunQuote, SubmitRun, Warning,
     },
     config,
     error::{Error, Kind},
@@ -1020,11 +1020,14 @@ fn gone(state: &str) -> bool {
     matches!(state, "failed" | "released")
 }
 
-/// Why an ended rental ended: who released it, else its failure.
+/// Why an ended rental ended: who released it, else its failure. A market that moved past the
+/// quote is the rental's own verdict, over the refused attempt before it: only a new quote helps.
 fn cause(rental: &types::Rental) -> String {
+    let priced_out = rental.detail.as_deref().is_some_and(|d| d.starts_with(QUOTE_EXCEEDED));
     rental
         .release_cause
         .clone()
+        .or_else(|| priced_out.then(|| QUOTE_EXCEEDED.to_owned()))
         .or_else(|| rental.failure.as_ref().map(|f| f.code.clone()))
         .or_else(|| rental.detail.clone())
         .unwrap_or_else(|| format!("its Hub says it {}", rental.state))
@@ -1191,4 +1194,35 @@ fn names(rental: &types::Rental, text: &str) -> bool {
             .machine_name
             .as_deref()
             .is_some_and(|name| name.eq_ignore_ascii_case(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rental the market priced out after its quoted host refused (Hub th-260) says so over the
+    /// refused attempt's failure, whose remedy (another GPU, later) would not rent it.
+    #[test]
+    fn a_priced_out_rental_names_its_quote_over_the_refused_attempt() {
+        let failed = |detail: &str| -> types::Rental {
+            serde_json::from_value(serde_json::json!({
+                "rental_id": "pr-1", "name": "shutendouji", "state": "failed",
+                "requested_accelerator_model": "NVIDIA GeForce RTX 4090", "accelerator_count": 2,
+                "creator_public_key": "k", "base_worker_image_digest": "sha256:0",
+                "hourly_rate_usd_micros": 2_733_000, "spend_usd_micros": 0, "spend_basis": "none",
+                "container_disk_gb": 300, "created_at": "2026-10-21T03:37:34Z",
+                "detail": detail,
+                "failure": {"code": "provider_create_did_not_happen", "base_worker_image_digest": "sha256:0"},
+            }))
+            .unwrap()
+        };
+        let priced_out = failed(
+            "placement.quote_exceeded: every machine that matches NVIDIA GeForce RTX 4090 x2 now \
+             costs more than this rental's quote; rent again for a new quote",
+        );
+        assert_eq!(cause(&priced_out), QUOTE_EXCEEDED);
+        let refused =
+            failed("Provider capacity became unavailable before creation; no machine was created.");
+        assert_eq!(cause(&refused), "provider_create_did_not_happen");
+    }
 }
