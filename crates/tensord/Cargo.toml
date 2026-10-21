@@ -55,6 +55,8 @@ tracing-subscriber.workspace = true
 png = "0.17"
 tower.workspace = true
 tempfile.workspace = true
+# The multi-process ledger test builds its stand-ins' layout from spans.
+varena = { workspace = true, features = ["store"] }
 x509-parser = "0.18"
 
 [build-dependencies]
