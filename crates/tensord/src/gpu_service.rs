@@ -1257,8 +1257,8 @@ impl Pool {
     /// Room for a request of `plan` at `shape` on every GPU of the lane, in device order (so two
     /// groups never wait on each other): while it does not fit (`fits`) and no request runs
     /// there, idle executors end, least recently used first (never `plan`'s, nor a warm
-    /// member's when `spare`). Whether it fits everywhere; a request starts either way, and
-    /// varena in its executor makes what room it can.
+    /// member's when `spare`). Whether it fits everywhere; a request is then admitted
+    /// (`memory::admit`), waiting while it does not.
     fn make_room(&self, plan: &str, start: usize, degree: u32, shape: &str, spare: bool) -> io::Result<bool> {
         self.reap();
         let mut fit = true;
@@ -2696,10 +2696,24 @@ impl Pool {
         }
         let prepared = command_ok(prepared)?;
         // Admitted at its shape, the key its peak is recorded under: room made for it, then on
-        // every GPU of its lane or none (else dispatched anyway).
+        // every GPU of its lane or none, waiting while it does not fit. A child on its family's
+        // own lane is its family's: its parent is blocked on it.
         let shape = shape(&prepared.features);
-        self.make_room(&construction, start, degree, &shape, false)?;
-        let _dispatched = Dispatched::admit(gpus, id, &construction, &shape);
+        let ledgers: Vec<&varena::Ledger> = gpus.iter().filter_map(|d| d.memory.as_ref()).map(|m| &m.ledger).collect();
+        let admitted = match self.allocations.shared(start..start + degree as usize) {
+            true => {
+                memory::dispatch(&ledgers, id, &construction, &shape);
+                Ok(true)
+            }
+            false => self.make_room(&construction, start, degree, &shape, false)
+                .and_then(|_| memory::admit(engine, &ledgers, id, &construction, &shape)),
+        };
+        let _dispatched = Dispatched { gpus, id: id.into() };
+        if !admitted? {
+            // Canceled while it waited for room: it never started.
+            defer_completion(engine, id, &session.executor.birth, &session.followers, Outcome::Canceled)?;
+            return Ok(true);
+        }
         let spool = if let Some(identity) = self.config.identity {
             // Keep Journal/results/admin paths private to the core. A separate peer-owned
             // spool lives only inside this executor's already authorized output directory.
@@ -2947,26 +2961,10 @@ fn shape(features: &BTreeMap<String, serde_json::Value>) -> String {
 /// as the package's widest measured shape; none measured, it fits only on an idle GPU.
 const UNPREPARED: &str = "";
 
-/// A request admitted on every GPU of its lane under `<package>|<shape>` (the key its peak is
-/// recorded under), until it ends.
+/// A request admitted on every GPU of its lane (`memory::admit`), undispatched when it ends.
 struct Dispatched<'a> {
     gpus: &'a [Device],
     id: String,
-}
-impl<'a> Dispatched<'a> {
-    /// `Ledger::admit`: on all of the lane's GPUs or none. Refused (its room made as far as
-    /// TensorD may), it is dispatched anyway, and varena in its executor makes the rest.
-    fn admit(gpus: &'a [Device], id: &str, package: &str, shape: &str) -> Self {
-        let ledgers: Vec<&varena::Ledger> = gpus.iter().filter_map(|d| d.memory.as_ref()).map(|m| &m.ledger).collect();
-        let dispatched = varena::Ledger::admit(&ledgers, id, package, shape).and_then(|admitted| match admitted {
-            true => Ok(()),
-            false => ledgers.iter().try_for_each(|ledger| ledger.dispatch(id, package, shape)),
-        });
-        if let Err(error) = dispatched {
-            tracing::warn!("memory: request {id} runs unrecorded: {error}");
-        }
-        Self { gpus, id: id.into() }
-    }
 }
 impl Drop for Dispatched<'_> {
     fn drop(&mut self) {

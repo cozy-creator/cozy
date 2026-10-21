@@ -5,7 +5,7 @@
 //! custody runs inside the ledger and the RAM tier ([`Tier`]) in this process. One thread blocks
 //! on every ledger's events; on each wake the dispatch queue asks again, the rows the ledger names
 //! stalled end, and changed peaks are saved.
-use crate::machine::receipt;
+use crate::{execution::Engine, machine::receipt};
 use platform::contain::host_pressure::{self, HostMode};
 use std::{
     collections::BTreeMap,
@@ -67,6 +67,38 @@ impl Gpu {
     /// The table at a glance, for the memory log.
     pub fn status(&self) -> Status {
         self.ledger.status()
+    }
+}
+
+/// Admits request `id` at `<package>|<shape>` on every one of `ledgers` or none (`Ledger::admit`,
+/// which names the key its peak is recorded under). Refused, it waits for the engine's activity,
+/// which every ledger event and every cancel bumps, and asks again: running requests end, and a
+/// GPU nothing runs on always admits. False: it was canceled meanwhile. A ledger that cannot
+/// answer lets it run unrecorded.
+pub fn admit(engine: &Engine, ledgers: &[&Ledger], id: &str, package: &str, shape: &str) -> io::Result<bool> {
+    loop {
+        let seen = engine.activity_epoch();
+        match Ledger::admit(ledgers, id, package, shape) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!("memory: request {id} runs unrecorded: {error}");
+                return Ok(true);
+            }
+        }
+        if engine.get(id)?.cancel_actor.is_some() {
+            return Ok(false);
+        }
+        engine.wait_activity(seen, None);
+    }
+}
+
+/// A child call on its family's own lane: admitted under its family's admission, with no
+/// `fits` (its parent is blocked on it), and dispatched under its own key so its peak is recorded.
+/// Should the two compute at once, varena's demand in the executors makes the room.
+pub fn dispatch(ledgers: &[&Ledger], id: &str, package: &str, shape: &str) {
+    if let Err(error) = ledgers.iter().try_for_each(|ledger| ledger.dispatch(id, package, shape)) {
+        tracing::warn!("memory: request {id} runs unrecorded: {error}");
     }
 }
 
