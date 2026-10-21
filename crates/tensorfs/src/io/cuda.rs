@@ -51,6 +51,7 @@ pub const ATTR_PCI_DEVICE_ID: c_int = 34;
 pub const ATTR_PCI_DOMAIN_ID: c_int = 50;
 pub const ATTR_POSIX_FD_SUPPORTED: c_int = 103;
 pub const ATTR_WIN32_HANDLE_SUPPORTED: c_int = 104;
+pub const ATTR_READ_ONLY_HOST_REGISTER_SUPPORTED: c_int = 113;
 
 pub const MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const MEM_LOCATION_TYPE_DEVICE: u32 = 1;
