@@ -168,6 +168,8 @@ codes![
     REDIRECT_REFUSED,
     HUB_UNREACHABLE,
     HUB_REFUSED,
+    // a source origin (Hugging Face, Civitai, a URL) answered what an ask cannot use
+    ORIGIN_REFUSED,
     TLS_UNTRUSTED,
     REF_NOT_FOUND,
     CREDENTIAL_REQUIRED,

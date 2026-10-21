@@ -44,9 +44,6 @@ pub struct Access {
     pub cancel_notify: Option<Arc<tokio::sync::Notify>>,
     /// Extra source trust roots supplied by the caller, in DER.
     pub ca_der: Option<Vec<u8>>,
-    /// The stall rule's tick (the fetch's): a GET that moves nothing for 120 of these is
-    /// asked again from the byte it reached.
-    pub tick: Duration,
 }
 
 impl std::fmt::Debug for Access {
@@ -71,7 +68,6 @@ impl Default for Access {
             cancelled: None,
             cancel_notify: None,
             ca_der: None,
-            tick: ask::TICK,
         }
     }
 }
@@ -334,7 +330,7 @@ impl<'a> Scope<'a> {
             )?,
             None => Client::new(self.policy(p)),
         };
-        let patience = Patience::new(self.tick);
+        let patience = Patience::default();
         let work = self.until(async {
             let mut sink = |at, frame: &[u8]| {
                 self.check()?;
@@ -346,7 +342,7 @@ impl<'a> Scope<'a> {
                 Ok(headers) => Ok(headers.get("link").and_then(|v| v.to_str().ok()).and_then(next_link)),
                 Err(status @ (404 | 410)) => refuse(Code::REF_NOT_FOUND, what(status)),
                 Err(status @ (401 | 403)) => refuse(Code::PERMISSION_DENIED, what(status)),
-                Err(status) => refuse(Code::HUB_REFUSED, what(status)),
+                Err(status) => refuse(Code::ORIGIN_REFUSED, what(status)),
             }
         });
         match &self.runtime {

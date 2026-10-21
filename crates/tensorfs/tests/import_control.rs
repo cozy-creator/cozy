@@ -56,15 +56,14 @@ fn safetensors() -> Vec<u8> {
 }
 
 /// What the first ask of a path meets: the listing's or the member's body held after its
-/// prefix until released; or, of the member, a 429 with `Retry-After: 1`, its body cut after the
-/// prefix, or its body silent after the prefix for good.
+/// prefix until released; or, of the member, a 429 with `Retry-After: 1` or its body cut after
+/// the prefix.
 #[derive(Clone, Copy, PartialEq)]
 enum Stall {
     Listing,
     Member,
     Busy,
     Cut,
-    Silent,
 }
 #[derive(Clone)]
 struct Seen {
@@ -151,18 +150,11 @@ impl Origin {
                 stream.write_all(&body[..prefix]).unwrap();
                 stream.flush().unwrap();
                 waiting.store(true, Ordering::Release);
-                match stall {
-                    Some(Stall::Cut) => return,
-                    Some(Stall::Silent) => {
-                        while !done.load(Ordering::Acquire) {
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                    }
-                    _ => {
-                        while !go.load(Ordering::Acquire) && !done.load(Ordering::Acquire) {
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                    }
+                if stall == Some(Stall::Cut) {
+                    return;
+                }
+                while !go.load(Ordering::Acquire) && !done.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
                 }
                 let _ = stream.write_all(&body[prefix..]);
                 return;
@@ -455,17 +447,15 @@ async fn stalled_listing_and_member_cancel_on_caller_runtime_and_resume_exact_by
     }
 }
 
-/// One import rides out a 429 at its `Retry-After`, and a member body cut or gone silent after
-/// its first 16 bytes is asked again from byte 16; the stall rule's tick is 5 ms (0.6 s of
-/// silence drops a request).
+/// One import rides out a 429 at its `Retry-After`, and a member body cut after its first 16
+/// bytes is asked again from byte 16 (a silent one: `fetch::ask`'s own test).
 #[test]
-fn weather_and_stopped_bodies_are_asked_again_from_the_byte_reached() {
-    for stall in [Stall::Busy, Stall::Cut, Stall::Silent] {
+fn weather_and_cut_bodies_are_asked_again_from_the_byte_reached() {
+    for stall in [Stall::Busy, Stall::Cut] {
         let scratch = Scratch::new();
         let origin = Origin::new(Some(stall));
         let store = Store::open(scratch.0.join("store")).unwrap();
-        let access = Access { tick: Duration::from_millis(5), ..access(&origin, None, None, None) };
-        let (result, files, committed) = convert(&store, &access, None);
+        let (result, files, committed) = convert(&store, &access(&origin, None, None, None), None);
         assert_bytes(&store, &result.unwrap(), &files);
         assert!(committed);
         let seen = origin.requests.lock().unwrap();
