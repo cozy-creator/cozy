@@ -4,6 +4,8 @@
 set -euo pipefail
 cargo fetch --locked --target x86_64-unknown-linux-gnu
 target="$PWD/target/manylinux"
+# A toolchain a failed run left in the cache may be half-installed: the container installs its own.
+rm -rf "$target/rustup"
 mkdir -p "$target" dist/testbins
 docker run --rm --user "$(id -u):$(id -g)" --tmpfs /cargo:rw,exec,mode=1777 \
   -e CARGO_HOME=/cargo -e RUSTUP_HOME=/target/rustup -e CARGO_BUILD_JOBS="$(nproc)" \
