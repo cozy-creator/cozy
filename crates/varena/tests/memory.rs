@@ -408,3 +408,24 @@ fn the_latest_measured_room_wins() {
     assert_eq!(room(&mem, id, "l", "1x8", pages, None), 6 * MB, "this run's measurement is newer");
 }
 
+
+/// The vertical slice: a cold request's record carries the fills of the loads before it, by
+/// source, so its cold cost shows; a warm one after it carries none.
+#[test]
+fn a_cold_requests_record_carries_its_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_scope, _l, mem, g) = open("loadstats", 16 * MB);
+    let id = mem.load(set(dir.path(), "ls", 2, &g.uuid), Level::Gpu).unwrap();
+    let cold = mem.request("cold", plan("ls")).unwrap();
+    let s = cold.stats();
+    assert_eq!(s.moved.store.bytes, 2 * REGION_ALIGN, "the load's fills, from the store");
+    assert_eq!(s.trace.iter().filter(|r| r.origin == varena::Origin::Store).count(), 2, "{:?}", s.trace);
+    let pass = cold.pass(id, "fwd", "1x8", Torch::default()).unwrap();
+    drop(mem.bind(id, 0, 0).unwrap());
+    drop(pass);
+    let s = cold.end();
+    assert_eq!(s.moved.store.bytes, 2 * REGION_ALIGN);
+    assert_eq!(s.trace.len(), 3, "two load fills and one bind: {:?}", s.trace);
+    let warm = mem.request("warm", plan("ls")).unwrap();
+    assert_eq!(warm.stats().moved.store.bytes, 0, "nothing filled since");
+}

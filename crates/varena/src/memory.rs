@@ -142,8 +142,10 @@ pub struct StepStats {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Stats {
     pub request: String,
+    /// Every fill since the previous request ended (loads included) and during this one.
     pub moved: Moved,
-    /// One entry per bind.
+    /// One entry per bind, after one per fill made before it opened (its loads: step 0, with
+    /// the fill's origin).
     pub trace: Vec<Ref>,
     pub steps: Vec<StepStats>,
     /// Time binds waited on fills in flight (a demand miss, or a prefetch not yet landed).
@@ -345,6 +347,8 @@ struct State {
     /// The room each cut configuration failed at.
     failed_at: HashMap<String, u64>,
     stats: HashMap<u64, Stats>,
+    /// Fills no open request made (loads): the next request's record opens with them.
+    unclaimed: Stats,
     last: Option<Stats>,
     /// Passes running, per (request, set): a joint step's sets each have their own.
     active: HashMap<(u64, u32), Active>,
@@ -395,6 +399,19 @@ impl State {
 
     fn stats(&mut self, req: Option<u64>) -> Option<&mut Stats> {
         self.stats.get_mut(&req?)
+    }
+
+    /// Where a fill is recorded: its request's record, else (a load's, or one with no request
+    /// open) the next request's, which opens with them.
+    fn fills(&mut self, req: Option<u64>, key: Key, bytes: u64, origin: Origin) -> &mut Stats {
+        match req.filter(|r| self.stats.contains_key(r)) {
+            Some(r) => self.stats.entry(r).or_default(),
+            None => {
+                let set = self.sets.get(key.0 as usize).and_then(Option::as_ref).map(|m| m.spec.name.clone()).unwrap_or_default();
+                self.unclaimed.trace.push(Ref { step: 0, set, block: key.1, bytes, origin, speculative: false });
+                &mut self.unclaimed
+            }
+        }
     }
 
     fn step_stats(&mut self, req: u64) -> Option<&mut StepStats> {
@@ -973,10 +990,9 @@ impl Inner {
             let gen = st.tick();
             st.homes.insert(key, Home { phys, ready: Event::DONE, gen, filled: true, filling: false, fresh: false, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false });
             st.sync(key);
-            if let Some(s) = st.stats(req) {
-                s.moved.kept.bytes += span;
-                s.moved.kept.ns += start.elapsed().as_nanos() as u64;
-            }
+            let s = st.fills(req, key, span, Origin::Kept);
+            s.moved.kept.bytes += span;
+            s.moved.kept.ns += start.elapsed().as_nanos() as u64;
             adopted += span;
             self.publish(&st);
             self.unlock(st);
@@ -1152,13 +1168,12 @@ impl Inner {
                     h.origin = origin;
                 }
                 st.sync(job.key);
-                if let Some(s) = st.stats(job.req) {
-                    let f = if origin == Origin::Tier { &mut s.moved.tier } else { &mut s.moved.store };
-                    f.bytes += span;
-                    f.ns += ns;
-                    if speculative {
-                        s.moved.speculative += span;
-                    }
+                let s = st.fills(job.req, job.key, span, origin);
+                let f = if origin == Origin::Tier { &mut s.moved.tier } else { &mut s.moved.store };
+                f.bytes += span;
+                f.ns += ns;
+                if speculative {
+                    s.moved.speculative += span;
                 }
                 if stored {
                     self.keep(&mut st, job.key);
@@ -1583,7 +1598,9 @@ impl Inner {
             self.shared.put(&key, None)?;
         }
         st.table.requests.push(Req { id: rid, name: id.to_string(), steps, rooms, ..Req::default() });
-        st.stats.insert(rid, Stats { request: id.to_string(), ..Stats::default() });
+        // A cold request's record carries the fills since the last one ended (its loads).
+        let earlier = std::mem::take(&mut st.unclaimed);
+        st.stats.insert(rid, Stats { request: id.to_string(), moved: earlier.moved, trace: earlier.trace, ..Stats::default() });
         self.publish(&st);
         self.unlock(st);
         Ok(rid)
