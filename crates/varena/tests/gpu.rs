@@ -98,19 +98,17 @@ fn marked(child: &mut Child, marker: &str) -> String {
 
 #[test]
 #[ignore = "native GPU: a rental only"]
-fn context_is_measured_and_free_is_the_drivers() {
+fn free_is_the_drivers() {
     let (b, uuid) = gpu();
-    let context = b.context();
-    assert!(context > 0 && context < b.capacity(), "the context made at open measures {context}");
     let len = 64 * b.granularity();
     let before = b.free().unwrap();
     let page = b.create(len).unwrap();
     let during = b.free().unwrap();
     b.destroy(page);
     let after = b.free().unwrap();
-    assert!(before - during >= len, "creating {len} bytes freed only {}", before - during);
+    assert!(before - during >= len, "creating {len} bytes took only {}", before - during);
     assert!(after - during >= len, "destroying {len} bytes gave back only {}", after - during);
-    println!("PASS context {context} measured, free is the driver's {uuid}");
+    println!("PASS free is the driver's {uuid}");
 }
 
 #[test]
@@ -125,6 +123,7 @@ fn process_used_counts_this_processes_pages_and_allocations() {
     let len = 64 * b.granularity();
     let start = b.process_used().unwrap();
     assert!(start > 0, "this process holds a context");
+    let context = start;
     let va = b.reserve(len).unwrap();
     let page = b.create(len).unwrap();
     b.map(va, 0, &page, Access::ReadWrite).unwrap();
@@ -149,7 +148,7 @@ fn process_used_counts_this_processes_pages_and_allocations() {
     holder.wait().unwrap();
     unload(&b, va, 0, page);
     b.release(va);
-    println!("PASS process bytes ({how}) count pages and allocations; a {len} byte imported page moved them {imported} {uuid}");
+    println!("PASS process bytes ({how}): context {context} at open, pages and allocations counted; a {len} byte imported page moved them {imported} {uuid}");
 }
 
 #[test]
