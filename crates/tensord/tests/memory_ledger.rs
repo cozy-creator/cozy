@@ -18,7 +18,7 @@ use tensord::{
     memory::{self, Gpu, MemoryLog, Peaks},
 };
 use varena::{
-    layout::Layout, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Measured, Memory, PartId, Plan, SetSpec, Step,
+    layout::Layout, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Measured, Memory, PartId, Plan, SetSpec, Step, Torch,
 };
 
 const MIB: u64 = 1 << 20;
@@ -46,15 +46,15 @@ fn spec(gpu: &GpuId) -> SetSpec {
     let spans: Vec<tensorfs::io::Span> = PARTS
         .iter()
         .enumerate()
-        .map(|(i, what)| tensorfs::io::Span {
-            what: what.to_string(),
+        .map(|(i, tensor)| tensorfs::io::Span {
+            what: format!("{tensor}#data"),
             len: MIB,
             source: tensorfs::io::ItemSource::Inline(Arc::from(vec![i as u8 + 1; MIB as usize])),
         })
         .collect();
     let regions: Vec<Vec<String>> = PARTS.iter().map(|p| vec![p.to_string()]).collect();
     let layout = Layout::build(&spans, &regions).unwrap();
-    let parts: Vec<PartId> = PARTS.iter().map(|p| PartId { name: p.to_string(), encoding: "raw".into(), dtype: "u8".into() }).collect();
+    let parts: Vec<PartId> = PARTS.iter().map(|p| PartId { name: format!("{p}#data"), encoding: "raw".into(), dtype: "u8".into() }).collect();
     let fingerprint = Fingerprint::new(&layout, &parts, Fill::Stored, PACKAGE, "0/1", &gpu.uuid);
     SetSpec {
         name: format!("{PACKAGE}/c"),
@@ -91,9 +91,12 @@ fn executor_stand_in() {
         let reply = match line.split_once(' ').unwrap_or((&line, "")) {
             ("load", _) => {
                 let request = memory.request(&format!("load-{}", std::process::id()), plan()).unwrap();
+                let pass = request.pass(set, "1", Torch::default()).unwrap();
                 let pins: Vec<_> = (0..PARTS.len() as u32).map(|block| memory.bind(set, block, 0).unwrap()).collect();
                 drop(pins);
-                let moved = request.end().moved;
+                pass.end(Measured::default(), Torch::default());
+                let stats = request.end();
+                let moved = stats.moved;
                 format!("{} {} {}", moved.kept.bytes, moved.tier.bytes, moved.store.bytes)
             }
             ("run", id) => {
@@ -104,7 +107,7 @@ fn executor_stand_in() {
             }
             ("end", _) => {
                 let (request, pass) = running.take().unwrap();
-                pass.end(Measured { allocated_peak: ROOM, ..Default::default() });
+                pass.end(Measured { allocated_peak: ROOM, ..Default::default() }, Torch::default());
                 request.end();
                 "ended".into()
             }
@@ -190,7 +193,7 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
         let _ = woke.send(());
     })
     .unwrap();
-    let set_bytes = PARTS.len() as u64 * MIB;
+    let set_bytes = spec(&id).layout.nbytes;
 
     // Granted at spawn, it loads from the RAM tier or the store: nothing is kept yet.
     let mut first = StandIn::spawn(&gpu, &id);
