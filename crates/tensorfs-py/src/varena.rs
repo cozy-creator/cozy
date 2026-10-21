@@ -18,7 +18,7 @@ use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostB
 
 use crate::store::PyCheckpoint;
 
-create_exception!(tensorfs.varena, VarenaError, PyException, "A varena error: `.code` names its class; `.sticky` means the device context is gone.");
+create_exception!(tensorfs.varena, VarenaError, PyException, "A varena error: `.code` names its class; `.cuda_code` is the driver's CUresult for a device error; `.sticky` means the device context is gone.");
 create_exception!(tensorfs.varena, Exhausted, VarenaError, "The one memory error: `.gpu`, `.need`, `.site`, `.stats`.");
 
 fn error(py: Python<'_>, gpu: &str, e: Error) -> PyErr {
@@ -29,6 +29,11 @@ fn error(py: Python<'_>, gpu: &str, e: Error) -> PyErr {
     let v = err.value(py);
     let _ = v.setattr("code", e.code());
     let _ = v.setattr("sticky", e.is_sticky());
+    let cuda = match &e {
+        Error::Device { code, .. } => Some(*code),
+        _ => None,
+    };
+    let _ = v.setattr("cuda_code", cuda);
     if let Error::Exhausted(x) = e {
         let _ = (v.setattr("gpu", gpu), v.setattr("need", x.need), v.setattr("site", x.site));
         let _ = Py::new(py, PyStats::from(x.stats)).and_then(|s| v.setattr("stats", s));
@@ -245,16 +250,16 @@ pub enum PyNext {
     Exhausted { error: Py<PyAny> },
 }
 
-/// TensorD's descriptors for this process's memory; `Memory.open` takes them.
+/// TensorD's table descriptor for this process's memory; `Memory.open` takes it.
 #[pyclass(name = "Grant", module = "tensorfs.varena", frozen)]
 pub struct PyGrant(Mutex<Option<Grant>>);
 
 #[pymethods]
 impl PyGrant {
-    /// Takes ownership of the table's and the events' descriptors (handles on Windows).
+    /// Takes ownership of the table's descriptor (a handle on Windows).
     #[new]
-    fn new(table: i64, events: i64) -> Self {
-        PyGrant(Mutex::new(Some(Grant { table: owned(table), events: owned(events) })))
+    fn new(table: i64) -> Self {
+        PyGrant(Mutex::new(Some(Grant { table: owned(table) })))
     }
 
     /// A standalone engine's grant: `gpu`'s table by name; `limit` lowers its capacity (the first

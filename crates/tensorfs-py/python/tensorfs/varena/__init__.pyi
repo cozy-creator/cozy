@@ -13,10 +13,11 @@ from typing import Final, Literal
 from .._ext import Checkpoint
 
 class VarenaError(Exception):
-    """`code`: EXHAUSTED, INVALID, DEVICE, IO, CLOSED or INTERNAL; `sticky`: the device context
-    is gone and the process must end."""
+    """`code`: EXHAUSTED, INVALID, DEVICE, IO, CLOSED or INTERNAL; `cuda_code`: a device error's
+    CUresult (2: out of memory); `sticky`: the device context is gone and the process must end."""
 
     code: str
+    cuda_code: int | None
     sticky: bool
 
 class Exhausted(VarenaError):
@@ -39,9 +40,10 @@ class GpuId:
     def memory(self) -> int: ...
 
 class Grant:
-    """TensorD's descriptors (handles on Windows) for this process's memory; ownership passes."""
+    """TensorD's table descriptor (a handle on Windows) for this process's memory; ownership
+    passes."""
 
-    def __init__(self, table: int, events: int) -> None: ...
+    def __init__(self, table: int) -> None: ...
     @staticmethod
     def open(gpu: GpuId, limit: int | None = None) -> Grant:
         """A standalone engine's grant: `gpu`'s table by name; `limit` lowers its capacity (the
