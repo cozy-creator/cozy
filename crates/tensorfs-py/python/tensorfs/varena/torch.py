@@ -8,9 +8,11 @@
 
 A block's params are views of its pin only while the block runs; placeholders (shape, dtype and
 device, no bytes) stand in otherwise, so no tensor outlives its page. A model's top-level forward
-is one pass: varena makes its measured room, torch's allocator is capped to `torch_limit`, and
-the pass reports torch's allocated peak, the allocator's slack, the context's growth and each cut
-site's peak. cozy-runtime's catch calls `r.oom` and `r.cut` and measures sites with `r.site`.
+is one pass: its fill identity is set, varena makes its measured room, torch's allocator is
+capped to `torch_limit`, and the pass reports torch's allocated peak, the allocator's slack and
+each cut site's peak, with torch's bytes at its start and end and at every `oom`. varena calls
+torch's `empty_cache` when its decision trims. cozy-runtime's catch calls `r.oom` and `r.cut` and
+measures sites with `r.site`.
 """
 
 from __future__ import annotations
@@ -165,11 +167,6 @@ class _Pass:
     """An open pass and what it measured so far; `open` holds each running site's peak."""
 
     native: Pass
-    request: Request
-    allocated: int
-    reserved: int
-    used: int
-    paged: int
     peak: int = 0
     reserved_peak: int = 0
     sites: dict[str, int] = field(default_factory=dict)
@@ -218,24 +215,24 @@ class Memory:
         self.cuda = device.type == "cuda"
         self.models: dict[nn.Module, Model] = {}
         self.requests: dict[Request, None] = {}
-        #: the allocator's slack, given back by `empty_cache` when varena's decision asks
-        self.torch = native.cache("torch", self._trim) if self.cuda else None
         self.total = torch.cuda.mem_get_info(device)[1] if self.cuda else 0
+        if self.cuda:
+            native.trim_with(self._trim)
 
     @classmethod
-    def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None) -> Memory:
-        """A TensorD executor's memory (`grant`), or a standalone engine's (the device's table by
-        name). On CUDA the backend opens first and measures this process's context, so open it
-        before torch initializes CUDA, or torch's context counts as foreign bytes. CPU and MPS use
-        host pages on the machine's table `host` (its RAM); a `GpuId` names a host table and its
-        capacity explicitly."""
+    def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None) -> Memory:
+        """A TensorD executor's memory (`grant`), or a standalone engine's: the device's table by
+        name, its capacity lowered to `limit` (the first opener sets it, a later one can only
+        lower it). On CUDA the backend opens first and measures this process's context, so open
+        it before torch initializes CUDA, or torch's context counts as foreign bytes. CPU and MPS
+        use host pages on the machine's table `host` (its RAM); a `GpuId` names a host table."""
         if isinstance(gpu, GpuId):
-            return cls(Native.host(gpu, grant), torch.device("cpu"))
+            return cls(Native.host(gpu, grant, limit), torch.device("cpu"))
         device = torch.device("cuda", gpu) if isinstance(gpu, int) else torch.device(gpu)
         if device.type == "cuda":
-            return cls(Native.cuda(device.index or 0, grant), torch.device("cuda", device.index or 0))
+            return cls(Native.cuda(device.index or 0, grant, limit), torch.device("cuda", device.index or 0))
         ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        return cls(Native.host(GpuId("host", device.type, ram), grant), device)
+        return cls(Native.host(GpuId("host", device.type, ram), grant, limit), device)
 
     @property
     def gpu(self) -> GpuId:
@@ -245,8 +242,14 @@ class Memory:
 
     def load(self, module: nn.Module, level: Level | str = Level.GPU) -> Model:
         """`module` (built on meta) from its `_varena` weights at `level`: one region per block
-        and one for common, its fill's identity in the fingerprint, and hooks that bind blocks
-        while they run."""
+        and one for common, and hooks that bind blocks while they run. A loaded module moves to
+        `level` in place."""
+        if isinstance(level, str):
+            level = Level.GPU if level == "gpu" else Level.RAM
+        if module in self.models:
+            model = self.models[module]
+            self.native.load(model.set, level)
+            return model
         declared = vars(module).get("_varena")
         if not isinstance(declared, Declared):
             raise Unbound(f"{type(module).__name__}: no weights declared (`_varena = Declared(...)`)")
@@ -256,12 +259,8 @@ class Memory:
             if w.keys is None or key in w.keys:
                 owned.setdefault(_block_of(key, paths), []).append(f"{w.component}/{key}")
         order = [p for p in ("", *paths) if p in owned]
-        fill = declared.fill
-        kind = Fill.Stored() if fill is None else Fill.Undeclared() if fill.identity is None else Fill.Declared(fill.identity)
         name = f"{w.release or w.ck.id}/{w.component}"
-        set = Set(name, w.ck, [owned[p] for p in order], fill=kind, release=w.release, shard=w.shard, gpu=self.gpu.uuid)
-        if isinstance(level, str):
-            level = Level.GPU if level == "gpu" else Level.RAM
+        set = Set(name, w.ck, [owned[p] for p in order], fill=_fill(declared.fill), release=w.release, shard=w.shard, gpu=self.gpu.uuid)
         model = Model(self, module, declared, name, set, self.native.load(set, level))
         for region, path in enumerate(order):
             block = _Block(model, path, region)
@@ -293,7 +292,6 @@ class Memory:
             _request.reset(token)
             self.requests.pop(r, None)
             r.ended = r.native.end()
-            self._slack()
 
     def cache(self, owner: str, shrink: Callable[[int], int]) -> Cache:
         """Bytes the caller holds that `shrink(want) -> freed` gives back on varena's ask; a
@@ -341,16 +339,10 @@ class Memory:
             fraction = min(self.native.torch_limit() / self.total, 1.0)
             torch.cuda.set_per_process_memory_fraction(fraction, self.device)
 
-    def _trim(self, want: int) -> int:
+    def _trim(self) -> int:
         before = torch.cuda.memory_reserved(self.device)
         torch.cuda.empty_cache()
-        self._slack()
         return max(before - torch.cuda.memory_reserved(self.device), 0)
-
-    def _slack(self) -> None:
-        if self.torch is not None:
-            held = torch.cuda.memory_reserved(self.device) - torch.cuda.memory_allocated(self.device)
-            self.native.cached(self.torch, max(held, 0))
 
     # -- passes
 
@@ -363,10 +355,9 @@ class Memory:
             try:
                 r = self._current()
                 shape = "x".join(str(d) for t in tree_leaves((args, kwargs)) if isinstance(t, Tensor) for d in t.shape)
-                allocated, reserved = _torch(self)
-                native = r.native.pass_(model.id, shape, allocated, reserved)
+                self.native.fill(model.id, _fill(model.fill))
+                p = _Pass(r.native.pass_(model.id, shape, *_torch(self)))
                 self._cap()
-                p = _Pass(native, r, allocated, reserved, _used(self), _paged(r))
                 p.entered = sys.exc_info()[1]
                 if self.cuda:
                     torch.cuda.reset_peak_memory_stats(self.device)
@@ -389,15 +380,9 @@ class Memory:
                 self._exit(model.common)
             if sys.exc_info()[1] is not p.entered:
                 return  # torch runs this hook in its handler of the forward's raise: unended, it records nothing
-            peak = slack = context = 0
             if self.cuda:
                 _fold(p, self.device)
-                allocated, reserved = _torch(self)
-                peak, slack = p.peak, max(p.reserved_peak - p.peak, 0)
-                grew = (_used(self) - p.used) - (reserved - p.reserved) - (_paged(p.request) - p.paged)
-                context = max(grew, 0)
-            p.native.end(peak, slack, context, list(p.sites.items()))
-            self._slack()
+            p.native.end(p.peak, max(p.reserved_peak - p.peak, 0), list(p.sites.items()), *_torch(self))
 
     # -- blocks
 
@@ -454,7 +439,7 @@ class Request:
     def oom(self, need: int | None = None, site: str | None = None, collective: bool = False) -> Next:
         """An op ran out of memory: varena's answer, with torch's cap applied after it. A
         `collective` site's finer level waits for the next pass's agreement."""
-        answer = self.native.oom(need, site, collective)
+        answer = self.native.oom(*_torch(self.memory), need, site, collective)
         self.memory._cap()
         return answer
 
@@ -511,21 +496,11 @@ def _torch(memory: Memory) -> tuple[int, int]:
     return torch.cuda.memory_allocated(memory.device), torch.cuda.memory_reserved(memory.device)
 
 
-def _used(memory: Memory) -> int:
-    """The device's used bytes, as the driver counts them."""
-    if not memory.cuda:
-        return 0
-    free, total = torch.cuda.mem_get_info(memory.device)
-    return total - free
-
-
-def _paged(r: Request) -> int:
-    """Pages this request's fills created less those its evictions removed (kept pages import
-    existing memory)."""
-    if not r.memory.cuda:
-        return 0
-    s = r.native.stats()
-    return s.moved.tier.bytes + s.moved.store.bytes - sum(s.evicted)
+def _fill(fill: Filling | None) -> Fill:
+    """A fill as varena names it: none, declared by its identity, or undeclared."""
+    if fill is None:
+        return Fill.Stored()
+    return Fill.Undeclared() if fill.identity is None else Fill.Declared(fill.identity)
 
 
 def _fold(p: _Pass, device: torch.device) -> None:

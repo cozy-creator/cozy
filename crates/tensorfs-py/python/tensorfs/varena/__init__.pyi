@@ -42,6 +42,10 @@ class Grant:
     """TensorD's descriptors (handles on Windows) for this process's memory; ownership passes."""
 
     def __init__(self, table: int, events: int) -> None: ...
+    @staticmethod
+    def open(gpu: GpuId, limit: int | None = None) -> Grant:
+        """A standalone engine's grant: `gpu`'s table by name; `limit` lowers its capacity (the
+        first opener sets it, a later one can only lower it)."""
 
 class Fill:
     """What turns a page's stored bytes into its weights."""
@@ -117,12 +121,12 @@ class Set:
 
 class Memory:
     @staticmethod
-    def cuda(ordinal: int, grant: Grant | None = None) -> Memory:
-        """CUDA device `ordinal`'s table through TensorD's `grant`, or by name (standalone). Open
-        it before torch initializes CUDA: the backend measures this process's context then."""
+    def cuda(ordinal: int, grant: Grant | None = None, limit: int | None = None) -> Memory:
+        """CUDA device `ordinal`'s table through TensorD's `grant`, or by name (standalone, its
+        capacity lowered to `limit`). Open it before torch initializes CUDA."""
 
     @staticmethod
-    def host(gpu: GpuId, grant: Grant | None = None) -> Memory:
+    def host(gpu: GpuId, grant: Grant | None = None, limit: int | None = None) -> Memory:
         """Host pages of `gpu.memory` bytes (CPU, MPS) on the table `gpu.uuid` names."""
 
     @property
@@ -131,6 +135,13 @@ class Memory:
         """Registers `set` and brings it to `level`; its id."""
 
     def unload(self, set: int) -> None: ...
+    def trim_with(self, trim: Callable[[], int]) -> None:
+        """The allocator's trim (torch's `empty_cache`), returning the bytes it freed (called from
+        varena's thread): a demand trims before it evicts anything."""
+
+    def fill(self, set: int, fill: Fill) -> None:
+        """`set`'s current fill (a no-op when unchanged): pages filled under another come back
+        fresh."""
     def cache(self, owner: str, shrink: Callable[[int], int]) -> int:
         """Bytes the caller holds that `shrink(want) -> freed` gives back (from varena's thread);
         a cache owned by a request id ends with it."""
@@ -158,9 +169,17 @@ class Request:
     def plan(self, plan: list[tuple[list[str], int]]) -> None:
         """Replaces the plan; its cursor starts over."""
 
-    def oom(self, need: int | None = None, site: str | None = None, collective: bool = False) -> Next:
+    def oom(
+        self,
+        allocated: int,
+        reserved: int,
+        need: int | None = None,
+        site: str | None = None,
+        collective: bool = False,
+    ) -> Next:
         """An op ran out of memory (`need` more bytes when known) at cut site `site` (None: it
-        cannot be cut); a `collective` site's finer level waits for the next pass's agreement."""
+        cannot be cut), with torch's bytes now; a `collective` site's finer level waits for the
+        next pass's agreement."""
 
     def parked(self, nbytes: int) -> None:
         """The bytes a `Park` answer moved to the host (0: none, and the next `oom` is Exhausted)."""
@@ -173,8 +192,9 @@ class Request:
         """Ends it: its pins, rooms and caches go."""
 
 class Pass:
-    def end(self, allocated_peak: int, slack: int, context: int, sites: list[tuple[str, int]]) -> None:
-        """Records what the pass measured; dropping it unended records nothing."""
+    def end(self, allocated_peak: int, slack: int, sites: list[tuple[str, int]], allocated: int, reserved: int) -> None:
+        """Records what the pass measured (torch's absolute allocated peak, the allocator's slack
+        at it, each cut site's peak) and torch's bytes now; dropping it unended records nothing."""
 
 class Pin:
     @property
@@ -296,3 +316,5 @@ class Stats:
     def peak(self) -> int: ...
     @property
     def leftover(self) -> int: ...
+    def json(self) -> str:
+        """The record as JSON, field for field (what a Runtime relays)."""

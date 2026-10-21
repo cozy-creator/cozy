@@ -5,17 +5,19 @@ A tiny `UNet2DConditionModel` is written into a TensorFS store; the same model b
 loaded through `tensorfs.varena.torch.Memory` (blocks from `_no_split_modules`) and run under
 `mem.request`, then compared with the plain model:
   - with room for it all;
-  - with a capacity below its size, so it streams, and so with a declared fill on fresh pages;
-  - in two processes on one table, the idle one making room for the other.
+  - in two processes on one table, the idle one making room for the other;
+  - with a capacity below its size, so it streams, and so with a declared fill on fresh pages.
 First, the compiled `tensorfs._ext.varena` matches its stub name for name.
 
     python scripts/varena-standalone.py
-Runs on the CPU over host pages (each run names its own tables); on CUDA when a GPU is visible.
+Runs on the CPU over host pages (each run names its own tables), or on GPU 0 when one is visible,
+its capacity lowered by the standalone limit.
 """
 
 from __future__ import annotations
 
 import ast
+import gc
 import json
 import os
 import subprocess
@@ -136,10 +138,18 @@ def stub_matches() -> None:
     check("the compiled module matches its stub", got == want, {k: (got.get(k), want.get(k)) for k in got.keys() | want.keys() if got.get(k) != want.get(k)})
 
 
+def opened(table: str, capacity: int) -> Memory:
+    """A standalone memory of `capacity` bytes: host pages on table `table`, or GPU 0's table
+    lowered to it."""
+    if torch.cuda.is_available():
+        return Memory.open(0, limit=capacity)
+    return Memory.open(GpuId(table, "cpu", capacity))
+
+
 def child(store: str, table: str, capacity: int) -> int:
     """The second process: its request needs the room the idle first one holds."""
     plain, ck = build(Path(store))
-    mem = Memory.open(GpuId(table, "cpu", capacity))
+    mem = opened(table, capacity)
     stats = run(mem, loaded(ck, mem), plain, "child", 1)
     print(json.dumps({"child origins": [r.origin for r in stats.trace], "evicted": stats.evicted}), flush=True)
     return 0 if all(results) else 1
@@ -152,29 +162,20 @@ def main() -> int:
     tag = f"varena-standalone-{os.getpid()}"
     cuda = torch.cuda.is_available()
 
-    mem = Memory.open(0) if cuda else Memory.open(GpuId(f"{tag}-ample", "cpu", 1 << 30))
+    mem = Memory.open(0) if cuda else opened(f"{tag}-ample", 1 << 30)
     unet = loaded(ck, mem)
-    run(mem, unet, plain, "ample", 2)
+    stats = run(mem, unet, plain, "ample", 2)
     spans = mem.models[unet].set.spans
+    room = stats.peak - sum(spans)  # the passes' measured room beside the weights
     common, blocks = spans[0], sorted(spans[1:])
-    if cuda:  # a standalone CUDA table has the card's capacity: the rest needs host pages
-        print(f"{sum(results)}/{len(results)} checks passed")
-        return 0 if all(results) else 1
+    del mem, unet
+    gc.collect()
+    # A GPU's capacity counts the whole card: this process's context and anything foreign.
+    base = (lambda free, total: total - free)(*torch.cuda.mem_get_info(0)) if cuda else 0
 
-    capacity = common + sum(blocks) // 2
-    mem = Memory.open(GpuId(f"{tag}-short", "cpu", capacity))
-    stats = run(mem, loaded(ck, mem), plain, "short", 2)
-    check("short: it streams", sum(stats.evicted) > 0, stats.evicted)
-
-    mem = Memory.open(GpuId(f"{tag}-fill", "cpu", capacity))
-    doubled = UNet2DConditionModel(**CONFIG).eval()
-    doubled.load_state_dict({k: v * 2 if k.endswith("to_q.weight") else v for k, v in plain.state_dict().items()})
-    stats = run(mem, loaded(ck, mem, Double()), doubled, "fill", 2)
-    check("fill: each fresh page is filled once", sum(r.origin != "hit" for r in stats.trace) > 0, stats.trace)
-
-    capacity = sum(spans) * 3 // 2
-    table = f"{tag}-two"
-    mem = Memory.open(GpuId(table, "cpu", capacity))
+    # Capacities only fall on one GPU's table: the largest first.
+    table, capacity = f"{tag}-two", base * (2 if cuda else 1) + sum(spans) * 3 // 2 + room  # a GPU child's context is about ours
+    mem = opened(table, capacity)
     unet = loaded(ck, mem)
     run(mem, unet, plain, "first", 1)
     stats = run(mem, unet, plain, "first warm", 1)
@@ -184,6 +185,19 @@ def main() -> int:
     check("two processes: the second completes beside the idle first", done.returncode == 0, done.returncode)
     stats = run(mem, unet, plain, "first again", 1)
     check("two processes: the first gave room and reads again", any(r.origin != "hit" for r in stats.trace), [r.origin for r in stats.trace])
+    del mem, unet
+    gc.collect()
+
+    capacity = base + common + sum(blocks) // 2 + room
+    mem = opened(f"{tag}-short", capacity)
+    stats = run(mem, loaded(ck, mem), plain, "short", 2)
+    check("short: it streams", sum(stats.evicted) > 0, stats.evicted)
+
+    mem = opened(f"{tag}-fill", capacity)
+    doubled = UNet2DConditionModel(**CONFIG).eval()
+    doubled.load_state_dict({k: v * 2 if k.endswith("to_q.weight") else v for k, v in plain.state_dict().items()})
+    stats = run(mem, loaded(ck, mem, Double()), doubled, "fill", 2)
+    check("fill: each fresh page is filled once", sum(r.origin != "hit" for r in stats.trace) > 0, stats.trace)
 
     print(f"{sum(results)}/{len(results)} checks passed")
     return 0 if all(results) else 1

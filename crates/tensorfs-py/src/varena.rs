@@ -48,6 +48,14 @@ fn detached<T: Send>(py: Python<'_>, gpu: &str, f: impl Send + FnOnce() -> varen
     py.detach(|| caught(f)).map_err(|e| error(py, gpu, e))
 }
 
+/// A Python callback's byte count, from varena's thread; its error is reported, never raised.
+fn call<'py>(py: Python<'py>, f: &Py<PyAny>, args: impl pyo3::call::PyCallArgs<'py>) -> u64 {
+    f.call1(py, args).and_then(|r| r.extract::<u64>(py)).unwrap_or_else(|e| {
+        e.write_unraisable(py, None);
+        0
+    })
+}
+
 /// `detached` for a call with nothing to return.
 fn done(py: Python<'_>, gpu: &str, f: impl Send + FnOnce()) -> PyResult<()> {
     detached(py, gpu, || {
@@ -128,23 +136,39 @@ pub struct PyStepStats {
     evicted: Vec<u64>,
 }
 
-#[pyclass(name = "Stats", module = "tensorfs.varena", frozen, get_all, skip_from_py_object)]
+#[pyclass(name = "Stats", module = "tensorfs.varena", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyStats {
+    raw: varena::Stats,
+    #[pyo3(get)]
     request: String,
+    #[pyo3(get)]
     moved: PyMoved,
+    #[pyo3(get)]
     trace: Vec<PyRef_>,
+    #[pyo3(get)]
     steps: Vec<PyStepStats>,
+    #[pyo3(get)]
     stall_ns: u64,
+    #[pyo3(get)]
     evicted: Vec<u64>,
+    #[pyo3(get)]
     evicted_lowered: u64,
+    #[pyo3(get)]
     speculative_evicted_d: u64,
+    #[pyo3(get)]
     retries: u32,
+    #[pyo3(get)]
     cuts: u32,
+    #[pyo3(get)]
     parks: u32,
+    #[pyo3(get)]
     parked: u64,
+    #[pyo3(get)]
     lowered: bool,
+    #[pyo3(get)]
     peak: u64,
+    #[pyo3(get)]
     leftover: u64,
 }
 
@@ -156,6 +180,7 @@ impl From<varena::Fills> for PyFills {
 
 impl From<varena::Stats> for PyStats {
     fn from(s: varena::Stats) -> Self {
+        let raw = s.clone();
         let m = s.moved;
         let origin = |o: Origin| match o {
             Origin::Hit => "hit",
@@ -164,6 +189,7 @@ impl From<varena::Stats> for PyStats {
             Origin::Store => "store",
         };
         PyStats {
+            raw,
             request: s.request,
             moved: PyMoved { kept: m.kept.into(), tier: m.tier.into(), store: m.store.into(), speculative: m.speculative },
             trace: s.trace.into_iter().map(|r| PyRef_ { step: r.step, set: r.set, block: r.block, bytes: r.bytes, origin: origin(r.origin), speculative: r.speculative }).collect(),
@@ -180,6 +206,14 @@ impl From<varena::Stats> for PyStats {
             peak: s.peak,
             leftover: s.leftover,
         }
+    }
+}
+
+#[pymethods]
+impl PyStats {
+    /// The record as JSON, field for field (what a Runtime relays).
+    fn json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.raw).map_err(|e| VarenaError::new_err(e.to_string()))
     }
 }
 
@@ -221,6 +255,25 @@ impl PyGrant {
     #[new]
     fn new(table: i64, events: i64) -> Self {
         PyGrant(Mutex::new(Some(Grant { table: owned(table), events: owned(events) })))
+    }
+
+    /// A standalone engine's grant: `gpu`'s table by name; `limit` lowers its capacity (the first
+    /// opener sets it, a later one can only lower it).
+    #[staticmethod]
+    #[pyo3(signature = (gpu, limit = None))]
+    fn open(py: Python<'_>, gpu: PyGpuId, limit: Option<u64>) -> PyResult<Self> {
+        let id = GpuId { uuid: gpu.uuid, model: gpu.model, memory: gpu.memory };
+        let grant = detached(py, &id.uuid, || Grant::open(&id, limit))?;
+        Ok(PyGrant(Mutex::new(Some(grant))))
+    }
+}
+
+/// The fill a `Fill` names.
+fn fill_of(fill: &PyFill) -> Fill {
+    match fill {
+        PyFill::Stored() => Fill::Stored,
+        PyFill::Declared { identity } => Fill::Declared(identity.clone()),
+        PyFill::Undeclared() => Fill::Undeclared,
     }
 }
 
@@ -274,12 +327,7 @@ impl PySet {
             let (component, key, dtype, shape) = (stored.component, stored.key, stored.dtype, stored.shape);
             parts.push(PyPart { component, key, role, dtype, shape, region: p.region, offset: p.offset - region.offset, nbytes: p.nbytes });
         }
-        let fill = match &*fill {
-            PyFill::Stored() => Fill::Stored,
-            PyFill::Declared { identity } => Fill::Declared(identity.clone()),
-            PyFill::Undeclared() => Fill::Undeclared,
-        };
-        let fingerprint = Fingerprint::new(&layout, &ids, fill, release, shard, gpu);
+        let fingerprint = Fingerprint::new(&layout, &ids, fill_of(&fill), release, shard, gpu);
         let source = source(&ck).map_err(invalid)?;
         Ok(PySet { spec: SetSpec { name, layout: Arc::new(layout), source, fingerprint }, parts })
     }
@@ -346,14 +394,19 @@ impl PyMemory {
         self.memory.as_ref().unwrap_or_else(|| unreachable!())
     }
 
-    fn open(py: Python<'_>, grant: Option<PyRef<'_, PyGrant>>, dl: (i32, i32), backend: impl Send + FnOnce() -> varena::Result<(GpuId, Box<dyn Backend>)>) -> PyResult<Self> {
+    /// `grant`, else `gpu`'s table by name with `limit`; the backend opens first.
+    fn open(py: Python<'_>, grant: Option<PyRef<'_, PyGrant>>, limit: Option<u64>, dl: (i32, i32), backend: impl Send + FnOnce() -> varena::Result<(GpuId, Box<dyn Backend>)>) -> PyResult<Self> {
         let grant = match grant {
             Some(g) => Some(lock(&g.0).take().ok_or_else(|| error(py, "", Error::Closed("grant already used".into())))?),
             None => None,
         };
         let (gpu, memory) = detached(py, "", || {
             let (gpu, backend) = backend()?;
-            Ok((gpu.clone(), Memory::open(gpu, grant, backend)?))
+            let grant = match grant {
+                Some(g) => g,
+                None => Grant::open(&gpu, limit)?,
+            };
+            Ok((gpu.clone(), Memory::open(gpu, Some(grant), backend)?))
         })?;
         let gpu = PyGpuId { uuid: gpu.uuid, model: gpu.model, memory: gpu.memory };
         Ok(PyMemory { memory: Some(Arc::new(memory)), gpu, dl })
@@ -363,12 +416,11 @@ impl PyMemory {
 #[pymethods]
 impl PyMemory {
     /// CUDA device `ordinal`'s table through TensorD's `grant`, or by name without one
-    /// (standalone). Open it before torch initializes CUDA: the backend measures this process's
-    /// context as the device's used bytes across its open.
+    /// (standalone, its capacity lowered to `limit`). Open it before torch initializes CUDA.
     #[staticmethod]
-    #[pyo3(signature = (ordinal, grant = None))]
-    fn cuda(py: Python<'_>, ordinal: i32, grant: Option<PyRef<'_, PyGrant>>) -> PyResult<Self> {
-        PyMemory::open(py, grant, (KDL_CUDA, ordinal), || {
+    #[pyo3(signature = (ordinal, grant = None, limit = None))]
+    fn cuda(py: Python<'_>, ordinal: i32, grant: Option<PyRef<'_, PyGrant>>, limit: Option<u64>) -> PyResult<Self> {
+        PyMemory::open(py, grant, limit, (KDL_CUDA, ordinal), || {
             let backend = CudaBackend::open(ordinal)?;
             Ok((backend.gpu()?, Box::new(backend) as Box<dyn Backend>))
         })
@@ -376,10 +428,10 @@ impl PyMemory {
 
     /// Host pages of `gpu.memory` bytes (CPU, MPS), on the table `gpu.uuid` names.
     #[staticmethod]
-    #[pyo3(signature = (gpu, grant = None))]
-    fn host(py: Python<'_>, gpu: PyGpuId, grant: Option<PyRef<'_, PyGrant>>) -> PyResult<Self> {
+    #[pyo3(signature = (gpu, grant = None, limit = None))]
+    fn host(py: Python<'_>, gpu: PyGpuId, grant: Option<PyRef<'_, PyGrant>>, limit: Option<u64>) -> PyResult<Self> {
         let id = GpuId { uuid: gpu.uuid, model: gpu.model, memory: gpu.memory };
-        PyMemory::open(py, grant, (KDL_CPU, 0), || Ok((id.clone(), Box::new(HostBackend::new(id.memory)) as Box<dyn Backend>)))
+        PyMemory::open(py, grant, limit, (KDL_CPU, 0), || Ok((id.clone(), Box::new(HostBackend::new(id.memory)) as Box<dyn Backend>)))
     }
 
     /// Registers `set` and brings it to `level`; returns its id.
@@ -392,17 +444,22 @@ impl PyMemory {
         done(py, &self.gpu.uuid, || self.memory().unload(SetId(set)))
     }
 
+    /// The allocator's trim (torch's `empty_cache`), returning the bytes it freed: a demand
+    /// trims before it evicts anything.
+    fn trim_with(&self, py: Python<'_>, trim: Py<PyAny>) -> PyResult<()> {
+        let trim = Box::new(move || Python::try_attach(|py| call(py, &trim, ())).unwrap_or(0));
+        done(py, &self.gpu.uuid, || self.memory().trim_with(trim))
+    }
+
+    /// `set`'s current fill (a no-op when unchanged): pages filled under another come back fresh.
+    fn fill(&self, py: Python<'_>, set: u32, fill: PyRef<'_, PyFill>) -> PyResult<()> {
+        let fill = fill_of(&fill);
+        done(py, &self.gpu.uuid, || self.memory().fill(SetId(set), fill))
+    }
+
     /// Bytes the caller holds that `shrink(want) -> freed` gives back; returns its id.
     fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>) -> PyResult<u32> {
-        let shrink = Box::new(move |want: u64| {
-            let freed = Python::try_attach(|py| {
-                shrink.call1(py, (want,)).and_then(|r| r.extract::<u64>(py)).unwrap_or_else(|e| {
-                    e.write_unraisable(py, None);
-                    0
-                })
-            });
-            freed.unwrap_or(0)
-        });
+        let shrink = Box::new(move |want: u64| Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0));
         detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, shrink))).map(|c| c.0)
     }
 
@@ -483,11 +540,11 @@ impl PyRequest {
 
     /// An op ran out of memory, `need` more bytes when known, at cut site `site` (None: the op
     /// cannot be cut); a `collective` site's finer level waits for the next pass's agreement.
-    #[pyo3(signature = (need = None, site = None, collective = false))]
-    fn oom(&self, py: Python<'_>, need: Option<u64>, site: Option<&str>, collective: bool) -> PyResult<PyNext> {
+    #[pyo3(signature = (allocated, reserved, need = None, site = None, collective = false))]
+    fn oom(&self, py: Python<'_>, allocated: u64, reserved: u64, need: Option<u64>, site: Option<&str>, collective: bool) -> PyResult<PyNext> {
         let r = self.get(py)?;
         let site = site.map(|name| Site { name, collective });
-        Ok(match detached(py, &self.gpu, || Ok(r.oom(need, site)))? {
+        Ok(match detached(py, &self.gpu, || Ok(r.oom(need, site, Torch { allocated, reserved })))? {
             Next::Retry => PyNext::Retry(),
             Next::Cut(level) => PyNext::Cut { level },
             Next::Park(budget) => PyNext::Park { budget },
@@ -537,11 +594,11 @@ impl Drop for PyPass {
 
 #[pymethods]
 impl PyPass {
-    /// torch's allocated peak (absolute), the allocator's slack at it, the context's growth,
-    /// and each cut site's own allocated peak.
-    fn end(&self, py: Python<'_>, allocated_peak: u64, slack: u64, context: u64, sites: Vec<(String, u64)>) -> PyResult<()> {
+    /// torch's allocated peak (absolute), the allocator's slack at it and each cut site's own
+    /// allocated peak; then torch's bytes now.
+    fn end(&self, py: Python<'_>, allocated_peak: u64, slack: u64, sites: Vec<(String, u64)>, allocated: u64, reserved: u64) -> PyResult<()> {
         let Some(pass) = lock(&self.0).take() else { return Ok(()) };
-        done(py, "", || pass.end(Measured { allocated_peak, slack, context, sites }))
+        done(py, "", || pass.end(Measured { allocated_peak, slack, sites }, Torch { allocated, reserved }))
     }
 }
 

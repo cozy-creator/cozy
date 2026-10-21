@@ -1,6 +1,7 @@
 //! tensorfs-py: the `tensorfs` wheel's compiled half. It marshals; every byte-level fact comes
 //! from `tensorfs` and `varena`. Torch stays outside: tensors cross as DLPack.
 
+mod ceiling;
 mod cleanup;
 mod errors;
 #[cfg(feature = "store")]
@@ -38,6 +39,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
     errors::install(m)?;
     cleanup::install(m)?;
+    ceiling::install(m)?;
     m.add("__version__", python_distribution_version())?;
     // The store format every process on the machine shares.
     m.add("STORE_FORMAT", tensorfs::STORE_FORMAT)?;
