@@ -1368,7 +1368,7 @@ impl Publisher {
         let mut picked: Vec<_> = slots.iter().map(|slot| pick(slot, false)).collect::<Result<_, _>>()?;
         land(&picked)?;
         // Memory short (design §2.2): a `min_bits=4` compute slot takes 4 bits when the weights it
-        // constructs exceed the budget, its last measured activations on these GPUs taken out.
+        // constructs exceed the budget (the GPU less a quarter for activations).
         let shrinks = |slot: &Value| {
             let tolerances = precision::Slot::of(slot);
             request.bits == 0 && tolerances.min_bits == 4 && !tolerances.decode && !tolerances.raw
@@ -1377,16 +1377,7 @@ impl Publisher {
             let constructed = slots.iter().zip(&picked).filter(|(slot, _)| crate::gpu_service::constructed(slot));
             let checkpoints = distinct(constructed.filter_map(|(_, (_, named, _))| named.as_ref()));
             let bytes: u64 = checkpoints.iter().map(|named| self.bytes(named)).sum();
-            let measured: Vec<String> = service
-                .engine
-                .with_journal(|j| j.preparations_of(actor, &installation.alias))
-                .map_err(io_failure)?
-                .iter()
-                .filter_map(|preparation| Plan::of(preparation).ok())
-                .filter(|plan| plan.entrypoint == request.entrypoint)
-                .map(|plan| plan.construction)
-                .collect();
-            if gpu.budget(degree, &measured).is_some_and(|budget| bytes > budget) {
+            if gpu.budget(degree).is_some_and(|budget| bytes > budget) {
                 for (slot, chosen) in slots.iter().zip(&mut picked).filter(|(slot, _)| shrinks(slot)) {
                     *chosen = pick(slot, true)?;
                 }
@@ -2522,7 +2513,7 @@ pub(crate) mod tests {
         let file = named.file_name().unwrap().to_string_lossy().to_string();
         let (digest, _) = updates.stage(&file, &mut File::open(&named).unwrap()).unwrap();
         let runtime = Some(Choice { file, sha256: digest.clone(), ..Default::default() });
-        let request = Request { operation: "dev".into(), pin: None, runtime, tensorfs: None, cozy: None, binary: None, toolchain: false };
+        let request = Request { operation: "dev".into(), pin: None, runtime, tensorfs: None, cozy: None, binary: None, gpu_memory_limit: None, toolchain: false };
         updates.request(request, |_| ()).unwrap();
         loop {
             let status = updates.update("dev").unwrap();

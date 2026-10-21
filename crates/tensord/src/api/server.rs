@@ -33,6 +33,8 @@ pub struct MachineIdentity {
     pub store: Option<std::path::PathBuf>,
     /// The GPUs this boot measured, which its readiness receipt names.
     pub gpus: Vec<receipt::Gpu>,
+    /// The most memory each of them offers (`machine.gpu_memory_limit`).
+    pub gpu_memory_limit: Option<u64>,
 }
 
 impl MachineIdentity {
@@ -65,6 +67,7 @@ impl MachineIdentity {
             updates: None,
             store: None,
             gpus: vec![],
+            gpu_memory_limit: None,
             webrtc: None,
             player: Default::default(),
             webrtc_port: None,

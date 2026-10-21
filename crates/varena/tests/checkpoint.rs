@@ -1,17 +1,19 @@
-//! TensorFS v2 checkpoints through `register_checkpoint`: a real v2 store written by its writer,
-//! filled into the pinned tier (CPU) and onto a device (GPU, ignored by default), every part
-//! read back. The checkpoint has packs, a tensor over two chunks, two components and an empty
-//! tensor.
+//! TensorFS v2 checkpoints through `register`: a real v2 store written by its writer, bound on
+//! the host core from its chunk files and from a sealed host layout, every part read back. The
+//! checkpoint has packs, a tensor over two chunks, two components and an empty tensor. The GPU
+//! core's proof runs on a rental (`scripts/varena-gpu.py`).
 #![cfg(target_os = "linux")]
 
-use std::os::unix::fs::FileExt;
+use std::os::fd::AsRawFd;
+use std::sync::Arc;
 
 use tensorfs::client::regions;
 use tensorfs::format::Dtype;
+use tensorfs::ids::ObjectRef;
 use tensorfs::store2::{Checkpoint, Store};
 use tensorfs::writer::{Data, Source};
-use varena::cuda::{self, CUstream, CtxGuard};
-use varena::{Plane, PlaneConfig, Tier, WsId};
+use varena::checkpoint::Ck;
+use varena::{cuda, memory, Error, Gpu, Host, HostSet};
 
 const MIB: usize = 1 << 20;
 
@@ -62,61 +64,122 @@ impl Drop for Fixture {
     }
 }
 
-/// Every non-empty part of `layout` in `region` (all when None), read by `read(offset, n)`,
-/// equals its tensor's bytes.
-fn check(p: &Plane, ws: WsId, region: Option<u32>, read: impl Fn(u64, usize) -> Vec<u8>) {
-    let layout = p.layout(ws).unwrap();
+fn check(ws: &Arc<HostSet>) {
+    check_parts(ws, TENSORS.iter().filter(|t| t.2 > 0).count());
+}
+
+/// Every part, bound region by region, equals its tensor's bytes and carries its dtype and
+/// shape; the first bind of a region is fresh, the next is not; `want` parts have bytes.
+fn check_parts(ws: &Arc<HostSet>, want: usize) {
     let mut seen = 0;
-    for part in layout.parts.iter().filter(|x| region.is_none_or(|r| x.region == r)) {
-        let (comp_key, _) = part.what.rsplit_once('#').unwrap();
-        let (component, key) = comp_key.split_once('/').unwrap();
-        let n = TENSORS.iter().find(|t| t.0 == component && t.1 == key).unwrap().2;
-        assert_eq!(part.nbytes as usize, n, "{}", part.what);
-        if n > 0 {
-            assert!(read(part.offset, n) == bytes_of(key, n), "{} differs", part.what);
-            seen += 1;
+    for r in 0..ws.weights.layout.regions.len() as u32 {
+        let pin = ws.bind(r).unwrap();
+        assert!(pin.fresh && !ws.bind(r).unwrap().fresh);
+        for part in ws.weights.parts.iter().filter(|p| p.region == r) {
+            let n = TENSORS.iter().find(|t| t.0 == part.component && t.1 == part.key).unwrap().2;
+            assert_eq!((part.nbytes as usize, part.dtype.as_str(), part.shape.as_slice(), part.role.as_str()), (n, "U8", &[n as u64][..], ""));
+            // SAFETY: the part lies inside the region the pin keeps.
+            let got = unsafe { std::slice::from_raw_parts((pin.ptr + part.offset) as *const u8, n) };
+            assert!(got == bytes_of(&part.key, n), "{}/{} differs", part.component, part.key);
+            seen += (n > 0) as usize;
         }
     }
-    assert!(seen > 0);
+    assert_eq!(seen, want);
+}
+
+/// Every chunk of `ck`, opened: what a grant hands over.
+fn granted(ck: &Checkpoint) -> Vec<(ObjectRef, std::fs::File)> {
+    let chunks = ck.header().chunks.iter().enumerate();
+    chunks.map(|(i, c)| (ObjectRef { sha256: c.sha256.clone(), length: c.length }, std::fs::File::open(ck.chunk_path(i)).unwrap())).collect()
 }
 
 #[test]
-fn a_v2_checkpoint_fills_the_pinned_tier_exactly() {
-    let fx = Fixture::new("pinned");
-    let p = Plane::open(PlaneConfig { readers: 2, ..Default::default() }).unwrap();
+fn a_v2_checkpoint_binds_on_the_host_exactly_from_its_chunk_files() {
+    let fx = Fixture::new("host");
     let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
-    let ws = p.register_checkpoint("ck", &fx.ck, &rs, None).unwrap();
-    assert_eq!(p.layout(ws).unwrap().regions.len(), rs.len());
-    p.set_pinned_budget(1 << 30).unwrap();
-    p.want(ws, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
-    let fd = p.host_fd(ws).unwrap();
-    // SAFETY: a borrowed view of the plane's fd for positional reads; never closed here.
-    let f = std::mem::ManuallyDrop::new(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) });
-    check(&p, ws, None, |off, n| {
-        let mut got = vec![0u8; n];
-        f.read_exact_at(&mut got, off).unwrap();
-        got
-    });
+    let ws = Host.register("ck", &fx.ck, &rs, None, None).unwrap();
+    assert_eq!(ws.weights.layout.regions.len(), rs.len());
+    check(&ws);
+    assert!(ws.bind(0).unwrap().writable);
     // One component alone is a weight set of its own tensors.
     let vae: Vec<Vec<String>> = rs.iter().filter(|r| r[0].starts_with("vae/")).cloned().collect();
-    let wv = p.register_checkpoint("vae", &fx.ck, &vae, None).unwrap();
-    assert!(p.layout(wv).unwrap().parts.iter().all(|x| x.what.starts_with("vae/")));
-    // A window is a weight set of its regions' parts alone, filled exactly.
+    assert!(Host.register("vae", &fx.ck, &vae, None, None).unwrap().weights.parts.iter().all(|p| p.component == "vae"));
+    // A window is a weight set of its regions' parts alone, read exactly.
     let window = regions(fx.ck.header(), 64 << 20, &blocks(), &["unet/blocks.2".into()]);
-    let ww = p.register_checkpoint("window", &fx.ck, &window, None).unwrap();
-    let parts: Vec<String> = p.layout(ww).unwrap().parts.iter().map(|x| x.what.clone()).collect();
-    assert_eq!(parts, ["unet/blocks.2.a#value", "unet/blocks.2.b#value", "unet/norm.weight#value"]);
-    p.want(ww, Tier::Pinned, None, 0, false).unwrap().wait().unwrap();
-    let fd = p.host_fd(ww).unwrap();
-    // SAFETY: as above.
-    let f = std::mem::ManuallyDrop::new(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) });
-    check(&p, ww, None, |off, n| {
-        let mut got = vec![0u8; n];
-        f.read_exact_at(&mut got, off).unwrap();
-        got
-    });
-    assert!(p.register_checkpoint("bad", &fx.ck, &[vec!["unet/blocks.9".into()]], None).is_err());
-    p.close().unwrap();
+    let ww = Host.register("window", &fx.ck, &window, None, None).unwrap();
+    let parts: Vec<&str> = ww.weights.parts.iter().map(|p| p.key.as_str()).collect();
+    assert_eq!(parts, ["blocks.2.a", "blocks.2.b", "norm.weight"]);
+    check_parts(&ww, 3);
+    assert!(Host.register("bad", &fx.ck, &[vec!["unet/blocks.9".into()]], None, None).is_err());
+}
+
+#[test]
+fn a_v2_checkpoint_binds_from_the_chunk_files_a_grant_hands_over_and_no_others() {
+    let fx = Fixture::new("granted");
+    let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
+    check(&Host.register("granted", &fx.ck, &rs, None, Some(granted(&fx.ck))).unwrap());
+    let none = Host.register("none", &fx.ck, &rs, None, Some(Vec::new())).unwrap();
+    assert!((0..rs.len() as u32).any(|r| none.bind(r).is_err()), "an object no grant handed over is never read");
+}
+
+#[test]
+fn a_header_parsed_alone_binds_and_seals_from_its_grant_only() {
+    let fx = Fixture::new("parsed");
+    let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
+    let parsed = Ck { header: fx.ck.header(), stored: None };
+    check(&Host.register("parsed", parsed, &rs, None, Some(granted(&fx.ck))).unwrap());
+    assert!(matches!(Host.register("bare", parsed, &rs, None, None), Err(Error::Invalid(_))), "no store, no grant: nothing to read");
+    let fd = memory::seal(parsed, &rs, "parsed", 2, Some(granted(&fx.ck))).unwrap();
+    check(&Host.register("sealed", parsed, &rs, Some(fd.as_raw_fd()), None).unwrap());
+}
+
+#[cfg(target_os = "linux")] // sealed host layouts are Linux-only
+#[test]
+fn a_v2_checkpoint_binds_on_the_host_exactly_from_a_sealed_layout() {
+    let fx = Fixture::new("sealed");
+    let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
+    let fd = memory::seal(&fx.ck, &rs, "ck", 2, None).unwrap();
+    let carried = varena::host::sealed_regions(fd.as_raw_fd()).unwrap();
+    assert_eq!(carried, rs, "a sealed layout carries the regions it was built from");
+    let ws = Host.register("ck", &fx.ck, &carried, Some(fd.as_raw_fd()), None).unwrap();
+    check(&ws);
+    assert!(!ws.bind(0).unwrap().writable, "views of the machine's layout are read-only");
+    let mut moved = rs.clone();
+    let tail = moved[0].pop().unwrap();
+    moved[1].push(tail);
+    assert!(Host.register("ck", &fx.ck, &moved, Some(fd.as_raw_fd()), None).is_err(), "another grouping is refused");
+}
+
+/// The glue's regions: header-order runs cut where the owning block changes. blocks.2.b and norm
+/// share a pack, so that chunk is read once per region, from the files and into a sealed layout.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_chunk_two_regions_share_is_read_per_region() {
+    let fx = Fixture::new("runs");
+    let chunk = |key: &str| fx.ck.header().tensor("unet", key).unwrap().locations()[0].1.chunk;
+    assert_eq!(chunk("blocks.2.b"), chunk("norm.weight"));
+    let mut rs: Vec<Vec<String>> = Vec::new();
+    let mut last = None;
+    for &(c, k, _) in TENSORS {
+        let owner = (c, blocks().into_iter().find(|b| format!("{c}/{k}").starts_with(&format!("{b}."))));
+        if last.as_ref() != Some(&owner) {
+            rs.push(Vec::new());
+            last = Some(owner);
+        }
+        rs.last_mut().unwrap().push(format!("{c}/{k}"));
+    }
+    assert!(rs.contains(&vec!["unet/blocks.2.a".into(), "unet/blocks.2.b".into()]), "{rs:?}");
+    check(&Host.register("runs", &fx.ck, &rs, None, None).unwrap());
+    let fd = memory::seal(&fx.ck, &rs, "runs", 2, None).unwrap();
+    check(&Host.register("runs", &fx.ck, &rs, Some(fd.as_raw_fd()), None).unwrap());
+}
+
+#[test]
+fn a_gpu_takes_whole_pages_and_says_why_it_cannot_open() {
+    assert!(matches!(Gpu::open(0, 3 << 20), Err(Error::Invalid(_))), "chunks are whole 2 MiB pages");
+    if !cuda::available() {
+        assert!(matches!(Gpu::open(0, 2 << 20), Err(Error::CudaUnavailable(_))));
+    }
 }
 
 #[test]
@@ -161,31 +224,48 @@ fn a_window_gets_the_regions_the_full_call_gives_its_tensors() {
 }
 
 #[test]
-#[ignore = "GPU"]
-fn a_v2_checkpoint_reaches_the_device_exactly() {
-    let fx = Fixture::new("device");
-    let (_, ctx) = cuda::primary_context(0).unwrap();
-    let _g = CtxGuard::enter(ctx).unwrap();
-    let d = cuda::driver().unwrap();
-    let mut s: CUstream = std::ptr::null_mut();
-    cuda::check("cuStreamCreate", unsafe { (d.stream_create)(&mut s, cuda::STREAM_NON_BLOCKING) }).unwrap();
-    let p = Plane::open(PlaneConfig { devices: vec![0], ..Default::default() }).unwrap();
-    let ws = p.register_checkpoint("ck", &fx.ck, &regions(fx.ck.header(), 64 << 20, &[], &[]), None).unwrap();
-    p.set_vram_budget(0, 1 << 30).unwrap();
-    p.want(ws, Tier::Device(0), None, 0, false).unwrap().wait().unwrap();
-    let layout = p.layout(ws).unwrap();
-    for r in 0..layout.regions.len() as u32 {
-        let l = p.acquire(ws, 0, r, s as u64, None).unwrap();
-        let mut got = vec![0u8; l.nbytes as usize];
-        cuda::check("cuMemcpyDtoHAsync", unsafe { (d.memcpy_dtoh_async)(got.as_mut_ptr() as *mut libc::c_void, l.ptr, got.len(), s) }).unwrap();
-        cuda::check("cuStreamSynchronize", unsafe { (d.stream_synchronize)(s) }).unwrap();
-        let base = layout.regions[r as usize].offset;
-        check(&p, ws, Some(r), |off, n| got[(off - base) as usize..(off - base) as usize + n].to_vec());
-        l.release(s as u64).unwrap();
+fn a_seal_logs_its_disk_copy() {
+    let fx = Fixture::new("logged");
+    let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
+    let fd = memory::seal(&fx.ck, &rs, "logged", 2, None).unwrap();
+    // the seal returns as it opens the layout; its fill runs on its own and logs as it ends
+    while varena::host::filling(std::os::fd::AsFd::as_fd(&fd)).unwrap() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    let st = p.stats();
-    println!("device: {:?}", st.devices[0].counters);
-    assert!(st.poisoned.is_none());
-    cuda::check("cuStreamSynchronize", unsafe { (d.stream_synchronize)(s) }).unwrap();
-    p.close().unwrap();
+    assert!(varena::host::complete(std::os::fd::AsFd::as_fd(&fd)).unwrap());
+    let all: u64 = TENSORS.iter().map(|t| t.2 as u64).sum();
+    let copies = varena::ceiling::take();
+    assert!(copies.iter().any(|c| c.kind == "disk" && c.bytes == all && c.ns > 0), "{copies:?}");
+}
+
+/// On a GPU only: `give` takes a slot of a set in use that no bound block holds, never a bound
+/// one, and the next stream maps a slot again.
+#[test]
+fn give_takes_a_busy_sets_unbound_slot_never_a_bound_one() {
+    if !cuda::available() {
+        return;
+    }
+    let fx = Fixture::new("give");
+    let rs = regions(fx.ck.header(), 64 << 20, &[], &[]);
+    let gpu = Gpu::open(0, 2 << 20).unwrap();
+    let ws = gpu.register("give", &fx.ck, &rs, None, None).unwrap();
+    ws.home(&[]).unwrap();
+    ws.busy(true);
+    let slots = || gpu.stats().unwrap().slots;
+    let sync = || {
+        let (_, ctx) = cuda::primary_context(0).unwrap();
+        let _c = cuda::CtxGuard::enter(ctx).unwrap();
+        // SAFETY: the legacy stream of our current context.
+        cuda::check("cuStreamSynchronize", unsafe { (cuda::driver().unwrap().stream_synchronize)(std::ptr::null_mut()) }).unwrap();
+    };
+    let pin = ws.bind(0, 0).unwrap();
+    sync();
+    gpu.give(u64::MAX).unwrap();
+    assert_eq!(slots(), 1, "a bound slot is never given");
+    drop(pin);
+    sync();
+    gpu.give(u64::MAX).unwrap();
+    assert_eq!(slots(), 0, "an unbound slot of a busy set is given");
+    let _pin = ws.bind(0, 0).unwrap();
+    assert_eq!(slots(), 1, "the next stream maps one again");
 }

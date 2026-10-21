@@ -27,20 +27,23 @@ use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use tensorfs::ids::ObjectRef;
 use platform::shm::{self, Region, RESIZE_SEALS, WRITE_SEALS};
 
+use crate::ceiling::Copy;
 use crate::cuda;
 use crate::io::{IoTally, Mode, Source};
 use crate::layout::{ItemSource, Layout, PART_ALIGN};
-use crate::{Error, Result};
+use crate::{lock, Error, Result};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"TFSPLN02");
+const MAGIC: u64 = u64::from_le_bytes(*b"TFSPLN03");
 const MAGIC_WINDOW: u64 = u64::from_le_bytes(*b"TFSWIN01");
 /// The state page, at `data` (the layout's nbytes): magic, region count, digest (64 hex bytes),
-/// one u32 word per region, then each region's (offset, span); the file's last 8 bytes repeat
-/// `data`, so a holder without the layout (`release_hold`) finds the page.
+/// one u32 word per region, each region's (offset, span), then the regions the layout was built
+/// from (`names_off`); the file's last 8 bytes repeat `data`, so a holder without the layout
+/// (`release_hold`, `sealed_regions`) finds the page.
 const WORDS_OFF: usize = 8 + 8 + 64;
 const READY: u32 = 1;
 /// A sealed layout's region its filler could not fill: whoever waits for it gets an error.
@@ -50,17 +53,91 @@ const FAILED: u32 = 2;
 /// it later (`OpenFill::stage`), which clears the bit before the first byte lands.
 const HOLE: u32 = 4;
 
-/// A region's page lock in this process (`HostMem::pin_region`): not tried, registered, refused.
+/// A region's page lock in this process (`HostMem::pin_region`): never copied, registered,
+/// refused, copied once unlocked.
 const PIN_NONE: u8 = 0;
 const PIN_YES: u8 = 1;
 const PIN_REFUSED: u8 = 2;
+const PIN_ONCE: u8 = 3;
 
 fn ext_off(regions: usize) -> usize {
     (WORDS_OFF + 4 * regions).next_multiple_of(8)
 }
 
-fn meta_len(regions: usize) -> usize {
-    (ext_off(regions) + 16 * regions + 8).next_multiple_of(PART_ALIGN as usize)
+/// The names section: its byte length, then per region a u32 name count and each name as a u32
+/// length and its bytes.
+fn names_off(regions: usize) -> usize {
+    ext_off(regions) + 16 * regions
+}
+
+fn meta_len(regions: usize, names: usize) -> usize {
+    (names_off(regions) + 8 + names + 8).next_multiple_of(PART_ALIGN as usize)
+}
+
+fn encode_names(names: &[Vec<String>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for region in names {
+        out.extend((region.len() as u32).to_le_bytes());
+        for n in region {
+            out.extend((n.len() as u32).to_le_bytes());
+            out.extend(n.as_bytes());
+        }
+    }
+    out
+}
+
+fn decode_names(mut b: &[u8], regions: usize) -> Option<Vec<Vec<String>>> {
+    let u32_of = |b: &mut &[u8]| -> Option<usize> {
+        let (n, rest) = b.split_first_chunk::<4>()?;
+        *b = rest;
+        Some(u32::from_le_bytes(*n) as usize)
+    };
+    let mut out = Vec::with_capacity(regions.min(b.len() / 4));
+    for _ in 0..regions {
+        let count = u32_of(&mut b)?;
+        let mut region = Vec::with_capacity(count.min(b.len() / 4));
+        for _ in 0..count {
+            let len = u32_of(&mut b)?;
+            let (name, rest) = b.split_at_checked(len)?;
+            region.push(String::from_utf8(name.to_vec()).ok()?);
+            b = rest;
+        }
+        out.push(region);
+    }
+    b.is_empty().then_some(out)
+}
+
+fn read_at(fd: RawFd, buf: &mut [u8], at: usize) -> bool {
+    // SAFETY: a read into our own buffer.
+    unsafe { libc::pread(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), at as libc::off_t) == buf.len() as isize }
+}
+
+fn u64_at(fd: RawFd, at: usize) -> Option<u64> {
+    let mut b = [0u8; 8];
+    read_at(fd, &mut b, at).then(|| u64::from_le_bytes(b))
+}
+
+/// The state page's names section length, when `data + meta_len` is exactly `size`.
+fn names_len(fd: RawFd, data: usize, regions: usize, size: usize) -> Option<usize> {
+    let len = usize::try_from(u64_at(fd, data.checked_add(names_off(regions))?)?).ok()?;
+    (len < size && data.checked_add(meta_len(regions, len)) == Some(size)).then_some(len)
+}
+
+/// The regions a sealed layout (`fill_sealed`, `open_sealed`) was built from, read from its own
+/// state page: what rebuilds its layout without the module (`Gpu::adopt`). Adoption checks the
+/// rebuilt layout's digest, so the names are trusted no further than that.
+pub fn sealed_regions(fd: RawFd) -> Result<Vec<Vec<String>>> {
+    let bad = || Error::Invalid("host fd is not a sealed weight-set layout".into());
+    let size = file_size(fd)?;
+    let data = size.checked_sub(8).and_then(|t| u64_at(fd, t)).and_then(|d| usize::try_from(d).ok()).ok_or_else(bad)?;
+    let (magic, n) = (u64_at(fd, data).ok_or_else(bad)?, u64_at(fd, data + 8).ok_or_else(bad)?);
+    let n = usize::try_from(n).ok().filter(|&n| magic == MAGIC && n < size).ok_or_else(bad)?;
+    let len = names_len(fd, data, n, size).ok_or_else(bad)?;
+    let mut buf = vec![0u8; len];
+    if !read_at(fd, &mut buf, data + names_off(n) + 8) {
+        return Err(bad());
+    }
+    decode_names(&buf, n).ok_or_else(bad)
 }
 
 /// A streamed layout's window section, after the extents: slot count, slot span, then one u64
@@ -175,7 +252,7 @@ pub fn release_hold(hold: OwnedFd) -> Result<u64> {
         return Ok(0);
     }
     let n = u64::from_le_bytes(head[8..].try_into().unwrap()) as usize;
-    if u64::from_le_bytes(head[..8].try_into().unwrap()) != MAGIC || data.checked_add(meta_len(n)) != Some(size) {
+    if u64::from_le_bytes(head[..8].try_into().unwrap()) != MAGIC || n >= size || names_len(fd, data, n, size).is_none() {
         return Ok(0);
     }
     let mut words = vec![0u8; 4 * n];
@@ -285,10 +362,11 @@ impl HostMem {
     }
 
     /// Until region `r` of a sealed layout is Ready: its filler sets the word after the last
-    /// byte lands (or marks it failed). Its filler is this executor's machine, so a filler that
-    /// dies takes the waiter with it; there is no deadline to guess.
+    /// byte lands (or marks it failed). A filler that ends without either (a killed process)
+    /// lets go of its fill lock, and the waiter's error says so; there is no deadline to guess.
     pub fn wait_ready(&self, r: u32) -> Result<()> {
         let mut pause = std::time::Duration::from_micros(20);
+        let mut gone = false;
         loop {
             let w = self.word(r).load(Ordering::Acquire);
             if w & READY != 0 {
@@ -300,6 +378,10 @@ impl HostMem {
             if w & HOLE != 0 {
                 return Err(Error::Invalid(format!("sealed layout region {r} is not staged")));
             }
+            if gone {  // read once more after the lock went: Ready may have landed just before
+                return Err(Error::Invalid(format!("sealed layout region {r}: its filler is gone")));
+            }
+            gone = !filler(self.fd.as_fd(), self.data)?;
             std::thread::sleep(pause);
             pause = (pause * 2).min(std::time::Duration::from_millis(1));
         }
@@ -474,7 +556,7 @@ impl HostMem {
     }
 
     fn read_begin(&self, r: u32) -> Result<()> {
-        let mut readers = self.readers.lock().unwrap();
+        let mut readers = lock(&self.readers);
         let n = readers.entry(r).or_insert(0);
         if *n == 0 {
             self.lock(r, Region::Read, true)?;
@@ -484,7 +566,7 @@ impl HostMem {
     }
 
     fn read_end(&self, r: u32) {
-        let mut readers = self.readers.lock().unwrap();
+        let mut readers = lock(&self.readers);
         if let Some(n) = readers.get_mut(&r) {
             *n -= 1;
             if *n == 0 {
@@ -525,24 +607,21 @@ impl HostMem {
     fn adopt_owned(fd: OwnedFd, layout: &Layout, sealed: bool, init: bool) -> Result<HostMem> {
         let regions = layout.regions.len();
         let data = layout.nbytes as usize;
-        let map_len = data + meta_len(regions);
-        // SAFETY: fstat into a zeroed struct.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
-            return Err(os("fstat host fd"));
-        }
-        let fresh = (init || st.st_size == 0) && !sealed;
-        if fresh {
+        let size = file_size(fd.as_raw_fd())?;
+        let fresh = (init || size == 0) && !sealed;
+        let names = if fresh { encode_names(&layout.names) } else { Vec::new() };
+        let map_len = if fresh {
+            let map_len = data + meta_len(regions, names.len());
             // SAFETY: sizing our own descriptor; a sparse file costs no RAM until written.
             if unsafe { libc::ftruncate(fd.as_raw_fd(), map_len as libc::off_t) } != 0 {
                 return Err(os("ftruncate host fd"));
             }
-        } else if st.st_size as usize != map_len {
-            return Err(Error::Invalid(format!(
-                "host fd is {} bytes, this layout needs {map_len}",
-                st.st_size
-            )));
-        }
+            map_len
+        } else if names_len(fd.as_raw_fd(), data, regions, size).is_some() {
+            size
+        } else {
+            return Err(Error::Invalid(format!("host fd is {size} bytes, not this layout's {data} and its state page")));
+        };
         // SAFETY: shared mapping of a descriptor we hold, length checked above.
         let ptr = unsafe {
             libc::mmap(
@@ -584,7 +663,10 @@ impl HostMem {
                     e.write_unaligned(reg.offset.to_le());
                     e.add(1).write_unaligned(reg.span.to_le());
                 }
-                (page.add(meta_len(regions) - 8) as *mut u64).write_unaligned((data as u64).to_le());
+                let at = page.add(names_off(regions));
+                (at as *mut u64).write_unaligned((names.len() as u64).to_le());
+                std::ptr::copy_nonoverlapping(names.as_ptr(), at.add(8), names.len());
+                (page.add(map_len - data - 8) as *mut u64).write_unaligned((data as u64).to_le());
             }
             head.1.copy_from_slice(layout.digest.as_bytes());
             head.0[1] = regions as u64;
@@ -707,37 +789,40 @@ impl HostMem {
         let mut ctx: cuda::CUcontext = std::ptr::null_mut();
         // SAFETY: out-param.
         unsafe { (d.ctx_get_current)(&mut ctx) };
-        self.registered.lock().unwrap().push((off, ctx as usize));
+        lock(&self.registered).push((off, ctx as usize));
         Ok(())
     }
 
-    /// Page-lock region `r` (`[off, off + len)`) once, so its copies to a device are one DMA,
-    /// and keep it until `unpin_region` or the layout closes. Returns (locked, refused now): a
-    /// refused region is never asked again and its copies go through the staging buffers,
-    /// never as pageable memory. A sealed layout is mapped read-only, so only a driver that
-    /// locks read-only memory can lock it (an RTX 4070 answers NOT_SUPPORTED): that answer
-    /// holds for the whole layout. Only a region whose bytes exist (Ready): a hole's pages
-    /// would be allocated by the lock. The caller binds a context first.
-    pub fn pin_region(&self, r: u32, off: u64, len: u64) -> (bool, bool) {
+    /// Whether region `r` (`[off, off + len)`) copies to a device as one DMA: page-locked on
+    /// its second copy, and kept until `unpin_region` or the layout closes. A first copy (a
+    /// refill) goes through the staging buffers: locking 4 KiB pages runs at about 15 GB/s and
+    /// does not scale with threads (4090 host, run 11942), below a GPU's H2D ceiling; a region
+    /// copied again (streamed) pays it once. A refused region is never asked again. A sealed
+    /// layout is mapped read-only, so only a driver that locks read-only memory can lock it (an
+    /// RTX 4070 or 4090 answers NOT_SUPPORTED): that answer holds for the whole layout. Only a
+    /// region whose bytes exist (Ready). The caller binds a context first.
+    pub fn pin_region(&self, r: u32, off: u64, len: u64) -> bool {
         let state = &self.pinned[r as usize];
-        let _g = self.pinning.lock().unwrap();
+        let _g = lock(&self.pinning);
         match state.load(Ordering::Acquire) {
-            PIN_YES => (true, false),
-            PIN_REFUSED => (false, false),
+            PIN_YES => true,
+            PIN_REFUSED => false,
+            PIN_NONE => {
+                state.store(PIN_ONCE, Ordering::Release);
+                false
+            }
             _ => match crate::faults::hit("pin").and_then(|_| self.register(off, len)) {
                 Ok(()) => {
                     state.store(PIN_YES, Ordering::Release);
-                    (true, false)
+                    true
                 }
                 Err(Error::Cuda { code: cuda::ERROR_NOT_SUPPORTED, .. }) if self.sealed => {
-                    for state in &self.pinned {
-                        let _ = state.compare_exchange(PIN_NONE, PIN_REFUSED, Ordering::AcqRel, Ordering::Acquire);
-                    }
-                    (false, true)
+                    self.pinned.iter().for_each(|s| s.store(PIN_REFUSED, Ordering::Release));
+                    false
                 }
                 Err(_) => {
                     state.store(PIN_REFUSED, Ordering::Release);
-                    (false, true)
+                    false
                 }
             },
         }
@@ -746,7 +831,7 @@ impl HostMem {
     /// Unlock region `r` before its RAM is punched; a refill locks it again. The caller binds a
     /// context first.
     pub fn unpin_region(&self, r: u32, off: u64) -> Result<()> {
-        let _g = self.pinning.lock().unwrap();
+        let _g = lock(&self.pinning);
         if self.pinned[r as usize].swap(PIN_NONE, Ordering::AcqRel) == PIN_YES {
             self.unregister(off)?;
         }
@@ -755,8 +840,8 @@ impl HostMem {
 
     /// Unlock every region this process locked (a plane closing, while its context lives).
     pub fn unpin_all(&self) -> Result<()> {
-        let _g = self.pinning.lock().unwrap();
-        let offsets: Vec<u64> = self.registered.lock().unwrap().iter().map(|r| r.0).collect();
+        let _g = lock(&self.pinning);
+        let offsets: Vec<u64> = lock(&self.registered).iter().map(|r| r.0).collect();
         for off in offsets {
             self.unregister(off)?;
         }
@@ -772,7 +857,7 @@ impl HostMem {
         cuda::check("cuMemHostUnregister", unsafe {
             (d.mem_host_unregister)(self.ptr.add(off as usize) as *mut libc::c_void)
         })?;
-        self.registered.lock().unwrap().retain(|r| r.0 != off);
+        lock(&self.registered).retain(|r| r.0 != off);
         Ok(())
     }
 }
@@ -822,8 +907,42 @@ pub struct OpenFill {
     host: HostMem,
 }
 
+/// Whether the filler of the sealed layout whose state page is at `data` still holds its fill
+/// lock (a write lock over the page's magic, on the filler's own description).
+fn filler(fd: BorrowedFd<'_>, data: usize) -> Result<bool> {
+    shm::written(fd, data, 8).map_err(crate::os("query the fill lock"))
+}
+
+/// Whether the sealed layout behind `fd` is still being filled: its filler, alive, holds the
+/// fill lock. Its holder hands adopters the chunk files too, for a filler that dies.
+pub fn filling(fd: BorrowedFd<'_>) -> Result<bool> {
+    let raw = fd.as_raw_fd();
+    let data = file_size(raw)?.checked_sub(8).and_then(|t| u64_at(raw, t)).and_then(|d| usize::try_from(d).ok());
+    data.map_or(Ok(false), |data| filler(fd, data))
+}
+
+/// Whether every region of the sealed layout behind `fd` is Ready or a hole: none failed, and
+/// none left unfilled by a filler that died. Its holder grants an incomplete one to nobody.
+pub fn complete(fd: BorrowedFd<'_>) -> Result<bool> {
+    let raw = fd.as_raw_fd();
+    let bad = || Error::Invalid("host fd is not a sealed weight-set layout".into());
+    let size = file_size(raw)?;
+    let data = size.checked_sub(8).and_then(|t| u64_at(raw, t)).and_then(|d| usize::try_from(d).ok()).ok_or_else(bad)?;
+    let n = u64_at(raw, data + 8).and_then(|n| usize::try_from(n).ok()).filter(|&n| n < size).ok_or_else(bad)?;
+    let mut words = vec![0u8; 4 * n];
+    if !read_at(raw, &mut words, data + WORDS_OFF) {
+        return Err(bad());
+    }
+    let done = |w: &[u8; 4]| {
+        let w = u32::from_le_bytes(*w);
+        w & FAILED == 0 && w & (READY | HOLE) != 0
+    };
+    Ok(words.as_chunks::<4>().0.iter().all(done))
+}
+
 /// Create `layout`'s memfd (in `reserved` when given: its pages exist, so the copy only maps
-/// them) and seal it now; returns the memfd to hand out and the fill to run. `staged`: the
+/// them) and seal it now; returns the memfd to hand out and the fill to run. The fill holds
+/// the fill lock on its own description until it ends, so adopters see a killed filler. `staged`: the
 /// only regions this layout will hold (the rest are holes until staged); None: every region.
 pub fn open_sealed(name: &str, layout: &Layout, reserved: Option<OwnedFd>, staged: Option<&[u32]>) -> Result<(OwnedFd, OpenFill)> {
     let host = match reserved {
@@ -837,6 +956,7 @@ pub fn open_sealed(name: &str, layout: &Layout, reserved: Option<OwnedFd>, stage
             }
         }
     }
+    ofd_lock(host.fd.as_fd(), host.data, 8, Region::Write, false)?;
     let fd = reopen(host.fd.as_raw_fd())?;
     // Future-write leaves this mapping writable.
     shm::seal(fd.as_fd()).map_err(crate::os("seal host layout"))?;
@@ -892,8 +1012,11 @@ impl OpenFill {
         Ok(taken.iter().map(|&r| layout.regions[r as usize].span).sum())
     }
 
+    /// Logged as a `disk` copy run against the volume's ceiling.
     fn copy(&self, layout: &Layout, wanted: &[u32], source: &Source, threads: usize, tally: &IoTally) -> Result<()> {
-        let host = &self.host;
+        let (t, host) = (Instant::now(), &self.host);
+        let counts = || [&tally.cached_bytes, &tally.direct_bytes, &tally.buffered_bytes, &tally.inline_bytes].map(|c| c.load(Ordering::Relaxed));
+        let before = counts();
         let mut region_of = Vec::new();
         for &r in wanted {
             region_of.extend(std::iter::repeat_n(r as usize, layout.regions[r as usize].items.len()));
@@ -938,7 +1061,7 @@ impl OpenFill {
                     // keeps items disjoint inside the live mapping.
                     let dst = unsafe { host.base().add(it.offset as usize) };
                     if let Err(e) = unsafe { source.read_item(it, dst, mode, tally) } {
-                        failed.lock().unwrap().get_or_insert(e);
+                        lock(&failed).get_or_insert(e);
                         next.store(items.len(), Ordering::Relaxed);
                         return;
                     }
@@ -955,10 +1078,20 @@ impl OpenFill {
                 });
             }
         });
-        match failed.into_inner().unwrap() {
-            Some(e) => Err(e),
-            None => Ok(()),
+        if let Some(e) = failed.into_inner().unwrap() {
+            return Err(e);
         }
+        let moved = counts().iter().zip(before).map(|(a, b)| a - b).collect::<Vec<_>>();
+        crate::ceiling::record(Copy {
+            kind: "disk",
+            gpu: -1,
+            bytes: moved.iter().sum(),
+            ns: t.elapsed().as_nanos() as u64,
+            ceiling: source.disk_ceiling(&objects, tally).unwrap_or(0.0),
+            cached: moved[0],
+            ..Default::default()
+        });
+        Ok(())
     }
 }
 

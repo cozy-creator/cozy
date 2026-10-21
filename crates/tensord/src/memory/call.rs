@@ -1,98 +1,101 @@
-//! One call's device memory as its executor measured it: the run's `memory` measurements,
-//! which `cozy run show` prints. Peaks are the call's own; holdings are its process's at the
-//! call's end; counts are what its plane and torch did since the executor's previous call (since
-//! it started, for its first).
-use crate::device_executor::{Frame, PlaneFacts, Shortfall};
+//! One call's memory as its executor's varena measured it (design memory-varena §5.8): the
+//! request's `memory` object per model per step, kept as the run's `memory` measurements and
+//! printed by `cozy run show`.
+use crate::device_executor::Frame;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// One pass of a model: bytes at home and resident, copied home and streamed through slots,
+/// the GPU-timed prefetch stall, torch's allocated peak above the pass's start, and torch's
+/// allocated bytes at that start (a leak shows as their growth).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Step {
+    pub model: String,
+    pub gpu: u32,
+    pub step: u64,
+    pub home: u64,
+    pub resident: u64,
+    pub paged_in: u64,
+    pub streamed: u64,
+    pub stall_ns: u64,
+    pub activations: u64,
+    pub allocated: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Eviction {
+    pub model: String,
+    pub gpu: u32,
+    pub rung: u32,
+    pub reason: String,
+    pub nbytes: u64,
+}
+
+/// The measured activation peak of a model at one shape key, and the cuts in force there.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Peak {
+    pub model: String,
+    pub shape: String,
+    pub peak: u64,
+    pub cuts: Vec<String>,
+}
+
+/// The executor's `memory` object for one request, kept whole as `stats`: what the merge gate
+/// reads (`measurements.memory.stats`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct Stats {
+    /// Torch bytes still allocated at the request's end beyond its start, on every GPU.
+    pub leftover: u64,
+    /// Weight bytes copied to the device during the request, home or through slots.
+    pub paged_in: u64,
+    /// Per model (`<construction>/<component>`), the bytes copied in each of its passes.
+    pub steps: BTreeMap<String, Vec<u64>>,
+    pub rows: Vec<Step>,
+    pub evictions: Vec<Eviction>,
+    pub peaks: Vec<Peak>,
+    pub leftover_by_gpu: Vec<(u32, u64)>,
+    /// What this machine does not read, kept as sent.
+    #[serde(flatten)]
+    pub other: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct CallMemory {
-    /// torch's high-water marks: live tensors, and the segments it reserved for them.
+    /// torch's high-water marks over the call: live tensors, and the segments reserved for them.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_allocated_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_reserved_bytes: Option<u64>,
-    /// The peak above the call's start (activations, derived weights), and each stage method's.
-    pub activation_peak_bytes: Option<u64>,
-    pub stage_peaks: BTreeMap<String, u64>,
-    /// The process on its GPU at the end: CUDA context + torch reserved + the plane's maps.
-    pub process_bytes: Option<u64>,
-    pub context_bytes: Option<u64>,
-    pub reserved_bytes: Option<u64>,
-    /// Weights mapped on the GPU (its own and custody's), the plane's budget, the process cap.
-    pub weights_bytes: Option<u64>,
-    pub budget_bytes: Option<u64>,
-    pub cap_bytes: Option<u64>,
-    /// Weight bytes copied to the GPU; of them, read from disk and bounced through staging.
-    pub paged_in_bytes: Option<u64>,
-    pub disk_bytes: Option<u64>,
-    pub bounce_bytes: Option<u64>,
-    pub register_failed: Option<u64>,
-    /// Weight regions evicted, and components given back whole to make torch room.
-    pub evictions: Option<u64>,
-    pub paged_out: Option<u64>,
-    pub paged_out_bytes: Option<u64>,
-    /// torch short of room: whole-cache drops to place one allocation, OOMs it raised, the
-    /// executor's retries after one, and its own cache releases.
-    pub alloc_retries: Option<u64>,
-    pub alloc_ooms: Option<u64>,
-    pub oom_retries: Option<u64>,
-    pub cache_releases: Option<u64>,
-    pub cache_released_bytes: Option<u64>,
-    /// How each stage ran (decode mode, CFG layout), and what a refused stage lacked.
-    pub modes: BTreeMap<String, String>,
-    pub shortfall: Option<Shortfall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<Stats>,
 }
 
 impl CallMemory {
-    /// `since` is the plane's counts at the executor's previous call. None: nothing measured.
-    pub fn of(reply: &Frame, since: &PlaneFacts) -> Option<Self> {
-        if reply.metrics.is_none() && reply.plane.is_none() && reply.shortfall.is_none() {
+    /// None: the executor measured nothing.
+    pub fn of(reply: &Frame) -> Option<Self> {
+        let known = |v: Option<i64>| v.and_then(|v| u64::try_from(v).ok());
+        if reply.memory.is_none() && reply.metrics.is_none() {
             return None;
         }
         let metrics = reply.metrics.clone().unwrap_or_default();
-        let plane = reply.plane.clone().unwrap_or_default();
-        let moved = |of: fn(&PlaneFacts) -> Option<u64>| {
-            of(&plane).map(|now| now.saturating_sub(of(since).unwrap_or(0)))
-        };
         Some(Self {
             peak_allocated_bytes: known(metrics.peak_vram_bytes),
             peak_reserved_bytes: known(metrics.peak_reserved_bytes),
-            activation_peak_bytes: known(plane.activation_peak_bytes)
-                .or(known(metrics.working_peak_vram_bytes)),
-            stage_peaks: metrics
-                .activation_peaks
-                .iter()
-                .filter_map(|(stage, bytes)| Some((stage.clone(), known(Some(*bytes))?)))
-                .collect(),
-            process_bytes: known(plane.process_bytes),
-            context_bytes: known(plane.context_bytes),
-            reserved_bytes: known(plane.reserved_bytes),
-            weights_bytes: known(plane.committed_bytes)
-                .map(|own| own + known(plane.shared_bytes).unwrap_or(0)),
-            budget_bytes: known(plane.budget_bytes),
-            cap_bytes: known(plane.cap_bytes),
-            paged_in_bytes: moved(|p| p.h2d_bytes),
-            disk_bytes: moved(|p| p.disk_copy_bytes),
-            bounce_bytes: moved(|p| p.bounce_copy_bytes),
-            register_failed: moved(|p| p.register_failed),
-            evictions: moved(|p| p.evictions),
-            paged_out: moved(|p| p.paged_out),
-            paged_out_bytes: moved(|p| p.paged_out_bytes),
-            alloc_retries: moved(|p| p.alloc_retries),
-            alloc_ooms: moved(|p| p.alloc_ooms),
-            oom_retries: moved(|p| p.oom_retries),
-            cache_releases: moved(|p| p.cache_releases),
-            cache_released_bytes: moved(|p| p.cache_released_bytes),
-            modes: plane.modes,
-            shortfall: reply.shortfall.clone(),
+            stats: reply.memory.clone(),
         })
     }
-}
 
-/// The executor's signed byte counts: -1 is unreadable.
-fn known(value: Option<i64>) -> Option<u64> {
-    value.and_then(|v| u64::try_from(v).ok())
+    /// Models that ran more than one pass in this call: the host cache keeps their layouts
+    /// past run-once ones' (`<construction>/<component>`, a weight set's grant name).
+    pub fn per_step(&self) -> Vec<String> {
+        let steps = self.stats.iter().flat_map(|stats| &stats.steps);
+        steps.filter(|(_, passes)| passes.len() > 1).map(|(model, _)| model.clone()).collect()
+    }
 }
 
 #[cfg(test)]
@@ -100,25 +103,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_call_counts_what_moved_since_the_executors_previous_call() {
+    fn a_calls_memory_keeps_its_executors_stats_whole() {
         let reply: Frame = serde_json::from_value(serde_json::json!({
-            "metrics": {"peak_vram_bytes": 900, "peak_reserved_bytes": 1000,
-                "activation_peaks": {"vae.decode": 300}},
-            "plane": {"h2d_bytes": 5000, "evictions": 7, "committed_bytes": 400,
-                "shared_bytes": 100, "context_bytes": -1, "activation_peak_bytes": 350},
-            "shortfall": {"resource": "vram", "needed_bytes": 1200, "available_bytes": 1150,
-                "request_shape": "vae.decode"}
+            "metrics": {"peak_vram_bytes": 900, "peak_reserved_bytes": 1000},
+            "memory": {
+                "leftover": 12,
+                "paged_in": 25,
+                "steps": {"h3/te": [5], "h3/dit": [20, 0]},
+                "rows": [
+                    {"model": "h3/te", "gpu": 0, "step": 0, "home": 5, "resident": 5, "paged_in": 5},
+                    {"model": "h3/dit", "gpu": 0, "step": 0, "home": 20, "resident": 20, "paged_in": 20, "stall_ns": 7},
+                    {"model": "h3/dit", "gpu": 0, "step": 1, "home": 20, "resident": 20, "activations": 4}
+                ],
+                "evictions": [{"model": "h3/te", "gpu": 0, "rung": 2, "reason": "asked", "nbytes": 5}],
+                "peaks": [{"model": "h3/dit", "shape": "832x480x121", "peak": 4, "cuts": ["ffn:2"]}],
+                "leftover_by_gpu": [[0, 12]],
+                "newer": {"kept": true}
+            }
         }))
         .unwrap();
-        let before = PlaneFacts { h2d_bytes: Some(3000), evictions: Some(2), ..Default::default() };
-        let memory = CallMemory::of(&reply, &before).unwrap();
-        assert_eq!(memory.peak_reserved_bytes, Some(1000));
-        assert_eq!(memory.activation_peak_bytes, Some(350));
-        assert_eq!(memory.stage_peaks["vae.decode"], 300);
-        assert_eq!((memory.paged_in_bytes, memory.evictions), (Some(2000), Some(5)));
-        assert_eq!((memory.weights_bytes, memory.context_bytes), (Some(500), None));
-        assert_eq!(memory.paged_out, None);
-        assert_eq!(memory.shortfall.unwrap().needed_bytes, 1200);
-        assert!(CallMemory::of(&Frame::default(), &before).is_none());
+        let memory = CallMemory::of(&reply).unwrap();
+        assert_eq!((memory.peak_allocated_bytes, memory.peak_reserved_bytes), (Some(900), Some(1000)));
+        assert_eq!(memory.per_step(), ["h3/dit"]);
+        let kept = serde_json::to_value(&memory).unwrap();
+        let sent = serde_json::to_value(&reply.memory).unwrap();
+        assert_eq!(kept["stats"], sent, "the gate reads the executor's object as it sent it");
+        assert_eq!(kept["stats"]["steps"]["h3/dit"], serde_json::json!([20, 0]));
+        assert_eq!(kept["stats"]["newer"]["kept"], true);
+        assert_eq!(kept["stats"]["rows"][1]["stall_ns"], 7);
+        assert!(CallMemory::of(&Frame::default()).is_none());
     }
 }

@@ -55,6 +55,8 @@ pub struct Config {
     pub grant: Grant,
     /// CUDA_VISIBLE_DEVICES as the launcher set it: indices or UUIDs; empty is no GPU.
     pub visible_devices: Option<String>,
+    /// The most memory each GPU offers (`machine.gpu_memory_limit`).
+    pub gpu_memory_limit: Option<u64>,
     /// The provider's public mapping of this pod's ports, told to the Hub at boot.
     pub endpoint: Option<Endpoint>,
     /// The provider's names, for [`crate::machine::provider::ProviderSelf::take`].
@@ -69,6 +71,13 @@ pub struct Config {
 pub fn load(lifetime: Lifetime) -> io::Result<Config> {
     let loaded = shared::load(shared::Flags::default()).map_err(|e| invalid(&named(&e.message)))?;
     from_loaded(lifetime, loaded, shared::environment())
+}
+
+/// `machine.gpu_memory_limit` as config.toml says it now. The service reads it at each start:
+/// it is forked from a parent that loaded the config before an update wrote the limit.
+pub fn gpu_memory_limit() -> io::Result<Option<u64>> {
+    let loaded = shared::load(shared::Flags::default()).map_err(|e| invalid(&named(&e.message)))?;
+    Ok(loaded.config.machine.gpu_memory_limit)
 }
 
 /// Takes the readiness key out of the environment, so nothing this machine starts inherits it.
@@ -105,6 +114,7 @@ fn from_loaded(lifetime: Lifetime, loaded: Loaded, environment: &BTreeMap<String
     Ok(Config {
         logs: grant.layout.state.join("logs"),
         visible_devices: machine.visible_devices.clone(),
+        gpu_memory_limit: machine.gpu_memory_limit,
         endpoint: rental.then(|| crate::machine::endpoint::from_env(provider.clone())).flatten(),
         provider,
         grant,

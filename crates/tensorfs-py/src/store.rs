@@ -417,8 +417,8 @@ impl PyStore {
 /// tensors (`Checkpoint.parse`), with no chunks to read.
 #[pyclass(name = "Checkpoint", module = "tensorfs", frozen)]
 pub struct PyCheckpoint {
-    header: Header,
-    stored: Option<(Checkpoint, Named)>,
+    pub(crate) header: Header,
+    pub(crate) stored: Option<(Checkpoint, Named)>,
     tensors: OnceLock<Py<PyDict>>,
 }
 
