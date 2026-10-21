@@ -235,6 +235,11 @@ pub enum DeviceCommand {
         actor: String,
         #[serde(skip_serializing_if = "String::is_empty")]
         operation: String,
+        /// The family whose GPUs its calls share (`Execution::family`): while it waits on a
+        /// child call it yields under this name (varena `Request::yielding`), so the child is
+        /// admitted beside it.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        family: String,
     },
     /// Warming: the loaded construction's models are loaded at `level` (`gpu` or `ram`; varena
     /// places them), nothing run.

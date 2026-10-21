@@ -1590,11 +1590,11 @@ impl Pool {
         let leaders = self.leaders.lock().unwrap();
         leaders.values().filter(|(_, p, _)| p.as_str() == plan).map(|(_, _, start)| *start).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
     }
-    /// Whether a call of `plan` fits on every GPU of the lane from `start` now, before its shape
-    /// is known (`fits`). A GPU without a ledger has nothing to refuse it with.
-    fn fits(&self, plan: &str, start: usize, degree: u32) -> bool {
+    /// Whether a call of `plan` in `family` fits on every GPU of the lane from `start` now,
+    /// before its shape is known (`fits`). A GPU without a ledger has nothing to refuse it with.
+    fn fits(&self, plan: &str, start: usize, degree: u32, family: Option<&str>) -> bool {
         let lane = self.lane(start, degree).unwrap_or_default();
-        lane.iter().filter_map(|d| d.memory.as_ref()).all(|m| m.ledger.fits(plan, UNPREPARED))
+        lane.iter().filter_map(|d| d.memory.as_ref()).all(|m| m.ledger.fits(plan, UNPREPARED, family))
     }
     /// Where `plan` runs now, with its lane's call slots: inside its root's `lane` when it has
     /// one, else (a standalone call, or warming with no root) on GPUs no root holds or older
@@ -1621,7 +1621,7 @@ impl Pool {
             .iter()
             .find_map(|start| take(*start, claims))
             .or_else(|| {
-                let fit = |start: &usize| !hosts.contains(start) && self.fits(&plan.construction, *start, plan.degree);
+                let fit = |start: &usize| !hosts.contains(start) && self.fits(&plan.construction, *start, plan.degree, family);
                 starts.clone().filter(fit).find_map(|start| take(start, claims))
             })
             .or_else(|| (hosts.is_empty() || lane.is_some()).then(|| starts.clone().find_map(|start| take(start, claims))).flatten());
@@ -1849,7 +1849,7 @@ impl Pool {
             return Ok("already loaded");
         }
         // A warm member or a prefetch starts only where it fits: it never takes a running call's room.
-        if !self.fits(&plan.construction, start, plan.degree) {
+        if !self.fits(&plan.construction, start, plan.degree, None) {
             return Ok("no GPU room beside the warm set and the running call");
         }
         let born = Mutex::new(vec![]);
@@ -2714,18 +2714,12 @@ impl Pool {
             return Ok(true);
         }
         let prepared = command_ok(prepared)?;
-        // Admitted at its shape, the key its peak is recorded under: room made for it, then on
-        // every GPU of its lane or none, waiting while it does not fit. A child on its family's
-        // own lane is its family's: its parent is blocked on it.
+        // Admitted at its shape, the key its peak is recorded under, on every GPU of its lane or
+        // none, waiting while it does not fit. In its family, a yielded parent's working set is
+        // left out: the parent waits on it.
         let shape = shape(&prepared.features);
         let ledgers: Vec<&varena::Ledger> = gpus.iter().filter_map(|d| d.memory.as_ref()).map(|m| &m.ledger).collect();
-        let admitted = match self.allocations.shared(start..start + degree as usize) {
-            true => {
-                memory::dispatch(&ledgers, id, &construction, &shape);
-                Ok(true)
-            }
-            false => memory::admit(engine, &ledgers, id, &construction, &shape),
-        };
+        let admitted = memory::admit(engine, &ledgers, id, &construction, &shape, record.family());
         let _dispatched = Dispatched { gpus, id: id.into() };
         if !admitted? {
             // Canceled while it waited for room: it never started.
@@ -2774,6 +2768,7 @@ impl Pool {
                 destination: calls.map(|calls| calls.destination(id)).unwrap_or_default(),
                 actor: record.submission.as_ref().map(|submission| submission.actor.clone()).unwrap_or_default(),
                 operation,
+                family: record.family().unwrap_or_default().into(),
                 max_output_bytes: crate::output_capacity::for_callable(document, "entrypoints", &plan.entrypoint)?,
                 request_id: id.into(),
                 construction: construction.clone(),

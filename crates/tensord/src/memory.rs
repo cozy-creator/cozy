@@ -56,15 +56,16 @@ impl Gpu {
     }
 }
 
-/// Admits request `id` at `<package>|<shape>` on every one of `ledgers` or none (`Ledger::admit`,
-/// which names the key its peak is recorded under). Refused, it waits for the engine's activity,
+/// Admits request `id` of `family` at `<package>|<shape>` on every one of `ledgers` or none
+/// (`Ledger::admit`, which names the key its peak is recorded under; a yielded request of the
+/// same family, waiting on this one, is left out). Refused, it waits for the engine's activity,
 /// which every ledger event and every cancel bumps, and asks again: running requests end, and a
 /// GPU nothing runs on always admits. False: it was canceled meanwhile. A ledger that cannot
 /// answer lets it run unrecorded.
-pub fn admit(engine: &Engine, ledgers: &[&Ledger], id: &str, package: &str, shape: &str) -> io::Result<bool> {
+pub fn admit(engine: &Engine, ledgers: &[&Ledger], id: &str, package: &str, shape: &str, family: Option<&str>) -> io::Result<bool> {
     loop {
         let seen = engine.activity_epoch();
-        match Ledger::admit(ledgers, id, package, shape) {
+        match Ledger::admit(ledgers, id, package, shape, family) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
             Err(error) => {
@@ -76,15 +77,6 @@ pub fn admit(engine: &Engine, ledgers: &[&Ledger], id: &str, package: &str, shap
             return Ok(false);
         }
         engine.wait_activity(seen, None);
-    }
-}
-
-/// A child call on its family's lane: admitted under its family's admission, with no `fits`
-/// (its parent is blocked on it), and dispatched under its own key so its peak is recorded.
-/// Should the two compute at once, varena's demand in the executors makes the room.
-pub fn dispatch(ledgers: &[&Ledger], id: &str, package: &str, shape: &str) {
-    if let Err(error) = ledgers.iter().try_for_each(|ledger| ledger.dispatch(id, package, shape)) {
-        tracing::warn!("memory: request {id} runs unrecorded: {error}");
     }
 }
 
