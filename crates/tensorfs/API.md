@@ -76,7 +76,7 @@ store keeps them while that file exists and holds this header; opening a header 
 holds its data the same way, so a moved or copied file is held once it is opened. Otherwise
 local copies expire 7 days after their last use, least recently used first when the disk runs
 low. Open checkpoints keep their bytes in the meantime. To copy a checkpoint to another machine,
-write the portable form with `saved.materialize(dir, Format::Cozytensors, None)`.
+write the portable form with `saved.materialize(dir, Format::Cozytensors, false)`.
 
 `dest` is the exact filename; TensorFS does not append a variant or create a directory.
 `dest` and `repo_id` exclude each other. `variant` names `model.<variant>.cozytensors` in a
@@ -110,7 +110,7 @@ let model: Ref = "me/model@1.0/bf16".parse()?;
 let folder = client.materialize(&model, &Download::default(), None, false).await?;
 println!("downloaded to {}", folder.display());
 
-saved.materialize(Path::new("./portable"), Format::Cozytensors, None).await?;
+saved.materialize(Path::new("./portable"), Format::Cozytensors, false).await?;
 let destination: Ref = "me/output".parse()?;
 let tree = client.upload_folder(&destination, Path::new("./portable"), None).await?;
 println!("published {}", tree.id());
