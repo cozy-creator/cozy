@@ -2,8 +2,11 @@
 //! no model (a script) is given the GPUs it asks for, all in its one process, and a count wider
 //! than the machine is refused by name; a call that ignores its cancel is killed once its
 //! patience is spent, ends CANCELED saying so, and its GPU serves the next run.
+#[path = "common/child.rs"]
+mod child;
 #[path = "common/named_runtime.rs"]
 mod named_runtime;
+use child::BareEnv;
 use ed25519_dalek::{pkcs8::EncodePrivateKey, SigningKey};
 use std::{
     path::Path,
@@ -40,9 +43,8 @@ fn boot(home: &Path) -> (Machine, Client) {
     let mut machine = Machine(
         Command::new(env!("CARGO_BIN_EXE_tensord"))
             .arg("--persistent")
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", home)
+            .bare_env()
+            .user_home(home)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()

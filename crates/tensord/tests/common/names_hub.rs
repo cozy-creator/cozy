@@ -144,7 +144,7 @@ fn publish(store: &Store, models: &[Model], layout: &std::path::Path) -> HashSet
     std::thread::scope(|scope| {
         scope.spawn(|| {
             let client = Client::new(SourcePolicy::default());
-            let endpoint = Endpoint::new(&client, &format!("file://{}", layout.display()), None).unwrap();
+            let endpoint = Endpoint::new(&client, &layout.display().to_string(), None).unwrap();
             for ((repository, release), tree) in &named {
                 let tag = if release.is_empty() { MAIN } else { release };
                 runtime.block_on(upload_tree(&endpoint, repository, tree, store, tag)).unwrap();

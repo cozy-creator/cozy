@@ -63,16 +63,7 @@ impl Cas {
     /// Whether `object` is here; a use renews it.
     pub fn reuse(&self, object: &ObjectRef) -> io::Result<bool> {
         let _gate = GATE.read().unwrap();
-        let file = match File::open(self.path(object)?) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        if file.metadata()?.len() != object.length {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("object {} has another length here", object.id())));
-        }
-        file.set_modified(SystemTime::now())?;
-        Ok(true)
+        self.reuse_held(object)
     }
 
     /// Admits what `src` yields. With `expect`, one already here is reused unread and other
@@ -173,8 +164,12 @@ impl Cas {
 
     /// `reuse` under a gate the caller holds.
     fn reuse_held(&self, object: &ObjectRef) -> io::Result<bool> {
-        match File::open(self.path(object)?) {
-            Ok(file) if file.metadata()?.len() == object.length => file.set_modified(SystemTime::now()).map(|_| true),
+        let path = self.path(object)?;
+        match fs::metadata(&path) {
+            Ok(meta) if meta.len() == object.length => {
+                let now = fs::FileTimes::new().set_modified(SystemTime::now());
+                platform::durable::set_times(&path, now).map(|()| true).map_err(io::Error::from)
+            }
             Ok(_) => Err(io::Error::new(io::ErrorKind::InvalidData, format!("object {} has another length here", object.id()))),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),

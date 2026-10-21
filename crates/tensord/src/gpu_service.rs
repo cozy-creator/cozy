@@ -3758,7 +3758,7 @@ mod tests {
     /// held layout (whole or still filling) is one descriptor; without one, nothing follows.
     #[test]
     fn a_read_grant_answer_is_the_shape_runtime_reads() {
-        let (held, fds) = granted(7, Some(File::open("/dev/null").unwrap()));
+        let (held, fds) = granted(7, Some(tempfile::tempfile().unwrap()));
         assert_eq!(fds.len(), 1);
         assert_eq!(serde_json::to_value(&held).unwrap(), json!({"event": "answer", "seq": 7, "ok": true,
             "code": "", "detail": "", "held": true, "sha256": "", "length": 0, "descriptors": 1}));

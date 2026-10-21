@@ -642,8 +642,8 @@ mod tests {
         };
         let tensorfs = std::env::var_os("COZY_TEST_TENSORFS_WHEEL").map(PathBuf::from).unwrap_or_else(|| {
             let dir = installer.generations.with_file_name("tensorfs-wheel");
-            run(Command::new("python3").args(["-m", "pip", "download", "-q", "--no-deps", "--only-binary=:all:", "--python-version", "3.12",
-                "--platform", "manylinux_2_28_x86_64", "--platform", "manylinux_2_17_x86_64", "-d"]).arg(&dir).arg(requirement(&runtime, "tensorfs")));
+            run(Command::new("python3").args(["-m", "pip", "download", "-q", "--no-deps", "--only-binary=:all:", "--python-version", "3.12", "-d"])
+                .arg(&dir).arg(requirement(&runtime, "tensorfs")));
             fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap()
         });
         let runtime_build = wheel_version(&runtime);
@@ -678,8 +678,8 @@ mod tests {
     fn sdk_pair(root: &Path) -> Vec<PathBuf> {
         let sdk = root.join("sdk");
         let download = |requirement: &str| {
-            run(Command::new("python3").args(["-m", "pip", "download", "-q", "--no-deps", "--only-binary=:all:", "--python-version", "3.12",
-                "--platform", "manylinux_2_28_x86_64", "--platform", "manylinux_2_17_x86_64", "-d"]).arg(&sdk).arg(requirement));
+            run(Command::new("python3").args(["-m", "pip", "download", "-q", "--no-deps", "--only-binary=:all:", "--python-version", "3.12", "-d"])
+                .arg(&sdk).arg(requirement));
         };
         let wheel = |prefix: &str| {
             (fs::read_dir(&sdk).unwrap().map(|entry| entry.unwrap().path()))
