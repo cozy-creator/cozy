@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{Arc, OnceLock},
     thread,
     time::{Duration, Instant},
@@ -57,32 +57,25 @@ impl Drop for Fixture {
 fn lifecycle() -> &'static (PathBuf, String) {
     static INSTALLED: OnceLock<(PathBuf, String)> = OnceLock::new();
     INSTALLED.get_or_init(|| {
-        const INSTALL: &str = r#"
-import json, subprocess, sys
-from pathlib import Path
-from tensord_client.packages import install
-fixture, out = Path(sys.argv[1]), Path(sys.argv[2])
-subprocess.run(["uv", "build", "--wheel", "--out-dir", str(out / "client"), "."], check=True, capture_output=True)
-generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12",
-                     sdk=[Path(wheel) for wheel in sys.argv[3:]])
-print(json.dumps({"identity": generation.identity}))
-"#;
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let out = std::env::temp_dir().join(format!("tensord-durable-lifecycle-{}", uuid::Uuid::new_v4()));
-        let output = Command::new("uv")
-            .current_dir(repo)
-            .args(["run", "--locked", "--extra", "test", "python", "-c", INSTALL])
-            .arg(repo.join("tests/fixtures/cpu_lifecycle"))
-            .arg(&out)
-            // The named Runtime, as a machine runs it.
-            .args(named_runtime::pair())
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let (helper, client) = named_runtime::installer();
+        // The named Runtime, as a machine runs it.
+        let config = tensord::api::install::InstallerConfig {
+            helper_python: helper.clone(),
+            helper_engine: None,
+            python: "3.12".into(),
+            generations: out.join("generations"),
+            client_wheel: client.clone(),
+            staging_root: out.join("staging"),
+            sdk: named_runtime::pair().to_vec(),
+            runtime_build: named_runtime::build(),
+            uv: "uv".into(),
+            seed_cache: None,
+        };
+        let prepared = tensord::api::install::prepare_project(&config, &repo.join("tests/fixtures/cpu_lifecycle"), None).unwrap();
         named_runtime::loaded(&named_runtime::environments(&out.join("generations")), "the lifecycle fixture");
-        let line = String::from_utf8(output.stdout).unwrap();
-        let installed: Value = serde_json::from_str(line.lines().last().unwrap()).unwrap();
-        (out.join("generations"), installed["identity"].as_str().unwrap().into())
+        (out.join("generations"), prepared.record.identity.clone())
     })
 }
 

@@ -102,6 +102,23 @@ pub struct RootSet {
     pub callees: std::collections::BTreeMap<String, String>,
     pub(crate) files: Vec<Carrier>,
 }
+impl RootSet {
+    /// A local package named by its own metadata, carrying nothing: `local/<name>` `release`.
+    pub fn local(name: &str, release: &str) -> Self {
+        Self {
+            operation_id: String::new(),
+            package: format!("local/{name}"),
+            release: release.into(),
+            installation_id: String::new(),
+            python_requires: String::new(),
+            python_version: String::new(),
+            source_archive: String::new(),
+            dependency_requirements: vec![],
+            callees: Default::default(),
+            files: vec![],
+        }
+    }
+}
 pub struct UploadedPackage {
     pub root: RootSet,
     pub files: Vec<UploadedFile>,

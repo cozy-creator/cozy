@@ -140,37 +140,24 @@ fn launch_in(root: &Path, extra: &[std::ffi::OsString], scope: &[&str]) -> (Chil
 }
 
 fn hold_classifier(state: &Path, actor: &str) {
-    const INSTALL: &str = r#"
-import json, subprocess, sys
-from pathlib import Path
-from tensord_client.packages import install
-fixture, out = Path(sys.argv[1]), Path(sys.argv[2])
-subprocess.run(["uv", "build", "--wheel", "--out-dir", str(out / "client"), "."], check=True, capture_output=True)
-generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12",
-                     sdk=[Path(wheel) for wheel in sys.argv[3:]])
-print(json.dumps({"identity": generation.identity}))
-"#;
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     fs::create_dir_all(state).unwrap();
-    let output = Command::new("uv")
-        .current_dir(repo)
-        .args([
-            "run", "--locked", "--extra", "test", "python", "-c", INSTALL,
-        ])
-        .arg(repo.join("tests/fixtures/cpu_classifier"))
-        .arg(state)
-        // The named Runtime, as every machine of this suite runs it.
-        .args(named_runtime::pair())
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let line = String::from_utf8(output.stdout).unwrap();
-    let value: serde_json::Value = serde_json::from_str(line.lines().last().unwrap()).unwrap();
-    let identity = value["identity"].as_str().unwrap();
+    let (helper, client) = named_runtime::installer();
+    // The named Runtime, as every machine of this suite runs it.
+    let config = tensord::api::install::InstallerConfig {
+        helper_python: helper.clone(),
+        helper_engine: None,
+        python: "3.12".into(),
+        generations: state.join("generations"),
+        client_wheel: client.clone(),
+        staging_root: state.join("staging"),
+        sdk: named_runtime::pair().to_vec(),
+        runtime_build: named_runtime::build(),
+        uv: "uv".into(),
+        seed_cache: None,
+    };
+    let prepared = tensord::api::install::prepare_project(&config, &repo.join("tests/fixtures/cpu_classifier"), None).unwrap();
+    let identity = prepared.record.identity.as_str();
     let generation: serde_json::Value = serde_json::from_slice(
         &fs::read(
             state

@@ -261,17 +261,22 @@ pub fn describe_environment(
 
 /// A live project's interface, described from its own directory by the environment's Runtime.
 pub fn describe_project(python: &str, project: &Path) -> Result<Box<RawValue>, Failure> {
+    // A flat record: serde buffers an internally tagged enum, which a RawValue cannot pass.
     #[derive(serde::Deserialize)]
-    #[serde(tag = "kind", rename_all = "snake_case")]
-    enum Reply {
-        Described { interface: Box<RawValue> },
-        DescribeFailed { code: String, detail: String },
+    struct Reply {
+        kind: String,
+        interface: Option<Box<RawValue>>,
+        #[serde(default)]
+        code: String,
+        #[serde(default)]
+        detail: String,
     }
     let request = json!({"kind": "describe", "project": project, "environment_python": python});
     let (stdout, success) = in_environment(python, &request)?;
-    match serde_json::from_slice::<Reply>(&stdout).map_err(undescribed)? {
-        Reply::Described { interface } if success => Ok(interface),
-        Reply::DescribeFailed { code, detail } => Err(("package_prepare_description_failed", format!("{code}: {detail}"))),
+    let reply = serde_json::from_slice::<Reply>(&stdout).map_err(undescribed)?;
+    match (reply.kind.as_str(), reply.interface) {
+        ("described", Some(interface)) if success => Ok(interface),
+        ("describe_failed", _) => Err(("package_prepare_description_failed", format!("{}: {}", reply.code, reply.detail))),
         _ => Err(("package_prepare_description_failed", "project description did not complete".into())),
     }
 }

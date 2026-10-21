@@ -1169,46 +1169,31 @@ mod product_log_tests {
         collections::BTreeMap,
         fs::File,
         path::{Path, PathBuf},
-        process::Command,
     };
 
-    const INSTALL: &str = r#"
-import json, subprocess, sys
-from pathlib import Path
-from tensord_client.packages import install
-fixture, out = Path(sys.argv[1]), Path(sys.argv[2])
-subprocess.run(["uv", "build", "--wheel", "--out-dir", str(out / "client"), "."], check=True, capture_output=True)
-generation = install(fixture, out / "generations", next((out / "client").glob("*.whl")), python="3.12",
-                     sdk=[Path(wheel) for wheel in sys.argv[3:]])
-print(json.dumps({"identity": generation.identity}))
-"#;
-
-    /// A real uv-installed generation of `tests/fixtures/<name>` (released cozy-runtime).
+    /// A real generation of `tests/fixtures/<name>`, installed on the machine's one path.
     fn install_fixture(root: &Path) -> String {
         install_named(root, "cpu_publish")
     }
     fn install_named(root: &Path, name: &str) -> String {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let output = Command::new("uv")
-            .current_dir(repo)
-            .args([
-                "run", "--locked", "--extra", "test", "python", "-c", INSTALL,
-            ])
-            .arg(repo.join("tests/fixtures").join(name))
-            .arg(root)
-            // The named Runtime, as a machine runs it.
-            .args(named_runtime::pair())
-            .output()
-            .expect("uv runs the repository's installer");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let (helper, client) = named_runtime::installer();
+        // The named Runtime, as a machine runs it.
+        let config = crate::api::install::InstallerConfig {
+            helper_python: helper.clone(),
+            helper_engine: None,
+            python: "3.12".into(),
+            generations: root.join("generations"),
+            client_wheel: client.clone(),
+            staging_root: root.join("staging"),
+            sdk: named_runtime::pair().to_vec(),
+            runtime_build: named_runtime::build(),
+            uv: "uv".into(),
+            seed_cache: None,
+        };
+        let prepared = crate::api::install::prepare_project(&config, &repo.join("tests/fixtures").join(name), None).unwrap();
         named_runtime::loaded(&named_runtime::environments(&root.join("generations")), name);
-        let line = String::from_utf8(output.stdout).unwrap();
-        let value: Value = serde_json::from_str(line.lines().last().unwrap()).unwrap();
-        value["identity"].as_str().unwrap().to_owned()
+        prepared.record.identity.clone()
     }
 
     struct Publisher<'a> {

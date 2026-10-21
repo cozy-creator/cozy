@@ -159,6 +159,29 @@ pub fn prepare_uploaded(
     prepare(config, &materialized.root_set, &capture, None, stop)
 }
 
+/// A project directory on this disk installed as a local package (`local/<name>`, as its
+/// pyproject names it) on the one path an uploaded source takes: what a tool or a test holding
+/// the project takes.
+pub fn prepare_project(config: &InstallerConfig, project: &Path, stop: Option<&Stop>) -> Result<PreparedGeneration, Error> {
+    #[derive(Deserialize)]
+    struct Pyproject {
+        project: Declared,
+    }
+    #[derive(Deserialize)]
+    struct Declared {
+        name: String,
+        version: String,
+    }
+    let text = fs::read_to_string(project.join("pyproject.toml")).map_err(storage)?;
+    let declared = toml::from_str::<Pyproject>(&text)
+        .map_err(|e| Error::validation("invalid_request", format!("{}: {e}", project.display())))?
+        .project;
+    let capture = |command: &mut Command| {
+        command.arg("--project").arg(project);
+    };
+    prepare(config, &RootSet::local(&declared.name, &declared.version), &capture, None, stop)
+}
+
 /// A live project installed editable in `environment`, which is built when it is not there
 /// yet: the generation it publishes describes the project now and runs in that environment.
 #[allow(clippy::too_many_arguments)]

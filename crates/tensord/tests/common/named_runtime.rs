@@ -112,3 +112,29 @@ pub fn environments(generations: &Path) -> Vec<PathBuf> {
         .filter(|python| python.exists())
         .collect()
 }
+
+/// The development Runtime the named pair is, as an update's `--runtime-wheel` names it
+/// (`runtime_build`): the operator's choice runs whatever a fixture's bounds. "" with none named.
+pub fn build() -> String {
+    named().map(|(version, _)| version.clone()).unwrap_or_default()
+}
+
+/// What a test's local installs run with: the repository's helper interpreter (the client and
+/// the test extras, `uv run --locked --extra test`) and the machine client wheel, built once.
+pub fn installer() -> &'static (PathBuf, PathBuf) {
+    static INSTALLER: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+    INSTALLER.get_or_init(|| {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let run = |command: &mut Command| {
+            let out = command.current_dir(repo).output().unwrap();
+            assert!(out.status.success(), "{command:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        let helper = run(Command::new("uv").args(["run", "--locked", "--extra", "test", "python", "-c", "import sys; print(sys.executable)"]));
+        let out = std::env::temp_dir().join(format!("tensord-client-{}", std::process::id()));
+        run(Command::new("uv").args(["build", "--wheel", "--out-dir"]).arg(&out));
+        let client = std::fs::read_dir(&out).unwrap().flatten().map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "whl")).unwrap();
+        (PathBuf::from(helper.lines().last().unwrap()), client)
+    })
+}
