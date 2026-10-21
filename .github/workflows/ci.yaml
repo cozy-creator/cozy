@@ -52,5 +52,5 @@ jobs:
     secrets: inherit
     with:
       # Hub v0.33.0 (tags and the class record) and the Runtime above, until they are released.
-      tensorhub_ref: d061bd66c5a87a1c704a8be3094a14c2cf6101c2
+      tensorhub_ref: e0c6592f6aacb4c0a18369c6a9060ee1da3d873d
       runtime_ref: e3feaa744f31baf8e7a67e55dcbe2dd09ef52111
