@@ -382,7 +382,8 @@ class Model:
         self.flight, self.aloft, self.held = 0, False, 0
         #: passes in its last request (this one's so far, if more)
         self.repeats = self.last_use = self.steps = self.peak = self.base = 0
-        self.planned = -1
+        #: the epochs of its latest plan and of a request whose first pass ran unmeasured
+        self.planned = self.rose = -1
         self.filled: Hashable | None = None
         #: torch bytes its passes allocated above their start in its last request; -1 unmeasured
         self.reserve = -1
@@ -720,11 +721,13 @@ class Memory:
                 self._evict(model, "refill", 0)
             model.filled = version
 
-    def _plan(self, model: Model) -> None:
+    def _plan(self, model: Model, measured: bool = False) -> None:
         """The watermark as a pass starts, from the measured reserve: a repeating model wholly at
         home if it fits beside its reserve and the idle bytes and cold weights worth less, else a
-        spread set; one run once takes only free room. Unmeasured, a repeating model stays at
-        home and one run once keeps only what is resident. Within a request it never rises.
+        spread set; one run once takes free room and what idle tenants give back on an ask.
+        Unmeasured, a repeating model stays at home and one run once keeps only what is resident.
+        Within a request it never rises, but once in a cold request: planned from the reserve
+        its first pass `measured` (12666: an idle executor's 16.3 GB, a DiT streamed whole).
         Planning cuts only FFN tokens, to the fewest pieces that make a repeating model wholly
         resident (`cuts.planned`), else as far as each doubling brings a block home; the rest
         streams. Other cuts in force relax (`cuts.coarser`) whenever the peak the relaxed pass
@@ -734,17 +737,19 @@ class Memory:
         repeating = model.repeats >= 2
         if not model.blocks or (model.reserve < 0 and repeating):
             return
+        others = 0
         if model.reserve < 0:
             want = {b for b in model.home if _resident(model, b)}
+            model.rose = self.epoch  # unmeasured: its first measured plan may still rise
         else:
             spare = self.core.stats()  # type: ignore[union-attr]
             terms = {"free": self.available(), "idle": spare.idle, "slots": spare.slot_bytes}
             terms["own"] = _set(model)[0] - model.common.nbytes
-            if repeating:  # and what idle tenants give back on an ask
+            if repeating:  # and its own cold weights worth less
                 keep = self._keep(model)
                 cold = (m for m in self.models.values() if self._victim(m))
                 terms["cold"] = sum(_set(m)[0] for m in cold if self._keep(m) < keep)
-                terms["others"] = self._others()
+            terms["others"] = others = self._others()  # what idle tenants give back on an ask
             room = sum(terms.values()) - model.slack  # the allocator's, not the weights'
             sizes = _sizes(model)
             shape, whole = model.track.shape, sum(sizes)
@@ -775,14 +780,19 @@ class Memory:
                 fits = whole <= room
             slots = _SLOTS * max(sizes)  # all of the core's: two left a bind short of its third
             want = set(model.order if fits else _spread(model.order, sizes, room - slots))
-        if self.active:
+        if self.active and not (measured and model.rose == self.epoch):
             want &= model.home
+        if model.reserve >= 0:
+            model.rose = -1  # one rise a request at most
         self._set_home(model, want, "plan", 4)
         if model.reserve >= 0:
             owed = sum(model.blocks[b].nbytes for b in model.home if not _resident(model, b))
             slots = _SLOTS * max(_sizes(model)) if len(model.home) < len(model.blocks) else 0
             need = model.reserve + model.slack + owed + slots
             if self.available() < need:
+                # what it counted on from idle tenants first, not its own pages (12666: the DiT
+                # streamed 20.7 GB a step beside an idle executor that could give 16.3 GB)
+                self._ask(self._free() + min(others, need - self.available()))
                 self._free_upto(need, "plan")
 
     # -- blocks
@@ -887,7 +897,7 @@ class Memory:
                 model.reserve = shape.peak
             if moved or model.planned != self.epoch:
                 model.planned = self.epoch
-                self._plan(model)
+                self._plan(model, moved)
             model.demands = self.demands
         model.seen[block.index] = None
 
