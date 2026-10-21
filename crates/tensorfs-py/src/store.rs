@@ -945,26 +945,6 @@ impl PyCheckpoint {
     }
 }
 
-/// Groups `ck`'s tensors into `<component>/<key>` regions for a weight plane: tensors sharing a
-/// chunk stay together, and neighbours merge while their chunks total at most `max_bytes`,
-/// never across a `<component>/<key prefix>` boundary (a block) unless a shared chunk does.
-/// `only` limits the work and the result to the tensors a load wants.
-#[pyfunction]
-#[pyo3(signature = (ck, max_bytes = 64 << 20, boundaries = None, only = None))]
-pub(crate) fn regions(
-    ck: &PyCheckpoint,
-    max_bytes: u64,
-    boundaries: Option<Vec<String>>,
-    only: Option<Vec<String>>,
-) -> Vec<Vec<String>> {
-    tensorfs::raw::regions(
-        &ck.header,
-        max_bytes,
-        &boundaries.unwrap_or_default(),
-        &only.unwrap_or_default(),
-    )
-}
-
 // ---------------------------------------------------------------- arrays
 
 /// Bytes on a page boundary: aligned for every dtype, and an O_DIRECT read lands in place.

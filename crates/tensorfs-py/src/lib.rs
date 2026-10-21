@@ -3,8 +3,6 @@
 
 mod cleanup;
 mod errors;
-#[cfg_attr(windows, path = "varena_windows.rs")]
-mod varena;
 #[cfg(feature = "store")]
 mod classref;
 #[cfg(feature = "store")]
@@ -21,6 +19,8 @@ mod dlpack_source;
 mod verification;
 #[cfg(feature = "store")]
 mod resident_decode;
+#[cfg(feature = "store")]
+mod varena;
 
 use pyo3::prelude::*;
 
@@ -45,5 +45,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     store::install(m)?;
     #[cfg(feature = "store")]
     credentials::install(m)?;
-    varena::install(m)
+    #[cfg(feature = "store")]
+    varena::install(m)?;
+    Ok(())
 }
