@@ -142,12 +142,6 @@ impl CudaBackend {
         })
     }
 
-    /// This process's context as `open` measured it: the device's used bytes across making it.
-    /// Where the driver has no per-process numbers, the context is this and grows by nothing the
-    /// backend can see.
-    pub fn opened_context(&self) -> u64 {
-        self.context
-    }
 
     pub fn ordinal(&self) -> i32 {
         self.ordinal
@@ -224,6 +218,12 @@ impl Backend for CudaBackend {
             code: -1,
             name: "the driver names no process of ours (WDDM, or another pid namespace)".into(),
         })
+    }
+
+    /// The device's used bytes `open` measured across making the context (0 when a framework
+    /// made it first): the context where the driver has no per-process numbers.
+    fn opened_context(&self) -> u64 {
+        self.context
     }
 
     fn granularity(&self) -> u64 {
