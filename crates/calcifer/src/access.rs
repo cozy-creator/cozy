@@ -687,6 +687,7 @@ mod tests {
                     warnings: vec![],
                     inputs: vec![],
                     wants: None,
+                    agreed: None,
                 },
             )
             .unwrap();
@@ -796,6 +797,7 @@ mod tests {
                     warnings: vec![],
                     inputs: vec![],
                     wants: None,
+                    agreed: None,
                 },
             )
             .unwrap();
@@ -978,6 +980,7 @@ mod tests {
                     warnings: vec![],
                     inputs: vec![],
                     wants: None,
+                    agreed: None,
                 },
             )
             .unwrap();
