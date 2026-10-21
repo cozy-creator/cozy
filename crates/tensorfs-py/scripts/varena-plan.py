@@ -9,7 +9,8 @@ kernel's first launch takes device bytes outside torch (lazy module loading, run
 
 H3 ref2va_turbo 5 s runs with its declared plan, cold then warm, at the sizes of runs
 11951-11955 and 12122 on RTX 4090s: 24 GiB on one GPU; an 8 GiB limit on the 24 GiB card with a gone
-executor's kept pages over the limit (11955). 8 GiB at 2 GPUs is one such memory per GPU.
+executor's kept pages over the limit (11955). 8 GiB at 2 GPUs is one such memory per GPU. Card G
+(12288) at its measured sizes, where the int8 DiT cannot be wholly resident.
 
 Each request must complete, and: no restore evicts a page with a declared use; no prefetch
 refills a step after demand made room in it; no region comes back twice in a step; the bytes
@@ -71,9 +72,11 @@ def check(name: str, ok: object, detail: object = "") -> None:
 class Card:
     """One GPU: the driver's free count and torch's caching allocator."""
 
-    def __init__(self, total: int, context: int) -> None:
+    def __init__(self, total: int, context: int, slack: int = 0) -> None:
         self.total, self.context, self.foreign, self.mapped = total, context, 0, 0
-        self.reserved = self.allocated = self.peak = 0
+        self.reserved = self.allocated = self.peak = self.held = 0
+        #: what the allocator holds beyond its allocations (its rounding and splits)
+        self.slack = slack
         self.cap, self.loaded = total, set()
         self.core: Core | None = None
 
@@ -81,12 +84,12 @@ class Card:
         return max(self.total - self.context - self.foreign - self.mapped - self.reserved, 0)
 
     def malloc(self, n: int) -> None:
-        grow = max(self.allocated + n - self.reserved, 0)
+        grow = max(self.allocated + n + self.slack - self.reserved, 0)
         if grow and (grow > self.free() or self.reserved + grow > self.cap):
             raise torch.OutOfMemoryError(f"CUDA out of memory. Tried to allocate {n / MIB:.2f} MiB")
         self.reserved += grow
         self.allocated += n
-        self.peak = max(self.peak, self.allocated)
+        self.peak, self.held = max(self.peak, self.allocated), max(self.held, self.reserved)
 
     def launch(self, kernel: str) -> None:
         """A kernel's first launch maps its module: device bytes no allocator sees."""
@@ -119,8 +122,8 @@ def fake_cuda() -> None:
     c.mem_get_info = lambda *_: (CARD.free(), CARD.total)
     c.memory_reserved = lambda *_: CARD.reserved
     c.memory_allocated = lambda *_: CARD.allocated
-    c.max_memory_allocated = lambda *_: CARD.peak
-    c.reset_peak_memory_stats = lambda *_: setattr(CARD, "peak", CARD.allocated)
+    c.max_memory_allocated, c.max_memory_reserved = lambda *_: CARD.peak, lambda *_: CARD.held
+    c.reset_peak_memory_stats = lambda *_: vars(CARD).update(peak=CARD.allocated, held=CARD.reserved)
     c.empty_cache = lambda: setattr(CARD, "reserved", CARD.allocated)
     c.set_per_process_memory_fraction = lambda f, *_: setattr(CARD, "cap", int(f * CARD.total))
     c.current_stream = lambda *_: STREAM
@@ -359,16 +362,17 @@ FeedForward.__module__ = "diffusers.models.attention"
 
 
 class FFN(FeedForward):
-    """An FFN that holds its projection's output and its activation at once, per token."""
+    """An FFN that holds its projection's output and its activation at once, per token, or
+    `live` bytes a token as measured."""
 
-    def __init__(self, proj: int, inner: int, out: int) -> None:
+    def __init__(self, proj: int, inner: int, out: int, live: int = 0) -> None:
         super().__init__()
-        self.proj, self.out = nn.Module(), nn.Module()
+        self.proj, self.out, self.live = nn.Module(), nn.Module(), live
         self.proj.out_features, self.out.in_features, self.out.out_features = proj, inner, out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        width = self.proj.out_features + self.out.in_features
-        n = width * x.element_size() * (x.numel() // x.shape[-1])
+        width = self.live or (self.proj.out_features + self.out.in_features) * x.element_size()
+        n = width * (x.numel() // x.shape[-1])
         torch.ops.varenaplan.alloc(n, device=torch.device("cuda", 0))
         CARD.allocated -= n
         return x
@@ -639,8 +643,44 @@ def failure(name: str, mem: vt.Memory, core: Core, models: dict[str, vt.Model]) 
             check(f"{name} after {label}: the next request completes", False, exc)
 
 
+def card_g() -> None:
+    """Card G (12288): a 4090 where H3's int8 DiT cannot be wholly resident (52 blocks, 21.1 GB,
+    beside a 5.14 GB peak the allocator holds 1.38 GB more for, 12415; an FFN cut frees 33.8 kB
+    a token, a third of its units). Warm at prompts 2 and 4 tokens longer than cold, with no
+    out-of-memory retry, each DiT pass after its first reads at most what its uncut peak, the
+    allocator's slack and the streaming slots leave no room for, plus two blocks."""
+    global STATE, DIT_FFN
+    saved = dict(SIZES), STATE, DIT_FFN
+    SIZES.update(transformer_ref=(37_594_240, 406_847_488, 52, 3_790_000_000))
+    SIZES.update(ref2va_turbo=(799_014_912, 0, 0, 0))
+    STATE, DIT_FFN = 914_167_808, (*DIT_FFN, 33_836)
+    try:
+        card = Card(25_757_220_864, 1_111_000_000, 1_380_000_000)  # context 0.52 GB, another's 0.60
+        mem, _, models = build(card, None, 0, False)
+        dit = models["transformer_ref"]
+        block = SIZES["transformer_ref"][1]
+        h3(mem, models, "card G cold", dit=39_806)
+        for tokens in (39_808, 39_810):
+            label, retries = f"card G warm at {tokens} DiT tokens", mem.memo.retries
+            passes = [s for s in h3(mem, models, label, dit=tokens).steps if s.model == dit.name]
+            check(f"{label}: no out-of-memory retry", mem.memo.retries == retries, mem.memo.retries - retries)
+            peak = SIZES["transformer_ref"][3] + DIT_FFN[3] * tokens  # uncut
+            most = max(s.paged_in + s.streamed for s in passes[1:])
+            room = card.total - card.context - card.slack - STATE - SIZES["ref2va_turbo"][0] - peak
+            floor = dit.nbytes - room + vt._SLOTS * block
+            check(f"{label}: each later pass reads {most / 1e9:.2f} GB, at most the "
+                  f"{floor / 1e9:.2f} GB its uncut peak leaves out and two blocks", most <= floor + 2 * block)
+    except Exception as exc:  # noqa: BLE001
+        check("card G: completes", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        SIZES.clear()
+        SIZES.update(saved[0])
+        STATE, DIT_FFN = saved[1:]
+
+
 def main() -> int:
     fake_cuda()
+    card_g()
     card = 25_757_220_864  # an RTX 4090 (11951-11955)
     case("24 GiB", Card(card, GIB // 2), None)
     case("8 GiB", Card(card, GIB // 2), 8 * GIB)

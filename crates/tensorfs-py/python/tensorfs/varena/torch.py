@@ -382,6 +382,8 @@ class Model:
         self.filled: Hashable | None = None
         #: torch bytes its passes allocated above their start in its last request; -1 unmeasured
         self.reserve = -1
+        #: what torch's allocator held beyond the allocated peak in its latest uncut pass
+        self.slack = 0
         self.mark = (0, 0, 0)
         #: `Memory.demands` as its pass started
         self.demands = 0
@@ -723,10 +725,10 @@ class Memory:
         home and one run once keeps only what is resident. Within a request it never rises.
         Planning cuts only FFN tokens, to the fewest pieces that make a repeating model wholly
         resident (`cuts.planned`), else as far as each doubling brings a block home; the rest
-        streams. Other cuts in force relax (`cuts.coarser`)
-        whenever the peak the relaxed pass needs (its peak measured uncut, else twice the cut
-        one) still leaves the model two streaming slots, and any cut whose peak is no lower
-        than whole goes. Measured, a pass's working set gets its room before it runs."""
+        streams. Other cuts in force relax (`cuts.coarser`) whenever the peak the relaxed pass
+        needs (`cuts.relaxing`) still leaves the model two streaming slots, and any cut whose
+        peak is no lower than whole goes. Measured, a pass's working set gets its room before
+        it runs."""
         repeating = model.repeats >= 2
         if not model.blocks or (model.reserve < 0 and repeating):
             return
@@ -741,7 +743,7 @@ class Memory:
                 cold = (m for m in self.models.values() if self._victim(m))
                 terms["cold"] = sum(_set(m)[0] for m in cold if self._keep(m) < keep)
                 terms["others"] = self._others()
-            room = sum(terms.values())
+            room = sum(terms.values()) - model.slack  # the allocator's, not the weights'
             sizes = _sizes(model)
             shape, whole = model.track.shape, sum(sizes)
             need = cuts.relaxing(shape, model.reserve)  # a cut no lower than whole goes for good
@@ -759,22 +761,27 @@ class Memory:
             fits = whole <= room
             if not fits and repeating:
                 saved = cuts.planned(shape, whole - room, max(sizes))
-                ffn = sum(v * shape.scopes[k][0] for k, v in shape.units.items()) if shape else 0
+                ffn = max(  # the most one FFN scope's cut saves (`cuts.planned`'s bound)
+                    (v * shape.scopes[k][0] for k, v in shape.units.items()), default=0
+                ) if shape else 0
                 mapped, context = spare.mapped, self.context  # what the room leaves out
                 self.noted(4, f"{model.component} short {whole - room} B of resident, "
                            f"ffn cut saves {saved}: {terms} reserve {model.reserve} "
-                           f"ffn {ffn} mapped {mapped} context {context}", 0)
+                           f"slack {model.slack} ffn {ffn} mapped {mapped} context {context}"
+                           f"{self._beside()}", 0)
                 model.reserve, room = model.reserve - saved, room + saved
                 fits = whole <= room
-            want = set(model.order if fits else _spread(model.order, sizes, room - 2 * max(sizes)))
+            slots = _SLOTS * max(sizes)  # all of the core's: two left a bind short of its third
+            want = set(model.order if fits else _spread(model.order, sizes, room - slots))
         if self.active:
             want &= model.home
         self._set_home(model, want, "plan", 4)
         if model.reserve >= 0:
             owed = sum(model.blocks[b].nbytes for b in model.home if not _resident(model, b))
             slots = _SLOTS * max(_sizes(model)) if len(model.home) < len(model.blocks) else 0
-            if self.available() < model.reserve + owed + slots:
-                self._free_upto(model.reserve + owed + slots, "plan")
+            need = model.reserve + model.slack + owed + slots
+            if self.available() < need:
+                self._free_upto(need, "plan")
 
     # -- blocks
 
@@ -891,7 +898,11 @@ class Memory:
         (last_paged, last_streamed, last_stall), model.mark = model.mark, (paged, streamed, stall)
         activations = max(torch.cuda.max_memory_allocated(model.device) - model.base, 0)
         model.peak = max(model.peak, activations)
-        cuts.peaked(model.track, activations)
+        # an uncut pass: what torch held beyond its allocated peak is the allocator's slack, which
+        # planning leaves free (planned without it, H3's 24 GB warm steps ran 3-5 s slower, 12388)
+        if cuts.peaked(model.track, activations):
+            held = torch.cuda.max_memory_reserved(model.device) - model.base
+            model.slack = max(held - activations, 0)
         home = model.home_bytes()
         moved = (paged - last_paged, streamed - last_streamed, stall - last_stall)
         step = Step(
@@ -1011,6 +1022,20 @@ class Memory:
         table, row = self.row
         idle = (f for f in table.snapshot() if f.state == "live" and f.slot != row.id)
         return sum(f.reclaimable for f in idle if not f.running)
+
+    def _beside(self) -> str:
+        """What each other live row keeps from an ask: its context, weights in use, and torch's
+        bytes beyond its caches (12586: an idle executor gave 4.9 of its 16.2 GB)."""
+        if self.row is None:
+            return ""
+        table, row = self.row
+        rows = [f for f in table.snapshot() if f.state == "live" and f.slot != row.id]
+        return "".join(
+            f"; pid {f.pid} {'running' if f.running else 'idle'} held {f.held} gives "
+            f"{f.reclaimable}, keeps context {f.context} in use {f.resident - min(f.cold, f.resident)} "
+            f"torch {max(f.torch_allocated - f.cache, f.active_peak)}"
+            for f in rows
+        )
 
     def _landed(self, model: Model) -> None:
         """Demand outranks a prefetch: copies still landing hold pages no eviction may take, so
@@ -1305,13 +1330,13 @@ class Memory:
         return freed
 
     def _set_home(self, model: Model, want: set[int], why: str, rung: int) -> int:
-        gone = model.home - want
-        if want == model.home:
-            return 0
-        model.home = set(want)
-        model.ws.home(_home_regions(model))
+        if want != model.home:
+            model.home = set(want)
+            model.ws.home(_home_regions(model))
+        gone = [b for b in model.order if b not in want and _resident(model, b)]
         if not gone:
             return 0
+        self._landed(model)
         freed = int(model.ws.evict([r for b in gone for r in model.blocks[b].regions]))
         if freed:
             self._evicted(model, rung, why, freed)
@@ -1554,13 +1579,14 @@ class Memory:
 
     def _need(self, model: Model) -> int:
         """Torch bytes a pass of `model` takes above its start: the running shape's measured
-        peak, else its last measured one; -1 never measured (a model without blocks has none)."""
+        peak, else its last measured one, and the allocator's slack; -1 never measured (a model
+        without blocks has none)."""
         shape = model.track.shape
         if not model.blocks:
             return 0
         if model.flight and shape is not None:
-            return shape.peak
-        return max(model.reserve, model.peak) if model.steps else -1
+            return shape.peak + model.slack if shape.peak >= 0 else -1
+        return max(model.reserve, model.peak) + model.slack if model.steps else -1
 
     def _names(self, step: frozenset[object]) -> tuple[str, ...]:
         """A plan step's models by component name, as declared when none is loaded."""

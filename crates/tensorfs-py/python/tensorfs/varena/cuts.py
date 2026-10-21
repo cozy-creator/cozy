@@ -42,6 +42,10 @@ Attention: TypeAlias = "Callable[[Tensor, Tensor, Tensor, Tensor | None], Tensor
 #: Free bytes a retry asks beyond the failed allocation: the allocator's rounding, a workspace.
 SLACK = 64 << 20
 _ALLOCATE = re.compile(r"Tried to allocate ([\d.]+) (B|KiB|MiB|GiB|TiB)")
+#: a device allocation failure in the words of torch, the driver, Triton ("Triton Error [CUDA]: out
+#: of memory", 12586) or a CUDA library
+_REFUSED = ("CUDA error: out of memory", "CUDA driver error: out of memory", "[CUDA]: out of memory",
+            "_ALLOC_FAILED")
 _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40}
 #: diffusers' token-wise feed-forwards and the activation projections inside them
 _FFN = frozenset({"FeedForward", "GELU", "GEGLU", "SwiGLU", "ApproximateGELU", "LinearActivation"})
@@ -110,6 +114,8 @@ class Shape:
     )
     #: an FFN cut's bytes per token no longer live at once when it runs in pieces (`planned`)
     units: dict[tuple[object, ...], int] = field(default_factory=dict)
+    #: its latest pass with one FFN cut in force: its scope, tokens no longer live, peak
+    cut: tuple[tuple[object, ...], int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,23 +206,35 @@ def shape_of(args: Args, kwargs: Kwargs) -> str:
     return ", ".join(f"{str(t.dtype).removeprefix('torch.')}{list(t.shape)}" for t in tensors)
 
 
-def peaked(track: Track, nbytes: int) -> None:
-    if track.shape is not None:
-        track.shape.peak = nbytes
-        if not _cut(track.shape):
-            track.shape.whole = nbytes
+def peaked(track: Track, nbytes: int) -> bool:
+    """A pass's allocated peak; True when it ran uncut. A shape's whole and one-FFN-cut peaks
+    bound that FFN's bytes per token by what the cut measured to free: its units count every
+    width it holds, and H3's int8 DiT freed 29 kB a token where they said 75 (12282)."""
+    shape = track.shape
+    if shape is None:
+        return False
+    shape.peak, cut = nbytes, _cuts(shape)
+    if not cut:
+        shape.whole = nbytes
+    elif len(cut) == 1 and next(iter(cut))[0] == "ffn":
+        ((key, (total, size)),) = cut.items()
+        shape.cut = (key, total - size, nbytes)
+    if shape.whole >= 0 and shape.cut is not None:
+        key, freed, peak = shape.cut
+        shape.units[key] = min(shape.units[key], max(shape.whole - peak, 0) // freed)
+    return not cut
 
 
-def _cut(shape: Shape) -> bool:
-    memo = _served.memo
-    return any(memo.sizes.get(k, t) < t for k, (t, _, _) in shape.scopes.items())
+def _cuts(shape: Shape) -> dict[tuple[object, ...], tuple[int, int]]:
+    """Its scopes cut in force: their totals and sizes."""
+    sizes = _served.memo.sizes
+    found = {k: (t, min(sizes.get(k, t), t)) for k, (t, _, _) in shape.scopes.items()}
+    return {k: (t, s) for k, (t, s) in found.items() if s < t}
 
 
 def ffn_only(shape: Shape | None) -> bool:
     """Every cut of `shape` in force is an FFN's (planning's own kind)."""
-    memo = _served.memo
-    scopes = shape.scopes.items() if shape is not None else ()
-    cut = [k for k, (t, _, _) in scopes if memo.sizes.get(k, t) < t]
+    cut = _cuts(shape) if shape is not None else {}
     return bool(cut) and all(k[0] == "ffn" for k in cut)
 
 
@@ -239,7 +257,7 @@ def short(exc: BaseException, first: bool = False) -> int | None:
     text = str(exc)
     if isinstance(exc, torch.AcceleratorError):
         return 0 if getattr(exc, "error_code", None) == 2 or "out of memory" in text else None
-    failed = "CUDA error: out of memory" in text or "_ALLOC_FAILED" in text
+    failed = any(mark in text for mark in _REFUSED)
     failed |= first and ("CUBLAS_STATUS_" in text or "CUDNN_STATUS_" in text)
     return 0 if isinstance(exc, RuntimeError) and failed else None
 
@@ -330,6 +348,13 @@ def _settle(
     return size, out
 
 
+def launch[T](device: torch.device, name: str, run: Callable[[], T]) -> T:
+    """A launch torch's dispatch never sees (a Triton kernel's): out of memory it did not run, so
+    it runs again as an op does, with room made (rungs 1-2, other processes asked), then after
+    rung 4 while that makes room (12586: a glue kernel on a full GPU, after a collective)."""
+    return _settle(lambda _: run(), 1, 1, int, device, name)[1]
+
+
 def planned(shape: Shape | None, short: int, block: int) -> int:
     """Planning's one cut: FFN tokens, never attention. The widest FFN scope of `shape` (its
     bytes per token over its tokens) goes to the fewest pieces whose saving (those bytes over
@@ -365,23 +390,36 @@ def planned(shape: Shape | None, short: int, block: int) -> int:
 
 def relaxing(shape: Shape | None, peak: int) -> int | None:
     """What a pass of `shape` needs with its cuts relaxed (`coarser`): its peak measured uncut,
-    when one was, else twice `peak` (one step at most doubles it); None when none is cut."""
-    if shape is None or not _cut(shape):
+    when one was, else `peak` plus each FFN cut's bytes per token over the tokens relaxing makes
+    live at once, or twice `peak` (one step at most doubles it) when a cut has no such unit;
+    None when none is cut."""
+    if shape is None or not (cut := _cuts(shape)):
         return None
-    return shape.whole if shape.whole >= 0 else 2 * peak
+    if shape.whole >= 0:
+        return shape.whole
+    if any(k not in shape.units for k in cut):
+        return 2 * peak
+    return peak + sum(shape.units[k] * (_coarser(t, s) - s) for k, (t, s) in cut.items())
 
 
 def coarser(shape: Shape) -> None:
     """Relaxation (the planner's): a shape's cuts go back to whole when it ran uncut before,
     else one step toward it, half as many pieces (a floor-halved size doubles back to whole
-    exactly); its peak waits to be measured again."""
+    exactly); its peak waits to be measured again. Whole forgets the size: a remembered token
+    count would cut a later shape a few tokens longer (12288: 39806 of 39808)."""
     memo = _served.memo
-    for key, (total, _, _) in shape.scopes.items():
-        size = min(memo.sizes.get(key, total), total)
-        if size < total:
-            pieces = 1 if shape.whole >= 0 else (-(-total // size) + 1) // 2
-            memo.sizes[key] = -(-total // max(pieces, 1))
+    for key, (total, size) in _cuts(shape).items():
+        relaxed = total if shape.whole >= 0 else _coarser(total, size)
+        if relaxed < total:
+            memo.sizes[key] = relaxed
+        else:
+            memo.sizes.pop(key, None)
     shape.peak, shape.cuts = -1, {}
+
+
+def _coarser(total: int, size: int) -> int:
+    """One relaxation step: half as many pieces, rounding up."""
+    return -(-total // max((-(-total // size) + 1) // 2, 1))
 
 
 def _halve(align: int, size: int) -> int:
@@ -1079,7 +1117,7 @@ def _ffn(kind: str, width: int, forward: Callable[..., object]) -> Callable[...,
         per_token, device = max(width, x.shape[-1]) * x.element_size(), x.device
         site = _local.site
         if site is not None and site.track.shape is not None:
-            site.track.shape.units[key] = per_token
+            site.track.shape.units.setdefault(key, per_token)  # `peaked` may have measured less
 
         def shrink(size: int) -> int:  # half, or the tokens the room holds; the memo keeps it,
             return min(size // 2, _served.rungs.available(device) // per_token or size)  # not x
