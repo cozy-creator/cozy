@@ -356,8 +356,10 @@ def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tup
     return reference, spans, stats.peak - sum(spans), base, weakref.ref(mem)
 
 
-def two(ck: tensorfs.Checkpoint, store: Path, table: str, capacity: int, reference: list[torch.Tensor]) -> weakref.ref[Memory]:
-    """Two processes on one table, the idle first making room for the second."""
+def two(ck: tensorfs.Checkpoint, store: Path, table: str, capacity: int, reference: list[torch.Tensor]) -> tuple[int, weakref.ref[Memory]]:
+    """Two processes on one table, the idle first making room for the second. Returns the
+    working set varena measured for the model's step (its weights, torch's bytes at the pass's
+    start and its room) and the memory."""
     saved = store.parent / "reference.pt"
     torch.save(reference, saved)  # the child runs two passes: its run blocks have a declared later use
     mem = opened(table, capacity)
@@ -370,7 +372,7 @@ def two(ck: tensorfs.Checkpoint, store: Path, table: str, capacity: int, referen
     check("two processes: the second completes beside the idle first", done.returncode == 0, done.returncode)
     stats, _ = run(mem, unet, reference[:1], "first again", SAME)
     check("two processes: the first gave room and reads again", any(r.origin != "hit" for r in stats.trace), [r.origin for r in stats.trace])
-    return weakref.ref(mem)
+    return stats.steps[0].w, weakref.ref(mem)
 
 
 def capped(ck: tensorfs.Checkpoint, table: str, capacity: int, base: int, spans: list[int], reference: list[torch.Tensor], ceiling: tensorfs.Ceiling) -> weakref.ref[Memory]:
@@ -399,11 +401,13 @@ def main() -> int:
     reference, spans, room, base, memory = ample(ck, plain, tag)
     gone(memory, "ample")
     ceiling = tensorfs.ceiling(device=0 if CUDA else None, path=store)
-    common, blocks = spans[0], sorted(spans[1:])
+    blocks = sorted(spans[1:])
     # Capacities only fall on one GPU's table: the largest first. A GPU child's context is about ours.
     capacity = base * (2 if CUDA else 1) + sum(spans) * 3 // 2 + room
-    gone(two(ck, store, f"{tag}-two", capacity, reference), "two processes")
-    capacity = base + common + sum(blocks) // 2 + room
+    w, memory = two(ck, store, f"{tag}-two", capacity, reference)
+    gone(memory, "two processes")
+    # Below the working set varena measured, by half the blocks: it must stream.
+    capacity = base + w - sum(blocks) // 2
     gone(capped(ck, f"{tag}-short", capacity, base, spans, reference, ceiling), "short")
     gone(baked(ck, plain, f"{tag}-fill", capacity), "fill")
     print(f"{sum(results)}/{len(results)} checks passed")
