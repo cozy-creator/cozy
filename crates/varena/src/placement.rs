@@ -4644,16 +4644,183 @@ mod gpu_tests {
         println!("PASS idle observed peak admits adaptive warm use without dropping pins {uuid}");
     }
 
+    const ACTIVATION_REQUESTER: &str = "VARENA_TEST_ACTIVATION_REQUESTER";
+
+    struct ForeignRequester {
+        process: std::process::Child,
+        input: std::process::ChildStdin,
+        replies: mpsc::Receiver<String>,
+        reader: Option<thread::JoinHandle<()>>,
+    }
+    impl ForeignRequester {
+        fn spawn(ledger: &Ledger) -> Self {
+            use std::io::BufRead;
+            use std::os::unix::process::CommandExt;
+            use std::process::{Command, Stdio};
+
+            let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+            let inherited = theirs.as_raw_fd();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "placement::gpu_tests::activation_oom_waits_for_foreign_idle_reclaim_and_keeps_live_pins",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(ACTIVATION_REQUESTER, "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            // Spawn/exec precedes either process opening CUDA. The child receives
+            // the same three-FD grant as a real executor, bound to its own PID.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::dup2(inherited, 9) < 0 || libc::fcntl(9, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut process = command.spawn().unwrap();
+            assert_ne!(process.id(), std::process::id());
+            drop(theirs);
+            let grant = ledger.grant(process.id()).unwrap();
+            for fd in [&grant.table, &grant.events, &grant.channel] {
+                platform::handles::send_fd(&ours, fd).unwrap();
+            }
+            drop((grant, ours));
+            let input = process.stdin.take().unwrap();
+            let output = process.stdout.take().unwrap();
+            let (sent, replies) = mpsc::channel();
+            let reader = thread::spawn(move || {
+                for line in std::io::BufReader::new(output).lines() {
+                    let line = line.unwrap();
+                    if let Some((_, reply)) = line.split_once('@') {
+                        if sent.send(reply.trim().to_owned()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            Self {
+                process,
+                input,
+                replies,
+                reader: Some(reader),
+            }
+        }
+        fn send(&mut self, command: &str) {
+            use std::io::Write;
+            writeln!(self.input, "{command}").unwrap();
+            self.input.flush().unwrap();
+        }
+        fn reply(&self) -> String {
+            self.replies
+                .recv_timeout(Duration::from_secs(5))
+                .expect("fresh requester process did not reply")
+        }
+        fn status(&mut self) -> (u64, u64) {
+            self.send("status");
+            let reply = self.reply();
+            let fields = reply.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(fields.len(), 3);
+            assert_eq!(fields[0], "status");
+            (fields[1].parse().unwrap(), fields[2].parse().unwrap())
+        }
+        fn finish(&mut self) {
+            self.send("finish");
+            assert_eq!(self.reply(), "finished");
+            assert!(self.process.wait().unwrap().success());
+            self.reader.take().unwrap().join().unwrap();
+        }
+    }
+    impl Drop for ForeignRequester {
+        fn drop(&mut self) {
+            if self.reader.is_some() {
+                let _ = self.process.kill();
+                let _ = self.process.wait();
+                let _ = self.reader.take().unwrap().join();
+            }
+        }
+    }
+
+    fn activation_requester() {
+        use std::io::{BufRead, Write};
+        use std::os::fd::FromRawFd;
+
+        const MIB: u64 = 1 << 20;
+        // Only the freshly exec'd test helper owns descriptor9.
+        let control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(9) };
+        let table = platform::handles::recv_fd(&control).unwrap();
+        let events = platform::handles::recv_fd(&control).unwrap();
+        let channel = platform::handles::recv_fd(&control).unwrap();
+        let requester = Placement::open(0, Some((table, events, channel))).unwrap();
+        // A weightless request has an unknown future footprint. Keep this real
+        // row idle while the independent owner warms its fixture weights.
+        println!(
+            "@ready {} {}",
+            std::process::id(),
+            assigned_gpu(&requester.gpu)
+        );
+        std::io::stdout().flush().unwrap();
+        for line in std::io::stdin().lock().lines() {
+            match line.unwrap().as_str() {
+                "begin" => {
+                    requester
+                        .begin(1, vec![], "foreign-requester".into(), "shape".into())
+                        .unwrap();
+                    println!("@begun");
+                }
+                "status" => println!(
+                    "@status {} {}",
+                    requester.available().unwrap(),
+                    requester.allocator_budget().unwrap()
+                ),
+                "relief" => println!("@{:?}", requester.relief(1, MIB, false).unwrap()),
+                "finish" => {
+                    let allocated = tensorfs::io::DeviceBuffer::new(0, MIB as usize).unwrap();
+                    requester.allocator(0, MIB, MIB).unwrap();
+                    drop(allocated);
+                    requester.allocator(0, 0, 0).unwrap();
+                    requester.end(1).unwrap();
+                    requester.close().unwrap();
+                    println!("@finished");
+                    std::io::stdout().flush().unwrap();
+                    return;
+                }
+                command => panic!("unknown requester command: {command}"),
+            }
+            std::io::stdout().flush().unwrap();
+        }
+        panic!("requester control closed before cleanup");
+    }
+
     #[test]
     #[ignore = "requires an owned rental; never run on the local GPU"]
     fn activation_oom_waits_for_foreign_idle_reclaim_and_keeps_live_pins() {
+        if std::env::var_os(ACTIVATION_REQUESTER).is_some() {
+            activation_requester();
+            return;
+        }
         let uuid = fill_worker(|| {
             const MIB: u64 = 1 << 20;
             let fixture = FillLedger::new();
+            let mut requester = ForeignRequester::spawn(&fixture.ledger);
+            let ready = requester.reply();
+            let ready = ready.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(ready.len(), 3);
+            assert_eq!(ready[0], "ready");
+            assert_eq!(ready[1].parse::<u32>().unwrap(), requester.process.id());
             let owner = fixture.placement();
-            let requester = fixture.placement();
             let uuid = assigned_gpu(&owner.gpu);
-            assert_eq!(requester.gpu_uuid().unwrap(), uuid);
+            assert_eq!(ready[2], uuid);
+            let rows = fixture.ledger.status().unwrap().rows;
+            assert_eq!(rows.len(), 2);
+            assert_ne!(rows[0].owner, rows[1].owner);
+            assert_ne!(rows[0].pid, rows[1].pid);
+            assert!(rows.iter().any(|row| row.pid == std::process::id()));
+            assert!(rows.iter().any(|row| row.pid == requester.process.id()));
             let pages = owner
                 .register(
                     1,
@@ -4664,7 +4831,15 @@ mod gpu_tests {
                     None,
                 )
                 .unwrap();
-            owner.load(1, Tier::Gpu).unwrap();
+            assert_eq!(owner.load(1, Tier::Gpu).unwrap(), Relief::Complete);
+            owner
+                .settle()
+                .expect("checked completion of actual warm fills");
+            assert_eq!(
+                owner.resident().unwrap()[0].1,
+                16 * MIB,
+                "the fixture must warm all four real CUDA regions before pressure"
+            );
             let retained = owner.gpu.bind(pages[0], 0).unwrap();
             owner.refresh().unwrap();
             let slack = Arc::new(Mutex::new(Some(
@@ -4674,11 +4849,14 @@ mod gpu_tests {
             let (release, finish) = mpsc::channel();
             let gate = ReleaseGate(Some(release));
             let finish = Mutex::new(finish);
+            let first_trim = AtomicBool::new(true);
             let weak = Arc::downgrade(&owner);
             let held = slack.clone();
             owner.trim_with(Arc::new(move |_| {
-                entered.send(()).unwrap();
-                finish.lock().recv().unwrap();
+                if first_trim.swap(false, Ordering::AcqRel) {
+                    entered.send(()).unwrap();
+                    finish.lock().recv().unwrap();
+                }
                 // This real allocator cache remains busy. Its acknowledgement
                 // must not be mistaken for physical progress by the requester.
                 assert!(held.lock().is_some());
@@ -4686,47 +4864,39 @@ mod gpu_tests {
                 Ok(0)
             }));
             owner.allocator(0, 0, 4 * MIB).unwrap();
-            requester
-                .begin(1, vec![], "foreign-requester".into(), "shape".into())
-                .unwrap();
-            let available = requester.available().unwrap();
+            requester.send("begin");
+            assert_eq!(requester.reply(), "begun");
+            let (available, budget) = requester.status();
             assert_eq!(available, 4 * MIB);
-            let budget = requester.allocator_budget().unwrap();
             assert_eq!(budget, available);
-            let (sent, done) = mpsc::channel();
-            let asking = requester.clone();
-            let worker = thread::spawn(move || {
-                sent.send(asking.relief(1, MIB, false)).unwrap();
-            });
+            requester.send("relief");
             waiting
                 .recv_timeout(Duration::from_secs(5))
                 .expect("no foreign trim request");
             assert!(
-                matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                matches!(requester.replies.try_recv(), Err(mpsc::TryRecvError::Empty)),
                 "relief returned before the actual foreign callback acknowledged"
             );
             drop(gate);
-            assert_eq!(
-                done.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(),
-                Relief::Complete
-            );
-            worker.join().unwrap();
+            assert_eq!(requester.reply(), "Complete");
             assert!(
                 slack.lock().is_some(),
                 "the callback did not actually free its cache"
             );
+            let (reclaimed, raised_budget) = requester.status();
             assert!(
-                requester.available().unwrap() >= available + 4 * MIB,
+                reclaimed >= available + 4 * MIB,
                 "no-op acknowledgement reset the fixed reclaim target"
             );
             assert!(
-                requester.allocator_budget().unwrap() > budget,
+                raised_budget > budget,
                 "actual remote reclamation did not reach the allocator ceiling"
             );
             for remaining in [8 * MIB, 4 * MIB] {
+                requester.send("relief");
                 assert_eq!(
-                    requester.relief(1, MIB, false).unwrap(),
-                    Relief::Complete,
+                    requester.reply(),
+                    "Complete",
                     "a new OOM in the same unchanged request reused an old remote ACK"
                 );
                 assert_eq!(
@@ -4735,11 +4905,12 @@ mod gpu_tests {
                     "each actual OOM must reclaim one more unpinned CUDA region"
                 );
             }
+            requester.send("relief");
+            let no_progress = requester.reply();
             assert!(
-                matches!(
-                    requester.relief(1, MIB, false).unwrap(),
-                    Relief::Cut(_) | Relief::Lower(_) | Relief::Exhausted(_)
-                ),
+                ["Cut(", "Lower(", "Exhausted("]
+                    .iter()
+                    .any(|prefix| no_progress.starts_with(prefix)),
                 "a no-progress owner produced Complete or discarded its protected bytes"
             );
             assert_eq!(owner.ledger.capacity(), 24 * MIB);
@@ -4760,16 +4931,11 @@ mod gpu_tests {
             }
             .expect("foreign pinned CUDA content");
             assert_eq!(bytes, [7; 32]);
-            let allocated = tensorfs::io::DeviceBuffer::new(0, (MIB) as usize).unwrap();
-            requester.allocator(0, MIB, MIB).unwrap();
-            drop(allocated);
-            requester.allocator(0, 0, 0).unwrap();
-            requester.end(1).unwrap();
+            requester.finish();
             drop(retained);
             owner.gpu.wait_pending().unwrap();
             drop(slack.lock().take());
             owner.allocator(0, 0, 0).unwrap();
-            requester.close().unwrap();
             owner.close().unwrap();
             uuid
         });
@@ -4777,6 +4943,4 @@ mod gpu_tests {
             "PASS activation OOM acknowledges foreign idle reclaim and preserves live pins {uuid}"
         );
     }
-
-
 }
