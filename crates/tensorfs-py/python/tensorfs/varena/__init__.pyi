@@ -245,6 +245,26 @@ class Pin:
         copy: bool | None = None,
     ) -> object: ...
     def __dlpack_device__(self) -> tuple[int, int]: ...
+    def window(self) -> Window:
+        """The same bytes holding no pin: valid only while the block is bound."""
+
+class Window:
+    """A block's bytes without a pin (`Pin.window`): its tensors are valid only while the block is
+    bound, and the pin that binds it orders their consumers."""
+
+    @property
+    def ptr(self) -> int: ...
+    @property
+    def len(self) -> int: ...
+    def __dlpack__(
+        self,
+        *,
+        stream: int | None = None,
+        max_version: tuple[int, int] | None = None,
+        dl_device: tuple[int, int] | None = None,
+        copy: bool | None = None,
+    ) -> object: ...
+    def __dlpack_device__(self) -> tuple[int, int]: ...
 
 class Next:
     """`Request.oom`'s answer."""

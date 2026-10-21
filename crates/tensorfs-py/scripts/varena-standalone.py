@@ -321,6 +321,41 @@ def capping(mem: Memory, unet: UNet2DConditionModel) -> None:
     check("cap: within a pass it never falls", len(caps) == 6 and rising, seen)
 
 
+def overhead(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> weakref.ref[Memory]:
+    """On host pages (the same bytes, the same kernels), a warm forward through the adapter costs
+    at most 10% more CPU than the plain model's. Its own table and model, every block a hit;
+    the best of several tries each, interleaved, so the shared machine's load is not the
+    measurement."""
+    mem = opened(f"{tag}-overhead", 1 << 31)
+    unet = loaded(ck, mem)
+    x, text = inputs(torch.device("cpu"), 0)
+
+    def plain_run() -> None:
+        with torch.no_grad():
+            for _ in range(3):
+                plain(x, 3, encoder_hidden_states=text)
+
+    def served() -> None:
+        with mem.request("overhead", plan=[unet] * 3) as r, torch.no_grad():
+            for _ in range(3):
+                unet(x, 3, encoder_hidden_states=text)
+        origins.update(ref.origin for ref in r.stats().trace)
+
+    origins: set[str] = set()
+    plain_run()
+    served()
+    origins.clear()
+    best = [float("inf"), float("inf")]
+    for _ in range(11):
+        for i, run_ in enumerate((plain_run, served)):
+            began = time.process_time()
+            run_()
+            best[i] = min(best[i], time.process_time() - began)
+    ratio = best[1] / best[0]
+    check(f"overhead: a warm forward through the adapter costs {100 * (ratio - 1):+.1f}% CPU over plain (at most +10%)", ratio <= 1.10 and origins == {"hit"}, (best, origins))
+    return weakref.ref(mem)
+
+
 def ample(ck: tensorfs.Checkpoint, plain: UNet2DConditionModel, tag: str) -> tuple[list[torch.Tensor], list[int], int, int, weakref.ref[Memory]]:
     """Room for it all: against the plain model, held, entries, identity, concurrency, attempts.
     Returns the reference outputs, the region spans, the measured room, the base (contexts and
@@ -425,6 +460,8 @@ def main() -> int:
     tag = f"varena-standalone-{os.getpid()}"
     reference, spans, room, base, memory = ample(ck, plain, tag)
     gone(memory, "ample")
+    if not CUDA:
+        gone(overhead(ck, plain, tag), "overhead")
     ceiling = tensorfs.ceiling(device=0 if CUDA else None, path=store)
     blocks = sorted(spans[1:])
     # Capacities only fall on one GPU's table: the largest first. A GPU child's context is about ours.
