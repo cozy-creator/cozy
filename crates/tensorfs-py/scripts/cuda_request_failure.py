@@ -21,7 +21,7 @@ class PayloadFailed(Exception):
 
 with tempfile.TemporaryDirectory(prefix="request-failure-") as folder:
     writer = tensorfs.Writer(cache_dir=Path(folder))
-    writer.component("net", cls="", config={}).put("weight", torch.ones(4, 4))
+    writer.component("net", cls=None, config={}).put("weight", torch.ones(4, 4))
     checkpoint = writer.commit()
     with torch.device("meta"):
         module = torch.nn.Linear(4, 4, bias=False)
