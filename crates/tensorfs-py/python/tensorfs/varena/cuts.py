@@ -348,7 +348,7 @@ def _settle(
     return size, out
 
 
-def launch[T](device: torch.device, name: str, run: Callable[[], T]) -> T:
+def launch(device: torch.device, name: str, run: Callable[[], _T]) -> _T:
     """A launch torch's dispatch never sees (a Triton kernel's): out of memory it did not run, so
     it runs again as an op does, with room made (rungs 1-2, other processes asked), then after
     rung 4 while that makes room (12586: a glue kernel on a full GPU, after a collective)."""
