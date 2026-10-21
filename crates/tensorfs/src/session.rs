@@ -270,14 +270,17 @@ impl Client {
         source.file(reference, filename, local_dir).await
     }
 
-    /// Makes the folder a commit of the repository and moves tag `reference.revision` (none:
-    /// [`fetch::MAIN`]) to it: a new tag is private, an existing one keeps its flags. The folder
-    /// may be thin (headers and repo files): a chunk or asset it lacks comes from the store, and a
-    /// remote repository refuses only one the endpoint lacks too. The commit.
+    /// Commits the folder's files on top of tag `reference.revision` (none: [`fetch::MAIN`]) of
+    /// the repository, as Hugging Face's `upload_folder`: the tag's tree keeps its other files,
+    /// loses the paths a `delete_patterns` glob matches, and takes the folder's files, added or
+    /// replaced. A new tag is private; an existing one keeps its flags. The folder may be thin
+    /// (headers and repo files): a chunk or asset it lacks comes from the store, and a remote
+    /// repository refuses only one the endpoint lacks too. The commit.
     pub async fn upload_folder(
         &self,
         reference: &Ref,
         folder: &Path,
+        delete_patterns: &[&str],
         progress: Option<&Progress<'_>>,
     ) -> Result<ObjectRef> {
         let tag = reference.revision.as_deref().unwrap_or(crate::fetch::MAIN);
@@ -302,26 +305,24 @@ impl Client {
         if let Some(report) = progress {
             report(0, total)?;
         }
-        if reference.repo_id.starts_with("local/") {
-            self.store.update_ref(&reference.repo_id, |old| {
-                Some(crate::fetch::with_tag(old, &reference.repo_id, tag, &tree))
-            })?;
-        } else {
-            let source = self.source(reference, false)?;
-            crate::fetch::upload_tree(
-                &source.endpoint.inner,
-                &reference.repo_id,
-                &tree,
-                &self.store,
-                tag,
-            )
-            .await
-            .map_err(provider::from_native)?;
-        }
+        // A local repository's endpoint is this store: one commit path for both.
+        let source = self.source(reference, false)?;
+        let control = crate::fetch::UploadControl { cancelled: &|| false, progress: &|_, _| {}, commit: &|| true };
+        let uploaded = crate::fetch::upload_tree_with(
+            &source.endpoint.inner,
+            &reference.repo_id,
+            &tree,
+            &self.store,
+            tag,
+            delete_patterns,
+            &control,
+        )
+        .await
+        .map_err(provider::from_native)?;
         if let Some(report) = progress {
             report(total, total)?;
         }
-        Ok(tree)
+        Ok(uploaded.commit)
     }
 
     fn source(&self, reference: &Ref, offline: bool) -> Result<remote::Remote> {

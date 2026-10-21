@@ -182,16 +182,17 @@ impl Context {
                 None,
             );
         }
-        let mut parsed = Tree {
-            files: files.clone(),
+        // A published commit is the tag's tree with this variant on top; else the writer's own.
+        let tree = match published {
+            Some(commit) => commit.clone(),
+            None => {
+                let mut parsed = Tree { files: files.clone() };
+                parsed.set_variant(&self.variant, header.clone());
+                self.store.put_tree(&parsed)?
+            }
         };
-        parsed.set_variant(&self.variant, header.clone());
-        let tree = self.store.put_tree(&parsed)?;
-        if published.is_some_and(|id| id != &tree) {
-            return fail(
-                Kind::Integrity,
-                "published tree differs from the locally committed tree",
-            );
+        if self.store.tree(&tree)?.header(&self.variant) != Some(header) {
+            return fail(Kind::Integrity, "the commit does not name this writer's header");
         }
         let named = published.and(self.repo_id.as_ref()).map(|name| Ref {
             repo_id: name.clone(),

@@ -21,7 +21,7 @@
 //!   rename: a folder without the header is unfinished. Objects its base's store holds are
 //!   referenced, not copied (a thin folder).
 //! - A streaming writer sends each object to an endpoint as it seals it ([`Stream`]) and, at
-//!   commit, the header and a tree of it, a commit of its repo that a tag moves to.
+//!   commit, the header, set with its repo files on top of a tag's tree as a new commit.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -184,8 +184,8 @@ enum Dest {
         variant: String,
         cache: Option<Store>,
     },
-    /// Objects sent as they seal; at commit the header and tree, a commit of repo `name` that
-    /// tag `tag` moves to.
+    /// Objects sent as they seal; at commit the header, as `variant` with the repo files
+    /// committed onto tag `tag` of repo `name`.
     Endpoint {
         store: Store,
         stream: Arc<Stream>,
@@ -251,8 +251,8 @@ impl Store {
         Writer::open(Dest::Store(self.clone()), writers.join(name), key, base)
     }
 
-    /// A writer of `variant` whose objects go to `stream` as they seal and whose commit makes a
-    /// tree of it (with its repo files) a commit of repo `name` there, moving tag `tag` to it.
+    /// A writer of `variant` whose objects go to `stream` as they seal and whose commit sets it
+    /// (with its repo files) on top of tag `tag` of repo `name` there.
     /// The local checkpoint commits first and remains available when the upload fails.
     pub fn streaming_writer(&self, stream: Arc<Stream>, name: &str, tag: &str, variant: &str, base: Option<&Checkpoint>) -> Result<Writer> {
         self.streaming_writer_resumable(stream, name, tag, variant, base, None)
@@ -611,7 +611,9 @@ impl Writer {
                 let id = self.admit_header(store, &header)?;
                 store.used(&id.sha256, std::iter::once(&id).chain(&objects).chain(self.repo.values()))?;
                 self.committed = Some(id.clone());
-                self.published = Some(stream.commit(name, tag, variant, header, &self.repo).map_err(sent)?);
+                let done = stream.commit(name, tag, variant, header, &self.repo).map_err(sent)?;
+                // The commit's tree is held here too: the checkpoint names it.
+                self.published = Some(store.put_tree(&done.tree)?);
                 id
             }
         };

@@ -86,6 +86,8 @@ pub enum Payload {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Uploaded {
     pub repo: Repo,
+    /// The commit the tag now names: its tree before, with the upload's files on top.
+    pub commit: ObjectRef,
     pub objects: usize,
     pub sent: usize,
     pub bytes: u64,
@@ -601,11 +603,62 @@ pub fn with_tag(repo: Option<Repo>, name: &str, tag: &str, commit: &ObjectRef) -
     repo
 }
 
-/// Sends what `endpoint` lacks of `tree`'s closure in `store` (chunks, assets and repo files,
-/// then headers, then the tree), then moves tag `tag` of repo `name` to it: the tree is the
-/// commit.
+/// What one commit made: its tree and ref, the repo document naming it, whether the tag already
+/// named that tree, and whether the tree's object was sent (the endpoint lacked it).
+pub struct Committed {
+    pub commit: ObjectRef,
+    pub tree: Tree,
+    pub repo: Repo,
+    pub converged: bool,
+    pub sent: bool,
+}
+
+/// The one commit path (git's rule, as Hugging Face's `upload_folder`): tag `tag` of repo `name`
+/// moves to its current tree (none: empty) with the paths a `delete` pattern matches removed and
+/// `files` added or replaced. Every object `files` cite must be at the endpoint already. A lost
+/// conditional write re-reads the tag's tree and applies the change again.
+pub async fn commit_onto(endpoint: &Endpoint, name: &str, tag: &str, files: &BTreeMap<String, ObjectRef>, delete: &[&str]) -> Result<Committed> {
+    if !crate::format::tag_name(tag) {
+        return refuse(Code::KEY_GRAMMAR, format!("{tag:?} is not a tag name"));
+    }
+    for _ in 0..REPO_WRITES {
+        let parent = endpoint.repo(name).await?.and_then(|(r, _)| Some(r.tag(tag)?.commit.clone()));
+        let base = match &parent {
+            Some(commit) => Tree::from_json(&endpoint.document(commit).await?).map_err(|e| invalid_tree(commit, e))?,
+            None => Tree::default(),
+        };
+        let tree = base.commit(files, delete);
+        let bytes = Bytes::from(tree.to_json().map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() })?);
+        let commit = ObjectRef::of(&bytes);
+        let sent = endpoint.upload(&commit, &move || Ok(Payload::Bytes(bytes.clone()))).await?;
+        // Other tags' edits are re-applied by update_repo; this tag moving on is a new parent.
+        let mut moved = false;
+        let named = endpoint.update_repo(name, |old| {
+            let now = old.as_ref().and_then(|r| r.tag(tag)).map(|t| &t.commit);
+            moved = now != parent.as_ref() && now != Some(&commit);
+            match moved {
+                true => refuse(Code::REPOSITORY_CONFLICT, format!("{name}@{tag} moved")),
+                false => Ok(Some(with_tag(old, name, tag, &commit))),
+            }
+        });
+        match named.await {
+            Ok(repo) => return Ok(Committed { converged: parent.as_ref() == Some(&commit), commit, tree, repo, sent }),
+            Err(_) if moved => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    refuse(Code::REPOSITORY_CONFLICT, format!("{name}@{tag}: {REPO_WRITES} commits lost to other writers"))
+}
+
+fn invalid_tree(commit: &ObjectRef, e: crate::format::Error) -> Refusal {
+    Refusal { code: Code::UNKNOWN_FORMAT, detail: format!("{}: {e}", commit.id()) }
+}
+
+/// Sends what `endpoint` lacks of the closure of `tree`'s files in `store` (chunks, assets and
+/// repo files, then headers), then commits those files onto tag `tag` of repo `name`
+/// ([`commit_onto`]).
 pub async fn upload_tree(endpoint: &Endpoint, name: &str, tree: &ObjectRef, store: &Store, tag: &str) -> Result<Uploaded> {
-    upload_tree_with(endpoint, name, tree, store, tag, &UploadControl {
+    upload_tree_with(endpoint, name, tree, store, tag, &[], &UploadControl {
         cancelled: &|| false,
         progress: &|_, _| {},
         commit: &|| true,
@@ -622,8 +675,9 @@ pub struct UploadControl<'a> {
     pub commit: &'a (dyn Fn() -> bool + Sync),
 }
 
-/// [`upload_tree`] with cancellation before the ref update, progress, and a final commit gate.
-pub async fn upload_tree_with(endpoint: &Endpoint, name: &str, tree: &ObjectRef, store: &Store, tag: &str, control: &UploadControl<'_>) -> Result<Uploaded> {
+/// [`upload_tree`] deleting the paths `delete` patterns match, with cancellation before the ref
+/// update, progress, and a final commit gate.
+pub async fn upload_tree_with(endpoint: &Endpoint, name: &str, tree: &ObjectRef, store: &Store, tag: &str, delete: &[&str], control: &UploadControl<'_>) -> Result<Uploaded> {
     if !crate::format::tag_name(tag) {
         return refuse(Code::KEY_GRAMMAR, format!("{tag:?} is not a tag name"));
     }
@@ -646,12 +700,12 @@ pub async fn upload_tree_with(endpoint: &Endpoint, name: &str, tree: &ObjectRef,
     leaves.dedup();
     let (mut sent, mut bytes) = (0, 0);
     let objects = leaves.len() + headers.len() + 1;
-    let total = leaves.iter().chain(&headers).chain(std::iter::once(tree))
+    let total = leaves.iter().chain(&headers)
         .try_fold(0u64, |sum, object| sum.checked_add(object.length))
         .ok_or_else(|| Refusal { code: Code::ARITH_OVERFLOW, detail: "upload closure byte count overflows".into() })?;
     let mut verified = 0;
     (control.progress)(0, total);
-    for stage in [leaves, headers, vec![tree.clone()]] {
+    for stage in [leaves, headers] {
         let mut sending = futures::stream::iter(stage)
             .map(|object| async move {
                 let (from, at) = (store.clone(), object.clone());
@@ -679,13 +733,11 @@ pub async fn upload_tree_with(endpoint: &Endpoint, name: &str, tree: &ObjectRef,
     if (control.cancelled)() || !(control.commit)() {
         return Err(stopped());
     }
-    let mut converged = false;
-    let repo = endpoint.update_repo(name, |old| {
-        let new = with_tag(old.clone(), name, tag, tree);
-        converged = old.as_ref() == Some(&new);
-        Ok(Some(new))
-    }).await?;
-    Ok(Uploaded { repo, objects, sent, bytes, converged })
+    let done = commit_onto(endpoint, name, tag, &parsed.files, delete).await?;
+    if done.sent {
+        (sent, bytes) = (sent + 1, bytes + done.commit.length);
+    }
+    Ok(Uploaded { repo: done.repo, commit: done.commit, objects, sent, bytes, converged: done.converged })
 }
 
 /// Replaces `<root>/<key>` with `bytes` under the store's record lock while it has ETag `etag`.
@@ -806,19 +858,15 @@ impl Stream {
         first
     }
 
-    /// A writer's commit: its `header` as `variant` of a tree with `files`, each sent after
-    /// what it cites, then tag `tag` of repo `name` moved to the tree. The tree's ref.
-    pub fn commit(&self, name: &str, tag: &str, variant: &str, header: Vec<u8>, files: &BTreeMap<String, ObjectRef>) -> Result<ObjectRef> {
+    /// A writer's commit: its `header`, sent after what it cites, as `variant` with `files`
+    /// committed onto tag `tag` of repo `name` ([`commit_onto`]).
+    pub fn commit(&self, name: &str, tag: &str, variant: &str, header: Vec<u8>, files: &BTreeMap<String, ObjectRef>) -> Result<Committed> {
         self.flush()?;
         let header = self.put(header)?;
         self.flush()?;
         let mut tree = Tree { files: files.clone() };
-        tree.set_variant(variant, header.clone());
-        let tree = self.put(tree.to_json().map_err(|e| Refusal { code: Code::UNKNOWN_FORMAT, detail: e.to_string() })?)?;
-        self.flush()?;
-        let named = self.endpoint.update_repo(name, |old| Ok(Some(with_tag(old, name, tag, &tree))));
-        self.runtime.block_on(named)?;
-        Ok(tree)
+        tree.set_variant(variant, header);
+        self.runtime.block_on(commit_onto(&self.endpoint, name, tag, &tree.files, &[]))
     }
 }
 

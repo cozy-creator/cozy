@@ -489,7 +489,7 @@ impl Runs {
                     endpoint = endpoint.anonymous();
                 }
                 let runtime = tensorfs::fetch::runtime().map_err(|error| refused("upload_failed", error.to_string()))?;
-                let uploaded = runtime.block_on(upload_tree_with(&endpoint, repository, &tree, publisher.store(), tag, &UploadControl {
+                let uploaded = runtime.block_on(upload_tree_with(&endpoint, repository, &tree, publisher.store(), tag, &[], &UploadControl {
                     cancelled: &|| stoppable.stop.is_cancelled(),
                     progress: &|done, total| observe(&stage, done, total),
                     commit: &|| stoppable.commit(),
@@ -497,7 +497,7 @@ impl Runs {
                     true => refused(crate::published::CANCELED, "the upload was canceled before its ref update; admitted objects remain available"),
                     false => refused("upload_failed", error.to_string()),
                 })?;
-                row["published"] = json!({"destination": destination, "tree": tree.id(), "tag": tag,
+                row["published"] = json!({"destination": destination, "tree": uploaded.commit.id(), "tag": tag,
                     "checkpoint": header.id(), "converged": uploaded.converged});
             }
             models.push(row);

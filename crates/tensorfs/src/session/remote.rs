@@ -210,7 +210,7 @@ impl Remote {
         let bytes = self.store.read(&root)?;
         let (tree, header, variant, mut extra) = match Tree::from_json(&bytes) {
             Ok(tree) => {
-                let (variant, header) = tree.variant(wanted.as_deref())?;
+                let (variant, header) = tree.variant(wanted.as_deref()).map_err(|e| absent(wanted.is_some(), e))?;
                 let extra = tree.repo_files().map(|(_, r)| r.clone()).collect();
                 (
                     Some(root.clone()),
@@ -265,7 +265,7 @@ impl Remote {
             .await?;
         let tree = self.store.tree(&root)?;
         let headers: Vec<_> = match wanted.as_deref() {
-            Some(variant) => vec![tree.variant(Some(variant))?.1.clone()],
+            Some(variant) => vec![tree.variant(Some(variant)).map_err(|e| absent(true, e))?.1.clone()],
             None => tree.variants().map(|(_, h)| h.clone()).collect(),
         };
         let _header_hold = self.store.hold(&headers)?;
@@ -345,4 +345,10 @@ impl Remote {
         self.store.maintain(0)?;
         Ok(dest)
     }
+}
+
+/// A named variant the commit lacks is not found; an unnamed choice among several is invalid.
+fn absent(named: bool, e: crate::format::Error) -> Failure {
+    let kind = if named { Kind::NotFound } else { Kind::Invalid };
+    Failure { kind, detail: e.to_string() }
 }
