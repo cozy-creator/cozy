@@ -168,8 +168,10 @@ fn stage(
     let cohort: Cohort = serde_json::from_str(payload).map_err(|e| {
         Error::validation("invalid_payload", format!("an update payload is a JSON object: {e}"))
     })?;
-    for name in cohort.unknown.keys() {
-        tracing::warn!("update {id}: ignoring unknown payload field {name:?}");
+    // An instruction this machine cannot carry out fails; ignored, it would succeed unapplied.
+    if let Some(name) = cohort.unknown.keys().next() {
+        let version = env!("CARGO_PKG_VERSION");
+        return Err(Error::validation("update_field_unknown", format!("cozy {version} cannot carry out an update's {name:?}")));
     }
     // The file an input binds to `member`, staged as `file` and held to its digest.
     let held = |member: &str, file: &str| -> Result<Option<Choice>, Error> {

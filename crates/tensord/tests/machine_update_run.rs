@@ -154,7 +154,7 @@ fn outcome(log: &[v1::RunEvent]) -> v1::Outcome {
 
 fn spec(runtime: (&str, &str), tensorfs: (&str, &str)) -> v1::RunSpec {
     let payload = serde_json::json!({
-        "runtime": runtime.0, "tensorfs": tensorfs.0, "note": "ignored",
+        "runtime": runtime.0, "tensorfs": tensorfs.0,
     });
     let input = |field: &str, digest: &str| v1::InputFile {
         field: field.into(),
@@ -235,6 +235,15 @@ async fn an_update_run_installs_its_pair_in_place_and_an_unresolvable_one_ends_f
     };
     let denied = refused.submit(&request).await.unwrap_err();
     assert_eq!(denied.status(), Some(403));
+    // A field this machine cannot carry out (the `binary` an older machine predates) refuses the
+    // update before anything runs, never a success that changed nothing.
+    let mut unknown = request.spec.clone();
+    let payload = serde_json::json!({"runtime": runtime, "tensorfs": tensorfs, "agent": "bundled"});
+    unknown.payload = v1::Json::parse(payload.to_string()).ok();
+    let machine_cap = client(&root, port, &cap(capability::MACHINE)).await;
+    let refused = machine_cap.submit(&v1::RunRequest { id: "up-0".into(), spec: unknown }).await.unwrap_err();
+    assert_eq!((refused.status(), refused.code()), (Some(400), Some("update_field_unknown")), "{refused}");
+    assert!(refused.to_string().contains(r#""agent""#), "{refused}");
 
     let log = update(
         &root,

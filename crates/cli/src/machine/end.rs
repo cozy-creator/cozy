@@ -291,7 +291,6 @@ pub async fn update(
         payload.insert("runtime".into(), target.runtime.into());
         payload.insert("tensorfs".into(), target.tensorfs.into());
     }
-    payload.insert("agent".into(), "bundled".into());
     let spec = v1::RunSpec {
         kind: v1::RunKind::Update,
         payload: Some(
