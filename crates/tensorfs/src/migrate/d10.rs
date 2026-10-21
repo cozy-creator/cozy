@@ -458,15 +458,18 @@ impl<'t> Migrator<'t> {
             let found = if component.is_empty() {
                 inferred.pipeline.as_ref().map(|p| p.class.clone())
             } else {
-                family_class(model, component, &versions)
-                    .or_else(|| inferred.components.iter().find(|c| c.name == component).map(|c| c.class.clone()))
+                inferred.components.iter().find(|c| c.name == component).map(|c| c.class.clone())
+                    .filter(|c| !c.is_unknown()).or_else(|| family_class(model, component, &versions))
             };
             // An explicit qualified source names its own library; retain the rest of its
             // namespace, rather than guessing the library of an unqualified class.
             if let Some((library, class)) = name.split_once('.') {
                 let identifier = |s: &str| !s.is_empty() && s.bytes().enumerate().all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || i > 0 && b.is_ascii_digit());
                 if name.split('.').all(identifier) {
-                    return Ok(ClassRef::new(library, versions.get(library).map_or("", String::as_str), class));
+                    let config = if component.is_empty() { header.pipeline().map(|p| &p.config) }
+                        else { header.component(component).map(|c| &c.config) };
+                    let own = config.and_then(|c| c.get(&format!("{library}_version")).or_else(|| c.get(&format!("_{library}_version")))).and_then(Json::as_str);
+                    return Ok(ClassRef::new(library, own.or_else(|| versions.get(library).map(String::as_str)).unwrap_or(""), class));
                 }
             }
             if let Some(class) = found.filter(|c| !c.is_unknown() && c.name == name) { return Ok(class); }

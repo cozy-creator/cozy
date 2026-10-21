@@ -195,6 +195,7 @@ fn ambiguous_text_class_refuses_before_any_endpoint_write() {
 fn approved_family_and_qualified_names_work_without_inventing_versions() {
     for (model, class, metadata, want) in [
         ("acme/birefnet", "BiRefNet", json!({}), ClassRef::new("birefnet", "0.4.0", "BiRefNet")),
+        ("acme/birefnet", "BiRefNet", json!({"architectures": ["BiRefNet"]}), ClassRef::new("transformers", "", "BiRefNet")),
         ("acme/configured", "PlainModel", json!({"architectures": ["PlainModel"]}), ClassRef::new("transformers", "", "PlainModel")),
         ("acme/qualified", "example.deep.Model", json!({"_class_name": "example.deep.Model", "_diffusers_version": "0.41.0"}), ClassRef::new("example", "", "deep.Model")),
         ("acme/versioned", "example.deep.Model", json!({"_example_version": "1.2"}), ClassRef::new("example", "1.2", "deep.Model")),
