@@ -83,7 +83,7 @@ async fn rent(
         detach,
     };
     match crate::machine::order(ctx, &ctx.hub()?, order).await? {
-        Ordered::Placed(_, machine) => Ok(machine.name),
+        Ordered::Placed(rented) => Ok(rented.machine.name),
         Ordered::Declined => Err(Error::new(
             Kind::Usage,
             "quote_declined",

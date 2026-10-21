@@ -64,16 +64,17 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
         key: rent.idempotency_key,
         detach: rent.detach,
     };
-    let (rented, machine) = match self::order(ctx, &hub, order).await? {
-        Ordered::Placed(rented, machine) => (rented, machine),
+    let rented = match self::order(ctx, &hub, order).await? {
+        Ordered::Placed(rented) => *rented,
         Ordered::Declined => {
             output::say(ctx, "nothing was rented");
             return Ok(ExitCode::SUCCESS);
         }
         Ordered::Unwatched => return Ok(ExitCode::SUCCESS),
     };
+    let machine = rented.machine.clone();
     if ctx.json {
-        output::json(&Rented { machine, ..rented });
+        output::json(&rented);
         return Ok(ExitCode::SUCCESS);
     }
     let q = &rented.quote;
@@ -123,8 +124,8 @@ pub(crate) enum Ordered {
     Declined,
     /// Ctrl-C while it booted: the order goes on, unwatched.
     Unwatched,
-    /// Accepted (`detach`), else ready.
-    Placed(Rented, Machine),
+    /// Accepted (`detach`), else its machine as it became ready.
+    Placed(Box<Rented>),
 }
 
 /// Places `order` at the quote its renter agrees to and, unless detached, follows it until its
@@ -179,11 +180,10 @@ pub(crate) async fn order(ctx: &Context, hub: &Hub, order: Order) -> Result<Orde
             output::say(ctx, "this order was placed already; following it");
         }
         if detach {
-            let machine = rented.machine.clone();
-            return Ok(Ordered::Placed(rented, machine));
+            return Ok(Ordered::Placed(Box::new(rented)));
         }
         match follow(ctx, rented.machine.clone(), notices).await {
-            Ok(Some(machine)) => return Ok(Ordered::Placed(rented, machine)),
+            Ok(Some(machine)) => return Ok(Ordered::Placed(Box::new(Rented { machine, ..rented }))),
             Ok(None) => return Ok(Ordered::Unwatched),
             // Every machine at the agreed price went before one was bought. An agreed price is
             // never exceeded: a person agrees to a new quote, and `--yes` fails carrying it.
