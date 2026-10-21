@@ -1512,23 +1512,25 @@ impl WeightSet {
     /// Home regions whose pages landed and were not handed out yet, each kept for TensorD:
     /// `(region, span, container)`, a socket whose queue holds the allocation's fd. The pages
     /// outlive this process while TensorD holds the container; unmapping them here drains it.
-    pub fn kept(&self) -> Result<Vec<(u32, u64, OwnedFd)>> {
-        self.keep(false)
+    /// `filled`: only pages a page-in transform already filled (bound since they landed), for
+    /// a set whose fill writes its pages (a LoRA bake): a page still fresh would be kept unfilled.
+    pub fn kept(&self, filled: bool) -> Result<Vec<(u32, u64, OwnedFd)>> {
+        self.keep(false, filled)
     }
 
     /// Exports after the caller has stopped admission and drained every use of these weights.
     /// Lifetime address pins (cached graphs) may remain; no work may read or write them now.
     /// Their addresses and pins stay intact, and incomplete copies still cannot be exported.
-    pub fn kept_quiescent(&self) -> Result<Vec<(u32, u64, OwnedFd)>> {
-        self.keep(true)
+    pub fn kept_quiescent(&self, filled: bool) -> Result<Vec<(u32, u64, OwnedFd)>> {
+        self.keep(true, filled)
     }
 
-    fn keep(&self, quiescent: bool) -> Result<Vec<(u32, u64, OwnedFd)>> {
+    fn keep(&self, quiescent: bool, filled: bool) -> Result<Vec<(u32, u64, OwnedFd)>> {
         let g = &self.gpu.inner;
         g.with(|st| {
             let mut out = vec![];
             for (r, reg) in st.set(self.id).regs.iter_mut().enumerate() {
-                let Some(m) = reg.map.as_mut().filter(|m| m.chunks.len() == 1 && m.chunks[0].shared && !m.deposited) else { continue };
+                let Some(m) = reg.map.as_mut().filter(|m| m.chunks.len() == 1 && m.chunks[0].shared && !m.deposited && !(filled && m.fresh)) else { continue };
                 let ready = if quiescent {
                     m.fill.as_ref().map_or(Ok(false), |f| f.landed())? && passed(&mut m.released)?
                 } else {
@@ -1563,17 +1565,19 @@ impl WeightSet {
 
     /// Home regions mapped from pages another process kept (`kept`'s fds, taken out of their
     /// containers): imported and mapped, no copy. A page that will not import or map is skipped
-    /// and fills as usual. Returns the bytes adopted.
-    pub fn adopt_pages(&self, pages: Vec<(u32, OwnedFd)>) -> Result<u64> {
+    /// and fills as usual. `filled`: pages a page-in transform filled, which no host layout holds
+    /// (the caller proved what filled them): they map filled, never filled again. Returns the
+    /// regions adopted.
+    pub fn adopt_pages(&self, pages: Vec<(u32, OwnedFd)>, filled: bool) -> Result<Vec<u32>> {
         let g = &self.gpu.inner;
         g.with(|st| {
-            let (base, w, mut adopted) = (st.set(self.id).base, st.set(self.id).w.clone(), 0);
+            let (base, w, mut adopted) = (st.set(self.id).base, st.set(self.id).w.clone(), vec![]);
             for (r, fd) in pages {
                 let x = w.layout.region(r)?;
                 if !st.set(self.id).shared || st.reg(self.id, r)?.map.is_some() || !st.reg(self.id, r)?.home {
                     continue;
                 }
-                let host = w.host.as_ref().filter(|m| m.ready(r)).map(|m| m.base() as usize + x.offset as usize);
+                let host = w.host.as_ref().filter(|m| !filled && m.ready(r)).map(|m| m.base() as usize + x.offset as usize);
                 let va = base + x.offset;
                 match g.import(va, x.span, &fd).and_then(|h| g.holds(h, va, x.span, x.nbytes, host)) {
                     Ok(handle) => {
@@ -1583,10 +1587,10 @@ impl WeightSet {
                         };
                         let fill = Arc::new(Fill { state: Mutex::new(Some(ready)), cv: Condvar::new() });
                         let chunks = vec![Chunk { handle, size: x.span, shared: true }];
-                        let m = Mapping { va: base + x.offset, span: x.span, chunks, fill: Some(fill), fresh: true, kept: Some(contain(fd)?), ..Default::default() };
+                        let m = Mapping { va: base + x.offset, span: x.span, chunks, fill: Some(fill), fresh: !filled, kept: Some(contain(fd)?), ..Default::default() };
                         st.reg(self.id, r)?.map = Some(m);
                         st.mapped += x.span;
-                        adopted += x.nbytes;
+                        adopted.push(r);
                     }
                     Err(e) => tracing::warn!("varena: kept region {r} of {} did not map, it fills: {e}", w.name),
                 }
