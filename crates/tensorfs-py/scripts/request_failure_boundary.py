@@ -25,6 +25,7 @@ def boundary(source: Path) -> types.ModuleType:
     classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
     request = next(node for node in classes["Memory"].body if getattr(node, "name", "") == "request")
     clear = next(node for node in tree.body if getattr(node, "name", "") == "_clear_frames")
+    note = next(node for node in tree.body if getattr(node, "name", "") == "_add_note")
     module = types.ModuleType("request_failure_source")
     module.__dict__.update(
         dataclass=dataclass, field=field, contextmanager=contextmanager,
@@ -34,7 +35,7 @@ def boundary(source: Path) -> types.ModuleType:
     sys.modules[module.__name__] = module
     code = ast.Module(body=[
         ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
-        classes["RequestStats"], classes["Request"], clear,
+        classes["RequestStats"], classes["Request"], clear, note,
         ast.ClassDef(name="Memory", bases=[], keywords=[], body=[request], decorator_list=[]),
     ], type_ignores=[])
     # Execute only the parsed request boundary under test, without Torch/native imports.
