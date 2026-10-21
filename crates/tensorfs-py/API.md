@@ -601,16 +601,17 @@ needed.
 
 ```python
 license_path = tensorfs.download_file("me/model", "LICENSE")
-tree_id = tensorfs.upload_folder(repo_id="me/model", folder_path="./portable", token=my_token)
+commit = tensorfs.upload_folder(repo_id="me/model", folder_path="./portable", token=my_token)
 ```
 
 `download_file` returns one file path and accepts revision, location and authentication
 options, without component or variant selection.
 
-`upload_folder` returns the exact published tree id. Its options are `revision`, `token`,
-`endpoint` and `cache_dir`. Without a revision it appends an unreleased checkpoint;
-it does not create a public release. Repository files such as README and LICENSE are
-ordinary files in the uploaded folder.
+`upload_folder` commits the folder on top of the tag `revision` (default `main`, private when new),
+as Hugging Face's does: the tag's current files stay, the folder's files are added or replaced, and
+only paths matching `delete_patterns` (fnmatch globs such as `"*.int8.cozytensors"`) are removed.
+It returns the commit id. It never publishes: making a tag public is `cozy model publish`.
+Repository files such as README and LICENSE are ordinary files in the uploaded folder.
 
 ### Work directly with repository references
 
@@ -635,7 +636,7 @@ A conflict can cause the callback to run again, so it must tolerate retries.
 | `convert_to_cozytensors` | `Checkpoint` |
 | `materialize` | Local folder path; native cozytensors or Safetensors output |
 | `download_file` | Local file path |
-| `upload_folder` | Published tree id |
+| `upload_folder` | The commit id |
 
 Normal loading uses `open` followed by component tensor reads. Use
 `checkpoint.download(components=...)` to preload data into the shared store;
