@@ -878,7 +878,9 @@ pub(crate) async fn run_quote(
     body: Bytes,
 ) -> Result<Json<wire::RunQuote>, Refusal> {
     let submit = parse::<SubmitRun>(&body)?;
-    if config::Origin::parse(&submit.hub).is_ok_and(|hub| api.machines.device_key(&hub).is_err()) {
+    if config::Origin::parse(&submit.hub)
+        .is_ok_and(|hub| api.machines.hubs.client(hub.as_str()).is_err())
+    {
         return Err(Refusal(crate::rentals::signed_out(&submit.hub)));
     }
     Ok(Json(
