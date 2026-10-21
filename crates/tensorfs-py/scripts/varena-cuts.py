@@ -682,8 +682,42 @@ def lattice() -> None:
     )
 
 
+def launches() -> None:
+    """A launch outside torch's dispatch (a Triton kernel's) out of memory runs again with room
+    made, and again after rung 4; anything else, or no room left, is its own failure."""
+    failures = ["Triton Error [CUDA]: out of memory"] * 2
+    ran = []
+
+    def launch() -> str:
+        if failures:
+            raise RuntimeError(failures.pop())
+        ran.append(1)
+        return "ran"
+
+    memo, _, room = fresh(1 << 40, frees=1 << 20, lowers=1, step=1 << 20)
+    out = cuts.launch(CPU, "glue", launch)
+    check(
+        "a Triton launch out of memory runs again: room made, then a block lower",
+        out == "ran" and ran == [1] and memo.retries == 2 and room.made == 2 and room.lowered == 1,
+        (out, memo.retries, room.made, room.lowered),
+    )
+    memo, _, room = fresh(1 << 40)
+    failures[:] = ["Triton Error [CUDA]: out of memory"]
+    try:
+        cuts.launch(CPU, "glue", launch)
+        check("with no room to make, the launch fails typed", False)
+    except MemoryError as exc:
+        check("with no room to make, the launch fails typed", "glue" in str(exc), exc)
+    failures[:] = ["Triton Error [CUDA]: an illegal memory access was encountered"]
+    try:
+        cuts.launch(CPU, "glue", launch)
+        check("another launch error is its own", False)
+    except RuntimeError as exc:
+        check("another launch error is its own", "illegal" in str(exc) and memo.retries == 1, exc)
+
+
 def main() -> int:
-    for test in (ffn_cut, relax, plans, swapped, fused_ffn, attention_cut, bands, vae_decode, block_catch, lattice):
+    for test in (ffn_cut, relax, plans, swapped, fused_ffn, attention_cut, bands, vae_decode, block_catch, launches, lattice):
         test()
     print(f"{sum(results)}/{len(results)} passed", flush=True)
     return 0 if all(results) else 1

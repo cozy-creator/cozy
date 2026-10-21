@@ -769,7 +769,8 @@ class Memory:
                 mapped, context = spare.mapped, self.context  # what the room leaves out
                 self.noted(4, f"{model.component} short {whole - room} B of resident, "
                            f"ffn cut saves {saved}: {terms} reserve {model.reserve} "
-                           f"slack {model.slack} ffn {ffn} mapped {mapped} context {context}", 0)
+                           f"slack {model.slack} ffn {ffn} mapped {mapped} context {context}"
+                           f"{self._beside()}", 0)
                 model.reserve, room = model.reserve - saved, room + saved
                 fits = whole <= room
             slots = _SLOTS * max(sizes)  # all of the core's: two left a bind short of its third
@@ -1023,6 +1024,20 @@ class Memory:
         table, row = self.row
         idle = (f for f in table.snapshot() if f.state == "live" and f.slot != row.id)
         return sum(f.reclaimable for f in idle if not f.running)
+
+    def _beside(self) -> str:
+        """What each other live row keeps from an ask: its context, weights in use, and torch's
+        bytes beyond its caches (12586: an idle executor gave 4.9 of its 16.2 GB)."""
+        if self.row is None:
+            return ""
+        table, row = self.row
+        rows = [f for f in table.snapshot() if f.state == "live" and f.slot != row.id]
+        return "".join(
+            f"; pid {f.pid} {'running' if f.running else 'idle'} held {f.held} gives "
+            f"{f.reclaimable}, keeps context {f.context} in use {f.resident - min(f.cold, f.resident)} "
+            f"torch {max(f.torch_allocated - f.cache, f.active_peak)}"
+            for f in rows
+        )
 
     def _landed(self, model: Model) -> None:
         """Demand outranks a prefetch: copies still landing hold pages no eviction may take, so

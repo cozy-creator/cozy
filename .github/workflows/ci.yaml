@@ -26,7 +26,7 @@ jobs:
       build: tensorfs
       # Until Runtime0.30.0 is on PyPI, build the exact current-cohort source whose dependency
       # range accepts this TensorFS0.12 wheel. The public Runtime relock remains a separate gate.
-      runtime_ref: 9b278b5e7ee035f8f8f8e2e9bc79445c556d5cc5
+      runtime_ref: 1d44cb8f8f7884c17ca41ef9a580d87d6a89454d
       # cozy's and Calcifer's suites need a Hub and a built TensorD: owner-day below. varena's
       # placement under a declared plan runs first, on the wheel with CPU torch.
       test: >-
@@ -53,4 +53,4 @@ jobs:
       # U11 current-release Hub and rehearsal harness; switch to master after this source lands.
       tensorhub_ref: 7654cba98f6f594014fc4bcedc4776d7773e279b
       # The tests' Runtime and TensorFS pair; this line goes when Runtime 0.30.0 and tensorfs 0.12 are on PyPI.
-      runtime_ref: 9b278b5e7ee035f8f8f8e2e9bc79445c556d5cc5
+      runtime_ref: 1d44cb8f8f7884c17ca41ef9a580d87d6a89454d

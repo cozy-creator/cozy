@@ -41,6 +41,10 @@ type Attention = Callable[[Tensor, Tensor, Tensor, Tensor | None], Tensor]
 #: Free bytes a retry asks beyond the failed allocation: the allocator's rounding, a workspace.
 SLACK = 64 << 20
 _ALLOCATE = re.compile(r"Tried to allocate ([\d.]+) (B|KiB|MiB|GiB|TiB)")
+#: a device allocation failure in the words of torch, the driver, Triton ("Triton Error [CUDA]: out
+#: of memory", 12586) or a CUDA library
+_REFUSED = ("CUDA error: out of memory", "CUDA driver error: out of memory", "[CUDA]: out of memory",
+            "_ALLOC_FAILED")
 _UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40}
 #: diffusers' token-wise feed-forwards and the activation projections inside them
 _FFN = frozenset({"FeedForward", "GELU", "GEGLU", "SwiGLU", "ApproximateGELU", "LinearActivation"})
@@ -252,7 +256,7 @@ def short(exc: BaseException, first: bool = False) -> int | None:
     text = str(exc)
     if isinstance(exc, torch.AcceleratorError):
         return 0 if getattr(exc, "error_code", None) == 2 or "out of memory" in text else None
-    failed = "CUDA error: out of memory" in text or "_ALLOC_FAILED" in text
+    failed = any(mark in text for mark in _REFUSED)
     failed |= first and ("CUBLAS_STATUS_" in text or "CUDNN_STATUS_" in text)
     return 0 if isinstance(exc, RuntimeError) and failed else None
 
@@ -341,6 +345,13 @@ def _settle[T](
         memo.sizes[key] = size
         _note(name, size)
     return size, out
+
+
+def launch[T](device: torch.device, name: str, run: Callable[[], T]) -> T:
+    """A launch torch's dispatch never sees (a Triton kernel's): out of memory it did not run, so
+    it runs again as an op does, with room made (rungs 1-2, other processes asked), then after
+    rung 4 while that makes room (12586: a glue kernel on a full GPU, after a collective)."""
+    return _settle(lambda _: run(), 1, 1, int, device, name)[1]
 
 
 def planned(shape: Shape | None, short: int, block: int) -> int:
