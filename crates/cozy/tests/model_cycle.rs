@@ -164,12 +164,15 @@ fn a_model_uploaded_by_one_machine_is_pulled_bit_identical_by_another() {
     let run = completed(&home, &cozy(&home, None, &["--json", "model", "upload", TINY, &model, "--on", "m1"]));
     let made = &run["result"]["models"][0];
     assert_eq!(made["published"]["destination"], format!("{model}@main"), "{run}");
-    let source = made["published"]["checkpoint"].as_str().unwrap().to_owned();
+    // The commit (the tree `main` moved to) and the checkpoint (its header) it names.
+    let source = made["published"]["tree"].as_str().unwrap().to_owned();
+    let header = made["published"]["checkpoint"].clone();
 
     let second = machine(&home, "m2");
     let checkpoint = format!("{model}#{source}");
     let run = completed(&home, &cozy(&home, None, &["--json", "model", "download", &checkpoint, "--on", "m2"]));
-    assert_eq!(run["result"]["models"][0]["tree"], source.as_str(), "{run}");
+    let pulled = &run["result"]["models"][0];
+    assert_eq!((&pulled["tree"], &pulled["checkpoint"]), (&Value::from(source.as_str()), &header), "{run}");
     let (made, pulled) = (closure(&first.store(), &source), closure(&second.store(), &source));
     assert!(made.len() >= 3, "a tree, a header and its chunks: {}", made.len());
     assert!(made == pulled, "the pulled checkpoint differs from the uploaded one");
@@ -199,19 +202,20 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     let made = &run["result"]["models"][0];
     assert_eq!(made["resolved"], TINY, "{run}");
     assert_eq!(made["published"]["destination"], format!("{model}@main"), "{run}");
-    let source = made["published"]["checkpoint"].as_str().unwrap().to_owned();
+    let source = made["published"]["tree"].as_str().unwrap().to_owned();
+    let header = made["published"]["checkpoint"].as_str().unwrap().to_owned();
 
-    // Another machine reads the private checkpoint by its digest, under the run's owner bearer.
+    // Another machine reads the private checkpoint by its header's digest, under the run's owner bearer.
     let _other = machine(&home, "m2");
-    let checkpoint = format!("{model}#{source}");
+    let checkpoint = format!("{model}#{header}");
     let run = completed(&home, &cozy(&home, None, &["--json", "model", "download", &checkpoint, "--on", "m2"]));
-    assert_eq!(run["result"]["models"][0]["tree"], source.as_str(), "{run}");
+    assert_eq!(run["result"]["models"][0]["checkpoint"], header.as_str(), "{run}");
 
     // A release names it; info shows the lane and its checkpoint.
     let release = json(&home, &["--json", "model", "publish", &model, "--release", "1.0.0", "--commit", &source]);
     assert_eq!((release["commit"].as_str(), &release["changed"]), (Some(source.as_str()), &Value::Bool(true)), "{release}");
     let info = json(&home, &["--json", "model", "info", &model]);
-    assert_eq!(info["releases"][0]["lanes"][0]["checkpoint"], format!("{model}#{source}"), "{info}");
+    assert_eq!(info["releases"][0]["lanes"][0]["checkpoint"], format!("{model}#{header}"), "{info}");
 
     json(&home, &["--json", "model", "family", &model, "cycle-test"]);
     let found = json(&home, &["--json", "model", "search", "--family", "cycle-test"]);

@@ -54,7 +54,7 @@ must outlive the parent checkpoint; owned child handles retain their source and 
 
 ```rust
 use std::path::Path;
-use tensorfs::{format::Dtype, WriterOptions};
+use tensorfs::{format::{ClassRef, Dtype}, WriterOptions};
 
 let mut writer = client.writer(WriterOptions {
     dest: Some(Path::new("./model.cozytensors")),
@@ -63,7 +63,7 @@ let mut writer = client.writer(WriterOptions {
 let bytes: Vec<u8> = [1.0_f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
 let mut input = bytes.as_slice();
 {
-    let mut model = writer.component("model", "", Default::default(), None)?;
+    let mut model = writer.component("model", ClassRef::default(), Default::default(), None)?;
     model.put("weight", Dtype::F32, &[2], &mut input)?;
 }
 let saved = writer.commit().await?;
