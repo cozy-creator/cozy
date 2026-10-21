@@ -258,11 +258,18 @@ pub struct Migrator<'t> {
     table: &'t [Upstream],
     listings: HashMap<String, Vec<remote::Member>>,
     fetched: HashMap<String, Vec<u8>>,
+    offline: bool,
 }
 
 impl<'t> Migrator<'t> {
     pub fn new(access: remote::Access, table: &'t [Upstream]) -> Migrator<'t> {
-        Migrator { access, table, listings: HashMap::new(), fetched: HashMap::new() }
+        Migrator { access, table, listings: HashMap::new(), fetched: HashMap::new(), offline: false }
+    }
+
+    /// A local store transition preserves exactly the files it already has. Recorded source
+    /// provenance remains metadata; it neither authorizes a network request nor fills files.
+    pub(crate) fn offline() -> Migrator<'static> {
+        Migrator { offline: true, ..Migrator::new(remote::Access::default(), &[]) }
     }
 
     /// The repo document `doc` in D10, its old objects read by `read`: each release a public tag,
@@ -469,7 +476,7 @@ impl<'t> Migrator<'t> {
     /// A claimed source resolves where it says (`hf://…@commit`, `civitai://<version>`):
     /// listed once. `local` and `unknown` are markers, not claims.
     fn verify(&mut self, source: &str) -> Result<()> {
-        if [LOCAL, UNKNOWN].contains(&source) || self.listings.contains_key(source) {
+        if self.offline || [LOCAL, UNKNOWN].contains(&source) || self.listings.contains_key(source) {
             return Ok(());
         }
         let listing = remote::list(&remote::parse(source)?, &self.access)?;
