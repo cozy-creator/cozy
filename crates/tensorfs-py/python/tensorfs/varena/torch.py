@@ -171,12 +171,14 @@ class _Pass:
     native: Pass
     #: its model's set
     set: int
-    #: `<entry>|<dims>`: the entry module's path in the model ("" the root) and its tensors' dims
+    #: the module its forward entered: its path in the model ("" the root)
+    entry: str
+    #: its tensor arguments' dims, joined by `x`
     shape: str
     peak: int = 0
     reserved_peak: int = 0
-    #: each cut site's allocated peak and whether it is a collective's
-    sites: dict[str, tuple[int, bool]] = field(default_factory=dict)
+    #: each cut site's allocated peak, whether it is a collective's, and its finest level
+    sites: dict[str, tuple[int, bool, int]] = field(default_factory=dict)
     open: list[list[object]] = field(default_factory=list)
     #: the exception being handled where it opened: another at its close is a raise
     entered: BaseException | None = None
@@ -419,8 +421,8 @@ class Memory:
     # -- passes
 
     def _open(self, model: Model, entry: str, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
-        """The outermost forward of `model` (its root or a direct child, `entry`) is a pass, keyed
-        by its entry and its tensor arguments' dims: each entry point has its own measured room."""
+        """The outermost forward of `model` (its root or a direct child, `entry`) is a pass of its
+        entry at its tensor arguments' dims: each entry point has its own measured room."""
         local = model.local
         local.depth = getattr(local, "depth", 0) + 1
         if local.depth > 1:
@@ -428,15 +430,14 @@ class Memory:
         p: _Pass | None = None
         try:
             r = self._current()
-            dims = "x".join(str(d) for t in tree_leaves((args, kwargs)) if isinstance(t, Tensor) for d in t.shape)
-            shape = f"{entry}|{dims}"
+            shape = "x".join(str(d) for t in tree_leaves((args, kwargs)) if isinstance(t, Tensor) for d in t.shape)
             identity = model.fill.identity if model.fill is not None else None
             if identity != model.identity:
                 for hold in list(model.holds):  # pins of the old bake would keep its pages
                     hold.shed()
                 model.identity = identity
             self.native.fill(model.id, _fill(model.fill))
-            p = _Pass(r.native.pass_(model.id, shape, *self.torch.now()), model.id, shape)
+            p = _Pass(r.native.pass_(model.id, entry, shape, *self.torch.now()), model.id, entry, shape)
             self._cap()
             p.entered = sys.exc_info()[1]
             self._fold()  # the passes open already keep what ran before; this one starts here
@@ -467,8 +468,8 @@ class Memory:
             self.passes.remove(p)
         if sys.exc_info()[1] is not p.entered:
             return  # torch runs this hook in its handler of the forward's raise: unended, it records nothing
-        sites = [(name, peak, collective) for name, (peak, collective) in p.sites.items()]
-        model.last = (p.shape, p.peak, max(p.reserved_peak - p.peak, 0))
+        sites = [(name, *site) for name, site in p.sites.items()]
+        model.last = (f"{p.entry}|{p.shape}", p.peak, max(p.reserved_peak - p.peak, 0))
         p.native.end(model.last[1], model.last[2], sites, *self.torch.now())
 
     # -- blocks
@@ -520,14 +521,16 @@ class Request:
         """Replaces the plan (as `Memory.request` takes it); its cursor starts over."""
         self.native.plan(self.memory._plan(steps))
 
-    def oom(self, need: int | None = None, site: str | None = None, collective: bool = False) -> Next:
-        """An op ran out of memory: varena's answer, with torch's cap applied after it. A
-        `collective` site's finer level waits for the next pass's agreement."""
-        p = _open_pass()
-        answer = self.native.oom(p.set, *self.memory.torch.now(), need, site, collective)
+    def oom(self, need: int | None = None, site: str | None = None, collective: bool = False, finest: int = 0) -> Next:
+        """An op ran out of memory: varena's answer, with torch's cap applied after it. `site` is
+        its cut site (None: it cannot be cut), cut no finer than `finest`; a `collective` site's
+        finer level waits for the next pass's agreement. Outside any pass (package code between
+        passes) varena answers with demand and Park, never a Cut."""
+        p = _pass.get()
+        answer = self.native.oom(p.set if p else None, *self.memory.torch.now(), need, site, collective, finest)
         # The failed attempt's peak is not the pass's: when it ran in its site, it is dropped, and
         # the retry is measured afresh from here.
-        attempt = bool(p.open) and p.open[-1][0] == site
+        attempt = p is not None and bool(p.open) and p.open[-1][0] == site
         self.memory._fold(discard=p if attempt else None)
         self.memory._cap()
         return answer
@@ -560,9 +563,9 @@ class Request:
         return self.native.yielding()
 
     @contextmanager
-    def site(self, name: str, collective: bool = False) -> Iterator[None]:
-        """Measures cut site `name`'s op (a `collective`'s: its levels are agreed per pass): its
-        allocated peak goes into the open pass's sites and its peak."""
+    def site(self, name: str, collective: bool = False, finest: int = 0) -> Iterator[None]:
+        """Measures cut site `name`'s op (a `collective`'s: its levels are agreed per pass; cut no
+        finer than `finest`): its allocated peak goes into the open pass's sites and its peak."""
         p = _pass.get()
         if p is None:
             yield
@@ -576,7 +579,7 @@ class Request:
         finally:
             memory._fold()
             p.open.remove(entry)
-            p.sites[name] = (max(p.sites.get(name, (0, collective))[0], entry[1]), collective)  # type: ignore[call-overload]
+            p.sites[name] = (max(p.sites.get(name, (0,))[0], entry[1]), collective, finest)  # type: ignore[call-overload]
 
     def stats(self) -> Stats:
         return self.ended if self.ended is not None else self.native.stats()

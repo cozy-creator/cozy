@@ -123,11 +123,12 @@ def scaled(plain: UNet2DConditionModel, k: int) -> list[torch.Tensor]:
     return [forward(model, torch.device("cpu"), n) for n in range(2)]
 
 
-def loaded(ck: tensorfs.Checkpoint, mem: Memory, fill: Scale | None = None) -> UNet2DConditionModel:
-    """The model on meta, loaded; a filled one is its own set (its own release)."""
+def loaded(ck: tensorfs.Checkpoint, mem: Memory, fill: Scale | None = None, release: str = "") -> UNet2DConditionModel:
+    """The model on meta, loaded. A `release` names a set of its own (a filled model's is
+    "scaled"), whose measured rooms are its own: a probe's big buffers stay out of the others'."""
     with torch.device("meta"):
         unet = UNet2DConditionModel(**CONFIG).eval()
-    vars(unet)["_varena"] = Declared(Weights(ck, "unet", release="scaled" if fill else ""), fill=fill)
+    vars(unet)["_varena"] = Declared(Weights(ck, "unet", release=release or ("scaled" if fill else "")), fill=fill)
     mem.load(unet, "gpu")
     return unet
 
@@ -136,7 +137,7 @@ def concurrent(mem: Memory, ck: tensorfs.Checkpoint) -> None:
     """Two threads run two models' passes interleaved: the first allocates and frees a buffer,
     then waits while the second opens its pass (a device-wide peak reset) and ends it. The first
     pass's peak must still hold its buffer, and the second's must not."""
-    a, b = loaded(ck, mem), loaded(ck, mem)
+    a, b = loaded(ck, mem, release="concurrent"), loaded(ck, mem, release="concurrent")
     big = 1 << 29  # far above the tiny model's own activations, so the peaks tell the passes apart
     opened, done = threading.Event(), threading.Event()
 
@@ -181,12 +182,19 @@ def concurrent(mem: Memory, ck: tensorfs.Checkpoint) -> None:
 def run(mem: Memory, unet: UNet2DConditionModel, want: list[torch.Tensor], id: str, atol: float) -> tuple[native.Stats, list[torch.Tensor]]:
     """A forward of `unet` per expected output, in one request."""
     got = []
-    with mem.request(id, plan=[unet] * len(want)) as r:
-        for n, expected in enumerate(want):
-            got.append(forward(unet, mem.device, n))
-            diff = (got[n] - expected).abs().max().item()
-            check(f"{id}: pass {n} equals its reference (max diff {diff:.2e})", diff <= atol, diff)
+    try:
+        with mem.request(id, plan=[unet] * len(want)) as r:
+            for n, expected in enumerate(want):
+                got.append(forward(unet, mem.device, n))
+                diff = (got[n] - expected).abs().max().item()
+                check(f"{id}: pass {n} equals its reference (max diff {diff:.2e})", diff <= atol, diff)
+    except native.Exhausted as short:
+        # What varena saw: the request's steps (capacity, working set), torch's bytes and its cap.
+        print(f"EXHAUSTED {id}: {short}; torch_limit {mem.native.torch_limit()}, torch {mem.torch.now()}; STATS {short.stats.json()}", flush=True)
+        raise
     stats = r.stats()
+    # Each step's capacity and working set (weights plus its largest measured pass room).
+    print(f"STEPS {id}: " + " ".join(f"(capacity {t.capacity}, w {t.w})" for t in stats.steps) + f"; last pass {mem.models[unet].last}", flush=True)
     check(f"{id}: leaves nothing behind", stats.leftover == 0, stats.leftover)
     check(f"{id}: its record crosses as JSON", json.loads(stats.json())["request"] == id, stats.json())
     return stats, got
@@ -257,10 +265,11 @@ def child(store: str, table: str, capacity: int, reference: str) -> int:
     return 0 if all(results) else 1
 
 
-def attempts(mem: Memory, unet: UNet2DConditionModel) -> None:
+def attempts(mem: Memory, ck: tensorfs.Checkpoint) -> None:
     """An op at a cut site fails (its attempt allocated `failed` bytes), varena answers, and the
     retry allocates `retried`: the pass records the completed attempt's peak, not the failed one's."""
     failed, retried = 1 << 30, 1 << 28  # apart by far more than the tiny model's own activations
+    unet = loaded(ck, mem, release="attempts")
 
     def op(*_: object) -> None:
         r = mem._current()
@@ -298,7 +307,7 @@ def main() -> int:
     measured: list[bool] = []
     with mem.request("entries", plan=[unet, unet]) as r:
         def seen(*_: object) -> None:
-            keys.append(adapter._pass.get().shape)
+            keys.append(adapter._pass.get().entry)
             measured.append(r.measured())
 
         probe = unet.conv_in.register_forward_pre_hook(seen)
@@ -311,10 +320,14 @@ def main() -> int:
     check("entries: a new entry's room is estimated, a measured shape's is measured", measured == [False, True], measured)
     diff = (got - plain.conv_in(x.cpu()).detach()).abs().max().item()
     check(f"entries: a direct child's forward runs bound (max diff {diff:.2e})", diff <= ACROSS, diff)
-    check("entries: each entry is its own pass key", len(keys) == 2 and keys[0].startswith("conv_in|") and keys[1].startswith("|"), keys)
+    check("entries: each entry is its own pass key", keys == ["conv_in", ""], keys)
+    steps = r.stats().steps
+    with mem.request("between") as between:
+        answer = between.oom(None, None)  # package code between passes: no pass to cut
+    check("between passes: an OOM is answered, never refused", isinstance(answer, native.Next), answer)
     # The capacity varena ran a step against is the card less contexts (grown by now: cuDNN,
     # cuBLAS) and foreign bytes; the limits below are that much plus what they mean to hold.
-    base = mem.gpu.memory - min(step.capacity for step in r.stats().steps)
+    base = mem.gpu.memory - min(step.capacity for step in steps)
 
     shed: list[bool] = []
     scale = Scale(2)
@@ -325,7 +338,7 @@ def main() -> int:
     run(mem, filled, scaled(plain, 3)[:1], "scaled x3", ACROSS if CUDA else SAME)
     check("identity: a pass under a new identity shed the hold of the old bake", shed == [True] and not mem.models[filled].holds, (shed, hold.blocks))
     concurrent(mem, ck)
-    attempts(mem, unet)
+    attempts(mem, ck)
     spans = model.set.spans
     room = stats.peak - sum(spans)  # the passes' measured room beside the weights
     common, blocks = spans[0], sorted(spans[1:])
