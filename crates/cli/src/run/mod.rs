@@ -163,8 +163,8 @@ enum Verb {
         /// The run's number or id, and `#output` when it wrote more than one.
         #[arg(value_name = "RUN[#OUTPUT]")]
         run: String,
-        /// The destination repository.
-        #[arg(value_name = "ORG/MODEL")]
+        /// Where it goes: org/model[@tag], the repository and the private tag it moves (main).
+        #[arg(value_name = "ORG/MODEL[@TAG]")]
         model: String,
         /// Print the upload's run record at once instead of following it.
         #[arg(long)]
