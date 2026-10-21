@@ -130,9 +130,10 @@ location  = [chunk_index, offset, length]
   reader MUST refuse a class that is not three texts or has an empty `library` with a `name` or `version`. `version`
   MAY be `""` where nothing records it (a local folder); a writer warns then. The pipeline's is `diffusers` and its
   `_class_name`. With a pipeline, a component's library and name are its `model_index.json` entry `[library, Class]`,
-  and the unknown class where the entry is `[null, null]` or absent. An entry's library that is not installed
-  (`diffusers`, `transformers`, or one some config of the model records a version for) is a Diffusers pipeline module
-  (`stable_diffusion`, `kandinsky`), so the class is `diffusers`'s: SD's safety checker is `["diffusers", <the model's
+  and the unknown class where the entry is `[null, null]` or absent. A dotted library is a module path of a package
+  library, so the library is its top-level package (`minimax_h3.pipeline` is `minimax_h3`). An undotted one that is
+  not installed (`diffusers`, `transformers`, or one some config of the model records a version for) is a Diffusers
+  pipeline module (`stable_diffusion`, `kandinsky`), so the class is `diffusers`'s: SD's safety checker is `["diffusers", <the model's
   diffusers version>, "StableDiffusionSafetyChecker"]`. Without one, they are what the component's config names: Transformers'
   `architectures[0]`, Diffusers' `_class_name`, or a tokenizer config's `tokenizer_class`. The version is the
   component's own config's for its library (`_diffusers_version`, `transformers_version`), else one another config of

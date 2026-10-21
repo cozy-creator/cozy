@@ -462,8 +462,8 @@ fn documents(
 ///   it names no class for has the unknown class.
 /// - Without one, a component named [`ROOT_COMPONENT`] owns the root (a Transformers folder),
 ///   and a component's class is its config's ([`config_class`]).
-/// - A pair's library that is a Diffusers pipeline module (`stable_diffusion`) is `diffusers`
-///   ([`class_of`]). A class's version is its own config's for its library (`_diffusers_version`,
+/// - A pair's library is its package for a dotted module path, and `diffusers` for a Diffusers
+///   pipeline module (`stable_diffusion`) ([`class_of`]). A class's version is its own config's for its library (`_diffusers_version`,
 ///   `transformers_version`), else one another config of the model records for that library,
 ///   else `reference`'s (the converter's pinned reference configs), else `""`.
 /// - In a component's folder, the first of [`CONFIGS`] is its config, and the other run files
@@ -561,15 +561,18 @@ pub fn layout(
     })
 }
 
-/// A class from its library and name: the library as written when it is installed (`diffusers`,
-/// `transformers`, or one `versions` holds), else a Diffusers pipeline module (`stable_diffusion`,
-/// `kandinsky`) and so `diffusers`; at the version `versions` holds for that library, else `""`.
-/// `versions` is the model's: its configs' records, then the converter reference's.
+/// A class from a `model_index.json` pair's library and name. The library is:
+/// - a dotted module path's top-level package (`minimax_h3.pipeline` is `minimax_h3`);
+/// - itself when installed: `diffusers`, `transformers`, or one `versions` holds;
+/// - else a Diffusers pipeline module (`stable_diffusion`, `kandinsky`), so `diffusers`.
+///
+/// The version is the one `versions` holds for that library, else `""`. `versions` is the
+/// model's: its configs' records, then the converter reference's.
 pub fn class_of(library: &str, name: &str, versions: &Versions) -> ClassRef {
-    let library = match library {
-        "diffusers" | "transformers" => library,
-        installed if versions.contains_key(installed) => installed,
-        _ => "diffusers",
+    let library = match library.split_once('.') {
+        Some((package, _)) => package,
+        None if matches!(library, "diffusers" | "transformers") || versions.contains_key(library) => library,
+        None => "diffusers",
     };
     ClassRef::new(library, versions.get(library).map_or("", String::as_str), name)
 }
