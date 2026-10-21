@@ -328,8 +328,9 @@ fn pages_fill_protect_unmap_and_survive_a_clean_owner_exit() {
     step!();
 }
 
-/// `stray`: one `st.global.u8` of 7 at its argument. `copy`: `words` u64s from `src` to `dst`,
-/// one thread (a consumer that reads a page).
+/// `stray`: one `st.global.u8` of 7 at its argument. `spin`: busy for `ns` nanoseconds of the
+/// GPU's clock (a forward). `copy`: `words` u64s from `src` to `dst`, one thread (a consumer that
+/// reads a page).
 const KERNELS: &std::ffi::CStr = c"
 .version 7.0
 .target sm_70
@@ -340,6 +341,18 @@ const KERNELS: &std::ffi::CStr = c"
     ld.param.u64 %a, [at];
     mov.u32 %v, 7;
     st.global.u8 [%a], %v;
+    ret;
+}
+.visible .entry spin(.param .u64 ns) {
+    .reg .b64 %start, %now, %n, %d;
+    .reg .pred %p;
+    ld.param.u64 %n, [ns];
+    mov.u64 %start, %globaltimer;
+SPIN:
+    mov.u64 %now, %globaltimer;
+    sub.u64 %d, %now, %start;
+    setp.lt.u64 %p, %d, %n;
+    @%p bra SPIN;
     ret;
 }
 .visible .entry copy(.param .u64 dst, .param .u64 src, .param .u64 words) {
@@ -1024,7 +1037,7 @@ fn concurrent_binds_of_one_block_fill_it_once() {
 
 #[test]
 #[ignore = "native GPU: a rental only"]
-fn a_page_unmaps_only_after_its_last_consumer() {
+fn a_rebind_waits_in_stream_while_the_last_consumer_runs() {
     let (b, g, uuid) = card("release");
     step!();
     let _ledger = Ledger::create(&g, None).unwrap();
@@ -1055,12 +1068,11 @@ fn a_page_unmaps_only_after_its_last_consumer() {
     step!();
     drop(pin);
     step!();
-    // Memory takes the release now; its event waits behind the gate and the copy. A second bind
-    // must wait for it too.
+    // Memory takes the release now; its event waits behind the gate and the copy. The rebind
+    // refills the page in place after it: in-stream, never waiting for it on the host.
     let _ = mem.torch_limit();
-    // The rebind waits for the refill, which waits in-stream for the consumer behind the gate.
     let (again, waited) = std::thread::scope(|t| {
-        let (rebind, waited) = blocked(t, first, || mem.bind(s, 0, 0));
+        let (rebind, waited) = watch(t, first, || mem.bind(s, 0, 0));
         drop(gate);
         (rebind.join().unwrap(), waited)
     });
@@ -1069,7 +1081,7 @@ fn a_page_unmaps_only_after_its_last_consumer() {
     step!();
     assert_eq!(bytes(dst, REGION_ALIGN, 0), *block(2, 0));
     step!();
-    assert_eq!(waited, Waited::Asleep, "the rebind spun on the host waiting for the consumer (a host sync)");
+    assert_eq!(waited, Waited::Returned, "the rebind waited on the host while the last consumer ran (longer than a whole first bind took)");
     step!();
     let again = again.unwrap();
     step!();
@@ -1085,23 +1097,25 @@ fn a_page_unmaps_only_after_its_last_consumer() {
     step!();
     assert_eq!(r.end().leftover, 0);
     step!();
-    println!("PASS a page unmaps only after its last consumer {uuid}");
+    println!("PASS a rebind waits in-stream while the last consumer runs {uuid}");
     step!();
 }
 
-/// How a waiter was seen waiting.
+/// What a call on another thread was seen doing.
 #[derive(Debug, PartialEq)]
 enum Waited {
-    /// Asleep (state S or D) inside its call: it waits for an event that wakes it.
+    /// It returned.
+    Returned,
+    /// Asleep (state S or D) for longer than `budget`, the same call's whole earlier duration:
+    /// it waits on the host for something the caller still holds back.
     Asleep,
-    /// Running on the CPU longer than `budget`, the same call's whole earlier duration: it spins
-    /// on the host, waiting for the device.
+    /// Running on the CPU for longer than `budget`: it spins on the host, waiting for the device.
     Spun,
 }
 
-/// Runs `f` on a thread of `t` and returns once that thread is seen waiting inside `f` before it
-/// returned, and how: the wait the caller then ends is real, not skipped.
-fn blocked<'s, T: Send + 's>(t: &'s std::thread::Scope<'s, '_>, budget: std::time::Duration, f: impl FnOnce() -> T + Send + 's) -> (std::thread::ScopedJoinHandle<'s, T>, Waited) {
+/// Runs `f` on a thread of `t` and watches it, the caller holding back what `f` may wait for,
+/// until `f` returns or is seen waiting on the host (asleep or spinning) for longer than `budget`.
+fn watch<'s, T: Send + 's>(t: &'s std::thread::Scope<'s, '_>, budget: std::time::Duration, f: impl FnOnce() -> T + Send + 's) -> (std::thread::ScopedJoinHandle<'s, T>, Waited) {
     let (sent, tid) = mpsc::channel();
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let finished = done.clone();
@@ -1113,19 +1127,139 @@ fn blocked<'s, T: Send + 's>(t: &'s std::thread::Scope<'s, '_>, budget: std::tim
         out
     });
     let task = format!("/proc/self/task/{}", tid.recv().unwrap());
+    let mut asleep: Option<std::time::Instant> = None;
     loop {
-        let stat = std::fs::read_to_string(format!("{task}/stat")).unwrap();
+        if done.load(std::sync::atomic::Ordering::Acquire) {
+            return (handle, Waited::Returned);
+        }
+        let (Ok(stat), Ok(sched)) = (std::fs::read_to_string(format!("{task}/stat")), std::fs::read_to_string(format!("{task}/schedstat"))) else {
+            // The thread ended between the looks.
+            return (handle, Waited::Returned);
+        };
         let state = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_owned));
-        let ran = std::fs::read_to_string(format!("{task}/schedstat")).unwrap().split_whitespace().next().unwrap().parse::<u128>().unwrap();
-        assert!(!done.load(std::sync::atomic::Ordering::Acquire), "it returned without waiting");
+        let ran = sched.split_whitespace().next().unwrap().parse::<u128>().unwrap();
         if matches!(state.as_deref(), Some("S" | "D")) {
-            return (handle, Waited::Asleep);
+            if asleep.get_or_insert_with(std::time::Instant::now).elapsed() > budget {
+                return (handle, Waited::Asleep);
+            }
+        } else {
+            asleep = None;
         }
         if ran > budget.as_nanos() {
             return (handle, Waited::Spun);
         }
         std::thread::yield_now();
     }
+}
+
+/// While a forward runs on the card (a kernel on a stream that reads a set's pages), the bind and
+/// pass paths run on the host: binds that evict idle pages, releases, a pass start, the torch cap,
+/// an unload, and the backend's own calls (free, process bytes, events). None may wait for the
+/// forward: each one's wall time stays below the forward's, which is ten times the bind sequence
+/// on an idle card (a call that waited would take at least that long). Every time is reported.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn the_bind_and_pass_paths_do_not_wait_for_a_running_forward() {
+    let (b, g, uuid) = card("forward");
+    step!();
+    let probe = CudaBackend::open(0).unwrap();
+    step!();
+    let _ledger = Ledger::create(&g, None).unwrap();
+    let mem = memory(b, &g);
+    step!();
+    // 64 pages: 128 MiB of binds, each one evicting an idle page on the full card.
+    let pages = 64;
+    step!();
+    let a = mem.load(set("a", 4, Fill::Stored, &g.uuid, |b| block(20, b)), Level::Ram).unwrap();
+    step!();
+    let (b1, b2) = (mem.load(bulk("b1", pages, &g.uuid), Level::Ram).unwrap(), mem.load(bulk("b2", pages, &g.uuid), Level::Ram).unwrap());
+    step!();
+    let c = mem.load(set("c", 1, Fill::Stored, &g.uuid, |b| block(21, b)), Level::Ram).unwrap();
+    step!();
+    let _crowd = crowd();
+    mem.load(bulk("idle", more_than_free(), &g.uuid), Level::Gpu).unwrap();
+    step!();
+    let r = mem.request("r", plan(&[&["a", "b1", "b2", "c"]])).unwrap();
+    step!();
+    let mut passes: Vec<Pass> = [a, b1, b2].iter().map(|s| r.pass(*s, "main", "1", Torch::default()).unwrap()).collect();
+    step!();
+    let sequence = |set: SetId| {
+        let start = std::time::Instant::now();
+        let pins: Vec<Pin> = (0..pages).map(|b| mem.bind(set, b, 0).unwrap()).collect();
+        drop(pins);
+        start.elapsed()
+    };
+    step!();
+    let idle = sequence(b1);
+    step!();
+    let forward = idle * 10;
+    step!();
+    let stream = cuda::Stream::new(0).unwrap();
+    step!();
+    let other = cuda::Stream::new(0).unwrap();
+    step!();
+    let pins: Vec<Pin> = (0..4).map(|b| mem.bind(a, b, stream.raw()).unwrap()).collect();
+    step!();
+    let launched = std::time::Instant::now();
+    step!();
+    assert_eq!(launch(c"spin", &[forward.as_nanos() as u64], stream.raw()), cuda::SUCCESS);
+    step!();
+    drop(pins);
+    step!();
+    let mut times: Vec<(&str, std::time::Duration)> = vec![];
+    step!();
+    let mut time = |what: &'static str, f: &mut dyn FnMut()| {
+        let start = std::time::Instant::now();
+        f();
+        times.push((what, start.elapsed()));
+    };
+    step!();
+    time("binds+evictions", &mut || {
+        sequence(b2);
+    });
+    step!();
+    time("pass start", &mut || passes.push(r.pass(c, "main", "1", Torch::default()).unwrap()));
+    step!();
+    time("torch_limit", &mut || {
+        mem.torch_limit();
+    });
+    step!();
+    time("unload", &mut || mem.unload(b1));
+    step!();
+    time("free", &mut || {
+        probe.free().unwrap();
+    });
+    step!();
+    time("process_used", &mut || {
+        let _ = probe.process_used();
+    });
+    step!();
+    time("record+query+wait", &mut || {
+        let e = probe.record(stream.raw()).unwrap();
+        assert!(!probe.query(e).unwrap(), "the forward is still running");
+        probe.wait(e, other.raw()).unwrap();
+        probe.retire(e);
+    });
+    step!();
+    stream.drain().unwrap();
+    step!();
+    let ran = launched.elapsed();
+    step!();
+    assert!(ran >= forward, "the forward ran {ran:?}, asked {forward:?}");
+    step!();
+    let report: Vec<String> = times.iter().map(|(w, t)| format!("{w} {t:?}")).collect();
+    step!();
+    println!("FORWARD {ran:?} (binds+evictions of {pages} pages on an idle card: {idle:?}): {}", report.join(", "));
+    step!();
+    for (what, took) in &times {
+        assert!(*took < forward, "{what} took {took:?} under a {forward:?} forward: it waited for it");
+    }
+    drop(passes);
+    step!();
+    assert_eq!(r.end().leftover, 0);
+    step!();
+    println!("PASS the bind and pass paths do not wait for a running forward {uuid}");
+    step!();
 }
 
 /// A pass of `m` (two pinned blocks) whose one-gibibyte activation meets a real OOM: the card is
@@ -1400,12 +1534,12 @@ fn a_transform_binds_another_set_under_pressure_and_a_second_binder_waits_for_it
     assert_eq!(launch(c"copy", &[pin.ptr, f.ptr, REGION_ALIGN / 8], stream.raw()), cuda::SUCCESS);
     step!();
     let (second, waited) = std::thread::scope(|t| {
-        let (waiter, waited) = blocked(t, first, || mem.bind(base, 0, 0).unwrap());
+        let (waiter, waited) = watch(t, first, || mem.bind(base, 0, 0).unwrap());
         pin.filled();
         (waiter.join().unwrap(), waited)
     });
     step!();
-    assert_eq!(waited, Waited::Asleep, "the second binder spun on the host waiting for the bake");
+    assert_eq!(waited, Waited::Asleep, "the second binder must wait, asleep, for the bake ({waited:?})");
     step!();
     assert!(!second.fresh, "the second binder gets the baked page");
     step!();
