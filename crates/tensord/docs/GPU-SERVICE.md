@@ -97,7 +97,8 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   by rank 0.
 - TensorD handles no byte count: it asks each GPU's ledger `fits(package, shape)`, from the
   peaks varena measured per `<construction>|<shape>` (the shape: PrepareRequest's feature values
-  joined by `x`; `""` before it is known, where an unmeasured call fits only on an idle GPU).
+  joined by `x`; `""` before it is known: the package's widest measured shape, and with none
+  measured it fits only on an idle GPU).
   Before a cold session spawns, and again once its request's shape is known, while it does not
   fit and nothing runs on a GPU of its lane, idle executors end, least recently used first,
   outside every warm set first. The request is then admitted on every GPU of its lane or none
