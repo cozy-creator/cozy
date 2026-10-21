@@ -162,6 +162,42 @@ mod imp {
         unsafe { libc::write(event.as_raw_fd(), one.as_ptr().cast(), 8) };
     }
 
+    /// The GPU's wake endpoint, bound by its TensorD: a datagram socket named for the GPU that
+    /// every participant signals, so a standalone process's frees reach it too. `None` while
+    /// another process holds it.
+    pub(crate) fn wake_bind(name: &str) -> Result<Option<Owned>> {
+        match std::os::unix::net::UnixDatagram::bind_addr(&address(&format!("wake-{name}"))?) {
+            Ok(s) => {
+                s.set_nonblocking(true).map_err(|e| Error::io("wake", e))?;
+                Ok(Some(s.into()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Ok(None),
+            Err(e) => Err(Error::io("bind the wake", e)),
+        }
+    }
+
+    /// A participant's sending end (unbound).
+    pub(crate) fn wake_sender() -> Result<Owned> {
+        let s = std::os::unix::net::UnixDatagram::unbound().map_err(|e| Error::io("wake", e))?;
+        s.set_nonblocking(true).map_err(|e| Error::io("wake", e))?;
+        Ok(s.into())
+    }
+
+    /// Signals the GPU's wake; nobody bound (no TensorD), a full queue (a wake is pending
+    /// already) and a bad name are all no signal needed.
+    pub(crate) fn wake(sender: &Owned, name: &str) {
+        let Ok(addr) = address(&format!("wake-{name}")) else { return };
+        let Ok(s) = sender.try_clone().map(std::os::unix::net::UnixDatagram::from) else { return };
+        let _ = s.send_to_addr(&[1], &addr);
+    }
+
+    /// Clears every wake received so far.
+    pub(crate) fn wake_clear(endpoint: &Owned) {
+        let mut buf = [0u8; 64];
+        // SAFETY: nonblocking reads into our buffer until the queue is empty.
+        while unsafe { libc::recv(endpoint.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) } > 0 {}
+    }
+
     /// Blocks until `event` is readable, then clears it.
     pub(crate) fn await_event(event: &Owned) -> Result<()> {
         let mut poll = libc::pollfd { fd: event.as_raw_fd(), events: libc::POLLIN, revents: 0 };
@@ -346,7 +382,8 @@ mod imp {
         let state = |path: String| std::fs::read_to_string(path).ok().and_then(|s| s.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string)));
         let process = state(format!("/proc/{pid}/stat"));
         let thread = state(format!("/proc/{pid}/task/{tid}/stat"));
-        process.as_deref() == Some("Z") || matches!(thread.as_deref(), Some("T" | "t"))
+        // `t` (traced: py-spy, gdb) is never a stall.
+        process.as_deref() == Some("Z") || thread.as_deref() == Some("T")
     }
 
     /// Whether the file still has a name (a table whose name was unlinked is nobody's).
@@ -427,6 +464,14 @@ mod imp {
         Err(later())
     }
     pub(crate) fn signal(_: &Owned) {}
+    pub(crate) fn wake_bind(_: &str) -> Result<Option<Owned>> {
+        Err(later())
+    }
+    pub(crate) fn wake_sender() -> Result<Owned> {
+        Err(later())
+    }
+    pub(crate) fn wake(_: &Owned, _: &str) {}
+    pub(crate) fn wake_clear(_: &Owned) {}
     pub(crate) fn await_event(_: &Owned) -> Result<()> {
         Err(later())
     }
