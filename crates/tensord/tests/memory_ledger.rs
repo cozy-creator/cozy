@@ -69,22 +69,22 @@ fn plan() -> Plan {
 }
 
 /// An executor stand-in: run by `StandIn::spawn` with its control socket at stdin. It opens its
-/// memory with the two descriptors that arrive first, then answers one line per command:
-/// `load` (a request binding every block: `<kept> <tier> <store>` bytes moved), `run <id>` (a
-/// request whose pass starts, unmeasured) and `end` (that pass measured, the request ended).
+/// memory with the two descriptors that arrive first and loads the set at its level (`gpu`:
+/// warmed, `ram`: in the RAM tier only), then answers one line per command: `load` (a request
+/// binding every block: `<origins> <kept bytes> <store bytes>`), `run <id>` (a request whose
+/// pass starts, unmeasured) and `end` (that pass measured, the request ended).
 #[test]
 #[ignore = "memory_ledger's tests run it as an executor"]
 fn executor_stand_in() {
     let Ok(gpu) = std::env::var("S5_STAND_IN") else { return };
-    let (uuid, rest) = gpu.split_once('|').unwrap();
-    let (model, bytes) = rest.split_once('|').unwrap();
+    let [uuid, model, bytes, level] = gpu.split('|').collect::<Vec<_>>()[..] else { panic!("{gpu}") };
     let gpu = GpuId { uuid: uuid.into(), model: model.into(), memory: bytes.parse().unwrap() };
     // SAFETY: the spawning test installs its private socket at the child's stdin.
     let control = unsafe { UnixStream::from_raw_fd(0) };
     let table = platform::handles::recv_fd(&control).unwrap();
     let events = platform::handles::recv_fd(&control).unwrap();
     let memory = Memory::open(gpu.clone(), Some(Grant { table, events }), Box::new(HostBackend::new(gpu.memory))).unwrap();
-    let set = memory.load(spec(&gpu), Level::Ram).unwrap();
+    let set = memory.load(spec(&gpu), if level == "gpu" { Level::Gpu } else { Level::Ram }).unwrap();
     let (mut out, lines) = (control.try_clone().unwrap(), BufReader::new(control).lines());
     let mut running = None;
     for line in lines.map_while(Result::ok) {
@@ -96,8 +96,8 @@ fn executor_stand_in() {
                 drop(pins);
                 pass.end(Measured::default(), Torch::default());
                 let stats = request.end();
-                let moved = stats.moved;
-                format!("{} {} {}", moved.kept.bytes, moved.tier.bytes, moved.store.bytes)
+                let origins: Vec<String> = stats.trace.iter().map(|bind| format!("{:?}", bind.origin)).collect();
+                format!("{} {} {}", origins.join(","), stats.moved.kept.bytes, stats.moved.store.bytes)
             }
             ("run", id) => {
                 let request = memory.request(id, plan()).unwrap();
@@ -125,11 +125,11 @@ struct StandIn {
 }
 
 impl StandIn {
-    fn spawn(gpu: &Gpu, id: &GpuId) -> StandIn {
+    fn spawn(gpu: &Gpu, id: &GpuId, level: &str) -> StandIn {
         let (control, theirs) = UnixStream::pair().unwrap();
         let child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "executor_stand_in", "--ignored", "--nocapture"])
-            .env("S5_STAND_IN", format!("{}|{}|{}", id.uuid, id.model, id.memory))
+            .env("S5_STAND_IN", format!("{}|{}|{}|{level}", id.uuid, id.model, id.memory))
             .stdin(Stdio::from(OwnedFd::from(theirs)))
             .stdout(Stdio::null())
             .spawn()
@@ -153,11 +153,11 @@ impl StandIn {
         reply.trim().to_string()
     }
 
-    /// (kept, tier, store) bytes its load request moved.
-    fn load(&mut self) -> (u64, u64, u64) {
+    /// Where its load request's binds came from, and the bytes it imported and read.
+    fn load(&mut self) -> (String, u64, u64) {
         let reply = self.ask("load");
-        let moved: Vec<u64> = reply.split(' ').map(|n| n.parse().unwrap()).collect();
-        (moved[0], moved[1], moved[2])
+        let [origins, kept, store] = reply.split(' ').collect::<Vec<_>>()[..] else { panic!("{reply}") };
+        (origins.into(), kept.parse().unwrap(), store.parse().unwrap())
     }
 
     /// `kill -9`, then waitpid.
@@ -195,10 +195,9 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
     .unwrap();
     let set_bytes = spec(&id).layout.nbytes;
 
-    // Granted at spawn, it loads from the RAM tier or the store: nothing is kept yet.
-    let mut first = StandIn::spawn(&gpu, &id);
-    let (kept, tier, store) = first.load();
-    assert_eq!((kept, tier + store), (0, set_bytes));
+    // Granted at spawn, it warms the set onto its GPU: binds are hits there.
+    let mut first = StandIn::spawn(&gpu, &id, "gpu");
+    assert_eq!(first.load(), ("Hit,Hit,Hit".into(), 0, 0));
     assert!(gpu.maps(first.pid()));
 
     // An unmeasured run fits nothing beside it.
@@ -228,8 +227,8 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
     wakes.recv_timeout(BACKSTOP).expect("a reaped row signals");
     assert!(!gpu.status().rows.iter().any(|row| row.pid == pid && row.live));
     assert!(orphans(&gpu) >= set_bytes, "its kept pages are orphans");
-    let mut second = StandIn::spawn(&gpu, &id);
-    assert_eq!(second.load(), (set_bytes, 0, 0), "every page imported by fingerprint");
+    let mut second = StandIn::spawn(&gpu, &id, "ram");
+    assert_eq!(second.load(), ("Kept,Kept,Kept".into(), set_bytes, 0), "every page imported by fingerprint");
     assert_eq!(orphans(&gpu), 0);
 
     // Peaks persist per GPU model: another GPU of the model starts with them.
