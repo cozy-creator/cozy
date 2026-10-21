@@ -311,6 +311,9 @@ async fn eager_open_downloads_checkpoint_bytes_without_materializing_a_repositor
     // A copy of another length is not held: offline it is not cached, as a missing one is;
     // online it is fetched again and replaced.
     fs::write(&blob, b"damaged").unwrap();
+    let mut protected = fs::metadata(&blob).unwrap().permissions();
+    protected.set_readonly(true);
+    fs::set_permissions(&blob, protected).unwrap();
     let refused = client.open("account/eager", &offline).await.unwrap_err();
     assert_eq!((refused.kind, refused.detail.ends_with("is not cached")), (Kind::NotFound, true), "{refused}");
     client.open("account/eager", &Open { lazy: false, ..options }).await.unwrap();

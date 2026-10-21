@@ -458,9 +458,18 @@ impl Store {
     fn install(&self, temp: &Path, blob: &Path, sha256: &str) -> Result<()> {
         let length = fs::metadata(temp).map_err(fail("stat", temp))?.len();
         if let Some(held) = self.young(sha256)? {
-            if held.metadata().map_err(fail("stat", blob))?.len() == length {
+            let metadata = held.metadata().map_err(fail("stat", blob))?;
+            if metadata.len() == length {
                 let _ = fs::remove_file(temp);
                 return Ok(());
+            }
+            // Windows refuses to replace a read-only file.
+            #[cfg(windows)]
+            #[allow(clippy::permissions_set_readonly_false)]
+            {
+                let mut writable = metadata.permissions();
+                writable.set_readonly(false);
+                fs::set_permissions(blob, writable).map_err(fail("unprotect", blob))?;
             }
         }
         let shard = blob.parent().expect("a blob has a shard");
