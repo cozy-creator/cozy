@@ -141,6 +141,15 @@ impl Drop for ChildRow {
 #[test]
 #[ignore]
 fn child() {
+    if let Some(name) = std::env::var_os("VARENA_TEST_CAP_REOPEN") {
+        let requested = std::env::var("VARENA_TEST_CAP_BYTES")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let opened = Ledger::create(name.to_str().unwrap(), requested).unwrap();
+        println!("@cap {} {}", std::process::id(), opened.capacity());
+        return;
+    }
     let control = unsafe { UnixStream::from_raw_fd(9) };
     let table = platform::handles::recv_fd(&control).unwrap();
     let events = platform::handles::recv_fd(&control).unwrap();
@@ -1220,4 +1229,82 @@ fn reopened_coordinator_gets_real_eventfd_wakeups() {
         "reopened coordinator missed shared progress"
     );
     assert_eq!(reopened.status().unwrap().rows[0].snapshot.classes, [3; 7]);
+}
+
+#[test]
+fn managed_cap_survives_idle_physical_reopens_and_releases_only_with_its_coordinator() {
+    let name = format!(
+        "cap-authority-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Relaxed)
+    );
+    let host = std::sync::Arc::new(varena::ledger::HostCache::default());
+    let coordinate = |capacity| Ledger::create_managed_with_host(&name, capacity, host.clone());
+    let managed = coordinate(6 << 30).unwrap();
+    assert!(managed.status().unwrap().rows.is_empty());
+    let local = Ledger::create(&name, 24 << 30).unwrap();
+    assert_eq!(local.capacity(), 6 << 30);
+    assert_eq!(managed.capacity(), 6 << 30);
+    assert!(
+        coordinate(12 << 30).is_err(),
+        "one live pool owns the ceiling"
+    );
+    let process = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "child",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("VARENA_TEST_CAP_REOPEN", &name)
+        .env("VARENA_TEST_CAP_BYTES", (24u64 << 30).to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = process.id();
+    assert_ne!(pid, std::process::id());
+    let output = process.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout
+        .lines()
+        .any(|line| line.ends_with(&format!("@cap {pid} {}", 6u64 << 30))));
+    assert_eq!(
+        managed.capacity(),
+        6 << 30,
+        "a fresh process must not replace idle authority"
+    );
+    // CUDA's actual usable total still clamps the shared authority downward.
+    assert_eq!(local.limit_capacity(5 << 30).unwrap(), 5 << 30);
+    assert_eq!(managed.capacity(), 5 << 30);
+    let grant = managed.grant_unbound().unwrap();
+    let adopted = Ledger::adopt(grant.table.as_fd(), grant.events.as_fd()).unwrap();
+    assert_eq!(adopted.capacity(), 5 << 30);
+    drop(managed);
+    // Neither local/adopted opens nor any of the three granted descriptors own
+    // the coordinator's independent CLOEXEC authority lease.
+    let next = coordinate(12 << 30).unwrap();
+    assert_eq!(next.capacity(), 12 << 30);
+    assert_eq!(adopted.capacity(), 12 << 30);
+    let mut executor = ChildRow::spawn(&next);
+    assert_eq!(executor.call("capacity"), (12u64 << 30).to_string());
+    drop(next);
+    assert!(
+        coordinate(6 << 30).is_err(),
+        "a live executor still forbids lowering"
+    );
+    executor.kill();
+    drop(executor);
+    let uncapped = coordinate(24 << 30).unwrap();
+    assert_eq!(uncapped.capacity(), 24 << 30);
+    assert_eq!(local.capacity(), 24 << 30);
+    drop((uncapped, adopted, grant, local));
+    let uid = unsafe { libc::geteuid() };
+    std::fs::remove_file(format!("/dev/shm/varena-{name}-{uid}")).unwrap();
 }
