@@ -36,20 +36,31 @@ pub struct Ceiling {
     pub h2d_gbps: Option<f64>,
     /// Streams used by the fastest measured H2D probe.
     pub streams: Option<u32>,
+    /// Page cache → pinned staging GB/s on that GPU's readers: what a warm read can reach.
+    pub copy_gbps: Option<f64>,
+    /// Readers that reached `copy_gbps`.
+    pub copy_readers: Option<u32>,
 }
 
-/// What reads from `path`'s volume (and, with `device`, copies to that GPU) can reach.
+/// What reads from `path`'s volume (and, with `device`, copies to that GPU, and its readers' copies
+/// out of the page cache) can reach.
 pub fn ceiling(device: Option<i32>, path: &Path) -> io::Result<Ceiling> {
     #[cfg(unix)]
     let gpu = device.map(|device| super::metrics::h2d(device).ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, format!("CUDA device {device} has no measurable H2D ceiling")))).transpose()?;
     #[cfg(not(unix))]
     let gpu: Option<(f64, u32)> = if device.is_some() { return Err(io::Error::new(io::ErrorKind::Unsupported, "H2D ceiling is unavailable on this platform")); } else { None };
+    #[cfg(unix)]
+    let copy = device.and_then(super::metrics::copy);
+    #[cfg(not(unix))]
+    let copy: Option<(f64, u32)> = None;
     let (disk_gbps, disk_direct) = disk(path)?;
     Ok(Ceiling {
         disk_gbps,
         disk_direct,
         h2d_gbps: gpu.map(|g| g.0),
         streams: gpu.map(|g| g.1),
+        copy_gbps: copy.map(|c| c.0),
+        copy_readers: copy.map(|c| c.1),
     })
 }
 

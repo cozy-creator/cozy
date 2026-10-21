@@ -187,6 +187,8 @@ pub struct ReadStats {
     pub pin_ns: u64,
     pub staged: u64,
     pub busy_ns: u64,
+    /// Staging readers a device read ended with (`device`: grown while that helped).
+    pub readers: u64,
 }
 
 impl ReadStats {
@@ -295,14 +297,15 @@ unsafe fn read_impl(
     stats.pin_ns += device.pin_ns;
     stats.staged += device.staged;
     stats.busy_ns += device.busy_ns;
+    stats.readers = device.readers;
     stats.bytes = copies.iter().map(|c| c.dst.len() as u64).sum();
     stats.ns = start.elapsed().as_nanos() as u64;
     Ok(stats)
 }
 
-/// Logs the file reads among `copies` as one disk run (`metrics`).
+/// Logs the file reads among `copies` as one disk run (`metrics`): their volume's ceiling.
 #[cfg(unix)]
-fn disk_run(copies: &[Copy], stats: &ReadStats, ns: u64) {
+fn disk_run(copies: &[Copy], stats: &ReadStats, ns: u64) -> f64 {
     let mut files: Vec<&File> = Vec::new();
     let mut bytes = 0;
     for c in copies {
@@ -313,7 +316,8 @@ fn disk_run(copies: &[Copy], stats: &ReadStats, ns: u64) {
             }
         }
     }
-    if bytes > 0 {
-        metrics::disk_run(&files, bytes, ns, stats.direct, stats.cached);
+    match bytes {
+        0 => 0.0,
+        _ => metrics::disk_run(&files, bytes, ns, stats.direct, stats.cached),
     }
 }
