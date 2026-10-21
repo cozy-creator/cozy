@@ -1906,11 +1906,10 @@ impl Inner {
                 st.stuck.insert((active.set, active.shape.clone(), site.clone()));
             }
         }
-        let known = self.memo(&mut st, &key)?;
-        if known.as_ref().is_none_or(|k| k.max(&room) != *k) {
-            // Merged with what other processes recorded meanwhile, atomically.
-            let merged = ledger::record_room(&self.shared, &key, &room)?;
-            st.rooms.insert(key.clone(), merged);
+        // The latest completed measurement is the room (it comes down when a pass needs less).
+        if self.memo(&mut st, &key)?.as_ref() != Some(&room) {
+            ledger::record_room(&self.shared, &key, &room)?;
+            st.rooms.insert(key.clone(), room.clone());
             self.shared.ring();
         }
         // The request's working set as this pass really used it: its step's pages and the room
@@ -1940,6 +1939,7 @@ impl Inner {
             let mut st = self.lock();
             self.measure(&mut st, torch);
             if let Some(set) = set {
+                self.outgrown(&mut st, req, set, torch.allocated + need.unwrap_or(0))?;
                 if let (Some(s), Some(shape)) = (site, st.active.get(&(req, set)).map(|a| a.shape.clone())) {
                     let key = (set, shape, s.name.to_string());
                     st.finest.insert(key.clone(), s.finest);
@@ -1981,6 +1981,22 @@ impl Inner {
         self.publish(&st);
         self.unlock(st);
         Ok(next)
+    }
+
+    /// An OOM in a pass whose room was measured: the room it needed (`allocated`, its
+    /// allocation with the failing op's) is recorded at once, so the next pass reserves it.
+    fn outgrown(&self, st: &mut State, req: u64, set: u32, allocated: u64) -> Result<()> {
+        let Some((shape, start)) = st.active.get(&(req, set)).filter(|a| a.measured).map(|a| (a.shape.clone(), a.allocated)) else { return Ok(()) };
+        let name = st.mech(set)?.spec.name.clone();
+        let key = room_key(&name, &shape, &st.levels(set, &shape));
+        let Some(known) = self.memo(st, &key)? else { return Ok(()) };
+        let delta = allocated.saturating_sub(start);
+        if delta > known.delta {
+            let room = Room { delta, ..known };
+            ledger::record_room(&self.shared, &key, &room)?;
+            st.rooms.insert(key, room);
+        }
+        Ok(())
     }
 
     fn end_request(&self, req: u64) -> Stats {
