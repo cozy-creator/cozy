@@ -141,6 +141,9 @@ impl Backend for Recording {
     fn process_used(&self) -> varena::Result<u64> {
         self.host.process_used()
     }
+    fn opened_context(&self) -> u64 {
+        self.host.opened_context()
+    }
     fn granularity(&self) -> u64 {
         self.host.granularity()
     }
@@ -229,8 +232,8 @@ fn agent() {
                 uuid = id.to_string();
                 let memory: u64 = memory.parse().unwrap();
                 let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory };
-                // SAFETY: descriptor 3 is the grant the parent handed this process.
-                let grant = unsafe { varena::Grant { table: platform::handles::Owned::from_raw_fd(3) } };
+                // SAFETY: descriptors 3 and 4 are the grant the parent handed this process.
+                let grant = unsafe { varena::Grant { table: platform::handles::Owned::from_raw_fd(3), row: platform::handles::Owned::from_raw_fd(4) } };
                 mem = Some(Memory::open(g, Some(grant), Box::new(HostBackend::new(memory))).unwrap());
                 format!("ok {}", std::process::id())
             }
@@ -286,14 +289,14 @@ fn agent() {
                 "ok".into()
             }
             ["shrunk"] => format!("ok {}", shrunk.load(std::sync::atomic::Ordering::Relaxed)),
-            ["pass", req, set, shape] => match requests[*req].pass(sets[*set].0, shape, Torch::default()) {
+            ["pass", req, set, shape] => match requests[*req].pass(sets[*set].0, "fwd", shape, Torch::default()) {
                 Ok(p) => {
                     passes.insert(req.to_string(), p);
                     "ok".into()
                 }
                 Err(e) => format!("err {}", e.code()),
             },
-            ["passas", req, set, shape, name] => match requests[*req].pass(sets[*set].0, shape, Torch::default()) {
+            ["passas", req, set, shape, name] => match requests[*req].pass(sets[*set].0, "fwd", shape, Torch::default()) {
                 Ok(p) => {
                     passes.insert(name.to_string(), p);
                     "ok".into()
@@ -344,7 +347,7 @@ fn agent() {
                 pins.clear();
                 "ok".into()
             }
-            ["oom", req, set, need] => match requests[*req].oom(sets[*set].0, Some(need.parse().unwrap()), None, Torch::default()) {
+            ["oom", req, set, need] => match requests[*req].oom(Some(sets[*set].0), Some(need.parse().unwrap()), None, Torch::default()) {
                 Next::Retry => "retry".into(),
                 Next::Cut(l) => format!("cut {l}"),
                 Next::Park(b) => format!("park {b}"),
@@ -401,16 +404,16 @@ impl Agent {
         Agent::start(Command::new(std::env::current_exe().unwrap()))
     }
 
-    /// A child holding TensorD's grant as descriptor 3.
+    /// A child holding TensorD's grant as descriptors 3 and 4.
     fn granted(grant: varena::Grant) -> Agent {
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
-        let table = grant.table.as_raw_fd();
+        let (table, row) = (grant.table.as_raw_fd(), grant.row.as_raw_fd());
         let mut command = Command::new(std::env::current_exe().unwrap());
-        // SAFETY: only an async-signal-safe dup2 call between fork and exec.
+        // SAFETY: only async-signal-safe dup2 calls between fork and exec.
         unsafe {
             command.pre_exec(move || {
-                if libc::dup2(table, 3) < 0 {
+                if libc::dup2(table, 3) < 0 || libc::dup2(row, 4) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -705,10 +708,10 @@ fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
     // TensorD serves the tier too: a stopped executor must not be the one serving it.
     let _tier = varena::Tier::serve(varena::Pressure::Headroom).unwrap();
     let (a_path, b_path) = (write_set(dir, "va", 4), write_set(dir, "vb", 2));
-    let mut a = Agent::granted(ledger.grant(0).unwrap());
+    let mut a = Agent::granted(ledger.grant(std::process::id()).unwrap());
     a.ok(&format!("grant {} {}", g.uuid, g.memory));
     a.ok(&format!("load va {} stored gpu", a_path.display()));
-    let mut b = Agent::granted(ledger.grant(0).unwrap());
+    let mut b = Agent::granted(ledger.grant(std::process::id()).unwrap());
     let b_pid = b.ok(&format!("grant {} {}", g.uuid, g.memory));
     b.ok(&format!("load vb {} stored ram", b_path.display()));
     b.ok(&format!("load vn {} stored gpu", write_set(dir, "vn", 1).display()));
@@ -877,7 +880,7 @@ fn a_child_runs_while_its_parent_yields(dir: &Path) {
     let g = gpu("yield", 8 * MB);
     let ledger = varena::Ledger::create(&g, None).unwrap();
     let (p_path, c_path) = (write_set(dir, "yp", 2), write_set(dir, "yc", 3));
-    let mut parent = Agent::granted(ledger.grant(0).unwrap());
+    let mut parent = Agent::granted(ledger.grant(std::process::id()).unwrap());
     let parent_pid = parent.ok(&format!("grant {} {}", g.uuid, g.memory));
     parent.ok(&format!("load yp {} stored ram", p_path.display()));
     parent.ok("request r yp");
@@ -889,7 +892,7 @@ fn a_child_runs_while_its_parent_yields(dir: &Path) {
     assert_eq!(held(&parent_pid), 4 * MB);
     // The parent calls its child and waits on it.
     parent.ok("yield r");
-    let mut child = Agent::granted(ledger.grant(0).unwrap());
+    let mut child = Agent::granted(ledger.grant(std::process::id()).unwrap());
     child.ok(&format!("grant {} {}", g.uuid, g.memory));
     child.ok(&format!("load yc {} stored ram", c_path.display()));
     child.ok("request c yc");

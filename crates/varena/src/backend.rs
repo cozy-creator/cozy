@@ -41,6 +41,10 @@ pub enum Access {
     Read,
 }
 
+/// The code [`Backend::create`] fails with when the device has no memory for the page
+/// (`CUDA_ERROR_OUT_OF_MEMORY`; the host backend answers the same at its limit).
+pub const OUT_OF_MEMORY: i32 = 2;
+
 /// One device's mechanism. Every call is short: no call waits on another process or a fill.
 pub trait Backend: Send + Sync {
     /// The device's total bytes (the card, or a host device's limit).
@@ -48,9 +52,13 @@ pub trait Backend: Send + Sync {
     /// Free bytes as the driver measures them now. Only foreign bytes derive from it (the
     /// device's used bytes less every row's); placement never sizes from it.
     fn free(&self) -> Result<u64>;
-    /// Device bytes this process holds now, measured (NVML per process; on WDDM a device-wide
-    /// delta). Its context is this less torch's reserved bytes and its mapped pages.
+    /// Device bytes this process holds now, measured (NVML per process). Its context is this
+    /// less torch's reserved bytes and its mapped pages. Errs where it cannot be measured
+    /// (WDDM, a foreign pid namespace).
     fn process_used(&self) -> Result<u64>;
+    /// The device's used bytes across this process's context creation, at open: the context
+    /// where `process_used` cannot be measured.
+    fn opened_context(&self) -> u64;
     /// Physical pages and their offsets are multiples of this.
     fn granularity(&self) -> u64;
     fn reserve(&self, len: u64) -> Result<Va>;
@@ -154,6 +162,10 @@ mod host {
         /// The pages it created, as NVML charges a process: an imported page is its exporter's.
         fn process_used(&self) -> Result<u64> {
             Ok(self.pages.lock().created())
+        }
+
+        fn opened_context(&self) -> u64 {
+            0
         }
 
         fn granularity(&self) -> u64 {
@@ -301,6 +313,10 @@ mod host {
             Ok(self.pages.lock().created())
         }
         /// VirtualAlloc's allocation granularity.
+        fn opened_context(&self) -> u64 {
+            0
+        }
+
         fn granularity(&self) -> u64 {
             1 << 16
         }

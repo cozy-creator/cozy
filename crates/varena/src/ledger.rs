@@ -199,6 +199,9 @@ pub(crate) struct Shared {
     /// excludes only other processes.
     heap: Mutex<()>,
     pub name: String,
+    /// The table owner's uid: its services (custody, the tier, the wake, the asks) are named
+    /// in that user's namespace.
+    pub ns: u32,
     /// Signals the GPU's wake endpoint (TensorD's, by name).
     wake: Owned,
 }
@@ -231,8 +234,10 @@ impl Shared {
     /// The table behind `fd` (a grant's), initialised if it is new. The first opener sets the
     /// capacity; a later one can only lower it.
     pub fn adopt(fd: Owned, gpu: &GpuId, capacity: u64) -> Result<Shared> {
-        let fd = os::reopen(&fd, true)?;
-        os::own(&fd)?;
+        // The description handed over is this process's own (a granted executor of another uid
+        // could not open the file again).
+        let ns = os::own(&fd)?;
+        os::accept_uid(ns);
         os::share(&fd, OPEN, 8, true)?;
         if !os::linked(&fd)? {
             return Err(Error::Closed(format!("the table of {} was unlinked", gpu.uuid)));
@@ -258,7 +263,7 @@ impl Shared {
         })();
         os::unlock(&fd, 0, 8)?;
         let map = init?;
-        Ok(Shared { fd, map: RwLock::new(Arc::new(map)), heap: Mutex::new(()), name: gpu.uuid.clone(), wake: os::wake_sender()? })
+        Ok(Shared { fd, map: RwLock::new(Arc::new(map)), heap: Mutex::new(()), name: gpu.uuid.clone(), ns, wake: os::wake_sender()? })
     }
 
     pub fn descriptor(&self) -> Result<Owned> {
@@ -322,7 +327,7 @@ impl Shared {
     /// Room freed, a row died, an ask went out or a peak was recorded: TensorD's event, from
     /// every participant (granted or standalone) through the GPU's named wake.
     pub fn ring(&self) {
-        os::wake(&self.wake, &self.name);
+        os::wake(&self.wake, self.ns, &self.name);
     }
 
     /// Every READY record, read again if the heap's shape moved meanwhile.
@@ -442,7 +447,11 @@ impl Shared {
 
     /// A row for `pid`, held by an OFD lock on a description of its own.
     pub fn claim(self: &Arc<Self>, pid: u32) -> Result<Row> {
-        let lock = os::reopen(&self.fd, true)?;
+        self.claim_with(pid, os::reopen(&self.fd, true)?)
+    }
+
+    /// A row held by a lock on `lock`, a description of this table no one else uses (a grant's).
+    pub fn claim_with(self: &Arc<Self>, pid: u32, lock: Owned) -> Result<Row> {
         let (at, ready) = self.alloc(ROW_CELLS, ROW, |m, at| {
             if let Some(r) = row(m, at) {
                 r.pid.store(pid, Relaxed);
@@ -609,7 +618,7 @@ fn ask_name(gpu: &str, id: u64) -> String {
 /// Asks the row whose ask socket is `name` to give back host layout `digest`; returns the bytes
 /// it unpinned and unmapped. Its reply or its death ends the wait.
 pub(crate) fn release_host(name: &str, digest: &str) -> u64 {
-    match os::connect(name) {
+    match os::connect(os::euid(), name) {
         Ok(Some(stream)) => os::call::<_, Answer>(&stream, &Ask::Host { digest: digest.into() }, None).map_or(0, |(a, _)| a.freed),
         _ => 0,
     }
@@ -671,7 +680,7 @@ impl Row {
         rec.asked.store(bytes, Release);
         rec.asking.store(id, Release);
         self.shared.ring();
-        let freed = match os::connect(&ask_name(&self.shared.name, id)) {
+        let freed = match os::connect(self.shared.ns, &ask_name(&self.shared.name, id)) {
             Ok(Some(stream)) => os::call::<_, Answer>(&stream, &Ask::Room { ceiling: ceiling.index(), bytes }, None).map_or(0, |(a, _)| a.freed),
             _ => 0,
         };
@@ -682,7 +691,7 @@ impl Row {
 
     /// Binds this row's ask socket: its owner's ask thread serves it.
     pub fn listen(&self) -> Result<Listener> {
-        os::listen(&self.ask_name())?.ok_or_else(|| Error::Internal("a row's ask socket is taken".into()))
+        os::listen(self.shared.ns, &self.ask_name())?.ok_or_else(|| Error::Internal("a row's ask socket is taken".into()))
     }
 
     /// Its ask socket's name, for services that ask it (the RAM tier).
@@ -698,7 +707,7 @@ impl Row {
 
     /// Wakes an ask thread blocked in its accept (to stop it).
     pub fn knock(&self) {
-        let _ = os::connect(&ask_name(&self.shared.name, self.id()));
+        let _ = os::connect(self.shared.ns, &ask_name(&self.shared.name, self.id()));
     }
 
     /// Serves this row's asks until `stop`: every asker (of this user only) at once, each
@@ -844,10 +853,12 @@ pub(crate) fn held(rows: &[RowView]) -> u64 {
 
 // ---- TensorD's side
 
-/// What TensorD hands an executor for its [`crate::Memory`]: the table. The field is public so
-/// a spawner can pass it across exec.
+/// What TensorD hands an executor for its [`crate::Memory`]: two descriptions of the table,
+/// one for the table and one for the executor's row lock (an executor of another uid cannot
+/// open the file itself). Fields are public so a spawner can pass them across exec.
 pub struct Grant {
     pub table: Owned,
+    pub row: Owned,
 }
 
 impl Grant {
@@ -858,7 +869,8 @@ impl Grant {
         // Read-locked open while the grant lives.
         let table = open_named(&gpu.uuid)?;
         drop(Shared::adopt(os::dup(&table)?, gpu, capacity)?);
-        Ok(Grant { table })
+        let row = os::reopen(&table, true)?;
+        Ok(Grant { table, row })
     }
 }
 
@@ -907,6 +919,10 @@ pub enum Peak {
 /// measured per (set, shape); a running pass uses its own start allocation instead.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Room {
+    /// What it was measured at: the package entry, the shape, the cut levels in effect.
+    pub entry: String,
+    pub shape: String,
+    pub cuts: std::collections::BTreeMap<String, u32>,
     pub start: u64,
     /// Allocated peak less what was allocated at the pass's start.
     pub delta: u64,
@@ -928,7 +944,7 @@ impl Room {
     /// Each field's larger, and the newer sites when they were measured.
     pub fn max(&self, newer: &Room) -> Room {
         let sites = if newer.sites.is_empty() { self.sites.clone() } else { newer.sites.clone() };
-        Room { start: self.start.max(newer.start), delta: self.delta.max(newer.delta), slack: self.slack.max(newer.slack), context: self.context.max(newer.context), sites }
+        Room { entry: self.entry.clone(), shape: self.shape.clone(), cuts: self.cuts.clone(), start: self.start.max(newer.start), delta: self.delta.max(newer.delta), slack: self.slack.max(newer.slack), context: self.context.max(newer.context), sites }
     }
 }
 
@@ -947,9 +963,9 @@ impl Ledger {
     /// it holds the service lock (it does when it starts first).
     pub fn create(gpu: &GpuId, limit: Option<u64>) -> Result<Ledger> {
         let capacity = limit.map_or(gpu.memory, |l| l.min(gpu.memory));
-        let events = os::wake_bind(&gpu.uuid)?.ok_or_else(|| Error::Invalid(format!("another TensorD holds {}", gpu.uuid)))?;
         let table = open_named(&gpu.uuid)?;
         let shared = Arc::new(Shared::adopt(table, gpu, capacity)?);
+        let events = os::wake_bind(shared.ns, &gpu.uuid)?.ok_or_else(|| Error::Invalid(format!("another TensorD holds {}", gpu.uuid)))?;
         shared.reap(None)?;
         for (key, _) in shared.facts("dispatch/")? {
             shared.put(&key, None)?;
@@ -963,9 +979,11 @@ impl Ledger {
         self.shared.set_mode(mode)
     }
 
-    /// The descriptors executor `pid` opens its memory with.
-    pub fn grant(&self, _pid: u32) -> Result<Grant> {
-        Ok(Grant { table: self.shared.descriptor()? })
+    /// The descriptors executor `pid` opens its memory with. Its uid joins the uids this
+    /// process's services accept (a granted set, never any peer).
+    pub fn grant(&self, pid: u32) -> Result<Grant> {
+        os::accept_uid(os::uid_of(pid)?);
+        Ok(Grant { table: self.shared.descriptor()?, row: self.shared.descriptor()? })
     }
 
     /// After `waitpid`: `pid`'s row goes, and the pages it kept become orphans.
@@ -1158,6 +1176,16 @@ mod tests {
         os::unlink(&gpu.uuid);
     }
 
+    /// A table's namespace is its owner's; a process's own uid is what `grant` reads for it.
+    #[test]
+    fn a_table_is_named_for_its_owner() {
+        let gpu = GpuId { uuid: format!("unit-{}-owner", std::process::id()), model: "host".into(), memory: 1 << 30 };
+        let shared = Shared::adopt(os::shared(&gpu.uuid, true).unwrap(), &gpu, gpu.memory).unwrap();
+        assert_eq!(shared.ns, os::euid());
+        assert_eq!(os::uid_of(std::process::id()).unwrap(), os::euid());
+        os::unlink(&gpu.uuid);
+    }
+
     /// Review 2, finding 14: concurrent writers of one fact merge (the larger stays), whatever
     /// their order.
     #[test]
@@ -1183,7 +1211,7 @@ mod tests {
     fn a_standalone_table_goes_with_its_last_row() {
         let gpu = GpuId { uuid: format!("unit-{}-unlink", std::process::id()), model: "host".into(), memory: 1 << 30 };
         // TensorD's wake, without a TensorD holding the table open.
-        let wake = os::wake_bind(&gpu.uuid).unwrap().unwrap();
+        let wake = os::wake_bind(os::euid(), &gpu.uuid).unwrap().unwrap();
         let mem = crate::Memory::open(gpu.clone(), None, Box::new(crate::HostBackend::new(gpu.memory))).unwrap();
         // SAFETY: geteuid reads a process attribute.
         let path = format!("/dev/shm/cozy-varena-{}-{}", unsafe { libc::geteuid() }, gpu.uuid);

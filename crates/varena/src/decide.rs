@@ -32,10 +32,10 @@ pub enum Trigger {
     /// unmeasured, the reserve `unmeasured` sets aside: the room and its step's unmapped pages
     /// must fit.
     Pass { req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried: Tried },
-    /// An op of `req`'s pass over `set` ran short by `need` (at least one page's worth when
-    /// unknown) at `site`; a collective site recovers locally and proposes its finer level for
-    /// the next pass.
-    Oom { req: u64, set: u32, need: Option<u64>, site: Option<String>, collective: bool, tried: Tried },
+    /// An op of `req`'s pass over `set` (`None`: outside any pass) ran short by `need` (at
+    /// least one page's worth when unknown) at `site`; a collective site recovers locally and
+    /// proposes its finer level for the next pass.
+    Oom { req: u64, set: Option<u32>, need: Option<u64>, site: Option<OomSite>, tried: Tried },
     /// Another row asks for `bytes` under `ceiling`.
     Ask { ceiling: Class, bytes: u64 },
     /// Fetch ahead for `req` into the surplus.
@@ -44,10 +44,22 @@ pub enum Trigger {
     Load { set: u32 },
 }
 
+/// The op site an OOM happened at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OomSite {
+    pub name: String,
+    pub collective: bool,
+    /// The finest level the op has: never proposed or cut beyond.
+    pub finest: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     /// Run the trim hook: the allocator's slack (part of F) becomes free, before any eviction.
     Trim(u64),
+    /// Kept pages were unmapped: their bytes are free once custody has let go of them (the
+    /// Withdraws are sent); decide again then.
+    Settle,
     /// Unmap an own page, of this class now.
     Unmap { page: Key, class: Class },
     /// Ask custody to drop this many orphan bytes, least recently used first.
@@ -65,9 +77,9 @@ pub enum Action {
     Claim { req: u64, bytes: u64 },
     /// The pass's room, set in the same apply as the evictions that made it.
     Reserve { req: u64, room: u64, measured: bool },
-    /// Cut `site` of the pass over `set` one level finer; the cut level last had `failed_at`
-    /// bytes of room.
-    Cut { req: u64, set: u32, site: String, failed_at: u64 },
+    /// Cut `site` of the pass over `set` (`None`: a site outside any pass, the request's own)
+    /// one level finer; the cut level last had `failed_at` bytes of room.
+    Cut { req: u64, set: Option<u32>, site: String, failed_at: u64 },
     /// Relax `site` one level: its measured room fits the surplus.
     Relax { req: u64, set: u32, site: String },
     /// A collective site's level proposed for the next agreement: finer after an OOM (whose
@@ -94,7 +106,7 @@ pub fn decide(t: &Table, trigger: &Trigger) -> Vec<Action> {
             d.out
         }
         Trigger::Pass { req, set, room, unmeasured, tried } => pass(t, *req, *set, *room, *unmeasured, tried),
-        Trigger::Oom { req, set, need, site, collective, tried } => oom(t, *req, *set, *need, site.as_deref(), *collective, tried),
+        Trigger::Oom { req, set, need, site, tried } => oom(t, *req, *set, *need, site.as_ref(), tried),
         Trigger::Ask { ceiling, bytes } => answer(t, *ceiling, *bytes),
         Trigger::Speculate { req, tried } => speculate(t, *req, tried),
         Trigger::Load { set } => {
@@ -138,10 +150,10 @@ fn pass(t: &Table, req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried
             Some(Done::Remote) => return d.out,
             _ => {}
         }
-        let fresh = |s: &&CutSite| !s.stuck && !s.collective && s.peak > 0 && !cut.contains(s.name.as_str());
+        let fresh = |s: &&CutSite| !s.stuck && !s.collective && s.peak > 0 && s.level < s.finest && !cut.contains(s.name.as_str());
         if let Some(site) = sites.iter().filter(fresh).max_by_key(|s| (s.peak, std::cmp::Reverse(s.name.clone()))) {
             cut.insert(&site.name);
-            d.out.push(Action::Cut { req, set, site: site.name.clone(), failed_at: d.got + held });
+            d.out.push(Action::Cut { req, set: Some(set), site: site.name.clone(), failed_at: d.got + held });
             (room, measured) = match site.finer {
                 Some(finer) => (finer, true),
                 None => (unmeasured, false),
@@ -152,11 +164,14 @@ fn pass(t: &Table, req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried
         if lowered {
             d.lowered = true;
             d.need = room.saturating_sub(held) + unmapped(true);
-            if d.run(Rungs::Lowered) != Some(Done::Enough) {
-                d.exhausted();
-                return d.out;
+            match d.run(Rungs::Lowered) {
+                Some(Done::Enough) => break,
+                Some(Done::Remote) => return d.out,
+                _ => {
+                    d.exhausted();
+                    return d.out;
+                }
             }
-            break;
         }
         d.out.push(Action::Lower(req));
         lowered = true;
@@ -182,9 +197,19 @@ fn pass(t: &Table, req: u64, set: u32, room: Option<u64>, unmeasured: u64, tried
 /// what this demand freed. Then the demand order; at its end, a cut of the op's site (never a
 /// collective's mid-pass: its finer level is proposed for the next pass), lowering, parking,
 /// exhaustion. Each answer is progress, so a sequence ends.
-fn oom(t: &Table, req: u64, set: u32, need: Option<u64>, site: Option<&str>, collective: bool, tried: &Tried) -> Vec<Action> {
+/// Outside any pass (no set) no pass's site is cut and no running W lowers: the demand order,
+/// then the request's own cut of an op site outside any pass (its memo), then a park, then
+/// exhaustion.
+fn oom(t: &Table, req: u64, set: Option<u32>, need: Option<u64>, site: Option<&OomSite>, tried: &Tried) -> Vec<Action> {
     let Some(r) = t.request(req) else { return vec![Action::Exhausted { need: need.unwrap_or(0) }] };
-    let sites = r.sites.get(&set).map(Vec::as_slice).unwrap_or_default();
+    let sites = set.and_then(|s| r.sites.get(&s)).map(Vec::as_slice).unwrap_or_default();
+    let level = |name: &str| match set {
+        Some(_) => sites.iter().find(|s| s.name == name).map_or(0, |s| s.level),
+        None => r.outside.get(name).copied().unwrap_or(0),
+    };
+    // A site at its finest level is not cut or proposed further: the next rung follows.
+    let outside = site.filter(|s| set.is_none() && !s.collective && level(&s.name) < s.finest);
+    let site = set.zip(site).filter(|(_, s)| level(&s.name) < s.finest);
     // Unknown: any page's worth is progress.
     let mut d = Demand::new(t, need.unwrap_or(1), Some(req), None, tried);
     d.oom = true;
@@ -192,10 +217,9 @@ fn oom(t: &Table, req: u64, set: u32, need: Option<u64>, site: Option<&str>, col
         d.got = t.free().min(tried.freed);
     }
     let mut out = vec![];
-    if let (Some(site), true) = (site, collective) {
-        if !tried.cut.contains(site) {
-            let level = sites.iter().find(|s| s.name == site).map_or(0, |s| s.level) + 1;
-            out.push(Action::Propose { req, set, site: site.to_string(), level, failed_at: Some(r.room + r.claimed + t.free()) });
+    if let Some((set, s)) = site.filter(|(_, s)| s.collective) {
+        if !tried.cut.contains(&s.name) {
+            out.push(Action::Propose { req, set, site: s.name.clone(), level: level(&s.name) + 1, failed_at: Some(r.room + r.claimed + t.free()) });
         }
     }
     match d.run(Rungs::Oom) {
@@ -204,17 +228,27 @@ fn oom(t: &Table, req: u64, set: u32, need: Option<u64>, site: Option<&str>, col
             return out;
         }
         Some(Done::Enough) => {}
+        Some(Done::Lowered) | None if set.is_none() => match outside {
+            Some(s) => d.out.push(Action::Cut { req, set: None, site: s.name.clone(), failed_at: r.room + r.claimed + t.free() }),
+            None if d.got == 0 => d.park_or_exhaust(r.episode.parked),
+            None => {}
+        },
         Some(Done::Lowered) | None => {
-            let cuttable = site.filter(|s| !collective && !sites.iter().any(|x| x.name == *s && x.stuck));
-            if let Some(site) = cuttable {
-                d.out.push(Action::Cut { req, set, site: site.to_string(), failed_at: r.room + r.claimed + t.free() });
+            let cuttable = site.filter(|(_, s)| !s.collective && !sites.iter().any(|x| x.name == s.name && x.stuck));
+            if let Some((set, s)) = cuttable {
+                d.out.push(Action::Cut { req, set: Some(set), site: s.name.clone(), failed_at: r.room + r.claimed + t.free() });
             } else {
                 if !r.lowered {
                     d.out.push(Action::Lower(req));
                 }
                 d.lowered = true;
-                if d.run(Rungs::Lowered).is_none() && d.got == 0 {
-                    d.park_or_exhaust(r.episode.parked);
+                match d.run(Rungs::Lowered) {
+                    Some(Done::Remote) => {
+                        out.append(&mut d.out);
+                        return out;
+                    }
+                    None if d.got == 0 => d.park_or_exhaust(r.episode.parked),
+                    _ => {}
                 }
             }
         }
@@ -251,6 +285,8 @@ struct Demand<'a> {
     need: u64,
     /// Bytes available so far: F plus what the planned actions free.
     got: u64,
+    /// Bytes of kept pages planned out: free once custody lets go (a Settle).
+    withdrawn: u64,
     req: Option<u64>,
     /// The page being bound: never a victim.
     keep: Option<Key>,
@@ -263,11 +299,30 @@ struct Demand<'a> {
 
 impl<'a> Demand<'a> {
     fn new(t: &'a Table, need: u64, req: Option<u64>, keep: Option<Key>, tried: &'a Tried) -> Demand<'a> {
-        Demand { t, need, got: t.free(), req, keep, tried, oom: false, lowered: false, gone: BTreeSet::new(), out: vec![] }
+        Demand { t, need, got: t.free(), withdrawn: 0, req, keep, tried, oom: false, lowered: false, gone: BTreeSet::new(), out: vec![] }
     }
 
     fn enough(&self) -> bool {
         self.got >= self.need
+    }
+
+    /// What is still missing, the withdrawn kept pages counted as coming.
+    fn short(&self) -> u64 {
+        self.need.saturating_sub(self.got + self.withdrawn)
+    }
+
+    /// Enough once the withdrawn kept pages are free.
+    fn covered(&self) -> bool {
+        self.got + self.withdrawn >= self.need
+    }
+
+    /// Covered by kept pages planned out: settle, then decide again.
+    fn settles(&mut self) -> bool {
+        if self.enough() || !self.covered() || self.withdrawn == 0 {
+            return false;
+        }
+        self.out.push(Action::Settle);
+        true
     }
 
     /// Own pages of `class`, in eviction order.
@@ -293,10 +348,11 @@ impl<'a> Demand<'a> {
         pages.into_iter().map(|(k, b, ..)| (k, b)).collect()
     }
 
-    /// Unmaps own pages of `class` until enough.
+    /// Unmaps own pages of `class` until enough (counting kept pages' bytes, which come back
+    /// once custody lets go).
     fn evict(&mut self, class: Class) {
         for (page, bytes) in self.own(class) {
-            if self.enough() {
+            if self.covered() {
                 return;
             }
             if class == Class::S {
@@ -308,7 +364,10 @@ impl<'a> Demand<'a> {
             }
             self.out.push(Action::Unmap { page, class });
             self.gone.insert(page);
-            self.got += bytes;
+            match self.t.page(page).is_some_and(|p| p.kept) {
+                true => self.withdrawn += bytes,
+                false => self.got += bytes,
+            }
         }
     }
 
@@ -317,10 +376,10 @@ impl<'a> Demand<'a> {
         let mut caches: Vec<_> = self.t.caches.iter().filter(|c| c.bytes > 0).collect();
         caches.sort_by_key(|c| (c.last_use, c.id));
         for c in caches {
-            if self.enough() {
+            if self.covered() {
                 return;
             }
-            let bytes = c.bytes.min(self.need - self.got);
+            let bytes = c.bytes.min(self.short());
             self.out.push(Action::Shrink { cache: c.id, bytes });
             self.got += bytes;
         }
@@ -331,7 +390,7 @@ impl<'a> Demand<'a> {
         let mut rows: Vec<_> = self.t.others.iter().filter(|r| !self.tried.asked.contains(&(r.row, ceiling)) && r.evictable(ceiling) > 0).collect();
         rows.sort_by_key(|r| (std::cmp::Reverse(r.evictable(ceiling)), r.row));
         let mut asked = false;
-        let mut left = self.need - self.got;
+        let mut left = self.short();
         for r in rows {
             if left == 0 {
                 break;
@@ -351,14 +410,17 @@ impl<'a> Demand<'a> {
         }
         if rungs == Rungs::Lowered {
             self.evict(Class::W);
+            if self.settles() {
+                return Some(Done::Remote);
+            }
             return self.enough().then_some(Done::Enough);
         }
         if !self.tried.trimmed && self.t.slack() > 0 {
-            self.out.push(Action::Trim((self.need - self.got).min(self.t.slack())));
+            self.out.push(Action::Trim(self.short().min(self.t.slack())));
             return Some(Done::Remote);
         }
         if !self.tried.orphans && self.t.orphans > 0 {
-            self.out.push(Action::ReleaseOrphans((self.need - self.got).min(self.t.orphans)));
+            self.out.push(Action::ReleaseOrphans(self.short().min(self.t.orphans)));
             return Some(Done::Remote);
         }
         self.evict(Class::S);
@@ -369,14 +431,14 @@ impl<'a> Demand<'a> {
         if self.enough() {
             return Some(Done::Enough);
         }
-        if self.ask(Class::N) {
+        if self.settles() || self.ask(Class::N) {
             return Some(Done::Remote);
         }
         self.evict(Class::D);
         if self.enough() {
             return Some(Done::Enough);
         }
-        if self.ask(Class::D) {
+        if self.settles() || self.ask(Class::D) {
             return Some(Done::Remote);
         }
         if rungs == Rungs::Bind {
@@ -388,6 +450,9 @@ impl<'a> Demand<'a> {
             self.evict(Class::W);
             if self.enough() {
                 return Some(Done::Enough);
+            }
+            if self.settles() {
+                return Some(Done::Remote);
             }
             self.exhausted();
             return None;
@@ -450,7 +515,8 @@ fn speculate(t: &Table, req: u64, tried: &Tried) -> Vec<Action> {
         (1..=ahead).map(|i| r.rooms.get((r.cursor.step + i) as usize).copied().flatten().map(|room| room.saturating_sub(r.room))).try_fold(0, |m, x| x.map(|x| m.max(x)))
     };
     let mut d = Demand { got: if t.shared { 0 } else { t.free() }, ..Demand::new(t, 0, Some(req), None, tried) };
-    let n: Vec<(Key, u64)> = d.own(Class::N);
+    // Kept pages stay: freeing one waits on custody, and it is the cache.
+    let n: Vec<(Key, u64)> = d.own(Class::N).into_iter().filter(|(k, _)| !t.page(*k).is_some_and(|p| p.kept)).collect();
     let mut n = n.into_iter();
     for (page, bytes, distance) in wanted {
         let Some(keep) = reserve(distance.0) else { return d.out };

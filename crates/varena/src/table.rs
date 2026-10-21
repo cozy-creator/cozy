@@ -168,6 +168,8 @@ pub struct Page {
     pub releasing: Vec<u64>,
     /// (request, step) it was mapped for speculatively.
     pub speculative: Option<(u64, u32)>,
+    /// Kept (exported to custody): unmapping it frees its bytes only once custody lets go.
+    pub kept: bool,
     /// A logical clock, not time.
     pub last_use: u64,
 }
@@ -191,6 +193,8 @@ pub struct Set {
 pub struct CutSite {
     pub name: String,
     pub level: u32,
+    /// The finest level its op has: never cut beyond.
+    pub finest: u32,
     /// Its measured peak at this level.
     pub peak: u64,
     /// A finer level did not lower the pass's allocated peak: not cut further at this shape.
@@ -244,6 +248,8 @@ pub struct Req {
     pub rooms: Vec<Option<u64>>,
     /// The cut sites of each set's current pass (a joint step runs several).
     pub sites: BTreeMap<u32, Vec<CutSite>>,
+    /// Cut levels of op sites outside any pass (the package's own code): the request's memo.
+    pub outside: BTreeMap<String, u32>,
     /// Waiting on a child call: the room it gave back, retaken when the wait ends. Meanwhile
     /// its current step's pages are a later use (D) and it has no remaining W.
     pub yielded: Option<u64>,
@@ -327,6 +333,9 @@ pub struct Table {
     pub orphans: u64,
     /// Host bytes available now, for parking.
     pub headroom: u64,
+    /// Bytes of kept pages this process unmapped whose Withdraw custody has not had yet: its
+    /// handle still holds them (pinned, P).
+    pub pending: u64,
     /// Torch's allocator, as last measured (pass start and end, every OOM).
     pub allocated: u64,
     pub reserved: u64,
@@ -389,9 +398,12 @@ impl Table {
         Some(if distance.is_some() { Class::D } else { Class::N })
     }
 
-    /// This process's page bytes by class.
+    /// This process's page bytes by class (withdrawn kept pages custody still holds are P).
     pub fn classes(&self) -> [u64; 7] {
         let mut out = [0u64; 7];
+        if let Some(p) = out.get_mut(Class::P.index()) {
+            *p = self.pending;
+        }
         for (key, page) in self.pages() {
             if let Some(slot) = self.class(key).and_then(|c| out.get_mut(c.index())) {
                 *slot += page.bytes;
@@ -417,7 +429,7 @@ impl Table {
     }
 
     pub fn held(&self) -> u64 {
-        self.context + self.torch() + self.mapped()
+        self.context + self.torch() + self.mapped() + self.pending
     }
 
     fn others_held(&self) -> u64 {
