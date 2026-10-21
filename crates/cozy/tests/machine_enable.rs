@@ -234,11 +234,8 @@ fn an_update_runs_a_renamed_binary_and_rolls_a_broken_one_back() {
         "COZY_TEST_BROKEN_COZY: a cozy build whose machine exits once ready (the job builds it)",
     );
     // cozy installed in the home, as the installer puts it: the machine's launch path.
-    let bin = home.root().join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let launch = bin.join("cozy");
-    std::fs::copy(env!("CARGO_BIN_EXE_cozy"), &launch).unwrap();
-    home.use_binary(&launch);
+    let launch = home.installed();
+    let bin = launch.parent().unwrap();
     let _cleanup = Cleanup(&home, true);
     json(&cozy(&home, &["machine", "enable", "--json"]));
     let root = home.root().join("machine");

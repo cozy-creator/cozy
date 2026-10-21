@@ -36,7 +36,7 @@ pub async fn enable(ctx: &Context) -> Result<ExitCode, Error> {
     let managed = services.available();
     let calcifer = ctx.calcifer().await?;
     let root = machine_root(ctx)?;
-    let spec = spec(&root)?;
+    let spec = spec(ctx, &root)?;
     let running = !free(&root);
     let changed = match managed {
         true => services
@@ -168,14 +168,12 @@ fn services(ctx: &Context) -> Services {
     Services::new(&ctx.home, &ctx.user_home)
 }
 
-/// The service: this cozy as `machine serve --persistent`, saying anything before its own log
-/// opens into `start.log` beside it.
-fn spec(root: &Path) -> Result<ServiceSpec, Error> {
-    let program = std::env::current_exe()
-        .map_err(|e| Error::new(Kind::Internal, "current_exe", e.to_string()))?;
+/// The service: the installed cozy as `machine serve --persistent`, saying anything before its
+/// own log opens into `start.log` beside it.
+fn spec(ctx: &Context, root: &Path) -> Result<ServiceSpec, Error> {
     Ok(ServiceSpec {
         name: SERVICE.into(),
-        program,
+        program: crate::calcifer_client::installed(&ctx.home)?,
         args: vec!["machine".into(), "serve".into(), "--persistent".into()],
         log: Some(start_log(root)),
     })
