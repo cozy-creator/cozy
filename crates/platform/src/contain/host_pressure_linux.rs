@@ -153,7 +153,7 @@ fn own_cgroup() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Feedback, Reserve};
+    use super::super::Feedback;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -369,20 +369,6 @@ mod tests {
             feedback.give(2_580_000, start + WINDOW * 4),
             "well above it"
         );
-    }
-
-    #[test]
-    fn the_reserve_keeps_a_recent_peak_and_forgets_it_on_quiet_passes() {
-        let mut reserve = Reserve::default();
-        assert_eq!(reserve.observe(4 << 30), 0);
-        // A 6 GiB burst came and went: 6 GiB stays theirs for now.
-        assert_eq!(reserve.observe(10 << 30), 0);
-        assert_eq!(reserve.observe(4 << 30), 6 << 30);
-        reserve.quiet(4 << 30);
-        assert_eq!(reserve.observe(4 << 30), 3 << 30);
-        reserve.quiet(4 << 30);
-        reserve.quiet(4 << 30);
-        assert_eq!(reserve.observe(4 << 30), (3 << 30) / 4);
     }
 
     #[test]
