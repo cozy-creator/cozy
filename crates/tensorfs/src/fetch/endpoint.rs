@@ -128,7 +128,10 @@ impl Endpoint {
             At::Http(base)
         } else {
             let path = url.strip_prefix("file://").unwrap_or(&url);
-            if !path.starts_with('/') {
+            // `file:///C:/dir` names `C:/dir` on Windows.
+            #[cfg(windows)]
+            let path = path.strip_prefix('/').filter(|p| p.get(1..2) == Some(":")).unwrap_or(path);
+            if !Path::new(path).is_absolute() {
                 return refuse(Code::SOURCE_NOT_ALLOWED, format!("{url}: not an https://, loopback http:// or file:/// endpoint"));
             }
             At::Dir(PathBuf::from(path), OnceLock::new())
