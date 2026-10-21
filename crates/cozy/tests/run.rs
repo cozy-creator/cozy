@@ -204,6 +204,14 @@ fn the_grammar_refuses_what_it_cannot_run() {
         cpu.code == 2 && message.contains("needs no GPU") && message.contains("--on new:cpu"),
         "{cpu:?}"
     );
+    // A Hub that does not answer is named, with why and what to check.
+    let offline = home.cozy(["run", "fidika/unknown/generate", "--tensorhub", "http://127.0.0.1:1", "--json"]);
+    let refusal = offline.refusal();
+    let (message, remedy) = (refusal["message"].to_string(), refusal["remedy"].to_string());
+    assert!(
+        message.contains("no answer from http://127.0.0.1:1") && remedy.contains("internet connection"),
+        "{offline:?}"
+    );
 }
 
 #[test]

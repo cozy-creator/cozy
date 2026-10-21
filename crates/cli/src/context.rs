@@ -148,7 +148,8 @@ pub fn hub_error(error: impl Into<hub_client::Error>) -> Error {
             }
             error
         }
-        Hub::Call(message) => Error::new(Kind::Unavailable, "hub_unreachable", message),
+        Hub::Call(message) => Error::new(Kind::Unavailable, "hub_unreachable", message)
+            .remedy("check this computer's internet connection, then try again"),
         Hub::Credential(message) | Hub::Key(message) => {
             Error::new(Kind::Credential, "hub_credential", message).next("cozy login <email>")
         }

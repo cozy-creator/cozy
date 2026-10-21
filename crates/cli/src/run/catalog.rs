@@ -112,7 +112,7 @@ pub async fn latest(ctx: &Context, hub: &Hub, package: &str) -> Result<String, E
     let answer = client
         .exec(request, &info)
         .await
-        .map_err(|e| hub_error(hub_client::Error::Call(e.to_string())))?;
+        .map_err(|e| hub_error(hub_client::Error::unanswered(&e)))?;
     let status = answer.status();
     if status == StatusCode::NOT_MODIFIED
         && let Some(kept) = kept
@@ -127,7 +127,7 @@ pub async fn latest(ctx: &Context, hub: &Hub, package: &str) -> Result<String, E
     let body = answer
         .bytes()
         .await
-        .map_err(|e| hub_error(hub_client::Error::Call(e.to_string())))?;
+        .map_err(|e| hub_error(hub_client::Error::unanswered(&e)))?;
     if !status.is_success() {
         return Err(absent(refusal(status.as_u16(), &body), package));
     }
