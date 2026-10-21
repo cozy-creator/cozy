@@ -285,11 +285,6 @@ pub fn meter(pid: u32) -> Option<(u64, u64)> {
     sys::meter(pid)
 }
 
-/// Each live thread's CPU nanoseconds, by thread id. `None`: unreadable (Linux only so far).
-pub fn threads(pid: u32) -> Option<Vec<(u32, u64)>> {
-    sys::threads(pid)
-}
-
 /// `meter`'s two parts summed: Runtime's `proctree.progress_burn`.
 pub fn burn(pid: u32) -> Option<u64> {
     meter(pid).map(|(cpu, moved)| cpu.saturating_add(moved))

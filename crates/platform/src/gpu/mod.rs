@@ -171,23 +171,24 @@ impl Device {
         })
     }
 
-    /// Whether kernels ran or device memory moved (copies count) in NVML's samples after
-    /// `seen` (its timestamp, µs), which it advances.
-    pub fn worked_since(&self, seen: &mut u64) -> Result<bool> {
+    /// Whether kernels ran, and whether device memory moved (kernels' traffic, copies, peer
+    /// writes), in NVML's samples after `seen` (its timestamp, µs), which it advances.
+    pub fn worked_since(&self, seen: &mut u64) -> Result<(bool, bool)> {
         let device = self.nvml.device_by_index(self.index).map_err(failed("open device"))?;
-        let (from, mut worked) = (*seen, false);
-        for sampling in [Sampling::GpuUtilization, Sampling::MemoryUtilization] {
-            for sample in device.samples(sampling, from).map_err(failed("utilization samples"))? {
+        let from = *seen;
+        let mut busy = |sampling| -> Result<bool> {
+            let samples = device.samples(sampling, from).map_err(failed("utilization samples"))?;
+            Ok(samples.iter().fold(false, |busy, sample| {
                 *seen = (*seen).max(sample.timestamp);
-                worked |= match sample.value {
+                busy || match sample.value {
                     SampleValue::U32(value) => value > 0,
                     SampleValue::U64(value) => value > 0,
                     SampleValue::I64(value) => value > 0,
                     SampleValue::F64(value) => value > 0.0,
-                };
-            }
-        }
-        Ok(worked)
+                }
+            }))
+        };
+        Ok((busy(Sampling::GpuUtilization)?, busy(Sampling::MemoryUtilization)?))
     }
 
     pub fn display_active(&self) -> Result<bool> {
