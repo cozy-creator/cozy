@@ -11,8 +11,8 @@ use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle, ThreadId};
 
 use parking_lot::{Condvar, Mutex};
-use tensorfs::io::source::Source;
 use tensorfs::io::ReadStats;
+use tensorfs::io::source::Source;
 
 use crate::gpu::{BindState, FillAttempt, FillPhase, FillPin, Gpu, Pin};
 use crate::layout::Layout;
@@ -159,6 +159,17 @@ impl TransferProof {
         self.complete = false;
         if !self.invalid.contains(&reason) {
             self.invalid.push(reason);
+        }
+    }
+
+    fn registered(&mut self, pages: &[ProofPage], imported: bool) {
+        // A new immutable registration adds known demand identities, not initial
+        // residency. An imported GPU span would introduce content outside this
+        // request's measured I/O and therefore still prevents an isolated bound.
+        self.pages.extend_from_slice(pages);
+        self.pages.sort_unstable_by_key(|page| page.page);
+        if imported {
+            self.invalidate("late-gpu-import");
         }
     }
 }
@@ -703,6 +714,11 @@ impl Placement {
             };
             let imported = self.channel.take(self.row.owner(), key)?;
             if !imported.is_empty() {
+                // Mark the scope before attempting import: even a later failed
+                // registration must not hide externally supplied GPU content.
+                for run in self.inner.lock().requests.values_mut() {
+                    run.stats.proof.registered(&[], true);
+                }
                 let (sender, receiver) =
                     UnixStream::pair().map_err(|error| Error::Io(error.to_string()))?;
                 let spans = imported.iter().map(|(bytes, _)| *bytes).collect::<Vec<_>>();
@@ -719,6 +735,7 @@ impl Placement {
             }
             pages.push(page);
         }
+        let proof_pages = ProofPage::catalog(&pages, &fingerprint, layout);
         self.inner.lock().models.insert(
             id,
             Model {
@@ -727,7 +744,7 @@ impl Placement {
                 fingerprint,
                 ram_key: tensorfs::sha256::digest(layout.digest.as_bytes()),
                 transform,
-                proof_pages: ProofPage::catalog(&pages, &fingerprint, layout),
+                proof_pages: proof_pages.clone(),
                 source,
                 regions: layout
                     .regions
@@ -743,7 +760,7 @@ impl Placement {
             },
         );
         for run in self.inner.lock().requests.values_mut() {
-            run.stats.proof.invalidate("registration-changed");
+            run.stats.proof.registered(&proof_pages, false);
         }
         self.refresh()?;
         rollback.committed = true;
@@ -1537,9 +1554,8 @@ impl Placement {
             let Some(model) = inner.models.remove(&id) else {
                 return Ok(());
             };
-            for run in inner.requests.values_mut() {
-                run.stats.proof.invalidate("registration-changed");
-            }
+            // Active proof catalogs retain retired identities: their earlier
+            // demands and measured copies still belong to the request history.
             model.ram.cancelled.store(true, Ordering::Release);
             inner.retired.extend(model.pages.iter().copied());
             for page in inner
@@ -2631,6 +2647,69 @@ mod gpu_tests {
     }
 
     #[test]
+    fn late_registration_adds_demand_content_without_rewriting_initial_residency() {
+        let mut inner = event_test_inner();
+        let proof = &mut inner.requests.get_mut(&9).unwrap().stats.proof;
+        *proof = TransferProof {
+            complete: true,
+            isolated: true,
+            initial: vec![7],
+            pages: vec![ProofPage {
+                page: 7,
+                content: "prior/0".into(),
+                payload: 3,
+                mapped: 128,
+            }],
+            ..Default::default()
+        };
+        proof.registered(
+            &[ProofPage {
+                page: 8,
+                content: "selected/0".into(),
+                payload: 5,
+                mapped: 128,
+            }],
+            false,
+        );
+        Placement::event_locked(&mut inner, 9, 8, "bind", "demand").unwrap();
+        let stats = &inner.requests[&9].stats;
+        assert!(stats.proof.complete);
+        assert!(stats.proof.knows(7), "earlier content remains in history");
+        assert!(stats.proof.knows(8));
+        assert_eq!(stats.proof.pages[1].payload, 5);
+        assert_eq!(stats.proof.initial, [7]);
+        assert_eq!(stats.events.len(), 1, "registration fabricated no events");
+        assert!(stats.copies.is_empty(), "registration fabricated no I/O");
+    }
+
+    #[test]
+    fn late_gpu_import_stays_incomplete_when_its_catalog_arrives() {
+        let mut inner = event_test_inner();
+        let proof = &mut inner.requests.get_mut(&9).unwrap().stats.proof;
+        proof.complete = true;
+        // Import is recorded before the fallible GPU operation, including when
+        // registration later fails before it can publish its complete catalog.
+        proof.registered(&[], true);
+        assert_eq!(proof.invalid, ["late-gpu-import"]);
+        assert!(!proof.complete);
+        proof.registered(
+            &[ProofPage {
+                page: 8,
+                content: "imported/0".into(),
+                payload: 5,
+                mapped: 128,
+            }],
+            false,
+        );
+        Placement::event_locked(&mut inner, 9, 8, "bind", "demand").unwrap();
+        let stats = &inner.requests[&9].stats;
+        assert!(!stats.proof.complete);
+        assert_eq!(stats.proof.invalid, ["late-gpu-import"]);
+        assert!(stats.proof.initial.is_empty());
+        assert!(stats.copies.is_empty());
+    }
+
+    #[test]
     fn released_orphan_events_keep_victim_bytes_and_use_current_totals() {
         let mut inner = event_test_inner();
         // Custody's acknowledged release and refresh removed the last orphan.
@@ -3032,9 +3111,11 @@ mod gpu_tests {
     fn failed_begin_rolls_back_and_reuses_the_request_identity() {
         let placement = Placement::open(0, None).expect("real CUDA placement");
         let uuid = assigned_gpu(&placement.gpu);
-        assert!(placement
-            .begin(7, vec![vec![999]], "test".into(), "shape".into())
-            .is_err());
+        assert!(
+            placement
+                .begin(7, vec![vec![999]], "test".into(), "shape".into())
+                .is_err()
+        );
         assert!(
             placement.stats(7).is_err(),
             "failed begin must not retain request state"
@@ -3099,6 +3180,77 @@ mod gpu_tests {
             digest: format!("fill-dependency-{regions}-{value}"),
             names: vec![],
         }
+    }
+
+    #[test]
+    #[ignore = "requires an owned rental; never run on the local GPU"]
+    fn late_immutable_registration_keeps_the_complete_transfer_history() {
+        let fixture = FillLedger::new();
+        let placement = fixture.placement();
+        let uuid = assigned_gpu(&placement.gpu);
+        let source = Arc::new(Source::files(vec![], false, 0));
+        let old = placement
+            .register(
+                1,
+                "prior".into(),
+                [101; 32],
+                &fill_layout(1, 7),
+                source.clone(),
+                None,
+            )
+            .unwrap();
+        placement
+            .begin(9, vec![vec![1]], "late-content".into(), "shape".into())
+            .unwrap();
+        drop(placement.bind(9, old[0], 0).unwrap());
+        placement.gpu.wait_pending().unwrap();
+        let selected = placement
+            .register(
+                2,
+                "selected".into(),
+                [102; 32],
+                &fill_layout(1, 9),
+                source,
+                None,
+            )
+            .unwrap();
+        placement.close_model(1).unwrap();
+        placement.declare(9, vec![vec![2]]).unwrap();
+        let pin = placement.bind(9, selected[0], 0).unwrap();
+        let mut bytes = [0_u8; 32];
+        unsafe {
+            tensorfs::io::read(
+                &[tensorfs::io::Copy {
+                    src: tensorfs::io::Src::Device {
+                        device: 0,
+                        ptr: pin.ptr,
+                        stream: 0,
+                    },
+                    dst: tensorfs::io::Dst::host(&mut bytes),
+                }],
+                &tensorfs::io::ReadOpts::default(),
+            )
+        }
+        .unwrap();
+        assert_eq!(bytes, [9; 32]);
+        drop(pin);
+        placement.gpu.wait_pending().unwrap();
+        let stats = placement.end(9).unwrap();
+        assert!(stats.proof.complete, "{:?}", stats.proof.invalid);
+        assert!(stats.proof.initial.is_empty());
+        assert!(stats.proof.knows(old[0]));
+        assert!(stats.proof.knows(selected[0]));
+        assert_eq!(
+            stats
+                .events
+                .iter()
+                .filter(|event| event.kind == "bind")
+                .count(),
+            2
+        );
+        assert_eq!(stats.copies.len(), 2);
+        placement.close().unwrap();
+        println!("PASS late immutable registration keeps complete transfer history {uuid}");
     }
 
     struct FillLedger {
@@ -3236,12 +3388,14 @@ mod gpu_tests {
                 bytes, [11; 32],
                 "the callback must read the actual other model"
             );
-            assert!(placement
-                .stats(9)
-                .unwrap()
-                .events
-                .iter()
-                .any(|event| event.kind == "lower"));
+            assert!(
+                placement
+                    .stats(9)
+                    .unwrap()
+                    .events
+                    .iter()
+                    .any(|event| event.kind == "lower")
+            );
             active.store(false, Ordering::Release);
             drop(pin);
             placement.gpu.wait_pending().unwrap();
@@ -3498,11 +3652,9 @@ mod gpu_tests {
         // Exercise allocator slack with actual CUDA allocations, not synthetic
         // resident bytes. A live 4MiB owner later joins the idle 12MiB cache.
         let live = tensorfs::io::DeviceBuffer::new(0, 4 << 20).unwrap();
-        let idle = Arc::new(Mutex::new(vec![tensorfs::io::DeviceBuffer::new(
-            0,
-            12 << 20,
-        )
-        .unwrap()]));
+        let idle = Arc::new(Mutex::new(vec![
+            tensorfs::io::DeviceBuffer::new(0, 12 << 20).unwrap(),
+        ]));
         let attempts = Arc::new(AtomicU64::new(0));
         let (entered, waiting) = mpsc::channel();
         let (release, finish) = mpsc::channel();
@@ -4184,12 +4336,14 @@ mod gpu_tests {
         };
         assert!(matches!(error, Error::DeviceFull { .. }), "{error}");
         assert_eq!(calls.load(Ordering::Acquire), 3);
-        assert!(placement
-            .gpu
-            .facts()
-            .unwrap()
-            .iter()
-            .any(|(id, bytes, _, _)| *id == victim && *bytes == 0));
+        assert!(
+            placement
+                .gpu
+                .facts()
+                .unwrap()
+                .iter()
+                .any(|(id, bytes, _, _)| *id == victim && *bytes == 0)
+        );
         let stats = placement.end(1).expect("failed request ends normally");
         assert_eq!(stats.copies.len(), 3);
         assert!(placement.inner.lock().requests.is_empty());
@@ -4512,7 +4666,9 @@ mod gpu_tests {
         drop(context);
         placement.allocator(0, 0, 0).unwrap();
         placement.close().unwrap();
-        println!("PASS controlled lower preserves fitting home, pins and bounded physical reclaim {uuid}");
+        println!(
+            "PASS controlled lower preserves fitting home, pins and bounded physical reclaim {uuid}"
+        );
     }
 
     #[test]
