@@ -90,7 +90,10 @@ fn executor_stand_in() {
     // SAFETY: the spawning test installs its private socket at the child's stdin.
     let control = unsafe { UnixStream::from_raw_fd(0) };
     // Granted by TensorD, or a standalone engine that opens the GPU's table by name.
-    let grant = (opened == "granted").then(|| Grant { table: platform::handles::recv_fd(&control).unwrap() });
+    let grant = (opened == "granted").then(|| {
+        let table = platform::handles::recv_fd(&control).unwrap();
+        Grant { table, row: platform::handles::recv_fd(&control).unwrap() }
+    });
     let memory = Memory::open(gpu.clone(), grant, Box::new(HostBackend::new(gpu.memory))).unwrap();
     let set = memory.load(spec(&gpu), if level == "gpu" { Level::Gpu } else { Level::Ram }).unwrap();
     let (mut out, lines) = (control.try_clone().unwrap(), BufReader::new(control).lines());
@@ -109,7 +112,7 @@ fn executor_stand_in() {
             reply = match (command.as_str(), args.as_str()) {
                 ("load", _) => {
                     let request = memory.request(&format!("load-{}", std::process::id()), plan()).unwrap();
-                    let pass = request.pass(set, "1", Torch::default()).unwrap();
+                    let pass = request.pass(set, "load", "1", Torch::default()).unwrap();
                     let pins: Vec<_> = (0..PARTS.len() as u32).map(|block| memory.bind(set, block, 0).unwrap()).collect();
                     drop(pins);
                     pass.end(Measured::default(), Torch::default());
@@ -122,7 +125,7 @@ fn executor_stand_in() {
                     "open".into()
                 }
                 ("pass", shape) => {
-                    pass = Some(request.as_ref().unwrap().pass(set, shape, Torch::default()).unwrap());
+                    pass = Some(request.as_ref().unwrap().pass(set, "run", shape, Torch::default()).unwrap());
                     "passing".into()
                 }
                 ("done", room) => {
@@ -158,26 +161,37 @@ struct StandIn {
 
 impl StandIn {
     fn spawn(gpu: &Gpu, id: &GpuId, level: &str) -> StandIn {
-        let standin = StandIn::start(id, level, "granted");
+        StandIn::granted(gpu, id, level, None)
+    }
+
+    /// Granted at its spawn, as `uid` (the executor identity a root TensorD runs it as) or as
+    /// this process.
+    fn granted(gpu: &Gpu, id: &GpuId, level: &str, uid: Option<u32>) -> StandIn {
+        let standin = StandIn::start(id, level, "granted", uid);
         let grant = gpu.ledger.grant(standin.pid()).unwrap();
         platform::handles::send_fd(&standin.control, &grant.table).unwrap();
+        platform::handles::send_fd(&standin.control, &grant.row).unwrap();
         standin
     }
 
     /// An engine with no TensorD: its memory opens the GPU's table by name.
     fn standalone(id: &GpuId, level: &str) -> StandIn {
-        StandIn::start(id, level, "named")
+        StandIn::start(id, level, "named", None)
     }
 
-    fn start(id: &GpuId, level: &str, opened: &str) -> StandIn {
+    fn start(id: &GpuId, level: &str, opened: &str, uid: Option<u32>) -> StandIn {
         let (control, theirs) = UnixStream::pair().unwrap();
-        let child = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args(["--exact", "executor_stand_in", "--ignored", "--nocapture"])
             .env("S5_STAND_IN", format!("{}|{}|{}|{level}|{opened}", id.uuid, id.model, id.memory))
             .stdin(Stdio::from(OwnedFd::from(theirs)))
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stdout(Stdio::null());
+        if let Some(uid) = uid {
+            std::os::unix::process::CommandExt::uid(&mut command, uid);
+            std::os::unix::process::CommandExt::gid(&mut command, uid);
+        }
+        let child = command.spawn().unwrap();
         let replies = BufReader::new(control.try_clone().unwrap());
         StandIn { child, control, replies }
     }
@@ -478,4 +492,36 @@ fn tensord_wakes_on_a_standalone_engines_events() {
     assert_eq!(engine.ask(&format!("end {BIG_ROOM}")), "ended");
     assert_eq!(wakes.recv_timeout(BACKSTOP).expect("its peak and its freed room wake TensorD"), memory::Woke::Ledger);
     assert!(gpu.ledger.status().rows.iter().any(|row| row.pid == engine.pid() && row.live), "its row is on TensorD's table");
+}
+
+/// The executor identity a root TensorD launches executors as (`config.identity`): `nobody`.
+const IDENTITY: u32 = 65534;
+
+/// Review 1, item 8b: under `config.identity` a root TensorD grants its table to executors of
+/// another uid: they open it, keep pages in TensorD's custody, a successor of that uid imports
+/// them after a kill, and admission works as for TensorD's own uid. Run as root (the hosted run
+/// copies this binary where `nobody` may run it).
+#[test]
+#[ignore = "needs root: a TensorD granting executors of another uid"]
+fn a_root_tensord_grants_executors_of_its_identity() {
+    // SAFETY: geteuid reads a process attribute.
+    assert_eq!(unsafe { libc::geteuid() }, 0, "run as root");
+    let dir = tempfile::tempdir().unwrap();
+    let (log, peaks) = (MemoryLog::at(dir.path().join("logs")), Peaks::at(dir.path().join("peaks")));
+    let id = gpu_id("identity");
+    let gpu = Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, &peaks, &log).unwrap();
+    let mut first = StandIn::granted(&gpu, &id, "gpu", Some(IDENTITY));
+    assert_eq!(first.load(), ("Hit,Hit,Hit".into(), 0, 0), "warmed on its GPU");
+    assert!(maps(&gpu, first.pid()), "its row is on TensorD's table");
+    assert!(varena::Ledger::admit(&[&gpu.ledger], "identity", PACKAGE, "8").unwrap());
+    assert_eq!(first.ask("run identity 8"), "passing");
+    assert_eq!(first.ask(&format!("end {ROOM}")), "ended");
+    gpu.ledger.undispatch("identity");
+    assert!(gpu.ledger.peaks().iter().any(|peak| key(peak) == format!("{PACKAGE}|8")), "its peak reached TensorD's table");
+    let pid = first.kill();
+    gpu.ledger.reap(pid);
+    assert!(orphans(&gpu) >= spec(&id).layout.nbytes, "its kept pages are in TensorD's custody");
+    let mut second = StandIn::granted(&gpu, &id, "ram", Some(IDENTITY));
+    assert_eq!(second.load(), ("Hit,Hit,Hit".into(), 0, 0), "imported at load, not copied");
+    assert_eq!(orphans(&gpu), 0);
 }
