@@ -535,7 +535,8 @@ impl Zygote {
             return false;
         }
         let mut children = self.children.lock().unwrap();
-        children.retain(|birth| !birth.ended().unwrap_or(true));
+        // A child is gone only when proven gone: one whose state cannot be read is still a child.
+        children.retain(|birth| !matches!(birth.ended(), Ok(true)));
         children.is_empty()
     }
     /// Its private host bytes (PSS less shared memory), 0 when not running.
@@ -857,7 +858,13 @@ impl Pool {
             return false;
         };
         let (plan, start) = (session.plan.clone(), session.start);
-        if let Err(error) = session.executor.shutdown() {
+        // One that already exited is only reaped; a live one is asked to stop. Both block until
+        // it is gone.
+        let ended = match session.executor.birth.ended() {
+            Ok(true) => session.executor.terminate().map(drop),
+            _ => session.executor.shutdown(),
+        };
+        if let Err(error) = ended {
             tracing::warn!("ending idle deviceless executor of {plan}: {error}");
         }
         self.ended(&plan, start, 0);
@@ -2447,8 +2454,11 @@ impl Pool {
         let (key, degree) = (session_key(&plan.construction, start), plan.degree);
         let retained = match degree {
             0 => {
+                // One way out of the idle pool: an executor proven ended leaves through
+                // `end_idle_deviceless`, reaped and accounted. One whose state cannot be read is
+                // never dropped silently with what it holds; it serves on.
+                while self.end_idle_deviceless(|session| matches!(session.executor.birth.ended(), Ok(true))) {}
                 let mut idle = self.deviceless.lock().unwrap();
-                idle.retain(|session| !session.executor.birth.ended().unwrap_or(true));
                 let newest = idle.iter().rposition(|session| session.plan == plan.construction);
                 newest.map(|at| idle.remove(at))
             }
