@@ -10,18 +10,17 @@ use crate::{
     journal::{Installation, Preparation},
     objects::Refused,
     precision,
-    process::Supervised,
     service::Service,
 };
 use base64::Engine as _;
 use fs2::FileExt;
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    collections::{BTreeMap, HashMap},
+    fs::{self, File},
+    io,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -38,6 +37,7 @@ use tensorfs::{
     sha256,
 };
 use crate::catalog::normalized;
+use crate::environments::{self, SDK};
 
 /// How each published environment gets its Runtime SDK. Empty `requirements` keeps the
 /// release's own locked SDK rows.
@@ -80,6 +80,15 @@ impl OwnerUv {
 }
 
 impl PackageSdk {
+    /// This machine's pair as an environment takes it (`environments::install_pair`).
+    pub(crate) fn pair(&self) -> environments::Pair<'_> {
+        environments::Pair {
+            requirements: &self.requirements,
+            find_links: self.find_links.as_deref(),
+            runtime_build: &self.runtime_build,
+        }
+    }
+
     /// Executors use the selected Runtime/TensorFS pair (an update's, else the image's), so they
     /// speak this machine's protocol; without a complete pair, each release's locked SDK.
     pub fn selected(wheels: &Path, root: &Path, uv: PathBuf) -> Self {
@@ -942,11 +951,15 @@ impl Publisher {
             let pins = self.export_pins(&project, &lock_sdk, job.stop.as_ref())?;
             fs::write(dir.join("constraints.txt"), pins).map_err(io_failure)?;
         }
-        let (mut sdk_choice, mut sdk_fallback) = ("locked", String::new());
+        let uv = |args: &[&str]| self.uv(args, job.stop.as_ref());
+        let constraints = dir.join("constraints.txt");
+        let (mut machine_pair, mut sdk_fallback) = (false, String::new());
         if own_sdk {
             next();
             let restore = || sync(true, !client);
-            (sdk_choice, sdk_fallback) = self.install_sdk(&py, &dir, &lock_sdk, &restore, compile(!client), job.stop.as_ref())?;
+            let restore: Option<&dyn Fn() -> Result<(), Failure>> = (!lock_sdk.is_empty()).then_some(&restore);
+            (machine_pair, sdk_fallback) =
+                environments::install_pair(&uv, &self.sdk.pair(), &py, &env, &constraints, restore, compile(!client))?;
             if !sdk_fallback.is_empty() {
                 tracing::warn!("package {package} {release}: {sdk_fallback}");
                 job.stage(format!("warning: {sdk_fallback}"));
@@ -954,11 +967,10 @@ impl Publisher {
         }
         if let Some(wheel) = &self.sdk.client_wheel {
             next();
-            let constraints = dir.join("constraints.txt").to_string_lossy().to_string();
-            let wheel = wheel.to_string_lossy().to_string();
-            self.uv(&["pip", "install", "--no-config", "--python", &py, compile(true), "--constraints", &constraints, &wheel],
-                job.stop.as_ref())?;
+            environments::add_client(&uv, &py, wheel, &constraints, compile(true))?;
         }
+        let runtime_build = if machine_pair { self.sdk.runtime_build.clone() } else { String::new() };
+        environments::refuse_conflicts(&uv, &py, &runtime_build)?;
         let interface = &card.interface;
         let application = interface.get("application").and_then(Value::as_str).ok_or((
             "package_prepare_interface_invalid",
@@ -970,25 +982,24 @@ impl Publisher {
         // (th-245 did, and every callee became `local/<name>`: run 5234).
         let org = package.split_once('/').map_or("", |(org, _)| org);
         let hub_packages: BTreeMap<String, String> = hosted.iter().map(|name| (name.clone(), format!("{org}/{name}"))).collect();
-        let (source_digest, callees) = match &self.sdk.client_wheel {
-            Some(_) => describe_environment(&py, &locked.distribution, &hub_packages)?,
-            None => (String::new(), vec![]),
+        let described = match &self.sdk.client_wheel {
+            Some(_) => environments::describe_environment(&py, &locked.distribution, &hub_packages, false)?,
+            None => environments::Described::default(),
         };
-        let runtime_build = if sdk_choice == "machine" { self.sdk.runtime_build.as_str() } else { "" };
-        let record = json!({"identity":identity,"package":locked.distribution,"version":release,"application":application,"python":interpreter,"dependencies":installed_sdk(&env),"interface":interface,"sdk":sdk_choice,"sdk_fallback":sdk_fallback,"runtime_build":runtime_build,"source_digest":source_digest,"callees":callees});
-        let staged = dir.join(".generation.json.new");
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&staged)
-            .map_err(io_failure)?;
-        file.write_all(record.to_string().as_bytes())
-            .and_then(|_| file.sync_all())
-            .map_err(io_failure)?;
-        fs::rename(&staged, dir.join("generation.json")).map_err(io_failure)?;
-        platform::durable::sync_dir(&dir)
-            .and_then(|()| platform::durable::sync_dir(generations))
-            .map_err(|error| io_failure(error.into()))
+        let record = crate::catalog::Generation {
+            identity: identity.into(),
+            package: locked.distribution.clone(),
+            version: release.into(),
+            application: application.into(),
+            python: interpreter.clone(),
+            dependencies: environments::installed(&env),
+            interface: interface.clone(),
+            source_digest: described.source_digest,
+            callees: described.callees,
+            sdk_fallback,
+            runtime_build,
+        };
+        environments::publish(&dir, generations, &record)
     }
 
     /// The lock's exact versions as constraints (`name==version ; marker`), less `except`: what
@@ -1085,76 +1096,8 @@ impl Publisher {
         Ok(Some(lock))
     }
 
-    /// This machine's own Runtime and TensorFS in an environment holding a release's locked
-    /// requirements, where the package's bounds admit them (uv's check of every installed
-    /// requirement); else the release's locked pair (`restore`), and why. A development Runtime
-    /// an update named (`--runtime-wheel`) is the operator's choice: it runs whatever the
-    /// package's bounds on the pair, which the warning names, and one that cannot install
-    /// refuses the release. Returns which SDK the environment holds and its run warning, if
-    /// any: never silent.
-    fn install_sdk(&self, py: &str, dir: &Path, locked: &[&str], restore: &dyn Fn() -> Result<(), Failure>, compile: &str,
-        stop: Option<&Stop>) -> Result<(&'static str, String), Failure> {
-        let constraints = dir.join("constraints.txt").to_string_lossy().to_string();
-        let mut args = vec!["pip", "install", "--no-config", "--python", py, compile, "--constraints", &constraints];
-        let links = self.sdk.find_links.as_ref().map(|p| p.to_string_lossy().to_string());
-        if let Some(links) = &links {
-            args.extend(["--find-links", links]);
-        }
-        args.extend(self.sdk.requirements.iter().map(String::as_str));
-        // What the release's own closure reports already stands (NVIDIA's aarch64 cusparseLt
-        // wheel is tagged `sbsa`, so uv flags it on every Linux arm64 machine): the pair is
-        // refused only for a finding it adds. uv's failure names its step and its output.
-        let before = self.check(py, stop)?;
-        let own = self.uv(&args, stop).and_then(|()| {
-            let added: Vec<String> = self.check(py, stop)?.difference(&before).cloned().collect();
-            match added.is_empty() {
-                true => Ok(()),
-                false => Err(("package_installation_uv_failed", format!("uv pip check:\n{}", added.join("\n")))),
-            }
-        });
-        let Err((code, detail)) = own else {
-            return Ok(("machine", String::new()));
-        };
-        let build = &self.sdk.runtime_build;
-        if code == CANCELED {
-            return Err((code, detail));
-        } else if !build.is_empty() {
-            // uv's check names each requirement the installed pair misses; any other failure
-            // (the pair's own dependencies against the lock's) leaves nothing it could run.
-            let missed: Vec<&str> = detail.lines().map(str::trim).filter(|l| l.starts_with("The package `")).collect();
-            if missed.is_empty() || !missed.iter().all(|l| pair_bound(l)) {
-                return Err((code, format!("this machine's development Runtime {build} cannot run this release: {detail}")));
-            }
-            return Ok(("machine", format!("{}; this machine's development Runtime {build} (`--runtime-wheel`) runs it regardless", missed.join("; "))));
-        }
-        if locked.is_empty() {
-            return Err((code, detail));
-        }
-        let detail: Vec<&str> = detail.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-        let detail = detail[detail.len().saturating_sub(12)..].join(" | ");
-        // The locked pair failing too (TensorFS's sdist on aarch64) still names why the machine's did not.
-        restore().map_err(|(locked_code, why)| (locked_code, format!(
-            "{why}; this machine's own Runtime and TensorFS did not install first ({code}: {})", crate::triage::ends(&detail, 1000))))?;
-        Ok(("locked", format!(
-            "this machine's own Runtime and TensorFS did not install ({code}: {}); it runs the release's locked {}",
-            crate::triage::ends(&detail, 2000),
-            locked.join(", ")
-        )))
-    }
-
     fn uv(&self, args: &[&str], stop: Option<&Stop>) -> Result<(), Failure> {
         self.uv_observed(args, &[], stop, &|_| ())
-    }
-
-    /// `uv pip check`'s findings in an environment, one line each (`The package …`).
-    fn check(&self, py: &str, stop: Option<&Stop>) -> Result<BTreeSet<String>, Failure> {
-        match self.uv(&["pip", "check", "--no-config", "--python", py], stop) {
-            Ok(()) => Ok(BTreeSet::new()),
-            Err((code, detail)) => {
-                let found: BTreeSet<String> = detail.lines().map(str::trim).filter(|l| l.starts_with("The package ")).map(String::from).collect();
-                if found.is_empty() { Err((code, detail)) } else { Ok(found) }
-            }
-        }
     }
 
     /// `uv` with `read` told, about once a second, how many bytes the process has read so far
@@ -1165,8 +1108,7 @@ impl Publisher {
         read: &(dyn Fn(u64) + Sync)) -> Result<(), Failure> {
         crate::machine::client::ensure_uv(&self.sdk.uv).map_err(|e| ("uv_unavailable", e.to_string()))?;
         let mut command = Command::new(&self.sdk.uv);
-        command.args(args).env_clear().envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-        platform::process::own_group(&mut command);
+        command.args(args).env_clear().envs(env.iter().copied());
         // Windows spells its names in any case (`Path`), and resolves no host name for a
         // process without `SystemRoot`; TEMP and TMP are its temporary directory.
         const KEPT: [&str; 7] = ["PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "LANG", "SYSTEMROOT", "TEMP", "TMP"];
@@ -1188,32 +1130,7 @@ impl Publisher {
             (None, Some(owner)) => command.env("UV_CACHE_DIR", &owner.cache),
             (None, None) => command.env("UV_CACHE_DIR", self.root.join("uv-cache")),
         };
-        let mut child = command.spawn().map_err(|e| {
-            (
-                "package_installation_uv_absent",
-                format!("cannot run uv: {e}"),
-            )
-        })?;
-        let mut stderr = child.stderr.take().expect("piped uv stderr");
-        let (ended, stderr) = std::thread::scope(|scope| {
-            let drained = scope.spawn(move || {
-                let mut kept = Vec::new();
-                let _ = stderr.read_to_end(&mut kept);
-                kept
-            });
-            let ended = crate::process::supervise(&mut child, stop, "uv", read);
-            (ended, drained.join().unwrap_or_default())
-        });
-        let step = args[..2.min(args.len())].join(" ");
-        match ended.map_err(|e| ("package_installation_uv_failed", format!("uv: {e}")))? {
-            Supervised::Exited(status) if status.success() => Ok(()),
-            Supervised::Exited(_) => Err((
-                "package_installation_uv_failed",
-                format!("uv {step}:\n{}", crate::api::install::stderr_tail(&stderr)),
-            )),
-            Supervised::Canceled => Err(canceled()),
-            Supervised::Wedged(verdict) => Err(("no_progress", format!("uv {step}: {verdict}"))),
-        }
+        environments::run_uv(command, &args[..2.min(args.len())].join(" "), stop, read)
     }
 
     /// The run's model grants and its precision warnings. Each slot takes the run's choice, else
@@ -1837,76 +1754,6 @@ struct Locked {
     packages: BTreeMap<String, String>,
 }
 
-/// The Runtime SDK pair: the machine's own, where it has one.
-const SDK: [&str; 2] = ["cozy-runtime", "tensorfs"];
-
-/// The environment's root digest and the other Apps it holds, described inside it by the
-/// machine's client without importing them (`runtime_describe`). A failed description fails
-/// this preparation; it never publishes an environment with silently missing callees.
-pub fn describe_environment(
-    python: &str,
-    root: &str,
-    packages: &BTreeMap<String, String>,
-) -> Result<(String, Vec<crate::catalog::Callee>), Failure> {
-    #[derive(serde::Deserialize)]
-    #[serde(tag = "kind", rename_all = "snake_case")]
-    enum Reply {
-        DescribedEnvironment { source_digest: String, callees: Vec<crate::catalog::Callee> },
-        DescribeFailed { code: String, detail: String },
-    }
-    // -S keeps authored .pth startup code out; only the venv's own site-packages are added.
-    const BOOTSTRAP: &str = "import pathlib,runpy,sys;\
-        root=pathlib.Path(sys.executable).absolute().parent.parent;\
-        sys.path[:0]=[str(p) for p in (*(root/'lib').glob('python*/site-packages'),root/'Lib'/'site-packages') if p.is_dir()];\
-        runpy.run_module('tensord_client.runtime_describe',run_name='__main__')";
-    let described = Command::new(python)
-        .args(["-I", "-S", "-c", BOOTSTRAP])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .and_then(|mut child| {
-            let request = json!({"kind": "describe_environment", "root": root, "packages": packages}).to_string();
-            child.stdin.take().expect("piped").write_all(request.as_bytes())?;
-            child.wait_with_output()
-        });
-    let output = described.map_err(io_failure)?;
-    let reply = serde_json::from_slice::<Reply>(&output.stdout).map_err(|error| {
-        ("package_prepare_description_failed", format!("environment description failed: {error}"))
-    })?;
-    match reply {
-        Reply::DescribedEnvironment { source_digest, callees } if output.status.success() => Ok((source_digest, callees)),
-        Reply::DescribeFailed { code, detail } => Err(("package_prepare_description_failed", format!("{code}: {detail}"))),
-        _ => Err(("package_prepare_description_failed", "environment description did not complete".into())),
-    }
-}
-
-/// uv's check line for a bound on the machine's own pair that the installed pair misses:
-/// "The package `anima` requires `cozy-runtime[media]>=0.24.7`, but `0.24.6` is installed".
-fn pair_bound(line: &str) -> bool {
-    let required = line.split_once("` requires `").and_then(|(_, rest)| rest.split_once("`, but `")).map(|(r, _)| r);
-    required.is_some_and(|r| {
-        let end = r.find(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))).unwrap_or(r.len());
-        SDK.contains(&normalized(&r[..end]).as_str())
-    })
-}
-
-/// The Runtime and TensorFS an environment holds, by their installed distribution names.
-fn installed_sdk(env: &Path) -> Vec<Value> {
-    let mut found: Vec<Value> = platform::paths::venv_site_packages(env)
-        .into_iter()
-        .flat_map(|site| fs::read_dir(site).into_iter().flatten().flatten())
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            let (distribution, version) = name.strip_suffix(".dist-info")?.split_once('-')?;
-            let distribution = normalized(distribution);
-            SDK.contains(&distribution.as_str()).then(|| json!({"name": distribution, "version": version}))
-        })
-        .collect();
-    found.sort_by_key(|d| d["name"].as_str().unwrap_or_default().to_string());
-    found
-}
-
 /// The release's pyproject and uv.lock read for what `generation` hands uv and what it moves
 /// itself. A Hub row with more than one wheel (one per platform) is uv's to choose.
 fn read_lock(pyproject: &str, lock: &str, source: &hub::Source) -> Result<Locked, Failure> {
@@ -2021,6 +1868,7 @@ pub(crate) mod names_hub;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::io::Write;
     use std::time::Duration;
 
     /// A release locked for Linux alone tells a Mac or Windows machine where it runs, at once.
@@ -2318,7 +2166,8 @@ pub(crate) mod tests {
 
     /// The machine's own Runtime goes into an environment whose packages admit it; one whose
     /// bounds refuse it runs the release's locked one, and the generation says why (uv's own
-    /// words) and which. Real uv, wheels and lock; no network.
+    /// words) and which. The record lists every installed distribution. Real uv, wheels and
+    /// lock; no network.
     #[test]
     fn a_refused_machine_sdk_falls_back_to_the_locked_one_and_says_so() {
         let root = std::env::temp_dir().join(format!("cm-sdk-{}", uuid::Uuid::new_v4()));
@@ -2343,7 +2192,7 @@ pub(crate) mod tests {
         let admits = card(pyproject, lock);
         let (record, stages) = generate_after(&publisher, &generations, "admits", &admits, None).unwrap();
         assert_eq!(record.sdk_fallback, "");
-        let held: Vec<_> = record.dependencies.iter().map(|d| (d.name.as_str(), d.version.as_str())).collect();
+        let held: Vec<_> = record.dependencies.iter().filter(|d| SDK.contains(&d.name.as_str())).map(|d| (d.name.as_str(), d.version.as_str())).collect();
         assert_eq!(held, [("cozy-runtime", "9.0")]);
         // One stage to the person, its steps counted; linking the machine's pair in is a step of
         // the install, never named as an update.
@@ -2358,8 +2207,8 @@ pub(crate) mod tests {
         let record = generate(&publisher, &generations, "refuses", &card(pyproject, lock)).unwrap();
         let why = &record.sdk_fallback;
         assert!(why.contains("uv pip check") && why.contains("needs-old"), "{why}");
-        assert!(why.ends_with("it runs the release's locked cozy-runtime"), "{why}");
-        let held: Vec<_> = record.dependencies.iter().map(|d| (d.name.as_str(), d.version.as_str())).collect();
+        assert!(why.ends_with("it runs the package's own cozy-runtime==1.0"), "{why}");
+        let held: Vec<_> = record.dependencies.iter().filter(|d| SDK.contains(&d.name.as_str())).map(|d| (d.name.as_str(), d.version.as_str())).collect();
         assert_eq!(held, [("cozy-runtime", "1.0")]);
         let _ = fs::remove_dir_all(root);
     }
@@ -2387,7 +2236,7 @@ pub(crate) mod tests {
         let (pyproject, lock) = locked(&root.join("sbsa"), &["sbsa-tagged"], &wheels, "");
         let record = generate(&publisher, &root.join("generations"), "sbsa", &card(pyproject, lock)).unwrap();
         assert_eq!(record.sdk_fallback, "");
-        let held: Vec<_> = record.dependencies.iter().map(|d| (d.name.as_str(), d.version.as_str())).collect();
+        let held: Vec<_> = record.dependencies.iter().filter(|d| SDK.contains(&d.name.as_str())).map(|d| (d.name.as_str(), d.version.as_str())).collect();
         assert_eq!(held, [("cozy-runtime", "9.0")]);
         let _ = fs::remove_dir_all(root);
     }
@@ -2517,7 +2366,7 @@ pub(crate) mod tests {
             tiny_wheel(&wheels, package, "1.0", &[floor]);
             let (pyproject, lock) = locked(&root.join(package), &[package], &wheels, "");
             let record = generate(&publisher, &generations, package, &card(pyproject, lock)).unwrap();
-            let held: Vec<_> = record.dependencies.iter().map(|d| (d.name.as_str(), d.version.as_str())).collect();
+            let held: Vec<_> = record.dependencies.iter().filter(|d| SDK.contains(&d.name.as_str())).map(|d| (d.name.as_str(), d.version.as_str())).collect();
             assert_eq!(held, [("cozy-runtime", "2.1"), ("tensorfs", "1.0")], "{package}");
             assert_eq!((record.runtime_build.as_str(), record.sdk_fallback), (build.as_str(), warning), "{package}");
         }

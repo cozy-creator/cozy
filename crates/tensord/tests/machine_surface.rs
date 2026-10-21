@@ -2695,10 +2695,11 @@ mod v1_api {
             .map(|g| g.path().join("env/bin/python"))
             .find(|p| p.exists())
             .unwrap();
-        let (digest, callees) = tensord::published::describe_environment(
+        let tensord::environments::Described { source_digest: digest, callees, .. } = tensord::environments::describe_environment(
             python.to_str().unwrap(),
             "tensord-cpu-caller",
             &Default::default(),
+            false,
         ).unwrap();
         assert!(digest.starts_with("sha256:"), "{digest}");
         assert_eq!(callees[0].application, "cpu_memo:app", "{callees:?}");

@@ -1,7 +1,9 @@
 """The trusted installer helper's command line: stdout carries exactly one typed record.
 
-It is its own module so `PackageError` is one class: run as `-m ...packages`, that module would
-be `__main__`, and the errors `captured_packages` raises would escape its handler untyped.
+`capture` builds one environment of a local package's own closure; the machine does the rest
+(`environments.rs`). It is its own module so `PackageError` is one class: run as `-m
+...packages`, that module would be `__main__`, and the errors `captured_packages` raises would
+escape its handler untyped.
 """
 from __future__ import annotations
 
@@ -12,7 +14,7 @@ from pathlib import Path
 
 import msgspec
 
-from .captured_packages import install_captured, install_editable
+from .captured_packages import capture, capture_editable
 from .package_records import InstallFailed
 from .packages import PackageError
 
@@ -20,7 +22,9 @@ from .packages import PackageError
 def main():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
-    captured = commands.add_parser("install-captured")
+    captured = commands.add_parser("capture")
+    # The generation root the machine made: the environment is built at <root>/env.
+    captured.add_argument("--root", type=Path)
     captured.add_argument("--project", type=Path)
     captured.add_argument("--wheel", action="append", type=Path, default=[])
     captured.add_argument("--requirements", type=Path)
@@ -28,29 +32,27 @@ def main():
     captured.add_argument("--release", required=True)
     captured.add_argument("--python-requires", default="")
     captured.add_argument("--python-version", default="")
-    captured.add_argument("--generations", type=Path, required=True)
-    captured.add_argument("--client-wheel", type=Path, required=True)
+    # The machine's Runtime/TensorFS pair, which it installs over the closure next.
     captured.add_argument("--sdk-wheel", action="append", type=Path, default=[])
-    # The development Runtime an update named: it runs whatever the package's bounds on the pair.
-    captured.add_argument("--runtime-build", default="")
+    # The package's own pair again, where the machine's could not stand.
+    captured.add_argument("--restore", action="store_true")
     captured.add_argument("--python", default=sys.executable)
-    captured.add_argument("--callees", default="{}")
     # A live project installed editable in this environment, kept while its lock stands.
     captured.add_argument("--editable-environment", type=Path)
-    # An index the project's sources name without declaring it (name=url).
+    # An index the project's sources name without declaring (name=url).
     captured.add_argument("--index", action="append", default=[])
-    # A live project's own code, by content (its installed files only point at it).
-    captured.add_argument("--source-digest", default="")
     args = parser.parse_args()
     try:
         shared = dict(distribution=args.distribution, release=args.release, python_requires=args.python_requires,
-            python_version=args.python_version, generations=args.generations, client_wheel=args.client_wheel,
-            python=args.python, sdk=args.sdk_wheel, runtime_build=args.runtime_build, callees=msgspec.json.decode(args.callees, type=dict[str, str]))
+                      python_version=args.python_version, python=args.python, sdk=args.sdk_wheel, restore=args.restore)
         if args.editable_environment:
-            result = install_editable(project=args.project, environment=args.editable_environment, wheels=args.wheel,
-                                      indexes=args.index, source_digest=args.source_digest, **shared)
+            result = capture_editable(project=args.project, environment=args.editable_environment, wheels=args.wheel,
+                                      indexes=args.index, **shared)
+        elif args.root is None:
+            raise PackageError("invalid_request", "a captured environment is built under --root")
         else:
-            result = install_captured(project=args.project, wheels=args.wheel, requirements=args.requirements, **shared)
+            result = capture(root=args.root, project=args.project, wheels=args.wheel, requirements=args.requirements,
+                             **shared)
     except PackageError as exc:
         print(msgspec.json.encode(InstallFailed(exc.code, str(exc))).decode())
         raise SystemExit(1)

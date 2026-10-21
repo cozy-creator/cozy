@@ -84,7 +84,8 @@ code is still not sandboxed.
 | `api/machine_status.rs` | Status: identity and receipt to anyone, the whole machine to a machine cap as it changes | `frame`, `watch` | D2 |
 | `api/machine_update.rs` | Runs of `kind: update`: a software cohort from versions or held wheel objects; its log is the update's state history | `submit`, `events`, `owns` | D2 |
 | `api/capability.rs` | `Cozy-Cap` grants (the Go agent's token) for run outputs and maintenance | `Grant`, `verify`, `mint` | G |
-| `api/install.rs` | Materialize uploaded packages, run the uv installer helper | `InstallerConfig`, `PreparedGeneration` | D1 |
+| `api/install.rs` | Materialize uploaded packages, run the helper's capture, finish the environment (`environments.rs`) | `InstallerConfig`, `PreparedGeneration` | D1 |
+| `environments.rs` | Every environment's finish, release or local: the machine's pair, client, uv check, description, typed `generation.json` | `install_pair`, `describe_environment`, `publish` | D1 |
 | `machine_api.rs` | `MachineBackend` implementation: submit, events, collect, list, inventory | `NativeBackend` | D1 |
 | `products.rs` | Run output log: `Outputs.publish` custody and `product` events (SET/APPEND, composite parts) | `publish`, `retain`, `document` | G |
 | `triage.rs` | One bounded triage bundle per failed attempt, named by its outcome | `TriageRef`, `Facts` | G |
@@ -121,7 +122,8 @@ code is still not sandboxed.
 
 | Module | Role |
 |---|---|
-| `packages.py`, `captured_packages.py`, `installer.py`, `package_records.py`, `runtime_describe.py` | Static description and uv generation install (`python -m tensord_client.installer`) |
+| `packages.py`, `captured_packages.py`, `installer.py`, `package_records.py` | A local package's own closure, captured with uv (`python -m tensord_client.installer capture`) |
+| `runtime_describe.py` | Static description inside an environment (`environments.rs` asks it) |
 | `device_codec.py` | Output encoder, embedded into `device_executor.rs` with `include_str!` |
 
 ## Development tools (not proof; see PLAN decision 5)

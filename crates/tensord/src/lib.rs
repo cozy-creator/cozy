@@ -12,6 +12,7 @@ pub mod catalog;
 pub mod config;
 pub mod child_launcher;
 pub mod deposits;
+pub mod environments;
 pub mod device_executor;
 pub mod execution;
 mod gpu_allocation;

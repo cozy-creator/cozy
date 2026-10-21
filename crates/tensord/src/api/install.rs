@@ -1,5 +1,6 @@
-//! Materialize verified package carriers and call the trusted Python/uv installer.
-//! The service commits actor/installation aliases in its one execution journal.
+//! Materialize verified package carriers, let the trusted Python/uv helper capture a local
+//! package's own closure, and finish its environment on the one path a release's takes
+//! (`environments`). The service commits actor/installation aliases in its one execution journal.
 use super::workspaces::{RootSet, UploadedPackage};
 use platform::durable::Mode;
 use fs2::FileExt;
@@ -11,6 +12,7 @@ use std::{
     process::{Command, Stdio},
     sync::Arc,
 };
+use crate::environments;
 use crate::stop::Stop;
 use protocol::error::Error;
 use crate::triage::masked;
@@ -35,24 +37,8 @@ pub struct InstallerConfig {
     /// overlayfs never copies its payload (Torch) into each environment of each edit.
     pub seed_cache: Option<PathBuf>,
 }
-#[derive(Clone, Debug, Deserialize, serde::Serialize)]
-pub struct Dependency {
-    pub name: String,
-    pub version: String,
-}
-#[derive(Debug, Deserialize, serde::Serialize)]
-pub struct GenerationRecord {
-    pub identity: String,
-    pub package: String,
-    pub version: String,
-    pub application: String,
-    pub python: PathBuf,
-    #[serde(default)]
-    pub dependencies: Vec<Dependency>,
-    pub interface: Box<serde_json::value::RawValue>,
-}
 pub struct PreparedGeneration {
-    pub record: GenerationRecord,
+    pub record: crate::catalog::Generation,
     pub interface_bytes: Vec<u8>,
     pub hold: Arc<File>,
 }
@@ -159,17 +145,18 @@ pub fn prepare_uploaded(
     stop: Option<&Stop>,
 ) -> Result<PreparedGeneration, Error> {
     let materialized = materialize_uploaded(uploaded, &config.staging_root)?;
-    let mut command = installer(config, &materialized.root_set)?;
-    if let Some(project) = &materialized.project {
-        command.arg("--project").arg(project);
-    }
-    for wheel in &materialized.wheels {
-        command.arg("--wheel").arg(wheel);
-    }
-    if let Some(requirements) = &materialized.requirements {
-        command.arg("--requirements").arg(requirements);
-    }
-    publish(config, command, stop, None)
+    let capture = |command: &mut Command| {
+        if let Some(project) = &materialized.project {
+            command.arg("--project").arg(project);
+        }
+        for wheel in &materialized.wheels {
+            command.arg("--wheel").arg(wheel);
+        }
+        if let Some(requirements) = &materialized.requirements {
+            command.arg("--requirements").arg(requirements);
+        }
+    };
+    prepare(config, &materialized.root_set, &capture, None, stop)
 }
 
 /// A live project installed editable in `environment`, which is built when it is not there
@@ -189,16 +176,176 @@ pub fn prepare_editable(
     // outlives it): that helper ends before another builds the same environment.
     let claim = environment.with_extension("installer");
     end_stale(&claim).map_err(storage)?;
-    let mut command = installer(config, root)?;
-    command.arg("--project").arg(project).arg("--editable-environment").arg(environment);
-    command.arg("--source-digest").arg(source_digest);
-    for (name, url) in indexes {
-        command.arg("--index").arg(format!("{name}={url}"));
+    let capture = |command: &mut Command| {
+        command.arg("--project").arg(project).arg("--editable-environment").arg(environment);
+        for (name, url) in indexes {
+            command.arg("--index").arg(format!("{name}={url}"));
+        }
+        for wheel in wheels {
+            command.arg("--wheel").arg(wheel);
+        }
+    };
+    let live = Live { project, environment, source_digest, claim: &claim };
+    prepare(config, root, &capture, Some(live), stop)
+}
+
+/// A live project's environment, kept across its edits.
+struct Live<'a> {
+    project: &'a Path,
+    environment: &'a Path,
+    /// The project's own code, by content: its installed files only point at it.
+    source_digest: &'a str,
+    claim: &'a Path,
+}
+
+/// What the machine keeps of a live environment once it is ready (`.ready`): its pair's warning
+/// and the development Runtime it holds.
+#[derive(Default, Deserialize, serde::Serialize)]
+struct Ready {
+    sdk_fallback: String,
+    runtime_build: String,
+}
+
+/// One local package's environment at a new generation: the helper captures the package's own
+/// closure (`capture` adds what it is), then this machine's pair, its client, uv's check, the
+/// description and the typed record, as for a release (`environments`). A generation that
+/// fails is removed: it was never published.
+fn prepare(
+    config: &InstallerConfig,
+    root: &RootSet,
+    capture: &dyn Fn(&mut Command),
+    live: Option<Live>,
+    stop: Option<&Stop>,
+) -> Result<PreparedGeneration, Error> {
+    fs::create_dir_all(&config.generations).map_err(storage)?;
+    let generations = platform::durable::canonical(&config.generations).map_err(std::io::Error::from).map_err(storage)?;
+    let dir = generations.join(uuid::Uuid::new_v4().simple().to_string());
+    fs::create_dir(&dir).map_err(storage)?;
+    let built = (|| {
+        // Held from the start: nothing collects it between its record and its first run.
+        let hold = File::create(dir.join(".hold")).map_err(storage)?;
+        hold.lock_shared().map_err(storage)?;
+        let helper = |restore: bool| -> Result<Captured, Error> {
+            let mut command = installer(config, root)?;
+            if live.is_none() {
+                command.arg("--root").arg(&dir);
+            }
+            if restore {
+                command.arg("--restore");
+            }
+            capture(&mut command);
+            run_helper(command, stop, live.as_ref().map(|l| l.claim))
+        };
+        let captured = helper(false)?;
+        if let Some(live) = &live {
+            let environment = platform::durable::canonical(live.environment).map_err(std::io::Error::from).map_err(storage)?;
+            platform::durable::symlink(&environment, &dir.join("env")).map_err(std::io::Error::from).map_err(storage)?;
+        }
+        let env = dir.join("env");
+        let python = platform::paths::venv_python(&env);
+        let py = python.to_string_lossy().to_string();
+        let uv = |args: &[&str]| uv(config, args, stop);
+        let ready = match &captured.ready {
+            Some(kept) => serde_json::from_str(kept).unwrap_or_else(|_| Ready { sdk_fallback: kept.clone(), ..Ready::default() }),
+            None => {
+                let constraints = dir.join("constraints.txt");
+                let requirements: Vec<String> = config.sdk.iter().map(|w| w.to_string_lossy().into_owned()).collect();
+                let pair = environments::Pair { requirements: &requirements, find_links: None, runtime_build: &config.runtime_build };
+                let (machine, sdk_fallback) = match config.sdk.is_empty() {
+                    true => (false, String::new()),
+                    false => {
+                        environments::pin_installed(&env, &environments::SDK, &constraints).map_err(failure)?;
+                        let restore: &dyn Fn() -> Result<(), environments::Failure> =
+                            &|| helper(true).map(drop).map_err(|e| ("package_installation_failed", e.message));
+                        environments::install_pair(&uv, &pair, &py, &env, &constraints, Some(restore), "--no-compile-bytecode")
+                            .map_err(failure)?
+                    }
+                };
+                if config.sdk.is_empty() {
+                    environments::pin_installed(&env, &[], &constraints).map_err(failure)?;
+                }
+                if !sdk_fallback.is_empty() {
+                    tracing::warn!("package {}: {sdk_fallback}", root.package);
+                }
+                environments::add_client(&uv, &py, &config.client_wheel, &constraints, "--compile-bytecode").map_err(failure)?;
+                let runtime_build = if machine { config.runtime_build.clone() } else { String::new() };
+                environments::refuse_conflicts(&uv, &py, &runtime_build).map_err(failure)?;
+                let ready = Ready { sdk_fallback, runtime_build };
+                if let Some(live) = &live {
+                    let kept = serde_json::to_vec(&ready).map_err(|e| storage(std::io::Error::other(e)))?;
+                    fs::write(live.environment.join(".ready"), kept).map_err(storage)?;
+                }
+                ready
+            }
+        };
+        let described = environments::describe_environment(&py, &captured.package, &root.callees, live.is_none()).map_err(failure)?;
+        let interface = match (&live, described.interface) {
+            (Some(live), _) => environments::describe_project(&py, live.project).map_err(failure)?,
+            (None, Some(interface)) => interface,
+            (None, None) => return Err(Error::internal("custody_corrupt", "the environment described no interface of its own")),
+        };
+        let source_digest = match &live {
+            Some(live) if !live.source_digest.is_empty() => live.source_digest.to_string(),
+            _ => described.source_digest,
+        };
+        let record = crate::catalog::Generation {
+            identity: dir.file_name().expect("generation name").to_string_lossy().into_owned(),
+            package: captured.package,
+            version: captured.version,
+            application: captured.application,
+            python,
+            dependencies: environments::installed(&env),
+            interface: serde_json::from_str(interface.get()).map_err(|e| storage(std::io::Error::other(e)))?,
+            source_digest,
+            callees: described.callees,
+            sdk_fallback: ready.sdk_fallback,
+            runtime_build: ready.runtime_build,
+        };
+        environments::publish(&dir, &generations, &record).map_err(failure)?;
+        Ok(PreparedGeneration { record, interface_bytes: interface.get().as_bytes().to_vec(), hold: Arc::new(hold) })
+    })();
+    if built.is_err() {
+        // Uniquely owned and never published: no run ever resolved it.
+        let _ = fs::remove_dir_all(&dir);
     }
-    for wheel in wheels {
-        command.arg("--wheel").arg(wheel);
+    built
+}
+
+/// uv as a local package's install runs it: the helper's environment (the machine's own,
+/// without credentials or Runtime-owned names; an image's seeded cache, symlinked).
+fn uv(config: &InstallerConfig, args: &[&str], stop: Option<&Stop>) -> Result<(), environments::Failure> {
+    let mut command = Command::new(&config.uv);
+    platform::process::inherit_nothing(&mut command);
+    command
+        .args(args)
+        .env_clear()
+        .envs(crate::launch_identity::inherited())
+        .env("PATH", helper_path(&config.uv))
+        .envs(config.seed_cache.iter().flat_map(|seed| {
+            [("UV_CACHE_DIR", seed.as_os_str()), ("UV_LINK_MODE", std::ffi::OsStr::new("symlink"))]
+        }));
+    environments::run_uv(command, &args[..2.min(args.len())].join(" "), stop, &|_| ())
+}
+
+/// A refusal from the shared path, in the words a helper refusal takes.
+fn failure((code, detail): environments::Failure) -> Error {
+    match code {
+        crate::published::CANCELED => Error::conflict(code, detail),
+        "no_progress" => Error::conflict(code, detail),
+        _ => Error::conflict("precondition_failed", format!("{code}: {detail}")),
     }
-    publish(config, command, stop, Some(&claim))
+}
+
+/// What the helper captured: one environment of the package's own closure.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename = "captured")]
+struct Captured {
+    package: String,
+    version: String,
+    application: String,
+    /// An editable environment already ready: what the machine kept of it (`.ready`).
+    #[serde(default)]
+    ready: Option<String>,
 }
 
 /// Who builds at a claim: the helper, and the machine that started it.
@@ -219,8 +366,8 @@ fn end_stale(claim: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The trusted helper's command for one package: this machine's interpreter, SDK pair,
-/// description client and generations, and what the package declares of itself.
+/// The trusted helper's command for one package: this machine's interpreter and SDK pair, and
+/// what the package declares of itself.
 fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Error> {
     let captured_python = &root.python_version;
     let python = if !captured_python.is_empty() {
@@ -255,35 +402,28 @@ fn installer(config: &InstallerConfig, root: &RootSet) -> Result<Command, Error>
         }))
         .arg("-m")
         .arg("tensord_client.installer")
-        .arg("install-captured")
-        .arg("--generations")
-        .arg(&config.generations)
-        .arg("--client-wheel")
-        .arg(&config.client_wheel)
+        .arg("capture")
         .args(
             config
                 .sdk
                 .iter()
                 .flat_map(|wheel| [std::ffi::OsStr::new("--sdk-wheel"), wheel.as_os_str()]),
         )
-        .arg(format!("--runtime-build={}", config.runtime_build))
         .arg("--python")
         .arg(python)
         .arg("--distribution")
         .arg(root.package.rsplit('/').next().expect("declared package"))
         .arg("--release")
         .arg(&root.release)
-        .arg("--callees")
-        .arg(serde_json::to_string(&root.callees).map_err(|error| Error::internal("internal", error.to_string()))?)
         .arg(format!("--python-requires={}", root.python_requires))
         .arg(format!("--python-version={}", root.python_version));
     Ok(command)
 }
 
-/// Run the helper to its exit and hold the generation it published. Its process group ends
-/// with its run's cancel (`stop`), or when it stops moving past its measured patience
-/// (`process::supervise`); a long install that moves is never killed.
-fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&Stop>, claim: Option<&Path>) -> Result<PreparedGeneration, Error> {
+/// Run the helper to its exit and read what it captured. Its process group ends with its run's
+/// cancel (`stop`), or when it stops moving past its measured patience (`process::supervise`);
+/// a long install that moves is never killed.
+fn run_helper(mut command: Command, stop: Option<&Stop>, claim: Option<&Path>) -> Result<Captured, Error> {
     let mut child = platform::process::own_group(&mut command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -338,57 +478,8 @@ fn publish(config: &InstallerConfig, mut command: Command, stop: Option<&Stop>, 
             _ => Error::conflict("precondition_failed", message),
         });
     }
-    if output.len() > 8 << 20 {
-        return Err(Error::capacity("exhausted",
-            "prepared package interface exceeds its control-record bound",
-        ));
-    }
-    let returned: GenerationRecord = serde_json::from_slice(&output)
-        .map_err(|_| Error::internal("custody_corrupt", "installer returned an invalid typed generation record"))?;
-    let generations = platform::durable::canonical(&config.generations).map_err(std::io::Error::from).map_err(storage)?;
-    if returned.identity.len() != 32
-        || !returned
-            .identity
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(Error::internal("custody_corrupt",
-            "installer returned an invalid native generation identity",
-        ));
-    }
-    let directory = generations.join(&returned.identity);
-    if directory
-        .symlink_metadata()
-        .map_err(storage)?
-        .file_type()
-        .is_symlink()
-        || platform::durable::canonical(&directory).map_err(std::io::Error::from).map_err(storage)? != directory
-    {
-        return Err(Error::internal("custody_corrupt",
-            "published generation path is not an owned native directory",
-        ));
-    }
-    let hold = platform::durable::open_nofollow(&directory.join(".hold"), OpenOptions::new().read(true)).map_err(std::io::Error::from)
-        .map_err(storage)?;
-    hold.lock_shared().map_err(storage)?;
-    let file = platform::durable::open_nofollow(&directory.join("generation.json"), OpenOptions::new().read(true)).map_err(std::io::Error::from)
-        .map_err(storage)?;
-    let record: GenerationRecord = serde_json::from_reader(file.take(8 << 20))
-        .map_err(|_| Error::internal("custody_corrupt", "published generation manifest is invalid"))?;
-    if record.identity != returned.identity
-        || record.python != platform::paths::venv_python(&directory.join("env"))
-        || !record.python.is_file()
-    {
-        return Err(Error::internal("custody_corrupt",
-            "published generation does not name its native interpreter",
-        ));
-    }
-    let interface_bytes = record.interface.get().as_bytes().to_vec();
-    Ok(PreparedGeneration {
-        record,
-        interface_bytes,
-        hold: Arc::new(hold),
-    })
+    serde_json::from_slice(&output)
+        .map_err(|_| Error::internal("custody_corrupt", "installer returned an invalid typed capture record"))
 }
 fn storage(error: std::io::Error) -> Error {
     Error::unavailable("unavailable", format!(
@@ -463,22 +554,10 @@ mod tests {
     /// start, never just its last 12 lines: uv's explanation starts well before its last line.
     #[test]
     fn a_failed_install_quotes_the_installers_stderr_tail() {
-        let config = super::InstallerConfig {
-            helper_python: "python3".into(),
-            helper_engine: None,
-            python: "3.12".into(),
-            generations: std::env::temp_dir(),
-            client_wheel: Default::default(),
-            staging_root: std::env::temp_dir(),
-            sdk: vec![],
-            uv: "uv".into(),
-            seed_cache: None,
-            runtime_build: String::new(),
-        };
         let mut helper = std::process::Command::new("sh");
         helper.args(["-c", r#"echo '{"kind":"install_failed","code":"package_dependency_operation_failed","detail":"uv pip install"}'
             i=0; while [ $i -lt 40 ]; do echo "  uv line $i https://user:tok@hub.example/simple" >&2; i=$((i+1)); done; exit 1"#]);
-        let refused = super::publish(&config, helper, None, None).err().expect("the helper failed");
+        let refused = super::run_helper(helper, None, None).err().expect("the helper failed");
         let message = &refused.message;
         assert!(message.starts_with("package_dependency_operation_failed: uv pip install:\nuv line 0 "), "{message}");
         assert!(message.ends_with("uv line 39 https://***@hub.example/simple") && message.lines().count() == 41, "{message}");

@@ -1,10 +1,5 @@
-"""Consumed package metadata and opaque SDK interface records."""
+"""Consumed package metadata, the helper's captured environment and the in-environment description records."""
 import msgspec
-
-
-class Dependency(msgspec.Struct, frozen=True):
-    name: str
-    version: str
 
 
 class Callee(msgspec.Struct, frozen=True):
@@ -16,21 +11,6 @@ class Callee(msgspec.Struct, frozen=True):
     interface: msgspec.Raw
     source_digest: str = ""
     package: str = ""
-
-
-class Generation(msgspec.Struct, frozen=True):
-    identity: str
-    package: str
-    version: str
-    application: str
-    python: str
-    dependencies: list[Dependency]
-    interface: msgspec.Raw
-    # The package's own installed files, hashed: what keys its memoized calls across machines.
-    source_digest: str = ""
-    callees: list[Callee] = []
-    # Empty when this machine's own Runtime/TensorFS pair installed; else why the package's own runs.
-    sdk_fallback: str = ""
 
 
 class ApplicationEntry(msgspec.Struct, frozen=True):
@@ -95,6 +75,12 @@ class InstallFailed(msgspec.Struct, tag="install_failed", tag_field="kind"):
     detail: str
 
 
-GENERATION_DECODER = msgspec.json.Decoder(Generation)
-DESCRIPTION_DECODER = msgspec.json.Decoder(Described | DescribeFailed)
-ENVIRONMENT_DECODER = msgspec.json.Decoder(DescribedEnvironment | DescribeFailed)
+class Captured(msgspec.Struct, tag="captured", tag_field="kind"):
+    """One environment of a local package's own closure (`captured_packages`); the machine
+    installs its pair, its client and its record next (`environments.rs`)."""
+    package: str
+    version: str
+    application: str
+    python: str
+    #: An editable environment already ready: what the machine kept of it (`.ready`).
+    ready: str | None = None

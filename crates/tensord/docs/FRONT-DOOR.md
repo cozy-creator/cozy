@@ -29,7 +29,8 @@ The readiness receipt is `{payload, hmac_sha256}`, where the HMAC covers
 ## Install (`install.rs`)
 
 `prepare_uploaded(InstallerConfig, UploadedPackage)` materializes verified descriptors into a
-private stage and runs `tensord_client.installer install-captured` (see `PACKAGE-BRIDGE.md`).
+private stage, makes a generation, and runs `tensord_client.installer capture` for the package's
+own closure; the machine finishes it as a release's (`environments.rs`, see `PACKAGE-BRIDGE.md`).
 - No wall-clock kill. Stdout is capped at 8 MiB.
 - A failure `{kind: "install_failed", code, detail}` is refused with its code.
 - It returns `PreparedGeneration`: a 32-hex identity, the record, interface bytes, and a shared
