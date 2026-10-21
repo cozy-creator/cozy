@@ -18,7 +18,7 @@ impl Memory {
         limit: Option<u64>,
         host: Arc<HostCache>,
     ) -> varena::Result<Self> {
-        Ledger::create_with_host(
+        Ledger::create_managed_with_host(
             gpu_uuid,
             limit.map_or(card_bytes, |cap| cap.min(card_bytes)),
             host,

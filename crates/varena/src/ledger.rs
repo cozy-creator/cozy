@@ -379,6 +379,8 @@ pub struct Ledger {
     table: Arc<Table>,
     events: Arc<OwnedFd>,
     _watcher: Option<Watcher>,
+    // Independent CLOEXEC description: cap authority never follows a rank grant.
+    _cap_authority: Option<OwnedFd>,
     custody: Arc<Mutex<Custody>>,
     host: Arc<HostCache>,
     observations: Mutex<HashMap<Owner, (u64, u64)>>,
@@ -392,6 +394,24 @@ impl Ledger {
     /// TensorD supplies one host cache for all of its device ledgers. CUDA page
     /// custody and the shared per-device placement table remain independent.
     pub fn create_with_host(gpu_uuid: &str, capacity: u64, host: Arc<HostCache>) -> Result<Self> {
+        Self::open_named(gpu_uuid, capacity, host, false)
+    }
+    /// TensorD owns the configured ceiling for its whole pool generation, even
+    /// while no executor owns a row. Local opens may discover physical capacity
+    /// but cannot replace this authority. A drained restart releases the lease.
+    pub fn create_managed_with_host(
+        gpu_uuid: &str,
+        capacity: u64,
+        host: Arc<HostCache>,
+    ) -> Result<Self> {
+        Self::open_named(gpu_uuid, capacity, host, true)
+    }
+    fn open_named(
+        gpu_uuid: &str,
+        capacity: u64,
+        host: Arc<HostCache>,
+        managed: bool,
+    ) -> Result<Self> {
         host.check_process()?;
         if gpu_uuid.is_empty()
             || gpu_uuid.len() > 96
@@ -436,8 +456,29 @@ impl Ledger {
         if table.shared().header.magic.load(Acquire) != MAGIC {
             return Err(Error::Invalid("ledger protocol differs".into()));
         }
+        // The authority byte is outside the mapped data and all row leases;
+        // it changes no header/FD wire layout. Initialization serializes its
+        // acquisition/probe with every capacity replacement.
+        let authority_offset = size_of::<Shared>();
+        let (cap_authority, managed_elsewhere) = if managed {
+            let authority = shm::reopen(table.file.as_fd(), true)
+                .map_err(crate::os("open GPU cap authority"))?;
+            if !shm::region_lock(authority.as_fd(), authority_offset, 1, Region::Write, false)
+                .map_err(crate::os("claim GPU cap authority"))?
+            {
+                return Err(Error::Invalid(
+                    "GPU cap already has a live coordinator".into(),
+                ));
+            }
+            (Some(authority), false)
+        } else {
+            let held = shm::region_holder(table.file.as_fd(), authority_offset, 1)
+                .map_err(crate::os("probe GPU cap authority"))?
+                .is_some();
+            (None, held)
+        };
         let current = table.shared().header.capacity.load(Acquire);
-        if current != capacity {
+        if current != capacity && !managed_elsewhere {
             let live = table.rows()?.iter().any(|row| row.state == State::Live);
             if live && capacity < current {
                 return Err(Error::Invalid(
@@ -485,6 +526,7 @@ impl Ledger {
         let out = Self {
             table: table.clone(),
             events,
+            _cap_authority: cap_authority,
             _watcher: Some(Watcher {
                 stop,
                 table,
@@ -516,6 +558,7 @@ impl Ledger {
             table,
             events,
             _watcher: None,
+            _cap_authority: None,
             custody: Arc::default(),
             host: Arc::new(HostCache::default()),
             observations: Mutex::default(),

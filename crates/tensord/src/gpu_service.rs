@@ -4539,6 +4539,35 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_physical_reopen_cannot_raise_a_machine_cap_before_start_or_load() {
+        let (root, pool, _) = pool_with_limit(1, Some(6 << 30));
+        let lane = pool.lane(0, 1).unwrap();
+        let placement = lane[0].memory.placement().unwrap();
+        assert!(placement.status().unwrap().rows.is_empty());
+        let uuid = &pool.inventory(&lane[0].entry).unwrap().device_uuid;
+        // Public Memory.open(None) discovers physical capacity and takes this
+        // same local-create path before any executor has claimed a row.
+        let local = varena::ledger::Ledger::create(uuid, 8 << 30).unwrap();
+        assert_eq!(local.capacity(), 6 << 30);
+        assert_eq!(pool.device_limit(lane), Some(6 << 30));
+        assert!(pool.budget(1, &[]).unwrap() <= 6 << 30);
+        let grant = placement.grant_unbound().unwrap();
+        let native = varena::ledger::Ledger::adopt(
+            std::os::fd::AsFd::as_fd(&grant.table),
+            std::os::fd::AsFd::as_fd(&grant.events),
+        )
+        .unwrap();
+        assert_eq!(
+            native.capacity(),
+            6 << 30,
+            "the native FD carries the same cap"
+        );
+        drop((native, grant, local));
+        pool.stop().unwrap();
+        drop(pool);
+        crate::scratch::remove(&root);
+    }
+    #[test]
     fn incomplete_inventory_fails_at_start_instead_of_queueing_forever() {
         for inventory in [
             json!([]),
