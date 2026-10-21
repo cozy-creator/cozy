@@ -426,6 +426,9 @@ struct Session {
     launch: Launch,
     /// It has served a call: its next one is not its first.
     invoked: bool,
+    /// Where TensorD last had its models brought (varena places them): `host` once loaded,
+    /// `gpu` after a call or a `gpu` warming.
+    level: Level,
 }
 
 /// What this call proved about the executor it returned. A cache handoff is never inferred
@@ -459,6 +462,8 @@ struct Zygote {
     changed: Condvar,
     /// Executors forked from it that may still live.
     children: Mutex<Vec<Birth>>,
+    /// Its last fork (or its start): childless parents end least recently used first.
+    used: Mutex<Option<Instant>>,
 }
 #[derive(Default)]
 enum ZygoteState {
@@ -507,6 +512,7 @@ impl Zygote {
         match &forked {
             Forked::Ready(child) => {
                 self.children.lock().unwrap().push(child.birth.clone());
+                *self.used.lock().unwrap() = Some(Instant::now());
             }
             Forked::Lost(..) => {
                 // Its children ended with it; the pool replaces it (`new_session`).
@@ -610,8 +616,10 @@ pub struct Pool {
     peaks: memory::Peaks,
     /// Woken by the ledgers' events: a queued request asks `fits` again then.
     engine: std::sync::OnceLock<Weak<Engine>>,
+    /// Rows the ledgers named stalled at the last look: each is ended once.
+    stalled: Mutex<std::collections::BTreeSet<u32>>,
     /// The machine's RAM tier, served while the pool lives.
-    _tier: memory::HostTier,
+    _tier: Option<Arc<varena::Tier>>,
     /// Held while the pool lives: the thread blocked on the ledgers' events ends with it.
     _events: Option<std::os::unix::net::UnixStream>,
     /// Memoized Model methods' results, shared by every run on this machine.
@@ -622,7 +630,7 @@ pub struct Pool {
 struct Device {
     entry: String,
     /// Its ledger; None where the inventory does not name its memory.
-    memory: Option<memory::Gpu>,
+    memory: Option<Arc<memory::Gpu>>,
 }
 
 /// One GPU executor process: its plan and lane, and a handle that ends exactly it.
@@ -697,17 +705,23 @@ impl Pool {
         let peaks = memory::Peaks::at(root.join("peaks"));
         let devices: Vec<Device> = envelope.iter().map(|entry| Device {
             entry: entry.clone(),
-            memory: memory::Gpu::create(entry, &config.inventory, config.gpu_memory_limit, config.host.mode, &peaks, &notes),
+            memory: memory::Gpu::create(entry, &config.inventory, config.gpu_memory_limit, config.host.mode, &peaks, &notes).map(Arc::new),
         }).collect();
-        let tier = memory::HostTier::serve(config.host.mode);
+        let tier = memory::serve_tier(config.host.mode);
         let launcher = crate::child_launcher::ChildLauncher::new()?;
         let memo = Arc::new(crate::memo::Memo::open(root.join("stage-memo"))?);
         Ok(Arc::new_cyclic(|pool: &Weak<Self>| {
-            let ledgers: Vec<&varena::Ledger> = devices.iter().filter_map(|d| d.memory.as_ref()).map(|m| &m.ledger).collect();
+            let ledgers = devices.iter().filter_map(|d| d.memory.clone()).map(memory::Source::Ledger);
+            let sources: Vec<memory::Source> = ledgers.chain(tier.clone().map(memory::Source::Tier)).collect();
             let pool = pool.clone();
-            let events = match ledgers.is_empty() {
+            let woke = move |woke| match (pool.upgrade(), woke) {
+                (Some(pool), memory::Woke::Ledger) => pool.memory_changed(),
+                (Some(pool), memory::Woke::HostShort) => pool.host_short(),
+                (None, _) => {}
+            };
+            let events = match sources.is_empty() {
                 true => None,
-                false => memory::react(&ledgers, move || pool.upgrade().iter().for_each(|pool| pool.memory_changed()))
+                false => memory::react(sources, woke)
                     .map_err(|error| tracing::warn!("memory: no ledger events: {error}"))
                     .ok(),
             };
@@ -719,6 +733,7 @@ impl Pool {
                 devices,
                 peaks,
                 engine: Default::default(),
+                stalled: Mutex::default(),
                 _tier: tier,
                 _events: events,
                 incarnation,
@@ -740,22 +755,76 @@ impl Pool {
         }))
     }
     /// A ledger signalled (room freed, a row died, a peak was recorded): the dispatch queue asks
-    /// `fits` again, each row the ledger names stalled ends, and changed peaks are saved.
+    /// `fits` again, each row the ledger newly names stalled ends (once), and changed peaks are
+    /// saved.
     fn memory_changed(&self) {
         if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
             engine.notify_activity();
         }
-        let gpus: Vec<(&str, &memory::Gpu)> = self.devices.iter().filter_map(|d| Some((d.entry.as_str(), d.memory.as_ref()?))).collect();
-        for (entry, gpu) in &gpus {
-            for pid in gpu.ledger.stalled() {
-                self.notes.note(serde_json::json!({"event": "stalled", "gpu": entry, "pid": pid}));
-                self.end_stalled(pid);
-            }
+        let gpus: Vec<(&str, &memory::Gpu)> = self.devices.iter().filter_map(|d| Some((d.entry.as_str(), d.memory.as_deref()?))).collect();
+        let stalled: Vec<(&str, u32)> = gpus.iter().flat_map(|(entry, gpu)| gpu.ledger.stalled().into_iter().map(move |pid| (*entry, pid))).collect();
+        let fresh: Vec<(&str, u32)> = {
+            let mut seen = self.stalled.lock().unwrap();
+            let fresh = stalled.iter().filter(|(_, pid)| !seen.contains(pid)).copied().collect();
+            *seen = stalled.iter().map(|(_, pid)| *pid).collect();
+            fresh
+        };
+        for (entry, pid) in fresh {
+            self.notes.note(serde_json::json!({"event": "stalled", "gpu": entry, "pid": pid}));
+            self.end_stalled(pid);
         }
         let models: std::collections::BTreeSet<&str> = gpus.iter().map(|(_, gpu)| gpu.model.as_str()).collect();
         for model in models {
             self.peaks.save(model, gpus.iter().filter(|(_, gpu)| gpu.model == model).map(|(_, gpu)| &gpu.ledger));
         }
+    }
+    /// The RAM tier gave back all it may and the host is still short: one idle process ends,
+    /// least recently used first: a deviceless executor, else an import-only parent with no live
+    /// child, else an executor on a GPU no call holds (outside every warm set first).
+    fn host_short(&self) {
+        let ended = match () {
+            () if self.end_idle_deviceless(|_| true) => "deviceless",
+            () if self.end_idle_parent() => "parent",
+            () if self.end_lru_idle() => "gpu",
+            () => "",
+        };
+        self.notes.note(serde_json::json!({"event": "host_short", "ended": ended}));
+    }
+    /// End the least recently used import-only parent with no live child; whether one ended.
+    fn end_idle_parent(&self) -> bool {
+        let victim = {
+            let mut zygotes = self.zygotes.lock().unwrap();
+            let chosen = zygotes.iter().filter(|(_, zygote)| zygote.childless())
+                .min_by_key(|(_, zygote)| *zygote.used.lock().unwrap()).map(|(app, _)| app.clone());
+            chosen.and_then(|app| zygotes.remove(&app))
+        };
+        let Some(zygote) = victim else {
+            return false;
+        };
+        if let ZygoteState::Ready(parent) = std::mem::take(&mut *zygote.state.lock().unwrap()) {
+            if let Err(error) = parent.shutdown() {
+                tracing::warn!("ending an idle import-only executor: {error}");
+            }
+        }
+        true
+    }
+    /// End the least recently used idle GPU executor (outside every warm set first) whose lane's
+    /// call slots are free meanwhile; whether one ended.
+    fn end_lru_idle(&self) -> bool {
+        let members: std::collections::BTreeSet<String> = {
+            let sets = self.members.lock().unwrap();
+            sets.values().flatten().filter_map(|m| m.plan.as_ref().map(|p| p.construction.clone())).collect()
+        };
+        let mut idle: Vec<(bool, Instant, String, std::ops::Range<usize>)> = {
+            let sessions = self.sessions.lock().unwrap();
+            let lane = |s: &Session| s.start..s.start + s.degree as usize;
+            sessions.iter().map(|(key, s)| (members.contains(&s.plan), s.used, key.clone(), lane(s))).collect()
+        };
+        idle.sort_by_key(|(member, used, _, _)| (*member, *used));
+        idle.into_iter().any(|(_, _, key, lane)| {
+            let Some(_upkeep) = self.allocations.upkeep(lane) else { return false };
+            self.end_session(&key)
+        })
     }
     /// End the least recently used idle deviceless executor `which` picks; whether one ended.
     fn end_idle_deviceless(&self, which: impl Fn(&Session) -> bool) -> bool {
@@ -772,24 +841,6 @@ impl Pool {
         }
         self.ended(&plan, start, 0);
         true
-    }
-    /// End the least recently used idle executor on GPU `device` other than `plan`'s: outside
-    /// every warm set first, and never a member's when `spare`. The caller holds its call slot.
-    fn end_idle_on(&self, device: usize, plan: &str, spare: bool) -> bool {
-        let members: std::collections::BTreeSet<String> = {
-            let sets = self.members.lock().unwrap();
-            sets.values().flatten().filter_map(|m| m.plan.as_ref().map(|p| p.construction.clone())).collect()
-        };
-        let victim = {
-            let sessions = self.sessions.lock().unwrap();
-            let on = |s: &Session| (s.start..s.start + s.degree as usize).contains(&device);
-            sessions
-                .iter()
-                .filter(|(_, s)| on(s) && s.plan != plan && !(spare && members.contains(&s.plan)))
-                .min_by_key(|(_, s)| (members.contains(&s.plan), s.used))
-                .map(|(key, _)| key.clone())
-        };
-        victim.is_some_and(|key| self.end_session(&key))
     }
     /// End idle executor `key` and observe its exit: what it held goes back. Whether it was idle.
     fn end_session(&self, key: &str) -> bool {
@@ -926,14 +977,6 @@ impl Pool {
             gone.iter().for_each(|birth| gpu.ledger.reap(birth.pid));
         }
     }
-    /// A loaded executor's level from its leader's ledger row: `gpu` while it maps weights
-    /// there, else `host`.
-    fn loaded_level(&self, start: usize, pid: u32) -> Level {
-        match self.devices.get(start).and_then(|d| d.memory.as_ref()).is_some_and(|m| m.maps(pid)) {
-            true => Level::Gpu,
-            false => Level::Host,
-        }
-    }
     /// The engine's dispatch wakes whenever a ledger signals: a queued request asks `fits`
     /// again then, and never polls.
     pub fn wake_on_freed(&self, engine: &Arc<Engine>) {
@@ -1049,7 +1092,7 @@ impl Pool {
             return "a request is queued; it loads after";
         }
         let asked = Instant::now();
-        let mut result = self.prewarm(engine, held, plan.clone(), start, true, member.fetch.clone());
+        let mut result = self.prewarm(engine, held, plan.clone(), start, member.fetch.clone());
         if let (Ok("loaded" | "already loaded"), Level::Gpu | Level::Host) = (&result, level) {
             result = self.map_member(engine, plan, start, level);
         }
@@ -1081,6 +1124,9 @@ impl Pool {
             },
             &mut device_executor::Baseline,
         );
+        if reply.as_ref().is_ok_and(|reply| reply.ok) {
+            session.level = level;
+        }
         self.keep_idle(engine, session)?;
         let reply = reply?;
         if !reply.ok {
@@ -1165,8 +1211,7 @@ impl Pool {
             }
             session.used = Instant::now();
             if session.loaded {
-                let level = self.loaded_level(session.start, session.executor.birth.pid);
-                let noted = ((session.generation.clone(), session.application.clone()), level, session.executor.birth.clone());
+                let noted = ((session.generation.clone(), session.application.clone()), session.level, session.executor.birth.clone());
                 self.levels.lock().unwrap().insert(key.clone(), noted);
             }
             sessions.insert(key, session);
@@ -1253,27 +1298,6 @@ impl Pool {
                 "its imports failed (the machine's log says why)"
             }
         }
-    }
-    /// Room for a request of `plan` at `shape` on every GPU of the lane, in device order (so two
-    /// groups never wait on each other): while it does not fit (`fits`) and no request runs
-    /// there, idle executors end, least recently used first (never `plan`'s, nor a warm
-    /// member's when `spare`). Whether it fits everywhere; a request is then admitted
-    /// (`memory::admit`), waiting while it does not.
-    fn make_room(&self, plan: &str, start: usize, degree: u32, shape: &str, spare: bool) -> io::Result<bool> {
-        self.reap();
-        let mut fit = true;
-        for (gpu, device) in (start..).zip(self.lane(start, degree)?) {
-            let Some(memory) = &device.memory else { continue };
-            while !memory.ledger.fits(plan, shape) {
-                if memory.running() || !self.end_idle_on(gpu, plan, spare) {
-                    self.notes.note(serde_json::json!({"event": "short", "plan": plan, "gpu": device.entry,
-                        "shape": shape, "running": memory.running()}));
-                    fit = false;
-                    break;
-                }
-            }
-        }
-        Ok(fit)
     }
     /// Idle executors that exited leave the pool.
     fn reap(&self) {
@@ -1780,7 +1804,7 @@ impl Pool {
                 };
                 if !active() { return; }
                 let waited = asked.elapsed();
-                let result = pool.prewarm(&engine, &held, plan, start, false, Some(fetch));
+                let result = pool.prewarm(&engine, &held, plan, start, Some(fetch));
                 pool.note_prewarm(&key, waited, asked.elapsed() - waited, &result);
             });
         if let Err(error) = started {
@@ -1819,19 +1843,13 @@ impl Pool {
         held: &HeldGeneration,
         plan: Plan,
         start: usize,
-        member: bool,
         fetch: Option<Arc<crate::access::Fetch>>,
     ) -> io::Result<&'static str> {
         if self.sessions.lock().unwrap().contains_key(&session_key(&plan.construction, start)) {
             return Ok("already loaded");
         }
-        // A warm set member may end idle executors outside every set; a prefetch only starts
-        // where it fits. Neither touches a member or a running call.
-        let fits = match member {
-            true => self.make_room(&plan.construction, start, plan.degree, UNPREPARED, true)?,
-            false => self.fits(&plan.construction, start, plan.degree),
-        };
-        if !fits {
+        // A warm member or a prefetch starts only where it fits: it never takes a running call's room.
+        if !self.fits(&plan.construction, start, plan.degree) {
             return Ok("no GPU room beside the warm set and the running call");
         }
         let born = Mutex::new(vec![]);
@@ -2057,6 +2075,7 @@ impl Pool {
         let Some((zygote, true)) = self.zygote(&held) else {
             return;
         };
+        *zygote.used.lock().unwrap() = Some(Instant::now());
         let pool = Arc::downgrade(self);
         let started = std::thread::Builder::new()
             .name("executor-prespawn".into())
@@ -2287,8 +2306,6 @@ impl Pool {
                 session
             }
             None => {
-                // Room for its process and a request of it before it exists.
-                self.make_room(&plan.construction, start, degree, UNPREPARED, false)?;
                 let born = Mutex::new(vec![]);
                 let on_birth = |birth: &Birth, cancel: &Cancellation| {
                     born.lock().unwrap().extend(executor_births(birth, &[]));
@@ -2464,6 +2481,7 @@ impl Pool {
             used: Instant::now(),
             launch,
             invoked: false,
+            level: Level::Host,
         })
     }
 
@@ -2503,15 +2521,15 @@ impl Pool {
         if !session.loaded {
             let interface_path = self.interface_file(&session.executor, held)?;
             let starting = Instant::now();
-            // Each GPU's grant (its table and events) follows the Start, in lane order: every rank
-            // claims its own row. Granted to the executor, whose exit reaps them.
+            // Each GPU's grant (its table) follows the Start, in lane order: every rank claims its
+            // own row. Granted to the executor, whose exit reaps them.
             let grants = match gpus.iter().all(|d| d.memory.is_some()) {
                 true => gpus.iter().filter_map(|d| d.memory.as_ref())
                     .map(|m| m.ledger.grant(session.executor.birth.pid).map_err(io::Error::other))
                     .collect::<io::Result<Vec<_>>>()?,
                 false => vec![],
             };
-            let ledgers: Vec<File> = grants.into_iter().flat_map(|g| [File::from(g.table), File::from(g.events)]).collect();
+            let ledgers: Vec<File> = grants.into_iter().map(|grant| File::from(grant.table)).collect();
             // Rank 0 spawns and forms every follower inside this command; its watch meters
             // the whole group's work, so formation ends only on measured lack of progress.
             let started = command_ok(session.executor.command_with(
@@ -2523,7 +2541,7 @@ impl Pool {
                     import_only: false,
                     call_interfaces: crate::calls::call_interfaces(held, &interface_path),
                     constructions: constructions(&plan),
-                    ledgers: (ledgers.len() / 2) as u32,
+                    ledgers: ledgers.len() as u32,
                     memory_mode: self.config.host.mode.into(),
                 },
                 &ledgers,
@@ -2705,8 +2723,7 @@ impl Pool {
                 memory::dispatch(&ledgers, id, &construction, &shape);
                 Ok(true)
             }
-            false => self.make_room(&construction, start, degree, &shape, false)
-                .and_then(|_| memory::admit(engine, &ledgers, id, &construction, &shape)),
+            false => memory::admit(engine, &ledgers, id, &construction, &shape),
         };
         let _dispatched = Dispatched { gpus, id: id.into() };
         if !admitted? {
@@ -2773,6 +2790,7 @@ impl Pool {
         );
         session.executor.waits = None;
         let reply = reply?;
+        session.level = Level::Gpu;
         self.record_invoke(&construction, &lane, first, invoked.elapsed(), &reply);
         record_measurements(engine, id, &plan, &reply);
         if reply.attention_applied {
@@ -2950,11 +2968,17 @@ fn defer_completion(
     engine.defer_completion(id, outcome, executor_births(leader, followers))
 }
 
-/// A request's shape: its normalized features' values (PrepareRequest's, integer axes in name
-/// order) joined by `x`, as varena compares shapes; "" when it has none.
+/// A request's shape key: its normalized features (PrepareRequest's axes, in name order) as
+/// `axis=value` joined by `,`, with `%`, `,`, `=` and `|` escaped, so two feature sets never
+/// share a key and none splits the ledger's `<package>|<shape>`; `-` when it has none.
 fn shape(features: &BTreeMap<String, serde_json::Value>) -> String {
-    let dims = features.values().map(|v| v.as_u64().map_or_else(|| v.to_string(), |n| n.to_string()));
-    dims.collect::<Vec<_>>().join("x")
+    let escape = |text: &str| text.replace('%', "%25").replace(',', "%2C").replace('=', "%3D").replace('|', "%7C");
+    let value = |v: &serde_json::Value| v.as_u64().map_or_else(|| v.to_string(), |n| n.to_string());
+    let axes: Vec<String> = features.iter().map(|(axis, v)| format!("{}={}", escape(axis), escape(&value(v)))).collect();
+    match axes.is_empty() {
+        true => "-".into(),
+        false => axes.join(","),
+    }
 }
 
 /// The shape a call is placed at before its executor normalizes its request: the ledger reads it
@@ -3868,6 +3892,15 @@ mod tests {
         drop((call, replica));
         pool.stop().unwrap();
         crate::scratch::remove(&root);
+    }
+
+    #[test]
+    fn a_shape_key_names_its_axes_and_escapes_them() {
+        let of = |features: serde_json::Value| shape(&serde_json::from_value(features).unwrap());
+        assert_eq!(of(json!({"width": 832, "frames": 81})), "frames=81,width=832");
+        assert_ne!(of(json!({"frames": 8, "height": 4})), of(json!({"assets": 8, "frames": 4})));
+        assert_eq!(of(json!({"a,b": "x=y|z%"})), "a%2Cb=\"x%3Dy%7Cz%25\"");
+        assert_eq!(of(json!({})), "-");
     }
 
     #[test]
