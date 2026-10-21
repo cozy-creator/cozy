@@ -7,6 +7,8 @@
 //! standalone engine runs the same code and no executor's row outlives it.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -67,27 +69,39 @@ fn name(gpu: &str) -> String {
     format!("custody-{gpu}")
 }
 
-/// Binds the GPU's custody name and serves it from this process while it lives, under a row of
-/// its own; false when another participant serves it.
+/// Binds the GPU's custody name and serves it from this process, under a row of its own, until
+/// nobody is connected and nothing is kept; false when another participant serves it.
 fn start(shared: &Arc<Shared>) -> Result<bool> {
     let Some(listener) = os::listen(&name(&shared.name))? else { return Ok(false) };
     let row = Arc::new(shared.claim(std::process::id())?);
     let state = Arc::new(Mutex::new(State::default()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let gpu = shared.name.clone();
     std::thread::Builder::new()
         .name("varena-custody".into())
         .spawn(move || {
             for stream in os::incoming(listener) {
-                let (s, r) = (state.clone(), row.clone());
-                let _ = std::thread::Builder::new().name("varena-custody-conn".into()).spawn(move || serve(stream, &s, &r));
+                if stop.load(Acquire) {
+                    // The listener and, with the last connection, the row go.
+                    return;
+                }
+                let (s, r, halt, gpu) = (state.clone(), row.clone(), stop.clone(), gpu.clone());
+                let _ = std::thread::Builder::new().name("varena-custody-conn".into()).spawn(move || {
+                    if serve(stream, &s, &r) {
+                        halt.store(true, Release);
+                        let _ = os::connect(&name(&gpu));
+                    }
+                });
             }
         })
         .map_err(|e| Error::io("spawn custody", e))?;
     Ok(true)
 }
 
-fn serve(stream: Stream, state: &Mutex<State>, row: &Row) {
+/// Serves one connection; true when it was the last and nothing is kept (custody may stop).
+fn serve(stream: Stream, state: &Mutex<State>, row: &Row) -> bool {
     // Only this user's processes: an abstract name has no permissions of its own.
-    let Ok(pid) = os::peer(&stream) else { return };
+    let Ok(pid) = os::peer(&stream) else { return false };
     let conn = {
         let mut s = state.lock();
         s.clock += 1;
@@ -153,8 +167,9 @@ fn serve(stream: Stream, state: &Mutex<State>, row: &Row) {
                 (Reply::Done, None)
             }
         };
-        row.set_orphans(s.orphans());
+        let orphans = s.orphans();
         drop(s);
+        row.set_orphans(orphans);
         let sent = os::encode(&reply).and_then(|b| os::send(&stream, &(b, out)));
         if sent.is_err() {
             break;
@@ -163,7 +178,10 @@ fn serve(stream: Stream, state: &Mutex<State>, row: &Row) {
     let mut s = state.lock();
     s.orphan(conn);
     s.conns.remove(&conn);
-    row.set_orphans(s.orphans());
+    let (orphans, idle) = (s.orphans(), s.conns.is_empty() && s.pages.is_empty());
+    drop(s);
+    row.set_orphans(orphans);
+    idle
 }
 
 /// A participant's connection to custody. A broken connection reconnects (serving custody when
@@ -171,19 +189,28 @@ fn serve(stream: Stream, state: &Mutex<State>, row: &Row) {
 pub(crate) struct Client {
     shared: Arc<Shared>,
     stream: Mutex<Option<Stream>>,
+    /// Connections made: a new one may be a new holder (TensorD restarted), who knows none of
+    /// this process's pages, so its user exports them all again.
+    holder: AtomicU64,
 }
 
 impl Client {
     /// Connects to the GPU's custody, serving it from this process when nobody does.
     pub fn open(shared: &Arc<Shared>) -> Result<Client> {
-        let client = Client { shared: shared.clone(), stream: Mutex::new(None) };
+        let client = Client { shared: shared.clone(), stream: Mutex::new(None), holder: AtomicU64::new(0) };
         *client.stream.lock() = Some(client.connect()?);
         Ok(client)
+    }
+
+    /// Which connection this is (it changes when the holder may have).
+    pub fn holder(&self) -> u64 {
+        self.holder.load(Acquire)
     }
 
     fn connect(&self) -> Result<Stream> {
         loop {
             if let Some(stream) = os::connect(&name(&self.shared.name))? {
+                self.holder.fetch_add(1, AcqRel);
                 return Ok(stream);
             }
             // Nobody serves it: bind it; a racer that bound first is connected to next.
@@ -191,22 +218,24 @@ impl Client {
         }
     }
 
-    /// One call; a broken connection is replaced once (the service's holder exited).
+    /// One call; a broken connection is replaced once (the service's holder exited). The
+    /// stream's lock is a leaf: connecting (which may start the service) happens outside it.
     fn call(&self, call: &Call, handle: Option<&Owned>) -> Result<(Reply, Option<Owned>)> {
-        let mut stream = self.stream.lock();
         let mut last = Error::Closed("custody".into());
         for _ in 0..2 {
-            let s = match stream.take() {
-                Some(s) => s,
-                None => self.connect()?,
-            };
+            if self.stream.lock().is_none() {
+                let fresh = self.connect()?;
+                self.stream.lock().get_or_insert(fresh);
+            }
+            let mut stream = self.stream.lock();
+            let Some(s) = stream.as_ref() else { continue };
             let handle = handle.map(os::dup).transpose()?;
-            match os::call(&s, call, handle) {
-                Ok(reply) => {
-                    *stream = Some(s);
-                    return Ok(reply);
+            match os::call(s, call, handle) {
+                Ok(reply) => return Ok(reply),
+                Err(e) => {
+                    *stream = None;
+                    last = e;
                 }
-                Err(e) => last = e,
             }
         }
         Err(last)

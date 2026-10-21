@@ -25,6 +25,8 @@ pub(crate) type Message = (Vec<u8>, Option<Owned>);
 mod imp {
     use std::io::{Read, Write};
     use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering::Acquire;
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 
@@ -199,6 +201,82 @@ mod imp {
         std::iter::repeat_with(move || listener.accept()).filter_map(|c| c.ok().map(|(s, _)| s))
     }
 
+    /// Serves every connection to `listener` at once (one poll over all) until `stop` is seen:
+    /// each connection's one message, which carries no handle, is answered with `answer`'s bytes
+    /// and the connection closed. A peer of another user is refused at accept; a silent or
+    /// stopped one holds nobody up.
+    pub(crate) fn serve_all(listener: Listener, stop: &AtomicBool, mut answer: impl FnMut(&[u8]) -> Vec<u8>) {
+        if listener.set_nonblocking(true).is_err() {
+            return;
+        }
+        let mut conns: Vec<(Stream, Vec<u8>)> = vec![];
+        loop {
+            let mut polls: Vec<libc::pollfd> = std::iter::once(listener.as_raw_fd()).chain(conns.iter().map(|(s, _)| s.as_raw_fd())).map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
+            // SAFETY: live descriptors in a correctly sized array.
+            if unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, -1) } < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return;
+            }
+            if stop.load(Acquire) {
+                return;
+            }
+            let ready: Vec<bool> = polls.iter().map(|p| p.revents != 0).collect();
+            let mut next = vec![];
+            for (i, (s, mut buf)) in conns.drain(..).enumerate() {
+                if !ready.get(i + 1).copied().unwrap_or(false) {
+                    next.push((s, buf));
+                    continue;
+                }
+                let open = drain(&s, &mut buf);
+                match frame(&buf) {
+                    Frame::Whole(body) => {
+                        let reply = answer(body);
+                        let _ = (&s).write_all(&reply);
+                    }
+                    Frame::Partial if open => next.push((s, buf)),
+                    Frame::Partial | Frame::Bad => {}
+                }
+            }
+            if ready.first().copied().unwrap_or(false) {
+                while let Ok((s, _)) = listener.accept() {
+                    if peer(&s).is_ok() && s.set_nonblocking(true).is_ok() {
+                        next.push((s, vec![]));
+                    }
+                }
+            }
+            conns = next;
+        }
+    }
+
+    /// Reads what has arrived; false at the end of the stream or on an error.
+    fn drain(s: &Stream, buf: &mut Vec<u8>) -> bool {
+        let mut chunk = [0u8; 512];
+        loop {
+            match (&*s).read(&mut chunk) {
+                Ok(0) => return false,
+                Ok(n) => buf.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
+    }
+
+    enum Frame<'a> {
+        Whole(&'a [u8]),
+        Partial,
+        /// A message with a handle, which an ask never carries.
+        Bad,
+    }
+
+    fn frame(buf: &[u8]) -> Frame<'_> {
+        let Some(&[a, b, c, d, fd]) = buf.get(..5) else { return Frame::Partial };
+        if fd != 0 {
+            return Frame::Bad;
+        }
+        let len = u32::from_le_bytes([a, b, c, d]) as usize;
+        buf.get(5..5 + len).map_or(Frame::Partial, Frame::Whole)
+    }
+
     /// Connects to the service; `None` when nobody serves it. A service of another user is
     /// refused.
     pub(crate) fn connect(name: &str) -> Result<Option<Stream>> {
@@ -269,6 +347,12 @@ mod imp {
         let process = state(format!("/proc/{pid}/stat"));
         let thread = state(format!("/proc/{pid}/task/{tid}/stat"));
         process.as_deref() == Some("Z") || matches!(thread.as_deref(), Some("T" | "t"))
+    }
+
+    /// Whether the file still has a name (a table whose name was unlinked is nobody's).
+    pub(crate) fn linked(fd: &Owned) -> Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::File::from(dup(fd)?).metadata().map_err(|e| Error::io("stat the table", e))?.nlink() > 0)
     }
 
     pub(crate) fn unlink(name: &str) {
@@ -352,6 +436,9 @@ mod imp {
     pub(crate) fn incoming(listener: Listener) -> std::iter::Empty<Stream> {
         match listener {}
     }
+    pub(crate) fn serve_all(listener: Listener, _: &std::sync::atomic::AtomicBool, _: impl FnMut(&[u8]) -> Vec<u8>) {
+        match listener {}
+    }
     pub(crate) fn connect(_: &str) -> Result<Option<Stream>> {
         Err(later())
     }
@@ -372,6 +459,9 @@ mod imp {
     }
     pub(crate) fn stalled(_: u32, _: u32) -> bool {
         false
+    }
+    pub(crate) fn linked(_: &Owned) -> Result<bool> {
+        Err(later())
     }
     pub(crate) fn unlink(_: &str) {}
 }
