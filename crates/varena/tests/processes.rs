@@ -516,7 +516,7 @@ fn a_killed_holder_leaves_orphans_a_successor_imports(dir: &Path) {
     for block in 0..4 {
         assert_eq!(b.ok(&format!("exact k {block}")), "true", "block {block} bit-exact");
     }
-    assert_eq!(b.ok("trace r"), "Hit,Hit,Hit,Hit", "imported at load, not copied");
+    assert_eq!(b.ok("trace r"), "Kept,Kept,Kept,Kept,Hit,Hit,Hit,Hit", "imported at load (its fills in the record), not copied");
     b.ok("unpin");
     let end = b.ok("end r");
     assert!(end.contains("tier=0 store=0"), "{end}");
@@ -690,7 +690,7 @@ fn kept_pages_survive_a_holder_that_served(dir: &Path) {
     for block in 0..3 {
         assert_eq!(b.ok(&format!("exact s {block}")), "true");
     }
-    assert_eq!(b.ok("trace r"), "Hit,Hit,Hit", "every page kept, none copied");
+    assert_eq!(b.ok("trace r"), "Kept,Kept,Kept,Hit,Hit,Hit", "every page kept, none copied");
     b.ok("unpin");
     let end = b.ok("end r");
     assert!(end.contains("tier=0 store=0"), "{end}");
