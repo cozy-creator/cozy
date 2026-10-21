@@ -1009,6 +1009,12 @@ fn role_agent() {
                 }
                 Err(e) => format!("err {e}"),
             },
+            ["endpass", req, peak] => {
+                if let Some(p) = passes.remove(*req) {
+                    p.end(Measured { allocated_peak: peak.parse().unwrap(), slack: 0, sites: vec![] }, Torch::default());
+                }
+                "ok".into()
+            }
             ["bind", set, block] => match m().bind(sets[*set], block.parse().unwrap(), 0) {
                 Ok(pin) => {
                     let fresh = pin.fresh;
@@ -1123,18 +1129,21 @@ fn a_kept_set_is_imported_after_its_holders_kill_9_and_another_fill_refills() {
     a.child.kill().unwrap();
     assert_eq!(a.child.wait().unwrap().signal(), Some(libc::SIGKILL));
     ledger.reap(a.pid());
+    let orphans: u64 = ledger.status().rows.iter().map(|r| r.classes[1]).sum();
+    assert_eq!(orphans, 4 * REGION_ALIGN, "class O shows the orphans");
     let mut s = Agent::spawn();
     s.ok(&format!("open {}", g.uuid));
+    // One load path: the load imports what custody keeps, at any level.
     s.ok("load k 4 10 stored ram");
     s.ok("request r k");
     s.ok("pass r k 1");
     for b in 0..4 {
         assert_eq!(s.ok(&format!("exact k {b} 10")), "true", "block {b} bit-exact");
     }
-    assert_eq!(s.ok("trace r"), "Kept,Kept,Kept,Kept", "imported, not copied");
+    assert_eq!(s.ok("trace r"), "Hit,Hit,Hit,Hit", "imported at load, not copied");
     s.ok("unpin");
     let end = s.ok("end r");
-    assert!(end.contains(&format!("kept={}", 4 * REGION_ALIGN)) && end.contains("store=0"), "{end}");
+    assert!(end.contains("tier=0 store=0"), "{end}");
     s.exit();
     let mut c = Agent::spawn();
     c.ok(&format!("open {}", g.uuid));
@@ -1149,6 +1158,66 @@ fn a_kept_set_is_imported_after_its_holders_kill_9_and_another_fill_refills() {
     c.ok("end r");
     c.exit();
     println!("PASS a kept set is imported after its holder's kill -9, and another fill refills {uuid}");
+}
+
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn kept_pages_survive_a_holder_that_served() {
+    let (ledger, g, uuid) = tensord("served");
+    let mut a = Agent::spawn();
+    a.ok(&format!("open {}", g.uuid));
+    a.ok("load s 3 14 stored gpu");
+    a.ok("request r s");
+    a.ok("pass r s 1");
+    for b in 0..3 {
+        a.ok(&format!("bind s {b}"));
+    }
+    a.ok("unpin");
+    // A measured pass: the successor's pass needs room, and must not find it in its own kept pages.
+    a.ok(&format!("endpass r {}", 1u64 << 30));
+    a.ok("end r");
+    a.child.kill().unwrap();
+    a.child.wait().unwrap();
+    ledger.reap(a.pid());
+    let mut b = Agent::spawn();
+    b.ok(&format!("open {}", g.uuid));
+    b.ok("load s 3 14 stored ram");
+    b.ok("request r s");
+    b.ok("pass r s 1");
+    for block in 0..3 {
+        assert_eq!(b.ok(&format!("exact s {block} 14")), "true");
+    }
+    assert_eq!(b.ok("trace r"), "Hit,Hit,Hit", "every page kept, none copied");
+    b.ok("unpin");
+    let end = b.ok("end r");
+    assert!(end.contains("tier=0 store=0"), "{end}");
+    b.exit();
+    println!("PASS kept pages survive a holder that served {uuid}");
+}
+
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn binds_outlive_the_custody_holder() {
+    // No TensorD: the first participant serves custody, and it dies.
+    let (b, g, uuid) = card("holder");
+    drop(b);
+    let mut a = Agent::spawn();
+    a.ok(&format!("open {}", g.uuid));
+    a.ok("load hx 2 15 stored gpu");
+    let mut c = Agent::spawn();
+    c.ok(&format!("open {}", g.uuid));
+    c.ok("load hy 2 16 stored ram");
+    a.child.kill().unwrap();
+    a.child.wait().unwrap();
+    c.ok("request r hy");
+    c.ok("pass r hy 1");
+    assert_eq!(c.ok("exact hy 1 16"), "true", "binds go on: the next call serves custody itself");
+    c.ok("unpin");
+    c.ok("end r");
+    c.exit();
+    // The table goes with the last of its rows.
+    drop(Ledger::create(&g, None).unwrap());
+    println!("PASS binds outlive the custody holder {uuid}");
 }
 
 #[test]
