@@ -32,7 +32,7 @@ use windows_sys::Win32::{
         Threading::{
             CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CreateProcessW,
             DETACHED_PROCESS, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-            GetExitCodeProcess, GetProcessTimes, INFINITE, InitializeProcThreadAttributeList,
+            GetExitCodeProcess, GetProcessIoCounters, GetProcessTimes, INFINITE, IO_COUNTERS, InitializeProcThreadAttributeList,
             OpenProcess, OpenThread, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
             PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
             ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, THREAD_SUSPEND_RESUME,
@@ -105,17 +105,34 @@ pub(super) fn set_name(_: &str) -> crate::Result<()> {
     Err(crate::Error::unsupported(crate::Seam::Process))
 }
 
-/// Groups and meters are read only on Linux so far: unreadable here, which decides nothing.
-pub(super) fn group_members(_: &Birth) -> Vec<Birth> {
-    Vec::new()
+/// A leader's followers: the processes it started and theirs, born after it.
+pub(super) fn group_members(leader: &Birth) -> Vec<Birth> {
+    super::descendants(leader.pid)
+        .into_iter()
+        .filter_map(|pid| birth(pid).ok())
+        .filter(|member| member.start_ticks >= leader.start_ticks)
+        .collect()
 }
 
-pub(super) fn meter(_: u32) -> Option<(u64, u64)> {
-    None
+/// CPU nanoseconds used and bytes read and written. Windows keeps no time waiting for a CPU.
+pub(super) fn meter(pid: u32) -> Option<(u64, u64)> {
+    let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
+    let [_, _, kernel, user] = times(&process).ok()?;
+    let io = io_counters(&process)?;
+    let cpu = (ticks(kernel) + ticks(user)).saturating_mul(100);
+    Some((cpu, io.ReadTransferCount.saturating_add(io.WriteTransferCount)))
 }
 
-pub(super) fn read_bytes(_: u32) -> Option<u64> {
-    None
+pub(super) fn read_bytes(pid: u32) -> Option<u64> {
+    let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
+    Some(io_counters(&process)?.ReadTransferCount)
+}
+
+fn io_counters(process: &OwnedHandle) -> Option<IO_COUNTERS> {
+    // SAFETY: plain-old-data the call fills.
+    let mut counters: IO_COUNTERS = unsafe { mem::zeroed() };
+    // SAFETY: a live handle with query rights and a writable record.
+    (unsafe { GetProcessIoCounters(raw(process), &mut counters) } != 0).then_some(counters)
 }
 
 pub(super) fn become_subreaper() -> crate::Result<()> {

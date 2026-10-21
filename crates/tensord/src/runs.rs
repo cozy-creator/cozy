@@ -1717,7 +1717,7 @@ mod tests {
     }
     fn gone(pid: u32) -> bool {
         // A zombie is gone too: its parent (uv) has not reaped it yet.
-        fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| stat.contains(") Z "))
+        platform::process::Birth::of(pid).and_then(|birth| birth.ended()).unwrap_or(true)
     }
 
     /// A canceled preparation stops its work: the install's process group is killed at once,
@@ -1769,6 +1769,7 @@ mod tests {
     /// An install starved of CPU is working, not wedged: its build runs at 1% of a core (its
     /// own cgroup, quota 1 ms per 100 ms, as a container's spent quota beside a boot kernel
     /// compile) for longer than the stall floor, moving no byte, and the run completes.
+    #[cfg(target_os = "linux")] // Starves its build through a cgroup CPU quota.
     #[test]
     fn a_starved_install_completes() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));

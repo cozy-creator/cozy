@@ -428,8 +428,8 @@ pub fn supervise(
         // Bytes moved are progress, and CPU used or owed at a tenth of a core or more (`meter`).
         // An idle process's timer wakeups are not: uv waiting on its build spends one 10 ms
         // tick in about 10 s.
-        let members = group_members(exact.birth()).into_iter().map(|member| member.pid);
-        let reading = std::iter::once(exact.birth().pid).chain(members).filter_map(meter)
+        let members = group_members(exact.birth());
+        let reading = std::iter::once(exact.birth().pid).chain(members.iter().map(|member| member.pid)).filter_map(meter)
             .fold((0u64, 0u64), |(cpu, moved), (c, m)| (cpu + c, moved + m));
         if last.is_some_and(|(cpu, moved): (u64, u64)| reading.1 != moved || reading.0.saturating_sub(cpu) >= tick.as_nanos() as u64 / 10) {
             advances += 1;
@@ -441,18 +441,30 @@ pub fn supervise(
             read(bytes);
         }
         if stop.is_some_and(|stop| stop.is_cancelled()) {
-            exact.kill()?;
+            end(&exact, &members)?;
             ended = Some(Supervised::Canceled);
         } else if let Some(since) = pace.still_since() {
             let still = now - since;
             if still > pace.patience(floor) {
-                exact.kill()?;
+                end(&exact, &members)?;
                 ended = Some(Supervised::Wedged(format!("{what} wedged: {}", pace.verdict(still, floor))));
             }
         }
     }
     let status = child.wait()?;
     Ok(ended.unwrap_or(Supervised::Exited(status)))
+}
+
+/// Kills `exact` and its followers, which a Unix group signal reaches anyway and a Windows tree
+/// only this way.
+fn end(exact: &Exact, members: &[Birth]) -> io::Result<()> {
+    exact.kill()?;
+    for member in members {
+        if let Ok(Some(member)) = Exact::open(member) {
+            let _ = member.kill();
+        }
+    }
+    Ok(())
 }
 
 /// A preparation's verdict, on its measured progress (`Stop::progress`) as an invocation's is:

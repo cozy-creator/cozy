@@ -274,13 +274,13 @@ pub fn end_tree(tree: &[Exact]) -> Result<()> {
 }
 
 /// Every process in `leader`'s process group born with or after it: a leader's followers. A
-/// group number is not reused while a member lives. Empty on Windows, whose trees are Job Objects.
+/// group number is not reused while a member lives. Windows has no groups: its descendants.
 pub fn group_members(leader: &Birth) -> Vec<Birth> {
     sys::group_members(leader)
 }
 
 /// CPU nanoseconds used or owed (time runnable but waiting for a CPU) and bytes moved, the
-/// measure of a process's progress. `None`: unreadable, which decides nothing (Windows so far).
+/// measure of a process's progress. `None`: unreadable, which decides nothing.
 pub fn meter(pid: u32) -> Option<(u64, u64)> {
     sys::meter(pid)
 }
