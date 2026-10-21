@@ -360,7 +360,9 @@ overwrite the file and the data expires like any other local copy. The copy for 
 objects. `Writer()` without a destination keeps the checkpoint in the store as a cache entry. `base=` reuses
 unchanged tensors and `resume=` journals local work. `Writer(repo_id=…, revision=…, endpoint=…, token=…)` streams
 new objects, makes a commit and moves the private tag `revision` (default `main`) to it; `variant=` names the file
-`model.<variant>.cozytensors` and needs `repo_id`. `upload_folder` does the same for a folder and returns the commit.
+`model.<variant>.cozytensors` and needs `repo_id`. The commit goes on top of the tag: its other variants and files
+stay, so a bf16 and then an int8 writer to `main` leave both. `upload_folder` does the same for a folder (removing
+only what `delete_patterns` names) and returns the commit.
 Publishing (making a tag public, a release) is the CLI's `cozy model publish`. A successful checkpoint carries the exact
 commit; an upload failure keeps `writer.local_checkpoint`, which can be uploaded again for 7 days, and remains an error.
 

@@ -54,7 +54,7 @@ def open(name_or_path: StrPath, *, revision: str | None=None, variant: str | Non
 def materialize(source: str | Checkpoint, *, revision: str | None=None, variant: str | None=None, components: Sequence[str] | None=None, cache_dir: StrPath | None=None, local_dir: StrPath | None=None, local_files_only: bool=False, token: Token | None=None, endpoint: str | None=None, format: str='cozytensors', decode: bool=False) -> str:
     ...
 
-def upload_folder(*, repo_id: str, folder_path: StrPath, revision: str='main', token: Token | None=None, endpoint: str | None=None, cache_dir: StrPath | None=None) -> str:
+def upload_folder(*, repo_id: str, folder_path: StrPath, revision: str='main', delete_patterns: str | Sequence[str] | None=None, token: Token | None=None, endpoint: str | None=None, cache_dir: StrPath | None=None) -> str:
     ...
 
 class Error(Exception):

@@ -72,9 +72,11 @@ PUT  B/refs/<org>/<name>.json   If-Match: <etag> | If-None-Match: *
   answers `428`.
 - On `412` the client reads the document again, applies its change to it and retries. A retry after a lost answer
   that gets `412` reads it again: when it equals what was sent, the write succeeded.
-- Uploading makes a commit and moves a tag to it; publishing creates or moves a public tag, or makes a private one
-  public; yanking sets `yanked`. Each is one PUT of the edited document. A model is deleted by a document with no
-  tags. There is no DELETE.
+- Uploading makes a commit on top of a tag, as git does: the tag's current tree (none when the tag is new), minus
+  the paths the client's delete patterns match, plus the uploaded files, added or replaced; a file the commit sets is
+  never deleted. The tag then moves to it. Publishing creates or moves a public tag, or makes a private one public;
+  yanking sets `yanked`. Each is one PUT of the edited document; on `412` an upload reads the tag's tree again and
+  re-applies its files. A model is deleted by a document with no tags. There is no DELETE.
 - A server checks:
   - the body is a canonical `cozytensors.repo/1` document (cozytensors.md §9) whose `name` folds to the path;
   - every commit it cites has its closure present and readable by the writer, else `409 closure_incomplete` with up
