@@ -43,6 +43,7 @@ async fn submit(
     spec: v1::RunSpec,
 ) -> Result<Run, Error> {
     let ask = SubmitRun {
+        agreed: None,
         on,
         hub: hub.to_owned(),
         kind,
@@ -120,6 +121,7 @@ pub async fn install_directory(
         String::new(),
     );
     let ask = SubmitRun {
+        agreed: None,
         on,
         hub: ctx.hub()?.origin.into(),
         kind: calcifer::Kind::Warm,

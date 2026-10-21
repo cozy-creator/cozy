@@ -83,7 +83,7 @@ fn a_rentals_hub_warnings_reach_whoever_meets_it() {
     );
 
     // The Hub places it after it accepts the order: the boot's follower says what it warns of.
-    let rented = home.cozy(["machine", "rent", "cpu"]);
+    let rented = home.cozy(["machine", "rent", "cpu", "--yes"]);
     assert_eq!(rented.code, 0, "{rented:?}");
     assert!(rented.stderr.contains(LOW), "{rented:?}");
     let name = rented

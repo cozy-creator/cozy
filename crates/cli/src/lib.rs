@@ -41,6 +41,9 @@ struct Cli {
     /// The Hub to use instead of the current one (`cozy hub use`).
     #[arg(long, global = true, value_name = "HUB", add = ArgValueCompleter::new(completion::hubs))]
     tensorhub: Option<String>,
+    /// Agree without being asked: to a rental's quote, an uninstall, a deletion.
+    #[arg(long, short = 'y', global = true)]
+    yes: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -102,7 +105,7 @@ pub fn main() -> ExitCode {
         Err(error) => return output::refuse(cli.json, &error),
     };
     let warnings = loaded.warnings.clone();
-    let ctx = Context::new(cli.json, loaded, output::Term::detect());
+    let ctx = Context::new(cli.json, cli.yes, loaded, output::Term::detect());
     for warning in &warnings {
         output::warn(warning);
     }

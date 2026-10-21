@@ -29,7 +29,7 @@ fn a_rental_placed_off_its_requesters_continent_says_why() {
     home.sign_in("placed@cozy.test");
 
     // The Hub places a rental after it accepts the order: the boot's follower says why.
-    let rented = home.cozy(["machine", "rent", "cpu"]);
+    let rented = home.cozy(["machine", "rent", "cpu", "--yes"]);
     assert_eq!(rented.code, 0, "{rented:?}");
     assert!(rented.stderr.contains(FAR), "{rented:?}");
     let name = rented
@@ -60,7 +60,11 @@ fn a_rental_placed_off_its_requesters_continent_says_why() {
     // A run that rents its machine says it too, once it is placed.
     let package = common::package::publish(&home, "tiny", "0.1.0");
     let echo = format!("{package}/echo");
-    let out = home.cozy(["run", &echo, "text=far", "--on", "new:cpu"]);
+    // Renting for a run is agreed to like any rental: refused with its quote without a yes.
+    let unagreed = home.cozy(["run", &echo, "text=far", "--on", "new:cpu", "--json"]);
+    let refusal = unagreed.refusal();
+    assert!(refusal["code"] == "quote_unagreed" && refusal["message"].to_string().contains("cpu ×1: $"), "{unagreed:?}");
+    let out = home.cozy(["run", &echo, "text=far", "--on", "new:cpu", "--yes"]);
     assert_eq!(out.code, 0, "{out:?}");
     assert!(out.stderr.contains(FAR), "{out:?}");
     let list = home.json(["machine", "list", "--json"]);

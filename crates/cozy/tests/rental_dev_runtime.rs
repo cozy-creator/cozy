@@ -138,7 +138,7 @@ fn a_rentals_dev_runtime_runs_a_script_pinned_to_pypis() {
         &dev,
     ]);
 
-    let rented = home.json(["machine", "rent", "cpu", "--detach", "--json"]);
+    let rented = home.json(["machine", "rent", "cpu", "--yes", "--detach", "--json"]);
     let name = rented["machine"]["name"].as_str().unwrap().to_owned();
     let rental = Rental(
         &home,

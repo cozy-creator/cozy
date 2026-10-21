@@ -600,6 +600,7 @@ async fn calcifer_answers_within_a_second_on_a_big_store_while_a_commit_is_stuck
         warnings: vec![],
         inputs: vec![],
         wants: None,
+        agreed: None,
     };
     store.submit("k", "sha256:k", new).unwrap();
     drop(store);

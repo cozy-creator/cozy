@@ -9,7 +9,7 @@ use std::{path::Path, sync::Arc};
 use calcifer::{Calcifer, machines::Machines};
 use platform::paths::Home;
 use protocol::{
-    calcifer::{Kind, On, SubmitRun},
+    calcifer::{Agreed, Kind, On, SubmitRun},
     config, machine as v1,
 };
 use hub_client::{Client, Credential, DeviceKey, P256Key, RunToken, UserSession, testing, types};
@@ -87,28 +87,32 @@ async fn a_hub_is_listed_signed_in_and_a_rent_it_will_not_price_records_nothing(
     );
 
     // A bare `--on new` asks the Hub's placement; nothing holds this run on a Hub with no
-    // provider, so the run fails typed and nothing is rented.
+    // provider, so the run fails typed and nothing is rented. Without an agreed quote it is
+    // refused before it is recorded.
+    let held = |agreed| SubmitRun {
+        agreed,
+        on: On::New(None),
+        hub: origin.clone(),
+        kind: Kind::Call,
+        target: "cozy-test/held/generate".into(),
+        spec: v1::RunSpec {
+            source: Some(v1::Source::Release(v1::Release {
+                package: "cozy-test/held".into(),
+                release: String::new(),
+            })),
+            entrypoint: "generate".into(),
+            ..Default::default()
+        },
+        inputs: vec![],
+        out: None,
+        warnings: vec![],
+    };
+    let unagreed = calcifer.submit("calcifer-run-0", held(None)).await;
+    let Err(calcifer::Error::Refused(refused)) = unagreed else { panic!("{unagreed:?}") };
+    assert_eq!(refused.code, "quote_unagreed");
+    let agreed = Agreed { usd_micros_per_hour: 1_000_000_000, usd_micros_per_gb: 1_000_000 };
     let run = calcifer
-        .submit(
-            "calcifer-run-1",
-            SubmitRun {
-                on: On::New(None),
-                hub: origin.clone(),
-                kind: Kind::Call,
-                target: "cozy-test/held/generate".into(),
-                spec: v1::RunSpec {
-                    source: Some(v1::Source::Release(v1::Release {
-                        package: "cozy-test/held".into(),
-                        release: String::new(),
-                    })),
-                    entrypoint: "generate".into(),
-                    ..Default::default()
-                },
-                inputs: vec![],
-                out: None,
-                warnings: vec![],
-            },
-        )
+        .submit("calcifer-run-1", held(Some(agreed)))
         .await
         .unwrap()
         .run
@@ -199,6 +203,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
         calcifer.submit(
             key,
             SubmitRun {
+                agreed: None,
                 on: On::Machine("m".into()),
                 hub: origin.clone(),
                 kind: Kind::Warm,
@@ -237,6 +242,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
         .submit(
             "k-respelled",
             SubmitRun {
+                agreed: None,
                 on: On::Machine("m".into()),
                 hub: machine_spelling(&origin),
                 kind: Kind::Warm,
@@ -299,6 +305,7 @@ async fn a_runs_capability_is_bound_to_its_machine_and_traded_at_its_hub() {
     // Local code's org-relative references name this account: the machine got the run so.
     let (staged, local) = common::local_spec(home.path());
     let run = SubmitRun {
+        agreed: None,
         on: On::Machine("m".into()),
         hub: origin.clone(),
         kind: Kind::Warm,

@@ -18,6 +18,8 @@ use crate::{calcifer_client::Client, output::Term};
 #[derive(Debug)]
 pub struct Context {
     pub json: bool,
+    /// `--yes`: agreed without being asked.
+    pub yes: bool,
     pub config: Config,
     pub home: Home,
     /// The user's home directory: services and `~` are relative to it.
@@ -27,9 +29,10 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(json: bool, loaded: Loaded, term: Term) -> Self {
+    pub fn new(json: bool, yes: bool, loaded: Loaded, term: Term) -> Self {
         Self {
             json,
+            yes,
             config: loaded.config,
             home: loaded.home,
             user_home: loaded.user_home,

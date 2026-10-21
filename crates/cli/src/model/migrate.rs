@@ -61,6 +61,7 @@ fn failed(code: &str, message: impl Into<String>) -> Error {
 /// Submits one migration run and follows it to its end.
 async fn run(ctx: &Context, args: &Args, target: String, spec: RunSpec) -> Result<Run, Error> {
     let submit = SubmitRun {
+        agreed: None,
         on: args.placement.on(),
         hub: ctx.hub()?.origin.into(),
         kind: RunKind::Warm,

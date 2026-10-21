@@ -66,6 +66,7 @@ async fn an_input_uploads_near_the_link_rate_over_a_long_round_trip() {
         .collect();
     let (staged, input) = common::input_file(Path::new(home.path()), &bytes);
     let submit = SubmitRun {
+        agreed: None,
         on: On::from("m".to_owned()),
         hub: "https://tensorhub.com".into(),
         kind: Kind::Warm,
@@ -253,6 +254,7 @@ async fn inputs_the_machine_holds_are_asked_about_once_over_a_long_round_trip() 
     // Sent, then accepted: how long a run takes from its submit to its machine's acceptance.
     let mut sent = async |key: &str, inputs: &[(protocol::calcifer::StagedInput, protocol::machine::InputFile)]| {
         let submit = SubmitRun {
+            agreed: None,
             on: On::from("m".to_owned()),
             hub: "https://tensorhub.com".into(),
             kind: Kind::Warm,

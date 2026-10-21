@@ -292,6 +292,7 @@ pub async fn update(
         ..Default::default()
     };
     let submit = SubmitRun {
+        agreed: None,
         on: On::Machine(m.name.clone()),
         hub: hub.origin.into(),
         kind: calcifer::Kind::Update,
@@ -355,6 +356,7 @@ pub async fn toolchain(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
         ..Default::default()
     };
     let submit = SubmitRun {
+        agreed: None,
         on: On::Machine(m.name.clone()),
         hub: hub.origin.into(),
         kind: calcifer::Kind::Update,
