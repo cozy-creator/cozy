@@ -21,8 +21,8 @@ use serde_json::{json, Value as Json};
 use crate::failure::{fail, Failure, Kind, Result};
 use crate::fetch::{self, Client, Endpoint, Fetcher, Fresh, Origin, Payload, SourcePolicy, Want};
 use crate::format::decode::{check_metadata, PartMetadata};
-use crate::format::{Body, Component, Config, Header, Metadata, ObjectRef, Repo, Tag, Tensor, Tree, Value, HEADER_PATH, TREE_FORMAT};
-use crate::import::{layout, remote};
+use crate::format::{Body, ClassRef, Component, Config, Header, Metadata, ObjectRef, Repo, Tag, Tensor, Tree, Value, HEADER_PATH, TREE_FORMAT};
+use crate::import::{layout, remote, Versions};
 use crate::store::Store;
 
 use super::v1;
@@ -162,6 +162,17 @@ fn under(entry: &str, path: &str) -> bool {
     }
 }
 
+/// Components whose configs name no class: the class that implements them, read from the
+/// package or model code that loads them (owner, 2026-10-20). An empty version is the pin's.
+const CLASSES: &[(&[&str], &str, [&str; 3])] = &[
+    (&["*/seedvr2-7b"], "conditioning", ["seedvr2", "0.6.1", "Conditioning"]),
+    (&["*/seedvr2-7b"], "dit", ["seedvr2", "0.6.1", "NaDiT"]),
+    (&["*/seedvr2-7b"], "vae", ["seedvr2", "0.6.1", "VideoAutoencoderKLWrapper"]),
+    (&["*/birefnet"], "model", ["birefnet", "0.4.0", "BiRefNet"]),
+    (&["*/minimax-h3-vsa-gate"], "model", ["minimax_h3", "1.43.2", "GateStack"]),
+    (&["*/flux-3-klein-upsampler", "*/qwen3.5-9b"], "model", ["transformers", "", "Qwen3_5ForConditionalGeneration"]),
+];
+
 /// Releases that become private tags (a public tag is a PEP 440 version): model and version, by
 /// ruling (2026-10-20: an audit artifact). Any other release not a version refuses its repo.
 pub const PRIVATE: &[(&str, &str)] = &[("fidika/minimax-h3-turbo-lora", "1.0.0-audit.1")];
@@ -204,7 +215,7 @@ struct OldTag {
 impl OldRepo {
     /// In order: releases (public), the checkpoints no release cites (private), then tags.
     fn tags(self) -> Vec<OldTag> {
-        let cited: Vec<ObjectRef> = self.releases.iter().flat_map(|r| r.lanes.iter().flat_map(|l| l.values().cloned())).collect();
+        let cited: Vec<ObjectRef> = self.releases.iter().flat_map(|r| r.lanes.iter().flat_map(|l| l.values()).chain(&r.tree)).cloned().collect();
         let releases = self.releases.into_iter().map(|r| OldTag { name: Some(r.version), lanes: r.lanes, commit: r.tree, public: true, yanked: r.yanked });
         let checkpoints = (self.checkpoints.into_iter().filter(|c| !cited.contains(c)))
             .map(|c| OldTag { name: None, lanes: None, commit: Some(c), public: false, yanked: false });
@@ -284,26 +295,27 @@ impl<'t> Migrator<'t> {
         let upstream = self.table.iter().find(|u| u.models.iter().any(|p| matches(p, &name)));
         let tree_at = |o: &ObjectRef| -> Result<bool> { Ok(serde_json::from_slice::<Json>(&read(o)?).is_ok_and(|d| d["format"] == TREE_FORMAT)) };
         let tags = old.tags();
-        // The old checkpoints to name: private, and not yet trees.
-        let mut unnamed = BTreeSet::new();
-        for c in tags.iter().filter(|t| !t.public && t.lanes.is_none()).filter_map(|t| t.commit.as_ref()) {
-            if !tree_at(c)? {
-                unnamed.insert(c.sha256.clone());
-            }
-        }
-        let width = |sha256: &str| if unnamed.iter().filter(|o| o[..12] == sha256[..12]).count() > 1 { 16 } else { 12 };
+        // Named tags retain their spelling. Reserve even later names before assigning an
+        // immutable private retention name to an unnamed checkpoint (including a D10 tree).
+        let unnamed: BTreeSet<String> = (tags.iter())
+            .filter(|t| t.name.is_none() && !t.public && t.lanes.is_none())
+            .filter_map(|t| t.commit.as_ref().map(|c| c.sha256.clone())).collect();
+        let reserved: BTreeSet<String> = tags.iter().filter_map(|t| t.name.clone()).collect();
         let mut objects = Objects::new();
         let mut lanes: HashMap<ObjectRef, Lane> = HashMap::new();
+        let mut trees = HashMap::new();
+        let mut converted = Vec::new();
         let put = |objects: &mut Objects, tree: &Tree| -> Result<ObjectRef> { Ok(add(objects, tree.to_json()?)) };
         let (mut repo, mut released, mut unreleased, mut private) = (Repo::new(&name), Vec::new(), Vec::new(), Vec::new());
         for t in tags {
             let what = t.name.clone().unwrap_or_default();
+            let unnamed_tag = t.name.is_none();
             let commit = match (&t.lanes, &t.commit) {
                 (Some(named), _) => {
                     let (mut tree, mut report, mut conflicts) = (Tree::default(), serde_json::Map::new(), Vec::new());
                     for (lane_name, manifest) in named {
                         if !lanes.contains_key(manifest) {
-                            let lane = self.lane(manifest, upstream, read, &mut objects)?;
+                            let lane = self.lane(&name, manifest, upstream, read, &mut objects)?;
                             lanes.insert(manifest.clone(), lane);
                         }
                         let lane = &lanes[manifest];
@@ -321,10 +333,16 @@ impl<'t> Migrator<'t> {
                     released.push(json!({"version": what, "tree": at.id(), "yanked": t.yanked, "lanes": report, "conflicts": conflicts}));
                     at
                 }
-                (None, Some(c)) if tree_at(c)? => c.clone(),
+                (None, Some(c)) if tree_at(c)? => {
+                    if !trees.contains_key(c) {
+                        let at = self.tree(&name, c, upstream, read, &mut objects, &mut converted)?;
+                        trees.insert(c.clone(), at);
+                    }
+                    trees[c].clone()
+                }
                 (None, Some(c)) => {
                     if !lanes.contains_key(c) {
-                        let lane = self.lane(c, upstream, read, &mut objects)?;
+                        let lane = self.lane(&name, c, upstream, read, &mut objects)?;
                         lanes.insert(c.clone(), lane);
                     }
                     let lane = &lanes[c];
@@ -342,22 +360,24 @@ impl<'t> Migrator<'t> {
             }
             let tag = match (t.name, &t.commit) {
                 (Some(n), _) if t.public => n,
-                (n, Some(c)) if unnamed.contains(&c.sha256) => {
+                (None, Some(c)) if unnamed.contains(&c.sha256) => {
                     let bytes = read(c)?;
-                    let file_only = self.offline && v1::files_only(&bytes)?.is_some();
-                    let kind = if file_only || v1::manifest(&bytes)?.is_some() { "v1" } else { "v2" };
-                    let derived = format!("{kind}-{}", &c.sha256[..width(&c.sha256)]);
-                    if n.as_ref().is_some_and(|n| *n != derived) {
-                        return fail(Kind::Invalid, format!("{name}: checkpoint {} is tagged {n:?}, A11 names it {derived}", c.id()));
-                    }
-                    if let Some(r) = unreleased.last_mut() {
-                        r["name"] = json!(derived);
-                    }
+                    let tree = tree_at(c)?;
+                    let file_only = !tree && self.offline && v1::files_only(&bytes)?.is_some();
+                    let kind = if !tree && (file_only || v1::manifest(&bytes)?.is_some()) { "v1" } else { "v2" };
+                    let derived = private_name(kind, &c.sha256, &unnamed, &reserved);
                     derived
                 }
                 (Some(n), _) => n,
                 (None, _) => return fail(Kind::Invalid, format!("{name}: an unnamed tag")),
             };
+            if let Some(c) = &t.commit {
+                if let Some(r) = unreleased.iter_mut().rev().find(|r| r["old"] == c.id()) {
+                    r["name"] = json!(tag);
+                } else if !t.public && unnamed_tag {
+                    unreleased.push(json!({"old": c.id(), "tree": commit.id(), "name": tag, "already_tree": true}));
+                }
+            }
             if repo.tag(&tag).is_some() {
                 return fail(Kind::Invalid, format!("{name}: two tags named {tag}"));
             }
@@ -368,12 +388,92 @@ impl<'t> Migrator<'t> {
         if !private.is_empty() {
             report["made_private"] = json!(private);
         }
+        if !converted.is_empty() {
+            report["trees"] = json!(converted);
+        }
         Ok(Migrated { repo, objects, report })
+    }
+
+    /// An existing D10 tree keeps every file and variant name. Only TEXT-class headers and
+    /// the tree references that name them change; no asset or tensor chunk is read.
+    fn tree(&mut self, model: &str, old: &ObjectRef, upstream: Option<&Upstream>, read: Read,
+            objects: &mut Objects, reports: &mut Vec<Json>) -> Result<ObjectRef> {
+        let mut tree = Tree::from_json(&read(old)?)?;
+        let mut headers = Vec::new();
+        for (path, object) in &mut tree.files {
+            if crate::format::variant_of(path).is_none() {
+                continue;
+            }
+            let bytes = read(object)?;
+            let new = self.class_header(model, &bytes, upstream)
+                .map_err(|e| Failure { detail: format!("{model} {} {path}: {}", old.id(), e.detail), ..e })?;
+            if new != bytes {
+                let at = add(objects, new);
+                headers.push(json!({"path": path, "old": object.id(), "header": at.id()}));
+                *object = at;
+            }
+        }
+        if headers.is_empty() { return Ok(old.clone()); }
+        let at = add(objects, tree.to_json()?);
+        reports.push(json!({"old": old.id(), "tree": at.id(), "headers": headers}));
+        Ok(at)
+    }
+
+    fn class_header(&mut self, model: &str, old: &[u8], upstream: Option<&Upstream>) -> Result<Vec<u8>> {
+        if Header::from_cbor(old).is_ok() { return Ok(old.to_vec()); }
+        // First let the strict current reader validate every non-class field. These temporary
+        // unknown records are never published, and retain each old name for the second pass.
+        let mut names = BTreeMap::new();
+        let neutral = class_fields(old, &mut |component, name| {
+            names.insert(component.to_owned(), name.to_owned());
+            Ok(ClassRef::default())
+        })?;
+        let header = Header::from_cbor(&neutral)?;
+        if names.values().all(String::is_empty) { return Ok(neutral); }
+        let reference = match upstream { Some(u) => self.reference(u.from)?, None => Versions::new() };
+        let mut files = BTreeMap::new();
+        if let Some(pipeline) = header.pipeline() {
+            files.insert("model_index.json".to_owned(), serde_json::to_vec(&pipeline.config).map_err(|e| invalid(e.to_string()))?);
+        }
+        for component in header.components() {
+            files.insert(format!("{}/{}", component.name, component.config_name()), serde_json::to_vec(&component.config).map_err(|e| invalid(e.to_string()))?);
+        }
+        let tensored = header.components().iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        let inferred = layout(files, &tensored, &reference)?;
+        let mut versions = reference;
+        for config in header.pipeline().map(|p| &p.config).into_iter().chain(header.components().iter().map(|c| &c.config)) {
+            for (key, value) in config {
+                if let (Some(library), Some(version)) = (key.strip_suffix("_version"), value.as_str()) {
+                    versions.insert(library.trim_start_matches('_').to_owned(), version.to_owned());
+                }
+            }
+        }
+        let out = class_fields(old, &mut |component, name| {
+            if name.is_empty() { return Ok(ClassRef::default()); }
+            let found = if component.is_empty() {
+                inferred.pipeline.as_ref().map(|p| p.class.clone())
+            } else {
+                family_class(model, component, &versions)
+                    .or_else(|| inferred.components.iter().find(|c| c.name == component).map(|c| c.class.clone()))
+            };
+            if let Some(class) = found.filter(|c| !c.is_unknown() && c.name == name) { return Ok(class); }
+            // An explicit qualified source names its own library; retain the rest of its
+            // namespace, rather than guessing the library of an unqualified class.
+            if let Some((library, class)) = name.split_once('.') {
+                let identifier = |s: &str| !s.is_empty() && s.bytes().enumerate().all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || i > 0 && b.is_ascii_digit());
+                if name.split('.').all(identifier) {
+                    return Ok(ClassRef::new(library, versions.get(library).map_or("", String::as_str), class));
+                }
+            }
+            fail(Kind::Unsupported, format!("{component:?} TEXT class {name:?} has no verified library/class record"))
+        })?;
+        Header::from_cbor(&out)?;
+        Ok(out)
     }
 
     /// One old lane: its header in D10 (old tensors, filled run data, configs, assets) and its
     /// repo files; every lane file is checked to have landed in one of them.
-    fn lane(&mut self, manifest: &ObjectRef, upstream: Option<&Upstream>, read: Read, objects: &mut Objects) -> Result<Lane> {
+    fn lane(&mut self, model: &str, manifest: &ObjectRef, upstream: Option<&Upstream>, read: Read, objects: &mut Objects) -> Result<Lane> {
         let raw = read(manifest)?;
         if self.offline {
             if let Some(files) = v1::files_only(&raw)? {
@@ -431,7 +531,18 @@ impl<'t> Migrator<'t> {
             }
         }
         let tensored: Vec<String> = tensors.iter().map(|(name, _)| name.clone()).collect();
-        let l = layout(bytes.clone(), &tensored, &Default::default())?;
+        let reference = match upstream {
+            Some(u) => self.reference(u.from)?,
+            None => Versions::new(),
+        };
+        let mut l = layout(bytes.clone(), &tensored, &reference)?;
+        for f in &mut l.components {
+            if f.class.is_unknown() {
+                if let Some(class) = family_class(model, &f.name, &reference) {
+                    f.class = class;
+                }
+            }
+        }
         let mut keep = |b: Vec<u8>| add(objects, b);
         let components = (l.components.into_iter())
             .map(|f| Component {
@@ -469,7 +580,11 @@ impl<'t> Migrator<'t> {
         let cbor = new.to_cbor()?;
         check(&chunks, &tensors, &new, &cbor, &bytes, &repo_files)?;
         let at = add(objects, cbor);
-        let mut report = json!({"old": manifest.id(), "header": at.id()});
+        let classes: serde_json::Map<String, Json> = new.components().iter()
+            .filter(|c| !c.tensors.is_empty())
+            .map(|c| (c.name.clone(), json!([c.class.library, c.class.version, c.class.name])))
+            .collect();
+        let mut report = json!({"old": manifest.id(), "header": at.id(), "classes": classes});
         if !filled.is_empty() {
             report["filled"] = json!(filled);
         }
@@ -493,6 +608,33 @@ impl<'t> Migrator<'t> {
         Ok(())
     }
 
+    /// The library versions the pinned upstream `from` records (its `model_index.json`, then its
+    /// configs by path): a class's version where the lane's own configs record none.
+    fn reference(&mut self, from: &str) -> Result<Versions> {
+        let mut out = Versions::new();
+        if self.offline || !from.starts_with("hf://") {
+            return Ok(out);
+        }
+        self.verify(from)?;
+        let mut paths: Vec<String> = (self.listings[from].iter())
+            .map(|m| m.path.clone())
+            .filter(|p| p == "model_index.json" || p.rsplit('/').next() == Some("config.json") && p.matches('/').count() <= 1)
+            .collect();
+        paths.sort_by_key(|p| (p != "model_index.json", p.clone()));
+        for path in paths {
+            for (_, bytes) in self.upstream(from, &path)? {
+                let Ok(Json::Object(doc)) = serde_json::from_slice::<Json>(&bytes) else { continue };
+                for (key, value) in doc {
+                    let library = key.strip_suffix("_version").map(|l| l.trim_start_matches('_').to_owned());
+                    if let (Some(library), Some(version)) = (library.filter(|l| !l.is_empty()), value.as_str()) {
+                        out.entry(library).or_insert_with(|| version.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The files under `entry` at the pinned upstream `from`, by path.
     fn upstream(&mut self, from: &str, entry: &str) -> Result<Vec<(String, Vec<u8>)>> {
         self.verify(from)?;
@@ -511,6 +653,93 @@ impl<'t> Migrator<'t> {
 
 fn invalid(detail: String) -> Failure {
     Failure { kind: Kind::Invalid, detail }
+}
+
+fn family_class(model: &str, component: &str, reference: &Versions) -> Option<ClassRef> {
+    let (_, _, [library, version, name]) = CLASSES.iter()
+        .find(|(models, c, _)| *c == component && models.iter().any(|p| matches(p, model)))?;
+    let version = if version.is_empty() { reference.get(*library).map_or("", String::as_str) } else { version };
+    Some(ClassRef::new(library, version, name))
+}
+
+/// A definite CBOR record as its untouched head and item byte spans. Unlike the normal
+/// reader this only locates fields; the strict ARRAY3 reader validates the spliced result.
+fn fields(bytes: &[u8]) -> Result<(&[u8], Vec<&[u8]>)> {
+    let bad = |e: minicbor::decode::Error| invalid(format!("D10 header: {e}"));
+    let mut d = Decoder::new(bytes);
+    let n = d.array().map_err(bad)?.ok_or_else(|| invalid("an indefinite D10 record".into()))?;
+    let head = &bytes[..d.position()];
+    let mut items = Vec::new();
+    for _ in 0..n {
+        let at = d.position();
+        d.skip().map_err(bad)?;
+        items.push(&bytes[at..d.position()]);
+    }
+    if d.position() != bytes.len() { return fail(Kind::Invalid, "bytes after a D10 record"); }
+    Ok((head, items))
+}
+
+fn join_fields(head: &[u8], items: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = head.to_vec();
+    items.iter().for_each(|item| out.extend_from_slice(item));
+    out
+}
+
+/// Replace only TEXT class fields. ARRAY3 classes and every other field (including extension
+/// fields, encoding-table order and config numeric encodings) retain their exact bytes.
+fn class_fields(old: &[u8], select: &mut impl FnMut(&str, &str) -> Result<ClassRef>) -> Result<Vec<u8>> {
+    let (head, root) = fields(old)?;
+    if root.len() < 6 { return fail(Kind::Invalid, "a D10 header has fewer than six fields"); }
+    let mut root = root.into_iter().map(<[u8]>::to_vec).collect::<Vec<_>>();
+    let mut class = |bytes: &mut Vec<u8>, component: &str| -> Result<()> {
+        let mut d = Decoder::new(bytes);
+        if d.datatype().map_err(|e| invalid(e.to_string()))? == minicbor::data::Type::String {
+            let name = d.str().map_err(|e| invalid(e.to_string()))?;
+            if d.position() != bytes.len() { return fail(Kind::Invalid, "bytes after a TEXT class"); }
+            let selected = select(component, name)?;
+            let mut encoded = minicbor::Encoder::new(Vec::new());
+            encoded.array(3).expect("Vec write").str(&selected.library).expect("Vec write")
+                .str(&selected.version).expect("Vec write").str(&selected.name).expect("Vec write");
+            *bytes = encoded.into_writer();
+        }
+        Ok(())
+    };
+    let (phead, pipeline) = fields(&root[3])?;
+    if !pipeline.is_empty() {
+        if pipeline.len() < 2 { return fail(Kind::Invalid, "a D10 pipeline has fewer than two fields"); }
+        let mut pipeline = pipeline.into_iter().map(<[u8]>::to_vec).collect::<Vec<_>>();
+        class(&mut pipeline[0], "")?;
+        root[3] = join_fields(phead, &pipeline);
+    }
+    let (chead, components) = fields(&root[4])?;
+    let mut converted = Vec::new();
+    for component in components {
+        let (head, values) = fields(component)?;
+        if values.len() < 5 { return fail(Kind::Invalid, "a D10 component has fewer than five fields"); }
+        let name = Decoder::new(values[0]).str().map_err(|e| invalid(e.to_string()))?.to_owned();
+        let mut values = values.into_iter().map(<[u8]>::to_vec).collect::<Vec<_>>();
+        class(&mut values[1], &name)?;
+        converted.push(join_fields(head, &values));
+    }
+    root[4] = join_fields(chead, &converted);
+    Ok(join_fields(head, &root))
+}
+
+/// A deterministic name in A11's existing retention namespace, without moving any named
+/// tag. Prefixes grow through the complete digest; a deliberately occupied complete name
+/// gets the first free numeric suffix. The finite reserved set guarantees termination.
+fn private_name(kind: &str, digest: &str, unnamed: &BTreeSet<String>, reserved: &BTreeSet<String>) -> String {
+    for width in (12..=64).step_by(4) {
+        let name = format!("{kind}-{}", &digest[..width]);
+        if !reserved.contains(&name) && !unnamed.iter().any(|other| other != digest && other[..width] == digest[..width]) {
+            return name;
+        }
+    }
+    for suffix in 1_u64.. {
+        let name = format!("{kind}-{digest}-{suffix}");
+        if !reserved.contains(&name) { return name; }
+    }
+    unreachable!("a finite set of tags cannot occupy every retention name")
 }
 
 /// Cozy's native config wrappers become the files they hold, every key accounted for:
@@ -718,6 +947,12 @@ async fn old_objects(endpoint: &Arc<Endpoint>, client: &Client, scratch: &Store,
             files.extend(m.files.into_iter().map(|(_, o)| o));
             files.push(m.header.clone());
             v1_headers.push(m.header);
+            continue;
+        }
+        if let Ok(tree) = Tree::from_json(&raw) {
+            // Existing D10 chunks and assets remain in place; only variant header metadata
+            // is needed to inspect/upgrade the class fields.
+            files.extend(tree.variants().map(|(_, header)| header.clone()));
             continue;
         }
         let doc: Option<Doc> = serde_json::from_slice(&raw).ok();
