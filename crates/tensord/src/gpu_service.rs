@@ -740,14 +740,14 @@ impl Pool {
         }))
     }
     /// A ledger signalled (room freed, a row died, a peak was recorded): the dispatch queue asks
-    /// `fits` again, each row `status` names stalled ends, and changed peaks are saved.
+    /// `fits` again, each row the ledger names stalled ends, and changed peaks are saved.
     fn memory_changed(&self) {
         if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
             engine.notify_activity();
         }
         let gpus: Vec<(&str, &memory::Gpu)> = self.devices.iter().filter_map(|d| Some((d.entry.as_str(), d.memory.as_ref()?))).collect();
         for (entry, gpu) in &gpus {
-            for pid in gpu.ledger.status().stalled {
+            for pid in gpu.ledger.stalled() {
                 self.notes.note(serde_json::json!({"event": "stalled", "gpu": entry, "pid": pid}));
                 self.end_stalled(pid);
             }
