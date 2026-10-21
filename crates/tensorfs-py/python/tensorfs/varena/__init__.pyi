@@ -172,37 +172,54 @@ class Request:
 
     def oom(
         self,
+        set: int,
         allocated: int,
         reserved: int,
         need: int | None = None,
         site: str | None = None,
         collective: bool = False,
     ) -> Next:
-        """An op ran out of memory (`need` more bytes when known) at cut site `site` (None: it
-        cannot be cut), with torch's bytes now; a `collective` site's finer level waits for the
-        next pass's agreement."""
+        """An op of `set`'s pass ran out of memory (`need` more bytes when known) at cut site
+        `site` (None: it cannot be cut), with torch's bytes now; a `collective` site's finer
+        level waits for the next pass's agreement."""
 
     def parked(self, nbytes: int) -> None:
         """The bytes a `Park` answer moved to the host (0: none, and the next `oom` is Exhausted)."""
 
-    def levels(self) -> list[tuple[str, int]]:
-        """The current pass's collective sites' proposed `(site, level)`: the level in effect, or
-        a finer one an OOM proposed."""
+    def cut(self, set: int, site: str) -> int:
+        """The cut level of `set`'s current pass for `site` (0: whole)."""
 
-    def agree(self, levels: list[tuple[str, int]]) -> None:
-        """The levels the ranks agreed (the maximum of their proposals), for the current pass."""
-
-    def cut(self, site: str) -> int:
-        """The current pass's cut level for `site` (0: whole)."""
+    def yielding(self) -> Yielded:
+        """The request waits on a child call: until the guard ends it gives back its reserved
+        room and its step's pages may be asked for; ended, it takes its room back."""
 
     def stats(self) -> Stats: ...
     def end(self) -> Stats:
         """Ends it: its pins, rooms and caches go."""
 
 class Pass:
-    def end(self, allocated_peak: int, slack: int, sites: list[tuple[str, int]], allocated: int, reserved: int) -> None:
+    def end(self, allocated_peak: int, slack: int, sites: list[tuple[str, int, bool]], allocated: int, reserved: int) -> None:
         """Records what the pass measured (torch's absolute allocated peak, the allocator's slack
-        at it, each cut site's peak) and torch's bytes now; dropping it unended records nothing."""
+        at it, each cut site's `(name, peak, collective)`) and torch's bytes now; dropping it
+        unended records nothing."""
+
+    def measured(self) -> bool:
+        """Whether its room is the one measured for its set, shape and cut levels."""
+
+    def levels(self) -> list[tuple[str, int]]:
+        """Its collective sites' proposed `(site, level)`, for the ranks to agree before any
+        exchange."""
+
+    def agree(self, levels: list[tuple[str, int]]) -> None:
+        """The levels the ranks agreed (the maximum of their proposals): in effect for it."""
+
+class Yielded:
+    """A request waiting on a child call (`Request.yielding`): `end`, or leaving its `with`, ends
+    the wait."""
+
+    def end(self) -> None: ...
+    def __enter__(self) -> Yielded: ...
+    def __exit__(self, *exc: object) -> None: ...
 
 class Pin:
     @property

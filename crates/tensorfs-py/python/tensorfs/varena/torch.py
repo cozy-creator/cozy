@@ -31,7 +31,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves
 
-from . import Exhausted, Fill, GpuId, Grant, Level, Next, Pass, Pin, Stats, VarenaError
+from . import Exhausted, Fill, GpuId, Grant, Level, Next, Pass, Pin, Stats, VarenaError, Yielded
 from . import Memory as Native
 from . import Request as NativeRequest
 from . import Set
@@ -168,11 +168,14 @@ class _Pass:
     """An open pass and what it measured so far; `open` holds each running site's peak."""
 
     native: Pass
+    #: its model's set
+    set: int
     #: `<entry>|<dims>`: the entry module's path in the model ("" the root) and its tensors' dims
     shape: str
     peak: int = 0
     reserved_peak: int = 0
-    sites: dict[str, int] = field(default_factory=dict)
+    #: each cut site's allocated peak and whether it is a collective's
+    sites: dict[str, tuple[int, bool]] = field(default_factory=dict)
     open: list[list[object]] = field(default_factory=list)
     #: the exception being handled where it opened: another at its close is a raise
     entered: BaseException | None = None
@@ -395,7 +398,7 @@ class Memory:
                 dims = "x".join(str(d) for t in tree_leaves((args, kwargs)) if isinstance(t, Tensor) for d in t.shape)
                 shape = f"{entry}|{dims}"
                 self.native.fill(model.id, _fill(model.fill))
-                p = _Pass(r.native.pass_(model.id, shape, *_torch(self)), shape)
+                p = _Pass(r.native.pass_(model.id, shape, *_torch(self)), model.id, shape)
                 self._cap()
                 p.entered = sys.exc_info()[1]
                 if self.cuda:
@@ -421,7 +424,8 @@ class Memory:
                 return  # torch runs this hook in its handler of the forward's raise: unended, it records nothing
             if self.cuda:
                 _fold(p, self.device)
-            p.native.end(p.peak, max(p.reserved_peak - p.peak, 0), list(p.sites.items()), *_torch(self))
+            sites = [(name, peak, collective) for name, (peak, collective) in p.sites.items()]
+            p.native.end(p.peak, max(p.reserved_peak - p.peak, 0), sites, *_torch(self))
 
     # -- blocks
 
@@ -478,7 +482,7 @@ class Request:
     def oom(self, need: int | None = None, site: str | None = None, collective: bool = False) -> Next:
         """An op ran out of memory: varena's answer, with torch's cap applied after it. A
         `collective` site's finer level waits for the next pass's agreement."""
-        answer = self.native.oom(*_torch(self.memory), need, site, collective)
+        answer = self.native.oom(_open_pass().set, *_torch(self.memory), need, site, collective)
         self.memory._cap()
         return answer
 
@@ -488,21 +492,31 @@ class Request:
 
     def cut(self, site: str) -> int:
         """The current pass's level for cut site `site` (0: whole)."""
-        return self.native.cut(site)
+        return self.native.cut(_open_pass().set, site)
 
     def levels(self) -> list[tuple[str, int]]:
         """The current pass's proposed `(site, level)` for its collective cut sites; the group
         agrees them (cozy-runtime's all-reduce) and hands them to `agree` before any exchange."""
-        return self.native.levels()
+        return _open_pass().native.levels()
 
     def agree(self, levels: list[tuple[str, int]]) -> None:
         """The levels every rank uses for the current pass's collective sites."""
-        self.native.agree(levels)
+        _open_pass().native.agree(levels)
+
+    def measured(self) -> bool:
+        """Whether the current pass's room came from a measurement (False with no pass open)."""
+        p = _pass.get()
+        return p is not None and p.native.measured()
+
+    def yielding(self) -> Yielded:
+        """`with r.yielding():` while the request waits on a child call: its room goes back
+        until the wait ends."""
+        return self.native.yielding()
 
     @contextmanager
-    def site(self, name: str) -> Iterator[None]:
-        """Measures cut site `name`'s op: its allocated peak goes into the open pass's sites and
-        its peak."""
+    def site(self, name: str, collective: bool = False) -> Iterator[None]:
+        """Measures cut site `name`'s op (a `collective`'s: its levels are agreed per pass): its
+        allocated peak goes into the open pass's sites and its peak."""
         p = _pass.get()
         if p is None or not self.memory.cuda:
             yield
@@ -516,7 +530,7 @@ class Request:
         finally:
             _fold(p, device)
             p.open.remove(entry)
-            p.sites[name] = max(p.sites.get(name, 0), entry[1])  # type: ignore[call-overload]
+            p.sites[name] = (max(p.sites.get(name, (0, collective))[0], entry[1]), collective)  # type: ignore[call-overload]
 
     def stats(self) -> Stats:
         return self.ended if self.ended is not None else self.native.stats()
@@ -542,6 +556,14 @@ def _torch(memory: Memory) -> tuple[int, int]:
     if not memory.cuda:
         return 0, 0
     return torch.cuda.memory_allocated(memory.device), torch.cuda.memory_reserved(memory.device)
+
+
+def _open_pass() -> _Pass:
+    """The pass the calling op runs in."""
+    p = _pass.get()
+    if p is None:
+        raise Unbound("no pass is open here: a loaded model's forward opens one")
+    return p
 
 
 def _fill(fill: Filling | None) -> Fill:

@@ -214,13 +214,20 @@ def main() -> int:
         run(mem, unet, reference[:1], "held", SAME)
     check("hold: released, placeholders are back", isinstance(unet.down_blocks[0].attentions[0].proj_in.weight, Placeholder))
     keys: list[str] = []
-    probe = unet.conv_in.register_forward_pre_hook(lambda *_: keys.append(adapter._pass.get().shape))
-    with mem.request("entries", plan=[unet, unet]):
-        x, _ = inputs(mem.device, 0)
+    measured: list[bool] = []
+    with mem.request("entries", plan=[unet, unet]) as r:
+        def seen(*_: object) -> None:
+            keys.append(adapter._pass.get().shape)
+            measured.append(r.measured())
+
+        probe = unet.conv_in.register_forward_pre_hook(seen)
+        with r.yielding():  # a wait on a child call gives the request's room back meanwhile
+            x, _ = inputs(mem.device, 0)
         with torch.no_grad():
             got = unet.conv_in(x).cpu()
         forward(unet, mem.device, 0)
     probe.remove()
+    check("entries: a new entry's room is estimated, a measured shape's is measured", measured == [False, True], measured)
     diff = (got - plain.conv_in(x.cpu()).detach()).abs().max().item()
     check(f"entries: a direct child's forward runs bound (max diff {diff:.2e})", diff <= ACROSS, diff)
     check("entries: each entry is its own pass key", len(keys) == 2 and keys[0].startswith("conv_in|") and keys[1].startswith("|"), keys)

@@ -14,7 +14,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use tensorfs::format::Body;
 use varena::layout::Layout;
-use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Measured, Memory, Next, Origin, Pass, Pin, Plan, Request, SetId, SetSpec, Site, Step, Torch};
+use varena::{Backend, CudaBackend, Error, Fill, Fingerprint, GpuId, Grant, HostBackend, Level, Measured, Memory, Next, Origin, Pass, Pin, Plan, Request, SetId, SetSpec, Site, SitePeak, Step, Torch, Yielded};
 
 use crate::store::PyCheckpoint;
 
@@ -447,7 +447,7 @@ impl PyMemory {
     /// The allocator's trim (torch's `empty_cache`), returning the bytes it freed: a demand
     /// trims before it evicts anything.
     fn trim_with(&self, py: Python<'_>, trim: Py<PyAny>) -> PyResult<()> {
-        let trim = Box::new(move || Python::try_attach(|py| call(py, &trim, ())).unwrap_or(0));
+        let trim = move || Python::try_attach(|py| call(py, &trim, ())).unwrap_or(0);
         done(py, &self.gpu.uuid, || self.memory().trim_with(trim))
     }
 
@@ -459,7 +459,7 @@ impl PyMemory {
 
     /// Bytes the caller holds that `shrink(want) -> freed` gives back; returns its id.
     fn cache(&self, py: Python<'_>, owner: &str, shrink: Py<PyAny>) -> PyResult<u32> {
-        let shrink = Box::new(move |want: u64| Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0));
+        let shrink = move |want: u64| Python::try_attach(|py| call(py, &shrink, (want,))).unwrap_or(0);
         detached(py, &self.gpu.uuid, || Ok(self.memory().cache(owner, shrink))).map(|c| c.0)
     }
 
@@ -538,13 +538,15 @@ impl PyRequest {
         done(py, &self.gpu, || r.plan(steps(plan)))
     }
 
-    /// An op ran out of memory, `need` more bytes when known, at cut site `site` (None: the op
-    /// cannot be cut); a `collective` site's finer level waits for the next pass's agreement.
-    #[pyo3(signature = (allocated, reserved, need = None, site = None, collective = false))]
-    fn oom(&self, py: Python<'_>, allocated: u64, reserved: u64, need: Option<u64>, site: Option<&str>, collective: bool) -> PyResult<PyNext> {
+    /// An op of `set`'s pass ran out of memory, `need` more bytes when known, at cut site `site`
+    /// (None: the op cannot be cut), with torch's bytes now; a `collective` site's finer level
+    /// waits for the next pass's agreement.
+    #[pyo3(signature = (set, allocated, reserved, need = None, site = None, collective = false))]
+    #[allow(clippy::too_many_arguments)]
+    fn oom(&self, py: Python<'_>, set: u32, allocated: u64, reserved: u64, need: Option<u64>, site: Option<&str>, collective: bool) -> PyResult<PyNext> {
         let r = self.get(py)?;
         let site = site.map(|name| Site { name, collective });
-        Ok(match detached(py, &self.gpu, || Ok(r.oom(need, site, Torch { allocated, reserved })))? {
+        Ok(match detached(py, &self.gpu, || Ok(r.oom(SetId(set), need, site, Torch { allocated, reserved })))? {
             Next::Retry => PyNext::Retry(),
             Next::Cut(level) => PyNext::Cut { level },
             Next::Park(budget) => PyNext::Park { budget },
@@ -558,23 +560,17 @@ impl PyRequest {
         done(py, &self.gpu, || r.parked(nbytes))
     }
 
-    /// The current pass's collective sites' proposed `(site, level)`: the level in effect, or a
-    /// finer one an OOM proposed.
-    fn levels(&self, py: Python<'_>) -> PyResult<Vec<(String, u32)>> {
+    /// The cut level of `set`'s current pass for op site `site` (0: whole).
+    fn cut(&self, py: Python<'_>, set: u32, site: &str) -> PyResult<u32> {
         let r = self.get(py)?;
-        detached(py, &self.gpu, || Ok(r.levels()))
+        detached(py, &self.gpu, || Ok(r.cut(SetId(set), site)))
     }
 
-    /// The levels the ranks agreed (the maximum of their proposals), in effect for the current pass.
-    fn agree(&self, py: Python<'_>, levels: Vec<(String, u32)>) -> PyResult<()> {
+    /// The request waits on a child call: until the guard ends it gives back its reserved room
+    /// and its step's pages may be asked for; ended, it takes its room back.
+    fn yielding(&self, py: Python<'_>) -> PyResult<PyYielded> {
         let r = self.get(py)?;
-        done(py, &self.gpu, || r.agree(levels))
-    }
-
-    /// The current pass's cut level for op site `site` (0: whole).
-    fn cut(&self, py: Python<'_>, site: &str) -> PyResult<u32> {
-        let r = self.get(py)?;
-        detached(py, &self.gpu, || Ok(r.cut(site)))
+        Ok(PyYielded(Mutex::new(Some(detached(py, &self.gpu, || Ok(r.yielding()))?))))
     }
 
     fn stats(&self, py: Python<'_>) -> PyResult<PyStats> {
@@ -605,13 +601,64 @@ impl Drop for PyPass {
     }
 }
 
+impl PyPass {
+    /// `f` on the open pass, off the GIL.
+    fn with<T: Send>(&self, py: Python<'_>, f: impl Send + FnOnce(&Pass) -> T) -> PyResult<T> {
+        let guard = lock(&self.0);
+        let pass = guard.as_ref().ok_or_else(|| error(py, "", Error::Closed("pass ended".into())))?;
+        detached(py, "", || Ok(f(pass)))
+    }
+}
+
 #[pymethods]
 impl PyPass {
     /// torch's allocated peak (absolute), the allocator's slack at it and each cut site's own
-    /// allocated peak; then torch's bytes now.
-    fn end(&self, py: Python<'_>, allocated_peak: u64, slack: u64, sites: Vec<(String, u64)>, allocated: u64, reserved: u64) -> PyResult<()> {
+    /// `(name, allocated peak, collective)`; then torch's bytes now.
+    fn end(&self, py: Python<'_>, allocated_peak: u64, slack: u64, sites: Vec<(String, u64, bool)>, allocated: u64, reserved: u64) -> PyResult<()> {
         let Some(pass) = lock(&self.0).take() else { return Ok(()) };
+        let sites = sites.into_iter().map(|(name, peak, collective)| SitePeak { name, peak, collective }).collect();
         done(py, "", || pass.end(Measured { allocated_peak, slack, sites }, Torch { allocated, reserved }))
+    }
+
+    /// Whether its room is the one measured for its set, shape and cut levels.
+    fn measured(&self, py: Python<'_>) -> PyResult<bool> {
+        self.with(py, Pass::measured)
+    }
+
+    /// Its collective sites' proposed `(site, level)`, for the ranks to agree before any exchange.
+    fn levels(&self, py: Python<'_>) -> PyResult<Vec<(String, u32)>> {
+        self.with(py, Pass::levels)
+    }
+
+    /// The levels the ranks agreed (the maximum of their proposals): in effect for this pass.
+    fn agree(&self, py: Python<'_>, levels: Vec<(String, u32)>) -> PyResult<()> {
+        self.with(py, |p| p.agree(levels))
+    }
+}
+
+/// A request waiting on a child call (`Request.yielding`); its end, or leaving its `with`, ends the wait.
+#[pyclass(name = "Yielded", module = "tensorfs.varena", frozen)]
+pub struct PyYielded(Mutex<Option<Yielded>>);
+
+impl Drop for PyYielded {
+    fn drop(&mut self) {
+        release(lock(&self.0).take());
+    }
+}
+
+#[pymethods]
+impl PyYielded {
+    fn end(&self) {
+        release(lock(&self.0).take());
+    }
+
+    fn __enter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (*_exc))]
+    fn __exit__(&self, _exc: &Bound<'_, pyo3::types::PyTuple>) {
+        self.end();
     }
 }
 
@@ -777,6 +824,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMemory>()?;
     m.add_class::<PyRequest>()?;
     m.add_class::<PyPass>()?;
+    m.add_class::<PyYielded>()?;
     m.add_class::<PyPin>()?;
     m.add_class::<PyNext>()?;
     m.add_class::<PyFills>()?;
