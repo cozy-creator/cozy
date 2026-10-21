@@ -381,7 +381,7 @@ async fn invoke(
         attention_kernel: args.attention_kernel.as_deref().unwrap_or_default(),
     };
     let out = args.out.map(|dir| terms.cwd.join(dir));
-    gpuless(ctx, &on, callable, &target, bits).await;
+    gpuless(ctx, &on, &card.interface, callable, &target, bits).await;
     let submission = call.submission(on, &hub.origin, &call.spec(&bound)?, Some(&bound), out);
     send(ctx, submission, &terms.key, args.detach).await
 }
@@ -457,9 +457,16 @@ async fn send(ctx: &Context, submission: SubmitRun, key: &str, detach: bool) -> 
 /// Warns that a run sent to a ready machine with no supported GPU runs on its CPU (a GPU
 /// function slowly) and that its models take their 16-bit lanes whatever `--bits` asked (a CPU
 /// runs no 8- or 4-bit format), and how to rent one instead.
-pub(crate) async fn gpuless(ctx: &Context, on: &On, callable: &Callable, target: &str, bits: u32) {
+pub(crate) async fn gpuless(
+    ctx: &Context,
+    on: &On,
+    interface: &Interface,
+    callable: &Callable,
+    target: &str,
+    bits: u32,
+) {
     let On::Machine(name) = on else { return };
-    let (slow, narrow) = (callable.accelerator != Some(false), matches!(bits, 4 | 8));
+    let (slow, narrow) = (interface.gpu(callable), matches!(bits, 4 | 8));
     if !slow && !narrow {
         return;
     }
@@ -603,22 +610,23 @@ fn quoted(input: &str) -> String {
 fn functions(ctx: &Context, package: &str, resolved: &Resolved) {
     let from = resolved.from.to_string();
     let card = &resolved.card;
-    functions_of(ctx, package, &card.release, Some(&from), &card.interface);
+    functions_of(ctx, package, (&card.release, card.summary()), Some(&from), &card.interface);
 }
 
 /// A package's public functions, and where each runs.
 fn functions_of(
     ctx: &Context,
     package: &str,
-    release: &str,
+    (release, summary): (&str, &str),
     from: Option<&str>,
     interface: &Interface,
 ) {
     let public = interface.public();
     let callable = |name: &str| interface.callables.iter().find(|c| c.name == name);
-    let runs_on = |name: &str| match callable(name).is_some_and(|c| c.accelerator == Some(false)) {
-        true => "CPU",
-        false => "GPU",
+    let runs_on = |name: &str| match callable(name) {
+        Some(c) if interface.orchestrates(c) => "GPU, through its calls",
+        Some(c) if c.accelerator == Some(false) => "CPU",
+        _ => "GPU",
     };
     let conversion = |name: &&str| callable(name).is_some_and(Callable::is_conversion);
     if ctx.json {
@@ -626,7 +634,8 @@ fn functions_of(
             .map(|name| serde_json::json!({"function": name, "runs_on": runs_on(name), "conversion": conversion(name)}))
             .collect();
         output::json(&serde_json::json!({
-            "package": package, "release": release, "release_from": from, "functions": rows,
+            "package": package, "release": release, "release_from": from, "summary": summary,
+            "functions": rows,
         }));
         return;
     }
@@ -644,7 +653,11 @@ fn functions_of(
         table = table.note(format!("for model authors: {} (conversions)", conversions.join(", ")));
     }
     let from = from.map(|from| format!(" ({from})")).unwrap_or_default();
-    table.note(format!("{package} {release}{from}")).print();
+    let summary = match summary.is_empty() {
+        true => String::new(),
+        false => format!(": {summary}"),
+    };
+    table.note(format!("{package} {release}{from}{summary}")).print();
     let next: Vec<String> = public
         .iter()
         .take(2)
