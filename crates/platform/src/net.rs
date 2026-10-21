@@ -27,3 +27,14 @@ pub fn listen(address: SocketAddr) -> io::Result<TcpListener> {
     #[cfg(not(windows))]
     TcpListener::bind(address)
 }
+
+#[cfg(all(test, windows))]
+mod tests {
+    #[test]
+    fn a_reusing_socket_cannot_take_a_listened_port() {
+        let ours = super::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+        let thief = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        thief.set_reuse_address(true).unwrap();
+        assert!(thief.bind(&ours.local_addr().unwrap().into()).is_err());
+    }
+}

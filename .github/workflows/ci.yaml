@@ -46,7 +46,7 @@ jobs:
       build: none
       test: cargo test --workspace --locked --no-fail-fast --exclude cozy --exclude calcifer --exclude tensord
 
-  # TensorD's and TensorFS's suites on Windows (xs-061), with the Runtime above and this ref's TensorFS.
+  # platform's, TensorD's and TensorFS's suites on Windows (xs-061), with the Runtime above and this ref's TensorFS.
   windows:
     runs-on: windows-2025
     # Hang bound, not a work budget.
@@ -73,7 +73,7 @@ jobs:
           (cd crates/tensorfs-py && uvx maturin@1.15.0 build --release --out "$RUNNER_TEMP/tensorfs")
           echo "COZY_TEST_RUNTIME_WHEEL=$(ls "$RUNNER_TEMP"/runtime/cozy_runtime-*.whl)" >> "$GITHUB_ENV"
           echo "COZY_TEST_TENSORFS_WHEEL=$(ls "$RUNNER_TEMP"/tensorfs/tensorfs-*.whl)" >> "$GITHUB_ENV"
-      - run: cargo test -p tensord -p tensorfs --locked --no-fail-fast
+      - run: cargo test -p platform -p tensord -p tensorfs --locked --no-fail-fast
 
   owner-day:
     if: github.event_name == 'push'
