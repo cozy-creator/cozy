@@ -262,7 +262,8 @@ def child(store: str, table: str, capacity: int, reference: str) -> int:
     varena keeps over another process's idle pages (N): the idle first gives room."""
     _, ck = build(Path(store))
     mem = opened(table, capacity)
-    stats, _ = run(mem, loaded(ck, mem), torch.load(reference), "child", SAME)
+    # A set of its own: the first's kept pages of the same set would be imported, shared, not made room for.
+    stats, _ = run(mem, loaded(ck, mem, release="child"), torch.load(reference), "child", SAME)
     print(json.dumps({"child origins": [r.origin for r in stats.trace], "evicted": stats.evicted}), flush=True)
     return 0 if all(results) else 1
 
