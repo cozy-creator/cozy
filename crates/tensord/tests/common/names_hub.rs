@@ -4,11 +4,13 @@
 //! layout TensorFS's own `upload_tree` wrote, `GET /refs/<org>/<name>.json` and `GET`/`HEAD
 //! /blobs/…`, each blob GET redirected to another origin (`/o/<sha>` at `localhost`), as the Hub
 //! redirects to storage. Anonymous callers see releases (public tags) and their closures; the
-//! owner's bearer ([`OWNER`], or those [`admit`] names) sees private tags (`main`) too; any other
+//! owner's bearer ([`OWNER`], or those [`admit`] names) sees private tags (`main`) too and uploads
+//! (`PUT` of blobs and conditional refs, as TensorFS's `upload_tree` sends them); any other
 //! credential is 401.
 //! It records every request.
 #![allow(dead_code)]
 use axum::{
+    body::Bytes,
     extract::State,
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
@@ -265,7 +267,7 @@ fn ranged(bytes: &[u8], headers: &HeaderMap) -> Response {
     }
 }
 
-async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, headers: HeaderMap) -> Response {
+async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let path = uri.path().to_string();
     let presented = headers.get("authorization").and_then(|v| v.to_str().ok());
     let admitted = ADMITTED.lock().unwrap().get(&served.origin).cloned().unwrap_or_else(|| vec![OWNER.into()]);
@@ -334,6 +336,22 @@ async fn answer(State(served): State<Arc<Served>>, method: Method, uri: Uri, hea
             ([("content-type", "text/html")], page.unwrap()).into_response()
         }
         (Method::GET, _) if door.is_some() => ranged(door.unwrap().2, &headers),
+        // The owner's upload: an object once, then its repo document while it is as last read.
+        (Method::PUT, p) if owner && (p.starts_with("/blobs/") || p.starts_with("/refs/")) => {
+            let file = served.layout.join(&p[1..]);
+            if p.starts_with("/refs/") {
+                let now = std::fs::read(&file).ok().map(|bytes| Repo::from_json(&bytes).unwrap().to_json().unwrap());
+                let etag = now.map(|bytes| format!("\"sha256:{}\"", tensorfs::sha256::hex_digest(&bytes)));
+                let asked = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+                if asked("if-match").is_some_and(|tag| Some(tag) != etag.as_deref()) || (asked("if-none-match").is_some() && etag.is_some()) {
+                    return StatusCode::PRECONDITION_FAILED.into_response();
+                }
+                Repo::from_json(&body).unwrap();
+            }
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, &body).unwrap();
+            StatusCode::NO_CONTENT.into_response()
+        }
         (Method::GET, p) if p.starts_with("/refs/") => {
             let Ok(bytes) = std::fs::read(served.layout.join(&p[1..])) else {
                 return absent();
