@@ -4,7 +4,7 @@
 //! essential one is a refusal naming its install. Probes read no environment: the caller hands in
 //! PATH.
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::Command,
     sync::{Mutex, PoisonError},
@@ -249,6 +249,23 @@ pub fn uv_build() -> Option<Archive> {
 /// The pinned uv's directory under `tools`.
 pub fn uv_dir(tools: &Path) -> PathBuf {
     tools.join("uv").join(UV_VERSION)
+}
+
+/// Where an owner's uv keeps its cache and managed Pythons, as uv resolves them from the owner's
+/// environment `env`: its own variables, else XDG under `HOME`, else (Windows) `LOCALAPPDATA` and
+/// `APPDATA`. Relative values count for nothing.
+pub fn uv_owner_dirs(env: &BTreeMap<String, String>) -> Option<(PathBuf, PathBuf)> {
+    let path = |name: &str| env.get(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    let (cache, python) = if cfg!(windows) {
+        let cache = path("LOCALAPPDATA").map(|dir| dir.join("uv").join("cache"));
+        (cache, path("APPDATA").map(|dir| dir.join("uv").join("data").join("python")))
+    } else {
+        let home = path("HOME");
+        let base = |xdg: &str, default: &str| path(xdg).or_else(|| home.as_ref().map(|h| h.join(default)));
+        let python = base("XDG_DATA_HOME", ".local/share").map(|dir| dir.join("uv").join("python"));
+        (base("XDG_CACHE_HOME", ".cache").map(|dir| dir.join("uv")), python)
+    };
+    Some((path("UV_CACHE_DIR").or(cache)?, path("UV_PYTHON_INSTALL_DIR").or(python)?))
 }
 
 /// The pinned uv in `tools`, else uv on `path`.

@@ -71,7 +71,7 @@ print(json.dumps({"identity": generation.identity}))
         let out = std::env::temp_dir().join(format!("tensord-durable-lifecycle-{}", uuid::Uuid::new_v4()));
         let output = Command::new("uv")
             .current_dir(repo)
-            .args(["run", "--locked", "--extra", "test", "python", "-c", INSTALL])
+            .args(["run", "--locked", "--extra", "installer", "python", "-c", INSTALL])
             .arg(repo.join("tests/fixtures/cpu_lifecycle"))
             .arg(&out)
             // The named Runtime, as a machine runs it.

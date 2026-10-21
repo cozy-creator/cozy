@@ -60,7 +60,7 @@ pub struct PackageSdk {
 }
 
 /// Where uv keeps its cache and managed Pythons for the owner whose environment `env` is: as
-/// uv itself resolves them (its variables, then XDG, then the home directory's defaults).
+/// uv itself resolves them (`platform::tools::uv_owner_dirs`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnerUv {
     pub cache: PathBuf,
@@ -69,13 +69,8 @@ pub struct OwnerUv {
 
 impl OwnerUv {
     pub fn of(env: &BTreeMap<String, String>) -> Option<Self> {
-        let path = |name: &str| env.get(name).map(PathBuf::from).filter(|p| p.is_absolute());
-        let home = path("HOME");
-        let base = |xdg: &str, default: &str| path(xdg).or_else(|| home.as_ref().map(|h| h.join(default)));
-        Some(Self {
-            cache: path("UV_CACHE_DIR").or_else(|| Some(base("XDG_CACHE_HOME", ".cache")?.join("uv")))?,
-            python: path("UV_PYTHON_INSTALL_DIR").or_else(|| Some(base("XDG_DATA_HOME", ".local/share")?.join("uv/python")))?,
-        })
+        let (cache, python) = platform::tools::uv_owner_dirs(env)?;
+        Some(Self { cache, python })
     }
 }
 
@@ -2439,16 +2434,25 @@ pub(crate) mod tests {
         fs::create_dir_all(&wheels).unwrap();
         let wheel = tiny_wheel(&wheels, "takes-any", "1.0", &[]);
         let (pyproject, lock) = locked(&root.join("project"), &["takes-any"], &wheels, "");
-        let owner = OwnerUv::of(&BTreeMap::from([("HOME".into(), root.join("home").display().to_string())])).unwrap();
-        assert_eq!(owner, OwnerUv { cache: root.join("home/.cache/uv"), python: root.join("home/.local/share/uv/python") });
-        let named = BTreeMap::from([("HOME".into(), "/h".into()), ("XDG_CACHE_HOME".into(), "/x".into()),
-            ("XDG_DATA_HOME".into(), "relative".into()), ("UV_PYTHON_INSTALL_DIR".into(), "/p".into())]);
-        assert_eq!(OwnerUv::of(&named), Some(OwnerUv { cache: "/x/uv".into(), python: "/p".into() }));
+        // As uv itself answers for an owner's environment, defaults and named directories alike.
+        let at = |dir: &str| root.join(dir).display().to_string();
+        let defaults = BTreeMap::from([("HOME", at("home")), ("LOCALAPPDATA", at("local")), ("APPDATA", at("roaming"))]);
+        let named = BTreeMap::from([("HOME", at("home")), ("XDG_CACHE_HOME", at("x")), ("XDG_DATA_HOME", "relative".into()),
+            ("UV_CACHE_DIR", at("c")), ("UV_PYTHON_INSTALL_DIR", at("p"))]);
+        for env in [&defaults, &named] {
+            let asked = |what: &str| {
+                let out = Command::new("uv").args([what, "dir"]).env_clear().envs(env).output().unwrap();
+                PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
+            };
+            let env: BTreeMap<String, String> = env.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            assert_eq!(OwnerUv::of(&env), Some(OwnerUv { cache: asked("cache"), python: asked("python") }), "{env:?}");
+        }
+        let owner = OwnerUv::of(&defaults.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()).unwrap();
         // The owner's own install fills the cache; then the wheel's file goes.
         let seeded = root.join("seeded");
         for args in [
             vec!["venv", "-q", "--python", "3.12", seeded.to_str().unwrap()],
-            vec!["pip", "install", "-q", "--python", seeded.join("bin/python").to_str().unwrap(), "--no-index",
+            vec!["pip", "install", "-q", "--python", platform::paths::venv_python(&seeded).to_str().unwrap(), "--no-index",
                 "--find-links", wheels.to_str().unwrap(), "takes-any"],
         ] {
             assert!(Command::new("uv").args(&args).env("UV_CACHE_DIR", &owner.cache).status().unwrap().success(), "{args:?}");

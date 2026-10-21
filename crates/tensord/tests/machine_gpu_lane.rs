@@ -167,7 +167,8 @@ async fn a_call_that_ignores_its_cancel_is_killed_and_its_gpu_serves_the_next_ru
     let pid = pid.unwrap_or_else(|| panic!("the stubborn call ended before it ran: {outcome:?}"));
     assert_eq!(outcome.status, "canceled", "{outcome:?}");
     assert!(lines.iter().any(|l| l.contains("it did not stop for its cancel")), "{lines:?}");
-    assert!(!Path::new(&format!("/proc/{pid}")).exists(), "the stubborn executor still runs");
+    let gone = platform::process::Birth::of(pid as u32).and_then(|birth| birth.ended()).unwrap_or(true);
+    assert!(gone, "the stubborn executor still runs");
     // Its GPU is free: the next call takes it.
     assert_eq!(devices(&run(&client, &manifest, "after", 0).await), "0");
 }

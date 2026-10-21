@@ -611,7 +611,7 @@ mod tests {
             })
             .clone();
         let helper = run(Command::new("uv").current_dir(repo).args([
-            "run", "--locked", "--extra", "test", "python", "-c", "import sys; print(sys.executable)",
+            "run", "--locked", "--extra", "installer", "python", "-c", "import sys; print(sys.executable)",
         ]));
         let state = root.join("state");
         let service = Service::open(&state, &root.join("generations"), 1).unwrap();

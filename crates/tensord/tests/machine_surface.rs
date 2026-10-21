@@ -155,7 +155,7 @@ print(json.dumps({"identity": generation.identity}))
     let output = Command::new("uv")
         .current_dir(repo)
         .args([
-            "run", "--locked", "--extra", "test", "python", "-c", INSTALL,
+            "run", "--locked", "--extra", "installer", "python", "-c", INSTALL,
         ])
         .arg(repo.join("tests/fixtures/cpu_classifier"))
         .arg(state)

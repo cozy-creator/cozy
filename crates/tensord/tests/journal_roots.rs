@@ -54,7 +54,7 @@ fn tools(root: &Path) -> Tools {
         .success());
     let helper = Command::new("uv")
         .current_dir(repo)
-        .args(["run", "--locked", "--extra", "test", "python", "-c", "import sys; print(sys.executable)"])
+        .args(["run", "--locked", "--extra", "installer", "python", "-c", "import sys; print(sys.executable)"])
         .output()
         .unwrap();
     let client = fs::read_dir(root.join("client"))
