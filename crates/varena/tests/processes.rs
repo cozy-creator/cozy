@@ -17,6 +17,9 @@ use varena::{Access, Backend, Event, Fill, Fingerprint, GpuId, HostBackend, Leve
 
 const MB: u64 = 1 << 20;
 
+/// The tables the running case made: removed when it ends, passed or failed.
+static TABLES: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -67,7 +70,9 @@ fn main() {
         std::fs::create_dir(&path).unwrap();
         print!("test {name} ... ");
         std::io::stdout().flush().unwrap();
-        match std::panic::catch_unwind(|| case(&path)) {
+        let outcome = std::panic::catch_unwind(|| case(&path));
+        TABLES.lock().drain(..).for_each(|t| varena::os::remove_table(&t));
+        match outcome {
             Ok(()) => println!("ok"),
             Err(_) => {
                 println!("FAILED");
@@ -82,7 +87,9 @@ fn main() {
 }
 
 fn gpu(case: &str, memory: u64) -> GpuId {
-    GpuId { uuid: format!("t{}-{case}", std::process::id()), model: "host".into(), memory }
+    let uuid = format!("t{}-{case}", std::process::id());
+    TABLES.lock().push(uuid.clone());
+    GpuId { uuid, model: "host".into(), memory }
 }
 
 /// A byte of set `seed`'s file at `offset`.
@@ -469,6 +476,16 @@ impl Agent {
     fn exit(mut self) {
         self.ok("exit");
         assert!(self.child.wait().unwrap().success());
+    }
+}
+
+impl Drop for Agent {
+    /// A case that failed leaves no child holding its rows.
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
