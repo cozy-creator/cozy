@@ -1,13 +1,14 @@
 //! varena: the memory of the processes computing with model weights (design `varena-slim.md`).
 //!
 //! [`table`] holds one process's facts and [`decide`] is the one pure decision procedure over
-//! them; [`Memory`] applies its actions in an executor over a [`Backend`] (CUDA VMM, or host
-//! pages). [`Ledger`] is the GPU's shared table, run by TensorD or opened by name by a
+//! them; [`Memory`] applies its actions in an executor over a [`Backend`] ([`CudaBackend`], or
+//! host pages). [`Ledger`] is the GPU's shared table, run by TensorD or opened by name by a
 //! standalone engine; [`custody`] keeps filled pages across a process's death; [`Tier`] is the
 //! machine's RAM tier. TensorFS's `io` moves every byte.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 pub mod backend;
+pub mod cuda;
 pub mod custody;
 pub mod decide;
 #[cfg(feature = "faults")]
@@ -20,6 +21,7 @@ pub mod table;
 pub mod tier;
 
 pub use backend::{Access, Backend, Event, HostBackend, Physical, Va};
+pub use cuda::CudaBackend;
 pub use ledger::{Grant, Ledger, Peak, RowStatus, Status};
 pub use memory::{CacheId, Fills, Measured, Memory, Moved, Next, Origin, Pass, Pin, Ref, Request, SetId, Site, Stats, StepStats, Torch};
 pub use table::{Fill, Fingerprint, Level, PartId, Plan, SetSpec, Step};
