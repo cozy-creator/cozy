@@ -555,6 +555,53 @@ fn fills_are_reported_against_the_measured_ceiling() {
     println!("PASS fills reported against the measured ceiling {uuid}");
 }
 
+/// A RAM fill read again. Unregistered, TensorFS's engine stages a range's first read, then
+/// registers it for the length of each later read (cuMemHostRegister, then cuMemHostUnregister as
+/// the read ends): every reuse pays the registration. Registered once by its owner through
+/// `Backend::register_host` (as the executor does when it maps a RAM-tier layout), every read
+/// copies directly. Rates are reported as % of TensorFS's measured H2D ceiling.
+#[test]
+#[ignore = "native GPU: a rental only"]
+fn a_registered_host_range_fills_directly_every_time() {
+    let (b, uuid) = gpu();
+    let (h2d, _) = io::metrics::h2d(0).unwrap();
+    let len = (1u64 << 30).next_multiple_of(b.granularity());
+    let data = pattern(len, 9);
+    let va = b.reserve(len).unwrap();
+    let page = b.create(len).unwrap();
+    b.map(va, 0, &page, Access::ReadWrite).unwrap();
+    let mut rows = vec![];
+    let mut read = |what: &str| -> (f64, u64, u64) {
+        io::metrics::take();
+        // SAFETY: the mapping is ours and writable; `data` outlives the read.
+        unsafe { io::read(&[Copy { src: Src::Host(data.as_ptr()), dst: b.target(va, 0, len) }], &ReadOpts::default()) }.unwrap();
+        let runs: Vec<_> = io::metrics::take().into_iter().filter(|c| c.kind == "h2d").collect();
+        let sum = |f: fn(&io::metrics::Copy) -> u64| runs.iter().map(f).sum::<u64>();
+        let gbps = sum(|c| c.bytes) as f64 / sum(|c| c.ns).max(1) as f64;
+        let (pin, staged) = (sum(|c| c.pin_ns), sum(|c| c.staged));
+        rows.push(format!("{what} {gbps:.2} GB/s = {:.0}% (pin {:.0} ms, staged {} MiB)", 100.0 * gbps / h2d, pin as f64 / 1e6, staged >> 20));
+        (gbps, pin, staged)
+    };
+    read("unregistered 1");
+    let (again, ..) = read("unregistered 2");
+    read("unregistered 3");
+    // SAFETY: `data` stays mapped until it is unregistered below.
+    unsafe { b.register_host(data.as_ptr(), len) }.unwrap();
+    let first = read("registered 1");
+    let second = read("registered 2");
+    b.unregister_host(data.as_ptr()).unwrap();
+    assert_eq!(bytes(va.base, len, 0), data);
+    b.unmap(va, 0, len).unwrap();
+    b.destroy(page);
+    b.release(va);
+    println!("REUSE of {h2d:.2} GB/s: {}", rows.join("; "));
+    for (gbps, pin, staged) in [first, second] {
+        assert_eq!((pin, staged), (0, 0), "a registered range copies directly, never staged or pinned per read");
+        assert!(gbps > again, "a registered read beats an unregistered reuse ({gbps:.2} vs {again:.2} GB/s)");
+    }
+    println!("PASS a registered host range fills directly every time (second {:.0}% vs first {:.0}%) {uuid}", 100.0 * second.0 / h2d, 100.0 * first.0 / h2d);
+}
+
 // ---- Memory over the CUDA backend
 
 /// The run's GPU under a name of this case's own, so its table, custody and kept pages are the
