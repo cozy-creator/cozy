@@ -32,7 +32,7 @@ fn main() {
     }
     let filter: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with('-')).collect();
     type Case = (&'static str, fn(&Path));
-    let cases: [Case; 13] = [
+    let cases: [Case; 14] = [
         ("an_idle_holder_answers_an_ask", an_idle_holder_answers_an_ask),
         ("a_killed_holder_leaves_orphans_a_successor_imports", a_killed_holder_leaves_orphans_a_successor_imports),
         ("a_failed_request_frees_everything", a_failed_request_frees_everything),
@@ -46,6 +46,7 @@ fn main() {
         ("a_stale_reader_never_frees_a_newer_row", a_stale_reader_never_frees_a_newer_row),
         ("the_tier_takes_back_a_pinned_layout", the_tier_takes_back_a_pinned_layout),
         ("a_joint_step_runs_a_pass_per_set", a_joint_step_runs_a_pass_per_set),
+        ("a_child_runs_while_its_parent_yields", a_child_runs_while_its_parent_yields),
     ];
     let dir = tempfile::tempdir().unwrap();
     let mut failed = vec![];
@@ -126,6 +127,7 @@ fn agent() {
     let mut requests: HashMap<String, Request> = HashMap::new();
     let mut passes: HashMap<String, Pass> = HashMap::new();
     let mut pins: Vec<Pin> = vec![];
+    let mut yielded: HashMap<String, varena::Yielded> = HashMap::new();
     let shrunk = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut out = std::io::stdout();
     for line in std::io::stdin().lock().lines() {
@@ -244,12 +246,20 @@ fn agent() {
                 pins.clear();
                 "ok".into()
             }
-            ["oom", req, need] => match requests[*req].oom(Some(need.parse().unwrap()), None, Torch::default()) {
+            ["oom", req, set, need] => match requests[*req].oom(sets[*set].0, Some(need.parse().unwrap()), None, Torch::default()) {
                 Next::Retry => "retry".into(),
                 Next::Cut(l) => format!("cut {l}"),
                 Next::Park(b) => format!("park {b}"),
                 Next::Exhausted(e) => format!("exhausted {} {}", e.stats.request, e.need),
             },
+            ["yield", req] => {
+                yielded.insert(req.to_string(), requests[*req].yielding());
+                "ok".into()
+            }
+            ["unyield", req] => {
+                yielded.remove(*req);
+                "ok".into()
+            }
             ["parked", req, bytes] => {
                 requests[*req].parked(bytes.parse().unwrap());
                 "ok".into()
@@ -441,10 +451,10 @@ fn a_failed_request_frees_everything(dir: &Path) {
     a.ok("bind f 1");
     // The free bytes are claimed once (the cap was stale); with every page pinned nothing else
     // frees: park (the host has headroom), and a park of nothing ends it.
-    assert_eq!(a.say("oom r1 67108864"), "retry");
-    assert!(a.say("oom r1 67108864").starts_with("park "));
+    assert_eq!(a.say("oom r1 f 67108864"), "retry");
+    assert!(a.say("oom r1 f 67108864").starts_with("park "));
     a.ok("parked r1 0");
-    assert!(a.say("oom r1 67108864").starts_with("exhausted r1"));
+    assert!(a.say("oom r1 f 67108864").starts_with("exhausted r1"));
     a.ok("cache r1 1048576");
     a.ok("unpin");
     assert!(a.ok("end r1").starts_with("leftover=0"));
@@ -535,6 +545,8 @@ fn the_tier_gives_back_in_order(dir: &Path) {
     }
     y.ok("request r l4;l4;l4;l3");
     y.ok("pass r l4 1x1");
+    // The executor tells the tier its next uses on its own thread.
+    tier.await_uses(|u| u.contains(&(digest("l4"), Some(0))) && u.contains(&(digest("l3"), Some(3))));
     let mut left = vec![digest("l1"), digest("l2"), digest("l3"), digest("l4")];
     assert_eq!(tier.held().into_iter().filter(|d| left.contains(d)).collect::<Vec<_>>(), left);
     for n in 1..=4 {
@@ -585,7 +597,8 @@ fn kept_pages_survive_a_holder_that_served(dir: &Path) {
 }
 
 /// Review 1, finding 2: an ask to a victim whose ask thread cannot run (stopped) waits on the
-/// victim itself: when it dies, the asker goes on, with no timer. TensorD sees it stalled.
+/// victim itself: when it dies, the asker goes on, with no timer. Review 2, finding 3: TensorD
+/// sees it stalled only while an ask is pending to it, and the ask is in the asker's own row.
 fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
     let g = gpu("stop", 8 * MB);
     let ledger = varena::Ledger::create(&g, None).unwrap();
@@ -611,7 +624,7 @@ fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
         libc::kill(pid, libc::SIGSTOP);
         libc::waitpid(pid, &mut status, libc::WUNTRACED);
     }
-    assert_eq!(ledger.stalled(), vec![pid as u32], "its ask thread is stopped: measured, not counted");
+    assert!(ledger.stalled().is_empty(), "stopped, but nobody asks it: not stalled");
     b.send("pass r vb 1x1");
     // The ask is a ledger event: wait for it, until the stopped victim's row is asked.
     let fd = std::os::fd::AsRawFd::as_raw_fd(ledger.events());
@@ -624,6 +637,7 @@ fn an_ask_to_a_stopped_victim_ends_when_it_dies(dir: &Path) {
             libc::read(fd, event.as_mut_ptr().cast(), 8);
         }
     }
+    assert_eq!(ledger.stalled(), vec![pid as u32], "asked and its ask thread stopped: measured, not counted");
     a.child.kill().unwrap();
     a.child.wait().unwrap();
     assert_eq!(b.reply(), "ok", "the asker went on when the victim died");
@@ -753,4 +767,46 @@ fn a_joint_step_runs_a_pass_per_set(dir: &Path) {
     let peaks = ledger.peaks();
     let peak = |set: &str| peaks.iter().find(|p| p.key.starts_with(&format!("{set}|"))).map(|p| p.bytes);
     assert_eq!((peak("ja"), peak("jb")), (Some(3 * MB), Some(5 * MB)), "{peaks:?}");
+}
+
+/// Round 2, finding 15 (S5): a request waiting on a child call yields its room and its step's
+/// pages: the child (parent W + child W > capacity) runs beside it, and the parent completes.
+fn a_child_runs_while_its_parent_yields(dir: &Path) {
+    let g = gpu("yield", 8 * MB);
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let (p_path, c_path) = (write_set(dir, "yp", 2), write_set(dir, "yc", 3));
+    let mut parent = Agent::granted(ledger.grant(0).unwrap());
+    let parent_pid = parent.ok(&format!("grant {} {}", g.uuid, g.memory));
+    parent.ok(&format!("load yp {} stored ram", p_path.display()));
+    parent.ok("request r yp");
+    parent.ok("pass r yp 1x1");
+    parent.ok("bind yp 0");
+    parent.ok("bind yp 1");
+    parent.ok("unpin");
+    let held = |pid: &str| ledger.status().rows.iter().find(|r| r.pid.to_string() == pid).map_or(0, |r| r.classes.iter().sum::<u64>());
+    assert_eq!(held(&parent_pid), 4 * MB);
+    // The parent calls its child and waits on it.
+    parent.ok("yield r");
+    let mut child = Agent::granted(ledger.grant(0).unwrap());
+    child.ok(&format!("grant {} {}", g.uuid, g.memory));
+    child.ok(&format!("load yc {} stored ram", c_path.display()));
+    child.ok("request c yc");
+    child.ok("pass c yc 1x1");
+    for block in 0..3 {
+        assert_eq!(child.ok(&format!("exact yc {block}")), "true");
+    }
+    // Its pages were a later use while it waited: it gave what its child asked for. (Not
+    // yielded they are its working set, and its child would have streamed beside them.)
+    assert_eq!(held(&parent_pid), 2 * MB, "the yielded parent gave its child what it needed");
+    child.ok("unpin");
+    child.ok("end c");
+    child.exit();
+    // The child returned: the parent takes its room back and finishes.
+    parent.ok("unyield r");
+    for block in 0..2 {
+        assert_eq!(parent.ok(&format!("exact yp {block}")), "true");
+    }
+    parent.ok("unpin");
+    parent.ok("end r");
+    parent.exit();
 }

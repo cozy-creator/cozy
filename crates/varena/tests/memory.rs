@@ -53,7 +53,7 @@ fn room(mem: &Memory, id: varena::SetId, name: &str, shape: &str, pages: u64, me
     let pass = r.pass(id, shape, Torch::default()).unwrap();
     let w = r.stats().peak;
     if let Some(peak) = measured {
-        pass.end(Measured { allocated_peak: peak, slack: 0, sites: vec![("ffn".into(), peak / 2)] }, Torch::default());
+        pass.end(Measured { allocated_peak: peak, slack: 0, sites: vec![varena::SitePeak { name: "ffn".into(), peak: peak / 2, collective: false }] }, Torch::default());
     }
     drop(r);
     w - pages
@@ -82,22 +82,23 @@ fn an_oom_at_a_cut_site_cuts_and_a_collective_one_waits_for_the_next_pass() {
     let pins: Vec<_> = (0..2).map(|b| mem.bind(id, b, 0).unwrap()).collect();
     let site = Some(Site { name: "ffn", collective: false });
     // The free bytes went to the pages; every page is pinned: the op cuts, level by level.
-    assert!(matches!(r.oom(Some(MB), site, Torch::default()), Next::Cut(1)));
-    assert_eq!(r.cut("ffn"), 1);
-    assert!(matches!(r.oom(Some(MB), site, Torch::default()), Next::Cut(2)));
+    assert!(!pass.measured() && !r.measured(), "no room measured at this shape yet");
+    assert!(matches!(r.oom(id, Some(MB), site, Torch::default()), Next::Cut(1)));
+    assert_eq!(r.cut(id, "ffn"), 1);
+    assert!(matches!(r.oom(id, Some(MB), site, Torch::default()), Next::Cut(2)));
     // Review 1, finding 4: a collective site never cuts mid-pass. It recovers locally, its
     // finer level is proposed, and it takes effect when the ranks agree at the next pass.
     let collective = Some(Site { name: "allgather", collective: true });
-    let next = r.oom(Some(MB), collective, Torch::default());
+    let next = r.oom(id, Some(MB), collective, Torch::default());
     assert!(matches!(next, Next::Park(_) | Next::Exhausted(_)), "{next:?}");
-    assert_eq!(r.cut("allgather"), 0, "unchanged within the pass");
+    assert_eq!(r.cut(id, "allgather"), 0, "unchanged within the pass");
     drop(pins);
     drop(pass);
     let next = r.pass(id, "1x8", Torch::default()).unwrap();
     assert_eq!(next.levels(), vec![("allgather".to_string(), 1)], "proposed for the agreement");
-    assert_eq!(r.cut("allgather"), 0);
+    assert_eq!(r.cut(id, "allgather"), 0);
     next.agree(vec![("allgather".into(), 2)]);
-    assert_eq!(r.cut("allgather"), 2, "the ranks' maximum");
+    assert_eq!(r.cut(id, "allgather"), 2, "the ranks' maximum");
 }
 
 /// Review 1, finding 11: dropping an earlier pass after the next one started keeps the next
@@ -155,10 +156,70 @@ fn orphans_show_as_class_o() {
 #[test]
 fn an_empty_shape_fits_by_the_widest_measured() {
     let (ledger, mem, _g) = open("widest", 16 * MB);
-    ledger.restore(&[varena::Peak { key: "pkg|1x1".into(), bytes: 2 * MB, sites: vec![] }, varena::Peak { key: "pkg|4x4".into(), bytes: 17 * MB, sites: vec![] }]).unwrap();
+    ledger.restore(&[varena::Peak { key: "pkg|1x1".into(), bytes: 2 * MB, start: 0, sites: vec![] }, varena::Peak { key: "pkg|4x4".into(), bytes: 17 * MB, start: 0, sites: vec![] }]).unwrap();
     let busy = mem.request("busy", Plan::default()).unwrap();
     assert!(ledger.fits("pkg", "1x1"));
     assert!(!ledger.fits("pkg", ""), "the widest (17 MB) beside a running request does not fit");
     drop(busy);
     assert!(ledger.fits("pkg", ""), "an idle GPU fits anything");
+}
+
+/// Round 2, finding 4: in a joint step an OOM names its set, and cuts only that set's site,
+/// whichever pass started last.
+#[test]
+fn a_joint_steps_oom_cuts_only_its_own_sets_site() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_l, mem, g) = open("joint", 4 * MB);
+    let a = mem.load(set(dir.path(), "a", 1, &g.uuid), Level::Ram).unwrap();
+    let b = mem.load(set(dir.path(), "b", 1, &g.uuid), Level::Ram).unwrap();
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["pkg@1/a".into(), "pkg@1/b".into()], passes: 1 }] }).unwrap();
+    let pa = r.pass(a, "1x8", Torch::default()).unwrap();
+    let pb = r.pass(b, "1x8", Torch::default()).unwrap();
+    let pins = [mem.bind(a, 0, 0).unwrap(), mem.bind(b, 0, 0).unwrap()];
+    let site = Some(Site { name: "ffn", collective: false });
+    assert!(matches!(r.oom(a, Some(MB), site, Torch::default()), Next::Cut(1)));
+    assert_eq!(r.cut(a, "ffn"), 1, "a's pass cut");
+    assert_eq!(r.cut(b, "ffn"), 0, "b's pass, started last, untouched");
+    drop(pins);
+    drop((pa, pb));
+}
+
+/// Round 2, finding 6: one unit for rooms. Latents carried across steps (allocated > 0 at every
+/// pass start) are part of every absolute room: the remaining working set a row publishes and
+/// the peak it records count them, and speculation keeps the next step's absolute room free,
+/// so the plan runs with no D page evicted.
+#[test]
+fn rooms_count_what_earlier_steps_left_allocated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ledger, mem, g) = open("units", 16 * MB);
+    let a = mem.load(set(dir.path(), "a", 1, &g.uuid), Level::Ram).unwrap();
+    let b = mem.load(set(dir.path(), "b", 2, &g.uuid), Level::Ram).unwrap();
+    let page = REGION_ALIGN;
+    let latents = 6 * MB;
+    let torch = Torch { allocated: latents, reserved: latents };
+    let plan = || Plan { steps: ["a", "b", "a"].iter().map(|s| Step { sets: vec![format!("pkg@1/{s}")], passes: 1 }).collect() };
+    // Measured once: a's pass grows nothing beyond the latents, b's grows 4 MB.
+    let first = mem.request("first", plan()).unwrap();
+    for (id, grows) in [(a, 0), (b, 4 * MB), (a, 0)] {
+        let p = first.pass(id, "1x8", torch).unwrap();
+        p.end(Measured { allocated_peak: latents + grows, slack: 0, sites: vec![] }, torch);
+    }
+    let peak = first.end().peak;
+    assert_eq!(peak, 2 * page + latents + 4 * MB, "the first request's peak is b's pages and its absolute room");
+    let second = mem.request("second", plan()).unwrap();
+    let remaining = |l: &varena::Ledger| l.status().rows.iter().map(|r| r.remaining).sum::<u64>();
+    assert_eq!(remaining(&ledger), 2 * page + latents + 4 * MB, "published absolute: pages, start allocation, growth");
+    let p = second.pass(a, "1x8", torch).unwrap();
+    assert!(p.measured() && second.measured(), "a's room at 1x8 was measured");
+    // Speculation fetched ahead only into what leaves b's absolute room beyond a's free.
+    let free = ledger.status().free;
+    assert!(free >= 4 * MB, "b's extra room stays free: {free}");
+    p.end(Measured { allocated_peak: latents, slack: 0, sites: vec![] }, torch);
+    for id in [b, a] {
+        let p = second.pass(id, "1x8", torch).unwrap();
+        (0..if id == b { 2 } else { 1 }).for_each(|block| drop(mem.bind(id, block, 0).unwrap()));
+        p.end(Measured { allocated_peak: latents, slack: 0, sites: vec![] }, torch);
+    }
+    let stats = second.end();
+    assert_eq!(stats.evicted[varena::table::Class::D.index()], 0, "{stats:?}");
 }

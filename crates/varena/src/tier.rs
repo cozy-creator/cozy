@@ -8,7 +8,7 @@
 //! executor mapping a chosen layout is asked first, through its row's ask thread, to unpin and
 //! unmap it, so the pages really return when the tier punches them out.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
@@ -60,6 +60,14 @@ struct Layout {
     /// Connection → its declared distance and its ask socket.
     users: HashMap<u64, (Option<u32>, String)>,
     used: u64,
+    /// A release asked of its users, punched when they have all answered.
+    pending: Option<Pending>,
+}
+
+struct Pending {
+    regions: Vec<u32>,
+    forget: bool,
+    waiting: HashSet<u64>,
 }
 
 impl Layout {
@@ -83,7 +91,8 @@ impl Layout {
             .enumerate()
             .map(|(r, (off, span))| {
                 let ready = self.ready(r).is_some_and(|w| w.load(Acquire) == 1);
-                let in_flight = ready && os::held(&self.fd, self.data + off, *span).unwrap_or(true);
+                // A layout already being asked back is in flight whole: it is not chosen twice.
+                let in_flight = ready && (self.pending.is_some() || os::held(&self.fd, self.data + off, *span).unwrap_or(true));
                 (*span, ready, in_flight)
             })
             .collect();
@@ -181,37 +190,55 @@ struct State {
     releases: u64,
     /// Bytes executors reported unpinned and unmapped when asked.
     acked: u64,
+    /// The host-short event's signalling end: nothing is left to give back.
+    short: Option<Owned>,
 }
 
-/// Applies the host decision for `trigger`: the users of each chosen layout unpin and unmap it
-/// first (the lock released while they answer: a reply, or their death), then its regions are
-/// punched out. Returns the bytes given back.
-fn relieve(state: &(Mutex<State>, Condvar), trigger: HostTrigger) -> u64 {
-    let (lock, cv) = state;
-    let (actions, asks) = {
-        let s = lock.lock();
-        let facts: Vec<HostLayout> = s.layouts.iter().map(|(d, l)| l.facts(d)).collect();
-        let actions = host_decide(&facts, trigger);
-        let mut chosen: Vec<&String> = actions.iter().map(|a| match a { HostAction::Release { digest, .. } | HostAction::Forget(digest) => digest }).collect();
-        chosen.dedup();
-        let asks: Vec<(String, u64, String)> = chosen.into_iter().filter_map(|d| s.layouts.get(d).map(|l| (d, l))).flat_map(|(d, l)| l.users.iter().map(move |(conn, (_, ask))| (d.clone(), *conn, ask.clone()))).collect();
-        (actions, asks)
-    };
-    let acked: u64 = asks.iter().map(|(digest, _, ask)| ledger::release_host(ask, digest)).sum();
+type Shared = Arc<(Mutex<State>, Condvar)>;
+
+/// Applies the host decision for `trigger` without waiting on anyone: a chosen layout nobody
+/// maps is punched out now; one that executors map is asked back from each of them (on a thread
+/// per ask), and punched once every one has answered or died. Nothing left to give back raises
+/// the host-short event. Returns the bytes given back now.
+fn relieve(state: &Shared, trigger: HostTrigger) -> u64 {
+    let (lock, cv) = &**state;
     let mut s = lock.lock();
-    s.acked += acked;
-    for (digest, conn, _) in &asks {
-        if let Some(l) = s.layouts.get_mut(digest) {
-            l.users.remove(conn);
+    let facts: Vec<HostLayout> = s.layouts.iter().map(|(d, l)| l.facts(d)).collect();
+    let actions = host_decide(&facts, trigger);
+    if actions.is_empty() {
+        // Nothing left to give and nothing being asked back: the host is short past the tier.
+        if s.layouts.values().all(|l| l.pending.is_none()) {
+            if let Some(w) = &s.short {
+                os::signal(w);
+            }
+        }
+        return 0;
+    }
+    let mut chosen: BTreeMap<String, (Vec<u32>, bool)> = BTreeMap::new();
+    for a in actions {
+        match a {
+            HostAction::Release { digest, region } => chosen.entry(digest).or_default().0.push(region),
+            HostAction::Forget(digest) => chosen.entry(digest).or_default().1 = true,
         }
     }
     let mut gave = 0;
-    for a in actions {
-        match a {
-            HostAction::Release { digest, region } => gave += s.layouts.get(&digest).map_or(0, |l| l.release(region)),
-            HostAction::Forget(digest) => {
+    for (digest, (regions, forget)) in chosen {
+        let Some(l) = s.layouts.get_mut(&digest) else { continue };
+        let users: Vec<(u64, String)> = l.users.iter().map(|(c, (_, ask))| (*c, ask.clone())).collect();
+        if users.is_empty() {
+            gave += regions.iter().map(|r| l.release(*r)).sum::<u64>();
+            if forget {
                 s.layouts.remove(&digest);
             }
+            continue;
+        }
+        l.pending = Some(Pending { regions, forget, waiting: users.iter().map(|(c, _)| *c).collect() });
+        for (conn, ask) in users {
+            let (state, digest) = (state.clone(), digest.clone());
+            let _ = std::thread::Builder::new().name("varena-tier-ask".into()).spawn(move || {
+                let freed = ledger::release_host(&ask, &digest);
+                acked(&state, &digest, conn, freed);
+            });
         }
     }
     if gave > 0 {
@@ -222,10 +249,36 @@ fn relieve(state: &(Mutex<State>, Condvar), trigger: HostTrigger) -> u64 {
     gave
 }
 
+/// A user answered (or died): once every user of the layout has, its regions are punched out.
+fn acked(state: &Shared, digest: &str, conn: u64, freed: u64) {
+    let (lock, cv) = &**state;
+    let mut s = lock.lock();
+    s.acked += freed;
+    let Some(l) = s.layouts.get_mut(digest) else { return };
+    l.users.remove(&conn);
+    let Some(p) = l.pending.as_mut() else { return };
+    p.waiting.remove(&conn);
+    if !p.waiting.is_empty() {
+        return;
+    }
+    let Some(p) = l.pending.take() else { return };
+    let gave: u64 = p.regions.iter().map(|r| l.release(*r)).sum();
+    if p.forget && l.users.is_empty() {
+        s.layouts.remove(digest);
+    }
+    if gave > 0 {
+        s.releases += 1;
+    }
+    drop(s);
+    cv.notify_all();
+}
+
 /// The machine's RAM-tier service, served from this process until dropped.
 pub struct Tier {
-    state: Arc<(Mutex<State>, Condvar)>,
+    state: Shared,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    /// The host-short event's waiting end.
+    short: Owned,
 }
 
 impl Drop for Tier {
@@ -263,7 +316,9 @@ impl Tier {
 
     fn bind() -> Result<Option<Tier>> {
         let Some(listener) = os::listen(NAME)? else { return Ok(None) };
-        let state = Arc::new((Mutex::new(State::default()), Condvar::new()));
+        let short = os::event()?;
+        let signal = os::dup(&short)?;
+        let state = Arc::new((Mutex::new(State { short: Some(signal), ..State::default() }), Condvar::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (s, halt) = (state.clone(), stop.clone());
         std::thread::Builder::new()
@@ -278,7 +333,7 @@ impl Tier {
                 }
             })
             .map_err(|e| Error::io("spawn tier", e))?;
-        Ok(Some(Tier { state, stop }))
+        Ok(Some(Tier { state, stop, short }))
     }
 
     /// The layouts holding any ready region (status).
@@ -296,12 +351,47 @@ impl Tier {
         out
     }
 
+    /// Blocks until the tier has nothing left to give back and the host is still short: TensorD
+    /// then ends idle executors, least recently used first (the last host rung, a lifecycle
+    /// action, so TensorD's).
+    pub fn await_short(&self) -> Result<()> {
+        os::await_event(&self.short)
+    }
+
+    /// The host-short event, for a caller that waits on several (signalled; a wait clears it).
+    pub fn short(&self) -> &Owned {
+        &self.short
+    }
+
     /// Bytes executors unpinned and unmapped when the tier asked them to (status).
     pub fn acked(&self) -> u64 {
         self.state.0.lock().acked
     }
 
     /// Blocks until the tier has given back `n` rungs since it started; returns the count.
+    /// Each layout's nearest declared use over its users (`None`: none declares one), as the
+    /// executors last told it (status).
+    pub fn uses(&self) -> Vec<(String, Option<u32>)> {
+        let s = self.state.0.lock();
+        let mut out: Vec<(String, Option<u32>)> = s.layouts.iter().map(|(d, l)| (d.clone(), l.users.values().filter_map(|(d, _)| *d).min())).collect();
+        out.sort();
+        out
+    }
+
+    /// Blocks until `seen` holds of [`Tier::uses`] (executors tell the tier asynchronously).
+    pub fn await_uses(&self, seen: impl Fn(&[(String, Option<u32>)]) -> bool) {
+        let (lock, cv) = &*self.state;
+        let mut s = lock.lock();
+        loop {
+            let mut uses: Vec<(String, Option<u32>)> = s.layouts.iter().map(|(d, l)| (d.clone(), l.users.values().filter_map(|(d, _)| *d).min())).collect();
+            uses.sort();
+            if seen(&uses) {
+                return;
+            }
+            cv.wait(&mut s);
+        }
+    }
+
     pub fn await_releases(&self, n: u64) -> u64 {
         let (lock, cv) = &*self.state;
         let mut s = lock.lock();
@@ -312,12 +402,12 @@ impl Tier {
     }
 }
 
-fn serve(stream: Stream, state: &(Mutex<State>, Condvar)) {
+fn serve(stream: Stream, state: &Shared) {
     // Only this user's processes: an abstract name has no permissions of its own.
     if os::peer(&stream).is_err() {
         return;
     }
-    let (lock, cv) = state;
+    let (lock, cv) = &**state;
     let conn = {
         let mut s = lock.lock();
         s.clock += 1;
@@ -346,6 +436,7 @@ fn serve(stream: Stream, state: &(Mutex<State>, Condvar)) {
                 }) {
                     *d = distance;
                 }
+                cv.notify_all();
                 (Reply::Done, None)
             }
             Call::Close { digest } => {
@@ -357,6 +448,7 @@ fn serve(stream: Stream, state: &(Mutex<State>, Condvar)) {
             Call::Room { bytes } => {
                 drop(s);
                 let headroom = u64::try_from(platform::contain::host_memory::read().available).unwrap_or(0);
+                // Never waits: what nobody maps goes now; what executors map is asked back.
                 let gave = if headroom >= bytes { 0 } else { relieve(state, HostTrigger::Room { bytes, headroom }) };
                 cv.notify_all();
                 s = lock.lock();
@@ -386,7 +478,7 @@ fn open(s: &mut State, digest: &str, regions: Vec<(u64, u64)>) -> Result<(u64, O
     os::resize(&fd, data + end)?;
     let words = os::map(&fd, data as usize, true)?;
     let handed = os::dup(&fd)?;
-    s.layouts.insert(digest.to_string(), Layout { fd, words, regions, data, users: HashMap::new(), used: 0 });
+    s.layouts.insert(digest.to_string(), Layout { fd, words, regions, data, users: HashMap::new(), used: 0, pending: None });
     Ok((data, handed))
 }
 
@@ -585,8 +677,10 @@ impl Client {
         self.call(&Call::Close { digest: digest.into() }).map(|_| ())
     }
 
-    /// Host headroom for `bytes`, the tier giving back in order; false when it cannot.
+    /// Host headroom for `bytes`, the tier giving back in order; false when it cannot now. A
+    /// connection of its own: a fill never waits behind another call.
     pub fn room(&self, bytes: u64) -> Result<bool> {
-        Ok(matches!(self.call(&Call::Room { bytes })?.0, Reply::Room { ok: true }))
+        let Some(stream) = os::connect(NAME)? else { return Ok(false) };
+        Ok(matches!(os::call::<_, Reply>(&stream, &Call::Room { bytes }, None)?.0, Reply::Room { ok: true }))
     }
 }
