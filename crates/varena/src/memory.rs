@@ -474,7 +474,7 @@ impl Memory {
                 None => Grant::open(&gpu, None)?,
             };
             let capacity = gpu.memory.min(backend.capacity());
-            let shared = Arc::new(Shared::adopt(grant.table, &gpu, capacity, Some(grant.events))?);
+            let shared = Arc::new(Shared::adopt(grant.table, &gpu, capacity)?);
             shared.reap(None)?;
             let row = Arc::new(shared.claim(std::process::id())?);
             let listener = row.listen()?;
@@ -1057,6 +1057,10 @@ impl Inner {
         let ns = start.elapsed().as_nanos() as u64;
         let mut st = self.state.lock();
         if st.homes.get(&job.key).is_none_or(|h| h.gen != job.gen) {
+            // The page changed under the fill: its event is nobody's.
+            if let Ok((_, ready)) = result {
+                self.backend.retire(ready);
+            }
             return;
         }
         match result {
@@ -2233,7 +2237,14 @@ impl Pin {
 
 impl Drop for Pin {
     fn drop(&mut self) {
-        let event = self.inner.backend.record(self.stream).unwrap_or(Event::DONE);
+        // Without an event the release waits on the host for this one pin's stream (rare).
+        let event = self.inner.backend.record(self.stream).unwrap_or_else(|e| {
+            tracing::warn!("varena: recording a release failed ({e}); synchronizing its stream");
+            if let Err(e) = self.inner.backend.synchronize(self.stream) {
+                tracing::warn!("varena: synchronizing a released pin's stream failed: {e}");
+            }
+            Event::DONE
+        });
         let untransformed = self.transform && !self.transformed.load(Ordering::Acquire);
         let _ = self.inner.release_tx.send(Release { key: self.key, pin: self.id, event, untransformed });
         self.inner.landed.notify_all();

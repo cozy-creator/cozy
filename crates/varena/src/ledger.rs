@@ -199,7 +199,8 @@ pub(crate) struct Shared {
     /// excludes only other processes.
     heap: Mutex<()>,
     pub name: String,
-    events: Option<Owned>,
+    /// Signals the GPU's wake endpoint (TensorD's, by name).
+    wake: Owned,
 }
 
 /// The heap lock, held.
@@ -229,7 +230,7 @@ fn open_named(name: &str) -> Result<Owned> {
 impl Shared {
     /// The table behind `fd` (a grant's), initialised if it is new. The first opener sets the
     /// capacity; a later one can only lower it.
-    pub fn adopt(fd: Owned, gpu: &GpuId, capacity: u64, events: Option<Owned>) -> Result<Shared> {
+    pub fn adopt(fd: Owned, gpu: &GpuId, capacity: u64) -> Result<Shared> {
         let fd = os::reopen(&fd, true)?;
         os::own(&fd)?;
         os::share(&fd, OPEN, 8, true)?;
@@ -257,7 +258,7 @@ impl Shared {
         })();
         os::unlock(&fd, 0, 8)?;
         let map = init?;
-        Ok(Shared { fd, map: RwLock::new(Arc::new(map)), heap: Mutex::new(()), name: gpu.uuid.clone(), events })
+        Ok(Shared { fd, map: RwLock::new(Arc::new(map)), heap: Mutex::new(()), name: gpu.uuid.clone(), wake: os::wake_sender()? })
     }
 
     pub fn descriptor(&self) -> Result<Owned> {
@@ -318,11 +319,10 @@ impl Shared {
         Ok(())
     }
 
-    /// Room freed, a row died or a peak was recorded: TensorD's event.
+    /// Room freed, a row died, an ask went out or a peak was recorded: TensorD's event, from
+    /// every participant (granted or standalone) through the GPU's named wake.
     pub fn ring(&self) {
-        if let Some(e) = &self.events {
-            os::signal(e);
-        }
+        os::wake(&self.wake, &self.name);
     }
 
     /// Every READY record, read again if the heap's shape moved meanwhile.
@@ -483,7 +483,10 @@ impl Shared {
     /// Frees dead rows (of `pid`, or any): their holders are gone, so their locks are free.
     pub fn reap(&self, pid: Option<u32>) -> Result<bool> {
         let mut any = false;
-        for r in self.rows()? {
+        let rows = self.rows()?;
+        #[cfg(feature = "faults")]
+        crate::faults::hit(crate::faults::Point::Reap);
+        for r in rows {
             if !r.live && pid.is_none_or(|p| p == r.pid) {
                 any |= self.free(r.off, r.word, true)?;
             }
@@ -667,9 +670,7 @@ impl Row {
         let _one = self.asking.lock();
         rec.asked.store(bytes, Release);
         rec.asking.store(id, Release);
-        if let Some(e) = &self.shared.events {
-            os::signal(e);
-        }
+        self.shared.ring();
         let freed = match os::connect(&ask_name(&self.shared.name, id)) {
             Ok(Some(stream)) => os::call::<_, Answer>(&stream, &Ask::Room { ceiling: ceiling.index(), bytes }, None).map_or(0, |(a, _)| a.freed),
             _ => 0,
@@ -722,8 +723,8 @@ impl Drop for Row {
         self.publish(&Facts::default());
         self.set_orphans(0);
         if self.shared.free(self.at, self.word, false).unwrap_or(false) {
-            self.shared.ring();
             let _ = self.shared.leave();
+            self.shared.ring();
         }
     }
 }
@@ -843,24 +844,21 @@ pub(crate) fn held(rows: &[RowView]) -> u64 {
 
 // ---- TensorD's side
 
-/// What TensorD hands an executor for its [`crate::Memory`]: the table and TensorD's eventfd.
-/// Fields are public so a spawner can pass them across exec.
+/// What TensorD hands an executor for its [`crate::Memory`]: the table. The field is public so
+/// a spawner can pass it across exec.
 pub struct Grant {
     pub table: Owned,
-    pub events: Owned,
 }
 
 impl Grant {
-    /// `gpu`'s table by name, created when absent, for a standalone engine: no TensorD reads
-    /// its events. `limit` lowers the capacity (the first opener sets it, a later one can only
-    /// lower it).
+    /// `gpu`'s table by name, created when absent, for a standalone engine. `limit` lowers the
+    /// capacity (the first opener sets it, a later one can only lower it).
     pub fn open(gpu: &GpuId, limit: Option<u64>) -> Result<Grant> {
         let capacity = limit.map_or(gpu.memory, |l| l.min(gpu.memory));
         // Read-locked open while the grant lives.
         let table = open_named(&gpu.uuid)?;
-        let events = os::event()?;
-        drop(Shared::adopt(os::dup(&table)?, gpu, capacity, None)?);
-        Ok(Grant { table, events })
+        drop(Shared::adopt(os::dup(&table)?, gpu, capacity)?);
+        Ok(Grant { table })
     }
 }
 
@@ -876,6 +874,8 @@ pub struct RowStatus {
     pub remaining: u64,
     /// Running requests with no measured working set.
     pub unmeasured: u32,
+    /// Torch's bytes as the row counts them: rooms, and claims while its asks are out.
+    pub torch: u64,
     /// Bytes asked of it and not yet answered.
     pub asked: u64,
 }
@@ -892,25 +892,21 @@ pub struct Status {
     pub dispatched: Vec<(String, String)>,
 }
 
-/// A measured peak, as TensorD persists it per GPU model.
+/// A measured peak, as TensorD persists it per GPU model: an opaque typed record, restored
+/// exactly as it was read.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Peak {
-    /// `<package>|<shape>` (a request's largest working set) or `<set>|<shape>|<cuts>` (a
-    /// pass's room and its sites).
-    pub key: String,
-    /// A request's largest working set; a pass's room beyond its start allocation.
-    pub bytes: u64,
-    /// A pass's allocation at its start (what earlier steps left allocated); 0 for a request.
-    pub start: u64,
-    /// Each cut site's peak and collective flag, for a pass.
-    pub sites: Vec<SitePeak>,
+pub enum Peak {
+    /// A request's largest working set at `<package>|<shape>`.
+    Request { key: String, bytes: u64 },
+    /// A pass's room at `<set>|<shape>|<cuts>`, every field as measured.
+    Pass { key: String, room: Room },
 }
 
 /// A pass's measured room, as the ledger keeps it under `room/<set>|<shape>|<cuts>`. One unit
 /// everywhere: the absolute room is the start allocation plus [`Room::bytes`], with the start
 /// measured per (set, shape); a running pass uses its own start allocation instead.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Room {
+pub struct Room {
     pub start: u64,
     /// Allocated peak less what was allocated at the pass's start.
     pub delta: u64,
@@ -939,20 +935,25 @@ impl Room {
 /// TensorD's handle on one GPU's table.
 pub struct Ledger {
     shared: Arc<Shared>,
+    /// The GPU's wake endpoint, bound by name: every participant signals it.
     events: Owned,
     custody: custody::Client,
 }
 
 impl Ledger {
     /// The GPU's table, named per GPU and user; capacity = min(card, limit), never raised by a
-    /// later opener. A restarted TensorD reopens the same table. TensorD serves custody when
+    /// later opener. A restarted TensorD reopens the same table and drops every dispatch it
+    /// finds (TensorD is the only dispatcher: they are a dead one's). TensorD serves custody when
     /// it holds the service lock (it does when it starts first).
     pub fn create(gpu: &GpuId, limit: Option<u64>) -> Result<Ledger> {
         let capacity = limit.map_or(gpu.memory, |l| l.min(gpu.memory));
-        let events = os::event()?;
+        let events = os::wake_bind(&gpu.uuid)?.ok_or_else(|| Error::Invalid(format!("another TensorD holds {}", gpu.uuid)))?;
         let table = open_named(&gpu.uuid)?;
-        let shared = Arc::new(Shared::adopt(table, gpu, capacity, Some(os::dup(&events)?))?);
+        let shared = Arc::new(Shared::adopt(table, gpu, capacity)?);
         shared.reap(None)?;
+        for (key, _) in shared.facts("dispatch/")? {
+            shared.put(&key, None)?;
+        }
         let custody = custody::Client::open(&shared)?;
         Ok(Ledger { shared, events, custody })
     }
@@ -964,7 +965,7 @@ impl Ledger {
 
     /// The descriptors executor `pid` opens its memory with.
     pub fn grant(&self, _pid: u32) -> Result<Grant> {
-        Ok(Grant { table: self.shared.descriptor()?, events: os::dup(&self.events)? })
+        Ok(Grant { table: self.shared.descriptor()? })
     }
 
     /// After `waitpid`: `pid`'s row goes, and the pages it kept become orphans.
@@ -1035,27 +1036,25 @@ impl Ledger {
     pub fn peaks(&self) -> Vec<Peak> {
         let mut out = vec![];
         for (key, v) in self.shared.facts("peak/").unwrap_or_default() {
-            let bytes = v.try_into().map(u64::from_le_bytes).unwrap_or(0);
-            out.push(Peak { key: key.trim_start_matches("peak/").to_string(), bytes, start: 0, sites: vec![] });
+            if let Ok(bytes) = v.try_into().map(u64::from_le_bytes) {
+                out.push(Peak::Request { key: key.trim_start_matches("peak/").to_string(), bytes });
+            }
         }
         for (key, v) in self.shared.facts("room/").unwrap_or_default() {
             if let Ok(room) = serde_json::from_slice::<Room>(&v) {
-                out.push(Peak { key: key.trim_start_matches("room/").to_string(), bytes: room.bytes(), start: room.start, sites: room.sites });
+                out.push(Peak::Pass { key: key.trim_start_matches("room/").to_string(), room });
             }
         }
         out
     }
 
-    /// Peaks persisted earlier on this machine, for this GPU model: a request's (`a|b`) as its
-    /// largest W, a pass's (`a|b|c`) as its room.
+    /// Peaks persisted earlier on this machine, for this GPU model, merged in (the larger of
+    /// each field stays): restoring what was saved changes nothing.
     pub fn restore(&self, peaks: &[Peak]) -> Result<()> {
         for p in peaks {
-            match p.key.matches('|').count() {
-                1 => record_peak(&self.shared, &p.key, p.bytes)?,
-                _ => {
-                    let room = Room { start: p.start, delta: p.bytes, slack: 0, context: 0, sites: p.sites.clone() };
-                    record_room(&self.shared, &p.key, &room)?;
-                }
+            match p {
+                Peak::Request { key, bytes } => record_peak(&self.shared, key, *bytes)?,
+                Peak::Pass { key, room } => drop(record_room(&self.shared, key, room)?),
             }
         }
         Ok(())
@@ -1079,7 +1078,7 @@ impl Ledger {
             foreign,
             rows: rows
                 .iter()
-                .map(|r| RowStatus { pid: r.pid, live: r.live, context: r.facts.context, classes: classes(r), remaining: r.facts.remaining, unmeasured: r.facts.unmeasured as u32, asked: asked_of(&rows, r.id()) })
+                .map(|r| RowStatus { pid: r.pid, live: r.live, context: r.facts.context, classes: classes(r), remaining: r.facts.remaining, unmeasured: r.facts.unmeasured as u32, torch: r.facts.torch, asked: asked_of(&rows, r.id()) })
                 .collect(),
             dispatched: dispatched.into_iter().map(|(k, v)| (k.trim_start_matches("dispatch/").to_string(), String::from_utf8_lossy(&v).into_owned())).collect(),
         }
@@ -1094,9 +1093,21 @@ impl Ledger {
         rows.iter().filter(|r| r.tid != 0 && asked_of(&rows, r.id()) > 0 && os::stalled(r.pid, r.tid)).map(|r| r.pid).collect()
     }
 
-    /// Readable when room frees, a row dies or a peak is recorded; reading it clears it.
+    /// Readable when room frees, a row dies, an ask goes out or a peak is recorded, in any
+    /// process on the GPU; [`Ledger::clear_events`] clears it.
     pub fn events(&self) -> &Owned {
         &self.events
+    }
+
+    pub fn clear_events(&self) {
+        os::wake_clear(&self.events);
+    }
+
+    /// Blocks until the next event, and clears every one so far.
+    pub fn await_event(&self) -> Result<()> {
+        os::await_event(&self.events)?;
+        os::wake_clear(&self.events);
+        Ok(())
     }
 
     /// A GPU fault or sticky error: the GPU's kept pages go.
@@ -1127,7 +1138,7 @@ mod tests {
     #[test]
     fn a_stale_word_frees_nothing_newer() {
         let gpu = GpuId { uuid: format!("unit-{}-stale", std::process::id()), model: "host".into(), memory: 1 << 30 };
-        let shared = Arc::new(Shared::adopt(os::shared(&gpu.uuid, true).unwrap(), &gpu, gpu.memory, None).unwrap());
+        let shared = Arc::new(Shared::adopt(os::shared(&gpu.uuid, true).unwrap(), &gpu, gpu.memory).unwrap());
         let first = shared.claim(1).unwrap();
         let (at, stale) = (first.at, first.word);
         drop(first);
@@ -1145,5 +1156,42 @@ mod tests {
         assert_eq!(second.ask(row_id(at, stale), Class::N, 1).unwrap(), 0);
         drop(second);
         os::unlink(&gpu.uuid);
+    }
+
+    /// Review 2, finding 14: concurrent writers of one fact merge (the larger stays), whatever
+    /// their order.
+    #[test]
+    fn concurrent_peaks_merge_to_the_largest() {
+        let gpu = GpuId { uuid: format!("unit-{}-merge", std::process::id()), model: "host".into(), memory: 1 << 30 };
+        let shared = Arc::new(Shared::adopt(os::shared(&gpu.uuid, true).unwrap(), &gpu, gpu.memory).unwrap());
+        let writers: Vec<_> = (1..=8u64)
+            .map(|i| {
+                let shared = shared.clone();
+                std::thread::spawn(move || (0..16).for_each(|_| record_peak(&shared, "pkg|1x1", i << 20).unwrap()))
+            })
+            .collect();
+        writers.into_iter().for_each(|w| w.join().unwrap());
+        let bytes = shared.fact("peak/pkg|1x1").unwrap().map(|v| u64::from_le_bytes(v.try_into().unwrap()));
+        assert_eq!(bytes, Some(8 << 20));
+        assert_eq!(shared.facts("peak/").unwrap().len(), 1, "one record per key");
+        os::unlink(&gpu.uuid);
+    }
+
+    /// Review 2, finding 14: a standalone engine's table is unlinked when its last row leaves
+    /// (custody stops once nobody is connected and nothing is kept).
+    #[test]
+    fn a_standalone_table_goes_with_its_last_row() {
+        let gpu = GpuId { uuid: format!("unit-{}-unlink", std::process::id()), model: "host".into(), memory: 1 << 30 };
+        // TensorD's wake, without a TensorD holding the table open.
+        let wake = os::wake_bind(&gpu.uuid).unwrap().unwrap();
+        let mem = crate::Memory::open(gpu.clone(), None, Box::new(crate::HostBackend::new(gpu.memory))).unwrap();
+        // SAFETY: geteuid reads a process attribute.
+        let path = format!("/dev/shm/cozy-varena-{}-{}", unsafe { libc::geteuid() }, gpu.uuid);
+        assert!(std::path::Path::new(&path).exists());
+        drop(mem);
+        while std::path::Path::new(&path).exists() {
+            os::await_event(&wake).unwrap();
+            os::wake_clear(&wake);
+        }
     }
 }
