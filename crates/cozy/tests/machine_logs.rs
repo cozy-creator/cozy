@@ -53,10 +53,10 @@ fn a_machines_logs_read_and_follow_what_it_did() {
     ]);
     assert_eq!(out.code, 0, "{out:?}");
     let read = lines(&home.cozy(["machine", "logs", "m1", "tensorfs", "-n", "0", "--json"]));
-    // One line says what the download did: its source, manifest, objects, bytes and time.
+    // One line says what the download did: its source, header, objects, bytes and time.
     let said = |l: &Value| {
         let text = l["text"].as_str().unwrap();
-        [" import ", TINY, "manifest=sha256:", "objects=", "bytes=", "downloaded=", "seconds="]
+        [" import ", TINY, "header=sha256:", "objects=", "bytes=", "downloaded=", "seconds="]
             .iter()
             .all(|part| text.contains(part))
     };

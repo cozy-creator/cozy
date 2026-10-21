@@ -163,7 +163,7 @@ fn a_model_uploaded_by_one_machine_is_pulled_bit_identical_by_another() {
     let model = format!("{account}/tiny-cycle");
     let run = completed(&home, &cozy(&home, None, &["--json", "model", "upload", TINY, &model, "--on", "m1"]));
     let made = &run["result"]["models"][0];
-    assert_eq!(made["published"]["destination"], model.as_str(), "{run}");
+    assert_eq!(made["published"]["destination"], format!("{model}@main"), "{run}");
     let source = made["published"]["checkpoint"].as_str().unwrap().to_owned();
 
     let second = machine(&home, "m2");
@@ -198,7 +198,7 @@ fn a_model_is_uploaded_quantized_and_published_by_its_machine() {
     let run = completed(&home, &cozy(&home, None, &["--json", "model", "upload", TINY, &model, "--on", "m1"]));
     let made = &run["result"]["models"][0];
     assert_eq!(made["resolved"], TINY, "{run}");
-    assert_eq!(made["published"]["destination"], model.as_str(), "{run}");
+    assert_eq!(made["published"]["destination"], format!("{model}@main"), "{run}");
     let source = made["published"]["checkpoint"].as_str().unwrap().to_owned();
 
     // Another machine reads the private checkpoint by its digest, under the run's owner bearer.
