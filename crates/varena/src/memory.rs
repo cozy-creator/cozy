@@ -193,6 +193,7 @@ pub struct Pin {
 pub struct Pass {
     inner: Arc<Inner>,
     req: u64,
+    set: u32,
     id: u64,
 }
 
@@ -232,6 +233,8 @@ struct Active {
     set: u32,
     shape: String,
     allocated: u64,
+    /// Its own room (its start's allocation included), measured or the unmeasured reserve.
+    room: u64,
     /// The context at the pass's start: its growth is the pass's.
     context: u64,
 }
@@ -299,7 +302,8 @@ struct State {
     failed_at: HashMap<String, u64>,
     stats: HashMap<u64, Stats>,
     last: Option<Stats>,
-    active: HashMap<u64, Active>,
+    /// Passes running, per (request, set): a joint step's sets each have their own.
+    active: HashMap<(u64, u32), Active>,
     failed: HashMap<Key, Error>,
     /// Request → the `<package>|<shape>` its peak is recorded under.
     peaks: HashMap<u64, String>,
@@ -358,7 +362,24 @@ impl State {
 
     /// The request whose current pass runs `set`.
     fn binding(&self, set: u32) -> Option<u64> {
-        self.active.iter().filter(|(_, a)| a.set == set).map(|(r, _)| *r).max()
+        self.active.keys().filter(|(_, s)| *s == set).map(|(r, _)| *r).max()
+    }
+
+    /// The request's most recently started pass (the one an op, a cut or an OOM is in).
+    fn current(&self, req: u64) -> Option<&Active> {
+        self.active.iter().filter(|((r, _), _)| *r == req).map(|(_, a)| a).max_by_key(|a| a.id)
+    }
+
+    fn pass_of(&self, req: u64, pass: u64) -> Option<&Active> {
+        self.active.iter().find(|((r, _), a)| *r == req && a.id == pass).map(|(_, a)| a)
+    }
+
+    /// The request's room with `this` pass's own (`own`, allocated `allocated`) beside its other
+    /// running passes: the largest allocation at a start, plus each pass's growth beyond it.
+    fn joint(&self, req: u64, this: u64, allocated: u64, own: u64) -> u64 {
+        let others = self.active.iter().filter(|((r, _), a)| *r == req && a.id != this).map(|(_, a)| a);
+        let (high, growth) = others.fold((allocated, own.saturating_sub(allocated)), |(h, g), a| (h.max(a.allocated), g + a.room.saturating_sub(a.allocated)));
+        high + growth
     }
 
     fn levels(&self, set: u32, shape: &str) -> BTreeMap<String, u32> {
@@ -973,16 +994,22 @@ impl Inner {
             let dst = self.backend.target(va, off, span);
             let region = spec.layout.region(job.key.1)?;
             let pin = |held: &tier::Held| held.pin(job.key.1, |p, l| self.backend.register_host(p, l), |p| self.backend.unregister_host(p));
+            // A copy from the tier, its region settled after (unlocked if the tier asked for it).
+            let read = |held: &tier::Held| {
+                let copied = held.read(job.key.1, dst);
+                held.settle(job.key.1, |p| self.backend.unregister_host(p));
+                copied
+            };
             if let Some(held) = &held {
                 pin(held)?;
-                if held.read(job.key.1, dst)? {
+                if read(held)? {
                     return Ok((Origin::Tier, self.backend.fence()?));
                 }
                 // Staged through the tier when the host has the room (the tier's decision).
                 if self.tier.as_ref().is_some_and(|t| t.room(span).unwrap_or(false)) {
                     held.fill(job.key.1, |host| self.store(&spec.source, &region.items, region.offset, host))?;
                     pin(held)?;
-                    if held.read(job.key.1, dst)? {
+                    if read(held)? {
                         return Ok((Origin::Store, self.backend.fence()?));
                     }
                 }
@@ -1176,7 +1203,7 @@ impl Inner {
                 }
             }
             Action::Cut { req, site, failed_at } => {
-                if let Some((set, shape)) = st.active.get(req).map(|a| (a.set, a.shape.clone())) {
+                if let Some((set, shape)) = st.current(*req).map(|a| (a.set, a.shape.clone())) {
                     let name = st.mech(set)?.spec.name.clone();
                     let key = room_key(&name, &shape, &st.levels(set, &shape));
                     st.failed_at.insert(key, *failed_at);
@@ -1187,14 +1214,14 @@ impl Inner {
                 }
             }
             Action::Relax { req, site } => {
-                if let Some((set, shape)) = st.active.get(req).map(|a| (a.set, a.shape.clone())) {
+                if let Some((set, shape)) = st.current(*req).map(|a| (a.set, a.shape.clone())) {
                     if let Some(l) = st.cuts.get_mut(&(set, shape)).and_then(|c| c.get_mut(site)) {
                         *l = l.saturating_sub(1);
                     }
                 }
             }
             Action::Propose { req, site } => {
-                if let Some((set, shape)) = st.active.get(req).map(|a| (a.set, a.shape.clone())) {
+                if let Some((set, shape)) = st.current(*req).map(|a| (a.set, a.shape.clone())) {
                     let now = st.levels(set, &shape).get(site).copied().unwrap_or(0);
                     let p = st.proposed.entry((set, shape)).or_default().entry(site.clone()).or_insert(0);
                     *p = (*p).max(now + 1);
@@ -1315,7 +1342,7 @@ impl Inner {
             l
         };
         let regions: Vec<(u64, u64)> = layout.regions.iter().map(|r| (r.offset, r.span)).collect();
-        let held = tier.open_layout(&layout.digest, regions).map_err(|e| tracing::warn!("varena: tier: {e}")).ok().map(Arc::new);
+        let held = tier.open_layout(&layout.digest, regions, &self.row.ask_name()).map_err(|e| tracing::warn!("varena: tier: {e}")).ok().map(Arc::new);
         let mut st = self.lock();
         if let Some(Some(m)) = st.sets.get_mut(set as usize) {
             m.held = held;
@@ -1523,11 +1550,20 @@ impl Inner {
         Ok((now.map(|r| allocated + r.bytes()), allocated + growth, sites))
     }
 
-    /// The active pass's room now (its levels may have just changed), its sites set on its
-    /// request.
+    /// The request's room for its current pass now (its levels may have just changed), beside
+    /// its other running passes; the pass's sites set on the request with the same offset.
     fn pass_room(&self, st: &mut State, req: u64) -> Result<(Option<u64>, u64)> {
-        let Some((set, shape, allocated)) = st.active.get(&req).map(|a| (a.set, a.shape.clone(), a.allocated)) else { return Ok((None, 0)) };
-        let (room, unmeasured, sites) = self.room(st, set, &shape, allocated)?;
+        let Some((id, set, shape, allocated)) = st.current(req).map(|a| (a.id, a.set, a.shape.clone(), a.allocated)) else { return Ok((None, 0)) };
+        let (room, unmeasured, mut sites) = self.room(st, set, &shape, allocated)?;
+        if let Some(a) = st.active.get_mut(&(req, set)) {
+            a.room = room.unwrap_or(unmeasured);
+        }
+        let joint = |own: u64| st.joint(req, id, allocated, own);
+        for s in &mut sites {
+            s.finer = s.finer.map(joint);
+            s.coarser = s.coarser.map(|(c, f)| (joint(c), f));
+        }
+        let (room, unmeasured) = (room.map(joint), joint(unmeasured));
         if let Some(r) = st.table.request_mut(req) {
             r.sites = sites;
         }
@@ -1600,7 +1636,7 @@ impl Inner {
             }
             self.measure(&mut st, torch);
             let (id, context) = (st.tick(), st.table.context);
-            st.active.insert(req, Active { id, set, shape: shape.to_string(), allocated: torch.allocated, context });
+            st.active.insert((req, set), Active { id, set, shape: shape.to_string(), allocated: torch.allocated, room: torch.allocated, context });
             if let Some(r) = st.table.request_mut(req) {
                 r.episode = Default::default();
                 r.claimed = 0;
@@ -1661,11 +1697,11 @@ impl Inner {
     fn end_pass(&self, req: u64, pass: u64, measured: Measured, torch: Torch) -> Result<()> {
         let mut st = self.lock();
         self.measure(&mut st, torch);
-        if st.active.get(&req).is_none_or(|a| a.id != pass) {
+        let Some(key) = st.active.iter().find(|((r, _), a)| *r == req && a.id == pass).map(|(k, _)| *k) else {
             self.unlock(st);
             return Ok(());
-        }
-        let Some(active) = st.active.remove(&req) else { return Ok(()) };
+        };
+        let Some(active) = st.active.remove(&key) else { return Ok(()) };
         let name = st.mech(active.set)?.spec.name.clone();
         let levels = st.levels(active.set, &active.shape);
         let key = room_key(&name, &active.shape, &levels);
@@ -1696,7 +1732,7 @@ impl Inner {
         {
             let mut st = self.lock();
             self.measure(&mut st, torch);
-            if let (Some(s), Some(a)) = (site.filter(|s| s.collective), st.active.get(&req)) {
+            if let (Some(s), Some(a)) = (site.filter(|s| s.collective), st.current(req)) {
                 let key = (a.set, a.shape.clone(), s.name.to_string());
                 st.collective.insert(key);
             }
@@ -1708,7 +1744,7 @@ impl Inner {
         let stats = |st: &State| st.stats.get(&req).cloned().unwrap_or_default();
         let next = match actions.iter().rev().find(|a| matches!(a, Action::Cut { .. } | Action::Park(_) | Action::Exhausted { .. })) {
             Some(Action::Cut { site, .. }) => {
-                let level = st.active.get(&req).map(|a| (a.set, a.shape.clone())).and_then(|(set, shape)| st.cuts.get(&(set, shape)).and_then(|c| c.get(site).copied()));
+                let level = st.current(req).map(|a| (a.set, a.shape.clone())).and_then(|(set, shape)| st.cuts.get(&(set, shape)).and_then(|c| c.get(site).copied()));
                 Next::Cut(level.unwrap_or(1))
             }
             Some(Action::Park(_)) => {
@@ -1733,7 +1769,7 @@ impl Inner {
     fn end_request(&self, req: u64) -> Stats {
         let mut st = self.lock();
         let name = st.table.request(req).map(|r| r.name.clone()).unwrap_or_default();
-        st.active.remove(&req);
+        st.active.retain(|(r, _), _| *r != req);
         st.synthetic.remove(&req);
         st.table.requests.retain(|r| r.id != req);
         let owned: Vec<u32> = st.table.caches.iter().filter(|c| c.owner == name).map(|c| c.id).collect();
@@ -1801,6 +1837,16 @@ impl Inner {
             self.recover();
         }
         out.unwrap_or(0)
+    }
+
+    /// The RAM tier wants layout `digest` back: its regions are unlocked (one being read when
+    /// its copy ends) and its mapping goes with the last fill holding it. Rust only, at once.
+    fn release_tier(&self, digest: &str) -> u64 {
+        let held: Vec<Arc<tier::Held>> = {
+            let mut st = self.state.lock();
+            st.sets.iter_mut().flatten().filter(|m| m.spec.layout.digest == digest).filter_map(|m| m.held.take()).collect()
+        };
+        held.iter().map(|h| h.release(|p| self.backend.unregister_host(p))).sum()
     }
 
     /// The trim thread's work: the trim hook and shrinks an ask wanted, then a ledger event.
@@ -1873,13 +1919,20 @@ fn fill_loop(jobs: &(Mutex<Jobs>, Condvar), inner: &Weak<Inner>) {
 }
 
 fn ask_loop(listener: crate::os::Listener, row: &Weak<Row>, inner: &Weak<Inner>, stop: &AtomicBool) {
+    if let Some(row) = row.upgrade() {
+        row.ask_thread();
+    }
     for stream in crate::os::incoming(listener) {
         if stop.load(Ordering::Acquire) {
             return;
         }
         let (Some(me), Some(row)) = (inner.upgrade(), row.upgrade()) else { return };
+        let answer = |ask: ledger::Ask| match ask {
+            ledger::Ask::Room { ceiling, bytes } => me.answer(if ceiling >= Class::D.index() { Class::D } else { Class::N }, bytes),
+            ledger::Ask::Host { digest } => me.release_tier(&digest),
+        };
         // Never dies: a failed or panicking answer frees nothing, and the next ask is served.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| row.serve(&stream, |ceiling, bytes| me.answer(ceiling, bytes))));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| row.serve(&stream, answer)));
     }
 }
 
@@ -1923,7 +1976,7 @@ impl Request {
     /// torch's bytes now; returns once the pass's measured room is free.
     pub fn pass(&self, set: SetId, shape: &str, torch: Torch) -> Result<Pass> {
         let id = self.inner.guard(|| self.inner.pass(self.id, set.0, shape, torch))?;
-        Ok(Pass { inner: self.inner.clone(), req: self.id, id })
+        Ok(Pass { inner: self.inner.clone(), req: self.id, set: set.0, id })
     }
 
     /// An op ran out of memory, needing `need` more bytes when the error said; `site` is its
@@ -1958,7 +2011,7 @@ impl Request {
         self.inner
             .guard(|| {
                 let st = self.inner.lock();
-                let level = st.active.get(&self.id).and_then(|a| st.cuts.get(&(a.set, a.shape.clone()))).and_then(|c| c.get(site)).copied().unwrap_or(0);
+                let level = st.current(self.id).and_then(|a| st.cuts.get(&(a.set, a.shape.clone()))).and_then(|c| c.get(site)).copied().unwrap_or(0);
                 self.inner.unlock(st);
                 Ok(level)
             })
@@ -1967,13 +2020,13 @@ impl Request {
 
     /// The current pass's collective sites' proposed levels ([`Pass::levels`]).
     pub fn levels(&self) -> Vec<(String, u32)> {
-        let pass = self.inner.state.lock().active.get(&self.id).map(|a| a.id);
+        let pass = self.inner.state.lock().current(self.id).map(|a| a.id);
         pass.map(|id| self.inner.levels(self.id, id)).unwrap_or_default()
     }
 
     /// The levels the ranks agreed, for the current pass ([`Pass::agree`]).
     pub fn agree(&self, levels: Vec<(String, u32)>) {
-        let pass = self.inner.state.lock().active.get(&self.id).map(|a| a.id);
+        let pass = self.inner.state.lock().current(self.id).map(|a| a.id);
         if let Some(id) = pass {
             self.inner.agree(self.id, id, levels);
         }
@@ -2060,7 +2113,7 @@ impl Inner {
     fn levels(&self, req: u64, pass: u64) -> Vec<(String, u32)> {
         self.guard(|| {
             let st = self.lock();
-            let out = match st.active.get(&req).filter(|a| a.id == pass) {
+            let out = match st.pass_of(req, pass) {
                 Some(a) => {
                     let now = st.levels(a.set, &a.shape);
                     let proposed = st.proposed.get(&(a.set, a.shape.clone())).cloned().unwrap_or_default();
@@ -2079,7 +2132,7 @@ impl Inner {
     fn agree(&self, req: u64, pass: u64, levels: Vec<(String, u32)>) {
         let _ = self.guard(|| {
             let mut st = self.lock();
-            if let Some((set, shape)) = st.active.get(&req).filter(|a| a.id == pass).map(|a| (a.set, a.shape.clone())) {
+            if let Some((set, shape)) = st.pass_of(req, pass).map(|a| (a.set, a.shape.clone())) {
                 for (site, level) in levels {
                     st.collective.insert((set, shape.clone(), site.clone()));
                     let now = st.cuts.entry((set, shape.clone())).or_default().entry(site.clone()).or_insert(0);
@@ -2101,8 +2154,8 @@ impl Drop for Pass {
     /// Ends only its own pass: a newer one of the same request keeps its state.
     fn drop(&mut self) {
         let mut st = self.inner.state.lock();
-        if st.active.get(&self.req).is_some_and(|a| a.id == self.id) {
-            st.active.remove(&self.req);
+        if st.active.get(&(self.req, self.set)).is_some_and(|a| a.id == self.id) {
+            st.active.remove(&(self.req, self.set));
         }
     }
 }
