@@ -524,20 +524,13 @@ fn start_api(
         crate::api::machine_runs::resume(runs)?;
     }
     listener.set_nonblocking(true)?;
-    #[derive(serde::Serialize)]
-    struct Ready<'a> {
-        address: String,
-        worker_id: &'a str,
-        boot_id: &'a str,
-        cert_pem: &'a str,
-    }
-    let ready = serde_json::to_vec(&Ready {
+    let ready = serde_json::to_vec(&protocol::config::ApiReady {
         address: listener.local_addr()?.to_string(),
-        worker_id: &identity.authority.worker_id,
-        boot_id: &identity.authority.boot_id,
-        cert_pem: &identity.cert_pem,
+        worker_id: identity.authority.worker_id.clone(),
+        boot_id: identity.authority.boot_id.clone(),
+        cert_pem: identity.cert_pem.clone(),
     })?;
-    crate::machine::identity::write_atomic(&root.join("api-ready.json"), &ready, 0o600)?;
+    crate::machine::identity::write_atomic(&root.join(protocol::config::API_READY), &ready, 0o600)?;
     let runtime = machine_runtime()?;
     std::thread::Builder::new()
         .name("machine-api".into())

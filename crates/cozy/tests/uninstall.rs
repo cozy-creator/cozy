@@ -1,6 +1,7 @@
 //! `cozy uninstall`, through the installed binary in a home set up as the installer leaves one: it
 //! asks first, then ends Calcifer and the machine, removes `~/.cozy` (itself with it),
-//! `~/.config/cozy` and the shell lines, and keeps only the model store unless `--all`. Every OS.
+//! `~/.config/cozy` and the shell lines, and keeps only the model store, TensorFS's shared cache,
+//! which `--all` names with the command that removes it. Every OS.
 mod common;
 
 use std::{fs, path::Path, time::Duration};
@@ -41,7 +42,7 @@ fn user_path(set: Option<&str>) -> String {
 }
 
 #[test]
-fn uninstall_removes_what_cozy_made_and_keeps_the_model_store_unless_all() {
+fn uninstall_removes_what_cozy_made_and_keeps_the_shared_model_store() {
     let Some(home) = Home::new() else { return };
     let user = home.path();
     let bin = home.root().join("bin");
@@ -81,7 +82,8 @@ fn uninstall_removes_what_cozy_made_and_keeps_the_model_store_unless_all() {
         .root()
         .join("machine/var/lib/cozy/machine/agent.lock.holder");
     let machine: Birth = serde_json::from_slice(&fs::read(holder).unwrap()).unwrap();
-    let store = home.root().join("machine/var/lib/tensorfs");
+    // The model store the machine fills: this computer's TensorFS home, outside ~/.cozy.
+    let store = user.join(".cache/tensorfs");
     write(&store.join("objects/model"), "weights");
 
     // No terminal to answer and no --yes: refused, nothing touched.
@@ -111,12 +113,13 @@ fn uninstall_removes_what_cozy_made_and_keeps_the_model_store_unless_all() {
     assert!(!installed.exists(), "the binary is still there");
     assert!(!user.join(".config/cozy").exists());
     assert!(!fish.exists());
-    let left: Vec<_> = fs::read_dir(home.root())
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name())
-        .collect();
-    assert_eq!(left, ["machine"], "only the model store stays");
+    for _ in 0..100 {
+        if !home.root().exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!home.root().exists(), "~/.cozy is still there");
     assert_eq!(
         fs::read_to_string(store.join("objects/model")).unwrap(),
         "weights"
@@ -131,7 +134,14 @@ fn uninstall_removes_what_cozy_made_and_keeps_the_model_store_unless_all() {
 
     install();
     let all: Value = home.json(["uninstall", "--yes", "--all", "--json"]);
-    assert_eq!(all["kept"], serde_json::json!([]), "{all}");
+    let kept = &all["kept"][0];
+    assert_eq!(kept["path"].as_str().map(Path::new), Some(&*store), "{all}");
+    let remove = kept["remove"].as_str().unwrap_or_default();
+    assert!(remove.contains(&*store.to_string_lossy()), "{all}");
+    assert!(
+        store.join("objects/model").exists(),
+        "--all removed TensorFS's shared cache"
+    );
     for _ in 0..100 {
         if !home.root().exists() {
             break;

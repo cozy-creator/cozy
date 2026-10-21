@@ -1,6 +1,7 @@
 //! `cozy uninstall`: removes what cozy put on this computer: its machine and Calcifer with their
 //! services, `~/.cozy` (this binary with it), the installer's `~/.config/cozy` and shell lines, and
-//! on Windows its PATH entry. The machine's model store stays unless `--all`.
+//! on Windows its PATH entry. The machine's model store is TensorFS's cache, which `tfs` and Python
+//! TensorFS share: it stays, and `--all` says how to remove it.
 use std::{
     fs,
     io::{self, IsTerminal as _, Write as _},
@@ -19,7 +20,8 @@ use crate::{Context, machine, output};
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
-    /// Remove the machine's model store too.
+    /// Name the model store (TensorFS's shared cache) with the command that removes it; it is
+    /// left in place.
     #[arg(long)]
     all: bool,
 }
@@ -39,6 +41,9 @@ const RC_FILES: [&str; 7] = [
 struct Item {
     path: PathBuf,
     bytes: u64,
+    /// For a kept store under `--all`: the command that removes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remove: Option<String>,
 }
 
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
@@ -63,9 +68,8 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         }
     }
     let (root, store) = machine::root_and_store(ctx)?;
-    let keep: Vec<PathBuf> = (store.into_iter())
-        .filter(|store| !args.all && store.exists())
-        .collect();
+    // TensorFS's cache, shared with `tfs` and Python TensorFS: kept, `--all` too (owner ruling).
+    let keep: Vec<PathBuf> = store.into_iter().filter(|store| store.exists()).collect();
     let mut dirs = vec![ctx.home.root().to_path_buf(), root.clone(), config_dir(ctx)];
     if cfg!(windows) && platform::paths::is_login_home(&ctx.user_home) {
         dirs.extend(env("LOCALAPPDATA").map(|dir| dir.join("cozy")));
@@ -77,9 +81,15 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     let item = |path: &PathBuf, keep: &[PathBuf]| Item {
         path: path.clone(),
         bytes: size(path, keep),
+        remove: None,
     };
     let removed: Vec<Item> = dirs.iter().map(|dir| item(dir, &keep)).collect();
-    let kept: Vec<Item> = keep.iter().map(|dir| item(dir, &[])).collect();
+    let kept: Vec<Item> = (keep.iter())
+        .map(|dir| Item {
+            remove: args.all.then(|| removal(dir)),
+            ..item(dir, &[])
+        })
+        .collect();
     let rc: Vec<PathBuf> = (rc_files(ctx).into_iter())
         .filter(|file| unsourced(file).is_some())
         .collect();
@@ -132,11 +142,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     let total = removed.iter().map(|item| item.bytes).sum();
     let mut record = output::Record::new().field("removed", output::bytes(total));
     for item in &kept {
-        record = record.note(format!(
-            "kept the model store at {} ({}); delete that folder to free it",
-            item.path.display(),
-            output::bytes(item.bytes)
-        ));
+        record = record.note(kept_store(item));
     }
     record.note("cozy is uninstalled").print(ctx);
     Ok(ExitCode::SUCCESS)
@@ -152,13 +158,31 @@ fn plan(ctx: &Context, removed: &[Item], kept: &[Item], rc: &[PathBuf]) {
         table = table.row([format!("its line in {}", file.display()), String::new()]);
     }
     for item in kept {
-        table = table.note(format!(
-            "keeps the model store at {} ({}); --all removes it",
-            item.path.display(),
-            output::bytes(item.bytes)
-        ));
+        table = table.note(kept_store(item));
     }
     table.print();
+}
+
+/// The kept store, its size, and (`--all`) how to remove it.
+fn kept_store(item: &Item) -> String {
+    let (path, size) = (item.path.display(), output::bytes(item.bytes));
+    match &item.remove {
+        Some(command) => format!(
+            "keeps TensorFS's model cache at {path} ({size}), which `tfs` and Python TensorFS share; remove it with `{command}`"
+        ),
+        None => format!(
+            "keeps TensorFS's model cache at {path} ({size}); `--all` says how to remove it"
+        ),
+    }
+}
+
+/// The shell command that removes `dir`.
+fn removal(dir: &Path) -> String {
+    let path = dir.display().to_string();
+    match cfg!(windows) {
+        true => format!("Remove-Item -Recurse -Force '{}'", path.replace('\'', "''")),
+        false => format!("rm -rf '{}'", path.replace('\'', "'\\''")),
+    }
 }
 
 /// A person's yes; without a terminal, `--yes` is the only one.

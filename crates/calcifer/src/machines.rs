@@ -934,7 +934,7 @@ pub(crate) async fn create(
             Ok(Json(added.map_err(Refusal)?).into_response())
         }
         NewMachine::Local { root } => {
-            let ready = root.join("var/lib/cozy/tensord/api-ready.json");
+            let ready = protocol::config::MachineRoot::new(root).ready();
             let local = api.machines.put_local(endpoint_of(&ready).map_err(Refusal)?);
             Ok(Json(local.map_err(Refusal)?).into_response())
         }
@@ -1040,12 +1040,6 @@ fn usage(message: String) -> Error {
 
 /// How to reach the TensorD whose `api-ready.json` is at `path`.
 pub fn endpoint_of(path: &Path) -> Result<Endpoint, Error> {
-    #[derive(serde::Deserialize)]
-    struct Ready {
-        address: String,
-        worker_id: String,
-        cert_pem: String,
-    }
     let unreadable = |e: String| {
         Error::new(
             Kind::Unavailable,
@@ -1054,7 +1048,7 @@ pub fn endpoint_of(path: &Path) -> Result<Endpoint, Error> {
         )
     };
     let bytes = std::fs::read(path).map_err(|e| unreadable(e.to_string()))?;
-    let ready: Ready = serde_json::from_slice(&bytes).map_err(|e| unreadable(e.to_string()))?;
+    let ready: protocol::config::ApiReady = serde_json::from_slice(&bytes).map_err(|e| unreadable(e.to_string()))?;
     Ok(Endpoint {
         worker_id: ready.worker_id,
         address: ready.address,

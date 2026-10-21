@@ -30,7 +30,7 @@ pub struct Lifetime {
 /// dying processes or none hold is waited out until the kernel releases it.
 pub fn hold(layout: &Layout) -> io::Result<()> {
     fs::create_dir_all(&layout.state)?;
-    let lock = LockFile::new(layout.state.join("agent.lock"));
+    let lock = LockFile::new(layout.files().lock());
     let held = match lock.try_lock(Kind::Exclusive)? {
         Some(held) => held,
         None => {
@@ -177,7 +177,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tensord-hold-{}", URL_SAFE_NO_PAD.encode(random::<9>().unwrap())));
         let layout = Layout::new(&root, None);
         fs::create_dir_all(&layout.state).unwrap();
-        let mut holder = std::process::Command::new("python3").args(["-c", HOLD]).arg(layout.state.join("agent.lock"))
+        let mut holder = std::process::Command::new("python3").args(["-c", HOLD]).arg(layout.files().lock())
             .stdout(std::process::Stdio::piped()).spawn().unwrap();
         holder.stdout.take().unwrap().read_exact(&mut [0u8; 5]).unwrap();
         let birth = Birth::of(holder.id()).unwrap();

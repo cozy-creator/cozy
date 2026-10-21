@@ -1,6 +1,6 @@
 //! The machine's launch grant: what a Hub (rental) or this computer's home (persistent) gives
 //! it, judged once from [`crate::config`]'s load.
-use protocol::config::MachineConfig;
+use protocol::config::{MachineConfig, MachineRoot};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use platform::paths::Home;
 use ed25519_dalek::VerifyingKey;
@@ -55,9 +55,6 @@ pub struct Grant {
     pub home: Home,
 }
 
-/// A machine root's own TensorFS store.
-const STORE: &str = "var/lib/tensorfs";
-
 /// The image's filesystem, rooted: "/" on a pod, a directory on an owned machine. The paths
 /// preserve the machine's identity across software updates.
 #[derive(Clone, Debug)]
@@ -75,17 +72,22 @@ pub struct Layout {
 }
 impl Layout {
     pub fn new(root: &Path, store: Option<PathBuf>) -> Self {
+        let files = MachineRoot::new(root);
         Self {
             root: root.into(),
-            bootstrap: root.join("run/cozy/bootstrap"),
-            state: root.join("var/lib/cozy/machine"),
-            store: store.unwrap_or_else(|| root.join(STORE)),
+            bootstrap: files.bootstrap(),
+            state: files.state(),
+            store: store.unwrap_or_else(|| files.rental_store()),
             cache: None,
         }
     }
+    /// The root's files (`protocol::config::MachineRoot`), as the CLI and Calcifer find them.
+    pub fn files(&self) -> MachineRoot {
+        MachineRoot::new(&self.root)
+    }
     /// This service's execution journal and package generations.
     pub fn engine(&self) -> PathBuf {
-        self.root.join("var/lib/cozy/tensord")
+        self.files().engine()
     }
 }
 
@@ -160,10 +162,8 @@ impl Grant {
                 _ => return Err(invalid("bootstrap receipt key must be 32 bytes of unpadded base64url")),
             },
         };
-        let store = match (&raw.store, rental) {
-            (None, false) => Some(tensorfs::home::resolve(None).map_err(|e| invalid(&e.to_string()))?),
-            (named, _) => named.clone(),
-        };
+        let shared = || tensorfs::home::resolve(None).map_err(|e| invalid(&e.to_string()));
+        let store = raw.store(&MachineRoot::new(&root), rental, shared)?;
         let idle_ms = match raw.rental_idle_seconds {
             None => super::lifecycle::IDLE_GRACE_MS,
             Some(seconds) if seconds > 0 => i64::from(seconds) * 1000,
@@ -171,7 +171,7 @@ impl Grant {
         };
         Ok(Self {
             lifetime,
-            layout: Layout { cache: raw.cache.clone(), ..Layout::new(&root, store) },
+            layout: Layout { cache: raw.cache.clone(), ..Layout::new(&root, Some(store)) },
             listen_host,
             worker_id,
             worker_port,

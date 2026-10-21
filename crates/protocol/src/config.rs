@@ -6,8 +6,8 @@
 //! a command.
 use std::{
     collections::BTreeMap,
-    fmt,
-    path::PathBuf,
+    fmt, io,
+    path::{Path, PathBuf},
     sync::OnceLock,
 };
 
@@ -121,11 +121,71 @@ pub struct MachineConfig {
 }
 
 impl MachineConfig {
-    /// This computer's machine root: `root`, else `~/.cozy/machine`. Its API's endpoint is
-    /// `<root>/var/lib/cozy/tensord/api-ready.json`.
+    /// This computer's machine root: `root`, else `~/.cozy/machine`.
     pub fn root(&self, home: &Home) -> PathBuf {
         self.root.clone().unwrap_or_else(|| home.machine())
     }
+
+    /// The TensorFS store a machine on `root` fills: `store`, else a rental's own
+    /// (`MachineRoot::rental_store`), else this computer's shared TensorFS home (`shared`:
+    /// `TENSORFS_HOME`, else `~/.cache/tensorfs`).
+    pub fn store(&self, root: &MachineRoot, rental: bool, shared: impl FnOnce() -> io::Result<PathBuf>) -> io::Result<PathBuf> {
+        match (&self.store, rental) {
+            (Some(store), _) => Ok(store.clone()),
+            (None, true) => Ok(root.rental_store()),
+            (None, false) => shared(),
+        }
+    }
+}
+
+/// A machine root's files, laid out as TensorD writes them and as the CLI and Calcifer find them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachineRoot(PathBuf);
+
+/// The file a machine's API writes once it serves ([`ApiReady`]), in its engine directory.
+pub const API_READY: &str = "api-ready.json";
+
+impl MachineRoot {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self(root.into())
+    }
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+    /// Its boot's receipts and TLS leaf.
+    pub fn bootstrap(&self) -> PathBuf {
+        self.0.join("run/cozy/bootstrap")
+    }
+    /// Its lifetime: boot id, ports, logs, lock.
+    pub fn state(&self) -> PathBuf {
+        self.0.join("var/lib/cozy/machine")
+    }
+    /// TensorD's journal, environments and runs' bytes.
+    pub fn engine(&self) -> PathBuf {
+        self.0.join("var/lib/cozy/tensord")
+    }
+    /// Held by the machine on this root for its life; `cozy machine` probes it.
+    pub fn lock(&self) -> PathBuf {
+        self.state().join("agent.lock")
+    }
+    /// Its API's endpoint, written once it serves ([`ApiReady`]).
+    pub fn ready(&self) -> PathBuf {
+        self.engine().join(API_READY)
+    }
+    /// A rental's own TensorFS store.
+    pub fn rental_store(&self) -> PathBuf {
+        self.0.join("var/lib/tensorfs")
+    }
+}
+
+/// How to reach a machine's API once it serves: `api-ready.json` ([`MachineRoot::ready`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiReady {
+    pub address: String,
+    pub worker_id: String,
+    pub boot_id: String,
+    pub cert_pem: String,
 }
 
 /// The environment name of a pod's boot keys.

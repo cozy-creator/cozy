@@ -191,6 +191,7 @@ impl Home {
             "CIVITAI_TOKEN",
             "COZY_DOWNLOAD_URL",
             "COMPLETE",
+            "TENSORFS_HOME",
         ] {
             command.env_remove(var);
         }

@@ -15,6 +15,7 @@ use platform::{
 };
 use protocol::{
     calcifer::{self, Event, Machine, NewMachine, On, Run, RunList, Status, SubmitRun},
+    config::MachineRoot,
     error::{Error, Kind},
     machine as v1,
 };
@@ -180,7 +181,7 @@ fn spec(ctx: &Context, root: &Path) -> Result<ServiceSpec, Error> {
 }
 
 fn start_log(root: &Path) -> PathBuf {
-    root.join("var/lib/cozy/machine/start.log")
+    MachineRoot::new(root).state().join("start.log")
 }
 
 /// Starts the machine detached from this command, as `spec` says (in this command's environment,
@@ -234,7 +235,7 @@ async fn start(
 /// Ends a detached machine: the process its root's lock names, and everything it started.
 fn end_detached(root: &Path) -> Result<(), Error> {
     let failed = |e: String| Error::new(Kind::Unavailable, "machine_stop_failed", e);
-    let lock = LockFile::new(root.join("var/lib/cozy/machine/agent.lock"));
+    let lock = LockFile::new(MachineRoot::new(root).lock());
     if free(root) {
         return Ok(());
     }
@@ -266,15 +267,18 @@ fn machine_config(ctx: &Context) -> Result<protocol::config::MachineConfig, Erro
     Ok(config.machine)
 }
 
-/// For `cozy uninstall`: the machine's root, and the model store it keeps there (none when the
-/// config names a store elsewhere, which may be shared).
+/// For `cozy uninstall`: the machine's root, and the model store it fills (this computer's
+/// TensorFS home, as the machine resolves it); none when the config names a store, which may be
+/// another's.
 pub(crate) fn root_and_store(ctx: &Context) -> Result<(PathBuf, Option<PathBuf>), Error> {
     let config = machine_config(ctx)?;
     let root = config.root(&ctx.home);
-    let store = config
-        .store
-        .is_none()
-        .then(|| root.join("var").join("lib").join("tensorfs"));
+    let shared = || tensorfs::home::resolve(None).map_err(std::io::Error::other);
+    let store = match config.store {
+        Some(_) => None,
+        None => Some(config.store(&MachineRoot::new(&root), false, shared)
+            .map_err(|e| Error::new(Kind::Internal, "store_unresolved", e.to_string()))?),
+    };
     Ok((root, store))
 }
 
@@ -296,7 +300,7 @@ pub(crate) fn end(ctx: &Context, root: &Path) -> Result<(), Error> {
 /// The running machine's processes, eldest first: the holder of its root's lock and all it
 /// started, and on Windows the stable parent above it, which would start a killed service again.
 fn processes(root: &Path) -> Vec<platform::process::Exact> {
-    let lock = LockFile::new(root.join("var/lib/cozy/machine/agent.lock"));
+    let lock = LockFile::new(MachineRoot::new(root).lock());
     let holder = (!free(root))
         .then(|| lock.holder().ok().flatten())
         .flatten();
@@ -315,7 +319,7 @@ fn processes(root: &Path) -> Vec<platform::process::Exact> {
 
 /// Whether nothing holds the machine's root: no machine has run there, or none runs now.
 fn free(root: &Path) -> bool {
-    let path = root.join("var/lib/cozy/machine/agent.lock");
+    let path = MachineRoot::new(root).lock();
     !path.exists()
         || matches!(
             LockFile::new(path).try_lock(LockKind::Exclusive),
@@ -323,13 +327,9 @@ fn free(root: &Path) -> bool {
         )
 }
 
-fn ready_path(root: &Path) -> PathBuf {
-    root.join("var/lib/cozy/tensord/api-ready.json")
-}
-
 /// When the machine at `root` last wrote that it serves: its `api-ready.json`'s mtime.
 fn served_at(root: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(ready_path(root))
+    std::fs::metadata(MachineRoot::new(root).ready())
         .and_then(|m| m.modified())
         .ok()
 }
