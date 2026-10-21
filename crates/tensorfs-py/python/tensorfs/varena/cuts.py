@@ -185,6 +185,12 @@ def serve(memo: Memo, rungs: Rungs) -> None:
     _served.memo, _served.rungs = memo, rungs
 
 
+def available(device: torch.device) -> int:
+    """What one allocation on `device` may take now (0: no memory serves it), for a caller that
+    sizes its own pieces, such as a context-parallel exchange."""
+    return _served.rungs.available(device)
+
+
 @dataclass(eq=False, slots=True)
 class _Scope:
     finer: bool = False
