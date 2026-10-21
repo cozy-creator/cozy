@@ -172,10 +172,10 @@ fn an_empty_shape_fits_by_the_widest_measured() {
     let (_scope, ledger, mem, _g) = open("widest", 16 * MB);
     ledger.restore(&[varena::Peak::Request { key: "pkg|1x1".into(), bytes: 2 * MB }, varena::Peak::Request { key: "pkg|4x4".into(), bytes: 17 * MB }]).unwrap();
     let busy = mem.request("busy", Plan::default()).unwrap();
-    assert!(ledger.fits("pkg", "1x1"));
-    assert!(!ledger.fits("pkg", ""), "the widest (17 MB) beside a running request does not fit");
+    assert!(ledger.fits("pkg", "1x1", None));
+    assert!(!ledger.fits("pkg", "", None), "the widest (17 MB) beside a running request does not fit");
     drop(busy);
-    assert!(ledger.fits("pkg", ""), "an idle GPU fits anything");
+    assert!(ledger.fits("pkg", "", None), "an idle GPU fits anything");
 }
 
 /// Round 2, finding 4: in a joint step an OOM names its set, and cuts only that set's site,

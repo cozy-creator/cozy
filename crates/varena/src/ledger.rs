@@ -23,6 +23,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use platform::handles::Owned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::custody;
 use crate::decide::{self, Admitted};
@@ -31,7 +32,7 @@ use crate::memory::SitePeak;
 use crate::table::{Class, Remote};
 use crate::{Error, GpuId, Result};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"vledger7");
+const MAGIC: u64 = u64::from_le_bytes(*b"vledger8");
 /// The header's page: the heap starts after it, and grows from there.
 const HEADER: u64 = 4096;
 /// The heap's unit: rows take two, a fact as many as its bytes need.
@@ -48,8 +49,9 @@ const READY: u64 = 2;
 const ROW: u64 = 1;
 const FACT: u64 = 2;
 
-/// The latch: context, torch, caches, classes (7), remaining, unmeasured, running, outside.
-const WORDS: usize = 14;
+/// The latch: context, torch, caches, classes (7), remaining, unmeasured, running, outside,
+/// yielded, family.
+const WORDS: usize = 16;
 
 #[repr(C)]
 struct Header {
@@ -80,6 +82,8 @@ struct RowRec {
     /// Host layouts the RAM tier is asking this row back and it has not answered: the tier is
     /// no row, so its asks are marked here.
     host: AtomicU64,
+    /// Its process waits for room elsewhere: every change of the table signals its endpoint.
+    waiting: AtomicU64,
     seq: AtomicU64,
     latch: [[AtomicU64; WORDS]; 2],
 }
@@ -139,17 +143,21 @@ pub(crate) struct Facts {
     pub unmeasured: u64,
     pub running: u64,
     pub outside: u64,
+    /// The remaining W of its requests waiting on child calls, and the family they wait for
+    /// (a hash; 0: none): only that family's child is admitted beside it as if it were gone.
+    pub yielded: u64,
+    pub family: u64,
 }
 
 impl Facts {
     fn words(&self) -> [u64; WORDS] {
         let c = self.classes;
-        [self.context, self.torch, self.caches, c[0], c[1], c[2], c[3], c[4], c[5], c[6], self.remaining, self.unmeasured, self.running, self.outside]
+        [self.context, self.torch, self.caches, c[0], c[1], c[2], c[3], c[4], c[5], c[6], self.remaining, self.unmeasured, self.running, self.outside, self.yielded, self.family]
     }
 
     fn of(w: [u64; WORDS]) -> Facts {
-        let [context, torch, caches, c0, c1, c2, c3, c4, c5, c6, remaining, unmeasured, running, outside] = w;
-        Facts { context, torch, caches, classes: [c0, c1, c2, c3, c4, c5, c6], remaining, unmeasured, running, outside }
+        let [context, torch, caches, c0, c1, c2, c3, c4, c5, c6, remaining, unmeasured, running, outside, yielded, family] = w;
+        Facts { context, torch, caches, classes: [c0, c1, c2, c3, c4, c5, c6], remaining, unmeasured, running, outside, yielded, family }
     }
 
     fn held(&self) -> u64 {
@@ -172,6 +180,7 @@ pub(crate) struct RowView {
     pub tid: u32,
     /// Host layouts the tier is asking of it now.
     pub host: u64,
+    pub waiting: bool,
 }
 
 impl RowView {
@@ -339,7 +348,21 @@ impl Shared {
     /// Room freed, a row died, an ask went out or a peak was recorded: TensorD's event, from
     /// every participant (granted or standalone) through the GPU's named wake.
     pub fn ring(&self) {
+        self.event();
+        // And every row waiting for room.
+        if let Ok(rows) = self.waiting() {
+            rows.into_iter().for_each(|id| os::wake(&self.wake, self.ns, &row_wake(&self.name, id)));
+        }
+    }
+
+    /// TensorD's event alone.
+    fn event(&self) {
         os::wake(&self.wake, self.ns, &self.name);
+    }
+
+    /// The rows waiting for room (their ids).
+    fn waiting(&self) -> Result<Vec<u64>> {
+        self.records(|m, at, w| (kind(w) == ROW && row(m, at)?.waiting.load(Acquire) > 0).then(|| row_id(at, w)))
     }
 
     /// Every READY record, read again if the heap's shape moved meanwhile.
@@ -468,7 +491,7 @@ impl Shared {
             if let Some(r) = row(m, at) {
                 r.pid.store(pid, Relaxed);
                 r.tid.store(0, Relaxed);
-                [&r.asking, &r.asked, &r.orphans, &r.host, &r.seq].iter().for_each(|a| a.store(0, Relaxed));
+                [&r.asking, &r.asked, &r.orphans, &r.host, &r.waiting, &r.seq].iter().for_each(|a| a.store(0, Relaxed));
                 r.latch.iter().flatten().for_each(|a| a.store(0, Relaxed));
             }
         })?;
@@ -490,7 +513,7 @@ impl Shared {
             }
             let r = row(m, at)?;
             let facts = Facts::of(latch_read(&r.seq, &r.latch));
-            Some(RowView { off: at, word: w, pid: r.pid.load(Acquire), live: true, facts, orphans: r.orphans.load(Acquire), asking: r.asking.load(Acquire), asked: r.asked.load(Acquire), tid: r.tid.load(Acquire), host: r.host.load(Acquire) })
+            Some(RowView { off: at, word: w, pid: r.pid.load(Acquire), live: true, facts, orphans: r.orphans.load(Acquire), asking: r.asking.load(Acquire), asked: r.asked.load(Acquire), tid: r.tid.load(Acquire), host: r.host.load(Acquire), waiting: r.waiting.load(Acquire) > 0 })
         })?;
         views
             .into_iter()
@@ -637,6 +660,17 @@ fn restore_fact(shared: &Shared, key: &str, value: Vec<u8>) -> Result<()> {
     shared.merge(key, |old| Some(old.map_or(value, <[u8]>::to_vec)))
 }
 
+/// A family's id as rows publish it (never 0).
+pub(crate) fn family_id(family: &str) -> u64 {
+    let h = Sha256::digest(family.as_bytes());
+    u64::from_le_bytes(std::array::from_fn(|i| h.get(i).copied().unwrap_or(0))).max(1)
+}
+
+/// The wake endpoint of row `id`, signalled while it waits for room.
+fn row_wake(gpu: &str, id: u64) -> String {
+    format!("{gpu}-row-{id}")
+}
+
 fn ask_name(gpu: &str, id: u64) -> String {
     format!("ask-{gpu}-{id}")
 }
@@ -734,6 +768,17 @@ impl Row {
         rec.asking.store(0, Release);
         rec.asked.store(0, Release);
         Ok(freed)
+    }
+
+    /// This row's wake endpoint, signalled while it waits for room.
+    pub fn endpoint(&self) -> Result<Owned> {
+        os::wake_bind(self.shared.ns, &row_wake(&self.shared.name, self.id()))?.ok_or_else(|| Error::Internal("a row's wake is taken".into()))
+    }
+
+    /// Marks this row waiting (every change of the table signals it) or not.
+    pub fn set_waiting(&self, waiting: bool) {
+        self.rec(|r| r.waiting.store(u64::from(waiting), Release));
+        self.shared.event();
     }
 
     /// Binds this row's ask socket: its owner's ask thread serves it.
@@ -937,6 +982,8 @@ pub struct RowStatus {
     pub torch: u64,
     /// Bytes asked of it and not yet answered.
     pub asked: u64,
+    /// Waiting for room: a request's wait on a child call ended and its room is not back yet.
+    pub waiting: bool,
 }
 
 /// The table at a glance (display only; reading it changes nothing).
@@ -1043,7 +1090,7 @@ impl Ledger {
         let admitted = rows
             .iter()
             .filter(|r| r.live)
-            .map(|r| Admitted { context: r.facts.context, outside: r.facts.outside, remaining: r.facts.remaining, running: r.facts.running as u32, unmeasured: r.facts.unmeasured as u32 })
+            .map(|r| Admitted { context: r.facts.context, outside: r.facts.outside, remaining: r.facts.remaining, running: r.facts.running as u32, unmeasured: r.facts.unmeasured as u32, yielded: r.facts.yielded, family: r.facts.family })
             .collect();
         let dispatched = self.shared.facts("dispatch/")?.into_iter().map(|(_, key)| self.peak(&String::from_utf8_lossy(&key))).collect::<Result<_>>()?;
         Ok((self.shared.capacity()?, self.shared.foreign()?, admitted, dispatched))
@@ -1062,18 +1109,18 @@ impl Ledger {
 
     /// Whether a request of `package` at `shape` (empty: its widest measured shape) can start
     /// now beside everything running.
-    pub fn fits(&self, package: &str, shape: &str) -> bool {
+    pub fn fits(&self, package: &str, shape: &str, family: Option<&str>) -> bool {
         let fit = || -> Result<bool> {
             let (capacity, foreign, rows, dispatched) = self.admitted()?;
-            Ok(decide::fits(capacity, foreign, &rows, &dispatched, self.peak(&format!("{package}|{shape}"))?))
+            Ok(decide::fits(capacity, foreign, &rows, &dispatched, self.peak(&format!("{package}|{shape}"))?, family.map(family_id)))
         };
         fit().unwrap_or(false)
     }
 
     /// A multi-GPU group: dispatches `request` on every GPU of `group` if it fits on all, else
     /// on none (an error part-way undoes the dispatches made).
-    pub fn admit(group: &[&Ledger], request: &str, package: &str, shape: &str) -> Result<bool> {
-        if !group.iter().all(|l| l.fits(package, shape)) {
+    pub fn admit(group: &[&Ledger], request: &str, package: &str, shape: &str, family: Option<&str>) -> Result<bool> {
+        if !group.iter().all(|l| l.fits(package, shape, family)) {
             return Ok(false);
         }
         for (i, l) in group.iter().enumerate() {
@@ -1141,7 +1188,7 @@ impl Ledger {
             foreign,
             rows: rows
                 .iter()
-                .map(|r| RowStatus { pid: r.pid, live: r.live, context: r.facts.context, classes: classes(r), remaining: r.facts.remaining, unmeasured: r.facts.unmeasured as u32, torch: r.facts.torch, asked: asked_of(&rows, r.id()) })
+                .map(|r| RowStatus { pid: r.pid, live: r.live, context: r.facts.context, classes: classes(r), remaining: r.facts.remaining, unmeasured: r.facts.unmeasured as u32, torch: r.facts.torch, asked: asked_of(&rows, r.id()), waiting: r.waiting })
                 .collect(),
             dispatched: dispatched.into_iter().map(|(k, v)| (k.trim_start_matches("dispatch/").to_string(), String::from_utf8_lossy(&v).into_owned())).collect(),
         }

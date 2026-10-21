@@ -380,15 +380,15 @@ fn any_oom_sequence_ends_within_pages_plus_cuts_plus_two() {
 
 #[test]
 fn admission_counts_each_byte_once() {
-    let row = |remaining, running, unmeasured| Admitted { context: GB, outside: 0, remaining, running, unmeasured };
-    assert!(fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[], Some(12 * GB)));
-    assert!(!fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[], Some(13 * GB + 1)));
-    assert!(!fits(24 * GB, 2 * GB, &[row(10 * GB, 1, 0)], &[], Some(12 * GB)), "foreign bytes are taken off");
-    assert!(!fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[Some(4 * GB)], Some(12 * GB)), "a dispatched request counts");
+    let row = |remaining, running, unmeasured| Admitted { context: GB, outside: 0, remaining, running, unmeasured, yielded: 0, family: 0 };
+    assert!(fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[], Some(12 * GB), None));
+    assert!(!fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[], Some(13 * GB + 1), None));
+    assert!(!fits(24 * GB, 2 * GB, &[row(10 * GB, 1, 0)], &[], Some(12 * GB), None), "foreign bytes are taken off");
+    assert!(!fits(24 * GB, 0, &[row(10 * GB, 1, 0)], &[Some(4 * GB)], Some(12 * GB), None), "a dispatched request counts");
     // Unmeasured: only on an idle GPU.
-    assert!(!fits(24 * GB, 0, &[row(GB, 1, 0)], &[], None));
-    assert!(fits(24 * GB, 0, &[row(0, 0, 0)], &[], None));
-    assert!(!fits(24 * GB, 0, &[row(GB, 1, 1)], &[], Some(GB)));
+    assert!(!fits(24 * GB, 0, &[row(GB, 1, 0)], &[], None, None));
+    assert!(fits(24 * GB, 0, &[row(0, 0, 0)], &[], None, None));
+    assert!(!fits(24 * GB, 0, &[row(GB, 1, 1)], &[], Some(GB), None));
 }
 
 // ---- regressions from review 1
@@ -414,7 +414,7 @@ fn an_oom_counts_its_own_unmaps_after_an_ask() {
 #[test]
 fn an_idle_gpu_admits_a_model_larger_than_the_card() {
     let idle = Admitted { context: GB, ..Admitted::default() };
-    assert!(fits(8 * GB, 0, &[idle], &[], Some(20 * GB)));
+    assert!(fits(8 * GB, 0, &[idle], &[], Some(20 * GB), None));
     let (mut t, rooms) = h3(8 * GB);
     play(&mut t, &rooms, false);
     let r = &t.requests[0];

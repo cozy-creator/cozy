@@ -484,8 +484,8 @@ fn answer(t: &Table, ceiling: Class, bytes: u64) -> Vec<Action> {
     if ceiling >= Class::D {
         d.evict(Class::D);
     }
-    // Idle, or every request waiting on a child call: its trim and caches answer too.
-    if t.requests.iter().all(|r| r.yielded.is_some()) && !d.enough() {
+    // Idle: its trim and caches answer too.
+    if t.requests.is_empty() && !d.enough() {
         if t.slack() > 0 {
             d.out.push(Action::Trim(t.slack()));
         }
@@ -547,20 +547,24 @@ pub struct Admitted {
     pub running: u32,
     /// Running requests with an unmeasured step left.
     pub unmeasured: u32,
+    /// The remaining W of its requests waiting on child calls, and their family (0: none).
+    pub yielded: u64,
+    pub family: u64,
 }
 
 /// Whether a request whose W is `w` (`None`: unmeasured) fits beside `rows` and the dispatched
 /// requests not yet running: contexts + pins outside a running W + each running request's
 /// largest remaining W + this one's ≤ capacity less foreign bytes. An idle GPU always fits (a
-/// request larger than the card streams); anything unmeasured fits only there.
-pub fn fits(capacity: u64, foreign: u64, rows: &[Admitted], dispatched: &[Option<u64>], w: Option<u64>) -> bool {
+/// request larger than the card streams); anything unmeasured fits only there. A request
+/// waiting on a child call counts too, except for its own family's child (`family`).
+pub fn fits(capacity: u64, foreign: u64, rows: &[Admitted], dispatched: &[Option<u64>], w: Option<u64>, family: Option<u64>) -> bool {
     if rows.iter().all(|r| r.running == 0) && dispatched.is_empty() {
         return true;
     }
     if w.is_none() || rows.iter().any(|r| r.unmeasured > 0) || dispatched.iter().any(Option::is_none) {
         return false;
     }
-    let rows: u64 = rows.iter().map(|r| r.context + r.outside + r.remaining).sum();
+    let rows: u64 = rows.iter().map(|r| r.context + r.outside + r.remaining + if family == Some(r.family) { 0 } else { r.yielded }).sum();
     let dispatched: u64 = dispatched.iter().flatten().sum();
     rows + dispatched + w.unwrap_or(0) <= capacity.saturating_sub(foreign)
 }

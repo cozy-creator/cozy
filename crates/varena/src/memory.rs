@@ -522,6 +522,8 @@ struct Inner {
     shared: Arc<Shared>,
     row: Arc<Row>,
     _device: Device,
+    /// Signalled by every change of the table while this process waits for room.
+    room_wake: Owned,
     custody: Option<Arc<custody::Client>>,
     tier: Option<Arc<tier::Client>>,
     state: Mutex<State>,
@@ -566,6 +568,7 @@ impl Memory {
             shared.reap(None)?;
             let row = Arc::new(shared.claim_with(std::process::id(), grant.row)?);
             let listener = row.listen()?;
+            let room_wake = row.endpoint()?;
             let custody = custody::Client::open(&shared).map_err(|e| tracing::warn!("varena: no custody: {e}")).ok().map(Arc::new);
             let tier = tier::Client::open(shared.ns).map_err(|e| tracing::warn!("varena: no RAM tier: {e}")).ok().map(Arc::new);
             let (to_custody, to_tier, mech) = (Arc::new(Outbox::default()), Arc::new(Outbox::default()), Arc::new(Outbox::default()));
@@ -580,6 +583,7 @@ impl Memory {
                 shared,
                 row: row.clone(),
                 _device: device,
+                room_wake,
                 custody,
                 tier,
                 state: Mutex::new(State { table, holder, tier_holder, ..State::default() }),
@@ -970,8 +974,9 @@ impl Inner {
     fn publish(&self, st: &State) {
         let t = &st.table;
         let remaining: Vec<Option<u64>> = t.requests.iter().map(|r| t.remaining(r)).collect();
-        // Every request waiting on a child call: idle for others, its slack and caches theirs.
-        let idle = t.requests.iter().all(|r| r.yielded.is_some());
+        // A request waiting on a child call is no stranger's: it runs, and its W counts for
+        // everyone but its family's child.
+        let idle = t.requests.is_empty();
         self.row.publish(&Facts {
             context: t.context,
             torch: t.torch() + st.claims.values().sum::<u64>(),
@@ -979,8 +984,10 @@ impl Inner {
             classes: t.classes(),
             remaining: remaining.iter().flatten().sum(),
             unmeasured: remaining.iter().filter(|r| r.is_none()).count() as u64,
-            running: t.requests.iter().filter(|r| r.yielded.is_none()).count() as u64,
+            running: t.requests.len() as u64,
             outside: t.outside(),
+            yielded: t.requests.iter().map(|r| t.yielded_w(r)).sum(),
+            family: t.requests.iter().find(|r| r.yielded.is_some()).map_or(0, |r| r.family),
         });
     }
 
@@ -2453,15 +2460,18 @@ impl Request {
         self.inner.state.lock().current(self.id).is_some_and(|a| a.measured)
     }
 
-    /// The request waits on a child call: until the guard drops it gives back its reserved
-    /// room, counts only what is allocated, has no remaining working set, and its step's pages
-    /// may be asked for (a later use). Dropped, it takes its room back as a pass start does.
-    pub fn yielding(&self) -> Yielded {
+    /// The request waits on a child call of its family `family`: until the guard drops it gives
+    /// back its reserved room and counts only what is allocated; its remaining working set is
+    /// published apart, for every request's admission but that family's child; its step's
+    /// pages may be asked for (a later use). Dropped, it takes its room back as a request first
+    /// gets it (a decision, then waits on the table's changes).
+    pub fn yielding(&self, family: &str) -> Yielded {
         let _ = self.inner.guard(|| {
             let mut st = self.inner.lock();
             if let Some(r) = st.table.request_mut(self.id).filter(|r| r.yielded.is_none()) {
                 r.yielded = Some(r.room + r.claimed);
                 (r.room, r.claimed) = (0, 0);
+                r.family = ledger::family_id(family);
             }
             self.inner.publish(&st);
             self.inner.unlock(st);
@@ -2691,16 +2701,29 @@ impl Inner {
             self.unlock(st);
             back.zip(set)
         };
-        if let Some(((room, measured), set)) = back {
-            let actions = self.demand(Trigger::Pass { req, set, room: measured.then_some(room), unmeasured: room, tried: Tried::default() }, Some(req))?;
-            if let Some(Action::Exhausted { need }) = actions.last() {
-                let st = self.lock();
-                let stats = st.stats.get(&req).cloned().unwrap_or_default();
-                self.unlock(st);
-                return Err(Error::Exhausted(exhausted(*need, None, stats)));
+        let Some(((room, measured), set)) = back else { return Ok(()) };
+        // Its room back as a request first gets it: a decision, then waits on the table's
+        // changes. Exhausted only if the card cannot hold it at all.
+        self.row.set_waiting(true);
+        let out = loop {
+            let actions = match self.demand(Trigger::Pass { req, set, room: measured.then_some(room), unmeasured: room, tried: Tried::default() }, Some(req)) {
+                Ok(a) => a,
+                Err(e) => break Err(e),
+            };
+            let Some(Action::Exhausted { need }) = actions.last() else { break Ok(()) };
+            let st = self.lock();
+            let never = room > st.table.capacity;
+            let stats = st.stats.get(&req).cloned().unwrap_or_default();
+            self.unlock(st);
+            if never {
+                break Err(Error::Exhausted(exhausted(*need, None, stats)));
             }
-        }
-        Ok(())
+            if let Err(e) = crate::os::wake_await(&self.room_wake) {
+                break Err(e);
+            }
+        };
+        self.row.set_waiting(false);
+        out
     }
 
     fn levels(&self, req: u64, pass: u64) -> Vec<(String, u32)> {
@@ -2746,8 +2769,8 @@ pub struct Yielded {
 }
 
 impl Yielded {
-    /// The wait is over: the room is taken back as a pass start takes it, `Exhausted` when it
-    /// cannot be (the caller handles it as at a pass start). Dropping it does the same, quietly.
+    /// The wait is over: the room is taken back, waiting for it as a request first gets it;
+    /// `Exhausted` only when the card cannot hold it. Dropping it does the same, quietly.
     pub fn end(mut self) -> Result<()> {
         match self.wait.take() {
             Some((inner, req)) => inner.guard(|| inner.unyield(req)),

@@ -253,6 +253,8 @@ pub struct Req {
     /// Waiting on a child call: the room it gave back, retaken when the wait ends. Meanwhile
     /// its current step's pages are a later use (D) and it has no remaining W.
     pub yielded: Option<u64>,
+    /// The family it waits for while yielded (`crate::ledger` publishes it; 0: none).
+    pub family: u64,
     pub episode: Episode,
 }
 
@@ -494,6 +496,14 @@ impl Table {
                 room.map(|room| self.held_pages(req, sets) + room)
             })
             .try_fold(0, |m, w| w.map(|w| m.max(w)))
+    }
+
+    /// A yielded request's remaining W as it will be when its wait ends (0 when not yielded):
+    /// admission counts it for everyone but its family's child.
+    pub fn yielded_w(&self, req: &Req) -> u64 {
+        let Some(room) = req.yielded else { return 0 };
+        let back = Req { room, yielded: None, ..req.clone() };
+        self.remaining(&back).unwrap_or_else(|| self.w(&back))
     }
 
     /// Pinned bytes outside every open request's current step (counted apart by `fits`).

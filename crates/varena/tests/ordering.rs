@@ -792,26 +792,6 @@ fn a_capped_table_keeps_its_cap_beside_other_occupants() {
     assert_eq!(mem.torch_limit(), 4 << 20, "min(cap, card - others)");
 }
 
-/// Review 3, N5: a parent whose room is gone when its wait ends (its child's bytes, here others'
-/// on the card) hears it as at a pass start.
-#[test]
-fn a_yield_that_cannot_take_its_room_back_says_so() {
-    let dir = tempfile::tempdir().unwrap();
-    let uuid = format!("unyield-{}", std::process::id());
-    let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 << 20 };
-    let _scope = Scope::new(&g.uuid);
-    let events = Arc::new(Events::default());
-    let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap();
-    let p = mem.load(stored(dir.path(), &uuid, "p", 1), Level::Ram).unwrap();
-    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["p".into()], passes: 1 }] }).unwrap();
-    let pass = r.pass(p, "fwd", "1x8", Torch { allocated: 2 << 20, reserved: 2 << 20 }).unwrap();
-    let wait = r.yielding();
-    // The child takes the rest of the card meanwhile.
-    events.foreign.store(6 << 20, Ordering::SeqCst);
-    assert!(matches!(wait.end(), Err(varena::Error::Exhausted(_))));
-    drop(pass);
-}
-
 /// One Memory per device per process: a row is a process.
 #[test]
 fn a_device_opens_once_per_process() {
