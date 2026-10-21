@@ -1139,7 +1139,7 @@ async fn source_export_lazily_downloads_only_selected_verified_objects() {
     ))
     .unwrap();
     let tree = producer
-        .upload_folder(&"acme/export".parse().unwrap(), &data.folder, None)
+        .upload_folder(&"acme/export".parse().unwrap(), &data.folder, &[], None)
         .await
         .unwrap();
     let http = Http::new(origin);
