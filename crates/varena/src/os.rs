@@ -1,0 +1,367 @@
+//! The OS mechanisms under the ledger and the services: a named shared file, row locks that die
+//! with their holder (OFD locks), wait words (futex), a wake event (eventfd) and a local service
+//! socket whose bound name is the service lock. Linux has them; elsewhere every call refuses
+//! until its seam exists, and the decision code above is the same.
+
+use std::sync::atomic::AtomicU32;
+
+use platform::handles::Owned;
+
+use crate::{Error, Result};
+
+/// A shared mapping; unmapped on drop.
+pub(crate) struct Map {
+    pub base: *mut u8,
+    pub len: usize,
+}
+
+// SAFETY: the mapping is reached only through atomics and bytes its users synchronise.
+unsafe impl Send for Map {}
+// SAFETY: as above.
+unsafe impl Sync for Map {}
+
+/// A message on a service stream: JSON bytes and, maybe, one handle.
+pub(crate) type Message = (Vec<u8>, Option<Owned>);
+
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::{Map, Message};
+    use crate::{Error, Result};
+    use platform::handles::Owned;
+    use platform::shm::Region;
+
+    pub(crate) type Listener = UnixListener;
+    pub(crate) type Stream = UnixStream;
+
+    /// A file in shared memory named per user: `/dev/shm/cozy-varena-<uid>-<name>`.
+    pub(crate) fn shared(name: &str, create: bool) -> Result<(Owned, bool)> {
+        // SAFETY: geteuid reads a process attribute.
+        let uid = unsafe { libc::geteuid() };
+        let clean: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+        let path = format!("/dev/shm/cozy-varena-{uid}-{clean}");
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true);
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        if create {
+            if let Ok(file) = options.clone().create_new(true).open(&path) {
+                return Ok((file.into(), true));
+            }
+        }
+        let file = options.open(&path).map_err(|e| Error::io(&format!("open {path}"), e))?;
+        Ok((file.into(), false))
+    }
+
+    pub(crate) fn size(fd: &Owned) -> Result<u64> {
+        let file = std::fs::File::from(fd.try_clone().map_err(|e| Error::io("dup", e))?);
+        Ok(file.metadata().map_err(|e| Error::io("stat", e))?.len())
+    }
+
+    pub(crate) fn resize(fd: &Owned, len: u64) -> Result<()> {
+        // SAFETY: sizing a file we hold.
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } != 0 {
+            return Err(Error::os("resize"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn map(fd: &Owned, len: usize, write: bool) -> Result<Map> {
+        let prot = if write { libc::PROT_READ | libc::PROT_WRITE } else { libc::PROT_READ };
+        // SAFETY: a new shared mapping of a file we hold.
+        let base = unsafe { libc::mmap(std::ptr::null_mut(), len, prot, libc::MAP_SHARED, fd.as_raw_fd(), 0) };
+        if base == libc::MAP_FAILED {
+            return Err(Error::os("map"));
+        }
+        Ok(Map { base: base.cast(), len })
+    }
+
+    /// `len` bytes of `fd` from `offset`, a multiple of the page size.
+    pub(crate) fn map_at(fd: &Owned, offset: u64, len: usize, write: bool) -> Result<Map> {
+        let prot = if write { libc::PROT_READ | libc::PROT_WRITE } else { libc::PROT_READ };
+        // SAFETY: a new shared mapping of a file we hold.
+        let base = unsafe { libc::mmap(std::ptr::null_mut(), len, prot, libc::MAP_SHARED, fd.as_raw_fd(), offset as libc::off_t) };
+        if base == libc::MAP_FAILED {
+            return Err(Error::os("map"));
+        }
+        Ok(Map { base: base.cast(), len })
+    }
+
+    impl Drop for Map {
+        fn drop(&mut self) {
+            // SAFETY: our own mapping; nothing borrows it past its owner.
+            unsafe { libc::munmap(self.base.cast(), self.len) };
+        }
+    }
+
+    pub(crate) fn reopen(fd: &Owned, write: bool) -> Result<Owned> {
+        Ok(platform::shm::reopen(fd.as_fd(), write)?)
+    }
+
+    /// Takes (or, `wait`, waits for) a write lock on a byte range of this description.
+    pub(crate) fn lock(fd: &Owned, start: u64, len: u64, wait: bool) -> Result<bool> {
+        Ok(platform::shm::region_lock(fd.as_fd(), start as usize, len as usize, Region::Write, wait)?)
+    }
+
+    /// Takes (or waits for) a read lock: many readers, no writer.
+    pub(crate) fn share(fd: &Owned, start: u64, len: u64, wait: bool) -> Result<bool> {
+        Ok(platform::shm::region_lock(fd.as_fd(), start as usize, len as usize, Region::Read, wait)?)
+    }
+
+    pub(crate) fn unlock(fd: &Owned, start: u64, len: u64) -> Result<()> {
+        platform::shm::region_lock(fd.as_fd(), start as usize, len as usize, Region::Unlock, false)?;
+        Ok(())
+    }
+
+    /// Whether another description holds a lock over the range.
+    pub(crate) fn held(fd: &Owned, start: u64, len: u64) -> Result<bool> {
+        Ok(platform::shm::region_holder(fd.as_fd(), start as usize, len as usize)?.is_some())
+    }
+
+    pub(crate) fn punch(fd: &Owned, offset: u64, len: u64) -> Result<()> {
+        Ok(platform::shm::punch(fd.as_fd(), offset, len)?)
+    }
+
+    pub(crate) fn memfd(name: &str) -> Result<Owned> {
+        Ok(platform::shm::memfd_named(name)?)
+    }
+
+    pub(crate) fn wait(word: &AtomicU32, seen: u32) {
+        // SAFETY: a futex wait on a live shared word; it returns on a change, a wake or a signal.
+        unsafe { libc::syscall(libc::SYS_futex, word.as_ptr(), libc::FUTEX_WAIT, seen, std::ptr::null::<libc::timespec>()) };
+    }
+
+    pub(crate) fn wake(word: &AtomicU32) {
+        // SAFETY: a futex wake on a live shared word.
+        unsafe { libc::syscall(libc::SYS_futex, word.as_ptr(), libc::FUTEX_WAKE, i32::MAX) };
+    }
+
+    /// Bumps `word` and wakes its waiters.
+    pub(crate) fn ring(word: &AtomicU32) {
+        word.fetch_add(1, Ordering::Release);
+        wake(word);
+    }
+
+    pub(crate) fn event() -> Result<Owned> {
+        // SAFETY: eventfd(2) with no shared state.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(Error::os("eventfd"));
+        }
+        // SAFETY: a descriptor we just created.
+        Ok(unsafe { Owned::from_raw_fd(fd) })
+    }
+
+    pub(crate) fn signal(event: &Owned) {
+        let one = 1u64.to_ne_bytes();
+        // SAFETY: an 8-byte write to an eventfd; a full counter is a signal already.
+        unsafe { libc::write(event.as_raw_fd(), one.as_ptr().cast(), 8) };
+    }
+
+    /// Blocks until `event` is readable, then clears it.
+    pub(crate) fn await_event(event: &Owned) -> Result<()> {
+        let mut poll = libc::pollfd { fd: event.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        loop {
+            // SAFETY: one live descriptor.
+            if unsafe { libc::poll(&mut poll, 1, -1) } > 0 {
+                let mut buf = [0u8; 8];
+                // SAFETY: an 8-byte read into our buffer; EAGAIN when another reader took it.
+                unsafe { libc::read(event.as_raw_fd(), buf.as_mut_ptr().cast(), 8) };
+                return Ok(());
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(Error::io("poll", e));
+            }
+        }
+    }
+
+    fn address(name: &str) -> Result<SocketAddr> {
+        // SAFETY: geteuid reads a process attribute.
+        let uid = unsafe { libc::geteuid() };
+        SocketAddr::from_abstract_name(format!("cozy-varena-{uid}-{name}")).map_err(|e| Error::io("socket name", e))
+    }
+
+    /// Binds the service name: `None` while another process holds it. The bound name is the
+    /// service lock, released by the kernel when its holder dies.
+    pub(crate) fn listen(name: &str) -> Result<Option<Listener>> {
+        match UnixListener::bind_addr(&address(name)?) {
+            Ok(l) => Ok(Some(l)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Ok(None),
+            Err(e) => Err(Error::io("bind service", e)),
+        }
+    }
+
+    /// Connects to the service; `None` when nobody serves it.
+    pub(crate) fn connect(name: &str) -> Result<Option<Stream>> {
+        match UnixStream::connect_addr(&address(name)?) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Ok(None),
+            Err(e) => Err(Error::io("connect service", e)),
+        }
+    }
+
+    /// The peer's pid; only this user's processes may connect.
+    pub(crate) fn peer(stream: &Stream) -> Result<u32> {
+        Ok(platform::handles::peer_credentials(stream)?.pid)
+    }
+
+    pub(crate) fn send(stream: &Stream, (bytes, handle): &Message) -> Result<()> {
+        let mut s = stream;
+        let mut head = (bytes.len() as u32).to_le_bytes().to_vec();
+        head.push(handle.is_some() as u8);
+        head.extend_from_slice(bytes);
+        s.write_all(&head).map_err(|e| Error::io("send", e))?;
+        if let Some(h) = handle {
+            platform::handles::send_fd(stream, h)?;
+        }
+        Ok(())
+    }
+
+    /// The next message; `None` at the end of the stream.
+    pub(crate) fn recv(stream: &Stream) -> Result<Option<Message>> {
+        let mut s = stream;
+        let mut head = [0u8; 5];
+        match s.read_exact(&mut head) {
+            Ok(()) => {}
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset) => return Ok(None),
+            Err(e) => return Err(Error::io("recv", e)),
+        }
+        let [a, b, c, d, fd] = head;
+        let mut bytes = vec![0u8; u32::from_le_bytes([a, b, c, d]) as usize];
+        s.read_exact(&mut bytes).map_err(|e| Error::io("recv", e))?;
+        let handle = if fd == 1 { Some(platform::handles::recv_fd(stream)?) } else { None };
+        Ok(Some((bytes, handle)))
+    }
+
+
+    pub(crate) fn dup(h: &Owned) -> Result<Owned> {
+        h.try_clone().map_err(|e| Error::io("dup", e))
+    }
+
+    pub(crate) fn unlink(name: &str) {
+        // SAFETY: geteuid reads a process attribute.
+        let uid = unsafe { libc::geteuid() };
+        let clean: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+        let _ = std::fs::remove_file(format!("/dev/shm/cozy-varena-{uid}-{clean}"));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod imp {
+    use std::sync::atomic::AtomicU32;
+
+    use super::{Map, Message};
+    use crate::{Error, Result};
+    use platform::handles::Owned;
+
+    /// A service endpoint this OS does not have yet.
+    pub(crate) enum Listener {}
+    pub(crate) enum Stream {}
+
+    fn later() -> Error {
+        Error::Invalid(format!("the shared table is not yet on {}", std::env::consts::OS))
+    }
+
+    pub(crate) fn shared(_: &str, _: bool) -> Result<(Owned, bool)> {
+        Err(later())
+    }
+    pub(crate) fn size(_: &Owned) -> Result<u64> {
+        Err(later())
+    }
+    pub(crate) fn resize(_: &Owned, _: u64) -> Result<()> {
+        Err(later())
+    }
+    pub(crate) fn map(_: &Owned, _: usize, _: bool) -> Result<Map> {
+        Err(later())
+    }
+    pub(crate) fn map_at(_: &Owned, _: u64, _: usize, _: bool) -> Result<Map> {
+        Err(later())
+    }
+    impl Drop for Map {
+        fn drop(&mut self) {}
+    }
+    pub(crate) fn reopen(_: &Owned, _: bool) -> Result<Owned> {
+        Err(later())
+    }
+    pub(crate) fn lock(_: &Owned, _: u64, _: u64, _: bool) -> Result<bool> {
+        Err(later())
+    }
+    pub(crate) fn share(_: &Owned, _: u64, _: u64, _: bool) -> Result<bool> {
+        Err(later())
+    }
+    pub(crate) fn unlock(_: &Owned, _: u64, _: u64) -> Result<()> {
+        Err(later())
+    }
+    pub(crate) fn held(_: &Owned, _: u64, _: u64) -> Result<bool> {
+        Err(later())
+    }
+    pub(crate) fn punch(_: &Owned, _: u64, _: u64) -> Result<()> {
+        Err(later())
+    }
+    pub(crate) fn memfd(_: &str) -> Result<Owned> {
+        Err(later())
+    }
+    pub(crate) fn wait(_: &AtomicU32, _: u32) {}
+    pub(crate) fn wake(_: &AtomicU32) {}
+    pub(crate) fn ring(_: &AtomicU32) {}
+    pub(crate) fn event() -> Result<Owned> {
+        Err(later())
+    }
+    pub(crate) fn signal(_: &Owned) {}
+    pub(crate) fn await_event(_: &Owned) -> Result<()> {
+        Err(later())
+    }
+    pub(crate) fn listen(_: &str) -> Result<Option<Listener>> {
+        Err(later())
+    }
+    pub(crate) fn connect(_: &str) -> Result<Option<Stream>> {
+        Err(later())
+    }
+    pub(crate) fn peer(s: &Stream) -> Result<u32> {
+        match *s {}
+    }
+    pub(crate) fn send(s: &Stream, _: &Message) -> Result<()> {
+        match *s {}
+    }
+    pub(crate) fn recv(s: &Stream) -> Result<Option<Message>> {
+        match *s {}
+    }
+    pub(crate) fn dup(_: &Owned) -> Result<Owned> {
+        Err(later())
+    }
+    pub(crate) fn unlink(_: &str) {}
+}
+
+pub(crate) use imp::*;
+
+/// Waits until `done` answers, woken through `word`.
+pub(crate) fn until<T>(word: &AtomicU32, mut done: impl FnMut() -> Option<T>) -> T {
+    loop {
+        let seen = word.load(std::sync::atomic::Ordering::Acquire);
+        if let Some(x) = done() {
+            return x;
+        }
+        wait(word, seen);
+    }
+}
+
+/// A typed message's bytes.
+pub(crate) fn encode<T: serde::Serialize>(m: &T) -> Result<Vec<u8>> {
+    serde_json::to_vec(m).map_err(|e| Error::Internal(format!("encode: {e}")))
+}
+
+pub(crate) fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T> {
+    serde_json::from_slice(b).map_err(|e| Error::Invalid(format!("decode: {e}")))
+}
+
+/// Sends `m` with `handle` and reads the typed reply.
+pub(crate) fn call<T: serde::Serialize, R: serde::de::DeserializeOwned>(stream: &Stream, m: &T, handle: Option<Owned>) -> Result<(R, Option<Owned>)> {
+    send(stream, &(encode(m)?, handle))?;
+    let (bytes, handle) = recv(stream)?.ok_or_else(|| Error::Closed("the service".into()))?;
+    Ok((decode(&bytes)?, handle))
+}

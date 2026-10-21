@@ -106,7 +106,9 @@ impl Layout {
                 return Err(Error::Invalid(format!("{what:?} is named both as a part and by its tensor")));
             }
             seen.insert(key);
-            per_region[r as usize].push(i);
+            if let Some(v) = per_region.get_mut(r as usize) {
+                v.push(i);
+            }
         }
         if let Some(t) = owner.keys().find(|t| !seen.contains(*t)) {
             return Err(Error::Invalid(format!("region names {t:?}, which the checkpoint does not carry")));
@@ -121,7 +123,7 @@ impl Layout {
             let mut items = Vec::new();
             let mut end = start;
             for &i in idx {
-                let (what, its) = &parts[i];
+                let Some((what, its)) = parts.get(i) else { continue };
                 let off = align_up(end, PART_ALIGN);
                 let mut n = 0u64;
                 for (j, it) in its.iter().enumerate() {
