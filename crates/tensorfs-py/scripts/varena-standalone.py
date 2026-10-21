@@ -5,7 +5,8 @@ A `UNet2DConditionModel` (305 MiB) is written into a TensorFS store; the same mo
 meta is loaded through `tensorfs.varena.torch.Memory` (blocks from `_no_split_modules`) and run
 under `mem.request`:
   - with room for it all, against the plain model; held bound (a CUDA graph's hold); a direct
-    child's forward is its own pass, keyed by its entry;
+    child's forward is its own pass, keyed by its entry; a fill-identity change sheds a hold and
+    bakes anew; two threads' passes measured apart;
   - in two processes on one table, the idle one making room for the other;
   - with a capacity below its size, so it streams, its outputs the uncapped run's and its fills
     reported against `tensorfs.ceiling`; and so with a declared fill on fresh pages.
@@ -51,6 +52,8 @@ CONFIG = dict(
 )
 CUDA = torch.cuda.is_available()
 DEVICE = torch.device("cuda", 0) if CUDA else torch.device("cpu")
+# Every process of the test computes in F32 (TF32 convolutions differ by about 1e-3).
+torch.backends.cudnn.allow_tf32 = torch.backends.cuda.matmul.allow_tf32 = False
 #: The same device's kernels agree to F32 rounding; the CPU and a GPU differ by more.
 SAME, ACROSS = 1e-5, 1e-3
 results: list[bool] = []
@@ -96,23 +99,83 @@ def forward(unet: UNet2DConditionModel, device: torch.device, n: int) -> torch.T
         return unet(x, 3, encoder_hidden_states=text).sample.cpu()
 
 
-class Double:
-    """A declared fill, as a LoRA bake is: doubles each attention query weight as its page arrives."""
+class Scale:
+    """A declared fill, as a LoRA bake is: scales each attention query weight by `k` as its page
+    arrives; `k` is its identity, read at every pass."""
 
-    identity = "double to_q"
+    def __init__(self, k: int) -> None:
+        self.k = k
+
+    @property
+    def identity(self) -> str:
+        return f"to_q x{self.k}"
 
     def __call__(self, block: str, parts: dict[str, dict[str, torch.Tensor]]) -> None:
         for key, roles in parts.items():
             if key.endswith("to_q.weight"):
-                roles["value"].mul_(2)
+                roles["value"].mul_(self.k)
 
 
-def loaded(ck: tensorfs.Checkpoint, mem: Memory, fill: Double | None = None) -> UNet2DConditionModel:
+def scaled(plain: UNet2DConditionModel, k: int) -> list[torch.Tensor]:
+    """The plain model's outputs with its attention query weights scaled by `k`."""
+    model = UNet2DConditionModel(**CONFIG).eval()
+    model.load_state_dict({key: v * k if key.endswith("to_q.weight") else v for key, v in plain.state_dict().items()})
+    return [forward(model, torch.device("cpu"), n) for n in range(2)]
+
+
+def loaded(ck: tensorfs.Checkpoint, mem: Memory, fill: Scale | None = None) -> UNet2DConditionModel:
+    """The model on meta, loaded; a filled one is its own set (its own release)."""
     with torch.device("meta"):
         unet = UNet2DConditionModel(**CONFIG).eval()
-    vars(unet)["_varena"] = Declared(Weights(ck, "unet"), fill=fill)
+    vars(unet)["_varena"] = Declared(Weights(ck, "unet", release="scaled" if fill else ""), fill=fill)
     mem.load(unet, "gpu")
     return unet
+
+
+def concurrent(mem: Memory, ck: tensorfs.Checkpoint) -> None:
+    """Two threads run two models' passes interleaved: the first allocates and frees a buffer,
+    then waits while the second opens its pass (a device-wide peak reset) and ends it. The first
+    pass's peak must still hold its buffer, and the second's must not."""
+    a, b = loaded(ck, mem), loaded(ck, mem)
+    big = 1 << 29  # far above the tiny model's own activations, so the peaks tell the passes apart
+    opened, done = threading.Event(), threading.Event()
+
+    def allocate(*_: object) -> None:
+        torch.empty(big, dtype=torch.uint8, device=mem.device)  # freed at once: only the peak keeps it
+        opened.set()
+        done.wait()
+
+    hook = a.conv_in.register_forward_pre_hook(allocate)
+    errors: list[BaseException] = []
+
+    def pass_a() -> None:
+        try:
+            with mem.request("concurrent a", plan=[a]):
+                forward(a, mem.device, 0)
+        except BaseException as e:
+            errors.append(e)
+
+    def pass_b() -> None:
+        try:
+            opened.wait()
+            with mem.request("concurrent b", plan=[b]):
+                forward(b, mem.device, 0)
+        except BaseException as e:
+            errors.append(e)
+        finally:
+            done.set()
+
+    threads = [threading.Thread(target=pass_a), threading.Thread(target=pass_b)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    hook.remove()
+    check("concurrent: two threads' passes both complete", not errors, errors)
+    pa, pb = mem.models[a].last, mem.models[b].last
+    if CUDA:
+        check("concurrent: the first pass keeps its buffer's peak across the other's reset", pa is not None and pa[1] >= big, pa)
+        check("concurrent: the second pass's peak is its own", pb is not None and pb[1] < big, pb)
 
 
 def run(mem: Memory, unet: UNet2DConditionModel, want: list[torch.Tensor], id: str, atol: float) -> tuple[native.Stats, list[torch.Tensor]]:
@@ -194,17 +257,35 @@ def child(store: str, table: str, capacity: int, reference: str) -> int:
     return 0 if all(results) else 1
 
 
+def attempts(mem: Memory, unet: UNet2DConditionModel) -> None:
+    """An op at a cut site fails (its attempt allocated `failed` bytes), varena answers, and the
+    retry allocates `retried`: the pass records the completed attempt's peak, not the failed one's."""
+    failed, retried = 1 << 30, 1 << 28  # apart by far more than the tiny model's own activations
+
+    def op(*_: object) -> None:
+        r = mem._current()
+        with r.site("probe"):
+            torch.empty(failed, dtype=torch.uint8, device=mem.device)
+            r.oom(None, "probe")
+            torch.empty(retried, dtype=torch.uint8, device=mem.device)
+
+    hook = unet.conv_in.register_forward_pre_hook(op)
+    with mem.request("attempts", plan=[unet]):
+        forward(unet, mem.device, 0)
+    hook.remove()
+    last = mem.models[unet].last
+    if CUDA:
+        check("attempts: a pass records the completed attempt's peak, not the failed one's", last is not None and retried <= last[1] < failed, last)
+
+
 def main() -> int:
     stub_matches()
-    torch.backends.cudnn.allow_tf32 = torch.backends.cuda.matmul.allow_tf32 = False
     store = Path(tempfile.mkdtemp(prefix="varena-standalone-")) / "store"
     plain, ck = build(store)
     tag = f"varena-standalone-{os.getpid()}"
     expected = [forward(plain, torch.device("cpu"), n) for n in range(2)]
 
     mem = Memory.open(0) if CUDA else opened(f"{tag}-ample", 1 << 31)
-    # A GPU's capacity counts the whole card: this process's context and anything foreign.
-    base = (lambda free, total: total - free)(*torch.cuda.mem_get_info(0)) if CUDA else 0
     unet = loaded(ck, mem)
     stats, reference = run(mem, unet, expected, "ample", ACROSS if CUDA else SAME)
     model = mem.models[unet]
@@ -231,6 +312,20 @@ def main() -> int:
     diff = (got - plain.conv_in(x.cpu()).detach()).abs().max().item()
     check(f"entries: a direct child's forward runs bound (max diff {diff:.2e})", diff <= ACROSS, diff)
     check("entries: each entry is its own pass key", len(keys) == 2 and keys[0].startswith("conv_in|") and keys[1].startswith("|"), keys)
+    # The capacity varena ran a step against is the card less contexts (grown by now: cuDNN,
+    # cuBLAS) and foreign bytes; the limits below are that much plus what they mean to hold.
+    base = mem.gpu.memory - min(step.capacity for step in r.stats().steps)
+
+    shed: list[bool] = []
+    scale = Scale(2)
+    filled = loaded(ck, mem, scale)
+    hold = mem.models[filled].hold(shed=lambda: shed.append(True))
+    run(mem, filled, scaled(plain, 2)[:1], "scaled x2, held", ACROSS if CUDA else SAME)
+    scale.k = 3
+    run(mem, filled, scaled(plain, 3)[:1], "scaled x3", ACROSS if CUDA else SAME)
+    check("identity: a pass under a new identity shed the hold of the old bake", shed == [True] and not mem.models[filled].holds, (shed, hold.blocks))
+    concurrent(mem, ck)
+    attempts(mem, unet)
     spans = model.set.spans
     room = stats.peak - sum(spans)  # the passes' measured room beside the weights
     common, blocks = spans[0], sorted(spans[1:])
@@ -263,10 +358,7 @@ def main() -> int:
     print(f"STATS_JSON {stats.json()}", flush=True)
 
     mem = opened(f"{tag}-fill", capacity)
-    doubled = UNet2DConditionModel(**CONFIG).eval()
-    doubled.load_state_dict({k: v * 2 if k.endswith("to_q.weight") else v for k, v in plain.state_dict().items()})
-    want = [forward(doubled, torch.device("cpu"), n) for n in range(2)]
-    stats, _ = run(mem, loaded(ck, mem, Double()), want, "fill", ACROSS if CUDA else SAME)
+    stats, _ = run(mem, loaded(ck, mem, Scale(2)), scaled(plain, 2), "fill", ACROSS if CUDA else SAME)
     check("fill: each fresh page is filled once", sum(r.origin != "hit" for r in stats.trace) > 0, stats.trace)
 
     print(f"{sum(results)}/{len(results)} checks passed")

@@ -10,8 +10,9 @@ A block's params are views of its pin only while the block runs; placeholders (s
 device, no bytes) stand in otherwise, so no tensor outlives its page. A model's top-level forward
 is one pass: its fill identity is set, varena makes its measured room, torch's allocator is
 capped to `torch_limit`, and the pass reports torch's allocated peak, the allocator's slack and
-each cut site's peak, with torch's bytes at its start and end and at every `oom`. varena calls
-torch's `empty_cache` when its decision trims. cozy-runtime's catch calls `r.oom` and `r.cut` and
+each cut site's peak, with torch's bytes at its start and end and at every `oom`. Peaks reset
+device-wide, so every reset first folds them into every open pass. varena calls torch's
+`empty_cache` when its decision trims. cozy-runtime's catch calls `r.oom` and `r.cut` and
 measures sites with `r.site`.
 """
 
@@ -194,13 +195,19 @@ class Model:
         self.common: _Block | None = None
         self.sites = _sites(module)
         self.handles: list[torch.utils.hooks.RemovableHandle] = []
-        self.depth = 0
-        self.passing: _Pass | None = None
+        #: per thread: its forwards' depth, and the pass the outermost opened
+        self.local = threading.local()
+        self.holds: list[Hold] = []
+        #: its last measured pass: `(shape, allocated peak, slack)` as sent to varena
+        self.last: tuple[str, int, int] | None = None
+        #: the fill identity its pages were last declared under
+        self.identity: str | None = declared.fill.identity if declared.fill is not None else None
 
-    def hold(self) -> Hold:
+    def hold(self, shed: Callable[[], None] | None = None) -> Hold:
         """Every block bound, pins and param views, until the hold's release (a CUDA graph's
         fixed addresses). Register the graph as a `mem.cache` whose shrink drops it and releases
-        this."""
+        this. A pass that changes the fill identity sheds the hold first and calls `shed` (it
+        drops the graph, whose addresses hold the old bake)."""
         blocks = [b for b in (self.common, *self.blocks.values()) if b is not None]
         held: list[_Block] = []
         try:
@@ -211,7 +218,9 @@ class Model:
             for b in reversed(held):
                 self.memory._exit(b)
             raise
-        return Hold(self.memory, held)
+        hold = Hold(self, held, shed)
+        self.holds.append(hold)
+        return hold
 
     def close(self) -> None:
         """Unhooks the module and unloads its set."""
@@ -225,13 +234,21 @@ class Model:
 class Hold:
     """A model's blocks held bound (`Model.hold`); `release`, or leaving its `with`, lets them go."""
 
-    def __init__(self, memory: Memory, blocks: list[_Block]) -> None:
-        self.memory, self.blocks = memory, blocks
+    def __init__(self, model: Model, blocks: list[_Block], shed: Callable[[], None] | None) -> None:
+        self.model, self.blocks, self.on_shed = model, blocks, shed
 
     def release(self) -> None:
         blocks, self.blocks = self.blocks, []
+        if self in self.model.holds:
+            self.model.holds.remove(self)
         for b in reversed(blocks):
-            self.memory._exit(b)
+            self.model.memory._exit(b)
+
+    def shed(self) -> None:
+        """Released for a fill-identity change; its owner drops what it built on the old bake."""
+        self.release()
+        if self.on_shed is not None:
+            self.on_shed()
 
     def __enter__(self) -> Hold:
         return self
@@ -255,9 +272,12 @@ class Memory:
         self.cuda = device.type == "cuda"
         self.models: dict[nn.Module, Model] = {}
         self.requests: dict[Request, None] = {}
-        self.total = torch.cuda.mem_get_info(device)[1] if self.cuda else 0
-        if self.cuda:
-            native.trim_with(self._trim)
+        self.torch = _Allocator(device)
+        #: every open pass on the device, of every thread: a reset folds into each first
+        self.passes: list[_Pass] = []
+        self.measuring = threading.Lock()
+        if device.type != "cpu":
+            native.trim_with(self.torch.trim)
 
     @classmethod
     def open(cls, gpu: int | str | torch.device | GpuId = 0, grant: Grant | None = None, *, limit: int | None = None) -> Memory:
@@ -328,10 +348,17 @@ class Memory:
         token = _request.set(r)
         try:
             yield r
+        except BaseException as failed:
+            try:
+                r.ended = r.native.end()
+            except BaseException as ending:
+                failed.add_note(f"ending request {id!r} also failed: {ending!r}")  # the request's own error stays the one raised
+            raise
+        else:
+            r.ended = r.native.end()
         finally:
             _request.reset(token)
             self.requests.pop(r, None)
-            r.ended = r.native.end()
 
     def cache(self, owner: str, shrink: Callable[[int], int]) -> Cache:
         """Bytes the caller holds that `shrink(want) -> freed` gives back on varena's ask; a
@@ -375,57 +402,74 @@ class Memory:
 
     def _cap(self) -> None:
         """torch's allocator may hold `torch_limit` bytes from now on."""
-        if self.cuda:
-            fraction = min(self.native.torch_limit() / self.total, 1.0)
-            torch.cuda.set_per_process_memory_fraction(fraction, self.device)
+        self.torch.cap(self.native.torch_limit())
 
-    def _trim(self) -> int:
-        before = torch.cuda.memory_reserved(self.device)
-        torch.cuda.empty_cache()
-        return max(before - torch.cuda.memory_reserved(self.device), 0)
+    def _fold(self, discard: _Pass | None = None) -> None:
+        """The allocator's peaks since the last reset into every open pass and its open sites,
+        but `discard`'s (a failed attempt's); then the reset. The only place peaks reset."""
+        with self.measuring:
+            peak, reserved = self.torch.peaks()
+            for p in self.passes:
+                if p is not discard:
+                    p.peak, p.reserved_peak = max(p.peak, peak), max(p.reserved_peak, reserved)
+                    for entry in p.open:
+                        entry[1] = max(entry[1], peak)  # type: ignore[call-overload]
+            self.torch.reset()
 
     # -- passes
 
     def _open(self, model: Model, entry: str, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
         """The outermost forward of `model` (its root or a direct child, `entry`) is a pass, keyed
         by its entry and its tensor arguments' dims: each entry point has its own measured room."""
-        with model.lock:
-            model.depth += 1
-            if model.depth > 1:
-                return
-            try:
-                r = self._current()
-                dims = "x".join(str(d) for t in tree_leaves((args, kwargs)) if isinstance(t, Tensor) for d in t.shape)
-                shape = f"{entry}|{dims}"
-                self.native.fill(model.id, _fill(model.fill))
-                p = _Pass(r.native.pass_(model.id, shape, *_torch(self)), model.id, shape)
-                self._cap()
-                p.entered = sys.exc_info()[1]
-                if self.cuda:
-                    torch.cuda.reset_peak_memory_stats(self.device)
-                if model.common is not None:
-                    self._enter(model.common)
-                model.passing, p.token = p, _pass.set(p)
-            except BaseException:
-                model.depth -= 1
-                raise
+        local = model.local
+        local.depth = getattr(local, "depth", 0) + 1
+        if local.depth > 1:
+            return
+        p: _Pass | None = None
+        try:
+            r = self._current()
+            dims = "x".join(str(d) for t in tree_leaves((args, kwargs)) if isinstance(t, Tensor) for d in t.shape)
+            shape = f"{entry}|{dims}"
+            identity = model.fill.identity if model.fill is not None else None
+            if identity != model.identity:
+                for hold in list(model.holds):  # pins of the old bake would keep its pages
+                    hold.shed()
+                model.identity = identity
+            self.native.fill(model.id, _fill(model.fill))
+            p = _Pass(r.native.pass_(model.id, shape, *self.torch.now()), model.id, shape)
+            self._cap()
+            p.entered = sys.exc_info()[1]
+            self._fold()  # the passes open already keep what ran before; this one starts here
+            with self.measuring:
+                self.passes.append(p)
+            if model.common is not None:
+                self._enter(model.common)
+            local.passing, p.token = p, _pass.set(p)
+        except BaseException:
+            local.depth -= 1
+            with self.measuring:
+                if p in self.passes:
+                    self.passes.remove(p)
+            raise
 
     def _close(self, model: Model) -> None:
-        with model.lock:
-            model.depth -= 1
-            p = model.passing
-            if model.depth or p is None:
-                return
-            model.passing = None
-            _pass.reset(p.token)  # type: ignore[arg-type]
-            if model.common is not None:
-                self._exit(model.common)
-            if sys.exc_info()[1] is not p.entered:
-                return  # torch runs this hook in its handler of the forward's raise: unended, it records nothing
-            if self.cuda:
-                _fold(p, self.device)
-            sites = [(name, peak, collective) for name, (peak, collective) in p.sites.items()]
-            p.native.end(p.peak, max(p.reserved_peak - p.peak, 0), sites, *_torch(self))
+        local = model.local
+        local.depth -= 1
+        p = getattr(local, "passing", None)
+        if local.depth or p is None:
+            return
+        local.passing = None
+        _pass.reset(p.token)  # type: ignore[arg-type]
+        if model.common is not None:
+            self._exit(model.common)
+        self._fold()
+        with self.measuring:
+            self.passes.remove(p)
+        if sys.exc_info()[1] is not p.entered:
+            return  # torch runs this hook in its handler of the forward's raise: unended, it records nothing
+        sites = [(name, peak, collective) for name, (peak, collective) in p.sites.items()]
+        model.last = (p.shape, p.peak, max(p.reserved_peak - p.peak, 0))
+        p.native.end(model.last[1], model.last[2], sites, *self.torch.now())
 
     # -- blocks
 
@@ -451,15 +495,12 @@ class Memory:
         model = block.model
         pin = self.native.bind(model.id, block.region, stream.cuda_stream if stream is not None else 0)
         base = torch.from_dlpack(pin)
-        if base.device != self.device and not self.cuda:
-            base = base.to(self.device)  # MPS: host pages are copied in for the block's run
-        views = {
-            key: {role: base[a.offset : a.offset + a.nbytes].view(a.dtype).view(a.shape) for role, a in roles.items()}
-            for key, roles in block.tensors.items()
-        }
         if pin.fresh and model.fill is not None:
-            model.fill(block.path, views)
+            model.fill(block.path, _views(block, base))  # on the pin's own bytes, before any copy
             pin.filled()
+        if base.device != self.device:
+            base = base.to(self.device)  # MPS: host pages are copied in for the block's run
+        views = _views(block, base)
         block.pin, block.stream = pin, stream
         try:
             _write(block, views)
@@ -482,7 +523,12 @@ class Request:
     def oom(self, need: int | None = None, site: str | None = None, collective: bool = False) -> Next:
         """An op ran out of memory: varena's answer, with torch's cap applied after it. A
         `collective` site's finer level waits for the next pass's agreement."""
-        answer = self.native.oom(_open_pass().set, *_torch(self.memory), need, site, collective)
+        p = _open_pass()
+        answer = self.native.oom(p.set, *self.memory.torch.now(), need, site, collective)
+        # The failed attempt's peak is not the pass's: when it ran in its site, it is dropped, and
+        # the retry is measured afresh from here.
+        attempt = bool(p.open) and p.open[-1][0] == site
+        self.memory._fold(discard=p if attempt else None)
         self.memory._cap()
         return answer
 
@@ -518,17 +564,17 @@ class Request:
         """Measures cut site `name`'s op (a `collective`'s: its levels are agreed per pass): its
         allocated peak goes into the open pass's sites and its peak."""
         p = _pass.get()
-        if p is None or not self.memory.cuda:
+        if p is None:
             yield
             return
-        device = self.memory.device
-        _fold(p, device)
-        entry: list[object] = [name, torch.cuda.memory_allocated(device)]
+        memory = self.memory
+        memory._fold()
+        entry: list[object] = [name, memory.torch.now()[0]]
         p.open.append(entry)
         try:
             yield
         finally:
-            _fold(p, device)
+            memory._fold()
             p.open.remove(entry)
             p.sites[name] = (max(p.sites.get(name, (0, collective))[0], entry[1]), collective)  # type: ignore[call-overload]
 
@@ -552,10 +598,58 @@ class Cache:
 # ------------------------------------------------------------------------------ helpers
 
 
-def _torch(memory: Memory) -> tuple[int, int]:
-    if not memory.cuda:
+class _Allocator:
+    """torch's allocator on the memory's device: its bytes, peaks, cap and trim. CUDA's keeps
+    peaks. MPS's keeps none, so its peak is what each fold reads. The CPU's is the host's
+    malloc: nothing to read or cap."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device, self.kind = device, device.type
+        self.total = torch.cuda.mem_get_info(device)[1] if self.kind == "cuda" else 0
+        if self.kind == "mps":
+            self.total = torch.mps.recommended_max_memory()
+
+    def now(self) -> tuple[int, int]:
+        """Bytes allocated and reserved now."""
+        if self.kind == "cuda":
+            return torch.cuda.memory_allocated(self.device), torch.cuda.memory_reserved(self.device)
+        if self.kind == "mps":
+            return torch.mps.current_allocated_memory(), torch.mps.driver_allocated_memory()
         return 0, 0
-    return torch.cuda.memory_allocated(memory.device), torch.cuda.memory_reserved(memory.device)
+
+    def peaks(self) -> tuple[int, int]:
+        """The allocated and reserved peaks since the last reset."""
+        if self.kind == "cuda":
+            return torch.cuda.max_memory_allocated(self.device), torch.cuda.max_memory_reserved(self.device)
+        return self.now()
+
+    def reset(self) -> None:
+        if self.kind == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+    def cap(self, limit: int) -> None:
+        if self.kind == "cuda":
+            torch.cuda.set_per_process_memory_fraction(min(limit / self.total, 1.0), self.device)
+        elif self.kind == "mps":
+            # MPS takes a fraction of its recommended working set, at most twice it.
+            torch.mps.set_per_process_memory_fraction(min(limit / self.total, 2.0))
+
+    def trim(self) -> int:
+        """`empty_cache`, returning the bytes it gave back (varena calls it when it trims)."""
+        before = self.now()[1]
+        if self.kind == "cuda":
+            torch.cuda.empty_cache()
+        elif self.kind == "mps":
+            torch.mps.empty_cache()
+        return max(before - self.now()[1], 0)
+
+
+def _views(block: _Block, base: Tensor) -> dict[str, dict[str, Tensor]]:
+    """The block's stored parts as typed views of its bytes `base`."""
+    return {
+        key: {role: base[a.offset : a.offset + a.nbytes].view(a.dtype).view(a.shape) for role, a in roles.items()}
+        for key, roles in block.tensors.items()
+    }
 
 
 def _open_pass() -> _Pass:
@@ -571,16 +665,6 @@ def _fill(fill: Filling | None) -> Fill:
     if fill is None:
         return Fill.Stored()
     return Fill.Undeclared() if fill.identity is None else Fill.Declared(fill.identity)
-
-
-def _fold(p: _Pass, device: torch.device) -> None:
-    """The allocator's peaks since the last reset into the pass and its open sites; then reset."""
-    peak = torch.cuda.max_memory_allocated(device)
-    p.peak = max(p.peak, peak)
-    p.reserved_peak = max(p.reserved_peak, torch.cuda.max_memory_reserved(device))
-    for entry in p.open:
-        entry[1] = max(entry[1], peak)  # type: ignore[call-overload]
-    torch.cuda.reset_peak_memory_stats(device)
 
 
 def _block_of(key: str, paths: Sequence[str]) -> str:
