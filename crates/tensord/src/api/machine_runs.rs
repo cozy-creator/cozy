@@ -803,13 +803,14 @@ mod tests {
         let service = Service::open(&state, &generations, 1).unwrap();
         let objects =
             Arc::new(Objects::new(&temp.path().join("writes"), service.engine.clone()).unwrap());
+        let store = crate::storage::open(&temp.path().join("store")).unwrap();
         let runs = Arc::new(Runs {
             service,
             objects,
-            publisher: None,
+            publisher: crate::published::Publisher::new(&temp.path().join("published"), Default::default(),
+                crate::origin::Machine::new(store, None).unwrap()).unwrap(),
             local: None,
             own_hub: None,
-           
             contexts: Default::default(),
         });
         let mut resent = original;

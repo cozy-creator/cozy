@@ -13,6 +13,7 @@ use tensord::{
     journal::{Execution, InputFile, State},
     local_source::LocalSources,
     objects::Objects,
+    published::Publisher,
     runs::{Runs, Source, Spec},
     service::Service,
 };
@@ -92,18 +93,18 @@ fn open(root: &Path, tools: &Tools) -> Machine {
             seed_cache: None,
         },
     );
+    let machine = tensord::origin::Machine::new(store.clone(), None).unwrap();
     let runs = Arc::new(Runs {
         service: service.clone(),
         objects: objects.clone(),
-        publisher: None,
+        publisher: Publisher::new(&root.join("published"), Default::default(), machine.clone()).unwrap(),
         local: Some(Arc::new(local)),
         own_hub: None,
-       
         contexts: Default::default(),
     });
     let config = GpuConfig::deviceless(&root.join("home")).unwrap();
     service.configure_pool(Pool::new(&root.join("pool"), config, store.clone()).unwrap()).unwrap();
-    Calls::configure(&service, tensord::origin::Machine::new(store.clone(), None).unwrap(), Some(&runs)).unwrap();
+    Calls::configure(&service, machine, Some(&runs)).unwrap();
     Machine {
         service,
         store,

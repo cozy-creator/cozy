@@ -138,7 +138,8 @@ pub enum Progress {
 pub struct Request {
     /// The run this prepares for: a run waiting on its install is told so by this id.
     pub run: String,
-    pub source: hub::Source,
+    /// The run's Hub: a release and a Hub-named model need it; held code and models do not.
+    pub source: Option<hub::Source>,
     pub package: String,
     /// Empty: the Hub's newest, as it named it under `catalog_revision`.
     pub release: String,
@@ -159,6 +160,19 @@ pub struct Request {
     /// A call's: its imports start as soon as it installs. A warm run imports only when its
     /// level asks (`downloaded` never does).
     pub imports: bool,
+}
+
+impl Request {
+    /// The run's Hub, for `what`: refused when the run carries no Hub access.
+    fn hub(&self, what: &str) -> Result<&hub::Source, Failure> {
+        let absent = || ("hub_access_absent", format!("{what} needs the run's Hub access, and this run carries none"));
+        self.source.as_ref().ok_or_else(absent)
+    }
+
+    /// Its Hub's origin key; empty without one.
+    fn origin(&self) -> String {
+        self.source.as_ref().and_then(|source| hub::origin_key(&source.origin)).unwrap_or_default()
+    }
 }
 
 /// A Hub checkpoint as a run names it (th-245): `repository` at `release` (empty: the newest) in
@@ -698,7 +712,7 @@ impl Publisher {
     /// An earlier environment of this release here, which kept its card beside it (`CARD`): an
     /// exact release never changes, so its environment for another SDK reads nothing from the Hub.
     fn earlier(&self, service: &Service, actor: &str, request: &Request, release: &str) -> Option<PathBuf> {
-        let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
+        let origin = request.origin();
         service.engine.installations(actor).ok()?.into_iter()
             .filter(|i| i.package == request.package && i.release == release && i.hub == origin)
             .map(|i| service.catalog.root().join(&i.generation))
@@ -721,7 +735,7 @@ impl Publisher {
 
     /// The installation of `release` of the request's package at its Hub, by this machine's SDK.
     fn release_alias(&self, request: &Request, release: &str) -> String {
-        let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
+        let origin = request.origin();
         let sdk = format!(
             "{:?}{:?}{:?}",
             self.sdk.requirements, self.sdk.find_links, self.sdk.client_wheel
@@ -764,7 +778,7 @@ impl Publisher {
                 ])
             })
             .collect();
-        let origin = hub::origin_key(&request.source.origin).unwrap_or_default();
+        let origin = request.origin();
         let package = request.installed.as_ref().map(|i| i.package.as_str()).unwrap_or(&request.package);
         let release = request.installed.as_ref().map(|i| i.release.as_str()).unwrap_or(&request.release);
         let key = json!({"installation":alias,"package":package,"release":release,"hub":origin,"owner":request.owner,"catalog":request.catalog_revision,"entrypoint":request.entrypoint,"choices":choices,"row":gpus,"gpus":request.gpus,"bits":request.bits});
@@ -882,7 +896,8 @@ impl Publisher {
             "release_root_invalid",
             "package must be org/name".to_string(),
         ))?;
-        let catalog = || Catalog::new(&request.source).map_err(|e| ("catalog_read_failed", e.0));
+        let source = request.hub("a release")?;
+        let catalog = || Catalog::new(source).map_err(|e| ("catalog_read_failed", e.0));
         let release = match request.release.is_empty() {
             true => self.newest(service, request, &catalog()?, org, name)?,
             false => request.release.clone(),
@@ -902,19 +917,19 @@ impl Publisher {
             Some(card) => card,
             None => hub_card(&catalog()?, &request.package, &release, &self.sdk.python)?,
         };
-        let locked = read_lock(&card.pyproject, &card.lock, &request.source)?;
+        let locked = read_lock(&card.pyproject, &card.lock, source)?;
         let before = earlier.and_then(|dir| fs::read(dir.join("generation.json")).ok())
             .and_then(|raw| serde_json::from_slice::<crate::catalog::Generation>(&raw).ok())
             .map(|record| record.dependencies.into_iter().map(|d| (normalized(&d.name), d.version)).collect());
         let stage = install_stage(&request.package, &release, before.as_ref(), &self.planned_pair(&locked));
         let wheels: Vec<&str> = card.wheels.iter().map(|wheel| wheel.sha256.as_str()).collect();
-        let identity = sha256::hex_digest(json!({"package":request.package,"release":release,"pyproject":card.pyproject,"lock":card.lock,"wheels":wheels,"python":card.python,"hub":hub::origin_key(&request.source.origin),"sdk":self.sdk.requirements,"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
+        let identity = sha256::hex_digest(json!({"package":request.package,"release":release,"pyproject":card.pyproject,"lock":card.lock,"wheels":wheels,"python":card.python,"hub":hub::origin_key(&source.origin),"sdk":self.sdk.requirements,"links":self.sdk.find_links,"client":self.sdk.client_wheel}).to_string().as_bytes())[..32].to_string();
         let wanted = Environment {
             card: &card,
             locked: &locked,
             package: &request.package,
             release: &release,
-            source: &request.source,
+            source,
             stage: &stage,
         };
         self.generation(service.catalog.root(), &identity, &wanted, job)?;
@@ -937,7 +952,7 @@ impl Publisher {
                 release,
                 interface: serde_json::to_vec(&held.record.interface)
                     .map_err(|e| io_failure(io::Error::other(e)))?,
-                hub: hub::origin_key(&request.source.origin).unwrap_or_default(),
+                hub: request.origin(),
             })
             .map_err(io_failure)
     }
@@ -1367,7 +1382,7 @@ impl Publisher {
             let bits = tolerances.bits(request.bits, short);
             let ruled = named.lane.is_empty() && named.tree.is_none();
             let lanes = if ruled { tolerances.lanes(bits, &gpus) } else { vec![] };
-            let named = self.resolve(service, &request.source, named, &lanes, &request.catalog_revision)?;
+            let named = self.resolve(service, request.hub(&format!("the model for {path}"))?, named, &lanes, &request.catalog_revision)?;
             let model = format!("{}@{}", named.repository, named.release);
             let warnings = if ruled { tolerances.warnings(bits, &gpus, &model, &named.lane) } else { vec![] };
             let grant = ModelGrant {
@@ -1382,8 +1397,13 @@ impl Publisher {
             Ok((grant, (!named.repository.starts_with("local/")).then_some(named), warnings))
         };
         // Each checkpoint lands as its structure: what of it comes, and when, its calls direct.
+        // Only a Hub names a checkpoint here (`pick` refused it without the run's access).
         let land = |picked: &[(ModelGrant, Option<Named>, Vec<String>)]| {
-            self.structure(&request.source, &distinct(picked.iter().filter_map(|(_, named, _)| named.as_ref())), job)
+            let named = distinct(picked.iter().filter_map(|(_, named, _)| named.as_ref()));
+            match named.is_empty() {
+                true => Ok(()),
+                false => self.structure(request.hub("a Hub model")?, &named, job),
+            }
         };
         let mut picked: Vec<_> = slots.iter().map(|slot| pick(slot, false)).collect::<Result<_, _>>()?;
         land(&picked)?;
@@ -1424,8 +1444,8 @@ impl Publisher {
                 .iter()
                 .find(|c| c.parameter == grant.slot || c.parameter == parameter)
             {
-                let resolve = |named| self.resolve(service, &request.source, named, &[], &request.catalog_revision);
-                apply_adapters(self, &request.source, &resolve, choice, grant, &request.providers, job)?;
+                let resolve = |source: &hub::Source, named| self.resolve(service, source, named, &[], &request.catalog_revision);
+                apply_adapters(self, request.source.as_ref(), &resolve, choice, grant, &request.providers, job)?;
             }
         }
         job.stage(format!("preparing {}", request.package));
@@ -1602,8 +1622,8 @@ fn refused(code: &'static str, refusal: tensorfs::err::Refusal) -> Failure {
 /// adapter view composed (`adapter::compose`); the grant then names the view.
 fn apply_adapters(
     publisher: &Publisher,
-    source: &hub::Source,
-    resolve: &dyn Fn(Named) -> Result<Named, Failure>,
+    source: Option<&hub::Source>,
+    resolve: &dyn Fn(&hub::Source, Named) -> Result<Named, Failure>,
     choice: &domain::ModelChoice,
     grant: &mut ModelGrant,
     providers: &Providers,
@@ -1626,7 +1646,9 @@ fn apply_adapters(
             }
             let tree = (!adapter.manifest.is_empty())
                 .then(|| ObjectRef { sha256: adapter.manifest.trim_start_matches("sha256:").into(), length: 0 });
-            let named = resolve(Named {
+            let source = source.ok_or_else(|| ("hub_access_absent",
+                format!("an adapter of {} names a Hub model, and this run carries no Hub access", grant.slot)))?;
+            let named = resolve(source, Named {
                 repository: adapter.model.clone(),
                 release: adapter.release.clone(),
                 lane: adapter.lane.clone(),
@@ -1666,7 +1688,7 @@ fn apply_adapters(
     }
     // The view re-packs the base's small parts: its chunks come first (its load reads them anyway).
     let base = object(&grant.manifest)?;
-    if let Some(pulled) = publisher.pulled(&base).map_err(io_failure)? {
+    if let (Some(pulled), Some(source)) = (publisher.pulled(&base).map_err(io_failure)?, source) {
         publisher.ensure(source, &pulled, job.stop.as_ref(), &|d, t| job.bytes(d, t))?;
     }
     // The view is the store's to keep from here: the call that reads it holds it open.
@@ -1709,7 +1731,7 @@ fn install_stage(package: &str, release: &str, before: Option<&BTreeMap<String, 
 
 /// The journal name of an unnamed release of the request's package at its Hub.
 fn newest_key(request: &Request) -> String {
-    json!(["newest", hub::origin_key(&request.source.origin), request.package]).to_string()
+    json!(["newest", request.origin(), request.package]).to_string()
 }
 
 /// A checkpoint named by its hash, with what a hash alone does not say: its length (the Hub's) and
@@ -1904,7 +1926,7 @@ fn model_slots(interface: &Value, entrypoint: &str) -> Option<Vec<Value>> {
         .cloned()
 }
 
-pub fn declares_models(installation: &Installation, entrypoint: &str) -> bool {
+fn declares_models(installation: &Installation, entrypoint: &str) -> bool {
     serde_json::from_slice(&installation.interface)
         .ok()
         .and_then(|i: Value| model_slots(&i, entrypoint))
@@ -2590,7 +2612,7 @@ pub(crate) mod tests {
     fn an_explicit_gpu_count_and_bits_have_their_own_preparation_cache_key() {
         let mut request = Request {
             run: String::new(),
-            source: hub::Source::new("https://hub.example", None, None).unwrap(),
+            source: Some(hub::Source::new("https://hub.example", None, None).unwrap()),
             package: "org/package".into(), release: "1".into(), installed: None,
             owner: "org".into(), catalog_revision: String::new(), providers: Providers::default(),
             entrypoint: "render".into(), choices: vec![], gpus: 0, bits: 0, imports: true,
@@ -2966,7 +2988,7 @@ pub(crate) mod tests {
         pub publisher: Arc<Publisher>,
         pub installation: Installation,
         pub hub: hub::Source,
-        heard: names_hub::Heard,
+        pub heard: names_hub::Heard,
         /// Each published manifest's lane.
         pub lanes: HashMap<String, String>,
     }
@@ -3016,7 +3038,7 @@ pub(crate) mod tests {
 
         /// `render` prepared for `acme`'s run at `bits` with `choices`.
         fn prepare(&self, bits: u32, choices: Vec<domain::ModelChoice>) -> Prepared {
-            let request = Request { run: String::new(), source: self.hub.clone(), package: self.installation.package.clone(), release: "1.0.0".into(),
+            let request = Request { run: String::new(), source: Some(self.hub.clone()), package: self.installation.package.clone(), release: "1.0.0".into(),
                 installed: Some(self.installation.clone()), owner: "acme".into(), catalog_revision: "r1".into(),
                 providers: Providers::default(), entrypoint: "render".into(), choices, gpus: 0, bits, imports: false };
             self.publisher.prepare_now(&self.service, "alice", &request, None, None).unwrap()
@@ -3055,7 +3077,7 @@ pub(crate) mod tests {
     }
 
     fn local_alias_request(machine: &Machine, choices: Vec<domain::ModelChoice>) -> Request {
-        Request { run: String::new(), source: machine.hub.clone(), package: machine.installation.package.clone(),
+        Request { run: String::new(), source: Some(machine.hub.clone()), package: machine.installation.package.clone(),
             release: "1.0.0".into(), installed: Some(machine.installation.clone()), owner: "acme".into(),
             catalog_revision: "same-catalog".into(), providers: Providers::default(), entrypoint: "render".into(),
             choices, gpus: 0, bits: 0, imports: false }

@@ -416,10 +416,7 @@ impl Service {
         }
         let sweep = || -> io::Result<crate::reclaim::Swept> {
             let pool = self.pool();
-            let mut bound = self.engine.bound_generations()?;
-            if let Some(pool) = &pool {
-                bound.extend(pool.config().packages.iter().map(|p| p.generation.clone()));
-            }
+            let bound = self.engine.bound_generations()?;
             let kernels = self.gpu().map(|gpu| gpu.kernel_caches());
             let publisher = self.publisher.lock().unwrap().clone();
             let uv_cache = publisher
