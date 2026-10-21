@@ -342,7 +342,7 @@ from pathlib import Path
 import tensorfs
 
 with tensorfs.Writer("./model.cozytensors") as writer:
-    component = writer.component("model", cls="", config={"width": 2})
+    component = writer.component("model", config={"width": 2})
     component.put("weight", array("f", [1, 2]), dtype="F32", shape=[2])
     component.asset("tokenizer.json", b"{}")
 checkpoint = writer.commit()

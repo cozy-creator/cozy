@@ -142,7 +142,7 @@ class Model:
                     offset += length
                 header = json.dumps(meta, separators=(",", ":")).encode()
                 header += b" " * (-len(header) % 8)
-                target = writer.component(component, cls="", config={})
+                target = writer.component(component, cls=None, config={})
                 with open(st_dir / f"{component}.safetensors", "xb") as stream:
                     stream.write(len(header).to_bytes(8, "little") + header)
                     for _, key, role, length, *_ in parts:

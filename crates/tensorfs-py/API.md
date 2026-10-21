@@ -398,8 +398,8 @@ import tensorfs
 
 with tensorfs.Writer("./model.cozytensors") as writer:
     writer.metadata["source"] = "my-training-run"
-    writer.pipeline("my_package.MyPipeline", {"version": 1})
-    model = writer.component("model", cls="my_package.MyModel", config={"width": 2})
+    writer.pipeline(tensorfs.ClassRef("my_package", "1.0", "MyPipeline"), {"version": 1})
+    model = writer.component("model", cls=("my_package", "1.0", "MyModel"), config={"width": 2})
     model.put("weight", array("f", [1, 2]), dtype="F32", shape=[2])
     model.asset("vocab.txt", b"one\ntwo\n")
 
@@ -407,6 +407,11 @@ saved = writer.commit()
 print(saved.id)       # immutable header identity
 print(saved.tree)     # repository-tree identity, when present
 ```
+
+`ClassRef(library, version, name)` is an immutable, hashable class record, also accepted as a
+three-string tuple. Components without a known class use `None` (the unknown record); a
+known class may record an empty version when no version is available. It is metadata, not
+an import path.
 
 The context commits on normal exit. `commit()` returns a `Checkpoint` and returns the same
 result on later successful calls. A raw Python buffer needs explicit `dtype` and `shape`;

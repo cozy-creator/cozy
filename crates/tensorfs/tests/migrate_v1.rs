@@ -173,7 +173,7 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
         let source = ck.metadata().get("source").cloned();
         if lane.name == "paul/d1-gate5-sdxl-b" {
             assert_eq!(source, Some(Value::Str(UPSTREAMS[0].from.into())));
-            assert_eq!(ck.pipeline().unwrap().class, "diffusers.StableDiffusionXLPipeline");
+            assert_eq!(ck.pipeline().unwrap().class.name, "StableDiffusionXLPipeline");
             assert!(ck.component("tokenizer").is_ok() && ck.component("tokenizer_2").is_ok());
         } else {
             assert_eq!(source, Some(Value::Str(UNKNOWN.into())), "{}", lane.name);

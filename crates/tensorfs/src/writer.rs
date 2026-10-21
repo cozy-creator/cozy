@@ -37,8 +37,8 @@ use crate::err;
 use crate::fetch::Stream;
 use crate::format::layout::{self, GRID, STANDALONE};
 use crate::format::{
-    self, variant_path, Body, Component, Config, Dtype, Encoding, Header, Metadata, ObjectRef,
-    Part, Pipeline, Tensor, Value, CHUNKS_DIR, CONFIG_FILE,
+    self, variant_path, Body, ClassRef, Component, Config, Dtype, Encoding, Header, Metadata,
+    ObjectRef, Part, Pipeline, Tensor, Value, CHUNKS_DIR, CONFIG_FILE,
 };
 use crate::import;
 use crate::store::retention::{self, Hold};
@@ -168,7 +168,7 @@ enum Line {
 #[derive(Clone, Debug, Default)]
 struct Spec {
     name: String,
-    class: String,
+    class: ClassRef,
     config: Config,
     config_file: Option<String>,
 }
@@ -387,12 +387,10 @@ impl Writer {
         Ok(writer)
     }
 
-    /// What `model_index.json` held: the pipeline's class (`diffusers.<Class>`) and config.
-    pub fn pipeline(&mut self, class: &str, config: Config) {
-        self.pipeline = Some(Pipeline {
-            class: class.to_owned(),
-            config,
-        });
+    /// What `model_index.json` held: the pipeline's class and config.
+    pub fn pipeline(&mut self, class: ClassRef, config: Config) {
+        unversioned("the pipeline", &class);
+        self.pipeline = Some(Pipeline { class, config });
     }
 
     /// Declares component `name` (again: its class and config change, its tensors stay) and
@@ -400,13 +398,15 @@ impl Writer {
     pub fn component(
         &mut self,
         name: &str,
-        class: &str,
+        class: ClassRef,
         config: Config,
         config_file: Option<&str>,
     ) -> Result<ComponentWriter<'_>> {
         if !segment(name) {
             return Err(bad(format!("component name {name:?} is not one plain path segment")));
         }
+        class.check(name)?;
+        unversioned(name, &class);
         let config_file = match config_file {
             Some(file) => (file != CONFIG_FILE).then(|| file.to_owned()),
             None => match self.specs.iter().find(|spec| spec.name == name) {
@@ -418,7 +418,7 @@ impl Writer {
         };
         let spec = Spec {
             name: name.to_owned(),
-            class: class.to_owned(),
+            class,
             config,
             config_file,
         };
@@ -1466,6 +1466,14 @@ fn asset_name(component: &str, name: &str) -> Result<()> {
         return Err(bad(format!("{component:?}/{name:?} cannot name an asset")));
     }
     Ok(())
+}
+
+/// A known library without a version leaves the class's state_dict contract open: warned, kept.
+fn unversioned(what: &str, class: &ClassRef) {
+    if !class.is_unknown() && class.version.is_empty() {
+        let (library, name) = (&class.library, &class.name);
+        tracing::warn!("{what}: class {library} {name} records no {library} version");
+    }
 }
 
 fn bad(detail: impl Into<String>) -> Error {

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::Value as Json;
 use tensorfs::format::layout::{self, Item};
 use tensorfs::format::{
-    newest, newest_by, repo_key, Body, Component, Config, Dtype, Encoding, Error, Header, Location, ObjectRef, Part,
+    newest, newest_by, repo_key, Body, ClassRef, Component, Config, Dtype, Encoding, Error, Header, Location, ObjectRef, Part,
     Pipeline, Repo, Resolution, Tag, Tensor, Tree, HEADER_FORMAT,
 };
 
@@ -413,6 +413,10 @@ fn from_projection(p: &Json) -> (Header, bool) {
     let list = |v: &Json| v.as_array().unwrap().clone();
     let uint = |v: &Json| v.as_u64().unwrap();
     let text = |v: &Json| v.as_str().unwrap().to_owned();
+    let class = |v: &Json| match list(v).as_slice() {
+        [library, version, name] => ClassRef { library: text(library), version: text(version), name: text(name) },
+        _ => panic!("a class is [library, version, name]"),
+    };
     let config = |v: &Json| serde_json::from_value::<Config>(v.clone()).unwrap();
     let root = list(p);
     let mut later = root.len() > 6 || root[0] != HEADER_FORMAT;
@@ -436,7 +440,7 @@ fn from_projection(p: &Json) -> (Header, bool) {
     let pipeline = list(&root[3]);
     later |= pipeline.len() > 2;
     let pipeline = (!pipeline.is_empty()).then(|| Pipeline {
-        class: text(&pipeline[0]),
+        class: class(&pipeline[0]),
         config: config(&pipeline[1]),
     });
     let mut encodings = Vec::new();
@@ -499,7 +503,7 @@ fn from_projection(p: &Json) -> (Header, bool) {
         }
         Component {
             name: text(&c[0]),
-            class: text(&c[1]),
+            class: class(&c[1]),
             config: config(&c[2]),
             tensors,
             assets,

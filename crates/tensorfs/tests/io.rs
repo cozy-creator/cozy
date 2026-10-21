@@ -12,6 +12,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use tensorfs::format::ClassRef;
 use tensorfs::format::{Body, Component, Dtype, Encoding, Header, Location, ObjectRef, Part, Tensor, CHUNKS_DIR};
 use tensorfs::import::{Access, Request};
 use tensorfs::io::{self, Copy, Dst, ReadOpts, ReadStats, Src, Target};
@@ -442,7 +443,7 @@ fn overflowing_file_ranges_and_request_grids_refuse_before_writing() {
 /// tensor past the 64 MiB grid (two chunks).
 fn written(dir: &Path, n: usize) -> Checkpoint {
     let mut w = Writer::folder(dir, "", None, false).unwrap();
-    let mut c = w.component("unet", "diffusers.UNet2DConditionModel", Default::default(), None).unwrap();
+    let mut c = w.component("unet", ClassRef::new("diffusers", "0.35.1", "UNet2DConditionModel"), Default::default(), None).unwrap();
     for i in 0..n {
         let bytes = noise(i as u64, 1 + (i * 7919) % (300 << 10));
         c.put(&format!("blocks.{}.w{i}", i / 16), &Dtype::U8, &[bytes.len() as u64], Data::Plain(Source::Read(&mut &bytes[..]))).unwrap();
@@ -532,7 +533,7 @@ fn host_read_speed() {
     let gb: usize = std::env::var("TENSORFS_IO_BENCH_GB").map_or(4, |v| v.parse().unwrap());
     let scratch = Scratch::new("speed");
     let mut w = Writer::folder(&scratch.0, "", None, false).unwrap();
-    let mut c = w.component("transformer", "", Default::default(), None).unwrap();
+    let mut c = w.component("transformer", Default::default(), Default::default(), None).unwrap();
     let block = noise(1, 48 * MIB);
     for i in 0..gb * 1024 / 48 {
         let mut bytes = block.clone();

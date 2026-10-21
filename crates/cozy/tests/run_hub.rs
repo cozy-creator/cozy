@@ -231,7 +231,7 @@ fn canonical_tags_round_trip_at_a_real_hub_without_a_machine() {
         .collect();
     let mut writer = source.writer(None, None).unwrap();
     let mut model = writer
-        .component("model", "conformance.Fixture", Default::default(), None)
+        .component("model", tensorfs::format::ClassRef::new("conformance", "1.0", "Fixture"), Default::default(), None)
         .unwrap();
     model
         .put(

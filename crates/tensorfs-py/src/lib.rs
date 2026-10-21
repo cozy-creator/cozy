@@ -6,6 +6,8 @@ mod errors;
 #[cfg_attr(windows, path = "varena_windows.rs")]
 mod varena;
 #[cfg(feature = "store")]
+mod classref;
+#[cfg(feature = "store")]
 mod file;
 #[cfg(feature = "store")]
 mod store;

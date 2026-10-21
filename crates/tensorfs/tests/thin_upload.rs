@@ -53,7 +53,7 @@ async fn a_thin_folder_uploads_from_the_store_or_what_the_endpoint_holds() {
     // A checkpoint in store `a`, its folder made thin: the header and a README only.
     let a = client(&dir.0.join("a"), &origin);
     let mut writer = a.writer(WriterOptions::default()).unwrap();
-    writer.component("model", "", Default::default(), None).unwrap().put("w", Dtype::U8, &[weight.len() as u64], &mut &weight[..]).unwrap();
+    writer.component("model", Default::default(), Default::default(), None).unwrap().put("w", Dtype::U8, &[weight.len() as u64], &mut &weight[..]).unwrap();
     let saved = writer.commit().await.unwrap();
     let full = saved.materialize(&dir.0.join("full"), Format::Cozytensors, false).await.unwrap();
     let folder = dir.0.join("thin");

@@ -611,7 +611,7 @@ mod tests {
         let mut writer = source.writer(None, None).unwrap();
         let config: HeaderConfig = serde_json::from_str("{}").unwrap();
         writer
-            .component("model", "conformance.Fixture", config, None)
+            .component("model", Default::default(), config, None)
             .unwrap()
             .put(
                 "weight",
@@ -687,6 +687,7 @@ mod tests {
                     warnings: vec![],
                     inputs: vec![],
                     wants: None,
+                    agreed: None,
                 },
             )
             .unwrap();
@@ -796,6 +797,7 @@ mod tests {
                     warnings: vec![],
                     inputs: vec![],
                     wants: None,
+                    agreed: None,
                 },
             )
             .unwrap();
@@ -978,6 +980,7 @@ mod tests {
                     warnings: vec![],
                     inputs: vec![],
                     wants: None,
+                    agreed: None,
                 },
             )
             .unwrap();

@@ -1287,7 +1287,7 @@ mod v1_api {
         use tensorfs::{format::{ConfigValue, Dtype}, writer::{Data, Source}};
         let mut writer = store.writer(None, None).unwrap();
         let config = tensorfs::format::Config::from_iter([("n".to_string(), ConfigValue::from(n))]);
-        let mut model = writer.component("model", "", config, None).unwrap();
+        let mut model = writer.component("model", Default::default(), config, None).unwrap();
         model.put("weight", &Dtype::F32, &[n as u64], Data::Plain(Source::Read(&mut vec![5u8; 4 * n].as_slice()))).unwrap();
         writer.commit().unwrap()
     }
