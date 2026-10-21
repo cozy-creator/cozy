@@ -278,6 +278,7 @@ impl Client {
     async fn start(&self) -> Result<Holder, Error> {
         let home = &self.0.home;
         let installed = installed(home)?;
+        let spec = self.spec(installed.clone());
         let failed = |e: platform::Error| {
             Error::new(Kind::Unavailable, "calcifer_start_failed", e.to_string())
         };
@@ -299,7 +300,7 @@ impl Client {
         // defined for the installed cozy, else runs the installed one detached.
         let exe = std::env::current_exe().and_then(|exe| exe.canonicalize());
         let ours = matches!((exe, installed.canonicalize()), (Ok(exe), Ok(it)) if exe == it);
-        let managed = services.available() && (ours || services.current(&self.spec()));
+        let managed = services.available() && (ours || services.current(&spec));
         // Started detached for want of systemctl: no login starts it again.
         let path: Vec<_> =
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
@@ -311,7 +312,7 @@ impl Client {
             output::warn(&warning);
         }
         if managed && ours {
-            let wrote = services.ensure(&self.spec()).map_err(failed)?;
+            let wrote = services.ensure(&spec).map_err(failed)?;
             steps.done(match wrote {
                 true => "wrote Calcifer's service and reloaded its manager",
                 false => "found Calcifer's service current",
@@ -325,8 +326,8 @@ impl Client {
             // Calcifer that was stopping, which held the lock until it went.
             if child.is_none() && self.lock_free() {
                 match managed {
-                    true => services.start(&self.spec()).map_err(failed)?,
-                    false => child = Some(self.spawn().map_err(failed)?),
+                    true => services.start(&spec).map_err(failed)?,
+                    false => child = Some(spawn(&spec).map_err(failed)?),
                 }
                 if !std::mem::replace(&mut asked, true) {
                     steps.done("started Calcifer");
@@ -366,19 +367,14 @@ impl Client {
         }
     }
 
-    fn spec(&self) -> ServiceSpec {
+    /// Calcifer's service: the installed cozy's `cozy calcifer`.
+    fn spec(&self, installed: PathBuf) -> ServiceSpec {
         ServiceSpec {
             name: "calcifer".into(),
-            program: self.0.home.binary(),
+            program: installed,
             args: vec!["calcifer".into()],
             log: Some(self.0.home.calcifer_log()),
         }
-    }
-
-    /// `cozy calcifer`, detached, saying anything before its own log opens into that log.
-    fn spawn(&self) -> platform::Result<Detached> {
-        let spec = self.spec();
-        process::detach(&spec.program, &spec.args, spec.log.as_deref())
     }
 
     /// Sends one request, starting Calcifer when it is gone, reading its record again when a
@@ -672,6 +668,11 @@ impl Sse {
 }
 
 /// A path from segments, each percent-encoded.
+/// `cozy calcifer`, detached, saying anything before its own log opens into that log.
+fn spawn(spec: &ServiceSpec) -> platform::Result<Detached> {
+    process::detach(&spec.program, &spec.args, spec.log.as_deref())
+}
+
 pub fn path(segments: &[&str]) -> String {
     let mut url = url::Url::parse("http://calcifer/").expect("a base URL");
     url.path_segments_mut()
