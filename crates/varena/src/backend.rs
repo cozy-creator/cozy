@@ -87,14 +87,6 @@ pub trait Backend: Send + Sync {
     fn retire(&self, event: Event);
     /// After a device error: proves the copy stream's work complete or fails.
     fn drain(&self) -> Result<()>;
-    /// Registers host memory (a RAM-tier layout's read-only mapping) with the device once, so
-    /// every fill from it copies directly, with no staging and no registration per read.
-    ///
-    /// # Safety
-    /// `ptr..ptr + len` stays mapped until [`Backend::unregister_host`] returns for it.
-    unsafe fn register_host(&self, ptr: *const u8, len: u64) -> Result<()>;
-    /// Ends [`Backend::register_host`]'s registration; call it before unmapping the memory.
-    fn unregister_host(&self, ptr: *const u8) -> Result<()>;
 }
 
 /// Pages in host memory: a memfd each, mapped into a reserved range. Its export is a read-only
@@ -284,15 +276,6 @@ mod host {
         fn drain(&self) -> Result<()> {
             Ok(())
         }
-
-        /// Host pages copy within host memory: nothing to register.
-        unsafe fn register_host(&self, _: *const u8, _: u64) -> Result<()> {
-            Ok(())
-        }
-
-        fn unregister_host(&self, _: *const u8) -> Result<()> {
-            Ok(())
-        }
     }
 }
 
@@ -370,12 +353,6 @@ mod host {
         }
         fn retire(&self, _: Event) {}
         fn drain(&self) -> Result<()> {
-            Ok(())
-        }
-        unsafe fn register_host(&self, _: *const u8, _: u64) -> Result<()> {
-            Ok(())
-        }
-        fn unregister_host(&self, _: *const u8) -> Result<()> {
             Ok(())
         }
     }
