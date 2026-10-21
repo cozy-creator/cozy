@@ -101,12 +101,15 @@ fn role_monitor() {
     cuda::check("cuDeviceGet", unsafe { (cuda::driver().unwrap().device_get)(&mut device, 0) }).unwrap();
     let nvml = platform::gpu::Device::open(&cuda::uuid(device).unwrap()).unwrap();
     let mut seen = 0;
-    nvml.worked_since(&mut seen).unwrap();
+    let _ = nvml.worked_since(&mut seen);
     println!("@ ready");
     std::io::stdout().flush().unwrap();
     for _ in std::io::stdin().lock().lines() {
-        let (kernels, memory) = nvml.worked_since(&mut seen).unwrap();
-        println!("@ {kernels} {memory}");
+        // NVML answers "not found" when it has taken no sample since the last look: no signal.
+        match nvml.worked_since(&mut seen) {
+            Ok((kernels, memory)) => println!("@ {kernels} {memory}"),
+            Err(e) => println!("@ unknown {e}"),
+        }
         std::io::stdout().flush().unwrap();
     }
 }
@@ -1038,7 +1041,9 @@ fn a_page_unmaps_only_after_its_last_consumer() {
     step!();
     let gate = Gate::hold(consumer.raw());
     step!();
+    let first = std::time::Instant::now();
     let pin = mem.bind(s, 0, consumer.raw()).unwrap();
+    let first = first.elapsed();
     step!();
     assert!(pin.fresh);
     step!();
@@ -1054,15 +1059,17 @@ fn a_page_unmaps_only_after_its_last_consumer() {
     // must wait for it too.
     let _ = mem.torch_limit();
     // The rebind waits for the refill, which waits in-stream for the consumer behind the gate.
-    let again = std::thread::scope(|t| {
-        let rebind = blocked(t, || mem.bind(s, 0, 0));
+    let (again, waited) = std::thread::scope(|t| {
+        let (rebind, waited) = blocked(t, first, || mem.bind(s, 0, 0));
         drop(gate);
-        rebind.join().unwrap()
+        (rebind.join().unwrap(), waited)
     });
     step!();
     assert_eq!(synchronize(), cuda::SUCCESS, "the consumer read its page while it was mapped");
     step!();
     assert_eq!(bytes(dst, REGION_ALIGN, 0), *block(2, 0));
+    step!();
+    assert_eq!(waited, Waited::Asleep, "the rebind spun on the host waiting for the consumer (a host sync)");
     step!();
     let again = again.unwrap();
     step!();
@@ -1082,9 +1089,19 @@ fn a_page_unmaps_only_after_its_last_consumer() {
     step!();
 }
 
-/// Runs `f` on a thread of `t` and returns once that thread is seen asleep inside `f` (state S
-/// or D in /proc) before `f` returned: the wait the caller then ends is real, not skipped.
-fn blocked<'s, T: Send + 's>(t: &'s std::thread::Scope<'s, '_>, f: impl FnOnce() -> T + Send + 's) -> std::thread::ScopedJoinHandle<'s, T> {
+/// How a waiter was seen waiting.
+#[derive(Debug, PartialEq)]
+enum Waited {
+    /// Asleep (state S or D) inside its call: it waits for an event that wakes it.
+    Asleep,
+    /// Running on the CPU longer than `budget`, the same call's whole earlier duration: it spins
+    /// on the host, waiting for the device.
+    Spun,
+}
+
+/// Runs `f` on a thread of `t` and returns once that thread is seen waiting inside `f` before it
+/// returned, and how: the wait the caller then ends is real, not skipped.
+fn blocked<'s, T: Send + 's>(t: &'s std::thread::Scope<'s, '_>, budget: std::time::Duration, f: impl FnOnce() -> T + Send + 's) -> (std::thread::ScopedJoinHandle<'s, T>, Waited) {
     let (sent, tid) = mpsc::channel();
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let finished = done.clone();
@@ -1095,12 +1112,17 @@ fn blocked<'s, T: Send + 's>(t: &'s std::thread::Scope<'s, '_>, f: impl FnOnce()
         finished.store(true, std::sync::atomic::Ordering::Release);
         out
     });
-    let stat = format!("/proc/self/task/{}/stat", tid.recv().unwrap());
+    let task = format!("/proc/self/task/{}", tid.recv().unwrap());
     loop {
-        let state = std::fs::read_to_string(&stat).unwrap().rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_owned));
+        let stat = std::fs::read_to_string(format!("{task}/stat")).unwrap();
+        let state = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_owned));
+        let ran = std::fs::read_to_string(format!("{task}/schedstat")).unwrap().split_whitespace().next().unwrap().parse::<u128>().unwrap();
         assert!(!done.load(std::sync::atomic::Ordering::Acquire), "it returned without waiting");
         if matches!(state.as_deref(), Some("S" | "D")) {
-            return handle;
+            return (handle, Waited::Asleep);
+        }
+        if ran > budget.as_nanos() {
+            return (handle, Waited::Spun);
         }
         std::thread::yield_now();
     }
@@ -1366,7 +1388,9 @@ fn a_transform_binds_another_set_under_pressure_and_a_second_binder_waits_for_it
     step!();
     let stream = cuda::Stream::new(0).unwrap();
     step!();
+    let first = std::time::Instant::now();
     let pin = mem.bind(base, 0, stream.raw()).unwrap();
+    let first = first.elapsed();
     step!();
     assert!(pin.fresh, "the caller bakes it");
     step!();
@@ -1375,11 +1399,13 @@ fn a_transform_binds_another_set_under_pressure_and_a_second_binder_waits_for_it
     step!();
     assert_eq!(launch(c"copy", &[pin.ptr, f.ptr, REGION_ALIGN / 8], stream.raw()), cuda::SUCCESS);
     step!();
-    let second = std::thread::scope(|t| {
-        let waiter = blocked(t, || mem.bind(base, 0, 0).unwrap());
+    let (second, waited) = std::thread::scope(|t| {
+        let (waiter, waited) = blocked(t, first, || mem.bind(base, 0, 0).unwrap());
         pin.filled();
-        waiter.join().unwrap()
+        (waiter.join().unwrap(), waited)
     });
+    step!();
+    assert_eq!(waited, Waited::Asleep, "the second binder spun on the host waiting for the bake");
     step!();
     assert!(!second.fresh, "the second binder gets the baked page");
     step!();

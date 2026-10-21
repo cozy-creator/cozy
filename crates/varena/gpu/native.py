@@ -18,7 +18,9 @@ stuck: a step's line can land just after one look, so only a second quiet look s
 quiet step. It is then killed and fails as stalled. A case with no earlier run is never killed:
 it runs unjudged. Each start
 and verdict goes to the run log as it happens; a cancel kills the running case and returns the
-logs so far. The outputs hold every case's log and result.json; the caller judges from it.
+logs so far. A case that fails also puts its log's tail in the run log, which reaches the caller
+even when a cancelled run's outputs do not. The outputs hold every case's log and result.json;
+the caller judges from it.
 """
 from pathlib import Path
 import json
@@ -53,28 +55,42 @@ def group_io(group: int) -> int:
 
 
 class Monitor:
-    """The binary's `role_monitor`: whether the GPU worked since the last look."""
+    """The binary's `role_monitor`: whether the GPU worked since the last look. A monitor that
+    cannot answer gives no GPU signal; the case's lines and bytes still judge it."""
 
-    def __init__(self, program: Path):
+    def __init__(self, program: Path, log):
         env = dict(os.environ, VARENA_GPU_ROLE="monitor")
+        self.log = log
         self.proc = subprocess.Popen([str(program), "--ignored", "--exact", "role_monitor", "--nocapture", "--test-threads=1"],
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, cwd=program.parent,
-                                     env=env, start_new_session=True)
-        self.answer()
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                     cwd=program.parent, env=env, start_new_session=True)
+        self.alive = self.answer() is not None
 
-    def answer(self) -> str:
+    def answer(self) -> str | None:
         for line in self.proc.stdout:
             if "@ " in line:
                 return line.split("@ ", 1)[1].strip()
-        raise RuntimeError("the GPU monitor ended")
+        self.log("the GPU monitor ended: judging by lines and bytes only")
+        self.alive = False
+        return None
 
     def worked(self) -> bool:
-        self.proc.stdin.write("look\n")
-        self.proc.stdin.flush()
-        return "true" in self.answer().split()
+        if not self.alive:
+            return False
+        try:
+            self.proc.stdin.write("look\n")
+            self.proc.stdin.flush()
+        except OSError:
+            self.alive = False
+            return False
+        answer = self.answer() or ""
+        return answer.split()[:1] != ["unknown"] and "true" in answer.split()
 
     def close(self):
-        self.proc.stdin.close()
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
         self.proc.wait()
 
 
@@ -124,7 +140,7 @@ def main(ctx: ScriptContext, *, binary: Annotated[FileAsset, AssetBound(max_byte
     program.chmod(0o700)
     logs = root / "logs"
     logs.mkdir()
-    monitor = Monitor(program)
+    monitor = Monitor(program, lambda m: ctx.log(m, level="warn"))
     passed, failed, ended, unjudged, gpus, took, longest = [], [], {}, [], set(), {}, {}
     for case in cases:
         if ctx.cancelled:
@@ -148,6 +164,9 @@ def main(ctx: ScriptContext, *, binary: Annotated[FileAsset, AssetBound(max_byte
         gpus.update(named if ok else [])
         verdict = "PASS" if ok else (end or "FAIL").upper()
         ctx.log(f"{verdict} {case} in {took[case]} s, longest step {longest[case]} s", level="warn" if ok else "error")
+        if not ok:
+            # The run log reaches the caller even when a cancelled run's outputs do not.
+            ctx.log(f"TAIL {case}:\n" + "\n".join(text.splitlines()[-40:]), level="error")
     monitor.close()
     result = {"label": label, "cases": cases, "passed": passed, "failed": failed, "ended": ended, "unjudged": unjudged,
               "seconds": took, "steps": {c: s for c, s in longest.items() if s}, "gpus": sorted(gpus),
