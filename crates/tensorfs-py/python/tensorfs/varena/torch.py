@@ -35,8 +35,8 @@ from . import Request as NativeRequest
 from . import Set
 
 __all__ = [
-    "Bind", "Cache", "Declared", "Exhausted", "Filling", "Memory", "Model", "Next", "Placeholder",
-    "Request", "Stats", "Unbound", "VarenaError", "Weights", "blocks_of",
+    "Bind", "Cache", "Declared", "Exhausted", "Filling", "GpuId", "Grant", "Level", "Memory", "Model",
+    "Next", "Placeholder", "Request", "Stats", "Unbound", "VarenaError", "Weights", "blocks_of",
 ]
 
 #: TensorFS dtype names; an `F4` part is u8 pairs.
