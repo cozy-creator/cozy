@@ -4,8 +4,10 @@
 //! the wanted components' chunks and assets), reads each object through the tiers local store →
 //! volume → origin,
 //! and admits it through the store, which verifies it. One HTTP client ([`Client`]) and one
-//! downloader serve every origin.
+//! downloader serve every origin; every other ask of a remote (the Endpoint's documents and
+//! uploads, an import's sources) is asked again by one rule (`ask`).
 
+pub(crate) mod ask;
 pub mod conform;
 mod download;
 mod endpoint;

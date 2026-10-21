@@ -42,16 +42,17 @@ pub(crate) struct Answer {
     pub until: Option<Instant>,
 }
 
-/// Downloads may retry an exchange failure, but never a caller's credential callback.
+/// An exchange failure may be asked again; the caller's own verdict (its credential callback,
+/// its sink, its stop) never is.
 pub(crate) enum GetError {
-    Provider(Refusal),
+    Caller(Refusal),
     Exchange(Refusal),
 }
 
 impl GetError {
     pub(crate) fn refusal(self) -> Refusal {
         match self {
-            Self::Provider(refusal) | Self::Exchange(refusal) => refusal,
+            Self::Caller(refusal) | Self::Exchange(refusal) => refusal,
         }
     }
 }
@@ -78,6 +79,17 @@ impl Answer {
             .parse::<u64>()
             .ok()
             .map(Duration::from_secs)
+    }
+
+    /// `Content-Range: bytes <first>-<last>/<total>`: its first byte, and its total unless `*`.
+    pub fn content_range(&self) -> Option<(u64, Option<u64>)> {
+        let (span, total) = self.header("content-range")?.strip_prefix("bytes ")?.split_once('/')?;
+        let first = span.split_once('-')?.0.trim().parse().ok()?;
+        let total = match total.trim() {
+            "*" => None,
+            total => Some(total.parse().ok()?),
+        };
+        Some((first, total))
     }
 
     /// The next frame of body bytes, `None` at the end.
@@ -192,14 +204,7 @@ impl Client {
 
     /// GET `url`, following redirects the policy allows, each hop checked again. Credentials
     /// go only to the origin they were given for: another origin gets only the `range`.
-    pub(crate) async fn get_authorized(&self, url: &str, headers: &[(String, String)], provider: Option<&dyn TokenProvider>) -> Result<Answer> {
-        self.get_authorized_attempt(url, headers, provider).await.map_err(|error| match error {
-            GetError::Provider(refusal) | GetError::Exchange(refusal) => refusal,
-        })
-    }
-
-    /// Retain failure origin for the downloader's retry decision; import callers return both.
-    pub(crate) async fn get_authorized_attempt(&self, url: &str, headers: &[(String, String)], mut provider: Option<&dyn TokenProvider>) -> std::result::Result<Answer, GetError> {
+    pub(crate) async fn get_authorized(&self, url: &str, headers: &[(String, String)], mut provider: Option<&dyn TokenProvider>) -> std::result::Result<Answer, GetError> {
         let mut url = url.to_string();
         let mut headers = headers.to_vec();
         let (mut hops, mut until) = (0, None::<Instant>);
@@ -207,14 +212,14 @@ impl Client {
         loop {
             let mut presented = headers.clone();
             if let Some(provider) = provider {
-                presented.extend(provider.headers(&Presented { method: "GET", url: &url, headers: &headers, payload: None }).await.map_err(GetError::Provider)?);
+                presented.extend(provider.headers(&Presented { method: "GET", url: &url, headers: &headers, payload: None }).await.map_err(GetError::Caller)?);
             }
             let response = self.send("GET", &url, &presented, None).await.map_err(GetError::Exchange)?.response;
             let uri: Uri = url.parse().expect("sent");
             let status = response.status().as_u16();
             let sent = Presented { method: "GET", url: &url, headers: &presented, payload: None };
             let retry = match provider {
-                Some(provider) => provider.retry(&sent, status, response.headers()).map_err(GetError::Provider)?,
+                Some(provider) => provider.retry(&sent, status, response.headers()).map_err(GetError::Caller)?,
                 None => false,
             };
             if retry && !challenged {

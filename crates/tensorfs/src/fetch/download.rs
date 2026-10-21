@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{watch, Notify, Semaphore};
 
+use super::ask;
 use super::net::{same_origin, Client, GetError};
 use super::origin::{HttpLocation, Location, Origin};
 use super::token::TokenProvider;
@@ -909,12 +910,12 @@ impl Shared {
             ));
         }
         let answer = tokio::select! {
-            answer = self.client.get_authorized_attempt(url, &headers, provider) => answer,
+            answer = self.client.get_authorized(url, &headers, provider) => answer,
             () = flight.aborted() => return Shared::dropped(flight),
         };
         let mut answer = match answer {
             Ok(answer) => answer,
-            Err(GetError::Provider(refusal)) => return Attempt::Fatal(refusal),
+            Err(GetError::Caller(refusal)) => return Attempt::Fatal(refusal),
             Err(GetError::Exchange(refusal)) => {
                 if refusal.code == Code::FD_HEADROOM {
                     self.backoff();
@@ -951,25 +952,11 @@ impl Shared {
                 }
             }
             206 => {
-                let range = answer
-                    .header("content-range")
-                    .unwrap_or_default()
-                    .to_string();
-                let first = range
-                    .strip_prefix("bytes ")
-                    .and_then(|r| r.split_once('-'))
-                    .and_then(|(a, _)| a.parse::<u64>().ok());
-                let total = range.rsplit_once('/').map(|(_, total)| total);
-                if first != Some(sink.reached)
-                    || total.is_some_and(|t| t != "*" && t != object.length.to_string())
-                {
+                let range = answer.content_range();
+                if !range.is_some_and(|(first, total)| first == sink.reached && total.is_none_or(|t| t == object.length)) {
                     return Attempt::Fatal(Refusal {
                         code: Code::LENGTH_MISMATCH,
-                        detail: format!(
-                            "{}: content-range {range:?} for byte {}",
-                            what(),
-                            sink.reached
-                        ),
+                        detail: format!("{}: content-range {range:?} for byte {}", what(), sink.reached),
                     });
                 }
             }
@@ -999,7 +986,7 @@ impl Shared {
                     detail: what(),
                 })
             }
-            408 | 425 | 429 | 500..=599 => {
+            status if ask::weather(status) => {
                 return Attempt::Again {
                     why: what(),
                     wait: answer.stated_wait(),
