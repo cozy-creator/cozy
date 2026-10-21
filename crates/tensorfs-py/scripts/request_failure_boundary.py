@@ -7,6 +7,7 @@ Actual allocator release is covered separately by cuda_request_failure.py.
 from __future__ import annotations
 
 import ast
+import builtins
 import itertools
 import sys
 import threading
@@ -28,7 +29,7 @@ def boundary(source: Path) -> types.ModuleType:
     module.__dict__.update(
         dataclass=dataclass, field=field, contextmanager=contextmanager,
         nullcontext=nullcontext, cuts=types.SimpleNamespace(caught=nullcontext),
-        traceback=traceback, sys=sys,
+        traceback=traceback, sys=sys, builtins=builtins,
     )
     sys.modules[module.__name__] = module
     code = ast.Module(body=[
