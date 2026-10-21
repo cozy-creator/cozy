@@ -8,7 +8,8 @@ use crate::{
     device_executor::Line,
     call_memo::{self, Memo},
     execution::Stoppable,
-    gpu_service::{without_gpus, KeptMember, Level, Member},
+    catalog::HeldGeneration,
+    gpu_service::{without_gpus, KeptMember, Level, Member, Plan, Pool},
     hub,
     journal::{CallMemo, Execution, Failure, InputFile, Installation, Outcome, ResultRecord},
     local_source::LocalSources,
@@ -773,6 +774,59 @@ impl Runs {
         Ok(None)
     }
 
+    /// A warm set member, built one way whether a warm run makes it or a restart brings it back
+    /// (`restore_warm_sets`). Its weights come behind every run's, under `hub`: the run's access
+    /// with its owner's newest bearer. Without one (no bearer survives a restart) they come from
+    /// the rental's own Hub, else anonymously from its installation's Hub: a public release
+    /// resumes, a private one waits for its owner's next run.
+    fn member(&self, held: HeldGeneration, installation: &Installation, plan: Option<Plan>, level: Level,
+        hub: Option<hub::Source>) -> Arc<Member> {
+        let hub = hub.or_else(|| {
+            let own = self.own_hub.clone().filter(|own| {
+                installation.hub.is_empty() || hub::origin_key(&own.origin).as_deref() == Some(installation.hub.as_str())
+            });
+            own.or_else(|| hub::Source::new(&installation.hub, None, None).ok())
+        });
+        let fetch = plan.is_some().then(|| crate::access::Fetch::new(self.publisher.machine().clone(), hub, u64::MAX));
+        Member::new(held, plan, level, fetch)
+    }
+
+    /// Each caller's warm set as the journal keeps it, built again (`member`) and brought up in
+    /// the background: a restarted machine re-warms without its controller. A member whose
+    /// installation is gone leaves the set.
+    pub(crate) fn restore_warm_sets(&self) -> io::Result<()> {
+        let Some(gpu) = self.service.gpu() else {
+            return Ok(());
+        };
+        let kept = self.service.engine.with_journal(|journal| journal.warm_sets())?;
+        let actors: std::collections::BTreeSet<&String> = kept.iter().map(|(actor, _)| actor).collect();
+        for actor in actors {
+            let all = kept.iter().filter(|(of, _)| of == actor);
+            let (records, members): (Vec<String>, Vec<Arc<Member>>) = all
+                .clone()
+                .filter_map(|(_, record)| Some((record.clone(), self.restore_member(&gpu, actor, record)?)))
+                .unzip();
+            if records.len() < all.count() {
+                self.service.engine.with_journal(|journal| journal.replace_warm_set(actor, &records))?;
+            }
+            gpu.set_members(actor, members);
+        }
+        self.service.rewarm(&gpu)
+    }
+
+    /// One kept member, with its plan as it was bound while the store still holds its weights.
+    fn restore_member(&self, gpu: &Pool, actor: &str, record: &str) -> Option<Arc<Member>> {
+        let kept: KeptMember = serde_json::from_str(record).ok()?;
+        let installed = self.service.engine.installation(actor, &kept.installation).ok()??;
+        let held = self.service.catalog.resolve(&installed.generation).ok()?;
+        let bound = match kept.preparation.as_str() {
+            "" => None,
+            id => self.service.engine.preparation(actor, id).ok()?,
+        };
+        let plan = bound.and_then(|bound| gpu.plan(&bound).ok()).filter(|plan| gpu.holds(plan));
+        Some(self.member(held, &installed, plan, Level::named(&kept.level)?, None))
+    }
+
     /// A warm run's set: every member installed and its weights downloaded as a warm run of it
     /// alone does, the set kept in the journal, and one pass to bring the members up. The
     /// result lists each member's `level` and why it is lower than asked (`held_back`).
@@ -857,11 +911,7 @@ impl Runs {
                 })
                 .map_err(io::Error::other)?);
                 let held = self.service.catalog.resolve(&installation.generation)?;
-                // A member's weights come under its owner's newest bearer, after every run's.
-                let fetch = plan.is_some().then(|| {
-                    crate::access::Fetch::new(self.publisher.machine().clone(), hub.clone(), u64::MAX)
-                });
-                members.push(Member::new(held, plan, item.level, fetch));
+                members.push(self.member(held, &installation, plan, item.level, hub.clone()));
             }
         }
         self.service
@@ -1339,6 +1389,41 @@ mod tests {
         let hub_model = domain::ModelChoice { repository: "acme/model".into(), release: "1.0.0".into(), ..Default::default() };
         assert_eq!(resolve(Some(hub_model)).err().unwrap().code, "hub_access_absent");
         assert!(machine.heard.lock().unwrap().is_empty(), "a run without Hub access asks no Hub");
+    }
+
+    /// A restart brings a warm set back as a warm run builds it (`Runs::member`): a member whose
+    /// weights had not all come fetches them, from the rental's own Hub, no owner bearer held.
+    /// Rebuilt without a fetch, it reported "its weights are downloading" and never did.
+    #[test]
+    fn a_restored_warm_member_fetches_its_weights_from_the_rentals_own_hub() {
+        let entrypoints = json!([{"name": "generate",
+            "models": [{"path": "generate.models.model", "class": "M", "default": "model@1.0.0"}]}]);
+        let machine = crate::published::tests::Machine::with("acme/pkg", &[("8.9", 24 << 30)], entrypoints, &["bf16"]);
+        let store = machine.publisher.store().clone();
+        let objects = Arc::new(Objects::new(&machine.root.join("writes"), machine.service.engine.clone()).unwrap());
+        let runs = Runs { service: machine.service.clone(), objects, publisher: machine.publisher.clone(), local: None,
+            own_hub: Some(machine.hub.clone()), contexts: Default::default() };
+        // What the journal kept of a warm run the restart cut short: the member, its model resolved
+        // and its structure here, none of its chunks.
+        let mut call = spec(Source::Installation(machine.installation.alias.clone()), true, "set");
+        (call.owner, call.catalog_revision) = ("acme".into(), "r1".into());
+        let (installation, plan, _) = runs.resolve("alice", "set", Some(machine.installation.clone()), None,
+            Some(machine.hub.clone()), &call, "generate", &[], 0, None, None).unwrap();
+        let plan = plan.unwrap();
+        let member = serde_json::to_string(&KeptMember { installation: installation.alias, level: "downloaded".into(),
+            preparation: plan.id.clone(), item: STANDARD.encode(b"generate") }).unwrap();
+        machine.service.engine.with_journal(|journal| journal.replace_warm_set("alice", &[member])).unwrap();
+        let chunks: Vec<_> = plan.upfront().iter().flat_map(|(header, components)| {
+            crate::storage::chunks(&crate::access::checkpoint(&store, header).unwrap(), components)
+        }).collect();
+        assert!(!chunks.is_empty() && !chunks.iter().any(|chunk| crate::storage::present(&store, chunk)));
+        runs.restore_warm_sets().unwrap();
+        let started = std::time::Instant::now();
+        while !chunks.iter().all(|chunk| crate::storage::present(&store, chunk)) {
+            assert!(started.elapsed() < Duration::from_secs(60), "the restored member's weights never came");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(machine.service.gpu().unwrap().members("alice"), [(Level::Downloaded, "")]);
     }
 
     #[test]
