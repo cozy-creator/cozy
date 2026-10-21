@@ -2,7 +2,7 @@
 //! create shareable physical pages, map them (read-only once filled), export and import them,
 //! fill them through TensorFS's `io::read` on a copy stream, and order consumers on events.
 //! [`HostBackend`] is the same mechanism over host pages (memfd): CPU and MPS executors and the
-//! CPU tests use it. The CUDA backend lives with its driver (S2).
+//! CPU tests use it; [`crate::CudaBackend`] is CUDA's.
 
 use std::collections::HashMap;
 
