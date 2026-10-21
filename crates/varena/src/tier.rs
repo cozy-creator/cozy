@@ -71,32 +71,104 @@ impl Layout {
         (0..self.regions.len()).any(|r| self.ready(r).is_some_and(|w| w.load(Acquire) == 1))
     }
 
-    /// Its release order: orphaned (by age), no declared use, then furthest declared first.
-    fn rank(&self) -> (u8, i64) {
-        if self.users.is_empty() {
-            return (0, self.used as i64);
-        }
-        match self.users.values().copied().min().flatten() {
-            None if self.users.values().all(Option::is_none) => (1, self.used as i64),
-            _ => (2, -i64::from(self.users.values().filter_map(|d| *d).min().unwrap_or(0))),
-        }
+    /// Its facts for [`host_decide`]: a ready region another description has locked is in
+    /// flight (a copy from it, or a fill into it).
+    fn facts(&self, digest: &str) -> HostLayout {
+        let regions = self
+            .regions
+            .iter()
+            .enumerate()
+            .map(|(r, (off, span))| {
+                let ready = self.ready(r).is_some_and(|w| w.load(Acquire) == 1);
+                let in_flight = ready && os::held(&self.fd, self.data + off, *span).unwrap_or(true);
+                (*span, ready, in_flight)
+            })
+            .collect();
+        HostLayout { digest: digest.to_string(), regions, users: self.users.values().copied().collect(), used: self.used }
     }
 
-    /// Gives back every region not in flight; true when it gave any.
-    fn release(&self) -> bool {
-        let mut gave = false;
-        for (r, (off, span)) in self.regions.iter().enumerate() {
-            let Some(word) = self.ready(r) else { continue };
-            if word.load(Acquire) != 1 || !matches!(os::lock(&self.fd, self.data + off, *span, false), Ok(true)) {
-                continue;
-            }
-            word.store(0, Release);
-            let _ = os::punch(&self.fd, self.data + off, *span);
-            let _ = os::unlock(&self.fd, self.data + off, *span);
-            gave = true;
+    /// Gives back region `r` unless a copy took it meanwhile.
+    fn release(&self, r: u32) -> u64 {
+        let Some(&(off, span)) = self.regions.get(r as usize) else { return 0 };
+        let Some(word) = self.ready(r as usize) else { return 0 };
+        if !matches!(os::lock(&self.fd, self.data + off, span, false), Ok(true)) {
+            return 0;
         }
-        gave
+        word.store(0, Release);
+        let _ = os::punch(&self.fd, self.data + off, span);
+        let _ = os::unlock(&self.fd, self.data + off, span);
+        span
     }
+}
+
+/// A layout as [`host_decide`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostLayout {
+    pub digest: String,
+    /// Per region: (bytes, ready, in flight).
+    pub regions: Vec<(u64, bool, bool)>,
+    /// Each user's next declared use, in steps; `None`: no declared use.
+    pub users: Vec<Option<u32>>,
+    /// When it was last used (a logical clock).
+    pub used: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostTrigger {
+    /// A pressure event: give back one rung (one layout's regions not in flight).
+    Pressure,
+    /// A fill needs this many bytes of host headroom beyond `headroom`.
+    Room { bytes: u64, headroom: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostAction {
+    Release { digest: String, region: u32 },
+    /// An orphaned layout with nothing left: its file goes.
+    Forget(String),
+}
+
+/// The tier's one decision procedure, pure: orphaned layouts (least recently used first), then
+/// layouts with no declared use, then the furthest declared; never a region in flight. TensorFS
+/// owns its staging buffers, so the tier has no staging rung of its own.
+pub fn host_decide(layouts: &[HostLayout], trigger: HostTrigger) -> Vec<HostAction> {
+    let rank = |l: &HostLayout| -> (u8, i64) {
+        if l.users.is_empty() {
+            return (0, l.used as i64);
+        }
+        match l.users.iter().filter_map(|d| *d).min() {
+            None => (1, l.used as i64),
+            Some(d) => (2, -i64::from(d)),
+        }
+    };
+    let mut order: Vec<&HostLayout> = layouts.iter().filter(|l| l.regions.iter().any(|(_, ready, _)| *ready)).collect();
+    order.sort_by(|a, b| rank(a).cmp(&rank(b)).then(a.digest.cmp(&b.digest)));
+    let free = |l: &HostLayout| l.regions.iter().enumerate().rev().filter(|(_, (_, ready, flight))| *ready && !flight).map(|(r, (b, ..))| (r as u32, *b)).collect::<Vec<_>>();
+    let mut out = vec![];
+    match trigger {
+        HostTrigger::Pressure => {
+            if let Some(l) = order.into_iter().find(|l| !free(l).is_empty()) {
+                let regions = free(l);
+                out.extend(regions.iter().map(|(r, _)| HostAction::Release { digest: l.digest.clone(), region: *r }));
+                if l.users.is_empty() && regions.len() == l.regions.iter().filter(|(_, ready, _)| *ready).count() {
+                    out.push(HostAction::Forget(l.digest.clone()));
+                }
+            }
+        }
+        HostTrigger::Room { bytes, headroom } => {
+            let mut have = headroom;
+            for l in order {
+                for (r, b) in free(l) {
+                    if have >= bytes {
+                        return out;
+                    }
+                    out.push(HostAction::Release { digest: l.digest.clone(), region: r });
+                    have += b;
+                }
+            }
+        }
+    }
+    out
 }
 
 #[derive(Default)]
@@ -107,20 +179,23 @@ struct State {
 }
 
 impl State {
-    /// One rung: the first layout in release order that gives anything back.
-    fn relieve(&mut self) -> bool {
-        let mut order: Vec<(String, (u8, i64))> = self.layouts.iter().filter(|(_, l)| l.holds()).map(|(d, l)| (d.clone(), l.rank())).collect();
-        order.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-        for (digest, (class, _)) in order {
-            if self.layouts.get(&digest).is_some_and(Layout::release) {
-                if class == 0 {
+    /// Applies the host decision for `trigger`; returns the bytes given back.
+    fn relieve(&mut self, trigger: HostTrigger) -> u64 {
+        let facts: Vec<HostLayout> = self.layouts.iter().map(|(d, l)| l.facts(d)).collect();
+        let actions = host_decide(&facts, trigger);
+        let mut gave = 0;
+        for a in actions {
+            match a {
+                HostAction::Release { digest, region } => gave += self.layouts.get(&digest).map_or(0, |l| l.release(region)),
+                HostAction::Forget(digest) => {
                     self.layouts.remove(&digest);
                 }
-                self.releases += 1;
-                return true;
             }
         }
-        false
+        if gave > 0 {
+            self.releases += 1;
+        }
+        gave
     }
 }
 
@@ -149,7 +224,7 @@ impl Tier {
                     return;
                 }
                 let (lock, cv) = &*state;
-                lock.lock().relieve();
+                lock.lock().relieve(HostTrigger::Pressure);
                 cv.notify_all();
             })
             .map_err(|e| Error::io("spawn pressure", e))?;
@@ -191,6 +266,10 @@ impl Tier {
 }
 
 fn serve(stream: Stream, state: &(Mutex<State>, Condvar)) {
+    // Only this user's processes: an abstract name has no permissions of its own.
+    if os::peer(&stream).is_err() {
+        return;
+    }
     let (lock, cv) = state;
     let conn = {
         let mut s = lock.lock();
@@ -227,15 +306,10 @@ fn serve(stream: Stream, state: &(Mutex<State>, Condvar)) {
                 (Reply::Done, None)
             }
             Call::Room { bytes } => {
-                let mut ok = true;
-                while i64::try_from(bytes).is_ok_and(|b| platform::contain::host_memory::read().available < b) {
-                    if !s.relieve() {
-                        ok = false;
-                        break;
-                    }
-                }
+                let headroom = u64::try_from(platform::contain::host_memory::read().available).unwrap_or(0);
+                let gave = if headroom >= bytes { 0 } else { s.relieve(HostTrigger::Room { bytes, headroom }) };
                 cv.notify_all();
-                (Reply::Room { ok }, None)
+                (Reply::Room { ok: headroom + gave >= bytes }, None)
             }
         };
         drop(s);
@@ -279,9 +353,40 @@ pub(crate) struct Held {
     ro: Map,
     data: u64,
     regions: Vec<(u64, u64)>,
+    /// Regions page-locked for the copy engine (once each, while ready).
+    registered: parking_lot::Mutex<std::collections::HashSet<u32>>,
 }
 
 impl Held {
+    /// Page-locks region `r` once it is ready, so fills from it are pinned copies; a region
+    /// the tier gave back is unlocked first.
+    pub fn pin(&self, r: u32, register: impl FnOnce(u64, u64) -> Result<()>, unregister: impl FnOnce(u64) -> Result<()>) -> Result<()> {
+        let (off, span) = self.region(r)?;
+        let ptr = self.ro.base as u64 + self.data + off;
+        let ready = self.ready(r).is_some_and(|w| w.load(Acquire) == 1);
+        let mut registered = self.registered.lock();
+        match (ready, registered.contains(&r)) {
+            (true, false) => {
+                register(ptr, span)?;
+                registered.insert(r);
+            }
+            (false, true) => {
+                unregister(ptr)?;
+                registered.remove(&r);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Unlocks every region (the layout is closing).
+    pub fn unpin(&self, mut unregister: impl FnMut(u64) -> Result<()>) {
+        for r in self.registered.lock().drain() {
+            if let Ok((off, _)) = self.region(r) {
+                let _ = unregister(self.ro.base as u64 + self.data + off);
+            }
+        }
+    }
     fn ready(&self, r: u32) -> Option<&AtomicU32> {
         let at = r as usize * 4;
         (at + 4 <= self.data as usize).then(|| {
@@ -373,7 +478,7 @@ impl Client {
         let fd = os::reopen(&fd, true)?;
         let len = data + regions.iter().map(|(o, s)| o + s).max().unwrap_or(0);
         let ro = os::map(&fd, len as usize, false)?;
-        Ok(Held { fd, ro, data, regions })
+        Ok(Held { fd, ro, data, regions, registered: Default::default() })
     }
 
     pub fn use_layout(&self, digest: &str, distance: Option<u32>) -> Result<()> {

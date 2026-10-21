@@ -78,17 +78,70 @@ fn an_oom_at_a_cut_site_cuts_and_a_collective_one_waits_for_the_next_pass() {
     let (_l, mem, g) = open("cut", 4 * MB);
     let id = mem.load(set(dir.path(), "c", 2, &g.uuid), Level::Ram).unwrap();
     let r = mem.request("r", plan("c")).unwrap();
-    let _pass = r.pass(id, "1x8", Torch::default()).unwrap();
+    let pass = r.pass(id, "1x8", Torch::default()).unwrap();
     let pins: Vec<_> = (0..2).map(|b| mem.bind(id, b, 0).unwrap()).collect();
     let site = Some(Site { name: "ffn", collective: false });
     // The free bytes went to the pages; every page is pinned: the op cuts, level by level.
     assert!(matches!(r.oom(Some(MB), site, Torch::default()), Next::Cut(1)));
     assert_eq!(r.cut("ffn"), 1);
     assert!(matches!(r.oom(Some(MB), site, Torch::default()), Next::Cut(2)));
-    // A collective site never cuts mid-pass: it recovers locally, and the next pass runs finer.
+    // Review 1, finding 4: a collective site never cuts mid-pass. It recovers locally, its
+    // finer level is proposed, and it takes effect when the ranks agree at the next pass.
     let collective = Some(Site { name: "allgather", collective: true });
     let next = r.oom(Some(MB), collective, Torch::default());
     assert!(matches!(next, Next::Park(_) | Next::Exhausted(_)), "{next:?}");
-    assert_eq!(r.cut("allgather"), 1, "recorded for the next pass");
+    assert_eq!(r.cut("allgather"), 0, "unchanged within the pass");
     drop(pins);
+    drop(pass);
+    let next = r.pass(id, "1x8", Torch::default()).unwrap();
+    assert_eq!(next.levels(), vec![("allgather".to_string(), 1)], "proposed for the agreement");
+    assert_eq!(r.cut("allgather"), 0);
+    next.agree(vec![("allgather".into(), 2)]);
+    assert_eq!(r.cut("allgather"), 2, "the ranks' maximum");
+}
+
+/// Review 1, finding 11: dropping an earlier pass after the next one started keeps the next
+/// one's state (binds stay its request's).
+#[test]
+fn a_late_dropped_pass_leaves_the_next_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_l, mem, g) = open("late", 16 * MB);
+    let id = mem.load(set(dir.path(), "l", 2, &g.uuid), Level::Ram).unwrap();
+    let r = mem.request("r", Plan { steps: vec![Step { sets: vec!["pkg@1/l".into()], passes: 2 }] }).unwrap();
+    let first = r.pass(id, "1x8", Torch::default()).unwrap();
+    let second = r.pass(id, "1x8", Torch::default()).unwrap();
+    drop(first);
+    drop(mem.bind(id, 0, 0).unwrap());
+    assert_eq!(r.stats().trace.len(), 1, "the bind is still the request's");
+    drop(second);
+}
+
+/// Review 1, finding 3: a Memory that served custody, once dropped, leaves no row publishing its
+/// bytes: custody's row is its own and holds only orphans.
+#[test]
+fn a_dropped_custody_holder_leaves_no_zombie_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = GpuId { uuid: format!("m{}-zombie", std::process::id()), model: "host".into(), memory: 16 * MB };
+    let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(g.memory))).unwrap();
+    mem.load(set(dir.path(), "z", 2, &g.uuid), Level::Gpu).unwrap();
+    let ledger = varena::Ledger::create(&g, None).unwrap();
+    let held = |l: &varena::Ledger| l.status().rows.iter().map(|r| r.classes.iter().sum::<u64>()).sum::<u64>();
+    assert_eq!(held(&ledger), 4 * MB);
+    drop(mem);
+    // Its kept pages are orphans now (class O on custody's row); nothing else is published.
+    let rows = ledger.status().rows;
+    assert!(rows.iter().all(|r| r.classes.iter().enumerate().all(|(c, b)| c == 1 || *b == 0)), "{rows:?}");
+    assert_eq!(rows.iter().map(|r| r.classes[1]).sum::<u64>(), 4 * MB, "S5: class O shows the orphans");
+}
+
+/// S5: `fits(package, "")` means the package's widest measured shape.
+#[test]
+fn an_empty_shape_fits_by_the_widest_measured() {
+    let (ledger, mem, _g) = open("widest", 16 * MB);
+    ledger.restore(&[varena::Peak { key: "pkg|1x1".into(), bytes: 2 * MB, sites: vec![] }, varena::Peak { key: "pkg|4x4".into(), bytes: 17 * MB, sites: vec![] }]).unwrap();
+    let busy = mem.request("busy", Plan::default()).unwrap();
+    assert!(ledger.fits("pkg", "1x1"));
+    assert!(!ledger.fits("pkg", ""), "the widest (17 MB) beside a running request does not fit");
+    drop(busy);
+    assert!(ledger.fits("pkg", ""), "an idle GPU fits anything");
 }

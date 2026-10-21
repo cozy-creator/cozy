@@ -1,17 +1,21 @@
 //! One executor's memory on one device: the applier of [`crate::decide`]'s actions. One
 //! `parking_lot` mutex guards the table and the mechanism's state; it is held for a decision and
-//! its application, never across a fill, a remote answer or a caller's callback. Fills run on
-//! fill threads; pin releases arrive through a channel; asks are answered by a thread of its
-//! own. A panic is caught at every public call: the call fails `Internal`, the table is derived
-//! again from the mappings, and the process keeps serving.
+//! its application, never across a fill, a remote call or a caller's callback: custody and tier
+//! calls made while it is held go to an outbox, sent in order once it is released. Fills run
+//! on fill threads (demand misses before prefetches); pin releases arrive through a channel;
+//! asks are answered from pages by a thread of its own that runs no caller code; an idle
+//! process's trim and cache shrinks run on its trim thread. A panic is caught at every public
+//! call and on every thread: the call fails `Internal`, the table is derived again from the
+//! mappings, and the process keeps serving.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex, MutexGuard};
+use platform::handles::Owned;
 
 use crate::backend::{Access, Backend, Event, Physical, Va};
 use crate::custody;
@@ -63,7 +67,7 @@ pub enum Next {
 }
 
 /// Where a bound block's bytes came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum Origin {
     /// Already mapped and filled.
     Hit,
@@ -74,7 +78,7 @@ pub enum Origin {
 }
 
 /// One bind: the page-reference trace the gate computes Belady MIN from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Ref {
     pub step: u32,
     pub set: String,
@@ -86,14 +90,14 @@ pub struct Ref {
 }
 
 /// Bytes filled from one source and the time the fills took, summed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Fills {
     pub bytes: u64,
     pub ns: u64,
 }
 
 /// Bytes moved, by source: fill time over bytes against the measured ceiling gives the %.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Moved {
     /// Kept pages imported by fingerprint (no copy; `ns` is the import).
     pub kept: Fills,
@@ -104,7 +108,7 @@ pub struct Moved {
 }
 
 /// One step of a request.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct StepStats {
     /// The capacity the step ran against (the device's, less foreign bytes, other rows and
     /// contexts), measured at its start.
@@ -116,7 +120,7 @@ pub struct StepStats {
 }
 
 /// One request's record (the design's §5 bar).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Stats {
     pub request: String,
     pub moved: Moved,
@@ -147,8 +151,9 @@ pub struct Stats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Site<'a> {
     pub name: &'a str,
-    /// A collective's site: ranks agree on cut levels at pass start, so a finer level is
-    /// recorded for the next pass and this one recovers locally.
+    /// A collective's site: ranks agree on cut levels at pass start ([`Pass::levels`],
+    /// [`Pass::agree`]), so a finer level is proposed for the next pass and this one recovers
+    /// locally.
     pub collective: bool,
 }
 
@@ -157,8 +162,8 @@ pub struct Memory {
     inner: Arc<Inner>,
 }
 
-/// A request in flight; dropping it ends it: its pins' room, its caches and its claims go, and
-/// the leftover is measured.
+/// A request in flight; dropping it ends it: its room, its claims and its caches go, and the
+/// leftover is measured.
 pub struct Request {
     inner: Arc<Inner>,
     id: u64,
@@ -178,7 +183,7 @@ pub struct Pin {
     key: Key,
     id: u64,
     stream: usize,
-    /// Fresh bytes of a set with a transform: unmapped on release unless [`Pin::filled`].
+    /// Fresh bytes of a set with a transform: refilled on release unless [`Pin::filled`].
     transform: bool,
     transformed: AtomicBool,
 }
@@ -188,9 +193,11 @@ pub struct Pin {
 pub struct Pass {
     inner: Arc<Inner>,
     req: u64,
+    id: u64,
 }
 
 type Shrink = Arc<Mutex<Box<dyn FnMut(u64) -> u64 + Send>>>;
+type Trim = Arc<Mutex<Box<dyn FnMut() -> u64 + Send>>>;
 
 struct SetMech {
     spec: SetSpec,
@@ -213,13 +220,15 @@ struct Home {
     exported: bool,
     origin: Origin,
     speculative: bool,
-    /// The fill identity its bytes were made under ([`crate::Fingerprint::key`]).
+    /// The fill identity its bytes were made under ([`crate::Fingerprint::key`]); empty: its
+    /// bytes are not the weights (a transform released undone), so it goes once unpinned.
     identity: String,
-    /// Keep (read-only, exported) once `ready` completes: the transform may still be running.
+    /// Keep (read-only, exported) once `ready` completes: a write may still be running.
     keep_after: bool,
 }
 
 struct Active {
+    id: u64,
     set: u32,
     shape: String,
     allocated: u64,
@@ -233,6 +242,14 @@ struct Job {
     req: Option<u64>,
 }
 
+/// Fill jobs: a demand miss goes before any prefetch.
+#[derive(Default)]
+struct Jobs {
+    demand: VecDeque<Job>,
+    ahead: VecDeque<Job>,
+    closed: bool,
+}
+
 struct Release {
     key: Key,
     pin: u64,
@@ -241,7 +258,22 @@ struct Release {
     untransformed: bool,
 }
 
-type Trim = Arc<Mutex<Box<dyn FnMut() -> u64 + Send>>>;
+/// A custody or tier call made under the lock, sent in order once it is released.
+enum Call {
+    Export { fp: String, page: u32, len: u64, handle: Owned },
+    Withdraw { fp: String, page: u32 },
+    Disown { fp: String, page: u32 },
+    Use { digest: String, distance: Option<u32> },
+    Close { digest: String },
+}
+
+/// What an idle process's trim thread runs: the trim hook and cache shrinks.
+#[derive(Default)]
+struct Wanted {
+    trim: bool,
+    shrinks: Vec<(u32, u64)>,
+    closed: bool,
+}
 
 #[derive(Default)]
 struct State {
@@ -257,8 +289,11 @@ struct State {
     trim: Option<Trim>,
     /// Rooms read from the ledger, by key.
     rooms: HashMap<String, Room>,
-    /// Cut levels per (set, shape).
+    /// Cut levels in effect per (set, shape); a collective site's are the agreed ones.
     cuts: HashMap<(u32, String), BTreeMap<String, u32>>,
+    /// Finer levels proposed for collective sites, for the next pass's agreement.
+    proposed: HashMap<(u32, String), BTreeMap<String, u32>>,
+    collective: HashSet<(u32, String, String)>,
     stuck: BTreeSet<(u32, String, String)>,
     /// The room each cut configuration failed at.
     failed_at: HashMap<String, u64>,
@@ -268,6 +303,12 @@ struct State {
     failed: HashMap<Key, Error>,
     /// Request → the `<package>|<shape>` its peak is recorded under.
     peaks: HashMap<u64, String>,
+    /// Requests whose last step is one their plan did not declare.
+    synthetic: HashSet<u64>,
+    /// Bytes asked of other rows and not yet decided on: published as held, so nobody else
+    /// takes them first.
+    claim: u64,
+    outbox: Vec<Call>,
 }
 
 impl State {
@@ -323,6 +364,13 @@ impl State {
     fn levels(&self, set: u32, shape: &str) -> BTreeMap<String, u32> {
         self.cuts.get(&(set, shape.to_string())).cloned().unwrap_or_default()
     }
+
+    /// Bumps `site`'s level in effect; returns it.
+    fn cut(&mut self, set: u32, shape: &str, site: &str) -> u32 {
+        let level = self.cuts.entry((set, shape.to_string())).or_default().entry(site.to_string()).or_insert(0);
+        *level += 1;
+        *level
+    }
 }
 
 /// `<set>|<shape>|<site=level,...>`.
@@ -335,6 +383,12 @@ fn dims(shape: &str) -> Option<Vec<u64>> {
     shape.split('x').map(|d| d.parse().ok()).collect()
 }
 
+fn with(levels: &BTreeMap<String, u32>, site: &str, level: u32) -> BTreeMap<String, u32> {
+    let mut l = levels.clone();
+    l.insert(site.to_string(), level);
+    l
+}
+
 struct Inner {
     backend: Box<dyn Backend>,
     shared: Arc<Shared>,
@@ -343,9 +397,15 @@ struct Inner {
     tier: Option<tier::Client>,
     state: Mutex<State>,
     landed: Condvar,
+    /// Held from before the state lock is released until its outbox is sent: calls go out in
+    /// the order they were made.
+    calls: Mutex<()>,
     release_tx: Sender<Release>,
     releases: Mutex<Receiver<Release>>,
-    jobs: Mutex<Option<Sender<Job>>>,
+    /// Fill jobs and the trim thread's work: shared with the threads, which hold only a weak
+    /// reference to the rest while they wait, so dropping the Memory ends them.
+    jobs: Arc<(Mutex<Jobs>, Condvar)>,
+    wanted: Arc<(Mutex<Wanted>, Condvar)>,
     stop: Arc<AtomicBool>,
     #[cfg(unix)]
     tally: tensorfs::io::source::IoTally,
@@ -371,10 +431,10 @@ impl Memory {
             let shared = Arc::new(Shared::adopt(grant.table, &gpu, capacity, Some(grant.events))?);
             shared.reap(None)?;
             let row = Arc::new(shared.claim(std::process::id())?);
-            let custody = custody::Client::open(&gpu.uuid, &row).map_err(|e| tracing::warn!("varena: no custody: {e}")).ok();
+            let listener = row.listen()?;
+            let custody = custody::Client::open(&shared).map_err(|e| tracing::warn!("varena: no custody: {e}")).ok();
             let tier = tier::Client::open().map_err(|e| tracing::warn!("varena: no RAM tier: {e}")).ok();
             let (release_tx, releases) = channel();
-            let (jobs, queue) = channel::<Job>();
             let table = Table { capacity: shared.capacity()?, context: backend.process_used()?, ..Table::default() };
             let inner = Arc::new(Inner {
                 backend,
@@ -384,29 +444,35 @@ impl Memory {
                 tier,
                 state: Mutex::new(State { table, ..State::default() }),
                 landed: Condvar::new(),
+                calls: Mutex::new(()),
                 release_tx,
                 releases: Mutex::new(releases),
-                jobs: Mutex::new(Some(jobs)),
+                jobs: Arc::new((Mutex::new(Jobs::default()), Condvar::new())),
+                wanted: Arc::new((Mutex::new(Wanted::default()), Condvar::new())),
                 stop: Arc::new(AtomicBool::new(false)),
                 #[cfg(unix)]
                 tally: Default::default(),
             });
             // One fill thread per copy stream TensorFS runs per device: a fill waits on its
             // streams, so this many keep them busy.
-            let queue = Arc::new(Mutex::new(queue));
             for _ in 0..tensorfs::io::ReadOpts::default().streams.max(1) {
-                let (queue, weak) = (queue.clone(), Arc::downgrade(&inner));
-                std::thread::Builder::new().name("varena-fill".into()).spawn(move || fill_loop(&queue, &weak)).map_err(|e| Error::io("spawn fill", e))?;
+                let (weak, jobs) = (Arc::downgrade(&inner), inner.jobs.clone());
+                std::thread::Builder::new().name("varena-fill".into()).spawn(move || fill_loop(&jobs, &weak)).map_err(|e| Error::io("spawn fill", e))?;
             }
             let (weak, stop) = (Arc::downgrade(&inner), inner.stop.clone());
-            std::thread::Builder::new().name("varena-ask".into()).spawn(move || ask_loop(&row, &weak, &stop)).map_err(|e| Error::io("spawn ask", e))?;
-            inner.publish(&inner.state.lock());
+            std::thread::Builder::new().name("varena-ask".into()).spawn(move || ask_loop(listener, &row, &weak, &stop)).map_err(|e| Error::io("spawn ask", e))?;
+            let (weak, wanted) = (Arc::downgrade(&inner), inner.wanted.clone());
+            std::thread::Builder::new().name("varena-trim".into()).spawn(move || trim_loop(&wanted, &weak)).map_err(|e| Error::io("spawn trim", e))?;
+            let st = inner.lock();
+            inner.publish(&st);
+            inner.unlock(st);
             Ok(Memory { inner })
         })
     }
 
-    /// Registers a set and brings it to `level`. On every start, first or restart, each page
-    /// imports a kept page by fingerprint, else fills from the RAM tier, else from the store.
+    /// Registers a set and brings it to `level`; a set loaded again is re-levelled in place. On
+    /// every start, first or restart, its pages kept under its fingerprint are imported, and
+    /// the rest fill from the RAM tier, else the store.
     pub fn load(&self, set: SetSpec, level: Level) -> Result<SetId> {
         self.inner.guard(|| self.inner.load(set, level))
     }
@@ -419,6 +485,7 @@ impl Memory {
                 m.closing = true;
             }
             self.inner.close_sets(&mut st);
+            self.inner.unlock(st);
             Ok(())
         });
     }
@@ -426,36 +493,56 @@ impl Memory {
     /// Registers bytes the caller holds (torch tensors) that `shrink(want) -> freed` gives back.
     /// A cache whose `owner` is a request id ends with that request.
     pub fn cache(&self, owner: &str, shrink: Box<dyn FnMut(u64) -> u64 + Send>) -> CacheId {
-        let mut st = self.inner.lock();
-        let id = st.tick() as u32;
-        let last_use = st.clock;
-        st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), bytes: 0, last_use });
-        st.shrinks.insert(id, Arc::new(Mutex::new(shrink)));
-        CacheId(id)
+        let shrink = Arc::new(Mutex::new(shrink));
+        self.inner
+            .guard(|| {
+                let mut st = self.inner.lock();
+                let id = st.tick() as u32;
+                let last_use = st.clock;
+                st.table.caches.push(crate::table::Cache { id, owner: owner.to_string(), bytes: 0, last_use });
+                st.shrinks.insert(id, shrink);
+                self.inner.unlock(st);
+                Ok(CacheId(id))
+            })
+            .unwrap_or(CacheId(0))
     }
 
     /// The cache now holds `bytes`.
     pub fn cached(&self, cache: CacheId, bytes: u64) {
-        let mut st = self.inner.lock();
-        let now = st.tick();
-        if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == cache.0) {
-            c.bytes = bytes;
-            c.last_use = now;
-        }
-        self.inner.publish(&st);
+        let _ = self.inner.guard(|| {
+            let mut st = self.inner.lock();
+            let now = st.tick();
+            if let Some(c) = st.table.caches.iter_mut().find(|c| c.id == cache.0) {
+                c.bytes = bytes;
+                c.last_use = now;
+            }
+            self.inner.publish(&st);
+            self.inner.unlock(st);
+            Ok(())
+        });
     }
 
     pub fn uncache(&self, cache: CacheId) {
-        let mut st = self.inner.lock();
-        st.table.caches.retain(|c| c.id != cache.0);
-        st.shrinks.remove(&cache.0);
-        self.inner.publish(&st);
+        let _ = self.inner.guard(|| {
+            let mut st = self.inner.lock();
+            st.table.caches.retain(|c| c.id != cache.0);
+            st.shrinks.remove(&cache.0);
+            self.inner.publish(&st);
+            self.inner.unlock(st);
+            Ok(())
+        });
     }
 
     /// Registers the allocator's trim (torch's `empty_cache`), returning the bytes it freed: the
     /// allocator's slack is free (F), and a demand trims before it evicts anything.
     pub fn trim_with(&self, trim: Box<dyn FnMut() -> u64 + Send>) {
-        self.inner.lock().trim = Some(Arc::new(Mutex::new(trim)));
+        let trim = Arc::new(Mutex::new(trim));
+        let _ = self.inner.guard(|| {
+            let mut st = self.inner.lock();
+            st.trim = Some(trim);
+            self.inner.unlock(st);
+            Ok(())
+        });
     }
 
     /// Sets the set's current fill identity (a no-op when unchanged). Pages filled under another
@@ -464,7 +551,9 @@ impl Memory {
     pub fn fill(&self, set: SetId, fill: Fill) {
         let _ = self.inner.guard(|| {
             let mut st = self.inner.lock();
-            self.inner.refill(&mut st, set.0, fill)
+            let r = self.inner.refill(&mut st, set.0, fill);
+            self.inner.unlock(st);
+            r
         });
     }
 
@@ -483,14 +572,21 @@ impl Memory {
     /// Bytes torch's allocator may hold now: capacity − context − mapped − other rows − foreign
     /// bytes. The adapter applies it at every pass start and after every `oom` answer.
     pub fn torch_limit(&self) -> u64 {
-        let mut st = self.inner.lock();
-        let _ = self.inner.refresh(&mut st);
-        st.table.torch_limit()
+        self.inner
+            .guard(|| {
+                let mut st = self.inner.lock();
+                self.inner.refresh(&mut st)?;
+                let limit = st.table.torch_limit();
+                self.inner.unlock(st);
+                Ok(limit)
+            })
+            .unwrap_or(0)
     }
 
     /// The record of the request that ended last.
     pub fn stats(&self) -> Option<Stats> {
-        self.inner.lock().last.clone()
+        let st = self.inner.state.lock();
+        st.last.clone()
     }
 }
 
@@ -504,7 +600,8 @@ impl Inner {
         out
     }
 
-    /// After a panic: the table's pages from the mappings, each open request's episode afresh.
+    /// After a panic: the table's pages derived again from the homes (each recorded in the same
+    /// statement as its mapping, so they are the mappings), each open request's episode afresh.
     fn recover(&self) {
         let mut st = self.state.lock();
         let keys: Vec<Key> = st.table.pages().map(|(k, _)| k).collect();
@@ -515,15 +612,63 @@ impl Inner {
             r.episode = Default::default();
             r.speculated.clear();
         }
+        st.claim = 0;
         self.publish(&st);
+        self.unlock(st);
         self.landed.notify_all();
     }
 
-    /// The state, with pin releases applied and completed release events retired.
+    /// The state, with pin releases applied and completed events acted on.
     fn lock(&self) -> MutexGuard<'_, State> {
         let mut st = self.state.lock();
         self.drain(&mut st);
         st
+    }
+
+    /// Releases the state, then sends the calls it made, in order.
+    fn unlock(&self, mut st: MutexGuard<'_, State>) {
+        let calls = std::mem::take(&mut st.outbox);
+        if calls.is_empty() {
+            return;
+        }
+        let order = self.calls.lock();
+        drop(st);
+        self.send(calls);
+        drop(order);
+    }
+
+    /// Sends the outbox while the state stays locked across (a waiter about to sleep).
+    fn flush(&self, st: &mut MutexGuard<'_, State>) {
+        let calls = std::mem::take(&mut st.outbox);
+        if calls.is_empty() {
+            return;
+        }
+        let order = self.calls.lock();
+        MutexGuard::unlocked(st, || self.send(calls));
+        drop(order);
+    }
+
+    fn send(&self, calls: Vec<Call>) {
+        for call in calls {
+            let _ = match call {
+                Call::Export { fp, page, len, handle } => self.custody.as_ref().map(|c| c.export(&fp, page, len, handle)),
+                Call::Withdraw { fp, page } => self.custody.as_ref().map(|c| c.withdraw(&fp, page)),
+                Call::Disown { fp, page } => self.custody.as_ref().map(|c| c.disown(&fp, page)),
+                Call::Use { digest, distance } => self.tier.as_ref().map(|t| t.use_layout(&digest, distance)),
+                Call::Close { digest } => self.tier.as_ref().map(|t| t.close(&digest)),
+            };
+        }
+    }
+
+    /// Waits for a fill or release, the outbox sent first.
+    fn wait(&self, st: &mut MutexGuard<'_, State>) {
+        if !st.outbox.is_empty() {
+            // Sent, and the caller looks again before it sleeps.
+            self.flush(st);
+            return;
+        }
+        self.landed.wait(st);
+        self.drain(st);
     }
 
     fn drain(&self, st: &mut State) {
@@ -538,11 +683,12 @@ impl Inner {
                 st.releasing.insert(r.key);
             }
             if r.untransformed {
+                // Its bytes are not the weights: it goes once unpinned and its release event
+                // completed, and the next bind fills again.
                 if let Some(h) = st.homes.get_mut(&r.key) {
                     h.transforming = false;
+                    h.identity.clear();
                 }
-                // Its bytes are not the weights: they go, and the next bind fills again.
-                let _ = self.unmap(st, r.key, Class::P, None, true);
                 wake = true;
             }
             st.sync(r.key);
@@ -576,7 +722,8 @@ impl Inner {
         }
     }
 
-    /// Unmaps unpinned pages filled under a fill identity their set no longer has.
+    /// Unmaps unpinned pages whose bytes are not their set's weights now (another fill identity,
+    /// or a transform released undone), once no release event is pending.
     fn drop_stale(&self, st: &mut State) {
         let stale: Vec<Key> = st
             .homes
@@ -606,7 +753,8 @@ impl Inner {
         Ok(())
     }
 
-    /// Unmaps the unpinned pages of closing sets; a set goes once it has none.
+    /// Unmaps the unpinned pages of closing sets; a set goes once it has none. Its slot stays
+    /// empty: open plans name it by index.
     fn close_sets(&self, st: &mut State) {
         let closing: Vec<u32> = st.sets.iter().enumerate().filter(|(_, m)| m.as_ref().is_some_and(|m| m.closing)).map(|(i, _)| i as u32).collect();
         for set in closing {
@@ -619,9 +767,10 @@ impl Inner {
             }
             if let Some(m) = st.sets.get_mut(set as usize).and_then(Option::take) {
                 self.backend.release(m.va);
-                if let Some(t) = &self.tier {
-                    let _ = t.close(&m.spec.layout.digest);
+                if let Some(held) = &m.held {
+                    held.unpin(|p| self.backend.unregister_host(p));
                 }
+                st.outbox.push(Call::Close { digest: m.spec.layout.digest.clone() });
             }
             if let Some(slot) = st.table.sets.get_mut(set as usize) {
                 *slot = None;
@@ -629,7 +778,7 @@ impl Inner {
         }
     }
 
-    /// The other rows, orphans, capacity and foreign bytes, read now.
+    /// The other rows, orphans, capacity, mode and foreign bytes, read now.
     fn refresh(&self, st: &mut State) -> Result<()> {
         let mut rows = self.shared.rows()?;
         if rows.iter().any(|r| !r.live) && self.shared.reap(None)? {
@@ -639,6 +788,7 @@ impl Inner {
         st.table.others = others;
         st.table.orphans = orphans;
         st.table.capacity = self.shared.capacity()?;
+        st.table.shared = self.shared.shared_mode()?;
         let others: u64 = st.table.others.iter().map(crate::table::Remote::held).sum();
         let used = self.backend.capacity().saturating_sub(self.backend.free()?);
         st.table.foreign = used.saturating_sub(others + orphans + st.table.held());
@@ -652,8 +802,8 @@ impl Inner {
         let idle = t.requests.is_empty();
         self.row.publish(&Facts {
             context: t.context,
-            torch: t.torch(),
-            caches: if idle { t.torch() } else { 0 },
+            torch: t.torch() + st.claim,
+            caches: if idle { t.slack() + t.caches.iter().map(|c| c.bytes).sum::<u64>() } else { 0 },
             classes: t.classes(),
             remaining: remaining.iter().flatten().sum(),
             unmeasured: remaining.iter().filter(|r| r.is_none()).count() as u64,
@@ -670,9 +820,7 @@ impl Inner {
         let Some(home) = st.homes.remove(&key) else { return Ok(()) };
         let (va, off, span) = st.place(key)?;
         if home.exported && withdraw {
-            if let Some(c) = &self.custody {
-                let _ = c.withdraw(&home.identity, key.1);
-            }
+            st.outbox.push(Call::Withdraw { fp: home.identity.clone(), page: key.1 });
         }
         let unmapped = self.backend.unmap(va, off, span);
         self.backend.destroy(home.phys);
@@ -692,30 +840,52 @@ impl Inner {
         unmapped
     }
 
-    /// Imports the page kept under its fingerprint, if custody holds one: no copy.
-    fn import(&self, st: &mut State, key: Key, req: Option<u64>) -> Result<bool> {
-        let Some(c) = &self.custody else { return Ok(false) };
-        let m = st.mech(key.0)?;
-        if !m.spec.fingerprint.declared() {
-            return Ok(false);
+    /// Imports the kept pages of `keys` custody holds under their sets' fingerprints: no copy,
+    /// and orphans are adopted before any demand could release them. The calls run unlocked;
+    /// an import nobody needs any more goes back.
+    fn adopt(&self, keys: Vec<Key>, req: Option<u64>) -> Result<u64> {
+        let Some(c) = &self.custody else { return Ok(0) };
+        let wanted: Vec<(Key, String)> = {
+            let st = self.lock();
+            let w = keys
+                .into_iter()
+                .filter(|k| st.table.page(*k).is_some_and(|p| !p.mapped))
+                .filter_map(|k| st.mech(k.0).ok().filter(|m| m.spec.fingerprint.declared()).map(|m| (k, m.spec.fingerprint.key())))
+                .collect();
+            self.unlock(st);
+            w
+        };
+        let mut adopted = 0;
+        for (key, identity) in wanted {
+            let start = Instant::now();
+            let Some(handle) = c.import(&identity, key.1) else { continue };
+            let mut st = self.lock();
+            let current = st.mech(key.0).ok().map(|m| m.spec.fingerprint.key());
+            if st.homes.contains_key(&key) || current.as_ref() != Some(&identity) {
+                st.outbox.push(Call::Disown { fp: identity, page: key.1 });
+                self.unlock(st);
+                continue;
+            }
+            let (va, off, span) = st.place(key)?;
+            let phys = self.backend.import(handle, span)?;
+            if let Err(e) = self.backend.map(va, off, &phys, Access::Read) {
+                self.backend.destroy(phys);
+                st.outbox.push(Call::Disown { fp: identity, page: key.1 });
+                self.unlock(st);
+                return Err(e);
+            }
+            let gen = st.tick();
+            st.homes.insert(key, Home { phys, ready: Event::DONE, gen, filled: true, filling: false, fresh: false, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false });
+            st.sync(key);
+            if let Some(s) = st.stats(req) {
+                s.moved.kept.bytes += span;
+                s.moved.kept.ns += start.elapsed().as_nanos() as u64;
+            }
+            adopted += span;
+            self.publish(&st);
+            self.unlock(st);
         }
-        let start = Instant::now();
-        let identity = m.spec.fingerprint.key();
-        let Some(handle) = c.import(&identity, key.1)? else { return Ok(false) };
-        let (va, off, span) = st.place(key)?;
-        let phys = self.backend.import(handle, span)?;
-        if let Err(e) = self.backend.map(va, off, &phys, Access::Read) {
-            self.backend.destroy(phys);
-            return Err(e);
-        }
-        let gen = st.tick();
-        st.homes.insert(key, Home { phys, ready: Event::DONE, gen, filled: true, filling: false, fresh: false, transforming: false, exported: true, origin: Origin::Kept, speculative: false, identity, keep_after: false });
-        st.sync(key);
-        if let Some(s) = st.stats(req) {
-            s.moved.kept.bytes += span;
-            s.moved.kept.ns += start.elapsed().as_nanos() as u64;
-        }
-        Ok(true)
+        Ok(adopted)
     }
 
     /// Maps a page read-write and queues its fill. A speculative map that finds no device
@@ -738,18 +908,25 @@ impl Inner {
         let identity = st.mech(key.0)?.spec.fingerprint.key();
         st.homes.insert(key, Home { phys, ready: Event::DONE, gen, filled: false, filling: true, fresh: false, transforming: false, exported: false, origin: Origin::Store, speculative, identity, keep_after: false });
         st.sync(key);
-        let queued = self.jobs.lock().as_ref().is_some_and(|j| j.send(Job { key, gen, req }).is_ok());
-        if !queued {
+        let (lock, queued) = &*self.jobs;
+        let mut jobs = lock.lock();
+        if jobs.closed {
             return Err(Error::Closed("the fill threads".into()));
         }
+        let job = Job { key, gen, req };
+        if speculative { jobs.ahead.push_back(job) } else { jobs.demand.push_back(job) }
+        drop(jobs);
+        queued.notify_one();
         Ok(true)
     }
 
-    /// Exports a filled page of a declared set into custody, read-only. Only once its ready
+    /// Exports a filled page of a declared set into custody, read-only, only once its ready
     /// event completed: a write still running must not meet a read-only page, and another
     /// process must not import a half-made one.
     fn keep(&self, st: &mut State, key: Key) {
-        let Some(c) = &self.custody else { return };
+        if self.custody.is_none() {
+            return;
+        }
         let Ok((va, off, span)) = st.place(key) else { return };
         let Ok(m) = st.mech(key.0) else { return };
         let fp = m.spec.fingerprint.clone();
@@ -767,16 +944,19 @@ impl Inner {
             st.releasing.insert(key);
             return;
         }
-        let kept = self.backend.protect(va, off, span, Access::Read).and_then(|_| self.backend.export(&home.phys)).and_then(|h| c.export(&home.identity, key.1, span, h));
-        match kept {
-            Ok(()) => home.exported = true,
+        match self.backend.protect(va, off, span, Access::Read).and_then(|_| self.backend.export(&home.phys)) {
+            Ok(handle) => {
+                home.exported = true;
+                let fp = home.identity.clone();
+                st.outbox.push(Call::Export { fp, page: key.1, len: span, handle });
+            }
             Err(e) => tracing::warn!("varena: keeping {key:?} failed: {e}"),
         }
     }
 
     /// A fill thread's job: tier, else store (through the tier when it has room), then the
     /// page's ready event.
-    fn fill(&self, job: Job) {
+    fn fill(&self, job: &Job) {
         let prepared = {
             let st = self.state.lock();
             match (st.homes.get(&job.key), st.mech(job.key.0), st.place(job.key)) {
@@ -791,24 +971,23 @@ impl Inner {
             crate::faults::hit(crate::faults::Point::Fill);
             let dst = self.backend.target(va, off, span);
             let region = spec.layout.region(job.key.1)?;
-            let origin = match &held {
-                Some(held) if held.read(job.key.1, dst)? => Origin::Tier,
-                Some(held) if self.tier.as_ref().is_some_and(|t| t.room(span).unwrap_or(false)) => {
+            let pin = |held: &tier::Held| held.pin(job.key.1, |p, l| self.backend.register_host(p, l), |p| self.backend.unregister_host(p));
+            if let Some(held) = &held {
+                pin(held)?;
+                if held.read(job.key.1, dst)? {
+                    return Ok((Origin::Tier, self.backend.fence()?));
+                }
+                // Staged through the tier when the host has the room (the tier's decision).
+                if self.tier.as_ref().is_some_and(|t| t.room(span).unwrap_or(false)) {
                     held.fill(job.key.1, |host| self.store(&spec.source, &region.items, region.offset, host))?;
-                    match held.read(job.key.1, dst)? {
-                        true => Origin::Store,
-                        false => {
-                            self.store(&spec.source, &region.items, region.offset, dst)?;
-                            Origin::Store
-                        }
+                    pin(held)?;
+                    if held.read(job.key.1, dst)? {
+                        return Ok((Origin::Store, self.backend.fence()?));
                     }
                 }
-                _ => {
-                    self.store(&spec.source, &region.items, region.offset, dst)?;
-                    Origin::Store
-                }
-            };
-            Ok((origin, self.backend.fence()?))
+            }
+            self.store(&spec.source, &region.items, region.offset, dst)?;
+            Ok((Origin::Store, self.backend.fence()?))
         });
         let ns = start.elapsed().as_nanos() as u64;
         let mut st = self.state.lock();
@@ -858,7 +1037,21 @@ impl Inner {
             }
         }
         self.publish(&st);
-        drop(st);
+        self.unlock(st);
+        self.landed.notify_all();
+    }
+
+    /// A fill thread's job failed outside its copy (a panic): its page goes, its binder fails.
+    fn fail(&self, job: &Job, e: Error) {
+        let mut st = self.state.lock();
+        if st.homes.get(&job.key).is_some_and(|h| h.gen == job.gen) {
+            if let Some(h) = st.homes.get_mut(&job.key) {
+                h.filling = false;
+            }
+            let _ = self.unmap(&mut st, job.key, Class::P, None, true);
+            st.failed.insert(job.key, e);
+        }
+        self.unlock(st);
         self.landed.notify_all();
     }
 
@@ -877,8 +1070,10 @@ impl Inner {
 
     // ---- demands
 
-    /// Decides and applies until the trigger is met or ends: remote rungs (orphans, asks) run
-    /// with the lock released, then the procedure decides again with them tried.
+    /// Decides and applies until the trigger is met or ends. Remote rungs (the trim hook,
+    /// orphans, asks) run with the lock released; bytes asked of others are claimed in this
+    /// row meanwhile, so nobody takes them first; then the procedure decides again with them
+    /// tried and what every round freed counted.
     fn demand(&self, mut trigger: Trigger, req: Option<u64>) -> Result<Vec<Action>> {
         loop {
             let mut st = self.lock();
@@ -887,21 +1082,33 @@ impl Inner {
                 st.table.headroom = u64::try_from(platform::contain::host_memory::read().available).unwrap_or(0);
             }
             let actions = decide(&st.table, &trigger);
-            let mut remote = vec![];
-            let mut shrinks = vec![];
+            let (mut remote, mut shrinks, mut freed) = (vec![], vec![], 0);
             for a in &actions {
-                self.apply(&mut st, a, req, &mut remote, &mut shrinks)?;
+                freed += self.apply(&mut st, a, req, &mut remote, &mut shrinks)?;
+            }
+            st.claim = remote.iter().map(|a| if let Action::Ask { bytes, .. } = a { *bytes } else { 0 }).sum();
+            // A pass whose cut changed its room decides again at the new levels.
+            if let (Trigger::Pass { room, unmeasured, .. }, Some(r)) = (&mut trigger, req) {
+                if actions.iter().any(|a| matches!(a, Action::Cut { .. })) && !remote.is_empty() {
+                    (*room, *unmeasured) = self.pass_room(&mut st, r)?;
+                }
             }
             self.publish(&st);
-            drop(st);
+            self.unlock(st);
             self.shrink(shrinks);
             if remote.is_empty() {
                 return Ok(actions);
             }
             let tried = match &mut trigger {
                 Trigger::Bind { tried, .. } | Trigger::Pass { tried, .. } | Trigger::Oom { tried, .. } | Trigger::Speculate { tried, .. } => tried,
-                Trigger::Ask { .. } => return Ok(actions),
+                Trigger::Ask { .. } | Trigger::Load { .. } => return Ok(actions),
             };
+            tried.freed += freed;
+            for a in &actions {
+                if let Action::Cut { site, .. } | Action::Propose { site, .. } = a {
+                    tried.cut.insert(site.clone());
+                }
+            }
             for a in remote {
                 match a {
                     Action::Trim(_) => {
@@ -910,15 +1117,11 @@ impl Inner {
                     }
                     Action::ReleaseOrphans(bytes) => {
                         tried.orphans = true;
-                        if let Some(c) = &self.custody {
-                            tried.freed += c.release(bytes)?;
-                        }
+                        tried.freed += self.custody.as_ref().map_or(0, |c| c.release(bytes));
                     }
                     Action::Ask { row, ceiling, bytes } => {
                         tried.asked.insert((row, ceiling));
-                        let at = ledger::row_offset(row);
-                        let until = self.shared.ask(at, ceiling, bytes)?;
-                        tried.freed += self.shared.answered(at, ceiling, until)?;
+                        tried.freed += self.shared.ask(row, ceiling, bytes)?;
                     }
                     _ => {}
                 }
@@ -926,9 +1129,14 @@ impl Inner {
         }
     }
 
-    fn apply(&self, st: &mut State, a: &Action, req: Option<u64>, remote: &mut Vec<Action>, shrinks: &mut Vec<(u32, u64, Shrink)>) -> Result<()> {
+    /// Applies one action; returns the bytes it unmapped.
+    fn apply(&self, st: &mut State, a: &Action, req: Option<u64>, remote: &mut Vec<Action>, shrinks: &mut Vec<(u32, u64, Shrink)>) -> Result<u64> {
         match a {
-            Action::Unmap { page, class } => self.unmap(st, *page, *class, req, true)?,
+            Action::Unmap { page, class } => {
+                let bytes = st.table.page(*page).map_or(0, |p| p.bytes);
+                self.unmap(st, *page, *class, req, true)?;
+                return Ok(bytes);
+            }
             Action::Trim(_) | Action::ReleaseOrphans(_) | Action::Ask { .. } => remote.push(a.clone()),
             Action::Shrink { cache, bytes } => {
                 if let Some(s) = st.shrinks.get(cache) {
@@ -945,14 +1153,12 @@ impl Inner {
             }
             Action::Prefetch(k) => {
                 let step = req.and_then(|r| st.table.request(r)).and_then(|r| r.distance(*k).map(|d| r.cursor.step + d.0));
-                if let (Some(r), Some(step)) = (req, step) {
-                    if let Some(rq) = st.table.request_mut(r) {
-                        rq.speculated.insert(*k);
-                    }
-                    if self.map(st, *k, req, true)? {
-                        if let Some(p) = st.table.page_mut(*k) {
-                            p.speculative = Some((r, step));
-                        }
+                if let Some(r) = req.and_then(|r| st.table.request_mut(r)) {
+                    r.speculated.insert(*k);
+                }
+                if self.map(st, *k, req, true)? {
+                    if let (Some(r), Some(step), Some(p)) = (req, step, st.table.page_mut(*k)) {
+                        p.speculative = Some((r, step));
                     }
                 }
             }
@@ -960,6 +1166,37 @@ impl Inner {
                 if let Some(r) = st.table.request_mut(*req) {
                     r.claimed += bytes;
                     r.episode.claimed_free = true;
+                }
+            }
+            Action::Reserve { req, room, measured } => {
+                if let Some(r) = st.table.request_mut(*req) {
+                    r.room = *room;
+                    r.measured = *measured;
+                }
+            }
+            Action::Cut { req, site, failed_at } => {
+                if let Some((set, shape)) = st.active.get(req).map(|a| (a.set, a.shape.clone())) {
+                    let name = st.mech(set)?.spec.name.clone();
+                    let key = room_key(&name, &shape, &st.levels(set, &shape));
+                    st.failed_at.insert(key, *failed_at);
+                    st.cut(set, &shape, site);
+                }
+                if let Some(s) = st.stats(Some(*req)) {
+                    s.cuts += 1;
+                }
+            }
+            Action::Relax { req, site } => {
+                if let Some((set, shape)) = st.active.get(req).map(|a| (a.set, a.shape.clone())) {
+                    if let Some(l) = st.cuts.get_mut(&(set, shape)).and_then(|c| c.get_mut(site)) {
+                        *l = l.saturating_sub(1);
+                    }
+                }
+            }
+            Action::Propose { req, site } => {
+                if let Some((set, shape)) = st.active.get(req).map(|a| (a.set, a.shape.clone())) {
+                    let now = st.levels(set, &shape).get(site).copied().unwrap_or(0);
+                    let p = st.proposed.entry((set, shape)).or_default().entry(site.clone()).or_insert(0);
+                    *p = (*p).max(now + 1);
                 }
             }
             Action::Lower(r) => {
@@ -970,9 +1207,9 @@ impl Inner {
                     s.lowered = true;
                 }
             }
-            Action::Cut { .. } | Action::Park(_) | Action::Exhausted { .. } => {}
+            Action::Park(_) | Action::Exhausted { .. } => {}
         }
-        Ok(())
+        Ok(0)
     }
 
     /// Runs caches' shrink callbacks, the lock released (they are the caller's code).
@@ -1006,13 +1243,11 @@ impl Inner {
 
     // ---- the calls
 
-    /// A set loaded again is the same set, re-levelled in place (and given the fill identity it
-    /// names); a different layout under its name is refused.
     fn load(&self, spec: SetSpec, level: Level) -> Result<SetId> {
         let (id, again) = {
             let mut st = self.lock();
             let existing = st.sets.iter().position(|m| m.as_ref().is_some_and(|m| m.spec.name == spec.name && !m.closing));
-            match existing {
+            let out = match existing {
                 Some(i) if st.mech(i as u32)?.spec.fingerprint.digest == spec.fingerprint.digest => {
                     self.refill(&mut st, i as u32, spec.fingerprint.fill)?;
                     (i as u32, true)
@@ -1021,27 +1256,28 @@ impl Inner {
                 None => {
                     let layout = &spec.layout;
                     let va = self.backend.reserve(layout.nbytes)?;
-                    let regions: Vec<(u64, u64)> = layout.regions.iter().map(|r| (r.offset, r.span)).collect();
-                    let held = self.tier.as_ref().and_then(|t| t.open_layout(&layout.digest, regions).map_err(|e| tracing::warn!("varena: tier: {e}")).ok()).map(Arc::new);
                     let pages = layout.regions.iter().map(|r| Page { bytes: r.span, ..Page::default() }).collect();
                     let set = Set { name: spec.name.clone(), pages, declared: spec.fingerprint.declared() };
-                    let i = st.sets.iter().position(Option::is_none).unwrap_or(st.sets.len());
-                    let mech = SetMech { spec, va, held, closing: false };
-                    if i == st.sets.len() {
-                        st.sets.push(Some(mech));
-                        st.table.sets.push(Some(set));
-                    } else {
-                        if let Some(slot) = st.sets.get_mut(i) {
-                            *slot = Some(mech);
-                        }
-                        if let Some(slot) = st.table.sets.get_mut(i) {
-                            *slot = Some(set);
-                        }
-                    }
-                    (i as u32, false)
+                    let i = st.sets.len() as u32;
+                    st.sets.push(Some(SetMech { spec, va, held: None, closing: false }));
+                    st.table.sets.push(Some(set));
+                    (i, false)
                 }
-            }
+            };
+            self.unlock(st);
+            out
         };
+        if !again {
+            self.open_tier(id)?;
+        }
+        // One load path: whatever custody keeps for this fingerprint comes first, at any level.
+        let keys: Vec<Key> = {
+            let st = self.lock();
+            let k = st.table.pages().filter(|(k, p)| k.0 == id && !p.mapped).map(|(k, _)| k).collect();
+            self.unlock(st);
+            k
+        };
+        self.adopt(keys, None)?;
         match level {
             Level::Ram => {
                 if again {
@@ -1052,12 +1288,39 @@ impl Inner {
                         self.unmap(&mut st, key, Class::N, None, true)?;
                     }
                     self.publish(&st);
+                    self.unlock(st);
                 }
                 self.load_ram(id)?
             }
-            Level::Gpu => self.load_gpu(id)?,
+            Level::Gpu => {
+                self.demand(Trigger::Load { set: id }, None)?;
+                let mut st = self.lock();
+                while st.table.pages().any(|(k, p)| k.0 == id && p.filling) {
+                    self.wait(&mut st);
+                }
+                self.unlock(st);
+            }
         }
         Ok(SetId(id))
+    }
+
+    /// The set's layout in the RAM tier, opened unlocked (a call to the tier).
+    fn open_tier(&self, set: u32) -> Result<()> {
+        let Some(tier) = &self.tier else { return Ok(()) };
+        let layout = {
+            let st = self.lock();
+            let l = st.mech(set)?.spec.layout.clone();
+            self.unlock(st);
+            l
+        };
+        let regions: Vec<(u64, u64)> = layout.regions.iter().map(|r| (r.offset, r.span)).collect();
+        let held = tier.open_layout(&layout.digest, regions).map_err(|e| tracing::warn!("varena: tier: {e}")).ok().map(Arc::new);
+        let mut st = self.lock();
+        if let Some(Some(m)) = st.sets.get_mut(set as usize) {
+            m.held = held;
+        }
+        self.unlock(st);
+        Ok(())
     }
 
     /// Fills the set's layout in the RAM tier, region by region, as host headroom allows.
@@ -1065,7 +1328,9 @@ impl Inner {
         let (spec, held) = {
             let st = self.lock();
             let m = st.mech(set)?;
-            (m.spec.clone(), m.held.clone())
+            let out = (m.spec.clone(), m.held.clone());
+            self.unlock(st);
+            out
         };
         let (Some(held), Some(tier)) = (held, &self.tier) else { return Ok(()) };
         for (r, region) in spec.layout.regions.iter().enumerate() {
@@ -1073,27 +1338,6 @@ impl Inner {
                 break;
             }
             held.fill(r as u32, |host| self.store(&spec.source, &region.items, region.offset, host))?;
-        }
-        Ok(())
-    }
-
-    /// Imports every kept page, then fills the rest into free bytes only; waits for the fills.
-    fn load_gpu(&self, set: u32) -> Result<()> {
-        let mut st = self.lock();
-        self.refresh(&mut st)?;
-        let keys: Vec<Key> = st.table.pages().filter(|(k, p)| k.0 == set && !p.mapped).map(|(k, _)| k).collect();
-        for key in keys {
-            if self.import(&mut st, key, None)? {
-                continue;
-            }
-            let bytes = st.table.page(key).map_or(0, |p| p.bytes);
-            if st.table.free() < bytes || !self.map(&mut st, key, None, true)? {
-                break;
-            }
-        }
-        self.publish(&st);
-        while st.table.pages().any(|(k, p)| k.0 == set && p.filling) {
-            self.landed.wait(&mut st);
         }
         Ok(())
     }
@@ -1129,6 +1373,7 @@ impl Inner {
         st.table.requests.push(Req { id: rid, name: id.to_string(), steps, rooms, ..Req::default() });
         st.stats.insert(rid, Stats { request: id.to_string(), ..Stats::default() });
         self.publish(&st);
+        self.unlock(st);
         Ok(rid)
     }
 
@@ -1147,12 +1392,11 @@ impl Inner {
             }
             let identity = st.mech(set)?.spec.fingerprint.key();
             match st.homes.get(&key) {
-                // Filled under another identity and still pinned: it goes when released.
+                // Not the set's weights now and still pinned: it goes when released.
                 Some(h) if h.identity != identity => {
                     hit = false;
                     waited = true;
-                    self.landed.wait(&mut st);
-                    self.drain(&mut st);
+                    self.wait(&mut st);
                 }
                 Some(h) if h.filled || !(h.filling || h.transforming) => {
                     speculative |= h.speculative;
@@ -1162,19 +1406,21 @@ impl Inner {
                     speculative |= h.speculative;
                     hit = false;
                     waited = true;
-                    self.landed.wait(&mut st);
-                    self.drain(&mut st);
+                    self.wait(&mut st);
                 }
                 None => {
                     hit = false;
-                    if self.import(&mut st, key, req)? {
+                    let orphans = st.table.orphans > 0;
+                    self.unlock(st);
+                    if orphans && self.adopt(vec![key], req)? > 0 {
+                        st = self.lock();
                         continue;
                     }
-                    drop(st);
                     let actions = self.demand(Trigger::Bind { page: key, req, tried: Tried::default() }, req)?;
                     st = self.lock();
                     if let Some(Action::Exhausted { need }) = actions.last() {
                         let stats = st.stats(req).cloned().unwrap_or_default();
+                        self.unlock(st);
                         return Err(Error::Exhausted(exhausted(*need, None, stats)));
                     }
                 }
@@ -1207,52 +1453,84 @@ impl Inner {
             }
         }
         self.publish(&st);
-        drop(st);
+        self.unlock(st);
         self.speculate(req);
         self.backend.wait(ready, stream)?;
         Ok(Pin { ptr: va.base + off, len: span, ready, fresh, inner: self.clone(), key, id, stream, transform, transformed: AtomicBool::new(false) })
     }
 
-    /// The pass's room: measured at its cuts, else bounded by a measured shape, else the
-    /// unmeasured reserve (the largest context growth measured on the machine).
-    fn room(&self, st: &mut State, set: u32, shape: &str, allocated: u64) -> Result<(u64, bool, Vec<CutSite>)> {
-        let name = st.mech(set)?.spec.name.clone();
-        let levels = st.levels(set, shape);
-        let sites = |st: &State, room: &Room| {
-            room.sites.iter().map(|(n, peak)| CutSite { name: n.clone(), level: levels.get(n).copied().unwrap_or(0), peak: *peak, stuck: st.stuck.contains(&(set, shape.to_string(), n.clone())) }).collect()
-        };
-        if let Some(room) = self.memo(st, &room_key(&name, shape, &levels))? {
-            return Ok((allocated + room.bytes(), true, sites(st, &room)));
+    /// A configuration's measured room: exact, else bounded by the nearest larger measured
+    /// shape, else scaled from the nearest smaller by its largest dimension ratio.
+    fn measured(&self, st: &mut State, name: &str, shape: &str, levels: &BTreeMap<String, u32>) -> Result<Option<Room>> {
+        if let Some(room) = self.memo(st, &room_key(name, shape, levels))? {
+            return Ok(Some(room));
         }
-        let cuts = room_key("", "", &levels);
+        let cuts = room_key("", "", levels);
         let cuts = cuts.trim_start_matches("||");
         let rooms = self.shared.facts(&format!("room/{name}|"))?;
-        let ours = dims(shape);
+        let Some(ours) = dims(shape) else { return Ok(None) };
         let mut larger: Option<(u64, Room)> = None;
         let mut smaller: Option<(u64, f64, Room)> = None;
         for (key, v) in &rooms {
             let mut parts = key.trim_start_matches("room/").rsplitn(3, '|');
             let (Some(c), Some(s)) = (parts.next(), parts.next()) else { continue };
-            let (Some(theirs), Some(ours), Ok(room)) = (dims(s), ours.as_ref(), serde_json::from_slice::<Room>(v)) else { continue };
+            let (Some(theirs), Ok(room)) = (dims(s), serde_json::from_slice::<Room>(v)) else { continue };
             if c != cuts || theirs.len() != ours.len() {
                 continue;
             }
             let product: u64 = theirs.iter().product();
-            if theirs.iter().zip(ours).all(|(t, o)| t >= o) && larger.as_ref().is_none_or(|(p, _)| product < *p) {
+            if theirs.iter().zip(&ours).all(|(t, o)| t >= o) && larger.as_ref().is_none_or(|(p, _)| product < *p) {
                 larger = Some((product, room));
-            } else if theirs.iter().zip(ours).all(|(t, o)| t <= o) && smaller.as_ref().is_none_or(|(p, ..)| product > *p) {
-                let ratio = theirs.iter().zip(ours).map(|(t, o)| *o as f64 / (*t).max(1) as f64).fold(1.0, f64::max);
+            } else if theirs.iter().zip(&ours).all(|(t, o)| t <= o) && smaller.as_ref().is_none_or(|(p, ..)| product > *p) {
+                let ratio = theirs.iter().zip(&ours).map(|(t, o)| *o as f64 / (*t).max(1) as f64).fold(1.0, f64::max);
                 smaller = Some((product, ratio, room));
             }
         }
         if let Some((_, room)) = larger {
-            return Ok((allocated + room.bytes(), true, sites(st, &room)));
+            return Ok(Some(room));
         }
-        if let Some((_, ratio, room)) = smaller {
-            return Ok((allocated + (room.bytes() as f64 * ratio) as u64, true, sites(st, &room)));
+        Ok(smaller.map(|(_, ratio, room)| Room { delta: (room.bytes() as f64 * ratio) as u64, slack: 0, context: 0, sites: room.sites }))
+    }
+
+    /// The pass's room at its cut levels (`None`: unmeasured) and the unmeasured reserve (the
+    /// largest context growth measured on the machine), with its sites' finer and coarser
+    /// measured rooms for the decision.
+    fn room(&self, st: &mut State, set: u32, shape: &str, allocated: u64) -> Result<(Option<u64>, u64, Vec<CutSite>)> {
+        let name = st.mech(set)?.spec.name.clone();
+        let levels = st.levels(set, shape);
+        let now = self.measured(st, &name, shape, &levels)?;
+        let mut names: BTreeSet<String> = now.iter().flat_map(|r| r.sites.iter().map(|(n, _)| n.clone())).collect();
+        names.extend(levels.keys().cloned());
+        names.extend(st.collective.iter().filter(|(s, sh, _)| *s == set && sh == shape).map(|(.., n)| n.clone()));
+        let mut sites = vec![];
+        for n in names {
+            let level = levels.get(&n).copied().unwrap_or(0);
+            let peak = now.as_ref().and_then(|r| r.sites.iter().find(|(s, _)| *s == n)).map_or(0, |(_, p)| *p);
+            let finer = self.measured(st, &name, shape, &with(&levels, &n, level + 1))?.map(|r| allocated + r.bytes());
+            let coarser = match level {
+                0 => None,
+                l => {
+                    let at = with(&levels, &n, l - 1);
+                    let failed = st.failed_at.get(&room_key(&name, shape, &at)).copied();
+                    self.measured(st, &name, shape, &at)?.map(|r| (allocated + r.bytes(), failed))
+                }
+            };
+            let key = (set, shape.to_string(), n.clone());
+            sites.push(CutSite { stuck: st.stuck.contains(&key), collective: st.collective.contains(&key), name: n, level, peak, finer, coarser });
         }
         let growth = self.shared.facts("room/")?.iter().filter_map(|(_, v)| serde_json::from_slice::<Room>(v).ok()).map(|r| r.context).max().unwrap_or(0);
-        Ok((allocated + growth, false, vec![]))
+        Ok((now.map(|r| allocated + r.bytes()), allocated + growth, sites))
+    }
+
+    /// The active pass's room now (its levels may have just changed), its sites set on its
+    /// request.
+    fn pass_room(&self, st: &mut State, req: u64) -> Result<(Option<u64>, u64)> {
+        let Some((set, shape, allocated)) = st.active.get(&req).map(|a| (a.set, a.shape.clone(), a.allocated)) else { return Ok((None, 0)) };
+        let (room, unmeasured, sites) = self.room(st, set, &shape, allocated)?;
+        if let Some(r) = st.table.request_mut(req) {
+            r.sites = sites;
+        }
+        Ok((room, unmeasured))
     }
 
     fn memo(&self, st: &mut State, key: &str) -> Result<Option<Room>> {
@@ -1266,49 +1544,39 @@ impl Inner {
         Ok(room)
     }
 
-    /// Relaxes one cut a level when that level is measured and its room fits the surplus (F,
-    /// O and own N) and beats the room it last failed at.
-    fn relax(&self, st: &mut State, set: u32, shape: &str) -> Result<()> {
-        let name = st.mech(set)?.spec.name.clone();
-        let levels = st.levels(set, shape);
-        let Some(now) = self.memo(st, &room_key(&name, shape, &levels))? else { return Ok(()) };
-        let surplus = st.table.free() + st.table.orphans + st.table.classes().get(Class::N.index()).copied().unwrap_or(0);
-        for (site, level) in levels.iter().filter(|(_, l)| **l > 0) {
-            let mut coarser = levels.clone();
-            coarser.insert(site.clone(), level - 1);
-            let key = room_key(&name, shape, &coarser);
-            let Some(room) = self.memo(st, &key)? else { continue };
-            let fits = room.bytes().saturating_sub(now.bytes()) <= surplus && st.failed_at.get(&key).is_none_or(|f| surplus > *f);
-            if fits {
-                st.cuts.insert((set, shape.to_string()), coarser);
-                return Ok(());
-            }
-        }
-        Ok(())
-    }
-
-    /// Moves the request's cursor to the pass of `set`; true when a step began.
+    /// Moves the request's cursor to the pass of `set`; true when a step began. A pass the plan
+    /// does not declare takes one synthetic step at the end, reused by the next such pass.
     fn advance(st: &mut State, req: u64, set: u32) -> Result<bool> {
+        let synthetic = st.synthetic.contains(&req);
         let r = st.table.request_mut(req).ok_or_else(|| Error::Closed("the request".into()))?;
         let i = r.cursor.step;
-        let current = r.steps.get(i as usize).filter(|(s, _)| s.contains(&set)).map(|(_, p)| *p);
+        let current = r.steps.get(i as usize).is_some_and(|(s, _)| s.contains(&set));
         let begun = r.cursor.passes.get(&set).copied().unwrap_or(0);
         let later = (i + 1..r.steps.len() as u32).find(|j| r.steps.get(*j as usize).is_some_and(|(s, _)| s.contains(&set)));
         let first = begun == 0 && r.cursor.passes.is_empty();
         // Each page is fetched ahead at most once per pass.
         r.speculated.clear();
-        if current.is_some_and(|p| begun < p || later.is_none()) {
+        // A set of the current step stays in it, however many passes it runs; only a set the
+        // step lacks moves the cursor, to the first later step that has it.
+        if current {
             r.cursor.passes.insert(set, begun + 1);
             r.cursor.next.insert(set, 0);
             return Ok(first);
         }
         let j = match later {
             Some(j) => j,
+            None if synthetic => {
+                let last = r.steps.len().saturating_sub(1);
+                if let Some(step) = r.steps.get_mut(last) {
+                    *step = (vec![set], 1);
+                }
+                last as u32
+            }
             None => {
-                // A pass the plan does not declare: a step of its own at the end.
                 r.steps.push((vec![set], 1));
                 r.rooms.push(None);
-                r.steps.len() as u32 - 1
+                st.synthetic.insert(req);
+                return Self::advance(st, req, set);
             }
         };
         r.cursor = crate::table::Cursor { step: j, passes: BTreeMap::from([(set, 1)]), next: BTreeMap::from([(set, 0)]) };
@@ -1316,8 +1584,8 @@ impl Inner {
         Ok(true)
     }
 
-    fn pass(&self, req: u64, set: u32, shape: &str, torch: Torch) -> Result<()> {
-        let (mut room, mut measured) = {
+    fn pass(&self, req: u64, set: u32, shape: &str, torch: Torch) -> Result<u64> {
+        let (id, room, unmeasured, step_pages, orphans) = {
             let mut st = self.lock();
             st.mech(set)?;
             self.refresh(&mut st)?;
@@ -1327,56 +1595,33 @@ impl Inner {
                 if let Some(s) = st.step_stats(req) {
                     s.capacity = capacity;
                 }
-                self.tier_uses(&st, req);
+                self.tier_uses(&mut st, req);
             }
             self.measure(&mut st, torch);
-            let context = st.table.context;
-            st.active.insert(req, Active { set, shape: shape.to_string(), allocated: torch.allocated, context });
+            let (id, context) = (st.tick(), st.table.context);
+            st.active.insert(req, Active { id, set, shape: shape.to_string(), allocated: torch.allocated, context });
             if let Some(r) = st.table.request_mut(req) {
                 r.episode = Default::default();
                 r.claimed = 0;
             }
-            self.relax(&mut st, set, shape)?;
-            let (room, measured, sites) = self.room(&mut st, set, shape, torch.allocated)?;
-            if let Some(r) = st.table.request_mut(req) {
-                r.sites = sites;
-            }
-            (room, measured)
+            let (room, unmeasured) = self.pass_room(&mut st, req)?;
+            let step: Vec<Key> = st.table.request(req).and_then(|r| r.steps.get(r.cursor.step as usize)).map(|(sets, _)| st.table.pages().filter(|(k, p)| sets.contains(&k.0) && !p.mapped).map(|(k, _)| k).collect()).unwrap_or_default();
+            let orphans = st.table.orphans > 0;
+            self.unlock(st);
+            (id, room, unmeasured, step, orphans)
         };
-        let mut tried = Tried::default();
-        loop {
-            let actions = self.demand(Trigger::Pass { req, room, tried: tried.clone() }, Some(req))?;
-            match actions.last() {
-                Some(Action::Exhausted { need }) => {
-                    let st = self.lock();
-                    let stats = st.stats.get(&req).cloned().unwrap_or_default();
-                    return Err(Error::Exhausted(exhausted(*need, None, stats)));
-                }
-                Some(Action::Cut { site, .. }) => {
-                    tried.cut.insert(site.clone());
-                    let mut st = self.lock();
-                    let level = st.cuts.entry((set, shape.to_string())).or_default().entry(site.clone()).or_insert(0);
-                    *level += 1;
-                    let peak = st.table.request(req).and_then(|r| r.sites.iter().find(|s| &s.name == site)).map_or(0, |s| s.peak);
-                    if let Some(s) = st.stats(Some(req)) {
-                        s.cuts += 1;
-                    }
-                    let (r, m, sites) = self.room(&mut st, set, shape, torch.allocated)?;
-                    // Unmeasured at the finer level: the site's peak halves with it, as an
-                    // estimate the catch backs.
-                    (room, measured) = if m && r < room { (r, m) } else { (room.saturating_sub(peak / 2), measured) };
-                    if let Some(rq) = st.table.request_mut(req) {
-                        rq.sites = sites;
-                    }
-                }
-                _ => break,
-            }
+        // Kept pages of this step are adopted before the demand could release them as orphans.
+        if orphans {
+            self.adopt(step_pages, Some(req))?;
+        }
+        let actions = self.demand(Trigger::Pass { req, room, unmeasured, tried: Tried::default() }, Some(req))?;
+        if let Some(Action::Exhausted { need }) = actions.last() {
+            let st = self.lock();
+            let stats = st.stats.get(&req).cloned().unwrap_or_default();
+            self.unlock(st);
+            return Err(Error::Exhausted(exhausted(*need, None, stats)));
         }
         let mut st = self.lock();
-        if let Some(r) = st.table.request_mut(req) {
-            r.room = room;
-            r.measured = measured;
-        }
         let w = st.table.request(req).map_or(0, |r| st.table.w(r));
         if let Some(s) = st.step_stats(req) {
             s.w = s.w.max(w);
@@ -1385,34 +1630,40 @@ impl Inner {
             s.peak = s.peak.max(w);
         }
         self.publish(&st);
-        drop(st);
+        self.unlock(st);
         self.speculate(Some(req));
-        Ok(())
+        Ok(id)
     }
 
     /// Tells the tier each set's next use in this request, for its release order.
-    fn tier_uses(&self, st: &State, req: u64) {
-        let (Some(tier), Some(r)) = (&self.tier, st.table.request(req)) else { return };
-        for (i, m) in st.sets.iter().enumerate() {
-            let Some(m) = m else { continue };
-            let distance = r.distance((i as u32, 0)).map(|d| d.0);
-            let _ = tier.use_layout(&m.spec.layout.digest, distance);
+    fn tier_uses(&self, st: &mut State, req: u64) {
+        if self.tier.is_none() {
+            return;
         }
+        let Some(r) = st.table.request(req) else { return };
+        let uses: Vec<Call> = st.sets.iter().enumerate().filter_map(|(i, m)| m.as_ref().map(|m| Call::Use { digest: m.spec.layout.digest.clone(), distance: r.distance((i as u32, 0)).map(|d| d.0) })).collect();
+        st.outbox.extend(uses);
     }
 
     /// Torch's figures now, and the context derived from them: this process's device bytes
-    /// less torch's reserved and the mapped pages.
+    /// less torch's reserved and the pages it created (an imported page is not charged to the
+    /// importer's process).
     fn measure(&self, st: &mut State, torch: Torch) {
         st.table.allocated = torch.allocated;
         st.table.reserved = torch.reserved;
         if let Ok(used) = self.backend.process_used() {
-            st.table.context = used.saturating_sub(torch.reserved + st.table.mapped());
+            let created: u64 = st.homes.iter().filter(|(_, h)| h.origin != Origin::Kept).filter_map(|(k, _)| st.table.page(*k)).map(|p| p.bytes).sum();
+            st.table.context = used.saturating_sub(torch.reserved + created);
         }
     }
 
-    fn end_pass(&self, req: u64, measured: Measured, torch: Torch) -> Result<()> {
+    fn end_pass(&self, req: u64, pass: u64, measured: Measured, torch: Torch) -> Result<()> {
         let mut st = self.lock();
         self.measure(&mut st, torch);
+        if st.active.get(&req).is_none_or(|a| a.id != pass) {
+            self.unlock(st);
+            return Ok(());
+        }
         let Some(active) = st.active.remove(&req) else { return Ok(()) };
         let name = st.mech(active.set)?.spec.name.clone();
         let levels = st.levels(active.set, &active.shape);
@@ -1421,57 +1672,43 @@ impl Inner {
         let room = Room { delta: measured.allocated_peak.saturating_sub(active.allocated), slack: measured.slack, context: growth, sites: measured.sites.clone() };
         // A site whose finer level did not lower the allocated peak is not cut further here.
         for (site, level) in levels.iter().filter(|(_, l)| **l > 0) {
-            let mut coarser = levels.clone();
-            coarser.insert(site.clone(), level - 1);
-            if self.memo(&mut st, &room_key(&name, &active.shape, &coarser))?.is_some_and(|c| room.delta >= c.delta) {
+            if self.memo(&mut st, &room_key(&name, &active.shape, &with(&levels, site, level - 1)))?.is_some_and(|c| room.delta >= c.delta) {
                 st.stuck.insert((active.set, active.shape.clone(), site.clone()));
             }
         }
         let known = self.memo(&mut st, &key)?;
-        let merged = match known {
+        let merged = match &known {
             Some(k) => Room { delta: k.delta.max(room.delta), slack: k.slack.max(room.slack), context: k.context.max(room.context), sites: if room.sites.is_empty() { k.sites.clone() } else { room.sites.clone() } },
             None => room.clone(),
         };
-        if self.memo(&mut st, &key)?.as_ref() != Some(&merged) {
+        if known.as_ref() != Some(&merged) {
             st.rooms.insert(key.clone(), merged.clone());
             self.shared.put(&format!("room/{key}"), Some(&crate::os::encode(&merged)?))?;
             self.shared.ring();
         }
         self.publish(&st);
+        self.unlock(st);
         Ok(())
     }
 
     fn oom(&self, req: u64, need: Option<u64>, site: Option<Site<'_>>, torch: Torch) -> Result<Next> {
-        self.measure(&mut self.lock(), torch);
-        let collective = site.is_some_and(|s| s.collective);
-        if let (true, Some(site)) = (collective, site) {
-            // Ranks agree on levels at pass start: the finer level waits for the next pass, and
-            // stays recorded even if this pass is dropped.
+        {
             let mut st = self.lock();
-            if let Some(a) = st.active.get(&req) {
-                let k = (a.set, a.shape.clone());
-                *st.cuts.entry(k).or_default().entry(site.name.to_string()).or_insert(0) += 1;
+            self.measure(&mut st, torch);
+            if let (Some(s), Some(a)) = (site.filter(|s| s.collective), st.active.get(&req)) {
+                let key = (a.set, a.shape.clone(), s.name.to_string());
+                st.collective.insert(key);
             }
+            self.unlock(st);
         }
-        let local = site.filter(|s| !s.collective).map(|s| s.name.to_string());
-        let actions = self.demand(Trigger::Oom { req, need, site: local.clone(), tried: Tried::default() }, Some(req))?;
+        let trigger = Trigger::Oom { req, need, site: site.map(|s| s.name.to_string()), collective: site.is_some_and(|s| s.collective), tried: Tried::default() };
+        let actions = self.demand(trigger, Some(req))?;
         let mut st = self.lock();
         let stats = |st: &State| st.stats.get(&req).cloned().unwrap_or_default();
         let next = match actions.iter().rev().find(|a| matches!(a, Action::Cut { .. } | Action::Park(_) | Action::Exhausted { .. })) {
             Some(Action::Cut { site, .. }) => {
-                let limit = st.table.torch_limit();
-                let a = st.active.get(&req).map(|a| (a.set, a.shape.clone()));
-                let Some((set, shape)) = a else { return Ok(Next::Exhausted(exhausted(need.unwrap_or(0), Some(site), stats(&st)))) };
-                let name = st.mech(set)?.spec.name.clone();
-                let levels = st.levels(set, &shape);
-                st.failed_at.insert(room_key(&name, &shape, &levels), limit);
-                let level = st.cuts.entry((set, shape)).or_default().entry(site.clone()).or_insert(0);
-                *level += 1;
-                let level = *level;
-                if let Some(s) = st.stats(Some(req)) {
-                    s.cuts += 1;
-                }
-                Next::Cut(level)
+                let level = st.active.get(&req).map(|a| (a.set, a.shape.clone())).and_then(|(set, shape)| st.cuts.get(&(set, shape)).and_then(|c| c.get(site).copied()));
+                Next::Cut(level.unwrap_or(1))
             }
             Some(Action::Park(_)) => {
                 if let Some(r) = st.table.request_mut(req) {
@@ -1479,7 +1716,7 @@ impl Inner {
                 }
                 Next::Park(st.table.headroom)
             }
-            Some(Action::Exhausted { need: short }) => Next::Exhausted(exhausted(*short, local.as_deref(), stats(&st))),
+            Some(Action::Exhausted { need: short }) => Next::Exhausted(exhausted(*short, site.map(|s| s.name), stats(&st))),
             _ => {
                 if let Some(s) = st.stats(Some(req)) {
                     s.retries += 1;
@@ -1488,6 +1725,7 @@ impl Inner {
             }
         };
         self.publish(&st);
+        self.unlock(st);
         Ok(next)
     }
 
@@ -1495,6 +1733,7 @@ impl Inner {
         let mut st = self.lock();
         let name = st.table.request(req).map(|r| r.name.clone()).unwrap_or_default();
         st.active.remove(&req);
+        st.synthetic.remove(&req);
         st.table.requests.retain(|r| r.id != req);
         let owned: Vec<u32> = st.table.caches.iter().filter(|c| c.owner == name).map(|c| c.id).collect();
         let holding: Vec<u32> = st.table.caches.iter().filter(|c| c.owner == name && c.bytes > 0).map(|c| c.id).collect();
@@ -1508,7 +1747,7 @@ impl Inner {
                 let _ = self.shared.put(&key, Some(&stats.peak.to_le_bytes()));
             }
         }
-        drop(st);
+        self.unlock(st);
         self.shrink(shrinks);
         let mut st = self.lock();
         st.table.caches.retain(|c| !owned.contains(&c.id));
@@ -1518,50 +1757,76 @@ impl Inner {
         stats.leftover = leftover;
         st.last = Some(stats.clone());
         self.publish(&st);
-        if let Some(tier) = &self.tier {
-            for m in st.sets.iter().flatten() {
-                let _ = tier.use_layout(&m.spec.layout.digest, None);
-            }
+        let uses: Vec<Call> = st.sets.iter().flatten().map(|m| Call::Use { digest: m.spec.layout.digest.clone(), distance: None }).collect();
+        if self.tier.is_some() {
+            st.outbox.extend(uses);
         }
-        drop(st);
+        self.unlock(st);
         self.shared.ring();
         stats
     }
 
-    /// The own ask thread's answer: pages only while a request runs here; an idle process also
-    /// shrinks its caches (after answering, so the asker never waits on them).
-    /// Pages are freed now; an idle process's trim and cache shrinks (the caller's code) run
-    /// after the answer, which counts only the pages, so the asker never waits on them.
-    fn answer(&self, ceiling: Class, bytes: u64) -> (u64, bool, Vec<(u32, u64, Shrink)>) {
+    /// The ask thread's answer, from pages only: it runs no caller code. An idle process's trim
+    /// and cache shrinks go to its trim thread, after the answer.
+    fn answer(&self, ceiling: Class, bytes: u64) -> u64 {
         let out = crate::caught(|| {
             let mut st = self.lock();
             let actions = decide(&st.table, &Trigger::Ask { ceiling, bytes });
-            let (mut freed, mut trim, mut shrinks, mut remote) = (0, false, vec![], vec![]);
+            let mut freed = 0;
+            let mut wanted = Wanted::default();
             for a in &actions {
                 match a {
-                    Action::Unmap { page, .. } => {
+                    Action::Unmap { page, class } => {
                         freed += st.table.page(*page).map_or(0, |p| p.bytes);
-                        self.unmap(&mut st, *page, Class::N, None, true)?;
+                        self.unmap(&mut st, *page, *class, None, true)?;
                     }
-                    Action::Trim(_) => trim = true,
-                    _ => self.apply(&mut st, a, None, &mut remote, &mut shrinks)?,
+                    Action::Trim(_) => wanted.trim = true,
+                    Action::Shrink { cache, bytes } => wanted.shrinks.push((*cache, *bytes)),
+                    _ => {}
                 }
             }
             self.publish(&st);
-            Ok((freed, trim, shrinks))
+            self.unlock(st);
+            if wanted.trim || !wanted.shrinks.is_empty() {
+                let (lock, want) = &*self.wanted;
+                let mut w = lock.lock();
+                w.trim |= wanted.trim;
+                w.shrinks.append(&mut wanted.shrinks);
+                want.notify_one();
+            }
+            Ok(freed)
         });
         if out.is_err() {
             self.recover();
         }
-        out.unwrap_or_default()
+        out.unwrap_or(0)
+    }
+
+    /// The trim thread's work: the trim hook and shrinks an ask wanted, then a ledger event.
+    fn idle_trim(&self, wanted: Wanted) {
+        if wanted.trim {
+            self.trim();
+        }
+        let shrinks: Vec<(u32, u64, Shrink)> = {
+            let st = self.state.lock();
+            wanted.shrinks.iter().filter_map(|(id, b)| st.shrinks.get(id).map(|s| (*id, *b, s.clone()))).collect()
+        };
+        self.shrink(shrinks);
+        let st = self.state.lock();
+        self.publish(&st);
+        drop(st);
+        self.shared.ring();
     }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        self.row.wake();
-        self.jobs.lock().take();
+        self.row.knock();
+        self.jobs.0.lock().closed = true;
+        self.jobs.1.notify_all();
+        self.wanted.0.lock().closed = true;
+        self.wanted.1.notify_all();
         let mut st = self.state.lock();
         let homes: Vec<(Key, Home)> = st.homes.drain().collect();
         for (key, home) in homes {
@@ -1572,34 +1837,66 @@ impl Drop for Inner {
         }
         for m in st.sets.drain(..).flatten() {
             self.backend.release(m.va);
+            if let Some(held) = &m.held {
+                held.unpin(|p| self.backend.unregister_host(p));
+            }
+        }
+        let calls = std::mem::take(&mut st.outbox);
+        drop(st);
+        self.send(calls);
+    }
+}
+
+fn fill_loop(jobs: &(Mutex<Jobs>, Condvar), inner: &Weak<Inner>) {
+    loop {
+        let job = {
+            let (lock, queued) = jobs;
+            let mut jobs = lock.lock();
+            loop {
+                if jobs.closed {
+                    return;
+                }
+                if let Some(job) = jobs.demand.pop_front().or_else(|| jobs.ahead.pop_front()) {
+                    break job;
+                }
+                queued.wait(&mut jobs);
+            }
+        };
+        let Some(me) = inner.upgrade() else { return };
+        // A panic outside the copy fails the job's binder; the thread keeps serving.
+        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| me.fill(&job))) {
+            let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned());
+            me.fail(&job, Error::Internal(format!("panic: {}", msg.unwrap_or_default())));
         }
     }
 }
 
-fn fill_loop(queue: &Mutex<Receiver<Job>>, inner: &Weak<Inner>) {
-    loop {
-        let job = queue.lock().recv();
-        let (Ok(job), Some(inner)) = (job, inner.upgrade()) else { return };
-        inner.fill(job);
-    }
-}
-
-fn ask_loop(row: &Row, inner: &Weak<Inner>, stop: &AtomicBool) {
-    loop {
-        let wants = row.wait_asked(stop);
+fn ask_loop(listener: crate::os::Listener, row: &Row, inner: &Weak<Inner>, stop: &AtomicBool) {
+    for stream in crate::os::incoming(listener) {
         if stop.load(Ordering::Acquire) {
             return;
         }
-        let Some(inner) = inner.upgrade() else { return };
-        for (ceiling, bytes, asked) in wants {
-            let (freed, trim, shrinks) = inner.answer(ceiling, bytes);
-            row.answer(ceiling, asked, freed);
-            if trim {
-                inner.trim();
+        let Some(me) = inner.upgrade() else { return };
+        // Never dies: a failed or panicking answer frees nothing, and the next ask is served.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| row.serve(&stream, |ceiling, bytes| me.answer(ceiling, bytes))));
+    }
+}
+
+fn trim_loop(wanted: &(Mutex<Wanted>, Condvar), inner: &Weak<Inner>) {
+    loop {
+        let wanted = {
+            let (lock, want) = wanted;
+            let mut w = lock.lock();
+            while !w.trim && w.shrinks.is_empty() {
+                if w.closed {
+                    return;
+                }
+                want.wait(&mut w);
             }
-            inner.shrink(shrinks);
-            inner.shared.ring();
-        }
+            std::mem::take(&mut *w)
+        };
+        let Some(me) = inner.upgrade() else { return };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| me.idle_trim(wanted)));
     }
 }
 
@@ -1614,7 +1911,9 @@ impl Request {
                 r.rooms = rooms;
                 r.cursor = Default::default();
             }
+            st.synthetic.remove(&self.id);
             self.inner.publish(&st);
+            self.inner.unlock(st);
             Ok(())
         });
     }
@@ -1622,8 +1921,8 @@ impl Request {
     /// Starts a pass of `set` at `shape` (dimensions joined by `x`, e.g. `1x81x480x832`), with
     /// torch's bytes now; returns once the pass's measured room is free.
     pub fn pass(&self, set: SetId, shape: &str, torch: Torch) -> Result<Pass> {
-        self.inner.guard(|| self.inner.pass(self.id, set.0, shape, torch))?;
-        Ok(Pass { inner: self.inner.clone(), req: self.id })
+        let id = self.inner.guard(|| self.inner.pass(self.id, set.0, shape, torch))?;
+        Ok(Pass { inner: self.inner.clone(), req: self.id, id })
     }
 
     /// An op ran out of memory, needing `need` more bytes when the error said; `site` is its
@@ -1638,37 +1937,65 @@ impl Request {
 
     /// What the caller parked after a `Park` answer; 0 makes the next `oom` answer Exhausted.
     pub fn parked(&self, bytes: u64) {
-        let mut st = self.inner.lock();
-        if let Some(s) = st.stats(Some(self.id)) {
-            s.parks += 1;
-            s.parked += bytes;
-        }
-        if let Some(r) = st.table.request_mut(self.id) {
-            r.episode.parked = bytes == 0;
-        }
+        let _ = self.inner.guard(|| {
+            let mut st = self.inner.lock();
+            if let Some(s) = st.stats(Some(self.id)) {
+                s.parks += 1;
+                s.parked += bytes;
+            }
+            if let Some(r) = st.table.request_mut(self.id) {
+                r.episode.parked = bytes == 0;
+            }
+            self.inner.unlock(st);
+            Ok(())
+        });
     }
 
-    /// The current pass's cut level for op site `site` (0: whole).
+    /// The current pass's cut level for op site `site` (0: whole); a collective site's is the
+    /// level the ranks agreed.
     pub fn cut(&self, site: &str) -> u32 {
-        let st = self.inner.lock();
-        st.active.get(&self.id).and_then(|a| st.cuts.get(&(a.set, a.shape.clone()))).and_then(|c| c.get(site)).copied().unwrap_or(0)
+        self.inner
+            .guard(|| {
+                let st = self.inner.lock();
+                let level = st.active.get(&self.id).and_then(|a| st.cuts.get(&(a.set, a.shape.clone()))).and_then(|c| c.get(site)).copied().unwrap_or(0);
+                self.inner.unlock(st);
+                Ok(level)
+            })
+            .unwrap_or(0)
+    }
+
+    /// The current pass's collective sites' proposed levels ([`Pass::levels`]).
+    pub fn levels(&self) -> Vec<(String, u32)> {
+        let pass = self.inner.state.lock().active.get(&self.id).map(|a| a.id);
+        pass.map(|id| self.inner.levels(self.id, id)).unwrap_or_default()
+    }
+
+    /// The levels the ranks agreed, for the current pass ([`Pass::agree`]).
+    pub fn agree(&self, levels: Vec<(String, u32)>) {
+        let pass = self.inner.state.lock().active.get(&self.id).map(|a| a.id);
+        if let Some(id) = pass {
+            self.inner.agree(self.id, id, levels);
+        }
     }
 
     pub fn stats(&self) -> Stats {
-        self.inner.lock().stats.get(&self.id).cloned().unwrap_or_default()
+        let st = self.inner.state.lock();
+        st.stats.get(&self.id).cloned().unwrap_or_default()
     }
 
     /// Ends the request, returning its record.
     pub fn end(mut self) -> Stats {
         self.ended = true;
-        self.inner.end_request(self.id)
+        let id = self.id;
+        self.inner.guard(|| Ok(self.inner.end_request(id))).unwrap_or_default()
     }
 }
 
 impl Drop for Request {
     fn drop(&mut self) {
         if !self.ended {
-            self.inner.end_request(self.id);
+            let id = self.id;
+            let _ = self.inner.guard(|| Ok(self.inner.end_request(id)));
         }
     }
 }
@@ -1679,21 +2006,24 @@ impl Pin {
     /// the block stays pinned and is kept (read-only, exported) only after it.
     pub fn filled(&self) {
         self.transformed.store(true, Ordering::Release);
-        let event = self.inner.backend.record(self.stream).unwrap_or(Event::DONE);
-        let mut st = self.inner.lock();
-        if let Some(h) = st.homes.get_mut(&self.key) {
-            let old = std::mem::replace(&mut h.ready, event);
-            h.filled = true;
-            h.transforming = false;
-            if old != event {
-                self.inner.backend.retire(old);
+        let _ = self.inner.guard(|| {
+            let event = self.inner.backend.record(self.stream)?;
+            let mut st = self.inner.lock();
+            if let Some(h) = st.homes.get_mut(&self.key) {
+                let old = std::mem::replace(&mut h.ready, event);
+                h.filled = true;
+                h.transforming = false;
+                if old != event {
+                    self.inner.backend.retire(old);
+                }
             }
-        }
-        st.sync(self.key);
-        self.inner.keep(&mut st, self.key);
-        self.inner.publish(&st);
-        drop(st);
-        self.inner.landed.notify_all();
+            st.sync(self.key);
+            self.inner.keep(&mut st, self.key);
+            self.inner.publish(&st);
+            self.inner.unlock(st);
+            self.inner.landed.notify_all();
+            Ok(())
+        });
     }
 }
 
@@ -1709,12 +2039,69 @@ impl Drop for Pin {
 impl Pass {
     /// Records what the pass measured, with the allocator's figures at its end.
     pub fn end(self, measured: Measured, torch: Torch) {
-        let _ = self.inner.guard(|| self.inner.end_pass(self.req, measured, torch));
+        let _ = self.inner.guard(|| self.inner.end_pass(self.req, self.id, measured, torch));
+    }
+
+    /// The collective sites' proposed levels for this pass: the level in effect, or a finer
+    /// one an OOM proposed. cozy-runtime all-reduces their maximum across the ranks and hands
+    /// it to [`Pass::agree`] before the pass runs its collectives.
+    pub fn levels(&self) -> Vec<(String, u32)> {
+        self.inner.levels(self.req, self.id)
+    }
+
+    /// The levels the ranks agreed (the maximum of their proposals): in effect for this pass.
+    pub fn agree(&self, levels: Vec<(String, u32)>) {
+        self.inner.agree(self.req, self.id, levels);
+    }
+}
+
+impl Inner {
+    fn levels(&self, req: u64, pass: u64) -> Vec<(String, u32)> {
+        self.guard(|| {
+            let st = self.lock();
+            let out = match st.active.get(&req).filter(|a| a.id == pass) {
+                Some(a) => {
+                    let now = st.levels(a.set, &a.shape);
+                    let proposed = st.proposed.get(&(a.set, a.shape.clone())).cloned().unwrap_or_default();
+                    let mut sites: Vec<String> = st.collective.iter().filter(|(s, sh, _)| *s == a.set && *sh == a.shape).map(|(.., n)| n.clone()).collect();
+                    sites.sort();
+                    sites.into_iter().map(|n| (n.clone(), now.get(&n).copied().unwrap_or(0).max(proposed.get(&n).copied().unwrap_or(0)))).collect()
+                }
+                None => vec![],
+            };
+            self.unlock(st);
+            Ok(out)
+        })
+        .unwrap_or_default()
+    }
+
+    fn agree(&self, req: u64, pass: u64, levels: Vec<(String, u32)>) {
+        let _ = self.guard(|| {
+            let mut st = self.lock();
+            if let Some((set, shape)) = st.active.get(&req).filter(|a| a.id == pass).map(|a| (a.set, a.shape.clone())) {
+                for (site, level) in levels {
+                    st.collective.insert((set, shape.clone(), site.clone()));
+                    let now = st.cuts.entry((set, shape.clone())).or_default().entry(site.clone()).or_insert(0);
+                    *now = (*now).max(level);
+                    if let Some(p) = st.proposed.get_mut(&(set, shape.clone())) {
+                        if p.get(&site).is_some_and(|l| *l <= level) {
+                            p.remove(&site);
+                        }
+                    }
+                }
+            }
+            self.unlock(st);
+            Ok(())
+        });
     }
 }
 
 impl Drop for Pass {
+    /// Ends only its own pass: a newer one of the same request keeps its state.
     fn drop(&mut self) {
-        self.inner.state.lock().active.remove(&self.req);
+        let mut st = self.inner.state.lock();
+        if st.active.get(&self.req).is_some_and(|a| a.id == self.id) {
+            st.active.remove(&self.req);
+        }
     }
 }

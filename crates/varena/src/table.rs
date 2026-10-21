@@ -195,7 +195,16 @@ pub struct CutSite {
     pub peak: u64,
     /// A finer level did not lower the pass's allocated peak: not cut further at this shape.
     pub stuck: bool,
+    /// A collective's site: its level changes only as the ranks agree at a pass start.
+    pub collective: bool,
+    /// The pass's measured room one level finer; `None`: unmeasured there.
+    pub finer: Option<u64>,
+    /// The pass's measured room one level coarser, and the room that level last failed at.
+    pub coarser: Option<(u64, Option<u64>)>,
 }
+
+/// Pages a streamed (lowered) step holds at once: one bound while the next lands.
+pub const SLOTS: u64 = 2;
 
 /// Where a request is in its plan.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -274,7 +283,8 @@ pub struct Cache {
 /// Another process's row, as it published it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Remote {
-    pub row: u32,
+    /// Its row's offset and generation (a reused offset is another row).
+    pub row: u64,
     /// It has a request open: an ask reaches only its pages.
     pub running: bool,
     pub context: u64,
@@ -311,6 +321,9 @@ pub struct Table {
     /// Torch's allocator, as last measured (pass start and end, every OOM).
     pub allocated: u64,
     pub reserved: u64,
+    /// Shared mode (a machine its owner also uses): speculation never grows this process's
+    /// footprint, so it takes only what it frees of its own.
+    pub shared: bool,
     /// Indexed by set id; `None` once unloaded.
     pub sets: Vec<Option<Set>>,
     pub requests: Vec<Req>,
@@ -417,15 +430,25 @@ impl Table {
         sets.iter().filter_map(|s| self.sets.get(*s as usize)?.as_ref()).flat_map(|s| s.pages.iter()).map(|p| p.bytes).sum()
     }
 
-    /// The request's working set now: its current step's pages plus its room.
+    /// A step's pages as the request holds them: all, or, lowered, its streaming slots.
+    fn held_pages(&self, req: &Req, sets: &[u32]) -> u64 {
+        let all = self.step_pages(sets);
+        if !req.lowered {
+            return all;
+        }
+        let largest = sets.iter().filter_map(|s| self.sets.get(*s as usize)?.as_ref()).flat_map(|s| s.pages.iter()).map(|p| p.bytes).max().unwrap_or(0);
+        all.min(largest * SLOTS)
+    }
+
+    /// The request's working set now: its current step's pages (or slots, lowered) plus its room.
     pub fn w(&self, req: &Req) -> u64 {
-        req.step(req.cursor.step).map_or(0, |(sets, _)| self.step_pages(sets)) + req.room + req.claimed
+        req.step(req.cursor.step).map_or(0, |(sets, _)| self.held_pages(req, sets)) + req.room + req.claimed
     }
 
     /// The largest W left in the request's plan; `None` while a remaining step is unmeasured.
     pub fn remaining(&self, req: &Req) -> Option<u64> {
         let steps = req.steps.iter().zip(&req.rooms).skip(req.cursor.step as usize);
-        steps.map(|((sets, _), room)| room.map(|room| self.step_pages(sets) + room)).try_fold(0, |m, w| w.map(|w| m.max(w)))
+        steps.map(|((sets, _), room)| room.map(|room| self.held_pages(req, sets) + room)).try_fold(0, |m, w| w.map(|w| m.max(w)))
     }
 
     /// Pinned bytes outside every open request's current step (counted apart by `fits`).

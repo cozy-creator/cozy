@@ -1,9 +1,7 @@
 //! The OS mechanisms under the ledger and the services: a named shared file, row locks that die
-//! with their holder (OFD locks), wait words (futex), a wake event (eventfd) and a local service
-//! socket whose bound name is the service lock. Linux has them; elsewhere every call refuses
+//! with their holder (OFD locks), a wake event (eventfd) and local sockets, a service's bound
+//! name being its lock. Linux has them; elsewhere every call refuses
 //! until its seam exists, and the decision code above is the same.
-
-use std::sync::atomic::AtomicU32;
 
 use platform::handles::Owned;
 
@@ -29,7 +27,6 @@ mod imp {
     use std::os::fd::{AsFd, AsRawFd, FromRawFd};
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
-    use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{Map, Message};
     use crate::{Error, Result};
@@ -39,22 +36,30 @@ mod imp {
     pub(crate) type Listener = UnixListener;
     pub(crate) type Stream = UnixStream;
 
-    /// A file in shared memory named per user: `/dev/shm/cozy-varena-<uid>-<name>`.
-    pub(crate) fn shared(name: &str, create: bool) -> Result<(Owned, bool)> {
+    /// A file in shared memory named per user, `/dev/shm/cozy-varena-<uid>-<name>`, created
+    /// when absent.
+    pub(crate) fn shared(name: &str, create: bool) -> Result<Owned> {
         // SAFETY: geteuid reads a process attribute.
         let uid = unsafe { libc::geteuid() };
         let clean: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
         let path = format!("/dev/shm/cozy-varena-{uid}-{clean}");
         let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true);
+        options.read(true).write(true).create(create);
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        if create {
-            if let Ok(file) = options.clone().create_new(true).open(&path) {
-                return Ok((file.into(), true));
-            }
-        }
         let file = options.open(&path).map_err(|e| Error::io(&format!("open {path}"), e))?;
-        Ok((file.into(), false))
+        Ok(file.into())
+    }
+
+    /// Refuses a table this user does not own, or that others may write.
+    pub(crate) fn own(fd: &Owned) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let file = std::fs::File::from(fd.try_clone().map_err(|e| Error::io("dup", e))?);
+        let meta = file.metadata().map_err(|e| Error::io("stat", e))?;
+        // SAFETY: geteuid reads a process attribute.
+        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+            return Err(Error::Invalid("the shared table belongs to someone else".into()));
+        }
+        Ok(())
     }
 
     pub(crate) fn size(fd: &Owned) -> Result<u64> {
@@ -130,21 +135,8 @@ mod imp {
         Ok(platform::shm::memfd_named(name)?)
     }
 
-    pub(crate) fn wait(word: &AtomicU32, seen: u32) {
-        // SAFETY: a futex wait on a live shared word; it returns on a change, a wake or a signal.
-        unsafe { libc::syscall(libc::SYS_futex, word.as_ptr(), libc::FUTEX_WAIT, seen, std::ptr::null::<libc::timespec>()) };
-    }
 
-    pub(crate) fn wake(word: &AtomicU32) {
-        // SAFETY: a futex wake on a live shared word.
-        unsafe { libc::syscall(libc::SYS_futex, word.as_ptr(), libc::FUTEX_WAKE, i32::MAX) };
-    }
 
-    /// Bumps `word` and wakes its waiters.
-    pub(crate) fn ring(word: &AtomicU32) {
-        word.fetch_add(1, Ordering::Release);
-        wake(word);
-    }
 
     pub(crate) fn event() -> Result<Owned> {
         // SAFETY: eventfd(2) with no shared state.
@@ -201,16 +193,20 @@ mod imp {
         std::iter::repeat_with(move || listener.accept()).filter_map(|c| c.ok().map(|(s, _)| s))
     }
 
-    /// Connects to the service; `None` when nobody serves it.
+    /// Connects to the service; `None` when nobody serves it. A service of another user is
+    /// refused.
     pub(crate) fn connect(name: &str) -> Result<Option<Stream>> {
         match UnixStream::connect_addr(&address(name)?) {
-            Ok(s) => Ok(Some(s)),
+            Ok(s) => {
+                peer(&s)?;
+                Ok(Some(s))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Ok(None),
             Err(e) => Err(Error::io("connect service", e)),
         }
     }
 
-    /// The peer's pid; only this user's processes may connect.
+    /// The peer's pid; a peer of another user is refused (abstract names have no permissions).
     pub(crate) fn peer(stream: &Stream) -> Result<u32> {
         Ok(platform::handles::peer_credentials(stream)?.pid)
     }
@@ -237,8 +233,13 @@ mod imp {
             Err(e) => return Err(Error::io("recv", e)),
         }
         let [a, b, c, d, fd] = head;
-        let mut bytes = vec![0u8; u32::from_le_bytes([a, b, c, d]) as usize];
-        s.read_exact(&mut bytes).map_err(|e| Error::io("recv", e))?;
+        let len = u64::from(u32::from_le_bytes([a, b, c, d]));
+        // Grows with what arrives, never with what the peer claims.
+        let mut bytes = vec![];
+        s.take(len).read_to_end(&mut bytes).map_err(|e| Error::io("recv", e))?;
+        if bytes.len() as u64 != len {
+            return Ok(None);
+        }
         let handle = if fd == 1 { Some(platform::handles::recv_fd(stream)?) } else { None };
         Ok(Some((bytes, handle)))
     }
@@ -258,7 +259,6 @@ mod imp {
 
 #[cfg(not(target_os = "linux"))]
 mod imp {
-    use std::sync::atomic::AtomicU32;
 
     use super::{Map, Message};
     use crate::{Error, Result};
@@ -272,7 +272,10 @@ mod imp {
         Error::Invalid(format!("the shared table is not yet on {}", std::env::consts::OS))
     }
 
-    pub(crate) fn shared(_: &str, _: bool) -> Result<(Owned, bool)> {
+    pub(crate) fn shared(_: &str, _: bool) -> Result<Owned> {
+        Err(later())
+    }
+    pub(crate) fn own(_: &Owned) -> Result<()> {
         Err(later())
     }
     pub(crate) fn size(_: &Owned) -> Result<u64> {
@@ -311,8 +314,6 @@ mod imp {
     pub(crate) fn memfd(_: &str) -> Result<Owned> {
         Err(later())
     }
-    pub(crate) fn wait(_: &AtomicU32, _: u32) {}
-    pub(crate) fn ring(_: &AtomicU32) {}
     pub(crate) fn event() -> Result<Owned> {
         Err(later())
     }
@@ -346,16 +347,6 @@ mod imp {
 
 pub(crate) use imp::*;
 
-/// Waits until `done` answers, woken through `word`.
-pub(crate) fn until<T>(word: &AtomicU32, mut done: impl FnMut() -> Option<T>) -> T {
-    loop {
-        let seen = word.load(std::sync::atomic::Ordering::Acquire);
-        if let Some(x) = done() {
-            return x;
-        }
-        wait(word, seen);
-    }
-}
 
 /// A typed message's bytes.
 pub(crate) fn encode<T: serde::Serialize>(m: &T) -> Result<Vec<u8>> {
