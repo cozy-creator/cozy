@@ -202,6 +202,7 @@ fn set(dir: &std::path::Path, uuid: &str) -> SetSpec {
 fn a_page_is_kept_only_after_its_transform_completes() {
     let dir = tempfile::tempdir().unwrap();
     let g = GpuId { uuid: format!("order-{}", std::process::id()), model: "host".into(), memory: 8 << 20 };
+    let _scope = Scope::new(&g.uuid);
     let _ledger = varena::Ledger::create(&g, None).unwrap();
     let events = Arc::new(Events::default());
     let backend = Stream { host: HostBackend::new(g.memory), events: events.clone() };
@@ -237,6 +238,7 @@ fn a_page_is_kept_only_after_its_transform_completes() {
 fn a_page_unmaps_only_after_its_last_consumer() {
     let dir = tempfile::tempdir().unwrap();
     let g = GpuId { uuid: format!("consumer-{}", std::process::id()), model: "host".into(), memory: 8 << 20 };
+    let _scope = Scope::new(&g.uuid);
     let _ledger = varena::Ledger::create(&g, None).unwrap();
     let events = Arc::new(Events::default());
     let backend = Stream { host: HostBackend::new(g.memory), events: events.clone() };
@@ -267,6 +269,7 @@ fn a_page_unmaps_only_after_its_last_consumer() {
 fn a_binder_never_waits_on_a_release_event() {
     let dir = tempfile::tempdir().unwrap();
     let g = GpuId { uuid: format!("hang-{}", std::process::id()), model: "host".into(), memory: 8 << 20 };
+    let _scope = Scope::new(&g.uuid);
     let _ledger = varena::Ledger::create(&g, None).unwrap();
     let events = Arc::new(Events::default());
     let backend = Stream { host: HostBackend::new(g.memory), events: events.clone() };
@@ -306,6 +309,23 @@ fn a_binder_never_waits_on_a_release_event() {
     completes.join().unwrap();
 }
 
+/// This binary's namespace for tables and service names (never a machine's), and the test's
+/// table removed when it ends.
+struct Scope(String);
+
+impl Scope {
+    fn new(uuid: &str) -> Scope {
+        assert!(varena::os::namespace(&format!("test{}-", std::process::id())));
+        Scope(uuid.to_string())
+    }
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        varena::os::remove_table(&self.0);
+    }
+}
+
 /// A custody whose answers wait for `gate`.
 fn gated_custody(gpu: &str, gate: Arc<Gate>) {
     serve_custody(gpu, gate, Arc::new(Log::default()));
@@ -343,7 +363,7 @@ impl Log {
 
 fn serve_custody(gpu: &str, gate: Arc<Gate>, log: Arc<Log>) {
     let uid = unsafe { libc::geteuid() };
-    let addr = SocketAddr::from_abstract_name(format!("cozy-varena-{uid}-custody-{gpu}")).unwrap();
+    let addr = SocketAddr::from_abstract_name(format!("cozy-varena-{uid}-test{}-custody-{gpu}", std::process::id())).unwrap();
     let listener = UnixListener::bind_addr(&addr).unwrap();
     std::thread::spawn(move || {
         for (conn, s) in listener.incoming().enumerate() {
@@ -392,6 +412,7 @@ fn no_call_waits_on_custody() {
     let dir = tempfile::tempdir().unwrap();
     let uuid = format!("deadlock-{}", std::process::id());
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 64 << 20 };
+    let _scope = Scope::new(&g.uuid);
     let custody = Arc::new(Gate::default());
     custody.open();
     gated_custody(&uuid, custody.clone());
@@ -436,6 +457,7 @@ fn kept_pages_go_to_a_new_custody_holder() {
     let dir = tempfile::tempdir().unwrap();
     let uuid = format!("holder-{}", std::process::id());
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 64 << 20 };
+    let _scope = Scope::new(&g.uuid);
     let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
     gate.open();
     serve_custody(&uuid, gate, log.clone());
@@ -465,6 +487,7 @@ fn kept_pages_go_to_a_new_custody_holder() {
 fn a_release_without_an_event_synchronizes_its_stream() {
     let dir = tempfile::tempdir().unwrap();
     let g = GpuId { uuid: format!("record-{}", std::process::id()), model: "host".into(), memory: 8 << 20 };
+    let _scope = Scope::new(&g.uuid);
     let _ledger = varena::Ledger::create(&g, None).unwrap();
     let events = Arc::new(Events::default());
     let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap();
@@ -484,6 +507,7 @@ fn a_create_short_of_memory_decides_again() {
     let dir = tempfile::tempdir().unwrap();
     let uuid = format!("create-{}", std::process::id());
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 4 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
     let ledger = varena::Ledger::create(&g, None).unwrap();
     let events = Arc::new(Events::default());
     let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap();
@@ -650,6 +674,7 @@ fn an_evicted_kept_page_is_free_once_withdrawn() {
     let dir = tempfile::tempdir().unwrap();
     let uuid = format!("withdraw-{}", std::process::id());
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 3 * REGION_ALIGN };
+    let _scope = Scope::new(&g.uuid);
     let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
     gate.open();
     serve_custody(&uuid, gate, log.clone());
@@ -674,6 +699,7 @@ fn an_evicted_kept_page_is_free_once_withdrawn() {
 #[test]
 fn an_unmeasurable_process_keeps_its_opened_context() {
     let g = GpuId { uuid: format!("opened-{}", std::process::id()), model: "host".into(), memory: 64 << 20 };
+    let _scope = Scope::new(&g.uuid);
     let ledger = varena::Ledger::create(&g, None).unwrap();
     let events = Arc::new(Events::default());
     events.unmeasured.store(5 << 20, Ordering::SeqCst);
@@ -692,6 +718,7 @@ fn a_kept_page_is_never_overwritten_under_its_old_key() {
     let dir = tempfile::tempdir().unwrap();
     let uuid = format!("rekey-{}", std::process::id());
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 << 20 };
+    let _scope = Scope::new(&g.uuid);
     let (gate, log) = (Arc::new(Gate::default()), Arc::new(Log::default()));
     gate.open();
     serve_custody(&uuid, gate.clone(), log.clone());
@@ -733,6 +760,7 @@ fn a_kept_page_is_never_overwritten_under_its_old_key() {
 #[test]
 fn a_capped_table_keeps_its_cap_beside_other_occupants() {
     let g = GpuId { uuid: format!("capped-{}", std::process::id()), model: "host".into(), memory: 64 << 20 };
+    let _scope = Scope::new(&g.uuid);
     let events = Arc::new(Events::default());
     // 40 MB of the card are others' (no row accounts for them).
     events.foreign.store(40 << 20, Ordering::SeqCst);
@@ -751,6 +779,7 @@ fn a_yield_that_cannot_take_its_room_back_says_so() {
     let dir = tempfile::tempdir().unwrap();
     let uuid = format!("unyield-{}", std::process::id());
     let g = GpuId { uuid: uuid.clone(), model: "host".into(), memory: 8 << 20 };
+    let _scope = Scope::new(&g.uuid);
     let events = Arc::new(Events::default());
     let mem = Memory::open(g.clone(), None, Box::new(Stream { host: HostBackend::new(g.memory), events: events.clone() })).unwrap();
     let p = mem.load(stored(dir.path(), &uuid, "p", 1), Level::Ram).unwrap();
@@ -767,8 +796,34 @@ fn a_yield_that_cannot_take_its_room_back_says_so() {
 #[test]
 fn a_device_opens_once_per_process() {
     let g = GpuId { uuid: format!("once-{}", std::process::id()), model: "host".into(), memory: 8 << 20 };
+    let _scope = Scope::new(&g.uuid);
     let first = Memory::open(g.clone(), None, Box::new(HostBackend::new(g.memory))).unwrap();
     assert!(matches!(Memory::open(g.clone(), None, Box::new(HostBackend::new(g.memory))), Err(varena::Error::Invalid(_))));
     drop(first);
     drop(Memory::open(g.clone(), None, Box::new(HostBackend::new(g.memory))).unwrap());
+}
+
+/// Review 3, item 15: a bind that needs a page only its own thread pins fails at once (a typed
+/// error), never a hang: re-binding a page it is transforming, or switching its fill identity
+/// under its own hold.
+#[test]
+fn a_bind_on_its_own_threads_pin_fails_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = GpuId { uuid: format!("selfpin-{}", std::process::id()), model: "host".into(), memory: 8 << 20 };
+    let _scope = Scope::new(&g.uuid);
+    let _ledger = varena::Ledger::create(&g, None).unwrap();
+    let mem = Memory::open(g.clone(), None, Box::new(HostBackend::new(g.memory))).unwrap();
+    let spec = set(dir.path(), &g.uuid);
+    let id = mem.load(spec.clone(), Level::Ram).unwrap();
+    let fresh = mem.bind(id, 0, 0).unwrap();
+    assert!(fresh.fresh);
+    assert!(matches!(mem.bind(id, 0, 0), Err(varena::Error::Held(_))), "it is transforming it");
+    fresh.filled();
+    let hold = mem.bind(id, 0, 0).unwrap();
+    let mut other = spec;
+    other.fingerprint.fill = Fill::Declared("lora-b".into());
+    mem.load(other, Level::Ram).unwrap();
+    assert!(matches!(mem.bind(id, 0, 0), Err(varena::Error::Held(_))), "another identity under its own hold");
+    drop((fresh, hold));
+    assert!(mem.bind(id, 0, 0).unwrap().fresh, "unheld, it fills again");
 }

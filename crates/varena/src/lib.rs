@@ -15,7 +15,7 @@ pub mod faults;
 pub mod layout;
 pub mod ledger;
 pub mod memory;
-mod os;
+pub mod os;
 mod outbox;
 pub mod table;
 pub mod tier;
@@ -64,6 +64,10 @@ pub enum Error {
     /// A panic or broken invariant inside varena: the request fails, the process keeps serving.
     #[error("internal: {0}")]
     Internal(String),
+    /// A bind that needs a page only the calling thread pins (re-binding a page it is
+    /// transforming, or an identity switch under its own hold): it would wait on itself.
+    #[error("held: {0}")]
+    Held(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -78,13 +82,14 @@ impl Error {
             Error::Io(_) => "IO",
             Error::Closed(_) => "CLOSED",
             Error::Internal(_) => "INTERNAL",
+            Error::Held(_) => "HELD",
         }
     }
 
     /// CUDA documents these as destroying the context: the process must end, and the GPU's kept
     /// pages go (cuda 13.0 driver API, CUresult).
     pub fn is_sticky(&self) -> bool {
-        matches!(self, Error::Device { code: 700 | 702 | 709 | 710 | 714..=719 | 721, .. })
+        matches!(self, Error::Device { code: 700 | 702 | 709 | 710 | 714..=719 | 721 | 911, .. })
     }
 
     pub(crate) fn io(what: &str, e: impl std::fmt::Display) -> Error {
