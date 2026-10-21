@@ -19,7 +19,7 @@ from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, S
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol, TypeAlias
+from typing import Any, Protocol, TypeAlias, runtime_checkable
 
 import torch
 from torch import Tensor, nn
@@ -132,6 +132,14 @@ class Fill(Protocol):
     ) -> None: ...
 
     def prepare(self) -> Hashable: ...
+
+
+@runtime_checkable
+class _CallSelectedFill(Protocol):
+    @property
+    def prefetch_ready(self) -> bool:
+        """False only while a call-selected transform has no immutable selection."""
+        ...
 
 
 class Shrink(Protocol):
@@ -533,6 +541,7 @@ class Request:
     passes: dict[str, int] = field(default_factory=dict)
     cleanup_errors: tuple[BaseException, ...] = field(default=(), init=False, repr=False)
     _failed: bool = field(default=False, init=False, repr=False)
+    _pending: set[Model] = field(default_factory=set, init=False, repr=False)
 
     def mark_failed(self) -> None:
         """Retire unused allocator slack on exit, including a failure returned as a value.
@@ -542,15 +551,20 @@ class Request:
         """
         self._failed = True
 
-    def plan(self, steps: Sequence[PlanStep] | None) -> None:
+    def plan(self, steps: Sequence[PlanStep] | None, *, _preserve_position: bool = False) -> None:
         self.raw_plan = tuple(
             step if isinstance(step, (str, Model, nn.Module)) else tuple(step)
             for step in (steps or ())
         )
-        names, models = self.memory._plan(self.raw_plan)
+        names, models, pending = self.memory._plan(self.raw_plan)
         self.declared = names
         if self.memory.native is not None:
-            self.memory.native.declare(self.native_id, models)
+            self.memory.native.declare(
+                self.native_id, models,
+                pending=[model.ws.id for model in pending],
+                preserve_position=_preserve_position,
+            )
+        self._pending = pending
 
 
 PlanStep: TypeAlias = "Model | nn.Module | str | Collection[Model | nn.Module | str]"
@@ -805,7 +819,7 @@ class Memory:
 
     def _plan(
         self, steps: Sequence[PlanStep]
-    ) -> tuple[tuple[tuple[str, ...], ...], list[list[int]]]:
+    ) -> tuple[tuple[tuple[str, ...], ...], list[list[int]], set[Model]]:
         if self.native is None:
             names = []
             for step in steps:
@@ -818,8 +832,8 @@ class Memory:
                         )
                     )
                 )
-            return tuple(names), [[] for _ in names]
-        names, ids = [], []
+            return tuple(names), [[] for _ in names], set()
+        names, ids, pending = [], [], set()
         for step in steps:
             entries = [step] if isinstance(step, (str, Model, nn.Module)) else step
             found: list[Model] = []
@@ -841,9 +855,15 @@ class Memory:
             ids.append(
                 [model.ws.id for model in found] if self.native is not None else []
             )
-        return tuple(names), ids
+            pending.update(
+                model for model in found
+                if isinstance(model.fill, _CallSelectedFill) and not model.fill.prefetch_ready
+            )
+        return tuple(names), ids, pending
 
     def _fresh(self, model: Model) -> None:
+        if isinstance(model.fill, _CallSelectedFill) and not model.fill.prefetch_ready:
+            raise Unbound("call-selected model content is still pending")
         version = model.fill.prepare() if model.fill is not None else None
         if version != model.version:
             for cache in tuple(self.caches):
@@ -855,6 +875,13 @@ class Memory:
             self.native.close_model(old)
             for request in tuple(self.active):
                 request.plan(request.raw_plan)
+        else:
+            # The selected bytes can equal the previous warm call. In that case
+            # activate their edges without replacing registration or rewinding
+            # another model's cursor in the current joint phase.
+            for request in tuple(self.active):
+                if model in request._pending:
+                    request.plan(request.raw_plan, _preserve_position=True)
 
     def _start(self, model: Model) -> None:
         with self.changed:
@@ -1089,15 +1116,19 @@ class Memory:
         request.reads = {
             model.name: (0, 0, model.binding_ns) for model in self.models.values()
         }
-        names, models = self._plan(plan or ())
+        names, models, pending = self._plan(plan or ())
         request.declared = names
+        request._pending = pending
         request.raw_plan = tuple(
             step if isinstance(step, (str, Model, nn.Module)) else tuple(step)
             for step in (plan or ())
         )
         if self.native is not None:
             self._measure()
-            self.native.begin(request.native_id, models, package, shape)
+            self.native.begin(
+                request.native_id, models, package, shape,
+                pending=[model.ws.id for model in pending],
+            )
         self.active[request] = None
         stack = self.local.__dict__.setdefault("requests", [])
         stack.append(request)

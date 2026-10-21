@@ -207,6 +207,7 @@ impl RamWarm {
 
 struct Request {
     steps: Vec<Vec<ModelId>>,
+    pending: BTreeSet<ModelId>,
     explicit: bool,
     package: String,
     shape: String,
@@ -766,6 +767,17 @@ impl Placement {
         package: String,
         shape: String,
     ) -> Result<()> {
+        self.begin_pending(id, steps, package, shape, BTreeSet::new())
+    }
+
+    pub fn begin_pending(
+        &self,
+        id: RequestId,
+        steps: Vec<Vec<ModelId>>,
+        package: String,
+        shape: String,
+        pending: BTreeSet<ModelId>,
+    ) -> Result<()> {
         let _operation = self.operations.lock();
         self.refresh()?;
         if self.inner.lock().requests.contains_key(&id) {
@@ -794,6 +806,7 @@ impl Placement {
             id,
             Request {
                 steps: vec![],
+                pending: BTreeSet::new(),
                 explicit: false,
                 package,
                 shape,
@@ -805,7 +818,7 @@ impl Placement {
                 pass_index: 0,
             },
         );
-        if let Err(error) = Self::declare_locked(&mut inner, id, steps) {
+        if let Err(error) = Self::declare_locked(&mut inner, id, steps, pending, false) {
             Self::remove_request(&mut inner, id);
             return Err(error);
         }
@@ -826,13 +839,35 @@ impl Placement {
     }
 
     pub fn declare(&self, id: RequestId, steps: Vec<Vec<ModelId>>) -> Result<()> {
+        self.declare_pending(id, steps, BTreeSet::new(), false)
+    }
+
+    pub fn declare_pending(
+        &self,
+        id: RequestId,
+        steps: Vec<Vec<ModelId>>,
+        pending: BTreeSet<ModelId>,
+        preserve_position: bool,
+    ) -> Result<()> {
         let _operation = self.operations.lock();
-        Self::declare_locked(&mut self.inner.lock(), id, steps)?;
+        Self::declare_locked(
+            &mut self.inner.lock(),
+            id,
+            steps,
+            pending,
+            preserve_position,
+        )?;
         self.hydrate(id)?;
         self.refresh()
     }
 
-    fn declare_locked(inner: &mut Inner, id: RequestId, steps: Vec<Vec<ModelId>>) -> Result<()> {
+    fn declare_locked(
+        inner: &mut Inner,
+        id: RequestId,
+        steps: Vec<Vec<ModelId>>,
+        pending: BTreeSet<ModelId>,
+        preserve_position: bool,
+    ) -> Result<()> {
         let mut groups: Vec<(Vec<ModelId>, u32)> = vec![];
         for mut models in steps {
             models.sort_unstable();
@@ -849,6 +884,27 @@ impl Placement {
                 groups.push((models, 1));
             }
         }
+        if pending
+            .iter()
+            .any(|id| !groups.iter().any(|(models, _)| models.contains(id)))
+        {
+            return Err(invalid("pending model is absent from the plan"));
+        }
+        if preserve_position {
+            let prior = inner
+                .requests
+                .get(&id)
+                .ok_or_else(|| invalid("unknown request"))?;
+            if prior.steps
+                != groups
+                    .iter()
+                    .map(|(models, _)| models.clone())
+                    .collect::<Vec<_>>()
+                || !pending.is_subset(&prior.pending)
+            {
+                return Err(invalid("readiness update changed logical plan groups"));
+            }
+        }
         for page in &mut inner.table.pages {
             page.uses.retain(|usage| usage.request != id);
         }
@@ -856,6 +912,9 @@ impl Placement {
             let mut orders = BTreeMap::<ModelId, u32>::new();
             for _ in 0..*passes {
                 for model in models {
+                    if pending.contains(model) {
+                        continue;
+                    }
                     let order = orders.entry(*model).or_default();
                     let pages = inner
                         .models
@@ -903,16 +962,21 @@ impl Placement {
             .filter(|(_, (models, _))| models.len() > 1)
             .map(|(step, _)| step as u32)
             .collect();
-        facts.position = Position { step: 0, order: 0 };
-        facts.model_positions.clear();
-        facts.starved = false;
+        if !preserve_position {
+            facts.position = Position { step: 0, order: 0 };
+            facts.model_positions.clear();
+            facts.starved = false;
+        }
         let request = inner
             .requests
             .get_mut(&id)
             .ok_or_else(|| invalid("unknown request"))?;
         request.steps = groups.into_iter().map(|(models, _)| models).collect();
+        request.pending = pending;
         request.explicit = !request.steps.is_empty();
-        request.budgets.clear();
+        if !preserve_position {
+            request.budgets.clear();
+        }
         Ok(())
     }
 
@@ -966,6 +1030,13 @@ impl Placement {
         let demand;
         {
             let mut inner = self.inner.lock();
+            if inner
+                .requests
+                .get(&request)
+                .is_some_and(|run| run.pending.contains(&model))
+            {
+                return Err(invalid("call-selected model content is still pending"));
+            }
             demand = !inner
                 .requests
                 .get(&request)
@@ -2611,6 +2682,7 @@ mod gpu_tests {
                 9,
                 Request {
                     steps: vec![],
+                    pending: BTreeSet::new(),
                     explicit: true,
                     package: "orphan-events".into(),
                     shape: "shape".into(),
@@ -2628,6 +2700,95 @@ mod gpu_tests {
             trim: None,
             slack_trim: SlackTrim::default(),
         }
+    }
+
+    fn selection_test_inner() -> Inner {
+        let mut inner = event_test_inner();
+        let prototype = inner.table.pages[0].clone();
+        inner.table.pages.clear();
+        for id in [1, 2] {
+            let mut page = prototype.clone();
+            page.id = id;
+            page.model = Some(id);
+            inner.table.pages.push(page);
+            inner.models.insert(
+                id,
+                Model {
+                    name: format!("model-{id}"),
+                    pages: vec![id],
+                    fingerprint: [id as u8; 32],
+                    ram_key: [0; 32],
+                    transform: None,
+                    proof_pages: vec![],
+                    source: Arc::new(Source::files(vec![], false, 0)),
+                    regions: vec![],
+                    ram: Arc::new(RamWarm::new().unwrap()),
+                    ram_generation: None,
+                },
+            );
+        }
+        inner.table.requests.push(plan::Request {
+            id: 9,
+            row: 1,
+            position: Position { step: 0, order: 0 },
+            working_sets: vec![],
+            starved: false,
+            sharing_limit: None,
+            resident_steps: BTreeSet::new(),
+            joint_steps: BTreeSet::new(),
+            model_positions: BTreeMap::new(),
+            can_cut: true,
+            can_lower: true,
+            reclaim_round: 0,
+        });
+        inner
+    }
+
+    #[test]
+    fn pending_content_keeps_distinct_logical_groups_and_activation_keeps_the_cursor() {
+        let mut inner = selection_test_inner();
+        let steps = vec![vec![1], vec![2]];
+        Placement::declare_locked(&mut inner, 9, steps.clone(), BTreeSet::from([1, 2]), false)
+            .unwrap();
+        assert_eq!(inner.requests[&9].steps, steps);
+        assert!(inner.table.pages.iter().all(|page| page.uses.is_empty()));
+        let facts = &mut inner.table.requests[0];
+        facts.position = Position { step: 1, order: 37 };
+        facts.model_positions.insert(2, 42);
+        Placement::declare_locked(&mut inner, 9, steps, BTreeSet::from([1]), true).unwrap();
+        let facts = &inner.table.requests[0];
+        assert_eq!(facts.position, Position { step: 1, order: 37 });
+        assert_eq!(facts.model_positions[&2], 42);
+        assert!(inner.table.pages[0].uses.is_empty());
+        assert_eq!(inner.table.pages[1].uses[0].position.step, 1);
+    }
+
+    #[test]
+    fn pending_joint_model_preserves_fixed_edges_and_repeated_residency() {
+        let mut inner = selection_test_inner();
+        let steps = vec![vec![1, 2], vec![1, 2]];
+        Placement::declare_locked(&mut inner, 9, steps.clone(), BTreeSet::from([2]), false)
+            .unwrap();
+        assert_eq!(inner.requests[&9].steps, [vec![1, 2]]);
+        assert_eq!(inner.table.pages[0].uses.len(), 2);
+        assert!(inner.table.pages[1].uses.is_empty());
+        inner.table.requests[0].model_positions.insert(1, 1);
+        Placement::declare_locked(&mut inner, 9, steps, BTreeSet::new(), true).unwrap();
+        let facts = &inner.table.requests[0];
+        assert_eq!(facts.model_positions[&1], 1);
+        assert!(facts.resident_steps.contains(&0));
+        assert!(facts.joint_steps.contains(&0));
+        assert_eq!(inner.table.pages[0].uses.len(), 2);
+        assert_eq!(inner.table.pages[1].uses.len(), 2);
+        assert!(Placement::declare_locked(
+            &mut inner,
+            9,
+            vec![vec![2], vec![1]],
+            BTreeSet::new(),
+            true
+        )
+        .is_err());
+        assert_eq!(inner.table.requests[0].model_positions[&1], 1);
     }
 
     #[test]

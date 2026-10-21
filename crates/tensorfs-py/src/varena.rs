@@ -442,6 +442,7 @@ impl PyPlane {
             .insert(id, model.clone());
         Ok(PyWeightSet(model))
     }
+    #[pyo3(signature=(request,plan,package,shape,*,pending=None))]
     fn begin(
         &self,
         py: Python<'_>,
@@ -449,13 +450,37 @@ impl PyPlane {
         plan: Vec<Vec<u64>>,
         package: String,
         shape: String,
+        pending: Option<Vec<u64>>,
     ) -> PyResult<()> {
         let c = self.core(py)?;
-        native(py, || c.begin(request, plan, package, shape))
+        native(py, || {
+            c.begin_pending(
+                request,
+                plan,
+                package,
+                shape,
+                pending.unwrap_or_default().into_iter().collect(),
+            )
+        })
     }
-    fn declare(&self, py: Python<'_>, request: u64, plan: Vec<Vec<u64>>) -> PyResult<()> {
+    #[pyo3(signature=(request,plan,*,pending=None,preserve_position=false))]
+    fn declare(
+        &self,
+        py: Python<'_>,
+        request: u64,
+        plan: Vec<Vec<u64>>,
+        pending: Option<Vec<u64>>,
+        preserve_position: bool,
+    ) -> PyResult<()> {
         let c = self.core(py)?;
-        native(py, || c.declare(request, plan))
+        native(py, || {
+            c.declare_pending(
+                request,
+                plan,
+                pending.unwrap_or_default().into_iter().collect(),
+                preserve_position,
+            )
+        })
     }
     fn enter(&self, py: Python<'_>, request: u64, model: u64) -> PyResult<(&'static str, u64)> {
         let c = self.core(py)?;
