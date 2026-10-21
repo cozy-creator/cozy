@@ -220,6 +220,12 @@ impl Interface {
         callable.accelerator != Some(false) || self.orchestrates(callable)
     }
 
+    /// Whether `callable` loads model weights: its own, or those of the internal functions it
+    /// orchestrates. A machine with no supported GPU loads none (Runtime 0.30, every OS).
+    pub fn loads_weights(&self, callable: &Callable) -> bool {
+        !callable.models.is_empty() || self.orchestrates(callable)
+    }
+
     /// A CPU function that loads no model, in a package with internal GPU functions: it calls them.
     pub fn orchestrates(&self, callable: &Callable) -> bool {
         callable.accelerator == Some(false)
@@ -484,9 +490,14 @@ pub(crate) mod tests {
             entry("render", serde_json::json!({"accelerator": false})),
         ]);
         let render = h3.callables.iter().find(|c| c.name == "render").unwrap();
-        assert!(h3.orchestrates(render) && h3.gpu(render));
+        assert!(h3.orchestrates(render) && h3.gpu(render) && h3.loads_weights(render));
         let plain = read(vec![entry("render", serde_json::json!({"accelerator": false}))]);
-        assert!(!plain.gpu(&plain.callables[0]));
+        assert!(!plain.gpu(&plain.callables[0]) && !plain.loads_weights(&plain.callables[0]));
+        // A GPU script with no weights still runs on a machine without a GPU; one with weights does not.
+        let script = read(vec![entry("main", serde_json::json!({}))]);
+        assert!(script.gpu(&script.callables[0]) && !script.loads_weights(&script.callables[0]));
+        let cpu_model = read(vec![entry("generate", serde_json::json!({"accelerator": false, "models": model}))]);
+        assert!(!cpu_model.gpu(&cpu_model.callables[0]) && cpu_model.loads_weights(&cpu_model.callables[0]));
     }
 
     #[test]

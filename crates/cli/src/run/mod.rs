@@ -381,7 +381,7 @@ async fn invoke(
         attention_kernel: args.attention_kernel.as_deref().unwrap_or_default(),
     };
     let out = args.out.map(|dir| terms.cwd.join(dir));
-    gpuless(ctx, &on, &card.interface, callable, &target, bits).await;
+    gpuless(ctx, &on, &card.interface, callable, &target).await?;
     let submission = call.submission(on, &hub.origin, &call.spec(&bound)?, Some(&bound), out);
     send(ctx, submission, &terms.key, args.detach).await
 }
@@ -454,46 +454,47 @@ async fn send(ctx: &Context, submission: SubmitRun, key: &str, detach: bool) -> 
     follow(ctx, submitted.run, detach).await
 }
 
-/// Warns that a run sent to a ready machine with no supported GPU runs on its CPU (a GPU
-/// function slowly) and that its models take their 16-bit lanes whatever `--bits` asked (a CPU
-/// runs no 8- or 4-bit format), and how to rent one instead.
+/// Refuses a run of a function that loads model weights on a ready machine with no supported GPU,
+/// which loads none (Runtime 0.30, every OS), before anything is sent; warns that a GPU function
+/// with no weights runs there on the CPU, slowly.
 pub(crate) async fn gpuless(
     ctx: &Context,
     on: &On,
     interface: &Interface,
     callable: &Callable,
     target: &str,
-    bits: u32,
-) {
-    let On::Machine(name) = on else { return };
-    let (slow, narrow) = (interface.gpu(callable), matches!(bits, 4 | 8));
-    if !slow && !narrow {
-        return;
+) -> Result<(), Error> {
+    let On::Machine(name) = on else { return Ok(()) };
+    let weights = interface.loads_weights(callable);
+    if !weights && !interface.gpu(callable) {
+        return Ok(());
     }
     let Ok(calcifer) = ctx.calcifer().await else {
-        return;
+        return Ok(());
     };
     let Ok(listed) = calcifer.machines().await else {
-        return;
+        return Ok(());
     };
     let none = listed.machines.iter().any(|m| {
         (m.name == *name || m.alias.as_deref() == Some(name))
             && (m.status.as_ref()).is_some_and(|s| s.phase == "ready" && s.gpus.is_empty())
     });
-    if none {
-        let said: Vec<_> = [
-            slow.then(|| format!("{target} runs on its CPU, slowly")),
-            narrow
-                .then(|| format!("its models take their 16-bit lanes (--bits {bits} needs a GPU)")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        output::warn(&format!(
-            "{name} has no supported GPU, so {}; `--on new` rents one: cozy run {target} … --on new",
-            said.join(", and ")
-        ));
+    if !none {
+        return Ok(());
     }
+    if weights {
+        return Err(Error::new(
+            Kind::Capacity,
+            "gpu_needed",
+            format!("{target} loads model weights, which needs an NVIDIA GPU here; {name} has none, so nothing was sent"),
+        )
+        .remedy("add `--on new` to rent one (price shown first)")
+        .next(format!("cozy run {target} … --on new")));
+    }
+    output::warn(&format!(
+        "{name} has no supported GPU, so {target} runs on its CPU, slowly; `--on new` rents one: cozy run {target} … --on new"
+    ));
+    Ok(())
 }
 
 /// Binds `terms` to `function` of `card`, against its release.

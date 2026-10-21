@@ -92,21 +92,17 @@ fn local_code_runs_on_a_real_machine_and_runs_again_as_edited() {
     ));
     assert_eq!(again["result"]["value"], "edited, and run again", "{again}");
 
-    // A GPU function sent to a machine with no supported GPU: it says so, and how to rent one;
-    // asked for 8 bits, that its models take their 16-bit lanes there instead.
+    // A GPU function with no weights sent to a machine with no supported GPU runs on its CPU: it
+    // says so, and how to rent one. A function with no weights asked for 8 bits is told nothing.
     std::fs::write(work.join("gpu.py"), SCRIPT.replace("# accelerator = false\n", "")).unwrap();
     let gpu = cozy(&home, &work, &["run", "gpu.py", "--on", "m1", "--detach"]);
     assert!(
         gpu.stderr.contains("m1 has no supported GPU") && gpu.stderr.contains("--on new"),
         "{gpu:?}"
     );
-    assert!(!gpu.stderr.contains("16-bit"), "{gpu:?}");
+    assert!(gpu.code == 0 && gpu.stderr.contains("slowly"), "{gpu:?}");
     let eight = cozy(&home, &work, &["run", "greet.py", "--bits", "8", "--on", "m1", "--detach"]);
-    assert!(
-        eight.stderr.contains("its models take their 16-bit lanes (--bits 8 needs a GPU)")
-            && !eight.stderr.contains("slowly"),
-        "{eight:?}"
-    );
+    assert!(eight.code == 0 && !eight.stderr.contains("GPU"), "{eight:?}");
 
     // A project directory: its functions, then one of them.
     copy(
