@@ -102,8 +102,10 @@ Acceptance, journal, progress and output custody stay in `Engine`; scheduling st
   Before a cold session spawns, and again once its request's shape is known, while it does not
   fit and nothing runs on a GPU of its lane, idle executors end, least recently used first,
   outside every warm set first. The request is then admitted on every GPU of its lane or none
-  (`Ledger::admit`, which names its key so its peak is recorded); refused, it is dispatched
-  anyway and varena in its executor makes what room it can. It is spawned by the pool's `ChildLauncher`, which journals the birth, then sent
+  (`memory::admit`: `Ledger::admit`, which names its key so its peak is recorded). Refused, it
+  waits, with no timer, for the ledgers' events (the engine's activity) and asks again: running
+  requests end, and a GPU nothing runs on always admits. A cancel ends the wait; the request
+  never started. It is spawned by the pool's `ChildLauncher`, which journals the birth, then sent
   Start (with its ledgers), Load and Activate once. Each request sends PrepareRequest and Invoke.
 - Warming: a warm member's executor is loaded, then `Map{construction, level}` has it load its
   models at `gpu` or `ram` (varena's `load(level)`), for any degree.
