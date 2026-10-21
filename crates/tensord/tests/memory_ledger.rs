@@ -269,7 +269,8 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
 
     // Granted at spawn, it warms the set onto its GPU: binds are hits there.
     let mut first = StandIn::spawn(&gpu, &id, "gpu");
-    assert_eq!(first.load(), ("Hit,Hit,Hit".into(), 0, 0));
+    // The load's fills join the next request's record (S1 41bfa23d9): read once from the store, then binds hit.
+    assert_eq!(first.load(), ("Store,Store,Store,Hit,Hit,Hit".into(), 0, set_bytes));
     assert!(maps(&gpu, first.pid()));
 
     // An unmeasured run fits nothing beside it.
@@ -301,7 +302,7 @@ fn a_killed_executors_kept_pages_are_the_next_ones_and_fits_follows_measured_pea
     assert!(orphans(&gpu) >= set_bytes, "its kept pages are orphans");
     // One load path: its load imports what custody keeps, at any level; its binds are hits.
     let mut second = StandIn::spawn(&gpu, &id, "ram");
-    assert_eq!(second.load(), ("Hit,Hit,Hit".into(), 0, 0), "imported at load, not copied");
+    assert_eq!(second.load(), ("Kept,Kept,Kept,Hit,Hit,Hit".into(), set_bytes, 0), "imported at load, not copied");
     assert_eq!(orphans(&gpu), 0, "every orphan imported by fingerprint");
     assert!(maps(&gpu, second.pid()));
 
@@ -511,7 +512,7 @@ fn a_root_tensord_grants_executors_of_its_identity() {
     let id = gpu_id("identity");
     let gpu = Gpu::create("0", &[inventory(&id)], None, HostMode::Dedicated, &peaks, &log).unwrap();
     let mut first = StandIn::granted(&gpu, &id, "gpu", Some(IDENTITY));
-    assert_eq!(first.load(), ("Hit,Hit,Hit".into(), 0, 0), "warmed on its GPU");
+    assert_eq!(first.load(), ("Store,Store,Store,Hit,Hit,Hit".into(), 0, spec(&id).layout.nbytes), "warmed on its GPU");
     assert!(maps(&gpu, first.pid()), "its row is on TensorD's table");
     assert!(varena::Ledger::admit(&[&gpu.ledger], "identity", PACKAGE, "8").unwrap());
     assert_eq!(first.ask("run identity 8"), "passing");
@@ -522,6 +523,6 @@ fn a_root_tensord_grants_executors_of_its_identity() {
     gpu.ledger.reap(pid);
     assert!(orphans(&gpu) >= spec(&id).layout.nbytes, "its kept pages are in TensorD's custody");
     let mut second = StandIn::granted(&gpu, &id, "ram", Some(IDENTITY));
-    assert_eq!(second.load(), ("Hit,Hit,Hit".into(), 0, 0), "imported at load, not copied");
+    assert_eq!(second.load(), ("Kept,Kept,Kept,Hit,Hit,Hit".into(), spec(&id).layout.nbytes, 0), "imported at load, not copied");
     assert_eq!(orphans(&gpu), 0);
 }
