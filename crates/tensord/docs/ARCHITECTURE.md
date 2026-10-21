@@ -44,8 +44,8 @@ Calcifer ──HTTPS (Cozy-Cap)──> api::http ─> machine_api::NativeBackend
                           gpu_service::Pool ─> device_executor::DeviceExecutor
                             (retained executors per plan: deviceless, one GPU or a group,
                              via the Runtime trampoline)
-                            memory::GpuLedger: per-GPU ledger + eventfd, fits, reaps, stalls
-                            answers model-source, read-grant and deposit requests
+                            memory: per-GPU varena ledgers (grant, reap, fits, stalls, peaks)
+                            and the RAM tier
                           calls::Calls: child calls and each attempt's weights grant
 ```
 
@@ -103,9 +103,8 @@ code is still not sandboxed.
 | `calls.rs` | Child calls (the seam broker): each call a run, canceled with its parent; each attempt's weights grant | `Calls`, `Caller` | G |
 | `execution.rs` | Acceptance, attempt supervision, cancellation, progress coalescing, output custody, reconcile | `Engine` | E |
 | `journal.rs` | SQLite journal: executions, installations, preparations, receipts, process births | `Journal`, `Execution`, `State`, `ProcessBirth` | E |
-| `gpu_service.rs` | Executor pool (degree 0, 1 or n): published package/model mapping, executor retention, request callbacks; GPU groups (a degree-K plan on the first K GPUs, one memory decision per GPU), one call slot per GPU and one-GPU replicas and multi-slot plans | `Pool`, `GpuConfig`, `Plan`, `PlanSlot`, `PlanSource`, `ModelGrant` | B2 (admission, grants), E (spawn/fencing), D1 (published mapping), I (groups, slots) |
-| `memory/` | Each GPU's varena ledger and eventfd, TensorD's row in it, `fits`, reaps, stalls and freed wakes on an NVML watch thread (`gpu`); a call's memory measurements (`call`) | `GpuLedger`, `CallMemory` | xs-046 B4 |
-| `deposits.rs` | Sealed host layouts executors deposit, granted to the next executor of the same weights | `Deposits` | xs-046 B4 |
+| `gpu_service.rs` | Executor pool (degree 0, 1 or n): published package/model mapping, executor retention, request callbacks; one placement path for every degree (hosting lane, then a lane where it fits, else a free one; a group admitted on all of its GPUs or none), one call slot per GPU, replicas and multi-slot plans | `Pool`, `GpuConfig`, `Plan`, `PlanSlot`, `PlanSource`, `ModelGrant` | B2 (admission, grants), E (spawn/fencing), D1 (published mapping), I (groups, slots) |
+| `memory.rs` | Each GPU's varena ledger (custody inside), its events thread, peaks persisted per GPU model, the RAM tier served in TensorD, the memory log | `Gpu`, `Peaks`, `HostTier`, `MemoryLog` | xs-058 S5 |
 | `device_executor.rs` | Typed control seam to the Runtime device executor, per-request output encoding | `DeviceExecutor`, `ExecutorConfig`, `DeviceCommand`, `Frame`, `Answer` | E |
 | `launch_identity.rs` | Runtime trampoline command, the executor environment seal, optional UID/GID | `LaunchIdentity`, `Seal`, `trampoline` | E |
 | `process.rs` | Exact process births, kill (scope and group), the progress meter and watch (leader plus process-group members), reaping (`reap_group`) | `Exact`, `Pace`, `Watching`, `Reaped` | E, I |
