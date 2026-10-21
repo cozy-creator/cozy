@@ -258,7 +258,7 @@ pub fn uv_owner_dirs(env: &BTreeMap<String, String>) -> Option<(PathBuf, PathBuf
     let path = |name: &str| env.get(name).map(PathBuf::from).filter(|p| p.is_absolute());
     let (cache, python) = if cfg!(windows) {
         let cache = path("LOCALAPPDATA").map(|dir| dir.join("uv").join("cache"));
-        (cache, path("APPDATA").map(|dir| dir.join("uv").join("data").join("python")))
+        (cache, path("APPDATA").map(|dir| dir.join("uv").join("python")))
     } else {
         let home = path("HOME");
         let base = |xdg: &str, default: &str| path(xdg).or_else(|| home.as_ref().map(|h| h.join(default)));

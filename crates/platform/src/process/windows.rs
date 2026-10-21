@@ -17,8 +17,8 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, HANDLE,
-        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
-        WAIT_TIMEOUT,
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, STILL_ACTIVE, SetHandleInformation,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     System::{
         Diagnostics::ToolHelp::{
@@ -93,8 +93,12 @@ pub(super) fn kill(handle: &Handle, _: &Birth) -> io::Result<()> {
     // SAFETY: a live process handle opened with PROCESS_TERMINATE.
     if unsafe { TerminateProcess(raw(&handle.0), 1) } == 0 {
         let error = io::Error::last_os_error();
-        // Terminating a process that already exited is refused; it is done.
-        if !signaled(&handle.0, Some(Duration::ZERO))? {
+        // A process that exited, or is exiting (its job was just ended), refuses it: it is done.
+        let mut code = 0;
+        // SAFETY: a live process handle and a writable exit code.
+        let exiting = unsafe { GetExitCodeProcess(raw(&handle.0), &mut code) } != 0
+            && code != STILL_ACTIVE as u32;
+        if !exiting && !signaled(&handle.0, Some(Duration::ZERO))? {
             return Err(error);
         }
     }

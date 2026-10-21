@@ -154,9 +154,8 @@ print(json.dumps({"identity": generation.identity}))
     fs::create_dir_all(state).unwrap();
     let output = Command::new("uv")
         .current_dir(repo)
-        .args([
-            "run", "--locked", "--extra", "installer", "python", "-c", INSTALL,
-        ])
+        .args(named_runtime::helper())
+        .args(["python", "-c", INSTALL])
         .arg(repo.join("tests/fixtures/cpu_classifier"))
         .arg(state)
         // The named Runtime, as every machine of this suite runs it.
@@ -869,7 +868,7 @@ mod v1_api {
                 "run",
                 "--locked",
                 "--extra",
-                "test",
+                "installer",
                 "python",
                 "-c",
                 "import sys; print(sys.executable)",

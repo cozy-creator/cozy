@@ -731,6 +731,7 @@ mod tests {
 
     /// The real installer from objects the signer wrote; the same manifest reopens it.
     #[test]
+    #[cfg_attr(windows, ignore = "PyPI's cozy-runtime 0.27.4 needs tensorfs 0.10, which has no Windows wheel")]
     fn a_written_local_package_reuses_its_environment() {
         let Machine { root, service, objects, installer, .. } = machine("cm-local");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -771,6 +772,7 @@ mod tests {
     /// Remote edits get independent editable trees/environments. Explicit direct paths keep
     /// reading the authored directory in place.
     #[test]
+    #[cfg_attr(windows, ignore = "PyPI's cozy-runtime 0.27.4 needs tensorfs 0.10, which has no Windows wheel")]
     fn remote_edits_keep_prior_sources_and_direct_paths_stay_live() {
         let m = machine("cm-live");
         let sources = LocalSources::new(m.objects.clone(), m.installer.clone());
@@ -879,6 +881,7 @@ mod tests {
     /// Two already-running processes import a library module and read its package data only
     /// after a second remote install. The main stays unchanged; late root/library files change.
     #[test]
+    #[cfg_attr(windows, ignore = "PyPI's cozy-runtime 0.27.4 needs tensorfs 0.10, which has no Windows wheel")]
     fn concurrent_remote_runs_keep_late_imports_and_data() {
         use std::io::{BufRead, BufReader, Write};
         use std::process::{Child, ChildStdout, Stdio};
@@ -1108,6 +1111,7 @@ mod tests {
     /// published package's are: on a pod's overlayfs a hardlink copies each file up (the A4000
     /// rental reclaimed 196 MiB of copies from one weightless edit's environment).
     #[test]
+    #[cfg_attr(windows, ignore = "PyPI's cozy-runtime 0.27.4 needs tensorfs 0.10, which has no Windows wheel")]
     fn a_local_package_links_its_dependencies_from_the_seeded_cache() {
         let m = machine("cm-seeded");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1205,6 +1209,7 @@ mod tests {
     /// never published) runs that Runtime where the machine's own pair is refused by its pin, and
     /// every run says so. Both capture shapes the CLI sends; runs 5252/5274/5276 failed here.
     #[test]
+    #[cfg_attr(windows, ignore = "PyPI's cozy-runtime 0.27.4 needs tensorfs 0.10, which has no Windows wheel")]
     fn a_vendored_dev_runtime_runs_where_its_pin_refuses_the_machine_pair() {
         let m = machine("cm-vendored");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1287,6 +1292,7 @@ mod tests {
     /// PyPI never had) runs a script on it whatever the script's own bounds on the pair, as it
     /// runs a release, and every run says so (cr-203: runs 11304/11371 fell back to PyPI's pair).
     #[test]
+    #[cfg_attr(windows, ignore = "PyPI's cozy-runtime 0.27.4 needs tensorfs 0.10, which has no Windows wheel")]
     fn a_machines_dev_runtime_runs_a_script_whose_bound_it_misses() {
         let m = machine("cm-dev-machine");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));

@@ -918,7 +918,8 @@ async fn public_names_match_the_generic_format_with_unicode_reserved_characters_
     let client = Client::new(config(&scratch.0.join("cache"), origin.to_str().unwrap())).unwrap();
     let offline = Client::new(config(&scratch.0.join("cache"), "http://127.0.0.1:1")).unwrap();
     let endpoint = Endpoint::new(origin.to_str().unwrap(), None).unwrap();
-    for name in ["AcMe Space/MoDEL%?#É", "Org%2F/.Hidden", "組/名"] {
+    // A folder endpoint keeps names raw, and NTFS holds no `?` in a file name.
+    for name in ["AcMe Space/MoDEL%?#É", "Org%2F/.Hidden", "組/名"].into_iter().filter(|n| !cfg!(windows) || !n.contains('?')) {
         let mut reference: Ref = name.parse().unwrap();
         assert_eq!(reference.repo_id, name);
         reference.revision = Some("1".into());

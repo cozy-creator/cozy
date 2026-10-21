@@ -118,7 +118,11 @@ async fn repo_names_are_encoded_for_http_and_raw_on_disk() {
         ),
         ("Org%2F/.Hidden", "/refs/org%252f/.hidden.json"),
         ("組/名", "/refs/%E7%B5%84/%E5%90%8D.json"),
-    ] {
+    ]
+    // A folder endpoint keeps names raw, and NTFS holds no `?` in a file name.
+    .into_iter()
+    .filter(|(name, _)| !cfg!(windows) || !name.contains('?'))
+    {
         let mut initial = Repo::new(name);
         initial.set_tag("first", ObjectRef::of(b"first"));
         directory

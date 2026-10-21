@@ -189,7 +189,7 @@ fn a_synthetic_checkpoint_exports_uploads_downloads_and_verifies() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|f| f == "unet/diffusion_pytorch_model.safetensors"));
+        .any(|f| f.as_str().unwrap().replace('\\', "/") == "unet/diffusion_pytorch_model.safetensors"));
     let config: Json = serde_json::from_slice(&fs::read(out.join("unet/config.json")).unwrap()).unwrap();
     assert_eq!(config, Json::Object(ck.component("unet").unwrap().config.clone()));
     let files = [

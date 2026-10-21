@@ -236,7 +236,8 @@ async fn wait_partial(dir: &Path, bytes: u64) {
         entries
             .map(|e| match e.file_type() {
                 Ok(t) if t.is_dir() => largest(&e.path()),
-                _ => e.metadata().map_or(0, |m| m.len()),
+                // Asked of the file: a Windows listing keeps a stale length for a file being written.
+                _ => fs::metadata(e.path()).map_or(0, |m| m.len()),
             })
             .max()
             .unwrap_or(0)
