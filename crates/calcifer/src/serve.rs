@@ -119,7 +119,11 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
     let calcifer = Calcifer::open(&home.calcifer(), &home.outputs())
         .map_err(|e| failed(Error::new(Kind::Internal, "calcifer_store", e.to_string())))?;
     steps.done("store");
-    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+    let listener = platform::net::listen((Ipv4Addr::LOCALHOST, port).into()).and_then(|listener| {
+        listener.set_nonblocking(true)?;
+        TcpListener::from_std(listener)
+    });
+    let listener = match listener {
         Ok(listener) => listener,
         Err(e) => {
             calcifer.close();

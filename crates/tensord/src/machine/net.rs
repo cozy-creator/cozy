@@ -11,12 +11,12 @@ use tokio::{net::TcpStream, task::JoinSet};
 /// then names: this computer's machine keeps its ports across restarts.
 pub fn kept_listener(saved: &Path, host: IpAddr, port: Option<u16>) -> io::Result<TcpListener> {
     if let Some(port) = port {
-        return TcpListener::bind((host, port));
+        return platform::net::listen((host, port).into());
     }
     let kept = fs::read_to_string(saved).ok().and_then(|text| text.trim().parse::<u16>().ok());
-    let listener = match kept.map(|port| TcpListener::bind((host, port))) {
+    let listener = match kept.map(|port| platform::net::listen((host, port).into())) {
         Some(Ok(listener)) => listener,
-        _ => TcpListener::bind((host, 0))?,
+        _ => platform::net::listen((host, 0).into())?,
     };
     let bound = listener.local_addr()?.port();
     if kept != Some(bound) {

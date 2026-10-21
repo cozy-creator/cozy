@@ -11,6 +11,7 @@ pub mod gpu;
 pub mod handles;
 pub mod ipc;
 pub mod lock;
+pub mod net;
 pub mod paths;
 pub mod process;
 pub mod service;

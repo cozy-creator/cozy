@@ -20,9 +20,11 @@ thiserror.workspace = true
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+socket2.workspace = true
 windows-sys = { workspace = true, features = [
     "Wdk_System_SystemInformation",
     "Win32_Foundation",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
