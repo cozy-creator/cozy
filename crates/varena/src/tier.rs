@@ -517,19 +517,23 @@ impl Held {
     }
 
     /// The tier wants the layout back: every region not being read is unlocked now, the rest
-    /// when their copy ends; the mapping goes with the last holder. Returns the layout's bytes.
+    /// when their copy ends; the mapping goes with the last holder. Returns the bytes it had
+    /// page-locked.
     pub fn release(&self, mut unregister: impl FnMut(u64) -> Result<()>) -> u64 {
         let mut pins = self.pins.lock();
         pins.released = true;
         let regions: Vec<u32> = pins.registered.drain().collect();
+        let mut bytes = 0;
         for r in regions {
+            let Ok((ptr, span)) = self.ptr(r) else { continue };
+            bytes += span;
             if pins.reading.contains(&r) {
                 pins.deferred.push(r);
-            } else if let Ok((ptr, _)) = self.ptr(r) {
+            } else {
                 let _ = unregister(ptr);
             }
         }
-        self.ro.len as u64
+        bytes
     }
 
     /// After a copy from region `r`: unlocks it if the layout was released meanwhile.

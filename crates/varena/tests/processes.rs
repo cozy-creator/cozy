@@ -735,7 +735,7 @@ fn the_tier_takes_back_a_pinned_layout(dir: &Path) {
     tier.await_releases(1);
     assert!(resident(&digest("p1")) < REGION_ALIGN, "the pinned layout's regions returned: {}", resident(&digest("p1")));
     assert!(resident(&digest("p2")) >= 4 * MB, "the next one is untouched");
-    assert!(tier.acked() >= 4 * MB, "y unpinned and unmapped it when asked: {}", tier.acked());
+    assert_eq!(tier.acked(), REGION_ALIGN, "y unpinned the one region it had page-locked, when asked");
     assert_eq!(y.ok("exact p1 1"), "true", "y goes on from the store");
     y.ok("unpin");
     y.exit();
