@@ -971,7 +971,7 @@ fn activation(r: &Request, set: SetId, p: &mut Pressure, len: u64, pages: u32) -
     step!();
     while let Err(code) = p.try_take(len) {
         assert_eq!(code, cuda::ERROR_OUT_OF_MEMORY);
-        let next = r.oom(set, Some(len), None, p.torch());
+        let next = r.oom(Some(set), Some(len), None, p.torch());
         answers.push(format!("{next:?}").split('(').next().unwrap_or_default().to_string());
         assert!(matches!(next, Next::Retry), "idle pages answer Retry: {answers:?}");
         assert!(answers.len() <= pages as usize + 2, "the OOM ladder must end: {answers:?}");
@@ -991,7 +991,7 @@ fn concurrent_binds_of_one_block_fill_it_once() {
     step!();
     let r = mem.request("r", plan(&[&["m"]])).unwrap();
     step!();
-    let pass = r.pass(s, "1x1", Torch::default()).unwrap();
+    let pass = r.pass(s, "main", "1x1", Torch::default()).unwrap();
     step!();
     let streams = [cuda::Stream::new(0).unwrap(), cuda::Stream::new(0).unwrap()];
     step!();
@@ -1032,7 +1032,7 @@ fn a_page_unmaps_only_after_its_last_consumer() {
     step!();
     let r = mem.request("r", plan(&[&["t"]])).unwrap();
     step!();
-    let pass = r.pass(s, "1x1", Torch::default()).unwrap();
+    let pass = r.pass(s, "main", "1x1", Torch::default()).unwrap();
     step!();
     let consumer = cuda::Stream::new(0).unwrap();
     step!();
@@ -1089,7 +1089,8 @@ fn blocked<'s, T: Send + 's>(t: &'s std::thread::Scope<'s, '_>, f: impl FnOnce()
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let finished = done.clone();
     let handle = t.spawn(move || {
-        sent.send(unsafe { libc::gettid() }).unwrap();
+        // The syscall: glibc 2.28 (manylinux_2_28) has no gettid wrapper.
+        sent.send(unsafe { libc::syscall(libc::SYS_gettid) }).unwrap();
         let out = f();
         finished.store(true, std::sync::atomic::Ordering::Release);
         out
@@ -1110,7 +1111,7 @@ fn blocked<'s, T: Send + 's>(t: &'s std::thread::Scope<'s, '_>, f: impl FnOnce()
 fn first_run(mem: &Memory, m: SetId, idle: u32) -> (Vec<String>, Stats) {
     let r = mem.request("first", plan(&[&["m"]])).unwrap();
     step!();
-    let pass = r.pass(m, "1x8", Torch::default()).unwrap();
+    let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
     step!();
     let pins: Vec<Pin> = (0..2).map(|b| mem.bind(m, b, 0).unwrap()).collect();
     step!();
@@ -1181,7 +1182,7 @@ fn a_measured_pass_gets_its_room_before_it_runs() {
     step!();
     let r = mem.request("second", plan(&[&["m"]])).unwrap();
     step!();
-    let pass = r.pass(m, "1x8", Torch::default()).unwrap();
+    let pass = r.pass(m, "main", "1x8", Torch::default()).unwrap();
     step!();
     let mut p = Pressure::none();
     step!();
@@ -1224,7 +1225,7 @@ fn a_page_larger_than_the_card_is_exhausted_before_any_io_and_its_id_serves_agai
     step!();
     let r = mem.request("r", plan(&[&["huge"]])).unwrap();
     step!();
-    let pass = r.pass(huge, "1", Torch::default());
+    let pass = r.pass(huge, "main", "1", Torch::default());
     step!();
     let e = match &pass {
         Err(e) => e.clone(),
@@ -1245,7 +1246,7 @@ fn a_page_larger_than_the_card_is_exhausted_before_any_io_and_its_id_serves_agai
     step!();
     let r = mem.request("r", plan(&[&["m"]])).unwrap();
     step!();
-    let pass = r.pass(m, "1", Torch::default()).unwrap();
+    let pass = r.pass(m, "main", "1", Torch::default()).unwrap();
     step!();
     let pin = mem.bind(m, 0, 0).unwrap();
     step!();
@@ -1275,7 +1276,7 @@ fn a_bind_on_a_full_card_takes_idle_pages_then_is_exhausted_and_recovers_when_ro
     step!();
     let r = mem.request("r", plan(&[&["m"]])).unwrap();
     step!();
-    let pass = r.pass(m, "1", Torch::default()).unwrap();
+    let pass = r.pass(m, "main", "1", Torch::default()).unwrap();
     step!();
     // Everything else on the card is an allocation varena cannot free.
     let full = Pressure::fill(64 << 10);
@@ -1321,7 +1322,7 @@ fn repeated_passes_of_a_set_keep_its_declared_step() {
     let r = mem.request("r", plan(&[&["a"], &["vae", "audio"], &["dit", "lora"], &["audio"], &["vae"]])).unwrap();
     step!();
     let forward = |n: &str| {
-        let pass = r.pass(id(n), "1", Torch::default()).unwrap();
+        let pass = r.pass(id(n), "main", "1", Torch::default()).unwrap();
         drop(mem.bind(id(n), 0, 0).unwrap());
         pass.end(Measured::default(), Torch::default());
         r.stats().trace.last().map(|t| t.step).unwrap()
@@ -1361,7 +1362,7 @@ fn a_transform_binds_another_set_under_pressure_and_a_second_binder_waits_for_it
     step!();
     let r = mem.request("r", plan(&[&["base", "factors"]])).unwrap();
     step!();
-    let pass = r.pass(base, "1", Torch::default()).unwrap();
+    let pass = r.pass(base, "main", "1", Torch::default()).unwrap();
     step!();
     let stream = cuda::Stream::new(0).unwrap();
     step!();
@@ -1406,7 +1407,7 @@ fn a_ram_level_set_binds_from_the_tier() {
     step!();
     let r = mem.request("r", plan(&[&["t"]])).unwrap();
     step!();
-    let pass = r.pass(s, "1", Torch::default()).unwrap();
+    let pass = r.pass(s, "main", "1", Torch::default()).unwrap();
     step!();
     let pins: Vec<Pin> = (0..4).map(|b| mem.bind(s, b, 0).unwrap()).collect();
     step!();
@@ -1487,7 +1488,7 @@ fn role_agent() {
                 requests.insert(id.to_string(), m().request(id, plan(&steps)).unwrap());
                 "ok".into()
             }
-            ["pass", req, set, shape] => match requests[*req].pass(sets[*set], shape, Torch::default()) {
+            ["pass", req, set, shape] => match requests[*req].pass(sets[*set], "main", shape, Torch::default()) {
                 Ok(p) => {
                     passes.insert(req.to_string(), p);
                     "ok".into()
