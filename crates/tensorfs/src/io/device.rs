@@ -994,13 +994,14 @@ pub(super) fn copy_ceiling(device: i32) -> io::Result<(f64, u32)> {
     use std::os::unix::fs::FileExt;
     let engine = Engine::get(device).map_err(io::Error::other)?;
     let _serial = engine.serial.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: a fresh anonymous file, owned below.
-    let fd = unsafe { libc::memfd_create(c"tensorfs-copy-probe".as_ptr(), libc::MFD_CLOEXEC) };
+    // SAFETY: a fresh anonymous file, owned below. The syscall, not glibc's wrapper (2.27+): the
+    // `tfs` binary links against manylinux2014's glibc 2.17.
+    let fd = unsafe { libc::syscall(libc::SYS_memfd_create, c"tensorfs-copy-probe".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: the descriptor was just created and nothing else owns it.
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
     let block = vec![0x5a; PIECE];
     for at in (0..COPY_PROBE).step_by(PIECE) {
         file.write_all_at(&block, at as u64)?;
