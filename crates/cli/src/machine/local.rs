@@ -4,7 +4,6 @@ use std::{
     io,
     path::{Path, PathBuf},
     process::ExitCode,
-    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -20,13 +19,15 @@ use protocol::{
 };
 use serde::Serialize;
 
-use crate::{Context, calcifer_client::Client, output};
+use crate::{
+    Context,
+    calcifer_client::Client,
+    launch::{self, Ended, Launch},
+    output,
+};
 
 /// The user service `cozy machine enable` installs.
 const SERVICE: &str = "machine";
-/// How often a start is looked at, and how often the person hears it is still starting.
-const SAMPLE: Duration = Duration::from_millis(250);
-const REPORT: Duration = Duration::from_secs(10);
 
 /// `cozy machine enable`: this computer's machine as this user's service, recorded as `local`.
 /// A service runs only for the login home under a user service manager; otherwise the machine
@@ -183,14 +184,6 @@ fn start_log(root: &Path) -> PathBuf {
     root.join("var/lib/cozy/machine/start.log")
 }
 
-/// Starts the machine detached from this command, as `spec` says (in this command's environment,
-/// whose HOME is the one enabling it), saying anything before its own log opens into its start log.
-fn detach(spec: &ServiceSpec) -> Result<platform::process::Detached, Error> {
-    platform::process::detach(&spec.program, &spec.args, spec.log.as_deref()).map_err(|e| {
-        Error::new(Kind::Unavailable, "machine_start_failed", e.to_string()).remedy(AS_A_SERVICE)
-    })
-}
-
 /// Starts the machine as `services`' service (or detached without one) and waits until it serves:
 /// a start that fails, or a machine that exits or is restarted before it serves, is refused.
 async fn start(
@@ -201,34 +194,34 @@ async fn start(
     running: bool,
     before: Option<std::time::SystemTime>,
 ) -> Result<(), Error> {
+    let log = start_log(root);
     let failed = |why: String| {
-        Error::new(Kind::Unavailable, "machine_start_failed", why)
-            .next(format!("cat {}", start_log(root).display()))
+        let error = Error::new(Kind::Unavailable, "machine_start_failed", why);
+        // Detached, it never comes back after a reboot: say how it becomes a service.
+        let error = if services.is_none() {
+            error.remedy(AS_A_SERVICE)
+        } else {
+            error
+        };
+        error.next(format!("cat {}", log.display()))
     };
-    match services {
-        Some(services) => {
-            if running {
-                services.stop(SERVICE).map_err(|e| failed(e.to_string()))?;
-            }
-            services.start(spec).map_err(|e| failed(e.to_string()))?;
-            ready(ctx, root, before, || {
-                services
-                    .failed(SERVICE)
-                    .then(|| failed(format!("cozy-{SERVICE}.service exited before it served")))
-            })
-            .await
-        }
-        None => {
-            let mut child = detach(spec)?;
-            ready(ctx, root, before, || match child.try_wait() {
-                Ok(Some(status)) => Some(failed(format!(
-                    "the machine exited ({status}) before it served"
-                ))),
-                _ => None,
-            })
-            .await
-        }
+    if let (Some(services), true) = (services, running) {
+        services.stop(SERVICE).map_err(|e| failed(e.to_string()))?;
     }
+    let mut launch = Launch::new(services, spec);
+    launch.start().map_err(|e| failed(e.to_string()))?;
+    let shown = log.display().to_string();
+    launch::until(ctx.json, "the machine", &shown, async || {
+        if served_at(root).is_some_and(|at| Some(at) > before) && !free(root) {
+            return Ok(Some(()));
+        }
+        match launch.ended() {
+            None => Ok(None),
+            Some(Ended::Failed(why)) => Err(failed(format!("the machine: {why}"))),
+            Some(Ended::Yielded) => Err(failed("the machine exited before it served".into())),
+        }
+    })
+    .await
 }
 
 /// Ends a detached machine: the process its root's lock names, and everything it started.
@@ -332,38 +325,6 @@ fn served_at(root: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(ready_path(root))
         .and_then(|m| m.modified())
         .ok()
-}
-
-/// Waits until the machine writes that it serves after `before`, saying every so often that it
-/// still starts and where its log is. It ends on the machine's own answer, never on a clock.
-async fn ready(
-    ctx: &Context,
-    root: &Path,
-    before: Option<std::time::SystemTime>,
-    mut failed: impl FnMut() -> Option<Error>,
-) -> Result<(), Error> {
-    let began = Instant::now();
-    let mut reported = began;
-    loop {
-        if served_at(root).is_some_and(|at| Some(at) > before) && !free(root) {
-            return Ok(());
-        }
-        if let Some(error) = failed() {
-            return Err(error);
-        }
-        tokio::time::sleep(SAMPLE).await;
-        if reported.elapsed() >= REPORT {
-            reported = Instant::now();
-            output::say(
-                ctx,
-                &format!(
-                    "waiting for the machine to serve ({}s so far); {} says what it is doing",
-                    began.elapsed().as_secs(),
-                    start_log(root).display()
-                ),
-            );
-        }
-    }
 }
 
 /// Waits until no run is in progress on `local`, naming each and following it to its end.
