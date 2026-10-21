@@ -136,6 +136,11 @@ class Fill(Protocol):
 
 @runtime_checkable
 class _CallSelectedFill(Protocol):
+    def prepare(self) -> Hashable: ...
+
+    @property
+    def call_selected(self) -> bool: ...
+
     @property
     def prefetch_ready(self) -> bool:
         """False only while a call-selected transform has no immutable selection."""
@@ -542,6 +547,7 @@ class Request:
     cleanup_errors: tuple[BaseException, ...] = field(default=(), init=False, repr=False)
     _failed: bool = field(default=False, init=False, repr=False)
     _pending: set[Model] = field(default_factory=set, init=False, repr=False)
+    _selected: dict[Model, Hashable] = field(default_factory=dict, init=False, repr=False)
 
     def mark_failed(self) -> None:
         """Retire unused allocator slack on exit, including a failure returned as a value.
@@ -556,7 +562,7 @@ class Request:
             step if isinstance(step, (str, Model, nn.Module)) else tuple(step)
             for step in (steps or ())
         )
-        names, models, pending = self.memory._plan(self.raw_plan)
+        names, models, pending = self.memory._plan(self.raw_plan, self._selected)
         self.declared = names
         if self.memory.native is not None:
             self.memory.native.declare(
@@ -818,12 +824,24 @@ class Memory:
         return requests[-1]
 
     def _plan(
-        self, steps: Sequence[PlanStep]
+        self, steps: Sequence[PlanStep], selected: Mapping[Model, Hashable] | None = None,
     ) -> tuple[tuple[tuple[str, ...], ...], list[list[int]], set[Model]]:
+        selected = selected or {}
+
+        def unresolved(model: Model) -> bool:
+            fill = model.fill
+            return (
+                isinstance(fill, _CallSelectedFill) and fill.call_selected
+                and (not fill.prefetch_ready or model not in selected
+                     or selected[model] != fill.prepare()
+                     or (self.native is not None and model.version != fill.prepare()))
+            )
+
         if self.native is None:
-            names = []
+            names, pending = [], set()
             for step in steps:
                 entries = [step] if isinstance(step, (str, Model, nn.Module)) else step
+                pending.update(entry for entry in entries if isinstance(entry, Model) and unresolved(entry))
                 names.append(
                     tuple(
                         sorted(
@@ -832,7 +850,7 @@ class Memory:
                         )
                     )
                 )
-            return tuple(names), [[] for _ in names], set()
+            return tuple(names), [[] for _ in names], pending
         names, ids, pending = [], [], set()
         for step in steps:
             entries = [step] if isinstance(step, (str, Model, nn.Module)) else step
@@ -857,14 +875,25 @@ class Memory:
             )
             pending.update(
                 model for model in found
-                if isinstance(model.fill, _CallSelectedFill) and not model.fill.prefetch_ready
+                if unresolved(model)
             )
         return tuple(names), ids, pending
+
+    def _select(self, model: Model, version: Hashable) -> None:
+        """Record actual call metadata for this caller's request, without doing I/O."""
+        stack = self.local.__dict__.get("requests", ())
+        if stack:
+            request = stack[-1]
+            request._selected[model] = version
+            if self.native is None:
+                request._pending.discard(model)
 
     def _fresh(self, model: Model) -> None:
         if isinstance(model.fill, _CallSelectedFill) and not model.fill.prefetch_ready:
             raise Unbound("call-selected model content is still pending")
         version = model.fill.prepare() if model.fill is not None else None
+        if isinstance(model.fill, _CallSelectedFill) and model.fill.call_selected:
+            self._select(model, model.fill.prepare())
         if version != model.version:
             for cache in tuple(self.caches):
                 if any(hold.model is model for hold in cache.holds):
@@ -879,9 +908,10 @@ class Memory:
             # The selected bytes can equal the previous warm call. In that case
             # activate their edges without replacing registration or rewinding
             # another model's cursor in the current joint phase.
-            for request in tuple(self.active):
-                if model in request._pending:
-                    request.plan(request.raw_plan, _preserve_position=True)
+            stack = self.local.__dict__.get("requests", ())
+            if stack and model in stack[-1]._pending:
+                request = stack[-1]
+                request.plan(request.raw_plan, _preserve_position=True)
 
     def _start(self, model: Model) -> None:
         with self.changed:

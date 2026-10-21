@@ -2706,7 +2706,7 @@ mod gpu_tests {
         let mut inner = event_test_inner();
         let prototype = inner.table.pages[0].clone();
         inner.table.pages.clear();
-        for id in [1, 2] {
+        for id in [1, 2, 3] {
             let mut page = prototype.clone();
             page.id = id;
             page.model = Some(id);
@@ -2801,6 +2801,49 @@ mod gpu_tests {
         )
         .is_err());
         assert_eq!(inner.table.requests[0].model_positions[&1], 1);
+    }
+
+    #[test]
+    fn another_requests_selected_native_id_does_not_activate_pending_content() {
+        let mut inner = selection_test_inner();
+        inner.requests.insert(
+            10,
+            Request {
+                steps: vec![],
+                pending: BTreeSet::new(),
+                explicit: true,
+                package: "other-selection".into(),
+                shape: "shape".into(),
+                stats: Stats::default(),
+                budgets: BTreeMap::new(),
+                pass_index: 0,
+            },
+        );
+        let mut other = inner.table.requests[0].clone();
+        other.id = 10;
+        inner.table.requests.push(other);
+        let steps = |selected| vec![vec![3], vec![3, selected], vec![3]];
+        Placement::declare_locked(&mut inner, 9, steps(1), BTreeSet::new(), false).unwrap();
+        Placement::declare_locked(&mut inner, 10, steps(2), BTreeSet::new(), false).unwrap();
+        // The globally registered content is now B (native ID2). Request A must
+        // keep its logical phases while that incompatible ID has no A-use edge.
+        Placement::declare_locked(&mut inner, 9, steps(2), BTreeSet::from([2]), false).unwrap();
+        assert_eq!(inner.requests[&9].steps, [vec![3], vec![2, 3], vec![3]]);
+        assert!(inner.table.pages[0].uses.is_empty());
+        assert!(inner.table.pages[1]
+            .uses
+            .iter()
+            .all(|usage| usage.request == 10 && usage.position.step == 1));
+        assert_eq!(inner.table.pages[1].uses.len(), 1);
+        // Selecting A again exchanges the roles; B cannot borrow A's ID1.
+        Placement::declare_locked(&mut inner, 9, steps(1), BTreeSet::new(), false).unwrap();
+        Placement::declare_locked(&mut inner, 10, steps(1), BTreeSet::from([1]), false).unwrap();
+        assert!(inner.table.pages[0]
+            .uses
+            .iter()
+            .all(|usage| usage.request == 9 && usage.position.step == 1));
+        assert_eq!(inner.table.pages[0].uses.len(), 1);
+        assert!(inner.table.pages[1].uses.is_empty());
     }
 
     #[test]
