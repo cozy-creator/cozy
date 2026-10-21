@@ -1,0 +1,88 @@
+name: windows-gpu
+# The Windows + NVIDIA proof (xs-061): scripts/windows-gpu-proof.ps1 on one Windows GPU runner, its bundle
+# uploaded. The runner is a label: the org's hosted T4 (scripts/windows-gpu-hosted-runner.sh), an owner's
+# PC (scripts/windows-gpu-runner.ps1, windows-rtx) or a TensorDock rental (tracker
+# scripts/cr-020-rent-windows-gpu-runner.py). windows-2025 checks the no-GPU path: the proof must refuse.
+#   gh workflow run windows-gpu.yaml -R cozy-creator/cozy-creator -f runner=<label> [-f version=0.10.1] [-f runs='fidika/sdxl/generate steps=30']
+run-name: windows-gpu on ${{ inputs.runner }}
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner label
+        type: string
+        default: windows-gpu-t4
+      version:
+        description: A cozy release to install (0.10.1); empty installs tensorhub.com's
+        type: string
+      mirror:
+        description: A candidate release directory (COZY_DOWNLOAD_URL), in place of version
+        type: string
+      runs:
+        description: Functions to run, comma-separated, each with optional key=value inputs
+        type: string
+        default: fidika/sdxl/generate, fidika/birefnet/remove_background, fidika/qwen-image-2/generate_image, fidika/flux-3-klein/generate
+      driver:
+        description: A self-hosted runner's NVIDIA driver below cozy's floor; install (a rental) or keep (an owner's PC). A hosted runner gets Azure's GRID driver.
+        type: choice
+        options: [keep, install]
+        default: keep
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: ${{ inputs.runner }}
+    # Hang bound, not a work budget.
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      # The hosted T4 image ships driver 471.11 in TCC; Azure's GRID driver makes it WDDM with CUDA 13 without
+      # a reboot. A rental's GeForce card takes NVIDIA's Game Ready driver.
+      - name: NVIDIA driver at cozy's floor, in WDDM
+        env:
+          INSTALL: ${{ runner.environment == 'github-hosted' && 'grid' || inputs.driver == 'install' && 'geforce' || '' }}
+        run: |
+          $floor = [version]'580.88'
+          $urls = @{
+            grid = 'https://download.microsoft.com/download/0f21fd13-2390-4c79-876a-87ae3dc724c6/596.86_grid_win10_win11_server2022_server2025_dch_64bit_international_azure_swl.exe'
+            geforce = 'https://us.download.nvidia.com/Windows/617.42/617.42-desktop-win10-win11-64bit-international-dch-whql.exe'
+          }
+          function Smi { "$env:SystemRoot\System32\nvidia-smi.exe", "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe" | Where-Object { Test-Path $_ } | Select-Object -First 1 }
+          function Driver {
+            if (-not (Smi)) { return 'none' }
+            $version, $model = (& (Smi) --query-gpu=driver_version,driver_model.current --format=csv,noheader | Select-Object -First 1) -split ',\s*'
+            if ([version]$version -ge $floor -and $model -eq 'WDDM') { return '' }
+            "$version $model"
+          }
+          if (-not (Get-CimInstance Win32_VideoController | Where-Object PNPDeviceID -like 'PCI\VEN_10DE*')) { 'no NVIDIA GPU on this runner'; exit 0 }
+          $short = Driver
+          if (-not $short) { & (Smi); exit 0 }
+          "driver $short; cozy needs $floor or newer, in WDDM"
+          if (-not $env:INSTALL) { throw 'this runner keeps its driver: update it, or dispatch with -f driver=install' }
+          curl.exe -fsSL -o "$env:RUNNER_TEMP\nvidia-driver.exe" $urls[$env:INSTALL]
+          if ($LASTEXITCODE) { throw "download failed: $($urls[$env:INSTALL])" }
+          $installer = Start-Process "$env:RUNNER_TEMP\nvidia-driver.exe" -ArgumentList '-s', '-noreboot', '-clean', '-noeula' -Wait -PassThru
+          "the $env:INSTALL installer exited $($installer.ExitCode)"
+          $short = Driver
+          if ($short) { throw "after installing, driver $short" }
+          & (Smi)
+      - name: Proof
+        env:
+          RUNS: ${{ inputs.runs }}
+          MIRROR: ${{ inputs.mirror || inputs.version && format('https://github.com/cozy-creator/cozy-creator/releases/download/v{0}', inputs.version) || '' }}
+        run: |
+          $runs = @($env:RUNS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          & scripts/windows-gpu-proof.ps1 -Out "$env:RUNNER_TEMP\windows-gpu-proof" -DownloadUrl $env:MIRROR -Runs $runs
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: windows-gpu-proof-${{ github.run_id }}
+          path: ${{ runner.temp }}/windows-gpu-proof
