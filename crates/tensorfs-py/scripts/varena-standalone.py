@@ -19,12 +19,15 @@ its capacity is lowered by the standalone limit, and the uncapped GPU run is the
 from __future__ import annotations
 
 import ast
+import faulthandler
 import gc
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import tensorfs
@@ -56,6 +59,18 @@ results: list[bool] = []
 def check(name: str, ok: object, detail: object = "") -> None:
     results.append(bool(ok))
     print(f"{'PASS' if ok else 'FAIL'} {name}" + ("" if ok else f": {detail}"), flush=True)
+
+
+def watch() -> None:
+    """Diagnostics only, never a failure: every thread's Python stack after a minute with no new
+    check (a minute: far above any one check's time here, and few enough dumps to read)."""
+    seen = -1
+    while True:
+        time.sleep(60)
+        if len(results) == seen:
+            print(f"STALL no check in 60 s after {seen}; every thread's stack:", flush=True)
+            faulthandler.dump_traceback(file=sys.stdout, all_threads=True)
+        seen = len(results)
 
 
 def build(store: Path) -> tuple[UNet2DConditionModel, tensorfs.Checkpoint]:
@@ -252,4 +267,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    threading.Thread(target=watch, daemon=True).start()
     sys.exit(child(*sys.argv[2:4], int(sys.argv[4]), sys.argv[5]) if sys.argv[1:2] == ["child"] else main())

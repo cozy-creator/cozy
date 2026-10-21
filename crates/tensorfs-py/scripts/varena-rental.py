@@ -7,7 +7,7 @@
 
 The script runs in a fresh process of this script's interpreter (its environment has torch and
 diffusers), with the given TensorFS wheel installed into a directory ahead of the environment's
-own TensorFS. Its output holds the script's log.
+own TensorFS. Its output streams to the run's log as it comes, and the output holds it too.
 """
 import os
 import shutil
@@ -38,10 +38,17 @@ def main(*, wheel: Annotated[FileAsset, AssetBound(max_bytes=1 << 27)],
     (root / WHEEL).write_bytes(wheel.read_bytes())
     test = root / "varena-standalone.py"
     test.write_bytes(script.read_bytes())
-    text = install(site, "--no-deps", str(root / WHEEL))
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(site), os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep)}
-    run = subprocess.run([sys.executable, str(test)], env=env, capture_output=True, text=True, cwd=root)
-    text += f"$ {sys.executable} varena-standalone.py: exit {run.returncode}\n{run.stdout}{run.stderr}"
-    (logs / "log.txt").write_text(text)
-    print(text, flush=True)
+    with (logs / "log.txt").open("w") as log:
+        def say(line: str) -> None:  # streamed: the run's log shows where a stall sits
+            print(line, end="", flush=True)
+            log.write(line)
+            log.flush()
+
+        say(install(site, "--no-deps", str(root / WHEEL)))
+        command = [sys.executable, "-u", str(test)]
+        with subprocess.Popen(command, env=env, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as child:
+            for line in child.stdout or ():
+                say(line)
+        say(f"$ {' '.join(command)}: exit {child.returncode}\n")
     return out.save_tree(logs)
