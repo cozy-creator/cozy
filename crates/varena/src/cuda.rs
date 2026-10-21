@@ -342,18 +342,18 @@ impl Backend for CudaBackend {
 
     /// Read-only (the tier's mapping is), in the primary context, so TensorFS's reads see
     /// registered memory and copy directly.
-    unsafe fn register_host(&self, ptr: *const u8, len: u64) -> Result<()> {
+    fn register_host(&self, ptr: u64, len: u64) -> Result<()> {
         let _ctx = self.primary.enter()?;
-        // SAFETY: the caller keeps the range mapped until `unregister_host`.
-        let pin = unsafe { cuda::pin_region(ptr.cast_mut(), len as usize, true) }?;
+        // SAFETY: the tier keeps the range mapped until `unregister_host`.
+        let pin = unsafe { cuda::pin_region(ptr as *mut u8, len as usize, true) }?;
         self.hosts.lock().insert(ptr as usize, pin);
         Ok(())
     }
 
     /// A failed release keeps the registration, so its owner keeps the memory mapped and retries.
-    fn unregister_host(&self, ptr: *const u8) -> Result<()> {
+    fn unregister_host(&self, ptr: u64) -> Result<()> {
         let mut hosts = self.hosts.lock();
-        let pin = hosts.get_mut(&(ptr as usize)).ok_or_else(|| Error::Invalid(format!("{ptr:?} is not registered")))?;
+        let pin = hosts.get_mut(&(ptr as usize)).ok_or_else(|| Error::Invalid(format!("{ptr:#x} is not registered")))?;
         pin.release()?;
         hosts.remove(&(ptr as usize));
         Ok(())
