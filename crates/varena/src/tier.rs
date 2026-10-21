@@ -206,8 +206,10 @@ fn relieve(state: &Shared, trigger: HostTrigger) -> u64 {
     let facts: Vec<HostLayout> = s.layouts.iter().map(|(d, l)| l.facts(d)).collect();
     let actions = host_decide(&facts, trigger);
     if actions.is_empty() {
-        // Nothing left to give and nothing being asked back: the host is short past the tier.
-        if s.layouts.values().all(|l| l.pending.is_none()) {
+        // Under pressure with nothing left to give (a layout being asked back of a stalled user
+        // waits for TensorD to end it): the host is short past the tier. A staging Room is no
+        // pressure.
+        if trigger == HostTrigger::Pressure {
             if let Some(w) = &s.short {
                 os::signal(w);
             }
@@ -221,7 +223,7 @@ fn relieve(state: &Shared, trigger: HostTrigger) -> u64 {
             HostAction::Forget(digest) => chosen.entry(digest).or_default().1 = true,
         }
     }
-    let mut gave = 0;
+    let (mut gave, mut unasked) = (0, vec![]);
     for (digest, (regions, forget)) in chosen {
         let Some(l) = s.layouts.get_mut(&digest) else { continue };
         let users: Vec<(u64, String)> = l.users.iter().map(|(c, (_, ask))| (*c, ask.clone())).collect();
@@ -234,17 +236,22 @@ fn relieve(state: &Shared, trigger: HostTrigger) -> u64 {
         }
         l.pending = Some(Pending { regions, forget, waiting: users.iter().map(|(c, _)| *c).collect() });
         for (conn, ask) in users {
-            let (state, digest) = (state.clone(), digest.clone());
-            let _ = std::thread::Builder::new().name("varena-tier-ask".into()).spawn(move || {
-                let freed = ledger::release_host(&ask, &digest);
-                acked(&state, &digest, conn, freed);
+            let (st, d) = (state.clone(), digest.clone());
+            let asking = std::thread::Builder::new().name("varena-tier-ask".into()).spawn(move || {
+                let freed = ledger::release_host(&ask, &d);
+                acked(&st, &d, conn, freed);
             });
+            // No thread, no answer: the user is not waited for.
+            if asking.is_err() {
+                unasked.push((digest.clone(), conn));
+            }
         }
     }
     if gave > 0 {
         s.releases += 1;
     }
     drop(s);
+    unasked.into_iter().for_each(|(digest, conn)| acked(state, &digest, conn, 0));
     cv.notify_all();
     gave
 }
@@ -641,7 +648,8 @@ pub(crate) struct Client {
     stream: Mutex<Stream>,
     /// The namespace of the tier it found (the table owner's).
     ns: u32,
-    _service: Option<Tier>,
+    /// The tier this client serves from this process, when it found none.
+    service: Mutex<Option<Tier>>,
 }
 
 impl Client {
@@ -649,24 +657,23 @@ impl Client {
     /// process (with the host's pressure trigger when it arms) when nobody does and it is this
     /// user's; another user's tier is its TensorD's, never ours.
     pub fn open(ns: u32) -> Result<Client> {
-        let mut service = None;
-        loop {
-            if let Some(stream) = os::connect(ns, NAME)? {
-                return Ok(Client { stream: Mutex::new(stream), ns, _service: service });
-            }
-            if ns != os::euid() {
-                return Err(Error::Closed("the RAM tier (its TensorD serves none)".into()));
-            }
-            let mode = platform::contain::host_pressure::HostMode::Shared;
-            service = match platform::contain::host_pressure::Pressure::arm(mode) {
-                Ok(p) => Tier::serve(Pressure::Host(p))?,
-                Err(_) => Tier::serve(Pressure::Headroom)?,
-            };
-        }
+        let (stream, service) = connect(ns)?;
+        Ok(Client { stream: Mutex::new(stream), ns, service: Mutex::new(service) })
     }
 
+    /// One call; a broken connection (its tier's server went) is replaced once. The stream's
+    /// lock is a leaf: connecting (which may start a tier) happens outside it.
     fn call(&self, call: &Call) -> Result<(Reply, Option<Owned>)> {
-        os::call(&self.stream.lock(), call, None)
+        if let Ok(reply) = os::call(&self.stream.lock(), call, None) {
+            return Ok(reply);
+        }
+        let (stream, service) = connect(self.ns)?;
+        if let Some(service) = service {
+            *self.service.lock() = Some(service);
+        }
+        let mut current = self.stream.lock();
+        *current = stream;
+        os::call(&current, call, None)
     }
 
     /// Maps `digest`'s layout; the tier asks `ask` (this process's row) to give it back.
@@ -689,8 +696,27 @@ impl Client {
 
     /// Host headroom for `bytes`, the tier giving back in order; false when it cannot now. A
     /// connection of its own: a fill never waits behind another call.
-    pub fn room(&self, bytes: u64) -> Result<bool> {
-        let Some(stream) = os::connect(self.ns, NAME)? else { return Ok(false) };
-        Ok(matches!(os::call::<_, Reply>(&stream, &Call::Room { bytes }, None)?.0, Reply::Room { ok: true }))
+    pub fn room(&self, bytes: u64) -> bool {
+        let Ok(Some(stream)) = os::connect(self.ns, NAME) else { return false };
+        matches!(os::call::<_, Reply>(&stream, &Call::Room { bytes }, None), Ok((Reply::Room { ok: true }, _)))
+    }
+}
+
+/// Connects to the tier in user `ns`'s namespace, serving it from this process when nobody does
+/// and it is this user's (returned with the stream).
+fn connect(ns: u32) -> Result<(Stream, Option<Tier>)> {
+    let mut service = None;
+    loop {
+        if let Some(stream) = os::connect(ns, NAME)? {
+            return Ok((stream, service));
+        }
+        if ns != os::euid() {
+            return Err(Error::Closed("the RAM tier (its TensorD serves none)".into()));
+        }
+        let mode = platform::contain::host_pressure::HostMode::Shared;
+        service = match platform::contain::host_pressure::Pressure::arm(mode) {
+            Ok(p) => Tier::serve(Pressure::Host(p))?,
+            Err(_) => Tier::serve(Pressure::Headroom)?,
+        };
     }
 }
