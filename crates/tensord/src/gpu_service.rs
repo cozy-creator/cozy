@@ -162,6 +162,10 @@ pub struct PlanSlot {
     /// fetched or warmed before then.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub on_demand: bool,
+    /// Components the model class declares placeable (`@placeable`): in a group, TensorD names
+    /// the GPU that keeps each at Load (`Binding::homes`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placeable: Vec<String>,
 }
 
 /// One `Weights[M]` argument: the checkpoint a call reads raw (never constructed), and the
@@ -1491,11 +1495,18 @@ impl Pool {
                 model: format!("{}@{}", grant.repository, grant.release),
                 ..Default::default()
             };
+            let placeable = model.get("placeable").and_then(serde_json::Value::as_array).into_iter().flatten()
+                .map(|c| c.as_str().map(str::to_owned).ok_or_else(|| invalid("declared placeable component is not a name")))
+                .collect::<io::Result<Vec<_>>>()?;
+            if placeable.iter().any(|c| !binding.components.contains(c)) {
+                return Err(invalid(&format!("a placeable component of {path} is not one it loads")));
+            }
             planned.push(PlanSlot {
                 binding,
                 lane: grant.lane.clone(),
                 selected_encoded_bytes,
                 on_demand: model.get("on_demand").and_then(serde_json::Value::as_bool) == Some(true),
+                placeable,
             });
         }
         let digest = |value: serde_json::Value| -> io::Result<String> {
@@ -3534,7 +3545,7 @@ mod tests {
             installation: "i".into(),
             generation: "g".into(),
             entrypoint: "remove_background".into(),
-            slots: vec![PlanSlot { binding, lane: "fp16".into(), selected_encoded_bytes: 0, on_demand: false }],
+            slots: vec![PlanSlot { binding, lane: "fp16".into(), selected_encoded_bytes: 0, on_demand: false, placeable: vec![] }],
             sources: vec![source],
             degree: 1,
         };
