@@ -841,6 +841,12 @@ impl Inner {
             }
             Err(e) => {
                 tracing::warn!("varena: filling {:?} failed: {e}", job.key);
+                // A sticky error ends the process, and the GPU's kept pages go with it.
+                if e.is_sticky() {
+                    if let Some(c) = &self.custody {
+                        let _ = c.fault();
+                    }
+                }
                 if let Some(h) = st.homes.get_mut(&job.key) {
                     h.filling = false;
                 }
