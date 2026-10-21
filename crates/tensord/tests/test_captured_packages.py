@@ -154,19 +154,19 @@ def test_an_installed_app_the_reader_refuses_fails_the_installation_naming_it(ca
             python_version="3.12", generations=root / "refused-generations", client_wheel=client, python="3.12")
 
 
-def test_a_dependency_conflict_fails_the_installation_naming_it(capture):
-    """The conflict uv's check finds is the failure's detail; a pod's machine log is out of reach."""
+def test_a_dependency_conflict_is_the_runs_warning_never_a_refusal(capture):
+    """The conflict uv's check finds is named in the generation's warning; it installs and runs."""
     root, source, client, frozen = capture
     wheels = root / "conflicted-wheels"
     subprocess.run(["uv", "build", "--wheel", "--out-dir", str(wheels), str(source)], check=True)
     requirements = root / "conflicted-requirements.txt"
     subprocess.run(["uv", "export", "--frozen", "--no-dev", "--no-emit-project", "--project", str(source), "--output-file", str(requirements)], check=True)
     conflicted = app_wheel(wheels, "conflicted_app", "from cozy_runtime.author import App\napp = App()\n", "Requires-Dist: numpy==1.0.0\n")
-    with pytest.raises(PackageError, match="conflicted-app.* requires .numpy==1.0.0.") as raised:
-        install_captured(project=None, wheels=[next(wheels.glob("tensord_cpu_classifier-*.whl")), conflicted],
-            requirements=requirements, distribution="tensord-cpu-classifier", release="0.1.0", python_requires=">=3.12",
-            python_version="3.12", generations=root / "conflicted-generations", client_wheel=client, python="3.12")
-    assert raised.value.code == "package_dependency_conflict"
+    generation = install_captured(project=None, wheels=[next(wheels.glob("tensord_cpu_classifier-*.whl")), conflicted],
+        requirements=requirements, distribution="tensord-cpu-classifier", release="0.1.0", python_requires=">=3.12",
+        python_version="3.12", generations=root / "conflicted-generations", client_wheel=client, python="3.12")
+    assert re.search(r"^uv pip check: .*conflicted-app.* requires .numpy==1\.0\.0.", generation.sdk_fallback), generation.sdk_fallback
+    assert_installed(generation)
 
 
 def test_a_wheel_tagged_for_another_platform_stands_and_a_missed_requirement_refuses(tmp_path):

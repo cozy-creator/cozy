@@ -1201,11 +1201,13 @@ mod tests {
         let _ = fs::remove_dir_all(m.root);
     }
 
-    /// A package pinning a vendored dev Runtime (how unreleased Runtime code is tested; it is
-    /// never published) runs that Runtime where the machine's own pair is refused by its pin, and
-    /// every run says so. Both capture shapes the CLI sends; runs 5252/5274/5276 failed here.
+    /// A package whose lock holds another Runtime than the machine's (here a vendored dev build,
+    /// pinned exactly) runs on the machine's own pair: version skew is allowed. uv's check of its
+    /// pin is the run's warning, never a refusal (card I: an old-pair lock refused, runs
+    /// 12795-12810). A dev Runtime is a machine's through `--runtime-wheel`. Every capture shape
+    /// the CLI sends.
     #[test]
-    fn a_vendored_dev_runtime_runs_where_its_pin_refuses_the_machine_pair() {
+    fn a_lock_of_another_runtime_runs_on_the_machines_pair_with_a_warning() {
         let m = machine("cm-vendored");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let pair = sdk_pair(&m.root);
@@ -1265,18 +1267,19 @@ mod tests {
         for digest in [source, carried, live] {
             let installed = sources.install(&m.service, "alice", &digest, None, "", &|_| ()).unwrap();
             let held = m.service.catalog.resolve(&installed.generation).unwrap();
-            let versions = installed_sdk(&held.record.python);
-            assert!(versions.starts_with(&format!("{dev} ")), "{versions}");
+            assert_eq!(installed_sdk(&held.record.python), format!("{runtime} {}", wheel_version(&pair[1])));
             let why = &held.record.sdk_fallback;
-            assert!(why.contains(&format!("requires `cozy-runtime=={dev}`, but `{runtime}` is installed")), "{why}");
-            assert!(why.ends_with(&format!("it runs the package's own cozy-runtime=={dev}, tensorfs=={}", &versions[dev.len() + 1..])), "{why}");
+            assert!(why.starts_with("uv pip check: ") && why.contains(&format!("requires `cozy-runtime=={dev}`, but `{runtime}` is installed")), "{why}");
+            run(Command::new(&held.record.python).args(["-I", "-c", "import cpu_input"]));
         }
 
-        // A refusal carries its reason: a typed one as itself, a failed operation in uv's words.
-        let refused = |digest: &str| sources.install(&m.service, "alice", digest, None, "", &|_| ()).err().unwrap().message;
+        // Without its vendored wheel it installs all the same: the machine's pair stands in for it.
         let absent = manifest(serde_json::json!({"source": member("source.tar", &archive(&project, &files))}));
-        let why = refused(&absent);
-        assert!(why.contains("package_dependency_operation_failed: uv sync --frozen exited") && why.contains(&format!("vendor/cozy_runtime-{runtime}")), "{why}");
+        let installed = sources.install(&m.service, "alice", &absent, None, "", &|_| ()).unwrap();
+        let held = m.service.catalog.resolve(&installed.generation).unwrap();
+        assert_eq!(installed_sdk(&held.record.python), format!("{runtime} {}", wheel_version(&pair[1])));
+        // A refusal carries its reason, a typed one as itself.
+        let refused = |digest: &str| sources.install(&m.service, "alice", digest, None, "", &|_| ()).err().unwrap().message;
         let python = manifest(serde_json::json!({"source": member("source.tar", &tree), "python_requires": ">=4"}));
         let why = refused(&python);
         assert!(why.starts_with("package_python_unavailable: configured interpreter does not satisfy"), "{why}");
@@ -1319,7 +1322,7 @@ mod tests {
         let held = m.service.catalog.resolve(&installed.generation).unwrap();
         assert_eq!(installed_sdk(&held.record.python), format!("{dev} {}", wheel_version(&pair[1])));
         assert_eq!(held.record.sdk_fallback, format!(
-            "The package `tensord-cpu-input` requires `cozy-runtime=={runtime}`, but `{dev}` is installed; \
+            "uv pip check: The package `tensord-cpu-input` requires `cozy-runtime=={runtime}`, but `{dev}` is installed; \
              this machine's development Runtime {build} (`--runtime-wheel`) runs it regardless"));
         let _ = fs::remove_dir_all(&m.root);
     }

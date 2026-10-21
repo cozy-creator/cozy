@@ -917,13 +917,13 @@ impl Publisher {
         let compile = |last: bool| if last { "--compile-bytecode" } else { "--no-compile-bytecode" };
         let hosted: Vec<String> = files.iter().map(HubFile::distribution).collect();
         let lock_sdk: Vec<&str> = SDK.into_iter().filter(|n| own_sdk && locked.packages.contains_key(*n)).collect();
-        let sync = |sdk_too: bool, last: bool| -> Result<(), Failure> {
+        let sync = |last: bool| -> Result<(), Failure> {
             let project = project.to_string_lossy();
             // The release's own `[tool.uv]` settings hold (its build settings for a source-only
             // row): no `--no-config`.
             let mut args = vec!["sync", "--frozen", "--inexact", "--no-dev", "--no-install-project",
                 "--project", &project, "--python", &py, compile(last)];
-            let held = locked.git.iter().chain(&hosted).map(String::as_str).chain(lock_sdk.iter().copied().filter(|_| !sdk_too));
+            let held = locked.git.iter().chain(&hosted).map(String::as_str).chain(lock_sdk.iter().copied());
             for name in held {
                 args.extend(["--no-install-package", name]);
             }
@@ -931,7 +931,7 @@ impl Publisher {
                 .map_err(|failure| platform(failure, package, release))
         };
         next();
-        sync(false, wheels.is_empty() && !own_sdk && !client)?;
+        sync(wheels.is_empty() && !own_sdk && !client)?;
         if !wheels.is_empty() {
             let paths: Vec<String> = wheels.iter().map(|w| w.to_string_lossy().into_owned()).collect();
             let mut args = vec!["pip", "install", "--no-config", "--python", &py, compile(!own_sdk && !client), "--no-deps"];
@@ -942,11 +942,11 @@ impl Publisher {
             let pins = self.export_pins(&project, &lock_sdk, job.stop.as_ref())?;
             fs::write(dir.join("constraints.txt"), pins).map_err(io_failure)?;
         }
-        let (mut sdk_choice, mut sdk_fallback) = ("locked", String::new());
+        // The machine's own pair when it has one, whatever the lock's: its findings warn.
+        let (sdk_choice, mut sdk_fallback) = (if own_sdk { "machine" } else { "locked" }, String::new());
         if own_sdk {
             next();
-            let restore = || sync(true, !client);
-            (sdk_choice, sdk_fallback) = self.install_sdk(&py, &dir, &lock_sdk, &restore, compile(!client), job.stop.as_ref())?;
+            sdk_fallback = self.install_sdk(&py, &dir, compile(!client), job.stop.as_ref())?;
             if !sdk_fallback.is_empty() {
                 tracing::warn!("package {package} {release}: {sdk_fallback}");
                 job.stage(format!("warning: {sdk_fallback}"));
@@ -1085,61 +1085,47 @@ impl Publisher {
         Ok(Some(lock))
     }
 
-    /// This machine's own Runtime and TensorFS in an environment holding a release's locked
-    /// requirements, where the package's bounds admit them (uv's check of every installed
-    /// requirement); else the release's locked pair (`restore`), and why. A development Runtime
-    /// an update named (`--runtime-wheel`) is the operator's choice: it runs whatever the
-    /// package's bounds on the pair, which the warning names, and one that cannot install
-    /// refuses the release. Returns which SDK the environment holds and its run warning, if
-    /// any: never silent.
-    fn install_sdk(&self, py: &str, dir: &Path, locked: &[&str], restore: &dyn Fn() -> Result<(), Failure>, compile: &str,
-        stop: Option<&Stop>) -> Result<(&'static str, String), Failure> {
+    /// This machine's own Runtime and TensorFS over a release's locked requirements, always.
+    /// Every other locked version stays exact: the lock's pins constrain the install, and a pin
+    /// the pair's own requirements reject keeps the lock's version while the pair goes in
+    /// without its dependencies. What uv's check finds that the pair adds, the package's bounds
+    /// on the pair included, is the run's warning, never a refusal: a real import failure names
+    /// itself when it runs. Returns that warning; empty when there is none.
+    fn install_sdk(&self, py: &str, dir: &Path, compile: &str, stop: Option<&Stop>) -> Result<String, Failure> {
         let constraints = dir.join("constraints.txt").to_string_lossy().to_string();
-        let mut args = vec!["pip", "install", "--no-config", "--python", py, compile, "--constraints", &constraints];
         let links = self.sdk.find_links.as_ref().map(|p| p.to_string_lossy().to_string());
-        if let Some(links) = &links {
-            args.extend(["--find-links", links]);
-        }
-        args.extend(self.sdk.requirements.iter().map(String::as_str));
-        // What the release's own closure reports already stands (NVIDIA's aarch64 cusparseLt
-        // wheel is tagged `sbsa`, so uv flags it on every Linux arm64 machine): the pair is
-        // refused only for a finding it adds. uv's failure names its step and its output.
-        let before = self.check(py, stop)?;
-        let own = self.uv(&args, stop).and_then(|()| {
-            let added: Vec<String> = self.check(py, stop)?.difference(&before).cloned().collect();
-            match added.is_empty() {
-                true => Ok(()),
-                false => Err(("package_installation_uv_failed", format!("uv pip check:\n{}", added.join("\n")))),
+        let install = |how: &[&str]| {
+            let mut args = vec!["pip", "install", "--no-config", "--python", py, compile];
+            args.extend(how);
+            if let Some(links) = &links {
+                args.extend(["--find-links", links]);
             }
-        });
-        let Err((code, detail)) = own else {
-            return Ok(("machine", String::new()));
+            args.extend(self.sdk.requirements.iter().map(String::as_str));
+            self.uv(&args, stop)
         };
-        let build = &self.sdk.runtime_build;
-        if code == CANCELED {
-            return Err((code, detail));
-        } else if !build.is_empty() {
-            // uv's check names each requirement the installed pair misses; any other failure
-            // (the pair's own dependencies against the lock's) leaves nothing it could run.
-            let missed: Vec<&str> = detail.lines().map(str::trim).filter(|l| l.starts_with("The package `")).collect();
-            if missed.is_empty() || !missed.iter().all(|l| pair_bound(l)) {
-                return Err((code, format!("this machine's development Runtime {build} cannot run this release: {detail}")));
+        // What the release's own closure reports already stands (NVIDIA's aarch64 cusparseLt
+        // wheel is tagged `sbsa`, so uv flags it on every Linux arm64 machine).
+        let before = self.check(py, stop)?;
+        let mut warnings = vec![];
+        if let Err((code, detail)) = install(&["--constraints", &constraints]) {
+            if code == CANCELED {
+                return Err((code, detail));
             }
-            return Ok(("machine", format!("{}; this machine's development Runtime {build} (`--runtime-wheel`) runs it regardless", missed.join("; "))));
+            install(&["--no-deps"])?;
+            warnings.push(format!(
+                "this machine's Runtime and TensorFS want versions the release's lock does not hold, which it keeps ({})",
+                crate::triage::ends(&detail, 1000)
+            ));
         }
-        if locked.is_empty() {
-            return Err((code, detail));
+        let added: Vec<String> = self.check(py, stop)?.difference(&before).cloned().collect();
+        if !added.is_empty() {
+            warnings.push(format!("uv pip check: {}", added.join("; ")));
         }
-        let detail: Vec<&str> = detail.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-        let detail = detail[detail.len().saturating_sub(12)..].join(" | ");
-        // The locked pair failing too (TensorFS's sdist on aarch64) still names why the machine's did not.
-        restore().map_err(|(locked_code, why)| (locked_code, format!(
-            "{why}; this machine's own Runtime and TensorFS did not install first ({code}: {})", crate::triage::ends(&detail, 1000))))?;
-        Ok(("locked", format!(
-            "this machine's own Runtime and TensorFS did not install ({code}: {}); it runs the release's locked {}",
-            crate::triage::ends(&detail, 2000),
-            locked.join(", ")
-        )))
+        let build = &self.sdk.runtime_build;
+        if !warnings.is_empty() && !build.is_empty() {
+            warnings.push(format!("this machine's development Runtime {build} (`--runtime-wheel`) runs it regardless"));
+        }
+        Ok(warnings.join("; "))
     }
 
     fn uv(&self, args: &[&str], stop: Option<&Stop>) -> Result<(), Failure> {
@@ -1881,16 +1867,6 @@ pub fn describe_environment(
     }
 }
 
-/// uv's check line for a bound on the machine's own pair that the installed pair misses:
-/// "The package `anima` requires `cozy-runtime[media]>=0.24.7`, but `0.24.6` is installed".
-fn pair_bound(line: &str) -> bool {
-    let required = line.split_once("` requires `").and_then(|(_, rest)| rest.split_once("`, but `")).map(|(r, _)| r);
-    required.is_some_and(|r| {
-        let end = r.find(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))).unwrap_or(r.len());
-        SDK.contains(&normalized(&r[..end]).as_str())
-    })
-}
-
 /// The Runtime and TensorFS an environment holds, by their installed distribution names.
 fn installed_sdk(env: &Path) -> Vec<Value> {
     let mut found: Vec<Value> = platform::paths::venv_site_packages(env)
@@ -2316,57 +2292,84 @@ pub(crate) mod tests {
         assert_eq!(newest_release(&catalog, "acme", "only-pre").unwrap(), "1.0.0rc2");
     }
 
-    /// The machine's own Runtime goes into an environment whose packages admit it; one whose
-    /// bounds refuse it runs the release's locked one, and the generation says why (uv's own
-    /// words) and which. Real uv, wheels and lock; no network.
+    /// This machine's own Runtime and TensorFS go into every environment, whatever the lock's
+    /// pair and the package's bounds on it. An H3-like lock of Runtime 0.27 / TensorFS 0.10, its
+    /// package bounded below 0.28 / 0.11, installs and runs on a 0.30 / 0.13 machine with every
+    /// other locked version exact; uv's check of those bounds is the run's warning, never a
+    /// refusal. A locked pin the pair's own requirements reject is kept, and the pair goes in
+    /// without its dependencies. Real uv, wheels and locks; no network.
     #[test]
-    fn a_refused_machine_sdk_falls_back_to_the_locked_one_and_says_so() {
+    fn an_old_pair_lock_runs_on_the_machines_pair_with_a_warning() {
         let root = std::env::temp_dir().join(format!("cm-sdk-{}", uuid::Uuid::new_v4()));
         let (wheels, own) = (root.join("wheels"), root.join("own"));
-        fs::create_dir_all(&wheels).unwrap();
-        fs::create_dir_all(&own).unwrap();
-        let machine = tiny_wheel(&own, "cozy-runtime", "9.0", &[]);
-        tiny_wheel(&wheels, "cozy-runtime", "1.0", &[]);
-        tiny_wheel(&wheels, "needs-old", "1.0", &["cozy-runtime<2"]);
-        tiny_wheel(&wheels, "takes-any", "1.0", &["cozy-runtime"]);
-        let sdk = PackageSdk {
-            uv: PathBuf::from("uv"),
-            python: "3.12".into(),
-            requirements: vec![machine.to_string_lossy().into()],
-            ..Default::default()
+        for dir in [&wheels, &own] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let pair = [tiny_wheel(&own, "cozy-runtime", "0.30.0", &[]), tiny_wheel(&own, "tensorfs", "0.13.0", &[])];
+        tiny_wheel(&wheels, "cozy-runtime", "0.27.0", &[]);
+        tiny_wheel(&wheels, "tensorfs", "0.10.0", &[]);
+        tiny_wheel(&wheels, "cz-h3-app", "1.0", &["cozy-runtime<0.28", "tensorfs<0.11"]);
+        tiny_wheel(&wheels, "cz-takes-any", "1.0", &["cozy-runtime"]);
+        tiny_wheel(&wheels, "cz-pinned", "1.0", &[]);
+        tiny_wheel(&wheels, "cz-pinned", "2.0", &[]);
+        tiny_wheel(&wheels, "cz-holds-pinned", "1.0", &["cz-pinned==1.0"]);
+        let publisher = |requirements: Vec<String>| {
+            let sdk = PackageSdk { uv: PathBuf::from("uv"), python: "3.12".into(), requirements,
+                find_links: Some(wheels.clone()), ..Default::default() };
+            let store = crate::storage::open(&root.join(format!("tensorfs-{}", uuid::Uuid::new_v4()))).unwrap();
+            Publisher::new(&root.join("published"), sdk, crate::origin::Machine::new(store, None).unwrap()).unwrap()
         };
-        let store = crate::storage::open(&root.join("tensorfs")).unwrap();
-        let publisher = Publisher::new(&root.join("published"), sdk, crate::origin::Machine::new(store, None).unwrap()).unwrap();
+        let machine = publisher(pair.iter().map(|w| w.to_string_lossy().into()).collect());
         let generations = root.join("generations");
+        let held = |record: &crate::catalog::Generation| -> Vec<(String, String)> {
+            record.dependencies.iter().map(|d| (d.name.clone(), d.version.clone())).collect()
+        };
+        let pair_held = vec![("cozy-runtime".to_string(), "0.30.0".to_string()), ("tensorfs".to_string(), "0.13.0".to_string())];
+        // Run: the environment imports what it holds, at the versions it holds.
+        let runs = |identity: &str, names: &[&str]| -> String {
+            let python = platform::paths::venv_python(&generations.join(identity).join("env"));
+            let script = format!(
+                "import importlib, importlib.metadata as m\nfor n in {names:?}: importlib.import_module(n.replace('-', '_'))\nprint(' '.join(m.version(n) for n in {names:?}))"
+            );
+            let out = Command::new(python).args(["-I", "-c", &script]).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
 
-        let (pyproject, lock) = locked(&root.join("admits"), &["takes-any"], &wheels, "");
+        // A lock whose packages admit the machine's pair: no warning.
+        let (pyproject, lock) = locked(&root.join("admits"), &["cz-takes-any"], &wheels, "");
         let admits = card(pyproject, lock);
-        let (record, stages) = generate_after(&publisher, &generations, "admits", &admits, None).unwrap();
-        assert_eq!(record.sdk_fallback, "");
-        let held: Vec<_> = record.dependencies.iter().map(|d| (d.name.as_str(), d.version.as_str())).collect();
-        assert_eq!(held, [("cozy-runtime", "9.0")]);
+        let (record, stages) = generate_after(&machine, &generations, "admits", &admits, None).unwrap();
+        assert_eq!((record.sdk_fallback.as_str(), held(&record)), ("", pair_held.clone()));
         // One stage to the person, its steps counted; linking the machine's pair in is a step of
         // the install, never named as an update.
         let first = "installing acme/app 1.0 on this machine (first run of this release)";
         assert_eq!(stages, [format!("{first} 1/3"), format!("{first} 2/3"), format!("{first} 3/3")]);
-        // Another environment of the release (here, another SDK's identity) with the same pair.
-        let (_, stages) = generate_after(&publisher, &generations, "admits-again", &admits, Some(&record)).unwrap();
+        let (_, stages) = generate_after(&machine, &generations, "admits-again", &admits, Some(&record)).unwrap();
         let again = "installing acme/app 1.0 on this machine";
         assert_eq!(stages, [format!("{again} 1/3"), format!("{again} 2/3"), format!("{again} 3/3")]);
 
-        let (pyproject, lock) = locked(&root.join("refuses"), &["needs-old"], &wheels, "");
-        let record = generate(&publisher, &generations, "refuses", &card(pyproject, lock)).unwrap();
+        // The old pair's lock: the machine's pair, its bounds a warning; it runs.
+        let (pyproject, lock) = locked(&root.join("old-pair"), &["cz-h3-app"], &wheels, "");
+        assert!(lock.contains("version = \"0.27.0\"") && lock.contains("version = \"0.10.0\""), "{lock}");
+        let record = generate(&machine, &generations, "old-pair", &card(pyproject, lock)).unwrap();
+        assert_eq!(held(&record), pair_held);
         let why = &record.sdk_fallback;
-        assert!(why.contains("uv pip check") && why.contains("needs-old"), "{why}");
-        assert!(why.ends_with("it runs the release's locked cozy-runtime"), "{why}");
-        let held: Vec<_> = record.dependencies.iter().map(|d| (d.name.as_str(), d.version.as_str())).collect();
-        assert_eq!(held, [("cozy-runtime", "1.0")]);
+        assert!(why.starts_with("uv pip check: ") && why.contains("cz-h3-app"), "{why}");
+        assert_eq!(runs("old-pair", &["cozy-runtime", "tensorfs", "cz-h3-app"]), "0.30.0 0.13.0 1.0");
+
+        // A pair whose own requirement a locked pin rejects: the pin stays, the pair goes in.
+        let wants = publisher(vec![tiny_wheel(&own, "cozy-runtime", "0.31.0", &["cz-pinned>=2"]).to_string_lossy().into()]);
+        let (pyproject, lock) = locked(&root.join("cz-pinned"), &["cz-holds-pinned", "cz-takes-any"], &wheels, "");
+        let record = generate(&wants, &generations, "cz-pinned", &card(pyproject, lock)).unwrap();
+        assert!(record.sdk_fallback.contains("want versions the release's lock does not hold"), "{}", record.sdk_fallback);
+        assert_eq!(runs("cz-pinned", &["cozy-runtime", "cz-pinned", "cz-holds-pinned"]), "0.31.0 1.0 1.0");
         let _ = fs::remove_dir_all(root);
     }
 
     /// A finding the release's own closure carries (NVIDIA's aarch64 cusparseLt wheel is tagged
-    /// `sbsa`, which uv's check flags) keeps the machine's pair: only a finding the pair adds
-    /// refuses it. Real uv and lock; no network.
+    /// `sbsa`, which uv's check flags) is no warning: only a finding the pair adds is one.
+    /// Real uv and lock; no network.
     #[test]
     fn a_finding_the_lock_already_carries_keeps_the_machines_sdk() {
         let root = std::env::temp_dir().join(format!("cm-sdk-sbsa-{}", uuid::Uuid::new_v4()));
@@ -2510,7 +2513,7 @@ pub(crate) mod tests {
         for (package, floor, warning) in [
             ("meets", "cozy-runtime>=2.1", String::new()),
             ("misses", "cozy-runtime[media]>=3", format!(
-                "The package `misses` requires `cozy-runtime[media]>=3`, but `2.1` is installed; \
+                "uv pip check: The package `misses` requires `cozy-runtime[media]>=3`, but `2.1` is installed; \
                  this machine's development Runtime {build} (`--runtime-wheel`) runs it regardless"
             )),
         ] {
