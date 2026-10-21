@@ -23,6 +23,7 @@ use crate::store::{fault, Durability, Store};
 
 const WORK: &str = ".store1-migration";
 const PREPARED: &str = "prepared.json";
+const RETAINED: &str = "local/store1-recovered";
 const FORMAT3: &[u8] = b"{\"format\":\"tensorfs.store/3\"}";
 const FENCE: &[u8] = b"TensorFS store1 manifests were retained in .store1-migration/legacy-manifests. This store was converted; use TensorFS 0.13 or an explicit offline rollback.\n";
 
@@ -39,6 +40,10 @@ pub struct Report {
     pub checkpoints: Vec<Checkpoint>,
     /// A stopped old SDK's exact source-selection identity, retained as a private tag.
     pub aliases: BTreeMap<String, String>,
+    /// Historical public checkpoints no current release names. Their original published facts
+    /// remain verbatim in repos/; local private retention is not anonymous-public equivalence.
+    #[serde(default)]
+    pub published_orphans: BTreeMap<String, Vec<ObjectRef>>,
 }
 
 /// Keep this descriptor until the new machine relinquishes the store. Reclaiming owner.lock
@@ -334,6 +339,7 @@ fn prepare(root: &Path, work: &Path, original_format: Option<Vec<u8>>) -> Result
         repos: 0,
         checkpoints: Vec::new(),
         aliases: BTreeMap::new(),
+        published_orphans: BTreeMap::new(),
     };
     let mut cited = BTreeSet::new();
     let mut migrator = Migrator::offline();
@@ -360,6 +366,18 @@ fn prepare(root: &Path, work: &Path, original_format: Option<Vec<u8>>) -> Result
                 detail: "store1 repo has no name".into(),
             })?;
         let name = format!("{org}/{model}");
+        if name.eq_ignore_ascii_case(RETAINED) {
+            return fail(
+                Kind::Conflict,
+                format!("{RETAINED} already exists; no user alias was overwritten"),
+            );
+        }
+        if path != root.join(format!("repos/{name}.json")) {
+            return invalid(format!(
+                "{} does not match repository {name}",
+                path.display()
+            ));
+        }
         if !names.insert(name.to_ascii_lowercase()) {
             return invalid(format!("duplicate store1 repository {name}"));
         }
@@ -379,9 +397,25 @@ fn prepare(root: &Path, work: &Path, original_format: Option<Vec<u8>>) -> Result
             .iter()
             .map(|c| object(&c["manifest"], &name))
             .collect::<Result<Vec<_>>>()?;
+        if roots.iter().collect::<BTreeSet<_>>().len() != roots.len()
+            || checkpoints.iter().any(|c| !c["published"].is_boolean())
+        {
+            return invalid(format!(
+                "{name}: duplicate checkpoint or invalid published fact"
+            ));
+        }
         cited.extend(roots.iter().cloned());
         let mut versions = Vec::new();
+        let mut released = BTreeSet::new();
         for r in releases {
+            if !r["version"].is_string()
+                || !r["yanked"].is_boolean()
+                || !r["revision"].as_u64().is_some_and(|r| r > 0)
+            {
+                return invalid(format!(
+                    "{name}: invalid release version, revision or yanked fact"
+                ));
+            }
             let mut lanes = BTreeMap::new();
             for l in r["lanes"]
                 .as_array()
@@ -395,13 +429,26 @@ fn prepare(root: &Path, work: &Path, original_format: Option<Vec<u8>>) -> Result
                     detail: format!("{name}: lane has no name"),
                 })?;
                 let o = object(&l["manifest"], &name)?;
-                if !roots.contains(&o) || lanes.insert(lane, o).is_some() {
+                released.insert(o.clone());
+                if !checkpoints.iter().any(|c| {
+                    c["published"] == true && object(&c["manifest"], &name).is_ok_and(|m| m == o)
+                }) || lanes.insert(lane, o).is_some()
+                {
                     return invalid(format!(
                         "{name}: duplicate lane or unretained release checkpoint"
                     ));
                 }
             }
             versions.push(json!({"version": r["version"], "lanes": lanes, "yanked": r["yanked"]}));
+        }
+        let orphans = checkpoints
+            .iter()
+            .zip(&roots)
+            .filter(|(c, o)| c["published"] == true && !released.contains(*o))
+            .map(|(_, o)| o.clone())
+            .collect::<Vec<_>>();
+        if !orphans.is_empty() {
+            report.published_orphans.insert(name.clone(), orphans);
         }
         let local = org.eq_ignore_ascii_case("local");
         let selection = if local {
@@ -441,24 +488,34 @@ fn prepare(root: &Path, work: &Path, original_format: Option<Vec<u8>>) -> Result
         report.repos += 1;
     }
     let orphaned: Vec<_> = all.difference(&cited).cloned().collect();
+    let mut retained = Repo::new(RETAINED);
     if !orphaned.is_empty() {
-        let name = "local/store1-recovered";
-        if names.contains(name) {
-            return fail(
-                Kind::Conflict,
-                format!("{name} already exists; no retained checkpoint was renamed"),
-            );
-        }
-        let repo = convert(
+        retained = convert(
             root,
             &stage,
             &mut migrator,
-            json!({"name": name, "checkpoints": orphaned}),
+            json!({"name": RETAINED, "checkpoints": orphaned}),
             &mut report,
         )?;
-        stage.update_ref(name, |_| Some(repo))?;
-        names.insert(name.into());
-        report.repos += 1;
+    }
+    // A store1 authored repo need not be named local/. Store3 non-local refs are caches, so
+    // root every migrated tree through the existing local-ref retention regime. These exact
+    // digest tags are only added here, never moved by replay or made public.
+    for checkpoint in &report.checkpoints {
+        retained.set_tag(&checkpoint.manifest.sha256, checkpoint.tree.clone());
+    }
+    for repo in stage
+        .refs()?
+        .into_iter()
+        .filter(|r| names.contains(&r.name.to_ascii_lowercase()))
+    {
+        for tree in repo.roots() {
+            retained.set_tag(&tree.sha256, tree.clone());
+        }
+    }
+    if !retained.tags.is_empty() {
+        stage.update_ref(RETAINED, |_| Some(retained))?;
+        names.insert(RETAINED.into());
     }
     report
         .checkpoints
@@ -567,6 +624,7 @@ fn publish(root: &Path, work: &Path, p: &Prepared) -> Result<()> {
     }
     for (relative, bytes) in &p.records {
         if relative.is_absolute()
+            || !(relative.starts_with("refs") || relative.starts_with("uses"))
             || relative
                 .components()
                 .any(|c| !matches!(c, std::path::Component::Normal(_)))
@@ -584,7 +642,8 @@ fn publish(root: &Path, work: &Path, p: &Prepared) -> Result<()> {
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                durable::replace(&path, bytes, 0o600).map_err(std::io::Error::from)?
+                // Match ordinary Store records. TensorD may launch a configured executor UID.
+                durable::replace(&path, bytes, 0o644).map_err(std::io::Error::from)?
             }
             Err(e) => return Err(e.into()),
         }
