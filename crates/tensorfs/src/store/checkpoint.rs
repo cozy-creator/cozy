@@ -78,7 +78,7 @@ impl Checkpoint {
             Objects::Store(store) | Objects::Folder { cache: Some(store), .. } => {
                 let mut held: Vec<String> = std::iter::once(&id).chain(header.objects()).map(|o| o.sha256.clone()).collect();
                 if let Objects::Folder { dir, .. } = &objects {
-                    let real = fs::canonicalize(dir).ok();
+                    let real = platform::durable::canonical(dir).ok();
                     let snapshot = real.as_deref().and_then(|r| r.strip_prefix(store.root().join("snapshots")).ok());
                     held.extend(snapshot.and_then(|p| p.iter().next()?.to_str().map(str::to_owned)));
                 }

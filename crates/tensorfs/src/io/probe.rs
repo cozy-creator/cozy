@@ -162,7 +162,8 @@ pub(crate) fn keep(key: &str, values: &[f64]) {
     MEMO.lock().unwrap().insert(key.clone(), values.to_vec());
     let line: String = values.iter().map(|v| format!("\t{v}")).collect();
     let _ = fs::create_dir_all(path.parent().expect("the table has a directory"));
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+    // Windows locks need read or write access, which append alone does not grant.
+    if let Ok(mut f) = OpenOptions::new().read(true).create(true).append(true).open(path) {
         if f.lock().is_ok() {
             let _ = f.write_all(format!("{key}{line}\n").as_bytes());
         }

@@ -175,10 +175,8 @@ fn check(store: &Store) {
 fn age(store: &Store, objects: impl IntoIterator<Item = ObjectRef>, by: Duration) {
     let then = SystemTime::now() - by;
     for object in objects {
-        File::open(store.path(&object).unwrap())
-            .unwrap()
-            .set_modified(then)
-            .unwrap();
+        let times = std::fs::FileTimes::new().set_modified(then);
+        platform::durable::set_times(&store.path(&object).unwrap(), times).unwrap();
     }
 }
 
@@ -679,8 +677,8 @@ fn collect_drops_the_least_recently_used_first_and_never_a_root() {
     // One use of each but m3, the oldest first.
     for (tree, hours) in [(&m1, 3), (&m2, 2), (&e, 1)] {
         drop(store.variant(tree, None).unwrap());
-        let used = File::open(store.root().join("uses").join(&tree.sha256)).unwrap();
-        used.set_modified(SystemTime::now() - hours * HOUR).unwrap();
+        let times = std::fs::FileTimes::new().set_modified(SystemTime::now() - hours * HOUR);
+        platform::durable::set_times(&store.root().join("uses").join(&tree.sha256), times).unwrap();
     }
     age(&store, blobs(&store), 2 * HOUR);
 

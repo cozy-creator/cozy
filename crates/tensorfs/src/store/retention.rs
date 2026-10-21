@@ -50,7 +50,7 @@ impl Hold {
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(fail("create", &path)(e)),
             };
-            file.lock().map_err(fail("lock", &path))?;
+            platform::lock::try_claim(&file).map_err(platform("claim", &path))?;
             let hold = Hold { store: store.clone(), file, held: Mutex::default() };
             hold.extend(digests)?;
             return Ok(Arc::new(hold));
@@ -178,7 +178,7 @@ impl Store {
     /// Roots `header` while the file at `path` (absolute) holds it: one record per path, so saving
     /// another header there replaces it.
     pub(crate) fn root_file(&self, path: &Path, header: &ObjectRef) -> Result<()> {
-        let path = fs::canonicalize(path).map_err(fail("resolve", path))?;
+        let path = platform::durable::canonical(path).map_err(platform("resolve", path))?;
         let id = ObjectRef::of(path.as_os_str().as_encoded_bytes()).sha256;
         let record = self.root.join("files").join(id);
         let root = FileRoot { path, header: header.clone() };
@@ -199,10 +199,10 @@ impl Store {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(fail("open", &path)(e)),
             };
-            match file.try_lock() {
-                Ok(()) => drop(fs::remove_file(&path)),
-                Err(TryLockError::WouldBlock) => roots.extend(lines(&path)?.unwrap_or_default()),
-                Err(TryLockError::Error(e)) => return Err(fail("lock", &path)(e)),
+            // The claim, not the file, says its holder lives: a Windows lock would bar reading it.
+            match platform::lock::try_claim(&file).map_err(platform("claim", &path))? {
+                true => drop(fs::remove_file(&path)),
+                false => roots.extend(lines(&path)?.unwrap_or_default()),
             }
         }
         for record in list(&self.root.join("files"))? {

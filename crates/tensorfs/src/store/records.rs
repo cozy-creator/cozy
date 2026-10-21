@@ -271,7 +271,7 @@ mod tests {
         let store = Store::open(&scratch.0).unwrap();
         assert_eq!(
             store.ref_path("AcMe/Model.v1").unwrap(),
-            scratch.0.join("refs/acme/model.v1.json")
+            store.root().join("refs").join("acme").join("model.v1.json")
         );
         assert_eq!(
             store.ref_path("AcMe Space/MODEL%?").unwrap(),
@@ -307,7 +307,7 @@ mod tests {
         names.push(format!("{}/{}", "a".repeat(200), "b".repeat(300)));
         for name in &names {
             let path = store.ref_path(name).unwrap();
-            for part in path.strip_prefix(scratch.0.join("refs")).unwrap().iter() {
+            for part in path.strip_prefix(store.root().join("refs")).unwrap().iter() {
                 let text = part.to_str().unwrap();
                 assert!(text.len() <= 133 && text.is_ascii());
                 assert!(

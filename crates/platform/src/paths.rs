@@ -132,6 +132,17 @@ pub fn venv_site_packages(venv: &Path) -> Option<PathBuf> {
         .find(|site| site.is_dir())
 }
 
+/// The directory a `file://` URL or a plain path names, when absolute: `file:///C:/x` is `C:/x` on
+/// Windows, `file:///x` is `/x` elsewhere.
+pub fn file_url_path(url: &str) -> Option<PathBuf> {
+    let path = url.strip_prefix("file://").unwrap_or(url);
+    let path = match path.as_bytes() {
+        [b'/', drive, b':', ..] if cfg!(windows) && drive.is_ascii_alphabetic() => &path[1..],
+        _ => path,
+    };
+    Some(PathBuf::from(path)).filter(|path| path.is_absolute())
+}
+
 /// The PATH every executor starts from, never the machine's PATH: the tools cozy pinned in `tools`
 /// (`Home::tools`), then this OS's own program directories. On Windows those are System32 (a
 /// current driver's `nvidia-smi` and `nvml.dll`), the Windows directory and Program Files'

@@ -477,8 +477,14 @@ async fn an_object_is_fetched_once_and_priority_orders_the_queue() {
             ..Want::default()
         },
     );
-    let (first, second) = tokio::join!(fetcher.objects(&origin, &a, &later), async {
-        while server.blob_asks().is_empty() {
+    let ended = std::sync::atomic::AtomicBool::new(false);
+    let (first, second) = tokio::join!(async {
+        let first = fetcher.objects(&origin, &a, &later).await;
+        ended.store(true, std::sync::atomic::Ordering::Release);
+        first
+    }, async {
+        // A first pull that fails before it asks for a blob ends the wait.
+        while server.blob_asks().is_empty() && !ended.load(std::sync::atomic::Ordering::Acquire) {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         fetcher.objects(&origin, &urgent, &sooner).await

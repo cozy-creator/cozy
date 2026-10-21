@@ -1,7 +1,7 @@
 //! Public Writer identities remain usable for the same cache lifetime as their headers.
 #![cfg(feature = "store")]
 
-use std::fs::{self, File, FileTimes};
+use std::fs::{self, FileTimes};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -84,10 +84,7 @@ async fn returned_writer_tree_survives_gc_for_the_header_cache_lifetime() {
     let old = SystemTime::now() - tensorfs::store::GRACE - Duration::from_secs(60);
     for object in [&header, &tree, &stale].into_iter().chain(&payload) {
         let path = cache.join(object.key());
-        File::open(&path)
-            .unwrap()
-            .set_times(FileTimes::new().set_accessed(old).set_modified(old))
-            .unwrap();
+        platform::durable::set_times(&path, FileTimes::new().set_accessed(old).set_modified(old)).unwrap();
         assert!(
             fs::metadata(path).unwrap().modified().unwrap()
                 < SystemTime::now() - tensorfs::store::GRACE

@@ -60,12 +60,8 @@ fn sparse(from: &Path, to: &Path) {
         .unwrap_or(0);
     fs::create_dir_all(to.parent().unwrap()).unwrap();
     fs::write(to, &raw[..8 + n]).unwrap();
-    fs::File::options()
-        .write(true)
-        .open(to)
-        .unwrap()
-        .set_len((8 + n) as u64 + end)
-        .unwrap();
+    let file = fs::File::options().write(true).open(to).unwrap();
+    platform::durable::set_sparse_len(&file, (8 + n) as u64 + end).unwrap();
 }
 
 type Tensors = BTreeMap<(String, String), (Dtype, Vec<u64>, Vec<u8>)>;

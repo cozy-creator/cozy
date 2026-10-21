@@ -978,8 +978,11 @@ impl Writer {
             good += line.len();
         }
         if good < bytes.len() {
-            journal
-                .set_len(good as u64)
+            // Not through the append handle: Windows truncates only through one that may write.
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_len(good as u64))
                 .map_err(fail("truncate", &path))?;
         }
         for line in lines {

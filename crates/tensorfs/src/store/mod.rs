@@ -186,7 +186,7 @@ impl Store {
     pub fn open(root: impl Into<PathBuf>) -> Result<Store> {
         let root = root.into();
         fs::create_dir_all(&root).map_err(fail("create", &root))?;
-        let root = fs::canonicalize(&root).map_err(fail("resolve", &root))?;
+        let root = platform::durable::canonical(&root).map_err(platform("resolve", &root))?;
         let record = root.join("format");
         match fs::read(&record) {
             Ok(bytes) => {

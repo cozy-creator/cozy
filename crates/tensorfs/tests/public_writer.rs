@@ -444,7 +444,7 @@ fn expire_cache(cache: &Path) {
     let ttl = tensorfs::store::TTL;
     let then = std::time::SystemTime::now() - ttl * 2;
     for entry in fs::read_dir(cache.join("uses")).unwrap() {
-        fs::File::open(entry.unwrap().path()).unwrap().set_modified(then).unwrap();
+        platform::durable::set_times(&entry.unwrap().path(), fs::FileTimes::new().set_modified(then)).unwrap();
     }
     let store = tensorfs::store::Store::open(cache).unwrap();
     store.with_grace(std::time::Duration::ZERO).collect(u64::MAX, ttl).unwrap();

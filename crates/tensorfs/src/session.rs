@@ -194,9 +194,8 @@ impl Client {
     pub async fn open(&self, name_or_path: &str, options: &Open) -> Result<Checkpoint> {
         let path = Path::new(name_or_path);
         let checkpoint = if path.exists() {
-            let path = path
-                .canonicalize()
-                .map_err(|e| io_failure(path.display(), e))?;
+            let path = platform::durable::canonical(path)
+                .map_err(|e| io_failure(path.display(), e.into()))?;
             let raw = crate::store::Checkpoint::folder(
                 &path,
                 options.variant.as_deref(),

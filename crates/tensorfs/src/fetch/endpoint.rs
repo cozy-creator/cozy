@@ -127,11 +127,10 @@ impl Endpoint {
             client.policy().admit(&base)?;
             At::Http(base)
         } else {
-            let path = url.strip_prefix("file://").unwrap_or(&url);
-            if !path.starts_with('/') {
+            let Some(path) = platform::paths::file_url_path(&url) else {
                 return refuse(Code::SOURCE_NOT_ALLOWED, format!("{url}: not an https://, loopback http:// or file:/// endpoint"));
-            }
-            At::Dir(PathBuf::from(path), OnceLock::new())
+            };
+            At::Dir(path, OnceLock::new())
         };
         let token = match at {
             At::Http(_) => token.or_else(|| default_for(&url)),

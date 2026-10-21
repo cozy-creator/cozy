@@ -6,13 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use platform::durable::FileAt;
 
 use serde::Deserialize;
 
@@ -902,7 +902,8 @@ fn land_in(m: &Member, dest: &Path, access: &Scope<'_>) -> Result<PathBuf> {
         } else {
             0
         };
-        let mut out: File = OpenOptions::new().create(true).append(true).open(dest).map_err(io)?;
+        // Written at offsets: Windows truncates only through a handle that may write anywhere.
+        let out: File = OpenOptions::new().create(true).write(true).truncate(false).open(dest).map_err(io)?;
         out.set_len(from).map_err(io)?;
         let (range, mut end) = ((from > 0).then_some((from, None)), from);
         access.get(provider, url, range, &mut |at, frame| {
@@ -910,7 +911,7 @@ fn land_in(m: &Member, dest: &Path, access: &Scope<'_>) -> Result<PathBuf> {
                 // The origin started the body over.
                 out.set_len(at).map_err(io)?;
             }
-            out.write_all(frame).map_err(io)?;
+            out.write_all_at(frame, at).map_err(io)?;
             end = at + frame.len() as u64;
             Ok(())
         })?;

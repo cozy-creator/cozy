@@ -72,7 +72,8 @@ async fn export_files_without_a_directory_renders_a_cache_folder_that_expires() 
     let component = saved.component("tokenizer").unwrap();
 
     let managed = component.export_files(None).unwrap();
-    assert!(managed.starts_with(cache.join("snapshots")), "{}", managed.display());
+    let snapshots = platform::durable::canonical(&cache).unwrap().join("snapshots");
+    assert!(managed.starts_with(snapshots), "{}", managed.display());
     assert_eq!(fs::read(managed.join("vocab.json")).unwrap(), br#"{"a":0}"#);
     assert!(managed.join("tokenizer_config.json").is_file());
     assert_eq!(component.export_files(None).unwrap(), managed, "the folder is reused");
@@ -83,11 +84,9 @@ async fn export_files_without_a_directory_renders_a_cache_folder_that_expires() 
     // Age the folder's use past the TTL; a collection by the TTL evicts it, never the caller's copy.
     let then = std::time::SystemTime::now() - tensorfs::store::TTL * 2;
     let name = managed.file_name().unwrap().to_str().unwrap();
-    fs::File::open(cache.join("uses").join(name)).unwrap().set_modified(then).unwrap();
-    platform::durable::open_dir(&managed)
-        .unwrap()
-        .set_times(fs::FileTimes::new().set_modified(then))
-        .unwrap();
+    for path in [cache.join("uses").join(name), managed.clone()] {
+        platform::durable::set_times(&path, fs::FileTimes::new().set_modified(then)).unwrap();
+    }
     Store::open(&cache).unwrap().collect(u64::MAX, tensorfs::store::TTL).unwrap();
     assert!(!managed.exists(), "an expired export folder outlived the cache TTL");
     assert!(explicit.join("vocab.json").is_file());
