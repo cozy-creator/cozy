@@ -92,11 +92,24 @@ fn real_v1_lanes_become_d10_citing_their_bytes_where_they_are() {
     let fetch = FetchClient::new(SourcePolicy::default());
     let endpoint = Arc::new(Endpoint::new(&fetch, &root.to_string_lossy(), None).unwrap());
     let mut migrator = Migrator::new(Access::from_env(), UPSTREAMS);
+    // A dry run sends nothing and plans the document the run then writes.
+    let refs = |name: &str| fs::read(root.join(format!("refs/{name}.json"))).unwrap();
+    let mut planned = BTreeMap::new();
+    for lane in &lanes {
+        let scratch = Store::open(dir.0.join("plan").join(lane.name.replace('/', "__"))).unwrap();
+        let before = refs(&lane.name);
+        let plan = d10::plan(&endpoint, &fetch, &lane.name, &scratch, &mut migrator).unwrap();
+        assert!(plan.report["would_offer"]["objects"].as_u64().unwrap() > 0, "{}", lane.name);
+        assert_eq!((refs(&lane.name), &plan.before), (before.clone(), &before), "{}", lane.name);
+        planned.insert(lane.name.clone(), plan.after);
+    }
+    assert_eq!(blobs(&root), held, "a dry run sent an object");
     let mut trees = BTreeMap::new();
     for lane in &lanes {
         let scratch = Store::open(dir.0.join("scratch").join(lane.name.replace('/', "__"))).unwrap();
         let done = d10::migrate(&endpoint, &fetch, &lane.name, &scratch, &mut migrator).unwrap();
         println!("{:#}", done.report);
+        assert_eq!((refs(&lane.name), &done.after), (planned[&lane.name].clone(), &planned[&lane.name]), "{}", lane.name);
         let report = &done.report["checkpoints"][0];
         assert_eq!(report["old"], lane.manifest.id().as_str());
         let repo = Repo::from_json(&fs::read(root.join(format!("refs/{}.json", lane.name))).unwrap()).unwrap();
