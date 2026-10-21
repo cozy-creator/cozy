@@ -1165,7 +1165,9 @@ mod v1_api {
     }
 
     /// A deviceless function (`accelerator=False`) runs on a pooled executor: its second call
-    /// is served by the executor of its first, which paid the imports once.
+    /// is served by the executor of its first, which paid the imports once. Only host pressure
+    /// ends it between calls (memory goes back to the host, a loaded runner's): each change
+    /// of executor is one the memory log's `host_pressure` notes gave back.
     #[tokio::test]
     async fn a_second_deviceless_call_reuses_its_executor() {
         let (machine, tools) = installing_machine().await;
@@ -1189,10 +1191,21 @@ mod v1_api {
             let result: serde_json::Value = json(&done.result);
             served.push((result["pid"].as_u64().unwrap(), result["served"].as_u64().unwrap()));
         }
-        for (ordinal, (pid, count)) in served.iter().enumerate() {
-            assert_eq!(*pid, served[0].0, "one executor served every sequential call: {served:?}");
-            assert_eq!(*count, ordinal as u64 + 1, "{served:?}");
+        let logs = machine.store().join("logs");
+        let given = ["memory.log", "memory.log.1"].iter()
+            .flat_map(|name| fs::read_to_string(logs.join(name)).unwrap_or_default().lines().map(str::to_owned).collect::<Vec<_>>())
+            .filter(|line| line.contains("\"event\":\"host_pressure\"") && line.contains("\"gave\":true"))
+            .count();
+        assert_eq!(served[0].1, 1, "{served:?}");
+        let mut changes = 0;
+        for pair in served.windows(2) {
+            let ((was, served_before), (now, count)) = (pair[0], pair[1]);
+            match was == now {
+                true => assert_eq!(count, served_before + 1, "{served:?}"),
+                false => (changes, _) = (changes + 1, assert_eq!(count, 1, "{served:?}")),
+            }
         }
+        assert!(changes <= given, "an executor ended between calls with no host pressure to give back to ({given}): {served:?}");
         let _ = fs::remove_dir_all(tools);
     }
 
