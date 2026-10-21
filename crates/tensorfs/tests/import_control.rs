@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tensorfs::err::{Code, Result};
@@ -55,16 +55,22 @@ fn safetensors() -> Vec<u8> {
     bytes
 }
 
-#[derive(Clone, Copy)]
+/// What the first ask of a path meets: the listing's or the member's body held after its
+/// prefix until released; or, of the member, a 429 with `Retry-After: 1` or its body cut after
+/// the prefix.
+#[derive(Clone, Copy, PartialEq)]
 enum Stall {
     Listing,
     Member,
+    Busy,
+    Cut,
 }
 #[derive(Clone)]
 struct Seen {
     path: String,
     range: Option<String>,
     authorized: bool,
+    at: Instant,
 }
 struct Origin {
     url: String,
@@ -85,9 +91,10 @@ impl Origin {
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(Vec::new())),
         );
-        let (waiting, go, done, record) = (
+        let (waiting, go, done, done_accepting, record) = (
             stalled.clone(),
             release.clone(),
+            stop.clone(),
             stop.clone(),
             requests.clone(),
         );
@@ -109,74 +116,89 @@ impl Origin {
         for (name, bytes) in members {
             files.insert(format!("/proof/model/resolve/{COMMIT}/{name}"), bytes);
         }
+        let (files, fired) = (Arc::new(files), AtomicBool::new(false));
+        let serve = move |mut stream: TcpStream| {
+            let Some(request) = receive(&mut stream) else {
+                return;
+            };
+            let path = request.path.split('?').next().unwrap().to_owned();
+            record.lock().unwrap().push(request.clone());
+            let Some(body) = files.get(&path) else {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Missing\r\ncontent-length:0\r\nconnection:close\r\n\r\n",
+                );
+                return;
+            };
+            let stalls = match stall {
+                Some(Stall::Listing) => path.ends_with("/revision/main"),
+                Some(_) => path.ends_with("/model.safetensors"),
+                None => false,
+            };
+            if stalls && !fired.swap(true, Ordering::AcqRel) {
+                if stall == Some(Stall::Busy) {
+                    let busy = b"HTTP/1.1 429 Busy\r\nretry-after: 1\r\ncontent-length:0\r\nconnection:close\r\n\r\n";
+                    let _ = stream.write_all(busy);
+                    return;
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-length:{}\r\nconnection:close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                let prefix = 16.min(body.len() / 2);
+                stream.write_all(&body[..prefix]).unwrap();
+                stream.flush().unwrap();
+                waiting.store(true, Ordering::Release);
+                if stall == Some(Stall::Cut) {
+                    return;
+                }
+                while !go.load(Ordering::Acquire) && !done.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let _ = stream.write_all(&body[prefix..]);
+                return;
+            }
+            let (lo, hi, status) = match request
+                .range
+                .as_deref()
+                .and_then(|range| range.strip_prefix("bytes="))
+                .and_then(|range| range.split_once('-'))
+            {
+                Some((lo, hi)) => (
+                    lo.parse::<usize>().unwrap(),
+                    if hi.is_empty() {
+                        body.len()
+                    } else {
+                        hi.parse::<usize>().unwrap() + 1
+                    }
+                    .min(body.len()),
+                    206,
+                ),
+                None => (0, body.len(), 200),
+            };
+            let range = if status == 206 {
+                format!("content-range:bytes {}-{}/{}\r\n", lo, hi - 1, body.len())
+            } else {
+                String::new()
+            };
+            let _=write!(stream,"HTTP/1.1 {status} fixture\r\ncontent-length:{}\r\n{range}connection:close\r\n\r\n",hi-lo);
+            let _ = stream.write_all(&body[lo..hi]);
+        };
+        // A connection held open never keeps another waiting.
+        let serve = Arc::new(serve);
         let worker = thread::spawn(move || {
-            while !done.load(Ordering::Acquire) {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(pair) => pair,
+            while !done_accepting.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let serve = serve.clone();
+                        thread::spawn(move || serve(stream));
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(1));
-                        continue;
                     }
                     Err(error) => panic!("accept: {error}"),
-                };
-                let Some(request) = receive(&mut stream) else {
-                    continue;
-                };
-                let path = request.path.split('?').next().unwrap().to_owned();
-                record.lock().unwrap().push(request.clone());
-                let Some(body) = files.get(&path) else {
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 404 Missing\r\ncontent-length:0\r\nconnection:close\r\n\r\n",
-                    );
-                    continue;
-                };
-                let should_stall = match stall {
-                    Some(Stall::Listing) => path.ends_with("/revision/main"),
-                    Some(Stall::Member) => path.ends_with("/model.safetensors"),
-                    None => false,
-                };
-                if should_stall && !waiting.load(Ordering::Acquire) {
-                    write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\ncontent-length:{}\r\nconnection:close\r\n\r\n",
-                        body.len()
-                    )
-                    .unwrap();
-                    let prefix = 16.min(body.len() / 2);
-                    stream.write_all(&body[..prefix]).unwrap();
-                    stream.flush().unwrap();
-                    waiting.store(true, Ordering::Release);
-                    while !go.load(Ordering::Acquire) && !done.load(Ordering::Acquire) {
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                    let _ = stream.write_all(&body[prefix..]);
-                    continue;
                 }
-                let (lo, hi, status) = match request
-                    .range
-                    .as_deref()
-                    .and_then(|range| range.strip_prefix("bytes="))
-                    .and_then(|range| range.split_once('-'))
-                {
-                    Some((lo, hi)) => (
-                        lo.parse::<usize>().unwrap(),
-                        if hi.is_empty() {
-                            body.len()
-                        } else {
-                            hi.parse::<usize>().unwrap() + 1
-                        }
-                        .min(body.len()),
-                        206,
-                    ),
-                    None => (0, body.len(), 200),
-                };
-                let range = if status == 206 {
-                    format!("content-range:bytes {}-{}/{}\r\n", lo, hi - 1, body.len())
-                } else {
-                    String::new()
-                };
-                let _=write!(stream,"HTTP/1.1 {status} fixture\r\ncontent-length:{}\r\n{range}connection:close\r\n\r\n",hi-lo);
-                let _ = stream.write_all(&body[lo..hi]);
             }
         });
         Self {
@@ -261,6 +283,7 @@ fn receive(stream: &mut TcpStream) -> Option<Seen> {
         authorized: headers
             .get("authorization")
             .is_some_and(|value| value == "Bearer import-proof"),
+        at: Instant::now(),
     })
 }
 
@@ -420,6 +443,32 @@ async fn stalled_listing_and_member_cancel_on_caller_runtime_and_resume_exact_by
                     .any(|request| request.range.as_deref() == Some("bytes=16-")),
                 "the real partial member did not resume"
             );
+        }
+    }
+}
+
+/// One import rides out a 429 at its `Retry-After`, and a member body cut after its first 16
+/// bytes is asked again from byte 16 (a silent one: `fetch::ask`'s own test).
+#[test]
+fn weather_and_cut_bodies_are_asked_again_from_the_byte_reached() {
+    for stall in [Stall::Busy, Stall::Cut] {
+        let scratch = Scratch::new();
+        let origin = Origin::new(Some(stall));
+        let store = Store::open(scratch.0.join("store")).unwrap();
+        let (result, files, committed) = convert(&store, &access(&origin, None, None, None), None);
+        assert_bytes(&store, &result.unwrap(), &files);
+        assert!(committed);
+        let seen = origin.requests.lock().unwrap();
+        let asks: Vec<&Seen> = seen.iter().filter(|r| r.path.ends_with("/model.safetensors")).collect();
+        assert_eq!(asks.len(), 2, "one ask again");
+        assert!(asks.iter().all(|ask| ask.authorized), "source credentials were lost");
+        match stall {
+            Stall::Busy => {
+                assert_eq!(asks[1].range, None);
+                let waited = asks[1].at - asks[0].at;
+                assert!(waited >= Duration::from_secs(1), "asked again after {waited:?}, not at Retry-After");
+            }
+            _ => assert_eq!(asks[1].range.as_deref(), Some("bytes=16-"), "not resumed from the byte reached"),
         }
     }
 }

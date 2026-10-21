@@ -17,8 +17,9 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 
 use crate::err::{refuse, Code, Refusal, Result};
+use crate::fetch::ask::{self, Patience};
 use crate::fetch::policy::{base_host, SourcePolicy};
-use crate::fetch::Client;
+use crate::fetch::{Client, GetError};
 
 /// The most bytes of one listing or document read whole.
 const DOCUMENT_BYTES: usize = 32 << 20;
@@ -306,20 +307,17 @@ impl<'a> Scope<'a> {
         read_small_in(member, self)
     }
 
-    /// GET `url` from `p` (bytes `range` when given: from, and through), handing each body
-    /// frame to `sink`; the `Link: rel="next"` page when the answer names one.
+    /// GET `url` from `p` (bytes `range` when given: from, and through) into `sink`, which takes
+    /// each body frame with the byte it starts at ([`ask::get`]); the `Link: rel="next"` page
+    /// when the answer names one.
     fn get(
         &self,
         p: Provider,
         url: &str,
         range: Option<(u64, Option<u64>)>,
-        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+        sink: &mut ask::Sink<'_>,
     ) -> Result<Option<String>> {
-        let mut headers = self.headers(p, url);
-        if let Some((from, through)) = range {
-            let through = through.map_or(String::new(), |t| t.to_string());
-            headers.push(("range".into(), format!("bytes={from}-{through}")));
-        }
+        let headers = self.headers(p, url);
         self.check()?;
         let client = match self.ca_der.as_deref() {
             Some(der) => Client::with_roots(
@@ -332,30 +330,21 @@ impl<'a> Scope<'a> {
             )?,
             None => Client::new(self.policy(p)),
         };
-        let work = async {
-            let mut answer = self
-                .until(client.get_authorized(url, &headers, self.token.as_deref()))
-                .await?;
-            let status = answer.status();
-            let ranged =
-                range.is_some_and(|(from, _)| from > 0) || range.is_some_and(|(_, t)| t.is_some());
-            match status {
-                200 if !ranged => {}
-                206 if range.is_some() => {}
-                404 | 410 => return refuse(Code::REF_NOT_FOUND, format!("{url}: HTTP {status}")),
-                401 | 403 => {
-                    return refuse(Code::PERMISSION_DENIED, format!("{url}: HTTP {status}"))
-                }
-                _ => return refuse(Code::TRANSFER_FAILED, format!("{url}: HTTP {status}")),
-            }
-            let next = answer.header("link").and_then(next_link);
-            while let Some(frame) = self.until(answer.frame()).await? {
+        let patience = Patience::default();
+        let work = self.until(async {
+            let mut sink = |at, frame: &[u8]| {
                 self.check()?;
-                sink(&frame)?;
+                sink(at, frame)
+            };
+            let got = ask::get(&client, url, &headers, self.token.as_deref(), &patience, range, &mut sink).await;
+            let what = |status| format!("{url}: HTTP {status}");
+            match got.map_err(GetError::refusal)? {
+                Ok(headers) => Ok(headers.get("link").and_then(|v| v.to_str().ok()).and_then(next_link)),
+                Err(status @ (404 | 410)) => refuse(Code::REF_NOT_FOUND, what(status)),
+                Err(status @ (401 | 403)) => refuse(Code::PERMISSION_DENIED, what(status)),
+                Err(status) => refuse(Code::ORIGIN_REFUSED, what(status)),
             }
-            self.check()?;
-            Ok(next)
-        };
+        });
         match &self.runtime {
             Some(runtime) => runtime.block_on(work),
             None => crate::fetch::runtime()?.block_on(work),
@@ -378,7 +367,8 @@ impl<'a> Scope<'a> {
     /// A small document read whole, and the next page it names.
     fn document(&self, p: Provider, url: &str) -> Result<(Vec<u8>, Option<String>)> {
         let mut body = Vec::new();
-        let next = self.get(p, url, None, &mut |frame| {
+        let next = self.get(p, url, None, &mut |at, frame| {
+            body.truncate(at as usize);
             if body.len() + frame.len() > DOCUMENT_BYTES {
                 return refuse(
                     Code::SIZE_CAP,
@@ -912,16 +902,17 @@ fn land_in(m: &Member, dest: &Path, access: &Scope<'_>) -> Result<PathBuf> {
         } else {
             0
         };
-        let mut out: File = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(from > 0)
-            .truncate(from == 0)
-            .open(dest)
-            .map_err(io)?;
-        let range = (from > 0).then_some((from, None));
-        access.get(provider, url, range, &mut |frame| {
-            out.write_all(frame).map_err(io)
+        let mut out: File = OpenOptions::new().create(true).append(true).open(dest).map_err(io)?;
+        out.set_len(from).map_err(io)?;
+        let (range, mut end) = ((from > 0).then_some((from, None)), from);
+        access.get(provider, url, range, &mut |at, frame| {
+            if at != end {
+                // The origin started the body over.
+                out.set_len(at).map_err(io)?;
+            }
+            out.write_all(frame).map_err(io)?;
+            end = at + frame.len() as u64;
+            Ok(())
         })?;
         out.sync_all().map_err(io)?;
     }
@@ -963,7 +954,8 @@ pub fn read_range(m: &Member, from: u64, to: u64, access: &Access) -> Result<Vec
         *provider,
         url,
         Some((from, Some(to.saturating_sub(1)))),
-        &mut |frame| {
+        &mut |at, frame| {
+            out.truncate((at - from) as usize);
             out.extend_from_slice(frame);
             Ok(())
         },

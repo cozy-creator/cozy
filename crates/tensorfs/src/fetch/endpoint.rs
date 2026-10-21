@@ -12,14 +12,14 @@
 //! - **A directory** writes through a store over it: objects verified, temp and rename; refs under
 //!   the store's record lock, read and replaced inside it.
 //! - **Weather** (transport failures, 408/425/429/5xx) is asked again at `Retry-After` or a
-//!   doubling wait, until nothing has moved for the Fetcher's stall rule.
+//!   doubling wait, until nothing has moved for the stall rule ([`super::ask`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -28,6 +28,7 @@ use base64::engine::{general_purpose::STANDARD, Engine as _};
 use super::net::Uri;
 use serde_json::Value;
 
+use super::ask::{self, Patience, Tried};
 use super::net::{join, same_origin, Body, Client, GetError, HeaderMap};
 use super::origin::{Location, Origin};
 use super::policy::is_loopback_origin;
@@ -41,12 +42,6 @@ use crate::store::Store;
 pub const MAIN: &str = "main";
 /// The most bytes a repo document may have.
 const REPO_BYTES: usize = 16 << 20;
-/// The Fetcher's tick, and its floor for stillness (120 ticks): nothing moving for less is no
-/// evidence; for 8× the slowest answer seen, it is.
-const TICK: Duration = Duration::from_millis(250);
-const STILL: Duration = Duration::from_secs(30);
-const STALL_FACTOR: u32 = 8;
-const WEATHER: [u16; 7] = [408, 425, 429, 500, 502, 503, 504];
 /// Objects an upload sends at once.
 const STREAMS: usize = 16;
 
@@ -56,8 +51,7 @@ pub struct Endpoint {
     at: At,
     client: Client,
     token: Option<Arc<dyn TokenProvider>>,
-    /// The slowest answer seen (nanoseconds): what the stall rule scales.
-    slowest: AtomicU64,
+    patience: Patience,
 }
 
 enum At {
@@ -143,7 +137,7 @@ impl Endpoint {
             At::Http(_) => token.or_else(|| default_for(&url)),
             At::Dir(..) => None,
         };
-        Ok(Endpoint { url, at, client: client.clone(), token, slowest: AtomicU64::new(0) })
+        Ok(Endpoint { url, at, client: client.clone(), token, patience: Patience::default() })
     }
 
     pub fn url(&self) -> &str {
@@ -335,25 +329,21 @@ impl Endpoint {
             }
             At::Http(base) => {
                 let url = format!("{base}/{}", object.key());
-                let moved = AtomicU64::new(0);
-                let get = async {
-                    let mut answer = self.client.get_authorized(&url, &[], self.token.as_deref()).await?;
-                    match answer.status() {
-                        200 => {}
-                        404 | 410 => return refuse(Code::OBJECT_ABSENT, format!("GET {url}: {}", answer.status())),
-                        status => return refuse(Code::HUB_REFUSED, format!("GET {url}: {status}")),
+                let mut body = Vec::new();
+                let mut sink = |at: u64, frame: &[u8]| {
+                    body.truncate(at as usize);
+                    body.extend_from_slice(frame);
+                    match body.len() as u64 > object.length {
+                        true => refuse(Code::OBJECT_ID_MISMATCH, format!("GET {url}: more than {} B", object.length)),
+                        false => Ok(()),
                     }
-                    let mut body = Vec::new();
-                    while let Some(frame) = answer.frame().await? {
-                        moved.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                        body.extend_from_slice(&frame);
-                        if body.len() as u64 > object.length {
-                            break;
-                        }
-                    }
-                    Ok(body)
                 };
-                self.watched(get, &moved).await?
+                let got = ask::get(&self.client, &url, &[], self.token.as_deref(), &self.patience, None, &mut sink).await;
+                match got.map_err(GetError::refusal)? {
+                    Ok(_) => body,
+                    Err(status @ (404 | 410)) => return refuse(Code::OBJECT_ABSENT, format!("GET {url}: {status}")),
+                    Err(status) => return refuse(Code::HUB_REFUSED, format!("GET {url}: {status}")),
+                }
             }
         };
         match ObjectRef::of(&bytes) == *object {
@@ -458,30 +448,21 @@ impl Endpoint {
         }
     }
 
-    /// The stall rule: nothing moved for 8× the slowest answer, never under [`STILL`].
-    fn patience(&self) -> Duration {
-        let slowest = Duration::from_nanos(self.slowest.load(Ordering::Relaxed));
-        STILL.max(slowest * STALL_FACTOR)
-    }
-
-    /// One exchange, its answer read whole. Weather is asked again until nothing has moved for
-    /// the stall rule; the provider may ask once more (a nonce, a refresh).
+    /// One exchange, its answer read whole, asked again by the one rule ([`ask::again`]); the
+    /// provider may ask once more (a nonce, a refresh).
     async fn exchange(&self, ask: Ask<'_>) -> Result<Reply> {
         self.exchange_attempt(ask).await.map_err(GetError::refusal)
     }
 
     async fn exchange_attempt(&self, ask: Ask<'_>) -> std::result::Result<Reply, GetError> {
-        let (mut still, mut wait, mut asked_again) = (Instant::now(), TICK, false);
-        let mut stated_most = Duration::ZERO;
-        loop {
+        let (ask, challenged, patience) = (&ask, &AtomicBool::new(false), &self.patience);
+        ask::again(patience, move |moved| async move {
             let mut headers = ask.headers.clone();
-            let (moved, began) = (Arc::new(AtomicU64::new(0)), Instant::now());
-            let authorized = match ask.auth {
-                true => self.watched(self.authorize(ask.method, ask.url, &ask.headers, ask.payload), &moved).await,
-                false => Ok(vec![]),
-            }.map_err(GetError::Provider)?;
-            // A provider's failure is the caller's verdict, not failed network traffic.
-            headers.extend(authorized);
+            if ask.auth {
+                // A provider's failure is the caller's verdict, not failed network traffic.
+                let authorized = ask::watched(patience, &moved, self.authorize(ask.method, ask.url, &ask.headers, ask.payload));
+                headers.extend(authorized.await.map_err(GetError::Caller)?);
+            }
             let body = match ask.body {
                 Some(make) => Some(match make()? {
                     Payload::Bytes(bytes) => Body::Bytes(bytes),
@@ -492,42 +473,23 @@ impl Endpoint {
                 }),
                 None => None,
             };
-            let outcome = self.watched(self.round_trip(ask.method, ask.url, &headers, body, &moved), &moved).await;
-            // Bytes that moved before a transport failure are progress; a "not now" is not.
-            let progressed = outcome.is_err() && moved.load(Ordering::Relaxed) > 0;
-            let (why, stated) = match outcome {
-                Ok(reply) => {
-                    self.slowest.fetch_max(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    let sent = Request { method: ask.method, url: ask.url, headers: &headers, payload: ask.payload };
-                    let again = match (ask.auth, &self.token) {
-                        (true, Some(token)) => token.retry(&sent, reply.status, &reply.headers).map_err(GetError::Provider)?,
-                        _ => false,
-                    };
-                    if again && !asked_again {
-                        asked_again = true;
-                        continue;
-                    }
-                    if !WEATHER.contains(&reply.status) {
-                        return Ok(reply);
-                    }
-                    let stated = (reply.header("retry-after")).and_then(|s| s.trim().parse().ok()).map(Duration::from_secs);
-                    (format!("{} {}: {}", ask.method, ask.url, reply.status), stated)
-                }
-                Err(e) if matches!(e.code, Code::TRANSFER_FAILED | Code::FD_HEADROOM | Code::STALLED) => (e.detail, None),
-                Err(e) => return Err(e.into()),
+            let reply = ask::watched(patience, &moved, self.round_trip(ask.method, ask.url, &headers, body, &moved)).await?;
+            let sent = Request { method: ask.method, url: ask.url, headers: &headers, payload: ask.payload };
+            let again = match (ask.auth, &self.token) {
+                (true, Some(token)) => token.retry(&sent, reply.status, &reply.headers).map_err(GetError::Caller)?,
+                _ => false,
             };
-            if progressed {
-                still = Instant::now();
-            }
-            stated_most = stated_most.max(stated.unwrap_or_default());
-            let patience = self.patience().max(stated_most * 2);
-            if still.elapsed() > patience {
-                return refuse(Code::HUB_UNREACHABLE, format!("{why}; nothing moved for {:.0} s", still.elapsed().as_secs_f64())).map_err(GetError::Exchange);
-            }
-            tracing::debug!(%why, "asked again");
-            tokio::time::sleep(stated.unwrap_or(wait)).await;
-            wait = (wait * 2).min(patience / 8);
-        }
+            let why = format!("{} {}: {}", ask.method, ask.url, reply.status);
+            Ok(if again && !challenged.swap(true, Ordering::Relaxed) {
+                Tried::Again { why, wait: Some(Duration::ZERO) }
+            } else if ask::weather(reply.status) {
+                let wait = (reply.header("retry-after")).and_then(|s| s.trim().parse().ok()).map(Duration::from_secs);
+                Tried::Again { why, wait }
+            } else {
+                Tried::Done(reply)
+            })
+        })
+        .await
     }
 
     async fn round_trip(&self, method: &str, url: &str, headers: &[(String, String)], body: Option<Body>, moved: &AtomicU64) -> Result<Reply> {
@@ -543,25 +505,6 @@ impl Endpoint {
             }
         }
         Ok(Reply { url: url.to_owned(), status, headers, body })
-    }
-
-    /// `exchange` dropped once nothing moves (no body bytes out, no answer) for the stall rule.
-    async fn watched<T>(&self, exchange: impl std::future::Future<Output = Result<T>>, moved: &AtomicU64) -> Result<T> {
-        tokio::pin!(exchange);
-        let (mut seen, mut since) = (0, Instant::now());
-        loop {
-            tokio::select! {
-                done = &mut exchange => return done,
-                () = tokio::time::sleep(TICK) => {
-                    let now = moved.load(Ordering::Relaxed);
-                    if now != seen {
-                        (seen, since) = (now, Instant::now());
-                    } else if since.elapsed() > self.patience() {
-                        return refuse(Code::STALLED, format!("nothing moved for {:.0} s", since.elapsed().as_secs_f64()));
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -720,7 +663,7 @@ pub async fn upload_tree_with(endpoint: &Endpoint, name: &str, tree: &ObjectRef,
             }
             let done = tokio::select! {
                 done = sending.next() => done,
-                () = tokio::time::sleep(TICK) => continue,
+                () = tokio::time::sleep(ask::TICK) => continue,
             };
             let Some(done) = done else { break };
             let (pushed, length) = done?;
